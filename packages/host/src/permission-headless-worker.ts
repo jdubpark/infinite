@@ -75,6 +75,10 @@ type StoredAnswer = { digest: string; receipt: { requestId: string; state: "deli
 
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const clean = (text: string, limit: number) => text.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, " ").trim().slice(0, limit);
+/** Calls of one agent with the same tool and input share this key. */
+const callKey = (call: ChannelCall, inputHash: string) => `${call.agentId ?? ""}\n${call.toolName}\n${inputHash}`;
+/** How many keys of open calls a worker holds. Past it the worker holds none. */
+export const OPEN_CALL_KEYS = 4096;
 
 /** The hook payload fields the channel reads. Anything else in the payload is ignored. */
 function readCall(body: unknown): (ChannelCall & { nativeSessionId?: string }) | undefined {
@@ -97,8 +101,18 @@ export class HeadlessChannelWorker {
   private served = false;
   private nativeSessionId?: string;
   private deferred?: Deferred;
-  /** Tool calls the class check saw, by agent, tool and input, for the PermissionRequest that has no call id. */
-  private recent = new Map<string, string>();
+  /**
+   * Calls left to the provider's own rules, by agent, tool and input, for the PermissionRequest that has no call id.
+   * The value is the one such call's id. It is a count when the call has no id or identical calls are open together:
+   * their requests cannot be told apart, so none of them takes a call id. A call the provider settles without a
+   * request stays here, so the request of a later identical call takes no id either.
+   */
+  private recent = new Map<string, string | number>();
+  /**
+   * True once the worker stopped holding calls: more keys were open than it holds, or a provider exited. From then on
+   * it holds none, so no request takes a held id, for as long as the worker lives.
+   */
+  private lost = false;
   /** Call ids that already received the owner's answer. A repeat is denied. */
   private consumed = new Set<string>();
   private answers = new Map<string, StoredAnswer>();
@@ -119,6 +133,37 @@ export class HeadlessChannelWorker {
   }
 
   private deny(code: RejectCode): ChannelAnswer { return { decision: "deny", reason: requesterNotice(code) }; }
+
+  /**
+   * A call that goes on to the provider's own rules. Only such a call can come back as a PermissionRequest. An id seen
+   * again while it alone is held is the same call. Among counted calls a repeat cannot be told from a new call, so it
+   * counts again.
+   */
+  private leftOpen(key: string, callId?: string) {
+    if (this.lost) return;
+    const held = this.recent.get(key);
+    if (callId !== undefined && held === callId) return;
+    this.recent.set(key, held === undefined ? callId ?? 1 : typeof held === "number" ? held + 1 : 2);
+    // One key is never dropped alone: a later identical call would then look alone, and an earlier call's request
+    // could take its id.
+    if (this.recent.size > OPEN_CALL_KEYS) { this.recent.clear(); this.lost = true; }
+  }
+
+  /**
+   * The call id of a PermissionRequest. A request that names its call keeps that id, and takes a call off only when
+   * that call is the one held. A request without an id takes the id of the one identical call left open. With several
+   * left open it takes none and counts one of them off. This assumes that a call raises one request at most.
+   */
+  private callOf(key: string, own?: string): string | undefined {
+    const held = this.recent.get(key);
+    if (own !== undefined) {
+      if (held === own) this.recent.delete(key);
+      return own;
+    }
+    if (typeof held === "number" && held > 1) this.recent.set(key, held - 1);
+    else this.recent.delete(key);
+    return typeof held === "string" ? held : undefined;
+  }
 
   /** Recorded only in the session's own journal. */
   private pending(tool: string): ChannelAnswer {
@@ -176,14 +221,13 @@ export class HeadlessChannelWorker {
       return settle("allow", "receipt", "Headless: the owner's allow was returned to the resumed call.", { decision: "allow" });
     }
     if (deferred) return this.pending(call.toolName);
-    if (call.toolUseId) {
-      this.recent.set(`${call.agentId ?? ""}\n${call.toolName}\n${inputHash}`, call.toolUseId);
-      if (this.recent.size > 256) this.recent.delete(this.recent.keys().next().value!);
-    }
     let reply: ChannelReply;
     try { reply = await this.ask({ op: "class", call }, CLASS_CHECK_MS); }
     catch { return this.deny("unavailable"); }
-    if (reply.result === "not-served" || reply.result === "none") return { decision: "none" };
+    if (reply.result === "not-served" || reply.result === "none") {
+      this.leftOpen(callKey(call, inputHash), call.toolUseId);
+      return { decision: "none" };
+    }
     if (reply.result === "deny") {
       // The host recorded no owner decision this call could wait on: under a halt it is denied as unavailable;
       // otherwise it is denied with needs-owner and the owner is told with the class.
@@ -222,11 +266,10 @@ export class HeadlessChannelWorker {
     const call = readCall(body);
     if (!call) return this.deny("unavailable");
     this.first(call);
-    if (this.deferred) return this.pending(call.toolName);
     const inputHash = hash(call.toolInput);
-    const key = `${call.agentId ?? ""}\n${call.toolName}\n${inputHash}`;
-    const callId = call.toolUseId ?? this.recent.get(key);
-    if (callId) this.recent.delete(key);
+    // A request without a call id is counted off before any answer, so its call does not stay counted when the answer is pending.
+    const callId = this.callOf(callKey(call, inputHash), call.toolUseId);
+    if (this.deferred) return this.pending(call.toolName);
     // Stable for this raised request; an uncorrelated request gets an id of its own.
     const requestId = `headless:${this.host.sessionId}:${callId ?? `r${++this.requests}-${inputHash.slice(0, 24)}`}`;
     const forwarded: ChannelCall = { toolName: call.toolName, toolInput: call.toolInput, ...(callId ? { toolUseId: callId } : {}), ...(call.agentId ? { agentId: call.agentId } : {}) };
@@ -243,6 +286,11 @@ export class HeadlessChannelWorker {
 
   /** The provider exited. True when the session stays open because a deferred call waits for the owner. */
   exited(exitCode: number): boolean {
+    // A hook of the provider that exited can still arrive after the owner's answer started the next one, and nothing
+    // in a hook tells the two apart. Its request would take the id of the next provider's identical call. So the worker
+    // holds no call from here on.
+    this.recent.clear();
+    this.lost = true;
     const deferred = this.deferred;
     if (!deferred) return false;
     if (deferred.phase === "deferring" && exitCode === 0 && this.nativeSessionId) {

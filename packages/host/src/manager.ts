@@ -24,7 +24,7 @@ import { socketPath, workerCall } from "./ipc.js";
 import { SealedFileCache, listedSavedState, listedSession, savedState, unavailableState, type ListedSession, type SavedStatus } from "./session-listing.js";
 import { assertRunnerDeployment } from "./deployment.js";
 import { DEFAULT_HOOKS } from "./config.js";
-import { codeModeEnabled } from "./code-mode.js";
+import { codeModeEnabled, memberLaunchPrompt } from "./code-mode.js";
 import { HostLoadGate, LaunchHeldError, readHostLoad, type HostLoadProbe } from "./host-load.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
 import { validateNativeOpenCodeArgs } from "./native-opencode.js";
@@ -1160,7 +1160,7 @@ export class Manager {
       context.text
         ? `Shared project context (version ${context.version}, provided by the owner):\n${context.text}`
         : "",
-      request.prompt,
+      request.team ? memberLaunchPrompt(request.prompt, request.provider, session.codeMode === true) : request.prompt,
     ]
       .filter(Boolean)
       .join("\n\n");

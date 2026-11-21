@@ -27,6 +27,22 @@ type Lifecycle = { id: string; title: string; status: string; reason?: string; r
 type StorageVolume = { label: string; path: string; fullness: number; availableInodes: number; availableBytes: number; fullnessBy?: "bytes" | "inodes" };
 type StorageAlert = { label: string; fullness: number; availableInodes: number; availableBytes: number; fullnessBy: "bytes" | "inodes"; critical: boolean };
 type StorageCrossing = { previous: number; warningArmed: boolean; criticalArmed: boolean };
+
+/** The owner rule shared by push delivery and the decision queue. */
+export function promptOwner(
+  row: Pick<Row, "id" | "attention">,
+  permissions?: Pick<PermissionDeliveryService, "holder">,
+  teams?: Pick<Teams, "promptOwner">,
+): PromptOwner {
+  const prompt = row.attention.prompt;
+  if (row.attention.state !== "needs-you" || !prompt) return "user";
+  let holder: "agent" | "owner" | "undecided" = "owner";
+  if (permissions) try { holder = permissions.holder(row.id, prompt.id); } catch { /* An unavailable holder leaves the prompt with the owner. */ }
+  if (holder !== "owner") return holder === "agent" ? "coordinator" : "undecided";
+  if (!teams?.promptOwner) return "user";
+  try { return teams.promptOwner(row.id, prompt); } catch { return "user"; }
+}
+
 const PUSH_STATES = new Set(["needs-you", "turn-finished", "exited", "recording-error"]);
 /** How long a delegated run may take to pick a member's prompt up for review before the owner hears about it. */
 const REVIEW_START_GRACE_MS = 45_000;
@@ -219,17 +235,8 @@ export class Notifier {
   }
   /** An open permission prompt is the owner's unless the permission agent or the member's run can still decide it. */
   private promptOwner(row: Row): PromptOwner {
-    const prompt = row.attention.prompt;
-    if (row.attention.state !== "needs-you" || !prompt) return "user";
     // The permission agent holds the push only while it can still decide the dialog; "undecided" gets the review grace.
-    const holder = this.permissionHolder(row.id, prompt.id);
-    if (holder !== "owner") return holder === "agent" ? "coordinator" : "undecided";
-    if (!this.teams?.promptOwner) return "user";
-    try { return this.teams.promptOwner(row.id, prompt); } catch { return "user"; }
-  }
-  private permissionHolder(sessionId: string, promptId: number): "agent" | "owner" | "undecided" {
-    if (!this.permissions) return "owner";
-    try { return this.permissions.holder(sessionId, promptId); } catch { return "owner"; }
+    return promptOwner(row, this.permissions, this.teams);
   }
   /** The class a permission dialog was left to the owner for. Only one of the host's own class identifiers is ever named. */
   private ownerClass(row: Row): InterruptClass | undefined {

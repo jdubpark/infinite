@@ -912,6 +912,16 @@ export class TeamService {
   }
   /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state. */
   statuses() { return [...this.records.values()].filter(stored => !stored.run.replay).map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal && !stored.run.missionId, goal: Boolean(stored.run.goal), mission: Boolean(stored.run.missionId) })); }
+  /** Open decisions only; it builds no views or tracker refreshes. */
+  decisionQueueCandidates() { return [...this.records.values()].flatMap(stored => {
+    const run = stored.run, held = heldWaiting(stored), decisions = run.decisions.filter(item => item.revision === run.revision && !item.answer);
+    return !run.replay && ((!stored.halt && run.status !== "paused") || held) && decisions.length
+      ? [{ id: run.id, title: run.title, projectId: run.projectId, revision: run.revision, status: run.status, missionId: run.missionId,
+        goal: Boolean(run.goal), held, decisions: structuredClone(decisions) }]
+      : [];
+  }); }
+  /** The team context named by a member session, without building a view. */
+  decisionQueueSessionOrigin(runId: string, role: string) { const run = this.records.get(runId)?.run; return run && { id: run.id, title: run.title, role }; }
   /**
    * Who a member session's open prompt waits on. "coordinator" while a delegated decision is live
    * for it, "undecided" while the run could still start one, otherwise "user": the prompt stays

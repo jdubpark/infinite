@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
-import type { Prompt } from "@infinite/attention";
+import { terminalOnlyPrompt, type Prompt } from "@infinite/attention";
 import { theme } from "../theme";
 import { Button } from "./Button";
 
@@ -44,8 +44,7 @@ export function DecisionCard({
   const [reply, setReply] = useState("");
   const busy = status.kind === "sending" || status.kind === "sent";
   const enabled = canAnswer && !busy;
-  const feedText = backend === "cmux" && prompt.source === "protocol" && prompt.acceptsText && Boolean(prompt.hash);
-  const needsTerminal = !feedText && (prompt.multiSelect || !prompt.hash || prompt.options.length === 0);
+  const needsTerminal = terminalOnlyPrompt(prompt, backend);
   const textReply = prompt.acceptsText && prompt.kind !== "yes-no" && (backend !== "cmux" || prompt.source === "protocol");
   // Status sits right under the options, where the person just tapped.
   // Outcomes that outlive the prompt ("changed", refusals) are the Brief's notice.

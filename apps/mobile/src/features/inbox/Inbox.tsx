@@ -5,12 +5,14 @@ import { PROVIDER_NAMES, groupSessions, type InboxGroup } from "@infinite/attent
 import {
   api,
   connectionKey,
+  listSessions,
   type Connection,
   type Me,
   type SessionRow,
 } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { useLive } from "../../api/useLive";
+import { useClock } from "../../api/useClock";
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
 import { GlassButton, GroupHeader, LiveStatus, Segmented, Sheet, SheetRow } from "../../components/Glass";
@@ -62,11 +64,11 @@ export function Inbox({
     deps: [],
     load: async () => {
       const [list, me] = await Promise.all([
-        api<{ sessions: SessionRow[] }>(connection, "/sessions"),
+        listSessions(connection),
         api<Me>(connection, "/me"),
       ]);
       return {
-        sessions: [...list.sessions].sort((a, b) =>
+        sessions: [...list].sort((a, b) =>
           b.createdAt.localeCompare(a.createdAt),
         ),
         me,
@@ -84,6 +86,8 @@ export function Inbox({
   const hasTeams = Boolean(data?.me.teams), hasGoals = Boolean(data?.me.goals);
   // Only the visible tab polls quickly; the others refresh their counts slowly.
   const focused = useIsFocused();
+  // A quiet list is not sent again for a minute, so a visible Inbox also reads the clock to move its ages on.
+  const clock = useClock(15_000, focused);
   const pace = (tab: InboxView) => focused && view === tab ? 4000 : 20000;
   const teamsPoll = useLive<TeamListItem[] | null>(connection, {
     topics: ["teams"], intervalMs: pace("teams"), deps: [hasTeams],
@@ -101,7 +105,7 @@ export function Inbox({
   // Team agents are the coordinator's to steer; they appear under their team and in search.
   const sessions = all.filter(session => !session.team);
   const teamAgents = all.length - sessions.length;
-  const now = data?.at ?? 0;
+  const now = Math.max(data?.at ?? 0, clock);
   const waiting = {
     sessions: sessions.filter(session => session.attention.state === "needs-you").length,
     teams: teams.filter(team => teamGroup(team, pendingApprovals(team, all).length) === "attention").length,

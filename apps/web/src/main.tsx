@@ -27,7 +27,7 @@ import {
   Waypoints,
   WifiOff,
 } from "lucide-react";
-import { useApi, ago, ApiError, isControlRefusal, isMissionManaged, missionManagedLine, names, pendingLabel, sourceLabel, type Me, type ProjectDetail, type ProjectSourceStatus, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
+import { useApi, ago, ApiError, isControlRefusal, isMissionManaged, missionManagedLine, names, pendingLabel, readSessions, sourceLabel, type Me, type ProjectDetail, type ProjectSourceStatus, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
 import { clearDrafts, readDraft, settleDraft, useSessionDraft, writeDraft, type PendingInput } from "./drafts";
 import { creations, lifecycles } from "./requests";
 import { MachinePicker, MachineProvider, useMachines } from "./machines";
@@ -98,8 +98,8 @@ function App() {
     return () => { current = false; window.removeEventListener("online", retry); };
   }, [attempt]);
   const host = useLiveRefresh(async (current) => {
-    const data = await api<{ sessions: Session[] }>("/sessions");
-    if (current()) setSessions(data.sessions.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+    const rows = await readSessions(api);
+    if (current()) setSessions([...rows].sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
   }, 1800, me);
   const teamFeed = useLiveRefresh(async current => {
     const data = await api<{ teams: TeamListItem[] }>("/teams?view=list");

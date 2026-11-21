@@ -7,8 +7,9 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { initialAttention } from "@infinite/attention";
 import { Manager, publicAttention, withDefaultAttention } from "../packages/host/src/manager.js";
-import { socketPath } from "../packages/host/src/ipc.js";
-import { writeSealed } from "../packages/host/src/vault.js";
+import { socketPath, workerCall } from "../packages/host/src/ipc.js";
+import { listedSavedState, unavailableState } from "../packages/host/src/session-listing.js";
+import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import type { Config, Session, WorkerState } from "../packages/host/src/types.js";
 import { inProcessHost } from "./helpers.js";
 
@@ -77,15 +78,25 @@ function fakeWorker(runDir: string, id: string, state: unknown) {
   });
 }
 
-/** Today's list() body, rebuilt from meta() and state(). */
+/**
+ * The list() body, rebuilt without the caches from meta() and the worker's answer, else the saved status dated by its
+ * file, else unavailable since the session's creation.
+ */
 async function oracle(manager: Manager, options: { includeFullMessage?: boolean } = {}) {
   const ids = readdirSync(join(manager.config.stateDir, "sessions")).filter(
     n => /^[a-f0-9-]{36}$/.test(n) && !existsSync(join(manager.config.stateDir, "deleted-sessions", `${n}.sealed`)),
   );
   const rows = await Promise.allSettled(ids.map(async id => {
     const { session } = manager.meta(id);
-    const { screen: _screen, ...state } = await manager.state(id).catch(() =>
-      withDefaultAttention({ status: "unavailable", seq: 0, screen: "" }));
+    const saved = () => {
+      const file = join(manager.config.stateDir, "sessions", id, "status.sealed");
+      if (!existsSync(file)) return unavailableState(session.createdAt);
+      const state = unseal<WorkerState>(manager.key, `${id}:status`, fs.readFileSync(file, "utf8"));
+      return listedSavedState({ state, savedAt: new Date(statSync(file).mtimeMs).toISOString() });
+    };
+    const { screen: _screen, ...state } = await workerCall<WorkerState>(manager.config.runDir, id, { op: "state", screen: false })
+      .then(answer => withDefaultAttention(answer), saved)
+      .catch(() => unavailableState(session.createdAt));
     const { context: _context, initialPrompt: _prompt, generatedTitle: _generatedTitle, nativeArgs: _nativeArgs, handoff: _handoff, ...summary } = session;
     return { ...summary, ...state, attention: options.includeFullMessage ? state.attention : publicAttention(state.attention) };
   }));
@@ -128,7 +139,8 @@ test("listing rows equal the rows built from meta and state, cold, warm, and aft
   try {
     const E = ID(), U1 = ID(), U2 = ID(), L = ID(), S = ID(), X = ID(), N = ID(), D = ID();
     writeMeta(f, E, sessionOf(E, { contextSources: [], runtime: { id: "rt-e", location: "local", transport: "pty" } } as Partial<Session>));
-    writeStatus(f, E, exitedState(3, { exitCode: 0, capabilities: { transcript: 1 }, attention: { ...initialAttention(now(), false), lastMessage: "m".repeat(400) } }));
+    const savedAttention = { ...initialAttention(now(), false), lastMessage: "m".repeat(400) };
+    writeStatus(f, E, exitedState(3, { exitCode: 0, capabilities: { transcript: 1 }, attention: savedAttention }));
     writeMeta(f, U1, sessionOf(U1, { status: "running" }));
     writeStatus(f, U1, { status: "running", seq: 2, screen: "", attention: initialAttention(now(), false) });
     writeMeta(f, U2, sessionOf(U2, { status: "running" }));
@@ -157,11 +169,21 @@ test("listing rows equal the rows built from meta and state, cold, warm, and aft
     mock.timers.setTime(Date.now() + 60_000);
     const later = await manager.list();
     assertRows(later, await oracle(manager), "after the clock moves on");
-    const exitedAt = (rows: typeof later) => rows.find(row => row.id === E)!.attention.lastActivityAt;
-    assert.notEqual(exitedAt(later), exitedAt(cold), "the exited row's lastActivityAt is the call time");
+    // A row without a worker carries recorded times, never the time of the call: nothing changed, so nothing differs.
+    assert.equal(JSON.stringify(later), JSON.stringify(cold), "a minute later the listing is byte-identical");
+    const row = (id: string) => later.find(listed => listed.id === id)!.attention;
+    assert.equal(row(E).lastActivityAt, savedAttention.lastActivityAt, "the exited row keeps its saved lastActivityAt");
+    const savedAt = new Date(statSync(join(recordDir(f, U1), "status.sealed")).mtimeMs).toISOString();
+    assert.deepEqual([row(U1).state, row(U1).since], ["unavailable", savedAt], "a worker gone without recording its exit is unavailable since its status was saved");
+    assert.deepEqual([row(U2).state, row(U2).since], ["unavailable", "2026-11-14T00:00:00.000Z"], "without a saved status, since its creation");
+    // Kept on purpose, pending the owner's decision: state() dates a worker that does not answer at the call. A
+    // mission's stall check reads lastActivityAt from it, and a worker does not save its status on every activity.
+    for (const id of [E, U1, U2]) assert.equal((await manager.state(id)).attention.lastActivityAt, new Date().toISOString(), `state() dates ${id === E ? "an exited" : "an unavailable"} row at the call`);
 
     const restarted = new Manager(f.config, f.key);
-    assertRows(await restarted.list(), await oracle(restarted), "after a restart");
+    const afterRestart = await restarted.list();
+    assertRows(afterRestart, await oracle(restarted), "after a restart");
+    assert.equal(JSON.stringify(afterRestart), JSON.stringify(cold), "after a restart the listing is byte-identical");
   } finally {
     mock.timers.reset();
     for (const worker of workers) await worker.close();

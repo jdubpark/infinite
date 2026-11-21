@@ -51,7 +51,11 @@ export class TeamReviewFeedback {
   private next?: { watch: boolean; done: Promise<void> };
   private stopTick?: () => void;
   private closed = false;
-  /** Ends a read in flight at close; after close, nothing is saved or steered (checked after every wait). */
+  /**
+   * Ends a read in flight at close. After close the poller makes none of its own saves and submits no steer (checked
+   * after every wait). A steer it already submitted to the team queue still completes; its receipt lets the next start
+   * acknowledge the intent without reading GitHub.
+   */
   private readonly abort = new AbortController();
   constructor(private readonly host: ReviewFeedbackHost) {}
 
@@ -79,7 +83,7 @@ export class TeamReviewFeedback {
     this.stopTick = onTick?.(() => { if (this.host.now() - this.lastPoll >= settings.pollMs) void this.poll(); });
     return this.pass(false);
   }
-  /** Stops the timer and the read in flight. Resolves once the current pass has ended. */
+  /** Stops the timer and the read in flight. Resolves once the current pass has ended, at most READ_SETTLE_MS after a stopped read. */
   close() { this.closed = true; this.stopTick?.(); this.abort.abort(); return this.settled(); }
   /** Resolves when no pass is running or waiting. */
   settled(): Promise<void> { return this.next?.done ?? this.running ?? Promise.resolve(); }

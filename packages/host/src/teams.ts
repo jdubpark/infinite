@@ -1888,7 +1888,7 @@ export class TeamService {
     this.timer = setInterval(tick, 500); this.timer.unref(); tick();
     void this.reviewFeedback.start(listener => this.options?.source?.onTick?.(listener) ?? (() => {}));
   }
-  /** Resolves once the review-feedback pass that was running has ended; everything else stops at once. */
+  /** Resolves once the review poller's pass has ended (its own saves are fenced; a steer it already queued still completes). Everything else stops at once. */
   close(): Promise<void> { const reviewFeedback = this.reviewFeedback.close(); this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const timer of this.sampleTimers) clearTimeout(timer); this.sampleTimers.clear(); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); for (const controller of this.memberWorkSaveControllers.values()) controller.abort(); for (const controller of this.agentControllers.values()) controller.abort(); this.objectiveTests.close(); this.removeAgentSource?.(); return reviewFeedback; }
   /** Settles once work queued before now has finished, so a caller can stop sessions it may still launch. */
   async idle() {

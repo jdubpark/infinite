@@ -103,6 +103,14 @@ function unanswered(error: unknown): boolean {
   return (error as { name?: unknown } | null)?.name === "TimeoutError";
 }
 
+/**
+ * A request that got no answer because the connection failed. Fetch reports every network failure as a TypeError;
+ * an answer that refuses the request is another error.
+ */
+function dropped(error: unknown): boolean {
+  return error instanceof TypeError;
+}
+
 const stringOption = (options: Options, name: string) => {
   const value = options[name];
   return typeof value === "string" ? value : undefined;
@@ -323,6 +331,7 @@ export async function handlePermissionsClientCommand(positional: string[], optio
     if (!status.readiness) throw new Error("This host does not support permission replays. Upgrade the host.");
     console.error(`[Infinite] Replaying ${parsed.data.cases.length} cases · request ${requestId}`);
     // A busy host can answer late while it works. A start under the same request ID returns the job it started, so both are asked again.
+    // A poll is a read of a job the host answered for a moment before, so it is also asked again when the connection drops.
     let answered = Date.now();
     const ask = async <T>(path: string, body?: unknown): Promise<T> => {
       for (;;) {
@@ -331,7 +340,7 @@ export async function handlePermissionsClientCommand(positional: string[], optio
           answered = Date.now();
           return answer;
         } catch (error) {
-          if (!unanswered(error)) throw error;
+          if (!unanswered(error) && !(body === undefined && dropped(error))) throw error;
           if (Date.now() - answered >= REPLAY_CONTACT_MS)
             throw new Error(`The host did not answer for ${REPLAY_CONTACT_MS / 60_000} minutes. The replay may still run: run this command again with --request-id ${requestId} to follow it. If the host restarted meanwhile, that starts the replay again.`);
           await delay(REPLAY_POLL_MS);

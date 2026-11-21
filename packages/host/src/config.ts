@@ -93,6 +93,7 @@ const schema = z
     hostLoad: z.object({ minAvailableMemoryGiB: z.number().min(0).max(4096), maxLoadPerCpu: z.number().positive().max(64) }).strict().optional(),
     intake: intakeConfigSchema.optional(),
     mcp: mcpConfigSchema.optional(),
+    codeMode: z.object({ claude: z.enum(["off", "headless", "all"]) }).strict().optional(),
     teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional(), outcomes: outcomeSettingsSchema.optional(), blackboard: z.object({ tools: z.boolean().optional() }).strict().optional(), memberTraces: memberTraceSettingsSchema.optional() }).strict().optional(),
     machine: z.object({ id: z.uuid(), label: machineLabelSchema }).strict().optional(),
     // The permission agent's tiers, the miss-rate threshold and this host's release commands.

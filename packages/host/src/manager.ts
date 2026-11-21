@@ -24,6 +24,7 @@ import { socketPath, workerCall } from "./ipc.js";
 import { SealedFileCache, listedSavedState, listedSession, savedState, unavailableState, type ListedSession, type SavedStatus } from "./session-listing.js";
 import { assertRunnerDeployment } from "./deployment.js";
 import { DEFAULT_HOOKS } from "./config.js";
+import { codeModeEnabled } from "./code-mode.js";
 import { HostLoadGate, LaunchHeldError, readHostLoad, type HostLoadProbe } from "./host-load.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
 import { validateNativeOpenCodeArgs } from "./native-opencode.js";
@@ -33,7 +34,7 @@ import type { FuseGate } from "./fuse/types.js";
 import { haltReason } from "./halt/rules.js";
 import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotRejectOption, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
-import { missionCoordinatorLaunch, permissionCoordinatorLaunch, sessionAgentProfile, teamModelLaunch, withoutSharedContext } from "./launch.js";
+import { headlessLaunch, missionCoordinatorLaunch, permissionCoordinatorLaunch, sessionAgentProfile, teamModelLaunch, withoutSharedContext } from "./launch.js";
 import { withNativeContinuation } from "./native-continuation.js";
 import { SESSION_PERMISSION_ACTOR_LABEL, isRequesterNotice, sessionPermissionRequestId, type SessionPermissionAnswer } from "./permission-session-requests.js";
 import { deferredCallOpen, type HeadlessPermissionChannel } from "./permission-headless.js";
@@ -77,6 +78,7 @@ export interface CreateSession {
   resumeNativeSession?: { id: string; source: "hook" | "protocol" };
   continuation?: NativeContinuation;
 }
+type ManagedCreateSession = CreateSession & { recordedCodeMode?: true };
 interface StoredSession {
   session: Session;
   fingerprint: string;
@@ -980,8 +982,8 @@ export class Manager {
     if (session.workspace) throw new ContentError("Recover this hybrid workspace with the laptop CLI before starting a new runtime");
     const args = session.provider === "claude" ? ["--resume", native.id]
       : session.provider === "codex" ? ["resume", native.id] : ["--session", native.id];
-    const request: CreateSession = { requestId, provider: session.provider, projectId: session.projectId,
-      title: session.title, prompt: "", nativeArgs: args, resumedFrom: sessionId, resumeNativeSession: native };
+    const request: ManagedCreateSession = { requestId, provider: session.provider, projectId: session.projectId,
+      title: session.title, prompt: "", nativeArgs: args, resumedFrom: sessionId, resumeNativeSession: native, ...(session.codeMode === true ? { recordedCodeMode: true as const } : {}) };
     if (project) {
       const cwd = relative(realpathSync(project.path), session.cwd);
       if (cwd) request.cwd = cwd;
@@ -1015,7 +1017,7 @@ export class Manager {
    * Creates the session, or returns the one its request already made. A team launch that fails before its session
    * record exists gives its fuse launch back: the count stays, and a retry with the same id is not counted twice.
    */
-  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, github?: SessionGithubOrigin, haltScope?: readonly string[]) {
+  private async createOnce(request: ManagedCreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, github?: SessionGithubOrigin, haltScope?: readonly string[]) {
     try { return await this.createRecorded(request, workspaceTrusted, github, haltScope); }
     catch (error) {
       // A started launch stays started, and a failing fuse never hides the launch error.
@@ -1024,7 +1026,7 @@ export class Manager {
     }
   }
   /** `github` says who decided the session's GitHub grant; see SessionGithubOrigin. `haltScope` is every project the work covers. */
-  private async createRecorded(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, github?: SessionGithubOrigin, haltScope?: readonly string[]) {
+  private async createRecorded(request: ManagedCreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, github?: SessionGithubOrigin, haltScope?: readonly string[]) {
     if (!request.resumedFrom && request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
     if (request.workspace && (request.provider !== "codex" || !request.localUi))
       throw new Error("Laptop execution requires the Codex native interface");
@@ -1142,6 +1144,16 @@ export class Manager {
     // Recorded with the session: a headless launch, whether the permission channel serves it, and why not.
     const headless = this.headlessChannel?.admit({ provider: request.provider, profile: launchProfile, session, hooks: request.nativeArgs === undefined && !request.localUi });
     if (headless) session.headless = headless.record;
+    const coordinator = request.team?.role === "permission-coordinator" || request.team?.role === "mission-coordinator";
+    const facts = { headless: headlessLaunch(request.provider, launchProfile).headless, served: session.headless?.channel === true, excluded: coordinator };
+    // Learning runs keep a stable member identity and must not mix Code Mode into replay evidence.
+    // A resume keeps its source's choice. A source that recorded none did not ask for Code Mode, and its resume request
+    // is the one an earlier host built, so a resume that host had started still matches its fingerprint.
+    const recorded = request.recordedCodeMode ?? (request.resumedFrom === undefined ? undefined : false);
+    session.codeMode = codeModeEnabled(this.config.codeMode?.claude, request.provider, facts, recorded, request.purpose);
+    // The record says the host asked. Claude Code refuses to resume a Code Mode conversation with Code Mode off.
+    if (request.recordedCodeMode && !session.codeMode)
+      throw new ContentError("The host asked for Code Mode when this conversation started. Claude Code resumes a Code Mode conversation only with Code Mode on, and a headless resume on this host cannot ask for it. Start a new session instead of resuming it.", 409);
     // Keep the native prompt exact. Only opted-in, qualified sessions receive the
     // separate handoff MCP capability; the context snapshot stays in the record.
     const prompt = request.nativeArgs !== undefined ? "" : [
@@ -1186,6 +1198,7 @@ export class Manager {
         runDir: this.config.runDir,
         key: this.key.toString("base64"),
         prompt,
+        codeMode: session.codeMode === true,
         ...(request.workspace ? { executorTokenHash: createHash("sha256").update(request.workspace.token).digest("hex") } : {}),
         ...(headless?.bootstrap ? { permissionChannel: headless.bootstrap } : {}),
         ...(githubGrant ? { github: githubGrant } : {}), ...(codexTraceRoot ? { codexTraceRoot } : {}),

@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { claimControl, startHost, waitFor } from "./helpers.js";
 
@@ -96,6 +96,112 @@ setInterval(() => {}, 1000);
       ["-mgrok-code-fast-1", "Do work"],
       ["-pDescribe the problem"],
     ]);
+  } finally {
+    await host.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("owner resume keeps the native conversation's recorded Code Mode after config changes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-code-mode-resume-"));
+  const launchLog = join(root, "launches.jsonl");
+  const fixture = join(root, "agent.mjs");
+  const nativeIds = [randomUUID(), randomUUID(), randomUUID()];
+  writeFileSync(fixture, `
+import { appendFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+const resume = args.indexOf('--resume');
+const prompt = args.find(value => value.startsWith('native:'));
+const nativeId = resume >= 0 ? args[resume + 1] : prompt?.slice('native:'.length);
+appendFileSync(${JSON.stringify(launchLog)}, JSON.stringify({ mode: process.env.CLAUDE_CODE_EXPERIMENTAL_CODE_MODE, nativeId }) + '\\n');
+if (process.env.INFINITE_HOOK_URL) await fetch(process.env.INFINITE_HOOK_URL + '/claude', {
+  method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + process.env.INFINITE_HOOK_TOKEN },
+  body: JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: nativeId, prompt: 'Resume fixture' })
+});
+setInterval(() => {}, 1000);
+`);
+  const host = await startHost({ agents: { claude: { command: process.execPath, args: [fixture] } }, config: { codeMode: { claude: "all" } } });
+  const readLaunches = () => readFileSync(launchLog, "utf8").trim().split("\n").map(line => JSON.parse(line) as { mode?: string; nativeId: string });
+  const start = async (nativeId: string) => {
+    const id = randomUUID();
+    const created = await host.fetchApi("/sessions", "owner", { requestId: id, projectId: "rehearsal", provider: "claude", title: "Code Mode", prompt: `native:${nativeId}` });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    assert.equal(Object.hasOwn(created.body, "codeMode"), false, "creation responses keep the host choice internal");
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), response => response.body.nativeSession?.id === nativeId);
+    return id;
+  };
+  const stop = async (id: string) => {
+    const control = await claimControl(host, id, "owner");
+    await host.fetchApi(`/sessions/${id}/stop`, "owner", { requestId: randomUUID() }, control.headers);
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), response => response.body.status === "exited");
+  };
+  const setModeAndRestartApi = async (claude: "off" | "all") => {
+    host.config.codeMode = { claude };
+    writeFileSync(join(host.root, "config.json"), JSON.stringify(host.config));
+    await host.stopApi();
+    await host.start();
+  };
+  try {
+    const enabled = await start(nativeIds[0]!);
+    assert.equal(Object.hasOwn((await host.fetchApi(`/sessions/${enabled}`)).body, "codeMode"), false);
+    const listed = await host.fetchApi("/sessions");
+    const sessionRows = (listed.body as { sessions: Record<string, unknown>[] }).sessions;
+    assert.equal(Object.hasOwn(sessionRows.find(row => row.id === enabled)!, "codeMode"), false, "listing rows keep the host choice internal");
+    await stop(enabled);
+    await setModeAndRestartApi("off");
+    const enabledResume = await host.fetchApi(`/sessions/${enabled}/resume`, "owner", { requestId: randomUUID() });
+    assert.equal(enabledResume.status, 200, JSON.stringify(enabledResume.body));
+    assert.equal(Object.hasOwn(enabledResume.body, "codeMode"), false, "resume responses keep the host choice internal");
+    await waitFor(() => readLaunches(), launches => launches.length === 2);
+    assert.equal(readLaunches()[1]!.mode, "1");
+
+    const disabled = await start(nativeIds[1]!);
+    assert.equal(Object.hasOwn((await host.fetchApi(`/sessions/${disabled}`)).body, "codeMode"), false);
+    await stop(disabled);
+    await setModeAndRestartApi("all");
+    const disabledResume = await host.fetchApi(`/sessions/${disabled}/resume`, "owner", { requestId: randomUUID() });
+    assert.equal(disabledResume.status, 200, JSON.stringify(disabledResume.body));
+    await waitFor(() => readLaunches(), launches => launches.length === 4);
+    assert.equal(Object.hasOwn(readLaunches()[3]!, "mode"), false);
+
+    // A plain conversation's resume request is the one the host built before the switch existed. So a resume that an
+    // earlier host had started, with the record written and the receipt not yet, is found again by its fingerprint.
+    const key = readFileSync(host.config.keyFile);
+    const record = (id: string) => unseal<{ session: Record<string, any>; fingerprint: string }>(key, `${id}:meta`,
+      readFileSync(join(host.config.stateDir, "sessions", id, "meta.sealed"), "utf8"));
+    const plain = disabledResume.body.id as string;
+    const earlierRequest = { requestId: plain, provider: "claude", projectId: "rehearsal", title: "Code Mode", prompt: "",
+      nativeArgs: ["--resume", nativeIds[1]], resumedFrom: disabled, resumeNativeSession: record(plain).session.resumeNativeSession };
+    assert.equal(record(plain).fingerprint, createHash("sha256").update(JSON.stringify(earlierRequest)).digest("hex"));
+    assert.equal(record(plain).session.codeMode, false);
+    rmSync(join(host.config.stateDir, "resumptions", `${plain}.sealed`));
+    const retried = await host.fetchApi(`/sessions/${disabled}/resume`, "owner", { requestId: plain });
+    assert.equal(retried.status, 200, JSON.stringify(retried.body));
+    assert.equal(retried.body.id, plain);
+    assert.equal(readLaunches().length, 4, "the retry starts nothing");
+
+    // Claude Code resumes a Code Mode conversation only with Code Mode on. A headless run takes the request only from
+    // its --settings argument, and an owner resume has no permission channel to carry one. So the host refuses the
+    // resume through a headless profile, and starts and records nothing.
+    const recorded = await start(nativeIds[2]!);
+    assert.equal(readLaunches()[4]!.mode, "1");
+    await stop(recorded);
+    host.config.agents = { claude: { command: process.execPath, args: [fixture, "-p"] } };
+    await setModeAndRestartApi("all");
+    const resumeId = randomUUID();
+    const headlessResume = await host.fetchApi(`/sessions/${recorded}/resume`, "owner", { requestId: resumeId });
+    assert.equal(headlessResume.status, 409, JSON.stringify(headlessResume.body));
+    assert.match(headlessResume.body.error, /asked for Code Mode.*Start a new session/);
+    assert.equal(existsSync(join(host.config.stateDir, "sessions", resumeId)), false, "the refusal leaves no successor record");
+    assert.equal(existsSync(join(host.config.stateDir, "resumptions", `${resumeId}.sealed`)), false, "the refusal leaves no receipt");
+    // Nothing was kept, so the same request resumes the conversation once the profile is interactive again, and the
+    // launch after the fifth is that resume, in Code Mode, whatever the setting says by then.
+    host.config.agents = { claude: { command: process.execPath, args: [fixture] } };
+    await setModeAndRestartApi("off");
+    const interactiveResume = await host.fetchApi(`/sessions/${recorded}/resume`, "owner", { requestId: resumeId });
+    assert.equal(interactiveResume.status, 200, JSON.stringify(interactiveResume.body));
+    await waitFor(() => readLaunches(), launches => launches.length === 6);
+    assert.deepEqual(readLaunches()[5], { mode: "1", nativeId: nativeIds[2] });
   } finally {
     await host.stop();
     rmSync(root, { recursive: true, force: true });

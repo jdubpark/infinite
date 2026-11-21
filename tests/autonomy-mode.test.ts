@@ -71,15 +71,24 @@ test("parsing the host configuration adds no key to a digested block", () => {
     const write = (name: string, value: unknown) => { const file = join(root, name); writeFileSync(file, JSON.stringify(value)); return file; };
     const plain = readConfig(write("plain.json", hostConfig(root))).config;
     const explicit = readConfig(write("explicit.json", hostConfig(root, { autonomy: { defaultMode: "supervised" } }))).config;
+    const codeModeOff = readConfig(write("code-mode-off.json", hostConfig(root, { codeMode: { claude: "off" } }))).config;
+    const codeModeHeadless = readConfig(write("code-mode-headless.json", hostConfig(root, { codeMode: { claude: "headless" } }))).config;
+    const codeModeAll = readConfig(write("code-mode-all.json", hostConfig(root, { codeMode: { claude: "all" } }))).config;
     const digested = (config: Config) => JSON.stringify({ teams: config.teams, source: config.source, linear: config.linear, agents: config.agents, team: config.projects[0]!.team });
     // Frozen from today's parse: schema defaults (publishHeads, mergeMethod, maxDecisions) are part of the digest and stay unchanged.
     const frozen = '{"teams":{"workspaceDir":"ROOT/teams","commandPrefix":{"command":"safe","args":[]},"lineup":{"coordinator":{"id":"coord","label":"Coordinator","provider":"claude","model":"model","effort":"high","tier":"strong"},"integrator":{"id":"integrator","label":"Integrator","provider":"claude","model":"model","effort":"high","tier":"strong"},"reviewer":{"id":"reviewer","label":"Reviewer","provider":"claude","model":"model","effort":"high","tier":"strong"},"implementers":[{"id":"haiku","label":"Haiku","provider":"claude","model":"claude-haiku-5-5","effort":"low","tier":"light"}],"escalations":[{"id":"sonnet","label":"Sonnet","provider":"claude","model":"claude-sonnet-5-5","effort":"high","tier":"strong"}]},"publishHeads":true},"source":{"mirrorDir":"ROOT/mirrors"},"linear":{"apiKeyFile":"ROOT/linear-key"},"agents":{"claude":{"command":"claude","args":[]},"codex":{"command":"codex","args":[]}},"team":{"checks":[{"command":"node","args":["check.js"]}],"delivery":{"mode":"merge","repository":"example/demo","baseBranch":"main","mergeMethod":"squash"},"permissions":{"mode":"coordinator","scope":"Routine approvals","maxDecisions":25}}}'.replaceAll("ROOT", root);
     assert.equal(digested(plain), frozen);
     assert.equal(digested(explicit), digested(plain));
     assert.equal(Object.hasOwn(plain, "autonomy"), false);
+    assert.equal(plain.codeMode, undefined);
+    assert.deepEqual(codeModeOff.codeMode, { claude: "off" });
+    assert.deepEqual(codeModeHeadless.codeMode, { claude: "headless" });
+    assert.deepEqual(codeModeAll.codeMode, { claude: "all" });
     assert.deepEqual(explicit.autonomy, { defaultMode: "supervised" });
     assert.throws(() => readConfig(write("auto.json", hostConfig(root, { autonomy: { defaultMode: "auto" } }))));
     assert.throws(() => readConfig(write("mode-key.json", hostConfig(root, { autonomy: { mode: "supervised" } }))));
+    assert.throws(() => readConfig(write("code-mode-invalid.json", hostConfig(root, { codeMode: { claude: "sometimes" } }))));
+    assert.throws(() => readConfig(write("code-mode-provider.json", hostConfig(root, { codeMode: { codex: "all" } }))));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -116,6 +125,15 @@ test("the routine authority digest is the same before and after modes exist", as
       assert.equal(sealed.routine.status, "scheduled");
       assert.equal(sealed.routine.reason, undefined);
       assert.equal(sealed.authority, expected);
+    }
+    for (const value of [undefined, { claude: "off" }, { claude: "all" }] as const) {
+      if (value === undefined) delete (config as Config).codeMode;
+      else (config as Config).codeMode = value;
+      assert.equal(frozenAuthority(config, project), expected);
+      const restarted = new RoutineService({ ...config, stateDir }, key, {} as never, hooks);
+      await restarted.tick();
+      restarted.close();
+      assert.equal(sealedAuthority(routine.id).authority, expected);
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

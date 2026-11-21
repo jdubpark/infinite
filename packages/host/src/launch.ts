@@ -6,6 +6,7 @@ import { TeamError } from "./team-workspace.js";
 import { codexTrustArgs } from "./workspace-trust.js";
 import { sudoShape } from "./sudo-profile.js";
 import { EGRESS_ENVIRONMENT_NAMES } from "./egress.js";
+import { CLAUDE_CODE_MODE_ENV } from "./code-mode.js";
 
 /** eval.member.agents[provider] for a learning purpose, else config.agents[provider]. Throws TeamError 409 "eval-identity-missing" for a learning purpose without an eval profile for the provider. */
 export function sessionAgentProfile(config: Pick<Config, "agents" | "eval">, provider: Provider, purpose: SessionPurpose | undefined): AgentProfile | undefined {
@@ -229,7 +230,7 @@ export const PERMISSION_REQUEST_TIMEOUT_S = 360;
  * interpreter by absolute path. The channel hooks are separate commands from the signal relay, whose reply never
  * becomes a provider decision.
  */
-export function headlessChannelArgs(relayPath: string, signalHooks: boolean): string[] {
+export function headlessChannelArgs(relayPath: string, signalHooks: boolean, codeMode = false): string[] {
   const development = relayPath.endsWith(".ts");
   const run = (script: string, route: string) =>
     [process.execPath, ...(development ? ["--import", import.meta.resolve("tsx")] : []), script, route].join(" ");
@@ -245,7 +246,9 @@ export function headlessChannelArgs(relayPath: string, signalHooks: boolean): st
     const handlers = [...(relayed ? [signal] : []), ...(event === "PreToolUse" ? [check] : event === "PermissionRequest" ? [decide] : [])];
     if (handlers.length) hooks[event] = [{ hooks: handlers }];
   }
-  return ["--setting-sources", "", "--settings", JSON.stringify({ disableAllHooks: false, hooks })];
+  return ["--setting-sources", "", "--settings", JSON.stringify({ disableAllHooks: false, hooks,
+    ...(codeMode ? { env: { [CLAUDE_CODE_MODE_ENV]: "1" } } : {}),
+  })];
 }
 
 /** What the host can tell about a launch from the arguments it passes the provider. */
@@ -343,6 +346,7 @@ export function buildLaunch(
   /** The host admitted this headless Claude session to the permission channel. */
   channel = false,
   egressConfigured = false,
+  codeMode = false,
 ): AgentProfile {
   const args = [...profile.args];
   const hostEgressEnvVars = egressConfigured ? EGRESS_ENVIRONMENT_NAMES : [];
@@ -417,7 +421,7 @@ export function buildLaunch(
   }
   // A served headless session: the permission channel's hooks and the signal hooks in one settings layer, with no
   // user, project or local settings loaded, so no settings file can switch them off or answer before them.
-  if (hooks && provider === "claude" && channel) args.push(...headlessChannelArgs(relayPath, enabled.claude));
+  if (hooks && provider === "claude" && channel) args.push(...headlessChannelArgs(relayPath, enabled.claude, codeMode));
   // Every other Claude team launch (member, mission coordinator, permission coordinator) loads the agent account's own
   // settings and no project or local file. A Codex member can commit `.claude/settings.json` or `.mcp.json`; Claude Code
   // runs their hooks and MCP server commands in any folder and applies their allow rules in a trusted one, so a later

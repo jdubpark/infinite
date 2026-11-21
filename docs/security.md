@@ -46,6 +46,61 @@ rejects unmet permissions instead of providing an interactive approval flow. Pro
 configured contributor use without changing provider terms or retention. See
 [Goals and agent teams](teams.md) for scope, routing, limits, and recovery.
 
+### Claude Code Mode
+
+Claude Code has an experimental Code Mode: the model writes one program that
+calls several tools, where it would otherwise call them one at a time. The host
+asks for it when it starts a new session and the top-level `codeMode.claude`
+setting says so:
+
+- `off`, the default, also when the key is absent: no new session asks for it.
+- `headless`: served headless Claude sessions ask for it.
+- `all`: interactive Claude sessions do too, the owner's and team members'.
+
+The host only asks. It does not check that Claude Code turned Code Mode on. A
+profile whose tool list leaves out the program tool, a restricted launch, an
+older model, or a custom API endpoint starts without it, and the host's record
+still says that it asked.
+
+Some launches never ask. A permission coordinator and a mission coordinator
+run with tool lists that leave out the program tool. Permission-reviewer turns,
+headless launches that the permission channel does not serve, evaluation and
+learning sessions, other providers, and launches outside the host's worker stay
+as they are. A headless run takes the request only from the `env` key of its
+`--settings` argument, and the host puts the request there only for served
+headless launches.
+
+In a served session each tool call inside a program raises its own hooks, so
+the permission channel still decides each call.
+
+A session records whether the host asked for Code Mode. Resuming the same
+conversation asks again when the record says so, whatever the setting says by
+then, and does not ask when the record says no or the session is older than
+this setting. The record is not part of any API response.
+
+Claude Code resumes a Code Mode conversation only with Code Mode on. An owner
+resume has no permission channel, so through a headless profile it cannot ask
+for Code Mode. The host refuses that resume with a reason and starts nothing. It
+goes by its record: it refuses when the record says the host asked, also where
+an incompatible profile kept Code Mode from starting. A conversation whose
+record says no, or that has no record, resumes as before.
+
+Before setting `all`:
+
+- Claude Code asks for a confirmation once per operating-system account. The
+  host does not answer it, and this setting does not accept it in advance.
+  Accept it once in a terminal on the account that runs the agents. Until then
+  every interactive launch that asks for Code Mode stops at the confirmation.
+- The behaviour described here was measured against Claude Code 2.1.330. The
+  host does not check the installed version.
+- A Code Mode session cannot use Remote Control, Claude in Chrome, or computer
+  use.
+- Where agents start through `sudo`, an interactive launch carries the request
+  in the environment variable `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE`, which
+  reaches Claude Code only if the sudoers `env_keep` list names it. Served
+  headless launches carry it in their `--settings` argument and need no sudoers
+  entry.
+
 On the Ubuntu host, provider wrappers can load owner-managed environment files
 for host-wide credentials, Android tooling, and a selected project. Values are
 exported literally and never passed through `eval`, so file contents cannot

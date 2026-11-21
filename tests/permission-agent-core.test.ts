@@ -328,9 +328,9 @@ test("code environment assignments raise for strong review only where the shell 
     for (const command of [`${name}=ok true`, `env ${name}=ok true`])
       assert.ok(readShell(command).opaqueReasons.includes("code-environment") && raised(command).includes("raise:opaque"), command);
   }
-  const envTerminator = "env -- NODE_OPTIONS=--no-warnings true";
+  const envTerminator = "env -- NODE_OPTIONS=--require=./setup.cjs true";
   assert.ok(readShell(envTerminator).opaqueReasons.includes("code-environment") && raised(envTerminator).includes("raise:opaque"));
-  const wrapperBody = "NODE_OPTIONS=--no-warnings watch 'true'";
+  const wrapperBody = "NODE_OPTIONS=--require=./setup.cjs watch 'true'";
   assert.ok(readShell(wrapperBody).opaqueReasons.includes("code-environment") && raised(wrapperBody).includes("raise:opaque"));
 
   for (const command of [
@@ -382,6 +382,58 @@ test("declaration builtins read code environment assignments with the same exemp
   assert.ok(readShell("export GIT_SSH_COMMAND=x && git fetch").opaqueReasons.includes("code-environment"));
 });
 
+test("append environment assignments use the same rules at every assignment boundary", () => {
+  for (const prefix of ["", "env ", "env -- ", "export ", "declare -x ", "typeset -x ", "readonly "]) {
+    const suffix = ["", "env ", "env -- "].includes(prefix) ? " node app.js" : "; npm test";
+    for (const assignment of ["NODE_OPTIONS+=--require=./setup.cjs", "GIT_SSH_COMMAND+=x", "PYTHONPATH+=../lib"]) {
+      const command = `${prefix}${assignment}${suffix}`;
+      assert.ok(readShell(command).opaqueReasons.includes("code-environment"), command);
+      assert.ok(raise(bash(command), { rejectHistory: false }).includes("raise:opaque"), command);
+    }
+    for (const assignment of ["CI+=1", "GIT_PAGER+=cat", "PYTHONPATH+=src", "NODE_OPTIONS+=--no-warnings"])
+      assert.deepEqual(raise(bash(`${prefix}${assignment}${suffix}`), { rejectHistory: false }), [], `${prefix}${assignment}`);
+  }
+});
+
+test("wrapper environment options preserve code environment checks", () => {
+  for (const prefix of ["strace -E ", "strace -E", "strace --env ", "strace --env=", "run0 --setenv ", "run0 --setenv="]) {
+    for (const assignment of ["NODE_OPTIONS=--require=./setup.cjs", "NODE_OPTIONS+=--import=./setup.mjs", "GIT_SSH_COMMAND=x"]) {
+      const command = `${prefix}${assignment} node app.js`;
+      assert.ok(readShell(command).opaqueReasons.includes("code-environment"), command);
+      assert.ok(raise(bash(command), { rejectHistory: false }).includes("raise:opaque"), command);
+    }
+    for (const assignment of ["CI=1", "NODE_OPTIONS=--no-warnings", "NODE_OPTIONS+=--max-old-space-size=4096", "GIT_PAGER=cat"]) {
+      const command = `${prefix}${assignment} node app.js`;
+      assert.deepEqual(readShell(command).opaqueReasons, [], command);
+      assert.ok(!raise(bash(command), { rejectHistory: false }).includes("raise:opaque"), command);
+    }
+  }
+  assert.deepEqual(raise(bash("strace -E NODE_OPTIONS node app.js"), { rejectHistory: false }), []);
+});
+
+test("NODE_OPTIONS exempts only complete lists of inert runtime options", () => {
+  const inert = [
+    "--max-old-space-size=4096", "--max-semi-space-size=64", "--stack-trace-limit=20", "--enable-source-maps", "--no-warnings",
+    "--trace-warnings", "--no-deprecation", "--trace-deprecation", "--unhandled-rejections=strict", "--unhandled-rejections=throw",
+    "--unhandled-rejections=warn", "--unhandled-rejections=warn-with-error-code", "--unhandled-rejections=none",
+    "--dns-result-order=verbatim", "--dns-result-order=ipv4first", "--dns-result-order=ipv6first", "--experimental-vm-modules", "--expose-gc",
+  ];
+  for (const value of ["", ...inert, inert.join(" "), "  --no-warnings\t--enable-source-maps  "])
+    for (const quote of ["'", '\"']) {
+      const command = `NODE_OPTIONS=${quote}${value}${quote} npm test`;
+      assert.deepEqual(raise(bash(command), { rejectHistory: false }), [], command);
+    }
+  assert.deepEqual(raise(bash("NODE_OPTIONS=--max-old-space-size=4096 npm test"), { rejectHistory: false }), []);
+  for (const value of ["--require=./setup.cjs", "-r ./setup.cjs", "--import=./setup.mjs", "--loader=./loader.mjs",
+    "--env-file=./settings", "--inspect", "--unknown", "--max-old-space-size=x", "--no-warnings=1", "--dns-result-order=unknown"]) {
+    for (const options of [value, `--no-warnings ${value}`, `${value} --no-warnings`]) {
+      const command = `NODE_OPTIONS='${options}' npm test`;
+      assert.ok(readShell(command).opaqueReasons.includes("code-environment"), command);
+      assert.ok(raise(bash(command), { rejectHistory: false }).includes("raise:opaque"), command);
+    }
+  }
+});
+
 test("code carrying loader values are recognized while ordinary file and module values stay normal", () => {
   const raised = (command: string) => raise(bash(command), { rejectHistory: false });
   for (const command of [
@@ -401,7 +453,7 @@ test("code carrying loader values are recognized while ordinary file and module 
 });
 
 test("the embedded-command search treats a code environment assignment as unread", () => {
-  const command = "unknown-wrapper NODE_OPTIONS=--no-warnings true";
+  const command = "unknown-wrapper NODE_OPTIONS=--require=./setup.cjs true";
   assert.deepEqual(readShell(command).opaqueReasons, []);
   assert.ok(raise(bash(command), { rejectHistory: false }).includes("raise:opaque"));
 });

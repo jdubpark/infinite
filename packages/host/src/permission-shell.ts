@@ -96,11 +96,26 @@ const INTERPRETERS: Record<string, Interpreter> = {
   expect: { code: "c", valued: "fbD" },
 };
 
+/** Only these complete runtime options are inert; unknown options and mixed lists still raise. */
+const INERT_NODE_OPTIONS = [
+  /^--(?:max-old-space-size|max-semi-space-size|stack-trace-limit)=\d+$/,
+  /^--(?:enable-source-maps|no-warnings|trace-warnings|no-deprecation|trace-deprecation|experimental-vm-modules|expose-gc)$/,
+  /^--unhandled-rejections=(?:throw|strict|warn|warn-with-error-code|none)$/,
+  /^--dns-result-order=(?:verbatim|ipv4first|ipv6first)$/,
+];
+/** Shared syntax for leading, wrapper, and declaration assignments, including shell append forms. */
+const ENVIRONMENT_ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)\+?=(.*)$/s;
+
 /** Environment assignments that change what code a command or interpreter can run. */
 const CODE_ENVIRONMENT_ASSIGNMENTS: ReadonlyArray<{ names: readonly string[]; raises: (value: string) => boolean }> = [
   {
+    // Node may load code through options; a list consisting only of inert runtime flags is routine.
+    names: ["NODE_OPTIONS"],
+    raises: value => value.split(/\s+/).filter(Boolean).some(option => !INERT_NODE_OPTIONS.some(pattern => pattern.test(option))),
+  },
+  {
     // Runtime code injection, shell startup, and interpreter startup hooks.
-    names: ["NODE_OPTIONS", "LD_PRELOAD", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "ENV", "PROMPT_COMMAND",
+    names: ["LD_PRELOAD", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "ENV", "PROMPT_COMMAND",
       "PERL5OPT", "RUBYOPT", "PYTHONSTARTUP"],
     raises: () => true,
   },
@@ -140,7 +155,7 @@ const CODE_ENVIRONMENT_ASSIGNMENTS: ReadonlyArray<{ names: readonly string[]; ra
 ];
 
 function isCodeEnvironmentAssignment(word: string): boolean {
-  const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word);
+  const assignment = ENVIRONMENT_ASSIGNMENT.exec(word);
   if (!assignment) return false;
   const [, name, value] = assignment;
   return CODE_ENVIRONMENT_ASSIGNMENTS.some(rule => rule.names.some(pattern => {
@@ -245,6 +260,8 @@ function shellCommandString(argv: readonly string[]): { command: boolean; index:
  */
 interface Wrapper {
   valued: ReadonlySet<string>;
+  /** Options whose values assign variables in the child environment. */
+  environment?: ReadonlySet<string>;
   chdir?: ReadonlySet<string>;
   root?: ReadonlySet<string>;
   split?: ReadonlySet<string>;
@@ -270,7 +287,7 @@ const WRAPPERS: Record<string, Wrapper> = {
   doas: { valued: options("-u", "-C"), shell: options("-s") },
   pkexec: { valued: options("--user"), alwaysShell: true },
   run0: { valued: options("-u", "--user", "-g", "--group", "-D", "--chdir", "--setenv", "--property", "--slice", "--unit", "--description", "--nice", "--machine"),
-    chdir: options("-D", "--chdir"), alwaysShell: true },
+    chdir: options("-D", "--chdir"), environment: options("--setenv"), alwaysShell: true },
   env: { valued: options("-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-P"), chdir: options("-C", "--chdir"), split: options("-S", "--split-string") },
   nohup: { valued: options() }, builtin: { valued: options() }, exec: { valued: options("-a") },
   command: { valued: options(), noCommand: options("-v", "-V") },
@@ -284,7 +301,7 @@ const WRAPPERS: Record<string, Wrapper> = {
   strace: {
     valued: options("-a", "-b", "-e", "-E", "-I", "-o", "-O", "-p", "-P", "-s", "-S", "-u", "-U", "-X", "--output", "--attach", "--user", "--env",
       "--trace", "--trace-path", "--signal", "--status", "--string-limit", "--summary-sort-by", "--columns"),
-    writes: options("-o", "--output"), noCommand: options("-p", "--attach"), attach: options("-p", "--attach"),
+    environment: options("-E", "--env"), writes: options("-o", "--output"), noCommand: options("-p", "--attach"), attach: options("-p", "--attach"),
   },
   ltrace: {
     valued: options("-a", "-A", "-D", "-e", "-F", "-l", "-n", "-o", "-p", "-s", "-u", "-w", "-x", "--output", "--library"),
@@ -368,10 +385,10 @@ function wrapperOptions(words: ReadonlyArray<{ text: string; expands: boolean }>
     if (text === "--") {
       index++;
       // GNU env still consumes assignments after its option terminator.
-      if (env) while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]?.text ?? "")) assignments.push(words[index++].text);
+      if (env) while (ENVIRONMENT_ASSIGNMENT.test(words[index]?.text ?? "")) assignments.push(words[index++].text);
       break;
     }
-    if (env && /^[A-Za-z_][A-Za-z0-9_]*=/.test(text)) { assignments.push(text); index++; continue; }
+    if (env && ENVIRONMENT_ASSIGNMENT.test(text)) { assignments.push(text); index++; continue; }
     if (env && text === "-") { index++; continue; }
     if (!text.startsWith("-") || text === "-") break;
     index++;
@@ -486,7 +503,7 @@ function build(tokens: Token[], reasons: Set<string>, directory: Directory, real
   }
   let start = 0;
   let codeEnvironment = false;
-  while (start < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[start].text)) {
+  while (start < words.length && ENVIRONMENT_ASSIGNMENT.test(words[start].text)) {
     codeEnvironment ||= isCodeEnvironmentAssignment(words[start].text);
     start++;
   }
@@ -514,6 +531,7 @@ function build(tokens: Token[], reasons: Set<string>, directory: Directory, real
     let shellBody: { text: string; expands: boolean } | undefined;
     let hasBody = false;
     for (const { option, value } of found) {
+      if (wrapper.environment?.has(option) && value) codeEnvironment ||= isCodeEnvironmentAssignment(value.text);
       if (wrapper.root?.has(option)) reasons.add("changed-root");
       if (wrapper.chdir?.has(option)) {
         // The command runs in that directory: its relative paths resolve there, or are unknown.

@@ -10,6 +10,7 @@ import { buildCapsule } from "../packages/host/src/eval-rules.js";
 import { outputSchemas } from "../packages/host/src/team-mcp-results.js";
 import { recordedTeamReportSchema, teamReportSchema, type TeamBrief, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask } from "../packages/host/src/team-types.js";
 import type { TeamRunRouting, TeamRunRoutingAuto } from "../packages/host/src/routing-types.js";
+import { ENTRY_PROFILE, ENTRY_PROVIDERS, smallRun } from "./fixtures/team-prompt-run.js";
 
 const PROMPT_LIMIT_BYTES = 80 * 1024;
 
@@ -341,8 +342,6 @@ test("a member context never carries the feature map or the eval block", () => {
 });
 
 const ENTRY_ROLES_UNDER_TEST = ["project-manager", "scout", "implementer", "integrator", "reviewer"] as const;
-const ENTRY_PROVIDERS = ["claude", "codex", "opencode"] as const;
-const ENTRY_PROFILE: TeamModelProfile = { id: "fixture-profile", label: "Fixture profile", provider: "claude", model: "fixture-model", effort: "high" };
 const CONTEXT_ACCESS_END = "even when their complete inline text is present.";
 const MEMBER_ROLES_UNDER_TEST = ["permission-coordinator", ...ENTRY_ROLES_UNDER_TEST, "delivery"] as const;
 const entryToolRoles = new Set<string>(ENTRY_ROLES_UNDER_TEST);
@@ -350,32 +349,6 @@ const entryToolRoles = new Set<string>(ENTRY_ROLES_UNDER_TEST);
 function declaredOutputFields(schema: { properties?: Record<string, unknown>; required?: string[] }) {
   const required = new Set(schema.required ?? []);
   return Object.keys(schema.properties ?? {}).map(field => `${field}${required.has(field) ? "" : "?"}`);
-}
-
-function smallRun(extra: Partial<TeamRun> = {}): TeamRun {
-  return {
-    id: "00000000-0000-4000-8000-000000000011",
-    projectId: "example-project",
-    provider: "claude",
-    title: "Entry prompt run",
-    objective: "Preserve the owner-visible contract.",
-    parallelism: 1,
-    revision: 1,
-    status: "implementing",
-    createdAt: "2026-11-01T00:00:00.000Z",
-    updatedAt: "2026-11-01T00:00:00.000Z",
-    workspace: "/home/dev/projects/example",
-    branch: "infinite/team-entry",
-    baseCommit: "a".repeat(40),
-    tasks: [],
-    members: [],
-    decisions: [],
-    checks: [],
-    steering: [],
-    events: [],
-    round: 1,
-    ...extra,
-  } as TeamRun;
 }
 
 test("the entry paragraph is the only change and only with tools on", () => {
@@ -539,8 +512,8 @@ test("a retarget swaps the entry paragraph", () => {
   assert.equal(backAgain.includes(codexSandboxInstructions), false);
   assert.equal(backAgain.includes(codexMemberToolInstructions(true)), false);
   const plain = teamPrompt(smallRun(), "implementer", undefined, undefined, "claude", ENTRY_PROFILE);
-  assert.equal(refreshReportingInstructions(plain, "codex").includes(entryInstructions("codex")), false);
-  assert.equal(refreshReportingInstructions(plain, "codex").includes(entryInstructions("claude")), false);
+  assert.equal(refreshReportingInstructions(plain, "codex", "implementer").includes(entryInstructions("codex")), false);
+  assert.equal(refreshReportingInstructions(plain, "codex", "implementer").includes(entryInstructions("claude")), false);
   const plainCodex = retargetPrompt(plain, { provider: "codex", profile: { ...ENTRY_PROFILE, provider: "codex" }, role: "implementer", entryTools: false });
   assert.ok(plainCodex);
   assert.equal(plainCodex.split(codexMemberToolInstructions(false)).length - 1, 1);

@@ -2217,7 +2217,7 @@ test("retargeting a member prompt keeps its answers, swaps reporting and profile
   const answered = (provider: TeamModelProfile["provider"], profile: TeamModelProfile) => `${teamPrompt(run, "implementer", undefined, undefined, provider, profile)}\n\nUser answered: Compact`;
   assert.equal(retargetPrompt(answered("claude", haiku), { provider: "opencode", profile: deepseek, role: "implementer", entryTools: false }), answered("opencode", deepseek));
   const oldHelper = teamPrompt(run, "implementer", undefined, undefined, "opencode", astra);
-  const refreshed = refreshReportingInstructions(oldHelper, "codex");
+  const refreshed = refreshReportingInstructions(oldHelper, "codex", "implementer");
   assert.match(refreshed, /report tool of the infinite_team MCP server/);
   assert.doesNotMatch(refreshed, /Pipe a JSON object matching the above schema to this command:/);
   assert.equal(retargetPrompt(oldHelper, { provider: "codex", profile: astra, role: "implementer", entryTools: false }), teamPrompt(run, "implementer", undefined, undefined, "codex", astra));
@@ -2225,7 +2225,7 @@ test("retargeting a member prompt keeps its answers, swaps reporting and profile
   // A Codex prompt written by an earlier release names its helper, at another release's path.
   const older = oldHelper.replace(/to this command: [^\n]+?\. The helper/, "to this command: 'node' 'dist/team-report.js'. The helper");
   assert.notEqual(older, oldHelper);
-  assert.equal(refreshReportingInstructions(`${older}\n\nUser answered: Compact`, "codex"), `${refreshed}\n\nUser answered: Compact`);
+  assert.equal(refreshReportingInstructions(`${older}\n\nUser answered: Compact`, "codex", "implementer"), `${refreshed}\n\nUser answered: Compact`);
   assert.equal(retargetPrompt(answered("claude", haiku), { provider: "codex", profile: astra, role: "implementer", entryTools: false }), answered("codex", astra));
   const oldCodex = teamPrompt(run, "implementer", undefined, undefined, "codex", astra).replace(/Codex sandbox guidance:[^\n]+\n\nWorking rule for tools:[^\n]+\n\n/, "");
   assert.match(retargetPrompt(oldCodex, { provider: "codex", profile: astra, role: "implementer", entryTools: false })!, /Codex sandbox guidance:/, "an older accumulated Codex prompt gains the current paragraph");

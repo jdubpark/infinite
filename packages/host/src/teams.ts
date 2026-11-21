@@ -2704,7 +2704,7 @@ export class TeamService {
     const provider = modelProfile?.provider ?? run.provider;
     const configuredProject = this.config.projects.find(project => project.id === run.projectId)?.team;
     const permissionRecoveryHistory = this.permissionRecoveryHistory(run);
-    let instructions = prompt === undefined ? teamPrompt(run, role, task, undefined, provider, modelProfile, configuredProject, permissionRecoveryHistory, this.publishHeadsEnabled()) : refreshReportingInstructions(prompt, provider);
+    let instructions = prompt === undefined ? teamPrompt(run, role, task, undefined, provider, modelProfile, configuredProject, permissionRecoveryHistory, this.publishHeadsEnabled()) : refreshReportingInstructions(prompt, provider, role);
     // Carried questions and recovery notes can outgrow an otherwise bounded prompt.
     // Keep them complete in the context file and rebuild the role's current authority.
     if (role !== "permission-coordinator" && Buffer.byteLength(instructions) > 80 * 1024)

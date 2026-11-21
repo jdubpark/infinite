@@ -41,6 +41,7 @@ import { outcomeBackfill } from "./outcome-backfill.js";
 import { outcomeProjector } from "./outcome-projector.js";
 import { EvalHost } from "./eval-host.js";
 import { EXCLUSION_REASONS, OUTCOMES_MODULE, outcomeModule, runOutcomeView, sweepExpiredOutcomes, type SignalRow } from "./outcome-store.js";
+import { registerVerdicts, sweepExpiredVerdicts } from "./verdict-store.js";
 import { RoutingRecorder } from "./routing-recorder.js";
 import { registerRouting, sweepExpiredDecisions } from "./routing-store.js";
 import { ownerSignal, SignalRequestError, type OwnerSignalInput } from "./outcome-signals.js";
@@ -261,6 +262,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   outbox.registerProjector(configurationProjector());
   evidence.register(outcomeModule());
   registerRouting(evidence, outbox);
+  registerVerdicts(evidence, outbox);
   // The project signal inbox. Sources record facts into it; only consumers' own scheduler passes act on them.
   const signals = new SignalService({ store: evidence });
   baseScanner = new BaseScanner({
@@ -403,6 +405,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   const sweepEvidence = () => {
     evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
     sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays);
+    sweepExpiredVerdicts(evidence, new Date().toISOString());
     sweepExpiredDecisions(evidence, new Date().toISOString());
     signals.sweep();
   };

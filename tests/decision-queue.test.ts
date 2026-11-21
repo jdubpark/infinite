@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { initialAttention, type Attention, type Prompt } from "@infinite/attention";
 import { buildDecisionQueue } from "../packages/host/src/decision-queue.js";
+import { readDecisionQueue } from "../packages/host/src/decision-queue-read.js";
+import type { Manager } from "../packages/host/src/manager.js";
 import type { MissionDecision } from "../packages/host/src/mission-types.js";
 import type { TeamDecision } from "../packages/host/src/team-types.js";
 import { promptOwner } from "../packages/host/src/notifier.js";
+import { schedulerFixture } from "./fixtures/team-scheduler.js";
+import { limitLineup } from "./team-fixture.js";
 
 type QueueInput = Parameters<typeof buildDecisionQueue>[0];
 type SessionInput = QueueInput["sessions"][number];
@@ -67,6 +71,7 @@ function team(id: string, overrides: Partial<Omit<TeamInput, "id" | "title">> = 
     status: "needs-input",
     missionId: undefined,
     goal: false,
+    held: false,
     goalCanAnswer: false,
     decisions: [],
     ...overrides,
@@ -151,6 +156,54 @@ test("shared prompt ownership checks the permission holder before the team coord
   assert.equal(promptOwner(row, { holder: () => { throw new Error("unavailable"); } }), "user");
 });
 
+test("queue classifies delegated member prompts before hiding tool input", async () => {
+  const f = schedulerFixture();
+  try {
+    const member = f.run.members[0]!;
+    f.run.status = "implementing";
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time checks.", maxDecisions: 2 };
+    f.run.lineup = limitLineup;
+    f.writeTeam();
+    const teams = f.openTeam();
+    const prompt: Prompt = {
+      id: 1, kind: "permission", source: "hook", hash: "a".repeat(64), acceptsText: false,
+      title: "Run command?", options: [{ index: 0, label: "Yes, proceed", role: "accept" }, { index: 1, label: "No", role: "reject" }],
+      tool: { name: "Bash", input: { command: "npm run check" }, inputComplete: true },
+    };
+    const row = {
+      id: member.sessionId, title: "Delegated member", projectId: "fixture", provider: "demo", cwd: member.cwd,
+      createdAt: at(1), contextVersion: 1, status: "running" as const, seq: 0, screen: "",
+      attention: attention(at(1), "needs-you", prompt),
+      team: { runId: f.run.id, memberId: member.memberId, revision: member.revision, role: member.role },
+    };
+    let includedFullMessage = false;
+    const manager = {
+      list: async (options?: { includeFullMessage?: boolean }) => {
+        includedFullMessage = options?.includeFullMessage === true;
+        return [row];
+      },
+    } as unknown as Pick<Manager, "list">;
+    const read = (service: typeof teams) => readDecisionQueue({
+      manager, cmux: undefined, permissions: { holder: () => "owner" }, teams: service,
+      goals: { decisionAnswerable: () => false }, missions: { decisionQueueCandidates: () => [] },
+    });
+
+    assert.equal(teams.promptOwner(member.sessionId, prompt), "undecided");
+    assert.deepEqual((await read(teams)).decisions, []);
+    assert.equal(includedFullMessage, true);
+
+    f.run.permissionsRevokedAt = new Date().toISOString();
+    f.writeTeam();
+    teams.close();
+    const revoked = f.openTeam();
+    assert.equal(revoked.promptOwner(member.sessionId, prompt), "user");
+    const queued = await read(revoked);
+    assert.deepEqual(queued.decisions.map(item => item.key), [`session:${member.sessionId}:1`]);
+    assert.equal(queued.decisions[0]?.kind, "session");
+    assert.deepEqual(queued.decisions[0]?.kind === "session" && queued.decisions[0].prompt.tool?.input, {});
+  } finally { f.close(); }
+});
+
 test("team decisions must be unanswered and belong to the current revision", () => {
   const queued = buildDecisionQueue({
     sessions: [],
@@ -174,6 +227,7 @@ test("paused, closed, and mission-owned teams are excluded while answerable goal
     sessions: [],
     teams: [
       team("paused", { status: "paused", decisions: [teamDecision("d")] }),
+      team("held-paused", { status: "paused", held: true, decisions: [teamDecision("d")] }),
       team("merged", { status: "merged", revision: 2, decisions: [teamDecision("old-open-looking", 2)] }),
       team("reviewed", { status: "ready-for-review", decisions: [teamDecision("d")] }),
       team("unchanged", { status: "no-change", decisions: [teamDecision("d")] }),
@@ -185,7 +239,9 @@ test("paused, closed, and mission-owned teams are excluded while answerable goal
     missions: [],
   });
 
-  assert.deepEqual(queued.decisions.map(decision => decision.key), ["team:goal-answerable:d"]);
+  assert.deepEqual(queued.decisions.map(decision => decision.key), ["team:goal-answerable:d", "team:held-paused:d"]);
+  const held = queued.decisions.find(decision => decision.key === "team:held-paused:d");
+  assert.equal(held?.kind === "team" && held.held, true);
 });
 
 test("mission-held subteam decisions appear once while the mission takes answers", () => {

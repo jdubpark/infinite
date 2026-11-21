@@ -98,7 +98,7 @@ All API routes except login require a bearer key or same-origin HttpOnly cookie.
 | Browser login | `POST /api/login` | Valid key, matching Origin |
 | Device capabilities | `GET /api/me` | Any paired role |
 | List / inspect sessions | `GET /api/sessions`, `GET /api/sessions/:id` | Any |
-| Read the decision queue | `GET /api/decision-queue` | Any |
+| Read the decision queue | `GET /api/decision-queue` | Any; a held team answer carries `held: true` and waits for resume |
 | Subscribe to live state | `GET /api/events?topics=...&after=...` | Any |
 | Create session | `POST /api/sessions` | Owner |
 | Archive / unarchive an exited session | `POST /api/sessions/:id/archive` | Owner |

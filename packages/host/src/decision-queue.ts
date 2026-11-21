@@ -7,7 +7,7 @@ import type { Session } from "./types.js";
 /** One decision that waits on a person, from anywhere on the host. */
 export type QueueDecision =
   | { kind: "session"; key: string; since: string; origin: QueueOrigin; answerPath: string; prompt: Prompt }
-  | { kind: "team"; key: string; since: string; origin: QueueOrigin; answerPath: string; revision: number; decision: TeamDecision }
+  | { kind: "team"; key: string; since: string; origin: QueueOrigin; answerPath: string; revision: number; decision: TeamDecision; held?: true }
   | { kind: "mission"; key: string; since: string; origin: QueueOrigin; answerPath: string; revision: number; decision: MissionDecision };
 
 export interface QueueOrigin {
@@ -39,6 +39,7 @@ export interface DecisionQueueInput {
     status: TeamStatus;
     missionId: string | undefined;
     goal: boolean;
+    held: boolean;
     goalCanAnswer: boolean;
     decisions: TeamDecision[];
   }[];
@@ -109,7 +110,7 @@ export function buildDecisionQueue(input: DecisionQueueInput): DecisionQueue {
   }
 
   for (const team of input.teams) {
-    if (team.status === "paused" || closedTeamStatuses.has(team.status) || team.missionId !== undefined || (team.goal && !team.goalCanAnswer)) continue;
+    if ((team.status === "paused" && !team.held) || closedTeamStatuses.has(team.status) || team.missionId !== undefined || (team.goal && !team.goalCanAnswer)) continue;
     for (const decision of team.decisions) {
       if (decision.revision !== team.revision || decision.answer) continue;
       decisions.push({
@@ -120,6 +121,7 @@ export function buildDecisionQueue(input: DecisionQueueInput): DecisionQueue {
         answerPath: `/api/teams/${team.id}/decisions/${decision.id}/answer`,
         revision: team.revision,
         decision: structuredClone(decision),
+        ...(team.held ? { held: true as const } : {}),
       });
     }
   }

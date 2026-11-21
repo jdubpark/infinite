@@ -15,6 +15,7 @@ import { RoutineService } from "../packages/host/src/routines.js";
 import { HaltService } from "../packages/host/src/halt/service.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { MissionService } from "../packages/host/src/missions.js";
+import { buildDecisionQueue } from "../packages/host/src/decision-queue.js";
 import { TeamError, type TeamService } from "../packages/host/src/teams.js";
 import type { ProductGoal } from "../packages/host/src/goal-types.js";
 import type { Mission } from "../packages/host/src/mission-types.js";
@@ -59,6 +60,11 @@ async function step(teams: TeamService, id: string) {
 function goalStep(goals: GoalService, id: string) {
   const internal = goals as unknown as { record(id: string): unknown; step(stored: unknown): Promise<void> };
   return internal.step(internal.record(id));
+}
+
+function teamDecisionQueue(teams: TeamService, goals: GoalService) {
+  return buildDecisionQueue({ sessions: [], missions: [], teams: teams.decisionQueueCandidates().map(candidate => ({ ...candidate,
+    goalCanAnswer: !candidate.goal || goals.decisionAnswerable(candidate.id, candidate.held) })) });
 }
 
 /** A Unix socket path must stay short, so the Manager's run directory sits directly under /tmp. */
@@ -167,7 +173,8 @@ test("a project halt pauses running work in scope and its release resumes only w
   // A: the fixture's standalone run, planning with a running coordinator. B: paused by the owner. C: a goal's cycle.
   f.writeTeam();
   const standalone = f.run.id;
-  const ownerPaused = writeRun(f, { title: "Owner paused", status: "paused", reason: "Paused by the owner." });
+  const ownerPaused = writeRun(f, { title: "Owner paused", status: "paused", reason: "Paused by the owner.",
+    decisions: [{ id: randomUUID(), memberId: f.run.members[0]!.memberId, revision: 1, question: "Which file?", options: ["a", "b"], createdAt: at }] });
   const goalTeam = writeRun(f, { title: "Goal cycle", status: "implementing" });
   const goal = {
     id: randomUUID(), projectId: "fixture", title: "Improve the fixture", objective: "Choose scoped work", successCriteria: "Evidence",
@@ -182,6 +189,7 @@ test("a project halt pauses running work in scope and its release resumes only w
 
   const teams = f.openTeam();
   const goals = new GoalService(f.config, f.key, teams);
+  assert.deepEqual(teamDecisionQueue(teams, goals).decisions, [], "an ordinary owner-paused run cannot take its unanswered decision");
   const manager = { meta: () => { throw Object.assign(new Error("No session."), { code: "ENOENT" }); }, hostLoad: { held: () => undefined } } as unknown as Manager;
   const missions = new MissionService(f.config, f.key, manager, teams, { get: () => { throw new Error("Not queried in this test"); } });
   const missionOf = (id: string) => (missions as unknown as { records: Map<string, { mission: Mission; ownerHalt?: unknown }> }).records.get(id)!;
@@ -582,7 +590,14 @@ test("a goal whose team waits for input is paused by the halt, and the release r
     assert.equal(teams.get(team.id).reason, PROJECT_TEXT);
     assert.equal(teams.get(team.id).revision, 1);
 
-    // The owner answers through the goal during the halt: the answer is kept, and nothing starts.
+    const heldQueue = teamDecisionQueue(teams, goals);
+    assert.equal(heldQueue.decisions.length, 1);
+    assert.equal(heldQueue.decisions[0]?.kind, "team");
+    assert.equal(heldQueue.decisions[0]?.kind === "team" && heldQueue.decisions[0].held, true);
+    assert.equal(heldQueue.decisions[0]?.kind === "team" && heldQueue.decisions[0].answerPath,
+      `/api/teams/${team.id}/decisions/${team.decisionId}/answer`);
+
+    // The team answer route dispatches this goal-owned decision to GoalService during the halt.
     await goals.answer(team.id, team.decisionId, { requestId: randomUUID(), revision: 1, text: "Change a.txt" });
     await step(teams, team.id); await step(teams, team.id);
     assert.equal(f.launches.length, 0, "an answer given during the halt starts nothing");

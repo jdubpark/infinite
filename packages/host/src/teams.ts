@@ -915,9 +915,9 @@ export class TeamService {
   /** Open decisions only; it builds no views or tracker refreshes. */
   decisionQueueCandidates() { return [...this.records.values()].flatMap(stored => {
     const run = stored.run, held = heldWaiting(stored), decisions = run.decisions.filter(item => item.revision === run.revision && !item.answer);
-    return !run.replay && run.status !== "paused" && (!stored.halt || held) && decisions.length
+    return !run.replay && ((!stored.halt && run.status !== "paused") || held) && decisions.length
       ? [{ id: run.id, title: run.title, projectId: run.projectId, revision: run.revision, status: run.status, missionId: run.missionId,
-        goal: Boolean(run.goal), goalHeld: held, decisions: structuredClone(decisions) }]
+        goal: Boolean(run.goal), held, decisions: structuredClone(decisions) }]
       : [];
   }); }
   /** The team context named by a member session, without building a view. */

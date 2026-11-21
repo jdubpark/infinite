@@ -1300,7 +1300,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   app.get("/api/board", (_req, res) => {
     const memberships = projectGroups.membershipSnapshot(); return res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects, id => memberships.get(id)));
   });
-  app.get("/api/decision-queue", async (_req, res) => res.json(await readDecisionQueue({ config, manager, cmux, permissions: sessionPermissions, teams, goals, missions })));
+  app.get("/api/decision-queue", async (_req, res) => res.json(await readDecisionQueue({ manager, cmux, permissions: sessionPermissions, teams, goals, missions })));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
   // Which files each agent's recorded tool inputs pointed at. Read-only; observed inputs are not evidence of use or of a landed change.
   const contextTouches = new ContextTouches({

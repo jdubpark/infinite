@@ -6,8 +6,9 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
 import { EGRESS_ENVIRONMENT_NAMES } from "../packages/host/src/egress.js";
+import { codeModeEnabled } from "../packages/host/src/code-mode.js";
 import { buildLaunch, headlessLaunch, headlessResumeProfile, missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
-import { addProjectIdToLaunchEnv } from "../packages/host/src/worker-env.js";
+import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv } from "../packages/host/src/worker-env.js";
 import { claudeConfigPath, codexTrustArgs, recordClaudeTrust, repositoryCodexConfig } from "../packages/host/src/workspace-trust.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
@@ -26,6 +27,19 @@ test("worker launch passes only a valid session project ID", () => {
     addProjectIdToLaunchEnv(env, projectId);
     assert.equal(Object.hasOwn(env, "INFINITE_PROJECT_ID"), false, `invalid project ID ${String(projectId)} is omitted`);
   }
+});
+
+test("interactive launch environment adds Code Mode only for eligible Claude sessions", () => {
+  const environment = (excluded: boolean) => {
+    const env: Record<string, string> = {};
+    addClaudeCodeModeToLaunchEnv(env, codeModeEnabled("all", "claude", { headless: false, served: false, excluded }));
+    return env;
+  };
+  assert.deepEqual(environment(false), { CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1" });
+  assert.deepEqual(environment(true), {});
+  const codex: Record<string, string> = {};
+  addClaudeCodeModeToLaunchEnv(codex, codeModeEnabled("all", "codex", { headless: false, served: false, excluded: false }));
+  assert.deepEqual(codex, {});
 });
 
 test("team model selection preserves configured provider permissions and refuses competing model controls", () => {
@@ -513,18 +527,28 @@ test("codex hooks stay off unless the config turns them on", () => {
 });
 
 test("a served headless Claude launch loads only the host's settings, with the channel hooks beside the signal relay", () => {
-  const launch = buildLaunch("claude", { command: "claude", args: ["-p"] }, "go", hooks, relay, enabled, false, undefined, undefined, undefined, undefined, true);
+  const profile = { command: "claude", args: ["-p"] };
+  const launch = buildLaunch("claude", profile, "go", hooks, relay, enabled, false, undefined, undefined, undefined, undefined, true, false, true);
   const sources = launch.args.indexOf("--setting-sources");
   assert.equal(launch.args[sources + 1], "");
   assert.equal(launch.args.filter(arg => arg === "--settings").length, 1);
   const settings = JSON.parse(launch.args[launch.args.indexOf("--settings") + 1]);
   assert.equal(settings.disableAllHooks, false);
+  assert.deepEqual(settings.env, { CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1" });
   const commands = (event: string) => settings.hooks[event][0].hooks.map((hook: { command: string; timeout: number }) => [hook.command.split(" ").slice(-2).join(" "), hook.timeout]);
   assert.deepEqual(commands("PreToolUse"), [["/opt/infinite/packages/host/dist/hook-relay.js claude", 10], ["/opt/infinite/packages/host/dist/permission-hook.js check", 30]]);
   // The relay would open a hook-only prompt and push the owner while the permission agent decides.
   assert.deepEqual(commands("PermissionRequest"), [["/opt/infinite/packages/host/dist/permission-hook.js request", 360]]);
   assert.equal(settings.hooks.PreToolUse[0].hooks[1].command.split(" ")[0], process.execPath);
   assert.equal(launch.args.at(-1), "go");
+  const disabled = buildLaunch("claude", profile, "go", hooks, relay, enabled, false, undefined, undefined, undefined, undefined, true, false, false);
+  const disabledSettings = JSON.parse(disabled.args[disabled.args.indexOf("--settings") + 1]);
+  assert.deepEqual(Object.keys(disabledSettings).sort(), ["disableAllHooks", "hooks"]);
+  const withoutMode = { ...settings }; delete withoutMode.env;
+  const normalizedArgs = [...launch.args];
+  normalizedArgs[launch.args.indexOf("--settings") + 1] = disabled.args[disabled.args.indexOf("--settings") + 1]!;
+  assert.deepEqual(normalizedArgs, disabled.args, "the channel settings env is the only argv change");
+  assert.equal(JSON.stringify(withoutMode), disabled.args[disabled.args.indexOf("--settings") + 1]);
   // Without the signal hooks only the channel hooks remain.
   const quiet = JSON.parse(buildLaunch("claude", { command: "claude", args: ["-p"] }, "", hooks, relay, { claude: false, codex: false }, false, undefined, undefined, undefined, undefined, true).args.at(-1)!);
   assert.deepEqual(Object.keys(quiet.hooks).sort(), ["PermissionRequest", "PreToolUse"]);
@@ -571,6 +595,20 @@ test("an in-place resume replaces the profile's own continuation and keeps the s
   assert.deepEqual(headlessResumeProfile({ command: "sudo", args: ["-u", "agent", "--", "/usr/local/bin/claude", "-p", "--resume=old"] }, "conv_1").args,
     ["-u", "agent", "--", "/usr/local/bin/claude", "-p", "--resume", "conv_1"]);
   assert.throws(() => headlessResumeProfile({ command: "claude", args: [] }, "bad id"), /Invalid/);
+});
+
+test("a served headless resume follows the recorded Code Mode, not the current level", () => {
+  const profile = { command: "claude", args: ["-p"] };
+  for (const [level, recorded, expected] of [["off", true, "1"], ["all", false, undefined]] as const) {
+    const codeMode = codeModeEnabled(level, "claude", { headless: true, served: true, excluded: false }, recorded);
+    const launch = buildLaunch("claude", headlessResumeProfile(profile, "native-session"), "", hooks, relay, enabled,
+      false, undefined, undefined, undefined, undefined, true, false, codeMode);
+    const settings = JSON.parse(launch.args[launch.args.indexOf("--settings") + 1]!);
+    assert.equal(settings.env?.CLAUDE_CODE_EXPERIMENTAL_CODE_MODE, expected);
+    assert.equal(Object.hasOwn(settings, "env"), expected !== undefined);
+    assert.ok(launch.args.includes("-p"));
+    assert.ok(launch.args.includes("--resume") && launch.args.includes("native-session"));
+  }
 });
 
 const entryMember = { runId: randomUUID(), memberId: randomUUID(), revision: 1 };

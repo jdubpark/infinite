@@ -9,7 +9,12 @@ import type { Session, WorkerState } from "./types.js";
  */
 export const SETTLED_MS = 2000;
 
-export type ListedSession = Omit<Session, "context" | "initialPrompt" | "generatedTitle" | "nativeArgs" | "handoff">;
+export type ListedSession = Omit<Session, "context" | "initialPrompt" | "generatedTitle" | "nativeArgs" | "handoff" | "codeMode">;
+
+export function withoutCodeMode<T extends Session>(session: T): Omit<T, "codeMode"> {
+  const { codeMode: _codeMode, ...visible } = session;
+  return visible;
+}
 
 /** The part of a session record that a listing row shows. Destructuring keeps the key order. */
 export function listedSession(session: Session): ListedSession {
@@ -20,7 +25,7 @@ export function listedSession(session: Session): ListedSession {
     nativeArgs: _nativeArgs,
     handoff: _handoff,
     ...summary
-  } = session;
+  } = withoutCodeMode(session);
   return summary;
 }
 

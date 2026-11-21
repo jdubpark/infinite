@@ -102,6 +102,73 @@ setInterval(() => {}, 1000);
   }
 });
 
+test("owner resume keeps the native conversation's recorded Code Mode after config changes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-code-mode-resume-"));
+  const launchLog = join(root, "launches.jsonl");
+  const fixture = join(root, "agent.mjs");
+  const nativeIds = [randomUUID(), randomUUID()];
+  writeFileSync(fixture, `
+import { appendFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+const resume = args.indexOf('--resume');
+const prompt = args.find(value => value.startsWith('native:'));
+const nativeId = resume >= 0 ? args[resume + 1] : prompt?.slice('native:'.length);
+appendFileSync(${JSON.stringify(launchLog)}, JSON.stringify({ mode: process.env.CLAUDE_CODE_EXPERIMENTAL_CODE_MODE, nativeId }) + '\\n');
+if (process.env.INFINITE_HOOK_URL) await fetch(process.env.INFINITE_HOOK_URL + '/claude', {
+  method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + process.env.INFINITE_HOOK_TOKEN },
+  body: JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: nativeId, prompt: 'Resume fixture' })
+});
+setInterval(() => {}, 1000);
+`);
+  const host = await startHost({ agents: { claude: { command: process.execPath, args: [fixture] } }, config: { codeMode: { claude: "all" } } });
+  const readLaunches = () => readFileSync(launchLog, "utf8").trim().split("\n").map(line => JSON.parse(line) as { mode?: string; nativeId: string });
+  const start = async (nativeId: string) => {
+    const id = randomUUID();
+    const created = await host.fetchApi("/sessions", "owner", { requestId: id, projectId: "rehearsal", provider: "claude", title: "Code Mode", prompt: `native:${nativeId}` });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    assert.equal(Object.hasOwn(created.body, "codeMode"), false, "creation responses keep the host choice internal");
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), response => response.body.nativeSession?.id === nativeId);
+    return id;
+  };
+  const stop = async (id: string) => {
+    const control = await claimControl(host, id, "owner");
+    await host.fetchApi(`/sessions/${id}/stop`, "owner", { requestId: randomUUID() }, control.headers);
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), response => response.body.status === "exited");
+  };
+  const setModeAndRestartApi = async (claude: "off" | "all") => {
+    host.config.codeMode = { claude };
+    writeFileSync(join(host.root, "config.json"), JSON.stringify(host.config));
+    await host.stopApi();
+    await host.start();
+  };
+  try {
+    const enabled = await start(nativeIds[0]!);
+    assert.equal(Object.hasOwn((await host.fetchApi(`/sessions/${enabled}`)).body, "codeMode"), false);
+    const listed = await host.fetchApi("/sessions");
+    const sessionRows = (listed.body as { sessions: Record<string, unknown>[] }).sessions;
+    assert.equal(Object.hasOwn(sessionRows.find(row => row.id === enabled)!, "codeMode"), false, "listing rows keep the host choice internal");
+    await stop(enabled);
+    await setModeAndRestartApi("off");
+    const enabledResume = await host.fetchApi(`/sessions/${enabled}/resume`, "owner", { requestId: randomUUID() });
+    assert.equal(enabledResume.status, 200, JSON.stringify(enabledResume.body));
+    assert.equal(Object.hasOwn(enabledResume.body, "codeMode"), false, "resume responses keep the host choice internal");
+    await waitFor(() => readLaunches(), launches => launches.length === 2);
+    assert.equal(readLaunches()[1]!.mode, "1");
+
+    const disabled = await start(nativeIds[1]!);
+    assert.equal(Object.hasOwn((await host.fetchApi(`/sessions/${disabled}`)).body, "codeMode"), false);
+    await stop(disabled);
+    await setModeAndRestartApi("all");
+    const disabledResume = await host.fetchApi(`/sessions/${disabled}/resume`, "owner", { requestId: randomUUID() });
+    assert.equal(disabledResume.status, 200, JSON.stringify(disabledResume.body));
+    await waitFor(() => readLaunches(), launches => launches.length === 4);
+    assert.equal(Object.hasOwn(readLaunches()[3]!, "mode"), false);
+  } finally {
+    await host.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("native resume refuses a live continuation bound to another project", async () => {
   const root = mkdtempSync(join(tmpdir(), "infinite-resume-projects-"));
   const firstRoot = join(root, "first-project");

@@ -53,7 +53,7 @@ import { drainLaunch, runFinalDrain } from "./final-drain.js";
 import { buildLaunch, headlessResumeProfile } from "./launch.js";
 import { channelToken } from "./permission-headless.js";
 import { HeadlessChannelWorker } from "./permission-headless-worker.js";
-import { addProjectIdToLaunchEnv } from "./worker-env.js";
+import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv } from "./worker-env.js";
 import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrust } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
@@ -1640,6 +1640,7 @@ server.listen(socketPath(runDir, session.id), async () => {
     }
     env.TERM = "xterm-256color";
     addProjectIdToLaunchEnv(env, session.projectId);
+    addClaudeCodeModeToLaunchEnv(env, config.codeMode && !session.headless?.channel);
     if (config.codexTraceRoot) env.CODEX_ROLLOUT_TRACE_ROOT = config.codexTraceRoot;
     // Present only with autonomy.boundary.github: Git and gh reach GitHub through the proxy with this grant.
     if (config.github) {
@@ -1692,6 +1693,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       session.workspaceTrusted ? session.cwd : undefined,
       Boolean(session.team?.entryTools), Boolean(permissionChannel),
       egress.status !== "off",
+      config.codeMode,
     );
     if (session.runtime?.nativeUi === "codex") {
       if (session.workspace) {
@@ -1877,6 +1879,7 @@ server.listen(socketPath(runDir, session.id), async () => {
         hookServer ? { url: hookServer.url, token: hookToken } : null, relayPath, config.attention.hooks,
         Boolean(session.team), session.teamModelProfile, session.handoff?.policy ? session.id : undefined,
         session.workspaceTrusted ? session.cwd : undefined, Boolean(session.team?.entryTools), true, egress.status !== "off",
+        config.codeMode,
       );
       const pty = spawn(next.command, next.args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
       child = pty;

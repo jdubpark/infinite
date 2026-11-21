@@ -46,6 +46,45 @@ rejects unmet permissions instead of providing an interactive approval flow. Pro
 configured contributor use without changing provider terms or retention. See
 [Goals and agent teams](teams.md) for scope, routing, limits, and recovery.
 
+### Claude Code Mode
+
+Claude Code has an experimental Code Mode: the model writes one program that
+calls several tools, where it would otherwise call them one at a time. The host
+asks for it only when the top-level `codeMode.claude` setting says so:
+
+- `off`, the default, also when the key is absent: the host never asks for it.
+- `headless`: served headless Claude sessions start in Code Mode.
+- `all`: interactive Claude sessions do too, the owner's and team members'.
+
+Some launches never get it. A permission coordinator and a mission coordinator
+run with tool lists that leave out the program tool, so Code Mode cannot start
+there. Permission-reviewer turns, headless launches that the permission channel
+does not serve, evaluation and learning sessions, other providers, and launches
+outside the host's worker stay as they are.
+
+Each tool call inside a program raises its own hooks, so the permission channel
+still decides each call.
+
+A session records whether the host started it in Code Mode. Resuming the same
+conversation keeps that choice, whatever the setting says by then. The record is
+not part of any API response.
+
+Before setting `all`:
+
+- Claude Code asks for a confirmation once per operating-system account. Only
+  the owner answers it; the host hands it to no agent. Accept it once in a
+  terminal on the account that runs the agents. Until then every interactive
+  launch stops at the confirmation.
+- Claude Code 2.1.328 or newer is needed. The host does not check the installed
+  version, and an older version ignores the request.
+- A Code Mode session cannot use Remote Control, Claude in Chrome, or computer
+  use.
+- Where agents start through `sudo`, an interactive launch carries the request
+  in the environment variable `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE`, which
+  reaches Claude Code only if the sudoers `env_keep` list names it. Served
+  headless launches carry it in their `--settings` argument and need no sudoers
+  entry.
+
 On the Ubuntu host, provider wrappers can load owner-managed environment files
 for host-wide credentials, Android tooling, and a selected project. Values are
 exported literally and never passed through `eval`, so file contents cannot

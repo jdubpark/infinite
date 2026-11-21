@@ -433,13 +433,14 @@ else if (command === "plan-fleet") {
           provider === "claude" || provider === "codex"
             ? ` · hooks ${(config.attention?.hooks ?? DEFAULT_HOOKS)[provider] ? "enabled" : "disabled"}`
             : "";
+        const codeMode = provider === "claude" ? ` · Code Mode ${config.codeMode?.claude ?? "off"}` : "";
         try {
           console.log(
-            `${provider}: ${execFileSync(profile.command, [...profile.args, "--version"], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "ignore"] }).trim()}${hooks}`,
+            `${provider}: ${execFileSync(profile.command, [...profile.args, "--version"], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "ignore"] }).trim()}${hooks}${codeMode}`,
           );
         } catch {
           console.log(
-            `${provider}: unavailable; install and authenticate on this host`,
+            `${provider}: unavailable; install and authenticate on this host${hooks}${codeMode}`,
           );
         }
       }

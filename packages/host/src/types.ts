@@ -53,6 +53,8 @@ export interface Session {
   purpose?: SessionPurpose;
   /** Host-owned (contract C7). A lowercase SHA-256 hex digest. */
   configId?: string;
+  /** Whether this Claude conversation started in Code Mode. Older records omit this and mean false. */
+  codeMode?: boolean;
   handoff?: { policy?: import("./handoff-types.js").HandoffPolicy; reason?: string };
   id: string;
   managedBy?: { kind: "mission"; missionId: string; teamId?: string };
@@ -140,6 +142,8 @@ export interface Config {
   intake?: import("./intake-types.js").IntakeConfig;
   /** Separate authenticated request connector; absent keeps its listener disabled. */
   mcp?: import("./mcp-types.js").McpConfig;
+  /** Claude Code Mode launch policy. Absent means off. */
+  codeMode?: { claude: "off" | "headless" | "all" };
   /** Separate working copies, writable by the host and selected provider execution account. */
   teams?: {
     workspaceDir: string; commandPrefix?: import("./team-types.js").TeamCommand; lineup?: import("./team-types.js").TeamLineup;
@@ -345,6 +349,8 @@ export interface Bootstrap {
   runDir: string;
   key: string;
   prompt: string;
+  /** The session's recorded Code Mode choice, preserved across native relaunches. */
+  codeMode: boolean;
   executorTokenHash?: string;
   /** Set only when the host admitted this headless session to the permission channel. */
   permissionChannel?: { socket: string };

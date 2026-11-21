@@ -55,6 +55,7 @@ import { TeamService, TeamError } from "./teams.js";
 import { readDecisionQueue } from "./decision-queue-read.js";
 import { objectiveRoutes } from "./objective-routes.js";
 import { sendSessionList } from "./session-list.js";
+import { withoutCodeMode } from "./session-listing.js";
 import { parseGoalCreateBody } from "./objective-input.js";
 import { routingRoutes } from "./routing-routes.js";
 import { spawnTeamBundle } from "./team-workspace.js";
@@ -490,7 +491,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       const session = await cmux.get(sessionId);
       return { ...session, machineId: config.machine!.id, resumable: resumable(session) };
     }
-    const session = { ...manager.meta(sessionId).session, ...(await manager.state(sessionId, true)) };
+    const session = withoutCodeMode({ ...manager.meta(sessionId).session, ...(await manager.state(sessionId, true)) });
     const handoff = handoffs.view(sessionId);
     const managed = managedBy(session);
     // One session's detail is no listing: it must not replace what the last listing left for every other session.
@@ -1648,7 +1649,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     const { backend: _backend, ...nativeRequest } = request;
     scheduleGraphForSession(request.projectId);
     // Owner-only route: the owner started this session, which decides its GitHub grant under autonomy.boundary.github.
-    res.status(201).json(await startInProject(request.projectId, () => manager.create(nativeRequest, "owner")));
+    res.status(201).json(withoutCodeMode(await startInProject(request.projectId, () => manager.create(nativeRequest, "owner"))));
   });
   // Imported sessions keep their own transport and journal. Authorization is the same
   // as the managed-worker routes; raw native gateways remain worker-only.
@@ -1798,7 +1799,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     const { requestId } = z.object({ requestId: id }).strict().parse(req.body);
     const projectId = manager.meta(sessionId).session.projectId;
     scheduleGraphForSession(projectId);
-    res.json(await startInProject(projectId, () => manager.resume(sessionId, requestId, "owner")));
+    res.json(withoutCodeMode(await startInProject(projectId, () => manager.resume(sessionId, requestId, "owner"))));
   });
   app.get("/api/sessions/:id/native", refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use the native frontend" });

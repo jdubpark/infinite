@@ -496,6 +496,16 @@ test("the relay refuses objective records", async () => {
   } finally { client.close(); runner.close(); }
 });
 
+test("the relay refuses the verdicts read", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    await assert.rejects(client.request(`/goals/${randomUUID()}/verdicts`), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused verdicts read does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
 test("the relay refuses routing reads", async () => {
   const runner = await httpRunner();
   const client = createRemoteClient({ url: runner.url, token: runner.token });

@@ -2,6 +2,8 @@ import type express from "express";
 import { z } from "zod";
 import type { GoalService } from "./goals.js";
 import type { TeamService } from "./teams.js";
+import type { TeamVerdicts } from "./team-verdicts.js";
+import { goalVerdictsView } from "./verdict-view.js";
 
 const uuid = z.uuid();
 const recordQuery = z.strictObject({ version: z.string().regex(/^[1-9][0-9]{0,5}$/).optional() });
@@ -11,7 +13,8 @@ const recordQuery = z.strictObject({ version: z.string().regex(/^[1-9][0-9]{0,5}
  * latest) and writes nothing. The correction is owner only; its body goes to `correctObjective` unparsed, which parses it.
  */
 export function objectiveRoutes(app: express.Express,
-  services: { goals: Pick<GoalService, "objectiveRecord" | "correctObjective">; teams: Pick<TeamService, "objectiveRecord"> },
+  services: { goals: Pick<GoalService, "objectiveRecord" | "correctObjective" | "get">;
+    teams: Pick<TeamService, "objectiveRecord"> & { verdicts: Pick<TeamVerdicts, "detail"> } },
   read: express.RequestHandler, owner: express.RequestHandler): void {
   // A UUID is case-insensitive; the host stores its ids in lower case.
   const recordId = (value: unknown) => uuid.parse(String(value).toLowerCase());
@@ -20,6 +23,10 @@ export function objectiveRoutes(app: express.Express,
     res.json(services.goals.objectiveRecord(recordId(req.params.id), query.version === undefined ? undefined : Number(query.version)));
   });
   app.post("/api/goals/:id/record", owner, async (req, res) => res.json(await services.goals.correctObjective(recordId(req.params.id), req.body)));
+  // Provisional agent assessments: one goal view and in-memory detail reads. The relay's goal pattern has no `verdicts` branch.
+  app.get("/api/goals/:id/verdicts", read, (req, res) => {
+    res.json(goalVerdictsView(services.goals.get(recordId(req.params.id)), id => services.teams.verdicts.detail(id)));
+  });
   app.get("/api/teams/:id/record", read, (req, res) => {
     const query = recordQuery.parse(req.query);
     res.json(services.teams.objectiveRecord(recordId(req.params.id), query.version === undefined ? undefined : Number(query.version)));

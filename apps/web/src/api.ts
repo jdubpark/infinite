@@ -242,7 +242,7 @@ export type GoalVerdictView = {
   label: "Agent assessment, provisional";
   result: AssessedState; evaluatorResult?: AssessedState; differs: boolean; reason?: string; counts: VerdictCounts; progress: number;
   owner?: { result: "achieved" | "not-achieved" | "inconclusive"; agrees?: boolean };
-  criteria: { id: string; producer: "host" | "evaluator" | "owner"; state: ComposedState; label: "host receipt" | "agent assessment" | "waiting for you";
+  criteria: { id: string; producer: "host" | "evaluator" | "owner"; state: ComposedState; label: "host receipt" | "agent assessment" | "waiting for you" | "your rating";
     reason?: string; evaluatorState?: AssessedState; receipt?: { handle: string; outcome: "pass" | "fail" | "unknown" }; handles?: string[]; note?: string }[];
   evaluator?: { profileId: string; family: string; sharedFamily: boolean; alsoReviewed: boolean };
   detail: "available" | "expired";

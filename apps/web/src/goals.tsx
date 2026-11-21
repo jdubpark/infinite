@@ -35,7 +35,7 @@ const entries = (value: string) => value.split("\n").map(line => line.trim()).fi
 const hasContributor = (lineup?: TeamLineup) => lineup && [lineup.coordinator, lineup.integrator, lineup.reviewer, ...lineup.implementers, ...(lineup.escalations ?? [])].some(profile => profile.dataUse === "contributor");
 export const ASSESSMENT_LABEL = "Agent assessment, provisional";
 const assessedLabels: Record<AssessedState, string> = { met: "Met", "not-met": "Not met", inconclusive: "Inconclusive" };
-const producerLabels = { "host receipt": "Host receipt", "agent assessment": ASSESSMENT_LABEL, "waiting for you": "Waiting for you" } as const;
+const producerLabels = { "host receipt": "Host receipt", "agent assessment": ASSESSMENT_LABEL, "waiting for you": "Waiting for you", "your rating": "Your rating" } as const;
 export const countsText = (counts: VerdictCounts) => `${counts.met} met · ${counts.notMet} not met · ${counts.inconclusive} inconclusive · ${counts.pendingOwner} waiting for you`;
 /** The newest cycle assessment's id: the one the owner's answer names. */
 export const newestVerdictId = (cycles: { assessment?: GoalAssessment }[]) => [...cycles].reverse().find(cycle => cycle.assessment)?.assessment?.verdictId;

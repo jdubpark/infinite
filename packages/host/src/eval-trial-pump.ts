@@ -17,6 +17,7 @@ import { loadTask, type BundleState, type ValidateContext } from "./eval-validat
 import type { HaltService } from "./halt/service.js";
 import type { HostLoadGate } from "./host-load.js";
 import type { Manager } from "./manager.js";
+import type { CostLookup, SessionCost } from "./outcome-cells.js";
 import { readOutcome } from "./outcome-store.js";
 import { outcomeId } from "./outcome-projector.js";
 import type { ProjectSourceService } from "./project-source.js";
@@ -32,7 +33,7 @@ import type { Config, Provider } from "./types.js";
 // it was running. Nothing here throws: a failed step leaves its rows for the next one.
 
 export const EVAL_STOPPING_MS = 120_000, TRIAL_LAUNCH_MS = 900_000, TRIAL_SESSION_KEEP_MS = 3_600_000, TRIAL_SESSIONS_BATCH = 20,
-  EVAL_LIMIT_UNSTATED_MS = 900_000, EVAL_LIMIT_MAX_MS = 86_400_000;
+  EVAL_LIMIT_UNSTATED_MS = 900_000, TRIAL_COST_WAIT_MS = 86_400_000, EVAL_LIMIT_MAX_MS = 86_400_000;
 const IDENTITY_FRESH_MS = 600_000, STOP_TRIES = 3;
 
 export type TrialTeams = Pick<TeamService, "createForReplay" | "replayState" | "endReplay" | "forgetReplay" | "replayIds" | "providerLimits">;
@@ -40,6 +41,8 @@ export type TrialPumpOptions = {
   config: Config; store: EvidenceStore; jobs: TrialJobs; grader: Grader; identity: EvalIdentity;
   teams: () => TrialTeams; sessions: Pick<Manager, "list" | "remove">; source: Pick<ProjectSourceService, "mirrorPath" | "status">;
   hostLoad: Pick<HostLoadGate, "held">; halt: () => Pick<HaltService, "check">;
+  /** The usage ledger's cost of a session; a trial's tokens and spend are recorded from it before the session is removed. */
+  cost?: CostLookup;
   graderProbe: () => Promise<GraderProbe>; inventory?: () => Promise<RuntimeProcess[]>; now?: () => string;
 };
 
@@ -119,21 +122,38 @@ export class TrialPump {
       }
       const endedBefore = new Date(Date.parse(at) - TRIAL_SESSION_KEEP_MS).toISOString();
       const ended = this.options.store.read(db => trialSessions(db, endedBefore, TRIAL_SESSIONS_BATCH));
-      for (const { trialId, sessionId } of ended) {
+      for (const { trialId, sessionId, endedAt } of ended) {
         try {
+          const cost = this.costOf(sessionId, endedAt, at);
+          if (cost === "wait") continue;
           try {
             await this.options.sessions.remove(sessionId);
           } catch (error) {
             // A session that is already gone needs no removal; any other refusal keeps the row for the next sweep.
             if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
           }
-          this.options.store.write(tx => clearTrialSession(tx, trialId));
+          this.options.store.write(tx => clearTrialSession(tx, trialId, cost));
         } catch {
           // One failed row leaves the others to their removal.
         }
       }
     } catch {
       // The sweep never throws.
+    }
+  }
+
+  /**
+   * The session's tokens and cost from the usage ledger, read before the session is removed. A session the ledger holds
+   * no usage for is `none`, never zero. A lookup that throws waits for the next sweep until the trial ended a day ago.
+   * Without the option nothing is recorded.
+   */
+  private costOf(sessionId: string, endedAt: string, at: string): SessionCost | "none" | "wait" | undefined {
+    const lookup = this.options.cost;
+    if (lookup === undefined) return undefined;
+    try {
+      return lookup(sessionId) ?? "none";
+    } catch {
+      return Date.parse(at) - Date.parse(endedAt) >= TRIAL_COST_WAIT_MS ? "none" : "wait";
     }
   }
 
@@ -448,12 +468,12 @@ export class TrialPump {
     }
   }
 
-  /** The oldest scheduled or running baseline job, with its project when the project still exists; undefined when no job is open. */
+  /** The oldest scheduled or running trial job (any kind but validate), with its project when the project still exists; undefined when no job is open. */
   private openJob(): { projectId: string | undefined } | undefined {
     try {
       return this.options.store.read(db => {
         const row = db.get<{ project_ref: string }>(
-          "SELECT project_ref FROM eval_jobs WHERE kind = 'baseline' AND status IN ('scheduled', 'running') ORDER BY created_at, job_id LIMIT 1");
+          "SELECT project_ref FROM eval_jobs WHERE kind != 'validate' AND status IN ('scheduled', 'running') ORDER BY created_at, job_id LIMIT 1");
         if (row === undefined) return undefined;
         const project = this.options.config.projects.find(item => db.index("project", item.id) === row.project_ref);
         return { projectId: project?.id };

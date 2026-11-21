@@ -14,6 +14,7 @@ import { evalCorpusModule } from "../packages/host/src/eval-store.js";
 import { TrialJobs } from "../packages/host/src/eval-trial-jobs.js";
 import { TrialPump, type TrialTeams } from "../packages/host/src/eval-trial-pump.js";
 import { evalTrialsModule, finishTrial, insertTrial, startTrial } from "../packages/host/src/eval-trial-store.js";
+import type { CostLookup } from "../packages/host/src/outcome-cells.js";
 import { configRef, TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
 
 // The trial pump over small fakes: a real store and a real TrialJobs, a recording identity, and no member. The end-to-end
@@ -36,11 +37,11 @@ type Probe = Parameters<EvalIdentity["probe"]>[0];
 
 /** The pump with no member and a source whose `status` has no mirror head, so no trial can start. Every call is logged. */
 function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: EvalProbe[]; sessionsRemoved?: string[]; forgetThrows?: boolean; replayIds?: string[];
-  replayState?: (trialId: string) => Promise<unknown>; onStatus?: () => void } = {}) {
+  replayState?: (trialId: string) => Promise<unknown>; onStatus?: () => void; cost?: CostLookup; clock?: () => string } = {}) {
   const root = mkdtempSync(join(tmpdir(), "infinite-trial-pump-"));
   dirs.push(root);
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: randomBytes(32) });
-  const now = () => new Date().toISOString();
+  const now = options.clock ?? (() => new Date().toISOString());
   store.register(evalCorpusModule(store, now));
   store.register(evalTrialsModule(store, now));
   const config = {
@@ -84,6 +85,7 @@ function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: E
   const pump = new TrialPump({
     config, store, jobs, grader, identity, teams: () => teams,
     sessions: { list: async () => [], remove: async (id: string) => { sessionsRemoved.push(id); if (options.removeRefused) throw new Error("refused"); } } as never,
+    ...(options.cost ? { cost: options.cost } : {}),
     source: { mirrorPath: () => join(root, "mirror.git"), status: () => { log.push("status"); options.onStatus?.(); return { mode: "github", repository: "example/app", baseBranch: "main" } as never; } },
     hostLoad: { held: () => undefined }, halt: () => ({ check: () => ({ state: "clear" as const }) }),
     graderProbe: async () => ({ state: "ready", storage: true, version: 2, uid: 5002 }), inventory: async () => [], now,
@@ -241,6 +243,114 @@ test("start-up drops a preparing row, so its slot runs again as attempt 0, and k
     const voided = r.store.read(db => db.get<{ ending: string | null; session_id: string | null }>("SELECT ending, session_id FROM eval_trials WHERE trial_id = ?", running));
     assert.equal(voided?.ending, "void-host");
     assert.equal(voided?.session_id, "session-voided", "the voided trial names its session, so the sweep removes it");
+  } finally {
+    r.cleanup();
+  }
+});
+
+type CostRow = { session_id: string | null; tokens: number | null; spent_usd: number | null; cost: string | null };
+const COST_SQL = "SELECT session_id, tokens, spent_usd, cost FROM eval_trials WHERE trial_id = ?";
+
+function endedTrial(r: ReturnType<typeof rig>, sessionId: string, endedAt: string): string {
+  const jobId = r.addJob();
+  const trialId = r.seed(jobId, 0, "running");
+  r.store.write(tx => finishTrial(tx, trialId, { grade: VOID_GRADE, configId: null, profileEpoch: null, sessionId, patchKeepDays: 90 }, endedAt));
+  return trialId;
+}
+
+test("a session's cost is recorded before its removal", async () => {
+  const order: string[] = [];
+  const lookups: Record<string, { usd: number; tokens: number; complete: boolean } | undefined> = {
+    "session-complete": { usd: 1.25, tokens: 900, complete: true },
+    "session-partial": { usd: 0.5, tokens: 100, complete: false },
+    "session-unmeasured": undefined,
+  };
+  const removed: string[] = [];
+  const r = rig({ sessionsRemoved: removed, cost: sessionId => { order.push(`cost:${sessionId}`); return lookups[sessionId]; } });
+  try {
+    const long = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    const jobId = r.addJob();
+    const ids: Record<string, string> = {};
+    let slot = 0;
+    for (const sessionId of Object.keys(lookups)) {
+      const trialId = r.seed(jobId, slot++, "running");
+      ids[sessionId] = trialId;
+      r.store.write(tx => finishTrial(tx, trialId, { grade: VOID_GRADE, configId: null, profileEpoch: null, sessionId, patchKeepDays: 90 }, long));
+    }
+    await r.pump.sweep();
+    assert.equal(removed.length, 3, "every session is removed");
+    for (const sessionId of removed) {
+      assert.ok(order.indexOf(`cost:${sessionId}`) >= 0, "the lookup ran for " + sessionId);
+    }
+    const read = (name: string): CostRow | undefined => r.store.read(db => db.get<CostRow>(COST_SQL, ids[name]));
+    const complete = read("session-complete");
+    assert.equal(complete?.cost, "complete");
+    assert.equal(complete?.tokens, 900);
+    assert.equal(complete?.spent_usd, 1.25);
+    assert.equal(complete?.session_id, null);
+    const partial = read("session-partial");
+    assert.equal(partial?.cost, "partial");
+    assert.equal(partial?.tokens, 100);
+    assert.equal(partial?.spent_usd, 0.5);
+    const none = read("session-unmeasured");
+    assert.equal(none?.cost, "none");
+    assert.equal(none?.tokens, null, "unknown stays unknown, never zero");
+    assert.equal(none?.spent_usd, null);
+    assert.equal(none?.session_id, null);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a cost is read before the session is removed", async () => {
+  const events: string[] = [];
+  const removed: string[] = [];
+  const r = rig({ sessionsRemoved: removed, cost: sessionId => { events.push(`cost:${sessionId}:removed=${removed.length}`); return { usd: 1, tokens: 1, complete: true }; } });
+  try {
+    endedTrial(r, "session-order", new Date(Date.now() - 2 * 3_600_000).toISOString());
+    await r.pump.sweep();
+    assert.deepEqual(events, ["cost:session-order:removed=0"], "the lookup saw no removal yet");
+    assert.deepEqual(removed, ["session-order"]);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a cost the ledger cannot read waits a day", async () => {
+  let clock = Date.now();
+  const removed: string[] = [];
+  const r = rig({ sessionsRemoved: removed, clock: () => new Date(clock).toISOString(),
+    cost: () => { throw new Error("ledger unavailable"); } });
+  try {
+    const endedAt = new Date(clock - 2 * 3_600_000).toISOString();
+    const trialId = endedTrial(r, "session-wait", endedAt);
+    await r.pump.sweep();
+    assert.deepEqual(removed, [], "the session stays");
+    const waiting = r.store.read(db => db.get<CostRow>(COST_SQL, trialId));
+    assert.equal(waiting?.session_id, "session-wait");
+    assert.equal(waiting?.cost, null);
+    clock = Date.parse(endedAt) + 24 * 3_600_000;
+    await r.pump.sweep();
+    assert.deepEqual(removed, ["session-wait"], "after a day the session is removed");
+    const done = r.store.read(db => db.get<CostRow>(COST_SQL, trialId));
+    assert.equal(done?.cost, "none");
+    assert.equal(done?.tokens, null);
+    assert.equal(done?.spent_usd, null);
+    assert.equal(done?.session_id, null);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("the pump opens a comparison job", async () => {
+  const r = rig();
+  try {
+    r.addJob();
+    r.store.write(tx => { tx.run("UPDATE eval_jobs SET kind = 'compare'"); });
+    await r.pump.step();
+    await r.pump.step();
+    const fetched = r.probeInputs.map(input => input.fetchUrl).filter(url => url !== undefined);
+    assert.ok(fetched.some(url => url?.includes("example/app")), "the probe names the compare job's project");
   } finally {
     r.cleanup();
   }

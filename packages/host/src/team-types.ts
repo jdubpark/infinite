@@ -6,6 +6,7 @@ import { evalProjectSchema, CANDIDATE_PROFILES_MAX } from "./eval-config.js";
 import type { TrialEnding } from "./eval-types.js";
 import { POINTS_ALGORITHM_VERSION, teamRoutingSchema } from "./routing-policy.js";
 import { intentCheckReportSchema } from "./intent-report.js";
+import { criteriaRowsSchema, verdictReportSchema, type RunAssessment } from "./verdict-types.js";
 import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
 import type { RoutingKnobs, TeamRunRouting } from "./routing-types.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
@@ -236,7 +237,7 @@ export const teamProjectSchema = z.object({
   /** The routing policy (owner-set). No default, so an unset policy leaves the authority digest unchanged. */
   routing: teamRoutingSchema.optional(),
   /** The objective switches. No default: an absent key leaves every routine digest and prompt unchanged. `intentCheck` overrides the mode's default. */
-  objective: z.strictObject({ prompts: z.enum(["on", "off"]).optional(), intentCheck: z.enum(["on", "off"]).optional(), register: z.enum(["on", "off"]).optional() }).optional(),
+  objective: z.strictObject({ prompts: z.enum(["on", "off"]).optional(), intentCheck: z.enum(["on", "off"]).optional(), register: z.enum(["on", "off"]).optional(), evaluator: z.enum(["on", "off"]).optional() }).optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
@@ -536,6 +537,7 @@ export const teamGoalContextSchema = z.object({
   ownerExtendedDeadlineAt: z.iso.datetime().optional(),
   /** The record digest pinned for this run; absent when the objective switch is off or the record was unreadable. */
   record: recordDigestSchema.optional(),
+  criteria: criteriaRowsSchema.optional(),
 }).strict();
 export type TeamGoalContext = z.infer<typeof teamGoalContextSchema>;
 export const teamEvidenceSchema = z.object({ source: z.string().trim().min(1).max(1000), observation: z.string().trim().min(1).max(2000) }).strict();
@@ -604,6 +606,7 @@ const teamReportVariants = [
   z.object({ kind: z.literal("pull-request"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("blocked"), summary: z.string().min(1).max(4000), blocker: blockerEvidenceSchema.optional() }).strict(),
   intentCheckReportSchema,
+  verdictReportSchema,
 ] as const;
 /** What the report tool accepts from a member: every question carries the member's recommendation. */
 export const teamReportSchema = z.discriminatedUnion("kind", [...teamReportVariants,
@@ -617,7 +620,7 @@ export const recordedTeamReportSchema = z.discriminatedUnion("kind", [...teamRep
 export type TeamReport = z.infer<typeof recordedTeamReportSchema>;
 export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: recordedTeamReportSchema }).strict();
 export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
-export type TeamRole = "permission-coordinator" | "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery" | "intent-checker";
+export type TeamRole = "permission-coordinator" | "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery" | "intent-checker" | "evaluator";
 /** A mission coordinator's assignment carries the mission ID as `runId`; it reports `MissionReport`s. */
 export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole | "mission-coordinator"; taskId?: string; verificationRefused?: true; entryTools?: true;
   /** The host selects this member's escalation (implementer) or scout (project manager) profiles; a report may omit them. */
@@ -775,6 +778,10 @@ export interface TeamRun {
   intentCheck?: "on" | "off";
   /** Pinned by createRun when the project's register is on; absent otherwise and on runs created before the register existed. */
   register?: "on";
+  /** Pinned by createRun when the project's evaluator and register are on; absent otherwise and on runs created before verdicts existed. */
+  verdicts?: "on";
+  /** The current revision's verdict summary; absent until one is composed. */
+  assessment?: RunAssessment;
   /** Explicit owner delegation pinned at creation. Old runs remain opted out. */
   permissions?: TeamPermissions;
   permissionsRevokedAt?: string;

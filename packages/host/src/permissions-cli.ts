@@ -95,6 +95,13 @@ function printEntry(entry: LogEntry) {
 }
 const REPLAY_USAGE = "Usage: infinite permissions replay --set FILE [--json] [--request-id UUID]";
 const REPLAY_POLL_MS = 2_000;
+/** How long the CLI keeps asking a host that does not answer a replay start or poll, from its last answer. */
+const REPLAY_CONTACT_MS = 120_000;
+
+/** A request the host did not answer in time, or a connection that failed. The host may still have acted on it. */
+function unanswered(error: unknown): boolean {
+  return (error as { name?: unknown } | null)?.name === "TimeoutError" || error instanceof TypeError;
+}
 
 const stringOption = (options: Options, name: string) => {
   const value = options[name];
@@ -315,13 +322,29 @@ export async function handlePermissionsClientCommand(positional: string[], optio
     const status = await api.json<PermissionStatus>("/permissions/status");
     if (!status.readiness) throw new Error("This host does not support permission replays. Upgrade the host.");
     console.error(`[Infinite] Replaying ${parsed.data.cases.length} cases · request ${requestId}`);
-    let { job } = await api.json<{ job: ReplayJob }>("/permissions/replays", { requestId, set });
+    // A busy host can answer late while it works. A start under the same request ID returns the job it started, so both are asked again.
+    let answered = Date.now();
+    const ask = async <T>(path: string, body?: unknown): Promise<T> => {
+      for (;;) {
+        try {
+          const answer = await api.json<T>(path, body);
+          answered = Date.now();
+          return answer;
+        } catch (error) {
+          if (!unanswered(error)) throw error;
+          if (Date.now() - answered >= REPLAY_CONTACT_MS)
+            throw new Error(`The host did not answer for ${REPLAY_CONTACT_MS / 60_000} minutes. The replay may still run: run this command again with --request-id ${requestId} to follow it.`);
+          await delay(REPLAY_POLL_MS);
+        }
+      }
+    };
+    let { job } = await ask<{ job: ReplayJob }>("/permissions/replays", { requestId, set });
     let shown = -1;
     // A replay can take many model turns. The host runs it as a job; the CLI polls until it ends.
     while (job.state === "running") {
       if (job.done !== shown) { console.error(`[Infinite] ${Number(job.done)} of ${Number(job.total)} cases`); shown = job.done; }
       await delay(REPLAY_POLL_MS);
-      job = (await api.json<{ job: ReplayJob }>(`/permissions/replays/${encodeURIComponent(job.id)}`)).job;
+      job = (await ask<{ job: ReplayJob }>(`/permissions/replays/${encodeURIComponent(job.id)}`)).job;
     }
     if (job.state !== "finished" || !job.result) throw new Error(clean(job.error ?? "The replay did not finish.", 500));
     if (options["--json"]) console.log(JSON.stringify(job.result, null, 2));

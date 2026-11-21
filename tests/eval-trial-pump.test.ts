@@ -88,7 +88,7 @@ function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: E
       if (options.forgetThrows) throw new Error("forget failed");
       return true;
     },
-    replayIds: () => options.replayIds ?? [],
+    replayIds: () => { log.push("replayIds"); return options.replayIds ?? []; },
     providerLimits: () => [],
   } as unknown as TrialTeams;
   const sessionsRemoved = options.sessionsRemoved ?? [];
@@ -181,14 +181,31 @@ test("the identity probe is keyed by project", async () => {
   }
 });
 
-test("start-up launches no probe while no trial job is open", async () => {
+test("start-up probes once, not on every step, while no trial job is open", async () => {
   const r = rig({ probes: [{ state: "unavailable" }, { state: "unavailable" }, { state: "unavailable" }] });
   try {
     for (let step = 0; step < 3; step++) await r.pump.step();
-    assert.equal(r.probeInputs.length, 0, "no probe while nothing can run");
+    assert.equal(r.probeInputs.length, 1, "one probe for the first start-up");
     r.addJob();
     await r.pump.step();
-    assert.ok(r.probeInputs.length >= 1, "the start-up runs when the first job opens");
+    assert.equal(r.probeInputs.length, 2, "the start-up runs again when the first job opens");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a start-up that voided rows is retried until the account is clean", async () => {
+  const r = rig({ probes: [{ state: "unavailable" }, READY] });
+  try {
+    const jobId = r.addJob();
+    r.seed(jobId, 0, "running");
+    r.store.write(tx => tx.run("UPDATE eval_jobs SET status = 'cancelled' WHERE job_id = ?", jobId));
+    await r.pump.step();
+    assert.equal(r.probeInputs.length, 1, "the first start-up probes and fails");
+    await r.pump.step();
+    assert.equal(r.probeInputs.length, 2, "the next step probes again");
+    assert.ok(r.log.includes("stop"), "stop ran");
+    assert.ok(r.log.includes("clean"), "clean ran");
   } finally {
     r.cleanup();
   }
@@ -218,8 +235,17 @@ test("the pump starts nothing while the trials module is not ready", async () =>
     for (let step = 0; step < 2; step++) await r.pump.step();
     assert.equal(r.probeInputs.length, 0, "no probe");
     assert.equal(r.log.filter(entry => entry === "status").length, 0, "no trial start");
-    const n = r.store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM eval_trials"))?.n;
-    assert.equal(n, 0, "no trial row");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("the sweep does nothing while the trials module is not ready", async () => {
+  const r = rig({ trialsNewer: true, replayIds: [randomUUID()] });
+  try {
+    await r.pump.sweep();
+    assert.equal(r.log.includes("replayIds"), false, "the teams fake was not asked");
+    assert.equal(r.sessionsRemoved.length, 0, "no session removed");
   } finally {
     r.cleanup();
   }

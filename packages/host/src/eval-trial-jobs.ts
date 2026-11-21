@@ -259,7 +259,8 @@ export class TrialJobs {
 
   block(jobId: string, reason: "eval-processes-alive"): void {
     this.store.write(tx => {
-      if (this.rowOf(tx, jobId) === undefined) return;
+      const row = this.rowOf(tx, jobId);
+      if (row === undefined || (row.status !== "scheduled" && row.status !== "running")) return;
       setJob(tx, jobId, this.now(), { status: "blocked", reason, waiting: null });
     });
   }

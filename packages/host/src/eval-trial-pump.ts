@@ -70,6 +70,10 @@ export class TrialPump {
   private readonly bundle: BundleState = { spawn: () => { throw new Error("No bundle is set."); }, job: null, sha256: null, restreamedFor: null, tooLarge: null };
   private readonly limits = new Map<Provider, number>();
   private started = false;
+  /** True once this process tried the start-up. */
+  private attempted = false;
+  /** True while the account may hold what this process left: voided rows, or a failed stop or clean. */
+  private dirty = false;
   private live: Live | undefined;
   private probed: { at: number; probe: EvalProbe; projectId: string | undefined } | undefined;
   /** Steps to skip before the next trial start, after a source that could not start. */
@@ -110,6 +114,7 @@ export class TrialPump {
   /** Hourly: sweepTrials, forgetReplay for final trials whose run remains, and sessions.remove for at most 20 sessions ended over an hour ago. */
   async sweep(): Promise<void> {
     try {
+      if (!this.ready()) return;
       const at = this.now();
       this.options.store.tryWrite(tx => { sweepTrials(tx, at); });
       const teams = this.options.teams();
@@ -183,9 +188,11 @@ export class TrialPump {
   /** Once per process, before any trial: drops the preparing rows, voids the running ones, and stops, cleans, and resets the account. */
   private async startup(): Promise<boolean> {
     const rows = this.options.store.read(db => liveTrials(db));
-    // With no live row and no open job there is nothing to clean or run: the real start-up waits for the first job.
+    // The first attempt of a process always runs. Later attempts wait for a job unless this process has something to clean.
     const open = this.openJob();
-    if (rows.length === 0 && open === undefined) return false;
+    if (this.attempted && !this.dirty && rows.length === 0 && open === undefined) return false;
+    this.attempted = true;
+    if (rows.length > 0) this.dirty = true;
     const at = this.now();
     for (const row of rows) {
       if (row.state === "preparing") {
@@ -213,6 +220,7 @@ export class TrialPump {
       }
     }
     this.started = true;
+    this.dirty = false;
     return true;
   }
 
@@ -303,7 +311,10 @@ export class TrialPump {
   /** Ends a trial with `ending`: the stopped account, the final row, the clean, the record, and the run's removal. */
   private async close(live: Live, ending: TrialEnding, state: ReplayState | undefined, stopped: Stop): Promise<void> {
     if (stopped === "alive") this.options.jobs.block(live.jobId, "eval-processes-alive");
-    if (stopped !== "stopped") this.started = false;
+    if (stopped !== "stopped") {
+      this.started = false;
+      this.dirty = true;
+    }
     const at = this.now();
     const grade = gradeOf({ ending, expected: this.expectedOf(live.taskId), overwritten: 0, diff: null, isolation: live.source.isolation });
     this.options.store.write(tx => finishTrial(tx, live.trialId, this.final(grade, null, null, state?.sessionId ?? live.sessionId ?? null), at));
@@ -312,7 +323,10 @@ export class TrialPump {
 
   /** The steps after a trial's row is final: the clean, the record, the run's removal, and the provider limit. */
   private async afterFinal(live: Live, ending: TrialEnding, state: ReplayState | undefined): Promise<void> {
-    if (!(await this.cleanAndScrub())) this.started = false;
+    if (!(await this.cleanAndScrub())) {
+      this.started = false;
+      this.dirty = true;
+    }
     this.options.jobs.record(live.jobId, ending);
     await this.options.teams().forgetReplay(live.trialId).catch(() => false);
     if (ending === "void-limit") this.limit(live.configuration.profile.provider, state?.resetsAt);

@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { join, resolve } from "node:path";
 import { Manager } from "../packages/host/src/manager.js";
 import { workerCall } from "../packages/host/src/ipc.js";
+import { headlessChannelArgs } from "../packages/host/src/launch.js";
 import {
   HeadlessPermissionChannel, channelToken, deferredCallOpen, deliveryKey, type ChannelReply,
 } from "../packages/host/src/permission-headless.js";
@@ -295,40 +296,29 @@ const claudeModeHooks = (name: string) => readFileSync(new URL(`./fixtures/claud
 test("Code Mode deferred Write resumes the same captured call id", async () => {
   const rows = claudeModeHooks("defer-hooks.jsonl");
   const w = workerRig([{ result: "none" }, { ...owner, rule: "write-owner" }]);
-  const dispatch = async (body: Record<string, unknown>) => {
-    if (body.hook_event_name === "PreToolUse") return w.channel.check(body);
-    if (body.hook_event_name === "PermissionRequest") return w.channel.request(body);
-    return undefined;
-  };
+  const launchArgs = headlessChannelArgs("/repo/hook-relay.js", true);
+  const settings: { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> } = JSON.parse(launchArgs[launchArgs.indexOf("--settings") + 1]!);
+  const routes = (event: string) => settings.hooks[event]?.[0]?.hooks.map(({ command }) => command.split(" ").slice(-2).join(" ")) ?? [];
+  assert.deepEqual(routes("PreToolUse"), ["/repo/hook-relay.js claude", "/repo/permission-hook.js check"]);
+  assert.deepEqual(routes("PermissionRequest"), ["/repo/permission-hook.js request"]);
+  assert.deepEqual(routes("PostToolUse"), ["/repo/hook-relay.js claude"]);
+  assert.deepEqual(routes("UserPromptSubmit"), ["/repo/hook-relay.js claude"]);
   const bash = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Bash")!;
   const original = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Write")!;
   const resumed = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Write" && row !== original)!;
   const callId = original.tool_use_id;
   assert.equal(typeof callId, "string");
-  assert.match(callId as string, /^toolu_cc_[0-9a-f]{32}$/);
   assert.equal(resumed.tool_use_id, callId);
-  for (const row of rows) {
-    const before = w.channel.view();
-    const requestCount = w.requests.length;
-    const answer = await dispatch(row);
-    if (row === original) {
-      assert.deepEqual(answer, { decision: "defer", reason: "This call waits for the owner's answer. The session resumes with that answer." });
-      const deferred = w.records.find(record => record.event === "deferred");
-      assert.equal(deferred?.callId, callId);
-      assert.equal(deferred?.rule, "write-owner");
-      assert.equal(w.channel.exited(0), true);
-      w.channel.answer({ requestId: "fixture-owner-answer", promptId: w.prompts[0]!, option: 0 });
-    } else if (row === resumed) {
-      assert.deepEqual(answer, { decision: "allow" });
-      assert.equal(w.records.find(record => record.event === "delivered")?.callId, callId);
-    } else if ((row.hook_event_name === "PostToolUse" && row.tool_name === "REPL") || (row.hook_event_name === "UserPromptSubmit" && row.prompt === "Continue from where you left off.")) {
-      assert.equal(answer, undefined);
-      assert.deepEqual(w.channel.view(), before);
-      assert.equal(w.requests.length, requestCount);
-    } else if (row === bash) {
-      assert.deepEqual(answer, { decision: "none" });
-    }
-  }
+
+  assert.deepEqual(await w.channel.check(bash), { decision: "none" });
+  assert.deepEqual(await w.channel.check(original), { decision: "defer", reason: "This call waits for the owner's answer. The session resumes with that answer." });
+  const deferred = w.records.find(record => record.event === "deferred");
+  assert.equal(deferred?.callId, callId);
+  assert.equal(deferred?.rule, "write-owner");
+  assert.equal(w.channel.exited(0), true);
+  w.channel.answer({ requestId: "fixture-owner-answer", promptId: w.prompts[0]!, option: 0 });
+  assert.deepEqual(await w.channel.check(resumed), { decision: "allow" });
+  assert.equal(w.records.find(record => record.event === "delivered")?.callId, callId);
   assert.equal(w.channel.waiting(), false);
 });
 

@@ -140,6 +140,15 @@ test("the verdict context holds owner text and host facts only", () => {
   assert.deepEqual(Object.keys(context).sort(), ["base", "changedPaths", "checks", "head", "kind", "receipts", "record", "rubric", "verdictKind"]);
 });
 
+test("a later round that holds only a failed setup row lists no checks", () => {
+  const setup = { command: { command: "npm", args: ["ci"] }, phase: "setup", status: "failed", startedAt: "t", output: "", revision: 2, round: 2, headCommit: HEAD };
+  const base = runFixture();
+  const run = runFixture({ checks: [...base.checks, setup] });
+  const context = verdictContext({ run, record: recordFixture(), head: HEAD, kind: "reviewed" });
+  assert.ok(context);
+  assert.deepEqual(context.checks, [], "the final round is round 2, and it shows no setup row");
+});
+
 test("a change record from another head leaves no changed paths", () => {
   const stale = runFixture({ changes: { headCommit: OLD_HEAD, recordedAt: "t", truncated: false, files: [{ path: "src/old.ts", status: "added", added: 1, removed: 0 }] } });
   const context = verdictContext({ run: stale, record: recordFixture(), head: HEAD, kind: "no-change" });

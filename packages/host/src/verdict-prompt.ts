@@ -79,7 +79,7 @@ export function verdictContext(input: { run: TeamRun; record: ObjectiveRecord; h
     changedPaths: run.changes?.headCommit === head
       ? { paths: run.changes.files.map(file => file.path), truncated: run.changes.truncated }
       : { paths: [], truncated: true },
-    checks: finalRound.map(check => ({ name: [check.command.command, ...check.command.args].join(" "), status: check.status })),
+    checks: finalRound.filter(check => check.phase === undefined).map(check => ({ name: [check.command.command, ...check.command.args].join(" "), status: check.status })),
     receipts: (input.receipts ?? [])
       .filter(item => item.subject === "criterion" && item.commit === head)
       .map(({ handle, kind: receiptKind, id, outcome }) => ({ handle, kind: receiptKind, id, outcome })),
@@ -87,9 +87,12 @@ export function verdictContext(input: { run: TeamRun; record: ObjectiveRecord; h
   return Buffer.byteLength(JSON.stringify(context), "utf8") > VERDICT_CONTEXT_BYTES ? undefined : context;
 }
 
-/** This revision's highest round, without setup rows, kept at the head (the receipts' own reading of a final round). */
-function finalCheckRound(run: TeamRun, head: string): TeamRun["checks"] {
-  const atRevision = run.checks.filter(check => check.revision === run.revision && check.phase === undefined);
+/**
+ * This revision's highest round among all its rows, setup rows included, kept at the head: the receipts' own reading of a final
+ * round (objective-receipts roundsOf). A last round that holds only a failed setup row is the final round, and passed nothing.
+ */
+export function finalCheckRound(run: TeamRun, head: string): TeamRun["checks"] {
+  const atRevision = run.checks.filter(check => check.revision === run.revision);
   if (atRevision.length === 0) return [];
   const round = Math.max(...atRevision.map(check => check.round ?? 0));
   return atRevision.filter(check => (check.round ?? 0) === round && check.headCommit === head);

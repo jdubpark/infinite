@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { Prompt } from "@infinite/attention";
 import type { Blackboard } from "../../packages/host/src/evidence/blackboard.js";
@@ -22,23 +22,33 @@ import { schedulerFixture } from "./team-scheduler.js";
  *
  * Fault: the host stops right after the Nth record write of a request or pass. The simulator drops the service, opens
  * a new one from disk, and retries the cut request with the same request id.
+ * What a stop models: the host process ends right after that write lands. No process is killed. From the stop on, every
+ * call the old service makes into what it was given (fixture manager, Blackboard, clock, project runner) fails with
+ * HostStopped, and a state file it changes after the stop is put back before the restart. Its timers run until its
+ * close(), which still runs at the restart with every effect refused.
  *
  * Invariants, checked against a small pure model that changes only when the host acknowledged a request:
  * I1 An acknowledged request took effect exactly once: revision, status, halt, steering, answers, revocation,
  *    continuations, its event line, and its receipt, across any stop and retry. A request the host admitted before a
  *    stop is acknowledged on retry.
  * I2 A retry of an acknowledged request with the same request id is acknowledged, keeps its receipt, and writes nothing.
- * I3 The record loads after every stop, and its status and revision are the model's before or after the cut request.
- *    After the host's own pass only the halt may have changed.
- * I4 Revision, member cursors and saved receipts never go back across writes, stops and restarts.
+ * I3 The record loads after every stop, and its whole projection is the model's before the cut request, after it, or
+ *    the intermediate state INTERMEDIATE names for that request and write. After the host's own pass only the halt may
+ *    have changed.
+ * I4 Revision, member cursors and saved receipts never go back across writes, stops and restarts. Cursors start at
+ *    the end of the member's journal and never advance here: only the scheduler's full pass reads reports.
  * I5 A settled run stays settled: once a cancelled record is written, every later record is cancelled at the same
  *    revision, and no new request is acknowledged.
  * I6 A refused request writes nothing.
  * I7 A request is acknowledged only at the revision it names, and a request id belongs to one action: the same id with
  *    another action or body is refused as a request conflict.
+ * Two values are observed, not modeled: each receipt's digest (I2 checks it never changes), and whether a host pass
+ * ended the halt (I3 allows either).
  */
 
 export class Violation extends Error {}
+/** What every dependency of a stopped service answers: the host process is gone. */
+export class HostStopped extends Error {}
 
 export type Kind = "pause" | "resume" | "cancel" | "steer" | "revoke" | "answer" | "continue";
 const KINDS: readonly Kind[] = ["pause", "resume", "cancel", "steer", "revoke", "answer", "continue"];
@@ -57,6 +67,7 @@ const EVENT: Record<Kind, string> = {
 const SETTLED: ReadonlySet<TeamStatus> = new Set(["cancelled", "merged", "no-change", "ready-for-review"]);
 // A fixed clock for retention, so a run never ages out under the simulator.
 const T0 = Date.parse("2026-11-13T10:00:00.000Z");
+const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g;
 export const RERUN = (seed: number, strict = false) => `${strict ? "TEAM_SIM_STRICT=1 " : ""}TEAM_SIM_SEED=${seed} node --import tsx --test tests/team-run-sim.test.ts`;
 
 // ---- Model -------------------------------------------------------------------------------------------------------
@@ -93,7 +104,23 @@ function apply(m: Model, request: Request): Model {
   return next;
 }
 
+/** The model once the host acknowledged `request`: its effect, and its id among the acknowledged. */
+function acknowledge(pre: Model, request: Request, receipt = ""): Model {
+  return { ...apply(pre, request), acked: { ...pre.acked, [request.body.requestId]: { request, receipt } } };
+}
+
+/**
+ * I3's intermediate states: what the record may hold after a stop that follows write `cut` of a request, besides the
+ * state before it and the state after it, as the change relative to the state before. None holds the request's
+ * receipt: a saved receipt answers the retry by replay, so the request's whole effect must be saved with it.
+ */
+const INTERMEDIATE: Readonly<Record<string, (pre: Model) => Partial<Model>>> = {
+  // Revocation is set before the permission fence's save, so no delegated answer starts while the fence runs.
+  "revoke:1": () => ({ revoked: true }),
+};
+
 type Projection = Omit<Model, "acked" | "replannable"> & { receipts: string[] };
+type Allowed = readonly (readonly [string, Model])[];
 
 function project(saved: Saved): Projection {
   const run = saved.run;
@@ -106,6 +133,12 @@ function project(saved: Saved): Projection {
 function expected(m: Model): Projection {
   const { acked, replannable: _replannable, ...rest } = m;
   return { ...rest, receipts: Object.keys(acked).sort() };
+}
+
+/** The name of the allowed state the record holds, or undefined. */
+function match(saved: Saved, allowed: Allowed): string | undefined {
+  const got = project(saved);
+  return allowed.find(([, m]) => isDeepStrictEqual(expected(m), got))?.[0];
 }
 
 function difference(want: Projection, got: Projection): string {
@@ -199,6 +232,9 @@ function setup(f: Fixture, s: Script): Model {
   const run = f.run, pm = run.members[0]!;
   const events = Object.fromEntries(KINDS.map(kind => [kind, 0])) as Record<Kind, number>;
   const [decisionId, permissionId, answerRequestId, coordinatorMemberId] = s.ids as [string, string, string, string];
+  // The coordinator has read its journal so far, so I4 has a nonzero cursor to keep.
+  f.journal.append("output", { text: "Earlier output." }); f.journal.append("output", { text: "Later output." });
+  pm.cursor = f.journal.seq;
   if (s.start !== "working") pm.status = s.start === "waiting" ? "waiting" : "stopped";
   if (s.start === "paused") run.status = "paused";
   if (s.start === "stalled") { run.status = "blocked"; run.reason = memberStallReason; }
@@ -230,60 +266,116 @@ function setup(f: Fixture, s: Script): Model {
  */
 export type Variant = { patch?: (service: TeamService) => void; stop?: "clean" | "torn" | "lost"; strict?: boolean };
 type Outcome<T> = { value?: T; error?: unknown; writes: Saved[]; stopped: boolean };
+/** One service's life: whether its host stopped, and the call it stopped in. */
+type Life = { stopped: boolean; label: string };
 
-/** One TeamService at a time over the fixture's state directory, with a stop armed per call. */
+/** Every file under `root` with its bytes, by path relative to `root`, less the paths in `skip`. */
+function files(root: string, skip: ReadonlySet<string>, at = ""): Map<string, Buffer> {
+  const found = new Map<string, Buffer>();
+  for (const entry of readdirSync(join(root, at), { withFileTypes: true })) {
+    const name = join(at, entry.name);
+    if (skip.has(name)) continue;
+    if (entry.isDirectory()) for (const [inner, bytes] of files(root, skip, name)) found.set(inner, bytes);
+    else if (entry.isFile()) found.set(name, readFileSync(join(root, name)));
+  }
+  return found;
+}
+
+/**
+ * One TeamService at a time over the fixture's state directory, with a stop armed per call. Every service gets the same
+ * fixture manager: its sessions, states and journals stand for worker processes, which outlive a host restart. Its one
+ * host-side part, hostLoad, keeps no state, and its counters only record calls, so a restart resets nothing there.
+ * The config and key are data, not calls, and are not guarded.
+ */
 class Host {
   service?: TeamService;
   private writes: Saved[] = [];
   private stopAt = 0;
+  private label = "open";
+  private life: Life = { stopped: false, label: "open" };
   private before?: Buffer;
-  private stopped = false;
+  private unblock?: () => void;
+  private atStop?: Map<string, Buffer>;
   private readonly file: string;
+  private readonly skip: ReadonlySet<string>;
 
-  constructor(private readonly f: Fixture, private readonly variant: Variant) {
+  constructor(private readonly f: Fixture, private readonly variant: Variant, private readonly counts: Counts) {
     this.file = join(f.config.stateDir, "teams", `${f.run.id}.sealed`);
+    this.skip = new Set([join("teams", `${f.run.id}.sealed`), join("teams", `${f.run.id}.sealed.saved`)]);
   }
 
   bytes(): Buffer { return readFileSync(this.file); }
   read(): Saved { return unseal<Saved>(this.f.key, `team:${this.f.run.id}`, readFileSync(this.file, "utf8")); }
 
+  /** Wraps each method of a dependency: once `life` stopped, a call reaches nothing and fails with HostStopped. */
+  private guard<T extends object>(life: Life, target: T, path = ""): T {
+    return new Proxy(target, { get: (object, key) => {
+      const value: unknown = Reflect.get(object, key), name = `${path}${String(key)}`;
+      if (typeof value === "object" && value !== null) return this.guard(life, value, `${name}.`);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        if (!life.stopped) return value.apply(object, args);
+        bump(this.counts, `after-stop:${life.label}:${name}`);
+        const error = new HostStopped(`The host stopped before ${name}.`);
+        if (value.constructor.name === "AsyncFunction") return Promise.reject(error);
+        throw error;
+      };
+    } });
+  }
+
   /** Opens a service over the record on disk. Its constructor's own writes are returned. */
   open(): Saved[] {
     this.writes = [];
+    const life: Life = { stopped: false, label: this.label };
+    this.life = life;
     let previous = this.bytes();
     // The Blackboard mirror runs right after each sealed write lands: the simulator's write counter and stop switch.
     const entries = { retryable: () => false, held: () => false, unread: () => false, mirror: () => {
       this.writes.push(this.read());
       if (this.stopAt > 0 && this.writes.length === this.stopAt) {
-        this.before = previous; this.stopped = true;
-        renameSync(this.file, `${this.file}.saved`); mkdirSync(this.file);
-      }
-      previous = this.stopped ? previous : this.bytes();
+        life.stopped = true; life.label = this.label; this.before = previous;
+        this.atStop = files(this.f.config.stateDir, this.skip);
+        this.unblock = this.f.blockRecordWrites("team", this.f.run.id);
+      } else previous = this.bytes();
       return true;
-    } } as unknown as Blackboard;
-    const service = new TeamService(this.f.config, this.f.key, this.f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { entries, now: () => T0 });
+    } };
+    const given = this.guard(life, { now: () => T0, start: (_project: string, start: () => unknown) => start() });
+    const service = new TeamService(this.f.config, this.f.key, this.guard(life, this.f.manager) as unknown as Manager, given.start as never,
+      undefined, undefined, { entries: this.guard(life, entries) as unknown as Blackboard, now: given.now });
     this.variant.patch?.(service);
     this.service = service;
     return this.writes;
   }
 
   /** Runs one host call; with `stopAt`, the host stops right after that write of the call and its answer is lost. */
-  async call<T>(work: (service: TeamService) => Promise<T>, stopAt = 0): Promise<Outcome<T>> {
-    this.writes = []; this.stopAt = stopAt; this.stopped = false;
+  async call<T>(work: (service: TeamService) => Promise<T>, label: string, stopAt = 0): Promise<Outcome<T>> {
+    const life = this.life;
+    this.writes = []; this.stopAt = stopAt; this.label = label;
     let value: T | undefined, error: unknown;
     try { value = await work(this.service!); } catch (caught) { error = caught; }
     this.stopAt = 0;
-    return { value, error, writes: this.writes, stopped: this.stopped };
+    return { value, error, writes: this.writes, stopped: life.stopped };
   }
 
-  /** Drops the service and opens a new one from disk; after a stop the record file comes back first. */
+  /** Puts back every state file other than the record that changed after the stop, and counts each by its generic name. */
+  private restoreFiles() {
+    const root = this.f.config.stateDir, then = this.atStop!, now = files(root, this.skip);
+    for (const [name, bytes] of then) if (!now.get(name)?.equals(bytes)) {
+      bump(this.counts, `after-stop:file:${name.replace(UUID, "<id>")}`);
+      mkdirSync(dirname(join(root, name)), { recursive: true }); writeFileSync(join(root, name), bytes);
+    }
+    for (const name of now.keys()) if (!then.has(name)) { bump(this.counts, `after-stop:file:${name.replace(UUID, "<id>")}`); rmSync(join(root, name)); }
+  }
+
+  /** Drops the service and opens a new one from disk; after a stop the state files and the record come back first. */
   async restart(): Promise<Saved[]> {
-    await this.service!.close();
-    if (this.stopped) {
-      rmdirSync(this.file); renameSync(`${this.file}.saved`, this.file);
+    const life = this.life;
+    await this.service!.close().catch(error => { if (!(error instanceof HostStopped)) throw error; });
+    if (life.stopped) {
+      this.restoreFiles();
+      this.unblock!(); this.unblock = undefined;
       if (this.variant.stop === "torn") writeFileSync(this.file, this.bytes().subarray(0, this.bytes().length >> 1));
       if (this.variant.stop === "lost") writeFileSync(this.file, this.before!);
-      this.stopped = false;
     }
     return this.open();
   }
@@ -314,15 +406,19 @@ const code = (error: unknown) => error instanceof TeamError ? error.code : error
  * A defect in the current code that the simulator finds. It is counted, not thrown, unless the variant is strict.
  * A pause or a cancel records its receipt with its status before the permission fence's save, and adds its event line
  * and stopping reason only in the save after it. A stop between the two leaves the request answered on retry, the run
- * paused or cancelled, and no "Team paused." or "Team cancelled." line.
+ * paused or cancelled, and no "Team paused." or "Team cancelled." line. I3 sees it on the reopened record.
  */
 export const KNOWN_DEFECT = "pause-cancel-event-lost";
 
-function knownDefect(m: Model, got: Projection, request: Request, cut: boolean): boolean {
-  if (!cut || (request.kind !== "pause" && request.kind !== "cancel")) return false;
-  const want = expected(m);
-  return isDeepStrictEqual({ ...want, events: { ...want.events, [request.kind]: want.events[request.kind] - 1 } }, got);
+/** Whether the record written at the cut (`captured`) is the defect's: only write 1 of a pause or cancel. */
+function knownDefect(request: Request, cut: number, captured: Saved, prior: Saved): boolean {
+  if (cut !== 1 || (request.kind !== "pause" && request.kind !== "cancel")) return false;
+  const lines = (saved: Saved) => saved.run.events.filter(event => event.text.startsWith(EVENT[request.kind])).length;
+  return Boolean(captured.receipts[request.body.requestId]) && captured.run.status === (request.kind === "pause" ? "paused" : "cancelled") &&
+    captured.halt === request.kind && lines(captured) === lines(prior) && captured.run.reason === prior.run.reason;
 }
+
+const withoutEvent = (m: Model, kind: Kind): Model => ({ ...m, events: { ...m.events, [kind]: m.events[kind] - 1 } });
 
 // ---- Simulation --------------------------------------------------------------------------------------------------
 
@@ -373,15 +469,15 @@ class Sim {
   }
 
   /** The record holds exactly the model's state; `invariant` names the check that expects it. */
-  private effect(saved: Saved, invariant: string, request?: Request, cut = false) {
+  private effect(saved: Saved, invariant: string, request?: Request) {
     const want = expected(this.model), got = project(saved);
-    if (isDeepStrictEqual(want, got)) return;
-    if (request && !this.variant.strict && knownDefect(this.model, got, request, cut)) {
-      bump(this.counts, `known:${KNOWN_DEFECT}:${request.kind}`);
-      this.model = { ...this.model, events: got.events };
-      return;
-    }
-    this.fail(invariant, `${request ? `after the acknowledged ${request.kind}, ` : ""}${difference(want, got)}`);
+    if (!isDeepStrictEqual(want, got)) this.fail(invariant, `${request ? `after the acknowledged ${request.kind}, ` : ""}${difference(want, got)}`);
+  }
+
+  /** I3: the record holds none of the allowed states. */
+  private unexpected(saved: Saved, allowed: Allowed, what: string): never {
+    const got = project(saved);
+    this.fail("I3", `${what} is none of the states the model allows; ${allowed.map(([name, m]) => `against ${name}: ${difference(expected(m), got)}`).join("; ")}`);
   }
 
   private build(step: Extract<Step, { do: "request" }>): Request {
@@ -392,23 +488,34 @@ class Sim {
   }
 
   private async request(step: Extract<Step, { do: "request" }>) {
-    const request = this.build(step), pre = this.model, before = this.host.bytes();
-    const result = await this.host.call(service => send(service, this.f.run.id, request), step.stopAt);
+    const request = this.build(step), pre = this.model, before = this.host.bytes(), prior = this.host.read();
+    const result = await this.host.call(service => send(service, this.f.run.id, request), request.kind, step.stopAt);
     this.durableChecks(result.writes, `the ${request.kind}`);
     if (result.stopped) {
       // A refused request writes nothing (I6), so a request that wrote before the stop was admitted.
       if (request.body.revision !== pre.revision) this.fail("I7", `a ${request.kind} issued against revision ${request.body.revision} wrote the record at revision ${pre.revision} before the stop`);
       if (SETTLED.has(pre.status)) this.fail("I5", `a new ${request.kind} wrote the ${pre.status} record before the stop`);
       bump(this.counts, `cut:${request.kind}:${step.stopAt}`);
-      await this.reopen(pre, apply(pre, request));
-      const retry = await this.host.call(service => send(service, this.f.run.id, request));
+      const post = acknowledge(pre, request), name = `intermediate:${request.kind}:${step.stopAt}`, change = INTERMEDIATE[`${request.kind}:${step.stopAt}`];
+      const allowed: Allowed = [["the state before it", pre], ["the state after it", post], ...(change ? [[name, { ...pre, ...change(pre) }] as const] : [])];
+      // I3 before the retry: once retried, a repaired record would hide what the stop left.
+      const saved = await this.reopen(), held = match(saved, allowed);
+      let lost = false;
+      if (held === name) bump(this.counts, name);
+      if (held === undefined) {
+        if (this.variant.strict || !knownDefect(request, step.stopAt, result.writes[step.stopAt - 1]!, prior) ||
+            !isDeepStrictEqual(project(saved), expected(withoutEvent(post, request.kind)))) this.unexpected(saved, allowed, "the reopened record");
+        bump(this.counts, `known:${KNOWN_DEFECT}:${request.kind}`);
+        lost = true;
+      }
+      const retry = await this.host.call(service => send(service, this.f.run.id, request), request.kind);
       this.durableChecks(retry.writes, `the retried ${request.kind}`);
       if (retry.error !== undefined) this.fail("I1", `the host admitted the ${request.kind} before the stop, and refused its retry (${code(retry.error)})`);
-      this.acknowledged(request, pre, retry.value!, true);
+      this.acknowledged(request, pre, retry.value!, true, lost);
     } else if (result.error !== undefined) {
       this.refused(request, before, result);
       return;
-    } else this.acknowledged(request, pre, result.value!, false);
+    } else this.acknowledged(request, pre, result.value!, false, false);
     if (step.again) await this.retry(request);
     // The host's next pass, which ends a halt the request set, so a later resume is not refused while members stop.
     if (step.settle && this.model.halted) await this.pass(0);
@@ -420,12 +527,13 @@ class Sim {
     bump(this.counts, `refused:${result.error.code}`);
   }
 
-  private acknowledged(request: Request, pre: Model, view: TeamView, cut: boolean) {
+  /** `lost`: the known defect dropped this request's event line, so the model goes without it. */
+  private acknowledged(request: Request, pre: Model, view: TeamView, cut: boolean, lost: boolean) {
     if (SETTLED.has(pre.status)) this.fail("I5", `a new ${request.kind} was acknowledged on a ${pre.status} run`);
     if (request.body.revision !== pre.revision) this.fail("I7", `a ${request.kind} issued against revision ${request.body.revision} was acknowledged at revision ${pre.revision}`);
-    const saved = this.host.read(), receipt = saved.receipts[request.body.requestId];
-    this.model = { ...apply(pre, request), acked: { ...pre.acked, [request.body.requestId]: { request, receipt: receipt ?? "" } } };
-    this.effect(saved, "I1", request, cut);
+    const saved = this.host.read(), post = acknowledge(pre, request, saved.receipts[request.body.requestId] ?? "");
+    this.model = lost ? withoutEvent(post, request.kind) : post;
+    this.effect(saved, "I1", request);
     if (view.status !== saved.run.status || view.revision !== saved.run.revision)
       this.fail("I1", `the acknowledgement shows ${view.status} at revision ${view.revision}; the record holds ${saved.run.status} at ${saved.run.revision}`);
     bump(this.counts, `ack:${request.kind}`);
@@ -435,7 +543,7 @@ class Sim {
   /** I2: the same request again, after it was acknowledged. */
   private async retry(request: Request) {
     const receipt = this.model.acked[request.body.requestId]!.receipt, before = this.host.bytes();
-    const result = await this.host.call(service => send(service, this.f.run.id, request));
+    const result = await this.host.call(service => send(service, this.f.run.id, request), request.kind);
     if (result.error !== undefined) this.fail("I2", `a retry of the acknowledged ${request.kind} was refused (${code(result.error)})`);
     if (result.writes.length > 0 || !before.equals(this.host.bytes())) this.fail("I2", `a retry of the acknowledged ${request.kind} wrote the record`);
     if (this.host.read().receipts[request.body.requestId] !== receipt) this.fail("I2", `a retry of the acknowledged ${request.kind} changed its receipt`);
@@ -459,7 +567,7 @@ class Sim {
     // The same kind at the same revision is the same request unless its text differs; steer and answer carry new text.
     if (request.kind === prior.kind && request.body.revision === prior.body.revision && request.kind !== "steer" && request.kind !== "answer") request.body.revision += 1;
     const before = this.host.bytes();
-    const result = await this.host.call(service => send(service, this.f.run.id, request));
+    const result = await this.host.call(service => send(service, this.f.run.id, request), request.kind);
     if (result.error === undefined) this.fail("I7", `request id ${prior.body.requestId}, acknowledged as a ${prior.kind}, was acknowledged again as a different ${request.kind}`);
     if (code(result.error) !== "request-conflict") this.fail("I7", `request id ${prior.body.requestId} reused as a different ${request.kind} was refused as ${code(result.error)}, not as a request conflict`);
     this.refused(request, before, result);
@@ -468,61 +576,58 @@ class Sim {
   /** The host's own pass, which ends a halt once members stopped. It is not a request; the model takes the halt from the record. */
   private async pass(stopAt: number) {
     if (!this.model.halted) return bump(this.counts, "pass:idle");
-    const pre = this.model, step = (service: TeamService) => {
+    const pre = this.model, allowed: Allowed = [["the state before it", pre], ["the state with its halt ended", { ...pre, halted: false }]];
+    const step = (service: TeamService) => {
       const internal = service as unknown as Internal;
       return internal.step(internal.record(this.f.run.id));
     };
-    const result = await this.host.call(step, stopAt);
+    const result = await this.host.call(step, "pass", stopAt);
     this.durableChecks(result.writes, "the pass");
     if (result.stopped) {
       bump(this.counts, "cut:pass");
-      await this.reopen(pre, { ...pre, halted: false });
+      const reopened = await this.reopen();
+      if (match(reopened, allowed) === undefined) this.unexpected(reopened, allowed, "the reopened record");
       // The next pass runs only while the halt holds: past it, a pass would plan and launch members.
-      if (this.host.read().halt) {
-        const again = await this.host.call(step);
+      if (reopened.halt) {
+        const again = await this.host.call(step, "pass");
         this.durableChecks(again.writes, "the pass after the stop");
         if (again.error !== undefined) throw again.error;
       }
     } else if (result.error !== undefined) throw result.error;
     const saved = this.host.read();
-    this.allowed(saved, [pre], "the pass");
+    if (match(saved, allowed) === undefined) this.unexpected(saved, allowed, "the record after the pass");
     this.model = { ...pre, halted: Boolean(saved.halt) };
-    this.effect(saved, "I3");
     bump(this.counts, saved.halt ? "pass:still-halted" : "pass:ended-halt");
   }
 
   private async restart() {
-    await this.reopen(this.model, this.model);
-    this.effect(this.host.read(), "I3");
+    const saved = await this.reopen(), allowed: Allowed = [["the model", this.model]];
+    if (match(saved, allowed) === undefined) this.unexpected(saved, allowed, "the record after a clean restart");
     bump(this.counts, "restart");
   }
 
-  /** I3, I4 and I5 after the host stopped: a new service opens over the record, whose state is `pre` or `post`. */
-  private async reopen(pre: Model, post: Model) {
+  /** I3's load, I4 and I5 after the host stopped: a new service opens over the record. Returns the record it holds. */
+  private async reopen(): Promise<Saved> {
     let writes: Saved[];
     try { writes = await this.host.restart(); } catch (error) { this.fail("I3", `the record does not load after the stop (${code(error)})`); }
     this.durableChecks(writes, "the reopened service");
     let saved: Saved;
     try { saved = this.host.read(); } catch (error) { this.fail("I3", `the record does not load after the stop (${code(error)})`); }
     this.durableCheck(saved, "the reopened record");
-    this.allowed(saved, [pre, post], "the reopened record");
-  }
-
-  private allowed(saved: Saved, models: readonly Model[], what: string) {
-    const { status, revision } = saved.run;
-    if (!models.some(m => m.status === status && m.revision === revision))
-      this.fail("I3", `${what} is ${status} at revision ${revision}; the model allows ${models.map(m => `${m.status} at ${m.revision}`).join(" or ")}`);
+    return saved;
   }
 }
 
 /** One seed: one run, one script, checked after every step. Throws a Violation that names its seed and step. */
 export async function simulate(seed: number, counts: Counts, variant: Variant = {}): Promise<void> {
-  const s = script(seed), f = schedulerFixture(), host = new Host(f, variant);
+  const s = script(seed);
   bump(counts, `start:${s.start}${s.delegated ? ":delegated" : ""}`);
+  let f: Fixture | undefined, host: Host | undefined;
   try {
+    f = schedulerFixture(); host = new Host(f, variant, counts);
     await new Sim(seed, f, host, counts, variant).run(s);
   } finally {
-    await host.close()?.catch(() => undefined);
-    f.close();
+    await host?.close()?.catch(() => undefined);
+    f?.close();
   }
 }

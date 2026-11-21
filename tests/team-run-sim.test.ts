@@ -50,7 +50,7 @@ const FLOORS: Readonly<Record<string, number>> = {
   "ack:pause": 31, "ack:resume": 28, "ack:cancel": 8, "ack:steer": 34, "ack:revoke": 16, "ack:answer": 3, "ack:continue": 2,
   "retry:pause": 8, "retry:resume": 9, "retry:cancel": 4, "retry:steer": 10, "retry:revoke": 5, "retry:answer": 1, "retry:continue": 1,
   "refused:request-conflict": 20, "refused:stale-team-revision": 18, "refused:team-cancelled": 29, "refused:members-stopping": 8,
-  "pass:ended-halt": 49, "restart": 26,
+  "pass:ended-halt": 49, "restart": 26, "intermediate:revoke:1": 4,
 };
 
 test("team run requests keep their invariants across host stops", async t => {
@@ -59,7 +59,7 @@ test("team run requests keep their invariants across host stops", async t => {
   const violation = await sweep(SEEDS, counts, { strict: STRICT });
   if (violation) throw violation;
   t.diagnostic(`team sim: ${SEEDS.length} seeds from ${SEEDS[0]} in ${((performance.now() - started) / 1000).toFixed(1)} s, ${JSON.stringify(Object.fromEntries(sortedCounts(counts)))}`);
-  if (!DEFAULT_CORPUS) return;
+  if (!DEFAULT_CORPUS) return t.diagnostic("coverage floors are off: they describe the default corpus, and a TEAM_SIM_* setting changed it");
   for (const [name, floor] of Object.entries(FLOORS)) {
     assert.ok((counts[name] ?? 0) >= floor, `${name} ran ${counts[name] ?? 0} times, under its floor of ${floor}: the generator stopped producing it`);
   }
@@ -67,7 +67,7 @@ test("team run requests keep their invariants across host stops", async t => {
 
 // ---- Mutations ---------------------------------------------------------------------------------------------------
 
-type Stored = { run: TeamRun; receipts: Record<string, string>; checkHead?: string };
+type Stored = { run: TeamRun; receipts: Record<string, string>; checkHead?: string; halt?: string };
 type Body = { requestId: string; revision: number };
 /** The private service methods the source mutants replace on one instance. No file is edited. */
 type Private = {
@@ -76,6 +76,7 @@ type Private = {
   save(stored: Stored): void;
   resumeRun(stored: Stored, inPlace?: boolean, record?: () => void): Promise<void>;
   invalidatePermissionDecisions(stored: Stored, reason: string): Promise<boolean>;
+  event(stored: Stored, text: string): void;
 };
 const internals = (service: TeamService) => service as unknown as Private;
 
@@ -92,7 +93,8 @@ const patchReplay = (wrap: (host: Private, replay: Private["replay"]) => Private
 } });
 
 const MUTATIONS: readonly Mutation[] = [
-  { name: "the receipt is recorded at admission, before the permission fence's save (INF-331)", invariant: "I1", kind: "source",
+  // I3 sees the receipt on the reopened record before the retry; I1 would see the missing effect after it.
+  { name: "the receipt is recorded at admission, before the permission fence's save (INF-331)", invariant: "I3", kind: "source",
     variant: patchAdmit((_host, admit) => (stored, operation, body) => {
       const receipt = admit(stored, operation, body);
       if (receipt) stored.receipts[body.requestId] = receipt;
@@ -117,15 +119,39 @@ const MUTATIONS: readonly Mutation[] = [
         run.status = "planning"; run.reason = undefined; run.blockCode = undefined;
       };
     } } },
+  // A resume with no stop shows it first, through I1. Cut at write 1, I3 would see the cleared steering.
+  { name: "a resume clears the steering before the permission fence's save", invariant: "I1", kind: "source",
+    variant: { patch: service => {
+      const host = internals(service), resumeRun = host.resumeRun.bind(host);
+      host.resumeRun = (stored, inPlace, record) => { stored.run.steering = []; return resumeRun(stored, inPlace, record); };
+    } } },
+  // Its retry sets the halt again with the rest of the steer, so only a check before the retry sees it.
+  { name: "a steer sets its halt before the permission fence's save", invariant: "I3", kind: "source",
+    variant: patchAdmit((_host, admit) => (stored, operation, body) => {
+      const receipt = admit(stored, operation, body);
+      if (receipt && operation === "steer") stored.halt = "steer";
+      return receipt;
+    }) },
   { name: "a stop tears the record write", invariant: "I3", kind: "harness", variant: { stop: "torn" } },
-  { name: "a stop loses the last record write", invariant: "I4", kind: "harness", variant: { stop: "lost" } },
+  // A pause cut after write 2 then reopens on write 1's record, which no state allows there.
+  { name: "a stop loses the last record write", invariant: "I3", kind: "harness", variant: { stop: "lost" } },
+  { name: "a save moves member cursors back to the journal's start", invariant: "I4", kind: "source",
+    variant: { patch: service => {
+      const host = internals(service), save = host.save.bind(host);
+      host.save = stored => { for (const member of stored.run.members) member.cursor = 0; save(stored); };
+    } } },
   { name: "admission forgets that a cancelled run is settled", invariant: "I5", kind: "source",
     variant: patchAdmit((_host, admit) => (stored, operation, body) =>
       admit(stored.run.status === "cancelled" ? { ...stored, run: { ...stored.run, status: "paused" } } : stored, operation, body)) },
-  { name: "admission saves the record before its checks", invariant: "I6", kind: "source",
+  // The extra save moves each write one later, so a cut after write 2 leaves the fence's record.
+  { name: "admission saves the record before its checks", invariant: "I3", kind: "source",
     variant: patchAdmit((host, admit) => (stored, operation, body) => {
       host.save(stored);
       return admit(stored, operation, body);
+    }) },
+  { name: "a refused admission saves the record", invariant: "I6", kind: "source",
+    variant: patchAdmit((host, admit) => (stored, operation, body) => {
+      try { return admit(stored, operation, body); } catch (error) { host.save(stored); throw error; }
     }) },
   { name: "a reused request id replays whatever its action", invariant: "I7", kind: "source",
     variant: patchReplay(() => (stored, _operation, body) => Boolean(stored.receipts[body.requestId])) },
@@ -145,11 +171,26 @@ for (const mutation of MUTATIONS) {
 // ---- Known defect -------------------------------------------------------------------------------------------------
 
 // The corpus counts this defect instead of failing (see KNOWN_DEFECT in the fixture). These seeds still show it strictly;
-// when a fix lands they stop failing, and the allowance and this test go.
+// when a fix lands they stop failing, and the allowance and these tests go.
 for (const [seed, kind] of [[5, "pause"], [29, "cancel"]] as const) {
   test(`known defect ${KNOWN_DEFECT}: seed ${seed} loses the ${kind}'s event line after a stop after write 1`, { skip: ONLY !== undefined && "TEAM_SIM_SEED reruns one corpus seed" }, async () => {
     const violation = await sweep([seed], {}, { strict: true });
     assert.ok(violation, "the defect no longer reproduces: remove the allowance in tests/fixtures/team-run-sim.ts and this test");
-    assert.match(violation.message, new RegExp(`\\(${kind} [0-9a-f]{8}, stop after write 1.*: I1: after the acknowledged ${kind}, events is `));
+    assert.match(violation.message, new RegExp(`\\(${kind} [0-9a-f]{8}, stop after write 1.*: I3: the reopened record .*against the state after it: events is `));
+  });
+}
+
+// The allowance covers only write 1 of a pause or cancel: a pause or cancel whose event line is lost after its second
+// write still fails, with and without the allowance.
+const eventLost: Variant = { patch: service => {
+  const host = internals(service), event = host.event.bind(host);
+  host.event = (stored, text) => { if (text !== "Team paused." && text !== "Team cancelled.") event(stored, text); };
+} };
+for (const strict of [false, true]) {
+  test(`the ${KNOWN_DEFECT} allowance does not hide a pause or cancel that loses its event line after write 2${strict ? " (strict)" : ""}`, { skip: ONLY !== undefined && "TEAM_SIM_SEED reruns one corpus seed" }, async t => {
+    const violation = await sweep(SEEDS, {}, { ...eventLost, strict });
+    assert.ok(violation, `none of ${SEEDS.length} seeds caught it`);
+    assert.match(violation.message, /\((pause|cancel) [0-9a-f]{8}.*: I[13]: .*events is /);
+    t.diagnostic(`caught at ${violation.message.split("; rerun")[0]}`);
   });
 }

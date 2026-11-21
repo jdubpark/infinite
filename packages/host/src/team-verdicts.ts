@@ -7,6 +7,7 @@ import type { ObjectiveReceipt } from "./objective-receipts.js";
 import { VERDICT_OPS } from "./objective-record.js";
 import type { ObjectiveRecord } from "./objective-types.js";
 import type { TeamRegister } from "./team-register.js";
+import { memberLimit } from "./team-types.js";
 import type { TeamCommand, TeamMember, TeamModelProfile, TeamReport, TeamRun } from "./team-types.js";
 import { assertMemberReadOnly } from "./team-workspace.js";
 import { composeVerdict, verdictRecord } from "./verdict-compose.js";
@@ -335,7 +336,7 @@ export class TeamVerdicts {
     this.host.save(holder);
   }
 
-  /** The record, the choice, and the context, in that order; any miss finishes the verdict without an evaluator. */
+  /** The record, the choice, the context, and room for one more member, in that order; any miss finishes the verdict without an evaluator. */
   private launch(holder: VerdictHolder, state: VerdictState): void {
     const run = holder.run;
     const record = this.readyRecord(holder);
@@ -350,6 +351,11 @@ export class TeamVerdicts {
     }
     if (!verdictContext({ run, record, head: state.head, kind: state.kind, receipts: this.receiptsOf(state) })) {
       this.finish(holder, state, undefined, "context-too-large");
+      return;
+    }
+    // The evaluator is one more member. A run at its limit of members settles as it would without verdicts; it is never stopped for the limit here.
+    if (run.members.length >= memberLimit(run)) {
+      this.finish(holder, state, undefined, "evaluator-unavailable");
       return;
     }
     const { profile } = choice;

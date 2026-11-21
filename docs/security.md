@@ -625,7 +625,8 @@ result belongs to. A change to any of them sets aside every earlier verdict in
 the same way, so a verdict reached under older rules is not replayed under
 newer ones and no delivery of it starts under them. Two limits apply. An
 answer that the host had already handed to a session's worker when the change
-took effect is still typed; the worker types it within about one second. A
+took effect may still be typed after it, while the worker's control lease and
+its checks of the dialog hold; the restart of the host does not cancel it. A
 rollback to exactly the earlier rules and profiles brings their verdicts back,
 as it brings back their replay result. The host does not detect a replayed older copy of its sealed
 state: restoring `halt-epochs.sealed` from an older copy, alone or together with

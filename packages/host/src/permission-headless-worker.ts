@@ -77,7 +77,7 @@ const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(valu
 const clean = (text: string, limit: number) => text.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, " ").trim().slice(0, limit);
 /** Calls of one agent with the same tool and input share this key. */
 const callKey = (call: ChannelCall, inputHash: string) => `${call.agentId ?? ""}\n${call.toolName}\n${inputHash}`;
-/** How many keys of open calls a worker holds. Past it the worker holds none until the provider exits. */
+/** How many keys of open calls a worker holds. Past it the worker holds none. */
 export const OPEN_CALL_KEYS = 4096;
 
 /** The hook payload fields the channel reads. Anything else in the payload is ignored. */
@@ -105,10 +105,13 @@ export class HeadlessChannelWorker {
    * Calls left to the provider's own rules, by agent, tool and input, for the PermissionRequest that has no call id.
    * The value is the one such call's id. It is a count when the call has no id or identical calls are open together:
    * their requests cannot be told apart, so none of them takes a call id. A call the provider settles without a
-   * request stays here until the provider exits, so the request of a later identical call takes no id either.
+   * request stays here, so the request of a later identical call takes no id either.
    */
   private recent = new Map<string, string | number>();
-  /** True once more keys were open than the worker holds. It then holds none, so no request takes a held id, until the provider exits. */
+  /**
+   * True once the worker stopped holding calls: more keys were open than it holds, or a provider exited. From then on
+   * it holds none, so no request takes a held id, for as long as the worker lives.
+   */
   private lost = false;
   /** Call ids that already received the owner's answer. A repeat is denied. */
   private consumed = new Set<string>();
@@ -215,8 +218,6 @@ export class HeadlessChannelWorker {
         const reason = reply?.result === "withheld" ? reply.reason : "unavailable";
         return settle("withheld", "stale", `Headless: the owner's allow was withheld at the resume (${reason}); the call was denied as unavailable.`, this.deny("unavailable"));
       }
-      // The allowed call goes on to the provider's own rules, like any call the worker lets through.
-      this.leftOpen(callKey(call, inputHash), call.toolUseId);
       return settle("allow", "receipt", "Headless: the owner's allow was returned to the resumed call.", { decision: "allow" });
     }
     if (deferred) return this.pending(call.toolName);
@@ -266,7 +267,7 @@ export class HeadlessChannelWorker {
     if (!call) return this.deny("unavailable");
     this.first(call);
     const inputHash = hash(call.toolInput);
-    // Counted off before any answer, so a call whose request is answered as pending does not stay counted.
+    // A request without a call id is counted off before any answer, so its call does not stay counted when the answer is pending.
     const callId = this.callOf(callKey(call, inputHash), call.toolUseId);
     if (this.deferred) return this.pending(call.toolName);
     // Stable for this raised request; an uncorrelated request gets an id of its own.
@@ -285,9 +286,11 @@ export class HeadlessChannelWorker {
 
   /** The provider exited. True when the session stays open because a deferred call waits for the owner. */
   exited(exitCode: number): boolean {
-    // No call of the provider that exited is open any more.
+    // A hook of the provider that exited can still arrive after the owner's answer started the next one, and nothing
+    // in a hook tells the two apart. Its request would take the id of the next provider's identical call. So the worker
+    // holds no call from here on.
     this.recent.clear();
-    this.lost = false;
+    this.lost = true;
     const deferred = this.deferred;
     if (!deferred) return false;
     if (deferred.phase === "deferring" && exitCode === 0 && this.nativeSessionId) {

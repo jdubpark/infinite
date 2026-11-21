@@ -462,6 +462,15 @@ const decides = (w: ReturnType<typeof workerRig>) =>
 /** A PermissionRequest hook for a Bash command. The provider sends it without a call id. */
 const raise = (w: ReturnType<typeof workerRig>, command: string, extra: Record<string, unknown> = {}) =>
   w.channel.request({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command }, ...extra });
+/** A request may take its own call's id or none. It must not take another call's id. */
+const ownOrNone = (id: string | undefined, own: string) => assert.ok(id === undefined || id === own, `the request took ${id}, and its call is ${own}`);
+/** One call is deferred, the provider exits on it, and the owner's allow starts the next provider, which runs the call. */
+async function resumeAfterDeferral(w: ReturnType<typeof workerRig>) {
+  assert.equal((await w.pre("deploy production", "toolu_owner")).decision, "defer");
+  assert.equal(w.channel.exited(0), true);
+  w.channel.answer({ requestId: "a1", promptId: w.prompts[0]!, option: 0 });
+  assert.deepEqual(await w.pre("deploy production", "toolu_owner"), { decision: "allow" });
+}
 
 test("identical calls open together: no PermissionRequest takes a call id until all of them are counted off", async () => {
   const w = workerRig([]);
@@ -503,17 +512,19 @@ test("identical calls one after the other each keep their own id, and a call id 
   assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), ["toolu_a", "toolu_b"]);
 });
 
-test("among counted calls a repeated call id counts again: a later call loses its id, and no request takes a wrong one", async () => {
+test("a call id repeated among identical open calls gives no request another call's id", async () => {
   const w = workerRig([]);
   await w.pre("git status", "toolu_a");
   await w.pre("git status", "toolu_b");
   await w.pre("git status", "toolu_a");
   await raise(w, "git status");
   await raise(w, "git status");
-  // The repeat left one call counted that no request takes off, so this call is not alone.
+  // Both open calls raised their request. The worker counts the repeat as a third call, so this one takes no id here.
   await w.pre("git status", "toolu_c");
   await raise(w, "git status");
-  assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), [undefined, undefined, undefined]);
+  const ids = decides(w).map(decide => decide.call.toolUseId);
+  assert.deepEqual(ids.slice(0, 2), [undefined, undefined]);
+  ownOrNone(ids[2], "toolu_c");
 });
 
 test("a call the worker denied is not held, so its retry is alone and its request takes the retry's id", async () => {
@@ -574,7 +585,7 @@ test("a PermissionRequest denied as pending still counts its call off, so the re
   assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), ["toolu_3"]);
 });
 
-test("past its bound the worker holds no call, and no request takes a call id until the provider exits", async () => {
+test("past its bound the worker no longer trusts what it holds: an identical call does not look alone", async () => {
   const w = workerRig([]);
   await w.pre("git status", "toolu_a");
   for (let other = 0; other < OPEN_CALL_KEYS; other++) await w.pre(`echo ${other}`, `toolu_other_${other}`);
@@ -585,32 +596,32 @@ test("past its bound the worker holds no call, and no request takes a call id un
   await raise(w, "git status");
   await w.pre("npm test", "toolu_c");
   await raise(w, "npm test");
-  assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), [undefined, undefined, undefined]);
-
-  // After the provider exits nothing from before is open, so the worker holds calls again.
-  assert.equal(w.channel.exited(0), false);
-  await w.pre("npm test", "toolu_d");
-  await raise(w, "npm test");
-  assert.equal(decides(w)[3]!.call.toolUseId, "toolu_d");
+  const ids = decides(w).map(decide => decide.call.toolUseId);
+  assert.deepEqual(ids.slice(0, 2), [undefined, undefined]);
+  ownOrNone(ids[2], "toolu_c");
 });
 
-test("a provider exit closes every open call, so a call of the next run is alone", async () => {
-  const w = workerRig([]);
+test("a late PermissionRequest of a provider that exited does not take the id of the next provider's identical call", async () => {
+  const w = workerRig([{ result: "none" }, owner]);
+  // The first provider leaves this call open, and exits on another call's deferral before the request arrives.
   await w.pre("git status", "toolu_a");
-  assert.equal(w.channel.exited(0), false);
+  await resumeAfterDeferral(w);
   await w.pre("git status", "toolu_b");
   await raise(w, "git status");
-  assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), ["toolu_b"]);
+  await raise(w, "git status");
+  const ids = decides(w).map(decide => decide.call.toolUseId);
+  ownOrNone(ids[0], "toolu_a");
+  ownOrNone(ids[1], "toolu_b");
 });
 
-test("a resumed call that the owner allowed is held like any call the worker lets through, so its request takes its id", async () => {
-  const w = workerRig([owner]);
-  assert.equal((await w.pre("deploy production", "toolu_1")).decision, "defer");
-  assert.equal(w.channel.exited(0), true);
-  w.channel.answer({ requestId: "a1", promptId: w.prompts[0]!, option: 0 });
-  assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "allow" });
-  await raise(w, "deploy production");
-  assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), ["toolu_1"]);
+test("a call left open by a provider that exited gives its id to no request of the next provider", async () => {
+  const w = workerRig([{ result: "none" }, owner]);
+  await w.pre("git status", "toolu_a");
+  await resumeAfterDeferral(w);
+  // The first provider's call raised no request. This request belongs to the next provider's call.
+  await w.pre("git status", "toolu_b");
+  await raise(w, "git status");
+  ownOrNone(decides(w)[0]!.call.toolUseId, "toolu_b");
 });
 
 /* ------------------------------------------------------------------ the host half */

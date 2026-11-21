@@ -307,9 +307,13 @@ test("start-up blocks the open job when the account's processes stay alive", asy
     assert.equal(job?.reason, "eval-processes-alive");
     const n = r.store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM eval_trials"))?.n;
     assert.equal(n, 0, "no trial row");
-    const probes = r.probeInputs.length;
+    // The account is not clean, so the stop is tried again on each step (one a minute on a host) while the job stays blocked.
+    const stops = r.log.filter(entry => entry === "stop").length;
     await r.pump.step();
-    assert.equal(r.probeInputs.length, probes, "a blocked job launches no further probe");
+    assert.ok(r.log.filter(entry => entry === "stop").length > stops, "the next step tries the stop again");
+    const after = r.store.read(db => db.get<{ status: string; reason: string | null }>("SELECT status, reason FROM eval_jobs WHERE job_id = ?", jobId));
+    assert.equal(after?.status, "blocked", "the job stays blocked until the owner resumes it");
+    assert.equal(after?.reason, "eval-processes-alive");
   } finally {
     r.cleanup();
   }

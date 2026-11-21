@@ -69,7 +69,7 @@ export class TrialPump {
   private started = false;
   /** True once this process tried the start-up. */
   private attempted = false;
-  /** True while the account may hold what this process left: voided rows, or a failed stop or clean. */
+  /** True while the account may hold what a trial left: rows this process voided, or a stop or clean that has not succeeded yet. */
   private dirty = false;
   private live: Live | undefined;
   private probed: { at: number; probe: EvalProbe; projectId: string | undefined } | undefined;
@@ -165,7 +165,8 @@ export class TrialPump {
     if (next.kind === "trial") await this.begin(next, identity, grader);
   }
 
-  /** Once per process, before any trial: drops the preparing rows, voids the running ones, and stops, cleans, and resets the account. */
+  /** Before any trial: drops the preparing rows, voids the running ones, and stops, cleans, and resets the account.
+   *  A process tries it once. It tries again while a job is open or the account may be unclean, until it succeeds. */
   private async startup(): Promise<boolean> {
     const rows = this.options.store.read(db => liveTrials(db));
     // The first attempt of a process always runs. Later attempts wait for a job unless this process has something to clean.
@@ -187,9 +188,11 @@ export class TrialPump {
       this.options.jobs.record(row.jobId, "void-host");
     }
     const identity = await this.identityProbe(undefined, open?.projectId);
-    // An identity that is configured but cannot be probed has not been cleaned: start-up runs again on the next step.
+    // An identity that is configured but cannot be probed has not been cleaned. Start-up runs again while a job is open or rows were voided.
     if (identity.state === "unavailable" || identity.state === "misconfigured") return false;
     if (identity.state !== "not-configured") {
+      // From here the account counts as unclean until the stop and the clean both succeed, so a failure is tried again without a job.
+      this.dirty = true;
       const stopped = await stopEvalIdentity(this.options.identity, identity.uid ?? -1, this.inventory);
       // A process that stays alive blocks the open job, so the wait is visible and ends when the owner resumes it.
       if (stopped === "alive" && open !== undefined) this.options.jobs.block(open.jobId, "eval-processes-alive");

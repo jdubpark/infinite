@@ -8,7 +8,8 @@ import type { FuseGate } from "../packages/host/src/fuse/types.js";
 import { PULL_REQUEST_FIELDS, type ReviewIntake, reviewRequestId } from "../packages/host/src/review-feedback.js";
 import type { TeamReviewFeedback } from "../packages/host/src/team-review-feedback.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
-import type { TeamService } from "../packages/host/src/teams.js";
+import type { Manager } from "../packages/host/src/manager.js";
+import { TeamService, type TeamServiceOptions } from "../packages/host/src/teams.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
 type Fixture = ReturnType<typeof schedulerFixture>;
@@ -358,4 +359,23 @@ test("closing the host while a pull request read runs saves nothing and steers n
       assert.equal(gh.commands().length, reads + 1);
     } finally { f.close(); }
   }
+});
+
+test("the host start registers the review poll on the source timer, and close removes it", async () => {
+  const f = schedulerFixture();
+  const listeners = new Set<() => void>();
+  const source = { onTick: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; } };
+  let teams: TeamService | undefined;
+  try {
+    const gh = delivered(f);
+    gh.show([]);
+    teams = new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { source: source as unknown as TeamServiceOptions["source"] });
+    teams.start();
+    assert.equal(listeners.size, 1, "start registers one listener on the source timer");
+    for (const listener of listeners) listener();
+    await until(() => gh.commands().some(command => command[0] === "gh"));
+    assert.deepEqual(gh.commands().filter(command => command[0] === "gh"), [ghRead], "a tick past the interval reads the watched pull request once");
+    await teams.close();
+    assert.equal(listeners.size, 0, "close removes it");
+  } finally { await teams?.close(); f.close(); }
 });

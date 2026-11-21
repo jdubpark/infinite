@@ -27,6 +27,11 @@ const MARKER_FILE = "review-feedback.sealed", MARKER_SCOPE = "team:review-feedba
 /** Settled intents a run keeps, newest last. Pending intents are always kept. */
 const SETTLED_INTENT_LIMIT = 20;
 const READ_TIMEOUT_MS = 60_000;
+/**
+ * How long a read may stay open after the host stopped it (timeout or close). A child the host cannot signal, or one that
+ * left a descendant holding its output, would otherwise keep the read, and so close() and idle(), waiting.
+ */
+const READ_SETTLE_MS = 5_000;
 const UNWATCHED: Record<string, string> = {
   closed: "was closed", merged: "was merged", fork: "comes from a fork", base: "targets another base branch", branch: "is not on the branch this run delivered to", "not-delivered": "is not this run's delivery",
 };
@@ -238,7 +243,7 @@ export class TeamReviewFeedback {
     const { config } = this.host, run = stored.run;
     try {
       const result = await teamCommand({ command: "gh", args: pullRequestViewArgs(target) }, stored.root ?? config.teams?.workspaceDir ?? this.host.directory, this.abort.signal,
-        READ_TIMEOUT_MS, config.teams?.commandPrefix, undefined, hostGithubGrantEnvironment(config, { sid: `review:${run.id}`, project: run.projectId, repo: target.repository, ops: ["pr"] }));
+        READ_TIMEOUT_MS, config.teams?.commandPrefix, undefined, hostGithubGrantEnvironment(config, { sid: `review:${run.id}`, project: run.projectId, repo: target.repository, ops: ["pr"] }), READ_SETTLE_MS);
       if (result.exitCode !== 0 || result.interrupted || result.truncated) throw new Error(`gh exited with ${result.exitCode}${result.truncated ? " (output truncated)" : ""}`);
       return parsePullRequestView(result.stdout);
     } catch (error) {

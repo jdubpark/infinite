@@ -27,6 +27,7 @@ const ghRead = ["gh", "pr", "view", "7", "--json", PULL_REQUEST_FIELDS, "--repo"
 const fakeGh = `const fs = require("node:fs"); const [dir, command, ...args] = process.argv.slice(1);
 fs.appendFileSync(dir + "/commands.log", JSON.stringify([command, ...args]) + "\\n");
 if (command !== "gh") process.exit(3);
+if (fs.existsSync(dir + "/hold")) require("node:child_process").spawn(process.execPath, ["-e", "const fs = require('node:fs'), cell = new Int32Array(new SharedArrayBuffer(4)), end = Date.now() + 30000; while (!fs.existsSync(process.argv[1] + '/release') && Date.now() < end) Atomics.wait(cell, 0, 0, 50);", dir], { detached: true, stdio: ["ignore", "inherit", "inherit"] }).unref();
 if (fs.existsSync(dir + "/gate")) { const cell = new Int32Array(new SharedArrayBuffer(4)); while (!fs.existsSync(dir + "/release")) Atomics.wait(cell, 0, 0, 20); }
 process.stdout.write(fs.readFileSync(dir + "/pull-request.json", "utf8"));`;
 
@@ -48,6 +49,8 @@ function delivered(f: Fixture, enabled = true) {
     commands: (): string[][] => existsSync(join(dir, "commands.log")) ? readFileSync(join(dir, "commands.log"), "utf8").trim().split("\n").map(line => JSON.parse(line)) : [],
     /** Holds every later read until `release`. */
     gate: () => writeFileSync(join(dir, "gate"), ""),
+    /** Each later read also leaves a process in its own session holding the read's output open until `release`, out of the host's reach. */
+    hold: () => writeFileSync(join(dir, "hold"), ""),
     release: () => writeFileSync(join(dir, "release"), ""),
   };
 }
@@ -378,4 +381,22 @@ test("the host start registers the review poll on the source timer, and close re
     await teams.close();
     assert.equal(listeners.size, 0, "close removes it");
   } finally { await teams?.close(); f.close(); }
+});
+
+test("close settles within its bound while a process the host cannot stop holds the read open", { timeout: 30000 }, async () => {
+  const f = schedulerFixture();
+  const gh = delivered(f);
+  try {
+    gh.show([]);
+    const teams = f.openTeam(), feedback = poller(teams);
+    await feedback.start();
+    gh.gate(); gh.hold();
+    const pass = feedback.poll();
+    await until(() => gh.commands().length === 1);
+    const started = Date.now();
+    await teams.close();
+    await pass;
+    assert.ok(Date.now() - started < 12_000, `close took ${Date.now() - started} ms`);
+    await teams.idle();
+  } finally { gh.release(); f.close(); }
 });

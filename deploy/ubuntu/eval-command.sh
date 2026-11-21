@@ -408,7 +408,7 @@ op_setup() {
 # per line, digits only. It reads the kernel's own table, which gives the owner as a number: ipcs prints the owner as
 # a name cut to ten characters, which a longer account name never equals. An object counts as the account's when the
 # account owns it or created it: the creator can still remove an object whose owner it changed. Fails when the table
-# cannot be read, is longer than 4 MiB, or has no uid or cuid column, so that a caller never reads a failed listing as
+# cannot be read, reaches 4 MiB, or has no uid or cuid column, so that a caller never reads a failed listing as
 # an empty one.
 ipc_ids() {
   ipc_uid=$(/usr/bin/id -u)
@@ -420,7 +420,7 @@ ipc_ids() {
   esac
   [ -r "$ipc_table" ] || return 1
   listing=$(/usr/bin/head -c 4194305 "$ipc_table" 2>/dev/null) || return 1
-  [ "${#listing}" -le 4194304 ] || return 1
+  [ "${#listing}" -lt 4194304 ] || return 1
   ipc_column=0
   ipc_creator=0
   ipc_header=1

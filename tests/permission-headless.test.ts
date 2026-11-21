@@ -857,11 +857,11 @@ test("each resume the worker performed owes one continue: the first prompt after
   assert.deepEqual(mark([toolEnd]), [toolEnd]);
   assert.deepEqual(mark([prompt, next]), [{ ...prompt, automatic: true }, next], "only the first prompt after the resume is the provider's");
   assert.deepEqual(mark([prompt]), [prompt], "the answer is taken once");
-  // A second deferred call in the resumed run: its resume owes a continue again.
+  // A second deferred call in the resumed run, which the owner refuses: its resume owes a continue all the same.
   assert.equal((await w.pre("deploy staging", "toolu_second")).decision, "defer");
   assert.equal(w.channel.exited(0), true);
-  w.channel.answer({ requestId: "a2", promptId: w.prompts[1]!, option: 0 });
-  assert.deepEqual(await w.pre("deploy staging", "toolu_second"), { decision: "allow" });
+  w.channel.answer({ requestId: "a2", promptId: w.prompts[1]!, option: 1 });
+  assert.deepEqual(await w.pre("deploy staging", "toolu_second"), { decision: "deny", reason: OWNER_DENIED });
   assert.equal(w.resumed, 2);
   assert.deepEqual(mark([toolEnd, prompt]), [toolEnd, { ...prompt, automatic: true }], "the second resume owes one too");
   // A resume that fails owes nothing.

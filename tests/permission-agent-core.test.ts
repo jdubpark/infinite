@@ -117,6 +117,32 @@ test("each interrupt class routes a concrete request through a class rule, and n
   assert.equal(classify(bash("gh auth login"), CLASSES.filter(name => name !== "credentials")), undefined);
 });
 
+test("a screen dialog's command that spans more than one line is raised, because the screen does not say which breaks are wraps", async () => {
+  // A dialog without tool evidence carries only the command as the screen showed it, one screen line per line.
+  const dialog = (action: string) => caseRequest(item({ tool: "dialog", action }));
+  const raised = (action: string) => raise(dialog(action), { rejectHistory: false });
+
+  // INF-313: a fetch from another run's checkout, wrapped once at a space and once inside the long path.
+  const fetch = "git fetch --no-tags\n/home/dev/projects/sample-runs/form-fix-41a7\nb2/integration abc1234";
+  assert.deepEqual(raised("git fetch --no-tags /home/dev/projects/sample-runs/form-fix-41a7b2/integration abc1234"), ["raise:outside-root"], "the same command on one line");
+  assert.deepEqual(raised(fetch), ["raise:wrapped-dialog"]);
+  // A wrap may hide a class rule too. The class decision stays with the shown text, so a guess never interrupts the owner.
+  assert.equal(classify(dialog("npm\nlogin"), CLASSES), undefined);
+  assert.deepEqual(raised("npm\nlogin"), ["raise:wrapped-dialog"]);
+  // A routine command on one line raises nothing; the same command wrapped is raised.
+  assert.deepEqual(raised("npx vitest run src/components/address-form.test.tsx --reporter verbose"), []);
+  assert.deepEqual(raised("npx vitest run src/components/address-form\n.test.tsx --reporter verbose"), ["raise:wrapped-dialog"]);
+  // A tool request carries its own text, line breaks included, so it is read as given.
+  assert.deepEqual(raise(bash("cd src\n/usr/bin/make"), { rejectHistory: false }), []);
+
+  // The raised fetch never gets a light verdict.
+  const fake = fakeLauncher(turn => turn.tier === "light" ? { verdict: "allow", note: "Fine." } : { verdict: "reject", code: "outside-workspace", note: "Another run." });
+  const core = createPermissionAgentCore({ settings: settings(), launcher: fake.launcher });
+  const review = await core.review(dialog(fetch), context({ raised: core.raise(dialog(fetch), { rejectHistory: false }) }));
+  assert.deepEqual(fake.turns.map(turn => turn.tier), ["strong"]);
+  assert.equal(review.code, "outside-workspace");
+});
+
 test("literal shell bodies are read to three layers, a command behind a wrapper is found, and what the host cannot read is raised", async () => {
   const request = (command: string | string[]) => typeof command === "string" ? bash(command) : tool("Bash", { command });
   const rule = (command: string | string[]) => classify(request(command), CLASSES)?.rule;

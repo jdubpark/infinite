@@ -13,7 +13,7 @@ import { canonicalJson } from "./evidence/crypto.js";
 import { MAX_SHELL_DEPTH, quoteWord, readShell, remoteOperand, resolveWord, type PathResolver, type SimpleCommand } from "./permission-shell.js";
 
 /** Bumped by any change to the rule code below, or to the shell reading it uses, that is not a change to the lists. */
-export const CLASS_RULES_VERSION = 6;
+export const CLASS_RULES_VERSION = 7;
 
 /**
  * The host's lists. Commands are word prefixes after wrappers (sudo, env, timeout) are removed; option
@@ -668,6 +668,9 @@ export function raise(request: PermissionRequest, context: { rejectHistory: bool
   const embedded = reading.shell ? embeddedCommand(request, reading, facts) : undefined;
   if (embedded === "found") raised.push("raise:embedded-command");
   if (reading.opaque || embedded === "unread" || reading.unresolved.length > 0 || (!reading.shell && !KNOWN_TOOLS.test(request.tool))) raised.push("raise:opaque");
+  // A screen dialog shows its command wrapped to the terminal's width, and the screen does not say which line
+  // breaks are the command's own. Any reading of such a command is a guess, so the light tier never decides it.
+  if (request.tool === "dialog" && request.input === undefined && request.action.includes("\n")) raised.push("raise:wrapped-dialog");
   if (context.rejectHistory) raised.push("raise:reject-history");
   return raised;
 }

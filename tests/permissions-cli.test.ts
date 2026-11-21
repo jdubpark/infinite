@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { handlePermissionsClientCommand } from "../packages/host/src/permissions-cli.js";
 import { startHost, type Host } from "./helpers.js";
 
 const exec = promisify(execFile);
@@ -70,4 +71,46 @@ test("infinite permissions delegates, reports, and revokes workspaces through th
     if (host) await host.stop();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("a replay start or poll that the host does not answer in time is asked again under the same request ID", { timeout: 60000 }, async t => {
+  const late = () => Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+  const job = { id: "6f9619ff-8b86-4d01-b42d-00c04fc964ff", requestId: "", state: "running", done: 0, total: 1, startedAt: "2026-11-21T10:00:00.000Z" };
+  const fakeHost = (start: (attempt: number) => unknown, poll: (attempt: number) => unknown) => {
+    const starts: { requestId: string }[] = [];
+    let polls = 0;
+    const api = {
+      async json<T>(path: string, body?: unknown): Promise<T> {
+        if (path === "/permissions/status") return { readiness: { ready: false, reasons: [] } } as T;
+        if (path === "/permissions/replays") { starts.push(body as { requestId: string }); return start(starts.length) as T; }
+        assert.equal(path, `/permissions/replays/${job.id}`);
+        assert.equal(body, undefined, "a poll is a read");
+        return poll(++polls) as T;
+      },
+    };
+    return { api, starts };
+  };
+  const printed: string[] = [];
+  t.mock.method(console, "log", (line: string) => printed.push(line));
+  t.mock.method(console, "error", () => {});
+  const replay = (api: Parameters<typeof handlePermissionsClientCommand>[2]) =>
+    handlePermissionsClientCommand(["replay"], { "--set": resolve("tests/fixtures/permission-replay-set.json"), "--json": true }, api);
+
+  // The host started the job but answered too late, then a poll timed out. The CLI follows the same job to its end.
+  const busy = fakeHost(
+    attempt => { if (attempt === 1) throw late(); return { job }; },
+    attempt => { if (attempt === 1) throw late(); return { job: { ...job, state: "finished", done: 1, finishedAt: "2026-11-21T10:05:00.000Z", result: { cases: 1 } } }; },
+  );
+  assert.equal(await replay(busy.api), true);
+  assert.equal(busy.starts.length, 2);
+  assert.equal(busy.starts[1].requestId, busy.starts[0].requestId);
+  assert.deepEqual(JSON.parse(printed.join("\n")), { cases: 1 });
+
+  // An answer that refuses the start is not asked again, and neither is a failure other than a timeout.
+  const refusing = fakeHost(() => { throw new Error("Host returned HTTP 409."); }, () => assert.fail("no poll"));
+  await assert.rejects(replay(refusing.api), /HTTP 409/);
+  assert.equal(refusing.starts.length, 1);
+  const redirected = fakeHost(() => { throw new TypeError("fetch failed"); }, () => assert.fail("no poll"));
+  await assert.rejects(replay(redirected.api), /fetch failed/);
+  assert.equal(redirected.starts.length, 1);
 });

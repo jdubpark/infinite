@@ -633,7 +633,11 @@ ready when the result covers at least `minCases` cases and the interval's upper
 end is at most `maxMissRate`. The defaults are 100 cases and 5%. `replay` also
 prints the wrongful reject rate, and each figure by interrupt class and by the
 tier that decided. One replay runs at a time; the CLI polls the host until it
-ends. A replay that the host restart interrupts is lost: run it again.
+ends. A busy host can answer late: after a timeout the CLI asks again for
+about two minutes from the host's last answer, and a start under the same
+request ID returns the job it already started. If the CLI gives up, run the
+command again with the request ID it printed to follow the same job. A replay
+that the host restart interrupts is lost: run it again.
 
 ### Permission decision log
 

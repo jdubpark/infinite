@@ -109,6 +109,28 @@ test("another prompt's key hint is not the Code Mode footer", () => {
     assert.notEqual(detectPrompt([...staleCodeModeMenu("no"), hint], "claude")?.title, "Code Mode (experimental)", hint);
 });
 
+test("characters after an old Code Mode menu that are not its footer leave no open dialog", () => {
+  // Compared without punctuation, each of these lines lost every character and the old menu stayed open.
+  for (const trailing of ["❯", ">", "›", "$", "!!!", "继续", "/"]) {
+    for (const cursor of ["no", "yes"] as const)
+      assert.notEqual(detectPrompt([...staleCodeModeMenu(cursor), "", trailing], "claude")?.title, "Code Mode (experimental)", `${cursor} menu, then ${trailing}`);
+    assert.notEqual(detectPrompt([...screen("claude-code-mode"), trailing], "claude")?.title, "Code Mode (experimental)", `footer, then ${trailing}`);
+  }
+  // One screen cannot be an open dialog and an idle composer at once.
+  const idle = [...staleCodeModeMenu("no"), "", "❯"];
+  assert.equal(isIdleScreen(idle, "claude"), true);
+  assert.equal(detectPrompt(idle, "claude"), null);
+});
+
+test("the Code Mode footer is read at every wrap width", () => {
+  const footer = ["Tell us how it goes with /feedback", "Enter to confirm · Esc to start without it"];
+  for (let width = 1; width <= 80; width++) {
+    const lines = screen("claude-code-mode").flatMap(line =>
+      footer.includes(line.trim()) ? line.trim().match(new RegExp(`.{1,${width}}`, "g")) ?? [] : [line]);
+    assert.equal(detectPrompt(lines, "claude")?.title, "Code Mode (experimental)", `width ${width}`);
+  }
+});
+
 test("an old Code Mode menu followed by transcript text is not an open prompt", () => {
   assert.equal(detectPrompt([...staleCodeModeMenu("no"), "Task continued in the transcript."], "claude"), null);
 });

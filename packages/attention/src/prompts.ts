@@ -32,8 +32,12 @@ const QUESTION_OPTION = /^(chat about this|other|skip|type something)/i;
 const MULTI = /a to select all|n to select none/i;
 const YES_NO = /(\[(y\/N|Y\/n|y\/n)\]|\((y\/n|yes\/no)\))\s*:?\s*$/i;
 const KEY_HINT = /^(Enter to|Esc to|Press )/i;
-/** The Code Mode dialog's feedback line and key hint, compacted and joined, each optional. */
-const CODE_MODE_FOOTER = /^(tellushowitgoeswithfeedback)?(entertoconfirmesctostartwithoutit)?$/;
+/**
+ * The Code Mode dialog's feedback line and key hint with whitespace removed, each optional. Every other character
+ * counts, so an idle cursor after an older menu is not footer text. The separator is optional: a narrow wrap can
+ * leave it alone on a line, where it reads as a rule.
+ */
+const CODE_MODE_FOOTER = /^(Tellushowitgoeswith\/feedback)?(Entertoconfirm·?Esctostartwithoutit)?$/i;
 
 /** The non-empty lines of `text`, each with its whitespace runs collapsed to one space. */
 export function normalisedLines(text?: string): string[] {
@@ -188,7 +192,7 @@ function detectCodeModeConfirmation(clean: string[]): DetectedPrompt | null {
     if (!second) continue;
     // Only this dialog's own footer may follow. A general key hint would also admit another prompt's line, such as
     // "Press y to proceed or n to cancel [Y/n]", and return the older menu above it.
-    const tail = clean.slice(second.end + 1).filter(line => line !== "" && !RULE.test(line)).map(compact).join("");
+    const tail = clean.slice(second.end + 1).filter(line => !RULE.test(line)).join("").replace(/\s+/g, "");
     if (!CODE_MODE_FOOTER.test(tail)) continue;
     firstOption = first;
     secondOption = second;

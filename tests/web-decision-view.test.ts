@@ -71,6 +71,10 @@ describe("web decision queue view", { skip }, () => {
     return page;
   }
   const settle = (page: Page) => page.waitForTimeout(700);
+  const setVisibility = (page: Page, state: "hidden" | "visible") => page.evaluate(state => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: state });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }, state);
   async function sentOnce(host: Host): Promise<Sent> {
     for (let waited = 0; host.sent.length === 0 && waited < 4000; waited += 50) await new Promise(resolve => setTimeout(resolve, 50));
     assert.equal(host.sent.length, 1, "the view sends one request");
@@ -131,6 +135,39 @@ describe("web decision queue view", { skip }, () => {
     }
   });
 
+  test("hiding the tab drops the warning; returning takes no answers until a read lands and warns again after three seconds", async () => {
+    const host = hostWith(teamDecision("d1"));
+    const page = await open(host, { interval: 200 });
+    const notice = page.getByText(/has not refreshed since/);
+    try {
+      const submit = page.getByRole("button", { name: "Submit selected answer" });
+      await page.getByRole("button", { name: "3 attempts" }).click();
+      host.hold = new Promise(resolve => { host.release = resolve; });
+      await notice.waitFor({ timeout: 6000 });
+
+      await setVisibility(page, "hidden");
+      await notice.waitFor({ state: "detached", timeout: 1000 });
+      // Longer than the three seconds a watched tab waits before it warns.
+      await page.waitForTimeout(3600);
+      assert.equal(await notice.count(), 0, "time in a hidden tab counts toward no warning");
+
+      await setVisibility(page, "visible");
+      await page.waitForTimeout(1500);
+      assert.equal(await notice.count(), 0, "returning gives the next read its own three seconds");
+      assert.equal(await submit.isDisabled(), true, "and takes no answers until a read lands");
+      // No read has landed since the return, so the warning comes back.
+      await notice.waitFor({ timeout: 3000 });
+
+      host.hold = undefined;
+      host.release?.();
+      await notice.waitFor({ state: "detached", timeout: 4000 });
+      assert.equal(await submit.isEnabled(), true, "a read that lands turns answers back on");
+    } finally {
+      host.release?.();
+      await page.close();
+    }
+  });
+
   test("a destructive prompt takes an accepting option from a click, not from a key", async () => {
     const host = hostWith(destructivePrompt);
     const page = await open(host);
@@ -180,6 +217,26 @@ describe("web decision queue view", { skip }, () => {
     try {
       await page.getByText("The decision queue is not available on this host.").waitFor({ timeout: 4000 });
       assert.equal(await page.getByRole("button").count(), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  test("a host that stops serving the queue gets that line in place of its last queue", async () => {
+    const host = hostWith(teamDecision("d1"));
+    const page = await open(host);
+    try {
+      await page.getByText("Which limit for d1?").waitFor({ timeout: 4000 });
+      host.queueStatus = 404;
+      await page.getByText("The decision queue is not available on this host.").waitFor({ timeout: 4000 });
+      assert.equal(await page.getByText("Which limit for d1?").count(), 0, "the last queue does not stay as if the host still had one");
+      await page.keyboard.press("1");
+      await page.keyboard.press("Enter");
+      await settle(page);
+      assert.deepEqual(host.sent, []);
+
+      host.queueStatus = 200;
+      await page.getByText("Which limit for d1?").waitFor({ timeout: 4000 });
     } finally {
       await page.close();
     }

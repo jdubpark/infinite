@@ -8,9 +8,9 @@ export const QUEUE_READ_GRACE_MS = 3000;
 
 /**
  * The host's decision queue for one identity (a machine and a role). `queue` is the last answer the host gave. It
- * stays while a later read is in flight or fails. `current` says whether it still is the host's answer: the last read
- * succeeded, and the next one is not overdue. A decision the person answered here is hidden at once, and a read that
- * began after the answer settles it.
+ * stays while a later read is in flight or fails, and goes when the host answers that it has no queue. `current`
+ * says whether it still is the host's answer: the last read succeeded, and the next one is not overdue. A decision
+ * the person answered here is hidden at once, and a read that began after the answer settles it.
  */
 export function useDecisionQueueFeed(request: Api, identity: string | null, interval: number) {
   const readNumber = useRef(0);
@@ -32,8 +32,10 @@ export function useDecisionQueueFeed(request: Api, identity: string | null, inte
       if (changed) setAnsweredVersion(version => version + 1);
     } catch (error) {
       if (current() && identity) {
-        // A host without the route answers 404. That says the queue is not there, not that a read went wrong.
+        // A host without the route answers 404. That says the queue is not there, not that a read went wrong, so a
+        // queue from an earlier read goes too.
         const unavailable = error instanceof ApiError && error.status === 404;
+        if (unavailable) setSnapshot(undefined);
         setFailure(previous => previous?.identity === identity && previous.unavailable === unavailable ? previous
           : { identity, since: previous?.identity === identity ? previous.since : new Date().toISOString(), unavailable });
       }
@@ -52,11 +54,17 @@ export function useDecisionQueueFeed(request: Api, identity: string | null, inte
   const known = identity && snapshot?.identity === identity ? snapshot : undefined;
   // A read that fails is reported by the refresh itself. A read that only has not come back is not, so the queue
   // also stops being current once the next read is QUEUE_READ_GRACE_MS overdue. A hidden or offline tab reads
-  // nothing and sets no such mark: its return starts a read, and the refresh reports that one.
+  // nothing and sets no such mark: its return starts a read, and the refresh reports that one. Hiding also drops a
+  // mark already set, as the refresh drops its own warning.
   useEffect(() => {
     if (!known) return;
     let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => setOverdueRead(known.read), interval + QUEUE_READ_GRACE_MS);
-    const cancel = () => { if (!foreground()) { clearTimeout(timer); timer = undefined; } };
+    const cancel = () => {
+      if (foreground()) return;
+      clearTimeout(timer);
+      timer = undefined;
+      if (document.visibilityState === "hidden") setOverdueRead(0);
+    };
     document.addEventListener("visibilitychange", cancel);
     window.addEventListener("offline", cancel);
     return () => {

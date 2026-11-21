@@ -20,7 +20,7 @@ type QueueAnswerRequest = { requestId: string; revision: number; text: string };
 type KeyboardContext = Parameters<typeof applyDecisionQueueKey>[2];
 
 export type DecisionQueueViewProps = {
-  /** The last queue the host reported, or null before the first read. It stays while a later read is in flight or fails. */
+  /** The last queue the host reported, or null before the first read and on a host without the route. It stays while a later read is in flight or fails. */
   queue: DecisionQueue | null;
   /** When the host reported that queue. */
   readAt: string;

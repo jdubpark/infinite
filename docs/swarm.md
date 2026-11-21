@@ -175,10 +175,14 @@ one at a time, oldest first. The sidebar says how many wait.
   back three seconds after it was due. After about three seconds without a
   current queue, the decision dims, a notice says since when the queue has
   not refreshed, and the sidebar shows no count.
+- Time in a hidden tab does not count toward that notice. A tab that returns
+  reads at once and takes no answers until that read lands. The notice shows
+  only if no read lands within three seconds of the return.
 - A decision answered here leaves the queue at once. If the fifth read after
   the answer still lists it, it shows again.
 - A decision that leaves the queue while it is on screen is reported as no
   longer in the queue. The view does not say that it was answered, because
   the queue does not say why it left.
 - A host without the queue route gets one line that says the queue is not
-  available there.
+  available there. The same line replaces the last queue if the host stops
+  serving the route.

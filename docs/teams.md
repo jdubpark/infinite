@@ -1952,6 +1952,8 @@ The composed result is `not-met` when any criterion is `not-met`, whoever produc
 - The wait for the host's tests is 300,000 ms by the clock. After the host was down for longer, the verdict goes on without the receipts as soon as the host is back, and a host criterion without a receipt is `inconclusive` (`no-receipt`).
 - While a no-change cycle's verdict is held, the run still shows `planning`. The fixed event is the only sign of the hold.
 - The evaluator's fixed prompt gets the same graph and scratch-directory paragraphs the host appends to every member's prompt.
+- When the evaluator's working copy cannot be prepared, the run blocks, as it does when a reviewer's or a delivery member's cannot. This is new for a run that would otherwise settle with no further member. A resume starts a new revision and a new verdict.
+- A goal cycle whose evaluator is still running at the goal's deadline stops with `deadline` and does not settle. Without verdicts the same cycle settles at approval. An extension policy on the goal covers it, because the evaluator counts as active work.
 
 **Rollback.** Before a rollback to a host without this change:
 

@@ -365,6 +365,10 @@ export class HostPermissionPipeline implements PermissionPipeline {
     if (!canAllow) raised.push("not-qualified");
 
     // 6. The review, with the task's open rejects, the assignment's evidence rejects and the owner's direction.
+    // A verdict reached after the review read source files depends on what those files held then. Its own
+    // delivery reads them again; an identical later request would not, so such a verdict is never replayed.
+    let readSource = false;
+    const collect = options.collect;
     const context: PermissionReviewContext = {
       requesterFamily: family,
       interruptClasses: coverage.interruptClasses,
@@ -374,7 +378,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
         .filter(decision => decision.replayOf === undefined).map(rejectRef),
       raised,
       canAllow,
-      ...(options.collect ? { collect: options.collect } : {}),
+      ...(collect ? { collect: (paths: string[]) => { readSource = true; return collect(paths); } } : {}),
       // Every turn reads the halt again: one recorded after the light turn holds the strong turn.
       held: () => this.halted(requester.projectId),
       ...(options.signal ? { signal: options.signal } : {}),
@@ -407,7 +411,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
       ...(verdict.repeats === undefined ? {} : { repeats: verdict.repeats }),
     };
     try {
-      return this.record(decision, coverage, !isHostCode(decision.code));
+      return this.record(decision, coverage, !isHostCode(decision.code) && !readSource);
     } catch {
       // The journal refused the report as recorded (for example its tier list). That is a report with no verdict.
       const { note: _note, repeats: _repeats, code: _code, interruptClass: _class, ...rest } = decision;

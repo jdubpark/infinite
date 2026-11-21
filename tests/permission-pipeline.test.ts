@@ -379,9 +379,12 @@ test("halt epochs that cannot be read serve nothing, and earlier decisions apply
 
 test("the adapter's evidence collection reaches the review, and no collection exists without it", () => withFixture(async f => {
   f.delegate();
-  const collect = async () => ({ files: [], limitations: [], digest: "none" });
+  const asked: string[][] = [];
+  const evidence = { files: [], limitations: [], digest: "none" };
+  const collect = async (paths: string[]) => { asked.push(paths); return evidence; };
   await f.pipeline.decide(request({ action: "npm test" }), { collect });
-  assert.equal(f.core.reviews[0].context.collect, collect);
+  assert.equal(await f.core.reviews[0].context.collect?.(["src/index.ts"]), evidence);
+  assert.deepEqual(asked, [["src/index.ts"]]);
   await f.pipeline.decide(request({ action: "npm run lint" }));
   assert.equal(f.core.reviews[1].context.collect, undefined);
 }));

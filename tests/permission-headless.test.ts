@@ -844,15 +844,31 @@ test("the channel hook prints a provider decision only for a decision", () => {
   assert.deepEqual(JSON.parse(hookOutput("request", { decision: "defer" })).hookSpecificOutput.decision, { behavior: "deny", message: requesterNotice("unavailable") });
 });
 
-test("takeContinue answers true once after each resume the worker performed; the marker only marks a turn-start", async () => {
-  const w = workerRig([owner]);
-  assert.equal(w.channel.takeContinue(), false, "no resume yet");
+test("each resume the worker performed owes one continue: the first prompt after it is marked, and nothing else", async () => {
+  const w = workerRig([owner, { ...owner, decisionId: randomUUID() }]);
+  // The session worker's own callback, as worker.ts wires it on the Claude hook route.
+  const mark = (signals: Parameters<typeof claudeTurnSignals>[0]) => claudeTurnSignals(signals, () => w.channel.takeContinue());
+  const prompt = { kind: "turn-start" as const, prompt: "Continue from where you left off." };
+  const next = { kind: "turn-start" as const, prompt: "next" };
+  const toolEnd = { kind: "tool-end" as const, tool: "Bash", ok: true };
+  assert.deepEqual(mark([prompt]), [prompt], "before any resume a prompt is a person's");
   await resumeAfterDeferral(w);
-  assert.equal(w.channel.takeContinue(), true, "the first prompt after the resume is the provider's continue");
-  assert.equal(w.channel.takeContinue(), false, "the answer is taken once");
   // The resumed call's own hooks arrive before the continue prompt: they neither take the answer nor get the marker.
-  const signals = [{ kind: "tool-end" as const, tool: "Bash", ok: true }, { kind: "turn-start" as const, prompt: "Continue from where you left off." }, { kind: "turn-start" as const, prompt: "next" }];
-  let owed = true;
-  const marked = claudeTurnSignals(signals, () => { const taken = owed; owed = false; return taken; });
-  assert.deepEqual(marked, [signals[0], { kind: "turn-start", prompt: "Continue from where you left off.", automatic: true }, signals[2]]);
+  assert.deepEqual(mark([toolEnd]), [toolEnd]);
+  assert.deepEqual(mark([prompt, next]), [{ ...prompt, automatic: true }, next], "only the first prompt after the resume is the provider's");
+  assert.deepEqual(mark([prompt]), [prompt], "the answer is taken once");
+  // A second deferred call in the resumed run: its resume owes a continue again.
+  assert.equal((await w.pre("deploy staging", "toolu_second")).decision, "defer");
+  assert.equal(w.channel.exited(0), true);
+  w.channel.answer({ requestId: "a2", promptId: w.prompts[1]!, option: 0 });
+  assert.deepEqual(await w.pre("deploy staging", "toolu_second"), { decision: "allow" });
+  assert.equal(w.resumed, 2);
+  assert.deepEqual(mark([toolEnd, prompt]), [toolEnd, { ...prompt, automatic: true }], "the second resume owes one too");
+  // A resume that fails owes nothing.
+  const unresumable = workerRig([owner]);
+  unresumable.failResume();
+  await unresumable.pre("deploy production", "toolu_1");
+  unresumable.channel.exited(0);
+  unresumable.channel.answer({ requestId: "a1", promptId: unresumable.prompts[0]!, option: 0 });
+  assert.equal(unresumable.channel.takeContinue(), false, "a resume that fails owes no continue");
 });

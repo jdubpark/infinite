@@ -227,3 +227,30 @@ test("a review that GitHub supersedes while the owner's halt holds it starts not
     assert.ok(events(saved).includes("The owner's review PRR_1 was not applied: GitHub no longer shows this review as the owner's newest request for changes on the delivered head."));
   } finally { f.close(); }
 });
+
+test("a held review whose pull request is retargeted before the halt lifts starts nothing", async () => {
+  for (const [name, change, reason] of [["another base branch", { baseRefName: "release" }, "base"], ["another head branch", { headRefName: "renamed-branch" }, "branch"]] as const) {
+    const f = schedulerFixture();
+    try {
+      const gh = delivered(f), review = gh.review("PRR_1", owner, "CHANGES_REQUESTED");
+      gh.show([review]);
+      let halted = true;
+      const teams = f.openTeam(), feedback = poller(teams);
+      teams.useFuse({ held: () => halted ? { reason: "halt" } : undefined } as unknown as FuseGate);
+      await feedback.start();
+      await feedback.poll();
+      assert.deepEqual(f.readRecord<Saved>("team", f.run.id).reviewIntake?.intents.map(intent => intent.state), ["pending"]);
+
+      gh.show([review], change);
+      halted = false;
+      await feedback.poll();
+      const saved = f.readRecord<Saved>("team", f.run.id);
+      assert.equal(saved.run.revision, 1, `a pull request moved to ${name} starts nothing`);
+      assert.deepEqual(saved.run.steering, []);
+      assert.deepEqual(saved.reviewIntake?.intents.map(intent => [intent.reviewId, intent.state, intent.text]), [["PRR_1", "superseded", requested]], "the accepted text stays as read");
+      assert.deepEqual(saved.run.reviewFeedback?.map(entry => [entry.reviewId, entry.outcome]), [["PRR_1", "superseded"]]);
+      assert.ok(events(saved).includes("The owner's review PRR_1 was not applied: GitHub shows the pull request on another base or head branch than the one this run delivered to."));
+      assert.equal(saved.reviewIntake?.ended?.reason, reason, "the run then leaves the watched set");
+    } finally { f.close(); }
+  }
+});

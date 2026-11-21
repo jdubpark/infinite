@@ -123,14 +123,17 @@ test("the one read of a pull request is a read the GitHub proxy allows under the
   assert.equal(pullRequestTarget(delivered(run => { run.pullRequest!.pullRequestUrl = `${URL}/files`; })), undefined);
 });
 
-test("a saved intent holds only while its review is still the owner's newest request on the unmoved head", () => {
-  const intent = { reviewId: "PRR_1", commit: HEAD, submittedAt: "2026-11-02T00:00:00Z" };
-  assert.equal(intentStillCurrent(intent, read([review()]), OWNER, ENABLED), true);
-  assert.equal(intentStillCurrent(intent, read([review(), review({ id: "PRR_2", state: "APPROVED", submittedAt: "2026-11-03T00:00:00Z" })]), OWNER, ENABLED), false);
-  assert.equal(intentStillCurrent(intent, read([review({ state: "DISMISSED" })]), OWNER, ENABLED), false);
-  assert.equal(intentStillCurrent(intent, read([review()], { headRefOid: OLD }), OWNER, ENABLED), false);
-  assert.equal(intentStillCurrent(intent, read([review()], { state: "CLOSED" }), OWNER, ENABLED), false);
-  assert.equal(intentStillCurrent(intent, read([review()]), OWNER, "2026-11-05T00:00:00Z"), false, "the switch was turned on again after the review");
+test("a saved intent holds only while its review is still the owner's newest request on the unmoved head and branches", () => {
+  const intent = { reviewId: "PRR_1", commit: HEAD, submittedAt: "2026-11-02T00:00:00Z" }, run = delivered();
+  assert.equal(intentStillCurrent(intent, run, read([review()]), OWNER, ENABLED), true);
+  assert.equal(intentStillCurrent(intent, run, read([review(), review({ id: "PRR_2", state: "APPROVED", submittedAt: "2026-11-03T00:00:00Z" })]), OWNER, ENABLED), false);
+  assert.equal(intentStillCurrent(intent, run, read([review({ state: "DISMISSED" })]), OWNER, ENABLED), false);
+  assert.equal(intentStillCurrent(intent, run, read([review()], { headRefOid: OLD }), OWNER, ENABLED), false);
+  assert.equal(intentStillCurrent(intent, run, read([review()], { state: "CLOSED" }), OWNER, ENABLED), false);
+  assert.equal(intentStillCurrent(intent, run, read([review()], { baseRefName: "release" }), OWNER, ENABLED), false, "the pull request was retargeted");
+  assert.equal(intentStillCurrent(intent, run, read([review()], { headRefName: "renamed-branch" }), OWNER, ENABLED), false, "the head branch is not the recorded one");
+  assert.equal(intentStillCurrent(intent, delivered(item => { delete item.pullRequest!.branch; }), read([review()]), OWNER, ENABLED), false, "no recorded branch, no steer");
+  assert.equal(intentStillCurrent(intent, run, read([review()]), OWNER, "2026-11-05T00:00:00Z"), false, "the switch was turned on again after the review");
 });
 
 test("the review text and request id are a valid steer, and a long summary is cut with a note and the link", () => {

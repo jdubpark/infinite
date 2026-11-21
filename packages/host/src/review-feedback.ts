@@ -157,12 +157,13 @@ export function reviewVerdict(subject: { run: TeamRun; reviewIntake?: ReviewInta
 
 /**
  * Whether a saved intent still holds against a fresh read: its review is still the owner's newest and still requests
- * changes, it came after the switch was last turned on, and the pull request is open with its head unmoved.
+ * changes, it came after the switch was last turned on, and the pull request is open, still targets the run's base
+ * branch from the run's recorded delivery branch, and has its head unmoved.
  */
-export function intentStillCurrent(intent: Pick<ReviewIntent, "reviewId" | "commit" | "submittedAt">, pr: PullRequestRead, ownerLogin: string, enabledAt: string) {
+export function intentStillCurrent(intent: Pick<ReviewIntent, "reviewId" | "commit" | "submittedAt">, run: Pick<TeamRun, "delivery" | "pullRequest">, pr: PullRequestRead, ownerLogin: string, enabledAt: string) {
   const review = newestOwnerReview(pr, ownerLogin);
-  return pr.state === "OPEN" && !pr.isCrossRepository && review?.id === intent.reviewId && review.state === "CHANGES_REQUESTED" &&
-    pr.headRefOid === intent.commit && Date.parse(intent.submittedAt) > Date.parse(enabledAt);
+  return pr.state === "OPEN" && !pr.isCrossRepository && pr.baseRefName === run.delivery?.baseBranch && pr.headRefName === run.pullRequest?.branch &&
+    review?.id === intent.reviewId && review.state === "CHANGES_REQUESTED" && pr.headRefOid === intent.commit && Date.parse(intent.submittedAt) > Date.parse(enabledAt);
 }
 
 /** The review summary as steering text: at most REVIEW_TEXT_LIMIT characters, with a note and the link when it was longer. */

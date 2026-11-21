@@ -113,10 +113,12 @@ export class TeamReviewFeedback {
       const target = pullRequestTarget(stored.run);
       const read = target ? await this.read(stored, target) : undefined;
       if (target && !read) continue;
-      if (!read || !intentStillCurrent(intent, read, ownerLogin, enabledAt)) {
+      if (!read || !intentStillCurrent(intent, stored.run, read, ownerLogin, enabledAt)) {
+        const moved = read && (read.baseRefName !== stored.run.delivery?.baseBranch || read.headRefName !== stored.run.pullRequest?.branch);
         await this.host.enqueue(() => {
           const current = this.current(id, intent);
-          if (current) this.settle(current, intent, "superseded", "GitHub no longer shows this review as the owner's newest request for changes on the delivered head.");
+          if (current) this.settle(current, intent, "superseded", moved ? "GitHub shows the pull request on another base or head branch than the one this run delivered to."
+            : "GitHub no longer shows this review as the owner's newest request for changes on the delivered head.");
         });
         continue;
       }

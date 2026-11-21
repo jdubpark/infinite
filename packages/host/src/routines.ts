@@ -31,11 +31,12 @@ type Stored = {
 };
 const now = () => new Date().toISOString();
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
-/** Outcome settings change measurement and learning spend, never a routine's work (umbrella C11), so they are removed before hashing. */
+/** Outcome settings and member traces change measurement, learning spend and what the host keeps, never a routine's work (umbrella C11), so they are removed before hashing. */
 function digestedTeams(teams: Config["teams"]): Config["teams"] {
-  if (!teams || !("outcomes" in teams)) return teams;
+  if (!teams || !("outcomes" in teams || "memberTraces" in teams)) return teams;
   const rest: Partial<NonNullable<Config["teams"]>> = { ...teams };
   delete rest.outcomes;
+  delete rest.memberTraces;
   return rest as Config["teams"];
 }
 /** The eval block changes what the host measures, never a routine's work (umbrella C11), so it is removed before hashing. */

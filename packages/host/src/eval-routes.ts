@@ -27,6 +27,11 @@ const MESSAGES: Record<EvalRefusal["code"], string> = {
   "invalid-job-transition": "The job cannot take this action in its current state.",
   "task-not-active": "The task is not a candidate or valid task.",
   "evidence-unavailable": "The evidence store is unavailable.",
+  "too-few-tasks": "The selected set has too few tasks for this job.",
+  "subject-confirmed": "This configuration pair was already confirmed.",
+  "report-not-ready": "The report is not ready.",
+  "report-unreadable": "The report cannot be read.",
+  "no-report": "This job has no report.",
 };
 
 /**

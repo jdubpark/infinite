@@ -65,7 +65,7 @@ export function evalSummary(store: EvidenceStore, input: SummaryInput): EvalSumm
       states: db.all<StateRow>(STATE_COUNTS_SQL, ref),
       areas: areaCounts(db, ref, project),
       validCaptured: db.get<{ n: number }>(VALID_CAPTURED_SQL, ref, since)?.n ?? 0,
-      groups: groupStats(db, ref),
+      groups: { ...groupStats(db, ref), holdout: 0, exposed: 0 },
     };
   });
   return {

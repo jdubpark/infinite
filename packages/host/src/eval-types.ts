@@ -148,7 +148,7 @@ export type GraderState = "not-configured" | "unavailable" | "misconfigured" | "
 export type MiningState = "off" | "waiting" | "mining" | "caught-up" | "full" | "failing";
 export type MiningStatus = { state: MiningState; visited: number | null; mined: number | null; skipped: number | null; failures: number | null; backfillDone: boolean | null };
 export type EvalJobReason = "owner" | "validation-stuck" | "configuration-changed" | "grader-processes-alive" | "limit-reached" | "done" | "expired"
-  | "trial-voids" | "eval-processes-alive";
+  | "trial-voids" | "eval-processes-alive" | "identity-changed";
 export type EvalJobWait = "grader" | "window" | "host-load" | "halt" | "storage" | "bundle" | "mirror" | "another-job"
   | "eval-identity" | "provider-limit" | "session-slots" | "daily-cap";
 export type ValidateJobView = {
@@ -188,7 +188,66 @@ export type BaselineJobView = Omit<ValidateJobView, "kind" | "counts"> & {
   trials: { planned: number; started: number; graded: number; resolved: number; ended: number; void: number };
   dailyCap: number | null;
 };
-export type EvalJobView = ValidateJobView | BaselineJobView;
+export type EvalSet = "dev" | "holdout";
+export const PROMPT_ORIGINS = ["assignment", "run-objective", "commit-message"] as const;
+export type PromptOrigin = typeof PROMPT_ORIGINS[number];
+export type ComparisonJobRequest = {
+  kind: "compare" | "confirm";
+  /** compare: 2 to 4. confirm: exactly 2. */
+  configurations: TrialConfiguration[];
+  /** A confirm request admits no taskIds. */
+  taskFilter?: {
+    taskIds?: string[]; origins?: EvalOrigin[]; areas?: string[]; promptOrigins?: PromptOrigin[];
+    excludeGroups?: string[]; maxTasks?: number;
+  };
+  trialsPerTask?: number;
+  limits: { maxTrials: number; maxWallMinutes: number };
+  windows?: { startHourUtc: number; endHourUtc: number }[];
+  expiresAt?: string;
+};
+export type ComparisonPin = { configRef: string; profileEpoch: number; promptVersion: string };
+/** Sealed in `eval_jobs.payload` for a baseline, compare, or confirm job. Only comparison jobs have `tasks` and `pins`. */
+export type TrialJobPayload = {
+  projectId: string; request: BaselineJobRequest | ComparisonJobRequest; requestDigest: string; jobDigest: string;
+  tasks?: string[]; pins?: ComparisonPin[]; subject?: string;
+};
+export type ComparisonJobView = Omit<BaselineJobView, "kind" | "trials"> & {
+  kind: "compare" | "confirm";
+  set: EvalSet;
+  trials: { planned: number; started: number; graded: number; resolved: number | null; ended: number; void: number; reused: number };
+  report: "pending" | "ready" | null;
+};
+export type EvalJobView = ValidateJobView | BaselineJobView | ComparisonJobView;
+export type PairResult = {
+  a: number; b: number; n: number; mean: number | null; interval: [number, number] | null;
+  sign: { wins: number; losses: number; ties: number; p: number }; holm: number;
+  detectable: { observed: number | null; planning: [number, number] | null };
+};
+export type ComparisonStats = {
+  trialsPerTask: number; conclusive: boolean;
+  tasks: { planned: number; analysed: number; leftHoldout: number };
+  pairs: PairResult[];
+  sensitivity: { a: number; b: number; n: number; mean: number | null }[];
+  attrition: {
+    configuration: number; void: Record<"void-limit" | "void-host" | "void-owner", number>; changed: number; short: number;
+  }[];
+  cost: {
+    configuration: number; trials: number; resolved: number; costed: number; tokensPerResolved: number | null;
+    spentUsdPerResolved: number | null; listUsdPerResolved: null; minutesPerResolved: number | null;
+  }[];
+  byPromptOrigin: { promptOrigin: PromptOrigin; n: number; pairs: PairResult[] }[];
+  byArea: { area: string; n: number; pairs: PairResult[] }[];
+};
+export type ComparisonReport = ComparisonStats & {
+  jobId: string; projectId: string; kind: "compare" | "confirm"; set: EvalSet; source: "replay"; metric: "resolved";
+  status: RoutineStatus; reason: EvalJobReason | null; generatedAt: string;
+  configurations: { index: number; profileId: string; provider: string; profileEpoch: number; promptVersion: string }[];
+};
+export type ReplayPrior = {
+  projectId: string; profileId: string; profile: { provider: string; model: string | null; effort: string | null };
+  profileEpoch: number; promptVersion: string; role: "implementer"; area: string; kind: string | null;
+  tasks: number; trials: number; resolved: number; source: "replay"; promptOrigin: PromptOrigin; generatedAt: string; jobId: string;
+};
 export type ValidateJobRequest = {
   kind: "validate";
   taskFilter?: { taskIds?: string[]; origins?: EvalOrigin[]; areas?: string[]; revalidate?: boolean; maxTasks?: number };
@@ -201,8 +260,8 @@ export type EvalSummary = {
   capture: { on: boolean };
   mining: { on: boolean } & MiningStatus;
   tasks: { byState: Record<EvalState, number>; byOrigin: Record<EvalOrigin, Record<EvalState, number>>;
-           byArea: { area: string; candidate: number; valid: number }[]; bySet: null };
-  groups: { total: number; devOnly: number; largest: number };
+           byArea: { area: string; candidate: number; valid: number }[]; bySet: { dev: number; holdout: number } | null };
+  groups: { total: number; devOnly: number; largest: number; holdout: number; exposed: number };
   coverage: { days: number; validCaptured: number; accepted: number; share: number } | null;
   grader: { state: GraderState; version: number | null };
   evalIdentity: { state: EvalIdentityState };
@@ -211,12 +270,14 @@ export type EvalSummary = {
 };
 export type EvalRefusal = { status: 400 | 404 | 409 | 503; code: "invalid-eval-request" | "unknown-project" | "unknown-job" | "unknown-task"
   | "job-active" | "request-conflict" | "eval-config-incomplete" | "invalid-job-transition" | "task-not-active" | "evidence-unavailable"
-  | "profile-not-approved" };
+  | "profile-not-approved" | "too-few-tasks" | "subject-confirmed" | "report-not-ready" | "report-unreadable" | "no-report" };
 export interface EvalHostApi {
   summary(projectId: string): Promise<EvalSummary | EvalRefusal>;
   jobs(): EvalJobView[] | EvalRefusal;
   job(jobId: string): EvalJobView | EvalRefusal;
-  create(projectId: string, request: ValidateJobRequest | BaselineJobRequest, requestId: string): { created: boolean; job: EvalJobView } | EvalRefusal;
+  create(projectId: string, request: ValidateJobRequest | BaselineJobRequest | ComparisonJobRequest, requestId: string): { created: boolean; job: EvalJobView } | EvalRefusal;
   control(jobId: string, action: "pause" | "resume" | "cancel"): EvalJobView | EvalRefusal;
   retire(taskId: string): { taskId: string; state: "retired" } | EvalRefusal;
+  report(jobId: string): ComparisonReport | EvalRefusal;
+  priors(projectId: string): { projectId: string; priors: ReplayPrior[] } | EvalRefusal;
 }

@@ -18,11 +18,14 @@ import { evalSummary, SUMMARY_JOBS } from "./eval-summary.js";
 import {
   EVAL_MODULE,
   type BaselineJobRequest,
+  type ComparisonJobRequest,
+  type ComparisonReport,
   type EvalHostApi,
   type EvalJobView,
   type EvalRefusal,
   type EvalSummary,
   type GraderState,
+  type ReplayPrior,
   type ValidateJobRequest,
 } from "./eval-types.js";
 import { type BundleState, type TaskValidation, type ValidateContext, validateTask } from "./eval-validate.js";
@@ -197,9 +200,11 @@ export class EvalHost implements EvalHostApi {
     return this.guard(() => this.evalJobs.view(jobId) ?? refusal(404, "unknown-job"));
   }
 
-  create(projectId: string, request: ValidateJobRequest | BaselineJobRequest, requestId: string): { created: boolean; job: EvalJobView } | EvalRefusal {
-    return this.guard(() => request.kind === "baseline" ? this.trialJobs.create(projectId, request, requestId)
-      : this.evalJobs.create(projectId, request, requestId));
+  create(projectId: string, request: ValidateJobRequest | BaselineJobRequest | ComparisonJobRequest, requestId: string): { created: boolean; job: EvalJobView } | EvalRefusal {
+    if (request.kind !== "validate" && request.kind !== "baseline") return refusal(400, "invalid-eval-request");
+    const narrowed = request;
+    return this.guard(() => narrowed.kind === "baseline" ? this.trialJobs.create(projectId, narrowed, requestId)
+      : this.evalJobs.create(projectId, narrowed, requestId));
   }
 
   control(jobId: string, action: "pause" | "resume" | "cancel"): EvalJobView | EvalRefusal {
@@ -215,6 +220,14 @@ export class EvalHost implements EvalHostApi {
       retireTask(tx, taskId, "owner-retired", this.now());
       return { taskId, state: "retired" as const };
     }));
+  }
+
+  report(_jobId: string): ComparisonReport | EvalRefusal {
+    return refusal(404, "no-report");
+  }
+
+  priors(_projectId: string): { projectId: string; priors: ReplayPrior[] } | EvalRefusal {
+    return refusal(404, "unknown-project");
   }
 
   /** Starts one validation pass when none runs. */

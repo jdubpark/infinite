@@ -156,7 +156,9 @@ function fixture(options: FixtureOptions = {}): Fixture {
     // The host sends a baseline job to TrialJobs and a validate job to EvalJobs.
     create: (projectId, request, requestId) => request.kind === "baseline"
       ? trials.create(projectId, request, requestId)
-      : jobs.create(projectId, request, requestId),
+      : request.kind === "validate" ? jobs.create(projectId, request, requestId) : { status: 400, code: "invalid-eval-request" },
+    report: () => ({ status: 404, code: "no-report" }),
+    priors: () => ({ status: 404, code: "unknown-project" }),
     control: (jobId, action) => jobs.control(jobId, action),
     retire: taskId => retireOwned(store, taskId),
   };
@@ -281,7 +283,7 @@ test("the summary counts every state and keeps unknowns unknown", async () => {
     ]);
     assert.equal(summary.tasks.bySet, null);
     const expectedGroups = f.store.read(db => groupStats(db, db.index("project", PROJECT)));
-    assert.deepEqual(summary.groups, expectedGroups);
+    assert.deepEqual(summary.groups, { ...expectedGroups, holdout: 0, exposed: 0 });
     assert.equal(summary.capture.on, true);
     assert.equal(summary.mining.on, true);
     assert.equal(summary.mining.visited, null, "no mining row: visited is unknown, never 0");

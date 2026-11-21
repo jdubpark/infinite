@@ -32,7 +32,7 @@ const summary: EvalSummary = {
   capture: { on: true },
   mining: { on: true, state: "mining", visited: null, mined: 3, skipped: 1, failures: 0, backfillDone: false },
   tasks: { byState: counts(2, 1) as EvalSummary["tasks"]["byState"], byOrigin: { captured: counts(2, 0), mined: counts(0, 1) } as EvalSummary["tasks"]["byOrigin"], byArea: [], bySet: null },
-  groups: { total: 3, devOnly: 1, largest: 2 },
+  groups: { total: 3, devOnly: 1, largest: 2, holdout: 0, exposed: 0 },
   coverage: null,
   grader: { state: "ready" },
   jobs: [job],

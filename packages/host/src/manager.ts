@@ -1151,6 +1151,9 @@ export class Manager {
     // is the one an earlier host built, so a resume that host had started still matches its fingerprint.
     const recorded = request.recordedCodeMode ?? (request.resumedFrom === undefined ? undefined : false);
     session.codeMode = codeModeEnabled(this.config.codeMode?.claude, request.provider, facts, recorded, request.purpose);
+    // Claude Code refuses to resume a Code Mode conversation with Code Mode off, so this launch could only fail.
+    if (request.recordedCodeMode && !session.codeMode)
+      throw new ContentError("This conversation was started in Code Mode. Claude Code resumes it only with Code Mode on, and a headless resume on this host cannot ask for it. Start a new session instead of resuming it.", 409);
     // Keep the native prompt exact. Only opted-in, qualified sessions receive the
     // separate handoff MCP capability; the context snapshot stays in the record.
     const prompt = request.nativeArgs !== undefined ? "" : [

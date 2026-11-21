@@ -66,8 +66,9 @@ Some launches never ask. A permission coordinator and a mission coordinator
 run with tool lists that leave out the program tool. Permission-reviewer turns,
 headless launches that the permission channel does not serve, evaluation and
 learning sessions, other providers, and launches outside the host's worker stay
-as they are. A headless run takes the request only from its `--settings`
-argument, and only a served launch carries one.
+as they are. A headless run takes the request only from the `env` key of its
+`--settings` argument, and the host puts the request there only for served
+headless launches.
 
 In a served session each tool call inside a program raises its own hooks, so
 the permission channel still decides each call.
@@ -75,19 +76,21 @@ the permission channel still decides each call.
 A session records whether the host asked for Code Mode. Resuming the same
 conversation asks again when the record says so, whatever the setting says by
 then, and does not ask when the record says no or the session is older than
-this setting. One case differs: an owner resume has no permission channel, so a
-conversation resumed through a headless profile starts without Code Mode, and
-its new record says so. The record is not part of any API response.
+this setting. The record is not part of any API response.
+
+Claude Code resumes a Code Mode conversation only with Code Mode on. An owner
+resume has no permission channel, so through a headless profile it cannot ask
+for Code Mode. The host refuses that resume with a reason and starts nothing. A
+conversation that did not start in Code Mode resumes as before.
 
 Before setting `all`:
 
 - Claude Code asks for a confirmation once per operating-system account. The
   host does not answer it, and this setting does not accept it in advance.
   Accept it once in a terminal on the account that runs the agents. Until then
-  every interactive launch stops at the confirmation.
-- Claude Code's documentation names 2.1.328 as the first version with the hook
-  behaviour described here, and the host was measured against 2.1.330. The host
-  does not check the installed version.
+  every interactive launch that asks for Code Mode stops at the confirmation.
+- The behaviour described here was measured against Claude Code 2.1.330. The
+  host does not check the installed version.
 - A Code Mode session cannot use Remote Control, Claude in Chrome, or computer
   use.
 - Where agents start through `sudo`, an interactive launch carries the request

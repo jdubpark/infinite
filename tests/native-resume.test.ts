@@ -180,20 +180,28 @@ setInterval(() => {}, 1000);
     assert.equal(retried.body.id, plain);
     assert.equal(readLaunches().length, 4, "the retry starts nothing");
 
-    // A headless run takes Code Mode only from its --settings argument, and an owner resume has no permission channel
-    // to carry one. So a recorded Code Mode conversation resumed through a headless profile starts without the
-    // variable, and its record says so.
+    // Claude Code resumes a Code Mode conversation only with Code Mode on. A headless run takes the request only from
+    // its --settings argument, and an owner resume has no permission channel to carry one. So the host refuses the
+    // resume through a headless profile, and starts and records nothing.
     const recorded = await start(nativeIds[2]!);
     assert.equal(readLaunches()[4]!.mode, "1");
     await stop(recorded);
     host.config.agents = { claude: { command: process.execPath, args: [fixture, "-p"] } };
     await setModeAndRestartApi("all");
-    const headlessResume = await host.fetchApi(`/sessions/${recorded}/resume`, "owner", { requestId: randomUUID() });
-    assert.equal(headlessResume.status, 200, JSON.stringify(headlessResume.body));
+    const resumeId = randomUUID();
+    const headlessResume = await host.fetchApi(`/sessions/${recorded}/resume`, "owner", { requestId: resumeId });
+    assert.equal(headlessResume.status, 409, JSON.stringify(headlessResume.body));
+    assert.match(headlessResume.body.error, /started in Code Mode.*Start a new session/);
+    assert.equal(existsSync(join(host.config.stateDir, "sessions", resumeId)), false, "the refusal leaves no successor record");
+    assert.equal(existsSync(join(host.config.stateDir, "resumptions", `${resumeId}.sealed`)), false, "the refusal leaves no receipt");
+    // Nothing was kept, so the same request resumes the conversation once the profile is interactive again, and the
+    // launch after the fifth is that resume, in Code Mode, whatever the setting says by then.
+    host.config.agents = { claude: { command: process.execPath, args: [fixture] } };
+    await setModeAndRestartApi("off");
+    const interactiveResume = await host.fetchApi(`/sessions/${recorded}/resume`, "owner", { requestId: resumeId });
+    assert.equal(interactiveResume.status, 200, JSON.stringify(interactiveResume.body));
     await waitFor(() => readLaunches(), launches => launches.length === 6);
-    assert.equal(readLaunches()[5]!.nativeId, nativeIds[2]);
-    assert.equal(Object.hasOwn(readLaunches()[5]!, "mode"), false);
-    assert.equal(record(headlessResume.body.id as string).session.codeMode, false);
+    assert.deepEqual(readLaunches()[5], { mode: "1", nativeId: nativeIds[2] });
   } finally {
     await host.stop();
     rmSync(root, { recursive: true, force: true });

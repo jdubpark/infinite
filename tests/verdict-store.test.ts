@@ -63,8 +63,9 @@ function data(overrides: Record<string, unknown> = {}): Record<string, unknown> 
   };
 }
 
+/** A stored event. The host stamps `v: 1` on the data of every run event it emits. */
 function event(key: string, eventData: Record<string, unknown>, at: string = NOW, runId = "run-1"): OutboxEvent {
-  return { key, runId, revision: 3, at, kind: "verdict.recorded", data: eventData };
+  return { key, runId, revision: 3, at, kind: "verdict.recorded", data: { v: 1, ...eventData } };
 }
 
 type Row = Record<string, unknown>;
@@ -121,6 +122,11 @@ test("a verdict event projects one row", () => {
     f.outbox.flush([event("verdict-no-project", noProject)]);
     const badProject = data({ projectId: "Not An Id" });
     f.outbox.flush([event("verdict-bad-project", badProject)]);
+    // Data without the host's version, of a later version, or with a key the schema does not name writes nothing.
+    const unversioned = data(), newer = data(), noted = data({ note: "free text" });
+    f.outbox.flush([{ ...event("verdict-unversioned", unversioned), data: unversioned }]);
+    f.outbox.flush([event("verdict-newer", { ...newer, v: 2 })]);
+    f.outbox.flush([event("verdict-noted", noted)]);
     const later = data();
     f.outbox.flush([event("verdict-2", later)]);
     const ids = rows(f).map(item => item.verdict_id);
@@ -128,6 +134,7 @@ test("a verdict event projects one row", () => {
     assert.equal(ids.includes(bad.verdictId), false);
     assert.equal(ids.includes(noProject.verdictId), false);
     assert.equal(ids.includes(badProject.verdictId), false);
+    for (const refused of [unversioned, newer, noted]) assert.equal(ids.includes(refused.verdictId), false);
     assert.equal(ids.includes(later.verdictId), true);
   } finally {
     f.close();

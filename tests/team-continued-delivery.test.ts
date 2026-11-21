@@ -7,7 +7,7 @@ import { fixture, git, limitLineup } from "./team-fixture.js";
 import { waitFor } from "./helpers.js";
 import { TeamError } from "../packages/host/src/teams.js";
 import type { TeamReport } from "../packages/host/src/team-types.js";
-import { deliveryRecord } from "./fixtures/team-delivery-record.js";
+import { deliveryInternals, deliveryRecord } from "./fixtures/team-delivery-record.js";
 
 // INF-324 step 2: a run steered after it delivered a pull request works again and updates that same pull request.
 
@@ -133,4 +133,24 @@ test("a failed delivery in a continued revision blocks for the owner instead of 
       } else assert.equal(h.run.deliveryRecovery?.status, "stopping", "a first delivery inspects the remote by itself");
     } finally { await h.f.close(); }
   }
+});
+
+test("a run continued from a pull request recorded without its branch blocks at delivery instead of delivering to its checkpoint", { timeout: 60000 }, async () => {
+  const h = await deliveryRecord("pr");
+  try {
+    // A run steered before the host kept the branch: its pull request is from revision 1, and revision 2 was published to a checkpoint.
+    const checkpoint = `${h.run.branch}-${h.headCommit.slice(0, 8)}`;
+    Object.assign(h.run, { lineup: structuredClone(limitLineup), revision: 2, status: "reviewing",
+      pullRequest: { revision: 1, headCommit: h.headCommit, pullRequestUrl: PULL_REQUEST, summary: "Opened for review.", reportedAt: new Date().toISOString() },
+      publication: { repository: h.run.delivery!.repository, branch: checkpoint, commit: h.headCommit, publishedAt: new Date().toISOString() },
+      tasks: [{ id: "a", title: "a", instructions: "Change the label.", paths: ["src/a.ts"], dependsOn: [], revision: 2, status: "integrated", commit: h.headCommit }],
+      review: { verdict: "approved", summary: "Reviewed the continued head.", revision: 2 } });
+    h.member.status = "stopped"; h.stored.deliveryAttempt = undefined; h.stored.checkHead = h.headCommit;
+    await deliveryInternals(h.teams).step(h.stored);
+    assert.deepEqual([h.run.status, h.run.blockCode], ["blocked", "delivery-branch-unknown"], JSON.stringify(h.run.events.slice(-3)));
+    assert.match(h.run.reason ?? "", /recorded before the host kept its branch/);
+    assert.deepEqual(h.run.members.filter(member => member.role === "delivery" && member.revision === 2), [], "no delivery is granted the checkpoint");
+    assert.equal(h.stored.deliveryAttempt, undefined);
+    assert.equal(h.run.pullRequest?.branch, undefined);
+  } finally { await h.f.close(); }
 });

@@ -26,16 +26,20 @@ const TEAM_CONTEXT_PATH = ".git/infinite-team-context.json";
 const TEAM_PROMPT_LIMIT_BYTES = 80 * 1024;
 /**
  * The branch delivery pushes to. A recorded pull request keeps its branch: a run steered after delivery pushes its
- * reviewed head there again and never moves to another branch or a second pull request (INF-324).
+ * reviewed head there again and never moves to another branch or a second pull request (INF-324). Undefined while a
+ * pull request is recorded without its branch: the first-delivery choice below never applies once a pull request exists,
+ * and delivery is refused with UNKNOWN_DELIVERY_BRANCH.
  */
-export function teamDeliveryBranch(run: TeamRun) {
+export function teamDeliveryBranch(run: TeamRun): string | undefined {
+  if (run.pullRequest) return pullRequestBranch(run);
   const publication = run.publication;
-  return pullRequestBranch(run) ?? (run.headCommit && run.delivery && publication?.commit === run.headCommit && publication.repository === run.delivery.repository
-    ? publication.branch : run.branch);
+  return run.headCommit && run.delivery && publication?.commit === run.headCommit && publication.repository === run.delivery.repository ? publication.branch : run.branch;
 }
+/** Why delivery is refused on a run whose pull request was recorded before the host kept its branch (INF-324). */
+export const UNKNOWN_DELIVERY_BRANCH = "This run's pull request was recorded before the host kept its branch, and no read of GitHub has recorded it, so delivery cannot tell which branch updates that pull request. Start a new run for further changes.";
 /**
  * The branch of the recorded pull request. A record made before the branch was kept has none until the review poller
- * reads it from GitHub (design section 4); nothing guesses it, and a steer refuses such a run until then.
+ * reads it from GitHub (design section 4); the host does not infer it, and steering and delivery refuse such a run.
  */
 export function pullRequestBranch(run: Pick<TeamRun, "pullRequest">) {
   return run.pullRequest?.branch;
@@ -343,7 +347,8 @@ const HOST_SCOUT_SENTENCE = "The host assigns each scout's profile; omit agentPr
 /** The implementer's escalation paragraph when the host selects the stronger profile (`hostSelects(run, "escalation", own)`). */
 const HOST_ESCALATION = `If this task exceeds your reasoning capacity or the approach is failing, you may request one explicit escalation. The host selects the stronger profile. Report {"kind":"escalate","reason":"What failed or requires deeper reasoning; identify partial edits and remaining work"}. The host checks your partial edits, stops you, and continues in the same working copy. If this task already records an escalation, ask a material user question or report blocked; do not switch models yourself.`;
 export function teamPrompt(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, provider: Provider = run.provider, modelProfile?: TeamModelProfile, configuredProject?: Pick<TeamProject, "setup" | "checks">, permissionRecoveryHistory: TeamPermissionRecoveryView[] = [], publishHeads = true) {
-  const deliveryBranch = teamDeliveryBranch(run);
+  const deliveryBranch = teamDeliveryBranch(run) ?? "";
+  if (role === "delivery" && run.delivery && !deliveryBranch) throw new TeamError(409, "delivery-branch-unknown", UNKNOWN_DELIVERY_BRANCH);
   const implementerTask = task && role === "implementer" && "paths" in task
     ? (({ rubric: _rubric, ownerRating: _ownerRating, diffStat: _diffStat, reviewRounds: _reviewRounds, summary: _summary, routing: _routing, ...safeTask }) => safeTask)(task)
     : task;

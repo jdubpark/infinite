@@ -14,7 +14,7 @@ import { PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamBrief, type TeamContinue, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryView, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
-import { pullRequestBranch, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
+import { pullRequestBranch, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt, UNKNOWN_DELIVERY_BRANCH } from "./team-prompts.js";
 import { reviewEvidenceProblems } from "./team-acceptance.js";
 import { teamModelLaunch } from "./launch.js";
 import { CheckOutputScanner, checkFeedback } from "./team-check-output.js";
@@ -2661,6 +2661,7 @@ export class TeamService {
       throw new TeamError(409, "delivery-policy-changed", "The repository delivery policy changed or was removed; publication is blocked.");
     if (!run.headCommit || stored.checkHead !== run.headCommit || run.review?.revision !== run.revision || run.review.verdict !== "approved")
       throw new TeamError(409, "delivery-not-reviewed", "Delivery requires passing checks and independent approval for the current integration commit.");
+    if (!teamDeliveryBranch(run)) throw new TeamError(409, "delivery-branch-unknown", UNKNOWN_DELIVERY_BRANCH);
   }
   private memberProfile(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout): TeamModelProfile | undefined {
     if (!run.lineup) return undefined;
@@ -2982,7 +2983,7 @@ export class TeamService {
     const delivery = stored.run.delivery;
     const github = stored.run.replay ? undefined : sessionGithubScope({ kind: "team", role: member.role,
       repository: delivery?.repository ?? projectGithubRepository(this.config.projects.find(project => project.id === stored.run.projectId)),
-      ...(delivery ? { delivery: { mode: delivery.mode, repository: delivery.repository, headBranch: teamDeliveryBranch(stored.run) } } : {}) });
+      ...(delivery && teamDeliveryBranch(stored.run) ? { delivery: { mode: delivery.mode, repository: delivery.repository, headBranch: teamDeliveryBranch(stored.run)! } } : {}) });
     try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession(request, assignment(member), member.cwd, member.modelProfile, stored.root, this.replays.trusted(stored.run), this.replays.header(stored.run), github)); }
     catch (error) {
       this.fuse?.release(member.sessionId);

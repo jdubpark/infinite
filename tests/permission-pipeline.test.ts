@@ -766,7 +766,7 @@ test("one reading of a request serves its class rule, its stored key and its rev
 
   // The same path now resolves into a credential store: the raise rules match as before, and a class rule matches
   // too. The allow is not delivered, and a second attempt at the dialog reaches the owner.
-  f.core.classes.set("cat ../shared/notes", { interruptClass: "credentials-or-secrets", rule: "credential-path" });
+  f.core.classes.set("cat ../shared/notes", { interruptClass: "credentials", rule: "credential-path" });
   assert.equal(f.pipeline.applicable(allowed.decisionId, waiting), false, "the delivery check reads the request again");
   assert.equal(f.pipeline.applicable(allowed.decisionId), true, "the authority alone still holds");
   const owner = decided(await f.pipeline.decide(waiting), "owner");

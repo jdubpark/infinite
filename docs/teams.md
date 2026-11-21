@@ -2546,10 +2546,18 @@ Each request passes these steps in order:
    is locked and gets no model turn until the owner unlocks it. An identical
    request under the same authority is answered from its recorded verdict.
    A verdict belongs to the request as the host read it: the task text the
-   reviewer saw, and the raise rules that matched as the request's paths
-   resolved. After the owner narrows a session's task, or a path in the
-   command comes to resolve outside the session's directory, the identical
-   request is reviewed again, and so is a later attempt at the same dialog.
+   reviewer saw, and the class and raise rules that matched as the request's
+   paths resolved. When the agent decides a request whose task the owner
+   narrowed, or whose path came to resolve to a place the rules tell apart
+   (outside the session's directory, or into a path a class rule names), no
+   verdict recorded for the earlier reading answers it. The host reads the
+   request again immediately before a delivery and withholds the answer when
+   the reading changed while the review ran; the task text in that check is
+   the one the request was handed with. A pending dialog is not handed to the
+   agent again only because its reading changed. A recorded allow answers a
+   second attempt at the same dialog only while a new identical request could
+   replay it: a lock of the assignment, or an open effect reject of the task
+   newer than the allow, leaves it with the owner.
    A verdict that the strong model reached after it asked the host for
    source files is the exception: it cannot answer a new dialog. The delivery
    that follows the review checks again any file the adapter collected. An

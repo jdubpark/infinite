@@ -138,7 +138,7 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
     let fenced = true;
     await Promise.all([...this.delivering.values()].map(async ({ decisionId, target }) => {
       let applicable = false;
-      try { applicable = pipeline?.applicable(decisionId) === true; } catch { applicable = false; }
+      try { applicable = pipeline?.applicable(decisionId, target.request) === true; } catch { applicable = false; }
       if (applicable) return;
       try { if (!target.fence || !await target.fence()) fenced = false; } catch { fenced = false; }
     }));
@@ -231,7 +231,7 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
       return { handled: false, reason: live.reason };
     }
     let applicable = false;
-    try { applicable = pipeline.applicable(decisionId); } catch { applicable = false; }
+    try { applicable = pipeline.applicable(decisionId, request); } catch { applicable = false; }
     if (!applicable) {
       record("refusal", "The decision's authority was retired before delivery.");
       return { handled: false, reason: "The decision's authority was retired before delivery." };
@@ -257,7 +257,7 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
     this.unknown.add(request.id);
     // No await lies between the authority check above and this entry, so an owner act either fails that check
     // or finds the delivery here. The target reads `current` again under its lease, before the first key.
-    const current = () => { try { return pipeline.applicable(decisionId); } catch { return false; } };
+    const current = () => { try { return pipeline.applicable(decisionId, request); } catch { return false; } };
     this.delivering.set(request.id, { decisionId, target });
     let answered: "delivered" | "refused" | "uncertain";
     try { answered = await target.answer(option, decisionId, choice === "reject" ? notice : undefined, current); }

@@ -231,8 +231,11 @@ export interface PermissionPipeline {
   /**
    * Whether a recorded decision may still be applied now: its project is still covered under the same
    * authority, the host is ready, no owner halt covers it, and no revoke, regrouping or direction change retired it.
+   * With `request`, the request the decision was made for, the host also reads the request again: the decision
+   * applies only while that request still gets it, so a path that now resolves elsewhere or a changed task text
+   * withholds it. A delivery passes the request.
    */
-  applicable(decisionId: string): boolean;
+  applicable(decisionId: string, request?: PermissionRequest): boolean;
   /** Whether an owner halt covers the project now. A pipeline without a halt source leaves it out. */
   halted?(projectId: string): boolean;
   /** Linked delivery events. The decision is in the journal before the first one. */

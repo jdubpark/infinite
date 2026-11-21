@@ -2879,6 +2879,10 @@ These rulings settle the calls above. Where a task's text differs, the ruling wi
 11. **Commits.** A worker never commits, stashes, resets, or checks out. The coordinator reads each task's diff and commits it.
 12. **Waves.** At most four implementers at once. The first wave is Tasks 1 to 4; Task 5 runs with the second wave.
 13. **Reference tree.** The build starts on `main` at `84f9a8c3`. Since `21bebd00`, `main` changed only permission files, `docs/teams.md`, and an egress document, so the line numbers of the files this slice writes still hold, except in `docs/teams.md` (Task 16).
+14. **The verdict event carries its project.** `verdictEventDataSchema` gains a required `projectId` (the project id pattern of `team-types.ts`, `^[a-z0-9-]{1,80}$`), and the projector writes `tx.index("project", data.projectId)`. The projector reads no other module's table: a verdict event can be projected while the outcome ledger is behind or unavailable. Task 11's `emit` fills `projectId` from the run.
+15. **The module name is `objective-verdicts`.** The store's name rule refuses an underscore. The table stays `objective_verdicts`.
+16. **Three role lines came forward into Task 1's commit** so that every commit on the branch passes the typecheck: `TEAM_ROLES` (`team-mcp-results.ts`), `LAUNCH_ROLES` (`fuse/baseline.ts`), and `evaluator: ["verdict"]` in `roleAcceptsReport` (`teams.ts`). Task 12 finds that hook in place and counts 16 hooks to write. No evaluator member exists before Task 12, so the lines change nothing until then.
+17. **`verdict-types.ts` keeps its own copy of the id pattern.** `team-types.ts` loads that module, and it does not load `objective-types.ts`.
 
 ## Where the code and the design disagree
 

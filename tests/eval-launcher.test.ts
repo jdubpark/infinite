@@ -11,11 +11,24 @@ import { fileURLToPath } from "node:url";
 // current user. The installed file is never run here. `stop` ends every process of the account and deletes its
 // temporary files, so in every copy its kill line becomes `exit 99`: a broken account check fails a test instead of
 // ending the test runner's processes. The one test that runs `stop` to the end replaces the kill line with a no-op
-// and narrows STOP_DIRS to one directory. Every test skips on a platform other than Linux, and when the test runs as root.
+// and narrows STOP_DIRS to one directory. Every test but the installed-file check skips on a platform other than
+// Linux, and when the test runs as root.
+//
+// The test user may be a busy account, so two more rewrites keep its own state out of the copies:
+// - The installed launcher caps a trial's command with `prlimit --nproc=512`. On Linux that cap counts every thread
+//   the real user owns, so a user that owns more than 512 threads cannot fork. The copy drops the cap: prlimit then
+//   leaves the limit alone, and no value has to fit under the user's hard limit (a raise above it fails with EPERM).
+//   The cap itself is checked against the installed file by its own test, on every platform.
+// - The launcher counts and removes the account's System V objects, which it reads from the kernel's tables. A copy
+//   reads tables of its own that hold the kernel's header line and no object, so a test never counts what the user
+//   owned before it. The copy that runs `stop` to the end keeps the kernel's tables, and its test skips when the
+//   user already owns something that `stop` would remove.
 const LAUNCHER = fileURLToPath(new URL("../deploy/ubuntu/eval-command.sh", import.meta.url));
 const SKIP = process.platform !== "linux" ? "the launcher runs on Linux only"
   : process.getuid?.() === 0 ? "the launcher test must not run as root" : false;
 const TRIAL = "11111111-2222-4333-8444-555555555555";
+const NPROC_CAP = /--nproc=512 /;
+const IPC_TABLE = /ipc_table=\/proc\/sysvipc\/(shm|sem|msg)\b/g;
 // The fixed environment of exec and setup, sorted as the tests compare it.
 const FIXED = [
   "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT",
@@ -44,6 +57,11 @@ function sandbox(account: string = userInfo().username, stopDirs?: string): Sand
   const source = readFileSync(LAUNCHER, "utf8");
   const kill = /^ {2}kill -KILL -1 .*$/m;
   assert.equal(source.match(new RegExp(kill.source, "gm"))?.length, 1, "the launcher's kill line moved; move this guard with it");
+  assert.equal(source.match(new RegExp(NPROC_CAP.source, "g"))?.length, 1, "the launcher's --nproc=512 cap moved; move this guard with it");
+  assert.equal(source.match(IPC_TABLE)?.length, 3, "the launcher's System V tables moved; move this guard with them");
+  const tables = join(dir, "sysvipc");
+  mkdirSync(tables, { mode: 0o700 });
+  for (const name of ["shm", "sem", "msg"]) writeFileSync(join(tables, name), `${readFileSync(`/proc/sysvipc/${name}`, "utf8").split("\n", 1)[0]}\n`);
   const text = source
     .replace(/^ROOT=.*$/m, `ROOT='${root}'`)
     .replace(/^ACCOUNT=.*$/m, `ACCOUNT='${account}'`)
@@ -51,9 +69,13 @@ function sandbox(account: string = userInfo().username, stopDirs?: string): Sand
     .replace(/^TEMPLATE=.*$/m, `TEMPLATE='${template}'`)
     .replace(/^EVAL_TMP=.*$/m, `EVAL_TMP='${tmp}'`)
     .replace(/^STOP_DIRS=.*$/m, `STOP_DIRS='${stopDirs ?? shared}'`)
-    .replace(kill, stopDirs ? "  :" : "  exit 99");
+    .replace(kill, stopDirs ? "  :" : "  exit 99")
+    .replace(NPROC_CAP, "")
+    .replace(IPC_TABLE, (line: string, name: string) => stopDirs ? line : `ipc_table='${join(tables, name)}'`);
   assert.match(text, stopDirs ? /^ {2}:$/m : /^ {2}exit 99$/m, "the kill line was not replaced");
   assert.doesNotMatch(text, /kill -KILL -1/);
+  assert.doesNotMatch(text, /--nproc=/);
+  assert.equal(text.includes("/proc/sysvipc/"), Boolean(stopDirs), "only the copy that runs stop to the end reads the kernel's tables");
   writeFileSync(script, text, { mode: 0o700 });
   chmodSync(script, 0o700);
   return { dir, root, home, template, tmp, script };
@@ -136,6 +158,11 @@ function writeTree(base: string, files: Record<string, string>): void {
     writeFileSync(join(base, name), text);
   }
 }
+
+test("the installed launcher keeps its process cap", () => {
+  const source = readFileSync(LAUNCHER, "utf8");
+  assert.equal(source.match(new RegExp(NPROC_CAP.source, "g"))?.length, 1, "the installed launcher must still cap a trial's command with --nproc=512");
+});
 
 test("the eval launcher starts commands with a fixed environment", { skip: SKIP }, () => {
   const sb = sandbox();
@@ -342,6 +369,10 @@ test("stop removes the account's System V objects and its files in the added dir
   const lockFile = join("/run/lock", `eval-launcher-test-${process.pid}`);
   let segment = "";
   try {
+    // This copy's stop removes every System V object of the test user and every file it owns in /run/lock. The probe
+    // counts the same things, so any count here is state that is not the test's, and stop must not run against it.
+    const own = leftovers(sb);
+    if (own > 0) { t.skip(`the test user already owns ${own} System V objects or files in /run/lock, and stop would remove them`); return; }
     let writable = true;
     try { accessSync("/run/lock", constants.W_OK); } catch { writable = false; }
     if (writable) writeFileSync(lockFile, "x");
@@ -353,8 +384,8 @@ test("stop removes the account's System V objects and its files in the added dir
     const listing = () => spawnSync("/usr/bin/ipcs", ["-m"], { encoding: "utf8" }).stdout.split("\n").map(line => line.trim().split(/\s+/));
     const present = () => listing().some(fields => fields[0]?.startsWith("0x") && fields[1] === segment);
     assert.equal(present(), true, "the segment exists before stop");
-    // The probe reports the segment, and the file when there is one, as leftovers.
-    assert.ok(leftovers(sb) >= (writable ? 2 : 1), "the probe counts the account's shared memory and its file");
+    // The probe reports the segment, and the file when there is one, as leftovers: exactly what stop is about to remove.
+    assert.equal(leftovers(sb), writable ? 2 : 1, "the probe counts the account's shared memory and its file, and nothing else");
 
     const stopped = run(sb, ["stop"]);
     assert.equal(stopped.status, 0, stopped.stderr.toString("utf8"));
@@ -397,7 +428,8 @@ test("the proxy credential is in no process's arguments while a command runs", {
     assert.deepEqual(all.filter(p => p.args.join(" ").includes(secret)).map(p => p.args[0]), []);
   } finally {
     if (sleeperPid) { try { process.kill(sleeperPid, "SIGKILL"); } catch { /* already gone */ } }
-    if (child) {
+    // A child that already ended emits no second exit event, and a wait for one would never end.
+    if (child && child.exitCode === null && child.signalCode === null) {
       const ended = new Promise(resolve => child?.once("exit", resolve));
       child.kill("SIGKILL");
       await ended;

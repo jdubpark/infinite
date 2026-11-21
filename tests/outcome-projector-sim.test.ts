@@ -28,7 +28,8 @@ import { bump, type Counts, type Rand, rand, RunScript } from "./outcome-sim-scr
  * every handler it compares against; P5 and P6 recount with production's helpers or a copy of their logic; P7 checks
  * gap propagation only where a gap is already recorded. Rule semantics stay with tests/outcome-projector.test.ts,
  * tests/outcome-rules.test.ts and tests/outcome-signals.test.ts. For example, an empty repair answer that leaves its
- * round "answered", or a repair answer that keeps another base's links pending, passes every invariant (INF-316).
+ * round "answered", or a repair answer that keeps another base's links pending, passes every invariant; an example
+ * test in tests/outcome-projector.test.ts catches each (INF-316).
  *
  * Faults: a restart after the store took a flush and before any projection (close, then reopen the same path with the
  * same key and register everything again); the sealed outbox flushed again after that restart; a projector that throws
@@ -470,10 +471,7 @@ test("the outcome projector keeps its invariants under seeded faults", t => {
   }
 });
 
-test("a repair answer with no commit after a cancel settle recounts the summary's rounds", {
-  todo: "INF-316: repairIntegrated (outcome-projector.ts:374-395) does not recount a settled summary's rounds; once fixed, "
-    + "drop this todo and switch on EMPTY_REPAIR_AFTER_SETTLE in tests/outcome-sim-script.ts",
-}, () => {
+test("a repair answer with no commit after a cancel settle recounts the summary's rounds", () => {
   // The smallest list without a gap, reduced from simulator seed 18 with EMPTY_REPAIR_AFTER_SETTLE on. Production emits
   // this order when the integrator's operation finished before an owner cancel: the cancel saves run.settled, then the
   // queued completion emits repair.integrated, with no commit when nothing changed (teams.ts:2279-2292, 2695-2704, 5575).
@@ -493,7 +491,8 @@ test("a repair answer with no commit after a cancel settle recounts the summary'
       event(4, "run.settled", [1, "cancelled", "t"], {}, { status: "cancelled" }),
       event(5, "repair.integrated", [1, 1], { memberId: "g1" }, { round: 1, headCommit: head, baseCommit: base }),
     ]);
-    // Shown: { total: 1, attributed: 0, unattributed: 0, unknown: 1 }; the round is resolved and its one link is clear.
+    // Before INF-316 the summary kept { total: 1, attributed: 0, unattributed: 0, unknown: 1 } here; the round is resolved
+    // and its one link is clear, so the recount gives { total: 1, attributed: 0, unattributed: 1, unknown: 0 }.
     live.store.read(db => assert.deepEqual(readSummary(db, "run-d")!.payload.rounds, roundTotals(db, "run-d")));
   } finally {
     live?.store.close();

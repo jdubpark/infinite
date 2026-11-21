@@ -143,6 +143,26 @@ test("unchanged refetch notifications retry failed REST loads without resending 
   } finally { feed.close(); t.mock.timers.reset(); }
 });
 
+test("an unchanged inline session list is sent again once a minute, so a phone's ages keep moving", async t => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  const feed = new LiveFeed({
+    sessions: async () => ({ sessions: [{ id: "exited", attention: { since: "2026-11-20T00:00:00.000Z" } }] }),
+    teams: () => ({ teams: [] }), session: async () => ({}), events: async () => ({ events: [], cursor: 0, more: false }),
+  });
+  const sent: { at: number; update: unknown }[] = [];
+  try {
+    feed.subscribe(["sessions", "teams"], 0, update => sent.push({ at: now, update }));
+    await flush();
+    // 81 ticks of 750 ms: a window just over a minute in which nothing changes.
+    for (let tick = 0; tick < 81; tick++) { now += 750; t.mock.timers.tick(750); await flush(); }
+    assert.deepEqual(sent.map(row => [row.at, (row.update as { topic: string }).topic]), [[0, "sessions"], [0, "teams"], [60_000, "sessions"]],
+      "one re-send of the session list at a minute, none sooner, and none for other topics");
+    assert.deepEqual(sent[2]!.update, sent[0]!.update, "the re-send is the same inline list");
+  } finally { feed.close(); t.mock.timers.reset(); }
+});
+
 const buffers = new WeakMap<ReadableStreamDefaultReader<Uint8Array>, string>();
 async function readSse(reader: ReadableStreamDefaultReader<Uint8Array>) {
   let text = buffers.get(reader) ?? "";

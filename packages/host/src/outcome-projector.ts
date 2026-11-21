@@ -400,6 +400,12 @@ function repairIntegrated(ctx: Ctx): void {
   }
   for (const id of touched) saveOutcomeRow(tx, readOutcome(tx, id)!);
   setRoundState(tx, event, round, commit === undefined ? "resolved" : "answered");
+  // A late answer after the settle still corrects the summary's rounds, as a path event does.
+  const summary = readSummary(tx, event.runId);
+  if (summary) {
+    summary.payload.rounds = roundTotals(tx, event.runId);
+    writeSummary(tx, summary);
+  }
 }
 
 function repairPaths(ctx: Ctx): void {

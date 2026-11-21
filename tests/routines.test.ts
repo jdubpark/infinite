@@ -188,6 +188,20 @@ test("the intent check settings are inside the routine approval digest", async (
   } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("member trace settings are outside the routine approval digest", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    await service.create(f.create()); await wait(30); await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    f.config.teams!.memberTraces = { enabled: true, memberBytes: 1000, runBytes: 5000 };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "running", "turning member traces on keeps the approval");
+    f.config.teams!.trustWorkspaces = false;
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked", "a teams setting that changes the work still blocks it");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("the register setting is inside the routine approval digest", async () => {
   const f = setup(); let service = f.createService();
   try {

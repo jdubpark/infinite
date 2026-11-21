@@ -77,6 +77,8 @@ struct TeamResumeFailure: Equatable {
     @Published var activeID = ""
     @Published var me: JSON = .null
     @Published var sessions: [AgentSession] = []
+    /// The rows `sessions` is built from, and their version; reset with `sessions`.
+    private var sessionList = SessionList()
     @Published var resources: JSON = .null
     @Published var selectedID: String? { didSet { if selectedID != oldValue { mount(selectedID) } } }
     @Published var secondaryID: String? { didSet { if secondaryID != oldValue { mount(secondaryID) } } }
@@ -277,7 +279,7 @@ struct TeamResumeFailure: Equatable {
         for model in teamModels.values { model.stopPolling() }
         for model in missionModels.values { model.stopPolling() }
         let previousClient = client; client = nil
-        connected = false; connecting = true; sessions = []; resources = .null; me = .null
+        connected = false; connecting = true; sessions = []; sessionList = SessionList(); resources = .null; me = .null
         teams = []; selectedTeamID = nil; selectedMissionID = nil; teamOpenedFrom = nil; projectFilter = nil; showingHome = true; teamModels.removeAll(); teamResumeFailures = [:]; teamsFresh = false
         projectGroups = .empty; board = .empty; boardFresh = false; boardError = ""; missionModels.removeAll(); cost = nil
         halt = .clear; haltRetryAt = .distantPast
@@ -310,15 +312,26 @@ struct TeamResumeFailure: Equatable {
         guard displayVisible, let client else { return }
         let generation = connectionGeneration, visibility = displayGeneration
         do {
-            let response = try await client.request("/sessions")
+            // The poll names the version of the rows held: an unchanged list answers with its version alone.
+            // Refreshes overlap (the poll and an action's refresh), so each answer goes back with the read it answers.
+            let read = sessionList.begin()
+            let answer = try await client.request(read.path)
             guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
-            let next = response["sessions"].array.map(AgentSession.init).sorted {
-                if $0.needsYou != $1.needsYou { return $0.needsYou }
-                if $0.running != $1.running { return $0.running }
-                return $0.value["createdAt"].string > $1.value["createdAt"].string
+            var outcome = sessionList.accept(answer, to: read)
+            if outcome == .unreadable {
+                let plain = try await client.request("/sessions")
+                guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
+                outcome = sessionList.acceptPlain(plain, to: read)
             }
-            // Every poll returns the whole list; only a real change may redraw the window.
-            if next != sessions { sessions = next }
+            if outcome == .replaced {
+                let next = sessionList.rows.map(AgentSession.init).sorted {
+                    if $0.needsYou != $1.needsYou { return $0.needsYou }
+                    if $0.running != $1.running { return $0.running }
+                    return $0.value["createdAt"].string > $1.value["createdAt"].string
+                }
+                // Only a real change may redraw the window.
+                if next != sessions { sessions = next }
+            }
             sessionsLoaded = true
             if !connected { connected = true }
             sessionFreshness.recovered()

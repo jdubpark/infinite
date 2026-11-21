@@ -1,5 +1,5 @@
 import { createContext, useContext } from "react";
-import { createRemoteClient, RemoteError } from "@infinite/remote";
+import { createRemoteClient, RemoteError, sessionListReader } from "@infinite/remote";
 import type { Attention } from "@infinite/attention";
 export type Connection = { id: string; label: string; url: string; token: string; relay?: { machineId: string } };
 export type ControlLease = { id: string; label: string; expiresAt: number };
@@ -169,6 +169,13 @@ export const names: Record<string, string> = {
 export type Api = typeof api;
 export const ApiContext = createContext<Api>(api);
 export const useApi = () => useContext(ApiContext);
+const sessionReaders = new WeakMap<Api, ReturnType<typeof sessionListReader<Session>>>();
+/** The host's session list. Each read names the version of the rows this API read last, so an unchanged list answers with its version alone. */
+export function readSessions(api: Api): Promise<Session[]> {
+  let read = sessionReaders.get(api);
+  if (!read) sessionReaders.set(api, read = sessionListReader<Session>());
+  return read(path => api(path));
+}
 export function connectApi(connection: Connection): { api: Api; close: () => void } {
   const client = createRemoteClient(connection);
   return { close: () => client.close(), api: async <T>(path: string, body?: unknown, method?: string, controlId?: string): Promise<T> => {

@@ -8,6 +8,7 @@ import { ensureDefaultTeamRoot, ensureHostDirectory, publishTeamHead, removeMemb
 import { activeMember, digest, filesystemEntryExists, type TeamKernel, teamRunDirectory } from "./team-kernel.js";
 import { intakeEndedByRemoval } from "./review-feedback.js";
 import type { RetentionState, Stored, TeamServiceOptions } from "./teams.js";
+import { MemberTraces, removeMemberTraces, type TraceSettlementHost } from "./member-traces.js";
 
 /**
  * What the retention class uses of TeamService: part of the kernel, and the record, event and publication members it
@@ -37,6 +38,8 @@ export type RetentionHost = Pick<TeamKernel, "records" | "commands" | "manager" 
 
 /** How long a failed workspace removal waits before the scheduler tries it again. */
 const REMOVAL_RETRY_MS = 5 * 60_000;
+/** A record removal that failed in member trace cleanup, the one record failure retention waits out before retrying. */
+class TraceRemovalError extends TeamError {}
 /** A run's record waits at most this long for its events to reach the evidence store before retention removes it. */
 const EVIDENCE_WAIT_MS = 24 * 3600_000;
 function pathStrictlyInside(root: string, target: string) {
@@ -57,7 +60,27 @@ export class TeamRetention {
   readonly memberWorkSaveControllers = new Map<string, AbortController>();
   private readonly removalWaiters: Array<() => void> = [];
   private activeRemovals = 0;
+  private memberTraces?: MemberTraces;
+  /** Member traces, made when the service starts (`findMemberTraces`), which looks for their root once. */
+  private get traces() { return this.memberTraces ??= new MemberTraces(this.host.config.stateDir); }
+  findMemberTraces() { void this.traces; }
   constructor(private readonly host: RetentionHost) {}
+  private traceHost(): TraceSettlementHost {
+    const { manager } = this.host;
+    return {
+      stateDir: this.host.config.stateDir,
+      now: () => this.host.options?.now?.() ?? Date.now(),
+      // A session has exited when it says so. Missing metadata counts as an exit only when the worker cannot be reached
+      // either: a session that still answers as live is live, whatever its metadata.
+      exited: async sessionId => {
+        const status = (await manager.state(sessionId)).status;
+        if (status === "exited") return true;
+        if (status !== "unavailable") return false;
+        try { manager.meta(sessionId); return false; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return true; throw error; }
+      },
+    };
+  }
   private teamRoot(stored: Stored) {
     const root = stored.root ?? this.host.config.teams?.workspaceDir;
     if (!root) throw new TeamError(409, "invalid-workspace", "The team workspace is outside its configured root.");
@@ -263,6 +286,13 @@ export class TeamRetention {
     }
     try { if (!stored.run.replay) this.host.persistRetiredRunId(stored.run.id); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's deletion tombstone could not be saved; its record was kept."); }
+    // A host that never kept traces skips this. Otherwise a settlement pass still running over the run's traces ends
+    // first, and nothing of the run is kept after it.
+    if (this.traces.inUse(this.host.config)) {
+      await this.traces.forget(stored.run);
+      try { await removeMemberTraces(this.host.config.stateDir, stored.run.id); }
+      catch { throw new TraceRemovalError(500, "team-record-removal-failed", "The settled team's member traces could not be removed; its record was kept."); }
+    }
     try { await rmAsync(join(this.host.directory, `${stored.run.id}.sealed`), { force: true }); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's record could not be removed."); }
     this.host.commands.get(stored.run.id)?.abort();
@@ -350,7 +380,24 @@ export class TeamRetention {
     const retryAt = retention.retryAt?.[scope];
     return retryAt !== undefined && now < Date.parse(retryAt);
   }
+  /**
+   * Removes a cancelled run's record under the retention policy. Only a failed member trace cleanup waits out a backoff
+   * before the next attempt; every other failure, the evidence wait included, is tried again on the next pass.
+   */
+  private async removeRetainedRecord(stored: Stored) {
+    const retention = this.host.retentionState(stored), now = this.host.options?.now?.() ?? Date.now();
+    if (this.removalBackoffActive(retention, "traces", now)) return;
+    try { await this.deleteRecord(stored, true); }
+    catch (error) {
+      if (error instanceof TraceRemovalError) (retention.retryAt ??= {}).traces = new Date(now + REMOVAL_RETRY_MS).toISOString();
+      await this.reportRemovalFailure(stored, "record", error);
+    }
+  }
   async retire(stored: Stored) {
+    // Trace caps apply to replay runs too, and to traces recorded before the setting was turned off; a host that never
+    // kept traces skips this. The measurement runs in the background, where idle() waits for it.
+    const traces = this.traces.inUse(this.host.config) ? this.traces.settle(stored.run, this.traceHost()) : undefined;
+    if (traces) { this.removalTasks.add(traces); void traces.finally(() => this.removalTasks.delete(traces)); }
     if (stored.run.replay) return;
     try {
       const { run } = stored, retention = this.host.retentionState(stored), policy = this.host.config.teams?.retention ?? DEFAULT_TEAM_RETENTION;
@@ -373,10 +420,8 @@ export class TeamRetention {
           if (!run.events.some(event => event.text.startsWith("Workspaces removed under the retention policy after this ")))
             this.host.event(stored, `Workspaces removed under the retention policy after this ${run.status} run settled. See docs/teams.md.`);
           try { this.host.save(stored); } catch (error) { console.warn("Could not persist a removed team workspace marker.", error); }
-          if (run.status === "cancelled" && !run.goal && !run.missionId && !this.ownerPreventsRemoval(run) && !this.hasPendingPreparationFrom(stored) && await this.membersSettled(stored)) {
-            try { await this.deleteRecord(stored, true); }
-            catch (error) { await this.reportRemovalFailure(stored, "record", error); }
-          }
+          if (run.status === "cancelled" && !run.goal && !run.missionId && !this.ownerPreventsRemoval(run) && !this.hasPendingPreparationFrom(stored) && await this.membersSettled(stored))
+            await this.removeRetainedRecord(stored);
         },
         async error => {
           if (this.host.records.get(run.id) !== stored) return;
@@ -447,10 +492,8 @@ export class TeamRetention {
         }
         if (completionChanged) try { this.host.save(stored); } catch (error) { console.warn("Could not persist a completed team workspace removal.", error); }
         if (run.status === "blocked") await this.host.closeStaleBlockedRun(stored, policy.blockedHours);
-        if (statusAtStart === "cancelled" && run.status === "cancelled" && !run.goal && !run.missionId && retentionMs !== undefined && elapsed >= retentionMs && await this.membersSettled(stored)) {
-          try { await this.deleteRecord(stored, true); }
-          catch (error) { await this.reportRemovalFailure(stored, "record", error); }
-        }
+        if (statusAtStart === "cancelled" && run.status === "cancelled" && !run.goal && !run.missionId && retentionMs !== undefined && elapsed >= retentionMs && await this.membersSettled(stored))
+          await this.removeRetainedRecord(stored);
         return;
       }
       const retentionDue = retentionMs !== undefined && elapsed >= retentionMs;

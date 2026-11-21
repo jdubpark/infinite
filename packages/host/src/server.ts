@@ -53,6 +53,7 @@ import { ENTRY_KINDS } from "./evidence/entry-types.js";
 import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { objectiveRoutes } from "./objective-routes.js";
+import { sendSessionList } from "./session-list.js";
 import { parseGoalCreateBody } from "./objective-input.js";
 import { routingRoutes } from "./routing-routes.js";
 import { spawnTeamBundle } from "./team-workspace.js";
@@ -1569,9 +1570,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     res.clearCookie("infinite", { path: "/api" });
     res.json({ ok: true });
   });
-  app.get("/api/sessions", async (_req, res) =>
-    res.json({ sessions: await listSessions() }),
-  );
+  app.get("/api/sessions", (req, res) => sendSessionList(req, res, listSessions));
   app.get("/api/events", (req, res) => {
     const topicValues = z.array(z.union([z.literal("sessions"), z.literal("teams"), z.string().regex(/^session\/[0-9a-f-]{36}$/i)])).min(1).max(16)
       .parse(z.string().min(1).max(4096).parse(req.query.topics).split(","));

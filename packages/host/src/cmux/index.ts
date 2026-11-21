@@ -277,11 +277,16 @@ export class CmuxSessions {
       record.nativeId = row.session_id;
       record.transcript = string(row.file) ?? record.transcript;
     }
+    // Every record already holds the hook and Vault changes merged above, and the next refresh's snapshot would hide
+    // them, so one record's failed journal append or save must not cost the others their saves. The first failure is
+    // thrown once every record is observed.
+    let failure: { error: unknown } | undefined;
     for (const record of this.records.values()) {
       const surface = record.surfaceId ? this.tree.get(record.surfaceId) : undefined;
       const live = surface?.workspaceId === record.workspaceId && surface?.type === "terminal" && (!record.pid || processAlive(record.pid));
       const pending = record.launchedAt !== undefined && Date.now() - record.launchedAt < 30_000;
       const status = live ? "running" : pending ? "starting" : record.creation?.state === "uncertain" ? "unavailable" : "exited";
+      let unreadable = false;
       if (record.session.id === screenId && live) {
         try {
           // A lines argument enables scrollback on some cmux versions. Read the
@@ -310,18 +315,21 @@ export class CmuxSessions {
             record.screen = screen.text.slice(-512 * 1024);
             this.append(record, "output", { text: `\u001b[2J\u001b[H${record.screen.replace(/\r?\n/g, "\r\n")}`, snapshot: true });
           }
-        } catch { this.observe(record, "unavailable"); continue; }
+        } catch { unreadable = true; }
       }
-      const nativeFeed = matchingFeed(this.feed, { provider: record.session.provider as CmuxProvider, nativeId: record.nativeId, surfaceId: record.surfaceId });
-      const prompt = status === "running" ? pendingPrompt(record.session.provider as CmuxProvider, record.screen, nativeFeed) : undefined;
-      // Failure to refresh native Feed must never erase a known unanswered approval.
-      if (feed.status === "rejected" && record.prompt?.feed) {
-        this.observe(record, "unavailable");
-        continue;
-      }
-      this.observe(record, status, prompt);
-      if (JSON.stringify(record) !== previous.get(record.session.id)) this.save(record);
+      try {
+        // Failure to refresh native Feed must never erase a known unanswered approval.
+        if (unreadable || feed.status === "rejected" && record.prompt?.feed) this.observe(record, "unavailable");
+        else {
+          const nativeFeed = matchingFeed(this.feed, { provider: record.session.provider as CmuxProvider, nativeId: record.nativeId, surfaceId: record.surfaceId });
+          this.observe(record, status, status === "running" ? pendingPrompt(record.session.provider as CmuxProvider, record.screen, nativeFeed) : undefined);
+        }
+        // Compared with the record before this refresh, on every path: observe() saves only what it changes itself, and
+        // in a lasting outage it changes nothing, so a hook or Vault change merged above is saved here.
+        if (JSON.stringify(record) !== previous.get(record.session.id)) this.save(record);
+      } catch (error) { failure ??= { error }; }
     }
+    if (failure) throw failure.error;
   }
 
   private observe(record: Stored, status: Session["status"], pending?: PendingPrompt) {
@@ -335,7 +343,8 @@ export class CmuxSessions {
       // An outage is not evidence that an authenticated Feed decision closed.
       // Keep it latched in durable state until a successful observation resolves it.
       if (status !== "unavailable" || !record.prompt?.feed) record.prompt = undefined;
-      record.attention = applyLifecycle(record.attention, status as "exited" | "unavailable" | "recording-error", at);
+      // Entering the state records its time once; a later observation of the same state changes nothing, so a listing reads the same.
+      if (record.attention.state !== status) record.attention = applyLifecycle(record.attention, status as "exited" | "unavailable" | "recording-error", at);
     } else {
       if (pending?.fingerprint !== record.prompt?.fingerprint) {
         if (record.prompt) this.append(record, "signal", { kind: "prompt-closed", promptId: record.prompt.id, reason: "vanished", source: "host", provider: record.session.provider });
@@ -364,7 +373,8 @@ export class CmuxSessions {
     const status = record.recordingError ? "recording-error" : record.session.status;
     return {
       status, pid: record.pid, seq: this.journals.get(record.session.id)?.seq ?? 0, screen: record.screen,
-      attention: record.recordingError ? applyLifecycle(record.attention, "recording-error", now()) : record.attention,
+      // The record holds no time for the error, so the last recorded activity stands for it, never the time of the read.
+      attention: record.recordingError ? applyLifecycle(record.attention, "recording-error", record.attention.lastActivityAt) : record.attention,
       capabilities: { terminalSnapshot: 1, inputControl: 1 }, control: this.currentControl(record),
       runtime: record.session.runtime,
       ...(record.nativeId ? { nativeSession: { id: record.nativeId, source: "hook" as const } } : {}),
@@ -385,7 +395,7 @@ export class CmuxSessions {
       // Keep managed workers visible when cmux is overloaded, without presenting
       // a cached cmux observation as a connected runtime or valid input lease.
       return rows().map(row => ({ ...row, status: "unavailable" as const, control: null,
-        attention: applyLifecycle(row.attention, "unavailable", now()) }));
+        attention: applyLifecycle(row.attention, "unavailable", row.attention.lastActivityAt) }));
     });
   }
 

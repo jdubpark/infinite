@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { ActivityIndicator, Alert, Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
-import { api, connectionKey, type Board as BoardData, type BoardItem, type Connection, type Me, type SessionRow } from "../../api/client";
+import { api, connectionKey, listSessions, type Board as BoardData, type BoardItem, type Connection, type Me } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { useLive } from "../../api/useLive";
 import { Avatar } from "../../components/Avatar";
@@ -53,7 +53,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   });
   const rating = useTaskRating(connection, id, poll.refresh);
   const { data: me } = usePoll(() => api<Me>(connection, "/me"), 10000, [connection]);
-  const sessionsPoll = usePoll(() => api<{ sessions: SessionRow[] }>(connection, "/sessions").then(value => value.sessions), 4000, [connection]);
+  const sessionsPoll = usePoll(() => listSessions(connection), 4000, [connection]);
   const sessions = sessionsPoll.data;
   // Board data only adds attempt context; a failed read leaves the screen as it was.
   const boardPoll = usePoll(() => api<BoardData>(connection, "/board").then(value => ({ items: value.items, at: Date.now() })).catch(() => ({ items: [] as BoardItem[], at: Date.now() })), 4000, [connection]);

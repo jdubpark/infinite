@@ -21,7 +21,7 @@ import {
 } from "@infinite/attention";
 import { readEvents, unseal, writeSealed } from "./vault.js";
 import { socketPath, workerCall } from "./ipc.js";
-import { SealedFileCache, listedSession, type ListedSession } from "./session-listing.js";
+import { SealedFileCache, listedSavedState, listedSession, savedState, unavailableState, type ListedSession, type SavedStatus } from "./session-listing.js";
 import { assertRunnerDeployment } from "./deployment.js";
 import { DEFAULT_HOOKS } from "./config.js";
 import { HostLoadGate, LaunchHeldError, readHostLoad, type HostLoadProbe } from "./host-load.js";
@@ -39,6 +39,7 @@ import { SESSION_PERMISSION_ACTOR_LABEL, isRequesterNotice, sessionPermissionReq
 import { deferredCallOpen, type HeadlessPermissionChannel } from "./permission-headless.js";
 import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
 import { TeamError } from "./team-workspace.js";
+import { prepareMemberTrace } from "./member-traces.js";
 import { projectGithubRepository, sessionGithubGrant, sessionGithubScopeFor, type GithubGrantScope, type SessionGithubOrigin } from "./github-grants.js";
 import {
   learningPurpose, SESSION_PURPOSES,
@@ -180,22 +181,6 @@ export function withDefaultAttention(
     attention: applyLifecycle(initialAttention(now, false), status, now),
   };
 }
-const unavailable = (now = new Date().toISOString()): WorkerState => ({
-  status: "unavailable",
-  seq: 0,
-  screen: "",
-  attention: applyLifecycle(initialAttention(now, false), "unavailable", now),
-});
-/** The state a saved status gives when no worker answers: `exited` stays, anything else is `unavailable`. */
-function savedState(saved: WorkerState, now = new Date().toISOString()): WorkerState {
-  const status = saved.status === "exited" ? "exited" : "unavailable";
-  return {
-    ...saved,
-    status,
-    screen: "",
-    attention: applyLifecycle(saved.attention ?? initialAttention(now, false), status, now),
-  };
-}
 export class Manager {
   private serial: Promise<unknown> = Promise.resolve();
   /** Holds sessions the host starts for itself while the host is short of memory or overloaded. */
@@ -203,7 +188,7 @@ export class Manager {
   private readonly handoffProjects = new Map<string, string>();
   private fuse?: FuseGate;
   private readonly listedMeta = new SealedFileCache<ListedSession>((id, raw) => listedSession(unseal<StoredSession>(this.key, `${id}:meta`, raw).session));
-  private readonly savedStatus = new SealedFileCache<WorkerState>((id, raw) => unseal<WorkerState>(this.key, `${id}:status`, raw));
+  private readonly savedStatus = new SealedFileCache<SavedStatus>((id, raw, mtimeMs) => ({ state: unseal<WorkerState>(this.key, `${id}:status`, raw), savedAt: new Date(mtimeMs).toISOString() }));
   /** The launch gate: the owner's halt, then the launch-rate fuse. Without one, every session starts as before and nothing is counted. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
   private headlessChannel?: Pick<HeadlessPermissionChannel, "admit">;
@@ -352,6 +337,9 @@ export class Manager {
         await workerCall(this.config.runDir, id, { op: "state", screen }),
       );
     } catch {
+      // Dated now, unlike a listing row: a mission's stall check reads `lastActivityAt` from here, and a worker does not
+      // save its status on every activity, so a saved time would take a worker that missed one answer for quiet.
+      const now = new Date().toISOString();
       const file = join(this.config.stateDir, "sessions", id, "status.sealed");
       if (existsSync(file)) {
         const saved = unseal<WorkerState>(
@@ -359,16 +347,16 @@ export class Manager {
           `${id}:status`,
           readFileSync(file, "utf8"),
         );
-        return savedState(saved);
+        return savedState(saved, now);
       }
-      return unavailable();
+      return unavailableState(now);
     }
   }
   /**
    * `state(id)` for a listing. A worker is asked only when its socket file exists, since a
    * connect to a missing socket fails the same way; a failed ask falls through to the saved status.
    */
-  private async listedState(id: string): Promise<WorkerState> {
+  private async listedState(id: string, createdAt: string): Promise<WorkerState> {
     if (existsSync(socketPath(this.config.runDir, id))) {
       try {
         return withDefaultAttention(await workerCall(this.config.runDir, id, { op: "state", screen: false }));
@@ -377,8 +365,8 @@ export class Manager {
       }
     }
     const saved = this.savedStatus.read(id, join(this.config.stateDir, "sessions", id, "status.sealed"), Date.now());
-    if (saved === undefined) return unavailable();
-    return savedState(saved);
+    // A row without a saved status is unavailable since the session's creation, the one time its record holds.
+    return saved === undefined ? unavailableState(createdAt) : listedSavedState(saved);
   }
   /**
    * Every session whose metadata can be read. One session's unreadable status (or a worker
@@ -398,8 +386,8 @@ export class Manager {
         if (existsSync(this.deletedReceiptPath(id))) throw new Error("Session not found");
         const summary = this.listedMeta.read(id, join(this.config.stateDir, "sessions", id, "meta.sealed"), now);
         if (summary === undefined) throw new Error("Session not found");
-        const { screen: _screen, ...state } = await this.listedState(id).catch(
-          () => unavailable(),
+        const { screen: _screen, ...state } = await this.listedState(id, summary.createdAt).catch(
+          () => unavailableState(summary.createdAt),
         );
         return {
           ...summary,
@@ -1008,7 +996,7 @@ export class Manager {
       try { candidate = this.meta(id).session; }
       catch { throw new ContentError("A recording cannot be authenticated. Recover it before starting another continuation."); }
       if (candidate.provider !== session.provider) return undefined;
-      const current = await this.state(id).catch(() => unavailable());
+      const current = await this.state(id).catch(() => unavailableState(new Date().toISOString()));
       if (candidate.resumedFrom !== sessionId && candidate.resumeNativeSession?.id !== native.id && current.nativeSession?.id !== native.id) return undefined;
       if (current.status === "exited") return undefined;
       if (candidate.projectId !== session.projectId || (candidate.projectRoot ?? candidate.cwd) !== realpathSync(project.path))
@@ -1189,7 +1177,7 @@ export class Manager {
     child.stdin.on("error", () => {});
     // Inert unless autonomy.boundary.github is configured; the grant travels only in the private bootstrap pipe.
     const githubScope = sessionGithubScopeFor({ team: Boolean(request.team), origin: github, repository: projectGithubRepository(project) });
-    const githubGrant = sessionGithubGrant(this.config, githubScope, { sessionId: id, projectId: request.projectId });
+    const githubGrant = sessionGithubGrant(this.config, githubScope, { sessionId: id, projectId: request.projectId }), codexTraceRoot = prepareMemberTrace(this.config, id, request.provider, request.team, launchProfile);
     child.stdin.end(
       JSON.stringify({
         session,
@@ -1200,7 +1188,7 @@ export class Manager {
         prompt,
         ...(request.workspace ? { executorTokenHash: createHash("sha256").update(request.workspace.token).digest("hex") } : {}),
         ...(headless?.bootstrap ? { permissionChannel: headless.bootstrap } : {}),
-        ...(githubGrant ? { github: githubGrant } : {}),
+        ...(githubGrant ? { github: githubGrant } : {}), ...(codexTraceRoot ? { codexTraceRoot } : {}),
         attention: {
           // Native CLI launches keep their exact argv: no hook settings are injected.
           hooks: request.nativeArgs !== undefined

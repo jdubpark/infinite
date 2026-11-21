@@ -157,6 +157,8 @@ export interface Config {
     outcomes?: { holdDays?: number; retentionDays?: number };
     /** Blackboard switches; they pin into each new run and stay in the routine approval digest. */
     blackboard?: { tools?: boolean };
+    /** Codex members' native traces, kept on the host; off unless set, and on only with both caps. See docs/teams.md "Member traces". */
+    memberTraces?: import("./member-traces.js").MemberTraceSettings;
   };
   machine?: { id: string; label: string };
   /** The permission agent's light and strong tiers, its miss-rate threshold and the least replay set size. */
@@ -348,6 +350,8 @@ export interface Bootstrap {
   permissionChannel?: { socket: string };
   /** This session's GitHub grant and proxy origin, set only when `autonomy.boundary.github` is configured. */
   github?: { proxy: string; grant: string };
+  /** The directory Codex's native trace recorder writes to, set only for a Codex team member with `teams.memberTraces` on. */
+  codexTraceRoot?: string;
   attention: {
     hooks: { claude: boolean; codex: boolean };
     idleAfterMs: number;

@@ -482,6 +482,113 @@ When storage falls below `teams.storageFloor`, new runs are refused before their
 workspaces are created. See the configured reason in the API response and free
 space before retrying.
 
+## Member traces
+
+Codex can write a native trace of a member's run: every model request with its
+token usage, each program's source, a start and an end event for each nested
+tool call, and each nested call's result whole. The Codex session record in the
+provider's home already keeps every nested call, but cuts each stored result at
+64 KiB. Codex writes the trace when its environment carries
+`CODEX_ROLLOUT_TRACE_ROOT`. Codex does not document this variable; its name was
+found in the Codex binary.
+
+The host keeps these traces only when `teams.memberTraces` is on. It is off by
+default. Turning it on needs both caps, in bytes; the configuration refuses
+`enabled: true` without them, and there are no default caps:
+
+```json
+{ "teams": { "memberTraces": { "enabled": true, "memberBytes": 52428800, "runBytes": 524288000 } } }
+```
+
+- **Where.** Before a Codex team member starts, the host creates
+  `teams/traces/RUN_ID/MEMBER_ID` under its state directory, each level mode
+  `0700`, and points the member's Codex process there. Claude Code and OpenCode
+  members get nothing. The directory is outside every workspace and scratch
+  directory, and no API route, run or member field, team view, context file or
+  prompt names it.
+- **Caps.** The caps in force when a member starts are written into its
+  manifest and apply to that trace. Once the member's session has exited,
+  whatever the member's status (a project manager waiting on the owner's answer
+  has exited too), a scheduler pass measures the trace. A session that still
+  answers as live is live even when its metadata is missing; it counts as
+  exited only when it says so, or when it neither answers nor exists. A trace
+  over `memberBytes`, or one that would take the run's kept traces over
+  `runBytes`, is removed. The size is the sum of the `lstat` sizes of the
+  entries below the member's directory that are not directories, links
+  included. Directories are walked, not counted. The manifest itself is neither
+  counted nor removed. A leftover temporary manifest file is removed without
+  being counted. A running session is not measured, so its trace can pass the
+  caps until it exits. Codex writes made after a trace was settled are not
+  measured again; they are removed with the run. A measurement or removal that
+  fails, including a manifest of the member or of a sibling that cannot be
+  read, is tried again on a later pass, after a wait that doubles from 30
+  seconds up to 30 minutes. No run-cap decision is made while a sibling's
+  usage is unknown. The host log names the run and member, not the path.
+- **Cooperative caps.** In the one-account case a member can edit its own
+  manifest: its caps, bytes and state. That can change its own settlement and a
+  sibling's run-cap decision. It gives the member no access beyond what it
+  already has over its own trace, but the caps are cooperative, not
+  tamper-proof. A missing manifest, or one that is not a valid regular file, is
+  left alone and its trace is not measured.
+- **Manifest.** Each member's directory keeps `infinite-trace.json` (mode
+  `0600`): the state (`recording`, `kept`, `removing`, `removed` or
+  `not-recorded`), the caps recorded at the start, the bytes measured, the time,
+  the reason (`member-cap`, `run-cap` or `separate-account`), and
+  `sessionRecord: "kept"`, because the Codex session record is never touched.
+  It holds no trace content. A trace over a cap is marked `removing` first and
+  `removed` only after its files are gone.
+- **Turning it off.** Turning the setting off stops new traces only. Traces
+  recorded before keep their recorded caps, are still measured when their
+  sessions exit, and are removed with their runs.
+- **Deletion.** Removing a run (the owner's delete, cancelled-run retention, or
+  forgetting a replay) removes `teams/traces/RUN_ID`. Workspace retention leaves
+  traces alone: they last as long as the run record. When cancelled-run
+  retention fails to remove the traces, it waits out its retention backoff
+  before trying the record again; every other record removal failure, the
+  evidence wait included, is retried on the next pass as before. Deletion sets
+  no overall deadline on its filesystem work, so a stalled filesystem holds the
+  owner's delete until it answers.
+- **Hosts that never kept traces.** The team service looks for `teams/traces`
+  once when it starts. While the setting is not on and no root was found or
+  created, the scheduler and run deletion do no trace work and make no
+  filesystem call under it.
+- **Links.** Before it reads or changes a trace directory, the host checks each
+  level from `teams/traces` down with `lstat` and requires the directory to
+  resolve to its place under the traces root. A run's or member's trace
+  directory that is a link, or not a directory, is unlinked as itself and
+  logged by id; its target is preserved, and the run's removal goes on. A link
+  inside a trace counts as one entry and is unlinked as itself; a linked
+  directory's contents are not walked or removed. A `teams/traces` root that is
+  a link is left untouched: no trace is prepared under it, and run deletion logs
+  that it did not look there, so traces relocated behind such a link are never
+  erased by run deletion. The checks leave one residual. Node has no `openat`, so the
+  host names each path again for every later operation. Another process
+  running as the host's own account could swap a checked directory for a link
+  before such an operation resolves it as an ancestor. That applies to reads,
+  walks, creates, renames, `chmod` and removal alike. Such a process can
+  already change every file of that account, so this gives it nothing new.
+- **Known limit.** Deciding the run cap reads every sibling's manifest in the
+  run, so settling one member costs a scan of the run's member directories.
+- **Routines.** The setting is outside the routine approval digest: it changes
+  what the host keeps, not a routine's work.
+
+Who can read a trace depends on the launch model. Traces are plain JSON, not
+sealed like the host's records.
+
+- **One account** (the default local profiles, where the host and its members
+  run as the same account). Only that account and root can read a trace. That
+  account is also every member's account, so a member can read traces as it can
+  read the rest of the account's files. The variable is in the member's Codex
+  process environment, and Codex may pass it to the commands it runs.
+- **Separate agent account** (sudo launch profiles, as in the Ubuntu template).
+  The host's state directory is private to the host account, so the agent
+  account cannot write there. The host does not set the variable for such a
+  launch; it writes the manifest with state `not-recorded` and reason
+  `separate-account`. Keeping traces here needs an owner decision: Codex would
+  write them as the shared agent account, so every session of that account, in
+  every project, could read and change them, and sudo would need the variable in
+  its `env_keep` list. Nothing is built for that case.
+
 ## Eval capture
 
 Eval capture keeps each implementer task of a finished team run as an eval task. A later replay can run other configurations on the same tasks. This slice only captures and sorts them. Capture spends no model tokens, starts no session, and reads the corpus for no decision.

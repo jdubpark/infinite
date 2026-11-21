@@ -10,6 +10,7 @@ import { CmuxSessions } from "../packages/host/src/cmux/index.js";
 import { createApp } from "../packages/host/src/server.js";
 import { hashToken } from "../packages/host/src/config.js";
 import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
+import { unseal } from "../packages/host/src/vault.js";
 import type { Config, ControlLease, Receipt } from "../packages/host/src/types.js";
 import { apiClient, claimControl, startHost, waitFor } from "./helpers.js";
 
@@ -218,6 +219,10 @@ test("cmux refuses unknown foreground, stale surfaces, and dialog bypasses", { t
   assert.equal(f.mutations().length, 0);
   f.setState({ offline: true });
   assert.equal((await f.sessions.get(f.id)).status, "unavailable");
+  // An outage that lasts reads the same on every poll: the row keeps the time it became unavailable.
+  const during = JSON.stringify(await f.sessions.list());
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(JSON.stringify(await f.sessions.list()), during);
   f.config.cmux!.command = join(f.root, "missing-cmux");
   await f.restart();
   assert.equal((await f.sessions.get(f.id)).status, "unavailable");
@@ -279,6 +284,58 @@ test("an unanswered Feed approval remains guarded through repeated Feed outages 
   assert.equal((await f.sessions.get(f.id)).status, "running", "only a successful fresh Feed observation can resolve the latch");
   const freshControl = await f.claim();
   assert.equal((await f.sessions.call<Receipt>(f.id, { op: "input", requestId: randomUUID(), text: "New direction", submit: true, ...freshControl })).state, "delivered");
+});
+
+test("a lasting cmux outage saves what the host learns meanwhile and keeps the times it recorded", { timeout: 20000 }, async (t) => {
+  const f = await fixture(t);
+  const saved = () => unseal<{ session: { title: string }; attention: { lastActivityAt: string } }>(f.key, `cmux:${f.id}:meta`, readFileSync(join(f.config.stateDir, "cmux", f.id, "meta.sealed"), "utf8"));
+  const outages: [string, Record<string, unknown>, Record<string, unknown>][] = [
+    ["an unreadable screen", { screen: 7 }, { screen: "> " }],
+    ["a Feed outage over an approval", { feedOffline: true }, { feedOffline: false, feed: [] }],
+  ];
+  for (const [outage, start, end] of outages) {
+    if (start.feedOffline) {
+      f.setState({ feed: [{ request_id: "approval", kind: "permission", source: "claude", session_id: f.nativeId, status: "pending", title: "Run tool" }] });
+      assert.equal((await f.sessions.get(f.id)).attention.state, "needs-you");
+    }
+    f.setState(start);
+    const first = await f.sessions.get(f.id);
+    assert.equal(first.status, "unavailable", outage);
+    // The terminal is renamed while the outage lasts: the next observation changes the record but not its state.
+    f.setState({ workspaces: [{ id: "workspace", panes: [{ surfaces: [{ id: "surface", type: "terminal", title: `✳ Renamed during ${outage}` }] }] }] });
+    const second = await f.sessions.get(f.id);
+    assert.equal(second.title, `Renamed during ${outage}`);
+    assert.equal(saved().session.title, `Renamed during ${outage}`, `${outage}: the rename is saved, so a restart keeps it`);
+    assert.deepEqual(second.attention, first.attention, `${outage}: the row keeps the time the outage began`);
+    f.setState(end);
+    assert.equal((await f.sessions.get(f.id)).status, "running", outage);
+  }
+  // A journal that cannot be opened is a recording error, dated by the last recorded activity, never the read.
+  const events = join(f.config.stateDir, "cmux", f.id, "events");
+  appendFileSync(join(events, readdirSync(events).filter(name => name.endsWith(".journal")).sort().at(-1)!), "incomplete");
+  await f.restart();
+  const failed = (await f.sessions.list()).find(row => row.id === f.id)!;
+  assert.equal(failed.status, "recording-error");
+  assert.equal(failed.attention.lastActivityAt, saved().attention.lastActivityAt);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(JSON.stringify((await f.sessions.list()).find(row => row.id === f.id)), JSON.stringify(failed), "a recording error reads the same on every poll");
+});
+
+test("one cmux record's failed journal write does not cost another record its save", { timeout: 20000 }, async (t) => {
+  const f = await fixture(t);
+  const history = randomUUID(), row = (file: string) => ({ agent: "claude", session_id: history, cwd: f.cwd, title: "Earlier conversation", file: join(f.root, file) });
+  f.setState({ vault: [row("first.jsonl")] });
+  const other = (await f.sessions.list()).find(listed => listed.nativeSession?.id === history)!;
+  assert.equal(other.status, "exited");
+  // In one refresh the live terminal closes, so its record must journal the change, and the other record's
+  // transcript moves. The live record's journal cannot be written.
+  const events = join(f.config.stateDir, "cmux", f.id, "events");
+  for (const name of readdirSync(events)) chmodSync(join(events, name), 0o400);
+  f.setState({ workspaces: [], vault: [row("moved.jsonl")] });
+  await assert.rejects(f.sessions.list(), { code: "EACCES" }, "the failure is still reported");
+  const saved = unseal<{ transcript?: string }>(f.key, `cmux:${other.id}:meta`, readFileSync(join(f.config.stateDir, "cmux", other.id, "meta.sealed"), "utf8"));
+  assert.equal(saved.transcript, join(f.root, "moved.jsonl"), "the other record's change is saved in the same refresh");
+  assert.equal((await f.sessions.list()).find(listed => listed.id === f.id)!.status, "recording-error");
 });
 
 test("cmux resume respects capacity before recording intent while existing receipts stay retryable", { timeout: 20000 }, async (t) => {
@@ -431,6 +488,8 @@ test("concurrent cmux observations share work and do not delay control", { timeo
     const overloaded = await f.sessions.list();
     assert.equal(overloaded.find(row => row.id === f.id)!.status, "unavailable", "an overloaded inbox never presents cached cmux state as fresh");
     assert.equal(overloaded.find(row => row.id === f.id)!.control, null);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(JSON.stringify(await f.sessions.list()), JSON.stringify(overloaded), "an overloaded inbox dates its rows by recorded activity, so a repeated poll reads the same");
   } finally { rmSync(gate); await Promise.all([blocked, ...pending]); }
 
   const last = calls().length;

@@ -222,7 +222,7 @@ const gatesOnly = { teams: () => ({ providerLimits: () => [] }) as never, sessio
 function host(s: Setup, options: { identity?: EvalIdentity; teams?: EvalHostOptions["teams"]; sessions?: EvalHostOptions["sessions"];
   now?: () => string; inventory?: () => Promise<RuntimeProcess[]> } = {}): EvalHost {
   const status: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: s.r.head };
-  return new EvalHost({
+  const built = new EvalHost({
     config: s.config,
     store: s.r.store,
     source: { mirrorPath: () => s.r.mirror, status: () => status },
@@ -235,6 +235,22 @@ function host(s: Setup, options: { identity?: EvalIdentity; teams?: EvalHostOpti
     ...(options.identity ? { identity: options.identity } : { identity: s.identity }),
     ...(options.teams && options.sessions ? { teams: options.teams, sessions: options.sessions } : {}),
   } as EvalHostOptions);
+  stores.set(built, s.r.store);
+  return built;
+}
+
+/** Each host's store, for a helper that holds only the host. */
+const stores = new WeakMap<EvalHost, EvidenceStore>();
+
+/**
+ * Moves every group to the dev set. A group draws its set when it is created, and a baseline job reads the dev set only, so
+ * without this the one mined task is holdout in about three runs of ten and the job runs no trial. These tests are about
+ * trials; the sets have their own tests.
+ */
+function devOnly(h: EvalHost): void {
+  stores.get(h)?.write(tx => {
+    tx.run("UPDATE eval_groups SET holdout = 0, set_at = NULL");
+  });
 }
 
 /** Mines the fixture commits until the miner is caught up. */
@@ -263,6 +279,7 @@ async function validated(h: EvalHost): Promise<void> {
 
 /** The baseline job over the valid mined task, with the given trials per task. */
 function baseline(h: EvalHost, trialsPerTask: number, maxTrials: number, options: { maxWallMinutes?: number } = {}): string {
+  devOnly(h);
   const created = h.create(PROJECT, {
     kind: "baseline",
     configurations: [{ profile, guidance: "as-of-base", knowledge: "none" }],

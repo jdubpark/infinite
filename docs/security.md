@@ -739,6 +739,13 @@ Limits that remain:
   also raises some routine commands, for example a commit message that reads
   as a credential command. Those cost a strong turn and never an owner
   interrupt.
+  Code-running assignments, including append assignments, declaration builtins,
+  and wrapper environment options, also raise. Listed inert `NODE_OPTIONS`
+  runtime flags are exempt only when every option is on that list. Named
+  inert pager/editor values, disabled Git config files (`/dev/null`), and plain
+  relative module/library search paths or `GIT_DIR` values are exempt. These
+  exemptions never apply to appends: the concatenated value is unknown. Node
+  `data:` loader values and Perl `-M` values with a code suffix are inline code.
 - Paths are resolved through symbolic links when the request is read. A link
   that changes between the review and the command's own execution is not
   seen. A path that the host cannot read is raised. The evidence collector

@@ -289,6 +289,63 @@ function workerRig(replies: Array<ChannelReply | Error>) {
 }
 const owner: ChannelReply = { result: "owner", interruptClass: "production-or-staging", rule: "production-deploy", sessionRoot: "/workspace", decisionId: randomUUID(), deliveryKey: "d".repeat(64) };
 
+const claudeModeHooks = (name: string) => readFileSync(new URL(`./fixtures/claude-code-mode/${name}`, import.meta.url), "utf8")
+  .trim().split("\n").map(line => JSON.parse(line) as Record<string, unknown>);
+
+test("Code Mode deferred Write resumes the same captured call id", async () => {
+  const rows = claudeModeHooks("defer-hooks.jsonl");
+  const w = workerRig([{ result: "none" }, { ...owner, rule: "write-owner" }]);
+  const dispatch = async (body: Record<string, unknown>) => {
+    if (body.hook_event_name === "PreToolUse") return w.channel.check(body);
+    if (body.hook_event_name === "PermissionRequest") return w.channel.request(body);
+    return undefined;
+  };
+  const bash = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Bash")!;
+  const original = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Write")!;
+  const resumed = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Write" && row !== original)!;
+  const callId = original.tool_use_id;
+  assert.equal(typeof callId, "string");
+  assert.match(callId as string, /^toolu_cc_[0-9a-f]{32}$/);
+  assert.equal(resumed.tool_use_id, callId);
+  for (const row of rows) {
+    const before = w.channel.view();
+    const requestCount = w.requests.length;
+    const answer = await dispatch(row);
+    if (row === original) {
+      assert.deepEqual(answer, { decision: "defer", reason: "This call waits for the owner's answer. The session resumes with that answer." });
+      const deferred = w.records.find(record => record.event === "deferred");
+      assert.equal(deferred?.callId, callId);
+      assert.equal(deferred?.rule, "write-owner");
+      assert.equal(w.channel.exited(0), true);
+      w.channel.answer({ requestId: "fixture-owner-answer", promptId: w.prompts[0]!, option: 0 });
+    } else if (row === resumed) {
+      assert.deepEqual(answer, { decision: "allow" });
+      assert.equal(w.records.find(record => record.event === "delivered")?.callId, callId);
+    } else if ((row.hook_event_name === "PostToolUse" && row.tool_name === "REPL") || (row.hook_event_name === "UserPromptSubmit" && row.prompt === "Continue from where you left off.")) {
+      assert.equal(answer, undefined);
+      assert.deepEqual(w.channel.view(), before);
+      assert.equal(w.requests.length, requestCount);
+    } else if (row === bash) {
+      assert.deepEqual(answer, { decision: "none" });
+    }
+  }
+  assert.equal(w.channel.waiting(), false);
+});
+
+test("Code Mode PermissionRequest without an id inherits its nested call id", async () => {
+  const rows = claudeModeHooks("hooks.jsonl");
+  const w = workerRig([{ result: "none" }, { result: "none" }, { result: "deny", code: "unsafe", notice: "ignored" }]);
+  const check = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Bash")!;
+  await w.channel.check(check);
+  const write = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Write")!;
+  await w.channel.check(write);
+  const permission = rows.find(row => row.hook_event_name === "PermissionRequest")!;
+  assert.equal("tool_use_id" in permission, false);
+  await w.channel.request(permission);
+  const decide = w.requests.find(request => (request as { op?: string }).op === "decide") as { call: { toolUseId?: string } };
+  assert.equal(decide.call.toolUseId, write.tool_use_id);
+});
+
 test("while a call waits, every other call of the session is denied as pending", async () => {
   const w = workerRig([owner]);
   assert.equal((await w.pre("deploy production", "toolu_1")).decision, "defer");

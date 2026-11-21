@@ -139,6 +139,15 @@ test("a Claude step input is the sum of its three token fields", () => {
   assert.deepEqual({ steps: tail.snapshot().modelSteps, peak: tail.snapshot().peakInputTokens }, { steps: 1, peak: 160 });
 });
 
+test("Code Mode context gauge counts real model steps and only the program result", () => {
+  const tail = new ContextGaugeTail("claude");
+  const rows = readFileSync(new URL("./fixtures/claude-code-mode/transcript.jsonl", import.meta.url), "utf8").trim().split("\n");
+  for (const line of rows) tail.pushLine(line);
+  const gauge = tail.snapshot();
+  assert.deepEqual({ modelSteps: gauge.modelSteps, peakInputTokens: gauge.peakInputTokens }, { modelSteps: 2, peakInputTokens: 17531 });
+  assert.deepEqual(gauge.received, { other: { calls: 1, chars: 115, maxChars: 115 } });
+});
+
 test("tool classes: wait is program, and a name that ends in _agent or _agents is agent", () => {
   const tail = new ContextGaugeTail("codex");
   tail.push(call("w", "wait"));

@@ -78,6 +78,8 @@ class FakeCore implements PermissionAgentCore {
   readonly reviews: Array<{ request: PermissionRequest; context: PermissionReviewContext }> = [];
   readonly raises: boolean[] = [];
   next: (request: PermissionRequest, context: PermissionReviewContext) => PermissionReview = () => allow();
+  /** Actions with a path that resolves outside the session root now, as the host reads the file system. */
+  readonly outside = new Set<string>();
   /** Stands for the policy text, class rules and tier profiles in force. */
   rules = "rules-1";
   binding() { return this.rules; }
@@ -93,7 +95,7 @@ class FakeCore implements PermissionAgentCore {
   }
   raise(request: PermissionRequest, context: { rejectHistory: boolean }) {
     this.raises.push(context.rejectHistory);
-    return [...(request.destructive ? ["destructive"] : []), ...(context.rejectHistory ? ["reject-history"] : [])];
+    return [...(request.destructive ? ["destructive"] : []), ...(this.outside.has(request.action) ? ["outside-root"] : []), ...(context.rejectHistory ? ["reject-history"] : [])];
   }
   async review(request: PermissionRequest, context: PermissionReviewContext) {
     this.reviews.push({ request, context });
@@ -104,7 +106,7 @@ class FakeCore implements PermissionAgentCore {
 let requestSeq = 0;
 type RequestOptions = {
   action?: string; reuseKey?: string | null; taskId?: string; assignment?: string; sessionId?: string;
-  projectId?: string; model?: string | null; shape?: Partial<PermissionRequestShape>; destructive?: boolean;
+  projectId?: string; model?: string | null; shape?: Partial<PermissionRequestShape>; destructive?: boolean; task?: string;
 };
 function request(options: RequestOptions = {}): PermissionRequest {
   const action = options.action ?? "npm test";
@@ -122,7 +124,7 @@ function request(options: RequestOptions = {}): PermissionRequest {
       ...(options.model === null ? {} : { model: options.model ?? "model-alpha" }),
       sessionRoot: "/workspace/session-root",
       scratchRoots: [],
-      task: { title: "Build the feature", text: "Build the feature and run its checks." },
+      task: { title: "Build the feature", text: options.task ?? "Build the feature and run its checks." },
     },
     tool: "Bash",
     input: { command: action },
@@ -711,6 +713,46 @@ test("a change to the rules or tier profiles in force retires earlier verdicts: 
   f.core.rules = "rules-1";
   assert.equal(f.pipeline.applicable(pending.decisionId), true);
   assert.equal(f.pipeline.applicable(again.decisionId), false);
+}));
+
+test("a recorded verdict answers a request only while the paths resolve as they did and the task text is the same", () => withFixture(async f => {
+  f.delegate();
+  // A light allow for a path inside the session root. An identical request replays it.
+  f.core.next = () => allow([lightTier()]);
+  const waiting = request({ action: "cat notes/latest" });
+  const light = decided(await f.pipeline.decide(waiting), "allow");
+  decided(await f.pipeline.decide(request({ action: "cat notes/latest" })), "allow");
+  assert.equal(f.core.reviews.length, 1);
+
+  // The path now resolves outside the session root (a link was replaced). The identical request is raised and
+  // reviewed again; the light allow does not answer it.
+  f.core.outside.add("cat notes/latest");
+  f.core.next = () => allow();
+  const strong = decided(await f.pipeline.decide(request({ action: "cat notes/latest" })), "allow");
+  assert.equal(f.core.reviews.length, 2, "the request is reviewed again once a path resolves outside the root");
+  assert.deepEqual(f.core.reviews[1].context.raised, ["outside-root"]);
+  assert.equal(f.journal.decision(strong.decisionId)?.replayOf, undefined);
+  // A second attempt at the first dialog is not answered from its recorded light allow either, also after a restart.
+  const retried = decided(await f.pipeline.decide(waiting), "allow");
+  assert.notEqual(retried.decisionId, light.decisionId);
+  assert.equal(f.journal.decision(retried.decisionId)?.replayOf, strong.decisionId);
+  f.restart();
+  assert.deepEqual(await f.pipeline.decide(waiting), retried);
+  assert.equal(f.core.reviews.length, 2);
+  // While the path resolves inside the root again, the verdict reached for that reading answers again.
+  f.core.outside.delete("cat notes/latest");
+  assert.deepEqual(await f.pipeline.decide(waiting), light);
+  assert.equal(f.core.reviews.length, 2);
+
+  // The owner narrows a session's task in a later prompt. The identical request is reviewed against the new text.
+  const narrowed = "Build the feature and run its checks.\nDo not run the build script.";
+  decided(await f.pipeline.decide(request({ action: "npm run build" })), "allow");
+  decided(await f.pipeline.decide(request({ action: "npm run build" })), "allow");
+  assert.equal(f.core.reviews.length, 3);
+  f.core.next = () => reject("unrelated");
+  decided(await f.pipeline.decide(request({ action: "npm run build", task: narrowed })), "reject");
+  assert.equal(f.core.reviews.length, 4, "the request is reviewed again once the task text changed");
+  assert.equal(f.core.reviews[3].request.requester.task.text, narrowed);
 }));
 
 test("owner controls replay a request ID, refuse a conflicting one, and refuse what is not a reviewer's reject", () => withFixture(async f => {

@@ -249,7 +249,7 @@ export class TeamVerdicts {
       this.stopEvaluator(holder, state, member, "record-unavailable");
       return null;
     }
-    const built = verdictContext({ run: holder.run, record, head: state.head, kind: state.kind, receipts: this.receiptsOf(state) });
+    const built = verdictContext({ run: holder.run, record, head: state.head, kind: state.kind, receipts: this.receiptsOf(state), changedPaths: this.changeListOf(holder, state) });
     if (!built) {
       this.stopEvaluator(holder, state, member, "context-too-large");
       return null;
@@ -349,7 +349,7 @@ export class TeamVerdicts {
       this.finish(holder, state, undefined, choice.skipped);
       return;
     }
-    if (!verdictContext({ run, record, head: state.head, kind: state.kind, receipts: this.receiptsOf(state) })) {
+    if (!verdictContext({ run, record, head: state.head, kind: state.kind, receipts: this.receiptsOf(state), changedPaths: this.changeListOf(holder, state) })) {
       this.finish(holder, state, undefined, "context-too-large");
       return;
     }
@@ -463,7 +463,7 @@ export class TeamVerdicts {
     } else {
       composed = composeVerdict({
         record, head: state.head, kind: state.kind, configured: this.host.configured(run), receipts: this.receiptsOf(state),
-        facts: this.factsOf(holder, state), changedPaths: changedPathsOf(run, state.head),
+        facts: this.factsOf(holder, state), changedPaths: this.changeListOf(holder, state),
         ...(report === undefined ? {} : { report: this.judgedOnly(state, record, report) }), ...(reason === undefined ? {} : { reason }),
       });
       const outcome = this.writeRecord(holder, state, record, composed);
@@ -556,20 +556,35 @@ export class TeamVerdicts {
     return { ...(passed === undefined ? {} : { checksPassed: passed }), ...(approved === undefined ? {} : { reviewApproved: approved }) };
   }
 
+  /**
+   * The change list a verdict reads, for the composition and the evaluator's context alike. A reviewed verdict reads the run's own.
+   * A no-change run never sets one: it reads the parent run's when that list is at the verdict's head, else nothing changed between
+   * the base and the head, and the list is empty and complete.
+   */
+  private changeListOf(holder: VerdictHolder, state: VerdictState): { paths: string[]; truncated: boolean } {
+    if (state.kind === "reviewed") return changedPathsOf(holder.run, state.head);
+    const parent = this.host.holder(state.receiptsFrom)?.run;
+    if (parent?.changes?.headCommit === state.head) return changedPathsOf(parent, state.head);
+    return { paths: [], truncated: false };
+  }
+
   /** The reviewed pass's receipts at the head; undefined while pending, when no pass ran there, or when the run is gone. */
   private receiptsOf(state: VerdictState): readonly ObjectiveReceipt[] | undefined {
     const receipts = this.host.register.reviewedReceipts(state.receiptsFrom, state.head);
     return receipts === "pending" ? undefined : receipts;
   }
 
-  /** Every implementer and integrator with a result report is an author, from any revision (steer and resume reset run.tasks); every reviewer member is a reviewer. */
+  /**
+   * Every implementer and integrator member with a profile is an author, whatever its report and revision: an escalated or stopped
+   * member's edits can be in the head, and steer and resume reset run.tasks. Every reviewer member is a reviewer.
+   */
   private cycleOf(run: TeamRun): { authors: TeamModelProfile[]; reviewers: TeamModelProfile[] } {
     const authors: TeamModelProfile[] = [];
     const reviewers: TeamModelProfile[] = [];
     for (const member of run.members) {
       if (member.modelProfile === undefined) continue;
       if (member.role === "reviewer") reviewers.push(member.modelProfile);
-      else if ((member.role === "integrator" || member.role === "implementer") && member.report?.kind === "result") authors.push(member.modelProfile);
+      else if (member.role === "integrator" || member.role === "implementer") authors.push(member.modelProfile);
     }
     return { authors, reviewers };
   }

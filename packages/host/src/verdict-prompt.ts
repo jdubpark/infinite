@@ -52,7 +52,7 @@ export type VerdictContext = {
  * the objective. Undefined when the JSON is over VERDICT_CONTEXT_BYTES (counted in bytes); the caller refuses with `context-too-large`.
  */
 export function verdictContext(input: { run: TeamRun; record: ObjectiveRecord; head: string; kind: "reviewed" | "no-change";
-  receipts?: readonly ObjectiveReceipt[] }): VerdictContext | undefined {
+  receipts?: readonly ObjectiveReceipt[]; changedPaths?: { paths: string[]; truncated: boolean } }): VerdictContext | undefined {
   const { run, record, head, kind } = input;
   const finalRound = finalCheckRound(run, head);
   const context: VerdictContext = {
@@ -76,9 +76,9 @@ export function verdictContext(input: { run: TeamRun; record: ObjectiveRecord; h
     },
     rubric: { version: record.rubricVersion, items: RUBRIC_V1 },
     // A change list recorded at another head describes another tree, so it is not offered; the missing list is marked incomplete.
-    changedPaths: run.changes?.headCommit === head
+    changedPaths: input.changedPaths ?? (run.changes?.headCommit === head
       ? { paths: run.changes.files.map(file => file.path), truncated: run.changes.truncated }
-      : { paths: [], truncated: true },
+      : { paths: [], truncated: true }),
     checks: finalRound.filter(check => check.phase === undefined).map(check => ({ name: [check.command.command, ...check.command.args].join(" "), status: check.status })),
     receipts: (input.receipts ?? [])
       .filter(item => item.subject === "criterion" && item.commit === head)

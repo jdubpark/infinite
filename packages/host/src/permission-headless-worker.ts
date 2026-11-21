@@ -9,7 +9,7 @@
  * Nothing here allows a call on its own: an allow comes from the pipeline or from the owner's answer.
  */
 import { createHash } from "node:crypto";
-import type { Prompt } from "@infinite/attention";
+import type { Prompt, Signal } from "@infinite/attention";
 import { channelCall, CLASS_CHECK_MS, DECIDE_MS, type ChannelCall, type ChannelReply, type ChannelRequest, type IssuedDecision } from "./permission-headless.js";
 import { requesterNotice, type RejectCode } from "./permission-policy.js";
 import type { ChannelAnswer } from "./permission-hook.js";
@@ -97,6 +97,11 @@ function readCall(body: unknown): (ChannelCall & { nativeSessionId?: string }) |
   };
 }
 
+/** Marks the turn-start of a provider prompt the provider submitted itself after a resume. Only one turn-start is taken. */
+export function claudeTurnSignals(signals: Signal[], continued: () => boolean): Signal[] {
+  return signals.map(signal => signal.kind === "turn-start" && continued() ? { ...signal, automatic: true as const } : signal);
+}
+
 export class HeadlessChannelWorker {
   private served = false;
   private nativeSessionId?: string;
@@ -113,6 +118,8 @@ export class HeadlessChannelWorker {
    * it holds none, so no request takes a held id, for as long as the worker lives.
    */
   private lost = false;
+  /** Set after a resume the worker performed; the next prompt the provider submits is its own continue. */
+  private continueOwed = false;
   /** Call ids that already received the owner's answer. A repeat is denied. */
   private consumed = new Set<string>();
   private answers = new Map<string, StoredAnswer>();
@@ -347,7 +354,7 @@ export class HeadlessChannelWorker {
     this.host.closePrompt(deferred.promptId!, [OWNER_ALLOW, OWNER_DENY, OWNER_DENY_TEXT][option]);
     this.delivery(deferred.issued, "intent", `Headless: the owner ${decision === "allow" ? "allowed the call once" : "refused the call"}; the session resumes.`);
     this.host.publish(this.view());
-    try { this.host.resume(this.nativeSessionId!); }
+    try { this.host.resume(this.nativeSessionId!); this.continueOwed = true; }
     catch {
       this.retireCall("resume-failed");
       this.host.end();
@@ -361,6 +368,13 @@ export class HeadlessChannelWorker {
     const waiting = this.deferred.phase === "waiting";
     this.retireCall(reason);
     if (waiting) this.host.end();
+  }
+
+  /** True once after each resume the worker performed, so the provider's own continue prompt can be marked. */
+  takeContinue(): boolean {
+    const owed = this.continueOwed;
+    this.continueOwed = false;
+    return owed;
   }
 
   private retireCall(reason: string) {

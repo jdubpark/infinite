@@ -16,6 +16,7 @@ import {
   DEFERRAL_RETENTION_MS, HeadlessChannelWorker, OPEN_CALL_KEYS, OWNER_DENIED, PENDING_NOTICE, type ChannelWorkerHost,
 } from "../packages/host/src/permission-headless-worker.js";
 import { hookOutput } from "../packages/host/src/permission-hook.js";
+import { claudeTurnSignals } from "../packages/host/src/permission-headless-worker.js";
 import { requesterNotice } from "../packages/host/src/permission-policy.js";
 import type { PermissionAgentServices, PermissionOutcome, PermissionPipeline, PermissionRequest } from "../packages/host/src/permission-agent-types.js";
 import type { Config, Event, Session } from "../packages/host/src/types.js";
@@ -838,4 +839,16 @@ test("the channel hook prints a provider decision only for a decision", () => {
   assert.deepEqual(JSON.parse(hookOutput("check", { decision: "defer", reason: "wait" })), { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "defer", permissionDecisionReason: "wait" } });
   // A PermissionRequest hook cannot defer: anything but an allow is a deny.
   assert.deepEqual(JSON.parse(hookOutput("request", { decision: "defer" })).hookSpecificOutput.decision, { behavior: "deny", message: requesterNotice("unavailable") });
+});
+
+test("takeContinue answers true once after each resume the worker performed; the marker only marks a turn-start", async () => {
+  const w = workerRig([owner]);
+  assert.equal(w.channel.takeContinue(), false, "no resume yet");
+  await resumeAfterDeferral(w);
+  assert.equal(w.channel.takeContinue(), true, "the first prompt after the resume is the provider's continue");
+  assert.equal(w.channel.takeContinue(), false, "the answer is taken once");
+  const signals = [{ kind: "turn-start" as const, prompt: "Continue from where you left off." }, { kind: "tool-end" as const, tool: "Bash", ok: true }];
+  let owed = true;
+  const marked = claudeTurnSignals(signals, () => { const taken = owed; owed = false; return taken; });
+  assert.deepEqual(marked, [{ kind: "turn-start", prompt: "Continue from where you left off.", automatic: true }, signals[1]]);
 });

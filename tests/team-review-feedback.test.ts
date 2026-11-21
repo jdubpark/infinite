@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Blackboard } from "../packages/host/src/evidence/blackboard.js";
@@ -264,6 +265,33 @@ test("a held review whose pull request is retargeted before the halt lifts start
       assert.equal(saved.reviewIntake?.ended?.reason, reason, "the run then leaves the watched set");
     } finally { f.close(); }
   }
+});
+
+test("a steer on a pull request recorded without its branch is refused until a read of GitHub records the branch", async () => {
+  const f = schedulerFixture();
+  try {
+    const gh = delivered(f);
+    // A record made before the branch was kept: the delivered head was published to the branch the pull request uses.
+    delete f.run.pullRequest!.branch;
+    f.run.publication = { repository, branch, commit: gh.head, publishedAt: new Date().toISOString() };
+    f.writeTeam();
+    const teams = f.openTeam(), request = { requestId: randomUUID(), revision: 1, text: "Keep the old flag name as an alias." };
+    await assert.rejects(teams.steer(f.run.id, request), { code: "delivery-branch-unknown" });
+    let saved = f.readRecord<Saved>("team", f.run.id);
+    assert.equal(saved.run.pullRequest?.branch, undefined, "no branch is guessed or saved without a read of GitHub");
+    assert.equal(saved.run.revision, 1);
+
+    // The poller's first read that GitHub confirms records the branch, even when no review counts yet.
+    gh.show([]);
+    const feedback = poller(teams);
+    await feedback.start();
+    await feedback.poll();
+    assert.equal(f.readRecord<Saved>("team", f.run.id).run.pullRequest?.branch, branch);
+    const steered = await teams.steer(f.run.id, request);
+    assert.equal(steered.revision, 2);
+    saved = f.readRecord<Saved>("team", f.run.id);
+    assert.deepEqual([saved.run.pullRequest?.branch, saved.run.pullRequest?.revision], [branch, 1]);
+  } finally { f.close(); }
 });
 
 test("polls that arrive while a pass is slow coalesce into one more pass", async () => {

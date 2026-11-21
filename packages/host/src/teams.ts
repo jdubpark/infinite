@@ -1332,6 +1332,8 @@ export class TeamService {
       if (stored.pending && !this.commands.has(id)) throw new TeamError(409, "team-reconciliation-required", "This team has an unresolved workspace or verification operation. Inspect its evidence and start a new team rather than replaying uncertain work.");
       if (stored.pending && stored.pending.kind !== "check") throw new TeamError(409, "team-operation-running", "A workspace operation is in progress. Retry steering after it settles.");
       if (stored.run.workspaceRemovedAt) throw new TeamError(409, "team-workspace-removed", "This run's workspaces were removed under the retention policy; start a new run.");
+      // A delivered run continues on its pull request's branch, which only a read of GitHub may supply for an older record (INF-324).
+      if (stored.run.pullRequest && !pullRequestBranch(stored.run)) throw new TeamError(409, "delivery-branch-unknown", "This run's pull request was recorded before the host kept its branch, so a steer cannot tell which branch to continue. With review feedback switched on, the host records the branch at its next read of the pull request; retry then, or start a new run.");
       if (Buffer.byteLength(stored.run.steering.map(item => item.text).join("")) + Buffer.byteLength(body.text) > 32 * 1024) throw new TeamError(409, "team-steering-limit", "This team reached its 32 KiB steering limit. Start a new team with consolidated requirements.");
       if (stored.run.steering.length >= 20) throw new TeamError(409, "team-steering-limit", "This team reached its steering limit. Start a new team from the reviewed integration branch.");
       const receipt = this.admit(stored, "steer", body);
@@ -1344,7 +1346,6 @@ export class TeamService {
         this.event(stored, `${source ? inputSourceLabel(source) : "User"} steering superseded automatic recovery; its original report remains recorded as evidence.`);
       }
       // A delivered run delivers again to its pull request's branch; an earlier delivery recovery's record would refuse that report, so only its count stays (INF-324).
-      if (stored.run.pullRequest) stored.run.pullRequest.branch = pullRequestBranch(stored.run);
       if (stored.run.pullRequest && stored.run.deliveryRecovery) { stored.run.deliveryRecoveryAttempts = recoveriesUsed(stored.run); delete stored.run.deliveryRecovery; }
       stored.run.revision++; stored.run.steering.push({ text: body.text, revision: stored.run.revision, at: timestamp(), ...(source ? { source } : {}) });
       const objectiveNote = runObjectiveNote(stored, steerRunObjective(stored, body.requestId, timestamp())); if (objectiveNote) this.event(stored, objectiveNote);
@@ -3235,7 +3236,8 @@ export class TeamService {
       }, result => {
         if (report.disposition === "pull-request" && run.delivery?.mode === "pr") {
           stored.deliveryAttempt = undefined;
-          run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl!, summary: report.summary, reportedAt: timestamp(), branch: report.branch };
+          // An older record without its branch keeps none: only a read of GitHub supplies it (INF-324).
+          run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl!, summary: report.summary, reportedAt: timestamp(), ...(run.pullRequest && !run.pullRequest.branch ? {} : { branch: report.branch }) };
           this.emitWith(stored, "delivery.recorded", [member.revision, member.memberId], { memberId: member.memberId, revision: member.revision }, () => ({
             method: "pull-request", headCommit: report.headCommit }));
           run.status = "ready-for-review"; run.reason = undefined;
@@ -3322,8 +3324,8 @@ export class TeamService {
           this.repair(stored, `Delivery requires a scoped repair before checks and independent review run again. No merge was reported.\n${report.summary}`, "delivery");
         } else if (report.kind === "pull-request") {
           stored.deliveryAttempt = undefined;
-          // The branch delivery was granted, read before the record changes: the recorded pull request's, or the published head's.
-          run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl, summary: report.summary, reportedAt: timestamp(), branch: teamDeliveryBranch(run) };
+          // The branch delivery was granted, read before the record changes. An older record without its branch keeps none: only a read of GitHub supplies it.
+          run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl, summary: report.summary, reportedAt: timestamp(), ...(run.pullRequest && !run.pullRequest.branch ? {} : { branch: teamDeliveryBranch(run) }) };
           this.emitWith(stored, "delivery.recorded", [member.revision, member.memberId], { memberId: member.memberId, revision: member.revision }, () => ({
             method: "pull-request", headCommit: report.headCommit }));
           run.status = "ready-for-review"; run.reason = undefined;

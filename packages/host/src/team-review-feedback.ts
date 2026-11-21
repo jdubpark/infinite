@@ -8,7 +8,7 @@ import type { TeamKernel } from "./team-kernel.js";
 import type { Stored } from "./teams.js";
 import {
   type PullRequestRead, type ReviewIntent, intentStillCurrent, markReviewApplied, parsePullRequestView, pullRequestTarget,
-  pullRequestViewArgs, recordReviewOutcome, reviewRequestId, reviewText, reviewVerdict, watchedRun,
+  pullRequestViewArgs, recordedDeliveryBranch, recordReviewOutcome, reviewRequestId, reviewText, reviewVerdict, watchedRun,
 } from "./review-feedback.js";
 
 /** What the poller uses of TeamService. teams.ts builds it in `reviewFeedbackHost`. */
@@ -157,7 +157,14 @@ export class TeamReviewFeedback {
       const stored = this.host.records.get(id);
       if (this.closed || !stored || !watchedRun(stored.run, stored.reviewIntake) || stored.reviewIntake?.intents.some(item => item.state === "pending")) return undefined;
       const { run } = stored, verdict = reviewVerdict(stored, read, ownerLogin, enabledAt), at = new Date(this.host.now()).toISOString();
-      if (verdict.kind === "quiet" || verdict.kind === "known") return undefined;
+      // A record made before the branch was kept takes the branch this read confirmed (design section 4), whatever the
+      // review does, so a steer can then continue on it. Every verdict but "unwatched" has confirmed it.
+      const legacy = verdict.kind !== "unwatched" && !run.pullRequest!.branch;
+      if (legacy) run.pullRequest!.branch = recordedDeliveryBranch(run, read);
+      if (verdict.kind === "quiet" || verdict.kind === "known") {
+        if (legacy) this.host.save(stored);
+        return undefined;
+      }
       if (verdict.kind === "unwatched") {
         (stored.reviewIntake ??= { intents: [], handled: [], accepted: 0 }).ended = { at, reason: verdict.reason };
         this.host.event(stored, `Review feedback stopped for this run: its pull request ${UNWATCHED[verdict.reason]}.`);
@@ -165,17 +172,15 @@ export class TeamReviewFeedback {
         return undefined;
       }
       if (verdict.kind === "skip") {
-        if (!recordReviewOutcome(run, verdict.review, verdict.outcome, at)) return undefined;
-        if (verdict.outcome === "no-text") this.host.event(stored, `The owner's review ${verdict.review.id} requests changes with an empty summary. Write the requested changes in the review summary; inline comments are not read.`);
-        if (verdict.outcome === "limit") this.host.event(stored, `The owner's review ${verdict.review.id} was not taken: this run already accepted its limit of reviews. Start a new mission with consolidated direction.`);
-        this.host.save(stored);
+        const changed = recordReviewOutcome(run, verdict.review, verdict.outcome, at);
+        if (changed && verdict.outcome === "no-text") this.host.event(stored, `The owner's review ${verdict.review.id} requests changes with an empty summary. Write the requested changes in the review summary; inline comments are not read.`);
+        if (changed && verdict.outcome === "limit") this.host.event(stored, `The owner's review ${verdict.review.id} was not taken: this run already accepted its limit of reviews. Start a new mission with consolidated direction.`);
+        if (changed || legacy) this.host.save(stored);
         return undefined;
       }
       const intake = stored.reviewIntake ??= { intents: [], handled: [], accepted: 0 };
       const accepted: ReviewIntent = { reviewId: verdict.review.id, submittedAt: verdict.review.submittedAt, commit: verdict.review.commit!,
         text: reviewText(verdict.review.body, run.pullRequest!.pullRequestUrl), requestId: reviewRequestId(run.id, verdict.review.id), targetRevision: run.revision, state: "pending" };
-      // A record made before the branch was kept takes the branch this read confirmed (design section 4).
-      run.pullRequest!.branch ??= verdict.branch;
       intake.intents.push(accepted);
       recordReviewOutcome(run, verdict.review, "accepted", at);
       this.host.save(stored);

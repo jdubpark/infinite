@@ -34,13 +34,11 @@ export function teamDeliveryBranch(run: TeamRun) {
     ? publication.branch : run.branch);
 }
 /**
- * The branch of the recorded pull request. A record made before the branch was kept takes the branch that delivery was
- * granted: the one its head was published to, or the run's branch.
+ * The branch of the recorded pull request. A record made before the branch was kept has none until the review poller
+ * reads it from GitHub (design section 4); nothing guesses it, and a steer refuses such a run until then.
  */
-export function pullRequestBranch(run: Pick<TeamRun, "pullRequest" | "publication" | "delivery" | "branch">) {
-  const delivered = run.pullRequest, publication = run.publication;
-  if (!delivered) return undefined;
-  return delivered.branch ?? (run.delivery && publication?.commit === delivered.headCommit && publication.repository === run.delivery.repository ? publication.branch : run.branch);
+export function pullRequestBranch(run: Pick<TeamRun, "pullRequest">) {
+  return run.pullRequest?.branch;
 }
 /** A run steered after its delivery: its pull request is older than the run's revision, and delivery updates it. */
 const continuedPullRequest = (run: TeamRun) => run.pullRequest && run.pullRequest.revision !== run.revision ? run.pullRequest : undefined;

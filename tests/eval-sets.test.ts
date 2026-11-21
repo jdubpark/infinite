@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { evalCorpusModule } from "../packages/host/src/eval-store.js";
 import {
-  CONFIRMS_UNREPORTED_SQL,
   HOLDOUT_AGED_SQL,
   HOLDOUT_USED_SQL,
   SET_COUNTS_SQL,
@@ -191,6 +190,31 @@ test("rotation waits for every confirm report", () => {
   }
 });
 
+test("a project with an unreported confirm does not use up the pass", () => {
+  const f = open(KEY_A);
+  try {
+    f.store.write(tx => {
+      for (let i = 0; i < 100; i += 1) {
+        tx.run(
+          "INSERT INTO eval_groups (group_id, kind, project_ref, root_id, created_at, holdout, set_at) VALUES (?, 'run', 'project-a', ?, ?, 1, ?)",
+          `run:a-${i}`, `run:a-${i}`, NOW, daysAgo(300),
+        );
+      }
+      tx.run(
+        "INSERT INTO eval_jobs (job_id, project_ref, kind, status, request_id, created_at, expires_at, updated_at, payload) "
+        + "VALUES ('job-1', 'project-a', 'confirm', 'paused', 'req-1', ?, ?, ?, 'x')",
+        NOW, NOW, NOW,
+      );
+    });
+    for (let i = 0; i < 5; i += 1) addGroup(f.store, `run:b-${i}`, "project-b", { setAt: daysAgo(200) });
+    assert.equal(f.store.write(tx => rotateHoldout(tx, NOW)), 5, "all of project b's roots move in one pass");
+    assert.equal(holdoutCount(f.store, "project-b"), 0);
+    assert.equal(holdoutCount(f.store, "project-a"), 100, "none of project a's roots move");
+  } finally {
+    f.cleanup();
+  }
+});
+
 test("the hot statements read through an index", () => {
   const f = open(KEY_A);
   try {
@@ -201,7 +225,8 @@ test("the hot statements read through an index", () => {
     assert.match(plan(TRIAL_TASKS_SQL, "p", ""), /eval_tasks_next/);
     assert.match(plan(HOLDOUT_USED_SQL, 100), /eval_groups_holdout_used/);
     assert.match(plan(HOLDOUT_AGED_SQL, NOW, 100), /eval_groups_holdout_age/);
-    assert.match(plan(CONFIRMS_UNREPORTED_SQL), /eval_jobs_unreported/);
+    assert.match(plan(HOLDOUT_USED_SQL, 100), /eval_jobs_unreported/, "the held projects are read through the partial index");
+    assert.match(plan(HOLDOUT_AGED_SQL, NOW, 100), /eval_jobs_unreported/);
     const counts = plan(SET_COUNTS_SQL, "p");
     assert.doesNotMatch(counts, /SCAN t\b|SCAN eval_tasks/);
     assert.match(counts, /SEARCH t USING|SEARCH eval_tasks USING/);

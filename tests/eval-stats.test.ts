@@ -86,6 +86,18 @@ test("a two-configuration result gives the planned figures", () => {
   assert.equal(stats.conclusive, true);
 });
 
+test("the interval moves with the seed", () => {
+  // Per-task differences of the resolved counts, configuration 1 minus configuration 0.
+  const D = [0, -2, -1, -3, -3, -2, 0, -2, -1, 2, 0, 3];
+  const a = D.map(d => Math.max(0, -d));
+  const b = D.map((d, i) => (a[i] as number) + d);
+  const tasks = fixtureTasks([a, b]);
+  const pair = (seed: string) => comparisonStats(input(seed, 2, tasks)).pairs[0];
+  // The interval is a sum over resampled tasks divided by 12 tasks times 3 trials, so a sum of -20 is -20 / 36.
+  nearInterval(pair("job-fixture")?.interval ?? null, [-20 / 36, 3 / 36], "seed job-fixture");
+  nearInterval(pair("job-other")?.interval ?? null, [-21 / 36, 3 / 36], "seed job-other");
+});
+
 test("the same result set gives the same interval on every run", () => {
   const results = Array.from({ length: 10 }, () => comparisonStats(fixtureP()));
   for (const result of results) assert.deepEqual(result.pairs[0].interval, results[0].pairs[0].interval);

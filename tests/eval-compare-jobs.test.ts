@@ -178,6 +178,8 @@ test("a compare job selects dev tasks and a confirm job holdout tasks", () => {
     assert.equal(capped.tasks.length, 20, "the default is 20 tasks");
     const bad = { ...request("confirm", [CONFIG_A, CONFIG_B]), taskFilter: { taskIds: [holdoutId] } };
     assert.equal(comparisonJobSchema.safeParse(bad).success, false, "a confirm request admits no taskIds");
+    const shaped = { ...request("confirm", [CONFIG_A, CONFIG_B]), taskFilter: { excludeGroups: ["g-02"] } };
+    assert.equal(comparisonJobSchema.safeParse(shaped).success, false, "a confirm request admits no excludeGroups");
     assert.equal(comparisonJobSchema.safeParse(request("confirm", [CONFIG_A, CONFIG_B])).success, true);
     assert.equal(comparisonJobSchema.safeParse(request("compare", [CONFIG_A])).success, false);
     assert.equal(comparisonJobSchema.safeParse(request("compare", [CONFIG_A, CONFIG_B, CONFIG_C, CONFIG_A, CONFIG_B])).success, false);

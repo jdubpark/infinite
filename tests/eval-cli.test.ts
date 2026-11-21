@@ -162,7 +162,7 @@ function report(overrides: Partial<ComparisonReport> = {}): ComparisonReport {
 test("the report prints its figures", async () => {
   const lines = evalReportLines(report());
   assert.equal(lines[0], `report ${JOB_ID} compare (dev set) · completed · done · 3 trials per task`);
-  assert.equal(lines[1], "tasks 12 of 12 analysed (100%) · conclusive");
+  assert.equal(lines[1], "tasks 12 of 12 analysed (100%) · share rule met");
   assert.equal(lines[2], "configuration 0: light-a (codex, epoch 1)");
   assert.equal(lines[4], "1 vs 0: +0.194 [+0.056, +0.333] · sign 7-1-4, p 0.0703 (Holm 0.0703) · detectable 0.214 (planning 0.283 to 0.332)");
   assert.ok(lines.includes("attrition 0: void-limit 0, void-host 0, void-owner 0, changed 1, short 1"));
@@ -181,6 +181,14 @@ test("an inconclusive report says so", () => {
   const lines = evalReportLines(report({ conclusive: false, tasks: { planned: 10, analysed: 8, leftHoldout: 0 } }));
   assert.equal(lines[1], "tasks 8 of 10 analysed (80%) · inconclusive: under 90% of tasks kept every valid trial");
   assert.ok(lines.includes("sensitivity 1 vs 0: +0.167 over 10 tasks"));
+});
+
+test("the share rounds down, so it never reaches 90% by rounding", () => {
+  const lines = evalReportLines(report({ conclusive: false, tasks: { planned: 200, analysed: 179, leftHoldout: 0 } }));
+  assert.equal(lines[1], "tasks 179 of 200 analysed (89%) · inconclusive: under 90% of tasks kept every valid trial");
+  const met = evalReportLines(report({ conclusive: true }));
+  assert.ok(met[1].endsWith("share rule met"));
+  assert.equal(met[1].includes("· conclusive"), false);
 });
 
 const prior = (over: Partial<ReplayPrior> = {}): ReplayPrior => ({

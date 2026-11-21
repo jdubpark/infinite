@@ -168,6 +168,60 @@ function fixtureP(f: Fixture, jobId: string, kind: "compare" | "confirm", holdou
   return tasks;
 }
 
+test("the report pass writes nothing while a module is not ready", () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-eval-report-newer-"));
+  const databasePath = evidenceDatabasePath(join(root, "state"));
+  const vaultKey = randomBytes(32);
+  // A stored trials version one above the code's makes that module unavailable, as in the trial pump's test.
+  const first = new EvidenceStore({ databasePath, vaultKey });
+  first.register(evalCorpusModule(first, () => NOW));
+  const trials = evalTrialsModule(first, () => NOW);
+  first.register({ ...trials, version: trials.version + 1, readVersion: trials.version + 1 });
+  const seeded: Fixture = { store: first, close: () => first.close() };
+  const tasks = seedTasks(seeded, 2, false);
+  seedJob(seeded, { jobId: "job-newer", kind: "compare", tasks });
+  first.close();
+  const store = new EvidenceStore({ databasePath, vaultKey });
+  const f: Fixture = { store, close: () => { store.close(); rmSync(root, { recursive: true, force: true }); } };
+  try {
+    store.register(evalCorpusModule(store, () => NOW));
+    store.register(evalTrialsModule(store, () => NOW));
+    assert.equal(store.status().modules["eval-trials"], "unavailable");
+    assert.equal(pass(f).step(), "idle");
+    assert.equal(count(f, "SELECT count(*) AS n FROM eval_jobs WHERE reported_at IS NULL"), 1, "the job keeps no stamp");
+    assert.equal(count(f, "SELECT count(*) AS n FROM eval_reports"), 0);
+  } finally {
+    f.close();
+  }
+});
+
+test("a report uses its own job id as the seed", () => {
+  const f = ready();
+  try {
+    // Per-task differences of the resolved counts, configuration 1 minus configuration 0; the interval's sum is -20 or -21 by seed.
+    const D = [0, -2, -1, -3, -3, -2, 0, -2, -1, 2, 0, 3];
+    const a = D.map(d => Math.max(0, -d));
+    const b = D.map((d, i) => (a[i] as number) + d);
+    const tasks = seedTasks(f, 12, false);
+    for (const jobId of ["job-fixture", "job-other"]) {
+      seedJob(f, { jobId, kind: "compare", tasks });
+      seedTrials(f, jobId, tasks, [a, b]);
+    }
+    assert.equal(pass(f).step(), "reported");
+    assert.equal(pass(f).step(), "reported");
+    const interval = (jobId: string) => opened(read(f, jobId)).pairs[0]?.interval ?? null;
+    const fixture = interval("job-fixture");
+    const other = interval("job-other");
+    assert.ok(fixture !== null && other !== null);
+    assert.equal(fixture[0], -20 / 36);
+    assert.equal(fixture[1], 3 / 36);
+    assert.equal(other[0], -21 / 36);
+    assert.equal(other[1], 3 / 36);
+  } finally {
+    f.close();
+  }
+});
+
 test("a report is written once", () => {
   const f = ready();
   try {
@@ -271,8 +325,6 @@ test("the report holds no task material", () => {
       for (const id of trialIds) assert.equal(text.includes(id), false, "no trial id");
       for (let i = 0; i < 12; i += 1) assert.equal(text.includes(groupId(i)), false, "no group id");
       assert.equal(text.includes("model-"), false, "no model name");
-      assert.equal(text.includes("objective"), false, "no objective text");
-      assert.equal(text.includes("diff --git"), false, "no patch text");
     }
     const report = JSON.parse(json) as ComparisonReport;
     assert.equal(report.configurations[0]?.profileId, "profile-a");

@@ -21,7 +21,8 @@ export function sessionAgentProfile(config: Pick<Config, "agents" | "eval">, pro
  * Whether a new Claude team member of this host would be asked to start in Code Mode. Routing needs the answer before a
  * launch exists, so this is an estimate from the configured level and the shape of the Claude launch profile: a
  * headless launch whose shape the permission channel can serve counts as served. Each launch records its own answer,
- * which is no for a learning run and for a headless launch the channel does not serve.
+ * which is no for a learning run and for a headless launch the channel does not serve. A learning run carries no
+ * routing pin, so routing never reads this estimate for one.
  */
 export function memberCodeModeExpected(config: Pick<Config, "agents" | "codeMode">): boolean {
   const profile = config.agents.claude;

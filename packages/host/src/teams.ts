@@ -2921,7 +2921,7 @@ export class TeamService {
     });
   }
   private routerInput(run: TeamRun) {
-    return { publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"), objectiveDigest: objectivePromptOf(run), codeMode: !run.replay && memberCodeModeExpected(this.config),
+    return { publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"), objectiveDigest: objectivePromptOf(run), codeMode: memberCodeModeExpected(this.config),
       limited: this.limits.limited(), featureMap: (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features };
   }
   private async launch(stored: Stored, member: TeamMember) {

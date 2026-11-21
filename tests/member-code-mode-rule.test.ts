@@ -11,7 +11,8 @@ import { EventOutbox } from "../packages/host/src/evidence/outbox.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { memberCodeModeExpected } from "../packages/host/src/launch.js";
 import { Manager } from "../packages/host/src/manager.js";
-import { startFrame } from "../packages/host/src/routing-auto.js";
+import { startFrame, type RouterStart } from "../packages/host/src/routing-auto.js";
+import type { RoutingRecorder } from "../packages/host/src/routing-recorder.js";
 import { pinRouting } from "../packages/host/src/routing-policy.js";
 import type { TeamLineup, TeamModelProfile, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
 import type { AgentProfile, Config } from "../packages/host/src/types.js";
@@ -135,20 +136,27 @@ test("a Claude member records the configuration of the mode its launch recorded"
   assert.notEqual(versions[0], versions[1]);
 });
 
-test("a run's router reads the mode a new Claude member would start in, and a learning run reads none", () => {
-  const f = schedulerFixture();
-  try {
-    f.config.agents.claude = { command: "claude", args: [] };
-    f.config.codeMode = { claude: "all" };
-    const teams = f.openTeam();
-    const routed = (run: TeamRun) => (teams as unknown as { routerInput(run: TeamRun): { codeMode: boolean } }).routerInput(run).codeMode;
-    assert.equal(routed(f.run), true);
-    // A learning session never starts in Code Mode, so its run's router does not expect it.
-    assert.equal(routed({ ...f.run, replay: { jobId: "job", trialId: "trial", purpose: "replay" } }), false);
-    f.config.codeMode = { claude: "off" };
-    assert.equal(routed(f.run), false);
-  } finally {
-    f.close();
+test("a routed start reads the mode a new Claude member would start in", async () => {
+  const lineup: TeamLineup = { ...mixedLineup, implementers: [claudeLight, mixedLineup.implementers[1]!] };
+  for (const [level, expected] of [["all", true], ["off", false]] as const) {
+    const f = schedulerFixture();
+    try {
+      f.config.agents.claude = { command: "claude", args: [] };
+      f.config.codeMode = { claude: level };
+      // A run with one task ready to start, and a routing pin, so that the start goes to the router.
+      f.run.members = []; f.run.lineup = lineup; f.run.status = "implementing"; f.run.parallelism = 1; f.run.headCommit = f.run.baseCommit;
+      f.run.routing = pinRouting(undefined, "autonomous", lineup);
+      f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "pending", agentProfileId: claudeLight.id }];
+      f.writeTeam();
+      const teams = f.openTeam();
+      const starts: boolean[] = [];
+      teams.useRouter({ recordStart: (input: RouterStart) => { starts.push(input.codeMode); } } as unknown as RoutingRecorder);
+      const scheduler = teams as unknown as { record(id: string): unknown; step(stored: unknown): Promise<void> };
+      await scheduler.step(scheduler.record(f.run.id));
+      assert.deepEqual(starts, [expected], `level ${level}`);
+    } finally {
+      f.close();
+    }
   }
 });
 

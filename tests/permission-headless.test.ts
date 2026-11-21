@@ -464,7 +464,7 @@ const raise = (w: ReturnType<typeof workerRig>, command: string, extra: Record<s
   w.channel.request({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command }, ...extra });
 /** A request may take its own call's id or none. It must not take another call's id. */
 const ownOrNone = (id: string | undefined, own: string) => assert.ok(id === undefined || id === own, `the request took ${id}, and its call is ${own}`);
-/** One call is deferred, the provider exits on it, and the owner's allow starts the next provider, which runs the call. */
+/** One call is deferred, the provider exits on it, the owner allows it, and the resumed call receives that allow. */
 async function resumeAfterDeferral(w: ReturnType<typeof workerRig>) {
   assert.equal((await w.pre("deploy production", "toolu_owner")).decision, "defer");
   assert.equal(w.channel.exited(0), true);

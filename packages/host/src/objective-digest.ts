@@ -114,14 +114,15 @@ export function registerDigestFor(record: ObjectiveRecord): RegisterDigest {
 }
 
 /** false: no record digest. true: a criteria digest without a register. "register" or "register-autonomous": with one. */
-export type ObjectivePrompt = boolean | "register" | "register-autonomous";
+export type ObjectivePrompt = boolean | "register" | "register-autonomous" | "criteria" | "register-criteria" | "register-autonomous-criteria";
 
 /** A live run's prompt shape: false without a record digest; true with a digest without a register; else by the run's pinned mode. */
 export function objectivePromptOf(run: Pick<TeamRun, "goal" | "autonomy">): ObjectivePrompt {
   const digest = run.goal?.record;
   if (!digest) return false;
-  if (!digest.register) return true;
-  return autonomyOf(run) === "autonomous" ? "register-autonomous" : "register";
+  const rows = run.goal?.criteria ? "-criteria" : "";
+  if (!digest.register) return rows ? "criteria" : true;
+  return `${autonomyOf(run) === "autonomous" ? "register-autonomous" : "register"}${rows}` as ObjectivePrompt;
 }
 
 /** The shape a new run of `project` would render in `mode`: false with prompts off; true with the register off; else by `mode`. */

@@ -205,3 +205,15 @@ test("the objective prompt shape follows the digest, the register, and the mode"
   assert.equal(objectiveRegisterOn(projectWith({ register: "off" })), false, "off is not on");
   assert.equal(objectiveRegisterOn(projectWith({ register: "on" })), true, "on is on");
 });
+
+test("the criteria shapes follow the goal's rows", () => {
+  const digest = recordDigestFor(hostRecord(), [test1]);
+  const withRegister = { ...digest, register: { assumptions: [], questions: [] } };
+  const criteria = [{ criterion: "c1", status: "met", check: "command:npm test" }];
+  assert.equal(objectivePromptOf({ goal: { record: digest, criteria }, autonomy: undefined } as never), "criteria", "rows without a register");
+  assert.equal(objectivePromptOf({ goal: { record: withRegister, criteria }, autonomy: "supervised" } as never), "register-criteria", "rows with a register, supervised");
+  assert.equal(objectivePromptOf({ goal: { record: withRegister, criteria }, autonomy: "autonomous" } as never), "register-autonomous-criteria", "rows with a register, autonomous");
+  assert.equal(objectivePromptOf({ goal: { record: digest }, autonomy: undefined } as never), true, "no rows, today's value");
+  assert.equal(objectivePromptOf({ goal: { record: withRegister }, autonomy: "autonomous" } as never), "register-autonomous", "no rows, today's register value");
+  assert.equal(objectivePromptOf({ goal: { criteria }, autonomy: undefined } as never), false, "rows without a digest change nothing");
+});

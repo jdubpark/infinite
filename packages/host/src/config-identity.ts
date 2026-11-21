@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { canonicalJson } from "./evidence/crypto.js";
 import { intentCheckerPrompt } from "./intent-prompt.js";
+import { evaluatorPrompt } from "./verdict-prompt.js";
+import type { CriteriaRow } from "./verdict-types.js";
 import type { ObjectivePrompt } from "./objective-digest.js";
 import { profileIdentity } from "./run-events.js";
 import { entryCommand, reportCommand, teamPrompt } from "./team-prompts.js";
@@ -99,6 +101,11 @@ const FIXTURE_REGISTER: RegisterDigest = {
   assumptions: [{ id: "a1", status: "unchecked", criticality: "plan", statement: "Fixture assumption." }],
   questions: [{ id: "q1", text: "Fixture question? Default: keep." }],
 };
+/** The two fixed criteria rows the "-criteria" shapes add. Fixed text, never a live verdict. */
+const FIXTURE_ROWS: CriteriaRow[] = [
+  { criterion: "c0", status: "met", check: "judgement:owner-text" },
+  { criterion: "c1", status: "not-met", check: "command:npm test" },
+];
 /** Two fixed runs, each with its work item. Rendering them is the prompt version; no live run is read. */
 const FIXTURES: { run: TeamRun; work: TeamTask | TeamScout }[] = [
   {
@@ -141,11 +148,12 @@ function waitIn<T>(waiters: Set<(value: T | undefined) => void>, signal: AbortSi
  */
 function objectiveFixture(plain: TeamRun, objectiveDigest: ObjectivePrompt): TeamRun {
   if (objectiveDigest === false || !plain.goal) return plain;
-  if (objectiveDigest === true) return { ...plain, goal: { ...plain.goal, record: FIXTURE_RECORD } };
+  const rows = typeof objectiveDigest === "string" && objectiveDigest.endsWith("criteria") ? { criteria: FIXTURE_ROWS } : {};
+  if (objectiveDigest === true || objectiveDigest === "criteria") return { ...plain, goal: { ...plain.goal, record: FIXTURE_RECORD, ...rows } };
   return {
     ...plain,
-    autonomy: objectiveDigest === "register-autonomous" ? "autonomous" : "supervised",
-    goal: { ...plain.goal, record: { ...FIXTURE_RECORD, register: FIXTURE_REGISTER } },
+    autonomy: String(objectiveDigest).startsWith("register-autonomous") ? "autonomous" : "supervised",
+    goal: { ...plain.goal, record: { ...FIXTURE_RECORD, register: FIXTURE_REGISTER }, ...rows },
   };
 }
 
@@ -157,6 +165,7 @@ function objectiveFixture(plain: TeamRun, objectiveDigest: ObjectivePrompt): Tea
 export function renderedPrompts(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest: ObjectivePrompt = false): string[] {
   const command = reportCommand();
   if (role === "intent-checker") return [intentCheckerPrompt(provider, profile).split(command).join("<report-command>")];
+  if (role === "evaluator") return [evaluatorPrompt(provider, profile).split(command).join("<report-command>")];
   const entry = entryCommand();
   return FIXTURES.map(({ run: plain, work }) => {
     const run = objectiveFixture(plain, objectiveDigest);

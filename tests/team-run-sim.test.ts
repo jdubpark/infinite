@@ -182,7 +182,7 @@ for (const [seed, kind] of [[5, "pause"], [29, "cancel"]] as const) {
 
 // The allowance covers only write 1 of a pause or cancel. `eventLost` drops every "Team paused." and "Team cancelled."
 // line. In each seed below the first failure is then a pause or a cancel cut after write 2 (step 3 of both), through
-// I3, with and without the allowance. An allowance widened to every cut lets that step pass, and this test fails.
+// I3, with and without the allowance. An allowance widened to every cut lets that step pass, and the two runs without `strict` fail.
 const eventLost: Variant = { patch: service => {
   const host = internals(service), event = host.event.bind(host);
   host.event = (stored, text) => { if (text !== "Team paused." && text !== "Team cancelled.") event(stored, text); };

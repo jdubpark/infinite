@@ -4,7 +4,7 @@ import { lstatSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type { Config } from "./types.js";
 import type { Manager } from "./manager.js";
-import type { Prompt } from "@infinite/attention";
+import { accountSettingPrompt, type Prompt } from "@infinite/attention";
 import { isCollapsedPermissionPrompt, oneShotPermissionOption } from "./team-permissions.js";
 import type { Stored } from "./teams.js";
 
@@ -54,7 +54,8 @@ export const recoveriesUsed = (run: Pick<TeamRun, "deliveryRecovery" | "recovery
   Math.max(run.deliveryRecovery?.attempts ?? 0, run.recovery?.attempts ?? 0, run.deliveryRecoveryAttempts ?? 0);
 export const livePermissionRecoveryStatuses = new Set(["expanding", "diagnosing", "reviewing-evidence"]);
 export const screenPermissionPrompt = (prompt: Prompt) => prompt.source === "screen" && prompt.kind === "permission" && prompt.pinned === true && Boolean(prompt.hash);
-export const coordinatorPermissionPrompt = (prompt: Prompt) => oneShotPermissionOption(prompt) !== undefined || isCollapsedPermissionPrompt(prompt) || screenPermissionPrompt(prompt);
+export const coordinatorPermissionPrompt = (prompt: Prompt) => !accountSettingPrompt(prompt) &&
+  (oneShotPermissionOption(prompt) !== undefined || isCollapsedPermissionPrompt(prompt) || screenPermissionPrompt(prompt));
 export const permissionPromptKey = (targetSessionId: string, promptId: number, promptHash: string) => `${targetSessionId}:${promptId}:${promptHash}`;
 export const boundedRecoveryText = (value: string, max = 400) => [...value.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").replace(/\s+/g, " ").trim()].slice(0, max).join("");
 export function permissionRequestCount(run: TeamRun) {

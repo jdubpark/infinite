@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { classify, classRulesDigest, EMBEDDED_COMMAND_LIMITS, raise } from "../packages/host/src/permission-classes.js";
+import { detectPrompt, type Prompt } from "@infinite/attention";
 import { familyOf } from "../packages/host/src/permission-families.js";
 import { realHostPath } from "../packages/host/src/permission-shell.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_TEXT } from "../packages/host/src/permission-policy.js";
@@ -30,6 +31,8 @@ import {
 import { hostProtectedPaths, permissionAgentConfigSchema, protectedInstallPath, type PermissionAgentSettings } from "../packages/host/src/permission-agent-config.js";
 import { PermissionReviewHeld } from "../packages/host/src/permission-agent-types.js";
 import type { PermissionRequest, PermissionReviewContext } from "../packages/host/src/permission-agent-types.js";
+import { agentAcceptOption, oneShotRejectOption, permissionRequestShape } from "../packages/host/src/team-permissions.js";
+import { permissionChoices } from "../packages/host/src/permission-session-requests.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 
 const ROOT = "/home/dev/projects/sample";
@@ -115,6 +118,34 @@ test("each interrupt class routes a concrete request through a class rule, and n
   assert.ok(raise(opaque, { rejectHistory: false }).includes("raise:opaque"));
   // A class that is not in force is not matched.
   assert.equal(classify(bash("gh auth login"), CLASSES.filter(name => name !== "credentials")), undefined);
+});
+
+test("Claude Code Mode confirmation is persistent-only and cannot be answered by an agent", () => {
+  const screen = readFileSync(resolve("tests/fixtures/screens/claude-code-mode.txt"), "utf8").split("\n");
+  const detected = detectPrompt(screen, "claude");
+  assert.ok(detected);
+  const prompt: Prompt = { ...detected, id: 1, source: "screen", hash: "d".repeat(64) };
+
+  const shape = permissionRequestShape(prompt);
+  assert.equal(agentAcceptOption(prompt), undefined);
+  assert.equal(oneShotRejectOption(prompt), undefined);
+  assert.equal(shape.oneShotAccept, false);
+  assert.equal(shape.oneShotReject, false);
+  assert.equal(shape.persistentOnly, true);
+  const punctuated: Prompt = { ...prompt, title: "Code Mode (experimental):" };
+  assert.equal(oneShotRejectOption(punctuated), undefined);
+  assert.equal(permissionRequestShape(punctuated).persistentOnly, true);
+
+  const choices = permissionChoices(prompt);
+  assert.equal(choices.accept, undefined);
+  assert.equal(choices.reject, undefined);
+  assert.equal(choices.shape.oneShotAccept, false);
+  assert.equal(choices.shape.oneShotReject, false);
+  assert.equal(choices.shape.persistentOnly, true);
+
+  assert.deepEqual(classify(bash("turn on Code Mode", { shape }), CLASSES), {
+    interruptClass: "global-or-account-settings", rule: "class:persistent-only",
+  });
 });
 
 test("a screen dialog's command that spans more than one line is raised, because the screen does not say which breaks are wraps", async () => {

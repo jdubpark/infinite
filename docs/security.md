@@ -654,6 +654,8 @@ configuration: a write to the host's state, run or install directory, its
 configuration file, the vault key or a provider launcher is in the
 global-or-account-settings class, and so is a workspace trust prompt.
 
+Claude Code's experimental Code Mode confirmation changes a setting for the operating-system account. Only the owner answers it: "Yes" saves the choice for the account, and "No" would silently undo the owner's configuration, so neither option is delegated.
+
 Delivery records an intent before the first key, and a receipt, a refusal or
 an uncertain result after it. Before a key is sent, the host checks the
 session, the session root, the dialog's identity and evidence, the owner's

@@ -4,7 +4,7 @@ import { realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Session } from "./types.js";
 import type { Manager } from "./manager.js";
-import type { Prompt } from "@infinite/attention";
+import { accountSettingPrompt, type Prompt } from "@infinite/attention";
 import { assertMemberReadOnly, memberChangedPaths } from "./team-workspace.js";
 import { agentAcceptOption, isCollapsedPermissionPrompt, permissionEvidenceHash } from "./team-permissions.js";
 import { collectPermissionEvidence, permissionEvidenceDigest } from "./team-permission-evidence.js";
@@ -35,7 +35,7 @@ const underReview = (run: TeamRun, sessionId: string, promptId?: number) => prom
     ["pending", "reviewing", "approved", "answering"].includes(decision.status)) || promptId !== undefined &&
   (run.permissionRecovery?.requests ?? []).some(request => request.targetSessionId === sessionId && request.promptId === promptId && livePermissionRecoveryStatuses.has(request.status));
 /** A member dialog that the permission agent decides: a hashed permission dialog, or a collapsed command dialog. */
-const agentPermissionPrompt = (prompt: Prompt) => Boolean(prompt.hash) && (prompt.kind === "permission" || isCollapsedPermissionPrompt(prompt));
+const agentPermissionPrompt = (prompt: Prompt) => !accountSettingPrompt(prompt) && Boolean(prompt.hash) && (prompt.kind === "permission" || isCollapsedPermissionPrompt(prompt));
 /** Whether the coordinator review path still has live work in this run. The permission agent waits for it to settle. */
 const coordinatorReviewLive = (run: TeamRun) =>
   run.members.some(member => member.revision === run.revision && member.role === "permission-coordinator" && activeMember(member)) ||

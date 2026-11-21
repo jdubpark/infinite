@@ -30,6 +30,42 @@ test("claude permission dialog inside a box", () => {
   assert.equal(p.multiSelect, false);
 });
 
+test("Claude Code Mode confirmation is an owner-reserved prompt", () => {
+  const captured = screen("claude-code-mode");
+  const prompt = detectPrompt(captured, "claude");
+  assert.ok(prompt);
+  assert.equal(prompt.kind, "permission");
+  assert.equal(prompt.title, "Code Mode (experimental)");
+  assert.match(prompt.detail ?? "", /In Code Mode, Claude works by writing and running JavaScript/);
+  assert.deepEqual(prompt.options, [
+    { index: 0, label: "No, start without it", role: "reject" },
+    { index: 1, label: "Yes, turn on Code Mode", role: "accept" },
+  ]);
+  assert.equal(prompt.highlighted, 0);
+  assert.equal(prompt.acceptsText, false);
+  assert.equal(prompt.multiSelect, false);
+  assert.equal(prompt.pinned, true);
+
+  const yesSelected = captured.map(line => line.replace("❯ No, start without it", "No, start without it")
+    .replace("Yes, turn on Code Mode", "❯ Yes, turn on Code Mode"));
+  assert.equal(detectPrompt(yesSelected, "claude")?.highlighted, 1);
+  assert.equal(detectPrompt(["Claude Code is ready."], "claude"), null);
+  assert.equal(detectPrompt(["The transcript mentions Code Mode (experimental)."], "claude"), null);
+  assert.equal(detectPrompt(["Code Mode (experimental)", "No, start without it", "Yes, turn on Code Mode"], "claude"), null);
+
+  const wrapped = captured.flatMap(line => line.trim() === "❯ No, start without it" ? ["      ❯ No, start without", "        it"]
+    : line.trim() === "Yes, turn on Code Mode" ? ["      Yes, turn on", "        Code Mode"] : [line]);
+  const wrappedPrompt = detectPrompt(wrapped, "claude");
+  assert.deepEqual(wrappedPrompt?.options.map(option => option.label), ["No, start without it", "Yes, turn on Code Mode"]);
+
+  const trust = detectPrompt(screen("claude-trust"), "claude");
+  assert.ok(trust);
+  assert.match(trust.title, /^Quick safety check: Is this a project you created or one you trust\?/);
+  assert.equal(trust.kind, "permission");
+  assert.equal(trust.options[0].label, "No, exit");
+  assert.equal(trust.pinned, true);
+});
+
 test("transcript lines above a boxed dialog are not part of its header", () => {
   const lines = ["⏺ I'll remove the stale build directory first.", "  Then rebuild from scratch.", ...screen("claude-permission")];
   const p = detectPrompt(lines, "claude");

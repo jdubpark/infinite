@@ -1,5 +1,6 @@
 import type { PromptKind, PromptOption, Provider } from "./types.js";
 import { roleForLabel } from "./roles.js";
+import { accountSettingPrompt } from "./delegation.js";
 
 export interface DetectedPrompt {
   kind: PromptKind;
@@ -31,6 +32,7 @@ const QUESTION_OPTION = /^(chat about this|other|skip|type something)/i;
 const MULTI = /a to select all|n to select none/i;
 const YES_NO = /(\[(y\/N|Y\/n|y\/n)\]|\((y\/n|yes\/no)\))\s*:?\s*$/i;
 const KEY_HINT = /^(Enter to|Esc to|Press )/i;
+const CODE_MODE_FEEDBACK = "tellushowitgoeswithfeedback";
 
 /** The non-empty lines of `text`, each with its whitespace runs collapsed to one space. */
 export function normalisedLines(text?: string): string[] {
@@ -64,11 +66,10 @@ export function detectPrompt(lines: string[], provider: Provider): DetectedPromp
     const detailLines = above.filter((_, i) => i !== titleIndex && above[i] !== title);
     // A cut must be visible: delegation treats "… [+N chars]" as incomplete evidence, so a dialog
     // whose command runs past the cap can never qualify as a complete one-shot request.
-    const joined = detailLines.join("\n");
-    const detail = !detailLines.length ? undefined : joined.length > DETAIL_LIMIT ? `${joined.slice(0, DETAIL_LIMIT)}… [+${joined.length - DETAIL_LIMIT} chars]` : joined;
+    const detail = boundedDetail(detailLines);
     const footer = clean.slice(end + 1, end + 3).join(" ");
     const multiSelect = MULTI.test(footer);
-    const pinned = clean.slice(end + 1).every((l) => l === "" || RULE.test(l) || KEY_HINT.test(l));
+    const pinned = pinnedAfter(clean, end);
     let kind: PromptKind = "menu";
     if (PERMISSION.test(title)) kind = "permission";
     else if (options.some((o) => QUESTION_OPTION.test(o.label))) kind = "question";
@@ -82,6 +83,8 @@ export function detectPrompt(lines: string[], provider: Provider): DetectedPromp
   }
   const trust = detectWorkspaceTrust(clean);
   if (trust) return trust;
+  const codeMode = detectCodeModeConfirmation(clean);
+  if (codeMode) return codeMode;
   const lastIndex = findLastIndex(clean, (l) => l !== "");
   if (lastIndex >= 0 && YES_NO.test(clean[lastIndex])) {
     const title = clean[lastIndex];
@@ -138,7 +141,69 @@ function lastOptionBlock(clean: string[], raw: string[]) {
   return best;
 }
 
-const compact = (line: string) => line.replace(/[^a-z0-9]/gi, "").toLowerCase();
+function compact(line: string): string {
+  return line.replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+function boundedDetail(lines: string[]): string | undefined {
+  if (!lines.length) return undefined;
+  const joined = lines.join("\n");
+  return joined.length > DETAIL_LIMIT ? `${joined.slice(0, DETAIL_LIMIT)}… [+${joined.length - DETAIL_LIMIT} chars]` : joined;
+}
+
+function pinnedAfter(clean: string[], end: number, extraChrome?: (line: string) => boolean): boolean {
+  return clean.slice(end + 1).every(line => line === "" || RULE.test(line) || KEY_HINT.test(line) || extraChrome?.(line) === true);
+}
+
+function compactedOption(clean: string[], from: number, expected: string) {
+  for (let start = from; start < clean.length; start++) {
+    let accumulated = "";
+    for (let end = start; end < Math.min(clean.length, start + 4); end++) {
+      const text = clean[end].replace(/^[❯›>]\s*/, "").trim();
+      const part = compact(text);
+      if (!part || !expected.startsWith(accumulated + part)) break;
+      accumulated += part;
+      if (accumulated === expected) {
+        const line = clean[start];
+        return { start, end, highlighted: line.includes("❯") || line.includes("›") || line.trimStart().startsWith(">") };
+      }
+    }
+  }
+  return undefined;
+}
+
+/** Claude's first-run Code Mode setting is an unnumbered, owner-reserved two-option menu. */
+function detectCodeModeConfirmation(clean: string[]): DetectedPrompt | null {
+  const titleIndex = clean.findIndex(line => accountSettingPrompt({ title: line }));
+  if (titleIndex < 0) return null;
+  const no = compactedOption(clean, titleIndex + 1, "nostartwithoutit");
+  const yes = compactedOption(clean, titleIndex + 1, "yesturnoncodemode");
+  if (!no || !yes || no.start === yes.start || no.highlighted === yes.highlighted) return null;
+  const firstOption = Math.min(no.start, yes.start);
+  const options = [
+    { index: 0, label: "No, start without it", role: "reject" as const },
+    { index: 1, label: "Yes, turn on Code Mode", role: "accept" as const },
+  ].sort((left, right) => (left.role === "reject" ? no.start : yes.start) - (right.role === "reject" ? no.start : yes.start));
+  options.forEach((option, index) => { option.index = index; });
+  const marked = no.highlighted ? options.find(option => option.role === "reject")!.index
+    : yes.highlighted ? options.find(option => option.role === "accept")!.index : undefined;
+  const end = Math.max(no.end, yes.end);
+  const detailLines = clean.slice(titleIndex + 1, firstOption).filter(line => line !== "" && !RULE.test(line));
+  const detail = boundedDetail(detailLines);
+  return {
+    kind: "permission",
+    title: clean[titleIndex],
+    detail,
+    options,
+    highlighted: marked,
+    acceptsText: false,
+    multiSelect: false,
+    pinned: pinnedAfter(clean, end, line => compact(line) === CODE_MODE_FEEDBACK),
+    fingerprint: [clean[titleIndex], ...normalisedLines(detail), ...options.map(option => option.label)].join("\n"),
+    blockStart: firstOption,
+    blockEnd: end,
+  };
+}
 
 /** Claude's first-run folder question is an unnumbered two-option menu, not `1. Yes`. */
 function detectWorkspaceTrust(clean: string[]): DetectedPrompt | null {
@@ -177,7 +242,7 @@ function detectWorkspaceTrust(clean: string[]): DetectedPrompt | null {
     highlighted: marked,
     acceptsText: false,
     multiSelect: false,
-    pinned: clean.slice(end + 1).every((line) => line === "" || RULE.test(line) || KEY_HINT.test(line)),
+    pinned: pinnedAfter(clean, end),
     fingerprint: [title, ...normalisedLines(detail), ...options.map((option) => option.label)].join("\n"),
     blockStart: start,
     blockEnd: end,

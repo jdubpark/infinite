@@ -16,6 +16,8 @@ export function schemaType(schema: unknown): string {
     const members = schema[key];
     if (Array.isArray(members) && members.length > 0) return members.map(schemaType).join("|");
   }
+  // zod writes a nullable field and a union of primitives as a type list: the type is the union of its members.
+  if (Array.isArray(schema.type)) return schema.type.map(type => schemaType({ ...schema, type })).join("|");
   switch (schema.type) {
     case "string": return "string";
     case "integer":
@@ -41,7 +43,8 @@ export function schemaType(schema: unknown): string {
 
 /**
  * One signature sentence for a tool, in the form a program calls it: `args` is the argument list text, such as
- * `{ report }`, and the result's `structuredContent` type comes from the tool's declared output schema.
+ * `{ report }`, and the result's `structuredContent` type comes from the tool's declared output schema. The type is
+ * the result of a successful call; the caller says what a failed call returns.
  */
 export function toolSignature(server: string, tool: string, args: string, outputSchema: unknown): string {
   return `await tools.mcp__${server}__${tool}(${args}) returns { structuredContent: ${schemaType(outputSchema)} }.`;

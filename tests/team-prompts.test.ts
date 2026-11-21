@@ -3,15 +3,20 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
+import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { ENTRY_PARAGRAPH_LIMIT_BYTES, codexMemberToolInstructions, codexSandboxInstructions, contextAccessInstructions, entryCommand, entryInstructions, ownerDirectionLines, refreshReportingInstructions, reportCommand, reportingInstructions, retargetPrompt, teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
 import { hostEntry } from "../packages/host/src/evidence/host-entries.js";
 import { buildCapsule } from "../packages/host/src/eval-rules.js";
+import { buildLaunch } from "../packages/host/src/launch.js";
 import { outputSchemas } from "../packages/host/src/team-mcp-results.js";
 import { schemaType, toolSignature } from "../packages/host/src/tool-signature.js";
 import { recordedTeamReportSchema, teamReportSchema, type TeamBrief, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask } from "../packages/host/src/team-types.js";
 import type { TeamRunRouting, TeamRunRoutingAuto } from "../packages/host/src/routing-types.js";
 import { ENTRY_PROFILE, ENTRY_PROVIDERS, smallRun } from "./fixtures/team-prompt-run.js";
+
+// The host pins zod 4 (packages/host/package.json); the root install is zod 3, which lacks toJSONSchema.
+const { z } = createRequire(new URL("../packages/host/package.json", import.meta.url))("zod") as typeof import("zod");
 
 const PROMPT_LIMIT_BYTES = 80 * 1024;
 
@@ -412,6 +417,8 @@ test("Codex tool guidance follows provider, role, and available entry tools", ()
   }
 });
 
+const TOOL_FAILURE = " Each type is the result of a successful call. When a tool reports a failure the call does not throw: its result has isError true and the reason in content[0].text, and no structuredContent. Check isError before you read structuredContent, and print the reason.";
+
 test("Codex tool signatures name the callable form and carry the declared result shape", () => {
   const tools = [
     { name: "report", schema: outputSchemas.report },
@@ -421,15 +428,17 @@ test("Codex tool signatures name the callable form and carry the declared result
   ] as const;
   const paragraph = codexMemberToolInstructions(true);
   // The types come from the schemas, so a schema change grows every Codex member prompt: these bounds make that a decision.
-  assert.ok(Buffer.byteLength(paragraph, "utf8") < 2400, "the rule with the entry tools stays under 2,400 bytes");
-  assert.ok(Buffer.byteLength(codexMemberToolInstructions(false), "utf8") < 800, "the rule with the report tool alone stays under 800 bytes");
+  assert.ok(Buffer.byteLength(paragraph, "utf8") < 2700, "the rule with the entry tools stays under 2,700 bytes");
+  assert.ok(Buffer.byteLength(codexMemberToolInstructions(false), "utf8") < 1100, "the rule with the report tool alone stays under 1,100 bytes");
   assert.ok(paragraph.startsWith("Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results."));
   assert.doesNotMatch(paragraph, /session record keeps each nested call/);
   assert.doesNotMatch(paragraph, /\n/);
   assert.match(paragraph, /When a program lists or reads items, print how many it listed, read, and matched/);
   assert.match(paragraph, /Read the context file with a shell call inside a program, and select only the fields needed for your next decision\./);
   assert.match(paragraph, /Tool signatures inside exec \(generated from the tools' declared schemas, no lookup needed\): await tools\.mcp__infinite_team__report\(/);
-  const sentences = paragraph.split("await tools.").slice(1).map(sentence => `await tools.${sentence}`.trim());
+  // The types are successful results, so the rule also says what a failed call returns.
+  assert.ok(paragraph.endsWith(TOOL_FAILURE), "the rule ends with what a failed call returns");
+  const sentences = paragraph.slice(0, -TOOL_FAILURE.length).split("await tools.").slice(1).map(sentence => `await tools.${sentence}`.trim());
   assert.deepEqual(sentences.map(sentence => /^await tools\.mcp__infinite_team__(\w+)\(/.exec(sentence)?.[1]), tools.map(tool => tool.name));
   for (const [index, { name, schema }] of tools.entries()) {
     const sentence = sentences[index]!;
@@ -443,7 +452,7 @@ test("Codex tool signatures list only the tools a member can call", () => {
   const count = (text: string) => text.split("await tools.mcp__infinite_team__").length - 1;
   const reportOnly = codexMemberToolInstructions(false);
   assert.equal(count(reportOnly), 1);
-  assert.ok(reportOnly.endsWith("await tools.mcp__infinite_team__report({ report }) returns { structuredContent: { requestId: string, runId: string, memberId: string, revision: number, message: string } }."));
+  assert.ok(reportOnly.endsWith(`await tools.mcp__infinite_team__report({ report }) returns { structuredContent: { requestId: string, runId: string, memberId: string, revision: number, message: string } }.${TOOL_FAILURE}`));
   assert.equal(count(codexMemberToolInstructions(true)), 4);
 });
 
@@ -472,8 +481,37 @@ test("tool signature types render each schema form from the declared schema", ()
   assert.equal(schemaType({ type: "object" }), "unknown");
   assert.equal(schemaType({ type: "array", items: { anyOf: [{ type: "string" }, { type: "number" }] } }), "(string|number)[]");
   assert.equal(schemaType({ anyOf: [{ type: "string" }, { type: "null" }] }), "string|null");
+  assert.equal(schemaType({ type: ["string", "null"] }), "string|null");
   assert.equal(toolSignature("demo_server", "echo", "{ text }", { type: "object", properties: { text: { type: "string" } }, required: ["text"] }),
     "await tools.mcp__demo_server__echo({ text }) returns { structuredContent: { text: string } }.");
+});
+
+test("tool signature types follow the schemas the host's zod writes", () => {
+  // The expected text is written from the zod definition, not from the renderer.
+  const result = z.object({
+    id: z.string().uuid(),
+    note: z.string().nullable(),
+    count: z.number().int().nonnegative(),
+    kind: z.enum(["a", "b"]).optional(),
+    fixed: z.literal("pending"),
+    either: z.union([z.string(), z.number()]),
+    rows: z.array(z.object({ name: z.string(), done: z.boolean() }).strict()),
+    tags: z.array(z.enum(["x", "y"])),
+    scores: z.record(z.string(), z.number()),
+    anything: z.unknown(),
+    when: z.string().nullable().optional(),
+  }).strict();
+  assert.equal(schemaType(z.toJSONSchema(result, { target: "draft-7", io: "output" })),
+    '{ id: string, note: string|null, count: number, kind?: "a"|"b", fixed: "pending", either: string|number, rows: Array<{ name: string, done: boolean }>, tags: ("x"|"y")[], scores: unknown, anything: unknown, when?: string|null }');
+});
+
+test("Codex tool signatures name the server the Codex launch configures", () => {
+  const launch = buildLaunch("codex", { command: "codex", args: [] }, "task", { url: "http://127.0.0.1:1", token: "t" }, "/repo/hook-relay.js", { claude: true, codex: true }, true, undefined, undefined, undefined, true);
+  const servers = new Set(launch.args.flatMap(arg => /^mcp_servers\.([A-Za-z0-9_]+)\./.exec(arg)?.[1] ?? []));
+  assert.equal(servers.size, 1, "a Codex member launch configures one MCP server");
+  const [server] = servers;
+  const called = [...codexMemberToolInstructions(true).matchAll(/await tools\.mcp__(.+?)__(?:report|entry_list|entry_get|entry_post)\(/g)].map(match => match[1]);
+  assert.deepEqual(called, [server, server, server, server]);
 });
 
 test("Codex argument signatures match registered MCP input schemas", { timeout: 20000 }, async () => {
@@ -529,6 +567,13 @@ test("Codex argument signatures match registered MCP input schemas", { timeout: 
         .map(argument => ({ name: argument.replace(/\?$/, ""), optional: argument.endsWith("?") })).sort((a, b) => a.name.localeCompare(b.name));
       assert.deepEqual(args, actual, `${name} handwritten arguments match tools/list`);
     }
+    // What the rule says of a failed call is what this server answers: an error result with text and no structuredContent.
+    const failed = asRecord(asRecord(await rpc("tools/call", { name: "entry_get", arguments: {} })).result);
+    assert.equal(failed.isError, true);
+    assert.equal("structuredContent" in failed, false);
+    assert.ok(Array.isArray(failed.content));
+    const [first] = failed.content as unknown[];
+    assert.equal(typeof asRecord(first).text, "string");
   } finally {
     const exited = child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : new Promise<void>(resolveExit => child.once("exit", () => resolveExit()));
     child.stdin!.end();
@@ -669,9 +714,10 @@ function pinnedContexts() {
   const run = goalRun();
   return PIN_ROLES.map(role => JSON.stringify(teamContext(run, "Owner feedback excerpt.", { checks: PIN_CHECKS }, role), null, 2));
 }
-// INF-383 moved this pin to a5496297: the Codex working rule's signature sentences now name the callable form and the
-// nested result type, generated from the declared schemas. No other prompt or context byte changed.
-const PIN_PROMPTS_SHA256 = "a5496297d275be9aaa90fc01a5792e93a200366fe3ae40b98419915fa36eadaf";
+// INF-383 moved this pin to 36869333: the Codex working rule's signature sentences now name the callable form and the
+// nested result type, generated from the declared schemas, and the rule says what a failed call returns. No other
+// prompt or context byte changed.
+const PIN_PROMPTS_SHA256 = "3686933351c62af2577448bf68a95620e0d78e732ea5b103cb2b257164631ef8";
 const PIN_CONTEXTS_SHA256 = "9ee8fe8ac898e2d70ddbb012ba398387d526294ea61739fb7aad4385b7a7412b";
 
 test("the switch off keeps every prompt and context byte", () => {

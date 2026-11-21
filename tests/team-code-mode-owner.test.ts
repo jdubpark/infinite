@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { detectPrompt, type Prompt } from "@infinite/attention";
@@ -15,15 +16,22 @@ function codeModePrompt(): Prompt {
   return { ...detected, id: 2, source: "screen", hash: "d".repeat(64) };
 }
 
-test("a delegated team member's Code Mode prompt waits for the owner", () => {
+test("a delegated team member's Code Mode prompt stays with the owner despite a live decision", () => {
   const f = schedulerFixture();
   try {
     const member = f.run.members[0];
+    const prompt = codeModePrompt();
     f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of accepted checks.", maxDecisions: 2 };
     f.run.lineup = { ...limitLineup, coordinator: { ...limitLineup.coordinator, provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" } };
+    f.run.permissionDecisions = [{
+      id: randomUUID(), revision: 1, policyHash: "a".repeat(64), targetMemberId: member.memberId,
+      targetSessionId: member.sessionId, targetCwd: member.cwd, promptId: prompt.id, promptHash: prompt.hash!,
+      evidenceHash: "b".repeat(64), prompt, option: 1, expiresAt: new Date(Date.now() + 5 * 60000).toISOString(),
+      answerRequestId: randomUUID(), status: "reviewing",
+    }];
     f.writeTeam();
     const teams = f.openTeam();
-    assert.equal(teams.promptOwner(member.sessionId, codeModePrompt()), "user");
+    assert.equal(teams.promptOwner(member.sessionId, prompt), "user");
   } finally {
     f.close();
   }

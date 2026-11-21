@@ -71,6 +71,17 @@ test("one-shot review fails closed without complete and bounded evidence", () =>
   assert.equal(oneShotPermissionOption(persistentYes), undefined);
 });
 
+test("hook evidence cannot delegate the Code Mode account setting", () => {
+  const hookPrompt: Prompt = {
+    ...dialog,
+    title: "Code Mode (experimental)",
+    source: "hook",
+    tool: { name: "Bash", input: { command: "npm run check" }, inputComplete: true },
+  };
+  assert.equal(oneShotPermissionOption(hookPrompt), undefined);
+  assert.equal(oneShotPermissionOption({ ...hookPrompt, title: "Would you like to run this command?" }), 0);
+});
+
 // The Codex 0.163 command dialog as the host's terminal rendered it on a live run: the bottom of
 // the screen, under the transcript, with its key hint on the last row.
 const codexDialog = [

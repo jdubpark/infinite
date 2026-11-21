@@ -66,6 +66,73 @@ test("Claude Code Mode confirmation is an owner-reserved prompt", () => {
   assert.equal(trust.pinned, true);
 });
 
+const staleCodeModeMenu = (highlighted: "no" | "yes") => [
+  "Code Mode (experimental)",
+  `${highlighted === "no" ? "❯ " : "  "}No, start without it`,
+  `${highlighted === "yes" ? "❯ " : "  "}Yes, turn on Code Mode`,
+];
+
+test("Code Mode selects the final dialog when an older No menu remains above it", () => {
+  const live = screen("claude-code-mode").map(line => line.replace("❯ No, start without it", "No, start without it")
+    .replace("Yes, turn on Code Mode", "❯ Yes, turn on Code Mode"));
+  const lines = [...staleCodeModeMenu("no"), "", ...live];
+  const prompt = detectPrompt(lines, "claude");
+  assert.equal(prompt?.title, "Code Mode (experimental)");
+  assert.equal(prompt?.highlighted, 1);
+  assert.equal(prompt?.pinned, true);
+  assert.ok(prompt && prompt.blockStart >= staleCodeModeMenu("no").length + 1);
+});
+
+test("Code Mode selects the final dialog when an older Yes menu remains above it", () => {
+  const lines = [...staleCodeModeMenu("yes"), "", ...screen("claude-code-mode")];
+  const prompt = detectPrompt(lines, "claude");
+  assert.equal(prompt?.title, "Code Mode (experimental)");
+  assert.equal(prompt?.highlighted, 0);
+  assert.equal(prompt?.pinned, true);
+  assert.ok(prompt && prompt.blockStart >= staleCodeModeMenu("yes").length + 1);
+});
+
+test("an old Code Mode menu above a yes-no prompt leaves the yes-no prompt open", () => {
+  const prompt = detectPrompt([...staleCodeModeMenu("no"), "Continue? [y/N]"], "claude");
+  assert.equal(prompt?.kind, "yes-no");
+  assert.equal(prompt?.title, "Continue? [y/N]");
+});
+
+test("an old Code Mode menu followed by transcript text is not an open prompt", () => {
+  assert.equal(detectPrompt([...staleCodeModeMenu("no"), "Task continued in the transcript."], "claude"), null);
+});
+
+test("Code Mode option fragments cannot combine across unrelated screen text", () => {
+  assert.equal(detectPrompt([
+    "Code Mode (experimental)",
+    "❯ Yes, turn on Code Mode",
+    "The transcript continues here.",
+    "No, start without it",
+  ], "claude"), null);
+});
+
+test("Code Mode takes precedence over an older numbered permission menu", () => {
+  const lines = [...screen("claude-permission"), "", ...screen("claude-code-mode")];
+  const prompt = detectPrompt(lines, "claude");
+  assert.equal(prompt?.title, "Code Mode (experimental)");
+  assert.ok(prompt && prompt.blockStart >= screen("claude-permission").length + 1);
+});
+
+test("Code Mode takes precedence over an older folder-trust menu", () => {
+  const lines = [...screen("claude-trust"), "", ...screen("claude-code-mode")];
+  const prompt = detectPrompt(lines, "claude");
+  assert.equal(prompt?.title, "Code Mode (experimental)");
+  assert.ok(prompt && prompt.blockStart >= screen("claude-trust").length + 1);
+});
+
+test("Code Mode accepts a footer hint wrapped across two screen lines", () => {
+  const lines = screen("claude-code-mode").flatMap(line => line.trim() === "Enter to confirm · Esc to start without it"
+    ? ["  Enter to confirm · Esc to start", "    without it"] : [line]);
+  const prompt = detectPrompt(lines, "claude");
+  assert.equal(prompt?.title, "Code Mode (experimental)");
+  assert.equal(prompt?.pinned, true);
+});
+
 test("transcript lines above a boxed dialog are not part of its header", () => {
   const lines = ["⏺ I'll remove the stale build directory first.", "  Then rebuild from scratch.", ...screen("claude-permission")];
   const p = detectPrompt(lines, "claude");

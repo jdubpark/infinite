@@ -46,6 +46,9 @@ export function cleanLine(line: string): string {
 
 export function detectPrompt(lines: string[], provider: Provider): DetectedPrompt | null {
   const clean = lines.map(cleanLine);
+  // This detector only claims a dialog that ends the screen, so an older menu above it is not read as open.
+  const codeMode = detectCodeModeConfirmation(clean);
+  if (codeMode) return codeMode;
   const block = lastOptionBlock(clean, lines);
   if (block) {
     const { start, end, options, highlighted } = block;
@@ -83,8 +86,6 @@ export function detectPrompt(lines: string[], provider: Provider): DetectedPromp
   }
   const trust = detectWorkspaceTrust(clean);
   if (trust) return trust;
-  const codeMode = detectCodeModeConfirmation(clean);
-  if (codeMode) return codeMode;
   const lastIndex = findLastIndex(clean, (l) => l !== "");
   if (lastIndex >= 0 && YES_NO.test(clean[lastIndex])) {
     const title = clean[lastIndex];
@@ -155,18 +156,15 @@ function pinnedAfter(clean: string[], end: number, extraChrome?: (line: string) 
   return clean.slice(end + 1).every(line => line === "" || RULE.test(line) || KEY_HINT.test(line) || extraChrome?.(line) === true);
 }
 
-function compactedOption(clean: string[], from: number, expected: string) {
-  for (let start = from; start < clean.length; start++) {
-    let accumulated = "";
-    for (let end = start; end < Math.min(clean.length, start + 4); end++) {
-      const text = clean[end].replace(/^[❯›>]\s*/, "").trim();
-      const part = compact(text);
-      if (!part || !expected.startsWith(accumulated + part)) break;
-      accumulated += part;
-      if (accumulated === expected) {
-        const line = clean[start];
-        return { start, end, highlighted: line.includes("❯") || line.includes("›") || line.trimStart().startsWith(">") };
-      }
+function compactedOptionAt(clean: string[], start: number, expected: string) {
+  let accumulated = "";
+  for (let end = start; end < Math.min(clean.length, start + 4); end++) {
+    const part = compact(clean[end].replace(/^[❯›>]\s*/, "").trim());
+    if (!part || !expected.startsWith(accumulated + part)) return undefined;
+    accumulated += part;
+    if (accumulated === expected) {
+      const line = clean[start];
+      return { start, end, highlighted: line.includes("❯") || line.includes("›") || line.trimStart().startsWith(">") };
     }
   }
   return undefined;
@@ -174,21 +172,40 @@ function compactedOption(clean: string[], from: number, expected: string) {
 
 /** Claude's first-run Code Mode setting is an unnumbered, owner-reserved two-option menu. */
 function detectCodeModeConfirmation(clean: string[]): DetectedPrompt | null {
-  const titleIndex = clean.findIndex(line => accountSettingPrompt({ title: line }));
+  const titleIndex = findLastIndex(clean, line => accountSettingPrompt({ title: line }));
   if (titleIndex < 0) return null;
-  const no = compactedOption(clean, titleIndex + 1, "nostartwithoutit");
-  const yes = compactedOption(clean, titleIndex + 1, "yesturnoncodemode");
-  if (!no || !yes || no.start === yes.start || no.highlighted === yes.highlighted) return null;
-  const firstOption = Math.min(no.start, yes.start);
-  const options = [
-    { index: 0, label: "No, start without it", role: "reject" as const },
-    { index: 1, label: "Yes, turn on Code Mode", role: "accept" as const },
-  ].sort((left, right) => (left.role === "reject" ? no.start : yes.start) - (right.role === "reject" ? no.start : yes.start));
-  options.forEach((option, index) => { option.index = index; });
-  const marked = no.highlighted ? options.find(option => option.role === "reject")!.index
-    : yes.highlighted ? options.find(option => option.role === "accept")!.index : undefined;
-  const end = Math.max(no.end, yes.end);
-  const detailLines = clean.slice(titleIndex + 1, firstOption).filter(line => line !== "" && !RULE.test(line));
+  let firstOption: ReturnType<typeof compactedOptionAt>;
+  let secondOption: ReturnType<typeof compactedOptionAt>;
+  let firstRole: "reject" | "accept" | undefined;
+  for (let start = titleIndex + 1; start < clean.length; start++) {
+    const noFirst = compactedOptionAt(clean, start, "nostartwithoutit");
+    const yesFirst = noFirst ? undefined : compactedOptionAt(clean, start, "yesturnoncodemode");
+    const first = noFirst ?? yesFirst;
+    if (!first) continue;
+    const otherRole = noFirst ? "accept" : "reject";
+    const second = compactedOptionAt(clean, first.end + 1, otherRole === "accept" ? "yesturnoncodemode" : "nostartwithoutit");
+    if (!second) continue;
+    const tail = clean.slice(second.end + 1).filter(line => line !== "" && !RULE.test(line)).map(compact).join("");
+    const footerChrome = /^(tellushowitgoeswithfeedback)?(entertoconfirmesctostartwithoutit)?$/.test(tail);
+    if (!footerChrome && !pinnedAfter(clean, second.end, line => compact(line) === CODE_MODE_FEEDBACK)) continue;
+    firstOption = first;
+    secondOption = second;
+    firstRole = noFirst ? "reject" : "accept";
+    break;
+  }
+  if (!firstOption || !secondOption || firstOption.highlighted === secondOption.highlighted) return null;
+  const end = secondOption.end;
+  const options = firstRole === "reject"
+    ? [
+        { index: 0, label: "No, start without it", role: "reject" as const },
+        { index: 1, label: "Yes, turn on Code Mode", role: "accept" as const },
+      ]
+    : [
+        { index: 0, label: "Yes, turn on Code Mode", role: "accept" as const },
+        { index: 1, label: "No, start without it", role: "reject" as const },
+      ];
+  const marked = firstOption.highlighted ? 0 : 1;
+  const detailLines = clean.slice(titleIndex + 1, firstOption.start).filter(line => line !== "" && !RULE.test(line));
   const detail = boundedDetail(detailLines);
   return {
     kind: "permission",
@@ -198,9 +215,9 @@ function detectCodeModeConfirmation(clean: string[]): DetectedPrompt | null {
     highlighted: marked,
     acceptsText: false,
     multiSelect: false,
-    pinned: pinnedAfter(clean, end, line => compact(line) === CODE_MODE_FEEDBACK),
+    pinned: true,
     fingerprint: [clean[titleIndex], ...normalisedLines(detail), ...options.map(option => option.label)].join("\n"),
-    blockStart: firstOption,
+    blockStart: firstOption.start,
     blockEnd: end,
   };
 }

@@ -386,6 +386,30 @@ test("the adapter's evidence collection reaches the review, and no collection ex
   assert.equal(f.core.reviews[1].context.collect, undefined);
 }));
 
+test("a verdict reached after the review read source files is never replayed: an identical request is reviewed again", () => withFixture(async f => {
+  f.delegate();
+  const asked: string[][] = [];
+  const collect = async (paths: string[]) => { asked.push(paths); return { files: [], limitations: [], digest: "source-1" }; };
+  const build = () => request({ action: "node scripts/build.mjs" });
+  // The strong turn asks for the script before it allows: the verdict depends on what the file held then.
+  f.core.next = (_request, context) => { void context.collect?.(["scripts/build.mjs"]); return allow(); };
+  decided(await f.pipeline.decide(build(), { collect }), "allow");
+  assert.deepEqual(asked, [["scripts/build.mjs"]]);
+
+  // The file may have changed since. The identical request gets a review of its own, which can read it again.
+  f.core.next = () => allow();
+  const second = decided(await f.pipeline.decide(build(), { collect }), "allow");
+  assert.equal(f.journal.decision(second.decisionId)?.replayOf, undefined, "the earlier allow is not replayed");
+  assert.equal(f.core.reviews.length, 2);
+
+  // That review read no file, so its verdict replays as before, also across a restart.
+  const third = decided(await f.pipeline.decide(build(), { collect }), "allow");
+  assert.equal(f.journal.decision(third.decisionId)?.replayOf, second.decisionId);
+  f.restart();
+  decided(await f.pipeline.decide(build(), { collect }), "allow");
+  assert.equal(f.core.reviews.length, 2);
+}));
+
 test("a request that did not qualify is never allowed, and one with no one-shot reject is undeliverable", () => withFixture(async f => {
   f.delegate();
   f.core.next = () => allow();

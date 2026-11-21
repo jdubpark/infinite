@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { entryToolsFor } from "./entry-roles.js";
 import { registerText, scopeSentence } from "./register-prompt.js";
+import { outputSchemas } from "./team-mcp-results.js";
 import { TeamError } from "./team-workspace.js";
 import type { BlockerEvidence, TeamMember, TeamModelProfile, TeamProject, TeamRun, TeamScout, TeamTask, TeamPermissionRecoveryStep, TeamPermissionRecoveryView, TeamView } from "./team-types.js";
 import type { Provider } from "./types.js";
@@ -12,6 +13,23 @@ const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
 const profileSuffix = ". These are the host's configured model choices; they do not establish which backend actually served a turn. Do not switch models or change tool permissions.";
 export const profileInstructions = (modelProfile: TeamModelProfile) => `Requested runtime profile: ${JSON.stringify(modelProfile)}${profileSuffix}`;
 export const codexSandboxInstructions = "Codex sandbox guidance: The shell may restrict network access, local listeners, IPC sockets, and Git metadata writes. Prefer operations that work there. When a necessary development operation cannot run in the sandbox, request one-time execution of the complete command within your assigned role and pinned owner scope so the strong coordinator can review it. This includes repository inspection, scoped staging, test planning, builds, tests, and local browser checks when authorized; delivery still requires its separate pinned policy. Never request persistent approval or switch tools to bypass a denial. Report skipped checks and why; the host runs accepted checks after integration.";
+const resultFields = (tool: keyof typeof outputSchemas) => {
+  const schema = outputSchemas[tool];
+  const required = new Set(schema.required ?? []);
+  return Object.keys(schema.properties ?? {}).map(field => `${field}${required.has(field) ? "" : "?"}`).join(", ");
+};
+/** Codex member guidance for concise tool results, with signatures limited to the member's available tools. */
+export const codexMemberToolInstructions = (entryTools: boolean) => {
+  const signatures = [
+    `report({report}) -> {${resultFields("report")}}`,
+    ...(entryTools ? [
+      `entry_list({kinds?, taskId?, path?, since?, limit?}) -> {${resultFields("entry_list")}}`,
+      `entry_get({entryId}) -> {${resultFields("entry_get")}}`,
+      `entry_post({entry}) -> {${resultFields("entry_post")}}`,
+    ] : []),
+  ];
+  return `Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. The session record keeps each nested call and its result, with long results shortened there, so you do not need to print a result to keep it. When a program lists or reads items, print how many it listed, read, and matched. Read the context file inside a program and select only fields needed for your next decision. Tool signatures (arguments -> result fields): ${signatures.join("; ")}.`;
+};
 /** Every member and session reads it: a reject is final, and the same effect is never reached another way. */
 export const permissionRejectInstructions = "A rejected permission request is final for that request. Do not reach the same effect with another tool, command, or route.";
 /** What every asking agent reads about the recommendation its question must carry. */
@@ -312,6 +330,7 @@ const [commandHead, commandTail] = reportingInstructions("opencode", "\0").split
 const reportingPattern = () => new RegExp(`${escape(reportingInstructions("claude"))}|${escape(reportingInstructions("codex"))}|${escape(commandHead)}[^\\n]+?${escape(commandTail)}`, "g");
 const profilePattern = new RegExp(`Requested runtime profile: [^\\n]+?${escape(profileSuffix)}`);
 const codexSandboxPattern = () => new RegExp(`(?:^|\\n\\n)?${escape(codexSandboxInstructions)}(?=\\n\\n|$)`, "g");
+const codexMemberToolPattern = () => new RegExp(`(?:^|\\n\\n)?(?:${escape(codexMemberToolInstructions(false))}|${escape(codexMemberToolInstructions(true))})(?=\\n\\n|$)`, "g");
 /** Refreshes a carried prompt's report channel without changing prompts that have no known paragraph. */
 /** The entry paragraphs of every provider. The "other" form holds the helper's command, which may vary by install. */
 const entryPattern = () => {
@@ -323,14 +342,15 @@ export function refreshReportingInstructions(prompt: string, provider: Provider)
   return reportingPattern().test(withEntry) ? withEntry.replace(reportingPattern(), () => reportingInstructions(provider)) : withEntry;
 }
 function refreshCodexSandboxInstructions(prompt: string, provider: Provider) {
-  const withoutPreviousGuidance = prompt.replace(codexSandboxPattern(), "");
+  const withoutPreviousGuidance = prompt.replace(codexSandboxPattern(), "").replace(codexMemberToolPattern(), "");
   const permissionCoordinator = /^You are the team's permission-coordinator\./m.test(prompt);
   if (provider !== "codex" || permissionCoordinator) return withoutPreviousGuidance;
   const report = reportingInstructions(provider);
   const contextInstructions = contextAccessInstructions();
+  const guidance = `${codexSandboxInstructions}\n\n${codexMemberToolInstructions(entryPattern().test(withoutPreviousGuidance))}`;
   return withoutPreviousGuidance.includes(contextInstructions)
-    ? withoutPreviousGuidance.replace(contextInstructions, `${codexSandboxInstructions}\n\n${contextInstructions}`)
-    : withoutPreviousGuidance.replace(report, `${codexSandboxInstructions}\n\n${report}`);
+    ? withoutPreviousGuidance.replace(contextInstructions, `${guidance}\n\n${contextInstructions}`)
+    : withoutPreviousGuidance.replace(report, `${guidance}\n\n${report}`);
 }
 /**
  * Points a member's accumulated prompt, feedback and answers included, at another provider and
@@ -472,7 +492,7 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
       : role === "delivery"
       ? `The delivery policy is the only publication authority for this assignment. Delivery must use the existing provider tools and permissions. Do not approve or change provider permissions. ${permissionRejectInstructions} If a material scope decision is needed, report a blocker; do not expand scope. A delivery report claims a merge; a delivery-repair report asks the host to reintegrate and repeat checks and review, and does not claim a merge.`
       : `Do not publish, merge, deploy, change repository remotes, or approve provider permissions. ${permissionRejectInstructions} Report a blocking issue or request a user decision when needed. Questions must use {"kind":"question","question":"...","options":["..."],${recommendationExample}}; when feasible, offer concrete selectable options. Omit answerMode for freeform or legacy single-choice behavior; use answerMode "single" for mutually exclusive alternatives, answerMode "multiple" only for compatible choices the owner may select together, and answerMode "approval" only for a real authorization proposal. Approval questions require exactly two options, with the first meaning approve and the second meaning deny; two arbitrary options never imply approval. ${questionRecommendationInstructions} Never choose or approve for the owner. Blockers use {"kind":"blocked","summary":"..."} and may add "blocker":{"cause":{"status":"observed","detail":"..."},"issueRefs":[],"sourceRefs":[],"attemptedFixes":[{"fix":"...","outcome":"..."}],"proposedRecovery":"...","prevention":"...","validationEvidence":[{"sourceRef":"path or check","observation":"..."}]}; cause status is observed, hypothesis, or unknown. Add blocker only with source or check evidence; never include credentials. Independent teammates can continue while a decision is pending.`,
-    provider === "codex" && role !== "permission-coordinator" ? codexSandboxInstructions : "",
+    provider === "codex" && role !== "permission-coordinator" ? `${codexSandboxInstructions}\n\n${codexMemberToolInstructions(entryToolsFor(run, role))}` : "",
     [role === "permission-coordinator" ? "" : contextAccessInstructions(), entryToolsFor(run, role) ? entryInstructions(provider) : ""].filter(Boolean).join("\n\n"),
     reportingInstructions(provider),
   ];

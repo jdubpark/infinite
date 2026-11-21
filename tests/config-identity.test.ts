@@ -408,15 +408,22 @@ test("entry tools change the prompt version only for entry roles", () => {
   }
 });
 
-// Base pin: with the switch off, every role and provider keeps the prompt version it had at the base commit.
+// Moved from 1dfe7b9b8aff74f29c5570a3eca8b144da3f4b4e6c75af9b6681eadb766b9187 because INF-350 Codex member guidance changes Codex; Claude and OpenCode stay fixed.
 const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
 const PIN_PROVIDERS = ["claude", "codex", "opencode"] as const;
-// Moved from 2140e519 because questions now ask for a recommendation (INF-323).
-const PIN_VERSIONS_SHA256 = "1dfe7b9b8aff74f29c5570a3eca8b144da3f4b4e6c75af9b6681eadb766b9187";
+const PIN_VERSIONS_SHA256 = "a2505cbe95a81319dba36ed081b0fe9084af9ca34bee07bb66d9f3104dbab3e0";
+const PIN_CODEX_VERSIONS_SHA256 = "d2a2f92a481e696db983599f9e04cc8345921a4bda3060d078776041264991f0";
+const BASE_CODEX_VERSIONS_SHA256 = "fc50ece0f8f9dc245491da070464166ff4d0f952a5e239008419d2e72964ad52";
+const PIN_NON_CODEX_VERSIONS_SHA256 = "8075cde0d93bc9b0a46c3fe1a54dc40171fb23e033784dc1a935c07b3f438ec4";
 
 test("the switch off keeps every prompt version", () => {
   const versions = PIN_ROLES.flatMap(role => PIN_PROVIDERS.map(provider => promptVersion(role, provider, undefined, true)));
   assert.equal(createHash("sha256").update(JSON.stringify(versions)).digest("hex"), PIN_VERSIONS_SHA256);
+  const codex = PIN_ROLES.map(role => promptVersion(role, "codex", undefined, true));
+  const nonCodex = PIN_ROLES.flatMap(role => (["claude", "opencode"] as const).map(provider => promptVersion(role, provider, undefined, true)));
+  assert.equal(createHash("sha256").update(JSON.stringify(codex)).digest("hex"), PIN_CODEX_VERSIONS_SHA256);
+  assert.notEqual(PIN_CODEX_VERSIONS_SHA256, BASE_CODEX_VERSIONS_SHA256, "Codex receives the new member-tool guidance");
+  assert.equal(createHash("sha256").update(JSON.stringify(nonCodex)).digest("hex"), PIN_NON_CODEX_VERSIONS_SHA256, "Claude and OpenCode versions stay unchanged");
   for (const role of PIN_ROLES) for (const provider of PIN_PROVIDERS) {
     assert.equal(promptVersion(role, provider, undefined, true, false, false), promptVersion(role, provider, undefined, true));
   }

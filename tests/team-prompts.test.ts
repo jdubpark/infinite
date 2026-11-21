@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { ENTRY_PARAGRAPH_LIMIT_BYTES, entryCommand, entryInstructions, ownerDirectionLines, refreshReportingInstructions, reportCommand, retargetPrompt, teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
+import { ENTRY_PARAGRAPH_LIMIT_BYTES, codexMemberToolInstructions, codexSandboxInstructions, entryCommand, entryInstructions, ownerDirectionLines, refreshReportingInstructions, reportCommand, retargetPrompt, teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
 import { hostEntry } from "../packages/host/src/evidence/host-entries.js";
 import { buildCapsule } from "../packages/host/src/eval-rules.js";
+import { outputSchemas } from "../packages/host/src/team-mcp-results.js";
 import { recordedTeamReportSchema, teamReportSchema, type TeamBrief, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask } from "../packages/host/src/team-types.js";
 import type { TeamRunRouting, TeamRunRoutingAuto } from "../packages/host/src/routing-types.js";
 
@@ -340,6 +341,13 @@ const ENTRY_ROLES_UNDER_TEST = ["project-manager", "scout", "implementer", "inte
 const ENTRY_PROVIDERS = ["claude", "codex", "opencode"] as const;
 const ENTRY_PROFILE: TeamModelProfile = { id: "fixture-profile", label: "Fixture profile", provider: "claude", model: "fixture-model", effort: "high" };
 const CONTEXT_ACCESS_END = "even when their complete inline text is present.";
+const MEMBER_ROLES_UNDER_TEST = ["permission-coordinator", ...ENTRY_ROLES_UNDER_TEST, "delivery"] as const;
+const entryToolRoles = new Set<string>(ENTRY_ROLES_UNDER_TEST);
+
+function declaredOutputFields(schema: { properties?: Record<string, unknown>; required?: string[] }) {
+  const required = new Set(schema.required ?? []);
+  return Object.keys(schema.properties ?? {}).map(field => `${field}${required.has(field) ? "" : "?"}`);
+}
 
 function smallRun(extra: Partial<TeamRun> = {}): TeamRun {
   return {
@@ -375,7 +383,11 @@ test("the entry paragraph is the only change and only with tools on", () => {
     for (const role of ENTRY_ROLES_UNDER_TEST) {
       const off = teamPrompt(smallRun(), role, undefined, undefined, provider, ENTRY_PROFILE);
       const on = teamPrompt(smallRun({ blackboard: { tools: true } }), role, undefined, undefined, provider, ENTRY_PROFILE);
-      assert.equal(on, off.replace(CONTEXT_ACCESS_END, `${CONTEXT_ACCESS_END}\n\n${paragraph}`), `${role} ${provider}`);
+      const withEntry = off.replace(CONTEXT_ACCESS_END, `${CONTEXT_ACCESS_END}\n\n${paragraph}`);
+      const expected = provider === "codex" && entryToolRoles.has(role)
+        ? withEntry.replace(codexMemberToolInstructions(false), codexMemberToolInstructions(true))
+        : withEntry;
+      assert.equal(on, expected, `${role} ${provider}`);
     }
     for (const role of ["delivery", "permission-coordinator"] as const) {
       assert.equal(
@@ -387,6 +399,45 @@ test("the entry paragraph is the only change and only with tools on", () => {
   }
 });
 
+test("Codex tool guidance follows provider, role, and available entry tools", () => {
+  for (const provider of ENTRY_PROVIDERS) {
+    const profile = { ...ENTRY_PROFILE, provider };
+    for (const role of MEMBER_ROLES_UNDER_TEST) for (const toolsOn of [false, true]) {
+      const run = smallRun(toolsOn ? { blackboard: { tools: true } } : {});
+      const prompt = teamPrompt(run, role, undefined, undefined, provider, profile);
+      const codexMember = provider === "codex" && role !== "permission-coordinator";
+      const hasEntryTools = toolsOn && entryToolRoles.has(role);
+      assert.equal(prompt.split(codexSandboxInstructions).length - 1, codexMember ? 1 : 0, `${role} ${provider} sandbox`);
+      assert.equal(prompt.split(codexMemberToolInstructions(hasEntryTools)).length - 1, codexMember ? 1 : 0, `${role} ${provider} signatures`);
+      if (codexMember && hasEntryTools) {
+        assert.match(prompt, /entry_list\(/, `${role} Codex entry list`);
+        assert.match(prompt, /entry_get\(/, `${role} Codex entry get`);
+        assert.match(prompt, /entry_post\(/, `${role} Codex entry post`);
+      }
+    }
+  }
+});
+
+test("Codex tool signatures expose the declared result fields and stay concise", () => {
+  const tools = [
+    { name: "report", schema: outputSchemas.report },
+    { name: "entry_list", schema: outputSchemas.entry_list },
+    { name: "entry_get", schema: outputSchemas.entry_get },
+    { name: "entry_post", schema: outputSchemas.entry_post },
+  ] as const;
+  const paragraph = codexMemberToolInstructions(true);
+  assert.ok(Buffer.byteLength(paragraph, "utf8") < 1200);
+  assert.ok(paragraph.startsWith("Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. The session record keeps each nested call and its result, with long results shortened there, so you do not need to print a result to keep it."));
+  assert.match(paragraph, /When a program lists or reads items, print how many it listed, read, and matched/);
+  assert.match(paragraph, /Read the context file inside a program and select only fields/);
+  const signatures = [...paragraph.matchAll(/([a-z_]+)\([^)]*\) -> \{([^}]*)\}/g)];
+  assert.deepEqual(signatures.map(match => match[1]), tools.map(tool => tool.name));
+  for (const [index, { schema }] of tools.entries()) {
+    assert.deepEqual(signatures[index]![2]!.split(", "), declaredOutputFields(schema), `${tools[index]!.name} result fields match its output schema`);
+  }
+  assert.doesNotMatch(codexMemberToolInstructions(false), /entry_(?:list|get|post)\(/);
+});
+
 test("a retarget swaps the entry paragraph", () => {
   const prompt = teamPrompt(smallRun({ blackboard: { tools: true } }), "implementer", undefined, undefined, "claude", ENTRY_PROFILE);
   assert.ok(prompt.includes(entryInstructions("claude")));
@@ -394,9 +445,27 @@ test("a retarget swaps the entry paragraph", () => {
   assert.ok(retargeted);
   assert.equal(retargeted.split(entryInstructions("codex")).length - 1, 1);
   assert.equal(retargeted.includes(entryInstructions("claude")), false);
+  assert.equal(retargeted.split(codexSandboxInstructions).length - 1, 1);
+  assert.equal(retargeted.split(codexMemberToolInstructions(true)).length - 1, 1);
+  const codexAgain = retargetPrompt(retargeted, { provider: "codex", profile: { ...ENTRY_PROFILE, provider: "codex" } });
+  assert.ok(codexAgain);
+  assert.equal(codexAgain.split(codexSandboxInstructions).length - 1, 1);
+  assert.equal(codexAgain.split(codexMemberToolInstructions(true)).length - 1, 1);
+  const back = retargetPrompt(codexAgain, { provider: "claude", profile: ENTRY_PROFILE });
+  assert.ok(back);
+  assert.equal(back.includes(codexSandboxInstructions), false);
+  assert.equal(back.includes(codexMemberToolInstructions(true)), false);
+  const backAgain = retargetPrompt(back, { provider: "claude", profile: ENTRY_PROFILE });
+  assert.ok(backAgain);
+  assert.equal(backAgain.includes(codexSandboxInstructions), false);
+  assert.equal(backAgain.includes(codexMemberToolInstructions(true)), false);
   const plain = teamPrompt(smallRun(), "implementer", undefined, undefined, "claude", ENTRY_PROFILE);
   assert.equal(refreshReportingInstructions(plain, "codex").includes(entryInstructions("codex")), false);
   assert.equal(refreshReportingInstructions(plain, "codex").includes(entryInstructions("claude")), false);
+  const plainCodex = retargetPrompt(plain, { provider: "codex", profile: { ...ENTRY_PROFILE, provider: "codex" } });
+  assert.ok(plainCodex);
+  assert.equal(plainCodex.split(codexMemberToolInstructions(false)).length - 1, 1);
+  assert.equal(plainCodex.includes("entry_list("), false);
 });
 
 test("a member context never carries the feature map, the eval block, or routing", () => {
@@ -420,7 +489,7 @@ test("a member context never carries the feature map, the eval block, or routing
   }
 });
 
-// Byte pins: the prompts and contexts of a goal run, with the switch off, equal the output at the base commit.
+// Byte pins: Codex member prompts include the tool-output rule and available signatures; contexts stay byte-identical.
 const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
 const PIN_CHECKS = [{ command: "npm", args: ["test"] }];
 const PIN_GOAL = { id: "00000000-0000-4000-8000-000000000012", revision: 1, cycle: 1, successCriteria: "Owner success text.", nonGoals: ["Do not change billing."], allowedPaths: ["src"], evidence: [], previousWork: [], deadlineAt: "2026-12-01T00:00:00.000Z", maxMembers: 2 } as NonNullable<TeamRun["goal"]>;
@@ -438,7 +507,7 @@ function pinnedContexts() {
   const run = goalRun();
   return PIN_ROLES.map(role => JSON.stringify(teamContext(run, "Owner feedback excerpt.", { checks: PIN_CHECKS }, role), null, 2));
 }
-const PIN_PROMPTS_SHA256 = "d3c6439e21fad6364731c0bb4e0792ba9c2ca9cb2940d59568be9c994d8877fb";
+const PIN_PROMPTS_SHA256 = "31fd3fb30819c9999bb9cb49acf5790dc6b5cce4377a30dcfd89556e8895e580";
 const PIN_CONTEXTS_SHA256 = "9ee8fe8ac898e2d70ddbb012ba398387d526294ea61739fb7aad4385b7a7412b";
 
 test("the switch off keeps every prompt and context byte", () => {

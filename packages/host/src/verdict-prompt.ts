@@ -3,7 +3,7 @@ import type { Check, ObjectiveRecord, Threshold } from "./objective-types.js";
 import { codexMemberToolInstructions, codexSandboxInstructions, contextAccessInstructions, profileInstructions, readOnlyWorkspaceInstructions, reportingInstructions } from "./team-prompts.js";
 import type { TeamModelProfile, TeamRun } from "./team-types.js";
 import type { Provider } from "./types.js";
-import { VERDICT_LIMITS, type CriteriaRow } from "./verdict-types.js";
+import { VERDICT_LIMITS } from "./verdict-types.js";
 
 export const VERDICT_PROMPT_BYTES = 8 * 1024;
 export const VERDICT_CONTEXT_BYTES = 1024 * 1024;
@@ -93,9 +93,4 @@ function finalCheckRound(run: TeamRun, head: string): TeamRun["checks"] {
   if (atRevision.length === 0) return [];
   const round = Math.max(...atRevision.map(check => check.round ?? 0));
   return atRevision.filter(check => (check.round ?? 0) === round && check.headCommit === head);
-}
-
-/** The coordinator's lines for the rows: id, status, and check label, led by the label that marks them an agent assessment. */
-export function criteriaRowsText(rows: readonly CriteriaRow[]): string {
-  return ["Agent assessment, provisional, of the previous cycle:", ...rows.map(row => `- ${row.criterion}: ${row.status} (${row.check})`)].join("\n");
 }

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { RUBRIC_V1, VERDICT_CONTEXT_BYTES, VERDICT_PROMPT_BYTES, criteriaRowsText, evaluatorPrompt, verdictContext } from "../packages/host/src/verdict-prompt.js";
-import { VERDICT_LIMITS } from "../packages/host/src/verdict-types.js";
+import { RUBRIC_V1, VERDICT_CONTEXT_BYTES, VERDICT_PROMPT_BYTES, evaluatorPrompt, verdictContext } from "../packages/host/src/verdict-prompt.js";
+import { VERDICT_LIMITS, criteriaRowsText } from "../packages/host/src/verdict-types.js";
 import type { ObjectiveReceipt } from "../packages/host/src/objective-receipts.js";
 import type { ObjectiveRecord } from "../packages/host/src/objective-types.js";
 import type { TeamMember, TeamModelProfile, TeamRun } from "../packages/host/src/team-types.js";

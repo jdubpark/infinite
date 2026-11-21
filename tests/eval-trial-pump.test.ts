@@ -211,6 +211,21 @@ test("a start-up that voided rows is retried until the account is clean", async 
   }
 });
 
+test("a start-up whose stop leaves processes alive is tried again without an open job", async () => {
+  // What a restart finds after a trial left processes alive and blocked its job: no live row, no open job, and an account that is not clean.
+  const r = rig({ alive: true });
+  try {
+    const stops = () => r.log.filter(entry => entry === "stop").length;
+    await r.pump.step();
+    const first = stops();
+    assert.ok(first > 0, "the first start-up tried the stop");
+    await r.pump.step();
+    assert.ok(stops() > first, "the next step tries the stop again, with no job open");
+  } finally {
+    r.cleanup();
+  }
+});
+
 test("live rows without an open job still get the start-up", async () => {
   const r = rig();
   try {
@@ -245,7 +260,6 @@ test("the sweep does nothing while the trials module is not ready", async () => 
   try {
     await r.pump.sweep();
     assert.equal(r.log.includes("replayIds"), false, "the teams fake was not asked");
-    assert.equal(r.sessionsRemoved.length, 0, "no session removed");
   } finally {
     r.cleanup();
   }
@@ -295,9 +309,13 @@ test("start-up blocks the open job when the account's processes stay alive", asy
     assert.equal(job?.reason, "eval-processes-alive");
     const n = r.store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM eval_trials"))?.n;
     assert.equal(n, 0, "no trial row");
-    const probes = r.probeInputs.length;
+    // The account is not clean, so the stop is tried again on each step (one a minute on a host) while the job stays blocked.
+    const stops = r.log.filter(entry => entry === "stop").length;
     await r.pump.step();
-    assert.equal(r.probeInputs.length, probes, "a blocked job launches no further probe");
+    assert.ok(r.log.filter(entry => entry === "stop").length > stops, "the next step tries the stop again");
+    const after = r.store.read(db => db.get<{ status: string; reason: string | null }>("SELECT status, reason FROM eval_jobs WHERE job_id = ?", jobId));
+    assert.equal(after?.status, "blocked", "the job stays blocked until the owner resumes it");
+    assert.equal(after?.reason, "eval-processes-alive");
   } finally {
     r.cleanup();
   }

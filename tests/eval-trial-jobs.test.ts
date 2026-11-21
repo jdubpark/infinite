@@ -131,7 +131,6 @@ function fixture() {
   };
 }
 
-/** A valid captured task of the project, written the way the jobs test writes one. */
 test("block changes only an open job", () => {
   const states: string[] = [];
   for (const kind of ["cancelled", "paused", "running"]) {
@@ -160,6 +159,7 @@ test("block changes only an open job", () => {
   assert.equal(states[2], "running:blocked:eval-processes-alive");
 });
 
+/** A valid captured task of the project, written the way the jobs test writes one. */
 function addTask(f: Fixture, taskId: string): void {
   const at = new Date(START).toISOString();
   f.store.write(tx => {

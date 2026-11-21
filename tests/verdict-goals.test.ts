@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import type { RunAssessment } from "../packages/host/src/verdict-types.js";
 import { TeamError } from "../packages/host/src/teams.js";
 import type { ProductGoal } from "../packages/host/src/goal-types.js";
 import { CONTINUE_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "../packages/host/src/goal-verdicts.js";
@@ -54,6 +55,8 @@ test("acceptance 7: a provisional met stops the goal and continue resumes it", {
     assert.equal(achieved.status, 200, JSON.stringify(achieved.body));
     assert.equal(achieved.body.status, "achieved");
     assert.equal(achieved.body.outcomes.length, 2);
+    assert.equal(achieved.body.stopReason, undefined, "The owner's answer ends the provisional stop");
+    assert.equal(achieved.body.reason, undefined);
   } finally { await f.close(); }
 });
 
@@ -137,6 +140,37 @@ test("a standing goal records met and counts verdict failures", { timeout: 60000
   assert.equal(fifth.failedCycles, 1);
 });
 
+test("a verdict counts toward the failure stop only on a reviewed cycle", { timeout: 60000 }, async t => {
+  const { teams, goals, advance } = stubFixture(t);
+  const created = await goals.create(standing());
+  goals.start();
+  const settle = async (n: number, status: string, assessment: RunAssessment, extra: Record<string, unknown> = {}) => {
+    const launch = await until(() => teams.launches[n - 1], Boolean, `cycle ${n}`);
+    teams.settle(launch.request.requestId, status, { ...BRIEFED, assessment, ...extra }, 4);
+    const settled = await until(() => goals.get(created.id), goal => !goal.activeTeamId && goal.cycles.length === n && goal.cycles[n - 1]!.class !== undefined, `cycle ${n} to settle`);
+    advance(30);
+    return settled;
+  };
+  const quiet = (): RunAssessment => ({ ...assessmentOf(0, 0), kind: "no-change", result: "inconclusive" });
+
+  const failing = await settle(1, "ready-for-review", assessmentOf(0, 2));
+  assert.equal(failing.cycles[0]!.class, "reviewed");
+  assert.equal(failing.failedCycles, 1);
+
+  // An excluded cycle leaves the count alone, whatever its assessment says.
+  const excluded = await settle(2, "blocked", assessmentOf(0, 2), { blockCode: "provider-limit", reason: "The provider is limited." });
+  assert.equal(excluded.cycles[1]!.class, "excluded");
+  assert.equal(excluded.failedCycles, 1);
+
+  // Quiet no-change cycles reset the count and never pause the goal.
+  for (let n = 3; n <= 5; n++) {
+    const quietly = await settle(n, "no-change", quiet(), { reason: "No further work is justified." });
+    assert.equal(quietly.cycles[n - 1]!.class, "no-change");
+    assert.equal(quietly.failedCycles, 0, `Quiet cycle ${n} resets the count`);
+    assert.equal(quietly.status, "running");
+  }
+});
+
 test("acceptance 10 end to end", { timeout: 300000 }, async () => {
   const f = await hostFixture({ objective: { ...SWITCHES }, mode: "autonomous" });
   try {
@@ -181,6 +215,22 @@ test("a supervised goal shows the verdict and changes nothing", { timeout: 30000
     assert.ok(!goal.events.some(event => event.text === PROVISIONAL_EVENT), "A met verdict stops nothing");
     assert.ok((goal.failedCycles ?? 0) === 0, "The failure count is as today");
   } finally { await f.close(); }
+});
+
+test("an owner outcome without continue ends the provisional stop and keeps the goal stopped", { timeout: 60000 }, async t => {
+  const { teams, goals } = stubFixture(t);
+  const created = await goals.create(finite());
+  goals.start();
+  const launch = await until(() => teams.launches[0], Boolean, "cycle 1");
+  const met = assessmentOf(2, 0);
+  teams.settle(launch.request.requestId, "ready-for-review", { ...BRIEFED, assessment: met }, 4);
+  const provisional = await until(() => goals.get(created.id), goal => goal.stopReason === "provisional-met" && !goal.activeTeamId, "the provisional stop");
+  assert.equal(provisional.reason, PROVISIONAL_REASON);
+  const answered = await goals.outcome(created.id, outcomeOf(provisional, { verdictId: met.verdictId }) as never);
+  assert.equal(answered.status, "ready-for-review");
+  assert.equal(answered.stopReason, undefined);
+  assert.equal(answered.reason, undefined);
+  assert.equal(answered.outcomes.length, 1);
 });
 
 test("without verdicts a goal is as today", { timeout: 300000 }, async () => {

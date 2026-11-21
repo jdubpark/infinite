@@ -8,12 +8,14 @@ import {
   PROVISIONAL_REASON,
   assertVerdictAnswer,
   continueGoal,
+  answerProvisional,
   criteriaRowsFor,
   cycleVerdict,
   provisionalStop,
   verdictFailed,
 } from "../packages/host/src/goal-verdicts.js";
 import { createGoalObjective, correctGoalObjective, goalObjectiveView, type GoalHolder } from "../packages/host/src/objective-goals.js";
+import { recordDigest, type ObjectiveRecord } from "../packages/host/src/objective-types.js";
 import type { RunAssessment } from "../packages/host/src/verdict-types.js";
 import type { Project } from "../packages/host/src/types.js";
 import { TeamError } from "../packages/host/src/team-workspace.js";
@@ -142,6 +144,8 @@ test("the outcome rules refuse a wrong verdict answer", () => {
   };
   assert.equal(limited({ ceilingAt: "2026-01-01T00:05:00.000Z" }), "goal-limit-reached");
   assert.equal(limited({ memberCount: 4 }), "goal-limit-reached");
+  assert.equal(limited({ maxRuns: 1 }), "goal-limit-reached", "The feature-run limit is spent");
+  assert.equal(limited({ maxRuns: 2 }), "none", "One run below the limit still continues");
   assert.equal(limited({ steering: Array.from({ length: 20 }, () => ({ text: "d", revision: 1, at: AT })) }), "goal-steering-limit");
   assert.equal(limited({ objective: "x".repeat(24_001) }), "goal-steering-limit");
   assert.equal(goalOutcomeSchema.safeParse(outcome({ verdictId: held.verdictId, continue: true, result: "achieved" })).success, false);
@@ -184,15 +188,40 @@ test("continue appends one direction and restarts the goal", () => {
   assert.equal(typeof CONTINUE_EVENT, "string");
 });
 
+test("an owner outcome ends a provisional stop and only that", () => {
+  const { goal: subject } = stopped({ status: "ready-for-review", reason: PROVISIONAL_REASON });
+  answerProvisional(subject);
+  assert.equal(subject.stopReason, undefined);
+  assert.equal(subject.reason, undefined);
+  assert.equal(subject.status, "ready-for-review");
+  const timed = stopped({ status: "limit-reached", stopReason: "deadline", reason: "Time is up." }).goal;
+  answerProvisional(timed);
+  assert.equal(timed.stopReason, "deadline");
+  assert.equal(timed.reason, "Time is up.");
+});
+
 const project = (team: Record<string, unknown> | undefined) => ({ team }) as unknown as Pick<Project, "team">;
 const onProject = project({ checks: [], objective: { prompts: "on", register: "on", evaluator: "on" } });
+
+/** Sets each criterion's `latest` to a verdict id (or none for undefined), and reseals the record. */
+function latestIs(holder: GoalHolder, verdictOf: (id: string) => string | undefined) {
+  const { digest: _digest, ...body } = holder.objectiveRecord as ObjectiveRecord;
+  const criteria = body.criteria.map(item => {
+    const { latest: _latest, ...rest } = item;
+    const verdictId = verdictOf(item.id);
+    return verdictId === undefined ? rest : { ...rest, latest: { state: "met" as const, verdictId } };
+  });
+  const next = { ...body, criteria };
+  holder.objectiveRecord = { ...next, digest: recordDigest(next) };
+}
 
 function rowsFixture(overrides: Record<string, unknown> = {}) {
   const subject = goal(overrides);
   const holder = holderWith(subject, [judgement("Sources ranked"), artifact("Reasons given", `research/${"x".repeat(190)}.json`), judgement("Old criterion")]);
   const rated = assessment({ criteria: [{ id: "c0", state: "met" }, { id: "c1", state: "not-met" }, { id: "c2", state: "inconclusive" }, { id: "c3", state: "pending-owner" }] });
   subject.cycles = [cycle(1, { assessment: { ...rated, progress: 1 } })];
-  return { subject, holder };
+  latestIs(holder, () => rated.verdictId);
+  return { subject, holder, rated };
 }
 
 test("criteria rows follow the latest verdict, the record, and the switches", () => {
@@ -208,6 +237,14 @@ test("criteria rows follow the latest verdict, the record, and the switches", ()
   holder.objectiveRecord = retired;
   const after = criteriaRowsFor(holder, onProject).criteria;
   assert.deepEqual(after?.map(row => row.criterion), ["c0", "c1", "c2"]);
+});
+
+test("a criterion whose latest verdict is not the assessment's gives no row", () => {
+  const { holder, rated } = rowsFixture();
+  latestIs(holder, id => (id === "c1" ? undefined : id === "c2" ? randomUUID() : rated.verdictId));
+  const rows = criteriaRowsFor(holder, onProject).criteria;
+  assert.ok(rows);
+  assert.deepEqual(rows.map(row => row.criterion), ["c0", "c3"]);
 });
 
 test("criteria rows are empty when a switch, the mode, the verdict, or the record is missing", () => {

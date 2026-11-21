@@ -298,6 +298,9 @@ op_remove() {
 if [ $# -eq 0 ]; then refuse; fi
 op=$1
 shift
+# No operation reads the caller's directory. Leave it: the caller may stand where this account cannot enter, and find
+# then fails when it returns there after -exec.
+cd / || die
 case "$op" in
   probe) op_probe "$@" ;;
   receive) op_receive "$@" ;;

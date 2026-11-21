@@ -561,6 +561,12 @@ case "$op" in
   probe|stop) ;;
   *) tools_present || die ;;
 esac
+# exec and setup name their trial by the caller's directory. Every other operation leaves it: the caller may stand
+# where this account cannot enter, and find then fails when it returns there after -exec.
+case "$op" in
+  exec|setup) ;;
+  *) cd / || die ;;
+esac
 case "$op" in
   probe) op_probe "$@" ;;
   receive) op_receive "$@" ;;

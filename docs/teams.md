@@ -1388,6 +1388,41 @@ the refresh timer then picks up the merge. `team pull` works on the run as usual
 `merge`. `--merge-method` does not apply to it. A delivery report whose kind does
 not match the configured mode is refused with `delivery-mode-mismatch`.
 
+A steer on a run delivered as a pull request continues that pull request. This
+applies to every such steer, whether or not review feedback (below) is switched on:
+
+- The run counts as delivered only at the revision its pull request records. After
+  the steer, member recovery and the other rules of a working run apply again.
+- The steer removes an active delivery recovery record and keeps the number of
+  delivery recoveries already used, so that limit stays cumulative.
+- When head publication (`teams.publishHeads`) is on, each new integrated head is
+  published to a checkpoint branch `<run branch>-<first 8 hex characters of the
+  commit>`, never to the pull request's branch. Checkpoint branches are not
+  removed.
+- Delivery pushes the reviewed head to the pull request's recorded branch, after
+  the checks and the independent review pass. The remote branch must be unchanged
+  or move by fast-forward from the delivered head or from this run's earlier
+  repair heads. Delivery reports the same pull request URL.
+- The host refuses a delivery report that names another pull request, and the
+  `no-publication` and `owned-branch` dispositions.
+- When the delivery of a continued revision fails, the run blocks for the owner
+  without automatic delivery recovery.
+- A pull request recorded before the host kept its branch has no recorded branch,
+  and the host does not infer one. A new steer on that run is refused with
+  `delivery-branch-unknown`. A run that was already continued from such a record
+  blocks at delivery with the same code instead of delivering. Only review
+  feedback's read of GitHub records the branch, and only while the run waits for
+  review at its delivered revision. With review feedback off, such a run refuses
+  every new steer and never gets its branch recorded; start a new run instead.
+
+With `github.reviewFeedback` switched on, the owner's changes-requested review of
+that pull request steers the run the same way, once per review. Only the review
+summary is read, never inline comments. A review by another login, an approval, a
+comment, a review of an older head, and a review submitted before the switch was
+last turned on start nothing. A run accepts at most three reviews. Runs of goals,
+handoffs, replays and missions are not watched; routines start goals, so their
+runs are not watched either. Removing the run's workspace ends intake.
+
 ## Project context and explicit relationships
 
 Each project keeps its own context, task history, and repository evidence. Parent
@@ -3147,6 +3182,13 @@ fails: no landing is recorded, and held stays unknown.
 
 `teams.publishHeads` (boolean, default `true`) controls head publication. Set it
 to `false` to disable it.
+
+`github.reviewFeedback` is off by default. To switch it on, set `enabled: true` and
+`ownerLogin` to the owner's GitHub login. With `enabled: true` and no
+`ownerLogin`, the host refuses its configuration and does not start.
+`pollMinutes` (default 5) sets how often the host reads each watched pull request
+with `gh pr view` under a grant for the `pr` operation, which the GitHub proxy
+already allows. The host adds no credential and makes no GitHub write.
 
 Nothing new is needed for `--delivery pr`. The delivery member pushes from its
 member clone with its own tools, as it does for `merge`.

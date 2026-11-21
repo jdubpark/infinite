@@ -1,5 +1,5 @@
 import type { TeamRun } from "./team-types.js";
-import { type LiveDirection, type ObjectiveRecordView, type ObjectiveUnavailable, noticeFor, objectiveError, readStoredRecord, recordView, runRecord, syncDirections } from "./objective-record.js";
+import { type LiveDirection, type ObjectiveRecordView, type ObjectiveUnavailable, noticeFor, objectiveError, readStoredRecord, recordSteering, recordView, runRecord, syncDirections } from "./objective-record.js";
 import type { ObjectiveRecord } from "./objective-types.js";
 
 export type { ObjectiveUnavailable } from "./objective-record.js";
@@ -25,7 +25,7 @@ function ownership(run: TeamRun): "goal-owned" | "mission-owned" | "handoff-owne
 
 /** Syncs a ready record into the holder. Writes only when the sync added a direction. */
 function syncInto(holder: RunHolder, record: ObjectiveRecord, at: string, live?: LiveDirection): RunObjectiveResult {
-  const synced = syncDirections(record, holder.run.steering, at, live);
+  const synced = syncDirections(record, recordSteering(holder.run.steering), at, live);
   if (synced === "source-invalid") return "source-invalid";
   if (synced === record) return "unchanged";
   holder.objectiveRecord = synced;

@@ -799,8 +799,16 @@ export interface TeamRun {
   publication?: TeamPublication;
   /** Agent-reported delivery evidence; this is not independently verified by the host. */
   deliveryReceipt?: { revision: number; headCommit: string; pullRequestUrl: string; mergeCommit: string; summary: string; reportedAt: string };
-  /** Agent-reported open pull request for a `pr` delivery; the owner merges it on GitHub. Not host verification. */
-  pullRequest?: { revision: number; headCommit: string; pullRequestUrl: string; summary: string; reportedAt: string };
+  /**
+   * Agent-reported open pull request for a `pr` delivery; the owner merges it on GitHub. Not host verification.
+   * `revision` is the revision it was delivered at; a later revision continues the same pull request. `branch` is the
+   * branch the delivery was granted; absent on records made before it was kept (INF-324).
+   */
+  pullRequest?: { revision: number; headCommit: string; pullRequestUrl: string; summary: string; reportedAt: string; branch?: string };
+  /** Delivery recoveries a steer took off the run with its record, so the recovery limit stays cumulative (INF-324). */
+  deliveryRecoveryAttempts?: number;
+  /** The owner's reviews of the run's pull request that the host read, newest 20, with what each did. No review text (INF-324). */
+  reviewFeedback?: ReviewFeedbackEntry[];
   /** Bounded PM recovery of routine report/protocol failures; member reports remain the evidence source. */
   recovery?: {
     attempts: number;
@@ -871,7 +879,7 @@ export interface TeamRun {
   members: TeamMember[];
   decisions: TeamDecision[];
   checks: TeamCheck[];
-  steering: { text: string; revision: number; at: string; source?: ConnectorSource | "coordinator" }[];
+  steering: { text: string; revision: number; at: string; source?: SteeringSource }[];
   events: { at: string; text: string }[];
   reason?: string;
   /** TeamError.code for the current blocked state; absent on legacy records. */
@@ -899,9 +907,21 @@ export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permis
   continuable: boolean;
 };
 
+/**
+ * The owner's own review of a run's pull request, read from GitHub by the host (INF-324). It is owner direction and
+ * never approval; only the configured owner login's reviews become one.
+ */
+export type GithubReviewSource = { kind: "github-review"; id: string; name: string };
+export type SteeringSource = ConnectorSource | GithubReviewSource | "coordinator";
+export const githubReviewSource = (reviewId: string): GithubReviewSource => ({ kind: "github-review", id: reviewId, name: "Your GitHub review" });
+/** What a review the host read from the run's pull request did. `accepted` waits for its steer; see review-feedback.ts. */
+export type ReviewFeedbackOutcome = "accepted" | "applied" | "approved-seen" | "dismissed" | "stale-head" | "no-text" | "before-enable" | "limit" | "superseded" | "refused";
+export type ReviewFeedbackEntry = { reviewId: string; state: "CHANGES_REQUESTED" | "APPROVED" | "DISMISSED"; submittedAt: string; receivedAt: string; outcome: ReviewFeedbackOutcome };
+/** Steering the owner gave: typed by the owner, or the owner's own GitHub review. Connector and coordinator steering is agent direction. */
+export const ownerSteering = (item: { source?: SteeringSource }) => !item.source || typeof item.source === "object" && item.source.kind === "github-review";
 /** Display provenance without treating delegated agent content as owner authority. */
-export const inputSourceLabel = (source?: ConnectorSource | "coordinator" | "slack") =>
-  typeof source === "object" ? `Connector (${source.name})` : source === "coordinator" ? "Mission coordinator" : "Owner";
+export const inputSourceLabel = (source?: SteeringSource | "slack") =>
+  typeof source === "object" ? (source.kind === "github-review" ? "Owner (GitHub review)" : `Connector (${source.name})`) : source === "coordinator" ? "Mission coordinator" : "Owner";
 export const decisionAnswerLabel = (decision: Pick<TeamDecision, "answeredBy" | "source">) =>
   decision.answeredBy === "connector" ? (decision.source ? inputSourceLabel(decision.source) : "Connector") : decision.answeredBy === "coordinator" ? "Mission coordinator" : "User";
 /** The one form every authority surface prints for a decision's question. Intent decisions print ids, never checker text (R2). */

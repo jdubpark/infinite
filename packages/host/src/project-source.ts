@@ -106,6 +106,7 @@ export class ProjectSourceService {
   private readonly serial = new Map<string, Promise<unknown>>();
   private readonly changing = new Set<string>();
   private timer?: ReturnType<typeof setInterval>;
+  private readonly tickListeners = new Set<() => void>();
 
   constructor(private readonly config: Config, private readonly options: ProjectSourceOptions) {
     if (config.environment === "cloud" && Object.keys(config.source?.remoteOverrides ?? {}).length > 0)
@@ -386,12 +387,20 @@ export class ProjectSourceService {
     this.serial.set(projectId, next.catch(() => {}));
     return next;
   }
+  /** Runs `listener` on each minute of this refresher's timer, for work that reads GitHub on its own interval (review feedback). Returns its remover. */
+  onTick(listener: () => void): () => void {
+    this.tickListeners.add(listener);
+    return () => { this.tickListeners.delete(listener); };
+  }
   start(): void {
     if (this.timer) return;
     const maxAgeMs = (this.config.source?.refreshMinutes ?? 5) * 60_000;
     this.timer = setInterval(() => {
       for (const project of this.config.projects) {
         if (project.source?.mode === "github") void this.refresh(project.id, { maxAgeMs }).catch(() => {});
+      }
+      for (const listener of this.tickListeners) {
+        try { listener(); } catch (error) { console.warn("A source timer listener failed.", error instanceof Error ? error.message : "unknown error"); }
       }
     }, 60_000);
     this.timer.unref();

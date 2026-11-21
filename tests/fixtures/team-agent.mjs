@@ -456,9 +456,11 @@ async function main() {
         await new Promise(resolve => setTimeout(resolve, 40));
       }
     }
-    const shouldBlock = scenario === "agent-blocked-once" && assignment.revision === 1 || scenario === "agent-blocked-twice" && assignment.revision <= 3;
+    // delivery-continued: the revision the owner's steer starts blocks once, after its sibling reported.
+    const shouldBlock = scenario === "agent-blocked-once" && assignment.revision === 1 || scenario === "agent-blocked-twice" && assignment.revision <= 3 ||
+      scenario === "delivery-continued" && assignment.revision === 2;
     if (shouldBlock && assignment.taskId === "a") {
-      if (scenario === "agent-blocked-once") {
+      if (scenario === "agent-blocked-once" || scenario === "delivery-continued") {
       const until = Date.now() + 20000;
       while (!existsSync(join(receiptDir, `${assignment.runId}.b-reported`))) {
         if (Date.now() >= until) throw new Error("The independent sibling did not report before the blocker");
@@ -735,6 +737,8 @@ async function main() {
     receipt.finishedAt = Date.now();
     saveReceipt();
     await report({ kind: "result", summary: `Implemented ${assignment.taskId}.txt` });
+    if (scenario === "delivery-continued" && assignment.revision === 2 && assignment.taskId === "b")
+      writeFileSync(join(receiptDir, `${assignment.runId}.b-reported`), "reported", { mode: 0o600 });
     if (scenario === "agent-blocked-once" && assignment.revision === 1 && assignment.taskId === "b") {
       writeFileSync(join(receiptDir, `${assignment.runId}.b-reported`), "reported", { mode: 0o600 });
       await new Promise(resolve => setTimeout(resolve, 5000));
@@ -828,6 +832,19 @@ async function main() {
       }
       await report({ kind: "pull-request", headCommit: context.headCommit, pullRequestUrl: "https://github.com/example/app/pull/1",
         summary: "Opened one pull request for the newly checked and independently reviewed head." });
+      return;
+    }
+    if (scenario === "delivery-continued") {
+      // Pushes the reviewed head to the branch its prompt names, without force, and reports one pull request. A delivery
+      // that continues the pull request waits for the test, which inspects the remote first.
+      const branch = launchPrompt.match(/Use deterministic head branch (\S+), base branch/)?.[1];
+      if (!branch) throw new Error("The fixture could not read the delivery branch from its prompt");
+      const continued = launchPrompt.includes("This run continues its pull request");
+      writeFileSync(join(receiptDir, `delivery-started-${assignment.revision}.json`), JSON.stringify({ head, branch, continued, prompt: launchPrompt }), { mode: 0o600 });
+      while (continued && !existsSync(join(receiptDir, "delivery-continued-release"))) await new Promise(resolve => setTimeout(resolve, 40));
+      execFileSync("git", ["push", readFileSync(join(receiptDir, "delivery-remote"), "utf8").trim(), `${context.headCommit}:refs/heads/${branch}`], { stdio: "ignore" });
+      await report({ kind: "pull-request", headCommit: context.headCommit, pullRequestUrl: "https://github.com/example/app/pull/7",
+        summary: "Pushed the reviewed head to the pull request's branch." });
       return;
     }
     const mergeCommit = execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", `${scenario === "delivery-baseline-changed" ? base : head}^{tree}`, "-p", base, "-m", "Synthetic squash delivery"], { encoding: "utf8" }).trim();

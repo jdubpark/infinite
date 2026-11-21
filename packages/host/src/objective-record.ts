@@ -145,10 +145,18 @@ export function runRecord(run: TeamRun, at: string, handle: string): ObjectiveRe
       log: [{ seq: 1, at, version: 1, actor: "host", authority: "receipt", op: "record.created", target: "record", handle }],
     });
     if (!objectiveRecordSchema.safeParse(base).success) return "source-invalid";
-    return syncDirections(base, run.steering, at);
+    return syncDirections(base, recordSteering(run.steering), at);
   } catch {
     return "source-invalid";
   }
+}
+
+/**
+ * A run's steering as the record reads it. The owner's GitHub review is the owner's direction, so it enters without its
+ * source; connector and coordinator steering keep theirs, which the record does not take.
+ */
+export function recordSteering(steering: TeamRun["steering"]): readonly SteeringEntry[] {
+  return steering.map(entry => typeof entry.source === "object" && entry.source.kind === "github-review" ? { text: entry.text, revision: entry.revision, at: entry.at } : entry);
 }
 
 /** Appends one direction per steering entry that has none. Returns the same object when nothing is missing; never mutates its input. */

@@ -64,7 +64,7 @@ export function useLiveRefresh(
       generation++;
       setFresh(false);
       // A hidden tab reads nothing and nobody watches it: hiding drops a stale warning and stops the wait for one.
-      // Returning reads at once, and the warning shows only if no read lands within the same three seconds.
+      // Returning asks for a read at once, and the warning shows only if no read lands within the same three seconds.
       if (document.visibilityState === "hidden") recover(); else markStaleLater();
       if (!navigator.onLine) setFailed(true);
       clearTimeout(timer);

@@ -54,7 +54,7 @@ export function useDecisionQueueFeed(request: Api, identity: string | null, inte
   const known = identity && snapshot?.identity === identity ? snapshot : undefined;
   // A read that fails is reported by the refresh itself. A read that only has not come back is not, so the queue
   // also stops being current once the next read is QUEUE_READ_GRACE_MS overdue. A hidden or offline tab reads
-  // nothing and sets no such mark: its return starts a read, and the refresh reports that one. Hiding also drops a
+  // nothing and sets no such mark: its return asks for a read, and the refresh reports that one. Hiding also drops a
   // mark already set, as the refresh drops its own warning.
   useEffect(() => {
     if (!known) return;

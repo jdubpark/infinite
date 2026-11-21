@@ -191,7 +191,7 @@ setInterval(() => {}, 1000);
     const resumeId = randomUUID();
     const headlessResume = await host.fetchApi(`/sessions/${recorded}/resume`, "owner", { requestId: resumeId });
     assert.equal(headlessResume.status, 409, JSON.stringify(headlessResume.body));
-    assert.match(headlessResume.body.error, /started in Code Mode.*Start a new session/);
+    assert.match(headlessResume.body.error, /asked for Code Mode.*Start a new session/);
     assert.equal(existsSync(join(host.config.stateDir, "sessions", resumeId)), false, "the refusal leaves no successor record");
     assert.equal(existsSync(join(host.config.stateDir, "resumptions", `${resumeId}.sealed`)), false, "the refusal leaves no receipt");
     // Nothing was kept, so the same request resumes the conversation once the profile is interactive again, and the

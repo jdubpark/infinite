@@ -80,8 +80,10 @@ this setting. The record is not part of any API response.
 
 Claude Code resumes a Code Mode conversation only with Code Mode on. An owner
 resume has no permission channel, so through a headless profile it cannot ask
-for Code Mode. The host refuses that resume with a reason and starts nothing. A
-conversation that did not start in Code Mode resumes as before.
+for Code Mode. The host refuses that resume with a reason and starts nothing. It
+goes by its record: it refuses when the record says the host asked, also where
+an incompatible profile kept Code Mode from starting. A conversation whose
+record says no, or that has no record, resumes as before.
 
 Before setting `all`:
 

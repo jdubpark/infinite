@@ -46,6 +46,7 @@ test("the provisional stop offers exactly the two owner actions", () => {
   assert.ok(html.includes(">Achieved<"));
   assert.ok(html.includes(">Not achieved, continue<"));
   assert.ok(html.includes("Record your assessment."));
+  assert.ok(html.includes("not achieved without continuing, or inconclusive"));
 });
 
 test("the newest verdict id comes from the newest assessed cycle", () => {

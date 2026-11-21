@@ -96,10 +96,17 @@ export function readGitStream(input: GitStreamInput): Promise<StreamRead> {
   });
 }
 
+/**
+ * Git reads the whole `COMMIT:PATH` word as a revision before it splits it at the colon. A path that ends in its
+ * describe form (`-g` and hex digits) would select another object, and `^`, `~`, `{`, `}` or `@` can start a suffix
+ * that walks history or runs a commit-message search. A file with such a name cannot be read.
+ */
+const REVISION_SYNTAX = /[\^~{}@]|-g[0-9A-Fa-f]+$/;
+
 /** Form B1 after the six settings: `cat-file blob COMMIT:PATH`. Throws TypeError for a refused id or path; no child starts. */
 export function blobArgs(commit: string, path: string): string[] {
   if (!COMMIT_ID.test(commit)) throw new TypeError("A blob read needs a full commit id.");
-  if (!isScopedPath(path) || path === "." || path.length > BLOB_PATH_CHARS || /[\u0000-\u001f\u007f]/.test(path)) throw new TypeError("A blob read needs one repository path.");
+  if (!isScopedPath(path) || path === "." || path.length > BLOB_PATH_CHARS || /[\u0000-\u001f\u007f]/.test(path) || REVISION_SYNTAX.test(path)) throw new TypeError("A blob read needs one repository path.");
   return ["cat-file", "blob", `${commit}:${path}`];
 }
 

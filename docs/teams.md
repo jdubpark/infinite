@@ -1820,7 +1820,7 @@ Form B1 is the only new Git form. It runs in the run's integration checkout, aft
 
 | Form | Command | Limit | If refused |
 | --- | --- | --- | --- |
-| B1, one blob (new) | `git cat-file blob COMMIT:PATH`, with `GIT_NO_LAZY_FETCH=1` | 1,048,576 bytes and 30 seconds. `COMMIT` is 40 or 64 lowercase hexadecimal characters. `PATH` is a repository path of at most 300 characters, and not `.` | Every artifact and citation result is `unknown` with `read-failed`. Command tests still work. |
+| B1, one blob (new) | `git cat-file blob COMMIT:PATH`, with `GIT_NO_LAZY_FETCH=1` | 1,048,576 bytes and 30 seconds. `COMMIT` is 40 or 64 lowercase hexadecimal characters. `PATH` is a repository path of at most 300 characters, and not `.`. It holds none of `^ ~ { } @` and does not end in `-g` and hexadecimal digits, because Git reads the whole word as a revision first; a file with such a name reads as `read-failed` | Every artifact and citation result is `unknown` with `read-failed`. Command tests still work. |
 
 The launcher must end B1 by itself after 35 seconds, as it ends the capture reads. Until the owner installs a launcher that admits B1, every artifact and citation result is `unknown`.
 

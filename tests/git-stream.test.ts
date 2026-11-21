@@ -59,6 +59,10 @@ test("a blob read is one bounded form", async () => {
   for (const id of refusedIds) assert.throws(() => blobArgs(id, "docs/a.json"), TypeError, `id ${id.length}`);
   const refusedPaths = ["../a", "a:b", ".", ".git/x", "x".repeat(301), "docs/a\u0001b"];
   for (const path of refusedPaths) assert.throws(() => blobArgs(ID40, path), TypeError, JSON.stringify(path));
+  // Git reads the whole COMMIT:PATH word as a revision before it splits it, so a path may not end it in revision syntax.
+  const revisionPaths = ["r-g6d9fcb43", "docs/r-gABCDEF", "r-g1", "a^", "a~1", "a^{tree}", "a^{/x}", "a@{1}", "a@", "a{b", "a}b"];
+  for (const path of revisionPaths) assert.throws(() => blobArgs(ID40, path), TypeError, JSON.stringify(path));
+  for (const path of ["r-g", "r-gz1", "g-1234", "-x", "HEAD", "a.b-c_d+e=f"]) assert.equal(blobArgs(ID40, path)[2], `${ID40}:${path}`);
 
   // A reader given a refused argument resolves failed and starts no child.
   const { dir, head } = makeRepo();

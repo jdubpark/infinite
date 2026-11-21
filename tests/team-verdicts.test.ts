@@ -152,6 +152,35 @@ test("a verdict without an evaluator is inconclusive and releases the run", () =
   }
 });
 
+test("a run at its attempt limit gets no evaluator", () => {
+  // The evaluator is one more member of the run. The fixture's run has one member, its author.
+  const budget = (maxMembers: number) => ({ id: GOAL, revision: 1, cycle: 2, parentRunId: PARENT, maxMembers }) as never;
+  const full = fixture({ goal: true, run: { goal: budget(1) } });
+  assert.equal(full.verdicts.reviewed(full.holder), true);
+  finishPass(full.world, RUN, [receiptOf("c1", "pass")]);
+  drive(full, "done");
+  assert.equal(full.host.prepared.length, 0, "no member is added at the limit");
+  assert.equal(full.holder.verdict?.status, "done");
+  assert.equal(full.holder.verdict?.reason, "evaluator-unavailable");
+  assert.equal(full.holder.run.assessment?.result, "inconclusive");
+  assert.equal(full.holder.run.assessment?.criteria.find(row => row.id === "c1")?.state, "met", "the receipt still counts");
+  assert.equal(full.holder.outbox.length, 1, "one row");
+  assert.equal(full.verdicts.reviewed(full.holder), false, "the run proceeds");
+
+  // Room for one more: the evaluator starts. Its replacement would be a third member, so none starts.
+  const room = fixture({ goal: true, run: { goal: budget(2) } });
+  assert.equal(room.verdicts.reviewed(room.holder), true);
+  finishPass(room.world, RUN, [receiptOf("c1", "pass")]);
+  drive(room, "evaluating");
+  assert.equal(room.host.prepared.length, 1, "the evaluator starts in the last place");
+  assert.equal(room.verdicts.failed(room.holder, room.host.prepared[0]!.member), true);
+  drive(room, "done");
+  assert.equal(room.host.prepared.length, 1, "no replacement is added past the limit");
+  assert.equal(room.holder.verdict?.reason, "evaluator-unavailable");
+  assert.equal(countOf(eventTexts(room.holder), VERDICT_EVENTS.replaced), 0, "no replacement is announced");
+  assert.equal(room.verdicts.reviewed(room.holder), false, "the run proceeds");
+});
+
 test("one replacement, then evaluator-unavailable", () => {
   const f = evaluating();
   const first = f.member;

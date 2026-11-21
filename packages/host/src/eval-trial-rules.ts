@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import { canonicalJson } from "./evidence/crypto.js";
-import { profileIdentityKey, type ProfileKey } from "./config-identity.js";
+import { profileIdentityKey, promptVersion, type ProfileKey } from "./config-identity.js";
+import { profileIdentity } from "./run-events.js";
 import type { ParsedReport } from "./eval-report.js";
+import type { TeamModelProfile } from "./team-types.js";
 import { VOID_ENDINGS, type EvalIdentityState, type TrialConfiguration, type TrialEnding, type TrialGrade, type TrialState } from "./eval-types.js";
 
 // Pure trial rules: grades, the restore set, the next slot, the isolation label, and the ending maps. No I/O, no clock.
@@ -76,6 +78,18 @@ export function nextSlot(input: { tasks: readonly string[]; configRefs: readonly
 /** `isolated` only when the eval identity is ready, its fetch of the repository is refused, and the source is clean. */
 export function isolationLabel(input: { probe: IdentityProbe; sourceClean: boolean }): "isolated" | "none" {
   return input.probe.state === "ready" && input.probe.fetch === "refused" && input.sourceClean ? "isolated" : "none";
+}
+
+/** The prompt version `trialJobDigest` digests for a profile: the implementer prompt rendered for the canonical profile. */
+export function trialPromptVersion(profile: TeamModelProfile): string {
+  const canonical = JSON.parse(canonicalJson(profile)) as TeamModelProfile;
+  return promptVersion("implementer", canonical.provider, canonical, false, false, false);
+}
+
+/** The profile's provider, model, and effort as the outcome ledger keys them, with null for an absent model or effort. */
+export function trialProfileKey(profile: TeamModelProfile): ProfileKey {
+  const identity = profileIdentity(profile, profile.provider);
+  return { provider: identity.provider, model: identity.model ?? null, effort: identity.effort ?? null };
 }
 
 /** SHA-256 hex of the canonical JSON of profileIdentityKey(profile), guidance, and knowledge. */

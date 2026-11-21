@@ -50,7 +50,7 @@ type Project = Config["projects"][number];
 type Pass = NextTrial | { kind: "slots" };
 
 const NONE: NextTrial = { kind: "none" };
-const EMPTY_COUNTS: TrialCounts = { plannedTasks: 0, plannedTrials: 0, tasks: 0, skipped: 0, started: 0, graded: 0, resolved: 0, ended: 0, void: 0, voidStreak: 0 };
+const EMPTY_COUNTS: TrialCounts = { plannedTasks: 0, plannedTrials: 0, tasks: 0, skipped: 0, started: 0, graded: 0, resolved: 0, ended: 0, void: 0, voidStreak: 0, reused: 0 };
 
 const profileSchema = z.object({ provider: z.enum(["claude", "codex", "grok", "opencode", "demo"]) }).passthrough();
 const configurationSchema = z.object({

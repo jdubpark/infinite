@@ -4,6 +4,7 @@ import type { UsageTotals } from "./usage.js";
 import type { UsageRollup } from "./team-usage.js";
 import type { LinearTrackingView } from "./linear-types.js";
 import type { AutonomyMode } from "./autonomy.js";
+import type { RunAssessment } from "./verdict-types.js";
 import { signalKinds, type PendingWake } from "./signals/types.js";
 
 export function isScopedPath(value: string): boolean {
@@ -70,7 +71,14 @@ export const goalOutcomeSchema = goalActionSchema.extend({
   result: z.enum(["achieved", "not-achieved", "inconclusive"]),
   summary: z.string().trim().min(1).max(4000),
   evidence: z.string().trim().min(1).max(8000),
-}).strict();
+  /** The agent assessment this answer is about: one of the goal's cycle assessments. */
+  verdictId: z.uuid().optional(),
+  /** Not achieved, and the goal goes on: needs the `verdictId` of the provisional assessment that stopped it. */
+  continue: z.literal(true).optional(),
+}).strict().refine(value => value.continue === undefined || (value.verdictId !== undefined && value.result === "not-achieved"), { path: ["continue"], message: "Continue needs the verdictId of the assessment and the result not-achieved." });
+export type GoalOutcomeInput = z.infer<typeof goalOutcomeSchema>;
+/** A cycle's agent assessment with its progress: met criteria gained over the newest earlier assessed cycle. */
+export type GoalAssessment = RunAssessment & { progress: number };
 export type GoalStatus = "running" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-opportunity" | "limit-reached" | "cancelled" | "achieved";
 export interface GoalCycle {
   /** The mode the cycle's launch was prepared in; read once, when the launch is prepared. */
@@ -96,6 +104,8 @@ export interface GoalCycle {
   deadlineStop?: { at: string; fuseOpen?: true };
   /** Standing goals: how the cycle counts, recorded once when its members have stopped. */
   class?: CycleClass;
+  /** The cycle's agent assessment, provisional; copied from its run. */
+  assessment?: GoalAssessment;
   settledAt?: string;
   /** Standing goals: the pending wake this cycle consumed. */
   wake?: CycleWake;
@@ -107,7 +117,7 @@ export interface ProductGoal extends Omit<CreateGoal, "requestId"> {
   revision: number;
   status: GoalStatus;
   /** Structured budget stop reason; absent on legacy goals until migrated or stopped. */
-  stopReason?: "deadline" | "member-limit";
+  stopReason?: "deadline" | "member-limit" | "provisional-met";
   /** When the goal entered its current blocked period; a record from before this field takes its last save time. */
   blockedAt?: string;
   /** A deadline-stopped child should be replaced after an owner extends the goal. */
@@ -144,5 +154,5 @@ export interface ProductGoal extends Omit<CreateGoal, "requestId"> {
   nextCycleAt?: string;
   steering: { text: string; revision: number; at: string }[];
   events: { at: string; text: string }[];
-  outcomes: { result: "achieved" | "not-achieved" | "inconclusive"; summary: string; evidence: string; at: string; revision: number }[];
+  outcomes: { result: "achieved" | "not-achieved" | "inconclusive"; summary: string; evidence: string; at: string; revision: number; verdictId?: string }[];
 }

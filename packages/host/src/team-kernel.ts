@@ -65,3 +65,10 @@ export function filesystemEntryExists(path: string) {
   try { lstatSync(path); return true; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
 }
+export const commitId = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i;
+export function terminalPermissionCoordinator(run: TeamRun, member: TeamMember) {
+  if (member.role !== "permission-coordinator") return false;
+  const decision = permissionCoordinatorDecision(run, member);
+  return Boolean(decision && (["stale", "escalated"].includes(decision.status) ||
+    decision.status === "answered" && decision.receipt?.state === "delivered" && decision.receipt.result === "closed"));
+}

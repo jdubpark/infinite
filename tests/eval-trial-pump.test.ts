@@ -13,7 +13,8 @@ import type { TrialGrade } from "../packages/host/src/eval-types.js";
 import { evalCorpusModule } from "../packages/host/src/eval-store.js";
 import { TrialJobs } from "../packages/host/src/eval-trial-jobs.js";
 import { TrialPump, type TrialTeams } from "../packages/host/src/eval-trial-pump.js";
-import { evalTrialsModule, finishTrial, insertTrial, startTrial } from "../packages/host/src/eval-trial-store.js";
+import { EVAL_TRIALS_MODULE, evalTrialsModule, finishTrial, insertTrial, startTrial } from "../packages/host/src/eval-trial-store.js";
+import { EvalHost } from "../packages/host/src/eval-host.js";
 import { configRef, TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
 
 // The trial pump over small fakes: a real store and a real TrialJobs, a recording identity, and no member. The end-to-end
@@ -36,11 +37,21 @@ type Probe = Parameters<EvalIdentity["probe"]>[0];
 
 /** The pump with no member and a source whose `status` has no mirror head, so no trial can start. Every call is logged. */
 function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: EvalProbe[]; sessionsRemoved?: string[]; forgetThrows?: boolean; replayIds?: string[];
-  replayState?: (trialId: string) => Promise<unknown>; onStatus?: () => void } = {}) {
+  replayState?: (trialId: string) => Promise<unknown>; onStatus?: () => void; trialsNewer?: boolean; alive?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), "infinite-trial-pump-"));
   dirs.push(root);
-  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: randomBytes(32) });
+  const vaultKey = randomBytes(32);
+  const databasePath = evidenceDatabasePath(join(root, "state"));
   const now = () => new Date().toISOString();
+  if (options.trialsNewer) {
+    // A stored trials version one above the code's makes that module unavailable, as in evidence-store.test.ts.
+    const first = new EvidenceStore({ databasePath, vaultKey });
+    first.register(evalCorpusModule(first, now));
+    const trials = evalTrialsModule(first, now);
+    first.register({ ...trials, version: trials.version + 1, readVersion: trials.version + 1 });
+    first.close();
+  }
+  const store = new EvidenceStore({ databasePath, vaultKey });
   store.register(evalCorpusModule(store, now));
   store.register(evalTrialsModule(store, now));
   const config = {
@@ -86,7 +97,7 @@ function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: E
     sessions: { list: async () => [], remove: async (id: string) => { sessionsRemoved.push(id); if (options.removeRefused) throw new Error("refused"); } } as never,
     source: { mirrorPath: () => join(root, "mirror.git"), status: () => { log.push("status"); options.onStatus?.(); return { mode: "github", repository: "example/app", baseBranch: "main" } as never; } },
     hostLoad: { held: () => undefined }, halt: () => ({ check: () => ({ state: "clear" as const }) }),
-    graderProbe: async () => ({ state: "ready", storage: true, version: 2, uid: 5002 }), inventory: async () => [], now,
+    graderProbe: async () => ({ state: "ready", storage: true, version: 2, uid: 5002 }), inventory: async () => options.alive ? [{ ruid: 5001, euid: 5001, state: "S" } as never] : [], now,
   });
   const addJob = () => {
     const at = now();
@@ -114,7 +125,7 @@ function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: E
     });
     return trialId;
   };
-  return { store, config, pump, log, seed, probeInputs, sessionsRemoved, forgotten, addJob, cleanup: () => store.close() };
+  return { store, config, pump, log, root, now, jobs, seed, probeInputs, sessionsRemoved, forgotten, addJob, cleanup: () => store.close() };
 }
 
 test("a source that cannot start does not make a hot loop", async () => {
@@ -152,14 +163,113 @@ test("a start-up with an unavailable identity runs again, and stops and cleans b
 test("the identity probe is keyed by project", async () => {
   const r = rig();
   try {
-    // No job is open at start-up, so the start-up probe names no project.
+    // The job is cancelled while a trial row lives, so the start-up probe names no project.
+    const jobId = r.addJob();
+    r.seed(jobId, 0, "running");
+    r.store.write(tx => tx.run("UPDATE eval_jobs SET status = 'cancelled' WHERE job_id = ?", jobId));
     await r.pump.step();
     assert.equal(r.probeInputs.length, 1, "the start-up probe");
     assert.equal(r.probeInputs[0].fetchUrl, undefined, "the start-up probe fetches no repository");
-    r.addJob();
+    r.store.write(tx => tx.run("UPDATE eval_jobs SET status = 'scheduled' WHERE job_id = ?", jobId));
     await r.pump.step();
     assert.equal(r.probeInputs.length, 2, "the trial's project is probed again");
     assert.ok(r.probeInputs[1].fetchUrl?.includes("example/app"), "the second probe names the project's repository");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("start-up launches no probe while no trial job is open", async () => {
+  const r = rig({ probes: [{ state: "unavailable" }, { state: "unavailable" }, { state: "unavailable" }] });
+  try {
+    for (let step = 0; step < 3; step++) await r.pump.step();
+    assert.equal(r.probeInputs.length, 0, "no probe while nothing can run");
+    r.addJob();
+    await r.pump.step();
+    assert.ok(r.probeInputs.length >= 1, "the start-up runs when the first job opens");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("live rows without an open job still get the start-up", async () => {
+  const r = rig();
+  try {
+    const jobId = r.addJob();
+    const trialId = r.seed(jobId, 0, "running");
+    r.store.write(tx => tx.run("UPDATE eval_jobs SET status = 'cancelled' WHERE job_id = ?", jobId));
+    await r.pump.step();
+    const row = r.store.read(db => db.get<{ state: string; ending: string | null }>("SELECT state, ending FROM eval_trials WHERE trial_id = ?", trialId));
+    assert.equal(row?.state, "final");
+    assert.equal(row?.ending, "void-host");
+    assert.equal(r.probeInputs.length, 1, "the account is probed");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("the pump starts nothing while the trials module is not ready", async () => {
+  const r = rig({ trialsNewer: true });
+  try {
+    assert.equal(r.store.status().modules[EVAL_TRIALS_MODULE], "unavailable");
+    r.addJob();
+    for (let step = 0; step < 2; step++) await r.pump.step();
+    assert.equal(r.probeInputs.length, 0, "no probe");
+    assert.equal(r.log.filter(entry => entry === "status").length, 0, "no trial start");
+    const n = r.store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM eval_trials"))?.n;
+    assert.equal(n, 0, "no trial row");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a baseline create answers evidence-unavailable while the trials module is not ready", async () => {
+  const r = rig();
+  r.cleanup();
+  const root = mkdtempSync(join(tmpdir(), "infinite-trial-host-"));
+  dirs.push(root);
+  const vaultKey = randomBytes(32);
+  const databasePath = evidenceDatabasePath(join(root, "state"));
+  const now = () => new Date().toISOString();
+  // A stored trials version one above the code's makes that module unavailable, as in evidence-store.test.ts.
+  const first = new EvidenceStore({ databasePath, vaultKey });
+  const trials = evalTrialsModule(first, now);
+  first.register({ ...trials, version: trials.version + 1, readVersion: trials.version + 1 });
+  first.close();
+  const store = new EvidenceStore({ databasePath, vaultKey });
+  try {
+    const host = new EvalHost({
+      config: r.config, store, source: { mirrorPath: () => join(root, "mirror.git"), status: () => ({ mode: "github", repository: "example/app", baseBranch: "main" }) as never },
+      hostLoad: { held: () => undefined }, halt: () => ({ check: () => ({ state: "clear" as const }) }), runs: () => [], now,
+    });
+    assert.equal(store.status().modules[EVAL_TRIALS_MODULE], "unavailable");
+    const baseline = host.create(PROJECT, {
+      kind: "baseline", configurations: [{ profile: CLAUDE, guidance: "as-of-base", knowledge: "none" }],
+      limits: { maxTrials: 10, maxWallMinutes: 600 },
+    } as never, randomUUID());
+    assert.equal((baseline as { status?: number }).status, 503);
+    assert.equal((baseline as { code?: string }).code, "evidence-unavailable");
+    const validate = host.create(PROJECT, { kind: "validate", limits: { maxWallMinutes: 10 } } as never, randomUUID());
+    assert.ok("job" in validate, `a validate create still creates a job: ${JSON.stringify(validate).slice(0, 200)}`);
+    host.close();
+  } finally {
+    store.close();
+  }
+});
+
+test("start-up blocks the open job when the account's processes stay alive", async () => {
+  const r = rig({ alive: true });
+  try {
+    const jobId = r.addJob();
+    await r.pump.step();
+    const job = r.store.read(db => db.get<{ status: string; reason: string | null }>("SELECT status, reason FROM eval_jobs WHERE job_id = ?", jobId));
+    assert.equal(job?.status, "blocked");
+    assert.equal(job?.reason, "eval-processes-alive");
+    const n = r.store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM eval_trials"))?.n;
+    assert.equal(n, 0, "no trial row");
+    const probes = r.probeInputs.length;
+    await r.pump.step();
+    assert.equal(r.probeInputs.length, probes, "a blocked job launches no further probe");
   } finally {
     r.cleanup();
   }

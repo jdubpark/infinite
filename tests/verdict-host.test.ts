@@ -12,6 +12,7 @@ import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { Blackboard } from "../packages/host/src/evidence/blackboard.js";
 import { EventOutbox, type OutboxEvent } from "../packages/host/src/evidence/outbox.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
+import { isFuseReason } from "../packages/host/src/fuse/rules.js";
 import { FuseService } from "../packages/host/src/fuse/service.js";
 import { commandDigest } from "../packages/host/src/objective-input.js";
 import { VERDICT_OPS } from "../packages/host/src/objective-record.js";
@@ -334,6 +335,8 @@ test("a stalled evaluator is replaced once", { timeout: 120000 }, async () => {
     assert.equal(view.assessment?.result, "inconclusive");
     assert.equal(view.assessment?.reason, "evaluator-unavailable");
     const first = evaluators(view)[0]!, second = evaluators(view)[1]!;
+    assert.equal(Boolean(first.stalledAt), true, "the first evaluator stalled");
+    assert.equal(first.stoppedReason?.startsWith("No activity for "), true, `its stop reason is the stall: ${first.stoppedReason}`);
     assert.notEqual(first.modelProfile?.id, second.modelProfile?.id, "the replacement is a fresh choice");
     assert.equal(view.events.filter(event => event.text === VERDICT_EVENTS.replaced).length, 1);
     assert.equal(teams.get(f.run.id).status, "ready-for-review");
@@ -358,6 +361,8 @@ test("an open fuse holds the verdict", { timeout: 120000 }, async () => {
     const held = teams.get(f.run.id);
     assert.equal(TERMINAL.includes(held.status), false, `the run stays held: ${held.status}`);
     assert.equal(held.assessment, undefined);
+    assert.equal(isFuseReason(held.reason), true, `the fuse caused the hold: ${held.reason}`);
+    assert.equal(evaluators(held).every(member => member.status === "queued"), true, "an evaluator that exists was never launched");
 
     assert.equal(fuse.close({ scope: "project", projectId: "fixture" }), "closed");
     const evaluator = await launchedEvaluator(f, teams, f.run.id);

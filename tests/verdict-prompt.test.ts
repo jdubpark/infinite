@@ -184,7 +184,7 @@ test("criteria rows print labelled an agent assessment", () => {
   ]);
   const lines = text.split("\n");
   assert.equal(lines.length, 3);
-  assert.equal(lines[0], "Agent assessment, provisional, of the previous cycle:");
+  assert.equal(lines[0], "Agent assessment, provisional, of the latest assessed cycle:");
   assert.equal(lines[1], "- c0: met (receipt:checks-passed)");
   assert.equal(lines[2], "- c1: pending-owner (owner-rating:taste)");
   assert.equal(/note|threshold|count|score/i.test(text), false, "no note, threshold, count, or score");

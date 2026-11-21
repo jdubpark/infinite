@@ -345,6 +345,73 @@ test("an earlier revision's implementer still counts as an author", () => {
   assert.equal(f.host.prepared.length, 0);
 });
 
+test("an implementer that escalated or stopped without a report still counts as an author", () => {
+  const cases: [string, Partial<TeamMember>][] = [
+    ["escalated", { status: "reported", report: { kind: "escalate", reason: "Too hard." } as never }],
+    ["stopped without a report", { status: "stopped" }],
+  ];
+  for (const [name, extra] of cases) {
+    const f = fixture();
+    f.holder.run.members.push(memberOf(f.holder.run, "implementer", { modelProfile: ASTRA, ...extra }));
+    f.holder.run.members.push(memberOf(f.holder.run, "implementer", { modelProfile: DEEP, status: "reported", report: { kind: "result", summary: "Done." } as never }));
+    f.verdicts.reviewed(f.holder);
+    finishPass(f.world, RUN, [receiptOf("c1", "pass")]);
+    drive(f, "evaluating");
+    assert.equal(f.holder.verdict?.reason, "no-independent-evaluator", `${name}: both eligible models authored`);
+    assert.equal(f.host.prepared.length, 0, name);
+  }
+  const f = fixture();
+  f.holder.run.members.push(memberOf(f.holder.run, "implementer", { modelProfile: ASTRA, status: "stopped" }));
+  f.verdicts.reviewed(f.holder);
+  finishPass(f.world, RUN, [receiptOf("c1", "pass")]);
+  drive(f, "evaluating");
+  assert.equal(f.host.prepared[0]?.profile.id, DEEP.id, "the other family evaluates");
+});
+
+const PINNED = "research/pinned.json";
+const pinnedCriterion = (): Criterion[] => [{
+  id: "c6", origin: "owner", statement: "Pinned ranking verifies", check: { kind: "command", command: commandDigest({ command: "npm", args: ["run", "rank-verify"] }) },
+  producer: "host", threshold: { kind: "pass" }, state: "active", pinned: [{ path: PINNED, blob: "3".repeat(40) }],
+}];
+
+function noChangeWithParent(parentChanges: unknown, lineup: TeamLineup = SAME_FAMILY): Fixture {
+  const f = noChangeFixture({ lineup }, recordOf(RUN, 1, pinnedCriterion()));
+  if (parentChanges !== "gone") f.host.holders.set(PARENT, holderOf(runOf({ id: PARENT, headCommit: BASE, changes: parentChanges as never })));
+  f.world.passes.set(PARENT, { head: BASE, pending: false, receipts: [receiptOf("c6", "pass", PARENT, BASE)] });
+  f.verdicts.holdNoChange(f.holder, memberOf(f.holder.run, "project-manager", { status: "reported" }));
+  return f;
+}
+
+test("a no-change verdict takes its change list from the parent run", () => {
+  const list = { headCommit: BASE, recordedAt: AT, files: [{ path: "research/other.json", status: "added", added: 1, removed: 0 }], truncated: false };
+  const f = noChangeWithParent(list, LINEUP);
+  drive(f, "evaluating");
+  const member = f.host.prepared[0]!.member;
+  const context = f.verdicts.context(f.holder, member);
+  assert.deepEqual(context?.changedPaths.paths, ["research/other.json"], "the evaluator reads the parent's list");
+  assert.equal(context?.changedPaths.truncated, false);
+  reportEvaluator(f, member, reportOf({ c0: "met" }, undefined, ["file:research/other.json"]));
+  settle(f.host);
+  const rows = f.verdicts.detail(RUN)!.criteria;
+  assert.equal(rows.find(item => item.id === "c6")?.state, "met", "the pinned file is not in the parent's list");
+  assert.equal(rows.find(item => item.id === "c0")?.state, "met", "a file handle on a path of that list resolves");
+
+  const touched = { ...list, files: [{ path: PINNED, status: "modified", added: 1, removed: 1 }] };
+  const g = noChangeWithParent(touched);
+  drive(g, "releasing");
+  assert.equal(g.verdicts.detail(RUN)!.criteria.find(item => item.id === "c6")?.reason, "pinned-changed", "a pinned file in the parent's list voids met");
+});
+
+test("a no-change verdict without the parent's list at its head has an empty complete list", () => {
+  const other = { headCommit: HEAD, recordedAt: AT, files: [{ path: PINNED, status: "modified", added: 1, removed: 1 }], truncated: false };
+  for (const [name, parent] of [["another head", other], ["parent gone", "gone"], ["no list", undefined]] as const) {
+    const f = noChangeWithParent(parent);
+    drive(f, "releasing");
+    const row = f.verdicts.detail(RUN)!.criteria.find(item => item.id === "c6");
+    assert.equal(row?.state, "met", `${name}: nothing changed between the base and the head`);
+  }
+});
+
 const judgeable = (): Criterion[] => [{
   id: "c3", origin: "owner", statement: "The method is applied", check: { kind: "judgement", item: "method-applied" },
   producer: "evaluator", threshold: { kind: "pass" }, state: "active",

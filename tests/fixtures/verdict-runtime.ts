@@ -213,8 +213,8 @@ export function fixture(options: { run?: Partial<TeamRun>; record?: ObjectiveRec
 }
 
 /** A goal cycle that reported no change: no task, and the head equal to the base. */
-export function noChangeFixture(run: Partial<TeamRun> = {}): Fixture {
-  const f = fixture({ goal: true, run: { status: "planning", review: undefined, headCommit: BASE, ...run } });
+export function noChangeFixture(run: Partial<TeamRun> = {}, record?: ObjectiveRecord): Fixture {
+  const f = fixture({ goal: true, run: { status: "planning", review: undefined, headCommit: BASE, ...run }, ...(record === undefined ? {} : { record }) });
   f.holder.run.tasks.length = 0;
   return f;
 }

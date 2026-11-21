@@ -71,8 +71,6 @@ export interface PermissionCoreOptions {
 }
 
 export interface PermissionAgentCoreService extends PermissionAgentCore {
-  /** The pair of policy text and tier profiles a replay result belongs to. Any change gives another value. */
-  binding(): string;
   settings(): PermissionAgentSettings;
 }
 

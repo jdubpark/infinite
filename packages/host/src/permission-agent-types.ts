@@ -171,6 +171,12 @@ export class PermissionReviewHeld extends Error {
 export interface PermissionAgentCore {
   /** Whether the permission agent may serve any workspace on this host now. */
   readiness(): PermissionReadiness;
+  /**
+   * A digest of what a verdict depends on besides the request: the policy text, the tier texts, the classes,
+   * the class rules and the tier profiles. Any change gives another value. A replay result belongs to one
+   * binding, and so does every recorded decision.
+   */
+  binding(): string;
   /** A profile's family is its model vendor. Undefined when the host cannot establish it. */
   familyOf(profile: { provider: string; model?: string }): string | undefined;
   /** The interrupt class that a host predicate establishes for this request, among the classes in force. */

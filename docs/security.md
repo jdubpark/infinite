@@ -619,7 +619,11 @@ changes the epochs, so a halt that an older copy of the record brings back
 retires, at its release, the verdicts reached since the real release. A removed
 epochs file is replaced with a new host epoch, which retires every verdict not
 yet delivered. While the epochs or the halt record cannot be read, the agent
-serves nothing. The host does not detect a replayed older copy of its sealed
+serves nothing. The same authority carries a digest of the policy text, the
+tier texts, the class rules and the tier profiles: the digest that a replay
+result belongs to. A change to any of them retires every earlier verdict in
+the same way, so a verdict reached under older rules is never delivered or
+replayed under newer ones. The host does not detect a replayed older copy of its sealed
 state: restoring `halt-epochs.sealed` from an older copy, alone or together with
 `halt.sealed`, can make a verdict reached before a later halt applicable again,
 as restoring an older `halt.sealed` lifts a halt. A dialog that was

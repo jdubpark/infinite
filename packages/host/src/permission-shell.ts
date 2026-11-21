@@ -66,17 +66,25 @@ const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish
 interface Interpreter {
   code: string; valued?: string; attached?: string; digits?: string; stop?: string;
   long?: readonly string[]; longValued?: readonly string[]; words?: readonly string[]; modes?: readonly string[]; fromInput?: boolean;
+  /** A value of an otherwise non-code option can itself carry code. */
+  codeValue?: (option: string, value: string) => boolean;
 }
 const INTERPRETERS: Record<string, Interpreter> = {
   python: { code: "c", valued: "mWXQ", stop: "m", longValued: ["--check-hash-based-pycs"], modes: ["-m", "-V", "--version", "-h", "--help"], fromInput: true },
   node: {
     code: "ep", valued: "rC", long: ["--eval", "--print"], fromInput: true,
     longValued: ["--require", "--import", "--loader", "--experimental-loader", "--conditions", "--input-type", "--env-file", "--title"],
+    // Only data: loader URLs carry literal source; builtin and file module names remain normal values.
+    codeValue: (option, value) => ["-r", "--require", "--import", "--loader", "--experimental-loader"].includes(option) && /^data:/i.test(value),
     modes: ["--test", "--run", "-v", "--version", "-h", "--help", "-c", "--check"],
   },
   deno: { code: "", long: ["--eval"], words: ["eval"] },
   bun: { code: "e", long: ["--eval", "--print"] },
-  perl: { code: "eE", attached: "iIMmFxdDCV", digits: "l0", modes: ["-v", "-V", "-h"], fromInput: true },
+  // perlrun: since 5.39.8, `-M` accepts a separate module/code value as well as an attached one.
+  perl: {
+    code: "eE", valued: "M", attached: "iImFxdDCV", digits: "l0", modes: ["-v", "-V", "-h"], fromInput: true,
+    codeValue: (option, value) => option === "-M" && !/^-?[A-Za-z_]\w*(?:::\w+)*(?:=[^;]*)?$/.test(value.replace(/^=/, "")),
+  },
   ruby: { code: "e", valued: "IrCE", attached: "FixKTW", digits: "0", modes: ["-v", "--version", "-h", "--help"], fromInput: true },
   php: { code: "rRBE", valued: "dcfztSF", modes: ["-v", "-h", "-m", "-i", "-S", "-l"], fromInput: true },
   lua: { code: "e", valued: "l", modes: ["-v"], fromInput: true },
@@ -87,6 +95,61 @@ const INTERPRETERS: Record<string, Interpreter> = {
   elixir: { code: "e", valued: "r", long: ["--eval"] },
   expect: { code: "c", valued: "fbD" },
 };
+
+/** Environment assignments that change what code a command or interpreter can run. */
+const CODE_ENVIRONMENT_ASSIGNMENTS: ReadonlyArray<{ names: readonly string[]; raises: (value: string) => boolean }> = [
+  {
+    // Runtime code injection, shell startup, and interpreter startup hooks.
+    names: ["NODE_OPTIONS", "LD_PRELOAD", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "ENV", "PROMPT_COMMAND",
+      "PERL5OPT", "RUBYOPT", "PYTHONSTARTUP"],
+    raises: () => true,
+  },
+  {
+    // Git and SSH launch commands and helpers from these values.
+    names: ["GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_EXEC_PATH", "GIT_PROXY_COMMAND"],
+    raises: () => true,
+  },
+  {
+    // Pagers and editors are commands, except for these explicitly inert helpers.
+    names: ["GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL", "PAGER"],
+    raises: value => !["", "cat", "true", ":", "/dev/null"].includes(value),
+  },
+  {
+    // Git config environment variables can set options that launch helpers or aliases.
+    names: ["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_*", "GIT_CONFIG_VALUE_*"],
+    raises: () => true,
+  },
+  {
+    // Alternate Git config files can contain commands; /dev/null disables that config.
+    names: ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"],
+    raises: value => value !== "/dev/null",
+  },
+  {
+    // Plain relative entries are routine; outside or unresolved entries need strong review.
+    names: [
+      "NODE_PATH", // Redirects Node module resolution.
+      "PYTHONPATH", // Redirects Python imports.
+      "PERL5LIB", // Redirects Perl module loading.
+      "RUBYLIB", // Redirects Ruby library loading.
+      "LD_LIBRARY_PATH", // Redirects dynamic-library loading.
+      "GIT_DIR", // Selects a repository whose config can run commands.
+    ],
+    raises: value => value.split(":").some(entry => entry.startsWith("/") || entry.startsWith("~")
+      || entry.split("/").includes("..") || entry.includes("$")),
+  },
+];
+
+function isCodeEnvironmentAssignment(word: string): boolean {
+  const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word);
+  if (!assignment) return false;
+  const [, name, value] = assignment;
+  return CODE_ENVIRONMENT_ASSIGNMENTS.some(rule => rule.names.some(pattern => {
+    if (!pattern.endsWith("*")) return name === pattern;
+    const prefix = pattern.slice(0, -1);
+    return name.startsWith(prefix) && name.length > prefix.length;
+  }) && rule.raises(value));
+}
+
 /** Paths an interpreter reads as its standard input, as it reads `-`. */
 const STDIN_PATHS = new Set(["/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"]);
 /** The interpreter an executable name runs: `python3.12` is python, `nodejs`, `tsx` and `ts-node` are node, `luajit` is lua. */
@@ -113,7 +176,11 @@ function interpreterWords(spec: Interpreter, argv: readonly string[]): { code: b
     if (word.startsWith("--")) {
       const option = word.includes("=") ? word.slice(0, word.indexOf("=")) : word;
       if (spec.long?.includes(option)) { found.code = true; break; }
-      if (!word.includes("=") && spec.longValued?.includes(option)) index++;
+      if (spec.longValued?.includes(option)) {
+        const value = word.includes("=") ? word.slice(word.indexOf("=") + 1) : argv[index + 1];
+        if (value !== undefined && spec.codeValue?.(option, value)) { found.code = true; break; }
+        if (!word.includes("=")) index++;
+      }
       continue;
     }
     let stop = false;
@@ -127,6 +194,9 @@ function interpreterWords(spec: Interpreter, argv: readonly string[]): { code: b
       }
       if (spec.attached?.includes(letter)) break;
       if (spec.valued?.includes(letter)) {
+        const option = `-${letter}`;
+        const value = at + 1 === word.length ? argv[index + 1] : word.slice(at + 1).replace(/^=/, "");
+        if (value !== undefined && spec.codeValue?.(option, value)) { found.code = true; break; }
         if (at + 1 === word.length) index++;
         stop = Boolean(spec.stop?.includes(letter));
         break;
@@ -291,11 +361,18 @@ function changeDirectory(command: SimpleCommand, directory: Directory, real: Pat
 /** A wrapper's options, getopt style: `-abc` are flags until one takes a value, which is the rest of the word or the next word. */
 function wrapperOptions(words: ReadonlyArray<{ text: string; expands: boolean }>, start: number, wrapper: Wrapper, env: boolean) {
   const found: Array<{ option: string; value?: { text: string; expands: boolean } }> = [];
+  const assignments: string[] = [];
   let index = start;
   while (words[index]) {
     const text = words[index].text;
-    if (text === "--") { index++; break; }
-    if (env && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(text) || text === "-")) { index++; continue; }
+    if (text === "--") {
+      index++;
+      // GNU env still consumes assignments after its option terminator.
+      if (env) while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]?.text ?? "")) assignments.push(words[index++].text);
+      break;
+    }
+    if (env && /^[A-Za-z_][A-Za-z0-9_]*=/.test(text)) { assignments.push(text); index++; continue; }
+    if (env && text === "-") { index++; continue; }
     if (!text.startsWith("-") || text === "-") break;
     index++;
     if (text.startsWith("--")) {
@@ -314,7 +391,7 @@ function wrapperOptions(words: ReadonlyArray<{ text: string; expands: boolean }>
       break;
     }
   }
-  return { next: index, found };
+  return { next: index, found, assignments };
 }
 
 function lex(source: string, reasons: Set<string>): Token[] {
@@ -408,7 +485,11 @@ function build(tokens: Token[], reasons: Set<string>, directory: Directory, real
     words.push(token);
   }
   let start = 0;
-  while (start < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[start].text)) start++;
+  let codeEnvironment = false;
+  while (start < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[start].text)) {
+    codeEnvironment ||= isCodeEnvironmentAssignment(words[start].text);
+    start++;
+  }
   let privileged = false;
   let cwd = directory;
   let body: string | undefined;
@@ -425,7 +506,8 @@ function build(tokens: Token[], reasons: Set<string>, directory: Directory, real
     if (!wrapper) break;
     if (PRIVILEGE.has(name)) privileged = true;
     wrapperAt = start;
-    const { next, found } = wrapperOptions(words, start + 1, wrapper, name === "env");
+    const { next, found, assignments } = wrapperOptions(words, start + 1, wrapper, name === "env");
+    if (name === "env") codeEnvironment ||= assignments.some(isCodeEnvironmentAssignment);
     const has = (set: ReadonlySet<string> | undefined) => found.some(({ option }) => set?.has(option));
     start = next;
     shellWithoutCommand = Boolean(wrapper.alwaysShell) || has(wrapper.shell);
@@ -480,9 +562,14 @@ function build(tokens: Token[], reasons: Set<string>, directory: Directory, real
     start = wrapperAt;
   }
   const argv = words.slice(start).map(word => word.text);
-  if (!argv.length && !redirects.length && body === undefined) return undefined;
   const nameWord = words[start];
   const name = nameWord ? posix.basename(nameWord.text) : "";
+  // Declaration builtins retain assignments in argv instead of consuming them as a command prefix.
+  if (name === "export" || name === "readonly"
+    || (["declare", "typeset"].includes(name) && argv.slice(1).some(word => /^-[A-Za-z]*x[A-Za-z]*$/.test(word))))
+    codeEnvironment ||= argv.slice(1).some(isCodeEnvironmentAssignment);
+  if (codeEnvironment) reasons.add("code-environment");
+  if (!argv.length && !redirects.length && body === undefined) return undefined;
   if (nameWord?.expands) reasons.add("variable-command");
   // A remote command runs on another host, which the host rules cannot read.
   if (name === "ssh") reasons.add("remote-command");

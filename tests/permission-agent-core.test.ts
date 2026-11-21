@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, normalize } from "node:path";
 import { classify, classRulesDigest, EMBEDDED_COMMAND_LIMITS, raise } from "../packages/host/src/permission-classes.js";
 import { detectPrompt, type Prompt } from "@infinite/attention";
 import { familyOf } from "../packages/host/src/permission-families.js";
@@ -642,4 +642,20 @@ test("readiness needs a current replay result under the threshold; a policy, cla
   current = settings({ light: undefined, strong: [strongClaude, { ...strongClaude, id: "strong-claude-2", model: "sonnet" }] });
   assert.match(reasons(), /No light profile is configured/);
   assert.match(reasons(), /Strong profiles come from 1 model family; at least two are needed/);
+});
+
+test("one reading resolves each path once, so the class rules and the raise rules judge the same file system", () => {
+  // A resolver whose answer for a path changes between two calls, as a link replaced mid-decision does.
+  const calls = new Map<string, number>();
+  const resolvePath = (path: string) => {
+    const seen = (calls.get(path) ?? 0) + 1;
+    calls.set(path, seen);
+    return path.endsWith("/notes") && seen > 1 ? "/etc/sudoers" : normalize(path);
+  };
+  const core = createPermissionAgentCore({ settings: settings(), launcher: fakeLauncher(() => "no-report").launcher, resolvePath });
+  const rules = core.readRules(bash("cat ../shared/notes && sh -c \"cat ../shared/notes\" && cp draft.txt ../shared/notes"), CLASSES);
+  assert.deepEqual([...calls.values()].filter(count => count > 1), [], "no path is resolved twice in one reading");
+  assert.equal(rules.match, undefined);
+  assert.ok(rules.raised.includes("raise:outside-root"));
+  assert.ok(!rules.raised.includes("raise:reject-history"));
 });

@@ -110,10 +110,15 @@ export function createPermissionAgentCore(options: PermissionCoreOptions): Permi
   const facts = options.facts ?? {};
   const launcher = options.launcher;
   const real = purpose === "replay" ? undefined : options.resolvePath;
-  /** The request and its reading as the host rules judge them. */
+  /** The request and its reading as the host rules judge them. Within one reading each path is resolved once. */
   const read = (request: PermissionRequest) => {
-    const judged = real ? withRealRoots(request, real) : request;
-    return { judged, reading: readRequest(judged, real) };
+    const resolved = new Map<string, string | undefined>();
+    const once = real && ((path: string) => {
+      if (!resolved.has(path)) resolved.set(path, real(path));
+      return resolved.get(path);
+    });
+    const judged = once ? withRealRoots(request, once) : request;
+    return { judged, reading: readRequest(judged, once) };
   };
 
   const tierRecord = (tier: PermissionTierName, profile: TeamModelProfile, startedAt: string, endedAt: string): PermissionTier =>
@@ -145,6 +150,10 @@ export function createPermissionAgentCore(options: PermissionCoreOptions): Permi
     classify: (request, interruptClasses) => { const { judged, reading } = read(request); return classify(judged, interruptClasses, facts, reading); },
     qualify,
     raise: (request, context) => { const { judged, reading } = read(request); return raise(judged, context, reading, facts); },
+    readRules: (request, interruptClasses) => {
+      const { judged, reading } = read(request);
+      return { match: classify(judged, interruptClasses, facts, reading), raised: raise(judged, { rejectHistory: false }, reading, facts) };
+    },
 
     readiness(): PermissionReadiness {
       const settings = settingsOf();

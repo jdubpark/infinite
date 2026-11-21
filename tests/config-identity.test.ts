@@ -411,9 +411,8 @@ test("entry tools change the prompt version only for entry roles", () => {
 // Moved from a2505cbe because INF-343 adds project-manager and reviewer guidance across providers.
 const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
 const PIN_PROVIDERS = ["claude", "codex", "opencode"] as const;
-const PIN_VERSIONS_SHA256 = "f154a03956e03c0d06e915fa123a8976de1a200559b3aae81b08c515d011df6a";
-const PIN_CODEX_VERSIONS_SHA256 = "787d7cd1ec48ff94914913c41b1b15e759ee1b1e1b37b53d2505c928ed362942";
-const BASE_CODEX_VERSIONS_SHA256 = "fc50ece0f8f9dc245491da070464166ff4d0f952a5e239008419d2e72964ad52";
+const PIN_VERSIONS_SHA256 = "08ae370cd80e29585b7959874c8e934b537f29893e2a4c5d06f7757bc321d016";
+const PIN_CODEX_VERSIONS_SHA256 = "39610cc28024e7641ae55f511218e2d094d82fbeab195c0560ae8cb4312ad61a";
 const PIN_NON_CODEX_VERSIONS_SHA256 = "804d29fbd0d0bc826c7ef1cbcceff6b985ac61ed83b43996001ff4657418154c";
 
 test("the switch off keeps every prompt version", () => {
@@ -422,7 +421,6 @@ test("the switch off keeps every prompt version", () => {
   const codex = PIN_ROLES.map(role => promptVersion(role, "codex", undefined, true));
   const nonCodex = PIN_ROLES.flatMap(role => (["claude", "opencode"] as const).map(provider => promptVersion(role, provider, undefined, true)));
   assert.equal(createHash("sha256").update(JSON.stringify(codex)).digest("hex"), PIN_CODEX_VERSIONS_SHA256);
-  assert.notEqual(PIN_CODEX_VERSIONS_SHA256, BASE_CODEX_VERSIONS_SHA256, "Codex receives the new member-tool guidance");
   assert.equal(createHash("sha256").update(JSON.stringify(nonCodex)).digest("hex"), PIN_NON_CODEX_VERSIONS_SHA256, "Claude and OpenCode versions include the all-provider guidance");
   for (const role of PIN_ROLES) for (const provider of PIN_PROVIDERS) {
     assert.equal(promptVersion(role, provider, undefined, true, false, false), promptVersion(role, provider, undefined, true));

@@ -28,7 +28,7 @@ export const codexMemberToolInstructions = (entryTools: boolean) => {
       `entry_post({entry}) -> {${resultFields("entry_post")}}`,
     ] : []),
   ];
-  return `Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. The session record keeps each nested call and its result, with long results shortened there, so you do not need to print a result to keep it. When a program lists or reads items, print how many it listed, read, and matched. Read the context file inside a program and select only fields needed for your next decision. Tool signatures (arguments -> result fields): ${signatures.join("; ")}.`;
+  return `Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures (arguments -> fields of a successful result's structuredContent): ${signatures.join("; ")}.`;
 };
 /** Every member and session reads it: a reject is final, and the same effect is never reached another way. */
 export const permissionRejectInstructions = "A rejected permission request is final for that request. Do not reach the same effect with another tool, command, or route.";
@@ -329,8 +329,6 @@ const [commandHead, commandTail] = reportingInstructions("opencode", "\0").split
 /** Current MCP paragraphs and helper commands from prompts written by earlier releases. */
 const reportingPattern = () => new RegExp(`${escape(reportingInstructions("claude"))}|${escape(reportingInstructions("codex"))}|${escape(commandHead)}[^\\n]+?${escape(commandTail)}`, "g");
 const profilePattern = new RegExp(`Requested runtime profile: [^\\n]+?${escape(profileSuffix)}`);
-const codexSandboxPattern = () => new RegExp(`(?:^|\\n\\n)?${escape(codexSandboxInstructions)}(?=\\n\\n|$)`, "g");
-const codexMemberToolPattern = () => new RegExp(`(?:^|\\n\\n)?(?:${escape(codexMemberToolInstructions(false))}|${escape(codexMemberToolInstructions(true))})(?=\\n\\n|$)`, "g");
 /** Refreshes a carried prompt's report channel without changing prompts that have no known paragraph. */
 /** The entry paragraphs of every provider. The "other" form holds the helper's command, which may vary by install. */
 const entryPattern = () => {
@@ -341,26 +339,60 @@ export function refreshReportingInstructions(prompt: string, provider: Provider)
   const withEntry = entryPattern().test(prompt) ? prompt.replace(entryPattern(), () => entryInstructions(provider)) : prompt;
   return reportingPattern().test(withEntry) ? withEntry.replace(reportingPattern(), () => reportingInstructions(provider)) : withEntry;
 }
-function refreshCodexSandboxInstructions(prompt: string, provider: Provider) {
-  const withoutPreviousGuidance = prompt.replace(codexSandboxPattern(), "").replace(codexMemberToolPattern(), "");
-  const permissionCoordinator = /^You are the team's permission-coordinator\./m.test(prompt);
-  if (provider !== "codex" || permissionCoordinator) return withoutPreviousGuidance;
-  const report = reportingInstructions(provider);
-  const contextInstructions = contextAccessInstructions();
-  const guidance = `${codexSandboxInstructions}\n\n${codexMemberToolInstructions(entryPattern().test(withoutPreviousGuidance))}`;
-  return withoutPreviousGuidance.includes(contextInstructions)
-    ? withoutPreviousGuidance.replace(contextInstructions, `${guidance}\n\n${contextInstructions}`)
-    : withoutPreviousGuidance.replace(report, `${guidance}\n\n${report}`);
+function guidanceAnchor(prompt: string) {
+  const context = contextAccessInstructions();
+  const contextIndex = prompt.indexOf(context);
+  if (contextIndex >= 0) return { text: context, index: contextIndex };
+  const report = reportingPattern().exec(prompt);
+  return report?.index === undefined ? undefined : { text: report[0], index: report.index };
+}
+/** Remove only our live block at its designated insertion point; quoted copies elsewhere are accumulated evidence. */
+function removeAdjacentCodexGuidance(prompt: string, anchorIndex: number) {
+  if (prompt.slice(anchorIndex - 2, anchorIndex) !== "\n\n") return prompt;
+  const paragraphEnd = anchorIndex - 2;
+  const paragraphSeparator = prompt.lastIndexOf("\n\n", paragraphEnd - 1);
+  const paragraphStart = paragraphSeparator < 0 ? 0 : paragraphSeparator + 2;
+  const lastParagraph = prompt.slice(paragraphStart, paragraphEnd);
+  let blockStart: number | undefined;
+  if (lastParagraph === codexSandboxInstructions) {
+    blockStart = paragraphStart;
+  } else if (lastParagraph.startsWith("Working rule for tools:") && prompt.slice(paragraphStart - 2, paragraphStart) === "\n\n") {
+    const sandboxEnd = paragraphStart - 2;
+    const sandboxSeparator = prompt.lastIndexOf("\n\n", sandboxEnd - 1);
+    const sandboxStart = sandboxSeparator < 0 ? 0 : sandboxSeparator + 2;
+    if (prompt.slice(sandboxStart, sandboxEnd) === codexSandboxInstructions) blockStart = sandboxStart;
+  }
+  return blockStart === undefined ? prompt : prompt.slice(0, blockStart) + prompt.slice(anchorIndex);
+}
+/** Older intent checkers put the sandbox paragraph between the read-only rule and their profile. */
+function removeLegacyIntentCheckerSandbox(prompt: string) {
+  const profile = profilePattern.exec(prompt);
+  if (!profile) return prompt;
+  const legacy = `\n\n${readOnlyWorkspaceInstructions}\n\n${codexSandboxInstructions}\n\n`;
+  const reportStart = profile.index + profile[0].length + 2;
+  if (!prompt.slice(0, profile.index).endsWith(legacy) || prompt.slice(reportStart - 2, reportStart) !== "\n\n"
+    || reportingPattern().exec(prompt)?.index !== reportStart) return prompt;
+  return prompt.slice(0, profile.index - codexSandboxInstructions.length - 2) + prompt.slice(profile.index);
+}
+function refreshCodexSandboxInstructions(prompt: string, provider: Provider, role: TeamMember["role"], entryTools: boolean) {
+  let refreshed = role === "intent-checker" ? removeLegacyIntentCheckerSandbox(prompt) : prompt;
+  let anchor = guidanceAnchor(refreshed);
+  if (anchor) refreshed = removeAdjacentCodexGuidance(refreshed, anchor.index);
+  if (provider !== "codex" || role === "permission-coordinator") return refreshed;
+  anchor = guidanceAnchor(refreshed);
+  if (!anchor) return refreshed;
+  const guidance = `${codexSandboxInstructions}\n\n${codexMemberToolInstructions(entryTools)}`;
+  return refreshed.slice(0, anchor.index) + guidance + "\n\n" + refreshed.slice(anchor.index);
 }
 /**
  * Points a member's accumulated prompt, feedback and answers included, at another provider and
  * profile. Returns undefined when the prompt lacks a recognizable reporting paragraph or profile
  * line, so a caller never launches a member with another provider's reporting instructions.
  */
-export function retargetPrompt(prompt: string, to: { provider: Provider; profile: TeamModelProfile }) {
+export function retargetPrompt(prompt: string, to: { provider: Provider; profile: TeamModelProfile; role: TeamMember["role"]; entryTools: boolean }) {
   if (!reportingPattern().test(prompt) || !profilePattern.test(prompt)) return undefined;
   const retargeted = refreshReportingInstructions(prompt, to.provider).replace(profilePattern, () => profileInstructions(to.profile));
-  return refreshCodexSandboxInstructions(retargeted, to.provider);
+  return refreshCodexSandboxInstructions(retargeted, to.provider, to.role, to.entryTools);
 }
 /** The coordinator's explore paragraph when the host selects each scout's profile (`hostSelects(run, "scout")`). */
 const HOST_SCOUT_SENTENCE = "The host assigns each scout's profile; omit agentProfileId from scouts.";

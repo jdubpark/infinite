@@ -1595,7 +1595,10 @@ The coordinator can report that no further change is justified by the evidence.
 The goal then stops as `no-opportunity`, or `ready-for-review` if an earlier cycle
 produced reviewed changes. Exhausted attempts or time produce `limit-reached`;
 reaching the cycle limit leaves reviewed work ready for inspection. None of
-these states means the desired product outcome was achieved.
+these states means the desired product outcome was achieved. A goal on a project
+with `objective.evaluator` on can also stop as `ready-for-review` with
+`stopReason: "provisional-met"` (see [Verdicts](#verdicts)). That too is
+an agent assessment for the owner to answer, not an outcome.
 
 After a goal has stopped and has no active cycle or pending operation, an owner
 or controller can record `achieved`, `not-achieved`, or `inconclusive`, with an
@@ -1650,7 +1653,7 @@ the next cycle of an `autonomous` goal stays `autonomous`, and its checks skip
 with `no-eligible-profile`.
 
 **Evaluators.** The lineup's `evaluators` slot lists at most 4 strong profiles
-that may check a plan. Without the slot, the list is derived when the lineup is
+that may check a plan. The same list supplies the evaluator of a verdict (see [Verdicts](#verdicts)). Without the slot, the list is derived when the lineup is
 read: the reviewer, when its tier is `strong`, then each strong escalation, first
 id wins, at most 4. The derived list is never written back to the configuration.
 
@@ -1814,7 +1817,7 @@ The register is the set of assumptions and open questions in a goal's objective 
 
 A command test reads only the final check round of the revision, and only a check run in that round, not one from a setup phase. It is `unknown` when its command is not one of the project's configured checks now, or when its result is interrupted, running, or absent. An outside citation is `unknown`, and so is a read that fails, is too large, or is not run. `unknown` never changes a status and is never a number.
 
-A pass runs when a run settles as `ready-for-review`, `merged`, or `blocked` and has a check for its current revision. It is `reviewed` when the head is checked and the run is approved at that revision. Otherwise it is a `check` pass, which tests command checks and command tests only and reads no blob. A pass reads the commit it was marked at, not the run's current head, so a pass that outlives a revision still reads and files receipts for its own commit. One pass runs at a time, oldest first. A pass plans at most 40 subjects and reads at most 40 distinct blobs. Each read is at most 1 MiB and 30 seconds, and a pass starts no read after 120 seconds. While 4 reads are stalled, no new read starts. A pass changes only the record and the run's register state. It never changes the run's status, and a refuted assumption does not hold the next cycle; the refutation writes one event until the interruptions slice (C18) is built.
+A pass runs when a run settles as `ready-for-review`, `merged`, or `blocked` and has a check for its current revision. On a run pinned `verdicts: "on"` (see [Verdicts](#verdicts)), the reviewed pass runs earlier: the run is held after its review approves, the host asks for the pass at that point, and the verdict waits for it before the run settles. It is `reviewed` when the head is checked and the run is approved at that revision. Otherwise it is a `check` pass, which tests command checks and command tests only and reads no blob. A pass reads the commit it was marked at, not the run's current head, so a pass that outlives a revision still reads and files receipts for its own commit. One pass runs at a time, oldest first. A pass plans at most 40 subjects and reads at most 40 distinct blobs. Each read is at most 1 MiB and 30 seconds, and a pass starts no read after 120 seconds. While 4 reads are stalled, no new read starts. A pass changes only the record and the run's register state. It never changes the run's status, and a refuted assumption does not hold the next cycle; the refutation writes one event until the interruptions slice (C18) is built.
 
 Form B1 is the only new Git form. It runs in the run's integration checkout, after the six `-c` settings of the capture section:
 
@@ -1824,7 +1827,7 @@ Form B1 is the only new Git form. It runs in the run's integration checkout, aft
 
 The launcher must end B1 by itself after 35 seconds, as it ends the capture reads. Until the owner installs a launcher that admits B1, every artifact and citation result is `unknown`.
 
-**Receipts.** A test result is a receipt: its handle, kind, subject, ID, commit, outcome (`pass`, `fail`, or `unknown`), time, and a detail of enumerations and counts. The receipts of the latest pass, at most 40, live in the run's sealed record. No view shows them. A receipt sets an unpinned assumption to `verified` or `refuted` when its outcome differs from the status. It writes nothing when it agrees. A pinned assumption keeps its status and gains the receipt's handle only when the outcome differs. Each assumption keeps one `receipt:` handle. Criteria get receipts but no status.
+**Receipts.** A test result is a receipt: its handle, kind, subject, ID, commit, outcome (`pass`, `fail`, or `unknown`), time, and a detail of enumerations and counts. The receipts of the latest pass, at most 40, live in the run's sealed record. No view shows them. A receipt sets an unpinned assumption to `verified` or `refuted` when its outcome differs from the status. It writes nothing when it agrees. A pinned assumption keeps its status and gains the receipt's handle only when the outcome differs. Each assumption keeps one `receipt:` handle. Criteria get receipts but no status. A verdict reads them (see [Verdicts](#verdicts)).
 
 **Proposals.** A member proposes through the `assumption` field of a `finding` entry. The field either stances an existing assumption with `supports` or `contradicts`, or proposes a new one with a statement, a `refutedBy` observation, a test, and a criticality. Statements and `refutedBy` are at most 500 bytes each, and a test is at most 1,024 bytes of JSON. The entry route refuses a secret-shaped proposal with `422` and `entry-secret`. The host screens each proposal again before it applies it. A drop counts under its reason, and the first drop of a run writes one event.
 
@@ -1855,6 +1858,109 @@ A score must be 1 to 5 in halves, such as `3.5`. Any other score is a usage erro
 2. Finish or cancel a goal whose pending launch holds a register digest. The older host refuses that digest, so the goal blocks.
 3. Owner results already recorded stay in the record. The older host reads the latest version, but a version before a register entry answers `409` with `objective-version-unavailable`.
 4. A run pinned `register: "on"` loses its tests and proposals. The older host ignores `run.register` and the sealed register state. Findings that carry `assumption` never reach its board, and its entry route refuses new ones with `400`.
+
+### Verdicts
+
+On a run the owner opted in, the host starts one read-only `evaluator` member before the run settles. It combines the evaluator's report with host receipts and owner values into one verdict. The verdict is always shown as "Agent assessment, provisional". It is a claim about the objective record's criteria, not an outcome: only the owner's recorded outcome can mark a goal `achieved`, and the host approves nothing on a verdict's account. Without the setting below, a run and a goal are as they were before, byte for byte.
+
+**The setting.** `objective.evaluator` takes `"on"` or `"off"` and has no default. It is off unless set, in every mode, autonomous mode included. It needs `objective.register: "on"`, because host criteria take their state from the register's receipts. Writing the key at all changes the routine approval digest, so active routines wait for the owner's approval again. A run pins `run.verdicts: "on"` when it is created, and only when both keys are `"on"`. A mission subteam and a handoff run never pin it. A run created before this change never gets a verdict, even after a restart, and a pin already taken never moves. The team view shows the pin as `verdicts`.
+
+**When it runs.** The host holds the run at two points, before delivery or settle:
+
+- **Reviewed:** after the review approves a revision. The host first asks the register for a reviewed pass at the head and waits for it, so the evaluator and the composition read the same receipts. The hold comes before the read-only Git check of the integration checkout, so a held tick runs no Git command.
+- **No change:** when the project manager of a goal cycle reports `no-change` and the cycle started from a reviewed head. The verdict reads that head and takes its receipts from the parent run's reviewed pass. The report waits until the verdict is done. A first cycle that reports no change gets no verdict. Only a valid no-change report is held: no tasks, and the head equal to the base.
+
+A blocked, paused, or cancelled run gets no verdict. A standalone run gets one at the reviewed hold, for display only. A new revision (a steer, a resume, a replan) discards a verdict that has not finished, writes nothing from it, and holds the new revision again. While the launch fuse is open, the verdict waits with it.
+
+**Choosing the evaluator.** The host picks a profile from the lineup's `evaluators` (see [Intent check](#intent-check) for how that list is derived) by three rules:
+
+1. The profile's model family is known and differs from the coordinator's, and the profile's model never authored work in the run. An author is any implementer or integrator member of the run that holds a `result` report, in any revision, so work integrated before a steer or a resume still counts. A second profile of the same model cannot pass. Counting too many authors only gives `no-independent-evaluator`.
+2. Among the profiles that pass, the host prefers the first whose family neither authored nor reviewed in the run, then the first whose family authored nothing, then the first.
+3. The assessment records `sharedFamily` (the evaluator's family authored integrated work) and `alsoReviewed` (its model reviewed a change in the run). Having reviewed does not exclude a profile, because the evaluator never sees its own review.
+
+A profile on a limited provider is skipped. The router does not avoid `evaluators` profiles when it picks profiles for a cycle's tasks, so a lineup whose evaluators are all also implementers can end with `no-independent-evaluator`.
+
+**What the evaluator reads.** Its prompt is fixed text. Its context file holds the record's statement, directions, definitions, rules, non-goals, and active criteria (`id`, statement, check, producer, threshold); the head and the base; the changed paths; the final check round's names and statuses; the receipts at the head (handle, kind, id, outcome); and the rubric. Rubric version 1 has two items: `owner-text` and `method-applied`. The context holds no assumption, question, proposal, log entry, earlier verdict, member report, brief, finding, routing value, or credential. It is at most 1 MiB; a larger context gives `context-too-large`. The evaluator works in a read-only copy at the head. It has no entry tools and cannot launch, edit, or approve.
+
+**What the evaluator reports.** One report of kind `verdict`: a `result`, and between 1 and 8 criteria, each with an `id`, a `state` (`met`, `not-met`, or `inconclusive`), up to 8 evidence handles of at most 400 characters, and an optional note of 1 to 500 bytes. A handle is `receipt:...` copied from the context, `file:PATH`, or `file:PATH#Lfrom-Lto`. A report of another kind is replaced by fixed text and counts as a failure. The host keeps the report sealed with the run, outside the run record. No note or handle appears in a view, an event, the blackboard, a log entry, a ledger row, or a later member's context. The owner reads notes and handles through the verdicts read below.
+
+**Composition.** The host keeps the evaluator's own result and computes the composed result, one state per active criterion:
+
+| Producer | State |
+| --- | --- |
+| `host`, check `command` or `artifact` | The register's receipt for that criterion at the head, whatever the evaluator said: `pass` is `met`, `fail` is `not-met`, `unknown` is `inconclusive` (`receipt-unknown`). No receipt is `inconclusive` (`no-receipt`). |
+| `host`, check `receipt` | `checks-passed` and `review-approved` are host facts at the hold. No fact is `inconclusive` (`no-receipt`). `merged` and `landed` are `inconclusive` (`before-delivery`); see the known limits. |
+| `owner` | The owner's newest rating on the same head, against the threshold: `met` or `not-met`. Otherwise `pending-owner`. A rating on an older head judges older work, so a new head waits for a new rating. An owner criterion whose check is not an owner rating is `inconclusive` (`no-receipt`). |
+| `evaluator` | The evaluator's state, when every handle it gave resolves and a `met` gives at least one. A handle resolves when it names a receipt in the context, or a `file:` path (at most 300 characters) that is one of the changed paths or is named by an active artifact check. The host reads no file to resolve it. Otherwise `inconclusive` (`unresolved-evidence`). Citation handles never resolve yet. A criterion the evaluator did not judge is `inconclusive` (`not-assessed`). With no evaluator answer at all, `inconclusive` (`no-evaluator`). |
+
+Two rules apply on top:
+
+- A criterion whose `pinned` file changed in the run cannot be `met`. It is `inconclusive` (`pinned-changed`) until the owner pins the new blob. A change list that is cut short voids `met` for every pinned criterion.
+- When a host criterion's receipt and the evaluator disagree (`met` against `not-met`), the receipt stands and the record's log gets an `evaluator-contradicted-receipt` entry. An evaluator `inconclusive` is no contradiction.
+
+The composed result is `not-met` when any criterion is `not-met`, whoever produced it. Otherwise it is `inconclusive` when any criterion is `inconclusive`, or when there are no active criteria. Otherwise it is `met`. A `pending-owner` criterion never blocks `met`. `c0` is always an evaluator criterion, so every composed result holds an agent judgement.
+
+**Answers the host does not apply.**
+
+- An evaluator answer for an id that is not an active criterion is dropped and counted.
+- An evaluator answer for a criterion that changed after the evaluator read it is not applied. The host keeps a digest of each criterion's statement and check from the time it built the context. A criterion that changed, or that the context did not hold, composes as `not-assessed`.
+
+**Limits and failures.**
+
+- **Wait for tests.** The verdict waits for the register's pass for at most five minutes. After that, it goes on with the receipts that exist, and a host criterion without one is `inconclusive` (`no-receipt`). A no-change verdict waits for its parent run's pass under the same bound.
+- **One replacement.** An evaluator that stops, stalls, hits a limit, or sends no usable report is replaced once, by the same rules and without the failed profile. A read-only check of the evaluator's working copy that ends without a result counts as an evaluator failure. A second failure gives `inconclusive` with `evaluator-unavailable`. A pause, cancel, block, or recovery that stops the check counts no failure and writes nothing.
+- **No evaluator.** With no eligible profile (`no-independent-evaluator`), every eligible provider limited (`evaluator-unavailable`), or a context over the limit (`context-too-large`), no member starts. The host composes host and owner criteria, every evaluator criterion is `inconclusive`, and the run goes on.
+- **The attempt limit.** The evaluator counts as one agent attempt, and so does its replacement. A run at its limit of attempts gets no evaluator (`evaluator-unavailable`) and settles as it would without verdicts; the limit never stops a run because of the evaluator. A goal cycle with room for only its planner, one implementer, the integrator, and the reviewer therefore gets an `inconclusive` assessment.
+- **Unreadable record.** `record-unavailable` gives `inconclusive` for every criterion, sets the run's assessment, and adds one event. It writes no ledger row (see Known limits).
+- **Full or failing record write.** When the record's log is full, or its write fails, the assessment stays on the run and the goal, one event says so, and the record is unchanged.
+
+**What the verdict records.**
+
+- **On the run:** `run.assessment`, with ids, enumerations, and counts only: the verdict id, revision, head, kind (`reviewed` or `no-change`), the composed result, the evaluator's result, the reason, the four counts, and each criterion's state. It reaches every team view and relay device.
+- **In the record:** each active criterion's `latest` (`{ state, verdictId }`, never a note) and one `verdict.recorded` log entry per verdict, plus one `evaluator-contradicted-receipt` entry for each contradicted criterion. Verdict entries write only while the log stays under 300 entries and 160 KiB.
+- **In the ledger:** one `objective_verdicts` row per verdict, in the evidence store module `objective-verdicts`, projected from the run's `verdict.recorded` event. The row holds the verdict id, blind indexes of the project and the goal, the run id, the cycle, the revision, the kind, the record version, the rubric version, the evaluator's profile id, provider, model, and family, the flags `shared_family` and `also_reviewed`, the composed and the evaluator's result, the reason, one count per state, and the time. It holds no note, handle, or other text. Rows are kept 730 days, and a deleted run's rows are marked, not removed.
+- **Reasons.** A verdict carries at most one of four reasons: `no-independent-evaluator`, `evaluator-unavailable`, `record-unavailable`, and `context-too-large`. A criterion carries at most one of seven: `no-receipt`, `receipt-unknown`, `before-delivery`, `pinned-changed`, `unresolved-evidence`, `not-assessed`, and `no-evaluator`.
+- **In events:** fixed text with a result and counts. They never hold evaluator text.
+
+**In a goal.** `GoalCycle.assessment` copies the run's assessment and adds `progress`: the change in the number of `met` criteria since the previous cycle that had an assessment. Only an autonomous goal acts on a verdict. A supervised goal and a standalone run show it and change nothing.
+
+- **Finite goal.** A composed `met` on a reviewed cycle stops the goal as `ready-for-review` with `stopReason: "provisional-met"`. Its status is never `achieved`, and its reason reads `An agent assessment, provisional, found every criterion met. Record your assessment: achieved, or not achieved with continue.` Any other result starts the next feature, as before.
+- **Owner answer.** `POST /api/goals/:id/outcome` takes two more optional fields. `verdictId` names the assessment the owner answers. `continue: true` is allowed only with `result: "not-achieved"` and a `verdictId`, on a goal stopped by `provisional-met` whose newest assessment that `verdictId` names. It appends the outcome's `summary` as a steering entry, which the next cycle's objective prints as a user direction, and sets the goal `running`. Roles and relay rules are the outcome route's own. Refusals: `409` `verdict-not-found` (the id names no assessment of this goal), `409` `goal-not-provisional`, `409` `goal-limit-reached` (the deadline, the ceiling, or the member allowance is spent), `409` `goal-steering-limit`, and `400` for `continue` without `verdictId` or with another result. A refused answer changes nothing. `achieved` with the same `verdictId` sets the goal `achieved`.
+- **Standing goal.** A `met` is recorded, and the next cycle starts at its cadence. A cycle with an assessment fails when its composed result is not `met` and its `progress` is not positive. Three failed cycles in a row pause the goal with `repeated-failures`, as before, and a resume resets the count. A cycle with no assessment is classified as before.
+- **Criteria rows.** The next cycle's project manager gets one row per active criterion of the newest assessment: its id, its status (`met`, `not-met`, `inconclusive`, or `pending-owner`), and its check label (at most 120 bytes), led by the line "Agent assessment, provisional, of the previous cycle:". The rows reach only the project manager's prompt and context file, and only for an autonomous goal with prompts and the evaluator on. No other role gets a row, and no row holds a note, score, threshold, count, model, or profile.
+
+**Reads.**
+
+- `GET /api/goals/:id/verdicts` returns each cycle's verdict: the label, the composed and the evaluator's result, the counts, `progress`, the owner's outcome with that `verdictId` and whether it agrees (`met` with `achieved`, or `not-met` with `not-achieved`), and each criterion's producer, label, state, reason, receipt, handles, and note. A cycle's `detail` is `available` while the run's record lasts. After that it is `expired`, and the cycle shows its summary with no criteria. The roles are owner, controller, and viewer. The relay refuses the path.
+- A criterion's label follows one rule. A `pending-owner` criterion is `waiting for you`, whoever produces it. Otherwise a host criterion is `host receipt`, an owner criterion is `your rating`, and an evaluator criterion is `agent assessment`. The goal page and the phone show them as "Host receipt", "Waiting for you", "Your rating", and "Agent assessment, provisional".
+- `infinite goal verdicts ID [--json]` prints one block per cycle. A block has the line `Cycle N · Agent assessment, provisional · RESULT`, with `(evaluator said RESULT)` when the results differ. It then has an optional `Reason:` line, a line of counts and progress (`Met 1 · not met 0 · inconclusive 1 · waiting for you 0 · progress 1`), and an optional `You answered RESULT` line, marked `(agrees)` when it agrees. A cycle whose detail expired has the line `Details expired: this run's record is gone.` Each criterion has one line: its id, state, label, and reason. The text form prints no note and no handle. `--json` prints the response, notes and handles included. A goal with no assessment prints `No cycle of this goal has an assessment.`
+- Through team and goal views, every device, relay devices included, sees `run.verdicts`, `run.assessment`, `GoalCycle.assessment`, and an outcome's `verdictId`. All hold ids, enumerations, and counts.
+- The goal page and the phone's goal screen show each cycle's "Agent assessment, provisional", its counts, and, when they differ, the evaluator's own result. The owner opens a cycle to read its criteria. The owner's outcome shows as "Your assessment". A goal stopped by `provisional-met` offers "Achieved" and "Not achieved, continue". The Mac app does not show verdicts.
+
+**What a restart does.** The host fences an operation that a restart interrupted. It never replays it, so nothing is written twice.
+
+**Known limits.**
+
+- `merged` and `landed` receipt criteria are `inconclusive` (`before-delivery`), because the verdict comes before delivery. A goal whose record holds one never reaches a provisional `met`: the owner retires or edits that criterion. A step after delivery is a later change.
+- The ledger undercounts: a `record-unavailable` verdict writes no row, because a row needs a record version.
+- After a crash between the goal record's write and the run's save, the record holds one `verdict.recorded` entry for a verdict that has no assessment on the run and no ledger row. The run is fenced, and nothing is written twice.
+- For a no-change verdict, the run can be saved as released one step before the service saves the no-change result.
+- The lineup warning is not built. `evaluatorOverlaps` finds the evaluator profiles whose model also sits in `implementers` or `escalations`, but the enrollment view and `infinite repo init` do not show the result yet.
+- Agreement statistics wait. The verdicts read shows whether the owner agreed, but the ledger row has no agreement column and there is no per-profile agreement cell.
+- Not built: `until-met` standing goals, the goal digest's other fields, citation handles, and a goal roll-up of the latest assessment in the outcome ledger.
+- A verdict delays delivery by one read-only member.
+- The wait for the host's tests is 300,000 ms by the clock. After the host was down for longer, the verdict goes on without the receipts as soon as the host is back, and a host criterion without a receipt is `inconclusive` (`no-receipt`).
+- While a no-change cycle's verdict is held, the run still shows `planning`. The fixed event is the only sign of the hold.
+- The evaluator's fixed prompt gets the same graph and scratch-directory paragraphs the host appends to every member's prompt.
+
+**Rollback.** Before a rollback to a host without this change:
+
+1. Remove `objective.evaluator` from every project. The older host refuses the project schema with that key.
+2. Finish or cancel each run with a live `evaluator` member. The older host refuses the role.
+3. Finish or cancel a goal whose pending launch holds criteria rows. The older host refuses that context, so the goal blocks.
+4. Record the owner's outcome on every goal stopped with `stopReason: "provisional-met"`. The older host does not know that value.
+5. A record with verdict entries still parses, but a version before one answers `409` with `objective-version-unavailable`. The latest version still reads.
+6. The older host ignores `run.verdicts`, `run.assessment`, the sealed verdict, `GoalCycle.assessment`, and `verdictId`.
 
 ### Standing objectives
 
@@ -1913,8 +2019,10 @@ A standing goal never stops as `ready-for-review`, `no-opportunity`, or
   `reasonCode: "external-operation"`. Starting from the older parent could
   redo work that already landed.
 - Three cycles in a row fail. The goal becomes `paused` with
-  `reasonCode: "repeated-failures"`. A `reviewed` or `no-change` cycle ends the
-  run of failures, and an `excluded` cycle leaves it as it is. A resume resets
+  `reasonCode: "repeated-failures"`. With `objective.evaluator` on, a cycle that
+  has a verdict also fails when its composed result is not `met` and its progress
+  is not positive (see [Verdicts](#verdicts)). A `reviewed` or `no-change` cycle without
+  a failing verdict ends the run of failures, and an `excluded` cycle leaves it as it is. A resume resets
   the count.
 - The Linear issue blocks it, or the host lineup no longer has a strong
   coordinator and reviewer. The goal becomes `blocked`, as a finite goal does.
@@ -2438,8 +2546,9 @@ the deployment's host configuration to use it.
 }
 ```
 
-`evaluators` lists the profiles that may check a plan. This example names the
-reviewer's profile explicitly. See [Intent check](#intent-check) for how the
+`evaluators` lists the profiles that may check a plan, and, when
+`objective.evaluator` is on, assess a reviewed revision (see
+[Verdicts](#verdicts)). This example names the reviewer's profile explicitly. See [Intent check](#intent-check) for how the
 list is derived and how a checker is chosen.
 
 Optional OpenCode workers can be added to `implementers`. OpenCode uses a
@@ -3486,7 +3595,8 @@ mutation returns the current Goal or Team record.
 | `POST /api/goals/:id/steer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/goals/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner |
 | `POST /api/goals/:id/extend` | `requestId`, `revision`, `minutes` (5–1,440) | Owner |
-| `POST /api/goals/:id/outcome` | `requestId`, `revision`, `result`, `summary`, `evidence` | Owner/controller |
+| `GET /api/goals/:id/verdicts` | None; returns each cycle's provisional verdict with its criteria; the relay refuses it | Owner, controller, or viewer |
+| `POST /api/goals/:id/outcome` | `requestId`, `revision`, `result`, `summary`, `evidence`; optional `verdictId` and `continue` (see [Verdicts](#verdicts)) | Owner/controller |
 
 Creation requires `requestId` (UUID), `projectId`, `title` (up to 100 characters),
 `objective` (12,000), and `successCriteria` (4,000). Optional arrays are

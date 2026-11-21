@@ -70,7 +70,7 @@ const SETTLED: ReadonlySet<TeamStatus> = new Set(["cancelled", "merged", "no-cha
 // A fixed clock for retention, so a run never ages out under the simulator.
 const T0 = Date.parse("2026-11-13T10:00:00.000Z");
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g;
-export const RERUN = (seed: number, strict = false) => `${strict ? "TEAM_SIM_STRICT=1 " : ""}TEAM_SIM_SEED=${seed} node --import tsx --test tests/team-run-sim.test.ts`;
+export const RERUN = (seed: number) => `TEAM_SIM_SEED=${seed} node --import tsx --test tests/team-run-sim.test.ts`;
 
 // ---- Model -------------------------------------------------------------------------------------------------------
 
@@ -266,7 +266,7 @@ function setup(f: Fixture, s: Script): Model {
  * How a stop leaves the record. "clean" is the real host: writes are atomic, so a stop leaves the last write. The
  * other two are harness mutants: "torn" leaves half of the last write, "lost" loses it.
  */
-export type Variant = { patch?: (service: TeamService) => void; stop?: "clean" | "torn" | "lost"; strict?: boolean };
+export type Variant = { patch?: (service: TeamService) => void; stop?: "clean" | "torn" | "lost" };
 type Outcome<T> = { value?: T; error?: unknown; writes: Saved[]; stopped: boolean };
 /** One service's life: whether its host stopped, and the call it stopped in. */
 type Life = { stopped: boolean; label: string };
@@ -402,26 +402,6 @@ function send(service: TeamService, id: string, request: Request): Promise<TeamV
 
 const code = (error: unknown) => error instanceof TeamError ? error.code : error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 
-// ---- Known defects -----------------------------------------------------------------------------------------------
-
-/**
- * A defect in the current code that the simulator finds. It is counted, not thrown, unless the variant is strict.
- * A pause or a cancel records its receipt with its status before the permission fence's save, and adds its event line
- * and stopping reason only in the save after it. A stop between the two leaves the request answered on retry, the run
- * paused or cancelled, and no "Team paused." or "Team cancelled." line. I3 sees it on the reopened record.
- */
-export const KNOWN_DEFECT = "pause-cancel-event-lost";
-
-/** Whether the record written at the cut (`captured`) is the defect's: only write 1 of a pause or cancel. */
-function knownDefect(request: Request, cut: number, captured: Saved, prior: Saved): boolean {
-  if (cut !== 1 || (request.kind !== "pause" && request.kind !== "cancel")) return false;
-  const lines = (saved: Saved) => saved.run.events.filter(event => event.text.startsWith(EVENT[request.kind])).length;
-  return Boolean(captured.receipts[request.body.requestId]) && captured.run.status === (request.kind === "pause" ? "paused" : "cancelled") &&
-    captured.halt === request.kind && lines(captured) === lines(prior) && captured.run.reason === prior.run.reason;
-}
-
-const withoutEvent = (m: Model, kind: Kind): Model => ({ ...m, events: { ...m.events, [kind]: m.events[kind] - 1 } });
-
 // ---- Simulation --------------------------------------------------------------------------------------------------
 
 class Sim {
@@ -432,7 +412,7 @@ class Sim {
   constructor(private readonly seed: number, private readonly f: Fixture, private readonly host: Host, private readonly counts: Counts, private readonly variant: Variant) {}
 
   private fail(invariant: string, message: string): never {
-    throw new Violation(`seed ${this.seed} ${this.where}: ${invariant}: ${message}; rerun: ${RERUN(this.seed, this.variant.strict)}`);
+    throw new Violation(`seed ${this.seed} ${this.where}: ${invariant}: ${message}; rerun: ${RERUN(this.seed)}`);
   }
 
   async run(s: Script) {
@@ -490,7 +470,7 @@ class Sim {
   }
 
   private async request(step: Extract<Step, { do: "request" }>) {
-    const request = this.build(step), pre = this.model, before = this.host.bytes(), prior = this.host.read();
+    const request = this.build(step), pre = this.model, before = this.host.bytes();
     const result = await this.host.call(service => send(service, this.f.run.id, request), request.kind, step.stopAt);
     this.durableChecks(result.writes, `the ${request.kind}`);
     if (result.stopped) {
@@ -502,22 +482,16 @@ class Sim {
       const allowed: Allowed = [["the state before it", pre], ["the state after it", post], ...(change ? [[name, { ...pre, ...change(pre) }] as const] : [])];
       // I3 before the retry: once retried, a repaired record would hide what the stop left.
       const saved = await this.reopen(), held = match(saved, allowed);
-      let lost = false;
       if (held === name) bump(this.counts, name);
-      if (held === undefined) {
-        if (this.variant.strict || !knownDefect(request, step.stopAt, result.writes[step.stopAt - 1]!, prior) ||
-            !isDeepStrictEqual(project(saved), expected(withoutEvent(post, request.kind)))) this.unexpected(saved, allowed, "the reopened record");
-        bump(this.counts, `known:${KNOWN_DEFECT}:${request.kind}`);
-        lost = true;
-      }
+      if (held === undefined) this.unexpected(saved, allowed, "the reopened record");
       const retry = await this.host.call(service => send(service, this.f.run.id, request), request.kind);
       this.durableChecks(retry.writes, `the retried ${request.kind}`);
       if (retry.error !== undefined) this.fail("I1", `the host admitted the ${request.kind} before the stop, and refused its retry (${code(retry.error)})`);
-      this.acknowledged(request, pre, retry.value!, true, lost);
+      this.acknowledged(request, pre, retry.value!, true);
     } else if (result.error !== undefined) {
       this.refused(request, before, result);
       return;
-    } else this.acknowledged(request, pre, result.value!, false, false);
+    } else this.acknowledged(request, pre, result.value!, false);
     if (step.again) await this.retry(request);
     // The host's next pass, which ends a halt the request set, so a later resume is not refused while members stop.
     if (step.settle && this.model.halted) await this.pass(0);
@@ -529,12 +503,11 @@ class Sim {
     bump(this.counts, `refused:${result.error.code}`);
   }
 
-  /** `lost`: the known defect dropped this request's event line, so the model goes without it. */
-  private acknowledged(request: Request, pre: Model, view: TeamView, cut: boolean, lost: boolean) {
+  private acknowledged(request: Request, pre: Model, view: TeamView, cut: boolean) {
     if (SETTLED.has(pre.status)) this.fail("I5", `a new ${request.kind} was acknowledged on a ${pre.status} run`);
     if (request.body.revision !== pre.revision) this.fail("I7", `a ${request.kind} issued against revision ${request.body.revision} was acknowledged at revision ${pre.revision}`);
     const saved = this.host.read(), post = acknowledge(pre, request, saved.receipts[request.body.requestId] ?? "");
-    this.model = lost ? withoutEvent(post, request.kind) : post;
+    this.model = post;
     this.effect(saved, "I1", request);
     if (view.status !== saved.run.status || view.revision !== saved.run.revision)
       this.fail("I1", `the acknowledgement shows ${view.status} at revision ${view.revision}; the record holds ${saved.run.status} at ${saved.run.revision}`);

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { TeamRun } from "../packages/host/src/team-types.js";
 import type { TeamService } from "../packages/host/src/teams.js";
 import type { Counts } from "./outcome-sim-script.js";
-import { KNOWN_DEFECT, simulate, type Variant, Violation } from "./fixtures/team-run-sim.js";
+import { simulate, type Variant, Violation } from "./fixtures/team-run-sim.js";
 
 /*
  * Runs the team run crash simulator (tests/fixtures/team-run-sim.ts, which states the invariants I1-I7) over the
@@ -11,15 +11,14 @@ import { KNOWN_DEFECT, simulate, type Variant, Violation } from "./fixtures/team
  */
 
 // TEAM_SIM_SEED=N runs that seed alone and skips the mutants; TEAM_SIM_SEEDS=N runs N seeds from TEAM_SIM_BASE
-// (default 1). TEAM_SIM_STRICT=1 throws on the known defect instead of counting it. Floors describe the default corpus only.
+// (default 1). Floors describe the default corpus only.
 const DEFAULT_SEEDS = 50;
 const ONLY = process.env.TEAM_SIM_SEED;
 const COUNT = Number(process.env.TEAM_SIM_SEEDS ?? DEFAULT_SEEDS);
 const BASE_SEED = Number(process.env.TEAM_SIM_BASE ?? 1);
-const STRICT = process.env.TEAM_SIM_STRICT === "1";
 const SEEDS = ONLY === undefined ? Array.from({ length: COUNT }, (_, index) => BASE_SEED + index) : [Number(ONLY)];
 assert.ok(SEEDS.length > 0 && SEEDS.every(Number.isSafeInteger), "TEAM_SIM_SEED, TEAM_SIM_SEEDS and TEAM_SIM_BASE take integers");
-const DEFAULT_CORPUS = ONLY === undefined && COUNT === DEFAULT_SEEDS && BASE_SEED === 1 && !STRICT;
+const DEFAULT_CORPUS = ONLY === undefined && COUNT === DEFAULT_SEEDS && BASE_SEED === 1;
 // Seeds run this many at a time: each one mostly waits on sealed-record fsyncs and its fixture's git commands.
 const CONCURRENCY = 8;
 
@@ -40,11 +39,11 @@ async function sweep(seeds: readonly number[], counts: Counts, variant: Variant 
 
 /**
  * Floors for the default corpus at about half of what it produced, so a generator that stops producing a case fails.
- * Every request kind is cut after each write it makes: continue makes one; answer makes two only while a delegated
- * decision is live; the rest make two. The thinnest ran once: an answer cut after write 2 and a resume cut after write 2.
+ * Every request kind is cut after each write it makes: continue, pause, and cancel make one; answer makes two only
+ * while a delegated decision is live; the rest make two. The thinnest ran once: an answer cut after write 2 and resume after write 2.
  */
 const FLOORS: Readonly<Record<string, number>> = {
-  "cut:pause:1": 7, "cut:pause:2": 10, "cut:resume:1": 6, "cut:resume:2": 1, "cut:cancel:1": 1, "cut:cancel:2": 2,
+  "cut:pause:1": 7, "cut:resume:1": 6, "cut:resume:2": 1, "cut:cancel:1": 1,
   "cut:steer:1": 10, "cut:steer:2": 8, "cut:revoke:1": 7, "cut:revoke:2": 3, "cut:answer:1": 2, "cut:answer:2": 1,
   "cut:continue:1": 1, "cut:pass": 4,
   "ack:pause": 31, "ack:resume": 28, "ack:cancel": 8, "ack:steer": 34, "ack:revoke": 16, "ack:answer": 3, "ack:continue": 2,
@@ -56,7 +55,7 @@ const FLOORS: Readonly<Record<string, number>> = {
 test("team run requests keep their invariants across host stops", async t => {
   const counts: Counts = {};
   const started = performance.now();
-  const violation = await sweep(SEEDS, counts, { strict: STRICT });
+  const violation = await sweep(SEEDS, counts);
   if (violation) throw violation;
   t.diagnostic(`team sim: ${SEEDS.length} seeds from ${SEEDS[0]} in ${((performance.now() - started) / 1000).toFixed(1)} s, ${JSON.stringify(Object.fromEntries(sortedCounts(counts)))}`);
   if (!DEFAULT_CORPUS) return t.diagnostic("coverage floors are off: they describe the default corpus, and a TEAM_SIM_* setting changed it");
@@ -75,7 +74,8 @@ type Private = {
   replay(stored: Stored, operation: string, body: Body): boolean;
   save(stored: Stored): void;
   resumeRun(stored: Stored, inPlace?: boolean, record?: () => void): Promise<void>;
-  invalidatePermissionDecisions(stored: Stored, reason: string): Promise<boolean>;
+  invalidatePermissionDecisions(stored: Stored, reason: string, fenceAgent?: boolean): Promise<boolean>;
+  stopRun(stored: Stored, action: "pause" | "cancel", ownerHalt?: unknown, source?: unknown, line?: string, reason?: string): Promise<void>;
   event(stored: Stored, text: string): void;
 };
 const internals = (service: TeamService) => service as unknown as Private;
@@ -91,6 +91,34 @@ const patchReplay = (wrap: (host: Private, replay: Private["replay"]) => Private
   const host = internals(service);
   host.replay = wrap(host, host.replay.bind(host));
 } });
+
+const patchLateStopEffects: Variant = { patch: service => {
+  const host = internals(service), stopRun = host.stopRun.bind(host);
+  const invalidate = host.invalidatePermissionDecisions.bind(host), emit = host.event.bind(host);
+  let stopping: { action: "pause" | "cancel"; reason: string | undefined; events: string[] } | undefined;
+  host.event = (stored, text) => {
+    if (stopping && text.startsWith(stopping.action === "pause" ? "Team paused" : "Team cancelled")) stopping.events.push(text);
+    else emit(stored, text);
+  };
+  host.invalidatePermissionDecisions = async (stored, reason, fenceAgent) => {
+    if (!stopping || reason !== `The team was ${stopping.action} before the permission request could be answered.`)
+      return invalidate(stored, reason, fenceAgent);
+    const reasonAtFence = stored.run.reason;
+    stored.run.reason = stopping.reason;
+    try { return await invalidate(stored, reason, fenceAgent); }
+    finally { stored.run.reason = reasonAtFence; }
+  };
+  host.stopRun = async (stored, action, ownerHalt, source, line, reason) => {
+    const pending = { action, reason: stored.run.reason, events: [] as string[] };
+    stopping = pending;
+    try { await stopRun(stored, action, ownerHalt, source, line, reason); }
+    finally {
+      stopping = undefined;
+      for (const text of pending.events) emit(stored, text);
+      host.save(stored);
+    }
+  };
+} };
 
 const MUTATIONS: readonly Mutation[] = [
   // I3 sees the receipt on the reopened record before the retry; I1 would see the missing effect after it.
@@ -132,9 +160,9 @@ const MUTATIONS: readonly Mutation[] = [
       if (receipt && operation === "steer") stored.halt = "steer";
       return receipt;
     }) },
+  { name: "pause and cancel record their reason and event after the permission fence's save (INF-359)", invariant: "I3", kind: "source", variant: patchLateStopEffects },
   { name: "a stop tears the record write", invariant: "I3", kind: "harness", variant: { stop: "torn" } },
-  // A pause cut after write 2 then reopens on write 1's record, which no state allows there.
-  { name: "a stop loses the last record write", invariant: "I3", kind: "harness", variant: { stop: "lost" } },
+  { name: "a stop loses the last record write", invariant: "I4", kind: "harness", variant: { stop: "lost" } },
   { name: "a save moves member cursors back to the journal's start", invariant: "I4", kind: "source",
     variant: { patch: service => {
       const host = internals(service), save = host.save.bind(host);
@@ -143,8 +171,7 @@ const MUTATIONS: readonly Mutation[] = [
   { name: "admission forgets that a cancelled run is settled", invariant: "I5", kind: "source",
     variant: patchAdmit((_host, admit) => (stored, operation, body) =>
       admit(stored.run.status === "cancelled" ? { ...stored, run: { ...stored.run, status: "paused" } } : stored, operation, body)) },
-  // The extra save moves each write one later, so a cut after write 2 leaves the fence's record.
-  { name: "admission saves the record before its checks", invariant: "I3", kind: "source",
+  { name: "admission saves the record before its checks", invariant: "I6", kind: "source",
     variant: patchAdmit((host, admit) => (stored, operation, body) => {
       host.save(stored);
       return admit(stored, operation, body);
@@ -168,29 +195,9 @@ for (const mutation of MUTATIONS) {
   });
 }
 
-// ---- Known defect -------------------------------------------------------------------------------------------------
-
-// The corpus counts this defect instead of failing (see KNOWN_DEFECT in the fixture). These seeds still show it strictly;
-// when a fix lands they stop failing, and the allowance and these tests go.
 for (const [seed, kind] of [[5, "pause"], [29, "cancel"]] as const) {
-  test(`known defect ${KNOWN_DEFECT}: seed ${seed} loses the ${kind}'s event line after a stop after write 1`, { skip: ONLY !== undefined && "TEAM_SIM_SEED reruns one corpus seed" }, async () => {
-    const violation = await sweep([seed], {}, { strict: true });
-    assert.ok(violation, "the defect no longer reproduces: remove the allowance in tests/fixtures/team-run-sim.ts and this test");
-    assert.match(violation.message, new RegExp(`\\(${kind} [0-9a-f]{8}, stop after write 1.*: I3: the reopened record .*against the state after it: events is `));
-  });
-}
-
-// The allowance covers only write 1 of a pause or cancel. `eventLost` drops every "Team paused." and "Team cancelled."
-// line. In each seed below the first failure is then a pause or a cancel cut after write 2 (step 3 of both), through
-// I3, with and without the allowance. An allowance widened to every cut lets that step pass, and the two runs without `strict` fail.
-const eventLost: Variant = { patch: service => {
-  const host = internals(service), event = host.event.bind(host);
-  host.event = (stored, text) => { if (text !== "Team paused." && text !== "Team cancelled.") event(stored, text); };
-} };
-for (const [seed, kind] of [[1, "pause"], [10, "cancel"]] as const) for (const strict of [false, true]) {
-  test(`the ${KNOWN_DEFECT} allowance does not hide a ${kind} that loses its event line after write 2: seed ${seed}${strict ? " (strict)" : ""}`, { skip: ONLY !== undefined && "TEAM_SIM_SEED reruns one corpus seed" }, async () => {
-    const violation = await sweep([seed], {}, { ...eventLost, strict });
-    assert.ok(violation, `seed ${seed} no longer fails with the ${kind} event line dropped`);
-    assert.match(violation.message, new RegExp(`\\(${kind} [0-9a-f]{8}, stop after write 2.*: I3: the reopened record .*against the state after it: events is `));
+  test(`seed ${seed} ${kind} survives a stop after write 1`, async () => {
+    const violation = await sweep([seed], {});
+    assert.equal(violation, undefined, violation?.message);
   });
 }

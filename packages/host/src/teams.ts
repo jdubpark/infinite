@@ -1643,8 +1643,8 @@ export class TeamService {
       if (action === "resume") {
         if (run.status !== "paused" && !this.canResume(stored)) { record(); this.save(stored); return this.view(stored); }
         await this.resumeRun(stored, inPlace, record);
-      } else { record(); await this.stopRun(stored, action, undefined, body.source); }
-      this.event(stored, `Team ${action === "resume" ? inPlace ? "resumed where it waited for input" : "resumed with a fresh plan" : action === "pause" ? "paused" : "cancelled"}${body.source ? ` by ${inputSourceLabel(body.source)}` : ""}.`); this.save(stored);
+        this.event(stored, `Team ${inPlace ? "resumed where it waited for input" : "resumed with a fresh plan"}${body.source ? ` by ${inputSourceLabel(body.source)}` : ""}.`); this.save(stored);
+      } else { record(); await this.stopRun(stored, action, undefined, body.source, `Team ${action === "pause" ? "paused" : "cancelled"}${body.source ? ` by ${inputSourceLabel(body.source)}` : ""}.`); }
       return this.view(stored);
     });
   }
@@ -1690,11 +1690,11 @@ export class TeamService {
     run.status = "planning"; run.reason = undefined; run.blockCode = undefined;
   }
   /**
-   * Pause or cancel: active members stop on the next pass. The owner's action and the owner's halt both use it. A halt
-   * passes its mark, which is set together with the paused status, before the first save on this path: no record is
-   * ever paused by the halt without the mark, and no record carries the mark without the pause.
+   * Pause or cancel: active members stop on the next pass. The owner's action and the owner's halt both use it.
+   * Everything durable is set before the fence's save, the first on this path: status, reason, the halt's mark, the
+   * caller's event line and a cancel's intent release. A retry answered from the receipt has nothing left to do.
    */
-  private async stopRun(stored: Stored, action: "pause" | "cancel", ownerHalt?: Stored["ownerHalt"], source?: ConnectorSource) {
+  private async stopRun(stored: Stored, action: "pause" | "cancel", ownerHalt?: Stored["ownerHalt"], source?: ConnectorSource, line?: string, reason = "Stopping active team members; any human input lease remains authoritative.") {
     const run = stored.run;
     if (run.recovery && run.recovery.status !== "exhausted") {
       run.recovery.status = "exhausted";
@@ -1702,10 +1702,11 @@ export class TeamService {
     }
     run.status = action === "pause" ? "paused" : "cancelled"; stored.halt = action;
     if (ownerHalt) stored.ownerHalt = ownerHalt;
-    await this.invalidatePermissionDecisions(stored, `The team was ${action} before the permission request could be answered.`);
-    run.reason = "Stopping active team members; any human input lease remains authoritative.";
-    this.commands.get(run.id)?.abort();
+    run.reason = reason;
+    if (line) this.event(stored, line);
     if (action === "cancel") this.intentChecks.release(stored, "cancelled");
+    await this.invalidatePermissionDecisions(stored, `The team was ${action} before the permission request could be answered.`);
+    this.commands.get(run.id)?.abort();
   }
   /**
    * Whether the halt can hold this run where it waits for input: it waits, and nothing is in flight that a pause would
@@ -1723,18 +1724,16 @@ export class TeamService {
   /**
    * The owner's halt pauses one run and marks it. A working run stops through the owner's pause path. A run that waits
    * for input with nothing in flight is held where it waits: same revision, its questions open, its recovery untouched.
-   * The status and the mark are saved together, before anything else on either path.
+   * The paused status, the mark, the reason and the event line are set together, before the first save on either path.
    */
   private async haltStop(stored: Stored, mark: { haltId: string; reason: string }) {
     const run = stored.run;
     if (this.waitsWithNothingInFlight(stored)) {
       run.status = "paused"; run.reason = mark.reason; stored.ownerHalt = { ...mark, waiting: true };
-      await this.invalidatePermissionDecisions(stored, "The team was paused before the permission request could be answered.");
       this.event(stored, `Team paused where it waits for input: ${mark.reason} Its questions stay open; an answer is kept until it resumes.`);
+      await this.invalidatePermissionDecisions(stored, "The team was paused before the permission request could be answered.");
     } else {
-      await this.stopRun(stored, "pause", mark);
-      run.reason = mark.reason;
-      this.event(stored, `Team paused: ${mark.reason}`);
+      await this.stopRun(stored, "pause", mark, undefined, `Team paused: ${mark.reason}`, mark.reason);
     }
     this.save(stored);
   }

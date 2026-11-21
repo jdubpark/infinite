@@ -4,10 +4,12 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fixture, mixedLineup } from "./team-fixture.js";
+import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { waitFor } from "./helpers.js";
 import { INTENT_EVENTS } from "../packages/host/src/team-intent.js";
-import { INTENT_OPS } from "../packages/host/src/objective-record.js";
+import { INTENT_OPS, runRecord } from "../packages/host/src/objective-record.js";
 import { applyIntentReport } from "../packages/host/src/objective-intent.js";
+import type { IntentCheckReport } from "../packages/host/src/intent-report.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { Blackboard } from "../packages/host/src/evidence/blackboard.js";
@@ -436,6 +438,57 @@ test("a failed checker is replaced once and then skipped", { timeout: 1500000 },
       assert.equal(texts(view).filter(text => text.startsWith("Project manager planned")).length, 1, "one plan accepted");
     } finally { unflag(f, "intent-hold"); await f.close(); }
   }
+});
+
+test("a cancel cut releases a waiting objective intent once on retry", async () => {
+  const f = schedulerFixture();
+  try {
+    const at = new Date().toISOString(), decisionId = randomUUID(), checkerMemberId = randomUUID();
+    f.run.status = "needs-input"; f.run.autonomy = "autonomous"; f.run.intentCheck = "on"; f.run.members[0]!.status = "waiting";
+    const initial = runRecord(f.run, at, "record-created");
+    if (initial === "source-invalid") assert.fail("the fixture's objective must build a run record");
+    const applied = applyIntentReport(initial, { kind: "intent-check", summary: "One owner choice remains.", items: [{
+      dimension: "outcome", why: "The output name affects the result.", criticality: "outcome", disposition: "ask",
+      assumption: { statement: "The default name is accepted.", refutedBy: "The owner chooses another name.", test: { kind: "owner" } },
+      question: { text: "Which output name should the files use?", options: ["alpha", "beta"], interrupt: "definition" },
+    }] } as IntentCheckReport, { runId: f.run.id, revision: f.run.revision, checkerMemberId, decisionId, mode: "autonomous", goal: false, configured: [], at });
+    assert.ok(applied.decision, "the objective intent should wait on an owner answer");
+    assert.equal(applied.record.questions[0]?.waits, true);
+    f.run.decisions = [{ id: decisionId, memberId: checkerMemberId, revision: f.run.revision, question: applied.decision.question,
+      options: applied.decision.options, createdAt: at, intentQuestions: applied.decision.questions }];
+    f.writeTeam({ objectiveRecord: applied.record, intentCheck: { revision: f.run.revision, planMemberId: f.run.members[0]!.memberId,
+      status: "waiting", failures: 0, decisionId } });
+
+    const teams = f.openTeam(), request = { requestId: randomUUID(), revision: f.run.revision };
+    const service = teams as unknown as { save(stored: { run: TeamRun; receipts: Record<string, string> }): void };
+    const save = service.save.bind(teams);
+    let cut = false;
+    service.save = stored => {
+      save(stored);
+      if (!cut && stored.run.status === "cancelled" && stored.receipts[request.requestId]) {
+        cut = true;
+        throw new Error("Simulated host stop after the first cancel write.");
+      }
+    };
+    await assert.rejects(teams.cancel(f.run.id, request), /Simulated host stop after the first cancel write/);
+    assert.equal(cut, true, "the cancel did not reach its first durable write");
+
+    teams.close();
+    const restarted = f.openTeam();
+    const durable = f.readRecord<{ run: TeamRun; receipts: Record<string, string>; objectiveRecord: ObjectiveRecord }>("team", f.run.id);
+    const questionId = applied.decision.questions[0]!;
+    assert.equal(durable.run.status, "cancelled");
+    assert.equal(durable.receipts[request.requestId] !== undefined, true);
+    assert.equal(durable.run.reason, "Stopping active team members; any human input lease remains authoritative.");
+    assert.equal(durable.run.events.filter(event => event.text === "Team cancelled.").length, 1);
+    assert.equal(durable.objectiveRecord.questions.find(question => question.id === questionId)?.waits, false);
+    assert.equal(durable.objectiveRecord.log.filter(entry => entry.op === INTENT_OPS.released).length, 1);
+
+    assert.equal((await restarted.cancel(f.run.id, request)).status, "cancelled");
+    const retried = f.readRecord<{ objectiveRecord: ObjectiveRecord }>("team", f.run.id).objectiveRecord;
+    assert.equal(retried.questions.find(question => question.id === questionId)?.waits, false);
+    assert.equal(retried.log.filter(entry => entry.op === INTENT_OPS.released).length, 1);
+  } finally { f.close(); }
 });
 
 test("cancel and steer on a full log complete", { timeout: 1500000 }, async () => {

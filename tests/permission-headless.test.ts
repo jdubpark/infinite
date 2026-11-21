@@ -13,10 +13,9 @@ import {
   HeadlessPermissionChannel, channelToken, deferredCallOpen, deliveryKey, type ChannelReply,
 } from "../packages/host/src/permission-headless.js";
 import {
-  DEFERRAL_RETENTION_MS, HeadlessChannelWorker, OPEN_CALL_KEYS, OWNER_DENIED, PENDING_NOTICE, type ChannelWorkerHost,
+  claudeTurnSignals, DEFERRAL_RETENTION_MS, HeadlessChannelWorker, OPEN_CALL_KEYS, OWNER_DENIED, PENDING_NOTICE, type ChannelWorkerHost,
 } from "../packages/host/src/permission-headless-worker.js";
 import { hookOutput } from "../packages/host/src/permission-hook.js";
-import { claudeTurnSignals } from "../packages/host/src/permission-headless-worker.js";
 import { requesterNotice } from "../packages/host/src/permission-policy.js";
 import type { PermissionAgentServices, PermissionOutcome, PermissionPipeline, PermissionRequest } from "../packages/host/src/permission-agent-types.js";
 import type { Config, Event, Session } from "../packages/host/src/types.js";
@@ -121,6 +120,10 @@ test("a class call waits for the owner, and the owner's allow runs that one call
     assert.equal(r.log("ran.log"), "make safe-build\ndeploy production\n");
     const events = r.channelEvents(id).map(event => event.event);
     assert.deepEqual(events.filter(event => event !== "pending"), ["deferred", "waiting", "answer", "resumed", "delivered"]);
+    // The session's journal marks the provider's own continue prompt after the resume, and not the owner's request.
+    const turns = r.manager.events(id, 0, 500, new Set(["signal"])).events.map(event => event.data as { kind?: string; prompt?: string; automatic?: true })
+      .filter(data => data.kind === "turn-start").map(data => [data.prompt, data.automatic]);
+    assert.deepEqual(turns, [["mixed", undefined], ["Continue from where you left off.", true]]);
     // The owner decision is linked to its delivery events: deferral, the owner's answer, and the resumed call.
     const owner = r.decided.find(request => /production/.test(request.action))!;
     assert.equal(owner.requester.kind, "headless");
@@ -847,8 +850,9 @@ test("takeContinue answers true once after each resume the worker performed; the
   await resumeAfterDeferral(w);
   assert.equal(w.channel.takeContinue(), true, "the first prompt after the resume is the provider's continue");
   assert.equal(w.channel.takeContinue(), false, "the answer is taken once");
-  const signals = [{ kind: "turn-start" as const, prompt: "Continue from where you left off." }, { kind: "tool-end" as const, tool: "Bash", ok: true }];
+  // The resumed call's own hooks arrive before the continue prompt: they neither take the answer nor get the marker.
+  const signals = [{ kind: "tool-end" as const, tool: "Bash", ok: true }, { kind: "turn-start" as const, prompt: "Continue from where you left off." }, { kind: "turn-start" as const, prompt: "next" }];
   let owed = true;
   const marked = claudeTurnSignals(signals, () => { const taken = owed; owed = false; return taken; });
-  assert.deepEqual(marked, [{ kind: "turn-start", prompt: "Continue from where you left off.", automatic: true }, signals[1]]);
+  assert.deepEqual(marked, [signals[0], { kind: "turn-start", prompt: "Continue from where you left off.", automatic: true }, signals[2]]);
 });

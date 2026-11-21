@@ -354,8 +354,10 @@ export class HeadlessChannelWorker {
     this.host.closePrompt(deferred.promptId!, [OWNER_ALLOW, OWNER_DENY, OWNER_DENY_TEXT][option]);
     this.delivery(deferred.issued, "intent", `Headless: the owner ${decision === "allow" ? "allowed the call once" : "refused the call"}; the session resumes.`);
     this.host.publish(this.view());
-    try { this.host.resume(this.nativeSessionId!); this.continueOwed = true; }
-    catch {
+    try {
+      this.host.resume(this.nativeSessionId!);
+      this.continueOwed = true;
+    } catch {
       this.retireCall("resume-failed");
       this.host.end();
     }

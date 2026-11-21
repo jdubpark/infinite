@@ -977,7 +977,7 @@ A `404` without a known code prints `This host has no eval routes. Upgrade the h
 | `POST /api/eval/jobs/:id/pause`, `resume`, `cancel` | Owner |
 | `POST /api/eval/tasks/:id/retire` | Owner |
 
-A body or id that does not parse is `400` `invalid-eval-request`. An unknown project, job, or task is `404`. A store that is not ready is `503` `evidence-unavailable`. No route returns a capsule, a patch, a file name, a case, or a commit. The priors and report routes of part 8 of the design arrive in later steps.
+A body or id that does not parse is `400` `invalid-eval-request`. An unknown project, job, or task is `404`. A store that is not ready is `503` `evidence-unavailable`. No route returns a capsule, a patch, a file name, a case, or a commit. The report and priors routes exist: see [Eval comparisons](#commands-and-routes).
 
 ### Git forms of mining and validation
 
@@ -1043,7 +1043,7 @@ A baseline request has these fields. The schema is strict.
 
 A profile must belong to a provider that has an eval launch (`claude`, `codex`, or `opencode`). It must be in the project's lineup pools or in `candidateProfiles`. A `contributor` profile also needs the project's `routing.allowContributor`. Any other profile is `409` `profile-not-approved`. Pinned guidance, forced knowledge, and prompt overrides are not in this slice.
 
-**Create.** A request id with the same body returns the same job. The same id with another body is `409` `request-conflict`. A project whose baseline job is `scheduled`, `running`, `paused`, or `blocked` gets `409` `job-active`. A validate job does not count. At creation the job fixes its plan: `planned.tasks` is the number of valid tasks the filter selects, at most `maxTasks`, and `planned.trials` is the smaller of `limits.maxTrials` and tasks times configurations times `trialsPerTask`.
+**Create.** A request id with the same body returns the same job. The same id with another body is `409` `request-conflict`. A project whose baseline job is `scheduled`, `running`, `paused`, or `blocked` gets `409` `job-active`. A validate job does not count. A baseline job reads the dev set only and skips holdout tasks (see [Eval comparisons](#eval-comparisons)). At creation the job fixes its plan: `planned.tasks` is the number of valid dev-set tasks the filter selects, at most `maxTasks`, and `planned.trials` is the smaller of `limits.maxTrials` and tasks times configurations times `trialsPerTask`.
 
 **Pinned configuration.** The job pins a digest of the validation settings, `trialMinutes`, `eval.grader`, `eval.member`, each configuration's prompt version, and the project's permission settings. A change to any of them blocks the job with `configuration-changed` before its next trial. `resume` pins the new values.
 
@@ -1119,24 +1119,199 @@ The owner chooses these. The defaults are the ones this slice builds: the window
 
 The summary and `infinite eval status PROJECT` add three things. The eval identity line is `eval identity STATE`. The trial line is `trials today N of CAP`, or `trials off` without a cap. The grader line shows `grader ready (version 1: no trials)` when the grader's version is below 2. A baseline job prints `tasks R of P (skipped S) · trials started N of P, graded N, resolved N, ended N, void N`.
 
+When the project has `team.eval`, the summary adds the task count of each set (`tasks.bySet`, with `dev` and `holdout`), and its groups gain `holdout` and `exposed` counts. The status prints `sets dev N · holdout M`, and its groups line ends `holdout H, exposed X`. A project without `team.eval` has no set counts. A compare or confirm job prints the baseline line with `reused N` added, `resolved hidden` until its report is ready, and `report pending` or `report ready` once it has finished.
+
 #### Not built yet
 
 These arrive in later steps of the delivery order:
 
-- the dev and holdout sets, the exposure of a group, and `excludeGroups`;
-- trial reuse, and the `compare` and `confirm` jobs;
 - the standing budget, with `reserve`, `settle`, `status`, the USD limits, the learning floor, and `estimate-unavailable`;
 - pinned guidance, forced knowledge, prompt overrides, and the `gate` purpose;
 - duel judges and the open-duel gate;
-- run-level replay and the blind rubric;
-- a `promptOrigins` filter.
+- run-level replay and the blind rubric.
+
+### Eval comparisons
+
+A `compare` job runs two to four configurations over the same tasks of the dev set, and its report says which one resolves more of them. A `confirm` job runs one pair of configurations once over the holdout set, to check a result that the dev set suggested. Both are trial jobs: they use the trials above, with their gates, their eval account, and their one trial at a time.
+
+The comparison adds no setting and installs nothing. It needs `trialsPerDay` and the installs of [Eval trials](#eval-trials), and a project without `team.eval` behaves as before. Only the owner creates a job. The owner, a controller, and a viewer read reports and priors. A relay device reads neither.
+
+#### The two sets
+
+Every task belongs to the dev set or the holdout set. The set belongs to the task's group, and a task takes the set of its group's root. A task with no group row is in the dev set. No group spans both sets.
+
+**The draw.** The host draws a group's set once, when it creates the group row: a captured run's group, or a mined group. The draw is an HMAC of the group id under the evidence store's vault key, so nobody without the key can tell which groups are in the holdout set. The group goes to the holdout set when the first 8 hex digits of the draw, read as an unsigned integer, are below 1,288,490,189. That is about 30% of groups. The host stores the draw time as `set_at`.
+
+**Migration.** The first start on corpus version 3 draws every existing root the same way. A root goes to the dev set instead when it has the dev-only mark, or when one of its tasks already has a trial row. Its `set_at` is the time the group was created.
+
+**Merges.** A merged root is in the holdout set only when every merged root was, none had the dev-only mark or was exposed, and the merge does not set the dev-only mark. Its `set_at` is the earliest of theirs, and its confirm count is the largest. Any other merge gives a dev root, and every other row of that root leaves the holdout set. No group ever moves from the dev set to the holdout set.
+
+**Exposure.** A design that shows a task's content to a member outside the task's own trial marks the task's group exposed. An exposed group is in the dev set from that moment, and it never returns. The calibration read does this for every task it returns (see below).
+
+**Rotation.** A holdout group moves to the dev set after five confirm jobs, or 120 days after its `set_at`. The group's confirm count grows by one when a confirm job is created with one of its tasks. The hourly sweep moves at most 100 roots per pass. It moves no root of a project that has a confirm job without a report, because the job still reads them. A newly validated group is drawn like any other, so it can replace one that left.
+
+**Who reads which set.** A `baseline` or `compare` job reads the dev set only. A baseline job used to read every valid task. It now skips the holdout tasks.
+
+**Counts.** The summary and `infinite eval status PROJECT` show the task count of each set, and the number of holdout groups and exposed groups. A project without `team.eval` has no set counts.
+
+**The calibration read.** A host-internal function returns pairs for the duels design: for one dev task, the newest resolved and the newest unresolved graded trial patch. It admits dev tasks only, returns at most one pair per task and at most 20 pairs per call, and skips a task that has a patch on only one side. It marks the group of each returned task exposed in the same write. No route, command, log line, or event carries a pair. No caller exists yet.
+
+#### Compare and confirm requests
+
+The request has the shape of a baseline request, with these differences. The schema is strict.
+
+| Field | Limit | Default |
+|---|---|---|
+| `kind` | `compare` or `confirm` | none, required |
+| `configurations` | `compare`: 2 to 4. `confirm`: exactly 2. No two share a `configRef` | none, required |
+| `taskFilter.taskIds` | up to 200 ids. A `confirm` request admits none | all |
+| `taskFilter.origins`, `areas` | up to 2 origins; up to 32 areas | all |
+| `taskFilter.promptOrigins` | `assignment`, `run-objective`, `commit-message` | all |
+| `taskFilter.excludeGroups` | up to 200 group ids, each up to 64 characters | none |
+| `taskFilter.maxTasks` | 1 to 200 | 20 |
+| `trialsPerTask` | 1 to 5 | 3 |
+| `limits.maxTrials`, `limits.maxWallMinutes` | 1 to 1,000; 10 to 43,200 | none, required |
+| `windows`, `expiresAt` | as for a baseline job | any hour; 30 days |
+
+The kind fixes the set: `compare` reads the dev set and `confirm` reads the holdout set. The request has no `set` field. A `confirm` request names no task, so the owner cannot pick holdout tasks that a configuration is known to win.
+
+**The task list.** When the owner creates the job, the host selects the tasks that pass the filter, in task id order, up to `maxTasks`, and seals the list in the job. The `POST` is the approval. A task added later is never reached. A task that is no longer `valid` when its turn comes is skipped and counted. `planned.trials` is the smaller of `limits.maxTrials` and the slots (tasks times configurations times `trialsPerTask`) minus the reused copies.
+
+**Refusals.** The profile, configuration, request id, and active-job checks of a baseline job apply. A project has at most one active job of each kind, so a confirm job can run beside a compare job. These are specific to comparisons:
+
+| Status and code | Cause |
+|---|---|
+| `400` `invalid-eval-request` | The body fails the schema, for example a `confirm` job with three configurations or with `taskIds`. |
+| `409` `subject-confirmed` | The pair already had a confirm job. |
+| `409` `too-few-tasks` | A `compare` job selects fewer than 2 tasks, or a `confirm` job fewer than 15. This includes a holdout set of fewer than 15 valid tasks. |
+
+The host checks the subject before it selects tasks, so `subject-confirmed` wins over `too-few-tasks`. A refusal leaves nothing behind.
+
+#### The subject of a confirm job
+
+A confirm job has no named subject. Its subject is the SHA-256 of the canonical JSON of its two pins, `{ configRef, profileEpoch, promptVersion }`, sorted by `configRef`. The host refuses a second confirm job for the same subject with `409` `subject-confirmed`.
+
+The host writes the subject row when it creates the job, and it never removes the row. A confirm job that is cancelled, expires, or fails uses its subject all the same. The host cannot tell an honest cancel from a peek at the holdout set. This holds even for a job that ended before any trial started. A new profile epoch or a new prompt version gives a new subject, so the same two profiles can be confirmed again after either changes.
+
+#### Reuse
+
+At creation, a `compare` job fills slots with earlier trials instead of running them. A trial is a source when it is a final, non-void original trial of a `baseline` or `compare` job, and it ended within 30 days. It must match the task, the configuration's `configRef`, the harness version, the prompt version, and the profile epoch. A source that fills a slot becomes a copy row, marked with the id it copies. Each task and configuration takes the newest sources first, up to `trialsPerTask`.
+
+A copy never counts toward `maxTrials` or `trialsPerDay`, and no member runs for it. A compare job whose every slot is a copy completes at creation with reason `done`, starts no trial, and still gets its report. A `baseline` job and a `confirm` job never reuse. A confirm trial is never a source, so a holdout result never reaches a later comparison.
+
+Reuse is decided at creation, so the planned count that the owner sees before approval is the count the job runs.
+
+#### Pins and `identity-changed`
+
+At creation, a comparison job pins, for each configuration, the profile epoch at that time and the prompt version. Trials from different epochs never share a comparison.
+
+- A changed epoch or prompt version ends the job `completed` with reason `identity-changed`, before its next trial. The host checks this before the digest.
+- Any other change to the pinned digest (validation settings, `trialMinutes`, `eval.grader`, `eval.member`, or the permission settings) blocks the job `configuration-changed`, as for a baseline job.
+- The statistics count only trials whose epoch and prompt version equal the pins. Attrition counts the others as `changed`. A trial with an unknown epoch never matches.
+
+#### The report
+
+A finished `compare` or `confirm` job gets one report. A report pass runs on the host's tick. It takes the oldest finished job without a report, once the job's trial sessions are gone, so that their cost is recorded. It waits at most 24 hours after the job finished. The sessions go about an hour after their trials end, at most 20 per sweep. The pass computes the figures from the job's trial rows (at most 5,000) and its tasks' plain fields (at most 200), seals the report, and never changes it. Every read gives the same figures. A job whose sealed list cannot be opened gets a report with state `unreadable`.
+
+While a job is active, its view shows no result: `trials.resolved` is null and `report` is null. A finished job shows `report` `pending`, and then `ready`.
+
+The report names each configuration by its index (the order of the request), `profileId`, provider, profile epoch, and prompt version. It never names a model. It holds only aggregates. It holds no task, group, trial, or session id, and no commit, file name, case, patch, or text.
+
+**Figures.** A trial is valid when it is not void and it matches its pins. A task is analysed when every configuration has `trialsPerTask` valid trials. A task of a confirm job that has left the holdout set while the job ran does not count. The score of a configuration on a task is its resolved valid trials. For each pair `a < b`, the difference is `b` minus `a`, over the analysed tasks:
+
+| Figure | Meaning |
+|---|---|
+| `mean` | The mean difference in the share of trials resolved, from -1 to 1. |
+| `interval` | A 95% percentile bootstrap interval over tasks: 10,000 resamples, seeded from the job id, so it is the same on every read. |
+| `sign` | The wins, losses, and ties over tasks, and the exact two-sided sign test `p`. |
+| `holm` | The Holm-adjusted `p` over all the pairs of one figure. A job with two configurations has one pair, and its `holm` equals `p`. |
+| `detectable` | `observed`: the smallest difference this n could detect at 80% power, from the observed spread. `planning`: the same at the planning spread of 0.35 to 0.41. Both are null at too small an n. |
+
+A job with more than two configurations reports every pair. The spec names no control configuration. The same figures appear for each prompt origin and each area, with their n, and Holm runs within each group.
+
+**Inconclusive.** A report says `conclusive: false` when fewer than 90% of the planned tasks were analysed, or none was. Below that share, the tasks that survive can favour one configuration. The CLI prints `inconclusive: under 90% of tasks kept every valid trial`.
+
+**Attrition.** For each configuration: the void trials by ending (`void-limit`, `void-host`, `void-owner`), `changed` (trials that did not match the pins), and `short` (tasks with fewer than `trialsPerTask` valid trials). `tasks.leftHoldout` counts the confirm tasks that left the holdout set.
+
+**Sensitivity.** The difference again, over the tasks that have at least one final trial in every configuration. A slot without a valid, matching, resolved trial counts as not resolved. The value is the mean difference of `resolved / trialsPerTask`.
+
+**Costs.** For each configuration: `trials`, `resolved`, and `costed` (trials with a complete cost). `tokensPerResolved` and `spentUsdPerResolved` divide the complete-cost trials by the resolved valid trials among them. `minutesPerResolved` does the same for trials that have a duration. Each is null when its divisor is 0. The pump reads a trial's tokens and cost from the usage ledger before it removes the trial's session. A ledger without usage records `none`, never zero, and a lookup that fails is retried on each sweep until 24 hours after the trial ended. `spentUsd` is the ledger's cost for every profile. `listUsdPerResolved` is always null, because the host has no list-price table.
+
+**Storage.** Reports and priors are kept 365 days, and the hourly sweep removes at most 100 of each per pass. Subject rows are never removed.
+
+#### Priors
+
+A finished `baseline` or `compare` job also writes prior rows, for the evidence router. A `confirm` job writes none, and the prospective confirm export waits for a later design. A row is one cell: configuration, area, kind, prompt origin, profile epoch, and prompt version. It counts a trial when it is final, not void, `isolated`, and has a known configuration id, epoch, and prompt version, and when its task has a known prompt origin. `tasks` is the number of distinct tasks, and it is the sample size to trust. `trials` and `resolved` count the trials. The export leaves out reused copies. The job that ran a source trial exports it, so a compare job's rows count only the trials that job ran itself. A compare job whose every slot is reused writes a report and no prior row. One row has one epoch and one prompt version.
+
+The priors read returns the project's newest 500 rows as the spec's `ReplayPrior`:
+
+- `profile` holds the provider, the model, and the effort. A null model or effort stays null.
+- `area` is the area name from the project's feature map, `mixed`, or `root`, and `other` for an area that the map no longer names. `kind` stays null when unknown.
+- `role` is `implementer` and `source` is `replay`.
+
+The report never names a model. The priors read does, because the router needs it to match a prior to a profile. The router's read of the export is not built.
+
+#### Commands and routes
+
+| Command | Meaning |
+|---|---|
+| `infinite eval run PROJECT --file job.json --request-id UUID [--json]` | Creates a baseline, compare, or confirm job, by the `kind` in the file. |
+| `infinite eval report JOB [--json]` | Prints the stored report. |
+| `infinite eval priors PROJECT [--json]` | Prints the prior export, one line per row. |
+
+`report` prints these lines. A null figure prints `unknown`, a difference has its sign and three decimals, and a p-value has four.
+
+```text
+report JOB compare (dev set) · completed · done · 3 trials per task
+tasks 12 of 12 analysed (100%) · conclusive
+configuration 0: PROFILE (PROVIDER, epoch 1)
+1 vs 0: +0.194 [+0.056, +0.333] · sign 7-1-4, p 0.0703 (Holm 0.0703) · detectable 0.214 (planning 0.283 to 0.332)
+sensitivity 1 vs 0: +0.167 over 10 tasks
+attrition 0: void-limit 0, void-host 0, void-owner 0, changed 1, short 1
+cost 0: 4 trials, 2 resolved · per resolved: tokens 4500, spent USD 2.25, list USD unknown, minutes 30.0 (complete cost for 3 of 4)
+by prompt origin assignment (n 6): 1 vs 0 +0.278 [+0.111, +0.444], p 0.1250
+by area host (n 6): …
+```
+
+The lines for configurations, pairs, sensitivity, attrition, and cost repeat for each one. `priors` prints `PROFILE PROVIDER/MODEL/EFFORT epoch 1 · prompt 1a2b3c4d · area host · kind feature · origin assignment: 7 of 18 trials resolved over 6 tasks · JOB · GENERATED_AT`, with `none` for a null kind and `unknown` for a null model or effort. Without rows it prints `no priors`.
+
+A comparison job's count line adds `reused N` and, until its report is ready, `resolved hidden`: `tasks 3 of 20 (skipped 0) · trials started 9 of 60, graded 8, resolved hidden, ended 0, void 1, reused 12 · report pending`. `status` adds `sets dev N · holdout M`, and `holdout H, exposed X` on the groups line.
+
+| Route | Role |
+|---|---|
+| `GET /api/eval/jobs/:id/report` | Owner, controller, or viewer |
+| `GET /api/eval/projects/:id/priors` | Owner, controller, or viewer |
+
+The report route answers `404` `unknown-job`, and `409` `no-report` for a validate or baseline job, `report-not-ready` before the pass has run, and `report-unreadable`. A store that is not ready is `503` `evidence-unavailable`. No relay rule allows either route.
+
+#### Defaults
+
+The owner decided none of these. They stand until the owner changes one:
+
+- a holdout share of 30%;
+- rotation after five confirm jobs or 120 days;
+- 15 holdout tasks for a confirm job, and 2 tasks for a compare job;
+- 20 tasks per job, at most 200;
+- 3 trials per task;
+- reuse within 30 days;
+- reports and priors kept 365 days, and subjects kept with no limit;
+- a cancelled confirm job keeps its subject;
+- a report never names a model, and the priors read does.
+
+A comparison job waits for the same gates as a baseline job, in creation order with baseline jobs, and shows the same `waiting` values. A fully reused compare job needs none of them. Set counts, reports, and priors work without any trial.
+
+#### Planning figures are estimates
+
+`detectable.planning` and the spec's table (about 25 to 30 points at 15 tasks, 18 to 21 at 30, and 13 to 15 at 60, for 3 trials per task and 80% power) come from a normal approximation for a paired mean. They are estimates, not results. The simulation of the power of the sign test and the bootstrap interval on resolved scores is not part of this change. Until someone runs it, read `planning` as a rough guide and `observed` as the figure from your own data. No real report exists to check either against.
+
+#### Rollback
+
+The first start of this version migrates the corpus to version 3 and the trial store to version 2. A host without this version cannot read them. After the migrations ran, an older host reads `eval-corpus` and `eval-trials` as `unavailable`. Capture, mining, validation, and trials then stop until the newer host runs again. So rolling back this version is a step with a cost: stop the host, start the older one, and expect those four to stay stopped. Run the newer host again to resume them. Reports, priors, and subjects exist only in the newer version.
 
 ### Not in this slice
 
 These arrive in later steps of the delivery order:
 
-- the dev and holdout sets, and the exposure of a group;
-- reports, priors, and their routes;
 - a scheduled revalidation. An owner starts one with `revalidate`.
 
 Also not in this slice:

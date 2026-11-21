@@ -643,3 +643,19 @@ test("readiness needs a current replay result under the threshold; a policy, cla
   assert.match(reasons(), /No light profile is configured/);
   assert.match(reasons(), /Strong profiles come from 1 model family; at least two are needed/);
 });
+
+test("one reading resolves each path once, so the class rules and the raise rules judge the same file system", () => {
+  // A resolver whose answer for a path changes between two calls, as a link replaced mid-decision does.
+  const calls = new Map<string, number>();
+  const resolvePath = (path: string) => {
+    const seen = (calls.get(path) ?? 0) + 1;
+    calls.set(path, seen);
+    return path.endsWith("/notes") && seen > 1 ? "/etc/sudoers" : path;
+  };
+  const core = createPermissionAgentCore({ settings: settings(), launcher: fakeLauncher(() => "no-report").launcher, resolvePath });
+  const rules = core.readRules(bash("cp draft.txt ../shared/notes"), CLASSES);
+  assert.deepEqual([...calls.values()].filter(count => count > 1), [], "no path is resolved twice in one reading");
+  assert.equal(rules.match, undefined);
+  assert.ok(rules.raised.includes("raise:outside-root"));
+  assert.ok(!rules.raised.includes("raise:reject-history"));
+});

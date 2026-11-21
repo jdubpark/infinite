@@ -93,6 +93,7 @@ class FakeCore implements PermissionAgentCore {
     if (!shape.oneShotReject) return { qualified: false, reason: "no-one-shot-reject" };
     return { qualified: true };
   }
+  readRules(request: PermissionRequest) { return { match: this.classify(request), raised: this.raise(request, { rejectHistory: false }) }; }
   raise(request: PermissionRequest, context: { rejectHistory: boolean }) {
     this.raises.push(context.rejectHistory);
     return [...(request.destructive ? ["destructive"] : []), ...(this.outside.has(request.action) ? ["outside-root"] : []), ...(context.rejectHistory ? ["reject-history"] : [])];
@@ -811,6 +812,21 @@ test("a recorded allow answers a second attempt only while a new identical reque
   decided(await f.pipeline.decide(later), "undeliverable");
   f.controls.unlock(BUILDER, { requestId: randomUUID() }, actor);
   assert.deepEqual(await f.pipeline.decide(later), second);
+}));
+
+test("a recorded allow does not answer a second attempt past a newer owner verdict for the identical request", () => withFixture(async f => {
+  f.delegate();
+  const waiting = request({ action: "npm run build" });
+  const allowed = decided(await f.pipeline.decide(waiting), "allow");
+  // A newer open reject of the task stops the allow's replay, so the identical request is reviewed and reaches the owner.
+  f.core.next = () => reject("unsafe");
+  const unrelated = decided(await f.pipeline.decide(request({ action: "rm -rf ../shared", assignment: "task-1:reviewer" })), "reject");
+  f.core.next = () => ({ verdict: "owner", interruptClass: "credentials", tiers: [strongTier()] });
+  decided(await f.pipeline.decide(request({ action: "npm run build" })), "owner");
+  // The owner reopens the unrelated reject. The owner verdict is still the latest for the request.
+  f.controls.reopen(unrelated.decisionId, { requestId: randomUUID() }, actor);
+  assert.equal(f.journal.replayEligible(allowed.decisionId, { taskId: "task-1", requesterFamily: "alpha" }), true);
+  decided(await f.pipeline.decide(waiting), "undeliverable");
 }));
 
 test("owner controls replay a request ID, refuse a conflicting one, and refuse what is not a reviewer's reject", () => withFixture(async f => {

@@ -38,6 +38,8 @@ export const verdictEventDataSchema = z.strictObject({
   pendingOwner: count,
 });
 export type VerdictEventData = z.infer<typeof verdictEventDataSchema>;
+/** The data as stored: the host stamps `v: 1` on every run event. Data of another version, or of none, is not this shape. */
+const storedDataSchema = verdictEventDataSchema.extend({ v: z.literal(1) });
 
 /** The pattern of outcomeModule: one table, two blind indexes, a deleteRun hook that stamps and never removes. */
 export function verdictModule(options?: { now?: () => string }): EvidenceModule {
@@ -82,7 +84,7 @@ export function verdictProjector(): EventProjector {
     module: VERDICTS_MODULE,
     kinds: ["verdict.recorded"],
     project(tx, event) {
-      const parsed = verdictEventDataSchema.safeParse(event.data);
+      const parsed = storedDataSchema.safeParse(event.data);
       if (!parsed.success) return;
       const data = parsed.data;
       tx.run(

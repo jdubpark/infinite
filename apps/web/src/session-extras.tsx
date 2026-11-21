@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { Prompt } from "@infinite/attention";
+import { terminalOnlyPrompt, type Prompt } from "@infinite/attention";
 import { RefreshCw } from "lucide-react";
 import { ApiError, isControlRefusal, isMissionManaged, useApi, type ChatMessage, type MessagesPage, type ProjectFile, type Session } from "./api";
 import { useMachines } from "./machines";
@@ -142,7 +142,7 @@ export function PromptDecision({ sessionId, backend, prompt, canAnswer, controlI
     } finally { setBusy(false); refresh(); }
   }
   const feedText = backend === "cmux" && prompt.source === "protocol" && prompt.acceptsText && Boolean(prompt.hash);
-  const terminalOnly = !feedText && (prompt.multiSelect || !prompt.hash || !prompt.options.length);
+  const terminalOnly = terminalOnlyPrompt(prompt, backend);
   const textReply = prompt.acceptsText && prompt.kind !== "yes-no" && (backend !== "cmux" || prompt.source === "protocol");
   return <section className="prompt-decision" aria-label="Session needs your decision">
     <strong>{prompt.title}</strong>{prompt.detail && <pre>{prompt.detail}</pre>}

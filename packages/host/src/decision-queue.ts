@@ -1,12 +1,15 @@
-import type { Attention, Prompt } from "@infinite/attention";
+import { terminalOnlyPrompt, type Attention, type Prompt } from "@infinite/attention";
 import { publicAttention } from "./manager.js";
 import type { Mission, MissionDecision, MissionStatus } from "./mission-types.js";
 import type { TeamDecision, TeamStatus } from "./team-types.js";
 import type { Session } from "./types.js";
 
-/** One decision that waits on a person, from anywhere on the host. */
+/**
+ * One decision that waits on a person, from anywhere on the host. A session row with `terminalOnly` waits on a person
+ * too, but its `answerPath` refuses it: the person answers in that session's terminal.
+ */
 export type QueueDecision =
-  | { kind: "session"; key: string; since: string; origin: QueueOrigin; answerPath: string; prompt: Prompt }
+  | { kind: "session"; key: string; since: string; origin: QueueOrigin; answerPath: string; prompt: Prompt; terminalOnly?: true }
   | { kind: "team"; key: string; since: string; origin: QueueOrigin; answerPath: string; revision: number; decision: TeamDecision; held?: true }
   | { kind: "mission"; key: string; since: string; origin: QueueOrigin; answerPath: string; revision: number; decision: MissionDecision };
 
@@ -27,6 +30,7 @@ export interface DecisionQueueInput {
     title: string;
     projectId?: string;
     status: Session["status"];
+    backend?: Session["backend"];
     attention: Attention;
     owner: "user" | "coordinator" | "undecided";
     team: { id: string; title: string; role: string } | undefined;
@@ -106,6 +110,7 @@ export function buildDecisionQueue(input: DecisionQueueInput): DecisionQueue {
       origin: originForSession(session),
       answerPath: `/api/sessions/${session.id}/answer`,
       prompt,
+      ...(terminalOnlyPrompt(prompt, session.backend) ? { terminalOnly: true as const } : {}),
     });
   }
 

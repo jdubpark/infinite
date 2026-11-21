@@ -3,7 +3,7 @@ import test from "node:test";
 import { initialAttention, type Attention, type Prompt } from "@infinite/attention";
 import { buildDecisionQueue } from "../packages/host/src/decision-queue.js";
 import { readDecisionQueue } from "../packages/host/src/decision-queue-read.js";
-import type { Manager } from "../packages/host/src/manager.js";
+import { publicAttention, type Manager } from "../packages/host/src/manager.js";
 import type { MissionDecision } from "../packages/host/src/mission-types.js";
 import type { TeamDecision } from "../packages/host/src/team-types.js";
 import { promptOwner } from "../packages/host/src/notifier.js";
@@ -16,7 +16,9 @@ type TeamInput = QueueInput["teams"][number];
 type MissionInput = QueueInput["missions"][number];
 
 const at = (minute: number) => `2026-11-21T12:${String(minute).padStart(2, "0")}:00.000Z`;
+const hash = "a".repeat(64);
 
+/** A permission dialog the answer route can deliver to: its hook matched a block on the screen. */
 function prompt(id: number, tool?: Prompt["tool"]): Prompt {
   return {
     id,
@@ -25,6 +27,7 @@ function prompt(id: number, tool?: Prompt["tool"]): Prompt {
     options: [{ index: 1, label: "Run", role: "accept" }],
     acceptsText: false,
     source: "hook",
+    hash,
     ...(tool === undefined ? {} : { tool }),
   };
 }
@@ -138,9 +141,42 @@ test("session decisions require a live user-owned needs-you prompt and expose no
       options: [{ index: 1, label: "Run", role: "accept" }],
       acceptsText: false,
       source: "hook",
+      hash,
       tool: { name: "Bash", input: {} },
     },
   });
+});
+
+test("a session prompt that only its terminal can answer is listed and marked", () => {
+  const unverified = (id: number): Prompt => { const { hash: _hash, ...rest } = prompt(id); return rest; };
+  const waiting = (id: string, minute: number, current: Prompt, backend?: SessionInput["backend"]) =>
+    session(id, { ...(backend === undefined ? {} : { backend }), attention: attention(at(minute), "needs-you", current) });
+  const text = { source: "protocol", acceptsText: true, options: [] } as const;
+  const queued = buildDecisionQueue({
+    sessions: [
+      waiting("verified", 1, prompt(1)),
+      waiting("hook-only", 2, unverified(2)),
+      waiting("multi-select", 3, { ...prompt(3), multiSelect: true }),
+      waiting("no-options", 4, { ...prompt(4), options: [] }),
+      waiting("text-native", 5, { ...prompt(5), ...text }),
+      waiting("text-cmux", 6, { ...prompt(6), ...text }, "cmux"),
+      waiting("text-cmux-unverified", 7, { ...unverified(7), ...text }, "cmux"),
+    ],
+    teams: [],
+    missions: [],
+  });
+
+  // Every one of them waits on a person, so every one is listed. The marker says where the answer goes.
+  assert.deepEqual(queued.decisions.map(item => [item.origin.id, item.kind === "session" && item.terminalOnly === true]), [
+    ["verified", false],
+    ["hook-only", true],
+    ["multi-select", true],
+    ["no-options", true],
+    ["text-native", true],
+    ["text-cmux", false],
+    ["text-cmux-unverified", true],
+  ]);
+  assert.equal("terminalOnly" in queued.decisions[0]!, false);
 });
 
 test("shared prompt ownership checks the permission holder before the team coordinator", () => {
@@ -176,21 +212,20 @@ test("queue classifies delegated member prompts before hiding tool input", async
       attention: attention(at(1), "needs-you", prompt),
       team: { runId: f.run.id, memberId: member.memberId, revision: member.revision, role: member.role },
     };
-    let includedFullMessage = false;
+    // Like the real list: a row carries the tool input only when the full message is asked for.
     const manager = {
-      list: async (options?: { includeFullMessage?: boolean }) => {
-        includedFullMessage = options?.includeFullMessage === true;
-        return [row];
-      },
+      list: async (options?: { includeFullMessage?: boolean }) =>
+        [options?.includeFullMessage === true ? row : { ...row, attention: publicAttention(row.attention) }],
     } as unknown as Pick<Manager, "list">;
     const read = (service: typeof teams) => readDecisionQueue({
       manager, cmux: undefined, permissions: { holder: () => "owner" }, teams: service,
       goals: { decisionAnswerable: () => false }, missions: { decisionQueueCandidates: () => [] },
     });
 
+    // Without its tool input the team cannot classify the prompt and leaves it to the owner. The queue must not.
+    assert.equal(teams.promptOwner(member.sessionId, publicAttention(row.attention).prompt!), "user");
     assert.equal(teams.promptOwner(member.sessionId, prompt), "undecided");
     assert.deepEqual((await read(teams)).decisions, []);
-    assert.equal(includedFullMessage, true);
 
     f.run.permissionsRevokedAt = new Date().toISOString();
     f.writeTeam();

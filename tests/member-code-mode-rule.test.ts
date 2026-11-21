@@ -6,7 +6,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claudeProgramInstructions, memberLaunchPrompt } from "../packages/host/src/code-mode.js";
-import { memberConfiguration, promptVersion, renderedPrompts } from "../packages/host/src/config-identity.js";
+import { type ConfigComponents, configId, memberConfiguration, promptVersion, readGuidanceDigest, renderedPrompts } from "../packages/host/src/config-identity.js";
+import { EventOutbox } from "../packages/host/src/evidence/outbox.js";
+import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { memberCodeModeExpected } from "../packages/host/src/launch.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { startFrame } from "../packages/host/src/routing-auto.js";
@@ -95,6 +97,42 @@ test("routing scores a Claude candidate at the prompt version of the mode a new 
   assert.notEqual(on.get("haiku-medium"), off.get("haiku-medium"));
   assert.ok(off.get("astra-xhigh"));
   assert.equal(on.get("astra-xhigh"), off.get("astra-xhigh"));
+});
+
+test("a Claude member records the configuration of the mode its launch recorded", async () => {
+  const versions: string[] = [];
+  for (const codeMode of [true, false]) {
+    const f = schedulerFixture();
+    const store = new EvidenceStore({ databasePath: evidenceDatabasePath(f.config.stateDir), vaultKey: f.key });
+    try {
+      // One queued Claude implementer on task a.
+      const memberId = randomUUID();
+      f.run.members = [{ ...f.run.members[0]!, memberId, sessionId: randomUUID(), role: "implementer", title: "Implementer: a", taskId: "a",
+        provider: "claude", modelProfile: claudeLight, status: "queued", cursor: 0, prompt: "Write a.txt" }];
+      f.run.lineup = mixedLineup; f.run.status = "implementing"; f.run.parallelism = 2;
+      f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "running", memberId }];
+      f.writeTeam();
+      // The session record says whether the host asked for Code Mode. The stand-in manager returns it as the host does.
+      const start = f.manager.createTeamSession;
+      f.manager.createTeamSession = (async (...args: Parameters<typeof start>) => ({ ...(await start(...args)), ...(codeMode ? { codeMode: true } : {}) })) as typeof start;
+      const teams = f.openTeam({ events: new EventOutbox(store) });
+      const scheduler = teams as unknown as { record(id: string): unknown; step(stored: unknown): Promise<void> };
+      await scheduler.step(scheduler.record(f.run.id));
+      const configured = () => store.events({ runId: f.run.id, after: 0, limit: 500 }).events.filter(event => event.kind === "member.configured");
+      await waitFor(configured, found => found.length === 1, 60000);
+      await teams.idle();
+      const guidance = await readGuidanceDigest(f.run.workspace, f.run.baseCommit, undefined, new AbortController().signal);
+      assert.ok(guidance !== undefined, "the fixture's guidance reads");
+      const version = promptVersion("implementer", "claude", claudeLight, true, false, false, codeMode);
+      const components: ConfigComponents = { profile: { provider: "claude", model: claudeLight.model, effort: "medium" },
+        promptVersion: version, guidance, knowledge: "none", routing: "off", shape: "team" };
+      assert.deepEqual(configured()[0]!.data, { v: 1, configId: configId(components), provider: "claude", model: claudeLight.model, effort: "medium",
+        promptVersion: version, guidance, knowledge: "none", routing: "off", shape: "team" }, `Code Mode ${codeMode}`);
+      versions.push(version);
+    } finally { store.close(); f.close(); }
+  }
+  assert.equal(versions[1], promptVersion("implementer", "claude", claudeLight, true), "a launch without Code Mode keeps the version it had");
+  assert.notEqual(versions[0], versions[1]);
 });
 
 test("a run's router reads the mode a new Claude member would start in, and a learning run reads none", () => {

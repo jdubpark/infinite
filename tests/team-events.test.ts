@@ -10,7 +10,7 @@ import { EventOutbox, type OutboxEvent } from "../packages/host/src/evidence/out
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { RunEvent } from "../packages/host/src/evidence/types.js";
 import { MAX_OUTBOX_EVENTS } from "../packages/host/src/run-events.js";
-import { DEFAULT_TEAM_RETENTION, type TeamModelProfile, type TeamRun, teamGoalContextSchema } from "../packages/host/src/team-types.js";
+import { DEFAULT_TEAM_RETENTION, type TeamRun, teamGoalContextSchema } from "../packages/host/src/team-types.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { prepareMemberWorkspace } from "../packages/host/src/team-workspace.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
@@ -720,39 +720,6 @@ test("a launched member records its configuration", async () => {
     assert.deepEqual(event!.data, { v: 1, configId: configId(components), provider: "opencode", model: profile.model, effort: "high",
       promptVersion: version, guidance, knowledge: "none", routing: "off", shape: "team" });
   } finally { store.close(); f.close(); }
-});
-
-test("a Claude member records the configuration of the mode its launch recorded", async () => {
-  const claude: TeamModelProfile = { id: "haiku-medium", label: "Claude implementer", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" };
-  const versions: string[] = [];
-  for (const codeMode of [true, false]) {
-    const f = schedulerFixture();
-    const store = openStore(f, f.key);
-    try {
-      queueImplementer(f);
-      f.run.members[0] = { ...f.run.members[0]!, provider: "claude", modelProfile: claude };
-      f.writeTeam();
-      // The session record says whether the host asked for Code Mode. The stand-in manager returns it as the host does.
-      const start = f.manager.createTeamSession;
-      f.manager.createTeamSession = (async (...args: Parameters<typeof start>) => ({ ...(await start(...args)), ...(codeMode ? { codeMode: true } : {}) })) as typeof start;
-      const teams = f.openTeam({ events: new EventOutbox(store) });
-      const scheduler = internal(teams);
-      await scheduler.step(scheduler.record(f.run.id));
-      await waitFor(() => eventsOfKind(store, f.run.id, "member.configured").length === 1, "member.configured is stored");
-      await teams.idle();
-      const [event] = eventsOfKind(store, f.run.id, "member.configured");
-      const guidance = await readGuidanceDigest(f.run.workspace, f.run.baseCommit, undefined, new AbortController().signal);
-      assert.ok(guidance !== undefined, "the fixture's guidance reads");
-      const version = promptVersion("implementer", "claude", claude, true, false, false, codeMode);
-      const components: ConfigComponents = { profile: { provider: "claude", model: claude.model, effort: "medium" },
-        promptVersion: version, guidance, knowledge: "none", routing: "off", shape: "team" };
-      assert.deepEqual(event!.data, { v: 1, configId: configId(components), provider: "claude", model: claude.model, effort: "medium",
-        promptVersion: version, guidance, knowledge: "none", routing: "off", shape: "team" }, `Code Mode ${codeMode}`);
-      versions.push(version);
-    } finally { store.close(); f.close(); }
-  }
-  assert.equal(versions[1], promptVersion("implementer", "claude", claude, true), "a launch without Code Mode keeps the version it had");
-  assert.notEqual(versions[0], versions[1]);
 });
 
 test("a goal run with a pinned record digest records the digest's prompt version", async () => {

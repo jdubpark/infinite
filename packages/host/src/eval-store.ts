@@ -2,6 +2,7 @@ import type { EvidenceStore } from "./evidence/store.js";
 import { canonicalJson } from "./evidence/crypto.js";
 import type { EvidenceDb, EvidenceModule, EvidenceTx, RunEvent } from "./evidence/types.js";
 import type { Promotion } from "./eval-rules.js";
+import { drawExisting, fillTaskFields } from "./eval-sets.js";
 import {
   EVAL_MODULE,
   type ApprovalState,
@@ -117,6 +118,19 @@ export const SCHEMA_V2 = [
   "CREATE INDEX IF NOT EXISTS eval_jobs_created ON eval_jobs (created_at, job_id)",
 ];
 
+export const SCHEMA_V3 = [
+  "ALTER TABLE eval_groups ADD COLUMN holdout INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE eval_groups ADD COLUMN set_at TEXT",
+  "ALTER TABLE eval_groups ADD COLUMN exposed INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE eval_groups ADD COLUMN confirms INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE eval_tasks ADD COLUMN prompt_origin TEXT",
+  "ALTER TABLE eval_tasks ADD COLUMN kind TEXT",
+  "ALTER TABLE eval_jobs ADD COLUMN reported_at TEXT",
+  "CREATE INDEX IF NOT EXISTS eval_groups_holdout_age ON eval_groups (set_at) WHERE holdout = 1",
+  "CREATE INDEX IF NOT EXISTS eval_groups_holdout_used ON eval_groups (confirms) WHERE holdout = 1 AND confirms >= 5",
+  "CREATE INDEX IF NOT EXISTS eval_jobs_unreported ON eval_jobs (kind, project_ref, finished_at, job_id) WHERE reported_at IS NULL AND kind != 'validate'",
+];
+
 const TASK_COLUMNS = "task_id, origin, run_id, member_id, project_ref, state, reason, material, approval, approved_at, base, "
   + "material_bytes, captured_at, decided_at, checked_at, run_deleted_at, payload, group_id, lineage, validated_at, attempts";
 
@@ -165,11 +179,16 @@ export type Promoted = (tx: EvidenceTx, task: EvalTaskRow) => void;
 export function evalCorpusModule(store: EvidenceStore, now: () => string): EvidenceModule {
   return {
     name: EVAL_MODULE,
-    version: 2,
-    readVersion: 2,
+    version: 3,
+    readVersion: 3,
     migrate(tx, from) {
       if (from === 0) for (const statement of SCHEMA_V1) tx.exec(statement);
       if (from < 2) for (const statement of SCHEMA_V2) tx.exec(statement);
+      if (from < 3) {
+        for (const statement of SCHEMA_V3) tx.exec(statement);
+        drawExisting(tx);
+        fillTaskFields(tx);
+      }
     },
     deleteRun(tx, runId) {
       const owned = tx.get<{ n: number }>("SELECT count(*) AS n FROM eval_tasks WHERE run_id=?", runId)?.n ?? 0;

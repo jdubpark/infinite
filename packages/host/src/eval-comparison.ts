@@ -2,9 +2,10 @@ import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb, EvidenceTx } from "./evidence/types.js";
 import { areaNames, priorCells, writePriors, type PriorTask } from "./eval-priors.js";
 import { comparisonStats, type StatTask, type StatTrial } from "./eval-stats.js";
-import { jobRows, REPORT_KEEP_DAYS, type JobTrialRow } from "./eval-trial-store.js";
-import type {
-  ComparisonPin, ComparisonReport, EvalJobReason, EvalRefusal, PromptOrigin, TrialJobPayload,
+import { EVAL_TRIALS_MODULE, jobRows, REPORT_KEEP_DAYS, type JobTrialRow } from "./eval-trial-store.js";
+import {
+  EVAL_MODULE,
+  type ComparisonPin, type ComparisonReport, type EvalJobReason, type EvalRefusal, type PromptOrigin, type TrialJobPayload,
 } from "./eval-types.js";
 import type { Config } from "./types.js";
 
@@ -154,6 +155,9 @@ export class ComparisonPass {
   /** At most one finished job per call. Never throws. */
   step(): "reported" | "waiting" | "idle" {
     try {
+      // A report and its stamp are written only while both modules read and write.
+      const modules = this.store.status().modules;
+      if (modules[EVAL_MODULE] !== "ready" || modules[EVAL_TRIALS_MODULE] !== "ready") return "idle";
       const at = this.now();
       const due = this.store.read(db => {
         const candidates = db.all<DueRow>(REPORT_DUE_SQL);

@@ -161,7 +161,7 @@ export class EvalHost implements EvalHostApi {
     try { this.capture.sweep(); } catch { /* the sweep never throws */ }
     try { this.store.tryWrite(tx => { sweepGroups(tx); }); } catch { /* an unavailable store sweeps nothing */ }
     try { this.evalJobs.sweep(); } catch { /* an unavailable store sweeps nothing */ }
-    try { this.store.tryWrite(tx => { rotateHoldout(tx, this.now()); }); } catch { /* an unavailable store rotates nothing */ }
+    try { if (this.ready()) this.store.tryWrite(tx => { rotateHoldout(tx, this.now()); }); } catch { /* an unavailable store rotates nothing */ }
     void this.trials?.sweep();
   }
 

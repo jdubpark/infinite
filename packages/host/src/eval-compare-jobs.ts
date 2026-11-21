@@ -57,7 +57,8 @@ const comparisonShape = z.object({
 
 export const comparisonJobSchema = comparisonShape
   .refine(request => request.kind !== "confirm" || request.configurations.length === 2, "A confirm job compares exactly two configurations")
-  .refine(request => request.kind !== "confirm" || request.taskFilter?.taskIds === undefined, "A confirm job admits no taskIds") as unknown as z.ZodType<ComparisonJobRequest>;
+  .refine(request => request.kind !== "confirm" || request.taskFilter?.taskIds === undefined, "A confirm job admits no taskIds")
+  .refine(request => request.kind !== "confirm" || request.taskFilter?.excludeGroups === undefined, "A confirm job admits no excludeGroups") as unknown as z.ZodType<ComparisonJobRequest>;
 
 export type ComparisonPlan = {
   tasks: string[]; pins: ComparisonPin[]; subject?: string; roots: string[];
@@ -107,7 +108,7 @@ export function planComparison(tx: EvidenceTx, input: { projectId: string; reque
   const origins = filter?.origins === undefined ? undefined : new Set<string>(filter.origins);
   const promptOrigins = filter?.promptOrigins === undefined ? undefined : new Set<string>(filter.promptOrigins);
   const areas = filter?.areas === undefined ? undefined : new Set(filter.areas.map(area => tx.index("area", area)));
-  const excluded = filter?.excludeGroups === undefined ? undefined : new Set(filter.excludeGroups);
+  const excluded = filter?.excludeGroups === undefined || confirm ? undefined : new Set(filter.excludeGroups);
   const wanted = confirm ? 1 : 0;
   const tasks: string[] = [];
   const roots = new Set<string>();

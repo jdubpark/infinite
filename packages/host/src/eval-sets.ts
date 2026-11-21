@@ -19,10 +19,11 @@ export const SET_COUNTS_SQL = "SELECT COALESCE(r.holdout, 0) AS holdout, count(*
   + "ON g.group_id = t.group_id LEFT JOIN eval_groups r ON r.group_id = g.root_id WHERE t.project_ref = ? AND t.state = 'valid' GROUP BY 1";
 export const GROUP_SETS_SQL = "SELECT COALESCE(SUM(holdout), 0) AS holdout, COALESCE(SUM(exposed), 0) AS exposed FROM eval_groups "
   + "WHERE project_ref = ? AND root_id = group_id";
-export const HOLDOUT_USED_SQL = "SELECT group_id, project_ref FROM eval_groups WHERE holdout = 1 AND confirms >= 5 LIMIT ?";
-export const HOLDOUT_AGED_SQL = "SELECT group_id, project_ref FROM eval_groups WHERE holdout = 1 AND set_at <= ? ORDER BY set_at LIMIT ?";
-/** The first two terms select the partial index `eval_jobs_unreported`. An active confirm job has no report either. */
-export const CONFIRMS_UNREPORTED_SQL = "SELECT DISTINCT project_ref FROM eval_jobs WHERE reported_at IS NULL AND kind != 'validate' AND kind = 'confirm'";
+/** Leaves out every project that has a confirm job without a report: the job still reads its groups, and an active confirm job has no report
+ *  either. The first two terms of the inner statement select the partial index `eval_jobs_unreported`. */
+const UNBLOCKED = "AND project_ref NOT IN (SELECT project_ref FROM eval_jobs WHERE reported_at IS NULL AND kind != 'validate' AND kind = 'confirm')";
+export const HOLDOUT_USED_SQL = `SELECT group_id, project_ref FROM eval_groups WHERE holdout = 1 AND confirms >= 5 ${UNBLOCKED} LIMIT ?`;
+export const HOLDOUT_AGED_SQL = `SELECT group_id, project_ref FROM eval_groups WHERE holdout = 1 AND set_at <= ? ${UNBLOCKED} ORDER BY set_at LIMIT ?`;
 
 export type TrialTaskRow = {
   task_id: string;
@@ -77,13 +78,11 @@ export function markExposed(tx: EvidenceTx, groupId: string): boolean {
 
 /** Moves used and aged holdout roots to dev, at most `limit` roots, none in a project with an unreported confirm job. */
 export function rotateHoldout(tx: EvidenceTx, now: string, limit = ROTATION_BATCH): number {
-  const blocked = new Set(tx.all<{ project_ref: string }>(CONFIRMS_UNREPORTED_SQL).map(row => row.project_ref));
   const cutoff = new Date(Date.parse(now) - HOLDOUT_DAYS_MAX * DAY_MS).toISOString();
   let moved = 0;
   const move = (rows: { group_id: string; project_ref: string }[]): void => {
     for (const row of rows) {
       if (moved >= limit) return;
-      if (blocked.has(row.project_ref)) continue;
       moved += tx.run("UPDATE eval_groups SET holdout = 0, set_at = NULL WHERE group_id = ? AND holdout = 1", row.group_id).changes;
     }
   };

@@ -105,8 +105,8 @@ const groupPairs = (pairs: PairResult[]) =>
 /** A stored report as lines. It prints what the host returns: no model name is added, and a null figure prints as unknown. */
 export function evalReportLines(report: ComparisonReport): string[] {
   const { tasks } = report;
-  const share = tasks.planned > 0 ? `${Math.round(tasks.analysed / tasks.planned * 100)}%` : "unknown";
-  const verdict = report.conclusive ? "conclusive" : "inconclusive: under 90% of tasks kept every valid trial";
+  const share = tasks.planned > 0 ? `${Math.floor(tasks.analysed / tasks.planned * 100)}%` : "unknown";
+  const verdict = report.conclusive ? "share rule met" : "inconclusive: under 90% of tasks kept every valid trial";
   const reason = report.reason ? ` · ${clean(report.reason)}` : "";
   return [
     `report ${clean(report.jobId)} ${clean(report.kind)} (${clean(report.set)} set) · ${clean(report.status)}${reason} · ${count(report.trialsPerTask)} trials per task`,

@@ -21,7 +21,7 @@ const MESSAGES: Record<EvalRefusal["code"], string> = {
   "unknown-project": "The project is not configured on this host.",
   "unknown-job": "No job has this ID.",
   "unknown-task": "No task has this ID.",
-  "job-active": "This project already has an active validation job.",
+  "job-active": "This project already has an active job of this kind.",
   "request-conflict": "This request ID already names a different job.",
   "eval-config-incomplete": "The project's validation settings are incomplete.",
   "profile-not-approved": "The trial profile is not approved for this project.",

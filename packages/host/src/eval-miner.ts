@@ -88,7 +88,7 @@ export function insertMined(tx: EvidenceTx, input: MinedInsert, at: string): "in
   const inserted = tx.run(
     "INSERT OR IGNORE INTO eval_tasks (task_id, origin, run_id, member_id, project_ref, state, reason, material, approval, "
     + "approved_at, base, material_bytes, captured_at, decided_at, checked_at, run_deleted_at, payload, group_id, commit_ref, "
-    + "area_ref, paths_indexed) VALUES (?, 'mined', '', '', ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 1)",
+    + "area_ref, paths_indexed, prompt_origin, kind) VALUES (?, 'mined', '', '', ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 1, ?, ?)",
     taskId,
     projectRef,
     input.kind === "candidate" ? "candidate" : "rejected",
@@ -103,6 +103,8 @@ export function insertMined(tx: EvidenceTx, input: MinedInsert, at: string): "in
     taskId,
     commitRef,
     input.kind === "candidate" ? tx.index("area", input.features.area) : null,
+    input.kind === "candidate" ? input.promptOrigin : null,
+    input.kind === "candidate" ? input.features.kind : null,
   );
   if (inserted.changes === 0) return "exists";
   if (input.kind === "candidate") {

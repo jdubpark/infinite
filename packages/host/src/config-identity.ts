@@ -5,6 +5,7 @@ import { intentCheckerPrompt } from "./intent-prompt.js";
 import type { ObjectivePrompt } from "./objective-digest.js";
 import { profileIdentity } from "./run-events.js";
 import { entryCommand, reportCommand, teamPrompt } from "./team-prompts.js";
+import { memberLaunchPrompt } from "./code-mode.js";
 import { teamCommand, teamGitArgs } from "./team-workspace.js";
 import type { RecordDigest, RegisterDigest, TeamCommand, TeamMember, TeamModelProfile, TeamRun, TeamScout, TeamTask } from "./team-types.js";
 import type { Provider } from "./types.js";
@@ -150,17 +151,18 @@ function objectiveFixture(plain: TeamRun, objectiveDigest: ObjectivePrompt): Tea
 }
 
 /**
- * The fixture renders of `teamPrompt`. The report command holds the Node path and the reporter's own file path,
- * which change with the install directory and not with the wording, so a placeholder stands in for it.
- * Throws when teamPrompt throws.
+ * The fixture renders of the prompt a member is launched with: `teamPrompt`, and the rule for programs when the launch
+ * asks for Code Mode (`codeMode`, which changes only a Claude member's prompt). The report command holds the Node path
+ * and the reporter's own file path, which change with the install directory and not with the wording, so a placeholder
+ * stands in for it. Throws when teamPrompt throws.
  */
-export function renderedPrompts(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest: ObjectivePrompt = false): string[] {
+export function renderedPrompts(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest: ObjectivePrompt = false, codeMode = false): string[] {
   const command = reportCommand();
-  if (role === "intent-checker") return [intentCheckerPrompt(provider, profile).split(command).join("<report-command>")];
+  if (role === "intent-checker") return [memberLaunchPrompt(intentCheckerPrompt(provider, profile), provider, codeMode).split(command).join("<report-command>")];
   const entry = entryCommand();
   return FIXTURES.map(({ run: plain, work }) => {
     const run = objectiveFixture(plain, objectiveDigest);
-    return teamPrompt(entryTools ? { ...run, blackboard: { tools: true } } : run, role, work, undefined, provider, profile, { checks: FIXTURE_CHECKS }, [], publishHeads)
+    return memberLaunchPrompt(teamPrompt(entryTools ? { ...run, blackboard: { tools: true } } : run, role, work, undefined, provider, profile, { checks: FIXTURE_CHECKS }, [], publishHeads), provider, codeMode)
       .split(command).join("<report-command>").split(entry).join("<entry-command>");
   });
 }
@@ -169,11 +171,11 @@ export function renderedPrompts(role: TeamMember["role"], provider: Provider, pr
  * The digest of `renderedPrompts`. Cached per exact render input: the prompt prints the whole profile object, so
  * every profile field is part of the key. Throws when teamPrompt throws.
  */
-export function promptVersion(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest: ObjectivePrompt = false): string {
-  const key = JSON.stringify([role, provider, profile ?? null, publishHeads, entryTools, objectiveDigest]);
+export function promptVersion(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest: ObjectivePrompt = false, codeMode = false): string {
+  const key = JSON.stringify([role, provider, profile ?? null, publishHeads, entryTools, objectiveDigest, codeMode]);
   const cached = promptCache.get(key);
   if (cached !== undefined) return cached;
-  const version = sha256(canonicalJson(renderedPrompts(role, provider, profile, publishHeads, entryTools, objectiveDigest)));
+  const version = sha256(canonicalJson(renderedPrompts(role, provider, profile, publishHeads, entryTools, objectiveDigest, codeMode)));
   if (promptCache.size >= PROMPT_CACHE_LIMIT) promptCache.delete(promptCache.keys().next().value!);
   promptCache.set(key, version);
   return version;
@@ -266,6 +268,8 @@ export async function memberConfiguration(input: {
   shape?: "team" | "trial";
   /** The routing component. Absent means `off`, as every configuration before routing was stored. */
   routing?: string;
+  /** True when the host asked for Code Mode at the member's launch. It is part of the prompt version, so of the identity. */
+  codeMode?: boolean;
 }, signal: AbortSignal): Promise<MemberConfiguration | undefined> {
   if (input.routing !== undefined && !isRoutingComponent(input.routing)) return undefined;
   const routing = input.routing ?? "off";
@@ -274,7 +278,7 @@ export async function memberConfiguration(input: {
     if (guidance === undefined) return undefined;
     const identity = profileIdentity(input.profile, input.provider);
     const profile: ProfileKey = { provider: identity.provider, model: identity.model ?? null, effort: identity.effort ?? null };
-    const version = promptVersion(input.role, input.provider, input.profile, input.publishHeads, input.entryTools === true, input.objectiveDigest ?? false);
+    const version = promptVersion(input.role, input.provider, input.profile, input.publishHeads, input.entryTools === true, input.objectiveDigest ?? false, input.codeMode === true);
     const shape = input.shape ?? "team";
     const components: ConfigComponents = { profile, promptVersion: version, guidance, knowledge: "none", routing, shape };
     return { ...profile, promptVersion: version, guidance, knowledge: "none", routing, shape, configId: configId(components) };

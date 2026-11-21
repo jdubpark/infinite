@@ -30,6 +30,8 @@ export type RouterStart = {
   entryTools: boolean;
   /** Whether the run is a goal cycle with a record: the member's prompt version then carries the record digest. */
   objectiveDigest: ObjectivePrompt;
+  /** Whether a new Claude member of this host would be asked to start in Code Mode: a Claude candidate's prompt version then carries the rule for programs. */
+  codeMode: boolean;
   featureMap: FeatureMap | undefined;
   limited: ReadonlySet<Provider>;
 };
@@ -66,7 +68,7 @@ export function frameOf(input: RouterStart, screened: Screened[]): StartFrame {
   for (const item of screened) {
     if (item.removed !== undefined && item.removed !== "limited") continue;
     if (versions.has(item.identity)) continue;
-    const version = promptVersion("implementer", item.profile.provider, item.profile, input.publishHeads, input.entryTools, input.objectiveDigest);
+    const version = promptVersion("implementer", item.profile.provider, item.profile, input.publishHeads, input.entryTools, input.objectiveDigest, input.codeMode);
     versions.set(item.identity, { profile: item.profile, version });
   }
   return { features, screened, versions };

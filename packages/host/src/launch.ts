@@ -6,7 +6,7 @@ import { TeamError } from "./team-workspace.js";
 import { codexTrustArgs } from "./workspace-trust.js";
 import { sudoShape } from "./sudo-profile.js";
 import { EGRESS_ENVIRONMENT_NAMES } from "./egress.js";
-import { CLAUDE_CODE_MODE_ENV } from "./code-mode.js";
+import { CLAUDE_CODE_MODE_ENV, codeModeEnabled } from "./code-mode.js";
 
 /** eval.member.agents[provider] for a learning purpose, else config.agents[provider]. Throws TeamError 409 "eval-identity-missing" for a learning purpose without an eval profile for the provider. */
 export function sessionAgentProfile(config: Pick<Config, "agents" | "eval">, provider: Provider, purpose: SessionPurpose | undefined): AgentProfile | undefined {
@@ -15,6 +15,19 @@ export function sessionAgentProfile(config: Pick<Config, "agents" | "eval">, pro
   const profile = agents && (provider === "claude" || provider === "codex" || provider === "opencode") ? agents[provider] : undefined;
   if (!profile) throw new TeamError(409, "eval-identity-missing", "The eval identity has no launch profile for this provider.");
   return profile;
+}
+
+/**
+ * Whether a new Claude team member of this host would be asked to start in Code Mode. Routing needs the answer before a
+ * launch exists, so this is an estimate from the configured level and the shape of the Claude launch profile: a
+ * headless launch whose shape the permission channel can serve counts as served. Each launch records its own answer,
+ * which is no for a learning run and for a headless launch the channel does not serve.
+ */
+export function memberCodeModeExpected(config: Pick<Config, "agents" | "codeMode">): boolean {
+  const profile = config.agents.claude;
+  if (!profile) return false;
+  const shape = headlessLaunch("claude", profile);
+  return codeModeEnabled(config.codeMode?.claude, "claude", { headless: shape.headless, served: shape.headless && shape.unservable === undefined, excluded: false });
 }
 
 /** For a learning purpose, the snapshot with `text: ""` and `sources: []`: today's text is not the text of the work's time. */

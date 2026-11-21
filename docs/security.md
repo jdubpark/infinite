@@ -73,6 +73,24 @@ headless launches.
 In a served session each tool call inside a program raises its own hooks, so
 the permission channel still decides each call.
 
+A Claude team member whose launch asks for Code Mode reads one more paragraph
+at the end of its prompt: a working rule for programs. It says to filter and
+count inside the program and to print only what the next decision needs. It
+says that each call a program makes passes the same permission checks, that a
+rejected call is final inside a program too, and that the final report is
+submitted on its own. A member that starts without Code Mode reads its prompt
+unchanged. The host adds the rule at the launch and does not store it in the
+member's prompt or in the session's recorded first prompt.
+
+The mode is part of a member's configuration identity. The prompt version of a
+Claude member that started in Code Mode covers the rule, so outcome evidence of
+the two modes stays apart, and identities recorded before the mode existed stay
+the same. Routing reads its evidence at the prompt version a new member would
+start with. It estimates that mode from this setting and the shape of the
+Claude launch profile, and counts a headless launch that the permission channel
+could serve as served. Where the channel does not serve the project, members
+start without Code Mode, and routing counts their outcomes as earlier evidence.
+
 A session records whether the host asked for Code Mode. Resuming the same
 conversation asks again when the record says so, whatever the setting says by
 then, and does not ask when the record says no or the session is older than

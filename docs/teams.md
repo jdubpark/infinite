@@ -2545,6 +2545,13 @@ Each request passes these steps in order:
 3. **Lock and replay.** An assignment that repeated one rejected request twice
    is locked and gets no model turn until the owner unlocks it. An identical
    request under the same authority is answered from its recorded verdict.
+   The authority is the owner's delegation together with the policy text, the
+   class rules and the tier profiles in force, and the project's halt epoch.
+   A release or a configuration change that alters any of them sets aside
+   every verdict recorded before it: none is replayed, no delivery of one
+   starts, and the same request is decided again. An answer already handed to
+   a session's worker may still be typed. A rollback to exactly the earlier rules and
+   profiles brings their verdicts back, as it brings back their replay result.
 4. **Tier.** A routine request goes to the light model, which can allow it or
    refer it. A request is raised to the strong model when it is destructive,
    reaches outside the session's directory, uses a release verb or a push,

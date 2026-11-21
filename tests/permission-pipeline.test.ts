@@ -78,6 +78,9 @@ class FakeCore implements PermissionAgentCore {
   readonly reviews: Array<{ request: PermissionRequest; context: PermissionReviewContext }> = [];
   readonly raises: boolean[] = [];
   next: (request: PermissionRequest, context: PermissionReviewContext) => PermissionReview = () => allow();
+  /** Stands for the policy text, class rules and tier profiles in force. */
+  rules = "rules-1";
+  binding() { return this.rules; }
   readiness() { return { ready: this.ready, reasons: this.ready ? [] : ["No strong profile is configured."] }; }
   familyOf(profile: { provider: string; model?: string }) { return profile.model ? this.families[profile.model] : undefined; }
   classify(request: PermissionRequest) { return this.classes.get(request.action); }
@@ -633,6 +636,39 @@ test("a decision is applicable only under its own authority on a ready host, als
   assert.equal(f.pipeline.applicable(third.decisionId), false, "a revoke retires the decision");
   f.restart();
   assert.equal(f.pipeline.applicable(third.decisionId), false);
+}));
+
+test("a change to the rules or tier profiles in force retires earlier verdicts: no replay, no delivery, and a retry is decided again", () => withFixture(async f => {
+  f.delegate();
+  const allowed = decided(await f.pipeline.decide(request()), "allow");
+  decided(await f.pipeline.decide(request()), "allow");
+  assert.equal(f.core.reviews.length, 1, "an identical request replays while the rules stay the same");
+  const waiting = request({ action: "npm run build" });
+  const pending = decided(await f.pipeline.decide(waiting), "allow");
+  assert.equal(f.pipeline.applicable(pending.decisionId), true);
+
+  // A release with other class rules, policy text or tier profiles: the core reports another binding.
+  f.core.rules = "rules-2";
+  assert.equal(f.pipeline.applicable(allowed.decisionId), false);
+  assert.equal(f.pipeline.applicable(pending.decisionId), false, "a verdict reached under the old rules is not delivered");
+  const again = decided(await f.pipeline.decide(request()), "allow");
+  assert.equal(f.journal.decision(again.decisionId)?.replayOf, undefined, "the old allow is not replayed");
+  const retried = decided(await f.pipeline.decide(waiting), "allow");
+  assert.notEqual(retried.decisionId, pending.decisionId, "a retry of the waiting request is decided again");
+  assert.equal(f.core.reviews.length, 4);
+
+  // The new rules hold across a restart, and verdicts reached under them replay as before.
+  f.restart();
+  assert.equal(f.pipeline.applicable(again.decisionId), true);
+  assert.equal(f.pipeline.applicable(pending.decisionId), false);
+  decided(await f.pipeline.decide(request()), "allow");
+  assert.equal(f.core.reviews.length, 4);
+
+  // A rollback to exactly the earlier rules brings back the verdicts reached under them, as it brings back their
+  // replay result, and sets aside the verdicts of the rules it leaves.
+  f.core.rules = "rules-1";
+  assert.equal(f.pipeline.applicable(pending.decisionId), true);
+  assert.equal(f.pipeline.applicable(again.decisionId), false);
 }));
 
 test("owner controls replay a request ID, refuse a conflicting one, and refuse what is not a reviewer's reject", () => withFixture(async f => {

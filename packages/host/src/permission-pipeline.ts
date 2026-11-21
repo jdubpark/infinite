@@ -196,15 +196,16 @@ export class HostPermissionPipeline implements PermissionPipeline {
   }
 
   /**
-   * The coverage with the project's halt epoch in its authority. A halt ends the authority that earlier decisions
-   * were made under, as a new owner act does, and so does its release: a verdict reached before or during a halt is
-   * never delivered, and after the release the same request is decided again from current evidence. Undefined while
-   * the epoch cannot be read.
+   * The coverage with the core's binding and the project's halt epoch in its authority. Each ends the authority that
+   * earlier decisions were made under, as a new owner act does. A change to the policy text, the class rules or a
+   * tier profile retires every verdict reached before it: none is delivered or replayed, and the same request is
+   * decided again under the rules in force. A halt does the same, and so does its release. Undefined while the
+   * epoch cannot be read.
    */
-  private underHalts(coverage: Covered): Covered | undefined {
-    if (!this.haltEpochOf) return coverage;
-    const epoch = this.haltEpochOf(coverage.projectId);
-    return epoch === undefined ? undefined : { ...coverage, authorityHash: sha256(["permission-authority", coverage.authorityHash, epoch]) };
+  private inForce(coverage: Covered): Covered | undefined {
+    const epoch = this.haltEpochOf ? this.haltEpochOf(coverage.projectId) : null;
+    if (epoch === undefined) return undefined;
+    return { ...coverage, authorityHash: sha256(["permission-authority", coverage.authorityHash, this.core.binding(), epoch]) };
   }
 
   /** A halt that cannot be read counts as a halt. */
@@ -226,9 +227,9 @@ export class HostPermissionPipeline implements PermissionPipeline {
     catch { return { served: false, reason: "not-covered" }; }
     if (!coverage.covered) return { served: false, reason: "not-covered" };
     if (!this.ready()) return { served: false, reason: "not-ready" };
-    let halted: Covered | undefined;
-    try { halted = this.underHalts(coverage); } catch { halted = undefined; }
-    return halted ? { served: true, coverage: halted } : { served: false, reason: "not-ready" };
+    let current: Covered | undefined;
+    try { current = this.inForce(coverage); } catch { current = undefined; }
+    return current ? { served: true, coverage: current } : { served: false, reason: "not-ready" };
   }
 
   serves(projectId: string): PermissionServed {
@@ -267,7 +268,8 @@ export class HostPermissionPipeline implements PermissionPipeline {
       const row = this.state.decision(decisionId);
       if (!row || this.halted(row.projectId)) return false;
       const current = this.coverage(row.projectId);
-      // A revoke, an owner regrouping, a new owner act, a changed direction text and an owner halt each change or end the authority.
+      // A revoke, an owner regrouping, a new owner act, a changed direction text, an owner halt and a change to the
+      // rules or tier profiles in force each change or end the authority.
       return current.served && current.coverage.authorityHash === row.authorityHash;
     } catch {
       return false;
@@ -513,7 +515,7 @@ function decisionIdFor(request: PermissionRequest, authorityHash: string): strin
   return `pd-${sha256(["permission-decision", request.requester.sessionId, request.id, request.evidenceHash, authorityHash]).slice(0, 32)}`;
 }
 
-/** The stored reuse key. It changes with the delegation's authority, so a new owner act or direction text stops replay. */
+/** The stored reuse key. It changes with the authority, so a new owner act, a direction text or a change to the rules in force stops replay. */
 function reuseKeyFor(requestKey: string, coverage: Covered): string {
   return sha256(["permission-reuse", coverage.projectId, coverage.authorityHash, requestKey]);
 }

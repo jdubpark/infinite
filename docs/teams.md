@@ -1326,7 +1326,7 @@ A calibration measures one thing: whether the judge, shown the two patches of a 
 
 #### Setup
 
-1. Set `teams.lineup.judge` to a profile. The key takes one profile of the same shape as any lineup profile. It is the last key of the lineup. A `limitFallback` on the judge is refused. A judge `id` that also appears elsewhere in the lineup must name the same provider, model, effort or variant, tier, and data use. There is no tier rule, because the calibration measures fitness.
+1. Set `teams.lineup.judge` to a profile. The key takes one profile of the same shape as any lineup profile. It is the last key of the lineup. A `limitFallback` on the judge is refused. A judge `id` that also appears elsewhere in the lineup must name the same provider, model, effort or variant, tier, data use, and limit fallback. So a judge cannot reuse the `id` of a profile that has a `limitFallback`. There is no tier rule, because the calibration measures fitness.
 2. Configure an eval login for the judge's provider: `eval.member.agents[provider]`. Without it a request is refused `judge-launch-missing`.
 3. Add the judge provider's API host to the `_eval` egress list, if it is not there. See [egress](../deploy/ubuntu/egress.md#6-eval-identities).
 4. Set up the eval member account and the grader as for [eval trials](#eval-trials). A calibration uses both.
@@ -1349,7 +1349,7 @@ The package never holds a profile ID or label, a provider, a model, a member, se
 
 **The label draw.** The draw is the low bit of the first byte of `sha256` of `CALIBRATION_ID:PAIR_INDEX`. Ordering 0 puts the resolved patch in A when the draw is 0. Ordering 1 swaps the labels. Both orderings of a pair share one draw.
 
-**The report.** The judge sends one report of kind `judgement`: the `duelId` from its context file, `preferred` (`A`, `B`, or `tie`), a `rubric` with one score object for each patch, and a `summary` of 1 to 2000 characters. A score object has `correctness`, `cleanliness`, `extensibility`, and `docs`, each a whole number from 1 to 5. The judge may instead send a `question` or a `blocked` report. It sends nothing else: it has no entry tools and cannot plan, edit, or ask for permissions. The host never infers a preference.
+**The report.** The judge sends one report of kind `judgement`: the `duelId` from its context file, `preferred` (`A`, `B`, or `tie`), a `rubric` with one score object for each patch, and a `summary` of 1 to 2000 characters. A score object has `correctness`, `cleanliness`, `extensibility`, and `docs`, each a whole number from 1 to 5. The judge may instead send a `question` or a `blocked` report. It sends nothing else: it has no entry tools and cannot plan or edit. The host never infers a preference.
 
 #### The calibration job
 
@@ -1412,9 +1412,9 @@ Every non-void ending decides its ordering. A judge that cannot answer is a judg
 | `judged` | The judge sent a valid judgement for this run within `judgeMinutes`, and the working copy was unchanged. |
 | `no-result` | The judge exited without a report. |
 | `question`, `blocked` | The judge sent that report. Nobody answers it. |
-| `permission` | A permission dialog that nobody decided. |
+| `permission` | A permission dialog that nobody decided. In a project the permission agent serves, the agent decides a judge's dialog under the owner's delegation, as it does for a trial member. Elsewhere nobody does, and the judgement ends here. |
 | `stalled` | The judge made no progress. |
-| `changed` | The judge changed its working copy. |
+| `changed` | The judge sent a judgement, and its working copy had changed. The host checks the working copy only when it accepts a judgement: a judge that edits and then exits or asks ends `no-result` or `question`. |
 | `mismatch` | The report's `duelId` is not this run's. |
 | `timeout` | The judge ran past `judgeMinutes`. |
 | `void-limit` | The provider reported a limit. The calibration waits `provider-limit` until the reset. |
@@ -1489,6 +1489,7 @@ in force · judge minutes 10 · known spend 182000 tokens, $24.10 · created CRE
 - A calibration has no blocked state and shows no wait reason. While a gate above holds the next judgement, the view shows a running calibration and nothing more.
 - A stop that leaves eval processes alive voids the judgement, and the start-up retries it.
 - The view's spend is a floor.
+- A host failure before any judge session starts (no mirror head, or a source build that ends on an environment cause) ends the attempt `void-host` and uses one of the ordering's three attempts. A trial in the same state uses none. An outage that the identity and grader probes do not see can so end a calibration `pairs-dropped` with no judge session run. Start a new calibration after the outage.
 
 ### Not in this slice
 

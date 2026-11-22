@@ -279,9 +279,16 @@ test("a pump with no calibration runs trials as before", async () => {
 
 test("a pump with a judge configured but no calibration runs trials the same way", async () => {
   const off = makeRig({ judgements: false }), on = makeRig();
+  // Each request for a judgement is a write transaction on the evidence store, so an idle host must make none.
+  let asked = 0;
+  const next = on.judgements.next.bind(on.judgements);
+  on.judgements.next = async gates => { asked += 1; return next(gates); };
   try {
     assert.deepEqual(await trialSequence(on), await trialSequence(off));
     assert.equal(on.store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM judge_judgements")?.n), 0, "no row is written");
+    // The trial job is done: an idle pump takes its turns with nothing open.
+    for (let step = 0; step < 3; step++) await on.pump.step();
+    assert.equal(asked, 0, "with no calibration running the pump never asks for a judgement");
   } finally {
     off.close();
     on.close();

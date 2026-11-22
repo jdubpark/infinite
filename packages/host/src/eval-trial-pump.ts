@@ -27,7 +27,7 @@ import { readOutcome } from "./outcome-store.js";
 import { outcomeId } from "./outcome-projector.js";
 import type { ProjectSourceService } from "./project-source.js";
 import { inventoryRuntimeProcesses, type RuntimeProcess } from "./team-retirement.js";
-import type { ReplayState } from "./team-replay.js";
+import { replayWorkspace, type ReplayState } from "./team-replay.js";
 import type { TeamService } from "./teams.js";
 import type { TeamModelProfile } from "./team-types.js";
 import { spawnTeamBundle } from "./team-workspace.js";
@@ -556,7 +556,8 @@ export class TrialPump {
         return await this.cleanAfterJudgement();
       }
       try {
-        await writeJudgePackage(source.workspace, files, this.options.identity.teamPrefix());
+        // The writer refuses a linked path, so it gets the path the judge run will use: below the trials root's real path.
+        await writeJudgePackage(replayWorkspace(`${ctx.root}/trials`, source.workspace), files, this.options.identity.teamPrefix());
       } catch {
         judgements.finish(id, { ending: "void-host", sessionId: null });
         return await this.cleanAfterJudgement();

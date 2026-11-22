@@ -10,6 +10,17 @@ import type { Config, SessionPurpose } from "./types.js";
 import type { TeamCommand, TeamMember, TeamModelProfile, TeamReport, TeamRun } from "./team-types.js";
 import { assertMemberReadOnly, assertSecureAncestors, TeamError } from "./team-workspace.js";
 
+/**
+ * A trial workspace below the trials root's real path, which is how the run-path check reads the root. The rest of the
+ * path stays as given, so a link inside it is still refused. Every writer into a trial workspace takes its path from here.
+ */
+export function replayWorkspace(root: string, path: string): string {
+  const rest = relative(root, resolve(path));
+  if (!rest || rest.startsWith("..") || isAbsolute(rest)) throw new TeamError(409, "invalid-workspace", "The trial workspace is outside the trials root.");
+  try { return join(realpathSync(root), rest); }
+  catch { throw new TeamError(409, "invalid-workspace", "The trials root cannot be read."); }
+}
+
 export type ReplayCreate = {
   trialId: string; jobId: string; purpose: "replay" | "gate"; projectId: string;
   profile: TeamModelProfile; capsule: Capsule; features: EvalFeatures;
@@ -141,13 +152,8 @@ export class TeamReplay {
     }
   }
 
-  /** The trial workspace below the trials root's real path, which is how the run-path check reads the root. The rest of the
-   *  path stays as given, so a link inside it is still refused. */
   private workspace(path: string): string {
-    const root = this.root(), rest = relative(root, resolve(path));
-    if (!rest || rest.startsWith("..") || isAbsolute(rest)) throw new TeamError(409, "invalid-workspace", "The trial workspace is outside the trials root.");
-    try { return join(realpathSync(root), rest); }
-    catch { throw new TeamError(409, "invalid-workspace", "The trials root cannot be read."); }
+    return replayWorkspace(this.root(), path);
   }
 
   /** run.created, plan.accepted, and one task.planned with the eval features. A judge run emits run.created only. */

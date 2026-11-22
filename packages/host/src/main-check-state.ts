@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { WITNESS_LIMIT, type ProcessWitness } from "./process-census.js";
 import { teamCommandSchema, type TeamCommand } from "./team-types.js";
+import type { Config, Project } from "./types.js";
 
 /*
  * The durable record of the main check (INF-388) and its rules as pure functions. Nothing here reads a file or a
@@ -146,6 +147,15 @@ export function mainCheckSetting(team: unknown): MainCheckSetting | undefined {
   if (value === undefined) return undefined;
   const parsed = settingSchema.safeParse(value);
   return parsed.success ? parsed.data : undefined;
+}
+
+/**
+ * R3 gate 1 without the setting: what a check needs from the project and the host. A project that lacks one of
+ * these is never checked, whatever its setting says: configured checks, a team root, and a GitHub source.
+ */
+export function mainCheckRunnable(config: Pick<Config, "teams">, project: Pick<Project, "id" | "team" | "source">): boolean {
+  return project.team !== undefined && project.team.checks.length > 0 && config.teams !== undefined &&
+    project.source?.mode === "github" && PROJECT_ID.test(project.id);
 }
 
 export const isCommit = (value: string) => COMMIT.test(value);

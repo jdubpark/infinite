@@ -58,7 +58,9 @@ test("assertHandoffPolicy accepts a policy taken before the main check was turne
 
 test("the owner's route answers the view, refuses other roles, and holds no directory, root or witness", async () => {
   const record = { ...emptyRecord(), running: { head: HEAD, checks: "digest", startedAt: "2026-11-21T10:00:00.000Z", directory: "PROJECT-2026-11-21-main-check-abcdef12", root: "/home/dev/workspaces", witness: { boot: "boot", processes: [] } as never, recording: true as const } };
-  const config = { projects: [{ id: "project", team: { checks: [command], mainCheck: {} } }] } as never;
+  const team = { checks: [command], mainCheck: {} };
+  const source = { mode: "github", repository: "example/project", baseBranch: "main" };
+  const config = { teams: { workspaceDir: "/home/dev/workspaces" }, projects: [{ id: "project", team, source }, { id: "local", team }, { id: "unset", team: { checks: [command] }, source }] } as never;
   const app = express();
   // Stands in for the server's requireRole(["owner"]) gate, which the route is mounted behind.
   app.get("/api/projects/:id/main-check", (req, res, next) => (String(req.headers["x-role"]) === "owner" ? next() : void res.status(403).json({ error: "forbidden" })), mainCheckRoute(config, projectId => projectId === "project" ? viewOf(record, true) : undefined));
@@ -69,39 +71,49 @@ test("the owner's route answers the view, refuses other roles, and holds no dire
     const body = await owner.text();
     assert.equal(owner.status, 200);
     assert.equal(JSON.parse(body).readable, true);
+    assert.equal(JSON.parse(body).runnable, true);
+    assert.equal(JSON.parse(body).running.head, HEAD);
     assert.doesNotMatch(body, /main-check-abcdef12|home\/dev|witness|"root"|directory/);
     const viewer = await fetch(`${origin}/api/projects/project/main-check`, { headers: { "x-role": "viewer" } });
     assert.equal(viewer.status, 403);
     const unknown = await fetch(`${origin}/api/projects/nope/main-check`, { headers: { "x-role": "owner" } });
     assert.equal(unknown.status, 404);
-    const empty = await fetch(`${origin}/api/projects/project/main-check`, { headers: { "x-role": "owner" } });
-    assert.equal(empty.status, 200, "a project with no record yet answers the empty view");
+    const local = await (await fetch(`${origin}/api/projects/local/main-check`, { headers: { "x-role": "owner" } })).json();
+    assert.deepEqual([local.readable, local.enabled, local.runnable, local.results, local.notice], [true, true, false, [], 0],
+      "a project that does not follow GitHub answers the empty view and says the host never checks it");
+    const unset = await (await fetch(`${origin}/api/projects/unset/main-check`, { headers: { "x-role": "owner" } })).json();
+    assert.deepEqual([unset.enabled, unset.runnable], [false, true], "a project with no record and no setting answers the empty view, switched off");
   } finally { server.close(); }
 });
 
 type Ticket = { status: "ok" | "error"; details?: { error?: string }; message?: string };
-function notifierFixture(notices: MainCheckNotice[] | (() => never), options: { events?: string[]; devices?: number; tickets?: (count: number) => Ticket[] | Promise<never> } = {}) {
-  const sent: { to: string; title: string; body: string; collapseId: string; data: { url: string } }[][] = [];
+type Sent = { to: string; title: string; body: string; collapseId: string; data: { url: string } };
+type FixtureOptions = { events?: string[]; devices?: number; tickets?: (messages: Sent[]) => Ticket[] | Promise<never>; fuse?: boolean };
+function notifierFixture(notices: MainCheckNotice[], options: FixtureOptions = {}) {
+  const sent: Sent[][] = [];
   const accepted: unknown[] = [];
-  const refused: unknown[] = [];
+  const announced: string[][] = [];
   let asked = 0;
   const devices = Array.from({ length: options.devices ?? 1 }, (_, index) => ({ deviceId: `d${index}`, token: `ExponentPushToken[${index}]`, platform: "ios" as const, addedAt: "t" }));
-  const sender = async (messages: typeof sent[number]) => {
+  const sender = async (messages: Sent[]) => {
     sent.push(messages);
-    if (options.tickets) return options.tickets(messages.length) as never;
+    if (options.tickets) return options.tickets(messages);
     return messages.map(() => ({ status: "ok" as const, id: "x" }));
   };
   const mainCheck = {
-    notices: () => { asked += 1; if (typeof notices === "function") return notices(); return notices; },
+    notices: () => { asked += 1; return notices; },
     accepted: (projectId: string, notice: number, outcome: string) => { accepted.push([projectId, notice, outcome]); },
-    refused: (projectId: string, notice: number) => { refused.push([projectId, notice]); },
   };
+  const trip = { tripId: "trip-1", scope: "host", label: "the whole host", cause: "limit", ownerClose: false, openedAt: "2026-11-21T10:00:00.000Z" };
+  const fuse = options.fuse ? { interrupts: () => [trip], markAnnounced: (ids: string[]) => { announced.push(ids); } } : undefined;
   const notifier = new Notifier({ list: async () => [] } as never, { list: () => devices } as never, sender as never,
-    { detail: "minimal", events: options.events ?? ["main-check"], intervalMs: 100000 }, undefined, undefined, undefined, undefined, undefined, mainCheck as never);
-  return { notifier, sent, accepted, refused, asked: () => asked };
+    { detail: "minimal", events: options.events ?? ["main-check", "autonomy-interrupt"], intervalMs: 100000 }, undefined, undefined, undefined, fuse as never, undefined, mainCheck as never);
+  return { notifier, sent, accepted, announced, asked: () => asked };
 }
 const failedNotice = (): MainCheckNotice => ({ projectId: "project", label: "Example", notice: 1, outcome: "failed", summary: summary({}) });
 const passedNotice = (): MainCheckNotice => ({ projectId: "project", label: "Example", notice: 2, outcome: "passed", summary: summary({ outcome: "passed", failed: undefined, expected: 3 }) });
+const refusal = (): Ticket => ({ status: "error", details: { error: "InvalidCredentials" } });
+const okFor = (wanted: (message: Sent) => boolean) => (messages: Sent[]): Ticket[] => messages.map(message => wanted(message) ? { status: "ok" } : refusal());
 
 test("a failed main check sends the host's text, one message per device, and is accepted on an ok ticket", async () => {
   const fixture = notifierFixture([failedNotice()], { devices: 2 });
@@ -113,7 +125,6 @@ test("a failed main check sends the host's text, one message per device, and is 
   assert.equal(messages[0].collapseId, "main-check:project");
   assert.equal(messages[0].data.url, "/teams");
   assert.deepEqual(fixture.accepted, [["project", 1, "failed"]]);
-  assert.deepEqual(fixture.refused, []);
 });
 
 test("a passed main check says all checks passed, with no text from command output", async () => {
@@ -121,31 +132,46 @@ test("a passed main check says all checks passed, with no text from command outp
   await fixture.notifier.tick();
   assert.equal(fixture.sent[0][0].title, "Main passes again");
   assert.equal(fixture.sent[0][0].body, "Example: all 3 checks passed at 54b05b8.");
+  assert.deepEqual(fixture.accepted, [["project", 2, "passed"]]);
 });
 
-test("a refused ticket, a throwing sender and a notice without a summary are refused, and the last one is never sent", async () => {
-  const refusedTicket = notifierFixture([failedNotice()], { tickets: count => Array.from({ length: count }, () => ({ status: "error" as const, details: { error: "InvalidCredentials" } })) });
+test("a notice that reached no device is not accepted, whether the push service refused it or the sender failed", async () => {
+  const refusedTicket = notifierFixture([failedNotice()], { devices: 2, tickets: okFor(() => false) });
   await refusedTicket.notifier.tick();
-  assert.deepEqual(refusedTicket.refused, [["project", 1]]);
+  assert.equal(refusedTicket.sent.length, 1);
   assert.deepEqual(refusedTicket.accepted, []);
 
   const throwing = notifierFixture([failedNotice()], { tickets: () => Promise.reject(new Error("unreachable")) });
   await throwing.notifier.tick();
-  assert.deepEqual(throwing.refused, [["project", 1]]);
+  assert.deepEqual(throwing.accepted, []);
 
-  const bare = notifierFixture([{ projectId: "project", label: "Example", notice: 3, outcome: "failed" }]);
-  await bare.notifier.tick();
-  assert.deepEqual(bare.refused, [["project", 3]]);
-  assert.equal(bare.sent.length, 0, "nothing is sent for a notice without a summary");
+  const oneOfTwo = notifierFixture([failedNotice()], { devices: 2, tickets: okFor(message => message.to === "ExponentPushToken[1]") });
+  await oneOfTwo.notifier.tick();
+  assert.deepEqual(oneOfTwo.accepted, [["project", 1, "failed"]], "one device that got the message is enough");
 });
 
-test("no device or the event switched off means notices are never asked for", async () => {
-  const noDevice = notifierFixture([failedNotice()], { devices: 0 });
-  await noDevice.notifier.tick();
-  assert.equal(noDevice.asked(), 0);
+test("a main-check ticket and a fuse ticket are never taken for each other", async () => {
+  const onlyMain = notifierFixture([failedNotice()], { devices: 2, fuse: true, tickets: okFor(message => message.collapseId === "main-check:project") });
+  await onlyMain.notifier.tick();
+  assert.deepEqual(onlyMain.sent[0].map(message => message.collapseId), ["main-check:project", "main-check:project", "interrupt:fuse:host", "interrupt:fuse:host"]);
+  assert.deepEqual(onlyMain.accepted, [["project", 1, "failed"]]);
+  assert.deepEqual(onlyMain.announced, []);
 
+  const onlyFuse = notifierFixture([failedNotice()], { devices: 2, fuse: true, tickets: okFor(message => message.collapseId === "interrupt:fuse:host") });
+  await onlyFuse.notifier.tick();
+  assert.deepEqual(onlyFuse.accepted, []);
+  assert.deepEqual(onlyFuse.announced, [["trip-1"]]);
+});
+
+test("with the event switched off no notice is taken; with no device a taken notice is neither sent nor accepted", async () => {
   const off = notifierFixture([failedNotice()], { events: ["needs-you"] });
   await off.notifier.tick();
   assert.equal(off.asked(), 0);
   assert.equal(off.sent.length, 0);
+
+  const noDevice = notifierFixture([failedNotice()], { devices: 0 });
+  await noDevice.notifier.tick();
+  assert.equal(noDevice.asked(), 1);
+  assert.equal(noDevice.sent.length, 0);
+  assert.deepEqual(noDevice.accepted, []);
 });

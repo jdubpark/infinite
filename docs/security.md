@@ -486,7 +486,7 @@ With `team.mainCheck` set, the host runs the project's configured setup and chec
 
 Command output is untrusted. It can contain any text a failing test prints. The host keeps at most eight short entries for the owner's read of the main-check record. It never sends output in a push, never puts it in a prompt, and never records it as a project signal. The push text is made from the result's facts only: the position of the failing command, its exit code, and the first characters of the head.
 
-The main check starts no agent, changes no branch and kills no process. A check still running when the host stops is ended as interrupted, and a directory it left behind is removed only after a process census confirms that nothing of the run is still alive. The setting is off by default. See the Main check section of [teams.md](teams.md) for the limits.
+The main check starts no agent and changes no branch. It ends the commands it started when a halt engages, when a command reaches its time limit, and when the host stops. It never kills a process that a check left behind: a directory is removed only after a process census confirms that nothing of the run is still alive. No check starts on a host where a provider profile runs through sudo and no command prefix is configured, the configuration in which team creation is refused too. A main-check record the host cannot read is never overwritten, and it stops every main check on the host until it can be read. The owner's read of the record is the only route to it, and it answers no directory, root or process witness. The setting is off by default. See the Main check section of [teams.md](teams.md) for the limits.
 
 ## Request intake
 

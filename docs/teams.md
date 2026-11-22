@@ -3361,13 +3361,27 @@ Engage and release are idempotent by request ID. Engaging a scope that is alread
 
 The main check tells the owner when a project's main branch starts failing and when it passes again. It is off by default. A project turns it on with `team.mainCheck` in its settings, for example `{ "mainCheck": { "minutes": 30 } }`. The `minutes` key is optional and limits each command to 1 to 240 minutes; without it, the host uses `teams.checkMinutes` and then 60 minutes. The setting has no default, so an unset key leaves every routine approval digest and handoff unchanged. A project that lets the team establish its own checks has no configured checks to run, so the setting is refused together with `establishChecks`.
 
-When the setting is present and the project follows GitHub, the host runs the project's configured `setup` and `checks` at the newest head its mirror has received for the base branch. The run takes place in a disposable copy of that head, created the way a team run creates its workspace, and every command runs as the agent account, through the team's command prefix, as a team's checks are. The copy is read-only after each command. A copy that changes is recorded as an error, never as a result for main.
+The setting acts only on a project that follows GitHub and has configured checks, on a host with a team workspace. For any other project the host never runs a main check, and the owner's read of the record says `runnable: false`. When the setting acts, the host runs the project's configured `setup` and `checks` at the newest head its mirror has received for the base branch. The run takes place in a disposable copy of that head, created the way a team run creates its workspace, and every command runs as the agent account, through the team's command prefix, as a team's checks are. The host checks the copy after each command. A copy that a command changed is recorded as an error, never as a result for main.
+
+One main check runs at a time on the whole host. The host looks for work when the mirror reports a head and every 30 seconds. It checks only the newest head: a head that main has already left is never started. Before a check starts, the host asks the gates below in this order, and the owner's read shows the first one that holds as `waiting`:
+
+- `execution-identity`: a provider profile runs through sudo and the host has no `teams.commandPrefix`. Team creation is refused in the same configuration.
+- `census-unavailable`: the host cannot list the processes of a run under this command prefix.
+- `halt`: a halt covers the project or the host.
+- `host-load`: the host holds new launches while it is under load.
+- `storage`: the team volume is below its storage floor.
+- `another-check`: a main check of another project runs, or its copy is not removed yet.
+- `processes`: a process of an earlier check of this project may still be alive, so its copy stays.
+- `cleanup`: the removal of an earlier copy failed. The host tries again on the next pass.
+- `attempts`: this head was started three times with the same checks and never reached a result. A check that a halt or an orderly host stop interrupted is not counted.
 
 The host records each final result: the head, a digest of the checks it was measured with, the observation time, whether it passed or failed, and for a failure the position of the failing command and its exit code. The record also keeps the output of the failing command, at most eight short entries. That output is untrusted and is shown only in the owner's read of the record (`GET /api/projects/PROJECT_ID/main-check`). It never enters a prompt or a push. A non-owner device is refused. The route answers without directories, roots or process witnesses.
 
-The host sends one push per device when the health of main changes. It sends the first failure, and the first pass after a failure the owner was told about. The push is collapsed per project and opens `/teams`. Its text is made by the host from the result's facts alone: for a failure, the failing command's position and exit code and the first seven characters of the head; for a pass, the number of checks and the head. The push follows the `main-check` event, which is in the default push events. A result with no notice due sends nothing. A failure that was never announced and is then fixed sends nothing further.
+The host sends one push per device when the health of main changes. It sends the first failure, and the first pass after a failure the owner was told about. The push is collapsed per project and opens `/teams`. Its text is made by the host from the result's facts alone: for a failure, the failing command's position and exit code and the first seven characters of the head; for a pass, the number of checks and the head. The push follows the `main-check` event, which is in the default push events. A result with no notice due sends nothing. A failure that was never announced and is then fixed sends nothing further. The owner counts as told once the push service took the message for one device. A push that reached no device is sent again after a minute. A host stop between a send and its record repeats the push.
 
-The main check never starts an agent, never writes a project signal, never changes a session, a routine or a team, and never stops or kills a process. It also does not merge, deploy or change a branch.
+The main check never starts an agent, never writes a project signal, and never changes a session, a routine or a team. It does not merge, deploy or change a branch. It ends the commands it started when a halt engages, when a command reaches its time limit, and when the host stops; a check that ends this way has no result. It never kills a process that a check left behind. It removes the copy only after a process census finds nothing of the run alive, and until then the project waits on `processes`.
+
+If the host cannot read a project's main-check record, the owner's read answers `readable: false`. The record may name a copy that is not removed yet, so the host never overwrites it and starts no main check on the whole host until it can be read; it tries again on every pass. The record is `main-check/PROJECT_ID.sealed` in the host state directory. When it cannot be restored, removing that file clears the state at the next pass, and a copy the record named stays under the team workspace until someone removes it.
 
 Limits of this first slice, stated in full:
 
@@ -3380,7 +3394,7 @@ Limits of this first slice, stated in full:
 - Preparing the copy has no time limit of its own. It ends by the Git helpers' own limits, a halt, or a host stop.
 - Two different heads observed with the same stamp are ordered by their results' order in the record. Fetches of one mirror are serial, so their stamps differ in practice.
 
-Before turning the setting on, run the project's checks by hand at main's head, and confirm that the team's command prefix runs them as the agent account on this host. Then audit the launcher: a deployed launcher must recognise the main-check run directories and the `infinite/team-main-check-*` branch names that the copy uses, as it recognises a team run's.
+Before turning the setting on, run the project's checks by hand at main's head, and confirm that the team's command prefix runs them as the agent account on this host. A host whose configuration sets `push.events` itself must add `main-check` to that list, or the result is recorded and no push is sent. Then audit the launcher: a deployed launcher must recognise the main-check run directories and the `infinite/team-main-check-*` branch names that the copy uses, as it recognises a team run's.
 
 ## Configuration
 

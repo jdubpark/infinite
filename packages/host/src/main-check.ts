@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { defaultMainCheckPorts, type MainCheckHalt, type MainCheckHostLoad, type MainCheckPorts, type MainCheckTimer } from "./main-check-ports.js";
-import { accept, admit, candidate, checksDigest, emptyRecord, entryOf, finish, hostStart, isCommit, MAX_FAILURES, mainCheckRecordSchema, mainCheckSetting, noticeDue, observe, PROJECT_ID, retire, setWaiting, settle, viewOf, withWitness, type CheckSummary, type MainCheckCommand, type MainCheckReason, type MainCheckRecord, type MainCheckResult, type MainCheckView, type MainCheckWaiting, type Retiring } from "./main-check-state.js";
+import { accept, admit, candidate, checksDigest, emptyRecord, entryOf, finish, hostStart, isCommit, MAX_FAILURES, mainCheckRecordSchema, mainCheckRunnable, mainCheckSetting, noticeDue, observe, PROJECT_ID, retire, setWaiting, settle, viewOf, withWitness, type CheckSummary, type MainCheckCommand, type MainCheckReason, type MainCheckRecord, type MainCheckResult, type MainCheckView, type MainCheckWaiting, type Retiring } from "./main-check-state.js";
 import { extendWitness, recordCommand, type CensusResult, type ProcessWitness } from "./process-census.js";
 import type { MirrorFetch } from "./project-source.js";
 import { storageShortfall } from "./storage.js";
@@ -15,8 +15,10 @@ export type { MainCheckPorts } from "./main-check-ports.js";
 /*
  * Main check (INF-388, slice 1 of INF-346): the host runs a project's configured setup and checks at the newest head
  * its mirror received for the base branch, in a disposable copy, as the agent account, and offers one notice when
- * main's health changes. It starts no agent, records no project signal and kills no process. The rules are pure
- * functions in main-check-state.ts; this service applies them, and every side effect goes through `ports`.
+ * main's health changes. It starts no agent and records no project signal. It ends the commands it started when a
+ * halt engages, a command reaches its time limit or the host stops; it never kills a process a check left behind,
+ * and waits for a clean census before it removes the copy. The rules are pure functions in main-check-state.ts;
+ * this service applies them, and every side effect goes through `ports`.
  * Every record change is one synchronous write of the whole record, and memory follows only a write that landed.
  */
 
@@ -204,8 +206,7 @@ export class MainCheckService {
 
   /** R3 gate 1, with what a run needs: the setting, configured checks, a team root and a GitHub source. */
   private enabled(project: Project | undefined): project is Project & { team: TeamProject } {
-    return project?.team !== undefined && mainCheckSetting(project.team) !== undefined && project.team.checks.length > 0 &&
-      this.config.teams !== undefined && project.source?.mode === "github" && PROJECT_ID.test(project.id);
+    return project?.team !== undefined && mainCheckSetting(project.team) !== undefined && mainCheckRunnable(this.config, project);
   }
 
   private loadAll() {

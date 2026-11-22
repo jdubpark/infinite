@@ -57,9 +57,10 @@ export type ChannelRequest =
   | { v: 1; op: "delivery"; sessionId: string; token: string; decisionId: string; deliveryKey: string; kind: PermissionDelivery["kind"]; detail?: string }
   /**
    * Asked before the owner's allow of a deferred call is returned to the resumed call. `sessionRoot` is the root the
-   * deferral was decided under; `decisionId` and `deliveryKey` are set when the deferral was issued a decision.
+   * deferral was decided under; `decisionId` and `deliveryKey` are set when the deferral was issued a decision. `call`
+   * is the resumed call, which the host reads again; a worker of an earlier release sends none.
    */
-  | { v: 1; op: "resume"; sessionId: string; token: string; sessionRoot: string; decisionId?: string; deliveryKey?: string };
+  | { v: 1; op: "resume"; sessionId: string; token: string; sessionRoot: string; decisionId?: string; deliveryKey?: string; call?: ChannelCall };
 
 /** A decision the channel returned, with the key that lets this session's worker record its delivery. */
 export type IssuedDecision = { decisionId: string; deliveryKey: string };
@@ -133,6 +134,11 @@ export function headlessAssignment(session: Pick<Session, "id" | "team">): strin
 export function headlessTask(session: Pick<Session, "team" | "title" | "initialPrompt">, teamTask: ((session: Pick<Session, "team">) => { title: string; text: string } | undefined) | undefined): { title: string; text: string } | undefined {
   if (!session.team) return { title: bounded(session.title, 200), text: bounded(session.initialPrompt, 4000) };
   try { return teamTask?.(session); } catch { return undefined; }
+}
+
+/** The request id of a call's class check. The resume check builds the same id for the same call. */
+function classRequestId(sessionId: string, call: ChannelCall): string {
+  return `headless:${sessionId}:${call.toolUseId ?? createHash("sha256").update(JSON.stringify(call)).digest("hex")}`;
 }
 
 /** Builds the request from the host's records of the session. Only the tool call itself comes from the hook. */
@@ -237,7 +243,8 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
    * Whether the owner's allow of a deferred call may still be returned to the resumed call: the session keeps the
    * root the deferral was decided under, no owner halt covers its project, and the decision the deferral was issued
    * still applies. A deferral issued no decision gets no allow. The owner's answer may be days old, so it is read
-   * now, at the moment the call would run.
+   * now, at the moment the call would run: the resumed call is read again with the task as it is now, and a reading
+   * that no longer gives the deferral's decision withholds the allow.
    */
   private resumable(session: Session, request: Extract<ChannelRequest, { op: "resume" }>): ChannelReply {
     if (typeof request.sessionRoot !== "string" || request.sessionRoot.length < 1 || request.sessionRoot.length > 4096) throw new Error("invalid");
@@ -257,8 +264,16 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     // The allow is bound to the decision its deferral was issued, whose authority holds every recorded halt. A deferral
     // without one is bound to no authority, so no allow is returned for it.
     if (!issued) return { result: "withheld", reason: "stale" };
+    const raw = (request as { call?: unknown }).call;
+    const call = raw === undefined ? undefined : validCall(raw);
+    if (raw !== undefined && !call) throw new Error("invalid");
     let applies: boolean;
-    try { applies = pipeline.applicable(request.decisionId!) === true; } catch { applies = false; }
+    try {
+      // The class check gave the deferred call this request id, so an unchanged reading gives the deferral's decision id.
+      const task = call && headlessTask(session, this.options.teamTask);
+      const again = call && task && headlessRequest(session, call, classRequestId(session.id, call), task);
+      applies = (call === undefined || again !== undefined) && pipeline.applicable(request.decisionId!, again) === true;
+    } catch { applies = false; }
     if (!applies) return { result: "withheld", reason: "stale" };
     return { result: "ok" };
   }
@@ -342,7 +357,7 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     const task = headlessTask(session, this.options.teamTask);
     if (!task) return { result: "not-served" };
     if (request.op === "class") {
-      const built = headlessRequest(session, call, `headless:${session.id}:${call.toolUseId ?? createHash("sha256").update(JSON.stringify(call)).digest("hex")}`, task);
+      const built = headlessRequest(session, call, classRequestId(session.id, call), task);
       const match = pipeline.classOf(built);
       if (!match) return { result: "none" };
       // The decision is recorded through the pipeline; its class rules run first, so no model turn starts.
@@ -375,10 +390,13 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
       pipeline.recordDelivery(outcome.decisionId, "refusal", "Headless: a call that the rules left open cannot wait for the owner; it was denied with needs-owner.");
       return { result: "deny", code: "needs-owner", notice: requesterNotice("needs-owner"), ...issued, interruptClass: outcome.interruptClass };
     }
-    // The live checks before a verdict is returned, an allow or a reject. A team member's run is read again here.
+    // The live checks before a verdict is returned, an allow or a reject. A team member's run and the task are read
+    // again here: the verdict was reached for the task the request was built with.
     const live = (() => {
       try {
-        return realpathSync(this.options.sessions.meta(session.id).session.cwd) === built.requester.sessionRoot &&
+        const now = this.options.sessions.meta(session.id).session;
+        const again = headlessTask(now, this.options.teamTask);
+        return realpathSync(now.cwd) === built.requester.sessionRoot && again?.title === task.title && again.text === task.text &&
           this.teamServed(session) && pipeline.applicable(outcome.decisionId, built);
       } catch { return false; }
     })();

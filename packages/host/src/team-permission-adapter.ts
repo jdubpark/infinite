@@ -104,6 +104,8 @@ export type TeamTargetDeps = {
   sessionRoot(): string;
   /** The delivery role's pinned policy and host checks. Throws when they no longer hold. */
   roleCheck?(): Promise<void>;
+  /** The member's task as the run holds it now. A task that differs from the request's keeps the dialog with the owner. */
+  task?(): { title: string; text: string } | undefined;
   /** Collects the member's current workspace evidence with today's bounded collection. */
   workspace(): Promise<TeamWorkspaceEvidence>;
   /**
@@ -154,6 +156,13 @@ export function teamPermissionTarget(request: PermissionRequest, deps: TeamTarge
       try { root = deps.sessionRoot(); }
       catch { return fail(true, "The member's workspace could not be verified."); }
       if (root !== request.requester.sessionRoot) return fail(true, "The member's working directory changed.");
+      if (deps.task) {
+        // The verdict was reached for the task the request was handed with.
+        let task: { title: string; text: string } | undefined;
+        try { task = deps.task(); } catch { task = undefined; }
+        if (!task || task.title !== request.requester.task.title || task.text !== request.requester.task.text)
+          return fail(false, "The member's task changed after the request was read.");
+      }
       if (deps.roleCheck) {
         try { await deps.roleCheck(); }
         catch { return fail(false, "The delivery policy, reviewed head, or required checks are no longer current."); }

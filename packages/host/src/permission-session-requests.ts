@@ -443,6 +443,12 @@ export class SessionPermissionRequests {
     if (sessionRootOf(session, this.project(session.projectId)) !== sessionRoot || canonical(session.cwd) !== cwd)
       return { ok: false, stale: false, reason: "The session root changed." };
     if (personHolds(state.control ?? null)) return { ok: false, stale: false, reason: "A person holds input control of the session." };
+    // The task the review read is read again. A prompt the owner submitted meanwhile makes it another task, and the
+    // verdict was reached for the earlier one: the dialog stays with the owner.
+    let task: { title: string; text: string } | undefined;
+    try { task = this.task(session); } catch { task = undefined; }
+    if (!task || task.title !== request.requester.task.title || task.text !== request.requester.task.text)
+      return { ok: false, stale: false, reason: "The session's task changed after the request was read." };
     const { accept, reject } = permissionChoices(prompt);
     return { ok: true, ...(accept !== undefined ? { accept } : {}), ...(reject !== undefined ? { reject } : {}) };
   }

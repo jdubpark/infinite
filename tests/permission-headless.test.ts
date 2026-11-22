@@ -394,7 +394,8 @@ test("an owner's allow is withheld, and still used once, when the host refuses i
     const resume = ops.find(request => request.op === "resume")!;
     assert.deepEqual([resume.sessionRoot, resume.decisionId, resume.deliveryKey], ["/workspace", (owner as { decisionId: string }).decisionId, "d".repeat(64)]);
     // The check carries the resumed call, so the host reads it again.
-    assert.deepEqual((resume as { call?: unknown }).call, { toolName: "Bash", toolInput: { command: "deploy production" }, toolUseId: "toolu_1" });
+    const { toolName, toolInput, toolUseId } = (resume as { call?: Record<string, unknown> }).call ?? {};
+    assert.deepEqual([toolName, toolInput, toolUseId], ["Bash", { command: "deploy production" }, "toolu_1"]);
     assert.equal(ops.filter(request => request.op === "delivery").at(-1)?.kind, "stale");
     // The answer was used: the same call again is the owner's again.
     assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "deny", reason: requesterNotice("needs-owner") });

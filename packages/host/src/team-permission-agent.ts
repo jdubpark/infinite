@@ -34,7 +34,7 @@ const underReview = (run: TeamRun, sessionId: string, promptId?: number) => prom
   (run.permissionDecisions ?? []).some(decision => decision.targetSessionId === sessionId && decision.promptId === promptId &&
     ["pending", "reviewing", "approved", "answering"].includes(decision.status)) || promptId !== undefined &&
   (run.permissionRecovery?.requests ?? []).some(request => request.targetSessionId === sessionId && request.promptId === promptId && livePermissionRecoveryStatuses.has(request.status));
-/** A permission dialog that only a hook has reported: the screen read has not given it a hash yet, so nobody can decide it. */
+/** A permission dialog that a hook or another provider signal reported and the screen read has not reached: it has no hash yet, so nobody can decide it. */
 const unreadPermissionPrompt = (prompt: Prompt) => !accountSettingPrompt(prompt) && !prompt.hash && prompt.kind === "permission";
 /** A member dialog that the permission agent decides: a hashed permission dialog, or a collapsed command dialog. */
 const agentPermissionPrompt = (prompt: Prompt) => !accountSettingPrompt(prompt) && Boolean(prompt.hash) && (prompt.kind === "permission" || isCollapsedPermissionPrompt(prompt));
@@ -171,9 +171,11 @@ export class TeamPermissionAgent {
     for (const [key, entry] of this.agentHandOffs) if (key.startsWith(prefix) && holdingHandOff(entry, now)) return true;
     // A dialog that waits for its evidence to settle is the permission agent's too.
     for (const [key, at] of this.agentFirstSeen) if (key.startsWith(prefix) && now - at < AGENT_EVIDENCE_SETTLE_MS) return true;
-    // So is a dialog the screen read has not reached, for the same time from its first sight.
+    // So is a dialog the screen read has not reached, for the same time from its first sight. A clock that stepped back ends the wait.
     const observed = this.agentObserved.get(sessionId);
-    return observed?.promptId === promptId && observed.unreadAt !== undefined && now - observed.unreadAt < AGENT_EVIDENCE_SETTLE_MS;
+    if (observed?.promptId !== promptId || observed.unreadAt === undefined) return false;
+    const age = now - observed.unreadAt;
+    return age >= 0 && age < AGENT_EVIDENCE_SETTLE_MS;
   }
   agentBusy(runId: string) {
     const now = Date.now();
@@ -282,7 +284,7 @@ export class TeamPermissionAgent {
       member.status === "running" && member.role !== "permission-coordinator" && member.revision === run.revision &&
       !stored.halt && !["paused", "cancelled", "blocked"].includes(run.status) && !coordinatorReviewLive(run);
     const eligible = served && agentPermissionPrompt(prompt!);
-    // A hook can report a dialog before the screen read. The first sight starts its wait once; a later step does not start it again.
+    // A provider signal can report a dialog before the screen read. The first sight starts its wait once; a later step does not start it again.
     const seen = this.agentObserved.get(member.sessionId);
     const unreadAt = served && unreadPermissionPrompt(prompt!) ? (seen?.promptId === prompt!.id ? seen.unreadAt : undefined) ?? Date.now() : undefined;
     this.agentObserved.set(member.sessionId, { ...(open ? { promptId: prompt!.id } : {}), eligible, ...(unreadAt !== undefined ? { unreadAt } : {}) });

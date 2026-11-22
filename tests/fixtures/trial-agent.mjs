@@ -7,7 +7,7 @@
 //   { "mode": "silent" }                 exits without a report
 //   { "mode": "stall" }                  prints nothing and waits
 //   { "mode": "permission" }             draws a dialog that the pipeline leaves to a person
-//   { "mode": "permission-late" }        reports the same request by hook, and draws its dialog 300 ms later
+//   { "mode": "permission-late" }        reports the same request by hook, and draws its dialog 600 ms later
 //   { "mode": "permission-unread" }      reports the same request by hook, and never draws a dialog
 //   { "mode": "limit" }                  prints a usage-limit notice and reports the limit to the host
 import { cpSync, existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -69,7 +69,8 @@ if (mode === "reference") {
   forever();
 } else if (mode === "permission-late") {
   await hook(request);
-  await sleep(300);
+  // Longer than the scheduler's 500 ms tick: a step always reads the dialog before the screen shows it.
+  await sleep(600);
   console.log(dialog);
   forever();
 } else if (mode === "permission-unread") {

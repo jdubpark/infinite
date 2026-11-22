@@ -204,6 +204,19 @@ test("30 pairs across two projects pool", () => {
   } finally { f.close(); }
 });
 
+test("the pairs of one project are handed out together", async () => {
+  const f = ready();
+  try {
+    seedPairs(f, "P", 18);
+    seedPairs(f, "Q", 12);
+    created(f);
+    const starts = await drive(f, start => judged(start, true));
+    assert.equal(starts.length, 60);
+    const runs = starts.map(start => start.projectId).filter((project, at, all) => at === 0 || all[at - 1] !== project);
+    assert.deepEqual(runs, ["P", "Q"]);
+  } finally { f.close(); }
+});
+
 test("a named project limits the pool", () => {
   const f = ready();
   try {

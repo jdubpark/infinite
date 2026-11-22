@@ -60,11 +60,24 @@ const refuse = (status: CalibrationRefusal["status"], code: CalibrationRefusal["
 const IDLE: NextJudgement = { kind: "idle" };
 const isVoid = (ending: JudgeEnding | null) => ending !== null && JUDGE_VOID_ENDINGS.includes(ending);
 
-/** A stable UUID for one slot, so a retried `begin` or `finish` names the same judgement. The judge report echoes it as `duelId`. */
-export function judgementIdOf(calibrationId: string, pairIndex: number, ordering: 0 | 1, attempt: number): string {
-  const h = createHash("sha256").update(`${calibrationId}:${pairIndex}:${ordering}:${attempt}`).digest("hex");
+/** A UUID built from a seed, shaped as version 4, so the launchers' ID checks accept it. */
+function stableUuid(seed: string): string {
+  const h = createHash("sha256").update(seed).digest("hex");
   const variant = "89ab"[Number.parseInt(h.charAt(16), 16) & 3] as string;
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
+/** A stable UUID for one slot, so a retried `begin` or `finish` names the same judgement. The judge report echoes it as `duelId`. */
+export function judgementIdOf(calibrationId: string, pairIndex: number, ordering: 0 | 1, attempt: number): string {
+  return stableUuid(`${calibrationId}:${pairIndex}:${ordering}:${attempt}`);
+}
+
+/**
+ * The grader's job for one project of a calibration. The grader keeps one base bundle per job, and a bundle holds one
+ * project's repository, so two projects never share a job.
+ */
+export function graderJobOf(calibrationId: string, projectId: string): string {
+  return stableUuid(`${calibrationId}:grader:${projectId}`);
 }
 
 /**
@@ -252,7 +265,8 @@ export class JudgeCalibrations {
 
   /**
    * Round-robin over the projects in ID order, a page of up to CALIBRATION_PAGE at a time. A pair is skipped when either
-   * trial's recorded profile has the judge's provider and model.
+   * trial's recorded profile has the judge's provider and model. The kept pairs are then ordered by project: the grader
+   * holds one project's bundle at a time, so the pairs of one project run together and its bundle is streamed once.
    */
   private select(judge: TeamModelProfile, projects: readonly string[], want: number): { list: CalibrationPairRef[]; perProject: { projectId: string; pairs: number }[] } {
     type Cursor = { projectId: string; queue: CalibrationPairRef[]; after: string | null | undefined; taken: number };
@@ -271,6 +285,7 @@ export class JudgeCalibrations {
       }
       if (!moved) break;
     }
+    list.sort((a, b) => a.projectId < b.projectId ? -1 : a.projectId > b.projectId ? 1 : 0);
     return { list, perProject: cursors.filter(cursor => cursor.taken > 0).map(cursor => ({ projectId: cursor.projectId, pairs: cursor.taken })) };
   }
 

@@ -431,6 +431,27 @@ test("sweep expires a running calibration past its expiry", async () => {
   } finally { f.close(); }
 });
 
+test("the sweep deletes a calibration and its judgements after 365 days", async () => {
+  const f = ready();
+  try {
+    seedPairs(f, "P", 30);
+    const id = created(f);
+    const next = await f.jobs.next(gates());
+    assert.equal(next.kind, "start");
+    if (next.kind === "start") f.jobs.begin(next);
+    f.jobs.cancel(id);
+    const rows = () => f.store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM judge_judgements")!.n);
+    f.clock.at = new Date(Date.parse(T0) + 364 * DAY_MS).toISOString();
+    f.jobs.sweep();
+    assert.equal(f.jobs.views().length, 1, "a calibration younger than 365 days stays");
+    assert.equal(rows(), 1);
+    f.clock.at = new Date(Date.parse(T0) + 366 * DAY_MS).toISOString();
+    f.jobs.sweep();
+    assert.equal(f.jobs.views().length, 0, "the calibration is deleted");
+    assert.equal(rows(), 0, "and its judgements");
+  } finally { f.close(); }
+});
+
 test("the worst case spends exactly the request", async () => {
   const f = ready();
   try {

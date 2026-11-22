@@ -16,7 +16,7 @@ import {
 import { labelDraw } from "./judge-package.js";
 import {
   activeCalibration, calibrationJudgements, calibrationViews, dropJudgement, finishCalibration, finishJudgement, insertCalibration,
-  insertJudgement, liveJudgements, readCalibration, startJudgement, type CalibrationEnd, type CalibrationPairRef, type CalibrationRow,
+  insertJudgement, liveJudgements, readCalibration, startJudgement, sweepJudge, type CalibrationEnd, type CalibrationPairRef, type CalibrationRow,
   type CalibrationView, type JudgementRow,
 } from "./judge-store.js";
 import { JUDGE_VOID_ENDINGS, type Judgement, type JudgeEnding } from "./judge-types.js";
@@ -231,12 +231,13 @@ export class JudgeCalibrations {
     return row === undefined ? [] : [row.calibrationId];
   }
 
-  /** Expires the running calibration when its expiry has passed. */
+  /** Expires the running calibration when its expiry has passed, and deletes the rows past their keep time. */
   sweep(): void {
     const at = this.now();
     this.store.write(tx => {
       const row = activeCalibration(tx);
       if (row !== undefined && Date.parse(row.expiresAt) <= Date.parse(at)) finishCalibration(tx, row.calibrationId, this.endOf(tx, row, "expired", "expired"), at);
+      sweepJudge(tx, at);
     });
   }
 

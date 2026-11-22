@@ -2846,7 +2846,9 @@ Each request passes these steps in order:
    the reading changed while the review ran. The task is read again there
    too. A prompt that the owner submitted to a session after the request was
    read keeps the dialog with the owner, and so does a session record that
-   cannot be read to its end. A team member's answer is withheld when the run
+   cannot be read to its end before the delivery. When the record was too
+   long to read whole as the request was built, the task text says that later
+   prompts may be missing, and that alone withholds nothing. A team member's answer is withheld when the run
    objective or the task instructions differ from the ones the request was
    handed with; the dialog is then handed again and decided for the new task.
    A run that the host renamed is the same task. A pending dialog is not handed to the

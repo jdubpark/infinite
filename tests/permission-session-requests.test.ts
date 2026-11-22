@@ -353,6 +353,33 @@ test("a long session record with no new owner prompt never withholds a delivery"
   } finally { h.close(); }
 });
 
+test("a prompt that the bounded read of the task did not reach is named as possibly missing and does not withhold", async () => {
+  const h = harness({ delivery: new FakeDelivery(() => new Promise(() => {})) });
+  try {
+    // The owner's prompt sits past the part of a long record that one read of the task covers.
+    const events: Event[] = Array.from({ length: 7_000 }, (_, i) => i === 4_999
+      ? { seq: i + 1, at: "t", type: "input-result", data: { requestId: "i1", state: "delivered", message: "A prompt far into the record" } }
+      : { seq: i + 1, at: "t", type: "output", data: { text: "x" } });
+    const live = h.add("s", "covered", {}, permissionPrompt(1), events);
+    live.state.seq = 7_000;
+    const target = (await h.service.target("s"))!;
+    const { text } = target.request.requester.task;
+    assert.doesNotMatch(text, /far into the record/);
+    assert.match(text, /could not be read to its end; later owner prompts may be missing/);
+    for (let read = 0; read < 3; read++) assert.equal((await target.check()).ok, true);
+  } finally { h.close(); }
+});
+
+test("a session state without a record position withholds a delivery", async () => {
+  const h = harness({ delivery: new FakeDelivery(() => new Promise(() => {})) });
+  try {
+    const live = h.add("s", "covered");
+    delete (live.state as { seq?: number }).seq;
+    const target = (await h.service.target("s"))!;
+    assert.deepEqual(await target.check(), { ok: false, stale: false, reason: "The session record could not be read to its end." });
+  } finally { h.close(); }
+});
+
 test("a session record that cannot be read to its end withholds a delivery", async () => {
   const h = harness({ delivery: new FakeDelivery(() => new Promise(() => {})) });
   try {

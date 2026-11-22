@@ -341,7 +341,8 @@ export class SessionPermissionRequests {
     });
     const answers = new Map<string, Promise<"delivered" | "refused" | "uncertain">>();
     // Where the session's record stood when the task was read: the end of a complete read, or the state's position
-    // when the read stopped early. A prompt the owner submits after it makes the task another task.
+    // when the read stopped early. A prompt the owner submits after it makes the task another task. A prompt that an
+    // early stop did not reach is not looked for again: the task text says that later prompts may be missing.
     let read = Math.max(state.seq, this.scans.get(sessionId)?.cursor ?? 0);
     // What the review read is read again before delivery and must be unchanged.
     let collected: { paths: string[]; digest: string } | undefined;
@@ -519,6 +520,8 @@ export class SessionPermissionRequests {
    */
   private promptAfter(sessionId: string, after: number): number | "prompt" | "unread" {
     const types = new Set(["input-result"]);
+    // A position that is no position reads nothing, so it must not pass for a record with no later prompt.
+    if (!Number.isSafeInteger(after) || after < 0) return "unread";
     let cursor = after;
     try {
       for (let page = 0; page < TASK_SCAN_PAGES; page++) {

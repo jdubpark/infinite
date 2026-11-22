@@ -819,8 +819,9 @@ before or during an owner halt, withholds the allow, and so does a host that can
 reached at that moment. The host also reads the resumed call again, with the
 task as it is now: when a path of the call resolves elsewhere, a class or raise
 rule matches differently, or the task changed since the deferral, the decision
-no longer applies. For a team member the task includes the title, so a run
-that the host renamed after the deferral also withholds the allow. A worker
+no longer applies. For a team member without a task of its own the task title
+is the run's name, so a run that the host renamed after the deferral also
+withholds the allow. A worker
 that an earlier release started names no call in that check, and its allow is
 checked without this reading. A verdict the agent reaches for a headless call
 is likewise returned only while the task text is the one the call was decided

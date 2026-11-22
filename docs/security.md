@@ -73,6 +73,26 @@ headless launches.
 In a served session each tool call inside a program raises its own hooks, so
 the permission channel still decides each call.
 
+A Claude team member whose launch asks for Code Mode reads one more paragraph
+at the end of its prompt: a working rule for programs. It says to filter and
+count inside the program and to print only what the next decision needs. It
+says that each call a program makes passes the same permission checks, that a
+rejected call is final inside a program too, and that the final report is
+submitted on its own. A member that starts without Code Mode reads its prompt
+unchanged. The host adds the rule at the launch and does not store it in the
+member's prompt or in the session's recorded first prompt.
+
+The mode is part of a member's configuration identity. The prompt version of a
+Claude member that started in Code Mode covers the rule, so outcome evidence of
+the two modes stays apart, and identities recorded before the mode existed stay
+the same. Routing reads its evidence at the prompt version a new member would
+start with. It estimates that mode from this setting and the shape of the
+Claude launch profile, and counts a headless launch whose shape the permission
+channel can serve as served. When the setting enables Code Mode for that shape
+but the channel does not admit the launch, the member starts without Code Mode
+while routing still expects the mode, and routing counts that member's outcomes
+as earlier evidence.
+
 A session records whether the host asked for Code Mode. Resuming the same
 conversation asks again when the record says so, whatever the setting says by
 then, and does not ask when the record says no or the session is older than
@@ -739,6 +759,13 @@ Limits that remain:
   also raises some routine commands, for example a commit message that reads
   as a credential command. Those cost a strong turn and never an owner
   interrupt.
+  Code-running assignments, including append assignments, declaration builtins,
+  and wrapper environment options, also raise. Listed inert `NODE_OPTIONS`
+  runtime flags are exempt only when every option is on that list. Named
+  inert pager/editor values, disabled Git config files (`/dev/null`), and plain
+  relative module/library search paths or `GIT_DIR` values are exempt. These
+  exemptions never apply to appends: the concatenated value is unknown. Node
+  `data:` loader values and Perl `-M` values with a code suffix are inline code.
 - Paths are resolved through symbolic links when the request is read. A link
   that changes between the review and the command's own execution is not
   seen. A path that the host cannot read is raised. The evidence collector

@@ -79,7 +79,7 @@ function counting(store: EvidenceStore): { store: Store; opens: () => number } {
 function statusInput(overrides: Partial<Parameters<typeof routingStatus>[1]> = {}): Parameters<typeof routingStatus>[1] {
   return {
     projectId: "rehearsal", saved: undefined, autonomy: "supervised", lineup: mixedLineup, publishHeads: false, entryTools: false,
-    objectiveDigest: false, now: NOW, ...overrides,
+    objectiveDigest: false, codeMode: false, now: NOW, ...overrides,
   };
 }
 
@@ -423,6 +423,37 @@ test("the objective digest flag reads the version a goal cycle's start carries, 
     const withoutFlag = cellProfile(routingStatus(store, statusInput({ saved: { mode: "shadow" }, objectiveDigest: false })), "astra-xhigh");
     assert.deepEqual([withFlag.rows.production, withFlag.earlier.rows], [30, 0]);
     assert.deepEqual([withoutFlag.rows.production, withoutFlag.earlier.rows], [0, 30]);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("the Code Mode flag reads the version a Claude member started in Code Mode carries, and no other provider's", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    const claude: TeamModelProfile = { id: "haiku-medium", label: "Claude implementer", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" };
+    const astra = mixedLineup.implementers[1]!;
+    const lineup: TeamLineup = { ...mixedLineup, implementers: [claude, astra] };
+    seed(store, { area: "host" });
+    store.write(tx => {
+      configRow(tx, "program-rule", claude, promptVersion("implementer", "claude", claude, false, false, false, true));
+      configRow(tx, "astra-plain", astra, promptVersion("implementer", "codex", astra, false, false));
+      for (let index = 0; index < 30; index++) {
+        writeOutcome(tx, integratedRow({ id: `program-${index}`, profile: claude, configId: "program-rule" }));
+        writeOutcome(tx, integratedRow({ id: `astra-${index}`, profile: astra, configId: "astra-plain" }));
+      }
+    });
+    const read = (codeMode: boolean) => routingStatus(store!, statusInput({ saved: { mode: "shadow" }, lineup, codeMode }));
+    const on = read(true), off = read(false);
+    assert.deepEqual([cellProfile(on, "haiku-medium").rows.production, cellProfile(on, "haiku-medium").earlier.rows], [30, 0]);
+    assert.deepEqual([cellProfile(off, "haiku-medium").rows.production, cellProfile(off, "haiku-medium").earlier.rows], [0, 30]);
+    assert.deepEqual([cellProfile(on, "astra-xhigh").rows.production, cellProfile(on, "astra-xhigh").earlier.rows], [30, 0]);
+    // The other provider's evidence reads the same. Which profile the greedy pick names depends on the Claude candidate too.
+    const evidenceOf = (status: RoutingStatus) => { const { greedy: _pick, ...evidence } = cellProfile(status, "astra-xhigh"); return evidence; };
+    assert.deepEqual(evidenceOf(on), evidenceOf(off));
   } finally {
     store?.close();
     f.close();

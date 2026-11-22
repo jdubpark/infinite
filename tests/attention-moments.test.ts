@@ -84,3 +84,15 @@ test("a prompt-merged notice gives the decision row the dialog's own title and d
   assert.deepEqual(moments[0].expanded, [{ label: "Detail", text: "Bash command\nrm -rf build\nRemove the stale build directory" }]);
   assert.equal(moments[0].detail, "Waiting");
 });
+
+test("a provider-submitted turn-start is labelled as the provider's prompt, not the owner's request", () => {
+  const events: SignalEvent[] = [
+    ev({ kind: "turn-start", prompt: "Continue from where you left off.", automatic: true }),
+    ev({ kind: "turn-start", prompt: "add retries" }),
+  ];
+  const turns = deriveMoments(events).filter(m => m.kind === "turn");
+  assert.deepEqual(turns.map(m => [m.title, m.expanded]), [
+    ["add retries", [{ label: "Request", text: "add retries" }]],
+    ["Continued after the answer", [{ label: "Provider's own prompt", text: "Continue from where you left off." }]],
+  ]);
+});

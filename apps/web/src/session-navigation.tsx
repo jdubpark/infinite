@@ -6,7 +6,7 @@ import { cost } from "./usage";
 export type SessionTab = "chat" | "screen" | "terminal" | "files" | "context";
 export type CostView = "overview" | "projects" | "models";
 export type SwarmViewName = "lanes" | "wall" | "graph";
-type Location = { id: string | null; tab: SessionTab; creating: boolean; teams: boolean; teamId: string | null; creatingTeam: boolean; goals: boolean; goalId: string | null; creatingGoal: boolean; missionId: string | null; cost: boolean; costView: CostView; costProjectId: string | null; swarm: boolean; swarmView: SwarmViewName; permissions: boolean; permissionOverview: boolean; decisionId: string | null };
+type Location = { id: string | null; tab: SessionTab; creating: boolean; teams: boolean; teamId: string | null; creatingTeam: boolean; goals: boolean; goalId: string | null; creatingGoal: boolean; missionId: string | null; decisions: boolean; cost: boolean; costView: CostView; costProjectId: string | null; swarm: boolean; swarmView: SwarmViewName; permissions: boolean; permissionOverview: boolean; decisionId: string | null };
 
 function readLocation(machine: string): Location {
   const hash = window.location.hash.replace(new RegExp(`^#/machines/${machine}(?=/|$)`), "#");
@@ -14,6 +14,7 @@ function readLocation(machine: string): Location {
   const team = hash.match(/^#\/teams\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i);
   const goal = hash.match(/^#\/goals\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i);
   const mission = hash.match(/^#\/missions\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i);
+  const decisions = hash === "#/decisions";
   // Project IDs are host-configured slugs, so the cost routes accept any single path segment.
   const swarm = hash.match(/^#\/swarm(?:\/(wall|graph))?$/);
   const cost = hash.match(/^#\/cost(?:\/(projects|models)(?:\/([^/]+))?)?$/);
@@ -22,7 +23,7 @@ function readLocation(machine: string): Location {
   return { id: match?.[1] ?? null, tab: (match?.[2] as SessionTab) ?? "chat", creating: hash === "#/new",
     teams: hash === "#/teams" || hash === "#/teams/new" || Boolean(team), teamId: team?.[1] ?? null, creatingTeam: hash === "#/teams/new",
     goals: hash === "#/goals" || hash === "#/goals/new" || Boolean(goal), goalId: goal?.[1] ?? null, creatingGoal: hash === "#/goals/new",
-    missionId: mission?.[1] ?? null,
+    missionId: mission?.[1] ?? null, decisions,
     swarm: Boolean(swarm), swarmView: (swarm?.[1] as SwarmViewName | undefined) ?? "lanes",
     cost: Boolean(cost), costView: (cost?.[1] as CostView | undefined) ?? "overview", costProjectId: cost?.[1] === "projects" && cost[2] ? decodeURIComponent(cost[2]) : null,
     permissions: Boolean(permission), permissionOverview: permission?.[1] === "overview", decisionId: permission?.[2] ? decodeURIComponent(permission[2]) : null };
@@ -50,6 +51,7 @@ export function useSessionLocation(machine = "direct") {
     createTeam: () => { window.location.hash = `${prefix}/teams/new`; },
     navigateGoal: (id: string | null) => { window.location.hash = `${prefix}/goals${id ? `/${id}` : ""}`; },
     navigateMission: (id: string) => { window.location.hash = `${prefix}/missions/${id}`; },
+    navigateDecisions: () => { window.location.hash = `${prefix}/decisions`; },
     createGoal: () => { window.location.hash = `${prefix}/goals/new`; },
     navigateSwarm: (view: SwarmViewName = "lanes") => { window.location.hash = `${prefix}/swarm${view === "lanes" ? "" : `/${view}`}`; },
     navigateCost: (view: CostView = "overview", projectId?: string) => { window.location.hash = `${prefix}/cost${view === "overview" ? "" : `/${view}`}${projectId ? `/${encodeURIComponent(projectId)}` : ""}`; },

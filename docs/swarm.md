@@ -149,3 +149,41 @@ or its team or session leaves the view.
 - The active machine only.
 - No history or replay.
 - No controls.
+
+## Decisions view
+
+A separate route, `#/decisions`, shows what waits on a person: session
+prompts, team decisions, and mission decisions from `GET /api/decision-queue`,
+one at a time, oldest first. The sidebar says how many wait.
+
+- An option is selected first and sent second. A number key or a click
+  selects. Enter or the submit button sends. The `r` key selects the agent's
+  recommendation and sends nothing.
+- The recommended option is listed first. An approval question keeps its own
+  order: approve first, deny second.
+- A destructive session prompt takes an accepting option from a click only,
+  not from a number key.
+- Answers go through the existing session, team, and mission routes, so the
+  same roles, control lease, and revision checks apply. A viewer reads the
+  queue and cannot answer. Only the owner answers a mission decision.
+- A prompt that only its terminal can answer links to that session's terminal.
+- The view reads the queue every 1.8 seconds while it is open, and every 10
+  seconds otherwise for the sidebar count. The last queue the host reported
+  stays on screen while a read is in flight or fails.
+- The queue takes answers only while it is the host's current answer. A
+  failed read turns answers off at once. So does a read that has not come
+  back three seconds after it was due. After about three seconds without a
+  current queue, the decision dims, a notice says since when the queue has
+  not refreshed, and the sidebar shows no count.
+- Time in a hidden tab does not count toward that notice. A tab that returns
+  asks for a new read at once and takes no answers until one lands. If a read
+  from before is still in flight, the new one starts when that one settles.
+  The notice shows only if no read lands within three seconds of the return.
+- A decision answered here leaves the queue at once. If the fifth read after
+  the answer still lists it, it shows again.
+- A decision that leaves the queue while it is on screen is reported as no
+  longer in the queue. The view does not say that it was answered, because
+  the queue does not say why it left.
+- A host without the queue route gets one line that says the queue is not
+  available there. The same line replaces the last queue if the host stops
+  serving the route.

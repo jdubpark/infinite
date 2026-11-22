@@ -13,7 +13,7 @@ import { canonicalJson } from "./evidence/crypto.js";
 import { MAX_SHELL_DEPTH, quoteWord, readShell, remoteOperand, resolveWord, type PathResolver, type SimpleCommand } from "./permission-shell.js";
 
 /** Bumped by any change to the rule code below, or to the shell reading it uses, that is not a change to the lists. */
-export const CLASS_RULES_VERSION = 7;
+export const CLASS_RULES_VERSION = 8;
 
 /**
  * The host's lists. Commands are word prefixes after wrappers (sudo, env, timeout) are removed; option
@@ -578,7 +578,7 @@ export const EMBEDDED_COMMAND_LIMITS = { words: 64, length: 4_000, readings: 256
 /** Commands that never run an argument. Their arguments are not searched. */
 const NEVER_RUN = new Set(["echo", "printf", "grep", "egrep", "fgrep", "cat", "head", "tail", "wc"]);
 /** Opaque reasons that mean a candidate runs code the host does not read. */
-const RUNS_UNREAD_CODE = new Set(["inline-code", "inline-shell", "code-from-input"]);
+const RUNS_UNREAD_CODE = new Set(["inline-code", "inline-shell", "code-from-input", "code-environment"]);
 
 /**
  * Whether a command hides one that a class rule matches: a tail of its words, which a wrapper the shell

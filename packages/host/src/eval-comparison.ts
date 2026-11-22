@@ -69,6 +69,8 @@ function statTrial(row: JobTrialRow, pin: ComparisonPin, configuration: number):
 }
 
 type Built = { report: ComparisonReport } | "unreadable";
+/** What a read computed for one due job; the write only stores it. */
+type Prepared = { report?: Built; unreadable: boolean; priors?: { jobId: string; projectId: string; cells: ReturnType<typeof priorCells> } };
 
 function buildReport(db: EvidenceDb, due: DueRow, payload: TrialJobPayload, project: Project | undefined, at: string): Built {
   const confirm = due.kind === "confirm";
@@ -169,62 +171,63 @@ export class ComparisonPass {
       });
       if (due === undefined) return "idle";
       if (due === "waiting") return "waiting";
-      return this.store.write(tx => this.report(tx, due, at)) ? "reported" : "idle";
+      return this.report(due, at) ? "reported" : "idle";
     } catch {
       return "waiting";
     }
   }
 
-  private report(tx: EvidenceTx, due: DueRow, at: string): boolean {
-    if (tx.run("UPDATE eval_jobs SET reported_at = ? WHERE job_id = ? AND reported_at IS NULL", at, due.job_id).changes === 0) return false;
+  /**
+   * The statistics and the prior cells are computed in a read; the write then holds the lock only for the stamp and the inserts.
+   * The `reported_at IS NULL` guard in the write lets one pass win when two run.
+   */
+  private report(due: DueRow, at: string): boolean {
+    const prepared = this.store.read(db => this.prepare(db, due, at));
+    return this.store.write(tx => {
+      if (tx.run("UPDATE eval_jobs SET reported_at = ? WHERE job_id = ? AND reported_at IS NULL", at, due.job_id).changes === 0) return false;
+      if (prepared.report !== undefined) writeReport(tx, due, prepared.report === "unreadable" ? undefined : prepared.report.report, at);
+      if (prepared.unreadable) logUnreadable();
+      if (prepared.priors !== undefined) writePriors(tx, { ...prepared.priors, at });
+      return true;
+    });
+  }
+
+  private prepare(db: EvidenceDb, due: DueRow, at: string): Prepared {
     let payload: TrialJobPayload | undefined;
     try {
-      payload = tx.open<TrialJobPayload>("eval_jobs", due.job_id, due.payload);
+      payload = db.open<TrialJobPayload>("eval_jobs", due.job_id, due.payload);
     } catch {
       payload = undefined;
     }
     const comparison = due.kind !== "baseline";
-    if (payload === undefined) {
-      if (comparison) {
-        writeReport(tx, due, undefined, at);
-        logUnreadable();
-      }
-      return true;
-    }
+    if (payload === undefined) return comparison ? { report: "unreadable", unreadable: true } : { unreadable: false };
     const project = this.config.projects.find(item => item.id === payload.projectId);
+    let report: Built | undefined;
     if (comparison) {
-      let built: Built;
       try {
-        built = buildReport(tx, due, payload, project, at);
+        report = buildReport(db, due, payload, project, at);
       } catch {
-        built = "unreadable";
+        report = "unreadable";
       }
-      if (built === "unreadable") {
-        writeReport(tx, due, undefined, at);
-        logUnreadable();
-        return true;
-      }
-      writeReport(tx, due, built.report, at);
+      if (report === "unreadable") return { report, unreadable: true };
     }
-    if (due.kind === "confirm") return true;
-    this.priors(tx, due, payload, at);
-    return true;
+    if (due.kind === "confirm") return { report, unreadable: false };
+    const cells = this.priors(db, due, payload);
+    if (cells === undefined) return { report, unreadable: true };
+    return { report, unreadable: false, priors: { jobId: due.job_id, projectId: payload.projectId, cells } };
   }
 
-  private priors(tx: EvidenceTx, due: DueRow, payload: TrialJobPayload, at: string): void {
-    let cells: ReturnType<typeof priorCells>;
+  private priors(db: EvidenceDb, due: DueRow, payload: TrialJobPayload): ReturnType<typeof priorCells> | undefined {
     try {
       // Copies were counted by the job that ran them; exporting them again would count one trial twice.
-      const rows = jobRows(tx, due.job_id).filter(row => !row.reused);
+      const rows = jobRows(db, due.job_id).filter(row => !row.reused);
       const ids = payload.tasks ?? [...new Set(rows.map(row => row.taskId))].sort().slice(0, TASKS_MAX);
-      const known = taskRows(tx, ids);
-      cells = priorCells(payload.request.configurations, rows, priorTasks(known));
+      const known = taskRows(db, ids);
+      return priorCells(payload.request.configurations, rows, priorTasks(known));
     } catch {
-      // A job whose rows cannot be built keeps its stamp, so the queue moves on. The write below stays outside the try.
-      logUnreadable();
-      return;
+      // A job whose rows cannot be built keeps its stamp, so the queue moves on.
+      return undefined;
     }
-    writePriors(tx, { jobId: due.job_id, projectId: payload.projectId, cells, at });
   }
 }
 

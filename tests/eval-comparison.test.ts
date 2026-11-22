@@ -464,3 +464,36 @@ test("a job whose priors cannot be built does not block the next job", () => {
     f.close();
   }
 });
+
+test("the report statistics are computed in a read, not inside the write", () => {
+  const f = ready();
+  try {
+    fixtureP(f, "job-outside", "compare");
+    const seen = { outside: 0, inside: 0 };
+    // Counts the statements that read the trial rows, and whether the store's write was open when they ran.
+    const counting = <T extends object>(target: T, writing: boolean): T => new Proxy(target, {
+      get(object, key) {
+        const value = Reflect.get(object, key) as unknown;
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          if ((key === "all" || key === "get") && /eval_trials/.test(String(args[0]))) seen[writing ? "inside" : "outside"] += 1;
+          return (value as (...inner: unknown[]) => unknown).apply(object, args);
+        };
+      },
+    });
+    const spy = new Proxy(f.store, {
+      get(target, key) {
+        if (key === "write") return (fn: (tx: never) => unknown) => target.write(tx => fn(counting(tx, true) as never));
+        if (key === "read") return (fn: (db: never) => unknown) => target.read(db => fn(counting(db, false) as never));
+        const value = Reflect.get(target, key) as unknown;
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    assert.equal(new ComparisonPass({ store: spy, config: CONFIG, now: () => NOW }).step(), "reported");
+    assert.ok(seen.outside > 0, "the trial rows are read");
+    assert.equal(seen.inside, 0, "no trial row is read inside the write");
+    assert.equal(opened(read(f, "job-outside")).tasks.analysed > 0, true);
+  } finally {
+    f.close();
+  }
+});

@@ -75,6 +75,23 @@ class Run {
   }
 }
 
+test("with endsWithLeader, a command whose output closes at its exit settles on the close, whole and not truncated", CASE, async () => {
+  const run = new Run();
+  try {
+    const started = performance.now();
+    const result = await run.start(() => ({ command: "sh", args: ["-c", "echo whole; echo also >&2; exit 4"] }), true);
+    const elapsed = run.settledAt! - started;
+    assert.equal(result.exitCode, 4);
+    assert.equal(result.interrupted, false);
+    assert.equal(result.truncated, false, "the output closed");
+    assert.equal(result.stdout, "whole\n");
+    assert.equal(result.output, "whole\nalso\n");
+    assert.ok(elapsed < EXIT_DRAIN_MS, `settled ${elapsed.toFixed(0)} ms after the start: it waited out the drain`);
+  } finally {
+    run.dispose();
+  }
+});
+
 test("with endsWithLeader, a command whose leader exited settles a drain later with its exit code, and its leftover lives", CASE, async () => {
   const run = new Run();
   try {

@@ -75,6 +75,7 @@ const REPORT_SAMPLES: Record<TeamReport["kind"], TeamReport> = {
   question: { kind: "question", question: "Which file?", options: [], recommendation: { answers: ["a.txt"], reason: "It holds the change." } },
   blocked: { kind: "blocked", summary: "Cannot proceed" },
   "intent-check": { kind: "intent-check", summary: "No gap found", items: [] },
+  verdict: { kind: "verdict", result: "met", criteria: [{ id: "c0", state: "met", evidence: [] }] },
 };
 
 test("every report kind reaches member.reported", async () => {

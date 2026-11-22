@@ -977,7 +977,7 @@ A `404` without a known code prints `This host has no eval routes. Upgrade the h
 | `POST /api/eval/jobs/:id/pause`, `resume`, `cancel` | Owner |
 | `POST /api/eval/tasks/:id/retire` | Owner |
 
-A body or id that does not parse is `400` `invalid-eval-request`. An unknown project, job, or task is `404`. A store that is not ready is `503` `evidence-unavailable`. No route returns a capsule, a patch, a file name, a case, or a commit. The report and priors routes exist: see [Eval comparisons](#commands-and-routes).
+A body or id that does not parse is `400` `invalid-eval-request`. An unknown project, job, or task is `404`. A store that is not ready is `503` `evidence-unavailable`. A job read, a control, or the project summary that touches a baseline, compare, or confirm job needs the `eval-trials` module, so it answers `503` `evidence-unavailable` while that module is not ready; a validation job still reads and controls. A retried baseline create with the same request id answers `503` while the module is not ready. No route returns a capsule, a patch, a file name, a case, or a commit. The report and priors routes exist: see [Eval comparisons](#commands-and-routes).
 
 ### Git forms of mining and validation
 

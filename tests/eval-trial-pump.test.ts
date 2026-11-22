@@ -509,3 +509,23 @@ test("the pump opens a comparison job", async () => {
     r.cleanup();
   }
 });
+
+test("the identity status keeps the last probe once it has aged out", async t => {
+  const r = rig({ probes: [{ state: "misconfigured" }] });
+  try {
+    assert.deepEqual(r.pump.identityStatus(), { state: "unavailable" }, "no probe has happened");
+    r.addJob();
+    await r.pump.step();
+    assert.equal(r.probeInputs.length, 1, "one probe");
+    assert.equal(r.pump.identityStatus().state, "misconfigured", "a fresh probe is the state");
+    assert.equal(r.pump.identityStatus().lastProbe, undefined);
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 11 * 60_000 });
+    const aged = r.pump.identityStatus();
+    assert.equal(aged.state, "unavailable", "scheduling still sees an unavailable identity");
+    assert.equal(aged.lastProbe?.state, "misconfigured");
+    assert.match(aged.lastProbe?.at ?? "", /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
+    assert.equal(r.pump.identityState(), "unavailable");
+  } finally {
+    r.cleanup();
+  }
+});

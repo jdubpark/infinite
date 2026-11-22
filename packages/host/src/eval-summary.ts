@@ -41,6 +41,8 @@ export type SummaryInput = {
   /** The grader's launcher version, or null until a probe answered one. */
   graderVersion: number | null;
   evalIdentity: EvalIdentityState;
+  /** The last probe, shown when the state is `unavailable` because the probe aged out. */
+  evalIdentityLastProbe?: { state: EvalIdentityState; at: string };
   /** Trials the project started today (`trialsSince`), and the cap the project sets (null when `trialsPerDay` is absent). */
   trials: { today: number; dailyCap: number | null };
   /** The project's newest jobs, as `EvalJobs.projectJobs` returns them. */
@@ -87,7 +89,7 @@ export function evalSummary(store: EvidenceStore, input: SummaryInput): EvalSumm
     groups: { ...counted.groups, holdout: evalOn ? counted.sets.holdoutGroups : 0, exposed: evalOn ? counted.sets.exposedGroups : 0 },
     coverage: coverageOf(store, project, counted.validCaptured, days, now),
     grader: { state: input.grader, version: input.graderVersion },
-    evalIdentity: { state: input.evalIdentity },
+    evalIdentity: { state: input.evalIdentity, ...(input.evalIdentityLastProbe ? { lastProbe: input.evalIdentityLastProbe } : {}) },
     trials: { today: input.trials.today, dailyCap: input.trials.dailyCap },
     jobs: input.jobs.slice(0, SUMMARY_JOBS),
   };

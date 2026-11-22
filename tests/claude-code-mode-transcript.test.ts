@@ -23,3 +23,14 @@ test("Claude Code Mode transcript shows the program, each nested call, and the f
   assert.match(summary, /Agent ran Write: \/home\/dev\/projects\/demo\/total\.txt/);
   assert.equal(tail.discarded, 0, "repl-mode, tools-used, and host-row records are valid ignored rows");
 });
+
+// The provider's own continue after an owner's answer: a meta row the chat view must not show.
+test("the provider's own continue prompt after a deferred resume is not a chat message", () => {
+  const tail = new TranscriptTail("claude");
+  const row = {
+    type: "user", isMeta: true, promptSource: "system", turnOrigin: "system",
+    sessionId: "00000000-0000-4000-8000-000000000001", uuid: "00000000-0000-4000-8000-000000000003", parentUuid: null, isSidechain: false,
+    message: { role: "user", content: "Continue from where you left off." },
+  };
+  assert.deepEqual(tail.ingest(JSON.stringify(row) + "\n"), []);
+});

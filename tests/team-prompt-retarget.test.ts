@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
+  EARLIER_RULE_WITHOUT_ENTRY,
+  EARLIER_RULE_WITH_ENTRY,
   codexMemberToolInstructions,
   codexSandboxInstructions,
   contextAccessInstructions,
@@ -305,5 +308,32 @@ test("seeded retarget comparisons preserve quoted prompt evidence across every r
   } catch (error) {
     console.error(`retarget comparison seed=${seed}; returned=${returnedPrompts}; elapsedMs=${Math.round(performance.now() - started)}`);
     throw error;
+  }
+});
+
+test("the earlier working rule is kept as the bytes the earlier release wrote", () => {
+  // These are hashes of that release's own output, so an edit to a frozen form fails here instead of losing its prompts.
+  const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+  assert.equal(sha256(EARLIER_RULE_WITHOUT_ENTRY), "77d618fea6ee839cec3d9641f560e0ce2749985fc0330a1463b38c75470833b5");
+  assert.equal(sha256(EARLIER_RULE_WITH_ENTRY), "7595d799220ed280b9f93aacd694e6362570b107e7bb19ac814a8c431ae4ac10");
+});
+
+test("a prompt written by the earlier release is retargeted to one current working rule", () => {
+  const codexProfile = { ...ENTRY_PROFILE, provider: "codex" as const };
+  for (const entryTools of [false, true]) {
+    const current = codexMemberToolInstructions(entryTools);
+    const earlier = entryTools ? EARLIER_RULE_WITH_ENTRY : EARLIER_RULE_WITHOUT_ENTRY;
+    const prompt = teamPrompt(smallRun(entryTools ? { blackboard: { tools: true } } : {}), "implementer", undefined, undefined, "codex", codexProfile);
+    assert.equal(prompt.split(current).length - 1, 1, `entryTools ${entryTools} current prompt carries the rule once`);
+    const carried = prompt.replace(current, earlier);
+    assert.notEqual(carried, prompt);
+    const codex = retargetPrompt(carried, { provider: "codex", profile: codexProfile, role: "implementer", entryTools });
+    assert.equal(codex, prompt, `entryTools ${entryTools} the earlier rule is replaced by the current one`);
+    assert.equal(codex!.split(current).length - 1, 1);
+    assert.equal(codex!.includes(earlier), false);
+    const claude = retargetPrompt(codex!, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools });
+    assert.ok(claude);
+    assert.equal(claude.includes(current), false, `entryTools ${entryTools} no Codex rule reaches Claude`);
+    assert.equal(claude.includes(earlier), false);
   }
 });

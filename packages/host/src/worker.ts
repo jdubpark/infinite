@@ -52,7 +52,7 @@ import { TranscriptWatch, closesTurn } from "./transcript-watch.js";
 import { drainLaunch, runFinalDrain } from "./final-drain.js";
 import { buildLaunch, headlessResumeProfile } from "./launch.js";
 import { channelToken } from "./permission-headless.js";
-import { HeadlessChannelWorker } from "./permission-headless-worker.js";
+import { claudeTurnSignals, HeadlessChannelWorker } from "./permission-headless-worker.js";
 import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv } from "./worker-env.js";
 import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrust } from "./workspace-trust.js";
@@ -433,7 +433,7 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | Hook
   if (route === "drain") { const started = drainOpen ? transcriptWatch.drainFinal() : undefined; return started ? { transcript: started } : undefined; }
   if (route === "transcript") return state.status === "running" || drainOpen ? onTranscript(body) : undefined;
   if (state.status !== "running") return;
-  const signals = route === "claude" ? mapClaudeHook(body) : route === "codex" ? mapCodexHook(body) : mapCodexNotify(body);
+  const signals = route === "claude" ? claudeTurnSignals(mapClaudeHook(body), () => permissionChannel?.takeContinue() === true) : route === "codex" ? mapCodexHook(body) : mapCodexNotify(body);
   // With Codex hooks off, a notify only links the session record: its turn end reaches the transcript watch, and no
   // attention signal is journaled, because no turn-start hook would follow to show later work (INF-213).
   const linkOnly = route === "codex-notify" && !config.attention.hooks.codex;

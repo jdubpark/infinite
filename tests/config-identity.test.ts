@@ -413,8 +413,12 @@ test("entry tools change the prompt version only for entry roles", () => {
 // pin is 8075cde0, its value before both changes.
 const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
 const PIN_PROVIDERS = ["claude", "codex", "opencode"] as const;
-const PIN_VERSIONS_SHA256 = "08ae370cd80e29585b7959874c8e934b537f29893e2a4c5d06f7757bc321d016";
-const PIN_CODEX_VERSIONS_SHA256 = "39610cc28024e7641ae55f511218e2d094d82fbeab195c0560ae8cb4312ad61a";
+// INF-383 moved this pin to fc702f2f: the Codex working rule's signature sentences now name the callable form and the
+// nested result type, generated from the declared schemas, and the rule says what a failed call returns. No other
+// prompt version changed.
+const PIN_VERSIONS_SHA256 = "fc702f2f30c8f491371252dea4f30b12c493a0d4cb918619354a2b1d770e13d7";
+// INF-383 moved the Codex pin to 1690257f for the same working-rule change. The Claude and OpenCode pin is unchanged.
+const PIN_CODEX_VERSIONS_SHA256 = "1690257f5cd174cc239aa2dcfa555a1f6b9bb4d723344181744b6a92cbf424e5";
 const PIN_NON_CODEX_VERSIONS_SHA256 = "804d29fbd0d0bc826c7ef1cbcceff6b985ac61ed83b43996001ff4657418154c";
 
 test("the switch off keeps every prompt version", () => {

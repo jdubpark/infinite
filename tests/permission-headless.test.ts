@@ -13,7 +13,7 @@ import {
   HeadlessPermissionChannel, channelToken, deferredCallOpen, deliveryKey, type ChannelReply,
 } from "../packages/host/src/permission-headless.js";
 import {
-  DEFERRAL_RETENTION_MS, HeadlessChannelWorker, OPEN_CALL_KEYS, OWNER_DENIED, PENDING_NOTICE, type ChannelWorkerHost,
+  claudeTurnSignals, DEFERRAL_RETENTION_MS, HeadlessChannelWorker, OPEN_CALL_KEYS, OWNER_DENIED, PENDING_NOTICE, type ChannelWorkerHost,
 } from "../packages/host/src/permission-headless-worker.js";
 import { hookOutput } from "../packages/host/src/permission-hook.js";
 import { requesterNotice } from "../packages/host/src/permission-policy.js";
@@ -120,6 +120,10 @@ test("a class call waits for the owner, and the owner's allow runs that one call
     assert.equal(r.log("ran.log"), "make safe-build\ndeploy production\n");
     const events = r.channelEvents(id).map(event => event.event);
     assert.deepEqual(events.filter(event => event !== "pending"), ["deferred", "waiting", "answer", "resumed", "delivered"]);
+    // The session's journal marks the provider's own continue prompt after the resume, and not the owner's request.
+    const turns = r.manager.events(id, 0, 500, new Set(["signal"])).events.map(event => event.data as { kind?: string; prompt?: string; automatic?: true })
+      .filter(data => data.kind === "turn-start").map(data => [data.prompt, data.automatic]);
+    assert.deepEqual(turns, [["mixed", undefined], ["Continue from where you left off.", true]]);
     // The owner decision is linked to its delivery events: deferral, the owner's answer, and the resumed call.
     const owner = r.decided.find(request => /production/.test(request.action))!;
     assert.equal(owner.requester.kind, "headless");
@@ -838,4 +842,33 @@ test("the channel hook prints a provider decision only for a decision", () => {
   assert.deepEqual(JSON.parse(hookOutput("check", { decision: "defer", reason: "wait" })), { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "defer", permissionDecisionReason: "wait" } });
   // A PermissionRequest hook cannot defer: anything but an allow is a deny.
   assert.deepEqual(JSON.parse(hookOutput("request", { decision: "defer" })).hookSpecificOutput.decision, { behavior: "deny", message: requesterNotice("unavailable") });
+});
+
+test("each resume the worker performed owes one continue: the first prompt after it is marked, and nothing else", async () => {
+  const w = workerRig([owner, { ...owner, decisionId: randomUUID() }]);
+  // The session worker's own callback, as worker.ts wires it on the Claude hook route.
+  const mark = (signals: Parameters<typeof claudeTurnSignals>[0]) => claudeTurnSignals(signals, () => w.channel.takeContinue());
+  const prompt = { kind: "turn-start" as const, prompt: "Continue from where you left off." };
+  const next = { kind: "turn-start" as const, prompt: "next" };
+  const toolEnd = { kind: "tool-end" as const, tool: "Bash", ok: true };
+  assert.deepEqual(mark([prompt]), [prompt], "before any resume a prompt is a person's");
+  await resumeAfterDeferral(w);
+  // The resumed call's own hooks arrive before the continue prompt: they neither take the answer nor get the marker.
+  assert.deepEqual(mark([toolEnd]), [toolEnd]);
+  assert.deepEqual(mark([prompt, next]), [{ ...prompt, automatic: true }, next], "only the first prompt after the resume is the provider's");
+  assert.deepEqual(mark([prompt]), [prompt], "the answer is taken once");
+  // A second deferred call in the resumed run, which the owner refuses: its resume owes a continue all the same.
+  assert.equal((await w.pre("deploy staging", "toolu_second")).decision, "defer");
+  assert.equal(w.channel.exited(0), true);
+  w.channel.answer({ requestId: "a2", promptId: w.prompts[1]!, option: 1 });
+  assert.deepEqual(await w.pre("deploy staging", "toolu_second"), { decision: "deny", reason: OWNER_DENIED });
+  assert.equal(w.resumed, 2);
+  assert.deepEqual(mark([toolEnd, prompt]), [toolEnd, { ...prompt, automatic: true }], "the second resume owes one too");
+  // A resume that fails owes nothing.
+  const unresumable = workerRig([owner]);
+  unresumable.failResume();
+  await unresumable.pre("deploy production", "toolu_1");
+  unresumable.channel.exited(0);
+  unresumable.channel.answer({ requestId: "a1", promptId: unresumable.prompts[0]!, option: 0 });
+  assert.equal(unresumable.channel.takeContinue(), false, "a resume that fails owes no continue");
 });

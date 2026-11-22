@@ -239,9 +239,13 @@ export const teamProjectSchema = z.object({
   routing: teamRoutingSchema.optional(),
   /** The objective switches. No default: an absent key leaves every routine digest and prompt unchanged. `intentCheck` overrides the mode's default. */
   objective: z.strictObject({ prompts: z.enum(["on", "off"]).optional(), intentCheck: z.enum(["on", "off"]).optional(), register: z.enum(["on", "off"]).optional(), evaluator: z.enum(["on", "off"]).optional() }).optional(),
+  /** The main check (off by default). It runs the configured setup and checks at main's newest head and notifies on a change of health. No default, so an unset key leaves every digest unchanged. */
+  mainCheck: z.strictObject({ minutes: z.number().int().min(1).max(240).optional() }).optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
+  if (project.mainCheck && project.establishChecks)
+    context.addIssue({ code: "custom", path: ["mainCheck"], message: "The main check runs the configured checks, and a project that lets the team establish its own checks has none to run." });
   if (project.handoffMaxTotalMinutes !== undefined && project.handoffMaxTotalMinutes < (project.handoffMinutes ?? 60))
     context.addIssue({ code: "custom", path: ["handoffMaxTotalMinutes"], message: "The handoff ceiling cannot be shorter than its time limit." });
 });

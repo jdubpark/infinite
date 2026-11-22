@@ -1,6 +1,6 @@
 import type { ConnectorSource } from "./mcp-types.js";
 import { inputSourceLabel, decisionAnswerLabel, type SteeringSource } from "./team-types.js";
-import type { HandoffPolicy, TeamHandoffContext } from "./handoff-types.js";
+import { withoutMainCheck, type HandoffPolicy, type TeamHandoffContext } from "./handoff-types.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
@@ -1128,7 +1128,7 @@ export class TeamService {
   }
   assertHandoffPolicy(policy: HandoffPolicy) {
     const project = this.config.projects.find(item => item.id === policy.projectId);
-    if (!project || JSON.stringify(project.team) !== JSON.stringify(policy.project) || JSON.stringify(project.linear) !== JSON.stringify(policy.linear) || realpathSync(project.path) !== policy.path || this.config.teams?.workspaceDir !== policy.workspaceDir || JSON.stringify(this.config.teams?.commandPrefix) !== JSON.stringify(policy.commandPrefix))
+    if (!project || JSON.stringify(withoutMainCheck(project.team)) !== JSON.stringify(withoutMainCheck(policy.project)) || JSON.stringify(project.linear) !== JSON.stringify(policy.linear) || realpathSync(project.path) !== policy.path || this.config.teams?.workspaceDir !== policy.workspaceDir || JSON.stringify(this.config.teams?.commandPrefix) !== JSON.stringify(policy.commandPrefix))
       throw new TeamError(409, "handoff-policy-changed", "Project authority changed after the source session started; inspect the checkpoint before creating a new team.");
     for (const selection of lineupProfiles(policy.lineup)) {
       const profile = this.config.agents[selection.provider];

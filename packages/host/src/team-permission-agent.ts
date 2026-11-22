@@ -359,6 +359,7 @@ export class TeamPermissionAgent {
         await assertMemberReadOnly(sessionRoot, current.run.headCommit!, prefix);
       } } : {}),
       workspace,
+      task: () => { const current = this.host.record(runId).run; return teamPermissionTask(current, memberTaskOf(current, member.taskId)); },
       // The strong tier's source paths, with today's rules: inside the clone or the scratch directory, at most eight, bounded sizes.
       collect: async paths => {
         const normalized = this.normalizeRequestedPermissionPaths(paths, sessionRoot, member.scratchDirectory);

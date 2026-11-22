@@ -816,7 +816,16 @@ call, the worker asks the host again: an owner halt that covers the project,
 a changed session root, a team run that is no longer live, a deferral that was
 issued no decision, or a decision that no longer applies, including one reached
 before or during an owner halt, withholds the allow, and so does a host that cannot be
-reached at that moment. A withheld allow is denied with `unavailable`, and the
+reached at that moment. The host also reads the resumed call again, with the
+task as it is now: when a path of the call resolves elsewhere, a class or raise
+rule matches differently, or the task changed since the deferral, the decision
+no longer applies. For a team member without a task of its own the task title
+is the run's name, so a run that the host renamed after the deferral also
+withholds the allow. A worker
+that an earlier release started names no call in that check, and its allow is
+checked without this reading. A verdict the agent reaches for a headless call
+is likewise returned only while the task text is the one the call was decided
+with. A withheld allow is denied with `unavailable`, and the
 answer is used all the same. An owner's refusal is returned without that
 check. A resume that the host confirmed just before a halt was recorded can
 still run its call after the halt is acknowledged; nothing recalls an allow

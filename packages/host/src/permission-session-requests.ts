@@ -340,11 +340,20 @@ export class SessionPermissionRequests {
       authority: this.safe(() => this.parts.authority?.(session.projectId)),
     });
     const answers = new Map<string, Promise<"delivered" | "refused" | "uncertain">>();
+    // Where the session's record stood when the task was read: the end of a complete read, or the state's position
+    // when the read stopped early. A prompt the owner submits after it makes the task another task. A prompt that an
+    // early stop did not reach is not looked for again: the task text says that later prompts may be missing.
+    let read = Math.max(state.seq, this.scans.get(sessionId)?.cursor ?? 0);
     // What the review read is read again before delivery and must be unchanged.
     let collected: { paths: string[]; digest: string } | undefined;
     const check: PermissionInteractiveTarget["check"] = async () => {
       const live = await this.check(sessionId, request, prompt, sessionRoot, cwd);
-      if (!live.ok || !collected) return live;
+      if (!live.ok) return live;
+      const later = this.promptAfter(sessionId, read);
+      if (later === "prompt") return { ok: false, stale: false, reason: "The owner submitted a prompt after the request was read." };
+      if (later === "unread") return { ok: false, stale: false, reason: "The session record could not be read to its end." };
+      read = later;
+      if (!collected) return live;
       const again = await this.collect(sessionId, prompt, sessionRoot, cwd, collected.paths);
       return again.digest === collected.digest ? live : { ok: false, stale: true, reason: "A source file that the review read changed." };
     };
@@ -502,6 +511,27 @@ export class SessionPermissionRequests {
       prompts.push(...scan.prompts);
     }
     return { title: session.title.slice(0, TITLE_LIMIT), text: taskText(prompts, notes) };
+  }
+
+  /**
+   * Whether the owner submitted a prompt to the session after a position of its record. It reads forward from that
+   * position and keeps no state: the position it reached when it found none, "prompt" when it found one, and
+   * "unread" when the record could not be read to its end within the bound.
+   */
+  private promptAfter(sessionId: string, after: number): number | "prompt" | "unread" {
+    const types = new Set(["input-result"]);
+    // A position that is no position reads nothing, so it must not pass for a record with no later prompt.
+    if (!Number.isSafeInteger(after) || after < 0) return "unread";
+    let cursor = after;
+    try {
+      for (let page = 0; page < TASK_SCAN_PAGES; page++) {
+        const read = this.host.events(sessionId, cursor, 200, types);
+        if (read.events.some(event => event.data.state === "delivered" && typeof event.data.message === "string" && event.data.message.trim())) return "prompt";
+        cursor = read.cursor;
+        if (!read.more) return cursor;
+      }
+    } catch { /* The record cannot be read: nothing is delivered on it. */ }
+    return "unread";
   }
 
   /**

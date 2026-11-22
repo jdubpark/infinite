@@ -2843,8 +2843,15 @@ Each request passes these steps in order:
    (outside the session's directory, or into a path a class rule names), no
    verdict recorded for the earlier reading answers it. The host reads the
    request again immediately before a delivery and withholds the answer when
-   the reading changed while the review ran; the task text in that check is
-   the one the request was handed with. A pending dialog is not handed to the
+   the reading changed while the review ran. The task is read again there
+   too. A prompt that the owner submitted to a session after the request was
+   read keeps the dialog with the owner, and so does a session record that
+   cannot be read to its end before the delivery. When the record was too
+   long to read whole as the request was built, the task text says that later
+   prompts may be missing, and that alone withholds nothing. A team member's answer is withheld when the run
+   objective or the task instructions differ from the ones the request was
+   handed with; the dialog is then handed again and decided for the new task.
+   A run that the host renamed is the same task. A pending dialog is not handed to the
    agent again only because its reading changed. A recorded allow answers a
    second attempt at the same dialog only while a new identical request would
    replay the same verdict: a lock of the assignment, an open effect reject of

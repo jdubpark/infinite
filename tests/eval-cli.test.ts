@@ -237,10 +237,10 @@ test("the status prints the sets", () => {
 });
 
 test("status says what the last identity probe answered when it has aged out", () => {
-  const withTrials: EvalSummary = { ...summary, evalIdentity: { state: "unavailable", lastProbe: { state: "misconfigured", at: "2026-11-22T01:00:00.000Z" } }, trials: { today: 0, dailyCap: 6 } };
-  assert.ok(evalStatusLines(withTrials).includes("eval identity unavailable (last probe misconfigured, 2026-11-22T01:00:00.000Z)"));
-  const never: EvalSummary = { ...withTrials, evalIdentity: { state: "unavailable" } };
-  assert.ok(evalStatusLines(never).includes("eval identity unavailable (not probed)"));
-  const fresh: EvalSummary = { ...withTrials, evalIdentity: { state: "misconfigured" } };
-  assert.ok(evalStatusLines(fresh).includes("eval identity misconfigured"));
+  const base: EvalSummary = { ...summary, trials: { today: 0, dailyCap: 6 } };
+  const lines = (evalIdentity: unknown) => evalStatusLines({ ...base, evalIdentity } as EvalSummary);
+  assert.ok(lines({ state: "unavailable", lastProbe: { state: "misconfigured", at: "2026-11-22T01:00:00.000Z" } }).includes("eval identity unavailable (last probe misconfigured, 2026-11-22T01:00:00.000Z)"));
+  assert.ok(lines({ state: "unavailable", lastProbe: null }).includes("eval identity unavailable (not probed)"));
+  assert.ok(lines({ state: "unavailable" }).includes("eval identity unavailable"), "an older host says nothing it cannot know");
+  assert.ok(lines({ state: "misconfigured" }).includes("eval identity misconfigured"));
 });

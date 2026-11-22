@@ -260,7 +260,7 @@ export class EvalHost implements EvalHostApi {
     this.validation = run;
   }
 
-  /** Today's trials of the project; 0 while the trials module cannot be read, so the summary still answers. */
+  /** Today's trials of the project. The summary has already refused while the trials module is not ready, so a throw here is a store failure. */
   private trialsToday(projectId: string, day: string): number {
     try { return this.store.read(db => trialsSince(db, projectId, day)); } catch { return 0; }
   }

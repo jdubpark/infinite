@@ -264,7 +264,7 @@ export type EvalSummary = {
   groups: { total: number; devOnly: number; largest: number; holdout: number; exposed: number };
   coverage: { days: number; validCaptured: number; accepted: number; share: number } | null;
   grader: { state: GraderState; version: number | null };
-  evalIdentity: { state: EvalIdentityState; lastProbe?: { state: EvalIdentityState; at: string } };
+  evalIdentity: { state: EvalIdentityState; lastProbe?: { state: EvalIdentityState; at: string } | null };
   trials: { today: number; dailyCap: number | null };
   jobs: EvalJobView[];
 };

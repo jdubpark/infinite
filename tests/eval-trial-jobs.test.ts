@@ -811,3 +811,22 @@ test("the job view says when the stored report is unreadable", () => {
     f.cleanup();
   }
 });
+
+test("an idle job past its expiry waits for its live trial to end", () => {
+  const f = fixture();
+  try {
+    const created = f.trial.create(PROJECT, request({ expiresAt: new Date(START + 3_600_000).toISOString() }), REQUEST_ONE);
+    assert.ok("job" in created);
+    const jobId = created.job.jobId;
+    const trialId = insertAt(f, jobId, 0);
+    f.jobs.control(jobId, "pause");
+    f.setClock(START + 3_600_000);
+    assert.equal(f.trial.expireIdle(), 0, "a running trial holds the job");
+    assert.equal(f.jobs.view(jobId)?.status, "paused");
+    voidTrial(f, trialId);
+    assert.equal(f.trial.expireIdle(), 1, "the job expires once the trial is final");
+    assert.equal(f.jobs.view(jobId)?.status, "expired");
+  } finally {
+    f.cleanup();
+  }
+});

@@ -75,7 +75,8 @@ const graderLine = (grader: EvalSummary["grader"]) =>
 function identityLine(identity: EvalSummary["evalIdentity"]): string {
   const state = `eval identity ${clean(identity.state)}`;
   if (identity.state !== "unavailable") return state;
-  if (identity.lastProbe === undefined) return `${state} (not probed)`;
+  if (identity.lastProbe === undefined) return state;
+  if (identity.lastProbe === null) return `${state} (not probed)`;
   return `${state} (last probe ${clean(identity.lastProbe.state)}, ${clean(identity.lastProbe.at)})`;
 }
 

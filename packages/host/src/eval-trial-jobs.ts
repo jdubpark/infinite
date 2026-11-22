@@ -281,7 +281,11 @@ export class TrialJobs {
     return this.store.read(db => db.all<EvalJobRow>(BASELINE_JOBS_SQL, "running", BASELINE_JOBS_MAX).map(row => row.job_id));
   }
 
-  /** Ends the paused and blocked trial jobs whose expiry has passed, so they stop holding their project's holdout groups. */
+  /**
+   * Ends the paused and blocked trial jobs whose expiry has passed, so they stop holding their project's holdout groups.
+   * A job with a trial that is still preparing, running, or grading waits: it expires on a later call, once that trial is final,
+   * so its report never leaves the trial out.
+   */
   expireIdle(): number {
     return this.store.write(tx => this.expireIdleIn(tx));
   }
@@ -292,6 +296,7 @@ export class TrialJobs {
     for (const status of ["paused", "blocked"]) {
       for (const row of tx.all<EvalJobRow>(BASELINE_JOBS_SQL, status, BASELINE_JOBS_MAX)) {
         if (Date.parse(row.expires_at) > Date.parse(at)) continue;
+        if (tx.get("SELECT 1 AS live FROM eval_trials WHERE job_id = ? AND state IN ('preparing', 'running', 'grading') LIMIT 1", row.job_id) !== undefined) continue;
         finish(tx, row.job_id, at, "expired", "expired");
         ended += 1;
       }

@@ -176,9 +176,10 @@ export class TrialPump {
   }
 
   /** For display: the scheduling state, plus the last probe when that state is `unavailable` and a probe has happened. */
-  identityStatus(): { state: EvalIdentityState; lastProbe?: { state: EvalIdentityState; at: string } } {
+  identityStatus(): { state: EvalIdentityState; lastProbe?: { state: EvalIdentityState; at: string } | null } {
     const state = this.identityState();
-    if (state !== "unavailable" || this.probed === undefined) return { state };
+    if (state !== "unavailable") return { state };
+    if (this.probed === undefined) return { state, lastProbe: null };
     return { state, lastProbe: { state: this.probed.probe.state, at: new Date(this.probed.at).toISOString() } };
   }
 

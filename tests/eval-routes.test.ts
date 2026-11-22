@@ -884,6 +884,7 @@ test("the summary carries the last identity probe only when the host passes one"
     };
     const lastProbe = { state: "misconfigured" as const, at: "2026-11-22T01:00:00.000Z" };
     assert.deepEqual(evalSummary(f.store, { ...input, evalIdentityLastProbe: lastProbe }).evalIdentity, { state: "unavailable", lastProbe });
+    assert.deepEqual(evalSummary(f.store, { ...input, evalIdentityLastProbe: null }).evalIdentity, { state: "unavailable", lastProbe: null });
     assert.deepEqual(evalSummary(f.store, input).evalIdentity, { state: "unavailable" });
   } finally {
     f.cleanup();

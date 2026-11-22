@@ -14,6 +14,7 @@ import { evalCorpusModule } from "../packages/host/src/eval-store.js";
 import { TrialJobs } from "../packages/host/src/eval-trial-jobs.js";
 import { TrialPump, type TrialTeams } from "../packages/host/src/eval-trial-pump.js";
 import { EVAL_TRIALS_MODULE, evalTrialsModule, finishTrial, insertTrial, startTrial } from "../packages/host/src/eval-trial-store.js";
+import { ComparisonPass } from "../packages/host/src/eval-comparison.js";
 import { EvalHost } from "../packages/host/src/eval-host.js";
 import type { CostLookup } from "../packages/host/src/outcome-cells.js";
 import { configRef, TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
@@ -513,7 +514,7 @@ test("the pump opens a comparison job", async () => {
 test("the identity status keeps the last probe once it has aged out", async t => {
   const r = rig({ probes: [{ state: "misconfigured" }] });
   try {
-    assert.deepEqual(r.pump.identityStatus(), { state: "unavailable" }, "no probe has happened");
+    assert.deepEqual(r.pump.identityStatus(), { state: "unavailable", lastProbe: null }, "no probe has happened");
     r.addJob();
     await r.pump.step();
     assert.equal(r.probeInputs.length, 1, "one probe");
@@ -545,6 +546,23 @@ test("the sweep ends an idle paused job past its expiry and leaves an unexpired 
     await r.pump.sweep();
     assert.equal(statusOf()?.status, "expired");
     assert.equal(statusOf()?.reason, "expired");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("the comparison step reports no job whose trial is still live after a sweep", async () => {
+  const r = rig();
+  try {
+    const jobId = r.addJob();
+    r.seed(jobId, 0, "running");
+    r.store.write(tx => {
+      tx.run("UPDATE eval_jobs SET status = 'paused', reason = 'owner', expires_at = ? WHERE job_id = ?", new Date(Date.parse(r.now()) - 1000).toISOString(), jobId);
+    });
+    await r.pump.sweep();
+    const row = r.store.read(db => db.get<{ status: string }>("SELECT status FROM eval_jobs WHERE job_id = ?", jobId));
+    assert.equal(row?.status, "paused");
+    assert.equal(new ComparisonPass({ store: r.store, config: r.config, now: r.now }).step(), "idle");
   } finally {
     r.cleanup();
   }

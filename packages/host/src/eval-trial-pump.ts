@@ -3,7 +3,7 @@ import { evalProxyUrl } from "./egress.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { Grader, GraderProbe } from "./eval-grader.js";
 import { type EvalIdentity, type EvalProbe, evalCanaries, repositoryUrl, stopEvalIdentity } from "./eval-identity.js";
-import { EVAL_MODULE, type CapturedPayload, type MinedPayload, type TrialEnding, type TrialConfiguration, type TrialGrade } from "./eval-types.js";
+import { EVAL_MODULE, TRIAL_ENDINGS, type CapturedPayload, type MinedPayload, type TrialEnding, type TrialConfiguration, type TrialGrade } from "./eval-types.js";
 import type { EvalIdentityState } from "./eval-types.js";
 import { type NextTrial, type TrialGates, type TrialJobs } from "./eval-trial-jobs.js";
 import { type TrialSettings } from "./eval-config.js";
@@ -249,7 +249,9 @@ export class TrialPump {
       return this.close(live, "void-host", state, stopped);
     }
     if (state.ending === "settled") return this.grade(live, state);
-    return this.close(live, state.ending ?? "void-host", state, stopped);
+    // A trial run never ends with a judge-only ending (judged, changed, mismatch). If one did, the trial is void, not graded.
+    const ending = TRIAL_ENDINGS.find(name => name === state.ending);
+    return this.close(live, ending ?? "void-host", state, stopped);
   }
 
   private seen(live: Live, state: ReplayState): void {

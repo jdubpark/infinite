@@ -6,7 +6,7 @@ import { evalProjectSchema, CANDIDATE_PROFILES_MAX } from "./eval-config.js";
 import type { TrialEnding } from "./eval-types.js";
 import { POINTS_ALGORITHM_VERSION, teamRoutingSchema } from "./routing-policy.js";
 import { intentCheckReportSchema } from "./intent-report.js";
-import { judgementReportSchema } from "./judge-types.js";
+import { judgementReportSchema, type Judgement, type JudgeEnding } from "./judge-types.js";
 import { criteriaRowsSchema, verdictReportSchema, type RunAssessment } from "./verdict-types.js";
 import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
 import type { RoutingKnobs, TeamRunRouting } from "./routing-types.js";
@@ -769,7 +769,7 @@ export interface TeamCheck {
   // with the run and reaches later members' context; a passed check keeps none.
   scan?: CheckScan;
 }
-export type ReplayLink = { jobId: string; trialId: string; purpose: "replay" | "gate"; ending?: TrialEnding; resultCommit?: string; resetsAt?: string };
+export type ReplayLink = { jobId: string; trialId: string; purpose: "replay" | "gate" | "duel"; ending?: TrialEnding | JudgeEnding; resultCommit?: string; resetsAt?: string; judgement?: Judgement; judgeMinutes?: number };
 export interface TeamRun {
   /** Set when the run was created with the blackboard tools switch on and a ready store. Absent means today's behaviour. */
   blackboard?: { tools: true };

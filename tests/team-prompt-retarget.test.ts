@@ -2,8 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
-  EARLIER_RULE_WITHOUT_ENTRY,
-  EARLIER_RULE_WITH_ENTRY,
   codexMemberToolInstructions,
   codexSandboxInstructions,
   contextAccessInstructions,
@@ -15,6 +13,7 @@ import {
   retargetPrompt,
   teamPrompt,
 } from "../packages/host/src/team-prompts.js";
+import { KNOWN_RULE_TEXTS } from "../packages/host/src/team-rule-texts.js";
 import { intentCheckerPrompt } from "../packages/host/src/intent-prompt.js";
 import type { TeamMember, TeamModelProfile } from "../packages/host/src/team-types.js";
 import { ENTRY_PROFILE, ENTRY_PROVIDERS, smallRun } from "./fixtures/team-prompt-run.js";
@@ -311,29 +310,50 @@ test("seeded retarget comparisons preserve quoted prompt evidence across every r
   }
 });
 
-test("the earlier working rule is kept as the bytes the earlier release wrote", () => {
-  // These are hashes of that release's own output, so an edit to a frozen form fails here instead of losing its prompts.
+const withEntryTools = (rule: string) => rule.includes("entry_list");
+
+test("the known working rule texts are kept as the bytes a release wrote", () => {
+  // These are hashes of each release's own output, so an edit to an entry fails here instead of losing its prompts.
   const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
-  assert.equal(sha256(EARLIER_RULE_WITHOUT_ENTRY), "77d618fea6ee839cec3d9641f560e0ce2749985fc0330a1463b38c75470833b5");
-  assert.equal(sha256(EARLIER_RULE_WITH_ENTRY), "7595d799220ed280b9f93aacd694e6362570b107e7bb19ac814a8c431ae4ac10");
+  const pinned = [
+    "77d618fea6ee839cec3d9641f560e0ce2749985fc0330a1463b38c75470833b5",
+    "7595d799220ed280b9f93aacd694e6362570b107e7bb19ac814a8c431ae4ac10",
+    "e6ff71704aae9e01b8e94482cd8f49b02fd685de11b68cb863b6129f14888887",
+    "6896da1485bc8ccbafa98bc08d6a3f27eaf54884f17acdb68c4e725ff0845bab",
+  ];
+  const message = "KNOWN_RULE_TEXTS is append-only: an existing entry is never edited or removed, and a new text is appended with its hash here.";
+  assert.equal(KNOWN_RULE_TEXTS.length, pinned.length, message);
+  assert.deepEqual(KNOWN_RULE_TEXTS.map(sha256), pinned, message);
 });
 
-test("a prompt written by the earlier release is retargeted to one current working rule", () => {
+test("the generated working rule is one of the known rule texts", () => {
+  for (const entryTools of [false, true]) {
+    assert.ok(
+      KNOWN_RULE_TEXTS.includes(codexMemberToolInstructions(entryTools)),
+      `entryTools ${entryTools}: append the new generated text to KNOWN_RULE_TEXTS in packages/host/src/team-rule-texts.ts and its hash to the pin in this file, and leave the earlier entries in place.`,
+    );
+  }
+});
+
+test("a prompt written by any known release is retargeted to one current working rule", () => {
   const codexProfile = { ...ENTRY_PROFILE, provider: "codex" as const };
   for (const entryTools of [false, true]) {
     const current = codexMemberToolInstructions(entryTools);
-    const earlier = entryTools ? EARLIER_RULE_WITH_ENTRY : EARLIER_RULE_WITHOUT_ENTRY;
+    const earlierTexts = KNOWN_RULE_TEXTS.filter((rule) => withEntryTools(rule) === entryTools && rule !== current);
+    assert.ok(earlierTexts.length > 0, `entryTools ${entryTools} has an earlier known text`);
     const prompt = teamPrompt(smallRun(entryTools ? { blackboard: { tools: true } } : {}), "implementer", undefined, undefined, "codex", codexProfile);
     assert.equal(prompt.split(current).length - 1, 1, `entryTools ${entryTools} current prompt carries the rule once`);
-    const carried = prompt.replace(current, earlier);
-    assert.notEqual(carried, prompt);
-    const codex = retargetPrompt(carried, { provider: "codex", profile: codexProfile, role: "implementer", entryTools });
-    assert.equal(codex, prompt, `entryTools ${entryTools} the earlier rule is replaced by the current one`);
-    assert.equal(codex!.split(current).length - 1, 1);
-    assert.equal(codex!.includes(earlier), false);
-    const claude = retargetPrompt(codex!, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools });
-    assert.ok(claude);
-    assert.equal(claude.includes(current), false, `entryTools ${entryTools} no Codex rule reaches Claude`);
-    assert.equal(claude.includes(earlier), false);
+    for (const earlier of earlierTexts) {
+      const carried = prompt.replace(current, earlier);
+      assert.notEqual(carried, prompt);
+      const codex = retargetPrompt(carried, { provider: "codex", profile: codexProfile, role: "implementer", entryTools });
+      assert.equal(codex, prompt, `entryTools ${entryTools} a known rule is replaced by the current one`);
+      assert.equal(codex!.split(current).length - 1, 1);
+      assert.equal(codex!.includes(earlier), false);
+      const claude = retargetPrompt(codex!, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools });
+      assert.ok(claude);
+      assert.equal(claude.includes(current), false, `entryTools ${entryTools} no Codex rule reaches Claude`);
+      assert.equal(claude.includes(earlier), false);
+    }
   }
 });

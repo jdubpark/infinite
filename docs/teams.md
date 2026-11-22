@@ -2469,6 +2469,8 @@ Observations are grouped into an episode held in the worker. An episode starts a
 - A limit seen in any session, team member or not, updates the host-level entry. Nothing else happens to a non-team session.
 - Clients show the entry on the Teams list and the observation on session rows. Reset times are the provider's own statement, and a missing time means the provider gave none.
 
+The Codex working rule in a member prompt is recognised by exact text, so a retarget after a limit can find it. `packages/host/src/team-rule-texts.ts` lists every rule text a release has written; the list is append-only. When a member tool schema changes, the generated rule changes with it, and `tests/team-prompt-retarget.test.ts` fails until the new text is appended to the list and its hash to the pin.
+
 ### What the host never does
 
 - It never sends input to a limited member, answers a provider dialog, or enters credentials. Stopping the member is the only action.

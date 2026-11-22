@@ -266,6 +266,26 @@ async function trialSequence(r: Rig): Promise<string[]> {
   return r.log;
 }
 
+test("a finish that fails once does not stall the calibration", async () => {
+  const r = makeRig();
+  try {
+    const id = calibrate(r);
+    const finish = r.judgements.finish.bind(r.judgements);
+    let failures = 1;
+    r.judgements.finish = (judgementId, outcome) => {
+      if (failures-- > 0) throw new Error("store busy");
+      return finish(judgementId, outcome);
+    };
+    await until(r, () => finalCount(r, id) >= 2, 60);
+    const first = rowsOf(r, id).find(row => row.pairIndex === 0 && row.ordering === 0 && row.attempt === 0);
+    assert.equal(first?.state, "final", "the row the failed finish left live is ended");
+    assert.equal(first?.ending, "void-host", "by the start-up, as a host failure");
+    assert.ok(finalCount(r, id) >= 2, "the calibration goes on");
+  } finally {
+    r.close();
+  }
+});
+
 test("a pump with no calibration runs trials as before", async () => {
   const r = makeRig({ judgements: false });
   try {

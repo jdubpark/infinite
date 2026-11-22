@@ -638,7 +638,9 @@ export class TrialPump {
     try {
       this.options.judgements?.finish(live.judgementId, { ending: final, sessionId, ...(judgement === undefined ? {} : { judgement }) });
     } catch {
-      // A row that could not be recorded is voided by the next start-up.
+      // The row stays live and would hold every later judgement. The next step runs the start-up again, which voids it.
+      this.started = false;
+      this.dirty = true;
     }
     await this.cleanAfterJudgement();
     await this.options.teams().forgetReplay(live.judgementId).catch(() => false);

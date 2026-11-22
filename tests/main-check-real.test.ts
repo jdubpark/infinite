@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -126,7 +126,7 @@ class Sandbox {
     }
   }
 
-  /** The pid a long command wrote; such a command is `sh` replaced by `sleep`, so the pid is the sleep's. */
+  /** The pid a long command wrote: the sleep's, whether `sh` became the sleep or left it behind. */
   pid(): number | undefined {
     if (!existsSync(this.pidFile)) return undefined;
     const pid = Number.parseInt(readFileSync(this.pidFile, "utf8"), 10);
@@ -139,7 +139,8 @@ class Sandbox {
     await this.service?.close();
     const pid = this.pid();
     if (pid !== undefined && !gone(pid)) {
-      try { process.kill(-pid, "SIGKILL"); } catch { /* Already gone. */ }
+      try { process.kill(-pid, "SIGKILL"); } catch { /* Not a group leader, or already gone. */ }
+      try { process.kill(pid, "SIGKILL"); } catch { /* Already gone. */ }
     }
     rmSync(this.base, { recursive: true, force: true });
   }
@@ -353,6 +354,38 @@ test("h. close during a real long command finishes it as host-stop within the bo
     sandbox.halted = true;
     await sandbox.start();
     await sandbox.until("retirement", () => sandbox.view().retiring === 0);
+    assert.deepEqual(sandbox.runDirectories(), []);
+  } finally {
+    await sandbox.dispose();
+  }
+});
+
+test("i. a check that leaves a real sleep behind passes when its leader exits; the sleep is never signalled, and its directory retires after it", CASE, async t => {
+  const sandbox = new Sandbox({ "tracked.txt": "one\n" }, s => [sh(`sleep 4 & echo $! > '${s.pidFile}'; exit 0`)]);
+  try {
+    await sandbox.start();
+    sandbox.fetch();
+    await sandbox.until("the result", () => sandbox.view().last !== undefined);
+    const pid = sandbox.pid()!;
+    // The leader wrote the pid as it started the sleep.
+    const spawned = statSync(sandbox.pidFile).mtimeMs;
+    const took = Date.now() - spawned;
+    assert.equal(gone(pid), false, `the result came ${took} ms after the sleep started, once it had ended: the check waited for its leftover`);
+    assert.ok(took < 3_500, `the result came ${took} ms after the sleep started`);
+    const view = sandbox.view();
+    assert.equal(view.last?.outcome, "passed");
+    assert.deepEqual(view.last?.commands.map(command => [command.status, command.exitCode]), [["passed", 0]]);
+    assert.equal(view.results[0]?.outcome, "passed");
+    await sandbox.until("the entry waiting on the sleep", () => sandbox.view().retiring === 1 && sandbox.view().waiting === "processes", "alpha");
+    assert.equal(gone(pid), false, "the census found the sleep while it lives");
+    assert.deepEqual(sandbox.runDirectories().length, 1, "the copy stays while the sleep lives");
+    // A halt now has nothing of this check to stop, and signals nothing.
+    sandbox.halted = true;
+    await sandbox.until("the sleep's own exit", () => gone(pid), "alpha");
+    const lived = Date.now() - spawned;
+    t.diagnostic(`result ${took} ms after the sleep started; the sleep lived about ${lived} ms`);
+    assert.ok(lived >= 3_500, `the sleep ended ${lived} ms after it started, before its 4 seconds`);
+    await sandbox.until("retirement", () => sandbox.view().retiring === 0, "alpha");
     assert.deepEqual(sandbox.runDirectories(), []);
   } finally {
     await sandbox.dispose();

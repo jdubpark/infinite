@@ -15,10 +15,14 @@ export type { MainCheckPorts } from "./main-check-ports.js";
 /*
  * Main check (INF-388, slice 1 of INF-346): the host runs a project's configured setup and checks at the newest head
  * its mirror received for the base branch, in a disposable copy, as the agent account, and offers one notice when
- * main's health changes. It starts no agent and records no project signal. It ends the commands it started when a
- * halt engages, a command reaches its time limit or the host stops; it never kills a process a check left behind,
- * and waits for a clean census before it removes the copy. The rules are pure functions in main-check-state.ts;
- * this service applies them, and every side effect goes through `ports`.
+ * main's health changes. It starts no agent and records no project signal.
+ * A command ends with its leader. A halt, a command's time limit or the host stop kills the process group of a command
+ * whose leader still runs. Once the leader exited, nothing is signalled: the command settles when its pipes close or
+ * a second later, with the leader's exit code, and a stop in that second ends it at once. This holds for setup, the
+ * checks and the Git helpers of the copy alike. Whatever still runs after a command is a leftover: the witness holds
+ * it when it stayed in the command's session or group or was seen as a descendant, the census finds it there or by
+ * the copy's path, the entry waits on `processes`, and the copy is removed only after a clean census.
+ * The rules are pure functions in main-check-state.ts; this service applies them, and every side effect goes through `ports`.
  * Every record change is one synchronous write of the whole record, and memory follows only a write that landed.
  */
 
@@ -531,6 +535,8 @@ export class MainCheckService {
       const failures = status === "passed" ? [] : scanner.finish().failures.slice(0, MAX_FAILURES).map(failure => failure.detail ? `${failure.line}\n${failure.detail}` : failure.line);
       active.commands.push({ ...structuredClone(step), status, exitCode: result.exitCode, ...(failures.length ? { failures } : {}) });
       if (status === "interrupted") return { outcome: "interrupted", reason: active.stopReason ?? "time-limit" };
+      // A stop that came after the leader's exit ended the command without a signal; the check still ends here.
+      if (active.stopReason) return { outcome: "interrupted", reason: active.stopReason };
       try { await this.ports.assertClean(workspace, active.head, prefix, signal, step.phase); }
       catch { return { outcome: "error", reason: "copy-changed" }; }
       if (status === "failed") return { outcome: "failed" };
@@ -627,6 +633,8 @@ export class MainCheckService {
           .then(() => this.commandSettled(active))
           .catch(() => undefined);
       },
+      // A command, setup and checks and the Git helpers alike, ends with its leader: nothing it left behind is signalled.
+      endsWithLeader: true,
     };
   }
 

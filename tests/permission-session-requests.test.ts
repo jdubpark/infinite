@@ -318,16 +318,49 @@ test("a prompt the owner submits while a request is decided leaves the dialog wi
     const live = h.add("s", "covered");
     const target = (await h.service.target("s"))!;
     assert.equal((await target.check()).ok, true);
-    assert.equal((await target.check()).ok, true, "reading the task again changes nothing");
-    // The owner narrows the task while the review runs. The verdict was reached for the earlier task text.
-    live.events.push({ seq: 1, at: "t", type: "input-result", data: { requestId: "i1", state: "delivered", message: "Do not run the tests against the shared database" } });
-    assert.deepEqual(await target.check(), { ok: false, stale: false, reason: "The session's task changed after the request was read." });
+    assert.equal((await target.check()).ok, true, "reading the record again changes nothing");
+    // Agent output and an input without owner text are not a prompt.
+    live.events.push({ seq: 2, at: "t", type: "output", data: { text: "AGENT OUTPUT" } }, { seq: 3, at: "t", type: "input-result", data: { requestId: "i0", state: "delivered" } });
+    assert.equal((await target.check()).ok, true);
+    // The owner narrows the task while the review runs. The verdict was reached for the earlier task.
+    live.events.push({ seq: 4, at: "t", type: "input-result", data: { requestId: "i1", state: "delivered", message: "Do not run the tests against the shared database" } });
+    assert.deepEqual(await target.check(), { ok: false, stale: false, reason: "The owner submitted a prompt after the request was read." });
     assert.equal(await target.answer(0, "decision-1"), "refused");
     assert.equal(h.answered.length, 0);
-    // A request built now carries the new task text and passes its own check.
+    // A request built now carries the new prompt and passes its own check.
     const next = (await h.service.target("s"))!;
     assert.match(next.request.requester.task.text, /shared database/);
     assert.equal((await next.check()).ok, true);
+  } finally { h.close(); }
+});
+
+test("a long session record with no new owner prompt never withholds a delivery", async () => {
+  const h = harness({ delivery: new FakeDelivery(() => new Promise(() => {})) });
+  try {
+    // More output than one bounded read of the task covers, as after an API restart of a long session.
+    for (const total of [3_000, 3_500, 7_000]) {
+      const events: Event[] = Array.from({ length: total }, (_, i) => i === 5
+        ? { seq: i + 1, at: "t", type: "input-result", data: { requestId: "i1", state: "delivered", message: "An early owner prompt" } }
+        : { seq: i + 1, at: "t", type: "output", data: { text: "x" } });
+      const id = `long-${total}`;
+      const live = h.add(id, "covered", {}, permissionPrompt(1), events);
+      live.state.seq = total;
+      const target = (await h.service.target(id))!;
+      for (let read = 0; read < 3; read++) assert.equal((await target.check()).ok, true, `${total} events, check ${read + 1}`);
+      live.events.push({ seq: total + 1, at: "t", type: "input-result", data: { requestId: "i2", state: "delivered", message: "A later owner prompt" } });
+      assert.equal((await target.check()).ok, false);
+    }
+  } finally { h.close(); }
+});
+
+test("a session record that cannot be read to its end withholds a delivery", async () => {
+  const h = harness({ delivery: new FakeDelivery(() => new Promise(() => {})) });
+  try {
+    const live = h.add("s", "covered");
+    const target = (await h.service.target("s"))!;
+    // More new record than the bounded read covers before a delivery.
+    for (let seq = 2; seq <= 4_000; seq++) live.events.push({ seq, at: "t", type: "output", data: { text: "x" } });
+    assert.deepEqual(await target.check(), { ok: false, stale: false, reason: "The session record could not be read to its end." });
   } finally { h.close(); }
 });
 

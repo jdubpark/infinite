@@ -2844,9 +2844,12 @@ Each request passes these steps in order:
    verdict recorded for the earlier reading answers it. The host reads the
    request again immediately before a delivery and withholds the answer when
    the reading changed while the review ran. The task is read again there
-   too: a session's owner prompts, or a team member's run objective and task
-   instructions, that differ from the ones the request was handed with keep
-   the dialog with the owner. A pending dialog is not handed to the
+   too. A prompt that the owner submitted to a session after the request was
+   read keeps the dialog with the owner, and so does a session record that
+   cannot be read to its end. A team member's answer is withheld when the run
+   objective or the task instructions differ from the ones the request was
+   handed with; the dialog is then handed again and decided for the new task.
+   A run that the host renamed is the same task. A pending dialog is not handed to the
    agent again only because its reading changed. A recorded allow answers a
    second attempt at the same dialog only while a new identical request would
    replay the same verdict: a lock of the assignment, an open effect reject of

@@ -810,8 +810,15 @@ test("the resume check confirms an owner's allow only without a halt, while its 
 test("the resume check reads the resumed call again, with the task as it is now", async () => {
   const seen: Array<PermissionRequest | undefined> = [];
   let applies = true;
-  const h = hostRig(fakePipeline({ applicable: (_id, request) => { seen.push(request); return applies; } }).pipeline);
+  const fake = fakePipeline({ applicable: (_id, request) => { seen.push(request); return applies; } });
+  const h = hostRig(fake.pipeline);
   try {
+    // The class check of a call and the resume check of the same call build one request, whatever else the worker's
+    // call object carries, so the pipeline gives both the same decision id.
+    await h.ask({ op: "class", call: { ...bash("deploy production", "toolu_8"), nativeSessionId: "native-1" } });
+    const first = randomUUID();
+    await h.ask({ op: "resume", sessionRoot: h.session.cwd, decisionId: first, deliveryKey: deliveryKey(h.key, h.session.id, first), call: { ...bash("deploy production", "toolu_8"), nativeSessionId: "native-2" } });
+    assert.deepEqual(seen.at(-1), fake.decided.at(-1));
     const decisionId = randomUUID();
     const resume = (extra: Record<string, unknown> = {}) =>
       h.ask({ op: "resume", sessionRoot: h.session.cwd, decisionId, deliveryKey: deliveryKey(h.key, h.session.id, decisionId), ...extra });
@@ -835,7 +842,7 @@ test("the resume check reads the resumed call again, with the task as it is now"
 
 test("a verdict is withheld when the session's task changed while the call was decided", async () => {
   let rig: ReturnType<typeof hostRig>;
-  const changing = fakePipeline({ decide: async () => { rig.session.title = "Another task"; return { kind: "allow", decisionId: randomUUID(), strongTier: false }; } });
+  const changing = fakePipeline({ decide: async () => { rig.session.initialPrompt = "do something else"; return { kind: "allow", decisionId: randomUUID(), strongTier: false }; } });
   const h = rig = hostRig(changing.pipeline);
   try {
     assert.deepEqual(await h.ask({ op: "decide", call: bash("make safe-build"), requestId: `headless:${h.session.id}:toolu_1` }), { result: "not-served" });

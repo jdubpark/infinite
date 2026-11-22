@@ -104,7 +104,7 @@ export type TeamTargetDeps = {
   sessionRoot(): string;
   /** The delivery role's pinned policy and host checks. Throws when they no longer hold. */
   roleCheck?(): Promise<void>;
-  /** The member's task as the run holds it now. A task that differs from the request's keeps the dialog with the owner. */
+  /** The member's task as the run holds it now. A text that differs from the request's withholds the answer. */
   task?(): { title: string; text: string } | undefined;
   /** Collects the member's current workspace evidence with today's bounded collection. */
   workspace(): Promise<TeamWorkspaceEvidence>;
@@ -156,13 +156,6 @@ export function teamPermissionTarget(request: PermissionRequest, deps: TeamTarge
       try { root = deps.sessionRoot(); }
       catch { return fail(true, "The member's workspace could not be verified."); }
       if (root !== request.requester.sessionRoot) return fail(true, "The member's working directory changed.");
-      if (deps.task) {
-        // The verdict was reached for the task the request was handed with.
-        let task: { title: string; text: string } | undefined;
-        try { task = deps.task(); } catch { task = undefined; }
-        if (!task || task.title !== request.requester.task.title || task.text !== request.requester.task.text)
-          return fail(false, "The member's task changed after the request was read.");
-      }
       if (deps.roleCheck) {
         try { await deps.roleCheck(); }
         catch { return fail(false, "The delivery policy, reviewed head, or required checks are no longer current."); }
@@ -186,6 +179,9 @@ export function teamPermissionTarget(request: PermissionRequest, deps: TeamTarge
         if (state.attention.state !== "needs-you" || !live || live.id !== prompt.id || live.hash !== prompt.hash ||
             permissionEvidenceHash(live) !== permissionEvidenceHash(prompt))
           return fail(true, "The permission dialog changed or closed.");
+        // The verdict was reached for the task the request was handed with. The title is left out: the host renames a
+        // run on its own, and that is no change of the task.
+        if (deps.task && deps.task()?.text !== request.requester.task.text) return fail(false, "The member's task changed after the request was read.");
         const accept = agentAcceptOption(live), reject = oneShotRejectOption(live);
         return { ok: true as const, ...(accept === undefined ? {} : { accept }), ...(reject === undefined ? {} : { reject }) };
       } catch { return fail(true, "The member session could not be verified."); }

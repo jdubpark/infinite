@@ -390,13 +390,14 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
       pipeline.recordDelivery(outcome.decisionId, "refusal", "Headless: a call that the rules left open cannot wait for the owner; it was denied with needs-owner.");
       return { result: "deny", code: "needs-owner", notice: requesterNotice("needs-owner"), ...issued, interruptClass: outcome.interruptClass };
     }
-    // The live checks before a verdict is returned, an allow or a reject. A team member's run and the task are read
-    // again here: the verdict was reached for the task the request was built with.
+    // The live checks before a verdict is returned, an allow or a reject. A team member's run and the task text are
+    // read again here: the verdict was reached for the task the request was built with. The title is left out, because
+    // the host renames a run on its own.
     const live = (() => {
       try {
         const now = this.options.sessions.meta(session.id).session;
         const again = headlessTask(now, this.options.teamTask);
-        return realpathSync(now.cwd) === built.requester.sessionRoot && again?.title === task.title && again.text === task.text &&
+        return realpathSync(now.cwd) === built.requester.sessionRoot && again?.text === task.text &&
           this.teamServed(session) && pipeline.applicable(outcome.decisionId, built);
       } catch { return false; }
     })();

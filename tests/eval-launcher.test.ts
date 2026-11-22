@@ -2,20 +2,39 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomInt } from "node:crypto";
-import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// The launcher runs only as copies whose ROOT, ACCOUNT, EVAL_HOME, TEMPLATE, and STOP_DIRS lines are rewritten, as the
-// current user. The installed file is never run here. `stop` ends every process of the account and deletes its
-// temporary files, so in every copy its kill line becomes `exit 99`: a broken account check fails a test instead of
-// ending the test runner's processes. The one test that runs `stop` to the end replaces the kill line with a no-op
-// and narrows STOP_DIRS to one directory. Every test skips on a platform other than Linux, and when the test runs as root.
+// The launcher runs only as copies whose ROOT, ACCOUNT, EVAL_HOME, TEMPLATE, EVAL_TMP, and STOP_DIRS lines are
+// rewritten, as the current user. Every rewrite must match the installed file exactly as often as expected, so a
+// launcher line that moves fails the test instead of leaving an installed value in a copy. The installed file is
+// never run here. `stop` ends every process of the account and deletes its temporary files, so in every copy its
+// kill line becomes `exit 99`: a broken account check fails a test instead of ending the test runner's processes.
+// The one test that runs `stop` to the end replaces the kill line, and the one-second wait after it, with a no-op
+// and narrows STOP_DIRS to one directory. Every test but the installed-file check skips on a platform other than
+// Linux, and when the test runs as root.
+//
+// The test user may be a busy account, so two more rewrites keep its own state out of the copies:
+// - The installed launcher caps a trial's command with `prlimit --nproc=512`. On Linux that cap counts every thread
+//   the real user owns, so a user that already owns 512 threads cannot fork. The copy drops the cap, and prlimit then
+//   leaves the process limit alone. A larger cap would not do: a value above the user's hard limit fails with EPERM.
+//   The other prlimit caps stay. The installed file's own test checks, on every platform, that the prlimit command
+//   line still carries the cap.
+// - The launcher counts and removes the account's System V objects, which it reads from the kernel's tables. A copy
+//   reads tables of its own that hold the kernel's header line and no object, so a test never counts what the user
+//   owned before it. Two copies keep the kernel's tables: one that only probes, and the one that runs `stop` to the
+//   end. The `stop` test skips when the user already owns something that `stop` would remove. That decision is made
+//   by `ownSysV` and `ownEntries` below, which read the kernel and the directory without the launcher, so a
+//   launcher whose probe and `stop` disagree cannot let `stop` run against the user's own state.
 const LAUNCHER = fileURLToPath(new URL("../deploy/ubuntu/eval-command.sh", import.meta.url));
 const SKIP = process.platform !== "linux" ? "the launcher runs on Linux only"
   : process.getuid?.() === 0 ? "the launcher test must not run as root" : false;
 const TRIAL = "11111111-2222-4333-8444-555555555555";
+// The cap as the launcher's prlimit command line carries it. The same text in a comment does not match.
+const NPROC_CAP = /^( {2}\/usr\/bin\/prlimit )--nproc=512 /m;
+const IPC_TABLE = /ipc_table=\/proc\/sysvipc\/(shm|sem|msg)\b/g;
 // The fixed environment of exec and setup, sorted as the tests compare it.
 const FIXED = [
   "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT",
@@ -24,8 +43,19 @@ const FIXED = [
 const PROXY = ["HTTPS_PROXY", "HTTP_PROXY", "NODE_USE_ENV_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"];
 
 type Sandbox = { dir: string; root: string; home: string; template: string; tmp: string; script: string };
+// `stop` names the one directory of a copy that runs stop to the end. `kernelTables` keeps the kernel's System V
+// tables in a copy that only probes.
+type Copy = { stop?: string; kernelTables?: boolean };
 
-function sandbox(account: string = userInfo().username, stopDirs?: string): Sandbox {
+// Replaces every match of a pattern, which must match exactly `count` times.
+function rewrite(text: string, pattern: RegExp, to: (...match: string[]) => string, count = 1): string {
+  const all = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
+  assert.equal(text.match(all)?.length ?? 0, count, `the launcher's text for ${pattern} moved; move this rewrite with it`);
+  return text.replace(all, to);
+}
+
+function sandbox(account: string = userInfo().username, copy: Copy = {}): Sandbox {
+  const kernelTables = copy.kernelTables === true || copy.stop !== undefined;
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "eval-launcher-")));
   const root = join(dir, "root");
   const home = join(dir, "home");
@@ -42,18 +72,22 @@ function sandbox(account: string = userInfo().username, stopDirs?: string): Sand
   mkdirSync(template, { mode: 0o755 });
   const script = join(dir, "eval-command.sh");
   const source = readFileSync(LAUNCHER, "utf8");
-  const kill = /^ {2}kill -KILL -1 .*$/m;
-  assert.equal(source.match(new RegExp(kill.source, "gm"))?.length, 1, "the launcher's kill line moved; move this guard with it");
-  const text = source
-    .replace(/^ROOT=.*$/m, `ROOT='${root}'`)
-    .replace(/^ACCOUNT=.*$/m, `ACCOUNT='${account}'`)
-    .replace(/^EVAL_HOME=.*$/m, `EVAL_HOME='${home}'`)
-    .replace(/^TEMPLATE=.*$/m, `TEMPLATE='${template}'`)
-    .replace(/^EVAL_TMP=.*$/m, `EVAL_TMP='${tmp}'`)
-    .replace(/^STOP_DIRS=.*$/m, `STOP_DIRS='${stopDirs ?? shared}'`)
-    .replace(kill, stopDirs ? "  :" : "  exit 99");
-  assert.match(text, stopDirs ? /^ {2}:$/m : /^ {2}exit 99$/m, "the kill line was not replaced");
+  const tables = join(dir, "sysvipc");
+  mkdirSync(tables, { mode: 0o700 });
+  for (const name of ["shm", "sem", "msg"]) writeFileSync(join(tables, name), `${readFileSync(`/proc/sysvipc/${name}`, "utf8").split("\n", 1)[0]}\n`);
+  let text = source;
+  for (const [name, value] of Object.entries({ ROOT: root, ACCOUNT: account, EVAL_HOME: home, TEMPLATE: template, EVAL_TMP: tmp, STOP_DIRS: copy.stop ?? shared })) {
+    text = rewrite(text, new RegExp(`^${name}=.*$`, "m"), () => `${name}='${value}'`);
+  }
+  // The kill line and the one-second wait after it, as one match.
+  text = rewrite(text, /^ {2}kill -KILL -1 .*\n {2}\/usr\/bin\/sleep 1$/m, () => copy.stop ? "  :" : "  exit 99");
+  text = rewrite(text, NPROC_CAP, (_line, command) => command);
+  text = rewrite(text, IPC_TABLE, (line, name) => kernelTables ? line : `ipc_table='${join(tables, name)}'`, 3);
+  assert.match(text, copy.stop ? /^ {2}:$/m : /^ {2}exit 99$/m, "the kill line was not replaced");
   assert.doesNotMatch(text, /kill -KILL -1/);
+  assert.doesNotMatch(text, /^ {2}\/usr\/bin\/sleep 1$/m, "the wait after the kill line was not replaced");
+  assert.doesNotMatch(text, /--nproc=/);
+  assert.equal(text.includes("/proc/sysvipc/"), kernelTables, "only a copy that asks for the kernel's tables reads them");
   writeFileSync(script, text, { mode: 0o700 });
   chmodSync(script, 0o700);
   return { dir, root, home, template, tmp, script };
@@ -130,12 +164,53 @@ function leftovers(sb: Sandbox): number {
   return JSON.parse(probe.stdout.toString("utf8")).leftovers;
 }
 
+// The test user's System V objects, read from the kernel's tables without the launcher: every row that names the
+// user as owner or as creator, as `table:id`.
+function ownSysV(): string[] {
+  const uid = String(process.getuid?.());
+  const own: string[] = [];
+  for (const name of ["shm", "sem", "msg"]) {
+    const [header = [], ...rows] = readFileSync(`/proc/sysvipc/${name}`, "utf8").split("\n").filter(line => line.trim()).map(line => line.trim().split(/\s+/));
+    const owner = header.indexOf("uid"), creator = header.indexOf("cuid");
+    assert.ok(owner > 1 && creator > owner, `/proc/sysvipc/${name} has no uid and cuid columns`);
+    for (const row of rows) if (row[owner] === uid || row[creator] === uid) own.push(`${name}:${row[1]}`);
+  }
+  return own.sort();
+}
+
+// The entries the test user owns under a directory, on the directory's own file system, found without the launcher.
+// A directory that cannot be read is passed over, as the launcher's find passes over it.
+function ownEntries(dir: string): string[] {
+  const uid = process.getuid?.();
+  const own: string[] = [];
+  let device: number;
+  try { device = lstatSync(dir).dev; } catch { return own; }
+  const walk = (at: string): void => {
+    let names: string[] = [];
+    try { names = readdirSync(at); } catch { return; }
+    for (const name of names) {
+      const path = join(at, name);
+      let entry;
+      try { entry = lstatSync(path); } catch { continue; }
+      if (entry.uid === uid) own.push(path);
+      if (entry.isDirectory() && entry.dev === device) walk(path);
+    }
+  };
+  walk(dir);
+  return own.sort();
+}
+
 function writeTree(base: string, files: Record<string, string>): void {
   for (const [name, text] of Object.entries(files)) {
     mkdirSync(dirname(join(base, name)), { recursive: true });
     writeFileSync(join(base, name), text);
   }
 }
+
+test("the installed launcher keeps its process cap", () => {
+  const source = readFileSync(LAUNCHER, "utf8");
+  assert.equal(source.match(new RegExp(NPROC_CAP.source, "gm"))?.length, 1, "the installed launcher's prlimit command must still cap a trial's command with --nproc=512");
+});
 
 test("the eval launcher starts commands with a fixed environment", { skip: SKIP }, () => {
   const sb = sandbox();
@@ -333,37 +408,74 @@ test("stop refuses another account", { skip: SKIP }, async () => {
   }
 });
 
-test("stop removes the account's System V objects and its files in the added directories", { skip: SKIP || !["ipcs", "ipcrm", "ipcmk"].every(tool => existsSync(`/usr/bin/${tool}`)) && "util-linux ipcs, ipcrm, and ipcmk are missing" }, t => {
+test("stop removes the account's System V objects and its files in the added directories", { skip: SKIP || !["ipcrm", "ipcmk"].every(tool => existsSync(`/usr/bin/${tool}`)) && "util-linux ipcrm and ipcmk are missing" }, t => {
   // The launcher's own list names the directories the review found, and each is used only when it exists.
   const listed = readFileSync(LAUNCHER, "utf8").match(/^STOP_DIRS="([^"]*)"$/m)?.[1].split(" ") ?? [];
   for (const dir of ["/tmp", "/var/tmp", "/dev/shm", "/dev/mqueue", "/run/lock", "/var/crash"]) assert.ok(listed.includes(dir), `${dir} is in STOP_DIRS`);
 
-  const sb = sandbox(undefined, "/run/lock");
+  const sb = sandbox(undefined, { stop: "/run/lock" });
   const lockFile = join("/run/lock", `eval-launcher-test-${process.pid}`);
-  let segment = "";
+  let segment = "", created = false;
   try {
+    // This copy's stop removes every System V object of the test user and every entry it owns in /run/lock, so it
+    // runs only when the user owns none. The test counts them itself: the launcher's probe is under test here, and
+    // must not decide whether its own stop runs.
+    const before = [...ownSysV(), ...ownEntries("/run/lock")];
+    if (before.length > 0) { t.skip(`the test user already owns ${before.length} System V objects or entries in /run/lock, and stop would remove them`); return; }
+    assert.equal(leftovers(sb), 0, "the probe counts nothing for a user that owns nothing");
     let writable = true;
     try { accessSync("/run/lock", constants.W_OK); } catch { writable = false; }
-    if (writable) writeFileSync(lockFile, "x");
+    // `wx` fails on a file that already exists, so the test never takes over, and later removes, a file it did not
+    // make. Nothing is written, so no failed write can leave a file that cleanup does not know about.
+    if (writable) { closeSync(openSync(lockFile, "wx")); created = true; }
     else t.diagnostic("/run/lock is not writable by the test user, so the file in it is not asserted");
     const made = spawnSync("/usr/bin/ipcmk", ["-M", "4096"], { encoding: "utf8" });
     assert.equal(made.status, 0, made.stderr);
     segment = /(\d+)\s*$/m.exec(made.stdout)?.[1] ?? "";
     assert.match(segment, /^\d+$/, `ipcmk printed no id: ${made.stdout}`);
-    const listing = () => spawnSync("/usr/bin/ipcs", ["-m"], { encoding: "utf8" }).stdout.split("\n").map(line => line.trim().split(/\s+/));
-    const present = () => listing().some(fields => fields[0]?.startsWith("0x") && fields[1] === segment);
-    assert.equal(present(), true, "the segment exists before stop");
     // The probe reports the segment, and the file when there is one, as leftovers.
-    assert.ok(leftovers(sb) >= (writable ? 2 : 1), "the probe counts the account's shared memory and its file");
+    assert.equal(leftovers(sb), writable ? 2 : 1, "the probe counts the account's shared memory and its file, and nothing else");
+    // The last look before stop, again without the launcher: the user owns what the test made and nothing else. From
+    // here to the removal the copy starts a shell and a few commands and reads the tables, with no wait, so stop can
+    // take only an object that some other process of the user makes in that short time.
+    assert.deepEqual(ownSysV(), [`shm:${segment}`], "the user owns the test's segment and no other System V object");
+    assert.deepEqual(ownEntries("/run/lock"), writable ? [lockFile] : [], "the user owns the test's file in /run/lock and nothing else there");
 
     const stopped = run(sb, ["stop"]);
     assert.equal(stopped.status, 0, stopped.stderr.toString("utf8"));
-    assert.equal(present(), false, "stop removed the segment");
+    assert.deepEqual(ownSysV(), [], "stop removed the segment");
+    segment = "";
     assert.equal(existsSync(lockFile), false, "stop removed the file");
     assert.equal(leftovers(sb), 0);
   } finally {
-    if (segment) spawnSync("/usr/bin/ipcrm", ["-m", segment]);
-    rmSync(lockFile, { force: true });
+    // Only what the test made, and the segment only while the kernel still lists that id as the user's.
+    try {
+      if (segment && ownSysV().includes(`shm:${segment}`)) spawnSync("/usr/bin/ipcrm", ["-m", segment]);
+    } finally {
+      if (created) rmSync(lockFile, { force: true });
+      cleanup(sb);
+    }
+  }
+});
+
+test("the probe counts the test user's System V objects as the kernel lists them", { skip: SKIP }, t => {
+  // This copy reads the kernel's tables and never runs stop, so it also runs on a busy account, where the stop test
+  // skips. Its own shared directory is empty, so the probe's count is the user's System V objects alone.
+  const sb = sandbox(undefined, { kernelTables: true });
+  try {
+    // Another process of the user can make or remove an object while the probe runs. A round counts only when the
+    // user's objects were the same before and after it, and even then an object that came and went in between can
+    // put the probe one off. So one round that agrees passes, and the test fails only when every such round disagreed.
+    const disagreed: string[] = [];
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const before = ownSysV(), counted = leftovers(sb), after = ownSysV();
+      if (before.join() !== after.join()) continue;
+      if (counted === before.length) return;
+      disagreed.push(`${counted} for ${before.length}`);
+    }
+    if (disagreed.length === 0) { t.skip("the test user's System V objects changed during every probe"); return; }
+    assert.fail(`the probe counts the user's objects, and no other user's: it counted ${disagreed.join(", ")}`);
+  } finally {
     cleanup(sb);
   }
 });
@@ -372,23 +484,24 @@ test("the proxy credential is in no process's arguments while a command runs", {
   const sb = sandbox();
   let child: ReturnType<typeof spawn> | undefined;
   let sleeperPid = 0;
+  const duration = String(randomInt(100_000, 900_000));
+  const processes = () => readdirSync("/proc").filter(name => /^\d+$/.test(name)).flatMap(pid => {
+    try { return [{ pid: Number(pid), args: readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0") }]; } catch { return []; }
+  });
+  const sleeper = () => processes().find(p => p.args[0]?.endsWith("sleep") && p.args[1] === duration)?.pid ?? 0;
   try {
     const repo = makeRepo(sb);
     const work = prepareTrial(sb, repo.bundle);
     const secret = `credential-part-${randomInt(1_000_000, 9_000_000)}`;
-    const duration = String(randomInt(100_000, 900_000));
     child = spawn("/bin/sh", [sb.script, "setup", "--", "/bin/sleep", duration], {
       cwd: work,
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
       stdio: ["pipe", "ignore", "ignore"],
     });
     child.stdin?.end(`http://user:${secret}@127.0.0.1:9/\n`);
-    const processes = () => readdirSync("/proc").filter(name => /^\d+$/.test(name)).flatMap(pid => {
-      try { return [{ pid: Number(pid), args: readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0") }]; } catch { return []; }
-    });
     const deadline = Date.now() + 20_000;
     while (!sleeperPid && Date.now() < deadline) {
-      sleeperPid = processes().find(p => p.args[0]?.endsWith("sleep") && p.args[1] === duration)?.pid ?? 0;
+      sleeperPid = sleeper();
       if (!sleeperPid) await new Promise(resolve => setTimeout(resolve, 50));
     }
     assert.ok(sleeperPid, "the command started");
@@ -396,8 +509,12 @@ test("the proxy credential is in no process's arguments while a command runs", {
     assert.ok(all.some(p => p.args.includes("--kill-after=10")), "the launcher's timeout is running, so its arguments were checked");
     assert.deepEqual(all.filter(p => p.args.join(" ").includes(secret)).map(p => p.args[0]), []);
   } finally {
+    // The launcher's timeout runs in a process group of its own, so the kill of the shell below does not reach the
+    // sleep. A sleep that started after the search above gave up is looked for once more, by its random duration.
+    sleeperPid ||= sleeper();
     if (sleeperPid) { try { process.kill(sleeperPid, "SIGKILL"); } catch { /* already gone */ } }
-    if (child) {
+    // A child that already ended emits no second exit event, and a wait for one would never end.
+    if (child && child.exitCode === null && child.signalCode === null) {
       const ended = new Promise(resolve => child?.once("exit", resolve));
       child.kill("SIGKILL");
       await ended;

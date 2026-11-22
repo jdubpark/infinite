@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ArrowUpRight, Check, ChevronRight, GitBranch, Plus, RefreshCw, Send, Users, X } from "lucide-react";
-import { ApiError, ago, clock, isMissionManaged, missionManagedLine, names, useApi, type LimitSwitch, type LogEvent, type ProviderLimit, type Me, type OwnerRating, type Rubric, type Session, type TaskUsage, type TeamLineup, type TeamModelProfile, type TeamBrief, type TeamEvidence, type LinearTrackingView, type TeamUsage, type UsageTotals } from "./api";
+import { ApiError, ago, clock, isMissionManaged, missionManagedLine, names, postDecisionAnswer, useApi, type LimitSwitch, type LogEvent, type ProviderLimit, type Me, type OwnerRating, type Rubric, type Session, type TaskUsage, type TeamLineup, type TeamModelProfile, type TeamBrief, type TeamEvidence, type LinearTrackingView, type TeamUsage, type UsageTotals } from "./api";
 import { UsageFigure, UsageRollup, usageEnabled } from "./usage";
 import { SpendGlance, TaskCostRow } from "./cost";
 import { briefText, chooseBrief, monitorMembers, summarySessionId, type BriefingView } from "./team-monitor";
@@ -9,6 +9,7 @@ import { useLiveRefresh } from "./live-refresh";
 import { requestStore } from "./requests";
 import { LinearTracking } from "./linear";
 import { DictationNotice, MicButton, useDictation } from "./dictation";
+import { Decision } from "./team-decision";
 
 type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 type TeamRole = "project-manager" | "intent-checker" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
@@ -17,7 +18,7 @@ export type TeamTask = { id: string; title: string; instructions: string; paths:
 type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; headCommit: string; tasks: TeamTask[]; review?: TeamView["review"]; brief?: TeamBrief };
 type TeamScout = { id: string; title: string; instructions: string; agentProfileId: string; status: "pending" | "running" | "waiting" | "complete"; memberId?: string; summary?: string; evidence?: TeamEvidence[] };
 type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; cwd: string; baseCommit: string; provider?: string; modelProfile?: TeamModelProfile; usage?: UsageTotals; stoppedReason?: string };
-type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" | "connector"; source?: { kind: "connector"; id: string; name: string }; recommendation?: { answers: string[]; reason: string; outcome?: "matched" | "different" | "other" } };
+type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; answerMode?: "approval" | "single" | "multiple"; createdAt: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" | "connector"; source?: { kind: "connector"; id: string; name: string }; recommendation?: { answers: string[]; reason: string; outcome?: "matched" | "different" | "other" } };
 export type TeamView = {
   id: string; projectId: string; provider: string; title: string; objective: string; parallelism: number;
   revision: number; status: TeamStatus; createdAt: string; updatedAt: string; workspace: string;
@@ -81,6 +82,11 @@ const roles: Record<TeamRole, { name: string; description: string }> = {
   reviewer: { name: "Reviewer", description: "Reviews the result against your request." },
 };
 const date = (value: string) => new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+/** The name of the role that asked a decision, or "Team" when its member is no longer listed. */
+function askedBy(team: TeamView, decision: TeamDecision) {
+  const member = team.members.find(item => item.memberId === decision.memberId);
+  return member ? roles[member.role].name : "Team";
+}
 const statusClass = (status: TeamStatus) => ["needs-input", "blocked", "paused"].includes(status) ? "waiting" : ["ready-for-review", "merged"].includes(status) ? "ready" : ["cancelled", "no-change"].includes(status) ? "inactive" : "";
 function Status({ status }: { status: TeamStatus }) { return <span className={"team-status " + statusClass(status)}><span className="dot" />{labels[status]}</span>; }
 function RoleGuide() { return <div className="team-roles" aria-label="Team responsibilities">{Object.entries(roles).map(([id, role]) => <div key={id}><strong>{role.name}</strong><p>{role.description}</p></div>)}</div>; }
@@ -364,7 +370,14 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
     inFlight.add(body.requestId); setBusy(true);
     try {
       const { path: endpoint, label: action, ...payload } = body;
-      const result = await api<TeamView>(endpoint, payload);
+      let result: TeamView;
+      if (endpoint.endsWith("/answer")) {
+        if (typeof body.text !== "string") {
+          mutations.fail(key, body.requestId, "The answer text is missing.", true);
+          return;
+        }
+        result = await postDecisionAnswer<TeamView>(api, endpoint, { requestId: body.requestId, revision: body.revision, text: body.text });
+      } else result = await api<TeamView>(endpoint, payload);
       const accepted = mutations.complete(key, body.requestId, { id: result.id }, action + " recorded. Revision " + result.revision + ".");
       if (mounted.current) { receive(result); if (accepted && (endpoint.endsWith("/steer") || endpoint.endsWith("/continue"))) setDirection(""); view.refresh(); refreshTeams(); }
     } catch (error) {
@@ -467,7 +480,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       {team.pullRequest && <p className="team-notice team-ready"><Check size={18} /><span>The delivery agent reports an open pull request for the reviewed commit. The host records this report; it does not independently verify GitHub. {/^https:\/\//.test(team.pullRequest.pullRequestUrl) ? <a href={team.pullRequest.pullRequestUrl} target="_blank" rel="noreferrer">Open the pull request</a> : null}</span></p>}
       {team.goal && <p className="goal-team-origin"><a href={goalHref}>Open goal</a> · cycle {team.goal.cycle} · goal revision {team.goal.revision}</p>}
       {team.noChange && <section className="team-section"><h2>No change proposed</h2><p className="team-prose">{team.noChange.summary}</p><EvidenceList evidence={team.noChange.evidence} /></section>}
-      {openDecisions.length > 0 && <section className="team-section team-decisions"><h2>{missionManaged ? "Open decisions" : "Decisions for you"} <span className="quiet">{openDecisions.length}</span></h2>{openDecisions.map(decision => <Decision key={decision.id} decision={decision} disabled={!canSteer || team.status === "paused" || busy || Boolean(pending)} member={team.members.find(member => member.memberId === decision.memberId)} answer={text => void mutate("/teams/" + id + "/decisions/" + decision.id + "/answer", "Answer", text)} readOnly={missionManaged} />)}</section>}
+      {openDecisions.length > 0 && <section className="team-section team-decisions"><h2>{missionManaged ? "Open decisions" : "Decisions for you"} <span className="quiet">{openDecisions.length}</span></h2>{openDecisions.map(decision => <Decision key={decision.id} decision={decision} disabled={!canSteer || team.status === "paused" || busy || Boolean(pending)} from={askedBy(team, decision)} answer={text => void mutate("/teams/" + id + "/decisions/" + decision.id + "/answer", "Answer", text)} readOnly={missionManaged} />)}</section>}
       {attention.length > 0 && <section className="team-section team-decisions"><h2>Agent sessions need you</h2><p className="quiet">The host answers ordinary prompts in a member’s own workspace. These sessions still wait on a provider prompt; respond in the session.</p>{attention.map(session => <button className="team-session-link" key={session.id} onClick={() => openSession(session.id)}><span><strong>{session.title}</strong><small>{session.attention?.now ?? "Open the session to respond."}</small></span><ArrowUpRight size={18} /></button>)}</section>}
       <ProviderLimitNotice limits={team.providerLimits} />
       <section className="team-section"><h2>Your request</h2><p className="team-prose">{team.objective}</p></section>
@@ -508,12 +521,4 @@ function OutcomeNote({ decision }: { decision: TeamDecision }) {
   if (outcome === "matched") return <p className="quiet">Matched the recommendation</p>;
   if (outcome === "different") return <p className="quiet">Different from the recommendation</p>;
   return null;
-}
-
-function Decision({ decision, disabled, member, answer, readOnly }: { decision: TeamDecision; disabled: boolean; member?: TeamMember; answer: (text: string) => void; readOnly: boolean }) {
-  const [text, setText] = useState("");
-  const recommendation = decision.recommendation;
-  const isRecommended = (option: string) => recommendation?.answers.includes(option) === true;
-  const recommendedOnly = recommendation !== undefined && decision.options.length === 0 && recommendation.answers.length > 0 ? recommendation.answers[0] : undefined;
-  return <article className="team-decision"><p className="quiet">{member ? roles[member.role].name : "Team"} · revision {decision.revision}</p><p className="team-prose">{decision.question}</p>{recommendation && <div className="team-recommendation"><p className="quiet">Recommended by the agent</p><p className="team-prose"><strong>{recommendation.answers.join(", ")}</strong></p><p className="quiet">{recommendation.reason}</p></div>}{!readOnly && <><div className="team-decision-options">{decision.options.map((option, index) => <button key={index} className={isRecommended(option) ? "recommended" : undefined} aria-label={isRecommended(option) ? `${option}, recommended` : undefined} disabled={disabled} onClick={() => answer(option)}>{option}{isRecommended(option) && <span className="team-recommended-tag">Recommended</span>}</button>)}{recommendedOnly !== undefined && <button className="recommended" disabled={disabled} onClick={() => answer(recommendedOnly)}>Use the recommended answer</button>}</div><form onSubmit={event => { event.preventDefault(); if (text.trim()) answer(text.trim()); }}><label className="sr-only" htmlFor={"decision-" + decision.id}>Your answer</label><textarea id={"decision-" + decision.id} rows={2} maxLength={8000} placeholder="Write your answer…" value={text} onChange={event => setText(event.target.value)} disabled={disabled} /><button className="primary" disabled={disabled || !text.trim()}>Send answer <ArrowUpRight size={16} /></button></form></>}</article>;
 }

@@ -42,6 +42,8 @@ const CLAUDE_CLASSES = new Map<string, ToolClass>([
   ["Edit", "file-write"], ["Write", "file-write"], ["MultiEdit", "file-write"], ["NotebookEdit", "file-write"],
   ["Grep", "search"], ["Glob", "search"], ["LS", "search"], ["ToolSearch", "search"], ["WebFetch", "web"], ["WebSearch", "web"],
   ["Agent", "agent"], ["Task", "agent"],
+  // The Code Mode program call: its result is the program's output, like a Codex exec result.
+  ["REPL", "program"],
 ]);
 
 /** PROPOSED: Codex function names by class. Names ending in `_agent` or `_agents` are also `agent`; any other name is `other`. */

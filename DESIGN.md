@@ -309,7 +309,7 @@ A person runs a team through its coordinator, not its agents. Team agents leave 
 
 Native copy stays terse. Icons, counts, and chips carry state; sentences remain only where a decision or an honesty qualifier needs them, shortened to markers such as "agent claim", "not approval", and "Offline · last received".
 
-The web workspace navigation leads with Swarm, the landing view, followed by Sessions, Teams, Goals, and Cost.
+The web workspace navigation leads with Swarm, the landing view, followed by Sessions, Decisions, Teams, Goals, and Cost, three to a row. Decisions names in words how many decisions wait on a person, under its label, and shows no count when none wait, or when the queue read fails or goes stale.
 
 Web detail exposes Catch up, Full terminal, and Context. Native session detail exposes Chat, Activity, and Files; native team detail exposes Overview, Tasks, Agents, and Activity, with tasks as issue rows carrying an assignee avatar. Selected web tabs use the primary color and underline; the selected native segment is a raised lens. Labels stay in sentence case. The back control returns to the list.
 
@@ -336,7 +336,7 @@ Every region keeps its size. A blank slot keeps its space, rows keep their order
 - **Do** keep the warm sheet, ink hierarchy, and forest primary action consistent across pairing, lists, and detail.
 - **Do** place session titles before provider and status, and retain short stable IDs in list rows.
 - **Do** show connection freshness separately from process status and input delivery.
-- **Do** keep layout still while status changes. A stale or offline warning appears only after the view has stayed stale for about three seconds, and then floats over content or lives in an existing status element. A request in flight shows its busy state inside its own control. Receipts float and dismiss themselves, or sit in a slot that is always there. Controls still pause the moment a view goes stale.
+- **Do** keep layout still while status changes. A stale or offline warning appears only after the view has stayed stale for about three seconds, and then floats over content or lives in an existing status element. Time in a hidden tab does not count toward those seconds. A request in flight shows its busy state inside its own control. Receipts float and dismiss themselves, or sit in a slot that is always there. Controls still pause the moment a view goes stale.
 - **Do** preserve minimum 44px web and 48-unit native control targets, visible focus, and wrapping native command keys.
 - **Do** use platform system typography on native while preserving the web hierarchy and Instrument Sans identity.
 - **Do** respect reduced motion: web view entry has no blur animation when reduced motion is requested.

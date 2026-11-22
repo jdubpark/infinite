@@ -16,7 +16,7 @@ import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchem
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
 import { pullRequestBranch, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt, UNKNOWN_DELIVERY_BRANCH } from "./team-prompts.js";
 import { reviewEvidenceProblems } from "./team-acceptance.js";
-import { teamModelLaunch } from "./launch.js";
+import { memberCodeModeExpected, teamModelLaunch } from "./launch.js";
 import { CheckOutputScanner, checkFeedback } from "./team-check-output.js";
 import { resumeFailed } from "./native-continuation.js";
 import { combineCoverage, type UsageService } from "./usage-service.js";
@@ -2921,7 +2921,7 @@ export class TeamService {
     });
   }
   private routerInput(run: TeamRun) {
-    return { publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"), objectiveDigest: objectivePromptOf(run),
+    return { publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"), objectiveDigest: objectivePromptOf(run), codeMode: memberCodeModeExpected(this.config),
       limited: this.limits.limited(), featureMap: (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features };
   }
   private async launch(stored: Stored, member: TeamMember) {
@@ -3022,7 +3022,7 @@ export class TeamService {
     if (member.role !== "permission-coordinator") {
       const captured = { memberId: member.memberId, taskId: member.taskId, revision: member.revision, workspace: stored.run.workspace,
         baseCommit: member.baseCommit, role: member.role, provider: member.provider ?? run.provider, profile: member.modelProfile,
-        publishHeads: this.publishHeadsEnabled(), prefix: this.prefixFor(run), entryTools: Boolean(member.entryTools), objectiveDigest: objectivePromptOf(stored.run), routing: routingComponent(stored.run), shape: run.replay ? "trial" as const : "team" as const };
+        publishHeads: this.publishHeadsEnabled(), prefix: this.prefixFor(run), entryTools: Boolean(member.entryTools), objectiveDigest: objectivePromptOf(stored.run), routing: routingComponent(stored.run), shape: run.replay ? "trial" as const : "team" as const, codeMode: result.codeMode === true };
       this.enrich(stored, async signal => {
         const data = await memberConfiguration(captured, signal);
         if (!data) return undefined;

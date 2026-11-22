@@ -27,11 +27,14 @@ const ASTRA = mixedLineup.implementers[1]!;
 // C14: an autonomous lineup is ready only with an evaluator of another family than the coordinator's.
 const READY_LINEUP: TeamLineup = { ...mixedLineup, evaluators: [{ id: "evaluator", label: "Evaluator", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" }] };
 
-/** Serves the routes from an in-process app whose guard passes everyone, so the config function is the test's own. */
+/**
+ * Serves the routes from an in-process app whose guard passes everyone, so the config function is the test's own.
+ * A loaded config always has an agents map; the tests name it only where a Claude launch profile matters.
+ */
 async function serve(store: EvidenceStore, config: Config): Promise<{ get: (path: string) => Promise<Response>; close: () => Promise<void> }> {
   const app = express();
   const pass: express.RequestHandler = (_req, _res, next) => next();
-  routingRoutes(app, { evidence: store, config: () => config, teams: { revokeRouting: async () => ({}) } }, pass, pass);
+  routingRoutes(app, { evidence: store, config: () => ({ agents: {}, ...config }), teams: { revokeRouting: async () => ({}) } }, pass, pass);
   const server = app.listen(0, "127.0.0.1");
   await new Promise<void>(resolve => server.once("listening", () => resolve()));
   const { port } = server.address() as AddressInfo;
@@ -185,6 +188,42 @@ test("the status route reads the objective digest version only when owner criter
       const status = await (await registered.get("/api/routing/projects/rehearsal")).json() as RoutingStatus;
       assert.equal(astraRows(status), 3);
     } finally { await registered.close(); }
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the status route reads a Claude candidate at the version of the mode a new member would start in", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-routing-code-mode-"));
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: Buffer.alloc(32, 6) });
+  try {
+    store.register(configurationModule()); store.register(outcomeModule({ now: () => NOW })); store.register(routingModule());
+    const claude = { id: "haiku-medium", label: "Claude implementer", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" } as const;
+    const lineup: TeamLineup = { ...READY_LINEUP, implementers: [claude, ASTRA] };
+    // Two rows of a Claude member that started in Code Mode, under the route's flags: publishHeads on, entry tools off.
+    store.write(tx => {
+      tx.run("INSERT INTO configurations (config_id, provider, model, effort, prompt_version, guidance, knowledge, routing, shape, first_seen_at) VALUES ('program', 'claude', ?, 'medium', ?, 'g', 'k', 'off', 's', ?)",
+        claude.model, promptVersion("implementer", "claude", claude, true, false, false, true), NOW);
+      for (let index = 0; index < 2; index++)
+        writeOutcome(tx, { ...countedRow(`program-${index}`, "program"), profileId: claude.id, provider: "claude", model: claude.model, effort: "medium" });
+    });
+    const claudeRows = (status: RoutingStatus) => status.cells.find(cell => cell.cell.scope === "new-task")!.profiles.find(profile => profile.profileId === claude.id)!.rows.production;
+    const interactive = { claude: { command: "claude", args: [] } };
+    const cases = [
+      [{ agents: interactive, codeMode: { claude: "all" } }, 2],
+      [{ agents: interactive, codeMode: { claude: "headless" } }, 0],
+      [{ agents: interactive, codeMode: { claude: "off" } }, 0],
+      [{ agents: interactive }, 0],
+      [{ agents: { claude: { command: "claude", args: ["-p"] } }, codeMode: { claude: "headless" } }, 2],
+    ] as const;
+    for (const [host, expected] of cases) {
+      const served = await serve(store, { ...host, projects: [{ id: "rehearsal", autonomy: "autonomous", team: {} }], teams: { lineup } } as unknown as Config);
+      try {
+        const status = await (await served.get("/api/routing/projects/rehearsal")).json() as RoutingStatus;
+        assert.equal(claudeRows(status), expected, JSON.stringify(host));
+      } finally { await served.close(); }
+    }
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });

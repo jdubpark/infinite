@@ -40,7 +40,8 @@ export function deriveMoments(events: SignalEvent[]): Moment[] {
     switch (d.kind) {
       case "turn-start":
         flushQuiet(); lastEdit = undefined;
-        out.push({ id, at: e.at, kind: "turn", title: d.prompt ?? "New turn", source: d.source, expanded: d.prompt ? [{ label: "Request", text: d.prompt }] : [] });
+        // A provider's own continue is not the owner's request, so it is labelled as the provider's prompt.
+        out.push({ id, at: e.at, kind: "turn", title: d.automatic ? "Continued after the answer" : d.prompt ?? "New turn", source: d.source, expanded: d.prompt ? [{ label: d.automatic ? "Provider's own prompt" : "Request", text: d.prompt }] : [] });
         break;
       case "turn-end":
         flushQuiet(); lastEdit = undefined;

@@ -874,3 +874,18 @@ test("the relay refuses the report and priors reads", async () => {
     runner.close();
   }
 });
+
+test("the summary carries the last identity probe only when the host passes one", () => {
+  const f = fixture();
+  try {
+    const input = {
+      project: projectConfig() as unknown as Parameters<typeof evalSummary>[1]["project"], mining: f.mining, grader: f.grader, graderVersion: null,
+      evalIdentity: "unavailable" as const, trials: { today: 0, dailyCap: null }, jobs: [], now: NOW,
+    };
+    const lastProbe = { state: "misconfigured" as const, at: "2026-11-22T01:00:00.000Z" };
+    assert.deepEqual(evalSummary(f.store, { ...input, evalIdentityLastProbe: lastProbe }).evalIdentity, { state: "unavailable", lastProbe });
+    assert.deepEqual(evalSummary(f.store, input).evalIdentity, { state: "unavailable" });
+  } finally {
+    f.cleanup();
+  }
+});

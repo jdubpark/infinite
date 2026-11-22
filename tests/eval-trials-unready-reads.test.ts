@@ -46,7 +46,7 @@ function hostOver(root: string, store: EvidenceStore): EvalHost {
   });
 }
 
-type Rig = { host: EvalHost; store: EvidenceStore; baselineId: string | undefined; validateId: string; ready: () => void; cleanup: () => void };
+type Rig = { host: EvalHost; store: EvidenceStore; baselineId: string | undefined; validateId: string; cleanup: () => void };
 
 /** Stores a validation job and, when asked, a baseline job while the trials module is ready, then reopens it not ready. */
 function rig(options: { baseline: boolean }): Rig {
@@ -77,7 +77,7 @@ function rig(options: { baseline: boolean }): Rig {
   const store = new EvidenceStore({ databasePath, vaultKey });
   const host = hostOver(root, store);
   assert.equal(store.status().modules[EVAL_TRIALS_MODULE], "unavailable");
-  return { host, store, baselineId, validateId: validate.job.jobId, ready: () => undefined, cleanup: () => { host.close(); store.close(); } };
+  return { host, store, baselineId, validateId: validate.job.jobId, cleanup: () => { host.close(); store.close(); } };
 }
 
 function refused(value: unknown): { status?: number; code?: string } {

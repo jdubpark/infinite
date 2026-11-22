@@ -480,6 +480,14 @@ repository-scoped App credential. The refspec is an exact commit SHA to
 point is durability: work survives workspace removal and loss of the host disk. See
 [Head publication](teams.md#head-publication).
 
+## Main check execution
+
+With `team.mainCheck` set, the host runs the project's configured setup and checks at the newest head its mirror has received for the base branch. The commands run as the agent account, the same account that runs a team's checks, in a disposable copy of that head that is removed after the run. They are the project's own configured commands; the host does not build them from output or from a model's text. The command prefix applies to them as it does to team runs. The copy is checked after every command, and a copy that changed is never recorded as a result.
+
+Command output is untrusted. It can contain any text a failing test prints. The host keeps at most eight short entries for the owner's read of the main-check record. It never sends output in a push, never puts it in a prompt, and never records it as a project signal. The push text is made from the result's facts only: the position of the failing command, its exit code, and the first characters of the head.
+
+The main check starts no agent, changes no branch and kills no process. A check still running when the host stops is ended as interrupted, and a directory it left behind is removed only after a process census confirms that nothing of the run is still alive. The setting is off by default. See the Main check section of [teams.md](teams.md) for the limits.
+
 ## Request intake
 
 Intake lets the owner start a mission from a Linear issue and follow it in a Slack

@@ -39,11 +39,12 @@ function digestedTeams(teams: Config["teams"]): Config["teams"] {
   delete rest.memberTraces;
   return rest as Config["teams"];
 }
-/** The eval block changes what the host measures, never a routine's work (umbrella C11), so it is removed before hashing. */
+/** The eval block and the main check change what the host measures and tells the owner, never a routine's work (umbrella C11), so both are removed before hashing. */
 function digestedProjectTeam(team: Project["team"]): Project["team"] {
-  if (!team || !("eval" in team)) return team;
+  if (!team || !("eval" in team || "mainCheck" in team)) return team;
   const rest: Partial<NonNullable<Project["team"]>> = { ...team };
   delete rest.eval;
+  delete rest.mainCheck;
   return rest as Project["team"];
 }
 const terminal = new Set<Routine["status"]>(["completed", "cancelled", "expired"]);

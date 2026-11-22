@@ -10,6 +10,8 @@ import { z } from "zod";
 import { existsSync, realpathSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { Manager, publicAttention } from "./manager.js";
+import { MainCheckService } from "./main-check.js";
+import { mainCheckRoute } from "./main-check-route.js";
 import { hashToken, validateLinearConfig, validateMcpConfig } from "./config.js";
 import { runtimeSecurity } from "./deployment.js";
 import { workerCall, type WorkerError } from "./ipc.js";
@@ -223,7 +225,9 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   let sourceAppliedGraph: (projectId: string, head: string) => void = () => {};
   // The base scanner needs the evidence store, which opens after the project source service; its notices wait for it.
   let baseScanner: BaseScanner | undefined;
-  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix, onApplied: (id, head) => { sourceChanged(id); sourceAppliedGraph(id, head); }, onMirror: fetch => baseScanner?.notify(fetch) });
+  // The main check needs the halt service, which is built later; its observations are passed through this variable.
+  let mainCheck: MainCheckService | undefined;
+  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix, onApplied: (id, head) => { sourceChanged(id); sourceAppliedGraph(id, head); }, onMirror: fetch => { baseScanner?.notify(fetch); mainCheck?.observe(fetch); } });
   const repositoryGraphs = config.repositoryGraphs
     ? new RepositoryGraphs(config.repositoryGraphs, config.projects, config.teams?.workspaceDir, config.teams?.commandPrefix)
     : undefined;
@@ -580,6 +584,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   permissionTurnGate.hold = () => { const view = halt.view(); return view.readable && !view.host; };
   halt.useServices({ routines, goals, missions, teams }, teamId => goals.ownsActiveTeam(teamId) || missions.ownsActiveSubteam(teamId));
   const gate = halt.gate(fuse);
+  mainCheck = new MainCheckService({ config, key, mirrorPath: id => projectSource.mirrorPath(id), halt, hostLoad: manager.hostLoad });
   manager.useFuse(gate);
   teams.useFuse(gate);
   goals.useFuse(gate);
@@ -2066,6 +2071,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     if (!page) return void res.status(503).json(signalsUnavailable);
     res.json(page);
   });
+  app.get("/api/projects/:id/main-check", requireRole(["owner"]), mainCheckRoute(config, projectId => mainCheck?.view(projectId)));
   app.post("/api/projects/:id/source/refresh", requireRole(["owner"]), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (!projectSource.isGithub(projectId)) throw new ProjectSourceError("This project follows the laptop, not GitHub.", "not-github");
@@ -2253,6 +2259,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     evalHost.start();
     // A stop or resume pass that the previous process left unfinished is finished now.
     void halt.start().catch(() => {});
+    void mainCheck?.start().catch(() => {});
   });
   server.once("close", () => {
     headlessChannel.close();
@@ -2276,12 +2283,13 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     projectSource.stop();
     halt.stop();
     closeEvidence();
+    void mainCheck?.close();
   });
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); const teamsClosed = teams.close(); halt.stop(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([teamsClosed, mcp?.close(), repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
-  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, mcpServer: mcp?.server, closeConnections, fuse, halt,
+  const closeConnections = () => { const mainCheckClosed = mainCheck?.close() ?? Promise.resolve(); routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); const teamsClosed = teams.close(); halt.stop(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([teamsClosed, mainCheckClosed, mcp?.close(), repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, mcpServer: mcp?.server, closeConnections, fuse, halt, mainCheck,
     // ownerClass is read only for a dialog the delivery service handled and left to the owner, so no session wrapper is needed.
     permissions: { holder: (sessionId: string, promptId: number) => sessionPermissions.holder(sessionId, promptId),
       ownerClass: (sessionId: string, promptId: number) => permissionDelivery.ownerClass(sessionId, promptId) }, permissionAgent };

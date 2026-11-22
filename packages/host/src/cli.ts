@@ -16,6 +16,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { createApp } from "./server.js";
+import { mainCheckSetting } from "./main-check-state.js";
 import { Notifier } from "./notifier.js";
 import { sampleVolumes } from "./desktop.js";
 import { expoSender } from "./push.js";
@@ -398,6 +399,7 @@ else if (command === "plan-fleet") {
       ).start();
       console.log(`Push notifications: enabled (${config.push.detail} bodies)`);
       if (!config.push.events.includes("autonomy-interrupt")) console.warn("Push is on, but push.events has no autonomy-interrupt: an open spend fuse will send no notification.");
+      if (!config.push.events.includes("main-check") && config.projects.some(project => mainCheckSetting(project.team) !== undefined)) console.warn("Push is on and a project sets team.mainCheck, but push.events has no main-check: a change of main's health will send no notification.");
     }
     const failed = (error: Error) => { void stop().then(() => { throw error; }); };
     server.on("error", failed);

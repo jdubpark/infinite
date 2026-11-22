@@ -34,6 +34,8 @@ const underReview = (run: TeamRun, sessionId: string, promptId?: number) => prom
   (run.permissionDecisions ?? []).some(decision => decision.targetSessionId === sessionId && decision.promptId === promptId &&
     ["pending", "reviewing", "approved", "answering"].includes(decision.status)) || promptId !== undefined &&
   (run.permissionRecovery?.requests ?? []).some(request => request.targetSessionId === sessionId && request.promptId === promptId && livePermissionRecoveryStatuses.has(request.status));
+/** A permission dialog that only a hook has reported: the screen read has not given it a hash yet, so nobody can decide it. */
+const unreadPermissionPrompt = (prompt: Prompt) => !accountSettingPrompt(prompt) && !prompt.hash && prompt.kind === "permission";
 /** A member dialog that the permission agent decides: a hashed permission dialog, or a collapsed command dialog. */
 const agentPermissionPrompt = (prompt: Prompt) => !accountSettingPrompt(prompt) && Boolean(prompt.hash) && (prompt.kind === "permission" || isCollapsedPermissionPrompt(prompt));
 /** Whether the coordinator review path still has live work in this run. The permission agent waits for it to settle. */
@@ -91,7 +93,7 @@ export class TeamPermissionAgent {
   /** When the scheduler first saw a served dialog that lacks a recognised one-shot accept, by hand-off key. */
   private readonly agentFirstSeen = new Map<string, number>();
   /** The dialog the scheduler last saw on each served member session, and whether the permission agent takes it. */
-  private readonly agentObserved = new Map<string, { promptId?: number; eligible: boolean }>();
+  private readonly agentObserved = new Map<string, { promptId?: number; eligible: boolean; unreadAt?: number }>();
   /** Aborted when a run's permission authority ends while a decision runs. */
   readonly agentControllers = new Map<string, AbortController>();
   /** Agent deliveries holding a member's control lease now, by run, so a revoke can fence them. */
@@ -169,7 +171,9 @@ export class TeamPermissionAgent {
     for (const [key, entry] of this.agentHandOffs) if (key.startsWith(prefix) && holdingHandOff(entry, now)) return true;
     // A dialog that waits for its evidence to settle is the permission agent's too.
     for (const [key, at] of this.agentFirstSeen) if (key.startsWith(prefix) && now - at < AGENT_EVIDENCE_SETTLE_MS) return true;
-    return false;
+    // So is a dialog the screen read has not reached, for the same time from its first sight.
+    const observed = this.agentObserved.get(sessionId);
+    return observed?.promptId === promptId && observed.unreadAt !== undefined && now - observed.unreadAt < AGENT_EVIDENCE_SETTLE_MS;
   }
   agentBusy(runId: string) {
     const now = Date.now();
@@ -274,10 +278,14 @@ export class TeamPermissionAgent {
   handOffPermission(stored: Stored, member: TeamMember, state: Awaited<ReturnType<Manager["state"]>>) {
     const run = stored.run, prompt = state.attention.prompt;
     const open = state.status === "running" && state.attention.state === "needs-you" && prompt !== undefined;
-    const eligible = open && agentPermissionPrompt(prompt!) && !(state.control && state.control.expiresAt > Date.now()) &&
+    const served = open && !(state.control && state.control.expiresAt > Date.now()) &&
       member.status === "running" && member.role !== "permission-coordinator" && member.revision === run.revision &&
       !stored.halt && !["paused", "cancelled", "blocked"].includes(run.status) && !coordinatorReviewLive(run);
-    this.agentObserved.set(member.sessionId, { ...(open ? { promptId: prompt!.id } : {}), eligible });
+    const eligible = served && agentPermissionPrompt(prompt!);
+    // A hook can report a dialog before the screen read. The first sight starts its wait once; a later step does not start it again.
+    const seen = this.agentObserved.get(member.sessionId);
+    const unreadAt = served && unreadPermissionPrompt(prompt!) ? (seen?.promptId === prompt!.id ? seen.unreadAt : undefined) ?? Date.now() : undefined;
+    this.agentObserved.set(member.sessionId, { ...(open ? { promptId: prompt!.id } : {}), eligible, ...(unreadAt !== undefined ? { unreadAt } : {}) });
     if (this.agentObserved.size > AGENT_HANDOFF_LIMIT) this.agentObserved.delete(this.agentObserved.keys().next().value!);
     if (!eligible || !prompt) return;
     // A provider can add its tool evidence to a dialog it already drew: each evidence is its own hand-off, one at a time.

@@ -2538,6 +2538,8 @@ export class TeamService {
       // A recorded answer creates one replacement only after the original has confirmed exit.
       for (const decision of run.decisions.filter(item => item.revision === run.revision && item.answer)) {
         const prior = run.members.find(member => member.memberId === decision.memberId);
+        // A replay run holds its capsule's answers as decisions of no member. In any other run such a decision is a broken record.
+        if (prior === undefined && !run.replay) throw new TeamError(409, "decision-member-missing", "A team decision names a member its run does not hold.");
         if (prior?.status !== "waiting") continue;
         // An answered scout or implementer keeps waiting, answer intact, until a worker slot frees under the current limit.
         if ((prior.role === "scout" || prior.role === "implementer") && run.members.filter(member => holdsWorkerSlot(member, run.revision)).length >= run.parallelism) continue;

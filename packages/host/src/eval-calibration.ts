@@ -1,5 +1,5 @@
 import type { EvidenceStore } from "./evidence/store.js";
-import type { EvidenceTx } from "./evidence/types.js";
+import type { EvidenceDb, EvidenceTx } from "./evidence/types.js";
 import { markExposed } from "./eval-sets.js";
 
 // The calibration read: pairs of a resolved and an unresolved graded trial patch for one dev task.
@@ -9,11 +9,11 @@ export const CALIBRATION_PAIRS_MAX = 20;
 
 export const CALIBRATION_TASKS_SQL = "SELECT x.task_id FROM eval_trials x JOIN eval_tasks t ON t.task_id = x.task_id "
   + "LEFT JOIN eval_groups g ON g.group_id = t.group_id LEFT JOIN eval_groups r ON r.group_id = g.root_id "
-  + "WHERE x.project_ref = ? AND x.ending = 'graded' AND x.reused_from IS NULL AND x.task_id > ? AND t.state = 'valid' "
+  + "WHERE x.project_ref = ? AND x.ending = 'graded' AND x.reused_from IS NULL AND x.isolation = 'isolated' AND x.task_id > ? AND t.state = 'valid' "
   + "AND COALESCE(r.holdout, 0) = 0 GROUP BY x.task_id HAVING MIN(x.resolved) = 0 AND MAX(x.resolved) = 1 ORDER BY x.task_id LIMIT ?";
 
 export const PAIR_TRIAL_SQL = "SELECT x.trial_id FROM eval_trials x JOIN eval_trial_patches p ON p.trial_id = x.trial_id "
-  + "WHERE x.project_ref = ? AND x.task_id = ? AND x.ending = 'graded' AND x.reused_from IS NULL AND x.resolved = ? "
+  + "WHERE x.project_ref = ? AND x.task_id = ? AND x.ending = 'graded' AND x.reused_from IS NULL AND x.isolation = 'isolated' AND x.resolved = ? "
   + "ORDER BY x.ended_at DESC, x.trial_id LIMIT 1";
 
 export type CalibrationPair = {
@@ -24,13 +24,19 @@ export type CalibrationPair = {
 
 type Side = { trialId: string; patch: Buffer };
 
+/** The stored patch of one trial, or undefined when the trial has none (never stored, or swept after it expired). */
+export function readTrialPatch(db: EvidenceDb, trialId: string): Buffer | undefined {
+  const stored = db.get<{ payload: string }>("SELECT payload FROM eval_trial_patches WHERE trial_id = ?", trialId);
+  if (stored === undefined) return undefined;
+  const opened = db.open<{ patch: string }>("eval_trial_patches", trialId, stored.payload);
+  return Buffer.from(opened.patch, "base64");
+}
+
 function sideOf(tx: EvidenceTx, projectRef: string, taskId: string, resolved: 0 | 1): Side | undefined {
   const row = tx.get<{ trial_id: string }>(PAIR_TRIAL_SQL, projectRef, taskId, resolved);
   if (row === undefined) return undefined;
-  const stored = tx.get<{ payload: string }>("SELECT payload FROM eval_trial_patches WHERE trial_id = ?", row.trial_id);
-  if (stored === undefined) return undefined;
-  const opened = tx.open<{ patch: string }>("eval_trial_patches", row.trial_id, stored.payload);
-  return { trialId: row.trial_id, patch: Buffer.from(opened.patch, "base64") };
+  const patch = readTrialPatch(tx, row.trial_id);
+  return patch === undefined ? undefined : { trialId: row.trial_id, patch };
 }
 
 /**

@@ -106,6 +106,19 @@ test("a replay start or poll that the host does not answer in time is asked agai
   assert.equal(busy.starts[1].requestId, busy.starts[0].requestId);
   assert.deepEqual(JSON.parse(printed.join("\n")), { cases: 1 });
 
+  // The connection drops during a poll. The host answered a moment before, so the poll, a read, is asked again.
+  printed.length = 0;
+  const dropping = fakeHost(
+    () => ({ job }),
+    attempt => { if (attempt === 1) throw new TypeError("fetch failed"); return { job: { ...job, state: "finished", done: 1, finishedAt: "2026-11-21T10:05:00.000Z", result: { cases: 1 } } }; },
+  );
+  assert.equal(await replay(dropping.api), true);
+  assert.equal(dropping.starts.length, 1);
+  assert.deepEqual(JSON.parse(printed.join("\n")), { cases: 1 });
+  // An answer that refuses a poll ends the command.
+  const lost = fakeHost(() => ({ job }), () => { throw new Error("Host returned HTTP 404."); });
+  await assert.rejects(replay(lost.api), /HTTP 404/);
+
   // An answer that refuses the start is not asked again, and neither is a failure other than a timeout.
   const refusing = fakeHost(() => { throw new Error("Host returned HTTP 409."); }, () => assert.fail("no poll"));
   await assert.rejects(replay(refusing.api), /HTTP 409/);

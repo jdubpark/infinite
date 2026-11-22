@@ -379,7 +379,7 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     const live = (() => {
       try {
         return realpathSync(this.options.sessions.meta(session.id).session.cwd) === built.requester.sessionRoot &&
-          this.teamServed(session) && pipeline.applicable(outcome.decisionId);
+          this.teamServed(session) && pipeline.applicable(outcome.decisionId, built);
       } catch { return false; }
     })();
     if (!live) {

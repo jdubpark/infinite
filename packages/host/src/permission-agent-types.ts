@@ -184,6 +184,12 @@ export interface PermissionAgentCore {
   qualify(request: PermissionRequest): PermissionQualification;
   /** The raise rules that match. They only select the tier of a fresh turn. */
   raise(request: PermissionRequest, context: { rejectHistory: boolean }): string[];
+  /**
+   * The class rule and the raise rules that match, from one reading of the request in which each path is resolved
+   * once. The reject history is not among them. A decision takes both results from here, so they describe the same
+   * file system.
+   */
+  readRules(request: PermissionRequest, interruptClasses: readonly string[]): { match: PermissionClassMatch | undefined; raised: string[] };
   /** Runs the light turn, the strong turn, or both. Never throws for a model failure: that is `reject` with `unavailable`. */
   review(request: PermissionRequest, context: PermissionReviewContext): Promise<PermissionReview>;
 }
@@ -231,8 +237,11 @@ export interface PermissionPipeline {
   /**
    * Whether a recorded decision may still be applied now: its project is still covered under the same
    * authority, the host is ready, no owner halt covers it, and no revoke, regrouping or direction change retired it.
+   * With `request`, the request the decision was made for, the host also reads the request again: the decision
+   * applies only while that request still gets it, so a path that now resolves elsewhere or a changed task text
+   * withholds it. A delivery passes the request.
    */
-  applicable(decisionId: string): boolean;
+  applicable(decisionId: string, request?: PermissionRequest): boolean;
   /** Whether an owner halt covers the project now. A pipeline without a halt source leaves it out. */
   halted?(projectId: string): boolean;
   /** Linked delivery events. The decision is in the journal before the first one. */

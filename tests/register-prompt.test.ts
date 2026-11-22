@@ -44,8 +44,13 @@ const promptOf = (run: TeamRun, role: TeamMember["role"]) =>
   teamPrompt(run, role, undefined, undefined, "claude", PROFILE, { checks: CHECKS }, [], true);
 
 // Byte pin: a goal run without a register keeps every prompt byte. The value is this tree's output before Task 12,
-// moved once from 96ea12db when INF-323 added the recommendation to the question format line, the only change.
-const PIN_PROMPTS_SHA256 = "a4ff6934ae47f73f01d005a42bd9e89a5f33b44c559b5e03ea3f8e45a4f0d3f8";
+// moved from 96ea12db when INF-323 added the recommendation to the question format line, the only change, and from
+// a4ff6934 when INF-374 and INF-343 added three lines and changed no other: the Codex working rule for tools, the
+// planner's line on a measured target, and the reviewer's line on comparing a rewrite with the original.
+// INF-383 moved it to b17ea4ed: the Codex working rule's signature sentences now name the callable form and the nested
+// result type, generated from the declared schemas, and the rule says what a failed call returns. No other prompt byte
+// changed.
+const PIN_PROMPTS_SHA256 = "b17ea4ed8a3f97861036bd9b10e6547d825e06a7963a5a927cee7da8be339c35";
 
 test("without the register the goal section is byte for byte", () => {
   const prompts: string[] = [];

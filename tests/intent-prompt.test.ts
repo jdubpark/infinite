@@ -4,7 +4,7 @@ import { INTENT_CONTEXT_BYTES, INTENT_FEEDBACK_BYTES, INTENT_PROMPT_BYTES, corre
 import { runRecord } from "../packages/host/src/objective-record.js";
 import { applyIntentReport, intentApplied } from "../packages/host/src/objective-intent.js";
 import type { IntentCheckReport, IntentItem } from "../packages/host/src/intent-report.js";
-import { codexSandboxInstructions, profileInstructions, reportingInstructions, retargetPrompt } from "../packages/host/src/team-prompts.js";
+import { codexMemberToolInstructions, codexSandboxInstructions, contextAccessInstructions, profileInstructions, readOnlyWorkspaceInstructions, reportingInstructions, retargetPrompt } from "../packages/host/src/team-prompts.js";
 import type { TeamDecision, TeamMember, TeamModelProfile, TeamReport, TeamRun } from "../packages/host/src/team-types.js";
 import type { ObjectiveRecord } from "../packages/host/src/objective-types.js";
 
@@ -23,11 +23,52 @@ test("the checker's prompt holds no run data", () => {
     assert.ok(prompt.includes(".git/infinite-team-context.json"), `${provider}: names the context file`);
     assert.ok(prompt.includes(profileInstructions(CHECKER_PROFILE)), `${provider}: carries the profile line`);
     assert.ok(prompt.includes(reportingInstructions(provider)), `${provider}: carries the reporting paragraph`);
-    assert.notEqual(retargetPrompt(prompt, { provider: "claude", profile: CLAUDE_PROFILE }), undefined, `${provider}: retargets`);
+    assert.notEqual(retargetPrompt(prompt, { provider: "claude", profile: CLAUDE_PROFILE, role: "intent-checker", entryTools: false }), undefined, `${provider}: retargets`);
     assert.equal(intentCheckerPrompt(provider).includes("Requested runtime profile"), false, `${provider}: no profile line without a profile`);
   }
-  assert.equal(intentCheckerPrompt("codex", CHECKER_PROFILE).includes(codexSandboxInstructions), true, "the Codex prompt holds the sandbox guidance");
-  assert.equal(intentCheckerPrompt("claude", CHECKER_PROFILE).includes(codexSandboxInstructions), false, "the Claude prompt does not");
+  const codexPrompt = intentCheckerPrompt("codex", CHECKER_PROFILE);
+  const claudePrompt = intentCheckerPrompt("claude", CLAUDE_PROFILE);
+  const reportOnlyTools = codexMemberToolInstructions(false);
+  assert.equal(codexPrompt.split(reportOnlyTools).length - 1, 1, "the Codex prompt has the report-only paragraph exactly once");
+  assert.equal(claudePrompt.includes(reportOnlyTools), false, "the Claude prompt has no Codex report-only paragraph");
+  assert.equal(codexPrompt.includes(codexSandboxInstructions), true, "the Codex prompt holds the sandbox guidance");
+  assert.equal(claudePrompt.includes(codexSandboxInstructions), false, "the Claude prompt does not");
+  assert.ok(Buffer.byteLength(codexPrompt, "utf8") <= INTENT_PROMPT_BYTES, "the Codex prompt fits 8 KiB");
+  assert.ok(Buffer.byteLength(claudePrompt, "utf8") <= INTENT_PROMPT_BYTES, "the Claude prompt fits 8 KiB");
+});
+
+test("a carried Claude intent-checker prompt gets the fresh Codex guidance without entry signatures", () => {
+  const fresh = intentCheckerPrompt("codex", CHECKER_PROFILE);
+  const carried = retargetPrompt(intentCheckerPrompt("claude", CLAUDE_PROFILE), {
+    provider: "codex", profile: CHECKER_PROFILE, role: "intent-checker", entryTools: false,
+  });
+  assert.ok(carried, "the carried prompt retargets");
+
+  const guidance = `${codexSandboxInstructions}\n\n${codexMemberToolInstructions(false)}`;
+  const contextInstructions = contextAccessInstructions();
+  const contextBoundaryBlock = (prompt: string) => {
+    const contextIndex = prompt.indexOf(contextInstructions);
+    assert.notEqual(contextIndex, -1, "the context instructions are present");
+    const blockEnd = contextIndex - 2;
+    return prompt.slice(blockEnd - guidance.length, blockEnd);
+  };
+  assert.equal(contextBoundaryBlock(fresh), guidance, "fresh Codex guidance is directly before context access");
+  assert.equal(contextBoundaryBlock(carried), guidance, "retargeted Codex guidance is directly before context access");
+  assert.equal(contextBoundaryBlock(carried), contextBoundaryBlock(fresh), "fresh and carried guidance blocks match");
+  assert.doesNotMatch(carried, /entry_(?:list|get|post)\(/, "intent checker has no entry signatures");
+});
+
+test("retargeting a legacy Codex intent-checker prompt replaces only the old live sandbox paragraph", () => {
+  const legacy = intentCheckerPrompt("claude", CHECKER_PROFILE)
+    .replace(readOnlyWorkspaceInstructions, `${readOnlyWorkspaceInstructions}\n\n${codexSandboxInstructions}`)
+    .replace(reportingInstructions("claude"), reportingInstructions("codex"));
+  const notes = `\n\nQuoted checker guidance:\n\n${codexSandboxInstructions}\n\nEnd of quote.`;
+  for (const [provider, profile] of [["codex", CHECKER_PROFILE], ["claude", CLAUDE_PROFILE]] as const) {
+    const carried = retargetPrompt(legacy + notes, { provider, profile, role: "intent-checker", entryTools: false });
+    assert.ok(carried, `${provider}: the legacy prompt retargets`);
+    assert.equal(carried.split(codexSandboxInstructions).length - 1, provider === "codex" ? 2 : 1, provider);
+    assert.equal(carried, intentCheckerPrompt(provider, profile) + notes, provider);
+  }
 });
 
 const criterion = (id: string, origin: "owner" | "derived", extra: Record<string, unknown> = {}) => ({

@@ -2545,6 +2545,20 @@ Each request passes these steps in order:
 3. **Lock and replay.** An assignment that repeated one rejected request twice
    is locked and gets no model turn until the owner unlocks it. An identical
    request under the same authority is answered from its recorded verdict.
+   A verdict belongs to the request as the host read it: the task text the
+   reviewer saw, and the class and raise rules that matched as the request's
+   paths resolved. When the agent decides a request whose task the owner
+   narrowed, or whose path came to resolve to a place the rules tell apart
+   (outside the session's directory, or into a path a class rule names), no
+   verdict recorded for the earlier reading answers it. The host reads the
+   request again immediately before a delivery and withholds the answer when
+   the reading changed while the review ran; the task text in that check is
+   the one the request was handed with. A pending dialog is not handed to the
+   agent again only because its reading changed. A recorded allow answers a
+   second attempt at the same dialog only while a new identical request would
+   replay the same verdict: a lock of the assignment, an open effect reject of
+   the task newer than the allow, or a later verdict for the request leaves
+   it with the owner.
    A verdict that the strong model reached after it asked the host for
    source files is the exception: it cannot answer a new dialog. The delivery
    that follows the review checks again any file the adapter collected. An

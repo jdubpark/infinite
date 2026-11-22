@@ -1,6 +1,7 @@
 /** Pure scoring rules for a judge calibration. The unit is the pair: two orderings of one resolved and one unresolved trial. */
 export const CALIBRATION_MIN_PAIRS = 30;
 export const CALIBRATION_MAX_PAIRS = 60;
+export const CALIBRATION_DEFAULT_PAIRS = 36;
 export const CALIBRATION_LOWER_BOUND_MIN = 0.6;
 export const CALIBRATION_VALID_DAYS = 60;
 export const CALIBRATION_RETRIES = 2;

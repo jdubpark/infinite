@@ -85,7 +85,8 @@ test("with endsWithLeader, a command whose output closes at its exit settles on 
     assert.equal(result.interrupted, false);
     assert.equal(result.truncated, false, "the output closed");
     assert.equal(result.stdout, "whole\n");
-    assert.equal(result.output, "whole\nalso\n");
+    // Two pipes: their chunks arrive in either order.
+    assert.deepEqual(result.output.split("\n").filter(Boolean).sort(), ["also", "whole"]);
     assert.ok(elapsed < EXIT_DRAIN_MS, `settled ${elapsed.toFixed(0)} ms after the start: it waited out the drain`);
   } finally {
     run.dispose();
@@ -116,11 +117,12 @@ test("with endsWithLeader, a stop inside the drain settles at once and signals n
     const result = run.start(leaves, true);
     const sleep = await run.left();
     await run.leaderExited();
+    assert.equal(run.settledAt, undefined, "the drain is still pending when the stop comes");
     const stoppedAt = performance.now();
     run.controller.abort();
     const settled = await result;
     const waited = run.settledAt! - stoppedAt;
-    assert.ok(waited < 250, `settled ${waited.toFixed(0)} ms after the stop`);
+    assert.ok(waited >= 0 && waited < 250, `settled ${waited.toFixed(0)} ms after the stop`);
     assert.equal(settled.exitCode, 0);
     assert.equal(settled.interrupted, false);
     assert.equal(settled.truncated, true);

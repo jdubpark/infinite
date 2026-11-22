@@ -391,3 +391,33 @@ test("i. a check that leaves a real sleep behind passes when its leader exits; t
     await sandbox.dispose();
   }
 });
+
+test("j. under a command prefix the removal of a copy ends with its launcher: a host stop after that exit signals nothing", CASE, async () => {
+  const directory = "alpha-2026-11-20-main-check-0000d00d";
+  const sandbox = new Sandbox({ "tracked.txt": "one\n" }, () => [sh("true")]);
+  try {
+    mkdirSync(join(sandbox.teams, directory, "integration"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(sandbox.teams, directory, "integration", "left.txt"), "left\n");
+    // A launcher that runs the command, leaves a sleep that holds its output, and exits with the command's status.
+    const launcher = join(sandbox.base, "launcher.sh");
+    const leaderFile = join(sandbox.base, "leader");
+    writeFileSync(launcher, `echo $$ > '${leaderFile}'\n"$@"\nstatus=$?\nsleep 30 &\necho $! > '${sandbox.pidFile}'\nexit $status\n`);
+    sandbox.config.teams!.commandPrefix = { command: "sh", args: [launcher] };
+    sandbox.seed("alpha", { version: 1, retiring: [{ directory, root: sandbox.teams, witness: { boot: bootId(), processes: [], sessions: [], groups: [] } }] });
+    // The halt keeps the head from starting. This prefix has no census wrapper, so a census that found nothing stands in.
+    sandbox.halted = true;
+    const processes: MainCheckPorts["processes"] = { table: async () => ({ boot: bootId(), rows: [] }), start: async () => undefined, census: async () => ({ ok: true, findings: [] }) };
+    const service = await sandbox.start({ processes });
+    await sandbox.until("the launcher's sleep", () => sandbox.pid() !== undefined);
+    const pid = sandbox.pid()!;
+    const leader = Number.parseInt(readFileSync(leaderFile, "utf8"), 10);
+    // Node reaps the launcher as it emits `exit`, so a reaped launcher means the runner heard its exit.
+    await sandbox.until("the launcher's exit", () => gone(leader));
+    assert.equal(existsSync(join(sandbox.teams, directory, "integration")), false, "the launcher's rm ran");
+    await service.close();
+    await delay(500);
+    assert.equal(gone(pid), false, "the sleep the launcher left behind still runs half a second after the host stop");
+  } finally {
+    await sandbox.dispose();
+  }
+});

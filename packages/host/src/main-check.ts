@@ -19,9 +19,10 @@ export type { MainCheckPorts } from "./main-check-ports.js";
  * A command ends with its leader. A halt, a command's time limit or the host stop kills the process group of a command
  * whose leader still runs. Once the leader exited, nothing is signalled: the command settles when its pipes close or
  * a second later, with the leader's exit code, and a stop in that second ends it at once. This holds for setup, the
- * checks and the Git helpers of the copy alike. Whatever still runs after a command is a leftover: the witness holds
- * it when it stayed in the command's session or group or was seen as a descendant, the census finds it there or by
- * the copy's path, the entry waits on `processes`, and the copy is removed only after a clean census.
+ * checks, the Git helpers of the copy and the copy's removal alike. Whatever still runs after a command of a check is
+ * a leftover: the witness holds it when it stayed in the command's session or group or was seen as a descendant, the
+ * census finds it there or by the copy's path, the entry waits on `processes`, and the copy is removed only after a
+ * clean census.
  * The rules are pure functions in main-check-state.ts; this service applies them, and every side effect goes through `ports`.
  * Every record change is one synchronous write of the whole record, and memory follows only a write that landed.
  */
@@ -45,6 +46,11 @@ const NOTICE_FLIGHT_MS = 60_000;
 const WITNESS_SAVE_MS = 200;
 const WITNESS_SAMPLES = [250, 1_000, 5_000];
 const WITNESS_SAMPLE_MS = 15_000;
+/**
+ * The scope of a copy's removal. Under a command prefix the removal is a command too, and it also ends with its
+ * leader: a host stop after the launcher exited signals nothing. It is no command of a check, so no witness records it.
+ */
+const REMOVAL_SCOPE: CommandScope = { starting: () => undefined, started: () => undefined, endsWithLeader: true };
 
 type Slot = { record?: MainCheckRecord; unreadable?: true };
 type Step = { phase: "setup" | "verification"; command: TeamCommand };
@@ -355,7 +361,7 @@ export class MainCheckService {
     const current = this.slots.get(projectId)?.record?.retiring?.find(item => item.directory === entry.directory);
     if (!current) return undefined;
     if (JSON.stringify(current) !== JSON.stringify(entry) || !this.removable(projectId, current, result)) return "processes";
-    try { await this.ports.remove(directory, prefix, this.removals.signal, entry.root); }
+    try { await commandScope.run(REMOVAL_SCOPE, () => this.ports.remove(directory, prefix, this.removals.signal, entry.root)); }
     catch { return "cleanup"; }
     const record = this.slots.get(projectId)?.record;
     if (record) this.commit(projectId, retire(record, entry.directory));

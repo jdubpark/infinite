@@ -9,7 +9,7 @@ import { type NextTrial, type TrialGates, type TrialJobs } from "./eval-trial-jo
 import { type TrialSettings } from "./eval-config.js";
 import { gradeOf, TRIAL_HARNESS_VERSION } from "./eval-trial-rules.js";
 import {
-  clearTrialSession, dropTrial, finishTrial, gradingTrial, insertTrial, liveTrials, readTrial, startTrial, sweepTrials,
+  clearTrialSession, dropTrial, EVAL_TRIALS_MODULE, finishTrial, gradingTrial, insertTrial, liveTrials, readTrial, startTrial, sweepTrials,
   TRIAL_KEEP_DAYS_DEFAULT, TRIAL_PATCH_KEEP_DAYS, trialSessions,
 } from "./eval-trial-store.js";
 import { gradeTrial, prepareTrialSource, type SourceResult, type TrialContext } from "./eval-trial.js";
@@ -67,6 +67,10 @@ export class TrialPump {
   private readonly bundle: BundleState = { spawn: () => { throw new Error("No bundle is set."); }, job: null, sha256: null, restreamedFor: null, tooLarge: null };
   private readonly limits = new Map<Provider, number>();
   private started = false;
+  /** True once this process tried the start-up. */
+  private attempted = false;
+  /** True while the account may hold what a trial left: rows this process voided, or a stop or clean that has not succeeded yet. */
+  private dirty = false;
   private live: Live | undefined;
   private probed: { at: number; probe: EvalProbe; projectId: string | undefined } | undefined;
   /** Steps to skip before the next trial start, after a source that could not start. */
@@ -107,6 +111,7 @@ export class TrialPump {
   /** Hourly: sweepTrials, forgetReplay for final trials whose run remains, and sessions.remove for at most 20 sessions ended over an hour ago. */
   async sweep(): Promise<void> {
     try {
+      if (!this.ready()) return;
       const at = this.now();
       this.options.store.tryWrite(tx => { sweepTrials(tx, at); });
       const teams = this.options.teams();
@@ -160,9 +165,15 @@ export class TrialPump {
     if (next.kind === "trial") await this.begin(next, identity, grader);
   }
 
-  /** Once per process, before any trial: drops the preparing rows, voids the running ones, and stops, cleans, and resets the account. */
+  /** Before any trial: drops the preparing rows, voids the running ones, and stops, cleans, and resets the account.
+   *  A process tries it once. It tries again while a job is open or the account may be unclean, until it succeeds. */
   private async startup(): Promise<boolean> {
     const rows = this.options.store.read(db => liveTrials(db));
+    // The first attempt of a process always runs. Later attempts wait for a job unless this process has something to clean.
+    const open = this.openJob();
+    if (this.attempted && !this.dirty && rows.length === 0 && open === undefined) return false;
+    this.attempted = true;
+    if (rows.length > 0) this.dirty = true;
     const at = this.now();
     for (const row of rows) {
       if (row.state === "preparing") {
@@ -176,17 +187,23 @@ export class TrialPump {
         overwritten: 0, diff: null, isolation: "none" }), null, null, session ?? null), at));
       this.options.jobs.record(row.jobId, "void-host");
     }
-    const identity = await this.identityProbe(undefined, this.openJob()?.projectId);
-    // An identity that is configured but cannot be probed has not been cleaned: start-up runs again on the next step.
+    const identity = await this.identityProbe(undefined, open?.projectId);
+    // An identity that is configured but cannot be probed has not been cleaned. Start-up runs again while a job is open or rows were voided.
     if (identity.state === "unavailable" || identity.state === "misconfigured") return false;
     if (identity.state !== "not-configured") {
-      if ((await stopEvalIdentity(this.options.identity, identity.uid ?? -1, this.inventory)) !== "stopped") return false;
+      // From here the account counts as unclean until the stop and the clean both succeed, so a failure is tried again without a job.
+      this.dirty = true;
+      const stopped = await stopEvalIdentity(this.options.identity, identity.uid ?? -1, this.inventory);
+      // A process that stays alive blocks the open job, so the wait is visible and ends when the owner resumes it.
+      if (stopped === "alive" && open !== undefined) this.options.jobs.block(open.jobId, "eval-processes-alive");
+      if (stopped !== "stopped") return false;
       if (!(await this.cleanAndScrub())) return false;
       for (const jobId of this.options.jobs.running()) {
         if (!(await this.options.grader.clean(jobId))) return false;
       }
     }
     this.started = true;
+    this.dirty = false;
     return true;
   }
 
@@ -277,7 +294,10 @@ export class TrialPump {
   /** Ends a trial with `ending`: the stopped account, the final row, the clean, the record, and the run's removal. */
   private async close(live: Live, ending: TrialEnding, state: ReplayState | undefined, stopped: Stop): Promise<void> {
     if (stopped === "alive") this.options.jobs.block(live.jobId, "eval-processes-alive");
-    if (stopped !== "stopped") this.started = false;
+    if (stopped !== "stopped") {
+      this.started = false;
+      this.dirty = true;
+    }
     const at = this.now();
     const grade = gradeOf({ ending, expected: this.expectedOf(live.taskId), overwritten: 0, diff: null, isolation: live.source.isolation });
     this.options.store.write(tx => finishTrial(tx, live.trialId, this.final(grade, null, null, state?.sessionId ?? live.sessionId ?? null), at));
@@ -286,7 +306,10 @@ export class TrialPump {
 
   /** The steps after a trial's row is final: the clean, the record, the run's removal, and the provider limit. */
   private async afterFinal(live: Live, ending: TrialEnding, state: ReplayState | undefined): Promise<void> {
-    if (!(await this.cleanAndScrub())) this.started = false;
+    if (!(await this.cleanAndScrub())) {
+      this.started = false;
+      this.dirty = true;
+    }
     this.options.jobs.record(live.jobId, ending);
     await this.options.teams().forgetReplay(live.trialId).catch(() => false);
     if (ending === "void-limit") this.limit(live.configuration.profile.provider, state?.resetsAt);
@@ -449,14 +472,14 @@ export class TrialPump {
   }
 
   /** The oldest scheduled or running baseline job, with its project when the project still exists; undefined when no job is open. */
-  private openJob(): { projectId: string | undefined } | undefined {
+  private openJob(): { jobId: string; projectId: string | undefined } | undefined {
     try {
       return this.options.store.read(db => {
-        const row = db.get<{ project_ref: string }>(
-          "SELECT project_ref FROM eval_jobs WHERE kind = 'baseline' AND status IN ('scheduled', 'running') ORDER BY created_at, job_id LIMIT 1");
+        const row = db.get<{ job_id: string; project_ref: string }>(
+          "SELECT job_id, project_ref FROM eval_jobs WHERE kind = 'baseline' AND status IN ('scheduled', 'running') ORDER BY created_at, job_id LIMIT 1");
         if (row === undefined) return undefined;
         const project = this.options.config.projects.find(item => db.index("project", item.id) === row.project_ref);
-        return { projectId: project?.id };
+        return { jobId: row.job_id, projectId: project?.id };
       });
     } catch {
       return undefined;
@@ -503,7 +526,8 @@ export class TrialPump {
 
   private ready(): boolean {
     try {
-      return this.options.store.status().modules[EVAL_MODULE] === "ready";
+      const modules = this.options.store.status().modules;
+      return modules[EVAL_MODULE] === "ready" && modules[EVAL_TRIALS_MODULE] === "ready";
     } catch {
       return false;
     }

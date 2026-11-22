@@ -127,6 +127,34 @@ function fixture() {
   };
 }
 
+test("block changes only an open job", () => {
+  const states: string[] = [];
+  for (const kind of ["cancelled", "paused", "running"]) {
+    const f = fixture();
+    try {
+      const created = f.trial.create(PROJECT, request(), REQUEST_ONE);
+      assert.ok("job" in created);
+      const jobId = created.job.jobId;
+      if (kind === "cancelled") f.jobs.control(jobId, "cancel");
+      if (kind === "paused") {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          voidTrial(f, insertAt(f, jobId, attempt));
+          f.trial.record(jobId, "void-host");
+        }
+      }
+      if (kind === "running") f.store.write(tx => tx.run("UPDATE eval_jobs SET status = 'running' WHERE job_id = ?", jobId));
+      f.trial.block(jobId, "eval-processes-alive");
+      const view = f.jobs.view(jobId);
+      states.push(`${kind}:${view?.status}:${view?.reason}`);
+    } finally {
+      f.cleanup();
+    }
+  }
+  assert.equal(states[0], "cancelled:cancelled:owner");
+  assert.equal(states[1], "paused:paused:trial-voids");
+  assert.equal(states[2], "running:blocked:eval-processes-alive");
+});
+
 /** A valid captured task of the project, written the way the jobs test writes one. */
 function addTask(f: Fixture, taskId: string): void {
   const at = new Date(START).toISOString();

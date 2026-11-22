@@ -145,7 +145,8 @@ test("Code Mode context gauge counts real model steps and only the program resul
   for (const line of rows) tail.pushLine(line);
   const gauge = tail.snapshot();
   assert.deepEqual({ modelSteps: gauge.modelSteps, peakInputTokens: gauge.peakInputTokens }, { modelSteps: 2, peakInputTokens: 17531 });
-  assert.deepEqual(gauge.received, { other: { calls: 1, chars: 115, maxChars: 115 } });
+  // 115 is the length of the REPL result row (fixture line 12); the program call is the only tool call with a result.
+  assert.deepEqual(gauge.received, { program: { calls: 1, chars: 115, maxChars: 115 } });
 });
 
 test("tool classes: wait is program, and a name that ends in _agent or _agents is agent", () => {

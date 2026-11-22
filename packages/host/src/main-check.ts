@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { defaultMainCheckPorts, type MainCheckHalt, type MainCheckHostLoad, type MainCheckPorts, type MainCheckTimer } from "./main-check-ports.js";
-import { accept, admit, candidate, checksDigest, emptyRecord, entryOf, finish, hostStart, isCommit, MAX_FAILURES, mainCheckRecordSchema, mainCheckSetting, noticeDue, observe, outcomeOf, PROJECT_ID, retire, setWaiting, settle, viewOf, withWitness, type CheckSummary, type MainCheckCommand, type MainCheckReason, type MainCheckRecord, type MainCheckResult, type MainCheckView, type MainCheckWaiting, type Retiring } from "./main-check-state.js";
+import { accept, admit, candidate, checksDigest, emptyRecord, entryOf, finish, hostStart, isCommit, MAX_FAILURES, mainCheckRecordSchema, mainCheckSetting, noticeDue, observe, PROJECT_ID, retire, setWaiting, settle, viewOf, withWitness, type CheckSummary, type MainCheckCommand, type MainCheckReason, type MainCheckRecord, type MainCheckResult, type MainCheckView, type MainCheckWaiting, type Retiring } from "./main-check-state.js";
 import { extendWitness, recordCommand, type CensusResult, type ProcessWitness } from "./process-census.js";
 import type { MirrorFetch } from "./project-source.js";
 import { storageShortfall } from "./storage.js";
@@ -20,8 +20,8 @@ export type { MainCheckPorts } from "./main-check-ports.js";
  * Every record change is one synchronous write of the whole record, and memory follows only a write that landed.
  */
 
-/** A notice the push service may send. `summary` is health's; it is absent when the checks changed and no result has the current digest. */
-export type MainCheckNotice = { projectId: string; label: string; notice: number; outcome: "passed" | "failed"; summary?: CheckSummary };
+/** A notice the push service may send: health's generation, outcome and summary at the time of the offer. */
+export type MainCheckNotice = { projectId: string; label: string; notice: number; outcome: "passed" | "failed"; summary: CheckSummary };
 export type MainCheckOptions = {
   config: Config;
   key: Buffer;
@@ -681,6 +681,6 @@ export class MainCheckService {
     if (flight && flight.until > now) return undefined;
     const notice = record.notice ?? 0;
     this.flights.set(projectId, { notice, until: now + NOTICE_FLIGHT_MS });
-    return { projectId, label: project.name, notice, outcome: outcomeOf(record.health), ...(record.health ? { summary: structuredClone(record.health) } : {}) };
+    return { projectId, label: project.name, notice, outcome: record.health.outcome, summary: structuredClone(record.health) };
   }
 }

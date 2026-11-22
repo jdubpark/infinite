@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { MainCheckNotice, MainCheckService } from "../packages/host/src/main-check.js";
 import type { MainCheckPorts } from "../packages/host/src/main-check-ports.js";
-import { checksDigest, outcomeOf, type MainCheckRecord, type Retiring } from "../packages/host/src/main-check-state.js";
+import { checksDigest, outcomeOf, type CheckSummary, type MainCheckRecord, type Retiring } from "../packages/host/src/main-check-state.js";
 import type { CensusResult } from "../packages/host/src/process-census.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { Counts } from "./outcome-sim-script.js";
@@ -43,8 +43,9 @@ async function sweep(seeds: readonly number[], counts: Counts, variant: Variant 
  * They follow the cases the specification lists: a host stop after each kind of record write; heads that move,
  * revert, repeat, arrive late or twice; two projects; a halt during a check; checks changing at a measured head; a
  * census that fails, finds processes or is clean; a removal that fails; acceptances at once, late, out of order,
- * stale or never. The thinnest ran 3 to 8 times: a stop after a `told` write, the R8 ending of a record that read
- * again, an out-of-order acceptance, and a stop on a write of close().
+ * stale or never; a failure told, then the checks changed, and nothing offered until the next result (I10). The
+ * thinnest ran 3 to 8 times: a stop after a `told` write, the R8 ending of a record that read again, an out-of-order
+ * acceptance, and a stop on a write of close().
  */
 const FLOORS: Readonly<Record<string, number>> = {
   "stop:after-create": 8, "stop:after-admission": 18, "stop:after-witness": 50, "stop:after-finish": 22, "stop:after-retire": 20,
@@ -63,10 +64,10 @@ const FLOORS: Readonly<Record<string, number>> = {
   "outcome:passed": 174, "outcome:failed": 88, "outcome:error:copy-changed": 77, "outcome:error:workspace": 90,
   "outcome:error:command-unavailable": 32, "outcome:error:stop-unconfirmed": 41, "outcome:interrupted:time-limit": 39,
   "outcome:interrupted:host-stop": 40, "outcome:interrupted:halt": 19,
-  "health:failed": 86, "health:passed": 42, "health:fixed-before-told": 12, "told:changed": 94,
-  "notice:offered:failed": 93, "notice:offered:passed": 20, "notice:offered:passed:no-summary": 12,
-  "notice:accepted:at-once": 83, "notice:accepted:late": 18, "notice:accepted:out-of-order": 3, "notice:accepted:stale": 5,
-  "notice:refused": 7, "notice:never": 17,
+  "health:failed": 86, "health:passed": 42, "health:fixed-before-told": 7, "told:changed": 88,
+  "notice:offered:failed": 90, "notice:offered:passed": 22, "notice:withheld:told-failed-health-absent": 66,
+  "notice:accepted:at-once": 77, "notice:accepted:late": 17, "notice:accepted:out-of-order": 2, "notice:accepted:stale": 6,
+  "notice:refused": 5, "notice:never": 13,
 };
 
 test("the main check keeps its invariants across host stops, halts, faults and late acceptances", async t => {
@@ -178,6 +179,17 @@ const MUTATIONS: readonly Mutation[] = [
         const { health: _health, ...rest } = record;
         const next: MainCheckRecord = best ? { ...rest, health: best } : rest;
         return outcomeOf(best) === outcomeOf(record.health) ? next : { ...next, notice: (record.notice ?? 0) + 1 };
+      };
+    }) },
+  { name: "an absent health counts as passed at the offer (the notice rule before the amendment)", invariant: "I10",
+    variant: patch(host => {
+      const offer = host.offer.bind(host);
+      host.offer = (projectId, slot, now) => {
+        const record = slot.record;
+        if (!record || record.health || record.told?.outcome !== "failed") return offer(projectId, slot, now);
+        const at = new Date(now).toISOString();
+        const passed: CheckSummary = { head: record.observed?.head ?? "0".repeat(40), checks: "0".repeat(64), observedAt: at, outcome: "passed", finishedAt: at, expected: 0 };
+        return offer(projectId, { record: { ...record, health: passed } }, now);
       };
     }) },
   { name: "the halt is never read", invariant: "I8",

@@ -26,13 +26,16 @@ import { clearFaults, Clock, guard, hex, type Life, type Nature, World, type Wor
  * I4 A directory is removed only after a census of its current witness that finished and found nothing, never for a
  *    recording entry of the same boot left by an earlier host process, and never while a process of its run lives;
  *    after the drain every run directory is removed.
- * I5 `told` changes only on an acceptance, to what was accepted and never back; after the drain it equals health's outcome.
+ * I5 `told` changes only on an acceptance, to what was accepted and never back; after the drain, where health is
+ *    present, it equals health's outcome.
  * I6 A notice is offered only while it is due: a failure nobody was told about, then fixed, offers nothing further.
  * I7 `health` is the result of the most recently observed head that has a result with the current digest, and
  *    `notice` went up exactly when its outcome changed.
  * I8 Under a halt nothing is admitted; a check that runs into a halt ends interrupted once a halt poll passed (unless
  *    an earlier stop or an unconfirmed stop decided its ending), and ends within a poll and the stop bound.
  * I9 A result is recorded only for a check whose copy was at the head and clean after every command.
+ * I10 Every offered notice carries health as its summary, with the same outcome; nothing is offered while health is
+ *    absent, also when the owner was last told of a failure and the checks changed.
  * Other labels name rules the simulator also checks: R1, R2, R4, R5, R6, R8, R9 and close.
  */
 
@@ -420,7 +423,7 @@ class Sim {
     if (delta !== (changed ? 1 : 0)) this.fail("I7", `notice moved by ${delta} while health went from ${show(prev?.health)} to ${show(next.health)}`);
     if (changed) bump(this.counts, `health:${outcomeOf(next.health)}`);
     // I6's case: a failure the owner was never told about is fixed, so nothing is due.
-    if (changed && outcomeOf(next.health) === "passed" && outcomeOf(next.told) === "passed") bump(this.counts, "health:fixed-before-told");
+    if (changed && next.health?.outcome === "passed" && outcomeOf(next.told) === "passed") bump(this.counts, "health:fixed-before-told");
   }
 
   private checkAttempts(projectId: string, next: MainCheckRecord) {
@@ -460,10 +463,12 @@ class Sim {
     const record = this.durable(notice.projectId);
     const flight = this.flights.get(notice.projectId);
     if (flight && flight.until > this.clock.now) this.fail("R9", `a notice of ${notice.projectId} was offered while notice ${flight.notice} is in flight`);
-    if (!record || outcomeOf(record.health) === outcomeOf(record.told)) this.fail("I6", `notice ${notice.notice} (${notice.outcome}) was offered while health is ${show(record?.health)} and the owner was told ${record?.told?.outcome ?? "nothing"}`);
-    if (notice.outcome !== outcomeOf(record.health) || notice.notice !== (record.notice ?? 0) || !isDeepStrictEqual(notice.summary, record.health)) this.fail("R9", "the notice is not health's generation, outcome and summary");
+    if (!record?.health) this.fail("I10", `notice ${notice.notice} (${notice.outcome}) was offered while health is absent and the owner was told ${record?.told?.outcome ?? "nothing"}`);
+    if (notice.outcome !== record.health.outcome || !isDeepStrictEqual(notice.summary, record.health)) this.fail("I10", `notice ${notice.notice} says ${notice.outcome} with ${show(notice.summary)} while health is ${show(record.health)}`);
+    if (record.health.outcome === outcomeOf(record.told)) this.fail("I6", `notice ${notice.notice} (${notice.outcome}) was offered while health is ${show(record.health)} and the owner was told ${record.told?.outcome ?? "nothing"}`);
+    if (notice.notice !== (record.notice ?? 0)) this.fail("R9", `notice ${notice.notice} is not health's generation ${record.notice ?? 0}`);
     if (mainCheckSetting(this.project(notice.projectId).team) === undefined) this.fail("R9", "a notice was offered with the setting off");
-    bump(this.counts, `notice:offered:${notice.outcome}${notice.summary ? "" : ":no-summary"}`);
+    bump(this.counts, `notice:offered:${notice.outcome}`);
     this.flights.set(notice.projectId, { notice: notice.notice, until: this.clock.now + 60_000 });
   }
 
@@ -693,6 +698,11 @@ class Sim {
   private notify(all: boolean) {
     const offered = this.service.notices();
     this.raise();
+    // I10's case: the owner was told of a failure, the checks changed, and no result has the new ones yet.
+    for (const id of PROJECTS) {
+      const record = this.durable(id);
+      if (record?.told?.outcome === "failed" && !record.health && mainCheckSetting(this.project(id).team)) bump(this.counts, "notice:withheld:told-failed-health-absent");
+    }
     for (const notice of offered) {
       this.checkOffer(notice);
       const roll = all ? 0 : this.runtime.next();
@@ -771,7 +781,7 @@ class Sim {
       if (record.running || record.retiring?.length) return false;
       const head = record.observed?.head;
       if (head && !this.settledHead(id, record, head)) return false;
-      if (outcomeOf(record.health) !== outcomeOf(record.told)) return false;
+      if (record.health && record.health.outcome !== outcomeOf(record.told)) return false;
     }
     return true;
   }
@@ -812,8 +822,9 @@ class Sim {
       if (record.retiring?.length) this.fail("I4", `${record.retiring.length} run directories of ${id} were not retired with a clean census and working removal`);
       const head = record.observed?.head;
       if (head && !this.settledHead(id, record, head)) this.fail("I3", `the observed head ${short(head)} of ${id} has neither a result nor 3 charged admissions after the drain`);
-      if (outcomeOf(record.health) !== outcomeOf(record.told)) this.fail("I5", `told is ${record.told?.outcome ?? "absent"} while health is ${show(record.health)} after every notice was accepted`);
-      bump(this.counts, `end:${outcomeOf(record.health)}`);
+      // I5's end condition holds where health is present; without a result under the current checks nothing is due.
+      if (record.health && record.health.outcome !== outcomeOf(record.told)) this.fail("I5", `told is ${record.told?.outcome ?? "absent"} while health is ${show(record.health)} after every notice was accepted`);
+      bump(this.counts, `end:${record.health ? record.health.outcome : "no-health"}`);
     }
     for (const run of this.world.runs.values()) if (run.exists) this.fail("I4", `the run directory ${run.path} is still on disk after the drain`);
   }

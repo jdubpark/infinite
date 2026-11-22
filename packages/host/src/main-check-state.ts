@@ -283,9 +283,13 @@ export function setWaiting(record: MainCheckRecord, waiting: MainCheckWaiting | 
   return assign(record, "waiting", waiting);
 }
 
-/** R9: health's outcome differs from what the owner was told. The caller checks that the setting is present. */
-export function noticeDue(record: MainCheckRecord): boolean {
-  return outcomeOf(record.health) !== outcomeOf(record.told);
+/**
+ * R9: health is present and its outcome differs from what the owner was told. The caller checks that the setting is
+ * present. While no result has the current checks, nothing is due, also after a failure was told: the next result
+ * decides, so a notice always carries the result it speaks about.
+ */
+export function noticeDue(record: MainCheckRecord): record is MainCheckRecord & { health: CheckSummary } {
+  return record.health !== undefined && record.health.outcome !== outcomeOf(record.told);
 }
 
 /**

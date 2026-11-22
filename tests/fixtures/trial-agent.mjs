@@ -7,6 +7,8 @@
 //   { "mode": "silent" }                 exits without a report
 //   { "mode": "stall" }                  prints nothing and waits
 //   { "mode": "permission" }             draws a dialog that the pipeline leaves to a person
+//   { "mode": "permission-late" }        reports the same request by hook, and draws its dialog 300 ms later
+//   { "mode": "permission-unread" }      reports the same request by hook, and never draws a dialog
 //   { "mode": "limit" }                  prints a usage-limit notice and reports the limit to the host
 import { cpSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -41,6 +43,8 @@ async function hook(body) {
 }
 
 const result = { kind: "result", summary: "The trial member finished its assignment." };
+const dialog = ["Bash command", "  rm -rf build", "", "Do you want to proceed?", "❯ 1. Yes", "  2. No"].join("\n");
+const request = { hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command: "rm -rf build" } };
 if (mode === "reference") {
   cpSync(dir, process.cwd(), { recursive: true, filter: source => !source.endsWith(".git") });
   await report(result);
@@ -60,8 +64,16 @@ if (mode === "reference") {
 } else if (mode === "stall") {
   forever();
 } else if (mode === "permission") {
-  console.log(["Bash command", "  rm -rf build", "", "Do you want to proceed?", "❯ 1. Yes", "  2. No"].join("\n"));
-  await hook({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command: "rm -rf build" } });
+  console.log(dialog);
+  await hook(request);
+  forever();
+} else if (mode === "permission-late") {
+  await hook(request);
+  await sleep(300);
+  console.log(dialog);
+  forever();
+} else if (mode === "permission-unread") {
+  await hook(request);
   forever();
 } else if (mode === "limit") {
   console.log("You've hit your session limit · resets 3:45pm");

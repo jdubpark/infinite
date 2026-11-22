@@ -235,19 +235,41 @@ test("a replay run never acts on the world outside its workspace", { timeout: 12
   }
 });
 
+/** Installs a permission agent that serves every project and leaves each dialog to the owner. Returns the targets it was handed. */
+function leavingAgent(context: Awaited<ReturnType<typeof replayFixture>>): unknown[] {
+  const handled: unknown[] = [];
+  context.service.usePermissionAgent({
+    delivery: { addSource: () => () => {}, handle: async (target: unknown) => { handled.push(target); return { handled: false }; } },
+    pipeline: { serves: () => ({ served: true }), taskEnded: () => {} },
+  } as never);
+  return handled;
+}
+
 test("a replay run's permission hand-off reads the member's changes as the eval identity", { timeout: 120000 }, async () => {
   const context = await replayFixture();
   try {
-    const handled: unknown[] = [];
-    context.service.usePermissionAgent({
-      delivery: { addSource: () => () => {}, handle: async (target: unknown) => { handled.push(target); return { handled: false }; } },
-      pipeline: { serves: () => ({ served: true }), taskEnded: () => {} },
-    } as never);
+    const handled = leavingAgent(context);
     const { trialId } = await context.start("permission");
     assert.equal((await context.ended(trialId))?.ending, "permission");
     assert.ok(handled.length > 0, "the dialog was handed to the permission agent first");
     const teamCommands = join(context.f.receipts, "commands.jsonl");
     assert.equal(existsSync(teamCommands) ? readFileSync(teamCommands, "utf8").includes(trialId) : false, false, "the hand-off ran no command through the team prefix");
+  } finally {
+    await context.f.close();
+  }
+});
+
+test("a replay run holds a dialog that only a hook has reported, for a bounded time", { timeout: 120000 }, async () => {
+  const context = await replayFixture();
+  try {
+    const handled = leavingAgent(context);
+    const late = await context.start("permission-late");
+    assert.equal((await context.ended(late.trialId))?.ending, "permission");
+    assert.equal(handled.length > 0, true, "the trial waited for the screen to show the dialog, and the permission agent was asked");
+    handled.length = 0;
+    const unread = await context.start("permission-unread");
+    assert.equal((await context.ended(unread.trialId))?.ending, "permission", "a dialog the screen never shows does not hold the trial");
+    assert.equal(handled.length, 0, "and it is never handed to the permission agent");
   } finally {
     await context.f.close();
   }

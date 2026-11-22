@@ -34,7 +34,8 @@ export type AnswerResult = "closed" | "still-open" | "changed" | "refused";
 
 export type Signal =
   | { kind: "hooks-ready"; event: string }
-  | { kind: "turn-start"; prompt?: string }
+  /** `automatic`: the provider submitted this prompt itself (the continue after an owner's answer), not a person. */
+  | { kind: "turn-start"; prompt?: string; automatic?: true }
   | { kind: "turn-end"; message?: string; backgroundTasks?: number; stopHookActive?: boolean; failed?: boolean }
   | { kind: "tool-start"; tool: string; toolUseId?: string; input: Record<string, unknown>; quiet: boolean; destructive?: { pattern: string } }
   | { kind: "tool-end"; tool: string; toolUseId?: string; ok: boolean; durationMs?: number; summary?: string; files?: string[]; error?: string }

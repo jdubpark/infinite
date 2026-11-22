@@ -149,3 +149,13 @@ test("an unmatched REPL end preserves a running Bash tool and its permission pro
   assert.equal(attention.prompt?.tool?.name, "Bash");
   assert.equal(attention.state, "needs-you");
 });
+
+// The hook of the provider's own continue has no marker: the worker adds it, because only the worker knows it resumed.
+test("the continue prompt hook maps to a plain turn-start with no automatic marker", () => {
+  const body = {
+    session_id: "00000000-0000-4000-8000-000000000001", transcript_path: "/home/dev/.claude/projects/demo/00000000-0000-4000-8000-000000000001.jsonl",
+    cwd: "/home/dev/projects/demo", prompt_id: "00000000-0000-4000-8000-000000000002", permission_mode: "default",
+    hook_event_name: "UserPromptSubmit", prompt: "Continue from where you left off.",
+  };
+  assert.deepEqual(mapClaudeHook(body), [{ kind: "turn-start", prompt: "Continue from where you left off." }]);
+});

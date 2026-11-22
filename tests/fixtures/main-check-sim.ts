@@ -32,7 +32,9 @@ import { clearFaults, Clock, guard, hex, type Life, type Nature, World, type Wor
  * I7 `health` is the result of the most recently observed head that has a result with the current digest, and
  *    `notice` went up exactly when its outcome changed.
  * I8 Under a halt nothing is admitted; a check that runs into a halt ends interrupted once a halt poll passed (unless
- *    an earlier stop or an unconfirmed stop decided its ending), and ends within a poll and the stop bound.
+ *    an earlier stop or an unconfirmed stop decided its ending), and ends within a poll and the stop bound. A check
+ *    whose halt was surely read before its time limit or a host stop could stop it ends interrupted/halt, or
+ *    error/stop-unconfirmed when its command did not confirm the stop.
  * I9 A result is recorded only for a check whose copy was at the head and clean after every command.
  * I10 Every offered notice carries health as its summary, with the same outcome; nothing is offered while health is
  *    absent, also when the owner was last told of a failure and the checks changed.
@@ -201,6 +203,12 @@ function projectOf(id: ProjectId, variant: number): Project {
   };
 }
 
+/**
+ * The causes that can stop one check, with times. A halt could be read from `from` on and surely was by `by`, unless
+ * it was lifted sooner (then `by` is absent). A time limit and a host stop happen at their time.
+ */
+type Stops = { halt?: { from: number; by?: number }; limit?: number; hostStop?: number };
+
 class Sim {
   readonly clock = new Clock(T0);
   readonly world: World;
@@ -226,6 +234,8 @@ class Sim {
   private earlier = new Set<string>();
   private readonly censuses = new Map<string, { life: number; clean: boolean; witness: string }>();
   private readonly haltSince = new Map<string, number>();
+  /** I8: by run directory, for each check of this process, what could stop it and when. */
+  private readonly stops = new Map<string, Stops>();
   private readonly flights = new Map<string, { notice: number; until: number }>();
   private pending: MainCheckNotice[] = [];
   private readonly acceptedUpTo = new Map<string, number>();
@@ -314,6 +324,10 @@ class Sim {
         if (timeoutMs !== MINUTES * 60_000 || forceSettleAfterMs !== STOP_BOUND_MS) this.fail("R5", `a check command ran with a time limit of ${timeoutMs} ms and a stop bound of ${forceSettleAfterMs} ms`);
         if (!this.project(run.projectId).team!.checks.concat(this.project(run.projectId).team!.setup ?? []).some(item => isDeepStrictEqual(item, command))) bump(this.counts, "command:from-earlier-checks");
       }),
+      limit: (run, at) => {
+        const stops = this.stopsOf(run.path);
+        if (stops) stops.limit ??= at;
+      },
       natureOf: (projectId, head) => {
         const index = this.heads[projectId as ProjectId].indexOf(head);
         return { nature: this.s.natures[projectId as ProjectId][index]![this.variants.get(projectId)!]!, planLength: this.planLength(projectId) };
@@ -354,7 +368,48 @@ class Sim {
     this.charged.set(key, count);
     if (count > 3) this.fail("I3", `${short(running.head)} was admitted a ${count}th time with the same checks`);
     this.admitted.set(pathOf(running), { projectId, life: this.life.id });
+    this.stops.set(pathOf(running), {});
     bump(this.counts, `admission:${projectId}`);
+  }
+
+  /** The stop causes of a check this process admitted. */
+  private stopsOf(path: string): Stops | undefined {
+    return this.admitted.get(path)?.life === this.life.id ? this.stops.get(path) : undefined;
+  }
+
+  /** The running check of `id`, when this process admitted it. */
+  private runningHere(id: string): string | undefined {
+    const running = this.durable(id)?.running;
+    return running && this.stopsOf(pathOf(running)) ? pathOf(running) : undefined;
+  }
+
+  /** After the halts changed: a halt that lasts a poll and its slack is surely read; one lifted sooner may not be. */
+  private noteHalts() {
+    for (const id of PROJECTS) {
+      const path = this.runningHere(id);
+      const stops = path === undefined ? undefined : this.stops.get(path);
+      if (!stops) continue;
+      const halt = stops.halt;
+      if (this.halts(id)) {
+        if (!halt) stops.halt = { from: this.clock.now, by: this.clock.now + HALT_WINDOW_MS };
+        else halt.by ??= this.clock.now + HALT_WINDOW_MS;
+      } else if (halt?.by !== undefined && this.clock.now < halt.by) {
+        delete halt.by;
+      }
+    }
+  }
+
+  /**
+   * I8: the halt came first. Either it was surely read before the check ended and before any other cause, or the
+   * check was stopped and nothing but the halt was there to stop it.
+   */
+  private haltFirst(stops: Stops | undefined, stopped: boolean): boolean {
+    const halt = stops?.halt;
+    if (!halt) return false;
+    const others = [stops!.limit, stops!.hostStop].filter((at): at is number => at !== undefined);
+    const by = halt.by;
+    if (by !== undefined && by < this.clock.now && others.every(at => at > by)) return true;
+    return stopped && others.length === 0;
   }
 
   private onFinish(projectId: string, prev: MainCheckRecord, next: MainCheckRecord) {
@@ -372,10 +427,18 @@ class Sim {
     }
     bump(this.counts, `outcome:${last.outcome}${last.reason ? `:${last.reason}` : ""}`);
     // Once a halt poll passed, the check was told to stop: it ends interrupted, unless an earlier stop or an
-    // unconfirmed stop decided its ending.
+    // unconfirmed stop decided its ending. When the halt surely came first, it ends interrupted by the halt.
     const since = this.haltSince.get(projectId);
-    const stopped = last.outcome === "interrupted" || last.reason === "stop-unconfirmed";
-    if (since !== undefined && this.clock.now - since > HALT_WINDOW_MS && !stopped) this.fail("I8", `the check ended ${last.outcome}${last.reason ? `/${last.reason}` : ""} ${this.clock.now - since} ms into a halt`);
+    const ending = `${last.outcome}${last.reason ? `/${last.reason}` : ""}`;
+    const unconfirmed = last.outcome === "error" && last.reason === "stop-unconfirmed";
+    const stopped = last.outcome === "interrupted" || unconfirmed;
+    const stops = this.stops.get(pathOf(running));
+    this.stops.delete(pathOf(running));
+    if (this.haltFirst(stops, stopped)) {
+      bump(this.counts, "halt:first");
+      if (ending !== "interrupted/halt" && !unconfirmed) this.fail("I8", `the check met a halt first and ended ${ending}`);
+    }
+    if (since !== undefined && this.clock.now - since > HALT_WINDOW_MS && !stopped) this.fail("I8", `the check ended ${ending} ${this.clock.now - since} ms into a halt`);
     if (since !== undefined && last.reason === "halt") bump(this.counts, "halt:check-interrupted");
     if (last.outcome === "passed" || last.outcome === "failed") {
       const run = this.world.runs.get(pathOf(running));
@@ -644,6 +707,7 @@ class Sim {
         if (this.durable(id)?.running) bump(this.counts, "halt:during-check");
       }
     }
+    this.noteHalts();
     bump(this.counts, `halt:${scope === "host" || scope === "throw" ? scope : "project"}:${on ? "on" : "off"}`);
   }
 
@@ -746,6 +810,10 @@ class Sim {
   /** close(), then a new process. An armed stop may still land on a write of the shutdown. */
   private async restart() {
     const life = this.life;
+    for (const id of PROJECTS) {
+      const path = this.runningHere(id);
+      if (path !== undefined) this.stops.get(path)!.hostStop ??= this.clock.now;
+    }
     const closing = this.service.close();
     let done = false;
     void closing.then(() => { done = true; });
@@ -798,6 +866,7 @@ class Sim {
     this.disarm();
     this.world.faults = clearFaults();
     this.haltSince.clear();
+    this.noteHalts();
     this.identity(true);
     for (const id of PROJECTS) this.setting(id, true);
     this.restore();

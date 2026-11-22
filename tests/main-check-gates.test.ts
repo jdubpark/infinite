@@ -35,6 +35,7 @@ const hooks = (world: () => World): WorldHooks => ({
   remove: () => undefined,
   prepare: mirror => /\/mirrors\/([a-z0-9-]+)\.git$/.exec(mirror)![1]!,
   command: () => undefined,
+  limit: () => undefined,
   natureOf: () => ({ nature: { kind: "pass" }, planLength: 1 }),
   otherHead: head => head,
 });

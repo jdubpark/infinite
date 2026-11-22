@@ -3,7 +3,7 @@ import type { MainCheckRecord } from "../../packages/host/src/main-check-state.j
 import type { CensusFinding, CensusResult, ProcessRow, ProcessTable, ProcessWitness } from "../../packages/host/src/process-census.js";
 import type { VolumeUsage } from "../../packages/host/src/storage.js";
 import type { TeamCommand } from "../../packages/host/src/team-types.js";
-import { commandScope, TeamError, type CommandResult, type CommandScope } from "../../packages/host/src/team-workspace.js";
+import { commandScope, EXIT_DRAIN_MS, TeamError, type CommandResult, type CommandScope } from "../../packages/host/src/team-workspace.js";
 import { bump, type Counts, type Rand } from "../outcome-sim-script.js";
 
 /*
@@ -135,6 +135,8 @@ export interface WorldHooks {
   prepare(mirror: string, head: string, root: string, directoryName: string, branch: string, teamwork: boolean): string;
   /** Checks the arguments R5 fixes for a configured command. */
   command(run: WorldRun, command: TeamCommand, timeoutMs: number | undefined, forceSettleAfterMs: number | undefined): void;
+  /** A configured command was still running at its time limit, `at`; told when it settles. */
+  limit(run: WorldRun, at: number): void;
   natureOf(projectId: string, head: string): { nature: Nature; planLength: number };
   otherHead(projectId: string, head: string): string;
 }
@@ -280,14 +282,14 @@ export class World {
   }
 
   /** teamCommand's shape: the scope hears of the command before it starts, and of its pid right after. */
-  private command(life: Life, run: WorldRun, behavior: Behavior, signal: AbortSignal | undefined, timeoutMs: number, forceSettleAfterMs: number | undefined, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
+  private command(life: Life, run: WorldRun, behavior: Behavior, signal: AbortSignal | undefined, timeoutMs: number, forceSettleAfterMs: number | undefined, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void, limited?: (at: number) => void): Promise<CommandResult> {
     const scope = commandScope.getStore();
     const ready = scope?.starting();
-    const start = () => this.start(life, scope, run, behavior, signal, timeoutMs, forceSettleAfterMs, onOutput);
+    const start = () => this.start(life, scope, run, behavior, signal, timeoutMs, forceSettleAfterMs, onOutput, limited);
     return ready ? ready.then(start) : start();
   }
 
-  private start(life: Life, scope: CommandScope | undefined, run: WorldRun, behavior: Behavior, signal: AbortSignal | undefined, timeoutMs: number, forceSettleAfterMs: number | undefined, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
+  private start(life: Life, scope: CommandScope | undefined, run: WorldRun, behavior: Behavior, signal: AbortSignal | undefined, timeoutMs: number, forceSettleAfterMs: number | undefined, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void, limited?: (at: number) => void): Promise<CommandResult> {
     // The host process ended right after a write: the command it was about to start never starts.
     if (life.stopped) return new Promise<CommandResult>(() => undefined);
     if (behavior.end === "unavailable") {
@@ -303,15 +305,29 @@ export class World {
       let stopRequested = false;
       const timers: Timer[] = [];
       let output = "";
+      const limit = this.clock.now + timeoutMs;
       const done = () => {
         settled = true;
         for (const timer of timers) this.clock.cancel(timer);
         signal?.removeEventListener("abort", stop);
         proc.onExit = undefined;
+        if (this.clock.now >= limit) limited?.(limit);
       };
+      const settle = () => {
+        if (settled) return;
+        done();
+        resolve({ exitCode: proc.exitCode, output, stdout: output, interrupted, truncated: draining });
+      };
+      // Under `endsWithLeader`, a leader whose child outlives it settles at the end of the drain, or at once on a stop.
+      let draining = false;
       const stop = () => {
         // A host that stopped signals nothing.
         if (life.stopped || stopRequested || settled) return;
+        if (draining) {
+          bump(this.counts, "command:drain-stopped");
+          settle();
+          return;
+        }
         stopRequested = true;
         interrupted = true;
         if (proc.killable) {
@@ -327,8 +343,14 @@ export class World {
       };
       proc.onExit = () => {
         if (settled) return;
-        done();
-        resolve({ exitCode: proc.exitCode, output, stdout: output, interrupted, truncated: false });
+        if (stopRequested || !scope?.endsWithLeader || !proc.children.some(child => this.processes.has(child.pid))) {
+          settle();
+          return;
+        }
+        // The child holds the pipes; its own close within the second is not modelled.
+        draining = true;
+        bump(this.counts, "command:drained");
+        timers.push(this.clock.set(life, settle, EXIT_DRAIN_MS));
       };
       timers.push(this.clock.set(life, stop, timeoutMs));
       signal?.addEventListener("abort", stop, { once: true });
@@ -403,7 +425,7 @@ export class World {
     this.hooks.command(run, command, timeoutMs, forceSettleAfterMs);
     const behavior = this.behaviorOf(run, run.commandIndex);
     run.commandIndex += 1;
-    return this.command(life, run, behavior, signal, timeoutMs ?? 600_000, forceSettleAfterMs, onOutput);
+    return this.command(life, run, behavior, signal, timeoutMs ?? 600_000, forceSettleAfterMs, onOutput, at => this.hooks.limit(run, at));
   }
 
   private async assertClean(life: Life, cwd: string, base: string, signal: AbortSignal | undefined) {

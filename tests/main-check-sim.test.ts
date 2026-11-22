@@ -9,7 +9,7 @@ import type { Counts } from "./outcome-sim-script.js";
 import { simulate, type Variant, Violation } from "./fixtures/main-check-sim.js";
 
 /*
- * Runs the main-check simulator (tests/fixtures/main-check-sim.ts, which states the invariants I1-I9) over the default
+ * Runs the main-check simulator (tests/fixtures/main-check-sim.ts, which states the invariants I1-I10) over the default
  * corpus, and checks that each mutant below is caught through the invariant it names while the same corpus passes
  * without it.
  */
@@ -41,12 +41,14 @@ async function sweep(seeds: readonly number[], counts: Counts, variant: Variant 
 /**
  * Floors for the default corpus at about half of what it produced, so a generator that stops producing a case fails.
  * They follow the cases the specification lists: a host stop after each kind of record write; heads that move,
- * revert, repeat, arrive late or twice; two projects; a halt during a check; checks changing at a measured head; a
+ * revert, repeat, arrive late or twice; two projects; a halt during a check, and one that surely came before any other
+ * stop; a command whose leader exits while its child holds the pipes; checks changing at a measured head; a
  * census that fails, finds processes or is clean; a removal that fails; acceptances at once, late, out of order,
  * stale or never (a push that reached no device), and a notice offered again once its minute in flight ended; a
  * failure told, then the checks changed, and nothing offered until the next result (I10). The
  * thinnest ran 3 to 8 times: a stop after a `told` write, the R8 ending of a record that read again, an out-of-order
- * acceptance, and a stop on a write of close().
+ * acceptance, and a stop on a write of close(). A stop inside a command's drain ran once (`command:drain-stopped`) and
+ * has no floor; the real-process tests in tests/team-command-leader.test.ts cover it.
  */
 const FLOORS: Readonly<Record<string, number>> = {
   "stop:after-create": 8, "stop:after-admission": 18, "stop:after-witness": 50, "stop:after-finish": 22, "stop:after-retire": 20,
@@ -56,8 +58,8 @@ const FLOORS: Readonly<Record<string, number>> = {
   "admission:alpha": 415, "admission:beta": 309, "start:sudo": 32, "setting:off": 69,
   "fetch:next:observed": 730, "fetch:revert:observed": 319, "fetch:repeat:observed": 265, "fetch:duplicate:observed": 186,
   "fetch:late:observed": 24, "fetch:late:ignored": 178, "fetch:foreign:ignored": 70,
-  "halt:during-check": 44, "halt:check-interrupted": 19, "waiting:halt": 132,
-  "checks:changed-at-measured-head": 28, "command:from-earlier-checks": 3,
+  "halt:during-check": 44, "halt:check-interrupted": 19, "halt:first": 21, "waiting:halt": 132,
+  "checks:changed-at-measured-head": 28, "command:from-earlier-checks": 3, "command:drained": 277,
   "census:run:clean": 1097, "census:run:finds": 700, "census:run:fail": 45, "census:root:fail": 121,
   "removal:fail": 17, "waiting:cleanup": 5, "waiting:processes": 296, "retire:removed:earlier": 219,
   "waiting:another-check": 248, "waiting:attempts": 99, "waiting:execution-identity": 13, "waiting:census-unavailable": 29,
@@ -102,6 +104,7 @@ type Private = {
   settled(projectId: string, record: MainCheckRecord): MainCheckRecord;
   removable(projectId: string, entry: Retiring, result: CensusResult): boolean;
   halted(projectId: string): boolean;
+  stop(active: unknown, reason: "halt" | "host-stop" | "time-limit"): void;
   offer(projectId: string, slot: Slot, now: number): MainCheckNotice | undefined;
   notices(): MainCheckNotice[];
 };
@@ -200,6 +203,11 @@ const MUTATIONS: readonly Mutation[] = [
   { name: "a running check does not poll the halt; only the read before each command sees it", invariant: "I8",
     variant: patch(host => {
       host.pollHalt = () => undefined;
+    }) },
+  { name: "a check stopped by a halt is recorded as stopped by the host", invariant: "I8",
+    variant: patch(host => {
+      const stop = host.stop.bind(host);
+      host.stop = (active, reason) => stop(active, reason === "halt" ? "host-stop" : reason);
     }) },
   { name: "the copy is not checked after each command (one instance's assertClean port)", invariant: "I9",
     variant: patch(host => {

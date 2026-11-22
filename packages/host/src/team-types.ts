@@ -6,6 +6,7 @@ import { evalProjectSchema, CANDIDATE_PROFILES_MAX } from "./eval-config.js";
 import type { TrialEnding } from "./eval-types.js";
 import { POINTS_ALGORITHM_VERSION, teamRoutingSchema } from "./routing-policy.js";
 import { intentCheckReportSchema } from "./intent-report.js";
+import { judgementReportSchema } from "./judge-types.js";
 import { criteriaRowsSchema, verdictReportSchema, type RunAssessment } from "./verdict-types.js";
 import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
 import type { RoutingKnobs, TeamRunRouting } from "./routing-types.js";
@@ -274,13 +275,16 @@ export const teamLineupSchema = z.object({
   escalations: z.array(teamModelProfileSchema).min(1).max(8).optional(),
   fallbacks: z.array(teamModelProfileSchema).min(1).max(8).optional(),
   permissionReviewer: teamModelProfileSchema.optional(),
-  // Keep this last: lineup fingerprints include the parsed object's key order.
   /** Read-only intent checkers, strongest first. Each must be strong; the checker's family must differ from the coordinator's. */
   evaluators: z.array(teamModelProfileSchema).min(1).max(4).optional(),
+  // Keep this last: lineup fingerprints include the parsed object's key order.
+  /** The blind judge of a duel or calibration. Not a pool member: no routing, trial, or fallback chain sees it. */
+  judge: teamModelProfileSchema.optional(),
 }).strict().superRefine((lineup, context) => {
   for (const [index, profile] of (lineup.evaluators ?? []).entries()) {
     if (profile.tier !== "strong") context.addIssue({ code: "custom", path: ["evaluators", index, "tier"], message: "An evaluator must be a strong profile" });
   }
+  if (lineup.judge?.limitFallback !== undefined) context.addIssue({ code: "custom", path: ["judge", "limitFallback"], message: "A judge profile cannot have a limit fallback" });
   if (lineup.permissionReviewer && lineup.permissionReviewer.provider !== "claude")
     context.addIssue({ code: "custom", path: ["permissionReviewer", "provider"], message: "The permission reviewer profile must use Claude Code." });
   for (const pool of ["implementers", "escalations", "fallbacks", "evaluators"] as const) {
@@ -292,7 +296,7 @@ export const teamLineupSchema = z.object({
   }
   const identities = new Map<string, string>();
   const profiles = lineupProfiles(lineup);
-  for (const profile of profiles) {
+  for (const profile of [...profiles, ...(lineup.judge ? [lineup.judge] : [])]) {
     const identity = JSON.stringify([profile.provider, profile.model, profile.provider === "opencode" ? profile.variant : profile.effort, profile.tier, profile.dataUse ?? "standard", profile.limitFallback ?? null]);
     if (identities.has(profile.id) && identities.get(profile.id) !== identity)
       context.addIssue({ code: "custom", message: "A profile ID must identify the same provider, model, and effort throughout a lineup" });
@@ -607,6 +611,7 @@ const teamReportVariants = [
   z.object({ kind: z.literal("blocked"), summary: z.string().min(1).max(4000), blocker: blockerEvidenceSchema.optional() }).strict(),
   intentCheckReportSchema,
   verdictReportSchema,
+  judgementReportSchema,
 ] as const;
 /** What the report tool accepts from a member: every question carries the member's recommendation. */
 export const teamReportSchema = z.discriminatedUnion("kind", [...teamReportVariants,
@@ -620,7 +625,7 @@ export const recordedTeamReportSchema = z.discriminatedUnion("kind", [...teamRep
 export type TeamReport = z.infer<typeof recordedTeamReportSchema>;
 export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: recordedTeamReportSchema }).strict();
 export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
-export type TeamRole = "permission-coordinator" | "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery" | "intent-checker" | "evaluator";
+export type TeamRole = "permission-coordinator" | "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery" | "intent-checker" | "evaluator" | "judge";
 /** A mission coordinator's assignment carries the mission ID as `runId`; it reports `MissionReport`s. */
 export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole | "mission-coordinator"; taskId?: string; verificationRefused?: true; entryTools?: true;
   /** The host selects this member's escalation (implementer) or scout (project manager) profiles; a report may omit them. */

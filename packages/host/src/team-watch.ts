@@ -22,6 +22,7 @@ const roleNames: Record<string, string> = {
   reviewer: "Reviewer",
   delivery: "Delivery",
   evaluator: "Evaluator",
+  judge: "Judge",
 };
 
 export function teamMonitorText(team: any, checkedAt = "", detach = false): string {
@@ -103,7 +104,7 @@ export function failedTeamBriefRow(sessionId: string, error: string, previous: T
   return prior ? { ...prior, fetchError: error } : { sessionId, status: { state: "unknown", error }, fetchError: error };
 }
 
-const roleRank = ["project-manager", "intent-checker", "scout", "implementer", "integrator", "reviewer", "evaluator", "delivery"];
+const roleRank = ["project-manager", "intent-checker", "scout", "implementer", "integrator", "reviewer", "evaluator", "judge", "delivery"];
 
 export function orderedTeamMembers(team: any): any[] {
   const revision = team?.revision;

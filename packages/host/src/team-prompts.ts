@@ -195,7 +195,7 @@ export function teamContext(run: TeamRun, feedback?: string, configuredProject?:
     tasks: (run.tasks ?? []).map(withoutRouting),
     checks: run.checks ?? [],
     continuations: continuations.map(item => ({ ...item, tasks: item.tasks.map(withoutRouting) })),
-    memberReports: (run.members ?? []).filter(member => member.role !== "permission-coordinator" && member.role !== "evaluator").map(({ memberId, revision, role, taskId, status, baseCommit, report, stoppedReason, permissionBlocked }) => ({ memberId, revision, role, ...(taskId ? { taskId } : {}), status, baseCommit, ...(report ? { report } : {}), ...(stoppedReason ? { stoppedReason } : {}), ...(permissionBlocked ? { permissionBlocked } : {}) })),
+    memberReports: (run.members ?? []).filter(member => member.role !== "permission-coordinator" && member.role !== "evaluator" && member.role !== "judge").map(({ memberId, revision, role, taskId, status, baseCommit, report, stoppedReason, permissionBlocked }) => ({ memberId, revision, role, ...(taskId ? { taskId } : {}), status, baseCommit, ...(report ? { report } : {}), ...(stoppedReason ? { stoppedReason } : {}), ...(permissionBlocked ? { permissionBlocked } : {}) })),
     ...(run.permissionAgentDecisions?.length ? { permissionAgentDecisions: run.permissionAgentDecisions.slice(-20) } : {}),
     feedback: feedback ?? null,
   };

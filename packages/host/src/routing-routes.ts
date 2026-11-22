@@ -3,6 +3,7 @@ import { z } from "zod";
 import { startMode } from "./evaluator-profiles.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import { EvidenceError } from "./evidence/types.js";
+import { memberCodeModeExpected } from "./launch.js";
 import { objectivePromptFor } from "./objective-digest.js";
 import { routingExplain, routingStatus } from "./routing-reads.js";
 import { ROUTING_MODULE, setExplorePause } from "./routing-store.js";
@@ -66,6 +67,7 @@ export function routingRoutes(app: express.Express, deps: RoutingRouteDeps, guar
         entryTools: config.teams?.blackboard?.tools === true,
         // The shape a new run of this project would pin: the criteria digest, and the register when it is on.
         objectiveDigest: objectivePromptFor(project, startMode(project, config.teams?.lineup).mode),
+        codeMode: memberCodeModeExpected(config),
         now: new Date().toISOString(),
       }));
     } catch (error) {

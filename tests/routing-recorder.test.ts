@@ -51,7 +51,7 @@ const runOf = (lineup: TeamLineup, routing: TeamRun["routing"], id = "run-1", pr
 const taskOf = (id: string, extra: Record<string, unknown> = {}) =>
   ({ id, title: id, instructions: "do it", paths: PATHS, dependsOn: [], revision: 1, status: "pending", ...extra }) as unknown as TeamTask;
 const startOf = (run: TeamRun, task: TeamTask, extra: Partial<RouterStart> = {}): RouterStart =>
-  ({ run, task, publishHeads: false, entryTools: false, objectiveDigest: false, featureMap: undefined, limited: new Set(), ...extra });
+  ({ run, task, publishHeads: false, entryTools: false, objectiveDigest: false, codeMode: false, featureMap: undefined, limited: new Set(), ...extra });
 const recorder = (store: EvidenceStore, lines: string[] = [], clock?: () => number) =>
   new RoutingRecorder({ store, now: () => NOW, clock, log: line => lines.push(line) });
 const rowsOf = (store: EvidenceStore, runId: string, taskId: string) => store.read(db => taskDecisions(db, runId, taskId)).rows;

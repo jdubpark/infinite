@@ -408,15 +408,26 @@ test("entry tools change the prompt version only for entry roles", () => {
   }
 });
 
-// Base pin: with the switch off, every role and provider keeps the prompt version it had at the base commit.
+// Moved from 1dfe7b9b: Codex members get the working rule for tools (INF-350), and the project manager and the
+// reviewer get one sentence each on every provider (INF-343). Without those two sentences the Claude and OpenCode
+// pin is 8075cde0, its value before both changes.
 const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
 const PIN_PROVIDERS = ["claude", "codex", "opencode"] as const;
-// Moved from 2140e519 because questions now ask for a recommendation (INF-323).
-const PIN_VERSIONS_SHA256 = "1dfe7b9b8aff74f29c5570a3eca8b144da3f4b4e6c75af9b6681eadb766b9187";
+// INF-383 moved this pin to fc702f2f: the Codex working rule's signature sentences now name the callable form and the
+// nested result type, generated from the declared schemas, and the rule says what a failed call returns. No other
+// prompt version changed.
+const PIN_VERSIONS_SHA256 = "fc702f2f30c8f491371252dea4f30b12c493a0d4cb918619354a2b1d770e13d7";
+// INF-383 moved the Codex pin to 1690257f for the same working-rule change. The Claude and OpenCode pin is unchanged.
+const PIN_CODEX_VERSIONS_SHA256 = "1690257f5cd174cc239aa2dcfa555a1f6b9bb4d723344181744b6a92cbf424e5";
+const PIN_NON_CODEX_VERSIONS_SHA256 = "804d29fbd0d0bc826c7ef1cbcceff6b985ac61ed83b43996001ff4657418154c";
 
 test("the switch off keeps every prompt version", () => {
   const versions = PIN_ROLES.flatMap(role => PIN_PROVIDERS.map(provider => promptVersion(role, provider, undefined, true)));
   assert.equal(createHash("sha256").update(JSON.stringify(versions)).digest("hex"), PIN_VERSIONS_SHA256);
+  const codex = PIN_ROLES.map(role => promptVersion(role, "codex", undefined, true));
+  const nonCodex = PIN_ROLES.flatMap(role => (["claude", "opencode"] as const).map(provider => promptVersion(role, provider, undefined, true)));
+  assert.equal(createHash("sha256").update(JSON.stringify(codex)).digest("hex"), PIN_CODEX_VERSIONS_SHA256);
+  assert.equal(createHash("sha256").update(JSON.stringify(nonCodex)).digest("hex"), PIN_NON_CODEX_VERSIONS_SHA256, "Claude and OpenCode versions include the all-provider guidance");
   for (const role of PIN_ROLES) for (const provider of PIN_PROVIDERS) {
     assert.equal(promptVersion(role, provider, undefined, true, false, false), promptVersion(role, provider, undefined, true));
   }

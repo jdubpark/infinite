@@ -2,11 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, normalize } from "node:path";
 import { classify, classRulesDigest, EMBEDDED_COMMAND_LIMITS, raise } from "../packages/host/src/permission-classes.js";
 import { detectPrompt, type Prompt } from "@infinite/attention";
 import { familyOf } from "../packages/host/src/permission-families.js";
-import { realHostPath } from "../packages/host/src/permission-shell.js";
+import { readShell, realHostPath } from "../packages/host/src/permission-shell.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_TEXT } from "../packages/host/src/permission-policy.js";
 import { caseRequest, replaySetSchema, type ReplayCase } from "../packages/host/src/permission-replay.js";
 import {
@@ -313,6 +313,155 @@ test("literal shell bodies are read to three layers, a command behind a wrapper 
     "npx tsx scripts/x.ts", "uv run pytest", "ls | node scripts/count.mjs", "sed -i 's/foo/bar/' src/app.ts", "awk '{print $1}' log.txt", "git -c core.pager=cat log", `bash -l -c 'npm test'`])
     assert.deepEqual(raised(command), [], command);
   assert.ok(raised("perl -pi -e 's/a/b/' notes.txt").includes("raise:opaque"));
+});
+
+test("code environment assignments raise for strong review only where the shell consumes them", () => {
+  const request = (command: string) => bash(command);
+  const raised = (command: string) => raise(request(command), { rejectHistory: false });
+  const assignments = [
+    "NODE_OPTIONS", "LD_PRELOAD", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "ENV", "PERL5OPT", "RUBYOPT", "PYTHONSTARTUP",
+    "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_PAGER", "GIT_EDITOR", "GIT_ASKPASS", "SSH_ASKPASS",
+    "GIT_EXEC_PATH", "GIT_PROXY_COMMAND", "PROMPT_COMMAND", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+    "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL", "PAGER", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+  ];
+  for (const name of assignments) {
+    for (const command of [`${name}=ok true`, `env ${name}=ok true`])
+      assert.ok(readShell(command).opaqueReasons.includes("code-environment") && raised(command).includes("raise:opaque"), command);
+  }
+  const envTerminator = "env -- NODE_OPTIONS=--require=./setup.cjs true";
+  assert.ok(readShell(envTerminator).opaqueReasons.includes("code-environment") && raised(envTerminator).includes("raise:opaque"));
+  const wrapperBody = "NODE_OPTIONS=--require=./setup.cjs watch 'true'";
+  assert.ok(readShell(wrapperBody).opaqueReasons.includes("code-environment") && raised(wrapperBody).includes("raise:opaque"));
+
+  for (const command of [
+    "CI=1 NODE_ENV=test PORT=3000 FORCE_COLOR=0 node app.js", "env NODE_ENV=production node app.js",
+    "echo NODE_OPTIONS=--require ./setup.js", "printf '%s\\n' PYTHONPATH=src", "echo 'GIT_SSH_COMMAND=ssh'",
+  ]) assert.deepEqual(raised(command), [], command);
+});
+
+test("helper and config environment values exempt only the named inert values", () => {
+  const helpers = ["GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL", "PAGER"];
+  for (const name of helpers) for (const prefix of ["", "env "]) {
+    for (const value of ["", "cat", "true", ":", "/dev/null"])
+      assert.deepEqual(raise(bash(`${prefix}${name}=${value} git log`), { rejectHistory: false }), [], `${prefix}${name}=${value}`);
+    assert.ok(readShell(`${prefix}${name}='echo ok' git log`).opaqueReasons.includes("code-environment"), name);
+  }
+  for (const name of ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"]) for (const prefix of ["", "env "]) {
+    assert.deepEqual(raise(bash(`${prefix}${name}=/dev/null git log`), { rejectHistory: false }), []);
+    assert.ok(readShell(`${prefix}${name}=config git log`).opaqueReasons.includes("code-environment"), name);
+  }
+  for (const command of [
+    "GIT_PAGER=cat git log", "PAGER=cat git log -p", "GIT_EDITOR=true git rebase --continue",
+    "GIT_SEQUENCE_EDITOR=: git rebase -i HEAD~2", "EDITOR=true git commit --amend",
+  ]) assert.deepEqual(raise(bash(command), { rejectHistory: false }), [], command);
+});
+
+test("code search paths raise only for outside or unresolved entries", () => {
+  for (const name of ["NODE_PATH", "PYTHONPATH", "PERL5LIB", "RUBYLIB", "LD_LIBRARY_PATH", "GIT_DIR"]) {
+    for (const prefix of ["", "env "]) {
+      for (const value of ["", ".", "src", "./lib", ".git", ":src:./lib:", "foo..bar"])
+        assert.deepEqual(raise(bash(`${prefix}${name}=${value} true`), { rejectHistory: false }), [], `${prefix}${name}=${value}`);
+      for (const value of ["/opt/lib", "~/lib", "../lib", "src/../lib", "src/..", "src:$LIB", "src:/opt/lib", "src:~/lib", "src:../lib"])
+        assert.ok(readShell(`${prefix}${name}='${value}' true`).opaqueReasons.includes("code-environment"), `${prefix}${name}=${value}`);
+    }
+  }
+  for (const command of ["PYTHONPATH=. pytest", "PYTHONPATH=src python -m pytest", "NODE_PATH=./lib node app.js", "GIT_DIR=.git git status"])
+    assert.deepEqual(raise(bash(command), { rejectHistory: false }), [], command);
+});
+
+test("declaration builtins read code environment assignments with the same exemptions", () => {
+  for (const declaration of ["export", "declare -x", "typeset -x", "readonly"]) {
+    for (const assignment of ["NODE_OPTIONS=x", "GIT_SSH_COMMAND=x", "PAGER='echo ok'", "PYTHONPATH=../lib", "GIT_CONFIG_GLOBAL=config"]) {
+      const command = `${declaration} ${assignment}; npm test`;
+      assert.ok(readShell(command).opaqueReasons.includes("code-environment"), command);
+      assert.ok(raise(bash(command), { rejectHistory: false }).includes("raise:opaque"), command);
+    }
+    for (const assignment of ["CI=1", "GIT_PAGER=cat", "EDITOR=true", "PYTHONPATH=src", "GIT_DIR=.git", "GIT_CONFIG_SYSTEM=/dev/null"])
+      assert.deepEqual(raise(bash(`${declaration} ${assignment}; npm test`), { rejectHistory: false }), [], `${declaration} ${assignment}`);
+  }
+  assert.ok(readShell("export GIT_SSH_COMMAND=x && git fetch").opaqueReasons.includes("code-environment"));
+});
+
+test("listed environment appends always raise because the resulting value is unknown", () => {
+  const concatenated = "export PYTHONPATH=.; export PYTHONPATH+=.; python -m pytest";
+  assert.ok(readShell(concatenated).opaqueReasons.includes("code-environment"));
+  assert.ok(raise(bash(concatenated), { rejectHistory: false }).includes("raise:opaque"));
+  for (const command of ["PATH_SUFFIX+=x true", "CFLAGS+=-O2 make"])
+    assert.deepEqual(raise(bash(command), { rejectHistory: false }), [], command);
+  for (const prefix of ["", "env ", "env -- ", "export ", "declare -x ", "typeset -x ", "readonly "]) {
+    const suffix = ["", "env ", "env -- "].includes(prefix) ? " node app.js" : "; npm test";
+    for (const assignment of ["NODE_OPTIONS+=--require=./setup.cjs", "GIT_SSH_COMMAND+=x", "PYTHONPATH+=../lib",
+      "GIT_PAGER+=cat", "PYTHONPATH+=src", "GIT_DIR+=.git", "GIT_CONFIG_GLOBAL+=/dev/null", "NODE_OPTIONS+=--no-warnings", "NODE_OPTIONS+="]) {
+      const command = `${prefix}${assignment}${suffix}`;
+      assert.ok(readShell(command).opaqueReasons.includes("code-environment"), command);
+      assert.ok(raise(bash(command), { rejectHistory: false }).includes("raise:opaque"), command);
+    }
+    for (const assignment of ["CI+=1", "PATH_SUFFIX+=x", "CFLAGS+=-O2"])
+      assert.deepEqual(raise(bash(`${prefix}${assignment}${suffix}`), { rejectHistory: false }), [], `${prefix}${assignment}`);
+  }
+});
+
+test("wrapper environment options preserve code environment checks", () => {
+  for (const prefix of ["strace -E ", "strace -E", "strace --env ", "strace --env=", "run0 --setenv ", "run0 --setenv="]) {
+    for (const assignment of ["NODE_OPTIONS=--require=./setup.cjs", "NODE_OPTIONS+=--import=./setup.mjs", "NODE_OPTIONS+=--max-old-space-size=4096", "GIT_SSH_COMMAND=x"]) {
+      const command = `${prefix}${assignment} node app.js`;
+      assert.ok(readShell(command).opaqueReasons.includes("code-environment"), command);
+      assert.ok(raise(bash(command), { rejectHistory: false }).includes("raise:opaque"), command);
+    }
+    for (const assignment of ["CI=1", "PATH_SUFFIX+=x", "NODE_OPTIONS=--no-warnings", "GIT_PAGER=cat"]) {
+      const command = `${prefix}${assignment} node app.js`;
+      assert.deepEqual(readShell(command).opaqueReasons, [], command);
+      assert.ok(!raise(bash(command), { rejectHistory: false }).includes("raise:opaque"), command);
+    }
+  }
+  assert.deepEqual(raise(bash("strace -E NODE_OPTIONS node app.js"), { rejectHistory: false }), []);
+});
+
+test("NODE_OPTIONS exempts only complete lists of inert runtime options", () => {
+  const inert = [
+    "--max-old-space-size=4096", "--max-semi-space-size=64", "--stack-trace-limit=20", "--enable-source-maps", "--no-warnings",
+    "--trace-warnings", "--no-deprecation", "--trace-deprecation", "--unhandled-rejections=strict", "--unhandled-rejections=throw",
+    "--unhandled-rejections=warn", "--unhandled-rejections=warn-with-error-code", "--unhandled-rejections=none",
+    "--dns-result-order=verbatim", "--dns-result-order=ipv4first", "--dns-result-order=ipv6first", "--experimental-vm-modules", "--expose-gc",
+  ];
+  for (const value of ["", ...inert, inert.join(" "), "  --no-warnings\t--enable-source-maps  "])
+    for (const quote of ["'", '\"']) {
+      const command = `NODE_OPTIONS=${quote}${value}${quote} npm test`;
+      assert.deepEqual(raise(bash(command), { rejectHistory: false }), [], command);
+    }
+  assert.deepEqual(raise(bash("NODE_OPTIONS=--max-old-space-size=4096 npm test"), { rejectHistory: false }), []);
+  for (const value of ["--require=./setup.cjs", "-r ./setup.cjs", "--import=./setup.mjs", "--loader=./loader.mjs",
+    "--env-file=./settings", "--inspect", "--unknown", "--max-old-space-size=x", "--no-warnings=1", "--dns-result-order=unknown"]) {
+    for (const options of [value, `--no-warnings ${value}`, `${value} --no-warnings`]) {
+      const command = `NODE_OPTIONS='${options}' npm test`;
+      assert.ok(readShell(command).opaqueReasons.includes("code-environment"), command);
+      assert.ok(raise(bash(command), { rejectHistory: false }).includes("raise:opaque"), command);
+    }
+  }
+});
+
+test("code carrying loader values are recognized while ordinary file and module values stay normal", () => {
+  const raised = (command: string) => raise(bash(command), { rejectHistory: false });
+  for (const command of [
+    "node --require data:text/javascript,true", "node --require=data:text/javascript,true", "node -r data:text/javascript,true", "node -rdata:text/javascript,true",
+    "node -r=data:text/javascript,true", "node --import=DATA:text/javascript,true",
+    "node --import data:text/javascript,true", "node --import=data:text/javascript,true",
+    "node --loader data:text/javascript,true", "node --loader=data:text/javascript,true",
+    "node --experimental-loader data:text/javascript,true", "node --experimental-loader=data:text/javascript,true",
+    "perl '-Mstrict;1' /dev/null", "perl -M 'strict;1' /dev/null", "perl '-M-strict;1' /dev/null", "perl -M 'strict 1' /dev/null",
+  ]) assert.ok(readShell(command).opaqueReasons.includes("inline-code") && raised(command).includes("raise:opaque"), command);
+
+  for (const command of [
+    "node --require ./register.js", "node -r tsx", "node --import node:fs", "node --import file:///home/dev/projects/sample/register.mjs",
+    "node --loader ./loader.mjs", "node --experimental-loader=file:///home/dev/projects/sample/loader.mjs", "perl -Mstrict /dev/null", "perl -Mstrict=warnings /dev/null",
+    "ruby -r ./register.rb",
+  ]) assert.deepEqual(raised(command), [], command);
+});
+
+test("the embedded-command search treats a code environment assignment as unread", () => {
+  const command = "unknown-wrapper NODE_OPTIONS=--require=./setup.cjs true";
+  assert.deepEqual(readShell(command).opaqueReasons, []);
+  assert.ok(raise(bash(command), { rejectHistory: false }).includes("raise:opaque"));
 });
 
 test("a write to the configuration file the host was started with needs the owner", () => {
@@ -642,4 +791,20 @@ test("readiness needs a current replay result under the threshold; a policy, cla
   current = settings({ light: undefined, strong: [strongClaude, { ...strongClaude, id: "strong-claude-2", model: "sonnet" }] });
   assert.match(reasons(), /No light profile is configured/);
   assert.match(reasons(), /Strong profiles come from 1 model family; at least two are needed/);
+});
+
+test("one reading resolves each path once, so the class rules and the raise rules judge the same file system", () => {
+  // A resolver whose answer for a path changes between two calls, as a link replaced mid-decision does.
+  const calls = new Map<string, number>();
+  const resolvePath = (path: string) => {
+    const seen = (calls.get(path) ?? 0) + 1;
+    calls.set(path, seen);
+    return path.endsWith("/notes") && seen > 1 ? "/etc/sudoers" : normalize(path);
+  };
+  const core = createPermissionAgentCore({ settings: settings(), launcher: fakeLauncher(() => "no-report").launcher, resolvePath });
+  const rules = core.readRules(bash("cat ../shared/notes && sh -c \"cat ../shared/notes\" && cp draft.txt ../shared/notes"), CLASSES);
+  assert.deepEqual([...calls.values()].filter(count => count > 1), [], "no path is resolved twice in one reading");
+  assert.equal(rules.match, undefined);
+  assert.ok(rules.raised.includes("raise:outside-root"));
+  assert.ok(!rules.raised.includes("raise:reject-history"));
 });

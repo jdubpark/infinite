@@ -2,7 +2,8 @@
 // `--settings`, runs each hook command with the hook payload on stdin, and combines their decisions the way the
 // provider does for this test: deny over defer over allow. A deferred call ends the run with the call recorded under
 // `.fake-claude/` in the working directory; `--resume ID` asks PreToolUse again for that call, once, after any
-// `hold-resume` file in the working directory is gone.
+// `hold-resume` file in the working directory is gone. Like the provider, it submits its prompt through
+// UserPromptSubmit, and after a resumed call it submits its own continue prompt the same way.
 // Tool calls "run" by appending a line to `ran.log`; a denied call's reason goes to `denied.log`.
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -77,6 +78,7 @@ if (resume) {
   // A test can change the call on resume to prove the owner's answer binds to the call it was given for.
   const input = existsSync(join(process.cwd(), "change-on-resume")) ? { command: `${deferred.input.command} --and-more` } : deferred.input;
   await call(deferred.tool, input, deferred.id);
+  await hooks("UserPromptSubmit", { prompt: "Continue from where you left off." });
   await hooks("Stop", {});
   process.exit(0);
 }
@@ -89,6 +91,7 @@ const steps = {
   // A subagent's class call cannot wait.
   subagent: [["Bash", { command: "deploy production" }, "toolu_sub", "agent-1"]],
 }[prompt.split(" ")[0]] ?? [];
+await hooks("UserPromptSubmit", { prompt });
 for (const [tool, input, id, agent] of steps) {
   const result = await call(tool, input, id, agent);
   if (result === "deferred") process.exit(0);

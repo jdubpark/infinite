@@ -393,6 +393,8 @@ test("an owner's allow is withheld, and still used once, when the host refuses i
     const ops = w.requests as Array<{ op: string; sessionRoot?: string; decisionId?: string; deliveryKey?: string; kind?: string }>;
     const resume = ops.find(request => request.op === "resume")!;
     assert.deepEqual([resume.sessionRoot, resume.decisionId, resume.deliveryKey], ["/workspace", (owner as { decisionId: string }).decisionId, "d".repeat(64)]);
+    // The check carries the resumed call, so the host reads it again.
+    assert.deepEqual((resume as { call?: unknown }).call, { toolName: "Bash", toolInput: { command: "deploy production" }, toolUseId: "toolu_1" });
     assert.equal(ops.filter(request => request.op === "delivery").at(-1)?.kind, "stale");
     // The answer was used: the same call again is the owner's again.
     assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "deny", reason: requesterNotice("needs-owner") });
@@ -801,6 +803,42 @@ test("the resume check confirms an owner's allow only without a halt, while its 
     await assert.rejects(resume({ deliveryKey: undefined }), /unbound/);
     await assert.rejects(resume({ deliveryKey: deliveryKey(h.key, randomUUID(), decisionId) }), /unbound/);
     await assert.rejects(resume({ sessionRoot: undefined }), /invalid/);
+  } finally { h.done(); }
+});
+
+test("the resume check reads the resumed call again, with the task as it is now", async () => {
+  const seen: Array<PermissionRequest | undefined> = [];
+  let applies = true;
+  const h = hostRig(fakePipeline({ applicable: (_id, request) => { seen.push(request); return applies; } }).pipeline);
+  try {
+    const decisionId = randomUUID();
+    const resume = (extra: Record<string, unknown> = {}) =>
+      h.ask({ op: "resume", sessionRoot: h.session.cwd, decisionId, deliveryKey: deliveryKey(h.key, h.session.id, decisionId), ...extra });
+    assert.deepEqual(await resume({ call: bash("deploy production", "toolu_9") }), { result: "ok" });
+    // The request is the one the class check built for this call, so an unchanged reading gives the deferral's decision id.
+    const again = seen.at(-1)!;
+    assert.deepEqual([again.id, again.action, again.requester.task], [`headless:${h.session.id}:toolu_9`, "deploy production", { title: "T", text: "do it" }]);
+    h.session.title = "Another task";
+    await resume({ call: bash("deploy production", "toolu_9") });
+    assert.equal(seen.at(-1)!.requester.task.title, "Another task");
+    // A reading that no longer gives the decision withholds the owner's allow.
+    applies = false;
+    assert.deepEqual(await resume({ call: bash("deploy production", "toolu_9") }), { result: "withheld", reason: "stale" });
+    applies = true;
+    await assert.rejects(resume({ call: { toolName: "Bash" } }), /invalid/);
+    // A worker of an earlier release names no call: the decision is checked as before.
+    assert.deepEqual(await resume(), { result: "ok" });
+    assert.equal(seen.at(-1), undefined);
+  } finally { h.done(); }
+});
+
+test("a verdict is withheld when the session's task changed while the call was decided", async () => {
+  let rig: ReturnType<typeof hostRig>;
+  const changing = fakePipeline({ decide: async () => { rig.session.title = "Another task"; return { kind: "allow", decisionId: randomUUID(), strongTier: false }; } });
+  const h = rig = hostRig(changing.pipeline);
+  try {
+    assert.deepEqual(await h.ask({ op: "decide", call: bash("make safe-build"), requestId: `headless:${h.session.id}:toolu_1` }), { result: "not-served" });
+    assert.deepEqual(changing.deliveries.map(entry => entry.kind), ["stale"]);
   } finally { h.done(); }
 });
 

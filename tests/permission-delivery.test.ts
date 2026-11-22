@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { EvidenceDeliveryLedger, InteractivePermissionDelivery, permissionDeliveryModule, type PermissionDeliveryLedger } from "../packages/host/src/permission-delivery.js";
 import type { PermissionInteractiveTarget, PermissionOutcome, PermissionPipeline, PermissionRequest } from "../packages/host/src/permission-agent-types.js";
-import { teamPermissionRequest, teamPermissionTarget } from "../packages/host/src/team-permission-adapter.js";
+import { teamPermissionRequest, teamPermissionTarget, teamPermissionTask } from "../packages/host/src/team-permission-adapter.js";
 
 type Live = Awaited<ReturnType<PermissionInteractiveTarget["check"]>>;
 
@@ -309,3 +309,30 @@ test("a team member's source file that the review read must be unchanged at deli
   const live = await target.check();
   assert.deepEqual([live.ok, live.ok ? undefined : live.stale, live.ok ? undefined : live.reason], [false, true, "A source file that the review read changed."]);
 });
+
+test("a team member's task that changed while the request was decided leaves the dialog with the owner", async () => {
+  const root = "/home/dev/projects/infinite";
+  const workspace = { changedPaths: [], evidence: { files: [], limitations: [], digest: "workspace" } };
+  const run = { id: "run-1", projectId: "project-1", provider: "codex", title: "Run", objective: "Objective" };
+  const built = teamPermissionRequest({
+    run: run as never, member: { sessionId: "session-1", memberId: "member-1", role: "implementer", revision: 1 } as never,
+    prompt: request().prompt!, sessionRoot: root, workspace, acceptedChecks: null,
+  });
+  let objective = "Objective";
+  let reached = 0;
+  const target = teamPermissionTarget(built, {
+    manager: { meta: () => { reached++; throw new Error("stop here"); }, state: async () => { throw new Error("not reached"); }, answerAgentPermission: async () => { throw new Error("not reached"); } } as never,
+    assignment: { runId: "run-1", memberId: "member-1", revision: 1, role: "implementer" },
+    runCheck: () => undefined,
+    sessionRoot: () => root,
+    workspace: async () => workspace,
+    task: () => teamPermissionTask({ ...run, objective }, undefined),
+  });
+  // The same task passes this check and reaches the session checks.
+  await target.check();
+  assert.equal(reached, 1);
+  objective = "Objective, and never touch the release branch";
+  assert.deepEqual(await target.check(), { ok: false, stale: false, reason: "The member's task changed after the request was read." });
+  assert.equal(reached, 1);
+});
+

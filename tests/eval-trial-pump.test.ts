@@ -529,3 +529,23 @@ test("the identity status keeps the last probe once it has aged out", async t =>
     r.cleanup();
   }
 });
+
+test("the sweep ends an idle paused job past its expiry and leaves an unexpired one paused", async () => {
+  let clock = Date.parse("2026-11-16T10:00:00.000Z");
+  const r = rig({ clock: () => new Date(clock).toISOString() });
+  try {
+    const jobId = r.addJob();
+    r.store.write(tx => {
+      tx.run("UPDATE eval_jobs SET status = 'paused', reason = 'owner', expires_at = ? WHERE job_id = ?", new Date(clock + 3_600_000).toISOString(), jobId);
+    });
+    const statusOf = () => r.store.read(db => db.get<{ status: string; reason: string | null }>("SELECT status, reason FROM eval_jobs WHERE job_id = ?", jobId));
+    await r.pump.sweep();
+    assert.equal(statusOf()?.status, "paused", "before its expiry the job stays paused");
+    clock += 3_600_000;
+    await r.pump.sweep();
+    assert.equal(statusOf()?.status, "expired");
+    assert.equal(statusOf()?.reason, "expired");
+  } finally {
+    r.cleanup();
+  }
+});

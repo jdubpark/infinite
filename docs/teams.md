@@ -916,7 +916,7 @@ A job is created with a request. The CLI reads it from a file of at most 64 KiB,
 
 **Pinned configuration.** The job pins the validation settings and `eval.grader` when it is created. The settings are `focusedTest`, `reportFormat`, `gradingPaths`, `guardChecks`, and `setup`. A change to any of them blocks the job with `configuration-changed` before its next task. `resume` pins the new values, and that is the owner's approval. A change to the prompt version or the permission policy does not block a job.
 
-**Statuses.** A job is `scheduled`, `running`, `paused`, `blocked`, `completed`, `cancelled`, or `expired`. The reasons are `owner`, `validation-stuck`, `configuration-changed`, `grader-processes-alive`, `limit-reached`, `done`, and `expired`.
+**Statuses.** A job is `scheduled`, `running`, `paused`, `blocked`, `completed`, `cancelled`, or `expired`. The reasons are `owner`, `validation-stuck`, `configuration-changed`, `grader-processes-alive`, `limit-reached`, `done`, and `expired`. A paused or blocked baseline, compare, or confirm job also ends as `expired` once its `expiresAt` has passed, on the next pass or the hourly sweep.
 
 **Waits.** A job that cannot start a task says why, in its `waiting` field:
 
@@ -1215,7 +1215,7 @@ At creation, a comparison job pins, for each configuration, the profile epoch at
 
 A finished `compare` or `confirm` job gets one report. A report pass runs on the host's tick. It takes the oldest finished job without a report, once the job's trial sessions are gone, so that their cost is recorded. It waits at most 24 hours after the job finished. The sessions go about an hour after their trials end, at most 20 per sweep. The pass computes the figures from the job's trial rows (at most 5,000) and its tasks' plain fields (at most 200), seals the report, and never changes it. Every read gives the same figures. A job whose sealed list cannot be opened gets a report with state `unreadable`.
 
-While a job is active, its view shows no result: `trials.resolved` is null and `report` is null. A finished job shows `report` `pending`, and then `ready`.
+While a job is active, its view shows no result: `trials.resolved` is null and `report` is null. A finished job shows `report` `pending`, and then `ready`, or `unreadable` when the stored report could not be built.
 
 The report names each configuration by its index (the order of the request), `profileId`, provider, profile epoch, and prompt version. It never names a model. It holds only aggregates. It holds no task, group, trial, or session id, and no commit, file name, case, patch, or text.
 

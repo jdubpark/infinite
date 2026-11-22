@@ -191,6 +191,7 @@ export class TrialJobs {
     const baseline = rows.filter(row => row.kind !== "validate");
     const counts = trialCounts(db, baseline.map(row => row.job_id));
     const refs = this.refsOf(db);
+    const states = reportStates(db, baseline.filter(row => row.kind !== "baseline").map(row => row.job_id));
     const views = new Map<string, JobView>();
     for (const row of baseline) {
       const projectId = refs.get(row.project_ref) ?? null;
@@ -221,7 +222,8 @@ export class TrialJobs {
         kind: row.kind === "confirm" ? "confirm" : "compare",
         set: row.kind === "confirm" ? "holdout" : "dev",
         trials: { ...trials, resolved: reported ? count.resolved : null, reused: count.reused },
-        report: reported ? "ready" : row.finished_at === null ? null : "pending",
+        // The state column is read, not the payload: a ready row whose payload later fails to open still shows `ready`.
+        report: reported ? states.get(row.job_id) ?? "ready" : row.finished_at === null ? null : "pending",
       });
     }
     return views;
@@ -279,7 +281,27 @@ export class TrialJobs {
     return this.store.read(db => db.all<EvalJobRow>(BASELINE_JOBS_SQL, "running", BASELINE_JOBS_MAX).map(row => row.job_id));
   }
 
+  /** Ends the paused and blocked trial jobs whose expiry has passed, so they stop holding their project's holdout groups. */
+  expireIdle(): number {
+    return this.store.write(tx => this.expireIdleIn(tx));
+  }
+
+  private expireIdleIn(tx: EvidenceTx): number {
+    const at = this.now();
+    let ended = 0;
+    for (const status of ["paused", "blocked"]) {
+      for (const row of tx.all<EvalJobRow>(BASELINE_JOBS_SQL, status, BASELINE_JOBS_MAX)) {
+        if (Date.parse(row.expires_at) > Date.parse(at)) continue;
+        finish(tx, row.job_id, at, "expired", "expired");
+        ended += 1;
+      }
+    }
+    return ended;
+  }
+
   private pass(tx: EvidenceTx, gates: TrialGates, free: number | undefined): Pass {
+    // A paused job the owner paused stays paused until its expiry; only the expiry ends it.
+    this.expireIdleIn(tx);
     const refs = this.refsOf(tx);
     const rows = [
       ...tx.all<EvalJobRow>(BASELINE_JOBS_SQL, "scheduled", BASELINE_JOBS_MAX),
@@ -551,6 +573,14 @@ function setJob(tx: EvidenceTx, jobId: string, at: string, values: Record<string
     at,
     jobId,
   );
+}
+
+/** The stored report state of each job that has one, in one query. */
+function reportStates(db: EvidenceDb, jobIds: readonly string[]): Map<string, "ready" | "unreadable"> {
+  if (jobIds.length === 0) return new Map();
+  const marks = jobIds.map(() => "?").join(", ");
+  const rows = db.all<{ job_id: string; state: "ready" | "unreadable" }>(`SELECT job_id, state FROM eval_reports WHERE job_id IN (${marks})`, ...jobIds);
+  return new Map(rows.map(row => [row.job_id, row.state]));
 }
 
 function finish(tx: EvidenceTx, jobId: string, at: string, status: "completed" | "expired", reason: Extract<EvalJobReason, "done" | "limit-reached" | "expired" | "identity-changed">): void {

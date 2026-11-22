@@ -215,7 +215,7 @@ export type ComparisonJobView = Omit<BaselineJobView, "kind" | "trials"> & {
   kind: "compare" | "confirm";
   set: EvalSet;
   trials: { planned: number; started: number; graded: number; resolved: number | null; ended: number; void: number; reused: number };
-  report: "pending" | "ready" | null;
+  report: "pending" | "ready" | "unreadable" | null;
 };
 export type EvalJobView = ValidateJobView | BaselineJobView | ComparisonJobView;
 export type PairResult = {

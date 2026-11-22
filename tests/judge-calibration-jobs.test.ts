@@ -331,6 +331,20 @@ test("a calibration that cannot reach 30 counted pairs ends early", async () => 
   } finally { f.close(); }
 });
 
+test("a calibration whose last pair drops says why", async () => {
+  const f = ready();
+  try {
+    seedPairs(f, "P", 30);
+    created(f);
+    await drive(f, start => start.pairIndex === 29 ? { ending: "void-host", sessionId: null } : judged(start, true));
+    const done = view(f);
+    assert.equal(done.status, "completed");
+    assert.equal(done.pairs.counted, 29);
+    assert.equal(done.state, "not-ok");
+    assert.equal(done.reason, "pairs-dropped");
+  } finally { f.close(); }
+});
+
 test("a judge failure counts the pair incorrect", async () => {
   const f = ready();
   try {

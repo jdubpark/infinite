@@ -318,10 +318,11 @@ export class JudgeCalibrations {
     const states = pairStates(row.payload.pairs.length, calibrationJudgements(tx, row.calibrationId));
     const pending = states.filter(pair => pair.kind === "pending").length;
     const summary = calibrationSummary(states.flatMap(pair => pair.kind === "done" ? [pair] : []));
-    // Fewer than CALIBRATION_MIN_PAIRS pairs can still be counted: the result cannot be `ok`, so stop spending.
-    const early = pending > 0 && summary.counted + pending < CALIBRATION_MIN_PAIRS;
-    if (pending > 0 && !early) return;
-    finishCalibration(tx, row.calibrationId, { status: "completed", reason: early ? "pairs-dropped" : null, state: early ? "not-ok" : summary.state, counted: summary.counted, correct: summary.correct,
+    // Fewer than CALIBRATION_MIN_PAIRS pairs can be counted, now or ever: the result cannot be `ok`, so stop spending.
+    // A request holds at least that many pairs, so only dropped pairs bring the count below it.
+    const short = summary.counted + pending < CALIBRATION_MIN_PAIRS;
+    if (pending > 0 && !short) return;
+    finishCalibration(tx, row.calibrationId, { status: "completed", reason: short ? "pairs-dropped" : null, state: short ? "not-ok" : summary.state, counted: summary.counted, correct: summary.correct,
       agree: summary.agree, accuracy: summary.accuracy, lowerBound: summary.lowerBound, swapAgreement: summary.swapAgreement }, at);
   }
 

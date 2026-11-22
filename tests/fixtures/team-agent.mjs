@@ -423,7 +423,7 @@ async function main() {
     // The evaluator copies its context and launch prompt for the test. It stalls under `stall-evaluator`, reports `verdict.json` when
     // the test wrote one, and otherwise reports every criterion in its context met, with the first changed path as the handle.
     const context = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8"));
-    writeFileSync(join(receiptDir, `${assignment.memberId}.evaluator-context.json`), JSON.stringify(context), { mode: 0o600 });
+    writeWhole(join(receiptDir, `${assignment.memberId}.evaluator-context.json`), JSON.stringify(context));
     writeFileSync(join(receiptDir, `${assignment.memberId}.evaluator-prompt.txt`), receipt.prompt ?? process.argv.at(-1) ?? "", { mode: 0o600 });
     if (existsSync(join(receiptDir, "stall-evaluator"))) await new Promise(() => setInterval(() => {}, 1000));
     if (existsSync(join(receiptDir, "verdict.json"))) {

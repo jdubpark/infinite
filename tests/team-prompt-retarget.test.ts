@@ -310,50 +310,49 @@ test("seeded retarget comparisons preserve quoted prompt evidence across every r
   }
 });
 
-const withEntryTools = (rule: string) => rule.includes("entry_list");
+const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
-test("the known working rule texts are kept as the bytes a release wrote", () => {
-  // These are hashes of each release's own output, so an edit to an entry fails here instead of losing its prompts.
-  const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+test("the known working rule texts are kept byte for byte", () => {
+  // Each hash was taken from the generator's own output when its text was appended, so an edit to an entry fails here
+  // instead of losing the prompts that carry it.
   const pinned = [
     "77d618fea6ee839cec3d9641f560e0ce2749985fc0330a1463b38c75470833b5",
     "7595d799220ed280b9f93aacd694e6362570b107e7bb19ac814a8c431ae4ac10",
     "e6ff71704aae9e01b8e94482cd8f49b02fd685de11b68cb863b6129f14888887",
     "6896da1485bc8ccbafa98bc08d6a3f27eaf54884f17acdb68c4e725ff0845bab",
   ];
-  const message = "KNOWN_RULE_TEXTS is append-only: an existing entry is never edited or removed, and a new text is appended with its hash here.";
-  assert.equal(KNOWN_RULE_TEXTS.length, pinned.length, message);
-  assert.deepEqual(KNOWN_RULE_TEXTS.map(sha256), pinned, message);
+  assert.deepEqual(KNOWN_RULE_TEXTS.map(sha256), pinned,
+    "KNOWN_RULE_TEXTS is append-only: an existing entry is never edited or removed, and a new text is appended with its hash here.");
 });
 
 test("the generated working rule is one of the known rule texts", () => {
   for (const entryTools of [false, true]) {
+    const generated = codexMemberToolInstructions(entryTools);
     assert.ok(
-      KNOWN_RULE_TEXTS.includes(codexMemberToolInstructions(entryTools)),
-      `entryTools ${entryTools}: append the new generated text to KNOWN_RULE_TEXTS in packages/host/src/team-rule-texts.ts and its hash to the pin in this file, and leave the earlier entries in place.`,
+      KNOWN_RULE_TEXTS.includes(generated),
+      `entryTools ${entryTools}: append the new generated text to KNOWN_RULE_TEXTS in packages/host/src/team-rule-texts.ts and its hash to the pin in this file, and leave the earlier entries in place. Hash: ${sha256(generated)}. Text: ${JSON.stringify(generated)}`,
     );
   }
 });
 
-test("a prompt written by any known release is retargeted to one current working rule", () => {
+test("a prompt that carries any known working rule is retargeted to the current one", () => {
   const codexProfile = { ...ENTRY_PROFILE, provider: "codex" as const };
   for (const entryTools of [false, true]) {
     const current = codexMemberToolInstructions(entryTools);
-    const earlierTexts = KNOWN_RULE_TEXTS.filter((rule) => withEntryTools(rule) === entryTools && rule !== current);
-    assert.ok(earlierTexts.length > 0, `entryTools ${entryTools} has an earlier known text`);
     const prompt = teamPrompt(smallRun(entryTools ? { blackboard: { tools: true } } : {}), "implementer", undefined, undefined, "codex", codexProfile);
     assert.equal(prompt.split(current).length - 1, 1, `entryTools ${entryTools} current prompt carries the rule once`);
-    for (const earlier of earlierTexts) {
-      const carried = prompt.replace(current, earlier);
+    const forClaude = retargetPrompt(prompt, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools });
+    assert.ok(forClaude);
+    assert.equal(forClaude.includes("Working rule for tools"), false, `entryTools ${entryTools} no Codex rule reaches Claude`);
+    // Every other known text, of either variant: a role can gain or lose entry tools between the launch and the retarget.
+    const others = KNOWN_RULE_TEXTS.filter(rule => rule !== current);
+    assert.equal(others.length, KNOWN_RULE_TEXTS.length - 1);
+    for (const known of others) {
+      const carried = prompt.replace(current, known);
       assert.notEqual(carried, prompt);
-      const codex = retargetPrompt(carried, { provider: "codex", profile: codexProfile, role: "implementer", entryTools });
-      assert.equal(codex, prompt, `entryTools ${entryTools} a known rule is replaced by the current one`);
-      assert.equal(codex!.split(current).length - 1, 1);
-      assert.equal(codex!.includes(earlier), false);
-      const claude = retargetPrompt(codex!, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools });
-      assert.ok(claude);
-      assert.equal(claude.includes(current), false, `entryTools ${entryTools} no Codex rule reaches Claude`);
-      assert.equal(claude.includes(earlier), false);
+      const label = `entryTools ${entryTools}, known text ${KNOWN_RULE_TEXTS.indexOf(known)}`;
+      assert.equal(retargetPrompt(carried, { provider: "codex", profile: codexProfile, role: "implementer", entryTools }), prompt, `${label}: Codex gets the current rule once`);
+      assert.equal(retargetPrompt(carried, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools }), forClaude, `${label}: Claude gets no rule, straight from the known text`);
     }
   }
 });

@@ -1,8 +1,8 @@
 /**
- * Every Codex working-rule text a release has written into member prompts, oldest first.
+ * Every Codex working-rule text main has generated for member prompts, oldest first. Any of them may be in a live prompt.
  * The list is append-only: append a text whenever the generated rule changes (for example when a member tool's result
- * schema changes), and never edit an entry. Remove an entry only when no prompt written by the release that wrote it
- * can still be live. A prompt is recognised and retargeted only by exact text, so a missing entry strands its prompts.
+ * schema changes), and never edit an entry. Remove an entry only when no prompt that carries it can still be live.
+ * A prompt is recognised and retargeted only by exact text, so a missing entry strands its prompts.
  * This file imports nothing from team-prompts.ts.
  */
 export const KNOWN_RULE_TEXTS: readonly string[] = [

@@ -9,7 +9,6 @@ import { fileURLToPath } from "node:url";
 import { once } from "node:events";
 import express from "express";
 import { EvalHost, type EvalHostOptions } from "../packages/host/src/eval-host.js";
-import { evalTrialsModule } from "../packages/host/src/eval-trial-store.js";
 import { type Grader, launcherGrader } from "../packages/host/src/eval-grader.js";
 import type { MineGit } from "../packages/host/src/eval-mine-git.js";
 import { minedTaskId } from "../packages/host/src/eval-miner.js";
@@ -88,8 +87,6 @@ function rig(): Rig {
   const key = randomBytes(32);
   const databasePath = evidenceDatabasePath(join(dir, "state"));
   const store = new EvidenceStore({ databasePath, vaultKey: key });
-  // The server registers the trials module; the host's summary counts today's trials through it.
-  store.register(evalTrialsModule(store, () => new Date().toISOString()));
   return { dir, root, mirror, head: ids[3], ids, record: join(dir, "record.log"), store, groups: `${root}.groups`, key, databasePath };
 }
 
@@ -346,7 +343,6 @@ test("a restart in the middle of a task counts no attempt", { timeout: 600_000 }
     const restart = (): void => {
       r.store.close();
       r.store = new EvidenceStore({ databasePath: r.databasePath, vaultKey: r.key });
-      r.store.register(evalTrialsModule(r.store, () => new Date().toISOString()));
     };
     restart();
     const mark = ops(r.record).length;

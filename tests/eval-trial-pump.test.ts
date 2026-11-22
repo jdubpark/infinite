@@ -13,7 +13,9 @@ import type { TrialGrade } from "../packages/host/src/eval-types.js";
 import { evalCorpusModule } from "../packages/host/src/eval-store.js";
 import { TrialJobs } from "../packages/host/src/eval-trial-jobs.js";
 import { TrialPump, type TrialTeams } from "../packages/host/src/eval-trial-pump.js";
-import { evalTrialsModule, finishTrial, insertTrial, startTrial } from "../packages/host/src/eval-trial-store.js";
+import { EVAL_TRIALS_MODULE, evalTrialsModule, finishTrial, insertTrial, startTrial } from "../packages/host/src/eval-trial-store.js";
+import { EvalHost } from "../packages/host/src/eval-host.js";
+import type { CostLookup } from "../packages/host/src/outcome-cells.js";
 import { configRef, TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
 
 // The trial pump over small fakes: a real store and a real TrialJobs, a recording identity, and no member. The end-to-end
@@ -36,11 +38,21 @@ type Probe = Parameters<EvalIdentity["probe"]>[0];
 
 /** The pump with no member and a source whose `status` has no mirror head, so no trial can start. Every call is logged. */
 function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: EvalProbe[]; sessionsRemoved?: string[]; forgetThrows?: boolean; replayIds?: string[];
-  replayState?: (trialId: string) => Promise<unknown>; onStatus?: () => void } = {}) {
+  replayState?: (trialId: string) => Promise<unknown>; onStatus?: () => void; cost?: CostLookup; clock?: () => string; trialsNewer?: boolean; alive?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), "infinite-trial-pump-"));
   dirs.push(root);
-  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: randomBytes(32) });
-  const now = () => new Date().toISOString();
+  const vaultKey = randomBytes(32);
+  const databasePath = evidenceDatabasePath(join(root, "state"));
+  const now = options.clock ?? (() => new Date().toISOString());
+  if (options.trialsNewer) {
+    // A stored trials version one above the code's makes that module unavailable, as in evidence-store.test.ts.
+    const first = new EvidenceStore({ databasePath, vaultKey });
+    first.register(evalCorpusModule(first, now));
+    const trials = evalTrialsModule(first, now);
+    first.register({ ...trials, version: trials.version + 1, readVersion: trials.version + 1 });
+    first.close();
+  }
+  const store = new EvidenceStore({ databasePath, vaultKey });
   store.register(evalCorpusModule(store, now));
   store.register(evalTrialsModule(store, now));
   const config = {
@@ -76,7 +88,7 @@ function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: E
       if (options.forgetThrows) throw new Error("forget failed");
       return true;
     },
-    replayIds: () => options.replayIds ?? [],
+    replayIds: () => { log.push("replayIds"); return options.replayIds ?? []; },
     providerLimits: () => [],
   } as unknown as TrialTeams;
   const sessionsRemoved = options.sessionsRemoved ?? [];
@@ -84,9 +96,10 @@ function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: E
   const pump = new TrialPump({
     config, store, jobs, grader, identity, teams: () => teams,
     sessions: { list: async () => [], remove: async (id: string) => { sessionsRemoved.push(id); if (options.removeRefused) throw new Error("refused"); } } as never,
+    ...(options.cost ? { cost: options.cost } : {}),
     source: { mirrorPath: () => join(root, "mirror.git"), status: () => { log.push("status"); options.onStatus?.(); return { mode: "github", repository: "example/app", baseBranch: "main" } as never; } },
     hostLoad: { held: () => undefined }, halt: () => ({ check: () => ({ state: "clear" as const }) }),
-    graderProbe: async () => ({ state: "ready", storage: true, version: 2, uid: 5002 }), inventory: async () => [], now,
+    graderProbe: async () => ({ state: "ready", storage: true, version: 2, uid: 5002 }), inventory: async () => options.alive ? [{ ruid: 5001, euid: 5001, state: "S" } as never] : [], now,
   });
   const addJob = () => {
     const at = now();
@@ -114,7 +127,7 @@ function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: E
     });
     return trialId;
   };
-  return { store, config, pump, log, seed, probeInputs, sessionsRemoved, forgotten, addJob, cleanup: () => store.close() };
+  return { store, config, pump, log, root, now, jobs, seed, probeInputs, sessionsRemoved, forgotten, addJob, cleanup: () => store.close() };
 }
 
 test("a source that cannot start does not make a hot loop", async () => {
@@ -152,14 +165,157 @@ test("a start-up with an unavailable identity runs again, and stops and cleans b
 test("the identity probe is keyed by project", async () => {
   const r = rig();
   try {
-    // No job is open at start-up, so the start-up probe names no project.
+    // The job is cancelled while a trial row lives, so the start-up probe names no project.
+    const jobId = r.addJob();
+    r.seed(jobId, 0, "running");
+    r.store.write(tx => tx.run("UPDATE eval_jobs SET status = 'cancelled' WHERE job_id = ?", jobId));
     await r.pump.step();
     assert.equal(r.probeInputs.length, 1, "the start-up probe");
     assert.equal(r.probeInputs[0].fetchUrl, undefined, "the start-up probe fetches no repository");
-    r.addJob();
+    r.store.write(tx => tx.run("UPDATE eval_jobs SET status = 'scheduled' WHERE job_id = ?", jobId));
     await r.pump.step();
     assert.equal(r.probeInputs.length, 2, "the trial's project is probed again");
     assert.ok(r.probeInputs[1].fetchUrl?.includes("example/app"), "the second probe names the project's repository");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("start-up probes once, not on every step, while no trial job is open", async () => {
+  const r = rig({ probes: [{ state: "unavailable" }, { state: "unavailable" }, { state: "unavailable" }] });
+  try {
+    for (let step = 0; step < 3; step++) await r.pump.step();
+    assert.equal(r.probeInputs.length, 1, "one probe for the first start-up");
+    r.addJob();
+    await r.pump.step();
+    assert.equal(r.probeInputs.length, 2, "the start-up runs again when the first job opens");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a start-up that voided rows is retried until the account is clean", async () => {
+  const r = rig({ probes: [{ state: "unavailable" }, READY] });
+  try {
+    const jobId = r.addJob();
+    r.seed(jobId, 0, "running");
+    r.store.write(tx => tx.run("UPDATE eval_jobs SET status = 'cancelled' WHERE job_id = ?", jobId));
+    await r.pump.step();
+    assert.equal(r.probeInputs.length, 1, "the first start-up probes and fails");
+    await r.pump.step();
+    assert.equal(r.probeInputs.length, 2, "the next step probes again");
+    assert.ok(r.log.includes("stop"), "stop ran");
+    assert.ok(r.log.includes("clean"), "clean ran");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a start-up whose stop leaves processes alive is tried again without an open job", async () => {
+  // What a restart finds after a trial left processes alive and blocked its job: no live row, no open job, and an account that is not clean.
+  const r = rig({ alive: true });
+  try {
+    const stops = () => r.log.filter(entry => entry === "stop").length;
+    await r.pump.step();
+    const first = stops();
+    assert.ok(first > 0, "the first start-up tried the stop");
+    await r.pump.step();
+    assert.ok(stops() > first, "the next step tries the stop again, with no job open");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("live rows without an open job still get the start-up", async () => {
+  const r = rig();
+  try {
+    const jobId = r.addJob();
+    const trialId = r.seed(jobId, 0, "running");
+    r.store.write(tx => tx.run("UPDATE eval_jobs SET status = 'cancelled' WHERE job_id = ?", jobId));
+    await r.pump.step();
+    const row = r.store.read(db => db.get<{ state: string; ending: string | null }>("SELECT state, ending FROM eval_trials WHERE trial_id = ?", trialId));
+    assert.equal(row?.state, "final");
+    assert.equal(row?.ending, "void-host");
+    assert.equal(r.probeInputs.length, 1, "the account is probed");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("the pump starts nothing while the trials module is not ready", async () => {
+  const r = rig({ trialsNewer: true });
+  try {
+    assert.equal(r.store.status().modules[EVAL_TRIALS_MODULE], "unavailable");
+    r.addJob();
+    for (let step = 0; step < 2; step++) await r.pump.step();
+    assert.equal(r.probeInputs.length, 0, "no probe");
+    assert.equal(r.log.filter(entry => entry === "status").length, 0, "no trial start");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("the sweep does nothing while the trials module is not ready", async () => {
+  const r = rig({ trialsNewer: true, replayIds: [randomUUID()] });
+  try {
+    await r.pump.sweep();
+    assert.equal(r.log.includes("replayIds"), false, "the teams fake was not asked");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a baseline create answers evidence-unavailable while the trials module is not ready", async () => {
+  const r = rig();
+  r.cleanup();
+  const root = mkdtempSync(join(tmpdir(), "infinite-trial-host-"));
+  dirs.push(root);
+  const vaultKey = randomBytes(32);
+  const databasePath = evidenceDatabasePath(join(root, "state"));
+  const now = () => new Date().toISOString();
+  // A stored trials version one above the code's makes that module unavailable, as in evidence-store.test.ts.
+  const first = new EvidenceStore({ databasePath, vaultKey });
+  const trials = evalTrialsModule(first, now);
+  first.register({ ...trials, version: trials.version + 1, readVersion: trials.version + 1 });
+  first.close();
+  const store = new EvidenceStore({ databasePath, vaultKey });
+  try {
+    const host = new EvalHost({
+      config: r.config, store, source: { mirrorPath: () => join(root, "mirror.git"), status: () => ({ mode: "github", repository: "example/app", baseBranch: "main" }) as never },
+      hostLoad: { held: () => undefined }, halt: () => ({ check: () => ({ state: "clear" as const }) }), runs: () => [], now,
+    });
+    assert.equal(store.status().modules[EVAL_TRIALS_MODULE], "unavailable");
+    const baseline = host.create(PROJECT, {
+      kind: "baseline", configurations: [{ profile: CLAUDE, guidance: "as-of-base", knowledge: "none" }],
+      limits: { maxTrials: 10, maxWallMinutes: 600 },
+    } as never, randomUUID());
+    assert.equal((baseline as { status?: number }).status, 503);
+    assert.equal((baseline as { code?: string }).code, "evidence-unavailable");
+    const validate = host.create(PROJECT, { kind: "validate", limits: { maxWallMinutes: 10 } } as never, randomUUID());
+    assert.ok("job" in validate, `a validate create still creates a job: ${JSON.stringify(validate).slice(0, 200)}`);
+    host.close();
+  } finally {
+    store.close();
+  }
+});
+
+test("start-up blocks the open job when the account's processes stay alive", async () => {
+  const r = rig({ alive: true });
+  try {
+    const jobId = r.addJob();
+    await r.pump.step();
+    const job = r.store.read(db => db.get<{ status: string; reason: string | null }>("SELECT status, reason FROM eval_jobs WHERE job_id = ?", jobId));
+    assert.equal(job?.status, "blocked");
+    assert.equal(job?.reason, "eval-processes-alive");
+    const n = r.store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM eval_trials"))?.n;
+    assert.equal(n, 0, "no trial row");
+    // The account is not clean, so the stop is tried again on each step (one a minute on a host) while the job stays blocked.
+    const stops = r.log.filter(entry => entry === "stop").length;
+    await r.pump.step();
+    assert.ok(r.log.filter(entry => entry === "stop").length > stops, "the next step tries the stop again");
+    const after = r.store.read(db => db.get<{ status: string; reason: string | null }>("SELECT status, reason FROM eval_jobs WHERE job_id = ?", jobId));
+    assert.equal(after?.status, "blocked", "the job stays blocked until the owner resumes it");
+    assert.equal(after?.reason, "eval-processes-alive");
   } finally {
     r.cleanup();
   }
@@ -241,6 +397,114 @@ test("start-up drops a preparing row, so its slot runs again as attempt 0, and k
     const voided = r.store.read(db => db.get<{ ending: string | null; session_id: string | null }>("SELECT ending, session_id FROM eval_trials WHERE trial_id = ?", running));
     assert.equal(voided?.ending, "void-host");
     assert.equal(voided?.session_id, "session-voided", "the voided trial names its session, so the sweep removes it");
+  } finally {
+    r.cleanup();
+  }
+});
+
+type CostRow = { session_id: string | null; tokens: number | null; spent_usd: number | null; cost: string | null };
+const COST_SQL = "SELECT session_id, tokens, spent_usd, cost FROM eval_trials WHERE trial_id = ?";
+
+function endedTrial(r: ReturnType<typeof rig>, sessionId: string, endedAt: string): string {
+  const jobId = r.addJob();
+  const trialId = r.seed(jobId, 0, "running");
+  r.store.write(tx => finishTrial(tx, trialId, { grade: VOID_GRADE, configId: null, profileEpoch: null, sessionId, patchKeepDays: 90 }, endedAt));
+  return trialId;
+}
+
+test("a session's cost is recorded before its removal", async () => {
+  const order: string[] = [];
+  const lookups: Record<string, { usd: number; tokens: number; complete: boolean } | undefined> = {
+    "session-complete": { usd: 1.25, tokens: 900, complete: true },
+    "session-partial": { usd: 0.5, tokens: 100, complete: false },
+    "session-unmeasured": undefined,
+  };
+  const removed: string[] = [];
+  const r = rig({ sessionsRemoved: removed, cost: sessionId => { order.push(`cost:${sessionId}`); return lookups[sessionId]; } });
+  try {
+    const long = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    const jobId = r.addJob();
+    const ids: Record<string, string> = {};
+    let slot = 0;
+    for (const sessionId of Object.keys(lookups)) {
+      const trialId = r.seed(jobId, slot++, "running");
+      ids[sessionId] = trialId;
+      r.store.write(tx => finishTrial(tx, trialId, { grade: VOID_GRADE, configId: null, profileEpoch: null, sessionId, patchKeepDays: 90 }, long));
+    }
+    await r.pump.sweep();
+    assert.equal(removed.length, 3, "every session is removed");
+    for (const sessionId of removed) {
+      assert.ok(order.indexOf(`cost:${sessionId}`) >= 0, "the lookup ran for " + sessionId);
+    }
+    const read = (name: string): CostRow | undefined => r.store.read(db => db.get<CostRow>(COST_SQL, ids[name]));
+    const complete = read("session-complete");
+    assert.equal(complete?.cost, "complete");
+    assert.equal(complete?.tokens, 900);
+    assert.equal(complete?.spent_usd, 1.25);
+    assert.equal(complete?.session_id, null);
+    const partial = read("session-partial");
+    assert.equal(partial?.cost, "partial");
+    assert.equal(partial?.tokens, 100);
+    assert.equal(partial?.spent_usd, 0.5);
+    const none = read("session-unmeasured");
+    assert.equal(none?.cost, "none");
+    assert.equal(none?.tokens, null, "unknown stays unknown, never zero");
+    assert.equal(none?.spent_usd, null);
+    assert.equal(none?.session_id, null);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a cost is read before the session is removed", async () => {
+  const events: string[] = [];
+  const removed: string[] = [];
+  const r = rig({ sessionsRemoved: removed, cost: sessionId => { events.push(`cost:${sessionId}:removed=${removed.length}`); return { usd: 1, tokens: 1, complete: true }; } });
+  try {
+    endedTrial(r, "session-order", new Date(Date.now() - 2 * 3_600_000).toISOString());
+    await r.pump.sweep();
+    assert.deepEqual(events, ["cost:session-order:removed=0"], "the lookup saw no removal yet");
+    assert.deepEqual(removed, ["session-order"]);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a cost the ledger cannot read waits a day", async () => {
+  let clock = Date.now();
+  const removed: string[] = [];
+  const r = rig({ sessionsRemoved: removed, clock: () => new Date(clock).toISOString(),
+    cost: () => { throw new Error("ledger unavailable"); } });
+  try {
+    const endedAt = new Date(clock - 2 * 3_600_000).toISOString();
+    const trialId = endedTrial(r, "session-wait", endedAt);
+    await r.pump.sweep();
+    assert.deepEqual(removed, [], "the session stays");
+    const waiting = r.store.read(db => db.get<CostRow>(COST_SQL, trialId));
+    assert.equal(waiting?.session_id, "session-wait");
+    assert.equal(waiting?.cost, null);
+    clock = Date.parse(endedAt) + 24 * 3_600_000;
+    await r.pump.sweep();
+    assert.deepEqual(removed, ["session-wait"], "after a day the session is removed");
+    const done = r.store.read(db => db.get<CostRow>(COST_SQL, trialId));
+    assert.equal(done?.cost, "none");
+    assert.equal(done?.tokens, null);
+    assert.equal(done?.spent_usd, null);
+    assert.equal(done?.session_id, null);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("the pump opens a comparison job", async () => {
+  const r = rig();
+  try {
+    r.addJob();
+    r.store.write(tx => { tx.run("UPDATE eval_jobs SET kind = 'compare'"); });
+    await r.pump.step();
+    await r.pump.step();
+    const fetched = r.probeInputs.map(input => input.fetchUrl).filter(url => url !== undefined);
+    assert.ok(fetched.some(url => url?.includes("example/app")), "the probe names the compare job's project");
   } finally {
     r.cleanup();
   }

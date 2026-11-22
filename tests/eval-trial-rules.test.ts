@@ -8,9 +8,12 @@ import {
   isolationLabel,
   nextSlot,
   restoreSet,
+  trialProfileKey,
   VOID_ATTEMPTS_MAX,
   type SlotRow,
 } from "../packages/host/src/eval-trial-rules.js";
+import { profileIdentity } from "../packages/host/src/run-events.js";
+import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 import type { ParsedReport } from "../packages/host/src/eval-report.js";
 
 const parsed = (entries: Record<string, "passed" | "failed" | "skipped">): ParsedReport => ({
@@ -196,4 +199,17 @@ test("the configuration reference is stable for one profile and changes with it"
   assert.match(ref, /^[0-9a-f]{64}$/, "a SHA-256 hex digest");
   assert.equal(configRef({ ...configuration, profile: { ...profile, label: "Renamed" } }), ref, "the label is not part of the identity");
   assert.notEqual(configRef({ ...configuration, profile: { ...profile, effort: "high" } }), ref, "effort is part of the identity");
+});
+
+test("the profile key matches the outcome ledger's", () => {
+  const claude = { id: "p1", label: "A", provider: "claude", model: "model-a", effort: "high", tier: "strong" } as TeamModelProfile;
+  const opencode = { id: "p2", label: "B", provider: "opencode", model: "model-b", variant: "max", tier: "light" } as TeamModelProfile;
+  const bare = { id: "p3", label: "C", provider: "claude", tier: "light" } as unknown as TeamModelProfile;
+  for (const profile of [claude, opencode, bare]) {
+    const identity = profileIdentity(profile, profile.provider);
+    assert.deepEqual(trialProfileKey(profile), { provider: identity.provider, model: identity.model ?? null, effort: identity.effort ?? null });
+  }
+  assert.deepEqual(trialProfileKey(claude), { provider: "claude", model: "model-a", effort: "high" });
+  assert.deepEqual(trialProfileKey(opencode), { provider: "opencode", model: "model-b", effort: "max" });
+  assert.deepEqual(trialProfileKey(bare), { provider: "claude", model: null, effort: null });
 });

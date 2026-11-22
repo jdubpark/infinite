@@ -1,6 +1,7 @@
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb, EvidenceTx } from "./evidence/types.js";
 import { indexPaths, rejectTask, retireTask, runGroupId } from "./eval-store.js";
+import { drawnSet, mergedSet, type GroupSetRow } from "./eval-sets.js";
 import { EVAL_MODULE } from "./eval-types.js";
 import { COMMIT_ID } from "./outcome-hold.js";
 import { landingSignalId } from "./outcome-signals.js";
@@ -25,13 +26,16 @@ type DueRow = { group_id: string; project_ref: string; created_at: string };
 export { runGroupId };
 
 export function ensureGroup(tx: EvidenceTx, groupId: string, kind: "run" | "mined", projectRef: string, at: string): void {
+  const drawn = drawnSet(tx, groupId, at);
   tx.run(
-    "INSERT OR IGNORE INTO eval_groups (group_id, kind, project_ref, root_id, created_at) VALUES (?, ?, ?, ?, ?)",
+    "INSERT OR IGNORE INTO eval_groups (group_id, kind, project_ref, root_id, created_at, holdout, set_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
     groupId,
     kind,
     projectRef,
     groupId,
     at,
+    drawn.holdout,
+    drawn.setAt,
   );
 }
 
@@ -40,17 +44,30 @@ export function rootOf(db: EvidenceDb, groupId: string): string {
   return db.get<{ root_id: string }>("SELECT root_id FROM eval_groups WHERE group_id = ?", groupId)?.root_id ?? groupId;
 }
 
-/** Merges roots into the smallest id. `devOnly` marks the result; a merged root keeps any earlier mark. */
+/**
+ * Merges roots into the smallest id. `devOnly` marks the result; a merged root keeps any earlier mark. The merged root
+ * is holdout only by `mergedSet`'s rule, and no other row of the root keeps a set.
+ */
 export function mergeRoots(tx: EvidenceTx, roots: readonly string[], devOnly: boolean): string {
   const unique = [...new Set(roots)].sort(compareText);
   const root = unique[0];
-  const marks = tx.get<{ n: number }>(
-    `SELECT COALESCE(MAX(dev_only), 0) AS n FROM eval_groups WHERE group_id IN (${placeholders(unique.length)})`,
+  const rows = tx.all<GroupSetRow>(
+    `SELECT dev_only, holdout, exposed, set_at, confirms FROM eval_groups WHERE group_id IN (${placeholders(unique.length)})`,
     ...unique,
   );
-  const mark = Math.max(marks?.n ?? 0, devOnly ? 1 : 0);
+  const mark = Math.max(...rows.map(row => row.dev_only), devOnly ? 1 : 0);
+  const merged = mergedSet(rows, devOnly);
   tx.run(`UPDATE eval_groups SET root_id = ? WHERE root_id IN (${placeholders(unique.length)})`, root, ...unique);
-  tx.run("UPDATE eval_groups SET dev_only = ? WHERE group_id = ?", mark, root);
+  tx.run("UPDATE eval_groups SET holdout = 0, set_at = NULL WHERE root_id = ? AND group_id <> ?", root, root);
+  tx.run(
+    "UPDATE eval_groups SET dev_only = ?, holdout = ?, set_at = ?, exposed = ?, confirms = ? WHERE group_id = ?",
+    mark,
+    merged.holdout,
+    merged.setAt,
+    merged.exposed,
+    merged.confirms,
+    root,
+  );
   return root;
 }
 

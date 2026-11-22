@@ -14,7 +14,7 @@ import { EventOutbox } from "../packages/host/src/evidence/outbox.js";
 import { configurationModule, configurationProjector } from "../packages/host/src/configuration-store.js";
 import { outcomeProjector } from "../packages/host/src/outcome-projector.js";
 import { learningPurpose } from "../packages/host/src/types.js";
-import { evalTrialsModule, insertTrial } from "../packages/host/src/eval-trial-store.js";
+import { insertTrial } from "../packages/host/src/eval-trial-store.js";
 import { TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
 import { outcomeModule } from "../packages/host/src/outcome-store.js";
 import type { EvalJobView } from "../packages/host/src/eval-types.js";
@@ -99,8 +99,8 @@ function rig(): Rig {
   mkdirSync(root, { mode: 0o700 });
   const databasePath = evidenceDatabasePath(join(dir, "state")), vaultKey = randomBytes(32);
   const store = new EvidenceStore({ databasePath, vaultKey });
+  // The eval host registers the trials module itself, as it does on a live host.
   store.register(outcomeModule({ now: () => NOW }));
-  store.register(evalTrialsModule(store, () => NOW));
   return { dir, root, mirror, head: ids[3], ids, record: join(dir, "record.log"), store, groups: `${root}.groups`, databasePath, vaultKey };
 }
 
@@ -263,6 +263,8 @@ async function validated(h: EvalHost): Promise<void> {
 
 /** The baseline job over the valid mined task, with the given trials per task. */
 function baseline(h: EvalHost, trialsPerTask: number, maxTrials: number, options: { maxWallMinutes?: number } = {}): string {
+  // A group draws its set when it is created, and a baseline job reads the dev set only. Without this the one mined task is holdout in three runs of ten, and the job runs no trial.
+  (h as unknown as { store: EvidenceStore }).store.write(tx => { tx.run("UPDATE eval_groups SET holdout = 0, set_at = NULL"); });
   const created = h.create(PROJECT, {
     kind: "baseline",
     configurations: [{ profile, guidance: "as-of-base", knowledge: "none" }],
@@ -325,7 +327,6 @@ function graderRecord(s: Setup): string[][] {
 function reopen(s: Setup): void {
   const next = new EvidenceStore({ databasePath: s.r.databasePath, vaultKey: s.r.vaultKey });
   next.register(outcomeModule({ now: () => NOW }));
-  next.register(evalTrialsModule(next, () => NOW));
   next.register(configurationModule());
   retired.push(s.r.store);
   s.r.store = next;

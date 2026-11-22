@@ -3,6 +3,7 @@ import type { EvidenceDb } from "./evidence/types.js";
 import { EvidenceError } from "./evidence/types.js";
 import { captureSettings, EVAL_RETENTION_DAYS_DEFAULT, mineSettings } from "./eval-config.js";
 import { groupStats } from "./eval-groups.js";
+import { setCounts } from "./eval-sets.js";
 import {
   EVAL_MODULE,
   EVAL_STATES,
@@ -57,6 +58,7 @@ export function evalSummary(store: EvidenceStore, input: SummaryInput): EvalSumm
     throw new EvidenceError("unavailable", "The eval corpus is unavailable.");
   }
   const { project, now } = input;
+  const evalOn = project.team?.eval !== undefined;
   const days = Math.min(project.team?.eval?.retentionDays ?? EVAL_RETENTION_DAYS_DEFAULT, COVERAGE_DAYS_MAX);
   const since = new Date(Date.parse(now) - days * DAY_MS).toISOString();
   const counted = store.read(db => {
@@ -65,6 +67,7 @@ export function evalSummary(store: EvidenceStore, input: SummaryInput): EvalSumm
       states: db.all<StateRow>(STATE_COUNTS_SQL, ref),
       areas: areaCounts(db, ref, project),
       validCaptured: db.get<{ n: number }>(VALID_CAPTURED_SQL, ref, since)?.n ?? 0,
+      sets: setCounts(db, ref),
       groups: groupStats(db, ref),
     };
   });
@@ -80,8 +83,8 @@ export function evalSummary(store: EvidenceStore, input: SummaryInput): EvalSumm
       failures: input.mining.failures,
       backfillDone: input.mining.backfillDone,
     },
-    tasks: { ...tasksOf(counted.states), byArea: counted.areas, bySet: null },
-    groups: counted.groups,
+    tasks: { ...tasksOf(counted.states), byArea: counted.areas, bySet: evalOn ? { dev: counted.sets.dev, holdout: counted.sets.holdout } : null },
+    groups: { ...counted.groups, holdout: evalOn ? counted.sets.holdoutGroups : 0, exposed: evalOn ? counted.sets.exposedGroups : 0 },
     coverage: coverageOf(store, project, counted.validCaptured, days, now),
     grader: { state: input.grader, version: input.graderVersion },
     evalIdentity: { state: input.evalIdentity },

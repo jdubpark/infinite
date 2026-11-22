@@ -2448,3 +2448,758 @@ Open for the owner, with the default this plan builds: the windows of a job (non
 - Rendering the eval files for a second instance (`scripts/render-instance.mjs`).
 - The trials in the web client, the phone, and the Mac app.
 - MCP tools: none (C9 rules 3 and 8).
+
+# Slice: comparison
+
+Spec part 2 (the set and exposure of a task), part 5 (the calibration read), part 6 (the `compare` and `confirm` jobs and reuse), part 7 (statistics, the holdout set, epochs), and part 8 (the prior export, the report and priors routes and commands), delivery step 4, with acceptance 3's set clause, 10, and 11 (Linear INF-377). After it, an owner whose project runs baseline trials can compare two to four configurations on the dev set, confirm one configuration pair once on the holdout set, read a stored report with part 7's figures, and read the prior export that router delivery step 3 will consume. It builds on the trials slice, which is on `main`. It installs nothing, adds no setting, and starts no trial that the trials slice would not start.
+
+Where the design and the code disagree, or the design leaves a point open, this plan rules:
+
+- **The trial tables are never created on a live host.** Only tests register `evalTrialsModule` (`tests/eval-trial-run.test.ts:103`, `tests/eval-routes.test.ts:135`). No production code registers it, so on `main` the first trial store write would fail. Ruling: `EvalHost`'s constructor registers it after the corpus, unless `store.status().modules` already names it (Task 14). *(My call: this slice's tables live in that module, and the fix is one guarded statement.)*
+- **Where a set lives.** Part 2 gives a task `set?` and `exposed`, and acts on whole groups. Ruling: the set and the exposure flag live on the group's root row: `eval_groups.holdout`, `exposed`, `set_at`, and `confirms`. A task's set is its root's set. Only a root row has `holdout = 1`, and a task without a group row is in the dev set. *(My call: one row per group cannot let a group span both sets, and `mergeRoots` already keeps `root_id` flat.)*
+- **When a set is drawn.** Ruling: when the group row is created (capture's run group, a mined group). The draw is `tx.index("eval-set", groupId)`, an HMAC under the vault key. The group goes to holdout when the first 8 hex digits, read as an unsigned integer, are below 1,288,490,189, the ceiling of 0.3 × 2³². The v3 migration draws every existing root the same way. It sends a root to dev when the root has the dev-only mark, or when one of its tasks already has a trial row. *(My call: the vault key keeps the draw unknown to anyone without the key, and a task that a baseline job already measured has been seen.)*
+- **Merges and exposure.** A merged root is holdout only when every merged root was holdout, none was dev-only or exposed, and the merge does not set the dev-only mark. Otherwise it is dev. `markExposed` sets `exposed` and moves a holdout group to dev at once. *(Spec part 2: "No group ever moves from the dev set to the holdout set.")*
+- **Who reads the dev-only mark.** `mergeRoots` (through `mergedSet`) and the v3 migration. Slice 2's writers of the mark do not change.
+- **Rotation.** Part 7 moves a holdout group to dev after five confirm jobs or 120 days. Ruling: `confirms` counts the confirm jobs that listed a task of the group, and grows at creation. The 120 days count from `set_at`, the time the group was drawn into holdout. The hourly sweep moves at most 100 roots per pass. It moves none in a project that has a confirm job without a report. *(My call: a group must not leave holdout while a confirm job still reads it.)*
+- **Baseline reads dev only.** The trials slice's baseline job reads every valid task. Ruling: from this slice, a baseline job skips holdout tasks. *(Part 7: "`baseline` and `compare` jobs read the dev set only.")*
+- **The task set of a comparison.** Part 7: a job fixes its task set at approval. Ruling: a `compare` or `confirm` job selects its tasks when the owner creates it, in task id order, and seals the list (at most 200) in its payload. The owner's `POST` is the approval. The kind fixes the set: `compare` reads dev, and `confirm` reads holdout. The request has no `set` field, and a `confirm` request admits no `taskIds`. *(My call: a hand-picked holdout list would let the owner choose tasks that a configuration is known to win.)*
+- **Too few tasks.** Ruling: a `compare` job needs 2 selected tasks, and a `confirm` job needs 15 (`409 too-few-tasks`). This includes part 7's refusal when the holdout set has fewer than 15 tasks. *(My call: a confirm job over fewer tasks would be smaller than the set the spec requires.)*
+- **The subject.** Part 7's subject is a change candidate or a configuration pair, and change candidates arrive with the improvement gate. Ruling: a `confirm` request names no subject. Its subject is the SHA-256 of the canonical JSON of its two pins `{ configRef, profileEpoch, promptVersion }`, sorted by `configRef`. The subject row is written at creation and never removed, so a cancelled, expired, or failed confirm job also uses its subject. A new profile epoch or prompt version is a new subject. *(My call: the host cannot tell an honest cancel from a peek, and the subject protects the identity of a configuration.)* **Ruling needed.**
+- **Pins and epochs.** Part 7: trials from different profile epochs never share a comparison. Ruling: at creation, a comparison job pins `epochAt(profile identity, now)` and the prompt version of each configuration. Before each trial, a changed epoch or prompt version ends the job `completed` with reason `identity-changed`. Other digest changes block the job `configuration-changed`, as for baseline. The statistics count only trials whose `profile_epoch` and `prompt_version` equal the pins, and attrition counts the others as `changed`. A trial with an unknown epoch (no outcome row) never matches. *(My call: a resumed job with a new prompt version would put two configurations in one figure.)*
+- **Reuse.** Part 6 reuses a valid trial under 30 days old when the task, `configId`, profile epoch, and harness version match. `configId` includes the guidance digest at the task's base, which a job does not know before the run. Ruling: at creation, a `compare` job reuses final, non-void original trials of `baseline` and `compare` jobs that match the task, `config_ref`, harness version, prompt version (a new plain column), and profile epoch, and that ended within 30 days. Each source fills one slot of the new job as a copy row (`reused_from`). Copies never count toward `maxTrials` or `trialsPerDay`. `baseline` and `confirm` jobs never reuse, and a confirm trial is never a source. A compare job whose every slot is reused completes at creation. *(My call: the task's base fixes the guidance, so the task, `config_ref`, and prompt version decide `configId`; reuse at creation keeps the count shown before approval honest.)* **Ruling needed.**
+- **Pairs with more than two configurations.** Ruling: every pair `a < b`. The difference is `b` minus `a`. Holm adjusts over all pairs of one figure: the whole job, or one subgroup. *(My call: the spec names no control configuration.)*
+- **The sensitivity figure.** Ruling: over the tasks with at least one final trial in every configuration, a slot without a valid, matching, resolved trial counts as not resolved. The figure is the mean difference of `resolved / trialsPerTask`. *(My call: a voided slot never got a valid trial, so counting the slot as not resolved is "every void trial counted as not resolved" without counting retries twice.)*
+- **Costs.** Part 7 asks for `listUsd`, and for `spentUsd` for metered profiles. The code has no list-price table, and `outcome-cells.ts` reports the usage ledger's cost as `spentUsd` for every profile, with `listUsd: null`. Ruling: the same rule here, so `listUsdPerResolved` is always null. The pump's hourly session sweep reads a trial's tokens and cost from the usage ledger before it removes the session, and stores them in plain columns. *(My call: reuse `sessionCostOf`, and add no pricing.)*
+- **The prospective confirm.** Part 8 exports "the trials of a prospective `confirm` comparison", which delegated adoption delivery step 7 defines (groups after a registered base head). Ruling: not in this slice. Confirm trials never reach an export. *(My call: it needs the registered base head, which does not exist yet.)*
+- **Where the prompt origin and kind live.** They exist only in sealed task payloads, and a report needs them for each task. Ruling: eval-corpus v3 adds the plain columns `prompt_origin` and `kind` (both enumerations). Promotion and mining write them, and the migration fills them once. Comparison jobs get the `promptOrigins` filter. *(My call: the report pass must not open a sealed payload for each task.)*
+- **Model names.** The trials slice ruled that no route returns a profile model, and part 8's `ReplayPrior` carries `profile.model`. Ruling: a report names each configuration by index, `profileId`, provider, epoch, and prompt version, and never by model. The priors route returns the spec's `ReplayPrior`, model included. `eval_priors` keeps the provider, model, and effort as plain columns, as `configurations` does. **Ruling needed.**
+- **The calibration read marks exposure.** Part 5 says that a design which shows a task's content first marks the task's group exposed. Ruling: `calibrationPairs` marks the group of each returned task exposed, in the same write. *(My call: the only reader is a judge member, and a read without the mark would leave the rule to every caller.)*
+
+**Rulings before the build.**
+
+- Line numbers in this section were read on `main` at `21bebd00`. Find each place by the quoted code.
+- Nothing is installed, and no setting is added: no launcher form, sudo rule, network rule, egress list, or configuration field. `eval-config.ts` does not change, so it imports nothing from `team-types.ts`, and nothing new reaches the routine authority digest.
+- A project without `team.eval` behaves exactly as today. Group rows exist only for capture or mining, and only the owner creates jobs. The summary's `bySet` stays null without `team.eval`. No prompt, event, team view, or routine digest changes: `teams.ts`, `team-prompts.ts`, `team-replay.ts`, and `routines.ts` are not touched. No `TeamRun` field is added, so nothing new reaches relay devices through `view()`, and a replay run still reaches no client list.
+- `server.ts` changes one line in place (Task 14). `teams.ts` does not change.
+- The owner defaults stand until the owner changes one: a holdout share of 30%; rotation after five confirm jobs or 120 days; 15 holdout tasks for a confirm job and 2 tasks for a compare job; 20 tasks per job (at most 200); three trials per task; reuse within 30 days; reports and priors kept 365 days; subjects kept with no limit.
+- One trial still runs host-wide at a time. A comparison job takes its turn in `TrialJobs`, behind the trials slice's gates, in creation order with baseline jobs.
+
+**A comparison job is a trial job with a fixed task list.** `TrialJobs` keeps its gates and its one trial at a time. A row of kind `compare` or `confirm` differs in three places. At creation, it selects its tasks from one set, and in the same write it adds its reuse copies and, for `confirm`, its subject and each group's confirm count. Each step checks the pins before the digest. The scan walks the sealed list, not the corpus. The new `eval-compare-jobs.ts` holds selection, reuse, the pins, and the subject as functions over a transaction, so `TrialJobs` adds only the dispatch and the fixed-list scan. *(My call: a second scheduler would need its own gates and would race the first for the eval identity.)*
+
+**A finished job is reported once, from plain columns.** On each tick, `ComparisonPass.step` takes the oldest finished job without a report whose trial sessions are gone (so their cost is recorded), or that finished 24 hours ago. In one write it reads the job's trial rows (one statement, at most 5,000 rows) and its tasks' plain fields (one statement, at most 200 rows), and computes the figures with the pure `comparisonStats`. A `compare` or `confirm` job gets a sealed report. A `baseline` or `compare` job gets its prior rows. Then the pass sets `reported_at`. A report never changes after that. *(My call: a stored report gives the same interval on every read, and the pass never opens a task payload.)*
+
+**The statistics are a pure function of sorted rows.** `comparisonStats` sorts the tasks by id and each task's trials by configuration and slot before any figure, works on integer resolved counts, seeds the bootstrap from the job id, and returns the same object for the same rows in any order (acceptance 10).
+
+**A set change never rewrites a result.** A report and its prior rows keep their figures. A group that leaves holdout becomes readable by later baseline and compare jobs, and its confirm trials stay out of reuse and exports. A confirm report counts a task only while the task's group is still holdout when the report is written. A task whose group was exposed, or merged into dev, during the job counts as `leftHoldout` and lowers the share. An epoch change ends a comparison job (the pins ruling), and each prior row has the single epoch of its trials.
+
+## Coordinator rulings (2026-11-21)
+
+These rulings settle the points marked "Ruling needed" and add build rules. Where a task's text differs, the ruling wins.
+
+1. **The subject is confirmed as planned.** A `confirm` job's subject is the hash of its two sorted pins, written at creation and never removed, so a cancelled, expired, or failed confirm job uses its subject. The docs say so in plain words. Known limit, named in the pull request: a confirm job that ends before any trial started still uses its subject. The improvement gate, which will create confirm jobs without the owner, must revisit that case.
+2. **Reuse is confirmed as planned.** It is decided at creation, for `compare` jobs only, on the task, `config_ref`, harness version, prompt version, and profile epoch, within 30 days.
+3. **Model names.** A report never names a model. The priors read returns the spec's `ReplayPrior`, model included, because the router needs it. Task 12 adds one test, `the relay refuses the report and priors reads`: the relay's allow rules name no eval path today, and the test pins that for the two new reads.
+4. **Cost is confirmed as planned.** The ledger's cost is `spentUsd` for every profile, and `listUsd` is null.
+5. **The power simulation is not in this slice.** It stays under "Not in this slice", and the pull request names it. Task 5's planning figures match the spec's table.
+6. **Baseline reads the dev set only**, as part 7 says. The pull request names this as a change to the trials slice's behaviour.
+7. **The missing registration is fixed on its own.** `evalTrialsModule` is registered by no production code on `main`. That fix lands in its own pull request before this slice's Task 14, with a test that fails without it. Task 14 keeps its guarded registration only if that pull request has not merged when Task 14 starts; otherwise it builds on the merged fix and adds no second registration.
+8. **Rollback.** After this slice's migrations ran, a host without the slice reads `eval-corpus` and `eval-trials` as unavailable: capture, mining, validation, and trials stop until the newer host runs again. Task 15 writes this in `docs/teams.md` as a rollback step, and the pull request repeats it.
+9. **Lines.** A change that extends an existing expression, list, or statement text stays on its line. A new import, field, or statement gets its own lines, one statement per line. No task joins statements to hold a line count. If `server.ts` needs a line, Task 14 raises its entry in `scripts/file-size-baseline.json` by hand by exactly that line and reports it; no task runs the script with `--update`.
+10. **Test runs.** Every test command runs in the foreground, with `NODE_OPTIONS=--max-old-space-size=2048` and a time bound: `perl -e 'alarm shift; exec @ARGV' 900 node --import tsx --test FILE...`. No worker starts a Monitor, a background run, the full suite, or a mutation tool.
+11. **Commits.** A worker never commits, stashes, resets, or checks out. The coordinator reads each task's diff and commits it.
+12. **Reference tree.** The build starts on `main` at `84f9a8c3`. Since `21bebd00`, `main` changed no file this slice writes except `docs/teams.md` (Task 15).
+13. **Priors leave out copies** (added during the build). The report pass exports a job's prior rows from the trials that job ran itself. A reused copy's source trial is exported by the job that ran it, so exporting the copy would count one trial twice. `priorCells` stays as Task 9 fixes it; the filter is in the report pass (Task 10), with the test `the prior export leaves out copies`. A compare job whose every slot is reused writes a report and no prior row.
+14. **A job whose priors cannot be built does not block the queue** (added during the build). The report pass builds a job's prior cells before it writes them. When the build throws, the job keeps its `reported_at` stamp, gets no prior row, and the process logs `Eval report unreadable.` once. A failed store write still rolls back and is retried. Task 10 adds the test `a job whose priors cannot be built does not block the next job`.
+15. **What the holdout set keeps back** (from the whole-branch review). It keeps outcomes, not membership. No baseline or compare job runs a trial on a holdout task, so no result of a holdout task exists before a confirm job, and a confirm report holds aggregates only. Membership is not a secret from the owner: a `taskIds` filter, a planned count, the `too-few-tasks` refusal, and the summary's set counts each reveal it, and the spec's own task view has a `set` field. That is accepted, and the docs say it in place of "nobody without the key can tell". What the host stops is a confirm task list shaped by name: a `confirm` request admits no `taskIds` and no `excludeGroups`. The filters by origin, area, and prompt origin and `maxTasks` stay; the job view and the report do not record them. The owner can still shape a later confirm list by retiring tasks: the list is the first `maxTasks` valid holdout tasks in task id order, and a retired task leaves every later list. Retiring is permanent, and the docs say so. An exclusion by provenance arrives with change-candidate subjects in the improvement gate, where the host supplies it.
+16. **A pass writes only into a ready module** (from the review). The report pass does nothing unless `eval-corpus` and `eval-trials` are both ready, and the rotation does nothing unless `eval-corpus` is ready. A store whose version is above the code's, after a rollback, must not get rows in the older shape.
+17. **Rotation skips a held project in the statement** (from the review). The two rotation statements leave out every project that has a confirm job without a report, so such a project cannot use up the pass's 100 rows. A paused or blocked confirm job never expires, so its own project's holdout groups stay until the owner resumes or cancels it. That is a known limit with a follow-up issue. This ruling replaces `CONFIRMS_UNREPORTED_SQL` wherever Task 3's text and the Review Focus name it: the statement no longer exists.
+18. **The calibration read after rotation** (from the review). A group that left the holdout set is a dev group. The calibration read may return the patch of a confirm job's trial from that time, and it marks the group exposed. Reuse and the prior export still leave confirm trials out. The duels design, the first caller, can narrow this.
+19. **The report names no winner** (from the review). `conclusive` says only that the 90% share rule is met. The CLI prints `share rule met` for it and rounds the share down. The docs say the report gives each pair's difference, interval, and p-value.
+20. **The bootstrap's seed is pinned by a test** (from the review). One fixture's interval differs between two seeds, in the statistics test and in the report test, so a report that ignored its job id would fail.
+
+## Trust boundary, and what a review checks
+
+The slice reads these inputs:
+
+- **Owner requests.** `POST /api/eval/jobs` with `kind` `compare` or `confirm`, through a strict schema. Owner only.
+- **Stored rows.** The corpus, the trial rows, `profile_epochs` (through `epochAt`), and the usage ledger (through `sessionCostOf`). A job payload that does not open gives an `unreadable` report, never a guess.
+- **Device roles.** Owner, controller, and viewer read job views, reports, and priors.
+
+What reaches a plain column, a route, and a log:
+
+- The new plain columns hold ids, references (`area_ref`, `project_ref`, `config_ref`), enumerations (`prompt_origin`, `kind`, `cost`, the report `state`), digests (`prompt_version`, `subject`), counts, and times. `eval_priors` also holds the profile's id, provider, model, and effort. Sealed: a job's task list and pins (`eval_jobs.payload`), the report (`eval_reports.payload`), and a copy's configuration.
+- A report holds only aggregates: counts, means, intervals, p-values, attrition and cost for each configuration, and the figures for each area and prompt origin with their n. It never holds a task id, group id, trial id, session id, commit, file name, case, patch, text, or model.
+- `calibrationPairs` returns task ids and patches only to a host-internal caller. No route, CLI command, log line, or event carries them.
+- The only new log line is `Eval report unreadable.`, once per process. No event is added.
+
+The slice must survive these sequences. Each has a named test.
+
+| Sequence | Expected | Test |
+|---|---|---|
+| A second `confirm` job for one pair, after the first was cancelled | `409` `subject-confirmed` | Task 6 `a second confirm for one subject is refused` (acceptance 11) |
+| The same `requestId` twice | One job; the second answer has `created: false`; one subject row; each group's `confirms` grows once | Task 7 `a repeated request creates one job` |
+| A profile epoch advance while a compare job runs | The job ends `completed` `identity-changed` before its next trial; its report counts only matching trials | Task 7 `a changed identity ends the job`; Task 5 `attrition, the share rule, and the sensitivity figure` |
+| A holdout group is exposed while a confirm job runs | The group moves to dev at once; the report counts its tasks as `leftHoldout` | Task 10 `a confirm report counts only tasks still in holdout` |
+| The rotation sweep while a confirm job has no report | No group of that project moves | Task 2 `rotation waits for every confirm report` |
+| The rows of one job in any order | The same figures | Task 5 `the figures do not depend on row order` |
+| A host restart after a job finished and before its report | The next process writes the report, once | Task 10 `a report is written once` |
+| A trial session whose cost the usage ledger cannot read | The session stays for the next sweep; 24 hours after the trial ended, cost `none` and removal | Task 8 `a cost the ledger cannot read waits a day` |
+| A compare job whose every slot is reused | `completed` `done` at creation; no trial starts | Task 7 `a fully reused compare completes at creation` |
+| The store is opened by the trials slice's host after this slice ran | `eval-corpus` and `eval-trials` are `unavailable`; no trial starts | Task 2 `an older host leaves the corpus unavailable`; Task 4 `the v2 migration keeps v1 rows` |
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/eval-types.ts` (modify) | Comparison requests and views, reports, priors, refusals, reasons, `EvalHostApi` |
+| `packages/host/src/evidence/crypto.ts` (modify, net 0) | The index class `eval-set`, in place on lines 7 and 9 |
+| `packages/host/src/eval-store.ts` (modify) | `SCHEMA_V3` and the v3 migration; the drawn set in `insertMarker`; the plain fields at promotion |
+| `packages/host/src/eval-sets.ts` (create) | The draw, the merged set, exposure, rotation, set counts, the task statement with sets |
+| `packages/host/src/eval-groups.ts`, `eval-miner.ts` (modify) | The drawn set in `ensureGroup`; the merge rule; the plain fields of a mined task |
+| `packages/host/src/eval-trial-store.ts`, `eval-trial-rules.ts` (modify) | `eval-trials` v2: prompt versions, copies, costs, reports, subjects, priors; `trialPromptVersion`, `trialProfileKey` |
+| `packages/host/src/eval-stats.ts` (create) | Pure: part 7's figures |
+| `packages/host/src/eval-compare-jobs.ts` (create) | The comparison schema, selection, pins, the subject, reuse, confirm counts |
+| `packages/host/src/eval-trial-jobs.ts` (modify) | Create and step by kind, the fixed-list scan, dev-only baseline, comparison views |
+| `packages/host/src/eval-jobs.ts` (modify, net 0) | Three in-place lines: every trial kind takes `TrialJobs`' views and digests |
+| `packages/host/src/eval-trial-pump.ts` (modify) | The cost read before a session's removal; the open job of any trial kind |
+| `packages/host/src/eval-priors.ts` (create) | The prior cells, their rows, the priors read, area names |
+| `packages/host/src/eval-comparison.ts` (create) | `ComparisonPass` and `reportFor` |
+| `packages/host/src/eval-calibration.ts` (create) | `calibrationPairs` |
+| `packages/host/src/eval-summary.ts`, `eval-routes.ts` (modify) | Set counts; the report and priors routes; comparison requests |
+| `packages/host/src/eval-cli.ts` (modify) | `report`, `priors`, comparison job lines, set counts |
+| `packages/host/src/eval-host.ts` (modify) | Registration, the pass on the tick, rotation on the sweep, `create`, `report`, `priors`, `cost` |
+| `packages/host/src/server.ts` (modify, net 0) | One in-place line: the `cost` option |
+| `docs/teams.md`, the spec | Comparisons, sets, reports, priors, the amendments |
+| `tests/eval-{sets,store-v3,stats,compare-jobs,priors,comparison,calibration,compare-run}.test.ts` (create); `tests/evidence-store.test.ts`, `tests/eval-groups.test.ts`, `tests/eval-trial-store.test.ts`, `tests/eval-trial-rules.test.ts`, `tests/eval-trial-jobs.test.ts`, `tests/eval-trial-pump.test.ts`, `tests/eval-routes.test.ts`, `tests/eval-cli.test.ts` (modify) | Pure rules, a real store, the host |
+
+`teams.ts` does not change. `server.ts` changes one line in place and keeps its baseline of 2,285. Every new source file stays under 400 lines. `eval-store.ts` grows from 691 to at most 770, `eval-trial-jobs.ts` from 482 to at most 590, `eval-trial-pump.ts` from 512 to at most 540, `eval-host.ts` from 418 to at most 460, `eval-trial-store.ts` from 249 to at most 400, `eval-groups.ts` from 269 to at most 290, `eval-miner.ts` from 562 to at most 570, `eval-types.ts` from 222 to at most 320, `eval-cli.ts` from 154 to at most 270, `eval-routes.ts` from 128 to at most 165, and `eval-summary.ts` from 165 to at most 185. `eval-jobs.ts` and `evidence/crypto.ts` change only in place.
+
+**Order and owners.** Task 1 runs first and alone. Then Tasks 2, 4, 5, and 13 run in parallel. Task 3 waits for Task 2. Task 6 waits for Tasks 2 and 4. Tasks 8 and 9 wait for Task 4. Task 11 waits for Tasks 2 and 4. Task 7 waits for Task 6. Task 10 waits for Tasks 2, 5, and 9. Task 12 waits for Tasks 7 and 10. Task 14 waits for Tasks 3, 7, 8, 10, and 12, and runs last. Task 15 runs at any point after Task 1. With four implementers at once: Task 1; then 2, 4, 5, 13; then 3, 6, 8, 9 as slots free, then 11 and 15; then 7 and 10; then 12; then 14. Each file has one writer, except `eval-store.ts`, which Task 2 and then Task 3 write: Task 1 alone writes `eval-types.ts` and `evidence/crypto.ts`; Task 3 alone `eval-groups.ts` and `eval-miner.ts`; Task 4 alone `eval-trial-store.ts` and `eval-trial-rules.ts`; Task 7 alone `eval-trial-jobs.ts` and `eval-jobs.ts`; Task 8 alone `eval-trial-pump.ts`; Task 14 alone `eval-host.ts` and `server.ts`. Tasks build against each other's interfaces as fixed below, without talking.
+
+## Review Focus
+
+1. **Holdout leakage**: a holdout task in a baseline or compare job, in a calibration pair, in a prior row, or as a reuse source; one group in both sets. Expect none. Task 7 `baseline reads the dev set only`: deleting the `holdout` test in `selected` must fail it. Task 11 `the calibration read returns no holdout task and one pair per task`: deleting `COALESCE(r.holdout, 0) = 0` from `CALIBRATION_TASKS_SQL` must fail it. Task 3 `no group spans both sets`: deleting the update that clears `holdout` on the non-root rows in `mergeRoots` must fail it. Task 4 `reuse finds only matching originals`: deleting `j.kind IN ('baseline', 'compare')` from `REUSE_SQL` must fail it.
+2. **A second look at the holdout set**: a second confirm job for one subject, hand-picked confirm tasks, a group that rotates while its confirm job has no report. Expect a refusal or no move. Task 6 `a second confirm for one subject is refused`: deleting the `eval_subjects` read in `planComparison` must fail it. Task 2 `rotation waits for every confirm report`: deleting the `CONFIRMS_UNREPORTED_SQL` filter must fail it.
+3. **A figure that changes between runs, or that mixes identities**: unsorted rows, a seed other than the job id, a trial from another epoch or prompt version in a figure. Expect the planned numbers. Task 5 `the figures do not depend on row order`: removing the sort by key must fail it. Task 5 `attrition, the share rule, and the sensitivity figure`: deleting `matches` from the valid rule must fail it. Task 7 `a changed identity ends the job`: deleting the `pinsChanged` gate must fail it.
+4. **Result detail outside the seal, or before the end**: a report figure, task id, or model in a plain column, a log line, or a report body; a resolved count in the view of a running comparison. Expect none. Task 10 `the report holds no task material`. Task 7 `an interim view shows no result`: returning `count.resolved` for a running compare job must fail it.
+5. **An unbounded pass**: a report pass over every finished job, a scan of every trial, a rotation that moves every group. Expect the stated bounds. Task 10 `a report waits for the trial sessions, at most a day`, with `REPORT_DUE_SQL`'s `LIMIT 20`. Task 2 `rotation moves used and aged groups, at most 100 a pass`.
+
+### Task 1: the shared types and the index class
+
+**Files:** `packages/host/src/eval-types.ts`, `packages/host/src/evidence/crypto.ts` (net 0), `tests/evidence-store.test.ts`. Runs first and alone. It may make compile-only fixes in `eval-cli.ts`, `eval-summary.ts`, `eval-routes.ts`, `eval-jobs.ts`, `eval-trial-jobs.ts`, `eval-host.ts`, and the test adapters of `EvalHostApi` for the wider `EvalJobView`, `EvalSummary`, and `EvalHostApi`, and reports each line.
+
+**Interfaces (produces):**
+```ts
+export type EvalSet = "dev" | "holdout";
+export const PROMPT_ORIGINS = ["assignment", "run-objective", "commit-message"] as const;
+export type PromptOrigin = typeof PROMPT_ORIGINS[number];
+// EvalJobReason gains "identity-changed".
+export type ComparisonJobRequest = {
+  kind: "compare" | "confirm";
+  configurations: TrialConfiguration[];      // compare: 2 to 4; confirm: exactly 2
+  taskFilter?: { taskIds?: string[]; origins?: EvalOrigin[]; areas?: string[]; promptOrigins?: PromptOrigin[];
+                 excludeGroups?: string[]; maxTasks?: number };   // confirm: no taskIds
+  trialsPerTask?: number;
+  limits: { maxTrials: number; maxWallMinutes: number };
+  windows?: { startHourUtc: number; endHourUtc: number }[];
+  expiresAt?: string;
+};
+export type ComparisonPin = { configRef: string; profileEpoch: number; promptVersion: string };
+/** Sealed in `eval_jobs.payload` for a baseline, compare, or confirm job. Only comparison jobs have `tasks` and `pins`. */
+export type TrialJobPayload = { projectId: string; request: BaselineJobRequest | ComparisonJobRequest; requestDigest: string;
+  jobDigest: string; tasks?: string[]; pins?: ComparisonPin[]; subject?: string };
+export type ComparisonJobView = Omit<BaselineJobView, "kind" | "trials"> & {
+  kind: "compare" | "confirm"; set: EvalSet;
+  trials: { planned: number; started: number; graded: number; resolved: number | null; ended: number; void: number; reused: number };
+  report: "pending" | "ready" | null;
+};
+export type EvalJobView = ValidateJobView | BaselineJobView | ComparisonJobView;
+export type PairResult = { a: number; b: number; n: number; mean: number | null; interval: [number, number] | null;
+  sign: { wins: number; losses: number; ties: number; p: number }; holm: number;
+  detectable: { observed: number | null; planning: [number, number] | null } };
+export type ComparisonStats = {
+  trialsPerTask: number; conclusive: boolean;
+  tasks: { planned: number; analysed: number; leftHoldout: number };
+  pairs: PairResult[];
+  sensitivity: { a: number; b: number; n: number; mean: number | null }[];
+  attrition: { configuration: number; void: Record<"void-limit" | "void-host" | "void-owner", number>; changed: number; short: number }[];
+  cost: { configuration: number; trials: number; resolved: number; costed: number; tokensPerResolved: number | null;
+          spentUsdPerResolved: number | null; listUsdPerResolved: null; minutesPerResolved: number | null }[];
+  byPromptOrigin: { promptOrigin: PromptOrigin; n: number; pairs: PairResult[] }[];
+  byArea: { area: string; n: number; pairs: PairResult[] }[];
+};
+export type ComparisonReport = ComparisonStats & {
+  jobId: string; projectId: string; kind: "compare" | "confirm"; set: EvalSet; source: "replay"; metric: "resolved";
+  status: RoutineStatus; reason: EvalJobReason | null; generatedAt: string;
+  configurations: { index: number; profileId: string; provider: string; profileEpoch: number; promptVersion: string }[];
+};
+export type ReplayPrior = {
+  projectId: string; profileId: string; profile: { provider: string; model: string | null; effort: string | null };
+  profileEpoch: number; promptVersion: string; role: "implementer"; area: string; kind: string | null;
+  tasks: number; trials: number; resolved: number; source: "replay"; promptOrigin: PromptOrigin; generatedAt: string; jobId: string;
+};
+// EvalSummary: `tasks.bySet: { dev: number; holdout: number } | null`; `groups` gains `holdout: number; exposed: number`.
+// EvalRefusal codes gain "too-few-tasks" | "subject-confirmed" | "report-not-ready" | "report-unreadable" | "no-report".
+// EvalHostApi: `create` takes ValidateJobRequest | BaselineJobRequest | ComparisonJobRequest, and gains
+//   report(jobId: string): ComparisonReport | EvalRefusal;
+//   priors(projectId: string): { projectId: string; priors: ReplayPrior[] } | EvalRefusal;
+```
+
+**Decisions:**
+- `evidence/crypto.ts` line 7 (`export type EvidenceIndexClass = … | "eval-path";`) and line 9 (`const INDEX_CLASSES … "eval-path"]);`) each gain `"eval-set"`, in place.
+
+- [ ] **Step 1: Write the failing test** in `tests/evidence-store.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `the eval-set index class is admitted` | `tx.index("eval-set", "run:run-1")` is 64 hex digits, differs from `tx.index("project", "run:run-1")`, and equals the value a second store opened with the same vault key gives. |
+
+- [ ] **Step 2: Run the test and confirm it fails.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/evidence-store.test.ts` and the typecheck.
+
+### Task 2: the corpus, version 3, and the set rules
+
+**Files:** `packages/host/src/eval-store.ts` (the schema and `migrate` only), `packages/host/src/eval-sets.ts` (create), `tests/eval-sets.test.ts`, `tests/eval-store-v3.test.ts` (create). Needs Task 1. It may change a module version that `tests/eval-store-v2.test.ts` pins, and reports each line.
+
+**Interfaces (produces):**
+```ts
+// eval-store.ts: evalCorpusModule version 3, readVersion 3. When `from < 3`, migrate runs SCHEMA_V3, then drawExisting, then fillTaskFields.
+export const SCHEMA_V3 = [
+  "ALTER TABLE eval_groups ADD COLUMN holdout INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE eval_groups ADD COLUMN set_at TEXT",
+  "ALTER TABLE eval_groups ADD COLUMN exposed INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE eval_groups ADD COLUMN confirms INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE eval_tasks ADD COLUMN prompt_origin TEXT",
+  "ALTER TABLE eval_tasks ADD COLUMN kind TEXT",
+  "ALTER TABLE eval_jobs ADD COLUMN reported_at TEXT",
+  "CREATE INDEX IF NOT EXISTS eval_groups_holdout_age ON eval_groups (set_at) WHERE holdout = 1",
+  "CREATE INDEX IF NOT EXISTS eval_groups_holdout_used ON eval_groups (confirms) WHERE holdout = 1 AND confirms >= 5",
+  "CREATE INDEX IF NOT EXISTS eval_jobs_unreported ON eval_jobs (finished_at, job_id) WHERE reported_at IS NULL AND kind != 'validate'",
+];
+// eval-sets.ts
+export const HOLDOUT_THRESHOLD = 1_288_490_189, HOLDOUT_CONFIRMS_MAX = 5, HOLDOUT_DAYS_MAX = 120, CONFIRM_TASKS_MIN = 15, ROTATION_BATCH = 100;
+/** A page of valid tasks with each task's root and set; a task without a group row is dev. */
+export const TRIAL_TASKS_SQL = "SELECT t.task_id, t.origin, t.area_ref, t.prompt_origin, COALESCE(g.root_id, t.group_id) AS root_id, "
+  + "COALESCE(r.holdout, 0) AS holdout FROM eval_tasks t LEFT JOIN eval_groups g ON g.group_id = t.group_id "
+  + "LEFT JOIN eval_groups r ON r.group_id = g.root_id WHERE t.project_ref = ? AND t.state = 'valid' AND t.task_id > ? ORDER BY t.task_id LIMIT 200";
+export const SET_COUNTS_SQL = "SELECT COALESCE(r.holdout, 0) AS holdout, count(*) AS n FROM eval_tasks t LEFT JOIN eval_groups g "
+  + "ON g.group_id = t.group_id LEFT JOIN eval_groups r ON r.group_id = g.root_id WHERE t.project_ref = ? AND t.state = 'valid' GROUP BY 1";
+export const GROUP_SETS_SQL = "SELECT COALESCE(SUM(holdout), 0) AS holdout, COALESCE(SUM(exposed), 0) AS exposed FROM eval_groups "
+  + "WHERE project_ref = ? AND root_id = group_id";
+export const HOLDOUT_USED_SQL = "SELECT group_id, project_ref FROM eval_groups WHERE holdout = 1 AND confirms >= 5 LIMIT ?";
+export const HOLDOUT_AGED_SQL = "SELECT group_id, project_ref FROM eval_groups WHERE holdout = 1 AND set_at <= ? ORDER BY set_at LIMIT ?";
+/** The first two terms select the partial index `eval_jobs_unreported`. An active confirm job has no report either. */
+export const CONFIRMS_UNREPORTED_SQL = "SELECT DISTINCT project_ref FROM eval_jobs WHERE reported_at IS NULL AND kind != 'validate' AND kind = 'confirm'";
+export type TrialTaskRow = { task_id: string; origin: EvalOrigin; area_ref: string | null; prompt_origin: PromptOrigin | null; root_id: string; holdout: 0 | 1 };
+export type GroupSetRow = { holdout: number; exposed: number; dev_only: number; set_at: string | null; confirms: number };
+export function drawsHoldout(indexHex: string): boolean;                // parseInt(indexHex.slice(0, 8), 16) < HOLDOUT_THRESHOLD
+export function drawnSet(tx: EvidenceTx, groupId: string, at: string): { holdout: 0 | 1; setAt: string | null };
+export function mergedSet(roots: readonly GroupSetRow[], devOnly: boolean): { holdout: 0 | 1; setAt: string | null; exposed: 0 | 1; confirms: number };
+export function markExposed(tx: EvidenceTx, groupId: string): boolean;  // true when the group left holdout
+export function rotateHoldout(tx: EvidenceTx, now: string, limit?: number): number;
+export function setCounts(db: EvidenceDb, projectRef: string): { dev: number; holdout: number; holdoutGroups: number; exposedGroups: number };
+```
+
+**Decisions:**
+- `drawnSet` is `{ holdout: 1, setAt: at }` when `drawsHoldout(tx.index("eval-set", groupId))`, else `{ holdout: 0, setAt: null }`.
+- `mergedSet`: holdout when every row has `holdout` 1, `dev_only` 0, and `exposed` 0, and `devOnly` is false. Then `setAt` is the earliest `set_at` and `confirms` the largest. Otherwise `{ holdout: 0, setAt: null }`. `exposed` is the largest of the rows.
+- `drawExisting(tx)`: each root row (`group_id = root_id`) is holdout when `dev_only` is 0, `drawsHoldout` holds, and no task of the root has a row in `eval_trials` (read only when `sqlite_master` lists that table), with `set_at = created_at`. It runs once, over every root.
+- `fillTaskFields(tx)`: each `candidate` or `valid` row gets `prompt_origin` `assignment` (captured) or its payload's `promptOrigin` (mined), and `kind` from its payload's `features.kind` (null when absent). A payload that does not open leaves both null. It runs once, over at most `PROJECT_TASK_MAX` rows per project.
+- `markExposed` sets `exposed = 1` on the root (`rootOf`), and `holdout = 0, set_at = NULL` when it was holdout.
+- `rotateHoldout` reads `CONFIRMS_UNREPORTED_SQL` once, then `HOLDOUT_USED_SQL` and `HOLDOUT_AGED_SQL` (cutoff: `now` minus 120 days), each with `limit`, and sets `holdout = 0, set_at = NULL` on each root whose project is not in the first list, at most `limit` roots per call. Three statements and at most 100 updates.
+- `setCounts` runs `SET_COUNTS_SQL` and `GROUP_SETS_SQL`, one each.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-sets.test.ts` and `tests/eval-store-v3.test.ts`, on a real store.
+
+| Test name | Assertions |
+|---|---|
+| `the draw puts three in ten groups in holdout` | `drawsHoldout("4ccccccc" + "0".repeat(56))` is true and `drawsHoldout("4ccccccd" + "0".repeat(56))` is false. For the ids `run:0` to `run:9999` under one vault key, the holdout share is between 0.28 and 0.32. One id under one key draws the same set twice; some id draws differently under another key. |
+| `a merged group is holdout only when every part was` | `mergedSet`: two holdout rows: holdout, the earlier `set_at`, the larger `confirms`. One dev row, one exposed row, one `dev_only` row, or `devOnly` true: dev with `setAt` null. |
+| `exposure moves a holdout group to dev at once and never back` | `markExposed` of a holdout root: true, `holdout` 0, `exposed` 1. A later `mergedSet` with a holdout row: dev. `markExposed` of a dev group: false, `exposed` 1. |
+| `rotation moves used and aged groups, at most 100 a pass` | 150 aged holdout roots: 100 moved, then 50. A root with `confirms` 5: moved; 4: kept. A root drawn 119 days ago: kept; 120 days ago: moved. |
+| `rotation waits for every confirm report` | A `confirm` row with `reported_at` null in project A: no root of A moves, the roots of B do. After `reported_at` is set, A's roots move. |
+| `the hot statements read through an index` | `EXPLAIN QUERY PLAN` of `TRIAL_TASKS_SQL`, `HOLDOUT_USED_SQL`, `HOLDOUT_AGED_SQL`, and `CONFIRMS_UNREPORTED_SQL` uses `eval_tasks_next`, `eval_groups_holdout_used`, `eval_groups_holdout_age`, and `eval_jobs_unreported`. `SET_COUNTS_SQL` searches `eval_tasks` by index, never `SCAN eval_tasks`. |
+| `the v3 migration draws every root once` (in `eval-store-v3`) | A v2 store with 40 roots, 2 with `dev_only` and 3 with a task that has an `eval_trials` row, migrated: those 5 are dev; each other root's `holdout` equals `drawsHoldout` of its index, and a holdout root's `set_at` equals its `created_at`; no non-root row has `holdout` 1. A second open changes no row. |
+| `the v3 migration fills the prompt origin and kind` | A valid captured task: `assignment` and its features' kind. A mined candidate with `commit-message`: `commit-message`. A rejected task: both null. A task whose payload does not open: both null, and the migration completes. |
+| `an older host leaves the corpus unavailable` | A v3 store opened with a corpus module that claims version 2: `status().modules["eval-corpus"]` is `unavailable`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/eval-sets.test.ts`, the same for `tests/eval-store-v3.test.ts`, `tests/eval-store-v2.test.ts`, and `tests/eval-store.test.ts`, and the typecheck.
+
+### Task 3: the set writers
+
+**Files:** `packages/host/src/eval-store.ts` (two statements, in place), `packages/host/src/eval-groups.ts`, `packages/host/src/eval-miner.ts`, `tests/eval-groups.test.ts`. Needs Task 2.
+
+**Decisions:**
+- `eval-store.ts:227`, `tx.run("INSERT OR IGNORE INTO eval_groups (group_id, kind, project_ref, root_id, created_at) VALUES (?, 'run', ?, ?, ?)", groupId, ref, groupId, start.at);`, also writes `holdout` and `set_at` from `drawnSet(tx, groupId, start.at)`, on the same line.
+- The promotion at `eval-store.ts:445`, `"UPDATE eval_tasks SET state='candidate', decided_at=?, area_ref=?, payload=? WHERE task_id=?"`, also sets `prompt_origin='assignment'` and `kind` to `decision.features.kind`.
+- `ensureGroup` writes `holdout` and `set_at` from `drawnSet` in its insert.
+- `insertMined`'s insert also writes `prompt_origin` and `kind` (`input.promptOrigin`, `input.features.kind`) for a candidate, and null for a rejected row.
+- `mergeRoots(tx, roots, devOnly)` reads `dev_only, holdout, exposed, set_at, confirms` of the merged roots in its one statement, writes `mergedSet(rows, devOnly)` and the dev-only mark to the new root, and sets `holdout = 0, set_at = NULL` on every other row whose `root_id` is now the new root. Its signature does not change, so its three callers (`eval-groups.ts:96`, `eval-miner.ts:534`, `eval-miner.ts:547`) do not change.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-groups.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `a new group draws its set when it is created` | A run group from `insertMarker` and a mined group from `insertMined`: `holdout` equals `drawsHoldout(tx.index("eval-set", id))`; `set_at` is the creation time when holdout and null when dev. |
+| `no group spans both sets` (acceptance 3) | A captured task's run group drawn holdout and its mined landing drawn dev merge: the root is dev, no row of the root has `holdout` 1, and `TRIAL_TASKS_SQL` returns both tasks with `holdout` 0. Two holdout groups merge: holdout. A lineage-unclear merge (`devOnly` true) of two holdout groups: dev. |
+| `promotion and mining write the prompt origin and kind` | A promoted captured task: `assignment` and its kind. A mined `run-objective` candidate: `run-objective` and its kind. A rejected mined row: both null. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/eval-groups.test.ts`, the same for `tests/eval-miner.test.ts` and `tests/eval-capture.test.ts`, and the typecheck.
+
+### Task 4: the trial store, version 2
+
+**Files:** `packages/host/src/eval-trial-store.ts`, `packages/host/src/eval-trial-rules.ts`, `tests/eval-trial-store.test.ts`, `tests/eval-trial-rules.test.ts`. Needs Task 1. Runs in parallel with Tasks 2, 5, and 13.
+
+**Interfaces (produces):**
+```ts
+// eval-trial-store.ts: evalTrialsModule version 2, readVersion 2. migrate runs V1 when from is 0, then SCHEMA_TRIALS_V2 when from < 2.
+export const REUSE_DAYS = 30, REPORT_KEEP_DAYS = 365, JOB_ROWS_MAX = 5_000;
+export const SCHEMA_TRIALS_V2 = [
+  "ALTER TABLE eval_trials ADD COLUMN prompt_version TEXT",
+  "ALTER TABLE eval_trials ADD COLUMN reused_from TEXT",
+  "ALTER TABLE eval_trials ADD COLUMN tokens INTEGER",
+  "ALTER TABLE eval_trials ADD COLUMN spent_usd REAL",
+  "ALTER TABLE eval_trials ADD COLUMN cost TEXT",
+  "ALTER TABLE eval_trial_counts ADD COLUMN reused INTEGER NOT NULL DEFAULT 0",
+  "CREATE INDEX IF NOT EXISTS eval_trials_reuse ON eval_trials (task_id, config_ref, ended_at) WHERE state = 'final' AND reused_from IS NULL",
+  "CREATE INDEX IF NOT EXISTS eval_trials_graded ON eval_trials (project_ref, task_id, resolved, ended_at) WHERE ending = 'graded' AND reused_from IS NULL",
+  `CREATE TABLE IF NOT EXISTS eval_reports (job_id TEXT PRIMARY KEY, project_ref TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+    generated_at TEXT NOT NULL, expires_at TEXT NOT NULL, payload TEXT NOT NULL)`,
+  "CREATE INDEX IF NOT EXISTS eval_reports_expiry ON eval_reports (expires_at)",
+  `CREATE TABLE IF NOT EXISTS eval_subjects (project_ref TEXT NOT NULL, subject TEXT NOT NULL, job_id TEXT NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY (project_ref, subject))`,
+  `CREATE TABLE IF NOT EXISTS eval_priors (prior_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, project_ref TEXT NOT NULL, configuration INTEGER NOT NULL,
+    profile_id TEXT NOT NULL, provider TEXT NOT NULL, model TEXT, effort TEXT, profile_epoch INTEGER NOT NULL, prompt_version TEXT NOT NULL,
+    area_ref TEXT, kind TEXT, prompt_origin TEXT NOT NULL, tasks INTEGER NOT NULL, trials INTEGER NOT NULL, resolved INTEGER NOT NULL,
+    generated_at TEXT NOT NULL, expires_at TEXT NOT NULL)`,
+  "CREATE INDEX IF NOT EXISTS eval_priors_project ON eval_priors (project_ref, generated_at)",
+  "CREATE INDEX IF NOT EXISTS eval_priors_expiry ON eval_priors (expires_at)",
+];
+export const PROJECT_DAY_SQL = "SELECT count(*) AS n FROM eval_trials WHERE project_ref = ? AND created_at >= ? AND reused_from IS NULL";
+export const JOB_TRIALS_SQL = "SELECT count(*) AS n FROM eval_trials WHERE job_id = ? AND reused_from IS NULL";
+export const TRIAL_SESSIONS_SQL = "SELECT trial_id, session_id, ended_at FROM eval_trials WHERE session_id IS NOT NULL AND ended_at < ? ORDER BY ended_at LIMIT ?";
+export const REUSE_SQL = "SELECT t.trial_id, t.ending, t.resolved, t.isolation, t.config_id, t.profile_epoch, t.tokens, t.spent_usd, t.cost, "
+  + "t.started_at, t.ended_at FROM eval_trials t JOIN eval_jobs j ON j.job_id = t.job_id WHERE t.task_id = ? AND t.config_ref = ? "
+  + "AND t.state = 'final' AND t.reused_from IS NULL AND t.ended_at >= ? AND t.harness = ? AND t.prompt_version = ? AND t.profile_epoch = ? "
+  + "AND t.ending NOT IN ('void-limit', 'void-host', 'void-owner') AND j.kind IN ('baseline', 'compare') ORDER BY t.ended_at DESC, t.trial_id LIMIT ?";
+export const JOB_ROWS_SQL = "SELECT task_id, config_ref, slot, attempt, state, ending, resolved, isolation, config_id, profile_epoch, prompt_version, "
+  + "tokens, spent_usd, cost, started_at, ended_at, reused_from FROM eval_trials WHERE job_id = ? LIMIT 5001";
+export type TrialCost = "complete" | "partial" | "none";
+export type ReuseSource = { trialId: string; ending: TrialEnding; resolved: boolean; isolation: "isolated" | "none"; configId: string | null;
+  profileEpoch: number; tokens: number | null; spentUsd: number | null; cost: TrialCost | null; startedAt: string | null; endedAt: string };
+export type JobTrialRow = { taskId: string; configRef: string; slot: number; attempt: number; state: TrialState; ending: TrialEnding | null;
+  resolved: boolean | null; isolation: "isolated" | "none" | null; configId: string | null; profileEpoch: number | null;
+  promptVersion: string | null; tokens: number | null; spentUsd: number | null; cost: TrialCost | null;
+  startedAt: string | null; endedAt: string | null; reused: boolean };
+// insertTrial also writes prompt_version = trialPromptVersion(trial.configuration.profile). TrialCounts gains `reused`.
+export function reusable(db: EvidenceDb, input: { taskId: string; configRef: string; promptVersion: string; profileEpoch: number;
+  harness: number; since: string; limit: number }): ReuseSource[];
+export function insertCopy(tx: EvidenceTx, copy: { trialId: string; jobId: string; taskId: string; projectId: string;
+  configuration: TrialConfiguration; slot: number; promptVersion: string; source: ReuseSource; keepDays: number }, at: string): void;
+export function clearTrialSession(tx: EvidenceTx, trialId: string, cost?: { tokens: number; usd: number; complete: boolean } | "none"): void;
+export function trialSessions(db: EvidenceDb, endedBefore: string, limit: number): { trialId: string; sessionId: string; endedAt: string }[];
+export function jobRows(db: EvidenceDb, jobId: string): JobTrialRow[];   // throws EvidenceError("unreadable") above 5,000 rows
+// sweepTrials also deletes at most 100 expired reports and 100 expired priors per call.
+// eval-trial-rules.ts
+export function trialPromptVersion(profile: TeamModelProfile): string;
+export function trialProfileKey(profile: TeamModelProfile): ProfileKey;   // profileIdentity(profile, profile.provider), with null for an absent model or effort
+```
+
+**Decisions:**
+- `trialPromptVersion(profile)` is `promptVersion("implementer", profile.provider, JSON.parse(canonicalJson(profile)), false, false, false)`, the value `trialJobDigest` digests for that profile.
+- A copy row has a new trial id, `state` `final`, `attempt` 0, the given slot and prompt version, and the source's ending, resolved, isolation, `config_id`, `profile_epoch`, tokens, `spent_usd`, cost, `started_at`, and `ended_at`. `reused_from` is the source's id, `session_id` is null, `created_at` is now, and `expires_at` is now plus `keepDays`. Its payload is `{ projectId, taskId, configuration }`, sealed under its own id; it has no patch row. `insertCopy` adds 1 to `reused` and to no other counter.
+- `clearTrialSession` with a cost sets `tokens`, `spent_usd`, and `cost` `complete` or `partial` (by `complete`); with `"none"`, `cost` `none` and null amounts; without a cost, only `session_id = NULL`.
+- No plain column of the new tables holds a task's text, a patch, member output, or report detail.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-trial-store.test.ts` and `tests/eval-trial-rules.test.ts`, on a real store.
+
+| Test name | Assertions |
+|---|---|
+| `a trial row keeps its prompt version` | `insertTrial`: `prompt_version` equals `trialPromptVersion(profile)`; the same profile with its keys in another order gives the same value, and it equals `promptVersion("implementer", provider, canonical profile, false, false, false)`. |
+| `reuse finds only matching originals` | Sources for one task and `config_ref`: one match ended 29 days ago; one ended 31 days ago; a `void-host` trial; another prompt version; another epoch; another harness; a trial of a `confirm` job; a copy row. `reusable` returns only the first. With two matches: newest first, and `limit` holds. |
+| `a copy is final and counts only as reused` | `insertCopy`: `state` `final`, `reused_from` set, `session_id` null; counts `reused` 1 and `started` and `graded` 0; `PROJECT_DAY_SQL` and `JOB_TRIALS_SQL` count 0. |
+| `the profile key matches the outcome ledger's` (in `eval-trial-rules`) | `trialProfileKey` of a Claude profile with `effort` and of an OpenCode profile with `variant` equals `profileIdentity`'s provider, model, and effort, with null for an absent model or effort. |
+| `a session's cost is recorded when it is cleared` | A complete cost: `complete` with its tokens and amount; an incomplete one: `partial`; `"none"`: `none` with null amounts; no cost: `cost` stays null. |
+| `the v2 migration keeps v1 rows` | A v1 store with rows, opened at v2: the rows have null `prompt_version` and `reused_from`, counts `reused` 0, and the three new tables exist. A module that claims version 1 on a v2 store: `unavailable`. |
+| `expired reports and priors are swept` | 150 expired prior rows: 100 deleted, then 50. An expired report is deleted; a subject row is never deleted. |
+| `trial rows keep every text sealed` (extended) | Also no plain column of `eval_reports` or `eval_subjects` contains the capsule objective or the patch text. |
+| `the hot statements read through an index` (extended) | Also `REUSE_SQL` uses `eval_trials_reuse`, and `JOB_ROWS_SQL` uses `eval_trials_job`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/eval-trial-store.test.ts`, the same for `tests/eval-trial-rules.test.ts`, and the typecheck.
+
+### Task 5: the statistics
+
+**Files:** `packages/host/src/eval-stats.ts` (create), `tests/eval-stats.test.ts` (create). Needs Task 1. Runs in parallel with Tasks 2, 4, and 13.
+
+**Interfaces (produces):**
+```ts
+export const BOOTSTRAP_RESAMPLES = 10_000, INTERVAL_LOW = 250, INTERVAL_HIGH = 9_749, POWER_Z = 2.801585, PLANNING_SD = [0.35, 0.41] as const;
+export type StatTrial = { configuration: number; slot: number; ending: TrialEnding; resolved: boolean; matches: boolean;
+  tokens: number | null; spentUsd: number | null; cost: "complete" | "partial" | "none" | null; minutes: number | null };
+export type StatTask = { key: string; area: string; promptOrigin: PromptOrigin | null; leftHoldout: boolean; trials: StatTrial[] };
+export type StatInput = { seed: string; configurations: number; trialsPerTask: number; plannedTasks: number; tasks: StatTask[] };
+export function comparisonStats(input: StatInput): ComparisonStats;
+export function xoshiro128ss(state: readonly [number, number, number, number]): () => number;
+export function bootstrapStream(seed: string, pair: string, subgroup: string): () => number;
+export function signTest(wins: number, losses: number): number;
+export function holm(p: readonly number[]): number[];
+```
+
+**The rules.** `POWER_Z` is 1.959964 + 0.841621, the two-sided 95% and the 80% power normal quantiles. The input holds only final trials. Every step is deterministic:
+
+1. Sort the tasks by `key` in code-unit order, and each task's trials by configuration, then slot.
+2. A trial is **valid** when its ending is not a void ending and `matches` is true. A task is **analysed** when `leftHoldout` is false and every configuration has `trialsPerTask` valid trials. `r(c)` is the number of resolved valid trials of configuration `c`.
+3. For a pair `a < b` over a list of n analysed tasks, `D_i = r(b) − r(a)`, an integer. The mean is `ΣD / (n × t)`, where t is `trialsPerTask`.
+4. The bootstrap takes `next = bootstrapStream(seed, "a:b", subgroup)`, where `subgroup` is `all`, `area:NAME`, or `origin:NAME`. For each of 10,000 resamples it draws n indexes `Math.floor(next() * n / 2 ** 32)` and sums the drawn `D`. It sorts the sums ascending, and the interval is `[sums[250], sums[9749]] / (n × t)`. With n = 0, the mean and the interval are null.
+5. `bootstrapStream` hashes `${seed}\u0000${pair}\u0000${subgroup}` (UTF-8) with SHA-256, reads bytes 0 to 15 as four big-endian 32-bit words, and starts `xoshiro128ss` with them; an all-zero state takes 1 as its first word.
+6. `xoshiro128ss` returns `rotl(s1 × 5, 7) × 9`, then sets `t = s1 << 9; s2 ^= s0; s3 ^= s1; s1 ^= s2; s0 ^= s3; s2 ^= t; s3 = rotl(s3, 11)`, every operation modulo 2³² (`Math.imul`, `>>> 0`).
+7. The sign test counts wins (`D > 0`), losses (`D < 0`), and ties. `signTest(w, l)` is 1 when `w + l = 0`, else `min(1, 2 × Σ_{k=0}^{min(w,l)} C(w+l, k) / 2^(w+l))`, with the sum in `BigInt`.
+8. `holm(p)` orders the P values ascending (ties by position). The adjusted value at rank i (from 0) is the largest of `min(1, (P − j) × p_(j))` for j from 0 to i.
+9. `detectable.observed`, for n ≥ 2, is `POWER_Z × s / √n`, where s is the sample standard deviation (n − 1) of `D / t`. `detectable.planning`, for n ≥ 1, is `[POWER_Z × 0.35 / √n, POWER_Z × 0.41 / √n]`. Otherwise each is null.
+10. `conclusive` is `analysed ≥ 1 && analysed × 10 ≥ planned × 9`, in integers.
+11. `sensitivity`, for each pair: over the tasks with `leftHoldout` false and at least one trial of every configuration, `D'_i = r(b) − r(a)`. Every slot without a valid resolved trial counts as not resolved. The mean is `ΣD' / (n' × t)`, and null when n' = 0.
+12. `attrition`, for each configuration, over all its trials: the count of each void ending; `changed`, the trials with `matches` false; `short`, the tasks with `leftHoldout` false and fewer than t valid trials of that configuration. `tasks.leftHoldout` counts the tasks with the mark.
+13. `cost`, for each configuration, over all its trials: `trials`; `resolved`, its resolved valid trials; `costed`, the trials with cost `complete`. `tokensPerResolved` is the tokens of the costed trials over the resolved valid trials among them. `spentUsdPerResolved` is the same for `spentUsd`. `minutesPerResolved` is the minutes of the trials that have minutes over the resolved valid trials among them. Each is null when its divisor is 0. `listUsdPerResolved` is null.
+14. `byArea` groups the analysed tasks by area, with names ascending. `byPromptOrigin` groups them in `PROMPT_ORIGINS` order and leaves out a null origin. An empty group is left out. Holm runs within each group.
+
+**Fixtures.** In each, slot s of configuration c is one graded trial, resolved when `s < r(c)`, with `matches` true. Tasks are `task-01`, `task-02`, and so on.
+
+- **P**: seed `job-fixture`, two configurations, t 3, 12 tasks; `r(0)` = 1, 0, 2, 3, 1, 2, 0, 1, 3, 2, 1, 0; `r(1)` = 2, 1, 2, 3, 3, 2, 1, 0, 3, 3, 2, 1.
+- **H**: seed `job-holm`, three configurations, t 3, 12 tasks; `r(0)` = 1, 2, 0, 1, 2, 1, 0, 3, 1, 2, 1, 0; `r(1)` = 2, 2, 1, 1, 3, 1, 0, 3, 2, 2, 1, 1; `r(2)` = 1, 3, 2, 2, 3, 2, 1, 2, 2, 3, 2, 1.
+- **S**: seed `job-attrition`, two configurations, t 3, 10 planned tasks. Tasks 01 to 08: `r(0)` = 1, 2, 0, 3, 1, 2, 2, 1, and `r(1)` = 2, 2, 1, 3, 2, 3, 2, 2. Task 09: configuration 0 has three graded trials with 2 resolved; configuration 1 has slots 0 and 1 graded with slot 0 resolved, and slot 2 has three `void-limit` attempts. Task 10: configuration 0 has slots 0 and 2 graded and resolved, and slot 1 graded with `matches` false; configuration 1 has three resolved trials.
+- **C**: one task, configuration 0 only: slot 0 graded and resolved (1,000 tokens, 0.5 USD, `complete`, 10 minutes); slot 1 graded and unresolved (3,000, 1.5, `complete`, 20); slot 2 graded and resolved (2,000, 1.0, `partial`, 30); an earlier `void-host` attempt of slot 2 (500, 0.25, `complete`, no minutes).
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-stats.test.ts`. Numbers given as fractions are compared exactly. The other decimals are compared within 1e-6.
+
+| Test name | Assertions |
+|---|---|
+| `the generator follows the reference` | `xoshiro128ss([1, 2, 3, 4])` gives 11520, 0, 5927040, 70819200, 2031721883. `bootstrapStream("job-fixture", "0:1", "all")` gives 914680446, 1482476434, 3845691706. |
+| `a two-configuration result gives the planned figures` | P: one pair `a` 0, `b` 1, n 12; mean 7/36; interval [2/36, 12/36]; wins 7, losses 1, ties 4; p 0.0703125 and holm 0.0703125; observed 0.213769; planning [0.283062, 0.331587]; analysed 12 of 12, conclusive. |
+| `the same result set gives the same interval on every run` (acceptance 10) | P, ten calls: every `pairs[0].interval` is equal; after `pairs.length` is 1, the ten results are `deepEqual`. |
+| `the figures do not depend on row order` | 50 seeded shuffles of P's tasks and of each task's trials: after `pairs.length` and `byArea.length` match, `deepEqual` to the unshuffled result. |
+| `three configurations report Holm-adjusted p-values` | H: pairs 0:1, 0:2, 1:2 in that order. Sums 5, 10, 5. Intervals [2/36, 8/36], [5/36, 14/36], [0, 10/36]. p 0.0625, 0.01171875, 0.1796875. holm 0.125, 0.03515625, 0.1796875. |
+| `attrition, the share rule, and the sensitivity figure` (acceptance 10) | S: analysed 8 of 10, not conclusive. The pair: n 8, mean 5/24, interval [2/24, 7/24], wins 5, losses 0, ties 3, p 0.0625. Attrition 0: no voids, `changed` 1, `short` 1. Attrition 1: `void-limit` 3, `changed` 0, `short` 1. Sensitivity: n 10, mean 5/30. With task 09's slot 2 graded and unresolved in place of its voids: analysed 9, conclusive. |
+| `a confirm task that left holdout counts against the share` | P with task 12 marked `leftHoldout`: analysed 11, `tasks.leftHoldout` 1, conclusive. With tasks 11 and 12 marked: analysed 10, not conclusive. |
+| `subgroups by area and prompt origin` | P with tasks 01 to 06 in `host` and 07 to 12 in `web`, odd tasks `assignment` and even tasks `commit-message`. `host`: n 6, mean 4/18, interval [1/18, 8/18], p 0.25. `web`: n 6, mean 3/18, interval [−1/18, 6/18], p 0.375. `assignment`: n 6, mean 5/18, interval [2/18, 8/18], p 0.125. `commit-message`: n 6, mean 2/18, interval [−2/18, 5/18], p 0.625. No `run-objective` group. |
+| `the sign test and the power figure follow their formulas` | `signTest`: (0, 0) 1; (7, 1) 0.0703125; (10, 1) 0.01171875; (5, 5) 1. Planning at n 15: [0.253178, 0.296580]; at 30: [0.179024, 0.209714]; at 60: [0.126589, 0.148290] (the spec's table). At n 1, observed is null; at n 0, the mean, interval, and planning are null and p is 1. |
+| `cost per resolved trial counts only complete costs` | C: trials 4, resolved 2, costed 3, `tokensPerResolved` 4500, `spentUsdPerResolved` 2.25, `minutesPerResolved` 30, `listUsdPerResolved` null. With slot 0 `partial`: tokens and USD per resolved are null. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/eval-stats.test.ts` and the typecheck.
+
+### Task 6: comparison job creation
+
+**Files:** `packages/host/src/eval-compare-jobs.ts` (create), `tests/eval-compare-jobs.test.ts` (create). Needs Tasks 2 and 4.
+
+**Interfaces (produces):**
+```ts
+export const COMPARE_TASKS_MIN = 2, COMPARISON_TASKS_DEFAULT = 20;
+export const comparisonJobSchema: z.ZodType<ComparisonJobRequest>;
+export type ComparisonPlan = {
+  tasks: string[]; pins: ComparisonPin[]; subject?: string; roots: string[];
+  copies: { taskId: string; configuration: number; slot: number; source: ReuseSource }[];
+  slots: number; planned: { tasks: number; trials: number };
+};
+export function pinsOf(db: EvidenceDb, configurations: readonly TrialConfiguration[], at: string): ComparisonPin[];
+export function subjectOf(pins: readonly ComparisonPin[]): string;
+export function planComparison(tx: EvidenceTx, input: { projectId: string; request: ComparisonJobRequest; at: string }): ComparisonPlan | EvalRefusal;
+export function applyComparison(tx: EvidenceTx, input: { jobId: string; projectId: string; request: ComparisonJobRequest;
+  plan: ComparisonPlan; keepDays: number; at: string }): "scheduled" | "complete";
+export function pinsChanged(db: EvidenceDb, configurations: readonly TrialConfiguration[], pins: readonly ComparisonPin[], at: string): boolean;
+```
+
+**Decisions:**
+- `comparisonJobSchema` is strict, with `baselineJobSchema`'s field limits, plus: `kind` `compare` or `confirm`; two to four configurations for `compare` and exactly two for `confirm`, with distinct `configRef`s; `promptOrigins` from `PROMPT_ORIGINS`; `excludeGroups` of at most 200 ids, each at most 64 characters; and no `taskIds` for `confirm`.
+- `pinsOf` gives each configuration's `configRef`, `epochAt(db, profileIdentityKey(trialProfileKey(profile)), at)`, and `trialPromptVersion(profile)`. `subjectOf` is the SHA-256 of the canonical JSON of the pins sorted by `configRef`.
+- `planComparison`, in this order:
+  1. The pins. For `confirm`, the subject; a row in `eval_subjects` for the project and subject refuses with `409` `subject-confirmed`.
+  2. The selection: pages of `TRIAL_TASKS_SQL`, keeping rows whose `holdout` is 1 for `confirm` and 0 for `compare`, and that pass the filter (task ids, origins, areas by `tx.index("area", name)`, prompt origins, and `excludeGroups` against `root_id`). It stops at `maxTasks` (default 20, at most 200), or after at most 100 pages.
+  3. Fewer than 2 tasks for `compare`, or fewer than `CONFIRM_TASKS_MIN` for `confirm`: `409` `too-few-tasks`.
+  4. For `compare` only: for each task and configuration, `reusable(tx, { …, since: at minus 30 days, limit: trialsPerTask, harness: TRIAL_HARNESS_VERSION })`. The sources fill slots 0, 1, and so on.
+  5. `slots` is tasks × configurations × `trialsPerTask`. `planned.trials` is the smaller of `maxTrials` and `slots` minus the copies. `roots` is the distinct `root_id`s of a confirm job's tasks.
+- `applyComparison` writes every copy with `insertCopy` (prompt version from the pin), and for `confirm`, the `eval_subjects` row and `confirms = confirms + 1` on each root, in one statement over at most 200 ids. It answers `complete` when the copies fill every slot.
+- `pinsChanged` is true when `pinsOf(db, configurations, at)` differs from the pins in any epoch or prompt version.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-compare-jobs.test.ts`, on a real store with the corpus, the trials, and the configurations modules.
+
+| Test name | Assertions |
+|---|---|
+| `a compare job selects dev tasks and a confirm job holdout tasks` | 40 valid tasks, 16 in holdout roots: with `maxTasks` 200, `compare` lists the 24 dev tasks and `confirm` the 16 holdout tasks, each in task id order. `excludeGroups` drops one root's tasks; `promptOrigins` keeps only its origins; `confirm` with `taskIds` fails the schema. |
+| `a confirm job needs fifteen holdout tasks` | 14 holdout tasks: `409` `too-few-tasks`; 15: a plan. A compare with 1 dev task: `too-few-tasks`. |
+| `a second confirm for one subject is refused` (acceptance 11) | `applyComparison` of a confirm, then `planComparison` of the same pair in the other order: `409` `subject-confirmed`. The same pair after `advanceEpoch` of one profile: a plan with another subject. |
+| `a confirm job counts once on each holdout group` | A confirm over 16 tasks in 10 roots: each root has `confirms` 1; a second confirm of another pair over the same roots: 2. |
+| `reuse fills slots with matching recent trials` | Two configurations, t 3, task A: configuration 0 has three matching baseline trials and configuration 1 has one. The plan has copies at slots 0 to 2 and slot 0, and `planned.trials` is `slots` minus 4. A confirm plan over the same tasks has no copies. |
+| `the pins follow the epoch and the prompt version` | `pinsOf` at creation, then `advanceEpoch` of profile 0: `pinsChanged` is true. Pins whose `promptVersion` is 64 zeros: true. Unchanged: false. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/eval-compare-jobs.test.ts` and the typecheck.
+
+### Task 7: scheduling comparison jobs
+
+**Files:** `packages/host/src/eval-trial-jobs.ts`, `packages/host/src/eval-jobs.ts` (net 0), `tests/eval-trial-jobs.test.ts`. Needs Task 6.
+
+**Decisions:**
+- `create` parses `baseline` with `baselineJobSchema` and `compare` or `confirm` with `comparisonJobSchema`. The `INSERT INTO eval_jobs` of lines 155 and 156 takes the kind as a parameter in place of `'baseline'`, and the active check at line 145 uses the request's kind, so a project has at most one active job of each kind. For a comparison, after the existing checks, `planComparison` runs in the same write, the payload (`TrialJobPayload`) holds `tasks`, `pins`, and `subject`, then `openTrialCounts(planned)` and `applyComparison` run. `complete` finishes the job `completed` `done` at once.
+- `BASELINE_JOBS_SQL` (line 26) changes `kind = 'baseline'` to `kind != 'validate'`, in place.
+- The baseline `scan` and `plan` read `TRIAL_TASKS_SQL`, and `selected` refuses a row with `holdout` 1.
+- `step`, for a comparison row, after the limits check and before the digest check: `pinsChanged` ends the job `completed` `identity-changed`. `finish` takes the new reason.
+- `scanFixed`, the comparison scan: the payload's list in order, after the cursor (the last finished task). A task that is no longer `valid` counts as skipped (`advanceTask(tx, jobId, true)`). Otherwise `nextSlot` and the gates after it run as in `scan`. The end of the list finishes the job `completed` `done`. A step reads at most 200 tasks, two indexed reads each.
+- `views` gives a comparison row a `ComparisonJobView`: `set` from the kind, `trials.reused`, `trials.resolved` null until `reported_at` is set, and `report` null while active, `pending` when finished without a report, and `ready` after. It opens no payload.
+- `eval-jobs.ts`, in place: line 174's `row.kind === "baseline"` and line 383's and line 384's `row.kind === "baseline"` become `row.kind !== "validate"`.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-trial-jobs.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `baseline reads the dev set only` | Four valid tasks, one in a holdout root: a baseline job plans three tasks and never starts a trial of the holdout task. |
+| `a compare job runs its fixed list in order` | Trials start in the list's order; a task added after creation is never reached; a task retired after creation is skipped and counted. |
+| `a fully reused compare completes at creation` | Every slot reusable: `completed` `done`, no row other than the copies, and `next` answers `none`. |
+| `a changed identity ends the job` | `advanceEpoch` between two trials: the job is `completed` `identity-changed`, and no further trial row exists. |
+| `a repeated request creates one job` | One `requestId` twice: `created: false` the second time; one `eval_subjects` row; each root's `confirms` is 1. |
+| `one active job per kind` | A second compare while one is active: `job-active`; a confirm beside it: created. |
+| `an interim view shows no result` | A running compare: `trials.resolved` null and `report` null; finished: `pending`; with `reported_at` set: `ready` and the resolved count. |
+| `a comparison job waits for the trial gates` | A limited provider: the compare job waits `provider-limit`; the day's cap reached: `daily-cap`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/eval-trial-jobs.test.ts`, the same for `tests/eval-jobs.test.ts`, and the typecheck.
+
+### Task 8: cost capture in the pump
+
+**Files:** `packages/host/src/eval-trial-pump.ts`, `tests/eval-trial-pump.test.ts`. Needs Task 4.
+
+**Decisions:**
+- `TrialPumpOptions` gains `cost?: CostLookup` (`outcome-cells.ts`).
+- In `sweep`, before `sessions.remove(sessionId)`: `cost(sessionId)`. A value records `{ tokens, usd, complete }` with `clearTrialSession` after the removal; `undefined` records `"none"`. A throw leaves the session for the next sweep until its trial ended 24 hours ago, and then records `"none"` and removes it. Without the option, `clearTrialSession` records no cost.
+- `openJob()` (line 456): `kind = 'baseline'` becomes `kind != 'validate'`, in place.
+- Bound: at most 20 cost reads per hourly sweep, one for each session it removes.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-trial-pump.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `a session's cost is recorded before its removal` | A complete cost: the row has `cost` `complete`, its tokens, and its amount; the lookup ran before `remove`. |
+| `a cost the ledger cannot read waits a day` | A lookup that throws: the session stays and `cost` is null; with the clock 24 hours after the trial ended: `cost` `none`, and the session is removed. |
+| `the pump opens a comparison job` | With one open compare job and no baseline job, the identity probe's fetch URL is that job's project. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/eval-trial-pump.test.ts` and the typecheck.
+
+### Task 9: the prior export
+
+**Files:** `packages/host/src/eval-priors.ts` (create), `tests/eval-priors.test.ts` (create). Needs Tasks 2 and 4.
+
+**Interfaces (produces):**
+```ts
+export const PRIOR_KEEP_DAYS = 365, PRIORS_MAX = 500;
+export const PRIORS_SQL = "SELECT * FROM eval_priors WHERE project_ref = ? ORDER BY generated_at DESC, prior_id LIMIT 500";
+export type PriorTask = { areaRef: string | null; kind: string | null; promptOrigin: PromptOrigin | null };
+export type PriorCell = { configuration: number; profileId: string; provider: string; model: string | null; effort: string | null;
+  areaRef: string | null; kind: string | null; promptOrigin: PromptOrigin; profileEpoch: number; promptVersion: string;
+  tasks: number; trials: number; resolved: number };
+export function priorCells(configurations: readonly TrialConfiguration[], rows: readonly JobTrialRow[], tasks: ReadonlyMap<string, PriorTask>): PriorCell[];
+export function writePriors(tx: EvidenceTx, input: { jobId: string; projectId: string; cells: readonly PriorCell[]; at: string }): number;
+export function readPriors(db: EvidenceDb, project: Project): ReplayPrior[];
+export function areaNames(db: EvidenceDb, project: Project): Map<string, string>;   // area_ref to name: the feature map, `mixed`, `root`
+```
+
+**Decisions:**
+- `priorCells` (pure) counts a row when it is final with a non-void ending, `isolation` `isolated`, and `configId`, `profileEpoch`, and `promptVersion` known, and its task has a known prompt origin. It groups the rows by configuration (the index of `config_ref` in `configurations`), `areaRef`, `kind`, `promptOrigin`, `profileEpoch`, and `promptVersion`. `tasks` counts distinct task ids, `trials` the rows, and `resolved` the resolved rows. The profile fields come from `trialProfileKey` and `profile.id`. Cells are sorted by their key.
+- `writePriors` writes one row per cell: `prior_id` is the SHA-256 of the job id and the cell key, `project_ref` the project index, and `expires_at` `at` plus 365 days.
+- `readPriors` runs `PRIORS_SQL` and maps `area_ref` through `areaNames`, `other` when unknown. It returns `role` `implementer` and `source` `replay`.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-priors.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `the export counts isolated valid trials by cell` | Two configurations, two areas, three tasks: rows `isolated` and `none`, a `void-host` row, a row with null `configId`, and a task with no prompt origin. Only isolated, valid rows with known identity count; `tasks` counts distinct tasks; one cell per configuration, area, kind, origin, epoch, and prompt version. |
+| `one row has one epoch and one prompt version` | Rows of epochs 1 and 2: two cells. |
+| `the priors read maps areas and keeps unknowns unknown` | An `area_ref` whose area left the feature map reads `other`; a null kind stays null; a null model stays null. |
+| `the hot statements read through an index` | `PRIORS_SQL` uses `eval_priors_project`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/eval-priors.test.ts` and the typecheck.
+
+### Task 10: the report pass
+
+**Files:** `packages/host/src/eval-comparison.ts` (create), `tests/eval-comparison.test.ts` (create). Needs Tasks 5 and 9.
+
+**Interfaces (produces):**
+```ts
+export const REPORT_CANDIDATES = 20, REPORT_SESSION_WAIT_MS = 86_400_000;
+export const REPORT_DUE_SQL = "SELECT job_id, project_ref, kind, status, reason, finished_at, payload FROM eval_jobs WHERE reported_at IS NULL "
+  + "AND kind != 'validate' AND finished_at IS NOT NULL ORDER BY finished_at, job_id LIMIT 20";
+export const SESSIONS_HELD_SQL = "SELECT 1 AS held FROM eval_trials WHERE job_id = ? AND session_id IS NOT NULL LIMIT 1";
+/** At most 200 ids, one placeholder each. */
+export const REPORT_TASKS_SQL = "SELECT t.task_id, t.area_ref, t.prompt_origin, t.kind, COALESCE(r.holdout, 0) AS holdout FROM eval_tasks t "
+  + "LEFT JOIN eval_groups g ON g.group_id = t.group_id LEFT JOIN eval_groups r ON r.group_id = g.root_id WHERE t.task_id IN (…)";
+export class ComparisonPass {
+  constructor(options: { store: EvidenceStore; config: Pick<Config, "projects">; now?: () => string });
+  /** At most one finished job per call. Never throws. */
+  step(): "reported" | "waiting" | "idle";
+}
+export function reportFor(db: EvidenceDb, jobId: string): ComparisonReport | EvalRefusal;
+```
+
+**Decisions:**
+- A job is due when it is finished without a report, and either no trial of it holds a session or it finished at least 24 hours ago. `step` reads `REPORT_DUE_SQL` and at most 20 `SESSIONS_HELD_SQL`, and takes the first due job. The rest is one write, which first runs `UPDATE eval_jobs SET reported_at = ? WHERE job_id = ? AND reported_at IS NULL` and stops when it changed no row.
+- A payload that does not open: a compare or confirm job gets a report row with `state` `unreadable` and a sealed `{}`, and the process logs `Eval report unreadable.` once.
+- The input to `comparisonStats`: the job id as seed; the configurations in request order, matched by `config_ref`; `trialsPerTask`; `plannedTasks`, the list's length; for each listed task, its final rows from `jobRows`. `matches` is `profileEpoch` and `promptVersion` equal to the configuration's pin. `minutes` is `endedAt − startedAt` in minutes when both are known. The area is named through `areaNames`, and the prompt origin is the plain column. `leftHoldout` is set for a confirm task whose root is no longer holdout, or whose row is gone.
+- The report is `ComparisonReport`, sealed in `eval_reports` with `state` `ready` and `expires_at` plus 365 days. Its `configurations` are the pins with each profile's id and provider.
+- A baseline or compare job also gets `writePriors(priorCells(…))`, with its tasks from `REPORT_TASKS_SQL` (a baseline job: the distinct task ids of its rows, at most 200). A confirm job gets no prior row.
+- `reportFor`: a stored `ready` report is answered; `unreadable` answers `409` `report-unreadable`. Without a report: no job row is `404` `unknown-job`; a validate or baseline job is `409` `no-report`; otherwise `409` `report-not-ready`.
+- Bound per call: 20 job rows, 20 existence reads, and for the chosen job one payload, one `jobRows` statement (at most 5,000 rows), one `REPORT_TASKS_SQL` statement (at most 200 rows), and at most 36 million bootstrap draws (three partitions of at most 200 tasks, six pairs, 10,000 resamples). No task payload is opened.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-comparison.test.ts`, on a real store, with Task 5's fixtures written as trial rows.
+
+| Test name | Assertions |
+|---|---|
+| `a report is written once` | A finished compare job with fixture P's rows: one `step` answers `reported`; after `pairs.length` is 1, the report's pair equals Task 5's P figures. A second `step`, and a second `ComparisonPass` on the same store, answer `idle`, and one report row exists. |
+| `a report waits for the trial sessions, at most a day` | A trial that holds a session: `waiting`; after `clearTrialSession`: `reported`. A session held 24 hours after the job finished: `reported`. |
+| `a confirm report counts only tasks still in holdout` | Fixture P as a confirm job, with task 12's group exposed after creation: `tasks.leftHoldout` 1, analysed 11. |
+| `the report holds no task material` | The opened report's JSON holds no task id, trial id, group id, model name, capsule objective, or patch text; no plain column of `eval_reports` holds them. |
+| `a baseline job gets prior rows and no report` | A finished baseline job: prior rows, no `eval_reports` row, `reported_at` set. A confirm job: a report and no prior row. |
+| `reportFor answers each state` | `404` `unknown-job`; a baseline job: `409` `no-report`; a running compare: `409` `report-not-ready`; after the pass: the report; an unreadable payload: `409` `report-unreadable`. |
+| `the hot statements read through an index` | `REPORT_DUE_SQL` uses `eval_jobs_unreported`, and `SESSIONS_HELD_SQL` uses `eval_trials_job`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/eval-comparison.test.ts` and the typecheck.
+
+### Task 11: the calibration read
+
+**Files:** `packages/host/src/eval-calibration.ts` (create), `tests/eval-calibration.test.ts` (create). Needs Tasks 2 and 4.
+
+**Interfaces (produces):**
+```ts
+export const CALIBRATION_PAIRS_MAX = 20;
+export const CALIBRATION_TASKS_SQL = "SELECT x.task_id FROM eval_trials x JOIN eval_tasks t ON t.task_id = x.task_id "
+  + "LEFT JOIN eval_groups g ON g.group_id = t.group_id LEFT JOIN eval_groups r ON r.group_id = g.root_id "
+  + "WHERE x.project_ref = ? AND x.ending = 'graded' AND x.reused_from IS NULL AND x.task_id > ? AND t.state = 'valid' "
+  + "AND COALESCE(r.holdout, 0) = 0 GROUP BY x.task_id HAVING MIN(x.resolved) = 0 AND MAX(x.resolved) = 1 ORDER BY x.task_id LIMIT ?";
+export const PAIR_TRIAL_SQL = "SELECT x.trial_id FROM eval_trials x JOIN eval_trial_patches p ON p.trial_id = x.trial_id "
+  + "WHERE x.project_ref = ? AND x.task_id = ? AND x.ending = 'graded' AND x.reused_from IS NULL AND x.resolved = ? "
+  + "ORDER BY x.ended_at DESC, x.trial_id LIMIT 1";
+export type CalibrationPair = { taskId: string; resolved: { trialId: string; patch: Buffer }; unresolved: { trialId: string; patch: Buffer } };
+export function calibrationPairs(store: EvidenceStore, input: { projectId: string; after?: string; limit?: number }):
+  { pairs: CalibrationPair[]; next: string | null };
+```
+
+**Decisions:**
+- One write. At most `limit` (at most 20) tasks from `CALIBRATION_TASKS_SQL`; for each, `PAIR_TRIAL_SQL` with `resolved` 1 and with 0; a task without a stored patch on either side gives no pair. Each patch is opened the way `finishTrial` sealed it. Each returned task's group gets `markExposed`. `next` is the last task id read when the page was full, else null.
+- No route, command, log line, or event carries a pair. No caller exists in this slice; the duels design calls it.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-calibration.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `the calibration read returns no holdout task and one pair per task` (acceptance 11) | A dev task with three resolved and two unresolved graded trials with patches: one pair, the newest of each. A holdout task with both: no pair. A dev task with only resolved trials: none. A copy row never appears. The pair's patches equal the stored bytes. |
+| `the calibration read marks each returned group exposed` | After the call: `exposed` 1 on each returned task's root, and no other root changed. |
+| `the calibration read pages` | 25 eligible tasks with limit 20: 20 pairs and `next`; the second call: 5 pairs and `next` null. |
+| `the hot statements read through an index` | `CALIBRATION_TASKS_SQL` and `PAIR_TRIAL_SQL` use `eval_trials_graded`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/eval-calibration.test.ts` and the typecheck.
+
+### Task 12: the summary and the routes
+
+**Files:** `packages/host/src/eval-summary.ts`, `packages/host/src/eval-routes.ts`, `tests/eval-routes.test.ts`. Needs Tasks 7 and 10.
+
+**Decisions:**
+- The summary: `tasks.bySet` is `setCounts`' dev and holdout counts when the project has `team.eval`, else null. `groups.holdout` and `groups.exposed` come from the same call.
+- `GET /api/eval/jobs/:id/report` answers `api.report(id)`, and `GET /api/eval/projects/:id/priors` answers `api.priors(id)`, each for the owner, controller, and viewer. `jobOf` parses `compare` and `confirm` with `comparisonJobSchema`.
+- `MESSAGES` gain: `too-few-tasks` "The set has too few valid tasks for this job.", `subject-confirmed` "This configuration pair already had its confirm job.", `report-not-ready` "The job has no report yet.", `report-unreadable` "The job's record cannot be read, so it has no report.", and `no-report` "Only compare and confirm jobs have reports."
+- The test adapter's `report` calls `reportFor`, and its `priors` calls `readPriors`, through `store.read`.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-routes.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `a compare job is created, reported, and read` | An owner `POST` of a compare job: `201`, `kind` `compare`, `set` `dev`, `trials.resolved` null. `GET` of its report while it runs: `409` `report-not-ready`. After the job finishes and one `ComparisonPass.step`: `200` with one pair; a viewer `GET`: `200`; a viewer `POST`: `403`. |
+| `a second confirm answers 409` | Two confirm requests for one pair with different request ids: `201`, then `409` `subject-confirmed`. |
+| `the priors route lists the export` | After a finished baseline job and one pass: `200` with its rows; an unknown project: `404`. |
+| `the summary shows the sets` | `bySet` counts dev and holdout; `groups.holdout` and `groups.exposed`; a project without `team.eval`: `bySet` null. |
+| `no route answers with text from the corpus` (extended) | The report and priors bodies hold no capsule objective, patch text, task id, trial id, or group id, and the report body no model name. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/eval-routes.test.ts` on the host (it listens on loopback), and the typecheck.
+
+### Task 13: the CLI
+
+**Files:** `packages/host/src/eval-cli.ts`, `tests/eval-cli.test.ts`. Needs Task 1. Runs in parallel with Tasks 2, 4, and 5.
+
+**Decisions:**
+- `USAGE` adds `infinite eval report JOB [--json] | infinite eval priors PROJECT [--json]`. Both read their route; `--json` prints the body.
+- `report` lines, each value through `clean`; a difference with its sign and three decimals; a p-value with four; null as `unknown`:
+  1. `report JOB compare (dev set) · completed · done · 3 trials per task`
+  2. `tasks 12 of 12 analysed (100%) · conclusive`, or `tasks 8 of 10 analysed (80%) · inconclusive: under 90% of tasks kept every valid trial`
+  3. For each configuration: `configuration 0: PROFILE (PROVIDER, epoch 1)`
+  4. For each pair: `1 vs 0: +0.194 [+0.056, +0.333] · sign 7-1-4, p 0.0703 (Holm 0.0703) · detectable 0.214 (planning 0.283 to 0.332)`
+  5. For each pair: `sensitivity 1 vs 0: +0.167 over 10 tasks`
+  6. For each configuration: `attrition 0: void-limit 0, void-host 0, void-owner 0, changed 1, short 1`
+  7. For each configuration: `cost 0: 4 trials, 2 resolved · per resolved: tokens 4500, spent USD 2.25, list USD unknown, minutes 30.0 (complete cost for 3 of 4)`
+  8. For each prompt origin, then each area: `by prompt origin assignment (n 6): 1 vs 0 +0.278 [+0.111, +0.444], p 0.1250` and `by area host (n 6): …`
+- `priors` prints one line per row, `PROFILE PROVIDER/MODEL/EFFORT epoch 1 · prompt 1a2b3c4d · area host · kind feature · origin assignment: 7 of 18 trials resolved over 6 tasks · JOB · GENERATED_AT`, with the first 8 digits of the prompt version, `none` for a null kind, and `unknown` for a null model or effort. No rows: `no priors`.
+- A comparison job's count line: `tasks 3 of 20 (skipped 0) · trials started 9 of 60, graded 8, resolved hidden, ended 0, void 1, reused 12 · report pending`; `resolved hidden` until the report is `ready`, and no report part while the job is active.
+- The status adds `sets dev N · holdout M` when `bySet` is not null, and the groups line adds `holdout H, exposed X`.
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-cli.test.ts`, with fixed bodies.
+
+| Test name | Assertions |
+|---|---|
+| `the report prints its figures` | A body with fixture P's figures: lines 1, 2, and 4 exactly as above. |
+| `an inconclusive report says so` | A body with fixture S's figures: line 2 as above, and the sensitivity line `sensitivity 1 vs 0: +0.167 over 10 tasks`. |
+| `the priors print one line per row` | Two rows: two lines as above; an empty list: `no priors`. |
+| `a comparison job hides its result until the report` | A running compare view: `resolved hidden`; a `ready` one: the count. |
+| `text from the host is cleaned` | A profile id with a control character prints a space in its place. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/eval-cli.test.ts` and the typecheck.
+
+### Task 14: the eval host, the server, and the host test
+
+**Files:** `packages/host/src/eval-host.ts`, `packages/host/src/server.ts` (net 0), `tests/eval-compare-run.test.ts` (create). Needs Tasks 3, 7, 8, 10, and 12.
+
+**Decisions:**
+- The constructor registers `evalTrialsModule(this.store, this.now)` after `TaskCapture`, unless `store.status().modules` names `eval-trials`; a throw is caught, and the module stays unavailable.
+- `tick` runs `ComparisonPass.step()` after `validate()`, in its own `try`. `sweep` runs `rotateHoldout` in one `tryWrite`, in its own `try`.
+- `create` sends `validate` to `EvalJobs` and every other kind to `TrialJobs`. `report` and `priors` check the store first (`503` `evidence-unavailable` unless `eval-corpus` and `eval-trials` are ready), then answer `reportFor` and `readPriors` (`404` `unknown-project` for an unknown project).
+- `EvalHostOptions` gains `cost?: CostLookup`, passed to `TrialPump`.
+- `server.ts` line 271, `const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager });`, adds `cost: sessionId => sessionCostOf(usage.session(sessionId))` before the closing brace, on the same line. `sessionCostOf` is imported at line 69. `usage` is declared at line 304 and read only by the hourly sweep, which starts with `evalHost.start()` at line 2250. No other line of `server.ts` changes.
+- Cost per tick: one `ComparisonPass.step` (Task 10's bound). Per sweep: one rotation (three statements, at most 100 updates).
+
+- [ ] **Step 1: Write the failing tests** in `tests/eval-compare-run.test.ts`. Setup: a real store with only the outcome and configurations modules registered by the test, an injected clock, and no `teams` (so no trial pump). The test writes each task's group with its set instead of drawing it. Each test calls `start()` and closes the host.
+
+| Test name | Assertions |
+|---|---|
+| `the host registers the trial tables` | After construction, `status().modules["eval-trials"]` is `ready`. A host over a store where the test registered the module first: no throw. |
+| `a compare job of measured configurations reports on the tick` | A finished baseline job with fixture P's rows for two configurations (isolated, epoch 1, each profile's prompt version, ended within 30 days). `create` of a compare job over the same tasks: `completed` at creation. After two ticks (one job each): `report(jobId)` has interval [2/36, 12/36] and p 0.0703125, and `priors(projectId)` lists the baseline job's and the compare job's rows. |
+| `a confirm subject is refused through the host` | 16 holdout tasks: the first confirm is created; the second for the same pair answers `409` `subject-confirmed`. |
+| `rotation runs on the sweep` | Holdout roots drawn 121 days before the clock: after `sweep()`, none is holdout, and the summary's `bySet.dev` grew by their tasks. |
+| `an unavailable store answers 503` | A store that failed to open: `report` and `priors` answer `503`, and `tick` throws nothing. |
+| `a project without eval settings sees no change` | A project without `team.eval`, after `start()` and three ticks: the summary's `bySet` is null, and no group, job, report, or prior row exists. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `NODE_OPTIONS=--max-old-space-size=2048 node --import tsx --test tests/eval-compare-run.test.ts`, then the typecheck and `node scripts/check-file-size.mjs`.
+- [ ] **Step 5: The coordinator runs `npm run check` once, requests the independent review, and commits.**
+
+### Task 15: the docs
+
+**Files:** `docs/teams.md`, `docs/superpowers/specs/2026-11-12-replay-eval-design.md`. Needs Task 1. Runs in parallel with Tasks 2 to 14.
+
+**Decisions:**
+- `docs/teams.md`, after "Eval trials", a section "Eval comparisons": the two sets (the draw, merges, exposure, rotation); `compare` and `confirm` requests and their refusals; the subject rule; reuse; the pins and `identity-changed`; the report (each figure, inconclusive, attrition, sensitivity, costs, the stored report); the priors and their reader; the `report` and `priors` commands; the defaults of "Rulings before the build".
+- The spec amendments, dated, in the style of the earlier ones. Part 2: the set on the root and the draw. Part 5: the calibration read marks exposure. Part 6: the comparison request, reuse at creation, copies. Part 7: pairs and Holm, the sensitivity rule, the pins and `identity-changed`, rotation, the subject. Part 8: the report and priors shapes, model names, the prospective confirm deferred. Acceptance 3: the set clause is met. Acceptance 11: the calibration read marks exposure.
+- No home path, host name, user name, or tracker link.
+
+- [ ] **Step 1: Write the docs.** **Step 2: Run** the privacy scan of `AGENTS.md` over the diff.
+
+## Launcher forms
+
+None. The slice runs no Git command and no launcher operation of its own: no new form of `teams.commandPrefix`, the eval launcher, or the grader launcher. Its trials use the trials slice's forms.
+
+## Owner approvals
+
+Nothing to install. On a host where the trials slice's installs are not done, comparison jobs wait as baseline jobs do (`eval-identity` or `grader`); a fully reused compare job still completes and reports; the set columns, reports, and priors work without any trial.
+
+Open for the owner, with the default this plan builds: the holdout share (30%); rotation (five confirm jobs or 120 days); the minimum tasks of a confirm job (15) and of a compare job (2); whether a cancelled confirm job keeps its subject (yes); the reuse window (30 days); how long reports and priors are kept (365 days); whether a report may name a model (no); and whether the priors route may (yes, as the spec's shape).
+
+Unknown until the trials slice's installs are done: whether the usage ledger measures an eval session, so that its cost columns read other than `none`; and any real report figure.
+
+## Not in this slice
+
+- The prospective confirm and its export (delegated adoption delivery step 7).
+- Change-candidate subjects and the `gate` purpose (the improvement gate design).
+- The power simulation that part 7 asks for before the first `confirm` job. The planning figures stay estimates, and `docs/teams.md` says so.
+- The learning budget, USD job limits, and a list-price table for `listUsd` (delegated adoption delivery step 4).
+- The router's read of the export, and its adoption as a Class A prior (router delivery step 3, C15).
+- The callers of `calibrationPairs` (the duels design).
+- Reports and priors in the web client, the phone, and the Mac app.
+- MCP tools: none (C9 rule 3).

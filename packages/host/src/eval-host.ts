@@ -8,7 +8,10 @@ import { applyDuplicateRule, GroupPass, rootOf, sweepGroups } from "./eval-group
 import { launcherEvalIdentity, type EvalIdentity } from "./eval-identity.js";
 import { ACTIVE_JOBS_SQL, EvalJobs, JOB_LIST_MAX, type NextWork } from "./eval-jobs.js";
 import { TrialJobs } from "./eval-trial-jobs.js";
-import { trialsSince } from "./eval-trial-store.js";
+import { ComparisonPass, reportFor } from "./eval-comparison.js";
+import { readPriors } from "./eval-priors.js";
+import { rotateHoldout } from "./eval-sets.js";
+import { EVAL_TRIALS_MODULE, evalTrialsModule, trialsSince } from "./eval-trial-store.js";
 import { TrialPump, type TrialTeams } from "./eval-trial-pump.js";
 import { mineGit, type MineGit } from "./eval-mine-git.js";
 import { Miner } from "./eval-miner.js";
@@ -18,17 +21,21 @@ import { evalSummary, SUMMARY_JOBS } from "./eval-summary.js";
 import {
   EVAL_MODULE,
   type BaselineJobRequest,
+  type ComparisonJobRequest,
+  type ComparisonReport,
   type EvalHostApi,
   type EvalJobView,
   type EvalRefusal,
   type EvalSummary,
   type GraderState,
+  type ReplayPrior,
   type ValidateJobRequest,
 } from "./eval-types.js";
 import { type BundleState, type TaskValidation, type ValidateContext, validateTask } from "./eval-validate.js";
 import type { HaltService } from "./halt/service.js";
 import type { HostLoadGate } from "./host-load.js";
 import type { Manager } from "./manager.js";
+import type { CostLookup } from "./outcome-cells.js";
 import { spawnTeamBundle } from "./team-workspace.js";
 import { inventoryRuntimeProcesses, type RuntimeProcess } from "./team-retirement.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "./project-source.js";
@@ -55,6 +62,8 @@ export type EvalHostOptions = {
   sessions?: Pick<Manager, "list" | "remove">;
   /** The eval identity's launcher client; the default is the host's `eval.member`. */
   identity?: EvalIdentity;
+  /** The usage ledger's cost of a session, read by the trial pump before it removes the session. */
+  cost?: CostLookup;
 };
 
 type Probed = { at: number; probe: GraderProbe };
@@ -79,6 +88,7 @@ export class EvalHost implements EvalHostApi {
   private readonly miner: Miner;
   private readonly evalJobs: EvalJobs;
   private readonly trialJobs: TrialJobs;
+  private readonly comparison: ComparisonPass;
   /** The baseline trial pump, one step after each validation step. Undefined without `teams` and `sessions`. */
   private readonly trials: TrialPump | undefined;
   /** Owned by this pump across tasks: the job last streamed and its digest. */
@@ -109,7 +119,10 @@ export class EvalHost implements EvalHostApi {
     });
     this.groups = new GroupPass({ store: this.store, runs: options.runs, now: this.now });
     this.miner = new Miner({ config: this.config, store: this.store, source: this.source, git: this.git, runs: options.runs, now: this.now });
+    // The trial tables. Nothing else registers them, and every trial job, trial, and count below writes to them.
+    this.store.register(evalTrialsModule(this.store, this.now));
     this.trialJobs = new TrialJobs({ store: this.store, config: this.config, now: this.now });
+    this.comparison = new ComparisonPass({ store: this.store, config: this.config, now: this.now });
     this.evalJobs = new EvalJobs({
       store: this.store, config: this.config, now: this.now,
       baseline: { views: (db, rows) => this.trialJobs.views(db, rows), digest: (projectId, jobId) => this.trialJobs.digest(projectId, jobId) },
@@ -119,7 +132,7 @@ export class EvalHost implements EvalHostApi {
       config: this.config, store: this.store, jobs: this.trialJobs,
       grader: this.grader, identity, teams: options.teams, sessions: options.sessions, source: this.source, hostLoad: this.hostLoad,
       halt: this.halt, graderProbe: () => this.grader.probe(this.canaries()).catch((): GraderProbe => ({ state: "unavailable" })),
-      inventory: this.inventory, now: this.now,
+      inventory: this.inventory, now: this.now, cost: options.cost,
     }) : undefined;
   }
 
@@ -138,6 +151,7 @@ export class EvalHost implements EvalHostApi {
     try { this.groups.run(); } catch { /* the pass never throws */ }
     try { this.miner.pump(); } catch { /* the miner never throws */ }
     try { this.validate(); } catch { /* the pump never throws */ }
+    try { this.comparison.step(); } catch { /* the pass never throws */ }
     // Outside the chain, so a long validation task cannot delay a trial's timeout or cancel.
     void this.trials?.watch();
   }
@@ -147,6 +161,7 @@ export class EvalHost implements EvalHostApi {
     try { this.capture.sweep(); } catch { /* the sweep never throws */ }
     try { this.store.tryWrite(tx => { sweepGroups(tx); }); } catch { /* an unavailable store sweeps nothing */ }
     try { this.evalJobs.sweep(); } catch { /* an unavailable store sweeps nothing */ }
+    try { if (this.ready()) this.store.tryWrite(tx => { rotateHoldout(tx, this.now()); }); } catch { /* an unavailable store rotates nothing */ }
     void this.trials?.sweep();
   }
 
@@ -197,9 +212,11 @@ export class EvalHost implements EvalHostApi {
     return this.guard(() => this.evalJobs.view(jobId) ?? refusal(404, "unknown-job"));
   }
 
-  create(projectId: string, request: ValidateJobRequest | BaselineJobRequest, requestId: string): { created: boolean; job: EvalJobView } | EvalRefusal {
-    return this.guard(() => request.kind === "baseline" ? this.trialJobs.create(projectId, request, requestId)
-      : this.evalJobs.create(projectId, request, requestId));
+  create(projectId: string, request: ValidateJobRequest | BaselineJobRequest | ComparisonJobRequest, requestId: string): { created: boolean; job: EvalJobView } | EvalRefusal {
+    // A baseline, compare, or confirm job writes the trial tables, so it needs their module; a validation job does not.
+    if (request.kind !== "validate" && !this.trialsReady()) return refusal(503, "evidence-unavailable");
+    return this.guard(() => request.kind === "validate" ? this.evalJobs.create(projectId, request, requestId)
+      : this.trialJobs.create(projectId, request, requestId));
   }
 
   control(jobId: string, action: "pause" | "resume" | "cancel"): EvalJobView | EvalRefusal {
@@ -215,6 +232,18 @@ export class EvalHost implements EvalHostApi {
       retireTask(tx, taskId, "owner-retired", this.now());
       return { taskId, state: "retired" as const };
     }));
+  }
+
+  report(jobId: string): ComparisonReport | EvalRefusal {
+    if (!this.ready() || !this.trialsReady()) return refusal(503, "evidence-unavailable");
+    return this.guard(() => this.store.read(db => reportFor(db, jobId)));
+  }
+
+  priors(projectId: string): { projectId: string; priors: ReplayPrior[] } | EvalRefusal {
+    if (!this.ready() || !this.trialsReady()) return refusal(503, "evidence-unavailable");
+    const project = this.config.projects.find(item => item.id === projectId);
+    if (project === undefined) return refusal(404, "unknown-project");
+    return this.guard(() => ({ projectId, priors: this.store.read(db => readPriors(db, project)) }));
   }
 
   /** Starts one validation pass when none runs. */
@@ -396,6 +425,14 @@ export class EvalHost implements EvalHostApi {
   private ready(): boolean {
     try {
       return this.store.status().modules[EVAL_MODULE] === "ready";
+    } catch {
+      return false;
+    }
+  }
+
+  private trialsReady(): boolean {
+    try {
+      return this.store.status().modules[EVAL_TRIALS_MODULE] === "ready";
     } catch {
       return false;
     }

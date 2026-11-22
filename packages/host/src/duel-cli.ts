@@ -81,6 +81,7 @@ function calibrationBody(options: Options): Record<string, unknown> {
   };
 }
 
+/** The paths carry no `/api` prefix: the client adds it to every path. */
 export async function handleDuelClientCommand(positional: string[], options: Options, api: EvalApi): Promise<boolean> {
   const [verb, first] = positional;
   const json = options["--json"] === true;
@@ -90,17 +91,17 @@ export async function handleDuelClientCommand(positional: string[], options: Opt
   };
   if (verb === "calibrate" && positional.length === 1) {
     const body = calibrationBody(options);
-    const result = await read(() => api.json<{ calibration: CalibrationView }>("/api/duels/judges/calibrations", body, undefined, undefined, "POST"));
+    const result = await read(() => api.json<{ calibration: CalibrationView }>("/duels/judges/calibrations", body, undefined, undefined, "POST"));
     print(result, () => viewLines(result.calibration));
     return true;
   }
   if (verb === "judges" && positional.length === 1) {
-    const result = await read(() => api.json<{ calibrations: CalibrationView[] }>("/api/duels/judges"));
+    const result = await read(() => api.json<{ calibrations: CalibrationView[] }>("/duels/judges"));
     print(result, () => judgeLines(result.calibrations));
     return true;
   }
   if (verb === "cancel" && positional.length === 2) {
-    const result = await read(() => api.json<{ calibration: CalibrationView }>(`/api/duels/judges/calibrations/${encodeURIComponent(first!)}/cancel`, undefined, undefined, undefined, "POST"));
+    const result = await read(() => api.json<{ calibration: CalibrationView }>(`/duels/judges/calibrations/${encodeURIComponent(first!)}/cancel`, undefined, undefined, undefined, "POST"));
     print(result, () => viewLines(result.calibration));
     return true;
   }

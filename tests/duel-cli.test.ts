@@ -36,7 +36,7 @@ async function capture<T>(run: () => Promise<T>): Promise<string[]> {
 test("calibrate posts the request", async () => {
   const { api, calls } = fakeApi(() => ({ calibration: view() }));
   await capture(() => handleDuelClientCommand(["calibrate"], { "--judge": "j1", "--pairs": "30", "--request-id": REQUEST_ID }, api));
-  assert.deepEqual(calls, [{ path: "/api/duels/judges/calibrations", body: { requestId: REQUEST_ID, judgeProfileId: "j1", pairs: 30 }, method: "POST" }]);
+  assert.deepEqual(calls, [{ path: "/duels/judges/calibrations", body: { requestId: REQUEST_ID, judgeProfileId: "j1", pairs: 30 }, method: "POST" }]);
 });
 
 test("calibrate sends only the fields it was given", async () => {
@@ -63,7 +63,7 @@ test("calibrate refuses a missing judge or request ID before any call", async ()
 test("cancel posts to the calibration's cancel route", async () => {
   const { api, calls } = fakeApi(() => ({ calibration: view({ status: "cancelled", state: null }) }));
   const lines = await capture(() => handleDuelClientCommand(["cancel", "cal-1"], {}, api));
-  assert.deepEqual(calls, [{ path: "/api/duels/judges/calibrations/cal-1/cancel", body: undefined, method: "POST" }]);
+  assert.deepEqual(calls, [{ path: "/duels/judges/calibrations/cal-1/cancel", body: undefined, method: "POST" }]);
   assert.ok(lines.join("\n").includes("cancelled"));
 });
 
@@ -91,7 +91,7 @@ test("judges reads the list and --json prints the body", async () => {
   const body = { calibrations: [view()] };
   const { api, calls } = fakeApi(() => body);
   const lines = await capture(() => handleDuelClientCommand(["judges"], { "--json": true }, api));
-  assert.deepEqual(calls.map(c => c.path), ["/api/duels/judges"]);
+  assert.deepEqual(calls.map(c => c.path), ["/duels/judges"]);
   assert.deepEqual(JSON.parse(lines.join("\n")), body);
 });
 

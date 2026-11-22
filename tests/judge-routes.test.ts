@@ -11,6 +11,8 @@ import { configurationModule } from "../packages/host/src/configuration-store.js
 import { finishTrial, insertTrial, startTrial } from "../packages/host/src/eval-trial-store.js";
 import { configRef, TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
 import { EvalHost } from "../packages/host/src/eval-host.js";
+import { handleDuelClientCommand } from "../packages/host/src/duel-cli.js";
+import type { EvalApi } from "../packages/host/src/eval-cli.js";
 import { JUDGE_MODULE, judgeCalibrationsModule } from "../packages/host/src/judge-store.js";
 import type { TrialConfiguration, TrialGrade } from "../packages/host/src/eval-types.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
@@ -117,6 +119,23 @@ function seedPairs(r: Rig, count: number): void {
 }
 
 const body = (requestId = REQUEST) => ({ requestId, judgeProfileId: JUDGE.id });
+
+/** The command line's API as `connection` in `client.ts` builds it: it adds `/api` to every path, and a refusal throws its status and code. */
+const cliApi = (r: Rig, role: string): EvalApi => ({
+  json: async <T>(path: string, payload?: unknown, _signal?: AbortSignal, _headers?: Record<string, string>, method?: string) => {
+    const reply = await call(r, method ?? (payload === undefined ? "GET" : "POST"), `/api${path}`, role, payload);
+    if (reply.status >= 400) throw Object.assign(new Error(`HTTP ${reply.status}`), { status: reply.status, code: reply.body?.code });
+    return reply.body as T;
+  },
+});
+
+async function printed(run: () => Promise<unknown>): Promise<string[]> {
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.join(" ")); };
+  try { await run(); } finally { console.log = original; }
+  return lines;
+}
 const CREATE = "/api/duels/judges/calibrations";
 
 test("a viewer reads the judges list", async () => {
@@ -223,6 +242,28 @@ test("a judge module that is not ready answers 503 on every route", async () => 
       assert.equal(reply.status, 503, path);
       assert.equal(reply.body.code, "evidence-unavailable");
     }
+  } finally {
+    await r.close();
+  }
+});
+
+test("the duels command line reaches the routes", async () => {
+  const r = await rig();
+  try {
+    seedPairs(r, 30);
+    const owner = cliApi(r, "owner");
+    const started = await printed(() => handleDuelClientCommand(["calibrate"], { "--judge": JUDGE.id, "--request-id": REQUEST }, owner));
+    const id = r.store.read(db => db.get<{ id: string }>("SELECT calibration_id AS id FROM judge_calibrations")!.id);
+    assert.equal(started.length, 3);
+    assert.ok(started[0]!.startsWith(`calibration ${id} judge ${JUDGE.id} `), started[0]);
+    assert.ok(started[0]!.includes(" · running · "), started[0]);
+    const listed = await printed(() => handleDuelClientCommand(["judges"], {}, cliApi(r, "viewer")));
+    assert.equal(listed.length, 4);
+    assert.ok(listed[1]!.startsWith(`calibration ${id} `), listed[1]);
+    const cancelled = await printed(() => handleDuelClientCommand(["cancel", id], {}, owner));
+    assert.ok(cancelled[0]!.includes(" · cancelled · "), cancelled[0]);
+    assert.equal(r.store.read(db => db.get<{ status: string }>("SELECT status FROM judge_calibrations WHERE calibration_id = ?", id)!.status), "cancelled");
+    await assert.rejects(() => handleDuelClientCommand(["cancel", "00000000-0000-4000-8000-000000000000"], {}, owner), /No calibration has this ID\./);
   } finally {
     await r.close();
   }

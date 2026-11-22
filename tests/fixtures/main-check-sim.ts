@@ -469,6 +469,8 @@ class Sim {
     if (notice.notice !== (record.notice ?? 0)) this.fail("R9", `notice ${notice.notice} is not health's generation ${record.notice ?? 0}`);
     if (mainCheckSetting(this.project(notice.projectId).team) === undefined) this.fail("R9", "a notice was offered with the setting off");
     bump(this.counts, `notice:offered:${notice.outcome}`);
+    // R9's only retry: a notice nobody answered is offered again once its minute in flight is over.
+    if (flight?.notice === notice.notice) bump(this.counts, "notice:offered-again-after-flight");
     this.flights.set(notice.projectId, { notice: notice.notice, until: this.clock.now + 60_000 });
   }
 
@@ -694,7 +696,10 @@ class Sim {
     bump(this.counts, `notice:accepted:${how}`);
   }
 
-  /** Offers, then answers: at once, later and possibly out of order, refused, or never. `all` accepts everything. */
+  /**
+   * Offers, then answers: at once, later and possibly out of order, or never, as for a push that reached no device.
+   * `all` accepts everything.
+   */
   private notify(all: boolean) {
     const offered = this.service.notices();
     this.raise();
@@ -711,11 +716,8 @@ class Sim {
         // A second device's acceptance of the same notice may arrive much later.
         if (!all && this.runtime.chance(0.3)) this.pending.push(notice);
       } else if (roll < 0.7) this.pending.push(notice);
-      else if (roll < 0.8) {
-        this.service.refused(notice.projectId, notice.notice);
-        if (this.flights.get(notice.projectId)?.notice === notice.notice) this.flights.delete(notice.projectId);
-        bump(this.counts, "notice:refused");
-      } else bump(this.counts, "notice:never");
+      // No answer: the notice stays in flight and is offered again when its minute ends.
+      else bump(this.counts, "notice:never");
     }
     // Late acceptances arrive in any order: newest first half the time, otherwise shuffled.
     const late = this.runtime.chance(0.5) ? [...this.pending].sort((a, b) => b.notice - a.notice) : this.shuffle(this.pending);

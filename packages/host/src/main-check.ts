@@ -142,7 +142,10 @@ export class MainCheckService {
     } catch { /* An observation never fails the fetch that reported it. */ }
   }
 
-  /** R9: the due notices that are not in flight. A returned notice is in flight for 60 seconds or until it is answered. */
+  /**
+   * R9: the due notices that are not in flight. A returned notice is in flight for 60 seconds or until it is accepted.
+   * There is no other answer: one that reached no device is offered again when its flight ends.
+   */
   notices(): MainCheckNotice[] {
     const now = this.ports.now();
     const offered: MainCheckNotice[] = [];
@@ -161,10 +164,6 @@ export class MainCheckService {
     if (!record) return;
     const next = accept(record, notice, outcome);
     if (next !== record) this.commit(projectId, next);
-  }
-
-  refused(projectId: string, notice: number): void {
-    if (this.flights.get(projectId)?.notice === notice) this.flights.delete(projectId);
   }
 
   /** For the owner's read route: the record without directories, roots and witnesses, plus whether `health` belongs to the observed head. */

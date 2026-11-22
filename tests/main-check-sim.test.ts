@@ -43,7 +43,8 @@ async function sweep(seeds: readonly number[], counts: Counts, variant: Variant 
  * They follow the cases the specification lists: a host stop after each kind of record write; heads that move,
  * revert, repeat, arrive late or twice; two projects; a halt during a check; checks changing at a measured head; a
  * census that fails, finds processes or is clean; a removal that fails; acceptances at once, late, out of order,
- * stale or never; a failure told, then the checks changed, and nothing offered until the next result (I10). The
+ * stale or never (a push that reached no device), and a notice offered again once its minute in flight ended; a
+ * failure told, then the checks changed, and nothing offered until the next result (I10). The
  * thinnest ran 3 to 8 times: a stop after a `told` write, the R8 ending of a record that read again, an out-of-order
  * acceptance, and a stop on a write of close().
  */
@@ -64,10 +65,10 @@ const FLOORS: Readonly<Record<string, number>> = {
   "outcome:passed": 174, "outcome:failed": 88, "outcome:error:copy-changed": 77, "outcome:error:workspace": 90,
   "outcome:error:command-unavailable": 32, "outcome:error:stop-unconfirmed": 41, "outcome:interrupted:time-limit": 39,
   "outcome:interrupted:host-stop": 40, "outcome:interrupted:halt": 19,
-  "health:failed": 86, "health:passed": 42, "health:fixed-before-told": 7, "told:changed": 88,
-  "notice:offered:failed": 90, "notice:offered:passed": 22, "notice:withheld:told-failed-health-absent": 66,
-  "notice:accepted:at-once": 77, "notice:accepted:late": 17, "notice:accepted:out-of-order": 2, "notice:accepted:stale": 6,
-  "notice:refused": 5, "notice:never": 13,
+  "health:failed": 86, "health:passed": 42, "health:fixed-before-told": 7, "told:changed": 86,
+  "notice:offered:failed": 88, "notice:offered:passed": 21, "notice:withheld:told-failed-health-absent": 64,
+  "notice:accepted:at-once": 76, "notice:accepted:late": 17, "notice:accepted:out-of-order": 2, "notice:accepted:stale": 6,
+  "notice:never": 17, "notice:offered-again-after-flight": 5,
 };
 
 test("the main check keeps its invariants across host stops, halts, faults and late acceptances", async t => {

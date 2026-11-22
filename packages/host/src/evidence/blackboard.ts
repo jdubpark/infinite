@@ -1,6 +1,6 @@
 import type { TeamMember, TeamRole, TeamRun } from "../team-types.js";
 import { canonicalJson } from "./crypto.js";
-import { ADDRESSED_KIND_SQL, ENTRY_KINDS, MEMBER_ENTRY_KINDS, type EntryHead, type EntryKind, type HostEntry, type HostEntryKind } from "./entry-types.js";
+import { ADDRESSED_KIND_SQL, ENTRY_KINDS, MEMBER_ENTRY_KINDS, type EntryAuthorRole, type EntryHead, type EntryKind, type HostEntry, type HostEntryKind } from "./entry-types.js";
 import { ENTRY_NOTICE, addressedHeads, entryDigest, type EntryDigest } from "./entry-reads.js";
 import { hostEntry, hostEntryId, hostEntrySources } from "./host-entries.js";
 import { memberEntryId, memberScopeOf, postAllowed, type MemberEntryEnvelope, type MemberEntryPost } from "./member-entry.js";
@@ -64,7 +64,7 @@ type EntryRow = {
   supersedes: string | null;
   encrypted_head: string;
 };
-type SealedHead = { taskId?: string; authorRole?: TeamRole | "mission-coordinator"; paths: string[]; summary: string };
+type SealedHead = { taskId?: string; authorRole?: EntryAuthorRole | "mission-coordinator"; paths: string[]; summary: string };
 type ScopeRow = {
   member_id: string;
   role: string;
@@ -374,7 +374,7 @@ export class Blackboard {
     const id = record.envelope.requestId;
     const head: SealedHead = {
       ...(entry.taskId === undefined ? {} : { taskId: entry.taskId }),
-      authorRole: member.role,
+      authorRole: member.role as EntryAuthorRole, // The post check admits only a role with member kinds, and an evaluator has none.
       paths: entry.paths,
       summary: entry.summary,
     };

@@ -4,6 +4,11 @@ import type { TeamRole } from "../team-types.js";
 export const ENTRY_KINDS = ["contract", "finding", "blocker", "handoff", "report", "integration", "check", "direction"] as const;
 export type EntryKind = typeof ENTRY_KINDS[number];
 export type HostEntryKind = "report" | "integration" | "check" | "direction";
+/**
+ * The roles an entry can name as its author. An evaluator never authors one: it has no entry tools, and the host
+ * writes no report entry for its sealed report. Leaving it out keeps it out of the result types the member tools declare.
+ */
+export type EntryAuthorRole = Exclude<TeamRole, "evaluator">;
 
 /** The plain columns and sealed head of one stored entry. Member text lives only in the sealed body. */
 export type EntryHead = {
@@ -16,7 +21,7 @@ export type EntryHead = {
   kind: EntryKind;
   author: "host" | "member" | "owner";
   authority: "receipt" | "claim" | "direction";
-  authorRole?: TeamRole | "mission-coordinator";
+  authorRole?: EntryAuthorRole | "mission-coordinator";
   taskId?: string;
   paths: string[];
   subtaskIds?: string[];
@@ -38,7 +43,7 @@ export type HostEntry = {
   revision: number;
   at: string;
   authorMemberId?: string;
-  authorRole?: TeamRole;
+  authorRole?: EntryAuthorRole;
   taskId?: string;
   summary: string;
   body: Record<string, unknown>;

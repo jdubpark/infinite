@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { TeamDecision, TeamMember, TeamRun, TeamTask } from "../team-types.js";
 import { decisionAuthorityQuestion } from "../team-types.js";
 import { canonicalJson } from "./crypto.js";
-import type { HostEntry, HostEntryKind } from "./entry-types.js";
+import type { EntryAuthorRole, HostEntry, HostEntryKind } from "./entry-types.js";
 
 /** A summary is one line of at most this many UTF-8 bytes (spec part 3). */
 export const ENTRY_SUMMARY_BYTES = 240;
@@ -72,8 +72,8 @@ function answeredDecisions(run: TeamRun): TeamDecision[] {
   return list(run.decisions).filter(decision => decision.answer !== undefined && decision.answeredBy === "owner");
 }
 
-function reportingMembers(run: TeamRun): TeamMember[] {
-  return list(run.members).filter(member => member.report !== undefined && member.role !== "permission-coordinator" && member.role !== "evaluator");
+function reportingMembers(run: TeamRun): (TeamMember & { role: EntryAuthorRole })[] {
+  return list(run.members).filter((member): member is TeamMember & { role: EntryAuthorRole } => member.report !== undefined && member.role !== "permission-coordinator" && member.role !== "evaluator");
 }
 
 /** Continuation tasks, then the run's own tasks. The first integrated task of each member wins. */

@@ -50,7 +50,7 @@ type ExactAny = Check<Exact<{ id: any }, { id: string }>>;
 // @ts-expect-error A key added to one object member of a union.
 type ExactUnionMember = Check<Exact<{ a: string } | { a: string; b: string }, { a: string } | { a: string; b: string; c?: string }>>;
 
-const TEAM_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker", "evaluator"] as const satisfies readonly TeamRole[];
+const TEAM_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker"] as const satisfies readonly TeamRole[];
 const uuid = z.uuid();
 const revision = z.number().int().min(1);
 

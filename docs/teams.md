@@ -1949,7 +1949,7 @@ The composed result is `not-met` when any criterion is `not-met`, whoever produc
 - Agreement statistics wait. The verdicts read shows whether the owner agreed, but the ledger row has no agreement column and there is no per-profile agreement cell.
 - Not built: `until-met` standing goals, the goal digest's other fields, citation handles, and a goal roll-up of the latest assessment in the outcome ledger.
 - A verdict delays delivery by one read-only member.
-- A no-change cycle after a delivered parent starts from the merge commit. The parent's receipts and host facts are at its own head, so they do not apply: host criteria read `no-receipt`, and the assessment is `inconclusive`.
+- A no-change cycle after a delivered parent starts from the merge commit. The parent's receipts and host facts are at its own head, so they do not apply: host criteria read `no-receipt`, and a record that holds one gets `inconclusive`.
 - The wait for the host's tests is 300,000 ms by the clock. After the host was down for longer, the verdict goes on without the receipts as soon as the host is back, and a host criterion without a receipt is `inconclusive` (`no-receipt`).
 - While a no-change cycle's verdict is held, the run shows `planning` during the host's tests and until the evaluator is prepared, and then `reviewing` until the no-change result is saved. The fixed event is the only sign of the hold.
 - Over the relay, the phone shows a cycle's assessment and counts but cannot open its criteria: the relay refuses the verdicts path, and the screen shows that refusal.

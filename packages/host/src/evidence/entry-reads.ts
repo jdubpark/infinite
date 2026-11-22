@@ -1,6 +1,6 @@
 import type { TeamRole } from "../team-types.js";
 import { canonicalJson } from "./crypto.js";
-import { ADDRESSED_ENTRY_KINDS, ADDRESSED_KIND_SQL, type EntryHead, type EntryKind, type MemberHead } from "./entry-types.js";
+import { ADDRESSED_ENTRY_KINDS, ADDRESSED_KIND_SQL, type EntryAuthorRole, type EntryHead, type EntryKind, type MemberHead } from "./entry-types.js";
 import type { MemberListQuery, MemberScope } from "./member-entry.js";
 import type { EvidenceDb } from "./types.js";
 
@@ -48,7 +48,7 @@ type EntryRow = {
   supersedes: string | null;
   encrypted_head: string;
 };
-type SealedHead = { taskId?: string; authorRole?: TeamRole | "mission-coordinator"; paths: string[]; summary: string };
+type SealedHead = { taskId?: string; authorRole?: EntryAuthorRole | "mission-coordinator"; paths: string[]; summary: string };
 type ScopeRow = { run_id: string; role: string; launch_seq: number; encrypted_scope: string };
 type SealedScope = { taskId?: string; paths: string[]; dependsOn?: string[] };
 

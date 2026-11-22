@@ -215,6 +215,19 @@ test("the register setting is inside the routine approval digest", async () => {
   } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("the evaluator setting is inside the routine approval digest", async () => {
+  const f = setup(); let service = f.createService();
+  try {
+    await service.create(f.create()); await wait(30); await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    service.close(); service = f.createService(); await service.tick();
+    assert.equal(service.list()[0]!.status, "running", "a reload keeps the stored authority with the key absent");
+    f.config.projects[0]!.team = { ...f.config.projects[0]!.team!, objective: { evaluator: "on" } };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked", "writing the evaluator key blocks the active routine");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("a pending project run prevents overlap and launch is skipped when the approved budget cannot fit", async () => {
   const f = setup({ busy: async () => true }); const service = f.createService();
   try {

@@ -383,3 +383,39 @@ test("the CLI records owner results", async () => {
   assert.ok(lines.includes("  a5 verified pinned plan intent-check [receipt:run-1:1:a5]: Statement a5."), "of two shown handles, the later one prints");
   assert.ok(lines.includes(`  a6 refuted outcome intent-check [rating:${R}]: Statement a6.`), "a rating handle shows on its line");
 });
+
+test("goal verdicts prints the labels", async () => {
+  const response = {
+    verdicts: [{
+      cycle: 1, teamId: "t1", verdictId: R, kind: "reviewed", head: "a".repeat(40), at: AT,
+      label: "Agent assessment, provisional", result: "not-met", evaluatorResult: "met", differs: true,
+      counts: { met: 1, notMet: 1, inconclusive: 0, pendingOwner: 0 }, progress: 1,
+      owner: { result: "not-achieved", agrees: true },
+      criteria: [
+        { id: "c0", producer: "host", state: "met", label: "host receipt", receipt: { handle: "receipt:r1", outcome: "pass" } },
+        { id: "c2", producer: "owner", state: "met", label: "your rating" },
+        { id: "c1", producer: "evaluator", state: "not-met", label: "agent assessment", handles: ["file:a.ts"], note: "SECRET-NOTE" },
+      ],
+      detail: "available",
+    }],
+  };
+  const paths: string[] = [];
+  const api: Api = {
+    async json<T = unknown>(path: string): Promise<T> {
+      paths.push(path);
+      return response as T;
+    },
+  };
+  const logs = await captureLogs(() => handleGoalClientCommand(["verdicts", G], {}, api));
+  assert.deepEqual(paths, [`/goals/${G}/verdicts`]);
+  const text = logs.join("\n");
+  assert.ok(text.includes("Agent assessment, provisional"));
+  assert.ok(text.includes("host receipt"));
+  assert.ok(text.includes("agent assessment"));
+  assert.ok(text.includes("your rating"));
+  assert.ok(!text.includes("SECRET-NOTE"), "the text form prints no note");
+  const jsonLogs = await captureLogs(() => handleGoalClientCommand(["verdicts", G], { "--json": true }, api));
+  const printed = JSON.parse(jsonLogs.join("\n")) as typeof response;
+  assert.equal(printed.verdicts.length, 1);
+  assert.equal(printed.verdicts[0].criteria[2].note, "SECRET-NOTE");
+});

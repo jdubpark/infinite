@@ -6,7 +6,7 @@ import type { ProductGoal } from "../packages/host/src/goal-types.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
 import { canonicalBytes, cappedBytes, objectiveRecordSchema, recordDigest } from "../packages/host/src/objective-types.js";
 import type { Assumption, Criterion, Direction, LogEntry, ObjectiveRecord, Question } from "../packages/host/src/objective-types.js";
-import { INTENT_OPS, OBJECTIVE_ERRORS, goalRecord, logValue, objectiveError, readStoredRecord, rebuildVersion, recordView, runRecord, syncDirections } from "../packages/host/src/objective-record.js";
+import { INTENT_OPS, OBJECTIVE_ERRORS, VERDICT_OPS, goalRecord, logValue, objectiveError, readStoredRecord, rebuildVersion, recordView, runRecord, syncDirections } from "../packages/host/src/objective-record.js";
 import type { ObjectiveErrorCode } from "../packages/host/src/objective-record.js";
 
 const GOAL_ID = "6f1c2a3e-8b4d-4c5e-9f60-718293a4b5c6";
@@ -589,3 +589,62 @@ test("register refusals have fixed codes and sentences", () => {
     assert.equal(error.message, message);
   }
 });
+
+test("verdict ops rebuild their latest states", () => {
+  const VERDICT_1 = "11111111-2222-4333-8444-555555555555";
+  const VERDICT_2 = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+  const sealed = (record: Omit<ObjectiveRecord, "digest">): ObjectiveRecord => {
+    const body = { ...record, digest: "" } as ObjectiveRecord;
+    body.digest = recordDigest(body);
+    return body;
+  };
+  const base = goalRecord(goalFixture(), AT, "created") as ObjectiveRecord;
+  const c0 = base.criteria[0] as Criterion;
+  const c1: Criterion = {
+    id: "c1",
+    origin: "owner",
+    statement: "The shortlist names its sources.",
+    check: { kind: "judgement", item: "sources" },
+    producer: "evaluator",
+    threshold: { kind: "pass" },
+    state: "active",
+  };
+  const first = { c0: { state: "met", verdictId: VERDICT_1 }, c1: { state: "not-met", verdictId: VERDICT_1 } } as const;
+  const second = { c0: { state: "not-met", verdictId: VERDICT_2 }, c1: { state: "met", verdictId: VERDICT_2 } } as const;
+  const recorded = (seq: number, version: number, verdictId: string, before: unknown, latest: unknown): LogEntry => ({
+    seq, at: at(seq), version, actor: "host", authority: "receipt", op: VERDICT_OPS.recorded, target: "c0", handle: `verdict:${verdictId}`,
+    before: { inline: { latest: before } },
+    after: { inline: { latest, result: "not-met", kind: "reviewed", revision: version, head: "a".repeat(40) } },
+  } as LogEntry);
+  const contradicted = (seq: number, version: number, verdictId: string): LogEntry => ({
+    seq, at: at(seq), version, actor: "host", authority: "receipt", op: VERDICT_OPS.contradicted, target: "c1", handle: `verdict:${verdictId}`,
+    after: { inline: { evaluator: "met", receipt: "not-met" } },
+  } as LogEntry);
+  const log = [
+    base.log[0] as LogEntry,
+    recorded(2, 2, VERDICT_1, { c0: null, c1: null }, first),
+    contradicted(3, 2, VERDICT_1),
+    recorded(4, 3, VERDICT_2, first, second),
+  ];
+  const v1Criteria = [c0, c1];
+  const withLatest = (latest: Record<string, Criterion["latest"]>) => v1Criteria.map(item => ({ ...item, latest: latest[item.id] }));
+  const v3 = sealed({ ...base, version: 3, criteria: withLatest(second), log });
+  assert.equal(objectiveRecordSchema.safeParse(v3).success, true);
+  assert.equal(OP_NAMES_OK(VERDICT_OPS.recorded) && OP_NAMES_OK(VERDICT_OPS.contradicted), true);
+
+  const at2 = rebuildVersion(v3, 2);
+  assert.equal(at2.version, 2);
+  assert.equal(at2.criteria.length, 2);
+  assert.deepEqual(at2.criteria.map(item => item.latest), [first.c0, first.c1]);
+  const at1 = rebuildVersion(v3, 1);
+  assert.equal(at1.version, 1);
+  assert.equal(at1.criteria.length, 2);
+  for (const item of at1.criteria) assert.equal("latest" in item, false);
+
+  const unknown = sealed({ ...v3, log: log.map(item => (item.seq === 4 ? { ...item, op: "verdict.mystery" } : item)) });
+  assert.throws(() => rebuildVersion(unknown, 2), { status: 409, code: "objective-version-unavailable" });
+});
+
+function OP_NAMES_OK(op: string): boolean {
+  return /^[a-z]+(?:[.-][a-z]+)*$/.test(op);
+}

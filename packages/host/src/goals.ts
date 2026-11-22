@@ -5,7 +5,7 @@ import { writeSealed, unseal } from "./vault.js";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { autonomyStartEvent, startMode } from "./evaluator-profiles.js";
 import { TeamService, TeamError } from "./teams.js";
-import { goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalParallelismSchema, goalSteerSchema, parseCreateGoal, type CreateGoal, type CycleClass, type GoalCycle, type GoalReasonCode, type ProductGoal } from "./goal-types.js";
+import { goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalParallelismSchema, goalSteerSchema, parseCreateGoal, type CreateGoal, type CycleClass, type GoalCycle, type GoalOutcomeInput, type GoalReasonCode, type ProductGoal } from "./goal-types.js";
 import type { Config } from "./types.js";
 import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type CreateTeam, type TeamGoalContext, type TeamView } from "./team-types.js";
 import { addRollups, emptyRollup, type StoredRollup, type UsageRollup } from "./team-usage.js";
@@ -19,6 +19,7 @@ import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, folde
 import { KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import { correctionGate, digestEvent, correctGoalObjective, createGoalObjective, goalObjectiveNote, goalObjectiveView, goalRecordDigest, goalRecordPort, loadGoalObjective, ratingStamp, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
 import { objectivePromptsOn, objectiveRegisterOn } from "./objective-digest.js";
+import { answerProvisional, assertVerdictAnswer, continueGoal, criteriaRowsFor, cycleVerdict, provisionalStop, verdictFailed, CONTINUE_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "./goal-verdicts.js";
 import { correctionSchema, type CriterionInput } from "./objective-input.js";
 import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
 
@@ -568,18 +569,24 @@ export class GoalService {
     this.record(id);
     return Promise.reject(new TeamError(409, "agent-managed-capacity", "Goal worker capacity is agent-managed. The project manager selects a limit for each cycle."));
   }
-  outcome(id: string, input: Action & { result: "achieved" | "not-achieved" | "inconclusive"; summary: string; evidence: string }) {
+  outcome(id: string, input: GoalOutcomeInput) {
     const body = goalOutcomeSchema.parse(input);
     return this.enqueue(() => {
       const stored = this.record(id), goal = stored.goal;
       if (this.replay(stored, "outcome", body)) return structuredClone(goal);
       if (!terminal.has(goal.status) || goal.activeTeamId || stored.control || stored.launch)
         throw new TeamError(409, "goal-still-active", "Stop the active work before recording a product outcome.");
+      assertVerdictAnswer(goal, body, Date.now());
       this.admit(stored, "outcome", body);
-      goal.outcomes.push({ result: body.result, summary: body.summary, evidence: body.evidence, at: now(), revision: goal.revision });
+      goal.outcomes.push({ result: body.result, summary: body.summary, evidence: body.evidence, at: now(), revision: goal.revision, ...(body.verdictId ? { verdictId: body.verdictId } : {}) });
+      answerProvisional(goal);
       if (body.result === "achieved") goal.status = "achieved";
+      else if (body.continue) {
+        const note = continueGoal(stored, body, now());
+        if (note) this.event(stored, note);
+      }
       else if (goal.status === "achieved") goal.status = goal.cycles.some(cycle => ["ready-for-review", "merged"].includes(cycle.status)) ? "ready-for-review" : "no-opportunity";
-      this.event(stored, "A user recorded a product outcome with supporting evidence.");
+      this.event(stored, body.continue ? CONTINUE_EVENT : "A user recorded a product outcome with supporting evidence.");
       this.save(stored); return structuredClone(goal);
     });
   }
@@ -609,7 +616,7 @@ export class GoalService {
   close() { this.closed = true; if (this.timer) clearInterval(this.timer); }
   private refresh(stored: Stored, team: TeamView) {
     const cycle = stored.goal.cycles.find(value => value.teamId === team.id)!;
-    Object.assign(cycle, { status: team.status, memberCount: team.members.length, baseCommit: team.baseCommit, headCommit: team.headCommit, branch: team.branch, workspace: team.workspace, brief: team.brief, reason: team.reason });
+    Object.assign(cycle, { status: team.status, memberCount: team.members.length, baseCommit: team.baseCommit, headCommit: team.headCommit, branch: team.branch, workspace: team.workspace, brief: team.brief, reason: team.reason }, cycleVerdict(stored.goal, cycle, team));
     if (team.usage.total.messages > 0 || team.usage.unmeasuredMembers === 0) cycle.usage = cycleUsageSnapshot(team.usage);
     else delete cycle.usage;
     if (["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status)) cycle.finishedAt ??= now();
@@ -792,8 +799,10 @@ export class GoalService {
             goal.status = goal.cycles.some(cycle => ["ready-for-review", "merged"].includes(cycle.status)) ? "ready-for-review" : "no-opportunity";
             goal.reason = team.reason ?? "The coordinator found no further work justified by the available evidence.";
           } else {
-            goal.status = "running"; goal.reason = undefined;
-            this.event(stored, "A feature passed checks and independent review. The next feature will use its recorded commit.");
+            const stop = provisionalStop(goal, team);
+            goal.status = stop ? "ready-for-review" : "running"; goal.reason = stop ? PROVISIONAL_REASON : undefined;
+            if (stop) goal.stopReason = "provisional-met";
+            this.event(stored, stop ? PROVISIONAL_EVENT : "A feature passed checks and independent review. The next feature will use its recorded commit.");
           }
         }
       } else if (["running", "needs-input"].includes(goal.status)) {
@@ -868,7 +877,7 @@ export class GoalService {
       // The team context accepts 16 entries, so a long-running goal passes its newest reviewed cycles.
       previousWork: goal.cycles.filter(isReviewed).slice(-maxPreviousWork).map(value => `${value.brief?.title ?? `Feature ${value.cycle}`}: ${value.brief?.expectedOutcome ?? "Reviewed change"}`.slice(0, 2000)),
       deadlineAt: goal.deadlineAt, maxMembers, ...(parent ? { parentRunId: parent.teamId } : {}),
-      extendMinutes: goal.extendMinutes ?? 0, ceilingAt: ceilingOf(goal), ...(pinned && "digest" in pinned ? { record: pinned.digest } : {}) };
+      extendMinutes: goal.extendMinutes ?? 0, ceilingAt: ceilingOf(goal), ...(pinned && "digest" in pinned ? { record: pinned.digest } : {}), ...criteriaRowsFor(stored, project) };
     const wake = goal.standing && useWake ? goal.pendingWake : undefined;
     const objective = wakeObjective([goal.objective, ...goal.steering.map(value => `User direction: ${value.text}`)].join("\n\n"), wake);
     // Every cycle of a goal keeps the goal's pinned mode; a goal with no pin is supervised.
@@ -974,7 +983,7 @@ export class GoalService {
       else this.hold(stored, "blocked", "external-operation", unresolved);
       return;
     }
-    if (cycle.class === "failed") goal.failedCycles = (goal.failedCycles ?? 0) + 1;
+    if (cycle.class === "failed" || (cycle.class === "reviewed" && verdictFailed(cycle))) goal.failedCycles = (goal.failedCycles ?? 0) + 1;
     else if (cycle.class !== "excluded") goal.failedCycles = 0;
     if (!["running", "needs-input"].includes(goal.status)) return;
     goal.status = "running"; goal.reason = undefined;

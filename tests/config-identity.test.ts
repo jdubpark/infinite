@@ -468,3 +468,15 @@ test("the register changes the prompt version only where the prompt changes", ()
   // A project manager posts no findings, so it has one version under both register shapes.
   assert.equal(promptVersion("project-manager", "claude", undefined, false, true, "register"), promptVersion("project-manager", "claude", undefined, false, true, "register-autonomous"));
 });
+
+test("the criteria shapes change the coordinator's prompt version only", () => {
+  assert.equal(promptVersion("implementer", "claude", undefined, true, false, true), promptVersion("implementer", "claude", undefined, true, false, "criteria"), "the implementer's prompt never holds rows");
+  assert.equal(promptVersion("implementer", "claude", undefined, true, false, "register-autonomous"), promptVersion("implementer", "claude", undefined, true, false, "register-autonomous-criteria"));
+  assert.notEqual(promptVersion("project-manager", "claude", undefined, true, false, true), promptVersion("project-manager", "claude", undefined, true, false, "criteria"), "the coordinator's prompt holds them");
+  assert.notEqual(promptVersion("project-manager", "claude", undefined, true, false, "register"), promptVersion("project-manager", "claude", undefined, true, false, "register-criteria"));
+  const evaluator = promptVersion("evaluator", "claude", undefined, true);
+  assert.match(evaluator, HEX64);
+  assert.equal(promptVersion("evaluator", "claude", undefined, true), evaluator, "stable across two calls");
+  assert.notEqual(evaluator, promptVersion("intent-checker", "claude", undefined, true), "differs from the intent checker's");
+  assert.equal(renderedPrompts("evaluator", "claude", undefined, true).length, 1);
+});

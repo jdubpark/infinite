@@ -441,3 +441,37 @@ test("each new run pins the register by setting", async () => {
     assert.equal("register" in f.readRecord<{ run: TeamRun }>("team", off.id).run, false);
   } finally { teams.close(); f.close(); }
 });
+
+test("each new run pins verdicts by setting", async () => {
+  const f = teamFixture();
+  const teams = f.openTeam();
+  const saved = (id: string) => f.readRecord<{ run: TeamRun }>("team", id).run;
+  try {
+    // With both keys on, a mission subteam never pins verdicts.
+    f.config.projects[0]!.team!.objective = { evaluator: "on", register: "on" };
+    const mission = await teams.createForMission(teamRequest(), randomUUID(), lineup);
+    assert.equal(mission.verdicts, undefined, "a mission subteam never pins verdicts");
+    assert.equal("verdicts" in saved(mission.id), false);
+
+    // The evaluator key alone, and the register key alone, pin nothing.
+    f.config.projects[0]!.team!.objective = { evaluator: "on" };
+    const evaluatorOnly = await teams.create(teamRequest());
+    assert.equal(evaluatorOnly.verdicts, undefined, "the evaluator key needs the register key");
+    f.config.projects[0]!.team!.objective = { register: "on" };
+    const registerOnly = await teams.create(teamRequest());
+    assert.equal(registerOnly.verdicts, undefined, "the register key needs the evaluator key");
+    assert.equal("verdicts" in saved(registerOnly.id), false);
+
+    // Both keys on: a standalone run pins it.
+    f.config.projects[0]!.team!.objective = { evaluator: "on", register: "on" };
+    const standalone = await teams.create(teamRequest());
+    assert.equal(standalone.verdicts, "on");
+    assert.equal(saved(standalone.id).verdicts, "on");
+
+    // The evaluator key off pins nothing even with the register on.
+    f.config.projects[0]!.team!.objective = { evaluator: "off", register: "on" };
+    const off = await teams.create(teamRequest());
+    assert.equal(off.verdicts, undefined);
+    assert.equal("verdicts" in saved(off.id), false);
+  } finally { teams.close(); f.close(); }
+});

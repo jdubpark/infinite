@@ -124,6 +124,36 @@ export class TeamRegister {
     }
   }
 
+  /**
+   * At the verdict's hold: marks a reviewed pass for the run's current revision when the reviewed-head rule holds, whatever the
+   * run's status. True when such a pass exists after the call. Saves through host.save when it marks. Never throws.
+   */
+  markReviewed(holder: RegisterHolder): boolean {
+    try {
+      const run = holder.run;
+      if (run.register !== "on" || !reviewedHead(holder)) return false;
+      const current = holder.register?.pass;
+      if (current && current.revision === run.revision && current.kind === "reviewed") return true;
+      const pass: RegisterPass = {
+        revision: run.revision, kind: "reviewed", state: "pending", markedAt: this.host.now(),
+        ...(run.headCommit === undefined ? {} : { commit: run.headCommit }),
+      };
+      holder.register = { ...holder.register, pass };
+      this.queue.push({ holder, pass });
+      this.host.save(holder);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The receipts of the run's latest pass when it is a reviewed pass at `head`: "pending" while it runs; undefined otherwise. */
+  reviewedReceipts(runId: string, head: string): readonly ObjectiveReceipt[] | "pending" | undefined {
+    const pass = this.host.holder(runId)?.register?.pass;
+    if (pass === undefined || pass.kind !== "reviewed" || pass.commit !== head) return undefined;
+    return pass.state === "pending" ? "pending" : (pass.receipts ?? []);
+  }
+
   /** Once at startup: marks every holder and queues every pending pass. */
   restore(holders: Iterable<RegisterHolder>): void {
     for (const holder of holders) {

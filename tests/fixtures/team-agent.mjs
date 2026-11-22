@@ -419,6 +419,20 @@ async function main() {
       ? JSON.parse(readFileSync(join(receiptDir, "intent-report.json"), "utf8"))
       : { kind: "intent-check", summary: "No gap found.", items: [] };
     await report(value);
+  } else if (assignment.role === "evaluator") {
+    // The evaluator copies its context and launch prompt for the test. It stalls under `stall-evaluator`, reports `verdict.json` when
+    // the test wrote one, and otherwise reports every criterion in its context met, with the first changed path as the handle.
+    const context = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8"));
+    writeWhole(join(receiptDir, `${assignment.memberId}.evaluator-context.json`), JSON.stringify(context));
+    writeFileSync(join(receiptDir, `${assignment.memberId}.evaluator-prompt.txt`), receipt.prompt ?? process.argv.at(-1) ?? "", { mode: 0o600 });
+    if (existsSync(join(receiptDir, "stall-evaluator"))) await new Promise(() => setInterval(() => {}, 1000));
+    if (existsSync(join(receiptDir, "verdict.json"))) {
+      await report(JSON.parse(readFileSync(join(receiptDir, "verdict.json"), "utf8")));
+      return;
+    }
+    const changed = context.changedPaths?.paths?.[0];
+    await report({ kind: "verdict", result: "met",
+      criteria: (context.record?.criteria ?? []).map(item => ({ id: item.id, state: "met", evidence: changed ? [`file:${changed}`] : [] })) });
   } else if (assignment.role === "permission-coordinator") {
     const launchPrompt = process.argv.at(-1) ?? "";
     const decisionId = /"decisionId":"([a-f0-9-]{36})"/.exec(launchPrompt)?.[1];

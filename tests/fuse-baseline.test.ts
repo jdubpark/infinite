@@ -192,3 +192,17 @@ test("the intent checker is a counted launch role", () => {
     assert.equal(EXEMPT_ROLES.has("intent-checker"), false);
   });
 });
+
+test("the evaluator launches under the fuse", () => {
+  withDirectory((directory) => {
+    const key = randomBytes(32);
+    const file = join(directory, BASELINE_FILE);
+    const evaluator: FuseLaunchRecord = { ...launch("E1", "a", now - minute), role: "evaluator" };
+    const value = baseline({ seq: 2, launches: [evaluator] });
+    assert.equal(writeBaseline(file, key, value), true);
+    const read = readBaseline(file, key);
+    assert.equal(read?.launches.length, 1);
+    assert.equal(read?.launches[0]?.role, "evaluator");
+    assert.equal(read?.launches[0]?.state, "admitted");
+  });
+});

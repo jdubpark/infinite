@@ -71,3 +71,62 @@ export function chooseIntentChecker(lineup: TeamLineup | undefined, planAuthor: 
   });
   return profile ? { profile } : { skipped: "no-eligible-profile" };
 }
+
+export type EvaluatorChoice =
+  | { profile: TeamModelProfile; family: string; sharedFamily: boolean; alsoReviewed: boolean }
+  | { skipped: "no-independent-evaluator" | "evaluator-unavailable" };
+
+/** A model is its provider and model id together; a profile without a model is the provider's default. */
+function sameModel(a: TeamModelProfile, b: TeamModelProfile): boolean {
+  return a.provider === b.provider && a.model === b.model;
+}
+
+/**
+ * C14 rules 1 to 3 over evaluatorProfiles(lineup). `authors`: the profiles of implementer and integrator members whose work
+ * integrated in the run. `reviewers`: the run's reviewer profiles. `excluded`: profile ids that already failed this verdict.
+ */
+export function chooseEvaluator(
+  lineup: TeamLineup | undefined,
+  cycle: { authors: readonly TeamModelProfile[]; reviewers: readonly TeamModelProfile[] },
+  limited: ReadonlySet<Provider>,
+  excluded?: ReadonlySet<string>,
+): EvaluatorChoice {
+  if (!lineup) return { skipped: "no-independent-evaluator" };
+  const coordinatorFamily = familyOf(lineup.coordinator);
+  if (coordinatorFamily === undefined) return { skipped: "no-independent-evaluator" };
+  const eligible: Array<{ profile: TeamModelProfile; family: string }> = [];
+  for (const profile of evaluatorProfiles(lineup)) {
+    const family = familyOf(profile);
+    if (family === undefined || family === coordinatorFamily) continue;
+    if (cycle.authors.some(author => sameModel(author, profile))) continue;
+    eligible.push({ profile, family });
+  }
+  if (eligible.length === 0) return { skipped: "no-independent-evaluator" };
+  const available = eligible.filter(entry => !limited.has(entry.profile.provider) && !excluded?.has(entry.profile.id));
+  if (available.length === 0) return { skipped: "evaluator-unavailable" };
+  const authorFamilies = new Set<string | undefined>(cycle.authors.map(author => familyOf(author)));
+  const reviewerFamilies = new Set<string | undefined>(cycle.reviewers.map(reviewer => familyOf(reviewer)));
+  const chosen = available.find(entry => !authorFamilies.has(entry.family) && !reviewerFamilies.has(entry.family))
+    ?? available.find(entry => !authorFamilies.has(entry.family))
+    ?? available[0]!;
+  return {
+    profile: chosen.profile,
+    family: chosen.family,
+    sharedFamily: authorFamilies.has(chosen.family),
+    alsoReviewed: cycle.reviewers.some(reviewer => sameModel(reviewer, chosen.profile)),
+  };
+}
+
+/** True only for evaluator "on" with register "on", on a run that is neither a mission subteam nor a handoff run. */
+export function verdictPin(input: { evaluator?: "on" | "off"; register?: "on" | "off"; mission: boolean; handoff: boolean }): boolean {
+  if (input.mission || input.handoff) return false;
+  return input.evaluator === "on" && input.register === "on";
+}
+
+/** The ids of evaluator profiles whose model is also an implementer's or an escalation's (the lineup warning of part 5). */
+export function evaluatorOverlaps(lineup: TeamLineup): string[] {
+  const others = [...lineup.implementers, ...(lineup.escalations ?? [])];
+  return evaluatorProfiles(lineup)
+    .filter(profile => others.some(other => sameModel(other, profile)))
+    .map(profile => profile.id);
+}

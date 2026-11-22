@@ -152,3 +152,20 @@ test("a source the record does not hold builds nothing", () => {
     assert.equal(hostEntry(run, source, NOW), undefined, source);
   }
 });
+
+test("an evaluator's report never becomes an entry", () => {
+  const run = hostEntryRun();
+  const evaluatorId = "00000000-0000-4000-8000-0000000000a9";
+  const before = hostEntrySources(run).length;
+  run.members.push({
+    ...run.members[0]!,
+    memberId: evaluatorId,
+    role: "evaluator",
+    title: "Evaluator",
+    report: { kind: "verdict" } as never,
+  });
+  const sources = hostEntrySources(run);
+  assert.equal(sources.includes(`report:${evaluatorId}`), false);
+  assert.equal(sources.length, before);
+  assert.equal(hostEntry(run, `report:${evaluatorId}`, NOW), undefined);
+});

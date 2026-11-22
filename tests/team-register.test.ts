@@ -66,7 +66,7 @@ class Reader implements BlobReader {
 }
 
 /** One simulated host: the holders, the events, the clock, and the register built on them. `w.holders` is read at each call, so a restart can replace it. */
-type World = { holders: Map<string, RegisterHolder>; events: Ev[]; clock: { ms: number }; port: Port; reader: Reader; register: TeamRegister };
+type World = { holders: Map<string, RegisterHolder>; events: Ev[]; saves: RegisterHolder[]; clock: { ms: number }; port: Port; reader: Reader; register: TeamRegister };
 
 function makeRegister(w: World): TeamRegister {
   const host: RegisterHost = {
@@ -78,7 +78,7 @@ function makeRegister(w: World): TeamRegister {
       chain = next.catch(() => undefined);
       return next;
     },
-    save: () => undefined,
+    save: holder => { w.saves.push(holder); },
     event: (holder, text) => { w.events.push({ runId: holder.run.id, text }); },
     prefix: () => undefined,
     now: () => new Date(w.clock.ms).toISOString(),
@@ -90,7 +90,7 @@ function makeRegister(w: World): TeamRegister {
 }
 
 function world(port = new Port(), reader = new Reader()): World {
-  const w: World = { holders: new Map(), events: [], clock: { ms: Date.parse(AT) }, port, reader, register: undefined as unknown as TeamRegister };
+  const w: World = { holders: new Map(), events: [], saves: [], clock: { ms: Date.parse(AT) }, port, reader, register: undefined as unknown as TeamRegister };
   w.register = makeRegister(w);
   return w;
 }
@@ -631,4 +631,60 @@ test("seeded runs with restarts write each pass once", async () => {
   }
   // The invariants are vacuous unless passes wrote records across the seeds.
   assert.equal(applied > SEEDS / 4, true, `seed run: only ${applied} passes wrote a record across ${SEEDS} seeds`);
+});
+
+test("a verdict's reviewed pass is the run's only pass", async () => {
+  const w = world();
+  const record = baseRecord([artifactAssumption("a2", ENTRIES, 2), commandAssumption("a4", "fail")]);
+  const holder = holderOf(w, runOf({ status: "reviewing" }), record);
+  w.reader.files.set(`${HEAD}:${ENTRIES}`, json({ entries: [{ id: "e1" }] }));
+
+  // Until the hold, nothing is due at reviewing.
+  w.register.mark(holder);
+  assert.equal(holder.register?.pass, undefined, "mark adds no pass at reviewing");
+  assert.equal(w.register.reviewedReceipts(RUN, HEAD), undefined, "no pass, no receipts");
+
+  // At the hold: one pending reviewed pass, saved once.
+  assert.equal(w.register.markReviewed(holder), true, "the reviewed-head rule holds at reviewing");
+  assert.equal(holder.register?.pass?.kind, "reviewed", "the pass is a reviewed pass");
+  assert.equal(holder.register?.pass?.state, "pending", "the pass is pending");
+  assert.equal(holder.register?.pass?.commit, HEAD, "the pass is marked at the head");
+  assert.equal(w.saves.length, 1, "marking saves once");
+  assert.equal(w.register.reviewedReceipts(RUN, HEAD), "pending", "a running pass reads as pending");
+  assert.equal(w.register.reviewedReceipts(RUN, OTHER), undefined, "a wrong head gives nothing");
+
+  // The same call again: the pass exists, and nothing is marked or saved.
+  assert.equal(w.register.markReviewed(holder), true, "a second call finds the pass");
+  assert.equal(w.saves.length, 1, "a second call does not save");
+
+  // The pass runs and applies as any other.
+  w.register.drain();
+  await w.register.idle();
+  const receipts = w.register.reviewedReceipts(RUN, HEAD);
+  assert.notEqual(receipts, undefined, "a finished pass has receipts");
+  assert.notEqual(receipts, "pending", "a finished pass is not pending");
+  assert.equal(Array.isArray(receipts) ? receipts.length : -1, 2, "one receipt per subject");
+  assert.equal(w.reader.calls.length, 1, "one blob read");
+  assert.equal(w.register.reviewedReceipts(RUN, OTHER), undefined, "a wrong head still gives nothing");
+
+  // A later mark at ready-for-review adds no pass.
+  const pass = holder.register?.pass;
+  holder.run.status = "ready-for-review";
+  w.register.mark(holder);
+  w.register.drain();
+  await w.register.idle();
+  assert.equal(holder.register?.pass, pass, "mark finds the reviewed pass of the same revision");
+  assert.equal(w.reader.calls.length, 1, "no second read");
+
+  // An unpinned run, or one without the reviewed-head rule, gets no pass and no save.
+  const saved = w.saves.length;
+  const plain: RegisterHolder = { run: runOf({ id: "run-plain", status: "reviewing", register: undefined }), checkHead: HEAD };
+  assert.equal(w.register.markReviewed(plain), false, "an unpinned run gets no pass");
+  assert.equal(plain.register?.pass, undefined, "no pass on an unpinned run");
+  const unreviewed: RegisterHolder = { run: runOf({ id: "run-open", status: "reviewing", review: undefined }), checkHead: HEAD };
+  assert.equal(w.register.markReviewed(unreviewed), false, "a run without an approval gets no pass");
+  const moved: RegisterHolder = { run: runOf({ id: "run-moved", status: "reviewing" }), checkHead: OTHER };
+  assert.equal(w.register.markReviewed(moved), false, "a check head that is not the run's head gets no pass");
+  assert.equal(moved.register?.pass, undefined, "no pass on a moved head");
+  assert.equal(w.saves.length, saved, "a refused call saves nothing");
 });

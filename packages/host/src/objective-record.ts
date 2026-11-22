@@ -239,6 +239,9 @@ export const REGISTER_OPS = {
 } as const;
 const REGISTER_OP_SET = new Set<string>(Object.values(REGISTER_OPS));
 
+/** The ops a verdict writes. `rebuildVersion` undoes `recorded`; `contradicted` changes no record state. */
+export const VERDICT_OPS = { recorded: "verdict.recorded", contradicted: "evaluator-contradicted-receipt" } as const;
+
 const CRITERION_OPS = new Set(["criterion.added", "criterion.edited", "criterion.retired", "criterion.confirmed"]);
 
 /** Undoes one criterion entry: the criterion its `after` names goes back to its `before`, or is removed for an add. */
@@ -424,6 +427,34 @@ function undoProposal(state: Undoable, entry: LogEntry): Undoable {
   return { ...state, assumptions: assumptions.filter(item => !added.includes(item.id)) };
 }
 
+const verdictState = z.enum(["met", "not-met", "inconclusive", "pending-owner"]);
+const verdictLatest = z.strictObject({ state: verdictState, verdictId: z.uuid() });
+const verdictBefore = z.looseObject({ latest: z.record(z.string(), verdictLatest.nullable()) });
+const verdictAfter = z.looseObject({ latest: z.record(z.string(), verdictLatest) });
+
+/** Puts each criterion a verdict named back to its earlier `latest`, or removes `latest` when there was none. */
+function undoVerdict(state: Undoable, entry: LogEntry): Undoable {
+  const before = verdictBefore.safeParse(inlineOf(entry.before));
+  const after = verdictAfter.safeParse(inlineOf(entry.after));
+  if (!before.success || !after.success) throw unavailable();
+  const ids = Object.keys(after.data.latest);
+  if (ids.length !== Object.keys(before.data.latest).length) throw unavailable();
+  let criteria = state.criteria;
+  for (const id of ids) {
+    const previous = before.data.latest[id];
+    const written = after.data.latest[id]!;
+    const index = criteria.findIndex(item => item.id === id);
+    if (previous === undefined || index === -1) throw unavailable();
+    const current = criteria[index]!.latest;
+    if (current === undefined || current.state !== written.state || current.verdictId !== written.verdictId) throw unavailable();
+    const restored: Criterion = { ...criteria[index]! };
+    delete restored.latest;
+    if (previous !== null) restored.latest = previous;
+    criteria = criteria.map((item, position) => (position === index ? restored : item));
+  }
+  return { ...state, criteria };
+}
+
 function undoRegister(state: Undoable, entry: LogEntry): Undoable {
   switch (entry.op) {
     case REGISTER_OPS.tested: return undoStatuses(state, entry, id => `${entry.handle}:${id}`);
@@ -458,6 +489,11 @@ export function rebuildVersion(record: ObjectiveRecord, version: number): Object
       state = undoRegister(state, entry);
       continue;
     }
+    if (entry.op === VERDICT_OPS.recorded) {
+      state = undoVerdict(state, entry);
+      continue;
+    }
+    if (entry.op === VERDICT_OPS.contradicted) continue;
     if (entry.op !== "direction.appended" && entry.op !== "direction.copied") throw objectiveError("objective-version-unavailable");
     if (!record.statement.directions.some(item => item.id === entry.target)) throw objectiveError("objective-version-unavailable");
     state = { ...state, directions: state.directions.filter(item => item.id !== entry.target) };

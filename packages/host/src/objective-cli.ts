@@ -5,9 +5,12 @@ import { correctionSchema } from "./objective-input.js";
 import type { Correction, CorrectionOp } from "./objective-input.js";
 import { OBJECTIVE_ERRORS } from "./objective-record.js";
 import type { ObjectiveErrorCode, ObjectiveRecordView } from "./objective-record.js";
+import type { GoalVerdictView } from "./verdict-view.js";
 
 type GoalApi = { json<T = unknown>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T> };
 type Options = Record<string, string | boolean>;
+
+export const GOAL_VERDICTS_USAGE = "Usage: infinite goal verdicts ID [--json]";
 
 export const GOAL_RECORD_USAGE = [
   "Usage: infinite goal record ID [--version N] [--json]",
@@ -209,7 +212,42 @@ async function readView(api: GoalApi, goalId: string, version: string | undefine
   }
 }
 
+/** The text lines of `infinite goal verdicts`: one block per cycle, labelled, with no note, handle, or evaluator text. */
+export function goalVerdictLines(verdicts: GoalVerdictView[]): string[] {
+  if (verdicts.length === 0) return ["No cycle of this goal has an assessment."];
+  const lines: string[] = [];
+  for (const verdict of verdicts) {
+    lines.push(`Cycle ${verdict.cycle} · ${verdict.label} · ${verdict.result}${verdict.differs ? ` (evaluator said ${verdict.evaluatorResult})` : ""}`);
+    if (verdict.reason !== undefined) lines.push(`  Reason: ${verdict.reason}`);
+    const { counts } = verdict;
+    lines.push(`  Met ${counts.met} · not met ${counts.notMet} · inconclusive ${counts.inconclusive} · waiting for you ${counts.pendingOwner} · progress ${verdict.progress}`);
+    if (verdict.owner !== undefined) lines.push(`  You answered ${verdict.owner.result}${verdict.owner.agrees ? " (agrees)" : ""}`);
+    if (verdict.detail === "expired") lines.push("  Details expired: this run's record is gone.");
+    for (const criterion of verdict.criteria) {
+      lines.push(`  ${criterion.id} ${criterion.state} · ${criterion.label}${criterion.reason === undefined ? "" : ` · ${criterion.reason}`}`);
+    }
+  }
+  return lines.map(clean);
+}
+
+async function handleVerdicts(positional: string[], options: Options, api: GoalApi): Promise<boolean> {
+  const [, goalId, ...rest] = positional;
+  if (!goalId || rest.length > 0 || options["--version"] !== undefined || options["--request-id"] !== undefined || options["--file"] !== undefined) throw new Error(GOAL_VERDICTS_USAGE);
+  let reply: { verdicts: GoalVerdictView[] };
+  try { reply = await api.json<{ verdicts: GoalVerdictView[] }>(`/goals/${encodeURIComponent(goalId)}/verdicts`); }
+  catch (error) {
+    const { status, code } = faultOf(error);
+    if (status === 404 && code === "goal-not-found") throw new Error("No goal has this ID.");
+    if (status === 404) throw new Error("This host has no goal verdicts. Upgrade the host.");
+    throw error;
+  }
+  if (options["--json"] === true) { console.log(JSON.stringify(reply, null, 2)); return true; }
+  for (const line of goalVerdictLines(reply.verdicts)) console.log(line);
+  return true;
+}
+
 export async function handleGoalClientCommand(positional: string[], options: Options, api: GoalApi): Promise<boolean> {
+  if (positional[0] === "verdicts") return handleVerdicts(positional, options, api);
   const form = formOf(positional);
   const goalId = positional[1];
   const requested = options["--version"];

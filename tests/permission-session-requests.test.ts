@@ -312,6 +312,25 @@ test("evidence collection reads only inside the session root, within its limits,
   } finally { h.close(); }
 });
 
+test("a prompt the owner submits while a request is decided leaves the dialog with the owner", async () => {
+  const h = harness({ delivery: new FakeDelivery(() => new Promise(() => {})) });
+  try {
+    const live = h.add("s", "covered");
+    const target = (await h.service.target("s"))!;
+    assert.equal((await target.check()).ok, true);
+    assert.equal((await target.check()).ok, true, "reading the task again changes nothing");
+    // The owner narrows the task while the review runs. The verdict was reached for the earlier task text.
+    live.events.push({ seq: 1, at: "t", type: "input-result", data: { requestId: "i1", state: "delivered", message: "Do not run the tests against the shared database" } });
+    assert.deepEqual(await target.check(), { ok: false, stale: false, reason: "The session's task changed after the request was read." });
+    assert.equal(await target.answer(0, "decision-1"), "refused");
+    assert.equal(h.answered.length, 0);
+    // A request built now carries the new task text and passes its own check.
+    const next = (await h.service.target("s"))!;
+    assert.match(next.request.requester.task.text, /shared database/);
+    assert.equal((await next.check()).ok, true);
+  } finally { h.close(); }
+});
+
 test("the task evidence holds the title and the owner's prompts, and no agent output", async () => {
   const h = harness();
   try {

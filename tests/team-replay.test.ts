@@ -90,7 +90,8 @@ test("a replay run whose capsule holds an owner answer runs its member", { timeo
     const state = await context.ended(trialId);
     assert.equal(state?.ending, "settled");
     assert.equal(state?.memberId !== undefined, true, "the member started");
-    assert.match(readFileSync(join(work, ".git", "infinite-team-context.json"), "utf8"), /Compact/, "the answer reaches the member's context");
+    const written = JSON.parse(readFileSync(join(work, ".git", "infinite-team-context.json"), "utf8")) as { ownerAnswers?: unknown };
+    assert.deepEqual(written.ownerAnswers, [{ decisionId: "answer-1", question: "Which style?", answer: "Compact" }], "the answer reaches the member's context");
   } finally {
     await context.f.close();
   }

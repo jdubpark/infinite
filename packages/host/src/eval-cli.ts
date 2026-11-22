@@ -1,10 +1,20 @@
 import { closeSync, openSync, readSync } from "node:fs";
-import { EVAL_STATES, type BaselineJobView, type EvalJobView, type EvalState, type EvalSummary } from "./eval-types.js";
+import {
+  EVAL_STATES,
+  type BaselineJobView,
+  type ComparisonJobView,
+  type ComparisonReport,
+  type EvalJobView,
+  type EvalState,
+  type EvalSummary,
+  type PairResult,
+  type ReplayPrior,
+} from "./eval-types.js";
 
 type Options = Record<string, string | boolean>;
 export type EvalApi = { json<T = unknown>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T> };
 
-const USAGE = "Usage: infinite eval status PROJECT [--json] | infinite eval run PROJECT --file job.json --request-id UUID [--json] | infinite eval job JOB [--json] | infinite eval pause|resume|cancel JOB | infinite eval retire TASK";
+const USAGE = "Usage: infinite eval status PROJECT [--json] | infinite eval run PROJECT --file job.json --request-id UUID [--json] | infinite eval job JOB [--json] | infinite eval pause|resume|cancel JOB | infinite eval retire TASK | infinite eval report JOB [--json] | infinite eval priors PROJECT [--json]";
 /** A job file is read at most this many bytes; a larger one is refused before any call. */
 const JOB_FILE_LIMIT = 64 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -24,12 +34,29 @@ function baselineCountLine(job: BaselineJobView): string {
   return `tasks ${count(tasks.reached)} of ${count(tasks.planned)} (skipped ${count(tasks.skipped)}) · trials started ${count(trials.started)} of ${count(trials.planned)}, graded ${count(trials.graded)}, resolved ${count(trials.resolved)}, ended ${count(trials.ended)}, void ${count(trials.void)}`;
 }
 
+/** A number the host did not compute prints as unknown, never as zero. */
+const fixed = (value: number | null | undefined, digits: number) => typeof value === "number" ? value.toFixed(digits) : "unknown";
+/** A signed figure: the sign is always shown, so a zero difference reads `+0.000`. */
+const signed = (value: number | null | undefined, digits: number) =>
+  typeof value === "number" ? `${value < 0 ? "-" : "+"}${Math.abs(value).toFixed(digits)}` : "unknown";
+const intervalText = (interval: [number, number] | null) =>
+  interval === null ? "unknown" : `[${signed(interval[0], 3)}, ${signed(interval[1], 3)}]`;
+
+/** A comparison job's counts. The result stays hidden until the report is ready, and an active job has no report part. */
+function comparisonCountLine(job: ComparisonJobView): string {
+  const { tasks, trials } = job;
+  const resolved = job.report === "ready" ? count(trials.resolved) : "hidden";
+  const report = job.report === null || job.report === undefined ? "" : ` · report ${clean(job.report)}`;
+  return `tasks ${count(tasks.reached)} of ${count(tasks.planned)} (skipped ${count(tasks.skipped)}) · trials started ${count(trials.started)} of ${count(trials.planned)}, graded ${count(trials.graded)}, resolved ${resolved}, ended ${count(trials.ended)}, void ${count(trials.void)}, reused ${count(trials.reused)}${report}`;
+}
+
 /** One job as two lines: its header, then its counts. Every text value passes through `clean`. */
 export function evalJobLines(job: EvalJobView): string[] {
   const reason = job.reason ? ` · ${clean(job.reason)}` : "";
   const waiting = job.waiting ? ` · waiting ${clean(job.waiting)}` : "";
   const header = `job ${clean(job.jobId)} ${clean(job.status)}${reason}${waiting}`;
   if (job.kind === "baseline") return [header, baselineCountLine(job)];
+  if (job.kind === "compare" || job.kind === "confirm") return [header, comparisonCountLine(job)];
   if (job.kind !== "validate") return [header];
   const { counts } = job;
   return [
@@ -52,7 +79,8 @@ export function evalStatusLines(summary: EvalSummary): string[] {
     `capture ${summary.capture.on ? "on" : "off"} · mining ${clean(mining.state)} (visited ${count(mining.visited)}, mined ${count(mining.mined)}, skipped ${count(mining.skipped)}, failures ${count(mining.failures)})`,
     `states: ${stateCounts(summary.tasks.byState)}`,
     `mined: ${stateCounts(summary.tasks.byOrigin.mined)}`,
-    `groups ${count(summary.groups.total)} (dev-only ${count(summary.groups.devOnly)}, largest ${count(summary.groups.largest)})`,
+    ...(summary.tasks.bySet ? [`sets dev ${count(summary.tasks.bySet.dev)} · holdout ${count(summary.tasks.bySet.holdout)}`] : []),
+    `groups ${count(summary.groups.total)} (dev-only ${count(summary.groups.devOnly)}, largest ${count(summary.groups.largest)}, holdout ${count(summary.groups.holdout)}, exposed ${count(summary.groups.exposed)})`,
     summary.coverage === null
       ? "coverage unknown"
       : `coverage ${Math.round(summary.coverage.share * 100)}% of ${count(summary.coverage.accepted)} accepted attempts over ${count(summary.coverage.days)} days`,
@@ -67,6 +95,36 @@ export function evalStatusLines(summary: EvalSummary): string[] {
   }
   for (const job of summary.jobs) lines.push(...evalJobLines(job));
   return lines;
+}
+
+const pairText = (pair: PairResult) =>
+  `${pair.b} vs ${pair.a}: ${signed(pair.mean, 3)} ${intervalText(pair.interval)} · sign ${count(pair.sign.wins)}-${count(pair.sign.losses)}-${count(pair.sign.ties)}, p ${fixed(pair.sign.p, 4)} (Holm ${fixed(pair.holm, 4)}) · detectable ${fixed(pair.detectable.observed, 3)} (${pair.detectable.planning === null ? "planning unknown" : `planning ${fixed(pair.detectable.planning[0], 3)} to ${fixed(pair.detectable.planning[1], 3)}`})`;
+const groupPairs = (pairs: PairResult[]) =>
+  pairs.map(pair => `${pair.b} vs ${pair.a} ${signed(pair.mean, 3)} ${intervalText(pair.interval)}, p ${fixed(pair.sign.p, 4)}`).join("; ");
+
+/** A stored report as lines. It prints what the host returns: no model name is added, and a null figure prints as unknown. */
+export function evalReportLines(report: ComparisonReport): string[] {
+  const { tasks } = report;
+  const share = tasks.planned > 0 ? `${Math.floor(tasks.analysed / tasks.planned * 100)}%` : "unknown";
+  const verdict = report.conclusive ? "share rule met" : "inconclusive: under 90% of tasks kept every valid trial";
+  const reason = report.reason ? ` · ${clean(report.reason)}` : "";
+  return [
+    `report ${clean(report.jobId)} ${clean(report.kind)} (${clean(report.set)} set) · ${clean(report.status)}${reason} · ${count(report.trialsPerTask)} trials per task`,
+    `tasks ${count(tasks.analysed)} of ${count(tasks.planned)} analysed (${share}) · ${verdict}`,
+    ...report.configurations.map(c => `configuration ${c.index}: ${clean(c.profileId)} (${clean(c.provider)}, epoch ${count(c.profileEpoch)})`),
+    ...report.pairs.map(pairText),
+    ...report.sensitivity.map(s => `sensitivity ${s.b} vs ${s.a}: ${signed(s.mean, 3)} over ${count(s.n)} tasks`),
+    ...report.attrition.map(a => `attrition ${a.configuration}: void-limit ${count(a.void["void-limit"])}, void-host ${count(a.void["void-host"])}, void-owner ${count(a.void["void-owner"])}, changed ${count(a.changed)}, short ${count(a.short)}`),
+    ...report.cost.map(c => `cost ${c.configuration}: ${count(c.trials)} trials, ${count(c.resolved)} resolved · per resolved: tokens ${c.tokensPerResolved === null ? "unknown" : Math.round(c.tokensPerResolved)}, spent USD ${fixed(c.spentUsdPerResolved, 2)}, list USD unknown, minutes ${fixed(c.minutesPerResolved, 1)} (complete cost for ${count(c.costed)} of ${count(c.trials)})`),
+    ...report.byPromptOrigin.map(g => `by prompt origin ${clean(g.promptOrigin)} (n ${count(g.n)}): ${groupPairs(g.pairs)}`),
+    ...report.byArea.map(g => `by area ${clean(g.area)} (n ${count(g.n)}): ${groupPairs(g.pairs)}`),
+  ];
+}
+
+/** The prior export, one line per row. The model is the host's answer for the router, and unknown when null. */
+export function evalPriorLines(priors: ReplayPrior[]): string[] {
+  if (priors.length === 0) return ["no priors"];
+  return priors.map(p => `${clean(p.profileId)} ${clean(p.profile.provider)}/${clean(p.profile.model ?? "unknown")}/${clean(p.profile.effort ?? "unknown")} epoch ${count(p.profileEpoch)} · prompt ${clean(p.promptVersion).slice(0, 8)} · area ${clean(p.area)} · kind ${clean(p.kind ?? "none")} · origin ${clean(p.promptOrigin)}: ${count(p.resolved)} of ${count(p.trials)} trials resolved over ${count(p.tasks)} tasks · ${clean(p.jobId)} · ${clean(p.generatedAt)}`);
 }
 
 /** Maps the host's fixed answers to the plan's sentences. An absent route, an older host, answers 404 without a known code. */
@@ -143,6 +201,16 @@ export async function handleEvalClientCommand(positional: string[], options: Opt
   if ((verb === "pause" || verb === "resume" || verb === "cancel") && positional.length === 2) {
     const job = await read(() => api.json<EvalJobView>(`/eval/jobs/${encodeURIComponent(first!)}/${verb}`, undefined, undefined, undefined, "POST"));
     print(job, () => evalJobLines(job));
+    return true;
+  }
+  if (verb === "report" && positional.length === 2) {
+    const report = await read(() => api.json<ComparisonReport>(`/eval/jobs/${encodeURIComponent(first!)}/report`));
+    print(report, () => evalReportLines(report));
+    return true;
+  }
+  if (verb === "priors" && positional.length === 2) {
+    const result = await read(() => api.json<{ projectId: string; priors: ReplayPrior[] }>(`/eval/projects/${encodeURIComponent(first!)}/priors`));
+    print(result, () => evalPriorLines(result.priors));
     return true;
   }
   if (verb === "retire" && positional.length === 2) {

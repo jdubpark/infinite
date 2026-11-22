@@ -156,7 +156,7 @@ test("blind indexes separate classes", () => {
   assert.equal(blindIndex(key, "task", "a"), blindIndex(key, "task", "a"));
   assert.match(blindIndex(key, "task", "a"), /^[0-9a-f]{64}$/);
   // A goal, a mission, and a legacy line id each have a class of their own, so equal values never share an index.
-  const classes = ["project", "task", "area", "goal", "mission", "legacy", "feature-map"] as const;
+  const classes = ["project", "task", "area", "goal", "mission", "legacy", "feature-map", "eval-set"] as const;
   assert.equal(new Set(classes.map(cls => blindIndex(key, cls, "a"))).size, classes.length);
   assert.throws(() => blindIndex(key, "run" as EvidenceIndexClass, "a"), TypeError);
 });

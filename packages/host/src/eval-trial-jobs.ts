@@ -8,12 +8,16 @@ import type { EvidenceDb, EvidenceTx } from "./evidence/types.js";
 import { trialSettings, validationSettings, TRIAL_MINUTES_DEFAULT, type TrialSettings } from "./eval-config.js";
 import type { GraderProbe } from "./eval-grader.js";
 import type { EvalProbe } from "./eval-identity.js";
-import { ACTIVE_PROJECT_JOBS_SQL, inWindow, JOB_EXPIRY_DAYS_MAX, JOB_TASKS_MAX, NEXT_TASK_SQL, type EvalJobRow } from "./eval-jobs.js";
+import { ACTIVE_PROJECT_JOBS_SQL, inWindow, JOB_EXPIRY_DAYS_MAX, JOB_TASKS_MAX, type EvalJobRow } from "./eval-jobs.js";
+import { applyComparison, comparisonJobSchema, pinsChanged, planComparison } from "./eval-compare-jobs.js";
+import { TRIAL_TASKS_SQL, type TrialTaskRow } from "./eval-sets.js";
 import { configRef, nextSlot, VOID_STREAK_PAUSE } from "./eval-trial-rules.js";
-import { advanceTask, jobSlots, jobTrialCount, openTrialCounts, trialCounts, trialsSince, type TrialCounts } from "./eval-trial-store.js";
 import {
-  VOID_ENDINGS, type BaselineJobRequest, type BaselineJobView, type EvalJobWait, type EvalRefusal,
-  type TrialConfiguration, type TrialEnding,
+  advanceTask, jobSlots, jobTrialCount, openTrialCounts, trialCounts, trialsSince, TRIAL_KEEP_DAYS_DEFAULT, type TrialCounts,
+} from "./eval-trial-store.js";
+import {
+  VOID_ENDINGS, type BaselineJobRequest, type BaselineJobView, type ComparisonJobRequest, type ComparisonJobView,
+  type EvalJobReason, type EvalJobWait, type EvalRefusal, type TrialConfiguration, type TrialEnding, type TrialJobPayload,
 } from "./eval-types.js";
 import { lineupProfiles, type TeamModelProfile } from "./team-types.js";
 import type { Config, Provider } from "./types.js";
@@ -23,7 +27,7 @@ import type { Config, Provider } from "./types.js";
 export const TRIAL_CONFIGURATIONS_MAX = 4, TRIALS_PER_TASK_DEFAULT = 3, TRIALS_PER_TASK_MAX = 5, TRIAL_TASKS_DEFAULT = 20,
   TRIAL_TASKS_MAX = 200, MAX_TRIALS_MAX = 1_000, TRIAL_SLOTS_FREE_MIN = 4, BASELINE_JOBS_MAX = 100;
 /** The baseline jobs in one status, oldest first, through `eval_jobs_status`. */
-export const BASELINE_JOBS_SQL = "SELECT * FROM eval_jobs WHERE status = ? AND kind = 'baseline' ORDER BY created_at, job_id LIMIT ?";
+export const BASELINE_JOBS_SQL = "SELECT * FROM eval_jobs WHERE status = ? AND kind != 'validate' ORDER BY created_at, job_id LIMIT ?";
 
 /** Rows of NEXT_TASK_SQL per read. The statement's own LIMIT is 200. */
 const TASK_PAGE = 200;
@@ -41,16 +45,18 @@ export type NextTrial =
       slot: number; attempt: number; settings: TrialSettings }
   | { kind: "wait"; jobId: string; waiting: EvalJobWait } | { kind: "none" };
 
-/** Sealed in `eval_jobs.payload` for a baseline job. */
-type BaselinePayload = { projectId: string; request: BaselineJobRequest; requestDigest: string; jobDigest: string };
-type CandidateRow = { task_id: string; origin: string; area_ref: string | null };
+type JobRequest = BaselineJobRequest | ComparisonJobRequest;
+type JobView = BaselineJobView | ComparisonJobView;
+/** The column `reported_at` is not in `EvalJobRow`; `SELECT *` carries it. */
+type ReportedRow = EvalJobRow & { reported_at?: string | null };
+type CandidateRow = Pick<TrialTaskRow, "task_id" | "origin" | "area_ref" | "holdout">;
 type Filter = { origins?: Set<string>; areas?: Set<string>; ids?: Set<string> };
 type Project = Config["projects"][number];
 /** `slots` asks the caller for the free session count, which is read outside the write. */
 type Pass = NextTrial | { kind: "slots" };
 
 const NONE: NextTrial = { kind: "none" };
-const EMPTY_COUNTS: TrialCounts = { plannedTasks: 0, plannedTrials: 0, tasks: 0, skipped: 0, started: 0, graded: 0, resolved: 0, ended: 0, void: 0, voidStreak: 0 };
+const EMPTY_COUNTS: TrialCounts = { plannedTasks: 0, plannedTrials: 0, tasks: 0, skipped: 0, started: 0, graded: 0, resolved: 0, ended: 0, void: 0, voidStreak: 0, reused: 0 };
 
 const profileSchema = z.object({ provider: z.enum(["claude", "codex", "grok", "opencode", "demo"]) }).passthrough();
 const configurationSchema = z.object({
@@ -114,26 +120,26 @@ export class TrialJobs {
     this.now = options.now ?? (() => new Date().toISOString());
   }
 
-  create(projectId: string, request: BaselineJobRequest, requestId: string): { created: boolean; job: BaselineJobView } | EvalRefusal {
-    const parsed = baselineJobSchema.safeParse(request);
+  create(projectId: string, request: JobRequest, requestId: string): { created: boolean; job: JobView } | EvalRefusal {
+    const parsed = request.kind === "baseline" ? baselineJobSchema.safeParse(request) : comparisonJobSchema.safeParse(request);
     if (!parsed.success) return refusal(400, "invalid-eval-request");
     const project = this.projectOf(projectId);
     if (project === undefined) return refusal(404, "unknown-project");
     const nowMs = Date.parse(this.now());
     const expiresMs = parsed.data.expiresAt === undefined ? nowMs + JOB_EXPIRY_DAYS_MAX * DAY_MS : Date.parse(parsed.data.expiresAt);
     if (expiresMs > nowMs + JOB_EXPIRY_DAYS_MAX * DAY_MS) return refusal(400, "invalid-eval-request");
-    const normalized: BaselineJobRequest = {
+    const normalized = {
       ...parsed.data,
       taskFilter: { ...parsed.data.taskFilter, maxTasks: parsed.data.taskFilter?.maxTasks ?? TRIAL_TASKS_DEFAULT },
       trialsPerTask: parsed.data.trialsPerTask ?? TRIALS_PER_TASK_DEFAULT,
       expiresAt: new Date(expiresMs).toISOString(),
-    };
+    } as JobRequest;
     // Digest the body as the client sent it, so a replay later still matches. The default expiry moves with the clock.
     const requestDigest = sha256(canonicalJson({ projectId, request: parsed.data }));
     return this.store.write(tx => {
       const existing = tx.get<EvalJobRow>("SELECT * FROM eval_jobs WHERE request_id = ?", requestId);
       if (existing !== undefined) {
-        const payload = tx.open<BaselinePayload>("eval_jobs", existing.job_id, existing.payload);
+        const payload = tx.open<TrialJobPayload>("eval_jobs", existing.job_id, existing.payload);
         if (payload.requestDigest !== requestDigest) return refusal(409, "request-conflict");
         return { created: false, job: this.viewOf(tx, existing) };
       }
@@ -142,45 +148,57 @@ export class TrialJobs {
       const approval = this.profileRefusal(project, normalized.configurations, found.settings.candidateProfiles);
       if (approval !== undefined) return approval;
       const ref = tx.index("project", projectId);
-      if (tx.get(ACTIVE_PROJECT_JOBS_SQL, ref, "baseline") !== undefined) return refusal(409, "job-active");
+      if (tx.get(ACTIVE_PROJECT_JOBS_SQL, ref, normalized.kind) !== undefined) return refusal(409, "job-active");
       const jobId = randomUUID();
       const at = this.now();
-      const payload: BaselinePayload = {
+      const comparison = normalized.kind === "baseline" ? undefined : planComparison(tx, { projectId, request: normalized, at });
+      if (comparison !== undefined && "code" in comparison) return comparison;
+      const payload: TrialJobPayload = {
         projectId,
         request: normalized,
         requestDigest,
         jobDigest: trialJobDigest(project, this.config, normalized.configurations),
+        ...(comparison === undefined ? {} : { tasks: comparison.tasks, pins: comparison.pins }),
+        ...(comparison?.subject === undefined ? {} : { subject: comparison.subject }),
       };
       tx.run(
         "INSERT INTO eval_jobs (job_id, project_ref, kind, status, reason, waiting, request_id, created_at, started_at, "
-        + "expires_at, finished_at, updated_at, payload) VALUES (?, ?, 'baseline', 'scheduled', NULL, NULL, ?, ?, NULL, ?, NULL, ?, ?)",
+        + "expires_at, finished_at, updated_at, payload) VALUES (?, ?, ?, 'scheduled', NULL, NULL, ?, ?, NULL, ?, NULL, ?, ?)",
         jobId,
         ref,
+        normalized.kind,
         requestId,
         at,
         normalized.expiresAt ?? at,
         at,
         tx.seal("eval_jobs", jobId, payload),
       );
-      openTrialCounts(tx, jobId, this.plan(tx, ref, normalized));
+      if (comparison === undefined) {
+        openTrialCounts(tx, jobId, this.plan(tx, ref, normalized));
+      } else {
+        openTrialCounts(tx, jobId, comparison.planned);
+        const outcome = applyComparison(tx, {
+          jobId, projectId, request: normalized as ComparisonJobRequest, plan: comparison, keepDays: TRIAL_KEEP_DAYS_DEFAULT, at,
+        });
+        if (outcome === "complete") finish(tx, jobId, at, "completed", "done");
+      }
       return { created: true, job: this.viewOf(tx, this.rowOf(tx, jobId) as EvalJobRow) };
     });
   }
 
-  /** The views of the baseline rows of one page, with one counts read for all of them. */
-  views(db: EvidenceDb, rows: readonly EvalJobRow[]): Map<string, BaselineJobView> {
-    const baseline = rows.filter(row => row.kind === "baseline");
+  /** The views of the baseline, compare, and confirm rows of one page, with one counts read for all of them. */
+  views(db: EvidenceDb, rows: readonly EvalJobRow[]): Map<string, JobView> {
+    const baseline = rows.filter(row => row.kind !== "validate");
     const counts = trialCounts(db, baseline.map(row => row.job_id));
     const refs = this.refsOf(db);
-    const views = new Map<string, BaselineJobView>();
+    const views = new Map<string, JobView>();
     for (const row of baseline) {
       const projectId = refs.get(row.project_ref) ?? null;
       const project = projectId === null ? undefined : this.projectOf(projectId);
       const count = counts.get(row.job_id) ?? EMPTY_COUNTS;
-      views.set(row.job_id, {
+      const common = {
         jobId: row.job_id,
         projectId,
-        kind: "baseline",
         status: row.status,
         reason: row.reason,
         waiting: row.waiting,
@@ -189,8 +207,21 @@ export class TrialJobs {
         expiresAt: row.expires_at,
         finishedAt: row.finished_at,
         tasks: { planned: count.plannedTasks, reached: count.tasks, skipped: count.skipped },
-        trials: { planned: count.plannedTrials, started: count.started, graded: count.graded, resolved: count.resolved, ended: count.ended, void: count.void },
         dailyCap: project?.team?.eval?.trialsPerDay ?? null,
+      };
+      const trials = { planned: count.plannedTrials, started: count.started, graded: count.graded, resolved: count.resolved, ended: count.ended, void: count.void };
+      if (row.kind === "baseline") {
+        views.set(row.job_id, { ...common, kind: "baseline", trials });
+        continue;
+      }
+      // A result shows only from the stored report's time, so an interim view never leaks a figure. No payload is opened.
+      const reported = (row as ReportedRow).reported_at != null;
+      views.set(row.job_id, {
+        ...common,
+        kind: row.kind === "confirm" ? "confirm" : "compare",
+        set: row.kind === "confirm" ? "holdout" : "dev",
+        trials: { ...trials, resolved: reported ? count.resolved : null, reused: count.reused },
+        report: reported ? "ready" : row.finished_at === null ? null : "pending",
       });
     }
     return views;
@@ -239,7 +270,7 @@ export class TrialJobs {
     return this.store.read(db => {
       const row = db.get<{ payload: string }>("SELECT payload FROM eval_jobs WHERE job_id = ?", jobId);
       if (row === undefined) return undefined;
-      const payload = db.open<BaselinePayload>("eval_jobs", jobId, row.payload);
+      const payload = db.open<TrialJobPayload>("eval_jobs", jobId, row.payload);
       return this.pinned(projectId, payload.request.configurations)?.digest;
     });
   }
@@ -274,7 +305,7 @@ export class TrialJobs {
       setJob(tx, row.job_id, at, { status: "blocked", reason: "configuration-changed", waiting: null });
       return NONE;
     }
-    const payload = tx.open<BaselinePayload>("eval_jobs", row.job_id, row.payload);
+    const payload = tx.open<TrialJobPayload>("eval_jobs", row.job_id, row.payload);
     const request = payload.request;
     if (Date.parse(row.expires_at) <= nowMs) {
       finish(tx, row.job_id, at, "expired", "expired");
@@ -283,6 +314,10 @@ export class TrialJobs {
     const wallSpent = row.started_at !== null && nowMs - Date.parse(row.started_at) >= request.limits.maxWallMinutes * 60_000;
     if (jobTrialCount(tx, row.job_id) >= request.limits.maxTrials || wallSpent) {
       finish(tx, row.job_id, at, "completed", "limit-reached");
+      return NONE;
+    }
+    if (row.kind !== "baseline" && payload.pins !== undefined && pinsChanged(tx, request.configurations, payload.pins, at)) {
+      finish(tx, row.job_id, at, "completed", "identity-changed");
       return NONE;
     }
     const pinned = this.pinned(projectId, request.configurations);
@@ -300,7 +335,8 @@ export class TrialJobs {
     if (gates.grader.storage !== true || gates.identity.storage !== true) return this.waitOn(tx, row, "storage");
     if (gates.trialLive) return this.waitOn(tx, row, "another-job");
     if (request.configurations.some(configuration => gates.limited.has(configuration.profile.provider))) return this.waitOn(tx, row, "provider-limit");
-    return this.scan(tx, row, projectId, request, pinned.settings, free, nowMs);
+    if (row.kind !== "baseline") return this.scanFixed(tx, row, projectId, payload, pinned.settings, free, nowMs);
+    return this.scan(tx, row, projectId, request as BaselineJobRequest, pinned.settings, free, nowMs);
   }
 
   /**
@@ -328,7 +364,7 @@ export class TrialJobs {
         finish(tx, row.job_id, at, "completed", "done");
         return NONE;
       }
-      const page = tx.all<CandidateRow>(NEXT_TASK_SQL, row.project_ref, "valid", cursor ?? "");
+      const page = tx.all<TrialTaskRow>(TRIAL_TASKS_SQL, row.project_ref, cursor ?? "");
       const index = page.findIndex(candidate => selected(candidate, filter));
       if (index === -1) {
         if (page.length === TASK_PAGE) {
@@ -352,19 +388,72 @@ export class TrialJobs {
         continue;
       }
       if (index > 0) setJob(tx, row.job_id, at, { cursor });
-      if (free === undefined) return { kind: "slots" };
-      if (free < TRIAL_SLOTS_FREE_MIN) return this.waitOn(tx, row, "session-slots");
-      if (trialsSince(tx, projectId, utcDayStart(nowMs)) >= settings.trialsPerDay) return this.waitOn(tx, row, "daily-cap");
-      const configuration = request.configurations.find(item => configRef(item) === pick.configRef);
-      if (configuration === undefined) return NONE;
-      const started: Record<string, SQLInputValue> = row.status === "scheduled" ? { status: "running", started_at: at } : {};
-      if (row.waiting !== null) started.waiting = null;
-      if (Object.keys(started).length > 0) setJob(tx, row.job_id, at, started);
-      return {
-        kind: "trial", jobId: row.job_id, projectId, taskId: candidate.task_id, configuration,
-        configRef: pick.configRef, slot: pick.slot, attempt: pick.attempt, settings,
-      };
+      return this.handOut(tx, row, projectId, request.configurations, settings, free, nowMs, candidate.task_id, pick);
     }
+  }
+
+  /**
+   * The comparison scan: the sealed task list in order, after the cursor (the last finished task). A task that is no longer
+   * valid counts as skipped. The end of the list finishes the job. One call reads at most TASK_PAGE tasks.
+   */
+  private scanFixed(
+    tx: EvidenceTx,
+    row: EvalJobRow,
+    projectId: string,
+    payload: TrialJobPayload,
+    settings: TrialSettings,
+    free: number | undefined,
+    nowMs: number,
+  ): Pass {
+    const at = this.now();
+    const tasks = payload.tasks ?? [];
+    const request = payload.request;
+    const trialsPerTask = request.trialsPerTask ?? TRIALS_PER_TASK_DEFAULT;
+    const configRefs = request.configurations.map(configuration => configRef(configuration));
+    const after = row.cursor;
+    const first = after === null ? 0 : tasks.findIndex(taskId => compareText(taskId, after) > 0);
+    if (first === -1) {
+      finish(tx, row.job_id, at, "completed", "done");
+      return NONE;
+    }
+    const last = Math.min(tasks.length, first + TASK_PAGE);
+    for (let index = first; index < last; index += 1) {
+      const taskId = tasks[index] as string;
+      const valid = tx.get("SELECT 1 FROM eval_tasks WHERE task_id = ? AND state = 'valid'", taskId) !== undefined;
+      const pick = valid ? nextSlot({ tasks: [taskId], configRefs, trialsPerTask, rows: jobSlots(tx, row.job_id, taskId) }) : undefined;
+      if (pick !== undefined) return this.handOut(tx, row, projectId, request.configurations, settings, free, nowMs, taskId, pick);
+      advanceTask(tx, row.job_id, !valid);
+      setJob(tx, row.job_id, at, { cursor: taskId });
+    }
+    if (last === tasks.length) finish(tx, row.job_id, at, "completed", "done");
+    return NONE;
+  }
+
+  /** The gates that need a free session count, then the trial for one slot. */
+  private handOut(
+    tx: EvidenceTx,
+    row: EvalJobRow,
+    projectId: string,
+    configurations: readonly TrialConfiguration[],
+    settings: TrialSettings,
+    free: number | undefined,
+    nowMs: number,
+    taskId: string,
+    pick: { configRef: string; slot: number; attempt: number },
+  ): Pass {
+    const at = this.now();
+    if (free === undefined) return { kind: "slots" };
+    if (free < TRIAL_SLOTS_FREE_MIN) return this.waitOn(tx, row, "session-slots");
+    if (trialsSince(tx, projectId, utcDayStart(nowMs)) >= settings.trialsPerDay) return this.waitOn(tx, row, "daily-cap");
+    const configuration = configurations.find(item => configRef(item) === pick.configRef);
+    if (configuration === undefined) return NONE;
+    const started: Record<string, SQLInputValue> = row.status === "scheduled" ? { status: "running", started_at: at } : {};
+    if (row.waiting !== null) started.waiting = null;
+    if (Object.keys(started).length > 0) setJob(tx, row.job_id, at, started);
+    return {
+      kind: "trial", jobId: row.job_id, projectId, taskId, configuration,
+      configRef: pick.configRef, slot: pick.slot, attempt: pick.attempt, settings,
+    };
   }
 
   /** The settings and digest a job pins now, or undefined while the trial settings are incomplete. */
@@ -389,14 +478,14 @@ export class TrialJobs {
   }
 
   /** Planned tasks: the valid tasks the filter selects, at most maxTasks. Planned trials: tasks x configurations x trialsPerTask, at most maxTrials. */
-  private plan(db: EvidenceDb, ref: string, request: BaselineJobRequest): { tasks: number; trials: number } {
+  private plan(db: EvidenceDb, ref: string, request: JobRequest): { tasks: number; trials: number } {
     const filter = filterOf(db, request);
     const maxTasks = request.taskFilter?.maxTasks ?? TRIAL_TASKS_DEFAULT;
     let tasks = 0;
     let after = "";
     let page: CandidateRow[];
     do {
-      page = db.all<CandidateRow>(NEXT_TASK_SQL, ref, "valid", after);
+      page = db.all<TrialTaskRow>(TRIAL_TASKS_SQL, ref, after);
       for (const row of page) {
         after = row.task_id;
         if (tasks < maxTasks && selected(row, filter)) tasks += 1;
@@ -411,9 +500,9 @@ export class TrialJobs {
     return { kind: "wait", jobId: row.job_id, waiting };
   }
 
-  private viewOf(db: EvidenceDb, row: EvalJobRow): BaselineJobView {
+  private viewOf(db: EvidenceDb, row: EvalJobRow): JobView {
     const view = this.views(db, [row]).get(row.job_id);
-    if (view === undefined) throw new Error("A baseline job row has no view.");
+    if (view === undefined) throw new Error("A trial job row has no view.");
     return view;
   }
 
@@ -435,7 +524,7 @@ function refusal(status: EvalRefusal["status"], code: EvalRefusal["code"]): Eval
   return { status, code };
 }
 
-function filterOf(db: EvidenceDb, request: BaselineJobRequest): Filter {
+function filterOf(db: EvidenceDb, request: JobRequest): Filter {
   const filter = request.taskFilter;
   return {
     origins: filter?.origins === undefined ? undefined : new Set(filter.origins),
@@ -446,6 +535,7 @@ function filterOf(db: EvidenceDb, request: BaselineJobRequest): Filter {
 }
 
 function selected(candidate: CandidateRow, filter: Filter): boolean {
+  if (candidate.holdout === 1) return false;
   if (filter.origins !== undefined && !filter.origins.has(candidate.origin)) return false;
   if (filter.areas !== undefined && (candidate.area_ref === null || !filter.areas.has(candidate.area_ref))) return false;
   if (filter.ids !== undefined && !filter.ids.has(candidate.task_id)) return false;
@@ -463,7 +553,7 @@ function setJob(tx: EvidenceTx, jobId: string, at: string, values: Record<string
   );
 }
 
-function finish(tx: EvidenceTx, jobId: string, at: string, status: "completed" | "expired", reason: "done" | "limit-reached" | "expired"): void {
+function finish(tx: EvidenceTx, jobId: string, at: string, status: "completed" | "expired", reason: Extract<EvalJobReason, "done" | "limit-reached" | "expired" | "identity-changed">): void {
   setJob(tx, jobId, at, { status, reason, waiting: null, finished_at: at });
 }
 

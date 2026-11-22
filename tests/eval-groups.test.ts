@@ -30,6 +30,7 @@ import {
   readMaterial,
   reconcileBatch,
 } from "../packages/host/src/eval-store.js";
+import { TRIAL_TASKS_SQL, drawsHoldout } from "../packages/host/src/eval-sets.js";
 import type { CaptureStart, Capsule, EvalFeatures } from "../packages/host/src/eval-types.js";
 import { insertMined, minedTaskId, placeMined, type MinedCandidate } from "../packages/host/src/eval-miner.js";
 import { landingSignalId } from "../packages/host/src/outcome-signals.js";
@@ -530,5 +531,176 @@ test("the hot statements read through an index", () => {
     }
   } finally {
     f.cleanup();
+  }
+});
+
+type SetRow = { holdout: number; set_at: string | null; exposed: number };
+
+function setOf(db: EvidenceDb, group: string): SetRow {
+  const row = db.get<SetRow>("SELECT holdout, set_at, exposed FROM eval_groups WHERE group_id = ?", group);
+  assert.ok(row);
+  return row;
+}
+
+/** A run id whose run group draws the wanted set under this store's vault key. */
+function runDrawing(tx: EvidenceTx, holdout: boolean, skip: string[] = []): string {
+  for (let n = 0; n < 500; n++) {
+    const runId = `draw-run-${n}`;
+    if (skip.includes(runId)) continue;
+    if (drawsHoldout(tx.index("eval-set", runGroupId(runId))) === holdout) return runId;
+  }
+  throw new Error("no run id drew the wanted set");
+}
+
+/** A commit whose mined group draws the wanted set. */
+function commitDrawing(tx: EvidenceTx, holdout: boolean, skip: string[] = []): string {
+  for (let n = 0; n < 500; n++) {
+    const commit = n.toString(16).padStart(40, "9");
+    if (skip.includes(commit)) continue;
+    const id = minedTaskId(tx.index("project", PROJECT), tx.index("eval-commit", commit));
+    if (drawsHoldout(tx.index("eval-set", id)) === holdout) return commit;
+  }
+  throw new Error("no commit drew the wanted set");
+}
+
+function validate(tx: EvidenceTx, ...taskIds: string[]): void {
+  for (const id of taskIds) tx.run("UPDATE eval_tasks SET state = 'valid' WHERE task_id = ?", id);
+}
+
+function holdoutRows(db: EvidenceDb, root: string): number {
+  return db.get<{ n: number }>(
+    "SELECT COALESCE(SUM(holdout), 0) AS n FROM eval_groups WHERE root_id = ?",
+    root,
+  )?.n ?? 0;
+}
+
+test("a new group draws its set when it is created", () => {
+  const { store, cleanup } = open();
+  try {
+    store.write(tx => {
+      const holdRun = runDrawing(tx, true);
+      const devRun = runDrawing(tx, false);
+      captureTx(tx, holdRun, ["a.ts"], CAPTURED_AT);
+      captureTx(tx, devRun, ["b.ts"], CAPTURED_AT);
+      const hold = setOf(tx, runGroupId(holdRun));
+      assert.equal(hold.holdout, 1);
+      assert.equal(hold.set_at, CAPTURED_AT);
+      const dev = setOf(tx, runGroupId(devRun));
+      assert.equal(dev.holdout, 0);
+      assert.equal(dev.set_at, null);
+      const holdCommit = commitDrawing(tx, true);
+      const devCommit = commitDrawing(tx, false);
+      for (const commit of [holdCommit, devCommit]) {
+        const id = insertMinedTx(tx, commit, ["m.ts"], NOW);
+        const row = setOf(tx, id);
+        const drawn = drawsHoldout(tx.index("eval-set", id));
+        assert.equal(row.holdout, drawn ? 1 : 0);
+        assert.equal(row.set_at, drawn ? NOW : null);
+      }
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test("no group spans both sets", () => {
+  const { store, cleanup } = open();
+  try {
+    const used: string[] = [];
+    store.write(tx => {
+      const holdRun = runDrawing(tx, true, used);
+      used.push(holdRun);
+      const captured = captureTx(tx, holdRun, ["a.ts"], CAPTURED_AT);
+      const devCommit = commitDrawing(tx, false);
+      const mined = insertMinedTx(tx, devCommit, ["b.ts"], NOW);
+      validate(tx, captured, mined);
+      const root = mergeRoots(tx, [runGroupId(holdRun), mined], false);
+      assert.equal(holdoutRows(tx, root), 0);
+      const rows = tx.all<{ task_id: string; holdout: number }>(TRIAL_TASKS_SQL, tx.index("project", PROJECT), "");
+      assert.equal(rows.length, 2);
+      for (const row of rows) assert.equal(row.holdout, 0);
+    });
+    store.write(tx => {
+      const first = runDrawing(tx, true, used);
+      const second = runDrawing(tx, true, [...used, first]);
+      used.push(first, second);
+      captureTx(tx, first, ["c.ts"], CAPTURED_AT);
+      captureTx(tx, second, ["d.ts"], APPROVED_AT);
+      const earlier = [first, second]
+        .map(id => setOf(tx, runGroupId(id)).set_at ?? "")
+        .sort()[0];
+      const root = mergeRoots(tx, [runGroupId(first), runGroupId(second)], false);
+      const row = setOf(tx, root);
+      assert.equal(row.holdout, 1);
+      assert.equal(row.set_at, earlier);
+      assert.equal(holdoutRows(tx, root), 1);
+    });
+    store.write(tx => {
+      const third = runDrawing(tx, true, used);
+      const fourth = runDrawing(tx, true, [...used, third]);
+      captureTx(tx, third, ["e.ts"], CAPTURED_AT);
+      captureTx(tx, fourth, ["f.ts"], CAPTURED_AT);
+      const root = mergeRoots(tx, [runGroupId(third), runGroupId(fourth)], true);
+      assert.equal(setOf(tx, root).holdout, 0);
+      assert.equal(holdoutRows(tx, root), 0);
+      assert.equal(devOnlyOf(tx, root), 1);
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test("an exposed part moves the whole root to dev", () => {
+  const { store, cleanup } = open();
+  try {
+    store.write(tx => {
+      const first = runDrawing(tx, true);
+      const second = runDrawing(tx, true, [first]);
+      captureTx(tx, first, ["a.ts"], CAPTURED_AT);
+      captureTx(tx, second, ["b.ts"], CAPTURED_AT);
+      tx.run("UPDATE eval_groups SET exposed = 1, holdout = 0, set_at = NULL WHERE group_id = ?", runGroupId(second));
+      const root = mergeRoots(tx, [runGroupId(first), runGroupId(second)], false);
+      const row = setOf(tx, root);
+      assert.equal(row.holdout, 0);
+      assert.equal(row.exposed, 1);
+      assert.equal(holdoutRows(tx, root), 0);
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test("promotion and mining write the prompt origin and kind", () => {
+  const { store, cleanup } = open();
+  try {
+    const fields = (db: EvidenceDb, id: string): { prompt_origin: string | null; kind: string | null } => {
+      const row = db.get<{ prompt_origin: string | null; kind: string | null }>(
+        "SELECT prompt_origin, kind FROM eval_tasks WHERE task_id = ?",
+        id,
+      );
+      assert.ok(row);
+      return row;
+    };
+    store.write(tx => {
+      const captured = captureTx(tx, RUN, ["a.ts"], CAPTURED_AT);
+      approveTx(tx, captured, APPROVED_AT);
+      promoteTx(tx);
+      const promoted = fields(tx, captured);
+      assert.equal(promoted.prompt_origin, "assignment");
+      assert.equal(promoted.kind, FEATURES.kind);
+      const commit = commitDrawing(tx, false);
+      const mined = insertMinedTx(tx, commit, ["m.ts"], NOW);
+      const row = fields(tx, mined);
+      assert.equal(row.prompt_origin, "commit-message");
+      assert.equal(row.kind, FEATURES.kind);
+      const rejectedCommit = "1".repeat(40);
+      insertMined(tx, { kind: "rejected", projectId: PROJECT, commit: rejectedCommit, reason: "too-large" }, NOW);
+      const rejectedId = minedTaskId(tx.index("project", PROJECT), tx.index("eval-commit", rejectedCommit));
+      const none = fields(tx, rejectedId);
+      assert.equal(none.prompt_origin, null);
+      assert.equal(none.kind, null);
+    });
+  } finally {
+    cleanup();
   }
 });

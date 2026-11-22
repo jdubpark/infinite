@@ -1,12 +1,14 @@
 import type { EvidenceStore } from "./evidence/store.js";
 import { EvidenceError, type EvidenceDb, type EvidenceModule, type EvidenceTx } from "./evidence/types.js";
-import { configRef, type SlotRow } from "./eval-trial-rules.js";
+import { configRef, TRIAL_HARNESS_VERSION, trialPromptVersion, type SlotRow } from "./eval-trial-rules.js";
 import { VOID_ENDINGS, type TrialConfiguration, type TrialEnding, type TrialGrade, type TrialState } from "./eval-types.js";
 
 // The trial store: one row per trial, its sealed payload, its patch, and one counts row per replay job.
 
 export const EVAL_TRIALS_MODULE = "eval-trials", TRIAL_KEEP_DAYS_DEFAULT = 365, TRIAL_PATCH_KEEP_DAYS = 90,
   TRIAL_PATCH_MAX_BYTES = 1_048_576, TRIAL_PATCHES_HOST_MAX_BYTES = 268_435_456, TRIAL_SWEEP_BATCH = 100, LIVE_TRIALS_MAX = 8;
+
+export const REUSE_DAYS = 30, REPORT_KEEP_DAYS = 365, JOB_ROWS_MAX = 5_000;
 
 const TRIAL_COUNTS_IDS_MAX = 100;
 const DAY_MS = 86_400_000;
@@ -28,13 +30,48 @@ export const SCHEMA_TRIALS_V1 = [
   "CREATE INDEX IF NOT EXISTS eval_trial_patches_expiry ON eval_trial_patches (expires_at)",
   "CREATE TABLE IF NOT EXISTS eval_trial_totals (id INTEGER PRIMARY KEY CHECK (id = 1), patch_bytes INTEGER NOT NULL)",
 ];
+export const SCHEMA_TRIALS_V2 = [
+  "ALTER TABLE eval_trials ADD COLUMN prompt_version TEXT",
+  "ALTER TABLE eval_trials ADD COLUMN reused_from TEXT",
+  "ALTER TABLE eval_trials ADD COLUMN tokens INTEGER",
+  "ALTER TABLE eval_trials ADD COLUMN spent_usd REAL",
+  "ALTER TABLE eval_trials ADD COLUMN cost TEXT",
+  "ALTER TABLE eval_trial_counts ADD COLUMN reused INTEGER NOT NULL DEFAULT 0",
+  "CREATE INDEX IF NOT EXISTS eval_trials_reuse ON eval_trials (task_id, config_ref, ended_at) WHERE state = 'final' AND reused_from IS NULL",
+  "CREATE INDEX IF NOT EXISTS eval_trials_graded ON eval_trials (project_ref, task_id, resolved, ended_at) WHERE ending = 'graded' AND reused_from IS NULL",
+  `CREATE TABLE IF NOT EXISTS eval_reports (job_id TEXT PRIMARY KEY, project_ref TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+    generated_at TEXT NOT NULL, expires_at TEXT NOT NULL, payload TEXT NOT NULL)`,
+  "CREATE INDEX IF NOT EXISTS eval_reports_expiry ON eval_reports (expires_at)",
+  `CREATE TABLE IF NOT EXISTS eval_subjects (project_ref TEXT NOT NULL, subject TEXT NOT NULL, job_id TEXT NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY (project_ref, subject))`,
+  `CREATE TABLE IF NOT EXISTS eval_priors (prior_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, project_ref TEXT NOT NULL, configuration INTEGER NOT NULL,
+    profile_id TEXT NOT NULL, provider TEXT NOT NULL, model TEXT, effort TEXT, profile_epoch INTEGER NOT NULL, prompt_version TEXT NOT NULL,
+    area_ref TEXT, kind TEXT, prompt_origin TEXT NOT NULL, tasks INTEGER NOT NULL, trials INTEGER NOT NULL, resolved INTEGER NOT NULL,
+    generated_at TEXT NOT NULL, expires_at TEXT NOT NULL)`,
+  "CREATE INDEX IF NOT EXISTS eval_priors_project ON eval_priors (project_ref, generated_at)",
+  "CREATE INDEX IF NOT EXISTS eval_priors_expiry ON eval_priors (expires_at)",
+];
 export const LIVE_TRIALS_SQL = "SELECT trial_id, job_id, task_id, state FROM eval_trials WHERE state != 'final' ORDER BY state, created_at LIMIT 8";
 export const JOB_SLOTS_SQL = "SELECT task_id, config_ref, slot, attempt, state, ending FROM eval_trials WHERE job_id = ? AND task_id = ?";
-export const JOB_TRIALS_SQL = "SELECT count(*) AS n FROM eval_trials WHERE job_id = ?";
-export const PROJECT_DAY_SQL = "SELECT count(*) AS n FROM eval_trials WHERE project_ref = ? AND created_at >= ?";
+export const JOB_TRIALS_SQL = "SELECT count(*) AS n FROM eval_trials WHERE job_id = ? AND reused_from IS NULL";
+export const PROJECT_DAY_SQL = "SELECT count(*) AS n FROM eval_trials WHERE project_ref = ? AND created_at >= ? AND reused_from IS NULL";
 export const TRIALS_EXPIRED_SQL = "SELECT trial_id FROM eval_trials WHERE expires_at < ? ORDER BY expires_at LIMIT ?";
 export const PATCHES_EXPIRED_SQL = "SELECT trial_id, bytes FROM eval_trial_patches WHERE expires_at < ? ORDER BY expires_at LIMIT ?";
-export const TRIAL_SESSIONS_SQL = "SELECT trial_id, session_id FROM eval_trials WHERE session_id IS NOT NULL AND ended_at < ? ORDER BY ended_at LIMIT ?";
+export const TRIAL_SESSIONS_SQL = "SELECT trial_id, session_id, ended_at FROM eval_trials WHERE session_id IS NOT NULL AND ended_at < ? ORDER BY ended_at LIMIT ?";
+export const REUSE_SQL = "SELECT t.trial_id, t.ending, t.resolved, t.isolation, t.config_id, t.profile_epoch, t.tokens, t.spent_usd, t.cost, "
+  + "t.started_at, t.ended_at FROM eval_trials t JOIN eval_jobs j ON j.job_id = t.job_id WHERE t.task_id = ? AND t.config_ref = ? "
+  + "AND t.state = 'final' AND t.reused_from IS NULL AND t.ended_at >= ? AND t.harness = ? AND t.prompt_version = ? AND t.profile_epoch = ? "
+  + "AND t.ending NOT IN ('void-limit', 'void-host', 'void-owner') AND j.kind IN ('baseline', 'compare') ORDER BY t.ended_at DESC, t.trial_id LIMIT ?";
+export const JOB_ROWS_SQL = "SELECT task_id, config_ref, slot, attempt, state, ending, resolved, isolation, config_id, profile_epoch, prompt_version, "
+  + "tokens, spent_usd, cost, started_at, ended_at, reused_from FROM eval_trials WHERE job_id = ? LIMIT 5001";
+
+export type TrialCost = "complete" | "partial" | "none";
+export type ReuseSource = { trialId: string; ending: TrialEnding; resolved: boolean; isolation: "isolated" | "none"; configId: string | null;
+  profileEpoch: number; tokens: number | null; spentUsd: number | null; cost: TrialCost | null; startedAt: string | null; endedAt: string };
+export type JobTrialRow = { taskId: string; configRef: string; slot: number; attempt: number; state: TrialState; ending: TrialEnding | null;
+  resolved: boolean | null; isolation: "isolated" | "none" | null; configId: string | null; profileEpoch: number | null;
+  promptVersion: string | null; tokens: number | null; spentUsd: number | null; cost: TrialCost | null;
+  startedAt: string | null; endedAt: string | null; reused: boolean };
 
 export type TrialPayload = { projectId: string; taskId: string; configuration: TrialConfiguration;
   probes?: { fetch: "refused" | "open" | "skipped"; sourceClean: boolean }; grade?: TrialGrade;
@@ -47,7 +84,7 @@ export type NewTrial = Pick<TrialRow, "trialId" | "jobId" | "taskId" | "configRe
 export type TrialFinal = { grade: TrialGrade; configId: string | null; profileEpoch: number | null; sessionId: string | null;
   probes?: TrialPayload["probes"]; patch?: Buffer | "too-large" | "secret-shaped"; patchKeepDays: number };
 export type TrialCounts = { plannedTasks: number; plannedTrials: number; tasks: number; skipped: number;
-  started: number; graded: number; resolved: number; ended: number; void: number; voidStreak: number };
+  started: number; graded: number; resolved: number; ended: number; void: number; voidStreak: number; reused: number };
 
 type TrialSqlRow = { trial_id: string; job_id: string; task_id: string; project_ref: string; config_ref: string; config_id: string | null;
   profile_epoch: number | null; harness: number; slot: number; attempt: number; state: TrialState; ending: TrialEnding | null;
@@ -58,12 +95,16 @@ const addDays = (at: string, days: number) => new Date(Date.parse(at) + days * D
 export function evalTrialsModule(_store: EvidenceStore, _now: () => string): EvidenceModule {
   return {
     name: EVAL_TRIALS_MODULE,
-    version: 1,
-    readVersion: 1,
+    version: 2,
+    readVersion: 2,
     migrate(tx, from) {
-      if (from > 0) return;
-      for (const statement of SCHEMA_TRIALS_V1) tx.exec(statement);
-      tx.run("INSERT OR IGNORE INTO eval_trial_totals (id, patch_bytes) VALUES (1, 0)");
+      if (from === 0) {
+        for (const statement of SCHEMA_TRIALS_V1) tx.exec(statement);
+        tx.run("INSERT OR IGNORE INTO eval_trial_totals (id, patch_bytes) VALUES (1, 0)");
+      }
+      if (from < 2) {
+        for (const statement of SCHEMA_TRIALS_V2) tx.exec(statement);
+      }
     },
   };
 }
@@ -78,10 +119,11 @@ export function insertTrial(tx: EvidenceTx, trial: NewTrial, at: string): "inser
   const payload: TrialPayload = { projectId: trial.projectId, taskId: trial.taskId, configuration: trial.configuration };
   const changes = tx.run(
     "INSERT INTO eval_trials (trial_id, job_id, task_id, project_ref, config_ref, config_id, profile_epoch, harness, slot, attempt, "
-    + "state, ending, resolved, isolation, session_id, created_at, started_at, ended_at, expires_at, payload) "
-    + "VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, 'preparing', NULL, NULL, NULL, NULL, ?, NULL, NULL, ?, ?) ON CONFLICT DO NOTHING",
+    + "state, ending, resolved, isolation, session_id, created_at, started_at, ended_at, expires_at, payload, prompt_version) "
+    + "VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, 'preparing', NULL, NULL, NULL, NULL, ?, NULL, NULL, ?, ?, ?) ON CONFLICT DO NOTHING",
     trial.trialId, trial.jobId, trial.taskId, tx.index("project", trial.projectId), configRef(trial.configuration), trial.harness,
     trial.slot, trial.attempt, at, addDays(at, trial.keepDays), tx.seal("eval_trials", trial.trialId, payload),
+    trialPromptVersion(trial.configuration.profile),
   ).changes;
   return changes === 1 ? "inserted" : "exists";
 }
@@ -151,8 +193,48 @@ export function advanceTask(tx: EvidenceTx, jobId: string, skipped: boolean): vo
   tx.run("UPDATE eval_trial_counts SET tasks = tasks + 1, skipped = skipped + ? WHERE job_id=?", skipped ? 1 : 0, jobId);
 }
 
-export function clearTrialSession(tx: EvidenceTx, trialId: string): void {
-  tx.run("UPDATE eval_trials SET session_id=NULL WHERE trial_id=?", trialId);
+/** Clears the session id. With a cost it also records the session's tokens and cost; `"none"` records that the ledger had none. */
+export function clearTrialSession(tx: EvidenceTx, trialId: string, cost?: { tokens: number; usd: number; complete: boolean } | "none"): void {
+  if (cost === undefined) {
+    tx.run("UPDATE eval_trials SET session_id=NULL WHERE trial_id=?", trialId);
+    return;
+  }
+  if (cost === "none") {
+    tx.run("UPDATE eval_trials SET session_id=NULL, tokens=NULL, spent_usd=NULL, cost='none' WHERE trial_id=?", trialId);
+    return;
+  }
+  tx.run("UPDATE eval_trials SET session_id=NULL, tokens=?, spent_usd=?, cost=? WHERE trial_id=?",
+    cost.tokens, cost.usd, cost.complete ? "complete" : "partial", trialId);
+}
+
+/** Final, non-void original trials of baseline and compare jobs that a new compare job may copy, newest first. */
+export function reusable(db: EvidenceDb, input: { taskId: string; configRef: string; promptVersion: string; profileEpoch: number;
+  harness: number; since: string; limit: number }): ReuseSource[] {
+  return db.all<{ trial_id: string; ending: TrialEnding; resolved: number | null; isolation: "isolated" | "none" | null; config_id: string | null;
+    profile_epoch: number; tokens: number | null; spent_usd: number | null; cost: TrialCost | null; started_at: string | null; ended_at: string }>(
+    REUSE_SQL, input.taskId, input.configRef, input.since, input.harness, input.promptVersion, input.profileEpoch, input.limit,
+  ).map(row => ({
+    trialId: row.trial_id, ending: row.ending, resolved: row.resolved === 1, isolation: row.isolation ?? "none", configId: row.config_id,
+    profileEpoch: row.profile_epoch, tokens: row.tokens, spentUsd: row.spent_usd, cost: row.cost, startedAt: row.started_at, endedAt: row.ended_at,
+  }));
+}
+
+/** Writes a final copy row of a reused trial into one slot of a job. It counts as `reused` and nothing else. */
+export function insertCopy(tx: EvidenceTx, copy: { trialId: string; jobId: string; taskId: string; projectId: string;
+  configuration: TrialConfiguration; slot: number; promptVersion: string; source: ReuseSource; keepDays: number }, at: string): void {
+  const payload: TrialPayload = { projectId: copy.projectId, taskId: copy.taskId, configuration: copy.configuration };
+  const source = copy.source;
+  const changes = tx.run(
+    "INSERT INTO eval_trials (trial_id, job_id, task_id, project_ref, config_ref, config_id, profile_epoch, harness, slot, attempt, "
+    + "state, ending, resolved, isolation, session_id, created_at, started_at, ended_at, expires_at, payload, "
+    + "prompt_version, reused_from, tokens, spent_usd, cost) "
+    + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'final', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+    copy.trialId, copy.jobId, copy.taskId, tx.index("project", copy.projectId), configRef(copy.configuration), source.configId,
+    source.profileEpoch, TRIAL_HARNESS_VERSION, copy.slot, source.ending, source.resolved ? 1 : 0, source.isolation, at,
+    source.startedAt, source.endedAt, addDays(at, copy.keepDays), tx.seal("eval_trials", copy.trialId, payload),
+    copy.promptVersion, source.trialId, source.tokens, source.spentUsd, source.cost,
+  ).changes;
+  if (changes === 1) tx.run("UPDATE eval_trial_counts SET reused = reused + 1 WHERE job_id=?", copy.jobId);
 }
 
 function trialOf(db: EvidenceDb, row: TrialSqlRow): TrialRow {
@@ -205,23 +287,38 @@ export function trialCounts(db: EvidenceDb, jobIds: readonly string[]): Map<stri
   if (jobIds.length > TRIAL_COUNTS_IDS_MAX) throw new RangeError(`At most ${TRIAL_COUNTS_IDS_MAX} jobs per count.`);
   const marks = jobIds.map(() => "?").join(", ");
   const rows = db.all<{ job_id: string; planned_tasks: number; planned_trials: number; tasks: number; skipped: number; started: number;
-    graded: number; resolved: number; ended: number; voided: number; void_streak: number }>(
-    "SELECT job_id, planned_tasks, planned_trials, tasks, skipped, started, graded, resolved, ended, voided, void_streak "
+    graded: number; resolved: number; ended: number; voided: number; void_streak: number; reused: number }>(
+    "SELECT job_id, planned_tasks, planned_trials, tasks, skipped, started, graded, resolved, ended, voided, void_streak, reused "
     + `FROM eval_trial_counts WHERE job_id IN (${marks})`,
     ...jobIds,
   );
   for (const row of rows) {
     counts.set(row.job_id, {
       plannedTasks: row.planned_tasks, plannedTrials: row.planned_trials, tasks: row.tasks, skipped: row.skipped, started: row.started,
-      graded: row.graded, resolved: row.resolved, ended: row.ended, void: row.voided, voidStreak: row.void_streak,
+      graded: row.graded, resolved: row.resolved, ended: row.ended, void: row.voided, voidStreak: row.void_streak, reused: row.reused,
     });
   }
   return counts;
 }
 
-export function trialSessions(db: EvidenceDb, endedBefore: string, limit: number): { trialId: string; sessionId: string }[] {
-  return db.all<{ trial_id: string; session_id: string }>(TRIAL_SESSIONS_SQL, endedBefore, limit)
-    .map(row => ({ trialId: row.trial_id, sessionId: row.session_id }));
+export function trialSessions(db: EvidenceDb, endedBefore: string, limit: number): { trialId: string; sessionId: string; endedAt: string }[] {
+  return db.all<{ trial_id: string; session_id: string; ended_at: string }>(TRIAL_SESSIONS_SQL, endedBefore, limit)
+    .map(row => ({ trialId: row.trial_id, sessionId: row.session_id, endedAt: row.ended_at }));
+}
+
+/** Every trial row of a job, for the report pass. More than JOB_ROWS_MAX rows is `unreadable`, never a partial answer. */
+export function jobRows(db: EvidenceDb, jobId: string): JobTrialRow[] {
+  const rows = db.all<{ task_id: string; config_ref: string; slot: number; attempt: number; state: TrialState; ending: TrialEnding | null;
+    resolved: number | null; isolation: "isolated" | "none" | null; config_id: string | null; profile_epoch: number | null;
+    prompt_version: string | null; tokens: number | null; spent_usd: number | null; cost: TrialCost | null;
+    started_at: string | null; ended_at: string | null; reused_from: string | null }>(JOB_ROWS_SQL, jobId);
+  if (rows.length > JOB_ROWS_MAX) throw new EvidenceError("unreadable", "A job has more trial rows than a report reads.");
+  return rows.map(row => ({
+    taskId: row.task_id, configRef: row.config_ref, slot: row.slot, attempt: row.attempt, state: row.state, ending: row.ending,
+    resolved: row.resolved === null ? null : row.resolved === 1, isolation: row.isolation, configId: row.config_id,
+    profileEpoch: row.profile_epoch, promptVersion: row.prompt_version, tokens: row.tokens, spentUsd: row.spent_usd, cost: row.cost,
+    startedAt: row.started_at, endedAt: row.ended_at, reused: row.reused_from !== null,
+  }));
 }
 
 function releasePatch(tx: EvidenceTx, trialId: string, bytes: number): void {
@@ -245,5 +342,9 @@ export function sweepTrials(tx: EvidenceTx, now: string): number {
   }
   tx.run("DELETE FROM eval_trial_counts WHERE job_id IN (SELECT job_id FROM eval_trial_counts "
     + "WHERE job_id NOT IN (SELECT job_id FROM eval_jobs) LIMIT ?)", TRIAL_SWEEP_BATCH);
+  tx.run("DELETE FROM eval_reports WHERE job_id IN (SELECT job_id FROM eval_reports WHERE expires_at < ? ORDER BY expires_at LIMIT ?)",
+    now, TRIAL_SWEEP_BATCH);
+  tx.run("DELETE FROM eval_priors WHERE prior_id IN (SELECT prior_id FROM eval_priors WHERE expires_at < ? ORDER BY expires_at LIMIT ?)",
+    now, TRIAL_SWEEP_BATCH);
   return expired.length;
 }

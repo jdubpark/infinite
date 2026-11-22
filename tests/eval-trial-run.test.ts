@@ -263,6 +263,8 @@ async function validated(h: EvalHost): Promise<void> {
 
 /** The baseline job over the valid mined task, with the given trials per task. */
 function baseline(h: EvalHost, trialsPerTask: number, maxTrials: number, options: { maxWallMinutes?: number } = {}): string {
+  // A group draws its set when it is created, and a baseline job reads the dev set only. Without this the one mined task is holdout in three runs of ten, and the job runs no trial.
+  (h as unknown as { store: EvidenceStore }).store.write(tx => { tx.run("UPDATE eval_groups SET holdout = 0, set_at = NULL"); });
   const created = h.create(PROJECT, {
     kind: "baseline",
     configurations: [{ profile, guidance: "as-of-base", knowledge: "none" }],

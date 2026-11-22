@@ -2,8 +2,9 @@ import type express from "express";
 import { z } from "zod";
 import { EvidenceError } from "./evidence/types.js";
 import { validateJobSchema } from "./eval-jobs.js";
-import type { BaselineJobRequest, EvalHostApi, EvalRefusal, ValidateJobRequest } from "./eval-types.js";
+import type { BaselineJobRequest, ComparisonJobRequest, EvalHostApi, EvalRefusal, ValidateJobRequest } from "./eval-types.js";
 import { baselineJobSchema } from "./eval-trial-jobs.js";
+import { comparisonJobSchema } from "./eval-compare-jobs.js";
 
 const uuid = z.uuid();
 const TASK_ID = /^(captured|mined):[A-Za-z0-9:._-]{1,200}$/;
@@ -20,17 +21,22 @@ const MESSAGES: Record<EvalRefusal["code"], string> = {
   "unknown-project": "The project is not configured on this host.",
   "unknown-job": "No job has this ID.",
   "unknown-task": "No task has this ID.",
-  "job-active": "This project already has an active validation job.",
+  "job-active": "This project already has an active job of this kind.",
   "request-conflict": "This request ID already names a different job.",
   "eval-config-incomplete": "The project's validation settings are incomplete.",
   "profile-not-approved": "The trial profile is not approved for this project.",
   "invalid-job-transition": "The job cannot take this action in its current state.",
   "task-not-active": "The task is not a candidate or valid task.",
   "evidence-unavailable": "The evidence store is unavailable.",
+  "too-few-tasks": "The set has too few valid tasks for this job.",
+  "subject-confirmed": "This configuration pair already had its confirm job.",
+  "report-not-ready": "The job has no report yet.",
+  "report-unreadable": "The job's record cannot be read, so it has no report.",
+  "no-report": "Only compare and confirm jobs have reports.",
 };
 
 /**
- * The replay eval routes: the corpus summary, the validate jobs, and the owner's task retirement. Reads sit behind
+ * The replay eval routes: the corpus summary, the jobs, the stored report and prior reads, and the owner's task retirement. Reads sit behind
  * `read` (owner, controller, viewer); every change sits behind `owner`. A host refusal answers its own status and code.
  * An unavailable store answers 503 `evidence-unavailable`. No route returns a capsule, a patch, a file name, a case, or
  * a commit.
@@ -55,6 +61,16 @@ export function evalRoutes(
     const id = jobId(req.params.id);
     if (id === undefined) return refuse(res, invalid());
     respond(res, host.job(id));
+  }));
+
+  app.get("/api/eval/jobs/:id/report", readGuard, guarded(async (req, res) => {
+    const id = jobId(req.params.id);
+    if (id === undefined) return refuse(res, invalid());
+    respond(res, host.report(id));
+  }));
+
+  app.get("/api/eval/projects/:id/priors", readGuard, guarded(async (req, res) => {
+    respond(res, host.priors(String(req.params.id)));
   }));
 
   app.post("/api/eval/jobs", ownerGuard, guarded(async (req, res) => {
@@ -95,10 +111,11 @@ function guarded(handler: (req: express.Request, res: express.Response) => Promi
 }
 
 /** A job body parsed by its own kind's schema, or undefined: a body with no known kind, or one that does not parse. */
-function jobOf(value: unknown): ValidateJobRequest | BaselineJobRequest | undefined {
+function jobOf(value: unknown): ValidateJobRequest | BaselineJobRequest | ComparisonJobRequest | undefined {
   const kind = typeof value === "object" && value !== null && "kind" in value ? value.kind : undefined;
   const parsed = kind === "validate" ? validateJobSchema.safeParse(value)
     : kind === "baseline" ? baselineJobSchema.safeParse(value)
+    : kind === "compare" || kind === "confirm" ? comparisonJobSchema.safeParse(value)
     : undefined;
   return parsed?.success ? parsed.data : undefined;
 }

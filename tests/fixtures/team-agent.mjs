@@ -894,7 +894,8 @@ ${branch}`;
     }
     if (scenario === "reviewer-recording-error" && !existsSync(join(receiptDir, "reviewer-recording-error-started"))) {
       writeFileSync(join(receiptDir, "reviewer-recording-error-started"), "started", { mode: 0o600 });
-      const descendantScript = `const { existsSync, writeFileSync } = require('node:fs'); const { join } = require('node:path'); let child; process.on('SIGTERM',()=>{}); setInterval(() => { if (!child && existsSync(join(${JSON.stringify(receiptDir)}, 'retirement-expand-tree'))) { child = require('node:child_process').spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000)"], { detached:true, stdio:'ignore' }); writeFileSync(join(${JSON.stringify(receiptDir)}, 'retirement-discovered-pid.json'), JSON.stringify({ pid:child.pid }), { mode:0o600 }); } }, 50);`;
+      // The descendant runs its own script, out of reach of writeWhole, so it writes its receipt whole the same way.
+      const descendantScript = `const { existsSync, renameSync, writeFileSync } = require('node:fs'); const { join } = require('node:path'); let child; process.on('SIGTERM',()=>{}); setInterval(() => { if (!child && existsSync(join(${JSON.stringify(receiptDir)}, 'retirement-expand-tree'))) { child = require('node:child_process').spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000)"], { detached:true, stdio:'ignore' }); const file = join(${JSON.stringify(receiptDir)}, 'retirement-discovered-pid.json'); writeFileSync(file + '.tmp', JSON.stringify({ pid:child.pid }), { mode:0o600 }); renameSync(file + '.tmp', file); } }, 50);`;
       const descendant = spawn(process.execPath, ["-e", descendantScript],
         { detached: true, stdio: "ignore" });
       writeWhole(join(receiptDir, "reviewer-hold.json"), JSON.stringify({ pid: process.pid, descendantPid: descendant.pid }));

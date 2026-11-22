@@ -75,7 +75,7 @@ export type JudgementRow = { judgementId: string; calibrationId: string; pairInd
   createdAt: string; endedAt: string | null };
 export type NewJudgement = Pick<JudgementRow, "judgementId" | "calibrationId" | "pairIndex" | "ordering" | "attempt" | "resolvedIsA"> & { projectId: string };
 export type JudgementCost = { tokens: number; usd: number; complete: boolean } | "none";
-export type JudgementFinal = { ending: JudgeEnding; judgement?: Judgement; sessionId: string | null; cost?: JudgementCost };
+export type JudgementFinal = { ending: JudgeEnding; judgement?: Judgement; sessionId: string | null };
 
 type CalibrationSql = { calibration_id: string; request_id: string; judge_key: string; profile_epoch: number; prompt_version: string; status: CalibrationStatus;
   reason: string | null; state: CalibrationState | null; pairs_planned: number; pairs_counted: number; correct: number; agree: number; accuracy: number | null;
@@ -210,8 +210,8 @@ function addCost(tx: EvidenceTx, judgementId: string, cost: JudgementCost): void
 
 /**
  * Ends a `preparing` or `live` judgement, once. It stores the ending, the preferred label and sealed rubric of an
- * accepted judgement, the session ID (kept until `clearJudgementSession`), and the cost when known; a known cost also
- * joins the calibration's totals. A judgement that is already final or dropped writes nothing and answers false.
+ * accepted judgement, and the session ID (kept until `clearJudgementSession`, which records the cost). A judgement
+ * that is already final or dropped writes nothing and answers false.
  */
 export function finishJudgement(tx: EvidenceTx, judgementId: string, final: JudgementFinal, at: string): boolean {
   const rubric = final.judgement === undefined ? null : tx.seal("judge_judgements", judgementId, final.judgement.rubric);
@@ -219,9 +219,7 @@ export function finishJudgement(tx: EvidenceTx, judgementId: string, final: Judg
     "UPDATE judge_judgements SET state='final', ending=?, preferred=?, rubric=?, session_id=?, ended_at=? WHERE judgement_id=? AND state IN ('preparing', 'live')",
     final.ending, final.judgement?.preferred ?? null, rubric, final.sessionId, at, judgementId,
   ).changes;
-  if (changes === 0) return false;
-  if (final.cost !== undefined) addCost(tx, judgementId, final.cost);
-  return true;
+  return changes === 1;
 }
 
 /** Ends a `preparing` or `live` judgement as dropped, with a reason. A dropped pair stays a row, so the slot is never selected again. */
@@ -230,7 +228,7 @@ export function dropJudgement(tx: EvidenceTx, judgementId: string, reason: strin
     reason, at, judgementId).changes === 1;
 }
 
-/** Clears the session ID. With a cost it records it, once, as `finishJudgement` does; a cost already stored is kept. */
+/** Clears the session ID. With a cost it records it, once, and a known cost joins the calibration's totals; a cost already stored is kept. */
 export function clearJudgementSession(tx: EvidenceTx, judgementId: string, cost?: JudgementCost): void {
   if (cost !== undefined) addCost(tx, judgementId, cost);
   tx.run("UPDATE judge_judgements SET session_id=NULL WHERE judgement_id=?", judgementId);

@@ -17,7 +17,7 @@ import { labelDraw } from "./judge-package.js";
 import {
   activeCalibration, calibrationJudgements, calibrationViews, dropJudgement, finishCalibration, finishJudgement, insertCalibration,
   insertJudgement, liveJudgements, readCalibration, startJudgement, type CalibrationEnd, type CalibrationPairRef, type CalibrationRow,
-  type CalibrationView, type JudgementCost, type JudgementRow,
+  type CalibrationView, type JudgementRow,
 } from "./judge-store.js";
 import { JUDGE_VOID_ENDINGS, type Judgement, type JudgeEnding } from "./judge-types.js";
 import type { TeamModelProfile } from "./team-types.js";
@@ -48,8 +48,8 @@ export type CalibrationRefusal = { status: 400 | 404 | 409; code: "invalid-calib
 export type NextJudgement = { kind: "idle" } | { kind: "wait"; reason: string } | { kind: "start"; calibrationId: string;
   judgementId: string; projectId: string; taskId: string; pairIndex: number; ordering: 0 | 1; attempt: number; resolvedIsA: boolean;
   resolvedTrialId: string; unresolvedTrialId: string; judgeMinutes: number; profile: TeamModelProfile };
-export type JudgementOutcome = { ending: JudgeEnding; judgement?: Judgement; sessionId: string | null;
-  cost?: JudgementCost } | { dropped: "patch-missing" | "source-skipped" | "not-isolated" | "package-too-large" };
+export type JudgementOutcome = { ending: JudgeEnding; judgement?: Judgement; sessionId: string | null }
+  | { dropped: "patch-missing" | "source-skipped" | "not-isolated" | "package-too-large" };
 
 type Start = Extract<NextJudgement, { kind: "start" }>;
 type Options = { store: EvidenceStore; config: Pick<Config, "projects" | "eval" | "teams">; now: () => string };
@@ -216,7 +216,7 @@ export class JudgeCalibrations {
       if (row === undefined) return;
       if ("dropped" in outcome) dropJudgement(tx, judgementId, outcome.dropped, at);
       else finishJudgement(tx, judgementId, { ending: outcome.ending, sessionId: outcome.sessionId,
-        ...(outcome.judgement === undefined ? {} : { judgement: outcome.judgement }), ...(outcome.cost === undefined ? {} : { cost: outcome.cost }) }, at);
+        ...(outcome.judgement === undefined ? {} : { judgement: outcome.judgement }) }, at);
       const calibration = readCalibration(tx, row.calibration_id);
       if (calibration?.status === "running") this.complete(tx, calibration, at);
     });

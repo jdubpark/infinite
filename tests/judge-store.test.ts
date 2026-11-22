@@ -228,7 +228,7 @@ test("a judgement moves from preparing to live to final, once", () => {
     const scores = { correctness: 4, cleanliness: 3, extensibility: 3, docs: 2 };
     const judgement = { preferred: "A" as const, rubric: { a: scores, b: scores } };
     const later = "2026-11-22T00:05:00.000Z";
-    assert.equal(f.store.write(tx => finishJudgement(tx, "j1", { ending: "judged", judgement, sessionId: "session-1", cost: { tokens: 100, usd: 0.5, complete: true } }, later)), true);
+    assert.equal(f.store.write(tx => finishJudgement(tx, "j1", { ending: "judged", judgement, sessionId: "session-1" }, later)), true);
     assert.equal(f.store.write(tx => finishJudgement(tx, "j1", { ending: "timeout", sessionId: null }, later)), false);
     assert.deepEqual(f.store.read(db => liveJudgements(db)), []);
     const rows = f.store.read(db => calibrationJudgements(db, "c1"));
@@ -238,12 +238,11 @@ test("a judgement moves from preparing to live to final, once", () => {
     assert.equal(rows[0]?.preferred, "A");
     assert.equal(rows[0]?.resolvedIsA, true);
     assert.equal(rows[0]?.rubric?.a.correctness, 4);
-    assert.equal(rows[0]?.tokens, 100);
-    assert.equal(rows[0]?.cost, "complete");
+    assert.equal(rows[0]?.cost, null, "the finish records no cost");
     const raw = f.store.read(db => db.get<{ rubric: string }>("SELECT rubric FROM judge_judgements")?.rubric ?? "");
     assert.equal(raw.includes("correctness"), false, "the rubric column is sealed");
     const view = f.store.read(db => calibrationViews(db, T0, () => undefined))[0];
-    assert.deepEqual(view?.cost, { tokens: 100, spentUsd: 0.5 });
+    assert.deepEqual(view?.cost, { tokens: 0, spentUsd: 0 });
   } finally {
     f.close();
   }

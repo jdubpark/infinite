@@ -17,6 +17,7 @@ import { gradeTrial, prepareTrialSource, type SourceResult, type TrialContext } 
 import { loadTask, type BundleState, type ValidateContext } from "./eval-validate.js";
 import type { HaltService } from "./halt/service.js";
 import { graderJobOf, type JudgeCalibrations, type JudgementOutcome, type NextJudgement } from "./judge-calibration-jobs.js";
+import { clearJudgementSession, judgeSessions, type JudgementCost } from "./judge-store.js";
 import { judgePackage, judgeTaskOf, writeJudgePackage } from "./judge-package.js";
 import { JUDGE_ENDINGS, type JudgeEnding } from "./judge-types.js";
 import type { HostLoadGate } from "./host-load.js";
@@ -90,6 +91,8 @@ export class TrialPump {
   /** True while the account may hold what a trial left: rows this process voided, or a stop or clean that has not succeeded yet. */
   private dirty = false;
   private live: Live | undefined;
+  /** The kind of work that started last; with both kinds ready, the other kind goes first. */
+  private lastStart: "trial" | "judgement" | undefined;
   private probed: { at: number; probe: EvalProbe; projectId: string | undefined } | undefined;
   /** Steps to skip before the next trial start, after a source that could not start. */
   private cooldown = 0;
@@ -137,7 +140,7 @@ export class TrialPump {
       const teams = this.options.teams();
       for (const trialId of teams.replayIds()) {
         try {
-          if (this.options.store.read(db => readTrial(db, trialId))?.state === "final") await teams.forgetReplay(trialId);
+          if (this.forgettable(trialId)) await teams.forgetReplay(trialId);
         } catch {
           // One unreadable row or failed removal leaves that run for the next sweep.
         }
@@ -159,8 +162,48 @@ export class TrialPump {
           // One failed row leaves the others to their removal.
         }
       }
+      await this.sweepJudgements(endedBefore, at);
     } catch {
       // The sweep never throws.
+    }
+  }
+
+  /** A run to forget: a final trial, or a final or dropped judgement. A run no row names may belong to another caller, so it stays. */
+  private forgettable(id: string): boolean {
+    if (this.options.store.read(db => readTrial(db, id))?.state === "final") return true;
+    if (this.options.judgements === undefined) return false;
+    const judgement = this.options.store.read(db => db.get<{ state: string }>("SELECT state FROM judge_judgements WHERE judgement_id = ?", id));
+    return judgement?.state === "final" || judgement?.state === "dropped";
+  }
+
+  /** Removes judge sessions ended over an hour ago, cost first, and expires a calibration. Each part fails alone. */
+  private async sweepJudgements(endedBefore: string, at: string): Promise<void> {
+    const judgements = this.options.judgements;
+    if (judgements === undefined) return;
+    try {
+      const ended = this.options.store.read(db => judgeSessions(db, endedBefore, TRIAL_SESSIONS_BATCH));
+      for (const { judgementId, sessionId, endedAt } of ended) {
+        try {
+          const cost = this.costOf(sessionId, endedAt, at);
+          if (cost === "wait") continue;
+          try {
+            await this.options.sessions.remove(sessionId);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+          }
+          const recorded: JudgementCost | undefined = cost === undefined || cost === "none" ? cost : { tokens: cost.tokens, usd: cost.usd, complete: cost.complete };
+          this.options.store.write(tx => clearJudgementSession(tx, judgementId, recorded));
+        } catch {
+          // One failed row leaves the others to their removal.
+        }
+      }
+    } catch {
+      // The next sweep tries again.
+    }
+    try {
+      judgements.sweep();
+    } catch {
+      // A calibration that could not expire is expired by the next sweep.
     }
   }
 
@@ -191,19 +234,25 @@ export class TrialPump {
     if (!this.started && !(await this.startup())) return;
     if (this.live !== undefined) return this.advanceLive(this.live);
     const open = this.openJob();
-    if (open === undefined && !this.judging()) return;
+    const judging = this.judging();
+    if (open === undefined && !judging) return;
     if (this.cooldown > 0) {
       this.cooldown -= 1;
       return;
     }
-    for (const turn of this.turns(open !== undefined)) {
-      if (turn === "trial" ? await this.trialTurn(open) : await this.judgementTurn()) return;
+    for (const turn of this.turns(open !== undefined, judging)) {
+      if (turn === "trial" ? await this.trialTurn(open) : await this.judgementTurn()) {
+        this.lastStart = turn;
+        return;
+      }
     }
   }
 
-  /** The kinds of work to ask for, in order, when nothing is live: judgements only when no trial work is ready. */
-  private turns(trialJobOpen: boolean): ("trial" | "judgement")[] {
-    return trialJobOpen ? ["trial", "judgement"] : ["judgement"];
+  /** The kinds of work to ask for, in order, when nothing is live. With both kinds open the turns alternate. */
+  private turns(trialJobOpen: boolean, judging: boolean): ("trial" | "judgement")[] {
+    if (!trialJobOpen) return ["judgement"];
+    if (!judging) return ["trial"];
+    return this.lastStart === "trial" ? ["judgement", "trial"] : ["trial", "judgement"];
   }
 
   /** Asks for a trial and starts it. True when a trial started. */
@@ -221,11 +270,12 @@ export class TrialPump {
    *  A process tries it once. It tries again while a job is open or the account may be unclean, until it succeeds. */
   private async startup(): Promise<boolean> {
     const rows = this.options.store.read(db => liveTrials(db));
+    const judged = this.liveJudgements();
     // The first attempt of a process always runs. Later attempts wait for a job unless this process has something to clean.
     const open = this.openJob();
-    if (this.attempted && !this.dirty && rows.length === 0 && open === undefined && !this.judging()) return false;
+    if (this.attempted && !this.dirty && rows.length === 0 && judged.length === 0 && open === undefined && !this.judging()) return false;
     this.attempted = true;
-    if (rows.length > 0) this.dirty = true;
+    if (rows.length > 0 || judged.length > 0) this.dirty = true;
     const at = this.now();
     for (const row of rows) {
       if (row.state === "preparing") {
@@ -238,6 +288,16 @@ export class TrialPump {
       this.options.store.write(tx => finishTrial(tx, row.trialId, this.final(gradeOf({ ending: "void-host", expected: this.expectedOf(row.taskId),
         overwritten: 0, diff: null, isolation: "none" }), null, null, session ?? null), at));
       this.options.jobs.record(row.jobId, "void-host");
+    }
+    // A judgement row left in flight is a host failure, not a verdict: it ends void-host and its ordering retries. A drop would end its pair.
+    for (const { judgementId } of judged) {
+      const session = await this.options.teams().replayState(judgementId).then(state => state?.sessionId, () => undefined);
+      await this.options.teams().endReplay(judgementId, "void-host").catch(() => undefined);
+      try {
+        this.options.judgements?.finish(judgementId, { ending: "void-host", sessionId: session ?? null });
+      } catch {
+        // A row that could not be recorded is voided by the next start-up.
+      }
     }
     const identity = await this.identityProbe(undefined, open?.projectId);
     // An identity that is configured but cannot be probed has not been cleaned. Start-up runs again while a job is open or rows were voided.
@@ -421,6 +481,14 @@ export class TrialPump {
         // A run that cannot end is left to the sweep.
       }
       await this.close(live, "void-host", undefined, "stopped");
+    }
+  }
+
+  private liveJudgements(): { judgementId: string }[] {
+    try {
+      return this.options.judgements?.live() ?? [];
+    } catch {
+      return [];
     }
   }
 

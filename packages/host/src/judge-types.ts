@@ -1,6 +1,9 @@
 import { z } from "zod";
 
 /** The four dimensions of rubric version 1. */
+/** The judge's package directory, under the Git metadata directory of its clone. The prompt, the writer, and the context file all name it. */
+export const JUDGE_PACKAGE_DIR = "infinite-judge";
+
 export const RUBRIC_V1_DIMENSIONS = ["correctness", "cleanliness", "extensibility", "docs"] as const;
 const score = z.number().int().min(1).max(5);
 export const judgeScoresSchema = z.object({ correctness: score, cleanliness: score, extensibility: score, docs: score }).strict();

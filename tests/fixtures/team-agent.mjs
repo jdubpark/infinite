@@ -4,6 +4,14 @@ import { randomUUID } from "node:crypto";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
 
+// Tests and peers poll the receipt directory while this process runs, and parse a receipt as soon as it exists.
+// A receipt with content therefore appears whole or not at all: written under another name, then renamed.
+function writeWhole(file, data) {
+  const temporary = `${file}.${process.pid}.tmp`;
+  writeFileSync(temporary, data, { mode: 0o600 });
+  renameSync(temporary, file);
+}
+
 if (process.argv[2] === "--command-prefix") {
   const [, receiptDir, command, ...args] = process.argv.slice(2);
   appendFileSync(join(receiptDir, "commands.jsonl"), JSON.stringify({ command, args, cwd: process.cwd() }) + "\n", { mode: 0o600 });
@@ -121,7 +129,7 @@ if (process.argv[2] === "--bootstrap-setup") {
 }
 if (process.argv[2] === "--hold-check") {
   const receiptDir = process.argv[3];
-  writeFileSync(join(receiptDir, "check-ready.json"), JSON.stringify({ pid: process.pid }), { mode: 0o600 });
+  writeWhole(join(receiptDir, "check-ready.json"), JSON.stringify({ pid: process.pid }));
   const until = Date.now() + 30000;
   while (!existsSync(join(receiptDir, "check-release"))) {
     if (Date.now() >= until) process.exit(19);
@@ -139,10 +147,8 @@ if (scenario === "stall-slow-stop" || scenario === "agent-blocked-once") process
 if (!assignment || !process.env.INFINITE_HOOK_URL || !process.env.INFINITE_HOOK_TOKEN)
   throw new Error("The team worker did not provide its reporting capability");
 const receiptFile = join(receiptDir, `${assignment.memberId}.json`);
-// Peers poll this directory while members run. Replace a receipt whole, never truncate it in place.
 function saveReceipt() {
-  writeFileSync(`${receiptFile}.tmp`, JSON.stringify(receipt), { mode: 0o600 });
-  renameSync(`${receiptFile}.tmp`, receiptFile);
+  writeWhole(receiptFile, JSON.stringify(receipt));
 }
 const providerIndex = process.argv.indexOf("--fixture-provider");
 const receipt = { ...assignment, cwd: process.cwd(), pid: process.pid, startedAt: Date.now(),
@@ -150,7 +156,7 @@ const receipt = { ...assignment, cwd: process.cwd(), pid: process.pid, startedAt
   ...(providerIndex >= 0 ? { provider: process.argv[providerIndex + 1], argv: process.argv.slice(2) } : {}) };
 // A test that writes record-context keeps a copy of each member's context file.
 if (existsSync(join(receiptDir, "record-context")) && existsSync(join(".git", "infinite-team-context.json")))
-  writeFileSync(join(receiptDir, `${assignment.memberId}.context.json`), readFileSync(join(".git", "infinite-team-context.json")), { mode: 0o600 });
+  writeWhole(join(receiptDir, `${assignment.memberId}.context.json`), readFileSync(join(".git", "infinite-team-context.json")));
 if (receipt.provider === "opencode") {
   const args = process.argv.slice(providerIndex + 2), boundary = args.indexOf("--");
   if (args[0] !== "run" || boundary < 1 || boundary !== args.length - 2
@@ -253,8 +259,8 @@ async function main() {
   if (scenario === "mcp" || scenario === "stall-slow-stop") {
     // A private runtime receipt lets the test drive the actual worker capability
     // through a separate MCP child. It never enters a repository or API response.
-    writeFileSync(join(receiptDir, "mcp-capability.json"), JSON.stringify({ assignment,
-      url: process.env.INFINITE_HOOK_URL, token: process.env.INFINITE_HOOK_TOKEN }), { mode: 0o600 });
+    writeWhole(join(receiptDir, "mcp-capability.json"), JSON.stringify({ assignment,
+      url: process.env.INFINITE_HOOK_URL, token: process.env.INFINITE_HOOK_TOKEN }));
     return;
   }
   if (scenario === "unreported") {
@@ -380,7 +386,7 @@ async function main() {
     // The first plan is what an intent-plan checker sends as its report. Its name has no .json ending, so tests that
     // read every receipt never parse it.
     const firstPlan = join(receiptDir, `${assignment.runId}.first-plan`);
-    if (!existsSync(firstPlan)) writeFileSync(firstPlan, JSON.stringify(plan), { mode: 0o600 });
+    if (!existsSync(firstPlan)) writeWhole(firstPlan, JSON.stringify(plan));
     if (scenario === "bootstrap-override") {
       let rejection;
       try { await report(plan); }
@@ -394,7 +400,7 @@ async function main() {
     await report({ kind: "findings", summary: "Read the module", evidence: [{ source: "module.txt", observation: "The module exports one function." }] });
   } else if (assignment.role === "intent-checker") {
     // The checker copies its context and launch prompt for the test, then waits, exits, edits, or reports as the flags say.
-    writeFileSync(join(receiptDir, `${assignment.memberId}.intent-context.json`), readFileSync(join(".git", "infinite-team-context.json")), { mode: 0o600 });
+    writeWhole(join(receiptDir, `${assignment.memberId}.intent-context.json`), readFileSync(join(".git", "infinite-team-context.json")));
     writeFileSync(join(receiptDir, `${assignment.memberId}.intent-prompt.txt`), receipt.prompt ?? process.argv.at(-1) ?? "", { mode: 0o600 });
     if (existsSync(join(receiptDir, "intent-hold"))) {
       const until = Date.now() + 120000;
@@ -424,7 +430,7 @@ async function main() {
       if (start < 0) throw new Error("The permission review assignment omitted its recorded feedback");
       const feedbackText = launchPrompt.slice(start + marker.length).split("\n\n", 1)[0];
       permissionFeedback = JSON.parse(feedbackText);
-      writeFileSync(join(receiptDir, `${assignment.runId}.permission-feedback.json`), JSON.stringify(permissionFeedback), { mode: 0o600 });
+      writeWhole(join(receiptDir, `${assignment.runId}.permission-feedback.json`), JSON.stringify(permissionFeedback));
     }
     if (scenario === "permissions-codex-diagnostic-evidence") {
       const collected = new Set((permissionFeedback?.permissionEvidence?.files ?? []).map(file => file.path));
@@ -663,7 +669,7 @@ async function main() {
             if (text.includes("\r")) break;
           }
         }
-        writeFileSync(join(receiptDir, `${assignment.runId}.agent-answer.json`), JSON.stringify({ option: marker, text: text.replace(/\r$/, "") }), { mode: 0o600 });
+        writeWhole(join(receiptDir, `${assignment.runId}.agent-answer.json`), JSON.stringify({ option: marker, text: text.replace(/\r$/, "") }));
         process.stdout.write("\u001b[2J\u001b[HPermission request closed.\n");
       }
       if (scenario === "permissions-stale") {
@@ -706,7 +712,7 @@ async function main() {
       writeFileSync("README.md", `${readme}\nTeam update revision ${assignment.revision}\n`);
     }
     if (scenario === "result-operation-fails-once" && assignment.revision === 1 && assignment.taskId === "a") {
-      writeFileSync(join(receiptDir, "result-failure-ready.json"), JSON.stringify({ cwd: process.cwd(), memberId: assignment.memberId }), { mode: 0o600 });
+      writeWhole(join(receiptDir, "result-failure-ready.json"), JSON.stringify({ cwd: process.cwd(), memberId: assignment.memberId }));
       const until = Date.now() + 30000;
       while (!existsSync(join(receiptDir, "result-failure-report-release"))) {
         if (Date.now() >= until) throw new Error("The test did not release the first result report");
@@ -803,7 +809,7 @@ async function main() {
     if (scenario === "delivery-capability-failure" || scenario === "delivery-capability-repair") {
       const failure = { kind: "blocked", summary: "The existing provider lacks the required publication capability; no publication was attempted." };
       if (existingDeliveryMembers.length <= 1) {
-        writeFileSync(join(receiptDir, "delivery-started.json"), JSON.stringify({ head, memberId: assignment.memberId }), { mode: 0o600 });
+        writeWhole(join(receiptDir, "delivery-started.json"), JSON.stringify({ head, memberId: assignment.memberId }));
         while (!existsSync(join(receiptDir, "delivery-release"))) await new Promise(resolve => setTimeout(resolve, 40));
         if (scenario === "delivery-capability-repair") {
           await report(failure);
@@ -825,7 +831,7 @@ async function main() {
     }
     if (scenario === "delivery-base-recovery") {
       if (existingDeliveryMembers.length <= 1) {
-        writeFileSync(join(receiptDir, "delivery-started.json"), JSON.stringify({ head, memberId: assignment.memberId }), { mode: 0o600 });
+        writeWhole(join(receiptDir, "delivery-started.json"), JSON.stringify({ head, memberId: assignment.memberId }));
         while (!existsSync(join(receiptDir, "delivery-release"))) await new Promise(resolve => setTimeout(resolve, 40));
         await report({ kind: "blocked", summary: "The base branch moved while this reviewed README change conflicted; no pull request or publication was created." });
         return;
@@ -840,7 +846,7 @@ async function main() {
       const branch = launchPrompt.match(/Use deterministic head branch (\S+), base branch/)?.[1];
       if (!branch) throw new Error("The fixture could not read the delivery branch from its prompt");
       const continued = launchPrompt.includes("This run continues its pull request");
-      writeFileSync(join(receiptDir, `delivery-started-${assignment.revision}.json`), JSON.stringify({ head, branch, continued, prompt: launchPrompt }), { mode: 0o600 });
+      writeWhole(join(receiptDir, `delivery-started-${assignment.revision}.json`), JSON.stringify({ head, branch, continued, prompt: launchPrompt }));
       while (continued && !existsSync(join(receiptDir, "delivery-continued-release"))) await new Promise(resolve => setTimeout(resolve, 40));
       execFileSync("git", ["push", readFileSync(join(receiptDir, "delivery-remote"), "utf8").trim(), `${context.headCommit}:refs/heads/${branch}`], { stdio: "ignore" });
       await report({ kind: "pull-request", headCommit: context.headCommit, pullRequestUrl: "https://github.com/example/app/pull/7",
@@ -849,7 +855,7 @@ async function main() {
     }
     const mergeCommit = execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", `${scenario === "delivery-baseline-changed" ? base : head}^{tree}`, "-p", base, "-m", "Synthetic squash delivery"], { encoding: "utf8" }).trim();
     execFileSync("git", ["update-ref", "refs/heads/synthetic-merge", mergeCommit]);
-    writeFileSync(join(receiptDir, "delivery-started.json"), JSON.stringify({ head, memberId: assignment.memberId }), { mode: 0o600 });
+    writeWhole(join(receiptDir, "delivery-started.json"), JSON.stringify({ head, memberId: assignment.memberId }));
     if (scenario === "delivery-permission") {
       const context = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8"));
       const launchPrompt = process.argv.at(-1) ?? "";
@@ -888,10 +894,11 @@ ${branch}`;
     }
     if (scenario === "reviewer-recording-error" && !existsSync(join(receiptDir, "reviewer-recording-error-started"))) {
       writeFileSync(join(receiptDir, "reviewer-recording-error-started"), "started", { mode: 0o600 });
-      const descendantScript = `const { existsSync, writeFileSync } = require('node:fs'); const { join } = require('node:path'); let child; process.on('SIGTERM',()=>{}); setInterval(() => { if (!child && existsSync(join(${JSON.stringify(receiptDir)}, 'retirement-expand-tree'))) { child = require('node:child_process').spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000)"], { detached:true, stdio:'ignore' }); writeFileSync(join(${JSON.stringify(receiptDir)}, 'retirement-discovered-pid.json'), JSON.stringify({ pid:child.pid }), { mode:0o600 }); } }, 50);`;
+      // The descendant runs its own script, out of reach of writeWhole, so it writes its receipt whole the same way.
+      const descendantScript = `const { existsSync, renameSync, writeFileSync } = require('node:fs'); const { join } = require('node:path'); let child; process.on('SIGTERM',()=>{}); setInterval(() => { if (!child && existsSync(join(${JSON.stringify(receiptDir)}, 'retirement-expand-tree'))) { child = require('node:child_process').spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000)"], { detached:true, stdio:'ignore' }); const file = join(${JSON.stringify(receiptDir)}, 'retirement-discovered-pid.json'); writeFileSync(file + '.tmp', JSON.stringify({ pid:child.pid }), { mode:0o600 }); renameSync(file + '.tmp', file); } }, 50);`;
       const descendant = spawn(process.execPath, ["-e", descendantScript],
         { detached: true, stdio: "ignore" });
-      writeFileSync(join(receiptDir, "reviewer-hold.json"), JSON.stringify({ pid: process.pid, descendantPid: descendant.pid }), { mode: 0o600 });
+      writeWhole(join(receiptDir, "reviewer-hold.json"), JSON.stringify({ pid: process.pid, descendantPid: descendant.pid }));
       for (;;) { process.stdout.write("recording-error reviewer remains active\n"); await new Promise(resolve => setTimeout(resolve, 100)); }
     }
     for (const name of ["a.txt", "b.txt"])

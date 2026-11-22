@@ -2537,8 +2537,8 @@ export class TeamService {
       if (!trackingReady) return;
       // A recorded answer creates one replacement only after the original has confirmed exit.
       for (const decision of run.decisions.filter(item => item.revision === run.revision && item.answer)) {
-        const prior = run.members.find(member => member.memberId === decision.memberId)!;
-        if (prior.status !== "waiting") continue;
+        const prior = run.members.find(member => member.memberId === decision.memberId);
+        if (prior?.status !== "waiting") continue;
         // An answered scout or implementer keeps waiting, answer intact, until a worker slot frees under the current limit.
         if ((prior.role === "scout" || prior.role === "implementer") && run.members.filter(member => holdsWorkerSlot(member, run.revision)).length >= run.parallelism) continue;
         const answeredBy = decisionAnswerLabel(decision);

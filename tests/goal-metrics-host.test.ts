@@ -8,6 +8,7 @@ import { join, resolve } from "node:path";
 import type { CheckObservation } from "../packages/host/src/check-observations.js";
 import type { GoalMetrics, GoalMetricsView } from "../packages/host/src/goal-metrics.js";
 import type { CreateGoal, ProductGoal } from "../packages/host/src/goal-types.js";
+import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { commandDigest } from "../packages/host/src/objective-input.js";
 import type { TeamLineup, TeamRun } from "../packages/host/src/team-types.js";
 import { unseal } from "../packages/host/src/vault.js";
@@ -129,19 +130,36 @@ test("a goal's checks report numbers that reach only the curve route", { timeout
     const contexts = members.filter(member => member.role === "reviewer" || (member.role === "project-manager" && member.runId === second))
       .map(member => join(member.cwd, ".git", "infinite-team-context.json"));
     assert.ok(contexts.length >= 3, `the reviewers' and the second coordinator's context files: ${contexts.length}`);
-    for (const file of contexts) {
+    const texts = contexts.map(file => {
       assert.ok(existsSync(file), file);
       const text = readFileSync(file, "utf8");
       JSON.parse(text);
       assert.equal(text.includes(QUOTED), false, `${file} carries a reported number`);
-    }
-    const evidence = join(state, "evidence");
-    assert.ok(existsSync(evidence), "the event store exists");
-    for (const name of readdirSync(evidence)) {
-      assert.equal(readFileSync(join(evidence, name)).includes(Buffer.from(SENTINEL)), false, `evidence/${name} holds the name in plain bytes`);
-    }
+      return { file, text, reviewer: members.some(member => member.role === "reviewer" && file.startsWith(member.cwd)) };
+    });
+    // Positive control: a reviewer's context holds the check's output, with the line as the check printed it.
+    assert.ok(texts.some(item => item.reviewer && item.text.includes(`infinite-metric ${SENTINEL} 10`)), "a reviewer context holds the printed line");
 
-    await api.stopApi(); await api.start();
+    // The run events, decrypted: the store keeps their payloads in an encrypted column, so its file bytes prove nothing.
+    await api.stopApi();
+    const store = new EvidenceStore({ databasePath: evidenceDatabasePath(state), vaultKey: key });
+    try {
+      for (const cycle of goal.cycles) {
+        const kinds: string[] = [];
+        for (let after = 0; ;) {
+          const page = store.events({ runId: cycle.teamId, after, limit: 500 });
+          for (const event of page.events) {
+            kinds.push(event.kind);
+            assert.equal(JSON.stringify(event).includes(QUOTED), false, `event ${event.seq} (${event.kind}) carries a reported number`);
+          }
+          if (!page.more) break;
+          after = page.cursor;
+        }
+        assert.ok(kinds.includes("check.finished"), `the search read cycle ${cycle.cycle}'s check events: ${kinds.join(",")}`);
+      }
+    } finally { store.close(); }
+
+    await api.start();
     assert.deepEqual((await api.fetchApi(`/goals/${goal.id}/metrics`, "viewer")).body, view, "the curve is the same after a restart");
   } finally {
     await host?.stop();

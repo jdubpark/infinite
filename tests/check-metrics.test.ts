@@ -123,13 +123,15 @@ test("finish is idempotent and pushes after finish are ignored", () => {
   assert.deepStrictEqual(first, { metrics: [{ name: "a", state: "value", value: 1 }], more: 0 });
 });
 
-test("rule 11: a 5 MB line without LF keeps the heap bounded", () => {
+test("rule 11: a 16 MB line without LF keeps memory bounded, buffers included", () => {
   const scanner = new CheckMetricScanner();
   const chunk = Buffer.alloc(64 * 1024, "a");
-  const before = process.memoryUsage().heapUsed;
-  for (let i = 0; i < 80; i++) scanner.push(chunk, "stdout");
-  const grown = process.memoryUsage().heapUsed - before;
-  assert.ok(grown < 4 * 1024 * 1024, `heap grew by ${grown} bytes while scanning 5 MB`);
+  // Buffer contents live outside the V8 heap, so a scanner that kept a copy of each chunk would show only here.
+  const used = () => { const usage = process.memoryUsage(); return usage.heapUsed + usage.arrayBuffers; };
+  const before = used();
+  for (let i = 0; i < 256; i++) scanner.push(chunk, "stdout");
+  const grown = used() - before;
+  assert.ok(grown < 4 * 1024 * 1024, `memory grew by ${grown} bytes while scanning 16 MB`);
   assert.deepStrictEqual(scanner.finish(), { metrics: [], more: 0 });
 });
 

@@ -328,7 +328,13 @@ class Sim {
     if (run.fewer && last?.length) names = last.slice(0, r.int(0, last.length - 1));
     else {
       const roll = r.next(), count = roll < 0.1 ? 0 : roll < 0.7 ? r.int(1, 3) : roll < 0.95 ? r.int(4, 8) : r.int(9, 11);
-      names = [...NAMES].sort(() => r.next() - 0.5).slice(0, count);
+      // A seeded Fisher-Yates shuffle: unlike a random comparator, it does not depend on the engine's sort.
+      const pool: string[] = [...NAMES];
+      for (let index = pool.length - 1; index > 0; index--) {
+        const other = r.int(0, index);
+        [pool[index], pool[other]] = [pool[other]!, pool[index]!];
+      }
+      names = pool.slice(0, count);
     }
     if (names.length > SLOTS) bump(this.counts, "observe:unslotted");
     const wholeInvalid = r.chance(0.02);

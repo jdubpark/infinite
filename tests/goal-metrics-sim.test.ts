@@ -43,20 +43,20 @@ function sweep(seeds: readonly number[], counts: Counts, variant: Variant = {}):
  * write as a settlement; retention of orphans and past 50 entries; duplicate commands, a failed first occurrence, and
  * a setup row of a checked command; reviews that approve, ask for changes, approve an earlier revision or are missing;
  * a head that moved after its checks; and reads past 8 series, with a tie at the 8th, an unconfigured command and a
- * long label. The thinnest ran 60 to 130 times: retention past 50 entries, a failed first occurrence and an approval
+ * long label. The thinnest ran 41 to 137 times: retention past 50 entries, a failed first occurrence and an approval
  * of an earlier revision. A load that pruned never ran, since every write prunes first;
  * tests/goal-metrics-service.test.ts seeds a file that needs it.
  */
 const FLOORS: Readonly<Record<string, number>> = {
-  "seed:long": 11, "seed:fold": 64, "fold:at-launch": 150, "fold:with-settlement": 97, "prune:orphan": 65, "prune:cap": 30,
-  "stop:in-check": 500, "stop:between-run-and-goal": 360, "stop:after-goal-write": 71, "restart": 1000,
-  "settle:repeated": 449, "settle:values": 1500, "settle:unreviewed": 1560, "settle:no-values": 62, "settle:removed": 180,
-  "revision:fewer-values": 140, "entry:over-16": 79,
-  "observe:duplicate-command": 695, "observe:first-failed": 40, "observe:setup-same-command": 713, "observe:ambiguous": 3800,
-  "observe:invalid": 4400, "observe:whole-invalid": 357, "observe:unslotted": 728, "observe:interrupted-by-stop": 506,
-  "review:approved": 1818, "review:changes": 168, "review:older-revision": 54, "review:none": 293,
-  "head:moved": 199, "head:repeated": 481, "round:same": 477, "round:reset": 296, "config:changed": 166,
-  "read:over-8-series": 1200, "read:boundary-tie": 857, "read:unconfigured": 99, "read:long-label": 522,
+  "seed:long": 11, "seed:fold": 64, "fold:at-launch": 164, "fold:with-settlement": 85, "prune:orphan": 61, "prune:cap": 20,
+  "stop:in-check": 524, "stop:between-run-and-goal": 363, "stop:after-goal-write": 88, "restart": 1076,
+  "settle:repeated": 465, "settle:values": 1458, "settle:unreviewed": 1635, "settle:no-values": 80, "settle:removed": 188,
+  "revision:fewer-values": 142, "entry:over-16": 80,
+  "observe:duplicate-command": 709, "observe:first-failed": 49, "observe:setup-same-command": 710, "observe:ambiguous": 3954,
+  "observe:invalid": 4443, "observe:whole-invalid": 374, "observe:unslotted": 761, "observe:interrupted-by-stop": 524,
+  "review:approved": 1807, "review:changes": 171, "review:older-revision": 68, "review:none": 297,
+  "head:moved": 194, "head:repeated": 459, "round:same": 480, "round:reset": 308, "config:changed": 159,
+  "read:over-8-series": 1181, "read:boundary-tie": 897, "read:unconfigured": 106, "read:long-label": 553,
 };
 
 test("reported numbers keep their invariants across host stops, folds, reopened runs and duplicate commands", t => {

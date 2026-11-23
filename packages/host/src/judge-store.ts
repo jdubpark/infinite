@@ -65,7 +65,9 @@ export type CalibrationView = { calibrationId: string; profileId: string; profil
   pairs: { planned: number; counted: number; correct: number; perProject: { projectId: string; pairs: number }[] };
   accuracy: number | null; lowerBound: number | null; swapAgreement: number | null; judgeMinutes: number;
   cost: { tokens: number; spentUsd: number }; createdAt: string; expiresAt: string; completedAt: string | null;
-  validUntil: string | null; inForce: boolean };
+  validUntil: string | null; inForce: boolean;
+  /** The gate that holds the next judgement of a running calibration, kept in memory by the job. Null when none is known or the calibration is not running. */
+  waiting: string | null };
 
 export type JudgementState = "preparing" | "live" | "final" | "dropped";
 export type JudgementLabel = "A" | "B" | "tie";
@@ -161,7 +163,7 @@ export function calibrationViews(db: EvidenceDb, now: string,
       pairs: { planned: row.pairsPlanned, counted: row.pairsCounted, correct: row.correct, perProject: row.payload.perProject },
       accuracy: row.accuracy, lowerBound: row.lowerBound, swapAgreement: row.swapAgreement, judgeMinutes: row.judgeMinutes,
       cost: { tokens: row.tokens, spentUsd: row.spentUsd }, createdAt: row.createdAt, expiresAt: row.expiresAt,
-      completedAt: row.completedAt, validUntil: row.validUntil, inForce: found?.calibrationId === row.calibrationId,
+      completedAt: row.completedAt, validUntil: row.validUntil, inForce: found?.calibrationId === row.calibrationId, waiting: null,
     };
   });
 }
@@ -226,6 +228,11 @@ export function finishJudgement(tx: EvidenceTx, judgementId: string, final: Judg
 export function dropJudgement(tx: EvidenceTx, judgementId: string, reason: string, at: string): boolean {
   return tx.run("UPDATE judge_judgements SET state='dropped', drop_reason=?, ended_at=? WHERE judgement_id=? AND state IN ('preparing', 'live')",
     reason, at, judgementId).changes === 1;
+}
+
+/** Deletes a judgement row that is still `preparing`, so its slot is free again. A live, final, or dropped row is kept and the answer is false. */
+export function releaseJudgement(tx: EvidenceTx, judgementId: string): boolean {
+  return tx.run("DELETE FROM judge_judgements WHERE judgement_id=? AND state='preparing'", judgementId).changes === 1;
 }
 
 /** Clears the session ID. With a cost it records it, once, and a known cost joins the calibration's totals; a cost already stored is kept. */

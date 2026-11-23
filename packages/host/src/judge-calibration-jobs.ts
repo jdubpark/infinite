@@ -16,7 +16,7 @@ import {
 import { labelDraw } from "./judge-package.js";
 import {
   activeCalibration, calibrationJudgements, calibrationViews, dropJudgement, finishCalibration, finishJudgement, insertCalibration,
-  insertJudgement, liveJudgements, readCalibration, startJudgement, sweepJudge, type CalibrationEnd, type CalibrationPairRef, type CalibrationRow,
+  insertJudgement, liveJudgements, readCalibration, releaseJudgement, startJudgement, sweepJudge, type CalibrationEnd, type CalibrationPairRef, type CalibrationRow,
   type CalibrationView, type JudgementRow,
 } from "./judge-store.js";
 import { JUDGE_VOID_ENDINGS, type Judgement, type JudgeEnding } from "./judge-types.js";
@@ -122,6 +122,8 @@ export class JudgeCalibrations {
   private readonly store: EvidenceStore;
   private readonly config: Pick<Config, "projects" | "eval" | "teams">;
   private readonly now: () => string;
+  /** The gate that held the last start, in memory only: empty after a restart until the next step. */
+  private waiting: string | null = null;
 
   constructor(options: Options) {
     this.store = options.store;
@@ -179,7 +181,7 @@ export class JudgeCalibrations {
     return this.store.read(db => calibrationViews(db, at, judgeKey => {
       if (judge === undefined || profileIdentityKey(trialProfileKey(judge)) !== judgeKey) return undefined;
       return { epoch: epochAt(db, judgeKey, at), promptVersion: judgePromptVersion(judge.provider) };
-    }));
+    })).map(view => view.status === "running" ? { ...view, waiting: this.waiting } : view);
   }
 
   /**
@@ -190,10 +192,28 @@ export class JudgeCalibrations {
   async next(gates: TrialGates): Promise<NextJudgement> {
     const at = this.now();
     const pass = this.store.write(tx => this.step(tx, gates, at));
-    if (pass.kind !== "slots") return pass;
+    if (pass.kind !== "slots") {
+      this.waiting = pass.kind === "wait" ? pass.reason : null;
+      return pass;
+    }
     const free = await gates.freeSlots();
-    if (free < TRIAL_SLOTS_FREE_MIN) return { kind: "wait", reason: "session-slots" };
+    if (free < TRIAL_SLOTS_FREE_MIN) {
+      this.waiting = "session-slots";
+      return { kind: "wait", reason: "session-slots" };
+    }
+    this.waiting = null;
     return pass.start;
+  }
+
+  /** Remembers a gate the pump found after `next` answered `start`. */
+  hold(reason: string): void {
+    this.waiting = reason;
+  }
+
+  /** Takes back a start that failed before any judge session: the row goes, the ordering keeps its attempt, and the reason is remembered. */
+  release(judgementId: string, reason: string): void {
+    this.store.write(tx => { releaseJudgement(tx, judgementId); });
+    this.waiting = reason;
   }
 
   begin(start: Start): "inserted" | "exists" {

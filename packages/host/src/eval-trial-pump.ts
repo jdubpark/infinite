@@ -524,7 +524,10 @@ export class TrialPump {
     const next = await judgements.next(this.gates(gate, grader));
     if (next.kind !== "start") return false;
     const identity = await this.identityProbe(grader.uid, next.projectId);
-    if (identity.state !== "ready") return false;
+    if (identity.state !== "ready") {
+      judgements.hold("eval-identity");
+      return false;
+    }
     await this.beginJudgement(next, identity, grader);
     return true;
   }
@@ -545,9 +548,10 @@ export class TrialPump {
       // The context's job names the grader's job directory and its bundle, never the calibration.
       const graderJob = graderJobOf(start.calibrationId, start.projectId);
       const ctx = "settings" in found ? this.contextOf({ projectId: start.projectId, jobId: graderJob }, found.settings, id, identity, grader) : undefined;
+      // A host failure before any judge session uses no attempt: the row goes and the same slot starts again.
       if (ctx === undefined) {
         this.cooldown = 1;
-        return judgements.finish(id, { ending: "void-host", sessionId: null });
+        return judgements.release(id, "mirror");
       }
       const source = await (this.options.prepareSource ?? prepareTrialSource)(this.options.store, start.taskId, ctx);
       if (source.kind === "skip") return dropped("source-skipped");
@@ -557,7 +561,7 @@ export class TrialPump {
           this.dirty = true;
           this.started = false;
         }
-        return judgements.finish(id, { ending: "void-host", sessionId: null });
+        return judgements.release(id, source.cause === "halted" ? "halt" : source.cause);
       }
       // From here the account holds the source, so every way out cleans it.
       const files = source.isolation === "isolated" ? judgePackage({

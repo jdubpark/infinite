@@ -117,6 +117,12 @@ export class TrialPump {
       if (!this.ready()) return;
       const at = this.now();
       this.options.store.tryWrite(tx => { sweepTrials(tx, at); });
+      // The step runs only while a job is open, so an idle paused or blocked job past its expiry ends here.
+      try {
+        this.options.jobs.expireIdle();
+      } catch {
+        // A busy store leaves the expiry for the next sweep; the rest of this sweep still runs.
+      }
       const teams = this.options.teams();
       for (const trialId of teams.replayIds()) {
         try {
@@ -167,6 +173,14 @@ export class TrialPump {
     if (this.options.config.eval?.member === undefined) return "not-configured";
     if (this.probed !== undefined && Date.now() - this.probed.at <= IDENTITY_FRESH_MS) return this.probed.probe.state;
     return "unavailable";
+  }
+
+  /** For display: the scheduling state, plus the last probe when that state is `unavailable` and a probe has happened. */
+  identityStatus(): { state: EvalIdentityState; lastProbe?: { state: EvalIdentityState; at: string } | null } {
+    const state = this.identityState();
+    if (state !== "unavailable") return { state };
+    if (this.probed === undefined) return { state, lastProbe: null };
+    return { state, lastProbe: { state: this.probed.probe.state, at: new Date(this.probed.at).toISOString() } };
   }
 
   private async advance(): Promise<void> {

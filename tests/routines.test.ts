@@ -125,6 +125,16 @@ test("eval settings stay out of the routine approval digest", async () => {
   } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("the main check setting stays out of the routine approval digest", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    await service.create(f.create()); await wait(30); await service.tick();
+    f.config.projects[0]!.team!.mainCheck = { minutes: 20 };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "running", "turning the main check on does not block the routine");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("trial settings leave the routine digest alone", async () => {
   const f = setup(); const service = f.createService();
   try {

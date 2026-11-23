@@ -201,8 +201,8 @@ const schema = z
         endpoint: z.url().default("https://exp.host/--/api/v2/push/send"),
         detail: z.enum(["minimal", "full"]).default("minimal"),
         events: z
-          .array(z.enum(["needs-you", "turn-finished", "exited", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "team-blocked", "host-storage", "autonomy-interrupt"]))
-          .default(["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "host-storage", "autonomy-interrupt"]),
+          .array(z.enum(["needs-you", "turn-finished", "exited", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "team-blocked", "host-storage", "autonomy-interrupt", "main-check"]))
+          .default(["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "host-storage", "autonomy-interrupt", "main-check"]),
       })
       .strict()
       .optional(),

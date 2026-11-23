@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { EvidenceDeliveryLedger, InteractivePermissionDelivery, permissionDeliveryModule, type PermissionDeliveryLedger } from "../packages/host/src/permission-delivery.js";
 import type { PermissionInteractiveTarget, PermissionOutcome, PermissionPipeline, PermissionRequest } from "../packages/host/src/permission-agent-types.js";
-import { teamPermissionRequest, teamPermissionTarget } from "../packages/host/src/team-permission-adapter.js";
+import { teamPermissionRequest, teamPermissionTarget, teamPermissionTask } from "../packages/host/src/team-permission-adapter.js";
 
 type Live = Awaited<ReturnType<PermissionInteractiveTarget["check"]>>;
 
@@ -308,4 +308,39 @@ test("a team member's source file that the review read must be unchanged at deli
   content = "second";
   const live = await target.check();
   assert.deepEqual([live.ok, live.ok ? undefined : live.stale, live.ok ? undefined : live.reason], [false, true, "A source file that the review read changed."]);
+});
+
+test("a team member's task that changed while the request was decided withholds the answer, and a renamed run does not", async () => {
+  const root = "/home/dev/projects/infinite";
+  const prompt = request().prompt!;
+  const workspace = { changedPaths: [], evidence: { files: [], limitations: [], digest: "workspace" } };
+  const run = { id: "run-1", projectId: "project-1", provider: "codex", title: "Run", objective: "Objective" };
+  const assignment = { runId: "run-1", memberId: "member-1", revision: 1, role: "implementer" as const };
+  const built = teamPermissionRequest({
+    run: run as never, member: { sessionId: "session-1", memberId: "member-1", role: "implementer", revision: 1 } as never,
+    prompt, sessionRoot: root, workspace, acceptedChecks: null,
+  });
+  let now = { ...run };
+  let open = true;
+  const target = teamPermissionTarget(built, {
+    manager: {
+      meta: () => ({ session: { team: assignment, cwd: root } }),
+      state: async () => ({ status: "running", control: null, attention: open ? { state: "needs-you", prompt } : { state: "working" } }),
+      answerAgentPermission: async () => { throw new Error("not reached"); },
+    } as never,
+    assignment,
+    runCheck: () => undefined,
+    sessionRoot: () => root,
+    workspace: async () => workspace,
+    task: () => teamPermissionTask(now, undefined),
+  });
+  assert.equal((await target.check()).ok, true);
+  // The host names a run on its own; that is no change of the member's task.
+  now = { ...run, title: "A name the host wrote" };
+  assert.equal((await target.check()).ok, true);
+  now = { ...run, objective: "Objective, and never touch the release branch" };
+  assert.deepEqual(await target.check(), { ok: false, stale: false, reason: "The member's task changed after the request was read." });
+  // A dialog that closed is reported as gone, whatever the task reads now.
+  open = false;
+  assert.deepEqual(await target.check(), { ok: false, stale: true, reason: "The permission dialog changed or closed." });
 });

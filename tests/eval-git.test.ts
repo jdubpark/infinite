@@ -50,8 +50,22 @@ function recordingPrefix(dir: string): { prefix: TeamCommand; record: string } {
 function sleepingPrefix(dir: string): { prefix: TeamCommand; marker: string } {
   const marker = join(dir, "started.txt");
   const script = join(dir, "sleep.sh");
-  writeFileSync(script, `#!/bin/sh\necho started > "${marker}"\nsleep 10\n`);
+  writeFileSync(script, `#!/bin/sh\necho $$ > "${marker}"\nsleep 10\n`);
   return { prefix: { command: "/bin/sh", args: [script] }, marker };
+}
+
+/** After a limited read, the sleeper either never wrote its pid or is gone: a slow start cannot fail the read, a live leftover can. */
+async function assertSleeperGone(marker: string) {
+  const written = () => /^(\d+)\n$/.exec(existsSync(marker) ? readFileSync(marker, "utf8") : "")?.[1];
+  const until = Date.now() + 5000;
+  while (Date.now() < until && written() === undefined) await new Promise(resolve => setTimeout(resolve, 20));
+  const text = written();
+  if (text === undefined) return;
+  const pid = Number(text);
+  const gone = () => { try { process.kill(pid, 0); return false; } catch { return true; } };
+  const stop = Date.now() + 2000;
+  while (Date.now() < stop && !gone()) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(gone(), true, "the stopped read left its process running");
 }
 
 function failingPrefix(dir: string): TeamCommand {
@@ -186,14 +200,18 @@ test("a read that cannot end", async () => {
 
     let started = Date.now();
     assert.deepEqual(await git.patch(dir, from, to), { state: "failed" });
-    assert.ok(Date.now() - started < 2000);
-    assert.equal(existsSync(marker), true);
+    let took = Date.now() - started;
+    assert.ok(took >= 180, "the read ran until its limit: it did not fail at once");
+    assert.ok(took < 2000, "and it ended there");
+    await assertSleeperGone(marker);
 
     rmSync(marker, { force: true });
     started = Date.now();
     assert.deepEqual(await git.names(dir, from, to, 500), { state: "failed" });
-    assert.ok(Date.now() - started < 2000);
-    assert.equal(existsSync(marker), true);
+    took = Date.now() - started;
+    assert.ok(took >= 180, "the read ran until its limit: it did not fail at once");
+    assert.ok(took < 2000, "and it ended there");
+    await assertSleeperGone(marker);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

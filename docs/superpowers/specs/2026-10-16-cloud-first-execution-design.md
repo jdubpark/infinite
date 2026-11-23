@@ -72,7 +72,7 @@ Differences from the hybrid preparer:
 - A project records `lastSyncedAt`, `lastSyncedManifest`, `appliedAt`, `appliedManifest`, and `pendingGeneration`. `GET /api/projects/:id` returns them. Sync age is shown in the project picker on the Create screen; the session view shows the execution location.
 - Publication epochs and takeover fencing are not used. There is one executor per workspace, and it is the cloud.
 
-Cloud changes return to the Mac through `infinite pull PROJECT_ID --output DIRECTORY`, a project-level export. `infinite recover` stays for `--laptop` sessions. Comparing and merging is the owner's work until the reconciliation units in `docs/plans/2026-10-09-001-feat-seamless-hybrid-execution-plan.md` are built.
+Cloud changes return to the Mac through `infinite pull PROJECT_ID --output DIRECTORY`, a project-level export. `infinite recover` stays for `--laptop` sessions. Comparing and merging is the owner's work until the reconciliation units of the hybrid execution plan are built. That plan left the tree with the other plans of shipped work and stays in the Git history: `git show e71458b4:docs/plans/2026-10-09-001-feat-seamless-hybrid-execution-plan.md`.
 
 ## Context bundle
 

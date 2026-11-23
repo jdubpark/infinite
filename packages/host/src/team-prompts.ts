@@ -6,6 +6,7 @@ import { registerText, scopeSentence } from "./register-prompt.js";
 import { criteriaRowsText } from "./verdict-types.js";
 import { outputSchemas } from "./team-mcp-results.js";
 import { toolSignature } from "./tool-signature.js";
+import { KNOWN_RULE_TEXTS } from "./team-rule-texts.js";
 import { TeamError } from "./team-workspace.js";
 import type { BlockerEvidence, TeamMember, TeamModelProfile, TeamProject, TeamRun, TeamScout, TeamTask, TeamPermissionRecoveryStep, TeamPermissionRecoveryView, TeamView } from "./team-types.js";
 import type { Provider } from "./types.js";
@@ -29,10 +30,6 @@ export const codexMemberToolInstructions = (entryTools: boolean) => {
 };
 /** What a Codex program gets when a member tool fails: the member server answers with an error result, and the call returns it. */
 const toolFailureInstructions = "Each type is the result of a successful call. When a tool reports a failure the call does not throw: its result has isError true and the reason in content[0].text, and no structuredContent. Check isError before you read structuredContent, and print the reason.";
-// The working rule of the earlier release, frozen as text: a prompt written by that release must still be recognised
-// and retargeted, so these stay even though the rule above has moved on.
-export const EARLIER_RULE_WITHOUT_ENTRY = "Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures (arguments -> fields of a successful result's structuredContent): report({report}) -> {requestId, runId, memberId, revision, message}.";
-export const EARLIER_RULE_WITH_ENTRY = "Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures (arguments -> fields of a successful result's structuredContent): report({report}) -> {requestId, runId, memberId, revision, message}; entry_list({kinds?, taskId?, path?, since?, limit?}) -> {notice, heads, more, cursor?, unreadable}; entry_get({entryId}) -> {notice, head, body}; entry_post({entry}) -> {entryId, state, message}.";
 /** Every member and session reads it: a reject is final, and the same effect is never reached another way. */
 export const permissionRejectInstructions = "A rejected permission request is final for that request. Do not reach the same effect with another tool, command, or route.";
 /** What every asking agent reads about the recommendation its question must carry. */
@@ -127,6 +124,7 @@ function withoutPrivateSettings<T extends object>(project: T): T {
   const copy = { ...project } as Record<string, unknown>;
   delete copy.features;
   delete copy.eval;
+  delete copy.mainCheck;
   delete copy.routing;
   delete copy.objective;
   return copy as T;
@@ -339,7 +337,7 @@ const [entryCommandHead, entryCommandTail] = entryInstructions("opencode", "\0")
 const REPORT_PARAGRAPHS = [reportingInstructions("claude"), reportingInstructions("codex")];
 const ENTRY_PARAGRAPHS = [entryInstructions("claude"), entryInstructions("codex")];
 const CONTEXT_PARAGRAPH = contextAccessInstructions();
-const RULE_PARAGRAPHS = [codexMemberToolInstructions(false), codexMemberToolInstructions(true), EARLIER_RULE_WITHOUT_ENTRY, EARLIER_RULE_WITH_ENTRY];
+const RULE_PARAGRAPHS = [codexMemberToolInstructions(false), codexMemberToolInstructions(true), ...KNOWN_RULE_TEXTS];
 type PromptParagraphKind = "report" | "entry" | "context" | "sandbox" | "rule" | "profile" | "readonly";
 type PromptLayoutRole = TeamMember["role"];
 type PromptLayout = { report: number; entry?: number; context?: number; profile?: number };

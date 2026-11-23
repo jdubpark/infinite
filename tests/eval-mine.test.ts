@@ -139,6 +139,12 @@ test("a change-count or message read whose output a leftover held is failed, not
     const git = mineGit(() => ({ command: "/bin/sh", args: [script] }));
     assert.deepEqual(await git.numstat(mirror, ids[0]!, ids[1]!), { state: "failed" });
     assert.deepEqual(await git.message(mirror, ids[1]!), { state: "failed" });
+    // Control: the same launcher without the sleep reads both, so the leftover alone fails the reads above.
+    const plain = join(dir, "plain.sh");
+    writeFileSync(plain, `#!/bin/sh\nshift\nexec git "$@"\n`);
+    const control = mineGit(() => ({ command: "/bin/sh", args: [plain] }));
+    assert.equal((await control.numstat(mirror, ids[0]!, ids[1]!)).state, "read");
+    assert.equal((await control.message(mirror, ids[1]!)).state, "read");
   } finally {
     const left = existsSync(leftFile) ? readFileSync(leftFile, "utf8").split("\n").filter(Boolean).map(Number) : [];
     for (const pid of left) if (Number.isSafeInteger(pid) && pid > 1) { try { process.kill(pid, "SIGKILL"); } catch { /* Already ended. */ } }

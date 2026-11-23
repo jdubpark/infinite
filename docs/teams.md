@@ -2849,7 +2849,9 @@ The rule has two limits. A command that was stopped before its process exited
 ends when its output closes, or at the caller's limit where the caller sets
 one. Setup and check commands set none, so a check or setup command that ran
 past its time limit and left a process in another session holding its output
-keeps its operation open until that process ends. Two Git runners outside the
+keeps its operation open until that process ends. Under a command prefix that
+refuses the host's signal the stop reaches nothing, so any process that still
+holds the output does the same. Two Git runners outside the
 team command runner, the streamed patch and file reads and the team bundle
 download, are not covered yet: they wait for their output to close, and a stop
 signals the command's process group.
@@ -3611,7 +3613,7 @@ The host sends one push per device when the health of main changes. It sends the
 
 The main check never starts an agent, never writes a project signal, and never changes a session, a routine or a team. It does not merge, deploy or change a branch.
 
-A command of a check ends when the process that the host started for it exits, as every team command does. While that process runs, a halt, the command's time limit and a host stop end the command: the host kills the command's process group, and a check that ends this way has no result. After that process has exited, the host sends no signal to anything the command started. It reads output that is still open for at most one second, then closes it, and the command passes or fails by its exit code. A stop that arrives in that second ends the check with no result, and still sends no signal. A process that a check left behind is therefore never signalled by the host. When such a process writes to the closed output, the write fails as a write to a closed pipe does. The host removes the copy only after a process census finds nothing of the run alive. Until then the project waits on `processes`, and no main check starts on the host. Under a command prefix the removal is a command too, and the same rule holds for it: once the process that the host started for the removal has exited, the host signals nothing.
+A command of a check ends when the process that the host started for it exits, as every team command does. While that process runs, a halt, the command's time limit and a host stop end the command: the host kills the command's process group, and a check that ends this way has no result. After that process has exited, the host sends no signal to anything the command started. It reads output that is still open for at most one second, reads what the pipes already hold, then closes it, and the command passes or fails by its exit code. A stop that arrives in that second ends the check with no result, and still sends no signal. A process that a check left behind is therefore never signalled by the host. When such a process writes to the closed output, the write fails as a write to a closed pipe does. The host removes the copy only after a process census finds nothing of the run alive. Until then the project waits on `processes`, and no main check starts on the host. Under a command prefix the removal is a command too, and the same rule holds for it: once the process that the host started for the removal has exited, the host signals nothing.
 
 If the host cannot read a project's main-check record, the owner's read answers `readable: false`. The record may name a copy that is not removed yet, so the host never overwrites it and starts no main check on the whole host until it can be read; it tries again on every pass. The record is `main-check/PROJECT_ID.sealed` in the host state directory. When it cannot be restored, removing that file clears the state at the next pass, and a copy the record named stays under the team workspace until someone removes it.
 

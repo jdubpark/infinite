@@ -11,7 +11,7 @@ import type { EvalProbe } from "./eval-identity.js";
 import { ACTIVE_PROJECT_JOBS_SQL, inWindow, JOB_EXPIRY_DAYS_MAX, JOB_TASKS_MAX, type EvalJobRow } from "./eval-jobs.js";
 import { applyComparison, comparisonJobSchema, pinsChanged, planComparison } from "./eval-compare-jobs.js";
 import { TRIAL_TASKS_SQL, type TrialTaskRow } from "./eval-sets.js";
-import { configRef, nextSlot, VOID_STREAK_PAUSE } from "./eval-trial-rules.js";
+import { configRef, nextSlot, TRIAL_RELEASES, VOID_STREAK_PAUSE } from "./eval-trial-rules.js";
 import {
   advanceTask, jobSlots, jobTrialCount, openTrialCounts, trialCounts, trialsSince, TRIAL_KEEP_DAYS_DEFAULT, type TrialCounts,
 } from "./eval-trial-store.js";
@@ -113,6 +113,8 @@ export class TrialJobs {
   private readonly store: EvidenceStore;
   private readonly config: Pick<Config, "projects" | "eval" | "teams">;
   private readonly now: () => string;
+  /** The slot whose releases are being counted, and how many in a row. */
+  private released = { key: "", count: 0 };
 
   constructor(options: { store: EvidenceStore; config: Pick<Config, "projects" | "eval" | "teams">; now?: () => string }) {
     this.store = options.store;
@@ -257,6 +259,23 @@ export class TrialJobs {
       if (counts === undefined || !VOID_ENDINGS.includes(ending) || counts.voidStreak < VOID_STREAK_PAUSE) return;
       setJob(tx, jobId, this.now(), { status: "paused", reason: "trial-voids", waiting: null });
     });
+  }
+
+  /**
+   * A trial that could not start for a host cause. The cause is the job's `waiting`. Answers "released" while the slot keeps
+   * its attempt, and "exhausted" on the TRIAL_RELEASES-th release in a row for one slot: the caller then ends the trial `void-host`.
+   * The count is in memory, so a restart starts it again.
+   */
+  release(slot: Pick<Extract<NextTrial, { kind: "trial" }>, "jobId" | "taskId" | "configRef" | "slot" | "attempt">, waiting: EvalJobWait): "released" | "exhausted" {
+    const key = JSON.stringify([slot.jobId, slot.taskId, slot.configRef, slot.slot, slot.attempt]);
+    const count = this.released.key === key ? this.released.count + 1 : 1;
+    this.released = count >= TRIAL_RELEASES ? { key: "", count: 0 } : { key, count };
+    if (count >= TRIAL_RELEASES) return "exhausted";
+    this.store.write(tx => {
+      const row = this.rowOf(tx, slot.jobId);
+      if (row !== undefined && row.waiting !== waiting) setJob(tx, row.job_id, this.now(), { waiting });
+    });
+    return "released";
   }
 
   block(jobId: string, reason: "eval-processes-alive"): void {

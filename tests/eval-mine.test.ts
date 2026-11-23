@@ -128,6 +128,24 @@ test("the mining forms are exact and checked", async () => {
   }
 });
 
+test("a change-count or message read whose output a leftover held is failed, not too large", { skip: process.platform === "win32" && "process groups are POSIX" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "eval-mine-"));
+  const leftFile = join(dir, "left.pids");
+  try {
+    const { mirror, ids } = mirrorWith(dir, [{ "src/a.ts": "one\n" }, { "src/a.ts": "two\n", "tests/a.test.ts": "two\n" }]);
+    // A launcher that leaves a sleep holding the output, then runs Git as the leader: each read settles a drain after Git exits.
+    const script = join(dir, "leave.sh");
+    writeFileSync(script, `#!/bin/sh\nsleep 30 &\necho $! >> "${leftFile}"\nshift\nexec git "$@"\n`);
+    const git = mineGit(() => ({ command: "/bin/sh", args: [script] }));
+    assert.deepEqual(await git.numstat(mirror, ids[0]!, ids[1]!), { state: "failed" });
+    assert.deepEqual(await git.message(mirror, ids[1]!), { state: "failed" });
+  } finally {
+    const left = existsSync(leftFile) ? readFileSync(leftFile, "utf8").split("\n").filter(Boolean).map(Number) : [];
+    for (const pid of left) if (Number.isSafeInteger(pid) && pid > 1) { try { process.kill(pid, "SIGKILL"); } catch { /* Already ended. */ } }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("the verdict follows the design's limits", () => {
   const read = (entries: NumstatEntry[]) => ({ state: "read" as const, entries });
   const source = { path: "src/a.ts", added: 1, removed: 0 };

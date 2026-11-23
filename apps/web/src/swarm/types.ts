@@ -61,10 +61,10 @@ export const STAGES = ["plan", "scout", "build", "integrate", "check", "review",
 export type Stage = typeof STAGES[number];
 export const STAGE_LABEL: Record<Stage, string> = { plan: "plan", scout: "scout", build: "build", integrate: "integ", check: "check", review: "review", ship: "ship" };
 
-/** PM project manager, SC scout, IM implementer, IN integrator, RV reviewer, DL delivery, PR permission reviewer, MC mission coordinator, SO solo session. */
-export type RoleCode = "PM" | "SC" | "IM" | "IN" | "RV" | "DL" | "PR" | "MC" | "SO";
+/** PM project manager, SC scout, IM implementer, IN integrator, RV reviewer, EV evaluator, DL delivery, PR permission reviewer, MC mission coordinator, SO solo session. */
+export type RoleCode = "PM" | "SC" | "IM" | "IN" | "RV" | "EV" | "DL" | "PR" | "MC" | "SO";
 export const ROLE_NAME: Record<RoleCode, string> = {
-  PM: "Project manager", SC: "Scout", IM: "Implementer", IN: "Integrator", RV: "Reviewer", DL: "Delivery",
+  PM: "Project manager", SC: "Scout", IM: "Implementer", IN: "Integrator", RV: "Reviewer", EV: "Evaluator", DL: "Delivery",
   PR: "Permission reviewer", MC: "Mission coordinator", SO: "Solo session",
 };
 

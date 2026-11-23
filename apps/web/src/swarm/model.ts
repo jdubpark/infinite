@@ -30,6 +30,7 @@ const ROLES = new Map<string, { code: RoleCode; stage?: Stage }>([
   ["implementer", { code: "IM", stage: "build" }],
   ["integrator", { code: "IN", stage: "integrate" }],
   ["reviewer", { code: "RV", stage: "review" }],
+  ["evaluator", { code: "EV", stage: "review" }],
   ["delivery", { code: "DL", stage: "ship" }],
   ["permission-coordinator", { code: "PR" }],
 ]);

@@ -581,15 +581,13 @@ const jobOf = (r: ReturnType<typeof rig>, jobId: string) => r.store.read(db => d
 /** A source that ends with `cause` for the first `failures` builds, then skips the task. Each build records the row's attempt and the job's wait. */
 function scripted(failures: number, cause: "bundle-missing" | "grader-failed" = "bundle-missing") {
   const builds: Built[] = [];
-  let store: EvidenceStore | undefined;
   let jobId = "";
   const prepareSource: TrialPumpOptions["prepareSource"] = async (_store, _taskId, ctx) => {
     const row = _store.read(db => db.get<{ slot: number; attempt: number }>("SELECT slot, attempt FROM eval_trials WHERE trial_id = ?", ctx.trialId))!;
-    store = _store;
     builds.push({ slot: row.slot, attempt: row.attempt, waiting: jobId === "" ? null : _store.read(db => db.get<{ waiting: string | null }>("SELECT waiting FROM eval_jobs WHERE job_id = ?", jobId))!.waiting });
     return builds.length <= failures ? { kind: "environment", cause } : { kind: "skip", reason: "not-valid" };
   };
-  return { builds, prepareSource, setJob: (id: string) => { jobId = id; }, store: () => store };
+  return { builds, prepareSource, setJob: (id: string) => { jobId = id; } };
 }
 
 /** Steps until `count` source builds (or status reads, with no mirror head) were made; a step budget keeps a stuck pump from hanging. */

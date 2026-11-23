@@ -351,9 +351,11 @@ export class TrialPump {
 
   /** Ends a trial row `void-host` with no member graded, and counts the void for its job. A preparing row is started first, so it counts as started. */
   private voidHost(trialId: string, jobId: string, taskId: string, at: string, sessionId: string | null): void {
-    this.options.store.write(tx => startTrial(tx, trialId, at));
-    this.options.store.write(tx => finishTrial(tx, trialId, this.final(gradeOf({ ending: "void-host", expected: this.expectedOf(taskId),
-      overwritten: 0, diff: null, isolation: "none" }), null, null, sessionId), at));
+    const final = this.final(gradeOf({ ending: "void-host", expected: this.expectedOf(taskId), overwritten: 0, diff: null, isolation: "none" }), null, null, sessionId);
+    this.options.store.write(tx => {
+      startTrial(tx, trialId, at);
+      finishTrial(tx, trialId, final, at);
+    });
     this.options.jobs.record(jobId, "void-host");
   }
 

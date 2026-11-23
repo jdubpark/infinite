@@ -1466,7 +1466,7 @@ The list returns `{ calibrations: [...] }`, newest first, at most 20. A start an
 
 A view holds `calibrationId`, `profileId`, `profileEpoch`, `promptVersion`, `status` (`running`, `completed`, `cancelled`, or `expired`), `reason`, `state`, `pairs` (`planned`, `counted`, `correct`, and the pair count of each project), `accuracy`, `lowerBound`, `swapAgreement`, `judgeMinutes`, `cost` (`tokens` and `spentUsd`), `createdAt`, `expiresAt`, `completedAt`, `validUntil`, `inForce`, and `waiting`. While a calibration runs, `counted` and `correct` are 0 and its figures are null, because the host writes them when the calibration ends. A view never holds a task, a trial, a patch, a rubric, model text, or the judge's summary.
 
-**The wait reason.** `waiting` names the gate that holds the next judgement of a running calibration. It is `null` on a calibration that is not running, and when no gate is known. It holds one of the eight gate names in the table above, `mirror` (the project has no mirror head or no GitHub base branch), or a cause of a failed source build: `grader-failed`, `grader-processes-alive`, `eval-failed`, `eval-processes-alive`, `bundle-missing`, `storage`, or `halt` for a halted project. The host keeps the reason in memory, so it is empty after a restart until the next step. The command line prints it as `waiting on REASON`.
+**The wait reason.** `waiting` names the gate that holds the next judgement of a running calibration. It is `null` on a calibration that is not running, and when no gate is known. It holds one of the eight gate names in the table above, `mirror` (the project has no mirror head or no GitHub base branch), or a cause of a failed source build: `grader-failed`, `grader-processes-alive`, `eval-failed`, `eval-processes-alive`, `bundle-missing`, `storage`, or `halt` for a halted project. The host keeps the reason in memory, so it is empty after a restart, and on a new calibration, until the next step. While a trial holds the eval account the host asks for no judgement, and the reason is `another-job`. The command line prints it as `waiting on REASON`.
 
 **A host failure uses no attempt.** When the project has no mirror head, or the source build ends on an environment cause, no judge session has started. The host deletes the judgement row, the ordering keeps its attempt, and the calibration waits. The same judgement runs again once the cause clears, or the calibration expires. A failure after the source exists, and a row left in flight by a restart, still end the attempt `void-host`.
 
@@ -1490,6 +1490,7 @@ in force · judge minutes 10 · known spend 182000 tokens, $24.10 · created CRE
 
 #### Known limits of phase 1
 
+- A calibration has no blocked state. A cause that does not clear by itself holds it until it expires or the owner cancels it. The view's `waiting` names the cause.
 - A stop that leaves eval processes alive voids the judgement, and the start-up retries it.
 - The view's spend is a floor.
 

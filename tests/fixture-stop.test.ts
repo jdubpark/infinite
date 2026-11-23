@@ -6,7 +6,8 @@ import { join } from "node:path";
 import test from "node:test";
 import { endSessionWorkers, inProcessHost, processes, startHost, waitFor, WORKER_ENTRY } from "./helpers.js";
 
-const running = (pid: number) => processes().some(row => row.pid === pid);
+// A process that has ended and waits for its parent to collect it keeps its row and shows no command line.
+const running = (pid: number) => processes().some(row => row.pid === pid && row.command.includes(WORKER_ENTRY));
 
 test("a spawned host's stop ends a session whose worker is not listening yet", { timeout: 90 * 1000 }, async () => {
   const host = await startHost();

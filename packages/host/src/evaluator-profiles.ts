@@ -82,22 +82,25 @@ function sameModel(a: TeamModelProfile, b: TeamModelProfile): boolean {
 }
 
 /**
- * C14 rules 1 to 3 over evaluatorProfiles(lineup). `authors`: the profiles of implementer and integrator members whose work
+ * C14 rules 1 to 3 over evaluatorProfiles(lineup). Rule 1 excludes the coordinator's family and the family of every project manager that ran
+ * (`managers`; a fallback profile can differ from the coordinator); an unknown manager family makes none eligible. `authors`: the profiles of implementer and integrator members whose work
  * integrated in the run. `reviewers`: the run's reviewer profiles. `excluded`: profile ids that already failed this verdict.
  */
 export function chooseEvaluator(
   lineup: TeamLineup | undefined,
-  cycle: { authors: readonly TeamModelProfile[]; reviewers: readonly TeamModelProfile[] },
+  cycle: { authors: readonly TeamModelProfile[]; reviewers: readonly TeamModelProfile[]; managers: readonly TeamModelProfile[] },
   limited: ReadonlySet<Provider>,
   excluded?: ReadonlySet<string>,
 ): EvaluatorChoice {
   if (!lineup) return { skipped: "no-independent-evaluator" };
   const coordinatorFamily = familyOf(lineup.coordinator);
   if (coordinatorFamily === undefined) return { skipped: "no-independent-evaluator" };
+  const managerFamilies = cycle.managers.map(manager => familyOf(manager));
+  if (managerFamilies.some(family => family === undefined)) return { skipped: "no-independent-evaluator" };
   const eligible: Array<{ profile: TeamModelProfile; family: string }> = [];
   for (const profile of evaluatorProfiles(lineup)) {
     const family = familyOf(profile);
-    if (family === undefined || family === coordinatorFamily) continue;
+    if (family === undefined || family === coordinatorFamily || managerFamilies.includes(family)) continue;
     if (cycle.authors.some(author => sameModel(author, profile))) continue;
     eligible.push({ profile, family });
   }

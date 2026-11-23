@@ -916,7 +916,7 @@ A job is created with a request. The CLI reads it from a file of at most 64 KiB,
 
 **Pinned configuration.** The job pins the validation settings and `eval.grader` when it is created. The settings are `focusedTest`, `reportFormat`, `gradingPaths`, `guardChecks`, and `setup`. A change to any of them blocks the job with `configuration-changed` before its next task. `resume` pins the new values, and that is the owner's approval. A change to the prompt version or the permission policy does not block a job.
 
-**Statuses.** A job is `scheduled`, `running`, `paused`, `blocked`, `completed`, `cancelled`, or `expired`. The reasons are `owner`, `validation-stuck`, `configuration-changed`, `grader-processes-alive`, `limit-reached`, `done`, and `expired`.
+**Statuses.** A job is `scheduled`, `running`, `paused`, `blocked`, `completed`, `cancelled`, or `expired`. The reasons are `owner`, `validation-stuck`, `configuration-changed`, `grader-processes-alive`, `limit-reached`, `done`, and `expired`. A paused or blocked baseline, compare, or confirm job also ends as `expired` once its `expiresAt` has passed, on the next pass or the hourly sweep. A job with a trial still preparing, running, or grading expires after that trial ends.
 
 **Waits.** A job that cannot start a task says why, in its `waiting` field:
 
@@ -977,7 +977,7 @@ A `404` without a known code prints `This host has no eval routes. Upgrade the h
 | `POST /api/eval/jobs/:id/pause`, `resume`, `cancel` | Owner |
 | `POST /api/eval/tasks/:id/retire` | Owner |
 
-A body or id that does not parse is `400` `invalid-eval-request`. An unknown project, job, or task is `404`. A store that is not ready is `503` `evidence-unavailable`. No route returns a capsule, a patch, a file name, a case, or a commit. The report and priors routes exist: see [Eval comparisons](#commands-and-routes).
+A body or id that does not parse is `400` `invalid-eval-request`. An unknown project, job, or task is `404`. A store that is not ready is `503` `evidence-unavailable`. A job read or control that touches a baseline, compare, or confirm job needs the `eval-trials` module, so it answers `503` `evidence-unavailable` while that module is not ready; a validation job still reads and controls. The project summary always needs the `eval-trials` module once the host is configured for trials, so it answers `503` for every project while that module is not ready. A retried baseline create with the same request id answers `503` while the module is not ready. No route returns a capsule, a patch, a file name, a case, or a commit. The report and priors routes exist: see [Eval comparisons](#commands-and-routes).
 
 ### Git forms of mining and validation
 
@@ -1109,7 +1109,7 @@ The reasons that stop a job are `trial-voids` (three voids in a row), `eval-proc
 Nothing in this change is installed. Until the owner installs each part, the state shows what is missing:
 
 - **No `eval.member`:** the summary shows `eval identity not-configured`, and a baseline job waits `eval-identity`.
-- **Launcher not installed, or failing:** the summary shows `eval identity unavailable`, and a baseline job waits `eval-identity`.
+- **Launcher not installed, or failing:** the summary shows `eval identity unavailable (not probed)` or `eval identity unavailable (last probe STATE, TIME)`, and a baseline job waits `eval-identity`.
 - **Grader version 1:** the summary shows `grader ready (version 1: no trials)`, and a baseline job waits `grader`. Validation runs as before.
 - **A provider wrapper refused:** the replay launch fails, and the trial ends `void-host`. Three such trials pause the job `trial-voids`.
 
@@ -1117,7 +1117,7 @@ The owner chooses these. The defaults are the ones this slice builds: the window
 
 #### Summary and status
 
-The summary and `infinite eval status PROJECT` add three things. The eval identity line is `eval identity STATE`. The trial line is `trials today N of CAP`, or `trials off` without a cap. The grader line shows `grader ready (version 1: no trials)` when the grader's version is below 2. A baseline job prints `tasks R of P (skipped S) · trials started N of P, graded N, resolved N, ended N, void N`.
+The summary and `infinite eval status PROJECT` add three things. The eval identity line is `eval identity STATE`; for `unavailable` it adds `(not probed)` when the host never probed, or `(last probe STATE, TIME)` when the last probe aged out. The trial line is `trials today N of CAP`, or `trials off` without a cap. The grader line shows `grader ready (version 1: no trials)` when the grader's version is below 2. A baseline job prints `tasks R of P (skipped S) · trials started N of P, graded N, resolved N, ended N, void N`.
 
 When the project has `team.eval`, the summary adds the task count of each set (`tasks.bySet`, with `dev` and `holdout`), and its groups gain `holdout` and `exposed` counts. The status prints `sets dev N · holdout M`, and its groups line ends `holdout H, exposed X`. A project without `team.eval` has no set counts. A compare or confirm job prints the baseline line with `reused N` added, `resolved hidden` until its report is ready, and `report pending` or `report ready` once it has finished.
 
@@ -1215,7 +1215,7 @@ At creation, a comparison job pins, for each configuration, the profile epoch at
 
 A finished `compare` or `confirm` job gets one report. A report pass runs on the host's tick. It takes the oldest finished job without a report, once the job's trial sessions are gone, so that their cost is recorded. It waits at most 24 hours after the job finished. The sessions go about an hour after their trials end, at most 20 per sweep. The pass computes the figures from the job's trial rows (at most 5,000) and its tasks' plain fields (at most 200), seals the report, and never changes it. Every read gives the same figures. A job whose sealed list cannot be opened gets a report with state `unreadable`.
 
-While a job is active, its view shows no result: `trials.resolved` is null and `report` is null. A finished job shows `report` `pending`, and then `ready`.
+While a job is active, its view shows no result: `trials.resolved` is null and `report` is null. A finished job shows `report` `pending`, and then `ready`, or `unreadable` when the stored report could not be built.
 
 The report names each configuration by its index (the order of the request), `profileId`, provider, profile epoch, and prompt version. It never names a model. It holds only aggregates. It holds no task, group, trial, or session id, and no commit, file name, case, patch, or text.
 
@@ -2650,6 +2650,8 @@ Observations are grouped into an episode held in the worker. An episode starts a
 - Only a corroborated observation writes the host-level entry in `providerLimits`. It lasts until the provider's stated reset time, capped at 24 hours, or 15 minutes when the provider stated none. Only a later successful turn, by the same measure, of a session of that provider clears it early, and an older observation cannot restore a cleared entry. New members of that provider launch on their fallback while the entry exists. With no fallback, they launch on the original profile.
 - A limit seen in any session, team member or not, updates the host-level entry. Nothing else happens to a non-team session.
 - Clients show the entry on the Teams list and the observation on session rows. Reset times are the provider's own statement, and a missing time means the provider gave none.
+
+The Codex working rule in a member prompt is recognised by exact text, so a retarget after a limit can find it. `packages/host/src/team-rule-texts.ts` lists every rule text main has generated; the list is append-only. When a member tool schema changes, the generated rule changes with it, and `tests/team-prompt-retarget.test.ts` fails until the new text is appended to the list and its hash to the pin.
 
 ### What the host never does
 

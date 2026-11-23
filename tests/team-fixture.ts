@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
-import { endSessionWorkers, startHost, waitFor, type Host } from "./helpers.js";
+import { endSessionWorkers, hostInThisProcess, startHost, waitFor, type Host } from "./helpers.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { CreateTeam, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 import type { ProjectSourceService } from "../packages/host/src/project-source.js";
@@ -142,10 +142,11 @@ process.exit(child.status ?? 1);
       writeFileSync(keyFile, randomBytes(32), { mode: 0o600 });
       const directConfig: Config = { port: 0, origin: "http://127.0.0.1", keyFile, stateDir: join(root, "state"), runDir: join(root, "run"),
         environment: "local", enableDemo: true, maxSessions: 24, projects: [], tokens: [], agents, ...hostConfig };
+      hostInThisProcess(directConfig);
       host = { root, config: directConfig, origin: directConfig.origin, tokens: {} as Host["tokens"],
         fetchApi: async () => { throw new Error("The no-server fixture does not expose an API client."); },
         start: async () => {}, stopApi: async () => {},
-        stop: async () => { const floor = new Promise(resolve => setTimeout(resolve, 1700)); await endSessionWorkers(directConfig); await floor; rmSync(root, { recursive: true, force: true }); } };
+        stop: async () => { const floor = new Promise(resolve => setTimeout(resolve, 1700)); try { await endSessionWorkers(directConfig); await floor; } finally { rmSync(root, { recursive: true, force: true }); } } };
     } else {
       host = await startHost({ agents, config: hostConfig,
         ...(options.trustWorkspaces ? { env: { HOME: home } } : {}),

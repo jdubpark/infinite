@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
-import { endSessionWorkers, waitFor } from "./helpers.js";
+import { endSessionWorkers, hostInThisProcess, waitFor } from "./helpers.js";
 import { unseal } from "../packages/host/src/vault.js";
 import { Manager } from "../packages/host/src/manager.js";
 import type { HostLoadProbe } from "../packages/host/src/host-load.js";
@@ -45,6 +45,7 @@ export function missionHarness(options?: { configure?: (config: Config) => void;
     environment: "local", enableDemo: true, maxSessions: 24, agents: { claude: agent("claude"), codex: agent("codex") },
     projects: [{ id: "api", name: "API", path: api, team: { checks } }, { id: "web", name: "Web", path: web, team: { checks } }],
     teams: { workspaceDir: join(root, "teams"), lineup } };
+  hostInThisProcess(config);
   options?.configure?.(config);
   const at = new Date().toISOString();
   const groups: ProjectGroupLookup = { get: id => {
@@ -76,12 +77,15 @@ export function missionHarness(options?: { configure?: (config: Config) => void;
     shut();
     // A tick already under way can still launch a coordinator attempt or subteam member after close().
     await closing?.missions.idle(); await closing?.teams.idle();
-    // Workers exit 1.5 s after their child. Ask until none answers, so no worker or provider outlives the test.
-    await endSessionWorkers(config);
-    await new Promise(done => setTimeout(done, 1700));
-    // A test that opened a store under the root closes it here: after the services stopped, before the folder goes.
-    beforeRemove?.();
-    rmSync(root, { recursive: true, force: true });
+    try {
+      // Workers exit 1.5 s after their child. Ask until none of them runs, so no worker or provider outlives the test.
+      await endSessionWorkers(config);
+      await new Promise(done => setTimeout(done, 1700));
+    } finally {
+      // A test that opened a store under the root closes it here: after the services stopped, before the folder goes.
+      beforeRemove?.();
+      rmSync(root, { recursive: true, force: true });
+    }
   };
   return { root, state: config.stateDir, key, api, web, open, shut, close, create, release, coordinatorReceipts, services: () => services! };
 }

@@ -1,11 +1,12 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, rmSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { hashToken } from "../packages/host/src/config.js";
 import { createApp } from "../packages/host/src/server.js";
 import { workerCall } from "../packages/host/src/ipc.js";
+import { unseal } from "../packages/host/src/vault.js";
 import type { Config, Role, ControlLease } from "../packages/host/src/types.js";
 
 export const waitFor = async <T>(
@@ -23,12 +24,35 @@ export const waitFor = async <T>(
   throw new Error(`Condition was not reached; last state: ${JSON.stringify(last)}`);
 };
 
-/** The running processes, for a test that must see what a host has started or left behind. */
-export function processes(): { pid: number; parent: number; command: string }[] {
-  return execFileSync("ps", ["-eo", "pid=,ppid=,args="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).split("\n").flatMap(line => {
-    const row = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
-    return row ? [{ pid: Number(row[1]), parent: Number(row[2]), command: row[3]! }] : [];
+/** The running processes, for a test that must see what a host has started or left behind. `age` is in seconds. */
+export function processes(): { pid: number; parent: number; age: number; command: string }[] {
+  return execFileSync("ps", ["-ww", "-eo", "pid=,ppid=,etime=,args="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).split("\n").flatMap(line => {
+    // The elapsed time reads [[days-]hours:]minutes:seconds.
+    const row = /^\s*(\d+)\s+(\d+)\s+(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s+(.*)$/.exec(line);
+    return row ? [{ pid: Number(row[1]), parent: Number(row[2]), age: ((Number(row[3] ?? 0) * 24 + Number(row[4] ?? 0)) * 60 + Number(row[5])) * 60 + Number(row[6]), command: row[7]! }] : [];
   });
+}
+
+/** What a session worker's command line holds. Its command line names no session. */
+export const WORKER_ENTRY = "/packages/host/src/worker.";
+/** A worker that has not listened after this many seconds is not waited for: the host that started it gave up after about four. */
+const WORKER_START_SECONDS = 6;
+/** The hosts that run in this process. A worker of another one is never taken for a worker that is still starting. */
+const hostsHere = new Set<Config>();
+/** Names a host that runs in this process, so that the stop of another one can tell their workers apart. */
+export function hostInThisProcess(config: Config): Config { hostsHere.add(config); return config; }
+
+/** The worker processes among `workers` that belong to this host: the pid each listening worker recorded, and every listed pid. */
+function hostWorkers(config: Config, workers: readonly { pid: number }[], listed: readonly number[] = []): number[] {
+  const running = new Set(workers.map(row => row.pid));
+  const pids = new Set(listed.filter(pid => running.has(pid)));
+  let key: Buffer, ids: string[];
+  try { key = readFileSync(config.keyFile); ids = readdirSync(join(config.stateDir, "sessions")); } catch { return [...pids]; }
+  for (const id of ids) try {
+    const pid = unseal<{ workerPid?: number }>(key, `${id}:status`, readFileSync(join(config.stateDir, "sessions", id, "status.sealed"), "utf8")).workerPid;
+    if (pid !== undefined && running.has(pid)) pids.add(pid);
+  } catch { /* no status record: the worker has not listened yet, or a test stands a socket in for it */ }
+  return [...pids];
 }
 
 export async function freePort() {
@@ -105,16 +129,37 @@ export async function stopSessionWorkers(config: Config) {
 }
 
 /**
- * Stops the session workers under the state directory and returns when none answers and every listed process is gone.
- * One request is not enough: a worker that was started and is not listening yet refuses the connection, and a worker
- * whose provider is still starting refuses the stop. Stop whatever starts sessions before the call.
+ * Stops the session workers of a host and returns when none of them runs. Stop whatever starts sessions before the call.
+ *
+ * One request is not enough: a worker that is not listening yet does not hear it, and a worker whose provider is still
+ * starting refuses it. So the request repeats while a worker process of this host runs. A worker counts by its process,
+ * never by an answer: a test may stand a socket in for a worker, and that answers for as long as the test runs.
+ *
+ * `started` lists the workers of a host that ran in a child process. Without it the host ran in this process: a worker
+ * that is not listening yet has no record there, so the call also waits while a worker child of this process is young
+ * and no host of this process has recorded it. After `limitMs` the workers of this host that still run are killed and
+ * the call throws.
  */
-export async function endSessionWorkers(config: Config, started: number[] = []) {
-  const running = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-  const until = Date.now() + 30000;
-  while (await stopSessionWorkers(config) + started.filter(running).length > 0) {
-    if (Date.now() > until) throw new Error("Session workers still run after the test stopped them");
-    await new Promise(resolve => setTimeout(resolve, 100));
+export async function endSessionWorkers(config: Config, started?: readonly number[], limitMs = 30000) {
+  const until = Date.now() + limitMs;
+  try {
+    for (;;) {
+      await stopSessionWorkers(config);
+      const workers = processes().filter(row => row.command.includes(WORKER_ENTRY));
+      const mine = hostWorkers(config, workers, started);
+      const known = new Set([...mine, ...[...hostsHere].filter(host => host !== config).flatMap(host => hostWorkers(host, workers))]);
+      const starting = started ? [] : workers.filter(row => row.parent === process.pid && !known.has(row.pid) && row.age < WORKER_START_SECONDS);
+      if (mine.length + starting.length === 0) return;
+      if (Date.now() > until) {
+        // A worker that starts and is never recorded belongs to no host this call can name, so it is not a failure here.
+        if (!mine.length) return;
+        for (const pid of mine) try { process.kill(pid, "SIGKILL"); } catch { /* it ended meanwhile */ }
+        throw new Error(`Session workers still ran ${limitMs} ms after the test stopped them and were killed: ${mine.join(", ")}`);
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  } finally {
+    hostsHere.delete(config);
   }
 }
 
@@ -190,13 +235,16 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     if (api?.pid !== undefined && api.exitCode === null && api.signalCode === null) {
       // A suspended API starts nothing more, so the list of its workers is complete. It holds a worker that is not listening yet.
       api.kill("SIGSTOP");
-      try { started = processes().filter(row => row.parent === api.pid && row.command.includes("/packages/host/src/worker.")).map(row => row.pid); } catch { /* no process list: the workers that answer are still stopped */ }
+      try { started = processes().filter(row => row.parent === api.pid && row.command.includes(WORKER_ENTRY)).map(row => row.pid); } catch { /* no process list: the workers that recorded themselves are still stopped */ }
     }
-    // The API ends first: while it runs, it can start a session after the workers were asked.
-    await stopApi();
-    await endSessionWorkers(config, started);
-    await floor;
-    rmSync(root, { recursive: true, force: true });
+    try {
+      // The API ends first: while it runs, it can start a session after the workers were asked.
+      await stopApi();
+      await endSessionWorkers(config, started);
+      await floor;
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   };
 
   try {
@@ -248,6 +296,7 @@ export async function inProcessHost(options?: { configure?: (config: Config) => 
   const host = createApp(config, key);
   await new Promise<void>(resolve => host.server.listen(0, "127.0.0.1", resolve));
   config.port = (host.server.address() as { port: number }).port;
+  hostInThisProcess(config);
   const origin = `http://127.0.0.1:${config.port}`;
   return {
     ...host, root, config, origin, tokens, fetchApi: apiClient(origin, tokens),
@@ -255,14 +304,17 @@ export async function inProcessHost(options?: { configure?: (config: Config) => 
       // The stop takes no less time than the fixed wait it had before: other processes of the host may still be writing.
       const floor = new Promise(resolve => setTimeout(resolve, 1700));
       // The services end first, as in the host's own shutdown: while they run, they can start a session after the workers were asked.
-      const closing = host.closeConnections();
-      await new Promise<void>(resolve => host.server.close(() => resolve()));
-      await closing;
-      // A step already under way can still start a session after close().
-      await host.missions.idle(); await host.teams.idle();
-      await endSessionWorkers(config);
-      await floor;
-      rmSync(root, { recursive: true, force: true });
+      try {
+        const closing = host.closeConnections();
+        await new Promise<void>(resolve => host.server.close(() => resolve()));
+        await closing;
+        // A step already under way can still start a session after close().
+        await host.missions.idle(); await host.teams.idle();
+        await endSessionWorkers(config);
+        await floor;
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     },
   };
 }

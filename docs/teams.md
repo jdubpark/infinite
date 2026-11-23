@@ -2858,6 +2858,15 @@ the signal ends only the `sudo` process, and the output says nothing. In both
 cases the command is left to finish and its result is not used. Size the limit
 for the project's full check on the execution host.
 
+Setup and check commands run with a small fixed environment, not a login shell.
+Where the agent egress boundary is configured (see
+[security](security.md#agent-egress-boundary)), that environment also carries
+the proxy variables and `NODE_USE_ENV_PROXY=1`, in a team run and in the main
+check alike. A test that behaves differently when `HTTPS_PROXY` is set can
+therefore fail on the host and pass everywhere else. Before relying on a
+project's checks on a host, run them once in that environment, and make such a
+test independent of the variables.
+
 Every command that the host's team command runner starts for a team (setup,
 checks, member setup, the Git commands it runs and, under a command prefix,
 workspace removal) ends with the process that the host started for it.

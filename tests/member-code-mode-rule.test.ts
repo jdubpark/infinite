@@ -164,7 +164,7 @@ test("a routed start reads the mode a new Claude member would start in", async (
  * Starts one session on a stand-in provider that records the arguments and the Code Mode variable it started with:
  * a team member in `role`, or the owner's own session when `role` is null.
  */
-async function launchMember(level: "off" | "all" | undefined, provider: "claude" | "codex", role: string | null = "implementer") {
+async function launchMember(level: "off" | "all" | undefined, provider: "claude" | "codex", role: string | null = "implementer", nativeArgs?: string[]) {
   const root = mkdtempSync(join(tmpdir(), "infinite-member-rule-"));
   const log = join(root, "launch.json");
   const agent = join(root, "agent.mjs");
@@ -180,11 +180,14 @@ setTimeout(() => process.exit(0), 300);
     const cwd = join(config.teams!.workspaceDir, randomUUID(), "integration");
     mkdirSync(cwd, { recursive: true });
     const assignment = { runId: randomUUID(), memberId: randomUUID(), revision: 1, role, taskId: "a" } as never;
-    const request = { requestId: randomUUID(), projectId: "rehearsal", provider, title: "Member", prompt: PROMPT };
+    const request = { requestId: randomUUID(), projectId: "rehearsal", provider, title: "Member", prompt: PROMPT, ...(nativeArgs ? { nativeArgs } : {}) };
     const session = role === null ? await manager.create(request, "owner") : await manager.createTeamSession(request, assignment, cwd);
     await waitFor(() => existsSync(log), Boolean, 60000);
     const launch = JSON.parse(readFileSync(log, "utf8")) as { args: string[]; mode: string | null };
-    return { session, mode: launch.mode, prompts: launch.args.filter(arg => arg.includes("Member prompt:")) };
+    // The request as a command prefix such as sudo passes it on: in the `env` key of a settings argument, one entry per argument.
+    const settingsMode = launch.args.flatMap((arg, index) => arg === "--settings"
+      ? [(JSON.parse(launch.args[index + 1]!) as { env?: Record<string, string> }).env?.CLAUDE_CODE_EXPERIMENTAL_CODE_MODE ?? null] : []);
+    return { session, mode: launch.mode, settingsMode, args: launch.args, prompts: launch.args.filter(arg => arg.includes("Member prompt:")) };
   } finally {
     await host.close();
     rmSync(root, { recursive: true, force: true });
@@ -192,28 +195,41 @@ setTimeout(() => process.exit(0), 300);
 }
 
 test("a Claude member launched with Code Mode on is started with its prompt and the rule, and its record says so", { timeout: 120000 }, async () => {
-  const { session, mode, prompts } = await launchMember("all", "claude");
+  const { session, mode, settingsMode, prompts } = await launchMember("all", "claude");
   assert.equal(session.codeMode, true);
   assert.equal(mode, "1", "the launch asked for Code Mode");
+  assert.deepEqual(settingsMode, ["1"], "and asked in its one settings argument, which a sudo prefix passes on");
   assert.deepEqual(prompts, [`${PROMPT}\n\n${claudeProgramInstructions}`]);
   assert.equal(session.initialPrompt, PROMPT, "the session record keeps the prompt the team gave");
 });
 
 test("the owner's own Claude session in Code Mode is started with the owner's prompt and no rule", { timeout: 120000 }, async () => {
-  const { session, mode, prompts } = await launchMember("all", "claude", null);
+  const { session, mode, settingsMode, prompts } = await launchMember("all", "claude", null);
   assert.equal(session.team, undefined);
   assert.equal(session.codeMode, true);
   assert.equal(mode, "1");
+  assert.deepEqual(settingsMode, ["1"]);
   assert.equal(prompts.length, 1);
   assert.ok(prompts[0]!.includes(PROMPT));
   assert.ok(!prompts[0]!.includes("Working rule for programs"), `the rule is for team members, and the owner's session read: ${prompts[0]!.slice(-400)}`);
 });
 
+test("the owner's own native arguments stay exact in Code Mode, and the request goes ahead of them", { timeout: 120000 }, async () => {
+  const typed = ["--model", "opus", "--", "attach the logs"];
+  const { session, mode, args } = await launchMember("all", "claude", null, typed);
+  assert.equal(session.codeMode, true);
+  assert.equal(mode, "1");
+  assert.deepEqual(args, ["--settings", JSON.stringify({ env: { CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1" } }), ...typed],
+    "nothing follows the owner's `--`, where Claude Code would read it as prompt text");
+  assert.deepEqual((await launchMember("off", "claude", null, typed)).args, typed, "with the switch off a native launch keeps its exact arguments");
+});
+
 test("with the switch off a Claude member is started with its prompt byte for byte", { timeout: 120000 }, async () => {
   for (const level of ["off", undefined] as const) {
-    const { session, mode, prompts } = await launchMember(level, "claude");
+    const { session, mode, settingsMode, prompts } = await launchMember(level, "claude");
     assert.notEqual(session.codeMode, true, String(level));
     assert.equal(mode, null, String(level));
+    assert.ok(settingsMode.every(value => value === null), String(level));
     assert.deepEqual(prompts, [PROMPT], String(level));
   }
 });
@@ -225,5 +241,6 @@ test("Code Mode on changes nothing for a Codex member or for a coordinator that 
   const coordinator = await launchMember("all", "claude", "mission-coordinator");
   assert.notEqual(coordinator.session.codeMode, true);
   assert.equal(coordinator.mode, null);
+  assert.ok(coordinator.settingsMode.every(value => value === null));
   assert.deepEqual(coordinator.prompts, [PROMPT]);
 });

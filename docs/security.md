@@ -67,8 +67,12 @@ run with tool lists that leave out the program tool. Permission-reviewer turns,
 headless launches that the permission channel does not serve, evaluation and
 learning sessions, other providers, and launches outside the host's worker stay
 as they are. A headless run takes the request only from the `env` key of its
-`--settings` argument, and the host puts the request there only for served
-headless launches.
+`--settings` argument, and among headless launches the host puts the request
+there only for served ones. The host reads whether a launch is headless from
+the arguments it passes. A wrapper command that adds `--print` itself, or a
+`sudo` profile in a shape the host does not parse, counts as interactive: at
+`all` such a run carries the request and can start in Code Mode with no
+permission channel.
 
 In a served session each tool call inside a program raises its own hooks, so
 the permission channel still decides each call.
@@ -115,11 +119,23 @@ Before setting `all`:
   host does not check the installed version.
 - A Code Mode session cannot use Remote Control, Claude in Chrome, or computer
   use.
-- Where agents start through `sudo`, an interactive launch carries the request
-  in the environment variable `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE`, which
-  reaches Claude Code only if the sudoers `env_keep` list names it. Served
-  headless launches carry it in their `--settings` argument and need no sudoers
-  entry.
+- An interactive launch carries the request twice: in the environment variable
+  `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE`, and in the `env` key of a `--settings`
+  argument. Where the host passes its hook settings (a session started from the
+  web, phone or desktop app, a team member), the request is part of that
+  argument. Where it passes none (hooks switched off, a native launch from the
+  CLI, a resume), the host adds one `--settings` argument for the request
+  alone. It places that argument ahead of the
+  [native arguments](cli.md#native-arguments-and-cloud-workspaces), which stay
+  exact. Where agents start through `sudo`, the variable is dropped unless the
+  sudoers `env_keep` list names it, and the argument passes, so no sudoers
+  entry is needed. Served headless launches carry the request in their
+  `--settings` argument alone.
+- Claude Code honours only the last `--settings` argument of a launch. With the
+  host's hooks on, that is the host's own, and a `--settings` argument in the
+  launch profile is not read. Without the hook layer the host adds its argument
+  only where the launch brings none, so a profile or a native launch with its
+  own `--settings` asks for Code Mode through the variable alone.
 
 On the Ubuntu host, provider wrappers can load owner-managed environment files
 for host-wide credentials, Android tooling, and a selected project. Values are

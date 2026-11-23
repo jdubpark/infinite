@@ -163,6 +163,8 @@ export class JudgeCalibrations {
       return undefined;
     });
     if (wrote !== undefined) return "replay" in wrote ? this.viewOrRefusal(wrote.replay) : wrote;
+    // A reason found before this calibration existed is not its reason.
+    this.waiting = null;
     return this.viewOrRefusal(calibrationId);
   }
 

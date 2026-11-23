@@ -246,7 +246,11 @@ export class TrialPump {
   private async advance(): Promise<void> {
     if (!this.ready()) return;
     if (!this.started && !(await this.startup())) return;
-    if (this.live !== undefined) return this.advanceLive(this.live);
+    if (this.live !== undefined) {
+      // A live trial holds the eval account and no judgement is asked for meanwhile, so the calibration's view names it.
+      if (this.live.kind === "trial") this.options.judgements?.hold("another-job");
+      return this.advanceLive(this.live);
+    }
     const open = this.openJob();
     const judging = this.judging();
     if (open === undefined && !judging) return;

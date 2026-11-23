@@ -85,12 +85,14 @@ function makeRig(options: Options = {}) {
   } as unknown as Config;
   options.config?.(config);
   const log: string[] = [];
+  /** `probe`: the probe for a named project is not ready. `stop`: the account cannot be stopped, so the start-up cannot finish. */
+  const down = { probe: false, stop: false };
   /** The grader job and project of every source the pump asked for. */
   const sources: { jobId: string; projectId: string }[] = [];
   const identity = options.identity ?? ({
-    probe: async () => READY, receive: async () => "failed", prepare: async () => "failed", check: async () => "failed",
+    probe: async (input: Record<string, unknown>) => (down.probe && "fetchUrl" in input ? { state: "unavailable" } : READY), receive: async () => "failed", prepare: async () => "failed", check: async () => "failed",
     teamPrefix: () => undefined, setupPrefix: () => undefined,
-    stop: async () => { log.push("stop"); return true; },
+    stop: async () => { log.push("stop"); return !down.stop; },
     clean: async () => { log.push("clean"); return true; },
     scrub: async () => { log.push("scrub"); return true; },
   } as unknown as EvalIdentity);
@@ -103,7 +105,7 @@ function makeRig(options: Options = {}) {
   /** How many of the next source builds end on an environment cause. */
   const sourceFails = { left: 0 };
   const rig = {
-    root, store, config, log, sources, judge, jobs, judgements, now, mirror, sourceFails,
+    root, store, config, log, sources, judge, jobs, judgements, now, mirror, sourceFails, down,
     pump: undefined as unknown as TrialPump,
     close: () => store.close(),
   };
@@ -422,6 +424,62 @@ test("a source build that ends on an environment cause uses no attempt", async (
     const first = rowsOf(r, id)[0]!;
     assert.equal(first.attempt, 0, "the first attempt runs once the source works");
     assert.equal(first.ending, "judged");
+  } finally {
+    r.close();
+  }
+});
+
+test("ten source failures in a row end the attempt, and the next attempt runs", async () => {
+  const r = makeRig({ mode: "prefer-a" });
+  try {
+    r.sourceFails.left = 10;
+    const id = calibrate(r);
+    await until(r, () => finalCount(r, id) >= 1, { steps: 120 });
+    assert.equal(r.sources.length, 10, "ten source builds failed");
+    const rows = rowsOf(r, id);
+    assert.deepEqual(rows.map(row => [row.attempt, row.ending]), [[0, "void-host"]], "the tenth failure ends attempt 0");
+    await until(r, () => finalCount(r, id) >= 2, { steps: 40 });
+    assert.deepEqual(rowsOf(r, id).map(row => [row.attempt, row.ending]), [[0, "void-host"], [1, "judged"]]);
+  } finally {
+    r.close();
+  }
+});
+
+test("incomplete eval settings end the attempt at once", async () => {
+  const r = makeRig({ mode: "prefer-a" });
+  try {
+    const id = calibrate(r);
+    (r.config.projects[0] as { team?: unknown }).team = {};
+    await until(r, () => finalCount(r, id) >= 1, { steps: 20 });
+    const first = rowsOf(r, id)[0]!;
+    assert.deepEqual([first.attempt, first.ending], [0, "void-host"], "the attempt is used, not released");
+    assert.equal(r.sources.length, 0, "no source was built");
+  } finally {
+    r.close();
+  }
+});
+
+test("an identity that is not ready for the judgement's project shows eval-identity", async () => {
+  const r = makeRig({ mode: "prefer-a" });
+  try {
+    r.down.probe = true;
+    const id = calibrate(r);
+    await r.pump.step();
+    assert.equal(viewOf(r, id).waiting, "eval-identity");
+    assert.deepEqual(rowsOf(r, id), []);
+  } finally {
+    r.close();
+  }
+});
+
+test("a start-up that cannot finish shows start-up", async () => {
+  const r = makeRig({ mode: "prefer-a" });
+  try {
+    r.down.stop = true;
+    const id = calibrate(r);
+    await r.pump.step();
+    assert.equal(viewOf(r, id).waiting, "start-up");
+    assert.deepEqual(rowsOf(r, id), []);
   } finally {
     r.close();
   }

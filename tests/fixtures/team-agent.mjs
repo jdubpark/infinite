@@ -137,6 +137,14 @@ if (process.argv[2] === "--hold-check") {
   }
   process.exit(0);
 }
+if (process.argv[2] === "--leave-check") {
+  // A check that passes at once and leaves a process in its group that holds its output for a minute.
+  const receiptDir = process.argv[3];
+  const left = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: ["ignore", "inherit", "inherit"] });
+  appendFileSync(join(receiptDir, "check-leftover.pids"), `${left.pid}\n`, { mode: 0o600 });
+  process.stdout.write("The check passed and left a helper running.\n");
+  process.exit(0);
+}
 
 // A real child process reports through its worker's authenticated report
 // channel. The receipt directory only coordinates concurrent fixture processes;

@@ -43,7 +43,7 @@ import type { Readings } from "./readings.js";
 import { projectGithubRepository, sessionGithubScope } from "./github-grants.js";
 import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
-import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, commandScope, type CommandScope, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
+import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, commandScope, type CommandResult, type CommandScope, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { permissionEvidenceHash } from "./team-permissions.js";
@@ -230,6 +230,7 @@ function retentionEventAt(run: TeamRun) {
 export const memberTimeLimitReason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
 export const memberStallReason = "An agent showed no activity twice on the same assignment. Its workspace was preserved.";
 export const checkTimeoutReason = "A configured check ran past the team check time limit (teams.checkMinutes) and was stopped. No correction round was used; the integrated work was preserved.";
+export const commandLeftoverEvent = "A configured command exited while a process it started still held its output. The host judged the command by its exit code and neither waited for that process nor stopped it.";
 export const repeatedCheckFailureReason = "The same required verification command failed again against an unchanged integration commit. No further identical repair was attempted; inspect the check output and continue with owner direction.";
 const repairLimitReason = "The team exhausted its two correction rounds. Review the check and agent evidence before continuing manually.";
 const promptTooLargeReason = "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.";
@@ -908,6 +909,10 @@ export class TeamService {
     } catch { /* Best-effort naming never affects team creation or execution. */ }
   }
   private event(stored: Stored, text: string) { runEvent(stored.run, text); }
+  /** Evidence on the run, in fixed text, that a configured command left a process holding its output. */
+  private async noteLeftover(stored: Stored, result: CommandResult) {
+    if (result.leftover) await this.enqueue(() => { if (!this.closed) { this.event(stored, commandLeftoverEvent); this.save(stored); } });
+  }
   list(): TeamView[] { return [...this.records.values()].filter(stored => !stored.run.replay).map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   /** Compact rows for `GET /api/teams?view=list`, in `list()` order. `list()` and `get()` keep the full record. */
   listItems(): TeamListItem[] { return this.list().map(teamListItem); }
@@ -1299,6 +1304,7 @@ export class TeamService {
           assertParent();
           if (project.team?.setup) {
             const setup = await teamCommand(project.team.setup, workspace.workspace, signal, 600000, this.config.teams?.commandPrefix);
+            await this.noteLeftover(stored, setup);
             if (setup.exitCode !== 0 || setup.interrupted) throw new TeamError(409, "team-setup-failed", "The configured setup command failed. Inspect the isolated workspace before restarting.");
             await assertMemberReadOnly(workspace.workspace, workspace.baseCommit, this.config.teams?.commandPrefix, signal, "setup");
           }
@@ -2906,6 +2912,7 @@ export class TeamService {
         : this.config.projects.find(project => project.id === run.projectId)!.team!.setup;
       if (setup) {
         const setupCommand = this.replays.setupFor(run, this.config.teams?.commandPrefix); const result = await teamCommand(setup, cwd, signal, 600000, setupCommand.prefix, setupCommand.input);
+        await this.noteLeftover(stored, result);
         if (result.exitCode !== 0 || result.interrupted) throw new TeamError(409, "team-setup-failed", "A member's configured setup command failed. Its isolated workspace was preserved.");
         await assertMemberReadOnly(cwd, member.baseCommit, this.prefixFor(run), signal, "setup");
       }
@@ -3560,6 +3567,7 @@ export class TeamService {
         Object.assign(check, { status, finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, ...(status === "passed" ? {} : { scan: scanner.finish() }) });
         results.push(check);
         await this.enqueue(() => { if (!this.closed) this.save(stored); });
+        await this.noteLeftover(stored, result);
         if (!signal.aborted) await assertMemberReadOnly(verification.workspace, head, this.config.teams?.commandPrefix, signal, context);
         if (check.status !== "passed") break;
       }

@@ -152,6 +152,9 @@ function emptyVerdict(reason: VerdictReason): ComposedVerdict {
   return { result: "inconclusive", reason, criteria: [], counts: { met: 0, notMet: 0, inconclusive: 0, pendingOwner: 0 }, dropped: { unknownIds: 0, handles: 0 } };
 }
 
+/** The profiles of a run's members that the evaluator must differ from or be weighed against. */
+type Cycle = { authors: TeamModelProfile[]; reviewers: TeamModelProfile[]; managers: TeamModelProfile[] };
+
 /**
  * The verdict of one revision. Holds a reviewed revision (or a goal cycle's no-change report) while a register pass, then one
  * read-only evaluator, produce the facts; composes the evaluator's report with host receipts and owner values; writes the
@@ -344,7 +347,12 @@ export class TeamVerdicts {
       this.finish(holder, state, undefined, "record-unavailable");
       return;
     }
-    const choice = chooseEvaluator(run.lineup, this.cycleOf(run), this.host.limited(), new Set(state.excluded ?? []));
+    const cycle = this.cycleFor(run, state);
+    if (cycle === undefined) {
+      this.finish(holder, state, undefined, "no-independent-evaluator");
+      return;
+    }
+    const choice = chooseEvaluator(run.lineup, cycle, this.host.limited(), new Set(state.excluded ?? []));
     if ("skipped" in choice) {
       this.finish(holder, state, undefined, choice.skipped);
       return;
@@ -521,7 +529,7 @@ export class TeamVerdicts {
     };
   }
 
-  /** True when an evaluator's answer was applied to some criterion; a report whose answers were all dropped names no evaluator. */
+  /** True when an evaluator's answer was recorded on some criterion; a report whose answers were all dropped names no evaluator. */
   private applied(composed: ComposedVerdict): boolean {
     return composed.criteria.some(item => item.evaluatorState !== undefined);
   }
@@ -579,11 +587,21 @@ export class TeamVerdicts {
     return receipts === "pending" ? undefined : receipts;
   }
 
+  /** The members the evaluator must be independent of: this run's, and for a no-change verdict also those of the parent run, which made the head. Undefined when that run is gone. */
+  private cycleFor(run: TeamRun, state: VerdictState): Cycle | undefined {
+    const own = this.cycleOf(run);
+    if (state.kind === "reviewed") return own;
+    const parent = this.host.holder(state.receiptsFrom)?.run;
+    if (parent === undefined) return undefined;
+    const before = this.cycleOf(parent);
+    return { authors: [...own.authors, ...before.authors], reviewers: [...own.reviewers, ...before.reviewers], managers: [...own.managers, ...before.managers] };
+  }
+
   /**
    * Every implementer and integrator member with a profile is an author, whatever its report and revision: an escalated or stopped
    * member's edits can be in the head, and steer and resume reset run.tasks. Every reviewer member is a reviewer, and every project manager member with a profile is a manager.
    */
-  private cycleOf(run: TeamRun): { authors: TeamModelProfile[]; reviewers: TeamModelProfile[]; managers: TeamModelProfile[] } {
+  private cycleOf(run: TeamRun): Cycle {
     const authors: TeamModelProfile[] = [];
     const reviewers: TeamModelProfile[] = [];
     const managers: TeamModelProfile[] = [];

@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
-import { endSessionWorkers, hostInThisProcess, waitFor } from "./helpers.js";
+import { endSessionWorkers, waitFor } from "./helpers.js";
 import { unseal } from "../packages/host/src/vault.js";
 import { Manager } from "../packages/host/src/manager.js";
 import type { HostLoadProbe } from "../packages/host/src/host-load.js";
@@ -45,7 +45,6 @@ export function missionHarness(options?: { configure?: (config: Config) => void;
     environment: "local", enableDemo: true, maxSessions: 24, agents: { claude: agent("claude"), codex: agent("codex") },
     projects: [{ id: "api", name: "API", path: api, team: { checks } }, { id: "web", name: "Web", path: web, team: { checks } }],
     teams: { workspaceDir: join(root, "teams"), lineup } };
-  hostInThisProcess(config);
   options?.configure?.(config);
   const at = new Date().toISOString();
   const groups: ProjectGroupLookup = { get: id => {

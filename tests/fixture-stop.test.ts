@@ -38,9 +38,9 @@ test("a worker that will not end is killed at the limit, and the stop fails", { 
     await waitFor(async () => running(deaf.pid!), found => found);
     const nowhere = join("/tmp", "inf-test-no-host-" + randomUUID());
     const config = { keyFile: join(nowhere, "key"), stateDir: join(nowhere, "state"), runDir: join(nowhere, "run") } as Parameters<typeof endSessionWorkers>[0];
-    const ended = new Promise<void>(resolve => deaf.once("exit", () => resolve()));
     await assert.rejects(endSessionWorkers(config, [deaf.pid!], 600), /still ran 600 ms after the test stopped them and were killed/);
-    await ended;
+    // A bounded wait: a stop that left the worker running must fail this test, not hold it.
+    await waitFor(async () => deaf.signalCode, signal => signal !== null, 5000).catch(() => undefined);
     assert.equal(deaf.signalCode, "SIGKILL", "the stop that failed did not leave the worker running");
   } finally {
     if (deaf.exitCode === null && deaf.signalCode === null) deaf.kill("SIGKILL");

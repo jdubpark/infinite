@@ -24,26 +24,19 @@ export const waitFor = async <T>(
   throw new Error(`Condition was not reached; last state: ${JSON.stringify(last)}`);
 };
 
-/** The running processes, for a test that must see what a host has started or left behind. `age` is in seconds. */
-export function processes(): { pid: number; parent: number; age: number; command: string }[] {
-  return execFileSync("ps", ["-ww", "-eo", "pid=,ppid=,etime=,args="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).split("\n").flatMap(line => {
-    // The elapsed time reads [[days-]hours:]minutes:seconds.
-    const row = /^\s*(\d+)\s+(\d+)\s+(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s+(.*)$/.exec(line);
-    return row ? [{ pid: Number(row[1]), parent: Number(row[2]), age: ((Number(row[3] ?? 0) * 24 + Number(row[4] ?? 0)) * 60 + Number(row[5])) * 60 + Number(row[6]), command: row[7]! }] : [];
+/** The running processes, for a test that must see what a host has started or left behind. */
+export function processes(): { pid: number; parent: number; command: string }[] {
+  return execFileSync("ps", ["-ww", "-eo", "pid=,ppid=,args="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).split("\n").flatMap(line => {
+    const row = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    return row ? [{ pid: Number(row[1]), parent: Number(row[2]), command: row[3]! }] : [];
   });
 }
 
 /** What a session worker's command line holds. Its command line names no session. */
 export const WORKER_ENTRY = "/packages/host/src/worker.";
-/** A worker that has not listened after this many seconds is not waited for: the host that started it gave up after about four. */
-const WORKER_START_SECONDS = 6;
-/** The hosts that run in this process. A worker of another one is never taken for a worker that is still starting. */
-const hostsHere = new Set<Config>();
-/** Names a host that runs in this process, so that the stop of another one can tell their workers apart. */
-export function hostInThisProcess(config: Config): Config { hostsHere.add(config); return config; }
 
 /** The worker processes among `workers` that belong to this host: the pid each listening worker recorded, and every listed pid. */
-function hostWorkers(config: Config, workers: readonly { pid: number }[], listed: readonly number[] = []): number[] {
+function hostWorkers(config: Config, workers: readonly { pid: number }[], listed: readonly number[]): number[] {
   const running = new Set(workers.map(row => row.pid));
   const pids = new Set(listed.filter(pid => running.has(pid)));
   let key: Buffer, ids: string[];
@@ -135,31 +128,22 @@ export async function stopSessionWorkers(config: Config) {
  * starting refuses it. So the request repeats while a worker process of this host runs. A worker counts by its process,
  * never by an answer: a test may stand a socket in for a worker, and that answers for as long as the test runs.
  *
- * `started` lists the workers of a host that ran in a child process. Without it the host ran in this process: a worker
- * that is not listening yet has no record there, so the call also waits while a worker child of this process is young
- * and no host of this process has recorded it. After `limitMs` the workers of this host that still run are killed and
- * the call throws.
+ * A worker belongs to this host when it recorded itself, which it does when it starts to listen, or when `started`
+ * lists it: the workers a spawned host was seen to hold. A worker that is neither is not seen, so a host in this
+ * process must first settle what it launches (`idle()`). After `limitMs` the workers that still run are killed and the
+ * call throws.
  */
-export async function endSessionWorkers(config: Config, started?: readonly number[], limitMs = 30000) {
+export async function endSessionWorkers(config: Config, started: readonly number[] = [], limitMs = 30000) {
   const until = Date.now() + limitMs;
-  try {
-    for (;;) {
-      await stopSessionWorkers(config);
-      const workers = processes().filter(row => row.command.includes(WORKER_ENTRY));
-      const mine = hostWorkers(config, workers, started);
-      const known = new Set([...mine, ...[...hostsHere].filter(host => host !== config).flatMap(host => hostWorkers(host, workers))]);
-      const starting = started ? [] : workers.filter(row => row.parent === process.pid && !known.has(row.pid) && row.age < WORKER_START_SECONDS);
-      if (mine.length + starting.length === 0) return;
-      if (Date.now() > until) {
-        // A worker that starts and is never recorded belongs to no host this call can name, so it is not a failure here.
-        if (!mine.length) return;
-        for (const pid of mine) try { process.kill(pid, "SIGKILL"); } catch { /* it ended meanwhile */ }
-        throw new Error(`Session workers still ran ${limitMs} ms after the test stopped them and were killed: ${mine.join(", ")}`);
-      }
-      await new Promise(resolve => setTimeout(resolve, 100));
+  for (;;) {
+    await stopSessionWorkers(config);
+    const mine = hostWorkers(config, processes().filter(row => row.command.includes(WORKER_ENTRY)), started);
+    if (!mine.length) return;
+    if (Date.now() > until) {
+      for (const pid of mine) try { process.kill(pid, "SIGKILL"); } catch { /* it ended meanwhile */ }
+      throw new Error(`Session workers still ran ${limitMs} ms after the test stopped them and were killed: ${mine.join(", ")}`);
     }
-  } finally {
-    hostsHere.delete(config);
+    await new Promise(resolve => setTimeout(resolve, 100));
   }
 }
 
@@ -296,7 +280,6 @@ export async function inProcessHost(options?: { configure?: (config: Config) => 
   const host = createApp(config, key);
   await new Promise<void>(resolve => host.server.listen(0, "127.0.0.1", resolve));
   config.port = (host.server.address() as { port: number }).port;
-  hostInThisProcess(config);
   const origin = `http://127.0.0.1:${config.port}`;
   return {
     ...host, root, config, origin, tokens, fetchApi: apiClient(origin, tokens),

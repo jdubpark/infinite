@@ -1075,7 +1075,7 @@ Only the runner report resolves a trial. An exit code never does, and a missing 
 | `void-host` | The host restarted, a launcher refused or failed, a block code was unknown, or the replay run was lost. | Void. The slot runs again. |
 | `void-owner` | The owner halted the project or cancelled the job. | Void. The slot runs again later. |
 
-A slot gets at most three attempts. After three voids in a row, the job pauses with `trial-voids`. A dialog that the project's permission pipeline leaves to a person ends the trial `permission`. For a project that the host permission agent serves, the agent decides trial dialogs as it does production dialogs.
+A slot gets at most three attempts. After three voids in a row, the job pauses with `trial-voids`. A dialog that the project's permission pipeline leaves to a person ends the trial `permission`. For a project that the host permission agent serves, the agent decides trial dialogs as it does production dialogs. A provider's hook or another provider signal can report a dialog before the screen shows it. The agent cannot decide such a dialog yet, so it holds it for up to 1.5 seconds from its first sight: the trial waits for the screen, and the agent is asked first. A dialog that the screen never shows goes back to the owner after that time, which ends a trial `permission`.
 
 **Grades.** A grade holds `expectedPassed`, `expectedTotal`, `guardPassed`, `resolved`, `overwritten`, `diff`, and `isolation`. An unknown count is `null`, never `0`. `expectedPassed` is null when no report parses. `diff` is null when the change counts cannot be read. A null `expectedPassed` never resolves a trial. A result larger than the 1 MiB limit ends `scope-violation`.
 

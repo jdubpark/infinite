@@ -181,7 +181,8 @@ export type Stored = {
   deliveryAttempt?: { memberId: string; revision: number; headCommit: string };
   continuationHead?: { revision: number; headCommit: string };
   checkHead?: string;
-  /** Numbers the latest checks reported (check-observations.ts). Outside `run`, so no view, context file, prompt or event reads them. */ checkObservations?: CheckObservation[];
+  /** Numbers the latest checks reported (check-observations.ts). Outside `run`, so no view, context file, prompt or event reads them. */
+  checkObservations?: CheckObservation[];
   source?: { path: string; head?: string; startCommit?: string };
   handoffPolicy?: HandoffPolicy;
   goalExtensions?: Record<string, { deadlineAt: string; ceilingAt: string }>;
@@ -972,7 +973,8 @@ export class TeamService {
   missionIdOf(id: string): string | undefined { return this.record(id).run.missionId; }
   /** Read goal ownership without building a view or updating external tracking. Undefined for an unknown run. */
   goalIdOf(id: string): string | undefined { return this.records.get(id)?.run.goal?.id; }
-  /** The goal's one read of a run's reported numbers: only at a reviewed head, and never part of a view (check-observations.ts). */ reviewedObservations(id: string) { return reviewedObservationsOf(this.records.get(id)); }
+  /** The goal's one read of a run's reported numbers: only at a reviewed head, and never part of a view (check-observations.ts). */
+  reviewedObservations(id: string) { return reviewedObservationsOf(this.records.get(id)); }
   /** Whether a run holds a delivery attempt that has not resolved, without building a view. False for an unknown run. */
   hasDeliveryAttempt(id: string): boolean { return Boolean(this.records.get(id)?.deliveryAttempt); }
   /** Restores the mission-authored size boundary for subteams persisted before ceilings were stored. */
@@ -3567,7 +3569,8 @@ export class TeamService {
         const scanner = new CheckOutputScanner(), metrics = metricObserver();
         const result = await teamCommand(entry.command, verification.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix, undefined, undefined, undefined, (chunk, stream) => { metrics.push(chunk, stream); scanner.push(chunk, stream); });
         const status = result.interrupted ? "interrupted" : result.exitCode === 0 ? "passed" : "failed";
-        Object.assign(check, { status, finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, ...(status === "passed" ? {} : { scan: scanner.finish() }) }); metrics.record(stored, check);
+        Object.assign(check, { status, finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, ...(status === "passed" ? {} : { scan: scanner.finish() }) });
+        metrics.record(stored, check);
         results.push(check);
         await this.enqueue(() => { if (!this.closed) this.save(stored); });
         await this.noteLeftover(stored, result);

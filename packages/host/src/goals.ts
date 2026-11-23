@@ -55,7 +55,8 @@ type Stored = {
   /** The objective record (objective-goals.ts). Outside `goal`, so no view or digest reads it. */
   objectiveRecord?: unknown;
   objectiveNotice?: ObjectiveUnavailable;
-  /** One entry of reported numbers per cycle (goal-metrics.ts). Outside `goal`, so no goal view, Understanding record or relay read has them. */ metrics?: GoalMetrics;
+  /** One entry of reported numbers per cycle (goal-metrics.ts). Outside `goal`, so no goal view, Understanding record or relay read has them. */
+  metrics?: GoalMetrics;
 };
 const now = () => new Date().toISOString();
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -117,7 +118,8 @@ export class GoalService {
         }
       }
       const before = digest(stored), note = goalObjectiveNote(stored, loadGoalObjective(stored, now()));
-      pruneMetrics(stored); if (note) this.event(stored, note);
+      pruneMetrics(stored);
+      if (note) this.event(stored, note);
       this.records.set(id, stored);
       if (digest(stored) === before) { this.saved.set(id, before); continue; }
       try { writeSealed(join(this.directory, file), key, `goal:${id}`, stored); this.saved.set(id, digest(stored)); }
@@ -149,7 +151,8 @@ export class GoalService {
     return stored;
   }
   private save(stored: Stored) {
-    pruneMetrics(stored); if (this.saved.get(stored.goal.id) === digest(stored)) return;
+    pruneMetrics(stored);
+    if (this.saved.get(stored.goal.id) === digest(stored)) return;
     stored.goal.updatedAt = now();
     writeSealed(join(this.directory, `${stored.goal.id}.sealed`), this.key, `goal:${stored.goal.id}`, stored);
     this.saved.set(stored.goal.id, digest(stored));
@@ -544,7 +547,10 @@ export class GoalService {
     });
   }
   objectiveRecord(id: string, version?: number) { return goalObjectiveView(this.record(id), version); }
-  metrics(id: string) { const { goal, metrics } = this.record(id); return goalMetricsRead(metrics, goal.cycles, this.config.projects.find(value => value.id === goal.projectId)?.team?.checks ?? []); }
+  metrics(id: string) {
+    const { goal, metrics } = this.record(id);
+    return goalMetricsRead(metrics, goal.cycles, this.config.projects.find(value => value.id === goal.projectId)?.team?.checks ?? []);
+  }
   /**
    * The owner's correction of the criteria, applied exactly once. It writes the goal's sealed file once and answers the
    * corrected record. A replay answers the latest view and writes nothing. Criterion ops need objective prompts on; register ops need the register on.

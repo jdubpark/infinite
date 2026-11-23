@@ -114,6 +114,43 @@ test("a no-change cycle is held and released", () => {
   assert.equal(without.host.saves, 0);
 });
 
+/** A held no-change report on a cycle whose parent run (which made the head) has the given members, or is gone when `parent` is false. */
+function heldNoChange(parentMembers: (parent: TeamRun) => TeamMember[] | false) {
+  const f = noChangeFixture();
+  const parentRun = runOf({ id: PARENT, headCommit: BASE });
+  const members = parentMembers(parentRun);
+  if (members) {
+    parentRun.members = members;
+    f.host.holders.set(PARENT, holderOf(parentRun, undefined));
+  }
+  f.world.passes.set(PARENT, { head: BASE, pending: false, receipts: [receiptOf("c1", "pass", PARENT, BASE)] });
+  const pm = memberOf(f.holder.run, "project-manager", { status: "reported", report: { kind: "no-change", summary: "Nothing to change.", evidence: [] } as never });
+  f.holder.run.members.push(pm);
+  assert.equal(f.verdicts.holdNoChange(f.holder, pm), true);
+  drive(f, "evaluating");
+  return f;
+}
+
+test("a no-change verdict is independent of the parent run's authors", () => {
+  const f = heldNoChange(parent => [memberOf(parent, "implementer", { status: "stopped", modelProfile: ASTRA })]);
+  assert.equal(f.host.prepared.length, 1);
+  assert.equal(f.host.prepared[0]!.profile.id, DEEP.id, "the model that authored the head is not the evaluator");
+});
+
+test("a no-change verdict is independent of the parent run's project manager family", () => {
+  const f = heldNoChange(parent => [memberOf(parent, "project-manager", { status: "stopped", modelProfile: { ...ASTRA, id: "fallback-manager" } })]);
+  assert.equal(f.host.prepared.length, 1);
+  assert.equal(f.host.prepared[0]!.profile.id, DEEP.id, "the family of the parent's manager is not the evaluator's");
+});
+
+test("a no-change verdict whose parent run is gone has no independent evaluator", () => {
+  const f = heldNoChange(() => false);
+  drive(f, "releasing");
+  assert.equal(f.host.prepared.length, 0, "no evaluator member starts");
+  assert.equal(f.holder.verdict?.reason, "no-independent-evaluator");
+  assert.equal(f.holder.run.assessment?.reason, "no-independent-evaluator");
+});
+
 test("a verdict without an evaluator is inconclusive and releases the run", () => {
   type Case = { name: string; reason: "no-independent-evaluator" | "evaluator-unavailable" | "record-unavailable" | "context-too-large";
     options: Parameters<typeof fixture>[0]; limit?: Provider; readable: boolean };

@@ -2845,8 +2845,15 @@ Each request passes these steps in order:
    (outside the session's directory, or into a path a class rule names), no
    verdict recorded for the earlier reading answers it. The host reads the
    request again immediately before a delivery and withholds the answer when
-   the reading changed while the review ran; the task text in that check is
-   the one the request was handed with. A pending dialog is not handed to the
+   the reading changed while the review ran. The task is read again there
+   too. A prompt that the owner submitted to a session after the request was
+   read keeps the dialog with the owner, and so does a session record that
+   cannot be read to its end before the delivery. When the record was too
+   long to read whole as the request was built, the task text says that later
+   prompts may be missing, and that alone withholds nothing. A team member's answer is withheld when the run
+   objective or the task instructions differ from the ones the request was
+   handed with; the dialog is then handed again and decided for the new task.
+   A run that the host renamed is the same task. A pending dialog is not handed to the
    agent again only because its reading changed. A recorded allow answers a
    second attempt at the same dialog only while a new identical request would
    replay the same verdict: a lock of the assignment, an open effect reject of
@@ -3293,7 +3300,7 @@ For the escalation and scout points, before a release rollback past this release
 
 ## Launch-rate fuse
 
-The host limits how often it starts team sessions: 30 per project and 80 across the host in a rolling hour. A launch that would pass a limit waits. The member or goal shows a reason that starts "Waiting for the spend fuse:", names the project or the host, and gives no figures. The first trip of a UTC day closes by itself when fewer than half the limit remain in the last hour. If the limit is reached again on the same UTC day, the trip stays open until the owner closes it with `infinite fuse close --project PROJECT_ID` or `infinite fuse close --host`. The permission coordinator is never counted or held. The limits can be changed under `autonomy.fuse` in the host configuration (`project`, `host`, and `projects.PROJECT_ID`, each with `launchesPerHour`). A trip opened because the launch record cannot be read closes once the record can be read. Run `infinite fuse` to read every scope, or add `--json` for the full view. The `autonomy-interrupt` push event is on by default and sends the owner one notification per trip and subject per UTC day.
+The host limits how often it starts team sessions: 30 per project and 80 across the host in a rolling hour. A launch that would pass a limit waits. The member or goal shows a reason that starts "Waiting for the spend fuse:", names the project or the host, and gives no figures. The first trip of a UTC day closes by itself when fewer than half the limit remain in the last hour. If the limit is reached again on the same UTC day, the trip stays open until the owner closes it with `infinite fuse close --project PROJECT_ID` or `infinite fuse close --host`. The permission coordinator is never counted or held. The limits can be changed under `autonomy.fuse` in the host configuration (`project`, `host`, and `projects.PROJECT_ID`, each with `launchesPerHour`). A trip opened because the launch record cannot be read closes once the record can be read. Run `infinite fuse` to read every scope, or add `--json` for the full view. The `autonomy-interrupt` push event is on by default and sends the owner one notification per trip and subject per UTC day. The `main-check` push event is on by default too; it covers the main check's health changes, described under Main check.
 
 ## Project signals
 
@@ -3351,6 +3358,50 @@ Engaging also pauses the running work in scope through each item's own pause pat
 `infinite halt off --host` or `--project PROJECT_ID` releases it. The gate lifts first. Then each marked item that is still paused, and that the owner did not change during the halt, resumes in reverse order under the same rules as the owner's resume. A team run resumes with a fresh plan, except a run the halt paused where it waited for input: that run continues its revision, its open questions are still there, and an answer given during the halt starts the requesting member's next attempt. An item that those rules refuse stays paused and says why, for example a team whose members are still stopping, a team that needs workspace reconciliation, a goal or mission past its deadline, or a standing goal whose project is no longer autonomous. A standing goal has no deadline of its own, so a halt that outlasts its last cycle's time window does not end it: on release it returns to its cadence. A mission whose time limit passed during the halt is blocked at its time limit and stays blocked; extend it to continue (see [missions](missions.md)). Resume it when it is ready. A host halt and a project halt are independent: an item resumes only when no remaining halt covers it, and otherwise it moves to the remaining halt. `--keep-paused` lifts the gate and resumes nothing; each marked item, and each run that a marked goal or mission paused, then says that the owner kept it paused. A run paused where it waited stays that way, so it still takes an answer, and the owner's later resume continues where it waited. Whenever a release leaves a goal or mission paused, the runs it paused show the goal's or mission's new reason instead of the halt's.
 
 Engage and release are idempotent by request ID. Engaging a scope that is already halted, or releasing one that is not, changes nothing and returns the current state. The halt is recorded in `halt.sealed` in the host state directory with its time, reason, and the owner device that engaged it. A restart keeps it, and a restart in the middle of a pause or resume pass finishes that pass without repeating what was done. If the host cannot read the record, it treats the whole host as halted and refuses every change to the halt until the record can be read; it checks again every minute. Once the record can be read again, any pause or resume pass it holds as unfinished runs before the next change to the halt. When the record cannot be restored, removing that file on the host clears every halt at the next check; nothing resumes, so resume each paused item yourself. A second file, `halt-epochs.sealed`, holds the halt epochs that the permission agent reads: every engage and release renews the epoch of its scope, so a verdict reached before a halt or its release is never delivered after it. Restoring or removing `halt.sealed` leaves it as it is. Do not restore it from a copy; removing it makes the permission agent retire every verdict not yet delivered. A halt never infers completion and approves nothing. `infinite halt` lists every halted scope; add `--json` for the full view.
+
+## Main check
+
+The main check tells the owner when a project's main branch starts failing and when it passes again. It is off by default. A project turns it on with `team.mainCheck` in its settings, for example `{ "mainCheck": { "minutes": 30 } }`. The `minutes` key is optional and limits each command to 1 to 240 minutes; without it, the host uses `teams.checkMinutes` and then 60 minutes. The setting has no default, so an unset key leaves every routine approval digest and handoff unchanged. A project that lets the team establish its own checks has no configured checks to run, so the setting is refused together with `establishChecks`.
+
+The setting acts only on a project that follows GitHub and has configured checks, on a host with a team workspace. For any other project the host never runs a main check, and the owner's read of the record says `runnable: false`. When the setting acts, the host runs the project's configured `setup` and `checks` at the newest head its mirror has received for the base branch. The run takes place in a disposable copy of that head, created the way a team run creates its workspace, and every command runs as the agent account, through the team's command prefix, as a team's checks are. The host checks the copy after each command. A copy that a command changed is recorded as an error, never as a result for main.
+
+One main check runs at a time on the whole host. The host looks for work when the mirror reports a head and every 30 seconds. It checks only the newest head: a head that main has already left is never started. Before a check starts, the host asks the gates below in this order, and the owner's read shows the first one that holds as `waiting`:
+
+- `execution-identity`: a provider profile runs through sudo and the host has no `teams.commandPrefix`. Team creation is refused in the same configuration.
+- `census-unavailable`: the host cannot list the processes of a run under this command prefix.
+- `halt`: a halt covers the project or the host.
+- `host-load`: the host holds new launches while it is under load.
+- `storage`: the team volume is below its storage floor.
+- `another-check`: a main check of another project runs, or its copy is not removed yet.
+- `processes`: a process of an earlier check of this project may still be alive, so its copy stays.
+- `cleanup`: the removal of an earlier copy failed. The host tries again on the next pass.
+- `attempts`: this head was started three times with the same checks and never reached a result. A check that a halt or an orderly host stop interrupted is not counted.
+
+The host records each final result: the head, a digest of the checks it was measured with, the observation time, whether it passed or failed, and for a failure the position of the failing command and its exit code. The record also keeps the output of the failing command, at most eight short entries. That output is untrusted and is shown only in the owner's read of the record (`GET /api/projects/PROJECT_ID/main-check`). It never enters a prompt or a push. A non-owner device is refused, and the relay does not carry this route. No client shows it yet. The route answers without directories, roots or process witnesses.
+
+The host sends one push per device when the health of main changes. It sends the first failure, and the first pass after a failure the owner was told about. The push is collapsed per project and opens `/teams`. Its text is made by the host from the result's facts alone: for a failure, the failing command's position and exit code and the first seven characters of the head; for a pass, the number of checks and the head. The push follows the `main-check` event, which is in the default push events. A result with no notice due sends nothing. A failure that was never announced and is then fixed sends nothing further. The owner counts as told once the push service took the message for one device. A push that reached no device is sent again after a minute. A host stop between a send and its record repeats the push.
+
+The main check never starts an agent, never writes a project signal, and never changes a session, a routine or a team. It does not merge, deploy or change a branch.
+
+A command of a check ends when the process that the host started for it exits. While that process runs, a halt, the command's time limit and a host stop end the command: the host kills the command's process group, and a check that ends this way has no result. After that process has exited, the host sends no signal to anything the command started. It reads output that is still open for at most one second, then closes it, and the command passes or fails by its exit code. A stop that arrives in that second ends the check with no result, and still sends no signal. A process that a check left behind is therefore never signalled by the host. When such a process writes to the closed output, the write fails as a write to a closed pipe does. The host removes the copy only after a process census finds nothing of the run alive. Until then the project waits on `processes`, and no main check starts on the host. Under a command prefix the removal is a command too, and the same rule holds for it: once the process that the host started for the removal has exited, the host signals nothing.
+
+If the host cannot read a project's main-check record, the owner's read answers `readable: false`. The record may name a copy that is not removed yet, so the host never overwrites it and starts no main check on the whole host until it can be read; it tries again on every pass. The record is `main-check/PROJECT_ID.sealed` in the host state directory. When it cannot be restored, removing that file clears the state at the next pass, and a copy the record named stays under the team workspace until someone removes it.
+
+Limits of this first slice, stated in full:
+
+- After a host stop during a check, a command that never ends blocks every main check on that host until it ends or the host boots again. The record shows `waiting: processes` while that holds.
+- A prefix the process census does not support leaves the feature waiting on `census-unavailable`. The only supported forms are no prefix and the sudo shape with the census wrapper.
+- A project that lets the team establish its own checks has none configured and cannot use this.
+- The result of a head that main has already left can still be announced, with the commit it was measured at.
+- Tests cannot prove that a deployed launcher admits the forms the check uses. Audit the launcher before the setting is turned on in any project.
+- If the host's API process stops in the short window while a command of the check is starting, the run directory is not removed until the host boots again, and every main check on the host waits on `processes` until then.
+- Preparing the copy has no time limit of its own. It ends by the Git helpers' own limits, a halt, or a host stop.
+- Two different heads observed with the same stamp are ordered by their results' order in the record. Fetches of one mirror are serial, so their stamps differ in practice.
+- The host may not signal a command that the command prefix runs as another account. A halt, a time limit or a host stop then cannot end the command. The check is recorded as an error ten seconds later, the command runs on, and every main check on the host waits on `processes` until the command has ended. A team's checks have the same limit.
+- The host learns that a command's process has exited when its event loop next runs. A stop that the host handles before it has learned of the exit is a stop of a running command, and it kills the command's process group.
+- A process that a check left behind is found by the process, group and session ids that the host recorded during the check, and by its use of the copy. A process that left its group and session before the host sampled it, and that does not use the copy, is not found, and the copy is then removed while that process runs. The process census has the same limit for team runs.
+
+Before turning the setting on, run the project's checks by hand at main's head, and confirm that the team's command prefix runs them as the agent account on this host. A host whose configuration sets `push.events` itself must add `main-check` to that list, or the result is recorded and no push is sent. Then audit the launcher: a deployed launcher must recognise the main-check run directories and the `infinite/team-main-check-*` branch names that the copy uses, as it recognises a team run's.
 
 ## Configuration
 

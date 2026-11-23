@@ -218,7 +218,7 @@ export class HeadlessChannelWorker {
       // still applies. A host that refuses, cannot be reached or does not answer in time withholds it.
       let reply: ChannelReply | undefined;
       if (deferred.sessionRoot) {
-        try { reply = await this.ask({ op: "resume", sessionRoot: deferred.sessionRoot, ...(deferred.issued ?? {}) }, CLASS_CHECK_MS); }
+        try { reply = await this.ask({ op: "resume", sessionRoot: deferred.sessionRoot, ...(deferred.issued ?? {}), call }, CLASS_CHECK_MS); }
         catch { reply = undefined; }
       }
       if (reply?.result !== "ok") {

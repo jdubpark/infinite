@@ -5,6 +5,12 @@ import type { TeamCommand, TeamLineup, TeamProject } from "./team-types.js";
 export function handoffPathsOverlap(left: string, right: string) {
   return [relative(left, right), relative(right, left)].some(path => !isAbsolute(path) && path !== ".." && !path.startsWith("../"));
 }
+/** The main check setting changes what the host measures and tells the owner, never a handoff's authority, so a policy compares without it. */
+export function withoutMainCheck<T>(team: T): T {
+  if (!team || typeof team !== "object" || !("mainCheck" in team)) return team;
+  const { mainCheck: _mainCheck, ...rest } = team as T & { mainCheck?: unknown };
+  return rest as T;
+}
 export const handoffRequestSchema = z.object({
   backgroundWorkStopped: z.literal(true),
   objective: z.string().trim().min(1).max(4000),

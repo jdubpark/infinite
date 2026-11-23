@@ -2,6 +2,7 @@ import { PROVIDER_NAMES, type Attention, type Prompt, type Provider } from "@inf
 import type { Manager } from "./manager.js";
 import type { PushSender, PushStore } from "./push.js";
 import type { FuseService, FuseInterrupt } from "./fuse/service.js";
+import type { MainCheckNotice, MainCheckService } from "./main-check.js";
 import type { PermissionDeliveryService } from "./permission-agent-types.js";
 import { INTERRUPT_CLASSES, type InterruptClass } from "./permission-policy.js";
 import { learningPurpose, type SessionPurpose } from "./types.js";
@@ -97,6 +98,11 @@ export class Notifier {
      * `ownerClass` names the interrupt class for which it left a dialog to the owner, and the push names it.
      */
     private readonly permissions?: Pick<PermissionDeliveryService, "holder" | "ownerClass">,
+    /**
+     * The main check's notices (R9). A notice is accepted when a device got its message. Any other is left alone:
+     * the service offers it again a minute after it was taken.
+     */
+    private readonly mainCheck?: Pick<MainCheckService, "notices" | "accepted">,
   ) {}
   /** After a fuse push that reached no device, the time of the next attempt, on a clock that never steps back. */
   private fuseRetryAt = 0;
@@ -141,15 +147,19 @@ export class Notifier {
     const lifecycle = [...this.teamEvents(), ...this.goalEvents()];
     const storageDue = await this.storageEvents(Date.now());
     const fuseDue = this.fuseEvents();
-    if (!due.length && !lifecycle.length && !storageDue.length && !fuseDue.length) return;
+    const mainCheckDue = this.mainCheckEvents();
+    if (!due.length && !lifecycle.length && !storageDue.length && !fuseDue.length && !mainCheckDue.length) return;
     const devices = this.store.list();
     if (!devices.length) return;
+    // The fuse messages stay last: their ticket offsets are counted from the end of the list.
     const messages = [
       ...due.flatMap((row) => devices.map((d) => this.message(row, d.token))),
       ...lifecycle.flatMap((item) => devices.map((d) => this.lifecycleMessage(item, d.token))),
       ...storageDue.flatMap((item) => devices.map((d) => this.storageMessage(item, d.token))),
+      ...mainCheckDue.flatMap((item) => devices.map((d) => this.mainCheckMessage(item, d.token))),
       ...fuseDue.flatMap((item) => devices.map((d) => this.fuseMessage(item, d.token))),
     ];
+    const mainFirst = messages.length - (mainCheckDue.length + fuseDue.length) * devices.length;
     let tickets: Awaited<ReturnType<PushSender>>;
     try {
       tickets = await this.sender(messages);
@@ -157,6 +167,12 @@ export class Notifier {
       console.warn(`push: sender failed (${(error as Error).name})`);
       return;
     }
+    // A main-check notice is accepted when one of the devices got an ok ticket for its message. One that reached
+    // nobody gets no answer, so it is tried again after its minute in flight, not on every tick.
+    mainCheckDue.forEach((item, index) => {
+      const reached = devices.some((_device, device) => tickets[mainFirst + index * devices.length + device]?.status === "ok");
+      if (reached) this.mainCheck?.accepted(item.projectId, item.notice, item.outcome);
+    });
     // The sender resolves even when the push service refuses a message, with one ticket per message. A trip is
     // marked when at least one device received it, so a push that reached nobody is offered again.
     if (fuseDue.length) {
@@ -174,6 +190,29 @@ export class Notifier {
       else failures.add(ticket.details?.error ?? ticket.message ?? "error");
     });
     if (failures.size) console.warn(`push: ${[...failures].join(", ")}`);
+  }
+  /**
+   * R9: the main check's notices the owner may hear about now. Nothing is taken unless the event is enabled. A taken
+   * notice is in flight in the service for a minute, so with no device registered it is asked for once a minute.
+   */
+  private mainCheckEvents(): MainCheckNotice[] {
+    if (!this.mainCheck || !this.enabled("main-check")) return [];
+    try { return this.mainCheck.notices(); } catch { return []; }
+  }
+  /** The text is the host's, made from the notice's facts. No line of a command's output ever enters a push. */
+  private mainCheckMessage(item: MainCheckNotice, to: string) {
+    const { summary } = item;
+    const head = summary.head.slice(0, 7);
+    const text = summary.outcome === "passed"
+      ? { title: "Main passes again", body: `all ${summary.expected} checks passed at ${head}.` }
+      : { title: "Main is failing", body: summary.failed
+        ? `check ${summary.failed.index} of ${summary.expected} ${summary.failed.exitCode === null ? "exited with no exit code" : `exited ${summary.failed.exitCode}`} at ${head}.`
+        : `a check failed at ${head}.` };
+    return {
+      to, title: text.title, body: `${item.label}: ${text.body}`,
+      data: { url: "/teams", ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
+      priority: "default" as const, collapseId: `main-check:${fuseSubject(item.projectId)}`,
+    };
   }
   private async storageEvents(now: number): Promise<StorageAlert[]> {
     if (!this.storage || !this.enabled("host-storage") || (this.lastStorageEvaluationAt !== undefined && now - this.lastStorageEvaluationAt < 60_000)) return [];

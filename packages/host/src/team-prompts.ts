@@ -124,6 +124,7 @@ function withoutPrivateSettings<T extends object>(project: T): T {
   const copy = { ...project } as Record<string, unknown>;
   delete copy.features;
   delete copy.eval;
+  delete copy.mainCheck;
   delete copy.routing;
   delete copy.objective;
   return copy as T;

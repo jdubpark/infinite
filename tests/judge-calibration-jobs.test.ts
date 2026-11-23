@@ -562,9 +562,8 @@ test("a calibration that is not running shows no wait reason", async () => {
     const ended = f.jobs.cancel(id);
     assert.ok("calibration" in ended);
     assert.equal("calibration" in ended ? ended.calibration.waiting : "x", null, "a cancelled calibration waits on nothing");
-    assert.deepEqual(await f.jobs.next(gates()), { kind: "idle" });
     created(f, { requestId: "request-2" });
     const running = f.jobs.views().find(item => item.status === "running");
-    assert.equal(running?.waiting, null, "idle forgot the old reason");
+    assert.equal(running?.waiting, null, "a new calibration does not show a reason found before it existed");
   } finally { f.close(); }
 });

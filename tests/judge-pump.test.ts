@@ -286,6 +286,7 @@ test("a judgement waits while a trial is live", async () => {
     for (let step = 0; step < 8; step++) await r.pump.step();
     assert.equal(r.judge.creates.filter(item => item.purpose === "duel").length, 0, "no judge run starts while the trial is live");
     assert.equal(rowsOf(r, id).length, 0, "no judgement row is opened either");
+    assert.equal(viewOf(r, id).waiting, "another-job", "the view names the live trial as the gate");
     // The trial's session exits and the job is cancelled, so no further trial is ready: the trial closes, and the judgement runs after it.
     const trialId = r.judge.creates.find(item => item.purpose === "replay")!.trialId;
     r.store.write(tx => { tx.run("UPDATE eval_jobs SET status = 'cancelled' WHERE kind = 'baseline'"); });

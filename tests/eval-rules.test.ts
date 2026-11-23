@@ -86,6 +86,20 @@ test("a capsule keeps only what came before the member started", () => {
   assert.equal(buildCapsule(run, task, implementer(run, null)), null);
 });
 
+test("a capsule keeps the goal's other fields and leaves out its criteria rows", () => {
+  const base = hostEntryRun();
+  const goal = {
+    id: "7d2c1f3e-5a4b-4c6d-8e9f-0a1b2c3d4e5f", revision: 1, cycle: 1, successCriteria: "Tests pass", nonGoals: [], allowedPaths: ["."],
+    evidence: [], previousWork: [], deadlineAt: "2026-11-14T10:00:00.000Z", maxMembers: 4,
+    criteria: [{ criterion: "c0", status: "not-met", check: "npm test" }],
+  } as unknown as NonNullable<TeamRun["goal"]>;
+  const run = { ...base, goal };
+  const capsule = buildCapsule(run, integratedTask(run), implementer(run, "2026-11-13T10:05:00.000Z"));
+  const { criteria: _criteria, ...expected } = goal;
+  assert.deepEqual(capsule?.goal, expected);
+  assert.equal(Object.hasOwn(capsule?.goal ?? {}, "criteria"), false);
+});
+
 test("a start is refused before any read", () => {
   const run = hostEntryRun();
   const start = (objective: string, uiChanges = false) => captureStart(

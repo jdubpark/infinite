@@ -830,3 +830,23 @@ test("an idle job past its expiry waits for its live trial to end", () => {
     f.cleanup();
   }
 });
+
+test("a release counts one slot only: a release of another slot starts the count again", () => {
+  const f = fixture();
+  try {
+    const created = f.trial.create(PROJECT, request(), REQUEST_ONE);
+    assert.ok("job" in created);
+    const jobId = created.job.jobId;
+    const ref = configRef(configuration(CLAUDE));
+    const slotOf = (slot: number, attempt = 0) => ({ jobId, taskId: TASK_ONE, configRef: ref, slot, attempt });
+    const releases = (slot: ReturnType<typeof slotOf>, count: number) => Array.from({ length: count }, () => f.trial.release(slot, "bundle-missing"));
+    assert.ok(releases(slotOf(0), 9).every(answer => answer === "released"), "nine releases keep the attempt");
+    assert.equal(f.jobs.view(jobId)?.waiting, "bundle-missing", "the cause shows as the job's wait");
+    assert.equal(f.trial.release(slotOf(1), "bundle-missing"), "released", "another slot's first release");
+    assert.ok(releases(slotOf(0), 9).every(answer => answer === "released"), "the count of the first slot started again");
+    assert.equal(f.trial.release(slotOf(0), "bundle-missing"), "exhausted", "the tenth in a row for one slot");
+    assert.equal(f.trial.release(slotOf(0, 1), "bundle-missing"), "released", "the next attempt counts from one");
+  } finally {
+    f.cleanup();
+  }
+});

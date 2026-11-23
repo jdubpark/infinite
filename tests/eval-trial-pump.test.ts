@@ -12,7 +12,7 @@ import type { Grader } from "../packages/host/src/eval-grader.js";
 import type { TrialGrade } from "../packages/host/src/eval-types.js";
 import { evalCorpusModule } from "../packages/host/src/eval-store.js";
 import { TrialJobs } from "../packages/host/src/eval-trial-jobs.js";
-import { TrialPump, type TrialTeams } from "../packages/host/src/eval-trial-pump.js";
+import { TrialPump, type TrialPumpOptions, type TrialTeams } from "../packages/host/src/eval-trial-pump.js";
 import { EVAL_TRIALS_MODULE, evalTrialsModule, finishTrial, insertTrial, startTrial } from "../packages/host/src/eval-trial-store.js";
 import { ComparisonPass } from "../packages/host/src/eval-comparison.js";
 import { EvalHost } from "../packages/host/src/eval-host.js";
@@ -39,7 +39,9 @@ type Probe = Parameters<EvalIdentity["probe"]>[0];
 
 /** The pump with no member and a source whose `status` has no mirror head, so no trial can start. Every call is logged. */
 function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: EvalProbe[]; sessionsRemoved?: string[]; forgetThrows?: boolean; replayIds?: string[];
-  replayState?: (trialId: string) => Promise<unknown>; onStatus?: () => void; cost?: CostLookup; clock?: () => string; trialsNewer?: boolean; alive?: boolean } = {}) {
+  replayState?: (trialId: string) => Promise<unknown>; onStatus?: () => void; cost?: CostLookup; clock?: () => string; trialsNewer?: boolean; alive?: boolean;
+  /** The mirror head the scripted source status reports; without it the project has no mirror yet. */
+  mirrorHead?: string; prepareSource?: TrialPumpOptions["prepareSource"] } = {}) {
   const root = mkdtempSync(join(tmpdir(), "infinite-trial-pump-"));
   dirs.push(root);
   const vaultKey = randomBytes(32);
@@ -98,7 +100,8 @@ function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: E
     config, store, jobs, grader, identity, teams: () => teams,
     sessions: { list: async () => [], remove: async (id: string) => { sessionsRemoved.push(id); if (options.removeRefused) throw new Error("refused"); } } as never,
     ...(options.cost ? { cost: options.cost } : {}),
-    source: { mirrorPath: () => join(root, "mirror.git"), status: () => { log.push("status"); options.onStatus?.(); return { mode: "github", repository: "example/app", baseBranch: "main" } as never; } },
+    source: { mirrorPath: () => join(root, "mirror.git"), status: () => { log.push("status"); options.onStatus?.(); return { mode: "github", repository: "example/app", baseBranch: "main", ...(options.mirrorHead ? { mirrorHead: options.mirrorHead } : {}) } as never; } },
+    ...(options.prepareSource ? { prepareSource: options.prepareSource } : {}),
     hostLoad: { held: () => undefined }, halt: () => ({ check: () => ({ state: "clear" as const }) }),
     graderProbe: async () => ({ state: "ready", storage: true, version: 2, uid: 5002 }), inventory: async () => options.alive ? [{ ruid: 5001, euid: 5001, state: "S" } as never] : [], now,
   });
@@ -563,6 +566,98 @@ test("the comparison step reports no job whose trial is still live after a sweep
     const row = r.store.read(db => db.get<{ status: string }>("SELECT status FROM eval_jobs WHERE job_id = ?", jobId));
     assert.equal(row?.status, "paused");
     assert.equal(new ComparisonPass({ store: r.store, config: r.config, now: r.now }).step(), "idle");
+  } finally {
+    r.cleanup();
+  }
+});
+
+type Built = { attempt: number; waiting: string | null };
+const trialRows = (r: ReturnType<typeof rig>) => r.store.read(db => db.all<{ attempt: number; state: string; ending: string | null }>(
+  "SELECT attempt, state, ending FROM eval_trials ORDER BY created_at, attempt"));
+const jobOf = (r: ReturnType<typeof rig>, jobId: string) => r.store.read(db => db.get<{ status: string; reason: string | null; waiting: string | null }>(
+  "SELECT status, reason, waiting FROM eval_jobs WHERE job_id = ?", jobId))!;
+
+/** A source that ends with `cause` for the first `failures` builds, then skips the task. Each build records the row's attempt and the job's wait. */
+function scripted(failures: number, cause: "bundle-missing" | "grader-failed" = "bundle-missing") {
+  const builds: Built[] = [];
+  let store: EvidenceStore | undefined;
+  let jobId = "";
+  const prepareSource: TrialPumpOptions["prepareSource"] = async (_store, _taskId, ctx) => {
+    const row = _store.read(db => db.get<{ attempt: number }>("SELECT attempt FROM eval_trials WHERE trial_id = ?", ctx.trialId))!;
+    store = _store;
+    builds.push({ attempt: row.attempt, waiting: jobId === "" ? null : _store.read(db => db.get<{ waiting: string | null }>("SELECT waiting FROM eval_jobs WHERE job_id = ?", jobId))!.waiting });
+    return builds.length <= failures ? { kind: "environment", cause } : { kind: "skip", reason: "not-valid" };
+  };
+  return { builds, prepareSource, setJob: (id: string) => { jobId = id; }, store: () => store };
+}
+
+/** Steps until `count` source builds (or status reads, with no mirror head) were made; a step budget keeps a stuck pump from hanging. */
+async function stepsUntil(r: ReturnType<typeof rig>, made: () => number, count: number): Promise<void> {
+  for (let step = 0; step < 200 && made() < count; step++) await r.pump.step();
+  assert.equal(made(), count);
+}
+
+test("a source that cannot be built leaves no row for nine tries, and the tenth ends the trial void-host", async () => {
+  const s = scripted(100);
+  const r = rig({ baseBranch: "main", mirrorHead: "head", prepareSource: s.prepareSource });
+  try {
+    const jobId = r.addJob();
+    s.setJob(jobId);
+    await stepsUntil(r, () => s.builds.length, 9);
+    assert.deepEqual(trialRows(r), [], "nine failures leave no trial row");
+    assert.deepEqual({ ...jobOf(r, jobId) }, { status: "running", reason: null, waiting: "bundle-missing" }, "the job names the cause");
+    await stepsUntil(r, () => s.builds.length, 10);
+    assert.deepEqual(trialRows(r).map(row => ({ ...row })), [{ attempt: 0, state: "final", ending: "void-host" }], "the tenth failure ends the trial");
+    await stepsUntil(r, () => s.builds.length, 11);
+    assert.equal(s.builds[10]!.attempt, 1, "the next try is attempt 1: the voided one used attempt 0");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a cause that never clears uses the slot's three attempts and pauses the job", async () => {
+  const s = scripted(1000);
+  const r = rig({ baseBranch: "main", mirrorHead: "head", prepareSource: s.prepareSource });
+  try {
+    const jobId = r.addJob();
+    s.setJob(jobId);
+    await stepsUntil(r, () => s.builds.length, 30);
+    for (let step = 0; step < 6; step++) await r.pump.step();
+    assert.equal(s.builds.length, 30, "no build follows the third void");
+    assert.deepEqual(trialRows(r).map(row => ({ ...row })), [0, 1, 2].map(attempt => ({ attempt, state: "final", ending: "void-host" })));
+    const job = jobOf(r, jobId);
+    assert.deepEqual({ status: job.status, reason: job.reason }, { status: "paused", reason: "trial-voids" });
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a short outage uses no attempt and the wait clears when the source builds", async () => {
+  const s = scripted(3);
+  const r = rig({ baseBranch: "main", mirrorHead: "head", prepareSource: s.prepareSource });
+  try {
+    const jobId = r.addJob();
+    s.setJob(jobId);
+    await stepsUntil(r, () => s.builds.length, 3);
+    assert.equal(jobOf(r, jobId).waiting, "bundle-missing", "the job names the cause while the slot waits");
+    await stepsUntil(r, () => s.builds.length, 4);
+    assert.deepEqual(s.builds[3], { attempt: 0, waiting: null }, "the fourth build is attempt 0 and the job waits for nothing");
+    assert.deepEqual(trialRows(r), [], "no void row was written");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a project with no mirror head counts the same way", async () => {
+  const r = rig();
+  try {
+    const jobId = r.addJob();
+    const tries = () => r.log.filter(entry => entry === "status").length;
+    await stepsUntil(r, tries, 9);
+    assert.deepEqual(trialRows(r), []);
+    assert.equal(jobOf(r, jobId).waiting, "mirror");
+    await stepsUntil(r, tries, 10);
+    assert.deepEqual(trialRows(r).map(row => ({ ...row })), [{ attempt: 0, state: "final", ending: "void-host" }]);
   } finally {
     r.cleanup();
   }

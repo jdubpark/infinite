@@ -822,7 +822,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     if (explicitProject || uploadSource) { config.projectId = selected; privateJson(configPath, config); }
     const sourceSnapshot = uploadSource && !head.commit ? "empty cloud baseline" : uploadSource ? `local commit ${head.commit}` : detail.sync?.appliedManifest ? "existing cloud checkout retained" : "configured project checkout";
     console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, teamwork: output.teamwork, revision: output.revision, execution: output.execution, autonomy: output.autonomy, autonomySource: output.autonomySource, autonomyReady: output.autonomyReady, autonomyReason: output.autonomyReason, evaluatorOverlaps: output.evaluatorOverlaps, projectSource: enrolledSource, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source: sourceSnapshot }, null, 2));
-    if (output.evaluatorOverlaps?.length) console.error(`Warning: evaluator profile ${clean(output.evaluatorOverlaps.join(", "))} uses a model that an implementer or an escalation also uses, so its verdict may not be independent.`);
+    if (output.evaluatorOverlaps?.length) console.error(`Warning: an evaluator profile whose model an implementer or an escalation also uses never assesses a cycle with that model's work: ${clean(output.evaluatorOverlaps.join(", "))}.`);
     if (routingChoice?.mode === "auto") console.error(ROUTING_AUTO_NOTE);
     return true;
   }

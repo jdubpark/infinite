@@ -548,6 +548,12 @@ export const teamGoalContextSchema = z.object({
   criteria: criteriaRowsSchema.optional(),
 }).strict();
 export type TeamGoalContext = z.infer<typeof teamGoalContextSchema>;
+/** The goal without its criteria rows, which only the project manager reads. The same object when it has none. */
+export function withoutCriteria(goal: TeamGoalContext): TeamGoalContext {
+  if (!goal.criteria) return goal;
+  const { criteria: _criteria, ...rest } = goal;
+  return rest;
+}
 export const teamEvidenceSchema = z.object({ source: z.string().trim().min(1).max(1000), observation: z.string().trim().min(1).max(2000) }).strict();
 export type TeamEvidence = z.infer<typeof teamEvidenceSchema>;
 export const teamBriefSchema = z.object({

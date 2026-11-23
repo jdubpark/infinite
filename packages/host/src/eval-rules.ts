@@ -4,19 +4,13 @@ import type { Capsule, CapturedPayload, CaptureStart, EvalFeatures, MaterialStat
 import type { OutcomeRow } from "./outcome-store.js";
 import { rowUse } from "./outcome-cells.js";
 import { isTestPath, pathArea, type FeatureMap } from "./task-features.js";
-import { decisionAuthorityQuestion, type TeamMember, type TeamRun, type TeamTask } from "./team-types.js";
+import { decisionAuthorityQuestion, withoutCriteria, type TeamMember, type TeamRun, type TeamTask } from "./team-types.js";
 
 /** Pure capture rules. No I/O, no clock. */
 
 export const CAPSULE_MAX_BYTES = 65_536;
 export const REFERENCE_MAX_FILES = 500;
 export const LATER_FILES_MAX = 2_000;
-
-/** The goal as an implementer saw it: the criteria rows go to the project manager only. */
-function withoutCriteria(goal: NonNullable<TeamRun["goal"]>): NonNullable<TeamRun["goal"]> {
-  const { criteria: _criteria, ...rest } = goal;
-  return rest;
-}
 
 /** What the member saw when it started: steering, owner answers, and the task. Never a rendered prompt. */
 export function buildCapsule(run: TeamRun, task: TeamTask, member: TeamMember): Capsule | null {

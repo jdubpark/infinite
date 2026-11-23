@@ -1,4 +1,4 @@
-import { inputSourceLabel, ownerSteering, decisionAnswerLabel, decisionAuthorityQuestion, autoPinned, autoRouted, eligibleImplementers, escalationPool, hostSelects, scoutPool } from "./team-types.js";
+import { inputSourceLabel, ownerSteering, decisionAnswerLabel, decisionAuthorityQuestion, autoPinned, autoRouted, eligibleImplementers, escalationPool, hostSelects, scoutPool, withoutCriteria } from "./team-types.js";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { entryToolsFor } from "./entry-roles.js";
@@ -135,12 +135,6 @@ export const UNREPORTED_ROLES: ReadonlySet<TeamMember["role"]> = new Set(["permi
 export function withoutRouting<T extends object>(item: T): T {
   const { routing: _routing, ...rest } = item as T & { routing?: unknown };
   return rest as T;
-}
-/** The goal without its criteria rows, which only the project manager reads. The same object when it has none. */
-function withoutCriteria(goal: NonNullable<TeamRun["goal"]>): NonNullable<TeamRun["goal"]> {
-  if (!goal.criteria) return goal;
-  const { criteria: _criteria, ...rest } = goal;
-  return rest;
 }
 /**
  * The goal's JSON. With a pinned record digest, the success text leaves the JSON and the digest's criteria follow, with

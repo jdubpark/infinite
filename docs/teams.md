@@ -2306,7 +2306,7 @@ The composed result is `not-met` when any criterion is `not-met`, whoever produc
 - The ledger undercounts: a `record-unavailable` verdict writes no row, because a row needs a record version.
 - After a crash between the goal record's write and the run's save, the record holds one `verdict.recorded` entry for a verdict that has no assessment on the run and no ledger row. The run is fenced, and nothing is written twice.
 - For a no-change verdict, the run can be saved as released one step before the service saves the no-change result.
-- The lineup warning reaches the enrollment view (`evaluatorOverlaps`) and `infinite repo init`, which prints one warning line. The web, phone, and Mac clients do not render it yet.
+- The lineup warning reaches the enrollment view (`evaluatorOverlaps`, the ids of evaluator profiles whose model an implementer or an escalation also uses) and `infinite repo init`, which prints one warning line on the error stream. Such a profile never assesses a cycle with that model's work. The web, phone, and Mac clients do not render the warning yet.
 - Agreement statistics wait. The verdicts read shows whether the owner agreed, but the ledger row has no agreement column and there is no per-profile agreement cell.
 - Not built: `until-met` standing goals, the goal digest's other fields, citation handles, and a goal roll-up of the latest assessment in the outcome ledger.
 - A verdict delays delivery by one read-only member.

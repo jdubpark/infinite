@@ -1,12 +1,12 @@
 import type express from "express";
 import type { ChildProcess } from "node:child_process";
 import { type EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
-import { EvidenceError, type EvidenceTx } from "./evidence/types.js";
+import { EvidenceError, type EvidenceDb, type EvidenceTx } from "./evidence/types.js";
 import { TaskCapture } from "./eval-capture.js";
 import { type Grader, type GraderProbe, launcherGrader, PROBE_FRESH_MS, stopGrader } from "./eval-grader.js";
 import { applyDuplicateRule, GroupPass, rootOf, sweepGroups } from "./eval-groups.js";
 import { launcherEvalIdentity, type EvalIdentity } from "./eval-identity.js";
-import { ACTIVE_JOBS_SQL, EvalJobs, JOB_LIST_MAX, type NextWork } from "./eval-jobs.js";
+import { ACTIVE_JOBS_SQL, EvalJobs, JOB_LIST_MAX, type EvalJobRow, type NextWork } from "./eval-jobs.js";
 import { TrialJobs } from "./eval-trial-jobs.js";
 import { ComparisonPass, reportFor } from "./eval-comparison.js";
 import { readPriors } from "./eval-priors.js";
@@ -125,7 +125,7 @@ export class EvalHost implements EvalHostApi {
     this.comparison = new ComparisonPass({ store: this.store, config: this.config, now: this.now });
     this.evalJobs = new EvalJobs({
       store: this.store, config: this.config, now: this.now,
-      baseline: { views: (db, rows) => this.trialJobs.views(db, rows), digest: (projectId, jobId) => this.trialJobs.digest(projectId, jobId) },
+      baseline: { views: (db, rows) => this.trialViews(db, rows), digest: (projectId, jobId) => this.trialJobs.digest(projectId, jobId) },
     });
     const identity = options.identity ?? launcherEvalIdentity(() => this.config.eval?.member);
     this.trials = options.teams && options.sessions ? new TrialPump({
@@ -189,15 +189,18 @@ export class EvalHost implements EvalHostApi {
   async summary(projectId: string): Promise<EvalSummary | EvalRefusal> {
     const project = this.config.projects.find(item => item.id === projectId);
     if (project === undefined) return refusal(404, "unknown-project");
-    if (!this.ready()) return refusal(503, "evidence-unavailable");
+    // The summary reads today's trial count from the trial tables.
+    if (!this.ready() || !this.trialsReady()) return refusal(503, "evidence-unavailable");
     const grader = await this.graderState();
     const day = `${this.now().slice(0, 10)}T00:00:00.000Z`;
+    const identity = this.trials?.identityStatus() ?? { state: "not-configured" as const };
     return this.guard(() => evalSummary(this.store, {
       project,
       mining: this.miner.status(projectId),
       grader,
       graderVersion: this.probed?.probe.version ?? null,
-      evalIdentity: this.trials?.identityState() ?? "not-configured",
+      evalIdentity: identity.state,
+      evalIdentityLastProbe: identity.lastProbe,
       trials: { today: this.trialsToday(projectId, day), dailyCap: project.team?.eval?.trialsPerDay ?? null },
       jobs: this.evalJobs.projectJobs(projectId, SUMMARY_JOBS),
       now: this.now(),
@@ -257,7 +260,7 @@ export class EvalHost implements EvalHostApi {
     this.validation = run;
   }
 
-  /** Today's trials of the project; 0 while the trials module cannot be read, so the summary still answers. */
+  /** Today's trials of the project. The summary has already refused while the trials module is not ready, so a throw here is a store failure. */
   private trialsToday(projectId: string, day: string): number {
     try { return this.store.read(db => trialsSince(db, projectId, day)); } catch { return 0; }
   }
@@ -428,6 +431,12 @@ export class EvalHost implements EvalHostApi {
     } catch {
       return false;
     }
+  }
+
+  /** The views of trial job rows for a read or a control: they read the trial tables, so the module must be ready. */
+  private trialViews(db: EvidenceDb, rows: readonly EvalJobRow[]): Map<string, EvalJobView> {
+    if (rows.length > 0 && !this.trialsReady()) throw new EvidenceError("unavailable", "The trials module is not ready.");
+    return this.trialJobs.views(db, rows);
   }
 
   private trialsReady(): boolean {

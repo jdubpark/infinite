@@ -235,3 +235,12 @@ test("the status prints the sets", () => {
   assert.ok(lines.includes("sets dev 5 · holdout 2"));
   assert.ok(lines.includes("groups 3 (dev-only 1, largest 2, holdout 1, exposed 1)"));
 });
+
+test("status says what the last identity probe answered when it has aged out", () => {
+  const base: EvalSummary = { ...summary, trials: { today: 0, dailyCap: 6 } };
+  const lines = (evalIdentity: unknown) => evalStatusLines({ ...base, evalIdentity } as EvalSummary);
+  assert.ok(lines({ state: "unavailable", lastProbe: { state: "misconfigured", at: "2026-11-22T01:00:00.000Z" } }).includes("eval identity unavailable (last probe misconfigured, 2026-11-22T01:00:00.000Z)"));
+  assert.ok(lines({ state: "unavailable", lastProbe: null }).includes("eval identity unavailable (not probed)"));
+  assert.ok(lines({ state: "unavailable" }).includes("eval identity unavailable"), "an older host says nothing it cannot know");
+  assert.ok(lines({ state: "misconfigured" }).includes("eval identity misconfigured"));
+});

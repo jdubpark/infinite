@@ -28,6 +28,8 @@ import {
   startTrial,
 } from "../packages/host/src/eval-trial-store.js";
 import { configRef, TRIAL_HARNESS_VERSION, trialProfileKey } from "../packages/host/src/eval-trial-rules.js";
+import { ComparisonPass, reportFor } from "../packages/host/src/eval-comparison.js";
+import { rotateHoldout } from "../packages/host/src/eval-sets.js";
 import { advanceEpoch, configurationModule } from "../packages/host/src/configuration-store.js";
 
 const DAY_MS = 86_400_000;
@@ -722,6 +724,108 @@ test("a comparison job waits for the trial gates", async () => {
     const capped = await f.trial.next(f.gates());
     assert.equal(capped.kind, "wait");
     assert.equal(capped.kind === "wait" && capped.waiting, "daily-cap");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a paused or blocked job expires at its expiry time, and an unexpired paused job stays paused", async () => {
+  for (const kind of ["paused", "blocked"] as const) {
+    const f = fixture();
+    try {
+      const expires = new Date(START + 3_600_000).toISOString();
+      const created = f.trial.create(PROJECT, request({ expiresAt: expires }), REQUEST_ONE);
+      assert.ok("job" in created, JSON.stringify(created));
+      const jobId = created.job.jobId;
+      if (kind === "paused") f.jobs.control(jobId, "pause");
+      else f.trial.block(jobId, "eval-processes-alive");
+      assert.equal(f.jobs.view(jobId)?.status, kind);
+      f.setClock(START + 3_600_000 - 1);
+      await f.trial.next(f.gates());
+      assert.equal(f.jobs.view(jobId)?.status, kind, `before its expiry a ${kind} job stays ${kind}`);
+      f.setClock(START + 3_600_000);
+      await f.trial.next(f.gates());
+      const view = f.jobs.view(jobId);
+      assert.equal(view?.status, "expired", kind);
+      assert.equal(view?.reason, "expired");
+      assert.equal(view?.finishedAt, f.now());
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test("a paused confirm job past its expiry gets its report and frees the holdout rotation", async () => {
+  const f = fixture();
+  try {
+    const expires = new Date(START + 3_600_000).toISOString();
+    const created = f.trial.create(PROJECT, request({ expiresAt: expires }), REQUEST_ONE);
+    assert.ok("job" in created);
+    const jobId = created.job.jobId;
+    // The row is made a paused confirm job directly; the report and the rotation read only its kind, status, and stamps.
+    f.store.write(tx => {
+      tx.run("UPDATE eval_jobs SET kind = 'confirm', status = 'paused', reason = 'owner' WHERE job_id = ?", jobId);
+      tx.run(
+        "INSERT INTO eval_groups (group_id, kind, project_ref, root_id, created_at, holdout, set_at) VALUES ('run:held', 'run', ?, 'run:held', ?, 1, ?)",
+        tx.index("project", PROJECT), new Date(START).toISOString(), new Date(START - 300 * DAY_MS).toISOString(),
+      );
+    });
+    f.setClock(START + 3_600_000);
+    await f.trial.next(f.gates());
+    assert.equal(f.jobs.view(jobId)?.status, "expired");
+    assert.equal(f.store.write(tx => rotateHoldout(tx, f.now())), 0, "the unreported confirm job still holds the groups");
+    const pass = new ComparisonPass({ store: f.store, config: f.config, now: f.now });
+    assert.equal(pass.step(), "reported");
+    const stamped = f.store.read(db => db.get<{ reported_at: string | null }>("SELECT reported_at FROM eval_jobs WHERE job_id = ?", jobId));
+    assert.equal(stamped?.reported_at, f.now());
+    assert.equal(f.store.write(tx => rotateHoldout(tx, f.now())), 1, "the rotation moves again");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("the job view says when the stored report is unreadable", () => {
+  const f = fixture();
+  try {
+    const created = f.trial.create(PROJECT, request(), REQUEST_ONE);
+    assert.ok("job" in created);
+    const jobId = created.job.jobId;
+    // A compare job that finished, whose payload cannot be opened: the pass stores an unreadable report.
+    const at = f.now();
+    f.store.write(tx => {
+      tx.run("UPDATE eval_jobs SET kind = 'compare', status = 'completed', reason = 'done', finished_at = ?, payload = 'x' WHERE job_id = ?", at, jobId);
+    });
+    const before = f.jobs.view(jobId) as { report?: string | null };
+    assert.equal(before.report, "pending");
+    const pass = new ComparisonPass({ store: f.store, config: f.config, now: f.now });
+    assert.equal(pass.step(), "reported");
+    const state = f.store.read(db => db.get<{ state: string }>("SELECT state FROM eval_reports WHERE job_id = ?", jobId));
+    assert.equal(state?.state, "unreadable");
+    assert.equal((f.jobs.view(jobId) as { report?: string | null }).report, "unreadable");
+    const listed = f.jobs.list().find(view => view.jobId === jobId) as { report?: string | null } | undefined;
+    assert.equal(listed?.report, "unreadable");
+    const report = f.store.read(db => reportFor(db, jobId)) as { status?: number; code?: string };
+    assert.equal(report.status, 409);
+    assert.equal(report.code, "report-unreadable");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("an idle job past its expiry waits for its live trial to end", () => {
+  const f = fixture();
+  try {
+    const created = f.trial.create(PROJECT, request({ expiresAt: new Date(START + 3_600_000).toISOString() }), REQUEST_ONE);
+    assert.ok("job" in created);
+    const jobId = created.job.jobId;
+    const trialId = insertAt(f, jobId, 0);
+    f.jobs.control(jobId, "pause");
+    f.setClock(START + 3_600_000);
+    assert.equal(f.trial.expireIdle(), 0, "a running trial holds the job");
+    assert.equal(f.jobs.view(jobId)?.status, "paused");
+    voidTrial(f, trialId);
+    assert.equal(f.trial.expireIdle(), 1, "the job expires once the trial is final");
+    assert.equal(f.jobs.view(jobId)?.status, "expired");
   } finally {
     f.cleanup();
   }

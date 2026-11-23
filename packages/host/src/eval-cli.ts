@@ -71,6 +71,15 @@ const graderLine = (grader: EvalSummary["grader"]) =>
     ? "grader ready (version 1: no trials)"
     : `grader ${clean(grader.state)}`;
 
+/** The identity line: the state, and for `unavailable` what the last probe answered. */
+function identityLine(identity: EvalSummary["evalIdentity"]): string {
+  const state = `eval identity ${clean(identity.state)}`;
+  if (identity.state !== "unavailable") return state;
+  if (identity.lastProbe === undefined) return state;
+  if (identity.lastProbe === null) return `${state} (not probed)`;
+  return `${state} (last probe ${clean(identity.lastProbe.state)}, ${clean(identity.lastProbe.at)})`;
+}
+
 /** The status of one project, in the order the plan fixes. Plain columns only: ids, states, counts, and hashes. */
 export function evalStatusLines(summary: EvalSummary): string[] {
   const mining = summary.mining;
@@ -87,7 +96,7 @@ export function evalStatusLines(summary: EvalSummary): string[] {
     graderLine(summary.grader),
   ];
   // An older host sends no identity or trial fields; those lines are then left out, not shown as zero.
-  if (summary.evalIdentity) lines.push(`eval identity ${clean(summary.evalIdentity.state)}`);
+  if (summary.evalIdentity) lines.push(identityLine(summary.evalIdentity));
   if (summary.trials) {
     lines.push(summary.trials.dailyCap === null
       ? "trials off"

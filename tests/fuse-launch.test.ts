@@ -11,6 +11,8 @@ import type { FuseLaunch } from "../packages/host/src/fuse/types.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService, providerInputReason } from "../packages/host/src/teams.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
+import { unseal } from "../packages/host/src/vault.js";
+import { stopSessionWorkers, waitFor } from "./helpers.js";
 import { fixture, mixedLineup } from "./team-fixture.js";
 
 const START = Date.parse("2026-11-13T10:00:00.000Z");
@@ -278,6 +280,8 @@ test("the backstop refuses while open and passes the permission coordinator", as
 test("createOnce marks a created session started", { timeout: 120000 }, async () => {
   const host = await fixture("success", undefined, {}, { noServer: true });
   let store: EvidenceStore | undefined;
+  let workerPid: number | undefined;
+  let own: ReturnType<typeof shortRun> | undefined;
   try {
     const config = host.host.config;
     const key = readFileSync(config.keyFile);
@@ -285,7 +289,8 @@ test("createOnce marks a created session started", { timeout: 120000 }, async ()
     const clock = { now: START };
     const projectId = config.projects[0]!.id;
     const fuse = new FuseService({ config, key, store, sessionExists: () => true, now: () => clock.now });
-    const manager = new Manager(shortRun(config), key);
+    own = shortRun(config);
+    const manager = new Manager(own, key);
     manager.useFuse(fuse);
     const file = join(config.stateDir, BASELINE_FILE);
     const cwd = join(config.teams!.workspaceDir, randomUUID(), "integration");
@@ -294,6 +299,8 @@ test("createOnce marks a created session started", { timeout: 120000 }, async ()
     const id = randomUUID();
     const request = { requestId: id, projectId, provider: "demo" as const, title: "Write a", prompt: "Write a.txt" };
     await manager.createTeamSession(request, assignment, cwd);
+    workerPid = unseal<{ workerPid?: number }>(key, `${id}:status`, readFileSync(join(config.stateDir, "sessions", id, "status.sealed"), "utf8")).workerPid;
+    assert.equal(typeof workerPid, "number", "the session has a worker to end before cleanup");
     assert.equal(stateOf(key, file, id), "started");
     assert.equal(fuse.view().host.hour.launches, 1);
     fuse.release(id);
@@ -307,6 +314,9 @@ test("createOnce marks a created session started", { timeout: 120000 }, async ()
     assert.equal(fuse.view().host.hour.launches, counted, "the replay is not charged");
   } finally {
     store?.close();
+    // The session's worker listens under this test's own run directory, where the fixture's stop does not look. End it before the root goes.
+    if (own) await stopSessionWorkers(own);
+    if (workerPid) await waitFor(async () => { try { process.kill(workerPid!, 0); return true; } catch { return false; } }, running => !running, 30000);
     await host.close();
   }
 });

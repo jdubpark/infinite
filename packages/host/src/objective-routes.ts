@@ -13,7 +13,7 @@ const recordQuery = z.strictObject({ version: z.string().regex(/^[1-9][0-9]{0,5}
  * latest) and writes nothing. The correction is owner only; its body goes to `correctObjective` unparsed, which parses it.
  */
 export function objectiveRoutes(app: express.Express,
-  services: { goals: Pick<GoalService, "objectiveRecord" | "correctObjective" | "get">;
+  services: { goals: Pick<GoalService, "objectiveRecord" | "correctObjective" | "get" | "metrics">;
     teams: Pick<TeamService, "objectiveRecord"> & { verdicts: Pick<TeamVerdicts, "detail"> } },
   read: express.RequestHandler, owner: express.RequestHandler): void {
   // A UUID is case-insensitive; the host stores its ids in lower case.
@@ -27,6 +27,8 @@ export function objectiveRoutes(app: express.Express,
   app.get("/api/goals/:id/verdicts", read, (req, res) => {
     res.json(goalVerdictsView(services.goals.get(recordId(req.params.id)), id => services.teams.verdicts.detail(id)));
   });
+  // The curve of numbers the goal's checks reported (goal-metrics.ts). The relay's goal pattern has no `metrics` branch.
+  app.get("/api/goals/:id/metrics", read, (req, res) => res.json(services.goals.metrics(recordId(req.params.id))));
   app.get("/api/teams/:id/record", read, (req, res) => {
     const query = recordQuery.parse(req.query);
     res.json(services.teams.objectiveRecord(recordId(req.params.id), query.version === undefined ? undefined : Number(query.version)));

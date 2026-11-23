@@ -506,6 +506,17 @@ test("the relay refuses the verdicts read", async () => {
   } finally { client.close(); runner.close(); }
 });
 
+test("the relay refuses the reported-numbers curve", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    for (const path of [`/goals/${randomUUID()}/metrics`, `/goals/${randomUUID()}/metrics?view=full`])
+      await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused curve read does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
 test("the relay refuses routing reads", async () => {
   const runner = await httpRunner();
   const client = createRemoteClient({ url: runner.url, token: runner.token });

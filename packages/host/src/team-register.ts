@@ -57,7 +57,7 @@ type Plan = { head: string; subjects: Subject[]; reads: Target[]; checks: TeamCh
 type Running = { job: Job; controller: AbortController; done: Promise<void> };
 
 /** The reviewed-head rule of teams.ts: the check head is the run's head, and the run is approved at this revision. */
-function reviewedHead(holder: RegisterHolder): boolean {
+export function reviewedHead(holder: RegisterHolder): boolean {
   const run = holder.run;
   return run.headCommit !== undefined && holder.checkHead === run.headCommit &&
     run.review?.revision === run.revision && run.review.verdict === "approved";

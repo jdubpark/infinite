@@ -32,6 +32,26 @@ test("a spawned host's stop ends a session whose worker is not listening yet", {
   }
 });
 
+test("the stop of a host in this process ends a session whose worker is not listening yet", { timeout: 90 * 1000 }, async () => {
+  const host = await inProcessHost();
+  let workers: number[] = [];
+  let stopped = false;
+  try {
+    // Not awaited: the stop must meet the worker while the host is still starting it. Such a worker has no pid on record.
+    const creating = host.fetchApi("/sessions", "owner", { requestId: randomUUID(), provider: "demo", projectId: "rehearsal", title: "Starting", prompt: "Initial request" })
+      .catch(() => undefined);
+    workers = await waitFor(async () => processes().filter(row => row.parent === process.pid && row.command.includes(WORKER_ENTRY)).map(row => row.pid), list => list.length > 0);
+    await host.stop();
+    stopped = true;
+    await creating;
+    assert.equal(workers.length, 1, "one worker was started");
+    assert.deepEqual(workers.filter(running), [], "the worker is gone when the stop returns");
+  } finally {
+    for (const row of processes()) if (workers.includes(row.pid) && row.command.includes(WORKER_ENTRY)) process.kill(row.pid, "SIGKILL");
+    if (!stopped) await host.stop().catch(() => undefined);
+  }
+});
+
 test("the worker of a host in this process has ended when its sessions are stopped", { timeout: 60 * 1000 }, async () => {
   const host = await inProcessHost();
   let workers: number[] = [];

@@ -321,7 +321,9 @@ test("a stalled read ends at the caller's deadline and leaves a bounded number b
     }));
     assert.ok(Date.now() - started < 1500, "every caller's wait ends at its own deadline");
     assert.deepEqual(results, [undefined, undefined, undefined, undefined, undefined, undefined]);
-    // Four reads were started. The fifth and sixth callers found no free place and started none.
+    // Four reads were started, however slowly their processes came up. The fifth and sixth callers found no free place and started none.
+    const startBy = Date.now() + 10_000;
+    while (guidanceReads(log) < 4 && Date.now() < startBy) await new Promise(resolve => setTimeout(resolve, 20));
     await new Promise(resolve => setTimeout(resolve, 300));
     assert.equal(guidanceReads(log), 4);
     // The stalled reads end, their places free up, and a new commit is read.

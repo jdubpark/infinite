@@ -2819,26 +2819,40 @@ permission to signal it. The check output then says so, and the command is left
 to finish with its result discarded. Size the limit for the project's full check
 on the execution host.
 
-Every command the host runs for a team, setup, checks, member setup, Git
-commands and, under a command prefix, workspace removal alike, ends with the
-process that the host started for it.
+Every command that the host's team command runner starts for a team (setup,
+checks, member setup, the Git commands it runs and, under a command prefix,
+workspace removal) ends with the process that the host started for it.
 While that process runs, a stop (the time limit, a pause, a cancel, a block or a
 host stop) kills its process group. Once that process has exited, the host sends
 no signal to anything the command started: the group may be empty by then, and
 its id may already belong to an unrelated process. The host reads output that is
-still open for at most one second, then closes it. A setup or check command is
-decided by the exit code of the process the host started, so a check that exits
-0 while a process it started keeps the output open passes about a second later.
-Hosts before this rule waited for that output to close, so such a check ran into
-`teams.checkMinutes` and blocked the run. The host records the case in the run's
-events with one fixed line, "A configured command exited while a process it
-started still held its output. The host judged the command by its exit code and
-neither waited for that process nor stopped it." That process keeps running,
-in the verification copy for a check, until it ends; once the operation that ran
-the command has finished, nothing looks for it, and the run's directory may be
-removed while it runs. A Git read whose output stays open past that second is
-refused, as any incomplete read is. A stop that arrives within the second ends
-the command at once with the output read so far, and still sends no signal.
+still open for at most one second. It then reads what the pipes already hold:
+when both have ended, the command is complete with its whole output; otherwise
+the host closes them. A setup or check command is decided by the exit code of
+the process the host started, so a check that exits 0 while a process it started
+keeps the output open passes about a second later. Hosts before this rule waited
+for that output to close, so such a check ran into `teams.checkMinutes` and
+blocked the run. The host records the case in the run's events with one fixed
+line, "A configured command exited while a process it started still held its
+output. The host judged the command by its exit code and neither waited for that
+process nor stopped it." That process keeps running, in the verification copy
+for a check, until it ends. After an operation that succeeded, nothing looks for
+it, and the run's directory may be removed while it runs. A failed operation
+keeps its record: the census still finds the process by its recorded group, and
+retention holds the run's directories until the process ends. Most Git reads
+refuse a result whose output stayed open past that second, as they refuse any
+incomplete read; the few that decide by Git's exit code alone read only output
+that is complete when Git exits. A stop that arrives within the second ends the
+command at once with the output read so far, and still sends no signal.
+
+The rule has two limits. A command that was stopped before its process exited
+ends when its output closes, or at the caller's limit where the caller sets
+one. Setup and check commands set none, so a check or setup command that ran
+past its time limit and left a process in another session holding its output
+keeps its operation open until that process ends. Two Git runners outside the
+team command runner, the streamed patch and file reads and the team bundle
+download, are not covered yet: they wait for their output to close, and a stop
+signals the command's process group.
 
 For a brief that changes the interface, an approving reviewer must include
 `uiEvidence` describing the runnable flow inspected, results, and limitations.

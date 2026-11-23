@@ -12,7 +12,7 @@ import { hostEgressEnvironment } from "./egress.js";
 export class TeamError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
 }
-/** `leftover`: the leader exited while a process it started still held the output, so the command settled without its close (`teamCommand`); the output is then `truncated` too. */
+/** `leftover`: the leader exited and its output had not ended when the command settled, so a process it started still held it (`teamCommand`); the output is then `truncated` too. */
 export interface CommandResult { exitCode: number | null; output: string; stdout: string; interrupted: boolean; truncated: boolean; leftover: boolean }
 /** `extra` carries a host GitHub grant for one operation; without it the environment is exactly the fixed allowlist below. */
 export function teamCommandEnvironment(extra?: Record<string, string>): NodeJS.ProcessEnv {
@@ -43,12 +43,15 @@ export interface CommandScope {
 export const commandScope = new AsyncLocalStorage<CommandScope>();
 /** How long a command whose leader exited waits for its pipes to close. */
 export const EXIT_DRAIN_MS = 1_000;
+/** The most loop turns the decision at the end of the drain takes while output keeps arriving, so a process that prints without pause cannot hold the command. */
+const EXIT_DRAIN_TURNS = 3;
 /**
  * Commands are argv arrays, from owner configuration or an explicitly authorized plan. A command ends with its leader,
  * the process the host started. A stop while the leader runs kills the leader's process group. Once the leader exits
- * without a stop before it, the command settles when its pipes close or `EXIT_DRAIN_MS` later, whichever comes first,
- * with the leader's exit code and the output read so far; a stop after that exit settles it at once. A result that
- * settled before its pipes closed is `leftover` and `truncated`. Nothing is signalled after the exit, because the
+ * without a stop before it, the command settles with the leader's exit code when its pipes close or at the end of
+ * `EXIT_DRAIN_MS`, whichever comes first; a stop after that exit settles it at once. At the end of the drain the host
+ * first reads what the pipes already hold. A command whose stdout and stderr have both ended settles whole; otherwise
+ * it is `leftover` and `truncated`, with the output read so far. Nothing is signalled after the exit, because the
  * group may be empty and its id reused: whatever still runs is neither waited for nor stopped.
  */
 export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string, extraEnv?: Record<string, string>, forceSettleAfterMs?: number, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
@@ -68,10 +71,13 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
     }
     scope?.started(child.pid);
     let output = "", stdout = "", interrupted = false, settled = false, truncated = false, stopRequested = false, stopTimer: NodeJS.Timeout | undefined;
-    // The leader's exit code once it exited with no stop before it, and the drain after it.
-    let leaderExit: { code: number | null } | undefined, drainTimer: NodeJS.Timeout | undefined;
-    // An observer is evidence only; a throw in it must not break the command.
-    const observe = (chunk: Buffer, stream: "stdout" | "stderr") => { try { onOutput?.(chunk, stream); } catch { /* ignored */ } };
+    // The leader's exit code once it exited with no stop before it, the drain after it, and the output chunks read so far.
+    let leaderExit: { code: number | null } | undefined, drainTimer: NodeJS.Timeout | undefined, chunks = 0;
+    // Counts what arrives, for the drain. An observer is evidence only; a throw in it must not break the command.
+    const observe = (chunk: Buffer, stream: "stdout" | "stderr") => {
+      chunks += 1;
+      try { onOutput?.(chunk, stream); } catch { /* ignored */ }
+    };
     const onStdoutData = (chunk: Buffer) => { observe(chunk, "stdout"); capture(chunk); stdout = (stdout + chunk.toString("utf8")).slice(-65536); };
     const onStderrData = (chunk: Buffer) => { observe(chunk, "stderr"); capture(chunk); };
     const onInputError = (error: Error) => {
@@ -101,24 +107,35 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       child.unref();
       child.stdin?.destroy(); child.stdout?.destroy(); child.stderr?.destroy();
     };
+    // Both pipes ended: nothing holds the output any more, though Node closes their handles over later turns.
+    const outputEnded = () => child.stdout!.readableEnded && child.stderr!.readableEnded;
     const settleAtLeaderExit = () => {
       if (settled || !leaderExit) return;
       settled = true;
       finish();
+      const left = !outputEnded();
       abandon();
-      // The output did not close, so it may be incomplete: a Git helper refuses such a read.
-      resolveResult({ exitCode: leaderExit.code, output, stdout, interrupted, truncated: true, leftover: true });
+      // Output that has not ended may be incomplete: a Git helper refuses such a read.
+      resolveResult({ exitCode: leaderExit.code, output, stdout, interrupted, truncated: truncated || left, leftover: left });
+    };
+    // The drain timer runs before the poll phase of its loop turn, so the decision waits one turn for what the pipes
+    // already hold, and a few more while output keeps arriving.
+    const decideAtDrain = (turn: number, read: number) => {
+      if (settled) return;
+      if (outputEnded() || chunks === read || turn >= EXIT_DRAIN_TURNS) settleAtLeaderExit();
+      else setImmediate(decideAtDrain, turn + 1, chunks);
     };
     // Node emits `exit` as it reaps the leader, so until then its pid, and the group it leads, cannot be reused.
     const onChildExit = (code: number | null) => {
       if (settled || stopRequested) return;
       leaderExit = { code };
-      drainTimer = setTimeout(settleAtLeaderExit, EXIT_DRAIN_MS);
+      drainTimer = setTimeout(() => setImmediate(decideAtDrain, 1, chunks), EXIT_DRAIN_MS);
       drainTimer.unref();
     };
     const stop = () => {
       if (stopRequested || settled) return;
-      // After the leader's exit the group holds only what the command left behind, and that is never signalled.
+      // After the leader's exit the group holds only what the command left behind, and that is never signalled. The
+      // command settles at once, by the drain's test of whether its output has ended.
       if (leaderExit) {
         settleAtLeaderExit();
         return;

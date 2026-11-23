@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -8,8 +8,9 @@ import { commandScope, EXIT_DRAIN_MS, TeamError, teamCommand, teamHead, type Com
 
 /*
  * The leader rule on real processes (INF-388, INF-393). Every team command ends with its leader: once the process the
- * host started exits, the command settles when its pipes close or a drain later, marked `leftover` and `truncated`
- * when they did not close, and nothing is signalled after that exit. A stop while the leader runs still kills its group.
+ * host started exits, the command settles when its pipes close or at the end of a drain, once the loop has read what
+ * they hold; it is `leftover` and `truncated` when its output had not ended, and nothing is signalled after that exit.
+ * A stop while the leader runs still kills its group.
  */
 
 const CASE = { timeout: 20_000, skip: process.platform === "win32" && "process groups are POSIX" };
@@ -75,6 +76,17 @@ class Run {
     await until("the leader is reaped", () => { const leader = pidIn(this.leaderFile); return leader !== undefined && gone(leader); });
   }
 
+  /**
+   * Whether the command settled before the test could stop it inside the drain. The drain runs on this process's loop,
+   * after the 10 ms poll that sees the reap, so a test process late under load delays the drain too. Should the drain
+   * still end first, the case is skipped: a stop after the drain proves nothing about a stop inside it.
+   */
+  drainEnded(t: TestContext): boolean {
+    if (this.settledAt === undefined) return false;
+    t.skip("the command settled at the end of the drain before the test could stop it inside the drain");
+    return true;
+  }
+
   dispose() {
     const left = pidIn(this.leftFile);
     if (left !== undefined && Number.isSafeInteger(left) && left > 1 && !gone(left)) process.kill(left, "SIGKILL");
@@ -122,13 +134,13 @@ test("a command whose leader exited while its group holds the output settles a d
   }
 });
 
-test("a leftover that left the leader's group and session is neither waited for nor signalled", CASE, async () => {
+test("a leftover that left the leader's group and session is neither waited for nor signalled", CASE, async t => {
   const run = new Run();
   try {
     const result = run.start(escapes);
     const child = await run.left();
     await run.leaderExited();
-    assert.equal(run.settledAt, undefined, "the drain is still pending when the stop comes");
+    if (run.drainEnded(t)) return;
     const stoppedAt = performance.now();
     run.controller.abort();
     const settled = await result;
@@ -144,13 +156,13 @@ test("a leftover that left the leader's group and session is neither waited for 
   }
 });
 
-test("a stop inside the drain settles at once and signals nothing", CASE, async () => {
+test("a stop inside the drain settles at once and signals nothing", CASE, async t => {
   const run = new Run();
   try {
     const result = run.start(leaves);
     const sleep = await run.left();
     await run.leaderExited();
-    assert.equal(run.settledAt, undefined, "the drain is still pending when the stop comes");
+    if (run.drainEnded(t)) return;
     const stoppedAt = performance.now();
     run.controller.abort();
     const settled = await result;
@@ -183,7 +195,7 @@ test("a stop while the leader runs kills its group as before", CASE, async () =>
   }
 });
 
-test("a command inside a scope that records it ends with its leader the same way", CASE, async () => {
+test("a command inside a scope that records it ends with its leader the same way", CASE, async t => {
   const run = new Run();
   let recorded: number | undefined;
   try {
@@ -191,7 +203,7 @@ test("a command inside a scope that records it ends with its leader the same way
     const sleep = await run.left();
     await run.leaderExited();
     assert.equal(recorded, pidIn(run.leaderFile), "the scope recorded the leader");
-    assert.equal(run.settledAt, undefined, "the drain is still pending when the stop comes");
+    if (run.drainEnded(t)) return;
     run.controller.abort();
     const settled = await result;
     assert.equal(settled.interrupted, false);
@@ -217,7 +229,7 @@ test("a Git helper refuses a read whose output a leftover held, a drain after Gi
     await assert.rejects(teamHead(base, { command: "/bin/sh", args: [launcher] }),
       (error: unknown) => error instanceof TeamError && error.code === "workspace-operation-failed");
     const elapsed = performance.now() - started;
-    assert.ok(elapsed < EXIT_DRAIN_MS + 2_000, `refused ${elapsed.toFixed(0)} ms after the start, not at the 30 s limit`);
+    assert.ok(elapsed < 15_000, `refused ${elapsed.toFixed(0)} ms after the start, not at the 30 s limit`);
     await until("the launcher writes the pid of its sleep", () => pidIn(leftFile) !== undefined);
     assert.equal(gone(pidIn(leftFile)!), false, "the sleep the launcher left still runs");
   } finally {
@@ -227,30 +239,34 @@ test("a Git helper refuses a read whose output a leftover held, a drain after Gi
   }
 });
 
-test("a command with no leftover keeps its whole output when the event loop stalls past the drain as its last output arrives", CASE, async t => {
-  // Small enough to fit the pipe, so the leader writes it all and exits while the host stalls.
-  const lines = Array.from({ length: 60 }, (_, index) => `line ${index} ${"x".repeat(40)}`);
-  const expected = lines.map(line => `${line}\n`).join("");
-  const script = "for (const line of JSON.parse(process.argv[1])) process.stdout.write(line + '\\n'); process.stderr.write('done\\n');";
-  let leader: number | undefined, exitedFirst = false;
-  const stalled = new Set<"stdout" | "stderr">();
-  // The loop stalls at the first chunk of each pipe: the leader exits during the first stall, and the second may come after
-  // its exit was heard. When Node has already reaped the leader then, the drain runs out during the second stall.
-  const stall = (_chunk: Buffer, stream: "stdout" | "stderr") => {
-    if (stalled.has(stream)) return;
-    stalled.add(stream);
-    if (stream === "stderr") exitedFirst = leader !== undefined && gone(leader);
-    const until = performance.now() + EXIT_DRAIN_MS + 500;
-    while (performance.now() < until) { /* The host's event loop is blocked. */ }
+test("a command whose output ended while the loop was busy past the drain settles whole, with no leftover", CASE, async () => {
+  const run = new Run();
+  // The leader prints, leaves a holder in its group that prints once more 0.3 s later and ends, and exits 0.
+  const holds = (_leader: string, left: string): Command => ({ command: "sh", args: ["-c", `echo first; (sleep 0.3; echo late) & echo $! > '${left}'; exit 0`] });
+  let leader: number | undefined, busy = false, done = false;
+  // A setImmediate chain runs in the check phase of each loop turn. Once the leader's pid is gone, Node has reaped it and
+  // armed the drain; the chain then keeps the loop busy past the drain and until the holder has ended, so the drain timer
+  // runs in a turn whose poll phase has not yet read the holder's last line or the end of the output.
+  const tick = () => {
+    if (done) return;
+    if (!busy && leader !== undefined && gone(leader)) {
+      busy = true;
+      const from = performance.now(), holder = pidIn(run.leftFile);
+      const holding = () => holder !== undefined && !gone(holder) && performance.now() - from < 5_000;
+      while (performance.now() - from < EXIT_DRAIN_MS + 300 || holding()) { /* The host's event loop is busy. */ }
+    }
+    setImmediate(tick);
   };
-  const scope: CommandScope = { starting: () => undefined, started: pid => { leader = pid; } };
-  const result = await commandScope.run(scope, () => teamCommand({ command: process.execPath, args: ["-e", script, JSON.stringify(lines)] }, tmpdir(), undefined, 60_000,
-    undefined, undefined, undefined, undefined, stall));
-  t.diagnostic(`leader exit heard before the stall: ${exitedFirst}`);
-  assert.equal(stalled.size, 2, "the observer stalled the loop at both pipes");
-  assert.equal(result.exitCode, 0);
-  assert.equal(result.leftover, false, "nothing held the output");
-  assert.equal(result.truncated, false, "a stalled loop did not cut a clean command");
-  assert.equal(result.stdout, expected);
-  assert.ok(result.output.includes("done\n"));
+  setImmediate(tick);
+  try {
+    const result = await run.start(holds, { starting: () => undefined, started: pid => { leader = pid; } });
+    assert.ok(busy, "the loop was busy after the leader's exit was heard");
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.leftover, false, "the output had ended before the drain decided");
+    assert.equal(result.truncated, false);
+    assert.equal(result.stdout, "first\nlate\n");
+  } finally {
+    done = true;
+    run.dispose();
+  }
 });

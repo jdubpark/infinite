@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, rmSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -22,6 +22,14 @@ export const waitFor = async <T>(
   }
   throw new Error(`Condition was not reached; last state: ${JSON.stringify(last)}`);
 };
+
+/** The running processes, for a test that must see what a host has started or left behind. */
+export function processes(): { pid: number; parent: number; command: string }[] {
+  return execFileSync("ps", ["-eo", "pid=,ppid=,args="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).split("\n").flatMap(line => {
+    const row = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    return row ? [{ pid: Number(row[1]), parent: Number(row[2]), command: row[3]! }] : [];
+  });
+}
 
 export async function freePort() {
   const server = createServer();

@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { inProcessHost, waitFor } from "./helpers.js";
+import { inProcessHost, processes, waitFor } from "./helpers.js";
 import { lineup } from "./mission-harness.js";
 import { startIntakeLinearServer } from "./fixtures/intake-linear-server.js";
 import { startSlackServer } from "./fixtures/slack-server.js";
@@ -66,6 +66,8 @@ async function intakeHost(withSlack: boolean, options: {
       await slack?.close();
       await linear.close();
       rmSync(root, { recursive: true, force: true });
+      // Every agent names the receipts folder on its command line, so a session that outlived the stop shows here.
+      assert.deepEqual(processes().filter(row => row.command.includes(receipts)).map(row => row.pid), [], "no session of this host outlives its stop");
     },
   };
 }

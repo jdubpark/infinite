@@ -327,6 +327,31 @@ test("an automatic recovery names its source", async () => {
   }
 });
 
+test("a project manager recovery lists an implementer's working copy and not an evaluator's", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const manager = f.run.members[0]!;
+    manager.status = "stopped";
+    const member = { ...structuredClone(manager), memberId: "implementer-1", role: "implementer" as const, cwd: "/implementer/working/copy" };
+    const evaluator = { ...structuredClone(manager), memberId: "evaluator-1", role: "evaluator" as const, cwd: "/evaluator/working/copy" };
+    f.run.members.push(member, evaluator);
+    const reason = "A change left the assigned scope.";
+    f.run.recovery = { attempts: 1, status: "stopping", source: { code: "task-scope-violation", memberId: manager.memberId, revision: 1, reason, at: new Date().toISOString() } };
+    f.run.status = "planning"; f.run.blockCode = "task-scope-violation"; f.run.reason = reason;
+    f.run.headCommit = f.run.baseCommit;
+    Object.assign(f.config.projects[0]!, { team: { checks: [], establishChecks: true } });
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(() => f.readRecord<{ run: TeamRun }>("team", f.run.id).run.members.some(item => item.role === "project-manager" && item.revision === 2), "the recovery manager is queued");
+    const recovering = f.readRecord<{ run: TeamRun }>("team", f.run.id).run.members.find(item => item.role === "project-manager" && item.contextFeedback);
+    assert.ok(recovering?.contextFeedback?.includes(member.cwd), "the implementer's working copy is listed");
+    assert.equal(recovering.contextFeedback.includes(evaluator.cwd), false, "the evaluator's working copy is not listed");
+  } finally { store.close(); f.close(); }
+});
+
 test("preparing a run records its base commit", async () => {
   const f = schedulerFixture();
   const store = openStore(f, f.key);

@@ -9,7 +9,7 @@ import { projectSourceSchema, teamProjectSchema, type ProjectSource, type TeamCo
 import { TeamError, teamCommand } from "./team-workspace.js";
 import { unseal, writeSealed } from "./vault.js";
 import { homeRelativePath } from "./mirrored-projects.js";
-import { autonomyReady, type NotReady } from "./evaluator-profiles.js";
+import { autonomyReady, evaluatorOverlaps, type NotReady } from "./evaluator-profiles.js";
 import { autonomyModeSchema, autonomyOf, enrollmentAutonomy, type AutonomyMode, type AutonomySource } from "./autonomy.js";
 
 const enrollmentTeamSchema = teamProjectSchema;
@@ -51,6 +51,8 @@ export interface RepoEnrollmentView {
   autonomy: AutonomyMode;
   autonomySource: AutonomySource;
   autonomyReady: boolean; autonomyReason?: NotReady;
+  /** Evaluator profiles whose model an implementer or an escalation also uses; empty without a lineup. */
+  evaluatorOverlaps: string[];
 }
 
 interface StoredEnrollment {
@@ -341,6 +343,7 @@ export class RepoEnrollmentService {
       autonomy: autonomyOf(project),
       autonomySource: project.autonomy === undefined ? "not-enrolled" : saved?.autonomy !== undefined ? "saved" : "host-default",
       ...((readiness) => readiness.ready ? { autonomyReady: true } : { autonomyReady: false, autonomyReason: readiness.reason })(autonomyReady(this.config.teams?.lineup)),
+      evaluatorOverlaps: this.config.teams?.lineup ? evaluatorOverlaps(this.config.teams.lineup) : [],
     };
   }
 

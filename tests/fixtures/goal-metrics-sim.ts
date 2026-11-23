@@ -105,8 +105,8 @@ function refRead(state: RefState, cycles: GoalHolder["goal"]["cycles"], configur
   const position = new Map(cycles.map((cycle, index) => [cycle.teamId, index]));
   const labels = new Map<string, string>();
   for (const command of configured) {
-    const digest = refDigest(command), text = [command.command, ...command.args].join(" ");
-    if (!labels.has(digest)) labels.set(digest, text.length > LABEL ? `${text.slice(0, LABEL - 1)}…` : text);
+    const digest = refDigest(command), characters = Array.from([command.command, ...command.args].join(" "));
+    if (!labels.has(digest)) labels.set(digest, characters.length > LABEL ? `${characters.slice(0, LABEL - 1).join("")}…` : characters.join(""));
   }
   const runs = Object.keys(state.entries).filter(run => position.has(run)).sort((a, b) => position.get(a)! - position.get(b)!);
   const series = new Map<string, { id: string; newest: string; series: MetricSeries }>();

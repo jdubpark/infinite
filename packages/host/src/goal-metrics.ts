@@ -91,8 +91,8 @@ export function pruneMetrics(holder: MetricsHolder) {
 
 /** The command and its arguments, cut at 200 code points so no character is split. */
 function label(command: TeamCommand) {
-  const text = [command.command, ...command.args].join(" ");
-  return text.length <= GOAL_METRICS.label ? text : `${text.slice(0, GOAL_METRICS.label - 1)}…`;
+  const characters = [...[command.command, ...command.args].join(" ")];
+  return characters.length <= GOAL_METRICS.label ? characters.join("") : `${characters.slice(0, GOAL_METRICS.label - 1).join("")}…`;
 }
 
 /**

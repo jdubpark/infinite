@@ -169,6 +169,16 @@ test("the goal's read answers only at a reviewed head, with the final round of t
   assert.deepEqual(reviewedObservationsOf(noChecks), [], "a revision without checks has no numbers");
 });
 
+test("a run keeps at most 64 numbers per (revision, round, head), the first ones recorded", () => {
+  const holder = holderOf();
+  const commands = Array.from({ length: 9 }, (_, index): TeamCommand => ({ command: "npm", args: ["run", `check-${index}`] }));
+  const names = Array.from({ length: 8 }, (_, index) => `n${index}`);
+  for (const command of commands) finish(holder, row(command, "passed"), names.map(name => `infinite-metric ${name} 1\n`).join(""));
+  const kept = rows(holder.checkObservations);
+  assert.equal(kept.length, 64);
+  assert.deepEqual(kept.map(item => item.command), commands.slice(0, 8).flatMap(command => names.map(() => commandDigest(command))));
+});
+
 test("a record that throws leaves the holder as it was and never throws into the check loop", () => {
   const holder = holderOf();
   finish(holder, row(lint, "passed"), "infinite-metric speed 1\n");

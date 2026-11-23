@@ -25,6 +25,8 @@ export type CheckObservation = {
  */
 export type ObservationHolder = { run: TeamRun; checkHead?: string; checkObservations?: unknown };
 
+/** Rows kept per (revision, round, head): 8 configured checks of 8 names each. A larger set keeps its first 64. */
+export const OBSERVATIONS_MAX = 64;
 const STATES: ReadonlySet<unknown> = new Set<CheckMetricState>(["value", "ambiguous", "invalid"]);
 const ROW_KEYS = new Set(["command", "name", "revision", "round", "head", "at", "state", "value"]);
 
@@ -87,7 +89,7 @@ export function recordObservations(holder: ObservationHolder, check: TeamCheck, 
   const same = kept.filter(item => item.revision === check.revision && item.round === round && item.head === head);
   const rows = scan.metrics.map((metric): CheckObservation => ({ command, name: metric.name, revision: check.revision, round, head, at,
     state: metric.state, ...(metric.state === "value" && metric.value !== undefined ? { value: metric.value } : {}) }));
-  const next = [...same, ...rows];
+  const next = [...same, ...rows].slice(0, OBSERVATIONS_MAX);
   if (next.length) holder.checkObservations = next;
   else delete holder.checkObservations;
 }

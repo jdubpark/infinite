@@ -152,6 +152,8 @@ function accountedFor(witness: ProcessWitness, row: ProcessRow): CensusReason | 
  * The processes of the calling user that use `directory`: it or something under it is their working directory, an open
  * file, or part of a command-line argument. A process of the calling user that cannot be inspected is a finding
  * ("unreadable"). Processes of other users are not inspected; that is the caller's limit to state.
+ * A process belongs to the user it runs as. One that the calling user started and that runs as another user, such as
+ * the sudo process of a command, is that other user's process.
  */
 export async function directoryCensus(directory: string): Promise<CensusResult> {
   if (process.platform !== "linux" && process.platform !== "darwin") return { ok: false, problem: "unsupported platform" };
@@ -289,9 +291,10 @@ async function linuxCensus(directory: string): Promise<CensusFinding[]> {
 async function linuxReason(pid: number, uid: number, directory: string): Promise<CensusReason | undefined> {
   const base = `/proc/${pid}`;
   try {
-    // A process that hides its memory from its own account (ssh-agent, a sandboxed browser) is shown as owned by root.
-    // Its status still names its account. It cannot be inspected, so it is reported, never skipped.
-    if ((await stat(base)).uid !== uid) return await linuxAccount(base, uid) ? "unreadable" : undefined;
+    // /proc shows a process as owned by the user it runs as (its effective user id), also when the process hides its
+    // memory. One that runs as another user is not inspected, unless its status says it can act as this user again:
+    // that one cannot be inspected and is reported, never skipped.
+    if ((await stat(base)).uid !== uid) return await linuxActsAs(base, uid) ? "unreadable" : undefined;
   } catch (error) {
     return isGone(error) ? undefined : "unreadable";
   }
@@ -334,14 +337,26 @@ async function linuxLinks(base: string): Promise<{ paths: { reason: "working-dir
   return view;
 }
 
-/** True when the process's status names `uid` as one of its user ids, or cannot be read while the process exists. */
-async function linuxAccount(base: string, uid: number): Promise<boolean> {
+/** `statusActsAs` for a live process. True also when its status cannot be read while the process exists. */
+async function linuxActsAs(base: string, uid: number): Promise<boolean> {
   try {
-    const line = (await readFile(`${base}/status`, "utf8")).split("\n").find(text => text.startsWith("Uid:"));
-    return line === undefined || line.split(/\s+/).slice(1).some(value => Number(value) === uid);
+    return statusActsAs(await readFile(`${base}/status`, "utf8"), uid);
   } catch (error) {
     return !isGone(error);
   }
+}
+
+/**
+ * True when a Linux process status names `uid` as the effective, saved or filesystem user id: the process acts as that
+ * user or can do so again. The real user id alone names who started the process. A set-uid program such as sudo keeps
+ * it while it runs as another user, and a host that starts its commands through sudo always has such processes.
+ * True also when the text has no Uid line of four numbers, so a process that cannot be classified is reported. Pure.
+ */
+export function statusActsAs(status: string, uid: number): boolean {
+  const ids = status.split("\n").find(line => line.startsWith("Uid:"))?.trim().split(/\s+/).slice(1).map(Number) ?? [];
+  if (ids.length !== 4 || ids.some(id => !Number.isInteger(id))) return true;
+  // The four ids are real, effective, saved and filesystem.
+  return ids.slice(1).includes(uid);
 }
 
 async function darwinCensus(directory: string): Promise<CensusFinding[]> {

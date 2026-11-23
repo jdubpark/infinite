@@ -1680,7 +1680,9 @@ check, `in-use` when none does but a process uses the run directory, `ended`
 when the host looked and found neither, and `unknown` when it could not tell.
 The host's view is limited: it inspects processes of its own account and, through
 the installed `process-census` wrapper where a sudo command prefix is set, of the
-account that runs team commands; it does not inspect other accounts. Without that
+account that runs team commands; it does not inspect other accounts. A process
+counts for the account it runs as, so the `sudo` process of a command the host
+started is root's and is not inspected. Without that
 wrapper or its sudo rule the result is `unknown`. An `ended` or `unknown` result
 therefore does not replace the attestation, which is still required.
 
@@ -3590,6 +3592,7 @@ Limits of this first slice, stated in full:
 - Two different heads observed with the same stamp are ordered by their results' order in the record. Fetches of one mirror are serial, so their stamps differ in practice.
 - The host may not signal a command that the command prefix runs as another account. A halt, a time limit or a host stop then cannot end the command. The check is recorded as an error ten seconds later, the command runs on, and every main check on the host waits on `processes` until the command has ended. A team's checks have the same limit.
 - The host learns that a command's process has exited when its event loop next runs. A stop that the host handles before it has learned of the exit is a stop of a running command, and it kills the command's process group.
+- A process of the host's account, or of the account that runs commands, that the census cannot inspect keeps a copy from being removed for as long as that process runs, whether or not a check started it. Every main check on the host waits on `processes` meanwhile. On Linux a login session has such processes (its service manager and its SSH processes), so a host that runs under a login account never removes a copy. Run the host under an account of its own, as the Ubuntu deployment does. A process that the account only started and that runs as another account, such as a `sudo` process, is not one of them.
 - A process that a check left behind is found by the process, group and session ids that the host recorded during the check, and by its use of the copy. A process that left its group and session before the host sampled it, and that does not use the copy, is not found, and the copy is then removed while that process runs. The process census has the same limit for team runs.
 
 Before turning the setting on, run the project's checks by hand at main's head, and confirm that the team's command prefix runs them as the agent account on this host. A host whose configuration sets `push.events` itself must add `main-check` to that list, or the result is recorded and no push is sent. Then audit the launcher: a deployed launcher must recognise the main-check run directories and the `infinite/team-main-check-*` branch names that the copy uses, as it recognises a team run's.

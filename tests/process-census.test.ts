@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
-import { WITNESS_LIMIT, directoryCensus, extendWitness, newWitness, operationCensus, processStart, readProcessTable, recordCommand, witnessFindings,
+import { WITNESS_LIMIT, directoryCensus, extendWitness, newWitness, operationCensus, processStart, readProcessTable, recordCommand, statusActsAs, witnessFindings,
   type ProcessRow, type ProcessTable, type ProcessWitness } from "../packages/host/src/process-census.js";
 
 const censusFile = fileURLToPath(new URL("../packages/host/src/process-census.ts", import.meta.url));
@@ -20,6 +20,22 @@ function table(rows: ProcessRow[], boot = "boot-1"): ProcessTable {
 function witness(processes: { pid: number; start: string }[], boot = "boot-1"): ProcessWitness {
   return { boot, processes, sessions: [], groups: [] };
 }
+
+test("a process is the account's when it runs as it or can again, not when the account only started it (INF-402)", () => {
+  const status = (ids: string) => `Name:\tsudo\nUmask:\t0022\nState:\tS (sleeping)\nPid:\t4242\nUid:\t${ids}\nGid:\t999\t0\t0\t0\nGroups:\t999\n`;
+  // The sudo process of a command the host started: real user id 999, and root in the three ids it acts with.
+  assert.equal(statusActsAs(status("999\t0\t0\t0"), 999), false);
+  assert.equal(statusActsAs(status("999\t0\t0\t0"), 0), true);
+  // A process that can act as the account again stays the account's, whatever it runs as now.
+  assert.equal(statusActsAs(status("0\t999\t0\t0"), 999), true, "effective");
+  assert.equal(statusActsAs(status("0\t0\t999\t0"), 999), true, "saved");
+  assert.equal(statusActsAs(status("0\t0\t0\t999"), 999), true, "filesystem");
+  assert.equal(statusActsAs(status("1000\t1000\t1000\t1000"), 999), false, "another account");
+  // The account's gid on the Gid line and a pid that equals the uid name nobody.
+  assert.equal(statusActsAs("Pid:\t999\nUid:\t1000\t0\t0\t0\nGid:\t999\t999\t999\t999\n", 999), false);
+  // A status that cannot be classified is reported, never skipped.
+  for (const text of ["", "Name:\tx\n", status("999\t0\t0"), status("999\t0\t0\t0\t0"), status("999\tx\t0\t0"), status("")]) assert.equal(statusActsAs(text, 999), true, JSON.stringify(text));
+});
 
 test("a witness follows a recorded process's descendants into their own sessions and groups", () => {
   const w = witness([{ pid: 10, start: "a" }]);

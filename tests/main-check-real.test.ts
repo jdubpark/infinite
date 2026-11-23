@@ -13,12 +13,17 @@ import type { TeamCommand, TeamProject } from "../packages/host/src/team-types.j
 import { teamCommand } from "../packages/host/src/team-workspace.js";
 import type { Config } from "../packages/host/src/types.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
+import { censusPast, earlierProcesses } from "./main-check-earlier.js";
 
 /*
  * The main check on its default ports (INF-388): real Git, real processes, the real census and the real removal, in a
  * temporary directory, with no command prefix and no network. A pass runs on each observation, so a test that waits
  * on retirement reports the mirror's head again, as every mirror fetch does.
+ * One thing is taken out of the census: the processes this account could not inspect before the tests began
+ * (main-check-earlier.ts). Where there are none, the port is the default one.
  */
+
+const PROCESSES = censusPast(await earlierProcesses());
 
 const KEY = Buffer.alloc(32, 7);
 const WAIT_MS = 20_000;
@@ -86,7 +91,7 @@ class Sandbox {
   async start(ports?: Partial<MainCheckPorts>) {
     this.service = new MainCheckService({
       config: this.config, key: KEY, mirrorPath: () => this.mirror,
-      halt: { check: () => ({ state: this.halted ? "halted" : "clear" }) }, hostLoad: { held: () => undefined }, ports,
+      halt: { check: () => ({ state: this.halted ? "halted" : "clear" }) }, hostLoad: { held: () => undefined }, ports: { processes: PROCESSES, ...ports },
     });
     await this.service.start();
     return this.service;

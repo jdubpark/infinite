@@ -233,7 +233,7 @@ function recordFor(runId: string): ObjectiveRecord {
  * Writes a standalone run that the reviewer approved: one integrated task whose author is the lineup's implementer, a change to the
  * shortlist, a final check round for `rank-verify`, and the verdict pins. The next scheduler pass reaches the approved branch.
  */
-function seedReviewed(f: SchedulerFixture, options: { rank: "passed" | "failed"; lineup?: TeamLineup; outbox?: boolean; members?: number }): string {
+function seedReviewed(f: SchedulerFixture, options: { rank: "passed" | "failed"; lineup?: TeamLineup; outbox?: boolean; members?: number; manager?: TeamModelProfile }): string {
   f.config.agents = { demo: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] },
     codex: { command: process.execPath, args: [] }, opencode: { command: process.execPath, args: [] } } as Config["agents"];
   f.config.teams = { ...f.config.teams!, lineup: options.lineup ?? LINEUP };
@@ -246,6 +246,8 @@ function seedReviewed(f: SchedulerFixture, options: { rank: "passed" | "failed";
   const author: TeamMember = { ...f.run.members[0]!, role: "implementer", status: "stopped", taskId: "t1", modelProfile: IMPLEMENTER, provider: "opencode",
     report: { kind: "result", summary: "Wrote the shortlist" } as TeamMember["report"] };
   f.run.members = [author];
+  // A project manager that ran, as after a provider limit moved it to a fallback profile.
+  if (options.manager) f.run.members.push({ ...author, memberId: randomUUID(), sessionId: randomUUID(), role: "project-manager", taskId: undefined, report: undefined, modelProfile: options.manager });
   // Earlier attempts that stopped: they count against the run's limit of members and do nothing else.
   for (let extra = 1; extra < (options.members ?? 1); extra += 1) f.run.members.push({ ...author, memberId: randomUUID(), sessionId: randomUUID(), taskId: undefined, report: undefined });
   f.run.tasks = [{ id: "t1", title: "Write the shortlist", instructions: "Write it", paths: [SHORTLIST], dependsOn: [], revision: 1, status: "integrated", memberId: author.memberId,
@@ -300,6 +302,47 @@ test("acceptance 6 end to end", { timeout: 120000 }, async () => {
     assert.equal(ledger[0]!.run_id, f.run.id);
     assert.equal(ledger[0]!.result, "not-met");
     assert.equal(ledger[0]!.evaluator_result, "met");
+    const named = store.read(db => db.all<{ profile_id: string | null }>("SELECT profile_id FROM objective_verdicts"));
+    assert.equal(named[0]!.profile_id, evaluator!.modelProfile?.id, "an applied answer names the evaluator");
+    assert.equal(teams.verdicts.detail(f.run.id)?.evaluator?.profileId, evaluator!.modelProfile?.id);
+  } finally { store.close(); f.close(); }
+});
+
+test("a project manager that ran on a fallback family is never the evaluator's family", { timeout: 120000 }, async () => {
+  const f = schedulerFixture();
+  try {
+    activeSessions(f);
+    seedReviewed(f, { rank: "passed", manager: { ...REVIEWER, id: "astra-manager", label: "Fallback manager" } });
+    const teams = f.openTeam();
+    teams.start();
+    const view = await waitFor(() => Promise.resolve(teams.get(f.run.id)), current => current.assessment !== undefined || evaluators(current).length > 0, 60000);
+    teams.close();
+    assert.deepEqual(evaluators(view).map(member => member.modelProfile?.id), [], "no evaluator of the manager's family is launched");
+    assert.equal(view.assessment?.result, "inconclusive");
+    assert.equal(view.assessment?.reason, "no-independent-evaluator");
+  } finally { f.close(); }
+});
+
+test("a report whose answers were all dropped names no evaluator", { timeout: 120000 }, async () => {
+  const f = schedulerFixture(), store = new EvidenceStore({ databasePath: evidenceDatabasePath(f.config.stateDir), vaultKey: f.key });
+  const watch = watched(store);
+  try {
+    activeSessions(f);
+    seedReviewed(f, { rank: "passed" });
+    const teams = f.openTeam({ events: watch.outbox });
+    teams.start();
+    const evaluator = await launchedEvaluator(f, teams, f.run.id);
+    f.report(evaluator!.sessionId, { requestId: randomUUID(), runId: evaluator!.runId, memberId: evaluator!.memberId, revision: evaluator!.revision,
+      report: { kind: "verdict", result: "met", criteria: [{ id: "c-unknown", state: "met", evidence: [`file:${SHORTLIST}`] }] } });
+    const view = await waitFor(() => Promise.resolve(teams.get(f.run.id)), current => TERMINAL.includes(current.status), 60000);
+    teams.close();
+    assert.equal(view.assessment?.evaluatorResult !== undefined, true, "the report was kept");
+    assert.equal(teams.verdicts.detail(f.run.id)?.criteria.some(item => item.evaluatorState !== undefined), false, "no answer was applied");
+    assert.equal(teams.verdicts.detail(f.run.id)?.evaluator, undefined, "the detail names no evaluator");
+    const ledger = store.read(db => db.all<{ profile_id: string | null; family: string | null }>("SELECT profile_id, family FROM objective_verdicts"));
+    assert.equal(ledger.length, 1, "one ledger row");
+    assert.equal(ledger[0]!.profile_id, null);
+    assert.equal(ledger[0]!.family, null);
   } finally { store.close(); f.close(); }
 });
 

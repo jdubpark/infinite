@@ -36,6 +36,7 @@ const DAY_MS = 86_400_000;
 const START = Date.parse("2026-11-16T10:00:00.000Z");
 const PROJECT = "project-trials-1";
 const BARE = "project-trials-bare";
+const OTHER = "project-trials-2";
 const REQUEST_ONE = "11111111-1111-4111-8111-111111111111";
 const REQUEST_TWO = "22222222-2222-4222-8222-222222222222";
 const REQUEST_THREE = "33333333-3333-4333-8333-333333333333";
@@ -88,6 +89,7 @@ function fixture() {
     projects: [
       project(PROJECT, { mine: true, focusedTest: FOCUSED, reportFormat: "junit", trialsPerDay: 1 }),
       project(BARE, { mine: true, focusedTest: FOCUSED, reportFormat: "junit" }),
+      project(OTHER, { mine: true, focusedTest: FOCUSED, reportFormat: "junit", trialsPerDay: 1 }),
     ],
     eval: {
       grader: { prefix: { command: "/usr/bin/sudo", args: ["-n"] }, root: "/var/lib/infinite-grader/root" },
@@ -883,7 +885,7 @@ test("two jobs that take turns each reach their own tenth release", () => {
   const f = fixture();
   try {
     const first = open(f, PROJECT, REQUEST_ONE);
-    const second = open(f, BARE, REQUEST_TWO);
+    const second = open(f, OTHER, REQUEST_TWO);
     const seen: string[] = [];
     for (let turn = 1; turn <= 10; turn += 1) {
       seen.push(release(f, { jobId: first, slot: 0, attempt: 0 }, "eval-failed").answer, release(f, { jobId: second, slot: 0, attempt: 0 }, "eval-failed").answer);

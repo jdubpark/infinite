@@ -72,7 +72,7 @@ Separate rehearsals use actual Codex app-server, TUI and exec-server processes w
 
 A separate deployed rehearsal on 2026-10-09 used the installed CLI, an authenticated model using code-mode tools, a macOS laptop, and a Linux host. With workspace-write sandboxing and on-request approvals, the first tool edited the laptop fixture. Abrupt laptop-service loss selected the cloud checkpoint in about six seconds; a follow-up in the same conversation read the checkpoint and wrote a Linux file. Recovery preserved an independent offline laptop edit. Git access through the deployed agent identity and preservation of existing sessions through the API upgrade were checked separately. Private receipts remain outside this repository. This establishes that bounded workflow, not general toolchain or platform parity.
 
-The [implementation plan](plans/2026-10-09-001-feat-seamless-hybrid-execution-plan.md) retains stronger isolation and reconciliation follow-ups. This page describes the implemented boundary.
+The implementation plan retains stronger isolation and reconciliation follow-ups. It left the tree with the other plans of shipped work and stays in the Git history: `git show e71458b4:docs/plans/2026-10-09-001-feat-seamless-hybrid-execution-plan.md`. This page describes the implemented boundary.
 
 ## Earlier SSH prototype
 

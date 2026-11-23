@@ -4,6 +4,7 @@ import type { Session } from "../apps/web/src/api";
 import type { Attention, AttentionState } from "../packages/attention/src/types";
 import type { SwarmInput, SwarmMember, SwarmMission, SwarmSession, SwarmTeam } from "../apps/web/src/swarm/types";
 import { allAgents, buildSwarm, findAgent, findUnit } from "../apps/web/src/swarm/model";
+import { ROLE_NAME } from "../apps/web/src/swarm/types";
 import { approvalOwner } from "../apps/web/src/swarm/approval";
 import { ACTIVITY_BUCKETS, ACTIVITY_BUCKET_MS, createActivity } from "../apps/web/src/swarm/activity";
 
@@ -391,4 +392,14 @@ test("unmeasured agent counts reach every cost, and costs stay as measured", () 
   // Totals sum live swarms and leave the cost sum as it was: m-summed has no mission usage, so it adds nothing.
   assert.equal(model.totals.costUsd, 0 + 1.5 + 2 + 0.4);
   assert.equal(model.totals.unmeasured, 6 + 2 + 3 + 4 + 1);
+});
+
+test("an evaluator member is drawn with its code and name in the review stage", () => {
+  const model = buildSwarm(input({
+    teams: [team("checkout-v2", { status: "reviewing", members: [member("m-eval", { role: "evaluator" })] })],
+  }));
+  const agent = findAgent(model, "m-eval");
+  assert.equal(agent?.role, "EV");
+  assert.equal(agent?.stage, "review");
+  assert.equal(ROLE_NAME.EV, "Evaluator");
 });

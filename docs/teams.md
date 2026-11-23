@@ -2850,8 +2850,10 @@ ends when its output closes, or at the caller's limit where the caller sets
 one. Setup and check commands set none, so a check or setup command that ran
 past its time limit and left a process in another session holding its output
 keeps its operation open until that process ends. Under a command prefix that
-refuses the host's signal the stop reaches nothing, so any process that still
-holds the output does the same. Two Git runners outside the
+runs the command as another account, such as `sudo`, the stop does not reach
+the command: the host's signal is refused, or it ends only the launcher's own
+process. The command keeps running and holds the output, so the operation
+stays open until the command ends. Two Git runners outside the
 team command runner, the streamed patch and file reads and the team bundle
 download, are not covered yet: they wait for their output to close, and a stop
 signals the command's process group.

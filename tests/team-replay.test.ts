@@ -17,7 +17,7 @@ const LAUNCHER = resolve("tests/fixtures/eval-command.mjs");
 const TRIAL_AGENT = resolve("tests/fixtures/trial-agent.mjs");
 const profile: TeamModelProfile = { id: "trial-member", label: "Trial member", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" };
 const features: EvalFeatures = { role: "implementer", area: "docs", kind: null, risk: "normal", featureVersion: 1 };
-const capsule = (objective: string): Capsule => ({ objective, steering: ["Keep the change small."], ownerAnswers: [],
+const capsule = (objective: string, ownerAnswers: Capsule["ownerAnswers"] = []): Capsule => ({ objective, steering: ["Keep the change small."], ownerAnswers,
   task: { id: "a", title: "Write a.txt", instructions: "Write a.txt with the reviewed content.", paths: ["a.txt"] } });
 
 /** A real service over a fixture project, with the eval identity configured as the same-user launcher and the fake member. */
@@ -40,13 +40,13 @@ async function replayFixture(options: { capture?: CaptureSink } = {}) {
   let manager: Manager | undefined;
   const service = await f.openTeamService({ events: outbox, ...(options.capture ? { capture: options.capture } : {}), manager: m => { manager = m; } });
   /** Creates a trial whose workspace is a clone of the fixture project at its base commit, and whose member runs `mode`. */
-  const start = async (mode: string, objective = "Write a.txt for the replay trial.") => {
+  const start = async (mode: string, objective = "Write a.txt for the replay trial.", ownerAnswers: Capsule["ownerAnswers"] = []) => {
     const trialId = randomUUID(), work = join(evalRoot, "trials", trialId, "work");
     mkdirSync(join(evalRoot, "trials", trialId), { recursive: true, mode: 0o700 });
     git(evalRoot, "clone", "--quiet", f.source, work);
     writeFileSync(join(f.receipts, `${trialId}.mode`), JSON.stringify({ mode, dir: reference }), { mode: 0o600 });
     const created = await service.createForReplay({ trialId, jobId: randomUUID(), purpose: "replay", projectId: "rehearsal", profile,
-      capsule: capsule(objective), features, baseCommit: f.base, workspace: work });
+      capsule: capsule(objective, ownerAnswers), features, baseCommit: f.base, workspace: work });
     return { trialId, work, created };
   };
   const ended = (trialId: string) => waitFor(() => service.replayState(trialId), state => state?.phase === "ended", 90000);
@@ -77,6 +77,21 @@ test("a replay run is seeded and starts one implementer", { timeout: 120000 }, a
     // The member's session purpose and its prompt: the context file of the trial's workspace holds the capsule's objective.
     assert.match(readFileSync(join(work, ".git", "infinite-team-context.json"), "utf8"), /Write a\.txt for the replay trial\./);
     assert.equal((await context.getManager().list()).some(row => row.purpose === "replay"), true);
+  } finally {
+    await context.f.close();
+  }
+});
+
+test("a replay run whose capsule holds an owner answer runs its member", { timeout: 120000 }, async () => {
+  const context = await replayFixture();
+  try {
+    // The capsule's answers are seeded as answered decisions of no member. They are context for the prompt, not a member to replace.
+    const { trialId, work } = await context.start("reference", "Write a.txt for the replay trial.", [{ question: "Which style?", answer: "Compact" }]);
+    const state = await context.ended(trialId);
+    assert.equal(state?.ending, "settled");
+    assert.equal(state?.memberId !== undefined, true, "the member started");
+    const written = JSON.parse(readFileSync(join(work, ".git", "infinite-team-context.json"), "utf8")) as { ownerAnswers?: unknown };
+    assert.deepEqual(written.ownerAnswers, [{ decisionId: "answer-1", question: "Which style?", answer: "Compact" }], "the answer reaches the member's context");
   } finally {
     await context.f.close();
   }

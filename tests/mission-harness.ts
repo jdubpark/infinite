@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
-import { stopSessionWorkers, waitFor } from "./helpers.js";
+import { endSessionWorkers, waitFor } from "./helpers.js";
 import { unseal } from "../packages/host/src/vault.js";
 import { Manager } from "../packages/host/src/manager.js";
 import type { HostLoadProbe } from "../packages/host/src/host-load.js";
@@ -76,11 +76,8 @@ export function missionHarness(options?: { configure?: (config: Config) => void;
     shut();
     // A tick already under way can still launch a coordinator attempt or subteam member after close().
     await closing?.missions.idle(); await closing?.teams.idle();
-    // Workers exit 1.5 s after their child. Sweep until none answers, so no worker or provider outlives the test.
-    for (let pass = 1; await stopSessionWorkers(config); pass++) {
-      if (pass === 8) throw new Error("Session workers still answer after the mission test stopped them");
-      await new Promise(done => setTimeout(done, 500));
-    }
+    // Workers exit 1.5 s after their child. Ask until none answers, so no worker or provider outlives the test.
+    await endSessionWorkers(config);
     await new Promise(done => setTimeout(done, 1700));
     // A test that opened a store under the root closes it here: after the services stopped, before the folder goes.
     beforeRemove?.();

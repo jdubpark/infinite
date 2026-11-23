@@ -104,6 +104,20 @@ export async function stopSessionWorkers(config: Config) {
   return answered;
 }
 
+/**
+ * Stops the session workers under the state directory and returns when none answers and every listed process is gone.
+ * One request is not enough: a worker that was started and is not listening yet refuses the connection, and a worker
+ * whose provider is still starting refuses the stop. Stop whatever starts sessions before the call.
+ */
+export async function endSessionWorkers(config: Config, started: number[] = []) {
+  const running = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const until = Date.now() + 30000;
+  while (await stopSessionWorkers(config) + started.filter(running).length > 0) {
+    if (Date.now() > until) throw new Error("Session workers still run after the test stopped them");
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+}
+
 /** Boots a real API (`cli.ts serve`) on a free port with owner, controller and viewer device keys. */
 export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
   // Unix socket paths are short-limited, so the state lives under /tmp rather than os.tmpdir().
@@ -169,10 +183,19 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     );
   };
   const stop = async () => {
-    await stopSessionWorkers(config);
+    // The stop takes no less time than the fixed wait it had before: other processes of the host may still be writing.
+    const floor = new Promise((resolve) => setTimeout(resolve, 1700));
+    const api = child;
+    let started: number[] = [];
+    if (api?.pid !== undefined && api.exitCode === null && api.signalCode === null) {
+      // A suspended API starts nothing more, so the list of its workers is complete. It holds a worker that is not listening yet.
+      api.kill("SIGSTOP");
+      try { started = processes().filter(row => row.parent === api.pid && row.command.includes("/packages/host/src/worker.")).map(row => row.pid); } catch { /* no process list: the workers that answer are still stopped */ }
+    }
+    // The API ends first: while it runs, it can start a session after the workers were asked.
     await stopApi();
-    // Workers exit 1.5 s after their child; wait so they never write into a removed directory.
-    await new Promise((resolve) => setTimeout(resolve, 1700));
+    await endSessionWorkers(config, started);
+    await floor;
     rmSync(root, { recursive: true, force: true });
   };
 
@@ -229,11 +252,16 @@ export async function inProcessHost(options?: { configure?: (config: Config) => 
   return {
     ...host, root, config, origin, tokens, fetchApi: apiClient(origin, tokens),
     stop: async () => {
-      await stopSessionWorkers(config);
-      host.closeConnections();
+      // The stop takes no less time than the fixed wait it had before: other processes of the host may still be writing.
+      const floor = new Promise(resolve => setTimeout(resolve, 1700));
+      // The services end first, as in the host's own shutdown: while they run, they can start a session after the workers were asked.
+      const closing = host.closeConnections();
       await new Promise<void>(resolve => host.server.close(() => resolve()));
-      // Workers exit 1.5 s after their child; wait so they never write into a removed directory.
-      await new Promise(resolve => setTimeout(resolve, 1700));
+      await closing;
+      // A step already under way can still start a session after close().
+      await host.missions.idle(); await host.teams.idle();
+      await endSessionWorkers(config);
+      await floor;
       rmSync(root, { recursive: true, force: true });
     },
   };

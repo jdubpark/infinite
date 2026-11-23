@@ -200,6 +200,10 @@ test("a name list cut where a leftover held the output is failed, not too-wide",
     const script = join(dir, "leave.sh");
     writeFileSync(script, `#!/bin/sh\nsleep 30 &\necho $! > "${leftFile}"\nexec "$@"\n`);
     assert.deepEqual(await captureGit(() => ({ command: "/bin/sh", args: [script] })).names(dir, from, to, 500), { state: "failed" });
+    // Control: the same launcher without the sleep reads the list, so the leftover alone fails the read above.
+    const plain = join(dir, "plain.sh");
+    writeFileSync(plain, `#!/bin/sh\nexec "$@"\n`);
+    assert.deepEqual(await captureGit(() => ({ command: "/bin/sh", args: [plain] })).names(dir, from, to, 500), { state: "read", names: ["a.txt"] });
   } finally {
     const left = Number.parseInt(existsSync(leftFile) ? readFileSync(leftFile, "utf8") : "", 10);
     if (Number.isSafeInteger(left) && left > 1) { try { process.kill(left, "SIGKILL"); } catch { /* Already ended. */ } }

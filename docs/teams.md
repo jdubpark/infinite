@@ -2814,10 +2814,11 @@ Each configured check may run for `teams.checkMinutes` (default 60). A check tha
 runs past the limit is stopped and blocks the team with a resumable reason. The
 timeout does not count as one of the team's two correction rounds, because it is
 host evidence about the check, not about the agents' work. When the command runs
-through a `teams.commandPrefix` launcher such as `sudo`, the host may be refused
-permission to signal it. The check output then says so, and the command is left
-to finish with its result discarded. Size the limit for the project's full check
-on the execution host.
+through a `teams.commandPrefix` such as `sudo`, the stop does not reach it. The
+host is refused permission to signal it, and the check output then says so; or
+the signal ends only the `sudo` process, and the output says nothing. In both
+cases the command is left to finish and its result is not used. Size the limit
+for the project's full check on the execution host.
 
 Every command that the host's team command runner starts for a team (setup,
 checks, member setup, the Git commands it runs and, under a command prefix,
@@ -2851,9 +2852,9 @@ one. Setup and check commands set none, so a check or setup command that ran
 past its time limit and left a process in another session holding its output
 keeps its operation open until that process ends. Under a command prefix that
 runs the command as another account, such as `sudo`, the stop does not reach
-the command: the host's signal is refused, or it ends only the launcher's own
-process. The command keeps running and holds the output, so the operation
-stays open until the command ends. Two Git runners outside the
+the command: the host's signal is refused, or it ends only the `sudo` process.
+The command keeps running and holds the output, so the operation stays open
+until the command ends. Two Git runners outside the
 team command runner, the streamed patch and file reads and the team bundle
 download, are not covered yet: they wait for their output to close, and a stop
 signals the command's process group.

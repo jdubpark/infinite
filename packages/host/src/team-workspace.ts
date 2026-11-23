@@ -144,7 +144,8 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       interrupted = true;
       try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); }
       catch (error) {
-        // A prefixed launcher such as sudo leads a group the host may not signal; say so rather than imply the command stopped.
+        // A prefix such as sudo may lead a group the host may not signal; say so rather than imply the command stopped.
+        // When the signal is allowed it ends only the prefix's own process, and nothing is written: see docs/teams.md.
         if ((error as NodeJS.ErrnoException).code === "EPERM") capture(Buffer.from("\n[The host could not stop this command (EPERM); it was left to finish and its result is not used.]\n"));
       }
       if (forceSettleAfterMs !== undefined) {

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import type { CheckObservation } from "../packages/host/src/check-observations.js";
-import { cycleEntry, goalMetricsRead, GOAL_METRICS, pruneGoalMetrics, settleCycleMetrics, type CycleMetrics, type GoalMetrics } from "../packages/host/src/goal-metrics.js";
+import { cycleEntry, goalMetricsRead, GOAL_METRICS, pruneGoalMetrics, pruneMetrics, settleCycleMetrics, settleMetrics, type CycleMetrics, type GoalMetrics } from "../packages/host/src/goal-metrics.js";
 import { commandDigest } from "../packages/host/src/objective-input.js";
 import type { TeamCommand } from "../packages/host/src/team-types.js";
 
@@ -106,4 +106,35 @@ test("the read shows 8 series, newest first, ties by the smaller identity digest
     cycles("run-1"), [long, { command: "node", args: ["x".repeat(300)] }]);
   assert.equal(labelled.series[0]?.label?.length, GOAL_METRICS.label);
   assert.equal(labelled.series[0]?.label, `node ${"x".repeat(194)}…`);
+});
+
+/** Values of a shape this version never writes, as a later release could leave them before a rollback. */
+const FOREIGN: readonly [string, unknown][] = [
+  ["{}", {}], ["[null]", [null]], ["{ v: 2 }", { v: 2 }],
+  ["a version key beside the entries", { entries: [], dropped: 0, v: 2 }],
+  ["an entry with a key this version does not write", { dropped: 0, entries: [{ ...entry("run-1", [[lint, "speed", 1, 0]]), unit: "ms" }] }],
+];
+
+for (const [label, value] of FOREIGN) {
+  test(`retention, a settlement and the read leave a stored value of another shape as it was: ${label}`, () => {
+    const holder = { goal: { cycles: cycles("run-1", "run-2") }, metrics: value as unknown };
+    const stored = structuredClone(value);
+    pruneMetrics(holder);
+    settleMetrics(holder, "run-2", [observation(lint, "speed", 4)]);
+    settleMetrics(holder, "run-1", undefined);
+    assert.equal(holder.metrics, value, "the stored value is not replaced");
+    assert.deepEqual(holder.metrics, stored, "the stored value is not changed");
+    assert.deepEqual(goalMetricsRead(value, cycles("run-1", "run-2"), [lint]), { series: [], omittedSeries: 0, omittedValues: 0, dropped: 0 });
+  });
+}
+
+test("an absent field and the shape this version writes are settled and pruned as before", () => {
+  const holder: { goal: { cycles: { teamId: string; cycle: number }[] }; metrics?: unknown } = { goal: { cycles: cycles("run-1", "run-2") } };
+  settleMetrics(holder, "run-1", [observation(lint, "speed", 4)]);
+  settleMetrics(holder, "run-2", [observation(lint, "speed", 5)]);
+  assert.deepEqual((holder.metrics as GoalMetrics).entries.map(item => item.run), ["run-1", "run-2"]);
+  holder.goal.cycles = cycles("run-2");
+  pruneMetrics(holder);
+  assert.deepEqual((holder.metrics as GoalMetrics).entries.map(item => item.run), ["run-2"]);
+  assert.equal((holder.metrics as GoalMetrics).dropped, 1);
 });

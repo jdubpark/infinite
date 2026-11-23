@@ -31,7 +31,9 @@ function finish(holder: ObservationHolder, check: TeamCheck, stdout: string, std
   observer.record(holder, check);
 }
 const scanOf = (stdout: string) => { const scanner = new CheckMetricScanner(); scanner.push(Buffer.from(stdout), "stdout"); return scanner.finish(); };
-const pairs = (items: readonly CheckObservation[] | undefined) => (items ?? []).map(item => [item.command === commandDigest(lint) ? "lint" : "unit", item.name, item.state, item.value ?? null]);
+/** The stored field is `unknown` in the holder's type; these tests read what this version wrote. */
+const rows = (value: unknown) => (value ?? []) as CheckObservation[];
+const pairs = (items: unknown) => rows(items).map(item => [item.command === commandDigest(lint) ? "lint" : "unit", item.name, item.state, item.value ?? null]);
 
 test("a passed check keeps its numbers with their identity; stderr lines are not read", () => {
   const holder = holderOf(), check = row(lint, "passed", { round: 2 });
@@ -42,7 +44,7 @@ test("a passed check keeps its numbers with their identity; stderr lines are not
     { command: commandDigest(lint), name: "flaky", revision: 1, round: 2, head: HEAD, at: AT, state: "ambiguous" },
     { command: commandDigest(lint), name: "bad", revision: 1, round: 2, head: HEAD, at: AT, state: "invalid" },
   ]);
-  assert.equal("value" in holder.checkObservations![1]!, false, "an ambiguous number stores no value key");
+  assert.equal("value" in rows(holder.checkObservations)[1]!, false, "an ambiguous number stores no value key");
 });
 
 test("a failed, interrupted or setup check keeps nothing, and leaves what the holder kept", () => {
@@ -139,7 +141,7 @@ test("the goal's read answers only at a reviewed head, with the final round of t
 
   const copy = reviewed(), read = reviewedObservationsOf(copy)!;
   read[0]!.name = "changed";
-  assert.equal(copy.checkObservations![0]!.name, "speed", "the read is a copy");
+  assert.equal(rows(copy.checkObservations)[0]!.name, "speed", "the read is a copy");
 
   assert.equal(reviewedObservationsOf(undefined), undefined, "an unknown run");
   const wrongCheckHead = reviewed(); wrongCheckHead.checkHead = OTHER;
@@ -166,3 +168,31 @@ test("the goal's read answers only at a reviewed head, with the final round of t
   noChecks.checkObservations = [{ command: commandDigest(lint), name: "speed", revision: 2, round: 0, head: HEAD, at: AT, state: "value", value: 1 }];
   assert.deepEqual(reviewedObservationsOf(noChecks), [], "a revision without checks has no numbers");
 });
+
+test("a record that throws leaves the holder as it was and never throws into the check loop", () => {
+  const holder = holderOf();
+  finish(holder, row(lint, "passed"), "infinite-metric speed 1\n");
+  const before = structuredClone(holder.checkObservations);
+  // A row this version did not write: its command has no command text, so the first-occurrence search throws.
+  holder.run.checks.push({ ...row(unit, "failed"), command: null as unknown as TeamCommand });
+  assert.doesNotThrow(() => finish(holder, row(unit, "passed"), "infinite-metric size 2\n"));
+  assert.deepEqual(holder.checkObservations, before);
+});
+
+/** Values of a shape this version never writes, as a later release could leave them before a rollback. */
+const FOREIGN: readonly [string, unknown][] = [
+  ["{}", {}], ["[null]", [null]], ["{ v: 2 }", { v: 2 }],
+  ["a row with a key this version does not write", [{ command: commandDigest(lint), name: "speed", revision: 1, round: 0, head: HEAD, at: AT, state: "value", value: 1, unit: "ms" }]],
+];
+
+for (const [label, value] of FOREIGN) {
+  test(`a passed check and the goal's read leave a stored value of another shape as it was: ${label}`, () => {
+    const holder = holderOf();
+    holder.checkObservations = value;
+    const stored = structuredClone(value);
+    assert.doesNotThrow(() => finish(holder, row(lint, "passed"), "infinite-metric speed 1\n"));
+    assert.equal(holder.checkObservations, value, "the stored value is not replaced");
+    assert.deepEqual(holder.checkObservations, stored, "the stored value is not changed");
+    assert.deepEqual(reviewedObservationsOf(holder), [], "the read sees no numbers");
+  });
+}

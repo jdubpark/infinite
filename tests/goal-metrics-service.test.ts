@@ -1,14 +1,14 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import type { CheckObservation } from "../packages/host/src/check-observations.js";
+import { reviewedObservationsOf, type CheckObservation, type ObservationHolder } from "../packages/host/src/check-observations.js";
 import { GoalService } from "../packages/host/src/goals.js";
 import type { CreateGoal, GoalCycle, ProductGoal } from "../packages/host/src/goal-types.js";
 import type { CycleMetrics, GoalMetrics } from "../packages/host/src/goal-metrics.js";
 import { commandDigest } from "../packages/host/src/objective-input.js";
 import { TeamError, type TeamService } from "../packages/host/src/teams.js";
 import { emptyUsage } from "../packages/host/src/team-usage.js";
-import { createTeamSchema, teamGoalContextSchema, type CreateTeam, type TeamGoalContext, type TeamLineup, type TeamView } from "../packages/host/src/team-types.js";
+import { createTeamSchema, teamGoalContextSchema, type CreateTeam, type TeamGoalContext, type TeamLineup, type TeamRun, type TeamView } from "../packages/host/src/team-types.js";
 import type { Project } from "../packages/host/src/types.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
@@ -46,9 +46,11 @@ function stubTeams() {
   const views = new Map<string, TeamView>();
   const launches: { request: CreateTeam; context: TeamGoalContext }[] = [];
   const observations = new Map<string, CheckObservation[] | undefined>();
+  /** Run holders read through the real `reviewedObservationsOf`, as the team service reads its records. */
+  const holders = new Map<string, ObservationHolder>();
   const usage = () => ({ total: emptyUsage(), byProfile: {}, byProvider: {}, unmeasuredMembers: 0, partialMembers: 0 });
   const service = {
-    launches, observations,
+    launches, observations, holders,
     get(id: string) {
       const found = views.get(id);
       if (!found) throw new TeamError(404, "team-not-found", "The team was not found.");
@@ -56,7 +58,7 @@ function stubTeams() {
     },
     goalIdOf: (id: string) => views.get(id)?.goal?.id,
     hasDeliveryAttempt: () => false,
-    reviewedObservations: (id: string) => structuredClone(observations.get(id)),
+    reviewedObservations: (id: string) => holders.has(id) ? reviewedObservationsOf(holders.get(id)) : structuredClone(observations.get(id)),
     async createForGoal(request: CreateTeam, context: TeamGoalContext) {
       createTeamSchema.parse(request); teamGoalContextSchema.parse(context);
       const prior = views.get(request.requestId);
@@ -224,3 +226,47 @@ test("the step's write prunes the 51st entry its settlement adds", async t => {
   assert.deepEqual(written.entries.map(entry => entry.run), [...cycles.slice(1).map(cycle => cycle.teamId), run]);
   assert.equal(written.dropped, 1);
 });
+
+/** Values of a shape this version never writes, as a later release could leave them before a rollback. */
+const FOREIGN: readonly [string, unknown][] = [["{}", {}], ["[null]", [null]], ["{ v: 2 }", { v: 2 }]];
+const EMPTY = { series: [], omittedSeries: 0, omittedValues: 0, dropped: 0 };
+
+for (const [label, value] of FOREIGN) {
+  test(`the goal service starts over a stored metrics value of another shape, keeps it through a settlement, and reads the empty curve: ${label}`, async t => {
+    const { f, teams, open } = fixture(t);
+    const created = await open().create(finite());
+    const stored = f.readRecord<{ goal: ProductGoal; metrics?: unknown }>("goal", created.id);
+    stored.metrics = value;
+    f.writeRecord("goal", created.id, stored);
+    const raw = () => f.readRecord<{ metrics?: unknown }>("goal", created.id).metrics;
+
+    let goals: GoalService | undefined;
+    assert.doesNotThrow(() => { goals = open(); }, "the service starts");
+    assert.deepEqual(raw(), value, "the start writes nothing over it");
+    assert.deepEqual(goals!.metrics(created.id), EMPTY);
+    goals!.start();
+    const run = (await until(() => teams.launches[0], Boolean)).request.requestId;
+    teams.observations.set(run, observed(HEAD_A, 1, [["svc_speed", 10]]));
+    teams.settle(run, "ready-for-review", "stopped");
+    await until(() => teams.launches[1], Boolean);
+    assert.deepEqual(raw(), value, "the settlement and its write leave it as stored");
+    assert.deepEqual(goals!.metrics(created.id), EMPTY);
+  });
+
+  test(`a goal step reads a run's stored observations of another shape as no numbers and goes on: ${label}`, async t => {
+    const { f, teams, open } = fixture(t);
+    const goals = open();
+    const created = await goals.create(finite());
+    goals.start();
+    const run = (await until(() => teams.launches[0], Boolean)).request.requestId;
+    const reviewed = { verdict: "approved" as const, summary: "Approved.", revision: 1 };
+    teams.holders.set(run, { run: { revision: 1, headCommit: HEAD_A, review: reviewed, checks: [{ command: check, status: "passed", startedAt: new Date().toISOString(),
+      output: "", revision: 1, round: 0, headCommit: HEAD_A }] } as unknown as TeamRun, checkHead: HEAD_A, checkObservations: value });
+    teams.settle(run, "ready-for-review", "stopped");
+    await until(() => teams.launches[1], Boolean);
+    const goal = goals.get(created.id);
+    assert.equal(goal.status, "running", JSON.stringify(goal.reason));
+    assert.equal("metrics" in f.readRecord<Holder>("goal", created.id), false, "the run gave no numbers, so the goal keeps no entry");
+    assert.deepEqual(goals.metrics(created.id), EMPTY);
+  });
+}

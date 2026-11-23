@@ -18,7 +18,7 @@ import { pullRequestBranch, refreshReportingInstructions, retargetPrompt, teamCo
 import { reviewEvidenceProblems } from "./team-acceptance.js";
 import { memberCodeModeExpected, teamModelLaunch } from "./launch.js";
 import { CheckOutputScanner, checkFeedback } from "./team-check-output.js";
-import { metricObserver, reviewedObservationsOf, type CheckObservation } from "./check-observations.js";
+import { metricObserver, reviewedObservationsOf } from "./check-observations.js";
 import { resumeFailed } from "./native-continuation.js";
 import { combineCoverage, type UsageService } from "./usage-service.js";
 import { type EvidenceStore, eventProblem } from "./evidence/store.js";
@@ -182,7 +182,7 @@ export type Stored = {
   continuationHead?: { revision: number; headCommit: string };
   checkHead?: string;
   /** Numbers the latest checks reported (check-observations.ts). Outside `run`, so no view, context file, prompt or event reads them. */
-  checkObservations?: CheckObservation[];
+  checkObservations?: unknown;
   source?: { path: string; head?: string; startCommit?: string };
   handoffPolicy?: HandoffPolicy;
   goalExtensions?: Record<string, { deadlineAt: string; ceilingAt: string }>;

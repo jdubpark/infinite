@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { recordObservations, reviewedObservationsOf, type ObservationHolder } from "../packages/host/src/check-observations.js";
-import { goalMetricsRead, GOAL_METRICS, pruneMetrics, settleMetrics, type GoalMetricsView } from "../packages/host/src/goal-metrics.js";
+import { recordObservations, reviewedObservationsOf, type CheckObservation, type ObservationHolder } from "../packages/host/src/check-observations.js";
+import { goalMetricsRead, GOAL_METRICS, pruneMetrics, settleMetrics, type GoalMetrics, type GoalMetricsView } from "../packages/host/src/goal-metrics.js";
 import { commandDigest } from "../packages/host/src/objective-input.js";
 import type { TeamCheck } from "../packages/host/src/team-types.js";
 import type { Counts } from "./outcome-sim-script.js";
@@ -86,7 +86,7 @@ function lastOccurrence(holder: ObservationHolder, check: TeamCheck, scan: Param
   const command = commandDigest(check.command), round = check.round ?? 0;
   const sameTriple = (revision: number, itemRound: number, head: string | undefined) => revision === check.revision && itemRound === round && head === check.headCommit;
   if (check.status === "passed" && check.phase === undefined) {
-    const left = holder.checkObservations?.filter(item => !(item.command === command && sameTriple(item.revision, item.round, item.head)));
+    const left = observationsOf(holder)?.filter(item => !(item.command === command && sameTriple(item.revision, item.round, item.head)));
     if (left?.length) holder.checkObservations = left;
     else delete holder.checkObservations;
   }
@@ -112,21 +112,25 @@ function reversedTies(...args: Parameters<typeof goalMetricsRead>): GoalMetricsV
   return { ...all, series: shown, omittedSeries: ranked.length - shown.length };
 }
 
+/** The mutants run only on what this version writes, so they read the stored fields as its shapes. */
+const metricsOf = (holder: { metrics?: unknown }) => holder.metrics as GoalMetrics | undefined;
+const observationsOf = (holder: ObservationHolder) => holder.checkObservations as CheckObservation[] | undefined;
+
 type Mutation = { name: string; invariant: string; variant: Variant };
 
 const MUTATIONS: readonly Mutation[] = [
   { name: "retention puts back the entries of cycles the goal no longer holds", invariant: "I1",
     variant: { prune: holder => {
-      const before = holder.metrics?.entries ?? [];
+      const before = metricsOf(holder)?.entries ?? [];
       pruneMetrics(holder);
       const held = new Set(holder.goal.cycles.map(cycle => cycle.teamId)), orphans = before.filter(entry => !held.has(entry.run));
-      if (orphans.length) holder.metrics = { entries: [...holder.metrics?.entries ?? [], ...orphans], dropped: holder.metrics?.dropped ?? 0 };
+      if (orphans.length) holder.metrics = { entries: [...metricsOf(holder)?.entries ?? [], ...orphans], dropped: metricsOf(holder)?.dropped ?? 0 };
     } } },
   { name: "a settlement merges the earlier entry's values into the new one", invariant: "I2",
     variant: { settle: (holder, run, observations) => {
-      const before = holder.metrics?.entries.find(entry => entry.run === run);
+      const before = metricsOf(holder)?.entries.find(entry => entry.run === run);
       settleMetrics(holder, run, observations);
-      const after = holder.metrics?.entries.find(entry => entry.run === run);
+      const after = metricsOf(holder)?.entries.find(entry => entry.run === run);
       if (before && after) for (const value of before.values) {
         if (!after.values.some(item => item.command === value.command && item.name === value.name)) after.values.push(value);
       }
@@ -136,15 +140,15 @@ const MUTATIONS: readonly Mutation[] = [
   { name: "the goal's read takes the kept numbers of any round of the revision, not only its final round", invariant: "I2",
     variant: { reviewed: holder => {
       const answer = reviewedObservationsOf(holder);
-      return answer && holder ? (holder.checkObservations ?? []).filter(item => item.revision === holder.run.revision && item.head === holder.run.headCommit) : answer;
+      return answer && holder ? (observationsOf(holder) ?? []).filter(item => item.revision === holder.run.revision && item.head === holder.run.headCommit) : answer;
     } } },
   { name: "retention keeps 51 entries", invariant: "I3",
     variant: { prune: holder => withLimit("entries", 51, () => pruneMetrics(holder)) } },
   { name: "a settlement that removes an entry counts it as dropped", invariant: "I4",
     variant: { settle: (holder, run, observations) => {
-      const had = holder.metrics?.entries.some(entry => entry.run === run);
+      const had = metricsOf(holder)?.entries.some(entry => entry.run === run);
       settleMetrics(holder, run, observations);
-      if (had && !holder.metrics?.entries.some(entry => entry.run === run)) holder.metrics = { entries: holder.metrics?.entries ?? [], dropped: (holder.metrics?.dropped ?? 0) + 1 };
+      if (had && !metricsOf(holder)?.entries.some(entry => entry.run === run)) holder.metrics = { entries: metricsOf(holder)?.entries ?? [], dropped: (metricsOf(holder)?.dropped ?? 0) + 1 };
     } } },
   { name: "series that share their newest time rank by the larger identity digest", invariant: "I5",
     variant: { read: reversedTies } },

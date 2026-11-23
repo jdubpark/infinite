@@ -21,7 +21,8 @@ export type MetricPoint = { cycle: number; run: string; revision: number; head: 
 export type MetricSeries = { command: string; label?: string; name: string; configured: boolean; points: MetricPoint[] };
 export type GoalMetricsView = { series: MetricSeries[]; omittedSeries: number; omittedValues: number; dropped: number };
 type Cycles = readonly Pick<GoalCycle, "teamId">[];
-type MetricsHolder = { goal: { cycles: Cycles }; metrics?: GoalMetrics };
+/** `metrics` is `unknown`: a later release may have stored another shape before a rollback to this one (`isGoalMetrics`). */
+type MetricsHolder = { goal: { cycles: Cycles }; metrics?: unknown };
 
 const byteOrder = (a: string, b: string) => Buffer.compare(Buffer.from(a), Buffer.from(b));
 const identity = (command: string, name: string) => createHash("sha256").update(canonicalJson({ command, name })).digest("hex");
@@ -30,6 +31,23 @@ const kept = (state: GoalMetrics): GoalMetrics | undefined => state.entries.leng
 function assign(holder: MetricsHolder, next: GoalMetrics | undefined) {
   if (next) holder.metrics = next;
   else delete holder.metrics;
+}
+
+const record = (value: unknown, keys: readonly string[]): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value) && Object.keys(value).every(key => keys.includes(key));
+const count = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0;
+const isValue = (value: unknown) => record(value, ["command", "name", "value", "at"]) && typeof value.command === "string"
+  && typeof value.name === "string" && typeof value.value === "number" && Number.isFinite(value.value) && typeof value.at === "string";
+const isEntry = (value: unknown) => record(value, ["run", "revision", "head", "values", "more"]) && typeof value.run === "string"
+  && Number.isSafeInteger(value.revision) && typeof value.head === "string" && count(value.more) && Array.isArray(value.values) && value.values.every(isValue);
+
+/**
+ * Whether a stored `metrics` value has exactly the shape this version writes. Anything else, such as a later release's
+ * shape kept across a rollback, is left as stored: retention does not prune it, a settlement does not replace it, and
+ * the read answers the empty curve. Overwriting it would destroy that release's history.
+ */
+export function isGoalMetrics(value: unknown): value is GoalMetrics {
+  return record(value, ["entries", "dropped"]) && count(value.dropped) && Array.isArray(value.entries) && value.entries.every(isEntry);
 }
 
 /** The entry of one run: its observations with a value, in byte order of command digest then name; the first 16 kept, the rest counted. */
@@ -61,10 +79,17 @@ export function pruneGoalMetrics(state: GoalMetrics | undefined, cycles: Cycles)
   return kept({ entries, dropped: state.dropped + state.entries.length - entries.length });
 }
 
-export const settleMetrics = (holder: MetricsHolder, run: string, observations: readonly CheckObservation[] | undefined) =>
+/** Settles a cycle's entry on the holder, unless the holder keeps a value this version does not recognise. */
+export function settleMetrics(holder: MetricsHolder, run: string, observations: readonly CheckObservation[] | undefined) {
+  if (holder.metrics !== undefined && !isGoalMetrics(holder.metrics)) return;
   assign(holder, settleCycleMetrics(holder.metrics, run, observations));
-export const pruneMetrics = (holder: MetricsHolder) => { if (holder.metrics) assign(holder, pruneGoalMetrics(holder.metrics, holder.goal.cycles)); };
+}
+/** Retention on the holder, unless the holder keeps a value this version does not recognise. */
+export function pruneMetrics(holder: MetricsHolder) {
+  if (isGoalMetrics(holder.metrics)) assign(holder, pruneGoalMetrics(holder.metrics, holder.goal.cycles));
+}
 
+/** The command and its arguments, cut at 200 code points so no character is split. */
 function label(command: TeamCommand) {
   const text = [command.command, ...command.args].join(" ");
   return text.length <= GOAL_METRICS.label ? text : `${text.slice(0, GOAL_METRICS.label - 1)}…`;
@@ -74,9 +99,11 @@ function label(command: TeamCommand) {
  * The owner's curve, derived on each read from the entries and the configuration; nothing about a series is stored. A
  * series is every value of one (command digest, name), as points in the order of the goal's cycles; a cycle without an
  * entry is a gap. At most 8 series: those whose newest point is newest by `at`, then the smaller identity digest.
- * `configured` and `label` come from the project's checks now; a removed command's series has neither.
+ * `configured` and `label` come from the project's checks now; a removed command's series has neither. A stored value
+ * this version does not recognise reads as the empty curve.
  */
-export function goalMetricsRead(state: GoalMetrics | undefined, cycles: readonly Pick<GoalCycle, "teamId" | "cycle">[], configured: readonly TeamCommand[]): GoalMetricsView {
+export function goalMetricsRead(stored: unknown, cycles: readonly Pick<GoalCycle, "teamId" | "cycle">[], configured: readonly TeamCommand[]): GoalMetricsView {
+  const state = isGoalMetrics(stored) ? stored : undefined;
   const position = new Map(cycles.map((cycle, index) => [cycle.teamId, index]));
   const entries = (state?.entries ?? []).filter(item => position.has(item.run)).sort((a, b) => position.get(a.run)! - position.get(b.run)!);
   const labels = new Map<string, string>();

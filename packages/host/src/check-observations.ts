@@ -20,12 +20,35 @@ export type CheckObservation = {
  * The run's stored holder as this module reads it. `checkObservations` sits beside `run`, never in it: views, member
  * context files, prompts, Understanding records and events select `run`, so none of them carries an observation.
  * It holds one (revision, round, head): per command digest, the first non-setup occurrence of that command there.
+ * It is `unknown` because a later release may have stored another shape before a rollback to this one; every read
+ * goes through `storedObservations`.
  */
-export type ObservationHolder = { run: TeamRun; checkHead?: string; checkObservations?: CheckObservation[] };
+export type ObservationHolder = { run: TeamRun; checkHead?: string; checkObservations?: unknown };
+
+const STATES: ReadonlySet<unknown> = new Set<CheckMetricState>(["value", "ambiguous", "invalid"]);
+const ROW_KEYS = new Set(["command", "name", "revision", "round", "head", "at", "state", "value"]);
+
+function isObservation(value: unknown): value is CheckObservation {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  return Object.keys(row).every(key => ROW_KEYS.has(key)) && typeof row.command === "string" && typeof row.name === "string"
+    && Number.isSafeInteger(row.revision) && Number.isSafeInteger(row.round) && typeof row.head === "string" && typeof row.at === "string"
+    && STATES.has(row.state) && (row.value === undefined || (typeof row.value === "number" && Number.isFinite(row.value)));
+}
 
 /**
- * One check's metric scan. It sees every chunk the failure scanner sees. A scanner that throws voids that check's
- * numbers and never stops a chunk reaching the other observer.
+ * The stored rows as this version writes them: none when the field is absent, and undefined when it holds anything
+ * else. A value this version does not recognise is never read and never overwritten, so a later release's rows
+ * survive a rollback to this one.
+ */
+export function storedObservations(value: unknown): CheckObservation[] | undefined {
+  if (value === undefined) return [];
+  return Array.isArray(value) && value.every(isObservation) ? value : undefined;
+}
+
+/**
+ * One check's metric scan. It sees every chunk the failure scanner sees. A scanner or a record that throws voids that
+ * check's numbers, never stops a chunk reaching the other observer, and never throws into the check loop.
  */
 export function metricObserver() {
   const scanner = new CheckMetricScanner();
@@ -37,9 +60,8 @@ export function metricObserver() {
     },
     /** Finishes the scan, for every check, and records it on the holder. Call it in the same synchronous step that finishes the row. */
     record(holder: ObservationHolder, check: TeamCheck) {
-      let scan: CheckMetricScan | undefined;
-      try { scan = scanner.finish(); } catch { broken = true; }
-      if (!broken && scan) recordObservations(holder, check, scan);
+      if (broken) return;
+      try { recordObservations(holder, check, scanner.finish()); } catch { broken = true; }
     },
   };
 }
@@ -48,16 +70,18 @@ export function metricObserver() {
  * Keeps a passed check's numbers when the check is the first non-setup row of its command at its (revision, round,
  * head), the row `commandResult` reads for a receipt. A failed or interrupted check, a setup row and a later
  * occurrence of the same command keep nothing. A row of another (revision, round, head) replaces what the holder keeps;
- * a row older than it changes nothing.
+ * a row older than it changes nothing. A stored value this version does not recognise stays as it is, and the run
+ * keeps no numbers. Only the last statement changes the holder, so a throw before it leaves the holder as it was.
  */
 export function recordObservations(holder: ObservationHolder, check: TeamCheck, scan: CheckMetricScan): void {
   const head = check.headCommit, at = check.finishedAt;
   if (check.status !== "passed" || check.phase !== undefined || head === undefined || at === undefined) return;
+  const kept = storedObservations(holder.checkObservations);
+  if (!kept) return;
   const command = commandDigest(check.command), round = check.round ?? 0;
   const first = holder.run.checks.find(row => row.phase === undefined && row.revision === check.revision &&
     (row.round ?? 0) === round && row.headCommit === head && commandDigest(row.command) === command);
   if (first !== check) return;
-  const kept = holder.checkObservations ?? [];
   const held = kept[0];
   if (held && (held.revision > check.revision || (held.revision === check.revision && held.round > round))) return;
   const same = kept.filter(item => item.revision === check.revision && item.round === round && item.head === head);
@@ -79,6 +103,6 @@ export function reviewedObservationsOf(holder: ObservationHolder | undefined): C
   const rounds = run.checks.filter(check => check.revision === run.revision).map(check => check.round ?? 0);
   if (!rounds.length) return [];
   const round = Math.max(...rounds);
-  return (holder.checkObservations ?? []).filter(item => item.revision === run.revision && item.round === round && item.head === head)
+  return (storedObservations(holder.checkObservations) ?? []).filter(item => item.revision === run.revision && item.round === round && item.head === head)
     .map(item => ({ ...item }));
 }

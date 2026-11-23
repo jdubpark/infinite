@@ -22,7 +22,7 @@ import { objectivePromptsOn, objectiveRegisterOn } from "./objective-digest.js";
 import { answerProvisional, assertVerdictAnswer, continueGoal, criteriaRowsFor, cycleVerdict, provisionalStop, verdictFailed, CONTINUE_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "./goal-verdicts.js";
 import { correctionSchema, type CriterionInput } from "./objective-input.js";
 import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
-import { goalMetricsRead, pruneMetrics, settleMetrics, type GoalMetrics } from "./goal-metrics.js";
+import { goalMetricsRead, pruneMetrics, settleMetrics } from "./goal-metrics.js";
 
 type Action = { requestId: string; revision: number };
 /**
@@ -56,7 +56,7 @@ type Stored = {
   objectiveRecord?: unknown;
   objectiveNotice?: ObjectiveUnavailable;
   /** One entry of reported numbers per cycle (goal-metrics.ts). Outside `goal`, so no goal view, Understanding record or relay read has them. */
-  metrics?: GoalMetrics;
+  metrics?: unknown;
 };
 const now = () => new Date().toISOString();
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");

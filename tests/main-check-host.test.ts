@@ -9,6 +9,7 @@ import type { PushMessage, PushTicket } from "../packages/host/src/push.js";
 import type { TeamCommand } from "../packages/host/src/team-types.js";
 import { unseal } from "../packages/host/src/vault.js";
 import { inProcessHost, waitFor, type ApiResponse } from "./helpers.js";
+import { earlierProcesses } from "./main-check-earlier.js";
 import { git } from "./team-fixture.js";
 
 /*
@@ -21,6 +22,10 @@ import { git } from "./team-fixture.js";
 const PROJECT = "alpha";
 const WAIT_MS = 20_000;
 const CASE = { timeout: 60_000 };
+// createApp builds the service on its default ports, so a case that waits for a copy to be removed cannot pass on an
+// account with processes the census cannot inspect (main-check-earlier.ts). It is skipped there, with the reason.
+const UNINSPECTED = (await earlierProcesses()).size;
+const REMOVES_A_COPY = UNINSPECTED === 0 ? CASE : { ...CASE, skip: `this account has ${UNINSPECTED} process(es) the census cannot inspect, so a main check here removes no copy while they run (docs/teams.md, Main check, limits)` };
 const COMMIT = ["-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-q", "-m"];
 const sh = (script: string): TeamCommand => ({ command: "sh", args: ["-c", script] });
 
@@ -117,7 +122,7 @@ test("a mirror fetch reaches the main check through onMirror, and the owner's re
   }
 });
 
-test("a real Notifier tells the owner main is failing, then that it passes again, and a push that reached nobody changes nothing", CASE, async () => {
+test("a real Notifier tells the owner main is failing, then that it passes again, and a push that reached nobody changes nothing", REMOVES_A_COPY, async () => {
   const h = await mainCheckHost({ "tracked.txt": "one\n", broken: "yes\n" }, () => [sh("if [ -f broken ]; then echo 'not ok 1 - the build is broken' >&2; exit 3; fi")]);
   try {
     const registered = await h.host.fetchApi("/devices/push", "owner", { token: "ExponentPushToken[mainCheckDevice01]", platform: "ios" });

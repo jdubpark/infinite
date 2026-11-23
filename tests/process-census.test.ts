@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { WITNESS_LIMIT, directoryCensus, extendWitness, newWitness, operationCensus, processStart, readProcessTable, recordCommand, witnessFindings,
+import { WITNESS_LIMIT, directoryCensus, extendWitness, newWitness, operationCensus, processStart, readProcessTable, recordCommand, statusRunsAs, witnessFindings,
   type ProcessRow, type ProcessTable, type ProcessWitness } from "../packages/host/src/process-census.js";
 
 const censusFile = fileURLToPath(new URL("../packages/host/src/process-census.ts", import.meta.url));
@@ -20,6 +21,22 @@ function table(rows: ProcessRow[], boot = "boot-1"): ProcessTable {
 function witness(processes: { pid: number; start: string }[], boot = "boot-1"): ProcessWitness {
   return { boot, processes, sessions: [], groups: [] };
 }
+
+test("a process is the account's when the account is an id it runs with, not when the account only started it (INF-402)", () => {
+  const status = (ids: string) => `Name:\tsudo\nUmask:\t0022\nState:\tS (sleeping)\nPid:\t4242\nUid:\t${ids}\nGid:\t999\t0\t0\t0\nGroups:\t999\n`;
+  // The sudo process of a command the host started: real user id 999, and root in the three ids it acts with.
+  assert.equal(statusRunsAs(status("999\t0\t0\t0"), 999), false);
+  assert.equal(statusRunsAs(status("999\t0\t0\t0"), 0), true);
+  // The effective and filesystem ids are what a process runs with; the saved id counts too, to be safe.
+  assert.equal(statusRunsAs(status("0\t999\t0\t0"), 999), true, "effective");
+  assert.equal(statusRunsAs(status("0\t0\t999\t0"), 999), true, "saved");
+  assert.equal(statusRunsAs(status("0\t0\t0\t999"), 999), true, "filesystem");
+  assert.equal(statusRunsAs(status("1000\t1000\t1000\t1000"), 999), false, "another account");
+  // The account's gid on the Gid line and a pid that equals the uid name nobody.
+  assert.equal(statusRunsAs("Pid:\t999\nUid:\t1000\t0\t0\t0\nGid:\t999\t999\t999\t999\n", 999), false);
+  // A status that cannot be classified is reported, never skipped.
+  for (const text of ["", "Name:\tx\n", status("999\t0\t0"), status("999\t0\t0\t0\t0"), status("999\tx\t0\t0"), status("")]) assert.equal(statusRunsAs(text, 999), true, JSON.stringify(text));
+});
 
 test("a witness follows a recorded process's descendants into their own sessions and groups", () => {
   const w = witness([{ pid: 10, start: "a" }]);
@@ -95,6 +112,110 @@ test("a process whose first thread has exited is still found through its other t
     const census = await directoryCensus(directory);
     assert.equal(census.ok, true, census.ok ? "" : census.problem);
     assert.deepEqual(census.ok ? census.findings.filter(finding => finding.pid === child.pid) : [], [{ pid: child.pid, reason: "working-directory" }]);
+    // For another directory the process is inspected through that thread too: its exited first thread hides nothing.
+    const elsewhere = await directoryCensus(join(tmpdir(), `census-elsewhere-${process.pid}`));
+    assert.equal(elsewhere.ok, true, elsewhere.ok ? "" : elsewhere.problem);
+    assert.deepEqual(elsewhere.ok ? elsewhere.findings.filter(finding => finding.pid === child.pid) : undefined, []);
+  } finally {
+    try { process.kill(child.pid!, "SIGKILL"); } catch { /* Already exited. */ }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+const canLeaveExitedChild = (process.platform === "linux" || process.platform === "darwin") && spawnSync("python3", ["-c", ""]).status === 0;
+test("an exited process that waits for its parent holds nothing and is not reported (INF-402)", { skip: !canLeaveExitedChild }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "census-"));
+  // The parent never collects its child, so the child stays in the process table for as long as the parent sleeps.
+  const script = ["import os, time", "pid = os.fork()", "if pid == 0: os._exit(0)", "print(pid, flush=True)", "time.sleep(60)", ""].join("\n");
+  const parent = spawn("python3", ["-c", script], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  try {
+    const [line] = await once(parent.stdout!, "data") as [Buffer];
+    const exited = Number.parseInt(line.toString("utf8"), 10);
+    assert.ok(Number.isSafeInteger(exited) && exited > 0, `the parent should print its child's pid, got ${JSON.stringify(line.toString("utf8"))}`);
+    const state = (): string | undefined => {
+      if (process.platform !== "linux") return spawnSync("/bin/ps", ["-p", String(exited), "-o", "stat="], { encoding: "utf8" }).stdout.trim().charAt(0) || undefined;
+      try { const stat = readFileSync(`/proc/${exited}/stat`, "utf8"); return stat[stat.lastIndexOf(")") + 2]; } catch { return undefined; }
+    };
+    const until = Date.now() + 5000;
+    while (state() !== "Z" && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(state(), "Z", "the child should have exited and wait for its parent");
+    const census = await directoryCensus(directory);
+    assert.equal(census.ok, true, census.ok ? "" : census.problem);
+    assert.deepEqual(census.ok ? census.findings.filter(finding => finding.pid === exited) : undefined, []);
+  } finally {
+    try { process.kill(parent.pid!, "SIGKILL"); } catch { /* Already exited. */ }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// Root reads every process, so a process cannot hide from it.
+const canHideFromItsAccount = process.platform === "linux" && process.getuid?.() !== 0 && spawnSync("python3", ["-c", "import ctypes; ctypes.CDLL(None).prctl"]).status === 0;
+test("a process that cannot be inspected is reported, and is not when it can be a moment later (INF-402)", { skip: !canHideFromItsAccount }, async t => {
+  const directory = mkdtempSync(join(tmpdir(), "census-"));
+  // prctl(4, 0) is PR_SET_DUMPABLE off: /proc then refuses the process's links to its own account, as it does for a
+  // moment while a process exits. prctl(4, 1) undoes it. The process answers each line it reads.
+  const script = [
+    "import ctypes, sys, time",
+    "libc = ctypes.CDLL(None)",
+    "for line in sys.stdin:",
+    "    word = line.split()",
+    "    if word[0] == 'hide':",
+    "        assert libc.prctl(4, 0, 0, 0, 0) == 0",
+    "        print('hidden', flush=True)",
+    "    else:",
+    "        time.sleep(int(word[1]) / 1000)",
+    "        assert libc.prctl(4, 1, 0, 0, 0) == 0",
+    "        print('shown %d' % int(time.time() * 1000), flush=True)",
+    "",
+  ].join("\n");
+  const child = spawn("python3", ["-c", script], { detached: true, stdio: ["pipe", "pipe", "ignore"] });
+  const lines = createInterface({ input: child.stdout! })[Symbol.asyncIterator]();
+  const answer = async (command: string) => { child.stdin!.write(`${command}\n`); return String((await lines.next()).value); };
+  const reported = async () => {
+    const census = await directoryCensus(directory);
+    assert.equal(census.ok, true, census.ok ? "" : census.problem);
+    return census.ok ? census.findings.filter(finding => finding.pid === child.pid) : [];
+  };
+  try {
+    assert.equal(await answer("hide"), "hidden");
+    // The census tells whose process it is by the owner /proc shows. That stays the account while the process hides.
+    assert.equal(statSync(`/proc/${child.pid}`).uid, process.getuid!());
+    assert.deepEqual(await reported(), [{ pid: child.pid, reason: "unreadable" }], "a process that stays hidden is reported");
+    // The census looks again 100 ms after its first look, so no sooner than 100 ms after it began. A process that
+    // shows itself before then is not reported. An attempt in which the process was slower than that proves nothing.
+    let decided = false;
+    for (let attempt = 0; attempt < 5 && !decided; attempt += 1) {
+      if (attempt > 0) assert.equal(await answer("hide"), "hidden");
+      const begun = Date.now();
+      const shown = answer("show-after 60");
+      const findings = await reported();
+      const shownAt = Number((await shown).split(" ")[1]);
+      if (shownAt >= begun + 100) continue;
+      assert.deepEqual(findings, [], "a process that could be inspected at the second look is not reported");
+      decided = true;
+    }
+    if (!decided) t.skip("the process never showed itself within 100 ms, so the second look was not exercised");
+  } finally {
+    try { process.kill(child.pid!, "SIGKILL"); } catch { /* Already exited. */ }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a process that hides is still reported when its first thread has exited (INF-402)", { skip: !canExitFirstThread || !canHideFromItsAccount }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "census-"));
+  // The exited first thread has no working directory link, and such a task holds nothing. That rule must not cover the
+  // thread that lives on: /proc refuses that thread's links, so the process is one the census cannot inspect.
+  const script = ["import ctypes, threading, time", "libc = ctypes.CDLL(None)", "assert libc.prctl(4, 0, 0, 0, 0) == 0",
+    "threading.Thread(target=time.sleep, args=(60,)).start()", `libc.syscall(${threadExit}, 0)`, ""].join("\n");
+  const child = spawn("python3", ["-c", script], { cwd: directory, detached: true, stdio: "ignore" });
+  try {
+    const until = Date.now() + 5000;
+    const firstThreadExited = () => { try { const stat = readFileSync(`/proc/${child.pid}/stat`, "utf8"); return stat[stat.lastIndexOf(")") + 2] === "Z"; } catch { return false; } };
+    while (!firstThreadExited() && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(firstThreadExited(), true, "the first thread should have exited");
+    const census = await directoryCensus(directory);
+    assert.equal(census.ok, true, census.ok ? "" : census.problem);
+    assert.deepEqual(census.ok ? census.findings.filter(finding => finding.pid === child.pid) : [], [{ pid: child.pid, reason: "unreadable" }]);
   } finally {
     try { process.kill(child.pid!, "SIGKILL"); } catch { /* Already exited. */ }
     rmSync(directory, { recursive: true, force: true });

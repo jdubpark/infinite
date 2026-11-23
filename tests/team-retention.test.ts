@@ -293,6 +293,48 @@ test("an operation's intent says its record may be incomplete until a save holds
   } finally { await close(f, teams); }
 });
 
+test("a host stop inside a command's drain signals nothing, and after a restart the census still sees what the command left", { skip: process.platform === "win32" && "process groups are POSIX" }, async () => {
+  const f = schedulerFixture();
+  f.writeTeam();
+  const directory = runDirectory(f.run);
+  const leaderFile = join(directory, "leader"), leftFile = join(directory, "left"), release = join(directory, "release");
+  const pidIn = (file: string) => { const text = existsSync(file) ? readFileSync(file, "utf8") : ""; return text.endsWith("\n") ? Number.parseInt(text, 10) : undefined; };
+  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; } };
+  type Internals = { records: Map<string, { pending?: unknown }>; operation: (stored: unknown, kind: string, perform: (signal: AbortSignal) => Promise<unknown>, complete: () => void) => void;
+    refreshOperationCensus: (stored: unknown, force: boolean) => Promise<string | undefined> };
+  // Real processes and the real census. The leader leaves a sleep in its group that holds its output, then exits once released.
+  const teams = openTeam(f);
+  let restarted: TeamService | undefined;
+  try {
+    const internals = teams as unknown as Internals;
+    const stored = internals.records.get(f.run.id)!;
+    const script = `echo $$ > '${leaderFile}'; sleep 30 & echo $! > '${leftFile}'; while [ ! -f '${release}' ]; do sleep 0.05; done; exit 0`;
+    internals.operation(stored, "check", signal => teamCommand({ command: "sh", args: ["-c", script] }, f.run.workspace, signal), () => {});
+    await waitFor(() => pidIn(leftFile) !== undefined && savedRecord(f).pending?.recording === undefined && (savedRecord(f).pending?.witness?.sessions.length ?? 0) > 0,
+      "the saved intent should hold the command", 10_000);
+    writeFileSync(release, "");
+    const leader = pidIn(leaderFile)!;
+    // Node reaps the leader as it emits `exit`, so a reaped leader means the drain has begun.
+    const deadline = Date.now() + 10_000;
+    while (alive(leader) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(alive(leader), false, "the leader exits once released");
+    teams.close();
+    await teams.idle();
+    assert.ok(stored.pending, "a stop during the drain leaves the operation's intent for the next start");
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(alive(pidIn(leftFile)!), true, "the host stop signalled nothing after the leader's exit");
+    restarted = openTeam(f);
+    const restartedInternals = restarted as unknown as Internals;
+    assert.equal(await restartedInternals.refreshOperationCensus(restartedInternals.records.get(f.run.id)!, true), "running", "the census finds the sleep in the recorded group");
+  } finally {
+    const left = pidIn(leftFile);
+    if (left !== undefined && Number.isSafeInteger(left) && left > 1 && alive(left)) process.kill(left, "SIGKILL");
+    if (restarted) { restarted.close(); await restarted.idle(); }
+    else teams.close();
+    f.close();
+  }
+});
+
 test("a blocked run whose intent was still recording when the host stopped stays blocked though the host finds no process, unless the host has rebooted since", async () => {
   const f = schedulerFixture();
   const at = new Date().toISOString();

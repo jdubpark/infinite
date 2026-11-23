@@ -2,6 +2,7 @@ import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb, EvidenceModule, EvidenceTx } from "./evidence/types.js";
 import { REPORT_KEEP_DAYS, type TrialCost } from "./eval-trial-store.js";
 import { CALIBRATION_VALID_DAYS } from "./judge-calibration-rules.js";
+import type { SourceResult } from "./eval-trial.js";
 import type { Judgement, JudgeEnding } from "./judge-types.js";
 
 // The judge store: calibrations of a judge profile and the judgements that make them up. The sealed columns hold
@@ -60,6 +61,9 @@ export type NewCalibration = Pick<CalibrationRow, "calibrationId" | "requestId" 
 /** How a calibration ends. `state` is set for `completed` and null for `cancelled` and `expired`. */
 export type CalibrationEnd = { status: Exclude<CalibrationStatus, "running">; reason: string | null; state: CalibrationState | null;
   counted: number; correct: number; agree: number; accuracy: number | null; lowerBound: number | null; swapAgreement: number | null };
+/** Why the next judgement waits: a gate of the schedule, `mirror` or `start-up` found by the pump, or a cause of a failed source build. */
+export type CalibrationWait = "halt" | "host-load" | "eval-identity" | "grader" | "another-job" | "another-judgement" | "provider-limit"
+  | "session-slots" | "mirror" | "start-up" | Exclude<Extract<SourceResult, { kind: "environment" }>["cause"], "halted">;
 export type CalibrationView = { calibrationId: string; profileId: string; profileEpoch: number; promptVersion: string;
   status: CalibrationRow["status"]; reason: string | null; state: "ok" | "not-ok" | null;
   pairs: { planned: number; counted: number; correct: number; perProject: { projectId: string; pairs: number }[] };
@@ -67,7 +71,7 @@ export type CalibrationView = { calibrationId: string; profileId: string; profil
   cost: { tokens: number; spentUsd: number }; createdAt: string; expiresAt: string; completedAt: string | null;
   validUntil: string | null; inForce: boolean;
   /** The gate that holds the next judgement of a running calibration, kept in memory by the job. Null when none is known or the calibration is not running. */
-  waiting: string | null };
+  waiting: CalibrationWait | null };
 
 export type JudgementState = "preparing" | "live" | "final" | "dropped";
 export type JudgementLabel = "A" | "B" | "tie";

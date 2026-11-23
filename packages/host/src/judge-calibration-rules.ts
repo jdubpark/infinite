@@ -5,6 +5,8 @@ export const CALIBRATION_DEFAULT_PAIRS = 36;
 export const CALIBRATION_LOWER_BOUND_MIN = 0.6;
 export const CALIBRATION_VALID_DAYS = 60;
 export const CALIBRATION_RETRIES = 2;
+/** The failures in a row, before any judge session, that one judgement absorbs before the last one ends its attempt. */
+export const CALIBRATION_RELEASES = 10;
 export const WILSON_Z = 1.96;
 
 /** `preferred` is null when the judge failed to answer. */

@@ -245,7 +245,10 @@ export class TrialPump {
 
   private async advance(): Promise<void> {
     if (!this.ready()) return;
-    if (!this.started && !(await this.startup())) return;
+    if (!this.started && !(await this.startup())) {
+      this.options.judgements?.hold("start-up");
+      return;
+    }
     if (this.live !== undefined) {
       // A live trial holds the eval account and no judgement is asked for meanwhile, so the calibration's view names it.
       if (this.live.kind === "trial") this.options.judgements?.hold("another-job");
@@ -551,7 +554,12 @@ export class TrialPump {
       const found = trialSettings(project);
       // The context's job names the grader's job directory and its bundle, never the calibration.
       const graderJob = graderJobOf(start.calibrationId, start.projectId);
-      const ctx = "settings" in found ? this.contextOf({ projectId: start.projectId, jobId: graderJob }, found.settings, id, identity, grader) : undefined;
+      // A project that is gone or has incomplete eval settings is no outage: the attempt ends at once.
+      if (!("settings" in found)) {
+        this.cooldown = 1;
+        return judgements.finish(id, { ending: "void-host", sessionId: null });
+      }
+      const ctx = this.contextOf({ projectId: start.projectId, jobId: graderJob }, found.settings, id, identity, grader);
       // A host failure before any judge session uses no attempt: the row goes and the same slot starts again.
       if (ctx === undefined) {
         this.cooldown = 1;

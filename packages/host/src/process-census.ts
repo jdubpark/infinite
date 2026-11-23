@@ -57,6 +57,8 @@ const TABLE_BUFFER_BYTES = 64 * 1024 * 1024;
 const WRAPPER_LIMIT_MS = 10_000;
 /** A process can fork and exit between the listing and the reads of one pass; a second pass sees what the first missed. */
 const SECOND_PASS_MS = 100;
+/** How long the Linux census waits before it looks again at the processes it could not inspect. An exiting process is one for a few milliseconds. */
+const LOOK_AGAIN_MS = 100;
 const WRAPPER_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_WRAPPER_FINDINGS = 10_000;
 const MAX_INPUT_BYTES = 4096;
@@ -154,6 +156,8 @@ function accountedFor(witness: ProcessWitness, row: ProcessRow): CensusReason | 
  * ("unreadable"). Processes of other users are not inspected; that is the caller's limit to state.
  * A process belongs to the user it runs as. One that the calling user started and that runs as another user, such as
  * the sudo process of a command, is that other user's process.
+ * On Linux a process that has exited and waits for its parent is not a finding, and a process that could not be
+ * inspected is looked at once more, `LOOK_AGAIN_MS` later, before it is reported.
  */
 export async function directoryCensus(directory: string): Promise<CensusResult> {
   if (process.platform !== "linux" && process.platform !== "darwin") return { ok: false, problem: "unsupported platform" };
@@ -285,7 +289,17 @@ async function linuxCensus(directory: string): Promise<CensusFinding[]> {
     const reason = await linuxReason(Number(entry), uid, directory);
     if (reason) findings.push({ pid: Number(entry), reason });
   }
-  return findings;
+  if (!findings.some(finding => finding.reason === "unreadable")) return findings;
+  // While a process exits, /proc refuses its descriptors to its own account from the instant its memory is released
+  // until its files and working directory are. Each process that could not be inspected is looked at once more, and
+  // that look decides: by then such a process has exited, and one that still cannot be inspected is reported.
+  await new Promise(resolvePromise => setTimeout(resolvePromise, LOOK_AGAIN_MS));
+  const decided: CensusFinding[] = [];
+  for (const finding of findings) {
+    const reason = finding.reason === "unreadable" ? await linuxReason(finding.pid, uid, directory) : finding.reason;
+    if (reason) decided.push({ pid: finding.pid, reason });
+  }
+  return decided;
 }
 
 async function linuxReason(pid: number, uid: number, directory: string): Promise<CensusReason | undefined> {
@@ -321,20 +335,30 @@ async function linuxReason(pid: number, uid: number, directory: string): Promise
   return view.unreadable ? "unreadable" : undefined;
 }
 
-/** The working directory and open files under one /proc directory of a process or thread. `missing` marks a link that was not there. */
+/**
+ * The working directory and open files under one /proc directory of a process or thread. `missing` marks a link that
+ * was not there. A task that has exited holds nothing, and until its parent collects it /proc refuses the listing of
+ * its descriptors to its own account. So the working directory link is read last: when it is gone the task has exited,
+ * and what /proc refused before that is not `unreadable`.
+ */
 async function linuxLinks(base: string): Promise<{ paths: { reason: "working-directory" | "open-file"; path: string }[]; missing: boolean; unreadable: boolean }> {
-  const view = { paths: [] as { reason: "working-directory" | "open-file"; path: string }[], missing: false, unreadable: false };
-  const note = (error: unknown) => { if (isGone(error)) view.missing = true; else view.unreadable = true; };
-  try { view.paths.push({ reason: "working-directory", path: withoutDeleted(await readlink(`${base}/cwd`)) }); } catch (error) { note(error); }
+  const paths: { reason: "working-directory" | "open-file"; path: string }[] = [];
+  let missing = false;
+  let refused = false;
   try {
     for (const fd of await readdir(`${base}/fd`)) {
       // A descriptor closed between the listing and the read is gone, not hidden.
-      try { view.paths.push({ reason: "open-file", path: withoutDeleted(await readlink(`${base}/fd/${fd}`)) }); } catch (error) { if (!isGone(error)) view.unreadable = true; }
+      try { paths.push({ reason: "open-file", path: withoutDeleted(await readlink(`${base}/fd/${fd}`)) }); } catch (error) { if (!isGone(error)) refused = true; }
     }
   } catch (error) {
-    note(error);
+    if (isGone(error)) missing = true; else refused = true;
   }
-  return view;
+  try {
+    paths.push({ reason: "working-directory", path: withoutDeleted(await readlink(`${base}/cwd`)) });
+  } catch (error) {
+    return isGone(error) ? { paths, missing: true, unreadable: false } : { paths, missing, unreadable: true };
+  }
+  return { paths, missing, unreadable: refused };
 }
 
 /** `statusActsAs` for a live process. True also when its status cannot be read while the process exists. */

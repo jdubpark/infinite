@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { WITNESS_LIMIT, directoryCensus, extendWitness, newWitness, operationCensus, processStart, readProcessTable, recordCommand, statusActsAs, witnessFindings,
   type ProcessRow, type ProcessTable, type ProcessWitness } from "../packages/host/src/process-census.js";
@@ -111,6 +112,86 @@ test("a process whose first thread has exited is still found through its other t
     const census = await directoryCensus(directory);
     assert.equal(census.ok, true, census.ok ? "" : census.problem);
     assert.deepEqual(census.ok ? census.findings.filter(finding => finding.pid === child.pid) : [], [{ pid: child.pid, reason: "working-directory" }]);
+    // For another directory the process is inspected through that thread too: its exited first thread hides nothing.
+    const elsewhere = await directoryCensus(join(tmpdir(), `census-elsewhere-${process.pid}`));
+    assert.equal(elsewhere.ok, true, elsewhere.ok ? "" : elsewhere.problem);
+    assert.deepEqual(elsewhere.ok ? elsewhere.findings.filter(finding => finding.pid === child.pid) : undefined, []);
+  } finally {
+    try { process.kill(child.pid!, "SIGKILL"); } catch { /* Already exited. */ }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+const canLeaveExitedChild = (process.platform === "linux" || process.platform === "darwin") && spawnSync("python3", ["-c", ""]).status === 0;
+test("an exited process that waits for its parent holds nothing and is not reported (INF-402)", { skip: !canLeaveExitedChild }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "census-"));
+  // The parent never collects its child, so the child stays in the process table for as long as the parent sleeps.
+  const script = ["import os, time", "pid = os.fork()", "if pid == 0: os._exit(0)", "print(pid, flush=True)", "time.sleep(60)", ""].join("\n");
+  const parent = spawn("python3", ["-c", script], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  try {
+    const [line] = await once(parent.stdout!, "data") as [Buffer];
+    const exited = Number.parseInt(line.toString("utf8"), 10);
+    assert.ok(Number.isSafeInteger(exited) && exited > 0, `the parent should print its child's pid, got ${JSON.stringify(line.toString("utf8"))}`);
+    const state = (): string | undefined => {
+      if (process.platform !== "linux") return spawnSync("/bin/ps", ["-p", String(exited), "-o", "stat="], { encoding: "utf8" }).stdout.trim().charAt(0) || undefined;
+      try { const stat = readFileSync(`/proc/${exited}/stat`, "utf8"); return stat[stat.lastIndexOf(")") + 2]; } catch { return undefined; }
+    };
+    const until = Date.now() + 5000;
+    while (state() !== "Z" && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(state(), "Z", "the child should have exited and wait for its parent");
+    const census = await directoryCensus(directory);
+    assert.equal(census.ok, true, census.ok ? "" : census.problem);
+    assert.deepEqual(census.ok ? census.findings.filter(finding => finding.pid === exited) : undefined, []);
+  } finally {
+    try { process.kill(parent.pid!, "SIGKILL"); } catch { /* Already exited. */ }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+const canHideFromItsAccount = process.platform === "linux" && spawnSync("python3", ["-c", "import ctypes; ctypes.CDLL(None).prctl"]).status === 0;
+test("a process that cannot be inspected is reported, and is not when it can be a moment later (INF-402)", { skip: !canHideFromItsAccount }, async t => {
+  const directory = mkdtempSync(join(tmpdir(), "census-"));
+  // prctl(4, 0) is PR_SET_DUMPABLE off: /proc then refuses the process's links to its own account, as it does for a
+  // moment while a process exits. prctl(4, 1) undoes it. The process answers each line it reads.
+  const script = [
+    "import ctypes, sys, time",
+    "libc = ctypes.CDLL(None)",
+    "for line in sys.stdin:",
+    "    word = line.split()",
+    "    if word[0] == 'hide':",
+    "        assert libc.prctl(4, 0, 0, 0, 0) == 0",
+    "        print('hidden', flush=True)",
+    "    else:",
+    "        time.sleep(int(word[1]) / 1000)",
+    "        assert libc.prctl(4, 1, 0, 0, 0) == 0",
+    "        print('shown %d' % int(time.time() * 1000), flush=True)",
+    "",
+  ].join("\n");
+  const child = spawn("python3", ["-c", script], { detached: true, stdio: ["pipe", "pipe", "ignore"] });
+  const lines = createInterface({ input: child.stdout! })[Symbol.asyncIterator]();
+  const answer = async (command: string) => { child.stdin!.write(`${command}\n`); return String((await lines.next()).value); };
+  const reported = async () => {
+    const census = await directoryCensus(directory);
+    assert.equal(census.ok, true, census.ok ? "" : census.problem);
+    return census.ok ? census.findings.filter(finding => finding.pid === child.pid) : [];
+  };
+  try {
+    assert.equal(await answer("hide"), "hidden");
+    assert.deepEqual(await reported(), [{ pid: child.pid, reason: "unreadable" }], "a process that stays hidden is reported");
+    // The census looks again 100 ms after its first look, so no sooner than 100 ms after it began. A process that
+    // shows itself before then is not reported. An attempt in which the process was slower than that proves nothing.
+    let decided = false;
+    for (let attempt = 0; attempt < 5 && !decided; attempt += 1) {
+      if (attempt > 0) assert.equal(await answer("hide"), "hidden");
+      const begun = Date.now();
+      const shown = answer("show-after 60");
+      const findings = await reported();
+      const shownAt = Number((await shown).split(" ")[1]);
+      if (shownAt >= begun + 100) continue;
+      assert.deepEqual(findings, [], "a process that could be inspected at the second look is not reported");
+      decided = true;
+    }
+    if (!decided) t.skip("the process never showed itself within 100 ms, so the second look was not exercised");
   } finally {
     try { process.kill(child.pid!, "SIGKILL"); } catch { /* Already exited. */ }
     rmSync(directory, { recursive: true, force: true });

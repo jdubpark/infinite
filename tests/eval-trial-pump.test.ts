@@ -15,7 +15,6 @@ import { TrialJobs } from "../packages/host/src/eval-trial-jobs.js";
 import { TrialPump, type TrialPumpOptions, type TrialTeams } from "../packages/host/src/eval-trial-pump.js";
 import { EVAL_TRIALS_MODULE, evalTrialsModule, finishTrial, insertTrial, startTrial } from "../packages/host/src/eval-trial-store.js";
 import { ComparisonPass } from "../packages/host/src/eval-comparison.js";
-import { EvalJobs } from "../packages/host/src/eval-jobs.js";
 import { EvalHost } from "../packages/host/src/eval-host.js";
 import type { CostLookup } from "../packages/host/src/outcome-cells.js";
 import { configRef, TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
@@ -106,14 +105,17 @@ function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: E
     hostLoad: { held: () => undefined }, halt: () => ({ check: () => ({ state: "clear" as const }) }),
     graderProbe: async () => ({ state: "ready", storage: true, version: 2, uid: 5002 }), inventory: async () => options.alive ? [{ ruid: 5001, euid: 5001, state: "S" } as never] : [], now,
   });
-  const addJob = () => {
+  const addJob = (tasks = 1) => {
     const at = now();
     store.write(tx => {
-      tx.run(
-        "INSERT INTO eval_tasks (task_id, origin, run_id, member_id, project_ref, state, material, base, material_bytes, "
-        + "captured_at, checked_at, payload, group_id, area_ref, validated_at) "
-        + "VALUES (?, 'captured', 'run-1', 'member-1', ?, 'valid', 'stored', 'proven', 0, ?, ?, ?, 'run:run-1', 'host', ?)",
-        TASK, tx.index("project", PROJECT), at, at, tx.seal("eval_tasks", TASK, { projectId: PROJECT }), at);
+      for (let index = 1; index <= tasks; index += 1) {
+        const id = index === 1 ? TASK : `captured:run-1:t${String(index).padStart(2, "0")}`;
+        tx.run(
+          "INSERT INTO eval_tasks (task_id, origin, run_id, member_id, project_ref, state, material, base, material_bytes, "
+          + "captured_at, checked_at, payload, group_id, area_ref, validated_at) "
+          + "VALUES (?, 'captured', 'run-1', ?, ?, 'valid', 'stored', 'proven', 0, ?, ?, ?, 'run:run-1', 'host', ?)",
+          id, `member-${index}`, tx.index("project", PROJECT), at, at, tx.seal("eval_tasks", id, { projectId: PROJECT }), at);
+      }
     });
     const created = jobs.create(PROJECT, {
       kind: "baseline", configurations: [{ profile: CLAUDE, guidance: "as-of-base", knowledge: "none" }],
@@ -572,71 +574,91 @@ test("the comparison step reports no job whose trial is still live after a sweep
   }
 });
 
-type Built = { slot: number; attempt: number; waiting: string | null };
-const trialRows = (r: ReturnType<typeof rig>) => r.store.read(db => db.all<{ attempt: number; state: string; ending: string | null }>(
-  "SELECT attempt, state, ending FROM eval_trials ORDER BY created_at, attempt"));
+type Built = { taskId: string; slot: number; attempt: number; waiting: string | null };
+type Answer = Awaited<ReturnType<NonNullable<TrialPumpOptions["prepareSource"]>>>;
+const trialRows = (r: ReturnType<typeof rig>) => r.store.read(db => db.all<{ taskId: string; attempt: number; state: string; ending: string | null }>(
+  "SELECT task_id AS taskId, attempt, state, ending FROM eval_trials ORDER BY created_at, attempt"));
 const jobOf = (r: ReturnType<typeof rig>, jobId: string) => r.store.read(db => db.get<{ status: string; reason: string | null; waiting: string | null }>(
   "SELECT status, reason, waiting FROM eval_jobs WHERE job_id = ?", jobId))!;
+const skippedOf = (r: ReturnType<typeof rig>, jobId: string) => r.store.read(db => db.get<{ skipped: number }>(
+  "SELECT skipped FROM eval_trial_counts WHERE job_id = ?", jobId))!.skipped;
 
-/** A source that ends with `cause` for the first `failures` builds, then skips the task. Each build records the row's attempt and the job's wait. */
-function scripted(failures: number, cause: "bundle-missing" | "grader-failed" = "bundle-missing") {
+/** A scripted source: `answer` gets the task and the number of the build (from 1). Each build records its task, the row's slot and attempt, and the job's wait. */
+function scripted(answer: (taskId: string, build: number) => Answer) {
   const builds: Built[] = [];
   let jobId = "";
-  const prepareSource: TrialPumpOptions["prepareSource"] = async (_store, _taskId, ctx) => {
-    const row = _store.read(db => db.get<{ slot: number; attempt: number }>("SELECT slot, attempt FROM eval_trials WHERE trial_id = ?", ctx.trialId))!;
-    builds.push({ slot: row.slot, attempt: row.attempt, waiting: jobId === "" ? null : _store.read(db => db.get<{ waiting: string | null }>("SELECT waiting FROM eval_jobs WHERE job_id = ?", jobId))!.waiting });
-    return builds.length <= failures ? { kind: "environment", cause } : { kind: "skip", reason: "not-valid" };
+  const prepareSource: TrialPumpOptions["prepareSource"] = async (store, taskId, ctx) => {
+    const row = store.read(db => db.get<{ slot: number; attempt: number }>("SELECT slot, attempt FROM eval_trials WHERE trial_id = ?", ctx.trialId))!;
+    const waiting = store.read(db => db.get<{ waiting: string | null }>("SELECT waiting FROM eval_jobs WHERE job_id = ?", jobId))!.waiting;
+    builds.push({ taskId, slot: row.slot, attempt: row.attempt, waiting });
+    return answer(taskId, builds.length);
   };
   return { builds, prepareSource, setJob: (id: string) => { jobId = id; } };
 }
+const BROKEN: Answer = { kind: "environment", cause: "bundle-missing" };
+const SKIPPED: Answer = { kind: "skip", reason: "not-valid" };
 
-/** Steps until `count` source builds (or status reads, with no mirror head) were made; a step budget keeps a stuck pump from hanging. */
+/** Steps until `made()` reaches `count`; a step budget keeps a stuck pump from hanging. */
 async function stepsUntil(r: ReturnType<typeof rig>, made: () => number, count: number): Promise<void> {
-  for (let step = 0; step < 200 && made() < count; step++) await r.pump.step();
+  for (let step = 0; step < 300 && made() < count; step++) await r.pump.step();
   assert.equal(made(), count);
 }
+const T02 = "captured:run-1:t02";
 
-test("a source that cannot be built leaves no row for nine tries, and the tenth ends the trial void-host", async () => {
-  const s = scripted(100);
+test("a source that cannot be built leaves no row for nine tries; the tenth ends the trial void-host and skips the task", async () => {
+  const s = scripted((_task, build) => build <= 10 ? BROKEN : SKIPPED);
   const r = rig({ baseBranch: "main", mirrorHead: "head", prepareSource: s.prepareSource });
   try {
-    const jobId = r.addJob();
+    const jobId = r.addJob(4);
     s.setJob(jobId);
     await stepsUntil(r, () => s.builds.length, 9);
     assert.deepEqual(trialRows(r), [], "nine failures leave no trial row");
     assert.deepEqual({ ...jobOf(r, jobId) }, { status: "running", reason: null, waiting: "bundle-missing" }, "the job names the cause");
     await stepsUntil(r, () => s.builds.length, 10);
-    assert.deepEqual(trialRows(r).map(row => ({ ...row })), [{ attempt: 0, state: "final", ending: "void-host" }], "the tenth failure ends the trial");
+    assert.deepEqual(trialRows(r).map(row => ({ ...row })), [{ taskId: TASK, attempt: 0, state: "final", ending: "void-host" }], "the tenth failure ends the trial");
+    assert.equal(skippedOf(r, jobId), 1, "the job skips the task");
     await stepsUntil(r, () => s.builds.length, 11);
-    assert.equal(s.builds[10]!.attempt, 1, "the next try is attempt 1: the voided one used attempt 0");
+    assert.deepEqual({ ...s.builds[10]! }, { taskId: T02, slot: 0, attempt: 0, waiting: null }, "the next build is the next task, as attempt 0");
   } finally {
     r.cleanup();
   }
 });
 
-test("a cause that never clears uses the slot's three attempts and pauses the job", async () => {
-  const s = scripted(1000);
+test("a cause that no task clears ends three trials on three tasks and pauses the job", async () => {
+  const s = scripted(() => BROKEN);
   const r = rig({ baseBranch: "main", mirrorHead: "head", prepareSource: s.prepareSource });
   try {
-    const jobId = r.addJob();
+    const jobId = r.addJob(5);
     s.setJob(jobId);
     await stepsUntil(r, () => s.builds.length, 30);
     for (let step = 0; step < 6; step++) await r.pump.step();
     assert.equal(s.builds.length, 30, "no build follows the third void");
-    assert.deepEqual(trialRows(r).map(row => ({ ...row })), [0, 1, 2].map(attempt => ({ attempt, state: "final", ending: "void-host" })));
+    assert.deepEqual(trialRows(r).map(row => ({ ...row })), [TASK, T02, "captured:run-1:t03"].map(taskId => ({ taskId, attempt: 0, state: "final", ending: "void-host" })));
     const job = jobOf(r, jobId);
     assert.deepEqual({ status: job.status, reason: job.reason }, { status: "paused", reason: "trial-voids" });
-    const owner = new EvalJobs({ store: r.store, config: r.config, now: r.now, baseline: { views: (db, rows) => r.jobs.views(db, rows), digest: (projectId, id) => r.jobs.digest(projectId, id) } });
-    assert.ok(!("code" in owner.control(jobId, "resume")), "the owner resumes the job");
-    for (let step = 0; step < 6; step++) await r.pump.step();
-    assert.deepEqual({ ...s.builds[30]! }, { slot: 1, attempt: 0, waiting: null }, "after a resume the job moves on to the next slot, as attempt 0");
   } finally {
     r.cleanup();
   }
 });
 
-test("a short outage uses no attempt and the wait clears when the source builds", async () => {
-  const s = scripted(3);
+test("one task that never builds is skipped and the job goes on with the next task", async () => {
+  const s = scripted(task => task === TASK ? BROKEN : SKIPPED);
+  const r = rig({ baseBranch: "main", mirrorHead: "head", prepareSource: s.prepareSource });
+  try {
+    const jobId = r.addJob(4);
+    s.setJob(jobId);
+    await stepsUntil(r, () => s.builds.length, 12);
+    assert.deepEqual(s.builds.slice(10).map(build => build.taskId), [T02, "captured:run-1:t03"], "the later tasks build");
+    assert.equal(jobOf(r, jobId).status, "running");
+    assert.equal(jobOf(r, jobId).reason, null);
+    assert.equal(trialRows(r).length, 1, "one void row, for the bad task");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("a short outage uses no attempt, and the next hand-out clears the wait", async () => {
+  const s = scripted((_task, build) => build <= 3 ? BROKEN : SKIPPED);
   const r = rig({ baseBranch: "main", mirrorHead: "head", prepareSource: s.prepareSource });
   try {
     const jobId = r.addJob();
@@ -644,23 +666,21 @@ test("a short outage uses no attempt and the wait clears when the source builds"
     await stepsUntil(r, () => s.builds.length, 3);
     assert.equal(jobOf(r, jobId).waiting, "bundle-missing", "the job names the cause while the slot waits");
     await stepsUntil(r, () => s.builds.length, 4);
-    assert.deepEqual(s.builds[3], { slot: 0, attempt: 0, waiting: null }, "the fourth build is attempt 0 and the job waits for nothing");
+    assert.deepEqual({ ...s.builds[3]! }, { taskId: TASK, slot: 0, attempt: 0, waiting: null }, "the fourth build is attempt 0 and the job waits for nothing");
     assert.deepEqual(trialRows(r), [], "no void row was written");
   } finally {
     r.cleanup();
   }
 });
 
-test("a project with no mirror head counts the same way", async () => {
-  const r = rig();
+test("a project with no mirror head only waits, however long", async () => {
+  const r = rig({ baseBranch: "main" });
   try {
-    const jobId = r.addJob();
-    const tries = () => r.log.filter(entry => entry === "status").length;
-    await stepsUntil(r, tries, 9);
+    const jobId = r.addJob(3);
+    await stepsUntil(r, () => r.log.filter(entry => entry === "status").length, 12);
     assert.deepEqual(trialRows(r), []);
-    assert.equal(jobOf(r, jobId).waiting, "mirror");
-    await stepsUntil(r, tries, 10);
-    assert.deepEqual(trialRows(r).map(row => ({ ...row })), [{ attempt: 0, state: "final", ending: "void-host" }]);
+    assert.deepEqual({ ...jobOf(r, jobId) }, { status: "running", reason: null, waiting: "mirror" });
+    assert.equal(skippedOf(r, jobId), 0);
   } finally {
     r.cleanup();
   }

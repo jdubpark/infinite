@@ -419,6 +419,9 @@ export function buildLaunch(
   const relay = relayPath.endsWith(".ts")
     ? ["node", "--import", import.meta.resolve("tsx"), relayPath]
     : ["node", relayPath];
+  // An interactive Claude launch takes the Code Mode request from the `env` key of this argument as it does from its
+  // own environment. A command prefix such as sudo drops the variable and passes the argument, so the request rides here.
+  const codeModeRequest = codeMode && provider === "claude" && !channel ? { env: { [CLAUDE_CODE_MODE_ENV]: "1" } } : undefined;
   if (hooks && provider === "claude" && enabled.claude && !channel) {
     // A command hook, not an HTTP hook: the relay runs in the agent's account and is the only
     // process that can read the transcript the worker asks for in its reply.
@@ -430,8 +433,13 @@ export function buildLaunch(
       hooks: Object.fromEntries(
         CLAUDE_EVENTS.map((e) => [e, [{ hooks: [handler] }]]),
       ),
+      ...codeModeRequest,
     };
     args.push("--settings", JSON.stringify(settings));
+  } else if (codeModeRequest && !profile.args.some(arg => arg === "--settings" || arg.startsWith("--settings="))) {
+    // Without the hook layer the host passes this argument for the request alone. Claude Code honours only the last
+    // such argument, so a profile that brings its own keeps it, and its request travels only in the environment.
+    args.push("--settings", JSON.stringify(codeModeRequest));
   }
   // A served headless session: the permission channel's hooks and the signal hooks in one settings layer, with no
   // user, project or local settings loaded, so no settings file can switch them off or answer before them.

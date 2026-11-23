@@ -191,7 +191,7 @@ test("a record that throws leaves the holder as it was and never throws into the
 
 /** Values of a shape this version never writes, as a later release could leave them before a rollback. */
 const FOREIGN: readonly [string, unknown][] = [
-  ["{}", {}], ["[null]", [null]], ["{ v: 2 }", { v: 2 }],
+  ["null", null], ["{}", {}], ["[null]", [null]], ["{ v: 2 }", { v: 2 }],
   ["a row with a key this version does not write", [{ command: commandDigest(lint), name: "speed", revision: 1, round: 0, head: HEAD, at: AT, state: "value", value: 1, unit: "ms" }]],
 ];
 

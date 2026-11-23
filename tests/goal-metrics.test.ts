@@ -114,7 +114,7 @@ test("a label is cut at 200 code points, so no character is split", () => {
   // 198 code points before the emoji: a cut at 199 UTF-16 units would keep half of it.
   const cut = read({ command: "node", args: [`${"x".repeat(193)}\u{1F600}yyy`] });
   assert.equal(cut, `node ${"x".repeat(193)}\u{1F600}…`);
-  assert.equal(cut.isWellFormed(), true);
+  assert.doesNotThrow(() => encodeURIComponent(cut), "a half character would make this throw");
   assert.equal([...cut].length, GOAL_METRICS.label);
   const whole = read({ command: "node", args: ["\u{1F600}".repeat(195)] });
   assert.equal(whole, `node ${"\u{1F600}".repeat(195)}`, "200 code points in 395 UTF-16 units stay whole");
@@ -122,7 +122,7 @@ test("a label is cut at 200 code points, so no character is split", () => {
 
 /** Values of a shape this version never writes, as a later release could leave them before a rollback. */
 const FOREIGN: readonly [string, unknown][] = [
-  ["{}", {}], ["[null]", [null]], ["{ v: 2 }", { v: 2 }],
+  ["null", null], ["{}", {}], ["[null]", [null]], ["{ v: 2 }", { v: 2 }],
   ["a version key beside the entries", { entries: [], dropped: 0, v: 2 }],
   ["an entry with a key this version does not write", { dropped: 0, entries: [{ ...entry("run-1", [[lint, "speed", 1, 0]]), unit: "ms" }] }],
 ];

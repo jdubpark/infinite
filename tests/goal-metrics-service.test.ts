@@ -228,7 +228,7 @@ test("the step's write prunes the 51st entry its settlement adds", async t => {
 });
 
 /** Values of a shape this version never writes, as a later release could leave them before a rollback. */
-const FOREIGN: readonly [string, unknown][] = [["{}", {}], ["[null]", [null]], ["{ v: 2 }", { v: 2 }]];
+const FOREIGN: readonly [string, unknown][] = [["null", null], ["{}", {}], ["[null]", [null]], ["{ v: 2 }", { v: 2 }]];
 const EMPTY = { series: [], omittedSeries: 0, omittedValues: 0, dropped: 0 };
 
 for (const [label, value] of FOREIGN) {

@@ -475,16 +475,15 @@ export class TrialPump {
   }
 
   /**
-   * A trial that could not start for a host cause: its row goes and the slot keeps its attempt. The TRIAL_RELEASES-th failure in a
-   * row for one slot ends the trial `void-host` instead, so a cause that belongs to one task cannot hold the job.
+   * A trial that could not start: the row goes and the slot keeps its attempt. The TRIAL_RELEASES-th counted failure in a row for
+   * one slot ends the trial `void-host` and the job skips the task, so the next task runs; three voids in a row still pause the
+   * job, so a cause that is not the task's stops it after three tasks. `mirror` and `halt` only wait.
    */
   private release(next: Trial, trialId: string, waiting: EvalJobWait): void {
     this.cooldown = 1;
-    if (this.options.jobs.release(next, waiting) === "released") {
-      this.options.store.write(tx => dropTrial(tx, trialId));
-      return;
-    }
+    if (this.options.jobs.release({ ...next, trialId }, waiting) === "released") return;
     this.voidHost(trialId, next.jobId, next.taskId, this.now(), null);
+    this.options.jobs.skip(next.jobId, next.taskId);
   }
 
   /** Starts a trial: the row, its source, the run, and the live state. A source that cannot start ends or waits here. */

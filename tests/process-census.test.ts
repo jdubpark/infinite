@@ -1,13 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { WITNESS_LIMIT, directoryCensus, extendWitness, newWitness, operationCensus, processStart, readProcessTable, recordCommand, statusActsAs, witnessFindings,
+import { WITNESS_LIMIT, directoryCensus, extendWitness, newWitness, operationCensus, processStart, readProcessTable, recordCommand, statusRunsAs, witnessFindings,
   type ProcessRow, type ProcessTable, type ProcessWitness } from "../packages/host/src/process-census.js";
 
 const censusFile = fileURLToPath(new URL("../packages/host/src/process-census.ts", import.meta.url));
@@ -22,20 +22,20 @@ function witness(processes: { pid: number; start: string }[], boot = "boot-1"): 
   return { boot, processes, sessions: [], groups: [] };
 }
 
-test("a process is the account's when it runs as it or can again, not when the account only started it (INF-402)", () => {
+test("a process is the account's when the account is an id it runs with, not when the account only started it (INF-402)", () => {
   const status = (ids: string) => `Name:\tsudo\nUmask:\t0022\nState:\tS (sleeping)\nPid:\t4242\nUid:\t${ids}\nGid:\t999\t0\t0\t0\nGroups:\t999\n`;
   // The sudo process of a command the host started: real user id 999, and root in the three ids it acts with.
-  assert.equal(statusActsAs(status("999\t0\t0\t0"), 999), false);
-  assert.equal(statusActsAs(status("999\t0\t0\t0"), 0), true);
-  // A process that can act as the account again stays the account's, whatever it runs as now.
-  assert.equal(statusActsAs(status("0\t999\t0\t0"), 999), true, "effective");
-  assert.equal(statusActsAs(status("0\t0\t999\t0"), 999), true, "saved");
-  assert.equal(statusActsAs(status("0\t0\t0\t999"), 999), true, "filesystem");
-  assert.equal(statusActsAs(status("1000\t1000\t1000\t1000"), 999), false, "another account");
+  assert.equal(statusRunsAs(status("999\t0\t0\t0"), 999), false);
+  assert.equal(statusRunsAs(status("999\t0\t0\t0"), 0), true);
+  // The effective and filesystem ids are what a process runs with; the saved id counts too, to be safe.
+  assert.equal(statusRunsAs(status("0\t999\t0\t0"), 999), true, "effective");
+  assert.equal(statusRunsAs(status("0\t0\t999\t0"), 999), true, "saved");
+  assert.equal(statusRunsAs(status("0\t0\t0\t999"), 999), true, "filesystem");
+  assert.equal(statusRunsAs(status("1000\t1000\t1000\t1000"), 999), false, "another account");
   // The account's gid on the Gid line and a pid that equals the uid name nobody.
-  assert.equal(statusActsAs("Pid:\t999\nUid:\t1000\t0\t0\t0\nGid:\t999\t999\t999\t999\n", 999), false);
+  assert.equal(statusRunsAs("Pid:\t999\nUid:\t1000\t0\t0\t0\nGid:\t999\t999\t999\t999\n", 999), false);
   // A status that cannot be classified is reported, never skipped.
-  for (const text of ["", "Name:\tx\n", status("999\t0\t0"), status("999\t0\t0\t0\t0"), status("999\tx\t0\t0"), status("")]) assert.equal(statusActsAs(text, 999), true, JSON.stringify(text));
+  for (const text of ["", "Name:\tx\n", status("999\t0\t0"), status("999\t0\t0\t0\t0"), status("999\tx\t0\t0"), status("")]) assert.equal(statusRunsAs(text, 999), true, JSON.stringify(text));
 });
 
 test("a witness follows a recorded process's descendants into their own sessions and groups", () => {
@@ -177,6 +177,8 @@ test("a process that cannot be inspected is reported, and is not when it can be 
   };
   try {
     assert.equal(await answer("hide"), "hidden");
+    // The census tells whose process it is by the owner /proc shows. That stays the account while the process hides.
+    assert.equal(statSync(`/proc/${child.pid}`).uid, process.getuid!());
     assert.deepEqual(await reported(), [{ pid: child.pid, reason: "unreadable" }], "a process that stays hidden is reported");
     // The census looks again 100 ms after its first look, so no sooner than 100 ms after it began. A process that
     // shows itself before then is not reported. An attempt in which the process was slower than that proves nothing.

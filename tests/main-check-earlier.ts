@@ -7,6 +7,8 @@ import { bootId, hostProcesses, type CensusFinding, type HostProcesses } from ".
  * The account that runs the tests may own processes it cannot inspect: on Linux, a login session's service manager and
  * its SSH processes. The census reports each as `unreadable`, and a main check then never removes its copy
  * (docs/teams.md, "Main check", limits). Those processes ran before any test began, so no check of a test left them.
+ * The list is taken once. A process of that kind that appears during the tests, such as a new SSH login to the same
+ * account, is not in it, and the cases that wait for a copy to be removed then time out.
  */
 
 /** The processes of this account that the census cannot inspect now, by pid and start token. */

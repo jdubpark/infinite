@@ -306,9 +306,9 @@ async function linuxReason(pid: number, uid: number, directory: string): Promise
   const base = `/proc/${pid}`;
   try {
     // /proc shows a process as owned by the user it runs as (its effective user id), also when the process hides its
-    // memory. One that runs as another user is not inspected, unless its status says it can act as this user again:
-    // that one cannot be inspected and is reported, never skipped.
-    if ((await stat(base)).uid !== uid) return await linuxActsAs(base, uid) ? "unreadable" : undefined;
+    // memory. One that runs as another user is not inspected. It is skipped when this user only started it, and
+    // reported as one that cannot be inspected when this user is still its saved or filesystem user id.
+    if ((await stat(base)).uid !== uid) return await linuxRunsAs(base, uid) ? "unreadable" : undefined;
   } catch (error) {
     return isGone(error) ? undefined : "unreadable";
   }
@@ -361,22 +361,25 @@ async function linuxLinks(base: string): Promise<{ paths: { reason: "working-dir
   return { paths, missing, unreadable: refused };
 }
 
-/** `statusActsAs` for a live process. True also when its status cannot be read while the process exists. */
-async function linuxActsAs(base: string, uid: number): Promise<boolean> {
+/** `statusRunsAs` for a live process. True also when its status cannot be read while the process exists. */
+async function linuxRunsAs(base: string, uid: number): Promise<boolean> {
   try {
-    return statusActsAs(await readFile(`${base}/status`, "utf8"), uid);
+    return statusRunsAs(await readFile(`${base}/status`, "utf8"), uid);
   } catch (error) {
     return !isGone(error);
   }
 }
 
 /**
- * True when a Linux process status names `uid` as the effective, saved or filesystem user id: the process acts as that
- * user or can do so again. The real user id alone names who started the process. A set-uid program such as sudo keeps
- * it while it runs as another user, and a host that starts its commands through sudo always has such processes.
+ * True when a Linux process status names `uid` as one of the ids the process runs with: the effective and filesystem
+ * user ids, and the saved one to be safe. The real user id alone names who started the process, and it does not count:
+ * a set-uid program such as sudo keeps it while it runs as another user, and a host that starts its commands through
+ * sudo always has such processes. The rule is what the process runs as now, not what it could become: a process can
+ * take its real user id back, so a set-uid program that the user started is not reported, also when it uses the
+ * directory the census asks about.
  * True also when the text has no Uid line of four numbers, so a process that cannot be classified is reported. Pure.
  */
-export function statusActsAs(status: string, uid: number): boolean {
+export function statusRunsAs(status: string, uid: number): boolean {
   const ids = status.split("\n").find(line => line.startsWith("Uid:"))?.trim().split(/\s+/).slice(1).map(Number) ?? [];
   if (ids.length !== 4 || ids.some(id => !Number.isInteger(id))) return true;
   // The four ids are real, effective, saved and filesystem.

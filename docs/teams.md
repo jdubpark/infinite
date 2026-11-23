@@ -1127,7 +1127,7 @@ These arrive in later steps of the delivery order:
 
 - the standing budget, with `reserve`, `settle`, `status`, the USD limits, the learning floor, and `estimate-unavailable`;
 - pinned guidance, forced knowledge, prompt overrides, and the `gate` purpose;
-- duel judges and the open-duel gate;
+- the open-duel gate. The duel judge and its calibration are built (see [Judge calibration](#judge-calibration));
 - run-level replay and the blind rubric.
 
 ### Eval comparisons
@@ -1156,7 +1156,7 @@ Every task belongs to the dev set or the holdout set. The set belongs to the tas
 
 **What the holdout set keeps back.** It keeps outcomes, not membership. No baseline or compare job runs a trial on a holdout task, so no result of a holdout task exists before a confirm job, and a confirm report holds aggregates only. Which tasks are in the holdout set is not a secret from the owner: a `taskIds` filter, a job's planned count, the `too-few-tasks` refusal, and the counts above each let the owner work it out. The host does not hide it. A `confirm` request admits no task ids and no group ids, so a request cannot name its holdout tasks. The owner can still shape a later confirm list: a confirm list is the first `maxTasks` valid holdout tasks in task id order, and retiring a task removes it from every later list. Retiring is permanent, so it costs the owner that task.
 
-**The calibration read.** A host-internal function returns pairs for the duels design: for one dev task, the newest resolved and the newest unresolved graded trial patch. It admits dev tasks only, returns at most one pair per task and at most 20 pairs per call, and skips a task that has a patch on only one side. It marks the group of each returned task exposed in the same write. A group that left the holdout set is a dev group, so the read can return the patch of a confirm job's trial from that time. No route, command, log line, or event carries a pair. No caller exists yet.
+**The calibration read.** A host-internal function returns pairs for the duels design: for one dev task, the newest resolved and the newest unresolved graded trial patch. It admits dev tasks only, and `isolated` trials only. It returns at most one pair per task and at most 20 pairs per call, and skips a task that has a patch on only one side. It marks the group of each returned task exposed in the same write. A group that left the holdout set is a dev group, so the read can return the patch of a confirm job's trial from that time. No route, command, log line, or event carries a pair. Its caller is the [calibration job](#judge-calibration).
 
 #### Compare and confirm requests
 
@@ -1310,11 +1310,193 @@ A comparison job waits for the same gates as a baseline job, in creation order w
 
 The first start of this version migrates the corpus to version 3 and the trial store to version 2. A host without this version cannot read them. After the migrations ran, an older host reads `eval-corpus` and `eval-trials` as `unavailable`. Capture, mining, validation, and trials then stop until the newer host runs again. So rolling back this version is a step with a cost: stop the host, start the older one, and expect those four to stay stopped. Run the newer host again to resume them. Reports, priors, and subjects exist only in the newer version.
 
+### Judge calibration
+
+A calibration tells the owner how well one judge model picks the better of two patches. The host shows the judge pairs of past dev-set trials, one resolved and one not, and counts how often it prefers the resolved one. The result is a rate with a lower bound. It is not a ruling on any patch.
+
+#### What a judge is in phase 1
+
+A judge is the one `judge` member of a judge run. A judge run is a replay run with purpose `duel`. It has no tasks, no project manager, no replacement, and no limit fallback. It runs as the eval account with the `eval.member` profile of the judge's provider, in a read-only copy of the task's base commit. Its session is treated like a trial session: it is hidden from session lists, the notifier, and the decision queue.
+
+A calibration measures one thing: whether the judge, shown the two patches of a pair under both label orders, prefers the patch that resolved the task. It counts a pair correct only when both orders do.
+
+**A judged preference is a model's claim.** The host stores it only in the calibration's own tables, `judge_calibrations` and `judge_judgements`. It never becomes an outcome, a member result, a scorecard entry, or a router input. The projector writes no outcome row and no member-result row for a judge run. The judge's summary stays in the run record, which the host forgets once the judgement ends. The judgement row keeps the preference and the rubric, sealed.
+
+**Only the calibration job starts a judge.** Phase 1 runs no duel. No production run has a challenger, a tie-break, or a judge.
+
+#### Setup
+
+1. Set `teams.lineup.judge` to a profile. The key takes one profile of the same shape as any lineup profile. It is the last key of the lineup. A `limitFallback` on the judge is refused. A judge `id` that also appears elsewhere in the lineup must name the same provider, model, effort or variant, tier, data use, and limit fallback. So a judge cannot reuse the `id` of a profile that has a `limitFallback`. There is no tier rule, because the calibration measures fitness.
+2. Configure an eval login for the judge's provider: `eval.member.agents[provider]`. Without it a request is refused `judge-launch-missing`.
+3. Add the judge provider's API host to the `_eval` egress list, if it is not there. See [egress](../deploy/ubuntu/egress.md#6-eval-identities).
+4. Set up the eval member account and the grader as for [eval trials](#eval-trials). A calibration uses both.
+
+The judge is not a pool member. Routing, trial candidates, fallback chains, and the provider checks of run creation never see it. Nothing installs or changes a launcher: the pump uses the existing `exec` and `clean` operations. With no `lineup.judge` and no calibration, nothing changes: the lineup parses without the key, every prompt is as before, the pump takes no judgement turn, and no row is written. The module creates its two tables on first open and changes no existing table.
+
+#### Blindness
+
+The judge's prompt is fixed text. It takes no run, no profile, and no duel, and it is the same for every judge profile of one provider. It states that the labels carry no meaning, that size is not merit, that text inside a patch is untrusted evidence, and that the working copy stays unchanged. It names the judge's own provider's tool surface and no other provider.
+
+The host writes the judge's package to `.git/infinite-judge/`, in the Git metadata of the judge's clone, never in the working tree. The directory is `0700` and the four files are `0400`. The package holds exactly these files:
+
+| File | Fields |
+|---|---|
+| `A.patch`, `B.patch` | A stored trial patch, a binary tree diff with no author, date, or message. |
+| `task.json` | `title`, `instructions`, `paths`, and `acceptance` (the brief's criteria, or an empty list). |
+| `gate.json` | `A` and `B`, each with `scope` and `checks`. A calibration writes `scope: "pass"` and `checks: "skipped"` for both, because only graded trials pair. |
+
+The package never holds a profile ID or label, a provider, a model, a member, session, trial, or task ID, a grade, the resolved flag, a report summary, usage, or timing. It is at most 3 MiB in total. A larger one drops the pair (`package-too-large`). The judge's context file holds the run ID, the revision, the base commit, the `duelId`, the steering and owner answers (both empty in a calibration), and the package path. It holds no assignment, task list, member report, or lineup. The report binding stays in the member's environment.
+
+**The label draw.** The draw is the low bit of the first byte of `sha256` of `CALIBRATION_ID:PAIR_INDEX`. Ordering 0 puts the resolved patch in A when the draw is 0. Ordering 1 swaps the labels. Both orderings of a pair share one draw.
+
+**The report.** The judge sends one report of kind `judgement`: the `duelId` from its context file, `preferred` (`A`, `B`, or `tie`), a `rubric` with one score object for each patch, and a `summary` of 1 to 2000 characters. A score object has `correctness`, `cleanliness`, `extensibility`, and `docs`, each a whole number from 1 to 5. The judge may instead send a `question` or a `blocked` report. It sends nothing else: it has no entry tools and cannot plan or edit. The host never infers a preference.
+
+#### The calibration job
+
+The owner starts one with a request. It is finite and it expires.
+
+| Field | Range | Default |
+|---|---|---|
+| `requestId` | 1 to 200 characters. The CLI requires a UUID. | required |
+| `judgeProfileId` | The `id` of `lineup.judge`. | required |
+| `pairs` | 30 to 60. | 36 |
+| `projects` | 1 to 20 distinct project IDs, each with a `team.eval` block. | every project with a `team.eval` block |
+| `judgeMinutes` | 2 to 30. | 10 |
+| `expiresAt` | A time in the future, at most 30 days ahead. | 30 days ahead |
+
+The state needs 30 counted pairs, so a request for exactly 30 fails on its first dropped pair. The default leaves six spare.
+
+**Pair selection.** At creation the host reads pairs through the calibration read: dev-set tasks only, one pair per task, and `isolated` trials only. It goes round-robin over the projects in ID order, a page of up to 20 at a time. It skips a pair when either trial's recorded profile has the judge's provider and model. It keeps up to `pairs` pairs and then orders them by project. The sealed payload stores the pair list and the pair count of each project. With fewer than 30 pairs the request is refused `too-few-pairs` and nothing is stored.
+
+**Refusals.**
+
+| Status | Code | Meaning |
+|---|---|---|
+| 400 | `invalid-calibration-request` | The body is not valid, or `expiresAt` is past or more than 30 days ahead. |
+| 409 | `judge-not-configured` | The host has no `lineup.judge`. |
+| 409 | `judge-profile-mismatch` | `judgeProfileId` is not the configured judge. |
+| 409 | `judge-launch-missing` | The judge's provider has no `eval.member.agents` entry. |
+| 409 | `calibration-active` | Another calibration is running. At most one runs. |
+| 409 | `request-conflict` | The `requestId` was used for a different request. |
+| 409 | `eval-config-incomplete` | A named project has no `team.eval` block. |
+| 409 | `too-few-pairs` | The projects hold fewer than 30 usable pairs for this request. |
+| 404 | `unknown-calibration` | No calibration has this ID (cancel). |
+| 503 | `evidence-unavailable` | The evidence store or the judge module is not ready. |
+
+A repeated request with the same `requestId` and the same body answers with the same calibration. Each refusal has one fixed sentence that echoes no request text, ID, or file name.
+
+**Pins.** At creation the job pins the judge's identity key, its profile epoch, and the judge prompt version. If any of them changes before the job completes, the job ends `cancelled` with reason `identity-changed`, and no state is stored. A cancel from the owner ends it `cancelled` with reason `cancelled`. Passing `expiresAt` ends it `expired` with reason `expired`. A cancelled or expired calibration has no state, no accuracy, no lower bound, and no swap agreement, and it is never in force. A judgement that is live when the job ends is stopped and ends `void-owner`. A halt of the judgement's project does the same.
+
+#### Scoring
+
+The unit is the pair: both orderings of one resolved and one unresolved trial.
+
+| Figure | Meaning |
+|---|---|
+| `counted` | Pairs with a deciding ending on both orderings. A dropped pair is not counted. |
+| `correct` | Pairs whose two orderings both prefer the resolved trial. A tie, a failure, or a wrong pick makes the pair incorrect. |
+| `accuracy` | `correct` over `counted`. |
+| `swapAgreement` | The share of counted pairs whose two orderings prefer the same trial. A tie or a failure never agrees. |
+| `lowerBound` | The lower end of the Wilson score interval at z = 1.96, clamped at 0. |
+
+The state is `ok` when `counted` is at least 30 and `lowerBound` is at least 0.60. Otherwise it is `not-ok`. A completed calibration is valid for 60 days from its completion. The calibration **in force** for a judge is the newest completed `ok` calibration with the same identity key, the current profile epoch, the current prompt version, and a validity that has not ended. A calibration that does not match is not in force, and a completed `not-ok` calibration never is.
+
+`judgeWeight(accuracy)` is `max(0, 2 x accuracy - 1)`. It is defined and tested, and nothing calls it in phase 1.
+
+#### Failures and retries
+
+Every non-void ending decides its ordering. A judge that cannot answer is a judge failure, so a `no-result`, `question`, `blocked`, `permission`, `stalled`, `changed`, `mismatch`, or `timeout` ending scores the pair incorrect, with no retry. A `judged` ending with `tie` is also incorrect.
+
+| Ending | Meaning |
+|---|---|
+| `judged` | The judge sent a valid judgement for this run within `judgeMinutes`, and the working copy was unchanged. |
+| `no-result` | The judge exited without a report. |
+| `question`, `blocked` | The judge sent that report. Nobody answers it. |
+| `permission` | A permission dialog that nobody decided. In a project the permission agent serves, the agent decides a judge's dialog under the owner's delegation, as it does for a trial member. Elsewhere nobody does, and the judgement ends here. |
+| `stalled` | The judge made no progress. |
+| `changed` | The judge sent a judgement, and its working copy had changed. The host checks the working copy only when it accepts a judgement: a judge that edits and then exits or asks ends `no-result` or `question`. |
+| `mismatch` | The report's `duelId` is not this run's. |
+| `timeout` | The judge ran past `judgeMinutes`. |
+| `void-limit` | The provider reported a limit. The calibration waits `provider-limit` until the reset. |
+| `void-host` | A restart, a launcher refusal, a source or package failure, or a lost run. |
+| `void-owner` | The owner cancelled the calibration, or the project was halted. |
+
+A void ending retries the ordering. An ordering gets at most three attempts. After three void attempts the pair is dropped at once, and its other ordering never starts. A pair is also dropped when a patch has expired (`patch-missing`), when the source build skips the task (`source-skipped`), when the judge's workspace is not `isolated` (`not-isolated`), or when the package is too large (`package-too-large`).
+
+**Early end.** The calibration completes as soon as no pair is pending. It also completes early, `not-ok` with reason `pairs-dropped`, as soon as fewer than 30 pairs can still be counted, so it stops spending on a result that cannot be `ok`. A calibration that completes with no pending pair and fewer than 30 counted pairs carries the same reason. The reason tells the owner that the host could not measure the judge, not that the judge measured badly.
+
+**A restart.** The start-up ends a judgement that was `preparing` or `live` as `void-host`, and the ordering retries. It does not drop the pair, because a restart is a host failure. A stop that leaves eval processes alive also ends the judgement `void-host`, and the pump runs the start-up again.
+
+#### Scheduling
+
+A judgement starts only when all of these hold, in this order:
+
+| Gate | Wait |
+|---|---|
+| The project is not halted. | `halt` |
+| The host load is not held. | `host-load` |
+| The eval identity is `ready`, and the judge's provider has an `eval.member.agents` entry. | `eval-identity` |
+| The grader is `ready`. | `grader` |
+| No trial is live. | `another-job` |
+| No judgement is live or preparing. | `another-judgement` |
+| The judge's provider has no active limit. | `provider-limit` |
+| At least four host session slots are free. | `session-slots` |
+
+The calibration job also checks its expiry and its pins first. A calibration has no daily cap: `trialsPerDay` counts trials only.
+
+**One live session.** The eval identity runs one session at a time, shared by trials and judgements. When a trial job and a running calibration are both open, they take turns: after a trial starts, the next start is a judgement, and the reverse. A judgement never starts while a trial is live. After each judgement the pump stops the account's processes, cleans the source, and resets the home before the next start.
+
+**The grader job.** The source build of a judgement names one grader job for each calibration and project, not the calibration. The grader keeps one base bundle for each job, and a bundle holds one project's repository. The job orders its pairs by project for the same reason: the pairs of one project run together. The grader's clean removes every other job's directory, so each change of job streams a bundle again. A calibration alone changes bundles once for each project. While a trial job and a calibration take turns, each turn streams a bundle. That cost is accepted in phase 1.
+
+#### Spend
+
+The owner's request is the budget. One calibration starts at most `2 x pairs x 3` judge sessions (two orderings, at most three attempts each), each at most `judgeMinutes` long. The default of 36 pairs allows 216 sessions. Judge sessions do not count against a project's `trialsPerDay`, and a trial does not count against a calibration. The duel cap of the duels design needs the learning budget, which does not exist yet.
+
+The hourly sweep reads each judge session's tokens and cost from the usage ledger, records them on the judgement row, and then removes the session, about an hour after it ended. A lookup that fails is retried until 24 hours after the judgement ended. The close of a judgement reads no cost. A session the ledger has no usage for is recorded as `none`, never zero. The view's cost sums only what the sweep has recorded, so it is a floor, and it is low until the sweep has run. The sweep also expires a calibration whose expiry has passed. It deletes judgement rows and then calibration rows created more than 365 days ago.
+
+#### Reading results
+
+| Route | Role |
+|---|---|
+| `GET /api/duels/judges` | Owner, controller, or viewer |
+| `POST /api/duels/judges/calibrations` | Owner |
+| `POST /api/duels/judges/calibrations/:id/cancel` | Owner |
+
+The list returns `{ calibrations: [...] }`, newest first, at most 20. A start answers `201` with `{ calibration }`. A cancel answers `200` with the calibration. Cancelling a calibration that already ended changes nothing and returns it. A malformed ID is `404` `unknown-calibration`. A store that is not ready is `503` `evidence-unavailable`.
+
+A view holds `calibrationId`, `profileId`, `profileEpoch`, `promptVersion`, `status` (`running`, `completed`, `cancelled`, or `expired`), `reason`, `state`, `pairs` (`planned`, `counted`, `correct`, and the pair count of each project), `accuracy`, `lowerBound`, `swapAgreement`, `judgeMinutes`, `cost` (`tokens` and `spentUsd`), `createdAt`, `expiresAt`, `completedAt`, `validUntil`, and `inForce`. While a calibration runs, `counted` and `correct` are 0 and its figures are null, because the host writes them when the calibration ends. A view never holds a task, a trial, a patch, a rubric, model text, or the judge's summary.
+
+**Relay devices.** The remote channel serves only the paths that its allow list names, and no rule names `/api/duels/...`. A relay device gets `403` `remote-endpoint-denied` for all three routes. Run the commands from a paired machine CLI.
+
+| Command | Meaning |
+|---|---|
+| `infinite duels calibrate --judge PROFILE_ID [--pairs N] [--project ID[,ID...]] [--judge-minutes N] --request-id UUID [--json]` | Starts a calibration. |
+| `infinite duels judges [--json]` | Lists calibrations. |
+| `infinite duels cancel CALIBRATION [--json]` | Cancels a running calibration. |
+
+The CLI checks the ranges before any call. Each prints three lines for a calibration. A number the host did not measure prints as `unknown`, never zero, and while a calibration runs its pair counts print `unknown`. The cost line says `known spend`, and it prints `USD unknown` when the host has no figure.
+
+```text
+calibration 6f1b7c52-0c1e-4a46-9d0e-2b7a1c9e5d34 judge JUDGE_PROFILE epoch 1 · completed · state ok
+pairs 36 (PROJECT_ID 36) of 36 planned · correct 30 · accuracy 0.833 · lower bound 0.681 · swap agreement 0.917
+in force · judge minutes 10 · known spend 182000 tokens, $24.10 · created CREATED_AT · valid until VALID_UNTIL
+```
+
+`judges` leads with the line `A calibration measures a judge against pairs whose answer is known.` and prints `no calibrations` when none exist. A host without the routes answers `404`, and the CLI says `This host has no duel routes. Upgrade the host first.`
+
+#### Known limits of phase 1
+
+- A calibration has no blocked state and shows no wait reason. While a gate above holds the next judgement, the view shows a running calibration and nothing more.
+- A stop that leaves eval processes alive voids the judgement, and the start-up retries it.
+- The view's spend is a floor.
+- A host failure before any judge session starts (no mirror head, or a source build that ends on an environment cause) ends the attempt `void-host` and uses one of the ordering's three attempts. A trial in the same state uses none. An outage that the identity and grader probes do not see can so end a calibration `pairs-dropped` with no judge session run. Start a new calibration after the outage.
+
 ### Not in this slice
 
 These arrive in later steps of the delivery order:
 
-- a scheduled revalidation. An owner starts one with `revalidate`.
+- a scheduled revalidation. An owner starts one with `revalidate`;
+- the duel policy and its pin, eligibility, the challenger, the budget reservation, the objective gate, the `duels` table and its ledger fields, the tie-break, the position and style monitors, `infinite duels status`, `show`, `pause`, and `resume`, `repo init --duels`, and the client views of duels. Phase 1 runs no duel: only the calibration job starts a judge.
 
 Also not in this slice:
 
@@ -2499,6 +2681,9 @@ Before relying on the detectors unattended, confirm on the target host:
 | Implementer | Build its task in a separate working copy within its owned paths | Result, question, blocker, or explicit escalation request |
 | Integrator | Repair an integrated result after failed checks or review feedback | Repair result within the approved scope |
 | Reviewer | Inspect the integrated change and its evidence without editing it | Approval or changes requested; UI evidence when applicable |
+| Judge | Compare two patches of one task in a read-only copy, blind to who wrote them | A `judgement` report, a question, or a blocker |
+
+The judge is not part of a task run. In this phase only a calibration job starts one (see [Judge calibration](#judge-calibration)).
 
 The workflow keeps planning small. The coordinator may request one batch of
 1–3 read-only scouts from the worker pool, then receives their recorded findings
@@ -2734,6 +2919,12 @@ the deployment's host configuration to use it.
 `objective.evaluator` is on, assess a reviewed revision (see
 [Verdicts](#verdicts)). This example names the reviewer's profile explicitly. See [Intent check](#intent-check) for how the
 list is derived and how a checker is chosen.
+
+`judge` is an optional profile for the blind judge of a calibration (see
+[Judge calibration](#judge-calibration)). It is the last key of the lineup. It is
+not a pool member, so no routing, trial, or fallback chain sees it. A
+`limitFallback` on it is refused, and it has no tier rule. Without the key,
+nothing changes. No production run reads it.
 
 Optional OpenCode workers can be added to `implementers`. OpenCode uses a
 provider-qualified `model` and optional `variant`; it does not accept an

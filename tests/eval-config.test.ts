@@ -142,6 +142,7 @@ test("the trial settings parse with their limits", () => {
 
   assert.equal(learningPurpose("replay"), true);
   assert.equal(learningPurpose("gate"), true);
+  assert.equal(learningPurpose("duel"), true);
   assert.equal(learningPurpose("work"), false);
   assert.equal(learningPurpose(undefined), false);
 });

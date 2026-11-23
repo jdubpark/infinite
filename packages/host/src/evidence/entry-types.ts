@@ -5,10 +5,10 @@ export const ENTRY_KINDS = ["contract", "finding", "blocker", "handoff", "report
 export type EntryKind = typeof ENTRY_KINDS[number];
 export type HostEntryKind = "report" | "integration" | "check" | "direction";
 /**
- * The roles an entry can name as its author. An evaluator never authors one: it has no entry tools, and the host
+ * The roles an entry can name as its author. An evaluator or a judge never authors one: it has no entry tools, and the host
  * writes no report entry for its sealed report. Leaving it out keeps it out of the result types the member tools declare.
  */
-export type EntryAuthorRole = Exclude<TeamRole, "evaluator">;
+export type EntryAuthorRole = Exclude<TeamRole, "evaluator" | "judge">;
 
 /** The plain columns and sealed head of one stored entry. Member text lives only in the sealed body. */
 export type EntryHead = {

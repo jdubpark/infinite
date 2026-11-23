@@ -76,6 +76,7 @@ const REPORT_SAMPLES: Record<TeamReport["kind"], TeamReport> = {
   blocked: { kind: "blocked", summary: "Cannot proceed" },
   "intent-check": { kind: "intent-check", summary: "No gap found", items: [] },
   verdict: { kind: "verdict", result: "met", criteria: [{ id: "c0", state: "met", evidence: [] }] },
+  judgement: { kind: "judgement", duelId: randomUUID(), preferred: "A", rubric: { a: { correctness: 4, cleanliness: 4, extensibility: 4, docs: 4 }, b: { correctness: 3, cleanliness: 3, extensibility: 3, docs: 3 } }, summary: "A meets the criteria." },
 };
 
 test("every report kind reaches member.reported", async () => {

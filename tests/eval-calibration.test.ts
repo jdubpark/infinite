@@ -10,7 +10,7 @@ import { evalTrialsModule, finishTrial, insertCopy, insertTrial, openTrialCounts
 import { configRef, TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
 import type { TrialConfiguration, TrialGrade } from "../packages/host/src/eval-types.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
-import { CALIBRATION_TASKS_SQL, PAIR_TRIAL_SQL, calibrationPairs } from "../packages/host/src/eval-calibration.js";
+import { CALIBRATION_TASKS_SQL, PAIR_TRIAL_SQL, calibrationPairs, readTrialPatch } from "../packages/host/src/eval-calibration.js";
 
 const NOW = "2026-11-14T12:00:00.000Z";
 const PROJECT = "project-1";
@@ -18,8 +18,8 @@ const JOB = "job-1";
 const PROFILE = { id: "profile-1", label: "Trial", provider: "claude", model: "model-x", effort: "high", tier: "strong" } as TeamModelProfile;
 const CONFIGURATION: TrialConfiguration = { profile: PROFILE, guidance: "as-of-base", knowledge: "none" };
 
-function grade(resolved: boolean): TrialGrade {
-  return { ending: "graded", expectedPassed: resolved ? 1 : 0, expectedTotal: 1, guardPassed: true, resolved, overwritten: 0, diff: null, isolation: "isolated" };
+function grade(resolved: boolean, isolation: "isolated" | "none" = "isolated"): TrialGrade {
+  return { ending: "graded", expectedPassed: resolved ? 1 : 0, expectedTotal: 1, guardPassed: true, resolved, overwritten: 0, diff: null, isolation };
 }
 
 type Fixture = { store: EvidenceStore; close: () => void; seq: { n: number } };
@@ -54,14 +54,14 @@ function addTask(f: Fixture, taskId: string, groupId: string | null): void {
 }
 
 /** Adds a final graded trial with a patch; `minute` orders ended_at. */
-function addTrial(f: Fixture, taskId: string, resolved: boolean, patch: Buffer | undefined, minute: number): string {
+function addTrial(f: Fixture, taskId: string, resolved: boolean, patch: Buffer | undefined, minute: number, isolation: "isolated" | "none" = "isolated"): string {
   const trialId = `trial-${f.seq.n++}`;
   const at = new Date(Date.parse(NOW) + minute * 60_000).toISOString();
   f.store.write(tx => {
     insertTrial(tx, { trialId, jobId: JOB, taskId, configRef: configRef(CONFIGURATION), harness: TRIAL_HARNESS_VERSION, slot: f.seq.n, attempt: 0,
       projectId: PROJECT, configuration: CONFIGURATION, keepDays: 365 }, at);
     startTrial(tx, trialId, at);
-    finishTrial(tx, trialId, { grade: grade(resolved), configId: null, profileEpoch: null, sessionId: null, patchKeepDays: 90, patch }, at);
+    finishTrial(tx, trialId, { grade: grade(resolved, isolation), configId: null, profileEpoch: null, sessionId: null, patchKeepDays: 90, patch }, at);
   });
   return trialId;
 }
@@ -176,6 +176,54 @@ test("the hot statements read through an index", () => {
       const details = f.store.read(db => db.all<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)).map(row => row.detail);
       assert.equal(details.some(detail => detail.includes("eval_trials_graded")), true, `${sql.slice(0, 40)} uses eval_trials_graded: ${details.join(" | ")}`);
     }
+  } finally {
+    f.close();
+  }
+});
+
+test("a pair with a non-isolated trial is not returned", () => {
+  const f = ready();
+  try {
+    addGroup(f, "g-mixed", 0);
+    addGroup(f, "g-clean", 0);
+    addTask(f, "t-mixed", "g-mixed");
+    addTask(f, "t-clean", "g-clean");
+    addTrial(f, "t-mixed", true, Buffer.from("r"), 1);
+    addTrial(f, "t-mixed", false, Buffer.from("u"), 2, "none");
+    addTrial(f, "t-clean", true, Buffer.from("r"), 1);
+    addTrial(f, "t-clean", false, Buffer.from("u"), 2);
+    const result = calibrationPairs(f.store, { projectId: PROJECT });
+    assert.deepEqual(result.pairs.map(pair => pair.taskId), ["t-clean"]);
+  } finally {
+    f.close();
+  }
+});
+
+test("a non-isolated resolved trial does not hide an isolated one", () => {
+  const f = ready();
+  try {
+    addGroup(f, "g-a", 0);
+    addTask(f, "t-a", "g-a");
+    const isolated = addTrial(f, "t-a", true, Buffer.from("isolated-resolved"), 1);
+    addTrial(f, "t-a", true, Buffer.from("none-resolved-newer"), 2, "none");
+    addTrial(f, "t-a", false, Buffer.from("u"), 3);
+    const result = calibrationPairs(f.store, { projectId: PROJECT });
+    assert.equal(result.pairs.length, 1);
+    assert.equal(result.pairs[0]!.resolved.trialId, isolated);
+  } finally {
+    f.close();
+  }
+});
+
+test("the patch read returns the stored bytes", () => {
+  const f = ready();
+  try {
+    const bytes = Buffer.from("stored\n\u0000patch");
+    const id = addTrial(f, "t-a", true, bytes, 1);
+    const read = f.store.read(db => readTrialPatch(db, id));
+    assert.equal(read?.length, bytes.length);
+    assert.equal(read?.equals(bytes), true);
+    assert.equal(f.store.read(db => readTrialPatch(db, "unknown")), undefined);
   } finally {
     f.close();
   }

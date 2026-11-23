@@ -3,10 +3,11 @@ import { evalProxyUrl } from "./egress.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { Grader, GraderProbe } from "./eval-grader.js";
 import { type EvalIdentity, type EvalProbe, evalCanaries, repositoryUrl, stopEvalIdentity } from "./eval-identity.js";
-import { EVAL_MODULE, type CapturedPayload, type MinedPayload, type TrialEnding, type TrialConfiguration, type TrialGrade } from "./eval-types.js";
+import { EVAL_MODULE, TRIAL_ENDINGS, type CapturedPayload, type MinedPayload, type TrialEnding, type TrialConfiguration, type TrialGrade } from "./eval-types.js";
 import type { EvalIdentityState } from "./eval-types.js";
 import { type NextTrial, type TrialGates, type TrialJobs } from "./eval-trial-jobs.js";
-import { type TrialSettings } from "./eval-config.js";
+import { trialSettings, type TrialSettings } from "./eval-config.js";
+import { readTrialPatch } from "./eval-calibration.js";
 import { gradeOf, TRIAL_HARNESS_VERSION } from "./eval-trial-rules.js";
 import {
   clearTrialSession, dropTrial, EVAL_TRIALS_MODULE, finishTrial, gradingTrial, insertTrial, liveTrials, readTrial, startTrial, sweepTrials,
@@ -15,6 +16,10 @@ import {
 import { gradeTrial, prepareTrialSource, type SourceResult, type TrialContext } from "./eval-trial.js";
 import { loadTask, type BundleState, type ValidateContext } from "./eval-validate.js";
 import type { HaltService } from "./halt/service.js";
+import { graderJobOf, type JudgeCalibrations, type JudgementOutcome, type NextJudgement } from "./judge-calibration-jobs.js";
+import { clearJudgementSession, judgeSessions, type JudgementCost } from "./judge-store.js";
+import { judgePackage, judgeTaskOf, writeJudgePackage } from "./judge-package.js";
+import { JUDGE_ENDINGS, type JudgeEnding } from "./judge-types.js";
 import type { HostLoadGate } from "./host-load.js";
 import type { Manager } from "./manager.js";
 import type { CostLookup, SessionCost } from "./outcome-cells.js";
@@ -22,7 +27,7 @@ import { readOutcome } from "./outcome-store.js";
 import { outcomeId } from "./outcome-projector.js";
 import type { ProjectSourceService } from "./project-source.js";
 import { inventoryRuntimeProcesses, type RuntimeProcess } from "./team-retirement.js";
-import type { ReplayState } from "./team-replay.js";
+import { replayWorkspace, type ReplayState } from "./team-replay.js";
 import type { TeamService } from "./teams.js";
 import type { TeamModelProfile } from "./team-types.js";
 import { spawnTeamBundle } from "./team-workspace.js";
@@ -44,19 +49,30 @@ export type TrialPumpOptions = {
   /** The usage ledger's cost of a session; a trial's tokens and spend are recorded from it before the session is removed. */
   cost?: CostLookup;
   graderProbe: () => Promise<GraderProbe>; inventory?: () => Promise<RuntimeProcess[]>; now?: () => string;
+  /** The calibration jobs: the pump runs their judgements in the same single live slot as trials. Without it the pump runs trials only. */
+  judgements?: JudgeCalibrations;
+  /** Builds a task's source in the eval account; the default is `prepareTrialSource`. Injected only to run many judgements without many real sources. */
+  prepareSource?: typeof prepareTrialSource;
 };
 
 type ReadyTrial = Extract<SourceResult, { kind: "ready" }>;
 type Trial = Extract<NextTrial, { kind: "trial" }>;
+type JudgementStart = Extract<NextJudgement, { kind: "start" }>;
 /** The trial the pump holds in memory. A restart never sees it: start-up voids every trial row instead. */
-type Live = {
-  trialId: string; jobId: string; taskId: string; projectId: string; configuration: TrialConfiguration; settings: TrialSettings;
+type TrialLive = {
+  kind: "trial"; trialId: string; jobId: string; taskId: string; projectId: string; configuration: TrialConfiguration; settings: TrialSettings;
   source: ReadyTrial; ctx: TrialContext; launchedAt: number; endedSeenAt?: number;
   /** The last session the run reported, kept for a run that is later lost. */
   sessionId?: string;
   /** Stops that failed so far; the third voids the trial. */
   stopFailures?: number;
 };
+/** The judgement the pump holds in memory; its ID is the judge run's ID. Like a trial, it never survives a restart. */
+type JudgementLive = {
+  kind: "judgement"; judgementId: string; calibrationId: string; projectId: string; provider: Provider; judgeMinutes: number;
+  ctx: TrialContext; launchedAt: number; endedSeenAt?: number; sessionId?: string; stopFailures?: number;
+};
+type Live = TrialLive | JudgementLive;
 type Stop = "stopped" | "alive" | "failed";
 
 /** The git ancestry check of ValidateContext. A trial never asks it, so a call is a bug and says so. */
@@ -75,6 +91,8 @@ export class TrialPump {
   /** True while the account may hold what a trial left: rows this process voided, or a stop or clean that has not succeeded yet. */
   private dirty = false;
   private live: Live | undefined;
+  /** The kind of work that started last; with both kinds ready, the other kind goes first. */
+  private lastStart: "trial" | "judgement" | undefined;
   private probed: { at: number; probe: EvalProbe; projectId: string | undefined } | undefined;
   /** Steps to skip before the next trial start, after a source that could not start. */
   private cooldown = 0;
@@ -102,10 +120,12 @@ export class TrialPump {
     try {
       const live = this.live;
       if (live === undefined) return;
-      const state = await this.options.teams().replayState(live.trialId);
+      const state = await this.options.teams().replayState(live.kind === "trial" ? live.trialId : live.judgementId);
       if (state === undefined || this.live !== live) return;
       this.seen(live, state);
-      if (state.phase === "running") await this.checkRunning(live, state);
+      if (state.phase !== "running") return;
+      if (live.kind === "trial") await this.checkRunning(live, state);
+      else await this.checkJudging(live, state);
     } catch {
       // A failed check is repeated on the next tick.
     }
@@ -126,7 +146,7 @@ export class TrialPump {
       const teams = this.options.teams();
       for (const trialId of teams.replayIds()) {
         try {
-          if (this.options.store.read(db => readTrial(db, trialId))?.state === "final") await teams.forgetReplay(trialId);
+          if (this.forgettable(trialId)) await teams.forgetReplay(trialId);
         } catch {
           // One unreadable row or failed removal leaves that run for the next sweep.
         }
@@ -148,8 +168,48 @@ export class TrialPump {
           // One failed row leaves the others to their removal.
         }
       }
+      await this.sweepJudgements(endedBefore, at);
     } catch {
       // The sweep never throws.
+    }
+  }
+
+  /** A run to forget: a final trial, or a final or dropped judgement. A run no row names may belong to another caller, so it stays. */
+  private forgettable(id: string): boolean {
+    if (this.options.store.read(db => readTrial(db, id))?.state === "final") return true;
+    if (this.options.judgements === undefined) return false;
+    const judgement = this.options.store.read(db => db.get<{ state: string }>("SELECT state FROM judge_judgements WHERE judgement_id = ?", id));
+    return judgement?.state === "final" || judgement?.state === "dropped";
+  }
+
+  /** Removes judge sessions ended over an hour ago, cost first, and expires a calibration. Each part fails alone. */
+  private async sweepJudgements(endedBefore: string, at: string): Promise<void> {
+    const judgements = this.options.judgements;
+    if (judgements === undefined) return;
+    try {
+      const ended = this.options.store.read(db => judgeSessions(db, endedBefore, TRIAL_SESSIONS_BATCH));
+      for (const { judgementId, sessionId, endedAt } of ended) {
+        try {
+          const cost = this.costOf(sessionId, endedAt, at);
+          if (cost === "wait") continue;
+          try {
+            await this.options.sessions.remove(sessionId);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+          }
+          const recorded: JudgementCost | undefined = cost === undefined || cost === "none" ? cost : { tokens: cost.tokens, usd: cost.usd, complete: cost.complete };
+          this.options.store.write(tx => clearJudgementSession(tx, judgementId, recorded));
+        } catch {
+          // One failed row leaves the others to their removal.
+        }
+      }
+    } catch {
+      // The next sweep tries again.
+    }
+    try {
+      judgements.sweep();
+    } catch {
+      // A calibration that could not expire is expired by the next sweep.
     }
   }
 
@@ -188,26 +248,48 @@ export class TrialPump {
     if (!this.started && !(await this.startup())) return;
     if (this.live !== undefined) return this.advanceLive(this.live);
     const open = this.openJob();
-    if (open === undefined) return;
+    const judging = this.judging();
+    if (open === undefined && !judging) return;
     if (this.cooldown > 0) {
       this.cooldown -= 1;
       return;
     }
+    for (const turn of this.turns(open !== undefined, judging)) {
+      if (turn === "trial" ? await this.trialTurn(open) : await this.judgementTurn()) {
+        this.lastStart = turn;
+        return;
+      }
+    }
+  }
+
+  /** The kinds of work to ask for, in order, when nothing is live. With both kinds open the turns alternate. */
+  private turns(trialJobOpen: boolean, judging: boolean): ("trial" | "judgement")[] {
+    if (!trialJobOpen) return ["judgement"];
+    if (!judging) return ["trial"];
+    return this.lastStart === "trial" ? ["judgement", "trial"] : ["trial", "judgement"];
+  }
+
+  /** Asks for a trial and starts it. True when a trial started. */
+  private async trialTurn(open: { projectId: string | undefined } | undefined): Promise<boolean> {
+    if (open === undefined) return false;
     const grader = await this.graderState();
     const identity = await this.identityProbe(grader.uid, open.projectId);
     const next = await this.options.jobs.next(this.gates(identity, grader));
-    if (next.kind === "trial") await this.begin(next, identity, grader);
+    if (next.kind !== "trial") return false;
+    await this.begin(next, identity, grader);
+    return true;
   }
 
   /** Before any trial: drops the preparing rows, voids the running ones, and stops, cleans, and resets the account.
    *  A process tries it once. It tries again while a job is open or the account may be unclean, until it succeeds. */
   private async startup(): Promise<boolean> {
     const rows = this.options.store.read(db => liveTrials(db));
+    const judged = this.liveJudgements();
     // The first attempt of a process always runs. Later attempts wait for a job unless this process has something to clean.
     const open = this.openJob();
-    if (this.attempted && !this.dirty && rows.length === 0 && open === undefined) return false;
+    if (this.attempted && !this.dirty && rows.length === 0 && judged.length === 0 && open === undefined && !this.judging()) return false;
     this.attempted = true;
-    if (rows.length > 0) this.dirty = true;
+    if (rows.length > 0 || judged.length > 0) this.dirty = true;
     const at = this.now();
     for (const row of rows) {
       if (row.state === "preparing") {
@@ -220,6 +302,16 @@ export class TrialPump {
       this.options.store.write(tx => finishTrial(tx, row.trialId, this.final(gradeOf({ ending: "void-host", expected: this.expectedOf(row.taskId),
         overwritten: 0, diff: null, isolation: "none" }), null, null, session ?? null), at));
       this.options.jobs.record(row.jobId, "void-host");
+    }
+    // A judgement row left in flight is a host failure, not a verdict: it ends void-host and its ordering retries. A drop would end its pair.
+    for (const { judgementId } of judged) {
+      const session = await this.options.teams().replayState(judgementId).then(state => state?.sessionId, () => undefined);
+      await this.options.teams().endReplay(judgementId, "void-host").catch(() => undefined);
+      try {
+        this.options.judgements?.finish(judgementId, { ending: "void-host", sessionId: session ?? null });
+      } catch {
+        // A row that could not be recorded is voided by the next start-up.
+      }
     }
     const identity = await this.identityProbe(undefined, open?.projectId);
     // An identity that is configured but cannot be probed has not been cleaned. Start-up runs again while a job is open or rows were voided.
@@ -243,6 +335,10 @@ export class TrialPump {
 
   /** The live trial, one step: the run's state decides whether it runs on, ends, or grades. */
   private async advanceLive(live: Live): Promise<void> {
+    return live.kind === "trial" ? this.advanceTrial(live) : this.advanceJudgement(live);
+  }
+
+  private async advanceTrial(live: TrialLive): Promise<void> {
     const teams = this.options.teams();
     const state = await teams.replayState(live.trialId);
     if (state !== undefined) this.seen(live, state);
@@ -263,19 +359,21 @@ export class TrialPump {
       return this.close(live, "void-host", state, stopped);
     }
     if (state.ending === "settled") return this.grade(live, state);
-    return this.close(live, state.ending ?? "void-host", state, stopped);
+    // A trial run never ends with a judge-only ending (judged, changed, mismatch). If one did, the trial is void, not graded.
+    const ending = TRIAL_ENDINGS.find(name => name === state.ending);
+    return this.close(live, ending ?? "void-host", state, stopped);
   }
 
   private seen(live: Live, state: ReplayState): void {
     if (state.sessionId !== undefined) live.sessionId = state.sessionId;
   }
 
-  private async advanceRunning(live: Live, state: ReplayState): Promise<void> {
+  private async advanceRunning(live: TrialLive, state: ReplayState): Promise<void> {
     await this.checkRunning(live, state);
   }
 
   /** The checks of a running member; `advanceLive` and `watch` share them. */
-  private async checkRunning(live: Live, state: ReplayState): Promise<void> {
+  private async checkRunning(live: TrialLive, state: ReplayState): Promise<void> {
     const teams = this.options.teams();
     if (this.jobStatus(live.jobId) === "cancelled" || this.halted(live.projectId)) {
       await teams.endReplay(live.trialId, "void-owner");
@@ -294,7 +392,7 @@ export class TrialPump {
   }
 
   /** The trial's grading: the grader builds the grading commit and runs the focused test, then the trial is final. */
-  private async grade(live: Live, state: ReplayState): Promise<void> {
+  private async grade(live: TrialLive, state: ReplayState): Promise<void> {
     const flagged = this.options.store.write(tx => gradingTrial(tx, live.trialId, this.now()));
     if (!flagged) {
       // A row already in `grading` was left by a step that failed: the trial closes void-host instead of being forgotten.
@@ -326,7 +424,7 @@ export class TrialPump {
   }
 
   /** Ends a trial with `ending`: the stopped account, the final row, the clean, the record, and the run's removal. */
-  private async close(live: Live, ending: TrialEnding, state: ReplayState | undefined, stopped: Stop): Promise<void> {
+  private async close(live: TrialLive, ending: TrialEnding, state: ReplayState | undefined, stopped: Stop): Promise<void> {
     if (stopped === "alive") this.options.jobs.block(live.jobId, "eval-processes-alive");
     if (stopped !== "stopped") {
       this.started = false;
@@ -339,7 +437,7 @@ export class TrialPump {
   }
 
   /** The steps after a trial's row is final: the clean, the record, the run's removal, and the provider limit. */
-  private async afterFinal(live: Live, ending: TrialEnding, state: ReplayState | undefined): Promise<void> {
+  private async afterFinal(live: TrialLive, ending: TrialEnding, state: ReplayState | undefined): Promise<void> {
     if (!(await this.cleanAndScrub())) {
       this.started = false;
       this.dirty = true;
@@ -358,7 +456,7 @@ export class TrialPump {
       attempt: next.attempt, projectId: next.projectId, configuration: next.configuration, keepDays: TRIAL_KEEP_DAYS_DEFAULT,
     }, this.now()));
     if (inserted !== "inserted") return;
-    const ctx = this.contextOf(next, trialId, identity, grader);
+    const ctx = this.contextOf(next, next.settings, trialId, identity, grader);
     if (ctx === undefined) {
       this.options.store.write(tx => dropTrial(tx, trialId));
       this.cooldown = 1;
@@ -366,7 +464,7 @@ export class TrialPump {
     }
     let source: SourceResult;
     try {
-      source = await prepareTrialSource(this.options.store, next.taskId, ctx);
+      source = await (this.options.prepareSource ?? prepareTrialSource)(this.options.store, next.taskId, ctx);
     } catch {
       source = { kind: "environment", cause: "grader-failed" };
     }
@@ -382,7 +480,7 @@ export class TrialPump {
       return;
     }
     this.options.store.write(tx => startTrial(tx, trialId, this.now()));
-    const live: Live = { trialId, jobId: next.jobId, taskId: next.taskId, projectId: next.projectId, configuration: next.configuration,
+    const live: TrialLive = { kind: "trial", trialId, jobId: next.jobId, taskId: next.taskId, projectId: next.projectId, configuration: next.configuration,
       settings: next.settings, source, ctx, launchedAt: Date.now() };
     this.live = live;
     try {
@@ -400,7 +498,172 @@ export class TrialPump {
     }
   }
 
-  private contextOf(next: Trial, trialId: string, identity: EvalProbe, grader: GraderProbe): TrialContext | undefined {
+  private liveJudgements(): { judgementId: string }[] {
+    try {
+      return this.options.judgements?.live() ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  private judging(): boolean {
+    try {
+      return (this.options.judgements?.running().length ?? 0) > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Asks the calibration jobs for a judgement and starts it. True when a judgement started or an answer was recorded. */
+  private async judgementTurn(): Promise<boolean> {
+    const judgements = this.options.judgements;
+    if (judgements === undefined || !this.judging()) return false;
+    const grader = await this.graderState();
+    // The project is known only once a judgement is handed out: the gate probe reuses the last one, and the start probes its own.
+    const gate = await this.identityProbe(grader.uid, this.probed?.projectId);
+    const next = await judgements.next(this.gates(gate, grader));
+    if (next.kind !== "start") return false;
+    const identity = await this.identityProbe(grader.uid, next.projectId);
+    if (identity.state !== "ready") return false;
+    await this.beginJudgement(next, identity, grader);
+    return true;
+  }
+
+  /** Starts a judgement: the row, the two patches, the source, the package, and the run. Only with no live work. */
+  private async beginJudgement(start: JudgementStart, identity: EvalProbe, grader: GraderProbe): Promise<void> {
+    const judgements = this.options.judgements;
+    if (judgements === undefined || this.live !== undefined) return;
+    if (judgements.begin(start) !== "inserted") return;
+    const id = start.judgementId;
+    const dropped = (reason: Extract<JudgementOutcome, { dropped: string }>["dropped"]) => judgements.finish(id, { dropped: reason });
+    try {
+      const { resolved, unresolved } = this.options.store.read(db => ({
+        resolved: readTrialPatch(db, start.resolvedTrialId), unresolved: readTrialPatch(db, start.unresolvedTrialId) }));
+      if (resolved === undefined || unresolved === undefined) return dropped("patch-missing");
+      const project = this.options.config.projects.find(item => item.id === start.projectId);
+      const found = trialSettings(project);
+      // The context's job names the grader's job directory and its bundle, never the calibration.
+      const graderJob = graderJobOf(start.calibrationId, start.projectId);
+      const ctx = "settings" in found ? this.contextOf({ projectId: start.projectId, jobId: graderJob }, found.settings, id, identity, grader) : undefined;
+      if (ctx === undefined) {
+        this.cooldown = 1;
+        return judgements.finish(id, { ending: "void-host", sessionId: null });
+      }
+      const source = await (this.options.prepareSource ?? prepareTrialSource)(this.options.store, start.taskId, ctx);
+      if (source.kind === "skip") return dropped("source-skipped");
+      if (source.kind === "environment") {
+        this.cooldown = 1;
+        if (source.cause === "eval-processes-alive" || source.cause === "grader-processes-alive") {
+          this.dirty = true;
+          this.started = false;
+        }
+        return judgements.finish(id, { ending: "void-host", sessionId: null });
+      }
+      // From here the account holds the source, so every way out cleans it.
+      const files = source.isolation === "isolated" ? judgePackage({
+        a: { patch: start.resolvedIsA ? resolved : unresolved, gate: { scope: "pass", checks: "skipped" } },
+        b: { patch: start.resolvedIsA ? unresolved : resolved, gate: { scope: "pass", checks: "skipped" } },
+        task: judgeTaskOf(source.capsule),
+      }) : undefined;
+      if (files === undefined) {
+        judgements.finish(id, { dropped: source.isolation === "isolated" ? "package-too-large" : "not-isolated" });
+        return await this.cleanAfterJudgement();
+      }
+      try {
+        // The writer refuses a linked path, so it gets the path the judge run will use: below the trials root's real path.
+        await writeJudgePackage(replayWorkspace(`${ctx.root}/trials`, source.workspace), files, this.options.identity.teamPrefix());
+      } catch {
+        judgements.finish(id, { ending: "void-host", sessionId: null });
+        return await this.cleanAfterJudgement();
+      }
+      const live: JudgementLive = { kind: "judgement", judgementId: id, calibrationId: start.calibrationId, projectId: start.projectId,
+        provider: start.profile.provider, judgeMinutes: start.judgeMinutes, ctx, launchedAt: Date.now() };
+      this.live = live;
+      try {
+        await this.options.teams().createForReplay({ purpose: "duel", trialId: id, jobId: start.calibrationId, projectId: start.projectId,
+          profile: start.profile, baseCommit: source.baseCommit, workspace: source.workspace, steering: [], ownerAnswers: [],
+          judgeMinutes: start.judgeMinutes });
+        judgements.launched(id, null);
+      } catch {
+        await this.options.teams().endReplay(id, "void-host").catch(() => undefined);
+        await this.closeJudgement(live, "void-host", undefined, "stopped");
+      }
+    } catch {
+      // An unexpected failure records the judgement void-host; a row that cannot be recorded is left to the start-up.
+      try {
+        judgements.finish(id, { ending: "void-host", sessionId: null });
+      } catch {
+        // The start-up voids a row left preparing.
+      }
+      this.live = undefined;
+      this.dirty = true;
+      this.started = false;
+    }
+  }
+
+  private async cleanAfterJudgement(): Promise<void> {
+    if (!(await this.cleanAndScrub())) {
+      this.started = false;
+      this.dirty = true;
+    }
+  }
+
+  /** The live judgement, one step: the run's state decides whether it runs on or ends. */
+  private async advanceJudgement(live: JudgementLive): Promise<void> {
+    const state = await this.options.teams().replayState(live.judgementId);
+    if (state !== undefined) this.seen(live, state);
+    if (state === undefined) return this.closeJudgement(live, "void-host", undefined, await this.stop(live));
+    if (state.phase === "running") return this.checkJudging(live, state);
+    if (!state.sessionExited) {
+      live.endedSeenAt ??= Date.now();
+      if (Date.now() - live.endedSeenAt < EVAL_STOPPING_MS) return;
+    }
+    const stopped = await this.stop(live);
+    if (stopped === "failed" && (live.stopFailures = (live.stopFailures ?? 0) + 1) < STOP_TRIES) return;
+    // Only an ending a judge run can have is kept: a trial-only ending or `settled` voids the judgement.
+    const ending = JUDGE_ENDINGS.find(name => name === state.ending) ?? "void-host";
+    return this.closeJudgement(live, stopped === "stopped" ? ending : "void-host", state, stopped);
+  }
+
+  /** The checks of a running judge: its calibration ending, a halted project, the judge's time, and the launch limit. */
+  private async checkJudging(live: JudgementLive, state: ReplayState): Promise<void> {
+    const teams = this.options.teams();
+    if (!this.options.judgements?.running().includes(live.calibrationId) || this.halted(live.projectId)) {
+      await teams.endReplay(live.judgementId, "void-owner");
+      return;
+    }
+    if (state.memberStartedAt !== undefined) {
+      if (Date.now() - Date.parse(state.memberStartedAt) > live.judgeMinutes * 60_000) await teams.endReplay(live.judgementId, "timeout");
+      return;
+    }
+    if (Date.now() - live.launchedAt > TRIAL_LAUNCH_MS) await teams.endReplay(live.judgementId, "void-host");
+  }
+
+  /** Ends a judgement: the record, the clean, the run's removal, then the live slot. The sweep reads the session's cost, before it removes the session. */
+  private async closeJudgement(live: JudgementLive, ending: JudgeEnding, state: ReplayState | undefined, stopped: Stop): Promise<void> {
+    if (stopped !== "stopped") {
+      this.started = false;
+      this.dirty = true;
+    }
+    const sessionId = state?.sessionId ?? live.sessionId ?? null;
+    // A judged ending with no judgement has nothing to count.
+    const judgement = ending === "judged" ? state?.judgement : undefined;
+    const final: JudgeEnding = ending === "judged" && judgement === undefined ? "void-host" : ending;
+    try {
+      this.options.judgements?.finish(live.judgementId, { ending: final, sessionId, ...(judgement === undefined ? {} : { judgement }) });
+    } catch {
+      // The row stays live and would hold every later judgement. The next step runs the start-up again, which voids it.
+      this.started = false;
+      this.dirty = true;
+    }
+    await this.cleanAfterJudgement();
+    await this.options.teams().forgetReplay(live.judgementId).catch(() => false);
+    if (final === "void-limit") this.limit(live.provider, state?.resetsAt);
+    this.live = undefined;
+  }
+
+  private contextOf(next: { projectId: string; jobId: string }, settings: TrialSettings, trialId: string, identity: EvalProbe,
+    grader: GraderProbe): TrialContext | undefined {
     const { config, source } = this.options;
     try {
       const project = config.projects.find(item => item.id === next.projectId);
@@ -411,7 +674,7 @@ export class TrialPump {
       const prefix = config.teams?.commandPrefix;
       this.bundle.spawn = () => spawnTeamBundle(mirror, branch, prefix);
       return {
-        jobId: next.jobId, projectId: next.projectId, settings: next.settings, grader: this.options.grader,
+        jobId: next.jobId, projectId: next.projectId, settings, grader: this.options.grader,
         graderRoot: config.eval?.grader?.root ?? "", uid: grader.uid ?? -1, mirror, mirrorHead: status.mirrorHead, git: NO_ANCESTRY,
         halted: () => this.halted(next.projectId), inventory: this.inventory, now: this.now, bundle: this.bundle,
         trialId, identity: this.options.identity, evalUid: identity.uid ?? -1, probe: identity, root: config.eval?.member?.root ?? "",

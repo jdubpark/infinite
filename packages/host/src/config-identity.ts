@@ -3,6 +3,7 @@ import { basename } from "node:path";
 import { canonicalJson } from "./evidence/crypto.js";
 import { intentCheckerPrompt } from "./intent-prompt.js";
 import { evaluatorPrompt } from "./verdict-prompt.js";
+import { judgePrompt } from "./judge-prompt.js";
 import type { CriteriaRow } from "./verdict-types.js";
 import type { ObjectivePrompt } from "./objective-digest.js";
 import { profileIdentity } from "./run-events.js";
@@ -168,6 +169,7 @@ export function renderedPrompts(role: TeamMember["role"], provider: Provider, pr
   const command = reportCommand();
   if (role === "intent-checker") return [memberLaunchPrompt(intentCheckerPrompt(provider, profile), provider, codeMode).split(command).join("<report-command>")];
   if (role === "evaluator") return [memberLaunchPrompt(evaluatorPrompt(provider, profile), provider, codeMode).split(command).join("<report-command>")];
+  if (role === "judge") return [memberLaunchPrompt(judgePrompt(provider), provider, codeMode).split(command).join("<report-command>")];
   const entry = entryCommand();
   return FIXTURES.map(({ run: plain, work }) => {
     const run = objectiveFixture(plain, objectiveDigest);
@@ -188,6 +190,11 @@ export function promptVersion(role: TeamMember["role"], provider: Provider, prof
   if (promptCache.size >= PROMPT_CACHE_LIMIT) promptCache.delete(promptCache.keys().next().value!);
   promptCache.set(key, version);
   return version;
+}
+
+/** The judge's prompt version. The judge prompt takes no profile, so every judge profile of one provider shares it. */
+export function judgePromptVersion(provider: Provider): string {
+  return promptVersion("judge", provider, undefined, false);
 }
 
 /**

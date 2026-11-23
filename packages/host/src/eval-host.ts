@@ -13,6 +13,9 @@ import { readPriors } from "./eval-priors.js";
 import { rotateHoldout } from "./eval-sets.js";
 import { EVAL_TRIALS_MODULE, evalTrialsModule, trialsSince } from "./eval-trial-store.js";
 import { TrialPump, type TrialTeams } from "./eval-trial-pump.js";
+import { JudgeCalibrations } from "./judge-calibration-jobs.js";
+import { JUDGE_MODULE, judgeCalibrationsModule } from "./judge-store.js";
+import { judgeRoutes } from "./judge-routes.js";
 import { mineGit, type MineGit } from "./eval-mine-git.js";
 import { Miner } from "./eval-miner.js";
 import { evalRoutes } from "./eval-routes.js";
@@ -89,6 +92,8 @@ export class EvalHost implements EvalHostApi {
   private readonly evalJobs: EvalJobs;
   private readonly trialJobs: TrialJobs;
   private readonly comparison: ComparisonPass;
+  /** The judge calibration jobs, owned here so the routes and the pump share one. */
+  private readonly judgements: JudgeCalibrations;
   /** The baseline trial pump, one step after each validation step. Undefined without `teams` and `sessions`. */
   private readonly trials: TrialPump | undefined;
   /** Owned by this pump across tasks: the job last streamed and its digest. */
@@ -121,6 +126,8 @@ export class EvalHost implements EvalHostApi {
     this.miner = new Miner({ config: this.config, store: this.store, source: this.source, git: this.git, runs: options.runs, now: this.now });
     // The trial tables. Nothing else registers them, and every trial job, trial, and count below writes to them.
     this.store.register(evalTrialsModule(this.store, this.now));
+    this.store.register(judgeCalibrationsModule(this.store, this.now));
+    this.judgements = new JudgeCalibrations({ store: this.store, config: this.config, now: this.now });
     this.trialJobs = new TrialJobs({ store: this.store, config: this.config, now: this.now });
     this.comparison = new ComparisonPass({ store: this.store, config: this.config, now: this.now });
     this.evalJobs = new EvalJobs({
@@ -132,7 +139,7 @@ export class EvalHost implements EvalHostApi {
       config: this.config, store: this.store, jobs: this.trialJobs,
       grader: this.grader, identity, teams: options.teams, sessions: options.sessions, source: this.source, hostLoad: this.hostLoad,
       halt: this.halt, graderProbe: () => this.grader.probe(this.canaries()).catch((): GraderProbe => ({ state: "unavailable" })),
-      inventory: this.inventory, now: this.now, cost: options.cost,
+      inventory: this.inventory, now: this.now, cost: options.cost, judgements: this.judgements,
     }) : undefined;
   }
 
@@ -162,11 +169,13 @@ export class EvalHost implements EvalHostApi {
     try { this.store.tryWrite(tx => { sweepGroups(tx); }); } catch { /* an unavailable store sweeps nothing */ }
     try { this.evalJobs.sweep(); } catch { /* an unavailable store sweeps nothing */ }
     try { if (this.ready()) this.store.tryWrite(tx => { rotateHoldout(tx, this.now()); }); } catch { /* an unavailable store rotates nothing */ }
+    if (this.trials === undefined) try { if (this.judgeReady()) this.judgements.sweep(); } catch { /* an unavailable store sweeps nothing */ }
     void this.trials?.sweep();
   }
 
   routes(app: express.Express, readGuard: express.RequestHandler, ownerGuard: express.RequestHandler): void {
     evalRoutes(app, { host: this }, readGuard, ownerGuard);
+    judgeRoutes(app, { judgements: this.judgements, ready: () => this.judgeReady() }, readGuard, ownerGuard);
   }
 
   /** Resolves when the capture, the miner, and the validation pass in flight have ended. */
@@ -437,6 +446,15 @@ export class EvalHost implements EvalHostApi {
   private trialViews(db: EvidenceDb, rows: readonly EvalJobRow[]): Map<string, EvalJobView> {
     if (rows.length > 0 && !this.trialsReady()) throw new EvidenceError("unavailable", "The trials module is not ready.");
     return this.trialJobs.views(db, rows);
+  }
+
+  /** The judge tables read the corpus and the trials, so all three modules must be ready. */
+  private judgeReady(): boolean {
+    try {
+      return this.ready() && this.trialsReady() && this.store.status().modules[JUDGE_MODULE] === "ready";
+    } catch {
+      return false;
+    }
   }
 
   private trialsReady(): boolean {

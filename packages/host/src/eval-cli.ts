@@ -12,6 +12,7 @@ import {
 } from "./eval-types.js";
 
 type Options = Record<string, string | boolean>;
+export { handleDuelClientCommand } from "./duel-cli.js";
 export type EvalApi = { json<T = unknown>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T> };
 
 const USAGE = "Usage: infinite eval status PROJECT [--json] | infinite eval run PROJECT --file job.json --request-id UUID [--json] | infinite eval job JOB [--json] | infinite eval pause|resume|cancel JOB | infinite eval retire TASK | infinite eval report JOB [--json] | infinite eval priors PROJECT [--json]";

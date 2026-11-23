@@ -60,7 +60,7 @@ import { TeamRecovery, automaticOperationRecoveryCodes, deliveryBranchMatches, d
 import { planRunObjective, runObjectiveNote, runObjectiveView, steerRunObjective, type ObjectiveUnavailable } from "./objective-runs.js";
 import { TeamIntent, type GoalRecordPort, type IntentCheckState } from "./team-intent.js";
 import { TeamRegister, objectivePromptOf, registerPin, type RegisterState } from "./team-register.js";
-import { TeamReplay, type ReplayCreate, type ReplayState } from "./team-replay.js";
+import { TeamReplay, type JudgeCreate, type ReplayCreate, type ReplayState } from "./team-replay.js";
 import { autonomyStartEvent, intentCheckPin, startMode, verdictPin } from "./evaluator-profiles.js";
 import { TeamVerdicts, type VerdictState } from "./team-verdicts.js";
 export { TeamError } from "./team-workspace.js";
@@ -243,7 +243,7 @@ const automaticRecoveryCodes = new Set(["agent-blocked", "agent-question", "miss
 function roleAcceptsReport(role: TeamMember["role"], kind: NonNullable<TeamMember["report"]>["kind"]) {
   const expected: Record<TeamMember["role"], string[]> = {
     "permission-coordinator": ["permission-decision"], "project-manager": ["plan", "explore", "no-change"], scout: ["findings"],
-    implementer: ["result", "escalate"], integrator: ["result"], reviewer: ["review"], delivery: ["delivery", "delivery-repair", "delivery-reconciliation", "pull-request"], "intent-checker": ["intent-check"], evaluator: ["verdict"],
+    implementer: ["result", "escalate"], integrator: ["result"], reviewer: ["review"], delivery: ["delivery", "delivery-repair", "delivery-reconciliation", "pull-request"], "intent-checker": ["intent-check"], evaluator: ["verdict"], judge: ["judgement"],
   };
   return kind === "question" || kind === "blocked" || expected[role].includes(kind);
 }
@@ -367,7 +367,9 @@ export class TeamService {
   private fuse?: FuseGate;
   private missionReservations?: MissionReservationLookup;
   private readonly limits: ProviderLimits;
-  private readonly replays = new TeamReplay({ config: () => this.config, emit: (s, k, keys, ids, data) => this.emit(s as Stored, k, keys, ids, data), save: s => this.save(s as Stored), cancel: s => this.enqueue(() => this.stopRun(s as Stored, "cancel")), sessionStatus: async id => (await this.manager.state(id).catch(() => undefined))?.status, activeMember });
+  private readonly replays = new TeamReplay({ config: () => this.config, emit: (s, k, keys, ids, data) => this.emit(s as Stored, k, keys, ids, data), save: s => this.save(s as Stored), cancel: s => this.enqueue(() => this.stopRun(s as Stored, "cancel")), sessionStatus: async id => (await this.manager.state(id).catch(() => undefined))?.status, activeMember,
+    prepare: (s, o, p) => this.prepareMember(s as Stored, "judge", undefined, undefined, o, p),
+    operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m) });
   private readonly intentChecks = new TeamIntent({ prepare: (s, r, f, o, p) => this.prepareMember(s as Stored, r, undefined, f, o, p), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t), block: (s, e, m) => this.block(s as Stored, e, m), project: run => this.config.projects.find(project => project.id === run.projectId), limited: () => this.limits.limited(), prefix: () => this.config.teams?.commandPrefix });
   private readonly objectiveTests = new TeamRegister({ holder: id => this.records.get(id), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], workspace: s => { try { this.assertRunPath(s as Stored, s.run.workspace); return s.run.workspace; } catch { return undefined; } }, enqueue: work => this.enqueue(work), save: s => this.save(s as Stored), event: (s, text) => this.event(s as Stored, text), prefix: () => this.config.teams?.commandPrefix, now: timestamp });
   readonly verdicts = new TeamVerdicts({ holder: id => this.records.get(id), prepare: (s, o, p) => this.prepareMember(s as Stored, "evaluator", undefined, undefined, o, p), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t), emit: (s, d) => this.emitWith(s as Stored, "verdict.recorded", [d.verdictId], { revision: s.run.revision }, () => d), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], limited: () => this.limits.limited(), prefix: () => this.config.teams?.commandPrefix, register: this.objectiveTests, now: timestamp, uuid: randomUUID });
@@ -985,10 +987,10 @@ export class TeamService {
   objectiveRecord(id: string, version?: number) { return runObjectiveView(this.visible(id), version); }
   private visible(id: string) { const stored = this.record(id); if (stored.run.replay) throw new TeamError(404, "team-not-found", "This team does not exist."); return stored; }
   private prefixFor(run: TeamRun) { return this.replays.prefixFor(run, this.config.teams?.commandPrefix); }
-  createForReplay(input: ReplayCreate): Promise<{ runId: string }> { return this.enqueue(() => {
+  createForReplay(input: ReplayCreate | JudgeCreate): Promise<{ runId: string }> { return this.enqueue(() => {
     const existing = this.records.get(input.trialId); if (existing) return { runId: existing.run.id };
     const stored: Stored = { run: this.replays.seed(input, timestamp()), fingerprint: digest(input), receipts: {}, prepared: true, root: this.replays.root() };
-    this.records.set(stored.run.id, stored); this.replays.created(stored, input.features); this.save(stored); return { runId: stored.run.id }; }); }
+    this.records.set(stored.run.id, stored); this.replays.created(stored, input); this.save(stored); return { runId: stored.run.id }; }); }
   replayState(trialId: string): Promise<ReplayState | undefined> { return this.enqueue(() => this.replays.state(this.records.get(trialId))); }
   endReplay(trialId: string, ending: "timeout" | "void-owner" | "void-host"): Promise<void> { return this.enqueue(() => { const stored = this.records.get(trialId); if (stored?.run.replay) this.replays.end(stored, ending); }); }
   forgetReplay(trialId: string): Promise<boolean> { return this.enqueue(async () => { const stored = this.records.get(trialId); if (!stored) return true; if (!stored.run.replay || !this.replays.forgettable(stored)) return false; await this.retention.deleteRecord(stored, true); this.records.delete(trialId); return true; }); }
@@ -2537,8 +2539,10 @@ export class TeamService {
       if (!trackingReady) return;
       // A recorded answer creates one replacement only after the original has confirmed exit.
       for (const decision of run.decisions.filter(item => item.revision === run.revision && item.answer)) {
-        const prior = run.members.find(member => member.memberId === decision.memberId)!;
-        if (prior.status !== "waiting") continue;
+        const prior = run.members.find(member => member.memberId === decision.memberId);
+        // A replay run holds its capsule's answers as decisions of no member. In any other run such a decision is a broken record.
+        if (prior === undefined && !run.replay) throw new TeamError(409, "decision-member-missing", "A team decision names a member its run does not hold.");
+        if (prior?.status !== "waiting") continue;
         // An answered scout or implementer keeps waiting, answer intact, until a worker slot frees under the current limit.
         if ((prior.role === "scout" || prior.role === "implementer") && run.members.filter(member => holdsWorkerSlot(member, run.revision)).length >= run.parallelism) continue;
         const answeredBy = decisionAnswerLabel(decision);
@@ -2572,7 +2576,7 @@ export class TeamService {
       const reconciledBaseline = run.deliveryRecovery?.status === "replanning" && run.deliveryRecovery.revision === run.revision &&
         Boolean(run.deliveryRecovery.integratedHeadCommit) && run.deliveryRecovery.integratedHeadCommit === run.headCommit;
       if (!run.tasks.length && !reconciledBaseline) {
-        if (this.intentChecks.step(stored) || this.verdicts.step(stored)) return;
+        if (this.intentChecks.step(stored) || this.verdicts.step(stored) || this.replays.judgeStep(stored)) return;
         if (run.members.some(member => member.revision === run.revision && member.role === "project-manager" && member.status === "waiting")) { run.status = "needs-input"; this.save(stored); return; }
         this.prepareMember(stored, "project-manager"); return;
       }
@@ -2888,7 +2892,7 @@ export class TeamService {
       member.prompt = teamPrompt(run, role, task, feedback, member.provider ?? run.provider, member.modelProfile,
         this.config.projects.find(project => project.id === run.projectId)?.team, this.permissionRecoveryHistory(run), this.publishHeadsEnabled());
     }
-    if (role !== "permission-coordinator") run.status = role === "project-manager" || role === "intent-checker" ? "planning" : role === "scout" ? "discovering" : role === "reviewer" || role === "evaluator" ? "reviewing" : role === "delivery" ? "delivering" : role === "integrator" ? "integrating" : "implementing";
+    if (role !== "permission-coordinator") run.status = role === "project-manager" || role === "intent-checker" ? "planning" : role === "scout" ? "discovering" : role === "reviewer" || role === "evaluator" || role === "judge" ? "reviewing" : role === "delivery" ? "delivering" : role === "integrator" ? "integrating" : "implementing";
     this.operation(stored, "member", async signal => {
       this.assertRunPath(stored, run.workspace);
       if (continuationHead) await assertMemberReadOnly(run.workspace, continuationHead.headCommit, this.config.teams?.commandPrefix, signal, "integration");
@@ -2897,7 +2901,7 @@ export class TeamService {
       if (continuationHead) await assertMemberReadOnly(run.workspace, continuationHead.headCommit, this.config.teams?.commandPrefix, signal, "integration");
       // Bootstrap dependencies exist only after the first implementation. A failed
       // setup must not prevent the integrator from repairing the project.
-      const setup = role === "permission-coordinator" || role === "intent-checker" || role === "evaluator" ? undefined : run.establishChecks
+      const setup = role === "permission-coordinator" || role === "intent-checker" || role === "evaluator" || role === "judge" ? undefined : run.establishChecks
         ? role === "reviewer" ? run.verification?.setup : undefined
         : this.config.projects.find(project => project.id === run.projectId)!.team!.setup;
       if (setup) {
@@ -2986,10 +2990,10 @@ export class TeamService {
         this.save(stored);
       }
       const configuredProject = stored.run.handoff?.project ?? this.config.projects.find(project => project.id === stored.run.projectId)?.team;
-      const intentContext = member.role === "intent-checker" ? this.intentChecks.context(stored, member) : member.role === "evaluator" ? this.verdicts.context(stored, member) : undefined; if (intentContext === null) return;
+      const intentContext = member.role === "intent-checker" ? this.intentChecks.context(stored, member) : member.role === "evaluator" ? this.verdicts.context(stored, member) : member.role === "judge" ? this.replays.judgeContext(stored, member) : undefined; if (intentContext === null) return;
       const launchSeq = this.options?.entries?.launchMark(stored.run.id);
       const digest = intentContext ? undefined : this.options?.entries?.memberDigest(stored.run, member, launchSeq);
-      const contextBytes = await writeTeamContext(member.cwd, { ...(intentContext ?? teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run))), ...(digest ? { entries: digest } : {}), assignment: assignment(member, true), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.prefixFor(run));
+      const contextBytes = await writeTeamContext(member.cwd, { ...(intentContext ?? teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run))), ...(digest ? { entries: digest } : {}), ...(member.role === "judge" ? {} : { assignment: assignment(member, true) }), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.prefixFor(run));
       this.options?.entries?.recordLaunch(stored.run, member, { launchSeq, promptBytes: Buffer.byteLength(member.prompt, "utf8"), contextBytes, digestBytes: digest ? Buffer.byteLength(canonicalJson(digest), "utf8") : 0 });
     }
     // The launch is charged once, right before its session starts. A member whose session exists is a replay.

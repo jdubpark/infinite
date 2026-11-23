@@ -44,7 +44,11 @@ export interface ExecutionState {
 /** Why a team session exists. Only the host sets it, through createTeamSession. */
 export type SessionPurpose = "work" | "duel" | "replay" | "gate";
 export const SESSION_PURPOSES: readonly SessionPurpose[] = ["work", "duel", "replay", "gate"];
-export const LEARNING_PURPOSES: readonly SessionPurpose[] = ["replay", "gate"];
+/**
+ * The purposes whose sessions run as the eval identity: the eval agent profile, `_eval` egress, Code Mode off, and no injected context.
+ * Phase 2 of duels gives a production challenger the purpose `duel`, so before that ships the eval identity must be chosen by a rule apart from the purpose.
+ */
+export const LEARNING_PURPOSES: readonly SessionPurpose[] = ["replay", "gate", "duel"];
 export function learningPurpose(purpose: SessionPurpose | undefined): boolean {
   return purpose !== undefined && LEARNING_PURPOSES.includes(purpose);
 }

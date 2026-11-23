@@ -1124,7 +1124,7 @@ function validTeamPermissionExpansion(request: TeamPermissionExpansionRequest) {
     request.targetSessionId === session.id &&
     /^[a-f0-9-]{36}$/i.test(assignment.runId) && /^[a-f0-9-]{36}$/i.test(assignment.memberId) &&
     Number.isInteger(assignment.revision) && assignment.revision > 0 &&
-    ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker", "evaluator"].includes(assignment.role) &&
+    ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker", "evaluator", "judge"].includes(assignment.role) &&
     (assignment.taskId === undefined || typeof assignment.taskId === "string") &&
     Number.isInteger(screen.promptId) && screen.promptId >= 1 &&
     /^[a-f0-9]{64}$/i.test(screen.promptHash) && /^[a-f0-9]{64}$/i.test(screen.evidenceHash) &&
@@ -1381,7 +1381,7 @@ function validTeamAnswer(request: TeamAnswerRequest) {
     /^[a-f0-9-]{36}$/i.test(assignment.runId) &&
     /^[a-f0-9-]{36}$/i.test(assignment.memberId) &&
     Number.isInteger(assignment.revision) && assignment.revision > 0 &&
-    ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker", "evaluator"].includes(assignment.role) &&
+    ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker", "evaluator", "judge"].includes(assignment.role) &&
     (assignment.taskId === undefined || typeof assignment.taskId === "string") &&
     typeof request.targetCwd === "string" && request.targetCwd.length > 0 && request.targetCwd.length <= 4096 &&
     Number.isInteger(Date.parse(request.expiresAt)) && /^[a-f0-9]{64}$/i.test(request.policyHash) &&

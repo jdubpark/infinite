@@ -14,6 +14,7 @@ import { evalCorpusModule } from "../packages/host/src/eval-store.js";
 import { TrialJobs } from "../packages/host/src/eval-trial-jobs.js";
 import { TrialPump, type TrialTeams } from "../packages/host/src/eval-trial-pump.js";
 import { EVAL_TRIALS_MODULE, evalTrialsModule, finishTrial, insertTrial, startTrial } from "../packages/host/src/eval-trial-store.js";
+import { ComparisonPass } from "../packages/host/src/eval-comparison.js";
 import { EvalHost } from "../packages/host/src/eval-host.js";
 import type { CostLookup } from "../packages/host/src/outcome-cells.js";
 import { configRef, TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
@@ -505,6 +506,63 @@ test("the pump opens a comparison job", async () => {
     await r.pump.step();
     const fetched = r.probeInputs.map(input => input.fetchUrl).filter(url => url !== undefined);
     assert.ok(fetched.some(url => url?.includes("example/app")), "the probe names the compare job's project");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("the identity status keeps the last probe once it has aged out", async t => {
+  const r = rig({ probes: [{ state: "misconfigured" }] });
+  try {
+    assert.deepEqual(r.pump.identityStatus(), { state: "unavailable", lastProbe: null }, "no probe has happened");
+    r.addJob();
+    await r.pump.step();
+    assert.equal(r.probeInputs.length, 1, "one probe");
+    assert.equal(r.pump.identityStatus().state, "misconfigured", "a fresh probe is the state");
+    assert.equal(r.pump.identityStatus().lastProbe, undefined);
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 11 * 60_000 });
+    const aged = r.pump.identityStatus();
+    assert.equal(aged.state, "unavailable", "scheduling still sees an unavailable identity");
+    assert.equal(aged.lastProbe?.state, "misconfigured");
+    assert.match(aged.lastProbe?.at ?? "", /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
+    assert.equal(r.pump.identityState(), "unavailable");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("the sweep ends an idle paused job past its expiry and leaves an unexpired one paused", async () => {
+  let clock = Date.parse("2026-11-16T10:00:00.000Z");
+  const r = rig({ clock: () => new Date(clock).toISOString() });
+  try {
+    const jobId = r.addJob();
+    r.store.write(tx => {
+      tx.run("UPDATE eval_jobs SET status = 'paused', reason = 'owner', expires_at = ? WHERE job_id = ?", new Date(clock + 3_600_000).toISOString(), jobId);
+    });
+    const statusOf = () => r.store.read(db => db.get<{ status: string; reason: string | null }>("SELECT status, reason FROM eval_jobs WHERE job_id = ?", jobId));
+    await r.pump.sweep();
+    assert.equal(statusOf()?.status, "paused", "before its expiry the job stays paused");
+    clock += 3_600_000;
+    await r.pump.sweep();
+    assert.equal(statusOf()?.status, "expired");
+    assert.equal(statusOf()?.reason, "expired");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("the comparison step reports no job whose trial is still live after a sweep", async () => {
+  const r = rig();
+  try {
+    const jobId = r.addJob();
+    r.seed(jobId, 0, "running");
+    r.store.write(tx => {
+      tx.run("UPDATE eval_jobs SET status = 'paused', reason = 'owner', expires_at = ? WHERE job_id = ?", new Date(Date.parse(r.now()) - 1000).toISOString(), jobId);
+    });
+    await r.pump.sweep();
+    const row = r.store.read(db => db.get<{ status: string }>("SELECT status FROM eval_jobs WHERE job_id = ?", jobId));
+    assert.equal(row?.status, "paused");
+    assert.equal(new ComparisonPass({ store: r.store, config: r.config, now: r.now }).step(), "idle");
   } finally {
     r.cleanup();
   }

@@ -2,7 +2,7 @@
   "limit": 1000,
   "files": {
     "apps/web/src/main.tsx": 1178,
-    "packages/host/src/client.ts": 1405,
+    "packages/host/src/client.ts": 1406,
     "packages/host/src/evidence/permission-journal.ts": 1248,
     "packages/host/src/evidence/store.ts": 1084,
     "packages/host/src/goals.ts": 1051,
@@ -12,7 +12,7 @@
     "packages/host/src/outcome-store.ts": 1382,
     "packages/host/src/server.ts": 2296,
     "packages/host/src/team-cli.ts": 1242,
-    "packages/host/src/teams.ts": 3589,
+    "packages/host/src/teams.ts": 3593,
     "packages/host/src/understanding-work.ts": 1021,
     "packages/host/src/worker.ts": 1903,
     "scripts/egress-proxy.mjs": 1359,

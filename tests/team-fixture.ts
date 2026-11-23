@@ -185,7 +185,7 @@ process.exit(child.status ?? 1);
           if (!["ready-for-review", "merged", "cancelled"].includes(run.status))
             await host.fetchApi(`/teams/${run.id}/cancel`, "owner", { requestId: randomUUID(), revision: run.revision });
       }
-    } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+    } finally { try { await host.stop(); } finally { rmSync(root, { recursive: true, force: true }); } }
   };
   /** Serve the fixture's parent folder as the sync home and enroll a sibling teamwork folder through the API. */
   const enrollTeamwork = async (sync: Partial<NonNullable<Config["sync"]>> = {}, teamwork = "teamwork") => {

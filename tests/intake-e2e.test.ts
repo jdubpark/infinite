@@ -67,7 +67,9 @@ async function intakeHost(withSlack: boolean, options: {
       await linear.close();
       rmSync(root, { recursive: true, force: true });
       // Every agent names the receipts folder on its command line, so a session that outlived the stop shows here.
-      assert.deepEqual(processes().filter(row => row.command.includes(receipts)).map(row => row.pid), [], "no session of this host outlives its stop");
+      const left = processes().filter(row => row.command.includes(receipts)).map(row => row.pid);
+      for (const pid of left) try { process.kill(pid, "SIGKILL"); } catch { /* it ended meanwhile */ }
+      assert.deepEqual(left, [], "no session of this host outlives its stop");
     },
   };
 }

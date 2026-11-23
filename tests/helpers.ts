@@ -1,6 +1,6 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, rmSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, rmSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { hashToken } from "../packages/host/src/config.js";
@@ -46,6 +46,15 @@ function hostWorkers(config: Config, workers: readonly { pid: number }[], listed
     if (pid !== undefined && running.has(pid)) pids.add(pid);
   } catch { /* no status record: the worker has not listened yet, or a test stands a socket in for it */ }
   return [...pids];
+}
+
+/** A worker that has not listened after this long is not waited for: no record ties it to a host. */
+const WORKER_START_MS = 10000;
+
+/** True while a session of this host has a record and no status: its worker was launched and has not listened yet. */
+function launching(config: Config) {
+  const sessions = join(config.stateDir, "sessions");
+  try { return readdirSync(sessions).some(id => !existsSync(join(sessions, id, "status.sealed"))); } catch { return false; }
 }
 
 export async function freePort() {
@@ -129,16 +138,21 @@ export async function stopSessionWorkers(config: Config) {
  * never by an answer: a test may stand a socket in for a worker, and that answers for as long as the test runs.
  *
  * A worker belongs to this host when it recorded itself, which it does when it starts to listen, or when `started`
- * lists it: the workers a spawned host was seen to hold. A worker that is neither is not seen, so a host in this
- * process must first settle what it launches (`idle()`). After `limitMs` the workers that still run are killed and the
+ * lists it: the workers a spawned host was seen to hold. After `limitMs` the workers that still run are killed and the
  * call throws.
+ *
+ * Without `started` the host ran in this process, and its worker that is not listening yet is on no record. So while
+ * a session of the host has no status, the call also waits for the worker children of this process that this host has
+ * not recorded, for at most `WORKER_START_MS`: such a worker records itself when it listens, and then it counts.
  */
-export async function endSessionWorkers(config: Config, started: readonly number[] = [], limitMs = 30000) {
-  const until = Date.now() + limitMs;
+export async function endSessionWorkers(config: Config, started?: readonly number[], limitMs = 30000) {
+  const until = Date.now() + limitMs, heardBy = Date.now() + Math.min(limitMs, WORKER_START_MS);
   for (;;) {
     await stopSessionWorkers(config);
-    const mine = hostWorkers(config, processes().filter(row => row.command.includes(WORKER_ENTRY)), started);
-    if (!mine.length) return;
+    const workers = processes().filter(row => row.command.includes(WORKER_ENTRY));
+    const mine = hostWorkers(config, workers, started ?? []);
+    const starting = !started && Date.now() < heardBy && launching(config) ? workers.filter(row => row.parent === process.pid && !mine.includes(row.pid)) : [];
+    if (mine.length + starting.length === 0) return;
     if (Date.now() > until) {
       for (const pid of mine) try { process.kill(pid, "SIGKILL"); } catch { /* it ended meanwhile */ }
       throw new Error(`Session workers still ran ${limitMs} ms after the test stopped them and were killed: ${mine.join(", ")}`);

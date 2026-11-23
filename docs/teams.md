@@ -1464,7 +1464,11 @@ The hourly sweep reads each judge session's tokens and cost from the usage ledge
 
 The list returns `{ calibrations: [...] }`, newest first, at most 20. A start answers `201` with `{ calibration }`. A cancel answers `200` with the calibration. Cancelling a calibration that already ended changes nothing and returns it. A malformed ID is `404` `unknown-calibration`. A store that is not ready is `503` `evidence-unavailable`.
 
-A view holds `calibrationId`, `profileId`, `profileEpoch`, `promptVersion`, `status` (`running`, `completed`, `cancelled`, or `expired`), `reason`, `state`, `pairs` (`planned`, `counted`, `correct`, and the pair count of each project), `accuracy`, `lowerBound`, `swapAgreement`, `judgeMinutes`, `cost` (`tokens` and `spentUsd`), `createdAt`, `expiresAt`, `completedAt`, `validUntil`, and `inForce`. While a calibration runs, `counted` and `correct` are 0 and its figures are null, because the host writes them when the calibration ends. A view never holds a task, a trial, a patch, a rubric, model text, or the judge's summary.
+A view holds `calibrationId`, `profileId`, `profileEpoch`, `promptVersion`, `status` (`running`, `completed`, `cancelled`, or `expired`), `reason`, `state`, `pairs` (`planned`, `counted`, `correct`, and the pair count of each project), `accuracy`, `lowerBound`, `swapAgreement`, `judgeMinutes`, `cost` (`tokens` and `spentUsd`), `createdAt`, `expiresAt`, `completedAt`, `validUntil`, `inForce`, and `waiting`. While a calibration runs, `counted` and `correct` are 0 and its figures are null, because the host writes them when the calibration ends. A view never holds a task, a trial, a patch, a rubric, model text, or the judge's summary.
+
+**The wait reason.** `waiting` names the gate that holds the next judgement of a running calibration. It is `null` on a calibration that is not running, and when no gate is known. It holds one of the eight gate names in the table above, `mirror` (the project has no mirror head or no GitHub base branch), or a cause of a failed source build: `grader-failed`, `grader-processes-alive`, `eval-failed`, `eval-processes-alive`, `bundle-missing`, `storage`, or `halt` for a halted project. The host keeps the reason in memory, so it is empty after a restart until the next step. The command line prints it as `waiting on REASON`.
+
+**A host failure uses no attempt.** When the project has no mirror head, or the source build ends on an environment cause, no judge session has started. The host deletes the judgement row, the ordering keeps its attempt, and the calibration waits. The same judgement runs again once the cause clears, or the calibration expires. A failure after the source exists, and a row left in flight by a restart, still end the attempt `void-host`.
 
 **Relay devices.** The remote channel serves only the paths that its allow list names, and no rule names `/api/duels/...`. A relay device gets `403` `remote-endpoint-denied` for all three routes. Run the commands from a paired machine CLI.
 
@@ -1486,10 +1490,8 @@ in force · judge minutes 10 · known spend 182000 tokens, $24.10 · created CRE
 
 #### Known limits of phase 1
 
-- A calibration has no blocked state and shows no wait reason. While a gate above holds the next judgement, the view shows a running calibration and nothing more.
 - A stop that leaves eval processes alive voids the judgement, and the start-up retries it.
 - The view's spend is a floor.
-- A host failure before any judge session starts (no mirror head, or a source build that ends on an environment cause) ends the attempt `void-host` and uses one of the ordering's three attempts. A trial in the same state uses none. An outage that the identity and grader probes do not see can so end a calibration `pairs-dropped` with no judge session run. Start a new calibration after the outage.
 
 ### Not in this slice
 

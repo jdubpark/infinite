@@ -215,7 +215,7 @@ export type ComparisonJobView = Omit<BaselineJobView, "kind" | "trials"> & {
   kind: "compare" | "confirm";
   set: EvalSet;
   trials: { planned: number; started: number; graded: number; resolved: number | null; ended: number; void: number; reused: number };
-  report: "pending" | "ready" | null;
+  report: "pending" | "ready" | "unreadable" | null;
 };
 export type EvalJobView = ValidateJobView | BaselineJobView | ComparisonJobView;
 export type PairResult = {
@@ -264,7 +264,7 @@ export type EvalSummary = {
   groups: { total: number; devOnly: number; largest: number; holdout: number; exposed: number };
   coverage: { days: number; validCaptured: number; accepted: number; share: number } | null;
   grader: { state: GraderState; version: number | null };
-  evalIdentity: { state: EvalIdentityState };
+  evalIdentity: { state: EvalIdentityState; lastProbe?: { state: EvalIdentityState; at: string } | null };
   trials: { today: number; dailyCap: number | null };
   jobs: EvalJobView[];
 };

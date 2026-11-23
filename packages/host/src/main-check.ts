@@ -46,11 +46,6 @@ const NOTICE_FLIGHT_MS = 60_000;
 const WITNESS_SAVE_MS = 200;
 const WITNESS_SAMPLES = [250, 1_000, 5_000];
 const WITNESS_SAMPLE_MS = 15_000;
-/**
- * The scope of a copy's removal. Under a command prefix the removal is a command too, and it also ends with its
- * leader: a host stop after the launcher exited signals nothing. It is no command of a check, so no witness records it.
- */
-const REMOVAL_SCOPE: CommandScope = { starting: () => undefined, started: () => undefined, endsWithLeader: true };
 
 type Slot = { record?: MainCheckRecord; unreadable?: true };
 type Step = { phase: "setup" | "verification"; command: TeamCommand };
@@ -361,7 +356,9 @@ export class MainCheckService {
     const current = this.slots.get(projectId)?.record?.retiring?.find(item => item.directory === entry.directory);
     if (!current) return undefined;
     if (JSON.stringify(current) !== JSON.stringify(entry) || !this.removable(projectId, current, result)) return "processes";
-    try { await commandScope.run(REMOVAL_SCOPE, () => this.ports.remove(directory, prefix, this.removals.signal, entry.root)); }
+    // Under a command prefix the removal is a command too. It is no command of a check or of a team operation whose
+    // scope a pass may have inherited (a mirror fetch requests one), so it runs outside every scope and no witness records it.
+    try { await commandScope.exit(() => this.ports.remove(directory, prefix, this.removals.signal, entry.root)); }
     catch { return "cleanup"; }
     const record = this.slots.get(projectId)?.record;
     if (record) this.commit(projectId, retire(record, entry.directory));
@@ -639,8 +636,6 @@ export class MainCheckService {
           .then(() => this.commandSettled(active))
           .catch(() => undefined);
       },
-      // A command, setup and checks and the Git helpers alike, ends with its leader: nothing it left behind is signalled.
-      endsWithLeader: true,
     };
   }
 

@@ -1,22 +1,34 @@
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { commandScope, EXIT_DRAIN_MS, teamCommand, type CommandResult, type CommandScope } from "../packages/host/src/team-workspace.js";
+import { commandScope, EXIT_DRAIN_MS, TeamError, teamCommand, teamHead, type CommandResult, type CommandScope } from "../packages/host/src/team-workspace.js";
 
 /*
- * `CommandScope.endsWithLeader` on real processes (INF-388): a command whose leader exited settles without a signal,
- * marked truncated since its output never closed, so a process it left in its group lives on. Without the flag a
- * command settles only when its pipes close, and a stop kills the whole group: the team behaviour, pinned here.
+ * The leader rule on real processes (INF-388, INF-393). Every team command ends with its leader: once the process the
+ * host started exits, the command settles when its pipes close or at the end of a drain, once the loop has read what
+ * they hold; it is `leftover` and `truncated` when its output had not ended, and nothing is signalled after that exit.
+ * A stop while the leader runs still kills its group.
  */
 
 const CASE = { timeout: 20_000, skip: process.platform === "win32" && "process groups are POSIX" };
 const WAIT_MS = 10_000;
-/** The leader starts a background sleep that holds its pipes, writes the sleep's pid, and exits 0 at once. */
-const leaves = (pidFile: string) => ({ command: "sh", args: ["-c", `sleep 30 & echo $! > '${pidFile}'; exit 0`] });
+type Command = { command: string; args: string[] };
+/** The leader writes its pid, starts a background sleep in its own group that holds its pipes, writes the sleep's pid, and exits 3 at once. */
+const leaves = (leader: string, left: string): Command => ({ command: "sh", args: ["-c", `echo $$ > '${leader}'; sleep 30 & echo $! > '${left}'; exit 3`] });
 /** The same, but the leader waits for the sleep. */
-const waits = (pidFile: string) => ({ command: "sh", args: ["-c", `sleep 30 & echo $! > '${pidFile}'; wait`] });
+const waits = (leader: string, left: string): Command => ({ command: "sh", args: ["-c", `echo $$ > '${leader}'; sleep 30 & echo $! > '${left}'; wait`] });
+/** The leader starts a child in a session and group of its own that holds the leader's pipes, then exits 0. */
+const escapes = (leader: string, left: string): Command => ({ command: process.execPath, args: ["-e", [
+  "const { spawn } = require('node:child_process');",
+  "const { writeFileSync } = require('node:fs');",
+  "writeFileSync(process.argv[1], process.pid + '\\n');",
+  "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });",
+  "writeFileSync(process.argv[2], child.pid + '\\n');",
+  "process.exit(0);",
+].join("\n"), leader, left] });
 
 function gone(pid: number): boolean {
   try {
@@ -31,59 +43,67 @@ async function until(what: string, ready: () => boolean) {
   const deadline = Date.now() + WAIT_MS;
   while (!ready()) {
     if (Date.now() > deadline) assert.fail(`${what} within ${WAIT_MS} ms`);
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await new Promise(resolve => setTimeout(resolve, 10));
   }
 }
 
-/** One command under a scope that records the leader's pid, with the flag or without it. */
+function pidIn(file: string): number | undefined {
+  const text = existsSync(file) ? readFileSync(file, "utf8") : "";
+  return text.endsWith("\n") ? Number.parseInt(text, 10) : undefined;
+}
+
+/** One command, outside any scope unless one is given. Ends what the command left behind when the test is done. */
 class Run {
   readonly base = mkdtempSync(join(tmpdir(), "team-command-leader-"));
-  readonly pidFile = join(this.base, "pid");
+  readonly leaderFile = join(this.base, "leader");
+  readonly leftFile = join(this.base, "left");
   readonly controller = new AbortController();
-  leader?: number;
   settledAt?: number;
-  result?: Promise<CommandResult>;
 
-  start(command: (pidFile: string) => { command: string; args: string[] }, endsWithLeader: boolean) {
-    const scope: CommandScope = {
-      starting: () => undefined,
-      started: pid => { this.leader = pid; },
-      ...(endsWithLeader ? { endsWithLeader: true as const } : {}),
-    };
-    this.result = commandScope.run(scope, () => teamCommand(command(this.pidFile), this.base, this.controller.signal, 60_000))
-      .finally(() => { this.settledAt = performance.now(); });
-    return this.result;
+  start(command: (leader: string, left: string) => Command, scope?: CommandScope): Promise<CommandResult> {
+    const run = () => teamCommand(command(this.leaderFile, this.leftFile), this.base, this.controller.signal, 60_000);
+    return (scope ? commandScope.run(scope, run) : run()).finally(() => { this.settledAt = performance.now(); });
   }
 
-  /** The background sleep, once the leader wrote its pid. */
+  /** The process the leader left, once its pid is written. */
   async left(): Promise<number> {
-    await until("the leader writes the pid of its sleep", () => existsSync(this.pidFile) && readFileSync(this.pidFile, "utf8").endsWith("\n"));
-    return Number.parseInt(readFileSync(this.pidFile, "utf8"), 10);
+    await until("the leader writes the pid of what it leaves", () => pidIn(this.leftFile) !== undefined);
+    return pidIn(this.leftFile)!;
   }
 
   /** Node reaps the leader as it emits `exit`, so a reaped leader means the runner heard its exit. */
   async leaderExited() {
-    await until("the leader is reaped", () => this.leader !== undefined && gone(this.leader));
+    await until("the leader is reaped", () => { const leader = pidIn(this.leaderFile); return leader !== undefined && gone(leader); });
+  }
+
+  /**
+   * Whether the command settled before the test could stop it inside the drain. The drain runs on this process's loop,
+   * after the 10 ms poll that sees the reap, so a test process late under load delays the drain too. Should the drain
+   * still end first, the case is skipped: a stop after the drain proves nothing about a stop inside it.
+   */
+  drainEnded(t: TestContext): boolean {
+    if (this.settledAt === undefined) return false;
+    t.skip("the command settled at the end of the drain before the test could stop it inside the drain");
+    return true;
   }
 
   dispose() {
-    if (existsSync(this.pidFile)) {
-      const pid = Number.parseInt(readFileSync(this.pidFile, "utf8"), 10);
-      if (Number.isSafeInteger(pid) && pid > 1 && !gone(pid)) process.kill(pid, "SIGKILL");
-    }
+    const left = pidIn(this.leftFile);
+    if (left !== undefined && Number.isSafeInteger(left) && left > 1 && !gone(left)) process.kill(left, "SIGKILL");
     rmSync(this.base, { recursive: true, force: true });
   }
 }
 
-test("with endsWithLeader, a command whose output closes at its exit settles on the close, whole and not truncated", CASE, async () => {
+test("a command whose output closes at its exit settles on the close, whole, not truncated and with no leftover", CASE, async () => {
   const run = new Run();
   try {
     const started = performance.now();
-    const result = await run.start(() => ({ command: "sh", args: ["-c", "echo whole; echo also >&2; exit 4"] }), true);
+    const result = await run.start(() => ({ command: "sh", args: ["-c", "echo whole; echo also >&2; exit 4"] }));
     const elapsed = run.settledAt! - started;
     assert.equal(result.exitCode, 4);
     assert.equal(result.interrupted, false);
     assert.equal(result.truncated, false, "the output closed");
+    assert.equal(result.leftover, false);
     assert.equal(result.stdout, "whole\n");
     // Two pipes: their chunks arrive in either order.
     assert.deepEqual(result.output.split("\n").filter(Boolean).sort(), ["also", "whole"]);
@@ -93,31 +113,34 @@ test("with endsWithLeader, a command whose output closes at its exit settles on 
   }
 });
 
-test("with endsWithLeader, a command whose leader exited settles a drain later with its exit code, and its leftover lives", CASE, async () => {
+test("a command whose leader exited while its group holds the output settles a drain later with the leader's code, and a later stop signals nothing", CASE, async () => {
   const run = new Run();
   try {
     const started = performance.now();
-    const result = await run.start(leaves, true);
+    const result = await run.start(leaves);
     const sleep = await run.left();
     const elapsed = run.settledAt! - started;
-    assert.equal(result.exitCode, 0);
+    assert.equal(result.exitCode, 3);
     assert.equal(result.interrupted, false);
     assert.equal(result.truncated, true, "the output never closed");
+    assert.equal(result.leftover, true);
     assert.ok(elapsed >= EXIT_DRAIN_MS, `settled ${elapsed.toFixed(0)} ms after the start, before the drain ended`);
     assert.ok(elapsed < EXIT_DRAIN_MS + 4_000, `settled ${elapsed.toFixed(0)} ms after the start: it waited for the pipes`);
-    assert.equal(gone(sleep), false, "the leftover sleep runs");
+    run.controller.abort();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(gone(sleep), false, "the leftover sleep runs after the settled command's stop");
   } finally {
     run.dispose();
   }
 });
 
-test("with endsWithLeader, a stop inside the drain settles at once and signals nothing", CASE, async () => {
+test("a leftover that left the leader's group and session is neither waited for nor signalled", CASE, async t => {
   const run = new Run();
   try {
-    const result = run.start(leaves, true);
-    const sleep = await run.left();
+    const result = run.start(escapes);
+    const child = await run.left();
     await run.leaderExited();
-    assert.equal(run.settledAt, undefined, "the drain is still pending when the stop comes");
+    if (run.drainEnded(t)) return;
     const stoppedAt = performance.now();
     run.controller.abort();
     const settled = await result;
@@ -125,7 +148,30 @@ test("with endsWithLeader, a stop inside the drain settles at once and signals n
     assert.ok(waited >= 0 && waited < 250, `settled ${waited.toFixed(0)} ms after the stop`);
     assert.equal(settled.exitCode, 0);
     assert.equal(settled.interrupted, false);
+    assert.equal(settled.leftover, true);
+    await new Promise(resolve => setTimeout(resolve, 500));
+    assert.equal(gone(child), false, "the child in its own session still runs half a second after the stop");
+  } finally {
+    run.dispose();
+  }
+});
+
+test("a stop inside the drain settles at once and signals nothing", CASE, async t => {
+  const run = new Run();
+  try {
+    const result = run.start(leaves);
+    const sleep = await run.left();
+    await run.leaderExited();
+    if (run.drainEnded(t)) return;
+    const stoppedAt = performance.now();
+    run.controller.abort();
+    const settled = await result;
+    const waited = run.settledAt! - stoppedAt;
+    assert.ok(waited >= 0 && waited < 250, `settled ${waited.toFixed(0)} ms after the stop`);
+    assert.equal(settled.exitCode, 3);
+    assert.equal(settled.interrupted, false);
     assert.equal(settled.truncated, true);
+    assert.equal(settled.leftover, true);
     await new Promise(resolve => setTimeout(resolve, 500));
     assert.equal(gone(sleep), false, "the leftover sleep still runs half a second after the stop");
   } finally {
@@ -133,34 +179,94 @@ test("with endsWithLeader, a stop inside the drain settles at once and signals n
   }
 });
 
-test("with endsWithLeader, a stop while the leader runs kills its group as before", CASE, async () => {
+test("a stop while the leader runs kills its group as before", CASE, async () => {
   const run = new Run();
   try {
-    const result = run.start(waits, true);
+    const result = run.start(waits);
     const sleep = await run.left();
-    assert.equal(gone(run.leader!), false, "the leader waits for its sleep");
+    assert.equal(gone(pidIn(run.leaderFile)!), false, "the leader waits for its sleep");
     run.controller.abort();
     const settled = await result;
     assert.equal(settled.interrupted, true);
+    assert.equal(settled.leftover, false);
     await until("the sleep in the leader's group ends", () => gone(sleep));
   } finally {
     run.dispose();
   }
 });
 
-test("without endsWithLeader, a stop after the leader's exit kills the group that still holds the pipes", CASE, async () => {
+test("a command inside a scope that records it ends with its leader the same way", CASE, async t => {
   const run = new Run();
+  let recorded: number | undefined;
   try {
-    const result = run.start(leaves, false);
+    const result = run.start(leaves, { starting: () => undefined, started: pid => { recorded = pid; } });
     const sleep = await run.left();
     await run.leaderExited();
-    await new Promise(resolve => setTimeout(resolve, EXIT_DRAIN_MS + 200));
-    assert.equal(run.settledAt, undefined, "the command waits for its pipes past the drain");
+    assert.equal(recorded, pidIn(run.leaderFile), "the scope recorded the leader");
+    if (run.drainEnded(t)) return;
     run.controller.abort();
     const settled = await result;
-    assert.equal(settled.interrupted, true);
-    await until("the sleep in the leader's group ends", () => gone(sleep));
+    assert.equal(settled.interrupted, false);
+    assert.equal(settled.leftover, true);
+    await new Promise(resolve => setTimeout(resolve, 500));
+    assert.equal(gone(sleep), false, "the leftover sleep still runs half a second after the stop");
   } finally {
+    run.dispose();
+  }
+});
+
+test("a Git helper refuses a read whose output a leftover held, a drain after Git exited, and stops nothing", CASE, async () => {
+  const base = mkdtempSync(join(tmpdir(), "team-command-leader-git-"));
+  const leftFile = join(base, "left");
+  try {
+    const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+    execFileSync("git", ["init", "-q", "--initial-branch=main"], { cwd: base, env });
+    execFileSync("git", ["-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "commit", "-q", "--allow-empty", "-m", "base"], { cwd: base, env });
+    // A launcher that leaves a sleep holding the output, then runs Git as the leader.
+    const launcher = join(base, "launcher.sh");
+    writeFileSync(launcher, `sleep 30 &\necho $! > '${leftFile}'\nexec "$@"\n`);
+    const started = performance.now();
+    await assert.rejects(teamHead(base, { command: "/bin/sh", args: [launcher] }),
+      (error: unknown) => error instanceof TeamError && error.code === "workspace-operation-failed");
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 15_000, `refused ${elapsed.toFixed(0)} ms after the start, not at the 30 s limit`);
+    await until("the launcher writes the pid of its sleep", () => pidIn(leftFile) !== undefined);
+    assert.equal(gone(pidIn(leftFile)!), false, "the sleep the launcher left still runs");
+  } finally {
+    const left = pidIn(leftFile);
+    if (left !== undefined && Number.isSafeInteger(left) && left > 1 && !gone(left)) process.kill(left, "SIGKILL");
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("a command whose output ended while the loop was busy past the drain settles whole, with no leftover", CASE, async () => {
+  const run = new Run();
+  // The leader prints, leaves a holder in its group that prints once more 0.3 s later and ends, and exits 0.
+  const holds = (_leader: string, left: string): Command => ({ command: "sh", args: ["-c", `echo first; (sleep 0.3; echo late) & echo $! > '${left}'; exit 0`] });
+  let leader: number | undefined, busy = false, done = false;
+  // A setImmediate chain runs in the check phase of each loop turn. Once the leader's pid is gone, Node has reaped it and
+  // armed the drain; the chain then keeps the loop busy past the drain and until the holder has ended, so the drain timer
+  // runs in a turn whose poll phase has not yet read the holder's last line or the end of the output.
+  const tick = () => {
+    if (done) return;
+    if (!busy && leader !== undefined && gone(leader)) {
+      busy = true;
+      const from = performance.now(), holder = pidIn(run.leftFile);
+      const holding = () => holder !== undefined && !gone(holder) && performance.now() - from < 5_000;
+      while (performance.now() - from < EXIT_DRAIN_MS + 300 || holding()) { /* The host's event loop is busy. */ }
+    }
+    setImmediate(tick);
+  };
+  setImmediate(tick);
+  try {
+    const result = await run.start(holds, { starting: () => undefined, started: pid => { leader = pid; } });
+    assert.ok(busy, "the loop was busy after the leader's exit was heard");
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.leftover, false, "the output had ended before the drain decided");
+    assert.equal(result.truncated, false);
+    assert.equal(result.stdout, "first\nlate\n");
+  } finally {
+    done = true;
     run.dispose();
   }
 });

@@ -12,6 +12,12 @@ export const CAPSULE_MAX_BYTES = 65_536;
 export const REFERENCE_MAX_FILES = 500;
 export const LATER_FILES_MAX = 2_000;
 
+/** The goal as an implementer saw it: the criteria rows go to the project manager only. */
+function withoutCriteria(goal: NonNullable<TeamRun["goal"]>): NonNullable<TeamRun["goal"]> {
+  const { criteria: _criteria, ...rest } = goal;
+  return rest;
+}
+
 /** What the member saw when it started: steering, owner answers, and the task. Never a rendered prompt. */
 export function buildCapsule(run: TeamRun, task: TeamTask, member: TeamMember): Capsule | null {
   if (member.startedAt === undefined) return null;
@@ -29,7 +35,7 @@ export function buildCapsule(run: TeamRun, task: TeamTask, member: TeamMember): 
     steering,
     ownerAnswers,
     ...(run.brief ? { brief: run.brief } : {}),
-    ...(run.goal ? { goal: run.goal } : {}),
+    ...(run.goal ? { goal: withoutCriteria(run.goal) } : {}),
     task: { id: task.id, title: task.title, instructions: task.instructions, paths: [...task.paths] },
   };
 }

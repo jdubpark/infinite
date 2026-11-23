@@ -25,7 +25,7 @@ const CASE = { timeout: 60_000 };
 // createApp builds the service on its default ports, so a case that waits for a copy to be removed cannot pass on an
 // account with processes the census cannot inspect (main-check-earlier.ts). It is skipped there, with the reason.
 const UNINSPECTED = (await earlierProcesses()).size;
-const REMOVES_A_COPY = UNINSPECTED === 0 ? CASE : { ...CASE, skip: `this account has ${UNINSPECTED} process(es) the census cannot inspect, so a main check here never removes its copy (docs/teams.md, Main check, limits)` };
+const REMOVES_A_COPY = UNINSPECTED === 0 ? CASE : { ...CASE, skip: `this account has ${UNINSPECTED} process(es) the census cannot inspect, so a main check here removes no copy while they run (docs/teams.md, Main check, limits)` };
 const COMMIT = ["-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-q", "-m"];
 const sh = (script: string): TeamCommand => ({ command: "sh", args: ["-c", script] });
 

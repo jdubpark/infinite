@@ -57,7 +57,7 @@ const TABLE_BUFFER_BYTES = 64 * 1024 * 1024;
 const WRAPPER_LIMIT_MS = 10_000;
 /** A process can fork and exit between the listing and the reads of one pass; a second pass sees what the first missed. */
 const SECOND_PASS_MS = 100;
-/** How long the Linux census waits before it looks again at the processes it could not inspect. An exiting process is one for a few milliseconds. */
+/** How long the Linux census waits before it looks again at the processes it could not inspect. An exiting process is one for a few milliseconds, while it still holds its files. */
 const LOOK_AGAIN_MS = 100;
 const WRAPPER_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_WRAPPER_FINDINGS = 10_000;
@@ -290,9 +290,10 @@ async function linuxCensus(directory: string): Promise<CensusFinding[]> {
     if (reason) findings.push({ pid: Number(entry), reason });
   }
   if (!findings.some(finding => finding.reason === "unreadable")) return findings;
-  // While a process exits, /proc refuses its descriptors to its own account from the instant its memory is released
-  // until its files and working directory are. Each process that could not be inspected is looked at once more, and
-  // that look decides: by then such a process has exited, and one that still cannot be inspected is reported.
+  // /proc refuses a process's descriptors to its own account from the instant an exiting process has released its
+  // memory. For a few milliseconds more the process still holds its files and working directory; after that its
+  // working directory link is gone, and `linuxLinks` reads that as exited. So each process that could not be inspected
+  // is looked at once more, and that look decides: one that still cannot be inspected is reported.
   await new Promise(resolvePromise => setTimeout(resolvePromise, LOOK_AGAIN_MS));
   const decided: CensusFinding[] = [];
   for (const finding of findings) {

@@ -148,7 +148,8 @@ test("an exited process that waits for its parent holds nothing and is not repor
   }
 });
 
-const canHideFromItsAccount = process.platform === "linux" && spawnSync("python3", ["-c", "import ctypes; ctypes.CDLL(None).prctl"]).status === 0;
+// Root reads every process, so a process cannot hide from it.
+const canHideFromItsAccount = process.platform === "linux" && process.getuid?.() !== 0 && spawnSync("python3", ["-c", "import ctypes; ctypes.CDLL(None).prctl"]).status === 0;
 test("a process that cannot be inspected is reported, and is not when it can be a moment later (INF-402)", { skip: !canHideFromItsAccount }, async t => {
   const directory = mkdtempSync(join(tmpdir(), "census-"));
   // prctl(4, 0) is PR_SET_DUMPABLE off: /proc then refuses the process's links to its own account, as it does for a
@@ -194,6 +195,27 @@ test("a process that cannot be inspected is reported, and is not when it can be 
       decided = true;
     }
     if (!decided) t.skip("the process never showed itself within 100 ms, so the second look was not exercised");
+  } finally {
+    try { process.kill(child.pid!, "SIGKILL"); } catch { /* Already exited. */ }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a process that hides is still reported when its first thread has exited (INF-402)", { skip: !canExitFirstThread || !canHideFromItsAccount }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "census-"));
+  // The exited first thread has no working directory link, and such a task holds nothing. That rule must not cover the
+  // thread that lives on: /proc refuses that thread's links, so the process is one the census cannot inspect.
+  const script = ["import ctypes, threading, time", "libc = ctypes.CDLL(None)", "assert libc.prctl(4, 0, 0, 0, 0) == 0",
+    "threading.Thread(target=time.sleep, args=(60,)).start()", `libc.syscall(${threadExit}, 0)`, ""].join("\n");
+  const child = spawn("python3", ["-c", script], { cwd: directory, detached: true, stdio: "ignore" });
+  try {
+    const until = Date.now() + 5000;
+    const firstThreadExited = () => { try { const stat = readFileSync(`/proc/${child.pid}/stat`, "utf8"); return stat[stat.lastIndexOf(")") + 2] === "Z"; } catch { return false; } };
+    while (!firstThreadExited() && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(firstThreadExited(), true, "the first thread should have exited");
+    const census = await directoryCensus(directory);
+    assert.equal(census.ok, true, census.ok ? "" : census.problem);
+    assert.deepEqual(census.ok ? census.findings.filter(finding => finding.pid === child.pid) : [], [{ pid: child.pid, reason: "unreadable" }]);
   } finally {
     try { process.kill(child.pid!, "SIGKILL"); } catch { /* Already exited. */ }
     rmSync(directory, { recursive: true, force: true });

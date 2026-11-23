@@ -2328,6 +2328,44 @@ The composed result is `not-met` when any criterion is `not-met`, whoever produc
 5. A record with verdict entries still parses, but a version before one answers `409` with `objective-version-unavailable`. The latest version still reads.
 6. The older host ignores `run.verdicts`, `run.assessment`, the sealed verdict, `GoalCycle.assessment`, and `verdictId`.
 
+### Reported numbers
+
+A configured check can report a number by printing one line on stdout:
+
+```text
+infinite-metric NAME NUMBER
+```
+
+The host keeps those numbers per run and per goal cycle, and the owner reads them as a curve per goal. Nothing else reads them: no verdict, criterion, decision, prompt, or view.
+
+**The line.** `NAME` matches `[a-z][a-z0-9_.-]{0,39}`. `NUMBER` is a decimal such as `412`, `-3.5`, or `1e6`, at most 1e15 in magnitude. The line is exactly the marker, one space, the name, one space, and the number, at most 200 bytes, ended by LF, CRLF, or the end of the output. The scanner strips no terminal escapes: a line that starts with one is not a marker line.
+
+- The first 8 distinct names in a check's output take a slot. Each later line for a name without a slot is counted, line by line, and its number is not kept. This step stores no count of those lines.
+- A name is `invalid` when any marker line for it is not valid, for example a number out of range or a line over 200 bytes. Otherwise it is `ambiguous` when two of its lines carry different numbers, and otherwise a `value`. A marker line whose name is not a valid name makes every name of that check `invalid`. Only a `value` reaches a goal's curve.
+- Only stdout counts; a marker line on stderr is ignored. Only a check that passed counts. A setup command never counts.
+- When the same command is configured twice, the first non-setup run of it at a revision, round, and head decides, as for its receipt. A later run of it adds nothing, also when the first one failed.
+
+**On the run.** The numbers sit in the run's sealed holder beside `run`, never inside it. Every view, member context file, prompt, Understanding record, and event selects `run`, so none of them carries a number. The holder keeps the numbers of one revision, round, and head; a check at a newer one replaces them, and an older one changes nothing.
+
+**On the goal.** When a cycle's run ends (`ready-for-review`, `merged`, `no-change`, `blocked`, or `cancelled`) and the goal steps it, the goal settles one entry for that cycle. It reads the run's numbers only at a reviewed head: the head the checks passed at is the run's head, and the review approved the current revision. It then reads only the final round of that revision at that head. The entry sits beside `goal` in the goal's sealed holder, never in `goal` or a cycle, so no goal view, Understanding record, relay read, or member context carries it.
+
+- A later end of the same run replaces the entry whole. An end without a reviewed head, or with no `value`, removes it.
+- An entry keeps 16 values, in byte order of command digest, then name. It counts the rest in `more`.
+- Every write of the goal prunes first. It removes the entry of a cycle the goal no longer holds, for example after a standing goal folds old cycles, and keeps the newest 50 entries in cycle order. Each entry it removes counts once in `dropped`. An entry that a settlement removed is not counted.
+- An entry holds the command digest, never the command text.
+
+**The curve.** `GET /api/goals/:id/metrics` returns:
+
+- `series`: at most 8. A series is every value of one command digest and name, as points in cycle order (`cycle`, `run`, `revision`, `head`, `value`, `at`). A cycle without an entry is a gap. The series whose newest point is newest come first; a tie goes to the smaller SHA-256 of the canonical JSON of `{ command, name }`.
+- `configured` and `label` come from the project's checks at the time of the read. `label` is the command and its arguments joined by spaces, cut at 200 characters. A series whose command is no longer configured has `configured: false` and no `label`; a client can show its name and a short prefix of its digest.
+- `omittedSeries` counts the series past 8. `omittedValues` sums the entries' `more`. `dropped` is the goal's count of entries retention removed.
+
+The roles are owner, controller, and viewer, as for the objective record and verdicts reads. An unknown goal is `404`. The relay refuses the path, so a relay device never reads a number. No web, phone, or CLI view shows the curve yet.
+
+**What a number means.** The host observed that a configured check ran at the head, passed, and printed the line. It does not establish that the quantity was measured or that the name means what it says. The check runs on the head the team wrote, so the team's code decides what it prints. Read a curve as what the checks reported, not as evidence of an outcome.
+
+**Rollback.** An older host loads both holders without a schema and writes them back whole, so it keeps the two fields and ignores them. Its clients have no curve route.
+
 ### Standing objectives
 
 A goal can be a standing objective. It runs one cycle after another on a
@@ -4065,6 +4103,7 @@ mutation returns the current Goal or Team record.
 | `POST /api/goals/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner |
 | `POST /api/goals/:id/extend` | `requestId`, `revision`, `minutes` (5–1,440) | Owner |
 | `GET /api/goals/:id/verdicts` | None; returns each cycle's provisional verdict with its criteria; the relay refuses it | Owner, controller, or viewer |
+| `GET /api/goals/:id/metrics` | None; returns the curve of numbers the goal's checks reported (see [Reported numbers](#reported-numbers)); the relay refuses it | Owner, controller, or viewer |
 | `POST /api/goals/:id/outcome` | `requestId`, `revision`, `result`, `summary`, `evidence`; optional `verdictId` and `continue` (see [Verdicts](#verdicts)) | Owner/controller |
 
 Creation requires `requestId` (UUID), `projectId`, `title` (up to 100 characters),

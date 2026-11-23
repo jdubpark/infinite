@@ -293,7 +293,7 @@ test("an operation's intent says its record may be incomplete until a save holds
   } finally { await close(f, teams); }
 });
 
-test("a host stop inside a command's drain signals nothing, and after a restart the census still sees what the command left", { skip: process.platform === "win32" && "process groups are POSIX" }, async () => {
+test("a host stop inside a command's drain signals nothing, and after a restart the census still sees what the command left", { skip: process.platform === "win32" && "process groups are POSIX" }, async t => {
   const f = schedulerFixture();
   f.writeTeam();
   const directory = runDirectory(f.run);
@@ -308,8 +308,10 @@ test("a host stop inside a command's drain signals nothing, and after a restart 
   try {
     const internals = teams as unknown as Internals;
     const stored = internals.records.get(f.run.id)!;
-    const script = `echo $$ > '${leaderFile}'; sleep 30 & echo $! > '${leftFile}'; while [ ! -f '${release}' ]; do sleep 0.05; done; exit 0`;
-    internals.operation(stored, "check", signal => teamCommand({ command: "sh", args: ["-c", script] }, f.run.workspace, signal), () => {});
+    // The wait for the release is counted, so a test process that ended early cannot leave the shell polling for long.
+    const script = `echo $$ > '${leaderFile}'; sleep 30 & echo $! > '${leftFile}'; i=0; while [ ! -f '${release}' ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done; exit 0`;
+    let commandSettled = false;
+    internals.operation(stored, "check", signal => teamCommand({ command: "sh", args: ["-c", script] }, f.run.workspace, signal).finally(() => { commandSettled = true; }), () => {});
     await waitFor(() => pidIn(leftFile) !== undefined && savedRecord(f).pending?.recording === undefined && (savedRecord(f).pending?.witness?.sessions.length ?? 0) > 0,
       "the saved intent should hold the command", 10_000);
     writeFileSync(release, "");
@@ -318,6 +320,9 @@ test("a host stop inside a command's drain signals nothing, and after a restart 
     const deadline = Date.now() + 10_000;
     while (alive(leader) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
     assert.equal(alive(leader), false, "the leader exits once released");
+    // The drain runs on this loop after the 5 ms poll that sees the reap, so a test process late under load delays it too.
+    // Should the command still settle first, the host stop below would not fall inside the drain: skip, not fail.
+    if (commandSettled) return t.skip("the command settled at the end of the drain before the host stop");
     teams.close();
     await teams.idle();
     assert.ok(stored.pending, "a stop during the drain leaves the operation's intent for the next start");

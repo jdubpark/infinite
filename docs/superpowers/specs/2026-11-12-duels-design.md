@@ -310,3 +310,38 @@ Each phase is its own pull request and is useful alone.
 - The judge prompt wording, the seeded draws, and default cost estimates before the ledger has measured values.
 - The calibration job's records, and the columns of `judge_calibrations`.
 - The layout of `infinite duels status` and the client views.
+
+## Phase 1 as built (2026-11-22)
+
+This section records where phase 1 differs from the design. It does not change the design above. The operator's view is `docs/teams.md`, section "Judge calibration".
+
+**What phase 1 built.**
+- The `judge` role, the `lineup.judge` key, and the `judgement` report with rubric version 1.
+- The blind package: four files under `.git/infinite-judge/`, and a fixed prompt and context file that name no contestant.
+- The calibration job: its request, pair selection, the label draw, scoring, and the `ok` rule.
+- The `judge-calibrations` evidence module with `judge_calibrations` and `judge_judgements`.
+- Three routes under `/api/duels/judges` and the `infinite duels calibrate`, `judges`, and `cancel` commands.
+- Judgements run in the trial pump's one live slot, as a second kind of work beside trials.
+
+**What phase 1 left to phase 2.** The duel policy and its pin, eligibility, the challenger, the budget reservation, the objective gate, the `duels` table and ledger fields, the tie-break, the position and style monitors, `infinite duels status`, `show`, `pause`, and `resume`, `repo init --duels`, hold and choose, winner integration, clone retention, and the client views. Nothing calls `judgeWeight`. No production run starts a judge.
+
+**Where the design and the code disagree.**
+- **D1, isolation.** Part 9 counts a pair only when both trials are `isolated`, and the calibration read did not filter on it. Phase 1 adds the filter to both statements of the read. Phase 2 reads through the same function.
+- **D2, member ID in the context file.** Part 5 says the judge's context file holds no member ID. Every context file carried `assignment`, which holds `memberId`. A judge's context file omits `assignment`. The report binding stays in the session environment and names the judge itself. Phase 2 keeps this for the judge.
+- **D3, session identity.** The design gives the challenger and the judge the purpose `duel`. The code ties the eval identity to the session purpose, so phase 1 added `duel` to `LEARNING_PURPOSES`. Phase 2 must split session identity from purpose before it starts a challenger, because a challenger has purpose `duel` and must be a production member, not an eval session. `LEARNING_PURPOSES` carries a comment that says so.
+- **D4, the duel cap.** Part 8 spends calibration sessions from the duel cap of the learning budget. The code has no learning budget, reservation, or measured median. The owner's request is the bound: at most `2 x pairs x 3` judge sessions. Phase 2 moves calibration under the duel cap once the budget exists.
+- **D5, tool surface.** Part 5 says the judge's session exposes only the `report` tool. The eval agent profile gives it its normal read and shell tools. Phase 1 gives it no entry tools and no host-profile tools, and the read-only check ends a judgement `changed` when the judge sent one and its working copy had changed. The check runs only when the host accepts a judgement: a judge that edits and then exits or asks ends `no-result` or `question`. Phase 2 decides whether that is enough.
+- **D6, provider name in the prompt.** Acceptance 4 forbids a provider name in the prompt. The shared reporting and Codex sandbox text name the judge's own provider's tool surface. The text is the same whatever the contestants are, and the test forbids every other provider's name. Phase 2 keeps that rule.
+
+**Rulings that settle what the design left open.**
+- **6, session identity.** A judge session gets the eval agent profile, `_eval` egress, Code Mode off, and no injected context, and it is hidden like a trial session.
+- **9, role and report.** `judgement` carries `scores` for four rubric dimensions (`correctness`, `cleanliness`, `extensibility`, `docs`), each an integer from 1 to 5, and a `summary`. The reviewer's rubric carries a `why` for each dimension, and the judge's summary carries its reasons. The judge accepts `judgement`, `question`, and `blocked`.
+- **16, failures.** A void ending (`void-limit`, `void-host`, `void-owner`) retries its ordering at most twice. Every other non-judged ending scores the pair incorrect, because a judge that cannot answer is a judge failure and a host failure is not. A pair whose patch expired, whose source is skipped, or whose workspace is not `isolated` is dropped and not counted.
+- **17, budget.** The owner's request is the budget. A judge session does not count against `trialsPerDay`, and a trial does not count against a calibration. Trials and judgements take turns in the live slot.
+- **Default pairs.** The default is 36. The state needs 30 counted pairs, so a request for exactly 30 fails on its first dropped pair, and the default leaves six spare.
+- **Early drop.** An ordering that runs out of retries drops its pair at once, and its other ordering never starts.
+- **Early end.** A calibration ends `not-ok` with reason `pairs-dropped` as soon as fewer than 30 pairs can still be counted, whether pairs are still pending or the last one just dropped.
+- **Restart.** A restart voids a live judgement as `void-host` and retries it. It never drops the pair.
+- **Grader job.** Each calibration and project gets its own grader job, because the grader holds one base bundle per job and a bundle holds one project's repository.
+- **Pair order.** The job orders its pairs by project, so a calibration alone streams each bundle once.
+- **Session cost.** The hourly sweep records a judge session's cost before it removes the session. The close of a judgement reads none, so a view's spend is a floor.

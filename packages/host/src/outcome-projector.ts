@@ -86,7 +86,17 @@ export function outcomeProjector(store: EvidenceStore, options?: { log?: (line: 
   };
 }
 
+/** The kinds a duel run's summary still takes. Every other kind writes an outcome or a member result, which a judge run never has. */
+const DUEL_SUMMARY_KINDS: ReadonlySet<string> = new Set(["run.created", "run.prepared", "run.blocked", "run.revision-advanced", "run.settled", "run.deleted", "ledger.gap"]);
+
+/** One plain-column read by primary key: it runs for every event of every run, so it opens no payload. */
+function duelRun(tx: EvidenceDb, runId: string): boolean {
+  return tx.get<{ source: string }>("SELECT source FROM run_summaries WHERE run_id=?", runId)?.source === "duel";
+}
+
 function apply(ctx: Ctx): void {
+  // A judged preference is a model's claim: a duel run keeps its summary and writes no outcome row and no member result.
+  if (!DUEL_SUMMARY_KINDS.has(ctx.event.kind) && duelRun(ctx.tx, ctx.event.runId)) return;
   switch (ctx.event.kind) {
     case "run.created": return runCreated(ctx);
     case "run.prepared": return runPrepared(ctx);
@@ -122,6 +132,10 @@ function runCreated({ tx, event }: Ctx): void {
   if (missionId) summary.payload.missionId = missionId;
   if (data.purpose === "replay" || data.purpose === "gate") {
     summary.source = "replay";
+    summary.payload.trialId = str(data.trialId);
+  }
+  if (data.purpose === "duel") {
+    summary.source = "duel";
     summary.payload.trialId = str(data.trialId);
   }
   summary.revision = event.revision;

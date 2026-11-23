@@ -1,18 +1,21 @@
 import type express from "express";
 import type { ChildProcess } from "node:child_process";
 import { type EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
-import { EvidenceError, type EvidenceTx } from "./evidence/types.js";
+import { EvidenceError, type EvidenceDb, type EvidenceTx } from "./evidence/types.js";
 import { TaskCapture } from "./eval-capture.js";
 import { type Grader, type GraderProbe, launcherGrader, PROBE_FRESH_MS, stopGrader } from "./eval-grader.js";
 import { applyDuplicateRule, GroupPass, rootOf, sweepGroups } from "./eval-groups.js";
 import { launcherEvalIdentity, type EvalIdentity } from "./eval-identity.js";
-import { ACTIVE_JOBS_SQL, EvalJobs, JOB_LIST_MAX, type NextWork } from "./eval-jobs.js";
+import { ACTIVE_JOBS_SQL, EvalJobs, JOB_LIST_MAX, type EvalJobRow, type NextWork } from "./eval-jobs.js";
 import { TrialJobs } from "./eval-trial-jobs.js";
 import { ComparisonPass, reportFor } from "./eval-comparison.js";
 import { readPriors } from "./eval-priors.js";
 import { rotateHoldout } from "./eval-sets.js";
 import { EVAL_TRIALS_MODULE, evalTrialsModule, trialsSince } from "./eval-trial-store.js";
 import { TrialPump, type TrialTeams } from "./eval-trial-pump.js";
+import { JudgeCalibrations } from "./judge-calibration-jobs.js";
+import { JUDGE_MODULE, judgeCalibrationsModule } from "./judge-store.js";
+import { judgeRoutes } from "./judge-routes.js";
 import { mineGit, type MineGit } from "./eval-mine-git.js";
 import { Miner } from "./eval-miner.js";
 import { evalRoutes } from "./eval-routes.js";
@@ -89,6 +92,8 @@ export class EvalHost implements EvalHostApi {
   private readonly evalJobs: EvalJobs;
   private readonly trialJobs: TrialJobs;
   private readonly comparison: ComparisonPass;
+  /** The judge calibration jobs, owned here so the routes and the pump share one. */
+  private readonly judgements: JudgeCalibrations;
   /** The baseline trial pump, one step after each validation step. Undefined without `teams` and `sessions`. */
   private readonly trials: TrialPump | undefined;
   /** Owned by this pump across tasks: the job last streamed and its digest. */
@@ -121,18 +126,20 @@ export class EvalHost implements EvalHostApi {
     this.miner = new Miner({ config: this.config, store: this.store, source: this.source, git: this.git, runs: options.runs, now: this.now });
     // The trial tables. Nothing else registers them, and every trial job, trial, and count below writes to them.
     this.store.register(evalTrialsModule(this.store, this.now));
+    this.store.register(judgeCalibrationsModule(this.store, this.now));
+    this.judgements = new JudgeCalibrations({ store: this.store, config: this.config, now: this.now });
     this.trialJobs = new TrialJobs({ store: this.store, config: this.config, now: this.now });
     this.comparison = new ComparisonPass({ store: this.store, config: this.config, now: this.now });
     this.evalJobs = new EvalJobs({
       store: this.store, config: this.config, now: this.now,
-      baseline: { views: (db, rows) => this.trialJobs.views(db, rows), digest: (projectId, jobId) => this.trialJobs.digest(projectId, jobId) },
+      baseline: { views: (db, rows) => this.trialViews(db, rows), digest: (projectId, jobId) => this.trialJobs.digest(projectId, jobId) },
     });
     const identity = options.identity ?? launcherEvalIdentity(() => this.config.eval?.member);
     this.trials = options.teams && options.sessions ? new TrialPump({
       config: this.config, store: this.store, jobs: this.trialJobs,
       grader: this.grader, identity, teams: options.teams, sessions: options.sessions, source: this.source, hostLoad: this.hostLoad,
       halt: this.halt, graderProbe: () => this.grader.probe(this.canaries()).catch((): GraderProbe => ({ state: "unavailable" })),
-      inventory: this.inventory, now: this.now, cost: options.cost,
+      inventory: this.inventory, now: this.now, cost: options.cost, judgements: this.judgements,
     }) : undefined;
   }
 
@@ -162,11 +169,13 @@ export class EvalHost implements EvalHostApi {
     try { this.store.tryWrite(tx => { sweepGroups(tx); }); } catch { /* an unavailable store sweeps nothing */ }
     try { this.evalJobs.sweep(); } catch { /* an unavailable store sweeps nothing */ }
     try { if (this.ready()) this.store.tryWrite(tx => { rotateHoldout(tx, this.now()); }); } catch { /* an unavailable store rotates nothing */ }
+    if (this.trials === undefined) try { if (this.judgeReady()) this.judgements.sweep(); } catch { /* an unavailable store sweeps nothing */ }
     void this.trials?.sweep();
   }
 
   routes(app: express.Express, readGuard: express.RequestHandler, ownerGuard: express.RequestHandler): void {
     evalRoutes(app, { host: this }, readGuard, ownerGuard);
+    judgeRoutes(app, { judgements: this.judgements, ready: () => this.judgeReady() }, readGuard, ownerGuard);
   }
 
   /** Resolves when the capture, the miner, and the validation pass in flight have ended. */
@@ -189,15 +198,18 @@ export class EvalHost implements EvalHostApi {
   async summary(projectId: string): Promise<EvalSummary | EvalRefusal> {
     const project = this.config.projects.find(item => item.id === projectId);
     if (project === undefined) return refusal(404, "unknown-project");
-    if (!this.ready()) return refusal(503, "evidence-unavailable");
+    // The summary reads today's trial count from the trial tables.
+    if (!this.ready() || !this.trialsReady()) return refusal(503, "evidence-unavailable");
     const grader = await this.graderState();
     const day = `${this.now().slice(0, 10)}T00:00:00.000Z`;
+    const identity = this.trials?.identityStatus() ?? { state: "not-configured" as const };
     return this.guard(() => evalSummary(this.store, {
       project,
       mining: this.miner.status(projectId),
       grader,
       graderVersion: this.probed?.probe.version ?? null,
-      evalIdentity: this.trials?.identityState() ?? "not-configured",
+      evalIdentity: identity.state,
+      evalIdentityLastProbe: identity.lastProbe,
       trials: { today: this.trialsToday(projectId, day), dailyCap: project.team?.eval?.trialsPerDay ?? null },
       jobs: this.evalJobs.projectJobs(projectId, SUMMARY_JOBS),
       now: this.now(),
@@ -257,7 +269,7 @@ export class EvalHost implements EvalHostApi {
     this.validation = run;
   }
 
-  /** Today's trials of the project; 0 while the trials module cannot be read, so the summary still answers. */
+  /** Today's trials of the project. The summary has already refused while the trials module is not ready, so a throw here is a store failure. */
   private trialsToday(projectId: string, day: string): number {
     try { return this.store.read(db => trialsSince(db, projectId, day)); } catch { return 0; }
   }
@@ -425,6 +437,21 @@ export class EvalHost implements EvalHostApi {
   private ready(): boolean {
     try {
       return this.store.status().modules[EVAL_MODULE] === "ready";
+    } catch {
+      return false;
+    }
+  }
+
+  /** The views of trial job rows for a read or a control: they read the trial tables, so the module must be ready. */
+  private trialViews(db: EvidenceDb, rows: readonly EvalJobRow[]): Map<string, EvalJobView> {
+    if (rows.length > 0 && !this.trialsReady()) throw new EvidenceError("unavailable", "The trials module is not ready.");
+    return this.trialJobs.views(db, rows);
+  }
+
+  /** The judge tables read the corpus and the trials, so all three modules must be ready. */
+  private judgeReady(): boolean {
+    try {
+      return this.ready() && this.trialsReady() && this.store.status().modules[JUDGE_MODULE] === "ready";
     } catch {
       return false;
     }

@@ -149,9 +149,11 @@ export async function endSessionWorkers(config: Config, started?: readonly numbe
   const until = Date.now() + limitMs, heardBy = Date.now() + Math.min(limitMs, WORKER_START_MS);
   for (;;) {
     await stopSessionWorkers(config);
+    // Read before the records: a worker that records itself after this read is then found among them.
+    const unheard = !started && Date.now() < heardBy && launching(config);
     const workers = processes().filter(row => row.command.includes(WORKER_ENTRY));
     const mine = hostWorkers(config, workers, started ?? []);
-    const starting = !started && Date.now() < heardBy && launching(config) ? workers.filter(row => row.parent === process.pid && !mine.includes(row.pid)) : [];
+    const starting = unheard ? workers.filter(row => row.parent === process.pid && !mine.includes(row.pid)) : [];
     if (mine.length + starting.length === 0) return;
     if (Date.now() > until) {
       for (const pid of mine) try { process.kill(pid, "SIGKILL"); } catch { /* it ended meanwhile */ }

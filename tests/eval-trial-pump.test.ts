@@ -15,6 +15,7 @@ import { TrialJobs } from "../packages/host/src/eval-trial-jobs.js";
 import { TrialPump, type TrialPumpOptions, type TrialTeams } from "../packages/host/src/eval-trial-pump.js";
 import { EVAL_TRIALS_MODULE, evalTrialsModule, finishTrial, insertTrial, startTrial } from "../packages/host/src/eval-trial-store.js";
 import { ComparisonPass } from "../packages/host/src/eval-comparison.js";
+import { EvalJobs } from "../packages/host/src/eval-jobs.js";
 import { EvalHost } from "../packages/host/src/eval-host.js";
 import type { CostLookup } from "../packages/host/src/outcome-cells.js";
 import { configRef, TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
@@ -571,7 +572,7 @@ test("the comparison step reports no job whose trial is still live after a sweep
   }
 });
 
-type Built = { attempt: number; waiting: string | null };
+type Built = { slot: number; attempt: number; waiting: string | null };
 const trialRows = (r: ReturnType<typeof rig>) => r.store.read(db => db.all<{ attempt: number; state: string; ending: string | null }>(
   "SELECT attempt, state, ending FROM eval_trials ORDER BY created_at, attempt"));
 const jobOf = (r: ReturnType<typeof rig>, jobId: string) => r.store.read(db => db.get<{ status: string; reason: string | null; waiting: string | null }>(
@@ -583,9 +584,9 @@ function scripted(failures: number, cause: "bundle-missing" | "grader-failed" = 
   let store: EvidenceStore | undefined;
   let jobId = "";
   const prepareSource: TrialPumpOptions["prepareSource"] = async (_store, _taskId, ctx) => {
-    const row = _store.read(db => db.get<{ attempt: number }>("SELECT attempt FROM eval_trials WHERE trial_id = ?", ctx.trialId))!;
+    const row = _store.read(db => db.get<{ slot: number; attempt: number }>("SELECT slot, attempt FROM eval_trials WHERE trial_id = ?", ctx.trialId))!;
     store = _store;
-    builds.push({ attempt: row.attempt, waiting: jobId === "" ? null : _store.read(db => db.get<{ waiting: string | null }>("SELECT waiting FROM eval_jobs WHERE job_id = ?", jobId))!.waiting });
+    builds.push({ slot: row.slot, attempt: row.attempt, waiting: jobId === "" ? null : _store.read(db => db.get<{ waiting: string | null }>("SELECT waiting FROM eval_jobs WHERE job_id = ?", jobId))!.waiting });
     return builds.length <= failures ? { kind: "environment", cause } : { kind: "skip", reason: "not-valid" };
   };
   return { builds, prepareSource, setJob: (id: string) => { jobId = id; }, store: () => store };
@@ -627,6 +628,10 @@ test("a cause that never clears uses the slot's three attempts and pauses the jo
     assert.deepEqual(trialRows(r).map(row => ({ ...row })), [0, 1, 2].map(attempt => ({ attempt, state: "final", ending: "void-host" })));
     const job = jobOf(r, jobId);
     assert.deepEqual({ status: job.status, reason: job.reason }, { status: "paused", reason: "trial-voids" });
+    const owner = new EvalJobs({ store: r.store, config: r.config, now: r.now, baseline: { views: (db, rows) => r.jobs.views(db, rows), digest: (projectId, id) => r.jobs.digest(projectId, id) } });
+    assert.ok(!("code" in owner.control(jobId, "resume")), "the owner resumes the job");
+    for (let step = 0; step < 6; step++) await r.pump.step();
+    assert.deepEqual({ ...s.builds[30]! }, { slot: 1, attempt: 0, waiting: null }, "after a resume the job moves on to the next slot, as attempt 0");
   } finally {
     r.cleanup();
   }
@@ -641,7 +646,7 @@ test("a short outage uses no attempt and the wait clears when the source builds"
     await stepsUntil(r, () => s.builds.length, 3);
     assert.equal(jobOf(r, jobId).waiting, "bundle-missing", "the job names the cause while the slot waits");
     await stepsUntil(r, () => s.builds.length, 4);
-    assert.deepEqual(s.builds[3], { attempt: 0, waiting: null }, "the fourth build is attempt 0 and the job waits for nothing");
+    assert.deepEqual(s.builds[3], { slot: 0, attempt: 0, waiting: null }, "the fourth build is attempt 0 and the job waits for nothing");
     assert.deepEqual(trialRows(r), [], "no void row was written");
   } finally {
     r.cleanup();

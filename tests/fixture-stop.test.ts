@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import test from "node:test";
-import { endSessionWorkers, processes, startHost, waitFor, WORKER_ENTRY } from "./helpers.js";
+import { endSessionWorkers, inProcessHost, processes, startHost, waitFor, WORKER_ENTRY } from "./helpers.js";
 
 const running = (pid: number) => processes().some(row => row.pid === pid);
 
@@ -28,6 +28,24 @@ test("a spawned host's stop ends a session whose worker is not listening yet", {
     // A worker the stop missed must not outlive this test either, and must not hold the second stop.
     for (const row of processes()) if (workers.includes(row.pid) && row.command.includes(WORKER_ENTRY)) process.kill(row.pid, "SIGKILL");
     if (!stopped) await host.stop().catch(() => undefined);
+  }
+});
+
+test("the worker of a host in this process has ended when its sessions are stopped", { timeout: 60 * 1000 }, async () => {
+  const host = await inProcessHost();
+  let workers: number[] = [];
+  try {
+    const created = await host.fetchApi("/sessions", "owner", { requestId: randomUUID(), provider: "demo", projectId: "rehearsal", title: "Listening", prompt: "Initial request" });
+    assert.equal(typeof created.body.id, "string", JSON.stringify(created.body));
+    workers = processes().filter(row => row.parent === process.pid && row.command.includes(WORKER_ENTRY)).map(row => row.pid);
+    assert.equal(workers.length, 1, "one worker was started");
+    // No worker is listed here: this one counts because it recorded itself. Called without the fixed wait of the
+    // fixture's stop, which outlasts a worker that heard the request and would hide a call that returns early.
+    await endSessionWorkers(host.config);
+    assert.deepEqual(workers.filter(running), [], "the worker is gone when the call returns");
+  } finally {
+    await host.stop().catch(() => undefined);
+    for (const row of processes()) if (workers.includes(row.pid) && row.command.includes(WORKER_ENTRY)) process.kill(row.pid, "SIGKILL");
   }
 });
 

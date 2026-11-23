@@ -101,7 +101,8 @@ export function mineGit(prefix: () => TeamCommand | undefined): MineGit {
       let args: string[];
       try { args = numstatArgs(parent, commit); } catch { return { state: "failed" }; }
       const result = await run(mirror, args);
-      if (result === undefined || result.interrupted) return { state: "failed" };
+      // Output a leftover held is unread, not too large: the miner retries a failed read and rejects a too-large one for good.
+      if (result === undefined || result.interrupted || result.leftover) return { state: "failed" };
       if (result.truncated) return { state: "too-large" };
       if (result.exitCode !== 0) return { state: "failed" };
       const entries = parseNumstat(result.stdout);
@@ -111,7 +112,8 @@ export function mineGit(prefix: () => TeamCommand | undefined): MineGit {
       let args: string[];
       try { args = messageArgs(commit); } catch { return { state: "failed" }; }
       const result = await run(mirror, args);
-      if (result === undefined || result.interrupted) return { state: "failed" };
+      // As for numstat: output a leftover held is unread, not too large.
+      if (result === undefined || result.interrupted || result.leftover) return { state: "failed" };
       if (result.truncated) return { state: "too-large" };
       if (result.exitCode !== 0) return { state: "failed" };
       const parsed = parseMessage(result.stdout);

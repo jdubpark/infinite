@@ -12,7 +12,8 @@ import { hostEgressEnvironment } from "./egress.js";
 export class TeamError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
 }
-export interface CommandResult { exitCode: number | null; output: string; stdout: string; interrupted: boolean; truncated: boolean }
+/** `leftover`: the leader exited and its output had not ended when the command settled, so a process it started still held it (`teamCommand`); the output is then `truncated` too. */
+export interface CommandResult { exitCode: number | null; output: string; stdout: string; interrupted: boolean; truncated: boolean; leftover: boolean }
 /** `extra` carries a host GitHub grant for one operation; without it the environment is exactly the fixed allowlist below. */
 export function teamCommandEnvironment(extra?: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
@@ -38,19 +39,21 @@ export interface CommandScope {
   starting(): Promise<void> | undefined;
   /** Right after the start, once for each `starting`: the child's pid, or undefined when no process was started. The child leads its own session and process group. */
   started(pid: number | undefined): void;
-  /**
-   * A command ends with its leader. Once the child exits without a stop before it, the command settles when its pipes
-   * close or `EXIT_DRAIN_MS` later, whichever comes first, with the leader's exit code and the output read so far; a
-   * stop after that exit settles it at once. A result that settled before its pipes closed is `truncated`. Nothing is
-   * signalled after the exit: whatever still runs is a leftover the caller must find by other means. Without this, a
-   * command settles only when its pipes close.
-   */
-  endsWithLeader?: true;
 }
 export const commandScope = new AsyncLocalStorage<CommandScope>();
-/** How long a command whose leader exited waits for its pipes to close, under `CommandScope.endsWithLeader`. */
+/** How long a command whose leader exited waits for its pipes to close. */
 export const EXIT_DRAIN_MS = 1_000;
-/** Commands are argv arrays, from owner configuration or an explicitly authorized plan. */
+/** The most loop turns the decision at the end of the drain takes while output keeps arriving, so a process that prints without pause cannot hold the command. */
+const EXIT_DRAIN_TURNS = 3;
+/**
+ * Commands are argv arrays, from owner configuration or an explicitly authorized plan. A command ends with its leader,
+ * the process the host started. A stop while the leader runs kills the leader's process group. Once the leader exits
+ * without a stop before it, the command settles with the leader's exit code when its pipes close or at the end of
+ * `EXIT_DRAIN_MS`, whichever comes first; a stop after that exit settles it at once. At the end of the drain the host
+ * first reads what the pipes already hold. A command whose stdout and stderr have both ended settles whole; otherwise
+ * it is `leftover` and `truncated`, with the output read so far. Nothing is signalled after the exit, because the
+ * group may be empty and its id reused: whatever still runs is neither waited for nor stopped.
+ */
 export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string, extraEnv?: Record<string, string>, forceSettleAfterMs?: number, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
   const scope = commandScope.getStore(), ready = scope?.starting();
   const run = () => runTeamCommand(scope, command, cwd, signal, timeoutMs, prefix, input, extraEnv, forceSettleAfterMs, onOutput);
@@ -68,10 +71,13 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
     }
     scope?.started(child.pid);
     let output = "", stdout = "", interrupted = false, settled = false, truncated = false, stopRequested = false, stopTimer: NodeJS.Timeout | undefined;
-    // Under `endsWithLeader`: the leader's exit code once it exited with no stop before it, and the drain after it.
-    let leaderExit: { code: number | null } | undefined, drainTimer: NodeJS.Timeout | undefined;
-    // An observer is evidence only; a throw in it must not break the command.
-    const observe = (chunk: Buffer, stream: "stdout" | "stderr") => { try { onOutput?.(chunk, stream); } catch { /* ignored */ } };
+    // The leader's exit code once it exited with no stop before it, the drain after it, and the output chunks read so far.
+    let leaderExit: { code: number | null } | undefined, drainTimer: NodeJS.Timeout | undefined, chunks = 0;
+    // Counts what arrives, for the drain. An observer is evidence only; a throw in it must not break the command.
+    const observe = (chunk: Buffer, stream: "stdout" | "stderr") => {
+      chunks += 1;
+      try { onOutput?.(chunk, stream); } catch { /* ignored */ }
+    };
     const onStdoutData = (chunk: Buffer) => { observe(chunk, "stdout"); capture(chunk); stdout = (stdout + chunk.toString("utf8")).slice(-65536); };
     const onStderrData = (chunk: Buffer) => { observe(chunk, "stderr"); capture(chunk); };
     const onInputError = (error: Error) => {
@@ -88,7 +94,7 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       if (settled) return;
       settled = true;
       finish();
-      resolveResult({ exitCode, output, stdout, interrupted, truncated });
+      resolveResult({ exitCode, output, stdout, interrupted, truncated, leftover: false });
     };
     // A prefixed command or a leftover may hold these pipes open. Stop reading them and waiting for their close event.
     const abandon = () => {
@@ -101,24 +107,35 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       child.unref();
       child.stdin?.destroy(); child.stdout?.destroy(); child.stderr?.destroy();
     };
+    // Both pipes ended: nothing holds the output any more, though Node closes their handles over later turns.
+    const outputEnded = () => child.stdout!.readableEnded && child.stderr!.readableEnded;
     const settleAtLeaderExit = () => {
       if (settled || !leaderExit) return;
       settled = true;
       finish();
+      const left = !outputEnded();
       abandon();
-      // The output did not close, so it may be incomplete: a Git helper refuses such a read.
-      resolveResult({ exitCode: leaderExit.code, output, stdout, interrupted, truncated: true });
+      // Output that has not ended may be incomplete: a Git helper refuses such a read.
+      resolveResult({ exitCode: leaderExit.code, output, stdout, interrupted, truncated: truncated || left, leftover: left });
+    };
+    // The drain timer runs before the poll phase of its loop turn, so the decision waits one turn for what the pipes
+    // already hold, and a few more while output keeps arriving.
+    const decideAtDrain = (turn: number, read: number) => {
+      if (settled) return;
+      if (outputEnded() || chunks === read || turn >= EXIT_DRAIN_TURNS) settleAtLeaderExit();
+      else setImmediate(decideAtDrain, turn + 1, chunks);
     };
     // Node emits `exit` as it reaps the leader, so until then its pid, and the group it leads, cannot be reused.
     const onChildExit = (code: number | null) => {
       if (settled || stopRequested) return;
       leaderExit = { code };
-      drainTimer = setTimeout(settleAtLeaderExit, EXIT_DRAIN_MS);
+      drainTimer = setTimeout(() => setImmediate(decideAtDrain, 1, chunks), EXIT_DRAIN_MS);
       drainTimer.unref();
     };
     const stop = () => {
       if (stopRequested || settled) return;
-      // After the leader's exit the group holds only what the command left behind, and that is never signalled.
+      // After the leader's exit the group holds only what the command left behind, and that is never signalled. The
+      // command settles at once, by the drain's test of whether its output has ended.
       if (leaderExit) {
         settleAtLeaderExit();
         return;
@@ -127,7 +144,8 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       interrupted = true;
       try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); }
       catch (error) {
-        // A prefixed launcher such as sudo leads a group the host may not signal; say so rather than imply the command stopped.
+        // A prefix such as sudo may lead a group the host may not signal; say so rather than imply the command stopped.
+        // When the signal is allowed it ends only the prefix's own process, and nothing is written: see docs/teams.md.
         if ((error as NodeJS.ErrnoException).code === "EPERM") capture(Buffer.from("\n[The host could not stop this command (EPERM); it was left to finish and its result is not used.]\n"));
       }
       if (forceSettleAfterMs !== undefined) {
@@ -158,7 +176,7 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
     if (signal?.aborted) stop();
     child.once("error", onChildError);
     child.once("close", onChildClose);
-    if (scope?.endsWithLeader) child.once("exit", onChildExit);
+    child.once("exit", onChildExit);
   });
 }
 /** `grantEnv` maps the pushed ref to a host GitHub grant (`push` on exactly that ref) when the GitHub proxy is configured. */

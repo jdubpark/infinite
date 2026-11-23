@@ -190,6 +190,27 @@ test("a refused patch is failed, and a cut name list is too-wide", async () => {
   }
 });
 
+test("a name list cut where a leftover held the output is failed, not too-wide", { skip: process.platform === "win32" && "process groups are POSIX" }, async () => {
+  const dir = makeRepo();
+  const leftFile = join(dir, "left.pid");
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    // A launcher that leaves a sleep holding the output, then runs Git as the leader: the read settles a drain after Git exits.
+    const script = join(dir, "leave.sh");
+    writeFileSync(script, `#!/bin/sh\nsleep 30 &\necho $! > "${leftFile}"\nexec "$@"\n`);
+    assert.deepEqual(await captureGit(() => ({ command: "/bin/sh", args: [script] })).names(dir, from, to, 500), { state: "failed" });
+    // Control: the same launcher without the sleep reads the list, so the leftover alone fails the read above.
+    const plain = join(dir, "plain.sh");
+    writeFileSync(plain, `#!/bin/sh\nexec "$@"\n`);
+    assert.deepEqual(await captureGit(() => ({ command: "/bin/sh", args: [plain] })).names(dir, from, to, 500), { state: "read", names: ["a.txt"] });
+  } finally {
+    const left = Number.parseInt(existsSync(leftFile) ? readFileSync(leftFile, "utf8") : "", 10);
+    if (Number.isSafeInteger(left) && left > 1) { try { process.kill(left, "SIGKILL"); } catch { /* Already ended. */ } }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a read that cannot end", async () => {
   const dir = makeRepo();
   try {

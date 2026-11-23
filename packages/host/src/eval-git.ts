@@ -61,7 +61,8 @@ export function captureGit(
       if (!COMMIT_ID.test(from) || !COMMIT_ID.test(to) || signal.aborted) return { state: "failed" };
       try {
         const result = await teamCommand({ command: "git", args: teamGitArgs(cwd, namesArgs(from, to)) }, cwd, signal, timeoutMs, prefix());
-        if (result.exitCode !== 0 || result.interrupted) return { state: "failed" };
+        // A list cut where a leftover held the output is unread, not too wide.
+        if (result.exitCode !== 0 || result.interrupted || result.leftover) return { state: "failed" };
         if (result.truncated) return { state: "too-wide" };
         const names = result.stdout.split("\0").filter(Boolean);
         return names.length > max ? { state: "too-wide" } : { state: "read", names };

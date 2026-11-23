@@ -316,9 +316,9 @@ export class World {
       const settle = () => {
         if (settled) return;
         done();
-        resolve({ exitCode: proc.exitCode, output, stdout: output, interrupted, truncated: draining });
+        resolve({ exitCode: proc.exitCode, output, stdout: output, interrupted, truncated: draining, leftover: draining });
       };
-      // Under `endsWithLeader`, a leader whose child outlives it settles at the end of the drain, or at once on a stop.
+      // A leader whose child outlives it settles at the end of the drain, or at once on a stop.
       let draining = false;
       const stop = () => {
         // A host that stopped signals nothing.
@@ -343,7 +343,7 @@ export class World {
       };
       proc.onExit = () => {
         if (settled) return;
-        if (stopRequested || !scope?.endsWithLeader || !proc.children.some(child => this.processes.has(child.pid))) {
+        if (stopRequested || !proc.children.some(child => this.processes.has(child.pid))) {
           settle();
           return;
         }

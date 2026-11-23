@@ -53,7 +53,7 @@ import { drainLaunch, runFinalDrain } from "./final-drain.js";
 import { buildLaunch, headlessResumeProfile } from "./launch.js";
 import { channelToken } from "./permission-headless.js";
 import { claudeTurnSignals, HeadlessChannelWorker } from "./permission-headless-worker.js";
-import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv } from "./worker-env.js";
+import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv, codeModeInLaunchArguments } from "./worker-env.js";
 import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrust } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
@@ -1693,7 +1693,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       session.workspaceTrusted ? session.cwd : undefined,
       Boolean(session.team?.entryTools), Boolean(permissionChannel),
       egress.status !== "off",
-      config.codeMode,
+      codeModeInLaunchArguments(config.codeMode, session),
     );
     if (session.runtime?.nativeUi === "codex") {
       if (session.workspace) {

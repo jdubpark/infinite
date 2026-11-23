@@ -164,7 +164,7 @@ test("a routed start reads the mode a new Claude member would start in", async (
  * Starts one session on a stand-in provider that records the arguments and the Code Mode variable it started with:
  * a team member in `role`, or the owner's own session when `role` is null.
  */
-async function launchMember(level: "off" | "all" | undefined, provider: "claude" | "codex", role: string | null = "implementer") {
+async function launchMember(level: "off" | "all" | undefined, provider: "claude" | "codex", role: string | null = "implementer", nativeArgs?: string[]) {
   const root = mkdtempSync(join(tmpdir(), "infinite-member-rule-"));
   const log = join(root, "launch.json");
   const agent = join(root, "agent.mjs");
@@ -180,14 +180,14 @@ setTimeout(() => process.exit(0), 300);
     const cwd = join(config.teams!.workspaceDir, randomUUID(), "integration");
     mkdirSync(cwd, { recursive: true });
     const assignment = { runId: randomUUID(), memberId: randomUUID(), revision: 1, role, taskId: "a" } as never;
-    const request = { requestId: randomUUID(), projectId: "rehearsal", provider, title: "Member", prompt: PROMPT };
+    const request = { requestId: randomUUID(), projectId: "rehearsal", provider, title: "Member", prompt: PROMPT, ...(nativeArgs ? { nativeArgs } : {}) };
     const session = role === null ? await manager.create(request, "owner") : await manager.createTeamSession(request, assignment, cwd);
     await waitFor(() => existsSync(log), Boolean, 60000);
     const launch = JSON.parse(readFileSync(log, "utf8")) as { args: string[]; mode: string | null };
     // The request as a command prefix such as sudo passes it on: in the `env` key of a settings argument, one entry per argument.
     const settingsMode = launch.args.flatMap((arg, index) => arg === "--settings"
       ? [(JSON.parse(launch.args[index + 1]!) as { env?: Record<string, string> }).env?.CLAUDE_CODE_EXPERIMENTAL_CODE_MODE ?? null] : []);
-    return { session, mode: launch.mode, settingsMode, prompts: launch.args.filter(arg => arg.includes("Member prompt:")) };
+    return { session, mode: launch.mode, settingsMode, args: launch.args, prompts: launch.args.filter(arg => arg.includes("Member prompt:")) };
   } finally {
     await host.close();
     rmSync(root, { recursive: true, force: true });
@@ -212,6 +212,14 @@ test("the owner's own Claude session in Code Mode is started with the owner's pr
   assert.equal(prompts.length, 1);
   assert.ok(prompts[0]!.includes(PROMPT));
   assert.ok(!prompts[0]!.includes("Working rule for programs"), `the rule is for team members, and the owner's session read: ${prompts[0]!.slice(-400)}`);
+});
+
+test("the owner's own native arguments stay exact in Code Mode, and the request travels in the environment", { timeout: 120000 }, async () => {
+  const typed = ["--model", "opus", "--", "attach the logs"];
+  const { session, mode, args } = await launchMember("all", "claude", null, typed);
+  assert.equal(session.codeMode, true);
+  assert.equal(mode, "1");
+  assert.deepEqual(args, typed, "nothing follows the owner's `--`, where Claude Code would read it as prompt text");
 });
 
 test("with the switch off a Claude member is started with its prompt byte for byte", { timeout: 120000 }, async () => {

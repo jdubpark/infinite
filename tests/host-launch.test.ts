@@ -8,7 +8,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { EGRESS_ENVIRONMENT_NAMES } from "../packages/host/src/egress.js";
 import { codeModeEnabled } from "../packages/host/src/code-mode.js";
 import { buildLaunch, headlessLaunch, headlessResumeProfile, missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
-import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv } from "../packages/host/src/worker-env.js";
+import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv, codeModeInLaunchArguments } from "../packages/host/src/worker-env.js";
 import { claudeConfigPath, codexTrustArgs, recordClaudeTrust, repositoryCodexConfig } from "../packages/host/src/workspace-trust.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
@@ -68,6 +68,17 @@ test("an interactive Claude launch that asks for Code Mode carries the request i
   }
   // Only Claude Code has this request.
   assert.deepEqual(build("codex", [], null, enabled, false, true), ["p"]);
+});
+
+test("only arguments the host wrote carry the Code Mode request: the owner's own native arguments stay exact", () => {
+  // A session the host starts with its own arguments, and a resume, whose `--resume ID` the host writes.
+  assert.equal(codeModeInLaunchArguments(true, {}), true);
+  assert.equal(codeModeInLaunchArguments(true, { nativeArgs: ["--resume", "abc"], resumedFrom: "source" }), true);
+  // A fresh native launch: the owner typed these, perhaps with `--` or a subcommand that takes no further flag.
+  for (const nativeArgs of [[], ["--", "attach the logs"], ["mcp", "list"]])
+    assert.equal(codeModeInLaunchArguments(true, { nativeArgs }), false);
+  for (const session of [{}, { nativeArgs: [] }, { nativeArgs: ["--resume", "abc"], resumedFrom: "source" }])
+    assert.equal(codeModeInLaunchArguments(false, session), false);
 });
 
 test("team model selection preserves configured provider permissions and refuses competing model controls", () => {

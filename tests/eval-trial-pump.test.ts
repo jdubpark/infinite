@@ -15,6 +15,7 @@ import { TrialJobs } from "../packages/host/src/eval-trial-jobs.js";
 import { TrialPump, type TrialPumpOptions, type TrialTeams } from "../packages/host/src/eval-trial-pump.js";
 import { EVAL_TRIALS_MODULE, evalTrialsModule, finishTrial, insertTrial, startTrial } from "../packages/host/src/eval-trial-store.js";
 import { ComparisonPass } from "../packages/host/src/eval-comparison.js";
+import { EvalJobs } from "../packages/host/src/eval-jobs.js";
 import { EvalHost } from "../packages/host/src/eval-host.js";
 import type { CostLookup } from "../packages/host/src/outcome-cells.js";
 import { configRef, TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
@@ -624,7 +625,7 @@ test("a source that cannot be built leaves no row for nine tries; the tenth ends
   }
 });
 
-test("a cause that no task clears ends three trials on three tasks and pauses the job", async () => {
+test("a cause that no task clears ends three trials on three tasks and pauses the job; a resume goes on with the fourth task", async () => {
   const s = scripted(() => BROKEN);
   const r = rig({ baseBranch: "main", mirrorHead: "head", prepareSource: s.prepareSource });
   try {
@@ -636,6 +637,11 @@ test("a cause that no task clears ends three trials on three tasks and pauses th
     assert.deepEqual(trialRows(r).map(row => ({ ...row })), [TASK, T02, "captured:run-1:t03"].map(taskId => ({ taskId, attempt: 0, state: "final", ending: "void-host" })));
     const job = jobOf(r, jobId);
     assert.deepEqual({ status: job.status, reason: job.reason }, { status: "paused", reason: "trial-voids" });
+    assert.equal(skippedOf(r, jobId), 3, "the third task is skipped too, after the pause");
+    const owner = new EvalJobs({ store: r.store, config: r.config, now: r.now, baseline: { views: (db, rows) => r.jobs.views(db, rows), digest: (projectId, id) => r.jobs.digest(projectId, id) } });
+    assert.ok(!("code" in owner.control(jobId, "resume")), "the owner resumes the job");
+    await stepsUntil(r, () => s.builds.length, 31);
+    assert.deepEqual({ ...s.builds[30]! }, { taskId: "captured:run-1:t04", slot: 0, attempt: 0, waiting: null }, "the resumed job builds the fourth task, as attempt 0");
   } finally {
     r.cleanup();
   }

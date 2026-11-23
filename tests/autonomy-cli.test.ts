@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import test from "node:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { handleClientCommand } from "../packages/host/src/client.js";
 import { startHost } from "./helpers.js";
+import { mixedLineup } from "./team-fixture.js";
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 const fixedRequestId = "123e4567-e89b-42d3-a456-426614174000";
@@ -150,6 +151,30 @@ test("repo init sets, keeps, and validates the mode", { timeout: 90000 }, async 
     assert.equal((await host.fetchApi("/projects/sample/team")).body.revision, 2, "an invalid mode leaves the enrollment unchanged");
 
     assert.throws(() => invoke([plainPath, "--autonomy", "supervised"]), (error: { stderr?: string }) => /--autonomy/.test(String(error.stderr)));
+  } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("repo init warns about an evaluator that shares a model with an implementer", { timeout: 90000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-overlap-init-"));
+  const repoPath = join(root, "sample");
+  mkdirSync(repoPath);
+  git(repoPath, "init", "--initial-branch=main");
+  writeFileSync(join(repoPath, "tracked.txt"), "committed\n");
+  git(repoPath, "add", "tracked.txt");
+  git(repoPath, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture");
+  const checks = JSON.stringify([{ command: "git", args: ["status", "--short"] }]);
+  const evaluator = { id: "codex-evaluator", label: "Evaluator", provider: "codex" as const, model: "gpt-6-astra", effort: "xhigh" as const, tier: "strong" as const };
+  const host = await startHost({ config: {
+    projects: [{ id: "sample", name: "Sample", path: repoPath }],
+    teams: { workspaceDir: join(root, "team-workspaces"), lineup: { ...mixedLineup, evaluators: [evaluator] } },
+  } });
+  const clientFile = join(host.root, "overlap-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner }), { mode: 0o600 });
+  try {
+    const run = spawnSync(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile, "repo", "init", repoPath, "--project", "sample", "--check-json", checks, "--json"], { encoding: "utf8" });
+    assert.equal(run.status, 0, run.stderr);
+    assert.deepEqual(JSON.parse(run.stdout).evaluatorOverlaps, ["codex-evaluator"]);
+    assert.match(run.stderr, /Warning: .*codex-evaluator/);
   } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
 });
 

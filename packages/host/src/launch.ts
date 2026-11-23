@@ -361,6 +361,8 @@ export function buildLaunch(
   channel = false,
   egressConfigured = false,
   codeMode = false,
+  /** How many of the profile's last arguments are native ones: what the owner typed, or the host's own `--resume ID`. */
+  nativeArgCount = 0,
 ): AgentProfile {
   const args = [...profile.args];
   const hostEgressEnvVars = egressConfigured ? EGRESS_ENVIRONMENT_NAMES : [];
@@ -421,7 +423,6 @@ export function buildLaunch(
     : ["node", relayPath];
   // An interactive Claude launch takes the Code Mode request from the `env` key of this argument as it does from its
   // own environment. A command prefix such as sudo drops the variable and passes the argument, so the request rides here.
-  // The caller asks for it only where the host wrote the arguments: see codeModeInLaunchArguments.
   const codeModeRequest = codeMode && provider === "claude" && !channel ? { env: { [CLAUDE_CODE_MODE_ENV]: "1" } } : undefined;
   if (hooks && provider === "claude" && enabled.claude && !channel) {
     // A command hook, not an HTTP hook: the relay runs in the agent's account and is the only
@@ -438,10 +439,11 @@ export function buildLaunch(
     };
     args.push("--settings", JSON.stringify(settings));
   } else if (codeModeRequest && !profile.args.some(arg => arg === "--settings" || arg.startsWith("--settings="))) {
-    // Without the hook layer (hooks off, or a resume) the host passes this argument for the request alone. Claude Code
-    // honours only the last such argument, so a profile that brings its own keeps it, and its request travels only in
-    // the environment.
-    args.push("--settings", JSON.stringify(codeModeRequest));
+    // Without the hook layer (hooks off, a native launch, a resume) the host passes this argument for the request
+    // alone. It goes ahead of the native arguments, which stay exact: Claude Code reads what follows a typed `--` as
+    // prompt text. Claude Code honours only the last such argument, so a launch that brings its own keeps it, and its
+    // request travels only in the environment.
+    args.splice(Math.max(0, profile.args.length - nativeArgCount), 0, "--settings", JSON.stringify(codeModeRequest));
   }
   // A served headless session: the permission channel's hooks and the signal hooks in one settings layer, with no
   // user, project or local settings loaded, so no settings file can switch them off or answer before them.

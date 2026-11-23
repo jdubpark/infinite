@@ -119,23 +119,23 @@ Before setting `all`:
   host does not check the installed version.
 - A Code Mode session cannot use Remote Control, Claude in Chrome, or computer
   use.
-- An interactive launch carries the request in the environment variable
-  `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE`. Where the host wrote the launch's
-  arguments, it carries the request a second time, in the `env` key of a
-  `--settings` argument. That covers a session started from the web or phone
-  client, a team member, and a resume. Where agents start through `sudo`, the
-  variable is dropped unless the sudoers `env_keep` list names it, and the
-  argument passes, so these launches need no sudoers entry. Served headless
-  launches carry the request in their `--settings` argument alone.
-- A fresh native launch from the CLI keeps the owner's own arguments exact (see
-  [native arguments](cli.md#native-arguments-and-cloud-workspaces)), so its
-  request travels in the variable alone. Behind `sudo` it starts without Code
-  Mode unless `env_keep` names the variable.
+- An interactive launch carries the request twice: in the environment variable
+  `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE`, and in the `env` key of a `--settings`
+  argument. Where the host passes its hook settings (a session that a client
+  starts with a prompt, a team member), the request is part of that argument.
+  Where it passes none (hooks switched off, a native launch from the CLI, a
+  resume), the host adds one `--settings` argument for the request alone. It
+  places that argument ahead of the
+  [native arguments](cli.md#native-arguments-and-cloud-workspaces), which stay
+  exact. Where agents start through `sudo`, the variable is dropped unless the
+  sudoers `env_keep` list names it, and the argument passes, so no sudoers
+  entry is needed. Served headless launches carry the request in their
+  `--settings` argument alone.
 - Claude Code honours only the last `--settings` argument of a launch. With the
   host's hooks on, that is the host's own, and a `--settings` argument in the
-  launch profile is not read. Without the hook layer (hooks off, or a resume)
-  the host adds its argument only where the profile brings none, so a profile
-  with its own `--settings` asks for Code Mode through the variable alone.
+  launch profile is not read. Without the hook layer the host adds its argument
+  only where the launch brings none, so a profile or a native launch with its
+  own `--settings` asks for Code Mode through the variable alone.
 
 On the Ubuntu host, provider wrappers can load owner-managed environment files
 for host-wide credentials, Android tooling, and a selected project. Values are

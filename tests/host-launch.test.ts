@@ -8,7 +8,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { EGRESS_ENVIRONMENT_NAMES } from "../packages/host/src/egress.js";
 import { codeModeEnabled } from "../packages/host/src/code-mode.js";
 import { buildLaunch, headlessLaunch, headlessResumeProfile, missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
-import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv, codeModeInLaunchArguments } from "../packages/host/src/worker-env.js";
+import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv } from "../packages/host/src/worker-env.js";
 import { claudeConfigPath, codexTrustArgs, recordClaudeTrust, repositoryCodexConfig } from "../packages/host/src/workspace-trust.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
@@ -44,10 +44,11 @@ test("interactive launch environment adds Code Mode only for eligible Claude ses
 
 test("an interactive Claude launch that asks for Code Mode carries the request in the host's one settings argument", () => {
   const request = { CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1" };
+  const own = ["--settings", JSON.stringify({ env: request })];
   const settingsOf = (args: string[]) => args.flatMap((arg, index) => arg === "--settings" ? [JSON.parse(args[index + 1]!) as Record<string, unknown>] : []);
   const build = (provider: "claude" | "codex", args: string[], hookServer: typeof hooks | null, on: typeof enabled, team: boolean, codeMode: boolean) =>
     buildLaunch(provider, { command: provider, args }, "p", hookServer, relay, on, team, undefined, undefined, undefined, undefined, false, false, codeMode).args;
-  // The owner's session and a team member: one settings argument, the hook layer, with the request beside the hooks.
+  // A session from a client and a team member: one settings argument, the hook layer, with the request beside the hooks.
   for (const team of [false, true]) {
     const asked = build("claude", ["--model", "opus"], hooks, enabled, team, true), plain = build("claude", ["--model", "opus"], hooks, enabled, team, false);
     assert.deepEqual(settingsOf(asked).map(settings => settings.env), [request]);
@@ -60,25 +61,33 @@ test("an interactive Claude launch that asks for Code Mode carries the request i
   assert.deepEqual(build("claude", [], hooks, enabled, true, true).flatMap((arg, index, args) => arg === "--setting-sources" ? [args[index + 1]] : []), ["user"]);
   // With the hooks off the host passes the argument for the request alone.
   for (const [hookServer, on] of [[null, enabled], [hooks, { claude: false, codex: false }]] as const) {
-    assert.deepEqual(build("claude", [], hookServer, on, false, true), ["--settings", JSON.stringify({ env: request }), "p"]);
+    assert.deepEqual(build("claude", ["--model", "opus"], hookServer, on, false, true), ["--model", "opus", ...own, "p"]);
     assert.deepEqual(build("claude", [], hookServer, on, false, false), ["p"]);
-    // Claude Code honours only the last settings argument, so the host adds none beside the profile's own.
-    for (const own of [["--settings", "/etc/own.json"], ["--settings=/etc/own.json"]])
-      assert.deepEqual(build("claude", own, hookServer, on, false, true), [...own, "p"]);
+    // Claude Code honours only the last settings argument, so the host adds none beside the launch's own.
+    for (const brought of [["--settings", "/etc/own.json"], ["--settings=/etc/own.json"]])
+      assert.deepEqual(build("claude", brought, hookServer, on, false, true), [...brought, "p"]);
   }
   // Only Claude Code has this request.
   assert.deepEqual(build("codex", [], null, enabled, false, true), ["p"]);
 });
 
-test("only arguments the host wrote carry the Code Mode request: the owner's own native arguments stay exact", () => {
-  // A session the host starts with its own arguments, and a resume, whose `--resume ID` the host writes.
-  assert.equal(codeModeInLaunchArguments(true, {}), true);
-  assert.equal(codeModeInLaunchArguments(true, { nativeArgs: ["--resume", "abc"], resumedFrom: "source" }), true);
-  // A fresh native launch: the owner typed these, perhaps with `--` or a subcommand that takes no further flag.
-  for (const nativeArgs of [[], ["--", "attach the logs"], ["mcp", "list"]])
-    assert.equal(codeModeInLaunchArguments(true, { nativeArgs }), false);
-  for (const session of [{}, { nativeArgs: [] }, { nativeArgs: ["--resume", "abc"], resumedFrom: "source" }])
-    assert.equal(codeModeInLaunchArguments(false, session), false);
+test("the Code Mode request goes ahead of native arguments, which stay exact", () => {
+  const own = ["--settings", JSON.stringify({ env: { CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1" } })];
+  // A native launch has no hook layer and no prompt of the host's: the profile's arguments, then the native ones.
+  const native = (profileArgs: string[], typed: string[], codeMode = true) =>
+    buildLaunch("claude", { command: "claude", args: [...profileArgs, ...typed] }, "", hooks, relay, { claude: false, codex: false },
+      false, undefined, undefined, undefined, undefined, false, false, codeMode, typed.length).args;
+  // Nothing typed, prompt text after `--` (Claude Code reads all that follows as text), a subcommand, the host's own resume.
+  for (const typed of [[], ["--model", "opus", "--", "attach the logs"], ["mcp", "list"], ["--resume", "abc"]]) {
+    assert.deepEqual(native(["--verbose"], typed), ["--verbose", ...own, ...typed]);
+    assert.deepEqual(native([], typed), [...own, ...typed]);
+    assert.deepEqual(native(["--verbose"], typed, false), ["--verbose", ...typed], "a launch that does not ask keeps its exact arguments");
+  }
+  // Behind a command prefix the argument still follows the provider and the profile's own arguments.
+  const prefixed = ["-n", "-u", "agent", "--", "/opt/agents/claude", "--verbose"];
+  assert.deepEqual(native(prefixed, ["--", "attach the logs"]), [...prefixed, ...own, "--", "attach the logs"]);
+  // A settings argument the owner typed wins in Claude Code, so the host adds none.
+  assert.deepEqual(native(["--verbose"], ["--settings", "/etc/own.json"]), ["--verbose", "--settings", "/etc/own.json"]);
 });
 
 test("team model selection preserves configured provider permissions and refuses competing model controls", () => {

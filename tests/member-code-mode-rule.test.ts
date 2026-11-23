@@ -214,12 +214,14 @@ test("the owner's own Claude session in Code Mode is started with the owner's pr
   assert.ok(!prompts[0]!.includes("Working rule for programs"), `the rule is for team members, and the owner's session read: ${prompts[0]!.slice(-400)}`);
 });
 
-test("the owner's own native arguments stay exact in Code Mode, and the request travels in the environment", { timeout: 120000 }, async () => {
+test("the owner's own native arguments stay exact in Code Mode, and the request goes ahead of them", { timeout: 120000 }, async () => {
   const typed = ["--model", "opus", "--", "attach the logs"];
   const { session, mode, args } = await launchMember("all", "claude", null, typed);
   assert.equal(session.codeMode, true);
   assert.equal(mode, "1");
-  assert.deepEqual(args, typed, "nothing follows the owner's `--`, where Claude Code would read it as prompt text");
+  assert.deepEqual(args, ["--settings", JSON.stringify({ env: { CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1" } }), ...typed],
+    "nothing follows the owner's `--`, where Claude Code would read it as prompt text");
+  assert.deepEqual((await launchMember("off", "claude", null, typed)).args, typed, "with the switch off a native launch keeps its exact arguments");
 });
 
 test("with the switch off a Claude member is started with its prompt byte for byte", { timeout: 120000 }, async () => {

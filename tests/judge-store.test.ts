@@ -9,7 +9,7 @@ import {
   ACTIVE_CALIBRATION_SQL, CALIBRATION_JUDGEMENTS_SQL, IN_FORCE_SQL, JUDGE_MODULE, LIVE_JUDGEMENTS_SQL,
   activeCalibration, calibrationInForce, calibrationJudgements, calibrationViews, clearJudgementSession, dropJudgement,
   finishCalibration, finishJudgement, insertCalibration, insertJudgement, judgeCalibrationsModule, liveJudgements,
-  readCalibration, startJudgement, sweepJudge, type CalibrationEnd, type NewCalibration,
+  readCalibration, releaseJudgement, startJudgement, sweepJudge, type CalibrationEnd, type NewCalibration,
 } from "../packages/host/src/judge-store.js";
 
 const T0 = "2026-11-22T00:00:00.000Z";
@@ -243,6 +243,27 @@ test("a judgement moves from preparing to live to final, once", () => {
     assert.equal(raw.includes("correctness"), false, "the rubric column is sealed");
     const view = f.store.read(db => calibrationViews(db, T0, () => undefined))[0];
     assert.deepEqual(view?.cost, { tokens: 0, spentUsd: 0 });
+  } finally {
+    f.close();
+  }
+});
+
+test("a release deletes only a preparing judgement and frees its slot", () => {
+  const f = ready();
+  try {
+    f.store.write(tx => { insertCalibration(tx, calibration("c1")); });
+    const slot = (n: number) => ({ judgementId: `j${n}`, calibrationId: "c1", projectId: "zz-project", pairIndex: n, ordering: 0 as const, attempt: 0, resolvedIsA: true });
+    assert.equal(f.store.write(tx => insertJudgement(tx, slot(0), T0)), "inserted");
+    assert.equal(f.store.write(tx => releaseJudgement(tx, "j0")), true);
+    assert.deepEqual(f.store.read(db => calibrationJudgements(db, "c1")), [], "the row is gone");
+    assert.equal(f.store.write(tx => releaseJudgement(tx, "j0")), false, "a missing row answers false");
+    assert.equal(f.store.write(tx => insertJudgement(tx, slot(0), T0)), "inserted", "the same slot inserts again");
+    f.store.write(tx => { insertJudgement(tx, slot(1), T0); startJudgement(tx, "j1", "session-1"); });
+    f.store.write(tx => { insertJudgement(tx, slot(2), T0); finishJudgement(tx, "j2", { ending: "void-host", sessionId: null }, T0); });
+    f.store.write(tx => { insertJudgement(tx, slot(3), T0); dropJudgement(tx, "j3", "patch-missing", T0); });
+    for (const id of ["j1", "j2", "j3"]) assert.equal(f.store.write(tx => releaseJudgement(tx, id)), false, `${id} is kept`);
+    assert.deepEqual(f.store.read(db => calibrationJudgements(db, "c1")).map(r => [r.judgementId, r.state]),
+      [["j0", "preparing"], ["j1", "live"], ["j2", "final"], ["j3", "dropped"]]);
   } finally {
     f.close();
   }

@@ -526,3 +526,46 @@ test("a live judgement holds the next one and begin converges", async () => {
     assert.equal(row.preferred, next.resolvedIsA ? "A" : "B");
   } finally { f.close(); }
 });
+
+test("the view names the gate that holds the next judgement", async () => {
+  const f = ready();
+  try {
+    seedPairs(f, "P", 30);
+    const id = created(f);
+    assert.equal(view(f).waiting, null, "nothing has waited yet");
+    await f.jobs.next(gates({ hostLoadHeld: true }));
+    assert.equal(view(f).waiting, "host-load");
+    await f.jobs.next(gates({ freeSlots: async () => 0 }));
+    assert.equal(view(f).waiting, "session-slots");
+    f.jobs.hold("eval-identity");
+    assert.equal(view(f).waiting, "eval-identity", "a reason the pump found");
+    const next = await f.jobs.next(gates());
+    assert.equal(next.kind, "start");
+    assert.equal(view(f).waiting, null, "a start clears the reason");
+    if (next.kind !== "start") return;
+    assert.equal(f.jobs.begin(next), "inserted");
+    f.jobs.release(next.judgementId, "mirror");
+    assert.equal(view(f).waiting, "mirror");
+    assert.equal(rowsOf(f, id).length, 0, "a released start leaves no row");
+    const again = await f.jobs.next(gates());
+    assert.equal(again.kind === "start" ? again.judgementId : "", next.judgementId, "the same judgement runs again");
+    assert.equal(again.kind === "start" ? again.attempt : -1, 0);
+  } finally { f.close(); }
+});
+
+test("a calibration that is not running shows no wait reason", async () => {
+  const f = ready();
+  try {
+    seedPairs(f, "P", 30);
+    const id = created(f);
+    f.jobs.hold("grader");
+    const ended = f.jobs.cancel(id);
+    assert.ok("calibration" in ended);
+    assert.equal("calibration" in ended ? ended.calibration.waiting : "x", null, "a cancelled calibration waits on nothing");
+    assert.deepEqual(await f.jobs.next(gates()), { kind: "idle" });
+    f.jobs.create(body({ requestId: "request-2" }));
+    assert.equal(f.jobs.views()[0]!.status, "running");
+    assert.equal(f.jobs.views()[0]!.waiting, null, "idle forgot the old reason");
+    assert.equal(f.jobs.views()[1]!.waiting, null);
+  } finally { f.close(); }
+});

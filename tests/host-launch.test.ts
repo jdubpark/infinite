@@ -88,6 +88,16 @@ test("the Code Mode request goes ahead of native arguments, which stay exact", (
   assert.deepEqual(native(prefixed, ["--", "attach the logs"]), [...prefixed, ...own, "--", "attach the logs"]);
   // A settings argument the owner typed wins in Claude Code, so the host adds none.
   assert.deepEqual(native(["--verbose"], ["--settings", "/etc/own.json"]), ["--verbose", "--settings", "/etc/own.json"]);
+  // A native count the profile cannot hold gives no position to trust: nothing is added, least of all among sudo's options.
+  assert.deepEqual(buildLaunch("claude", { command: "sudo", args: prefixed }, "", hooks, relay, { claude: false, codex: false },
+    false, undefined, undefined, undefined, undefined, false, false, true, prefixed.length + 1).args, prefixed);
+  // What the host pushes itself comes after: the handoff arguments of a native launch, and a member's with the hooks off.
+  const handoff = buildLaunch("claude", { command: "claude", args: ["--verbose", "fix it"] }, "", hooks, relay, { claude: false, codex: false },
+    false, undefined, "handoff-session", undefined, undefined, false, false, true, 1).args;
+  assert.deepEqual(handoff.slice(0, 5), ["--verbose", ...own, "fix it", "--append-system-prompt"]);
+  const member = buildLaunch("claude", { command: "claude", args: ["--allowedTools", "Bash"] }, "p", hooks, relay, { claude: false, codex: false },
+    true, undefined, undefined, undefined, undefined, false, false, true).args;
+  assert.deepEqual([member.slice(0, 5), member.slice(-3)], [["--allowedTools", "Bash", ...own, "--mcp-config"], ["--setting-sources", "user", "p"]]);
 });
 
 test("team model selection preserves configured provider permissions and refuses competing model controls", () => {

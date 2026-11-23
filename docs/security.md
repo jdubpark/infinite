@@ -121,11 +121,11 @@ Before setting `all`:
   use.
 - An interactive launch carries the request twice: in the environment variable
   `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE`, and in the `env` key of a `--settings`
-  argument. Where the host passes its hook settings (a session that a client
-  starts with a prompt, a team member), the request is part of that argument.
-  Where it passes none (hooks switched off, a native launch from the CLI, a
-  resume), the host adds one `--settings` argument for the request alone. It
-  places that argument ahead of the
+  argument. Where the host passes its hook settings (a session started from the
+  web, phone or desktop app, a team member), the request is part of that
+  argument. Where it passes none (hooks switched off, a native launch from the
+  CLI, a resume), the host adds one `--settings` argument for the request
+  alone. It places that argument ahead of the
   [native arguments](cli.md#native-arguments-and-cloud-workspaces), which stay
   exact. Where agents start through `sudo`, the variable is dropped unless the
   sudoers `env_keep` list names it, and the argument passes, so no sudoers

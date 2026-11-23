@@ -438,12 +438,13 @@ export function buildLaunch(
       ...codeModeRequest,
     };
     args.push("--settings", JSON.stringify(settings));
-  } else if (codeModeRequest && !profile.args.some(arg => arg === "--settings" || arg.startsWith("--settings="))) {
+  } else if (codeModeRequest && nativeArgCount <= profile.args.length && !profile.args.some(arg => arg === "--settings" || arg.startsWith("--settings="))) {
     // Without the hook layer (hooks off, a native launch, a resume) the host passes this argument for the request
     // alone. It goes ahead of the native arguments, which stay exact: Claude Code reads what follows a typed `--` as
     // prompt text. Claude Code honours only the last such argument, so a launch that brings its own keeps it, and its
-    // request travels only in the environment.
-    args.splice(Math.max(0, profile.args.length - nativeArgCount), 0, "--settings", JSON.stringify(codeModeRequest));
+    // request travels only in the environment. So does the request of a launch whose native count the profile cannot
+    // hold: there is no position to trust, and the start of the list can be a command prefix's own options.
+    args.splice(profile.args.length - nativeArgCount, 0, "--settings", JSON.stringify(codeModeRequest));
   }
   // A served headless session: the permission channel's hooks and the signal hooks in one settings layer, with no
   // user, project or local settings loaded, so no settings file can switch them off or answer before them.

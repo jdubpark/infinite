@@ -368,6 +368,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
       ...(family === undefined ? {} : { family }),
       evidenceHash: request.evidenceHash,
       action: { tool: request.tool, summary: bounded(request.action) },
+      requestDigest: requestDigestFor(request),
     };
 
     // 1. Class rules: the owner answers, no model turn runs, and nothing is replayed for it.
@@ -576,6 +577,14 @@ const READ_SOURCE = "host:read-source";
  */
 function decisionIdFor(request: PermissionRequest, authorityHash: string, inputs: string): string {
   return `pd-${sha256(["permission-decision", request.requester.sessionId, request.id, request.evidenceHash, authorityHash, inputs]).slice(0, 32)}`;
+}
+
+/**
+ * One raised request, whatever authority or reading it is decided under: the part of the decision id that a halt
+ * release, a rule change or a changed reading leaves as it was. The journal counts a repeat once per digest.
+ */
+function requestDigestFor(request: PermissionRequest): string {
+  return sha256(["permission-request", request.requester.sessionId, request.id, request.evidenceHash]);
 }
 
 /**

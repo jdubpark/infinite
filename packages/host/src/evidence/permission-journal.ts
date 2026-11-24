@@ -67,6 +67,13 @@ export type PermissionDecision = {
   note?: string;
   replayOf?: string;
   repeats?: string;
+  /**
+   * A digest of the raised request this decision answers. The host decides one raised request again after a halt
+   * release, a change to the rules in force, or a changed reading, and each time gives it a new decision. Decisions
+   * with one digest count as one repeat. It is kept only in the sealed copy of the decision, so it is no column and
+   * a lookup does not return it. A decision recorded by an earlier release has none and counts on its own.
+   */
+  requestDigest?: string;
 };
 
 export type PermissionDecisionQuery = {
@@ -899,6 +906,7 @@ function normalizeDecision(value: PermissionDecision): PermissionDecision {
   assertOnlyKeys(value, [
     "id", "at", "workspaceId", "projectId", "taskId", "assignment", "sessionId", "role", "provider", "family",
     "evidenceHash", "reuseKey", "action", "rules", "tiers", "verdict", "code", "interruptClass", "note", "replayOf", "repeats",
+    "requestDigest",
   ]);
   const id = requiredString(value.id, "id");
   const at = requiredTimestamp(value.at, "at");
@@ -948,6 +956,7 @@ function normalizeDecision(value: PermissionDecision): PermissionDecision {
   const reuseKey = optionalString(value.reuseKey, "reuseKey");
   const replayOf = optionalString(value.replayOf, "replayOf");
   const repeats = optionalString(value.repeats, "repeats");
+  const requestDigest = optionalString(value.requestDigest, "requestDigest");
   if (repeats !== undefined && (verdict !== "reject" || !isEffectReject(value.code))) {
     throw new TypeError("A repeated request must be rejected with an effect reject code.");
   }
@@ -964,6 +973,7 @@ function normalizeDecision(value: PermissionDecision): PermissionDecision {
     ...(value.interruptClass === undefined ? {} : { interruptClass: value.interruptClass }),
     ...(value.note === undefined ? {} : { note: value.note }),
     ...(replayOf === undefined ? {} : { replayOf }), ...(repeats === undefined ? {} : { repeats }),
+    ...(requestDigest === undefined ? {} : { requestDigest }),
   };
 }
 
@@ -1081,22 +1091,49 @@ function canonicalDecision(db: EvidenceDb, row: DecisionRow, seen = new Set<stri
   return canonical === undefined ? undefined : canonicalDecision(db, canonical, seen);
 }
 
+/**
+ * How many raised requests of the assignment repeated the reject since the latest reset. The agent repeats a reject by
+ * raising a request. A request that the host decided again was raised once, so its decisions count once, at the first
+ * of them. The request that got the reject is no repeat of it. A decision with no request digest counts on its own.
+ */
 function repeatCountInDb(db: EvidenceDb, assignment: string, rejectId: string): number {
   const repeats = db.all<DecisionRow>(
     `SELECT * FROM ${DECISIONS} WHERE assignment=? AND repeats=? AND `
-    + `(code IS NULL OR code NOT IN (${placeholders(HOST_REJECT_CODES.length)}))`,
+    + `(code IS NULL OR code NOT IN (${placeholders(HOST_REJECT_CODES.length)})) ORDER BY seq`,
     assignment, rejectId, ...HOST_REJECT_CODES,
   );
+  if (repeats.length === 0) return 0;
   const resets = db.all<ControlRow>(
     `SELECT seq,kind,at,decision_id,assignment FROM ${CONTROLS} `
     + "WHERE (kind='unlock' AND assignment=?) OR (kind='reopen' AND decision_id=?)",
     assignment, rejectId,
   );
-  if (resets.length === 0) return repeats.length;
-  const latestReset = resets.reduce((latest, event) => compareOrder(event.at, event.seq, latest.at, latest.seq) > 0
-    ? event
-    : latest);
-  return repeats.filter(row => compareOrder(row.at, row.seq, latestReset.at, latestReset.seq) > 0).length;
+  const latestReset = resets.length === 0 ? undefined : resets.reduce((latest, event) =>
+    compareOrder(event.at, event.seq, latest.at, latest.seq) > 0 ? event : latest);
+  const reject = db.get<DecisionRow>(`SELECT * FROM ${DECISIONS} WHERE id=?`, rejectId);
+  const counted = new Set<string>();
+  const own = reject && requestDigestOf(db, reject);
+  if (own !== undefined) counted.add(own);
+  let count = 0;
+  for (const row of repeats) {
+    const digest = requestDigestOf(db, row);
+    if (digest !== undefined) {
+      if (counted.has(digest)) continue;
+      counted.add(digest);
+    }
+    if (latestReset === undefined || compareOrder(row.at, row.seq, latestReset.at, latestReset.seq) > 0) count++;
+  }
+  return count;
+}
+
+/** The request digest in a decision's sealed copy. A copy that cannot be read gives none, so the decision counts. */
+function requestDigestOf(db: EvidenceDb, row: DecisionRow): string | undefined {
+  try {
+    const digest = (JSON.parse(db.open<string>(INPUT_SEAL_TABLE, row.id, row.input_sealed)) as { requestDigest?: unknown }).requestDigest;
+    return typeof digest === "string" && digest.length > 0 ? digest : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function insertControl(tx: EvidenceTx, event: {

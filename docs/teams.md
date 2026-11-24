@@ -3117,11 +3117,15 @@ Each request passes these steps in order:
    can be rejected or sent to the owner. It is never allowed.
 3. **Lock and replay.** An assignment that repeated one rejected request twice
    is locked and gets no model turn until the owner unlocks it. A repeat is a
-   request that the agent raised. When the host decides one raised request
-   again, after a halt release, a change to the rules in force, or a changed
-   reading, that request still counts as one repeat, and the request that got
-   the reject is not a repeat of it. A decision recorded before this rule
-   carries no mark of its request and counts on its own. An identical
+   request that the agent raised: one dialog of an interactive session, or
+   one headless call. The host can decide one raised request more than once,
+   after a halt release, a change to the rules in force, a changed reading,
+   or a dialog whose evidence changed while it was open. Its decisions count
+   as one repeat, at the first of them, so a request counted before an unlock
+   does not count again after it. The request that got the reject is not a
+   repeat of it. A decision recorded by a release before this rule carries no
+   mark of its request: it counts on its own, and a reject recorded then can
+   still be repeated by its own request. An identical
    request under the same authority is answered from its recorded verdict.
    A verdict belongs to the request as the host read it: the task text the
    reviewer saw, and the class and raise rules that matched as the request's

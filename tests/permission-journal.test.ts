@@ -138,6 +138,11 @@ test("decisions that answered one raised request count as one repeat, and a deci
   // It is part of the content that an ID stands for.
   assert.throws(() => journal.appendDecision(effectReject("c-2", { repeats: "original", requestDigest: "request-d", at: at(10) })), /different content/);
   assert.throws(() => journal.appendDecision(effectReject("bad", { requestDigest: "" })), TypeError);
+
+  // A reject of an earlier release has no digest, so its own request, decided again, still counts against it.
+  journal.appendDecision(effectReject("old-original", { assignment: "assignment-2", at: at(11) }));
+  journal.appendDecision(effectReject("old-original-again", { assignment: "assignment-2", repeats: "old-original", requestDigest: "request-e", at: at(12) }));
+  assert.equal(journal.repeatCount("assignment-2", "old-original"), 1);
 }));
 
 test("model notes are sealed at rest and decrypted by decision lookup", () => {

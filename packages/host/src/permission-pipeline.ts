@@ -580,11 +580,14 @@ function decisionIdFor(request: PermissionRequest, authorityHash: string, inputs
 }
 
 /**
- * One raised request, whatever authority or reading it is decided under: the part of the decision id that a halt
- * release, a rule change or a changed reading leaves as it was. The journal counts a repeat once per digest.
+ * One raised request, whatever authority, reading or evidence it is decided under. The journal counts a repeat once
+ * per digest. An interactive dialog is one prompt of its session: the prompt id is the sequence of the event that
+ * opened it, a new dialog gets a new one, and the dialog keeps it while a hook adds its tool evidence, which changes
+ * the request id and the evidence hash. A headless call has no prompt, and its request id is the call's.
  */
 function requestDigestFor(request: PermissionRequest): string {
-  return sha256(["permission-request", request.requester.sessionId, request.id, request.evidenceHash]);
+  const raised = request.prompt ? ["prompt", request.prompt.id] : ["request", request.id, request.evidenceHash];
+  return sha256(["permission-request", request.requester.sessionId, ...raised]);
 }
 
 /**

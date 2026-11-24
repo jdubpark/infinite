@@ -145,6 +145,31 @@ test("decisions that answered one raised request count as one repeat, and a deci
   assert.equal(journal.repeatCount("assignment-2", "old-original"), 1);
 }));
 
+test("a decision whose sealed copy cannot be read counts on its own, and the lock is still read", () => {
+  const f = fixture();
+  try {
+    let store = open(f);
+    let journal = new PermissionJournal(store);
+    journal.appendDecision(effectReject("original", { requestDigest: "request-a" }));
+    journal.appendDecision(effectReject("b-1", { repeats: "original", requestDigest: "request-b", at: "2026-11-14T10:01:00.000Z" }));
+    journal.appendDecision(effectReject("b-2", { repeats: "original", requestDigest: "request-b", at: "2026-11-14T10:02:00.000Z" }));
+    assert.equal(journal.repeatCount("assignment-1", "original"), 1);
+    store.close();
+    const raw = new DatabaseSync(f.path);
+    try { raw.prepare("UPDATE permission_decisions SET input_sealed='not a sealed value' WHERE id='b-2'").run(); } finally { raw.close(); }
+    store = open(f);
+    try {
+      journal = new PermissionJournal(store);
+      assert.equal(journal.repeatCount("assignment-1", "original"), 2);
+      assert.equal(journal.isLocked("assignment-1"), true);
+    } finally {
+      store.close();
+    }
+  } finally {
+    f.close();
+  }
+});
+
 test("model notes are sealed at rest and decrypted by decision lookup", () => {
   const f = fixture();
   let store = open(f);

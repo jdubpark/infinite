@@ -282,6 +282,62 @@ test("same-mission reads coalesce and concurrent worker probes stay under the ho
   }
 });
 
+test("fixed-order mission polling eventually samples every live worker", async () => {
+  const missions = new Map<string, MissionProgressMissionSource>();
+  const children = new Map<string, MissionProgressChild>();
+  const assignments = new Map<string, TeamAssignment>();
+  const workersByMission = new Map<string, Set<string>>();
+  for (let missionIndex = 0; missionIndex < 8; missionIndex++) {
+    const id = randomUUID();
+    const coordinator = { runId: id, memberId: randomUUID(), sessionId: randomUUID(), revision: 1, role: "mission-coordinator" as const, status: "running" as const };
+    assignments.set(coordinator.sessionId, coordinator);
+    const subtasks: MissionProgressMissionSource["subtasks"] = [];
+    const workers = new Set<string>();
+    for (let teamIndex = 0; teamIndex < 2; teamIndex++) {
+      const teamId = randomUUID();
+      const projectId = `repo-${teamIndex}`;
+      const members = Array.from({ length: 4 }, (_, workerIndex) => {
+        const member = { runId: teamId, memberId: randomUUID(), sessionId: randomUUID(), revision: 1, role: "implementer" as const, taskId: `task-${workerIndex}`, status: "running" as const };
+        assignments.set(member.sessionId, { runId: teamId, memberId: member.memberId, revision: 1, role: member.role, taskId: member.taskId });
+        workers.add(member.memberId);
+        return member;
+      });
+      children.set(teamId, linkedChild({ runId: teamId, missionId: id, projectId, revision: 1, assignments: members, checks: [] }));
+      subtasks.push({ id: projectId, title: projectId, repoProjectId: projectId, status: "running", teamId });
+    }
+    missions.set(id, { id, title: "Working mission", status: "working", revision: 1, updatedAt: at, coordinator, subtasks });
+    workersByMission.set(id, workers);
+  }
+
+  const service = new MissionProgressService({
+    missions: { progressSource: id => missions.get(id)! },
+    teams: { missionProgressChild: teamId => children.get(teamId)! },
+    manager: {
+      meta: sessionId => ({ session: { team: assignments.get(sessionId) } }),
+      state: async () => ({ status: "running" }),
+    },
+  });
+  const observed = new Map([...missions.keys()].map(id => [id, new Set<string>()]));
+  const cursors = new Map<string, string>();
+  for (let round = 0; round < 8; round++) {
+    for (const id of missions.keys()) {
+      const page = await service.read(id, cursors.get(id));
+      if (round > 0) assert.equal(page.resync.required, false);
+      cursors.set(id, page.cursor);
+      for (const subtask of page.snapshot.subtasks) {
+        if (subtask.child.kind !== "linked") continue;
+        for (const member of subtask.child.assignments) {
+          if (member.workerStatus === "running") observed.get(id)!.add(member.memberId);
+        }
+      }
+    }
+  }
+
+  for (const [id, expected] of workersByMission) {
+    assert.deepEqual([...observed.get(id)!].sort(), [...expected].sort(), "every worker in the mission is eventually directly observed");
+  }
+});
+
 test("child projection rejects a run whose mission or project binding does not match", () => {
   const run = {
     id: childId, projectId: "api", missionId, replay: undefined, revision: 2, status: "implementing", updatedAt: at,

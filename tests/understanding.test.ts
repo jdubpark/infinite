@@ -381,7 +381,6 @@ test("Understanding is a read-only scoped API and its source-bound brief survive
     assert.equal(renamedUnderstanding.body.workspace.name, "Renamed workspace");
     assert.ok(renamedUnderstanding.body.repositories[0].current.some((artifact: any) => artifact.id === artifactId), "renaming a workspace preserves its retained source evidence");
 
-    // Replacing the enrolled directory at the same path must withhold its old artifact.
     const enrolledPath = host.config.projects[0].path;
     const movedPath = join(temp, "old-checkout");
     renameSync(enrolledPath, movedPath);

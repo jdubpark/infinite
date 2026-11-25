@@ -1,5 +1,3 @@
-// The task a permission reviewer reads for a headless call (INF-274). A team member's task is the run objective and its
-// task's instructions, the same projection the interactive adapter sends; the member's own prompt never reaches it.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -24,7 +22,6 @@ const lineup: TeamLineup = {
 };
 const command = { command: process.execPath, args: ["-e", "0"] };
 
-/** The scheduler fixture with a strong lineup and an objective switch that goals can read. */
 function fixture() {
   const f = schedulerFixture();
   f.config.teams = { ...f.config.teams!, lineup };
@@ -40,7 +37,6 @@ function setSwitch(f: ReturnType<typeof fixture>, value: "on" | "off") {
 const judgement = (statement: string) => ({ statement, check: { kind: "judgement" as const, item: "sources" }, threshold: { kind: "pass" as const } });
 const add = (criterion: ReturnType<typeof judgement>) => ({ op: "criterion.add" as const, criterion });
 const correction = (version: number, ops: unknown[]) => ({ requestId: randomUUID(), version, ops });
-/** Resolves once the tick that `start` queued has finished. */
 const barrier = (goals: GoalService, id: string) => goals.steer(id, { requestId: randomUUID(), revision: 999, text: "Barrier" }).catch(() => undefined);
 const createInput = (overrides: Partial<CreateGoal> = {}): CreateGoal => ({
   requestId: randomUUID(), projectId: "fixture", title: "Rank sources", objective: "Find ranked sources",
@@ -58,7 +54,6 @@ for (const prompts of ["on", "off"] as const) {
     try {
       goals = new GoalService(f.config, f.key, teams);
       const created = await goals.create(createInput({ successCriteria: `A ranked shortlist that holds ${success}` }));
-      // Criteria need the switch on; the cycle pins the digest only when the switch is on at launch.
       await goals.correctObjective(created.id, correction(1, [add(judgement(criterion))]));
       setSwitch(f, prompts);
       goals.start();
@@ -67,7 +62,6 @@ for (const prompts of ["on", "off"] as const) {
       assert.ok(teamId, "the tick launched the first cycle");
       goals.close(); goals = undefined; teams.close();
 
-      // A member with a task, added to the stored run the cycle launched.
       const stored = f.readRecord<{ run: TeamRun } & Record<string, unknown>>("team", teamId);
       const run = structuredClone(stored.run);
       const task = { id: "task-a", memberId: "member-a", title: "Rank the sources", instructions: "Write the shortlist file", dependsOn: [], status: "running",
@@ -84,16 +78,11 @@ for (const prompts of ["on", "off"] as const) {
         initialPrompt: teamPrompt(run, "implementer", task, "", "claude"), headless: { channel: true },
         team: { runId: run.id, memberId: member.memberId, revision: 1, role: "implementer", taskId: task.id } } as unknown as Session;
 
-      // (a) The control: the member prompt holds the success text, and with prompts on, the pinned digest's criterion.
       assert.ok(session.initialPrompt.includes(success), "control: the member prompt holds the success text");
       if (prompts === "on") assert.ok(session.initialPrompt.includes(criterion), "control: the member prompt holds the pinned digest");
-      // (b) The precondition: the run objective holds neither marker.
       assert.equal(run.objective.includes(success) || run.objective.includes(criterion), false);
-      // (c) The host's task for the member is the shared projection.
       const hostTask = teams.permissionAgentTask(session);
       assert.deepEqual(hostTask, teamPermissionTask(run, task));
-      // (d) The reviewer's turn carries the run objective and not the member prompt's markers. The task comes from the
-      // channel's own projection, wired as server.ts wires it.
       const channelTask = headlessTask(session, s => teams.permissionAgentTask(s));
       assert.deepEqual(channelTask, hostTask);
       const request = headlessRequest(session, { toolName: "Bash", toolInput: { command: "make safe-build" } }, `headless:${session.id}:toolu_1`, channelTask!);
@@ -105,7 +94,6 @@ for (const prompts of ["on", "off"] as const) {
   });
 }
 
-/** A channel over a fake pipeline, for the session's team task and its serve checks. */
 function rig(extra: { team?: Session["team"]; teamTask?: (session: Pick<Session, "team">) => { title: string; text: string } | undefined; prompt?: string }) {
   const key = randomBytes(32);
   const session = { id: randomUUID(), projectId: "rehearsal", provider: "claude", cwd: tmpdir(), title: "T", initialPrompt: extra.prompt ?? "do it",
@@ -142,7 +130,6 @@ test("a team session's request carries the reader's task, never the member promp
   await h.ask({ op: "class", call: bash("deploy production") });
   assert.equal(h.classed.length, 1, "the class check saw one request");
   assertClean(h.classed[0]);
-  // The class owner path also decides, so the decide op's request is the one added after this point.
   const before = h.decided.length;
   await h.ask({ op: "decide", call: bash("make safe-build"), requestId: `headless:${h.session.id}:toolu_1` });
   assert.equal(h.decided.length, before + 1, "the decide op saw one request");
@@ -157,7 +144,6 @@ test("a team session whose task cannot be read is not served", async () => {
     assert.deepEqual(await h.ask({ op: "decide", call: bash("make safe-build"), requestId: `headless:${h.session.id}:toolu_1` }), { result: "not-served" });
     assert.equal(h.decided.length, 0, "the pipeline's decide is never called");
   }
-  // The task reader itself: undefined without a reader, and undefined when the reader throws.
   const session = { title: "T", initialPrompt: "p", team } as Session;
   assert.equal(headlessTask(session, undefined), undefined);
   assert.equal(headlessTask(session, () => { throw new Error("no run"); }), undefined);
@@ -166,6 +152,5 @@ test("a team session whose task cannot be read is not served", async () => {
 test("a session outside a run keeps its own prompt as task text", () => {
   const session = { id: randomUUID(), title: "T".repeat(250), initialPrompt: "p".repeat(5000) } as Session;
   assert.deepEqual(headlessTask(session, undefined), { title: "T".repeat(200), text: "p".repeat(4000) });
-  // A reader is consulted only for a team session.
   assert.deepEqual(headlessTask(session, () => ({ title: "x", text: "y" })), { title: "T".repeat(200), text: "p".repeat(4000) });
 });

@@ -7,13 +7,6 @@ import { simulate, type Variant, Violation } from "./fixtures/team-run-sim.js";
 import { registerGoalPlanSimulator } from "./fixtures/goal-plan-sim.js";
 import "./fixtures/delivery-review-sim.js";
 
-/*
- * Runs the team run crash simulator (tests/fixtures/team-run-sim.ts, which states the invariants I1-I7) over the
- * default corpus, and checks that each mutant below is caught through the invariant it names.
- */
-
-// TEAM_SIM_SEED=N runs that seed alone and skips the mutants; TEAM_SIM_SEEDS=N runs N seeds from TEAM_SIM_BASE
-// (default 1). Floors describe the default corpus only.
 const DEFAULT_SEEDS = 50;
 const ONLY = process.env.TEAM_SIM_SEED;
 const COUNT = Number(process.env.TEAM_SIM_SEEDS ?? DEFAULT_SEEDS);
@@ -21,12 +14,10 @@ const BASE_SEED = Number(process.env.TEAM_SIM_BASE ?? 1);
 const SEEDS = ONLY === undefined ? Array.from({ length: COUNT }, (_, index) => BASE_SEED + index) : [Number(ONLY)];
 assert.ok(SEEDS.length > 0 && SEEDS.every(Number.isSafeInteger), "TEAM_SIM_SEED, TEAM_SIM_SEEDS and TEAM_SIM_BASE take integers");
 const DEFAULT_CORPUS = ONLY === undefined && COUNT === DEFAULT_SEEDS && BASE_SEED === 1;
-// Seeds run this many at a time: each one mostly waits on sealed-record fsyncs and its fixture's git commands.
 const CONCURRENCY = 8;
 
 const sortedCounts = (counts: Counts) => Object.entries(counts).sort(([a], [b]) => (a < b ? -1 : 1));
 
-/** Runs `seeds` in batches and returns the violation of the lowest failing seed of the first failing batch. */
 async function sweep(seeds: readonly number[], counts: Counts, variant: Variant = {}): Promise<Violation | undefined> {
   for (let at = 0; at < seeds.length; at += CONCURRENCY) {
     const results = await Promise.allSettled(seeds.slice(at, at + CONCURRENCY).map(seed => simulate(seed, counts, variant)));
@@ -39,11 +30,6 @@ async function sweep(seeds: readonly number[], counts: Counts, variant: Variant 
   return undefined;
 }
 
-/**
- * Floors for the default corpus at about half of what it produced, so a generator that stops producing a case fails.
- * Every request kind is cut after each write it makes: continue, pause, and cancel make one; answer makes two only
- * while a delegated decision is live; the rest make two. The thinnest ran once: an answer cut after write 2 and resume after write 2.
- */
 const FLOORS: Readonly<Record<string, number>> = {
   "cut:pause:1": 7, "cut:resume:1": 6, "cut:resume:2": 1, "cut:cancel:1": 1,
   "cut:steer:1": 10, "cut:steer:2": 8, "cut:revoke:1": 7, "cut:revoke:2": 3, "cut:answer:1": 2, "cut:answer:2": 1,
@@ -66,11 +52,8 @@ test("team run requests keep their invariants across host stops", async t => {
   }
 });
 
-// ---- Mutations ---------------------------------------------------------------------------------------------------
-
 type Stored = { run: TeamRun; receipts: Record<string, string>; checkHead?: string; halt?: string };
 type Body = { requestId: string; revision: number };
-/** The private service methods the source mutants replace on one instance. No file is edited. */
 type Private = {
   admit(stored: Stored, operation: string, body: Body): string | undefined;
   replay(stored: Stored, operation: string, body: Body): boolean;
@@ -82,7 +65,6 @@ type Private = {
 };
 const internals = (service: TeamService) => service as unknown as Private;
 
-/** `source` replaces a TeamService method in process; `harness` changes what a stop leaves on disk. */
 type Mutation = { name: string; invariant: string; kind: "source" | "harness"; variant: Variant };
 
 const patchAdmit = (wrap: (host: Private, admit: Private["admit"]) => Private["admit"]): Variant => ({ patch: service => {
@@ -123,7 +105,6 @@ const patchLateStopEffects: Variant = { patch: service => {
 } };
 
 const MUTATIONS: readonly Mutation[] = [
-  // I3 sees the receipt on the reopened record before the retry; I1 would see the missing effect after it.
   { name: "the receipt is recorded at admission, before the permission fence's save (INF-331)", invariant: "I3", kind: "source",
     variant: patchAdmit((_host, admit) => (stored, operation, body) => {
       const receipt = admit(stored, operation, body);
@@ -138,7 +119,6 @@ const MUTATIONS: readonly Mutation[] = [
     }) },
   { name: "a resume records its receipt and advances its revision before the permission fence (INF-334)", invariant: "I3", kind: "source",
     variant: { patch: service => {
-      // The body of resumeRun before 7fc88a98, less its outbox event, which this host does not keep.
       internals(service).resumeRun = async function (this: Private, stored, inPlace = false, record) {
         record?.();
         const run = stored.run;
@@ -149,13 +129,11 @@ const MUTATIONS: readonly Mutation[] = [
         run.status = "planning"; run.reason = undefined; run.blockCode = undefined;
       };
     } } },
-  // A resume with no stop shows it first, through I1. Cut at write 1, I3 would see the cleared steering.
   { name: "a resume clears the steering before the permission fence's save", invariant: "I1", kind: "source",
     variant: { patch: service => {
       const host = internals(service), resumeRun = host.resumeRun.bind(host);
       host.resumeRun = (stored, inPlace, record) => { stored.run.steering = []; return resumeRun(stored, inPlace, record); };
     } } },
-  // Its retry sets the halt again with the rest of the steer, so only a check before the retry sees it.
   { name: "a steer sets its halt before the permission fence's save", invariant: "I3", kind: "source",
     variant: patchAdmit((_host, admit) => (stored, operation, body) => {
       const receipt = admit(stored, operation, body);

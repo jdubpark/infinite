@@ -46,7 +46,6 @@ export const independentDeliveryLineup: TeamLineup = {
   reviewer: { id: "muse-reviewer", label: "Muse reviewer", provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant: "high", tier: "strong" },
 };
 
-/** `trustWorkspaces` also gives the host its own HOME, where a Claude member's trust is recorded. */
 export async function fixture(scenario = "success", lineup?: TeamLineup, config: Partial<Config> = {}, options: { trustWorkspaces?: boolean; env?: NodeJS.ProcessEnv; parallelism?: number; deliveryMode?: "merge" | "pr"; noServer?: boolean } = {}) {
   const root = realpathSync(mkdtempSync("/tmp/inf-team-"));
   const home = join(root, "home");
@@ -132,7 +131,6 @@ process.exit(child.status ?? 1);
       ] }) } }],
     ...config,
     agents: { ...agents, ...(config.agents ?? {}) },
-    // Head publication pushes to GitHub, so only tests with a local remote override turn it on.
     teams: { workspaceDir: join(root, "teams"), publishHeads: false, ...(lineup ? { lineup } : {}), ...(options.trustWorkspaces ? { trustWorkspaces: true } : {}), ...(scenario === "success" || scenario === "reviewer-recording-error" ? {
       commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", receipts] },
     } : scenario === "result-operation-fails-once" ? {
@@ -193,7 +191,6 @@ process.exit(child.status ?? 1);
       }
     } finally { try { await host.stop(); } finally { rmSync(root, { recursive: true, force: true }); } }
   };
-  /** Serve the fixture's parent folder as the sync home and enroll a sibling teamwork folder through the API. */
   const enrollTeamwork = async (sync: Partial<NonNullable<Config["sync"]>> = {}, teamwork = "teamwork") => {
     const home = realpathSync(dirname(source));
     host.config.sync = { homeDir: home, ...sync };

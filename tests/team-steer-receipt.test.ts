@@ -15,10 +15,6 @@ type Saved = { run: TeamRun; receipts: Record<string, string>; pending?: { kind:
 const revokedEvent = "Delegated permission decisions were revoked by the owner.";
 const count = (view: TeamView, text: string) => view.events.filter(event => event.text.startsWith(text)).length;
 
-/**
- * Stops the host right after its `stopAt`-th record write once armed. The Blackboard mirror runs after each sealed
- * write lands; from then on the record cannot be written, as if the process died before its next write.
- */
 function hostStop(f: Fixture, stopAt: number) {
   let armed = false, writes = 0, restore: (() => void) | undefined;
   const entries = { retryable: () => false, mirror: () => {
@@ -28,7 +24,6 @@ function hostStop(f: Fixture, stopAt: number) {
   return { entries: entries as unknown as Blackboard, arm: () => { armed = true; }, stopped: () => restore !== undefined, restart: () => restore?.() };
 }
 
-/** Runs `act` once per record write it makes, stopping the host after that write, and checks a retry on a restarted host. */
 async function eachStop(setup: (f: Fixture) => void, act: (f: Fixture, teams: TeamService) => Promise<TeamView>, retry: (f: Fixture, teams: TeamService, stopAt: number) => Promise<void>) {
   for (let stopAt = 1; ; stopAt++) {
     assert.ok(stopAt <= 10, "the action makes a bounded number of record writes");
@@ -45,7 +40,6 @@ async function eachStop(setup: (f: Fixture) => void, act: (f: Fixture, teams: Te
   }
 }
 
-/** A run whose coordinator approved one permission answer; the owner has one question open. */
 function delegatedRun(f: Fixture) {
   const target = f.run.members[0], at = new Date().toISOString();
   const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
@@ -62,12 +56,6 @@ function delegatedRun(f: Fixture) {
   f.writeTeam();
 }
 
-/**
- * Starts the host's own delivery of the approved answer, which saves its pending result operation and marks the
- * decision answering, then starts `act` and stops the host while the action's invalidation waits for the worker to
- * fence that answer. The first service is abandoned at that call, which never returns; a second one opens over what
- * the first saved. Only fences asked after the restart are counted.
- */
 async function stopInFence(f: Fixture, act: (teams: TeamService) => Promise<TeamView>) {
   let restarted = false, dispatched!: () => void, stopped!: () => void;
   const answering = new Promise<void>(resolve => { dispatched = resolve; }), fencing = new Promise<void>(resolve => { stopped = resolve; });
@@ -82,7 +70,6 @@ async function stopInFence(f: Fixture, act: (teams: TeamService) => Promise<Team
   const first = f.openTeam();
   type Deliver = { deliverApprovedDecision(stored: Saved, decision: TeamPermissionDecision): Promise<void> };
   const host = first as unknown as Deliver & { record(id: string): Saved; permissions?: Deliver };
-  // The delivery lives on the service until the teams.ts split (INF-330) moves it into the permission cluster.
   const delivery = host.permissions ?? host;
   const stored = host.record(f.run.id);
   await delivery.deliverApprovedDecision(stored, stored.run.permissionDecisions![0]!);
@@ -103,14 +90,12 @@ test("whichever record write a steer stops after, a retry of the same request ap
     assert.equal(replayed.revision, 2, `a stop after write ${stopAt} must not answer the retry without the steer`);
     assert.deepEqual(replayed.steering.map(item => item.text), [request.text]);
     assert.ok(f.readRecord<Saved>("team", f.run.id).receipts[request.requestId], "the receipt is saved with the steer");
-    // The request took effect: a further retry succeeds without re-checking its revision and steers nothing more.
     const again = await teams.steer(f.run.id, request);
     assert.equal(again.revision, 2);
     assert.deepEqual(again.steering.map(item => item.text), [request.text]);
   });
 });
 
-// A run the owner paused, and one blocked on a stalled member, which may replan: both resume under a new revision.
 for (const status of ["paused", "blocked"] as const) {
   test(`whichever record write a resume of a ${status} run stops after, a retry of the same request resumes it exactly once`, async () => {
     const resumed = "Team resumed with a fresh plan.", request = { requestId: randomUUID(), revision: 1 };
@@ -171,7 +156,6 @@ test("a host stop while an owner answer fences an answer in delivery keeps the o
     const question = f.run.decisions[0]!, request = { requestId: randomUUID(), revision: 1, text: "a" };
     const { teams } = await stopInFence(f, teams => teams.answer(f.run.id, question.id, request));
 
-    // The restart blocks the run on its retained delivery operation, so only a recorded answer can still be acknowledged.
     const retried = await teams.answer(f.run.id, question.id, request);
     assert.equal(retried.decisions.find(item => item.id === question.id)?.answer, request.text);
     assert.equal(count(retried, "A user decision was recorded."), 1);

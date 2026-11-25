@@ -8,7 +8,6 @@ import { connectRemoteAccess } from "../packages/host/src/remote-access.js";
 import { inProcessHost } from "./helpers.js";
 import { httpRunner, wireProxy } from "./remote-fixture.js";
 
-/** Load phone modules with Node stand-ins for React Native, Expo and React. */
 function loadPhone() {
   if (typeof nodeModule.registerHooks !== "function") return undefined;
   const native = new URL("./fixtures/mobile-native.ts", import.meta.url).href;
@@ -514,7 +513,6 @@ test("useLive starts its stale grace on return after an absence longer than thir
     available = false;
     setEventStreamsUnavailable(true);
     cursor = 42;
-    // Model iOS suspending JS timers while away: advance wall time without running the grace timer.
     t.mock.timers.setTime(1_031_001);
     await flush();
     assert.deepEqual(status(), { online: true, stale: false }, "background time does not mutate live status");
@@ -568,7 +566,6 @@ test("useLive restarts stale presentation grace on return when it was stale befo
     assert.deepEqual(status(), { online: false, stale: true }, "a failed stream becomes stale before backgrounding");
 
     setAppState("background");
-    // Model JS suspension without firing the background grace timer.
     t.mock.timers.setTime(Date.now() + 31_001);
     setAppState("active");
     await flush();
@@ -725,7 +722,6 @@ test("a phone poll stays live through a brief switch only until three seconds pa
     await settle(0);
     assert.deepEqual(status(), { online: true, stale: false });
 
-    // iOS reports inactive for the app switcher, Control Center and Face ID; polling continues.
     t.mock.timers.tick(1000);
     setAppState("inactive");
     t.mock.timers.tick(3000);

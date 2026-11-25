@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import * as egress from "../packages/host/src/egress.js";
-// @ts-ignore -- a dependency-free script without type declarations
+// @ts-expect-error
 import { createEgressProxy } from "../scripts/egress-proxy.mjs";
 
 const root = mkdtempSync(join(tmpdir(), "egress-eval-test-"));
@@ -45,7 +45,6 @@ async function startProxy(policy: unknown) {
   return { proxy, loaded, port: address.port as number, records, summaryFile };
 }
 
-/** The status of a CONNECT through the proxy, with the Proxy-Authorization header given. */
 function connectStatus(port: number, target: string, authorization: string): Promise<number> {
   return new Promise((resolve, reject) => {
     const socket = connect(port, "127.0.0.1");
@@ -67,13 +66,11 @@ function connectStatus(port: number, target: string, authorization: string): Pro
   });
 }
 
-/** The Basic header a proxy URL's user information stands for. */
 function authorizationOf(proxyUrl: string | undefined): string {
   const url = new URL(proxyUrl ?? "http://missing.invalid");
   return `Basic ${Buffer.from(`${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`).toString("base64")}`;
 }
 
-/** The project label of a proxy URL's credential: the part of the user name before the session. */
 const projectOf = (proxyUrl: string | undefined) => decodeURIComponent(new URL(proxyUrl ?? "http://missing.invalid").username).split(".")[0];
 
 function workerEnv(port: number, projectId: string, purpose?: string, nowMs?: number) {
@@ -95,7 +92,6 @@ test("an eval session leaves the network only for its own list", async t => {
   egress.installHostEgress({ autonomy: { boundary: { egress: { proxyUrl: `http://127.0.0.1:${fixture.port}`, keyPath } } } } as never, {} as NodeJS.ProcessEnv);
   assert.deepEqual(fixture.loaded, { mode: "enforce", error: null }, "the policy with the eval lists loads");
 
-  // A replay session's credential is the eval identity, and reaches only its own list.
   const replay = workerEnv(fixture.port, "project-a", "replay");
   assert.equal(replay.status, "on");
   assert.equal(projectOf(replay.env.HTTPS_PROXY), "_eval", "a replay session mints the _eval identity");
@@ -104,7 +100,6 @@ test("an eval session leaves the network only for its own list", async t => {
   assert.equal(await connectStatus(fixture.port, `registry.example:${echo.port}`, replayAuth), 403, "the host-wide allow list never applies to _eval");
   assert.equal(await connectStatus(fixture.port, `packages.example:${echo.port}`, replayAuth), 403);
 
-  // The setup identity reaches only the package registries, and only for its lifetime.
   const setup = egress.evalProxyUrl("_eval-setup", SESSION, SETUP_SECONDS);
   assert.equal(projectOf(setup), "_eval-setup");
   const setupAuth = authorizationOf(setup);
@@ -114,12 +109,10 @@ test("an eval session leaves the network only for its own list", async t => {
   const expired = egress.evalProxyUrl("_eval-setup", SESSION, SETUP_SECONDS, Date.now() - (SETUP_SECONDS + 1) * 1000);
   assert.equal(await connectStatus(fixture.port, `packages.example:${echo.port}`, authorizationOf(expired)), 407, "a setup credential past its 900 seconds is refused");
 
-  // A work session keeps its project and its project's list, which here is the host-wide allow list.
   const work = workerEnv(fixture.port, "project-a", "work");
   assert.equal(projectOf(work.env.HTTPS_PROXY), "project-a", "a work session keeps its project");
   assert.equal(await connectStatus(fixture.port, `registry.example:${echo.port}`, authorizationOf(work.env.HTTPS_PROXY)), 200);
 
-  // Without projects._eval, an eval credential reaches nothing, not even the host-wide list.
   const bare = await startProxy({ mode: "enforce", ports: [echo.port], allow: ["registry.example"], allowPrivate });
   t.after(() => bare.proxy.close());
   const bareReplay = workerEnv(bare.port, "project-a", "replay");

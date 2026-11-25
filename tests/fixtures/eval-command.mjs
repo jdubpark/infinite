@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-// Same-user stand-in for the eval launcher (deploy/ubuntu/eval-command.sh), for tests only.
-// It runs as the current user and follows the launcher's argument contract. Flags come before the operation.
-// It never signals a process, and it deletes only inside the --root, --home, and --tmp it was given.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -36,7 +33,6 @@ function exit(code, data) {
   else process.exit(code);
 }
 
-// One record per call: the operation's argv and the working directory the fixture ran in. Never stdin.
 if (opts.record) fs.appendFileSync(opts.record, `${JSON.stringify({ argv: [op, ...rest], cwd: process.cwd() })}\n`);
 
 const trialsDir = () => path.join(opts.root, "trials");
@@ -64,7 +60,6 @@ function readable(file) {
   }
 }
 
-/** Every path under dir, without following links, at most CAP. Each entry is { rel, dir, file }. */
 function entriesUnder(dir) {
   const out = [];
   const visit = (abs, rel) => {
@@ -85,7 +80,6 @@ function entriesUnder(dir) {
   return out;
 }
 
-/** True when a home path is allowed: a login path, a directory on the way to one, or a template path. */
 function keepPath(rel) {
   if (LOGIN_PATHS.some(login => login === rel || login.startsWith(`${rel}/`))) return true;
   return lstatOrNull(path.join(opts.template, rel)) !== null;
@@ -99,7 +93,6 @@ function differs(a, b) {
   }
 }
 
-/** What clearObstructions removes: one per login path, at the first obstruction on its way, or at the login itself. */
 function obstructions() {
   let n = 0;
   for (const login of LOGIN_PATHS) {
@@ -141,11 +134,9 @@ function probe(rest) {
   let fetch = "skipped";
   if (rest[0] === "--fetch") {
     if (rest.length < 2) exit(64);
-    // The proxy URL arrives on stdin's first line. The fixture reads it and records nothing of it.
     try {
       fs.readFileSync(0, "utf8");
     } catch {
-      // stdin closed: nothing to read.
     }
     fetch = opts.fetch;
     rest = rest.slice(2);
@@ -224,7 +215,6 @@ function check(trial, rest) {
   exit(0);
 }
 
-/** Sets the working directory's trial, or refuses: the cwd must be ROOT/trials/TRIAL/work or below. */
 function cwdTrial() {
   const real = fs.realpathSync(process.cwd());
   const relative = path.relative(path.join(fs.realpathSync(opts.root), "trials"), real).split(path.sep);
@@ -244,13 +234,11 @@ function setup(rest) {
   try {
     fs.readFileSync(0, "utf8");
   } catch {
-    // stdin closed: nothing to read.
   }
   const result = spawnSync(rest[1], rest.slice(2), { stdio: ["ignore", "inherit", "inherit"] });
   exit(result.status ?? 1);
 }
 
-// Signals nothing: the tests that need a process to survive inject their own inventory.
 function stop() {
   exit(0);
 }
@@ -272,7 +260,6 @@ function clean() {
   exit(0);
 }
 
-/** Removes what stands on the way to a login path, as the launcher's clear_obstructions does. */
 function clearObstructions() {
   for (const login of LOGIN_PATHS) {
     const parts = login.split("/");
@@ -291,7 +278,6 @@ function clearObstructions() {
   }
 }
 
-/** Removes every home entry except the login files and the directories on the way to them. */
 function pruneHome(dir, rel) {
   for (const name of fs.readdirSync(dir)) {
     const next = rel ? `${rel}/${name}` : name;

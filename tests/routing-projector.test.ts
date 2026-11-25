@@ -57,7 +57,6 @@ function payload(taskId: string): RoutingPayload {
   };
 }
 
-/** A pending `auto` start row for the task's first implementer, as the host writes it before the member exists. */
 function pendingRow(tx: EvidenceTx, runId: string, taskId: string, profileId: string, revision = 1, state: DecisionRow["state"] = "pending"): DecisionRow {
   return {
     key: decisionKey(runId, revision, tx.index("task", taskId), "start", 1),
@@ -98,7 +97,6 @@ function seedRows(store: EvidenceStore, rows: { runId: string; taskId: string; p
 
 let sequence = 0;
 
-/** A run event with a unique key. `seq` is what the projector sees. */
 function runEvent(kind: string, runId: string, fields: {
   revision?: number; memberId?: string; taskId?: string; data?: Record<string, unknown>;
 } = {}): RunEvent {
@@ -119,7 +117,6 @@ function runEvent(kind: string, runId: string, fields: {
 const started = (runId: string, taskId: string, memberId: string, profileId: string, extra: Record<string, unknown> = {}, revision = 1) =>
   runEvent("member.started", runId, { taskId, memberId, revision, data: { role: "implementer", profileId, ...extra } });
 
-/** Projects events one at a time in one write each, the way the outbox calls the projector. */
 function project(store: EvidenceStore, events: RunEvent[]): void {
   const projector = routingProjector();
   for (const event of events) store.write(tx => projector.project(tx, event));
@@ -208,8 +205,6 @@ test("projecting again, in each order of three events or after a restart, change
     }
   }
 
-  // A restart: events stored before the projector existed are projected by the first advance after it, and a
-  // reopened store projects nothing again.
   const f = fixture();
   try {
     let store = open(f);
@@ -250,7 +245,6 @@ test("projecting again, in each order of three events or after a restart, change
 const ESCALATION_PROFILE = "sonnet-escalation";
 const SCOUT_PROFILE = "haiku-light";
 
-/** A pending row at `point` for the task (or scout), as the host writes it before its member starts. */
 function pendingAt(tx: EvidenceTx, runId: string, taskId: string, profileId: string, point: RoutingPoint, revision = 1, state: DecisionRow["state"] = "pending"): DecisionRow {
   const row = pendingRow(tx, runId, taskId, profileId, revision, state);
   return { ...row, key: decisionKey(runId, revision, row.taskKey, point, 1), point, role: point === "scout" ? "scout" : "implementer" };

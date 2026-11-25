@@ -10,11 +10,10 @@ const base: UsageRecord = {
 
 test("configured prices override the reported cost and are per million tokens", () => {
   const record = { ...base, tokens: { input: 1_000_000, output: 500_000, reasoning: 0, cacheRead: 2_000_000, cacheWrite: 0 }, reportedCost: 9 };
-  // The expected sum is a float sum in the test itself (0.30800000000000005), so compare within 1e-9.
   const configured = priceUsage(record, { "deepseek/deepseek-flash": { input: 0.14, output: 0.28, cacheRead: 0.014 } });
   assert.ok(Math.abs(configured.cost - (0.14 + 0.14 + 0.028)) < 1e-9);
   assert.equal(configured.pricing, "configured");
-  assert.deepEqual(priceUsage(record, { "deepseek/deepseek-flash": { input: 1, output: 1 } }).cost, 1 + 0.5 + 2); // cacheRead defaults to input
+  assert.deepEqual(priceUsage(record, { "deepseek/deepseek-flash": { input: 1, output: 1 } }).cost, 1 + 0.5 + 2);
 });
 
 test("reasoning tokens bill at the output rate", () => {
@@ -34,11 +33,11 @@ test("a record whose model was never observed is unknown, whatever its reported 
 });
 
 test("period starts are UTC day, Monday week, and month", () => {
-  const now = new Date("2026-10-17T15:00:00Z"); // a Saturday
+  const now = new Date("2026-10-17T15:00:00Z");
   assert.equal(periodStart("day", now).toISOString(), "2026-10-17T00:00:00.000Z");
   assert.equal(periodStart("week", now).toISOString(), "2026-10-12T00:00:00.000Z");
   assert.equal(periodStart("month", now).toISOString(), "2026-10-01T00:00:00.000Z");
-  assert.equal(periodStart("week", new Date("2026-10-18T00:00:00Z")).toISOString(), "2026-10-12T00:00:00.000Z"); // a Sunday ends the week
+  assert.equal(periodStart("week", new Date("2026-10-18T00:00:00Z")).toISOString(), "2026-10-12T00:00:00.000Z");
 });
 
 test("sumUsage rounds the total to micro-dollars once, not per row", () => {

@@ -25,7 +25,6 @@ import { mixedLineup } from "./team-fixture.js";
 
 const NOW = "2026-11-15T12:00:00.000Z";
 const ago = (days: number) => new Date(Date.parse(NOW) - days * 86_400_000).toISOString();
-/** A period that ended 20 days ago, so an auto pin is taken. */
 const ENDED = ago(20);
 const PATHS = ["packages/host/src/a.ts"];
 const AREA = "host";
@@ -47,7 +46,6 @@ const ALL = (store: EvidenceStore) => {
   store.register(routingModule());
 };
 
-/** A fresh store with the modules `register` adds. A fixed vault key keeps the blind indexes stable. */
 function withStore(fn: (store: EvidenceStore) => void, register: (store: EvidenceStore) => void = ALL): void {
   const root = mkdtempSync(join(tmpdir(), "infinite-routing-auto-"));
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: Buffer.alloc(32, 7) });
@@ -60,7 +58,6 @@ function withStore(fn: (store: EvidenceStore) => void, register: (store: Evidenc
   }
 }
 
-/** A store whose evidence directory is a file, so it opens unavailable. */
 function withBrokenStore(fn: (store: EvidenceStore) => void): void {
   const root = mkdtempSync(join(tmpdir(), "infinite-routing-auto-broken-"));
   try {
@@ -91,7 +88,6 @@ const effortOf = (profile: TeamModelProfile) => ("effort" in profile ? profile.e
 const identityOf = (profile: TeamModelProfile) => profileIdentityKey({ provider: profile.provider, model: profile.model, effort: effortOf(profile) });
 const versionOf = (profile: TeamModelProfile) => promptVersion("implementer", profile.provider, profile, false, false);
 
-/** Counts the store's `read` calls made while `fn` runs. */
 function countReads(store: EvidenceStore, fn: () => void): number {
   const original = store.read.bind(store) as EvidenceStore["read"];
   let reads = 0;
@@ -107,7 +103,6 @@ function countReads(store: EvidenceStore, fn: () => void): number {
   return reads;
 }
 
-/** Counts the store's `tryWrite` calls made while `fn` runs. */
 function countWrites(store: EvidenceStore, fn: () => void): number {
   const original = store.tryWrite.bind(store) as EvidenceStore["tryWrite"];
   let writes = 0;
@@ -128,7 +123,6 @@ function config(tx: EvidenceTx, id: string, profile: TeamModelProfile, version: 
     + "VALUES (?, ?, ?, ?, ?, 'g', 'k', 'off', 's', ?)", id, profile.provider, profile.model, effortOf(profile), version, NOW);
 }
 
-/** An implementer start that integrated, was held, and froze. */
 function integrated(spec: { id: string; profile: TeamModelProfile; configId: string; endedAt?: string; area?: string }): OutcomeRow {
   const payload: OutcomePayload = { projectId: "rehearsal", taskId: "task-x", area: spec.area ?? AREA, featureMap: "default",
     rounds: { run: 1, attributed: 1, unknown: 0 }, limitEvents: 0, costCoverage: "none" };
@@ -201,32 +195,26 @@ test("a second start reuses the pending row and the task's routing", () => withS
   const first = rec.applyStart(startOf(run, a))!;
   const before = rowsOf(store, run.id, "task-a")[0]!;
 
-  // Thirty counted rows for the astra identity arrive between the two starts, so a fresh decision would differ.
   store.write(tx => {
     for (let index = 0; index < 30; index++) {
       writeOutcome(tx, integrated({ id: `late-${index}`, profile: mixedLineup.implementers[1]!, configId: "none", endedAt: NOW }));
     }
   });
 
-  // A lost save: the task's routing is gone, but the row is still there.
   delete a.routing;
   let second: TeamModelProfile | undefined;
-  // The stored row answers the read, so the start writes nothing.
   assert.equal(countWrites(store, () => { second = rec.applyStart(startOf(run, a)); }), 0);
   assert.equal(second!.id, first.id);
   assert.equal(countRows(store), 1);
   assert.deepEqual(rowsOf(store, run.id, "task-a")[0], before);
   assert.deepEqual(a.routing, { profileId: first.id, by: "router" });
 
-  // With the task's routing kept, the start reads nothing at all.
   const reads = countReads(store, () => rec.applyStart(startOf(run, a)));
   assert.equal(reads, 0);
 }));
 
 test("every failure starts the fallback profile with one run line", () => {
-  // The unavailable store: a is assigned its pick only when the pick passes, else astra; b is astra.
   withBrokenStore(store => {
-    // The default profile is the first implementer that passes rules 1 and 2: astra, or spark when contributors are allowed.
   for (const [allowContributor, expectedA, expectedB] of [[false, "astra-xhigh", "astra-xhigh"], [true, "spark-high", "spark-high"]] as const) {
       const routing = pinRouting({ mode: "auto", allowContributor }, "supervised", mixedLineup, ENDED)!;
       const run = runOf(mixedLineup, routing, `run-unavailable-${allowContributor}`);
@@ -253,7 +241,6 @@ test("every failure starts the fallback profile with one run line", () => {
     const b = taskOf("b");
     run.tasks.push(a, b);
     const lines: string[] = [];
-    // Each decision reads the clock twice: 0 at its start, 251 at its end.
     let tick = 0;
     const rec = recorder(store, lines, () => (tick++ % 2 === 0 ? 0 : 251));
     const pa = rec.applyStart(startOf(run, a))!;
@@ -311,7 +298,6 @@ test("every failure starts the fallback profile with one run line", () => {
 
 test("the guards make exploratory picks greedy in a real store, and the payload records them", () => withStore(store => {
   const routing = pinRouting({ mode: "auto", allowContributor: true }, "supervised", mixedLineup, ENDED)!;
-  // Ten applied, non-exploratory starts fill the window.
   const seed = runOf(mixedLineup, routing, "run-seed");
   const seedRec = recorder(store);
   for (let index = 0; index < 10; index++) {
@@ -334,7 +320,6 @@ test("the guards make exploratory picks greedy in a real store, and the payload 
     return { before, row };
   };
 
-  // Unpaused: some starts explore, and each exploratory one satisfies the share before it was taken.
   const unpaused = Array.from({ length: 50 }, (_, index) => start(index));
   const explored = unpaused.filter(item => item.row.explore);
   assert.ok(explored.length > 0, "some unpaused starts explore");
@@ -344,7 +329,6 @@ test("the guards make exploratory picks greedy in a real store, and the payload 
   }
   for (const { row } of unpaused) assert.equal(row.payload?.guards?.pausedAt, null);
 
-  // Paused: no start explores, and every start that would have explored is greedy-paused.
   store.write(tx => { setExplorePause(tx, "rehearsal", NOW, NOW); });
   const paused = Array.from({ length: 50 }, (_, index) => start(100 + index));
   assert.equal(paused.filter(item => item.row.explore).length, 0);
@@ -353,7 +337,6 @@ test("the guards make exploratory picks greedy in a real store, and the payload 
     assert.ok(row.basis === "greedy-paused" || (row.basis === "sampled" && row.chosenProfileId === row.greedyProfileId));
     assert.equal(row.payload?.guards?.pausedAt, NOW);
   }
-  // Every payload holds the spare attempts of its run.
   for (const { run, row } of starts) {
     assert.equal(row.payload?.guards?.spareAttempts, spareAttempts(run));
   }
@@ -366,7 +349,6 @@ test("the pin is auto only after the stored period end, and refuses without cove
   const saved: TeamRouting = { mode: "auto" };
   const contributorOnly: TeamLineup = { ...mixedLineup, implementers: [mixedLineup.implementers[0]!] };
 
-  // Recorded starts decided at `at`. The first 49 leave the period open.
   const recordStarts = (prefix: string, count: number, at: string, projectId = "rehearsal") => {
     const shadowRun = runOf(mixedLineup, pinRouting(undefined, "autonomous", mixedLineup), `run-rec-${prefix}`, projectId);
     const recording = new RoutingRecorder({ store, now: () => at, log: () => undefined });
@@ -375,7 +357,6 @@ test("the pin is auto only after the stored period end, and refuses without cove
     }
   };
 
-  // Fifty recorded starts 5 days ago meet the count, but the end, the first start plus 14 days, has not passed.
   recordStarts("early", 50, ago(5), "early");
   assert.deepEqual(pinner.pin(saved, "supervised", mixedLineup, "early"), pinRouting(saved, "supervised", mixedLineup));
   assert.equal(store.read(db => readProjectState(db, "early")).periodEndedAt, null, "no end is stored before it passes");
@@ -384,7 +365,6 @@ test("the pin is auto only after the stored period end, and refuses without cove
   assert.deepEqual(pinner.pin(saved, "supervised", mixedLineup, "rehearsal"), pinRouting(saved, "supervised", mixedLineup));
   assert.deepEqual(store.read(db => readProjectState(db, "rehearsal")), { periodEndedAt: null, explorePausedAt: null });
 
-  // The 50th recorded start, 15 days ago, ends the period at its first start plus 14 days.
   recordStarts("a-last", 1, ago(15));
   const firstPin = pinner.pin(saved, "supervised", mixedLineup, "rehearsal") as Extract<TeamRunRouting, { mode: "auto" }>;
   assert.equal(firstPin.mode, "auto");
@@ -392,22 +372,18 @@ test("the pin is auto only after the stored period end, and refuses without cove
   assert.equal(firstPin.digest, pinRouting(saved, "supervised", mixedLineup, ago(1))!.digest);
   assert.equal(store.read(db => readProjectState(db, "rehearsal")).periodEndedAt, ago(1));
 
-  // Retention removes the first 20 rows. The stored end does not move.
   store.write(tx => { tx.run("DELETE FROM routing_decisions WHERE key IN (SELECT key FROM routing_decisions ORDER BY decided_at, key LIMIT 20)"); });
   const secondPin = pinner.pin(saved, "supervised", mixedLineup, "rehearsal") as Extract<TeamRunRouting, { mode: "auto" }>;
   assert.equal(secondPin.periodEndedAt, ago(1));
 
-  // A saved auto with no implementer that passes the fixed rules refuses.
   assert.throws(() => pinner.pin(saved, "supervised", contributorOnly, "rehearsal"), (error: unknown) =>
     error instanceof TeamError && error.status === 409 && error.code === "routing-no-eligible-profile");
 
-  // The autonomous default never refuses: it pins shadow, logs its line once, and pins shadow over an all-contributor lineup.
   const defaultPin = pinner.pin(undefined, "autonomous", contributorOnly, "rehearsal");
   assert.deepEqual(defaultPin, pinRouting(undefined, "autonomous", contributorOnly));
   pinner.pin(undefined, "autonomous", contributorOnly, "rehearsal");
   assert.deepEqual(lines, [LINE.uncovered]);
 
-  // A saved shadow, a supervised project without a policy, and a saved policy read no store.
   assert.equal(countReads(store, () => pinner.pin({ mode: "shadow" }, "autonomous", mixedLineup, "rehearsal")), 0);
   assert.equal(countReads(store, () => pinner.pin(undefined, "supervised", mixedLineup, "rehearsal")), 0);
 }));
@@ -429,7 +405,6 @@ test("a stored period end is read from the table, and markPeriodEnded keeps the 
   assert.equal(store.read(db => readProjectState(db, "rehearsal")).periodEndedAt, ago(3));
 }));
 
-/** The points lineup: spark is a contributor, astra has no tier, haiku is light, opus is strong and on the reviewer's model. */
 const POINT_LINEUP: TeamLineup = {
   ...mixedLineup,
   implementers: [
@@ -455,7 +430,6 @@ const escalationOf = (run: TeamRun, task: TeamTask, ownProfileId: string | undef
   ({ ...startOf(run, task), ownProfileId, namedProfileId });
 const scoutOf = (run: TeamRun, scout: TeamScout): RouterScout => ({ run, scout, featureMap: undefined, limited: new Set() });
 
-/** An integrated implementer row that replaced a member by escalation, so its point is `escalation`. */
 const escalated = (spec: Parameters<typeof integrated>[0]): OutcomeRow => {
   const row = integrated(spec);
   return { ...row, payload: { ...row.payload, replaces: { memberId: "m0", cause: "escalation" } } };
@@ -470,7 +444,6 @@ test("an escalation decision is greedy over escalation evidence only, and writes
     run.tasks.push(task);
     store.write(tx => {
       for (let index = 0; index < 10; index++) writeOutcome(tx, escalated({ id: `esc-sonnet-${index}`, profile: SONNET_E, configId: "none", endedAt: NOW }));
-      // Start rows for astra-escalation's identity do not count at the escalation point.
       for (let index = 0; index < 10; index++) writeOutcome(tx, integrated({ id: `start-astra-${index}`, profile: ASTRA_E, configId: "none", endedAt: NOW }));
     });
 
@@ -500,7 +473,6 @@ test("an escalation decision is greedy over escalation evidence only, and writes
     assert.equal(countRows(store), 1);
   });
 
-  // With no evidence, the two candidates tie and the first in lineup order wins.
   withStore(fresh => {
     const routing = pinRouting(POINTS_PIN, "supervised", POINT_LINEUP, ENDED)!;
     const run = runOf(POINT_LINEUP, routing, "run-tie");
@@ -509,7 +481,6 @@ test("an escalation decision is greedy over escalation evidence only, and writes
     assert.deepEqual(decideAutoEscalation(fresh, escalationOf(run, task, "astra-xhigh"), () => NOW, () => 0), { profile: ASTRA_E, by: "router" });
   });
 
-  // Own profile sonnet-escalation, with the same evidence: the pick is astra-escalation, and sonnet is not a candidate.
   withStore(store => {
     const routing = pinRouting(POINTS_PIN, "supervised", POINT_LINEUP, ENDED)!;
     store.write(tx => {
@@ -523,7 +494,6 @@ test("an escalation decision is greedy over escalation evidence only, and writes
     const row = rowsOf(store, run.id, "task-own")[0]!;
     assert.equal(row.payload?.candidates.some(candidate => candidate.profileId === SONNET_E.id), false);
 
-    // A named escalation profile does not steer the pick. The row records it beside the router's pick.
     const named = taskOf("task-named");
     run.tasks.push(named);
     assert.deepEqual(decideAutoEscalation(store, escalationOf(run, named, "astra-xhigh", ASTRA_E.id), () => NOW, () => 0), { profile: SONNET_E, by: "router" });
@@ -541,15 +511,12 @@ test("an applied escalation of the router's counts at full weight at the escalat
     run.tasks.push(task);
     return decideAutoEscalation(store, escalationOf(run, task, "astra-xhigh"), () => NOW, () => 0);
   };
-  // With no evidence yet, the router picks astra four times. Those runs then integrate, as do six sonnet escalations.
   for (let index = 0; index < 4; index++) assert.deepEqual(decide(`esc-astra-${index}`), { profile: ASTRA_E, by: "router" });
   store.write(tx => {
     for (let index = 0; index < 4; index++) writeOutcome(tx, escalated({ id: `esc-astra-${index}`, profile: ASTRA_E, configId: "none", endedAt: NOW }));
     for (let index = 0; index < 6; index++) writeOutcome(tx, escalated({ id: `esc-sonnet-${index}`, profile: SONNET_E, configId: "none", endedAt: NOW }));
   });
-  // Pending, the astra rows weigh 4 x 0.5 against sonnet's 6 x 0.5.
   assert.deepEqual(decide("run-pending"), { profile: SONNET_E, by: "router" });
-  // Applied with their members, they weigh 4 x 1 against 6 x 0.5.
   store.write(tx => { tx.run("UPDATE routing_decisions SET state='applied', member_id='m1' WHERE run_id LIKE 'esc-astra-%'"); });
   assert.deepEqual(decide("run-applied"), { profile: ASTRA_E, by: "router" });
 }));
@@ -557,7 +524,6 @@ test("an applied escalation of the router's counts at full weight at the escalat
 test("a scout decision reads no outcome and writes one pending row", () => withStore(store => {
   const routing = pinRouting(POINTS_PIN, "supervised", POINT_LINEUP, ENDED)!;
   const run = runOf(POINT_LINEUP, routing, "run-scout");
-  // Twenty integrated starts for the astra identity would move a posterior. A scout reads none of them.
   store.write(tx => {
     for (let index = 0; index < 20; index++) writeOutcome(tx, integrated({ id: `scout-start-${index}`, profile: POINT_LINEUP.implementers[1]!, configId: "none", endedAt: NOW }));
   });
@@ -597,7 +563,6 @@ test("a second decision for one key reuses its row, even when its payload does n
   assert.deepEqual(decideAutoEscalation(store, escalationOf(run, task, "astra-xhigh"), () => NOW, () => 0), { profile: SONNET_E, by: "router" });
   assert.deepEqual(decideAutoScout(store, scoutOf(run, SCOUT), () => NOW, () => 0), { profile: POINT_LINEUP.implementers[1], by: "router" });
 
-  // Thirty astra escalations would flip a fresh decision. The stored row is the answer, and its payload no longer opens.
   store.write(tx => {
     for (let index = 0; index < 30; index++) writeOutcome(tx, escalated({ id: `repeat-astra-${index}`, profile: ASTRA_E, configId: "none", endedAt: NOW }));
     tx.run("UPDATE routing_decisions SET encrypted_payload='not-sealed' WHERE run_id=?", run.id);

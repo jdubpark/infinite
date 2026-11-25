@@ -132,7 +132,6 @@ test("summaries are one bounded line", () => {
   assert.equal(entrySummary("a\nb\t c\u0007d", "x"), "a b c d");
   assert.equal(entrySummary("é".repeat(300), "x"), "é".repeat(120));
   assert.equal(entrySummary(" \n", "fallback"), "fallback");
-  // A 4-byte character that would cross the 240-byte limit is dropped whole.
   const emoji = "\u{1F600}";
   const summary = entrySummary("a".repeat(239) + emoji, "x");
   assert.equal(summary, "a".repeat(239));

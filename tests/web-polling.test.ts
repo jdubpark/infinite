@@ -5,8 +5,6 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { chromium, type Browser, type Page } from "playwright";
 
-// Runs the web client's conversation panel and control lease in Chromium and toggles page visibility to check their requests.
-// PLAYWRIGHT_CHROMIUM_PATH selects a Chromium build other than the one `npx playwright install chromium` provides.
 const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH || chromium.executablePath();
 const skip = existsSync(executablePath) ? false : "Chromium for Playwright is not installed; run `npx playwright install chromium`";
 const harness = fileURLToPath(new URL("./fixtures/web-polling-harness.tsx", import.meta.url));
@@ -61,7 +59,6 @@ describe("web conversation polling", { skip }, () => {
   test("a hidden tab stops polling, and returning to it polls at once", async () => {
     const page = await open();
     try {
-      // The idle interval is 1.5 seconds, so a visible tab adds a request about that often.
       await page.waitForFunction(() => (window as unknown as { polling: { requests: number } }).polling.requests >= 2, undefined, { timeout: 4000 });
       await setVisibility(page, "hidden");
       await page.waitForTimeout(100);
@@ -70,7 +67,6 @@ describe("web conversation polling", { skip }, () => {
       assert.equal(await requests(page), hidden);
 
       await setVisibility(page, "visible");
-      // Returning polls immediately, well inside the 1.5-second interval.
       await page.waitForFunction(count => (window as unknown as { polling: { requests: number } }).polling.requests > count, hidden, { timeout: 500 });
     } finally {
       await page.close();
@@ -85,7 +81,6 @@ describe("web conversation polling", { skip }, () => {
       await page.waitForFunction(() => (window as unknown as { polling: Control }).polling.pending.length === 1, undefined, { timeout: 4000 });
       await setVisibility(page, "hidden");
       await setVisibility(page, "visible");
-      // The earlier read is still unanswered, yet returning starts a new one at once.
       await page.waitForFunction(() => (window as unknown as { polling: Control }).polling.pending.length === 2, undefined, { timeout: 500 });
       await page.evaluate(() => {
         const [before, after] = (window as unknown as { polling: Control }).polling.pending;
@@ -117,7 +112,6 @@ describe("web conversation polling", { skip }, () => {
       await warning.waitFor({ state: "hidden", timeout: 500 });
       await page.waitForTimeout(1500);
       assert.equal(await warning.count(), 0);
-      // The read started on return is still unanswered, so the warning comes back after the grace period.
       await warning.waitFor({ timeout: 3000 });
     } finally {
       await page.close();

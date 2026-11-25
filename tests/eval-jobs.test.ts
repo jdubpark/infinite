@@ -85,7 +85,6 @@ function fixture(): Fixture {
   };
 }
 
-/** A candidate, valid, or rejected captured or mined row, written the way the store's own tests write one. */
 function addTask(f: Fixture, taskId: string, options: { state?: string; origin?: string; area?: string; validatedAt?: string | null; projectId?: string } = {}): void {
   const at = new Date(START).toISOString();
   f.store.write(tx => {
@@ -136,7 +135,6 @@ test("a request id makes one job", () => {
     assert.equal(first.job.projectId, PROJECT);
     assert.equal(first.job.status, "scheduled");
 
-    // The default expiry is the clock plus 30 days, so a replay later must still match the body as sent.
     f.setClock(START + 1);
     const moved = f.jobs.create(PROJECT, request, REQUEST_ONE);
     assert.ok("job" in moved, "a replay 1 ms later is not a conflict");
@@ -314,8 +312,6 @@ test("the hot statements read through an index", () => {
   const f = fixture();
   try {
     const cut = new Date(START - 91 * DAY_MS).toISOString();
-    // Each entry names the index the plan must use. JOBS_SQL has no predicate, so SQLite walks eval_jobs_created in
-    // order and stops at LIMIT: the plan reads that index with a SCAN, not a SEARCH.
     const cases = [
       { name: "NEXT_TASK_SQL", sql: NEXT_TASK_SQL, params: ["p", "candidate", ""], index: "eval_tasks_next", search: true },
       { name: "ACTIVE_JOBS_SQL", sql: ACTIVE_JOBS_SQL, params: ["scheduled", 20], index: "eval_jobs_status", search: true },
@@ -341,7 +337,7 @@ test("a failed record frees the next job", () => {
   const f = fixture();
   try {
     const a = f.jobs.create(PROJECT, { kind: "validate", limits: { maxWallMinutes: 600 } }, REQUEST_ONE);
-    f.setClock(START + 1_000); // A is older than B, so the order does not depend on the random job id
+    f.setClock(START + 1_000);
     const b = f.jobs.create(PROJECT_TWO, { kind: "validate", limits: { maxWallMinutes: 600 } }, REQUEST_TWO);
     assert.ok("job" in a && "job" in b);
     addTask(f, "captured:run-1:t01");
@@ -370,7 +366,7 @@ test("while one job's task is in flight, the other job waits", () => {
   const f = fixture();
   try {
     const a = f.jobs.create(PROJECT, { kind: "validate", limits: { maxWallMinutes: 600 } }, REQUEST_ONE);
-    f.setClock(START + 1_000); // A is older than B, so the order does not depend on the random job id
+    f.setClock(START + 1_000);
     const b = f.jobs.create(PROJECT_TWO, { kind: "validate", limits: { maxWallMinutes: 600 } }, REQUEST_TWO);
     assert.ok("job" in a && "job" in b);
     addTask(f, "captured:run-1:t01");
@@ -450,7 +446,6 @@ test("revalidation visits each valid task once", () => {
     );
     assert.ok("job" in job);
     const jobId = job.job.jobId;
-    // Both are valid and older than REVALIDATE_DAYS, so the revalidation phase reaches them.
     const validatedAt = new Date(START - 40 * DAY_MS).toISOString();
     addTask(f, "captured:run-1:v1", { state: "valid", validatedAt });
     addTask(f, "captured:run-1:v2", { state: "valid", validatedAt });

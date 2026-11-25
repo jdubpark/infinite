@@ -153,7 +153,6 @@ const putBatch = (host: Api, body: Buffer, publisherId?: string, generation?: st
     ...(publisherId ? { "X-Infinite-Sync-Publisher": publisherId } : {}), ...(generation ? { "X-Infinite-Sync-Generation": generation } : {}) }, body,
 });
 const ok = async (response: Response) => { assert.equal(response.status, 200, await response.text()); };
-/** The CLI's transport over the real routes; `batches` counts batch requests, and `legacy` answers them as a host without the route would. */
 function transport(host: Api, counts = { batches: 0, singles: 0 }, legacy = false) {
   return (generation: string): ChunkTransport => ({
     has: async hashes => (await host.fetchApi("/projects/rehearsal/sync/has", "owner", { hashes }, syncHeaders(generation))).body.missing,
@@ -166,7 +165,6 @@ function transport(host: Api, counts = { batches: 0, singles: 0 }, legacy = fals
   });
 }
 
-/** Capture the laptop tree, begin a generation, and upload the chunks the host lacks. */
 async function upload(host: Api, laptop: string, storeDir: string, chunks: (generation: string) => ChunkTransport = transport(host)) {
   const manifest = await captureWorkspace({ roots: [laptop], cwd: laptop, storeDir });
   const begin = await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {}, syncHeaders());
@@ -189,12 +187,10 @@ test("sync routes receive a laptop tree, hold it while a session runs, and apply
   try {
     assert.equal((await host.fetchApi("/projects/rehearsal", "viewer")).status, 200);
     assert.equal((await host.fetchApi("/projects/rehearsal/sync/begin", "controller", {})).status, 403);
-    // Authorization runs before the manifest parser: a viewer's malformed body is refused, never parsed.
     const unparsed = await fetch(`${host.origin}/api/projects/rehearsal/sync/commit`, {
       method: "POST", headers: { Authorization: `Bearer ${host.tokens.viewer}`, "Content-Type": "application/json" }, body: "{",
     });
     assert.equal(unparsed.status, 403);
-    // A browser owner can read sync status but cannot move workspace content.
     const login = await fetch(`${host.origin}/api/login`, {
       method: "POST", headers: { Origin: host.origin, "Content-Type": "application/json" }, body: JSON.stringify({ token: host.tokens.owner }),
     });
@@ -210,10 +206,8 @@ test("sync routes receive a laptop tree, hold it while a session runs, and apply
     assert.equal(mismatched.status, 400);
     assert.equal((await mismatched.json()).code, "invalid-manifest");
     assert.equal((await putChunk(host, absent, Buffer.alloc(1024 * 1024 + 1))).status, 413);
-    // A body one byte over the chunk bound is refused as too large even when its hash is right.
     const oversize = Buffer.alloc(256 * 1024 + 1);
     assert.equal((await putChunk(host, createHash("sha256").update(oversize).digest("hex"), oversize)).status, 413);
-    // A batch is refused whole when any chunk misnames its content, when a frame is cut short, or when the body is over its bound.
     const good = Buffer.from("batched\n"), goodHash = createHash("sha256").update(good).digest("hex");
     const misnamed = await putBatch(host, encodeChunkBatch([{ hash: goodHash, bytes: good }, { hash: absent, bytes: Buffer.from("other\n") }]));
     assert.deepEqual([misnamed.status, (await misnamed.json()).code], [400, "invalid-manifest"]);
@@ -221,7 +215,6 @@ test("sync routes receive a laptop tree, hold it while a session runs, and apply
     const framed = encodeChunkBatch([{ hash: goodHash, bytes: good }]);
     assert.equal((await putBatch(host, framed.subarray(0, framed.length - 1))).status, 400);
     assert.equal((await putBatch(host, Buffer.alloc(2 * 1024 * 1024 + 1))).status, 413);
-    // A manifest at the bound still fits the commit body with its generation, so the store judges it.
     const begun = (await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {}, syncHeaders())).body.generation;
     const atBound = await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation: begun, manifest: "x".repeat(32 * 1024 * 1024 - 2) }, syncHeaders(begun));
     assert.deepEqual([atBound.status, atBound.body.code], [400, "invalid-manifest"]);
@@ -249,7 +242,6 @@ test("sync routes receive a laptop tree, hold it while a session runs, and apply
     const stop = await host.fetchApi(`/sessions/${id}/stop`, "owner", { requestId: randomUUID() });
     assert.equal(stop.status, 200);
     await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.status === "exited");
-    // The marker still says session-running, but nothing holds the project now.
     const waiting = (await host.fetchApi("/projects/rehearsal")).body.sync.pendingGeneration;
     assert.deepEqual([waiting?.reason, waiting?.id], ["awaiting-apply", second.manifest.id]);
     const applied = await host.fetchApi("/projects/rehearsal/sync/apply", "owner", {});
@@ -273,10 +265,8 @@ test("chunk upload batches a large tree into bounded requests and falls back to 
   const root = realpathSync(mkdtempSync("/tmp/inf-psync-batch-"));
   const laptop = join(root, "laptop"); mkdirSync(laptop);
   try {
-    // Random content does not repeat; seven full chunks fill a 2 MiB batch, so twelve need two.
     for (let index = 0; index < 12; index++) writeFileSync(join(laptop, `file-${index}.bin`), randomBytes(256 * 1024));
     for (let index = 0; index < 300; index++) writeFileSync(join(laptop, `small-${index}.txt`), `small ${index}\n`);
-    // The first batch request loses its connection, as fetch reports a dropped socket; the uploader sends it again.
     const counts = { batches: 0, singles: 0 };
     let dropped = false;
     const flaky = (generation: string): ChunkTransport => {
@@ -329,7 +319,6 @@ test("session starts are refused while a sync holds the project, and an admitted
     assert.equal((await host.fetchApi(`/sessions/${earlier}/stop`, "owner", { requestId: randomUUID() })).status, 200);
     await waitFor(() => host.fetchApi(`/sessions/${earlier}`), r => r.body.status === "exited");
 
-    // Hold a commit at its running check, inside the project's queue.
     writeFileSync(join(laptop, "notes.md"), "v1\n");
     const first = await upload(host, laptop, storeDir);
     let atCheck!: () => void, answer!: (running: boolean) => void;
@@ -350,7 +339,6 @@ test("session starts are refused while a sync holds the project, and an admitted
     answer(false);
     assert.equal((await held).appliedManifest, first.manifest.id);
 
-    // A start admitted before the next sync check counts as running before manager.list() can show it.
     let entered!: () => void, finish!: () => void;
     const creating = new Promise<void>(resolve => { entered = resolve; });
     host.manager.create = (request => new Promise(resolve => {
@@ -383,7 +371,6 @@ test("a running session whose worker does not answer still holds the next genera
     const id = randomUUID();
     assert.equal((await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Busy", prompt: "" })).status, 201);
     const running = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.status === "running" && r.body.pid > 0);
-    // Stop the session's worker, the provider's parent, so its state call times out during the commit.
     worker = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(running.body.pid)], { encoding: "utf8" }).trim());
     assert.ok(worker > 1);
     process.kill(worker, "SIGSTOP");
@@ -406,7 +393,6 @@ test("a failed apply answers a sync-specific refusal and keeps the generation pe
   try {
     writeFileSync(join(laptop, "notes.md"), "v1\n");
     assert.equal((await pushTree(host, laptop, storeDir)).commit.status, 200);
-    // The host cannot create its stage beside the project directory.
     chmodSync(host.root, 0o500);
     writeFileSync(join(laptop, "notes.md"), "v2\n");
     const { manifest, commit } = await pushTree(host, laptop, storeDir);

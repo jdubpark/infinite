@@ -5,9 +5,6 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { chromium, type Browser, type Page } from "playwright";
 
-// Runs the web client's decision queue view and its feed in Chromium against stand-in /api routes, and checks what the
-// view sends and when it stops taking answers.
-// PLAYWRIGHT_CHROMIUM_PATH selects a Chromium build other than the one `npx playwright install chromium` provides.
 const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH || chromium.executablePath();
 const skip = existsSync(executablePath) ? false : "Chromium for Playwright is not installed; run `npx playwright install chromium`";
 const harness = fileURLToPath(new URL("./fixtures/web-decision-view-harness.tsx", import.meta.url));
@@ -17,7 +14,6 @@ const since = "2026-11-21T12:00:00.000Z";
 
 type Sent = { path: string; body: Record<string, unknown> };
 type Decision = { answerPath: string };
-/** The stand-in host. `hold` keeps every queue read open until `release` is called. */
 type Host = { decisions: Decision[]; sent: Sent[]; queueStatus: number; hold?: Promise<void>; release?: () => void };
 const hostWith = (...decisions: Decision[]): Host => ({ decisions, sent: [], queueStatus: 200 });
 
@@ -51,7 +47,6 @@ describe("web decision queue view", { skip }, () => {
     await page.route(`${ORIGIN}/view`, route => route.fulfill({ contentType: "text/html", body: '<div id="root"></div>' }));
     await page.route(`${ORIGIN}/api/**`, async route => {
       const request = route.request(), path = new URL(request.url()).pathname;
-      // A reply to a page that has closed has nowhere to go.
       const reply = (body: unknown, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) }).catch(() => {});
       if (request.method() !== "GET") {
         host.sent.push({ path, body: request.postDataJSON() as Record<string, unknown> });
@@ -115,7 +110,6 @@ describe("web decision queue view", { skip }, () => {
       assert.equal(await submit.isEnabled(), true, "a current queue takes the selected answer");
 
       host.hold = new Promise(resolve => { host.release = resolve; });
-      // The next read is due after 0.2 seconds, and the queue stops being current three seconds after that.
       await page.getByText(/has not refreshed since/).waitFor({ timeout: 6000 });
       assert.equal(await submit.isDisabled(), true);
       await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
@@ -147,7 +141,6 @@ describe("web decision queue view", { skip }, () => {
 
       await setVisibility(page, "hidden");
       await notice.waitFor({ state: "detached", timeout: 1000 });
-      // Longer than the three seconds a watched tab waits before it warns.
       await page.waitForTimeout(3600);
       assert.equal(await notice.count(), 0, "time in a hidden tab counts toward no warning");
 
@@ -155,7 +148,6 @@ describe("web decision queue view", { skip }, () => {
       await page.waitForTimeout(1500);
       assert.equal(await notice.count(), 0, "returning gives the next read its own three seconds");
       assert.equal(await submit.isDisabled(), true, "and takes no answers until a read lands");
-      // No read has landed since the return, so the warning comes back.
       await notice.waitFor({ timeout: 3000 });
 
       host.hold = undefined;

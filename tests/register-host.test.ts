@@ -19,7 +19,6 @@ import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
 type Fixture = ReturnType<typeof schedulerFixture>;
 
-/** Scheduler internals that the tests drive directly. */
 type Internal = {
   record(id: string): unknown;
   ingestEntries(): void;
@@ -27,7 +26,6 @@ type Internal = {
 };
 const internal = (teams: TeamService) => teams as unknown as Internal;
 
-/** The host's register, as the tests read it: its drain, its idle wait, and the latest pass's receipts. */
 type Tests = { drain(): void; idle(): Promise<void>; pending(runId: string): boolean; receipts(runId: string): ObjectiveReceipt[] | undefined };
 const registerOf = (teams: TeamService) => (teams as unknown as { objectiveTests: Tests }).objectiveTests;
 
@@ -40,7 +38,6 @@ function openStore(f: Fixture): EvidenceStore {
   return new EvidenceStore({ databasePath: evidenceDatabasePath(f.config.stateDir), vaultKey: f.key });
 }
 
-/** The scheduler fixture with the fake command prefix, a configured `rank-verify` check, and the register on. */
 function registerFixture(): { f: Fixture; receipts: string } {
   const f = schedulerFixture();
   const receipts = join(f.config.stateDir, "prefix");
@@ -55,7 +52,6 @@ function git(f: Fixture, ...args: string[]): string {
     { cwd: f.run.workspace, encoding: "utf8", stdio: "pipe" }).trim();
 }
 
-/** A document with 45 entries. The first `qualifying` cite two https sources on distinct hosts; the rest cite one. */
 function entriesDocument(qualifying: number) {
   return { entries: Array.from({ length: 45 }, (_, index) => ({
     id: `e${index}`,
@@ -63,7 +59,6 @@ function entriesDocument(qualifying: number) {
   })) };
 }
 
-/** Commits `research/entries.json` to the integration checkout and returns the new head. */
 function commitEntries(f: Fixture, document: unknown): string {
   mkdirSync(join(f.run.workspace, "research"), { recursive: true });
   writeFileSync(join(f.run.workspace, ENTRIES), JSON.stringify(document));
@@ -77,7 +72,6 @@ function assumption(id: string, test: Assumption["test"]): Assumption {
     refutedBy: `Refuted ${id}`, test, evidence: [], proposals: [] };
 }
 
-/** a2: at least 40 entries with two checkable sources each. a4: `rank-verify` must pass. */
 function recordFor(f: Fixture): ObjectiveRecord {
   const created = runRecord(f.run, AT, `run:${f.run.id}`);
   if (typeof created === "string") throw new Error(`the fixture record is ${created}`);
@@ -89,10 +83,6 @@ function recordFor(f: Fixture): ObjectiveRecord {
   }, []);
 }
 
-/**
- * Writes the run at ready-for-review on `head`, approved, with a failed `rank-verify` at its head, and its reviewer holding the
- * entry tools. The record is standalone and sealed with the run; `register` pins the run as a created run would.
- */
 function seedRun(f: Fixture, head: string, record: ObjectiveRecord, options: { register?: boolean; status?: TeamRun["status"] } = {}): void {
   f.run.status = options.status ?? "ready-for-review";
   f.run.revision = 1;
@@ -116,7 +106,6 @@ function postEnvelope(f: Fixture, memberId: string, entry: MemberEntryPost, revi
   return { op: "post", ...binding, requestId: memberEntryId(binding, entry), entry };
 }
 
-/** The reviewer posts a finding with an assumption field, and the host ingests it. */
 function postFinding(f: Fixture, teams: TeamService, entry: MemberEntryPost): void {
   const reviewer = f.run.members[0]!;
   f.post(reviewer.sessionId, "team-entry", postEnvelope(f, reviewer.memberId, entry));
@@ -127,7 +116,6 @@ const recordOf = (teams: TeamService, runId: string): ObjectiveRecord =>
   (internal(teams).record(runId) as { objectiveRecord: ObjectiveRecord }).objectiveRecord;
 const assumptionOf = (record: ObjectiveRecord, id: string) => record.assumptions.find(item => item.id === id)!;
 
-/** The fake prefix's log of every command it ran, one line each. */
 function commandLines(receipts: string): { command: string; args: string[] }[] {
   const file = join(receipts, "commands.jsonl");
   if (!existsSync(file)) return [];
@@ -152,13 +140,11 @@ test("acceptance 5 end to end", async () => {
     seedRun(f, head, record);
     teams = f.openTeam({ entries: new Blackboard(store) });
 
-    // The finding: a2 stays unchecked, with the contradicting proposal attached.
     postFinding(f, teams, finding("Only 31 entries cite two sources", "a2", "contradicts"));
     const posted = recordOf(teams, f.run.id);
     assert.equal(assumptionOf(posted, "a2").status, "unchecked");
     assert.equal(assumptionOf(posted, "a2").proposals.length, 1);
 
-    // The pass: a2 is refuted by its receipt, a4 by the failed check. One test version, no change to the run's status.
     const tests = registerOf(teams);
     tests.drain();
     await tests.idle();
@@ -171,7 +157,6 @@ test("acceptance 5 end to end", async () => {
     assert.equal(after.log.filter(entry => entry.op === "test.recorded").length, 1);
     assert.equal(f.readRecord<{ run: TeamRun }>("team", f.run.id).run.status, "ready-for-review");
 
-    // Commands: one B1 read of the blob at the head, and no command for the test on rank-verify.
     const lines = commandLines(receipts);
     assert.equal(lines.length, 1, `commands: ${JSON.stringify(lines)}`);
     assert.ok(lines[0]!.args.includes("cat-file"));
@@ -188,7 +173,6 @@ test("a run that settles while the service runs gets its pass from the tick", as
     const tests = registerOf(teams);
     assert.equal(tests.pending(f.run.id), false, "a run that has not settled has no pass at open");
 
-    // The run settles: the save that writes it marks the pass, and the service's own tick starts it.
     const held = internal(teams).record(f.run.id) as { run: TeamRun };
     held.run.status = "ready-for-review";
     internal(teams).save(held);

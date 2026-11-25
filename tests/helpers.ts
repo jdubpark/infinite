@@ -24,7 +24,6 @@ export const waitFor = async <T>(
   throw new Error(`Condition was not reached; last state: ${JSON.stringify(last)}`);
 };
 
-/** The running processes, for a test that must see what a host has started or left behind. */
 export function processes(): { pid: number; parent: number; command: string }[] {
   return execFileSync("ps", ["-ww", "-eo", "pid=,ppid=,args="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).split("\n").flatMap(line => {
     const row = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
@@ -32,10 +31,8 @@ export function processes(): { pid: number; parent: number; command: string }[] 
   });
 }
 
-/** What a session worker's command line holds. Its command line names no session. */
 export const WORKER_ENTRY = "/packages/host/src/worker.";
 
-/** The worker processes among `workers` that belong to this host: the pid each listening worker recorded, and every listed pid. */
 function hostWorkers(config: Config, workers: readonly { pid: number }[], listed: readonly number[]): number[] {
   const running = new Set(workers.map(row => row.pid));
   const pids = new Set(listed.filter(pid => running.has(pid)));
@@ -44,14 +41,12 @@ function hostWorkers(config: Config, workers: readonly { pid: number }[], listed
   for (const id of ids) try {
     const pid = unseal<{ workerPid?: number }>(key, `${id}:status`, readFileSync(join(config.stateDir, "sessions", id, "status.sealed"), "utf8")).workerPid;
     if (pid !== undefined && running.has(pid)) pids.add(pid);
-  } catch { /* no status record: the worker has not listened yet, or a test stands a socket in for it */ }
+  } catch { }
   return [...pids];
 }
 
-/** A worker that has not listened after this long is not waited for: no record ties it to a host. */
 const WORKER_START_MS = 10000;
 
-/** True while a session of this host has a record and no status: its worker was launched and has not listened yet. */
 function launching(config: Config) {
   const sessions = join(config.stateDir, "sessions");
   try { return readdirSync(sessions).some(id => !existsSync(join(sessions, id, "status.sealed"))); } catch { return false; }
@@ -73,7 +68,6 @@ export const demoProfile = () => ({
 export interface ApiResponse {
   status: number;
   headers: Headers;
-  // Response bodies are untyped JSON in these tests.
   body: any;
 }
 
@@ -83,19 +77,11 @@ export interface Host {
   config: Config;
   tokens: Record<Role, string>;
   fetchApi: (path: string, role?: Role | null, body?: unknown, headers?: Record<string, string>, method?: string) => Promise<ApiResponse>;
-  /** Start (or restart) the API process; detached session workers keep running across restarts. */
   start: () => Promise<void>;
-  /** Kill only the API process. */
   stopApi: () => Promise<void>;
-  /** Stop every session worker and the API, then remove the temporary state. */
   stop: () => Promise<void>;
 }
 
-/**
- * JSON requests to an API at `origin`, authenticated with the named role's device key.
- * Each request closes its connection. A test that blocks on a synchronous child call for longer than the host's
- * keep-alive time would otherwise send its next request on a connection the host has closed, and fail with `fetch failed`.
- */
 export function apiClient(origin: string, tokens: Record<Role, string>): Host["fetchApi"] {
   return async (path, role = "owner", body, headers = {}, method) => {
     const response = await fetch(origin + "/api" + path, {
@@ -112,14 +98,11 @@ export function apiClient(origin: string, tokens: Record<Role, string>): Host["f
   };
 }
 
-/** Stop every session worker recorded under `config.stateDir`, then wait for them to exit. */
-/** Asks every session worker under the state directory to stop; returns how many were still answering. */
 export async function stopSessionWorkers(config: Config) {
   let ids: string[] = [], answered = 0;
   try {
     ids = readdirSync(join(config.stateDir, "sessions")).filter((n) => /^[a-f0-9-]{36}$/.test(n));
   } catch {
-    /* no sessions were created */
   }
   for (const id of ids)
     try {
@@ -130,47 +113,28 @@ export async function stopSessionWorkers(config: Config) {
         ? await workerCall<ControlLease>(config.runDir, id, { op: "control", action: "claim", actor, takeover: true }) : undefined;
       await workerCall(config.runDir, id, { op: "stop", requestId: randomUUID(), ...(lease ? { actor, leaseId: lease.id } : {}) });
     } catch {
-      /* already exited */
     }
   return answered;
 }
 
-/**
- * Stops the session workers of a host and returns when none of them runs. Stop whatever starts sessions before the call.
- *
- * One request is not enough: a worker that is not listening yet does not hear it, and a worker whose provider is still
- * starting refuses it. So the request repeats while a worker process of this host runs. A worker counts by its process,
- * never by an answer: a test may stand a socket in for a worker, and that answers for as long as the test runs.
- *
- * A worker belongs to this host when it recorded itself, which it does when it starts to listen, or when `started`
- * lists it: the workers a spawned host was seen to hold. After `limitMs` the workers that still run are killed and the
- * call throws.
- *
- * Without `started` the host ran in this process, and its worker that is not listening yet is on no record. So while
- * a session of the host has no status, the call also waits for the worker children of this process that this host has
- * not recorded, for at most `WORKER_START_MS`: such a worker records itself when it listens, and then it counts.
- */
 export async function endSessionWorkers(config: Config, started?: readonly number[], limitMs = 30000) {
   const until = Date.now() + limitMs, heardBy = Date.now() + Math.min(limitMs, WORKER_START_MS);
   for (;;) {
     await stopSessionWorkers(config);
-    // Read before the records: a worker that records itself after this read is then found among them.
     const unheard = !started && Date.now() < heardBy && launching(config);
     const workers = processes().filter(row => row.command.includes(WORKER_ENTRY));
     const mine = hostWorkers(config, workers, started ?? []);
     const starting = unheard ? workers.filter(row => row.parent === process.pid && !mine.includes(row.pid)) : [];
     if (mine.length + starting.length === 0) return;
     if (Date.now() > until) {
-      for (const pid of mine) try { process.kill(pid, "SIGKILL"); } catch { /* it ended meanwhile */ }
+      for (const pid of mine) try { process.kill(pid, "SIGKILL"); } catch { }
       throw new Error(`Session workers still ran ${limitMs} ms after the test stopped them and were killed: ${mine.join(", ")}`);
     }
     await new Promise(resolve => setTimeout(resolve, 100));
   }
 }
 
-/** Boots a real API (`cli.ts serve`) on a free port with owner, controller and viewer device keys. */
 export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
-  // Unix socket paths are short-limited, so the state lives under /tmp rather than os.tmpdir().
   const root = mkdtempSync("/tmp/inf-test-");
   const port = await freePort();
   const origin = `http://127.0.0.1:${port}`;
@@ -233,17 +197,14 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     );
   };
   const stop = async () => {
-    // The stop takes no less time than the fixed wait it had before: other processes of the host may still be writing.
     const floor = new Promise((resolve) => setTimeout(resolve, 1700));
     const api = child;
     let started: number[] = [];
     if (api?.pid !== undefined && api.exitCode === null && api.signalCode === null) {
-      // A suspended API starts nothing more, so the list of its workers is complete. It holds a worker that is not listening yet.
       api.kill("SIGSTOP");
-      try { started = processes().filter(row => row.parent === api.pid && row.command.includes(WORKER_ENTRY)).map(row => row.pid); } catch { /* no process list: the workers that recorded themselves are still stopped */ }
+      try { started = processes().filter(row => row.parent === api.pid && row.command.includes(WORKER_ENTRY)).map(row => row.pid); } catch { }
     }
     try {
-      // The API ends first: while it runs, it can start a session after the workers were asked.
       await stopApi();
       await endSessionWorkers(config, started);
       await floor;
@@ -261,10 +222,6 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
   return { origin, root, config, tokens, fetchApi, start, stopApi, stop };
 }
 
-/**
- * Claims a session's input lease for `role` as one client instance. Input from that client must
- * carry the returned headers; the worker refuses input from anyone else while the lease lasts.
- */
 export async function claimControl(
   host: Host,
   sessionId: string,
@@ -283,7 +240,6 @@ export async function claimControl(
   return { lease, headers: { "X-Infinite-Client": clientId, "X-Infinite-Control": lease.id } };
 }
 
-/** An API served from this process, so a test can hold the sync queue open through the ProjectSync it returns. */
 export async function inProcessHost(options?: { configure?: (config: Config) => void }) {
   const root = realpathSync(mkdtempSync("/tmp/inf-psync-guard-"));
   const workspace = join(root, "workspace"); mkdirSync(workspace);
@@ -305,14 +261,11 @@ export async function inProcessHost(options?: { configure?: (config: Config) => 
   return {
     ...host, root, config, origin, tokens, fetchApi: apiClient(origin, tokens),
     stop: async () => {
-      // The stop takes no less time than the fixed wait it had before: other processes of the host may still be writing.
       const floor = new Promise(resolve => setTimeout(resolve, 1700));
-      // The services end first, as in the host's own shutdown: while they run, they can start a session after the workers were asked.
       try {
         const closing = host.closeConnections();
         await new Promise<void>(resolve => host.server.close(() => resolve()));
         await closing;
-        // A step already under way can still start a session after close().
         await host.missions.idle(); await host.teams.idle();
         await endSessionWorkers(config);
         await floor;

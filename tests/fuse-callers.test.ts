@@ -19,7 +19,6 @@ import type { Manager } from "../packages/host/src/manager.js";
 import type { Mission, CreateMission } from "../packages/host/src/mission-types.js";
 import type { TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 
-/** A gate that records every call and answers from the test's settings. */
 function stubGate(open?: FuseOpen) {
   const gate = {
     open, refuse: false,
@@ -83,7 +82,6 @@ test("a goal waits at check before it prepares a cycle", async () => {
     assert.equal(started.events.filter(event => event.text === fuseReasonText).length, 1, "Clearing the wait adds no event");
   } finally { goals.close(); f.close(); }
 
-  // Without a fuse the first pass starts a cycle, as before.
   const g = schedulerFixture();
   const plain: ProductGoal = { ...goal, id: randomUUID(), events: [], cycles: [], reason: undefined };
   g.writeRecord("goal", plain.id, { goal: plain, receipts: {}, fingerprint: "fixture" });
@@ -199,7 +197,6 @@ test("a mission coordinator waits at check and at admit", async () => {
     assert.equal(created.length, 0);
     assert.equal(attempt.status, "queued");
     assert.equal(mission.reason, fuseReasonText);
-    // The closed check cleared the wait, so the refused admit starts a new one: one more event.
     assert.equal(eventCount(), 2);
 
     gate.refuse = false;
@@ -220,7 +217,6 @@ test("a mission coordinator waits at check and at admit", async () => {
     await launch(limited as never);
     assert.deepEqual(gate.releases, [limited.sessionId], "A failed launch releases its admitted slot");
 
-    // The host's load holds a launch before the fuse is charged for it. The launch is admitted once the hold ends.
     const held = attemptOf();
     stored.attempts.push(held as never);
     limit = undefined;

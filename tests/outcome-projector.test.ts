@@ -37,7 +37,6 @@ const SUMMARY_COUNTS = {
 };
 const FEATURES = { role: "implementer", area: "core", kind: null, risk: "normal", featureVersion: 1, featureMap: "default" };
 
-/** A minute on the fixed clock. Events carry their own times; the projector never reads the clock. */
 const at = (minute: number) => `2026-11-13T10:${String(minute).padStart(2, "0")}:00.000Z`;
 
 type Harness = {
@@ -47,7 +46,6 @@ type Harness = {
   close(): void;
 };
 
-/** A store with both modules, an outbox, and both projectors. `wrap` may replace the outcomes projector. */
 function harness(wrap: (projector: EventProjector) => EventProjector = projector => projector): Harness {
   const root = mkdtempSync(join(tmpdir(), "infinite-outcome-projector-"));
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: randomBytes(32) });
@@ -73,7 +71,6 @@ function harness(wrap: (projector: EventProjector) => EventProjector = projector
 
 let counter = 0;
 
-/** One event with a unique key. `parts` add to the key so that a replayed event has the same key. */
 function ev(kind: string, runId: string, time: string, fields: {
   revision?: number; memberId?: string; taskId?: string; data?: Record<string, unknown>; parts?: (string | number)[];
 } = {}): OutboxEvent {
@@ -158,7 +155,6 @@ function repairPaths(runId: string, minute: number, round: number, paths: string
   return ev("repair.paths", runId, at(minute), { memberId: "integrator-1", revision, parts: [round], data });
 }
 
-/** The row of one implementer or scout in the run. */
 function rowOf(store: EvidenceStore, runId: string, memberId: string) {
   return store.read(db => readOutcome(db, `${runId}:${memberId}`));
 }
@@ -176,11 +172,6 @@ function levelsOf(row: { integrated: unknown; accepted: unknown; firstPass: unkn
   return [row.integrated, row.accepted, row.firstPass, row.held];
 }
 
-/**
- * Two tasks, a changes-requested review, and one repair round that touches only `a.txt`, then an approval.
- * `answer` says what the round reports: the paths, omitted paths, an integration without paths, an integration
- * without a commit, or nothing at all. The approval follows unless `approve` is false.
- */
 function repairScenario(runId: string, options: {
   answer?: "paths" | "omitted" | "integrated" | "no-commit" | "none"; approve?: boolean;
 } = {}): OutboxEvent[] {
@@ -255,7 +246,6 @@ test("a late path event resolves a frozen row", () => {
   const h = harness();
   try {
     const events = repairScenario(RUN, { answer: "integrated" });
-    // Approval and freeze arrive before the paths, so the round is still pending when the run settles.
     h.flush([...events, settled(RUN, 11, "ready-for-review")]);
     const before = rowOf(h.store, RUN, "m-b");
     assert.equal(before?.firstPass, null);
@@ -273,18 +263,15 @@ test("a late path event resolves a frozen row", () => {
 test("missing repair facts leave rounds unknown", () => {
   const h = harness();
   try {
-    // Paths omitted: the links of the round are unknown.
     h.flush(repairScenario("run-omitted", { answer: "omitted" }));
     for (const id of ["m-a", "m-b"]) {
       const row = rowOf(h.store, "run-omitted", id);
       assert.equal(row?.firstPass, null);
       assert.deepEqual(row?.payload.rounds, { run: 1, attributed: 0, unknown: 1 });
     }
-    // The round is never answered: the links stay pending.
     h.flush(repairScenario("run-unanswered", { answer: "none" }));
     assert.equal(rowOf(h.store, "run-unanswered", "m-b")?.firstPass, null);
     assert.deepEqual(rowOf(h.store, "run-unanswered", "m-b")?.payload.rounds, { run: 1, attributed: 0, unknown: 1 });
-    // An answer without a commit: every pending link is clear.
     h.flush(repairScenario("run-no-commit", { answer: "no-commit" }));
     assert.equal(rowOf(h.store, "run-no-commit", "m-b")?.firstPass, 1);
     assert.equal(rowOf(h.store, "run-no-commit", "m-a")?.firstPass, 1);
@@ -297,7 +284,6 @@ test("an empty repair answer resolves its round", () => {
   const h = harness();
   try {
     h.flush([...repairScenario("run-empty", { answer: "no-commit" }), settled("run-empty", 11, "ready-for-review")]);
-    // The round is resolved with its links clear, so it is unattributed, not unknown.
     assert.deepEqual(summaryOf(h.store, "run-empty")?.payload.rounds, { total: 1, attributed: 0, unattributed: 1, unknown: 0 });
   } finally {
     h.close();
@@ -314,13 +300,11 @@ test("an answer for another base clears that row's pending links", () => {
       started("run-base", "m-b", 4, { taskId: "b" }), integrated("run-base", "m-b", "b", 5),
       review("run-base", 6, "changes-requested", { profileId: "rev", model: "r-1" }),
       repairStarted("run-base", 7, 1),
-      // The round links both rows while they share the current base; the answer names another base.
       ev("repair.integrated", "run-base", at(8), {
         memberId: "integrator-1", parts: [1], data: { round: 1, commit: COMMIT_2, headCommit: HEAD, baseCommit: otherBase },
       }),
       review("run-base", 10, "approved", { profileId: "rev", model: "r-1" }),
     ]);
-    // Clear links are not pending, so neither row waits for a path event.
     assert.equal(rowOf(h.store, "run-base", "m-b")?.firstPass, 1);
     assert.equal(rowOf(h.store, "run-base", "m-a")?.firstPass, 1);
   } finally {
@@ -459,8 +443,6 @@ test("a same-model approval is flagged", () => {
 });
 
 test("a replayed page writes the same rows", () => {
-  // A member result, a changes-requested review, one repair round with its paths, an approval, and a settle, so
-  // every table of the module holds something.
   const events = [
     ...repairScenario(RUN),
     started(RUN, "reviewer-1", 11, { role: "reviewer" }),
@@ -487,12 +469,10 @@ test("a replayed page writes the same rows", () => {
   });
   try {
     clean.flush(events);
-    // The injected failure rolls the whole page back, so the cursor stays where it was.
     flaky.flush(events);
     assert.equal(seen, 5);
     flaky.outbox.advance();
     assert.ok(seen > 5);
-    // Blind indexes are keyed per store, so two stores never agree on them. Everything else must match.
     const tables = (h: Harness) => h.store.read(db => ({
       rows: runOutcomes(db, RUN).map(({ projectRef: _p, taskRef: _t, areaRef: _a, ...row }) => row),
       summary: (({ projectRef: _p, ...summary }) => summary)(readSummary(db, RUN)!),
@@ -510,8 +490,6 @@ test("a replayed page writes the same rows", () => {
     assert.equal(expected.state.length, 1);
     assert.deepEqual(tables(flaky), expected);
 
-    // Every write is a set or a recount: applying the whole page a second time, in order, changes nothing.
-    // The projector receives its own kinds only; `task.planned` is read on demand and never projected.
     assert.equal(applied.length, events.filter(event => inner!.kinds.includes(event.kind)).length);
     assert.ok(applied.length > 10);
     flaky.store.write(tx => { for (const event of applied) inner!.project(tx, event); });
@@ -610,11 +588,9 @@ test("members without a task get member results", () => {
 test("the summary counts rounds, not links", () => {
   const h = harness();
   try {
-    // One round, attributed to task a, in its own run.
     h.flush([...repairScenario("run-one"), settled("run-one", 11, "ready-for-review")]);
     assert.deepEqual(summaryOf(h.store, "run-one")?.payload.rounds, { total: 1, attributed: 1, unattributed: 0, unknown: 0 });
 
-    // Four rounds: attributed, resolved with no owner, omitted paths, and no answer at all.
     const run = "run-four";
     h.flush([
       created(run), prepared(run), planned(run, "a", ["a.txt"]), planned(run, "b", ["b.txt"]),
@@ -629,9 +605,7 @@ test("the summary counts rounds, not links", () => {
     ]);
     assert.deepEqual(summaryOf(h.store, run)?.payload.rounds, { total: 4, attributed: 1, unattributed: 1, unknown: 2 });
 
-    // A path event after the settle moves its round from unknown to its result, with no second settle.
     h.flush([repairPaths(run, 18, 4, ["c.txt"])]);
-    // Round 3 stays unknown: its paths were omitted, so nothing later can answer it.
     assert.deepEqual(summaryOf(h.store, run)?.payload.rounds, { total: 4, attributed: 1, unattributed: 2, unknown: 1 });
   } finally {
     h.close();
@@ -670,7 +644,6 @@ test("a review of a new head drops the old tree and approval", () => {
     assert.equal(summary?.payload.reviewedHead, OTHER_HEAD);
     assert.equal(summary?.payload.reviewedTree, undefined);
     assert.equal(summary?.approvedAt, null);
-    // A late tree for the old head changes nothing.
     h.flush([ev("review.tree", RUN, at(7), { memberId: "reviewer-1", data: { headCommit: HEAD, tree: TREE } })]);
     assert.equal(summaryOf(h.store, RUN)?.payload.reviewedTree, undefined);
   } finally {
@@ -717,8 +690,6 @@ test("a later event keeps a backfilled row's unknown rounds", () => {
   try {
     const run = "run-backfilled";
     const id = `${run}:m1`;
-    // Written as Task 4 writes it: an accepted row at the member's revision with no base commit, one round at
-    // revision 0, and one unknown link to it.
     h.store.write(tx => {
       writeOutcome(tx, {
         outcomeId: id, source: "production", projectRef: "", taskRef: "", areaRef: "", runId: run, revision: 1,
@@ -758,10 +729,8 @@ test("a row that ends has an end time", () => {
       created(RUN), prepared(RUN), planned(RUN, "a", ["a.txt"]), planned(RUN, "b", ["b.txt"]), planned(RUN, "c", ["c.txt"]),
       started(RUN, "m-question", 2, { taskId: "a" }),
       ev("member.reported", RUN, at(3), { memberId: "m-question", taskId: "a", data: { role: "implementer", reportKind: "question" } }),
-      // A host stop ends the attempt. The scope violation that follows names its fault and keeps that time.
       started(RUN, "m-scope", 4, { taskId: "b" }), stopped(RUN, "m-scope", 5, "host", "implementer", "b"),
       ev("run.blocked", RUN, at(6), { data: { code: "task-scope-violation", sourceMemberId: "m-scope" } }),
-      // A block that finds the attempt still open ends it at the block.
       started(RUN, "m-wrong", 7, { taskId: "c" }),
       ev("run.blocked", RUN, at(8), { data: { code: "wrong-agent-report", sourceMemberId: "m-wrong" } }),
       started(RUN, "reviewer-1", 9, { role: "reviewer" }),
@@ -786,8 +755,6 @@ test("a settle never turns a backfilled row to not accepted", () => {
   const h = harness();
   try {
     const run = "run-backfilled-review";
-    // A record can keep a review that requested changes. The backfill claims no acceptance from it, and a later
-    // settle must not add that claim.
     h.store.write(tx => {
       writeOutcome(tx, {
         outcomeId: `${run}:m1`, source: "production", projectRef: "", taskRef: "", areaRef: "", runId: run, revision: 1,
@@ -833,7 +800,6 @@ test("a report read after a halt's stop still counts", () => {
   try {
     h.flush([
       created(RUN), prepared(RUN), planned(RUN, "a", ["a.txt"]), planned(RUN, "b", ["b.txt"]),
-      // A halt stops a member before the host has read its whole journal, so the report can follow the stop.
       started(RUN, "m1", 2, { taskId: "a" }), stopped(RUN, "m1", 3, "host", "implementer", "a"),
       ev("member.reported", RUN, at(4), { memberId: "m1", taskId: "a", data: { role: "implementer", reportKind: "question" } }),
       started(RUN, "m2", 2, { taskId: "b" }), stopped(RUN, "m2", 3, "owner", "implementer", "b"),
@@ -848,7 +814,6 @@ test("a report read after a halt's stop still counts", () => {
     assert.equal(second?.disposition, "blocked");
     assert.equal(second?.exclusion, null);
 
-    // A member with no task follows the same rule: a report read after the halt's stop still stands.
     h.flush([
       started(RUN, "reviewer-1", 6, { role: "reviewer" }), stopped(RUN, "reviewer-1", 7, "host", "reviewer"),
       ev("member.reported", RUN, at(8), { memberId: "reviewer-1", data: { role: "reviewer", reportKind: "review" } }),
@@ -879,7 +844,6 @@ test("a run deleted while the projector is behind keeps and flags its rows", () 
   try {
     h.flush([created(RUN), prepared(RUN), planned(RUN, "a", ["a.txt"]), started(RUN, "m1", 2, { taskId: "a" })]);
     assert.equal(rowOf(h.store, RUN, "m1")?.disposition, "open");
-    // The integration is stored, and the projector never applies it.
     behind = true;
     h.flush([integrated(RUN, "m1", "a", 5)]);
     assert.equal(rowOf(h.store, RUN, "m1")?.disposition, "open");
@@ -907,7 +871,6 @@ test("a run deleted while the projector is behind keeps and flags its rows", () 
 test("a stop after the settle updates the summary's attempts", () => {
   const h = harness();
   try {
-    // An owner cancel settles the run first; the halt loop stops its members afterwards.
     h.flush([
       created(RUN), prepared(RUN), planned(RUN, "a", ["a.txt"]),
       started(RUN, "m1", 2, { taskId: "a" }),
@@ -919,7 +882,6 @@ test("a stop after the settle updates the summary's attempts", () => {
     h.flush([ev("rating.recorded", RUN, at(5), { memberId: "m1", taskId: "a", data: { score: 3 } })]);
     assert.deepEqual(summaryOf(h.store, RUN)?.payload.attempts, { "owner-stop": 1 });
 
-    // A backfilled failure keeps the levels of a counted failure when a later event touches it.
     const run = "run-backfilled-failure";
     h.store.write(tx => {
       writeOutcome(tx, {
@@ -948,13 +910,11 @@ test("the goal and the mission of a run reach its rows and its roll-up", () => {
     const goal = { id: "goal-1", cycle: 2 };
     const missionId = "mission-1";
     h.flush([
-      // A member that starts before `run.created` gets a row with no goal: the run still belongs through its summary.
       started(RUN, "m0", 0, { taskId: "a" }),
       ev("run.created", RUN, at(0), { data: { projectId: "example", purpose: "work", goalId: goal.id, goalCycle: goal.cycle, missionId } }),
       prepared(RUN), planned(RUN, "a", ["a.txt"]),
       started(RUN, "m1", 2, { taskId: "a" }),
       integrated(RUN, "m1", "a", 3),
-      // A run of no goal and no mission.
       created("run-2"), prepared("run-2"), planned("run-2", "a", ["a.txt"]),
       started("run-2", "m1", 2, { taskId: "a" }),
     ]);

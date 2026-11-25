@@ -62,7 +62,6 @@ test("the owner's route answers the view, refuses other roles, and holds no dire
   const source = { mode: "github", repository: "example/project", baseBranch: "main" };
   const config = { teams: { workspaceDir: "/home/dev/workspaces" }, projects: [{ id: "project", team, source }, { id: "local", team }, { id: "unset", team: { checks: [command] }, source }] } as never;
   const app = express();
-  // Stands in for the server's requireRole(["owner"]) gate, which the route is mounted behind.
   app.get("/api/projects/:id/main-check", (req, res, next) => (String(req.headers["x-role"]) === "owner" ? next() : void res.status(403).json({ error: "forbidden" })), mainCheckRoute(config, projectId => projectId === "project" ? viewOf(record, true) : undefined));
   const server = app.listen(0);
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;

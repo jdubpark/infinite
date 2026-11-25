@@ -25,8 +25,6 @@ const DIFF = { added: 3, removed: 1, files: 1, docs: false, tests: true };
 const FEATURES = { role: "implementer", area: "core", kind: null, risk: "normal", featureVersion: 1, featureMap: "default" };
 const at = (minute: number) => `2026-11-18T10:${String(minute).padStart(2, "0")}:00.000Z`;
 
-// ---------- a. integrationGauge ----------
-
 function gaugeInput(overrides: Partial<Parameters<typeof integrationGauge>[0]> = {}): Parameters<typeof integrationGauge>[0] {
   return {
     tasks: [{ id: "a", status: "running" }],
@@ -103,8 +101,6 @@ test("the gauge text holds no path and no commit id", () => {
   assert.deepEqual(Object.keys(gauge).sort(), ["changedPaths", "staleBase", "truncated", "writers"]);
 });
 
-// ---------- b. integrationOf ----------
-
 test("integrationOf accepts a valid gauge", () => {
   const value = { writers: 2, staleBase: true, changedPaths: 5, truncated: true };
   assert.deepEqual(integrationOf(value), value);
@@ -123,8 +119,6 @@ test("integrationOf drops unknown keys, a false truncated flag, and a non-boolea
   assert.deepEqual(integrationOf({ writers: 1, staleBase: "yes" }), { writers: 1 });
   assert.deepEqual(integrationOf({ writers: 1, changedPaths: 100001 }), { writers: 1 });
 });
-
-// ---------- c. projector ----------
 
 type Harness = { store: EvidenceStore; outbox: EventOutbox; flush(events: readonly OutboxEvent[]): void; close(): void };
 
@@ -234,8 +228,6 @@ test("a later integration without a valid gauge removes the earlier one", () => 
     } finally { h.close(); }
   }
 });
-
-// ---------- d. end to end through the team service ----------
 
 type Fixture = ReturnType<typeof schedulerFixture>;
 
@@ -369,7 +361,6 @@ test("two members integrate in order and their outcome rows replay identically",
       { writers: 1, staleBase: false, changedPaths: 1 },
       { writers: 0, staleBase: true, changedPaths: 1 },
     ]);
-    // The *Ref fields are keyed by each store's vault key, so a fresh store hashes them differently. Compare everything else.
     const unkeyed = (rows: typeof first) => rows.map(row => Object.fromEntries(Object.entries(row ?? {}).filter(([key]) => !key.endsWith("Ref"))));
     assert.deepEqual(unkeyed(project()), unkeyed(first), "a replay writes the same rows");
   } finally { store.close(); f.close(); }

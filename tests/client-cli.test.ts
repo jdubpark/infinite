@@ -122,8 +122,6 @@ test("team pull refuses a lifecycle run before review", { timeout: 60000 }, asyn
   writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
   const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
   try {
-    // Readiness is checked before the repository binding, so no enrollment is needed;
-    // enrolling would also replace the fixture's held check.
     await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
     const created = await run.host.fetchApi("/teams", "owner", run.create());
     assert.ok([200, 201].includes(created.status));
@@ -383,8 +381,6 @@ test("repo init keeps directory Linear defaults local, inherits the nearest mapp
   const otherPairingTeam = randomUUID(), otherPairingProject = randomUUID();
   let hostStopped = false;
   try {
-    // Both defaults are saved while the host is unreachable. A parent folder must not resolve,
-    // upload, or enroll anything on the host.
     await run.host.stopApi(); hostStopped = true;
     const parentResult = JSON.parse((await invoke(ownerConfig, [parent, "--linear-team", parentTeam, "--linear-project", parentProject])).stdout);
     assert.equal(parentResult.kind, "directory");
@@ -423,7 +419,6 @@ test("repo init keeps directory Linear defaults local, inherits the nearest mapp
     assert.deepEqual((await run.host.fetchApi("/projects/descendant-target/team")).body.linear, { teamId: nestedTeam, projectId: nestedProject });
     assert.equal((await run.host.fetchApi("/projects/isolated-target/team")).body.linear, undefined);
 
-    // Editing the directory default later does not rebind an already-enrolled repository.
     const changedParentProject = randomUUID();
     await invoke(ownerConfig, [nested, "--linear-team", nestedTeam, "--linear-project", changedParentProject]);
     rmSync(childDescendant, { recursive: true, force: true });
@@ -521,8 +516,6 @@ test("a lost child enrollment receipt preserves concurrent defaults and requires
     assert.deepEqual(currentParent.linear, { teamId: teamAfter, projectId: projectAfter }, "the successful child save merges with the latest parent defaults");
     assert.deepEqual((await run.host.fetchApi("/projects/race-target/team")).body.linear, { teamId: teamBefore, projectId: projectBefore });
 
-    // A first inherited request can commit even though its response is lost. Natural retry resumes
-    // that uncertain request under its own ID instead of creating another mutation.
     const lostArgs = [lostChild, "--project", "lost-target", "--check-json", JSON.stringify([{ command: "node", args: ["-e", "process.exit(0)"] }])];
     dropNextPut = true;
     let lostError: { stderr?: string } | undefined;
@@ -941,11 +934,8 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
   let app = createApp(config, key);
   let server = app.server.listen(0, "127.0.0.1"); await new Promise<void>(r => server.once("listening", r));
   config.port = (server.address() as { port: number }).port; config.origin = `http://127.0.0.1:${config.port}`;
-  // Recreate after selecting a port so the Host/Origin policy uses the real origin.
   await new Promise<void>(r => server.close(() => r()));
   app = createApp(config, key); server = app.server.listen(config.port, "127.0.0.1"); await new Promise<void>(r => server.once("listening", r));
-  // A real transport proxy delays only acknowledgments. Provider input and
-  // output remain live, exposing accidental per-key round-trip serialization.
   let holdReceipts = false;
   const held: (() => void)[] = [];
   const relaySockets = new Set<WebSocket>();
@@ -1118,9 +1108,6 @@ test("a new API lists and streams a pre-attention worker without replacing it", 
   const dir = join(config.stateDir, "sessions", id); mkdirSync(dir, { recursive: true }); mkdirSync(config.runDir);
   writeSealed(join(dir, "meta.sealed"), key, `${id}:meta`, { session: { id, provider: "codex", title: "Older session", projectId: "old", createdAt: new Date().toISOString(), status: "running", context: "", contextVersion: 0, initialPrompt: "", cwd: root }, fingerprint: "old" });
   const journal = new Journal(join(dir, "events"), key, id); journal.append("output", { text: "older-worker-output" });
-  // This is the actual pre-attention IPC response shape: the worker sends no attention block.
-  // Pre-control workers fingerprint the complete IPC input shape. Seed a
-  // delivered request from before upgrade, then retry it through the new API.
   const oldInput = { op: "input", requestId: randomUUID(), text: "before-upgrade", submit: true };
   const oldDigest = createHash("sha256").update(JSON.stringify(oldInput)).digest("hex");
   const oldReceipt = { requestId: oldInput.requestId, state: "delivered", seq: 3 };
@@ -1142,7 +1129,6 @@ test("a new API lists and streams a pre-attention worker without replacing it", 
     assert.equal(response.status, 200);
     const list = (await response.json() as { sessions: { id: string; pid: number; status: string; attention?: { state: string; now: string } }[] }).sessions;
     assert.equal(list.length, 1); assert.equal(list[0].pid, 12345); assert.equal(list[0].status, "running");
-    // The API fills the missing block so clients never break, but invents no idle or finished state.
     assert.equal(list[0].attention?.state, "unavailable"); assert.equal(list[0].attention?.now, "");
     const { op: _op, ...retry } = oldInput;
     const receipt = await fetch(origin + `/api/sessions/${id}/input`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify(retry) });
@@ -1226,8 +1212,6 @@ test("snapshot attachments and fenced device takeover preserve one live process 
     const retry = await host.fetchApi(path + "/input", "controller", phoneInput, sendHeaders);
     assert.equal(first.body.state, "delivered"); assert.deepEqual(first.body, retry.body);
     await host.fetchApi(path + "/control", "controller", { action: "release", leaseId: phoneLease.body.control.id }, phoneHeaders);
-    // Device labels were always free-form configuration. Display sanitization
-    // must not turn an accepted key into one that can no longer steer a worker.
     for (const label of ["", "long-label-".repeat(20)]) {
       host.config.tokens.find(t => t.role === "owner")!.label = label;
       await host.stopApi();
@@ -1325,7 +1309,6 @@ test("repo init keeps the team settings it does not own when it runs again", { t
     const before = (await run.host.fetchApi("/projects/rehearsal/team")).body.team;
     await enroll(firstChecks);
     const rerun = (await run.host.fetchApi("/projects/rehearsal/team")).body.team;
-    // The routine approval digest hashes this block as JSON, so a rerun with no change must leave it byte-identical.
     assert.equal(JSON.stringify(rerun), JSON.stringify(before));
     assert.equal(rerun.handoffMinutes, 30);
     assert.deepEqual(rerun.eval, { capture: true });

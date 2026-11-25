@@ -394,7 +394,6 @@ test("rematerializing an implicit project after deletion allocates a fresh ID", 
     assert.equal(rematerialized.id, "home-one-2");
     assert.equal(rematerialized.hidden, true);
     assert.equal(service.get("home-one").id, "home-one-2");
-    // The retired id no longer aliases the group that holds the checkout, whatever revision the stale edit carries.
     assert.throws(
       () => service.update("home-one", { requestId: randomUUID(), revision: rematerialized.revision, name: "Stale edit" }),
       failWith(404, "project-group-not-found"),
@@ -635,12 +634,10 @@ test("project group API exposes reads to paired roles and restricts all mutation
 test("a retired group id never aliases its replacement, and a prototype-named checkout lists safely", () => {
   const f = fixture();
   try {
-    // "beta" is a host project id; editing it materializes a stored group with that id.
     const service = f.service();
     const beta = service.get("beta");
     const renamed = service.update(beta.id, { requestId: randomUUID(), revision: beta.revision, name: "Beta product" });
     service.remove(renamed.id, { requestId: randomUUID(), revision: renamed.revision });
-    // The checkout folds again under a fresh id; a stale update to the retired id is refused rather than redirected.
     const replacement = service.get("beta");
     assert.notEqual(replacement.id, renamed.id);
     assert.throws(() => service.update(renamed.id, { requestId: randomUUID(), revision: replacement.revision, name: "Hijacked" }), failWith(404, "project-group-not-found"));

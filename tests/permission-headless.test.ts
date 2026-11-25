@@ -1,6 +1,3 @@
-// The headless permission channel (INF-246). The first tests run the real worker, hook commands and channel socket
-// against a scripted `claude --print` (tests/fixtures/headless-claude.mjs) and a fake pipeline. The rest drive the
-// channel's two halves directly. Run alone: node node_modules/tsx/dist/cli.mjs --test --test-concurrency=1 FILE
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -23,7 +20,6 @@ import { stopSessionWorkers, waitFor } from "./helpers.js";
 
 const FAKE = resolve("tests/fixtures/headless-claude.mjs");
 
-/** Production calls belong to the owner; `safe-build` is allowed; anything else is rejected with a model's note. */
 function fakePipeline(overrides: Partial<PermissionPipeline> = {}) {
   const deliveries: Array<{ decisionId: string; kind: string; detail?: string }> = [];
   const decided: PermissionRequest[] = [];
@@ -48,7 +44,6 @@ function fakePipeline(overrides: Partial<PermissionPipeline> = {}) {
   return { pipeline, deliveries, decided };
 }
 
-/** An in-process Manager and channel with a real worker per session, under a short /tmp path for Unix sockets. */
 async function rig(options: { args?: string[]; pipeline?: PermissionPipeline; overrides?: Partial<PermissionPipeline> } = {}) {
   const root = realpathSync(mkdtempSync("/tmp/inf-headless-"));
   const workspace = join(root, "workspace");
@@ -94,42 +89,34 @@ test("a class call waits for the owner, and the owner's allow runs that one call
     await r.manager.create({ requestId: id, provider: "claude", projectId: "rehearsal", title: "Headless", prompt: "mixed" });
     assert.deepEqual(r.manager.meta(id).session.headless, { channel: true });
     const waiting = await waitFor(() => live(r, id), s => s.attention.state === "needs-you" && Boolean(s.permissionChannel?.waiting), 40_000);
-    // The open call the pipeline allowed ran; the rejected one got the host's fixed notice, never the model's text.
     assert.equal(r.log("ran.log"), "make safe-build\n");
     assert.equal(r.log("denied.log"), `rm -rf scratch: ${requesterNotice("unsafe")}\n`);
     assert.doesNotMatch(r.log("denied.log"), /MODEL TEXT/);
-    // The provider ended its run; the session stays open with one owner prompt that no delegated review can take.
     assert.equal(waiting.status, "running");
     assert.equal(waiting.permissionChannel?.waiting?.interruptClass, "production-or-staging");
     const prompt = waiting.attention.prompt!;
     assert.equal(prompt.source, "protocol");
-    // The clients offer options for a prompt with a hash; no delegated review takes a `protocol` prompt.
     assert.match((prompt as { hash?: string }).hash ?? "", /^[a-f0-9]{64}$/);
     const row = (await r.manager.list()).find(item => item.id === id) as unknown as { attention: { prompt: { delegable?: boolean } } };
     assert.equal(row.attention.prompt.delegable, undefined);
     assert.deepEqual(prompt.options.map(option => option.label), ["Yes, allow once", "No", "No, and tell Claude what to do differently"]);
-    // Input cannot reach a provider that is not running: it is refused, not lost.
     await assert.rejects(workerCall(r.config.runDir, id, { op: "input", requestId: randomUUID(), text: "hello", submit: true }), /prompt-open/);
     const requestId = randomUUID();
     const answer = await workerCall<{ state: string; result: string }>(r.config.runDir, id, { op: "answer", requestId, promptId: prompt.id, option: 0 });
     assert.equal(answer.state, "delivered");
-    // A retry gets the same receipt; a second answer finds no prompt.
     assert.deepEqual(await workerCall(r.config.runDir, id, { op: "answer", requestId, promptId: prompt.id, option: 0 }), answer);
     await assert.rejects(workerCall(r.config.runDir, id, { op: "answer", requestId: randomUUID(), promptId: prompt.id, option: 1 }), /prompt-changed/);
     await waitFor(() => live(r, id), s => s.status === "exited", 30_000);
     assert.equal(r.log("ran.log"), "make safe-build\ndeploy production\n");
     const events = r.channelEvents(id).map(event => event.event);
     assert.deepEqual(events.filter(event => event !== "pending"), ["deferred", "waiting", "answer", "resumed", "delivered"]);
-    // The session's journal marks the provider's own continue prompt after the resume, and not the owner's request.
     const turns = r.manager.events(id, 0, 500, new Set(["signal"])).events.map(event => event.data as { kind?: string; prompt?: string; automatic?: true })
       .filter(data => data.kind === "turn-start").map(data => [data.prompt, data.automatic]);
     assert.deepEqual(turns, [["mixed", undefined], ["Continue from where you left off.", true]]);
-    // The owner decision is linked to its delivery events: deferral, the owner's answer, and the resumed call.
     const owner = r.decided.find(request => /production/.test(request.action))!;
     assert.equal(owner.requester.kind, "headless");
     assert.equal(owner.requester.sessionRoot, realpathSync(r.workspace));
     assert.deepEqual(r.deliveries.filter(d => /deferred|owner allowed|returned to the resumed/.test(d.detail ?? "")).map(d => d.kind), ["intent", "intent", "receipt"]);
-    // The conversation has no call left open, so an ordinary resume is not refused for it.
     assert.equal(deferredCallOpen((after, limit) => r.manager.events(id, after, limit)), false);
   } finally { await r.stop(); }
 });
@@ -141,13 +128,11 @@ test("an API restart between the owner's answer and the resume runs the call onc
     const id = randomUUID();
     await r.manager.create({ requestId: id, provider: "claude", projectId: "rehearsal", title: "Headless", prompt: "allowlisted" });
     const waiting = await waitFor(() => live(r, id), s => s.attention.state === "needs-you" && Boolean(s.permissionChannel?.waiting), 40_000);
-    // The resumed provider holds before it asks for the call again, so the API restarts between the answer and the resume.
     writeFileSync(join(r.workspace, "hold-resume"), "");
     const promptId = waiting.attention.prompt!.id;
     const requestId = randomUUID();
     const receipt = await workerCall(r.config.runDir, id, { op: "answer", requestId, promptId, option: 0 });
     await waitFor(async () => r.deliveries, list => list.some(d => /owner allowed/.test(d.detail ?? "")), 10_000);
-    // The restart: a new Manager and channel over the same state and socket, with no memory of the decision. The worker stays.
     r.channel.close();
     const manager = new Manager(r.config, r.key);
     const after = fakePipeline();
@@ -155,14 +140,12 @@ test("an API restart between the owner's answer and the resume runs the call onc
     manager.useHeadlessChannel(restarted);
     await restarted.listen();
     const now = { ...r, manager };
-    // The answer was consumed before the restart: a retry gets its receipt, and another answer finds no prompt.
     assert.deepEqual(await workerCall(r.config.runDir, id, { op: "answer", requestId, promptId, option: 0 }), receipt);
     await assert.rejects(workerCall(r.config.runDir, id, { op: "answer", requestId: randomUUID(), promptId, option: 0 }), /prompt-changed/);
     rmSync(join(r.workspace, "hold-resume"));
     await waitFor(() => live(now, id), s => s.status === "exited", 30_000);
     assert.equal(r.log("ran.log"), "deploy production\n");
     assert.deepEqual(now.channelEvents(id).map(event => event.event).filter(event => event !== "pending"), ["deferred", "waiting", "answer", "resumed", "delivered"]);
-    // The receipt is linked to the decision made before the restart, and only this session could record it.
     const decisionId = r.deliveries.find(d => /deferred/.test(d.detail ?? ""))!.decisionId;
     await waitFor(async () => after.deliveries, list => list.length > 0, 10_000);
     assert.deepEqual(after.deliveries.map(d => [d.decisionId, d.kind]), [[decisionId, "receipt"]]);
@@ -176,7 +159,6 @@ test("an owner halt engaged after the owner's allow and before the resumed call 
     const id = randomUUID();
     await r.manager.create({ requestId: id, provider: "claude", projectId: "rehearsal", title: "Headless", prompt: "allowlisted" });
     const waiting = await waitFor(() => live(r, id), s => s.attention.state === "needs-you" && Boolean(s.permissionChannel?.waiting), 40_000);
-    // The resumed provider holds before it asks for the call again, so the halt lands between the answer and the call.
     writeFileSync(join(r.workspace, "hold-resume"), "");
     await workerCall(r.config.runDir, id, { op: "answer", requestId: randomUUID(), promptId: waiting.attention.prompt!.id, option: 0 });
     await waitFor(async () => r.deliveries, list => list.some(d => /owner allowed/.test(d.detail ?? "")), 10_000);
@@ -187,7 +169,6 @@ test("an owner halt engaged after the owner's allow and before the resumed call 
     assert.equal(r.log("denied.log"), `deploy production: ${requesterNotice("unavailable")}\n`);
     const delivered = r.channelEvents(id).filter(event => event.event === "delivered");
     assert.deepEqual(delivered.map(event => event.decision), ["withheld"]);
-    // The answer was used once: no call is left open, and the decision records the withheld allow, never a receipt.
     assert.equal(deferredCallOpen((after, limit) => r.manager.events(id, after, limit)), false);
     const decisionId = r.deliveries.find(d => /deferred/.test(d.detail ?? ""))!.decisionId;
     await waitFor(async () => r.deliveries, list => list.some(d => d.decisionId === decisionId && d.kind === "stale"), 10_000);
@@ -203,7 +184,6 @@ test("a class call that arrives during an owner halt is denied as unavailable an
     const ended = await waitFor(() => live(r, id), s => s.status === "exited", 30_000);
     assert.equal(r.log("ran.log"), "");
     assert.equal(r.log("denied.log"), `deploy production: ${requesterNotice("unavailable")}\n`);
-    // No deferral was made, so no owner answer exists that could run the call after the release.
     assert.equal(ended.permissionChannel?.waiting, undefined);
     assert.deepEqual(r.channelEvents(id).filter(event => event.event === "deferred"), []);
   } finally { await r.stop(); }
@@ -214,7 +194,6 @@ test("an owner's refusal reaches the call with the host's notice and the owner's
   try {
     const id = randomUUID();
     await r.manager.create({ requestId: id, provider: "claude", projectId: "rehearsal", title: "Headless", prompt: "allowlisted" });
-    // The profile's allow rule is outranked: `permissions status` lists it, and the call still waits.
     const status = await r.channel.status();
     assert.deepEqual(status.shadowed.map(rule => [rule.rule, rule.interruptClass]), [["Bash(deploy production)", "production-or-staging"]]);
     const waiting = await waitFor(() => live(r, id), s => Boolean(s.permissionChannel?.waiting) && s.attention.state === "needs-you", 40_000);
@@ -236,7 +215,6 @@ test("stop retires a waiting call unanswered, and the session cannot be resumed 
     await waitFor(() => live(r, id), s => s.status === "exited", 20_000);
     assert.equal(r.log("ran.log"), "");
     assert.deepEqual(r.channelEvents(id).map(event => [event.event, event.reason]).at(-1), ["retired", "stopped"]);
-    // An ordinary resume has no channel: the provider's allow list would decide the call the owner was asked about.
     await assert.rejects(r.manager.resume(id, randomUUID()), /waited for the owner's answer/);
   } finally { await r.stop(); }
 });
@@ -248,12 +226,9 @@ test("a session the pipeline does not serve launches exactly as before", { timeo
     await r.manager.create({ requestId: id, provider: "claude", projectId: "rehearsal", title: "Headless", prompt: "allowlisted" });
     assert.deepEqual(r.manager.meta(id).session.headless, { channel: false, reason: "No owner act covers this project.", allowlist: ["Bash(deploy production)"] });
     await waitFor(() => live(r, id), s => s.status === "exited", 30_000);
-    // Without the channel the allow list decides, as it did before.
     assert.equal(r.log("ran.log"), "deploy production\n");
   } finally { await r.stop(); }
 });
-
-/* ------------------------------------------------------------------ the worker half, with a fake host */
 
 function workerRig(replies: Array<ChannelReply | Error>) {
   const records: Array<Record<string, unknown>> = [];
@@ -262,7 +237,6 @@ function workerRig(replies: Array<ChannelReply | Error>) {
   const closed: Array<[number, string]> = [];
   let now = Date.parse("2026-11-14T10:00:00.000Z");
   let ended = 0, resumed = 0, resumeFails = false;
-  // The host's answer to the resume check before an owner's allow is returned.
   let resumeReply: ChannelReply | Error = { result: "ok" };
   const host: ChannelWorkerHost = {
     sessionId: randomUUID(), token: "0".repeat(64), socket: "/nonexistent",
@@ -345,7 +319,6 @@ test("while a call waits, every other call of the session is denied as pending",
   assert.equal((await w.pre("deploy production", "toolu_1")).decision, "defer");
   for (const answer of [await w.pre("ls", "toolu_2"), await w.channel.request({ tool_name: "Bash", tool_input: { command: "ls" } })])
     assert.deepEqual(answer, { decision: "deny", reason: PENDING_NOTICE });
-  // Only the class check asked the host: a pending call starts no review.
   assert.deepEqual(w.requests.map(request => (request as { op: string }).op).filter(op => op !== "delivery"), ["class"]);
 });
 
@@ -364,10 +337,8 @@ test("the owner's answer is returned once, only to the call it was given for", a
   w.channel.answer({ requestId: "a1", promptId, option: 0 });
   assert.equal(w.resumed, 1);
   await assert.rejects(async () => w.channel.answer({ requestId: "a2", promptId, option: 1 }), /prompt-changed/);
-  // A different call id waiting behind the resumed one is still pending.
   assert.deepEqual(await w.pre("ls", "toolu_9"), { decision: "deny", reason: PENDING_NOTICE });
   assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "allow" });
-  // The same call again, once the answer was used, is the owner's again.
   assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "deny", reason: requesterNotice("needs-owner") });
 });
 
@@ -389,18 +360,14 @@ test("an owner's allow is withheld, and still used once, when the host refuses i
     w.channel.answer({ requestId: "a1", promptId: w.prompts[0], option: 0 });
     assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "deny", reason: requesterNotice("unavailable") });
     assert.deepEqual([w.records.at(-1)?.event, w.records.at(-1)?.decision], ["delivered", "withheld"]);
-    // The check named the deferral's root and decision; the withheld allow is recorded as stale for that decision.
     const ops = w.requests as Array<{ op: string; sessionRoot?: string; decisionId?: string; deliveryKey?: string; kind?: string }>;
     const resume = ops.find(request => request.op === "resume")!;
     assert.deepEqual([resume.sessionRoot, resume.decisionId, resume.deliveryKey], ["/workspace", (owner as { decisionId: string }).decisionId, "d".repeat(64)]);
-    // The check carries the resumed call, so the host reads it again.
     const { toolName, toolInput, toolUseId } = (resume as { call?: Record<string, unknown> }).call ?? {};
     assert.deepEqual([toolName, toolInput, toolUseId], ["Bash", { command: "deploy production" }, "toolu_1"]);
     assert.equal(ops.filter(request => request.op === "delivery").at(-1)?.kind, "stale");
-    // The answer was used: the same call again is the owner's again.
     assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "deny", reason: requesterNotice("needs-owner") });
   }
-  // An owner's refusal is returned without asking the host.
   const refused = workerRig([owner]);
   refused.answerResume(new Error("ECONNREFUSED"));
   await refused.pre("deploy production", "toolu_1");
@@ -463,15 +430,11 @@ test("a PermissionRequest carries the call id of its PreToolUse and only host te
   assert.match(decide.requestId, /:toolu_7$/);
 });
 
-/** The decide requests a worker sent, in order. */
 const decides = (w: ReturnType<typeof workerRig>) =>
   w.requests.filter(request => (request as { op?: string }).op === "decide") as Array<{ requestId: string; call: { toolUseId?: string } }>;
-/** A PermissionRequest hook for a Bash command. The provider sends it without a call id. */
 const raise = (w: ReturnType<typeof workerRig>, command: string, extra: Record<string, unknown> = {}) =>
   w.channel.request({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command }, ...extra });
-/** A request may take its own call's id or none. It must not take another call's id. */
 const ownOrNone = (id: string | undefined, own: string) => assert.ok(id === undefined || id === own, `the request took ${id}, and its call is ${own}`);
-/** One call is deferred, the provider exits on it, the owner allows it, and the resumed call receives that allow. */
 async function resumeAfterDeferral(w: ReturnType<typeof workerRig>) {
   assert.equal((await w.pre("deploy production", "toolu_owner")).decision, "defer");
   assert.equal(w.channel.exited(0), true);
@@ -484,7 +447,6 @@ test("identical calls open together: no PermissionRequest takes a call id until 
   await w.pre("git status", "toolu_a");
   await w.pre("git status", "toolu_b");
   await raise(w, "git status");
-  // A third identical call starts while one of the first two is still open.
   await w.pre("git status", "toolu_c");
   await raise(w, "git status");
   await raise(w, "git status");
@@ -492,7 +454,6 @@ test("identical calls open together: no PermissionRequest takes a call id until 
   assert.equal(new Set(decides(w).map(decide => decide.requestId)).size, 3, "each request has an id of its own");
   assert.equal(decides(w).some(decide => /toolu_/.test(decide.requestId)), false);
 
-  // All three are counted off, so the next identical call is alone and its request takes its id.
   await w.pre("git status", "toolu_d");
   await raise(w, "git status");
   assert.equal(decides(w)[3]!.call.toolUseId, "toolu_d");
@@ -526,7 +487,6 @@ test("a call id repeated among identical open calls gives no request another cal
   await w.pre("git status", "toolu_a");
   await raise(w, "git status");
   await raise(w, "git status");
-  // Both open calls raised their request. The worker counts the repeat as a third call, so this one takes no id here.
   await w.pre("git status", "toolu_c");
   await raise(w, "git status");
   const ids = decides(w).map(decide => decide.call.toolUseId);
@@ -546,10 +506,8 @@ test("a PermissionRequest that names its call keeps that id and counts none of t
   const w = workerRig([]);
   await w.pre("git status", "toolu_a");
   await w.pre("git status", "toolu_b");
-  // The worker cannot tell whether the named call is one of the two, so both stay counted.
   await raise(w, "git status", { tool_use_id: "toolu_z" });
   await raise(w, "git status");
-  // One of the two is still open. A third call is not alone, so the open call's request cannot take its id.
   await w.pre("git status", "toolu_c");
   await raise(w, "git status");
   assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), ["toolu_z", undefined, undefined]);
@@ -573,7 +531,6 @@ test("a call without an id is counted as open too, so its request never takes an
   await bare("git status");
   await raise(w, "git status");
   await raise(w, "git status");
-  // Alone, it is counted off by its own request and holds nothing back from the next call.
   await bare("git status");
   await raise(w, "git status");
   await w.pre("git status", "toolu_b");
@@ -596,8 +553,6 @@ test("past its bound the worker no longer trusts what it holds: an identical cal
   const w = workerRig([]);
   await w.pre("git status", "toolu_a");
   for (let other = 0; other < OPEN_CALL_KEYS; other++) await w.pre(`echo ${other}`, `toolu_other_${other}`);
-  // The first call may still be open, and the worker no longer holds it. An identical call must not look alone, or
-  // the first call's request would take its id.
   await w.pre("git status", "toolu_b");
   await raise(w, "git status");
   await raise(w, "git status");
@@ -610,7 +565,6 @@ test("past its bound the worker no longer trusts what it holds: an identical cal
 
 test("a late PermissionRequest of a provider that exited does not take the id of the next provider's identical call", async () => {
   const w = workerRig([{ result: "none" }, owner]);
-  // The first provider leaves this call open, and exits on another call's deferral before the request arrives.
   await w.pre("git status", "toolu_a");
   await resumeAfterDeferral(w);
   await w.pre("git status", "toolu_b");
@@ -625,13 +579,10 @@ test("a call left open by a provider that exited gives its id to no request of t
   const w = workerRig([{ result: "none" }, owner]);
   await w.pre("git status", "toolu_a");
   await resumeAfterDeferral(w);
-  // The first provider's call raised no request. This request belongs to the next provider's call.
   await w.pre("git status", "toolu_b");
   await raise(w, "git status");
   ownOrNone(decides(w)[0]!.call.toolUseId, "toolu_b");
 });
-
-/* ------------------------------------------------------------------ the host half */
 
 function hostRig(pipeline: PermissionPipeline, headless: Session["headless"] = { channel: true },
   extra: { team?: Session["team"]; teamLive?: (session: Session) => boolean } = {}) {
@@ -642,7 +593,6 @@ function hostRig(pipeline: PermissionPipeline, headless: Session["headless"] = {
     key, runDir: root, services: { pipeline },
     sessions: { meta: () => ({ session }), list: async () => [{ id: session.id, status: "running", headless }] },
     ...(extra.teamLive ? { teamLive: extra.teamLive } : {}),
-    // A team session is served only with a readable task (INF-274); this rig reads one from the run.
     ...(extra.team ? { teamTask: () => ({ title: "Team task", text: "Run objective" }) } : {}),
   });
   const ask = (request: Record<string, unknown>) => channel.handle({ v: 1, sessionId: session.id, token: channelToken(key, session.id), ...request });
@@ -655,7 +605,6 @@ test("the channel answers only the session its key was made for", async () => {
   const h = hostRig(fake.pipeline);
   try {
     await assert.rejects(h.channel.handle({ v: 1, sessionId: h.session.id, token: channelToken(randomBytes(32), h.session.id), op: "class", call: bash("ls") }), /unbound/);
-    // A delivery is recorded only with the key of a decision issued to this session.
     const decisionId = randomUUID();
     await assert.rejects(h.ask({ op: "delivery", decisionId, kind: "receipt" }), /unbound/);
     await assert.rejects(h.ask({ op: "delivery", decisionId, deliveryKey: deliveryKey(h.key, randomUUID(), decisionId), kind: "receipt" }), /unbound/);
@@ -667,7 +616,6 @@ test("the channel answers only the session its key was made for", async () => {
 const member = { runId: "run-1", memberId: "member-1", revision: 1, role: "implementer", taskId: "task-a" } as NonNullable<Session["team"]>;
 
 test("a team member's call is decided only while its run is live, checked again before an allow", async () => {
-  // Without the run check, and when it is false or throws, nothing is decided.
   for (const teamLive of [undefined, () => false, () => { throw new Error("no run"); }]) {
     const fake = fakePipeline();
     const h = hostRig(fake.pipeline, { channel: true }, { team: member, ...(teamLive ? { teamLive } : {}) });
@@ -677,13 +625,11 @@ test("a team member's call is decided only while its run is live, checked again 
       assert.equal(fake.decided.length, 0);
     } finally { h.done(); }
   }
-  // A live run is served.
   const served = hostRig(fakePipeline().pipeline, { channel: true }, { team: member, teamLive: () => true });
   try {
     assert.equal((await served.ask({ op: "class", call: bash("deploy production") })).result, "owner");
     assert.equal((await served.ask({ op: "decide", call: bash("make safe-build"), requestId: `headless:${served.session.id}:toolu_1` })).result, "allow");
   } finally { served.done(); }
-  // The run stops being live while the decision runs: the allow is withheld and recorded as stale.
   let checks = 0;
   const stopped = fakePipeline();
   const h = hostRig(stopped.pipeline, { channel: true }, { team: member, teamLive: () => ++checks === 1 });
@@ -700,26 +646,22 @@ test("a team member's headless seat is the interactive team adapter's, so their 
     try { await h.ask({ op: "decide", call: bash("make safe-build"), requestId: `headless:${h.session.id}:toolu_1` }); }
     finally { h.done(); }
   }
-  // The interactive adapter's value for the same run, role and task (team-permission-adapter.ts).
   assert.deepEqual(fake.decided.map(request => request.requester.assignment), ["team:run-1:implementer:task:task-a", "team:run-1:implementer"]);
 });
 
 test("a class call waits only on a recorded owner decision: a halt denies it as unavailable, any other outcome needs the owner", async () => {
-  // Under a halt nothing is decided or recorded, and nothing waits for the release.
   const held = fakePipeline({ decide: async () => ({ kind: "held" }) });
   const h = hostRig(held.pipeline);
   try {
     assert.deepEqual(await h.ask({ op: "class", call: bash("deploy production") }), { result: "deny", code: "unavailable", notice: requesterNotice("unavailable") });
     assert.equal(held.deliveries.length, 0);
   } finally { h.done(); }
-  // No owner decision to bind an answer to: denied with needs-owner, and the owner is told with the class rule's class.
   const needsOwner = { result: "deny", code: "needs-owner", notice: requesterNotice("needs-owner"), interruptClass: "production-or-staging" };
   for (const decide of [async () => ({ kind: "undeliverable", reason: "no ledger" }), async () => { throw new Error("journal down"); }]) {
     const other = hostRig(fakePipeline({ decide: decide as PermissionPipeline["decide"] }).pipeline);
     try { assert.deepEqual(await other.ask({ op: "class", call: bash("deploy production") }), needsOwner); }
     finally { other.done(); }
   }
-  // A verdict other than the owner's, for a class call: the same, and its decision records the refusal.
   const decisionId = randomUUID();
   const allowed = fakePipeline({ decide: async () => ({ kind: "allow", decisionId, strongTier: true }) });
   const a = hostRig(allowed.pipeline);
@@ -744,14 +686,12 @@ test("an allow is returned only while it still applies, and a destructive one on
 });
 
 test("a reject is returned only while it still applies, and a halt recorded while the call was decided denies it as unavailable", async () => {
-  // The decision was retired (a revoke or regrouping) while the call was decided: the provider keeps the call.
   const stale = fakePipeline({ applicable: () => false });
   const h = hostRig(stale.pipeline);
   try {
     assert.deepEqual(await h.ask({ op: "decide", call: bash("npm publish"), requestId: `headless:${h.session.id}:toolu_1` }), { result: "not-served" });
     assert.deepEqual(stale.deliveries.map(entry => entry.kind), ["stale"]);
   } finally { h.done(); }
-  // An owner halt recorded while the call was decided: no recorded verdict reaches the session.
   let halted = false;
   const halting = fakePipeline({
     decide: async () => { halted = true; return { kind: "reject", decisionId: randomUUID(), code: "unsafe", notice: "MODEL TEXT" }; },
@@ -788,7 +728,6 @@ test("the resume check confirms an owner's allow only without a halt, while its 
     const resume = (extra: Record<string, unknown> = {}) =>
       h.ask({ op: "resume", sessionRoot: h.session.cwd, decisionId, deliveryKey: deliveryKey(h.key, h.session.id, decisionId), ...extra });
     assert.deepEqual(await resume(), { result: "ok" });
-    // A deferral that was issued no decision is bound to no authority: its allow is withheld, also with no halt now.
     assert.deepEqual(await resume({ decisionId: undefined, deliveryKey: undefined }), { result: "withheld", reason: "stale" });
     halted = () => true;
     assert.deepEqual(await resume(), { result: "withheld", reason: "halted" });
@@ -800,7 +739,6 @@ test("the resume check confirms an owner's allow only without a halt, while its 
     assert.deepEqual(await resume(), { result: "withheld", reason: "stale" });
     applies = true;
     assert.deepEqual(await resume({ sessionRoot: "/elsewhere" }), { result: "withheld", reason: "stale" });
-    // A decision is confirmed only with the key issued to this session.
     await assert.rejects(resume({ deliveryKey: undefined }), /unbound/);
     await assert.rejects(resume({ deliveryKey: deliveryKey(h.key, randomUUID(), decisionId) }), /unbound/);
     await assert.rejects(resume({ sessionRoot: undefined }), /invalid/);
@@ -813,8 +751,6 @@ test("the resume check reads the resumed call again, with the task as it is now"
   const fake = fakePipeline({ applicable: (_id, request) => { seen.push(request); return applies; } });
   const h = hostRig(fake.pipeline);
   try {
-    // The class check of a call and the resume check of the same call build one request, whatever else the worker's
-    // call object carries, so the pipeline gives both the same decision id.
     await h.ask({ op: "class", call: { ...bash("deploy production", "toolu_8"), nativeSessionId: "native-1" } });
     const first = randomUUID();
     await h.ask({ op: "resume", sessionRoot: h.session.cwd, decisionId: first, deliveryKey: deliveryKey(h.key, h.session.id, first), call: { ...bash("deploy production", "toolu_8"), nativeSessionId: "native-2" } });
@@ -823,18 +759,15 @@ test("the resume check reads the resumed call again, with the task as it is now"
     const resume = (extra: Record<string, unknown> = {}) =>
       h.ask({ op: "resume", sessionRoot: h.session.cwd, decisionId, deliveryKey: deliveryKey(h.key, h.session.id, decisionId), ...extra });
     assert.deepEqual(await resume({ call: bash("deploy production", "toolu_9") }), { result: "ok" });
-    // The request is the one the class check built for this call, so an unchanged reading gives the deferral's decision id.
     const again = seen.at(-1)!;
     assert.deepEqual([again.id, again.action, again.requester.task], [`headless:${h.session.id}:toolu_9`, "deploy production", { title: "T", text: "do it" }]);
     h.session.title = "Another task";
     await resume({ call: bash("deploy production", "toolu_9") });
     assert.equal(seen.at(-1)!.requester.task.title, "Another task");
-    // A reading that no longer gives the decision withholds the owner's allow.
     applies = false;
     assert.deepEqual(await resume({ call: bash("deploy production", "toolu_9") }), { result: "withheld", reason: "stale" });
     applies = true;
     await assert.rejects(resume({ call: { toolName: "Bash" } }), /invalid/);
-    // A worker of an earlier release names no call: the decision is checked as before.
     assert.deepEqual(await resume(), { result: "ok" });
     assert.equal(seen.at(-1), undefined);
   } finally { h.done(); }
@@ -886,31 +819,26 @@ test("an open deferred call is found in the journal until it is delivered", () =
 test("the channel hook prints a provider decision only for a decision", () => {
   assert.equal(hookOutput("check", { decision: "none" }), "");
   assert.deepEqual(JSON.parse(hookOutput("check", { decision: "defer", reason: "wait" })), { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "defer", permissionDecisionReason: "wait" } });
-  // A PermissionRequest hook cannot defer: anything but an allow is a deny.
   assert.deepEqual(JSON.parse(hookOutput("request", { decision: "defer" })).hookSpecificOutput.decision, { behavior: "deny", message: requesterNotice("unavailable") });
 });
 
 test("each resume the worker performed owes one continue: the first prompt after it is marked, and nothing else", async () => {
   const w = workerRig([owner, { ...owner, decisionId: randomUUID() }]);
-  // The session worker's own callback, as worker.ts wires it on the Claude hook route.
   const mark = (signals: Parameters<typeof claudeTurnSignals>[0]) => claudeTurnSignals(signals, () => w.channel.takeContinue());
   const prompt = { kind: "turn-start" as const, prompt: "Continue from where you left off." };
   const next = { kind: "turn-start" as const, prompt: "next" };
   const toolEnd = { kind: "tool-end" as const, tool: "Bash", ok: true };
   assert.deepEqual(mark([prompt]), [prompt], "before any resume a prompt is a person's");
   await resumeAfterDeferral(w);
-  // The resumed call's own hooks arrive before the continue prompt: they neither take the answer nor get the marker.
   assert.deepEqual(mark([toolEnd]), [toolEnd]);
   assert.deepEqual(mark([prompt, next]), [{ ...prompt, automatic: true }, next], "only the first prompt after the resume is the provider's");
   assert.deepEqual(mark([prompt]), [prompt], "the answer is taken once");
-  // A second deferred call in the resumed run, which the owner refuses: its resume owes a continue all the same.
   assert.equal((await w.pre("deploy staging", "toolu_second")).decision, "defer");
   assert.equal(w.channel.exited(0), true);
   w.channel.answer({ requestId: "a2", promptId: w.prompts[1]!, option: 1 });
   assert.deepEqual(await w.pre("deploy staging", "toolu_second"), { decision: "deny", reason: OWNER_DENIED });
   assert.equal(w.resumed, 2);
   assert.deepEqual(mark([toolEnd, prompt]), [toolEnd, { ...prompt, automatic: true }], "the second resume owes one too");
-  // A resume that fails owes nothing.
   const unresumable = workerRig([owner]);
   unresumable.failResume();
   await unresumable.pre("deploy production", "toolu_1");

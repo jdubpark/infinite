@@ -155,7 +155,6 @@ test("blind indexes separate classes", () => {
   assert.notEqual(blindIndex(key, "feature-map", "a"), blindIndex(key, "area", "a"));
   assert.equal(blindIndex(key, "task", "a"), blindIndex(key, "task", "a"));
   assert.match(blindIndex(key, "task", "a"), /^[0-9a-f]{64}$/);
-  // A goal, a mission, and a legacy line id each have a class of their own, so equal values never share an index.
   const classes = ["project", "task", "area", "goal", "mission", "legacy", "feature-map", "eval-set"] as const;
   assert.equal(new Set(classes.map(cls => blindIndex(key, cls, "a"))).size, classes.length);
   assert.throws(() => blindIndex(key, "run" as EvidenceIndexClass, "a"), TypeError);
@@ -599,7 +598,6 @@ test("a leftover temporary file is removed only when its builder has exited", ()
     const temp = (pid: number) => `evidence.sqlite3.creating-${pid}-${randomUUID()}`;
     const stale = temp(exited);
     const running = temp(process.pid);
-    // Process 1 runs under another user, so probing it fails with EPERM, which means it runs.
     const otherUser = process.getuid?.() === 0 ? undefined : temp(1);
     const kept = [running, ...(otherUser ? [otherUser] : [])];
     for (const name of [stale, `${stale}-journal`, ...kept]) writeFileSync(join(directory, name), "half-built", { mode: 0o600 });
@@ -851,7 +849,6 @@ test("statements cannot cross the transaction boundary", () => {
       assert.throws(() => store.read(db => db.get(sql)), hasCode("invalid-statement"), sql);
     }
 
-    // `exec` runs every statement in its text. A later COMMIT or ROLLBACK ends the transaction and fails the write.
     assert.throws(() => store.write(tx => tx.exec("CREATE TABLE t(id); COMMIT;")), hasCode("invalid-statement"));
     assert.equal(tableExists(store, "t"), false, "the refusal comes before any statement runs");
     assert.throws(() => store.write(tx => {
@@ -977,7 +974,6 @@ test("transaction control is refused in every position and spelling", () => {
       "SELECT 1; PRAGMA journal_mode=DELETE",
       "SELECT 1; VACUUM",
       "SELECT 1; ﻿COMMIT",
-      // SQLite reads `$a(;...)` as one Tcl-style parameter, so its `;` ends nothing. The form is refused.
       "SELECT $a(;CREATE/**/TRIGGER); END;",
     ];
     for (const sql of refused) {
@@ -1066,7 +1062,6 @@ test("a write that SQLite rolled back takes no further operation", (t) => {
       try {
         tx.run("INSERT OR ROLLBACK INTO unique_rows (code) VALUES ('a')");
       } catch {
-        // SQLite has ended the write's transaction. Module code that keeps going must not commit anything.
       }
       const later: Array<() => unknown> = [
         () => tx.run("INSERT INTO unique_rows (code) VALUES ('b')"),

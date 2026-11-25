@@ -3,59 +3,6 @@ import { configId } from "../packages/host/src/config-identity.js";
 import type { OutboxEvent } from "../packages/host/src/evidence/outbox.js";
 import { runEventKey } from "../packages/host/src/run-events.js";
 
-/*
- * The event scripts of the outcome projector simulator (tests/outcome-projector-sim.test.ts): team runs as TeamService
- * emits them. Each order below is one the emitter guarantees, so a script keeps it. Line numbers are those of teams.ts,
- * unless a file is named, as the sources stood when this simulator was written:
- * - run.created opens a run (1604); run.prepared follows it (1664).
- * - A run's events reach the store in emission order: one outbox array per run, flushed whole (936-961, 1004-1019).
- * - A revision's project manager starts and reports first. Its task.planned events precede the starts of the plan's
- *   implementers, and discovery.accepted precedes the starts of its scouts (5240, 5322; launch 5158).
- * - A member's start precedes its report, its integration, its completion and its escalation (5158, 4852, 5569, 5254, 5264).
- * - An implementer's result is consumed (integrated, or refused for scope or conflict) only after every earlier planned
- *   task of its revision is integrated. Its other reports, escalations among them, and scout findings are consumed as
- *   they arrive (3458-3462, 5197).
- * - A member's exit is confirmed, setting it stopped, before its report is consumed (2971-2974, 3455-3462), and a halt
- *   emits member.stopped only when it changes a member to stopped (3303-3304). So an owner halt stops only members
- *   still active: queued, running, or reported and not yet consumed (3270). A drain selects every member of its
- *   revision (3270-3273); for a consumed member see the reorders below.
- * - member.stopped(stall | no-report) follows a drained journal, so no report of that member follows it (4880-4888, 3399-3420).
- * - A replacement starts after its predecessor's stall, limit or escalation (4908, 4936, 5269 link it before its launch);
- *   task.limit-switched precedes a limit replacement's start (4974).
- * - A second stall on one assignment (same revision, role and task) stops the member, then blocks the run with
- *   member-stalled, no source member and no replacement; no automatic recovery takes that code, so the run rests
- *   blocked (4888-4896, 269, 274, 2784). A limit read from a stalled member's journal stops it for the limit instead,
- *   which is no stall (4883-4887).
- * - review.recorded precedes the repair.started it causes (5519, 5528, 5599); repair.integrated answers its own round (5575).
- * - No repair.started follows a cancel or pause, which a revision must leave first (5595).
- * - A block saves its status first, so run.blocked precedes the halt's stops (2832, 928, 3304); a recovery stops the
- *   drained revision first and then emits run.revision-advanced (3267-3305, 2942).
- * - One key per fact (run-events.ts:9); the store keeps the first event of a repeated key (store.ts:287-318).
- * Reorders the emitter allows, which the scripts produce:
- * - The members of a revision run at once, so their starts and reports interleave (3333 loops over them on each pass).
- * - member.configured, review.tree and repair.paths are reads that end later, also after a settle (5172, 5535, 5584, 5618-5640).
- * - In a drain, a report read from a later journal page follows the halt's stop (3298-3305; outcome-rules.ts:61-65).
- * - A drain whose journal read of a consumed member threw leaves it unavailable (3301), and its next pass stops it, so
- *   a new member.stopped follows that member's integration, completion or escalation (3292-3304).
- * - A drain that reads another report envelope of a member emits member.reported under a key the store already holds
- *   (3298, 4850-4853). That is an emission, not a new stored fact: the store keeps the first event of a key. The
- *   test file's repeated-key fault delivers such events.
- * - An owner cancel settles first, and the halt loop stops the members afterwards (2204, 2231-2232, then 3304).
- * - An operation that finished before a cancel or pause completes while held, before or after the halt's stops and,
- *   for a cancel, after the settle: stopRun aborts the command but keeps `pending`, and the queued completion runs
- *   (2279-2292, 2695-2704). Covered: an integration, a scout's completion, a review, a repair answer (5569, 5254, 5519,
- *   5575), and the workspace preparation, so run.prepared can follow a cancel's run.settled (1664).
- * - A halt stops a queued member that never launched, with no start event (3283, 3291, then 3304).
- * - Runs interleave at flush granularity: each save flushes one run's outbox (855-866).
- * Not produced: owner answers and their replacements, permission and intent members, no-change settles, delivery
- * recovery, budget stops, and an implementer question that becomes a decision instead of a block. Also: a cancel
- * followed by a held task.escalated, a held discovery.accepted, or a held plan.accepted with its task.planned
- * (2695-2704, 5234-5245, 5262-5269, 5322); an owner resume of a run blocked on member-stalled (422); a delivery
- * member's stall or limit, which blocks with delivery-reconciliation-required after a publication attempt
- * (4890-4893, 4938-4941); and a limit with no fallback profile, which blocks with provider-limit (4945-4947).
- */
-
-// On: production can emit an empty repair answer after a cancel settle; the summary's rounds must follow it (INF-316).
 export const EMPTY_REPAIR_AFTER_SETTLE = true;
 
 export type Counts = Record<string, number>;
@@ -68,18 +15,14 @@ type Task = { escalated: boolean; integrated: boolean; member?: Member };
 type Data = Record<string, unknown>;
 
 const MAX_REVISION = 3;
-/** Codes a member's own report or an operation failure recovers from (teams.ts:269, 274). */
 const RECOVERY_CODES = new Set(["agent-blocked", "agent-question", "missing-agent-report", "wrong-agent-report", "task-scope-violation", "integration-conflict"]);
-/** The steps that consume an implementer's result, which wait for the earlier planned tasks (teams.ts:3458-3462). */
 const CONSUMES_RESULT = new Set(["integrate", "block:task-scope-violation", "block:integration-conflict"]);
-/** Completions a cancel holds, which then land after its run.settled, and enrichment reads that can land after one. */
 const HELD_KINDS = new Set(["run.prepared", "task.integrated", "scout.completed", "review.recorded", "repair.integrated"]);
 const LATE_KINDS = new Set(["member.configured", "review.tree", "repair.paths"]);
 const DIGESTS = ["a".repeat(64), "e".repeat(64)];
 const MODELS = ["m-1", "m-2", "m-3"];
 const PATHS = ["a.txt", "b.txt", "c.txt", "z.txt"];
 
-/** How one attempt ends, by weight. A third attempt always succeeds, so a replacement chain ends. */
 const IMPLEMENTER_ENDINGS: readonly (readonly [number, string[]])[] = [
   [55, ["report:result", "integrate"]],
   [12, ["stop:stall"]],
@@ -100,7 +43,6 @@ const SCOUT_ENDINGS: readonly (readonly [number, string[]])[] = [
 
 export const bump = (counts: Counts, name: string, by = 1) => { counts[name] = (counts[name] ?? 0) + by; };
 
-/** mulberry32: small, seeded, and the same on every platform. No Math.random and no clock anywhere in the simulator. */
 export function rand(seed: number): Rand {
   let state = seed >>> 0;
   const next = () => {
@@ -123,17 +65,12 @@ function weighted(r: Rand, table: readonly (readonly [number, string[]])[]): str
   return [...table[0]![1]];
 }
 
-/** A `member.configured` whose id matches its six components, as `configuredData` builds it. */
 function configured(model: string, promptVersion: string): Data {
   const profile = { provider: "claude", model, effort: null };
   const components = { profile, promptVersion, guidance: DIGESTS[1]!, knowledge: "none" as const, routing: "off", shape: "team" as const };
   return { configId: configId(components), provider: "claude", model, promptVersion, guidance: DIGESTS[1], knowledge: "none", routing: "off", shape: "team" };
 }
 
-/**
- * One run's events in emission order. Members run as threads; blocks, recoveries, steering, pauses, continuations and
- * owner cancels end revisions; enrichment reads land later. Event times come from the caller's logical clock.
- */
 export class RunScript {
   readonly events: OutboxEvent[] = [];
   private keys = new Set<string>();
@@ -157,14 +94,11 @@ export class RunScript {
   script(): OutboxEvent[] {
     const goal = this.r.chance(0.3) ? { goalId: "goal-1", goalCycle: 1, missionId: "mission-1" } : {};
     this.emit("run.created", [], {}, { projectId: "example", purpose: "work", ...goal });
-    // An owner cancel during the workspace preparation settles the run; the held preparation then completes (teams.ts:1664).
     this.ended = this.r.chance(0.1);
     if (this.ended) this.settle("cancelled");
     this.emit("run.prepared", [], {}, { baseCommit: this.base });
     while (!this.ended) this.revise();
-    // A read still running when the record is last saved emits later, or never when it fails.
     for (const read of this.late.splice(0)) if (this.r.chance(0.8)) read();
-    // Deleting the record flushes its outbox last; the projector only advances past run.deleted (teams.ts:1384).
     if (this.r.chance(0.25)) this.emit("run.deleted", [], {}, { status: this.status });
     return this.events;
   }
@@ -190,7 +124,6 @@ export class RunScript {
     if (this.late.length > 0 && this.r.chance(0.2)) this.late.splice(this.r.int(0, this.late.length - 1), 1)[0]!();
   }
 
-  /** One revision: an optional discovery, a plan and its members, then checks and reviews. */
   private revise(): void {
     if (this.r.chance(0.4)) {
       this.discover();
@@ -228,21 +161,18 @@ export class RunScript {
     }
   }
 
-  /** Whether a member's next step may run now: a result waits until every earlier planned task is integrated. */
   private inOrder(m: Member): boolean {
     if (m.role !== "implementer" || !CONSUMES_RESULT.has(m.steps[0]!)) return true;
     const ids = [...this.tasks.keys()];
     return ids.slice(0, ids.indexOf(m.taskId!)).every(id => this.tasks.get(id)!.integrated);
   }
 
-  /** Runs this revision's members as threads. False when a block or an owner halt ended the revision. */
   private work(): boolean {
     for (;;) {
       const waiting = this.members.filter(m => m.revision === this.revision && !m.stopped && m.steps.length > 0);
       if (waiting.length === 0) return true;
       const runnable = waiting.filter(m => this.inOrder(m));
       if (runnable.length === 0) throw new Error("the script waits on a task that cannot integrate");
-      // An operation in flight when the owner halts: the next result or findings to consume.
       const due = runnable.find(m => m.steps[0] === "integrate" || m.steps[0] === "complete");
       if (this.r.chance(due ? 0.12 : 0.006)) {
         const step = due?.steps.shift();
@@ -262,7 +192,6 @@ export class RunScript {
       } else if (verb === "stop") {
         this.stop(m, arg);
         if (arg === "stall") {
-          // A second stall of one assignment blocks the run, with no source member and no replacement (teams.ts:4894-4895).
           const again = this.members.some(o => o !== m && o.revision === m.revision && o.role === m.role && o.taskId === m.taskId && o.stalled);
           m.stalled = true;
           if (again) {
@@ -276,7 +205,6 @@ export class RunScript {
           this.emit("task.limit-switched", [m.id], this.ids(m), { role: m.role, fromProfileId: `profile-${m.model}`, toProfileId: "profile-fallback" });
         }
         if (arg === "no-report") {
-          // A member that exits without a report blocks the run (teams.ts:3419-3422).
           this.block("missing-agent-report", m);
           return false;
         }
@@ -287,7 +215,6 @@ export class RunScript {
     }
   }
 
-  /** Checks and reviews until the revision is approved, blocked or halted (teams.ts:5490-5539, 5594-5601). */
   private review(): void {
     for (;;) {
       this.emit("check.finished", [this.revision, this.round, this.stamp()], {}, { round: this.round });
@@ -323,7 +250,6 @@ export class RunScript {
     }
   }
 
-  /** One correction round. False when an owner halt ended the revision while the integrator's result was in flight. */
   private repair(cause: string): boolean {
     this.round += 1;
     const { revision, round, base } = this;
@@ -336,7 +262,6 @@ export class RunScript {
       const commit = empty ? undefined : this.commit();
       if (commit !== undefined) this.head = this.commit();
       this.emit("repair.integrated", [revision, round], { memberId: integrator.id, revision }, { round, commit, headCommit: this.head, baseCommit: base });
-      // A failed path read still emits, with pathsOmitted (teams.ts:5580-5587).
       if (commit !== undefined) {
         const paths = this.r.chance(0.15) ? { pathsOmitted: true } : { paths: PATHS.filter(() => this.r.chance(0.4)) };
         this.late.push(() => this.emit("repair.paths", [revision, round], { memberId: integrator.id, revision }, { round, commit, ...paths }));
@@ -357,7 +282,6 @@ export class RunScript {
       const delivery = this.member("delivery");
       this.start(delivery);
       if (roll < 0.08 && this.revision < MAX_REVISION) {
-        // Nothing was published and the base moved: a new revision starts on the new base (teams.ts:5397-5411).
         this.report(delivery, "delivery-reconciliation");
         return this.advance("moved-base");
       }
@@ -379,7 +303,6 @@ export class RunScript {
     this.ended = true;
   }
 
-  /** A block. A recoverable one drains its revision and advances; any other one blocks the run (teams.ts:2759-2833). */
   private block(code: string, source?: Member): void {
     if (source && RECOVERY_CODES.has(code) && this.recoveries < 2 && this.revision < MAX_REVISION && this.r.chance(0.8)) {
       this.recoveries += 1;
@@ -391,15 +314,10 @@ export class RunScript {
     this.halt("host", "block");
     const roll = this.r.next();
     if (roll < 0.3) return this.cancel();
-    // Retention removes a blocked run's workspace and settles it as blocked (teams.ts:3225-3226).
     if (roll < 0.45) this.settle("blocked", "workspace-removed");
     this.ended = true;
   }
 
-  /**
-   * An owner halt: cancel, pause (and maybe resume), or steer. `pending` is a workspace operation that already
-   * finished. Steering refuses to start while one runs (teams.ts:1695); a cancel or pause holds its completion.
-   */
   private ownerHalt(pending?: () => void): void {
     const action = this.revision < MAX_REVISION ? this.r.pick(["cancel", "cancel", "pause", "steer"]) : "cancel";
     if (action === "steer") {
@@ -414,7 +332,6 @@ export class RunScript {
     const stops = this.halt("owner", action);
     if (after) {
       pending!();
-      // The reorder is a completion after the halt's stops, so a halt that stopped no member does not count.
       if (stops > 0) bump(this.counts, "reorder:completion-after-halt");
     }
     if (action === "pause") this.status = "paused";
@@ -428,18 +345,11 @@ export class RunScript {
     this.ended = true;
   }
 
-  /**
-   * The halt loop stops every active member (teams.ts:3270-3305): one with steps left, or one never started. A
-   * consumed member stopped already. A drained revision reads one journal page, so a report can land on either side.
-   * Returns how many member.stopped events the halt emitted.
-   */
   private halt(reason: "owner" | "host", detail: string, drained?: number): number {
     let stops = 0;
     for (const m of this.members) {
       if (m.stopped) continue;
       if (m.started && m.steps.length === 0) {
-        // A drain selects consumed members too. One whose journal read threw turned unavailable, and the next pass
-        // stops it with a new member.stopped after its integration, completion or escalation (teams.ts:3270-3273, 3292-3304).
         if (m.revision === drained && this.r.chance(0.25)) {
           this.stop(m, reason, detail);
           stops += 1;
@@ -447,7 +357,6 @@ export class RunScript {
         }
         continue;
       }
-      // Work turns are only time, so a report after them can already sit in the journal the drain reads.
       const next = m.steps.find(step => step !== "work");
       const report = m.started && m.revision === drained && next?.startsWith("report:") ? next.slice(7) : undefined;
       const when = report === undefined ? "never" : this.r.pick(["before", "after", "after", "after", "after", "never"]);
@@ -495,7 +404,6 @@ export class RunScript {
     const prefix: Record<string, string> = { implementer: "m", scout: "s", reviewer: "r", integrator: "g", delivery: "d", "project-manager": "p" };
     const member: Member = {
       id: `${prefix[role]}${++this.serial}`, role, revision: this.revision, taskId, model: this.r.pick(MODELS), attempt, replaces,
-      // Work turns emit nothing; they keep a member in flight while the others move on.
       started: false, reported: false, stopped: false, stalled: false, steps: table === undefined ? [] : ["start", ...Array(this.r.int(0, 3)).fill("work"), ...steps],
     };
     this.members.push(member);

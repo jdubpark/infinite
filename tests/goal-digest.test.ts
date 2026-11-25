@@ -6,18 +6,14 @@ import * as crossing from "../packages/host/src/crossing-digest.js";
 import type { CriterionInput, EndedCycle, GoalDigest, HistoryLineInput } from "../packages/host/src/goal-digest.js";
 import type { ClaimInput, CrossingDigest, HostInput } from "../packages/host/src/crossing-digest.js";
 
-// The goal digest of design part 10. Special characters are built from code points.
-
 const { goalDigestSchema } = goal;
 const { OMITTED_MAX } = crossing;
 const LIMIT = 8192;
 const char = (code: number) => String.fromCodePoint(code);
 
-/** Independent measures: the test never calls the module's own byte helper. */
 const measure = (digest: unknown) => Buffer.byteLength(JSON.stringify(digest), "utf8");
 const utf8 = (value: string) => Buffer.byteLength(value, "utf8");
 
-/** A digest a call returned: defined, valid by the schema, and within every bound, checked independently. */
 function valid(digest: GoalDigest | undefined, where = "a call"): GoalDigest {
   assert.ok(digest, `${where}: refused an argument the test meant as usable`);
   const parsed = goalDigestSchema.safeParse(digest);
@@ -46,7 +42,6 @@ function ended(cycle: number, run: CrossingDigest, extra: Partial<EndedCycle> = 
   return { cycle, status: "blocked", line: STOP, run, handles: { runId: runId(cycle) }, outsideContent: false, ...extra };
 }
 
-/** The receipt fields: host facts, receipt `touched` rows and receipt failures, in order. */
 const receiptFields = (digest: GoalDigest) => ({
   cycle: digest.cycle,
   handles: digest.handles,
@@ -65,7 +60,6 @@ test("acceptance 11: a cycle that ends blocked after a failed check gives the ne
   const run = must(crossing.withClaims(host, { decisions: [{ what: "kept the API", why: "callers" }] }));
   const first = valid(goal.nextGoalDigest(undefined, ended(1, run)));
   assert.deepEqual(first.history, [{ cycle: 1, status: "blocked", line: "block checks-failed, stop failed" }]);
-  // The check failure, with its handle: the run whose check receipts hold its output.
   assert.deepEqual(first.failures, [{ signal: "exit 1", where: "npm test", class: "check", by: "receipt" }]);
   assert.deepEqual(first.handles, { runId: runId(1) });
   assert.deepEqual(first.touched, [{ path: "src/a.ts", op: "changed", by: "receipt" }]);
@@ -73,7 +67,6 @@ test("acceptance 11: a cycle that ends blocked after a failed check gives the ne
   assert.deepEqual(Object.keys(first).sort(), ["cycle", "decisions", "failures", "handles", "history", "omitted", "open", "outsideContent", "touched", "v"]);
   assert.deepEqual(first.omitted, { cycles: 0, touched: 0, failures: 0, decisions: 0, open: 0, criteria: 0 });
 
-  // Cycle 2 ends reviewed: its run's failures do not carry, its brief line joins the history, and claims are its own.
   const run2 = must(crossing.hostDigest({
     outcome: "complete", changed: [{ path: "src/b.ts", op: "added" }], failures: [{ signal: "exit 1", where: "npm test", class: "check" }],
   }));
@@ -85,7 +78,6 @@ test("acceptance 11: a cycle that ends blocked after a failed check gives the ne
   assert.deepEqual(second.touched.map(row => row.path), ["src/b.ts", "src/a.ts"]);
 });
 
-/** A wide cycle: long unique paths, long failure text, long claims, twelve long criteria and a long brief. */
 function wideCycle(cycle: number): EndedCycle {
   const fill = (prefix: string, size: number) => `${prefix} ${cycle} ${'"'.repeat(size)}`;
   const host = must(crossing.hostDigest({
@@ -117,14 +109,10 @@ test("acceptance 11: twenty cycles of large input stay within 8,192 bytes, and a
     assert.equal(digest.omitted.cycles, cycle - digest.history.length);
   }
   assert.ok(digest);
-  // The bound was reached, not merely respected.
   assert.ok(largest > LIMIT - 300, `the largest digest was ${largest} bytes`);
   assert.ok(digest.touched.length > 0 && digest.failures.some(row => row.by === "receipt"), "receipts were lost");
 });
 
-// The drop order of part 10, through fitGoalDigest on stored digests that are over the bound.
-
-/** A stored digest with short receipts and claims, sixteen history lines, and `size`-byte quoted fillers. */
 function stored(options: { history: number; claims: number; paths: number }): GoalDigest {
   const quoted = (size: number, tag: string) => `${tag}${'"'.repeat(size)}`;
   return {
@@ -147,7 +135,6 @@ function stored(options: { history: number; claims: number; paths: number }): Go
 }
 
 test("drop order: the oldest history lines go first, then claims, then receipts, and omitted counts them", () => {
-  // History over the bound: only history lines go, oldest first.
   const a = stored({ history: 200, claims: 10, paths: 4 });
   const fitA = valid(goal.fitGoalDigest(a), "history over");
   assert.ok(fitA.history.length > 0 && fitA.history.length < 16, `kept ${fitA.history.length} lines`);
@@ -155,7 +142,6 @@ test("drop order: the oldest history lines go first, then claims, then receipts,
   assert.deepEqual([fitA.decisions, fitA.open, fitA.criteria, fitA.failures, fitA.touched], [a.decisions, a.open, a.criteria, a.failures, a.touched]);
   assert.equal(fitA.omitted.cycles, 40 - fitA.history.length);
 
-  // Claims over the bound: every history line goes, then the oldest open questions, then decisions; criteria stay.
   const b = stored({ history: 200, claims: 220, paths: 4 });
   const fitB = valid(goal.fitGoalDigest(b), "claims over");
   assert.deepEqual(fitB.history, []);
@@ -167,7 +153,6 @@ test("drop order: the oldest history lines go first, then claims, then receipts,
   assert.equal(fitB.omitted.open, 4 - fitB.open.length);
   assert.equal(fitB.omitted.decisions, 6 - fitB.decisions.length);
 
-  // Receipts over the bound by themselves: every claim and line goes, then the oldest `touched` receipts.
   const c = stored({ history: 200, claims: 220, paths: 290 });
   const fitC = valid(goal.fitGoalDigest(c), "receipts over");
   assert.deepEqual([fitC.history, fitC.decisions, fitC.open, fitC.criteria], [[], [], [], []]);
@@ -177,7 +162,6 @@ test("drop order: the oldest history lines go first, then claims, then receipts,
   assert.deepEqual(fitC.omitted, { cycles: 40, touched: 24 - fitC.touched.length, failures: 1, decisions: 6, open: 4, criteria: 8 });
 });
 
-// Seeded generator: mulberry32.
 function mulberry32(seed: number): () => number {
   let state = seed >>> 0;
   return () => {
@@ -193,13 +177,6 @@ type Step = { claimed: EndedCycle; erased: EndedCycle; collisions: number };
 const HOST_CLASSES = ["check", "stop", "refusal", "conflict"] as const;
 const STATUSES = ["blocked", "failed", "merged", "ready-for-review", "cancelled", "no-change"] as const;
 
-/**
- * A random sequence of ended cycles, each in two forms: as generated, and with every claim erased (the run digest's
- * claim rows, the criteria and the brief text). Claims draw paths and failure keys from the pools receipts use, so
- * they collide with receipts of the same and of earlier cycles. A quarter of the run digests put such claims before
- * their receipts and hold more decisions and open questions than a crossing digest's caps allow, which the crossing
- * builders never do. Short paths reach the caps, long ones the byte bound.
- */
 function randomCycles(seed: number, count: number): Step[] {
   const random = mulberry32(seed);
   const int = (min: number, max: number) => min + Math.floor(random() * (max - min + 1));
@@ -272,10 +249,6 @@ function randomCycles(seed: number, count: number): Step[] {
 
 const CAP_OF = { touched: 24, failures: 6, decisions: 6, open: 4, criteria: 8 } as const;
 
-/**
- * Per counted list, whether this call trimmed it: "cap" when its counter rose above what the inputs brought and the
- * list is full, "bound" when it rose and the list is shorter, otherwise "none". The generator makes no malformed row.
- */
 function trims(digest: GoalDigest, previous: GoalDigest | undefined, cycle: EndedCycle): Record<keyof typeof CAP_OF, "cap" | "bound" | "none"> {
   const received = cycle.run.omitted;
   const claims = cycle.claimsUnavailable !== true;
@@ -310,9 +283,7 @@ test("differential: every sequence of cycles gives the same receipt fields with 
         throw new Error(`${where}: ${(error as Error).message}`);
       }
       assert.deepEqual(receiptFields(left), receiptFields(right), where);
-      // A real trim: a counter rose above what the inputs brought. At its cap the cap trimmed; below it, the bound.
       const [trimClaimed, trimErased] = [trims(left, claimed, step.claimed), trims(right, erased, step.erased)];
-      // The history lines this call had to place: the lines it was given and the new one.
       const historyAvailable = (claimed?.history.length ?? 0) + 1;
       claimed = left;
       erased = right;
@@ -344,7 +315,6 @@ test("replay: an ended cycle applied twice gives the digest of applying it once,
       const where = `seed ${seed}, cycle ${index + 1}`;
       const next = valid(goal.nextGoalDigest(digest, step.claimed), where);
       assert.deepEqual(goal.nextGoalDigest(digest, step.claimed), next, `${where}: not pure`);
-      // A restart repeats the build: once on the stored result, once on its JSON round trip.
       assert.deepEqual(goal.nextGoalDigest(next, step.claimed), next, `${where}: replay`);
       assert.deepEqual(goal.nextGoalDigest(JSON.parse(JSON.stringify(next)) as GoalDigest, step.claimed), next, `${where}: stored replay`);
       assert.deepEqual(goal.fitGoalDigest(next), next, `${where}: refit`);
@@ -358,13 +328,11 @@ test("replay: an ended cycle applied twice gives the digest of applying it once,
 
 test("counters: cycles without a line, the run digest's own counts, saturation, and the unavailable marker", () => {
   const big = { ...must(crossing.hostDigest({ outcome: "partial", read: ["a"] })), omitted: { touched: 7, decisions: 2, failures: 3, forSiblings: 1, open: 1e9 } };
-  // The first digest of a goal at cycle 5 counts four cycles without a line; a malformed line counts its own cycle.
   const first = valid(goal.nextGoalDigest(undefined, ended(5, big)));
   assert.deepEqual(first.omitted, { cycles: 4, touched: 7, failures: 3, decisions: 2, open: OMITTED_MAX, criteria: 0 });
   const second = valid(goal.nextGoalDigest(first, ended(8, big, { line: { kind: "stop" }, criteria: [null, { criterion: "x", status: "met" }] as CriterionInput[] })));
   assert.deepEqual(second.history.map(row => row.cycle), [5]);
   assert.deepEqual(second.omitted, { cycles: 7, touched: 14, failures: 3, decisions: 2, open: OMITTED_MAX, criteria: 1 });
-  // Unavailable claims: the claim lists stay empty and are marked; receipts and receipt failures still carry.
   const run = must(crossing.withClaims(must(crossing.hostDigest({ outcome: "failed", read: ["b"], failures: [{ signal: "exit 1", class: "check" }] })), {
     decisions: [{ what: "w", why: "y" }], open: ["q"], failures: [{ signal: "claimed" }],
   }));
@@ -373,14 +341,11 @@ test("counters: cycles without a line, the run digest's own counts, saturation, 
   assert.deepEqual([marked.decisions, marked.open, marked.failures], [[], [], [{ signal: "exit 1", class: "check", by: "receipt" }]]);
   assert.deepEqual(marked.touched.map(row => row.path), ["b", "a"]);
   assert.equal(valid(goal.nextGoalDigest(marked, ended(10, run))).claimsUnavailable, undefined);
-  // Claims change omitted.failures too: seven distinct claim failures beside no host failure count one, erased none.
   const host = must(crossing.hostDigest({ outcome: "failed" }));
   const seven = must(crossing.withClaims(host, { failures: Array.from({ length: 7 }, (_, index) => ({ signal: `claimed ${index}` })) }));
   assert.equal(valid(goal.nextGoalDigest(undefined, ended(1, seven))).omitted.failures, 1);
   assert.equal(valid(goal.nextGoalDigest(undefined, ended(1, host))).omitted.failures, 0);
 });
-
-// Totality: no input throws. A host-owned argument that is unusable refuses; a malformed row is dropped and counted.
 
 const deep = (() => {
   let value: unknown = {};
@@ -396,7 +361,6 @@ const HOSTILE: [string, unknown][] = [
   ["controls", `${char(0x202e)}${char(0x07)}${char(0xd800)}`], ["length", { length: 3 }],
 ];
 
-/** A usable cycle with every field populated, and a usable previous digest. */
 function richCycle(cycle: number): EndedCycle {
   const host = must(crossing.hostDigest({
     outcome: "failed", changed: [{ path: "src/a.ts", op: "added" }], read: ["src/b.ts"], failures: [{ signal: "exit 1", where: "npm test", class: "check" }],
@@ -409,7 +373,6 @@ function richCycle(cycle: number): EndedCycle {
   });
 }
 
-/** Sets `path` in a deep copy of `value`; the last key may be an array index. */
 function replaced<T>(value: T, path: (string | number)[], next: unknown): T {
   const copy = structuredClone(value) as Record<string | number, unknown>;
   let at = copy;
@@ -422,7 +385,6 @@ test("totality: hostile values in every position refuse or build a valid digest,
   const previous = valid(goal.nextGoalDigest(undefined, richCycle(1)));
   const cycle = richCycle(2);
   const baseline = valid(goal.nextGoalDigest(previous, cycle));
-  // Positions whose hostile value must refuse the call, and positions where it may only drop a row or a line.
   const refusing = [["cycle"], ["handles"], ["handles", "runId"], ["handles", "reviewedHead"], ["outsideContent"], ["unclearedHead"], ["unclearedHead", "head"], ["run"], ["run", "outcome"]];
   const lenient = [["status"], ["line"], ["line", "kind"], ["line", "title"], ["line", "blockCode"], ["criteria"], ["criteria", 0], ["criteria", 0, "status"],
     ["criteria", 0, "check"], ["claimsUnavailable"], ["run", "touched"], ["run", "touched", 0], ["run", "touched", 0, "path"], ["run", "failures", 0],
@@ -442,7 +404,6 @@ test("totality: hostile values in every position refuse or build a valid digest,
     assert.equal(call(`refit ${name}`, () => goal.fitGoalDigest(value as GoalDigest)), undefined, `refit ${name}`);
     for (const path of refusing) {
       const result = call(`${path.join(".")} = ${name}`, () => goal.nextGoalDigest(previous, replaced(cycle, path, value)));
-      // A value that is valid in its position, such as `true` for outsideContent or undefined for an optional field, builds.
       const same = Object.is(path.reduce<unknown>((at, key) => (at as Record<string | number, unknown>)[key], cycle), value);
       if (!same && !(value === undefined && ["unclearedHead", "handles.reviewedHead"].includes(path.join(".")))) {
         assert.equal(result, undefined, `${path.join(".")} = ${name} must refuse`);
@@ -460,10 +421,8 @@ test("totality: hostile values in every position refuse or build a valid digest,
     }
   }
   assert.ok(calls > HOSTILE.length * 30, `only ${calls} calls`);
-  // Huge text in every text position is clipped, and the digest stays within its bounds.
   const huge = valid(goal.nextGoalDigest(previous, { ...cycle, line: { kind: "brief", title: HUGE, expectedOutcome: HUGE }, criteria: [{ criterion: HUGE, status: "met", check: HUGE }] }));
   assert.deepEqual([utf8(huge.history[0]?.line ?? ""), utf8(huge.criteria?.[0]?.criterion ?? ""), utf8(huge.criteria?.[0]?.check ?? "")], [240, 240, 120]);
-  // An uncleared head without outside content is a contradiction, and a code with an upper-case letter is not a code.
   assert.equal(goal.nextGoalDigest(previous, { ...cycle, outsideContent: false }), undefined);
   assert.deepEqual(valid(goal.nextGoalDigest(previous, { ...cycle, status: "Blocked" })).history.map(row => row.cycle), [1]);
 });
@@ -471,7 +430,6 @@ test("totality: hostile values in every position refuse or build a valid digest,
 test("nothing else carries: extra fields on every input object never reach the digest", () => {
   const MARK = "carried-by-accident";
   const extras = { report: MARK, transcript: MARK, checkOutput: MARK, score: 0.9, rating: 5, usage: { tokens: 1 }, routing: MARK, quarantined: MARK };
-  /** A deep copy with the extra fields on every plain object. */
   const decorate = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(decorate);
     if (typeof value !== "object" || value === null) return value;
@@ -520,8 +478,6 @@ test("totality: 200,000 rows in any list position build a valid digest and never
   }
   assert.equal(calls, 6 * 3 + 5 * 2);
 });
-
-// Pins: each holds one rule that a one-line change to the module would otherwise break unseen.
 
 test("pin: outside content comes from the ended cycle alone, so a clearance turns it off", () => {
   const previous = valid(goal.nextGoalDigest(undefined, richCycle(1)));

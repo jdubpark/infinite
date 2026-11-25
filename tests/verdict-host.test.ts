@@ -32,15 +32,12 @@ type Stored = { run: TeamRun; verdict?: { status: string; failures: number; excl
 const AT = new Date().toISOString();
 const SHORTLIST = "research/shortlist.json";
 const RANK: TeamCommand = { command: "npm", args: ["run", "rank-verify"] };
-// Built at run time from fragments, so no marker text sits in the source as one string.
 const MARK = ["seal", "q7q7q7q7q7q7q7q7"].join("-");
 
 const COORDINATOR: TeamModelProfile = { id: "opus-coordinator", label: "Opus coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" };
 const INTEGRATOR: TeamModelProfile = { id: "opus-integrator", label: "Opus integrator", provider: "claude", model: "claude-opus-5-5", effort: "high", tier: "strong" };
-// The fake planner names these two ids for its two tasks; both run the same model.
 const IMPLEMENTER: TeamModelProfile = { id: "spark-high", label: "Deep implementer", provider: "opencode", model: "deepseek/deepseek-flash", variant: "medium", tier: "light" };
 const REVIEWER: TeamModelProfile = { id: "astra-reviewer", label: "Astra reviewer", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" };
-// The implementer's own model as an evaluator: listed first, and never chosen.
 const AUTHOR_MODEL: TeamModelProfile = { id: "deep-evaluator", label: "Deep evaluator", provider: "opencode", model: "deepseek/deepseek-flash", variant: "medium", tier: "strong" };
 const OTHER_FAMILY: TeamModelProfile = { id: "gemini-evaluator", label: "Gemini evaluator", provider: "opencode", model: "google/gemini-3-pro", variant: "high", tier: "strong" };
 const SECOND_IMPLEMENTER: TeamModelProfile = { ...IMPLEMENTER, id: "astra-xhigh", label: "Second deep implementer" };
@@ -52,7 +49,6 @@ const scheduler = (teams: TeamService) => teams as unknown as { record(id: strin
 const evaluators = (view: TeamView) => view.members.filter(member => member.role === "evaluator");
 const TERMINAL = ["ready-for-review", "merged", "blocked", "cancelled"];
 
-/** The events the service handed to the outbox, whether still waiting in a run's record or already flushed. The ledger is registered as the server registers it. */
 function watched(store: EvidenceStore) {
   const outbox = new EventOutbox(store);
   registerVerdicts(store, outbox);
@@ -68,9 +64,6 @@ function watched(store: EvidenceStore) {
   return { outbox, rows, all: () => flushed };
 }
 
-/* ------------------------------------------------ real runs, with the fake agent */
-
-/** A host with the fake agent. `verdicts` writes the project's evaluator and register settings. */
 async function realRun(verdicts: boolean, lineup: TeamLineup = LINEUP) {
   const f = await fixture("intent", lineup, {}, { noServer: true });
   const project = f.host.config.projects.find(item => item.id === "rehearsal")!;
@@ -92,7 +85,6 @@ test("acceptance 11 end to end", { timeout: 600000 }, async () => {
     const view = await settle(teams, created.id);
     assert.equal(view.status, "ready-for-review", JSON.stringify(view.events.slice(-5)));
 
-    // The implementer's model is listed first and is never chosen; the reviewer's profile evaluates.
     const members = evaluators(view);
     assert.equal(members.length, 1, "one evaluator");
     assert.equal(members[0]!.modelProfile?.id, REVIEWER.id);
@@ -127,7 +119,6 @@ test("without verdicts a run is as today", { timeout: 600000 }, async () => {
     assert.equal(watch.rows(teams, created.id).length, 0, "no verdict event");
   } finally { store.close(); await f.close(); }
 
-  // A verdict report from an implementer is a wrong report, as today: no assessment and no verdict state.
   const s = schedulerFixture();
   try {
     activeSessions(s);
@@ -151,7 +142,6 @@ test("without verdicts a run is as today", { timeout: 600000 }, async () => {
 test("evaluator text stays sealed", { timeout: 900000 }, async () => {
   const { f, store, entries, watch, teams } = await realRun(true);
   try {
-    // The evaluator's note and one handle carry the marker; the host must keep both out of every reader.
     writeFileSync(join(f.receipts, "verdict.json"), JSON.stringify({ kind: "verdict", result: "met",
       criteria: [{ id: "c0", state: "met", evidence: [`file:${MARK}.txt`, "file:a.txt"], note: `Looks right ${MARK}` }] }), { mode: 0o600 });
     writeFileSync(join(f.receipts, "record-context"), "");
@@ -163,15 +153,12 @@ test("evaluator text stays sealed", { timeout: 900000 }, async () => {
     assert.equal(evaluator[0]!.report?.kind, "verdict");
     assert.equal(view.assessment?.kind, "reviewed");
 
-    // The marker did reach the host: it sits in the sealed verdict state, the one place that may hold it.
     assert.equal(JSON.stringify(storedOf(teams, created.id).verdict).includes(MARK), true, "the evaluator's text reached the sealed state");
-    // The member's report in the view is the stub: ids and states, no evidence.
     const report = evaluator[0]!.report as { kind: string; criteria: { id: string; evidence: unknown[] }[] };
     assert.equal(report.kind, "verdict");
     assert.ok(report.criteria.length >= 1);
     for (const item of report.criteria) assert.equal(item.evidence.length, 0, "empty evidence");
 
-    // A later member: the owner steers the run, and the next project manager starts at a new revision.
     await teams.steer(created.id, { requestId: randomUUID(), revision: view.revision, text: "Add one more line" });
     const later = await waitFor(() => Promise.resolve(teams.get(created.id)),
       next => next.members.some(member => member.role === "project-manager" && member.revision > view.revision), 120000);
@@ -187,19 +174,14 @@ test("evaluator text stays sealed", { timeout: 900000 }, async () => {
       "the record": JSON.stringify(storedOf(teams, created.id).objectiveRecord),
     };
     for (const name of readdirSync(f.receipts)) {
-      // verdict.json is the evaluator's own input; its context and prompt copies hold only host text.
       if (name !== "verdict.json") places[`the file ${name.replace(/[0-9a-f-]{36}/g, "<id>")}`] = readFileSync(join(f.receipts, name), "utf8");
     }
     for (const [place, text] of Object.entries(places)) assert.equal(text.includes(MARK), false, `the marker reached ${place}`);
-    // The files of the later member were among those read.
     assert.ok(Object.keys(places).some(name => name.startsWith("the file ")), "member files were searched");
     assert.equal(existsSync(join(f.receipts, `${planner.memberId}.context.json`)), true);
   } finally { store.close(); await f.close(); }
 });
 
-/* ------------------------------------------------ seeded runs, on the scheduler fixture */
-
-/** The fixture's launched sessions are quiet from six minutes back, so the scheduler stalls each one before its report. */
 function activeSessions(f: SchedulerFixture) {
   const state = f.manager.state;
   f.manager.state = async (requestedId?: string) => ({ ...(await state(requestedId)), attention: initialAttention(new Date().toISOString(), true) });
@@ -210,7 +192,6 @@ function git(f: SchedulerFixture, ...args: string[]): string {
     { cwd: f.run.workspace, encoding: "utf8", stdio: "pipe" }).trim();
 }
 
-/** c0, three judgements, and c4: `rank-verify` must pass. */
 function recordFor(runId: string): ObjectiveRecord {
   const judged = (id: string, statement: string): Criterion => ({ id, origin: "owner", statement, check: { kind: "judgement", item: `item-${id}` },
     producer: "evaluator", threshold: { kind: "pass" }, state: "active" }) as Criterion;
@@ -229,10 +210,6 @@ function recordFor(runId: string): ObjectiveRecord {
   return { ...body, digest: recordDigest(body) } as ObjectiveRecord;
 }
 
-/**
- * Writes a standalone run that the reviewer approved: one integrated task whose author is the lineup's implementer, a change to the
- * shortlist, a final check round for `rank-verify`, and the verdict pins. The next scheduler pass reaches the approved branch.
- */
 function seedReviewed(f: SchedulerFixture, options: { rank: "passed" | "failed"; lineup?: TeamLineup; outbox?: boolean; members?: number; manager?: TeamModelProfile }): string {
   f.config.agents = { demo: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] },
     codex: { command: process.execPath, args: [] }, opencode: { command: process.execPath, args: [] } } as Config["agents"];
@@ -246,9 +223,7 @@ function seedReviewed(f: SchedulerFixture, options: { rank: "passed" | "failed";
   const author: TeamMember = { ...f.run.members[0]!, role: "implementer", status: "stopped", taskId: "t1", modelProfile: IMPLEMENTER, provider: "opencode",
     report: { kind: "result", summary: "Wrote the shortlist" } as TeamMember["report"] };
   f.run.members = [author];
-  // A project manager that ran, as after a provider limit moved it to a fallback profile.
   if (options.manager) f.run.members.push({ ...author, memberId: randomUUID(), sessionId: randomUUID(), role: "project-manager", taskId: undefined, report: undefined, modelProfile: options.manager });
-  // Earlier attempts that stopped: they count against the run's limit of members and do nothing else.
   for (let extra = 1; extra < (options.members ?? 1); extra += 1) f.run.members.push({ ...author, memberId: randomUUID(), sessionId: randomUUID(), taskId: undefined, report: undefined });
   f.run.tasks = [{ id: "t1", title: "Write the shortlist", instructions: "Write it", paths: [SHORTLIST], dependsOn: [], revision: 1, status: "integrated", memberId: author.memberId,
     commit: head, changedPaths: { paths: [SHORTLIST], truncated: false } } as TeamRun["tasks"][number]];
@@ -261,11 +236,9 @@ function seedReviewed(f: SchedulerFixture, options: { rank: "passed" | "failed";
 }
 
 const memberOf = (teams: TeamService, id: string, role: string, nth = 0) => storedOf(teams, id).run.members.filter(member => member.role === role)[nth];
-/** The evaluator once the host has launched its session. */
 const launchedEvaluator = (f: SchedulerFixture, teams: TeamService, id: string, nth = 0) =>
   waitFor(() => Promise.resolve(memberOf(teams, id, "evaluator", nth)), member => member !== undefined && f.launches.some(launch => launch.requestId === member.sessionId), 30000);
 
-/** What the fake evaluator does: reads its context file and reports every criterion in it met, with the first changed path. */
 function answerAllMet(f: SchedulerFixture, member: TeamMember) {
   const context = JSON.parse(readFileSync(join(member.cwd, ".git", "infinite-team-context.json"), "utf8")) as { record: { criteria: { id: string }[] }; changedPaths: { paths: string[] } };
   assert.ok(context.record.criteria.length >= 5, "the context holds the record's criteria");
@@ -296,7 +269,6 @@ test("acceptance 6 end to end", { timeout: 120000 }, async () => {
     assert.equal(contradicted[0]!.target, "c4");
     assert.equal(log.filter(entry => entry.op === VERDICT_OPS.recorded).length, 1);
     assert.equal(watch.rows(teams, f.run.id).length, 1, "one row event");
-    // The event the host stored reaches the ledger as a row.
     const ledger = store.read(db => db.all<{ result: string; evaluator_result: string | null; run_id: string }>("SELECT result, evaluator_result, run_id FROM objective_verdicts"));
     assert.equal(ledger.length, 1, "one ledger row");
     assert.equal(ledger[0]!.run_id, f.run.id);
@@ -350,7 +322,6 @@ test("a run at its attempt limit settles without an evaluator", { timeout: 12000
   const f = schedulerFixture();
   try {
     activeSessions(f);
-    // A standalone run admits 60 members, and the evaluator would be one more.
     seedReviewed(f, { rank: "passed", members: 60 });
     const teams = f.openTeam();
     teams.start();
@@ -366,7 +337,6 @@ test("a run at its attempt limit settles without an evaluator", { timeout: 12000
 test("a stalled evaluator is replaced once", { timeout: 120000 }, async () => {
   const f = schedulerFixture();
   try {
-    // The fixture's sessions are quiet from six minutes back, so each evaluator stalls as soon as the scheduler looks at it.
     seedReviewed(f, { rank: "passed", lineup: WIDE_LINEUP });
     const teams = f.openTeam();
     teams.start();
@@ -398,7 +368,6 @@ test("an open fuse holds the verdict", { timeout: 120000 }, async () => {
     teams.useFuse(fuse);
     teams.start();
 
-    // The verdict waits: no evaluator session starts, and the run neither settles nor loses its hold.
     await new Promise(resolve => setTimeout(resolve, 3000));
     assert.equal(f.launches.length, 0, "no evaluator launched");
     const held = teams.get(f.run.id);
@@ -422,7 +391,6 @@ test("a crash between the record's write and the save writes nothing twice", { t
   try {
     seedReviewed(f, { rank: "passed" });
     f.config.projects[0]!.team = { checks: [RANK], objective: { prompts: "on", evaluator: "on", register: "on" } } as Project["team"];
-    // A goal with its first cycle's run, created by the services themselves; both stop before the crash is written.
     const first = f.openTeam(), goals = new GoalService(f.config, f.key, first);
     const goal = await goals.create({ requestId: randomUUID(), projectId: "fixture", title: "Rank sources", objective: "Find ranked sources",
       successCriteria: "A ranked shortlist", nonGoals: [], allowedPaths: ["research"], evidence: [], maxRuns: 2, maxMinutes: 60, maxMembers: 4, parallelism: 2 } as CreateGoal);
@@ -434,8 +402,6 @@ test("a crash between the record's write and the save writes nothing twice", { t
     first.close();
     await first.idle();
 
-    // The files as the crash leaves them: the run held in `evaluating` with its evaluator reported and an operation running, and the
-    // goal's record already holding the verdict's entry.
     const teamFile = join(f.config.stateDir, "teams", `${teamId}.sealed`), goalFile = join(f.config.stateDir, "goals", `${goal.id}.sealed`);
     const team = unseal<Stored & Record<string, unknown>>(f.key, `team:${teamId}`, readFileSync(teamFile, "utf8"));
     const head = git(f, "rev-parse", "HEAD");
@@ -459,7 +425,6 @@ test("a crash between the record's write and the save writes nothing twice", { t
     sealedGoal.objectiveRecord = written as ObjectiveRecord;
     writeSealed(goalFile, f.key, `goal:${goal.id}`, sealedGoal);
 
-    // The host opens again.
     const teams = f.openTeam(), reopened = new GoalService(f.config, f.key, teams);
     teams.start();
     await new Promise(resolve => setTimeout(resolve, 3000));
@@ -472,8 +437,6 @@ test("a crash between the record's write and the save writes nothing twice", { t
     const after = storedOf(teams, teamId);
     assert.equal(after.run.assessment, undefined, "the run has no assessment");
     assert.equal((after.outbox ?? []).filter(event => event.kind === "verdict.recorded").length, 0, "no row event");
-    // The restart fences the interrupted operation as it does for any member's result: the run blocks, nothing replays, and the
-    // verdict stays where the crash left it.
     assert.equal(after.run.status, "blocked");
     assert.match(after.run.reason ?? "", /will not be replayed/);
     assert.equal(after.verdict?.status, "evaluating");

@@ -45,7 +45,7 @@ test("http links remain text", () => {
 test("quotes, rules and pipe tables", () => {
   const { nodes } = parseMarkdown("> quoted\n\n---\n\n| a | b |\n| - | - |\n| 1 | 2 |");
   assert.equal(nodes[0].type, "quote"); assert.equal(nodes[1].type, "rule");
-  assert.equal(nodes[2].type, "paragraph"); // table rows become paragraphs: "a · b" then "1 · 2"
+  assert.equal(nodes[2].type, "paragraph");
   assert.deepEqual(nodes[0], { type: "quote", children: [{ type: "paragraph", inlines: [{ type: "text", text: "quoted" }] }] });
   assert.deepEqual(nodes[1], { type: "rule" });
   assert.deepEqual(nodes[2], { type: "paragraph", inlines: [{ type: "text", text: "a · b" }] });

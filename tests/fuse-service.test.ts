@@ -44,7 +44,6 @@ function hostConfig(root: string, fuse?: unknown) {
   };
 }
 
-/** Writes a host configuration with the given fuse block and reads it through the real parser. */
 function parseConfig(root: string, fuse?: unknown): { config: Config; key: Buffer } {
   mkdirSync(join(root, "project-p"), { recursive: true });
   mkdirSync(join(root, "project-q"), { recursive: true });
@@ -75,7 +74,7 @@ function rig(fuse?: unknown): Rig {
     store: undefined as unknown as EvidenceStore,
     close() {
       for (const store of r.stores) {
-        try { store.close(); } catch { /* already closed by a restart */ }
+        try { store.close(); } catch { }
       }
       rmSync(root, { recursive: true, force: true });
     },
@@ -84,19 +83,16 @@ function rig(fuse?: unknown): Rig {
   return r;
 }
 
-/** A service on the rig's current store. Each store takes one service, as a host has one. */
 function service(r: Rig): FuseService {
   return new FuseService({ config: r.config, key: r.key, store: r.store, sessionExists: id => r.live.has(id), now: () => r.clock.now });
 }
 
-/** A restarted host: a new store object on the same path, then a new service. */
 function restart(r: Rig): FuseService {
   r.store.close();
   r.store = openStore(r, r.key);
   return service(r);
 }
 
-/** A store that cannot read the rows: the database exists, but the key that opens it is wrong. */
 function unreadable(r: Rig): FuseService {
   r.store.close();
   r.store = openStore(r, randomBytes(32));
@@ -168,13 +164,11 @@ test("the 31st launch in an hour waits", () => {
     fuse.markAnnounced(fuse.interrupts().map(item => item.tripId));
     assert.equal(fuse.interrupts().length, 0);
 
-    // 14 launches remain in the rolling window: the check closes.
     r.clock.now = START + 3_750_000;
     assert.equal(fuse.check({ projectId: "p" }).state, "closed");
     assert.equal(fuse.admit(launch("late")).ok, true);
     assert.equal(baselineOf(r).trips.find(t => t.tripId === tripA.tripId)?.closedBy, "rate");
 
-    // Reaching 30 again in the same UTC day opens a trip that needs the owner.
     for (let i = 0; i < 15; i++) assert.equal(fuse.admit(launch(`b${i}`)).ok, true);
     const tripB = fuse.check({ projectId: "p" });
     assertOpen(tripB);
@@ -223,14 +217,12 @@ test("a trip that needs the owner always sends its push", () => {
     fuse.markAnnounced([first.tripId]);
     assert.equal(fuse.interrupts().length, 0);
 
-    // The first trip closes by rate, and the limit is reached again on the same UTC day.
     r.clock.now += HOUR + 1;
     fuse.admit(launch("b1"));
     fuse.admit(launch("b2"));
     const open = fuse.check({ projectId: "p" });
     assertOpen(open);
     assert.equal(open.ownerClose, true);
-    // Every launch of the project now waits for the owner, so the owner is told at once and not a day later.
     const second = fuse.interrupts();
     assert.equal(second.length, 1);
     assert.equal(second[0]!.ownerClose, true);
@@ -244,11 +236,9 @@ test("an owner close clears launches stamped after it", () => {
     const fuse = service(r);
     for (const id of ["a1", "a2", "a3"]) fuse.admit(launch(id));
     assertOpen(fuse.check({ projectId: "p" }));
-    // The clock steps back, so every counted launch now lies after the time of the owner's close.
     r.clock.now -= 90 * 60_000;
     assert.equal(fuse.close({ scope: "project", projectId: "p" }), "closed");
     assert.equal(fuse.check({ projectId: "p" }).state, "closed");
-    // A launch after the close counts again, as the first of a fresh count.
     r.clock.now += 1000;
     assert.deepEqual(fuse.admit(launch("after")), { ok: true, launchId: "after" });
     assert.equal(fuse.view().projects.find(project => project.projectId === "p")!.hour.launches, 1);
@@ -285,8 +275,6 @@ test("the owner can close a scope that is open without a recorded trip", () => {
   try {
     const fuse = service(r);
     for (const id of ["a1", "a2", "a3", "a4"]) assert.equal(fuse.admit(launch(id)).ok, true);
-    // The limit is lowered below the count and the host restarts. The scope is open, and no trip was recorded,
-    // because every caller stops at the check.
     r.store.close();
     r.store = openStore(r, r.key);
     const lowered = { ...r.config, autonomy: { fuse: { project: { launchesPerHour: 2 } } } } as Config;
@@ -297,7 +285,6 @@ test("the owner can close a scope that is open without a recorded trip", () => {
     assert.equal(again.close({ scope: "project", projectId: "p" }), "closed");
     assert.equal(again.check({ projectId: "p" }).state, "closed");
     assert.equal(again.close({ scope: "project", projectId: "p" }), "not-open");
-    // The close is on record: the next trip that day needs the owner.
     r.clock.now += 1000;
     again.admit(launch("b1"));
     again.admit(launch("b2"));
@@ -315,12 +302,9 @@ test("a failed write does not repeat a trip's push", () => {
     fuse.admit(launch("a2"));
     const [trip] = fuse.interrupts();
     assert.ok(trip, "the trip waits to be announced");
-    // Writes fail from here on, as on a full disk.
     rmSync(r.file, { force: true });
     mkdirSync(r.file);
     fuse.markAnnounced([trip.tripId]);
-    // The announcement could not be written. It is kept in memory, so the notifier does not send the trip again
-    // on every tick.
     assert.equal(fuse.interrupts().some(item => item.tripId === trip.tripId), false);
     const failed = fuse.interrupts();
     assert.deepEqual(failed.map(item => item.cause), ["write-failed"]);
@@ -339,7 +323,6 @@ test("a write failure clears when the host can write again", () => {
     assert.notEqual(fuse.view().writeFailedAt, undefined);
     assert.equal(fuse.tick(), true);
     assert.notEqual(fuse.view().writeFailedAt, undefined, "the write still fails");
-    // The path works again. No launch arrives, and the next tick writes the baseline and clears the report.
     rmSync(r.file, { recursive: true, force: true });
     assert.equal(fuse.tick(), true);
     assert.equal(fuse.view().writeFailedAt, undefined);
@@ -358,7 +341,6 @@ test("a restart heals a store row that a failed mirror left open", () => {
     assertOpen(open);
     r.store.close();
     assert.equal(fuse.close({ scope: "project", projectId: "p" }), "closed");
-    // The file holds the close, and the store row is still open. A restart writes the close to the store.
     restart(r);
     const row = r.store.read(db => db.get<{ closed_at: number | null; closed_by: string | null }>("SELECT closed_at, closed_by FROM fuse_trips WHERE trip_id=?", open.tripId!));
     assert.equal(row?.closed_by, "owner");
@@ -379,10 +361,8 @@ test("a restart does not bring back a trip the file dropped", () => {
     assertOpen(open);
     assert.equal(open.ownerClose, true);
 
-    // The owner closes the trip while store writes fail: the file holds the close, and the store row stays open.
     r.store.close();
     assert.equal(fuse.close({ scope: "project", projectId: "p" }), "closed");
-    // The next day a write prunes the closed trip from the file.
     r.clock.now += 25 * HOUR;
     assert.equal(fuse.admit(launch("c1")).ok, true);
     assert.equal(baselineOf(r).trips.some(trip => trip.tripId === open.tripId), false, "the file dropped the closed trip");
@@ -487,7 +467,6 @@ test("a released launch retried after its hour counts again", () => {
     const fuse = service(r);
     assert.equal(fuse.admit(launch("A")).ok, true);
     fuse.release("A");
-    // An idle hour passes with no write, so memory still holds the released launch with its old time.
     r.clock.now += HOUR + 1;
     fuse.tick();
     const count = () => fuse.view().projects.find(project => project.projectId === "p")!.hour.launches;
@@ -495,7 +474,6 @@ test("a released launch retried after its hour counts again", () => {
     assert.deepEqual(fuse.admit(launch("A")), { ok: true, launchId: "A" });
     assert.equal(count(), 1, "a retry outside the hour is a launch of this hour");
     assert.equal(fuse.view().host.hour.launches, 1);
-    // Inside the hour a released launch keeps its time and is not counted twice.
     fuse.release("A");
     r.clock.now += 60_000;
     assert.equal(fuse.admit(launch("A")).ok, true);
@@ -514,7 +492,6 @@ test("a project name is cleaned and bounded in an interrupt", () => {
     assert.ok(trip);
     assert.equal(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(trip.label), false, "no control character reaches a push body");
     assert.equal(/[\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/.test(trip.label), false, "no direction or zero-width character either");
-    // Every character of the Unicode "other" classes is gone, which includes each direction control such as U+061C.
     assert.equal(/[\p{C}\p{Zl}\p{Zp}\p{Bidi_Control}]/u.test(trip.label), false);
     assert.equal(trip.label.includes("\u061c"), false);
     assert.ok(trip.label.length <= 80);
@@ -543,7 +520,6 @@ test("a failed baseline write refuses and changes nothing", () => {
     rmSync(r.file);
     mkdirSync(r.file);
     assert.deepEqual(fuse.admit(launch("A")), { ok: false, launchId: "A", failure: "write-failed" });
-    // Counts, limits, and states are as before. The view only adds that a write failed.
     const { writeFailedAt, ...after } = fuse.view();
     assert.deepEqual(after, before);
     assert.equal(writeFailedAt, new Date(r.clock.now).toISOString());

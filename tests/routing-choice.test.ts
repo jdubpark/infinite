@@ -20,7 +20,6 @@ function posterior(theta: Beta, phi: Beta): ProfilePosterior {
   return { reward: [], rescue: [], theta, phi, rows: { production: 0, duel: 0 }, earlierRows: 0, level: "none", untimed: 0 };
 }
 
-/** One scored entry per distinct identity, from the shape of the first profile that has it (as `choose` keys by identity). */
 function scoredFor(screened: readonly Screened[], shape: (profileId: string) => { theta: Beta; phi: Beta; costUsd: number }): Map<string, Scored> {
   const scored = new Map<string, Scored>();
   for (const item of screened) if (!scored.has(item.identity)) {
@@ -32,7 +31,6 @@ function scoredFor(screened: readonly Screened[], shape: (profileId: string) => 
 
 test("a sampled choice is the best of one draw per candidate, with ties to lineup order", () => {
   const example = knobs({ successValueUsd: 2, listWeight: 1 });
-  // p1dup shares p1's identity, so it draws the same value: ties go to lineup order.
   const lineup = lineupWith([codex("p1", "m1"), codex("p2", "m2"), codex("p3", "m3", "xhigh"), { ...codex("p1dup", "m1"), label: "dup" }]);
   const screened = screen(lineup, example, new Set<Provider>());
   const shape: Record<string, { theta: Beta; phi: Beta; costUsd: number }> = {
@@ -60,9 +58,6 @@ test("a sampled choice is the best of one draw per candidate, with ties to lineu
   assert.ok(explored > 0 && explored < 200, `explored ${explored}`);
 });
 
-// Golden draws pin the generator: a changed generator must raise ROUTING_ALGORITHM_VERSION. Math.log, Math.cos and **
-// can differ in the last bits between CPUs and Node builds, as the plan expects of a recheck, so each value is compared
-// within 1e-12: far above that drift, far below what a structural change to the generator moves.
 const GOLDEN_TOLERANCE = 1e-12;
 function assertGolden(a: number, b: number, seeds: readonly string[], expected: readonly number[]) {
   assert.equal(seeds.length, expected.length);
@@ -72,7 +67,6 @@ function assertGolden(a: number, b: number, seeds: readonly string[], expected: 
   });
 }
 
-// Beta(0.3, 0.7): the shape-below-1 path. An independent re-derivation agrees to 1 ulp.
 const GOLDEN_LOW = [0.026535592372285116, 0.1874803328660342];
 
 test("rule order, the elevated value, the first of all-limited candidates, the seed formulas, and a shape below 1", () => {
@@ -106,7 +100,6 @@ test("fixed rules remove contributor, reviewer-model, and limited candidates", (
   assert.deepEqual(removed(mixedLineup, knobs(), new Set<Provider>(["codex"])), [["spark-high", "contributor"], ["astra-xhigh", "limited"]]);
   assert.deepEqual(removed(mixedLineup, knobs({ allowContributor: true }), new Set<Provider>(["opencode"])), [["spark-high", "limited"], ["astra-xhigh", null]]);
 
-  // OpenCode profiles differ by variant: two variants of one model are two real candidates, neither dropped.
   const openCode = (id: string, variant: string): TeamModelProfile => ({ id, label: id, provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant });
   const variants = lineupWith([openCode("oc-high", "high"), openCode("oc-low", "low")]);
   const kept = screen(variants, knobs({ allowContributor: true }), new Set<Provider>());
@@ -183,7 +176,6 @@ test("elevated risk is greedy at the mean minus one deviation with triple value"
   }
 });
 
-// Recorded from the implementation on 2026-11-15 on arm64. x64 gives 0.10943549295678799 for the third, 2 ULPs away.
 const GOLDEN_VALUES = [0.2881993592935194, 0.35225517656152383, 0.10943549295678802];
 
 test("the sampler is deterministic and matches its Beta", () => {
@@ -228,7 +220,6 @@ test("the seed binds every part of the key", () => {
 
 const ALL_POINTS: RoutingPoint[] = ["start", "escalation", "scout"];
 
-// The point lineup: the reviewer is on claude-opus-5-5, as in tests/routing-points-rules.test.ts.
 const claudeAt = (id: string, model: string, effort: "high" | "xhigh", tier?: "light" | "strong"): TeamModelProfile =>
   ({ id, label: id, provider: "claude", model, effort, ...(tier ? { tier } : {}) }) as TeamModelProfile;
 const contributorAt = (id: string): TeamModelProfile =>
@@ -301,18 +292,15 @@ test("the scout rule takes the lowest tier cost and screens rules 1 to 3", () =>
   const contributorOk = chooseScout(screenScouts(POINT_LINEUP, knobs({ allowContributor: true, successValueUsd: 2, listWeight: 1 }), new Set<Provider>()))!;
   assert.deepEqual([contributorOk.basis, contributorOk.chosen], ["greedy-point", "spark-high"]);
 
-  // Rule 2 applies to the scout's candidates when they come through screenProfiles: opus-strong is on the reviewer's model.
   const unscreenedScouts = chooseScout(screenProfiles(POINT_LINEUP.implementers, POINT_LINEUP, example, new Set<Provider>()))!;
   assert.equal(unscreenedScouts.candidates.find(record => record.profileId === "opus-strong")?.removed, "reviewer-model");
   assert.equal(unscreenedScouts.chosen, "astra-xhigh");
 
-  // Lowest tier cost, not lineup order: the strong profile comes first and costs 2.20; the light one costs 0.40.
   const cheapest = chooseScout(screenProfiles([claudeAt("strong-first", "claude-sonnet-5-5", "high", "strong"), codex("light-second", "gpt-6-astra", "high")],
     POINT_LINEUP, example, new Set<Provider>()))!;
   assert.deepEqual([cheapest.basis, cheapest.chosen], ["greedy-point", "light-second"]);
   assert.deepEqual(cheapest.candidates.map(record => record.costUsd), [2.2, 0.4]);
 
-  // No candidate passes rules 1 and 2: undefined, so the caller writes no row.
   assert.equal(chooseScout(screenProfiles([contributorAt("spark-only")], POINT_LINEUP, example, new Set<Provider>())), undefined);
   assert.equal(chooseScout([] as Screened[]), undefined);
 });
@@ -329,7 +317,6 @@ test("coverage agrees with the router's screen at both new points", () => {
   const contributorScoutLineup = withLineup({ implementers: [contributorAt("spark-high"), POINT_LINEUP.implementers[3]] });
   const contributorOnly = withLineup({ implementers: [contributorAt("spark-high")], escalations: [POINT_LINEUP.escalations![3]] });
 
-  // The nine lineups and knob sets: the point lineup, with and without contributors, and variants that cover or uncover each point.
   const cases: { lineup: TeamLineup; over: Partial<RoutingKnobs> }[] = [
     { lineup: POINT_LINEUP, over: {} },
     { lineup: POINT_LINEUP, over: { allowContributor: true } },
@@ -355,7 +342,6 @@ test("coverage agrees with the router's screen at both new points", () => {
     assert.equal(coversPoint(run, "scout"), scoutKept);
     escalationCovered.push(escalationKept);
     scoutCovered.push(scoutKept);
-    // The member's own profile is never its escalation candidate, in the coverage check or in the screen.
     for (const own of (lineup.escalations ?? []).map(profile => profile.id)) {
       const screened = screenEscalations(lineup, knobsOf, new Set<Provider>(), own);
       assert.equal(screened.some(item => item.profile.id === own), false);

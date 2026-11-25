@@ -1,11 +1,8 @@
-// Stand-ins for the modules the phone's dictation hook imports: Expo's optional native module lookup, expo-router's
-// screen focus, and the host API. tests/mobile-dictation-lifecycle.test.ts bundles the real hook with these in their place.
 import { createContext, useContext } from "react";
 
 type Listener = (event?: unknown) => void;
 type Cleanup = { text: string; resolve: (value: { model: string; text: string }) => void };
 
-/** One recognizer for the whole app, like the native module. Ends can be held to model a late native `end`. */
 const listeners = new Map<string, Set<Listener>>();
 const emit = (name: string, event?: unknown) => { for (const listener of [...(listeners.get(name) ?? [])]) listener(event); };
 export const native = {
@@ -22,7 +19,6 @@ export const native = {
 const speech = {
   start() { native.starts++; setTimeout(() => emit("start")); },
   stop() { setTimeout(() => native.end()); },
-  // Like the platform recognizers, an abort reports the end later.
   abort() { native.aborts++; setTimeout(() => native.end()); },
   isRecognitionAvailable: () => true,
   requestPermissionsAsync: async () => ({ granted: true }),

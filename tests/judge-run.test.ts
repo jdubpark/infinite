@@ -18,14 +18,12 @@ import type { TeamService } from "../packages/host/src/teams.js";
 
 const LAUNCHER = resolve("tests/fixtures/eval-command.mjs");
 const JUDGE_AGENT = resolve("tests/fixtures/judge-agent.mjs");
-// Distinctive names that must never reach a byte the judge reads.
 const profile: TeamModelProfile = { id: "zz-judge-profile", label: "Label Zed", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" };
 const patch = (marker: string) => Buffer.from(`diff --git a/a.txt b/a.txt\nnew file mode 100644\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+${marker}\n`);
 
 type Stored = { run: TeamRun };
 const runOf = (service: TeamService, runId: string) => (service as unknown as { records: Map<string, Stored> }).records.get(runId)!.run;
 
-/** A real service over a fixture project, with the eval identity configured as the same-user launcher and the fake judge. */
 async function judgeFixture() {
   const f = await fixture("success", undefined, {}, { trustWorkspaces: true });
   const evalRoot = join(f.host.root, "eval");
@@ -41,7 +39,6 @@ async function judgeFixture() {
   const outbox = { flush(items: unknown[]) { events.push(...items); return { stored: true }; }, advance() { return { pending: false, blocked: [] }; } } as unknown as EventOutbox;
   let manager: Manager | undefined;
   const service = await f.openTeamService({ events: outbox, manager: m => { manager = m; } });
-  /** A judge run over a clone of the fixture project, holding a package of two patches. `mode` is the fixture judge's behavior. */
   const start = async (mode: string, options: { judgeMinutes?: number; resolvedMarker?: boolean } = {}) => {
     const duelId = randomUUID(), work = join(evalRoot, "trials", duelId, "work");
     mkdirSync(join(evalRoot, "trials", duelId), { recursive: true, mode: 0o700 });
@@ -108,7 +105,6 @@ test("the judge's context file and package carry no identity", { timeout: 120000
     assert.deepEqual(context1.ownerAnswers, [{ question: "Which style?", answer: "Compact" }]);
     const task = JSON.parse(readFileSync(join(readDir, "package.task.json"), "utf8")) as Record<string, unknown>;
     assert.deepEqual(Object.keys(task).sort(), ["acceptance", "instructions", "paths", "title"]);
-    // The session title and the stored prompt are fixed text too.
     assert.equal(member.prompt.includes(profile.label), false);
     assert.equal(member.prompt.includes(profile.id), false);
   } finally {
@@ -169,7 +165,6 @@ test("a wrong duel ID ends the run mismatch", { timeout: 120000 }, async () => {
 test("a late judgement ends the run timeout", { timeout: 120000 }, async () => {
   const context = await judgeFixture();
   try {
-    // 0.001 minutes is 60 ms: the fixture judge waits 1.5 s before it reports.
     const { duelId } = await context.start("late", { judgeMinutes: 0.001 });
     const state = await context.ended(duelId);
     assert.equal(state?.ending, "timeout");
@@ -188,7 +183,6 @@ test("a judge run never starts a second member", { timeout: 180000 }, async () =
       const { duelId } = await context.start(mode);
       const state = await context.ended(duelId);
       assert.equal(state?.ending, ending, `mode ${mode}`);
-      // Three more passes of the service's step: nothing may start.
       await new Promise(resolve => setTimeout(resolve, 3000));
       const run = runOf(context.service, duelId);
       assert.equal(run.members.length, 1, `mode ${mode} holds one member`);
@@ -230,7 +224,6 @@ test("a judge session uses the eval identity", { timeout: 120000 }, async () => 
     assert.equal(header.purpose, "duel");
     assert.equal(launches[0]![7], undefined, "a judge gets no GitHub grant scope");
     assert.equal((await context.getManager().list()).some(row => row.purpose === "duel"), true);
-    // The identity rules a session with this purpose gets: the eval agent profile and the `_eval` egress identity.
     assert.equal(sessionAgentProfile(context.f.host.config, "claude", "duel"), context.f.host.config.eval!.member!.agents!.claude);
     assert.equal(sessionEgressIdentity("rehearsal", "session", "duel").project, "_eval");
     const commands = existsSync(context.record) ? readFileSync(context.record, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as { argv: string[] }) : [];

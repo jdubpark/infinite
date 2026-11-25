@@ -35,7 +35,6 @@ test("an enrollment reads its saved mode, then the host default, then autonomous
   assert.deepEqual(enrollmentAutonomy({ autonomy: "auto" }, {}), { mode: "supervised", source: "saved" });
 });
 
-// A copy of the digest formula that RoutineService.authority() applies today, before any mode existed.
 function frozenAuthority(config: Config, project: Project) {
   const canonicalPath = realpathSync(project.path);
   return createHash("sha256").update(JSON.stringify({
@@ -75,7 +74,6 @@ test("parsing the host configuration adds no key to a digested block", () => {
     const codeModeHeadless = readConfig(write("code-mode-headless.json", hostConfig(root, { codeMode: { claude: "headless" } }))).config;
     const codeModeAll = readConfig(write("code-mode-all.json", hostConfig(root, { codeMode: { claude: "all" } }))).config;
     const digested = (config: Config) => JSON.stringify({ teams: config.teams, source: config.source, linear: config.linear, agents: config.agents, team: config.projects[0]!.team });
-    // Frozen from today's parse: schema defaults (publishHeads, mergeMethod, maxDecisions) are part of the digest and stay unchanged.
     const frozen = '{"teams":{"workspaceDir":"ROOT/teams","commandPrefix":{"command":"safe","args":[]},"lineup":{"coordinator":{"id":"coord","label":"Coordinator","provider":"claude","model":"model","effort":"high","tier":"strong"},"integrator":{"id":"integrator","label":"Integrator","provider":"claude","model":"model","effort":"high","tier":"strong"},"reviewer":{"id":"reviewer","label":"Reviewer","provider":"claude","model":"model","effort":"high","tier":"strong"},"implementers":[{"id":"haiku","label":"Haiku","provider":"claude","model":"claude-haiku-5-5","effort":"low","tier":"light"}],"escalations":[{"id":"sonnet","label":"Sonnet","provider":"claude","model":"claude-sonnet-5-5","effort":"high","tier":"strong"}]},"publishHeads":true},"source":{"mirrorDir":"ROOT/mirrors"},"linear":{"apiKeyFile":"ROOT/linear-key"},"agents":{"claude":{"command":"claude","args":[]},"codex":{"command":"codex","args":[]}},"team":{"checks":[{"command":"node","args":["check.js"]}],"delivery":{"mode":"merge","repository":"example/demo","baseBranch":"main","mergeMethod":"squash"},"permissions":{"mode":"coordinator","scope":"Routine approvals","maxDecisions":25}}}'.replaceAll("ROOT", root);
     assert.equal(digested(plain), frozen);
     assert.equal(digested(explicit), digested(plain));

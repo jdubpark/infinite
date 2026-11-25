@@ -24,7 +24,6 @@ const lineup: TeamLineup = {
   reviewer: { id: "reviewer", label: "Reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
 };
 
-/** The scheduler fixture with a configured project, lineup, and provider profiles. */
 function teamFixture() {
   const f = schedulerFixture();
   f.config.agents = { demo: { command: process.execPath, args: [] }, claude: { command: "claude", args: [] }, codex: { command: "codex", args: [] } };
@@ -99,7 +98,6 @@ test("a mode change applies from the next run", async () => {
 test("a run recorded before this slice reads as supervised and is not rewritten", () => {
   const f = teamFixture();
   f.config.projects[0]!.autonomy = "autonomous";
-  // Runs written since the capacity ceiling existed carry it; the constructor migrates only runs without one.
   f.run.parallelismCeiling = 4;
   f.writeTeam();
   const file = join(f.config.stateDir, "teams", `${f.run.id}.sealed`), before = readFileSync(file);
@@ -122,7 +120,6 @@ test("a goal recorded before this slice keeps its fields at load", async () => {
   try {
     goals = new GoalService(f.config, f.key, teams as unknown as TeamService);
     assert.equal(autonomyOf((await goals.get(goal.id)).goal ?? {}), "supervised");
-    // The migration writes the record once at load, so the bytes change; the goal's fields must not.
     const sealed = unseal<{ goal: ProductGoal; receipts: unknown; fingerprint: unknown }>(f.key, `goal:${goal.id}`, readFileSync(file, "utf8"));
     assert.deepEqual(sealed.goal, goal, "the goal keeps its fields at load");
     assert.deepEqual(sealed.receipts, {});
@@ -136,8 +133,6 @@ test("a goal launch prepared before this slice replays without a conflict", asyn
   f.config.projects[0]!.autonomy = "autonomous";
   const runId = randomUUID(), request: CreateTeam = { ...teamRequest(), requestId: runId, useConfiguredLineup: true } as CreateTeam;
   const context = goalContext(randomUUID());
-  // The fingerprint the code before this slice computed: the parsed request and the creation context
-  // (goal, then lineup, in that key order), with no autonomy key anywhere in the formula.
   const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
   const fingerprint = digest({ request: createTeamSchema.parse(request), goal: teamGoalContextSchema.parse(context), lineup: teamLineupSchema.parse(lineup) });
   const run = { ...structuredClone(f.run), id: runId, provider: "claude" as const, title: request.title, objective: request.objective, parallelismCeiling: 1 } as TeamRun;
@@ -162,7 +157,6 @@ test("a goal launch prepared before this slice replays without a conflict", asyn
   } finally { goals?.close(); teams.close(); f.close(); }
 });
 
-/** A stub team service: records each goal launch and returns views whose status the test sets. */
 function stubTeams() {
   const views = new Map<string, TeamView>();
   const launches: { cycle: number; autonomy: AutonomyMode | undefined }[] = [];
@@ -187,7 +181,6 @@ function stubTeams() {
   return service;
 }
 
-/** A goal record as the goal service writes it, without a launch unless the test adds one. */
 function goalRecord(f: ReturnType<typeof teamFixture>, extra: Partial<ProductGoal> = {}): ProductGoal {
   const at = new Date().toISOString(), deadlineAt = new Date(Date.now() + 60 * 60000).toISOString();
   return { id: randomUUID(), projectId: "fixture", title: "Inspect the fixture", objective: "Choose scoped work", successCriteria: "The owner has evidence",
@@ -293,7 +286,6 @@ test("a goal recorded before this slice stays supervised", async () => {
   } finally { goals?.close(); f.close(); }
 });
 
-/** The host lineup with no evaluator of another family: Claude coordinates and reviews, and no escalation is strong. */
 const { escalations: _strongEscalation, ...unreadyLineup } = lineup;
 const unready: TeamLineup = unreadyLineup;
 const noEvaluatorEvent = "This run starts supervised: no lineup profile of a model family other than the coordinator's can evaluate it.";
@@ -312,7 +304,6 @@ test("a lineup without an eligible evaluator starts new runs and goals supervise
   try {
     f.config.projects[0]!.autonomy = "autonomous";
     f.config.teams = { ...f.config.teams!, lineup: unready };
-    // The mission comes first: a mission cannot start while a standalone run of the project is active.
     const mission = await teams.createForMission(teamRequest(), randomUUID(), unready);
     assert.equal(mission.autonomy, "supervised");
     assert.equal(eventsWith(runEvents(f, mission.id), noEvaluatorEvent), 1);
@@ -347,19 +338,16 @@ test("pins already taken never move", async () => {
     f.config.projects[0]!.autonomy = "autonomous";
     const run = await teams.create({ ...teamRequest(), useConfiguredLineup: true } as CreateTeam);
     assert.equal(run.autonomy, "autonomous");
-    // The host lineup loses its evaluator; the pinned run stays autonomous through a pause and a reload.
     f.config.teams = { ...f.config.teams!, lineup: unready };
     const paused = await teams.pause(run.id, { requestId: randomUUID(), revision: run.revision });
     assert.equal(paused.autonomy, "autonomous");
     teams.close();
     teams = f.openTeam();
     assert.equal(autonomyOf(teams.get(run.id)), "autonomous");
-    // A goal cycle's run takes its goal's pin, whatever the lineup now gives, and logs no start event.
     const cycle = await teams.createForGoal(teamRequest(), goalContext(randomUUID()), unready, false, "autonomous");
     assert.equal(cycle.autonomy, "autonomous");
     assert.equal(eventsWith(runEvents(f, cycle.id), noEvaluatorEvent), 0);
 
-    // A goal created autonomous keeps autonomous in its next cycle after the lineup loses its evaluator.
     f.config.teams = { ...f.config.teams!, lineup };
     const stub = stubTeams();
     goals = new GoalService(f.config, f.key, stub as unknown as TeamService);
@@ -409,7 +397,6 @@ test("each new run pins the intent check by mode and setting", async () => {
     const goalOff = await teams.createForGoal(teamRequest(), goalContext(randomUUID()), lineup);
     assert.equal(goalOff.intentCheck, "off");
 
-    // A replayed request returns the run with the pin it was created with, not the pin the current settings give.
     const request = { ...teamRequest(), useConfiguredLineup: true } as CreateTeam;
     f.config.projects[0]!.autonomy = "autonomous";
     const first = await teams.create(request);
@@ -447,13 +434,11 @@ test("each new run pins verdicts by setting", async () => {
   const teams = f.openTeam();
   const saved = (id: string) => f.readRecord<{ run: TeamRun }>("team", id).run;
   try {
-    // With both keys on, a mission subteam never pins verdicts.
     f.config.projects[0]!.team!.objective = { evaluator: "on", register: "on" };
     const mission = await teams.createForMission(teamRequest(), randomUUID(), lineup);
     assert.equal(mission.verdicts, undefined, "a mission subteam never pins verdicts");
     assert.equal("verdicts" in saved(mission.id), false);
 
-    // The evaluator key alone, and the register key alone, pin nothing.
     f.config.projects[0]!.team!.objective = { evaluator: "on" };
     const evaluatorOnly = await teams.create(teamRequest());
     assert.equal(evaluatorOnly.verdicts, undefined, "the evaluator key needs the register key");
@@ -462,13 +447,11 @@ test("each new run pins verdicts by setting", async () => {
     assert.equal(registerOnly.verdicts, undefined, "the register key needs the evaluator key");
     assert.equal("verdicts" in saved(registerOnly.id), false);
 
-    // Both keys on: a standalone run pins it.
     f.config.projects[0]!.team!.objective = { evaluator: "on", register: "on" };
     const standalone = await teams.create(teamRequest());
     assert.equal(standalone.verdicts, "on");
     assert.equal(saved(standalone.id).verdicts, "on");
 
-    // The evaluator key off pins nothing even with the register on.
     f.config.projects[0]!.team!.objective = { evaluator: "off", register: "on" };
     const off = await teams.create(teamRequest());
     assert.equal(off.verdicts, undefined);

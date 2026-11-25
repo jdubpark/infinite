@@ -21,7 +21,7 @@ test("claude PreToolUse becomes tool-start with destructive flag and quiet marki
   if (open.kind !== "prompt-open") throw new Error();
   assert.equal(open.prompt.kind, "question");
   assert.equal(open.prompt.title, "Which DB?");
-  assert.equal(open.prompt.options.length, 0); // options come from the screen
+  assert.equal(open.prompt.options.length, 0);
   assert.equal(open.prompt.multiSelect, false);
 });
 
@@ -77,14 +77,12 @@ test("codex OSC text opens a prompt or ends a turn only on a known leading phras
   assert.deepEqual(kinds("Question: which database?"), ["notice", "prompt-open:question"]);
   assert.deepEqual(kinds("Codex: turn complete"), ["notice", "turn-end"]);
   assert.deepEqual(kinds("Turn complete"), ["notice", "turn-end"]);
-  // Words elsewhere in the text are only a notice.
   for (const text of ["Build complete", "Waiting for your input", "No approval needed", "Your question was answered", "Codex: task complete"])
     assert.deepEqual(kinds(text), ["notice"], text);
 });
 
 test("claude PermissionDenied closes the open prompt and keeps the reason as a notice", () => {
   const [closed, notice] = mapClaudeHook({ ...base, hook_event_name: "PermissionDenied", tool_name: "Bash", tool_input: { command: "rm -rf /" }, tool_use_id: "t9", reason: "Blocked by policy" });
-  // The worker binds promptId 0 to whichever prompt is open.
   assert.deepEqual(closed, { kind: "prompt-closed", promptId: 0, reason: "resolved" });
   assert.deepEqual(notice, { kind: "notice", type: "permission_denied", message: "Blocked by policy" });
 });

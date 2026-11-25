@@ -10,7 +10,6 @@ import type { Provider } from "../packages/host/src/types.js";
 import { limitLineup, mixedLineup } from "./team-fixture.js";
 
 const knobs = (over: Partial<RoutingKnobs> = {}): RoutingKnobs => ({ ...ROUTING_DEFAULTS, ...over });
-/** A run stub holding only the fields the helpers read. */
 const runWith = (over: Record<string, unknown>): TeamRun => ({ members: [], tasks: [], ...over }) as unknown as TeamRun;
 const autoPin = (over: Partial<RoutingKnobs> = {}): TeamRunRouting => ({
   mode: "auto", requested: "auto", source: "saved", knobs: knobs(over), defaults: [], algorithmVersion: 1, rewardVersion: 1,
@@ -38,7 +37,6 @@ test("off and shadow plan checks refuse as main does", () => {
   const withLineup = (routing?: TeamRunRouting) => runWith({ lineup: mixedLineup, ...(routing ? { routing } : {}) });
   const bare = runWith({});
   for (const use of ["plan", "scouts"] as const) {
-    // Without a lineup, any id refuses; a missing id passes, as main does.
     refuses(bare, [{ agentProfileId: "spark-high" }], use, PROFILE_MESSAGES.singleProvider);
     assert.doesNotThrow(() => assertTaskProfiles(bare, [{}], use));
     for (const run of [withLineup(), withLineup(shadowPin()), withLineup(shadowPin("auto"))]) {
@@ -61,7 +59,6 @@ test("auto plans may omit profiles, and scouts and escalations pass rule 1", () 
     assert.doesNotThrow(() => assertTaskProfiles(run, [{}, {}], "plan"));
     refuses(run, [{ agentProfileId: "not-a-profile" }], "plan", PROFILE_MESSAGES.autoPool);
     assert.doesNotThrow(() => assertTaskProfiles(run, [{ agentProfileId: "spark-high" }], "plan"));
-    // A scout must name a profile from the rule-1 pool: the contributor is refused unless the policy allows one.
     refuses(run, [{ agentProfileId: "spark-high" }], "scouts", PROFILE_MESSAGES.scoutPool);
     refuses(run, [{}], "scouts", PROFILE_MESSAGES.scoutPool);
     assert.doesNotThrow(() => assertTaskProfiles(run, [{ agentProfileId: "astra-xhigh" }], "scouts"));
@@ -73,7 +70,6 @@ test("auto plans may omit profiles, and scouts and escalations pass rule 1", () 
 });
 
 test("auto fallbacks skip a target that fails a fixed rule; off and shadow keep main's chain", () => {
-  // A (claude, limited) falls back to C (opencode, a contributor), which falls back to D (codex, a fallback profile).
   const a = { id: "a-claude", label: "A", provider: "claude", model: "claude-x", effort: "high", tier: "light", limitFallback: "c-contrib" } as TeamModelProfile;
   const c = { ...contributor("c-contrib", "c"), limitFallback: "d-codex" } as TeamModelProfile;
   const d = codex("d-codex", "gpt-x");
@@ -88,10 +84,8 @@ test("auto fallbacks skip a target that fails a fixed rule; off and shadow keep 
   assert.equal(switchFallback(lineup, "a-claude", "claude", new Set(), fallbackRule(auto, "implementer"))?.id, "d-codex");
   assert.equal(switchFallback(lineup, "a-claude", "claude", new Set())?.id, "c-contrib");
 
-  // With D on the reviewer's model as well, no target passes and the chain stops after two hops.
   const onReviewerModel: TeamLineup = { ...lineup, reviewer: { ...lineup.reviewer, model: "gpt-x" } };
   assert.equal(resolveLimitFallback(onReviewerModel, "a-claude", limited, fallbackRule(runWith({ lineup: onReviewerModel, routing: autoPin() }), "implementer")), undefined);
-  // A scout follows rule 1 only: D on the reviewer's model is its target, and the contributor C is still skipped.
   assert.equal(resolveLimitFallback(onReviewerModel, "a-claude", limited, fallbackRule(runWith({ lineup: onReviewerModel, routing: autoPin() }), "scout"))?.id, "d-codex");
 
   for (const role of ["project-manager", "integrator", "reviewer"] as const) assert.equal(fallbackRule(auto, role), undefined, role);
@@ -104,14 +98,11 @@ test("auto fallbacks skip a target that fails a fixed rule; off and shadow keep 
 });
 
 test("a covered run accepts scouts without a profile, and a named one still passes rule 1", () => {
-  // Version 2 lists scout, and mixedLineup's astra-xhigh is a scout candidate: the run covers scout.
   const covered = runWith({ lineup: mixedLineup, routing: { ...autoPin({ points: ["start", "scout"] }), algorithmVersion: 2 } });
   assert.doesNotThrow(() => assertTaskProfiles(covered, [{}, {}], "scouts"));
   assert.doesNotThrow(() => assertTaskProfiles(covered, [{ agentProfileId: "astra-xhigh" }, {}], "scouts"));
-  // A named contributor still fails rule 1, with step 2's message.
   refuses(covered, [{ agentProfileId: "spark-high" }], "scouts", PROFILE_MESSAGES.scoutPool);
   refuses(covered, [{}, { agentProfileId: "spark-high" }], "scouts", PROFILE_MESSAGES.scoutPool);
-  // Under a version-1 pin, a missing scout profile is still refused; without a pin, main's pool message.
   const v1 = runWith({ lineup: mixedLineup, routing: autoPin({ points: ["start", "scout"] }) });
   refuses(v1, [{}], "scouts", PROFILE_MESSAGES.scoutPool);
   refuses(runWith({ lineup: mixedLineup }), [{}], "scouts", PROFILE_MESSAGES.pool);
@@ -128,11 +119,9 @@ test("the fallbacks at the new points pass rules 1 and 2 and never the member's 
     implementers: [...mixedLineup.implementers, haikuLight, opusStrong],
     escalations: [astraEscalation, sonnetEscalation, opusEscalation],
   };
-  // Version 2 lists both points, so the fallbacks read a covered run.
   const covered = (over: Partial<TeamLineup> = {}) => runWith({ lineup: { ...lineup, ...over }, routing: { ...autoPin({ points: ["start", "escalation", "scout"] }), algorithmVersion: 2 } });
   const run = covered();
 
-  // escalationFallback: a named profile passes rules 1 and 2 or the first candidate that does; never the member's own.
   assert.equal(escalationFallback(run, "astra-xhigh", "sonnet-escalation")?.id, "sonnet-escalation");
   assert.equal(escalationFallback(run, "astra-xhigh", "opus-escalation")?.id, "astra-escalation");
   assert.equal(escalationFallback(run, "astra-escalation", "astra-escalation")?.id, "sonnet-escalation");
@@ -140,13 +129,11 @@ test("the fallbacks at the new points pass rules 1 and 2 and never the member's 
   assert.equal(escalationFallback(run, "astra-xhigh", undefined)?.id, "astra-escalation");
   assert.equal(escalationFallback(covered({ escalations: [astraEscalation] }), "astra-escalation", "astra-escalation"), undefined);
 
-  // scoutFallback: a named profile that is a scout candidate, else the first candidate. Contributors and strong profiles are not candidates.
   assert.equal(scoutFallback(run, { agentProfileId: "haiku-light" })?.id, "haiku-light");
   assert.equal(scoutFallback(run, { agentProfileId: "opus-strong" })?.id, "astra-xhigh");
   assert.equal(scoutFallback(run, { agentProfileId: "spark-high" })?.id, "astra-xhigh");
   assert.equal(scoutFallback(run, {})?.id, "astra-xhigh");
 
-  // fallbackRule for a scout: a covered run applies rules 1 and 2; a version-1 pin applies rule 1 only.
   const coveredScout = fallbackRule(run, "scout")!;
   assert.equal(coveredScout(opusEscalation), false);
   assert.equal(coveredScout(mixedLineup.implementers[0]!), false);

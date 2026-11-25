@@ -20,7 +20,6 @@ import { runEventKey } from "../packages/host/src/run-events.js";
 
 const HEX_A = "a".repeat(64);
 const HEX_B = "e".repeat(64);
-/** A policy digest of an `auto` run. Any 64 lower-case hex digits will do. */
 const DIGEST = "d".repeat(64);
 const RUN = "run-1";
 const BASE = "b".repeat(40);
@@ -29,7 +28,6 @@ const GIT = ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-
 
 const at = (minute: number) => `2026-11-13T10:${String(minute).padStart(2, "0")}:00.000Z`;
 
-/** The step-1 components of `a configId covers all six components`, with the routing component as given. */
 function components(routing: string): ConfigComponents {
   return {
     profile: { provider: "opencode", model: "vendor/model-a", effort: "high" },
@@ -51,7 +49,6 @@ test("a routing component is off or a policy digest, and off keeps main's ids", 
   assert.equal(isRoutingComponent(42), false);
   assert.equal(isRoutingComponent(undefined), false);
 
-  // Golden values of main's code before this change (computed on the step-1 tree). An `off` configuration keeps them.
   assert.equal(configId(components("off")), "c5116d39b09122c01e533092de4fbe3e670bbb980f98b7bb88f6596d36d28d79");
   assert.equal(configId({ ...components("off"), shape: "trial" }), "e1a5a2791bdf2de118e16779bf79d0bb13321f0715dcb0404cb255471fd3d701");
   assert.equal(
@@ -59,13 +56,11 @@ test("a routing component is off or a policy digest, and off keeps main's ids", 
     "96ecdf027f058e1fc6035ab603ba18a50a58457a8dc513f953798a5deac9ed17",
   );
 
-  // A digest changes the id, and only the digest does.
   const routed = configId(components(DIGEST));
   assert.notEqual(routed, configId(components("off")));
   assert.match(routed, /^[0-9a-f]{64}$/);
   assert.notEqual(configId(components("e".repeat(64))), routed);
 
-  // memberConfiguration: absent routing gives "off" and the id of `off`; a digest is recorded with its id.
   const root = mkdtempSync(join(tmpdir(), "routing-identity-"));
   try {
     execFileSync("git", ["init", "-q", "--template="], { cwd: root });
@@ -141,7 +136,6 @@ function ev(kind: string, time: string, fields: { memberId?: string; taskId?: st
   };
 }
 
-/** A member of an implementer task whose configuration carries the given routing component. */
 function memberEvents(routing: string): OutboxEvent[] {
   const profile = { provider: "claude", model: "m-1", effort: null };
   const configured = { ...components(routing), profile, promptVersion: HEX_A, guidance: HEX_B };
@@ -179,7 +173,6 @@ test("a routed member's configuration is stored and its outcome row keeps the id
 
     const row = h.store.read(db => readOutcome(db, `${RUN}:m1`));
     assert.equal(row?.configId, routedId);
-    // The routing reads join the configuration by its id; the joined prompt version must be found.
     const joined = h.store.read(db => db.get<{ prompt_version: string | null }>(
       "SELECT c.prompt_version FROM outcomes o LEFT JOIN configurations c ON c.config_id = o.config_id WHERE o.outcome_id = ?",
       `${RUN}:m1`,

@@ -5,8 +5,6 @@ import { fileURLToPath } from "node:url";
 import { build, type Plugin } from "esbuild";
 import { chromium, type Browser, type Page } from "playwright";
 
-// Runs the phone's real dictation hook in Chromium, with the native recognizer, screen focus, and host API
-// replaced by tests/fixtures/mobile-dictation-native.ts. Two screens share the one recognizer, as on the phone.
 const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH || chromium.executablePath();
 const skip = existsSync(executablePath) ? false : "Chromium for Playwright is not installed; run `npx playwright install chromium`";
 const harness = fileURLToPath(new URL("./fixtures/mobile-dictation-harness.tsx", import.meta.url));
@@ -59,7 +57,6 @@ describe("phone dictation lifecycle", { skip }, () => {
       notice: () => region.getByRole("status").innerText(),
     };
   };
-  // Lets timers, replies, and the renders they cause finish before the page is read.
   const settle = (page: Page) => page.evaluate(() => new Promise(resolve => setTimeout(resolve, 50)));
 
   test("a capture in one screen keeps another from starting, and its words reach only its own field", async () => {
@@ -109,7 +106,6 @@ describe("phone dictation lifecycle", { skip }, () => {
     await brief.button("Stop dictation").waitFor();
     await brief.button("Lock field").click();
     await brief.button("Unlock field").click();
-    // The aborted capture has not ended yet, however long that takes, so neither screen may start over it.
     await page.waitForTimeout(3200);
     await brief.button("Dictate").click();
     await terminal.button("Dictate").click();

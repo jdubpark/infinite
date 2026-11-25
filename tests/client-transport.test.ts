@@ -61,7 +61,7 @@ test("input without an acknowledgement ends the attachment after 15 seconds; ack
     assert.equal(await Promise.race([outcome, Promise.resolve("pending")]), "pending");
     mock.timers.tick(1);
     assert.equal(await outcome, "Input delivery is uncertain");
-    await assert.rejects(async () => { for await (const _ of connection.pages()) { /* drain */ } }, /acknowledgement timed out/);
+    await assert.rejects(async () => { for await (const _ of connection.pages()) { } }, /acknowledgement timed out/);
   } finally {
     connection.close();
     mock.timers.reset();

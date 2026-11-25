@@ -23,9 +23,6 @@ import type { JudgeCreate, ReplayState } from "../packages/host/src/team-replay.
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 import type { Config } from "../packages/host/src/types.js";
 
-// The pump's life around a judgement: start-up after a restart, the hourly sweep, and the turns it takes with trials. The rig is the
-// one of tests/judge-pump.test.ts (a scripted `TrialTeams`, a scripted judge, a scripted source build), copied and trimmed.
-
 const T0 = "2026-11-22T00:00:00.000Z";
 const DAY_BEFORE = "2026-11-20T00:00:00.000Z";
 const JOB = "job-1";
@@ -53,7 +50,6 @@ type Mode = "prefer-a" | "hang";
 type Rig = ReturnType<typeof makeRig>;
 type Options = { mode?: Mode; trialsPerDay?: number; judgements?: boolean; cost?: CostLookup; trialSessions?: boolean; failCleanAt?: number };
 
-/** The pump over a real store and real jobs, with 30 seeded dev pairs whose trials ran two days before the clock. */
 function makeRig(options: Options = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "infinite-judge-life-")));
   dirs.push(root);
@@ -75,7 +71,6 @@ function makeRig(options: Options = {}) {
     },
     teams: { workspaceDir: join(root, "workspaces"), lineup: LINEUP },
   } as unknown as Config;
-  /** Launcher ops and `createForReplay` calls, in order. */
   const log: string[] = [];
   const removed: string[] = [];
   let cleans = 0;
@@ -133,7 +128,6 @@ function seedPairs(r: { store: EvidenceStore }, count: number): void {
 
 type Scripted = { teams: TrialTeams; creates: { purpose: string; trialId: string }[]; states: Map<string, ReplayState> };
 
-/** A `TrialTeams` with no team service: `prefer-a` judges answer A at once, `hang` judges stay running. A replay run ends `no-result`. */
 function scriptedTeams(mode: Mode, log: string[]): Scripted {
   const states = new Map<string, ReplayState>();
   const creates: Scripted["creates"] = [];
@@ -161,7 +155,6 @@ function scriptedTeams(mode: Mode, log: string[]): Scripted {
   return { teams, creates, states };
 }
 
-/** Steps the pump until `done` holds, within a count and a time bound. */
 async function until(r: { pump: TrialPump }, done: () => boolean, steps = 200): Promise<void> {
   const deadline = Date.now() + 60_000;
   for (let step = 0; step < steps && Date.now() < deadline && !done(); step++) await r.pump.step();
@@ -176,7 +169,6 @@ const rowsOf = (r: Rig, id: string) => r.store.read(db => calibrationJudgements(
 const viewOf = (r: Rig, id: string) => r.judgements.views().find(view => view.calibrationId === id)!;
 const finalCount = (r: Rig, id: string) => rowsOf(r, id).filter(row => row.state === "final" || row.state === "dropped").length;
 
-/** Valid tasks for a baseline job: the pump starts one trial per task. */
 function addTrialJob(r: Rig, tasks: number): void {
   for (let i = 1; i <= tasks; i++) {
     const taskId = `captured:run-1:t0${i}`;
@@ -193,7 +185,6 @@ function addTrialJob(r: Rig, tasks: number): void {
   assert.ok("job" in created, "the baseline job is created");
 }
 
-/** A replay run's session exits at once, so the pump does not wait out the stopping grace. */
 const exitReplays = (r: Rig) => { for (const [id, state] of r.judge.states) if (state.phase === "ended" && !state.sessionExited) r.judge.states.set(id, { ...state, sessionExited: true }); };
 
 test("start-up voids a live judgement and retries it once", async () => {
@@ -203,7 +194,6 @@ test("start-up voids a live judgement and retries it once", async () => {
     await until(r, () => r.judgements.live().length === 1, 20);
     const first = rowsOf(r, id)[0]!;
     assert.equal(first.state, "live");
-    // The host restarts: a new pump over the same store finds the row left live.
     r.pump = r.build();
     let most = 0;
     const alive = () => [...r.judge.states.values()].filter(state => state.phase === "running").length;
@@ -231,7 +221,6 @@ test("start-up forgets a finished judge run", async () => {
     await until(r, () => finalCount(r, id) >= 1, 20);
     const done = rowsOf(r, id)[0]!;
     assert.equal(done.state, "final");
-    // A run whose row is final, and a run no row names: that one may belong to another caller of the replay runs.
     const stray = randomUUID();
     const endedState: ReplayState = { phase: "ended", ending: "judged", sessionExited: true, sessionId: "session-x" };
     r.pump = r.build();
@@ -259,7 +248,6 @@ test("the sweep never forgets the live judge run", async () => {
   }
 });
 
-/** The launcher ops and `createForReplay` calls of one trial, from start to its close. */
 async function trialSequence(r: Rig): Promise<string[]> {
   addTrialJob(r, 1);
   await until(r, () => r.judge.creates.length >= 1, 20);
@@ -310,7 +298,6 @@ test("a pump with no calibration runs trials as before", async () => {
   const r = makeRig({ judgements: false });
   try {
     const sequence = await trialSequence(r);
-    // Recorded from this fixture with the pump of commit c699dfb7 (the branch base), run through a one-line seam for the scripted source build.
     assert.deepEqual(sequence, ["stop", "clean", "scrub", "prepare", "create:replay", "stop", "clean", "scrub"]);
   } finally {
     r.close();
@@ -319,14 +306,12 @@ test("a pump with no calibration runs trials as before", async () => {
 
 test("a pump with a judge configured but no calibration runs trials the same way", async () => {
   const off = makeRig({ judgements: false }), on = makeRig();
-  // Each request for a judgement is a write transaction on the evidence store, so an idle host must make none.
   let asked = 0;
   const next = on.judgements.next.bind(on.judgements);
   on.judgements.next = async gates => { asked += 1; return next(gates); };
   try {
     assert.deepEqual(await trialSequence(on), await trialSequence(off));
     assert.equal(on.store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM judge_judgements")?.n), 0, "no row is written");
-    // The trial job is done: an idle pump takes its turns with nothing open.
     for (let step = 0; step < 3; step++) await on.pump.step();
     assert.equal(asked, 0, "with no calibration running the pump never asks for a judgement");
   } finally {
@@ -338,7 +323,6 @@ test("a pump with a judge configured but no calibration runs trials the same way
 test("a judgement leaves the trial daily count alone", async () => {
   const r = makeRig({ trialsPerDay: 2 });
   try {
-    // One trial started today.
     r.store.write(tx => {
       const configuration: TrialConfiguration = { profile: OTHER, guidance: "as-of-base", knowledge: "none" };
       insertTrial(tx, { trialId: "trial-today", jobId: JOB, taskId: taskOf(0), configRef: configRef(configuration), harness: TRIAL_HARNESS_VERSION, slot: 900,

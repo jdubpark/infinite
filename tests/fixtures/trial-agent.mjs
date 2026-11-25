@@ -1,15 +1,3 @@
-// A fake implementer for a replay trial. The eval profile runs it as the trial's member. Its mode comes from
-// `RECEIPTS/RUN.mode`, a JSON file the test writes before the trial starts, so one profile serves every ending:
-//   { "mode": "reference", "dir": DIR }  copies DIR's files into the workspace, then reports a result
-//   { "mode": "empty" }                  reports a result without changing anything
-//   { "mode": "outside" }                edits a file outside the task's paths, then reports a result
-//   { "mode": "question" | "blocked" | "escalate" }  reports that kind
-//   { "mode": "silent" }                 exits without a report
-//   { "mode": "stall" }                  prints nothing and waits
-//   { "mode": "permission" }             draws a dialog that the pipeline leaves to a person
-//   { "mode": "permission-late" }        reports the same request by hook, and draws its dialog 600 ms later
-//   { "mode": "permission-unread" }      reports the same request by hook, and never draws a dialog
-//   { "mode": "limit" }                  prints a usage-limit notice and reports the limit to the host
 import { cpSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -69,7 +57,6 @@ if (mode === "reference") {
   forever();
 } else if (mode === "permission-late") {
   await hook(request);
-  // Longer than the scheduler's 500 ms tick: a step always reads the dialog before the screen shows it.
   await sleep(600);
   console.log(dialog);
   forever();

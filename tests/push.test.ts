@@ -37,10 +37,10 @@ test("notifier sends once per transition, minimal body, prunes unregistered toke
   const manager = { list: async () => sessions } as never;
   const sender = async (messages: { to: string }[]) => { sent.push(messages); return messages.map((m) => m.to.includes("dead") ? { status: "error" as const, details: { error: "DeviceNotRegistered" } } : { status: "ok" as const, id: "x" }); };
   const notifier = new Notifier(manager, store, sender, { detail: "minimal", events: ["needs-you", "turn-finished", "exited", "recording-error"], intervalMs: 100000 });
-  await notifier.tick();                 // baseline, no sends
+  await notifier.tick();
   sessions[0].attention = att("needs-you", 7);
   await notifier.tick();
-  await notifier.tick();                 // same prompt: no second send
+  await notifier.tick();
   assert.equal(sent.length, 1);
   assert.equal(sent[0].length, 2);
   const first = sent[0][0] as { title: string; body: string; data: { url: string }; collapseId: string; priority: string };
@@ -51,13 +51,13 @@ test("notifier sends once per transition, minimal body, prunes unregistered toke
   assert.equal(first.priority, "high");
   assert.deepEqual(store.list().map((d) => d.token), ["ExponentPushToken[a]"]);
   sessions[0].attention = att("needs-you", 8);
-  await notifier.tick();                 // new prompt id: a new send
+  await notifier.tick();
   assert.equal(sent.length, 2);
   sessions[0].attention = att("turn-finished");
   await notifier.tick();
   assert.equal((sent[2][0] as { body: string }).body, "Retry logic finished a turn");
   sessions[0].attention = att("working");
-  await notifier.tick();                 // working is not a push event
+  await notifier.tick();
   assert.equal(sent.length, 3);
   rmSync(dir, { recursive: true, force: true });
 });
@@ -192,11 +192,11 @@ test("a team run is flagged once when it becomes blocked, never for a run alread
   ];
   const source = { statuses: () => teams };
   const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["needs-you", "team-blocked", "team-started"], intervalMs: 100000, machineId: "m1" }, source);
-  await notifier.tick();                 // baseline: the run blocked before startup is not flagged
+  await notifier.tick();
   assert.equal(sent.length, 0);
   teams[1].status = "blocked"; teams[1].reason = "An agent showed no activity twice on the same assignment."; teams[1].resumable = true;
   await notifier.tick();
-  await notifier.tick();                 // still blocked: no second push
+  await notifier.tick();
   assert.equal(sent.length, 1);
   teams[2].status = "blocked"; teams[2].reason = "Needs a decision.";
   await notifier.tick();
@@ -234,7 +234,7 @@ test("goal and team lifecycle events fire once per category transition with prio
   const teams = [{ id: "21111111-1111-4111-8111-111111111111", title: "Build feature", status: "implementing", reason: undefined as string | undefined, resumable: false, goal: false }];
   const events = ["goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled"];
   const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events, intervalMs: 100000 }, { statuses: () => teams }, { statuses: () => goals });
-  await notifier.tick(); // Items already present are primed silently.
+  await notifier.tick();
   assert.equal(sent.length, 0);
 
   goals.push({ id: "31111111-1111-4111-8111-111111111111", title: "New goal", status: "running", reason: undefined });
@@ -327,7 +327,6 @@ test("a record first seen already stuck or finished announces that status too", 
   const goals: { id: string; title: string; status: string }[] = [];
   const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["team-started", "team-stuck", "goal-finished"], intervalMs: 100000 }, { statuses: () => teams }, { statuses: () => goals });
   await notifier.tick();
-  // A run can fail preparation, and a goal can finish, between two polls.
   teams.push({ id: "71111111-1111-4111-8111-111111111111", title: "Failed setup", status: "blocked", goal: false });
   goals.push({ id: "81111111-1111-4111-8111-111111111111", title: "Quick goal", status: "achieved" });
   await notifier.tick();
@@ -377,7 +376,6 @@ test("notifier holds a team member's prompt while its coordinator can decide and
   );
   try {
     await notifier.tick();
-    // The coordinator holds the prompt: no push while it reviews, none when it answers and the prompt closes.
     owners.set("m1", "coordinator");
     member.attention = att("needs-you", 1);
     await notifier.tick();
@@ -387,7 +385,6 @@ test("notifier holds a team member's prompt while its coordinator can decide and
     await notifier.tick();
     assert.equal(sent.length, 0, "an answered prompt never reaches the owner");
 
-    // The coordinator escalates: the owner hears about it exactly once.
     owners.set("m1", "coordinator");
     member.attention = att("needs-you", 2);
     await notifier.tick();
@@ -397,7 +394,6 @@ test("notifier holds a team member's prompt while its coordinator can decide and
     assert.equal(sent.length, 1);
     assert.equal(sent[0][0].body, "Codex needs your approval in implementer: retire-member");
 
-    // A run that never starts a review within the grace period hands the prompt to the owner.
     member.attention = att("needs-you", 3);
     owners.set("m1", "undecided");
     await notifier.tick();
@@ -405,7 +401,6 @@ test("notifier holds a team member's prompt while its coordinator can decide and
     await notifier.tick();
     assert.equal(sent.length, 2);
 
-    // A prompt without complete one-shot evidence, and any non-team session, push at once.
     member.attention = att("needs-you", 4);
     owners.set("m1", "user");
     solo.attention = att("needs-you", 9);
@@ -469,13 +464,11 @@ test("the permission agent's holder decides the push: an agent-held dialog never
   const notifier = new Notifier(
     { list: async () => [member] } as never, store, sender,
     { detail: "minimal", events: ["needs-you"], intervalMs: 100000, reviewGraceMs: 0, reviewHoldLimitMs: 100000 },
-    // A served run's own answer is "user": whatever the permission agent leaves is the owner's.
     { statuses: () => [], promptOwner: () => "user" }, undefined, undefined, undefined,
     { holder: (_sessionId, promptId) => { asked.push(promptId); return holder; } },
   );
   try {
     await notifier.tick();
-    // An allow, a reject or a stale request: the agent held it until it closed. Nobody is pushed.
     holder = "agent";
     member.attention = att("needs-you", 1);
     await notifier.tick();
@@ -485,7 +478,6 @@ test("the permission agent's holder decides the push: an agent-held dialog never
     assert.equal(sent.length, 0, "a dialog the permission agent answered never reaches the owner");
     assert.ok(asked.includes(1), "the notifier asks the holder for the open dialog");
 
-    // A class rule, an owner verdict or an undeliverable request: the holder turns to the owner, who is pushed once.
     holder = "agent";
     member.attention = att("needs-you", 2);
     await notifier.tick();
@@ -494,7 +486,6 @@ test("the permission agent's holder decides the push: an agent-held dialog never
     await notifier.tick();
     assert.equal(sent.length, 1, "a dialog the permission agent leaves to the owner is pushed once");
 
-    // A dialog the scheduler has not handed off yet is held for the grace period only.
     holder = "undecided";
     member.attention = att("needs-you", 3);
     await notifier.tick();
@@ -511,7 +502,6 @@ test("a dialog the permission agent leaves to the owner for a class names the cl
   const sent: { title: string; body: string }[][] = [];
   const sender = async (messages: { title: string; body: string }[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
   const member = { id: "m1", title: "implementer: deploy", provider: "claude", status: "running", attention: att("working") };
-  // Prompt 1: a class rule or an owner verdict. 2: undeliverable, a host limit with no class. 3: a value that is not a host class.
   const classes: Record<number, string | undefined> = { 1: "production-or-staging", 2: undefined, 3: "The model's note: deploy now" };
   const notifier = new Notifier(
     { list: async () => [member] } as never, store, sender,
@@ -551,7 +541,7 @@ test("a held prompt survives a session missing from one listing and still reache
     await notifier.tick();
     member.attention = att("needs-you", 1);
     await notifier.tick();
-    sessions.length = 0;               // the listing briefly omits the session
+    sessions.length = 0;
     await notifier.tick();
     sessions.push(member);
     await notifier.tick();
@@ -629,7 +619,6 @@ test("a fuse push for a long project id has a short collapse id", async () => {
   store.add("controller", "ExponentPushToken[a]", "android");
   const sent: { collapseId: string }[][] = [];
   const sender = async (messages: never[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
-  // The configuration sets no length limit on a project id, and a push service limits the collapse id.
   const long = "p".repeat(200), other = `${"p".repeat(199)}q`;
   const pending = [long, other, "short"].map((projectId, index) => ({ tripId: `trip-${index}`, scope: "project" as const, projectId, label: "Fixture", cause: "launch-rate" as const, ownerClose: true, openedAt: "2026-11-13T10:00:00.000Z" }));
   const fuse = { interrupts: () => pending, markAnnounced: () => {} };
@@ -650,7 +639,6 @@ test("a fuse interrupt whose push failed is offered again", async () => {
   store.add("controller", "ExponentPushToken[b]", "android");
   let failing = true;
   let sends = 0;
-  // The sender resolves even when the push service refuses a message: each message gets its own ticket.
   const sender = async (messages: { to: string }[]) => { sends += 1; return messages.map(message => failing || message.to.endsWith("[b]") ? { status: "error" as const, message: "network" } : { status: "ok" as const, id: "x" }); };
   const pending = [
     { tripId: "trip-1", scope: "project" as const, projectId: "p", label: "Fixture", cause: "launch-rate" as const, ownerClose: true, openedAt: "2026-11-13T10:00:00.000Z" },
@@ -659,22 +647,18 @@ test("a fuse interrupt whose push failed is offered again", async () => {
   const marked: string[][] = [];
   const fuse = { interrupts: () => pending.filter(trip => !marked.flat().includes(trip.tripId)), markAnnounced: (ids: readonly string[]) => { marked.push([...ids]); } };
   const notifier = new Notifier({ list: async () => [] } as never, store, sender as never, { detail: "minimal", events: ["autonomy-interrupt"], intervalMs: 100000 }, undefined, undefined, undefined, fuse);
-  // The wait is measured on a clock that never steps back. The test holds that clock, so real time cannot move it.
   const clock = notifier as unknown as { monotonic: () => number };
   const started = 1_000_000;
   clock.monotonic = () => started;
   await notifier.tick();
   assert.equal(sends, 1);
   assert.deepEqual(marked, [], "no device received either trip, so neither is marked");
-  // The next attempt waits a minute, so an outage does not send on every tick.
   await notifier.tick();
   assert.equal(sends, 1);
-  // Just under a minute later nothing is sent yet.
   failing = false;
   clock.monotonic = () => started + 59_000;
   await notifier.tick();
   assert.equal(sends, 1);
-  // The minute has passed, and one device now receives its pushes. A trip that reached one device is announced.
   clock.monotonic = () => started + 61_000;
   await notifier.tick();
   assert.equal(sends, 2);
@@ -723,7 +707,6 @@ test("a headless call that waits names its class, and a call that could not wait
   const notifier = new Notifier({ list: async () => [session] } as never, store,
     async (messages) => { sent.push(messages as never); return messages.map(() => ({ status: "ok" as const, id: "x" })); },
     { detail: "minimal", events: ["needs-you"], intervalMs: 100000 });
-  // A notice present at startup was already announced.
   session.permissionChannel = { served: true, notice: { id: "n0", interruptClass: "credentials" } };
   await notifier.tick();
   session.attention = att("needs-you", 9);

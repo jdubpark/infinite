@@ -14,13 +14,6 @@ import type { TeamLineup, TeamRun } from "../packages/host/src/team-types.js";
 import { unseal } from "../packages/host/src/vault.js";
 import { startHost, waitFor, type Host } from "./helpers.js";
 
-/*
- * Reported numbers over the real host: the check runner, the team service and the goal service in one process, with
- * the goal fixture's agents through two cycles. The check is configured twice and prints its process id and a
- * sentinel name on stdout, a marker on stderr, and the setup prints one too. The test reads both sealed holders as a
- * positive control, then shows the sentinel name, as a JSON string, in no view, list, context file or event store.
- */
-
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 const lineup: TeamLineup = {
   coordinator: { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
@@ -30,7 +23,6 @@ const lineup: TeamLineup = {
   reviewer: { id: "reviewer", label: "Reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
 };
 const SENTINEL = "sentinel_q7x";
-/** How a stored name would appear in any JSON: as a whole string. The check's own output holds the name only inside a line. */
 const QUOTED = JSON.stringify(SENTINEL);
 const check = { command: process.execPath, args: ["check.mjs"] };
 const setup = { command: process.execPath, args: ["setup.mjs"] };
@@ -56,7 +48,6 @@ test("a goal's checks report numbers that reach only the curve route", { timeout
   writeFileSync(join(source, "setup.mjs"), 'console.log("infinite-metric from_setup 3");\n');
   git(source, "init", "--initial-branch=main"); git(source, "add", "features", "check.mjs", "setup.mjs");
   git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Metrics fixture");
-  // The coordinator's first plan waits for this release file; this test has nothing to do before it.
   writeFileSync(join(receipts, "release-first-plan"), "continue", { mode: 0o600 });
   let host: Host | undefined;
   try {
@@ -79,7 +70,6 @@ test("a goal's checks report numbers that reach only the curve route", { timeout
     assert.equal(goal.status, "ready-for-review", JSON.stringify(goal));
     assert.equal(goal.cycles.length, 2);
 
-    // Positive controls: both holders keep the numbers, beside `run` and `goal`.
     const key = readFileSync(api.config.keyFile), state = api.config.stateDir;
     const runHolder = (id: string) => unseal<RunHolder>(key, `team:${id}`, readFileSync(join(state, "teams", `${id}.sealed`), "utf8"));
     const goalHolder = unseal<GoalHolder>(key, `goal:${goal.id}`, readFileSync(join(state, "goals", `${goal.id}.sealed`), "utf8"));
@@ -118,7 +108,6 @@ test("a goal's checks report numbers that reach only the curve route", { timeout
     }
     assert.equal((await api.fetchApi(`/goals/${randomUUID()}/metrics`)).status, 404);
 
-    // The sentinel, as a stored name, is in no other read.
     const reads = ["/goals", `/goals/${goal.id}`, "/teams", "/teams?view=list", "/decision-queue", ...goal.cycles.map(cycle => `/teams/${cycle.teamId}`)];
     for (const path of reads) {
       const response = await api.fetchApi(path);
@@ -137,10 +126,8 @@ test("a goal's checks report numbers that reach only the curve route", { timeout
       assert.equal(text.includes(QUOTED), false, `${file} carries a reported number`);
       return { file, text, reviewer: members.some(member => member.role === "reviewer" && file.startsWith(member.cwd)) };
     });
-    // Positive control: a reviewer's context holds the check's output, with the line as the check printed it.
     assert.ok(texts.some(item => item.reviewer && item.text.includes(`infinite-metric ${SENTINEL} 10`)), "a reviewer context holds the printed line");
 
-    // The run events, decrypted: the store keeps their payloads in an encrypted column, so its file bytes prove nothing.
     await api.stopApi();
     const store = new EvidenceStore({ databasePath: evidenceDatabasePath(state), vaultKey: key });
     try {

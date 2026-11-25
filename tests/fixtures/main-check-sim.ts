@@ -7,43 +7,8 @@ import type { Config, Project } from "../../packages/host/src/types.js";
 import { bump, type Counts, type Rand, rand } from "../outcome-sim-script.js";
 import { clearFaults, Clock, guard, hex, type Life, type Nature, World, type WorldHooks } from "./main-check-world.js";
 
-/*
- * A seeded simulator of the main check (INF-388). Each seed builds a host with two GitHub projects and scripts mirror
- * fetches against a real MainCheckService whose ports are the world in main-check-world.ts: heads that move, revert
- * (A, B, A), oscillate and repeat; fetches that arrive late or twice; halts during a check; host load, storage, the
- * execution identity, a census that fails, finds processes or is clean, and a removal that fails; the checks changing
- * at the same head; the setting turned off and on; notices whose acceptances arrive at once, late, out of order or
- * never; a host stop right after any kind of record write (armed by count or by kind), a clean restart, a boot, an
- * unreadable record and its restore. Then a drain clears every fault, ends what never ends, accepts every notice, and
- * waits for the host to come to rest. Time is virtual, so a seed replays exactly.
- *
- * Invariants, checked at every record write, removal and notice, after every step, and at the end of the drain:
- * I1 No admission while a main check runs or any directory is unretired, on the whole host (an unreadable record
- *    counts, since it may hide one). An unreadable record is never written.
- * I2 A head that has a result with the current checks digest is never admitted again.
- * I3 A head has at most 3 charged admissions per checks digest, and the record's attempts are exactly the charged
- *    admissions the writes made; after the drain the observed head has a result or 3 charged admissions.
- * I4 A directory is removed only after a census of its current witness that finished and found nothing, never for a
- *    recording entry of the same boot left by an earlier host process, and never while a process of its run lives;
- *    after the drain every run directory is removed.
- * I5 `told` changes only on an acceptance, to what was accepted and never back; after the drain, where health is
- *    present, it equals health's outcome.
- * I6 A notice is offered only while it is due: a failure nobody was told about, then fixed, offers nothing further.
- * I7 `health` is the result of the most recently observed head that has a result with the current digest, and
- *    `notice` went up exactly when its outcome changed.
- * I8 Under a halt nothing is admitted; a check that runs into a halt ends interrupted once a halt poll passed (unless
- *    an earlier stop or an unconfirmed stop decided its ending), and ends within a poll and the stop bound. A check
- *    whose halt was surely read before its time limit or a host stop could stop it ends interrupted/halt, or
- *    error/stop-unconfirmed when its command did not confirm the stop.
- * I9 A result is recorded only for a check whose copy was at the head and clean after every command.
- * I10 Every offered notice carries health as its summary, with the same outcome; nothing is offered while health is
- *    absent, also when the owner was last told of a failure and the checks changed.
- * Other labels name rules the simulator also checks: R1, R2, R4, R5, R6, R8, R9 and close.
- */
-
 export class Violation extends Error {}
 export const RERUN = (seed: number) => `MAIN_CHECK_SIM_SEED=${seed} node --import tsx --test tests/main-check-sim.test.ts`;
-/** `patch` replaces something on one service instance; no source file is edited. */
 export type Variant = { patch?: (service: MainCheckService) => void };
 
 const ROOT = "/srv/main-check-sim";
@@ -55,7 +20,6 @@ type ProjectId = typeof PROJECTS[number];
 const HEADS = 4;
 const MINUTES = 1;
 const STOP_BOUND_MS = 10_000;
-/** A halt poll runs every 2 seconds; a final result after this much of a halt missed one. */
 const HALT_WINDOW_MS = 2_050;
 const DRAIN_ROUNDS = 240;
 const DRAIN_ROUND_MS = 15_000;
@@ -63,7 +27,6 @@ const STEPS_PER_SEED = 70;
 const SUDO = { command: "/usr/bin/sudo", args: ["-n", "-u", "agent", "--", "/opt/infinite/launcher"] };
 const npm = (...args: string[]): TeamCommand => ({ command: "npm", args });
 const make = (...args: string[]): TeamCommand => ({ command: "make", args });
-/** The setup and checks each project can be configured with; a change step moves between them. */
 const VARIANTS: Record<ProjectId, readonly { setup?: TeamCommand; checks: TeamCommand[] }[]> = {
   alpha: [
     { setup: npm("ci"), checks: [npm("run", "lint"), npm("test")] },
@@ -75,8 +38,6 @@ const VARIANTS: Record<ProjectId, readonly { setup?: TeamCommand; checks: TeamCo
     { setup: make("deps"), checks: [make("check"), make("test")] },
   ],
 };
-
-// ---- Script ------------------------------------------------------------------------------------------------------
 
 type Move = "next" | "revert" | "repeat" | "late" | "duplicate" | "foreign";
 type Step =
@@ -115,12 +76,10 @@ function nature(r: Rand): Nature {
 
 const PROJECT_PICK: readonly (readonly [number, ProjectId])[] = [[60, "alpha"], [40, "beta"]];
 
-/** Every random draw of the script happens here, before the host runs, so a seed names one script. */
 function script(seed: number): Script {
   const r = rand(seed);
   const natures = Object.fromEntries(PROJECTS.map(project => [project, Array.from({ length: HEADS }, () => VARIANTS[project].map(() => nature(r)))])) as Record<ProjectId, Nature[][]>;
   const steps: Step[] = [];
-  // Most halts, faults and settings that go off come back a few steps later, so heads keep being measured.
   const later: { at: number; step: Step }[] = [];
   const release = (index: number, step: Step) => {
     if (r.chance(0.7)) later.push({ at: index + r.int(1, 6), step });
@@ -167,8 +126,6 @@ function describe(step: Step): string {
   }
 }
 
-// ---- Host --------------------------------------------------------------------------------------------------------
-
 const flush = async () => {
   await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setImmediate(resolve));
@@ -181,7 +138,6 @@ const witnesses = (record: MainCheckRecord) => JSON.stringify([record.running?.w
 const WRITE_KINDS = ["create", "admission", "finish", "retire", "told", "observe", "witness", "waiting", "settle"] as const;
 type WriteKind = typeof WRITE_KINDS[number];
 
-/** What one record write did, so a stop can follow each kind and the corpus can show that it did. */
 function writeKind(prev: MainCheckRecord | undefined, next: MainCheckRecord): WriteKind {
   if (!prev) return "create";
   if (!prev.running && next.running) return "admission";
@@ -203,10 +159,6 @@ function projectOf(id: ProjectId, variant: number): Project {
   };
 }
 
-/**
- * The causes that can stop one check, with times. A halt could be read from `from` on and surely was by `by`, unless
- * it was lifted sooner (then `by` is absent). A time limit and a host stop happen at their time.
- */
 type Stops = { halt?: { from: number; by?: number }; limit?: number; hostStop?: number };
 
 class Sim {
@@ -226,7 +178,6 @@ class Sim {
   private inStart = false;
   private accepting?: { projectId: string; notice: number; outcome: "passed" | "failed" };
   private pendingObservation?: { projectId: string; head: string; at: string };
-  // The model: what the writes so far establish.
   private readonly log = new Map<string, { head: string; at: string }[]>();
   private readonly charged = new Map<string, number>();
   private readonly measured = new Set<string>();
@@ -234,7 +185,6 @@ class Sim {
   private earlier = new Set<string>();
   private readonly censuses = new Map<string, { life: number; clean: boolean; witness: string }>();
   private readonly haltSince = new Map<string, number>();
-  /** I8: by run directory, for each check of this process, what could stop it and when. */
   private readonly stops = new Map<string, Stops>();
   private readonly flights = new Map<string, { notice: number; until: number }>();
   private pending: MainCheckNotice[] = [];
@@ -265,7 +215,6 @@ class Sim {
     throw new Violation(`seed ${this.seed} ${this.where}: ${invariant}: ${message}; rerun: ${RERUN(this.seed)}`);
   }
 
-  /** A check that throws inside a port is kept and raised at the step: the service swallows what its ports throw. */
   private guarded(check: () => void) {
     try { check(); } catch (error) { this.failure ??= error; }
   }
@@ -287,7 +236,6 @@ class Sim {
     return team.checks.length + (team.setup ? 1 : 0);
   }
 
-  /** The record on disk; for an unreadable one, the record it was before. */
   private durable(id: string): MainCheckRecord | undefined {
     const text = this.corrupt.get(id) ?? this.world.records.get(id);
     return text === undefined ? undefined : JSON.parse(text) as MainCheckRecord;
@@ -306,7 +254,6 @@ class Sim {
         this.world.records.set(projectId, JSON.stringify(record));
         this.writes += 1;
         bump(this.counts, `write:${kind}`);
-        // A stop armed by kind waits for that kind and outlives stops armed by count.
         if (this.stopKinds.delete(kind)) bump(this.counts, "stop:by-kind");
         else if (this.stopAt > 0 && this.writes >= this.stopAt) this.stopAt = 0;
         else return;
@@ -335,8 +282,6 @@ class Sim {
       otherHead: (projectId, head) => this.heads[projectId as ProjectId].find(item => item !== head)!,
     };
   }
-
-  // ---- Checks at each write, census, removal and offer -----------------------------------------------------------
 
   private checkWrite(projectId: string, next: MainCheckRecord) {
     if (this.corrupt.has(projectId)) this.fail("I1", `the unreadable record of ${projectId} was written over`);
@@ -372,18 +317,15 @@ class Sim {
     bump(this.counts, `admission:${projectId}`);
   }
 
-  /** The stop causes of a check this process admitted. */
   private stopsOf(path: string): Stops | undefined {
     return this.admitted.get(path)?.life === this.life.id ? this.stops.get(path) : undefined;
   }
 
-  /** The running check of `id`, when this process admitted it. */
   private runningHere(id: string): string | undefined {
     const running = this.durable(id)?.running;
     return running && this.stopsOf(pathOf(running)) ? pathOf(running) : undefined;
   }
 
-  /** After the halts changed: a halt that lasts a poll and its slack is surely read; one lifted sooner may not be. */
   private noteHalts() {
     for (const id of PROJECTS) {
       const path = this.runningHere(id);
@@ -399,10 +341,6 @@ class Sim {
     }
   }
 
-  /**
-   * I8: the halt came first. Either it was surely read before the check ended and before any other cause, or the
-   * check was stopped and nothing but the halt was there to stop it.
-   */
   private haltFirst(stops: Stops | undefined, stopped: boolean): boolean {
     const halt = stops?.halt;
     if (!halt) return false;
@@ -418,7 +356,6 @@ class Sim {
     const last = next.last;
     if (!entry || !last || last.head !== running.head) this.fail("R6", "a check left `running` without its directory in `retiring` and its `last`");
     const key = `${projectId} ${running.head} ${running.checks}`;
-    // A check an earlier process admitted is ended by R8, at start or when its unreadable record reads again.
     if (this.admitted.get(pathOf(running))?.life !== this.life.id) {
       const kept = isDeepStrictEqual(entry.witness, running.witness) && entry.recording === running.recording;
       if (last.outcome !== "interrupted" || last.reason !== "host-stop" || !kept) this.fail("R8", `host start recorded ${last.outcome}/${last.reason} and ${kept ? "kept" : "changed"} the witness`);
@@ -426,8 +363,6 @@ class Sim {
       return;
     }
     bump(this.counts, `outcome:${last.outcome}${last.reason ? `:${last.reason}` : ""}`);
-    // Once a halt poll passed, the check was told to stop: it ends interrupted, unless an earlier stop or an
-    // unconfirmed stop decided its ending. When the halt surely came first, it ends interrupted by the halt.
     const since = this.haltSince.get(projectId);
     const ending = `${last.outcome}${last.reason ? `/${last.reason}` : ""}`;
     const unconfirmed = last.outcome === "error" && last.reason === "stop-unconfirmed";
@@ -465,7 +400,6 @@ class Sim {
     bump(this.counts, "told:changed");
   }
 
-  /** I7's model: the newest observation, in fetch order, whose head has a result with the current digest. */
   private expectedHealth(projectId: string, record: MainCheckRecord): CheckSummary | undefined {
     const digest = this.digestOf(projectId);
     const log = [...(this.log.get(projectId) ?? [])];
@@ -485,7 +419,6 @@ class Sim {
     const changed = outcomeOf(next.health) !== outcomeOf(prev?.health);
     if (delta !== (changed ? 1 : 0)) this.fail("I7", `notice moved by ${delta} while health went from ${show(prev?.health)} to ${show(next.health)}`);
     if (changed) bump(this.counts, `health:${outcomeOf(next.health)}`);
-    // I6's case: a failure the owner was never told about is fixed, so nothing is due.
     if (changed && next.health?.outcome === "passed" && outcomeOf(next.told) === "passed") bump(this.counts, "health:fixed-before-told");
   }
 
@@ -532,12 +465,10 @@ class Sim {
     if (notice.notice !== (record.notice ?? 0)) this.fail("R9", `notice ${notice.notice} is not health's generation ${record.notice ?? 0}`);
     if (mainCheckSetting(this.project(notice.projectId).team) === undefined) this.fail("R9", "a notice was offered with the setting off");
     bump(this.counts, `notice:offered:${notice.outcome}`);
-    // R9's only retry: a notice nobody answered is offered again once its minute in flight is over.
     if (flight?.notice === notice.notice) bump(this.counts, "notice:offered-again-after-flight");
     this.flights.set(notice.projectId, { notice: notice.notice, until: this.clock.now + 60_000 });
   }
 
-  /** I8: a check that runs into a halt ends within a poll and the stop bound. */
   private checkHaltEnds() {
     if (this.life.stopped) return;
     for (const id of PROJECTS) {
@@ -547,8 +478,6 @@ class Sim {
       if (this.admitted.get(pathOf(running))?.life === this.life.id) this.fail("I8", `the check of ${id} still runs ${this.clock.now - since} ms into a halt`);
     }
   }
-
-  // ---- Lives -----------------------------------------------------------------------------------------------------
 
   private async open() {
     const life: Life = { id: this.life.id + 1, stopped: false };
@@ -568,9 +497,7 @@ class Sim {
     this.raise();
   }
 
-  /** The host stopped right after a write: it stays down a while, may boot again, and opens over what is on disk. */
   private async recover() {
-    // The next process can stop too, after a write of its own start.
     while (this.life.stopped) {
       this.clock.drop(this.life);
       this.down = true;
@@ -611,8 +538,6 @@ class Sim {
     await flush();
     this.raise();
   }
-
-  // ---- Steps -----------------------------------------------------------------------------------------------------
 
   async run() {
     await this.open();
@@ -670,10 +595,8 @@ class Sim {
     if (move === "late") {
       head = this.runtime.pick(this.heads[id]);
       at = last - this.runtime.int(1, 20_000);
-      // Fetches of one mirror are serial, so two heads never share a stamp; settle could not order them.
       while ((this.log.get(id) ?? []).some(item => Date.parse(item.at) === at && item.head !== head)) at -= 1;
     }
-    // A duplicate repeats the last fetch; before any fetch it is a fresh one and takes a fresh stamp.
     const duplicate = move === "duplicate" && state.last !== undefined;
     if (duplicate) {
       head = state.last!.head;
@@ -721,7 +644,6 @@ class Sim {
     bump(this.counts, `gate:${gate}:${mode}`);
   }
 
-  /** A sudo provider profile without a team command prefix breaks R0. */
   private identity(fixed: boolean) {
     const teams = this.config.teams!;
     this.config.agents.claude = { command: "/usr/bin/sudo", args: ["-n", "-u", "agent", "--", "claude"] };
@@ -748,7 +670,6 @@ class Sim {
     bump(this.counts, `setting:${on ? "on" : "off"}`);
   }
 
-  /** `late` acceptances are labelled: out of order after a newer one of the project, stale after health moved on. */
   private accept(notice: MainCheckNotice, late: boolean) {
     const newest = this.acceptedUpTo.get(notice.projectId) ?? -1;
     const how = !late ? "at-once" : notice.notice < newest ? "out-of-order" : notice.notice < (this.durable(notice.projectId)?.notice ?? 0) ? "stale" : "late";
@@ -760,14 +681,9 @@ class Sim {
     bump(this.counts, `notice:accepted:${how}`);
   }
 
-  /**
-   * Offers, then answers: at once, later and possibly out of order, or never, as for a push that reached no device.
-   * `all` accepts everything.
-   */
   private notify(all: boolean) {
     const offered = this.service.notices();
     this.raise();
-    // I10's case: the owner was told of a failure, the checks changed, and no result has the new ones yet.
     for (const id of PROJECTS) {
       const record = this.durable(id);
       if (record?.told?.outcome === "failed" && !record.health && mainCheckSetting(this.project(id).team)) bump(this.counts, "notice:withheld:told-failed-health-absent");
@@ -777,13 +693,10 @@ class Sim {
       const roll = all ? 0 : this.runtime.next();
       if (roll < 0.45) {
         this.accept(notice, false);
-        // A second device's acceptance of the same notice may arrive much later.
         if (!all && this.runtime.chance(0.3)) this.pending.push(notice);
       } else if (roll < 0.7) this.pending.push(notice);
-      // No answer: the notice stays in flight and is offered again when its minute ends.
       else bump(this.counts, "notice:never");
     }
-    // Late acceptances arrive in any order: newest first half the time, otherwise shuffled.
     const late = this.runtime.chance(0.5) ? [...this.pending].sort((a, b) => b.notice - a.notice) : this.shuffle(this.pending);
     this.pending = [];
     for (const notice of late) {
@@ -807,7 +720,6 @@ class Sim {
     this.stopKinds.clear();
   }
 
-  /** close(), then a new process. An armed stop may still land on a write of the shutdown. */
   private async restart() {
     const life = this.life;
     for (const id of PROJECTS) {
@@ -818,7 +730,6 @@ class Sim {
     let done = false;
     void closing.then(() => { done = true; });
     for (let waited = 0; !done && !life.stopped && waited <= STOP_BOUND_MS + 5_000; waited += 250) await this.advance(250);
-    // The process ended on a write of its shutdown, as a stop: recovery opens the next one, now or after this step.
     if (life.stopped) {
       bump(this.counts, "restart:stopped-in-close");
       return;
@@ -837,9 +748,6 @@ class Sim {
     this.corrupt.clear();
   }
 
-  // ---- Drain -----------------------------------------------------------------------------------------------------
-
-  /** Entries only a boot can retire: recording, left by an earlier host process, of this boot. */
   private blockedUntilBoot() {
     return PROJECTS.some(id => this.durable(id)?.retiring?.some(entry => entry.recording && this.earlier.has(pathOf(entry)) && entry.witness.boot === this.world.boot));
   }
@@ -861,7 +769,6 @@ class Sim {
     return record.results?.some(item => item.head === head && item.checks === digest) || (this.charged.get(`${id} ${head} ${digest}`) ?? 0) >= 3;
   }
 
-  /** Clear gates, a quiet host, working removal and acceptances: the host must come to rest. */
   private async drain() {
     this.disarm();
     this.world.faults = clearFaults();
@@ -893,21 +800,18 @@ class Sim {
       if (record.retiring?.length) this.fail("I4", `${record.retiring.length} run directories of ${id} were not retired with a clean census and working removal`);
       const head = record.observed?.head;
       if (head && !this.settledHead(id, record, head)) this.fail("I3", `the observed head ${short(head)} of ${id} has neither a result nor 3 charged admissions after the drain`);
-      // I5's end condition holds where health is present; without a result under the current checks nothing is due.
       if (record.health && record.health.outcome !== outcomeOf(record.told)) this.fail("I5", `told is ${record.told?.outcome ?? "absent"} while health is ${show(record.health)} after every notice was accepted`);
       bump(this.counts, `end:${record.health ? record.health.outcome : "no-health"}`);
     }
     for (const run of this.world.runs.values()) if (run.exists) this.fail("I4", `the run directory ${run.path} is still on disk after the drain`);
   }
 
-  /** The seed is over: its process ends as a stop would end it. Nothing awaits virtual time that no longer moves. */
   end() {
     this.life.stopped = true;
     this.clock.drop(this.life);
   }
 }
 
-/** One seed: one host, one script, checked throughout. Throws a Violation that names its seed and step. */
 export async function simulate(seed: number, counts: Counts, variant: Variant = {}): Promise<void> {
   const s = script(seed);
   bump(counts, s.sudo ? "start:sudo" : "start:plain");

@@ -114,9 +114,9 @@ test("an already-running recording-error reviewer can be retired and replaced on
     assert.equal(second.status, 409, JSON.stringify(second.body));
     assert.equal(second.body.code, "member-retirement-unavailable");
   } finally {
-    for (const [path, mode] of modes) { try { chmodSync(path, mode); } catch { /* session cleanup may have removed it */ } }
-    for (const pid of [holdPid, descendantPid, discoveredPid, workerPid]) if (pid && alive(pid)) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
-    if (unrelated?.pid && alive(unrelated.pid)) { try { process.kill(unrelated.pid, "SIGKILL"); } catch { /* already gone */ } }
+    for (const [path, mode] of modes) { try { chmodSync(path, mode); } catch { } }
+    for (const pid of [holdPid, descendantPid, discoveredPid, workerPid]) if (pid && alive(pid)) { try { process.kill(pid, "SIGKILL"); } catch { } }
+    if (unrelated?.pid && alive(unrelated.pid)) { try { process.kill(unrelated.pid, "SIGKILL"); } catch { } }
     await f.close();
   }
 });

@@ -6,7 +6,6 @@ import type { ClaimInput, CrossingDigest, HostInput } from "../packages/host/src
 
 const { DIGEST_LIMIT_BYTES, OMITTED_MAX, crossingDigestSchema } = built;
 
-/** The builders for arguments a test means as valid: a refusal fails the test. `built.*` returns a refusal raw. */
 function must(digest: CrossingDigest | undefined): CrossingDigest {
   assert.ok(digest, "a builder refused a host-owned argument the test meant as valid");
   return digest;
@@ -25,7 +24,6 @@ const CLASSES = ["check", "stop", "refusal", "conflict"] as const;
 const LISTS = ["touched", "decisions", "failures", "forSiblings", "open"] as const;
 type ListName = (typeof LISTS)[number];
 
-/** Independent measure: the test never calls the module's own byte helper. */
 const measure = (digest: CrossingDigest) => Buffer.byteLength(JSON.stringify(digest), "utf8");
 
 function valid(digest: CrossingDigest): CrossingDigest {
@@ -38,7 +36,6 @@ function omittedOf(digest: CrossingDigest, list: ListName): number {
   return digest.omitted[list] ?? 0;
 }
 
-/** Every item given is either kept or counted in `omitted`. Holds when no two given items are duplicates. */
 function assertAccounting(result: CrossingDigest, sources: CrossingDigest[], extra: Partial<Record<ListName, number>> = {}) {
   for (const list of LISTS) {
     const given = sources.reduce((sum, digest) => sum + digest[list].length, 0) + (extra[list] ?? 0);
@@ -47,7 +44,6 @@ function assertAccounting(result: CrossingDigest, sources: CrossingDigest[], ext
   }
 }
 
-// Seeded generator: mulberry32 plus a per-run serial, so one seed always gives the same inputs.
 type Random = () => number;
 function prng(seed: number): Random {
   let state = seed >>> 0;
@@ -78,7 +74,6 @@ const HOSTILE_PATHS = [
   "a\u0085b.ts", "a\u009bb.ts", "a\u2028b.ts", "a\u202eb.ts", "a\u2066b.ts",
 ];
 
-/** A unique path, up to about 260 characters with multi-byte names. Adversarial runs may pick a hostile one. */
 function randomPath(gen: Gen): string {
   if (gen.adversarial && chance(gen, 0.3)) return pick(gen, HOSTILE_PATHS);
   const parts: string[] = [];
@@ -92,7 +87,6 @@ function randomPath(gen: Gen): string {
   return `${parts.join("/")}/f${tag(gen)}.ts`;
 }
 
-/** Text with a unique tag, up to `maxChars` characters. Adversarial runs add quotes, controls and duplicates. */
 function randomText(gen: Gen, maxChars: number): string {
   if (gen.adversarial && chance(gen, 0.2)) return pick(gen, DUPLICATE_TEXT);
   const pool = gen.adversarial ? [...TEXT_CHARS, ...HOSTILE_CHARS] : TEXT_CHARS;
@@ -133,13 +127,11 @@ function randomClaims(gen: Gen): ClaimInput {
   };
 }
 
-/** Counters near the cap, including values above it. Adversarial runs only. */
 function nearCap(gen: Gen, digest: CrossingDigest): CrossingDigest {
   const high = () => pick(gen, [OMITTED_MAX, OMITTED_MAX - int(gen, 0, 5), Number.MAX_SAFE_INTEGER]);
   return { ...digest, omitted: { touched: high(), decisions: high(), failures: high(), forSiblings: high(), open: high() } };
 }
 
-/** Values of the wrong runtime type or an invalid enum, for any field. `1e400` is taken as JSON parses it. */
 const HOSTILE: readonly (readonly [string, unknown])[] = [
   ["null", null], ["undefined", undefined], ["number", 7], ["boolean", true],
   ["nested object", { nested: { path: "src/x.ts", by: "receipt" } }],
@@ -150,10 +142,6 @@ const HOSTILE: readonly (readonly [string, unknown])[] = [
 ];
 const MALFORMED = HOSTILE.map(([, value]) => value);
 
-/**
- * Adversarial runs replace any node, the root included, with a malformed value. The result is typed as its input
- * on purpose: callers hand the builders parsed JSON whose static type is a promise nobody checked.
- */
 function mangle<T>(gen: Gen, value: T): T {
   const walk = (node: unknown): unknown => {
     if (chance(gen, 0.03)) return pick(gen, MALFORMED);
@@ -175,7 +163,6 @@ function claimCounts(claims: ClaimInput): Record<ListName, number> {
 }
 
 const long = (fill: string, count = 240) => fill.repeat(count);
-/** Distinct ASCII text of `total` bytes, so duplicate-folding does not shrink the fixture. */
 const numbered = (fill: string, index: number, total = 240) => `${index}${fill.repeat(total - String(index).length)}`;
 
 test("empty and host-built digests are schema-valid and bounded", () => {
@@ -423,12 +410,10 @@ test("sibling paths follow the same rule", () => {
   assert.deepEqual(digest.forSiblings, [{ note: "n", paths: ["app/[id]/x.ts"] }]);
 });
 
-/** Every character the path rule refuses beyond C0 and DEL: C1 controls, separators, direction controls. */
 const REFUSED_IN_PATHS = [
   "\u0080", "\u0085", "\u009b", "\u009f", "\u2028", "\u2029", "\u061c", "\u200e", "\u200f",
   "\u202a", "\u202b", "\u202c", "\u202d", "\u202e", "\u2066", "\u2067", "\u2068", "\u2069",
 ];
-/** Ordinary names, plus the neighbours of the refused ranges: NBSP, ZWJ inside an emoji, U+2027, U+202F. */
 const KEPT_PATHS = [
   "docs/café.md", "src/漢字.ts", "assets/🙂.png", "assets/\u{1F469}\u200d\u{1F4BB}.png", "a\u00a0b.ts", "a\u2027b.ts", "a\u202fb.ts",
 ];
@@ -481,7 +466,6 @@ function survivors(digest: CrossingDigest): Record<Stage, number> {
   };
 }
 
-/** A stage loses items only after every stage before it in the trim order has lost all of its items. */
 function assertTrimOrder(before: CrossingDigest, after: CrossingDigest) {
   const given = survivors(before);
   const kept = survivors(after);
@@ -613,7 +597,6 @@ test("random inputs with unique text and paths stay valid, bounded and fully acc
 
 test("adversarial inputs (duplicates, hostile text and paths, malformed types and enums, counters near the cap) stay valid and bounded", () => {
   const gen = generator(9304, true);
-  // A host-owned position may refuse a mangled argument. Whatever it returns must be valid; claims never refuse.
   const maybe = (digest: CrossingDigest | undefined) => (digest === undefined ? undefined : valid(digest));
   for (let run = 0; run < 300; run += 1) {
     const host = maybe(built.hostDigest(mangle(gen, randomHostInput(gen)))) ?? emptyDigest("partial");
@@ -645,12 +628,8 @@ test("the same inputs give byte-identical digests on every run", () => {
   assert.deepEqual(run(), run());
 });
 
-// Runtime totality. Callers pass parsed JSON, so no builder may throw on a value of any kind in any field. A
-// host-owned argument without a valid outcome is refused with undefined; the claims argument is never refused.
-
 type FieldPath = (string | number)[];
 
-/** The path to every node of `value`: the root, each property, and each array element. */
 function fieldPaths(value: unknown, prefix: FieldPath = []): FieldPath[] {
   const children: [string | number, unknown][] = Array.isArray(value)
     ? value.map((item, index) => [index, item])
@@ -658,7 +637,6 @@ function fieldPaths(value: unknown, prefix: FieldPath = []): FieldPath[] {
   return [prefix, ...children.flatMap(([key, item]) => fieldPaths(item, [...prefix, key]))];
 }
 
-/** A deep copy of `base` with the node at `path` replaced by `value`. */
 function replaceAt(base: unknown, path: FieldPath, value: unknown): unknown {
   if (path.length === 0) return value;
   const copy = structuredClone(base) as Record<string | number, unknown>;
@@ -692,12 +670,10 @@ const DIGEST_BASE: CrossingDigest = {
   omitted: { touched: 1, decisions: 2, failures: 3, forSiblings: 4, open: 5 },
 };
 
-/** Receipt rows in a canonical key order, so rows compare whatever order their keys were built in. */
 const receiptsOf = (digest: CrossingDigest) => [...digest.touched, ...digest.failures]
   .filter(row => row.by === "receipt")
   .map(row => JSON.stringify(row, Object.keys(row).sort()));
 
-/** [name, valid base argument, builder, whether the argument is host-owned]. */
 const BUILDERS: readonly [string, unknown, (input: unknown) => CrossingDigest | undefined, boolean][] = [
   ["emptyDigest", "partial", input => built.emptyDigest(input as CrossingDigest["outcome"]), true],
   ["hostDigest", HOST_BASE, input => built.hostDigest(input as HostInput), true],
@@ -720,7 +696,6 @@ test("hostile values in every field: a host-owned position refuses only a bad ar
         } catch (error) {
           assert.fail(`${where} threw: ${(error as Error).message}`);
         }
-        // No hostile value is a valid outcome. emptyDigest's argument is the outcome itself, its only path.
         if (hostOwned && (path.length === 0 || (path.length === 1 && path[0] === "outcome"))) {
           assert.equal(result, undefined, `${where} was not refused`);
           continue;
@@ -743,7 +718,6 @@ test("reproductions: a malformed row is dropped and counted, a malformed optiona
   assert.deepEqual(proto.touched, []);
   assert.equal(proto.omitted.touched, 1);
 
-  // A coerced ["kept"] would fold into "kept" uncounted. Dropped, it is counted.
   const open = valid(withClaims(empty, { open: [{}, "kept", 5, ["kept"]] } as unknown as ClaimInput));
   assert.deepEqual(open.open, ["kept"]);
   assert.equal(open.omitted.open, 3);
@@ -788,7 +762,6 @@ test("a host-owned argument with a missing, mistyped or unknown outcome is refus
     assert.equal(built.hostDigest({ ...forged, read: ["src/a.ts"] } as unknown as HostInput), undefined, `hostDigest ${label}`);
     assert.equal(built.fitDigest(digest), undefined, `fitDigest ${label}`);
     assert.equal(built.mergeDigest(complete, digest), undefined, `mergeDigest newer ${label}`);
-    // The older digest's outcome is never used, and it is still refused rather than ignored.
     assert.equal(built.mergeDigest(digest, complete), undefined, `mergeDigest older ${label}`);
     assert.equal(built.withClaims(digest, { open: ["q"] }), undefined, `withClaims digest ${label}`);
   }
@@ -828,10 +801,8 @@ test("reproductions: counters and containers of the wrong kind", () => {
   } as unknown as CrossingDigest));
   assert.deepEqual(odd.omitted, { touched: 0, decisions: OMITTED_MAX, failures: 0, forSiblings: 0, open: 0 });
 
-  // A list that is not an array reads as empty and counts nothing.
   const lists = valid(fitDigest({ ...emptyDigest("complete"), touched: "src/a.ts", open: { 0: "q" } } as unknown as CrossingDigest));
   assert.deepEqual([lists.touched, lists.open, lists.omitted], [[], [], zero]);
-  // A host-owned argument that is not an object is refused. A claims argument that is not an object reads as empty.
   for (const value of [null, undefined, 7, "partial", ["partial"]]) {
     const label = String(JSON.stringify(value));
     assert.equal(built.fitDigest(value as unknown as CrossingDigest), undefined, `fitDigest ${label}`);
@@ -855,7 +826,6 @@ test("a member-supplied by, class, outcome or omitted never raises authority in 
   } as unknown as ClaimInput));
   assert.equal(crafted.outcome, "partial");
   assert.deepEqual(crafted.omitted, receipt.omitted);
-  // Receipts precede claims within a list.
   assert.deepEqual(crafted.touched, [{ path: "src/r.ts", op: "read", by: "receipt" }, { path: "src/m.ts", op: "changed", by: "claim" }]);
   assert.deepEqual(crafted.failures, [
     { signal: "exit 1", class: "check", by: "receipt" },
@@ -864,7 +834,6 @@ test("a member-supplied by, class, outcome or omitted never raises authority in 
   assert.deepEqual(crafted.decisions, [{ what: "w", why: "y" }]);
   assert.deepEqual(crafted.forSiblings, [{ note: "n" }]);
   assert.equal(JSON.stringify(crafted).includes("MEMBER"), false);
-  // The digest argument is host-owned: without a valid outcome the call is refused, and none is borrowed from claims.
   const unknownOutcome = built.withClaims({ ...receipt, outcome: "sometimes" } as unknown as CrossingDigest, { outcome: "complete" } as unknown as ClaimInput);
   assert.equal(unknownOutcome, undefined);
 });

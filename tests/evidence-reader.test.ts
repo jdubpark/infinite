@@ -12,7 +12,6 @@ import { EvidenceError, type EvidenceModule } from "../packages/host/src/evidenc
 
 const readerModule = new URL("../packages/host/src/evidence/reader.ts", import.meta.url).href;
 
-/** A module `toy` at version 3 and read version 3, with one table and two committed rows. */
 const toy: EvidenceModule = {
   name: "toy",
   version: 3,
@@ -103,7 +102,6 @@ test("a reader refuses what it does not know", () => {
     } finally {
       open.close();
     }
-    // The module's version goes back, and a new reader reads again. So the next refusal is for the store's version alone.
     const restore = new DatabaseSync(f.path);
     restore.exec("UPDATE schema_modules SET read_version=3 WHERE name='toy'");
     restore.close();

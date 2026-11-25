@@ -20,7 +20,6 @@ import { exclusionOf, type Disposition, type Flag, type Level } from "../package
 
 const FROZEN = "2026-11-01T00:00:00.000Z";
 
-/** One outcome row. Every required field is filled; the overrides win. The exclusion follows the disposition. */
 function row(
   overrides: Partial<Omit<OutcomeRow, "payload">> & { payload?: Partial<OutcomePayload> } = {},
 ): OutcomeRow {
@@ -76,7 +75,6 @@ function row(
   };
 }
 
-/** A counted implementer attempt that stalled: every level is no. */
 function stalled(overrides: Partial<Omit<OutcomeRow, "payload">> & { payload?: Partial<OutcomePayload> } = {}): OutcomeRow {
   return row({ disposition: "stalled", integrated: 0, accepted: 0, firstPass: 0, held: 0, ...overrides });
 }
@@ -134,7 +132,6 @@ test("a query is refused in a fixed order", () => {
     "decision-without-profile",
   );
   assert.equal(refusal(() => checkCellQuery(query({ sources: [] }))), "no-sources");
-  // The source check comes first, so an empty source list in a decision with no profile reports no-sources.
   assert.equal(refusal(() => checkCellQuery(query({ use: "decision", sources: [], by: [] }))), "no-sources");
   assert.equal(refusal(() => checkCellQuery(query({ sources: ["legacy"], by: [] }))), "no refusal");
 });
@@ -257,7 +254,6 @@ test("keys never merge epochs, identities, or maps", () => {
   assert.deepEqual(pooled.key, {});
   assert.equal(pooled.attempts, 2);
 
-  // A missing effort adds no entry. OpenCode allows the variant `none`, which is its own identity and its own cell.
   assert.equal("effort" in cellKey(row({ effort: null }), ["profile"]), false);
   assert.equal(cellKey(row({ effort: "none" }), ["profile"]).effort, "none");
   const efforts = buildCells([row({ effort: null }), row({ effort: "none" })], query({ by: ["profile"] }));
@@ -395,7 +391,6 @@ test("a scan gap is reported", () => {
 });
 
 test("an unknown flag is ignored", () => {
-  // A later slice adds flags, and a newer host can write rows that an older one reads after a rollback.
   const cell = only(buildCells([row({ flags: ["gap", "future-flag"] as unknown as Flag[] })], query({ by: [] })));
   assert.equal(cell.flagged.gap, 1);
   assert.equal(Object.hasOwn(cell.flagged, "future-flag"), false);

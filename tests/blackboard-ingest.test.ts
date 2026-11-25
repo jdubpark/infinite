@@ -33,7 +33,6 @@ function open(f: Fixture, options: { key?: Buffer; busyTimeoutMs?: number } = {}
   });
 }
 
-/** Opens a fresh store and a Blackboard on it, then closes the store. */
 function withBoard(fn: (store: EvidenceStore, board: Blackboard) => void): void {
   const f = fixture();
   try {
@@ -57,7 +56,6 @@ function rowCount(store: EvidenceStore, runId?: string): number {
   });
 }
 
-/** The fixture run with the blackboard switch pinned and the entry tools on the three posting members. */
 function entryRun(): TeamRun {
   const run = hostEntryRun();
   run.blackboard = { tools: true };
@@ -73,7 +71,6 @@ function memberOf(run: TeamRun, memberId: string): TeamMember {
   return member;
 }
 
-/** A second member of the same role and task, with its own id and the entry tools. */
 function sibling(member: TeamMember): TeamMember {
   return { ...member, memberId: randomUUID(), entryTools: true };
 }
@@ -111,7 +108,6 @@ function handoff(summary: string, taskId: string): MemberEntryPost {
   });
 }
 
-/** A post record for `member`'s binding, unless the options name another binding. */
 function post(
   member: TeamMember,
   entry: MemberEntryPost,
@@ -129,7 +125,6 @@ function post(
   };
 }
 
-/** The stored (entry_id, state) pairs of the run, sorted by entry id, so list order does not matter. */
 function stateTable(board: Blackboard, runId: string): [string, string][] {
   return board.list(runId, { limit: 100 }).entries
     .map(entry => [entry.entryId, entry.state] as [string, string])
@@ -140,10 +135,8 @@ function sortPairs(pairs: [string, string][]): [string, string][] {
   return [...pairs].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 }
 
-/** The six orders of three items, as indexes. */
 const ORDERS: number[][] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
 
-/** Phase 2's version 1 statements, copied as they were shipped. */
 const VERSION_1_SCHEMA = [
   "CREATE TABLE entries ("
   + "seq INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -311,7 +304,6 @@ test("the run holds at most 400 member entries", () => {
   });
 });
 
-/** Inserts `count` sealed host report rows into the run, the rows a member count must not read as members. */
 function insertHostRows(store: EvidenceStore, runId: string, count: number): void {
   store.write(tx => {
     for (let index = 0; index < count; index += 1) {
@@ -350,7 +342,6 @@ test("handoffs keep the latest for each task in every order", () => {
     });
   }
 
-  // Three handoffs of one member in one call resolve the same way.
   const same = [0, 1, 2].map(index => post(implA, handoff(`same-${index}`, "a"), { at: at(index) }));
   withBoard((_store, board) => {
     assert.equal(board.ingest(run, implA, same, []).stored, 3);
@@ -383,7 +374,6 @@ test("a supersede chain resolves the same in every order", () => {
 
   withBoard((_store, board) => {
     assert.equal(board.ingest(run, implA, [a], []).stored, 1);
-    // Another member's contract of another task, and a finding of another kind, name A and leave it active.
     assert.equal(board.ingest(run, implB, [post(implB, contract("b-names-a", { supersedes: idA }))], []).stored, 1);
     assert.equal(board.ingest(run, implA, [post(implA, finding("finding-names-a", { supersedes: idA }))], []).stored, 1);
     assert.deepEqual(stateTable(board, run.id).find(([id]) => id === idA), [idA, "active"]);
@@ -470,11 +460,9 @@ test("withdraw hides nothing from the owner and changes state once", () => {
     assert.equal(got?.head.state, "withdrawn");
     assert.equal((got?.body as { change: string }).change, "withdraw-marker");
 
-    // The later post comes from the entry's own author, so the supersede rule would apply to an active entry.
     assert.equal(board.ingest(run, implA, [post(implA, contract("later", { supersedes: id }))], []).stored, 1);
     assert.equal(board.get(run.id, id)?.head.state, "withdrawn");
 
-    // A later handoff of the same task supersedes only an active handoff, so the withdrawn one stays withdrawn.
     const first = post(implA, handoff("withdrawn-handoff", "a"));
     const firstId = first.envelope.requestId;
     assert.equal(board.ingest(run, implA, [first], []).stored, 1);
@@ -485,7 +473,6 @@ test("withdraw hides nothing from the owner and changes state once", () => {
     assert.equal(board.get(run.id, firstId)?.head.state, "withdrawn");
     assert.equal(board.get(run.id, laterId)?.head.state, "active");
 
-    // A reader of the same task sees the later handoff, never the withdrawn one. The author's own posts are not listed to it.
     const reader = sibling(implA);
     assert.equal(board.mirror(run), true);
     const launchSeq = board.launchMark(run.id);
@@ -511,7 +498,6 @@ test("withdraw hides nothing from the owner and changes state once", () => {
   }
 });
 
-/** The same post record at a journal seq. */
 function atSeq(record: MemberPostRecord, seq: number): MemberPostRecord {
   return { ...record, seq };
 }
@@ -520,7 +506,6 @@ test("the store reports which posts it holds", () => {
   withBoard((store, board) => {
     const run = entryRun();
     const implA = memberOf(run, hostEntryIds.implA);
-    // 399 member entries are stored, so the page's first new post takes the 400th place.
     const first = Array.from({ length: 200 }, (_, index) => post(implA, contract(`first-${index}`)));
     const second = Array.from({ length: 199 }, (_, index) => post(implA, contract(`second-${index}`)));
     assert.equal(board.ingest(run, implA, first, []).stored, 200);
@@ -536,7 +521,6 @@ test("the store reports which posts it holds", () => {
     );
   });
 
-  // An unready store keeps nothing.
   const f = fixture();
   try {
     const store = open(f);

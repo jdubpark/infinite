@@ -5,11 +5,6 @@ import { metricObserver, recordObservations, reviewedObservationsOf, type CheckO
 import { commandDigest } from "../packages/host/src/objective-input.js";
 import type { TeamCheck, TeamCommand, TeamRun } from "../packages/host/src/team-types.js";
 
-/*
- * What a run keeps of the numbers its checks print, and the one read the goal makes of them
- * (packages/host/src/check-observations.ts). The real check runner is covered in tests/goal-metrics-host.test.ts.
- */
-
 const HEAD = "a".repeat(40), OTHER = "b".repeat(40), AT = "2026-11-23T08:00:00.000Z";
 const lint: TeamCommand = { command: "npm", args: ["run", "lint"] };
 const unit: TeamCommand = { command: "npm", args: ["test"] };
@@ -22,7 +17,6 @@ function holderOf(run: Partial<Run> = {}, checkHead: string | undefined = HEAD):
 function row(command: TeamCommand, status: TeamCheck["status"], fields: Partial<TeamCheck> = {}): TeamCheck {
   return { command, status, startedAt: AT, finishedAt: AT, exitCode: status === "passed" ? 0 : 1, output: "", revision: 1, round: 0, headCommit: HEAD, ...fields };
 }
-/** Appends the row as the check loop does, then finishes it with this stdout through the observer teams.ts uses. */
 function finish(holder: ObservationHolder, check: TeamCheck, stdout: string, stderr = "") {
   holder.run.checks.push(check);
   const observer = metricObserver();
@@ -31,7 +25,6 @@ function finish(holder: ObservationHolder, check: TeamCheck, stdout: string, std
   observer.record(holder, check);
 }
 const scanOf = (stdout: string) => { const scanner = new CheckMetricScanner(); scanner.push(Buffer.from(stdout), "stdout"); return scanner.finish(); };
-/** The stored field is `unknown` in the holder's type; these tests read what this version wrote. */
 const rows = (value: unknown) => (value ?? []) as CheckObservation[];
 const pairs = (items: unknown) => rows(items).map(item => [item.command === commandDigest(lint) ? "lint" : "unit", item.name, item.state, item.value ?? null]);
 
@@ -183,13 +176,11 @@ test("a record that throws leaves the holder as it was and never throws into the
   const holder = holderOf();
   finish(holder, row(lint, "passed"), "infinite-metric speed 1\n");
   const before = structuredClone(holder.checkObservations);
-  // A row this version did not write: its command has no command text, so the first-occurrence search throws.
   holder.run.checks.push({ ...row(unit, "failed"), command: null as unknown as TeamCommand });
   assert.doesNotThrow(() => finish(holder, row(unit, "passed"), "infinite-metric size 2\n"));
   assert.deepEqual(holder.checkObservations, before);
 });
 
-/** Values of a shape this version never writes, as a later release could leave them before a rollback. */
 const FOREIGN: readonly [string, unknown][] = [
   ["null", null], ["{}", {}], ["[null]", [null]], ["{ v: 2 }", { v: 2 }],
   ["a row with a key this version does not write", [{ command: commandDigest(lint), name: "speed", revision: 1, round: 0, head: HEAD, at: AT, state: "value", value: 1, unit: "ms" }]],

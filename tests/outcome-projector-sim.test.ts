@@ -16,54 +16,6 @@ import { OUTCOME_KINDS, outcomeModule, readSummary, runOutcomes } from "../packa
 import { runEventKey } from "../packages/host/src/run-events.js";
 import { bump, type Counts, type Rand, rand, RunScript } from "./outcome-sim-script.js";
 
-/*
- * A seeded fault simulator for the outcome ledger projector (INF-309). Each seed scripts three team runs the way
- * TeamService emits their events (tests/outcome-sim-script.ts states each order it keeps or breaks), delivers them to
- * the real evidence store, outbox and projectors on temporary SQLite files under faults, and checks the invariants
- * below after every delivery, from the stored state alone. A failure names its seed and step. Line numbers in this
- * header are those of the sources as they stood when the simulator was written.
- *
- * What it checks, and what it does not: scheduling and stored-state consistency under restarts, replays, rollbacks,
- * gaps and the emitter's orders. It does not check that a handler applies the right rule. P1's reference store runs
- * every handler it compares against; P5 and P6 recount with production's helpers or a copy of their logic; P7 checks
- * gap propagation only where a gap is already recorded. Rule semantics stay with tests/outcome-projector.test.ts,
- * tests/outcome-rules.test.ts and tests/outcome-signals.test.ts. For example, an empty repair answer that leaves its
- * round "answered", or a repair answer that keeps another base's links pending, passes every invariant; an example
- * test in tests/outcome-projector.test.ts catches each (INF-316).
- *
- * Faults: a restart after the store took a flush and before any projection (close, then reopen the same path with the
- * same key and register everything again); the sealed outbox flushed again after that restart; a projector that throws
- * mid-page, so the page rolls back; dropped events followed by ledger.gap; one key delivered again with other data.
- *
- * Invariants, checked after every step:
- * P1 The tables equal those of a reference store that holds the same events at the same seqs and projected each one
- *    in seq order up to the live cursors, with no outbox, paging, restart or rollback. Both stores run the same
- *    projector, so this is a differential check of one projector under two schedules, not an independent model.
- * P2 Projecting an event again right after itself changes no table: "every write is a set or a recount, so a replayed
- *    page writes the same rows" (outcome-projector.ts:64). The reference projects every event twice in a row and
- *    compares. Replaying the whole log onto the final state is not promised: a replayed run.settled freezes a row that
- *    integrated after the settle.
- * P3 A row that was integrated or completed keeps that disposition (outcome-rules.ts:66-72). The scripts send a new
- *    member.stopped after an integration or a completion when a drain stops a consumed member again after its journal
- *    read threw (teams.ts:3292-3304). A drain can also emit a member's report again, under a key the store already
- *    holds, so the store keeps the first event (teams.ts:4850-4853; the repeated-key fault). P3 also fails when any
- *    handler rewrites a stored disposition; the precedence table itself stays with tests/outcome-rules.test.ts.
- * P4 Once frozenAt is set, frozenAt, acceptance and the last review never change: "a later steer or continuation ...
- *    changes no frozen row" (spec part 4, Freeze; outcome-projector.ts:329, 508-528).
- * P5 Each row's levels, exclusion, round counts and scan-gap flag equal levels(), rowExclusion(), roundCounts() and
- *    scanGap() over its stored disposition, acceptance, links and signals (outcome-signals.ts:133-164).
- * P6 A settled summary's attempts equal its run's rows counted by disposition (outcome-projector.ts:530, 547-559).
- *    While the run rests settled, with no run.revision-advanced and no event of a later revision after its last
- *    run.settled, its rounds equal its round states and links counted as roundTotals documents
- *    (outcome-projector.ts:424-428; recounted at 419 and 531).
- * P7 When a summary has gap, every row and member result of its run has gap; no gap flag is ever removed.
- * P8 last_seq <= the outcomes cursor <= the highest stored seq; the cursor never moves back, a page that throws keeps
- *    it, and the final drain projects every stored event (evidence/outbox.ts:210-275).
- */
-
-// OUTCOME_SIM_SEED=N runs that seed alone; OUTCOME_SIM_SEEDS=N runs N seeds from OUTCOME_SIM_BASE (default 1). The
-// count floors describe the default corpus, so they apply only to it; any other seed set prints its counts and checks
-// the invariants alone.
 const DEFAULT_SEEDS = 30;
 const ONLY = process.env.OUTCOME_SIM_SEED;
 const COUNT = Number(process.env.OUTCOME_SIM_SEEDS ?? DEFAULT_SEEDS);
@@ -76,7 +28,6 @@ const T0 = Date.parse("2026-11-13T10:00:00.000Z");
 const DELETED_AT = "2026-11-14T00:00:00.000Z";
 const OUTCOME_KIND_SET: ReadonlySet<string> = new Set(OUTCOME_KINDS);
 
-/** Each save flushes what the run's outbox holds: one to four events. */
 function batches(r: Rand, events: readonly OutboxEvent[]): OutboxEvent[][] {
   const out: OutboxEvent[][] = [];
   for (let at = 0; at < events.length;) {
@@ -87,7 +38,6 @@ function batches(r: Rand, events: readonly OutboxEvent[]): OutboxEvent[][] {
   return out;
 }
 
-/** The live host: a store at one path and key, both modules, an outbox, and both projectors, as `server.ts` wires them. */
 class Live {
   store!: EvidenceStore;
   outbox!: EventOutbox;
@@ -119,13 +69,11 @@ class Live {
     });
   }
 
-  /** The next projected events count from one; the `at`-th one throws, so its whole page rolls back. */
   arm(at: number): void {
     this.failAt = at;
     this.seen = 0;
   }
 
-  /** A process restart: close, then open the same path with the same key and register everything again. */
   restart(): void {
     this.store.close();
     this.open();
@@ -146,7 +94,6 @@ type Row = Record<string, unknown>;
 type Tables = Record<string, Row[]>;
 type Snapshot = { tables: Tables; cursor: number; lastSeq: number; maxSeq: number };
 
-/** Every table the two projectors write, in a stable order. Sealed payloads are compared opened. */
 const TABLES: readonly (readonly [table: string, order: string, sealedBy?: string])[] = [
   ["outcomes", "outcome_id", "outcome_id"],
   ["run_summaries", "run_id", "run_id"],
@@ -158,7 +105,6 @@ const TABLES: readonly (readonly [table: string, order: string, sealedBy?: strin
   ["configurations", "config_id"],
 ];
 
-/** The tables, or one run's rows of them. Both stores share the vault key, so their blind indexes compare equal. */
 function tablesOf(db: EvidenceDb, runId?: string): Tables {
   const tables: Tables = {};
   for (const [table, order, sealedBy] of TABLES) {
@@ -178,10 +124,6 @@ function storedEvents(read: (after: number) => { events: RunEvent[]; cursor: num
   }
 }
 
-/**
- * The reference for P1 and P2. It copies the live store's stored events with their seqs, and projects them in seq
- * order, calling the configurations projector and then the outcomes projector directly, never through an outbox.
- */
 class Reference {
   readonly store: EvidenceStore;
   private readonly config = configurationProjector();
@@ -201,7 +143,6 @@ class Reference {
     const fresh = storedEvents(after => live.events({ after, limit: 500 }), this.copied);
     this.store.write(tx => {
       for (const { seq, ...event } of fresh) {
-        // A repeated key's refused insert still uses up a seq in the live store (SQLite AUTOINCREMENT), so skip the same seqs.
         if (tx.run("UPDATE sqlite_sequence SET seq=? WHERE name='run_events'", seq - 1).changes === 0) {
           tx.run("INSERT INTO sqlite_sequence (name, seq) VALUES ('run_events', ?)", seq - 1);
         }
@@ -226,7 +167,6 @@ function fail(where: string, message: string): never {
   return assert.fail(`${where}: ${message}`);
 }
 
-/** assert.deepStrictEqual, with the seed, step and reproduce line in front of its diff. */
 function same(where: string, label: string, actual: unknown, expected: unknown): void {
   try {
     assert.deepStrictEqual(actual, expected);
@@ -239,10 +179,6 @@ function same(where: string, label: string, actual: unknown, expected: unknown):
 const flagsOf = (row: Row) => String(row.flags ?? "").split(",").filter(Boolean);
 const sortedCounts = (counts: object) => Object.entries(counts).filter(([, n]) => n !== 0).sort(([a], [b]) => (a < b ? -1 : 1));
 
-/**
- * A run's rounds as the roundTotals docstring defines them: attributed when a link is attributed; else unknown when
- * the round is not resolved or a link is pending or unknown; else unattributed (outcome-projector.ts:424-428).
- */
 function roundTotals(db: EvidenceDb, runId: string) {
   const totals = { total: 0, attributed: 0, unattributed: 0, unknown: 0 };
   for (const round of db.all<Row>("SELECT revision, round, state FROM outcome_rounds WHERE run_id=?", runId)) {
@@ -256,7 +192,6 @@ function roundTotals(db: EvidenceDb, runId: string) {
   return totals;
 }
 
-/** P1 to P8 over the live store after one step. Returns the snapshot the next step compares against. */
 function check(live: Live, reference: Reference, prev: Snapshot | undefined, where: string): Snapshot {
   const cursor = live.cursor("outcomes");
   reference.catchUp(live.store, live.cursor("configurations"), cursor, where);
@@ -310,7 +245,6 @@ function check(live: Live, reference: Reference, prev: Snapshot | undefined, whe
         const counted: Record<string, number> = {};
         for (const row of runRows) bump(counted, row.disposition);
         same(where, `P6: the settled summary of ${runId} counts attempts`, sortedCounts(stored.payload.attempts), sortedCounts(counted));
-        // A dropped run.revision-advanced leaves its revision's later events behind, so they count as an advance too.
         const settle = db.get<Row>("SELECT seq, revision FROM run_events WHERE run_id=? AND kind='run.settled' AND seq<=? ORDER BY seq DESC LIMIT 1", runId, cursor);
         const moved = settle && db.get<Row>("SELECT 1 AS found FROM run_events WHERE run_id=? AND seq>? AND seq<=? AND (revision>? OR kind='run.revision-advanced')",
           runId, Number(settle.seq), cursor, Number(settle.revision));
@@ -329,17 +263,14 @@ function check(live: Live, reference: Reference, prev: Snapshot | undefined, whe
   return now;
 }
 
-/** Delivers one save's events under one fault drawn for it. Returns the fault's name for the step's label. */
 function deliver(r: Rand, live: Live, batch: OutboxEvent[], rest: OutboxEvent[][], delivered: OutboxEvent[], counts: Counts): string {
   const draw = r.next();
   if (draw < 0.12) {
-    // The flush stored its events and the process ended before any projection ran.
     live.store.write(tx => { for (const event of batch) live.store.appendEvent(tx, event); });
     delivered.push(...batch);
     live.restart();
     bump(counts, "fault:restart");
     if (r.chance(0.5)) {
-      // The sealed record still holds the outbox, so the new process sends it again (teams.ts:668).
       live.flush(batch);
       bump(counts, "fault:sealed-outbox-again");
       return "restart, then the sealed outbox again";
@@ -365,7 +296,6 @@ function deliver(r: Rand, live: Live, batch: OutboxEvent[], rest: OutboxEvent[][
     return `the projector throws at matching event ${at} of its page`;
   }
   if (draw < 0.26) {
-    // Past the outbox cap the oldest waiting events are dropped; a stored flush is followed by ledger.gap (teams.ts:957-960, 1012-1018).
     const waiting = [...batch, ...rest.splice(0, r.int(0, 2)).flat()];
     const dropped = r.int(1, Math.max(1, waiting.length - 1));
     const kept = waiting.slice(dropped);
@@ -384,7 +314,6 @@ function deliver(r: Rand, live: Live, batch: OutboxEvent[], rest: OutboxEvent[][
   delivered.push(...batch);
   const reported = delivered.filter(event => event.kind === "member.reported");
   if (draw < 0.34 && reported.length > 0) {
-    // A drain can read a second report envelope of a member: its event repeats the stored key with other data (teams.ts:3298, 4852).
     const first = r.pick(reported);
     live.flush([{ ...first, at: new Date(Date.parse(first.at) + 500).toISOString(), data: { ...first.data, reportKind: "question" } }]);
     bump(counts, "fault:repeated-key");
@@ -430,14 +359,6 @@ function simulate(seed: number, counts: Counts): void {
   }
 }
 
-/**
- * Floors for the default corpus, so a generator that silently stops producing a case fails: every outcome event
- * kind, every fault and every reorder ran at least 10 times there, and each floor is about half of that count.
- * Held completions after a cancel's settle are floored together, as reorder:completion-after-settle, and the late
- * run.prepared also alone: a run cancels at most once, so the five held kinds share the cancels, and alone the repair
- * answer, the review and the scout completion ran under 10 times (7, 3 and 8). The diagnostic shows each kind.
- * block:member-stalled is a path, not a kind, fault or reorder: a second stall of one assignment ran 6 times.
- */
 const FLOORS: Readonly<Record<string, number>> = {
   "kind:run.created": 44, "kind:run.prepared": 43, "kind:member.started": 355, "kind:member.configured": 248,
   "kind:member.reported": 300, "kind:member.stopped": 117, "kind:task.integrated": 54, "kind:scout.completed": 35,
@@ -455,7 +376,6 @@ const FLOORS: Readonly<Record<string, number>> = {
 test("the outcome projector keeps its invariants under seeded faults", t => {
   const counts: Counts = {};
   const warn = console.warn;
-  // The store logs each injected failure once per store instance; the counts below report what ran.
   console.warn = () => undefined;
   const started = performance.now();
   try {
@@ -472,9 +392,6 @@ test("the outcome projector keeps its invariants under seeded faults", t => {
 });
 
 test("a repair answer with no commit after a cancel settle recounts the summary's rounds", () => {
-  // The smallest list without a gap, reduced from simulator seed 18 with EMPTY_REPAIR_AFTER_SETTLE on. Production emits
-  // this order when the integrator's operation finished before an owner cancel: the cancel saves run.settled, then the
-  // queued completion emits repair.integrated, with no commit when nothing changed (teams.ts:2279-2292, 2695-2704, 5575).
   const base = "b".repeat(40), head = "c".repeat(40);
   const event = (second: number, kind: string, parts: (string | number)[], ids: { memberId?: string; taskId?: string }, data: Row): OutboxEvent => ({
     key: runEventKey(kind, "run-d", parts), runId: "run-d", revision: 1, at: new Date(T0 + second * 1000).toISOString(), kind, ...ids, data: { v: 1, ...data },
@@ -491,8 +408,6 @@ test("a repair answer with no commit after a cancel settle recounts the summary'
       event(4, "run.settled", [1, "cancelled", "t"], {}, { status: "cancelled" }),
       event(5, "repair.integrated", [1, 1], { memberId: "g1" }, { round: 1, headCommit: head, baseCommit: base }),
     ]);
-    // Before INF-316 the summary kept { total: 1, attributed: 0, unattributed: 0, unknown: 1 } here; the round is resolved
-    // and its one link is clear, so the recount gives { total: 1, attributed: 0, unattributed: 1, unknown: 0 }.
     live.store.read(db => assert.deepEqual(readSummary(db, "run-d")!.payload.rounds, roundTotals(db, "run-d")));
   } finally {
     live?.store.close();

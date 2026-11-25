@@ -22,7 +22,6 @@ function setup(): { open: () => EvidenceStore; cleanup: () => void } {
   };
 }
 
-/** The version-2 module, built from the DDL that version 2 shipped. */
 function v2Module(): EvidenceModule {
   return {
     name: EVAL_MODULE,
@@ -65,7 +64,6 @@ function addGroup(tx: EvidenceTx, id: string, project: string, devOnly: number, 
   );
 }
 
-/** Every column that version 2 stored, in a fixed order. */
 function v2Snapshot(store: EvidenceStore): string {
   return JSON.stringify(store.read(db => ({
     tasks: db.all(`SELECT ${V2_TASK_COLUMNS} FROM eval_tasks ORDER BY task_id`),
@@ -91,7 +89,6 @@ test("the v3 migration draws every root once", () => {
         addTask(tx, ref, { id: `t${i}`, origin: "captured", state: "valid", group, payload: { projectId: PROJECT } });
         if (measured.has(i)) tx.run("INSERT INTO eval_trials (trial_id, task_id) VALUES (?, ?)", `trial-${i}`, `t${i}`);
       }
-      // A merged child row of a root is never itself a holdout row.
       tx.run("INSERT INTO eval_groups (group_id, kind, project_ref, root_id, created_at) VALUES ('run:child', 'run', ?, 'run:g0', ?)", ref, NOW);
     });
     const beforeV2 = v2Snapshot(store);

@@ -25,7 +25,6 @@ function openStore(f: Fixture, key: Buffer): EvidenceStore {
   return new EvidenceStore({ databasePath: evidenceDatabasePath(f.config.stateDir), vaultKey: key });
 }
 
-/** Every stored event of one run, read page by page. */
 function allEvents(store: EvidenceStore, runId: string): RunEvent[] {
   const events: RunEvent[] = [];
   let after = 0;
@@ -41,7 +40,6 @@ function eventsOfKind(store: EvidenceStore, runId: string, kind: string): RunEve
   return allEvents(store, runId).filter(event => event.kind === kind);
 }
 
-/** Scheduler internals that the tests drive directly. */
 type Internal = {
   save(stored: unknown): void;
   record(id: string): unknown;
@@ -209,7 +207,6 @@ test("run creation emits run.created", async () => {
   const f = schedulerFixture();
   const store = openStore(f, f.key);
   try {
-    // The fixture project has no checks; the team may establish its own, as a project without configured checks needs.
     Object.assign(f.config.projects[0]!, { team: { checks: [], establishChecks: true } });
     Object.assign(f.config.agents, { demo: { command: process.execPath, args: [] } });
     const teams = f.openTeam({ events: new EventOutbox(store) });
@@ -331,7 +328,6 @@ test("preparing a run records its base commit", async () => {
   const f = schedulerFixture();
   const store = openStore(f, f.key);
   try {
-    // The fixture project has no checks; the team may establish its own, as a project without configured checks needs.
     Object.assign(f.config.projects[0]!, { team: { checks: [], establishChecks: true } });
     Object.assign(f.config.agents, { demo: { command: process.execPath, args: [] } });
     const teams = f.openTeam({ events: new EventOutbox(store) });
@@ -457,7 +453,6 @@ test("a run behaves the same with an unavailable store as with no ledger", async
         record(view);
       };
       await step(() => teams.pause(f.run.id, { requestId: randomUUID(), revision }));
-      // The fixture has no real provider to stop its member, so the stop the scheduler would record is set here before the resume.
       const paused = internal(teams).record(f.run.id) as { run: { members: { status: string }[] }; halt?: string };
       paused.run.members.forEach(member => { member.status = "stopped"; });
       paused.halt = undefined;
@@ -487,10 +482,8 @@ for (const removal of ["owner", "retention"] as const) test(`${removal} deletion
     if (removal === "retention") f.config.teams!.retention = { ...DEFAULT_TEAM_RETENTION, cancelledMinutes: 0 };
     f.writeTeam();
     const teams = f.openTeam({ events: outbox });
-    // server.ts attaches the store this way; removeRun must then do the whole deletion itself.
     teams.useEvidence(store);
     await teams.cancel(f.run.id, { requestId: randomUUID(), revision: 1 });
-    // The process can exit between scheduler passes, while its recorded member is still running.
     f.state.status = "exited";
     const scheduler = internal(teams), stored = scheduler.record(f.run.id);
     if (removal === "owner")
@@ -510,7 +503,6 @@ for (const removal of ["owner", "retention"] as const) test(`${removal} deletion
   } finally { store.close(); f.close(); }
 });
 
-/** The project manager's record, read from the sealed store, with its report set for `consume`. */
 function reportFrom(teams: TeamService, runId: string, report: unknown) {
   const stored = internal(teams).record(runId) as { run: TeamRun; members?: never };
   const member = stored.run.members[0]!;
@@ -622,7 +614,6 @@ test("a refused plan records no plan", async () => {
     const { stored, member } = reportFrom(teams, f.run.id, { kind: "plan", summary: "Self dependent", tasks: [
       { id: "a", title: "Loop", instructions: "Depends on itself", paths: ["src/a.ts"], dependsOn: ["a"] },
     ] });
-    // `step` turns a refused report into a block; this drives the same path without the scheduler loop.
     try { internal(teams).consume(stored, member); }
     catch (error) { internal(teams).block(stored, error, member); }
     await teams.idle();
@@ -676,7 +667,6 @@ test("a launch records member.started once", async () => {
   } finally { store.close(); f.close(); }
 });
 
-/** Queues one implementer on the `spark-high` profile of task `a`, as the launch tests do. */
 function queueImplementer(f: Fixture) {
   const memberId = randomUUID(), sessionId = randomUUID();
   const queued = { ...f.run.members[0]!, memberId, sessionId, role: "implementer" as const, title: "Implementer: a", taskId: "a",
@@ -688,7 +678,6 @@ function queueImplementer(f: Fixture) {
   return memberId;
 }
 
-/** A command prefix that runs `git` unchanged unless the command is a guidance read (`diff-tree`), which `act` handles. */
 function guidancePrefix(act: string) {
   return `const [command, ...args] = process.argv.slice(2);
 if (command === "git" && args.includes("diff-tree")) { ${act} }
@@ -727,7 +716,6 @@ test("a goal run with a pinned record digest records the digest's prompt version
   const store = openStore(f, f.key);
   try {
     const memberId = queueImplementer(f);
-    // The goal context the host writes when the objective switch is on: the record digest rides along, c0 empty.
     f.run.goal = teamGoalContextSchema.parse({
       id: randomUUID(), revision: 1, cycle: 1, successCriteria: "Owner success text.", nonGoals: [], allowedPaths: ["."], evidence: [],
       previousWork: [], deadlineAt: "2100-01-01T00:00:00.000Z", maxMembers: 2,
@@ -761,8 +749,6 @@ test("a stalled guidance read does not delay the launch", async () => {
     f.writeTeam();
     const teams = f.openTeam({ events: new EventOutbox(store) });
     const scheduler = internal(teams);
-    // The step returns while the read still sleeps. A launch that awaited the read would return after it,
-    // with the configuration already stored, and the count below would be 1.
     await scheduler.step(scheduler.record(f.run.id));
     await waitFor(() => eventsOfKind(store, f.run.id, "member.started").length === 1, "member.started is stored");
     const live = scheduler.record(f.run.id) as { run: TeamRun };
@@ -806,12 +792,10 @@ test("a read that never ends leaves a bounded number in flight", async () => {
     const warn = console.warn;
     console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")); };
     try {
-      // Under a launcher the host cannot signal, a stalled read does not settle.
       for (let index = 0; index < 20; index++) scheduler.enrich(stored, () => { started += 1; return new Promise<undefined>(resolve => release.push(() => resolve(undefined))); });
       await new Promise(resolve => setTimeout(resolve, 50));
       assert.equal(started, 16, "the seventeenth read is not started");
       assert.equal(warnings.filter(line => line.includes("Ledger reads are waiting")).length <= 1, true, "the skip is said once at most");
-      // Once the reads end, their places are free again.
       for (const end of release) end();
       await new Promise(resolve => setTimeout(resolve, 50));
       scheduler.enrich(stored, () => { started += 1; return Promise.resolve(undefined); });
@@ -950,7 +934,6 @@ test("a permission coordinator emits no member event", async () => {
       report: { kind: "permission-decision", decisionId: randomUUID(), verdict: "escalate", summary: "Needs the owner" } });
     scheduler.readMemberJournal(stored, member);
     assert.equal(member.report?.kind, "permission-decision", "the coordinator's report was read");
-    // A save flushes the outbox, so a wrongly emitted member event would reach the store here.
     scheduler.save(stored);
     await teams.idle();
     assert.deepEqual(allEvents(store, f.run.id).filter(event => event.kind.startsWith("member.")), []);
@@ -1055,7 +1038,6 @@ test("a sibling block stops the other members as host stops", async () => {
     f.run.members = [reporter, sibling];
     f.writeTeam();
     const teams = f.openTeam({ events: new EventOutbox(store) });
-    // The fixture launches the sibling's session so the halt loop can stop it.
     await f.manager.createTeamSession({ requestId: sibling.sessionId, provider: "demo", title: sibling.title, prompt: "Write b" },
       { runId: f.run.id, memberId: sibling.memberId, revision: sibling.revision, role: "implementer", taskId: "b" } as never, f.run.workspace);
     f.report(reporter.sessionId, { requestId: randomUUID(), runId: f.run.id, memberId: reporter.memberId, revision: reporter.revision,
@@ -1104,8 +1086,6 @@ test("a stop barrier that reads the same member on every tick stores one stop", 
   const f = schedulerFixture();
   const store = openStore(f, f.key);
   try {
-    // The first member drains at revision 1 on every tick. The second is not stopped until its third stop attempt,
-    // so the barrier stays open for three ticks.
     const drained = f.run.members[0]!;
     const waiting = { ...drained, memberId: randomUUID(), sessionId: randomUUID(), role: "implementer" as const, title: "Implementer: b",
       taskId: "b", revision: 2, status: "running" as const, report: undefined };
@@ -1157,7 +1137,6 @@ test("a retired reviewer's stop is a host stop", async () => {
   } finally { store.close(); f.close(); }
 });
 
-/** A member's own clone at the run's base commit, prepared as a real attempt is. */
 async function memberClone(f: Fixture, memberId: string) {
   return prepareMemberWorkspace(f.run.workspace, memberId, f.run.baseCommit, f.config.teams?.commandPrefix);
 }
@@ -1260,7 +1239,6 @@ test("an escalation records both profiles and links the new member", async () =>
     f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "running", memberId }];
     const member = { ...f.run.members[0]!, memberId, role: "implementer" as const, taskId: "a", cwd, provider: "opencode" as const,
       modelProfile: profile, status: "reported" as const, report: { kind: "escalate" as const, reason: "Needs the stronger model", agentProfileId: escalation.id } };
-    // The escalating member is stopped by the time its replacement launches; the fixture's session must agree.
     member.status = "stopped" as typeof member.status;
     f.state.status = "exited";
     f.run.members = [member];
@@ -1322,7 +1300,6 @@ test("a limit switch records both profiles and links the new member", async () =
   } finally { store.close(); f.close(); }
 });
 
-/** A run with one integrated task and no active member, ready for a check. */
 function checkScene(f: Fixture, checks: { command: string; args: string[] }[]) {
   const memberId = randomUUID();
   f.config.projects[0]!.team = { checks };
@@ -1389,7 +1366,6 @@ test("a check that a pause interrupts is still recorded", async () => {
   } finally { store.close(); f.close(); }
 });
 
-/** Two integrated tasks by two implementers, and a reviewer member, at the verified base commit. */
 async function reviewScene(f: Fixture, report: Record<string, unknown>) {
   const implA = randomUUID(), implB = randomUUID(), reviewerId = randomUUID();
   f.run.lineup = structuredClone(mixedLineup);
@@ -1419,7 +1395,6 @@ test("a changes-requested review records its verdict", async () => {
     const scheduler = internal(teams);
     const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
     scheduler.consume(stored, reviewer);
-    // The repair this verdict starts keeps the operation pending, so the stored event is the signal.
     await waitFor(() => eventsOfKind(store, f.run.id, "review.recorded").length > 0, "the review is recorded");
     const [recorded] = eventsOfKind(store, f.run.id, "review.recorded");
     assert.ok(recorded, "review.recorded is stored");
@@ -1674,7 +1649,6 @@ test("a refused changed-path read marks the paths omitted", async () => {
   const f = schedulerFixture();
   const store = openStore(f, f.key);
   try {
-    // Refuses only the ledger's read: a name-only diff between two commits. Member capture diffs against a tree.
     const refusal = `const { spawnSync } = require("node:child_process");
 const [command, ...args] = process.argv.slice(2);
 const isCommit = value => value !== undefined && spawnSync("git", ["cat-file", "-t", value], { cwd: process.cwd(), encoding: "utf8" }).stdout.trim() === "commit";
@@ -1711,7 +1685,6 @@ test("a path read that ends after the next round starts keeps its own round", as
   const f = schedulerFixture();
   const store = openStore(f, f.key);
   try {
-    // Delays only the ledger's read: a name-only diff between two commits. Member capture diffs against a tree.
     const delay = `const { spawnSync } = require("node:child_process");
 const [command, ...args] = process.argv.slice(2);
 const isCommit = value => value !== undefined && spawnSync("git", ["cat-file", "-t", value], { cwd: process.cwd(), encoding: "utf8" }).stdout.trim() === "commit";
@@ -1734,7 +1707,6 @@ process.exit(result.status ?? 1);`;
     scheduler.consume(stored, member);
     await waitFor(() => eventsOfKind(store, f.run.id, "repair.integrated").length > 0 && !stored.pending, "the integration completes first");
     assert.equal(eventsOfKind(store, f.run.id, "repair.paths").length, 0, "the path read is still running");
-    // The next repair round starts while the read of round 1 is still running.
     stored.run.round = 2;
     await waitFor(() => eventsOfKind(store, f.run.id, "repair.paths").length > 0, "the paths are recorded");
     const [integrated] = eventsOfKind(store, f.run.id, "repair.integrated");

@@ -39,7 +39,6 @@ test("a configId covers all six components", () => {
   const base = configId(components());
   assert.match(base, HEX64);
   assert.equal(configId(components()), base);
-  // Key order of the input does not change the digest.
   const reordered = components();
   assert.equal(configId({ shape: reordered.shape, routing: reordered.routing, knowledge: reordered.knowledge, guidance: reordered.guidance, promptVersion: reordered.promptVersion, profile: { effort: "high", model: "vendor/model-a", provider: "opencode" } }), base);
   const changed = [
@@ -66,7 +65,6 @@ test("a profile id names one identity, none, or an ambiguous one", () => {
   const twin = { ...first, label: "Twin" } as TeamModelProfile;
   const other = { id: "shared", label: "Other", provider: "codex", model: "model-b", effort: "high" } as TeamModelProfile;
   assert.deepEqual(profileKeyOf([first, twin], "shared"), { provider: "claude", model: "model-a", effort: "high" });
-  // The lineup schema refuses this lineup. The lookup still fails closed if one ever reaches it.
   assert.equal(profileKeyOf([first, other], "shared"), "ambiguous");
   assert.equal(profileKeyOf([first], "missing"), undefined);
   assert.equal(profileKeyOf([], "shared"), undefined);
@@ -81,7 +79,6 @@ test("the prompt version is stable per role and provider", () => {
 });
 
 test("the report command is not part of the prompt version", () => {
-  // A provider without a report tool is told the reporter's path, which changes with every install directory.
   const profile = { id: "light", label: "Light", provider: "opencode", model: "vendor/model-a", variant: "high" } as unknown as TeamModelProfile;
   const rendered = renderedPrompts("implementer", "opencode", profile, true);
   assert.ok(rendered.length > 0);
@@ -95,7 +92,6 @@ test("the report command is not part of the prompt version", () => {
 test("the prompt version follows every profile field the prompt prints", () => {
   const worker = { id: "deep", label: "Deep worker", provider: "claude", model: "model-x", effort: "high" } as TeamModelProfile;
   const escalation = { ...worker, label: "Deep escalation" } as TeamModelProfile;
-  // The second profile is asked first: a cache keyed by less than the profile would give it the first one's version.
   const escalationVersion = promptVersion("implementer", "claude", escalation, true);
   const workerVersion = promptVersion("implementer", "claude", worker, true);
   assert.notEqual(workerVersion, escalationVersion);
@@ -111,7 +107,6 @@ test("the guidance parser keeps guidance entries only", () => {
     ["160000", "vendor/AGENTS.md", "O4"],
     ["100644", "src/MY-AGENTS.md", "O5"],
     ["120000", "a/CLAUDE.md", "O6"],
-    // Git quotes a path that holds a non-ASCII byte, so the output stays ASCII.
     ["100644", '"d\\303\\251/AGENTS.md"', "O8"],
   ];
   const line = (mode: string, path: string, object: string, status = "A") => `:000000 ${mode} ${"0".repeat(40)} ${object} ${status}\t${path}\n`;
@@ -226,7 +221,6 @@ test("a path with a non-ASCII character reads the same every time", async () => 
     writeFileSync(join(repo.dir, "d\u00e9", "AGENTS.md"), "nested guidance\n");
     repo.git(["add", "."]);
     repo.git(["commit", "-q", "-m", "non-ascii"]);
-    // Git prints the path in its quoted form, which is ASCII, so no output chunk can split a character.
     const quoted = repo.git(["-c", "core.quotePath=true", "ls-tree", "-r", "--name-only", "HEAD"]).split("\n").find(path => path.includes("AGENTS.md"))!;
     assert.match(quoted, /^"[\x20-\x7e]+\/AGENTS\.md"$/, "the path is quoted and ASCII");
     const object = repo.git(["ls-tree", "-r", "HEAD"]).split("\n").find(row => row.includes("AGENTS.md"))!.split(/\s+/)[2]!;
@@ -267,7 +261,6 @@ test("guidance is read from a commit", async () => {
   }
 });
 
-/** A command prefix that logs each command line to `log`, runs `act` for a guidance read, and then runs the command. */
 function loggingPrefix(log: string, act = "") {
   const script = `const { appendFileSync } = require("node:fs");
 const { spawnSync } = require("node:child_process");
@@ -311,7 +304,6 @@ test("a stalled read ends at the caller's deadline and leaves a bounded number b
     }
     const log = join(repo.dir, ".git", "commands.log");
     writeFileSync(log, "");
-    // The read sleeps and takes no signal from its callers, as a command that the host cannot stop.
     const stalled = loggingPrefix(log, "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2000);");
     const started = Date.now();
     const results = await Promise.all(commits.slice(0, 6).map(commit => {
@@ -321,12 +313,10 @@ test("a stalled read ends at the caller's deadline and leaves a bounded number b
     }));
     assert.ok(Date.now() - started < 1500, "every caller's wait ends at its own deadline");
     assert.deepEqual(results, [undefined, undefined, undefined, undefined, undefined, undefined]);
-    // Four reads were started, however slowly their processes came up. The fifth and sixth callers found no free place and started none.
     const startBy = Date.now() + 10_000;
     while (guidanceReads(log) < 4 && Date.now() < startBy) await new Promise(resolve => setTimeout(resolve, 20));
     await new Promise(resolve => setTimeout(resolve, 300));
     assert.equal(guidanceReads(log), 4);
-    // The stalled reads end, their places free up, and a new commit is read.
     await new Promise(resolve => setTimeout(resolve, 2600));
     const later = await readGuidanceDigest(repo.dir, commits[6]!, loggingPrefix(log), new AbortController().signal);
     assert.match(later ?? "", HEX64);
@@ -347,7 +337,6 @@ test("a caller with no free place waits for one", async () => {
     }
     const log = join(repo.dir, ".git", "commands.log");
     writeFileSync(log, "");
-    // Each read takes a moment, so the fifth and sixth callers find every place taken. They have time to wait.
     const slow = loggingPrefix(log, "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);");
     const signal = new AbortController().signal;
     const digests = await Promise.all(commits.map(commit => readGuidanceDigest(repo.dir, commit, slow, signal)));
@@ -410,16 +399,9 @@ test("entry tools change the prompt version only for entry roles", () => {
   }
 });
 
-// Moved from 1dfe7b9b: Codex members get the working rule for tools (INF-350), and the project manager and the
-// reviewer get one sentence each on every provider (INF-343). Without those two sentences the Claude and OpenCode
-// pin is 8075cde0, its value before both changes.
 const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
 const PIN_PROVIDERS = ["claude", "codex", "opencode"] as const;
-// INF-383 moved this pin to fc702f2f: the Codex working rule's signature sentences now name the callable form and the
-// nested result type, generated from the declared schemas, and the rule says what a failed call returns. No other
-// prompt version changed.
 const PIN_VERSIONS_SHA256 = "fc702f2f30c8f491371252dea4f30b12c493a0d4cb918619354a2b1d770e13d7";
-// INF-383 moved the Codex pin to 1690257f for the same working-rule change. The Claude and OpenCode pin is unchanged.
 const PIN_CODEX_VERSIONS_SHA256 = "1690257f5cd174cc239aa2dcfa555a1f6b9bb4d723344181744b6a92cbf424e5";
 const PIN_NON_CODEX_VERSIONS_SHA256 = "804d29fbd0d0bc826c7ef1cbcceff6b985ac61ed83b43996001ff4657418154c";
 
@@ -436,7 +418,6 @@ test("the switch off keeps every prompt version", () => {
 });
 
 test("the record digest changes the prompt version only for goal roles", () => {
-  // Every role prints the goal section, so the fixture's goal run changes for each role; the run without a goal does not.
   for (const role of PIN_ROLES) {
     const off = renderedPrompts(role, "claude", undefined, false);
     const on = renderedPrompts(role, "claude", undefined, false, false, true);
@@ -452,7 +433,6 @@ test("the intent checker's prompt version is its own", () => {
   assert.match(checker, HEX64);
   assert.equal(promptVersion("intent-checker", "claude", undefined, false), checker);
   assert.notEqual(checker, promptVersion("reviewer", "claude", undefined, false));
-  // Claude and Codex report through an MCP tool, so only a command provider prints the placeholder.
   const profile = { id: "light", label: "Light", provider: "opencode", model: "vendor/model-a", variant: "high" } as unknown as TeamModelProfile;
   const render = renderedPrompts("intent-checker", "opencode", profile, false);
   assert.ok(render[0].includes("<report-command>"));
@@ -460,14 +440,11 @@ test("the intent checker's prompt version is its own", () => {
 });
 
 test("the register changes the prompt version only where the prompt changes", () => {
-  // The implementer with entry tools: the flag, the register, and the register pinned autonomous give three versions.
   const flag = promptVersion("implementer", "claude", undefined, false, true, true);
   const register = promptVersion("implementer", "claude", undefined, false, true, "register");
   const autonomous = promptVersion("implementer", "claude", undefined, false, true, "register-autonomous");
   assert.equal(new Set([flag, register, autonomous]).size, 3);
-  // Without entry tools the propose sentence never renders, so the two register shapes give one version.
   assert.equal(promptVersion("implementer", "claude", undefined, false, false, "register"), promptVersion("implementer", "claude", undefined, false, false, "register-autonomous"));
-  // A project manager posts no findings, so it has one version under both register shapes.
   assert.equal(promptVersion("project-manager", "claude", undefined, false, true, "register"), promptVersion("project-manager", "claude", undefined, false, true, "register-autonomous"));
 });
 

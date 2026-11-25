@@ -27,7 +27,6 @@ async function fixture(apiOverrides: Partial<McpRequestApi> = {}) {
   const headers = { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" };
   const call = (body: unknown, extra: Record<string, string> = {}): Promise<Response> => {
     const payload = typeof body === "string" ? body : JSON.stringify(body);
-    // Node fetch controls Host itself; use the wire client when testing DNS rebinding.
     if (extra.host) return new Promise((resolve, reject) => {
       const wire = request(origin + "/mcp", { method: "POST", headers: { ...headers, ...extra } }, response => {
         const chunks: Buffer[] = [];
@@ -206,7 +205,6 @@ test("CLI releases both listeners on startup failure and graceful shutdown", { t
   const { createServer } = await import("node:net");
   const { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } = await import("node:fs");
   const { join, resolve } = await import("node:path");
-  // Host Unix sockets need a short root on macOS as well as Linux.
   const root = mkdtempSync("/tmp/inf-mcp-");
   const reserve = async () => {
     const socket = createServer();

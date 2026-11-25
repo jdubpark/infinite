@@ -20,9 +20,6 @@ import { EvalHost } from "../packages/host/src/eval-host.js";
 import type { CostLookup } from "../packages/host/src/outcome-cells.js";
 import { configRef, TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
 
-// The trial pump over small fakes: a real store and a real TrialJobs, a recording identity, and no member. The end-to-end
-// behaviour lives in eval-trial-run.test.ts.
-
 const PROJECT = "project-pump-1";
 const TASK = "captured:run-1:t01";
 const CLAUDE: TeamModelProfile = { id: "claude-strong", label: "Claude strong", provider: "claude", model: "claude-opus-5-5", effort: "high", tier: "strong" };
@@ -38,7 +35,6 @@ test.after(() => {
 
 type Probe = Parameters<EvalIdentity["probe"]>[0];
 
-/** The pump with no member and a source whose `status` has no mirror head, so no trial can start. Every call is logged. */
 function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: EvalProbe[]; sessionsRemoved?: string[]; forgetThrows?: boolean; replayIds?: string[];
   replayState?: (trialId: string) => Promise<unknown>; onStatus?: () => void; cost?: CostLookup; clock?: () => string; trialsNewer?: boolean; alive?: boolean;
   /** The mirror head the scripted source status reports; without it the project has no mirror yet. */
@@ -49,7 +45,6 @@ function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: E
   const databasePath = evidenceDatabasePath(join(root, "state"));
   const now = options.clock ?? (() => new Date().toISOString());
   if (options.trialsNewer) {
-    // A stored trials version one above the code's makes that module unavailable, as in evidence-store.test.ts.
     const first = new EvidenceStore({ databasePath, vaultKey });
     first.register(evalCorpusModule(first, now));
     const trials = evalTrialsModule(first, now);
@@ -139,7 +134,6 @@ function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: E
 }
 
 test("a source that cannot start does not make a hot loop", async () => {
-  // The project has no base branch, so the trial's context is never built.
   const r = rig();
   try {
     r.addJob();
@@ -173,7 +167,6 @@ test("a start-up with an unavailable identity runs again, and stops and cleans b
 test("the identity probe is keyed by project", async () => {
   const r = rig();
   try {
-    // The job is cancelled while a trial row lives, so the start-up probe names no project.
     const jobId = r.addJob();
     r.seed(jobId, 0, "running");
     r.store.write(tx => tx.run("UPDATE eval_jobs SET status = 'cancelled' WHERE job_id = ?", jobId));
@@ -220,7 +213,6 @@ test("a start-up that voided rows is retried until the account is clean", async 
 });
 
 test("a start-up whose stop leaves processes alive is tried again without an open job", async () => {
-  // What a restart finds after a trial left processes alive and blocked its job: no live row, no open job, and an account that is not clean.
   const r = rig({ alive: true });
   try {
     const stops = () => r.log.filter(entry => entry === "stop").length;
@@ -281,7 +273,6 @@ test("a baseline create answers evidence-unavailable while the trials module is 
   const vaultKey = randomBytes(32);
   const databasePath = evidenceDatabasePath(join(root, "state"));
   const now = () => new Date().toISOString();
-  // A stored trials version one above the code's makes that module unavailable, as in evidence-store.test.ts.
   const first = new EvidenceStore({ databasePath, vaultKey });
   const trials = evalTrialsModule(first, now);
   first.register({ ...trials, version: trials.version + 1, readVersion: trials.version + 1 });
@@ -317,7 +308,6 @@ test("start-up blocks the open job when the account's processes stay alive", asy
     assert.equal(job?.reason, "eval-processes-alive");
     const n = r.store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM eval_trials"))?.n;
     assert.equal(n, 0, "no trial row");
-    // The account is not clean, so the stop is tried again on each step (one a minute on a host) while the job stays blocked.
     const stops = r.log.filter(entry => entry === "stop").length;
     await r.pump.step();
     assert.ok(r.log.filter(entry => entry === "stop").length > stops, "the next step tries the stop again");
@@ -343,7 +333,6 @@ test("a sweep that meets a failed removal still removes the due sessions", async
       startTrial(tx, trialId, long);
       finishTrial(tx, trialId, { grade: VOID_GRADE, configId: null, profileEpoch: null, sessionId: "session-due", patchKeepDays: 90 }, long);
     });
-    // The run of the final trial remains, and forgetting it fails.
     await r.pump.sweep();
     assert.deepEqual(r.sessionsRemoved, ["session-due"], "the due session is removed in the same sweep");
     assert.ok(r.forgotten.includes(trialId), "the failing forget was attempted");

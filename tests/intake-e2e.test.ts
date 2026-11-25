@@ -16,13 +16,8 @@ const OWNER = "U00000000", AGENT = "U11111111";
 const BINDING: IntakeThread = { channelId: "C0000000000", threadTs: "1700000000.000100" };
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, stdio: "ignore" });
-/** A Slack message link whose thread timestamp names the binding's root, as Slack writes it. */
 const slackLink = (thread: IntakeThread) => `https://example.slack.com/archives/${thread.channelId}/p${thread.threadTs.replace(".", "")}`;
 
-/**
- * A real host through createApp, with Linear and (optionally) Slack fakes and two repository projects the mission
- * fixture agent can work in. Intake polls Linear every 30 seconds, so each issue is filed after the host starts.
- */
 async function intakeHost(withSlack: boolean, options: {
   direct?: boolean; answerQuestions?: boolean; requestChannelIds?: string[]; ownerOnlyInJoinedChannels?: boolean;
 } = {}) {
@@ -96,7 +91,6 @@ test("a Slack-filed answer-only issue is acknowledged and reported in its thread
       "Infinite agent report: a mission started on this issue. Questions and the result will follow.",
       "Infinite agent report: ready for review.",
     ]);
-    // Every chat.postMessage call the bot made went into the bound thread: the fake keeps all posts, and only this thread was seeded.
     const postCalls = slack!.calls.filter(call => call.method === "chat.postMessage").length;
     assert.equal(postCalls, texts().length, "Each post the bot sent landed in the bound thread");
   } finally {
@@ -108,9 +102,7 @@ test("a question reaches the thread and the owner's tagged reply answers it", { 
   const world = await intakeHost(true);
   const { host, linear, slack, receipts } = world;
   try {
-    // The fixture coordinator dispatches its subtasks once this file exists.
     writeFileSync(join(receipts, "release-dispatch"), "go", { mode: 0o600 });
-    // The request's two subtasks run in two repositories, so the intake group holds both.
     const group = await host.fetchApi("/project-groups", "owner", { requestId: randomUUID(), name: "Shop", repos: ["api", "web"] });
     assert.equal(group.status, 200, JSON.stringify(group.body));
     host.config.intake!.mission.groupId = group.body.id;
@@ -129,7 +121,6 @@ test("a question reaches the thread and the owner's tagged reply answers it", { 
     assert.equal(asked.body.status, "needs-input");
     assert.equal(asked.body.decisions.find((item: { answer?: string }) => !item.answer)?.options.join(","), "JSON,Text");
 
-    // The owner's tagged reply arrives on the Socket Mode connection, in the bound thread.
     await slack!.emit({ type: "app_mention", user: OWNER, channel: BINDING.channelId, ts: "1700000900.000100", thread_ts: BINDING.threadTs, text: `<@${slack!.botUserId}> JSON` });
 
     const answered = await waitFor(async () => (await host.fetchApi(`/missions/${missionId}`)).body,
@@ -139,14 +130,12 @@ test("a question reaches the thread and the owner's tagged reply answers it", { 
     assert.equal(answered.decisions.find((item: { answer?: string }) => item.answer === "JSON")?.recommendation?.outcome, "matched");
     assert.notEqual(answered.status, "ready-for-review");
 
-    // The record keeps the reply as handled; read from the sealed record, since the API does not expose inbound entries.
     const sealed = unseal<IntakeRecord>(readFileSync(world.host.config.keyFile), `intake-record:${issue.id}`,
       readFileSync(join(world.host.config.stateDir, "intake", "records", `${issue.id}.sealed`), "utf8"));
     const reply = sealed.inbound.find(entry => entry.text === "JSON");
     assert.ok(reply?.handledAt, "The owner's reply is recorded as handled");
     assert.equal(reply?.outcome, "answered");
 
-    // Nothing was posted outside the bound thread.
     const postCalls = slack!.calls.filter(call => call.method === "chat.postMessage").length;
     assert.equal(postCalls, texts().length, "Each post the bot sent landed in the bound thread");
   } finally {
@@ -211,7 +200,7 @@ test("a teammate proposes work and checks its progress while the owner runs the 
     const earlyAnswer = channelEvent(OWNER, "1700000900.000003", "Q1 Text", BINDING.threadTs);
     slack.seedThread(BINDING, [sponsorship, earlyAnswer]);
     await send(sponsorship);
-    await send(sponsorship); // A second event ID for the same Slack message.
+    await send(sponsorship);
     await waitFor(async () => messages(), list => list.some(text => text.startsWith("**Q1:")), 90_000);
     const dispatch = messages().find(text => /\b2 subtasks\b/i.test(text));
     assert.ok(dispatch, "The thread reports the first dispatch and its subtask count");
@@ -225,7 +214,6 @@ test("a teammate proposes work and checks its progress while the owner runs the 
     const mission = async () => (await host.fetchApi(`/missions/${records[0].missionId}`)).body;
     assert.equal((await mission()).origin.rule, "owner message in Slack request channel");
     assert.ok((await mission()).objective.includes(`other 1 | ${proposal}`));
-    // Slack delivered these after the question appeared. One predates sponsorship and the other predates the question.
     await send(channelEvent(OWNER, "1700000900.000000", "cancel", BINDING.threadTs));
     await send(earlyAnswer);
     await waitFor(async () => messages(), list => list.some(text => text.includes("new reply")), 10_000);
@@ -262,7 +250,7 @@ test("a teammate proposes work and checks its progress while the owner runs the 
     assert.equal(linear.allIssues().length, 1);
 
     const next = { ...channelEvent(OWNER, "1700000900.000040", `<@${slack.botUserId}> work: HOLD-SUBTEAM review the export`, BINDING.threadTs), type: "app_mention" };
-    await send({ ...next, type: "message" }); // Slack can also deliver the ordinary message copy of a mention.
+    await send({ ...next, type: "message" });
     await send(next);
     const requests = await waitFor(async () => (await host.fetchApi("/intake")).body.records, rows => rows.some((row: { identifier: string; missionId?: string }) => row.identifier === "TEST-2" && row.missionId), 30_000);
     const followUp = requests.find((row: { identifier: string }) => row.identifier === "TEST-2");

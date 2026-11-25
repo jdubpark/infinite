@@ -24,13 +24,8 @@ import { fixture as teamFixture } from "./team-fixture.js";
 
 const NOW = new Date().toISOString();
 const ASTRA = mixedLineup.implementers[1]!;
-// C14: an autonomous lineup is ready only with an evaluator of another family than the coordinator's.
 const READY_LINEUP: TeamLineup = { ...mixedLineup, evaluators: [{ id: "evaluator", label: "Evaluator", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" }] };
 
-/**
- * Serves the routes from an in-process app whose guard passes everyone, so the config function is the test's own.
- * A loaded config always has an agents map; the tests name it only where a Claude launch profile matters.
- */
 async function serve(store: EvidenceStore, config: Config): Promise<{ get: (path: string) => Promise<Response>; close: () => Promise<void> }> {
   const app = express();
   const pass: express.RequestHandler = (_req, _res, next) => next();
@@ -41,7 +36,6 @@ async function serve(store: EvidenceStore, config: Config): Promise<{ get: (path
   return { get: path => fetch(`http://127.0.0.1:${port}${path}`), close: () => new Promise<void>(resolve => server.close(() => resolve())) };
 }
 
-/** A counted astra implementer row of the default point, under a stored configuration. */
 function countedRow(id: string, configId: string): OutcomeRow {
   return { outcomeId: `${id}:m1`, source: "production", projectRef: "", taskRef: "", areaRef: "", runId: id, revision: 1, memberId: "m1", sessionId: null, attemptIndex: 1,
     inherited: false, role: "implementer", profileId: ASTRA.id, provider: "codex", model: ASTRA.model, effort: "xhigh", profileEpoch: 1, configId, experimentRef: null, kind: null,
@@ -50,7 +44,6 @@ function countedRow(id: string, configId: string): OutcomeRow {
     payload: { projectId: "rehearsal", taskId: "task-x", area: "other/", featureMap: "default", rounds: { run: 1, attributed: 1, unknown: 0 }, limitEvents: 0, costCoverage: "none" } };
 }
 
-/** One stored start decision of a run's task, written while the host's API is stopped. */
 function seedDecision(host: Host, runId: string, taskId: string, projectId = "rehearsal"): void {
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(host.config.stateDir), vaultKey: readFileSync(host.config.keyFile) });
   try {
@@ -83,7 +76,6 @@ test("routing reads answer every paired role on a real host", { timeout: 60000 }
   const host = await startHost();
   const runId = randomUUID();
   try {
-    // The API holds the evidence file open, so the decision is written while it is stopped, then the API starts again.
     await host.stopApi();
     seedDecision(host, runId, "task-one");
     await host.start();
@@ -92,7 +84,6 @@ test("routing reads answer every paired role on a real host", { timeout: 60000 }
       const project = await host.fetchApi("/routing/projects/rehearsal", role);
       assert.equal(project.status, 200, `project status for ${role}`);
       assert.equal(project.body.projectId, "rehearsal");
-      // Off without a saved policy in a supervised project; the history of shadow decisions still counts.
       assert.equal(project.body.mode, "off");
       assert.equal(project.body.shadow.decisions, 1);
       const explain = await host.fetchApi(`/teams/${runId}/routing/task-one`, role);
@@ -115,7 +106,6 @@ test("routing reads answer every paired role on a real host", { timeout: 60000 }
     const anonymous = await host.fetchApi("/routing/projects/rehearsal", null);
     assert.equal(anonymous.status, 401);
 
-    // The evidence directory replaced by a file: the store is unavailable and both routes answer 503.
     await host.stopApi();
     rmSync(join(host.config.stateDir, "evidence"), { recursive: true, force: true });
     writeFileSync(join(host.config.stateDir, "evidence"), "not a directory");
@@ -132,7 +122,6 @@ test("routing reads answer every paired role on a real host", { timeout: 60000 }
 });
 
 test("the routing command prints status and explain", { timeout: 90000 }, async () => {
-  // The project's saved policy makes its status shadow; a supervised project with no policy is off.
   const host = await startHost({ config: { projects: [{ id: "routed", name: "Routed", path: process.cwd(), team: { checks: [], establishChecks: true, routing: { mode: "shadow" } } }] } });
   const runId = randomUUID();
   const clientFile = join(host.root, "routing-client.json");
@@ -158,7 +147,6 @@ test("the status route reads the objective digest version only when owner criter
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: Buffer.alloc(32, 6) });
   try {
     store.register(configurationModule()); store.register(outcomeModule({ now: () => NOW })); store.register(routingModule());
-    // The route's flags: publishHeads on (no setting is false), entry tools off.
     store.write(tx => {
       tx.run("INSERT INTO configurations (config_id, provider, model, effort, prompt_version, guidance, knowledge, routing, shape, first_seen_at) VALUES ('record', 'codex', ?, 'xhigh', ?, 'g', 'k', 'off', 's', ?)",
         ASTRA.model, promptVersion("implementer", "codex", ASTRA, true, false, true), NOW);
@@ -174,7 +162,6 @@ test("the status route reads the objective digest version only when owner criter
       } finally { await served.close(); }
     }
 
-    // With the register and entry tools on, an autonomous project reads the version of the autonomous register shape.
     store.write(tx => {
       for (const [id, shape, count] of [["register", "register", 1], ["register-autonomous", "register-autonomous", 3]] as const) {
         tx.run("INSERT INTO configurations (config_id, provider, model, effort, prompt_version, guidance, knowledge, routing, shape, first_seen_at) VALUES (?, 'codex', ?, 'xhigh', ?, 'g', 'k', 'off', 's', ?)",
@@ -201,7 +188,6 @@ test("the status route reads a Claude candidate at the version of the mode a new
     store.register(configurationModule()); store.register(outcomeModule({ now: () => NOW })); store.register(routingModule());
     const claude = { id: "haiku-medium", label: "Claude implementer", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" } as const;
     const lineup: TeamLineup = { ...READY_LINEUP, implementers: [claude, ASTRA] };
-    // Two rows of a Claude member that started in Code Mode, under the route's flags: publishHeads on, entry tools off.
     store.write(tx => {
       tx.run("INSERT INTO configurations (config_id, provider, model, effort, prompt_version, guidance, knowledge, routing, shape, first_seen_at) VALUES ('program', 'claude', ?, 'medium', ?, 'g', 'k', 'off', 's', ?)",
         claude.model, promptVersion("implementer", "claude", claude, true, false, false, true), NOW);
@@ -239,7 +225,6 @@ test("the routes pass the saved policy, the lineup, and the flags a new run pins
     const run = { id: runId, revision: 1, projectId: "rehearsal", lineup: mixedLineup, routing: pinRouting(undefined, "autonomous", mixedLineup) } as unknown as TeamRun;
     const task = { id: "task-one", title: "t", instructions: "do it", paths: ["packages/host/src/a.ts"], dependsOn: [], revision: 1, status: "pending" } as unknown as TeamTask;
     new RoutingRecorder({ store, log: () => {} }).recordStart({ run, task, publishHeads: true, entryTools: false, featureMap: undefined, limited: new Set() });
-    // Two rows under the version a new run pins by default (entry tools off), one under entry tools on. publishHeads changes only the delivery prompt.
     store.write(tx => {
       for (const [id, entryTools] of [["plain", false], ["tools", true]] as const) {
         tx.run("INSERT INTO configurations (config_id, provider, model, effort, prompt_version, guidance, knowledge, routing, shape, first_seen_at) VALUES (?, 'codex', ?, 'xhigh', ?, 'g', 'k', 'off', 's', ?)",
@@ -272,7 +257,6 @@ test("the routing status previews the start mode", async () => {
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: Buffer.alloc(32, 7) });
   try {
     store.register(configurationModule()); store.register(outcomeModule({ now: () => NOW })); store.register(routingModule());
-    // mixedLineup has no evaluator of another family, so an autonomous project starts supervised and routing is off.
     const statusFor = async (autonomy: string) => {
       const served = await serve(store, { projects: [{ id: "rehearsal", autonomy, team: {} }], teams: { lineup: mixedLineup } } as unknown as Config);
       try { return await (await served.get("/api/routing/projects/rehearsal")).json() as RoutingStatus; } finally { await served.close(); }
@@ -298,7 +282,6 @@ test("pause, resume, and revoke answer the owner only", { timeout: 120000 }, asy
 
     const created = await host.fetchApi("/teams", "owner", run.create());
     const team = await run.settled(created.body.id);
-    // A run without an auto pin has nothing to revoke.
     const revoked = await host.fetchApi(`/teams/${team.id}/routing/revoke`, "owner", { requestId: randomUUID(), revision: team.revision });
     assert.deepEqual([revoked.status, revoked.body.code], [409, "routing-not-enabled"]);
 
@@ -311,9 +294,7 @@ test("pause, resume, and revoke answer the owner only", { timeout: 120000 }, asy
     assert.deepEqual([unknown.status, unknown.body.code], [404, "unknown-project"]);
     assert.equal((await host.fetchApi("/me", "owner")).body.teams.routingAuto, 1);
 
-    // The evidence directory replaced by a file: the pause answers 503.
     await host.stopApi();
-    // First, with the API stopped: the host registered the routing projector, which advanced over the settled run's events.
     const evidence = new EvidenceStore({ databasePath: evidenceDatabasePath(host.config.stateDir), vaultKey: readFileSync(host.config.keyFile) });
     try {
       assert.ok(evidence.read(db => db.get("SELECT name FROM projector_cursors WHERE name='routing'")), "the routing projector is registered");
@@ -339,7 +320,6 @@ test("the team revoke-routing command reaches the route", { timeout: 120000 }, a
   try {
     const created = await host.fetchApi("/teams", "owner", run.create());
     const team = await run.settled(created.body.id);
-    // A run without an auto pin has nothing to revoke. The CLI reports the route's 409 code, not its message.
     const cli = spawnSync(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile, "team", "revoke-routing", team.id], { encoding: "utf8" });
     assert.notEqual(cli.status, 0);
     assert.equal(cli.stderr.includes("Host returned HTTP 409 (routing-not-enabled)"), true, cli.stderr);

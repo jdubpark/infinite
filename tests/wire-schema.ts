@@ -1,10 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
 
-/**
- * A strict checker for the draft-7 subset that the team tools' `outputSchema`s use. It reads the whole schema before
- * it reads the value, and throws on any keyword, `type` name, or `format` it does not implement, so it never passes a
- * schema it did not check. No dependency: the repository's only JSON Schema validator belongs to another workspace.
- */
 const DRAFT_7 = "http://json-schema.org/draft-07/schema#";
 const KEYWORDS = new Set(["type", "properties", "required", "additionalProperties", "items", "enum", "const", "anyOf", "pattern", "format", "minimum", "maximum"]);
 const TYPES = new Set(["object", "array", "string", "integer", "number", "boolean", "null"]);
@@ -17,7 +12,6 @@ function unsupported(at: string, what: string): never {
   throw new Error(`wire-schema: ${what} at ${at} is not implemented by this checker`);
 }
 
-/** Throws unless every keyword in the schema tree is one this checker implements, with a value of the shape it reads. */
 function assertSupported(schema: unknown, at: string, root: boolean): asserts schema is Schema {
   if (!isObject(schema)) unsupported(at, "a non-object schema");
   for (const [keyword, value] of Object.entries(schema)) {
@@ -82,7 +76,6 @@ function refusals(schema: Schema, value: unknown, at: string): string[] {
   return found;
 }
 
-/** Every way `value` breaks `schema`, by path; empty when it conforms. Throws on a schema outside the subset. */
 export function schemaRefusals(schema: unknown, value: unknown): string[] {
   assertSupported(schema, "$", true);
   return refusals(schema, value, "$");

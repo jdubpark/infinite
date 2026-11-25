@@ -13,8 +13,6 @@ import { McpRequestService } from "../packages/host/src/mcp-requests.js";
 import { McpRequestError } from "../packages/host/src/mcp-types.js";
 import type { Config } from "../packages/host/src/types.js";
 
-// These tests protect sealed admission, scope revocation, and durable action receipts. A second in-memory
-// tracker, an unguarded queued create, or a fresh request ID on replay would each violate an observable assertion.
 async function setup(options: { afterLabel?: (config: Config) => void } = {}) {
   const linearServer = await startIntakeLinearServer();
   const h = scriptedMissionHarness({ configure(config) {
@@ -134,7 +132,6 @@ test("revocation and group changes hold queued execution, including after restar
     assert.equal(ctx.linearServer.allIssues().length, 0, "changed group prevents filing against different repositories");
     const changed = ctx.groups.get("shop");
     ctx.groups.update("shop", { requestId: randomUUID(), revision: changed.revision, repos: ["api", "web"] });
-    // With valid current scope, a restarted intake still needs its connector admission service.
     const bareLinear = new LinearService(ctx.h.config, randomBytes(32));
     const bare = new IntakeService(ctx.h.config, ctx.store, ctx.h.missions, new IntakeLinear(bareLinear), { log: () => {} });
     await bare.poll(); bare.close(); bareLinear.close();

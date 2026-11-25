@@ -10,7 +10,6 @@ import { fixture } from "./team-fixture.js";
 
 const THREAD = "019a1b2c-3d4e-7f80-9a1b-2c3d4e5f6a7b";
 
-/** One team Codex member, run by the scripted stand-in. Returns its journal and worker state. */
 async function runCodexMember(codexHooks: boolean, mode?: "later-turn") {
   const home = mkdtempSync(join(tmpdir(), "infinite-codex-home-"));
   const savedHome = process.env.HOME;
@@ -39,7 +38,6 @@ async function runCodexMember(codexHooks: boolean, mode?: "later-turn") {
     try {
       await host?.close();
     } finally {
-      // Restored even when closing the host fails, so a failure here cannot change HOME for a later test.
       if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
       rmSync(home, { recursive: true, force: true });
     }

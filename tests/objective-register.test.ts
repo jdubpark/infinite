@@ -15,7 +15,6 @@ const HEAD = "1".repeat(40);
 const DIGEST = commandDigest({ command: "npm", args: ["test"] });
 const CONTEXT: ReceiptContext = { runId: RUN, revision: 3, kind: "reviewed", at: AT };
 
-/** A record that passes the schema: one owner c0, one run entry at version 1, and the given assumptions. */
 function baseRecord(assumptions: Assumption[], entries = 1): ObjectiveRecord {
   const log: LogEntry[] = Array.from({ length: entries }, (_, index) => ({
     seq: index + 1, at: AT, version: 1, actor: "owner", authority: "direction", op: "record.created", target: RUN,
@@ -40,7 +39,6 @@ function assumption(id: string, status: Assumption["status"], extra: Partial<Ass
   };
 }
 
-/** A command receipt for assumption `id` at revision 3, the context's revision. */
 function receipt(id: string, outcome: ObjectiveReceipt["outcome"]): ObjectiveReceipt {
   const observed = outcome === "pass" ? "passed" : outcome === "fail" ? "failed" : "absent";
   return {
@@ -64,7 +62,6 @@ test("receipts set statuses only where the outcome differs", () => {
   ]);
   const applied = applyReceipts(base, [receipt("a1", "pass"), receipt("a2", "fail"), receipt("a3", "pass"), receipt("a4", "unknown")], CONTEXT);
 
-  // Changes: a1 becomes verified, and a2 becomes refuted with its new handle last in place of the revision-2 handle.
   assert.ok(applied, "two receipts change a status");
   assert.deepStrictEqual(applied.changed, ["a1", "a2"]);
   assert.deepStrictEqual(applied.refutedOutcome, ["a2"]);
@@ -72,11 +69,9 @@ test("receipts set statuses only where the outcome differs", () => {
   assert.deepStrictEqual(byId(applied.record, "a2"), {
     ...byId(base, "a2"), status: "refuted", evidence: [`receipt:${RUN}:3:a2`],
   });
-  // No change: a3 agrees with its status, and a4 has an unknown result.
   assert.deepStrictEqual(byId(applied.record, "a3"), byId(base, "a3"));
   assert.deepStrictEqual(byId(applied.record, "a4"), byId(base, "a4"));
 
-  // The write: one version up, with one test.recorded entry whose before and after follow Task 7.
   assert.equal(applied.record.version, 2);
   assert.equal(applied.record.log.length, base.log.length + 1);
   assert.deepStrictEqual(applied.record.log[applied.record.log.length - 1], {
@@ -91,16 +86,13 @@ test("receipts set statuses only where the outcome differs", () => {
 
   assert.deepStrictEqual(rebuildVersion(applied.record, base.version), base, "rebuilding undoes the statuses and puts the old handle back");
 
-  // Receipts that change nothing return undefined: a passing verified assumption and an unknown one.
   assert.equal(applyReceipts(base, [receipt("a3", "pass"), receipt("a4", "unknown")], CONTEXT), undefined);
 
-  // A refuted plan assumption is not a refuted outcome.
   const plan = applyReceipts(base, [receipt("a4", "fail")], CONTEXT);
   assert.ok(plan, "a fail refutes the plan assumption");
   assert.equal(byId(plan.record, "a4").status, "refuted");
   assert.deepStrictEqual(plan.refutedOutcome, [], "only an outcome assumption counts as a refuted outcome");
 
-  // A receipt of another kind than the assumption's test changes nothing.
   const cited = baseRecord([
     assumption("a5", "assumed", { test: { kind: "citation", source: "docs/plan.md", quote: "The plan", refutesOn: "absent" } }),
   ]);
@@ -114,8 +106,6 @@ test("pinned and member assumptions keep their status", () => {
     assumption("m1", "assumed", { origin: "member" }),
   ]);
 
-  // A pinned verified outcome assumption with a fail keeps verified, gains the handle, and is not a refuted outcome;
-  // a pinned refuted one with a pass keeps refuted. A member assumption named by a receipt is unchanged.
   const applied = applyReceipts(base, [receipt("p1", "fail"), receipt("p3", "pass"), receipt("m1", "fail")], CONTEXT);
   assert.ok(applied, "pinned assumptions gain their handles");
   assert.deepStrictEqual(applied.changed, ["p1", "p3"]);
@@ -131,7 +121,6 @@ test("pinned and member assumptions keep their status", () => {
   assert.deepStrictEqual(byId(applied.record, "m1"), byId(base, "m1"));
   assert.deepStrictEqual(rebuildVersion(applied.record, base.version), base, "rebuilding takes the pinned handles off");
 
-  // Alone, a pass on the pinned verified assumption agrees with it, and a fail on the member assumption changes nothing.
   assert.equal(applyReceipts(base, [receipt("p1", "pass"), receipt("m1", "fail")], CONTEXT), undefined);
 });
 
@@ -158,13 +147,11 @@ test("a pass writes entries of at most eight at one version", () => {
 });
 
 test("a full log keeps the receipts and writes nothing", () => {
-  // The log is built directly, not written through 380 operations.
   const full = baseRecord([assumption("a1", "unchecked")], CORRECTION_LOG.entries);
   const before = structuredClone(full);
   assert.throws(() => applyReceipts(full, [receipt("a1", "pass")], CONTEXT), { code: "objective-log-full" });
   assert.deepStrictEqual(full, before, "the input record is unchanged");
 
-  // One entry short of the share still writes.
   const room = baseRecord([assumption("a1", "unchecked")], CORRECTION_LOG.entries - 1);
   const applied = applyReceipts(room, [receipt("a1", "pass")], CONTEXT);
   assert.ok(applied, "the last entry of the share is written");

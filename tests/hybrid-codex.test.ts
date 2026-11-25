@@ -19,8 +19,6 @@ test("hybrid wrapper leaves no executor, tunnel or native UI after abrupt client
   mkdirSync(bin); mkdirSync(workspace);
   const id = randomUUID(), threadId = randomUUID(), token = randomUUID(), leaseId = randomUUID();
   const calls: any[] = [], requests: string[] = [];
-  // Only external executables are fixtures. The real wrapper supervises their
-  // OS processes and owns the pipes whose closure must stop every helper.
   const executable = `#!/usr/bin/env node
 import {appendFileSync} from 'node:fs';
 import {basename} from 'node:path';
@@ -94,8 +92,6 @@ test("duplicate laptop disconnects and an early grace callback hand off the veri
     workspace: { cwd, roots: [cwd] }, directory: join(root, "host"),
     command: process.execPath, commandArgs: [resolve("tests/fixtures/native-codex.mjs")],
     record: value => records.push(value), publish: value => { state = value; },
-    // Provider selection is a separate boundary; this coordinator must reach
-    // it once with the materialized, verified tree after the grace period.
     select: async execution => { selected.push(execution.cwd); },
   });
   try {
@@ -112,9 +108,6 @@ test("duplicate laptop disconnects and an early grace callback hand off the veri
     const clock = context.mock.method(Date, "now", () => now);
     hybrid.connection(false);
     hybrid.connection(false);
-    // Timer and wall clocks need not agree exactly. Run the grace callback
-    // just before its wall-clock deadline, then cross the deadline without
-    // another connection or activity event to rescue a lost callback.
     now = began + 4999;
     context.mock.timers.tick(5000);
     await hybrid.control("sync/status", {});

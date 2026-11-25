@@ -1,9 +1,3 @@
-// Stands in for the team launcher when the real writer runs as another account: `bundle create` starts a
-// writer in its own session, so the host's group kill cannot reach it. The writer inherits this process's
-// stdout, which is one end of a socket pair, and writes without end, as a Git process does: nothing here makes
-// that end non-blocking, so each write waits until the socket takes it. When a write fails, the writer records
-// the error's code in END_FILE and ends. Every other Git command runs as given.
-// Usage: unsignalled-writer.mjs END_FILE git GIT_ARGS...
 import { spawn, spawnSync } from "node:child_process";
 
 const [endFile, ...command] = process.argv.slice(2);
@@ -24,5 +18,4 @@ for (;;) {
   }
 }`;
 const writer = spawn(process.execPath, ["-e", script, endFile], { stdio: ["ignore", "inherit", "ignore"], detached: true });
-// This process lives as long as its writer, unless the host ends it first.
 writer.once("exit", () => process.exit(0));

@@ -16,9 +16,7 @@ test("the detached sync service pushes edits, stays pending while a session runs
   const laptop = join(root, "laptop"); mkdirSync(laptop);
   const stateFile = join(root, "sync", "rehearsal.json");
   const storeDir = join(root, "sync", "rehearsal-store");
-  // An apply renames the cloud tree aside before moving the new one in; a read in between finds nothing.
   const cloudFile = () => { try { return readFileSync(join(host.config.projects[0].path, "app.ts"), "utf8"); } catch { return undefined; } };
-  // A language-server socket in the checkout is left out and reported once at startup.
   const server = createServer();
   try {
     writeFileSync(join(laptop, "app.ts"), "one\n");
@@ -39,7 +37,6 @@ test("the detached sync service pushes edits, stays pending while a session runs
     assert.deepEqual(recorded(idle), recorded(first), "an idle workspace leaves the committed checkpoint unchanged");
 
     writeFileSync(join(laptop, "app.ts"), "two\n");
-    // The cloud file reads "two" a moment before the apply is recorded; wait for the record too.
     const pushed = await waitFor(() => host.fetchApi("/projects/rehearsal"),
       r => cloudFile() === "two\n" && !r.body.sync.pendingGeneration && r.body.sync.appliedManifest === r.body.sync.lastSyncedManifest, 20000);
     assert.equal(pushed.body.sync.appliedManifest, pushed.body.sync.lastSyncedManifest, "a file change is pushed and applied");
@@ -76,7 +73,6 @@ test("a first upload that outlasts the startup inactivity bound completes while 
     mkdirSync(join(laptop, `d${d}`), { recursive: true });
     for (let f = 0; f < 100; f++) writeFileSync(join(laptop, `d${d}`, `f${f}.txt`), `${d}:${f}\n`);
   }
-  // The host answers the commit only after applying; hold it well past the bound.
   const bound = 2000, commit = host.projectSync.commit.bind(host.projectSync);
   host.projectSync.commit = (async (...args: Parameters<typeof commit>) => { await delay(3 * bound); return commit(...args); }) as typeof commit;
   try {
@@ -101,7 +97,6 @@ test("failed commits back off, and a lasting apply failure holds the content unt
     writeFileSync(join(laptop, "app.ts"), "one\n");
     await startSyncService({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal", root: laptop, stateFile, storeDir: join(root, "sync", "rehearsal-store") });
 
-    // A transient refusal is retried with the same content, each wait longer than the last.
     const attempts: number[] = [];
     host.projectSync.commit = (async () => { attempts.push(Date.now()); throw new ProjectSyncError("The host is busy", "apply-failed", 409, "other"); }) as typeof commit;
     writeFileSync(join(laptop, "app.ts"), "two\n");
@@ -111,20 +106,17 @@ test("failed commits back off, and a lasting apply failure holds the content unt
     stopSyncService(stateFile);
     host.projectSync.commit = commit;
 
-    // A lasting failure: the host cannot create its stage beside the project directory.
     await startSyncService({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal", root: laptop, stateFile, storeDir: join(root, "sync", "rehearsal-store") });
     chmodSync(host.root, 0o500);
     writeFileSync(join(laptop, "app.ts"), "three\n");
     const failed = await waitFor(detail, sync => sync.pendingGeneration?.reason === "apply-failed", 20000);
     assert.equal(failed.pendingGeneration.category, "permission");
     await waitFor(async () => readSyncState(stateFile)?.problem, problem => Boolean(problem?.includes("cannot read, write, or remove")), 10000);
-    // The same content is not pushed again.
     await delay(7000);
     assert.equal((await detail()).lastSyncedAt, failed.lastSyncedAt);
     chmodSync(host.root, 0o700);
     assert.equal((await host.fetchApi("/projects/rehearsal/sync/apply", "owner", {})).status, 200);
     assert.equal(readFileSync(join(host.config.projects[0].path, "app.ts"), "utf8"), "three\n");
-    // The service notices the explicit apply and clears its problem without another push.
     await waitFor(async () => readSyncState(stateFile), state => Boolean(state && !state.problem), 45000);
     assert.equal((await detail()).lastSyncedAt, failed.lastSyncedAt);
   } finally {

@@ -155,7 +155,6 @@ test("an unchanged inline session list is sent again once a minute, so a phone's
   try {
     feed.subscribe(["sessions", "teams"], 0, update => sent.push({ at: now, update }));
     await flush();
-    // 81 ticks of 750 ms: a window just over a minute in which nothing changes.
     for (let tick = 0; tick < 81; tick++) { now += 750; t.mock.timers.tick(750); await flush(); }
     assert.deepEqual(sent.map(row => [row.at, (row.update as { topic: string }).topic]), [[0, "sessions"], [0, "teams"], [60_000, "sessions"]],
       "one re-send of the session list at a minute, none sooner, and none for other topics");

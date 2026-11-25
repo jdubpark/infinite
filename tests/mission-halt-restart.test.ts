@@ -73,7 +73,6 @@ test("a halt release after restart settles a subteam whose pause reached it befo
     try {
       await first.halt.engage(scope, { requestId: randomUUID() }, owner);
 
-      // The child record is committed, then the host stops before applyOps can save the mission's acknowledgement.
       const deliver = first.teams.haltPauseChild.bind(first.teams);
       first.teams.haltPauseChild = async (id, token, reason) => {
         const reached = await deliver(id, token, reason);

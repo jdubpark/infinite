@@ -69,7 +69,6 @@ async function until<T>(get: () => T | Promise<T>, predicate: (value: T) => bool
   assert.fail(message);
 }
 
-// The API host runs in a child process, so clock-driven backoff and retention use a direct service with an injected clock.
 function directFixture(status: "implementing" | "cancelled", retention: Partial<typeof DEFAULT_TEAM_RETENTION>) {
   const f = schedulerFixture();
   const workspaceGit = (...args: string[]) => execFileSync("git", args, { cwd: f.run.workspace, encoding: "utf8", stdio: "pipe",
@@ -454,7 +453,7 @@ process.exit(result.status ?? 128);
   const savedWork = () => teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork;
   const pidFile = join(d.receipts, "hung-snapshot-pids");
   const pids = () => existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim().split("\n").filter(Boolean).map(Number) : [];
-  const killHungChild = (pid: number) => { try { process.kill(pid, "SIGKILL"); } catch { /* already stopped */ } };
+  const killHungChild = (pid: number) => { try { process.kill(pid, "SIGKILL"); } catch { } };
   const killHungChildren = () => { for (const pid of pids()) killHungChild(pid); };
   try {
     teams.start();

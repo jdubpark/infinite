@@ -87,10 +87,8 @@ test("the summary card reads the coordinator brief and the log card returns to i
   assert.match(summary, /not completion or approval/);
   assert.doesNotMatch(summary, /Implementer brief/);
   assert.doesNotMatch(summary, /Keep the first plan/);
-  // The person's open decision comes before the brief, with the command that answers it.
   assert.ok(summary.indexOf("Which signal means awake") < summary.indexOf("Coordinator brief"));
   assert.match(summary, /infinite team answer team-1 q1 "YOUR ANSWER"/);
-  // Sections follow the briefing contract: outcome, system shape, ranked review questions, changes, gaps.
   const order = ["Coordinator brief", "SYSTEM SHAPE", "REVIEW FIRST", "WHAT CHANGED", "GAPS AND UNKNOWNS"].map(text => summary.indexOf(text));
   assert.deepEqual([...order].sort((a, b) => a - b), order);
   assert.ok(!order.includes(-1));
@@ -110,7 +108,6 @@ test("the summary card reads the coordinator brief and the log card returns to i
   const screen = "\u001b[32mplanning the stop\u001b[0m\nnext step";
   assert.match(visibleScreen(screen), /planning the stop\nnext step/);
   assert.equal(plainScreen(screen), "planning the stop\nnext step");
-  // Blank rows under the composer do not count, so the last lines (dialog and prompt) survive the window.
   assert.equal(plainScreen("Run it?\nyes\n\n   \n", 1), "yes");
   const rows = Array.from({ length: 20 }, (_, index) => `row ${index + 1}`);
   assert.equal(plainScreen([...rows, "", " "].join("\n"), 14), rows.slice(-14).join("\n"));
@@ -146,7 +143,6 @@ test("watch keys switch views and agents, scroll, and detach", () => {
   assert.equal(teamWatchCommand("q"), "detach");
   assert.equal(teamWatchCommand("\u0003ln"), "detach");
   assert.equal(teamWatchCommand("ln"), "next");
-  // The final byte of an escape sequence is not read as a separate key.
   assert.equal(teamWatchCommand("l\u001bOB"), "down");
   assert.equal(teamWatchCommand("x"), null);
 });
@@ -183,7 +179,6 @@ test("a fixed status row keeps body position and frame height stable", () => {
 });
 
 test("recorded screens keep their terminal height without padding, and agent strips stay within width", () => {
-  // A terminal screen keeps its trailing blank rows, so its block height does not change as output fills it.
   const rows = (text: string) => visibleScreen(text, 6).split("\n").length;
   assert.equal(rows("one line\n\n\n\n"), rows("one line\ntwo lines\nthree\n\n"));
   assert.equal(rows("only\n"), 2);

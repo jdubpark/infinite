@@ -78,7 +78,6 @@ test("risk rises on a token, a prefix, or a label", () => {
   assert.equal(taskRisk([".github/workflows/ci.yml"]), "elevated");
   assert.equal(taskRisk(["packages/host/src/Permissions.ts"]), "elevated");
 
-  // An explicit prefix elevates a neutral file. Without the prefix the same file is normal.
   const neutral: FeatureMap = { areas: [{ id: "src", paths: ["src"] }], elevated: ["src/runtime.ts"] };
   assert.equal(taskRisk(["src/runtime.ts"]), "normal");
   assert.equal(taskRisk(["src/runtime.ts"], neutral), "elevated");
@@ -95,7 +94,6 @@ test("risk rises on a token, a prefix, or a label", () => {
     "k8s/service.yaml",
     ".gitlab-ci.yml",
     "packages/host/src/deployment.ts",
-    // Capital and digit forms.
     "src/K8sClient.ts",
     "K8S/service.yaml",
     "src/k8sClient.ts",
@@ -105,7 +103,6 @@ test("risk rises on a token, a prefix, or a label", () => {
     "src/DockerFileBuilder.ts",
     "src/K8S2Client.ts",
     "src/authV2Handler.ts",
-    // A plural matches its singular.
     "src/authorizations.ts",
     "src/authentications.ts",
     "src/permissions.ts",
@@ -137,7 +134,6 @@ test("risk rises on a token, a prefix, or a label", () => {
   assert.equal(taskRisk(["src/auth.ts"], byToken), "normal");
   assert.equal(taskRisk(["src/ledger.ts"], byToken), "elevated");
   assert.equal(taskRisk(["src/ledgers.ts"], byToken), "elevated");
-  // A project entry is spelled across adjacent words, as a default entry is.
   const compound: FeatureMap = { areas: [], elevatedTokens: ["oauth", "s3"] };
   assert.equal(taskRisk(["src/OAuthClient.ts"], compound), "elevated");
   assert.equal(taskRisk(["src/S3Bucket.ts"], compound), "elevated");
@@ -147,15 +143,12 @@ test("risk rises on a token, a prefix, or a label", () => {
 });
 
 test("a token needs a word boundary", () => {
-  // A separator, a camel-case boundary, or a letter-digit boundary marks a word.
   for (const path of ["src/authService.ts", "src/auth_service.ts", "src/auth-service.ts", "src/k8sClient.go", "src/auth2.ts"]) {
     assert.equal(taskRisk([path]), "elevated", path);
   }
-  // Nothing marks a boundary inside a lower-case compound, and a separator ends a name.
   for (const path of ["src/authservice.ts", "src/k8sclient.go", "src/per-mission-budget.ts", "src/reauth.ts"]) {
     assert.equal(taskRisk([path]), "normal", path);
   }
-  // A very long name is still read. Only a run longer than an entry is skipped.
   assert.equal(taskRisk([`src/${"Ab".repeat(600)}Auth.ts`]), "elevated");
   assert.equal(taskRisk([`src/${"a".repeat(3000)}.ts`]), "normal");
 });
@@ -204,7 +197,6 @@ test("task features combine the rules", () => {
   assert.equal(scout.area, "none");
   assert.equal(scout.kind, "investigation");
 
-  // Risk for each role, once normal and once elevated.
   assert.equal(taskFeatures({ role: "implementer", paths: ["packages/host/src/usage.ts"] }).risk, "normal");
   assert.equal(
     taskFeatures({ role: "implementer", paths: ["packages/host/src/usage.ts"], risk: "elevated" }).risk,
@@ -239,12 +231,10 @@ test("the feature map digest is stable", () => {
   assert.notEqual(featureMapDigest(first), featureMapDigest(changed));
   assert.equal(featureMapDigest(), "default");
 
-  // Array order is kept, so swapping two areas changes the digest.
   const a = { id: "a", paths: ["a"] };
   const b = { id: "b", paths: ["b"] };
   assert.notEqual(featureMapDigest({ areas: [a, b] }), featureMapDigest({ areas: [b, a] }));
 
-  // An undefined key digests like an absent key.
   const absent = { areas: [a] } as FeatureMap;
   const undefinedKey = { areas: [a], elevated: undefined } as unknown as FeatureMap;
   assert.equal(featureMapDigest(absent), featureMapDigest(undefinedKey));
@@ -257,7 +247,6 @@ test("the feature map schema refuses bad maps", () => {
     featureMapSchema.safeParse({ ...valid, elevatedTokens: ["ledger"], elevated: ["packages/host/src/vault.ts"] }).success,
     true,
   );
-  // The single prefix `.` is the match-all prefix, and it is valid.
   assert.equal(featureMapSchema.safeParse({ areas: [{ id: "all", paths: ["."] }] }).success, true);
 
   const refused: unknown[] = [
@@ -275,7 +264,6 @@ test("the feature map schema refuses bad maps", () => {
   for (const map of refused) {
     assert.equal(featureMapSchema.safeParse(map).success, false, JSON.stringify(map));
   }
-  // A project may set only risk rules. An empty area list is valid.
   assert.equal(featureMapSchema.safeParse({ areas: [], elevated: ["packages/host/src/vault.ts"] }).success, true);
 });
 

@@ -39,7 +39,6 @@ function open(f: Fixture, key?: Buffer): EvidenceStore {
   return new EvidenceStore({ databasePath: f.path, vaultKey: key ?? f.key });
 }
 
-/** Opens a fresh store and a Blackboard on it, then closes the store. */
 function withStore(fn: (f: Fixture, store: EvidenceStore, board: Blackboard) => void): void {
   const f = fixture();
   try {
@@ -54,7 +53,6 @@ function withStore(fn: (f: Fixture, store: EvidenceStore, board: Blackboard) => 
   }
 }
 
-/** The fixture run with the blackboard switch pinned, the entry tools on four members, and tasks a and b with paths. */
 function entryRun(): TeamRun {
   const run = hostEntryRun();
   run.blackboard = { tools: true };
@@ -82,7 +80,6 @@ function memberOf(run: TeamRun, memberId: string): TeamMember {
   return member;
 }
 
-/** A second member of the same role and task, with its own id and the entry tools. */
 function sibling(member: TeamMember): TeamMember {
   return { ...member, memberId: randomUUID(), entryTools: true };
 }
@@ -135,7 +132,6 @@ function handoff(summary: string, taskId: string): MemberEntryPost {
   });
 }
 
-/** A post record for `member`'s binding, unless the options name another binding. */
 function post(
   member: TeamMember,
   entry: MemberEntryPost,
@@ -153,7 +149,6 @@ function post(
   };
 }
 
-/** Stores one post and returns its entry id. */
 function ingestOne(board: Blackboard, run: TeamRun, member: TeamMember, entry: MemberEntryPost): string {
   const record = post(member, entry);
   assert.equal(board.ingest(run, member, [record], []).stored, 1);
@@ -173,10 +168,6 @@ type Seeded = {
   ids: Record<"D1" | "C1" | "C2" | "C3" | "K1" | "K2" | "H" | "Ib" | "F1" | "F0", string>;
 };
 
-/**
- * The world of the plan's Task 5 fixture. Mirrored entries first, then the launch of implA and the reviewer, then the
- * steering, the posts, the withdrawal, the integration of task b, and the findings, in that order.
- */
 function seed(store: EvidenceStore, board: Blackboard): Seeded {
   const run = entryRun();
   const pm = memberOf(run, hostEntryIds.pm);
@@ -333,12 +324,9 @@ test("a filtered list pages past the scan limit", () => {
   withStore((_f, store, board) => {
     const w = seed(store, board);
     const scope = scopeOf(store, w.implA);
-    // A finding with a path no other entry has, posted last, so the only match lies past the first scan.
     const z = ingestOne(board, w.run, w.rev, finding("Z late", { paths: ["zz/new"] }));
     const zSeq = board.get(w.run.id, z)?.head.seq;
     if (zSeq === undefined) throw new Error("late finding missing");
-    // The scan reads visible rows only, so the cap is the number of visible rows before it, and the match lies just past the first scan.
-    // The scan cap is the number of rows before it, so the match lies just past the first scan.
     const before = store.read(db => db.get<{ n: number }>(
       "SELECT count(*) AS n FROM entries WHERE run_id=? AND scope='run' AND state!='withdrawn' AND seq < ?",
       w.run.id,
@@ -407,7 +395,6 @@ test("an unreadable head is counted and left out", () => {
 test("an oversized head is skipped and paging goes on", () => {
   withStore((_f, store, board) => {
     const w = seed(store, board);
-    // The write path refuses a head this large, so the row is written directly. Its paths overlap implA's path src/a.
     const bigId = randomUUID();
     const bigPaths = Array.from({ length: 40 }, (_, index) => `src/a/${String(index).padStart(3, "0")}${"x".repeat(190)}`);
     store.write(tx => {
@@ -487,7 +474,6 @@ test("the digest fits 4,096 bytes and keeps the order", () => {
   }
 });
 
-/** Inserts `count` sealed run-scope rows straight into the store. Only the plain columns the reads use matter. */
 function insertRows(
   store: EvidenceStore,
   runId: string,
@@ -516,7 +502,6 @@ function insertRows(
   });
 }
 
-/** The seq of the row at `position` (1-based) in the run's seq order. */
 function seqAt(store: EvidenceStore, runId: string, position: number): number | undefined {
   return store.read(db => db.get<{ seq: number }>(
     "SELECT seq FROM entries WHERE run_id=? ORDER BY seq LIMIT 1 OFFSET ?",
@@ -525,7 +510,6 @@ function seqAt(store: EvidenceStore, runId: string, position: number): number | 
   )?.seq);
 }
 
-/** A filtered list with an explicit scan cap, as the bounded-read tests need. */
 function scan(store: EvidenceStore, scope: MemberScope, query: Parameters<typeof listForMember>[2], scanRows: number): MemberList {
   return store.read(db => listForMember(db, scope, query, scanRows));
 }
@@ -582,7 +566,6 @@ test("the default list keeps an older member post behind many reports", () => {
     const implB = memberOf(run, hostEntryIds.implB);
     const scope = memberScopeOf(run, implA, 0);
     const older = ingestOne(board, run, implB, contract("before the reports"));
-    // A long run: more host reports after the post than the default window holds.
     insertRows(store, run.id, { kind: "report", state: "active", author: "host", authority: "receipt" }, 1_001);
 
     const list = listOf(store, scope);

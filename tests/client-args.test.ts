@@ -205,7 +205,6 @@ test("roll-up lines for a settled goal", () => {
     target: { kind: "goal", id: "G1" },
     assessment: { result: "achieved", at: "2026-11-13T10:00:00Z", revision: 2 },
     runs: rollupRuns({
-      // The blocked run has a status and no counts, so only one run is settled: the one whose counts are summed.
       total: 2, withSummary: 2, withCounts: 1, deleted: 0, status: { merged: 1, blocked: 1 }, blockCodes: { "delivery-recovery": 1 },
       counts: { tasks: 2, integrated: 1, members: 3, round: 1, checks: 2, recoveries: 1, decisionsByOwner: 0, decisionsByCoordinator: 0, steering: 0, permissionEscalations: 0, continuations: 0 },
       rounds: { total: 3, attributed: 2, unattributed: 1, unknown: 0 },
@@ -286,7 +285,6 @@ test("routing lines show unknown, never zero", () => {
     "New task (project level)",
     "  ops-light  mean 0.5 [0.3, 0.7] · rescue 0.5 · rows production 0, duel 0 · earlier mass 0 (0 rows) · level none · $0.40 · greedy",
   ]);
-  // A raw mass above the applied mass prints both: the cap is 10 of a raw 20.
   const capped = routingStatusLines(routingStatusFixture({
     cells: [{ cell: { scope: "new-task" }, profiles: [{ ...routingProfile, earlier: { rows: 40, mass: 20, appliedMass: 10 } }] as never }],
   } as Partial<RoutingStatus>));
@@ -304,12 +302,10 @@ test("routing lines show unknown, never zero", () => {
   const off = routingStatusLines(routingStatusFixture({ mode: "off", requested: null, source: null, knobs: null, defaults: [], covers: { start: false, reason: "off" }, cells: [] } as Partial<RoutingStatus>));
   assert.equal(off[0], "alpha · routing off");
   assert.equal(off[1], "Start: not covered (off)");
-  // With no cell lines the costs line is last; the cell tail lines follow the cells when capped or unreadable.
   assert.equal(routingStatusLines(routingStatusFixture({ cells: [] } as Partial<RoutingStatus>)).at(-1), "Costs are tier defaults: light $0.40, strong $2.20, rescue $1.50. Limit headroom is not modelled. Intervals are 90% normal approximations. Coordinator-chosen history counts at half weight.");
   assert.deepEqual(routingStatusLines(routingStatusFixture({ cells: [], unreadableCells: 2, cellsCapped: true } as Partial<RoutingStatus>)).slice(-2), ["Older cells are not shown.", "Cells with unreadable details: 2."]);
 });
 
-/** One decision as the host answers it: the row without its four blind indexes, with its opened payload. */
 const explainDecision = (overrides: Partial<ExplainedDecision> = {}): ExplainedDecision => ({
   key: "k", runId: "11111111-1111-4111-8111-111111111111", revision: 1, point: "start", ordinal: 1, role: "implementer",
   kind: null, risk: "normal", featureVersion: 1, mode: "shadow", algorithmVersion: 1, rewardVersion: 1,
@@ -401,7 +397,6 @@ test("routing lines: the other branch of each line, and clean on every id", () =
 
 test("routing explain lines: the shape the host answers, a sampler fallback, and clean on the chosen and candidate ids", () => {
   const run = "11111111-1111-4111-8111-111111111111";
-  // What GET /api/teams/:id/routing/:taskId answers: the row without its four blind-index fields, and the opened payload.
   const explain: RoutingExplain = { runId: run, taskId: "t1", capped: false, decisions: [{
     key: "a".repeat(64), runId: run, revision: 2, point: "start", ordinal: 1, role: "implementer", kind: "feature", risk: "normal", featureVersion: 1,
     mode: "shadow", algorithmVersion: 1, rewardVersion: 1, policyDigest: "d".repeat(64), seed: "e".repeat(64), basis: "sampled",
@@ -433,7 +428,6 @@ test("the routing command refuses bad usage before any request, and maps or pass
   const hostError = (status: number, code?: string) => Object.assign(new Error(`Host returned HTTP ${status}.`), { status, code });
   await assert.rejects(handleRoutingClientCommand(["explain", "not-a-uuid", "t1"], {}, fake({ "/me": withFlag, "/teams/not-a-uuid/routing/t1": hostError(400, "invalid-routing-request") })),
     { message: "The host refused the routing request as invalid." });
-  // Any other failure passes through unchanged; the project ID is one encoded path segment.
   const other = hostError(500);
   await assert.rejects(handleRoutingClientCommand(["status", "a/b"], {}, fake({ "/me": withFlag, "/routing/projects/a%2Fb": other })), error => error === other);
 });
@@ -516,7 +510,6 @@ test("a pause prints its line in both modes, and the autonomous default names it
   assert.equal(endedDefault[4], "Shadow period: ended 2026-11-15T10:00:00.000Z.", "the autonomous default never says --routing auto is needed");
   const endedSaved = routingStatusLines(routingStatusFixture({ period: autoPeriod } as Partial<RoutingStatus>));
   assert.equal(endedSaved[4], "Shadow period: ended 2026-11-15T10:00:00.000Z. Auto routing needs --routing auto.");
-  // A saved policy without a mode in an autonomous project: the mode is the autonomous default's, so no --routing auto note.
   const savedNoMode = routingStatusLines(routingStatusFixture({ source: "saved", modeSource: "autonomous-default", period: autoPeriod } as Partial<RoutingStatus>));
   assert.equal(savedNoMode[0], "alpha · routing shadow (autonomous default) · auto starts after the shadow period");
   assert.equal(savedNoMode[4], "Shadow period: ended 2026-11-15T10:00:00.000Z.", "a saved policy without a mode never asks for --routing auto");

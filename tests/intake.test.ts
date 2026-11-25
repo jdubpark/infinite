@@ -20,21 +20,17 @@ import type { RouteReading } from "../packages/host/src/intake-route.js";
 const OWNER_SLACK = "U00000000", TEAMMATE_SLACK = "U22222222", AGENT_SLACK = "U11111111";
 const MINUTE = 60000;
 
-/** Slack timestamps are seconds with six decimals; `ms` is epoch milliseconds. */
 const slackTs = (ms: number) => `${Math.floor(ms / 1000)}.${String(ms % 1000).padStart(3, "0")}000`;
 const slackLink = (ts: string) => `https://example.slack.com/archives/C0000000000/p${ts.replace(".", "")}`;
 
-/** The owner's root message mentioning the agent, timestamped at the thread root. */
 const ownerMention = (root: string): SlackThreadMessage[] => [{ ts: root, user: OWNER_SLACK, text: `Please export this <@${AGENT_SLACK}>` }];
 
-/** An in-memory Slack thread reader. A thread is keyed by its root timestamp. */
 class FakeThreads implements IntakeThreadReader {
   readonly threads = new Map<string, SlackThreadMessage[]>();
   readonly unreadable = new Set<string>();
   failNext = 0;
   failure: Error = new Error("Slack is unavailable");
   permalinkFails = false;
-  /** While set, every thread read waits for it. */
   gate?: Promise<void>;
   waiting = 0;
   async permalink(binding: IntakeThread, ts: string): Promise<string> {
@@ -53,7 +49,6 @@ async function setup(options: { groupId?: string; maxActive?: number; requireSla
   wrapMissions?: (missions: MissionService) => MissionService } = {}) {
   const linearServer = await startIntakeLinearServer();
   const threads = new FakeThreads();
-  /** While `blocked` is set, a start is refused with it, as the route's admission refuses a mid-handoff project. */
   const control: { blocked?: Error } = {};
   let config!: Config;
   const configure = (target: Config) => {
@@ -78,7 +73,6 @@ async function setup(options: { groupId?: string; maxActive?: number; requireSla
   const store = new IntakeStore(config, storeKey);
   const enabled = Date.parse(store.enabledAt());
   const linearService = new LinearService(config, randomBytes(32));
-  /** Unexpected failures go here instead of the console, so tests can assert what was logged. */
   const logged: { line: string; error: unknown }[] = [];
   const service = (linear = new IntakeLinear(linearService)) => new IntakeService(config, store, missions, linear, { threads, pollMs: 3600000, ...(options.router ? { router: options.router } : {}), ...(options.routeWaitMs ? { routeWaitMs: options.routeWaitMs } : {}),
     log: (line, error) => logged.push({ line, error }),
@@ -87,16 +81,13 @@ async function setup(options: { groupId?: string; maxActive?: number; requireSla
       return missions.create(request, undefined, origin);
     } });
   const intake = service();
-  /** Registers a thread whose root is `offset` ms after the enable time, and returns its Slack link. */
   const addThread = (offset: number, messages: (root: string) => SlackThreadMessage[]) => {
     const root = slackTs(enabled + offset);
     threads.threads.set(root, messages(root));
     return { root, link: slackLink(root) };
   };
-  /** A default issue: created after enable, owned by the owner, labelled, with a thread that mentions the agent. */
   const issue = (overrides: Partial<IntakeFixtureIssue> = {}, offset = 2000): IntakeFixtureIssue => {
     const thread = addThread(offset, ownerMention);
-    // The default owner mention is at enabled + 2000 and the issue is filed at enabled + 3000, so the mention precedes filing.
     return linearServer.file({ createdAt: new Date(enabled + 3000).toISOString(), attachmentUrls: [thread.link], ...overrides });
   };
   return {
@@ -113,7 +104,6 @@ async function setup(options: { groupId?: string; maxActive?: number; requireSla
 }
 type Ctx = Awaited<ReturnType<typeof setup>>;
 
-/** Finds a view by its issue ID so tests never depend on list order. */
 const viewOf = (ctx: Ctx, issueId: string): IntakeView | undefined => ctx.list().find(view => view.issueId === issueId);
 
 test("an owner's labelled issue with the owner's Slack mention starts one mission", { timeout: 60000 }, async () => {
@@ -161,9 +151,7 @@ test("an unlabelled owner issue, an archived one, a closed one, and one older th
 test("a thread without the owner's mention of Linear's agent before filing is skipped", { timeout: 60000 }, async () => {
   const ctx = await setup();
   try {
-    // A teammate's mention of the agent does not count.
     const teammate = ctx.addThread(2000, root => [{ ts: root, user: TEAMMATE_SLACK, text: `<@${AGENT_SLACK}> export this` }]);
-    // The owner's mention is timestamped after the issue was filed, so it does not count either.
     const late = ctx.addThread(4000, root => [{ ts: root, user: OWNER_SLACK, text: `<@${AGENT_SLACK}> export this` }]);
     const teammateIssue = ctx.linearServer.file({ createdAt: ctx.iso(3000), attachmentUrls: [teammate.link] });
     const lateIssue = ctx.linearServer.file({ createdAt: ctx.iso(3000), attachmentUrls: [late.link] });
@@ -191,7 +179,6 @@ test("an owner's mention counts only when it is before filing: before admits, eq
 test("a teammate-created issue is skipped even when the thread qualifies", { timeout: 60000 }, async () => {
   const ctx = await setup();
   try {
-    // The owner's mention of the agent is the only one in the thread, and it is before filing.
     const thread = ctx.addThread(2000, ownerMention);
     const issue = ctx.linearServer.file({ createdAt: ctx.iso(3000), creatorId: randomUUID(), attachmentUrls: [thread.link] });
     await ctx.intake.poll();
@@ -279,7 +266,6 @@ test("a restart between the record and the mission yields one mission", { timeou
       thread: { channelId: "C0000000000", threadTs: slackTs(ctx.enabled + 2000) }, request,
       comments: {}, messages: [], questions: [], inbound: [], createdAt: ctx.iso(1000), updatedAt: ctx.iso(1000),
     });
-    // The mission exists, but the record still says queued: the crash point between the two writes.
     await ctx.missions.create(request, undefined, { kind: "intake", issueId: issue.id, identifier: issue.identifier, url: issue.url, rule: 'label "infinite", owner creator, owner Slack mention' });
     const first = ctx.service(), second = ctx.service();
     await first.poll();
@@ -300,7 +286,6 @@ test("a fourth request queues behind three and starts when one waits on the owne
     const last = () => viewOf(ctx, issues[3].id)!;
     assert.equal(last().holdReason, "max-active");
     ctx.h.release("release-dispatch");
-    // The three missions race for one repository, so any of them may be the one whose subteam asks the owner first.
     const started = issues.slice(0, 3).map(issue => missionRequestId(issue.id));
     await waitFor(async () => started.map(id => ctx.missions.peek(id)?.status), statuses => statuses.includes("needs-input"), 240000);
     await ctx.intake.poll();
@@ -465,7 +450,6 @@ test("the objective keeps the owner's first message and the owner's newest messa
   const text = intakeObjective(objectiveIssue("TEST-1", "d".repeat(13000)), thread, OWNER_SLACK);
   assert.ok(text.length <= 24000, `The objective is ${text.length} characters`);
   assert.match(text, /Slack thread \(the owner's messages\):\nroot message\n\[… \d+ earlier messages omitted\]\nx+ message \d+\n/);
-  // The padding sits before the number, so the newest message is the last line and carries its own number.
   assert.match(text, /\nx+ message 499$/);
   assert.equal(text.includes("message 1\n"), false, "The oldest messages after the first are the ones omitted");
 });
@@ -584,7 +568,6 @@ test("the started and ready-for-review comments are delivered once each, even af
 
 test("GET /api/intake lists a record for any role when intake is configured", { timeout: 120000 }, async () => {
   const linearServer = await startIntakeLinearServer();
-  // Enable time is set at the first poll, which runs when the host starts, so the issue is dated just ahead of now.
   const issue = linearServer.file({ createdAt: new Date(Date.now() + 60000).toISOString(), attachmentUrls: [] });
   const host = await inProcessHost({ configure: config => {
     config.linear = { apiKeyFile: linearServer.apiKeyFile, endpoint: linearServer.endpoint };
@@ -597,7 +580,6 @@ test("GET /api/intake lists a record for any role when intake is configured", { 
     const { records } = await waitFor(async () => (await host.fetchApi("/intake", "viewer")).body as { records: IntakeView[] }, body => body.records.length === 1, 60000);
     assert.equal(records[0].issueId, issue.id);
     assert.equal(records[0].identifier, issue.identifier);
-    // The start went through the route's admission: the project group lookup refused it, and the refusal is kept.
     assert.equal(records[0].state, "queued");
     assert.match(records[0].holdReason!, /project/i);
     for (const role of ["owner", "controller"] as const) {
@@ -641,7 +623,6 @@ test("a teammate's message in the linked thread is neither stored in the record 
 test("with the thread not required, an unreadable or failing thread admits the issue without a thread section", { timeout: 60000 }, async () => {
   const ctx = await setup({ requireSlackThread: false });
   try {
-    // Reads run in candidate order, so the failing read is the first issue's and the unreadable thread is the second's.
     const failing = ctx.addThread(2000, ownerMention);
     const failingIssue = ctx.linearServer.file({ createdAt: ctx.iso(1000), attachmentUrls: [failing.link] });
     const unreadable = ctx.addThread(2100, ownerMention);
@@ -705,7 +686,6 @@ test("a start that fails for another reason records only its summary, and a late
 test("one unexpected admission failure for one issue does not stop the other issues in the cycle and is reported", { timeout: 60000 }, async () => {
   const ctx = await setup();
   try {
-    // Reads run in candidate order, so the failing read belongs to the first issue.
     const failing = ctx.issue({}, 2000);
     const healthy = ctx.issue({}, 2100);
     const failure = new Error("Thread read failed at /srv/infinite-data/work/checkout from 192.0.2.7");
@@ -733,7 +713,7 @@ test("a started intake service records a mission's outcome from the mission chan
     const issue = ctx.issue();
     await ctx.intake.poll();
     live.start();
-    await live.poll(); // joins the start-up cycle, so the next change is observed by the listener alone
+    await live.poll();
     const id = missionRequestId(issue.id);
     await ctx.missions.cancel(id, { requestId: randomUUID(), revision: ctx.missions.peek(id)!.revision });
     const record = ctx.store.get(issue.id)!;
@@ -811,7 +791,6 @@ test("outbound text drops every path form at one boundary, then addresses, and k
     projects: [{ id: "api", name: "API", path: "/data/instances/work/api" }, { id: "web", name: "Web", path: "/data/state" }] } as unknown as Config;
   const omitted = "[local path omitted]";
   const cases: [string, string][] = [
-    // Configured directories and host roots.
     ["/srv/infinite-data/instances/work/workspaces/api/src/a.ts", omitted],
     ["Edited /data/instances/work/api/src/b.ts and path=/data/instances/work/teams/run-1", `Edited ${omitted} and path=${omitted}`],
     ["Read /etc/infinite-work/config.json, then `/opt/infinite-work/bin/x`", `Read ${omitted}, then \`${omitted}\``],
@@ -822,27 +801,22 @@ test("outbound text drops every path form at one boundary, then addresses, and k
     ["/private/tmp/build/out.log and /private/var/db/x", `${omitted} and ${omitted}`],
     ["Cache: /var/folders/ab/T/build", `Cache: ${omitted}`],
     ["Data in /srv/app/data;", `Data in ${omitted};`],
-    // The boundary: only at the start or after a character that cannot continue a name, URL path, or longer path.
     ["feature/tmp/fix", "feature/tmp/fix"],
     ["https://example.com/tmp/api/pull/1", "https://example.com/tmp/api/pull/1"],
     ["https://example.com/home/page", "https://example.com/home/page"],
     ["Docs at https://example.com/opt/x", "Docs at https://example.com/opt/x"],
     ["(/srv/app/x)", `(${omitted})`],
     ["path:/srv/app/x", `path:${omitted}`],
-    // Repeated slashes and `./` segments do not hide a root or a configured directory.
     ["/./srv//app/x", omitted],
     ["Wrote /data/./state/x and //data//state/y", `Wrote ${omitted} and ${omitted}`],
-    // Home, Windows drives, and file URLs.
     ["Notes in ~/notes/todo.md", `Notes in ${omitted}`],
     ["Built C:\\build\\out.log", `Built ${omitted}`],
     ["Saved to \"D:\\work\\out.txt\"", `Saved to "${omitted}"`],
     ["file:///srv/app/x", omitted],
     ["See file://server/share/notes.txt.", `See ${omitted}.`],
     ["Open FILE:///srv/app/x", `Open ${omitted}`],
-    // A trailing run of punctuation stays in the text.
     ["(/srv/app/x).", `(${omitted}).`],
     ["Under /srv/app/x?!", `Under ${omitted}?!`],
-    // Addresses after paths; links and branch names are kept.
     ["Host 192.0.2.7:8080 answered; 192.0.2.8.", "Host [address omitted]:8080 answered; [address omitted]."],
     ["Pull request: https://github.com/example/api/pull/1", "Pull request: https://github.com/example/api/pull/1"],
     ["Branch: example/web infinite/web-change", "Branch: example/web infinite/web-change"],
@@ -907,7 +881,6 @@ test("an unread linked thread binds nothing, so the Linear comments are kept eve
     assert.equal(view.threadBound, false);
     assert.equal(view.comments.started, "delivered");
     assert.equal(ctx.linearServer.comments(issue.id).length, 1, "The started comment goes to Linear");
-    // Without a thread reader nothing is read, so a readable link binds nothing either.
     const readerless = new IntakeService(ctx.config, ctx.store, ctx.missions, new IntakeLinear(ctx.linear), { pollMs: 3600000, log: () => undefined });
     const readable = ctx.addThread(2100, ownerMention);
     const second = ctx.linearServer.file({ createdAt: ctx.iso(1100), attachmentUrls: [readable.link] });
@@ -938,7 +911,6 @@ test("past the 2,000-issue scan cap the issues read are still processed and the 
   try {
     const cap = "More labelled issues than one intake cycle reads.";
     const admitted = ctx.issue();
-    // Issues older than the enable time are read and set aside without a record, which keeps this cycle cheap.
     for (let index = 0; index < 2000; index++) ctx.linearServer.file({ createdAt: new Date(ctx.enabled - 60000).toISOString() });
     await ctx.intake.poll();
     assert.equal(viewOf(ctx, admitted.id)!.state, "started", "An issue on a page that was read is admitted");
@@ -961,7 +933,6 @@ test("failureSummary keeps the fixed text of a Slack or Linear request failure, 
   } finally { await ctx.close(); }
 });
 
-/** A direct request: the owner's mention is the thread's root, `later` messages follow it, and the thread is registered. */
 function direct(ctx: Ctx, text = "Export fails on empty rows\nPlease fix the exporter", more: (root: string) => SlackThreadMessage[] = () => [], offset = 2000) {
   const root = slackTs(ctx.enabled + offset);
   const thread: IntakeThread = { channelId: "C0000000000", threadTs: root };
@@ -979,7 +950,6 @@ test("a direct request files one issue and starts a mission whose objective mark
       { ts: slackTs(ctx.enabled + 2800), user: OWNER_SLACK, text: "go ahead" },
       { ts: slackTs(ctx.enabled + 9000), user: TEAMMATE_SLACK, text: "said after the mention" },
     ]);
-    // The mention is a reply: the owner's "go ahead" at +2800 is the message the host was asked on.
     request.ts = slackTs(ctx.enabled + 2800);
     assert.equal(ctx.intake.requestFromSlack(request), "accepted");
     await ctx.intake.poll();
@@ -1045,7 +1015,6 @@ test("a direct record saved without the tracked text adopts the tracker's text i
     assert.equal(ctx.intake.requestFromSlack(direct(ctx)), "accepted");
     await ctx.intake.poll();
     const [issue] = ctx.linearServer.allIssues();
-    // As an older host stored it: the host's own text and no tracked text.
     ctx.store.update(issue.id, next => { delete next.tracked; });
     await ctx.intake.poll();
     const adopted = ctx.store.get(issue.id)!;
@@ -1140,7 +1109,6 @@ test("a first save that lands on disk but reports failure leaves one record afte
     ctx.store.create = record => {
       if (!failed) {
         failed = true;
-        // The file lands through another handle, so this store's map never learns of it, as after a failed write report.
         new IntakeStore(ctx.config, ctx.storeKey).create(record);
         throw new Error("write reported failure");
       }
@@ -1183,7 +1151,6 @@ test("a save that fails after the issue was created is recovered after a restart
     await ctx.intake.poll();
     assert.equal(ctx.linearServer.allIssues().length, 1, "The issue was created");
     assert.equal(ctx.missions.list().length, 0);
-    // Restart: the store is read back from disk and Slack redelivers the event.
     ctx.intake.close();
     const reopened = new IntakeStore(ctx.config, ctx.storeKey);
     const restarted = new IntakeService(ctx.config, reopened, ctx.missions, new IntakeLinear(ctx.linear), { threads: ctx.threads, pollMs: 3600000,
@@ -1264,7 +1231,6 @@ test("a request made during an in-flight cycle is filed without waiting for the 
     let release!: () => void;
     ctx.threads.gate = new Promise<void>(resolve => { release = resolve; });
     ctx.intake.requestFromSlack(direct(ctx));
-    // The first cycle is blocked reading the first request's thread; the second request misses its `file` loop.
     await waitFor(async () => ctx.threads.waiting, count => count > 0, 10000);
     assert.equal(ctx.intake.requestFromSlack(direct(ctx, "Second request", () => [], 2400)), "accepted");
     release();
@@ -1315,9 +1281,6 @@ test("a failed read-back keeps the creation error", { timeout: 60000 }, async ()
   } finally { await ctx.close(); }
 });
 
-// Routing between an answer and a request (INF-238)
-
-/** Every Linear operation but the candidate read the admit step makes; none belongs to an answer. */
 const linearWrites = (ctx: Ctx) => ctx.linearServer.calls.map(call => call.operation);
 const askOptions = { requireSlackThread: false, admitIssues: false, answerQuestions: true } as const;
 
@@ -1465,7 +1428,6 @@ test("a restart between routing and the mission start yields one mission and one
     assert.deepEqual([held.state, held.direct?.route?.kind, held.direct?.route?.by, held.holdReason, ctx.missions.list().length], ["queued", "answer", "model", "The project is busy.", 0]);
     const routedAt = held.direct!.route!.at;
     ctx.intake.close();
-    // A new service on the same store, as after a restart; its router would answer differently if it were asked.
     const restarted = new IntakeService(ctx.config, ctx.store, ctx.missions, new IntakeLinear(ctx.linear), { threads: ctx.threads, pollMs: 3600000,
       router: async text => { second.push(text); return { route: "work", confidence: 1 }; },
       create: (request, origin) => ctx.missions.create(request, undefined, origin) });
@@ -1511,9 +1473,7 @@ test("a request saved before routing existed, or while answerQuestions was off, 
   const calls: string[] = [];
   const ctx = await setup({ requireSlackThread: false, admitIssues: false, router: async text => { calls.push(text); return { route: "answer", confidence: 1 }; } });
   try {
-    // Saved while the setting was off: no route and no marker, as a record made before this feature.
     ctx.intake.requestFromSlack(direct(ctx, "which exports failed?", () => [], 2000));
-    // A pending record written by older code: the same shape, saved directly, with a held filing.
     const root = slackTs(ctx.enabled + 4000);
     ctx.threads.threads.set(root, [{ ts: root, user: OWNER_SLACK, text: "update the exporter" }]);
     const now = new Date().toISOString();
@@ -1554,10 +1514,6 @@ test("a marked request whose route was not stored when routing was turned off go
   } finally { await ctx.close(); }
 });
 
-/**
- * Stages the mission's reported state without Task 1's stop: while `current` is set, `peek` returns the real mission with
- * it laid over, so a time-limit stop or a finish can be applied to a poll. Unset, the real mission is reported.
- */
 function staged(stage: { current?: Partial<Mission> }) {
   return (missions: MissionService): MissionService => new Proxy(missions, {
     get: (target, property) => {
@@ -1586,7 +1542,6 @@ test("a mission stopped at its time limit keeps its record started, and each sto
     await ctx.intake.poll();
     await ctx.intake.poll();
     assert.equal(ctx.linearServer.comments(issue.id).length, 2, "The started comment and one stop comment; repeated saves post nothing");
-    // The owner extends and the mission stops again at a later time: that stop posts once more.
     stage.current = { ...stage.current, deadlineAt: secondStop };
     await ctx.intake.poll();
     assert.equal(ctx.store.get(issue.id)!.deadlineNoticeFor, secondStop);
@@ -1625,7 +1580,6 @@ test("an issue closed during a time-limit stop is paused once the owner extends,
     ctx.linearServer.edit(issue.id, { stateType: "completed" });
     await ctx.intake.poll();
     assert.equal(ctx.store.get(issue.id)!.closure, undefined, "A stopped mission is not paused, so the closure waits");
-    // The owner extends: the mission is running again, and the next watch pauses it.
     stage.current = undefined;
     await ctx.intake.poll();
     assert.equal(ctx.missions.peek(id)!.status, "paused");
@@ -1640,7 +1594,6 @@ test("a newer outcome that replaces an outcome whose send is still open is not m
     const issue = ctx.issue();
     await ctx.intake.poll();
     const id = missionRequestId(issue.id);
-    // A Linear client whose next comment send is held open until the test releases it. The fixture server cannot hold a send.
     const base = new IntakeLinear(ctx.linear);
     const send = base.comment.bind(base);
     let hold: { started: () => void; release: Promise<void> } | undefined;
@@ -1655,9 +1608,7 @@ test("a newer outcome that replaces an outcome whose send is still open is not m
     const gated = ctx.service(base);
     const pending = gated.poll();
     await sendStarted;
-    // While the first outcome's send is open, a later stop replaces it with a newer comment.
     stage.current = { ...stage.current, deadlineAt: ctx.iso(20 * MINUTE) };
-    // observe() is private; calling it stands in for the mission change that a later stop would deliver.
     (gated as unknown as { observe(mission: Mission): void }).observe(ctx.missions.peek(id)!);
     const replacement = ctx.store.get(issue.id)!.comments.outcome!;
     releaseSend();

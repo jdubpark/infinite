@@ -92,8 +92,6 @@ test("session deletion requires an exited session without a responding worker", 
     assert.equal(stopped.status, 200);
     await waitFor(() => host.fetchApi(path), response => response.body.status === "exited");
 
-    // The worker persists its exit before it unlinks the IPC socket. Retry until
-    // the manager can confirm that no worker still answers its state call.
     const removed = await waitFor(() => host.fetchApi(path, "owner", undefined, {}, "DELETE"), response => response.status === 200);
     assert.deepEqual(removed.body, { ok: true, id });
     assert.equal((await host.fetchApi("/sessions")).body.sessions.some((session: any) => session.id === id), false);

@@ -207,7 +207,6 @@ test("Socket Mode projects admission metadata and fails closed on malformed fiel
 test("a socket address outside Slack is refused before any TCP connection", async t => {
   const { slack, client } = await setup();
   t.after(() => slack.close());
-  // A raw TCP listener on loopback counts every connection attempt. A client without the address check would dial it.
   let attempts = 0;
   const forbidden = createServer(socket => { attempts++; socket.destroy(); });
   await new Promise<void>(resolve => forbidden.listen(0, "127.0.0.1", resolve));

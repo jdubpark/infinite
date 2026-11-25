@@ -106,6 +106,7 @@ export class WorkNarrativeStore {
   private readonly activeWorkspaces = new Set<string>();
   private readonly activeTasks = new Set<Promise<void>>();
   private readonly queue: QueuedNarrativeJob[] = [];
+  private readonly storageFailures = new Map<string, { key: string; at: string; reason: string }>();
   private closed = false;
 
   constructor(private readonly options: {
@@ -130,6 +131,11 @@ export class WorkNarrativeStore {
     const pending = this.pending.get(jobKey);
     if (pending?.key === expected) return { state: "pending", requestedAt: pending.requestedAt };
     const record = this.read(workspaceId, workId);
+    const storageFailure = this.storageFailures.get(jobKey);
+    if (storageFailure) {
+      if (storageFailure.key !== expected || (record && record.key === expected)) this.storageFailures.delete(jobKey);
+      else return { state: "failed", at: storageFailure.at, reason: storageFailure.reason };
+    }
     if (record && record.key !== expected) return { state: "stale", generatedAt: record.generatedAt, reason: "The recorded work revision has advanced since this narrative was generated." };
     if (record) return { state: "ready", generatedAt: record.generatedAt, engine: record.engine, model: record.model };
     if (!this.options.adapter.explainWork || !this.options.config.repositoryBriefings) return unavailable("No summary writer is configured on this host.");
@@ -148,7 +154,8 @@ export class WorkNarrativeStore {
     const current = this.status(workspaceId, workId, run);
     if (current.state === "ready") return { narrative: current, queued: false };
     if (current.state === "pending") return { narrative: current, queued: false };
-    if (current.state === "failed") return { narrative: unavailable("A failed narrative is cooling down; try again after 10 minutes."), queued: false };
+    const jobKey = `${workspaceId}/${workId}`;
+    if (current.state === "failed" && !this.storageFailures.has(jobKey)) return { narrative: unavailable("A failed narrative is cooling down; try again after 10 minutes."), queued: false };
     if (!this.options.adapter.explainWork || !this.options.config.repositoryBriefings) return { narrative: unavailable("No summary writer is configured on this host."), queued: false };
     const gate = this.gate(workId, run);
     if (gate) return { narrative: gate, queued: false };
@@ -156,12 +163,12 @@ export class WorkNarrativeStore {
     const failedAt = state.failures[workId]?.at;
     if (failedAt && this.now().getTime() - Date.parse(failedAt) < COOLDOWN_MS) return { narrative: unavailable("A failed narrative cannot be retried for 10 minutes."), queued: false };
 
-    const jobKey = `${workspaceId}/${workId}`;
     const existingIndex = this.queue.findIndex(item => item.jobKey === jobKey);
     const queuedOther = this.queue.filter(item => item.workspaceId === workspaceId && item.jobKey !== jobKey).length;
     if (state.jobs + queuedOther >= DAILY_JOBS)
       return { narrative: unavailable("The daily work narrative budget is exhausted."), queued: false };
     if (existingIndex !== -1) this.queue.splice(existingIndex, 1);
+    this.storageFailures.delete(jobKey);
     const requestedAt = this.now().toISOString();
     const key = narrativeKey(workId, run.baseCommit ?? null, run.headCommit ?? null);
     this.pending.set(jobKey, { requestedAt, key });
@@ -241,8 +248,10 @@ export class WorkNarrativeStore {
       try { this.persist(workspaceId, budget); }
       catch {
         budget.jobs--;
+        this.storageFailures.set(jobKey, { key: expectedKey, at: this.now().toISOString(), reason: "Narrative storage is unavailable on this host." });
         return;
       }
+      this.storageFailures.delete(jobKey);
       const result = await this.options.adapter.explainWork!({ root: run.workspace, baseCommit: run.baseCommit, question: workQuestion(run) }, adapterOptions);
       const latest = currentRun();
       if (this.closed || !latest || !currentJob() || narrativeKey(workId, latest.baseCommit ?? null, latest.headCommit ?? null) !== expectedKey || latest.workspace !== run.workspace || this.gate(workId, latest)) return;

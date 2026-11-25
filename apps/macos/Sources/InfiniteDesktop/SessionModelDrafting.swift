@@ -4,6 +4,7 @@ import InfiniteCore
 extension SessionModel {
     func loadInitialDraft() async {
         guard !draftLoaded else { return }
+        draftLoadError = nil
         do {
             let loaded = try await deps.readDraft(identity)
             if draftTouched {
@@ -18,6 +19,7 @@ extension SessionModel {
                     draft.lastQueuedText = lastQueuedText
                 }
                 draftLoaded = true
+                draftLoadError = nil
                 draftVersion += 1
                 if draft.pending != nil && notice.isEmpty {
                     notice = "A previous send was not confirmed. Inspect the terminal before retrying the same send or clearing it."
@@ -28,14 +30,27 @@ extension SessionModel {
             } else {
                 draft = loaded
                 draftLoaded = true
+                draftLoadError = nil
                 draftVersion += 1
                 if draft.pending != nil && notice.isEmpty {
                     notice = "A previous send was not confirmed. Inspect the terminal before retrying the same send or clearing it."
                 }
             }
         } catch {
+            draftLoadError = error.localizedDescription
             notice = error.localizedDescription
         }
+    }
+
+    func retryInitialDraftLoad() async {
+        guard !draftLoaded else { return }
+        if let existing = draftLoadTask {
+            await existing.value
+            if draftLoaded { return }
+        }
+        let task = Task<Void, Never> { @MainActor [weak self] in await self?.loadInitialDraft() }
+        draftLoadTask = task
+        await task.value
     }
 
     func setDraft(_ text: String) {
@@ -204,8 +219,8 @@ extension SessionModel {
                 try await self.deps.saveDraft(latest, key)
                 guard self.draft.pending?.id == pendingID else { return }
                 editedDuringSave = self.draftVersion != latestStartVersion
-                if !editedDuringSave && self.draft.text == pendingText {
-                    self.draft.text = ""
+                if !editedDuringSave {
+                    self.draft.text = latest.text
                 }
                 self.draft.pending = nil
                 self.draftVersion += 1

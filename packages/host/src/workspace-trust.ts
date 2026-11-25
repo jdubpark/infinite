@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -67,25 +67,54 @@ function staleLockStatus(path: string): "missing" | "fresh" | "stale" {
   return Date.now() - info.mtimeMs > LOCK_STALE_MS ? "stale" : "fresh";
 }
 
-function lockInode(lock: string): bigint | undefined {
-  try { return statSync(lock, { bigint: true }).ino; }
+interface HeldLock {
+  fd: number;
+  dev: bigint;
+  ino: bigint;
+}
+
+function pinLock(lock: string): HeldLock | undefined {
+  let fd: number;
+  try { fd = openSync(lock, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0)); }
   catch (error) {
     if (gone(error)) return undefined;
     throw error;
   }
+  try {
+    const info = fstatSync(fd, { bigint: true });
+    return { fd, dev: info.dev, ino: info.ino };
+  } catch (error) {
+    try { closeSync(fd); } catch {}
+    throw error;
+  }
 }
 
-function assertLockOwner(lock: string, ownerIno: bigint) {
-  if (lockInode(lock) !== ownerIno) throw new Error("Claude config lock was lost to another process");
+function lockMatches(lock: string, held: HeldLock): boolean {
+  let info: ReturnType<typeof statSync>;
+  try { info = statSync(lock, { bigint: true }); }
+  catch (error) {
+    if (gone(error)) return false;
+    throw error;
+  }
+  return info.dev === held.dev && info.ino === held.ino;
 }
 
-function releaseLockIfOwned(lock: string, ownerIno: bigint) {
-  if (lockInode(lock) !== ownerIno) return;
-  try { rmdirSync(lock); }
-  catch (error) { if (!gone(error)) throw error; }
+function assertLockOwner(lock: string, held: HeldLock) {
+  if (!lockMatches(lock, held)) throw new Error("Claude config lock was lost to another process");
 }
 
-function tryRecoverStaleLock(lock: string): { acquired: bigint } | "retry" | "busy" {
+function releaseLock(lock: string, held: HeldLock) {
+  try {
+    if (lockMatches(lock, held)) {
+      try { rmdirSync(lock); }
+      catch (error) { if (!gone(error)) throw error; }
+    }
+  } finally {
+    try { closeSync(held.fd); } catch {}
+  }
+}
+
+function tryRecoverStaleLock(lock: string): { acquired: HeldLock } | "retry" | "busy" {
   const initial = staleLockStatus(lock);
   if (initial === "missing") return "retry";
   if (initial === "fresh") return "busy";
@@ -95,7 +124,7 @@ function tryRecoverStaleLock(lock: string): { acquired: bigint } | "retry" | "bu
     if (exists(error)) return "busy";
     throw error;
   }
-  let acquiredIno: bigint | undefined;
+  let acquired: HeldLock | undefined;
   try {
     const current = staleLockStatus(lock);
     if (current === "missing") return "retry";
@@ -107,9 +136,9 @@ function tryRecoverStaleLock(lock: string): { acquired: bigint } | "retry" | "bu
     }
     try {
       mkdirSync(lock);
-      acquiredIno = lockInode(lock);
-      if (acquiredIno === undefined) return "busy";
-      return { acquired: acquiredIno };
+      acquired = pinLock(lock);
+      if (acquired === undefined) return "busy";
+      return { acquired };
     } catch (error) {
       if (exists(error)) return "busy";
       throw error;
@@ -118,7 +147,7 @@ function tryRecoverStaleLock(lock: string): { acquired: bigint } | "retry" | "bu
     try { rmdirSync(recover); }
     catch (error) {
       if (!gone(error)) {
-        if (acquiredIno !== undefined) try { releaseLockIfOwned(lock, acquiredIno); } catch {}
+        if (acquired !== undefined) try { releaseLock(lock, acquired); } catch {}
         throw error;
       }
     }
@@ -127,40 +156,40 @@ function tryRecoverStaleLock(lock: string): { acquired: bigint } | "retry" | "bu
 
 function withClaudeConfigLock<T>(configPath: string, waitMs: number, update: (assertOwned: () => void) => T): T {
   const lock = `${configPath}.lock`, deadline = Date.now() + waitMs;
-  let ownerIno: bigint | undefined;
+  let held: HeldLock | undefined;
   for (let attempt = 1; ; attempt++) {
     try {
       mkdirSync(lock);
-      ownerIno = lockInode(lock);
-      if (ownerIno !== undefined) break;
+      held = pinLock(lock);
+      if (held !== undefined) break;
       continue;
     } catch (error) { if (!exists(error)) throw error; }
     if (Date.now() >= deadline) throw new Error("Claude config is locked by another process");
     const recovered = tryRecoverStaleLock(lock);
-    if (typeof recovered === "object") { ownerIno = recovered.acquired; break; }
+    if (typeof recovered === "object") { held = recovered.acquired; break; }
     if (recovered === "retry") continue;
     pause(Math.min(200, 20 * attempt));
   }
-  try { return update(() => assertLockOwner(lock, ownerIno!)); } finally { releaseLockIfOwned(lock, ownerIno!); }
+  try { return update(() => assertLockOwner(lock, held!)); } finally { releaseLock(lock, held!); }
 }
 
 export async function withClaudeConfigLockAsync<T>(configPath: string, waitMs: number, update: (assertOwned: () => void) => T | Promise<T>): Promise<T> {
   const lock = `${configPath}.lock`, deadline = Date.now() + waitMs;
-  let ownerIno: bigint | undefined;
+  let held: HeldLock | undefined;
   for (let attempt = 1; ; attempt++) {
     try {
       mkdirSync(lock);
-      ownerIno = lockInode(lock);
-      if (ownerIno !== undefined) break;
+      held = pinLock(lock);
+      if (held !== undefined) break;
       continue;
     } catch (error) { if (!exists(error)) throw error; }
     if (Date.now() >= deadline) throw new Error("Claude config is locked by another process");
     const recovered = tryRecoverStaleLock(lock);
-    if (typeof recovered === "object") { ownerIno = recovered.acquired; break; }
+    if (typeof recovered === "object") { held = recovered.acquired; break; }
     if (recovered === "retry") continue;
     await delay(Math.min(200, 20 * attempt));
   }
-  try { return await update(() => assertLockOwner(lock, ownerIno!)); } finally { releaseLockIfOwned(lock, ownerIno!); }
+  try { return await update(() => assertLockOwner(lock, held!)); } finally { releaseLock(lock, held!); }
 }
 
 function applyClaudeTrust(configPath: string, cwd: string, assertOwned?: () => void): boolean {

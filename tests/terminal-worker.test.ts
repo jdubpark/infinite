@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { createConnection } from "node:net";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import headless from "@xterm/headless";
@@ -819,6 +820,62 @@ test("terminal sockets dispatch zero control claims or PTY writes after aborting
     assert.equal(worker.events().filter(event => event.type === "input-intent").length, 0);
     assert.doesNotMatch(worker.output(), /ABORTED_MANAGED_WRITE/);
 
+    const sendMaskedText = (socket: ReturnType<typeof createConnection>, text: string) => {
+      const payload = Buffer.from(text, "utf8");
+      const mask = randomBytes(4);
+      const header = payload.length < 126
+        ? Buffer.from([0x81, 0x80 | payload.length])
+        : Buffer.from([0x81, 0xfe, (payload.length >> 8) & 0xff, payload.length & 0xff]);
+      const masked = Buffer.allocUnsafe(payload.length);
+      for (let i = 0; i < payload.length; i++) masked[i] = payload[i]! ^ mask[i & 3]!;
+      socket.write(Buffer.concat([header, mask, masked]));
+    };
+    const openRawWs = () => new Promise<{ socket: ReturnType<typeof createConnection>; closeFrameReceived: Promise<number> }>((resolve, reject) => {
+      const raw = createConnection({ host: "127.0.0.1", port });
+      let upgraded = false;
+      let buffer = Buffer.alloc(0);
+      let markCloseFrame!: (code: number) => void;
+      const closeFrameReceived = new Promise<number>(done => { markCloseFrame = done; });
+      const parseFrames = () => {
+        while (buffer.length >= 2) {
+          const opcode = buffer[0]! & 0x0f;
+          let len = buffer[1]! & 0x7f;
+          let offset = 2;
+          if (len === 126) { if (buffer.length < 4) return; len = buffer.readUInt16BE(2); offset = 4; }
+          else if (len === 127) { if (buffer.length < 10) return; len = Number(buffer.readBigUInt64BE(2)); offset = 10; }
+          if (buffer.length < offset + len) return;
+          const payload = buffer.subarray(offset, offset + len);
+          buffer = buffer.subarray(offset + len);
+          if (opcode === 0x08) markCloseFrame(payload.length >= 2 ? payload.readUInt16BE(0) : 1005);
+        }
+      };
+      raw.on("error", reject);
+      raw.on("data", chunk => {
+        buffer = Buffer.concat([buffer, chunk]);
+        if (!upgraded) {
+          const end = buffer.indexOf("\r\n\r\n");
+          if (end < 0) return;
+          assert.match(buffer.subarray(0, end).toString("utf8"), /^HTTP\/1\.1 101 /);
+          upgraded = true;
+          buffer = buffer.subarray(end + 4);
+          resolve({ socket: raw, closeFrameReceived });
+        }
+        parseFrames();
+      });
+      raw.once("connect", () => {
+        raw.write([
+          `GET /api/sessions/${worker.id}/terminal?after=0 HTTP/1.1`,
+          `Host: 127.0.0.1:${port}`,
+          "Upgrade: websocket",
+          "Connection: Upgrade",
+          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+          "Sec-WebSocket-Version: 13",
+          "",
+          "",
+        ].join("\r\n"));
+      });
+    });
+
     missionManaged = async () => true;
     let gracefulStateCalls = 0;
     let markReaderReached!: () => void;
@@ -842,21 +899,26 @@ test("terminal sockets dispatch zero control claims or PTY writes after aborting
       }
       return originalState(id, screen);
     };
-    const gracefulSocket = await connect();
-    const gracefulClosed = new Promise<number>(resolve => gracefulSocket.once("close", code => resolve(code)));
-    gracefulSocket.send(JSON.stringify({ token }));
-    await readerReached;
-    gracefulSocket.send(JSON.stringify({ op: "raw", requestId: randomUUID(), text: "GRACEFUL_CLOSE_WRITE\n" }));
-    await inputReached;
-    releaseReaderState({ ...liveState, status: "exited", exitCode: 0 });
-    assert.equal(await gracefulClosed, 1000);
-    releaseInputState({ ...liveState, attention: { ...liveState.attention, state: "needs-you" } });
-    await new Promise(resolve => setTimeout(resolve, 150));
-    stateInterceptor = undefined;
-    assert.equal(controlCalls, 0);
-    assert.equal((await worker.call({ op: "state" })).control, null);
-    assert.equal(worker.events().filter(event => event.type === "input-intent").length, 0);
-    assert.doesNotMatch(worker.output(), /GRACEFUL_CLOSE_WRITE/);
+    const { socket: rawSocket, closeFrameReceived } = await openRawWs();
+    try {
+      sendMaskedText(rawSocket, JSON.stringify({ token }));
+      await readerReached;
+      sendMaskedText(rawSocket, JSON.stringify({ op: "raw", requestId: randomUUID(), text: "GRACEFUL_CLOSE_WRITE\n" }));
+      sendMaskedText(rawSocket, JSON.stringify({ op: "raw", requestId: randomUUID(), text: "GRACEFUL_CLOSE_QUEUED\n" }));
+      await inputReached;
+      releaseReaderState({ ...liveState, status: "exited", exitCode: 0 });
+      assert.equal(await closeFrameReceived, 1000);
+      assert.equal(rawSocket.destroyed, false, "peer has not sent close ack yet so server stays in CLOSING before ws close fires");
+      releaseInputState({ ...liveState, attention: { ...liveState.attention, state: "needs-you" } });
+      await new Promise(resolve => setTimeout(resolve, 150));
+      stateInterceptor = undefined;
+      assert.equal(controlCalls, 0);
+      assert.equal((await worker.call({ op: "state" })).control, null);
+      assert.equal(worker.events().filter(event => event.type === "input-intent").length, 0);
+      assert.doesNotMatch(worker.output(), /GRACEFUL_CLOSE_WRITE|GRACEFUL_CLOSE_QUEUED/);
+    } finally {
+      rawSocket.destroy();
+    }
   } finally {
     closeTerminals();
     server.closeAllConnections();

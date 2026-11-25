@@ -462,4 +462,86 @@ private actor SessionRequestLog {
         XCTAssertEqual(model.draft.text, "stuck send")
         XCTAssertEqual(model.notice, "Disk locked")
     }
+
+    func testClearPendingPreservesTextEditedBackToPendingTextWhileAwaitingPriorSave() async throws {
+        let drafts = SessionMemoryDrafts()
+        await drafts.save(DraftRecord(text: "other text", pending: PendingSend(id: "req-1", text: "hello")), key: "profile-a:sess-1")
+        let firstSaveGate = SessionDeferred<Void>()
+        actor SaveStep {
+            var count = 0
+            func next() -> Int { count += 1; return count }
+        }
+        let step = SaveStep()
+        let deps = SessionModelDependencies(
+            readDraft: { await drafts.read($0) },
+            saveDraft: { draft, key in
+                if await step.next() == 1 { try await firstSaveGate.wait() }
+                await drafts.save(draft, key: key)
+            },
+            acquireMutation: { key, text in await drafts.acquireMutation(key, text: text) },
+            clearDraftIfMatching: { id, key in await drafts.clearIfMatching(id, key: key) },
+            sendRequest: { _, _, _, _ in .object([:]) },
+            openTerminal: { _, _, _ in "stream-1" },
+            closeTerminal: { _, _ in },
+            sendTerminal: { _, _, _ in }
+        )
+
+        let model = SessionModel(session: makeSession(), client: makeClient(), profileID: "profile-a", role: "owner", supportsStream: true, deps: deps)
+        await model.draftLoadTask?.value
+        model.setDraft("draft before clear")
+        try await Task.sleep(for: .milliseconds(300))
+        await firstSaveGate.waitUntilEntered()
+
+        let clearTask = Task { await model.clearPending() }
+        await Task.yield()
+        model.setDraft("hello")
+        await firstSaveGate.succeed(())
+        await clearTask.value
+
+        XCTAssertNil(model.draft.pending)
+        XCTAssertEqual(model.draft.text, "hello")
+        let persisted = await drafts.read("profile-a:sess-1")
+        XCTAssertNil(persisted.pending)
+        XCTAssertEqual(persisted.text, "hello")
+    }
+
+    func testRetryInitialDraftLoadRecoversFromFailureAndEnablesSending() async throws {
+        let drafts = SessionMemoryDrafts()
+        await drafts.save(DraftRecord(text: "unlocked draft"), key: "profile-a:sess-1")
+        actor LoadToggle {
+            var shouldFail = true
+            func failNow() -> Bool { shouldFail }
+            func recover() { shouldFail = false }
+        }
+        let toggle = LoadToggle()
+        let deps = SessionModelDependencies(
+            readDraft: { key in
+                if await toggle.failNow() { throw DesktopError("Keychain locked") }
+                return await drafts.read(key)
+            },
+            saveDraft: { draft, key in await drafts.save(draft, key: key) },
+            acquireMutation: { key, text in await drafts.acquireMutation(key, text: text) },
+            clearDraftIfMatching: { id, key in await drafts.clearIfMatching(id, key: key) },
+            sendRequest: { _, _, _, _ in .object([:]) },
+            openTerminal: { _, _, _ in "stream-1" },
+            closeTerminal: { _, _ in },
+            sendTerminal: { _, _, _ in }
+        )
+
+        let model = SessionModel(session: makeSession(), client: makeClient(), profileID: "profile-a", role: "owner", supportsStream: true, deps: deps)
+        model.attached = true
+        await model.draftLoadTask?.value
+
+        XCTAssertFalse(model.draftLoaded)
+        XCTAssertEqual(model.draftLoadError, "Keychain locked")
+        XCTAssertFalse(model.canSend)
+
+        await toggle.recover()
+        await model.retryInitialDraftLoad()
+
+        XCTAssertTrue(model.draftLoaded)
+        XCTAssertNil(model.draftLoadError)
+        XCTAssertEqual(model.draft.text, "unlocked draft")
+        XCTAssertTrue(model.canSend)
+    }
 }

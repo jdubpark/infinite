@@ -700,13 +700,20 @@ test("charge-at-dispatch persists zero charges for canceled or gate-refused queu
     });
     failTarget = ws3File;
     assert.equal(store3.refresh("workspace-3", `team:${run1.id}`, run1, "owner").queued, true);
-    await waitFor(() => store3!.status("workspace-3", `team:${run1.id}`, run1).state === "unavailable" ? true : null);
+    const failedStatus = await waitFor(() => {
+      const value = store3!.status("workspace-3", `team:${run1.id}`, run1);
+      return value.state === "pending" ? null : value;
+    });
+    assert.equal(failedStatus.state, "failed");
+    assert.match(failedStatus.reason, /storage is unavailable/i);
     assert.equal(dispatchCalls, 0, "a failed dispatch-time quota persist must not invoke the writer");
     assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws3File, "utf8")).jobs, 47);
+    assert.equal(store3.status("workspace-3", `team:${run1.id}`, { ...run1, headCommit: "b".repeat(40) }).state, "unavailable");
     failTarget = null;
     assert.equal(store3.refresh("workspace-3", `team:${run1.id}`, run1, "owner").queued, true);
     await waitFor(() => store3!.read("workspace-3", `team:${run1.id}`));
     assert.equal(dispatchCalls, 1);
+    assert.equal(store3.status("workspace-3", `team:${run1.id}`, run1).state, "ready");
     assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws3File, "utf8")).jobs, 48);
     await store3.close();
   } finally {
@@ -716,5 +723,149 @@ test("charge-at-dispatch persists zero charges for canceled or gate-refused queu
     releaseFirst?.();
     releaseWindDown?.();
     await Promise.allSettled([store1?.close(), store2?.close(), store3?.close(), reopened1?.close(), reopened2?.close()]);
+  }
+});
+
+test("seeded simulator verifies durable narrative quota accounting across replacements, rollovers, faults, close, and reload", async t => {
+  let seed = 0x5eed1234;
+  const rand = () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let x = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    x ^= x + Math.imul(x ^ (x >>> 7), 61 | x);
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
+  const pick = <T>(items: readonly T[]): T => items[Math.floor(rand() * items.length)]!;
+
+  let nowMs = Date.parse("2026-10-25T12:00:00.000Z");
+  const now = () => new Date(nowMs);
+  const utcDay = () => now().toISOString().slice(0, 10);
+  const f = setup(t, { now });
+  const storeDir = join(f.stateDir, "understanding", "work-narratives");
+  mkdirSync(storeDir, { recursive: true });
+  const workspaces = ["sim-ws-1", "sim-ws-2"] as const;
+  const repos = Array.from({ length: 4 }, (_, index) => {
+    const ws = workspaces[Math.floor(index / 2)]!;
+    const dir = join(f.directory, `sim-repo-${index}`);
+    mkdirSync(join(dir, "src"), { recursive: true });
+    execFileSync("git", ["init", dir], { stdio: "ignore" });
+    writeFileSync(join(dir, "src/a.ts"), `export const r${index} = 0;\n`);
+    const baseCommit = commit(dir, `base-${index}`);
+    writeFileSync(join(dir, "src/a.ts"), `export const r${index} = 1;\n`);
+    const headCommit = commit(dir, `head-${index}-1`);
+    return { ws, dir, rev: 1, run: { ...structuredClone(f.run), id: `sim-run-${index}`, workspace: dir, baseCommit, headCommit } };
+  });
+
+  const realRenameSync = fs.renameSync;
+  let failPersist = false;
+  fs.renameSync = ((src: fs.PathLike, dest: fs.PathLike) => {
+    if (failPersist && String(dest).startsWith(storeDir)) throw Object.assign(new Error("sim write fault"), { code: "EIO" });
+    return realRenameSync(src, dest);
+  }) as typeof fs.renameSync;
+  syncBuiltinESMExports();
+
+  const expectedByDay = new Map<string, number>();
+  const keyOf = (ws: string, day: string) => `${ws}:${day}`;
+  const assertDiskMatchesOracle = (label: string) => {
+    const day = utcDay();
+    for (const ws of workspaces) {
+      const file = join(storeDir, `${ws}.sealed`);
+      const expected = expectedByDay.get(keyOf(ws, day)) ?? 0;
+      if (!existsSync(file)) {
+        assert.equal(expected, 0, `${label}: ${ws} missing file must have 0 dispatches`);
+        continue;
+      }
+      const saved = unseal<{ day: string; jobs: number }>(f.key, "understanding-work-narrative", readFileSync(file, "utf8"));
+      const actual = saved.day === day ? saved.jobs : 0;
+      assert.equal(actual, expected, `${label}: ${ws} persisted jobs must equal dispatched count on ${day}`);
+      assert.ok(actual <= 48, `${label}: ${ws} persisted jobs must not exceed daily limit`);
+    }
+  };
+
+  const blockedRuns = new Set<string>();
+  let holdWriters = false;
+  const waiters: Array<() => void> = [];
+  let inFlight = 0;
+  const makeStore = () => new WorkNarrativeStore({
+    config: f.config, key: f.key, now,
+    adapter: { explainWork: async ({ root }, { signal }) => {
+      inFlight++;
+      const entry = repos.find(item => item.dir === root)!;
+      const k = keyOf(entry.ws, utcDay());
+      expectedByDay.set(k, (expectedByDay.get(k) ?? 0) + 1);
+      try {
+        if (holdWriters) {
+          await new Promise<void>((resolve, reject) => {
+            const onAbort = () => reject(new Error("aborted"));
+            signal.addEventListener("abort", onAbort, { once: true });
+            waiters.push(() => { signal.removeEventListener("abort", onAbort); resolve(); });
+          });
+        }
+        return explanation();
+      } finally {
+        inFlight--;
+      }
+    } },
+    teams: { understandingRecords: () => repos.map(item => item.run), pendingOperation: id => blockedRuns.has(id) },
+  });
+
+  let store = makeStore();
+  const settleStore = async () => {
+    holdWriters = false;
+    while (waiters.length) waiters.shift()!();
+    await waitFor(() => inFlight === 0 && repos.every(r => store.status(r.ws, `team:${r.run.id}`, r.run).state !== "pending") ? true : null);
+  };
+
+  try {
+    for (let step = 0; step < 50; step++) {
+      const action = rand();
+      if (action < 0.35) {
+        const repo = pick(repos);
+        if (rand() < 0.45) {
+          repo.rev++;
+          writeFileSync(join(repo.dir, "src/a.ts"), `export const v = ${repo.rev};\n`);
+          repo.run.headCommit = commit(repo.dir, `step-${step}-${repo.rev}`);
+        }
+        holdWriters = rand() < 0.5;
+        failPersist = rand() < 0.2;
+        store.refresh(repo.ws, `team:${repo.run.id}`, repo.run, "owner");
+        await Promise.resolve();
+        await Promise.resolve();
+        failPersist = false;
+      } else if (action < 0.52) {
+        const repo = pick(repos);
+        if (blockedRuns.has(repo.run.id)) blockedRuns.delete(repo.run.id);
+        else blockedRuns.add(repo.run.id);
+      } else if (action < 0.72) {
+        await settleStore();
+        assertDiskMatchesOracle(`step-${step}-settle`);
+      } else if (action < 0.85) {
+        failPersist = rand() < 0.5;
+        await store.close();
+        failPersist = false;
+        while (waiters.length) waiters.shift()!();
+        assertDiskMatchesOracle(`step-${step}-reopen`);
+        store = makeStore();
+      } else {
+        await settleStore();
+        assertDiskMatchesOracle(`step-${step}-before-rollover`);
+        nowMs += 86_400_000;
+      }
+    }
+    await store.close();
+    assertDiskMatchesOracle("final");
+
+    const checkFile = join(storeDir, `${workspaces[0]}.sealed`);
+    const existing = existsSync(checkFile)
+      ? unseal<{ version: 1; day: string; jobs: number; records: Record<string, unknown>; failures: Record<string, unknown> }>(f.key, "understanding-work-narrative", readFileSync(checkFile, "utf8"))
+      : { version: 1 as const, day: utcDay(), jobs: 0, records: {}, failures: {} };
+    writeFileSync(checkFile, seal(f.key, "understanding-work-narrative", { ...existing, day: utcDay(), jobs: (expectedByDay.get(keyOf(workspaces[0], utcDay())) ?? 0) + 1 }));
+    assert.throws(() => assertDiskMatchesOracle("negative-control"), /persisted jobs must equal dispatched count/);
+  } finally {
+    failPersist = false;
+    holdWriters = false;
+    while (waiters.length) waiters.shift()!();
+    fs.renameSync = realRenameSync;
+    syncBuiltinESMExports();
+    await store.close();
   }
 });

@@ -340,12 +340,16 @@ final class SyncSafetyTests: XCTestCase {
         try stagedBlocked.handle.write(contentsOf: Data("blocked by coordinator".utf8))
         let coordinatorEntered = DispatchSemaphore(value: 0)
         let releaseCoordinator = DispatchSemaphore(value: 0)
-        defer { releaseCoordinator.signal() }
+        let holderReleased = LockFreeInt64(0)
+        defer {
+            holderReleased.store(1)
+            releaseCoordinator.signal()
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             var coordinationError: NSError?
             NSFileCoordinator().coordinate(writingItemAt: stagedBlocked.destination, options: .forReplacing, error: &coordinationError) { _ in
                 coordinatorEntered.signal()
-                _ = releaseCoordinator.wait(timeout: .now() + 5)
+                releaseCoordinator.wait()
             }
         }
         XCTAssertEqual(coordinatorEntered.wait(timeout: .now() + 2), .success)
@@ -353,12 +357,44 @@ final class SyncSafetyTests: XCTestCase {
             try await LocalFiles.installAsync(stagedBlocked, expected: nil)
         }
         try await Task.sleep(for: .milliseconds(30))
+        let cancelStarted = Date()
         inFlightInstall.cancel()
         do {
             try await inFlightInstall.value
             XCTFail("Expected in-flight installAsync to throw CancellationError")
         } catch is CancellationError {}
+        XCTAssertLessThan(Date().timeIntervalSince(cancelStarted), 1.0)
+        XCTAssertEqual(holderReleased.load(), 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+
+        let committedTarget = root.appendingPathComponent("committed.txt")
+        try Data("old".utf8).write(to: committedTarget)
+        let oldVersion = try XCTUnwrap(LocalFiles.version(root: root, path: "committed.txt"))
+        let stagedCommit = try LocalFiles.stage(root: root, path: "committed.txt")
+        try stagedCommit.handle.write(contentsOf: Data("new committed content".utf8))
+        var commitChecks = 0
+        try LocalFiles.install(stagedCommit, expected: oldVersion, isCancelled: {
+            commitChecks += 1
+            return commitChecks > 6
+        })
+        XCTAssertEqual(try String(contentsOf: committedTarget, encoding: .utf8), "new committed content")
+
+        let conflictTarget = root.appendingPathComponent("conflict.txt")
+        try Data("initial".utf8).write(to: conflictTarget)
+        let previewVersion = try XCTUnwrap(LocalFiles.version(root: root, path: "conflict.txt"))
+        try Data("competing edit".utf8).write(to: conflictTarget)
+        let stagedConflict = try LocalFiles.stage(root: root, path: "conflict.txt")
+        try stagedConflict.handle.write(contentsOf: Data("new content".utf8))
+        var conflictChecks = 0
+        do {
+            try LocalFiles.install(stagedConflict, expected: previewVersion, isCancelled: {
+                conflictChecks += 1
+                return conflictChecks > 5
+            })
+            XCTFail("Expected local-conflict DesktopError to be preserved")
+        } catch let error as DesktopError {
+            XCTAssertEqual(error.code, "local-conflict")
+        }
 
         let source = root.appendingPathComponent("upload-source.txt")
         try Data("payload".utf8).write(to: source)

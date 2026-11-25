@@ -539,7 +539,11 @@ private actor CmuxFakeBackend {
             var gateFlush = false
             func enable() { gateFlush = true }
         }
+        @MainActor final class ModelBox {
+            var model: CmuxViewModel?
+        }
         let flag = SaveGateFlag()
+        let box = ModelBox()
         let deps = CmuxViewModelDependencies(
             helperURL: { URL(fileURLWithPath: "/nonexistent/cmux") },
             connect: { _, _, _, _, _ in },
@@ -564,7 +568,14 @@ private actor CmuxFakeBackend {
             closeTerminal: { _, _ in },
             readDraft: { await fake.read($0) },
             saveDraft: { draft, key in
-                if await flag.gateFlush { try await flushGate.wait() }
+                if await flag.gateFlush {
+                    await MainActor.run {
+                        XCTAssertEqual(box.model?.inputFenced, true)
+                        XCTAssertEqual(box.model?.disconnecting, true)
+                        XCTAssertEqual(box.model?.inputEnabled, false)
+                    }
+                    try await flushGate.wait()
+                }
                 await fake.save(draft, key: key)
             },
             acquireMutation: { key, text in await fake.acquireMutation(key, text: text) },
@@ -572,6 +583,7 @@ private actor CmuxFakeBackend {
         )
 
         let model = CmuxViewModel(deps: deps)
+        box.model = model
         model.profiles = [CmuxHostProfile(id: "p1", label: "Host", route: "wss://cmux.example/v1/link")]
         model.activeID = "p1"
         model.setDisplayVisible(true)
@@ -712,5 +724,68 @@ private actor CmuxFakeBackend {
         XCTAssertFalse(model.attaching)
         XCTAssertFalse(model.draftEditingLocked)
         XCTAssertFalse(model.inputFenced)
+    }
+
+    func testStaleRawDrainerErrorNeverClearsNewerGenerationKeysOrInput() async throws {
+        let fake = CmuxFakeBackend()
+        let firstRawGate = CmuxDeferred<Void>()
+        actor RawStep {
+            var count = 0
+            func next() -> Int { count += 1; return count }
+        }
+        let step = RawStep()
+        let deps = CmuxViewModelDependencies(
+            helperURL: { URL(fileURLWithPath: "/nonexistent/cmux") },
+            connect: { _, _, _, _, _ in },
+            snapshot: { await fake.snapshot() },
+            attach: { id, handler in
+                await fake.setOutput(id, handler)
+                handler(.snapshot(Data("ok".utf8), columns: 80, rows: 24))
+            },
+            detach: {},
+            disconnect: {},
+            paste: { _ in .queued },
+            send: { data in
+                if await step.next() == 1 {
+                    try await firstRawGate.wait()
+                }
+                await fake.recordSend(data)
+                return .queued
+            },
+            resize: { _, _ in },
+            createTerminal: { _, _, _, _ in "term-created" },
+            closeTerminal: { _, _ in },
+            readDraft: { await fake.read($0) },
+            saveDraft: { draft, key in await fake.save(draft, key: key) },
+            acquireMutation: { key, text in await fake.acquireMutation(key, text: text) },
+            clearDraftIfMatching: { id, key in await fake.clearIfMatching(id, key: key) }
+        )
+
+        let model = CmuxViewModel(deps: deps)
+        model.profiles = [CmuxHostProfile(id: "p1", label: "Host", route: "wss://cmux.example/v1/link")]
+        model.activeID = "p1"
+        model.setDisplayVisible(true)
+        await model.connect()
+        try await Task.sleep(for: .milliseconds(50))
+        model.rendererRestored(model.rendererGeneration)
+        model.setInputEnabled(true)
+        model.directInput = true
+
+        model.raw("old")
+        await firstRawGate.waitUntilEntered()
+
+        model.setInputEnabled(false)
+        model.setInputEnabled(true)
+        model.directInput = true
+        model.raw("new")
+        try await Task.sleep(for: .milliseconds(30))
+
+        await firstRawGate.fail(DesktopError("Stale stream write failed"))
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertTrue(model.inputEnabled)
+        XCTAssertTrue(model.directInput)
+        let sent = await fake.sentBytes
+        XCTAssertEqual(sent, [Data("new".utf8)])
     }
 }

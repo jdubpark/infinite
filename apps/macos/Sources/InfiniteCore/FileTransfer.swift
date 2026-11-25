@@ -166,12 +166,18 @@ public enum LocalFiles {
     static func install(_ staged: LocalDownload, expected: FileVersion?, coordinator: NSFileCoordinator = NSFileCoordinator(), isCancelled: () -> Bool = { Task.isCancelled }) throws {
         if isCancelled() { throw CancellationError() }
         var coordinationError: NSError?, result: Result<Void, Error> = .success(())
+        var accessorRan = false
         coordinator.coordinate(writingItemAt: staged.destination, options: .forReplacing, error: &coordinationError) { _ in
             if isCancelled() {
                 result = .failure(CancellationError())
                 return
             }
+            accessorRan = true
             result = Result { try staged.install(expected: expected, isCancelled: isCancelled) }
+        }
+        if accessorRan {
+            try result.get()
+            return
         }
         if isCancelled() { throw CancellationError() }
         if let coordinationError { throw coordinationError }; try result.get()
@@ -195,11 +201,7 @@ public enum LocalFiles {
                         try install(staged, expected: expected, coordinator: coordinator.value, isCancelled: { gate.load() != 0 })
                         continuation.resume()
                     } catch {
-                        if gate.load() != 0 {
-                            continuation.resume(throwing: CancellationError())
-                        } else {
-                            continuation.resume(throwing: error)
-                        }
+                        continuation.resume(throwing: error)
                     }
                 }
             }

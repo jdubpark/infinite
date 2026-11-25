@@ -466,6 +466,13 @@ struct SessionPane: View {
     }
     private var composer: some View {
         VStack(spacing: 8) {
+            if !model.draftLoaded, let draftError = model.draftLoadError {
+                HStack(spacing: 8) {
+                    Text(draftError).font(.caption).foregroundStyle(.orange).lineLimit(2)
+                    Spacer()
+                    Button("Retry Loading Draft") { Task { await model.retryInitialDraftLoad() } }.controlSize(.small)
+                }
+            }
             PromptEditor(text: Binding(get: { model.draft.text }, set: model.setDraft), placeholder: "Message \(providerName(session.provider))…",
                          enabled: model.canSend && model.role != "viewer" && !promptBlocks,
                          editable: model.draftLoaded && model.role != "viewer",

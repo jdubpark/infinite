@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, mkdtempSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:net";
@@ -10,7 +10,7 @@ import { initialAttention } from "@infinite/attention";
 import { claimControl, endSessionWorkers, startHost, waitFor } from "./helpers.js";
 import { readConfig, hashToken } from "../packages/host/src/config.js";
 import { LaunchHeldError, type HostReading } from "../packages/host/src/host-load.js";
-import { socketPath } from "../packages/host/src/ipc.js";
+import { socketPath, workerCall } from "../packages/host/src/ipc.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { writeSealed } from "../packages/host/src/vault.js";
 import type { Config, Session } from "../packages/host/src/types.js";
@@ -385,7 +385,7 @@ test("queued team launches recheck hostLoad after create admission and release t
   }
 });
 
-test("concurrent creates with uppercase and lowercase spellings of the same requestId converge to one session", { timeout: 30_000 }, async () => {
+test("concurrent creates with uppercase and lowercase spellings converge to one session while preserving legacy mixed-case records", { timeout: 30_000 }, async () => {
   const root = realpathSync(mkdtempSync("/tmp/inf-uuid-case-"));
   const stateDir = join(root, "state"), runDir = join(root, "r"), projectDir = join(root, "project"), keyFile = join(root, "key");
   const agentScript = join(root, "agent.mjs");
@@ -401,18 +401,42 @@ test("concurrent creates with uppercase and lowercase spellings of the same requ
   const manager = new Manager(config, key);
   const canonical = randomUUID().toLowerCase();
   const upper = canonical.toUpperCase();
+  const legacyUpper = randomUUID().toUpperCase();
+  const legacyRequest = { requestId: legacyUpper, provider: "demo" as const, projectId: "rehearsal", title: "Legacy upper", prompt: "Legacy prompt" };
+  mkdirSync(join(stateDir, "sessions", legacyUpper), { recursive: true });
+  writeSealed(join(stateDir, "sessions", legacyUpper, "meta.sealed"), key, `${legacyUpper}:meta`, {
+    session: {
+      id: legacyUpper, provider: "demo", title: "Legacy upper", projectId: "rehearsal", cwd: projectDir,
+      createdAt: new Date().toISOString(), status: "exited", contextVersion: 0, context: "", initialPrompt: "Legacy prompt",
+    } as Session,
+    fingerprint: createHash("sha256").update(JSON.stringify(legacyRequest)).digest("hex"),
+  });
+  writeSealed(join(stateDir, "sessions", legacyUpper, "status.sealed"), key, `${legacyUpper}:status`, {
+    status: "exited", seq: 1, screen: "", exitCode: 0, attention: initialAttention(new Date().toISOString(), false),
+  });
   try {
+    assert.equal(manager.meta(legacyUpper).session.id, legacyUpper);
+    assert.equal((await manager.list()).some(session => session.id === legacyUpper), true);
+    const replayedExact = await manager.create(legacyRequest);
+    assert.equal(replayedExact.id, legacyUpper);
+    assert.equal(replayedExact.status, "exited");
+    const replayedLower = await manager.create({ ...legacyRequest, requestId: legacyUpper.toLowerCase() });
+    assert.equal(replayedLower.id, legacyUpper);
+    assert.equal(replayedLower.status, "exited");
+
     const [a, b] = await Promise.all([
       manager.create({ requestId: upper, provider: "demo", projectId: "rehearsal", title: "Case check", prompt: "Same prompt" }),
       manager.create({ requestId: canonical, provider: "demo", projectId: "rehearsal", title: "Case check", prompt: "Same prompt" }),
     ]);
-    assert.equal(a.id, canonical);
-    assert.equal(b.id, canonical);
+    assert.equal(a.id, b.id);
+    assert.ok(a.id === upper || a.id === canonical);
     assert.equal(a.runtime?.id, b.runtime?.id);
+    const directState = await workerCall<{ status: string }>(runDir, a.id, { op: "state" });
+    assert.equal(directState.status, "running");
     const live = (await manager.list()).filter(session => session.status === "running" || session.status === "starting");
-    assert.deepEqual(live.map(session => session.id), [canonical]);
+    assert.deepEqual(live.map(session => session.id), [a.id]);
     await assert.rejects(
-      manager.create({ requestId: upper, provider: "demo", projectId: "rehearsal", title: "Case check", prompt: "Different prompt" }),
+      manager.create({ requestId: a.id === upper ? canonical : upper, provider: "demo", projectId: "rehearsal", title: "Case check", prompt: "Different prompt" }),
       /different session/,
     );
   } finally {

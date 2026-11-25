@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import fs, { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -816,22 +816,24 @@ test("concurrent stale-lock recovery never removes a newly acquired Claude lock 
   }
 });
 
-test("Claude trust aborts commit and leaves replacement lock untouched if lock inode changes mid-update", async () => {
+test("Claude trust pins lock fd to prevent inode reuse, aborts commit, and leaves replacement lock untouched", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-claude-inode-")));
   const realWriteFileSync = fs.writeFileSync;
   try {
-    const config = join(root, ".claude.json"), lock = `${config}.lock`, parked = `${config}.parked`;
+    const config = join(root, ".claude.json"), lock = `${config}.lock`;
     const member = join(root, "member"), otherWriter = "/srv/other-writer";
     mkdirSync(member);
     writeFileSync(config, JSON.stringify({ numStartups: 5, projects: {} }));
 
+    let originalIno: bigint | undefined;
     let replacementIno: bigint | undefined;
     let swapped = false;
     fs.writeFileSync = ((file: fs.PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, options?: fs.WriteFileOptions) => {
       const result = (realWriteFileSync as (...args: unknown[]) => unknown)(file, data, options);
       if (!swapped && typeof file === "string" && file.endsWith(".tmp")) {
         swapped = true;
-        renameSync(lock, parked);
+        originalIno = statSync(lock, { bigint: true }).ino;
+        rmdirSync(lock);
         mkdirSync(lock);
         replacementIno = statSync(lock, { bigint: true }).ino;
         realWriteFileSync(config, JSON.stringify({ numStartups: 6, projects: { [otherWriter]: { hasTrustDialogAccepted: true } } }));
@@ -846,6 +848,7 @@ test("Claude trust aborts commit and leaves replacement lock untouched if lock i
       syncBuiltinESMExports();
     }
     assert.equal(swapped, true);
+    assert.notEqual(replacementIno, originalIno, "pinned open lock fd prevents filesystem inode reuse after rmdir+mkdir");
     assert.equal(existsSync(lock), true, "replacement lock owned by another writer must not be unlinked in finally");
     assert.equal(statSync(lock, { bigint: true }).ino, replacementIno);
     assert.deepEqual(JSON.parse(readFileSync(config, "utf8")), {

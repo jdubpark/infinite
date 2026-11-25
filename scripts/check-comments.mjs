@@ -10,7 +10,15 @@ export const BASELINE_PATH = "scripts/comments-baseline.json";
 const TS_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]);
 const C_LIKE_EXTENSIONS = new Set([".swift", ".c", ".h", ".kt", ".kts"]);
 const HASH_EXTENSIONS = new Set([".py", ".sh"]);
-const ALL_EXTENSIONS = new Set([...TS_EXTENSIONS, ...C_LIKE_EXTENSIONS, ...HASH_EXTENSIONS]);
+const CSS_EXTENSIONS = new Set([".css"]);
+const SYSTEMD_EXTENSIONS = new Set([".service", ".timer", ".socket"]);
+const ALL_EXTENSIONS = new Set([
+  ...TS_EXTENSIONS,
+  ...C_LIKE_EXTENSIONS,
+  ...HASH_EXTENSIONS,
+  ...CSS_EXTENSIONS,
+  ...SYSTEMD_EXTENSIONS,
+]);
 const SKIPPED_SEGMENTS = new Set(["node_modules", "vendor", "generated", "dist", ".build"]);
 
 const TS_DIRECTIVE_RE = /^(?:\/\/\/\s*<reference\b[^\n]*\/>\s*$|\/\/\s*@ts-expect-error(?:\s|$)|\/\/\s*eslint-disable-next-line(?:\s+[A-Za-z0-9_@/-]+(?:\s*,\s*[A-Za-z0-9_@/-]+)*)?\s*$)/;
@@ -421,9 +429,132 @@ function extractShellComments(text) {
   return comments;
 }
 
+function isCssIdentChar(ch) {
+  if (!ch) return false;
+  const code = ch.charCodeAt(0);
+  return (
+    (code >= 48 && code <= 57) ||
+    (code >= 65 && code <= 90) ||
+    (code >= 97 && code <= 122) ||
+    code === 45 ||
+    code === 95 ||
+    code >= 128
+  );
+}
+
+function trySkipCssUnquotedUrl(text, startIndex) {
+  const n = text.length;
+  if (startIndex + 4 > n) return -1;
+  if (startIndex > 0 && (isCssIdentChar(text[startIndex - 1]) || text[startIndex - 1] === "\\")) return -1;
+  if (text.slice(startIndex, startIndex + 4).toLowerCase() !== "url(") return -1;
+  let i = startIndex + 4;
+  while (i < n && (text[i] === " " || text[i] === "\t" || text[i] === "\n" || text[i] === "\r" || text[i] === "\f")) {
+    i += 1;
+  }
+  if (i < n && (text[i] === '"' || text[i] === "'")) return -1;
+  while (i < n) {
+    const ch = text[i];
+    if (ch === "\\") {
+      i += text[i + 1] === "\r" && text[i + 2] === "\n" ? 3 : 2;
+      continue;
+    }
+    if (ch === ")") return i + 1;
+    i += 1;
+  }
+  return n;
+}
+
+function extractCssComments(text) {
+  const starts = lineStartsOf(text);
+  const comments = [];
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (ch === "\\") {
+      i += next === "\r" && text[i + 2] === "\n" ? 3 : 2;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      i += 1;
+      while (i < n) {
+        const c = text[i];
+        if (c === "\\") {
+          i += text[i + 1] === "\r" && text[i + 2] === "\n" ? 3 : 2;
+          continue;
+        }
+        if (c === quote) {
+          i += 1;
+          break;
+        }
+        if (c === "\n") break;
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === "u" || ch === "U") {
+      const urlEnd = trySkipCssUnquotedUrl(text, i);
+      if (urlEnd !== -1) {
+        i = urlEnd;
+        continue;
+      }
+    }
+    if (ch === "/" && next === "*") {
+      const start = i;
+      i += 2;
+      while (i < n && !(text[i] === "*" && text[i + 1] === "/")) i += 1;
+      if (i < n) i += 2;
+      const end = i;
+      const startLine = offsetToLine(starts, start);
+      const endLine = offsetToLine(starts, Math.max(start, end - 1));
+      const before = text.slice(starts[startLine - 1], start);
+      const lineEnd = text.indexOf("\n", end);
+      const after = text.slice(end, lineEnd === -1 ? n : lineEnd);
+      comments.push({
+        start,
+        end,
+        startLine,
+        endLine,
+        kind: "block",
+        fullLineOnly: before.trim() === "" && after.trim() === "",
+        text: text.slice(start, end),
+      });
+      continue;
+    }
+    i += 1;
+  }
+  return comments;
+}
+
+function extractSystemdComments(text) {
+  const starts = lineStartsOf(text);
+  const comments = [];
+  const lines = text.split("\n");
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const rawLine = lines[idx];
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    let j = 0;
+    while (j < line.length && (line[j] === " " || line[j] === "\t")) j += 1;
+    if (j < line.length && (line[j] === "#" || line[j] === ";")) {
+      comments.push({
+        start: starts[idx] + j,
+        end: starts[idx] + line.length,
+        startLine: idx + 1,
+        endLine: idx + 1,
+        kind: "line",
+        fullLineOnly: true,
+        text: line.slice(j),
+      });
+    }
+  }
+  return comments;
+}
+
 function isAllowedDirective(item, ext) {
   const trimmed = item.text.trim();
-  if (item.startLine === 1 && trimmed.startsWith("#!")) return true;
+  if ((TS_EXTENSIONS.has(ext) || HASH_EXTENSIONS.has(ext)) && item.startLine === 1 && trimmed.startsWith("#!")) return true;
   if (TS_EXTENSIONS.has(ext)) return TS_DIRECTIVE_RE.test(trimmed);
   if (ext === ".swift") return item.startLine === 1 && SWIFT_DIRECTIVE_RE.test(trimmed);
   if (ext === ".sh") return SHELL_DIRECTIVE_RE.test(trimmed);
@@ -437,6 +568,8 @@ export function extractComments(text, filePath) {
   else if (C_LIKE_EXTENSIONS.has(ext)) raw = extractCLikeComments(text, ext);
   else if (ext === ".py") raw = extractPythonComments(text);
   else if (ext === ".sh") raw = extractShellComments(text);
+  else if (CSS_EXTENSIONS.has(ext)) raw = extractCssComments(text);
+  else if (SYSTEMD_EXTENSIONS.has(ext)) raw = extractSystemdComments(text);
 
   const filtered = raw.filter((item) => !isAllowedDirective(item, ext));
 

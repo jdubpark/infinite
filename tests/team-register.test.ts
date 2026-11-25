@@ -28,7 +28,6 @@ const MEMBER = { memberId: "m1", role: "reviewer" } as unknown as TeamMember;
 
 type Ev = { runId: string; text: string };
 
-/** The fake goal record port. `unavailable` and `failWrites` script the two skip paths. */
 class Port implements GoalRecordPort {
   records = new Map<string, ObjectiveRecord>();
   unavailable = false;
@@ -45,7 +44,6 @@ class Port implements GoalRecordPort {
   }
 }
 
-/** The fake blob reader. `stallFirst` counts the first reads as stalled; `onRead` runs inside a read, after it starts. */
 class Reader implements BlobReader {
   calls: string[] = [];
   files = new Map<string, StreamRead>();
@@ -65,7 +63,6 @@ class Reader implements BlobReader {
   }
 }
 
-/** One simulated host: the holders, the events, the clock, and the register built on them. `w.holders` is read at each call, so a restart can replace it. */
 type World = { holders: Map<string, RegisterHolder>; events: Ev[]; saves: RegisterHolder[]; clock: { ms: number }; port: Port; reader: Reader; register: TeamRegister };
 
 function makeRegister(w: World): TeamRegister {
@@ -107,14 +104,12 @@ function goalFixture(): ProductGoal {
   } as unknown as ProductGoal;
 }
 
-/** The goal's record at version 1, with the given assumptions and criteria. Its log keeps the creation entry only. */
 function baseRecord(assumptions: Assumption[] = [], criteria: Criterion[] = []): ObjectiveRecord {
   const created = goalRecord(goalFixture(), AT, "created");
   if (typeof created === "string") throw new Error(`the fixture record is ${created}`);
   return sealRecord(created, { assumptions, criteria: [...created.criteria, ...criteria] }, []);
 }
 
-/** An artifact test that passes when `ENTRIES` holds at least `min` entries. */
 function artifactAssumption(id: string, path: string, min: number): Assumption {
   return {
     id, statement: `Assumption ${id}`, status: "assumed", origin: "intent-check", criticality: "plan",
@@ -123,7 +118,6 @@ function artifactAssumption(id: string, path: string, min: number): Assumption {
   };
 }
 
-/** A command test on the configured `rank-verify` check. */
 function commandAssumption(id: string, refutesOn: "fail" | "pass"): Assumption {
   return {
     id, statement: `Assumption ${id}`, status: "assumed", origin: "intent-check", criticality: "plan",
@@ -135,7 +129,6 @@ function check(status: TeamCheck["status"], revision: number, headCommit = HEAD)
   return { command: RANK, status, startedAt: AT, output: "", revision, headCommit, round: 1 };
 }
 
-/** A run at `ready-for-review` on HEAD, approved at revision 1, with a failed `rank-verify` at revision 1. */
 function runOf(parts: Record<string, unknown> = {}): TeamRun {
   return {
     id: RUN, goal: { id: GOAL_ID }, status: "ready-for-review", revision: 1, headCommit: HEAD,
@@ -144,7 +137,6 @@ function runOf(parts: Record<string, unknown> = {}): TeamRun {
   } as unknown as TeamRun;
 }
 
-/** A holder for `run`, with the run's check head at its head commit and the record in the port. */
 function holderOf(w: World, run: TeamRun, record: ObjectiveRecord): RegisterHolder {
   w.port.records.set(GOAL_ID, record);
   const holder: RegisterHolder = { run, checkHead: HEAD };
@@ -160,7 +152,6 @@ function digestOf(value: unknown): string {
   return createHash("sha256").update(canonicalJson(JSON.parse(JSON.stringify(value)))).digest("hex");
 }
 
-/** The first top-level key whose canonical JSON differs, for a short failure message. */
 function firstDiff(left: ObjectiveRecord, right: ObjectiveRecord): string {
   const keys = [...new Set([...Object.keys(left), ...Object.keys(right)])].sort();
   return keys.find(key => canonicalJson((left as unknown as Record<string, unknown>)[key] ?? null) !== canonicalJson((right as unknown as Record<string, unknown>)[key] ?? null)) ?? "none";
@@ -172,7 +163,6 @@ test("a settled revision gets one pass", async () => {
   const holder = holderOf(w, runOf(), record);
   w.reader.files.set(`${HEAD}:${ENTRIES}`, json({ entries: [{ id: "e1" }] }));
 
-  // Due at ready-for-review on the reviewed head: one pending reviewed pass. The save that marks it writes it.
   w.register.mark(holder);
   assert.equal(holder.register?.pass?.kind, "reviewed", "a settled revision on the reviewed head is a reviewed pass");
   assert.equal(holder.register?.pass?.state, "pending", "the mark leaves one pending pass");
@@ -189,7 +179,6 @@ test("a settled revision gets one pass", async () => {
   assert.equal(w.events.length, 1, "a finished pass adds one event");
   assert.equal(w.events[0]?.text, REGISTER_EVENTS.recorded(1, { pass: 0, fail: 2, unknown: 0, changed: 2 }), "the event carries counts only");
 
-  // The same revision and kind again: no second pass, and no read.
   const first = holder.register?.pass;
   holder.run.status = "merged";
   w.register.mark(holder);
@@ -199,7 +188,6 @@ test("a settled revision gets one pass", async () => {
   assert.equal(w.reader.calls.length, 1, "no second read");
   assert.equal(w.port.records.get(GOAL_ID)?.version, 2, "no second write");
 
-  // A blocked revision with a check entry gets a check pass, which reads nothing.
   holder.run.status = "blocked";
   holder.run.revision = 2;
   holder.run.checks.push(check("failed", 2));
@@ -212,7 +200,6 @@ test("a settled revision gets one pass", async () => {
   assert.equal(holder.register?.pass?.state, "done", "the check pass ends done");
   assert.equal(w.reader.calls.length, 1, "a check pass reads nothing");
 
-  // The same revision is then reviewed on its head: a reviewed pass follows the check pass.
   holder.run.status = "ready-for-review";
   holder.run.review = { verdict: "approved", summary: "Approved.", revision: 2 };
   holder.checkHead = HEAD;
@@ -222,13 +209,11 @@ test("a settled revision gets one pass", async () => {
   await w.register.idle();
   assert.equal(holder.register?.pass?.state, "done", "the reviewed pass ends done");
 
-  // An unpinned run gets no pass.
   const plain = runOf({ id: "run-plain", register: undefined });
   const plainHolder: RegisterHolder = { run: plain, checkHead: HEAD };
   w.register.mark(plainHolder);
   assert.equal(plainHolder.register?.pass, undefined, "an unpinned run gets no pass");
 
-  // A run that has not settled gets no pass, and neither does a settled revision with no check at that revision.
   const busyHolder: RegisterHolder = { run: runOf({ id: "run-busy", status: "implementing" }), checkHead: HEAD };
   w.register.mark(busyHolder);
   assert.equal(busyHolder.register?.pass, undefined, "a run that has not settled gets no pass");
@@ -239,7 +224,6 @@ test("a settled revision gets one pass", async () => {
 });
 
 test("a pass never outlives its run or its revision", async () => {
-  // The holder is removed while the pass reads: nothing is written and no event is added.
   {
     const w = world();
     const holder = holderOf(w, runOf(), baseRecord([artifactAssumption("a2", ENTRIES, 2)]));
@@ -252,7 +236,6 @@ test("a pass never outlives its run or its revision", async () => {
     assert.equal(w.events.length, 0, "a removed run adds no event");
   }
 
-  // A new revision is marked while the old pass reads: the old apply writes nothing, and the new pass runs next.
   {
     const w = world();
     const holder = holderOf(w, runOf(), baseRecord([artifactAssumption("a2", ENTRIES, 2)]));
@@ -275,7 +258,6 @@ test("a pass never outlives its run or its revision", async () => {
     assert.equal(w.port.records.get(GOAL_ID)?.version, 2, "one write, from revision 2's pass");
   }
 
-  // A newer revision is marked before the queued pass starts: the stale job is skipped, and the newer pass runs once.
   {
     const w = world();
     const holder = holderOf(w, runOf(), baseRecord([artifactAssumption("a2", ENTRIES, 2)]));
@@ -293,7 +275,6 @@ test("a pass never outlives its run or its revision", async () => {
     assert.equal(w.events.length, 1, "one event");
   }
 
-  // The register closes while the pass reads: the pass is aborted, so no further read starts and nothing is written.
   {
     const w = world();
     const holder = holderOf(w, runOf(), baseRecord([artifactAssumption("a1", "p1.json", 1), artifactAssumption("a2", ENTRIES, 2)]));
@@ -306,7 +287,6 @@ test("a pass never outlives its run or its revision", async () => {
     assert.equal(w.events.length, 0, "a closed register adds no event");
   }
 
-  // The run moves on to a revision that is not due before the pass plans: the pass still reads the commit it was marked at.
   {
     const w = world();
     const holder = holderOf(w, runOf(), baseRecord([artifactAssumption("a2", ENTRIES, 2)]));
@@ -322,8 +302,6 @@ test("a pass never outlives its run or its revision", async () => {
       "the receipt is a fact about the marked commit");
   }
 
-  // The holder is copied and assigned back, as continue and verification recovery do, before the pass starts or while it reads:
-  // the pass settles once, on the copy the holder now holds, and nothing stays pending.
   for (const when of ["queued", "reading"] as const) {
     const w = world();
     const holder = holderOf(w, runOf(), baseRecord([artifactAssumption("a2", ENTRIES, 2)]));
@@ -343,7 +321,6 @@ test("a pass never outlives its run or its revision", async () => {
     assert.equal(w.port.records.get(GOAL_ID)?.version, 2, `${when}: one write, from the pass marked before the copy`);
   }
 
-  // A goal record write that fails: skipped write-failed, one event, and the receipts are kept.
   {
     const w = world();
     const holder = holderOf(w, runOf(), baseRecord([artifactAssumption("a2", ENTRIES, 2), commandAssumption("a4", "fail")]));
@@ -358,7 +335,6 @@ test("a pass never outlives its run or its revision", async () => {
     assert.equal(w.port.records.get(GOAL_ID)?.version, 1, "the record is unchanged");
   }
 
-  // An unreadable record: skipped record-unavailable, one event.
   {
     const w = world();
     const holder = holderOf(w, runOf(), baseRecord([artifactAssumption("a2", ENTRIES, 2)]));
@@ -370,7 +346,6 @@ test("a pass never outlives its run or its revision", async () => {
     assert.deepEqual(w.events.map(event => event.text), [REGISTER_EVENTS.skipped["record-unavailable"]], "one skip event");
   }
 
-  // A full log: skipped log-full, one event, and the receipts are kept.
   {
     const w = world();
     const record = baseRecord([commandAssumption("a4", "fail")]);
@@ -389,7 +364,6 @@ test("stalled reads stop the pass from reading", async () => {
   const paths = [1, 2, 3, 4, 5].map(index => `p${index}.json`);
   const assumptions = paths.map((path, index) => artifactAssumption(`a${index + 1}`, path, 1));
 
-  // The first four reads stall, so the fifth never starts.
   {
     const w = world();
     const holder = holderOf(w, runOf(), baseRecord(assumptions));
@@ -404,7 +378,6 @@ test("stalled reads stop the pass from reading", async () => {
     assert.equal(holder.register?.pass?.state, "done", "the pass still ends done");
   }
 
-  // A read that passes the 120-second deadline leaves the rest not-run.
   {
     const w = world();
     const holder = holderOf(w, runOf(), baseRecord(assumptions));
@@ -434,7 +407,6 @@ test("proposals follow the pin and the record", async () => {
   } as unknown as MemberPostRecord);
   const ids = ["6f1c2a3e-8b4d-4c5e-9f60-718293a4b501", "6f1c2a3e-8b4d-4c5e-9f60-718293a4b502", "6f1c2a3e-8b4d-4c5e-9f60-718293a4b503"];
 
-  // An unpinned run: nothing changes and no drop is counted.
   {
     const w = world();
     const holder = holderOf(w, runOf({ register: undefined }), baseRecord([artifactAssumption("a1", ENTRIES, 1)]));
@@ -444,7 +416,6 @@ test("proposals follow the pin and the record", async () => {
     assert.equal(w.events.length, 0, "an unpinned run adds no event");
   }
 
-  // A pinned run: a stance and a proposal apply once across two calls with the same posts.
   {
     const w = world();
     const holder = holderOf(w, runOf(), baseRecord([artifactAssumption("a1", ENTRIES, 1)]));
@@ -462,7 +433,6 @@ test("proposals follow the pin and the record", async () => {
     assert.equal(holder.register?.drops, undefined, "accepted proposals drop nothing");
   }
 
-  // An unreadable record: record-unavailable is counted with one event, and a second drop adds no second event.
   {
     const w = world();
     const holder = holderOf(w, runOf(), baseRecord([artifactAssumption("a1", ENTRIES, 1)]));
@@ -475,8 +445,6 @@ test("proposals follow the pin and the record", async () => {
     assert.equal(w.events.filter(event => event.text === REGISTER_EVENTS.proposalsDropped).length, 1, "a second drop adds no second event");
   }
 });
-
-// ---- Seeded sequences -----------------------------------------------------------------------------------------------
 
 const SEEDS = 100;
 const STEPS = 30;
@@ -523,7 +491,6 @@ function stepsOf(seed: number): Step[] {
   return steps;
 }
 
-/** Runs the steps on a fresh world. With `restarts`, the restart steps close and rebuild the host from a JSON round trip. */
 async function execute(seed: number, steps: readonly Step[], restarts: boolean): Promise<{ w: World }> {
   const w = world();
   const base = baseRecord([artifactAssumption("a1", ENTRIES, 1), commandAssumption("a2", "fail")]);
@@ -533,7 +500,6 @@ async function execute(seed: number, steps: readonly Step[], restarts: boolean):
   w.holders.set(RUN, { run: runOf({ status: "working", revision: 1, checks: [], review: undefined }), checkHead: undefined });
   let proposed = 0;
   let revision = 1;
-  // Closes the register, as a restart does, even while a pass reads. The host state goes through a JSON round trip.
   const reopen = (): void => {
     w.register.close();
     w.holders = new Map([...w.holders].map(([id, holder]) => [id, JSON.parse(JSON.stringify(holder)) as RegisterHolder]));
@@ -552,7 +518,6 @@ async function execute(seed: number, steps: readonly Step[], restarts: boolean):
         holder.checkHead = step.reviewed ? step.head : holder.checkHead;
         holder.run.review = step.reviewed ? { verdict: "approved", summary: "Approved.", revision } : undefined;
         holder.run.checks.push({ ...check(step.result, revision, step.head), round: 1 });
-        // Every save marks the pass, as teams.ts' save does.
         w.register.mark(holder);
         break;
       }
@@ -610,7 +575,6 @@ test("seeded runs with restarts write each pass once", async () => {
     assert.equal(digestOf(finalRestarted) === digestOf(finalPlain), true,
       `seed ${seed}: restarts changed the record at key ${firstDiff(finalPlain, finalRestarted)}`);
 
-    // At most one test.recorded version per revision and kind.
     const versions = new Map<string, Set<number>>();
     for (const entry of finalRestarted.log) {
       if (entry.op !== REGISTER_OPS.tested) continue;
@@ -622,14 +586,12 @@ test("seeded runs with restarts write each pass once", async () => {
       assert.equal(set.size <= 1, true, `seed ${seed}: revision and kind ${key} wrote ${set.size} versions`);
     }
 
-    // Every pass ends done, or was replaced by one that does.
     for (const holder of restarted.w.holders.values()) {
       const state = holder.register?.pass?.state;
       assert.equal(state === undefined || state === "done", true, `seed ${seed}: a pass is still ${state}`);
       if (holder.register?.pass?.wrote !== undefined) applied += 1;
     }
   }
-  // The invariants are vacuous unless passes wrote records across the seeds.
   assert.equal(applied > SEEDS / 4, true, `seed run: only ${applied} passes wrote a record across ${SEEDS} seeds`);
 });
 
@@ -639,12 +601,10 @@ test("a verdict's reviewed pass is the run's only pass", async () => {
   const holder = holderOf(w, runOf({ status: "reviewing" }), record);
   w.reader.files.set(`${HEAD}:${ENTRIES}`, json({ entries: [{ id: "e1" }] }));
 
-  // Until the hold, nothing is due at reviewing.
   w.register.mark(holder);
   assert.equal(holder.register?.pass, undefined, "mark adds no pass at reviewing");
   assert.equal(w.register.reviewedReceipts(RUN, HEAD), undefined, "no pass, no receipts");
 
-  // At the hold: one pending reviewed pass, saved once.
   assert.equal(w.register.markReviewed(holder), true, "the reviewed-head rule holds at reviewing");
   assert.equal(holder.register?.pass?.kind, "reviewed", "the pass is a reviewed pass");
   assert.equal(holder.register?.pass?.state, "pending", "the pass is pending");
@@ -653,11 +613,9 @@ test("a verdict's reviewed pass is the run's only pass", async () => {
   assert.equal(w.register.reviewedReceipts(RUN, HEAD), "pending", "a running pass reads as pending");
   assert.equal(w.register.reviewedReceipts(RUN, OTHER), undefined, "a wrong head gives nothing");
 
-  // The same call again: the pass exists, and nothing is marked or saved.
   assert.equal(w.register.markReviewed(holder), true, "a second call finds the pass");
   assert.equal(w.saves.length, 1, "a second call does not save");
 
-  // The pass runs and applies as any other.
   w.register.drain();
   await w.register.idle();
   const receipts = w.register.reviewedReceipts(RUN, HEAD);
@@ -667,7 +625,6 @@ test("a verdict's reviewed pass is the run's only pass", async () => {
   assert.equal(w.reader.calls.length, 1, "one blob read");
   assert.equal(w.register.reviewedReceipts(RUN, OTHER), undefined, "a wrong head still gives nothing");
 
-  // A later mark at ready-for-review adds no pass.
   const pass = holder.register?.pass;
   holder.run.status = "ready-for-review";
   w.register.mark(holder);
@@ -676,7 +633,6 @@ test("a verdict's reviewed pass is the run's only pass", async () => {
   assert.equal(holder.register?.pass, pass, "mark finds the reviewed pass of the same revision");
   assert.equal(w.reader.calls.length, 1, "no second read");
 
-  // An unpinned run, or one without the reviewed-head rule, gets no pass and no save.
   const saved = w.saves.length;
   const plain: RegisterHolder = { run: runOf({ id: "run-plain", status: "reviewing", register: undefined }), checkHead: HEAD };
   assert.equal(w.register.markReviewed(plain), false, "an unpinned run gets no pass");

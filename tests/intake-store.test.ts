@@ -225,7 +225,6 @@ test("trimming keeps a pending reply and drops older sent and failed replies in 
   try {
     const store = h.open();
     store.create(record(A));
-    // A pending reply with an error is one the pump will retry; a failed one is final.
     const retried: Message = { key: "reply:retried", kind: "reply", text: "message", createdAt: "2026-01-01T00:00:00.000Z", status: "pending", attempts: 1, error: "Slack request failed: ratelimited", nextAttemptAt: "2026-01-01T00:00:05.000Z" };
     store.update(A, r => {
       r.messages = [message("ack", "ack"), message("reply:failed", "reply", "failed"), message("reply:pending", "reply", "pending"), retried,
@@ -268,7 +267,7 @@ test("create notifies listeners after the write, and a throwing listener loses n
     const seen: { issueId: string; onDisk: boolean; state: string }[] = [];
     store.onChange(r => {
       seen.push({ issueId: r.issueId, onDisk: h.open().get(A)?.state === "queued", state: r.state });
-      Object.assign(r, { state: "finished" }); // a listener's copy cannot change the stored record
+      Object.assign(r, { state: "finished" });
     });
     store.create(record(A));
     assert.deepEqual(seen, [{ issueId: A, onDisk: true, state: "queued" }], "A new record reaches listeners once, after the write");

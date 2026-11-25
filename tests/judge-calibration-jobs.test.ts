@@ -566,7 +566,6 @@ test("a calibration that is not running shows no wait reason", async () => {
   } finally { f.close(); }
 });
 
-/** Starts the next judgement and fails it before any session: the row is inserted, then released. */
 async function failStart(f: Fixture, reason = "eval-failed", as?: Partial<Start>): Promise<Start> {
   const next = await f.jobs.next(gates());
   assert.equal(next.kind, "start");

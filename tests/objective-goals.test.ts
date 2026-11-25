@@ -32,17 +32,14 @@ const lineup: TeamLineup = {
 
 const command = { command: process.execPath, args: ["-e", "0"] };
 
-/** The scheduler fixture with a strong lineup, a configured project whose objective switch is on, so goals can be created. */
 function fixture() {
   const f = schedulerFixture();
   f.config.teams = { ...f.config.teams!, lineup };
   f.config.projects[0]!.team = { checks: [command], objective: { prompts: "on" } } as Config["projects"][number]["team"];
-  // The launch needs a profile for each provider of the lineup; the fixture's manager runs no agent.
   f.config.agents = { claude: { command: process.execPath, args: [] }, codex: { command: process.execPath, args: [] } } as Config["agents"];
   return f;
 }
 
-/** Sets or removes the project's objective switch. `undefined` removes the key, as an operator who never wrote it has it. */
 function setSwitch(f: ReturnType<typeof fixture>, value: "on" | "off" | undefined) {
   const { objective: _objective, ...team } = f.config.projects[0]!.team!;
   f.config.projects[0]!.team = (value === undefined ? team : { ...team, objective: { prompts: value } }) as Config["projects"][number]["team"];
@@ -54,7 +51,6 @@ const createInput = (overrides: Partial<CreateGoal> = {}): CreateGoal => ({
   evidence: ["notes.md"], maxRuns: 2, maxMinutes: 60, maxMembers: 4, parallelism: 2, ...overrides,
 });
 
-/** A goal as an earlier host wrote it: no objective record, a fixed update time, and a fixed revision. */
 function legacyGoal(overrides: Record<string, unknown> = {}): ProductGoal {
   const at = "2026-01-01T00:00:00.000Z";
   return {
@@ -76,11 +72,9 @@ const commandCriterion = (statement: string) => ({ statement, check: { kind: "co
 const artifactCriterion = { statement: "The shortlist file exists", check: { kind: "artifact" as const, path: "research/shortlist.md" }, threshold: { kind: "pass" as const } };
 const add = (criterion: ReturnType<typeof judgement>) => ({ op: "criterion.add" as const, criterion });
 const correction = (version: number, ops: unknown[], requestId = randomUUID()) => ({ requestId, version, ops });
-/** Resolves once the tick that `start` queued has finished: a steer with a stale revision queues behind it and changes nothing. */
 const barrier = (goals: GoalService, id: string) => goals.steer(id, { requestId: randomUUID(), revision: 999, text: "Barrier" }).catch(() => undefined);
 const refused = (code: string) => (error: unknown) => error instanceof TeamError && error.code === code;
 
-/** Counts record parses and sealed-file reads until `stop`. */
 function meter() {
   const counts = { parses: 0, sealed: 0 };
   const { safeParse, parse } = objectiveRecordSchema;
@@ -224,7 +218,6 @@ test("an unreadable record is kept and never rewritten", async () => {
     const invalid = { schemaVersion: 1, junk: true }, newer = { schemaVersion: 2, future: "x" };
     f.writeRecord("goal", invalidId, { goal: legacyGoal({ id: invalidId }), receipts: {}, fingerprint: "fixture", objectiveRecord: invalid });
     f.writeRecord("goal", newerId, { goal: legacyGoal({ id: newerId }), receipts: {}, fingerprint: "fixture", objectiveRecord: newer });
-    // A record that parses apart from rule 9: its second direction entry names the first direction.
     const damagedId = randomUUID();
     const built = goalRecord(legacyGoal({ id: damagedId, steering: [
       { text: "Prefer seed stage", revision: 2, at: "2026-01-02T00:00:00.000Z" },
@@ -268,10 +261,8 @@ test("a failed migration write never stops the host", { skip: process.getuid?.()
     assert.match(warnings[0]!, /1 goals/);
     assert.equal(warnings[0]!.includes("Find ranked sources"), false);
 
-    // One goal tick with the folder still read-only. The goal names a team that does not exist, so the tick has nothing to write (a new cycle would need a write and block the goal): it keeps running, gains no event, and its file is unchanged.
     const fileBefore = readFileSync(goalFile(f, id), "utf8"), eventsBefore = goals!.get(id).events.length;
     goals!.start();
-    // A steer with a stale revision queues behind the tick and fails without a change, so it marks the tick's end.
     await goals!.steer(id, { requestId: randomUUID(), revision: 999, text: "Barrier" }).catch(() => undefined);
     goals!.close();
     assert.equal(goals!.get(id).status, "running");
@@ -284,7 +275,7 @@ test("a failed migration write never stops the host", { skip: process.getuid?.()
     assert.equal(objectiveRecordSchema.parse(f.readRecord<StoredShape>("goal", id).objectiveRecord).version, 2);
   } finally {
     console.warn = warn;
-    try { chmodSync(goalsDirectory, 0o700); } catch { /* the directory was removed with the fixture */ }
+    try { chmodSync(goalsDirectory, 0o700); } catch {}
     f.close();
   }
 });
@@ -332,7 +323,6 @@ test("creation criteria join version 1", async () => {
 test("a creation criterion that cannot be built refuses the create and stores nothing", async () => {
   const f = fixture(), teams = f.openTeam();
   try {
-    // A configured check without args makes its digest throw: a host fault, not an owner error.
     const configured = f.config.projects[0]!.team!.checks;
     f.config.projects[0]!.team!.checks = [{ command: process.execPath } as TeamCommand];
     const goals = new GoalService(f.config, f.key, teams);
@@ -385,7 +375,6 @@ test("a correction applies once", async () => {
     await assert.rejects(goals.correctObjective(created.id, correction(1, [add(judgement("Other"))], body.requestId)), refused("request-conflict"));
     await assert.rejects(goals.correctObjective(created.id, correction(1, [add(judgement("Other"))])), refused("objective-version-stale"));
     assert.equal(goals.get(created.id).revision, created.revision);
-    // The replay is checked before the switch: after the switch turns off, the applied correction still answers its view.
     setSwitch(f, "off");
     assert.deepEqual(await goals.correctObjective(created.id, body), first);
     assert.equal(readFileSync(goalFile(f, created.id), "utf8"), text);
@@ -436,7 +425,6 @@ test("a cycle pins the digest it launched with", async () => {
     assert.equal(reopened.objectiveRecord(created.id).version, 3);
     reopened.close();
 
-    // A pending launch stored by an older host has no record: it replays unchanged, without a digest.
     const legacy = createInput();
     const legacyId = (await reopened.create(legacy)).id;
     const stored = f.readRecord<StoredShape>("goal", legacyId);
@@ -457,12 +445,10 @@ test("a cycle pins the digest it launched with", async () => {
   } finally { goals?.close(); f.close(); }
 });
 
-/** Turns both objective switches on for this fixture's project, as a register run needs. */
 function setRegisterOn(f: ReturnType<typeof fixture>) {
   f.config.projects[0]!.team = { ...f.config.projects[0]!.team!, objective: { prompts: "on", register: "on" } } as Config["projects"][number]["team"];
 }
 
-/** A goal's record with `items` as its assumptions, resealed by hand: the writer does not take these shapes. */
 function recordWithAssumptions(goal: ProductGoal, items: unknown[]): ObjectiveRecord {
   const { digest: _digest, ...body } = goalRecord(goal, "2026-11-18T10:00:00.000Z", "created") as ObjectiveRecord;
   const next = { ...body, assumptions: items };
@@ -513,12 +499,10 @@ test("a goal run's pass reads and writes the goal's record", async () => {
     await barrier(goals, created.id);
     const teamId = goals.get(created.id).activeTeamId!;
     assert.ok(teamId, "the tick launched the cycle");
-    // A goal service that never starts still gives the team service its record port, and no goal tick races the pass.
     goals.close();
     goals = new GoalService(f.config, f.key, teams);
     const before = (f.readRecord<StoredShape>("goal", created.id).objectiveRecord as ObjectiveRecord).version;
 
-    // The run settles with a failed check at its revision: the check pass tests a1 and writes the goal's record.
     const held = (teams as unknown as { record(id: string): { run: TeamRun } }).record(teamId);
     held.run.headCommit ??= "1".repeat(40);
     held.run.status = "ready-for-review";
@@ -543,7 +527,6 @@ test("an owner rating stamps the latest reviewed cycle's head", async () => {
     const created = await goals.create(createInput());
     await goals.correctObjective(created.id, correction(1, [add({ statement: "The quality rating reaches three", check: { kind: "owner-rating", subject: "quality" }, threshold: { kind: "score", min: 3, of: 5 } } as never)]));
     goals.close();
-    // Cycle 4 is merged with head H4: the latest reviewed cycle, so its head and number are the rating's stamp.
     const stored = f.readRecord<StoredShape>("goal", created.id);
     const cycles = [{ teamId: randomUUID(), cycle: 4, goalRevision: 1, status: "merged", startedAt: "2026-11-18T10:00:00.000Z", memberCount: 1, headCommit: "H4" }];
     f.writeRecord("goal", created.id, { ...stored, goal: { ...stored.goal, cycles } });
@@ -581,7 +564,6 @@ test("an unreadable record launches without a digest", async () => {
   } finally { f.close(); }
 });
 
-/** A goal's record with `extra` criteria after c0, resealed by hand: the writer refuses the shapes these tests need. */
 function recordWith(goal: ProductGoal, extra: Criterion[]): ObjectiveRecord {
   const { digest: _digest, ...body } = goalRecord(goal, "2026-11-14T10:00:00.000Z", "created") as ObjectiveRecord;
   const next = { ...body, criteria: [body.criteria[0]!, ...extra] };
@@ -594,11 +576,9 @@ test("the digest skips with its reason and never throws", () => {
   const judged = (id: string): Criterion => ({ id, origin: "owner", statement: "a".repeat(1000), check: { kind: "judgement", item: "sources" }, producer: "evaluator", threshold: { kind: "pass" }, state: "active" });
   assert.ok("digest" in goalRecordDigest({ goal, objectiveRecord: recordWith(goal, []) }, [full]), "a small record has a digest");
 
-  // Eight criteria of 1,000-byte statements cross the 6,144-byte digest limit: the digest is skipped, not thrown.
   const large = recordWith(goal, Array.from({ length: 7 }, (_, index) => judged(`c${index + 1}`)));
   assert.deepEqual(goalRecordDigest({ goal, objectiveRecord: large }, [full]), { skipped: "digest-too-large" });
 
-  // A configured check without args makes the digest's label throw: that is an unreadable record, never an escape.
   const commanded = recordWith(goal, [{ id: "c1", origin: "owner", statement: "The checks pass", check: { kind: "command", command: commandDigest(full) }, producer: "host", threshold: { kind: "pass" }, state: "active" }]);
   assert.ok("digest" in goalRecordDigest({ goal, objectiveRecord: commanded }, [full]));
   assert.deepEqual(goalRecordDigest({ goal, objectiveRecord: commanded }, [{ command: process.execPath } as TeamCommand]), { skipped: "record-unavailable" });
@@ -608,7 +588,6 @@ test("a create with criteria is refused when its record cannot be built", async 
   const f = fixture(), teams = f.openTeam();
   try {
     const goals = new GoalService(f.config, f.key, teams);
-    // Each path is 300 control characters: valid by the path schema, but the record's JSON is over its 32 KiB cap.
     const control = String.fromCharCode(1).repeat(300);
     const request = createInput({ allowedPaths: Array.from({ length: 20 }, () => control) });
     await assert.rejects(goals.create(request, undefined, [commandCriterion("The checks pass")]), refused("objective-source-invalid"));
@@ -651,7 +630,6 @@ test("a skipped digest is logged once while its reason holds", async () => {
     first.start();
     await barrier(first, created.id);
     first.close();
-    // The first run has ended: the goal has no active run, so the next tick prepares a second cycle with the same skip.
     const ended = f.readRecord<StoredShape>("goal", created.id);
     f.writeRecord("goal", created.id, { ...ended, goal: { ...ended.goal, activeTeamId: undefined } });
 
@@ -689,7 +667,7 @@ test("a pending control reaches its team after a failed migration write", { skip
     assert.equal(teams.get(f.run.id).status, "paused");
   } finally {
     console.warn = warn;
-    try { chmodSync(goalsDirectory, 0o700); } catch { /* the directory was removed with the fixture */ }
+    try { chmodSync(goalsDirectory, 0o700); } catch {}
     goals?.close(); f.close();
   }
 });
@@ -700,7 +678,6 @@ test("lists, single reads, and an idle tick parse no record and read no sealed f
     const launching = new GoalService(f.config, f.key, teams);
     const first = await launching.create(createInput());
     const second = await launching.create(createInput({ title: "Second goal" }));
-    // Each goal's first tick prepares its cycle, which parses its record once; both then hold an active run.
     launching.start();
     await Promise.all([barrier(launching, first.id), barrier(launching, second.id)]);
     launching.close();
@@ -712,7 +689,6 @@ test("lists, single reads, and an idle tick parse no record and read no sealed f
       goals.list();
       goals.get(first.id);
       goals.get(second.id);
-      // An idle tick: the steer with a stale revision queues behind the tick and fails without a change.
       goals.start();
       await Promise.all([barrier(goals, first.id), barrier(goals, second.id)]);
       goals.close();
@@ -736,7 +712,6 @@ test("lists, single reads, and an idle tick parse no record and read no sealed f
     } finally { prepared.stop(); }
     assert.equal(ticking.objectiveRecord(first.id).version, 2);
 
-    // A cycle waiting on the intent check's question, on its own fixture: an idle tick parses no record and reads no sealed file.
     const checked = checkedFixture();
     try {
       const asking = checked.openTeam(), askingGoals = new GoalService(checked.config, checked.key, asking);
@@ -764,7 +739,6 @@ test("lists, single reads, and an idle tick parse no record and read no sealed f
   } finally { f.close(); }
 });
 
-/** The scheduler fixture with an autonomous project whose lineup holds one strong evaluator of another family, so a goal and each cycle pin the check. */
 const EVALUATOR: TeamModelProfile = { id: "evaluator", label: "Evaluator", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" };
 function checkedFixture() {
   const f = fixture();
@@ -773,7 +747,6 @@ function checkedFixture() {
   activeSessions(f);
   return f;
 }
-/** The fixture's launched sessions are quiet from six minutes back, so the scheduler stalls each one before its report. These tests report every session as active. */
 function activeSessions(f: ReturnType<typeof fixture>) {
   const state = f.manager.state;
   f.manager.state = async (requestedId?: string) => ({ ...(await state(requestedId)), attention: initialAttention(new Date().toISOString(), true) });
@@ -784,18 +757,15 @@ const BRIEF = { title: "Rank sources", problem: "Find ranked sources", evidence:
 const PLAN = { kind: "plan", summary: "Rank the sources", brief: BRIEF,
   tasks: [{ id: "a", title: "Write the shortlist", instructions: "Write research/shortlist.md", paths: ["research/shortlist.md"], dependsOn: [], agentProfileId: "light",
     criterionRefs: { objectiveVersion: 1, criteria: ["c0"] } }] };
-/** One assumption, and one derived criterion that quotes the objective (the quote rule reads the objective and the directions). */
 const ASSUME_AND_CRITERION = { kind: "intent-check", summary: "One assumption and one criterion.", items: [{ dimension: "sources", why: "The sources are not named.", criticality: "detail", disposition: "assume",
   assumption: { statement: "The sources are the notes' sources.", refutedBy: "The notes name other sources.", test: { kind: "owner" } } }],
   criteria: [{ derivedFrom: "Find ranked sources", statement: "Every source is named", check: { kind: "judgement", item: "sources" }, threshold: { kind: "pass" } }] };
-/** One owner question that blocks the cycle until it is answered. */
 const ASK = { kind: "intent-check", summary: "One outcome needs the owner.", items: [{ dimension: "outcome", why: "The output name is not set.", criticality: "outcome", disposition: "ask",
   assumption: { statement: "The owner chooses the output name.", refutedBy: "The owner names the output another way.", test: { kind: "owner" } },
   question: { text: "Which output name should the files use?", options: ["alpha", "beta"], interrupt: "definition" } }] };
 
 const membersOf = (teams: TeamService, id: string) => (teams as unknown as { record(id: string): { run: TeamRun } }).record(id).run.members;
 const memberOf = (teams: TeamService, id: string, role: string) => membersOf(teams, id).find(member => member.role === role);
-/** The member of `role` once the host has launched its session. */
 const launchedMember = async (f: ReturnType<typeof fixture>, teams: TeamService, id: string, role: string) => {
   try {
     return await waitFor(() => Promise.resolve(memberOf(teams, id, role)), member => member !== undefined && f.launches.some(launch => launch.requestId === member.sessionId), 20000);
@@ -828,7 +798,6 @@ test("a goal cycle's check writes the goal's record", { timeout: 600000 }, async
     const derived = view.record.criteria.find(item => item.id === "c1");
     assert.equal(derived?.origin, "derived");
     assert.equal(view.log.filter(entry => entry.op === "intent-check.applied").length, 1);
-    // The running cycle keeps the digest it launched with, and the next cycle's digest lists c1 as derived.
     assert.equal(teams.get(teamId).goal?.record?.version, 1);
     const digest = recordDigestFor({ ...view.record, log: view.log }, [command]);
     assert.equal(digest.criteria.find(item => item.id === "c1")?.derived, true);
@@ -851,7 +820,6 @@ test("a failed goal record write changes nothing", { timeout: 600000 }, async ()
     await barrier(goals, created.id);
     const teamId = goals.get(created.id).activeTeamId;
     assert.ok(teamId, "the tick launched the first cycle");
-    // Once the cycle is running, every goal write fails: the check's write is the one this test is about.
     const restore = f.blockRecordWrites("goal", created.id);
     let restored = false;
     try {

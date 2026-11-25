@@ -347,7 +347,7 @@ test("a confirmed launch is reconciled after approval expiry without creating a 
       admit(); acceptedId = request.requestId;
       const goal = { ...request, id: request.requestId, status: "running", cycles: [], activeTeamId: "team-active" } as unknown as ProductGoal;
       f.goals.set(goal.id, goal);
-      service!.close(); // Simulate shutdown after GoalService accepts, before the routine receipt is saved.
+      service!.close();
       return goal;
     },
   });
@@ -397,7 +397,6 @@ test("a settled no-opportunity recurs on cadence and completes at the approved o
   } finally { Date.now = realNow; service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
-/** An in-memory inbox for project "demo" that counts its reads. */
 function inbox() {
   const signals: ProjectSignal[] = [];
   let reads = 0, unreadable = false;
@@ -464,7 +463,6 @@ test("signals that arrive together start one occurrence, however many there are"
     const created = await service.create(f.create({ intervalMinutes: 60, maxOccurrences: 3, wakeOn: ["owner"], expiresAt: new Date(realNow() + 3 * 3_600_000).toISOString() }));
     at(1); await service.tick();
     settle(f, service.get(created.id).activeGoalId!); await service.tick();
-    // One more signal than a pass reads, all recorded before the next pass and after the gap.
     at(10);
     const batch = Array.from({ length: 51 }, () => signals.add("owner"));
     await service.tick();
@@ -491,7 +489,6 @@ test("an unreadable inbox starts nothing early and never uses up a waiting batch
     at(1); await service.tick();
     settle(f, service.get(created.id).activeGoalId!); await service.tick();
 
-    // The inbox fails between the first read and the launch: the early start waits for a readable inbox.
     at(10);
     const early = signals.add("owner");
     duringBusyCheck = () => signals.down(true);
@@ -504,7 +501,6 @@ test("an unreadable inbox starts nothing early and never uses up a waiting batch
     assert.deepEqual(service.get(created.id).occurrences[1]!.wake, { signalIds: [early.id], dropped: 0 });
     settle(f, service.get(created.id).activeGoalId!); await service.tick();
 
-    // A batch is half read when the inbox fails and the scheduled time comes. The schedule runs without the batch.
     at(69);
     const batch = Array.from({ length: 51 }, () => signals.add("owner"));
     await service.tick();
@@ -516,7 +512,6 @@ test("an unreadable inbox starts nothing early and never uses up a waiting batch
     assert.equal(routine.occurrences[2]!.wake, undefined);
     assert.equal(routine.pendingWake?.signals.length, 20, "the half-read batch still waits");
 
-    // With the inbox back, the whole batch starts one occurrence.
     signals.down(false);
     settle(f, routine.activeGoalId!); await service.tick();
     at(77); await service.tick();
@@ -599,7 +594,6 @@ test("a routine without wakeOn keeps its approval fingerprint and reads no signa
     Date.now = () => Date.parse("2030-01-01T00:01:00.000Z");
     await service.tick(); await service.tick();
     const stored = unseal<{ routine: Routine; fingerprint: string }>(f.key, `routine:${created.id}`, readFileSync(join(f.config.stateDir, "routines", `${created.id}.sealed`), "utf8"));
-    // The digest of this request as the host computed it before routines could carry wakeOn.
     assert.equal(stored.fingerprint, "f0153ac51484bc8d9c5c0eedb7f0f6b7c22b6fd2e9ddd504a7bca85ea52cf604");
     assert.equal(stored.routine.status, "running");
     for (const field of ["wakeOn", "signalCursor", "pendingWake", "wakeDeferred"]) assert.equal(field in stored.routine, false, field);

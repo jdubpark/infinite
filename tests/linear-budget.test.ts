@@ -13,7 +13,6 @@ import type { ProductGoal } from "../packages/host/src/goal-types.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
 import type { LinearTrackingView } from "../packages/host/src/linear-types.js";
 
-// The pump runs on real timers while these tests move a mocked Date, so waits count real attempts, not Date.now.
 const until = async <T>(read: () => T, accepts: (value: T) => boolean, attempts = 200) => {
   for (let attempt = 0; attempt < attempts; attempt++) {
     const value = read();
@@ -38,7 +37,6 @@ async function bridge() {
   const reads = (from: number) => linear.calls.slice(from).filter(call => call.operation === "InfiniteLinearIssues");
   const readIds = (from: number) => new Set(reads(from).flatMap(call => call.variables.filter.id.in as string[]));
   const extra: LinearService[] = [];
-  // A second service on the same configuration, with its own pause state.
   const fresh = () => { const value = new LinearService(config, randomBytes(32)); extra.push(value); return value; };
   return { linear, service, run, goal, reads, readIds, fresh,
     async close() { service.close(); for (const value of extra) value.close(); await linear.close(); rmSync(root, { recursive: true, force: true }); } };
@@ -57,7 +55,6 @@ test("a finished item keeps its confirmation for client reads; live items and a 
       for (const run of [live, active, oldCycle, finished]) b.service.updateTeam(run, true);
       b.service.updateTeam(blocked, true, false);
     };
-    // What the web and phone lists do on every poll.
     const clientReads = () => {
       for (const goal of [liveGoal, doneGoal]) b.service.getGoal(goal.id);
       return [live, active, oldCycle, finished, blocked].map(run => b.service.getTeam(run.id)!.status);
@@ -80,18 +77,15 @@ test("a finished item keeps its confirmation for client reads; live items and a 
     assert.ok(reread.has(issue(blocked.id)), "a blocked run keeps the gating age for client reads: the host can restart it by itself");
     assert.equal(b.service.getTeam(finished.id)!.status, "synced", "a client still sees the finished run's recent confirmation");
 
-    // An owner action that starts work from the finished run needs the gating age, and gets it after one read.
     assert.equal(b.service.getTeam(finished.id, true)!.status, "pending");
     const confirmed = await b.service.confirmTeam(finished.id);
     assert.equal(confirmed?.status, "synced");
     assert.ok(b.readIds(mark).has(issue(finished.id)));
 
-    // Past the settled window, a client read refreshes a finished item again.
     t.mock.timers.tick(10 * 60000);
     const later = b.linear.calls.length;
     await until(() => { clientReads(); return b.readIds(later); }, ids => ids.has(issue(oldCycle.id)) && ids.has(b.service.getGoal(doneGoal.id)!.issue!.id));
 
-    // Linear prices a read by its page size, so each read asks for exactly the issues it names.
     for (const call of b.reads(0)) assert.equal(call.variables.first, call.variables.filter.id.in.length);
     assert.deepEqual(b.linear.violations, []);
   } finally { await b.close(); }
@@ -119,7 +113,6 @@ test("rate-limit headers reach the bridge status; a limited read pauses with its
     const published = JSON.stringify(status);
     assert.ok(!published.includes(b.linear.apiKey) && !published.includes("Run implementing") && !published.includes("TEST-"), "the status carries no key and no issue content");
 
-    // Retry-After is Linear's own wait; a complexity reset an hour away does not stretch it.
     const limit = (headers: Record<string, string>) => {
       b.linear.rateLimitReads({ date: new Date().toUTCString(), ...headers });
       child.members.push({ memberId: randomUUID(), status: "queued" } as TeamRun["members"][number]);
@@ -141,7 +134,6 @@ test("rate-limit headers reach the bridge status; a limited read pauses with its
     assert.match(line, /This host sent \d+ requests \(\d+ complexity points reported\) in the last hour\.$/);
     assert.ok(!line.includes(b.linear.apiKey));
 
-    // Without Retry-After, only the spent limit's reset counts.
     t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     t.mock.timers.tick(125000);
     previous = view.retryAt;
@@ -150,14 +142,12 @@ test("rate-limit headers reach the bridge status; a limited read pauses with its
       "x-ratelimit-complexity-remaining": "2990000", "x-ratelimit-complexity-reset": String(now + 50 * 60000) });
     assert.ok(Math.abs(Date.parse(view.retryAt!) - (now + 3 * 60000)) < 2000, view.retryAt);
 
-    // A spent limit an hour from reset still probes again within five minutes.
     t.mock.timers.tick(3 * 60000 + 5000);
     previous = view.retryAt; now = Date.now();
     view = await limit({ "x-ratelimit-complexity-remaining": "0", "x-ratelimit-complexity-reset": String(now + 50 * 60000) });
     assert.ok(Math.abs(Date.parse(view.retryAt!) - (now + 5 * 60000)) < 2000, view.retryAt);
     assert.match(b.service.getTeam(child.id)!.reason!, /rate-limiting/);
 
-    // Once Linear answers again, tracking syncs and the pause leaves the view.
     b.linear.rateLimitReads(undefined);
     t.mock.timers.tick(5 * 60000 + 5000);
     view = await until(() => b.service.getTeam(child.id)!, value => value.status === "synced");
@@ -188,7 +178,6 @@ test("continuing a finished run needs a current Linear confirmation, not the old
       (error: unknown) => error instanceof TeamError && error.code === "linear-reconciliation-required");
     assert.equal(confirmations, 1, "the action asked Linear for a current confirmation first");
     current = { status: "synced", issue: sampleIssue };
-    // With a current confirmation the Linear gate passes, and the run's own continuation rules answer.
     await assert.rejects(teams.continueRun(fixture.run.id, { requestId: randomUUID(), revision: fixture.run.revision }),
       (error: unknown) => error instanceof TeamError && error.code !== "linear-reconciliation-required");
   } finally { teams.close(); fixture.close(); }
@@ -229,7 +218,6 @@ test("a rate limit waits for the time Linear states, read in its units and again
     result = await wait({ "x-ratelimit-requests-reset": "12" });
     assert.deepEqual(result, { ms: 60000, basis: "fallback" }, "an implausible reset counts as no timing");
 
-    // No usable time: one minute, then twice as long while the limit repeats.
     const service = b.fresh();
     b.linear.rateLimitReads({});
     assert.equal(await refusal(read(service)), 60000);
@@ -250,13 +238,11 @@ test("after a pause one request probes Linear, and the others wait for its answe
     t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     t.mock.timers.tick(61000);
 
-    // The probe meets another limit: the waiting requests never reach Linear and carry the new pause.
     let mark = b.linear.calls.length;
     const limited = await Promise.all([read(service), read(service), read(service)].map(refusal));
     assert.equal(b.linear.calls.length - mark, 1, "only the probe reached Linear");
     assert.deepEqual(limited, [120000, 120000, 120000]);
 
-    // The probe is answered: the others go only after that answer, and normal traffic reopens.
     t.mock.timers.tick(121000);
     b.linear.rateLimitReads(undefined);
     b.linear.delayReads(100);

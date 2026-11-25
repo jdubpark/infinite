@@ -10,21 +10,6 @@ import type { TeamService } from "../../packages/host/src/teams.js";
 import { bump, type Counts, rand } from "../outcome-sim-script.js";
 import { schedulerFixture } from "./team-scheduler.js";
 
-/*
- * A seeded crash/reopen simulator for goal planning. Each seed creates a real TeamService and a host-pinned
- * goal record, prepares a project manager, sends an invalid report, then either corrects it or repeats the bad report.
- * The correction state and accepted task links are read from the sealed team record after service reopen.
- *
- * Faults are generated from the seed: the host is restarted after a prepared pin, a saved correction, or an accepted
- * plan. The record is always reopened by TeamService, not reconstructed by the model. team-run-sim separately cuts
- * owner requests between individual writes and checks their receipts; this simulator checks the goal plan state.
- *
- * Invariants checked after each state transition:
- * I1 A newly prepared goal planner and every restored plan prompt keep the exact objective-version pin.
- * I2 The first malformed report spends one correction for the revision, and restart cannot restore that allowance.
- * I3 Accepted plan links persist as task metadata and never compose a criterion assessment.
- */
-
 export type GoalPlanFixture = ReturnType<typeof schedulerFixture>;
 type SimStored = { run: TeamRun; pending?: unknown; goalPlanCorrectionRevision?: number };
 type Internals = {
@@ -47,7 +32,6 @@ const BRIEF = {
   dataShape: "One output file.", acceptance: ["The output validates."], expectedOutcome: "A valid output is available.", uiChanges: false,
 };
 
-/** Shared goal setup for example and simulator tests. Writes the starting record through the scheduler fixture. */
 export function prepareGoalPlanFixture(fixture: GoalPlanFixture): void {
   fixture.run.headCommit = fixture.run.baseCommit;
   fixture.run.goal = teamGoalContextSchema.parse({
@@ -58,7 +42,6 @@ export function prepareGoalPlanFixture(fixture: GoalPlanFixture): void {
   fixture.writeTeam();
 }
 
-/** A plan shape shared by focused tests and generated simulator reports. */
 export function goalPlan(criterionRefs?: TeamTaskPlan["criterionRefs"]) {
   return {
     kind: "plan" as const, summary: "Create and check the output.", brief: BRIEF,
@@ -73,7 +56,6 @@ type Script = { first: InvalidKind; second: InvalidKind; followUp: FollowUp; res
 const INVALIDS: readonly InvalidKind[] = ["missing", "invented", "wrong-version"];
 function scriptFor(seed: number): Script {
   const r = rand(seed * 7919);
-  // Alternating the second report ensures the default bounded corpus exercises both acceptance and blocking.
   return { first: r.pick(INVALIDS), second: r.pick(INVALIDS), followUp: seed % 2 === 1 ? "valid" : "invalid",
     restartAfterPin: r.chance(0.5), restartAfterCorrection: r.chance(0.85), restartAfterOutcome: r.chance(0.5) };
 }
@@ -274,7 +256,6 @@ async function simulateGoalPlan(seed: number, counts: Counts, variant: Variant =
   }
 }
 
-/** Registers the goal-plan cases alongside the broader seeded team-run simulator. */
 export function registerGoalPlanSimulator(register: typeof test): void {
   const only = process.env.GOAL_PLAN_SIM_SEED ?? process.env.TEAM_SIM_SEED;
   const count = Number(process.env.GOAL_PLAN_SIM_SEEDS ?? 12);

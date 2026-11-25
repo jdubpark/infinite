@@ -23,7 +23,6 @@ process.stdin.resume();
 
 async function report(value) {
   if (value.kind === "plan" && prompt.includes("Task criterion references for this goal plan:")) {
-    // This fixture's progress task advances the owner's success text, criterion c0 in every pinned record.
     const context = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8"));
     const criterionRefs = { objectiveVersion: context.authority.goal.record.version, criteria: ["c0"] };
     value = { ...value, tasks: value.tasks.map(task => ({ ...task, criterionRefs })) };

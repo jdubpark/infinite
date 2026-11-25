@@ -95,6 +95,11 @@ describe("check-comments extractor", () => {
     assert.equal(isCheckedSourcePath("apps/macos/Sources/Core.swift"), true);
     assert.equal(isCheckedSourcePath("apps/macos/Sources/InfiniteAtomics/include/InfiniteAtomics.h"), true);
     assert.equal(isCheckedSourcePath("scripts/build.kts"), true);
+    assert.equal(isCheckedSourcePath("apps/web/src/style.css"), true);
+    assert.equal(isCheckedSourcePath("apps/web/dist/style.css"), false);
+    assert.equal(isCheckedSourcePath("deploy/ubuntu/infinite.service"), true);
+    assert.equal(isCheckedSourcePath("deploy/ubuntu/infinite-backup.timer"), true);
+    assert.equal(isCheckedSourcePath("deploy/ubuntu/egress/infinite-egress-proxy.socket"), true);
     assert.equal(isCheckedSourcePath("docs/adr/0001-demo.md"), false);
   });
 
@@ -171,6 +176,81 @@ describe("check-comments extractor", () => {
     assert.equal(summarizeFileComments(ktClean, "app/Demo.kt").blocks, 0);
     const ktsReal = 'val s = """/* not */ // not"""\n// real kotlin comment\n';
     assert.equal(summarizeFileComments(ktsReal, "build.gradle.kts").blocks, 1);
+  });
+
+  test("extracts CSS block comments while ignoring //, quoted strings with escapes, and unquoted url() values", () => {
+    const css = [
+      ".hero {",
+      "  background: url(https://example.com/a//b/*not-a-comment*/.png);",
+      "  mask-image: URL(https://example.com/a\\)/*still-url*/.svg);",
+      "  border-image: url(\"https://example.com/a/*quoted*/.png\" /* trailing inside quoted url */);",
+      "  content: \"/* inside double quotes */ \\\" /* still inside */\";",
+      "  --alt: '/* inside single quotes */ \\' /* still inside */';",
+      "  --wrapped: \"line one \\",
+      "/* still inside continued string */\";",
+      "  --slash-not-comment: https://example.com/path; // not a css comment",
+      "}",
+      ".esc\\/\\*ident { color: red; }",
+      ".custom { background: my-url(/* comment inside custom function */); }",
+      "/* standalone single-line comment */",
+      "/*",
+      " * multiline block",
+      " */",
+      ".inline { color: /* inline comment */ blue; }",
+    ].join("\n");
+
+    const summary = summarizeFileComments(css, "apps/web/src/demo.css");
+    assert.equal(summary.blocks, 5);
+    assert.equal(summary.lines, 7);
+    assert.equal(summary.shedLines, 4);
+    assert.deepEqual(
+      summary.details.map((block) => [block.startLine, block.endLine, block.fullLineOnly]),
+      [
+        [4, 4, false],
+        [12, 12, false],
+        [13, 13, true],
+        [14, 16, true],
+        [17, 17, false],
+      ],
+    );
+  });
+
+  test("extracts systemd unit comments per systemd.syntax(7) including # and ;, inline values, and line continuations", () => {
+    const unit = [
+      "#!not a shebang in systemd",
+      "[Unit]",
+      "Description=Demo #1; keeps inline # and ; intact",
+      "  # indented hash comment",
+      "\t; indented semicolon comment",
+      "# comment ending with backslash \\",
+      "After=network-online.target",
+      "; semicolon comment ending with backslash \\",
+      "Wants=network-online.target",
+      "",
+      "[Service]",
+      "ExecStart=/bin/sh -c \\",
+      "  # comment interspersed inside a continued directive",
+      "  ; semicolon comment interspersed inside a continued directive",
+      "  \"echo ok; echo #not-a-comment\"",
+      "Environment=FOO=a#b;c",
+    ].join("\n");
+
+    const serviceSummary = summarizeFileComments(unit, "deploy/ubuntu/demo.service");
+    assert.equal(serviceSummary.blocks, 4);
+    assert.equal(serviceSummary.lines, 7);
+    assert.equal(serviceSummary.shedLines, 7);
+    assert.deepEqual(
+      serviceSummary.details.map((block) => [block.startLine, block.endLine, block.lines.length]),
+      [
+        [1, 1, 1],
+        [4, 6, 3],
+        [8, 8, 1],
+        [13, 14, 2],
+      ],
+    );
+
+    assert.equal(summarizeFileComments("[Timer]\r\n; timer comment\r\nOnCalendar=daily\r\n", "deploy/ubuntu/demo.timer").lines, 1);
+    assert.equal(summarizeFileComments("[Socket]\n# socket comment\nListenStream=127.0.0.1:4785\n", "deploy/ubuntu/demo.socket").lines, 1);
   });
 });
 

@@ -513,7 +513,6 @@ small,
 .back {
   display: flex;
 }
-/* Floats under the top bar over the page's title text, never over its controls, and lets clicks through. */
 .connection-notice {
   position: absolute;
   z-index: 5;
@@ -1167,7 +1166,6 @@ small,
   }
 }
 
-/* Machine selection and remote session tools share the existing paper/ink palette. */
 .machine-root { height: 100dvh; min-height: 0; }
 .machine-picker { margin: 18px 0; min-width: 0; }
 .machine-picker > label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted, #617066); }
@@ -1205,9 +1203,7 @@ small,
   .prompt-decision { max-height: 25dvh; }
 }
 
-/* Agent teams share the journal frame while keeping their work and evidence distinct. */
 .workspace-navigation { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; padding: 14px 8px 0; }
-/* Icon above label, three to a row. The count of waiting decisions sits in the space under its label, so every label keeps its line and nothing moves when the count appears. */
 .workspace-navigation button { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; min-width: 0; height: 72px; padding: 6px 2px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font-size: 11px; }
 .workspace-navigation button svg { flex: none; }
 .workspace-navigation button[aria-current="page"] { background: #dce3d5; color: var(--green); font-weight: 600; }
@@ -1312,7 +1308,6 @@ small,
 .team-heading-actions .team-refresh { flex-shrink: 0; }
 .team-detail-meta { display: flex; align-items: center; gap: 10px 18px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
 .team-detail-meta .team-freshness { flex: 0 0 100%; min-height: 1.5em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
-/* Full-width like the freshness line, so the count and waiting note never reflow the header. */
 .team-detail-meta .team-workers { flex: 0 0 100%; min-height: 1.5em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
 .goal-active-cycle .team-section-heading .team-freshness { flex: 0 0 100%; min-height: 1.5em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .team-detail-body { padding: 0 42px 26px; overflow: auto; flex: 1; min-height: 0; }
@@ -1336,7 +1331,6 @@ small,
 .team-decision-readonly-options { margin: 16px 0 0; padding-left: 22px; color: var(--muted); font-size: 13px; line-height: 1.8; }
 .team-decision-readonly-options li { overflow-wrap: anywhere; }
 .team-decision-options button.recommended { border-color: var(--green); }
-/* The chosen option outweighs the recommended one: a fill and the word Selected, where a recommendation has only its border and tag. */
 .team-decision-options button[aria-pressed="true"] { border-color: var(--green); background: #edf0e7; color: var(--green); }
 .team-recommended-tag { margin-left: 8px; font-size: 11px; color: var(--green); }
 .team-session-link { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 14px; text-align: left; border: 0; border-bottom: 1px solid var(--rule); background: transparent; min-height: 60px; padding: 14px 0; }
@@ -1449,7 +1443,6 @@ small,
   .is-refreshing { animation: none; }
 }
 
-/* Mission details and links from the Swarm lanes. */
 .sw-mission-title { min-width: 0; padding: 0; border: 0; background: transparent; color: var(--sw-ink); font: inherit; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
 .sw-mission-title:hover, .sw-mission-title:focus-visible { text-decoration: underline; text-underline-offset: 3px; }
 .sw-held-missions { margin: 0 0 22px; padding: 8px 12px; border: 1px solid var(--sw-rule); border-radius: 8px; background: var(--sw-raised); }
@@ -1478,7 +1471,6 @@ small,
 .mission-request-notice p { margin: 0 0 8px; }
 .mission-request-notice .team-pending { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
 
-/* Goals keep the approved scope and human assessment alongside each work cycle. */
 .team-profile-tier { display: inline-block; margin-left: 8px; padding: 1px 5px; border: 1px solid var(--rule); border-radius: 4px; color: var(--muted); font-size: 10px; font-weight: 400; vertical-align: middle; }
 .team-model-profile > .team-data-use { color: #724314; }
 .team-evidence { padding-left: 20px; margin: 15px 0; font-size: 12px; line-height: 1.7; }
@@ -1559,7 +1551,6 @@ small,
   .linear-tracking-heading a { min-height: 44px; }
 }
 
-/* Cost: series slots are assigned in fixed order per account, validated for CVD separation on the paper surface. */
 :root { --series-1: #2b8a5e; --series-2: #4f6fd0; --series-3: #d4782a; --series-4: #6b4fbb; --series-5: #8f8a30; --series-6: #b25c8e; --chart-grid: #e3e6de; --chart-axis: #c3cabf; --chart-band: #eef1e9; }
 .cost-page { max-width: 1040px; padding-top: 30px; font-variant-numeric: tabular-nums; }
 .cost-switch { display: inline-flex; gap: 4px; padding: 3px; border: 1px solid var(--rule); border-radius: 8px; background: #fff; margin-bottom: 26px; }
@@ -1725,7 +1716,6 @@ small,
   .cost-rating { margin-left: 0; }
 }
 
-/* Permission decisions: the owner's read of the permission journal. */
 .permission-verdict { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
 .permission-verdict .dot, .permission-dot { background: #8f968e; }
 .permission-verdict.allow .dot, .permission-dot.allow { background: #307d54; }
@@ -1754,7 +1744,6 @@ small,
 .permission-cli .form-note { margin-top: 16px; }
 .permission-command { margin: 10px 0 4px; padding: 14px 16px; border-radius: 12px; background: #eef1e9; color: #334431; font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .permission-mark .error, .permission-mark [role="status"] { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 14px; }
-/* A wide screen shows the overview beside the log, so the link is for the phone, where one pane shows at a time. */
 .permission-overview-link { display: none; }
 @media (max-width: 700px) {
   .permission-detail h1.permission-action { font-size: 18px; }
@@ -1762,7 +1751,6 @@ small,
   .text-button.permission-overview-link { display: inline-flex; min-height: 44px; margin: 0 6px 4px; }
 }
 
-/* The owner's halt. It lasts until the owner releases it, so it takes its own place in the flow instead of floating. */
 .halt-banner {
   display: flex;
   flex-shrink: 0;
@@ -1790,14 +1778,12 @@ small,
 .halt-compact p { margin: 0; display: flex; flex-wrap: wrap; column-gap: 14px; row-gap: 2px; }
 .halt-compact b { font-weight: 600; }
 .halt-compact-item { min-width: 0; }
-/* The rail repeats the overview halt only where the list stands alone: the narrow layout without a detail view. */
 .halt-rail { display: none; }
 @media (max-width: 1000px) {
   .halt-banner { padding-left: 25px; padding-right: 25px; }
 }
 @media (max-width: 700px) {
   .halt-banner { padding-left: 17px; padding-right: 17px; }
-  /* The release command is for a terminal; a phone-width page keeps the room for its record. */
   .halt-release { display: none; }
   .app:not(.has-detail) .halt-rail { display: flex; margin: 14px 4px 0; padding: 10px 12px; border: 1px solid #e3d0ad; border-radius: 8px; }
 }

@@ -25,8 +25,6 @@ type Scheduler = {
 };
 const scheduler = (service: TeamService) => service as unknown as Scheduler;
 
-// The oracle observes which fixture agent produced each change and who reviewed which head.
-// The service integrates actual Git edits, runs the configured check, accepts the review and seals the receipts.
 async function simulateDelivery(seed: number, fault?: Fault) {
   const random = rand(seed);
   const f = schedulerFixture();
@@ -52,7 +50,6 @@ async function simulateDelivery(seed: number, fault?: Fault) {
       assert.equal(record.deliveryReviewApproval?.reviewerMemberId, accepted.id, message("accepted-review"));
       assert.equal(record.deliveryReviewApproval?.headCommit, accepted.head, message("accepted-review"));
     }
-    // Mutate only the gate's input to model checking a nominal lineup instead of the sealed writers.
     const gateLineage = fault === "skip-family-gate" && accepted?.head === head
       ? { ...lineage, families: ["unrelated"], unknown: false } : lineage;
     const reason = automaticMergeReviewReason({ run: { ...record.run, checkHead: record.checkHead }, members: record.run.members,
@@ -113,7 +110,6 @@ async function simulateDelivery(seed: number, fault?: Fault) {
       checked = record.run.headCommit;
       assert.equal(record.checkHead, checked);
       invariants();
-      // Both permission outcomes occur, including a same-family review after restart.
       const reviewer: Family = step === 1 ? author : random.pick(["claude", "gpt"] as const);
       await report("reviewer", reviewer);
       await reopen();

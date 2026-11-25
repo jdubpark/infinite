@@ -2,8 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { accept, admit, chargedAdmissions, checksDigest, emptyRecord, finish, MAX_ATTEMPT_ENTRIES, MAX_RESULTS, mainCheckRecordSchema, noticeDue, observe, settle, viewOf, type MainCheckRecord, type MainCheckResult, type Retiring } from "../packages/host/src/main-check-state.js";
 
-/* Examples for the pure main-check rules (INF-388). The seeded simulator covers their interplay; these pin the edges. */
-
 const DIGEST = checksDigest({ checks: [{ command: "npm", args: ["test"] }] });
 const OTHER_DIGEST = checksDigest({ setup: { command: "npm", args: ["ci"] }, checks: [{ command: "npm", args: ["test"] }] });
 const T0 = Date.parse("2026-11-20T08:00:00.000Z");
@@ -19,7 +17,6 @@ function result(head: string, outcome: MainCheckResult["outcome"], seconds: numb
   return { ...base, outcome };
 }
 
-/** Admits `head`, finishes it with `outcome`, and retires nothing: the record as the service would write it, settled. */
 function checked(record: MainCheckRecord, head: string, outcome: MainCheckResult["outcome"], seconds: number): MainCheckRecord {
   const directory = `alpha-2026-11-20-main-check-${seconds.toString(16).padStart(8, "0")}`;
   const observed = observe(record, head, at(seconds));
@@ -37,7 +34,6 @@ test("results past 20 keep the newest 20, and settle still finds health among th
   assert.equal(record.health?.head, headOf(MAX_RESULTS + 1));
   assert.equal(record.health?.outcome, "failed");
   assert.equal(mainCheckRecordSchema.safeParse(record).success, true);
-  // A head observed again, inside the kept 20, becomes health again.
   const again = settle(observe(record, headOf(5), at(1_000)), DIGEST);
   assert.equal(again.health?.head, headOf(5));
   assert.equal(again.health?.outcome, "passed");

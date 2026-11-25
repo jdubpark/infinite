@@ -5,7 +5,7 @@ description: Use when auditing, categorizing, and deleting code comments in this
 
 # Delete comments and tighten the ratchet
 
-This repository bans prose comments in new and cleaned source files via `npm run check:comments` (`scripts/check-comments.mjs`) backed by the downward-only baseline in `scripts/comments-baseline.json`. Use this workflow to burn down remaining baseline files cleanly without losing architectural decisions or hiding hacky workarounds.
+This repository bans prose comments in new and cleaned source files via `npm run check:comments` (`scripts/check-comments.mjs`) backed by the downward-only baseline in `scripts/comments-baseline.json`. The checker covers TypeScript/JavaScript (`.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs`), Swift/C/Kotlin (`.swift`, `.c`, `.h`, `.kt`, `.kts`), Python (`.py`), Shell (`.sh`), CSS (`.css`), and systemd unit files (`.service`, `.timer`, `.socket`). Use this workflow to burn down remaining baseline files cleanly without losing architectural decisions or hiding hacky workarounds.
 
 ## 1. Pick a target slice
 

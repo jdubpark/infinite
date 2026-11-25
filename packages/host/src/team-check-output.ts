@@ -192,7 +192,7 @@ export function scanCheckOutput(text: string): CheckScan {
   return scanner.finish();
 }
 export function unrecognisedTail(output: string): string {
-  const rows = output.split("\n").filter(row => strip(row).trim() !== "").slice(-TAIL_LINES).map(endRow);
+  const rows = output.split("\n").map(endRow).filter(row => row.trim() !== "").slice(-TAIL_LINES);
   if (rows.length === 0) return NO_OUTPUT;
   while (rows.length > 0 && [TAIL_HEADING, ...rows].join("\n").length > TAIL_CHARS) rows.shift();
   return [TAIL_HEADING, ...rows].join("\n");

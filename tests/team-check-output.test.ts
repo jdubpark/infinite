@@ -404,6 +404,7 @@ test("a tail row keeps its end, so a long line still shows its final error", () 
 test("no output, or only blank lines, gives the fixed no-output text", () => {
   assert.equal(unrecognisedTail(""), "The command wrote no output.");
   assert.equal(unrecognisedTail("\n  \n\t\n"), "The command wrote no output.");
+  assert.equal(unrecognisedTail([String.fromCodePoint(7), String.fromCodePoint(0x200b)].join("\n")), "The command wrote no output.");
 });
 
 test("a Jest warning and its coverage line are not failures", () => {

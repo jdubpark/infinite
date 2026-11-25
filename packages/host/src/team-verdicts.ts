@@ -185,8 +185,8 @@ export class TeamVerdicts {
 
   /**
    * Composes a settled run's verdict once more when the outcome ledger now shows its delivery. No evaluator runs. Returns false at the
-   * first check that fails (memory only, no store read, until the ledger is asked); true when it composed. The fact is saved with a new
-   * verdict id first, so a restart between the two saves composes the same verdict and writes its record entry once.
+   * first check that fails: memory only until the ledger is asked, and the record is read after that. True when it composed. The fact
+   * is saved with a new verdict id first, so a restart between the two saves composes the same verdict and writes its record entry once.
    */
   settleReceipt(holder: VerdictHolder): boolean {
     const run = holder.run;
@@ -195,20 +195,20 @@ export class TeamVerdicts {
     if (state === undefined || state.status !== "done" || state.kind !== "reviewed" || !this.current(run, state) || state.since === undefined || state.reason === "record-unavailable") return false;
     const assessment = run.assessment;
     if (assessment === undefined || assessment.revision !== state.revision || assessment.head !== state.head) return false;
-    const record = this.readyRecord(holder);
-    if (!record) return false;
-    // A restart came between the two saves: the new id and the fact are saved, the assessment is not.
     if (state.verdictId === assessment.verdictId) {
-      if (!record.criteria.some(item => item.state === "active" && deliveryReceiptOf(item) !== undefined)) return false;
+      // Memory only: a verdict none of whose criteria waited for the delivery has nothing to settle, whatever its record names now.
+      if (state.delivery === undefined && !state.composed?.criteria.some(item => item.reason === "before-delivery")) return false;
       const fact = this.host.delivery(run.id, state.head, state.since);
-      if (fact === undefined || fact === "none") return false;
-      const landedCriterion = record.criteria.some(item => item.state === "active" && deliveryReceiptOf(item) === "landed");
-      const wanted = fact === "reverted" && !landedCriterion ? "landed" : fact;
+      if (fact === undefined || fact === "none" || fact === state.delivery) return false;
+      const kinds = this.readyRecord(holder)?.criteria.filter(item => item.state === "active").map(deliveryReceiptOf);
+      if (!kinds?.some(kind => kind !== undefined)) return false;
+      const wanted = fact === "reverted" && !kinds.includes("landed") ? "landed" : fact;
       if (DELIVERY_ORDER.indexOf(wanted) <= DELIVERY_ORDER.indexOf(state.delivery ?? "none")) return false;
       state.delivery = wanted;
       state.verdictId = this.host.uuid();
       this.host.save(holder);
-    }
+    } else if (!this.readyRecord(holder)) return false;
+    // With another id than the assessment's, a restart came between the two saves: the id and the fact are saved, the assessment is not.
     this.finish(holder, state, state.reason === undefined ? state.report : undefined, state.reason, assessment.verdictId);
     return true;
   }

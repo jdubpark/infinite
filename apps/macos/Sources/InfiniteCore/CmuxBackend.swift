@@ -331,6 +331,7 @@ actor CmuxHelperProcess {
     private let stdoutIngressBytes = LockFreeInt64(0)
     private let stderrIngressBytes = LockFreeInt64(0)
     private let ingressOverflowed = LockFreeInt64(0)
+    private let stderrOverflowed = LockFreeInt64(0)
     private var partial = Data()
     private var lines: [Data] = []
     private var queuedBytes = 0
@@ -358,6 +359,10 @@ actor CmuxHelperProcess {
         let stdoutIngressBytes = self.stdoutIngressBytes
         let stderrIngressBytes = self.stderrIngressBytes
         let ingressOverflowed = self.ingressOverflowed
+        let stderrOverflowed = self.stderrOverflowed
+        let helperProcess = self.process
+        let outputHandle = self.output.fileHandleForReading
+        let errorHandle = self.errorOutput.fileHandleForReading
         process.executableURL = executable
         process.arguments = arguments
         process.standardInput = input
@@ -378,7 +383,9 @@ actor CmuxHelperProcess {
             if stdoutIngressBytes.add(count) > maxStdoutBufferBytes {
                 stdoutIngressBytes.sub(count)
                 handle.readabilityHandler = nil
+                errorHandle.readabilityHandler = nil
                 if ingressOverflowed.add(1) == 1 {
+                    if helperProcess.isRunning { helperProcess.terminate() }
                     continuation.yield(.overflow("The cmux helper output exceeded the client limit."))
                     continuation.finish()
                 }
@@ -403,7 +410,10 @@ actor CmuxHelperProcess {
             if stderrIngressBytes.add(count) > maxStderrBufferBytes {
                 stderrIngressBytes.sub(count)
                 handle.readabilityHandler = nil
+                outputHandle.readabilityHandler = nil
+                stderrOverflowed.store(1)
                 if ingressOverflowed.add(1) == 1 {
+                    if helperProcess.isRunning { helperProcess.terminate() }
                     continuation.yield(.overflow("The cmux helper error output exceeded the client limit."))
                     continuation.finish()
                 }
@@ -432,13 +442,31 @@ actor CmuxHelperProcess {
         }
     }
 
+    var hasIngressOverflowed: Bool { ingressOverflowed.load() != 0 }
+    var hasLatchedFailure: Bool { failure != nil || ingressOverflowed.load() != 0 }
+
+    private func latchedFailure() -> String? {
+        if let failure { return failure }
+        guard ingressOverflowed.load() != 0 else { return nil }
+        let message = stderrOverflowed.load() != 0
+            ? "The cmux helper error output exceeded the client limit."
+            : "The cmux helper output exceeded the client limit."
+        failure = message
+        partial.removeAll()
+        lines.removeAll()
+        queuedBytes = 0
+        ended = true
+        return message
+    }
+
     func write(_ data: Data) throws {
+        if let message = latchedFailure() { throw CmuxTransportError.failed(message) }
         guard process.isRunning else { throw CmuxTransportError.failed("The cmux helper stopped. Reconnect before sending another request.") }
         try input.fileHandleForWriting.write(contentsOf: data)
     }
 
     func readLine(deadline: Date) async throws -> Data {
-        if let failure { throw CmuxTransportError.failed(failure) }
+        if let message = latchedFailure() { throw CmuxTransportError.failed(message) }
         if !lines.isEmpty {
             let line = lines.removeFirst()
             queuedBytes -= line.count
@@ -469,8 +497,8 @@ actor CmuxHelperProcess {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
-                if let failure {
-                    continuation.resume(throwing: CmuxTransportError.failed(failure))
+                if let message = latchedFailure() {
+                    continuation.resume(throwing: CmuxTransportError.failed(message))
                     return
                 }
                 if !lines.isEmpty {
@@ -526,6 +554,7 @@ actor CmuxHelperProcess {
             queuedBytes = 0
             ended = true
             if failure == nil { failure = message }
+            if process.isRunning { process.terminate() }
             if let existing = lineWaiter {
                 lineWaiter = nil
                 existing.continuation.resume(throwing: CmuxTransportError.failed(failure ?? message))
@@ -537,9 +566,9 @@ actor CmuxHelperProcess {
             terminationWaiters.removeAll()
             for waiter in waiters { waiter.resume() }
             if let existing = lineWaiter {
-                if let failure {
+                if let message = latchedFailure() {
                     lineWaiter = nil
-                    existing.continuation.resume(throwing: CmuxTransportError.failed(failure))
+                    existing.continuation.resume(throwing: CmuxTransportError.failed(message))
                 } else if lines.isEmpty {
                     lineWaiter = nil
                     existing.continuation.resume(throwing: eofError())
@@ -549,10 +578,10 @@ actor CmuxHelperProcess {
     }
 
     private func receive(_ bytes: Data) {
-        if let failure {
+        if let message = latchedFailure() {
             if let existing = lineWaiter {
                 lineWaiter = nil
-                existing.continuation.resume(throwing: CmuxTransportError.failed(failure))
+                existing.continuation.resume(throwing: CmuxTransportError.failed(message))
             }
             return
         }
@@ -560,7 +589,7 @@ actor CmuxHelperProcess {
             ended = true
             if lines.isEmpty, let existing = lineWaiter {
                 lineWaiter = nil
-                existing.continuation.resume(throwing: failure.map { CmuxTransportError.failed($0) } ?? eofError())
+                existing.continuation.resume(throwing: latchedFailure().map { CmuxTransportError.failed($0) } ?? eofError())
             }
             return
         }
@@ -584,9 +613,9 @@ actor CmuxHelperProcess {
             failure = "The cmux helper frame exceeded the client limit."
         }
         if let existing = lineWaiter {
-            if let failure {
+            if let message = latchedFailure() {
                 lineWaiter = nil
-                existing.continuation.resume(throwing: CmuxTransportError.failed(failure))
+                existing.continuation.resume(throwing: CmuxTransportError.failed(message))
             } else if !lines.isEmpty {
                 let line = lines.removeFirst()
                 queuedBytes -= line.count
@@ -624,7 +653,7 @@ actor CmuxHelperProcess {
         ended = true
         if let existing = lineWaiter {
             lineWaiter = nil
-            existing.continuation.resume(throwing: failure.map { CmuxTransportError.failed($0) } ?? eofError())
+            existing.continuation.resume(throwing: latchedFailure().map { CmuxTransportError.failed($0) } ?? eofError())
         }
         canceledLineWaiters.removeAll()
         canceledTerminationWaiters.removeAll()

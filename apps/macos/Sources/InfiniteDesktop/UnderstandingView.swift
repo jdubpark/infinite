@@ -21,6 +21,7 @@ struct UnderstandingView: View {
     @State private var cacheSavedAt: Date?
     @State private var offlineWorkspaces: [ProjectGroup] = []
     @State private var offlineWorkspacesScope = ""
+    @State private var cachedCredentialScope = ""
     @State private var offlineWorkspacesTask: Task<Void, Never>?
 
     private enum Mode: String, CaseIterable, Identifiable {
@@ -30,10 +31,10 @@ struct UnderstandingView: View {
         var id: String { rawValue }
     }
 
-    private var offlineScope: String { "\(hostCacheIdentity)|\(credentialCacheIdentity)" }
+    private var offlineScope: String { "\(hostCacheIdentity)|\(cachedCredentialScope)" }
     private var groups: [ProjectGroup] {
         var combined = app.projectGroups.groups
-        if offlineWorkspacesScope == offlineScope {
+        if !cachedCredentialScope.isEmpty, cachedCredentialScope != "unavailable", offlineWorkspacesScope == offlineScope {
             for cached in offlineWorkspaces where !combined.contains(where: { $0.id == cached.id }) { combined.append(cached) }
         }
         return ProjectGroup.ordered(combined)
@@ -99,8 +100,8 @@ struct UnderstandingView: View {
         .background(Palette.background)
         .task(id: requestKey) { await refreshWhileVisible() }
         .onChange(of: app.projectGroups.groups.map(\.id)) { _, _ in refreshOfflineWorkspaces(); selectAvailableWorkspace() }
-        .onChange(of: app.activeID) { _, _ in refreshOfflineWorkspaces(); selectAvailableWorkspace() }
-        .onChange(of: app.connected) { _, connected in if !connected { refreshOfflineWorkspaces(); selectAvailableWorkspace() } }
+        .onChange(of: hostCacheIdentity) { _, _ in refreshOfflineWorkspaces(); selectAvailableWorkspace() }
+        .onChange(of: app.connected) { _, _ in refreshOfflineWorkspaces(); selectAvailableWorkspace() }
         .onChange(of: app.understandingWorkspaceID) { _, _ in
             selectedWorkID = nil
             selectedRepositoryID = nil
@@ -611,6 +612,7 @@ struct UnderstandingView: View {
     private func refreshOfflineWorkspaces() {
         let host = hostCacheIdentity
         let credential = credentialCacheIdentity
+        cachedCredentialScope = credential
         let nextScope = "\(host)|\(credential)"
         if offlineWorkspacesScope != nextScope {
             offlineWorkspaces = []
@@ -625,13 +627,13 @@ struct UnderstandingView: View {
         offlineWorkspacesTask = Task {
             let store = await UnderstandingSnapshotStore.shared()
             guard let recent = try? await store.readRecent(host: host, credential: credential) else {
-                if !Task.isCancelled, hostCacheIdentity == host, credentialCacheIdentity == credential {
+                if !Task.isCancelled, hostCacheIdentity == host, cachedCredentialScope == credential {
                     offlineWorkspaces = []
                     offlineWorkspacesScope = nextScope
                 }
                 return
             }
-            guard !Task.isCancelled, hostCacheIdentity == host, credentialCacheIdentity == credential else { return }
+            guard !Task.isCancelled, hostCacheIdentity == host, cachedCredentialScope == credential else { return }
             var seen = Set<String>()
             offlineWorkspaces = recent.compactMap { cached in
                 guard let data = cached.envelope.overview, let page = try? JSON.parse(data) else { return nil }

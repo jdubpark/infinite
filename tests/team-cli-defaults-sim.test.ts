@@ -1,12 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { nearestDirectoryDefault, saveDirectoryDefault } from "../packages/host/src/team-cli.js";
 
 type DefaultEntry = { teamId: string; projectId?: string };
+
+type SimulatorOps = {
+  save(defaultsPath: string, directory: string, value: DefaultEntry): void;
+  lookup(defaultsPath: string, directory: string): (DefaultEntry & { origin: string }) | undefined;
+  interruptWrite(defaultsPath: string, directory: string, seed: number, step: number): void;
+};
 
 function createRng(seed: number) {
   let state = seed >>> 0;
@@ -36,9 +42,15 @@ function expectedDefault(
   return undefined;
 }
 
-test("nearestDirectoryDefault preserves nearest-ancestor lookup and unrelated entries across legacy migration, overrides, and interrupted tmp writes", () => {
-  const seeds = [1, 7, 42, 1337, 9001];
+function atomicInterruptWrite(defaultsPath: string, directory: string, seed: number, step: number) {
+  const dirStore = `${defaultsPath}.d`;
+  mkdirSync(dirStore, { recursive: true, mode: 0o700 });
+  const hash = createHash("sha256").update(directory).digest("hex");
+  writeFileSync(join(dirStore, `${hash}.json.interrupted-${seed}-${step}.tmp`), "{\"version\":1,\"directory\":");
+  writeFileSync(`${defaultsPath}.interrupted-${seed}-${step}.tmp`, "{\"version\":1");
+}
 
+function runSimulation(seeds: number[], ops: SimulatorOps) {
   for (const seed of seeds) {
     const next = createRng(seed);
     const root = realpathSync(mkdtempSync(join(tmpdir(), `infinite-team-defaults-sim-${seed}-`)));
@@ -82,7 +94,7 @@ test("nearestDirectoryDefault preserves nearest-ancestor lookup and unrelated en
         const target = directories[Math.floor(next() * directories.length)];
         if (roll < 0.5) {
           const entry = makeEntry();
-          saveDirectoryDefault(defaultsPath, target, entry);
+          ops.save(defaultsPath, target, entry);
           dirDefaults.set(target, entry);
         } else if (roll < 0.75) {
           const entry = makeEntry();
@@ -92,16 +104,12 @@ test("nearestDirectoryDefault preserves nearest-ancestor lookup and unrelated en
             directories: Object.fromEntries(legacyDefaults),
           }, null, 2));
         } else {
-          const dirStore = `${defaultsPath}.d`;
-          mkdirSync(dirStore, { recursive: true, mode: 0o700 });
-          const hash = createHash("sha256").update(target).digest("hex");
-          writeFileSync(join(dirStore, `${hash}.json.interrupted-${seed}-${step}.tmp`), "{\"version\":1,\"directory\":");
-          writeFileSync(`${defaultsPath}.interrupted-${seed}-${step}.tmp`, "{\"version\":1");
+          ops.interruptWrite(defaultsPath, target, seed, step);
         }
 
         for (const query of directories) {
           assert.deepEqual(
-            nearestDirectoryDefault(defaultsPath, query),
+            ops.lookup(defaultsPath, query),
             expectedDefault(query, root, dirDefaults, legacyDefaults),
             `seed=${seed} step=${step} query=${query}`,
           );
@@ -116,4 +124,53 @@ test("nearestDirectoryDefault preserves nearest-ancestor lookup and unrelated en
       rmSync(root, { recursive: true, force: true });
     }
   }
+}
+
+const realOps: SimulatorOps = {
+  save: saveDirectoryDefault,
+  lookup: nearestDirectoryDefault,
+  interruptWrite: atomicInterruptWrite,
+};
+
+test("nearestDirectoryDefault preserves nearest-ancestor lookup and unrelated entries across legacy migration, overrides, and interrupted tmp writes", () => {
+  runSimulation([1, 7, 42, 1337, 9001], realOps);
+});
+
+test("simulator catches non-atomic crash truncation, shallowest-ancestor lookup, and sibling clobbering", () => {
+  assert.throws(() => runSimulation([42], {
+    ...realOps,
+    interruptWrite(defaultsPath, directory) {
+      const dirStore = `${defaultsPath}.d`;
+      mkdirSync(dirStore, { recursive: true, mode: 0o700 });
+      const hash = createHash("sha256").update(directory).digest("hex");
+      writeFileSync(join(dirStore, `${hash}.json`), "{\"version\":1,\"directory\":");
+    },
+  }), /Private CLI state is unreadable/);
+
+  assert.throws(() => runSimulation([42], {
+    ...realOps,
+    lookup(defaultsPath, directory) {
+      let shallowest: (DefaultEntry & { origin: string }) | undefined;
+      for (let current = directory; ; current = dirname(current)) {
+        const hit = nearestDirectoryDefault(defaultsPath, current);
+        if (hit) shallowest = hit;
+        if (current === dirname(current)) break;
+      }
+      return shallowest;
+    },
+  }), { name: "AssertionError" });
+
+  assert.throws(() => runSimulation([42], {
+    ...realOps,
+    save(defaultsPath, directory, value) {
+      const dirStore = `${defaultsPath}.d`;
+      const hash = createHash("sha256").update(directory).digest("hex");
+      if (existsSync(dirStore)) {
+        for (const entry of readdirSync(dirStore)) {
+          if (entry.endsWith(".json") && entry !== `${hash}.json`) rmSync(join(dirStore, entry), { force: true });
+        }
+      }
+      saveDirectoryDefault(defaultsPath, directory, value);
+    },
+  }), (error: unknown) => error instanceof Error && (error.name === "AssertionError" || (error as NodeJS.ErrnoException).code === "ENOENT"));
 });

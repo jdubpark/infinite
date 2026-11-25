@@ -299,11 +299,52 @@ function parseHeredocOperator(line, index) {
   const stripTabs = line[k] === "-";
   if (stripTabs) k += 1;
   while (k < line.length && (line[k] === " " || line[k] === "\t")) k += 1;
-  const rest = line.slice(k);
-  const match = /^(?:'([A-Za-z_][A-Za-z0-9_-]*)'|"([A-Za-z_][A-Za-z0-9_-]*)"|\\?([A-Za-z_][A-Za-z0-9_-]*))/.exec(rest);
-  if (!match) return null;
-  const delimiter = match[1] ?? match[2] ?? match[3];
-  return { delimiter, stripTabs, nextIndex: k + match[0].length };
+  let delimiter = "";
+  let hasWordChars = false;
+  let quote = null;
+  while (k < line.length) {
+    const ch = line[k];
+    if (quote === "'") {
+      if (ch === "'") { quote = null; k += 1; continue; }
+      delimiter += ch;
+      k += 1;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') { quote = null; k += 1; continue; }
+      if (ch === "$" || ch === "`") return null;
+      if (ch === "\\") {
+        if (k + 1 >= line.length) return null;
+        const nextCh = line[k + 1];
+        if (nextCh === '"' || nextCh === "\\" || nextCh === "$" || nextCh === "`") {
+          delimiter += nextCh;
+          k += 2;
+          continue;
+        }
+        delimiter += "\\";
+        k += 1;
+        continue;
+      }
+      delimiter += ch;
+      k += 1;
+      continue;
+    }
+    if (/[ \t\r\n;|&()<>]/.test(ch)) break;
+    if (ch === "'" || ch === '"') { quote = ch; hasWordChars = true; k += 1; continue; }
+    if (ch === "\\") {
+      if (k + 1 >= line.length) return null;
+      delimiter += line[k + 1];
+      hasWordChars = true;
+      k += 2;
+      continue;
+    }
+    if (ch === "$" || ch === "`") return null;
+    delimiter += ch;
+    hasWordChars = true;
+    k += 1;
+  }
+  if (quote !== null || !hasWordChars || delimiter.length === 0) return null;
+  return { delimiter, stripTabs, nextIndex: k };
 }
 
 function extractShellComments(text) {
@@ -313,6 +354,7 @@ function extractShellComments(text) {
   let inSingle = false;
   let inDouble = false;
   let paramDepth = 0;
+  const arithStack = [];
   const pendingHeredocs = [];
   for (let idx = 0; idx < lines.length; idx += 1) {
     const line = lines[idx];
@@ -329,16 +371,31 @@ function extractShellComments(text) {
       if (c === "'" && !inDouble) { inSingle = !inSingle; continue; }
       if (c === '"' && !inSingle) { inDouble = !inDouble; continue; }
       if (!inSingle) {
+        if (c === "$" && line[j + 1] === "(" && line[j + 2] === "(") { arithStack.push(0); j += 2; continue; }
+        if (!inDouble && paramDepth === 0 && c === "(" && line[j + 1] === "(") { arithStack.push(0); j += 1; continue; }
+        if (arithStack.length > 0) {
+          if (c === "(") { arithStack[arithStack.length - 1] += 1; continue; }
+          if (c === ")") {
+            if (arithStack[arithStack.length - 1] > 0) { arithStack[arithStack.length - 1] -= 1; continue; }
+            if (line[j + 1] === ")") { arithStack.pop(); j += 1; continue; }
+          }
+        }
         if (c === "$" && line[j + 1] === "{") { paramDepth += 1; j += 1; continue; }
         if (paramDepth > 0 && c === "}") { paramDepth -= 1; continue; }
       }
-      if (!inSingle && !inDouble && paramDepth === 0 && c === "<" && line[j + 1] === "<") {
+      if (!inSingle && !inDouble && paramDepth === 0 && arithStack.length === 0 && c === "<" && line[j + 1] === "<") {
+        if (line[j + 2] === "<") {
+          j += 2;
+          continue;
+        }
         const heredoc = parseHeredocOperator(line, j);
         if (heredoc) {
           pendingHeredocs.push({ delimiter: heredoc.delimiter, stripTabs: heredoc.stripTabs });
           j = heredoc.nextIndex - 1;
           continue;
         }
+        j += 1;
+        continue;
       }
       if (c === "#" && !inSingle && !inDouble && paramDepth === 0) {
         const prev = j === 0 ? "" : line[j - 1];

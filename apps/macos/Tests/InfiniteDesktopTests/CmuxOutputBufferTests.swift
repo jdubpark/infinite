@@ -63,7 +63,6 @@ final class CmuxOutputBufferTests: XCTestCase {
 
         let chunk = Data(repeating: 65, count: 9 * 1024 * 1024)
         buffer.append(.bytes(chunk))
-        await Task.yield()
         buffer.append(.bytes(chunk))
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(invalidCount, 1)
@@ -73,6 +72,39 @@ final class CmuxOutputBufferTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(invalidCount, 1)
         XCTAssertEqual(byteEventCount, 0)
+    }
+
+    @MainActor func testPendingDeliveryRetainsBudgetUntilDeliverCompletes() async throws {
+        var invalidCount = 0
+        var byteEventCount = 0
+        var appendedDuringDelivery = false
+        let overflowDelivered = expectation(description: "overflow delivered")
+        let chunk = Data(repeating: 65, count: 9 * 1024 * 1024)
+        var buffer: CmuxOutputBuffer?
+        buffer = CmuxOutputBuffer { events in
+            for event in events {
+                switch event {
+                case .invalidFrame:
+                    invalidCount += 1
+                    overflowDelivered.fulfill()
+                case .bytes:
+                    byteEventCount += 1
+                    if !appendedDuringDelivery {
+                        appendedDuringDelivery = true
+                        buffer?.append(.bytes(chunk))
+                    }
+                default:
+                    break
+                }
+            }
+        }
+        defer { buffer?.cancel() }
+
+        buffer?.append(.bytes(chunk))
+        await fulfillment(of: [overflowDelivered], timeout: 2)
+        XCTAssertTrue(appendedDuringDelivery)
+        XCTAssertEqual(invalidCount, 1)
+        XCTAssertEqual(byteEventCount, 1)
     }
 
     @MainActor func testReleasesBudgetOnlyAfterPendingFlushCompletes() async throws {

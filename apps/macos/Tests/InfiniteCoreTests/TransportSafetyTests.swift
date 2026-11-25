@@ -3,6 +3,45 @@ import CryptoKit
 import Network
 @testable import InfiniteCore
 
+private actor AsyncLatch {
+    private var completed = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        guard !completed else { return }
+        completed = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume() }
+    }
+
+    func wait(timeout: Duration = .seconds(5)) async throws {
+        if completed { return }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                await self.awaitSignal()
+            }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw DesktopError("Timed out waiting for event.")
+            }
+            defer { group.cancelAll() }
+            try await group.next()
+        }
+    }
+
+    private func awaitSignal() async {
+        if completed { return }
+        await withCheckedContinuation { continuation in
+            if completed {
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+            }
+        }
+    }
+}
+
 private actor MockRemoteServer {
     private let token: String
     private let serverID = UUID().uuidString.lowercased()
@@ -11,6 +50,7 @@ private actor MockRemoteServer {
     private var openedStreams: [String] = []
     private var closedStreams: [String] = []
     private var sentStreams: [String] = []
+    private var sentWaiters: [String: AsyncLatch] = [:]
 
     init(token: String) {
         self.token = token
@@ -59,6 +99,16 @@ private actor MockRemoteServer {
     func recordedOpenedStreams() -> [String] { openedStreams }
     func recordedClosedStreams() -> [String] { closedStreams }
     func recordedSentStreams() -> [String] { sentStreams }
+
+    func waitForSentStream(_ streamID: String, timeout: Duration = .seconds(5)) async throws {
+        if sentStreams.contains(streamID) { return }
+        let latch = sentWaiters[streamID] ?? {
+            let created = AsyncLatch()
+            sentWaiters[streamID] = created
+            return created
+        }()
+        try await latch.wait(timeout: timeout)
+    }
 
     private func accept(_ connection: NWConnection) {
         activeConnection = connection
@@ -142,7 +192,9 @@ private actor MockRemoteServer {
                     case "terminal-close":
                         closedStreams.append(msg["streamId"].string)
                     case "terminal-send":
-                        sentStreams.append(msg["streamId"].string)
+                        let streamID = msg["streamId"].string
+                        sentStreams.append(streamID)
+                        await sentWaiters.removeValue(forKey: streamID)?.signal()
                     default:
                         break
                     }
@@ -199,16 +251,21 @@ final class TransportSafetyTests: XCTestCase {
             profile: HostProfile(label: "Local", origin: "http://127.0.0.1:\(port)"),
             token: token
         )
-        let stream1 = try await client.openTerminal(sessionID: "s1") { _ in }
+        let firstClosed = AsyncLatch()
+        let stream1 = try await client.openTerminal(sessionID: "s1") { event in
+            if event["type"].string == "terminal-closed" {
+                Task { await firstClosed.signal() }
+            }
+        }
         await server.dropActiveConnection()
-        try await Task.sleep(for: .milliseconds(50))
+        try await firstClosed.wait(timeout: .seconds(5))
 
         let stream2 = try await client.openTerminal(sessionID: "s1") { _ in }
         XCTAssertNotEqual(stream1, stream2)
 
         await client.closeTerminal(stream1)
         try await client.sendTerminal(stream2, message: .object(["op": .string("raw"), "text": .string("ok")]))
-        try await Task.sleep(for: .milliseconds(50))
+        try await server.waitForSentStream(stream2, timeout: .seconds(5))
 
         let closed = await server.recordedClosedStreams()
         let sent = await server.recordedSentStreams()
@@ -271,7 +328,7 @@ final class TransportSafetyTests: XCTestCase {
             executable: URL(fileURLWithPath: "/bin/sh"),
             arguments: ["-c", "i=0; while [ $i -lt 260 ]; do echo '{\"ok\":true}'; i=$((i+1)); done; sleep 1"]
         )
-        try await Task.sleep(for: .milliseconds(150))
+        try await waitUntil(timeout: .seconds(5)) { await helper.hasLatchedFailure }
         do {
             _ = try await helper.readLine(deadline: Date().addingTimeInterval(5))
             XCTFail("Expected buffered lines to be rejected once limit failure was latched")
@@ -279,5 +336,42 @@ final class TransportSafetyTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("limit"))
         }
         await helper.stop()
+    }
+
+    func testCmuxHelperProcessRejectsQueuedLineAndWritesAfterIngressOverflow() async throws {
+        let helper = try CmuxHelperProcess(
+            executable: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "printf '{\"line\":1}\\n{\"line\":2}\\n'; read -r _; head -c 65536 /dev/zero | tr '\\0' 'b' >&2; sleep 2"],
+            maxStdoutBufferBytes: 4096,
+            maxStderrBufferBytes: 1024
+        )
+        let first = try await helper.readLine(deadline: Date().addingTimeInterval(5))
+        XCTAssertEqual(try JSON.parse(first)["line"].int, 1)
+
+        try await helper.write(Data("trigger\n".utf8))
+        try await waitUntil(timeout: .seconds(5)) { await helper.hasIngressOverflowed }
+
+        do {
+            _ = try await helper.readLine(deadline: Date().addingTimeInterval(5))
+            XCTFail("Expected queued line to be rejected after stderr ingress overflow")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("limit"))
+        }
+        do {
+            try await helper.write(Data("after\n".utf8))
+            XCTFail("Expected write to be rejected after ingress overflow")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("limit"))
+        }
+        await helper.stop()
+    }
+
+    private func waitUntil(timeout: Duration, condition: @escaping @Sendable () async -> Bool) async throws {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            if await condition() { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Timed out waiting for condition")
     }
 }

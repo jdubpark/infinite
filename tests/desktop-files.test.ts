@@ -21,6 +21,12 @@ test("DesktopFiles.directory preserves existing 0o700 directory mode while apply
   mkdirSync(existing, { mode: 0o700 });
   chownSync(existing, process.getuid!(), process.getgid!());
 
+  const probe = join(root, "setgid-probe");
+  mkdirSync(probe, { mode: 0o700 });
+  chownSync(probe, process.getuid!(), process.getgid!());
+  chmodSync(probe, 0o2770);
+  const supportsSetgid = (statSync(probe).mode & 0o2000) === 0o2000;
+
   const config = {
     projects: [{ id: "rehearsal", name: "Rehearsal", path: projectDir }],
     stateDir,
@@ -33,8 +39,10 @@ test("DesktopFiles.directory preserves existing 0o700 directory mode while apply
   try {
     const result = await files.directory("rehearsal", "private-existing/shared-child");
     assert.deepEqual(result, { path: "private-existing/shared-child", created: true });
-    assert.equal(statSync(existing).mode & 0o2777, 0o700);
-    assert.equal(statSync(join(existing, "shared-child")).mode & 0o2777, 0o2770);
+    assert.equal(statSync(existing).mode & 0o7777, 0o700);
+    const childMode = statSync(join(existing, "shared-child")).mode & 0o7777;
+    assert.equal(childMode & 0o777, 0o770);
+    if (supportsSetgid) assert.equal(childMode, 0o2770);
   } finally {
     files.close();
     rmSync(root, { recursive: true, force: true });

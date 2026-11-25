@@ -127,8 +127,32 @@ describe("check-comments extractor", () => {
     assert.equal(summary.lines, 2);
     assert.equal(summary.shedLines, 1);
 
-    const hereString = "grep foo <<< \"bar\" # real comment\n";
+    const hereString = [
+      "grep foo <<< \"bar\"",
+      "# comment after here-string",
+    ].join("\n");
     assert.equal(summarizeFileComments(hereString, "scripts/demo.sh").blocks, 1);
+
+    const arithmetic = [
+      "bits=$((1 << shift))",
+      "# comment after arithmetic shift",
+      "(( (a << 2) > 0 ))",
+      "# comment after compound arithmetic shift",
+    ].join("\n");
+    assert.equal(summarizeFileComments(arithmetic, "scripts/demo.sh").blocks, 2);
+
+    const dotted = [
+      "cat <<END.TXT",
+      "# inside dotted heredoc",
+      "END.TXT",
+      "# comment after dotted heredoc",
+      "cat <<$DYNAMIC",
+      "# comment after unexpanded delimiter",
+      "cat <<'UNCLOSED",
+      "'",
+      "# comment after unclosed quote closes",
+    ].join("\n");
+    assert.equal(summarizeFileComments(dotted, "scripts/demo.sh").blocks, 3);
   });
 
   test("checks .h C headers and ignores comments inside Kotlin triple-quoted raw strings", () => {

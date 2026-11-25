@@ -596,6 +596,44 @@ test("a failed stop is tried again before a settled trial is void", { timeout: 9
   }
 });
 
+test("a clean that fails at a trial's end is run again before the next trial starts", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const inner = s.identity;
+  let failedAt = -1;
+  // The first clean after a trial is final runs for real but reports failure, as a clean that leaves the account unsure does.
+  s.identity = { ...inner, clean: async () => {
+    const done = await inner.clean();
+    const ended = s.r.store.read(db => db.get<{ n: number }>("SELECT COUNT(*) AS n FROM eval_trials WHERE state = 'final'"))?.n ?? 0;
+    if (ended >= 1 && failedAt < 0) {
+      failedAt = launcherOps(s).length;
+      return false;
+    }
+    return done;
+  } };
+  const h = host(s, { teams: () => served.service, sessions: served.manager });
+  try {
+    await validated(h);
+    const jobId = baseline(h, 2, 2);
+    await drive(s, h, () => jobRow(s, jobId)?.status === "completed", [], 600_000);
+    assert.ok(failedAt >= 0, "the clean at the first trial's end failed once");
+    assert.equal(jobRow(s, jobId)?.status, "completed", "the second trial ran");
+    const after = launcherOps(s).slice(failedAt);
+    // A trial's own start resets the account once (stop, clean, scrub). The start-up that the failed clean forces is a second reset, before the next member's receive.
+    const receive = after.indexOf("receive");
+    assert.ok(receive > 0, "the second trial received its source after the failure");
+    assert.deepEqual(after.slice(0, receive), ["stop", "clean", "scrub", "stop", "clean", "scrub"],
+      `the failure forces a start-up reset before the trial's own reset and before any trial command; ops: ${after.join(",")}`);
+    assert.equal(trialRows(s, jobId).length, 2, "both trials ran");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
 test("a failed launch ends the run it may have left", { timeout: 900_000 }, async () => {
   const s = setup();
   const fx = await teamFixture(s);

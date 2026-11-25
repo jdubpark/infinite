@@ -107,6 +107,69 @@ test("same-id append is idempotent only for identical content", () => withJourna
   assert.equal(journal.decisions().length, 1);
 }));
 
+test("decisions that answered one raised request count as one repeat, and a decision with no request digest counts alone", () => withJournal(journal => {
+  const at = (minute: number) => `2026-11-14T10:${String(minute).padStart(2, "0")}:00.000Z`;
+  journal.appendDecision(effectReject("original", { requestDigest: "request-a" }));
+  // The request that got the reject, decided again: no repeat of its own reject.
+  journal.appendDecision(effectReject("original-again", { repeats: "original", requestDigest: "request-a", at: at(1) }));
+  assert.equal(journal.repeatCount("assignment-1", "original"), 0);
+  // One other request, decided three times: one repeat.
+  for (const [index, id] of ["b-1", "b-2", "b-3"].entries()) {
+    journal.appendDecision(effectReject(id, { repeats: "original", requestDigest: "request-b", at: at(2 + index) }));
+  }
+  assert.equal(journal.repeatCount("assignment-1", "original"), 1);
+  assert.equal(journal.isLocked("assignment-1"), false);
+  // A record of an earlier release has no digest. It counts as before, each on its own.
+  journal.appendDecision(effectReject("old-1", { repeats: "original", at: at(5) }));
+  assert.equal(journal.repeatCount("assignment-1", "original"), 2);
+  assert.equal(journal.isLocked("assignment-1"), true);
+  journal.appendDecision(effectReject("old-2", { repeats: "original", at: at(6) }));
+  assert.equal(journal.repeatCount("assignment-1", "original"), 3);
+
+  // After an unlock a request counted before it does not count again; a new request does.
+  journal.unlock({ assignment: "assignment-1", at: at(7), by: "owner" });
+  journal.appendDecision(effectReject("b-4", { repeats: "original", requestDigest: "request-b", at: at(8) }));
+  assert.equal(journal.repeatCount("assignment-1", "original"), 0);
+  journal.appendDecision(effectReject("c-1", { repeats: "original", requestDigest: "request-c", at: at(9) }));
+  journal.appendDecision(effectReject("c-2", { repeats: "original", requestDigest: "request-c", at: at(10) }));
+  assert.equal(journal.repeatCount("assignment-1", "original"), 1);
+  // The digest is no column and no part of what a lookup returns.
+  assert.equal("requestDigest" in journal.decision("c-1")!, false);
+  // It is part of the content that an ID stands for.
+  assert.throws(() => journal.appendDecision(effectReject("c-2", { repeats: "original", requestDigest: "request-d", at: at(10) })), /different content/);
+  assert.throws(() => journal.appendDecision(effectReject("bad", { requestDigest: "" })), TypeError);
+
+  // A reject of an earlier release has no digest, so its own request, decided again, still counts against it.
+  journal.appendDecision(effectReject("old-original", { assignment: "assignment-2", at: at(11) }));
+  journal.appendDecision(effectReject("old-original-again", { assignment: "assignment-2", repeats: "old-original", requestDigest: "request-e", at: at(12) }));
+  assert.equal(journal.repeatCount("assignment-2", "old-original"), 1);
+}));
+
+test("a decision whose sealed copy cannot be read counts on its own, and the lock is still read", () => {
+  const f = fixture();
+  try {
+    let store = open(f);
+    let journal = new PermissionJournal(store);
+    journal.appendDecision(effectReject("original", { requestDigest: "request-a" }));
+    journal.appendDecision(effectReject("b-1", { repeats: "original", requestDigest: "request-b", at: "2026-11-14T10:01:00.000Z" }));
+    journal.appendDecision(effectReject("b-2", { repeats: "original", requestDigest: "request-b", at: "2026-11-14T10:02:00.000Z" }));
+    assert.equal(journal.repeatCount("assignment-1", "original"), 1);
+    store.close();
+    const raw = new DatabaseSync(f.path);
+    try { raw.prepare("UPDATE permission_decisions SET input_sealed='not a sealed value' WHERE id='b-2'").run(); } finally { raw.close(); }
+    store = open(f);
+    try {
+      journal = new PermissionJournal(store);
+      assert.equal(journal.repeatCount("assignment-1", "original"), 2);
+      assert.equal(journal.isLocked("assignment-1"), true);
+    } finally {
+      store.close();
+    }
+  } finally {
+    f.close();
+  }
+});
+
 test("model notes are sealed at rest and decrypted by decision lookup", () => {
   const f = fixture();
   let store = open(f);

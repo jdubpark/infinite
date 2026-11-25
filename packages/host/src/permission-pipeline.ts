@@ -368,6 +368,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
       ...(family === undefined ? {} : { family }),
       evidenceHash: request.evidenceHash,
       action: { tool: request.tool, summary: bounded(request.action) },
+      requestDigest: requestDigestFor(request),
     };
 
     // 1. Class rules: the owner answers, no model turn runs, and nothing is replayed for it.
@@ -576,6 +577,17 @@ const READ_SOURCE = "host:read-source";
  */
 function decisionIdFor(request: PermissionRequest, authorityHash: string, inputs: string): string {
   return `pd-${sha256(["permission-decision", request.requester.sessionId, request.id, request.evidenceHash, authorityHash, inputs]).slice(0, 32)}`;
+}
+
+/**
+ * One raised request, whatever authority, reading or evidence it is decided under. The journal counts a repeat once
+ * per digest. An interactive dialog is one prompt of its session: the prompt id is the sequence of the event that
+ * opened it, a new dialog gets a new one, and the dialog keeps it while a hook adds its tool evidence, which changes
+ * the request id and the evidence hash. A headless call has no prompt, and its request id is the call's.
+ */
+function requestDigestFor(request: PermissionRequest): string {
+  const raised = request.prompt ? ["prompt", request.prompt.id] : ["request", request.id, request.evidenceHash];
+  return sha256(["permission-request", request.requester.sessionId, ...raised]);
 }
 
 /**

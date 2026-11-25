@@ -105,7 +105,7 @@ function cancelFollowUps(mission: Mission) {
   for (const item of openFollowUps(mission)) Object.assign(item, { state: "cancelled", settledAt: at });
   trimFollowUps(mission);
 }
-function trimFollowUps(mission: Mission) {
+export function trimFollowUps(mission: Mission) {
   const settled = (mission.followUps ?? []).filter(item => item.state !== "open").sort((a, b) => (a.settledAt ?? "").localeCompare(b.settledAt ?? ""));
   const dropped = new Set<MissionFollowUp>(settled.slice(0, Math.max(0, settled.length - settledFollowUpsKept)));
   if (dropped.size) mission.followUps = mission.followUps!.filter(item => !dropped.has(item));
@@ -139,7 +139,6 @@ export class MissionService {
       const id = file.slice(0, -7);
       const stored = unseal<Stored>(key, `mission:${id}`, readFileSync(join(this.directory, file), "utf8"));
       if (stored.mission.id !== id) throw new TeamError(409, "invalid-mission-record", "A mission record cannot be authenticated.");
-      for (const item of stored.mission.followUps ?? []) if (item.state !== "open" && !item.settledAt) Object.assign(item, { settledAt: item.dueAt || item.createdAt });
       this.records.set(id, stored);
       this.saved.set(id, digest(stored));
       let capacityChanged = false;

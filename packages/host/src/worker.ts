@@ -62,7 +62,7 @@ import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-openco
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
 import { JsonLineAssembler, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
-import { normalizeWorkerControlRequest, teamAnswerWorkerRequestSchema,
+import { normalizeWorkerControlRequest, teamAnswerWorkerRequestSchema, workerControlRequestSchema,
   type Bootstrap,
   type ControlActor,
   type ControlLease,
@@ -633,9 +633,9 @@ function validateControl(request: InputControl) {
     throw new Error("Invalid session control");
 }
 function changeControl(rawRequest: Extract<WorkerRequest, { op: "control" }>): ControlLease | null {
-  const request = normalizeWorkerControlRequest(rawRequest);
-  if (!validActor(request.actor) || !["claim", "renew", "release"].includes(request.action) || (request.takeover !== undefined && (request.action !== "claim" || typeof request.takeover !== "boolean"))) throw new Error("Invalid session control");
-  validateControl(request);
+  const normalized = normalizeWorkerControlRequest(rawRequest);
+  if ((normalized.action === "renew" || normalized.action === "release") && normalized.leaseId === undefined && validActor(normalized.actor) && (normalized as { takeover?: unknown }).takeover === undefined) throw new Refusal("control-lost");
+  const parsed = workerControlRequestSchema.safeParse(normalized); if (!parsed.success) throw new Error("Invalid session control"); const request = parsed.data;
   const active = currentControl();
   const owns = active && controller?.actorId === request.actor.id && active.id === request.leaseId;
   const reconnecting = active && controller?.actorId === request.actor.id && request.leaseId === undefined;

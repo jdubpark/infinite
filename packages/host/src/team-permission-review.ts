@@ -455,7 +455,7 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
     return true;
   }
   private requestPermissionEvidence(stored: Stored, decision: TeamPermissionDecision, member: TeamMember,
-    report: Extract<TeamReport, { kind: "permission-decision" }>) {
+    report: Extract<TeamReport, { kind: "permission-decision"; verdict: "request-evidence" }>) {
     const run = stored.run;
     const target = run.members.find(item => item.memberId === decision.targetMemberId && item.sessionId === decision.targetSessionId);
     if (!target || !report.requestedPaths?.length) {

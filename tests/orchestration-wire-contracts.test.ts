@@ -20,11 +20,15 @@ import {
   usageTotalsSchema,
   type GoalCycleUsage,
   type PassedTeamCheck,
+  type RecordedTeamReportEnvelope,
   type TeamCheck,
   type TeamProject,
+  type TeamReportEnvelope,
   type TeamRun,
 } from "../packages/host/src/team-types.js";
 import { teamReportToolInputSchema } from "../packages/host/src/team-mcp.js";
+import { terminalConnection } from "../packages/host/src/client-transport.js";
+import type { TerminalInput } from "@infinite/remote/protocol";
 import {
   goalCycleSchema,
   isActiveGoalCycle,
@@ -41,9 +45,10 @@ import {
 } from "../packages/host/src/goal-types.js";
 import {
   missionSubtaskSchema,
+  recordedMissionFollowUpSchema,
   type MissionDecisionState,
 } from "../packages/host/src/mission-types.js";
-import { MissionService } from "../packages/host/src/missions.js";
+import { MissionService, trimFollowUps } from "../packages/host/src/missions.js";
 import { writeSealed } from "../packages/host/src/vault.js";
 import { validateWorkspaceManifest } from "../packages/host/src/workspace-checkpoint.js";
 import {
@@ -111,6 +116,24 @@ test("HTTP, WebSocket, and worker control boundaries normalize takeover: false a
 
   const claimBody = httpControlRequestSchema.parse({ action: "claim", takeover: true });
   assert.deepEqual(normalizeControlRequest(claimBody, ACTOR), { ok: true, request: { op: "control", action: "claim", actor: ACTOR, takeover: true } });
+
+  const validRemoteRenew: TerminalInput = { op: "control", requestId: UUID, action: "renew", leaseId: UUID2, takeover: false };
+  const validRemoteClaim: TerminalInput = { op: "control", requestId: UUID, action: "claim", takeover: true };
+  // @ts-expect-error TerminalInput renew cannot set takeover: true
+  const invalidRemoteRenewTakeover: TerminalInput = { op: "control", requestId: UUID, action: "renew", leaseId: UUID2, takeover: true };
+  // @ts-expect-error TerminalInput release cannot set takeover: true
+  const invalidRemoteReleaseTakeover: TerminalInput = { op: "control", requestId: UUID, action: "release", leaseId: UUID2, takeover: true };
+  type ControlMethod = ReturnType<typeof terminalConnection>["control"];
+  const checkControlTyping = (control: ControlMethod) => {
+    void control("claim", true);
+    void control("renew");
+    void control("release");
+    // @ts-expect-error client-transport control rejects takeover argument on renew
+    void control("renew", true);
+    // @ts-expect-error client-transport control rejects takeover argument on release
+    void control("release", true);
+  };
+  assert.ok(validRemoteRenew && validRemoteClaim && invalidRemoteRenewTakeover && invalidRemoteReleaseTakeover && checkControlTyping);
 });
 
 test("live teamReportEnvelopeSchema and MCP JSON schema enforce structural delivery reconciliation while recordedTeamReportEnvelopeSchema preserves journal replay", () => {
@@ -147,13 +170,19 @@ test("live teamReportEnvelopeSchema and MCP JSON schema enforce structural deliv
   assert.equal(teamReportEnvelopeSchema.safeParse({ ...envelopeBase, report: legacyQuestion }).success, true);
   assert.equal(recordedTeamReportEnvelopeSchema.safeParse({ ...envelopeBase, report: legacyQuestion }).success, true);
 
+  const recordedLegacyEnvelope: RecordedTeamReportEnvelope = { ...envelopeBase, report: legacyOwnedBranch };
+  // @ts-expect-error live TeamReportEnvelope owned-branch requires remoteHeadCommit
+  const invalidLiveEnvelope: TeamReportEnvelope = { ...envelopeBase, report: legacyOwnedBranch };
+  assert.ok(recordedLegacyEnvelope && invalidLiveEnvelope);
+
   assert.equal(strictDeliveryReconciliationReportSchema.safeParse(legacyOwnedBranch).success, false);
   assert.equal(strictDeliveryReconciliationReportSchema.safeParse(strictOwnedBranch).success, true);
 
-  type BranchSchema = { properties?: { kind?: { const?: string }; disposition?: { const?: string } }; required?: string[]; oneOf?: BranchSchema[]; anyOf?: BranchSchema[] };
+  type BranchSchema = { properties?: { kind?: { const?: string }; disposition?: { const?: string }; verdict?: { const?: string }; requestedPaths?: unknown }; required?: string[]; oneOf?: BranchSchema[]; anyOf?: BranchSchema[] };
   const flatten = (node: BranchSchema): BranchSchema[] => [...(node.oneOf ?? []), ...(node.anyOf ?? [])].flatMap(child => (child.oneOf || child.anyOf) ? flatten(child) : [child]);
   const reportSchema = (teamReportToolInputSchema as { properties?: { report?: BranchSchema } }).properties?.report ?? {};
-  const deliveryBranches = flatten(reportSchema).filter(branch => branch.properties?.kind?.const === "delivery-reconciliation");
+  const flattened = flatten(reportSchema);
+  const deliveryBranches = flattened.filter(branch => branch.properties?.kind?.const === "delivery-reconciliation");
   const byDisposition = new Map(deliveryBranches.map(branch => [branch.properties?.disposition?.const, branch.required ?? []]));
   assert.equal(byDisposition.size, 3);
   assert.equal(byDisposition.get("no-publication")?.includes("remoteHeadCommit"), false);
@@ -162,6 +191,13 @@ test("live teamReportEnvelopeSchema and MCP JSON schema enforce structural deliv
   assert.equal(byDisposition.get("owned-branch")?.includes("pullRequestUrl"), false);
   assert.equal(byDisposition.get("pull-request")?.includes("remoteHeadCommit"), true);
   assert.equal(byDisposition.get("pull-request")?.includes("pullRequestUrl"), true);
+
+  const permissionBranches = flattened.filter(branch => branch.properties?.kind?.const === "permission-decision");
+  const byVerdict = new Map(permissionBranches.map(branch => [branch.properties?.verdict?.const, branch]));
+  assert.equal(byVerdict.size, 3);
+  assert.equal(byVerdict.get("approve-once")?.properties?.requestedPaths, undefined);
+  assert.equal(byVerdict.get("escalate")?.properties?.requestedPaths, undefined);
+  assert.equal(byVerdict.get("request-evidence")?.required?.includes("requestedPaths"), true);
 });
 
 test("GoalCycle and cancelled MissionSubtask usage schemas accept historical stored rollups and pre-catalog totals-only snapshots", () => {
@@ -176,6 +212,13 @@ test("GoalCycle and cancelled MissionSubtask usage schemas accept historical sto
     tokens: { input: 120, output: 60, reasoning: 0, cacheRead: 10, cacheWrite: 5 },
     messages: 2,
     pricing: { configured: 1, provider: 0, unknown: 0 },
+  };
+  const preCatalogIncompleteTotals = {
+    cost: 0.04,
+    tokens: { input: 120, output: 60, reasoning: 0, cacheRead: 10, cacheWrite: 5 },
+    messages: 2,
+    pricing: { configured: 1, provider: 0, unknown: 0 },
+    incomplete: true,
   };
   const currentRollup = {
     total: totals,
@@ -194,15 +237,17 @@ test("GoalCycle and cancelled MissionSubtask usage schemas accept historical sto
   const historicalNoPartial: GoalCycleUsage = { ...totals, ...legacyStoredRollup };
   const legacyTotalsOnly: GoalCycleUsage = totals;
   const legacyPreCatalogTotalsOnly: GoalCycleUsage = preCatalogTotals;
+  const legacyIncompleteTotalsOnly: GoalCycleUsage = preCatalogIncompleteTotals;
 
   assert.equal(usageTotalsSchema.safeParse(totals).success, true);
   assert.equal(usageTotalsSchema.safeParse(preCatalogTotals).success, false);
+  assert.equal(usageTotalsSchema.safeParse({ ...totals, incomplete: true }).success, false);
   assert.equal(usageRollupSchema.safeParse(currentRollup).success, true);
   assert.equal(usageRollupSchema.safeParse(legacyStoredRollup).success, false);
   assert.equal(storedUsageRollupSchema.safeParse(legacyStoredRollup).success, true);
 
   const baseCycle = { teamId: UUID, cycle: 1, goalRevision: 1, status: "ready-for-review", startedAt: AT, finishedAt: LATER, memberCount: 2 };
-  for (const usage of [currentSnapshot, historicalNoPartial, legacyTotalsOnly, legacyPreCatalogTotalsOnly]) {
+  for (const usage of [currentSnapshot, historicalNoPartial, legacyTotalsOnly, legacyPreCatalogTotalsOnly, legacyIncompleteTotalsOnly]) {
     assert.equal(goalCycleUsageSchema.safeParse(usage).success, true);
     assert.equal(goalCycleSchema.safeParse({ ...baseCycle, usage }).success, true);
   }
@@ -345,20 +390,30 @@ test("CreateGoal, TeamProject, MissionDecisionState, and TeamRun enforce strict 
   assert.ok(invalidForwardedMissionDecision && invalidRunCheck && invalidRunAgentDecision && invalidRunPublication);
 });
 
-test("MissionService loads legacy settled follow-ups missing settledAt without throwing during restore or trimming", () => {
+test("MissionService loads legacy settled follow-ups without synthesizing settledAt from future dueAt and trims safely", () => {
   const dir = mkdtempSync(join(tmpdir(), "inf-mission-legacy-followup-"));
   const stateDir = join(dir, "state");
   mkdirSync(join(stateDir, "missions"), { recursive: true });
   const key = randomBytes(32);
   const missionId = UUID;
-  const legacyFollowUps = Array.from({ length: 12 }, (_, index) => ({
+  const futureDueAt = "2099-01-01T00:00:00.000Z";
+  const legacyCancelled = {
+    id: "f-legacy-cancelled",
+    dueAt: futureDueAt,
+    reason: "Cancelled before future due date",
+    check: "Inspect PR",
+    createdAt: AT,
+    state: "cancelled" as const,
+  };
+  assert.equal(recordedMissionFollowUpSchema.safeParse(legacyCancelled).success, true);
+  const timestampedSettled = Array.from({ length: 11 }, (_, index) => ({
     id: `f-${index}`,
     dueAt: `2026-11-25T12:${String(index).padStart(2, "0")}:00.000Z`,
     reason: `Check ${index}`,
     check: "Inspect PR",
     createdAt: AT,
-    state: "fired",
-    ...(index % 2 === 0 ? {} : { settledAt: `2026-11-25T12:${String(index).padStart(2, "0")}:30.000Z` }),
+    state: "fired" as const,
+    settledAt: `2026-11-25T12:${String(index).padStart(2, "0")}:30.000Z`,
   }));
   const stored = {
     mission: {
@@ -378,7 +433,7 @@ test("MissionService loads legacy settled follow-ups missing settledAt without t
       maxTotalMinutes: 60,
       subtasks: [],
       decisions: [],
-      followUps: legacyFollowUps,
+      followUps: [legacyCancelled, ...timestampedSettled],
       steering: [],
       events: [],
     },
@@ -394,12 +449,13 @@ test("MissionService loads legacy settled follow-ups missing settledAt without t
   try {
     const loaded = service.peek(missionId);
     assert.ok(loaded);
-    assert.equal(loaded.followUps?.length, 12);
-    for (const item of loaded.followUps ?? []) {
-      assert.equal(item.state, "fired");
-      assert.equal(typeof item.settledAt, "string");
-      assert.ok(item.settledAt.length > 0);
-    }
+    const legacyEntry = loaded.followUps?.find(item => item.id === "f-legacy-cancelled");
+    assert.ok(legacyEntry);
+    assert.equal(legacyEntry.state, "cancelled");
+    assert.equal(legacyEntry.settledAt, undefined);
+    trimFollowUps(loaded);
+    assert.equal(loaded.followUps?.length, 10);
+    assert.deepEqual(loaded.followUps?.map(item => item.id), timestampedSettled.slice(1).map(item => item.id));
   } finally {
     service.close();
     rmSync(dir, { recursive: true, force: true });

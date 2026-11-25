@@ -276,6 +276,9 @@ interface MissionFollowUpBase {
 export type MissionFollowUp =
   | (MissionFollowUpBase & { state: "open"; settledAt?: never })
   | (MissionFollowUpBase & { state: "fired" | "cancelled"; settledAt: string });
+export type RecordedMissionFollowUp =
+  | (MissionFollowUpBase & { state: "open"; settledAt?: never })
+  | (MissionFollowUpBase & { state: "fired" | "cancelled"; settledAt?: string });
 const missionFollowUpBaseShape = {
   id: z.string().min(1),
   dueAt: z.iso.datetime(),
@@ -287,6 +290,11 @@ export const missionFollowUpSchema: z.ZodType<MissionFollowUp> = z.discriminated
   z.object({ ...missionFollowUpBaseShape, state: z.literal("open") }).strict(),
   z.object({ ...missionFollowUpBaseShape, state: z.literal("fired"), settledAt: z.iso.datetime() }).strict(),
   z.object({ ...missionFollowUpBaseShape, state: z.literal("cancelled"), settledAt: z.iso.datetime() }).strict(),
+]);
+export const recordedMissionFollowUpSchema: z.ZodType<RecordedMissionFollowUp> = z.discriminatedUnion("state", [
+  z.object({ ...missionFollowUpBaseShape, state: z.literal("open") }).strict(),
+  z.object({ ...missionFollowUpBaseShape, state: z.literal("fired"), settledAt: z.iso.datetime().optional() }).strict(),
+  z.object({ ...missionFollowUpBaseShape, state: z.literal("cancelled"), settledAt: z.iso.datetime().optional() }).strict(),
 ]);
 export type MissionOrigin = { kind: "intake"; issueId: string; identifier: string; url: string; rule: string; source?: ConnectorSource };
 export type MissionInputSource = "slack" | ConnectorSource;

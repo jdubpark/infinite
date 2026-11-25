@@ -89,19 +89,26 @@ export function terminalConnection(origin: string, token: string, sessionId: str
       catch (error) { pending.delete(requestId); clearTimeout(timer); pendingBytes -= size; reject(error); }
     });
   };
+  function control(action: "claim", takeover?: boolean): Promise<ControlLease | null>;
+  function control(action: "renew" | "release"): Promise<ControlLease | null>;
+  function control(action: "claim" | "renew" | "release", takeover = false): Promise<ControlLease | null> {
+    const requestId = randomUUID();
+    if (controls.size >= 4) return Promise.reject(new Error("A control request is already pending"));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => fail(new Error("Terminal acknowledgement timed out")), 15000);
+      timer.unref();
+      controls.set(requestId, { timer, resolve, reject });
+      try {
+        send(action === "claim"
+          ? { op: "control", requestId, action, ...(lease ? { leaseId: lease.id } : {}), ...(takeover ? { takeover: true } : {}) }
+          : { op: "control", requestId, action, ...(lease ? { leaseId: lease.id } : {}) });
+      }
+      catch (error) { controls.delete(requestId); clearTimeout(timer); reject(error); }
+    });
+  }
   return {
     get lease() { return lease; },
-    control(action: "claim" | "renew" | "release", takeover = false): Promise<ControlLease | null> {
-      const requestId = randomUUID();
-      if (controls.size >= 4) return Promise.reject(new Error("A control request is already pending"));
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => fail(new Error("Terminal acknowledgement timed out")), 15000);
-        timer.unref();
-        controls.set(requestId, { timer, resolve, reject });
-        try { send({ op: "control", requestId, action, ...(lease ? { leaseId: lease.id } : {}), ...(takeover ? { takeover: true } : {}) }); }
-        catch (error) { controls.delete(requestId); clearTimeout(timer); reject(error); }
-      });
-    },
+    control,
     async *pages(): AsyncGenerator<TerminalPage> {
       try {
         while (!ended || queue.length) {

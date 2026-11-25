@@ -21,6 +21,7 @@ import {
   deliveryReconciliationReportSchema,
   gitBranchSchema,
   githubRepositorySchema,
+  permissionDecisionReportSchema,
   teamCommandSchema,
   type TeamCheck,
   type TeamCommand,
@@ -536,12 +537,7 @@ const questionReportShape = { kind: z.literal("question"), question: z.string().
 const recordedDeliveryReconciliationReportSchema = z.object({ kind: z.literal("delivery-reconciliation"), headCommit: commitHashSchema, repository: githubRepository, branch: gitBranch, baseHeadCommit: commitHashSchema, disposition: z.enum(["no-publication", "owned-branch", "pull-request"]), remoteHeadCommit: commitHashSchema.optional(), pullRequestUrl: z.string().trim().min(1).max(500).optional(), summary: z.string().trim().min(1).max(4000) }).strict();
 export const strictDeliveryReconciliationReportSchema = deliveryReconciliationReportSchema;
 const sharedTeamReportVariants = [
-  z.object({ kind: z.literal("permission-decision"), decisionId: z.uuid(), verdict: z.enum(["approve-once", "request-evidence", "escalate"]), summary: z.string().trim().min(1).max(2000), requestedPaths: z.array(z.string().trim().min(1).max(512)).max(8).optional() }).strict().superRefine((report, context) => {
-    if (report.verdict === "request-evidence" && !report.requestedPaths?.length)
-      context.addIssue({ code: "custom", path: ["requestedPaths"], message: "Request evidence with at least one repository-relative or approved scratch path." });
-    if (report.verdict !== "request-evidence" && report.requestedPaths !== undefined)
-      context.addIssue({ code: "custom", path: ["requestedPaths"], message: "Only an evidence request may name paths." });
-  }),
+  permissionDecisionReportSchema,
   z.object({ kind: z.literal("plan"), summary: z.string().min(1).max(4000), parallelism: z.number().int().min(1).max(4).optional(), brief: teamBriefSchema.optional(), tasks: z.array(teamTaskPlanSchema).min(1).max(12), verification: teamVerificationSchema.optional() }).strict(),
   z.object({ kind: z.literal("explore"), summary: z.string().min(1).max(4000), parallelism: z.number().int().min(1).max(4).optional(), tasks: z.array(teamScoutPlanSchema).min(1).max(3) }).strict(),
   z.object({ kind: z.literal("findings"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
@@ -569,7 +565,8 @@ export const recordedTeamReportSchema = z.discriminatedUnion("kind", [...sharedT
 export type TeamReport = z.infer<typeof recordedTeamReportSchema>;
 export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: liveTeamReportSchema }).strict();
 export const recordedTeamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: recordedTeamReportSchema }).strict();
-export type TeamReportEnvelope = z.infer<typeof recordedTeamReportEnvelopeSchema>;
+export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
+export type RecordedTeamReportEnvelope = z.infer<typeof recordedTeamReportEnvelopeSchema>;
 export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole | "mission-coordinator"; taskId?: string; verificationRefused?: true; entryTools?: true; hostProfiles?: true };
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 export interface TeamMember extends TeamAssignment {

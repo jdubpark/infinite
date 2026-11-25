@@ -34,12 +34,14 @@ export const usageTotalsSchema: z.ZodType<UsageTotals> = z.object({
 }).strict();
 export type LegacyUsageTotals = Omit<UsageTotals, "pricing"> & {
   pricing: Omit<UsageTotals["pricing"], "catalog"> & { catalog?: number };
+  incomplete?: boolean;
 };
 const legacyTotalsOnlyUsageSchema: z.ZodType<LegacyUsageTotals> = z.object({
   cost: z.number().min(0),
   tokens: usageTokensSchema,
   messages: nonNegInt,
   pricing: legacyUsagePricingSchema,
+  incomplete: z.boolean().optional(),
 }).strict();
 const providerUsageMapSchema = z.object({
   claude: usageTotalsSchema.optional(),
@@ -192,11 +194,11 @@ const permissionDecisionBaseShape = {
   decisionId: z.uuid(),
   summary: z.string().trim().min(1).max(2000),
 };
-export const permissionDecisionReportSchema: z.ZodType<PermissionDecisionReport> = z.discriminatedUnion("verdict", [
+export const permissionDecisionReportSchema = z.discriminatedUnion("verdict", [
   z.object({ ...permissionDecisionBaseShape, verdict: z.literal("approve-once") }).strict(),
   z.object({ ...permissionDecisionBaseShape, verdict: z.literal("escalate") }).strict(),
   z.object({ ...permissionDecisionBaseShape, verdict: z.literal("request-evidence"), requestedPaths: z.array(z.string().trim().min(1).max(512)).min(1).max(8) }).strict(),
-]);
+]) satisfies z.ZodType<PermissionDecisionReport>;
 
 interface DeliveryReconciliationReportBase {
   kind: "delivery-reconciliation";

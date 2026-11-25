@@ -3184,8 +3184,8 @@ export class TeamService {
         const finishedCheck: TeamRun["checks"][number] = result.interrupted ? { ...baseCheck, status: "interrupted", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, scan: scanner.finish() }
           : result.exitCode === 0 ? { ...baseCheck, status: "passed", finishedAt: timestamp(), exitCode: 0, output: result.output }
           : { ...baseCheck, status: "failed", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, scan: scanner.finish() };
-        metrics.record(stored, finishedCheck); results.push(finishedCheck);
-        await this.enqueue(stored.run.id, () => { if (!this.closed) { const i = run.checks.indexOf(runningCheck); if (i >= 0) run.checks[i] = finishedCheck; this.save(stored); } });
+        results.push(finishedCheck);
+        await this.enqueue(stored.run.id, () => { if (!this.closed) { const i = run.checks.indexOf(runningCheck); if (i >= 0) run.checks[i] = finishedCheck; metrics.record(stored, finishedCheck); this.save(stored); } });
         await this.noteLeftover(stored, result);
         if (!signal.aborted) await assertMemberReadOnly(verification.workspace, head, this.config.teams?.commandPrefix, signal, context);
         if (finishedCheck.status !== "passed") break;

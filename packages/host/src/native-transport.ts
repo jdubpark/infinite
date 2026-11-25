@@ -1,12 +1,8 @@
 import type { WebSocket } from "ws";
 
-// Provider startup catalogs can exceed 12 MB. Bound individual messages and
-// queued output separately, allowing a short burst of catalog responses.
 export const NATIVE_MAX_MESSAGE = 32 * 1024 * 1024;
 export const NATIVE_MAX_BUFFERED = 64 * 1024 * 1024;
 
-// Compress only the cloud hop. Local provider sockets avoid repeated compression
-// work; independent message contexts keep memory bounded across attachments.
 export const NATIVE_COMPRESSION = {
   threshold: 1024,
   serverNoContextTakeover: true,
@@ -17,8 +13,6 @@ export const NATIVE_COMPRESSION = {
 
 const CATALOG_CHUNK_BYTES = 64 * 1024;
 
-// Only catalog read responses may be overtaken. Turn events, approval requests,
-// and all other provider messages retain their original ordering.
 export function nativeCatalogSender(socket: WebSocket, fail: () => void) {
   const queue: { id: number; data: Buffer; offset: number }[] = [];
   let nextId = 0, bytes = 0;

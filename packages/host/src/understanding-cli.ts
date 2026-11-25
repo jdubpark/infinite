@@ -43,7 +43,6 @@ function workLines(work: UnderstandingWork): string[] {
 type PlannedByRepository = Record<string, UnderstandingPlan[]>;
 const maxPages = 200;
 
-/** Follows `next` cursors until null; a repeated cursor or more than 200 pages is an error, not a silent truncation. */
 async function allPages<T extends { next: string | null }>(api: Api, path: string, merge: (page: T) => void) {
   const seen = new Set<string>();
   let cursor: string | null = null;
@@ -437,7 +436,6 @@ export async function handleUnderstandingCommand(positional: string[], options: 
   throw new Error(`Unknown understand command: ${clean(command)}`);
 }
 
-/** Local model checking runs before the CLI attempts to load a paired client configuration. */
 export async function handleLocalBehaviorCheckCommand(argv: string[]): Promise<boolean> {
   if (argv[0] !== "understand" || argv[1] !== "check") return false;
   const options: Options = {};

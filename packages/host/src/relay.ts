@@ -6,19 +6,11 @@ import { WebSocket, WebSocketServer } from "ws";
 import { MAX_FRAME_BYTES, MAX_REQUEST_BYTES, parseRelayEnvelope, UUID, type RelayEnvelope } from "@infinite/remote/protocol";
 
 export interface RelayOptions {
-  /** Only relay registration hashes. Never put device keys or their hashes here. */
   registrations: { machineId: string; tokenHash: string }[];
   maxClients?: number;
   maxClientsPerMachine?: number;
   maxHosts?: number;
-  /** Concurrent client channels from one address (an IPv6 /64), so one source cannot fill a machine's slots. */
   maxClientsPerAddress?: number;
-  /**
-   * A tunnel or reverse proxy on this machine connects through `relay.proxy`, a listener for a
-   * Unix socket whose permissions admit only that proxy. `addressHeader` names the header it sets
-   * to the real client address (for Cloudflare, `cf-connecting-ip`). Client channels are then
-   * accepted only through the proxy, so other local processes reach only the host route.
-   */
   proxy?: { addressHeader: string };
 }
 
@@ -26,7 +18,6 @@ const MAX_BUFFERED_BYTES = MAX_FRAME_BYTES * 4;
 const MAX_REQUEST_FRAME = MAX_REQUEST_BYTES * 2 + 4096;
 const MAX_TRACKED_ADDRESSES = 1024;
 
-/** An IPv4 address, or the /64 of an IPv6 address, since one client can hold a whole /64. */
 function addressKey(value: string) {
   const address = value.trim().toLowerCase().replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/, "");
   if (isIP(address) !== 6) return address;
@@ -36,17 +27,12 @@ function addressKey(value: string) {
   return `${groups.slice(0, 4).map(group => parseInt(group, 16).toString(16)).join(":")}::/64`;
 }
 
-/**
- * An untrusted router: the only exposed content is ciphertext and routing metadata.
- * It serves no web client; the browser client is for local development only.
- */
 export function createRelayServer(options: RelayOptions) {
   const registrations = new Map<string, Buffer>();
   for (const registration of options.registrations) {
     if (!UUID.test(registration.machineId) || !/^[a-f0-9]{64}$/.test(registration.tokenHash) || registrations.has(registration.machineId)) throw new Error("Invalid relay registration");
     registrations.set(registration.machineId, Buffer.from(registration.tokenHash, "hex"));
   }
-  // Without a proxy, every proxied client shares the proxy's address; only a proxy makes a per-address cap meaningful.
   const limits = { clients: options.maxClients ?? 128, perMachine: options.maxClientsPerMachine ?? 16, hosts: options.maxHosts ?? 64, perAddress: options.maxClientsPerAddress ?? (options.proxy ? 4 : 1024) };
   if (Object.values(limits).some(limit => !Number.isInteger(limit) || limit < 1 || limit > 1024)) throw new Error("Invalid relay connection limit");
   const addressHeader = options.proxy?.addressHeader.toLowerCase();
@@ -106,13 +92,10 @@ export function createRelayServer(options: RelayOptions) {
     const forwarded = req.headers[addressHeader];
     return typeof forwarded === "string" && isIP(forwarded.trim()) ? addressKey(forwarded) : "proxy";
   }
-  /** Counts an attempt; false once an address has made 60 in a minute. */
   function admit(address: string, now: number) {
     for (const [key, entry] of attempts) if (now - entry.start > 60000) attempts.delete(key);
     const attempt = attempts.get(address);
     if (attempt) return ++attempt.count <= 60;
-    // Forget the oldest address rather than refuse new ones, so rotating addresses cannot lock everyone out.
-    // A client rotating through more addresses can reset its own count; the edge gate in front bounds that.
     if (attempts.size >= MAX_TRACKED_ADDRESSES) attempts.delete(attempts.keys().next().value!);
     attempts.set(address, { start: now, count: 1 });
     return true;
@@ -126,7 +109,6 @@ export function createRelayServer(options: RelayOptions) {
     const now = Date.now(), ip = clientAddress(req);
     const machineId = route[2];
     if (route[1] === "hosts") {
-      // A registered runner is never throttled by other traffic on its address; failed attempts are.
       const hash = registrations.get(machineId), token = req.headers.authorization?.match(/^Bearer ([\x21-\x7e]{32,200})$/)?.[1];
       if (!hash || !token || req.headers.origin || !timingSafeEqual(createHash("sha256").update(token).digest(), hash)) { reject(admit(ip, now) ? 403 : 429); return; }
       if (hosts.has(machineId)) { reject(409); return; }

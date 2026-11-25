@@ -28,7 +28,6 @@ export function projectLimit(limits: FuseLimits, projectId: string): number {
   return Object.hasOwn(limits.projects, projectId) ? limits.projects[projectId] : limits.project;
 }
 
-/** Launches admitted in the last hour, after the scope's latest owner close. */
 export function rollingCount(
   launches: readonly FuseLaunchRecord[],
   trips: readonly FuseTripRecord[],
@@ -38,8 +37,6 @@ export function rollingCount(
 ): number {
   let cutoff = Number.NEGATIVE_INFINITY;
   for (const trip of trips) {
-    // A close stamped after now is not a cutoff yet: after a clock that stepped back, a cutoff in the future would
-    // leave every new launch uncounted until the clock passed it.
     if (trip.closedBy === "owner" && trip.closedAt !== undefined && trip.closedAt <= now && trip.scope === scope && (scope === "host" || trip.projectId === projectId)) {
       cutoff = Math.max(cutoff, trip.closedAt);
     }
@@ -63,11 +60,6 @@ function openResult(trip: FuseTripRecord): FuseOpen {
   return result;
 }
 
-/**
- * Judges one scope only: its own trips against its own count and limit. Within the
- * scope an open unmeasurable trip wins over a rate trip. A recorded open rate trip
- * stays open while 2 * count >= limit, or while it carries ownerClose.
- */
 export function scopeState(
   launches: readonly FuseLaunchRecord[],
   trips: readonly FuseTripRecord[],
@@ -79,7 +71,6 @@ export function scopeState(
   const open = trips.filter(
     (trip) => trip.closedAt === undefined && (scope === "host" ? trip.scope === "host" : trip.scope === "project" && trip.projectId === projectId),
   );
-  // Two open rate trips can share a scope after a baseline merge. The one that needs the owner decides.
   const winner = open.find((trip) => trip.cause === "unmeasurable") ?? open.find((trip) => trip.ownerClose) ?? open[0];
 
   if (winner) {
@@ -101,7 +92,6 @@ export function scopeState(
   return pending;
 }
 
-/** The host decides first with `limits.host`; the project is judged only when the host is closed. */
 export function fuseCheck(
   launches: readonly FuseLaunchRecord[],
   trips: readonly FuseTripRecord[],
@@ -149,12 +139,6 @@ export function isFuseReason(text: string | undefined): boolean {
   return text !== undefined && text.startsWith(FUSE_PREFIX);
 }
 
-/**
- * Sets or clears only a fuse or halt reason on the holder. `changed` is true only when the value changed.
- * A closed check clears a fuse reason, except the write failure, which only `admit` can judge: an accepted
- * admission clears that one. So a failing baseline write gives one steady reason, not one that flips each pass.
- * The owner's halt sits in front of the fuse: a halted result sets the halt reason, and any other result clears it.
- */
 export function applyFuseReason(
   holder: { reason?: string },
   result: FuseCheck | FuseAdmission | undefined,

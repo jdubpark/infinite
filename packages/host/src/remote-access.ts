@@ -21,24 +21,18 @@ const MAX_ACTIVE_REQUESTS = 16;
 const MAX_BUFFERED_BYTES = MAX_FRAME_BYTES * 2;
 const MAX_REQUEST_FRAME = MAX_REQUEST_BYTES * 2 + 4096;
 const REQUEST_TIMEOUT_MS = 30000;
-/** After a full team list exceeded the remote limit, later reads skip it for this long and answer rows at once. */
 const TEAM_LIST_RETRY_MS = 5 * 60_000;
 
 function allowedPath(method: RemoteMethod, path: string): boolean {
   if (path.length > 8192 || !path.startsWith("/api/") || path.includes("\\") || path.includes("#") || /[\x00-\x20]/.test(path)) return false;
   const url = new URL(path, "http://infinite.invalid");
-  // Reject normalization tricks and encoded route delimiters. File names belong in the query.
   if (url.pathname !== path.split("?")[0] || /%/i.test(url.pathname)) return false;
   if (method === "GET" && url.pathname === "/api/me") return true;
   if (method === "GET" && url.pathname === "/api/machine/resources") return true;
-  // The phone's permission decision log: reads, and a mark, which is a record only. Delegating, revoking,
-  // reopening and unlocking stay on a direct owner connection.
   if (method === "GET" && ["/api/permissions/log", "/api/permissions/candidates"].includes(url.pathname)) return true;
   if (method === "GET" && /^\/api\/permissions\/decisions\/[A-Za-z0-9_.:-]{1,200}$/.test(url.pathname)) return true;
   if (method === "POST" && url.pathname === "/api/permissions/marks") return true;
-  // The owner's halt banner. Reading is open to every paired role; engaging and releasing stay off this channel.
   if (method === "GET" && url.pathname === "/api/halt") return true;
-  // The phone's cost screen; the host still enforces each route's role.
   if (method === "GET" && ["/api/usage", "/api/usage/daily", "/api/usage/models", "/api/usage/projects"].includes(url.pathname)) return true;
   if (method === "GET" && /^\/api\/usage\/projects\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
   if (method === "POST" && url.pathname === "/api/usage/balances/refresh") return true;
@@ -66,7 +60,6 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   const mission = /^\/api\/missions\/([^/]+)(?:\/(steer|pause|resume|cancel|extend|answer\/([^/]+)))?$/.exec(url.pathname);
   if (mission && UUID.test(mission[1])) return method === "GET" ? !mission[2]
     : method === "POST" && Boolean(mission[2]) && (!mission[3] || UUID.test(mission[3]));
-  // Read-only context for the Swarm graph: directory names, file paths and counts, the class of data the file listing and session events already serve.
   const teamContext = /^\/api\/teams\/([^/]+)\/context$/.exec(url.pathname);
   if (teamContext) return method === "GET" && UUID.test(teamContext[1]);
   if (method === "GET" && /^\/api\/projects\/[a-z0-9-]{1,80}\/graph\/map$/.test(url.pathname)) return true;
@@ -141,7 +134,6 @@ function parseEventsCommand(value: unknown): RemoteEventsCommand {
   return message as unknown as RemoteEventsCommand;
 }
 
-/** Existing HTTP authorization remains the authority for roles, revocation and input leases. */
 export function connectRemoteAccess(server: Server, config: Config): () => void {
   if (!config.remote?.enabled) return () => {};
   if (runtimeSecurity(config.deployment).tenancy !== "single-tenant") throw new Error("Remote machine access requires a single-tenant runner");
@@ -160,7 +152,6 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
     const terminals = new Map<string, WebSocket>();
     const eventStreams = new Map<string, { controller: AbortController; buffered: number }>();
     const timeout = setTimeout(() => close(), HANDSHAKE_TIMEOUT_MS); timeout.unref();
-    // Idle terminal subscriptions must also stop after their device is revoked.
     const revocation = setInterval(() => { if (authenticatedKey && !authorized()) close(); }, 1000); revocation.unref();
     let idle: ReturnType<typeof setTimeout> | undefined;
     const handle = { receive, close };
@@ -248,7 +239,6 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
             stream.buffered += eventBytes;
             reply({ type: "events-event", streamId: command.id, topic: update.topic, data: update.data }, () => { stream.buffered = Math.max(0, stream.buffered - eventBytes); });
           }
-          // Completed frames are checked independently above; only the unfinished tail is bounded here.
           if (Buffer.byteLength(pendingText) > MAX_EVENTS_EVENT_BYTES + 128) {
             stopEvents(command.id, 1013, true, "Unfinished live event exceeds the remote event limit"); return;
           }
@@ -276,8 +266,6 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
       }
       const address = server.address();
       if (!address || typeof address === "string") throw new Error("Runner is not listening");
-      // The only destination is this server's existing authenticated terminal
-      // gateway. It owns role checks, input validation, receipts and leases.
       const path = `/api/sessions/${command.sessionId}/terminal?after=${command.after}&snapshot=${command.snapshot ? 1 : 0}`;
       const upstream = new WebSocket(`ws://127.0.0.1:${address.port}${path}`, {
         headers: { Host: new URL(config.origin).host }, maxPayload: MAX_RESPONSE_BYTES, perMessageDeflate: false, handshakeTimeout: HANDSHAKE_TIMEOUT_MS,
@@ -315,7 +303,6 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
         for (const [name, value] of Object.entries(request.headers ?? {})) {
           if (["x-infinite-client", "x-infinite-control"].includes(name.toLowerCase())) headers[name] = value;
         }
-        /** One loopback response, or nothing when it exceeds the remote limit. */
         const read = async (path: string) => {
           const response = await fetch(`http://127.0.0.1:${address.port}${path}`, {
             method: request.method, headers, redirect: "error", signal: controller.signal,
@@ -336,8 +323,6 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
           catch { throw new Error("Runner returned a non-JSON response"); }
           return { status: response.status, body };
         };
-        // An installed client asks for every run in full. On a host with many runs that list outgrows the remote limit,
-        // so its compact rows answer in its place: they keep each field a list screen reads, under the same key.
         const fullTeamList = request.method === "GET" && request.path === "/api/teams";
         const skipFull = fullTeamList && Date.now() - teamListTooLargeAt < TEAM_LIST_RETRY_MS;
         let result = skipFull ? undefined : await read(request.path);
@@ -376,8 +361,6 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
         const matches = !!authenticatedKey && equalBytes(suppliedKey, authenticatedKey) && authorized();
         suppliedKey.fill(0);
         if (!matches || Number(request.id) <= lastId) throw new Error("Device revoked or request replayed");
-        // A replayed client hello cannot pin a channel indefinitely. Complete
-        // authentication only after a fresh encrypted request proves key possession.
         refreshIdle();
         lastId = Number(request.id);
         if (request.type === "events-open" || request.type === "events-close") { void events(request); return; }
@@ -400,7 +383,6 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
   };
 
   const upgrade = (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-    // This listener owns only the encrypted endpoint; native bridges own their routes.
     if (req.url?.split("?")[0] !== "/api/remote") return;
     socket.on("error", () => {});
     const origin = new URL(config.origin);
@@ -410,8 +392,6 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
     if (closed || req.url !== "/api/remote" || !allowedHosts.includes(req.headers.host ?? "") || peers.size >= MAX_CHANNELS) {
       socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); return;
     }
-    // Browser Origins are intentionally accepted here: no cookies or plaintext bearer
-    // are consumed, and every message requires the paired-key authenticated channel.
     sockets.handleUpgrade(req, socket, head, ws => {
       const active = peer((text, onSent) => {
         if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount + Buffer.byteLength(text) > MAX_BUFFERED_BYTES) return false;
@@ -448,7 +428,6 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
       for (const active of relayPeers.values()) active.close();
       relayPeers.clear(); ws.terminate();
       if (!closed) {
-        // Reconnect the registration only. No request or mutation is retained for replay.
         retry = setTimeout(startRelay, retryMs + randomBytes(1)[0] * 4); retry.unref();
         retryMs = Math.min(retryMs * 2, 30000);
       }

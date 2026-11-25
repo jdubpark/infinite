@@ -1,6 +1,3 @@
-// Model-written digests of a session's chat for a person who stepped away. A summary is a
-// reading of the recorded messages, labeled with the model that wrote it; it never claims a
-// result the messages do not contain, and the host never acts on it.
 import { readFileSync } from "node:fs";
 import type { ChatMessage } from "./session-content.js";
 
@@ -8,7 +5,6 @@ export interface SummaryConfig { model: string; apiKeyFile: string; baseUrl: str
 export interface Summary {
   model: string;
   text: string;
-  /** Message cursors the summary covers, so a client can ask for what came after. */
   from: string;
   to: string;
   messages: number;
@@ -27,7 +23,6 @@ const INSTRUCTIONS = [
 const MAX_INPUT_CHARS = 120_000;
 const MAX_CACHE = 64;
 
-/** The chat as plain text, keeping the most recent part when it is too long. */
 export function transcriptText(messages: ChatMessage[]): string {
   const lines = messages.map(message => message.role === "user" ? `Person: ${message.text}`
     : message.role === "assistant" ? `Agent: ${message.text}` : `Agent ran ${message.toolName ?? "a tool"}: ${message.text.split("\n")[0].slice(0, 200)}`);
@@ -36,7 +31,6 @@ export function transcriptText(messages: ChatMessage[]): string {
   return text;
 }
 
-/** Extracts the assistant text from an OpenAI Responses API result. */
 export function responseText(body: unknown): string {
   const output = (body as { output?: unknown })?.output;
   if (!Array.isArray(output)) return "";
@@ -55,7 +49,6 @@ export class Summarizer {
   }
   get model() { return this.config.model; }
 
-  /** A short title derived only from a generated session's original prompt. */
   async titleFromPrompt(prompt: string): Promise<{ text: string; model: string }> {
     let response: Response;
     try {
@@ -73,7 +66,6 @@ export class Summarizer {
     return { text, model: this.config.model };
   }
 
-  /** One request per distinct message range; concurrent callers share it. */
   summarize(sessionId: string, messages: ChatMessage[], from: string, to: string): Promise<Summary> {
     const key = `${sessionId}:${from}:${to}`;
     const cached = this.cache.get(key);

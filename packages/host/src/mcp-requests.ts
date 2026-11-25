@@ -35,7 +35,6 @@ export const mcpRequestErrorMessages: Readonly<Record<string, string>> = {
   "mission-steering-limit": "This request cannot accept more direction.",
 };
 
-/** Scoped producer and reader over the host's sealed intake queue and mission receipts. */
 export class McpRequestService implements McpRequestApi {
   constructor(
     private readonly config: Config,
@@ -66,7 +65,6 @@ export class McpRequestService implements McpRequestApi {
         if (!connector.projectIds.includes(checkout.projectId)) throw denied();
         const project = this.config.projects.find(item => item.id === checkout.projectId);
         if (!project) throw denied();
-        // Resolve the enrolled path again so symlink retargeting cannot silently change queued execution.
         return { projectId: checkout.projectId, path: realpathSync(project.path), primary: checkout.primary };
       }).sort((a, b) => a.projectId.localeCompare(b.projectId));
       return { projectId: repo.projectId, ...(repo.key ? { key: repo.key } : {}), checkouts };
@@ -120,7 +118,6 @@ export class McpRequestService implements McpRequestApi {
         checkouts: scope.selectedCheckouts, maxSubtasks: this.config.intake!.mission.maxSubtasks, maxMinutes: this.config.intake!.mission.maxMinutes },
       comments: {}, messages: [], questions: [], inbound: [], createdAt: at, updatedAt: at,
     });
-    // Intake's existing timer owns filing and execution. The response only promises the sealed admission above.
     return this.view(record);
   }
 
@@ -173,7 +170,7 @@ export class McpRequestService implements McpRequestApi {
     try {
       const parsed = new URL(record.url);
       if (parsed.protocol === "https:" && !parsed.username && !parsed.password) url = parsed.href;
-    } catch { /* Pending tracking has no URL. */ }
+    } catch {}
     const live = mission && ["planning", "working", "needs-input"].includes(mission.status);
     return {
       runId: record.request!.requestId, projectId: record.external!.scope.groupId, title: outboundText(this.config, record.title),
@@ -186,7 +183,6 @@ export class McpRequestService implements McpRequestApi {
       ...(mission?.result ? { result: { kind: "agent-report" as const, summary: outboundText(this.config, mission.result.summary) } } : {}),
       ...(!mission ? { message: record.holdReason ? "This request is queued and waiting for tracking or execution admission." : "This request is queued." }
         : mission.status === "blocked" && mission.stopReason === "deadline" ? { message: "This request's time limit has expired. The owner must extend it in Infinite before work can continue." } : {}),
-      // A mission the owner's halt paused can be cancelled but not resumed by a connector.
       availableActions: !mission ? [] : live ? ["reply", "pause", "cancel"] : mission.status === "paused" && !isHaltReason(mission.reason) ? ["resume", "cancel"] : mission.status === "cancelled" ? [] : ["cancel"],
     };
   }

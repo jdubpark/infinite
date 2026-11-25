@@ -1,7 +1,3 @@
-// Provider transcripts (Claude Code project JSONL, Codex rollout JSONL) normalized into chat
-// messages. Shared by the cmux reader, which reads files directly, and the worker, which
-// receives the bytes from the hook relay because the agent's home is private to its account.
-
 export type TranscriptProvider = "claude" | "codex";
 
 export interface TranscriptMessage {
@@ -41,14 +37,12 @@ function toolText(name: string, input: unknown): string {
   return text ? text.slice(0, 2000) : name;
 }
 
-/** One JSONL record to the chat messages it contains. Unknown or injected records yield none. */
 export function parseTranscriptRecord(raw: string, provider: TranscriptProvider, offset: number): TranscriptMessage[] {
   let row: unknown;
   try { row = JSON.parse(raw); } catch { return []; }
   return parseTranscriptRow(row, provider, offset);
 }
 
-/** One parsed transcript row to the chat messages it contains. Unknown or injected rows yield none. */
 export function parseTranscriptRow(value: unknown, provider: TranscriptProvider, offset: number): TranscriptMessage[] {
   const row = object(value);
   const ts = string(row.timestamp);
@@ -79,7 +73,6 @@ export function parseTranscriptRow(value: unknown, provider: TranscriptProvider,
     const text = textContent(payload.content);
     const kinds = payload.internal_chat_message_metadata_passthrough?.content_item_kinds;
     if (payload.role === "user" && (Array.isArray(kinds) ? !kinds.includes("user.text") : INJECTED.test(text))) return [];
-    // The chat view includes user-visible replies; provider analysis is not a message.
     if (payload.role === "assistant" && payload.channel === "analysis") return [];
     return text ? [{ id, role: payload.role, text, ts }] : [];
   }
@@ -93,33 +86,22 @@ export function parseTranscriptRow(value: unknown, provider: TranscriptProvider,
   return [];
 }
 
-/** Longest text kept per message once it enters a recording. */
 export const MAX_RECORDED_MESSAGE = 16 * 1024;
 const MAX_PARTIAL_LINE = 4 * 1024 * 1024;
 
-/**
- * Incremental transcript ingestion. Bytes arrive in order from a known file offset; a record
- * split across two chunks waits for its newline. Messages already seen by id are not repeated,
- * so a relay retry after a lost acknowledgement cannot duplicate chat.
- */
 export class TranscriptTail {
   offset = 0;
-  /** True once a line was discarded because it exceeded the partial-line cap. */
   dropped = false;
-  /** Complete lines that were not JSON. Whitespace-only lines do not count. */
   discarded = 0;
   private partial = "";
   private readonly seen = new Set<string>();
   private readonly order: string[] = [];
-  /** `onRow` sees each parsed row once, before chat messages are built. A throwing observer is ignored. */
   constructor(readonly provider: TranscriptProvider, private readonly remember = 4096, private readonly onRow?: (row: unknown) => void) {}
 
-  /** True while an unterminated line waits for its newline. */
   get pending(): boolean {
     return this.partial.length > 0;
   }
 
-  /** Appends `text`, which must start at `this.offset`, and returns the new complete messages. */
   ingest(text: string): TranscriptMessage[] {
     this.offset += Buffer.byteLength(text);
     let buffer = this.partial + text;
@@ -134,7 +116,7 @@ export class TranscriptTail {
         continue;
       }
       if (this.onRow) {
-        try { this.onRow(row); } catch { /* An observer never stops chat. */ }
+        try { this.onRow(row); } catch {}
       }
       for (const message of parseTranscriptRow(row, this.provider, this.offset)) {
         if (this.seen.has(message.id)) continue;
@@ -143,7 +125,6 @@ export class TranscriptTail {
         messages.push({ ...message, text: message.text.slice(0, MAX_RECORDED_MESSAGE) });
       }
     }
-    // A record that never ends is not a transcript; drop it rather than grow without bound.
     if (buffer.length > MAX_PARTIAL_LINE) {
       buffer = "";
       this.dropped = true;

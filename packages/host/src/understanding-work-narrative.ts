@@ -78,7 +78,6 @@ export function workQuestion(run: TeamRun): string {
   const question = `${header}\n${taskLines.join("\n")}${footer}`;
   const bounded = truncated ? `${question}${note}` : question;
   if (Buffer.byteLength(bounded) <= QUESTION_LIMIT_BYTES) return bounded;
-  // Fixed instructions and field budgets leave room for the note; this guard only protects future edits.
   throw new Error("work-question-exceeded-byte-limit");
 }
 
@@ -243,7 +242,7 @@ export class WorkNarrativeStore {
         try {
           const parsed = unseal<StoredNarratives>(this.options.key, STORE_SCOPE, readFileSync(file, "utf8"));
           if (parsed.version === 1 && typeof parsed.day === "string" && Number.isInteger(parsed.jobs) && parsed.jobs >= 0 && parsed.records && typeof parsed.records === "object" && parsed.failures && typeof parsed.failures === "object") state = parsed;
-        } catch { /* An unreadable envelope is not served as authenticated narrative state. */ }
+        } catch {}
       }
       this.states.set(workspaceId, state);
     }

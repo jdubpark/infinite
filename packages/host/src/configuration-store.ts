@@ -7,7 +7,6 @@ export const CONFIGURATIONS_MODULE = "configurations";
 const CONFIGURED_KIND = "member.configured";
 const DIGEST = /^[0-9a-f]{64}$/;
 const PROVIDER = /^[a-z][a-z0-9-]{0,31}$/;
-/** A model name may hold 180 characters (the OpenCode profile rule). */
 const PROFILE_TEXT = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,179}$/;
 const DATA_KEYS = new Set([
   "v", "configId", "provider", "model", "effort", "promptVersion", "guidance", "knowledge", "routing", "shape",
@@ -17,16 +16,11 @@ type Parsed = { components: ConfigComponents; configId: string };
 
 let skipLogged = false;
 
-/**
- * The `configurations` module (spec part 3). Plain columns hold only digests, enumerations, and times.
- * Epochs are kept with their start times. Epoch 1 is implicit and has no row.
- */
 export function configurationModule(): EvidenceModule {
   return {
     name: CONFIGURATIONS_MODULE,
     version: 1,
     readVersion: 1,
-    // No `deleteRun` and no `runIds`: nothing in these tables belongs to a run.
     migrate(tx) {
       tx.exec(
         "CREATE TABLE IF NOT EXISTS configurations (config_id TEXT PRIMARY KEY, provider TEXT NOT NULL, "
@@ -47,12 +41,6 @@ export function configurationModule(): EvidenceModule {
   };
 }
 
-/**
- * Projects `member.configured` into `configurations`. Runs once per matching event, in `seq` order. A replayed
- * page is idempotent: a row is keyed by `config_id`, a digest of all six components, so a replay repeats the
- * same key and `DO NOTHING` keeps the first row. An event that fails the strict parse or whose `configId` does
- * not match its components is skipped with one log line per process. It never throws for one bad event.
- */
 export function configurationProjector(): EventProjector {
   return {
     name: CONFIGURATIONS_MODULE,
@@ -86,7 +74,6 @@ export function configurationProjector(): EventProjector {
   };
 }
 
-/** The highest epoch of the identity whose `since` is at or before `at`, or 1 when none is. */
 export function epochAt(db: EvidenceDb, identity: string, at: string): number {
   const row = db.get<{ epoch: number }>(
     "SELECT epoch FROM profile_epochs WHERE identity=? AND since<=? ORDER BY epoch DESC LIMIT 1",
@@ -96,7 +83,6 @@ export function epochAt(db: EvidenceDb, identity: string, at: string): number {
   return row?.epoch ?? 1;
 }
 
-/** A request id that already advanced another profile's epoch. The route answers it as a request conflict. */
 export class EpochRequestConflict extends Error {
   constructor() {
     super("This request ID belongs to another profile's epoch.");
@@ -104,23 +90,14 @@ export class EpochRequestConflict extends Error {
   }
 }
 
-/**
- * Advances a profile's epoch in one write. A request id that is already stored for the same identity returns
- * its stored epoch with `repeated: true` and changes nothing. One stored for another identity throws
- * EpochRequestConflict. Otherwise the new epoch is the identity's highest plus one, or 2.
- * Throws EvidenceError("unavailable") when the store is not ready.
- */
 export function advanceEpoch(
   store: EvidenceStore,
   input: { profile: ProfileKey; requestId: string; now: string },
 ): { epoch: number; since: string; repeated: boolean } {
   const { profile, requestId, now } = input;
   if (typeof requestId !== "string" || requestId.length === 0) throw new TypeError("An epoch needs a request id.");
-  // `epochAt` compares times as strings, so a start time must be in the one form `toISOString` gives.
   if (typeof now !== "string" || !isCanonicalTime(now)) throw new TypeError("An epoch needs a start time.");
   const identity = profileIdentityKey(profile);
-  // A module that failed to migrate, or one a newer host wrote, is unavailable. Without this check its SQL error
-  // would reach the caller as a generic failure.
   if (store.status().modules[CONFIGURATIONS_MODULE] !== "ready") {
     throw new EvidenceError("unavailable", "The configurations module is unavailable.");
   }
@@ -136,8 +113,6 @@ export function advanceEpoch(
       identity,
     );
     const epoch = (top?.epoch ?? 1) + 1;
-    // An epoch never starts before the one before it, so `epochAt` never puts a later epoch ahead of an earlier one.
-    // After a clock that stepped back, the two start together, and the earlier epoch is in effect for no time.
     const since = top !== undefined && top.since > now ? top.since : now;
     tx.run(
       "INSERT INTO profile_epochs (identity, epoch, provider, model, effort, since, request_id) "
@@ -154,7 +129,6 @@ export function advanceEpoch(
   });
 }
 
-/** Strict parse of `member.configured` data. Undefined for any unknown key, bad value, or mismatched `configId`. */
 function parseConfigured(data: unknown): Parsed | undefined {
   if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
   const source = data as Record<string, unknown>;
@@ -185,7 +159,6 @@ function isCanonicalTime(value: string): boolean {
   return !Number.isNaN(time) && new Date(time).toISOString() === value;
 }
 
-/** A profile field a member lacks is absent or null. Both mean the same component value. */
 function optionalText(value: unknown): value is string | null | undefined {
   return value === undefined || value === null || (typeof value === "string" && PROFILE_TEXT.test(value));
 }

@@ -64,7 +64,6 @@ export function terminalConnection(origin: string, token: string, sessionId: str
         const input = id ? pending.get(id) : undefined, control = id ? controls.get(id) : undefined;
         if (input) { pending.delete(id!); clearTimeout(input.timer); pendingBytes -= input.size; input.reject(refusal); return; }
         if (control) { controls.delete(id!); clearTimeout(control.timer); control.reject(refusal); return; }
-        // Resize has no receipt; deliver its refusal to the attachment loop.
       }
       const size = Buffer.byteLength(event.data);
       if (bytes + size > 8 * 1024 * 1024) throw new Error("Terminal output buffer limit reached");

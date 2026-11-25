@@ -1,9 +1,6 @@
 #!/usr/bin/env node
 import { handleClientCommand } from "./client.js";
 
-// The installed bundle is also the detached service entrypoint. Its private
-// IPC bootstrap is handled by laptop-service or sync-service, not by the
-// interactive parser.
 if (!((process.argv[2] === "--laptop-service" || process.argv[2] === "--sync-service") && process.send) && !await handleClientCommand(process.argv.slice(2))) {
   console.log(`Infinite — cloud sessions in your native terminal
 

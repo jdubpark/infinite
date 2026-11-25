@@ -11,28 +11,13 @@ export class HookPayloadError extends Error {
   constructor(readonly status: number, message = "Hook payload was refused") { super(message); }
 }
 
-/**
- * What the worker wants back from the relay. Only the relay reads this reply; the provider
- * sees the relay's empty stdout, so a reply can never become a hook decision.
- */
 export interface HookReply {
-  /**
-   * Send the transcript file at `path` from byte `after` to the `transcript` route. `drain` names the drain every
-   * post echoes. `secondaries` asks the relay to list the subagent transcripts on the primary end mark.
-   */
   transcript?: { path: string; after: number; drain?: number; secondaries?: boolean };
-  /** Acknowledged transcript bytes; the relay continues from here. */
   after?: number;
-  /** The secondary transcripts the worker wants, on the reply to a primary end mark. */
   secondaries?: SecondaryRequest[];
-  /** The answer to a `team-entry` request, sent as the JSON body of a 200. */
   entry?: Record<string, unknown>;
 }
 
-/**
- * The reply on a permission channel route. Only the channel's own hook command (permission-hook.ts) reads it; the
- * signal relay never calls these routes.
- */
 export type HookAnswer = import("./permission-hook.js").ChannelAnswer;
 
 export function startHookServer(opts: {
@@ -59,7 +44,6 @@ export function startHookServer(opts: {
     let body = "";
     let bytes = 0;
     let tooBig = false;
-    // A multi-byte character can straddle two TCP chunks; the stream decoder joins them.
     req.setEncoding("utf8");
     req.on("data", (chunk: string) => {
       if (tooBig) return;

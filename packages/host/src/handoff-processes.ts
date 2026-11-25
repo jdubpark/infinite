@@ -2,7 +2,6 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 const execute = promisify(execFile);
 export interface HandoffProcess { pid: number; parent: number; group: number; born: string; state: string }
-/** No command lines or environment are collected. Failure is never interpreted as an empty tree. */
 async function inventory(): Promise<HandoffProcess[]> {
   if (!["linux", "darwin"].includes(process.platform)) throw new Error("Handoff process inventory is unsupported on this platform");
   const { stdout } = await execute("ps", ["-axo", "pid=,ppid=,pgid=,lstart=,stat="], { encoding: "utf8", timeout: 3000, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, LC_ALL: "C" } });
@@ -24,7 +23,6 @@ function descendants(rows: HandoffProcess[], root: number, group?: number) {
   }
   return rows.filter(row => selected.has(row.pid));
 }
-/** Covers the PTY group and observed descendants; agent attestation covers prior detached jobs. */
 export async function stopHandoffProcesses(root: number, saveIntent: (processes: HandoffProcess[]) => void) {
   const first = await inventory(), leader = first.find(row => row.pid === root);
   if (!leader || leader.group !== root || root === process.pid || root <= 1) throw new Error("The source PTY process group could not be verified");
@@ -34,7 +32,6 @@ export async function stopHandoffProcesses(root: number, saveIntent: (processes:
   const signal = (pid: number, kind: NodeJS.Signals) => {
     try { process.kill(pid, kind); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw new Error("A source process could not be stopped"); }
   };
-  // The group identity is verified while the leader is still present.
   signal(-root, "SIGTERM");
   for (const row of known) if (row.group !== root) signal(row.pid, "SIGTERM");
   const until = Date.now() + 5000;
@@ -54,7 +51,6 @@ export async function stopHandoffProcesses(root: number, saveIntent: (processes:
     const additions = live.filter(row => !known.some(prior => prior.pid === row.pid));
     if (additions.length) { known = [...known, ...additions]; saveIntent(known); }
     if (!killed && Date.now() >= until - 4000) {
-      // Signal only still-matching identities, never an unverified reused group leader.
       for (const row of live) signal(row.pid, "SIGKILL");
       killed = true;
     } else if (killed) for (const row of additions) signal(row.pid, "SIGKILL");

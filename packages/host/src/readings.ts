@@ -37,7 +37,6 @@ const FILLER_LINE = /^(?:done|all set|summary|changes made|i['’]ve made the fo
 
 export function messageHash(text: string) { return createHash("sha256").update(text).digest("hex"); }
 
-/** Removes Markdown framing while preserving the agent's sentence words and order. */
 export function candidateSentences(message: string): string[] {
   const cleaned = message
     .replace(/```[\s\S]*?```/g, "\n")
@@ -70,8 +69,6 @@ function keyOf(id: string, type: Key, hash: string) { return `${id}:${type}:${ha
 function pairOf(id: string, type: Key) { return `${id}:${type}`; }
 function firstLine(prompt: string) { return prompt.split(/\r?\n/, 1)[0]?.trim() ?? ""; }
 
-// Team requests can name private files; strip file URLs and absolute or quoted paths before any model sees them.
-// An unquoted path with spaces is cut at each space, so later fragments that still contain a separator are removed too.
 export function titleInput(value: string) {
   const omitted = "[local path omitted]";
   return value.replace(/(["'`])([^\r\n]*?)\1/g, (quoted, _quote, path: string) =>
@@ -79,7 +76,6 @@ export function titleInput(value: string) {
     .replace(/(?<![\w./:\\~-])(?:file:\/\/[^\s<>"'`]*|\/[^\s<>"'`]+|~\/[^\s<>"'`]*|[A-Za-z]:[\\/][^\s<>"'`]*)(?:[ \t]+[^\s<>"'`]*[\\/][^\s<>"'`]*)*/gi, omitted);
 }
 
-/** True only when the rule-based turn line is likely to be unhelpful on the phone. */
 export function isWeakRuleLine(message: string): boolean {
   const firstRawLine = message.split(/\r?\n/).find(line => line.trim() !== "")?.trim() ?? "";
   const rawRuleLine = firstSentence(message) || "Finished a turn";
@@ -89,10 +85,6 @@ export function isWeakRuleLine(message: string): boolean {
   return structured || rawRuleLine.length > 140 || displayLine.length < 25 || displayLine.endsWith(":") || FILLER_LINE.test(filler);
 }
 
-/**
- * Optional, asynchronous phone readings. The cache is the only path used by list
- * requests; model work is queued in the background and never awaited by merge().
- */
 export class Readings {
   private readonly file: string;
   private readonly evaluationsFile: string;
@@ -102,7 +94,6 @@ export class Readings {
   private readonly active = new Map<string, string>();
   private readonly latestRows = new Map<string, LatestRow>();
   private readonly latestSessions = new Map<string, LatestSession>();
-  /** Every listed session's latest snapshot, valid while the row's title is the same and while the session's meta file has the same revision. It never holds a prompt. */
   private readonly settledSessions = new Map<string, { title: string; revision: string; latest: LatestSession }>();
   private observationRevision = 0;
   private timer?: ReturnType<typeof setInterval>;
@@ -123,7 +114,6 @@ export class Readings {
     }
     this.restore();
   }
-  /** True when the reading service may see session text; false leaves it to the intake route reading. */
   private get sessionJev(): boolean { return Boolean(this.config.jev && this.config.jev.sessionReadings !== false); }
   start() {
     if (!this.sessionJev) return;
@@ -133,12 +123,6 @@ export class Readings {
   }
   stop() { clearInterval(this.timer); }
 
-  /**
-   * Synchronous cache merge; stale message hashes and owner titles are omitted.
-   * `complete` says whether the rows are a whole listing. A whole listing replaces what the last one left. Any other
-   * read, such as one session's detail, adds its rows and forgets nothing. A stored session carries `backend`, so a
-   * caller that builds a row from a record passes `false`.
-   */
   merge<T extends ReadingRow>(rows: T[], complete = rows.length === 0 || rows.every(row => row.backend !== undefined)): T[] {
     this.observeRows(rows, complete ? "snapshot" : "partial", (row, session) => this.queueTitleReading(row, session));
     const merged = rows.map(row => {
@@ -159,7 +143,7 @@ export class Readings {
           const value = this.cached(row.id, "title", session.promptHash);
           reading.title = value?.title ?? fallback;
         }
-      } catch { /* Native cmux rows have no Infinite metadata. */ }
+      } catch {}
       if (this.sessionJev) this.queueTurnReading(row);
       return Object.keys(reading).length ? { ...row, reading } : row;
     });
@@ -167,7 +151,6 @@ export class Readings {
     return merged;
   }
 
-  /** Captures session inputs and queues gated work. Repeated polls deduplicate pending calls. */
   async tick() {
     if (!this.sessionJev) return;
     const revision = this.observationRevision;
@@ -181,7 +164,6 @@ export class Readings {
     this.drain();
   }
 
-  /** True when a title job for this session would be queued now. It is the only reason to read a known session's record again. */
   private titleDue(sessionId: string, latest: LatestSession): boolean {
     const hash = latest.promptHash;
     if (!this.sessionJev || !this.writer || !latest.defaultTitle || latest.promptLineLength <= 60 || !hash) return false;
@@ -351,10 +333,6 @@ export class Readings {
     if (!title?.text?.trim()) throw new Error("Title writer returned no text");
     if (stillCurrent()) this.recordResult(row.id, "title", hash, { title: { text: title.text.trim().slice(0, 100), source: "writer", model: title.model } });
   }
-  /**
-   * A concise team run title, or undefined to keep the request's first line. A line of 60 characters or fewer is
-   * kept as is; Jev, when configured, keeps a clear clipped line; otherwise the writer names the path-redacted request.
-   */
   async requestTitle(prompt: string): Promise<{ text: string; model?: string } | undefined> {
     if (!this.writer || firstLine(prompt).length <= 60) return undefined;
     const input = titleInput(prompt), clipped = clipTitle(firstLine(input));
@@ -371,10 +349,6 @@ export class Readings {
     const text = title.text.trim().slice(0, 100);
     return text ? { text, model: title.model } : undefined;
   }
-  /**
-   * Whether an owner's request asks a question (answer) or for a change (work), with the reading's confidence in
-   * that choice. Sends only the request text, cut to ROUTE_INPUT_LIMIT. Never throws: any failure is undefined.
-   */
   async requestRoute(text: string): Promise<RouteReading | undefined> {
     if (!this.config.jev) return undefined;
     try {
@@ -413,7 +387,7 @@ export class Readings {
           if (item.outcome.kind === "failure" && item.outcome.failedUntil <= Date.now()) continue;
           this.evaluations.set(item.sessionId, { ...this.evaluations.get(item.sessionId), [item.type]: { hash: item.hash, outcome: item.outcome } });
         }
-      } catch { /* A damaged evaluation cache is ignored; it never blocks session lists. */ }
+      } catch {}
     }
     if (existsSync(this.file)) try {
       const stored = unseal<StoredEntry[]>(this.key, "readings", readFileSync(this.file, "utf8"));
@@ -433,7 +407,7 @@ export class Readings {
         }
       }
       while (this.entries.size > CACHE_LIMIT) this.entries.delete(this.entries.keys().next().value!);
-    } catch { /* A damaged reading cache is ignored; it never blocks session lists. */ }
+    } catch {}
   }
 
   private cached(sessionId: string, type: Key, hash: string) {
@@ -469,13 +443,13 @@ export class Readings {
       const evaluation = byType[type];
       if (evaluation) stored.push({ sessionId, type, hash: evaluation.hash, outcome: evaluation.outcome });
     }
-    try { writeSealed(this.evaluationsFile, this.key, "reading-evaluations", stored); } catch { /* Backoff persistence is best effort. */ }
+    try { writeSealed(this.evaluationsFile, this.key, "reading-evaluations", stored); } catch {}
   }
 
   private put(entry: StoredEntry) {
     if (!entry.value) return;
     this.entries.delete(entry.key); this.entries.set(entry.key, entry);
     while (this.entries.size > CACHE_LIMIT) this.entries.delete(this.entries.keys().next().value!);
-    try { writeSealed(this.file, this.key, "readings", [...this.entries.values()]); } catch { /* Cache persistence is best effort. */ }
+    try { writeSealed(this.file, this.key, "readings", [...this.entries.values()]); } catch {}
   }
 }

@@ -10,8 +10,6 @@ const WINDOW = 4 * 1024 * 1024;
 const MAX_MESSAGE = 128 * 1024;
 const parseRecord = parseTranscriptRecord;
 
-/** Bounded, append-aware reads. The cursor includes a block index to avoid dropping
- * additional messages when one JSONL record crosses a page boundary. */
 export function readTranscript(path: string | undefined, provider: CmuxProvider, after?: string, limit = 200): { messages: Message[]; cursor: string; more: boolean } {
   if (after !== undefined && !/^\d+(?::\d+)?$/.test(after)) throw new CmuxError("invalid-cursor");
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new CmuxError("invalid-limit");
@@ -35,7 +33,7 @@ export function readTranscript(path: string | undefined, provider: CmuxProvider,
     let bytes = 0;
     while (position < length) {
       const end = buffer.indexOf(10, position);
-      if (end < 0 || end >= length) break; // An incomplete append is read next time.
+      if (end < 0 || end >= length) break;
       const offset = start + position;
       const parsed = parseRecord(buffer.toString("utf8", position, end), provider, offset);
       const first = after !== undefined && offset === requested ? requestedBlock : 0;
@@ -50,8 +48,6 @@ export function readTranscript(path: string | undefined, provider: CmuxProvider,
       position = end + 1;
       cursor = String(start + position);
     }
-    // A single oversized record must not pin the cursor forever. Skip complete
-    // oversized lines without parsing them; partial final lines still wait.
     if (position === 0 && length === WINDOW && after !== undefined) {
       let scanned = start + length;
       while (scanned < stat.size && scanned - start < 64 * 1024 * 1024) {

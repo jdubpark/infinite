@@ -49,7 +49,6 @@ type Filter = { origins?: Set<string>; areas?: Set<string>; ids?: Set<string> };
 type Project = Config["projects"][number];
 type Pass = NextTrial | { kind: "slots" };
 
-/** Waits that hold a slot without counting: the project's preconditions and an owner's halt. */
 const WAITS_ONLY: ReadonlySet<EvalJobWait> = new Set<EvalJobWait>(["mirror", "halt"]);
 
 const NONE: NextTrial = { kind: "none" };
@@ -104,7 +103,6 @@ export class TrialJobs {
   private readonly store: EvidenceStore;
   private readonly config: Pick<Config, "projects" | "eval" | "teams">;
   private readonly now: () => string;
-  /** Per job: the slot whose releases are being counted, and how many in a row. */
   private readonly released = new Map<string, { key: string; count: number }>();
 
   constructor(options: { store: EvidenceStore; config: Pick<Config, "projects" | "eval" | "teams">; now?: () => string }) {
@@ -245,12 +243,6 @@ export class TrialJobs {
     });
   }
 
-  /**
-   * A trial that could not start, in one transaction. A job that is no longer open only loses the row. Otherwise the row goes
-   * and the cause is the job's `waiting`, and the answer is "released"; a WAITS_ONLY cause is never counted and starts the count
-   * again. On the TRIAL_RELEASES-th counted release in a row for one slot of one job the row stays and the answer is "exhausted":
-   * the caller ends that trial `void-host` and skips the task. The count is in memory, so a restart starts it again.
-   */
   release(trial: Pick<Extract<NextTrial, { kind: "trial" }>, "jobId" | "taskId" | "configRef" | "slot" | "attempt"> & { trialId: string },
     waiting: EvalJobWait): "released" | "exhausted" {
     return this.store.write(tx => {

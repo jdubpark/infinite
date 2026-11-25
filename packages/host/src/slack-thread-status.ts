@@ -13,7 +13,6 @@ const PHASE: Record<MissionStatus, string> = {
 
 const SUBTASK_STATES: MissionSubtask["status"][] = ["running", "queued", "done", "blocked", "cancelled"];
 
-/** Participants see host-recorded state. The owner also gets the same open questions they can answer in this thread. */
 export function formatThreadStatus(record: IntakeRecord, mission: Mission | undefined, owner: boolean): string {
   const label = record.identifier || (record.direct?.route?.kind === "answer" ? "Question" : "Request");
   if (!mission) {

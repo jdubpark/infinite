@@ -93,7 +93,6 @@ function jsonValue(value: unknown, depth = 0): void {
   for (const item of Object.values(objectValue)) jsonValue(item, depth + 1);
 }
 
-/** Canonical JSON uses ECMAScript JSON strings/numbers and UTF-16 key ordering. */
 export function canonicalMemoryJson(value: unknown): string {
   if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
   if (typeof value === "number") {

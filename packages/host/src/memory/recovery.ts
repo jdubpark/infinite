@@ -37,7 +37,6 @@ export interface MemoryRecoveryAppendReceipt {
   signature: string;
 }
 
-/** Transport adapter contract. The caller pins and verifies the witness key. */
 export interface MemoryRecoveryWitness {
   append(
     expectedSequence: number,
@@ -52,7 +51,6 @@ export interface MemoryRecoveryCoordinatorOptions {
   witness?: MemoryRecoveryWitness;
   pinnedPublicKey?: Buffer | string | KeyObject;
   readCheckpoint(): MemoryRecoveryCheckpoint;
-  /** Apply denials and the new head in one durable store transaction. */
   applyDeltas(deltas: readonly MemoryRecoveryDelta[], checkpoint: MemoryRecoveryCheckpoint): void | Promise<void>;
   randomChallenge?: () => string;
 }
@@ -156,11 +154,6 @@ function publicKey(value: Buffer | string | KeyObject): KeyObject {
   return createPublicKey({ key: value as Buffer, format: "der", type: "spki" });
 }
 
-/**
- * Fresh-start and witness-append verifier. It never trusts a boolean supplied
- * by a witness adapter; signatures, challenge binding, and the complete hash
- * chain are checked against the pinned Ed25519 identity.
- */
 export class MemoryRecoveryCoordinator {
   private ready = false;
   private readonly witness?: MemoryRecoveryWitness;
@@ -234,12 +227,6 @@ export class MemoryRecoveryCoordinator {
     this.ready = true;
   }
 
-  /**
-   * Append a single access-removing delta after its local deny intent is durable.
-   * The callback commits the immutable success receipt and witness checkpoint in
-   * one local transaction. A rejected callback can be retried with the same ID;
-   * the witness returns the original append receipt for identical bytes.
-   */
   async appendAndCommit(
     delta: MemoryRecoveryDelta,
     commitAcknowledgement: (checkpoint: MemoryRecoveryCheckpoint, receipt: MemoryRecoveryAppendReceipt) => void | Promise<void>,
@@ -259,8 +246,6 @@ export class MemoryRecoveryCoordinator {
       }
       let receipt: MemoryRecoveryAppendReceipt;
       try {
-        // A restored database may already contain this verified delta while its
-        // local mutation receipt still awaits the original signed append ack.
         receipt = await this.witness.append(delta.sequence - 1, delta.priorHash, [delta]);
       } catch {
         throw new MemoryRecoveryError("unavailable", "Recovery witness acknowledgement is unavailable.", true);

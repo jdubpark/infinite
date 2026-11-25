@@ -15,18 +15,14 @@ export type ModelRow = {
 export type Suggestion = { text: string; profileId: string; comparedTo: string; role: string; n: [number, number] };
 export type Scorecard = { rubricVersion: 1; minAttempts: number; sources: Source[]; rows: ModelRow[]; suggestions: Suggestion[] };
 
-/** The identity that the configured lineup gives a profile id now. Undefined when the lineup does not have the id. */
 export type ProfileIdentityOf = (profileId: string) => { provider: string; model: string; effort: string | null } | undefined;
 
-/** The current epoch of an identity, from the profile epochs the owner declared. */
 export type CurrentEpochOf = (identity: { provider: string; model: string; effort: string | null }) => number | undefined;
 
 type Group = { profileId: string; provider: string; model: string; effort: string | null; epoch: number; identity: string; newest: number; rows: OutcomeRow[] };
 
-/** Null stays null: a missing effort and the literal effort `none`, which OpenCode allows, are two identities. */
 const identityOf = (provider: string, model: string, effort: string | null) => JSON.stringify([provider, model, effort]);
 
-/** Between identities of an id that the lineup no longer has: the newest rowTime, then the smaller identity string. */
 function preferred(candidate: Group, current: Group): boolean {
   if (candidate.newest !== current.newest) return candidate.newest > current.newest;
   return candidate.identity < current.identity;
@@ -91,7 +87,6 @@ function suggestionsOf(rows: readonly SuggestableRow[], role: string): Suggestio
   return suggestions;
 }
 
-/** One row per profile id, from production rows of one role. Reads the display use of each row. */
 export function scorecardFromRows(rows: readonly OutcomeRow[], options: { role: string; label: (profileId: string) => string | undefined; identity?: ProfileIdentityOf; epoch?: CurrentEpochOf; cost?: CostLookup; minAttempts?: number }): Scorecard {
   const minAttempts = options.minAttempts ?? MIN_COUNTED_ROWS;
   const groups = new Map<string, Group>();
@@ -105,10 +100,6 @@ export function scorecardFromRows(rows: readonly OutcomeRow[], options: { role: 
     group.newest = Math.max(group.newest, timeOf(row));
     groups.set(key, group);
   }
-  // Within one identity only the current epoch counts. An attempt keeps the epoch it started in, so an attempt from
-  // before an advance can end after it, and its end time must not bring the retired epoch back. And the owner can
-  // advance an epoch before any new attempt starts: the old rows are then all there is, and they must not stand as
-  // the profile's row. Without an epoch lookup, the highest epoch among the rows stands in for the current one.
   const currentEpoch = new Map<string, number | undefined>();
   const candidates = new Map<string, Group>();
   for (const group of groups.values()) {
@@ -121,8 +112,6 @@ export function scorecardFromRows(rows: readonly OutcomeRow[], options: { role: 
     const current = candidates.get(key);
     if (!current || group.epoch > current.epoch) candidates.set(key, group);
   }
-  // The configured lineup says which identity an id names now. A goal or a mission pins its lineup, so two
-  // identities behind one id can both keep ending attempts, and end times cannot choose between them.
   const chosen = new Map<string, Group>();
   const configured = new Map<string, string | undefined>();
   for (const group of candidates.values()) {

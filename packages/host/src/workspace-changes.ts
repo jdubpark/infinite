@@ -45,14 +45,13 @@ function gitMetadataDirectories(root: string): string[] {
   return paths.map(path => realpathSync(path));
 }
 
-/** Best-effort fallback when the bounded native watch is unavailable. */
 function watchFileEvents(roots: string[]): WorkspaceChanges {
   const rootWatchers: FSWatcher[] = [], metadataWatchers: FSWatcher[] = [];
   let metadata: string[] = [];
   let dirty = true, sticky = false, closed = false, pointerChanged = false;
   const closeWatchers = (watchers: FSWatcher[]) => {
     for (const watcher of watchers.splice(0)) {
-      try { watcher.close(); } catch { /* Continue closing the remaining watchers. */ }
+      try { watcher.close(); } catch {}
     }
   };
   const fail = () => {
@@ -99,7 +98,6 @@ function watchFileEvents(roots: string[]): WorkspaceChanges {
   };
 }
 
-/** A quiet take drains kernel events; only a topology change rebuilds the tree watch. */
 export async function watchWorkspaceChanges(paths: string[], cacheDir: string): Promise<WorkspaceChanges | undefined> {
   if (process.platform !== "darwin") return undefined;
 
@@ -117,18 +115,14 @@ export async function watchWorkspaceChanges(paths: string[], cacheDir: string): 
     watcher = undefined;
     metadata = next;
     const all = [...new Set([...roots, ...metadata])];
-    // The common Git directory already covers a linked worktree's selected metadata.
     const watched = all.filter(path => !all.some(parent => path !== parent && path.startsWith(`${parent}/`)));
     watcher = await createWorkspaceWatch(watched, cacheDir, { purpose: "changes" });
     const state = await watcher.flush();
-    // A busy registration stays invalid; take retries it after reporting dirty.
     revision = state.revision;
   };
   const fail = async () => {
     await watcher?.close();
     watcher = undefined;
-    // Preserve the existing event/ten-minute gate on unsupported filesystems,
-    // missing developer tools or resource exhaustion, without idle tree scans.
     fallback = watchFileEvents(roots);
   };
   try { await rebuild(metadataDirectories()); }
@@ -142,7 +136,6 @@ export async function watchWorkspaceChanges(paths: string[], cacheDir: string): 
       const state = await watcher.flush();
       const changed = state.revision !== revision || !state.valid;
       if (changed) {
-        // Re-resolve pointers only on events, including changes to external commondir files.
         const next = metadataDirectories();
         if (!state.valid || next.join("\0") !== metadata.join("\0")) await rebuild(next);
         else revision = state.revision;
@@ -154,7 +147,6 @@ export async function watchWorkspaceChanges(paths: string[], cacheDir: string): 
   }
   return {
     take() {
-      // Serialize re-registration with callers and teardown; no helper can escape close.
       operation = operation.then(take);
       return operation;
     },

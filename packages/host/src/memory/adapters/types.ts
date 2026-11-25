@@ -1,6 +1,5 @@
 import type { MemoryRecord } from "@infinite/remote";
 
-/** Provider-neutral projection adapter contracts. Canonical records remain in Infinite. */
 export type MemoryAdapterHealthState = "ready" | "degraded" | "unavailable" | "quarantined";
 export type MemoryIndexEventKind = "snapshot" | "upsert" | "delete" | "revoke" | "checkpoint";
 export type MemoryIndexState = "indexed" | "pending" | "disabled" | "quarantined";
@@ -40,7 +39,6 @@ export interface MemoryAdapterCandidate {
   match: "exact" | "lexical" | "semantic";
 }
 
-/** Provider-index linkage. Canonical lexical candidates do not require this metadata. */
 export interface IndexedCandidateMapping {
   partition: MemoryAdapterPartition;
   handle: string;
@@ -74,15 +72,10 @@ export interface MemoryAdapterHealth {
   reason: string | null;
 }
 
-/** Current authorization and durable projection metadata supplied by Infinite's store. */
 export interface MemoryProjectionLedger {
-  /** Synchronous host-owned epoch check. Throw before use if binding/source epochs are stale. */
   assertCurrentPartition(partition: MemoryAdapterPartition): void;
-  /** Only ready/active generations may be queried or hydrated. */
   assertServingPartition(partition: MemoryAdapterPartition): void;
-  /** Canonical authorization/epoch check without honoring the adapter quarantine flag. */
   assertCanonicalCurrent(partition: MemoryAdapterPartition): void;
-  /** Persisted quarantine status is checked when opening and before every use. */
   isQuarantined(partition: MemoryAdapterPartition): boolean;
   findCandidate(partition: MemoryAdapterPartition, handle: string): Promise<IndexedCandidateMapping | null>;
   findEvent(event: Pick<MemoryIndexSourceEvent, "partition" | "eventId" | "sourceEnrollmentId" | "sourceId" | "sourceRevision" | "kind" | "payloadHash">): Promise<MemoryIndexReceipt | null>;
@@ -95,20 +88,15 @@ export interface MemoryProjectionLedger {
 }
 
 export interface AuthorizedMemoryLexicalRead {
-  /** Only recall-eligible records, including authorized candidates with complete lineage. */
   records: MemoryRecord[];
-  /** Revalidate the opaque canonical read proof, including grants, time and lineage. */
   recheckCurrent(): void;
 }
 
 export interface AuthorizedMemoryHydration {
-  /** Null when the exact record revision is no longer eligible for ordinary recall. */
   record: MemoryRecord | null;
-  /** Revalidate the same canonical proof after any asynchronous boundary. */
   recheckCurrent(): void;
 }
 
-/** Bounded read and hydration from Infinite's current authorized canonical index. */
 export interface MemoryLexicalSource {
   searchAuthorizedRecords(input: MemoryAdapterSearchInput): Promise<AuthorizedMemoryLexicalRead>;
   hydrateCurrent(partition: MemoryAdapterPartition, recordId: string, recordRevision: number): Promise<AuthorizedMemoryHydration>;

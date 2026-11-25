@@ -4,7 +4,7 @@ import { accept, admit, candidate, checksDigest, emptyRecord, entryOf, finish, h
 import { extendWitness, recordCommand, type CensusResult, type ProcessWitness } from "./process-census.js";
 import type { MirrorFetch } from "./project-source.js";
 import { storageShortfall } from "./storage.js";
-import { CheckOutputScanner } from "./team-check-output.js";
+import { CheckOutputScanner, OutputTail } from "./team-check-output.js";
 import { DEFAULT_STORAGE_FLOOR, type TeamCommand, type TeamProject } from "./team-types.js";
 import { commandScope, TeamError, type CommandResult, type CommandScope } from "./team-workspace.js";
 import type { Config, Project } from "./types.js";
@@ -473,10 +473,11 @@ export class MainCheckService {
         return { outcome: "interrupted", reason: "halt" };
       }
       const scanner = new CheckOutputScanner();
+      const tail = new OutputTail();
       active.timers.limit = this.timer(() => this.stop(active, "time-limit"), timeoutMs);
       let result: CommandResult;
       try {
-        result = await this.ports.run(step.command, workspace, signal, timeoutMs, prefix, undefined, undefined, STOP_BOUND_MS, (chunk, stream) => scanner.push(chunk, stream));
+        result = await this.ports.run(step.command, workspace, signal, timeoutMs, prefix, undefined, undefined, STOP_BOUND_MS, (chunk, stream) => { scanner.push(chunk, stream); tail.push(chunk); });
       } catch (error) {
         return { outcome: "error", reason: codeOf(error) === "command-stop-unconfirmed" ? "stop-unconfirmed" : "command-unavailable" };
       } finally {
@@ -484,7 +485,8 @@ export class MainCheckService {
         active.timers.limit = undefined;
       }
       const status = result.interrupted ? "interrupted" : result.exitCode === 0 ? "passed" : "failed";
-      const failures = status === "passed" ? [] : scanner.finish().failures.slice(0, MAX_FAILURES).map(failure => failure.detail ? `${failure.line}\n${failure.detail}` : failure.line);
+      const scan = status === "passed" ? undefined : scanner.finish();
+      const failures = scan === undefined ? [] : scan.failures.length > 0 ? scan.failures.slice(0, MAX_FAILURES).map(failure => failure.detail ? `${failure.line}\n${failure.detail}` : failure.line) : [tail.unrecognised()];
       active.commands.push({ ...structuredClone(step), status, exitCode: result.exitCode, ...(failures.length ? { failures } : {}) });
       if (status === "interrupted") return { outcome: "interrupted", reason: active.stopReason ?? "time-limit" };
       if (active.stopReason) return { outcome: "interrupted", reason: active.stopReason };

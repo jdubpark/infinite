@@ -381,6 +381,7 @@ test("an evaluator whose working copy cannot be prepared settles the run without
     assert.equal(view.assessment?.reason, "evaluator-unavailable");
     assert.equal(evaluators(view).length, 0, "no evaluator was added");
     assert.equal(storedOf(teams, f.run.id).pending, undefined, "no failed operation stays on the run");
+    assert.equal(view.events.filter(event => /working copy could not be prepared \([a-z-]+\)/.test(event.text)).length, 1, "the run's events name the cause once");
   } finally { f.close(); }
 });
 

@@ -2904,12 +2904,13 @@ export class TeamService {
         this.config.projects.find(project => project.id === run.projectId)?.team, this.permissionRecoveryHistory(run), this.publishHeadsEnabled());
     }
     if (role !== "permission-coordinator") run.status = role === "project-manager" || role === "intent-checker" ? "planning" : role === "scout" ? "discovering" : role === "reviewer" || role === "evaluator" || role === "judge" ? "reviewing" : role === "delivery" ? "delivering" : role === "integrator" ? "integrating" : "implementing";
+    let failure: string | undefined;
     this.operation(stored, "member", async signal => {
       this.assertRunPath(stored, run.workspace);
       if (continuationHead) await assertMemberReadOnly(run.workspace, continuationHead.headCommit, this.config.teams?.commandPrefix, signal, "integration");
       let cwd: string;
       try { cwd = run.replay ? run.workspace : await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.config.teams?.commandPrefix, signal); }
-      catch (error) { if (onFailed && !signal.aborted) return undefined; throw error; }
+      catch (error) { if (!onFailed || signal.aborted) throw error; failure = error instanceof TeamError ? error.code : "workspace-operation-failed"; return undefined; }
       this.assertRunPath(stored, cwd);
       if (continuationHead) await assertMemberReadOnly(run.workspace, continuationHead.headCommit, this.config.teams?.commandPrefix, signal, "integration");
       // Bootstrap dependencies exist only after the first implementation. A failed
@@ -2939,7 +2940,7 @@ export class TeamService {
       }
       return cwd;
     }, cwd => {
-      if (cwd === undefined) { onFailed?.(); return; }
+      if (cwd === undefined) { this.event(stored, `${member.title}'s working copy could not be prepared (${failure}). The run goes on without it.`); onFailed?.(); return; }
       if (continuationHead && stored.continuationHead?.revision === continuationHead.revision && stored.continuationHead.headCommit === continuationHead.headCommit)
         delete stored.continuationHead;
       member.cwd = cwd; run.members.push(member);

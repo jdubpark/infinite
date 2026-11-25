@@ -23,8 +23,8 @@ export function accountPalette(ids: string[]): Record<string, string> {
   return colors;
 }
 const accountName = (id: string) => names[id] ?? ({ deepseek: "DeepSeek", meta: "Meta", openai: "OpenAI", anthropic: "Anthropic" } as Record<string, string>)[id] ?? id.charAt(0).toUpperCase() + id.slice(1);
-const roles = ["implementer", "integrator", "reviewer", "evaluator", "scout", "project-manager", "delivery"];
-const roleLabel: Record<string, string> = { implementer: "Implementers", integrator: "Integrator", reviewer: "Reviewer", evaluator: "Evaluator", scout: "Scouts", "project-manager": "Coordinator", delivery: "Delivery" };
+const roles = ["implementer", "integrator", "reviewer", "scout", "project-manager", "delivery"];
+const roleLabel: Record<string, string> = { implementer: "Implementers", integrator: "Integrator", reviewer: "Reviewer", scout: "Scouts", "project-manager": "Coordinator", delivery: "Delivery" };
 
 /** Dollars at the precision the figure deserves: cents from one cent, four places below it, "0.00" only for a true zero. */
 export function usd(value: number, currency = "USD"): string {

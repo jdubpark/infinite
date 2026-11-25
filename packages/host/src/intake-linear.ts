@@ -103,14 +103,14 @@ export class IntakeLinear {
     return result;
   }
 
-  async createIssue(input: { id: string; teamId: string; title: string; description: string; label: string }, authorize?: () => void): Promise<IntakeIssue> {
+  async createIssue(input: { id: string; teamId: string; title: string; description: string; label: string }, authorize?: () => void | Promise<void>): Promise<IntakeIssue> {
     const labelData = await this.linear.request("InfiniteIntakeLabel",
       "query InfiniteIntakeLabel($filter: IssueLabelFilter!, $first: Int!) { issueLabels(filter: $filter, first: $first) { nodes { id team { id } } } }",
       { filter: { name: { eqIgnoreCase: input.label }, or: [{ team: { id: { eq: input.teamId } } }, { team: { null: true } }] }, first: 50 });
     const labels = z.object({ issueLabels: z.object({ nodes: z.array(z.object({ id: z.uuid(), team: z.object({ id: z.uuid() }).nullable().optional() })).max(50) }) }).parse(labelData).issueLabels.nodes;
     const label = labels.find(item => item.team?.id === input.teamId) ?? labels.find(item => !item.team);
     if (!label) throw new MissingLabelError();
-    authorize?.();
+    await authorize?.();
     let failure: unknown;
     try {
       const data = await this.linear.request("InfiniteIntakeIssueCreate",

@@ -56,7 +56,7 @@ import type {
   WorkerRequest,
   ControlLease,
   Receipt,
-  TeamPermissionExpansionExpectation,
+  TeamMemberAssignment, TeamPermissionExpansionExpectation,
 } from "./types.js";
 
 /** This stop attempt was refused before any worker RPC could deliver it. */
@@ -733,7 +733,7 @@ export class Manager {
   ): Promise<import("./types.js").Receipt & { result?: import("@infinite/attention").AnswerResult }> {
     const session = this.meta(sessionId).session;
     const stored = session.team;
-    const validAssignment = (value: unknown): value is TeamAssignment => {
+    const validAssignment = (value: unknown): value is TeamMemberAssignment => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return false;
       const candidate = value as Partial<TeamAssignment>;
       return typeof candidate.runId === "string" && typeof candidate.memberId === "string" &&
@@ -744,7 +744,7 @@ export class Manager {
     const sameAssignment = (left: TeamAssignment | undefined, right: TeamAssignment) =>
       Boolean(left && left.runId === right.runId && left.memberId === right.memberId &&
         left.revision === right.revision && left.role === right.role && left.taskId === right.taskId);
-    if (!validAssignment(team) || !stored || !sameAssignment(stored, team) || decision.revision !== stored.revision ||
+    if (!validAssignment(team) || !validAssignment(stored) || !sameAssignment(stored, team) || decision.revision !== stored.revision ||
         decision.targetMemberId !== stored.memberId || decision.targetSessionId !== sessionId ||
         requestId !== decision.answerRequestId)
       throw new ContentError("This permission decision does not match the assigned team member", 403);
@@ -874,7 +874,7 @@ export class Manager {
     const stored = session.team;
     const sameAssignment = Boolean(stored && stored.runId === team.runId && stored.memberId === team.memberId &&
       stored.revision === team.revision && stored.role === team.role && stored.taskId === team.taskId);
-    if (!sameAssignment || !/^[a-f0-9-]{36}$/i.test(delivery.deliveryId) || !/^[a-f0-9-]{36}$/i.test(delivery.requestId) ||
+    if (!sameAssignment || !stored || stored.role === "mission-coordinator" || !/^[a-f0-9-]{36}$/i.test(delivery.deliveryId) || !/^[a-f0-9-]{36}$/i.test(delivery.requestId) ||
         team.role === "permission-coordinator")
       throw new ContentError("This permission delivery does not match the assigned team member", 403);
     const prompt = delivery.prompt;
@@ -904,9 +904,9 @@ export class Manager {
         throw new ContentError("The permission delivery was invalidated before the answer");
       try {
         return await workerCall(this.config.runDir, sessionId, {
-          op: "team-answer", requestId: delivery.requestId, decisionId: delivery.deliveryId, choice: delivery.choice,
-          ...(delivery.choice === "reject" && delivery.notice ? { text: delivery.notice } : {}),
-          targetSessionId: sessionId, assignment: stored!, targetCwd: canonicalCwd,
+          op: "team-answer", requestId: delivery.requestId, decisionId: delivery.deliveryId,
+          ...(delivery.choice === "accept" ? { choice: "accept" as const } : { choice: "reject" as const, ...(delivery.notice ? { text: delivery.notice } : {}) }),
+          targetSessionId: sessionId, assignment: { ...stored, role: stored.role }, targetCwd: canonicalCwd,
           expiresAt: delivery.expiresAt, policyHash: delivery.authorityHash,
           promptId: prompt.id, promptHash: prompt.hash, evidenceHash: delivery.evidenceHash, option: delivery.option,
           actor, leaseId: acquired.id,

@@ -62,16 +62,16 @@ import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-openco
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
 import { JsonLineAssembler, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
-import type {
-  Bootstrap,
-  ControlActor,
-  ControlLease,
-  Event,
-  InputControl,
-  Receipt,
-  TerminalSnapshot,
-  WorkerRequest,
-  WorkerState,
+import { normalizeWorkerControlRequest, teamAnswerWorkerRequestSchema, workerControlRequestSchema, workerWorkspaceExportRequestSchema,
+  type Bootstrap,
+  type ControlActor,
+  type ControlLease,
+  type Event,
+  type InputControl,
+  type Receipt,
+  type TerminalSnapshot,
+  type WorkerRequest,
+  type WorkerState,
 } from "./types.js";
 
 let bootstrap = "";
@@ -632,11 +632,10 @@ function validateControl(request: InputControl) {
     (request.leaseId !== undefined && (typeof request.leaseId !== "string" || request.leaseId.length > 80)))
     throw new Error("Invalid session control");
 }
-function changeControl(request: Extract<WorkerRequest, { op: "control" }>): ControlLease | null {
-  if (!validActor(request.actor) || !["claim", "renew", "release"].includes(request.action) ||
-    (request.takeover !== undefined && typeof request.takeover !== "boolean"))
-    throw new Error("Invalid session control");
-  validateControl(request);
+function changeControl(rawRequest: Extract<WorkerRequest, { op: "control" }>): ControlLease | null {
+  const normalized = normalizeWorkerControlRequest(rawRequest);
+  if ((normalized.action === "renew" || normalized.action === "release") && normalized.leaseId === undefined && validActor(normalized.actor) && (normalized as { takeover?: unknown }).takeover === undefined) throw new Refusal("control-lost");
+  const parsed = workerControlRequestSchema.safeParse(normalized); if (!parsed.success) throw new Error("Invalid session control"); const request = parsed.data;
   const active = currentControl();
   const owns = active && controller?.actorId === request.actor.id && active.id === request.leaseId;
   const reconnecting = active && controller?.actorId === request.actor.id && request.leaseId === undefined;
@@ -1232,28 +1231,7 @@ function validAnswer(request: AnswerRequest) {
   );
 }
 function validTeamAnswer(request: TeamAnswerRequest) {
-  const rawAssignment: unknown = request.assignment;
-  if (!rawAssignment || typeof rawAssignment !== "object" || Array.isArray(rawAssignment)) return false;
-  const assignment = rawAssignment as TeamAssignment;
-  const agentChoice = request.choice === "accept" || request.choice === "reject";
-  if (request.choice !== undefined && !agentChoice) return false;
-  if (agentChoice ? request.coordinatorMemberId !== undefined : !/^[a-f0-9-]{36}$/i.test(request.coordinatorMemberId ?? "")) return false;
-  if (request.text !== undefined && (request.choice !== "reject" || typeof request.text !== "string" || !request.text ||
-      request.text.length > 2000 || /[\x00-\x1f\x7f]/.test(request.text))) return false;
-  return typeof request.requestId === "string" && request.requestId.length <= 80 &&
-    /^[a-f0-9-]{36}$/i.test(request.decisionId) &&
-    request.targetSessionId === session.id &&
-    /^[a-f0-9-]{36}$/i.test(assignment.runId) &&
-    /^[a-f0-9-]{36}$/i.test(assignment.memberId) &&
-    Number.isInteger(assignment.revision) && assignment.revision > 0 &&
-    ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker", "evaluator", "judge"].includes(assignment.role) &&
-    (assignment.taskId === undefined || typeof assignment.taskId === "string") &&
-    typeof request.targetCwd === "string" && request.targetCwd.length > 0 && request.targetCwd.length <= 4096 &&
-    Number.isInteger(Date.parse(request.expiresAt)) && /^[a-f0-9]{64}$/i.test(request.policyHash) &&
-    Number.isInteger(request.promptId) && request.promptId >= 1 &&
-    /^[a-f0-9]{64}$/i.test(request.promptHash) && /^[a-f0-9]{64}$/i.test(request.evidenceHash) &&
-    Number.isInteger(request.option) && request.option >= 0 && validActor(request.actor) &&
-    typeof request.leaseId === "string" && request.leaseId.length > 0 && request.leaseId.length <= 80;
+  return request.targetSessionId === session.id && teamAnswerWorkerRequestSchema.safeParse(request).success;
 }
 
 const server = createServer((socket) => {
@@ -1304,8 +1282,10 @@ const server = createServer((socket) => {
             !["starting", "running"].includes(state.status)) throw new Refusal("unsupported");
         result = executor.attach();
       } else if (request.op === "workspace-export") {
-        if (!hybrid || !["sync/export", "sync/blob"].includes(request.method)) throw new Refusal("unsupported");
-        result = await hybrid.control(request.method, { hash: request.hash });
+        if (!["sync/export", "sync/blob"].includes(String((request as { method?: unknown }).method))) throw new Refusal("unsupported");
+        const parsed = workerWorkspaceExportRequestSchema.safeParse(request); if (!parsed.success) throw new Error(request.method === "sync/blob" && request.hash === undefined ? "A content hash is required" : "Invalid workspace export request");
+        if (!hybrid) throw new Refusal("unsupported");
+        result = await hybrid.control(parsed.data.method, parsed.data.method === "sync/blob" ? { hash: parsed.data.hash } : {});
       } else if (request.op === "native-connect") {
         result = await serialize(() => {
           if (!native || !request.actor || !request.leaseId || state.status !== "running") throw new Refusal("unsupported");

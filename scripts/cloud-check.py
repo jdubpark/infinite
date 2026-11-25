@@ -328,7 +328,7 @@ def package_manager_pin(directory: Path) -> dict[str, object] | None:
     match = re.fullmatch(r"npm@([0-9]+\.[0-9]+\.[0-9]+)", manager)
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", node) or not match:
         raise RuntimeError(".nvmrc or packageManager has an unsupported version format")
-    return {"platforms": ["darwin", "linux"], "node": node, "npm": match.group(1)}
+    return {"node": node, "npm": match.group(1)}
 
 
 def toolchain_pin(root: Path) -> bytes:
@@ -538,6 +538,12 @@ def main() -> int:
                 "-T",
                 "-o",
                 "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=90",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
                 "-o",
                 "StrictHostKeyChecking=yes",
                 "-o",

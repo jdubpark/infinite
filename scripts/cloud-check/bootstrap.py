@@ -1,3 +1,4 @@
+import ctypes
 import os
 import pathlib
 import secrets
@@ -68,9 +69,29 @@ def await_fallback(child):
             return 128 + number
         time.sleep(0.1)
 def launch_fallback(base, env):
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("runner lacks supported process containment")
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    PR_SET_CHILD_SUBREAPER = 36
+    if prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "could not enable child subreaper")
+    children = pathlib.Path(f"/proc/self/task/{os.getpid()}/children")
+    children.read_text()
     child = subprocess.Popen([sys.executable, "worker.py"], cwd=base, env=env,
                              stdin=subprocess.DEVNULL, start_new_session=True)
-    return child, await_fallback(child)
+    try:
+        return await_fallback(child)
+    finally:
+        while True:
+            owned = [int(pid) for pid in children.read_text().split()]
+            if not owned:
+                break
+            for pid in owned:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(pid, 0)
 
 
 def cleanup_docker(run_id, base):
@@ -134,7 +155,7 @@ try:
     size = int.from_bytes(header, "big")
     if size <= 0 or size > 1073741824:
         raise RuntimeError("invalid verification frame size")
-    with tempfile.TemporaryDirectory(prefix="iv-") as root:
+    with tempfile.TemporaryDirectory(prefix="iv-", dir="/tmp") as root:
         base = pathlib.Path(root)
         payload_path = base / "payload.tar.gz"
         with payload_path.open("wb") as output:
@@ -166,7 +187,7 @@ try:
             if systemd:
                 code, cancelled = launch_systemd(base, env, token, systemd)
             else:
-                _, code = launch_fallback(base, env)
+                code = launch_fallback(base, env)
                 cancelled = bool(interrupted)
         finally:
             cleanup_docker(run_id, base)

@@ -19,7 +19,6 @@ import time
 
 
 PAYLOAD = pathlib.Path(__file__).resolve().parent
-SUPPORTED_PLATFORMS = ("linux", "darwin")
 RUN_DIR: pathlib.Path | None = None
 CHILD: subprocess.Popen[str] | None = None
 GIT_ENV: dict[str, str] | None = None
@@ -122,8 +121,8 @@ def sha256_file(path: pathlib.Path) -> str:
 
 
 def ensure_pin(pin: dict[str, object]) -> tuple[str, str, str]:
-    if sys.platform not in SUPPORTED_PLATFORMS:
-        raise CheckError(f"unsupported platform: expected one of {', '.join(SUPPORTED_PLATFORMS)}, got {sys.platform}")
+    if sys.platform != "linux":
+        raise CheckError(f"cloud checkout requires a Linux runner, got {sys.platform}")
     node = version("node", ["--version"]).removeprefix("v")
     npm = version("npm", ["--version"])
     git = version("git", ["--version"])
@@ -148,7 +147,7 @@ def private_env(home: pathlib.Path, temp: pathlib.Path, marker: pathlib.Path, ru
     browsers.mkdir(mode=0o700, exist_ok=True)
     npm_cache.chmod(0o700)
     browsers.chmod(0o700)
-    return {
+    env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
@@ -407,7 +406,8 @@ def main() -> int:
         manifest = parse_manifest(envelope.get("files"))
         index_entries = envelope.get("index")
 
-        RUN_DIR = pathlib.Path(tempfile.mkdtemp(prefix="iv-", dir="/tmp"))
+        RUN_DIR = PAYLOAD / "j"
+        RUN_DIR.mkdir(mode=0o700)
         run_id = os.environ["INFINITE_CHECK_RUN_ID"]
         home = RUN_DIR / "h"
         home.mkdir(mode=0o700)

@@ -47,7 +47,7 @@ test("cloud dispatch preserves Git layers, worktree bytes, cwd, argv and the che
   assert.notEqual(unenrolled.status, 0);
   assert.equal(existsSync(join(sub, "unintended")), false);
   git("config", "--add", "infinite.verifyHost", "fixture-runner");
-  writeFileSync(join(bin, "ssh"), '#!/bin/sh\nfor command do :; done\nexec sh -c "$command"\n', { mode: 0o755 });
+  writeFileSync(join(bin, "ssh"), '#!/bin/sh\nfor command do :; done\nexport ANDROID_HOME=/opt/fixture-sdk\nexec sh -c "$command"\n', { mode: 0o755 });
   const proof = `
     const assert = require('node:assert/strict');
     const fs = require('node:fs');
@@ -64,7 +64,8 @@ test("cloud dispatch preserves Git layers, worktree bytes, cwd, argv and the che
     assert.deepEqual([...fs.readFileSync('link')],[0,255]);
     assert.ok(fs.statSync('odd name').mode & 0o100);
     assert.equal(process.argv[2], 'literal $value & spaces');
-    const service = require('node:child_process').spawn('sleep', ['60'], {stdio:'ignore'});
+    assert.equal(process.env.ANDROID_HOME, '/opt/fixture-sdk');
+    const service = require('node:child_process').spawn('sleep', ['60'], {stdio:'ignore', detached:true});
     service.unref();
     console.log('background pid=' + service.pid);
     console.log('verified remote working tree');

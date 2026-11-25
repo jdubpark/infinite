@@ -185,7 +185,7 @@ Unattended work is limited by each provider's permissions, quotas, authenticatio
 
 ## Cloud verification
 
-From a workstation, enroll an SSH alias for an owner-operated test account or VM in the checkout's private Git config. Verify its SSH host key through the owner's trusted channel first. Linked worktrees share this enrollment. The workstation needs Git, Python 3 and OpenSSH. The runner needs those tools, the Node version in `.nvmrc`, the npm version in `package.json`'s `packageManager` field, and the native build dependencies for the platform.
+From a workstation, enroll an SSH alias for an owner-operated test account or VM in the checkout's private Git config. Verify its SSH host key through the owner's trusted channel first. Linked worktrees share this enrollment. The workstation needs Git, Python 3.9+ and OpenSSH. The runner needs those tools, the Node version in `.nvmrc`, the npm version in `package.json`'s `packageManager` field, and the native build dependencies for the platform.
 
 ```sh
 git config --local --add infinite.verifyHost VERIFY_LINUX
@@ -197,12 +197,12 @@ Each run transfers the current Git revision, staged and unstaged edits, deletion
 
 Run `python3 scripts/install-cloud-check.py` once to install `infinite-check` for older worktrees as well. Run it again when upgrading the launcher. `infinite-check -- COMMAND ARG...` snapshots the calling worktree, including when invoked from a subdirectory. A checkout that predates both toolchain pins uses the installed launcher's pins.
 
-The first enrolled alias is the default. Enroll additional owned boxes with the same Git config command. Use `--runner` to select a box by capability or run independent checks on different boxes. Docker jobs use a cloud Docker runner. Xcode and iOS checks require an enrolled Mac.
+The first enrolled alias is the default. Enroll additional owned boxes with the same Git config command. Use `--runner` to select a box by capability or run independent checks on different boxes. Docker jobs use a Linux runner with Docker installed. The launcher contains test services using a Linux user systemd service or a child subreaper. Xcode and iOS simulator checks require a separately provisioned owner-operated Mac environment.
 
 Each job gets a unique `COMPOSE_PROJECT_NAME`. Use `docker run --rm` for disposable containers and label any other job-owned Docker resources with `io.infinite.check="$INFINITE_CHECK_RUN_ID"`. The runner cleans resources bearing that label or the job's Compose project label on its local Docker socket.
 
 ```sh
-python3 scripts/cloud-check.py --runner VERIFY_MAC -- npm run desktop:test
+python3 scripts/cloud-check.py --runner VERIFY_BROWSER -- npm test
 ```
 
 Provision Chromium with the lockfile's Playwright CLI on each browser runner. After `npm ci`, run `PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/infinite-cloud-check/playwright" ./node_modules/.bin/playwright install chromium`. Linux images also need Playwright's system dependencies.

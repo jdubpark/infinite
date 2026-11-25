@@ -12,4 +12,8 @@ Non-obvious architectural, protocol, security, concurrency, and compatibility de
 | [0006](0006-host-concurrency-and-lock-free-storage.md) | Host Lock-Free Storage, Pipeline Concurrency, and Partitioned Coordination | `packages/host/` | Accepted |
 | [0007](0007-host-state-machines-and-fail-closed-boundaries.md) | Host State Machines, Fail-Closed Halts, Eval Isolation, and Transport Boundaries | `packages/host/` | Accepted |
 | [0008](0008-wave2-domain-and-service-state-machines.md) | Wave 2A Domain, Background Service, and Session Control State Machines | `packages/host/`, `apps/mobile/`, `apps/web/` | Accepted |
+| [0010](0010-egress-and-github-proxy-security.md) | Egress Proxy Isolation and GitHub Credential Proxy Security | `scripts/` | Accepted |
+| [0011](0011-build-watch-graph-and-test-tooling.md) | Build, Native Workspace Watch, Code Graph, and Verification Tooling | `scripts/`, `.agents/skills/` | Accepted |
+| [0012](0012-web-client-ui-and-transport-invariants.md) | Web Client UI, Transport, Freshness, and Cost Accounting Invariants | `apps/web/` | Accepted |
+| [0013](0013-ubuntu-deployment-and-isolation.md) | Ubuntu Host Deployment, Service Isolation, and Encrypted Backups | `deploy/ubuntu/` | Accepted |
 | [0016](0016-wave3-per-entity-orchestration-queues.md) | Per-Entity Orchestration Queues and Orchestration Service Invariants | `packages/host/` | Accepted |

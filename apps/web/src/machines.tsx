@@ -10,7 +10,6 @@ export const useMachines = () => useContext(MachinesContext)!;
 const routeMachine = () => window.location.hash.match(/^#\/machines\/([^/]+)/)?.[1] ?? "direct";
 
 export function MachineProvider({ children }: { children: ReactNode }) {
-  // Keys, content, and machine profiles live in tab memory, never browser storage.
   const [profiles, setProfiles] = useState<Machine[]>([local]);
   const [activeId, setActiveId] = useState(routeMachine);
   const active = profiles.find(profile => profile.id === activeId);

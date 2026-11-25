@@ -269,8 +269,6 @@ async function cachedToken(path, repository, groupId, expectedPermissions = EXPE
   return undefined;
 }
 
-// Apply workflow opt-outs before key loading or discovery can fail. The cache directory
-// is issuer-owned; filenames are opaque hashes and never come from provider input.
 async function invalidateWorkflowOptOuts(config) {
   const retained = new Set(config.workflowRepositories.map(name => basename(tokenPath(config.tokenDirectory, name))));
   for (const entry of await readdir(config.tokenDirectory, { withFileTypes: true })) {

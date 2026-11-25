@@ -9,7 +9,6 @@ import sqlite3
 import subprocess
 import tarfile
 
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
@@ -23,7 +22,6 @@ def main():
     with args.archive.open("rb") as source:
         if hashlib.file_digest(source, "sha256").hexdigest() != args.sha256:
             raise RuntimeError("Encrypted archive checksum does not match the owner receipt")
-    # Never overwrite an existing project or restore over the live server.
     args.restore_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
     external_links = []
     acl_records = 0
@@ -71,14 +69,12 @@ def main():
         with path.open("rb") as source:
             if source.read(16) != b"SQLite format 3\x00":
                 continue
-        # Open the restored copy normally so SQLite can recover its copied WAL.
         with sqlite3.connect(str(path)) as database:
             if database.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
                 raise RuntimeError("A restored SQLite database failed integrity checking")
         checked += 1
     print(json.dumps({"verifiedFiles": len(manifest["files"]), "sqliteDatabases": checked, "createdAt": manifest["createdAt"], "pauseSeconds": manifest["pauseSeconds"], "externalSymlinksSkipped": len(external_links), "contentsVerified": True,
                       "archiveACLRecords": acl_records, "posixACLsApplied": False, "numericOwnersApplied": False}))
-
 
 if __name__ == "__main__":
     try:

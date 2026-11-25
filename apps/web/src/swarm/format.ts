@@ -1,4 +1,3 @@
-/** Compact figures for a view with little text. */
 
 export function usd(value: number | undefined): string {
   if (value === undefined) return "";
@@ -7,17 +6,12 @@ export function usd(value: number | undefined): string {
   return `$${value.toFixed(2)}`;
 }
 
-/**
- * A cost with the count of agents it leaves out. Unmeasured agents are never counted as $0: a measured
- * amount gains a `+`, and no measured amount becomes a dash.
- */
 export function cost(value: number | undefined, unmeasured: number): { text: string; title?: string } {
   if (unmeasured <= 0) return { text: usd(value) };
   if (value) return { text: `${usd(value)}+`, title: `${unmeasured} ${unmeasured === 1 ? "agent" : "agents"} not measured` };
   return { text: "—", title: "cost not measured" };
 }
 
-/** Elapsed time since an ISO instant: 42s, 3m, 2h, 4d. Empty when the instant is unknown. */
 export function elapsed(iso: string | undefined, now: number): string {
   if (!iso) return "";
   const seconds = Math.max(0, Math.floor((now - Date.parse(iso)) / 1000));
@@ -28,13 +22,11 @@ export function elapsed(iso: string | undefined, now: number): string {
   return `${Math.floor(seconds / 86400)}d`;
 }
 
-/** A short lowercase model name for a tile: the label up to its first space, at most ten characters. */
 export function shortModel(label: string | undefined, provider: string): string {
   const name = (label ?? provider).trim().split(/\s+/)[0] ?? provider;
   return name.toLowerCase().slice(0, 10);
 }
 
-/** Wall-clock HH:MM in the viewer's time zone. */
 export function clockTime(iso: string): string {
   return new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(iso));
 }

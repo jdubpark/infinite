@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-// Opt-in prototype. Conversation and model authentication remain on Infinite;
-// the selected laptop supplies tools only while this process is connected.
 import { spawn, execFile } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync, realpathSync, statSync } from "node:fs";
@@ -60,8 +58,6 @@ const signal = () => stop();
 for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(name, signal);
 function child(command, args, options, interactive = false) {
   if (interrupted) throw failure ?? new Error("Hybrid setup interrupted");
-  // A pipe owned by this client fences the helper lifetime even after SIGKILL.
-  // Codex's --exit-on-stdin-close only supports its hosted registration mode.
   const supervisor = `
     const {spawn}=require('node:child_process');
     const {createReadStream}=require('node:fs');
@@ -143,8 +139,6 @@ try {
         pending.delete(message.id); clearTimeout(request.timer);
         message.error ? request.reject(new Error(`Codex refused the ${message.error.code ?? "native"} request`)) : request.resolve(message.result);
       }
-      // Provider approval requests remain unanswered here. The native UI and
-      // phone terminal show them and require an explicit user decision.
     } catch { stop(new Error("Invalid native response")); }
   });
   await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
@@ -152,15 +146,11 @@ try {
   ws.on("close", () => { for (const request of pending.values()) { clearTimeout(request.timer); request.reject(new Error("Native response was lost; no request was retried")); } pending.clear(); });
   await call("initialize", { clientInfo: { name: "infinite_hybrid_prototype", version: "0.1.0" }, capabilities: { experimentalApi: true } });
   ws.send(JSON.stringify({ method: "initialized" }));
-  // Loaded Codex threads cache executor connections by environment ID. Give
-  // each connection a new generation; only the conversation identity persists.
   const environmentId = "infinite-laptop-" + randomUUID();
   await call("environment/add", { environmentId, execServerUrl: `ws://127.0.0.1:${remotePort}`, authBearerToken: token, connectTimeoutMs: 10000 });
   const info = await call("environment/info", { environmentId });
   if (!info.cwd || decodeURIComponent(new URL(info.cwd).pathname) !== cwd) throw new Error("The executor reported a different workspace");
   await call("thread/resume", { threadId: native.sessionId, excludeTurns: true });
-  // The native TUI also reads the legacy cwd when it rejoins. Keep that root
-  // aligned with the selected environment so its next turn does not reset it.
   await call("turn/start", { threadId: native.sessionId, cwd, input: [{ type: "text", text: values.prompt, text_elements: [] }],
     environments: [{ environmentId, cwd, runtimeWorkspaceRoots: [cwd] }] });
   console.error("[Infinite prototype] Follow-up accepted in the same conversation. Files remain on this laptop; selected tool results enter cloud context.");

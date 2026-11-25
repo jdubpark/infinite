@@ -5,7 +5,6 @@ export type DecisionQueueState = {
   decisions: QueueDecision[];
   activeKey?: string;
   selectedAnswers: string[];
-  /** The decision shown before is no longer in the queue, and it was not answered here. The queue does not say why. */
   activeLeft: boolean;
 };
 
@@ -51,15 +50,8 @@ export function removeAnsweredDecision(state: DecisionQueueState, key: string): 
     selectedAnswers: [], activeLeft: false };
 }
 
-/** Counted from the answer, the read at which a decision answered here shows again if the host still lists it. */
 export const ANSWERED_RESTORE_READ = 5;
 
-/**
- * Which answered keys stay hidden after a read. Each entry holds the number of the first read that began after the
- * answer was confirmed. An entry ends when such a read no longer lists the key. It also ends at the read numbered
- * ANSWERED_RESTORE_READ among them, if that read still lists the key: the host says the decision still waits, so it
- * shows again.
- */
 export function settleAnsweredKeys(hidden: ReadonlyMap<string, number>, read: number, listed: ReadonlySet<string>): Map<string, number> {
   const next = new Map<string, number>();
   for (const [key, firstRead] of hidden) {

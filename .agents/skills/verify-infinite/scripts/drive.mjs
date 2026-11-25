@@ -1,20 +1,4 @@
 #!/usr/bin/env node
-// Drive a running local Infinite host with Playwright, check it, and tear it down.
-//
-// Usage (from the repository root):
-//   node .agents/skills/verify-infinite/scripts/drive.mjs doctor  --instance DIR
-//   node .agents/skills/verify-infinite/scripts/drive.mjs sign-in --instance DIR
-//   node .agents/skills/verify-infinite/scripts/drive.mjs session --instance DIR
-//   node .agents/skills/verify-infinite/scripts/drive.mjs configure --instance DIR --profile teams|goals
-//   node .agents/skills/verify-infinite/scripts/drive.mjs team --instance DIR
-//   node .agents/skills/verify-infinite/scripts/drive.mjs goal --instance DIR
-//   node .agents/skills/verify-infinite/scripts/drive.mjs cleanup --instance DIR
-//
-// DIR is the instance directory from the launch step (config.json, devices.json,
-// server.pid, run-dir). Evidence goes to DIR/../evidence and is never deleted by cleanup.
-// Device keys are read from devices.json for requests and sign-in only: they are never
-// printed, logged, or written to evidence.
-// Chromium: PLAYWRIGHT_CHROMIUM_PATH, else the macOS Google Chrome app, else Playwright's bundled build.
 
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -40,11 +24,9 @@ const command = positionals[0];
 const COMMANDS = ["doctor", "sign-in", "session", "claim", "configure", "team", "goal", "cleanup"];
 if (!COMMANDS.includes(command)) fail(`Command must be one of ${COMMANDS.join(", ")}`);
 if (!values.instance) fail("Pass --instance DIR (the instance directory from the launch step)");
-// Port 4780 is another host's tunnel on some development machines. No command here uses it, in any form.
 const RESERVED_PORT = 4780;
 const instance = resolve(values.instance);
 const configFile = join(instance, "config.json");
-// Cleanup still runs when the config is already gone; the other commands need it. claim creates the instance.
 if (!existsSync(configFile) && !["cleanup", "claim"].includes(command)) fail(`No config.json in ${instance}; nothing to ${command}`);
 const config = existsSync(configFile) ? JSON.parse(readFileSync(configFile, "utf8")) : {};
 const port = Number(values.port ?? config.port);
@@ -64,7 +46,6 @@ function fail(message) {
   process.exit(1);
 }
 
-// Loaded on demand. Every error and log line passes through redact(), which removes all device keys.
 let devices;
 function deviceKeys() {
   if (devices === undefined) devices = JSON.parse(readFileSync(join(instance, "devices.json"), "utf8"));
@@ -76,9 +57,6 @@ const redact = (text) => {
   return secrets.reduce((out, secret) => out.split(secret).join("[device key]"), String(text));
 };
 
-// Every request to the host goes through here. Before any request (authenticated or not) the target must be the
-// verified instance: the port is the configured one, and the API process recorded for this instance is the one
-// listening on it. Nothing is sent to a port that fails the check.
 async function api(path, { auth = true, method = "GET", body } = {}) {
   assertTarget();
   const headers = auth ? { authorization: `Bearer ${ownerKey()}` } : {};
@@ -87,9 +65,6 @@ async function api(path, { auth = true, method = "GET", body } = {}) {
   return { status: response.status, json: await response.json().catch(() => null) };
 }
 
-// The browser sends a device key on sign-in, so it is held to the same check as api(): no page is opened and no
-// key is submitted unless this instance's recorded API process is the one listening on the configured port.
-// A refused check throws, so the journey records it as a failed step.
 async function openGuarded(page) {
   assertTarget();
   await openSignIn(page, origin);
@@ -115,10 +90,6 @@ function listeners() {
   }
 }
 
-// ps rows with pid, parent, start time, and command line. The identity (start time plus command line)
-// comes from the same row that establishes ownership, so a PID reused later is never adopted. A reused
-// PID has a different start time even when its command line is identical. Limits: lstart has one-second
-// resolution, and macOS cannot make the check and the signal one step.
 const PS_ROW = /^(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d+\s+[\d:]+\s+\d+)\s+(.*)$/;
 function psRows(args) {
   try {
@@ -134,7 +105,6 @@ function psRows(args) {
 const processTable = () => psRows(["-axo", "pid=,ppid=,lstart=,args="]);
 const processNow = (pid) => (Number.isInteger(pid) ? psRows(["-o", "pid=,ppid=,lstart=,args=", "-p", String(pid)])[0] : undefined);
 
-// Names lsof reports for one process's open files, e.g. unix socket paths with -U.
 function openNames(pid, flags) {
   try {
     const out = execFileSync("lsof", ["-nP", "-a", ...flags, "-p", String(pid), "-Fn"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
@@ -144,11 +114,6 @@ function openNames(pid, flags) {
   }
 }
 
-// Processes that belong to this instance and are not the API: session workers and the agent
-// processes they started (descendants). Nothing else qualifies, so a shell or editor that merely
-// has a file open in the instance is never signalled. A worker is matched by a unix socket under
-// this instance's run directory; the path stays visible to lsof even after the directory is
-// removed, so orphans are still found. Each entry keeps the start time and command line seen at discovery.
 function instanceProcesses() {
   const table = processTable();
   const runDirs = [runDir, existsSync(runDir) ? realpathSync(runDir) : ""].filter(Boolean);
@@ -174,10 +139,8 @@ function instanceProcesses() {
   return [...found].map((pid) => rows.get(pid)).filter(Boolean);
 }
 
-// True only while the PID is still the process recorded at discovery (same start time and command line).
 const unchanged = (entry) => processNow(entry.pid)?.identity === entry.identity;
 
-// Signals a recorded process only if its PID still holds that process. A PID that already exited is not an error.
 const signalIfUnchanged = (entry, name) => {
   if (!unchanged(entry)) return false;
   try {
@@ -197,7 +160,6 @@ const alive = (pid) => {
   }
 };
 
-// Polls until the processes exit (or stop matching their recorded identity) or the timeout passes.
 async function waitForExit(entries, timeoutMs) {
   const running = (entry) => alive(entry.pid) && unchanged(entry);
   const deadline = Date.now() + timeoutMs;
@@ -205,8 +167,6 @@ async function waitForExit(entries, timeoutMs) {
   return entries.filter(running);
 }
 
-// Gives each process time to exit on its own, then sends TERM, then KILL. Only the entries passed in are
-// signalled, and each one only after its identity is checked again.
 async function stopAll(entries, note) {
   if (!entries.length) return note("instance processes: none");
   note(`instance processes found: ${entries.map((entry) => entry.pid).join(",")}`);
@@ -215,7 +175,6 @@ async function stopAll(entries, note) {
   for (const entry of await waitForExit(stillRunning, 5000)) if (signalIfUnchanged(entry, "SIGKILL")) note(`process ${entry.pid} ignored SIGTERM; sent SIGKILL`);
 }
 
-// The API is ours when its command line carries this instance's config path.
 const isThisInstance = (entry) => Boolean(entry?.args.includes(`--config ${configFile}`));
 const ownsThisInstance = (pid) => isThisInstance(processNow(pid));
 
@@ -254,7 +213,6 @@ async function signIn() {
     await page.screenshot({ path: join(evidence, "01-sign-in.png") });
     step("sign-in page shown", true, origin);
 
-    // Negative control: a well-formed but unknown key must be refused and must not sign in.
     await page.locator("#device-key").fill("x".repeat(40));
     await page.locator("form:has(#device-key) button.primary").click();
     await expect(page.getByRole("alert")).toHaveText("Device key was not recognized", { timeout: 15000 });
@@ -263,7 +221,6 @@ async function signIn() {
     await signInGuarded(page, ownerKey());
     step("owner signed in", true, "session rail visible");
 
-    // The session cookie is scoped to path /api, so ask for a URL under it.
     const cookies = await context.cookies(`${origin}/api/me`);
     const cookie = cookies.find((item) => item.name === "infinite");
     step("browser session cookie set", Boolean(cookie?.httpOnly), cookie ? `httpOnly ${cookie.httpOnly}, sameSite ${cookie.sameSite}` : "missing");
@@ -311,8 +268,6 @@ const SESSION_TITLE = "Verification session";
 const FIRST_REQUEST = "Reply with one line.";
 const STEER_MESSAGE = "Verification message from the session journey";
 
-// Owner starts a Rehearsal session, takes control, steers it, and checks the PID across an offline gap.
-// A controller on a 390x844 touch phone then checks the same transcript and PID.
 async function session() {
   mkdirSync(evidence, { recursive: true });
   const startedAt = new Date().toISOString();
@@ -322,7 +277,6 @@ async function session() {
   let browser, executablePath, sessionId;
   let pid;
 
-  // Runs one named step. A failure is recorded with the first line of its error and stops the journey.
   const check = async (name, action) => {
     try {
       step(name, true, (await action()) ?? "");
@@ -336,7 +290,6 @@ async function session() {
     if (status !== 200) throw new Error(`GET session returned HTTP ${status}`);
     return json;
   };
-  // The page clears its own lease before the host confirms a release, so lease state is read from the host.
   const waitHostLease = async (held) => {
     const deadline = Date.now() + 15000;
     for (;;) {
@@ -464,8 +417,6 @@ async function session() {
       await phone.screenshot({ path: join(evidence, "05-controller-phone.png"), fullPage: true });
       if (!fits) throw new Error("document is wider than the 390px viewport");
     });
-    // A held control lease makes the worker refuse a stop from any other actor (HTTP 409) until it expires
-    // (30 seconds), so the journey ends by releasing it.
     await check("owner released control", async () => {
       await owner.getByRole("tab", { name: "Catch up", exact: true }).click();
       const stop = owner.getByRole("button", { name: "Stop controlling", exact: true });
@@ -503,10 +454,6 @@ async function session() {
   process.exit(failed.length ? 1 : 0);
 }
 
-// Host configuration for the teams and goals journeys. It runs after `cli.ts init --local` writes config.json
-// and before the API starts, so the API reads it at startup. It replaces the agents with the fixture agents from
-// tests/fixtures (no real provider command remains), puts a throwaway git project in the instance, and sets
-// teams.workspaceDir inside the instance. Nothing outside DIR is written.
 const TEAM_LINEUP = {
   coordinator: { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
   implementers: [{ id: "light", label: "Light worker", provider: "codex", model: "gpt-6-luna", effort: "high", tier: "light" }],
@@ -542,13 +489,9 @@ function createProject(directory, profile) {
   git("commit", "-m", "Verification project");
 }
 
-// Ownership: only an instance this harness claimed (claim, before init) may be configured. The receipt lives in the
-// instance; configure rejects a missing, copied, or already-configured receipt, a symlinked instance, config, or path,
-// a path that resolves outside the instance, a live server or listener, and any project or workspace that exists.
 const OWNERSHIP = "ownership.json";
 const FIXTURES = join(repoRoot, "tests/fixtures");
 
-// True when `path` exists, is not a symlink, and resolves inside the real instance directory.
 function insideInstance(realInstance, path) {
   if (!existsSync(path) || lstatSync(path).isSymbolicLink()) return false;
   const real = realpathSync(path);
@@ -561,9 +504,6 @@ function readReceipt() {
   return JSON.parse(readFileSync(file, "utf8"));
 }
 
-// Writes the instance and its run directory. Refuses a directory that already has content, so a claim can never
-// adopt an existing host. The run directory must be a fresh /tmp/iv- directory: the socket path limit keeps the
-// session workers' sockets out of the instance (see SKILL.md), so the run directory is the one path outside it.
 function claim() {
   if (!Number.isInteger(port) || port === RESERVED_PORT) fail(`claim needs a port other than ${RESERVED_PORT}`);
   if (existsSync(instance) && (lstatSync(instance).isSymbolicLink() || readdirSync(instance).length)) {
@@ -607,7 +547,6 @@ function configure() {
   if (config.runDir !== receipt.runDir || !/^\/tmp\/iv-/.test(receipt.runDir) || lstatSync(receipt.runDir).isSymbolicLink()) {
     fail("refusing: runDir is not the run directory this claim created");
   }
-  // The init placeholder project is the only project allowed, and it must still be empty.
   if (!Array.isArray(config.projects) || config.projects.length !== 1) fail("refusing: the config has unexpected projects");
   const placeholder = join(instance, "workspace");
   if (config.projects[0].path !== placeholder || !insideInstance(realInstance, placeholder) || readdirSync(placeholder).length) {
@@ -623,13 +562,7 @@ function configure() {
   const project = join(instance, "project");
   mkdirSync(receipts, { mode: 0o700 });
   createProject(project, profile);
-  // The goal fixture holds its first plan until this file exists (the goal tests write it by hand to inspect a
-  // held cycle). A journey has nothing to inspect, so release the plan up front. The cancel check leaves it out.
   if (profile === "goals" && !process.env.VERIFY_HOLD_FIRST_PLAN) writeFileSync(join(receipts, "release-first-plan"), "continue", { mode: 0o600 });
-  // Teams run on the Rehearsal provider (`demo`), which the fixture replaces: team-agent.mjs with scenario
-  // "success" plans two file tasks without agent profiles, so it needs no lineup. A configured lineup would
-  // refuse those tasks. Goals need a lineup with a strong coordinator and reviewer, so they use the goal fixture
-  // ("cycles") behind the claude and codex providers. The goal fixture writes its plan brief on every plan.
   const next = profile === "teams"
     ? {
       ...config,
@@ -653,8 +586,6 @@ function configure() {
   }];
   writeFileSync(configFile, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
 
-  // Every agent must be a fixture. A config with any other command (for example a real provider CLI left by init)
-  // is refused here, so the launch stops before the API starts.
   const written = JSON.parse(readFileSync(configFile, "utf8"));
   const agentNames = Object.keys(written.agents ?? {});
   if (!agentNames.length) fail("refusing: no fixture agents were written");
@@ -671,7 +602,6 @@ function configure() {
 
 const TEAM_LABELS = { planning: "Planning", discovering: "Investigating", implementing: "Implementing", integrating: "Integrating", verifying: "Running checks", reviewing: "Reviewing", delivering: "Delivering", merged: "Merge reported", "needs-input": "Needs your input", paused: "Paused", blocked: "Blocked", "ready-for-review": "Ready for your review", "no-change": "No change proposed", cancelled: "Cancelled" };
 const GOAL_LABELS = { running: "Working", "needs-input": "Needs your input", paused: "Paused", blocked: "Blocked", "ready-for-review": "Ready for your review", "no-opportunity": "No opportunity found", "limit-reached": "Limit reached", cancelled: "Cancelled", achieved: "Outcome recorded: achieved" };
-// Labels that end a wait on the page. The journey then checks that the label is the expected end state.
 const TEAM_END = ["Ready for your review", "Merge reported", "No change proposed", "Cancelled", "Blocked", "Needs your input"];
 const GOAL_END = ["Ready for your review", "Limit reached", "No opportunity found", "Cancelled", "Outcome recorded: achieved", "Blocked", "Needs your input"];
 const TEAM_TITLE = "Verification team";
@@ -680,7 +610,6 @@ const GOAL_TITLE = "Verification goal";
 const GOAL_OBJECTIVE = "Advance the verification progress file by one step.";
 const GOAL_SUCCESS = "The progress file reaches the next step and the check passes.";
 
-// Polls a locator's text until it is one of the end labels or the timeout passes, and returns the last text.
 async function waitForEnd(locator, ends, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let text = "";
@@ -691,8 +620,6 @@ async function waitForEnd(locator, ends, timeoutMs) {
   }
 }
 
-// Shared shape for the teams and goals journeys: sign in as owner, run each step through `check`, record the
-// evidence, and write NAME.json and NAME.log. The page label and the API status are compared at the end state.
 async function runRunJourney(name, body) {
   mkdirSync(evidence, { recursive: true });
   const startedAt = new Date().toISOString();
@@ -739,8 +666,6 @@ async function runRunJourney(name, body) {
   process.exit(failed.length ? 1 : 0);
 }
 
-// Starts a team from the web client on the throwaway project, follows it to its end state, and checks that the
-// page and GET /api/teams and GET /api/teams/:id agree on the status.
 async function team() {
   await runRunJourney("team", async ({ check, page, record, api: call, pages }) => {
     let teamId, pageStatus = "";
@@ -764,7 +689,6 @@ async function team() {
       await page.locator("#team-objective").fill(TEAM_OBJECTIVE);
       await page.locator("#team-project").selectOption("verify-team");
       await page.getByRole("button", { name: "Start team", exact: true }).click();
-      // The page may stay on the form with "Team started." or open the team directly.
       const started = page.getByRole("status").filter({ hasText: "Team started." });
       await expect(started.or(page.getByRole("heading", { name: TEAM_TITLE, exact: true }))).toBeVisible({ timeout: 15000 });
     });
@@ -799,8 +723,6 @@ async function team() {
   });
 }
 
-// Creates a goal from the web client on the throwaway project, follows it to its end state, and checks that the
-// page and GET /api/goals agree on the status and the recorded objective and paths.
 async function goal() {
   await runRunJourney("goal", async ({ check, page, record, api: call }) => {
     let goalId, pageStatus = "";
@@ -837,7 +759,6 @@ async function goal() {
       }
     });
     await check("goal page opened", async () => {
-      // Starting a goal may open its page directly; otherwise open the row in the list.
       const opened = page.getByRole("heading", { name: GOAL_TITLE, exact: true });
       const row = page.locator(".team-run-row", { hasText: GOAL_TITLE }).locator("button").first();
       await expect(opened.or(row)).toBeVisible({ timeout: 15000 });
@@ -865,8 +786,6 @@ async function goal() {
       return `API ${detail.json.status} = page "${pageStatus}", ${record.cycles} cycle(s)`;
     });
     await check("exactly one reviewed cycle reached success", async () => {
-      // A goal reaches ready-for-review when its cycle limit is spent. The status alone does not prove that a cycle
-      // was reviewed, so the one cycle's team must itself be ready for review with an approved review.
       const detail = (await call(`/api/goals/${goalId}`)).json;
       if (detail.cycles?.length !== 1) throw new Error(`expected exactly one cycle, found ${detail.cycles?.length ?? 0}`);
       const cycle = detail.cycles[0];
@@ -880,8 +799,6 @@ async function goal() {
   });
 }
 
-// Stops only what this instance started: sessions through the owner API, then the session workers
-// and their descendants, then the API PID. Evidence is kept.
 async function cleanup() {
   mkdirSync(evidence, { recursive: true });
   const log = [];
@@ -889,10 +806,8 @@ async function cleanup() {
     log.push(line);
     console.log(line);
   };
-  // The API's identity is recorded once here and rechecked before each signal, like every other process.
   const apiEntry = processNow(serverPid);
   const apiUp = isThisInstance(apiEntry);
-  // Session workers are detached and outlive the API, so they are found and stopped even when the API is gone.
   const known = new Map(instanceProcesses().map((entry) => [entry.pid, entry]));
   if (apiUp) {
     const sessions = await api("/api/sessions").catch(() => ({ json: null }));
@@ -902,9 +817,6 @@ async function cleanup() {
         .catch((error) => ({ status: redact(error.message) }));
       note(`stop session ${session.id.slice(0, 8)} (${session.provider}): HTTP ${stop.status}${stop.status === 409 ? " (another device holds control; the worker is stopped by signal below)" : ""}`);
     }
-    // Goals first: a goal cancels the team runs of its cycles, and the team cancel route refuses goal-owned runs
-    // (HTTP 409). Standalone teams that a failed journey left running are cancelled through the owner API, as
-    // sessions are. A finished run gets no call, and cleanup logs that it found none.
     const goalRuns = (await api("/api/goals").catch(() => ({ json: null }))).json?.goals ?? [];
     const activeGoals = goalRuns.filter((goal) => !GOAL_TERMINAL.includes(goal.status));
     if (!activeGoals.length) note("active goals: none");

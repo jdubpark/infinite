@@ -2,14 +2,11 @@ import type { ActivityStore } from "./types";
 
 export const ACTIVITY_BUCKETS = 30;
 export const ACTIVITY_BUCKET_MS = 10_000;
-/** A bucket with this many advances draws full. */
 const FULL_BUCKET_ADVANCES = 5;
-/** An agent not recorded for this long is forgotten. */
 const FORGET_MS = 600_000;
 
 type Entry = { seen?: string; recordedAt: number; advances: Map<number, number> };
 
-/** Page-observed activity. Starts empty; nothing is fetched or stored beyond this object. */
 export function createActivity(): ActivityStore {
   const entries = new Map<string, Entry>();
   return {

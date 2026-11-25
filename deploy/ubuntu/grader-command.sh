@@ -1,13 +1,4 @@
 #!/bin/sh
-# Launcher for the grader account. The host reaches it only through sudo (deploy/ubuntu/grader.sudoers), and it
-# runs one operation as ACCOUNT under ROOT. The owner sets ROOT and ACCOUNT at install and changes nothing else.
-#
-# Operations: probe -- [CANARY...] | receive JOB NAME MAXBYTES | run JOB DIR SECONDS -- ARGV... | read JOB REPORT MAXBYTES
-#             | digest JOB | export JOB | stop | clean JOB | remove JOB
-# Exit codes: 0 done; 2 missing (read, digest, export: no task directory or no refs/heads/trial); 3 over the byte
-# limit (receive, read); 64 refused before a child starts; 124 the time limit of run and export; 125 a launcher
-# failure before a child starts. In run and export, once the child has started: its status when it is below 64,
-# 124 at the time limit, and 1 for any other status.
 set -eu
 ROOT=/var/lib/infinite-grader/root
 ACCOUNT=infinite-grader
@@ -22,11 +13,9 @@ umask 077
 refuse() { exit 64; }
 die() { exit 125; }
 
-# Exactly 8-4-4-4-12 lowercase hex digits.
 valid_job() {
   H='[0-9a-f]'
   G4="$H$H$H$H"
-  # The hex classes are a glob on purpose.
   # shellcheck disable=SC2254
   case "$1" in
     $G4$G4-$G4-$G4-$G4-$G4$G4$G4) return 0 ;;
@@ -55,8 +44,6 @@ valid_report() {
   return 1
 }
 
-# Digits only, at most 12 of them, so the arithmetic below cannot overflow. A leading zero is refused,
-# because sh arithmetic reads 010 as octal.
 valid_count() {
   case "$1" in
     ''|*[!0-9]*|0?*) return 1 ;;
@@ -77,14 +64,12 @@ tools_present() {
   return 0
 }
 
-# Creates one directory under the root with mode 0700. A link on the way is refused, and so is a non-directory.
 make_dir() {
   if [ -L "$1" ]; then refuse; fi
   if [ ! -e "$1" ]; then /bin/mkdir -m 700 -- "$1" || die; fi
   if [ ! -d "$1" ]; then refuse; fi
 }
 
-# The path must resolve inside the job directory. REAL_JOB is set by setup_job.
 confined() {
   real=$(/usr/bin/realpath -e -- "$1") || die
   case "$real" in
@@ -93,7 +78,6 @@ confined() {
   esac
 }
 
-# Creates the job's directories, one link check each, and sets JOBDIR and REAL_JOB.
 setup_job() {
   make_dir "$JOBS"
   JOBDIR=$JOBS/$1
@@ -135,7 +119,6 @@ op_probe() {
   fi
   printf '{"uid":%s,"root":"%s","rootMode":"%s","rootOwner":%s,"readable":[%s],"metadata":"%s","freeBytes":%s,"freeInodes":%s,"ancestorsWritable":%s,"tools":%s,"version":2}\n' \
     "$uid" "$ROOT" "$mode" "$owner" "$readable" "$meta" "$((avail * bsize))" "$inodes" "$ancestors" "$tools"
-  # The launcher's version. Version 1 had no version field; the host reads its absence as version 1.
 }
 
 op_receive() {
@@ -156,7 +139,6 @@ op_receive() {
   /usr/bin/mv -f -T -- "$tmp" "$dest"
 }
 
-# Runs ARGV with the given time limit, from the current directory, under the fixed environment. Sets status.
 run_child() {
   child_seconds=$1
   shift
@@ -170,8 +152,6 @@ run_child() {
     "$@" || status=$?
 }
 
-# Exits with the child's status as run and export report it. 137 is timeout's KILL after the limit. The host checks
-# the elapsed time before it reads 124 as a time limit.
 finish_child() {
   if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then exit 124; fi
   if [ "$status" -lt 64 ]; then exit "$status"; fi
@@ -199,8 +179,6 @@ op_run() {
   finish_child
 }
 
-# Streams a bundle of refs/heads/trial from the task clone to stdout, under the 600-second limit. A task clone without
-# the trial branch exits 2, from the child, before any bytes are written.
 op_export() {
   [ $# -eq 1 ] || refuse
   valid_job "$1" || refuse
@@ -226,7 +204,6 @@ op_read() {
   if [ ! -f "$file" ]; then exit 2; fi
   size=$(/usr/bin/stat -c %s -- "$file")
   if [ "$size" -gt "$3" ]; then exit 3; fi
-  # One byte past the limit, so a file that grew after the stat shows as too large to the host.
   /usr/bin/head -c "$(( $3 + 1 ))" -- "$file"
 }
 
@@ -241,7 +218,6 @@ op_digest() {
   printf '%s\n' "${hash%% *}"
 }
 
-# Ends every process of the account, then removes the account's files from the shared temporary directories.
 op_stop() {
   [ $# -eq 0 ] || refuse
   kill -KILL -1 2>/dev/null || true
@@ -252,7 +228,6 @@ op_stop() {
     if [ -d "$dir" ]; then
       /usr/bin/find "$dir" -xdev -type d -user "$uid" ! -perm -u=rwx -exec /usr/bin/chmod u+rwx -- {} \; 2>/dev/null || true
       /usr/bin/find "$dir" -xdev -mindepth 1 -user "$uid" -prune -exec /usr/bin/rm -rf -- {} + 2>/dev/null || true
-      # Judged by what remains. Another account's unreadable directory does not fail the stop.
       if [ -n "$(/usr/bin/find "$dir" -xdev -mindepth 1 -user "$uid" -print -quit 2>/dev/null)" ]; then
         status=1
       fi
@@ -261,15 +236,12 @@ op_stop() {
   exit "$status"
 }
 
-# Makes every directory of a tree owner-writable and searchable, so rm -rf can empty a tree a test left read-only.
-# find acts on a directory before it reads it, and the chmod runs at once (\;), so each level opens before find enters.
 open_tree() {
   if [ -d "$1" ] && [ ! -L "$1" ]; then
     /usr/bin/find "$1" -xdev -type d ! -perm -u=rwx -exec /usr/bin/chmod u+rwx -- {} \; 2>/dev/null || true
   fi
 }
 
-# Leaves exactly ROOT/jobs/JOB/in/base.bundle: every other entry of ROOT, of ROOT/jobs, of the job, and of its in.
 op_clean() {
   [ $# -eq 1 ] || refuse
   valid_job "$1" || refuse
@@ -289,7 +261,6 @@ op_remove() {
   /usr/bin/rm -rf -- "${JOBS:?}/$1"
 }
 
-# Checks that apply to every operation, before any of them runs.
 [ "$(/usr/bin/id -un)" = "$ACCOUNT" ] || refuse
 [ "$(/usr/bin/id -u)" -ne 0 ] || refuse
 [ -d "$ROOT" ] && [ ! -L "$ROOT" ] || refuse
@@ -298,8 +269,6 @@ op_remove() {
 if [ $# -eq 0 ]; then refuse; fi
 op=$1
 shift
-# No operation reads the caller's directory. Leave it: the caller may stand where this account cannot enter, and find
-# then fails when it returns there after -exec.
 cd / || die
 case "$op" in
   probe) op_probe "$@" ;;

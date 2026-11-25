@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-// Ratchet on source file length. A new file must stay at or under the limit. A file already over the limit
-// may not grow past its entry in scripts/file-size-baseline.json. Raising an entry is a hand edit in the same
-// change, so a reviewer sees it. `--update` only lowers or removes entries; it never raises or adds one.
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { extname, join } from "node:path";
@@ -19,7 +16,6 @@ function isSourcePath(path) {
   return !path.split("/").some((segment) => SKIPPED_SEGMENTS.has(segment));
 }
 
-// Same count as `wc -l`, plus one for a non-empty file whose last line has no newline.
 function countLines(bytes) {
   let lines = 0;
   for (let at = bytes.indexOf(0x0a); at !== -1; at = bytes.indexOf(0x0a, at + 1)) lines += 1;
@@ -68,7 +64,6 @@ for (const path of Object.keys(recorded).sort()) {
   if (lines > limit) next[path] = Math.min(was, lines);
 }
 
-// `next` is filled in sorted-key order, so its keys stay sorted in the written file.
 if (update) {
   writeFileSync(join(root, BASELINE), `${JSON.stringify({ limit, files: next }, null, 2)}\n`);
   console.log(`file-size baseline updated (${Object.keys(next).length} entries).`);

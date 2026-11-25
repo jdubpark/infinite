@@ -1,14 +1,4 @@
 #!/bin/sh
-# Launcher for the eval account, which runs the member of a replay trial. The host reaches it only through sudo
-# (deploy/ubuntu/eval.sudoers), and it runs one operation as ACCOUNT under ROOT. The owner sets ROOT, ACCOUNT,
-# EVAL_HOME, TEMPLATE, and EVAL_TMP at install and changes nothing else. EVAL_TMP is the eval wrapper's TMPDIR, and
-# the two must be equal.
-#
-# Operations: probe [--fetch URL] -- [CANARY...] | receive TRIAL MAXBYTES | prepare TRIAL
-#             | check TRIAL -- OBJECT... | exec -- ARGV... | setup -- ARGV... | stop | clean | scrub
-# Exit codes: 0 done; 1 check found an object or a remote; 3 over the byte limit (receive); 64 refused before a
-# child starts; 124 the time limit of exec or setup; 125 a launcher failure before a child starts. In exec and setup,
-# once the child has started, its status.
 set -eu
 ROOT=/var/lib/infinite-eval/root
 ACCOUNT=infinite-eval
@@ -16,8 +6,6 @@ EVAL_HOME=/var/lib/infinite-eval/home
 TEMPLATE=/usr/local/share/infinite-eval/home
 EVAL_TMP=/var/lib/infinite-eval/tmp
 LOGIN_PATHS=".claude/.credentials.json .codex/auth.json .local/share/opencode/auth.json"
-# The world-writable directories where the account can leave files. stop empties them of the account's files, and the
-# probe counts what remains. A directory that does not exist is skipped.
 STOP_DIRS="/tmp /var/tmp /dev/shm /dev/mqueue /run/lock /var/crash"
 TRIALS=$ROOT/trials
 TRIAL_DIR=
@@ -31,11 +19,9 @@ umask 077
 refuse() { exit 64; }
 die() { exit 125; }
 
-# Exactly 8-4-4-4-12 lowercase hex digits.
 valid_trial() {
   H='[0-9a-f]'
   G4="$H$H$H$H"
-  # The hex classes are a glob on purpose.
   # shellcheck disable=SC2254
   case "$1" in
     $G4$G4-$G4-$G4-$G4-$G4$G4$G4) return 0 ;;
@@ -43,7 +29,6 @@ valid_trial() {
   return 1
 }
 
-# A full commit or tree id: 40 or 64 lowercase hex digits.
 valid_object() {
   case "$1" in
     ''|*[!0-9a-f]*) return 1 ;;
@@ -51,8 +36,6 @@ valid_object() {
   [ "${#1}" -eq 40 ] || [ "${#1}" -eq 64 ]
 }
 
-# Digits only, at most 12 of them, so the arithmetic below cannot overflow. A leading zero is refused,
-# because sh arithmetic reads 010 as octal.
 valid_count() {
   case "$1" in
     ''|*[!0-9]*|0?*) return 1 ;;
@@ -71,14 +54,12 @@ tools_present() {
   return 0
 }
 
-# Creates one directory with the given mode. A link on the way is refused, and so is a non-directory.
 make_dir() {
   if [ -L "$2" ]; then refuse; fi
   if [ ! -e "$2" ]; then /bin/mkdir -m "$1" -- "$2" || die; fi
   if [ ! -d "$2" ]; then refuse; fi
 }
 
-# The path must resolve inside the trial directory. REAL_TRIAL is set by setup_trial.
 confined() {
   real=$(/usr/bin/realpath -e -- "$1") || die
   case "$real" in
@@ -87,8 +68,6 @@ confined() {
   esac
 }
 
-# Creates the trial's directories and sets TRIAL_DIR and REAL_TRIAL. ROOT/trials and the trial are 0711, so the
-# host can enter the work directory without listing it. in and tmp are 0700.
 setup_trial() {
   valid_trial "$1" || refuse
   make_dir 711 "$TRIALS"
@@ -101,7 +80,6 @@ setup_trial() {
   confined "$TRIAL_DIR/tmp"
 }
 
-# Sets CWD_TRIAL to the trial whose work directory, or a directory below it, is the current directory, or refuses.
 cwd_trial() {
   if [ -L "$TRIALS" ]; then refuse; fi
   real=$(/usr/bin/realpath -e -- .) || refuse
@@ -114,9 +92,6 @@ cwd_trial() {
   valid_trial "$CWD_TRIAL" || refuse
 }
 
-# Runs git with the fixed Git environment under a time limit of $1 seconds. $2 is a proxy URL or empty, and the rest is
-# the command. The proxy variables and the fixed environment come before timeout, so that timeout, which lives as
-# long as the command, holds no credential in its arguments. The caller's environment is never passed.
 git_run() {
   seconds=$1
   gitproxy=$2
@@ -131,15 +106,11 @@ git_run() {
     "$@"
 }
 
-# Runs a command as the trial's member. $1 is the trial, $2 the proxy URL or empty, and the rest is the command.
 run_trial() {
   trial=$1
   proxy=$2
   shift 2
-  # timeout and the command come last, so that timeout's arguments, which stay readable in /proc for the whole run,
-  # hold no variable. prlimit runs env, and env runs timeout.
   set -- /usr/bin/timeout --kill-after=10 3600 "$@"
-  # The host's egress set (egress.ts): the six proxy variables and NODE_USE_ENV_PROXY, which Node 22 needs to use them.
   if [ -n "$proxy" ]; then
     set -- HTTPS_PROXY="$proxy" HTTP_PROXY="$proxy" https_proxy="$proxy" http_proxy="$proxy" \
       NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1 NODE_USE_ENV_PROXY=1 "$@"
@@ -151,7 +122,6 @@ run_trial() {
       LANG=C.UTF-8 LC_ALL=C.UTF-8 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
       GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 \
     "$@" || status=$?
-  # 137 is timeout's KILL after the limit, which is the time limit too.
   if [ "$status" -eq 137 ]; then exit 124; fi
   exit "$status"
 }
@@ -214,7 +184,6 @@ op_probe() {
     "$((avail * bsize))" "$inodes" "$ancestors" "$tools" "$trials" "$leftovers" "$fetch"
 }
 
-# Counts the entries of a directory, or prints 0 when it is missing or a link.
 count_entries() {
   if [ -d "$1" ] && [ ! -L "$1" ]; then
     /usr/bin/find "$1" -mindepth 1 -maxdepth 1 -printf x | /usr/bin/wc -c
@@ -223,7 +192,6 @@ count_entries() {
   fi
 }
 
-# True when a path of EVAL_HOME is allowed: a login path, a directory on the way to one, or a template path.
 keep_path() {
   for login in $LOGIN_PATHS; do
     case "$login" in
@@ -233,8 +201,6 @@ keep_path() {
   [ -e "$TEMPLATE/$1" ] || [ -L "$TEMPLATE/$1" ]
 }
 
-# Counts the paths of EVAL_HOME that keep_path refuses, and the template files whose bytes differ from the home's.
-# Each reads at most 10000 paths, and the total is 10000 when there are more.
 count_leftovers() {
   count=0
   if [ -d "$EVAL_HOME" ] && [ ! -L "$EVAL_HOME" ]; then
@@ -265,8 +231,6 @@ EOF
   printf '%s' "$count"
 }
 
-# Counts the account's System V objects, and its files in STOP_DIRS, which stop empties. A listing that fails counts
-# as one, so that the probe never reads an unknown state as empty.
 count_account_state() {
   n=0
   uid=$(/usr/bin/id -u)
@@ -286,13 +250,10 @@ count_account_state() {
   printf '%s' "$n"
 }
 
-# Counts the entries of ROOT other than trials.
 count_root_others() {
   /usr/bin/find "$ROOT" -mindepth 1 -maxdepth 1 ! -name trials -printf x | /usr/bin/wc -c
 }
 
-# Counts what clear_obstructions removes: one per login path, at the first obstruction on its way. A link, or a
-# non-directory, on the way counts; a login that is a link or is not a regular file counts.
 count_obstructions() {
   n=0
   for login in $LOGIN_PATHS; do
@@ -314,8 +275,6 @@ count_obstructions() {
   printf '%s' "$n"
 }
 
-# Removes what stands on the way to a login path, top-down: a link or a non-directory above the login is removed,
-# and so is a login that is a link or is not a regular file. The login is then lost, which is intended (fail closed).
 clear_obstructions() {
   for login in $LOGIN_PATHS; do
     prefix=
@@ -404,12 +363,6 @@ op_setup() {
   run_trial "$CWD_TRIAL" "$proxy" "$@" </dev/null
 }
 
-# Prints the ids of the account's System V objects of one kind (m shared memory, s semaphores, q message queues), one
-# per line, digits only. It reads the kernel's own table, which gives the owner as a number: ipcs prints the owner as
-# a name cut to ten characters, which a longer account name never equals. An object counts as the account's when the
-# account owns it or created it: the creator can still remove an object whose owner it changed. Fails when the table
-# cannot be read, reaches 4 MiB, or has no uid or cuid column, so that a caller never reads a failed listing as
-# an empty one.
 ipc_ids() {
   ipc_uid=$(/usr/bin/id -u)
   case "$1" in
@@ -425,7 +378,6 @@ ipc_ids() {
   ipc_creator=0
   ipc_header=1
   while read -r ipc_line; do
-    # Word splitting is wanted here: the table's columns are separated by spaces. No pattern character can expand.
     set -f
     # shellcheck disable=SC2086
     set -- $ipc_line
@@ -456,8 +408,6 @@ $listing
 EOF
 }
 
-# Ends every process of the account, then removes the account's System V objects and its files from the shared
-# directories of STOP_DIRS. Fails when any of them remains, or when it cannot list the System V objects.
 op_stop() {
   [ $# -eq 0 ] || refuse
   kill -KILL -1 2>/dev/null || true
@@ -476,7 +426,6 @@ op_stop() {
     if [ -d "$dir" ]; then
       /usr/bin/find "$dir" -xdev -type d -user "$uid" ! -perm -u=rwx -exec /usr/bin/chmod u+rwx -- {} \; 2>/dev/null || true
       /usr/bin/find "$dir" -xdev -mindepth 1 -user "$uid" -prune -exec /usr/bin/rm -rf -- {} + 2>/dev/null || true
-      # Judged by what remains. Another account's unreadable directory does not fail the stop.
       if [ -n "$(/usr/bin/find "$dir" -xdev -mindepth 1 -user "$uid" -print -quit 2>/dev/null)" ]; then
         status=1
       fi
@@ -485,17 +434,12 @@ op_stop() {
   exit "$status"
 }
 
-# Makes every directory of a tree owner-writable and searchable, so rm -rf can empty a tree a trial left read-only.
-# find acts on a directory before it reads it, and the chmod runs at once (\;), so each level opens before find enters.
 open_tree() {
   if [ -d "$1" ] && [ ! -L "$1" ]; then
     /usr/bin/find "$1" -xdev -type d ! -perm -u=rwx -exec /usr/bin/chmod u+rwx -- {} \; 2>/dev/null || true
   fi
 }
 
-# Removes every entry of ROOT other than trials, every entry of ROOT/trials, and every entry of EVAL_TMP when it is a
-# directory and not a link. The whole pass runs under one 600-second limit, in a child shell that opens read-only
-# directories before it removes anything.
 # shellcheck disable=SC2016
 CLEAN_SCRIPT='
 set -e
@@ -515,8 +459,6 @@ done
 '
 op_clean() {
   [ $# -eq 0 ] || refuse
-  # The account owns ROOT, so a trial can swap trials for a link or a file. Only clean repairs that, and it never
-  # follows the link: rm removes the entry itself, and the directory is made again with the mode setup_trial uses.
   if [ -L "$TRIALS" ] || { [ -e "$TRIALS" ] && [ ! -d "$TRIALS" ]; }; then
     /usr/bin/rm -f -- "$TRIALS" || die
     make_dir 711 "$TRIALS"
@@ -524,8 +466,6 @@ op_clean() {
   /usr/bin/timeout 600 /bin/sh -c "$CLEAN_SCRIPT" clean "$ROOT" "$TRIALS" "$EVAL_TMP"
 }
 
-# Resets EVAL_HOME to TEMPLATE within 60 seconds: removes every path except the login files and the directories on
-# the way to them, then copies the template over the home. Nothing is removed unless the template is present.
 op_scrub() {
   [ $# -eq 0 ] || refuse
   if [ ! -d "$TEMPLATE" ] || [ -L "$TEMPLATE" ]; then die; fi
@@ -548,7 +488,6 @@ op_scrub() {
   /usr/bin/timeout 60 /usr/bin/cp -R -- "$TEMPLATE/." "$EVAL_HOME/"
 }
 
-# Checks that apply to every operation, before any of them runs.
 [ "$(/usr/bin/id -un)" = "$ACCOUNT" ] || refuse
 [ "$(/usr/bin/id -u)" -ne 0 ] || refuse
 [ -d "$ROOT" ] && [ ! -L "$ROOT" ] || refuse
@@ -561,8 +500,6 @@ case "$op" in
   probe|stop) ;;
   *) tools_present || die ;;
 esac
-# exec and setup name their trial by the caller's directory. Every other operation leaves it: the caller may stand
-# where this account cannot enter, and find then fails when it returns there after -exec.
 case "$op" in
   exec|setup) ;;
   *) cd / || die ;;

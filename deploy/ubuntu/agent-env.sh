@@ -1,5 +1,4 @@
 #!/bin/sh
-# Sourced by provider wrappers. Loading this file defines functions only.
 
 _infinite_env_warn() {
   printf 'infinite_load_env: skipping %s: %s\n' "$1" "$2" >&2
@@ -52,8 +51,6 @@ _infinite_env_load_file() {
       continue
     fi
 
-    # Denied: launcher-owned keys, host-owned egress variables even when egress
-    # is disabled, this loader's namespace, and shell names unsafe to assign.
     case $_infinite_env_key in
       PATH|HOME|SHELL|TMPDIR|LD_*|XDG_*|INFINITE_*|SUDO_*|OPENCODE_SERVER_*|OPENCODE_CONFIG_CONTENT|npm_config_prefix|provider|HTTPS_PROXY|HTTP_PROXY|https_proxy|http_proxy|NO_PROXY|no_proxy|NODE_USE_ENV_PROXY) continue ;;
       _*) continue ;;
@@ -62,20 +59,12 @@ _infinite_env_load_file() {
       SHELLOPTS|FUNCNAME|DIRSTACK|PIPESTATUS|REPLY|TMOUT|COMP_*|COMPREPLY|EXECIGNORE|GLOBIGNORE|IGNOREEOF|INPUTRC) continue ;;
       POSIXLY_CORRECT|PROMPT_COMMAND|PROMPT_DIRTRIM|HOSTNAME|HOSTTYPE|MACHTYPE|OSTYPE|OPTERR|EMACS|INSIDE_EMACS|CHILD_MAX) continue ;;
     esac
-    # Files are additive: a variable the host already injected (sudoers
-    # env_keep: session tokens, OpenCode credentials) is never overridden.
-    # The key matched ^[A-Za-z_][A-Za-z0-9_]*$ above, so this eval only
-    # tests whether that one name is set; earlier files in this load may
-    # still be layered over.
     if eval "[ -n \"\${$_infinite_env_key+x}\" ]"; then
       case $_infinite_env_file_set in
         *"$_infinite_env_nl$_infinite_env_key$_infinite_env_nl"*) ;;
         *) _infinite_env_warn "$_infinite_env_file" "$_infinite_env_key is set by the host"; continue ;;
       esac
     fi
-    # No deny list is complete across shells: a readonly or arithmetic name
-    # makes the assignment fatal under set -e. Probe it in a subshell first;
-    # a fatal assignment only kills the subshell, and the key is skipped.
     if ! ( export "$_infinite_env_key=$_infinite_env_value" ) 2>/dev/null; then
       _infinite_env_warn "$_infinite_env_file" "cannot export $_infinite_env_key"
       continue
@@ -91,8 +80,6 @@ infinite_load_env() {
   _infinite_env_project_id=$2
   _infinite_env_agent_uid=$(id -u)
   _infinite_env_nl=$(printf '\n_'); _infinite_env_nl=${_infinite_env_nl%_}
-  # Names exported by files during this load, newline-delimited, so that a
-  # later file may layer over an earlier one but never over the host.
   _infinite_env_file_set=$_infinite_env_nl
 
   for _infinite_env_file in "$_infinite_env_dir"/secrets/*.env; do

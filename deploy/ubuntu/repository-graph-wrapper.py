@@ -6,12 +6,10 @@ import os
 from pathlib import Path
 import re
 
-
 WORKSPACES = Path("/srv/infinite-data/workspaces")
 CACHE = Path("/srv/infinite-data/repository-graphs")
 BUILDER = "/opt/infinite/scripts/repository_graph.py"
 GRAPHIFY = "/usr/local/bin/graphify"
-
 
 def inside(value, root):
     path = Path(value)
@@ -20,15 +18,12 @@ def inside(value, root):
     resolved = path.resolve()
     if resolved == root or root not in resolved.parents:
         raise ValueError("The requested path is outside its assigned root.")
-    # The builder also checks its own files. Reject symlinks before crossing the
-    # fixed deployment boundary, including paths whose final directory is new.
     cursor = path
     while cursor != root and cursor != cursor.parent:
         if cursor.is_symlink():
             raise ValueError("Symlinked repository or cache paths are not supported.")
         cursor = cursor.parent
     return str(resolved)
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
@@ -51,15 +46,12 @@ def main():
     if args.seed_cache_dir:
         command.extend(["--seed-cache-dir", inside(args.seed_cache_dir, CACHE)])
     os.umask(0o077)
-    # No provider environment, network credentials, or inherited Graphify flags
-    # are needed by deterministic code extraction.
     env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8",
            "HOME": str(CACHE / "tool-home"), "TMPDIR": "/srv/infinite-data/tmp/agent",
            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
            "GIT_TERMINAL_PROMPT": "0"}
     os.chdir(str(CACHE))
     os.execve(command[0], command, env)
-
 
 if __name__ == "__main__":
     try:

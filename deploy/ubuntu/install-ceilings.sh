@@ -1,8 +1,4 @@
 #!/bin/sh
-# Install or check the provider ceilings: root-owned policy files that
-# Claude Code and Codex read and that agents cannot change.
-# Usage: sudo deploy/ubuntu/install-ceilings.sh [--check]
-# No network access. Changes nothing with --check.
 set -eu
 
 usage() {
@@ -34,7 +30,6 @@ sha256_of() {
   sha256sum "$1" | cut -d' ' -f1
 }
 
-# Validate every template before any file is touched.
 validate_json() {
   if ! python3 -I -c '
 import json, sys
@@ -62,8 +57,6 @@ with open(sys.argv[1], "rb") as handle:
 validate_json "$templates/managed-settings.json"
 validate_toml "$templates/requirements.toml"
 
-# safe_above DIR: every directory above DIR is a real directory that only root can write.
-# Whoever can write one of them can replace everything below it. Prints the first problem.
 safe_above() {
   above=$(dirname "$1")
   while :; do
@@ -80,7 +73,6 @@ safe_above() {
   done
 }
 
-# dir_problem DIR: succeeds when DIR is a real directory that only root can write. Prints the reason otherwise.
 dir_problem() {
   if [ -L "$1" ] || [ ! -d "$1" ]; then
     printf '%s is not a real directory' "$1"
@@ -93,7 +85,6 @@ dir_problem() {
   return 0
 }
 
-# process TEMPLATE TARGET: install TEMPLATE at TARGET, or report a difference.
 process() {
   template=$1
   target=$2
@@ -112,7 +103,6 @@ process() {
       differs=1
       return
     fi
-    # The directory is checked before the target is touched: a name inside an unsafe directory can be a planted link.
     if ! problem=$(dir_problem "$dir"); then
       printf 'differs: %s; target not read\n' "$problem"
       differs=1
@@ -141,8 +131,6 @@ process() {
     return
   fi
 
-  # The directory comes first. Until only root can write it, nothing in it can be trusted,
-  # and a name in it may be a link that another account planted.
   if [ -L "$dir" ] || { [ -e "$dir" ] && [ ! -d "$dir" ]; }; then
     printf '%s is not a real directory. Remove it and run this script again.\n' "$dir" >&2
     exit 1
@@ -164,19 +152,14 @@ process() {
     printf 'Unchanged %s\n' "$target"
   else
     if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then
-      # Never read through a link or a special file as root. The rename below replaces the entry itself.
       printf 'Replacing %s, which was not a regular file. No copy was kept.\n' "$target"
     elif [ -f "$target" ]; then
-      # A new file with an unpredictable name: an existing name here could be a planted link.
-      # It stays readable by root only: the file it copies may have been restricted.
       backup=$(mktemp "$target.before-ceilings-$stamp.XXXXXX")
       cat "$target" > "$backup"
       printf 'Kept previous copy at %s (root only)\n' "$backup"
     fi
-    # Write beside the target and rename, so a reader never sees a partial file.
     temporary=$(mktemp "$dir/.ceiling.XXXXXX")
     install -o root -g root -m 0644 "$template" "$temporary"
-    # -T: replace the entry itself, also when it is a link to a directory.
     mv -fT "$temporary" "$target"
     printf 'Installed %s (root:root 0644)\n' "$target"
   fi

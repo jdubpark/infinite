@@ -21,7 +21,7 @@ import { resumeFailed } from "./native-continuation.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError, holdsHostLoadReason } from "./host-load.js";
 import { applyFuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
-import { KeyedQueue, mapConcurrent } from "./keyed-queue.js";
+import { KeyedQueue, PendingCreates, mapConcurrent, pauseWithPendingCreates } from "./keyed-queue.js";
 import { HALT_PAUSED_TEAM, KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import { missionDecisionQueueCandidates } from "./decision-queue.js";
 import { projectMissionSource } from "./mission-progress.js";
@@ -123,6 +123,7 @@ export class MissionService {
   private readonly saved = new Map<string, string>();
   private readonly directory: string;
   private readonly queues = new KeyedQueue();
+  private readonly pendingCreates = new PendingCreates();
   private readonly activeTicks = new Set<Promise<unknown>>();
   private timer?: NodeJS.Timeout;
   private closed = false;
@@ -266,10 +267,33 @@ export class MissionService {
       throw new TeamError(409, "request-conflict", "This request ID belongs to a different mission.");
     return this.view(prior);
   }
+  private chosenCheckouts(group: ProjectGroup, requestedCheckouts?: readonly string[]) {
+    return group.repos.map(repo => {
+      const requested = repo.checkouts.find(checkout => requestedCheckouts?.includes(checkout.projectId));
+      const chosen = requested
+        ?? repo.checkouts.find(checkout => checkout.primary && checkout.teamReady)
+        ?? repo.checkouts.find(checkout => checkout.teamReady)
+        ?? repo.checkouts.find(checkout => checkout.primary)
+        ?? repo.checkouts[0];
+      return { repo, requested, chosen };
+    });
+  }
+  private pendingProjectIds(request: CreateMission): readonly string[] | undefined {
+    const existing = this.records.get(request.requestId);
+    if (existing) return existing.mission.repoProjectIds;
+    try {
+      const ids: string[] = [];
+      for (const { chosen } of this.chosenCheckouts(this.groups.get(request.groupId), request.checkouts)) {
+        if (!chosen) return undefined;
+        ids.push(chosen.projectId);
+      }
+      return ids;
+    } catch { return undefined; }
+  }
   create(input: CreateMission, originalInput?: CreateMission, origin?: MissionOrigin, authorize?: () => void) {
     const request = createMissionSchema.parse(input);
     const originalFingerprint = originalInput && digest(createMissionSchema.parse(originalInput));
-    return this.enqueue(request.requestId, () => {
+    return this.pendingCreates.track(request.requestId, () => this.pendingProjectIds(request), this.enqueue(request.requestId, () => {
       authorize?.();
       const replayed = this.replayCreate(request);
       if (replayed) return replayed;
@@ -280,13 +304,7 @@ export class MissionService {
       if (request.checkouts?.some(projectId => !checkoutIds.has(projectId)))
         throw new TeamError(400, "mission-checkout-invalid", "Choose checkouts that belong to this project.");
       const checkoutEvents: string[] = [];
-      const repos: MissionPromptRepo[] = group.repos.map(repo => {
-        const requested = repo.checkouts.find(checkout => request.checkouts?.includes(checkout.projectId));
-        const chosen = requested
-          ?? repo.checkouts.find(checkout => checkout.primary && checkout.teamReady)
-          ?? repo.checkouts.find(checkout => checkout.teamReady)
-          ?? repo.checkouts.find(checkout => checkout.primary)
-          ?? repo.checkouts[0];
+      const repos: MissionPromptRepo[] = this.chosenCheckouts(group, request.checkouts).map(({ repo, requested, chosen }) => {
         if (!chosen) throw new TeamError(409, "mission-repository-missing", `Repository ${repo.projectId} has no enrolled checkout on this host.`);
         const project = this.config.projects.find(item => item.id === chosen.projectId);
         if (!project) throw new TeamError(409, "mission-repository-missing", `Repository ${chosen.projectId} is no longer enrolled on this host.`);
@@ -319,7 +337,7 @@ export class MissionService {
       for (const text of checkoutEvents) this.event(stored, text);
       this.records.set(stored.mission.id, stored); this.save(stored);
       return this.view(stored);
-    });
+    }));
   }
   private missionFolder(id: string, repos: MissionPromptRepo[]) {
     const workspaceDir = this.config.teams!.workspaceDir;
@@ -411,9 +429,8 @@ export class MissionService {
       this.save(stored); return this.view(stored);
     });
   }
-  async haltPause(mark: HaltMark, covers: HaltCovers) {
-    const ids = [...this.records.keys()];
-    const outcomes = await Promise.all(ids.map(id => this.enqueue(id, () => {
+  haltPause(mark: HaltMark, covers: HaltCovers): Promise<HaltOutcome[]> {
+    const task: Promise<HaltOutcome[]> = pauseWithPendingCreates<HaltOutcome>(this.pendingCreates, this.records, covers, id => this.enqueue(id, () => {
       const stored = this.records.get(id);
       if (!stored) return undefined;
       const mission = stored.mission;
@@ -430,8 +447,9 @@ export class MissionService {
         this.event(stored, `Mission paused: ${mark.reason}`); this.save(stored);
         return { kind: "mission", id: mission.id, title: mission.title, result: "paused" } satisfies HaltOutcome;
       } catch (error) { return pauseFailure("mission", mission.id, mission.title, error); }
-    })));
-    return outcomes.filter((item): item is HaltOutcome => item !== undefined);
+    })).finally(() => { this.activeTicks.delete(task); });
+    this.activeTicks.add(task);
+    return task;
   }
   async haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean): Promise<HaltOutcome[]> {
     const ids = [...this.records.keys()];

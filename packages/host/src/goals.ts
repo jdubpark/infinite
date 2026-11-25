@@ -13,7 +13,7 @@ import type { LinearService } from "./linear.js";
 import type { LinearTrackingView } from "./linear-types.js";
 import { applyFuseReason } from "./fuse/rules.js";
 import type { FuseGate } from "./fuse/types.js";
-import { KeyedQueue, mapConcurrent } from "./keyed-queue.js";
+import { KeyedQueue, PendingCreates, mapConcurrent, pauseWithPendingCreates } from "./keyed-queue.js";
 import { readSignals } from "./signals/consume.js";
 import { addToPendingWake, type PendingWake, type SignalReader } from "./signals/types.js";
 import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, foldedCycles, isReviewed, keptCycles, latestReviewed, maxFailedCycles, maxPreviousWork, restoreWake, runObjectiveLimitBytes, unresolvedOperation, wakeObjective, retryableCreationFailure } from "./goal-standing.js";
@@ -72,6 +72,7 @@ export class GoalService {
   private readonly saved = new Map<string, string>();
   private readonly directory: string;
   private readonly queues = new KeyedQueue();
+  private readonly pendingCreates = new PendingCreates();
   private readonly activeTicks = new Set<Promise<unknown>>();
   private timer?: NodeJS.Timeout;
   private closed = false;
@@ -220,7 +221,7 @@ export class GoalService {
   create(input: CreateGoal, admit?: () => void, criteria?: CriterionInput[]) {
     const request = parseCreateGoal(input);
     const payload = criteria ? { ...request, criteria } : request;
-    return this.enqueue(request.requestId, () => {
+    return this.pendingCreates.track(request.requestId, [request.projectId], this.enqueue(request.requestId, () => {
       const fingerprint = digest(payload), prior = this.records.get(request.requestId);
       if (prior) {
         if (prior.fingerprint !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different goal.");
@@ -255,7 +256,7 @@ export class GoalService {
       this.records.set(requestId, stored); this.save(stored);
       stored.goal.linear = this.linear?.updateGoal(stored.goal, stored.goal.linearTracking === true); this.save(stored);
       return structuredClone(stored.goal);
-    });
+    }));
   }
   private replay(stored: Stored, action: string, body: { requestId: string }) {
     const prior = stored.receipts[body.requestId];
@@ -311,10 +312,9 @@ export class GoalService {
       this.save(stored); return structuredClone(goal);
     });
   }
-  async haltPause(mark: HaltMark, covers: HaltCovers) {
+  haltPause(mark: HaltMark, covers: HaltCovers): Promise<HaltOutcome[]> {
     const pausable = (goal: ProductGoal) => goal.status === "running" || goal.status === "needs-input";
-    const ids = [...this.records.keys()];
-    const outcomes = await Promise.all(ids.map(id => this.enqueue(id, async () => {
+    const task: Promise<HaltOutcome[]> = pauseWithPendingCreates<HaltOutcome>(this.pendingCreates, this.records, covers, id => this.enqueue(id, async () => {
       const stored = this.records.get(id);
       if (!stored) return undefined;
       const goal = stored.goal;
@@ -330,8 +330,9 @@ export class GoalService {
         this.event(stored, `Goal paused: ${mark.reason}`); this.save(stored);
         return { kind: "goal", id: goal.id, title: goal.title, result: "paused" } satisfies HaltOutcome;
       } catch (error) { return pauseFailure("goal", goal.id, goal.title, error); }
-    })));
-    return outcomes.filter((item): item is HaltOutcome => item !== undefined);
+    })).finally(() => { this.activeTicks.delete(task); });
+    this.activeTicks.add(task);
+    return task;
   }
   async haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean): Promise<HaltOutcome[]> {
     const ids = [...this.records.keys()];

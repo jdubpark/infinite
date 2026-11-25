@@ -9,6 +9,7 @@ import { GoalService } from "../packages/host/src/goals.js";
 import { RoutineService } from "../packages/host/src/routines.js";
 import { MissionService, type ProjectGroupLookup } from "../packages/host/src/missions.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
+import { HaltService } from "../packages/host/src/halt/service.js";
 import type { CreateGoal, ProductGoal } from "../packages/host/src/goal-types.js";
 import type { CreateRoutine } from "../packages/host/src/routine-types.js";
 import type { TeamLineup, TeamRun } from "../packages/host/src/team-types.js";
@@ -613,6 +614,260 @@ test("TeamService deletion purges entry ingest queue, blocks rateTask, and does 
     forgetGate.resolve();
     await teams.close();
     store.close();
+    f.close();
+  }
+});
+
+test("HaltService.engage pauses existing runs immediately, drains in-flight TeamService.create awaiting volumeUsage, and keeps it paused on keepPaused release", async () => {
+  const f = schedulerFixture();
+  f.writeTeam();
+  const existingId = f.run.id;
+  const entered = deferred();
+  const unblock = deferred();
+  f.config.projects[0]!.team = { checks: [{ name: "check", command: process.execPath, args: ["--version"] }] };
+  f.config.agents.demo = { command: process.execPath, args: [] };
+
+  const teams = f.openTeam({
+    volumeUsage: async path => {
+      entered.resolve();
+      await unblock.promise;
+      return { path, totalBytes: 1e12, availableBytes: 9e11, totalInodes: 1e8, availableInodes: 9e7 };
+    },
+  });
+  const halt = new HaltService({ config: f.config, key: f.key });
+  const empty = { haltPause: async () => [], haltResume: async () => [] };
+  const scope = { scope: "project" as const, projectId: "fixture" };
+  const owner = { deviceId: "fixture", label: "Owner" };
+  halt.useServices({ teams, routines: empty, goals: empty, missions: empty }, () => false);
+  const gate = halt.gate({
+    check: () => ({ state: "clear" }),
+    admit: launch => ({ ok: true, launchId: launch.launchId }),
+    release: () => {},
+    started: () => {},
+  });
+  teams.useFuse(gate);
+
+  const id = randomUUID();
+  try {
+    const created = teams.create({
+      requestId: id,
+      projectId: "fixture",
+      provider: "demo",
+      title: "Local review",
+      objective: "Run fixture smoke check",
+      parallelism: 1,
+    });
+    await Promise.race([entered.promise, created]);
+
+    const engaging = halt.engage(scope, { requestId: randomUUID() }, owner);
+    for (let i = 0; i < 40 && teams.get(existingId).status !== "paused"; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal(teams.get(existingId).status, "paused", "existing run pauses immediately without waiting for blocked volumeUsage()");
+    unblock.resolve();
+
+    await created;
+    const engaged = await engaging;
+    assert.equal(engaged.paused.length, 2);
+    assert.equal(teams.get(id).status, "paused");
+    assert.equal(gate.check({ projectId: "fixture" }).state, "halted");
+
+    await halt.release(scope, { requestId: randomUUID(), keepPaused: true }, owner);
+    assert.equal(teams.get(id).status, "paused");
+  } finally {
+    unblock.resolve();
+    halt.stop();
+    await teams.close();
+    await teams.idle();
+    f.close();
+  }
+});
+
+test("HaltService.engage drains held Goal, Routine, and Mission creates and close() awaits active haltPause", async () => {
+  const f = schedulerFixture();
+  f.config.teams = { ...f.config.teams, lineup };
+  f.config.agents.claude = { command: process.execPath, args: [] };
+  f.config.projects[0]!.team = { checks: [{ command: process.execPath, args: ["-e", "0"] }] };
+
+  const fakeTeams = {
+    goalIdOf: () => undefined,
+    get: () => { throw new TeamError(404, "team-not-found", "missing"); },
+    useGoalRecords() {},
+    useMissionReservations() {},
+    ensureMissionCapacityCeiling() { return undefined; },
+    isActiveRun() { return false; },
+    activeForProject() { return false; },
+  } as unknown as TeamService;
+
+  const goals = new GoalService(f.config, f.key, fakeTeams);
+  const routines = new RoutineService(f.config, f.key, goals, { isProjectBusy: async () => false, startGoal: async () => { throw new Error("unused"); } });
+  const at = new Date().toISOString();
+  const groups: ProjectGroupLookup = {
+    get: id => ({
+      id, name: id, kind: "owner", hidden: false, implicit: false, revision: 1, createdAt: at, updatedAt: at,
+      repos: [{ projectId: "fixture", name: "Fixture", path: f.workspace, checkouts: [{ projectId: "fixture", name: "Fixture", path: f.workspace, primary: true, teamReady: true }] }],
+    }),
+  };
+  const missions = new MissionService(f.config, f.key, f.manager, fakeTeams, groups);
+  const halt = new HaltService({ config: f.config, key: f.key });
+  const empty = { haltPause: async () => [], haltResume: async () => [] };
+  const owner = { deviceId: "fixture", label: "Owner" };
+  halt.useServices({ teams: empty, routines, goals, missions }, () => false);
+
+  const routineGate = deferred();
+  const goalGate = deferred();
+  const missionGate = deferred();
+  const routineEntered = deferred();
+  const goalEntered = deferred();
+  const missionEntered = deferred();
+
+  const origRoutinePause = routines.haltPause.bind(routines);
+  routines.haltPause = (mark, covers) => { const p = origRoutinePause(mark, covers); routineEntered.resolve(); return p; };
+  const origGoalPause = goals.haltPause.bind(goals);
+  goals.haltPause = (mark, covers) => { const p = origGoalPause(mark, covers); goalEntered.resolve(); return p; };
+  const origMissionPause = missions.haltPause.bind(missions);
+  missions.haltPause = (mark, covers) => { const p = origMissionPause(mark, covers); missionEntered.resolve(); return p; };
+
+  try {
+    const goalReqId = randomUUID();
+    const routineReqId = randomUUID();
+    const missionReqId = randomUUID();
+
+    void (routines as unknown as { queues: KeyedQueue }).queues.enqueue("admission", () => routineGate.promise);
+    void (goals as unknown as { queues: KeyedQueue }).queues.enqueue(goalReqId, () => goalGate.promise);
+    void (missions as unknown as { queues: KeyedQueue }).queues.enqueue(missionReqId, () => missionGate.promise);
+
+    const creatingRoutine = routines.create({
+      requestId: routineReqId,
+      goal: { projectId: "fixture", title: "Routine", objective: "Do routine", successCriteria: "Done", allowedPaths: ["src"], maxRuns: 1, maxMinutes: 10, maxMembers: 4 },
+      intervalMinutes: 5, maxOccurrences: 2,
+      startsAt: new Date(Date.now() + 5_000).toISOString(),
+      expiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+    });
+    const creatingGoal = goals.create({
+      requestId: goalReqId, projectId: "fixture", title: "Goal", objective: "Do goal",
+      successCriteria: "Done", nonGoals: [], allowedPaths: ["src"], evidence: ["Spec"],
+      maxRuns: 1, maxMinutes: 10, maxMembers: 4,
+    });
+    const creatingMission = missions.create({
+      requestId: missionReqId, groupId: "fixture", title: "Mission", objective: "Do mission", maxSubtasks: 2, maxMinutes: 30,
+    });
+
+    const engaging = halt.engage({ scope: "project", projectId: "fixture" }, { requestId: randomUUID() }, owner);
+    await routineEntered.promise;
+    routineGate.resolve();
+    await goalEntered.promise;
+    goalGate.resolve();
+    await missionEntered.promise;
+    let closeSettled = false;
+    const closingMissions = missions.close().then(() => { closeSettled = true; });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(closeSettled, false, "close() must wait for active haltPause()");
+    missionGate.resolve();
+
+    await closingMissions;
+    assert.equal(closeSettled, true);
+    assert.equal(missions.get(missionReqId).status, "paused", "close() must not settle before haltPause finishes pausing the mission");
+
+    const [, , , engaged] = await Promise.all([creatingGoal, creatingRoutine, creatingMission, engaging]);
+
+    assert.equal(engaged.paused.length, 3);
+    assert.equal(goals.get(goalReqId).status, "paused");
+    assert.equal(routines.get(routineReqId).status, "paused");
+    assert.equal(missions.get(missionReqId).status, "paused");
+  } finally {
+    routineGate.resolve();
+    goalGate.resolve();
+    missionGate.resolve();
+    halt.stop();
+    await Promise.all([goals.close(), routines.close(), missions.close()]);
+    f.close();
+  }
+});
+
+test("MissionService.pendingProjectIds covers default checkouts of un-overridden repos and PendingCreates isolates colliding requestIds", async () => {
+  const f = schedulerFixture();
+  const repoPath = f.config.projects[0]!.path;
+  f.config.teams = { ...f.config.teams, lineup };
+  f.config.agents.claude = { command: process.execPath, args: [] };
+  f.config.agents.demo = { command: process.execPath, args: [] };
+  f.config.projects = [
+    { id: "proj-a", name: "Proj A", path: repoPath, team: { checks: [{ command: process.execPath, args: ["-e", "0"] }] } },
+    { id: "proj-b", name: "Proj B", path: repoPath, team: { checks: [{ command: process.execPath, args: ["-e", "0"] }] } },
+  ];
+
+  const fakeTeams = {
+    useMissionReservations() {},
+    ensureMissionCapacityCeiling() { return undefined; },
+    isActiveRun() { return false; },
+    activeForProject() { return false; },
+  } as unknown as TeamService;
+  const at = new Date().toISOString();
+  const groups: ProjectGroupLookup = {
+    get: id => ({
+      id, name: id, kind: "owner", hidden: false, implicit: false, revision: 1, createdAt: at, updatedAt: at,
+      repos: [
+        { projectId: "proj-a", name: "Repo A", path: repoPath, checkouts: [{ projectId: "proj-a", name: "Proj A", path: repoPath, primary: true, teamReady: true }] },
+        { projectId: "proj-b", name: "Repo B", path: repoPath, checkouts: [{ projectId: "proj-b", name: "Proj B", path: repoPath, primary: true, teamReady: true }] },
+      ],
+    }),
+  };
+  const missions = new MissionService(f.config, f.key, f.manager, fakeTeams, groups);
+  const unblockA = deferred();
+  const enteredA = deferred();
+  const teams = f.openTeam({
+    volumeUsage: async path => {
+      enteredA.resolve();
+      await unblockA.promise;
+      return { path, totalBytes: 1e12, availableBytes: 9e11, totalInodes: 1e8, availableInodes: 9e7 };
+    },
+  });
+  const halt = new HaltService({ config: f.config, key: f.key });
+  const empty = { haltPause: async () => [], haltResume: async () => [] };
+  const owner = { deviceId: "fixture", label: "Owner" };
+  halt.useServices({ teams, routines: empty, goals: empty, missions }, () => false);
+
+  const missionGate = deferred();
+  const missionEntered = deferred();
+  const origMissionPause = missions.haltPause.bind(missions);
+  missions.haltPause = (mark, covers) => { const p = origMissionPause(mark, covers); missionEntered.resolve(); return p; };
+
+  try {
+    const missionId = randomUUID();
+    void (missions as unknown as { queues: KeyedQueue }).queues.enqueue(missionId, () => missionGate.promise);
+    const creatingMission = missions.create({
+      requestId: missionId, groupId: "two-repo", checkouts: ["proj-a"], title: "Two repo", objective: "Work", maxSubtasks: 2, maxMinutes: 30,
+    });
+
+    const haltB = halt.engage({ scope: "project", projectId: "proj-b" }, { requestId: randomUUID() }, owner);
+    await missionEntered.promise;
+    missionGate.resolve();
+    const [missionView, engagedB] = await Promise.all([creatingMission, haltB]);
+    assert.equal(missionView.id, missionId);
+    assert.equal(engagedB.paused.length, 1);
+    assert.equal(missions.get(missionId).status, "paused");
+
+    const sharedId = randomUUID();
+    const createA = teams.create({ requestId: sharedId, projectId: "proj-a", provider: "demo", title: "Run A", objective: "Work A", parallelism: 1 });
+    await Promise.race([enteredA.promise, createA]);
+    const createB = teams.create({ requestId: sharedId, projectId: "proj-b", provider: "demo", title: "Run B", objective: "Work B", parallelism: 1 });
+    void createB.catch(() => {});
+
+    const haltA = halt.engage({ scope: "project", projectId: "proj-a" }, { requestId: randomUUID() }, owner);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    unblockA.resolve();
+
+    await createA;
+    await assert.rejects(createB, { code: "request-conflict" });
+    const engagedA = await haltA;
+    assert.equal(engagedA.paused.length, 1);
+    assert.equal(teams.get(sharedId).status, "paused");
+  } finally {
+    missionGate.resolve();
+    unblockA.resolve();
+    halt.stop();
+    await Promise.all([missions.close(), teams.close()]);
+    await teams.idle();
     f.close();
   }
 });

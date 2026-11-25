@@ -9,7 +9,7 @@ import { createRoutineSchema, routineActionSchema, type CreateRoutine, type Rout
 import type { GoalService } from "./goals.js";
 import { applyFuseReason } from "./fuse/rules.js";
 import type { FuseGate } from "./fuse/types.js";
-import { KeyedQueue, mapConcurrent } from "./keyed-queue.js";
+import { KeyedQueue, PendingCreates, mapConcurrent, pauseWithPendingCreates } from "./keyed-queue.js";
 import { readSignals } from "./signals/consume.js";
 import { addToPendingWake, type SignalReader } from "./signals/types.js";
 import { KEPT_PAUSED, LEFT_AS_IS, STILL_HALTED, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
@@ -56,6 +56,7 @@ export class RoutineService {
   private readonly saved = new Map<string, string>();
   private readonly directory: string;
   private readonly queues = new KeyedQueue();
+  private readonly pendingCreates = new PendingCreates();
   private readonly activeTicks = new Set<Promise<unknown>>();
   private timer?: NodeJS.Timeout;
   private closed = false;
@@ -118,7 +119,7 @@ export class RoutineService {
   useSignals(reader: SignalReader, runsOfGoals: RunsOfGoals) { this.signals = { reader, runsOfGoals }; }
   create(input: CreateRoutine): Promise<Routine> {
     const request = createRoutineSchema.parse(input);
-    return this.queues.enqueue("admission", () => {
+    return this.pendingCreates.track(request.requestId, [request.goal.projectId], this.queues.enqueue("admission", () => {
       const fingerprint = digest(request), prior = this.records.get(request.requestId);
       if (prior) {
         if (prior.fingerprint !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different routine.");
@@ -148,7 +149,7 @@ export class RoutineService {
       const stored: Stored = { routine, fingerprint, authority: this.authority(project), receipts: {} };
       this.records.set(routine.id, stored); this.save(stored);
       return this.view(stored);
-    });
+    }));
   }
   private replay(stored: Stored, action: string, body: RoutineAction) {
     const prior = stored.receipts[body.requestId];
@@ -184,9 +185,8 @@ export class RoutineService {
     const routine = stored.routine;
     routine.status = routine.occurrences.length ? "running" : "scheduled"; routine.reason = undefined; if (stored.launch) stored.launch.attempted = false;
   }
-  async haltPause(mark: HaltMark, covers: HaltCovers) {
-    const ids = [...this.records.keys()];
-    const outcomes = await Promise.all(ids.map(id => this.enqueue(id, () => {
+  haltPause(mark: HaltMark, covers: HaltCovers): Promise<HaltOutcome[]> {
+    const task: Promise<HaltOutcome[]> = pauseWithPendingCreates<HaltOutcome>(this.pendingCreates, this.records, covers, id => this.enqueue(id, () => {
       const stored = this.records.get(id);
       if (!stored) return undefined;
       const routine = stored.routine, title = routine.goal.title;
@@ -197,8 +197,9 @@ export class RoutineService {
         this.save(stored);
         return { kind: "routine", id: routine.id, title, result: "paused" } satisfies HaltOutcome;
       } catch (error) { return pauseFailure("routine", routine.id, title, error); }
-    })));
-    return outcomes.filter((item): item is HaltOutcome => item !== undefined);
+    })).finally(() => { this.activeTicks.delete(task); });
+    this.activeTicks.add(task);
+    return task;
   }
   async haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean): Promise<HaltOutcome[]> {
     const ids = [...this.records.keys()];

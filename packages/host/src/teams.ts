@@ -24,7 +24,7 @@ import { combineCoverage, type UsageService } from "./usage-service.js";
 import { type EvidenceStore, eventProblem } from "./evidence/store.js";
 import { applyFuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
-import { KeyedQueue, mapConcurrent } from "./keyed-queue.js";
+import { KeyedQueue, PendingCreates, mapConcurrent, pauseWithPendingCreates } from "./keyed-queue.js";
 import type { CaptureSink } from "./eval-types.js";
 import { captureStart } from "./eval-rules.js";
 import { HALT_PAUSED_TEAM, KEPT_PAUSED, LEFT_AS_IS, STILL_HALTED, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
@@ -258,6 +258,7 @@ export class TeamService {
   private readonly records = new Map<string, Stored>();
   private readonly retiredRunIds = new Set<string>();
   private readonly queues = new KeyedQueue();
+  private readonly pendingCreates = new PendingCreates();
   private readonly activeTicks = new Set<Promise<unknown>>();
   private timer?: NodeJS.Timeout;
   private running = false;
@@ -979,7 +980,7 @@ export class TeamService {
     return this.createRun(parsed, { handoff, handoffPolicy: policy, lineup: policy.lineup }, Boolean(policy.linear));
   }
   private createRun(parsed: CreateTeam, internal?: { goal?: TeamGoalContext; missionId?: string; requestSource?: ConnectorSource; parallelismCeiling?: number; baseRunId?: string; handoff?: TeamHandoffContext; handoffPolicy?: HandoffPolicy; lineup: TeamLineup; autonomy?: AutonomyMode }, linearTracking = false): Promise<TeamView> {
-    return this.enqueue(parsed.requestId, () => {
+    return this.pendingCreates.track(parsed.requestId, [parsed.projectId], this.enqueue(parsed.requestId, () => {
       const { useConfiguredLineup, ...singleProviderRequest } = parsed;
       const { parallelismCeiling: _ceiling, autonomy: _autonomy, ...creationContext } = internal ?? {};
       const prior = this.records.get(parsed.requestId), fingerprint = digest(internal ? { request: parsed, ...creationContext } : useConfiguredLineup ? parsed : singleProviderRequest);
@@ -1151,7 +1152,7 @@ export class TeamService {
         });
         return this.view(stored);
       });
-    });
+    }));
   }
   private replay(stored: Stored, operation: string, body: Action | Mutation | TeamContinue | TeamParallelism | VerificationMutation) {
     const prior = stored.receipts[body.requestId];
@@ -1525,9 +1526,8 @@ export class TeamService {
     this.event(stored, inPlace ? "Team resumed where it waited for input: the owner released the halt." : "Team resumed with a fresh plan: the owner released the halt.");
     this.save(stored);
   }
-  async haltPause(mark: HaltMark, covers: HaltCovers) {
-    const ids = [...this.records.keys()];
-    const outcomes = await Promise.all(ids.map(id => this.enqueue(id, async () => {
+  haltPause(mark: HaltMark, covers: HaltCovers): Promise<HaltOutcome[]> {
+    const task: Promise<HaltOutcome[]> = pauseWithPendingCreates<HaltOutcome>(this.pendingCreates, this.records, covers, id => this.enqueue(id, async () => {
       const stored = this.records.get(id);
       if (!stored) return undefined;
       const run = stored.run;
@@ -1536,8 +1536,9 @@ export class TeamService {
         await this.haltStop(stored, { haltId: mark.haltId, reason: mark.reason });
         return { kind: "team", id: run.id, title: run.title, result: "paused" } satisfies HaltOutcome;
       } catch (error) { return pauseFailure("team", run.id, run.title, error); }
-    })));
-    return outcomes.filter((item): item is HaltOutcome => item !== undefined);
+    })).finally(() => { this.activeTicks.delete(task); });
+    this.activeTicks.add(task);
+    return task;
   }
   async haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean): Promise<HaltOutcome[]> {
     const ids = [...this.records.keys()];

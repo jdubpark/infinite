@@ -480,6 +480,7 @@
     "packages/host/src/team-verdicts.ts": 94,
     "packages/host/src/team-watch.ts": 22,
     "packages/host/src/team-workspace.ts": 65,
+    "packages/host/src/teams.ts": 1,
     "packages/host/src/terminal-snapshot.ts": 12,
     "packages/host/src/terminal-stream.ts": 8,
     "packages/host/src/tool-signature.ts": 12,

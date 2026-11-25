@@ -245,8 +245,15 @@ export class TrialPump {
 
   private async advance(): Promise<void> {
     if (!this.ready()) return;
-    if (!this.started && !(await this.startup())) return;
-    if (this.live !== undefined) return this.advanceLive(this.live);
+    if (!this.started && !(await this.startup())) {
+      this.options.judgements?.hold("start-up");
+      return;
+    }
+    if (this.live !== undefined) {
+      // A live trial holds the eval account and no judgement is asked for meanwhile, so the calibration's view names it.
+      if (this.live.kind === "trial") this.options.judgements?.hold("another-job");
+      return this.advanceLive(this.live);
+    }
     const open = this.openJob();
     const judging = this.judging();
     if (open === undefined && !judging) return;
@@ -524,7 +531,10 @@ export class TrialPump {
     const next = await judgements.next(this.gates(gate, grader));
     if (next.kind !== "start") return false;
     const identity = await this.identityProbe(grader.uid, next.projectId);
-    if (identity.state !== "ready") return false;
+    if (identity.state !== "ready") {
+      judgements.hold("eval-identity");
+      return false;
+    }
     await this.beginJudgement(next, identity, grader);
     return true;
   }
@@ -544,10 +554,16 @@ export class TrialPump {
       const found = trialSettings(project);
       // The context's job names the grader's job directory and its bundle, never the calibration.
       const graderJob = graderJobOf(start.calibrationId, start.projectId);
-      const ctx = "settings" in found ? this.contextOf({ projectId: start.projectId, jobId: graderJob }, found.settings, id, identity, grader) : undefined;
-      if (ctx === undefined) {
+      // A project that is gone or has incomplete eval settings is no outage: the attempt ends at once.
+      if (!("settings" in found)) {
         this.cooldown = 1;
         return judgements.finish(id, { ending: "void-host", sessionId: null });
+      }
+      const ctx = this.contextOf({ projectId: start.projectId, jobId: graderJob }, found.settings, id, identity, grader);
+      // A host failure before any judge session uses no attempt: the row goes and the same slot starts again.
+      if (ctx === undefined) {
+        this.cooldown = 1;
+        return judgements.release(id, "mirror");
       }
       const source = await (this.options.prepareSource ?? prepareTrialSource)(this.options.store, start.taskId, ctx);
       if (source.kind === "skip") return dropped("source-skipped");
@@ -557,7 +573,7 @@ export class TrialPump {
           this.dirty = true;
           this.started = false;
         }
-        return judgements.finish(id, { ending: "void-host", sessionId: null });
+        return judgements.release(id, source.cause === "halted" ? "halt" : source.cause);
       }
       // From here the account holds the source, so every way out cleans it.
       const files = source.isolation === "isolated" ? judgePackage({

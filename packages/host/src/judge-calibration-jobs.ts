@@ -11,13 +11,13 @@ import { canonicalJson } from "./evidence/crypto.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb, EvidenceTx } from "./evidence/types.js";
 import {
-  CALIBRATION_DEFAULT_PAIRS, CALIBRATION_MAX_PAIRS, CALIBRATION_MIN_PAIRS, CALIBRATION_RETRIES, calibrationSummary, type OrderingResult,
+  CALIBRATION_DEFAULT_PAIRS, CALIBRATION_MAX_PAIRS, CALIBRATION_MIN_PAIRS, CALIBRATION_RELEASES, CALIBRATION_RETRIES, calibrationSummary, type OrderingResult,
 } from "./judge-calibration-rules.js";
 import { labelDraw } from "./judge-package.js";
 import {
   activeCalibration, calibrationJudgements, calibrationViews, dropJudgement, finishCalibration, finishJudgement, insertCalibration,
-  insertJudgement, liveJudgements, readCalibration, startJudgement, sweepJudge, type CalibrationEnd, type CalibrationPairRef, type CalibrationRow,
-  type CalibrationView, type JudgementRow,
+  insertJudgement, liveJudgements, readCalibration, releaseJudgement, startJudgement, sweepJudge, type CalibrationEnd, type CalibrationPairRef, type CalibrationRow,
+  type CalibrationView, type CalibrationWait, type JudgementRow,
 } from "./judge-store.js";
 import { JUDGE_VOID_ENDINGS, type Judgement, type JudgeEnding } from "./judge-types.js";
 import type { TeamModelProfile } from "./team-types.js";
@@ -45,7 +45,7 @@ export type CalibrationRequest = z.infer<typeof calibrationRequestSchema>;
 export type CalibrationRefusal = { status: 400 | 404 | 409; code: "invalid-calibration-request" | "judge-not-configured"
   | "judge-profile-mismatch" | "judge-launch-missing" | "calibration-active" | "request-conflict" | "eval-config-incomplete"
   | "too-few-pairs" | "unknown-calibration" };
-export type NextJudgement = { kind: "idle" } | { kind: "wait"; reason: string } | { kind: "start"; calibrationId: string;
+export type NextJudgement = { kind: "idle" } | { kind: "wait"; reason: CalibrationWait } | { kind: "start"; calibrationId: string;
   judgementId: string; projectId: string; taskId: string; pairIndex: number; ordering: 0 | 1; attempt: number; resolvedIsA: boolean;
   resolvedTrialId: string; unresolvedTrialId: string; judgeMinutes: number; profile: TeamModelProfile };
 export type JudgementOutcome = { ending: JudgeEnding; judgement?: Judgement; sessionId: string | null }
@@ -122,6 +122,10 @@ export class JudgeCalibrations {
   private readonly store: EvidenceStore;
   private readonly config: Pick<Config, "projects" | "eval" | "teams">;
   private readonly now: () => string;
+  /** The gate that held the last start, in memory only: empty after a restart until the next step. */
+  private waiting: CalibrationWait | null = null;
+  /** The judgement that failed last before any session, and how many times in a row. */
+  private released = { id: "", count: 0 };
 
   constructor(options: Options) {
     this.store = options.store;
@@ -161,6 +165,8 @@ export class JudgeCalibrations {
       return undefined;
     });
     if (wrote !== undefined) return "replay" in wrote ? this.viewOrRefusal(wrote.replay) : wrote;
+    // A reason found before this calibration existed is not its reason.
+    this.waiting = null;
     return this.viewOrRefusal(calibrationId);
   }
 
@@ -179,7 +185,7 @@ export class JudgeCalibrations {
     return this.store.read(db => calibrationViews(db, at, judgeKey => {
       if (judge === undefined || profileIdentityKey(trialProfileKey(judge)) !== judgeKey) return undefined;
       return { epoch: epochAt(db, judgeKey, at), promptVersion: judgePromptVersion(judge.provider) };
-    }));
+    })).map(view => view.status === "running" ? { ...view, waiting: this.waiting } : view);
   }
 
   /**
@@ -190,10 +196,42 @@ export class JudgeCalibrations {
   async next(gates: TrialGates): Promise<NextJudgement> {
     const at = this.now();
     const pass = this.store.write(tx => this.step(tx, gates, at));
-    if (pass.kind !== "slots") return pass;
+    if (pass.kind !== "slots") {
+      this.waiting = pass.kind === "wait" ? pass.reason : null;
+      return pass;
+    }
     const free = await gates.freeSlots();
-    if (free < TRIAL_SLOTS_FREE_MIN) return { kind: "wait", reason: "session-slots" };
+    if (free < TRIAL_SLOTS_FREE_MIN) {
+      this.waiting = "session-slots";
+      return { kind: "wait", reason: "session-slots" };
+    }
+    this.waiting = null;
     return pass.start;
+  }
+
+  /** Remembers a gate the pump found after `next` answered `start`. */
+  hold(reason: CalibrationWait): void {
+    this.waiting = reason;
+  }
+
+  /**
+   * Takes back a start that failed before any judge session: the row goes, the ordering keeps its attempt, and the reason
+   * is remembered when the row's calibration is still the running one. The CALIBRATION_RELEASES-th failure in a row of
+   * one judgement ends its attempt `void-host` instead, so a cause that belongs to one pair cannot hold the calibration.
+   */
+  release(judgementId: string, reason: CalibrationWait): void {
+    const count = this.released.id === judgementId ? this.released.count + 1 : 1;
+    const last = count >= CALIBRATION_RELEASES;
+    const running = this.store.write(tx => {
+      const row = tx.get<{ calibration_id: string }>("SELECT calibration_id FROM judge_judgements WHERE judgement_id = ? AND state = 'preparing'", judgementId);
+      if (row === undefined) return undefined;
+      if (!last) releaseJudgement(tx, judgementId);
+      return activeCalibration(tx)?.calibrationId === row.calibration_id;
+    });
+    if (running === undefined) return;
+    this.released = last ? { id: "", count: 0 } : { id: judgementId, count };
+    if (last) this.finish(judgementId, { ending: "void-host", sessionId: null });
+    if (running) this.waiting = reason;
   }
 
   begin(start: Start): "inserted" | "exists" {
@@ -361,7 +399,7 @@ export class JudgeCalibrations {
   }
 
   /** The gates of Ruling 18 that depend on the host, in order. Undefined when every one holds. */
-  private waitReason(db: EvidenceDb, gates: TrialGates, judge: TeamModelProfile, projectId: string, rows: readonly JudgementRow[]): string | undefined {
+  private waitReason(db: EvidenceDb, gates: TrialGates, judge: TeamModelProfile, projectId: string, rows: readonly JudgementRow[]): CalibrationWait | undefined {
     if (gates.halted(projectId)) return "halt";
     if (gates.hostLoadHeld) return "host-load";
     if (gates.identity.state !== "ready" || this.config.eval?.member?.agents?.[judge.provider] === undefined) return "eval-identity";

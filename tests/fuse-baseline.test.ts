@@ -24,7 +24,10 @@ function launch(launchId: string, projectId: string, admittedAt: number, state: 
   return { launchId, projectId, purpose: "work", role: "implementer", profileId: "p", state, admittedAt, seq };
 }
 
-function trip(overrides: Partial<FuseTripRecord> & Pick<FuseTripRecord, "tripId" | "scope" | "cause" | "openedAt">): FuseTripRecord {
+type TripOverrides = ({ scope: "host"; projectId?: never } | { scope: "project"; projectId: string }) &
+  ({ closedAt?: never; closedBy?: never } | { closedAt: number; closedBy: "rate" | "owner" | "baseline" }) &
+  { tripId: string; cause: FuseTripRecord["cause"]; window?: FuseTripRecord["window"]; openedAt: number; ownerClose?: boolean; announcedAt?: number; launches?: number; seq?: number };
+function trip(overrides: TripOverrides): FuseTripRecord {
   return { ownerClose: false, seq: 1, ...overrides };
 }
 

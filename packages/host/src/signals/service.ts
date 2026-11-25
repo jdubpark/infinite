@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { EvidenceStore } from "../evidence/store.js";
 import type { EvidenceDb, EvidenceModule, EvidenceTx } from "../evidence/types.js";
 import type { AppliedScan } from "../outcome-scan.js";
-import { type ProjectSignal, type SignalKind, type SignalReader, signalKinds } from "./types.js";
+import { type CommitSignalKind, type ProjectSignal, type SignalKind, type SignalReader, signalKinds } from "./types.js";
 
 export const SIGNALS_MODULE = "signals";
 export const SIGNAL_RETENTION_DAYS = 30;
@@ -75,7 +75,9 @@ const SIGNALS_EVIDENCE_MODULE: EvidenceModule = {
 };
 
 /** The sealed part of a row. The project and kind are sealed too, so a row moved to another project does not open. */
-type Sealed = { projectId: string; kind: SignalKind; key: string; runId?: string; commit?: string; text?: string };
+type Sealed =
+  | { projectId: string; kind: "owner"; key: string; text: string }
+  | { projectId: string; kind: CommitSignalKind; key: string; runId?: string; commit?: string };
 type Row = { seq: number; signal_id: string; kind: string; at: string; sealed: string };
 
 export type SignalInput = { projectId: string; kind: SignalKind; key: string; runId?: string; commit?: string; text?: string };
@@ -280,21 +282,22 @@ export function outsideCommit(scan: Pick<AppliedScan, "continuous" | "commits" |
 function checkInput(input: SignalInput): Sealed | undefined {
   if (!input || typeof input !== "object") return undefined;
   const { projectId, kind, key, runId, commit, text } = input;
-  const valid = typeof projectId === "string" && PROJECT_ID.test(projectId)
+  const baseValid = typeof projectId === "string" && PROJECT_ID.test(projectId)
     && typeof kind === "string" && KINDS.has(kind)
-    && typeof key === "string" && key.length <= MAX_SIGNAL_KEY_LENGTH && KEY.test(key)
-    && (runId === undefined || (typeof runId === "string" && RUN_ID.test(runId)))
-    && (commit === undefined || (typeof commit === "string" && COMMIT.test(commit)))
-    // Text comes from the owner only, so only the owner kind carries it, and it always does.
-    && (kind === "owner"
-      ? typeof text === "string" && text.trim().length > 0 && text.length <= MAX_SIGNAL_TEXT_LENGTH
-      : text === undefined);
-  if (!valid) return undefined;
+    && typeof key === "string" && key.length <= MAX_SIGNAL_KEY_LENGTH && KEY.test(key);
+  if (!baseValid) return undefined;
+  if (kind === "owner") {
+    if (runId !== undefined || commit !== undefined) return undefined;
+    if (typeof text !== "string" || text.trim().length === 0 || text.length > MAX_SIGNAL_TEXT_LENGTH) return undefined;
+    return { projectId, kind: "owner", key, text };
+  }
+  if (text !== undefined) return undefined;
+  if (runId !== undefined && (typeof runId !== "string" || !RUN_ID.test(runId))) return undefined;
+  if (commit !== undefined && (typeof commit !== "string" || !COMMIT.test(commit))) return undefined;
   return {
     projectId, kind, key,
     ...(runId === undefined ? {} : { runId }),
     ...(commit === undefined ? {} : { commit }),
-    ...(text === undefined ? {} : { text }),
   };
 }
 
@@ -356,6 +359,7 @@ function openSignal(db: EvidenceDb, row: Row, projectId: string): ProjectSignal 
   try {
     const sealed = db.open<Sealed>(TABLE, row.signal_id, row.sealed);
     if (sealed.projectId !== projectId || sealed.kind !== row.kind || typeof sealed.key !== "string") return undefined;
+    if (sealed.kind === "owner" && typeof sealed.text !== "string") return undefined;
     return toSignal(row.seq, row.signal_id, row.at, sealed);
   } catch {
     return undefined;
@@ -363,11 +367,13 @@ function openSignal(db: EvidenceDb, row: Row, projectId: string): ProjectSignal 
 }
 
 function toSignal(seq: number, id: string, at: string, sealed: Sealed): ProjectSignal {
+  if (sealed.kind === "owner") {
+    return { seq, id, projectId: sealed.projectId, kind: "owner", key: sealed.key, at, text: sealed.text };
+  }
   return {
     seq, id, projectId: sealed.projectId, kind: sealed.kind, key: sealed.key, at,
     ...(sealed.runId === undefined ? {} : { runId: sealed.runId }),
     ...(sealed.commit === undefined ? {} : { commit: sealed.commit }),
-    ...(sealed.text === undefined ? {} : { text: sealed.text }),
   };
 }
 

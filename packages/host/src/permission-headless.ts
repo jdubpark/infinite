@@ -440,13 +440,22 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
       try { session = this.options.sessions.meta(id).session; } catch { continue; }
       if (!session.headless) continue;
       const view = row.permissionChannel as PermissionChannelView | undefined;
-      const state: HeadlessSessionStatus["state"] = !session.headless.channel ? "not-served" : view?.served ? "served" : "admitted";
-      sessions.push({
-        sessionId: id, projectId: session.projectId, title: bounded(session.title, 200), provider: session.provider, state,
-        ...(state === "not-served" ? { reason: session.headless.reason ?? "The permission channel does not serve this launch." }
-          : state === "admitted" ? { reason: "No hook call of this session has arrived; it behaves as before." } : {}),
-        ...(view?.waiting ? { waiting: view.waiting } : {}),
-      });
+      if (!session.headless.channel) {
+        sessions.push({
+          sessionId: id, projectId: session.projectId, title: bounded(session.title, 200), provider: session.provider,
+          state: "not-served", reason: session.headless.reason ?? "The permission channel does not serve this launch.",
+        });
+      } else if (view?.served) {
+        sessions.push({
+          sessionId: id, projectId: session.projectId, title: bounded(session.title, 200), provider: session.provider,
+          state: "served", ...(view.waiting ? { waiting: view.waiting } : {}),
+        });
+      } else {
+        sessions.push({
+          sessionId: id, projectId: session.projectId, title: bounded(session.title, 200), provider: session.provider,
+          state: "admitted", reason: "No hook call of this session has arrived; it behaves as before.",
+        });
+      }
       if (!session.headless.channel || !pipeline) continue;
       // A team session whose task cannot be read is skipped, as it is not served.
       const task = headlessTask(session, this.options.teamTask);

@@ -26,14 +26,10 @@ const ACTIONS = new Set(["status", "pause", "resume", "cancel"]);
 const EXTEND_HELP = "Extend by 5 minutes to 24 hours, for example `extend 6h` or `extend 90m`.";
 const EXTEND_PROMPT = "Reply with a mention and `extend` (or `extend 6h`) to give it more time, or `cancel`.";
 const EXTEND_MIN = 5, EXTEND_CAP = 1440;
-/** `extend` as the first word of the reply; a sentence such as "extend the API" is not a command. */
 const EXTEND_WORD = /^extend(?=\s|$)/i;
-/** The whole reply as a command: bare `extend`, or a number with an optional space and a unit (hours when none). */
 const EXTEND_FORM = /^extend(?:\s+(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours)?)?$/i;
-/** An `extend` followed by a number that is not one of the forms is a malformed command, not steering. */
 const EXTEND_ATTEMPT = /^extend\s+[-+.\d]/i;
 const MINUTE_UNITS = new Set(["m", "min", "mins", "minute", "minutes"]);
-/** Identity failures a retry cannot fix: the surface stops with a reason, as it does for another workspace's token. */
 const PERMANENT_IDENTITY = new Set(["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired", "credential_unavailable"]);
 const ANSWER_START = "Answering this from the repositories, read-only. No issue was filed.";
 const ANSWER_FOOTER = "No issue was filed. To start work, mention me with the change you want, or begin with \"work:\".";
@@ -45,12 +41,18 @@ const alternativePrompt = (n: number, channelReplies = false) => `What would you
 
 export type DirectRequest = (input: { thread: IntakeThread; ts: string; eventId: string; text: string; entrypoint?: "channel-message" }) => "accepted" | "duplicate";
 
+type SurfaceState =
+  | { kind: "idle" }
+  | { kind: "verifying"; timer?: NodeJS.Timeout }
+  | { kind: "failed"; reason: string }
+  | { kind: "running"; botUserId: string; connection: { close(): void; connected(): boolean } }
+  | { kind: "closed"; reason?: string };
+
 interface Outcome { outcome: string; reply?: string }
 type SavedCall = NonNullable<IntakeInbound["call"]>;
 type Routed = { outcome: string; reply?: string; call?: Omit<SavedCall, "revision"> };
 const OUTCOMES: Record<SavedCall["action"], string> = { answer: "answered", steer: "steered", pause: "pause", resume: "resume", cancel: "cancel", extend: "extended" };
 
-/** The extend command the whole reply is: `minutes` is undefined for a bare `extend`; "invalid" for a malformed or out-of-range one. */
 function extendCommand(text: string): { minutes: number | undefined } | "invalid" | undefined {
   if (!EXTEND_WORD.test(text)) return undefined;
   const form = EXTEND_FORM.exec(text);
@@ -62,7 +64,7 @@ function extendCommand(text: string): { minutes: number | undefined } | "invalid
   }
   return EXTEND_ATTEMPT.test(text) ? "invalid" : undefined;
 }
-/** A message addressed to a person or group is conversation among participants. References in the request body remain usable. */
+
 const addressedToSomeoneElse = (text: string) =>
   /^(?:(?:hey|hi)[,\s]+)?(?:<@[UW][A-Z0-9]+(?:\|[^>]*)?>|<!(?:here|channel|everyone|subteam\^[^>]+)>)/i.test(text);
 
@@ -71,11 +73,9 @@ function isChannelControl(text: string): boolean {
     || /^(?:approve[d]?|deny|denied|yes|no)$/i.test(text);
 }
 
-/** A direct request starts at the owner's Slack message. For a tracker request the first confirmed thread post opens the conversation. */
 const afterThreadBinding = (record: IntakeRecord, ts: string) =>
   slackMessageAfter(ts, record.direct?.ts ?? record.messages.find(message => message.ts)?.ts);
 
-/** A time to the minute in UTC, as `missions.ts` writes it. */
 const utcMinute = (iso: string) => `${iso.slice(0, 16).replace("T", " ")} UTC`;
 const extendedAmount = (minutes: number) => {
   const plural = (value: number, unit: string) => `${value} ${unit}${value === 1 ? "" : "s"}`;
@@ -83,10 +83,6 @@ const extendedAmount = (minutes: number) => {
 };
 
 const now = () => new Date().toISOString();
-/**
- * Text from a caught error that a record, the API, or Slack may hold: the host's own refusal, or Slack's code. Anything
- * else is a summary of its name and code, because its message can carry host paths or addresses.
- */
 const errorText = (error: unknown) => error instanceof TeamError || error instanceof SlackError ? error.message : failureSummary(error);
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const sameThread = (a: IntakeThread | undefined, b: IntakeThread | undefined) =>
@@ -94,10 +90,15 @@ const sameThread = (a: IntakeThread | undefined, b: IntakeThread | undefined) =>
 const mentionsIdentifier = (text: string, identifier: string) =>
   new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(identifier)}(?![A-Za-z0-9])`).test(text);
 
-/**
- * Adds the text as one pending message, or as numbered parts when it is longer than one Slack message. Every part of
- * every kind is made here, after the outbound filter has removed host paths and addresses.
- */
+const messageBase = (item: IntakeMessage) => ({
+  key: item.key,
+  kind: item.kind,
+  text: item.text,
+  createdAt: item.createdAt,
+  attempts: item.attempts,
+  ...(item.blocks ? { blocks: item.blocks } : {}),
+});
+
 function addParts(config: Config, draft: IntakeRecord, key: string, kind: IntakeMessageKind, text: string, createdAt: string,
   blocks?: Record<string, unknown>[]) {
   const parts = splitSlackText(outboundText(config, text));
@@ -116,7 +117,6 @@ const questionText = (decision: MissionDecision, channelReplies = false) => (n: 
   const how = channelReplies ? "in this thread with your answer." : "with a mention and your answer.";
   const footer = decision.answerMode === "multiple" ? `Choose one or more options, then Submit. You can also reply ${how}`
     : options.length ? `Choose below, or reply ${how}` : `Reply ${how}`;
-  // The recommendation comes first, before the options it names.
   const recommendation = decision.recommendation ? ["", recommendationLine(decision.recommendation)] : [];
   return [`**Q${n}: ${decision.question}**`, ...recommendation, ...(options.length ? ["", ...options] : []), "", footer].join("\n");
 };
@@ -142,25 +142,14 @@ const choiceBlocks = (config: Config, issueId: string, decision: MissionDecision
   return selection;
 };
 
-/**
- * Posts an intake record's messages into the Slack thread it is bound to and applies the owner's tagged replies to its
- * mission. Every outbound message goes to `record.thread`; nothing here takes a channel from an inbound event as a place to post.
- */
 export class IntakeSlackSurface {
   private readonly slack: IntakeConfig["slack"];
-  private botUserId?: string;
-  private started = false;
-  private ready = false;
-  private closed = false;
-  private reason?: string;
+  private state: SurfaceState = { kind: "idle" };
   private droppedCount = 0;
-  private connection?: { close(): void; connected(): boolean };
-  private identityTimer?: NodeJS.Timeout;
   private readonly timers = new Map<string, NodeJS.Timeout>();
   private readonly pumping = new Set<string>();
   private readonly draining = new Set<string>();
   private readonly composeRetries = new Map<string, { attempts: number; timer?: NodeJS.Timeout }>();
-  /** The newest unresolved error per record; a later successful reconcile of that record clears it. */
   private readonly failures = new Map<string, string>();
   private unsubscribers: (() => void)[] = [];
 
@@ -176,57 +165,60 @@ export class IntakeSlackSurface {
   }
 
   async start(): Promise<void> {
-    if (!this.slack || this.closed || this.started) return;
-    this.started = true;
+    if (!this.slack || this.state.kind !== "idle") return;
+    this.state = { kind: "verifying" };
     await this.verify();
   }
 
   close(): void {
-    this.closed = true;
-    this.ready = false;
+    const reason = this.state.kind === "failed" || this.state.kind === "closed" ? this.state.reason : undefined;
+    if (this.state.kind === "verifying") clearTimeout(this.state.timer);
+    if (this.state.kind === "running") this.state.connection.close();
+    this.state = { kind: "closed", ...(reason ? { reason } : {}) };
     for (const off of this.unsubscribers) off();
     this.unsubscribers = [];
-    clearTimeout(this.identityTimer);
-    this.identityTimer = undefined;
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
     for (const retry of this.composeRetries.values()) clearTimeout(retry.timer);
     this.composeRetries.clear();
-    this.connection?.close();
-    this.connection = undefined;
   }
 
   status(): { connected: boolean; reason?: string; dropped: number; lastError?: string } {
     const lastError = [...this.failures.values()].at(-1);
-    return { connected: this.connection?.connected() ?? false, ...(this.reason ? { reason: this.reason } : {}),
-      ...(lastError ? { lastError } : {}), dropped: this.droppedCount };
+    const reason = this.state.kind === "failed" || this.state.kind === "closed" ? this.state.reason : undefined;
+    const connected = this.state.kind === "running" ? this.state.connection.connected() : false;
+    return { connected, ...(reason ? { reason } : {}), ...(lastError ? { lastError } : {}), dropped: this.droppedCount };
   }
 
   private async verify(): Promise<void> {
-    if (this.closed || !this.slack) return;
+    if (this.state.kind !== "verifying" || !this.slack) return;
     let identity: { teamId: string; userId: string };
     try {
       identity = await this.client.authTest();
     } catch (error) {
+      if (this.state.kind !== "verifying") return;
       if (error instanceof SlackError && !error.transient && PERMANENT_IDENTITY.has(error.code)) {
-        this.reason = `The Slack identity check failed: ${error.code}.`;
+        this.state = { kind: "failed", reason: `The Slack identity check failed: ${error.code}.` };
         return;
       }
-      this.identityTimer = setTimeout(() => { this.identityTimer = undefined; void this.verify(); }, IDENTITY_RETRY_MS);
+      const timer = setTimeout(() => {
+        if (this.state.kind !== "verifying") return;
+        this.state = { kind: "verifying" };
+        void this.verify();
+      }, IDENTITY_RETRY_MS);
+      this.state = { kind: "verifying", timer };
       return;
     }
-    if (this.closed) return;
+    if (this.state.kind !== "verifying") return;
     if (identity.teamId !== this.slack.teamId) {
-      this.reason = "The Slack token belongs to a different workspace.";
+      this.state = { kind: "failed", reason: "The Slack token belongs to a different workspace." };
       return;
     }
-    this.botUserId = identity.userId;
-    this.begin();
+    this.begin(identity.userId);
   }
 
-  private begin(): void {
-    this.ready = true;
-    this.connection = this.client.connect(envelope => this.receive(envelope));
+  private begin(botUserId: string): void {
+    this.state = { kind: "running", botUserId, connection: this.client.connect(envelope => this.receive(envelope)) };
     this.unsubscribers = [
       this.store.onChange(record => this.reconcile(record.issueId)),
       this.missions.onChange(mission => {
@@ -240,7 +232,6 @@ export class IntakeSlackSurface {
     }
   }
 
-  /** True only when the host can file a request and the configuration turns direct requests on. */
   private directOn(): boolean {
     return this.direct !== undefined && this.slack?.directRequests === true;
   }
@@ -249,7 +240,6 @@ export class IntakeSlackSurface {
     return this.directOn() ? FOLLOW_UP_DIRECT : FOLLOW_UP_LINEAR;
   }
 
-  /** Ordinary channel messages use the joined-channel policy or the legacy explicit channel map. */
   private mappedChannel(channelId: string): boolean {
     if (!this.directOn()) return false;
     if (this.slack?.ownerOnlyInJoinedChannels) return /^[CG][A-Z0-9]{2,20}$/.test(channelId);
@@ -260,15 +250,12 @@ export class IntakeSlackSurface {
     return Boolean(thread && this.mappedChannel(thread.channelId));
   }
 
-  // Outbound
-
   private reconcile(issueId: string): void {
-    if (!this.ready || this.closed) return;
+    if (this.state.kind !== "running") return;
     const record = this.store.get(issueId);
-    if (!record?.thread || record.state === "skipped") return;
+    if (!record?.thread) return;
     try {
       const mission = record.missionId ? this.missions.peek(record.missionId) : undefined;
-      // Compose against a copy first, so a record with nothing missing is not rewritten.
       const probe = structuredClone(record);
       this.compose(probe, mission);
       if (probe.messages.length !== record.messages.length || probe.questions.length !== record.questions.length) {
@@ -282,13 +269,10 @@ export class IntakeSlackSurface {
     void this.pump(issueId);
   }
 
-  /** A successful reconcile clears the record's error and its pending composition retry. */
-  /** The record's identifier for messages and logs; undefined when the store cannot read it. */
   private identifierOf(issueId: string): string | undefined {
     try { return this.store.get(issueId)?.identifier; } catch { return undefined; }
   }
 
-  /** Logs the error in full and keeps only its summary, prefixed with the identifier, for status. */
   private noteFailure(issueId: string, step: string, error: unknown): void {
     const identifier = this.identifierOf(issueId);
     this.logFailure(issueId, step, error, identifier);
@@ -308,7 +292,6 @@ export class IntakeSlackSurface {
     this.composeRetries.delete(issueId);
   }
 
-  /** Records the error and retries this record's reconcile on the Slack retry schedule; the mission is never touched. */
   private fail(issueId: string, error: unknown): void {
     this.noteFailure(issueId, "compose", error);
     const retry = this.composeRetries.get(issueId) ?? { attempts: 0 };
@@ -323,23 +306,21 @@ export class IntakeSlackSurface {
   }
 
   private compose(draft: IntakeRecord, mission: Mission | undefined): void {
+    if (draft.state === "skipped") return;
     const at = now();
     const has = (key: string) => draft.messages.some(message => message.key === key || message.key.startsWith(`${key}#`));
     const add = (key: string, kind: IntakeMessageKind, text: string) => {
       if (!has(key)) addParts(this.config, draft, key, kind, text, at);
     };
     const followUp = this.followUp();
-    // A direct request carries its issue link; before it is filed there is no identifier to name.
     const answer = isAnswerRecord(draft);
     const title = !draft.direct ? `${draft.identifier} "${draft.title}"`
       : answer ? `your question "${draft.title}"`
       : draft.identifier ? `${draft.identifier} "${draft.title}" (${draft.url})` : `your request "${draft.title}"`;
-    // A routed request that was not asked for by word says how to take the other route.
     const routed = draft.direct?.route?.kind === "work" && draft.direct.route.by !== "owner";
     const channelReplies = this.threadReplies(draft.thread);
     const replyHint = channelReplies ? "Reply in this thread to answer or steer." : "Reply with a mention to answer or steer.";
     const hint = routed ? `\n${WORK_HINT}` : "";
-    // Before the mission exists a reply has nothing to cancel, so the owner is told to cancel once it starts.
     const queuedHint = routed ? `\n${WORK_HINT_QUEUED}` : "";
     if (draft.state === "started" && answer) {
       add("ack", "ack", ANSWER_START);
@@ -348,18 +329,14 @@ export class IntakeSlackSurface {
     } else if (draft.state === "queued" && draft.holdReason === "max-active") {
       add("ack", "ack", `Queued ${title}. It starts when a running request finishes. I'll post questions and the result here.${queuedHint}`);
     } else if (draft.state === "queued" && draft.holdReason) {
-      // Posted once: the key exists after the first hold, so a later hold reason posts nothing.
       add("ack", "ack", `Received ${title}. It has not started: ${draft.holdReason}\nI'll post questions and the result here once it starts.${queuedHint}`);
     }
-    // A split acknowledgement is decided by its first part.
     const ack = draft.messages.find(message => message.key === "ack" || message.key === "ack#1");
-    // A held answer's first message was the hold notice, so its start is announced under its own key.
     if (draft.state === "started" && answer && ack && ack.text !== ANSWER_START) add("started", "started", ANSWER_START);
     if (draft.state === "started" && !answer && ack && !ack.text.startsWith("Started on ")) {
       add("started", "started", draft.direct ? `Started on ${draft.identifier} (${draft.url}).` : `Started on ${draft.identifier}.`);
     }
     if (mission) {
-      // This is a single durable milestone for live work. The stable key prevents revision churn from reposting it.
       if (channelReplies && draft.state === "started" && mission.status === "working" && mission.subtasks.length > 0 && !answer) {
         const count = mission.subtasks.length;
         add("progress:first-dispatch", "status", `The coordinator dispatched ${count} subtask${count === 1 ? "" : "s"}. Reply here with \`status\` for progress.`);
@@ -390,7 +367,6 @@ export class IntakeSlackSurface {
     }
   }
 
-  /** The record's number for a decision; a new one is one more than the highest number on any record in the same thread. */
   private questionNumber(draft: IntakeRecord, decisionId: string): number {
     const existing = draft.questions.find(question => question.decisionId === decisionId);
     if (existing) return existing.n;
@@ -424,20 +400,19 @@ export class IntakeSlackSurface {
   }
 
   private async pump(issueId: string): Promise<void> {
-    if (!this.ready || this.closed || this.pumping.has(issueId)) return;
+    if (this.state.kind !== "running" || this.pumping.has(issueId)) return;
     this.pumping.add(issueId);
     try {
-      while (!this.closed) {
+      while (this.state.kind === "running") {
         const record = this.store.get(issueId);
-        if (!record?.thread || record.state === "skipped") return;
-        const message = record.messages.find(item => item.status === "pending");
+        if (!record?.thread) return;
+        const message = record.messages.find((item): item is Extract<IntakeMessage, { status: "pending" }> => item.status === "pending");
         if (!message) return;
         const due = message.nextAttemptAt ? Date.parse(message.nextAttemptAt) : 0;
         if (due > Date.now()) { this.wake(issueId, due); return; }
         await this.deliver(issueId, record.thread, message);
       }
     } catch (error) {
-      // A failed store write leaves the message pending; the next change pumps again.
       this.noteFailure(issueId, "store", error);
     } finally {
       this.pumping.delete(issueId);
@@ -452,75 +427,65 @@ export class IntakeSlackSurface {
     }, Math.max(0, at - Date.now())));
   }
 
-  /**
-   * The Slack key is the record's ID and the message's local key, so two records in one thread never share a receipt.
-   * The message is marked uncertain before the post, so a crash inside the send is found by lookup on restart.
-   */
-  private async deliver(issueId: string, thread: IntakeThread, message: IntakeMessage): Promise<void> {
+  private async deliver(issueId: string, thread: IntakeThread, message: Extract<IntakeMessage, { status: "pending" }>): Promise<void> {
     const key = message.key, transport = `${issueId}:${key}`;
     if (message.uncertain) {
       let messages: SlackThreadMessage[] | "unreadable";
       try {
         messages = await this.client.thread(thread);
       } catch (error) {
-        this.patch(issueId, key, item => { item.attempts += 1; });
+        this.patch(issueId, key, item => ({ ...messageBase(item), attempts: item.attempts + 1, status: "pending", uncertain: true }));
         this.failed(issueId, key, error);
         return;
       }
       const found = Array.isArray(messages) ? messages.find(item => item.key === transport) : undefined;
       if (found) {
-        this.patch(issueId, key, item => {
-          item.status = "sent"; item.ts = found.ts; delete item.uncertain; delete item.nextAttemptAt; delete item.error;
-        });
+        this.patch(issueId, key, item => ({ ...messageBase(item), status: "sent", ts: found.ts }));
         return;
       }
     }
-    this.patch(issueId, key, item => { item.uncertain = true; item.attempts += 1; });
+    this.patch(issueId, key, item => ({ ...messageBase(item), attempts: item.attempts + 1, status: "pending", uncertain: true }));
     try {
       const blocks = message.blocks ? [{ type: "markdown", text: message.text }, ...message.blocks] : undefined;
       const { ts } = await this.client.post(thread, message.text, transport, blocks);
-      this.patch(issueId, key, item => {
-        item.status = "sent"; item.ts = ts;
-        delete item.uncertain; delete item.nextAttemptAt; delete item.error;
-      });
+      this.patch(issueId, key, item => ({ ...messageBase(item), status: "sent", ts }));
     } catch (error) {
       this.failed(issueId, key, error);
     }
   }
 
-  /** Called after the attempt was counted; schedules the next attempt or gives up. */
   private failed(issueId: string, key: string, error: unknown): void {
     if (!(error instanceof SlackError)) this.logFailure(issueId, "deliver", error);
     const permanent = error instanceof SlackError && !error.transient;
+    const summary = errorText(error);
     this.patch(issueId, key, item => {
-      item.error = errorText(error);
-      if (permanent) {
-        item.status = "failed"; delete item.uncertain; delete item.nextAttemptAt;
-        return;
-      }
-      item.uncertain = true;
+      if (permanent) return { ...messageBase(item), status: "failed", error: summary };
       if (Date.now() - Date.parse(item.createdAt) >= GIVE_UP_MS) {
-        item.status = "failed"; delete item.nextAttemptAt;
-        return;
+        return { ...messageBase(item), status: "failed", uncertain: true, error: summary };
       }
-      item.nextAttemptAt = new Date(Date.now() + (RETRY_DELAYS_MS[item.attempts - 1] ?? RETRY_EVERY_MS)).toISOString();
+      return {
+        ...messageBase(item),
+        status: "pending",
+        uncertain: true,
+        error: summary,
+        nextAttemptAt: new Date(Date.now() + (RETRY_DELAYS_MS[item.attempts - 1] ?? RETRY_EVERY_MS)).toISOString(),
+      };
     });
   }
 
-  private patch(issueId: string, key: string, change: (message: IntakeMessage) => void): void {
+  private patch(issueId: string, key: string, change: (message: IntakeMessage) => IntakeMessage): void {
     this.store.update(issueId, draft => {
-      const message = draft.messages.find(item => item.key === key);
-      if (message) change(message);
+      const index = draft.messages.findIndex(item => item.key === key);
+      if (index !== -1) draft.messages[index] = change(draft.messages[index]);
     });
   }
-
-  // Inbound
 
   private async receive(envelope: SlackEnvelope): Promise<void> {
+    if (this.state.kind !== "running") return;
     if (envelope.interaction) { await this.receiveInteraction(envelope); return; }
     const slack = this.slack, event = envelope.event;
     if (!slack || !event || envelope.teamId !== slack.teamId || !event.channel || !event.ts || !event.user
-      || event.user === this.botUserId || event.botId !== undefined || event.appId !== undefined || event.botProfile
+      || event.user === this.state.botUserId || event.botId !== undefined || event.appId !== undefined || event.botProfile
       || event.subtype !== undefined || event.channelType === "im" || event.channelType === "mpim" || event.channel.startsWith("D")) {
       this.droppedCount += 1;
       return;
@@ -528,7 +493,6 @@ export class IntakeSlackSurface {
     const owner = event.user === slack.ownerUserId;
     const mapped = this.mappedChannel(event.channel);
     const isChannel = event.channelType === "channel" || event.channelType === "group";
-    // Slack omits channel_type on app_mention. A private channel can have a C or G ID.
     if (slack.ownerOnlyInJoinedChannels && (!owner || !mapped || (event.channelType !== undefined && !isChannel))) {
       this.droppedCount += 1; return;
     }
@@ -543,7 +507,6 @@ export class IntakeSlackSurface {
     }
 
     const raw = (event.text ?? "").trim(), text = this.commandText(raw);
-    // Slack can send both event types for a mention. The app_mention owns that message in either delivery order.
     if (channelMessage && raw !== text) return;
     if (channelMessage && (!text || addressedToSomeoneElse(text))) { this.droppedCount += 1; return; }
     const eventId = envelope.eventId ?? envelope.envelopeId;
@@ -578,7 +541,6 @@ export class IntakeSlackSurface {
       } else { this.droppedCount += 1; }
       return;
     }
-    // A redelivered owner message can still have an unapplied call after an interrupted store write.
     const duplicate = (record: IntakeRecord) => record.inbound.some(item => item.eventId === eventId || item.ts === ts);
     const holders = bound.filter(duplicate);
     if (holders.length) {
@@ -603,7 +565,6 @@ export class IntakeSlackSurface {
     void this.drain(target.record.issueId);
   }
 
-  /** A public status query writes only to the thread outbox. It never enters the owner's mission command log. */
   private postThreadStatus(bound: IntakeRecord[], ts: string, owner: boolean): void {
     if (!bound.length) return;
     const key = `reply:thread-status:${ts}`;
@@ -616,7 +577,6 @@ export class IntakeSlackSurface {
     this.store.update(records.at(-1)!.issueId, draft => addParts(this.config, draft, key, "reply", text, now()));
   }
 
-  /** Validate an interactive callback against the configured owner, the persisted question, and the exact Slack post. */
   private async receiveInteraction(envelope: SlackEnvelope): Promise<void> {
     const slack = this.slack, interaction = envelope.interaction;
     if (!slack || !interaction || interaction.type !== "block_actions" || interaction.teamId !== slack.teamId || interaction.userId !== slack.ownerUserId
@@ -626,7 +586,7 @@ export class IntakeSlackSurface {
     if (!match || !action.actionTs || !action.actionId.startsWith("infinite_decision_")) { this.droppedCount += 1; return; }
     const [, baseBlockId, issueId, decisionId] = match;
     const record = this.store.get(issueId);
-    if (!record?.thread || record.state === "skipped" || record.thread.channelId !== interaction.channelId
+    if (!record?.thread || record.thread.channelId !== interaction.channelId
       || (interaction.threadTs !== undefined && interaction.threadTs !== record.thread.threadTs)) { this.droppedCount += 1; return; }
     const message = record.messages.find(item => item.kind === "question" && item.blocks?.some(block => block.block_id === action.blockId));
     if (!message) { this.droppedCount += 1; return; }
@@ -640,14 +600,14 @@ export class IntakeSlackSurface {
     if ((element.type === "button" && action.value !== element.value)
       || (element.type === "static_select" && action.value !== undefined && !optionValues.includes(action.value))
       || (element.type === "multi_static_select" && action.selectedValues?.some(value => !optionValues.includes(value)))) { this.droppedCount += 1; return; }
-    if (!message.ts && message.uncertain) {
+    if (message.status === "pending" && message.uncertain) {
       const messages = await this.client.thread(record.thread);
       const found = Array.isArray(messages) ? messages.find(item => item.key === `${issueId}:${message.key}` && item.ts === interaction.messageTs) : undefined;
-      if (found) this.patch(issueId, message.key, item => { item.status = "sent"; item.ts = found.ts; delete item.uncertain; delete item.nextAttemptAt; });
+      if (found) this.patch(issueId, message.key, item => ({ ...messageBase(item), status: "sent", ts: found.ts }));
     }
     const persisted = this.store.get(issueId)!;
     const sent = persisted.messages.find(item => item.key === message.key);
-    if (!sent || sent.ts !== interaction.messageTs) { this.droppedCount += 1; return; }
+    if (!sent || sent.status !== "sent" || sent.ts !== interaction.messageTs) { this.droppedCount += 1; return; }
     const identity = `${interaction.channelId}:${interaction.messageTs}:${action.actionTs}:${action.actionId}`;
     const entryId = `interactive:${identity}`;
     const duplicate = persisted.inbound.find(item => item.interactionId === identity || item.eventId === entryId);
@@ -663,7 +623,7 @@ export class IntakeSlackSurface {
       && new Set(items).size === items.length;
     if (action.actionId === "infinite_decision_multi" && mode === "multiple") {
       if (!validIndexes(values)) { this.droppedCount += 1; return; }
-      return; // A selection change is acknowledged; only Submit commits it.
+      return;
     }
     let answerText: string | undefined;
     let reply: string | undefined;
@@ -692,31 +652,22 @@ export class IntakeSlackSurface {
     if (!reply) void this.drain(issueId);
   }
 
-  /** Files an owner mention or opted-in channel message. A failure is logged, counted and rethrown; nothing is posted. */
   private fileDirect(thread: IntakeThread, ts: string, eventId: string, text: string, entrypoint?: "channel-message"): void {
     try {
       this.direct!({ thread, ts, eventId, text, ...(entrypoint ? { entrypoint } : {}) });
     } catch (error) {
       this.log("Intake Slack direct request failed.", error);
       this.droppedCount += 1;
-      // Rethrown so the envelope is not acknowledged and Slack redelivers it; nothing is posted.
       throw error;
     }
   }
 
-  /** In a thread whose records have all finished, whether the text keeps today's routing: a question number, an identifier, or a command. */
   private routesToRecord(bound: IntakeRecord[], text: string): boolean {
     if (QUESTION.test(text) || ACTIONS.has(text.toLowerCase()) || extendCommand(text) !== undefined) return true;
     return bound.some(record => record.identifier !== ""
       && new RegExp(`^${escapeRegExp(record.identifier)}(?=$|[\\s:,])`, "i").test(text));
   }
 
-  /**
-   * The record a reply belongs to, among the records bound to its thread (oldest first): the one whose questions hold a
-   * leading `Qn`; the one a leading identifier names, with the identifier removed; the one unfinished record; or the
-   * newest finished one. With more than one unfinished record and neither prefix, nothing is applied, and the newest
-   * unfinished record keeps the reply naming the open identifiers. A `Qn` no record holds gets the unknown-question reply.
-   */
   private target(bound: IntakeRecord[], text: string): { record: IntakeRecord; text: string; outcome?: string; reply?: string } {
     const unfinished = bound.filter(record => record.state !== "finished");
     const fallback = unfinished.length > 0 ? unfinished.at(-1)! : bound.at(-1)!;
@@ -730,7 +681,6 @@ export class IntakeSlackSurface {
       const named = new RegExp(`^${escapeRegExp(record.identifier)}(?=$|[\\s:,])`, "i").exec(text);
       if (named) return { record, text: text.slice(named[0].length).replace(/^\s*[:,]?\s*/, "") };
     }
-    // An answer has no identifier, so with other unfinished records the word "answer" names it.
     const answerRecord = unfinished.length > 1 ? unfinished.find(isAnswerRecord) : undefined;
     const selected = answerRecord ? /^answer(?=$|[\s:,])/i.exec(text) : null;
     if (answerRecord && selected) return { record: answerRecord, text: text.slice(selected[0].length).replace(/^\s*[:,]?\s*/, "") };
@@ -744,15 +694,15 @@ export class IntakeSlackSurface {
   }
 
   private commandText(text: string): string {
-    return text.replace(new RegExp(`<@${escapeRegExp(this.botUserId ?? "")}(?:\\|[^>]*)?>`, "g"), "").trim();
+    const botUserId = this.state.kind === "running" ? this.state.botUserId : "";
+    return text.replace(new RegExp(`<@${escapeRegExp(botUserId)}(?:\\|[^>]*)?>`, "g"), "").trim();
   }
 
-  /** Attaches a thread to the one started or queued record without a thread whose identifier the owner's mention names. */
   private bind(thread: IntakeThread, text: string): boolean {
     const matches = this.store.list().filter(record =>
       !record.thread && (record.state === "started" || record.state === "queued") && mentionsIdentifier(text, record.identifier));
     if (matches.length !== 1) return false;
-    this.store.update(matches[0].issueId, draft => { draft.thread = thread; });
+    this.store.update(matches[0].issueId, draft => { if (draft.state !== "skipped") draft.thread = thread; });
     return true;
   }
 
@@ -761,14 +711,13 @@ export class IntakeSlackSurface {
     this.draining.add(issueId);
     try {
       for (;;) {
-        if (this.closed) return;
+        if (this.state.kind !== "running") return;
         const record = this.store.get(issueId);
         const entry = record?.inbound.find(item => !item.handledAt);
         if (!record || !entry) return;
         await this.apply(record, entry);
       }
     } catch (error) {
-      // A failed store write leaves the entry unhandled; it is applied again on the next event, a redelivery, or a start.
       this.noteFailure(issueId, "inbound", error);
     } finally {
       this.draining.delete(issueId);
@@ -786,7 +735,6 @@ export class IntakeSlackSurface {
     });
   }
 
-  /** An entry with a saved call performs exactly that call; any other entry is routed once, and the chosen call is saved first. */
   private async act(record: IntakeRecord, entry: IntakeInbound): Promise<Outcome> {
     if (entry.call) return this.perform(record, entry, entry.call);
     if (record.state === "finished") return { outcome: "finished", reply: `This request has finished. ${this.followUp()}` };
@@ -799,7 +747,6 @@ export class IntakeSlackSurface {
     return this.perform(record, entry, call);
   }
 
-  /** Chooses the mission call for a reply from the mission's current state, or the reply that needs no call. */
   private route(record: IntakeRecord, mission: Mission, text: string, channelReplyTs?: string): Routed {
     const lower = text.toLowerCase();
     if (lower === "status") {
@@ -810,7 +757,6 @@ export class IntakeSlackSurface {
       return { outcome: "status", reply: [mission.status, ...open].join("\n") };
     }
     if (ACTIONS.has(lower)) return { outcome: lower, call: { action: lower as "pause" | "resume" | "cancel" } };
-    // Before the open-question check, so "extend" is never taken as an answer to a question.
     const extend = extendCommand(text);
     if (extend === "invalid") return { outcome: "invalid-extend", reply: EXTEND_HELP };
     if (extend) return { outcome: "extend", call: { action: "extend", minutes: extend.minutes ?? Math.min(mission.maxMinutes, EXTEND_CAP) } };
@@ -845,10 +791,6 @@ export class IntakeSlackSurface {
     return { outcome: "answered", call: { action: "answer", decisionId: decision.id, text: answer } };
   }
 
-  /**
-   * Runs the saved call at its saved revision. The revision is saved before each attempt; a stale revision is replaced by
-   * the current one and the same call is retried once. Any other mission refusal becomes the reply.
-   */
   private async perform(record: IntakeRecord, entry: IntakeInbound, saved: SavedCall): Promise<Outcome> {
     try {
       const missionId = record.missionId;
@@ -892,7 +834,6 @@ export class IntakeSlackSurface {
     return this.missions.cancel(missionId, { requestId, revision });
   }
 
-  /** The reply to an extension: the amount added and the stop time the mission now has, read after the call. */
   private extendedText(missionId: string, minutes: number): string {
     const amount = extendedAmount(minutes);
     const mission = this.missions.peek(missionId);

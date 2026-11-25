@@ -46,12 +46,12 @@ const origin = (issueId: string): MissionOrigin => ({
   kind: "intake", issueId, identifier: "TEST-1", url: "https://linear.example.invalid/issue/TEST-1", rule: 'label "infinite", owner creator',
 });
 
-function intakeRecord(issueId: string, state: IntakeRecord["state"], extra: Partial<IntakeRecord> = {}): IntakeRecord {
-  return {
-    issueId, identifier: "TEST-1", url: "https://linear.example.invalid/issue/TEST-1", title: "Export fails on empty rows",
-    description: "Rows with no values fail the export.", issueCreatedAt: NOW, issueUpdatedAt: NOW, state,
-    comments: {}, messages: [], questions: [], inbound: [], createdAt: NOW, updatedAt: NOW, ...extra,
-  };
+function intakeRecord(issueId: string, state: IntakeRecord["state"], extra: Record<string, unknown> = {}): IntakeRecord {
+  const base = { issueId, identifier: "TEST-1", url: "https://linear.example.invalid/issue/TEST-1", title: "Export fails on empty rows",
+    description: "Rows with no values fail the export.", issueCreatedAt: NOW, issueUpdatedAt: NOW, comments: {}, messages: [], questions: [], inbound: [], createdAt: NOW, updatedAt: NOW };
+  if (state === "skipped") return { ...base, ...extra, state, skipReason: "creator-mismatch" } as IntakeRecord;
+  if (state === "queued") return { ...base, ...extra, state } as IntakeRecord;
+  return { ...base, rule: 'label "infinite", owner creator', missionId: "mission-1", ...extra, state } as IntakeRecord;
 }
 
 type LogLine = { line: string; error: unknown };

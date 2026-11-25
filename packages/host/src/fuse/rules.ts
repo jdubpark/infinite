@@ -59,7 +59,7 @@ function openResult(trip: FuseTripRecord): FuseOpen {
     ownerClose: trip.ownerClose,
   };
   if (trip.window !== undefined) result.window = trip.window;
-  if (trip.projectId !== undefined) result.projectId = trip.projectId;
+  if (trip.scope === "project") result.projectId = trip.projectId;
   return result;
 }
 
@@ -92,9 +92,8 @@ export function scopeState(
   if (count < limit) return { state: "closed" };
   const sameDay = trips.some(
     (trip) =>
-      trip.scope === scope &&
       trip.cause === "launch-rate" &&
-      trip.projectId === (scope === "host" ? undefined : projectId) &&
+      (scope === "host" ? trip.scope === "host" : trip.scope === "project" && trip.projectId === projectId) &&
       utcDay(trip.openedAt) === utcDay(now),
   );
   const pending: FuseOpen = { state: "open", scope, window: "hour", cause: "launch-rate", ownerClose: sameDay };

@@ -95,7 +95,7 @@ type Private = {
   slots: Map<string, Slot>;
   retirement: Map<string, string>;
   listed: boolean;
-  active?: unknown;
+  phase: { kind: string; active?: unknown };
   unwritten: Set<unknown>;
   hostBusy(projectId: string): string | undefined;
   pollHalt(active: unknown): void;
@@ -122,7 +122,7 @@ const MUTATIONS: readonly Mutation[] = [
     variant: patch(host => {
       host.hostBusy = projectId => {
         if (host.slots.get(projectId)?.record?.retiring?.length) return host.retirement.get(projectId) ?? "processes";
-        if (!host.listed || host.active || host.unwritten.size > 0) return "another-check";
+        if (!host.listed || (host.phase.kind === "running" && host.phase.active) || host.unwritten.size > 0) return "another-check";
         for (const slot of host.slots.values()) if (slot.record?.running || slot.record?.retiring?.length) return "another-check";
         return undefined;
       };

@@ -33,7 +33,7 @@ class FakeDelivery implements PermissionDeliveryService {
   readonly targets: PermissionInteractiveTarget[] = [];
   private readonly held = new Map<string, "agent" | "owner" | "undecided">();
   constructor(
-    private readonly decide: (target: PermissionInteractiveTarget) => Promise<PermissionHandled> | PermissionHandled = () => ({ handled: true, result: "owner" }),
+    private readonly decide: (target: PermissionInteractiveTarget) => Promise<PermissionHandled> | PermissionHandled = () => ({ handled: true, result: "owner", decisionId: "dec-owner", interruptClass: "push" }),
     private readonly unknown: "agent" | "owner" | "undecided" = "owner",
   ) {}
   handle(target: PermissionInteractiveTarget) {
@@ -255,7 +255,7 @@ test("an owner halt leaves the dialog with the owner, and the same dialog is han
   let clock = 1_000_000, halted = true;
   const delivery = new FakeDelivery(target => target.request.requester.sessionId === "uncovered"
     ? { handled: false, reason: "No owner delegation covers this project." }
-    : halted ? { handled: false, reason: "An owner halt holds permission decisions for this project.", held: true } : { handled: true, result: "allowed" });
+    : halted ? { handled: false, reason: "An owner halt holds permission decisions for this project.", held: true } : { handled: true, result: "allowed", decisionId: "dec-allow", delivery: "receipt" });
   const h = harness({ delivery, now: () => clock });
   try {
     h.add("s", "covered");

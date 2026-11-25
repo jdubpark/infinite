@@ -13,7 +13,6 @@ import { componentGraph, diagramFromMermaid, diagramGraphSchema, linkDiagramNode
 import { seal, unseal, writeSealed } from "./vault.js";
 import { CatalogError, understandingCatalogLimits } from "./understanding-catalog.js";
 
-/** Each workspace keeps its own encrypted store; a store written before the split is read once and migrated. */
 const MAX_WORKSPACE_STORE_BYTES = 16 * 1024 * 1024;
 const MAX_LEGACY_STORE_BYTES = 64 * 1024 * 1024;
 const WORKSPACE_FILE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/;
@@ -30,13 +29,10 @@ const MAX_HOOK_COMPONENTS = 2;
 const MAX_EVIDENCE = 40;
 const MAX_EVIDENCE_TEXT = 2000;
 const MAX_PLANS_PER_COMPONENT = 100;
-/** Ceiling of one attempt: the configured timeout for the capture plus one more per repository brief that is due. */
 const MAX_ATTEMPT_MS = 30 * 60_000;
-/** Floor of the time an attempt keeps for the final source re-check; at most a fifth of the attempt. */
 const RECHECK_RESERVE_MS = 5000;
 const STATE_SCOPE = "understanding-runtime";
 const NO_WRITER = "No summary writer is configured on this host.";
-/** Errors that mean an engine call ran out of time rather than produced a wrong answer. */
 const isDeadline = (error: unknown) => error instanceof Error && /^(?:understanding-attempt-deadline|understanding-timeout|understanding-process-timeout)(?:\s|$)/.test(error.message);
 export const understandingOutputLimits = { differenceSummary: 5000, pullRequestTitle: 2000, environment: 200, url: 2048 } as const;
 
@@ -67,13 +63,11 @@ export interface UnderstandingAdapter {
   synthesize?(input: UnderstandingSynthesisInput, options: UnderstandingAdapterOptions): Promise<{ components: KnowledgeComponent[]; coverage: string[] }>;
   brief?(input: { workspaceId: string; root: string; repositoryId: string; context: RepoContext; base: string | null; components: Pick<KnowledgeComponent, "id" | "name">[] }, options: UnderstandingAdapterOptions): Promise<RepositoryBriefOutput>;
   delivery?(input: { workspaceId: string; root: string; repositoryId: string; head: string | null }, options: UnderstandingAdapterOptions): Promise<KnowledgeDelivery>;
-  /** Writes one work narrative for a recorded range; only an explicit refresh calls it. */
   explainWork?(input: { root: string; baseCommit: string; question: string }, options: UnderstandingAdapterOptions): Promise<{ brief: UnderstandingBrief; diagrams: Diagram[]; engine: string; model: string; generatedAt: string; coverage: string[] }>;
 }
 export function createContextAdapter(config: Config): UnderstandingAdapter {
   return config.repositoryBriefings ? { context: (root, options) => runRepositoryContext(config, root, options) } : {};
 }
-/** Plain sentences for the binding checks above; other failures keep the engine's own reason. */
 const BINDING_REASONS: Record<string, string> = {
   "repository-identity-unavailable": "The repository's identity could not be read; the checkout may not be a Git repository",
   "repository-identity-changed": "A checkout no longer matches the repository it was enrolled as",
@@ -114,11 +108,16 @@ type RuntimeState = {
   version: 1; day: string; workspaces: Record<string, { jobsToday: number; failureCount: number; synthesisCursor: string | null; repositories: Record<string, StoredRepository>; maintenance: KnowledgeMaintenance; updatedAt: string | null }>;
 };
 type SourceBinding = { group: ProjectGroup; repo: ProjectGroupRepo; root: string; rootIdentity: string; membership: string; projects: string[] };
-/** One maintenance attempt's working set, shared by its steps. `hooked` repositories hold engine output that the final re-check must confirm. */
 type Attempt = {
   workspaceId: string; group: ProjectGroup; bindings: SourceBinding[]; repos: Record<string, StoredRepository>;
   captured: Set<string>; hooked: Set<string>; partial: string[]; reserveMs: number;
 };
+
+type Lifecycle =
+  | { kind: "idle"; timer?: NodeJS.Timeout }
+  | { kind: "draining"; timer?: NodeJS.Timeout }
+  | { kind: "closing"; done: Promise<void>; resolve: () => void }
+  | { kind: "closed" };
 
 function emptyDelivery(repositoryId: string): KnowledgeDelivery {
   return { repositoryId, state: "unavailable", observedAt: null, pullRequests: [], environments: [], coverage: ["Provider delivery data is not configured."] };
@@ -132,7 +131,6 @@ const historySchema = z.array(z.object({ revision: z.number().int().positive(), 
 const planSchema = z.object({ id: z.string().max(160), revision: z.number().int().positive(), componentId: z.string().max(160), repositoryIds: z.array(z.string()).max(64), title: z.string().max(300), text: z.string().max(understandingCatalogLimits.planText), status: z.enum(["proposed", "accepted", "superseded"]), sourceUrl: z.string().max(2048).nullable(), workId: z.string().max(understandingCatalogLimits.planWorkId).nullable(), archived: z.boolean(), createdAt: z.string().datetime({ offset: true }), updatedAt: z.string().datetime({ offset: true }), history: historySchema }).strict();
 const knowledgeEvidenceSchema = z.object({ repositoryId: z.string().max(80), source: relativePath, line: z.number().int().positive().nullable(), text: z.string().max(12000).optional() }).strict();
 const claimEvidenceSchema = knowledgeEvidenceSchema.extend({ line: z.number().int().positive() });
-// Review claims combine an area, rationale, and question from the bounded brief.
 const knowledgeClaimSchema = z.object({ text: z.string().min(1).max(2000), basis: z.enum(["source", "agent", "owner", "provider"]), evidence: z.array(claimEvidenceSchema).max(6) }).strict();
 const citationSchema = z.object({ source: relativePath, line: z.number().int().positive() }).strict();
 const briefClaimSchema = z.object({ text: z.string().min(1).max(900), citations: z.array(citationSchema).max(6) }).strict();
@@ -163,7 +161,7 @@ const storedRepositorySchema = z.object({
   context: repoContextSchema, components: z.array(knowledgeComponentStateSchema).max(MAX_COMPONENTS), relationships: z.array(relationshipSchema).max(MAX_EDGES), delivery: deliverySchema,
   synthesisCoverage: z.array(z.string().max(1000)).max(100), completedPlanRevisions: record, completedSourceFingerprints: record, history: z.record(z.string(), z.array(z.object({ snapshotId: z.string(), at: z.string().datetime({ offset: true }), summary: z.string().max(4000) }).strict()).max(MAX_HISTORY)),
   brief: storedBriefSchema.nullable().default(null), briefFingerprint: z.string().nullable().default(null), briefFailure: z.string().max(400).nullable().default(null), componentDiagram: diagramGraphSchema.nullable().default(null),
-  previousHead: z.string().nullable().optional(), // Legacy key from an earlier build; accepted and ignored.
+  previousHead: z.string().nullable().optional(),
 }).strict().superRefine((value, context) => {
   for (const [key, revision] of Object.entries(value.completedPlanRevisions)) if (typeof revision !== "string") context.addIssue({ code: "custom", path: ["completedPlanRevisions", key], message: "invalid plan watermark" });
   for (const [key, fingerprint] of Object.entries(value.completedSourceFingerprints)) if (typeof fingerprint !== "string") context.addIssue({ code: "custom", path: ["completedSourceFingerprints", key], message: "invalid source watermark" });
@@ -184,11 +182,9 @@ function parseRepoContext(value: unknown): RepoContext {
   return { ...parsed, limitations: limitations.slice(0, 100) };
 }
 
-/** Bounded, encrypted deterministic map and opt-in maintenance queue. Reads never enqueue work. */
 export class UnderstandingRuntime {
   private readonly stateFile: string;
   private readonly stateDir: string;
-  /** Serialized form of each workspace as last written, so a persist touches only the files that changed. */
   private readonly written = new Map<string, string>();
   private attemptStartedAt = 0;
   private readonly adapter: UnderstandingAdapter;
@@ -196,12 +192,9 @@ export class UnderstandingRuntime {
   private state: RuntimeState = { version: 1, day: new Date().toISOString().slice(0, 10), workspaces: {} };
   private queue: string[] = [];
   private queued = new Set<string>();
-  /** Workspaces that were asked to refresh while their job was running; they run once more afterwards. */
   private dirty = new Set<string>();
-  private running = false;
-  private closed = false;
+  private lifecycle: Lifecycle = { kind: "idle" };
   private activeDeadline = 0;
-  private timer?: NodeJS.Timeout;
   private controllers = new Set<AbortController>();
   private children = new Set<ChildProcess>();
   private storageUnavailable = false;
@@ -215,43 +208,60 @@ export class UnderstandingRuntime {
     this.load();
   }
 
+  private currentLifecycle(): Lifecycle {
+    return this.lifecycle;
+  }
+
+  private isClosed(): boolean {
+    return this.lifecycle.kind === "closing" || this.lifecycle.kind === "closed";
+  }
+
   start(): void {
-    if (this.closed || this.timer) return;
-    this.timer = setInterval(() => this.reconcile(), 60_000);
-    this.timer.unref();
+    if ((this.lifecycle.kind !== "idle" && this.lifecycle.kind !== "draining") || this.lifecycle.timer) return;
+    const timer = setInterval(() => this.reconcile(), 60_000);
+    timer.unref();
+    this.lifecycle.timer = timer;
     this.reconcile();
   }
 
   close(): Promise<void> {
-    this.closed = true;
-    if (this.timer) clearInterval(this.timer);
-    this.timer = undefined;
+    if (this.lifecycle.kind === "closed") return Promise.resolve();
+    if (this.lifecycle.kind === "closing") return this.lifecycle.done;
+    if (this.lifecycle.timer) clearInterval(this.lifecycle.timer);
     for (const controller of this.controllers) controller.abort();
     for (const child of this.children) this.stopChild(child);
     this.queue = []; this.queued.clear();
-    return new Promise(resolvePromise => {
-      if (!this.running) return resolvePromise();
-      // Both timers keep the process alive, so a caller that awaits close always gets an answer within the limit.
-      const done = () => { clearInterval(timer); clearTimeout(limit); resolvePromise(); };
-      const timer = setInterval(() => { if (!this.running) done(); }, 10);
-      const limit = setTimeout(done, 1500);
+    if (this.lifecycle.kind === "idle") {
+      this.lifecycle = { kind: "closed" };
+      return Promise.resolve();
+    }
+    let resolveDone!: () => void;
+    const done = new Promise<void>(resolve => {
+      const finish = () => {
+        clearTimeout(limit);
+        if (this.lifecycle.kind === "closing") this.lifecycle = { kind: "closed" };
+        resolve();
+      };
+      resolveDone = finish;
+      const limit = setTimeout(finish, 1500);
     });
+    this.lifecycle = { kind: "closing", done, resolve: resolveDone };
+    return done;
   }
 
-  /** Queues a refresh for each enabled workspace containing the checkout after new work reached its working tree. */
   sourceChanged(projectId: string): void {
     let list: ReturnType<UnderstandingRuntimeOptions["groups"]["list"]>;
     try { list = this.options.groups.list(); } catch { return; }
     for (const group of list.groups) {
       if (!group.repos.some(repo => repo.projectId === projectId || repo.checkouts.some(checkout => checkout.projectId === projectId))) continue;
-      try { if (this.options.catalog.read(group.id).policy.enabled) this.refresh(group.id); } catch { /* A workspace that cannot refresh now is picked up by the timer. */ }
+      try { if (this.options.catalog.read(group.id).policy.enabled) this.refresh(group.id); } catch {}
     }
   }
 
   refresh(workspaceId: string): KnowledgeMaintenanceResult {
     this.group(workspaceId);
     const maintenance = this.workspace(workspaceId).maintenance;
-    if (this.closed) return { ...maintenance, state: "unavailable", message: "Understanding maintenance is shutting down." };
+    if (this.isClosed()) return { ...maintenance, state: "unavailable", message: "Understanding maintenance is shutting down." };
     if (maintenance.state === "running") this.dirty.add(workspaceId);
     if (maintenance.state === "running" || this.queued.has(workspaceId)) return { ...maintenance, state: "queued", message: "A refresh is already queued for this workspace." };
     const policy = this.options.catalog.read(workspaceId).policy;
@@ -267,7 +277,6 @@ export class UnderstandingRuntime {
 
   read(workspaceId: string): ReadKnowledge { return this.readWithContexts(workspaceId).knowledge; }
 
-  /** Knowledge plus the accepted repositories' stored contexts from the same validated pass, so provenance never outlives a rejected binding. */
   readWithContexts(workspaceId: string): { knowledge: ReadKnowledge; contexts: Record<string, RepoContext> } {
     const group = this.group(workspaceId);
     try {
@@ -291,7 +300,6 @@ export class UnderstandingRuntime {
       const coverage = [...new Set([...catalog.coverage, ...repos.flatMap(repo => repo.context.limitations), ...repos.flatMap(repo => repo.synthesisCoverage), ...(saved?.maintenance.state === "failed" && saved.maintenance.message ? [saved.maintenance.message] : []), ...(this.storageUnavailable ? ["Encrypted runtime state could not be loaded or saved; current deterministic data may be unavailable."] : [])])].slice(0, 200);
       let maintenance = saved?.maintenance ?? emptyMaintenance(catalog.policy);
       maintenance = { ...maintenance, dailyJobLimit: catalog.policy.dailyJobLimit, jobsToday: this.dailyJobs(workspaceId) };
-      // Ticks no longer clear the limit state after midnight when nothing moved, so the read does.
       if (maintenance.state === "budget-limited" && maintenance.jobsToday < maintenance.dailyJobLimit) maintenance = { ...maintenance, state: "idle", message: null };
       if (!this.hasConfiguredContext) maintenance = { ...maintenance, state: "unavailable", message: NO_WRITER };
       if (this.loadFailed) maintenance = { ...maintenance, state: "unavailable", message: "Encrypted maintenance state failed validation; the host will not overwrite it or start jobs until explicit recovery." };
@@ -307,8 +315,6 @@ export class UnderstandingRuntime {
     try {
       const today = new Date().toISOString().slice(0, 10);
       if (existsSync(this.stateFile)) {
-        // One store for every workspace, from before the split: read it once, write one file per workspace, keep it beside
-        // them. It stays authoritative until every file is written, so a split that stopped halfway is redone, not trusted.
         const raw = readFileSync(this.stateFile, "utf8");
         if (Buffer.byteLength(raw) > MAX_LEGACY_STORE_BYTES) throw new Error("store-too-large");
         this.state = runtimeStateSchema.parse(unseal<unknown>(this.options.key, STATE_SCOPE, raw)) as RuntimeState;
@@ -343,7 +349,6 @@ export class UnderstandingRuntime {
     } catch { this.storageUnavailable = true; this.loadFailed = true; }
   }
 
-  /** Writes every workspace whose state changed to its own file; returns the ids whose file could not be written. */
   private persist(): Set<string> {
     if (this.loadFailed) { this.storageUnavailable = true; return new Set(Object.keys(this.state.workspaces)); }
     const failed = new Set<string>();
@@ -390,7 +395,7 @@ export class UnderstandingRuntime {
   }
 
   private reconcile() {
-    if (this.closed) return;
+    if (this.isClosed()) return;
     let list: ProjectGroupList;
     try { list = this.options.groups.list(); } catch { return; }
     for (const group of list.groups) {
@@ -403,15 +408,12 @@ export class UnderstandingRuntime {
         const isBackoff = state.maintenance.state === "failed";
         const due = (!Number.isFinite(retryAt) || Date.now() >= retryAt) && (isBackoff || !Number.isFinite(last) || Date.now() - last >= delay);
         if (!due) continue;
-        // The limit is recorded once; later ticks leave the store alone until the day rolls over.
         if (state.maintenance.state === "budget-limited" && this.dailyJobs(group.id) >= policy.dailyJobLimit) continue;
-        // A failed attempt retries on its backoff, as its "next attempt" time promises; an ordinary tick runs only when a repository moved.
         if (!isBackoff && !this.sourceMoved(group, state.repositories)) continue;
         this.refresh(group.id);
-      } catch { /* A concurrently removed group is skipped until the next reconciliation. */ }
+      } catch {}
     }
   }
-  /** True when a bound repository's HEAD differs from its stored observation or it was never observed. Reads Git only; no engine call. */
   private sourceMoved(group: ProjectGroup, repositories: Record<string, StoredRepository>): boolean {
     return group.repos.some(repo => {
       const stored = repositories[repo.projectId];
@@ -422,18 +424,22 @@ export class UnderstandingRuntime {
   private backoff(id: string, interval: number) { const attempts = this.state.workspaces[id]?.failureCount ?? 0; return Math.max(interval, Math.min(24 * 60 * 60_000, interval * (2 ** Math.min(Math.max(0, attempts - 1), 8)))); }
 
   private async drain() {
-    if (this.running || this.closed) return;
-    this.running = true;
+    if (this.lifecycle.kind !== "idle") return;
+    this.lifecycle = { kind: "draining", timer: this.lifecycle.timer };
     try {
-      while (!this.closed && this.queue.length) {
+      while (this.lifecycle.kind === "draining" && this.queue.length) {
         const id = this.queue.shift()!; this.queued.delete(id);
         this.attemptStartedAt = Date.now(); this.activeDeadline = this.attemptStartedAt + this.attemptMs();
         try { await this.runWorkspace(id); }
         catch (error) { this.failWorkspace(id, error); }
         finally { this.activeDeadline = 0; }
-        if (this.dirty.delete(id) && !this.closed) this.refresh(id);
+        if (this.dirty.delete(id) && !this.isClosed()) this.refresh(id);
       }
-    } finally { this.running = false; }
+    } finally {
+      const lc = this.currentLifecycle();
+      if (lc.kind === "closing") lc.resolve();
+      else if (lc.kind === "draining") this.lifecycle = { kind: "idle", timer: lc.timer };
+    }
   }
 
   private async runWorkspace(workspaceId: string) {
@@ -442,7 +448,7 @@ export class UnderstandingRuntime {
       this.setMaintenance(workspaceId, { ...this.workspace(workspaceId).maintenance, state: "budget-limited", dailyJobLimit: policy.dailyJobLimit, jobsToday: this.dailyJobs(workspaceId), message: "The daily maintenance job limit has been reached." }); return;
     }
     const workspaceState = this.workspace(workspaceId);
-    workspaceState.jobsToday += 1; // Persist admission before source capture or any writer hook.
+    workspaceState.jobsToday += 1;
     if (this.persist().has(workspaceId)) throw new Error("runtime-budget-watermark-not-durable");
     const attempt = new Date().toISOString();
     this.setMaintenance(workspaceId, { ...workspaceState.maintenance, state: "running", lastObservedAt: attempt, dailyJobLimit: policy.dailyJobLimit, jobsToday: workspaceState.jobsToday, message: null });
@@ -454,7 +460,7 @@ export class UnderstandingRuntime {
     const capturedRepositories = new Set<string>();
     const captureStarted = Date.now();
     for (const binding of bindings) {
-      if (this.closed) throw new Error("closed");
+      if (this.isClosed()) throw new Error("closed");
       try {
         const observation = await this.capture(workspaceId, binding, catalogAtStart);
         repos[binding.repo.projectId] = observation;
@@ -462,11 +468,9 @@ export class UnderstandingRuntime {
       } catch (error) { partial.push(`Repository ${binding.repo.name}: ${failureReason(error)}`); }
     }
     if (!this.membershipStillCurrent(workspaceId, groupAtStart, bindings)) throw new Error("workspace-rebound");
-    // The final re-check repeats each capture, so engine steps leave it about twice the capture time.
     const reserveMs = Math.max(2 * (Date.now() - captureStarted), Math.min(RECHECK_RESERVE_MS, Math.floor(this.attemptMs() / 5)));
     const hookedRepos = new Set<string>();
     const job: Attempt = { workspaceId, group: groupAtStart, bindings, repos, captured: capturedRepositories, hooked: hookedRepos, partial, reserveMs };
-    // The captured source maps without this attempt's engine output; a repository that cannot be re-checked publishes this.
     const beforeHooks = new Map([...capturedRepositories].map(id => [id, structuredClone(repos[id])]));
     const currentPolicy = this.options.catalog.read(workspaceId).policy;
     let nextSynthesisCursor = workspaceState.synthesisCursor;
@@ -482,7 +486,6 @@ export class UnderstandingRuntime {
       const start = pending.findIndex(item => item.key > (workspaceState.synthesisCursor ?? ""));
       const ordered = start < 0 ? pending : [...pending.slice(start), ...pending.slice(0, start)];
       const selected = ordered.slice(0, MAX_HOOK_COMPONENTS);
-      /** Key of the first component refused for lack of time; the cursor stops before it so the next job resumes there. */
       let interrupted: string | undefined;
       for (const entry of selected) {
         if (interrupted) break;
@@ -506,8 +509,7 @@ export class UnderstandingRuntime {
           try {
             result = await this.invoke(options => this.adapter.synthesize!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, components: [component], plans: entry.plans.filter(plan => plan.componentId === component.id) }, options), MAX_OUTPUT_BYTES, { reserveMs });
           } catch (error) {
-            if (this.closed || !isDeadline(error)) throw error;
-            // Out of time: keep the components already explained and publish the source map.
+            if (this.isClosed() || !isDeadline(error)) throw error;
             partial.push(`Repository ${binding.repo.name}: synthesis unavailable: ${failureReason(error)}`);
             interrupted = `${binding.repo.projectId}:${component.id}`;
             break;
@@ -524,7 +526,7 @@ export class UnderstandingRuntime {
         const returned = new Map(output.components.map(component => [component.id, component]));
         for (const component of selectedComponents) {
           const synthesized = returned.get(component.id);
-          if (!synthesized) continue; // Refused for lack of time; it stays pending.
+          if (!synthesized) continue;
           const expectedPlanRevisions = component.planned.map(plan => ({ id: plan.id, revision: plan.revision })).sort((a, b) => a.id.localeCompare(b.id));
           const returnedPlanRevisions = synthesized.difference.planRevisions.map(plan => ({ id: plan.id, revision: plan.revision })).sort((a, b) => a.id.localeCompare(b.id));
           const generatedAt = synthesized.current.generatedAt ? Date.parse(synthesized.current.generatedAt) : Number.NaN;
@@ -560,7 +562,7 @@ export class UnderstandingRuntime {
         try {
           value = await this.invoke(options => this.adapter.delivery!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, head: observation.head }, options), MAX_OUTPUT_BYTES, { reserveMs });
         } catch (error) {
-          if (this.closed || !isDeadline(error)) throw error;
+          if (this.isClosed() || !isDeadline(error)) throw error;
           partial.push(`Repository ${binding.repo.name}: delivery unavailable: ${failureReason(error)}`);
           continue;
         }
@@ -579,8 +581,7 @@ export class UnderstandingRuntime {
           fresh = parseRepoContext(await this.invoke(options => this.adapter.context!(binding.root, options), MAX_CONTEXT_BYTES));
         } catch (error) {
           const before = beforeHooks.get(binding.repo.projectId);
-          if (this.closed || !isDeadline(error) || !before) throw error;
-          // Unconfirmed engine output is dropped; the captured source map still publishes.
+          if (this.isClosed() || !isDeadline(error) || !before) throw error;
           repos[binding.repo.projectId] = before;
           hookedRepos.delete(binding.repo.projectId);
           partial.push(`Repository ${binding.repo.name}: source re-check unavailable: ${failureReason(error)}`);
@@ -590,8 +591,6 @@ export class UnderstandingRuntime {
         if (realpathSync(fresh.repo) !== binding.root || freshFingerprint !== observation.fingerprint || fresh.head !== observation.head || !this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-generation-changed-during-hook");
       }
     }
-    // No await may separate this catalog check from publication: a later
-    // repository observation can yield to edits of an earlier repository's plans.
     if (currentPolicy.synthesis && this.adapter.synthesize) {
       const currentCatalog = this.options.catalog.read(workspaceId);
       for (const binding of bindings.filter(item => hookedRepos.has(item.repo.projectId))) {
@@ -611,14 +610,9 @@ export class UnderstandingRuntime {
     if (this.persist().has(workspaceId)) { this.state = before; this.written.delete(workspaceId); throw new Error("runtime-store-full"); }
   }
 
-  /**
-   * Briefs each captured repository whose fingerprint moved since its stored brief. A failure, including running
-   * out of time, becomes a partial line and keeps the source map; only a stored brief needs the final re-check.
-   */
   private async briefRepositories(attempt: Attempt): Promise<void> {
     const { workspaceId, group, bindings, repos, captured, hooked, partial, reserveMs } = attempt;
     const due = (binding: SourceBinding) => { const observation = repos[binding.repo.projectId]; return Boolean(observation && captured.has(binding.repo.projectId) && observation.briefFingerprint !== observation.fingerprint); };
-    // A brief is a model run over the whole repository: each one due extends the attempt by the configured timeout.
     const briefs = bindings.filter(due).length;
     if (briefs) this.activeDeadline = Math.min(this.attemptStartedAt + MAX_ATTEMPT_MS, this.activeDeadline + briefs * this.attemptMs());
     for (const binding of bindings) {
@@ -627,7 +621,6 @@ export class UnderstandingRuntime {
       const components = observation.components.filter(component => !component.retired);
       try {
         if (!this.boundStillCurrent(workspaceId, group, binding)) throw new Error("source-rebound-before-brief");
-        // Each brief may use the configured timeout; the extension above keeps the later steps their own time.
         const result = await this.invoke(options => this.adapter.brief!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, base: observation.brief?.head ?? null, components: components.map(({ id, name }) => ({ id, name })) }, options), MAX_OUTPUT_BYTES, { reserveMs });
         if (!this.boundStillCurrent(workspaceId, group, binding)) throw new Error("source-rebound-after-brief");
         const observedAt = new Date().toISOString();
@@ -639,7 +632,7 @@ export class UnderstandingRuntime {
         observation.brief = stored; observation.briefFingerprint = observation.fingerprint; observation.briefFailure = null;
         hooked.add(binding.repo.projectId);
       } catch (error) {
-        if (this.closed) throw error;
+        if (this.isClosed()) throw error;
         observation.briefFailure = failureReason(error);
         partial.push(`Repository ${binding.repo.name}: brief unavailable: ${observation.briefFailure}`);
       }
@@ -671,7 +664,6 @@ export class UnderstandingRuntime {
     const history: StoredRepository["history"] = { ...(old?.history ?? {}) };
     if (old && old.fingerprint !== fingerprint) for (const component of old.components) history[component.id] = [...(history[component.id] ?? []), { snapshotId: old.fingerprint, at: old.observedAt, summary: component.current.summary }].slice(-MAX_HISTORY);
     const map = componentGraph({ repositoryId: binding.repo.projectId, head: parsed.head, observedAt: source.observedAt, components, relationships });
-    // The map's own coverage is recomputed with each capture, so it travels with this observation's limitations.
     const observed = { ...parsed, limitations: [...map.coverage, ...parsed.limitations].slice(0, 100) };
     return { repositoryKey: key, repositoryIds: binding.projects, rootIdentity: binding.rootIdentity, observedAt: source.observedAt, fingerprint, head: parsed.head, context: observed, components, relationships, delivery, synthesisCoverage: old?.synthesisCoverage ?? [], completedPlanRevisions: old?.completedPlanRevisions ?? {}, completedSourceFingerprints: old?.completedSourceFingerprints ?? {}, history,
       brief: old?.brief ?? null, briefFingerprint: old?.briefFingerprint ?? null, briefFailure: old?.briefFailure ?? null,
@@ -765,13 +757,8 @@ export class UnderstandingRuntime {
     return knowledgeComponentStateSchema.parse({ ...value, pinned: original.pinned, retired: original.retired, redirectTo: original.redirectTo, planned: original.planned, featureIds: original.featureIds, history: original.history }) as KnowledgeComponent;
   }
 
-  /** One attempt's whole time budget; a single engine call is also capped by it. */
   private attemptMs() { return Math.min(MAX_ATTEMPT_MS, Math.max(1000, this.options.config.repositoryBriefings?.timeoutMs ?? 30_000)); }
 
-  /**
-   * Runs one engine call inside the attempt deadline. `reserveMs` is kept back for the final re-check and
-   * `share` limits the call to that fraction of what is left after the reserve.
-   */
   private async invoke<T>(callback: (options: UnderstandingAdapterOptions) => Promise<T>, maxBytes = MAX_OUTPUT_BYTES, window: { reserveMs?: number; share?: number } = {}): Promise<T> {
     const configured = this.attemptMs();
     const remaining = this.activeDeadline ? this.activeDeadline - Date.now() : configured;
@@ -781,7 +768,6 @@ export class UnderstandingRuntime {
     const timeoutMs = Math.min(configured, available);
     let timer: NodeJS.Timeout | undefined;
     try {
-      // Reject before aborting: an adapter that rejects on abort must not replace the timeout as the reason.
       const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => { reject(new Error("understanding-timeout")); controller.abort(); }, timeoutMs); timer.unref(); });
       const result = await Promise.race([callback({ signal: controller.signal, timeoutMs, maxBytes }), timeout]);
       if (Buffer.byteLength(JSON.stringify(result)) > maxBytes) throw new Error("understanding-output-too-large");
@@ -851,7 +837,6 @@ export function runRepositoryContext(config: Config, root: string, options: Unde
     catch { rejectPromise(new Error("context-spawn-failed")); return; }
     onChild(child);
     let out = Buffer.alloc(0), stderrTail = Buffer.alloc(0), settled = false;
-    // A failed exit or a stop for time carries the engine's last stderr line.
     const failed = (name: string) => new Error(failureReason(new Error(name), stderrTail.toString("utf8")));
     const finish = (error?: Error) => {
       if (settled) return; settled = true; options.signal.removeEventListener("abort", abort); onDone(child);

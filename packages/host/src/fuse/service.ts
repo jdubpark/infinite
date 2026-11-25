@@ -208,17 +208,18 @@ export class FuseService implements FuseGate {
       if (!this.authoritative || check.tripId !== undefined) return { ok: false, launchId, open: check };
       // A rate trip is judged but not yet recorded: record it now, so the owner can see and close it.
       const seq = this.seq + 1;
-      const trip: FuseTripRecord = {
+      const tripBase = {
         tripId: randomUUID(),
-        scope: check.scope,
-        ...(check.projectId === undefined ? {} : { projectId: check.projectId }),
-        cause: "launch-rate",
-        window: "hour",
+        cause: "launch-rate" as const,
+        window: "hour" as const,
         openedAt: now,
         ownerClose: check.ownerClose,
         launches: rollingCount(launches, trips, check.scope, check.projectId, now),
         seq,
       };
+      const trip: FuseTripRecord = check.scope === "host"
+        ? { ...tripBase, scope: "host" }
+        : { ...tripBase, scope: "project", projectId: check.projectId! };
       if (!this.persist(seq, [], [trip])) return { ok: false, launchId, failure: "write-failed" };
       return { ok: false, launchId, open: { ...check, tripId: trip.tripId } };
     }
@@ -296,7 +297,7 @@ export class FuseService implements FuseGate {
     const projectId = input.scope === "project" ? input.projectId : undefined;
     const now = this.now();
     const seq = this.seq + 1;
-    const closing = [...this.trips.values()]
+    const closing: FuseTripRecord[] = [...this.trips.values()]
       .filter(trip => trip.closedAt === undefined && trip.cause === "launch-rate" && trip.scope === scope && (scope === "host" || trip.projectId === projectId))
       .map((trip): FuseTripRecord => ({ ...trip, closedAt: now, closedBy: "owner", seq }));
     if (closing.length === 0) {
@@ -304,22 +305,23 @@ export class FuseService implements FuseGate {
       // opens (after a lowered limit, or after a clock that stepped back over an earlier close) is never written.
       // The owner can still close it: the trip is recorded as opened and closed in one write.
       const launches = [...this.launches.values()], trips = [...this.trips.values()];
-      const limit = scope === "host" ? this.limits.host : projectLimit(this.limits, projectId!);
+      const limit = input.scope === "host" ? this.limits.host : projectLimit(this.limits, input.projectId);
       const state = scopeState(launches, trips, scope, projectId, limit, now);
       if (state.state !== "open" || state.cause !== "launch-rate") return "not-open";
-      closing.push({
+      const closedBase = {
         tripId: randomUUID(),
-        scope,
-        ...(projectId === undefined ? {} : { projectId }),
-        cause: "launch-rate",
-        window: "hour",
+        cause: "launch-rate" as const,
+        window: "hour" as const,
         openedAt: now,
         closedAt: now,
-        closedBy: "owner",
+        closedBy: "owner" as const,
         ownerClose: state.ownerClose,
         launches: rollingCount(launches, trips, scope, projectId, now),
         seq,
-      });
+      };
+      closing.push(input.scope === "host"
+        ? { ...closedBase, scope: "host" }
+        : { ...closedBase, scope: "project", projectId: input.projectId });
     }
     // A launch stamped after now still counts, and the close time is now. After a clock that stepped back, every
     // counted launch would lie after the close, and the close would clear nothing. So those launches move to now.
@@ -360,8 +362,8 @@ export class FuseService implements FuseGate {
       .map(trip => ({
         tripId: trip.tripId,
         scope: trip.scope,
-        ...(trip.projectId === undefined ? {} : { projectId: trip.projectId }),
-        label: trip.scope === "host" ? "the host" : plainLabel(this.config.projects.find(project => project.id === trip.projectId)?.name ?? trip.projectId ?? ""),
+        ...(trip.scope === "project" ? { projectId: trip.projectId } : {}),
+        label: trip.scope === "host" ? "the host" : plainLabel(this.config.projects.find(project => project.id === trip.projectId)?.name ?? trip.projectId),
         cause: trip.cause,
         ownerClose: trip.ownerClose,
         openedAt: new Date(trip.openedAt).toISOString(),
@@ -447,17 +449,18 @@ export class FuseService implements FuseGate {
     for (const [scope, id, limit] of scopes) {
       const state = scopeState(counted, working, scope, id, limit, now);
       if (state.state !== "open" || state.tripId !== undefined) continue;
-      const trip: FuseTripRecord = {
+      const tripBase = {
         tripId: randomUUID(),
-        scope,
-        ...(id === undefined ? {} : { projectId: id }),
-        cause: "launch-rate",
-        window: "hour",
+        cause: "launch-rate" as const,
+        window: "hour" as const,
         openedAt: now,
         ownerClose: state.ownerClose,
         launches: rollingCount(counted, working, scope, id, now),
         seq,
       };
+      const trip: FuseTripRecord = scope === "host"
+        ? { ...tripBase, scope: "host" }
+        : { ...tripBase, scope: "project", projectId: id! };
       working.push(trip);
       changed.set(trip.tripId, trip);
     }
@@ -553,24 +556,29 @@ export class FuseService implements FuseGate {
             seq: row.seq,
           };
         });
-        const trips = db.all<{ trip_id: string; scope: FuseScope; cause: FuseCause; fuse_window: FuseWindow | null; opened_at: number; closed_at: number | null; closed_by: FuseTripRecord["closedBy"] | null; owner_close: number; announced_at: number | null; seq: number; sealed: string }>(
+        const trips = db.all<{ trip_id: string; scope: FuseScope; cause: FuseCause; fuse_window: FuseWindow | null; opened_at: number; closed_at: number | null; closed_by: "rate" | "owner" | "baseline" | null; owner_close: number; announced_at: number | null; seq: number; sealed: string }>(
           "SELECT trip_id, scope, cause, fuse_window, opened_at, closed_at, closed_by, owner_close, announced_at, seq, sealed FROM fuse_trips ORDER BY trip_id",
         ).map((row): FuseTripRecord => {
           const payload = db.open<TripPayload>("fuse_trips", row.trip_id, row.sealed);
-          return {
+          const base = {
             tripId: row.trip_id,
-            scope: row.scope,
-            ...(payload.projectId === undefined ? {} : { projectId: payload.projectId }),
             cause: row.cause,
             ...(row.fuse_window === null ? {} : { window: row.fuse_window }),
             openedAt: row.opened_at,
-            ...(row.closed_at === null ? {} : { closedAt: row.closed_at }),
-            ...(row.closed_by === null ? {} : { closedBy: row.closed_by }),
             ownerClose: row.owner_close === 1,
             ...(row.announced_at === null ? {} : { announcedAt: row.announced_at }),
             ...(payload.launches === undefined ? {} : { launches: payload.launches }),
             seq: row.seq,
           };
+          const scoped = row.scope === "host"
+            ? { ...base, scope: "host" as const }
+            : (() => {
+              if (payload.projectId === undefined) throw new Error("Missing projectId for project fuse trip.");
+              return { ...base, scope: "project" as const, projectId: payload.projectId };
+            })();
+          return row.closed_at !== null && row.closed_by !== null
+            ? { ...scoped, closedAt: row.closed_at, closedBy: row.closed_by }
+            : scoped;
         });
         const seq = Math.max(0, ...launches.map(launch => launch.seq), ...trips.map(trip => trip.seq));
         return { version: 1, seq, launches, trips };

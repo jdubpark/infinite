@@ -7,7 +7,7 @@ import { DEFAULT_REPORT_NAME, reportName } from "./config.js";
 import type { Config } from "./types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { TeamRun, TeamView } from "./team-types.js";
-import type { LinearBridgeStatus, LinearLimitView, LinearTrackingView } from "./linear-types.js";
+import type { LinearBridgeStatus, LinearIssueView, LinearLimitView, LinearTrackingView } from "./linear-types.js";
 import { unseal, writeSealed } from "./vault.js";
 import { recommendationLine } from "./question-recommendation.js";
 
@@ -303,26 +303,33 @@ export class LinearService {
   /** `relaxed` is a passive read: a record execution cannot depend on keeps its older confirmation. */
   private view(stored: Stored, relaxed = false): LinearTrackingView {
     this.configuration(stored);
-    const { issue } = stored;
-    const view: LinearTrackingView = { status: "pending", ...(stored.checkedAt ? { checkedAt: stored.checkedAt } : {}),
-      ...(issue ? { issue: { id: issue.id, identifier: issue.identifier, url: issue.url, title: issue.title, description: issue.description, state: { name: issue.state.name, type: issue.state.type }, updatedAt: issue.updatedAt } } : {}) };
-    if (stored.blocked) return { ...view, status: "blocked", reason: stored.blocked };
-    // While a rate limit pauses every request, that pause is why a waiting record waits.
+    const issue: LinearIssueView | undefined = stored.issue ? {
+      id: stored.issue.id, identifier: stored.issue.identifier, url: stored.issue.url,
+      title: stored.issue.title, description: stored.issue.description,
+      state: { name: stored.issue.state.name, type: stored.issue.state.type }, updatedAt: stored.issue.updatedAt,
+    } : undefined;
+    const checked = stored.checkedAt ? { checkedAt: stored.checkedAt } : {};
+    const withIssue = issue ? { issue } : {};
+    if (stored.blocked) return { status: "blocked", reason: stored.blocked, ...checked, ...withIssue };
     const waiting = (status: "pending" | "error", reason: string): LinearTrackingView => {
       const retryAt = this.retryUntil > Date.now() ? Math.max(this.retryUntil, stored.retryAt) : 0;
-      return retryAt ? { ...view, status, reason: rateLimitReason(retryAt), retryAt: at(retryAt) } : { ...view, status, reason };
+      const waitReason = retryAt ? rateLimitReason(retryAt) : reason;
+      const retry = retryAt ? { retryAt: at(retryAt) } : {};
+      if (status === "error") return { status: "error", reason: waitReason, ...checked, ...retry, ...withIssue };
+      return { status: "pending", reason: waitReason, ...checked, ...retry, ...withIssue };
     };
     if (stored.parentKey) {
       const parent = this.records.get(stored.parentKey), current = !relaxed || this.gating(stored);
-      // A child that gates execution needs its goal's current confirmation, so it asks for one.
       if (parent && current && !this.isFresh(parent)) this.clock(parent).readRequested = true;
       const gate = parent ? this.view(parent, !current) : undefined;
-      if (gate?.status === "blocked") return { ...view, status: "blocked", reason: gate.reason };
+      if (gate?.status === "blocked") return { status: "blocked", reason: gate.reason, ...checked, ...withIssue };
       if (!gate || gate.status !== "synced") return waiting(gate?.status === "error" ? "error" : "pending", gate?.reason ?? "Waiting for the parent goal's Linear issue.");
     }
     if (stored.error) return waiting("error", stored.error);
-    if (!this.isFresh(stored, this.window(stored, relaxed)) || this.pendingComments(stored)) return waiting("pending", "Waiting for Linear to confirm current requirements and execution evidence.");
-    return { ...view, status: "synced" };
+    if (!issue || !this.isFresh(stored, this.window(stored, relaxed)) || this.pendingComments(stored)) {
+      return waiting("pending", "Waiting for Linear to confirm current requirements and execution evidence.");
+    }
+    return { status: "synced", issue, ...checked };
   }
   start() {
     if (this.timer || this.closed) return;

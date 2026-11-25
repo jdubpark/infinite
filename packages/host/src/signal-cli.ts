@@ -14,9 +14,12 @@ const clean = (value: unknown, max = 500) => String(value ?? "").replace(/[\x00-
 
 function signalLine(signal: ProjectSignal): string {
   const parts = [String(signal.seq), clean(signal.at), clean(signal.kind)];
-  if (signal.runId) parts.push(`run ${clean(signal.runId)}`);
-  if (signal.commit) parts.push(`commit ${clean(signal.commit).slice(0, 12)}`);
-  if (signal.text) parts.push(clean(signal.text, MAX_TEXT));
+  if (signal.kind === "owner") {
+    parts.push(clean(signal.text, MAX_TEXT));
+  } else {
+    if (signal.runId) parts.push(`run ${clean(signal.runId)}`);
+    if (signal.commit) parts.push(`commit ${clean(signal.commit).slice(0, 12)}`);
+  }
   return parts.join("  ");
 }
 

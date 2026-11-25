@@ -10,11 +10,12 @@ const testFiles = readdirSync(new URL("../tests/", import.meta.url))
   .sort();
 const parallelFiles = testFiles.filter((name) => !serialFiles.has(name));
 const serial = testFiles.filter((name) => serialFiles.has(name));
-const requestedConcurrency = process.argv.find((arg) => arg.startsWith("--concurrency="))?.split("=", 2)[1];
+const requestedConcurrency = process.argv.find((arg) => arg.startsWith("--concurrency="))?.split("=", 2)[1]
+  ?? process.env.INFINITE_TEST_CONCURRENCY;
 const concurrency = requestedConcurrency === undefined ? 4 : Number(requestedConcurrency);
 
 if (!Number.isInteger(concurrency) || concurrency < 1) {
-  throw new Error("Usage: npm test -- --concurrency=<positive integer>");
+  throw new Error("Test concurrency must be a positive integer. Set --concurrency or INFINITE_TEST_CONCURRENCY.");
 }
 
 const tsx = fileURLToPath(import.meta.resolve("tsx/cli"));

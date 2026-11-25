@@ -31,7 +31,8 @@ export type TerminalInput =
   | { op: "raw"; requestId: string; text: string; leaseId?: string }
   | { op: "input"; requestId: string; text: string; submit: false; leaseId?: string }
   | { op: "resize"; cols: number; rows: number; leaseId?: string }
-  | { op: "control"; requestId: string; action: "claim" | "renew" | "release"; leaseId?: string; takeover?: boolean };
+  | { op: "control"; requestId: string; action: "claim"; leaseId?: string; takeover?: boolean }
+  | { op: "control"; requestId: string; action: "renew" | "release"; leaseId?: string; takeover?: false };
 export type RemoteTerminalCommand =
   | { type: "terminal-open"; id: string; token: string; sessionId: string; clientId: string; after: number; snapshot: boolean }
   | { type: "terminal-send"; id: string; token: string; streamId: string; message: TerminalInput }

@@ -107,7 +107,7 @@ import { LinearService } from "./linear.js";
 import { goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
-import { type Config, type Role, type Receipt, type Session, learningPurpose } from "./types.js";
+import { type Config, type Role, type Receipt, type Session, httpControlRequestSchema, learningPurpose, normalizeControlRequest } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
 import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
@@ -1573,8 +1573,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     const authority = { actor: res.locals.actor, leaseId: res.locals.leaseId };
     try {
       if (action === "/control") {
-        const body = z.object({ action: z.enum(["claim", "renew", "release"]), leaseId: id.optional(), takeover: z.boolean().optional() }).strict().parse(req.body);
-        return void res.json({ control: await cmux.call(sessionId, { op: "control", ...body, actor: res.locals.actor }) });
+        const normalized = normalizeControlRequest(httpControlRequestSchema.parse(req.body), res.locals.actor);
+        return void (normalized.ok ? res.json({ control: await cmux.call(sessionId, normalized.request) }) : (cmux.requireStored(sessionId), res.status(409).json({ code: normalized.code, error: "Control changed or expired. This input was not sent. Refresh and take control again." })));
       }
       if (action === "/input") return void res.json(await cmux.call(sessionId, { op: "input", ...inputSchema.parse(req.body), ...authority }));
       if (action === "/answer") return void res.json(await cmux.call(sessionId, { op: "answer", ...answerSchema.parse(req.body), ...authority }));
@@ -1693,7 +1693,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     if (!manager.meta(sessionId).session.workspace) return void res.status(409).json({ error: "This session has no hybrid workspace" });
     const request = z.object({ method: z.enum(["sync/export", "sync/blob"]), hash: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().parse(req.body);
     if (request.method === "sync/blob" && !request.hash) return void res.status(400).json({ error: "A content hash is required" });
-    res.json(await workerCall(config.runDir, sessionId, { op: "workspace-export", ...request }, 300000));
+    if (request.method === "sync/export" && request.hash) return void res.status(400).json({ error: "sync/export does not accept a content hash" });
+    res.json(await workerCall(config.runDir, sessionId, request.method === "sync/blob" ? { op: "workspace-export", method: "sync/blob", hash: request.hash! } : { op: "workspace-export", method: "sync/export" }, 300000));
   });
   app.all(/^\/api\/sessions\/([a-f\d-]{36})\/opencode(\/.*)?$/, refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer || req.headers.origin || !res.locals.leaseId) return void res.status(403).json({ error: "Native access requires an owner CLI and current control" });
@@ -1747,14 +1748,10 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.post("/api/sessions/:id/control", refuseManagedClaim, requireRole(["owner", "controller"]), async (req, res) => {
     const sessionId = id.parse(req.params.id);
     manager.meta(sessionId);
-    const body = z.object({
-      action: z.enum(["claim", "renew", "release"]),
-      leaseId: id.optional(),
-      takeover: z.boolean().optional(),
-    }).strict().parse(req.body);
+    const normalized = normalizeControlRequest(httpControlRequestSchema.parse(req.body), res.locals.actor);
     if (!(await manager.state(sessionId)).capabilities?.inputControl)
       return void res.status(409).json({ error: "This session uses an older worker without input control", code: "unsupported" });
-    res.json({ control: await manager.controlSession(sessionId, { op: "control", ...body, actor: res.locals.actor }) });
+    res.status(normalized.ok ? 200 : 409).json(normalized.ok ? { control: await manager.controlSession(sessionId, normalized.request) } : { code: normalized.code, error: "Control changed or expired. This input was not sent. Refresh and take control again." });
   });
   app.post("/api/sessions/:id/raw", refuseManagedOutsideProviderPrompt, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use native input" });

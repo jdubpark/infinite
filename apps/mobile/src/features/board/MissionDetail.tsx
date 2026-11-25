@@ -11,7 +11,7 @@ import { Card, Chip, TopBar } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { age } from "../../status";
 import { theme } from "../../theme";
-import { newer } from "../teams/model";
+import { directionSourceLabel, newer } from "../teams/model";
 import { RequestStatus, Section, SteerBox, t } from "../teams/parts";
 import { useRunRequest } from "../teams/useRunRequest";
 import { attemptLabel, attemptsOf, findBoardItem, missionControls, missionExtendChoices, missionShowsReason, missionStatusLabel, missionStopLine, missionStoppedAtLimit, missionSubtaskLabel, missionTimeLeftMs, openMissionDecisions } from "./model";
@@ -130,7 +130,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
       </Section> : null}
 
       {mission.steering.length || answered.length ? <Section title="Directions and decisions" count={mission.steering.length + answered.length}>
-          {[...mission.steering].reverse().map((entry, index) => <Card key={`${entry.at}/${index}`}><Text style={t.note}>{typeof entry.source === "object" ? entry.source.name : entry.source === "coordinator" ? "Mission coordinator" : "You"} · direction · revision {entry.revision} · {age(entry.at, now)}</Text><Text style={t.body}>{entry.text}</Text></Card>)}
+          {[...mission.steering].reverse().map((entry, index) => <Card key={`${entry.at}/${index}`}><Text style={t.note}>{directionSourceLabel(entry.source)} · direction · revision {entry.revision} · {age(entry.at, now)}</Text><Text style={t.body}>{entry.text}</Text></Card>)}
           {[...answered].reverse().map(decision => <Card key={decision.id}>
             <Text style={t.note}>Decision · answered by {decision.answeredBy === "connector" ? decision.source?.name ?? "Connector" : decision.answeredBy === "coordinator" ? "the coordinator" : "you"}{decision.answeredAt ? ` · ${age(decision.answeredAt, now)}` : ""}</Text>
             <Text style={t.body}>{decision.question}</Text>

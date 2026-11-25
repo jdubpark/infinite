@@ -21,7 +21,7 @@ export type TeamView = {
   workers?: TeamWorkers;
   revision: number; status: TeamStatus; createdAt: string; updatedAt: string; workspace: string;
   branch: string; baseCommit: string; headCommit?: string; tasks: TeamTask[]; members: TeamMember[];
-  decisions: TeamDecision[]; checks: TeamCheck[]; steering: { text: string; revision: number; at: string; source?: { kind: "connector"; id: string; name: string } | "coordinator" | "slack" }[];
+  decisions: TeamDecision[]; checks: TeamCheck[]; steering: { text: string; revision: number; at: string; source?: { kind: "connector" | "github-review"; id: string; name: string } | "coordinator" | "slack" }[];
   events: { at: string; text: string }[]; reason?: string; round: number;
   review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
   deliveryReceipt?: { revision: number; headCommit: string; pullRequestUrl: string; mergeCommit: string; summary: string; reportedAt: string };
@@ -284,6 +284,11 @@ export function goalControls(goal: ProductGoal, role: DeviceRole | undefined, fr
 
 export function lines(value: string) {
   return value.split("\n").map(line => line.trim()).filter(Boolean);
+}
+
+export function directionSourceLabel(source: { kind: string; name: string } | string | undefined): string {
+  if (typeof source === "object") return source.kind === "github-review" ? "Owner (GitHub review)" : source.name;
+  return source === "coordinator" ? "Mission coordinator" : "You";
 }
 
 export function shortDate(iso: string) {

@@ -12,7 +12,7 @@ import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { accountSettingPrompt, PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@infinite/attention";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
-import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamContinue, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryView, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
+import { buildTeamPendingOperation, createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamMemberRetireSchema, teamParallelismSchema, recordedTeamReportEnvelopeSchema, type CreateTeam, type TeamContinue, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryView, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
 import { pullRequestBranch, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
 import { reviewEvidenceProblems } from "./team-acceptance.js";
@@ -343,7 +343,7 @@ export class TeamService {
         this.save(stored); this.trackBlocked(stored);
       }
       if (stored.pending) {
-        for (const check of stored.run.checks) if (check.status === "running") { check.status = "interrupted"; check.finishedAt = timestamp(); }
+        stored.run.checks = stored.run.checks.map(check => check.status === "running" ? { ...check, status: "interrupted", finishedAt: timestamp() } : check);
         const pending = stored.pending, run = stored.run;
         const recoverableMarker = validVerificationRecovery(stored);
         const legacyGuardFailure = run.reason === LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON;
@@ -595,7 +595,7 @@ export class TeamService {
     const ready = run.tasks.filter(task => task.status === "pending" && task.dependsOn.every(id => run.tasks.find(item => item.id === id)?.status === "integrated")).length +
       (run.discovery && run.discovery.revision === run.revision && !run.discovery.completedAt ? run.discovery.tasks.filter(task => task.status === "pending").length : 0);
     const workers = { limit: run.parallelism, max, running: members.filter(member => holdsWorkerSlot(member, run.revision)).length, ready };
-    return { ...safeRun, ...(stored.pending ? { pendingOperation: { id: stored.pending.id, kind: stored.pending.kind, revision: stored.pending.revision, failed: Boolean(stored.pending.failure), ...(stored.pending.failure?.code ? { failureCode: stored.pending.failure.code } : {}), ...(stored.pending.source ? { sourceMemberId: stored.pending.source.memberId, sourceRole: stored.pending.source.role } : {}), ...(stored.census?.pendingId === stored.pending.id ? { processes: stored.census.state, processesCheckedAt: stored.census.at } : {}) } } : {}), tasks: safeRun.tasks.map(task => {
+    return { ...safeRun, ...(stored.pending ? { pendingOperation: buildTeamPendingOperation({ id: stored.pending.id, kind: stored.pending.kind, revision: stored.pending.revision, failure: stored.pending.failure, source: stored.pending.source, census: stored.census?.pendingId === stored.pending.id ? stored.census : undefined }) } : {}), tasks: safeRun.tasks.map(task => {
       const revision = task.revision ?? safeRun.revision;
       const attempts = withUsage.members.filter(member => member.taskId === task.id && member.revision === revision);
       const usage = attempts.flatMap(member => member.usage?.messages ? [member.usage] : []);
@@ -2416,7 +2416,7 @@ export class TeamService {
           else if (recoveryTurnEnd(data as unknown as SignalData) || (data.kind === "notice" && data.type === "quota_auto_resume_fired")) limit = undefined;
           continue;
         }
-        const parsed = teamReportEnvelopeSchema.safeParse(event.data);
+        const parsed = recordedTeamReportEnvelopeSchema.safeParse(event.data);
         if (!parsed.success) continue;
         const envelope = parsed.data;
         if (envelope.runId !== run.id || envelope.memberId !== member.memberId || envelope.revision !== member.revision) continue;
@@ -3177,23 +3177,23 @@ export class TeamService {
         this.save(stored);
       });
       for (const { context, ...entry } of commands) {
-        const check: TeamRun["checks"][number] = { ...entry, status: "running", startedAt: timestamp(), output: "", revision, round: run.round, headCommit: head };
-        await this.enqueue(stored.run.id, () => { if (!this.closed) { run.checks.push(check); this.save(stored); } });
+        const baseCheck = { ...entry, startedAt: timestamp(), revision, round: run.round, headCommit: head }, runningCheck: TeamRun["checks"][number] = { ...baseCheck, status: "running", output: "" };
+        await this.enqueue(stored.run.id, () => { if (!this.closed) { run.checks.push(runningCheck); this.save(stored); } });
         const scanner = new CheckOutputScanner(), metrics = metricObserver();
         let result: CommandResult;
         try { result = await teamCommand(entry.command, verification.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix, undefined, undefined, STOP_SETTLE_MS, (chunk, stream) => { metrics.push(chunk, stream); scanner.push(chunk, stream); }); }
         catch (error) {
-          if (error instanceof TeamError && error.code === "command-stop-unconfirmed") await this.enqueue(stored.run.id, () => { if (!this.closed) { Object.assign(check, { status: "interrupted", finishedAt: timestamp() }); this.save(stored); } });
+          if (error instanceof TeamError && error.code === "command-stop-unconfirmed") await this.enqueue(stored.run.id, () => { if (!this.closed) { const i = run.checks.indexOf(runningCheck); if (i >= 0) run.checks[i] = { ...baseCheck, status: "interrupted", finishedAt: timestamp(), output: "" }; this.save(stored); } });
           throw error;
         }
-        const status = result.interrupted ? "interrupted" : result.exitCode === 0 ? "passed" : "failed";
-        Object.assign(check, { status, finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, ...(status === "passed" ? {} : { scan: scanner.finish() }) });
-        metrics.record(stored, check);
-        results.push(check);
-        await this.enqueue(stored.run.id, () => { if (!this.closed) this.save(stored); });
+        const finishedCheck: TeamRun["checks"][number] = result.interrupted ? { ...baseCheck, status: "interrupted", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, scan: scanner.finish() }
+          : result.exitCode === 0 ? { ...baseCheck, status: "passed", finishedAt: timestamp(), exitCode: 0, output: result.output }
+          : { ...baseCheck, status: "failed", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, scan: scanner.finish() };
+        results.push(finishedCheck);
+        await this.enqueue(stored.run.id, () => { if (!this.closed) { const i = run.checks.indexOf(runningCheck); if (i >= 0) run.checks[i] = finishedCheck; metrics.record(stored, finishedCheck); this.save(stored); } });
         await this.noteLeftover(stored, result);
         if (!signal.aborted) await assertMemberReadOnly(verification.workspace, head, this.config.teams?.commandPrefix, signal, context);
-        if (check.status !== "passed") break;
+        if (finishedCheck.status !== "passed") break;
       }
       if (!this.closed && !signal.aborted) await assertMemberReadOnly(run.workspace, head, this.config.teams?.commandPrefix, signal, "integration");
       return results;

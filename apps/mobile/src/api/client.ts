@@ -236,7 +236,7 @@ export type Mission = {
   createdAt: string; updatedAt: string; lineup: TeamLineup;
   coordinator?: { memberId: string; sessionId: string; status: "running" | "waiting" | "stopped" };
   dispatchSummary?: string; subtasks: MissionSubtask[]; decisions: MissionDecision[];
-  steering: { text: string; revision: number; at: string; source?: { kind: "connector"; id: string; name: string } | "coordinator" | "slack" }[]; events: { at: string; text: string }[];
+  steering: { text: string; revision: number; at: string; source?: { kind: "connector" | "github-review"; id: string; name: string } | "coordinator" | "slack" }[]; events: { at: string; text: string }[];
   result?: { summary: string; revision: number; at: string };
   usage?: MissionUsage;
 };

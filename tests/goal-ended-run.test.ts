@@ -61,6 +61,7 @@ test("an ended run with a running member writes its event once and leaves the go
     await sleep(1500);
     const passFive = readFileSync(file);
     assert.equal(eventCount(record()), 1, "The ended run writes its event once");
+    assert.equal(JSON.stringify(goals.get(f.goal.id)).includes("endedAs"), false, "The client read of the goal carries no scheduler marker");
     assert.deepEqual(passFive, passTwo, "The goal file bytes do not change while nothing changes");
 
     goals.close();

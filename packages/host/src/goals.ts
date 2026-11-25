@@ -39,6 +39,7 @@ type Stored = {
   control?: PendingControl;
   extensionIntent?: GoalExtensionIntent;
   launchRetryAt?: string;
+  endedAs?: { teamId: string; status: string; headCommit?: string };
   ownerHalt?: { haltId: string; revision: number; run?: { teamId: string; token: string } };
   objectiveRecord?: unknown;
   objectiveNotice?: ObjectiveUnavailable;
@@ -720,10 +721,9 @@ export class GoalService {
         }
       } else {
       this.refresh(stored, team);
-      const cycle = goal.cycles.find(value => value.teamId === team!.id)!;
       const ended = ["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status);
-      if (!ended) delete cycle.endedAs;
-      const classified = ended && cycle.endedAs?.status === team.status && cycle.endedAs.headCommit === team.headCommit;
+      if (!ended) delete stored.endedAs;
+      const classified = ended && stored.endedAs?.teamId === team.id && stored.endedAs.status === team.status && stored.endedAs.headCommit === team.headCommit;
       if (ended) {
         settleMetrics(stored, team.id, this.teams.reviewedObservations?.(team.id));
         if (["running", "needs-input"].includes(goal.status) && ["ready-for-review", "merged", "no-change"].includes(team.status) && team.linear && team.linear.status !== "synced") {
@@ -735,7 +735,7 @@ export class GoalService {
         if (team.members.every(member => ["stopped", "waiting"].includes(member.status))) goal.activeTeamId = undefined;
         if (goal.standing) { if (!goal.activeTeamId) this.settleCycle(stored, goal.cycles.find(value => value.teamId === team!.id)!, team); }
         else if (["running", "needs-input"].includes(goal.status) && !classified) {
-          cycle.endedAs = { status: team.status, headCommit: team.headCommit };
+          stored.endedAs = { teamId: team.id, status: team.status, headCommit: team.headCommit };
           if (team.status === "blocked" || team.status === "cancelled") {
             const deadlineStopped = team.stopReason === "deadline" || goal.stopReason === "deadline" || goal.deadlineContinuation === true;
             if (deadlineStopped) { goal.stopReason = "deadline"; goal.deadlineContinuation = true; }

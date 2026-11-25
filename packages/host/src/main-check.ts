@@ -30,6 +30,7 @@ const NOTICE_FLIGHT_MS = 60_000;
 const WITNESS_SAVE_MS = 200;
 const WITNESS_SAMPLES = [250, 1_000, 5_000];
 const WITNESS_SAMPLE_MS = 15_000;
+const GATE_PATH = "main-check-gate";
 
 type Slot = { record?: MainCheckRecord; unreadable?: true };
 type Step = { phase: "setup" | "verification"; command: TeamCommand };
@@ -405,7 +406,7 @@ export class MainCheckService {
     const boot = this.ports.bootId();
     const witness: ProcessWitness = { boot, processes: [], sessions: [], groups: [] };
     try {
-      const result = await this.ports.processes.census(witness, this.rootOf(project), this.config.teams?.commandPrefix);
+      const result = await this.ports.processes.census(witness, join(this.rootOf(project), GATE_PATH), this.config.teams?.commandPrefix);
       return result.ok ? { boot, result } : undefined;
     } catch {
       return undefined;

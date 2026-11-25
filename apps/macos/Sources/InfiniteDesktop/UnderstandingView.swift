@@ -31,11 +31,13 @@ struct UnderstandingView: View {
         var id: String { rawValue }
     }
 
-    private var offlineScope: String { "\(hostCacheIdentity)|\(cachedCredentialScope)" }
     private var groups: [ProjectGroup] {
         var combined = app.projectGroups.groups
-        if !cachedCredentialScope.isEmpty, cachedCredentialScope != "unavailable", offlineWorkspacesScope == offlineScope {
-            for cached in offlineWorkspaces where !combined.contains(where: { $0.id == cached.id }) { combined.append(cached) }
+        if !offlineWorkspaces.isEmpty {
+            let liveCredential = credentialCacheIdentity
+            if liveCredential != "unavailable", liveCredential == cachedCredentialScope, offlineWorkspacesScope == "\(hostCacheIdentity)|\(liveCredential)" {
+                for cached in offlineWorkspaces where !combined.contains(where: { $0.id == cached.id }) { combined.append(cached) }
+            }
         }
         return ProjectGroup.ordered(combined)
     }
@@ -627,13 +629,13 @@ struct UnderstandingView: View {
         offlineWorkspacesTask = Task {
             let store = await UnderstandingSnapshotStore.shared()
             guard let recent = try? await store.readRecent(host: host, credential: credential) else {
-                if !Task.isCancelled, hostCacheIdentity == host, cachedCredentialScope == credential {
+                if !Task.isCancelled, hostCacheIdentity == host, cachedCredentialScope == credential, credentialCacheIdentity == credential {
                     offlineWorkspaces = []
                     offlineWorkspacesScope = nextScope
                 }
                 return
             }
-            guard !Task.isCancelled, hostCacheIdentity == host, cachedCredentialScope == credential else { return }
+            guard !Task.isCancelled, hostCacheIdentity == host, cachedCredentialScope == credential, credentialCacheIdentity == credential else { return }
             var seen = Set<String>()
             offlineWorkspaces = recent.compactMap { cached in
                 guard let data = cached.envelope.overview, let page = try? JSON.parse(data) else { return nil }

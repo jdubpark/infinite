@@ -8,10 +8,11 @@ import { nearestDirectoryDefault, saveDirectoryDefault } from "../packages/host/
 
 type DefaultEntry = { teamId: string; projectId?: string };
 
+type PrivateJsonWriter = Parameters<typeof saveDirectoryDefault>[3];
+
 type SimulatorOps = {
-  save(defaultsPath: string, directory: string, value: DefaultEntry): void;
+  save(defaultsPath: string, directory: string, value: DefaultEntry, io?: PrivateJsonWriter): void;
   lookup(defaultsPath: string, directory: string): (DefaultEntry & { origin: string }) | undefined;
-  interruptWrite(defaultsPath: string, directory: string, seed: number, step: number): void;
 };
 
 function createRng(seed: number) {
@@ -42,12 +43,32 @@ function expectedDefault(
   return undefined;
 }
 
-function atomicInterruptWrite(defaultsPath: string, directory: string, seed: number, step: number) {
-  const dirStore = `${defaultsPath}.d`;
-  mkdirSync(dirStore, { recursive: true, mode: 0o700 });
-  const hash = createHash("sha256").update(directory).digest("hex");
-  writeFileSync(join(dirStore, `${hash}.json.interrupted-${seed}-${step}.tmp`), "{\"version\":1,\"directory\":");
-  writeFileSync(`${defaultsPath}.interrupted-${seed}-${step}.tmp`, "{\"version\":1");
+class SimulatedCrashError extends Error {
+  constructor(phase: "write" | "rename") {
+    super(`simulated crash during ${phase}`);
+  }
+}
+
+function interruptRealSave(ops: SimulatorOps, defaultsPath: string, directory: string, value: DefaultEntry, step: number) {
+  let intercepted = false;
+  const crashInWrite = step % 2 === 0;
+  const io: PrivateJsonWriter = crashInWrite
+    ? {
+      writeFileSync(filePath, data, options) {
+        intercepted = true;
+        const partial = typeof data === "string" ? data.slice(0, 20) : Buffer.from(data as Uint8Array).subarray(0, 20);
+        writeFileSync(filePath, partial, options);
+        throw new SimulatedCrashError("write");
+      },
+    }
+    : {
+      renameSync() {
+        intercepted = true;
+        throw new SimulatedCrashError("rename");
+      },
+    };
+  assert.throws(() => ops.save(defaultsPath, directory, value, io), SimulatedCrashError);
+  assert.equal(intercepted, true);
 }
 
 function runSimulation(seeds: number[], ops: SimulatorOps) {
@@ -104,7 +125,7 @@ function runSimulation(seeds: number[], ops: SimulatorOps) {
             directories: Object.fromEntries(legacyDefaults),
           }, null, 2));
         } else {
-          ops.interruptWrite(defaultsPath, target, seed, step);
+          interruptRealSave(ops, defaultsPath, target, makeEntry(), step);
         }
 
         for (const query of directories) {
@@ -129,21 +150,21 @@ function runSimulation(seeds: number[], ops: SimulatorOps) {
 const realOps: SimulatorOps = {
   save: saveDirectoryDefault,
   lookup: nearestDirectoryDefault,
-  interruptWrite: atomicInterruptWrite,
 };
 
-test("nearestDirectoryDefault preserves nearest-ancestor lookup and unrelated entries across legacy migration, overrides, and interrupted tmp writes", () => {
+test("nearestDirectoryDefault preserves nearest-ancestor lookup and unrelated entries across legacy migration, overrides, and interrupted saves", () => {
   runSimulation([1, 7, 42, 1337, 9001], realOps);
 });
 
-test("simulator catches non-atomic crash truncation, shallowest-ancestor lookup, and sibling clobbering", () => {
+test("simulator catches non-atomic direct overwrite, shallowest-ancestor lookup, and sibling clobbering", () => {
   assert.throws(() => runSimulation([42], {
     ...realOps,
-    interruptWrite(defaultsPath, directory) {
+    save(defaultsPath, directory, value, io) {
       const dirStore = `${defaultsPath}.d`;
       mkdirSync(dirStore, { recursive: true, mode: 0o700 });
       const hash = createHash("sha256").update(directory).digest("hex");
-      writeFileSync(join(dirStore, `${hash}.json`), "{\"version\":1,\"directory\":");
+      const payload = JSON.stringify({ version: 1, directory, ...value }, null, 2) + "\n";
+      (io?.writeFileSync ?? writeFileSync)(join(dirStore, `${hash}.json`), payload, { mode: 0o600 });
     },
   }), /Private CLI state is unreadable/);
 
@@ -162,7 +183,7 @@ test("simulator catches non-atomic crash truncation, shallowest-ancestor lookup,
 
   assert.throws(() => runSimulation([42], {
     ...realOps,
-    save(defaultsPath, directory, value) {
+    save(defaultsPath, directory, value, io) {
       const dirStore = `${defaultsPath}.d`;
       const hash = createHash("sha256").update(directory).digest("hex");
       if (existsSync(dirStore)) {
@@ -170,7 +191,7 @@ test("simulator catches non-atomic crash truncation, shallowest-ancestor lookup,
           if (entry.endsWith(".json") && entry !== `${hash}.json`) rmSync(join(dirStore, entry), { force: true });
         }
       }
-      saveDirectoryDefault(defaultsPath, directory, value);
+      saveDirectoryDefault(defaultsPath, directory, value, io);
     },
   }), (error: unknown) => error instanceof Error && (error.name === "AssertionError" || (error as NodeJS.ErrnoException).code === "ENOENT"));
 });

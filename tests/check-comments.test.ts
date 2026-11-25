@@ -138,16 +138,24 @@ describe("check-comments extractor", () => {
       "# comment after arithmetic shift",
       "(( (a << 2) > 0 ))",
       "# comment after compound arithmetic shift",
+      "n=$(( ((1) + 2) * 3 ))",
+      "cat <<EOF",
+      "# payload after grouped arithmetic",
+      "EOF",
+      "a[1<<2]=OK",
+      "# comment after array subscript shift",
     ].join("\n");
-    assert.equal(summarizeFileComments(arithmetic, "scripts/demo.sh").blocks, 2);
+    assert.equal(summarizeFileComments(arithmetic, "scripts/demo.sh").blocks, 3);
 
     const dotted = [
       "cat <<END.TXT",
       "# inside dotted heredoc",
       "END.TXT",
       "# comment after dotted heredoc",
-      "cat <<$DYNAMIC",
-      "# comment after unexpanded delimiter",
+      "cat <<END$TAG",
+      "# inside dollar heredoc",
+      "END$TAG",
+      "# comment after dollar heredoc",
       "cat <<'UNCLOSED",
       "'",
       "# comment after unclosed quote closes",

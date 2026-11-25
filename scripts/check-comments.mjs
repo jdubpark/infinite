@@ -312,7 +312,6 @@ function parseHeredocOperator(line, index) {
     }
     if (quote === '"') {
       if (ch === '"') { quote = null; k += 1; continue; }
-      if (ch === "$" || ch === "`") return null;
       if (ch === "\\") {
         if (k + 1 >= line.length) return null;
         const nextCh = line[k + 1];
@@ -338,7 +337,6 @@ function parseHeredocOperator(line, index) {
       k += 2;
       continue;
     }
-    if (ch === "$" || ch === "`") return null;
     delimiter += ch;
     hasWordChars = true;
     k += 1;
@@ -365,6 +363,7 @@ function extractShellComments(text) {
       continue;
     }
     if (idx === 0 && line.startsWith("#!")) continue;
+    let bracketDepth = 0;
     for (let j = 0; j < line.length; j += 1) {
       const c = line[j];
       if (!inSingle && c === "\\") { j += 1; continue; }
@@ -372,7 +371,7 @@ function extractShellComments(text) {
       if (c === '"' && !inSingle) { inDouble = !inDouble; continue; }
       if (!inSingle) {
         if (c === "$" && line[j + 1] === "(" && line[j + 2] === "(") { arithStack.push(0); j += 2; continue; }
-        if (!inDouble && paramDepth === 0 && c === "(" && line[j + 1] === "(") { arithStack.push(0); j += 1; continue; }
+        if (!inDouble && paramDepth === 0 && arithStack.length === 0 && c === "(" && line[j + 1] === "(") { arithStack.push(0); j += 1; continue; }
         if (arithStack.length > 0) {
           if (c === "(") { arithStack[arithStack.length - 1] += 1; continue; }
           if (c === ")") {
@@ -382,8 +381,12 @@ function extractShellComments(text) {
         }
         if (c === "$" && line[j + 1] === "{") { paramDepth += 1; j += 1; continue; }
         if (paramDepth > 0 && c === "}") { paramDepth -= 1; continue; }
+        if (!inDouble && paramDepth === 0 && arithStack.length === 0) {
+          if (c === "[") { bracketDepth += 1; continue; }
+          if (c === "]" && bracketDepth > 0) { bracketDepth -= 1; continue; }
+        }
       }
-      if (!inSingle && !inDouble && paramDepth === 0 && arithStack.length === 0 && c === "<" && line[j + 1] === "<") {
+      if (!inSingle && !inDouble && paramDepth === 0 && arithStack.length === 0 && bracketDepth === 0 && c === "<" && line[j + 1] === "<") {
         if (line[j + 2] === "<") {
           j += 2;
           continue;

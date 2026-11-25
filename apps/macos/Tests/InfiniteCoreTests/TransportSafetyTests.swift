@@ -5,12 +5,12 @@ import Network
 
 private actor AsyncLatch {
     private var completed = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
 
     func signal() {
         guard !completed else { return }
         completed = true
-        let pending = waiters
+        let pending = waiters.values
         waiters.removeAll()
         for waiter in pending { waiter.resume() }
     }
@@ -31,14 +31,23 @@ private actor AsyncLatch {
     }
 
     private func awaitSignal() async {
-        if completed { return }
-        await withCheckedContinuation { continuation in
-            if completed {
-                continuation.resume()
-            } else {
-                waiters.append(continuation)
+        if completed || Task.isCancelled { return }
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if completed || Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    waiters[id] = continuation
+                }
             }
+        } onCancel: {
+            Task { await self.cancelWaiter(id) }
         }
+    }
+
+    private func cancelWaiter(_ id: UUID) {
+        waiters.removeValue(forKey: id)?.resume()
     }
 }
 
@@ -364,6 +373,18 @@ final class TransportSafetyTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("limit"))
         }
         await helper.stop()
+    }
+
+    func testAsyncLatchTimesOutPromptlyWithoutSignal() async {
+        let latch = AsyncLatch()
+        let start = ContinuousClock.now
+        do {
+            try await latch.wait(timeout: .milliseconds(25))
+            XCTFail("Expected unsignaled AsyncLatch to time out")
+        } catch {
+            let elapsed = ContinuousClock.now - start
+            XCTAssertLessThan(elapsed, .seconds(1))
+        }
     }
 
     private func waitUntil(timeout: Duration, condition: @escaping @Sendable () async -> Bool) async throws {

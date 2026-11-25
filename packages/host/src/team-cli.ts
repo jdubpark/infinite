@@ -47,11 +47,12 @@ const directoryDefaultsSchema = z.object({
   directories: z.record(z.string(), directoryDefaultValueSchema),
 }).strict();
 
-function privateJson(path: string, value: unknown) {
+type PrivateJsonWriter = { writeFileSync?: typeof writeFileSync; renameSync?: typeof renameSync };
+function privateJson(path: string, value: unknown, io?: PrivateJsonWriter) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.${randomUUID()}.tmp`;
-  writeFileSync(temporary, JSON.stringify(value, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-  try { renameSync(temporary, path); } catch (error) { rmSync(temporary, { force: true }); throw error; }
+  (io?.writeFileSync ?? writeFileSync)(temporary, JSON.stringify(value, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+  try { (io?.renameSync ?? renameSync)(temporary, path); } catch (error) { rmSync(temporary, { force: true }); throw error; }
 }
 function readPrivateJson(path: string, fallback: unknown) {
   try { return JSON.parse(readFileSync(path, "utf8")); } catch (error) {
@@ -264,16 +265,11 @@ function readLegacyDirectoryDefaults(path: string) {
     throw new Error("Saved directory Linear defaults are invalid; preserve private team CLI state and inspect it before retrying.");
   return parsed.data;
 }
-export function saveDirectoryDefault(path: string, directory: string, value: { teamId: string; projectId?: string }) {
+export function saveDirectoryDefault(path: string, directory: string, value: { teamId: string; projectId?: string }, io?: PrivateJsonWriter) {
   if (invalidDefaultDirectory(directory))
     throw new Error("Saved directory Linear defaults are invalid; preserve private team CLI state and inspect it before retrying.");
   const validated = directoryDefaultValueSchema.parse(value);
-  privateJson(directoryDefaultPath(path, directory), {
-    version: 1,
-    directory,
-    teamId: validated.teamId,
-    ...(validated.projectId ? { projectId: validated.projectId } : {}),
-  });
+  privateJson(directoryDefaultPath(path, directory), { version: 1, directory, teamId: validated.teamId, ...(validated.projectId ? { projectId: validated.projectId } : {}) }, io);
 }
 export function nearestDirectoryDefault(path: string, directory: string) {
   const legacy = existsSync(path) ? readLegacyDirectoryDefaults(path) : undefined;

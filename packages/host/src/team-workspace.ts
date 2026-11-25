@@ -37,6 +37,13 @@ export const EXIT_DRAIN_MS = 1_000;
 const EXIT_DRAIN_TURNS = 3;
 export const STOP_GRACE_MS = 5_000;
 export const STOP_SETTLE_MS = 10_000;
+export const COMMAND_STOP_UNCONFIRMED_REASON = "The host stopped a configured team command but cannot confirm that it ended, so it may still be running. The host starts nothing more for this run until a process census finds none of that operation's processes; Resume is accepted after that.";
+function stopUnconfirmed() { return new TeamError(409, "command-stop-unconfirmed", COMMAND_STOP_UNCONFIRMED_REASON); }
+export async function teamOperationCommand(command: TeamCommand, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, prefix?: TeamCommand, input?: string, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
+  const result = await teamCommand(command, cwd, signal, timeoutMs, prefix, input, undefined, STOP_SETTLE_MS, onOutput);
+  if (prefix && result.interrupted) throw stopUnconfirmed();
+  return result;
+}
 export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string, extraEnv?: Record<string, string>, forceSettleAfterMs?: number, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
   const scope = commandScope.getStore(), ready = scope?.starting();
   const run = () => runTeamCommand(scope, command, cwd, signal, timeoutMs, prefix, input, extraEnv, forceSettleAfterMs, onOutput);
@@ -126,7 +133,8 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       }
       stopRequested = true;
       interrupted = true;
-      if (signalGroup("SIGTERM")) {
+      if (!prefix) signalGroup("SIGKILL");
+      else if (signalGroup("SIGTERM")) {
         const graceTimer = setTimeout(() => {
           if (leaderRuns()) signalGroup("SIGKILL");
         }, STOP_GRACE_MS);
@@ -138,7 +146,7 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
           settled = true;
           finish();
           abandon();
-          reject(new TeamError(409, "command-stop-unconfirmed", "A configured team command did not close after the host tried to stop it."));
+          reject(stopUnconfirmed());
         }, forceSettleAfterMs);
         stopTimer.unref();
       }

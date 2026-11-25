@@ -45,7 +45,7 @@ import type { Readings } from "./readings.js";
 import { projectGithubRepository, sessionGithubScope } from "./github-grants.js";
 import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
-import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, commandScope, type CommandResult, type CommandScope, STOP_SETTLE_MS, teamCommand, teamHead, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
+import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, commandScope, type CommandResult, type CommandScope, COMMAND_STOP_UNCONFIRMED_REASON, teamOperationCommand, teamCommand, teamHead, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { permissionEvidenceHash } from "./team-permissions.js";
@@ -219,6 +219,10 @@ function obsoletePermissionResult(stored: Stored, pending: PendingOperation) {
   return candidates.length === 1 && (pending.source || reported.length === 1) ? candidates[0] : undefined;
 }
 
+function stoppedCommandEnded(stored: Stored) {
+  const pending = stored.pending;
+  return pending?.failure?.code === "command-stop-unconfirmed" && stored.census?.pendingId === pending.id && stored.census.state === "ended";
+}
 export function blockedTeamCanResume(input: {
   status: string;
   reason?: string;
@@ -231,7 +235,7 @@ export function blockedTeamCanResume(input: {
   verificationRecovery?: boolean;
 }): boolean {
   return input.status === "blocked"
-    && (input.verificationRecovery === true || input.reason === memberStallReason || input.reason === memberTimeLimitReason || input.reason === checkTimeoutReason)
+    && (input.verificationRecovery === true || input.reason === memberStallReason || input.reason === memberTimeLimitReason || input.reason === checkTimeoutReason || input.reason === COMMAND_STOP_UNCONFIRMED_REASON)
     && input.prepared
     && !input.pending
     && !input.deliveryAttempt
@@ -509,7 +513,7 @@ export class TeamService {
     return blockedTeamCanResume({
       status: run.status,
       reason: verificationRecovery ? verificationRecoveryReason : run.reason,
-      pending: Boolean(stored.pending) && !verificationRecovery,
+      pending: Boolean(stored.pending) && !verificationRecovery && !stoppedCommandEnded(stored),
       deliveryAttempt: Boolean(stored.deliveryAttempt),
       deliveryReceipt: Boolean(run.deliveryReceipt),
       prepared: stored.prepared,
@@ -1132,7 +1136,7 @@ export class TeamService {
               : await prepareTeamWorkspace(workspaceSource.path, root, directoryName, branch, this.config.teams?.commandPrefix, signal, workspaceSource.head, anchor, workspaceSource.startCommit);
             assertParent();
             if (project.team?.setup) {
-              const setup = await teamCommand(project.team.setup, workspace.workspace, signal, 600000, this.config.teams?.commandPrefix, undefined, undefined, STOP_SETTLE_MS);
+              const setup = await teamOperationCommand(project.team.setup, workspace.workspace, signal, 600000, this.config.teams?.commandPrefix);
               await this.noteLeftover(stored, setup);
               if (setup.exitCode !== 0 || setup.interrupted) throw new TeamError(409, "team-setup-failed", "The configured setup command failed. Inspect the isolated workspace before restarting.");
               await assertMemberReadOnly(workspace.workspace, workspace.baseCommit, this.config.teams?.commandPrefix, signal, "setup");
@@ -1185,6 +1189,7 @@ export class TeamService {
       const stored = this.record(id);
       if (this.replay(stored, "steer", body)) return this.view(stored);
       if (stored.deliveryAttempt || stored.run.deliveryReceipt) throw new TeamError(409, "delivery-reconciliation-required", "Inspect the recorded pull request before starting another run; steering cannot replay a started delivery.");
+      await this.settleStoppedCommand(stored);
       if (stored.pending && !this.commands.has(id)) throw new TeamError(409, "team-reconciliation-required", "This team has an unresolved workspace or verification operation. Inspect its evidence and start a new team rather than replaying uncertain work.");
       if (stored.pending && stored.pending.kind !== "check") throw new TeamError(409, "team-operation-running", "A workspace operation is in progress. Retry steering after it settles.");
       if (stored.run.workspaceRemovedAt) throw new TeamError(409, "team-workspace-removed", "This run's workspaces were removed under the retention policy; start a new run.");
@@ -1440,6 +1445,7 @@ export class TeamService {
         if (tracking && JSON.stringify(run.linear) !== JSON.stringify(tracking)) { run.linear = tracking; this.save(stored); }
       }
       if (action === "pause" && (["ready-for-review", "merged", "no-change"].includes(run.status) || run.status === "blocked" && !run.workspaceRemovedAt)) throw new TeamError(409, "team-not-running", "This team is not running and cannot be paused.");
+      if (action === "resume") await this.settleStoppedCommand(stored);
       const verificationRecovery = action === "resume" && validVerificationRecovery(stored) ? stored.verificationRecovery : undefined;
       if (action === "resume") { const refusal = this.resumeRefusal(stored, verificationRecovery); if (refusal) throw refusal; }
       if (action === "resume" && verificationRecovery) return this.resumeVerificationRecovery(stored, body, verificationRecovery);
@@ -1813,6 +1819,25 @@ export class TeamService {
       this.save(stored);
     }
     return census.state;
+  }
+  private replaceCheck(stored: Stored, running: TeamRun["checks"][number], finished: TeamRun["checks"][number], observe?: () => void) {
+    return this.enqueue(stored.run.id, () => {
+      if (this.closed) return;
+      const index = stored.run.checks.indexOf(running);
+      if (index >= 0) stored.run.checks[index] = finished;
+      observe?.();
+      this.save(stored);
+    });
+  }
+  private async settleStoppedCommand(stored: Stored) {
+    const pending = stored.pending;
+    if (pending?.failure?.code !== "command-stop-unconfirmed" || this.commands.has(stored.run.id)) return;
+    if (await this.refreshOperationCensus(stored, true) !== "ended")
+      throw new TeamError(409, "team-command-running", "An earlier command of this run may still be running. The host accepts this request once a process census finds none of that operation's processes.");
+    if (stored.pending !== pending) return;
+    stored.pending = undefined;
+    this.event(stored, "The host sees no process of the stopped command's operation; the run can resume.");
+    this.save(stored);
   }
   private operation<T>(stored: Stored, kind: NonNullable<Stored["pending"]>["kind"], perform: (signal: AbortSignal) => Promise<T>, complete: (value: T) => void,
     sourceMember?: TeamMember, sourceWorkspace: "member" | "integration" = "member") {
@@ -2562,7 +2587,7 @@ export class TeamService {
         ? role === "reviewer" ? run.verification?.setup : undefined
         : this.config.projects.find(project => project.id === run.projectId)!.team!.setup;
       if (setup) {
-        const setupCommand = this.replays.setupFor(run, this.config.teams?.commandPrefix); const result = await teamCommand(setup, cwd, signal, 600000, setupCommand.prefix, setupCommand.input, undefined, STOP_SETTLE_MS);
+        const setupCommand = this.replays.setupFor(run, this.config.teams?.commandPrefix); const result = await teamOperationCommand(setup, cwd, signal, 600000, setupCommand.prefix, setupCommand.input);
         await this.noteLeftover(stored, result);
         if (result.exitCode !== 0 || result.interrupted) throw new TeamError(409, "team-setup-failed", "A member's configured setup command failed. Its isolated workspace was preserved.");
         await assertMemberReadOnly(cwd, member.baseCommit, this.prefixFor(run), signal, "setup");
@@ -3181,16 +3206,17 @@ export class TeamService {
         await this.enqueue(stored.run.id, () => { if (!this.closed) { run.checks.push(runningCheck); this.save(stored); } });
         const scanner = new CheckOutputScanner(), metrics = metricObserver();
         let result: CommandResult;
-        try { result = await teamCommand(entry.command, verification.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix, undefined, undefined, STOP_SETTLE_MS, (chunk, stream) => { metrics.push(chunk, stream); scanner.push(chunk, stream); }); }
-        catch (error) {
-          if (error instanceof TeamError && error.code === "command-stop-unconfirmed") await this.enqueue(stored.run.id, () => { if (!this.closed) { const i = run.checks.indexOf(runningCheck); if (i >= 0) run.checks[i] = { ...baseCheck, status: "interrupted", finishedAt: timestamp(), output: "" }; this.save(stored); } });
+        try {
+          result = await teamOperationCommand(entry.command, verification.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix, undefined, (chunk, stream) => { metrics.push(chunk, stream); scanner.push(chunk, stream); });
+        } catch (error) {
+          if (error instanceof TeamError && error.code === "command-stop-unconfirmed") await this.replaceCheck(stored, runningCheck, { ...baseCheck, status: "interrupted", finishedAt: timestamp(), output: "" });
           throw error;
         }
         const finishedCheck: TeamRun["checks"][number] = result.interrupted ? { ...baseCheck, status: "interrupted", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, scan: scanner.finish() }
           : result.exitCode === 0 ? { ...baseCheck, status: "passed", finishedAt: timestamp(), exitCode: 0, output: result.output }
           : { ...baseCheck, status: "failed", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, scan: scanner.finish() };
         results.push(finishedCheck);
-        await this.enqueue(stored.run.id, () => { if (!this.closed) { const i = run.checks.indexOf(runningCheck); if (i >= 0) run.checks[i] = finishedCheck; metrics.record(stored, finishedCheck); this.save(stored); } });
+        await this.replaceCheck(stored, runningCheck, finishedCheck, () => metrics.record(stored, finishedCheck));
         await this.noteLeftover(stored, result);
         if (!signal.aborted) await assertMemberReadOnly(verification.workspace, head, this.config.teams?.commandPrefix, signal, context);
         if (finishedCheck.status !== "passed") break;

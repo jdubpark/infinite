@@ -45,10 +45,9 @@ If you find existing private information while working, remove or replace it and
   If Linear access is unavailable, report the unsynchronized work explicitly
   and preserve its request identity rather than inventing a completed update.
 
-- Requirements: Node.js 22.14+ and npm. `npm ci` builds the shared `@infinite/attention` package during install.
-- In a network-off provider sandbox, the `tsx` CLI cannot open its IPC socket and tests that start a host cannot listen; run focused tests that start no server with `node --import tsx --test FILE`, and leave the rest to the host-run checks.
-- Run `npm run check` (typecheck, tests, builds) before declaring host or shared-package work complete.
-- For the phone app, also run `npm run lint -w @infinite/mobile` and `npx tsc --noEmit` in `apps/mobile`.
+- Run every test and test environment on InfiniteBox or another enrolled owner-operated cloud runner. This covers focused tests, lint, typechecks, builds, browser sessions, Docker, and native simulators in every worktree and agent harness. Local work consists of editing, Git, dispatch and reading results.
+- From the checkout, use `npm run check` for host or shared-package work. For individual commands use `python3 scripts/cloud-check.py -- COMMAND ARG...`. The runner captures this worktree, installs the locked dependencies, and returns the command's exit status. Keep the receipt with the result. If the runner or a required tool is unavailable, report the check as blocked.
+- For mobile work also run `npm run lint -w @infinite/mobile` and `npm run typecheck -w @infinite/mobile`. Select an enrolled macOS runner for Xcode, Swift desktop checks and iOS simulators. See [cloud verification](README.md#cloud-verification).
 - New durable state logic gets a seeded simulator. This covers a record the host writes and reloads, a request receipt, and any state machine that must survive a restart. The simulator generates operations and faults from a printed seed, checks named invariants after every step, and has one mutation per invariant that it must catch. Extend an existing simulator when one covers the module (`tests/outcome-projector-sim.test.ts`, `tests/search-engine-sim.test.ts`). Keep example tests for behaviour a simulator cannot reach, such as a real process or a real socket. Do not delete an existing test to make room for one.
 - Compare a rewrite or a port with the code it replaces on generated inputs before the old code is removed. State improvement work as a measured baseline, a numeric target, and the command that measures both.
 - Product, design, and protocol context: `PRODUCT.md`, `DESIGN.md`, `docs/architecture.md`, `docs/security.md`.

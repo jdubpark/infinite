@@ -10,6 +10,8 @@ Expo ships breaking changes every SDK release. APIs you remember are likely rena
 
 ## Commands
 
+Run these commands inside an enrolled cloud runner. From the workstation, `npm run lint -w @infinite/mobile` and `npm run typecheck -w @infinite/mobile` dispatch there. Use the repository cloud runner for Expo, emulator, and native checks as well.
+
 Use `bunx` instead of `npx` if the project uses bun (`bun.lock` present).
 
 ```bash
@@ -37,5 +39,5 @@ Docs: https://docs.expo.dev/eas/index.md
 ## Rules
 
 - If `ios/` and `android/` directories do not exist, they are generated (Continuous Native Generation). Never create or edit them by hand — configure native behavior in `app.json` and config plugins.
-- Expo Go only includes its bundled native modules. After adding a library with native code, the app needs a development build: `npx expo run:ios|android` locally, or `eas build --profile development`.
+- Expo Go includes its bundled native modules. After adding a library with native code, build it on an enrolled runner with the matching SDK. Use an owned Mac runner for iOS.
 - Prefer recommended Expo modules over third-party libraries, and check your available skills before adding dependencies. Docs: https://docs.expo.dev/versions/latest/index.md

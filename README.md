@@ -39,9 +39,9 @@ Run `infinite --laptop codex` inside your project to keep tools on the laptop. T
 
 An experimental `infinite --local-ui codex "Initial prompt"` mode runs Codex's interface locally while its backend remains on the host. Typing stays local; `resume` rejoins the recorded conversation. This requires a supported Codex binary on both machines and an initial prompt. See [local Codex usage and limits](docs/cli.md#experimental-local-codex-interface). OpenCode also supports `infinite --local-ui opencode`, including empty sessions; see [local OpenCode usage](docs/cli.md#experimental-local-opencode-interface).
 
-## Run locally
+## Run a development host on a cloud runner
 
-Requires Node.js 22.14+ and npm. Linux needs the usual C++/Python build tools for `node-pty`; macOS needs Xcode Command Line Tools.
+In a standing development checkout on an owner-operated server, install the repository's verification toolchain and the native build tools for `node-pty`. Keep the host and browser in that environment or forward its loopback port over SSH.
 
 ```sh
 npm ci
@@ -183,11 +183,37 @@ Unattended work is limited by each provider's permissions, quotas, authenticatio
 
 **An attacker controlling the active worker or guest root can read active files and memory.** Journal encryption does not change that. Workspace files, native CLI histories, swap, credentials, and backups need the separate storage/isolation controls described in [security](docs/security.md).
 
-## Checks and deployment
+## Cloud verification
+
+From a workstation, enroll an SSH alias for an owner-operated test account or VM in the checkout's private Git config. Verify its SSH host key through the owner's trusted channel first. Linked worktrees share this enrollment. The workstation needs Git, Python 3 and OpenSSH. The runner needs those tools, the Node version in `.nvmrc`, the npm version in `package.json`'s `packageManager` field, and the native build dependencies for the platform.
 
 ```sh
+git config --local --add infinite.verifyHost VERIFY_LINUX
 npm run check
+python3 scripts/cloud-check.py -- node --import tsx --test tests/chat.test.ts
+```
+
+Each run transfers the current Git revision, staged and unstaged edits, deletions, and eligible nonignored untracked files into a disposable cloud checkout. Git history stops at the captured commit. Ignored inputs, credentials, Git remotes and unrelated refs stay outside the snapshot. The runner installs dependencies with `npm ci` from that checkout's lockfile. The receipt identifies the source snapshot, lockfile, platform, tool versions, and exit status. Concurrent calls use separate directories. Keep commands that share build output, a service, or a browser session in a single invocation.
+
+Run `python3 scripts/install-cloud-check.py` once to install `infinite-check` for older worktrees as well. Run it again when upgrading the launcher. `infinite-check -- COMMAND ARG...` snapshots the calling worktree, including when invoked from a subdirectory. A checkout that predates both toolchain pins uses the installed launcher's pins.
+
+The first enrolled alias is the default. Enroll additional owned boxes with the same Git config command. Use `--runner` to select a box by capability or run independent checks on different boxes. Docker jobs use a cloud Docker runner. Xcode and iOS checks require an enrolled Mac.
+
+Each job gets a unique `COMPOSE_PROJECT_NAME`. Use `docker run --rm` for disposable containers and label any other job-owned Docker resources with `io.infinite.check="$INFINITE_CHECK_RUN_ID"`. The runner cleans resources bearing that label or the job's Compose project label on its local Docker socket.
+
+```sh
+python3 scripts/cloud-check.py --runner VERIFY_MAC -- npm run desktop:test
+```
+
+Provision Chromium with the lockfile's Playwright CLI on each browser runner. After `npm ci`, run `PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/infinite-cloud-check/playwright" ./node_modules/.bin/playwright install chromium`. Linux images also need Playwright's system dependencies.
+
+For a standing runner checkout, administrators can create the root-owned file `/etc/infinite-cloud-runner` after provisioning it. The installed Infinite systemd host also qualifies. Normal npm tests on a standing runner use a fresh snapshot. Builds and dev servers started there directly can retain their output. A missing enrollment, unavailable runner, or toolchain mismatch stops workstation dispatch.
+
+### Mobile checks
+
+```sh
 npm run lint -w @infinite/mobile
+npm run typecheck -w @infinite/mobile
 npm run export:android -w @infinite/mobile
 npm run export:ios -w @infinite/mobile
 ```

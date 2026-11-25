@@ -5,6 +5,8 @@ description: Drive the running Infinite web client (React app served by the host
 
 # Verify Infinite
 
+Run this entire workflow, including the host, browser and cleanup, inside the same owner-operated cloud checkout. For a scripted journey from the workstation, pass the complete journey as one command to `scripts/cloud-check.py`. For interactive work and retained evidence, use a standing cloud checkout at the verified revision. Store exported evidence outside tracked source.
+
 Use this skill to run a disposable Infinite host from this checkout, drive the web client in a real browser, and keep the evidence. The host runs with the demo provider only, which the UI calls **Rehearsal**: a local test process that does not call a model. Do not start any other provider from a verification run.
 
 Pick the feature to drive from `features/README.md`. The sign-in journey and the sessions and steering journey are scripted; the teams and goals feature files give the selectors and steps to drive with Playwright.

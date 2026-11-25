@@ -1,12 +1,10 @@
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { chromium, type Browser, type Page } from "playwright";
 
 const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH || chromium.executablePath();
-const skip = existsSync(executablePath) ? false : "Chromium for Playwright is not installed; run `npx playwright install chromium`";
 const harness = fileURLToPath(new URL("./fixtures/web-dictation-harness.tsx", import.meta.url));
 const ORIGIN = "http://127.0.0.1/dictation";
 
@@ -17,7 +15,7 @@ type Harness = Window & {
   };
 };
 
-describe("web dictation lifecycle", { skip }, () => {
+describe("web dictation lifecycle", () => {
   let browser: Browser;
   let script: string;
   before(async () => {

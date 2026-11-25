@@ -109,9 +109,19 @@ test("a mirror fetch reaches the main check through onMirror, and the owner's re
   }
 });
 
-test("a failing command with no recognised failure line keeps a bounded tail in the owner's read, from 200 KB of output", CASE, async () => {
+test("a failing command with no recognised failure line keeps a bounded tail in the owner's read, and no push carries it, from 200 KB of output", CASE, async () => {
   const h = await mainCheckHost({ "tracked.txt": "one\n" }, () => [sh("yes 'padding padding padding padding' | head -c 200000; echo 'final line of output' >&2; exit 3")]);
   try {
+    const registered = await h.host.fetchApi("/devices/push", "owner", { token: "ExponentPushToken[mainCheckDevice02]", platform: "ios" });
+    assert.deepEqual([registered.status, registered.body], [200, { ok: true, push: true }]);
+    const sent: PushMessage[][] = [];
+    const sender = async (messages: PushMessage[]): Promise<PushTicket[]> => {
+      sent.push(messages);
+      return messages.map(() => ({ status: "ok", id: "ticket" }));
+    };
+    const { sessions, pushStore, teams, goals, fuse, permissions, mainCheck } = h.host;
+    const push = h.host.config.push!;
+    const notifier = new Notifier(sessions, pushStore, sender, { detail: push.detail, events: push.events, intervalMs: 2000, machineId: h.host.config.machine?.id }, teams, goals, { sample: async () => [] }, fuse, permissions, mainCheck);
     await h.refresh();
     const done = await h.until("the failed result", response => response.body.results?.length === 1);
     const failures: string[] = done.body.last.commands[0].failures;
@@ -120,13 +130,18 @@ test("a failing command with no recognised failure line keeps a bounded tail in 
     assert.ok(failures[0]!.endsWith("\nfinal line of output"));
     assert.ok(failures[0]!.length <= 2000, `the tail is ${failures[0]!.length} characters`);
     assert.equal(failures[0]!.split("\n").length, 21);
+    await notifier.tick();
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0]![0]!.body.includes("exited 3"), true);
+    assert.equal(JSON.stringify(sent).includes("final line of output"), false, "the unrecognised tail never enters a push");
+    assert.equal(JSON.stringify(sent).includes("padding"), false, "no output line enters a push");
   } finally {
     await h.host.stop();
   }
 });
 
 test("a real Notifier tells the owner main is failing, then that it passes again, and a push that reached nobody changes nothing", REMOVES_A_COPY, async () => {
-  const h = await mainCheckHost({ "tracked.txt": "one\n", broken: "yes\n" }, () => [sh("if [ -f broken ]; then echo 'the build broke at step seven' >&2; exit 3; fi")]);
+  const h = await mainCheckHost({ "tracked.txt": "one\n", broken: "yes\n" }, () => [sh("if [ -f broken ]; then echo 'not ok 1 - the build is broken' >&2; exit 3; fi")]);
   try {
     const registered = await h.host.fetchApi("/devices/push", "owner", { token: "ExponentPushToken[mainCheckDevice01]", platform: "ios" });
     assert.deepEqual([registered.status, registered.body], [200, { ok: true, push: true }]);
@@ -145,7 +160,7 @@ test("a real Notifier tells the owner main is failing, then that it passes again
     await notifier.tick();
     assert.equal(sent.length, 1);
     assert.deepEqual(sent[0]!.map(message => [message.to, message.title, message.body]), [["ExponentPushToken[mainCheckDevice01]", "Main is failing", `Alpha: check 1 of 1 exited 3 at ${first.slice(0, 7)}.`]]);
-    assert.equal(JSON.stringify(sent).includes("the build broke at step seven"), false, "the unrecognised tail never enters a push");
+    assert.equal(JSON.stringify(sent).includes("the build is broken"), false, "recognised failure text never enters a push");
     assert.deepEqual((await h.read()).body.told, { notice: 1, outcome: "failed" });
     await notifier.tick();
     assert.equal(sent.length, 1, "the owner was told; nothing is due");

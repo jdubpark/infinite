@@ -386,3 +386,34 @@ test("an unrecognised failure keeps the last 20 non-empty lines, cleaned, and cu
   assert.ok(long.endsWith("\nend"));
   assert.ok(long.startsWith("No failure line was recognised. Last lines of the output:\n"));
 });
+
+test("the unrecognised tail stays within 2,000 characters, keeps the last row and drops the first", () => {
+  const rows = Array.from({ length: 20 }, (_, index) => `row-${index + 1}-${"x".repeat(100)}`);
+  const entry = unrecognisedTail(rows.join("\n"));
+  assert.ok(entry.length <= 2000, `entry is ${entry.length} characters`);
+  assert.ok(entry.startsWith("No failure line was recognised. Last lines of the output:\n"));
+  assert.ok(entry.endsWith(rows[19]!));
+  assert.equal(entry.includes("row-1-"), false);
+});
+
+test("a tail row keeps its end, so a long line still shows its final error", () => {
+  const entry = unrecognisedTail(`${"x".repeat(100000)} ERROR: build failed\n`);
+  assert.ok(entry.endsWith("ERROR: build failed"));
+});
+
+test("no output, or only blank lines, gives the fixed no-output text", () => {
+  assert.equal(unrecognisedTail(""), "The command wrote no output.");
+  assert.equal(unrecognisedTail("\n  \n\t\n"), "The command wrote no output.");
+});
+
+test("a Jest warning and its coverage line are not failures", () => {
+  const warning = [
+    "  ● Validation Warning:",
+    "",
+    "    Unknown option \"testURL\" with value \"http://localhost\" was found.",
+    "",
+    "Jest: \"global\" coverage threshold for lines (80%) not met: 75%",
+    "",
+  ].join("\n");
+  assert.deepEqual(scanParts([{ stream: "stderr", text: warning }]).failures, []);
+});

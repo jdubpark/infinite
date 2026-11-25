@@ -8,7 +8,7 @@ import ts from "typescript";
 export const BASELINE_PATH = "scripts/comments-baseline.json";
 
 const TS_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]);
-const C_LIKE_EXTENSIONS = new Set([".swift", ".c", ".kt"]);
+const C_LIKE_EXTENSIONS = new Set([".swift", ".c", ".h", ".kt", ".kts"]);
 const HASH_EXTENSIONS = new Set([".py", ".sh"]);
 const ALL_EXTENSIONS = new Set([...TS_EXTENSIONS, ...C_LIKE_EXTENSIONS, ...HASH_EXTENSIONS]);
 const SKIPPED_SEGMENTS = new Set(["node_modules", "vendor", "generated", "dist", ".build"]);
@@ -50,6 +50,7 @@ function extractTsComments(text, filePath) {
     ts.ScriptKind.TS;
   const sourceFile = ts.createSourceFile(filePath, text, ts.ScriptTarget.Latest, false, scriptKind);
   const seen = new Map();
+  const jsxTextSpans = [];
 
   function addRanges(ranges) {
     if (!ranges) return;
@@ -59,16 +60,22 @@ function extractTsComments(text, filePath) {
   }
 
   function visit(node) {
+    if (node.kind === ts.SyntaxKind.JsxText) {
+      jsxTextSpans.push([node.pos, node.end]);
+      return;
+    }
     addRanges(ts.getLeadingCommentRanges(text, node.pos));
     addRanges(ts.getTrailingCommentRanges(text, node.end));
     for (const child of node.getChildren(sourceFile)) visit(child);
   }
   visit(sourceFile);
 
+  const isInsideJsxText = (pos) => jsxTextSpans.some(([start, end]) => pos >= start && pos < end);
   const starts = lineStartsOf(text);
   const sorted = [...seen.values()].sort((a, b) => a.pos - b.pos);
   const comments = [];
   for (const range of sorted) {
+    if (isInsideJsxText(range.pos)) continue;
     const rawText = text.slice(range.pos, range.end);
     if (range.pos === 0 && rawText.startsWith("#!")) continue;
     const startLine = offsetToLine(starts, range.pos);
@@ -150,7 +157,9 @@ function skipSwiftQuotedString(text, startIndex, triple) {
   return n;
 }
 
-function extractCLikeComments(text, isSwift) {
+function extractCLikeComments(text, ext) {
+  const isSwift = ext === ".swift";
+  const isKotlin = ext === ".kt" || ext === ".kts";
   const starts = lineStartsOf(text);
   const comments = [];
   let i = 0;
@@ -165,6 +174,12 @@ function extractCLikeComments(text, isSwift) {
     if (isSwift && ch === '"') {
       const triple = next === '"' && text[i + 2] === '"';
       i = skipSwiftQuotedString(text, i, triple);
+      continue;
+    }
+    if (isKotlin && ch === '"' && next === '"' && text[i + 2] === '"') {
+      i += 3;
+      while (i < n && !(text[i] === '"' && text[i + 1] === '"' && text[i + 2] === '"')) i += 1;
+      i += 3;
       continue;
     }
     if (!isSwift && ch === '"') {
@@ -202,7 +217,7 @@ function extractCLikeComments(text, isSwift) {
       i += 2;
       let depth = 1;
       while (i < n && depth > 0) {
-        if (isSwift && text[i] === "/" && text[i + 1] === "*") { depth += 1; i += 2; }
+        if ((isSwift || isKotlin) && text[i] === "/" && text[i + 1] === "*") { depth += 1; i += 2; }
         else if (text[i] === "*" && text[i + 1] === "/") { depth -= 1; i += 2; }
         else i += 1;
       }
@@ -278,6 +293,19 @@ function extractPythonComments(text) {
   return comments;
 }
 
+function parseHeredocOperator(line, index) {
+  if (line[index] !== "<" || line[index + 1] !== "<" || line[index + 2] === "<") return null;
+  let k = index + 2;
+  const stripTabs = line[k] === "-";
+  if (stripTabs) k += 1;
+  while (k < line.length && (line[k] === " " || line[k] === "\t")) k += 1;
+  const rest = line.slice(k);
+  const match = /^(?:'([A-Za-z_][A-Za-z0-9_-]*)'|"([A-Za-z_][A-Za-z0-9_-]*)"|\\?([A-Za-z_][A-Za-z0-9_-]*))/.exec(rest);
+  if (!match) return null;
+  const delimiter = match[1] ?? match[2] ?? match[3];
+  return { delimiter, stripTabs, nextIndex: k + match[0].length };
+}
+
 function extractShellComments(text) {
   const starts = lineStartsOf(text);
   const comments = [];
@@ -285,8 +313,15 @@ function extractShellComments(text) {
   let inSingle = false;
   let inDouble = false;
   let paramDepth = 0;
+  const pendingHeredocs = [];
   for (let idx = 0; idx < lines.length; idx += 1) {
     const line = lines[idx];
+    if (pendingHeredocs.length > 0) {
+      const target = pendingHeredocs[0];
+      const candidate = (target.stripTabs ? line.replace(/^\t+/, "") : line).replace(/\r$/, "");
+      if (candidate === target.delimiter) pendingHeredocs.shift();
+      continue;
+    }
     if (idx === 0 && line.startsWith("#!")) continue;
     for (let j = 0; j < line.length; j += 1) {
       const c = line[j];
@@ -296,6 +331,14 @@ function extractShellComments(text) {
       if (!inSingle) {
         if (c === "$" && line[j + 1] === "{") { paramDepth += 1; j += 1; continue; }
         if (paramDepth > 0 && c === "}") { paramDepth -= 1; continue; }
+      }
+      if (!inSingle && !inDouble && paramDepth === 0 && c === "<" && line[j + 1] === "<") {
+        const heredoc = parseHeredocOperator(line, j);
+        if (heredoc) {
+          pendingHeredocs.push({ delimiter: heredoc.delimiter, stripTabs: heredoc.stripTabs });
+          j = heredoc.nextIndex - 1;
+          continue;
+        }
       }
       if (c === "#" && !inSingle && !inDouble && paramDepth === 0) {
         const prev = j === 0 ? "" : line[j - 1];
@@ -331,7 +374,7 @@ export function extractComments(text, filePath) {
   const ext = extname(filePath);
   let raw = [];
   if (TS_EXTENSIONS.has(ext)) raw = extractTsComments(text, filePath);
-  else if (C_LIKE_EXTENSIONS.has(ext)) raw = extractCLikeComments(text, ext === ".swift");
+  else if (C_LIKE_EXTENSIONS.has(ext)) raw = extractCLikeComments(text, ext);
   else if (ext === ".py") raw = extractPythonComments(text);
   else if (ext === ".sh") raw = extractShellComments(text);
 

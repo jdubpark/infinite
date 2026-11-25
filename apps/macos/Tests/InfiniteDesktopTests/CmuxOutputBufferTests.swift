@@ -63,6 +63,7 @@ final class CmuxOutputBufferTests: XCTestCase {
 
         let chunk = Data(repeating: 65, count: 9 * 1024 * 1024)
         buffer.append(.bytes(chunk))
+        await Task.yield()
         buffer.append(.bytes(chunk))
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(invalidCount, 1)
@@ -72,6 +73,29 @@ final class CmuxOutputBufferTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(invalidCount, 1)
         XCTAssertEqual(byteEventCount, 0)
+    }
+
+    @MainActor func testReleasesBudgetOnlyAfterPendingFlushCompletes() async throws {
+        var invalidCount = 0
+        var byteEventCount = 0
+        let buffer = CmuxOutputBuffer { events in
+            for event in events {
+                switch event {
+                case .invalidFrame: invalidCount += 1
+                case .bytes: byteEventCount += 1
+                default: break
+                }
+            }
+        }
+        defer { buffer.cancel() }
+
+        let chunk = Data(repeating: 65, count: 9 * 1024 * 1024)
+        buffer.append(.bytes(chunk))
+        try await Task.sleep(for: .milliseconds(50))
+        buffer.append(.bytes(chunk))
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(invalidCount, 0)
+        XCTAssertEqual(byteEventCount, 2)
     }
 
     @MainActor func testCancelSuppressesPendingDelivery() async throws {

@@ -21,7 +21,7 @@ Deleting all comments in a single PR across 961 files would create an unreviewab
 3. **Narrow toolchain pragma exemption**: Line-1 shebangs (`#!`), line-1 SwiftPM `// swift-tools-version:` headers, TypeScript `/// <reference ... />` directives, `@ts-expect-error` compile-time negative tests, bare single-line `// eslint-disable-next-line` directives, and `# shellcheck disable=` directives in `.sh` files are exempt so required compiler/linter pragmas remain functional. `@ts-ignore` and multiline `/* eslint-disable ... */` blocks are intentionally not exempt.
 4. **Preserve knowledge outside source comments**:
    - Move **Decision Records** into numbered ADRs under `docs/adr/`.
-   - Delete **Excuse** comments and file Linear issues in team `INF` to fix the underlying hacks.
+   - Delete **Excuse** comments and file Linear issues in the configured Linear team (resolved from the checkout's private runtime configuration) to fix the underlying hacks.
    - Delete **Tautology** and **Stale** comments outright, improving naming or types where needed.
 5. **Repeatable burn-down**: `.agents/skills/delete-comment/SKILL.md` defines the repeatable `/delete-comment` workflow for clearing remaining baseline files in focused waves.
 

@@ -264,7 +264,7 @@ function readLegacyDirectoryDefaults(path: string) {
     throw new Error("Saved directory Linear defaults are invalid; preserve private team CLI state and inspect it before retrying.");
   return parsed.data;
 }
-function saveDirectoryDefault(path: string, directory: string, value: { teamId: string; projectId?: string }) {
+export function saveDirectoryDefault(path: string, directory: string, value: { teamId: string; projectId?: string }) {
   if (invalidDefaultDirectory(directory))
     throw new Error("Saved directory Linear defaults are invalid; preserve private team CLI state and inspect it before retrying.");
   const validated = directoryDefaultValueSchema.parse(value);
@@ -275,7 +275,7 @@ function saveDirectoryDefault(path: string, directory: string, value: { teamId: 
     ...(validated.projectId ? { projectId: validated.projectId } : {}),
   });
 }
-function nearestDirectoryDefault(path: string, directory: string) {
+export function nearestDirectoryDefault(path: string, directory: string) {
   const legacy = existsSync(path) ? readLegacyDirectoryDefaults(path) : undefined;
   for (let current = directory; ; current = dirname(current)) {
     const value = readDirectoryDefault(path, current) ?? legacy?.directories[current];

@@ -52,6 +52,18 @@ test("exited is terminal; late hooks do not revive it", () => {
   assert.equal(a.state, "exited");
 });
 
+test("terminal lifecycle transitions retain the last assistant message across reload", () => {
+  let a = initialAttention("t1", true);
+  a = applySignal(a, ev({ kind: "turn-end", message: "Final assistant reply.", backgroundTasks: 0 }));
+  a = applyLifecycle(a, "exited", "t2");
+  assert.equal(a.state, "exited");
+  assert.equal(a.lastMessage, "Final assistant reply.");
+  const reloaded = JSON.parse(JSON.stringify(a)) as Attention;
+  assert.equal(reloaded.lastMessage, "Final assistant reply.");
+  assert.equal(applyLifecycle(a, "unavailable", "t3").lastMessage, "Final assistant reply.");
+  assert.equal(applyLifecycle(a, "recording-error", "t4").lastMessage, "Final assistant reply.");
+});
+
 test("screen decisions open, merge, and close prompts", () => {
   const lines = ["Do you want to proceed?", "❯ 1. Yes", "  2. No, and tell Claude what to do differently"];
   const detected = detectPrompt(lines, "claude")!;

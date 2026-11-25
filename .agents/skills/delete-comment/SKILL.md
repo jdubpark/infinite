@@ -33,7 +33,7 @@ Machine pragmas exempted by `scripts/check-comments.mjs` (do not delete these if
 - **Tautology / Stale**: Delete the comment. If deleting a comment exposes an unclear identifier or magic constant, rename the identifier or extract a named constant instead of rewriting the comment.
 - **Excuse**:
   1. Delete the comment.
-  2. File a Linear issue in team `INF` (using the configured Linear MCP tools; search first to avoid duplicates) describing the hacky implementation, exact file path, failure mode, and concrete acceptance criterion.
+  2. Resolve the configured Linear team from the checkout's private runtime configuration and file a Linear issue in that team (using the configured Linear MCP tools; search first to avoid duplicates) describing the hacky implementation, exact file path, failure mode, and concrete acceptance criterion.
   3. If Linear MCP is unavailable in the current session, do not invent a tracked backlog file inside the repository; report the unsynchronized Linear-ready issue drafts in the handoff/summary so the owner or next session can file them.
 - **Decision Record**:
   1. Preserve the non-obvious decision in an Architectural Decision Record under `docs/adr/NNNN-short-topic.md` (extend an existing ADR when the decision belongs to the same subsystem rather than creating overlapping files).

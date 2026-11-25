@@ -20,6 +20,7 @@ struct UnderstandingView: View {
     @State private var cacheNotice = false
     @State private var cacheSavedAt: Date?
     @State private var offlineWorkspaces: [ProjectGroup] = []
+    @State private var offlineWorkspacesScope = ""
     @State private var offlineWorkspacesTask: Task<Void, Never>?
 
     private enum Mode: String, CaseIterable, Identifiable {
@@ -29,9 +30,12 @@ struct UnderstandingView: View {
         var id: String { rawValue }
     }
 
+    private var offlineScope: String { "\(hostCacheIdentity)|\(credentialCacheIdentity)" }
     private var groups: [ProjectGroup] {
         var combined = app.projectGroups.groups
-        for cached in offlineWorkspaces where !combined.contains(where: { $0.id == cached.id }) { combined.append(cached) }
+        if offlineWorkspacesScope == offlineScope {
+            for cached in offlineWorkspaces where !combined.contains(where: { $0.id == cached.id }) { combined.append(cached) }
+        }
         return ProjectGroup.ordered(combined)
     }
     private var currentGroup: ProjectGroup? {
@@ -607,17 +611,23 @@ struct UnderstandingView: View {
     private func refreshOfflineWorkspaces() {
         let host = hostCacheIdentity
         let credential = credentialCacheIdentity
-        guard credential != "unavailable" else {
-            offlineWorkspacesTask?.cancel()
+        let nextScope = "\(host)|\(credential)"
+        if offlineWorkspacesScope != nextScope {
             offlineWorkspaces = []
-            return
+            offlineWorkspacesScope = nextScope
         }
         offlineWorkspacesTask?.cancel()
+        guard credential != "unavailable" else {
+            offlineWorkspaces = []
+            offlineWorkspacesScope = nextScope
+            return
+        }
         offlineWorkspacesTask = Task {
             let store = await UnderstandingSnapshotStore.shared()
             guard let recent = try? await store.readRecent(host: host, credential: credential) else {
                 if !Task.isCancelled, hostCacheIdentity == host, credentialCacheIdentity == credential {
                     offlineWorkspaces = []
+                    offlineWorkspacesScope = nextScope
                 }
                 return
             }
@@ -630,6 +640,8 @@ struct UnderstandingView: View {
                 return ProjectGroup(.object(["id": .string(id), "name": .string(page["workspace"]["name"].string),
                                              "revision": .number(Double(cached.membershipRevision)), "repos": .array([])]))
             }
+            offlineWorkspacesScope = nextScope
+            selectAvailableWorkspace()
         }
     }
 
@@ -648,8 +660,9 @@ struct UnderstandingView: View {
             return
         }
         let groupID = group.id
+        let originHost = hostCacheIdentity
         let credentialIdentity = credentialCacheIdentity
-        let responseScope = "\(hostCacheIdentity)|\(credentialIdentity)|\(groupID)"
+        let responseScope = "\(originHost)|\(credentialIdentity)|\(groupID)"
         guard unsupportedScope != responseScope else { return }
 
         while !Task.isCancelled {
@@ -713,12 +726,12 @@ struct UnderstandingView: View {
                         : "Workspace Understanding requires a newer server. Update the server, then check again."
                     failureScope = responseScope
                     unsupportedScope = responseScope
-                    await clearWorkspaceCache(groupID, credential: credentialIdentity)
+                    await clearWorkspaceCache(groupID, host: originHost, credential: credentialIdentity)
                     loading = false
                     return
                 }
                 if remote?.status == 401 || remote?.status == 403 {
-                    await clearWorkspaceCache(groupID, credential: credentialIdentity)
+                    await clearWorkspaceCache(groupID, host: originHost, credential: credentialIdentity)
                 }
                 failure = error.localizedDescription
                 failureScope = responseScope
@@ -748,10 +761,14 @@ struct UnderstandingView: View {
         cacheNotice = true
         cacheSavedAt = cached.observedAt
     }
-    private func clearWorkspaceCache(_ workspace: String, credential: String) async {
+    private func clearWorkspaceCache(_ workspace: String, host originHost: String, credential: String) async {
+        let expectedScope = "\(originHost)|\(credential)|\(workspace)"
         let store = await UnderstandingSnapshotStore.shared()
-        try? await store.clear(host: hostCacheIdentity, credential: credential, workspace: workspace)
-        snapshot = nil; snapshotScope = ""; snapshotRevision = nil; cacheNotice = false; cacheSavedAt = nil
+        try? await store.clear(host: originHost, credential: credential, workspace: workspace)
+        guard hostCacheIdentity == originHost, credentialCacheIdentity == credential else { return }
+        if snapshotScope == expectedScope || snapshotScope.isEmpty {
+            snapshot = nil; snapshotScope = ""; snapshotRevision = nil; cacheNotice = false; cacheSavedAt = nil
+        }
         offlineWorkspaces.removeAll { $0.id == workspace }
     }
 }

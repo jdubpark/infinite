@@ -7,7 +7,7 @@ let package = Package(
     products: [.executable(name: "InfiniteDesktop", targets: ["InfiniteDesktop"])],
     targets: [
         .target(name: "InfiniteAtomics"),
-        .target(name: "InfiniteCore"),
+        .target(name: "InfiniteCore", dependencies: ["InfiniteAtomics"]),
         .executableTarget(name: "InfiniteDesktop", dependencies: ["InfiniteCore", "InfiniteAtomics"], resources: [.copy("Resources")]),
         .testTarget(name: "InfiniteCoreTests", dependencies: ["InfiniteCore"]),
         .testTarget(name: "InfiniteDesktopTests", dependencies: ["InfiniteDesktop"]),

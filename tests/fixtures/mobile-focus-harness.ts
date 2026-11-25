@@ -16,4 +16,12 @@ export function mount() {
   });
 }
 
+export function mountLive() {
+  return renderHook(() => useLive(connection, {
+    topics: ["sessions"], intervalMs: 40, deps: [],
+    load: () => monitor.load(),
+    select: () => undefined,
+  }));
+}
+
 export { monitor, setFocused } from "./mobile-focus-native";

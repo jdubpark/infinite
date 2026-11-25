@@ -248,11 +248,12 @@ export class DesktopFiles {
       prefix = prefix ? `${prefix}/${part}` : part;
       const location = await this.location(project, prefix, true);
       const parent = await lstat(dirname(location.file)), sharedGroup = this.config.sync?.sharedGroup || Boolean(parent.mode & 0o2000);
-      try { await mkdir(location.file, { mode: sharedGroup ? 0o2770 : 0o700 }); }
+      let created = false;
+      try { await mkdir(location.file, { mode: sharedGroup ? 0o2770 : 0o700 }); created = true; }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
       await this.location(project, prefix);
       if (!(await lstat(location.file)).isDirectory()) throw new DesktopError("not-directory", "A file already occupies this directory path", 409);
-      if (sharedGroup) await chmod(location.file, 0o2770);
+      if (created && sharedGroup) await chmod(location.file, 0o2770);
     }
     return { path: prefix, created: true };
   }

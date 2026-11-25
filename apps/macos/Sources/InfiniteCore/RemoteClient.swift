@@ -18,7 +18,6 @@ public actor RemoteClient {
         let session: URLSession
         let socket: URLSessionWebSocketTask
         var cipher: RemoteCipher
-        var requestCounter = 0
         var pending: [String: CheckedContinuation<JSON, Error>] = [:]
         var deadlines: [String: Task<Void, Never>] = [:]
         var streams: [String: @Sendable (JSON) -> Void] = [:]
@@ -58,6 +57,7 @@ public actor RemoteClient {
     private let profile: HostProfile
     private let token: String
     private var state: ConnectionState = .idle
+    private var requestCounter = 0
 
     public init(profile: HostProfile, token: String) {
         self.profile = profile
@@ -220,8 +220,8 @@ public actor RemoteClient {
         guard case .open(let channel) = state, channel.pending.count < 8 else {
             throw DesktopError("The connection is busy. Try again shortly.")
         }
-        channel.requestCounter += 1
-        let id = String(channel.requestCounter)
+        requestCounter += 1
+        let id = String(requestCounter)
         if fields["type"]?.string == "terminal-open" { channel.openingStreams.insert(id) }
         var object = fields
         object["id"] = .string(id)
@@ -289,9 +289,9 @@ public actor RemoteClient {
         guard case .open(let channel) = state else {
             throw DesktopError("The terminal disconnected. Reattach before sending input.")
         }
-        channel.requestCounter += 1
+        requestCounter += 1
         var object = fields
-        object["id"] = .string(String(channel.requestCounter))
+        object["id"] = .string(String(requestCounter))
         object["token"] = .string(token)
         let encoded = String(decoding: try channel.cipher.seal(.object(object)).data(), as: UTF8.self)
         try await withCheckedThrowingContinuation { continuation in

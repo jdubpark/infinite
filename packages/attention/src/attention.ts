@@ -32,6 +32,7 @@ export function applyLifecycle(att: Attention, status: "exited" | "unavailable" 
     ...transitionTiming(att, status, "lifecycle", at),
     state: status,
     now: "",
+    ...(att.lastMessage !== undefined ? { lastMessage: att.lastMessage } : {}),
     lastActivityAt: at,
     hooks: att.hooks,
     hookErrors: att.hookErrors,

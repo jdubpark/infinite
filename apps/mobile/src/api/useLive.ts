@@ -5,8 +5,8 @@ import { APP_BACKGROUND_GRACE_MS, inForeground, onForegroundChange } from "./for
 import { canUseLiveFallback, invalidatesLiveLoad, isLiveOnline, LIVE_STALE_DELAY_MS, shouldMarkLiveStale, shouldRetryEmptyLiveLoad } from "./liveStatus";
 
 export type Freshness<T> =
-  | { kind: "loading" }
-  | { kind: "online"; data: T; seen: string; refreshing: boolean }
+  | { kind: "loading"; online: boolean; seen: string; stale: boolean }
+  | { kind: "online"; data: T | null; seen: string; refreshing: boolean }
   | { kind: "offline"; data: T | null; seen: string; stale: boolean; refreshing: boolean };
 
 function freshnessView<T>(
@@ -14,7 +14,7 @@ function freshnessView<T>(
 ): { data: T | null; online: boolean; stale: boolean; loading: boolean; refreshing: boolean; seen: string } {
   switch (freshness.kind) {
     case "loading":
-      return { data: null, online: false, stale: false, loading: true, refreshing: false, seen: "" };
+      return { data: null, online: freshness.online, stale: freshness.stale && !freshness.online, loading: true, refreshing: false, seen: freshness.seen };
     case "online":
       return { data: freshness.data, online: true, stale: false, loading: false, refreshing: freshness.refreshing, seen: freshness.seen };
     case "offline":
@@ -117,7 +117,7 @@ type LiveOptions<T> = {
 export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
   data: T | null; online: boolean; stale: boolean; loading: boolean; refreshing: boolean; seen: string; refresh: () => void;
 } {
-  const [freshness, setFreshness] = useState<Freshness<T>>({ kind: "loading" });
+  const [freshness, setFreshness] = useState<Freshness<T>>({ kind: "loading", online: false, seen: "", stale: false });
   const current = useRef(options), value = useRef<T | null>(null), hasValue = useRef(false), refreshRef = useRef<() => void>(() => {});
   const focused = useIsFocused(), blurred = useRef(false);
   useEffect(() => { current.current = options; });
@@ -146,20 +146,17 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
     const toOffline = (stale?: boolean) => {
       setFreshness(prev => {
         switch (prev.kind) {
-          case "loading": return prev;
+          case "loading": {
+            const nextStale = stale ?? prev.stale;
+            return !prev.online && prev.stale === nextStale ? prev : { ...prev, online: false, stale: nextStale };
+          }
           case "online": return { kind: "offline", data: prev.data, seen: prev.seen, stale: stale ?? false, refreshing: prev.refreshing };
           case "offline": return stale === undefined || prev.stale === stale ? prev : { ...prev, stale };
         }
       });
     };
     const setSeenOnly = (seen: string) => {
-      setFreshness(prev => {
-        switch (prev.kind) {
-          case "loading": return prev;
-          case "online": return { ...prev, seen };
-          case "offline": return { ...prev, seen };
-        }
-      });
+      setFreshness(prev => ({ ...prev, seen }));
     };
     const delayStale = () => {
       if (!appActive || onlineNow() || staleTimer !== undefined) return;
@@ -171,17 +168,20 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
     };
     const markOnline = (seenOverride?: string) => {
       clearTimeout(staleTimer); staleTimer = undefined; offlineSince = null;
-      if (!hasValue.current) {
-        if (seenOverride !== undefined) setSeenOnly(seenOverride);
-        return;
-      }
-      const data = value.current as T;
-      setFreshness(prev => ({
-        kind: "online",
-        data,
-        seen: seenOverride ?? (prev.kind === "loading" ? stamp() : prev.seen),
-        refreshing: prev.kind === "loading" ? false : prev.refreshing,
-      }));
+      setFreshness(prev => {
+        const seen = seenOverride ?? (prev.kind === "loading" && !prev.seen ? stamp() : prev.seen);
+        if (!hasValue.current) {
+          if (prev.kind === "loading") return { kind: "loading", online: true, seen, stale: false };
+          if (prev.kind === "offline") return { kind: "online", data: null, seen, refreshing: prev.refreshing };
+          return seenOverride !== undefined ? { ...prev, seen } : prev;
+        }
+        return {
+          kind: "online",
+          data: value.current as T,
+          seen,
+          refreshing: prev.kind === "loading" ? false : prev.refreshing,
+        };
+      });
     };
     const updateOnline = (seenOverride?: string) => {
       if (onlineNow()) markOnline(seenOverride);
@@ -227,7 +227,9 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
           setFreshness(prev => {
             switch (prev.kind) {
               case "loading":
-                return { kind: "offline", data: null, seen: "", stale: false, refreshing: false };
+                return onlineNow()
+                  ? { kind: "online", data: null, seen: prev.seen || stamp(), refreshing: false }
+                  : { kind: "offline", data: null, seen: prev.seen, stale: prev.stale, refreshing: false };
               case "online":
               case "offline":
                 return manual && prev.refreshing ? { ...prev, refreshing: false } : prev;

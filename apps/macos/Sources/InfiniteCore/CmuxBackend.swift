@@ -315,15 +315,22 @@ public actor CmuxBackend {
 private enum CmuxHelperEvent: Sendable {
     case stdout(Data)
     case stderr(Data)
+    case overflow(String)
     case terminated
 }
 
-private actor CmuxHelperProcess {
+actor CmuxHelperProcess {
+    static let defaultMaxStdoutBufferBytes: Int64 = 16 * 1024 * 1024
+    static let defaultMaxStderrBufferBytes: Int64 = 256 * 1024
+
     private let process = Process()
     private let input = Pipe()
     private let output = Pipe()
     private let errorOutput = Pipe()
     private let eventContinuation: AsyncStream<CmuxHelperEvent>.Continuation
+    private let stdoutIngressBytes = LockFreeInt64(0)
+    private let stderrIngressBytes = LockFreeInt64(0)
+    private let ingressOverflowed = LockFreeInt64(0)
     private var partial = Data()
     private var lines: [Data] = []
     private var queuedBytes = 0
@@ -338,10 +345,19 @@ private actor CmuxHelperProcess {
     private var canceledTerminationWaiters: Set<UUID> = []
     private let observe: (@Sendable (JSON) -> Void)?
 
-    init(executable: URL, arguments: [String], observe: (@Sendable (JSON) -> Void)? = nil) throws {
+    init(
+        executable: URL,
+        arguments: [String],
+        maxStdoutBufferBytes: Int64 = defaultMaxStdoutBufferBytes,
+        maxStderrBufferBytes: Int64 = defaultMaxStderrBufferBytes,
+        observe: (@Sendable (JSON) -> Void)? = nil
+    ) throws {
         self.observe = observe
         let (eventStream, continuation) = AsyncStream.makeStream(of: CmuxHelperEvent.self)
         self.eventContinuation = continuation
+        let stdoutIngressBytes = self.stdoutIngressBytes
+        let stderrIngressBytes = self.stderrIngressBytes
+        let ingressOverflowed = self.ingressOverflowed
         process.executableURL = executable
         process.arguments = arguments
         process.standardInput = input
@@ -349,13 +365,53 @@ private actor CmuxHelperProcess {
         process.standardError = errorOutput
         output.fileHandleForReading.readabilityHandler = { handle in
             let bytes = handle.availableData
-            if bytes.isEmpty { handle.readabilityHandler = nil }
-            continuation.yield(.stdout(bytes))
+            if bytes.isEmpty {
+                handle.readabilityHandler = nil
+                if ingressOverflowed.load() == 0 { continuation.yield(.stdout(bytes)) }
+                return
+            }
+            if ingressOverflowed.load() != 0 {
+                handle.readabilityHandler = nil
+                return
+            }
+            let count = Int64(bytes.count)
+            if stdoutIngressBytes.add(count) > maxStdoutBufferBytes {
+                stdoutIngressBytes.sub(count)
+                handle.readabilityHandler = nil
+                if ingressOverflowed.add(1) == 1 {
+                    continuation.yield(.overflow("The cmux helper output exceeded the client limit."))
+                    continuation.finish()
+                }
+                return
+            }
+            if case .terminated = continuation.yield(.stdout(bytes)) {
+                stdoutIngressBytes.sub(count)
+            }
         }
         errorOutput.fileHandleForReading.readabilityHandler = { handle in
             let bytes = handle.availableData
-            if bytes.isEmpty { handle.readabilityHandler = nil }
-            continuation.yield(.stderr(bytes))
+            if bytes.isEmpty {
+                handle.readabilityHandler = nil
+                if ingressOverflowed.load() == 0 { continuation.yield(.stderr(bytes)) }
+                return
+            }
+            if ingressOverflowed.load() != 0 {
+                handle.readabilityHandler = nil
+                return
+            }
+            let count = Int64(bytes.count)
+            if stderrIngressBytes.add(count) > maxStderrBufferBytes {
+                stderrIngressBytes.sub(count)
+                handle.readabilityHandler = nil
+                if ingressOverflowed.add(1) == 1 {
+                    continuation.yield(.overflow("The cmux helper error output exceeded the client limit."))
+                    continuation.finish()
+                }
+                return
+            }
+            if case .terminated = continuation.yield(.stderr(bytes)) {
+                stderrIngressBytes.sub(count)
+            }
         }
         process.terminationHandler = { _ in
             continuation.yield(.terminated)
@@ -382,12 +438,12 @@ private actor CmuxHelperProcess {
     }
 
     func readLine(deadline: Date) async throws -> Data {
+        if let failure { throw CmuxTransportError.failed(failure) }
         if !lines.isEmpty {
             let line = lines.removeFirst()
             queuedBytes -= line.count
             return line
         }
-        if let failure { throw CmuxTransportError.failed(failure) }
         if ended { throw eofError() }
         let remaining = deadline.timeIntervalSinceNow
         guard remaining > 0 else {
@@ -413,14 +469,14 @@ private actor CmuxHelperProcess {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
+                if let failure {
+                    continuation.resume(throwing: CmuxTransportError.failed(failure))
+                    return
+                }
                 if !lines.isEmpty {
                     let line = lines.removeFirst()
                     queuedBytes -= line.count
                     continuation.resume(returning: line)
-                    return
-                }
-                if let failure {
-                    continuation.resume(throwing: CmuxTransportError.failed(failure))
                     return
                 }
                 if ended {
@@ -456,24 +512,50 @@ private actor CmuxHelperProcess {
     private func handle(_ event: CmuxHelperEvent) {
         switch event {
         case .stdout(let bytes):
+            if !bytes.isEmpty { stdoutIngressBytes.sub(Int64(bytes.count)) }
             receive(bytes)
         case .stderr(let bytes):
+            if !bytes.isEmpty { stderrIngressBytes.sub(Int64(bytes.count)) }
             standardError.append(bytes)
             if standardError.count > 4096 { standardError = standardError.suffix(4096) }
+        case .overflow(let message):
+            output.fileHandleForReading.readabilityHandler = nil
+            errorOutput.fileHandleForReading.readabilityHandler = nil
+            partial.removeAll()
+            lines.removeAll()
+            queuedBytes = 0
+            ended = true
+            if failure == nil { failure = message }
+            if let existing = lineWaiter {
+                lineWaiter = nil
+                existing.continuation.resume(throwing: CmuxTransportError.failed(failure ?? message))
+            }
         case .terminated:
             ended = true
             terminated = true
             let waiters = Array(terminationWaiters.values)
             terminationWaiters.removeAll()
             for waiter in waiters { waiter.resume() }
-            if lines.isEmpty, let existing = lineWaiter {
-                lineWaiter = nil
-                existing.continuation.resume(throwing: failure.map { CmuxTransportError.failed($0) } ?? eofError())
+            if let existing = lineWaiter {
+                if let failure {
+                    lineWaiter = nil
+                    existing.continuation.resume(throwing: CmuxTransportError.failed(failure))
+                } else if lines.isEmpty {
+                    lineWaiter = nil
+                    existing.continuation.resume(throwing: eofError())
+                }
             }
         }
     }
 
     private func receive(_ bytes: Data) {
+        if let failure {
+            if let existing = lineWaiter {
+                lineWaiter = nil
+                existing.continuation.resume(throwing: CmuxTransportError.failed(failure))
+            }
+            return
+        }
         if bytes.isEmpty {
             ended = true
             if lines.isEmpty, let existing = lineWaiter {

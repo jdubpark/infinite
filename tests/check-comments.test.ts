@@ -93,7 +93,52 @@ describe("check-comments extractor", () => {
     assert.equal(isCheckedSourcePath("packages/host/dist/index.js"), false);
     assert.equal(isCheckedSourcePath("packages\\host\\dist\\index.js"), false);
     assert.equal(isCheckedSourcePath("apps/macos/Sources/Core.swift"), true);
+    assert.equal(isCheckedSourcePath("apps/macos/Sources/InfiniteAtomics/include/InfiniteAtomics.h"), true);
+    assert.equal(isCheckedSourcePath("scripts/build.kts"), true);
     assert.equal(isCheckedSourcePath("docs/adr/0001-demo.md"), false);
+  });
+
+  test("ignores rendered JsxText while still counting comments inside JsxExpression", () => {
+    assert.equal(summarizeFileComments("export const x = <pre>// not a comment</pre>;\n", "apps/web/src/Demo.tsx").blocks, 0);
+    const mixed = summarizeFileComments("export const x = <pre>{/* real comment */}// not a comment</pre>;\n", "apps/web/src/Demo.tsx");
+    assert.equal(mixed.blocks, 1);
+    assert.equal(mixed.lines, 1);
+    const multiline = summarizeFileComments("export const x = <pre>\n  // not a comment\n  /* also not */\n  {/* real */}\n</pre>;\n", "apps/web/src/Demo.tsx");
+    assert.equal(multiline.blocks, 1);
+  });
+
+  test("skips shell here-document payloads including quoted apostrophes, headings, multiple heredocs, and tab-stripped delimiters", () => {
+    const sh = [
+      "#!/usr/bin/env bash",
+      "cat <<'EOF'",
+      "# Markdown heading",
+      "don't treat this apostrophe as an open quote",
+      "EOF",
+      "# real shell comment",
+      "cat <<-END <<\"NEXT\"",
+      "\t# inside tabbed heredoc",
+      "\tEND",
+      "# inside second heredoc",
+      "NEXT",
+      "echo ok # trailing real comment",
+    ].join("\n");
+    const summary = summarizeFileComments(sh, "scripts/demo.sh");
+    assert.equal(summary.blocks, 2);
+    assert.equal(summary.lines, 2);
+    assert.equal(summary.shedLines, 1);
+
+    const hereString = "grep foo <<< \"bar\" # real comment\n";
+    assert.equal(summarizeFileComments(hereString, "scripts/demo.sh").blocks, 1);
+  });
+
+  test("checks .h C headers and ignores comments inside Kotlin triple-quoted raw strings", () => {
+    assert.equal(summarizeFileComments("#ifndef DEMO_H\n#define DEMO_H\nint f(void);\n#endif\n", "include/demo.h").blocks, 0);
+    assert.equal(summarizeFileComments("/* header prose */\nint f(void);\n", "include/demo.h").blocks, 1);
+
+    const ktClean = 'val s = """He said "ok // ok" to me\\"""\n';
+    assert.equal(summarizeFileComments(ktClean, "app/Demo.kt").blocks, 0);
+    const ktsReal = 'val s = """/* not */ // not"""\n// real kotlin comment\n';
+    assert.equal(summarizeFileComments(ktsReal, "build.gradle.kts").blocks, 1);
   });
 });
 

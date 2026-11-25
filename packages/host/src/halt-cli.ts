@@ -14,7 +14,6 @@ export type HaltCommand =
 const USAGE = "Usage: infinite halt [--json] | infinite halt on --host | --project ID [--reason TEXT] | infinite halt off --host | --project ID [--keep-paused]";
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, 500);
 
-/** `infinite halt` reads the state. `on` and `off` take exactly one of --host or --project ID. */
 export function parseHaltCommand(positional: readonly string[], options: Options): HaltCommand {
   const host = options["--host"] === true, project = options["--project"];
   const reason = options["--reason"], keepPaused = options["--keep-paused"] === true;
@@ -23,7 +22,6 @@ export function parseHaltCommand(positional: readonly string[], options: Options
   if (positional.length !== 1 || (verb !== "on" && verb !== "off") || host === (project !== undefined)) throw new Error(USAGE);
   if ((verb === "on" && keepPaused) || (verb === "off" && reason !== undefined)) throw new Error(USAGE);
   const target: HaltTarget = host ? { scope: "host" } : { scope: "project", projectId: String(project) };
-  // Checked before the request, so a typo never reaches the host. A retry can reuse the printed request ID.
   const requestId = String(options["--request-id"] ?? randomUUID());
   if (!z.uuid().safeParse(requestId).success) throw new Error("--request-id takes the UUID of an earlier halt request.");
   if (verb === "on") {
@@ -34,7 +32,6 @@ export function parseHaltCommand(positional: readonly string[], options: Options
   return { action: "off", target, requestId, keepPaused };
 }
 
-/** One line per halted scope. Host text is cleaned before it reaches the terminal. */
 export function haltLines(view: HaltView): string[] {
   if (!view.readable) return ["The host cannot read its halt record, so the whole host is halted. Restore the record to change the halt."];
   const line = (name: string, state: HaltState) =>

@@ -39,8 +39,6 @@ export function validateBrief(value: unknown, root: string, context: RepoContext
   if (realpathSync(parsed.repo) !== realpathSync(root) || parsed.head !== context.head || parsed.fingerprint !== fingerprint(context)) throw new Error("understanding-brief-source-mismatch");
   const files = context.files;
   const evidence = parsed.evidence.filter(item => relativePath(item.source) && files[item.source] && item.line <= files[item.source].lines);
-  // The engine retains excerpts only for transient patch/activity references.
-  // File citations resolve against the captured file map and its exact fingerprint.
   const supported = (citation: { source: string; line: number }) => relativePath(citation.source) && Boolean(files[citation.source]) && citation.line <= files[citation.source]!.lines;
   let omitted = parsed.evidence.length - evidence.length;
   const claims = <T extends { citations: { source: string; line: number }[] }>(items: T[]) => items.flatMap(item => {
@@ -68,7 +66,6 @@ export function validateBrief(value: unknown, root: string, context: RepoContext
   };
 }
 
-/** Brief runs are model clients run as the agent account, so `env` defaults to the configured egress; host-account `gh` reads pass `process.env`. */
 function run(command: string, args: string[], options: UnderstandingAdapterOptions & { cwd: string; timeoutMs?: number; maxBytes?: number; env?: NodeJS.ProcessEnv }): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
     let child: ChildProcess;
@@ -79,15 +76,14 @@ function run(command: string, args: string[], options: UnderstandingAdapterOptio
       if (settled || closed === undefined || (reason && !escalated)) return;
       settled = true; clearTimeout(timer); options.signal.removeEventListener("abort", abort);
       if (!reason && closed === 0) { resolvePromise(output.toString("utf8")); return; }
-      // A failed exit or the runner's own timeout carries the engine's last stderr line.
       const failure = new Error(reason ?? `exit ${closed}`);
       rejectPromise(!reason || reason === "understanding-process-timeout" ? new Error(failureReason(failure, stderrTail.toString("utf8"))) : failure);
     };
     const stop = (why: string) => {
       if (reason) return; reason = why;
-      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGTERM"); else child.kill("SIGTERM"); } catch { /* process already ended */ }
+      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGTERM"); else child.kill("SIGTERM"); } catch {}
       const escalation = setTimeout(() => {
-        try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { /* process already ended */ }
+        try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch {}
         escalated = true; finish();
       }, 500);
       escalation.unref();

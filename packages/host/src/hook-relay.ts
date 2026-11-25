@@ -1,23 +1,15 @@
-// Provider command hook → POST to the worker's loopback hook listener. Never prints, always
-// exits 0, so nothing it does can become a hook decision for the provider.
-//
-// The relay runs inside the agent's account, so it is the only Infinite process that can read
-// the provider's transcript. When the worker's reply asks for the transcript, the relay streams
-// the file from the worker's byte cursor in bounded chunks until the worker has caught up.
 import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { FINAL_DRAIN_MS } from "./final-drain.js";
 import { MAX_SECONDARY_FILES, MAX_SECONDARY_PASSES, SECONDARY_ID, SECONDARY_NAME, type SecondaryListing } from "./transcript-secondary.js";
 
 const CHUNK = 192 * 1024;
-/** The most stream passes (one chunk or one end mark each) the primary transcript may spend in one relay run. */
 const MAX_CHUNKS = 64;
 const STREAM_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
 export interface RelayOptions {
   url: string;
   token: string;
-  /** Resolves the transcript when the payload names none (Codex rollouts). */
   home?: string;
   fetch?: typeof fetch;
 }
@@ -34,7 +26,6 @@ const post = async (options: RelayOptions, route: string, body: string): Promise
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
 };
 
-/** Codex names the rollout only by thread id; the file lives under the sessions date tree. */
 export function findCodexRollout(home: string, threadId: string): string | undefined {
   if (!/^[A-Za-z0-9-]{8,80}$/.test(threadId)) return undefined;
   const root = join(process.env.CODEX_HOME || join(home, ".codex"), "sessions");
@@ -48,12 +39,10 @@ export function findCodexRollout(home: string, threadId: string): string | undef
   return undefined;
 }
 
-/** The folder that holds a primary transcript's subagent transcripts: the path without `.jsonl`, then `subagents`. */
 export function secondaryFolder(primary: string): string {
   return join(primary.replace(/\.jsonl$/, ""), "subagents");
 }
 
-/** The subagent folder of `primary`, when its real path is the derived path: no link in the folder or its parents. */
 function realSecondaryFolder(primary: string): string | undefined {
   try {
     const folder = join(realpathSync(dirname(primary)), basename(primary).replace(/\.jsonl$/, ""), "subagents");
@@ -63,7 +52,6 @@ function realSecondaryFolder(primary: string): string | undefined {
   }
 }
 
-/** A listing and the identity of each listed file, which the open must match. The identities are sent as `id`. */
 interface Scan {
   folder: string;
   listing: SecondaryListing;
@@ -82,13 +70,12 @@ function scanSecondaries(primary: string): Scan | undefined {
     const ids = new Map<string, string>();
     for (const name of names.slice(0, MAX_SECONDARY_FILES)) {
       try {
-        // Bigint stats keep large inode numbers exact.
         const info = lstatSync(join(folder, name), { bigint: true });
         const id = `${info.dev}:${info.ino}`;
         if (!info.isFile() || !SECONDARY_ID.test(id)) continue;
         files.push({ name, size: Number(info.size), id });
         ids.set(name, id);
-      } catch { /* A file that cannot be stat'd stays in the total and is not listed. */ }
+      } catch {}
     }
     return { folder, listing: { files, total: names.length }, ids };
   } catch {
@@ -96,23 +83,16 @@ function scanSecondaries(primary: string): Scan | undefined {
   }
 }
 
-/** The secondary transcripts beside `primary`. Never throws. */
 export function listSecondaries(primary: string): SecondaryListing {
   return scanSecondaries(primary)?.listing ?? { files: [], total: 0 };
 }
 
-/** Where a stream reads. A secondary carries its name and the `id` its listing gave. */
 interface Source {
   file: string;
   secondary?: string;
   id?: string;
 }
 
-/**
- * Streams one transcript from `after` until the worker stops asking or the pass budget is spent. The primary
- * (no `secondary`) and each secondary run this loop. `endFields` adds fields to the end mark, after the size check.
- * Returns the reply to the end mark, when one was sent.
- */
 async function stream(
   options: RelayOptions,
   path: string,
@@ -129,7 +109,6 @@ async function stream(
   try {
     const opened = fstatSync(fd, { bigint: true });
     if (!opened.isFile()) return undefined;
-    // A file replaced after the listing has another identity, and is never read.
     if (source.id !== undefined && `${opened.dev}:${opened.ino}` !== source.id) return undefined;
     const buffer = Buffer.alloc(CHUNK);
     const echo = drain === undefined ? {} : { drain };
@@ -137,7 +116,6 @@ async function stream(
     let offset = after;
     while (budget.left > 0) {
       budget.left--;
-      // A fresh size on every pass. The end mark is sent only when the acknowledged cursor is at that size.
       const size = fstatSync(fd).size;
       if (offset >= size) {
         if (offset !== size) return undefined;
@@ -145,7 +123,6 @@ async function stream(
       }
       const length = readSync(fd, buffer, 0, Math.min(CHUNK, size - offset), offset);
       if (!length) return undefined;
-      // Chunks end on a UTF-8 boundary so the worker can decode each one on its own.
       let end = length, lead = length - 1, trailing = 0;
       while (lead >= 0 && trailing < 3 && (buffer[lead] & 0xc0) === 0x80) { lead--; trailing++; }
       if (lead >= 0 && buffer[lead] & 0x80) {
@@ -154,10 +131,8 @@ async function stream(
       }
       if (end <= 0) end = length;
       const text = buffer.toString("utf8", 0, end);
-      // A chunk never carries the end flag. The end mark follows only after the cursor reaches a fresh size.
       const reply = await post(options, "transcript", JSON.stringify({ ...target, offset, text, ...echo }));
       const next = typeof reply?.after === "number" ? reply.after : undefined;
-      // The worker names where it is; a mismatch resynchronizes, a repeat stops the loop.
       if (next === undefined || next === offset) return undefined;
       offset = next;
     }
@@ -165,10 +140,6 @@ async function stream(
   } finally { closeSync(fd); }
 }
 
-/**
- * Streams the secondaries the worker asked for, in the reply's order. Only names in the listing just sent are
- * opened. A failed file ends that file alone, and the shared budget bounds the whole run.
- */
 async function streamWanted(
   options: RelayOptions,
   path: string,
@@ -182,15 +153,13 @@ async function streamWanted(
   for (const item of reply.slice(0, MAX_SECONDARY_FILES)) {
     if (budget.left <= 0) return;
     const { name, after } = (item ?? {}) as { name?: unknown; after?: unknown };
-    // Only a name the listing gave is opened, and a name that repeats is streamed once.
     if (typeof name !== "string" || !scan.ids.has(name) || streamed.has(name) || typeof after !== "number" || !Number.isSafeInteger(after) || after < 0) continue;
     streamed.add(name);
     const source: Source = { file: join(scan.folder, name), secondary: name, id: scan.ids.get(name) };
-    try { await stream(options, path, source, after, drain, budget); } catch { /* The next wanted file still runs. */ }
+    try { await stream(options, path, source, after, drain, budget); } catch {}
   }
 }
 
-/** One hook event: forward the payload, then serve any transcript bytes the worker asks for. */
 export async function relay(route: string, body: string, options: RelayOptions) {
   let payload = body;
   if (options.home && (route === "codex" || route === "codex-notify")) {
@@ -201,17 +170,12 @@ export async function relay(route: string, body: string, options: RelayOptions) 
         const found = findCodexRollout(options.home, id);
         if (found) payload = JSON.stringify({ ...parsed, transcript_path: found });
       }
-    } catch { /* forwarded as received */ }
+    } catch {}
   }
   const reply = await post(options, route, payload);
-  // Only a claude transcript has subagent files.
   await serve(options, reply?.transcript, route === "claude");
 }
 
-/**
- * Streams the transcript a worker reply asks for. `secondariesAllowed` says whether this route may list subagent
- * files. The listing rides on the primary end mark, when the reply asks for it.
- */
 async function serve(options: RelayOptions, wanted: unknown, secondariesAllowed: boolean) {
   if (wanted && typeof wanted === "object" && typeof (wanted as { path?: unknown }).path === "string" &&
       Number.isSafeInteger((wanted as { after?: unknown }).after) && (wanted as { after: number }).after >= 0) {
@@ -229,7 +193,6 @@ async function serve(options: RelayOptions, wanted: unknown, secondariesAllowed:
   }
 }
 
-/** The final drain: asks the `drain` route what to read, then streams it as a hook-started drain does. */
 export async function drain(options: RelayOptions): Promise<void> {
   const reply = await post(options, "drain", "{}");
   await serve(options, reply?.transcript, true);

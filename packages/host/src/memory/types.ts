@@ -13,12 +13,10 @@ import type {
 } from "@infinite/remote";
 import type { MemoryRecoveryWitness } from "./recovery.js";
 
-/** Selector only. The host resolves it again on every protected operation. */
 export type MemoryPrincipalSelector =
   | { kind: "device"; deviceId: string }
   | { kind: "task"; taskBindingId: string };
 
-/** Fresh, host-authenticated state returned by the host integration callbacks. */
 export interface MemoryPrincipalSnapshot {
   principalId: string;
   kind: "device" | "task";
@@ -35,7 +33,6 @@ export interface MemoryPrincipalSnapshot {
   state: "active" | "revoked";
 }
 
-/** Current identity comes from ProjectGroupService, never from a caller selector. */
 export interface MemoryCurrentWorkspaceBinding {
   workspaceId: string;
   bindingEpoch: number;
@@ -45,7 +42,6 @@ export interface MemoryCurrentWorkspaceBinding {
 }
 
 export interface MemoryProvisionIntent {
-  /** Stable ID of the already-authorized, explicit workspace-enable intent. */
   intentEventId: string;
   actor: MemoryPrincipalSelector & { kind: "device" };
   workspaceId: string;
@@ -78,7 +74,6 @@ export interface MemoryAuthorizationSnapshot {
 
 const memoryReadFenceBrand: unique symbol = Symbol("memory-read-fence");
 
-/** An opaque host-only proof that a particular protected read was current. */
 export interface MemoryReadFence {
   readonly [memoryReadFenceBrand]: true;
 }
@@ -88,7 +83,6 @@ export interface AuthorizedRead<T> {
   fence: MemoryReadFence;
 }
 
-/** Only the store implementation should issue or inspect these opaque fences. */
 export function createMemoryReadFence(token: string): MemoryReadFence {
   const fence = {} as MemoryReadFence & { [memoryReadFenceBrand]: true; token: string };
   Object.defineProperty(fence, memoryReadFenceBrand, { value: true });
@@ -113,7 +107,6 @@ export interface MemoryStoreOptions {
 }
 
 export interface MemoryStore {
-  /** Initialize the SQLite schema and attempt fresh witness reconciliation. */
   openRecovery(): Promise<void>;
   readonly recoveryReady: boolean;
   provisionWorkspaceMemory(intent: MemoryProvisionIntent): AuthorizedRead<MemoryWorkspace>;
@@ -131,7 +124,6 @@ export interface MemoryStore {
   lexicalCandidates(actor: MemoryPrincipalSelector, workspaceId: string, query: MemoryLexicalQuery): AuthorizedRead<MemoryRecord[]>;
   currentAuthorizationSnapshot(actor: MemoryPrincipalSelector, workspaceId: string): AuthorizedRead<MemoryAuthorizationSnapshot>;
   getMutationStatus(actor: MemoryPrincipalSelector, workspaceId: string, requestId: string): AuthorizedRead<MemoryMutationStatusResult>;
-  /** Host transport calls this immediately before sending any protected response bytes. */
   revalidateResponse(actor: MemoryPrincipalSelector, fence: MemoryReadFence): void;
   close(): void;
 }

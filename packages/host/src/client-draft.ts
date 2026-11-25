@@ -5,8 +5,6 @@ import serialize from "@xterm/addon-serialize";
 import { randomUUID } from "node:crypto";
 import type { localDraftStore, LocalDraft } from "./client-draft-store.js";
 
-// Mirror the terminal even while the local editor covers it. Closing the editor
-// restores the latest cloud screen, including redraws that arrived meanwhile.
 export function draftTerminal(store: ReturnType<typeof localDraftStore>) {
   const terminal = new headless.Terminal({ cols: process.stdout.columns || 120, rows: process.stdout.rows || 32, scrollback: 0, allowProposedApi: true });
   const serializer = new serialize.SerializeAddon(); terminal.loadAddon(serializer);
@@ -28,7 +26,6 @@ export function draftTerminal(store: ReturnType<typeof localDraftStore>) {
     resize(cols: number, rows: number) { terminal.resize(cols, rows); },
     async snapshot(ansi: string, cols: number, rows: number) {
       terminal.resize(cols, rows);
-      // Cancel any partial escape sequence and restore the snapshot's modes.
       await this.output("\x18" + ansi);
     },
     inserted() { if (store.clear()) savedDraft = undefined; },
@@ -83,7 +80,6 @@ export function draftTerminal(store: ReturnType<typeof localDraftStore>) {
       const requestId = randomUUID();
       if (insert && text) {
         savedDraft = { text, state: "uncertain", requestId };
-        // Persist the uncertain state before any bytes can reach the host.
         if (!store.save(savedDraft, true)) return;
       } else if (!save(true)) return;
       draft = undefined; editor.close(); input.destroy(); redraw();

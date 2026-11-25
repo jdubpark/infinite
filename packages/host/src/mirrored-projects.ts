@@ -12,20 +12,17 @@ const invalid = () => new ProjectSyncError("Choose a project below the home dire
 type Entry = { path: string; id: string; forgotten?: true };
 const slug = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60).replace(/-+$/g, "") || "project";
 
-/** The wire path is relative to a home directory, with portable separators and no normalization ambiguity. */
 export function homeRelativePath(path: string): boolean {
   return path.length > 0 && path.length <= 4096 && !path.startsWith(".") &&
     !/[\\\x00-\x1f\x7f-\x9f]/.test(path) && path.split("/").every(part => part !== "" && part !== "." && part !== "..");
 }
 
-/** Local launch identity omits the account-specific home prefix. Never guess a mapping outside home. */
 export function localProjectPath(root: string): string {
   const path = relative(realpathSync(homedir()), root).split(sep).join("/");
   if (!homeRelativePath(path) || isAbsolute(path)) throw invalid();
   return path;
 }
 
-/** Owner-created mappings live in the private vault, independently of the operator's host configuration. */
 export class MirroredProjects {
   private readonly entries: Entry[];
   private readonly file: string;
@@ -47,7 +44,6 @@ export class MirroredProjects {
 
   private persist() { writeSealed(this.file, this.key, "mirrored-projects", { version: 2, entries: this.entries }); }
 
-  /** Resolve a possibly nonexistent path through its nearest existing ancestor. */
   private canonical(path: string): string {
     try { return realpathSync(path); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT" || dirname(path) === path) throw error;
@@ -60,12 +56,10 @@ export class MirroredProjects {
     const home = this.home();
     const destination = resolve(home, ...path.split("/"));
     if (!inside(home, destination) || destination === home) throw invalid();
-    // Refuse symlink aliases: they could silently select another project or private host directory.
     for (let current = destination; current !== home; current = dirname(current)) {
       try { if (!lstatSync(current).isDirectory()) throw invalid(); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
-    // Refuse before persisting: a mapping that held a credential or the team root would fail startup validation.
     const protectedPaths = [this.config.stateDir, this.config.runDir, this.config.keyFile, this.config.teams?.workspaceDir,
       this.config.linear?.apiKeyFile, this.config.push?.accessTokenFile, this.config.remote?.relay?.tokenFile, this.config.summaries?.apiKeyFile, this.config.jev?.apiKeyFile]
       .filter((value): value is string => Boolean(value));
@@ -79,7 +73,6 @@ export class MirroredProjects {
     const destination = this.destination(path);
     const existing = this.config.projects.find(project => this.canonical(resolve(project.path)) === destination);
     if (existing) return existing;
-    // Overlapping projects would have independent sync locks for the same files.
     if (this.config.projects.some(project => inside(this.canonical(resolve(project.path)), destination) || inside(destination, this.canonical(resolve(project.path)))))
       throw new ProjectSyncError("This folder overlaps another cloud project. Select that project with --project ID.", "cloud-changed");
     if (this.config.projects.some(project => project.teamworkDir &&
@@ -105,10 +98,7 @@ export class MirroredProjects {
     const entry = this.entries.find(value => value.path === path);
     const project = this.register(path, entry?.id);
     try {
-      // Intermediate folders remain host-controlled even when agents can edit each applied project.
       const shared = this.config.sync?.sharedGroup, parent = dirname(project.path), home = this.home();
-      // A folder agents can write could swap a folder below it for a symlink before the chmods below follow it.
-      // Check every existing ancestor up to the home folder, or to the first existing folder above a missing home.
       if (shared)
         for (let dir = parent; ; dir = dirname(dir)) {
           let exists = true;
@@ -119,7 +109,6 @@ export class MirroredProjects {
       const firstParent = mkdirSync(parent, { recursive: true, mode: shared ? 0o2750 : 0o700 });
       const created = mkdirSync(project.path, { recursive: true, mode: shared ? 0o2770 : 0o700 });
       if (shared) {
-        // mkdir modes pass through the process umask (the service runs with 0077), so set them on the folders this call made.
         if (firstParent) for (let dir = parent; ; dir = dirname(dir)) { chmodDirectoryNoFollow(dir, 0o2750); if (dir === firstParent || dirname(dir) === dir) break; }
         if (created) chmodDirectoryNoFollow(project.path, 0o2770);
       }

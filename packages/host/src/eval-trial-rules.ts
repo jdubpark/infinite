@@ -7,7 +7,6 @@ import type { TeamModelProfile } from "./team-types.js";
 import { VOID_ENDINGS, type EvalIdentityState, type TrialConfiguration, type TrialEnding, type TrialGrade, type TrialState } from "./eval-types.js";
 
 export const TRIAL_HARNESS_VERSION = 1, VOID_ATTEMPTS_MAX = 3, VOID_STREAK_PAUSE = 3;
-/** The failure in a row, for one slot, before a host cause ends the trial `void-host`. A shorter outage keeps the attempt. */
 export const TRIAL_RELEASES = 10;
 
 export type SlotRow = { taskId: string; configRef: string; slot: number; attempt: number; state: TrialState; ending: TrialEnding | null };

@@ -8,12 +8,10 @@ export const REGISTER_LEAD = "Assumptions and open questions from the owner's ob
 export const ASK_SENTENCE = "Ask for a user decision if a material scope decision is required.";
 export const PROPOSE_SENTENCE = "When the work depends on something the record does not settle, do not wait for a user decision: post a finding whose body proposes an assumption (a statement, what would refute it, a test, and a criticality), and plan so that the work survives if it is refuted. A proposal is a claim and changes no status.";
 
-/** The register's lead line and its JSON, one block. The JSON is the host's digest, never member text. */
 export function registerText(register: RegisterDigest): string {
   return `${REGISTER_LEAD}:\n${JSON.stringify(register)}`;
 }
 
-/** PROPOSE_SENTENCE when the goal digest holds a register, the run is pinned autonomous, and the role posts findings with entry tools; ASK_SENTENCE otherwise. */
 export function scopeSentence(run: TeamRun, role: TeamMember["role"]): string {
   const kinds = (ROLE_KINDS as Readonly<Record<string, readonly MemberEntryKind[]>>)[role] ?? [];
   const proposes = Boolean(run.goal?.record?.register) && autonomyOf(run) === "autonomous" && entryToolsFor(run, role) && kinds.includes("finding");

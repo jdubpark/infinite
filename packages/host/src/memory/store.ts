@@ -344,7 +344,6 @@ function numberColumn(source: SqlRow, key: string): number {
 
 function boolColumn(source: SqlRow, key: string): boolean { return numberColumn(source, key) === 1; }
 
-/** Persistent canonical SQLite store. It cannot serve until fresh recovery succeeds. */
 export class MemoryStoreService implements MemoryStoreContract {
   private readonly db: DatabaseSync;
   private readonly options: MemoryStoreOptions;
@@ -372,8 +371,6 @@ export class MemoryStoreService implements MemoryStoreContract {
     try {
       let initialize = false;
       try {
-        // Only a file created exclusively by this constructor may receive a new
-        // key check. Existing empty or pre-sentinel databases are refused.
         closeSync(openSync(options.databasePath, "wx", 0o600));
         initialize = true;
       } catch (error) {
@@ -385,7 +382,6 @@ export class MemoryStoreService implements MemoryStoreContract {
       }
       database = new DatabaseSync(options.databasePath);
       this.db = database;
-      // Recheck on the writer before any persistent PRAGMA or schema mutation.
       if (!initialize) this.authenticateStoreMetadata(database);
       chmodSync(options.databasePath, 0o600);
       database.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA busy_timeout=5000; PRAGMA wal_autocheckpoint=1000;");
@@ -475,7 +471,7 @@ export class MemoryStoreService implements MemoryStoreContract {
       this.db.exec("COMMIT");
       return result;
     } catch (error) {
-      try { this.db.exec("ROLLBACK"); } catch { /* preserve the original transaction failure */ }
+      try { this.db.exec("ROLLBACK"); } catch {}
       throw error;
     }
   }
@@ -535,7 +531,7 @@ export class MemoryStoreService implements MemoryStoreContract {
   private sizeBytes(): number {
     let total = 0;
     for (const suffix of ["", "-wal", "-shm"]) {
-      try { total += statSync(`${this.options.databasePath}${suffix}`).size; } catch { /* file not created yet */ }
+      try { total += statSync(`${this.options.databasePath}${suffix}`).size; } catch {}
     }
     return total;
   }
@@ -552,7 +548,7 @@ export class MemoryStoreService implements MemoryStoreContract {
       || (selector.kind === "task" && (Object.keys(selector).length !== 2 || typeof selector.taskBindingId !== "string"))
       || (selector.kind !== "device" && selector.kind !== "task")) throw memoryError("unauthenticated", "The current memory principal is unavailable.");
     let principal: MemoryPrincipalSnapshot | undefined;
-    try { principal = this.options.resolvePrincipal(selector); } catch { /* authentication callbacks fail closed */ }
+    try { principal = this.options.resolvePrincipal(selector); } catch {}
     const now = (this.options.now ?? Date.now)();
     const expiry = principal?.expiresAt === undefined ? Number.NaN : Date.parse(principal.expiresAt);
     const malformedTask = principal?.kind === "task" && (
@@ -595,7 +591,7 @@ export class MemoryStoreService implements MemoryStoreContract {
 
   private currentBinding(workspaceId: string): MemoryCurrentWorkspaceBinding {
     let binding: MemoryCurrentWorkspaceBinding | undefined;
-    try { binding = this.options.resolveWorkspaceBinding(workspaceId); } catch { /* lookup failures fail closed */ }
+    try { binding = this.options.resolveWorkspaceBinding(workspaceId); } catch {}
     if (!binding || binding.workspaceId !== workspaceId || !Number.isSafeInteger(binding.bindingEpoch) || binding.bindingEpoch < 1
       || !/^[a-f0-9]{64}$/.test(binding.bindingDigest)
       || !["active", "review-required", "retired"].includes(binding.state)) {
@@ -1340,9 +1336,6 @@ export class MemoryStoreService implements MemoryStoreContract {
           if (!localIntent) this.run("UPDATE memory_epochs SET serving_epoch=serving_epoch+1,grant_epoch=grant_epoch+?,source_epoch=source_epoch+? WHERE workspace_key=?",
             delta.action === "grant-revoke" ? 1 : 0, delta.action === "source-revoke" ? 1 : 0, delta.workspaceKey);
         }
-        // A restored snapshot can contain the original content-bearing job even
-        // when it has no local erase/archive intent. Witness denial must purge it
-        // in the same transaction as the tombstone and checkpoint advancement.
         if (delta.action === "erase" || delta.action === "revoke") this.purgeRecordOutboxPayloads(delta.objectKey);
       }
       this.run("UPDATE memory_recovery_state SET sequence=?,head_hash=? WHERE singleton=1", checkpoint.sequence, checkpoint.headHash);
@@ -2159,8 +2152,6 @@ export class MemoryStoreService implements MemoryStoreContract {
     return this.authorized(this.workspaceView(intent.workspaceId, created, binding), intent.actor, principal, intent.workspaceId, workspaceKey, binding.bindingEpoch);
   }
 
-  // Remaining read and mutation methods are implemented below.
-
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -2169,5 +2160,4 @@ export class MemoryStoreService implements MemoryStoreContract {
     this.db.close();
   }
 
-  // Remaining service methods are implemented below.
 }

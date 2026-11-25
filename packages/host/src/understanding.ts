@@ -19,8 +19,6 @@ import { pageOf } from "./understanding-pages.js";
 
 const MAX_GENERATIONS_PER_PROJECT = 16;
 const MAX_STORE_BYTES = 8 * 1024 * 1024;
-// Runtime output is capped at 1 MiB before sealing. Keep one bounded generation
-// of publication headroom so a full store can advance without deleting evidence first.
 const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024;
 const TEMPORARY_ARTIFACT = /^[0-9a-f-]{36}\.sealed\.[0-9a-f]{16}\.tmp$/;
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -84,7 +82,6 @@ export interface UnderstandingSources {
   knowledge?: { read(id: string): WorkspaceKnowledge };
 }
 
-/** Read model and retained, source-bound repository brief generations. Reads never schedule work. */
 export class UnderstandingService {
   private readonly directory: string;
   private state: State = { version: 1, generations: [] };
@@ -154,8 +151,6 @@ export class UnderstandingService {
 
   private async capture(session: Session, rootInput: string): Promise<Capture> {
     if (session.workspace || session.executionLocation === "laptop") throw new Error("source-unavailable");
-    // V1 artifacts bind one repository. A mission coordinator's inseparable
-    // multi-repository context needs a full pinned-source binding before retention.
     if (session.team?.role === "mission-coordinator") throw new Error("mission-brief-source-unavailable");
     const live = this.sources.manager.meta(session.id).session;
     if (live.projectId !== session.projectId || live.cwd !== session.cwd || digest(live.team ?? null) !== digest(session.team ?? null)) throw new Error("session-source-rebound");
@@ -208,15 +203,11 @@ export class UnderstandingService {
     try {
       mkdirSync(this.directory, { recursive: true, mode: 0o700 });
       const sizes = new Map(readdirSync(this.directory).filter(name => /^[0-9a-f-]{36}\.sealed$/.test(name)).map(name => [name.slice(0, -7), statSync(join(this.directory, name)).size]));
-      // Only known unacknowledged writes or validated, superseded generations
-      // can be reclaimed before publication; the current acknowledged set stays intact.
       for (const id of this.pendingPrune) {
         this.removeTemporaryArtifact(id);
         if (sizes.has(id)) { unlinkSync(join(this.directory, `${id}.sealed`)); sizes.delete(id); }
         this.pendingPrune.delete(id);
       }
-      // Interrupted writes from an earlier process still consume disk even when
-      // their UUID is not ours to clean up during this attempt.
       const temporaryBytes = readdirSync(this.directory).filter(name => TEMPORARY_ARTIFACT.test(name))
         .reduce((total, name) => total + statSync(join(this.directory, name)).size, 0);
       const currentBytes = [...sizes.values()].reduce((total, size) => total + size, temporaryBytes);
@@ -228,7 +219,7 @@ export class UnderstandingService {
     } catch (error) {
       this.pendingPrune.add(artifact.id);
       try { this.removeTemporaryArtifact(artifact.id); }
-      catch { /* Retry this exact prefix before any subsequent publication. */ }
+      catch {}
       this.storageError = "The latest brief could not be durably retained; prior snapshots remain available.";
       throw error;
     }
@@ -262,8 +253,6 @@ export class UnderstandingService {
         project.enrolledPath !== expected.enrolledPath || project.projectDevice !== expected.projectDevice ||
         project.projectInode !== expected.projectInode || project.repoIdentity !== expected.repoIdentity) return false;
     let cwd = expected.sourceCwd;
-    // Team member workspaces are deleted after a run. When the session record or run membership is gone,
-    // or the workspace paths no longer resolve, the matching repository binding and a recorded head suffice.
     const retained = !!entry.artifact.head;
     if (expected.sourceKind === "team") {
       let session: Session | undefined;
@@ -332,11 +321,8 @@ export class UnderstandingService {
     return this.workRows(this.workspace(id));
   }
 
-  /** Unbounded read: complete request text and every retained snapshot. Overview and pages both derive from it. */
   private build(id: string): WorkspaceUnderstanding {
     const group = this.workspace(id);
-    // One membership snapshot and one Git capture per checkout per request. Never reuse
-    // these across reads: a rebind or same-path replacement must invalidate the next read.
     const projects = new Map<string, ProjectBinding | undefined>();
     const bindings = new Map<string, boolean>();
     const rows = this.workRows(group);
@@ -367,7 +353,7 @@ export class UnderstandingService {
           if (session.team && !this.ownedTeamSession(session)) continue;
           activeStates.push(state.state);
           if (state.state === "failed") failedReasons.push(state.error?.split("Reason: ").slice(1).join("Reason: ") || state.error || "unknown");
-        } catch { /* closed or unavailable sessions do not alter retained artifact visibility */ }
+        } catch {}
       }
       const planned: UnderstandingPlan[] = currentWork.filter(work => work.repositoryIds.some(projectId => checkouts.has(projectId))).map(work => ({
         workId: work.id, kind: work.kind, title: work.title, text: work.objective ?? "", status: work.status, updatedAt: work.updatedAt, source: "request" as const, excerpt: false,
@@ -402,7 +388,6 @@ export class UnderstandingService {
     return pageOf(this.build(workspaceId).work, cursor, item => item.id);
   }
 
-  /** Derived at read time from recorded work. Never stored, so the owner catalog revision is untouched. */
   generatedPage(workspaceId: string, cursor?: string): GeneratedCatalogPage {
     const group = this.workspace(workspaceId);
     const repositoryOf = new Map(group.repos.flatMap(repo => repo.checkouts.map(checkout => [checkout.projectId, repo.projectId] as const)));
@@ -420,7 +405,6 @@ export class UnderstandingService {
   }
 }
 
-/** Parse and validate writer diagrams at persist time; retain source when the parsed graph is outside the artifact schema. */
 export function retainedDiagrams(artifactId: string, sources: { title: string; kind: "system" | "change"; mermaid: string; citations: { source: string; line: number }[] }[]): { diagrams: Diagram[]; coverage: string[] } {
   const diagrams: Diagram[] = [], coverage: string[] = [];
   sources.forEach((source, index) => {
@@ -462,14 +446,12 @@ function excerptOf(plan: UnderstandingPlan): UnderstandingPlan {
 
 const shown = (category: string, included: number, total: number) => `${category}: ${included} of ${total} shown here; the rest are available on the detail pages.`;
 
-/** One first-come budget, spent in a fixed order on whole records. Anything left out is
- * reachable through the paged detail endpoints, and the catalog is never emptied. */
 export function boundedResponse(value: WorkspaceUnderstanding): WorkspaceUnderstanding {
   const bytes = (item: unknown) => Buffer.byteLength(JSON.stringify(item)) + 1;
   let remaining = MAX_RESPONSE_BYTES - 64 * 1024;
   const take = (item: unknown) => { const size = bytes(item); if (size > remaining) return false; remaining -= size; return true; };
   const coverage = [...value.coverage];
-  remaining -= bytes({ ...value, knowledge: undefined, work: [], repositories: [], coverage }) + 8192; // Room for the omission lines.
+  remaining -= bytes({ ...value, knowledge: undefined, work: [], repositories: [], coverage }) + 8192;
 
   const repositories = value.repositories.map(source => ({ ...source, current: [], planned: [], coverage: [] }) as UnderstandingRepository);
   for (const repo of repositories) remaining -= bytes(repo);
@@ -481,7 +463,7 @@ export function boundedResponse(value: WorkspaceUnderstanding): WorkspaceUnderst
   const addArtifact = (repo: UnderstandingRepository, source: UnderstandingArtifact) => {
     const artifact: UnderstandingArtifact = { ...source, coverage: [...source.coverage], evidence: [] };
     if (!take(artifact)) return;
-    remaining -= 256; // Reserve the evidence line.
+    remaining -= 256;
     repo.current.push(artifact); selected.push({ source, artifact });
   };
   const sourceOf = (repo: UnderstandingRepository) => value.repositories.find(item => item.id === repo.id)!;

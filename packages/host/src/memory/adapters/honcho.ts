@@ -17,7 +17,6 @@ const MAX_RESPONSE_BYTES = 64 * 1024;
 
 export interface HonchoAdapterConfig {
   baseUrl: string;
-  /** Host-minted workspace-only JWT; adapter verifies its declared scope before use. */
   workspaceToken(workspaceName: string): string | undefined;
   timeoutMs?: number;
   fetch?: typeof fetch;
@@ -77,11 +76,6 @@ export class HonchoMemoryAdapter implements MemoryAdapter {
     }
   }
 
-  /**
-   * Honcho message writes schedule background embedding/reasoning retries. The
-   * adapter keeps that path disabled until a host-owned egress proxy can meter
-   * every nested attempt. Lexical indexing remains Infinite-owned.
-   */
   async indexSourceEvent(input: MemoryIndexInput): Promise<MemoryIndexReceipt> {
     this.ledger.assertCurrentPartition(input.event.partition);
     throw new Error(input.processingAllowed || input.semanticDestination
@@ -93,7 +87,6 @@ export class HonchoMemoryAdapter implements MemoryAdapter {
     throw new Error("Honcho is not the lexical source; use Infinite's canonical lexical index");
   }
 
-  /** Honcho search generates an embedding inside the service; disabled without per-attempt metering. */
   async searchSemantic(_input: MemoryAdapterSearchInput & {
     destination: { providerId: string; endpointId: string; modelId: string };
     reservationId: string;
@@ -106,7 +99,6 @@ export class HonchoMemoryAdapter implements MemoryAdapter {
     throw new Error("Honcho candidate hydration is disabled; hydrate from Infinite's canonical store");
   }
 
-  /** A 202 means deletion was queued. The generation remains quarantined. */
   async revokeAndQuarantine(partition: MemoryAdapterPartition, reason: string): Promise<void> {
     this.ledger.assertCanonicalCurrent(partition);
     await this.ledger.quarantine(partition, reason);
@@ -148,7 +140,6 @@ export class HonchoMemoryAdapter implements MemoryAdapter {
     this.ledger.assertCurrentPartition(input.partition);
   }
 
-  /** Qualification helper: create one isolated provider workspace for this collection generation. */
   async ensureWorkspace(partition: MemoryAdapterPartition): Promise<void> {
     this.ledger.assertCurrentPartition(partition);
     const name = workspaceName(partition);

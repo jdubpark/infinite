@@ -1,5 +1,3 @@
-// Lets the host see the processes that a team operation started, also after the API process that started them is gone.
-// Node built-ins, the pure sudo profile reader and type imports only: the census also runs alone, as the agent account, through a sudo wrapper.
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readdir, readFile, readlink, realpath, stat } from "node:fs/promises";
@@ -8,45 +6,29 @@ import { fileURLToPath } from "node:url";
 import { sudoShape } from "./sudo-profile.js";
 import type { TeamCommand } from "./team-types.js";
 
-/** One process as the census reads it. */
 export interface ProcessRow {
   pid: number; ppid: number; pgid: number;
-  /** Session id. Absent where the platform does not report one (macOS). */
   sid?: number;
   uid: number;
-  /** Opaque start token. Within one boot, the same pid with the same token is the same process. */
   start: string;
   command: string;
 }
 export interface ProcessTable {
-  /** Names this boot. No process outlives it, so a witness from another boot has nothing left to find. */
   boot: string;
   rows: ProcessRow[];
 }
-/** What the host recorded about the processes one operation started. Sealed with the operation's intent. */
 export interface ProcessWitness {
   boot: string;
-  /** Each command the host started for the operation: its direct child. */
   processes: { pid: number; start: string }[];
-  /** Session and process-group ids the host saw among those children and their descendants. */
   sessions: number[];
   groups: number[];
-  /** Set when a list reached WITNESS_LIMIT. Nothing is dropped to make room; the witness then no longer covers the operation. */
   overflow?: true;
 }
 export type CensusReason = "recorded-process" | "recorded-session" | "recorded-group" | "working-directory" | "open-file" | "command-line" | "unreadable";
 export interface CensusFinding { pid: number; reason: CensusReason }
-/**
- * `ok: true` with no findings means the census looked everywhere it claims to and found no process.
- * An `unreadable` finding is a process the census could not inspect: it is not evidence that the process uses the
- * directory, only that the census cannot rule it out.
- * `ok: false` means it could not finish; it proves nothing and callers must treat the processes as possibly running.
- */
 export type CensusResult = { ok: true; findings: CensusFinding[] } | { ok: false; problem: string };
 
-/** The wrapper's file name, beside the launcher that a sudo command prefix names. */
 export const CENSUS_WRAPPER = "process-census";
-/** The most entries a witness keeps in each list. A full list marks the witness as overflowed instead of dropping an entry. */
 export const WITNESS_LIMIT = 4096;
 
 const REASONS = new Set<string>(["recorded-process", "recorded-session", "recorded-group", "working-directory", "open-file", "command-line", "unreadable"]);
@@ -55,32 +37,24 @@ const LSOF = "/usr/sbin/lsof";
 const EXEC_LIMIT_MS = 20_000;
 const TABLE_BUFFER_BYTES = 64 * 1024 * 1024;
 const WRAPPER_LIMIT_MS = 10_000;
-/** A process can fork and exit between the listing and the reads of one pass; a second pass sees what the first missed. */
 const SECOND_PASS_MS = 100;
-/** How long the Linux census waits before it looks again at the processes it could not inspect. An exiting process is one for a few milliseconds, while it still holds its files. */
 const LOOK_AGAIN_MS = 100;
 const WRAPPER_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_WRAPPER_FINDINGS = 10_000;
 const MAX_INPUT_BYTES = 4096;
 
 let boot: string | undefined;
-/**
- * This boot's token, read once. "unsupported" where the host cannot read one; a witness then never matches a table,
- * and the table read itself rejects there, so the census reports that it could not finish.
- */
 export function bootId(): string {
   if (boot !== undefined) return boot;
   try {
     if (process.platform === "linux") boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
     else if (process.platform === "darwin") boot = /sec = (\d+)/.exec(execFileSync("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8", timeout: 5000 }))?.[1];
-  } catch { /* Reported as unsupported below. */ }
+  } catch {}
   return boot ||= "unsupported";
 }
-/** A witness with nothing recorded yet. */
 export function newWitness(): ProcessWitness {
   return { boot: bootId(), processes: [], sessions: [], groups: [] };
 }
-/** Every process on the host: Linux reads /proc, macOS runs ps. Rejects on another platform or when the read fails. */
 export async function readProcessTable(): Promise<ProcessTable> {
   const id = bootId();
   if (id === "unsupported") throw new Error("the boot cannot be named");
@@ -88,7 +62,6 @@ export async function readProcessTable(): Promise<ProcessTable> {
   if (process.platform === "darwin") return { boot: id, rows: await darwinRows() };
   throw new Error(`unsupported platform: ${process.platform}`);
 }
-/** The start token of a live process, or undefined when no such process exists. */
 export async function processStart(pid: number): Promise<string | undefined> {
   if (process.platform === "linux") {
     try { return parseLinuxStat(await readFile(`/proc/${pid}/stat`, "utf8")).start; } catch (error) { if (isGone(error)) return undefined; throw error; }
@@ -98,10 +71,6 @@ export async function processStart(pid: number): Promise<string | undefined> {
   }
   throw new Error(`unsupported platform: ${process.platform}`);
 }
-/**
- * Records a command the host started detached: it leads its own session and process group, so both ids are its pid
- * and need no read. With a start token the process itself is recorded too. Returns true when the witness changed. Pure.
- */
 export function recordCommand(witness: ProcessWitness, pid: number, start?: string): boolean {
   let changed = addUnique(witness, witness.groups, pid);
   changed = addUnique(witness, witness.sessions, pid) || changed;
@@ -110,11 +79,6 @@ export function recordCommand(witness: ProcessWitness, pid: number, start?: stri
   witness.processes.push({ pid, start });
   return true;
 }
-/**
- * Adds to the witness the session and group ids of every process it already accounts for (a recorded process, or a
- * member of a recorded session or group) and of every descendant of those in the table.
- * Returns true when the witness changed. A table from another boot changes nothing. Pure.
- */
 export function extendWitness(witness: ProcessWitness, table: ProcessTable): boolean {
   if (table.boot !== witness.boot) return false;
   const children = new Map<number, ProcessRow[]>();
@@ -131,10 +95,6 @@ export function extendWitness(witness: ProcessWitness, table: ProcessTable): boo
   }
   return changed;
 }
-/**
- * The live processes the witness accounts for: a recorded process (same pid and start token), or any process in a
- * recorded session or group. Empty when the table is from another boot. Pure.
- */
 export function witnessFindings(witness: ProcessWitness, table: ProcessTable): CensusFinding[] {
   if (table.boot !== witness.boot) return [];
   const findings: CensusFinding[] = [];
@@ -150,15 +110,6 @@ function accountedFor(witness: ProcessWitness, row: ProcessRow): CensusReason | 
     : row.sid !== undefined && witness.sessions.includes(row.sid) ? "recorded-session"
       : witness.groups.includes(row.pgid) ? "recorded-group" : undefined;
 }
-/**
- * The processes of the calling user that use `directory`: it or something under it is their working directory, an open
- * file, or part of a command-line argument. A process of the calling user that cannot be inspected is a finding
- * ("unreadable"). Processes of other users are not inspected; that is the caller's limit to state.
- * A process belongs to the user it runs as. One that the calling user started and that runs as another user, such as
- * the sudo process of a command, is that other user's process.
- * On Linux a process that has exited and waits for its parent is not a finding, and a process that could not be
- * inspected is looked at once more, `LOOK_AGAIN_MS` later, before it is reported.
- */
 export async function directoryCensus(directory: string): Promise<CensusResult> {
   if (process.platform !== "linux" && process.platform !== "darwin") return { ok: false, problem: "unsupported platform" };
   let target: string;
@@ -171,13 +122,6 @@ export async function directoryCensus(directory: string): Promise<CensusResult> 
     return { ok: false, problem: problemText(error) };
   }
 }
-/**
- * Looks for what is left of an operation: `witnessFindings` over a fresh table, plus `directoryCensus` of the run
- * directory, in this process and, with a sudo prefix, also under the account that ran the operation's commands. That
- * part is the wrapper `CENSUS_WRAPPER` beside the prefix's executable, run with the prefix's sudo options; the
- * directory goes on its standard input. A missing wrapper, a refused sudo, any other prefix, or a failed read gives
- * `ok: false`. It reports no process only after two passes found none and when the witness did not overflow.
- */
 export async function operationCensus(witness: ProcessWitness, directory: string, prefix?: TeamCommand): Promise<CensusResult> {
   const first = await censusPass(witness, directory, prefix);
   if (!first.ok || first.findings.some(finding => finding.reason !== "unreadable")) return first;
@@ -202,7 +146,6 @@ async function censusPass(witness: ProcessWitness, directory: string, prefix?: T
   }
   return { ok: true, findings: [...byPid].map(([pid, reason]) => ({ pid, reason })) };
 }
-/** The census as the team service uses it; tests replace it. */
 export interface HostProcesses {
   table(): Promise<ProcessTable>;
   start(pid: number): Promise<string | undefined>;
@@ -223,11 +166,9 @@ function markOverflow(witness: ProcessWitness): boolean {
 }
 
 function parseLinuxStat(text: string): { ppid: number; pgid: number; sid: number; start: string } {
-  // The command name may contain spaces and parentheses, so the fields start after the last ")". Field 3 is the first here.
   const fields = text.slice(text.lastIndexOf(")") + 2).split(" ");
   const ppid = Number(fields[1]), pgid = Number(fields[2]), sid = Number(fields[3]);
   if (!Number.isInteger(ppid) || !Number.isInteger(pgid) || !Number.isInteger(sid) || !fields[19]) throw new Error("unreadable process stat");
-  // Field 22 is the start time.
   return { ppid, pgid, sid, start: fields[19] };
 }
 
@@ -238,7 +179,6 @@ async function linuxRows(): Promise<ProcessRow[]> {
     const row = await linuxRow(Number(entry));
     if (row) rows.push(row);
   }
-  // Where /proc hides other accounts, their processes are missing here without an error. The first process always exists.
   if (!rows.some(row => row.pid === 1)) throw new Error("the process table does not show other accounts");
   return rows;
 }
@@ -290,10 +230,6 @@ async function linuxCensus(directory: string): Promise<CensusFinding[]> {
     if (reason) findings.push({ pid: Number(entry), reason });
   }
   if (!findings.some(finding => finding.reason === "unreadable")) return findings;
-  // /proc refuses a process's descriptors to its own account from the instant an exiting process has released its
-  // memory. For a few milliseconds more the process still holds its files and working directory; after that its
-  // working directory link is gone, and `linuxLinks` reads that as exited. So each process that could not be inspected
-  // is looked at once more, and that look decides: one that still cannot be inspected is reported.
   await new Promise(resolvePromise => setTimeout(resolvePromise, LOOK_AGAIN_MS));
   const decided: CensusFinding[] = [];
   for (const finding of findings) {
@@ -306,17 +242,12 @@ async function linuxCensus(directory: string): Promise<CensusFinding[]> {
 async function linuxReason(pid: number, uid: number, directory: string): Promise<CensusReason | undefined> {
   const base = `/proc/${pid}`;
   try {
-    // /proc shows a process as owned by the user it runs as (its effective user id), also when the process hides its
-    // memory. One that runs as another user is not inspected. It is skipped when this user only started it, and
-    // reported as one that cannot be inspected when this user is still its saved or filesystem user id.
     if ((await stat(base)).uid !== uid) return await linuxRunsAs(base, uid) ? "unreadable" : undefined;
   } catch (error) {
     return isGone(error) ? undefined : "unreadable";
   }
   const view = await linuxLinks(base);
   if (view.missing) {
-    // An exited leader has no links of its own while its other threads run on with the directory and files they share.
-    // A process that has exited altogether has no thread left to list.
     try {
       for (const thread of await readdir(`${base}/task`)) {
         if (Number(thread) === pid) continue;
@@ -336,19 +267,12 @@ async function linuxReason(pid: number, uid: number, directory: string): Promise
   return view.unreadable ? "unreadable" : undefined;
 }
 
-/**
- * The working directory and open files under one /proc directory of a process or thread. `missing` marks a link that
- * was not there. A task that has exited holds nothing, and until its parent collects it /proc refuses the listing of
- * its descriptors to its own account. So the working directory link is read last: when it is gone the task has exited,
- * and what /proc refused before that is not `unreadable`.
- */
 async function linuxLinks(base: string): Promise<{ paths: { reason: "working-directory" | "open-file"; path: string }[]; missing: boolean; unreadable: boolean }> {
   const paths: { reason: "working-directory" | "open-file"; path: string }[] = [];
   let missing = false;
   let refused = false;
   try {
     for (const fd of await readdir(`${base}/fd`)) {
-      // A descriptor closed between the listing and the read is gone, not hidden.
       try { paths.push({ reason: "open-file", path: withoutDeleted(await readlink(`${base}/fd/${fd}`)) }); } catch (error) { if (!isGone(error)) refused = true; }
     }
   } catch (error) {
@@ -362,7 +286,6 @@ async function linuxLinks(base: string): Promise<{ paths: { reason: "working-dir
   return { paths, missing, unreadable: refused };
 }
 
-/** `statusRunsAs` for a live process. True also when its status cannot be read while the process exists. */
 async function linuxRunsAs(base: string, uid: number): Promise<boolean> {
   try {
     return statusRunsAs(await readFile(`${base}/status`, "utf8"), uid);
@@ -371,26 +294,15 @@ async function linuxRunsAs(base: string, uid: number): Promise<boolean> {
   }
 }
 
-/**
- * True when a Linux process status names `uid` as one of the ids the process runs with: the effective and filesystem
- * user ids, and the saved one to be safe. The real user id alone names who started the process, and it does not count:
- * a set-uid program such as sudo keeps it while it runs as another user, and a host that starts its commands through
- * sudo always has such processes. The rule is what the process runs as now, not what it could become: a process can
- * take its real user id back, so a set-uid program that the user started is not reported, also when it uses the
- * directory the census asks about.
- * True also when the text has no Uid line of four numbers, so a process that cannot be classified is reported. Pure.
- */
 export function statusRunsAs(status: string, uid: number): boolean {
   const ids = status.split("\n").find(line => line.startsWith("Uid:"))?.trim().split(/\s+/).slice(1).map(Number) ?? [];
   if (ids.length !== 4 || ids.some(id => !Number.isInteger(id))) return true;
-  // The four ids are real, effective, saved and filesystem.
   return ids.slice(1).includes(uid);
 }
 
 async function darwinCensus(directory: string): Promise<CensusFinding[]> {
   const uid = process.getuid?.();
   if (uid === undefined) throw new Error("the user id cannot be read");
-  // Zombies have no working directory or files to read, and lsof does not list them; they are not unreadable.
   const rows = (await readProcessTable()).rows.filter(row => row.uid === uid && row.pid !== process.pid && !isCensusHelper(row) && !row.command.endsWith("<defunct>"));
   const records = await lsofRecords(uid);
   const findings: CensusFinding[] = [];
@@ -406,19 +318,16 @@ async function darwinCensus(directory: string): Promise<CensusFinding[]> {
   return findings;
 }
 
-/** The census's own ps and lsof calls, when they are still children of this process. */
 function isCensusHelper(row: ProcessRow): boolean {
   return row.ppid === process.pid && /^(\/bin\/ps|\/usr\/sbin\/lsof)( |$)/.test(row.command);
 }
 
-/** A failed look is not an exit: only a start token that is gone or different shows the listed process ended. */
 async function stillSameProcess(row: ProcessRow): Promise<boolean> {
   try { return (await processStart(row.pid)) === row.start; } catch { return true; }
 }
 
 async function lsofRecords(uid: number): Promise<Map<number, { cwd?: string; files: string[] }>> {
   const { stdout, error } = await exec(LSOF, ["-a", "-u", String(uid), "-Fpfn"]);
-  // lsof exits non-zero for some unreadable processes and still prints valid records; only a failure to run or no output is a failure.
   if (error && (typeof error.code !== "number" || !stdout.trim())) throw new Error(`lsof: ${error.message.slice(0, 120)}`);
   if (!stdout.trim()) throw new Error("lsof printed nothing");
   const records = new Map<number, { cwd?: string; files: string[] }>();
@@ -449,7 +358,6 @@ function underDirectory(path: string, directory: string): boolean {
   return path === directory || path.startsWith(directory.endsWith("/") ? directory : `${directory}/`);
 }
 
-/** True when the text contains the directory followed by the end of the text or one of the terminator characters. */
 function mentionsDirectory(text: string, directory: string, terminators: string): boolean {
   for (let at = text.indexOf(directory); at >= 0; at = text.indexOf(directory, at + 1)) {
     const next = text.charAt(at + directory.length);
@@ -468,7 +376,6 @@ async function prefixCensus(directory: string, prefix: TeamCommand): Promise<Cen
   } catch {
     return { ok: false, problem: "census wrapper missing" };
   }
-  // -n keeps sudo from waiting for a password; the policy then refuses the census at once if it is not allowed.
   const options = ["-n", ...shape.options.filter(arg => arg !== "-n")];
   return runWrapper(prefix.command, [...options, "--", wrapper], directory);
 }
@@ -491,18 +398,17 @@ function runWrapper(command: string, args: string[], directory: string): Promise
       finish({ ok: false, problem: "census wrapper could not start" });
       return;
     }
-    // The helper child is this census's own sudo process, never the census target.
     timer = setTimeout(() => {
-      try { child.kill("SIGKILL"); } catch { /* Already exited. */ }
+      try { child.kill("SIGKILL"); } catch {}
       finish({ ok: false, problem: "census wrapper timed out" });
     }, WRAPPER_LIMIT_MS);
-    child.stdin?.on("error", () => { /* The wrapper may exit before reading; its exit status decides. */ });
+    child.stdin?.on("error", () => {});
     child.stdin?.end(`${directory}\n`);
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
       output += chunk;
       if (output.length > WRAPPER_OUTPUT_BYTES) {
-        try { child.kill("SIGKILL"); } catch { /* Already exited. */ }
+        try { child.kill("SIGKILL"); } catch {}
         finish({ ok: false, problem: "census wrapper output too large" });
       }
     });
@@ -514,7 +420,6 @@ function runWrapper(command: string, args: string[], directory: string): Promise
   });
 }
 
-/** A pseudo-terminal echoes the directory it was sent before the result, so the result is the last line. */
 function parseWrapperOutput(text: string): CensusResult {
   const lines = text.split(/\r?\n/).filter(line => line.trim() !== "");
   const last = lines[lines.length - 1];
@@ -524,7 +429,6 @@ function parseWrapperOutput(text: string): CensusResult {
   return validateWrapperResult(value) ?? { ok: false, problem: "census wrapper printed an invalid result" };
 }
 
-/** Strict: the wrapper runs under another account, so its output is checked before it is trusted. */
 function validateWrapperResult(value: unknown): CensusResult | undefined {
   if (!isRecord(value)) return undefined;
   if (value.ok === false) {
@@ -561,7 +465,6 @@ function problemText(error: unknown): string {
   return error instanceof Error ? error.message.slice(0, 200) : "unknown error";
 }
 
-// Command-line entry: the wrapper runs this file with no arguments and the directory on standard input.
 const entry = process.argv[1] ? resolve(process.argv[1]) : undefined;
 if (entry && existsSync(entry) && realpathSync(entry) === fileURLToPath(import.meta.url)) void runCommandLine();
 
@@ -582,7 +485,6 @@ async function runCommandLine(): Promise<void> {
   process.exitCode = result.ok ? 0 : 1;
 }
 
-/** The first line of standard input, at most MAX_INPUT_BYTES. Undefined when the line is longer or the input is empty. */
 function readInputLine(): Promise<string | undefined> {
   return new Promise(resolvePromise => {
     const chunks: Buffer[] = [];

@@ -2,26 +2,16 @@ import { execFileSync } from "node:child_process";
 import { basename, dirname } from "node:path";
 import type { ProjectSource } from "./team-types.js";
 
-/** Which repository a checkout is a copy of, captured once from the checkout's own Git metadata. */
 export type CheckoutIdentity = {
   projectId: string;
-  /** `remote:HOST/PATH` (lowercase) or `root:HASH`. Checkouts with equal keys are the same repository. */
   key: string;
-  /** The repository's display name: the remote's last path segment, or the folder name when only a root commit is known. */
   repoName: string;
   capturedAt: string;
   from: "source" | "host-scan";
 };
 
-/** Trimmed stdout of `git -C cwd ...args`, or undefined when Git fails, is missing, or exceeds five seconds. */
 export type GitReader = (cwd: string, args: string[]) => string | undefined;
 
-/**
- * Enrolled checkouts are often owned by the agent user, not the host's service user, and Git refuses to read a
- * repository another user owns ("dubious ownership"). The reads here are metadata lookups that run no hooks, so
- * the ownership check is waived per invocation; the file-system monitor is forced off because it is the one
- * repository-configured command those lookups could otherwise start.
- */
 const READ_ONLY_GIT = ["-c", "safe.directory=*", "-c", "core.fsmonitor=false"];
 
 export const readGit: GitReader = (cwd, args) => {
@@ -34,14 +24,8 @@ export const readGit: GitReader = (cwd, args) => {
   }
 };
 
-/** Folder names that say nothing about which repository lives there. */
 const GENERIC_FOLDERS = new Set(["codebase", "code", "src", "repo", "app", "main", "worktree"]);
 
-/**
- * One key for every spelling of a remote: scheme, user info, and a trailing `.git` are dropped and the
- * host is lowercased. A port stays, since it names a different server, and the path keeps its case except
- * on github.com. `repoName` keeps the last path segment's spelling.
- */
 export function normalizeRemote(url: string): { key: string; repoName: string } | undefined {
   const raw = url.trim();
   if (!raw || /\s/.test(raw)) return undefined;
@@ -64,13 +48,11 @@ export function normalizeRemote(url: string): { key: string; repoName: string } 
   const segments = path.split("/").filter(Boolean);
   const repoName = segments.at(-1);
   if (!repoName) return undefined;
-  // GitHub names are case-insensitive; other hosts may distinguish case, and a port names a different server.
   const joined = segments.join("/");
   const hostName = host.replace(/:\d+$/, "");
   return { key: `remote:${host}/${hostName === "github.com" ? joined.toLowerCase() : joined}`, repoName };
 }
 
-/** The checkout folder's name, or its parent's when the folder name is generic (`codebase`, `src`, ...). */
 export function repoNameFromPath(path: string): string {
   const name = basename(path);
   if (!GENERIC_FOLDERS.has(name.toLowerCase())) return name;
@@ -78,22 +60,16 @@ export function repoNameFromPath(path: string): string {
   return parent || name;
 }
 
-/** A GitHub-tracked project names its repository in its source record; the checkout needs no remote and no scan. */
 export function sourceIdentity(project: { id: string; source?: ProjectSource }, at = new Date().toISOString()): CheckoutIdentity | undefined {
   if (project.source?.mode !== "github") return undefined;
   const normalized = normalizeRemote(`https://github.com/${project.source.repository}.git`);
   return normalized ? { projectId: project.id, key: normalized.key, repoName: normalized.repoName, capturedAt: at, from: "source" } : undefined;
 }
 
-/**
- * The identity every host component compares: the source record when the project follows GitHub, otherwise a
- * scan of the checkout. Enrolled GitHub checkouts carry no remote, so a scan alone would name a different key.
- */
 export function expectedIdentity(project: { id: string; path: string; source?: ProjectSource }, git: GitReader, at = new Date().toISOString()): CheckoutIdentity | undefined {
   return sourceIdentity(project, at) ?? captureIdentity(project, git, at);
 }
 
-/** Prefer the origin remote, then the repository's lowest root commit; nothing when Git cannot answer. */
 export function captureIdentity(project: { id: string; path: string }, git: GitReader, at = new Date().toISOString()): CheckoutIdentity | undefined {
   const remote = git(project.path, ["config", "--get", "remote.origin.url"]);
   const normalized = remote ? normalizeRemote(remote) : undefined;

@@ -75,7 +75,6 @@ export async function startNativeOpenCode(options: {
       const usage = usageFromStepFinish(p.part, { completedAt: new Date().toISOString(),
         ...(reported ? { ...reported, modelSource: "reported" as const }
           : requested ? { providerId: slash < 0 ? requested : requested.slice(0, slash), modelId: slash < 0 ? requested : requested.slice(slash + 1), modelSource: "requested" as const }
-            // Neither OpenCode nor the launch named a model: keep the tokens, never attribute or price them.
             : { providerId: "unknown", modelId: "unknown", modelSource: "unknown" as const }) });
       if (usage) options.onUsage?.(usage);
     }
@@ -86,8 +85,6 @@ export async function startNativeOpenCode(options: {
         id: 0, kind: permission ? "permission" : "question", source: "protocol",
         title: permission ? "OpenCode permission required" : "OpenCode has a question",
         detail: `${String(permission ? p.permission ?? "" : p.questions?.[0]?.question ?? "").slice(0, 1600)}\nUse the native terminal controls to answer the current dialog.`,
-        // The provider's actual dialog owns the choices. Do not manufacture
-        // compact approval buttons from an unverified screen mapping.
         options: [], acceptsText: false, multiSelect: false,
       } });
       if (id !== undefined) { prompts.set(p.id, id); if (prompts.size > 256) prompts.delete(prompts.keys().next().value!); }

@@ -10,10 +10,8 @@ import { unseal, writeSealed } from "./vault.js";
 
 type Stored = HandoffView & { sessionId: string; projectId: string; teamId: string; stopId: string; acceptedAt: string; deadlineAt: string; request: HandoffRequest; policy: HandoffPolicy };
 type StartInProject = <T>(projectId: string, action: () => Promise<T>) => Promise<T>;
-/** One durable transfer per source. Creation retries reuse the persisted team identity. */
 export class HandoffService {
   private readonly records = new Map<string, Stored>();
-  /** Sources that will never request a handoff, with the view they keep: no policy (fixed at creation), or exited with no request in the journal. Valid only while the session's meta file has the same revision. */
   private readonly settled = new Map<string, { view: HandoffView; revision: string }>();
   private readonly directory: string;
   private timer?: NodeJS.Timeout;
@@ -39,11 +37,9 @@ export class HandoffService {
     const kept = this.settled.get(sessionId);
     if (kept) { if (kept.revision === this.manager.metaRevision(sessionId)) return; this.settled.delete(sessionId); }
     const source = this.manager.meta(sessionId).session;
-    // The revision is the one the last listing saw. If the file changed since, the next listing sees another one and this answer is dropped.
     const revision = this.manager.metaRevision(sessionId);
     if (!source.handoff?.policy) { if (revision) this.settled.set(sessionId, { view: { status: "unavailable", reason: source.handoff?.reason ?? "This session was created without a handoff capability." }, revision }); return; }
     const event = this.manager.handoffRequest(sessionId);
-    // A worker appends a request only while running, and an exited session gets no new events.
     if (!event) { if (exited && revision) this.settled.set(sessionId, { view: { status: "available" }, revision }); return; }
     const envelope = handoffEnvelopeSchema.parse(event.data);
     if (envelope.sessionId !== sessionId) throw new Error("Invalid handoff source");
@@ -63,7 +59,6 @@ export class HandoffService {
     const source = this.manager.meta(sessionId).session;
     return source.handoff?.policy ? { status: "available" } : { status: "unavailable", reason: source.handoff?.reason ?? "This session was created without a handoff capability." };
   }
-  /** A listing row's view: from the handoff record, else from the remembered answer, else as `view`. A new object on every call. */
   listedView(sessionId: string): HandoffView {
     if (this.records.has(sessionId)) return this.view(sessionId);
     const kept = this.settled.get(sessionId);
@@ -103,7 +98,6 @@ export class HandoffService {
     } finally { this.busy = false; }
   }
   private async step(record: Stored) {
-    // A crash after creation must find the same team before inspecting a changed source.
     try {
       const team = this.teams.get(record.teamId);
       if (team.handoff?.sourceSessionId !== record.sessionId || team.projectId !== record.projectId) throw new Error("Conflicting handoff team identity");
@@ -138,7 +132,6 @@ export class HandoffService {
         title: this.manager.meta(record.sessionId).session.title.slice(0, 100), objective, parallelism: record.request.parallelism },
         { sourceSessionId: record.sessionId, checkpointHead: record.request.checkpointHead, deadlineAt: record.deadlineAt, maxMembers: record.policy.maxMembers, project: record.policy.project,
           extendMinutes: record.policy.extendMinutes ?? 0, ceilingAt: new Date(Date.parse(record.acceptedAt) + (record.policy.maxTotalMinutes ?? record.policy.maxMinutes) * 60000).toISOString() }, record.policy);
-      // Keep admission fenced until the pinned copy is fully prepared.
       this.save(record);
     });
   }

@@ -1,11 +1,5 @@
-// Reads `infinite-metric NAME NUMBER` lines from a check's stdout.
-// It works on raw bytes, so a chunk may end anywhere, even inside a CRLF or the marker.
-// It is strict: it does not strip terminal escapes. It is separate from the failure scanner.
-// Rule 12 is the caller's job: the caller keeps the values only when the check passed.
-
 export type CheckMetricState = "value" | "ambiguous" | "invalid";
 export interface CheckMetric { name: string; state: CheckMetricState; value?: number }
-/** `more` counts the marker lines that named a name without a slot (rule 10). */
 export interface CheckMetricScan { metrics: CheckMetric[]; more: number }
 
 export const METRIC_MARKER = "infinite-metric ";
@@ -14,25 +8,18 @@ export const METRIC_NAMES_MAX = 8;
 
 const LF = 0x0a;
 const CR = 0x0d;
-// Magnitude limit for a value. Infinity fails it too.
 const VALUE_LIMIT = 1e15;
 const NAME_PATTERN = "[a-z][a-z0-9_.-]{0,39}";
 const NUMBER_PATTERN = "-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?";
 const NAME = new RegExp(`^${NAME_PATTERN}$`);
-// The regex only admits printable ASCII, so a valid line needs no separate byte check.
 const LINE = new RegExp(`^infinite-metric (${NAME_PATTERN}) (${NUMBER_PATTERN})$`);
 
 export class CheckMetricScanner {
-  // The first 200 bytes of the current line. Bytes past that are counted, not kept.
   private readonly head = Buffer.alloc(METRIC_LINE_MAX_BYTES);
-  // Content bytes of the current line. It stops at 201, which is enough to know the line is too long.
   private lineBytes = 0;
-  // A CR was just read. It is dropped only if an LF follows it.
   private carriageReturn = false;
   private readonly slots = new Map<string, CheckMetric>();
-  // Marker lines whose name has no slot. Counted per line: keeping the names would break the memory bound (rule 11).
   private unslotted = 0;
-  // Set by a bad marker line whose name token is not a valid name. It makes every name invalid.
   private wholeInvalid = false;
   private result?: CheckMetricScan;
 
@@ -81,8 +68,6 @@ export class CheckMetricScanner {
     const text = this.head.toString("latin1", 0, Math.min(this.lineBytes, METRIC_LINE_MAX_BYTES));
     this.lineBytes = 0;
     if (!text.startsWith(METRIC_MARKER)) return;
-    // The name token is the bytes after the marker up to the next space. A token cut by the 200-byte
-    // limit is longer than any valid name, so it never matches.
     const token = text.slice(METRIC_MARKER.length).split(" ", 1)[0];
     const match = long ? null : LINE.exec(text);
     if (match) {
@@ -113,7 +98,6 @@ export class CheckMetricScanner {
     slot.value = undefined;
   }
 
-  // The first 8 distinct names take a slot, whether their line was valid or not.
   private slotFor(name: string): CheckMetric | undefined {
     const found = this.slots.get(name);
     if (found) return found;

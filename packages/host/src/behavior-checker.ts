@@ -95,7 +95,6 @@ function safeIntegerAt(value: unknown, path: string, min: number, max = Number.M
 function behaviorValueAt(value: unknown, path: string): BehaviorValue {
   if (typeof value === "boolean") return value;
   if (typeof value === "string") return stringAt(value, path, 256, 0);
-  // JSON, state keys, and the TLA integer encoding identify -0 with 0.
   if (typeof value === "number" && Number.isSafeInteger(value)) return value === 0 ? 0 : value;
   fail(path, "expected a string, boolean, or finite safe integer");
 }

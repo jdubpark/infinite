@@ -7,10 +7,6 @@ import { teamGitArgs, teamGitEnvironment } from "./team-workspace.js";
 export type StreamRead = { state: "read"; bytes: Buffer } | { state: "too-large" } | { state: "failed" };
 export const BLOB_MAX_BYTES = 1_048_576, BLOB_READ_MS = 30_000, BLOB_RELEASE_MS = 1_000, BLOB_PATH_CHARS = 300;
 
-/**
- * Stops the child's process group. False when the signal was refused (EPERM): a launcher that runs the command as
- * another account, or, on macOS, a child that has already ended. The caller cannot tell the two apart at that moment.
- */
 export function stopGroup(child: ChildProcess): boolean {
   try {
     if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
@@ -24,17 +20,9 @@ export function stopGroup(child: ChildProcess): boolean {
 export type GitStreamInput = {
   cwd: string; args: readonly string[]; prefix: TeamCommand | undefined; maxBytes: number; timeoutMs: number; signal: AbortSignal;
   stop: (child: ChildProcess) => boolean; releaseMs: number; env?: Record<string, string>;
-  /** Called once, when the answer is decided, before the child closes. */
   decided?: (read: StreamRead) => void;
 };
 
-/**
- * Streams a Git read on stdout. Keeps the output only while it fits in `maxBytes`; output is never cut or partly returned.
- * The answer is decided at the first of: the byte limit, the time limit, an abort, a stream error. The promise settles
- * only when the child closes, so a child that cannot be signalled still counts until it ends. After a refused stop the
- * child stops holding the process open `releaseMs` later; it is not released at once, because a child that has already
- * ended also refuses the signal and closes a moment later.
- */
 export function readGitStream(input: GitStreamInput): Promise<StreamRead> {
   const { cwd, args, prefix, maxBytes, timeoutMs, signal, stop, releaseMs, env, decided: report } = input;
   if (signal.aborted) return Promise.resolve({ state: "failed" });
@@ -82,7 +70,6 @@ export function readGitStream(input: GitStreamInput): Promise<StreamRead> {
     child.stdout!.on("error", () => decide({ state: "failed" }));
     child.stderr!.on("data", () => {});
     child.once("error", () => {
-      // The child could not start: the answer is known now.
       decide({ state: "failed" });
       clear();
       if (release) clearTimeout(release);
@@ -96,14 +83,8 @@ export function readGitStream(input: GitStreamInput): Promise<StreamRead> {
   });
 }
 
-/**
- * Git reads the whole `COMMIT:PATH` word as a revision before it splits it at the colon. A path that ends in its
- * describe form (`-g` and hex digits) would select another object, and `^`, `~`, `{`, `}` or `@` can start a suffix
- * that walks history or runs a commit-message search. A file with such a name cannot be read.
- */
 const REVISION_SYNTAX = /[\^~{}@]|-g[0-9A-Fa-f]+$/;
 
-/** Form B1 after the six settings: `cat-file blob COMMIT:PATH`. Throws TypeError for a refused id or path; no child starts. */
 export function blobArgs(commit: string, path: string): string[] {
   if (!COMMIT_ID.test(commit)) throw new TypeError("A blob read needs a full commit id.");
   if (!isScopedPath(path) || path === "." || path.length > BLOB_PATH_CHARS || /[\u0000-\u001f\u007f]/.test(path) || REVISION_SYNTAX.test(path)) throw new TypeError("A blob read needs one repository path.");
@@ -111,12 +92,10 @@ export function blobArgs(commit: string, path: string): string[] {
 }
 
 export type BlobReader = {
-  /** Resolves when the answer is decided. A child that the stop could not end counts as stalled until it closes. Never throws. */
   read(cwd: string, commit: string, path: string, signal: AbortSignal): Promise<StreamRead>;
   stalled(): number;
 };
 
-/** Reads through `prefix()` with teamGitArgs(cwd, blobArgs(…)) and env { GIT_NO_LAZY_FETCH: "1" }. */
 export function blobReader(
   prefix: () => TeamCommand | undefined,
   options: { timeoutMs?: number; stop?: (child: ChildProcess) => boolean; releaseMs?: number } = {},
@@ -138,7 +117,6 @@ export function blobReader(
           answered = true;
           resolveRead(read);
         };
-        // A child the stop refuses is counted until it closes; `decide` calls the stop before any close.
         const countedStop = (child: ChildProcess) => {
           const ended = stop(child);
           if (!ended) {

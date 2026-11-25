@@ -27,7 +27,6 @@ const fleetSchema = z
   })
   .strict();
 
-/** Secret-free capacity plan. This does not provision VMs or establish isolation. */
 export function planFleet(input: unknown) {
   const fleet = fleetSchema.parse(input);
   for (const field of ["tenantId", "vmId", "ipv4"] as const) {

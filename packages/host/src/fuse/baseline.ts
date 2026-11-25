@@ -9,13 +9,11 @@ export const BASELINE_SCOPE = "fuse-baseline";
 
 export type FuseBaseline = { version: 1; seq: number; launches: FuseLaunchRecord[]; trips: FuseTripRecord[] };
 
-/** Every launch role. The check below fails the build when `LaunchRole` gains a role this list lacks. */
 const LAUNCH_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker", "evaluator", "judge", "mission-coordinator"] as const satisfies readonly LaunchRole[];
 const everyRoleListed: Exclude<LaunchRole, typeof LAUNCH_ROLES[number]> extends never ? true : never = true;
 void everyRoleListed;
 
 const id = z.string().min(1).max(128);
-/** The host configuration sets no length limit on a project id, so the baseline sets none either. */
 const projectId = z.string().min(1);
 const seq = z.number().int().min(0);
 const time = z.number().int();
@@ -59,7 +57,6 @@ const baselineSchema: z.ZodType<FuseBaseline> = z.object({
   trips: z.array(tripSchema).max(1000),
 }).strict();
 
-/** Undefined when the file is missing, fails authentication, or fails the schema. Never throws. */
 export function readBaseline(file: string, key: Buffer): FuseBaseline | undefined {
   try {
     const parsed = baselineSchema.safeParse(unseal<unknown>(key, BASELINE_SCOPE, readFileSync(file, "utf8")));
@@ -69,7 +66,6 @@ export function readBaseline(file: string, key: Buffer): FuseBaseline | undefine
   }
 }
 
-/** `writeSealed` under BASELINE_SCOPE. False on any failure, including a baseline outside the schema. Never throws. */
 export function writeBaseline(file: string, key: Buffer, baseline: FuseBaseline): boolean {
   try {
     if (!baselineSchema.safeParse(baseline).success) return false;
@@ -80,12 +76,6 @@ export function writeBaseline(file: string, key: Buffer, baseline: FuseBaseline)
   }
 }
 
-/**
- * The baseline a cold start works from. The file is written before the store, so it has seen every item up to its
- * own `seq`: an item that only the store holds, from at or before that `seq`, is one the file dropped, and it stays
- * dropped. For an item in both copies the higher `seq` wins, and the file wins a tie. A trip never reopens, so the
- * later copy of a trip is the closed one, and no closed trip comes back.
- */
 export function mergeBaselines(file: FuseBaseline | undefined, store: FuseBaseline | undefined, now: number): FuseBaseline | undefined {
   if (!file) return store && pruneBaseline(store, now);
   if (!store) return pruneBaseline(file, now);
@@ -111,7 +101,6 @@ export function pruneBaseline(baseline: FuseBaseline, now: number): FuseBaseline
   };
 }
 
-/** The union by id. The higher seq wins, the file on a tie. A store-only item the file has already seen is left out. */
 function mergeById<T extends { seq: number }>(file: T[], store: T[], idOf: (item: T) => string, fileSeq: number): T[] {
   const merged = new Map<string, T>();
   for (const item of file) merged.set(idOf(item), item);

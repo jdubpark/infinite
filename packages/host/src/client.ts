@@ -43,7 +43,6 @@ type ClientConfig = { origin: string; token: string; projectId?: string };
 type Me = { role: string; capabilities?: { workspaceMirror?: number; mirrorForget?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
 const providers = new Set(["claude", "codex", "grok", "opencode"]);
 const providerNames: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok", opencode: "OpenCode" };
-/** Project IDs name local sync files, so an ID from the host or the command line is checked before it becomes a path. */
 const PROJECT_ID = /^[a-z0-9-]{1,80}$/;
 const clean = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 function startupProgress() {
@@ -88,7 +87,6 @@ function connection(config: ClientConfig, clientId = randomUUID()) {
       signal: signal ?? AbortSignal.timeout(15000),
     });
     if (!response.ok) {
-      // Server errors may contain request details; report only a bounded category.
       const detail = await response.json().catch(() => ({})) as { code?: unknown };
       const code = typeof detail.code === "string" && /^[a-z0-9-]{1,80}$/.test(detail.code) ? detail.code : undefined;
       const guidance = code === "stale-enrollment-revision" ? "The repository enrollment changed; refresh its status and submit a new request ID." :
@@ -102,7 +100,6 @@ function connection(config: ClientConfig, clientId = randomUUID()) {
 function sessionCwd(session: Session & Partial<WorkerState>) {
   return (session.execution?.location ?? session.executionLocation) === "laptop" ? session.workspace?.cwd : session.cwd;
 }
-/** One line per session, with where its tools run: the live executor when the session reports one, else its recorded location. */
 function printSessions(sessions: (Session & Partial<WorkerState>)[], machine: string) {
   for (const s of sessions) {
     const execution = s.execution;
@@ -217,9 +214,6 @@ async function selectSession(sessions: Session[], requested: string | undefined,
     return candidates[Number(answer) - 1];
   } finally { input.close(); }
 }
-// The server's headless terminal already answers device queries. Replaying them
-// on a second terminal would inject duplicate answers as if they were user input.
-// Clipboard OSC sequences are also excluded from recording replay.
 function terminalRenderer() {
   let pending = "";
   return (text: string) => {
@@ -262,8 +256,6 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   let handoffTimer: ReturnType<typeof setTimeout> | undefined, handoffBusy = false, handoffNotice = "";
   let renewal: ReturnType<typeof setInterval> | undefined;
   let lastStatus: Status = session.status;
-  // A detached CLI has no background job to keep alive. Terminate this client
-  // after restoring the TTY; an open proxy stream must not prevent detachment.
   const stop = () => { restoreTerminal(); process.exit(0); };
   const owner = me.role === "owner" && me.terminal.raw;
   const resize = () => {
@@ -353,7 +345,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
         notice(message);
         stop();
       }
-    } catch { /* Older hosts return no handoff route; normal attachment continues. */ }
+    } catch {}
     finally { handoffBusy = false; scheduleHandoff(nextPollMs); }
   };
   const send = async () => {
@@ -426,7 +418,6 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
       const signal = AbortSignal.any([abort.signal, stalled.signal]);
       try {
         if (!warned) progress.start(`Connecting to ${providerNames[session.provider] ?? session.provider} terminal`);
-        // A fresh HTTP connection resumes only the recording cursor, never the provider.
         duplex = me.terminal.duplex ? terminalConnection(config.origin, config.token, session.id, cursor, signal, { clientId, snapshot: me.terminal.snapshot, control: me.terminal.control }) : undefined;
         async function* legacyPages(): AsyncGenerator<TerminalPage> {
           const response = await api.request(`/sessions/${session.id}/stream?after=${cursor}`, undefined, signal);
@@ -502,10 +493,6 @@ export interface ParsedClientArgs { command: string; args: string[]; options: Re
 const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--autonomy", "--profile", "--run", "--by", "--sources", "--days", "--judge", "--pairs", "--judge-minutes", "--member", "--issue", "--commit", "--at", "--reason", "--withdraw", "--goal", "--mission", "--kind", "--task", "--since", "--direction", "--note", "--set", "--limit", "--before", "--after", "--version", "--routing", "--routing-value", "--routing-contributor", "--routing-points"]);
 const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--host", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs", "--dry-run", "--all", "--clear-direction", "--wrong", "--rejected", "--raised", "--keep-paused"]);
 
-/**
- * The provider or client command that `handleClientCommand` dispatches on. A token that directly follows
- * a client string option, or an option the client parser does not know, is that option's value.
- */
 export function clientCommandCandidate(args: readonly string[]): string | undefined {
   for (let index = 0; index < args.length; index++) {
     const token = args[index];
@@ -515,7 +502,6 @@ export function clientCommandCandidate(args: readonly string[]): string | undefi
   return undefined;
 }
 
-/** Infinite options come before the provider; everything after a provider is passed through unchanged. */
 export function parseClientArgs(argv: string[]): ParsedClientArgs {
   const args = [...argv];
   const options: Record<string, string | boolean> = {};
@@ -530,9 +516,7 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   while (args[0]?.startsWith("--")) option();
   const command = args.shift() ?? "";
   const positional: string[] = [];
-  // Unknown commands belong to the server CLI, whose options this parser must not reject.
   if (CLIENT_COMMANDS.has(command)) while (args.length) { if (args[0].startsWith("--")) option(); else positional.push(args.shift()!); }
-  // Checked after trailing options, so `infinite sync --include DIR` is refused like the leading form.
   if (options["--cloud"] && options["--laptop"]) throw new Error("Choose either cloud execution or --laptop");
   if (options["--laptop"]) {
     if (command !== "codex") throw new Error("--laptop starts a Codex session in this directory. Resume existing sessions with infinite resume ID.");
@@ -552,7 +536,6 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   return { command, args: providers.has(command) ? args : positional, options, includes };
 }
 
-/** Real path of `path`, resolving the nearest existing ancestor when the path does not exist yet. */
 function realPath(path: string): string {
   const missing: string[] = [];
   for (let current = resolve(path); ; current = dirname(current)) {
@@ -562,7 +545,6 @@ function realPath(path: string): string {
     }
   }
 }
-/** Checkout roots recorded by sync services in `syncDir`, running or not. An unreadable record names no root. */
 function syncRoots(syncDir: string) {
   if (!existsSync(syncDir)) return [];
   return readdirSync(syncDir).flatMap(name => {
@@ -574,7 +556,6 @@ function gitRoot(cwd: string) {
   try { return realpathSync(execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim()); }
   catch { return cwd; }
 }
-/** A local sync record keeps offline stop and explicit apply/pull pointed at this checkout. */
 function localSyncProject(syncDir: string, origin: string): string | undefined {
   if (!existsSync(syncDir)) return undefined;
   const root = gitRoot(realpathSync(process.cwd()));
@@ -597,7 +578,6 @@ type ProjectDetail = { id: string; name: string; sync: { lastSyncedAt?: string; 
 const shortHead = (head?: string) => head ? clean(head.slice(0, 8)) : undefined;
 const sourceBranch = (source: ProjectSourceStatus) => clean(source.baseBranch ?? "unknown");
 const sourceOrigin = (source: ProjectSourceStatus) => `origin/${sourceBranch(source)}`;
-/** One-line source status for project listings and launch output. */
 export function describeSource(source: ProjectSourceStatus, now = Date.now()): string {
   if (source.mode !== "github") return "follows laptop";
 
@@ -628,14 +608,11 @@ export function describeSource(source: ProjectSourceStatus, now = Date.now()): s
   return `${prefix} · ${state}${savedBranch ? ` · saved local edits on ${clean(savedBranch)}` : ""}`;
 }
 
-/** Compare the enrolled checkout with the host's last fetched commit without fetching. */
 export function compareLaptop(root: string, source: ProjectSourceStatus, now = Date.now()): string {
   const branch = sourceOrigin(source);
   const mirrorHead = source.mirrorHead;
   if (!mirrorHead) return `host has not fetched ${branch} yet`;
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(mirrorHead)) return "host is ahead; fetch to compare";
-  // Comparison is strictly local, including for partial clones whose promisor remote
-  // could otherwise be contacted by Git when an object is missing.
   const localGit = { cwd: root, env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } };
 
   try {
@@ -699,7 +676,6 @@ async function showProjects(me: Me, api: { json<T>(path: string): Promise<T> }, 
   await listProjects(groups, api, json);
 }
 
-/** One line per provider. Period words come from each provider's own window, never a fixed "month". */
 export function usageLines(summary: import("./usage-service.js").UsageSummary): string[] {
   const width = Math.max(...Object.keys(summary.providers).map(name => name.length));
   return Object.entries(summary.providers).map(([name, entry]) => {
@@ -707,7 +683,6 @@ export function usageLines(summary: import("./usage-service.js").UsageSummary): 
     const days = Math.round((Date.parse(entry.period.end) - Date.parse(entry.period.start)) / 86_400_000);
     const word = entry.budget?.period ?? (days <= 1 ? "day" : days <= 7 ? "week" : "month");
     if (!entry.measured || !entry.spent) {
-      // A provider without Spent still shows the tokens its ledger recorded, with its gaps counted beside them.
       if (entry.recorded && entry.recorded.messages > 0) {
         const tokens = Object.values(entry.recorded.tokens).reduce((sum, value) => sum + value, 0);
         const partial = entry.partialSessions ? `, ${entry.partialSessions} partial` : "";
@@ -724,7 +699,6 @@ export function usageLines(summary: import("./usage-service.js").UsageSummary): 
   });
 }
 
-/** Lines for `infinite evidence status`. Host text is cleaned before it reaches the terminal. */
 export function evidenceStatusLines(status: import("./evidence/types.js").EvidenceDescription): string[] {
   return [
     `Evidence store: ${clean(String(status.state))}`,
@@ -735,7 +709,6 @@ export function evidenceStatusLines(status: import("./evidence/types.js").Eviden
   ];
 }
 
-/** Lines for `infinite fuse`, one per scope. Host text is cleaned before it reaches the terminal. */
 export function fuseLines(view: import("./fuse/service.js").FuseView): string[] {
   const line = (name: string, scope: import("./fuse/service.js").FuseScopeView) => {
     if (scope.state === "closed") return `${name}: closed, ${Number(scope.hour.launches)} of ${Number(scope.hour.limit)} launches in the last hour`;
@@ -752,7 +725,6 @@ export function fuseLines(view: import("./fuse/service.js").FuseView): string[] 
 
 export type FuseCommand = { action: "view" } | { action: "close"; scope: { scope: "host" } | { scope: "project"; projectId: string } };
 const FUSE_USAGE = "Usage: infinite fuse [--json] | infinite fuse close --project ID | --host";
-/** `infinite fuse` reads the state. `infinite fuse close` takes exactly one of --project ID or --host. */
 export function parseFuseCommand(positional: readonly string[], options: Record<string, string | boolean>): FuseCommand {
   const host = options["--host"] === true, project = options["--project"];
   if (positional.length === 0 && !host && project === undefined) return { action: "view" };
@@ -761,10 +733,6 @@ export function parseFuseCommand(positional: readonly string[], options: Record<
   return { action: "close", scope: { scope: "project", projectId: String(project) } };
 }
 
-/**
- * One line per display cell, then a line for unreadable rows. A rate prints as a percentage with its interval, or as
- * `rate unknown` when no attempt counts. A missing fact never prints as zero.
- */
 export function outcomeCellLines(result: CellsResult): string[] {
   const level = (count: LevelCount) => `${count.yes} yes, ${count.no} no, ${count.unknown} unknown, ${count.rate === null ? "rate unknown" : `${Math.round(count.rate * 100)}%${count.interval ? ` (${Math.round(count.interval[0] * 100)}–${Math.round(count.interval[1] * 100)}%)` : ""}`}`;
   const lines = result.cells.length === 0 ? ["No outcome rows match."] : result.cells.map(cell => {
@@ -779,10 +747,6 @@ export function outcomeCellLines(result: CellsResult): string[] {
   return lines;
 }
 
-/**
- * The roll-up as lines, in the order of the coordinator's ruling. A null count, rounds, or token sum prints as unknown,
- * never as zero, and every value from the host passes through `clean`.
- */
 export function outcomeRollupLines(rollup: OutcomeRollup): string[] {
   const { runs, cost, unreadable } = rollup;
   const names = (record: Record<string, number>) => Object.keys(record).sort().map(name => `${clean(name)} ${record[name]}`).join(", ");
@@ -813,15 +777,10 @@ export function outcomeRollupLines(rollup: OutcomeRollup): string[] {
   return lines;
 }
 
-/** One line for each refused line of an import, in the order given. */
 export function legacyRefusedLines(lines: readonly { line: number; outcome: LegacyLineOutcome }[]): string[] {
   return lines.filter(line => line.outcome === "changed" || line.outcome === "conflict").map(line => `Line ${line.line}: ${line.outcome}`);
 }
 
-/**
- * The import result as lines: each refused line in file order, then one summary. A dry run says nothing was written,
- * and a dry run over several batches says that each batch was checked on its own.
- */
 export function legacyImportLines(result: { dryRun: boolean; lines: { line: number; outcome: LegacyLineOutcome }[]; removed: number; batches: number }): string[] {
   const count = (name: LegacyLineOutcome) => result.lines.filter(line => line.outcome === name).length;
   const refused = legacyRefusedLines(result.lines);
@@ -862,7 +821,6 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
   }
   const progress = startupProgress();
   const args = [...argv];
-  // Keep server administration commands and their --config semantics intact.
   const candidate = clientCommandCandidate(args);
   if (!candidate || (candidate === "list" && args.includes("--config"))) return false;
   try {
@@ -890,7 +848,6 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       console.log(`Paired ${config.origin} as ${me.role}. Credentials saved privately at ${path}`);
       return true;
     }
-    // Existing local-host list remains available before a laptop is paired.
     if (command === "list" && !existsSync(path) && !options["--client-config"] && !process.env.INFINITE_CLIENT_CONFIG) return false;
     const config = loadConfig(path), api = connection(config);
     if (command === "understand") return await handleUnderstandingCommand(positional, options, api);
@@ -955,11 +912,9 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
           let answer: LegacyImportResult;
           try {
             answer = await api.json<LegacyImportResult>("/outcomes/legacy", { dryRun, lines: batch }, undefined, undefined, "POST");
-            // One outcome answers one line. Another count means the host and this command disagree about the batch.
             if (!Array.isArray(answer.outcomes) || answer.outcomes.length !== batch.length)
               throw new Error(`The host answered the batch that starts at line ${first} with another number of lines. Check that the host and this command are the same version.`);
           } catch (error) {
-            // Lines of the batches already answered are kept by the host; name the refused ones before the failure.
             for (const line of legacyRefusedLines(outcomes)) console.log(line);
             if (error instanceof HttpError && error.status === 403) throw new Error("Importing legacy outcomes requires an owner device key.");
             if (error instanceof HttpError && error.status === 409) throw new Error(`The host holds too many legacy lines: the limit is 50,000. The batch that starts at line ${first} was not imported.`);
@@ -1076,7 +1031,6 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         throw error;
       }
       if (options["--json"]) console.log(JSON.stringify(result, null, 2));
-      // A missing model or effort is left out: `none` is a real OpenCode variant, and must not stand for "no effort".
       else console.log(`Profile ${clean(result.profileId)} (${[result.provider, result.model, result.effort].filter((value): value is string => value !== null).map(clean).join(" ")}) is in epoch ${result.epoch} since ${clean(result.since)}.`);
       return true;
     }
@@ -1141,7 +1095,6 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     }
     if (command === "resources") { await resources(api, options); return true; }
     if (command === "sync" && (options["--stop"] || options["--status"])) {
-      // The service is a local process: stopping or inspecting it must not depend on reaching the host.
       const syncDir = join(dirname(path), "sync");
       const recorded = existsSync(syncDir) ? readdirSync(syncDir).flatMap(name => /^([a-z0-9-]{1,80})\.json$/.exec(name)?.[1] ?? []) : [];
       if (options["--stop"]) {
@@ -1254,7 +1207,6 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const projectId = String(enrolled ?? mapped?.id ?? options["--project"] ?? localSyncProject(join(dirname(path), "sync"), config.origin) ?? config.projectId ?? me.projects[0]?.id ?? "");
       if (!PROJECT_ID.test(projectId) || (!mapped && !me.projects.some(p => p.id === projectId))) throw new Error("Unknown project. Use infinite projects");
       if (options["--apply"]) {
-        // A large tree can take minutes to publish; a refusal (409) leaves its reason in the pending marker.
         const applied = await api.request(`/projects/${projectId}/sync/apply`, options["--force"] ? { force: true } : {}, AbortSignal.timeout(300000)).catch(async (error: unknown) => {
           if (!(error instanceof HttpError) || error.status !== 409) throw error;
           throw new Error(`Not applied. ${describeSync((await api.json<ProjectDetail>(`/projects/${projectId}`)).sync)}`);
@@ -1280,13 +1232,11 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const directory = join(dirname(path), "pulls", projectId);
       const storeDir = { directory: join(directory, "objects"), sharedPoolDirectory: join(dirname(path), "workspace-pool") };
       const output = options["--output"] === undefined ? undefined : resolve(String(options["--output"]));
-      // A sync service uploads everything under its root, so a pulled copy there would travel back to the cloud.
       const target = realPath(output ?? directory);
       if (syncRoots(join(dirname(path), "sync")).some(root => target === root || target.startsWith(root.endsWith(sep) ? root : root + sep)))
         throw new Error("Choose an --output directory outside every synced checkout; the sync service would upload the pulled copy");
       progress.start("Downloading the cloud project tree");
       const exportSignal = AbortSignal.timeout(300000);
-      // The host scans the whole cloud tree before replying; api.json would cap that at 15 s.
       const { manifest: exported } = await (await api.request(`/projects/${projectId}/sync/export`, {}, exportSignal)).json() as { manifest: unknown };
       const manifest = validateWorkspaceManifest(exported);
       const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
@@ -1363,8 +1313,6 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       if (workspace) {
         progress.start("Connecting the laptop executor");
         await startLaptopService({ ...config, sessionId: session.id, workspaceToken: workspace.token, cwd: workspace.cwd, roots: workspace.roots, configFile: path });
-        // Tunnel readiness precedes provider admission. Detached launch must not
-        // report success if the backend rejects this executor or the first thread.
         progress.start("Preparing the first laptop turn");
         const deadline = Date.now() + 30000;
         while (true) {

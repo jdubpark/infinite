@@ -54,7 +54,6 @@ const historyCommands: Partial<Record<Provider, ReadonlySet<string>>> = {
   opencode: new Set(["attach", "import"]),
 };
 
-/** Reject public launches that ask a provider CLI to select an existing conversation. */
 export function assertFreshNativeContext(provider: Provider, args: string[]): void {
   const flags = historyFlags[provider];
   const values = optionValues[provider];
@@ -77,14 +76,10 @@ export function assertFreshNativeContext(provider: Provider, args: string[]): vo
     }
 
     if (argument.startsWith("-")) {
-      // A dash-leading token is parsed as another option by these CLIs unless
-      // attached with `=`, so don't let a missing option value hide a selector.
       if (values?.has(flag) && equals < 0 && args[i + 1] && !args[i + 1].startsWith("-")) i++;
       continue;
     }
 
-    // Some native parsers recognize subcommands after another positional value.
-    // A normal prompt is one argument; literal command tokens can follow `--`.
     if (commands?.has(argument)) throw historyError();
   }
 }

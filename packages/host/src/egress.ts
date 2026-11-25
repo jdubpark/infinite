@@ -5,17 +5,8 @@ import { isAbsolute } from "node:path";
 import { z } from "zod";
 import { learningPurpose, type Config, type SessionPurpose } from "./types.js";
 
-/**
- * Agent egress through the host egress proxy (scripts/egress-proxy.mjs, deploy/ubuntu/egress.md).
- *
- * Each provider session gets proxy variables whose URL carries that session's credential: the user name is
- * `PROJECT.SESSION` and the password `v1.EXPIRES.MAC`, an HMAC-SHA256 under a key that only the host and proxy
- * accounts can read. The proxy verifies it without state. The key never enters a session's environment.
- */
 const CREDENTIAL_CONTEXT = "infinite-egress/v1";
-/** A session's credential lasts as long as a long session might; the proxy accepts at most 31 days. */
 export const SESSION_CREDENTIAL_SECONDS = 30 * 24 * 60 * 60;
-/** Host-run commands mint a fresh credential per command. */
 export const HOST_CREDENTIAL_SECONDS = 24 * 60 * 60;
 export const HOST_IDENTITY = { project: "_host", session: "host" } as const;
 export const EVAL_EGRESS_PROJECT = "_eval", EVAL_SETUP_EGRESS_PROJECT = "_eval-setup",
@@ -34,11 +25,9 @@ export const EGRESS_ENVIRONMENT_NAMES: readonly string[] = Object.freeze(Object.
 const PROJECT_ID = /^[a-z0-9-]{1,80}$/;
 const PROJECT_LABEL = /^(?:_host|_none|_eval-setup|_eval|[a-z0-9-]{1,80})$/;
 const SESSION_LABEL = /^[A-Za-z0-9-]{1,64}$/;
-/** The summary's project names: projects, the reserved host and no-project labels, and requests without credentials. */
 export const EGRESS_PROJECT = /^(?:_unauthenticated|_host|_none|_eval-setup|_eval|[a-z0-9-]{1,80})$/;
 const KEY_BYTES = 32;
 const MAX_SUMMARY_BYTES = 16 * 1024 * 1024;
-/** Non-secret settings a host process passes to the workers it starts. */
 const WORKER_PROXY_URL = "INFINITE_EGRESS_PROXY_URL";
 const WORKER_KEY_FILE = "INFINITE_EGRESS_KEY_FILE";
 
@@ -64,7 +53,6 @@ export class EgressKeyError extends Error {
   }
 }
 
-/** The shared key: a regular 32-byte file owned by root or this account, that other users cannot read and the group cannot write. */
 export function readEgressKey(path: string): Buffer {
   let before: ReturnType<typeof lstatSync>;
   try { before = lstatSync(path); } catch { throw new EgressKeyError("unavailable"); }
@@ -85,7 +73,6 @@ export function readEgressKey(path: string): Buffer {
   }
 }
 
-/** The proxy credential for one identity, expiring at `expiresAt` (Unix seconds). */
 export function egressCredential(key: Buffer, project: string, session: string, expiresAt: number) {
   if (!PROJECT_LABEL.test(project) || !SESSION_LABEL.test(session) || !Number.isSafeInteger(expiresAt) || expiresAt <= 0)
     throw new Error("Invalid egress identity");
@@ -106,28 +93,21 @@ function proxyEnvironment(value: string): Record<string, string> {
   };
 }
 
-/** Remove inherited proxy state before applying the current egress policy. */
 export function clearEgressEnvironment(env: Record<string, string | undefined>): void {
   for (const name of EGRESS_ENVIRONMENT_NAMES) delete env[name];
 }
 
-/** The six proxy variables and Node's opt-in flag for one identity. Loopback stays direct. */
 export function egressProxyEnvironment(proxyUrl: string, key: Buffer, identity: EgressIdentity, lifetimeSeconds: number, nowMs = Date.now()): Record<string, string> {
   const { username, password } = egressCredential(key, identity.project, identity.session, Math.floor(nowMs / 1000) + lifetimeSeconds);
   const value = `http://${username}:${password}@${new URL(proxyUrl).host}`;
   return proxyEnvironment(value);
 }
 
-/**
- * The six proxy variables with no credential, for a configured host that cannot mint one: every request through the
- * proxy is answered 407, so nothing reaches the network by accident and local work is unaffected.
- */
 export function egressUncredentialedEnvironment(proxyUrl: string): Record<string, string> {
   const value = `http://${new URL(proxyUrl).host}`;
   return proxyEnvironment(value);
 }
 
-/** A session's identity: its project, or `_none` when it has no valid one. A learning session (replay or gate) is `_eval`. */
 export function sessionEgressIdentity(projectId: string | undefined, sessionId: string, purpose?: SessionPurpose): EgressIdentity {
   if (learningPurpose(purpose)) return { project: EVAL_EGRESS_PROJECT, session: sessionId };
   return { project: projectId && PROJECT_ID.test(projectId) ? projectId : "_none", session: sessionId };
@@ -135,11 +115,6 @@ export function sessionEgressIdentity(projectId: string | undefined, sessionId: 
 
 let hostEgress: { proxyUrl: string; keyPath: string; key?: Buffer; warned: boolean } | undefined;
 
-/**
- * Called once per host process after its configuration is read. With `autonomy.boundary.egress`, workers this
- * process starts inherit the proxy address and key path (never the key), and host-run team commands get the proxy
- * variables with the host identity. Without it, both are cleared, so the environment is what it was before.
- */
 export function installHostEgress(config: Pick<Config, "autonomy">, env: NodeJS.ProcessEnv = process.env): void {
   const egress = config.autonomy?.boundary?.egress;
   if (!egress) {
@@ -154,13 +129,6 @@ export function installHostEgress(config: Pick<Config, "autonomy">, env: NodeJS.
   void hostEgressEnvironment();
 }
 
-/**
- * Proxy variables for a host-run command, with a fresh host credential. Empty only when egress is not configured.
- * When the key cannot be read, the command still gets the proxy address, without a credential: its network requests
- * are refused with 407 rather than sent direct. That matters because a command run as the host account, which
- * happens without `teams.commandPrefix`, is outside the firewall rule, which matches only the agent account.
- * Local Git operations never use the proxy.
- */
 export function hostEgressEnvironment(nowMs = Date.now()): Record<string, string> {
   if (!hostEgress) return {};
   if (!hostEgress.key) {
@@ -174,11 +142,6 @@ export function hostEgressEnvironment(nowMs = Date.now()): Record<string, string
   return egressProxyEnvironment(hostEgress.proxyUrl, hostEgress.key, HOST_IDENTITY, HOST_CREDENTIAL_SECONDS, nowMs);
 }
 
-/**
- * The environment for a model client the host runs as the agent account (briefings, System tab briefs and context
- * runs): `base` without inherited proxy state, plus the configured egress with the host identity. Without the egress
- * block it carries no proxy variables. Host-account calls such as `gh` keep their own environment.
- */
 export function agentModelClientEnvironment(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   clearEgressEnvironment(env);
@@ -186,14 +149,6 @@ export function agentModelClientEnvironment(base: NodeJS.ProcessEnv = process.en
   return env;
 }
 
-/**
- * In a worker: the proxy variables for its session, from what the host process exported.
- * - `off`: egress is not configured. No variables; the environment is unchanged.
- * - `on`: the proxy address with the session's credential.
- * - `no-key`: the key cannot be read. The proxy address without a credential, so requests get 407 instead of going
- *   direct; the worker records the gap.
- * - `invalid`: the inherited proxy address is unusable. No session may start, since none could be routed.
- */
 export function workerEgressEnvironment(projectId: string | undefined, sessionId: string, env: NodeJS.ProcessEnv = process.env, nowMs = Date.now(), purpose?: SessionPurpose):
   { status: "off" | "on" | "no-key" | "invalid"; env: Record<string, string> } {
   const proxyUrl = env[WORKER_PROXY_URL], keyPath = env[WORKER_KEY_FILE];
@@ -206,10 +161,6 @@ export function workerEgressEnvironment(projectId: string | undefined, sessionId
   return { status: "on", env: egressProxyEnvironment(proxyUrl, key, sessionEgressIdentity(projectId, sessionId, purpose), SESSION_CREDENTIAL_SECONDS, nowMs) };
 }
 
-/**
- * The proxy URL with a fresh credential for an eval identity, from the state installHostEgress set up: undefined without
- * the boundary; the URL with no credential (every request refused) when the key cannot be read.
- */
 export function evalProxyUrl(project: "_eval" | "_eval-setup", session: string, lifetimeSeconds: number, nowMs = Date.now()): string | undefined {
   if (!hostEgress) return undefined;
   const address = new URL(hostEgress.proxyUrl).host;
@@ -220,9 +171,6 @@ export function evalProxyUrl(project: "_eval" | "_eval-setup", session: string, 
   const { username, password } = egressCredential(hostEgress.key, project, session, Math.floor(nowMs / 1000) + lifetimeSeconds);
   return `http://${username}:${password}@${address}`;
 }
-
-// ---------------------------------------------------------------------------
-// Summary, API view, CLI, doctor
 
 const countsSchema = z.object({
   allowed: z.number().int().min(0).optional(),
@@ -276,7 +224,6 @@ function readSummary(path: string): { summary?: EgressSummaryFile; state: Egress
   } catch { return { state: "invalid" }; }
 }
 
-/** What the owner reads to build the allowlist: hosts per project over the retained days, would-deny first. */
 export function egressView(config: Pick<Config, "autonomy">, project?: string, nowMs = Date.now()): EgressView {
   const egress = config.autonomy?.boundary?.egress;
   const empty: EgressView = { configured: Boolean(egress), summary: "not-configured", mode: null, updatedAt: null, ageSeconds: null, policyError: null, days: [], dropped: zero(), projects: [] };
@@ -316,7 +263,6 @@ export function egressView(config: Pick<Config, "autonomy">, project?: string, n
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, 300);
 const age = (seconds: number) => seconds < 120 ? `${seconds}s` : seconds < 7200 ? `${Math.round(seconds / 60)}m` : seconds < 172800 ? `${Math.round(seconds / 3600)}h` : `${Math.round(seconds / 86400)}d`;
 
-/** Lines for `infinite egress`. */
 export function egressLines(view: EgressView): string[] {
   if (!view.configured) return ["Egress: not configured on this host."];
   if (view.summary !== "available") return [`Egress: configured · summary ${clean(view.summary)}`];
@@ -338,7 +284,6 @@ export function egressLines(view: EgressView): string[] {
 
 const EGRESS_USAGE = "Usage: infinite egress [--project ID] [--json]";
 type EgressApi = { json<T = unknown>(path: string): Promise<T> };
-/** `infinite egress [--project ID] [--json]`: the hosts agents reached, for building the allowlist from observe mode. */
 export async function handleEgressClientCommand(positional: string[], options: Record<string, string | boolean>, api: EgressApi): Promise<boolean> {
   if (positional.length > 0) throw new Error(EGRESS_USAGE);
   const project = options["--project"];
@@ -359,7 +304,6 @@ function probe(host: string, port: number, timeoutMs: number): Promise<boolean> 
   });
 }
 
-/** One `doctor` line: proxy reachable, key readable, summary age. */
 export async function egressDoctorLine(egress: EgressConfig, nowMs = Date.now()): Promise<string> {
   const url = new URL(egress.proxyUrl);
   const reachable = await probe(url.hostname.replace(/^\[|\]$/g, ""), Number(url.port), 2000);

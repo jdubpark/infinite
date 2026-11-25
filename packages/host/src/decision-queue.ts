@@ -4,10 +4,6 @@ import type { Mission, MissionDecision, MissionStatus } from "./mission-types.js
 import type { TeamDecision, TeamStatus } from "./team-types.js";
 import type { Session } from "./types.js";
 
-/**
- * One decision that waits on a person, from anywhere on the host. A session row with `terminalOnly` waits on a person
- * too, but its `answerPath` refuses it: the person answers in that session's terminal.
- */
 export type QueueDecision =
   | { kind: "session"; key: string; since: string; origin: QueueOrigin; answerPath: string; prompt: Prompt; terminalOnly?: true }
   | { kind: "team"; key: string; since: string; origin: QueueOrigin; answerPath: string; revision: number; decision: TeamDecision; held?: true }
@@ -82,7 +78,6 @@ function compareQueueDecision(left: QueueDecision, right: QueueDecision): number
   return byTime || compareText(left.key, right.key);
 }
 
-/** Selects answerable mission decisions from stored records without constructing views. */
 export function missionDecisionQueueCandidates(
   records: Iterable<{ mission: Mission; ownerHalt?: { revision: number } }>,
   live: ReadonlySet<Mission["status"]>,
@@ -95,7 +90,6 @@ export function missionDecisionQueueCandidates(
   });
 }
 
-/** Collects unanswered prompts and decisions that a person can answer now. */
 export function buildDecisionQueue(input: DecisionQueueInput): DecisionQueue {
   const decisions: QueueDecision[] = [];
 

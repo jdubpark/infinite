@@ -193,6 +193,8 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
   counts(g, 2);
 });
 
+const snapshotOf = (f: Fixture) => ({ saves: f.host.saves, uuids: f.world.uuids, holder: sha(f.holder) });
+
 test("a run outside the rule is returned before any store read", () => {
   const refused: [string, (f: Fixture) => void][] = [
     ["not pinned", f => { delete f.holder.run.verdicts; }],
@@ -207,7 +209,8 @@ test("a run outside the rule is returned before any store read", () => {
     ["no assessment", f => { delete f.holder.run.assessment; }],
     ["no since", f => { delete f.holder.verdict!.since; }],
     ["record unavailable", f => { f.holder.verdict!.reason = "record-unavailable"; }],
-    ["no record", f => { delete f.holder.objectiveRecord; }],
+    // The record names delivery criteria, but none of this verdict's criteria waited for the delivery.
+    ["nothing waited", f => { for (const item of f.holder.verdict!.composed!.criteria) if (item.reason === "before-delivery") item.reason = "no-receipt"; }],
   ];
   for (const [name, change] of refused) {
     const f = delivered();
@@ -219,6 +222,13 @@ test("a run outside the rule is returned before any store read", () => {
     assert.equal(sha(f.holder), before.holder, `${name}: the holder is as it was`);
     assert.equal(f.host.saves, before.saves, `${name}: no save`);
   }
+  // A record that is gone is seen after the ledger is asked: nothing is saved and no id is drawn.
+  const gone = delivered();
+  delete gone.holder.objectiveRecord;
+  gone.host.deliveryFact = "landed";
+  const kept = snapshotOf(gone);
+  assert.equal(gone.verdicts.settleReceipt(gone.holder), false, "no record");
+  assert.deepEqual(snapshotOf(gone), kept, "no record: nothing is saved and no id is drawn");
   const noCriterion = delivered({ criteria: [] });
   noCriterion.host.deliveryFact = "landed";
   assert.equal(noCriterion.verdicts.settleReceipt(noCriterion.holder), false);

@@ -223,7 +223,7 @@ export type MissionProgressSources = {
 };
 
 type ParsedCursor = { generation: string; missionId: string; instance: string; sequence: number };
-type History = { instance: string; sequence: number; fingerprint: string; observations: MissionProgressObservation[] };
+type History = { instance: string; sequence: number; fingerprint: string; observations: MissionProgressObservation[]; livenessCursor: number };
 type ExpectedAssignment = MissionProgressMemberSource | NonNullable<MissionProgressMissionSource["coordinator"]>;
 type LivenessRequest = { key: string; assignment: ExpectedAssignment };
 type SampledProgress = { missionId: string; observedAt: string; snapshot: MissionProgressSnapshot; history: History; hadHistory: boolean };
@@ -279,7 +279,6 @@ export class MissionProgressService {
   private readonly inFlight = new Map<string, Promise<SampledProgress>>();
   /** Nonblocking host-wide cap: pages report unsampled liveness instead of queuing behind slow sockets. */
   private activeWorkerReads = 0;
-  private probeRound = 0;
 
   constructor(private readonly sources: MissionProgressSources) {}
 
@@ -295,6 +294,7 @@ export class MissionProgressService {
   }
 
   private async sample(missionId: string): Promise<SampledProgress> {
+    const historyAtStart = this.histories.get(missionId);
     const source = this.sources.missions.progressSource(missionId);
     if (source.id !== missionId) throw new Error("Mission progress source does not match the requested mission.");
     const observedAt = new Date().toISOString();
@@ -316,13 +316,18 @@ export class MissionProgressService {
       memberRequests.push(...current.map(member => ({ key: `member:${subtask.id}:${member.memberId}`, assignment: member })));
     }
     if (memberRequests.length) {
-      const offset = this.probeRound++ % memberRequests.length;
+      const offset = (historyAtStart?.livenessCursor ?? 0) % memberRequests.length;
       requests.push(...memberRequests.slice(offset), ...memberRequests.slice(0, offset));
     }
     requests.splice(MAX_LIVENESS_READS);
     const liveness = new Map<string, MissionProgressWorkerStatus>();
+    const memberRequestKeys = new Set(memberRequests.map(request => request.key));
+    let sampledMemberCount = 0;
     const values = await Promise.all(requests.map(async request => [request.key, await this.workerStatus(request.assignment)] as const));
-    for (const [key, status] of values) liveness.set(key, status);
+    for (const [key, status] of values) {
+      liveness.set(key, status);
+      if (memberRequestKeys.has(key) && status !== "not-sampled") sampledMemberCount++;
+    }
 
     const snapshot = boundedSnapshot({
       mission: {
@@ -370,21 +375,27 @@ export class MissionProgressService {
       })),
       ...(source.subtasks.length > subtasks.length ? { subtasksTruncated: true as const } : {}),
     });
-    const hadHistory = this.histories.has(missionId);
-    let history = this.histories.get(missionId);
+    const hadHistory = historyAtStart !== undefined && this.histories.get(missionId) === historyAtStart;
+    let history = hadHistory ? historyAtStart : undefined;
     const stateFingerprint = fingerprint(snapshot);
+    const livenessCursor = memberRequests.length && sampledMemberCount > 0
+      ? ((historyAtStart?.livenessCursor ?? 0) + sampledMemberCount) % memberRequests.length
+      : 0;
     if (!history) {
-      history = { instance: randomUUID(), sequence: 1, fingerprint: stateFingerprint, observations: [] };
+      history = { instance: randomUUID(), sequence: 1, fingerprint: stateFingerprint, observations: [], livenessCursor: historyAtStart ? 0 : livenessCursor };
       this.histories.set(missionId, history);
       this.trimHistories();
-    } else if (history.fingerprint !== stateFingerprint) {
-      history.sequence++;
-      history.fingerprint = stateFingerprint;
-      history.observations.push({ cursor: cursorFor(this.generation, missionId, history.instance, history.sequence), sequence: history.sequence, observedAt, snapshot });
-      if (history.observations.length > MAX_OBSERVATIONS_PER_MISSION)
-        history.observations.splice(0, history.observations.length - MAX_OBSERVATIONS_PER_MISSION);
+    } else {
+      if (memberRequests.length && sampledMemberCount > 0) history.livenessCursor = livenessCursor;
+      if (history.fingerprint !== stateFingerprint) {
+        history.sequence++;
+        history.fingerprint = stateFingerprint;
+        history.observations.push({ cursor: cursorFor(this.generation, missionId, history.instance, history.sequence), sequence: history.sequence, observedAt, snapshot });
+        if (history.observations.length > MAX_OBSERVATIONS_PER_MISSION)
+          history.observations.splice(0, history.observations.length - MAX_OBSERVATIONS_PER_MISSION);
+      }
       this.touch(missionId, history);
-    } else this.touch(missionId, history);
+    }
     return { missionId, observedAt, snapshot, history, hadHistory };
   }
 

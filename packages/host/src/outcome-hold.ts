@@ -11,30 +11,13 @@ export const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 const DAY_MS = 86_400_000;
 
-/** One commit of a base scan. A scan lists them oldest first. */
 export type ScanCommit = { id: string; tree: string; parents: string[] };
 
-/** `base` is the base commit the run's reviewed head was built on. */
 export type LandingCandidate = { runId: string; reviewedHead?: string; reviewedTree?: string; mergeCommit?: string; base?: string };
 export type Landing = { runId: string; commit: string; method: LandingMethod; position: number; reviewedHead?: string };
-/**
- * `commit` is the landing commit, the first of `ids`. `position` is set when the run landed in this scan. `unsure` is
- * true for an earlier landing with a `rewrite` or `source` scan since its own scan: the stored head may then not
- * descend from the landing commit, so a commit of a later scan may be older than the landing.
- */
 export type LandedRun = { runId: string; signalId: string; commit: string; ids: string[]; holdUntil: string; position?: number; unsure?: boolean };
 export type RevertMatch = { runId: string; signalId: string; commit: string; reverts: string };
 
-/**
- * Rules 1 to 3 of spec part 5. Exact matches only. Commits are taken oldest first; a run
- * lands at its first matching commit, and within one commit rule 1 comes before 2 and 2
- * before 3. Several runs may land on one commit.
- *
- * A tree can recur, so rule 3 also needs proof that the commit is not older than the run: the
- * commit is the reviewed head itself, or the run's base is in the list before the commit, or
- * the base is not in the list and the scan read no history older than the ledger's head
- * (`older` is false). A run whose reviewed head is its base changed nothing and never lands.
- */
 export function matchLandings(commits: readonly ScanCommit[], candidates: readonly LandingCandidate[], older = false): Landing[] {
   const landed = new Set<string>();
   const landings: Landing[] = [];
@@ -72,7 +55,6 @@ export function matchLandings(commits: readonly ScanCommit[], candidates: readon
   return landings;
 }
 
-/** The ids whose later reverts count: the landing commit, plus the reviewed head for `merge-parent`. */
 export function landedIds(method: LandingMethod, commit: string, reviewedHead?: string): string[] {
   if (method === "merge-parent" && reviewedHead !== undefined && reviewedHead !== commit) {
     return [commit, reviewedHead];
@@ -84,15 +66,6 @@ export function revertPattern(id: string): string {
   return `This reverts commit ${id}`;
 }
 
-/**
- * Rule 4. `hits` maps a landed id to the commits whose message names it, as form 5 reports them.
- * A revert counts once per landing signal and reverting commit. It needs `holdUntil >= at`, and
- * it must come after the landing commit. A run that landed in this scan has its position. For a
- * landing of an earlier scan, the list may hold the landing commit, and then a revert must come
- * after it. When the list does not hold it, the commits of a scan of new commits follow it only
- * while the stored head descends from it: not in a scan that rereads older history (`older`),
- * and not for an `unsure` landing. In those cases the order is unknown and nothing is matched.
- */
 export function matchReverts(
   commits: readonly ScanCommit[],
   landed: readonly LandedRun[],
@@ -125,20 +98,13 @@ export function matchReverts(
       }
     }
   }
-  // Every match names a commit of this scan, so its position is known.
   return matches.sort((a, b) => (positions.get(a.commit) ?? 0) - (positions.get(b.commit) ?? 0));
 }
 
-/** `landedAt` plus `holdDays` whole days, as an ISO string. */
 export function holdUntil(landedAt: string, holdDays: number): string {
   return new Date(Date.parse(landedAt) + holdDays * DAY_MS).toISOString();
 }
 
-/**
- * The window's coverage, in the order of spec part 5: a gap inside the window is `gap`; a
- * last scan at or after the close is `covered`; no later scan is `open`; a later scan that
- * records a gap is `gap`; otherwise the later scan must come within `lapseMs` of the last one.
- */
 export function windowCoverage(
   points: { last?: ScanPoint; next?: ScanPoint; gapInside: boolean },
   holdUntilAt: string,
@@ -153,14 +119,12 @@ export function windowCoverage(
   return Date.parse(next.at) - Date.parse(last.checkedAt) <= lapseMs ? "covered" : "gap";
 }
 
-/** Splits Git output into lines. Empty output is no lines; any other output ends with one newline, as Git prints it. */
 function lines(stdout: string): string[] | undefined {
   if (stdout === "") return [];
   if (!stdout.endsWith("\n")) return undefined;
   return stdout.slice(0, -1).split("\n");
 }
 
-/** Form 2, 3, and 5 output: one commit id per line, all of one length, at most `max` lines. */
 export function parseIds(stdout: string, max: number): string[] | undefined {
   const ids = lines(stdout);
   if (ids === undefined || ids.length > max) return undefined;
@@ -168,14 +132,12 @@ export function parseIds(stdout: string, max: number): string[] | undefined {
   return ids;
 }
 
-/** Form 4 output: `H T` then one ` P` per parent, one line per requested id, in the requested order. */
 export function parseCommits(stdout: string, ids: readonly string[]): ScanCommit[] | undefined {
   const rows = lines(stdout);
   if (rows === undefined || rows.length !== ids.length) return undefined;
   const commits: ScanCommit[] = [];
   for (let index = 0; index < rows.length; index += 1) {
     const tokens = rows[index].split(" ");
-    // A root commit has no parent, so its line ends with the space before the parents: one empty third token.
     if (tokens.length === 3 && tokens[2] === "") tokens.pop();
     if (tokens.length < 2) return undefined;
     const [id, tree, ...parents] = tokens;

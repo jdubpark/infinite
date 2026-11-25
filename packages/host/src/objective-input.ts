@@ -9,10 +9,8 @@ import { objectiveError } from "./objective-record.js";
 import { teamCommandSchema } from "./team-types.js";
 import type { TeamCommand } from "./team-types.js";
 
-/** Input bounds of owner corrections and creation criteria. `criterionCanonicalBytes` is checked where a criterion is built. */
 export const CORRECTION_LIMITS = { ops: 16, creationCriteria: 7, version: 1_000_000, criterionCanonicalBytes: 2_048 } as const;
 
-/** A check as an owner writes it: a command names its run, not its digest, and an artifact has no schema. */
 export type CheckInput = Exclude<Check, { kind: "command" } | { kind: "artifact" }>
   | { kind: "command"; run: TeamCommand }
   | { kind: "artifact"; path: string; count?: string };
@@ -24,7 +22,6 @@ export type CorrectionOp =
   | { op: "criterion.confirm"; id: string }
   | { op: "assumption.set"; id: string; status: "verified" | "refuted" }
   | { op: "rating.record"; subject: string; score: number };
-/** Owner ratings run from 1 to 5 in halves, so every score is exact in binary floating point. */
 export const RATING_SCALE = { min: 1, max: 5, step: 0.5 } as const;
 export type Correction = { requestId: string; version: number; ops: CorrectionOp[] };
 
@@ -86,15 +83,10 @@ export const correctionSchema: z.ZodType<Correction> = z.strictObject({
   return new Set(assumptions).size === assumptions.length && new Set(subjects).size === subjects.length;
 }, "Each assumption and each rating subject is named by at most one op");
 
-/** SHA-256 hex of the canonical JSON of a command's program and arguments. */
 export function commandDigest(command: TeamCommand): string {
   return createHash("sha256").update(canonicalJson({ command: command.command, args: command.args })).digest("hex");
 }
 
-/**
- * Splits a goal create body. `criteria` (1 to 7) is parsed here and the rest is the goal, parsed as the goal route
- * parses it, so a finite goal without `maxRuns` still gets the default.
- */
 export function parseGoalCreateBody(input: unknown): { goal: CreateGoal; criteria?: CriterionInput[] } {
   if (typeof input !== "object" || input === null || !Object.hasOwn(input, "criteria")) return { goal: parseCreateGoal(input) };
   const { criteria, ...rest } = input as Record<string, unknown>;

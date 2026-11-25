@@ -51,7 +51,6 @@ import {
   writeSignal,
 } from "./outcome-store.js";
 
-/** The signals of one row and, for an applied landing, its facts. Pure reads of the stored signals. */
 export type RowSignalFacts = { signals: RowSignals; landing?: { at: string; method: LandingMethod; holdUntil: string } };
 
 export type OwnerSignalInput =
@@ -69,7 +68,6 @@ export class SignalRequestError extends Error {
 }
 
 const DAY_MS = 86_400_000;
-/** A signal of the run does not open, so no level of the run can be recomputed from its signals. */
 export class SignalUnreadableError extends EvidenceError {
   constructor() {
     super("unavailable", "A signal of the run cannot be read.");
@@ -98,10 +96,6 @@ export function ratingSignalId(eventKey: string): string {
   return sha256(`rating:${eventKey}`);
 }
 
-/**
- * The signals that apply to one row, from the run's active signals only. The run's landing applies when the row's
- * review accepted it. A fix counts when the run has no landing, or when it is no later than the landing's close.
- */
 export function rowSignals(db: EvidenceDb, row: OutcomeRow): RowSignalFacts {
   const active = everySignal(db, row.runId).filter(signal => signal.state === "active");
   const excluded = active.some(signal => signal.payload.kind === "exclusion" && signal.outcomeId === row.outcomeId);
@@ -130,12 +124,7 @@ export function rowSignals(db: EvidenceDb, row: OutcomeRow): RowSignalFacts {
   };
 }
 
-/**
- * Writes a row with its levels, exclusion, round counts, scan-gap flag, and hold fields recomputed from the stored
- * facts. It never changes `acceptance`, the review's own fact. A row without `acceptance` takes `accepted` first.
- */
 export function saveOutcomeRow(tx: EvidenceTx, row: OutcomeRow): void {
-  // A legacy row keeps the levels its import gave it. Host rules must not rewrite the operator's claim.
   if (row.source === "legacy") throw new Error("A legacy row keeps the levels of its import.");
   row.acceptance = row.acceptance === undefined ? row.accepted : row.acceptance;
   const links = linksOf(tx, row.outcomeId);
@@ -152,7 +141,6 @@ export function saveOutcomeRow(tx: EvidenceTx, row: OutcomeRow): void {
   row.accepted = computed.accepted;
   row.firstPass = computed.firstPass;
   row.held = computed.held;
-  // A replay row never informs a rate, so its levels stay unknown (C5).
   if (row.source === "replay") row.accepted = row.firstPass = row.held = null;
   row.exclusion = rowExclusion(row.disposition, facts.signals) ?? null;
   row.payload.rounds = roundCounts(links);
@@ -165,11 +153,6 @@ export function saveOutcomeRow(tx: EvidenceTx, row: OutcomeRow): void {
   writeOutcome(tx, row);
 }
 
-/**
- * The run's signals for a recomputation. Each one must open: a signal that cannot be read may be the linked fix that
- * makes held no, or the exclusion that keeps a row out of the rates. A display may leave such a signal out; a save
- * may not.
- */
 function everySignal(db: EvidenceDb, runId: string): SignalRow[] {
   const signals = runSignals(db, runId);
   const stored = db.get<{ n: number }>("SELECT count(*) AS n FROM outcome_signals WHERE run_id=?", runId)?.n ?? 0;
@@ -177,12 +160,10 @@ function everySignal(db: EvidenceDb, runId: string): SignalRow[] {
   return signals;
 }
 
-/** Saves every row of a run, deleted runs included. It writes no summary. */
 export function recomputeRun(tx: EvidenceTx, runId: string): void {
   for (const row of runOutcomes(tx, runId)) saveOutcomeRow(tx, row);
 }
 
-/** The owner's claim with one request id. It is recorded or withdrawn in one write, and repeats are idempotent. */
 export function ownerSignal(store: EvidenceStore, input: OwnerSignalInput, now: string): { signal: SignalRow; repeated: boolean } {
   if (store.status().modules[OUTCOMES_MODULE] !== "ready") throw new EvidenceError("unavailable", UNAVAILABLE);
   try {
@@ -191,7 +172,6 @@ export function ownerSignal(store: EvidenceStore, input: OwnerSignalInput, now: 
       return recordSignal(tx, input, now);
     });
   } catch (error) {
-    // A summary or a row of the run that does not open is unavailable evidence, not a server fault. The write rolls back.
     if (error instanceof SignalRequestError || error instanceof EvidenceError) throw error;
     throw new EvidenceError("unavailable", UNAVAILABLE);
   }
@@ -209,7 +189,6 @@ function recordSignal(
     if ("request" in stored.payload && stored.payload.request === request) return { signal: stored, repeated: true };
     throw new SignalRequestError("request-conflict", "The request id names another request.");
   }
-  // A stored row whose payload does not open is never overwritten.
   if (hasSignal(tx, signalId)) throw new SignalRequestError("request-conflict", "The stored signal does not open.");
   const summary = readSummary(tx, input.runId);
   const rows = runOutcomes(tx, input.runId);
@@ -268,12 +247,10 @@ function withdrawSignal(
   return { signal, repeated: false };
 }
 
-/** The input without its request id and without the keys that are undefined, so that the request hash is stable. */
 function withoutRequestId(input: Extract<OwnerSignalInput, { action: "record" }>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(input).filter(([key, value]) => key !== "requestId" && value !== undefined));
 }
 
-/** The link states of one row, in revision and round order. */
 export function linksOf(tx: EvidenceDb, id: string): LinkState[] {
   return tx.all<{ state: string }>("SELECT state FROM outcome_round_links WHERE outcome_id=? ORDER BY revision, round", id)
     .map(row => row.state as LinkState);
@@ -283,18 +260,12 @@ function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-/** What a base branch scan needs from the store before it reads Git. Summaries and landings are read in one pass. */
 export type ScanInputs = {
-  /** `lastAt` is the newest scan's time, and `checkedAt` the time of the last fetch the ledger recorded at its head. */
   state?: { seq: number; head: string; repository: string; baseBranch: string; lastAt: string; checkedAt: string };
   candidates: LandingCandidate[];
   open: LandedRun[];
 };
 
-/**
- * The scan's inputs for a project at `at`. A candidate is a run approved in the last `APPROVAL_DAYS` with no active
- * landing. A reported id is used only when it is a commit id, since the reported merge commit is agent-reported text.
- */
 export function scanInputs(db: EvidenceDb, projectId: string, at: string): ScanInputs {
   const ref = db.index("project", projectId);
   const stored = readScanState(db, ref);
@@ -310,7 +281,6 @@ export function scanInputs(db: EvidenceDb, projectId: string, at: string): ScanI
   const candidates = landingCandidates(db, ref, daysBefore(at, APPROVAL_DAYS))
     .map(({ runId, payload }) => candidateOf(runId, payload));
   const atMs = Date.parse(at);
-  // After a scan that reread or replaced the history, the stored head may not descend from an earlier landing commit.
   const rewound = db.get<{ seq: number | null }>(
     "SELECT max(seq) AS seq FROM base_scans WHERE project_ref=? AND gap IN ('rewrite', 'source')",
     ref,
@@ -355,15 +325,8 @@ export type ScanWrite = {
   holdDays: number;
 };
 
-/** A landing or revert signal that `applyScan` wrote. Ids only: no text from Git or from an agent. */
 export type RecordedScanSignal = { kind: "landing" | "revert"; signalId: string; runId: string; commit: string };
 
-/**
- * One base branch scan, written in the caller's transaction. It applies only when the stored seq is `expectedSeq` and
- * `at` is not before the last scan's. A run keeps its first landing. A revert counts only while its landing is open at
- * `at`. Verdicts are stored once, and then the touched runs are recomputed. When `recorded` is given, each landing and
- * revert signal written is appended to it; the caller reads it only after the transaction commits.
- */
 export function applyScan(tx: EvidenceTx, scan: ScanWrite, recorded?: RecordedScanSignal[]): { applied: boolean; seq: number } {
   const ref = tx.index("project", scan.projectId);
   const current = readScanState(tx, ref)?.seq ?? 0;
@@ -442,10 +405,6 @@ export function applyScan(tx: EvidenceTx, scan: ScanWrite, recorded?: RecordedSc
   return { applied: true, seq };
 }
 
-/**
- * A check that a refresh confirmed the project's newest scan at `at`. It applies only at the stored seq and head. It
- * then stores the window verdicts that are now decided, and recomputes their runs.
- */
 export function applyCheck(tx: EvidenceTx, check: { projectId: string; head: string; at: string; expectedSeq: number }): { applied: boolean } {
   const ref = tx.index("project", check.projectId);
   const state = readScanState(tx, ref);
@@ -460,11 +419,6 @@ export function applyCheck(tx: EvidenceTx, check: { projectId: string; head: str
   return { applied: true };
 }
 
-/**
- * Recomputes a run that a scan touched. A run with a signal that does not open is left as it is, so that it cannot hold
- * up the other runs of the project. Its rows keep their levels: a scan writes a landing, a revert inside an open
- * window, or a verdict, so the levels it leaves stale are unknown or no, never a yes that should be a no.
- */
 function recomputeAfterScan(tx: EvidenceTx, runId: string): void {
   try {
     recomputeRun(tx, runId);
@@ -473,10 +427,6 @@ function recomputeAfterScan(tx: EvidenceTx, runId: string): void {
   }
 }
 
-/**
- * Stores the verdict of each active landing of the project that has none yet, when its window is covered or has a gap.
- * An open window stores nothing. Returns the runs decided.
- */
 function decideWindows(tx: EvidenceTx, ref: string, at: string): string[] {
   const decided: string[] = [];
   for (const signal of projectLandings(tx, ref, daysBefore(at, HOLD_DAYS_MAX + APPROVAL_DAYS))) {
@@ -490,7 +440,6 @@ function decideWindows(tx: EvidenceTx, ref: string, at: string): string[] {
   return decided;
 }
 
-/** Whether a signal row exists, whatever its payload reads as. */
 function hasSignal(tx: EvidenceDb, signalId: string): boolean {
   return tx.get("SELECT 1 AS found FROM outcome_signals WHERE signal_id=?", signalId) !== undefined;
 }

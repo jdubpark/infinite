@@ -18,7 +18,6 @@ export type ObjectiveUnavailable = "source-invalid" | "record-invalid" | "record
 export type ObjectiveState = { kind: "absent" } | { kind: "ready"; record: ObjectiveRecord }
   | { kind: "unavailable"; reason: "record-invalid" | "record-newer" };
 export type SteeringEntry = { text: string; revision: number; at: string };
-/** The steering entry that a live request appended, logged as the owner's direction. */
 export type LiveDirection = { revision: number; handle: string };
 export type ObjectiveRecordView = { owner: ObjectiveOwner; version: number; latestVersion: number; rebuilt: boolean;
   record: Omit<ObjectiveRecord, "log">; log: LogEntry[] };
@@ -70,7 +69,6 @@ export function objectiveError(code: ObjectiveErrorCode): TeamError {
   return new TeamError(OBJECTIVE_ERRORS[code].status, code, OBJECTIVE_ERRORS[code].message);
 }
 
-/** Stamps the digest over everything but the log and the digest itself. */
 function seal(body: Omit<ObjectiveRecord, "digest"> & Partial<Pick<ObjectiveRecord, "digest">>): ObjectiveRecord {
   return { ...body, digest: recordDigest(body) };
 }
@@ -81,7 +79,6 @@ function sameOwner(left: ObjectiveOwner, right: ObjectiveOwner): boolean {
   return false;
 }
 
-/** A goal's record: the owner's words as c0, then one direction per steering entry. */
 export function goalRecord(goal: ProductGoal, at: string, origin: "created" | "migrated", live?: LiveDirection): ObjectiveRecord | "source-invalid" {
   try {
     const entry: LogEntry = origin === "created"
@@ -117,7 +114,6 @@ export function goalRecord(goal: ProductGoal, at: string, origin: "created" | "m
   }
 }
 
-/** A standalone run's record: the objective as its text, c0 pointing at it, and the paths left open to the whole project. */
 export function runRecord(run: TeamRun, at: string, handle: string): ObjectiveRecord | "source-invalid" {
   try {
     const base = seal({
@@ -151,15 +147,10 @@ export function runRecord(run: TeamRun, at: string, handle: string): ObjectiveRe
   }
 }
 
-/**
- * A run's steering as the record reads it. The owner's GitHub review is the owner's direction, so it enters without its
- * source; connector and coordinator steering keep theirs, which the record does not take.
- */
 export function recordSteering(steering: TeamRun["steering"]): readonly SteeringEntry[] {
   return steering.map(entry => typeof entry.source === "object" && entry.source.kind === "github-review" ? { text: entry.text, revision: entry.revision, at: entry.at } : entry);
 }
 
-/** Appends one direction per steering entry that has none. Returns the same object when nothing is missing; never mutates its input. */
 export function syncDirections(record: ObjectiveRecord, steering: readonly SteeringEntry[], at: string, live?: LiveDirection): ObjectiveRecord | "source-invalid" {
   try {
     if (!steering.every(entry => steeringEntry.safeParse(entry).success)) return "source-invalid";
@@ -198,12 +189,10 @@ export function syncDirections(record: ObjectiveRecord, steering: readonly Steer
   }
 }
 
-/** Inline when the canonical value fits 2 KiB; otherwise a reference with the digest and size. */
 export function logValue(value: unknown, ref: string): LogValue {
   return logValueOf(value, ref);
 }
 
-/** Reads a sealed record strictly. Never repairs: a damaged or newer value is reported, not changed. */
 export function readStoredRecord(raw: unknown, owner: ObjectiveOwner): ObjectiveState {
   if (raw === undefined) return { kind: "absent" };
   try {
@@ -221,7 +210,6 @@ export function readStoredRecord(raw: unknown, owner: ObjectiveOwner): Objective
   }
 }
 
-/** The ops the intent check writes. `rebuildVersion` undoes each of them. */
 export const INTENT_OPS = {
   applied: "intent-check.applied",
   answered: "intent-check.answered",
@@ -230,7 +218,6 @@ export const INTENT_OPS = {
 } as const;
 const INTENT_OP_SET = new Set<string>(Object.values(INTENT_OPS));
 
-/** The ops the assumption register writes. `rebuildVersion` undoes each of them. */
 export const REGISTER_OPS = {
   tested: "test.recorded",
   proposed: "proposal.recorded",
@@ -239,12 +226,10 @@ export const REGISTER_OPS = {
 } as const;
 const REGISTER_OP_SET = new Set<string>(Object.values(REGISTER_OPS));
 
-/** The ops a verdict writes. `rebuildVersion` undoes `recorded`; `contradicted` changes no record state. */
 export const VERDICT_OPS = { recorded: "verdict.recorded", contradicted: "evaluator-contradicted-receipt" } as const;
 
 const CRITERION_OPS = new Set(["criterion.added", "criterion.edited", "criterion.retired", "criterion.confirmed"]);
 
-/** Undoes one criterion entry: the criterion its `after` names goes back to its `before`, or is removed for an add. */
 function undoCriterion(criteria: Criterion[], entry: LogEntry): Criterion[] {
   const unavailable = () => objectiveError("objective-version-unavailable");
   const canonical = (value: unknown) => canonicalJson(JSON.parse(JSON.stringify(value) ?? "null"));
@@ -283,7 +268,6 @@ function inlineOf(value: LogValue | undefined): unknown {
   return value.inline;
 }
 
-/** Puts back the state, wait, and decisionId that `before` names for each question. A name the record does not hold is unavailable. */
 function restoreQuestions(questions: Question[], before: LogValue | undefined): Question[] {
   const saved = savedQuestions.safeParse(inlineOf(before));
   if (!saved.success) throw unavailable();
@@ -299,7 +283,6 @@ function restoreQuestions(questions: Question[], before: LogValue | undefined): 
   return next;
 }
 
-/** The direction an answer appended: inline by its id, or named by its reference. None when the answer hit the direction cap. */
 function answeredDirectionId(after: LogValue | undefined): string | undefined {
   if (after === undefined) throw unavailable();
   if ("ref" in after) {
@@ -311,7 +294,6 @@ function answeredDirectionId(after: LogValue | undefined): string | undefined {
   return parsed.data.directionsFull === true ? undefined : parsed.data.direction?.id;
 }
 
-/** Undoes one intent entry. A check's added objects come out only when they hash to `addedDigest`. */
 function undoIntent(state: Undoable, entry: LogEntry): Undoable {
   if (entry.op === INTENT_OPS.skipped) return state;
   if (entry.op === INTENT_OPS.applied) {
@@ -344,7 +326,6 @@ function undoIntent(state: Undoable, entry: LogEntry): Undoable {
 }
 
 const STATUS = z.enum(["verified", "assumed", "refuted", "unchecked"]);
-/** `replaced` is the earlier handle with the same prefix, and `at` is its index in `evidence`. */
 const replacedHandle = z.strictObject({ handle: z.string(), at: z.number().int().min(0) });
 const statusesBefore = z.strictObject({
   assumptions: z.array(z.strictObject({ id: z.string(), status: STATUS, replaced: replacedHandle.optional() })),
@@ -358,7 +339,6 @@ const proposalAfter = z.looseObject({
   attached: z.array(z.strictObject({ id: z.string(), entryId: z.string() })),
 });
 
-/** Takes off the handle an entry added, which must be `expected`, and puts `replaced` back at its index. */
 function restoreEvidence(evidence: string[], expected: string, replaced: { handle: string; at: number } | undefined): string[] {
   if (evidence[evidence.length - 1] !== expected) throw unavailable();
   const kept = evidence.slice(0, -1);
@@ -373,7 +353,6 @@ function indexOfAssumption(assumptions: Assumption[], id: string): number {
   return index;
 }
 
-/** Undoes a host test or an owner rating: each assumption it names gets back its status and handles. */
 function undoStatuses(state: Undoable, entry: LogEntry, handleOf: (id: string) => string): Undoable {
   const before = statusesBefore.safeParse(inlineOf(entry.before));
   const after = statusesAfter.safeParse(inlineOf(entry.after));
@@ -391,7 +370,6 @@ function undoStatuses(state: Undoable, entry: LogEntry, handleOf: (id: string) =
   return { ...state, assumptions };
 }
 
-/** Undoes an owner pin: the status and the pin go back, and an absent pin stays absent. */
 function undoSet(state: Undoable, entry: LogEntry): Undoable {
   const before = setBefore.safeParse(inlineOf(entry.before));
   const after = setAfter.safeParse(inlineOf(entry.after));
@@ -409,7 +387,6 @@ function undoSet(state: Undoable, entry: LogEntry): Undoable {
   return { ...state, assumptions: state.assumptions.map((item, position) => (position === index ? restored : item)) };
 }
 
-/** Undoes a member's proposal: its stances come off in reverse, then its added assumptions, which must hash to `addedDigest`. */
 function undoProposal(state: Undoable, entry: LogEntry): Undoable {
   const parsed = proposalAfter.safeParse(inlineOf(entry.after));
   if (!parsed.success || entry.before !== undefined) throw unavailable();
@@ -432,7 +409,6 @@ const verdictLatest = z.strictObject({ state: verdictState, verdictId: z.uuid() 
 const verdictBefore = z.looseObject({ latest: z.record(z.string(), verdictLatest.nullable()) });
 const verdictAfter = z.looseObject({ latest: z.record(z.string(), verdictLatest) });
 
-/** Puts each criterion a verdict named back to its earlier `latest`, or removes `latest` when there was none. */
 function undoVerdict(state: Undoable, entry: LogEntry): Undoable {
   const before = verdictBefore.safeParse(inlineOf(entry.before));
   const after = verdictAfter.safeParse(inlineOf(entry.after));
@@ -464,7 +440,6 @@ function undoRegister(state: Undoable, entry: LogEntry): Undoable {
   }
 }
 
-/** Rebuilds the record as it was at `version` by undoing each later entry in descending seq. Throws objectiveError. */
 export function rebuildVersion(record: ObjectiveRecord, version: number): ObjectiveRecord {
   if (!Number.isInteger(version) || version < 1 || version > record.version) throw objectiveError("objective-version-not-found");
   const first = record.log[0];
@@ -511,7 +486,6 @@ export function rebuildVersion(record: ObjectiveRecord, version: number): Object
   return rebuilt;
 }
 
-/** The record at `version` (default: the latest) with its log. A version other than the latest is rebuilt. */
 export function recordView(record: ObjectiveRecord, version: number = record.version): ObjectiveRecordView {
   const target = version === record.version ? record : rebuildVersion(record, version);
   const body: Partial<ObjectiveRecord> = { ...target };
@@ -526,7 +500,6 @@ export function recordView(record: ObjectiveRecord, version: number = record.ver
   };
 }
 
-/** The event text to add once, or undefined. Sets `objectiveNotice` on a new reason and clears it when the record is readable. */
 export function noticeFor(holder: { objectiveNotice?: ObjectiveUnavailable }, result: string, events: Record<ObjectiveUnavailable, string>): string | undefined {
   if (result === "built" || result === "synced" || result === "unchanged") {
     delete holder.objectiveNotice;

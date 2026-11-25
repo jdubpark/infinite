@@ -13,9 +13,7 @@ import type { Config } from "./types.js";
 
 export const JOB_EXPIRY_DAYS_MAX = 30, JOB_TASKS_MAX = 1_000, JOB_TASKS_DEFAULT = 100, JOB_LIST_MAX = 100, STUCK_AFTER = 3,
   JOB_KEEP_DAYS = 90, REVALIDATE_DAYS = 30;
-/** Rows one `next` call reads per job, and the rows one sweep pass deletes. */
 const NEXT_PAGE = 200, ACTIVE_LIMIT = 100, SWEEP_LIMIT = 100, DAY_MS = 86_400_000;
-/** The cursor of the revalidation phase starts with this text; a task id never does. */
 const VALID_PHASE = "valid:";
 
 const TASK_ID_PATTERN = /^(captured|mined):[A-Za-z0-9:._-]{1,200}$/;
@@ -39,20 +37,13 @@ export const validateJobSchema: z.ZodType<ValidateJobRequest> = z.object({
   expiresAt: z.iso.datetime().optional(),
 }).strict();
 
-/** One task of the project, through `eval_tasks_next`: the next candidate or valid row after the cursor. */
 export const NEXT_TASK_SQL = "SELECT task_id, origin, area_ref, validated_at FROM eval_tasks WHERE project_ref = ? AND state = ? AND task_id > ? ORDER BY task_id LIMIT 200";
-/** The jobs in one status, oldest first, through `eval_jobs_status`. */
 export const ACTIVE_JOBS_SQL = "SELECT * FROM eval_jobs WHERE status = ? AND kind = 'validate' ORDER BY created_at, job_id LIMIT ?";
-/** Whether a project has a job of one kind that holds its slot, through `eval_jobs_project`. */
 export const ACTIVE_PROJECT_JOBS_SQL = "SELECT job_id FROM eval_jobs WHERE project_ref = ? AND kind = ? AND status IN ('scheduled', 'running', 'paused', 'blocked') LIMIT 1";
-/** The newest jobs of a project, through `eval_jobs_project`. */
 export const PROJECT_JOBS_SQL = "SELECT * FROM eval_jobs WHERE project_ref = ? ORDER BY created_at DESC, job_id DESC LIMIT ?";
-/** The newest jobs, in index order through `eval_jobs_created`, with no predicate, so the plan is a scan that stops at LIMIT. */
 export const JOBS_SQL = "SELECT * FROM eval_jobs ORDER BY created_at DESC, job_id DESC LIMIT ?";
-/** Finished jobs older than the cutoff, through the `created_at` range of `eval_jobs_created`. `finished_at` is never before `created_at`. */
 export const JOB_SWEEP_SQL = "SELECT job_id FROM eval_jobs WHERE created_at < ? AND finished_at < ? ORDER BY created_at, job_id LIMIT ?";
 
-/** SHA-256 of the canonical JSON of the validation settings and eval.grader. */
 export function jobDigest(settings: ValidationSettings, grader: EvalGraderConfig | undefined): string {
   return sha256(canonicalJson({ settings, grader: grader ?? null }));
 }
@@ -64,7 +55,6 @@ export type NextWork =
 
 export type Gates = { grader: GraderProbe; hostLoadHeld: boolean; halted: (projectId: string) => boolean };
 
-/** Sealed in `eval_jobs.payload`: the normalized request, its digest, and the digest pinned at the last approval. */
 type JobPayload = { projectId: string; request: ValidateJobRequest; requestDigest: string; jobDigest: string };
 
 export type EvalJobRow = JobRow;
@@ -83,7 +73,6 @@ type JobUpdate = Partial<Record<JobColumn, SQLInputValue>>;
 
 const NONE: NextWork = { kind: "none" };
 
-/** The baseline job's views and resume digest, supplied by TrialJobs for rows of kind `baseline`. */
 export type BaselineJobHooks = {
   views(db: EvidenceDb, rows: readonly EvalJobRow[]): Map<string, EvalJobView>;
   digest(projectId: string, jobId: string): string | undefined;
@@ -94,7 +83,6 @@ export class EvalJobs {
   private readonly config: Pick<Config, "projects" | "eval">;
   private readonly now: () => string;
   private readonly baseline: BaselineJobHooks | undefined;
-  /** The job whose task `next` handed out and `record` has not yet closed. One task runs at a time. */
   private inFlight: string | undefined;
 
   constructor(options: { store: EvidenceStore; config: Pick<Config, "projects" | "eval">; now?: () => string; baseline?: BaselineJobHooks }) {
@@ -117,7 +105,6 @@ export class EvalJobs {
       taskFilter: { ...parsed.data.taskFilter, maxTasks: parsed.data.taskFilter?.maxTasks ?? JOB_TASKS_DEFAULT },
       expiresAt: new Date(expiresMs).toISOString(),
     };
-    // Digest the body as the client sent it, so a replay later still matches. The default expiry moves with the clock.
     const requestDigest = sha256(canonicalJson({ projectId, request: parsed.data }));
     return this.store.write(tx => {
       const existing = tx.get<JobRow>("SELECT * FROM eval_jobs WHERE request_id = ?", requestId);
@@ -169,7 +156,6 @@ export class EvalJobs {
           waiting: null,
         };
         if (row.status === "blocked") {
-          // The owner's resume approves the configuration as it is now, so the job pins the current digest.
           const projectId = this.refs(tx).get(row.project_ref);
           const digest = projectId === undefined ? undefined : row.kind !== "validate"
             ? this.baseline?.digest(projectId, jobId) : this.pinnedDigest(projectId)?.digest;
@@ -208,7 +194,6 @@ export class EvalJobs {
     });
   }
 
-  /** The next task for the validator, or the wait that holds the jobs. Writes only job rows. */
   next(gates: Gates): NextWork {
     return this.store.write(tx => {
       const refs = this.refs(tx);
@@ -228,9 +213,7 @@ export class EvalJobs {
     });
   }
 
-  /** Closes the task `next` handed out: moves the cursor, counts the outcome, and applies a pause or a wait. */
   record(jobId: string, taskId: string, outcome: TaskValidation): void {
-    // Cleared before the write, so a failed write still frees the next job.
     if (this.inFlight === jobId) this.inFlight = undefined;
     this.store.write(tx => {
       const row = this.rowOf(tx, jobId);
@@ -252,7 +235,6 @@ export class EvalJobs {
           ...(stuck ? { status: "paused", reason: "validation-stuck" } : {}),
         });
       } else {
-        // An environment outcome counts nothing and keeps the cursor, so the task is visited again.
         if (outcome.cause === "grader-processes-alive") {
           update(tx, jobId, at, { status: "blocked", reason: "grader-processes-alive", waiting: null });
         } else if (outcome.cause === "halted") {
@@ -266,7 +248,6 @@ export class EvalJobs {
     });
   }
 
-  /** Deletes at most SWEEP_LIMIT finished jobs older than JOB_KEEP_DAYS. */
   sweep(): number {
     return this.store.write(tx => {
       const cutoff = new Date(Date.parse(this.now()) - JOB_KEEP_DAYS * DAY_MS).toISOString();
@@ -276,7 +257,6 @@ export class EvalJobs {
     });
   }
 
-  /** One job's turn in `next`: a task, a wait, or nothing from this job. Gates run in the plan's order. */
   private step(tx: EvidenceTx, row: JobRow, refs: Map<string, string>, gates: Gates): NextWork {
     const at = this.now();
     const nowMs = Date.parse(at);
@@ -311,7 +291,6 @@ export class EvalJobs {
     return this.scan(tx, row, projectId, payload, pinned.settings, nowMs);
   }
 
-  /** Reads one page of the job's phase after its cursor, and returns the first task that matches or ends the job. */
   private scan(
     tx: EvidenceTx,
     row: JobRow,
@@ -330,7 +309,6 @@ export class EvalJobs {
       for (let index = 0; index < page.length; index++) {
         const candidate = page[index];
         if (!matches(candidate, filter, phase, nowMs)) continue;
-        // Rows before the match are not tasks of this job, so the cursor moves past them.
         if (index > 0) update(tx, row.job_id, at, { cursor: cursorOf(phase, page[index - 1].task_id) });
         if (row.status === "scheduled") update(tx, row.job_id, at, { status: "running", started_at: at });
         if (row.waiting !== null) update(tx, row.job_id, at, { waiting: null });
@@ -339,12 +317,10 @@ export class EvalJobs {
       }
       const last = page[page.length - 1]?.task_id;
       if (page.length === NEXT_PAGE && last !== undefined) {
-        // A full page with no match: the next call starts after it.
         update(tx, row.job_id, at, { cursor: cursorOf(phase, last) });
         return NONE;
       }
       if (phase === "candidate" && revalidate) {
-        // Written now, so `record` keeps the valid phase even when the first valid match is at index 0.
         phase = "valid";
         after = "";
         update(tx, row.job_id, at, { cursor: cursorOf("valid", "") });
@@ -359,7 +335,6 @@ export class EvalJobs {
     const filter = request.taskFilter;
     return {
       origins: filter?.origins === undefined ? undefined : new Set(filter.origins),
-      // Rows keep the blind index of an area, not its name.
       areas: filter?.areas === undefined ? undefined : new Set(filter.areas.map(area => tx.index("area", area))),
       ids: filter?.taskIds === undefined ? undefined : new Set(filter.taskIds),
     };
@@ -378,7 +353,6 @@ export class EvalJobs {
     return this.viewsOf(db, [row], this.refs(db))[0];
   }
 
-  /** Validate rows take `viewWith`; baseline rows take the views of TrialJobs, read once for the page. */
   private viewsOf(db: EvidenceDb, rows: readonly JobRow[], refs: Map<string, string>): EvalJobView[] {
     const baseline = this.baseline?.views(db, rows.filter(row => row.kind !== "validate"));
     return rows.map(row => (row.kind !== "validate" ? baseline?.get(row.job_id) : undefined)
@@ -393,7 +367,6 @@ export class EvalJobs {
     return this.config.projects.find(project => project.id === projectId);
   }
 
-  /** The current digest of a project's validation settings, or undefined when they are incomplete. */
   private pinnedDigest(projectId: string): { settings: ValidationSettings; digest: string } | undefined {
     const project = this.projectOf(projectId);
     if (project === undefined) return undefined;
@@ -402,7 +375,6 @@ export class EvalJobs {
     return { settings: found.settings, digest: jobDigest(found.settings, this.config.eval?.grader) };
   }
 
-  /** Each configured project's reference, mapped back to its id. Built from the config, not from a row. */
   private refs(db: EvidenceDb): Map<string, string> {
     return new Map(this.config.projects.map(project => [db.index("project", project.id), project.id]));
   }
@@ -428,7 +400,6 @@ function viewWith(row: JobRow, projectId: string | null): EvalJobView {
   };
 }
 
-/** Writes the named columns and `updated_at`. The column names are fixed by `JobColumn`. */
 function update(tx: EvidenceTx, jobId: string, at: string, values: JobUpdate): void {
   const entries = Object.entries(values) as [JobColumn, SQLInputValue][];
   const sets = [...entries.map(([column]) => `${column} = ?`), "updated_at = ?"];
@@ -460,7 +431,6 @@ function matches(
   return true;
 }
 
-/** A window is [start, end) in UTC hours; an end below its start crosses midnight. */
 export function inWindow(windows: readonly { startHourUtc: number; endHourUtc: number }[], nowMs: number): boolean {
   const hour = new Date(nowMs).getUTCHours();
   return windows.some(window => window.startHourUtc < window.endHourUtc
@@ -472,7 +442,6 @@ function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-/** Code-unit order, the order SQLite's BINARY collation gives for these ASCII keys. */
 function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }

@@ -41,7 +41,6 @@ const DEFAULT_PROFILE = "default";
 const UNKNOWN_AREA = "(unknown)";
 const UNKNOWN_FEATURE_MAP = "unknown";
 const EVENT_PAGE = 500;
-/** The kinds that can add a row or change a row's disposition. Only these can change a summary's attempts. */
 const ATTEMPT_KINDS: ReadonlySet<string> = new Set([
   "member.started", "member.reported", "member.stopped", "task.integrated", "scout.completed", "task.escalated",
   "run.blocked", "run.revision-advanced",
@@ -59,13 +58,6 @@ type Facts = { projectId: string; goal?: OutcomePayload["goal"]; missionId?: str
 type Features = { area: string; kind: string | null; risk: string; featureVersion: number; featureMap: string };
 type Ctx = { tx: EvidenceTx; store: EvidenceStore; event: RunEvent; log: (line: string) => void };
 
-/**
- * The `outcomes` projector (spec parts 3 and 4). It turns the run events into one row per attempt, one summary per
- * run, and one member result per member without a task. Every rule reads `seq` order and the event's own time, never
- * the clock. Every write is a set or a recount, so a replayed page writes the same rows. No path or text is written:
- * owned and changed paths are compared in memory and dropped. It throws while the configurations module is not ready,
- * so its page rolls back and the cursor waits.
- */
 export function outcomeProjector(store: EvidenceStore, options?: { log?: (line: string) => void }): EventProjector {
   const log = options?.log ?? ((line: string) => console.warn(line));
   return {
@@ -86,16 +78,13 @@ export function outcomeProjector(store: EvidenceStore, options?: { log?: (line: 
   };
 }
 
-/** The kinds a duel run's summary still takes. Every other kind writes an outcome or a member result, which a judge run never has. */
 const DUEL_SUMMARY_KINDS: ReadonlySet<string> = new Set(["run.created", "run.prepared", "run.blocked", "run.revision-advanced", "run.settled", "run.deleted", "ledger.gap"]);
 
-/** One plain-column read by primary key: it runs for every event of every run, so it opens no payload. */
 function duelRun(tx: EvidenceDb, runId: string): boolean {
   return tx.get<{ source: string }>("SELECT source FROM run_summaries WHERE run_id=?", runId)?.source === "duel";
 }
 
 function apply(ctx: Ctx): void {
-  // A judged preference is a model's claim: a duel run keeps its summary and writes no outcome row and no member result.
   if (!DUEL_SUMMARY_KINDS.has(ctx.event.kind) && duelRun(ctx.tx, ctx.event.runId)) return;
   switch (ctx.event.kind) {
     case "run.created": return runCreated(ctx);
@@ -118,7 +107,7 @@ function apply(ctx: Ctx): void {
     case "run.revision-advanced": return revisionAdvanced(ctx);
     case "run.settled": return runSettled(ctx);
     case "ledger.gap": return ledgerGap(ctx);
-    default: return; // run.deleted: the deleteRun hook stamps the rows, and the cursor advances.
+    default: return;
   }
 }
 
@@ -161,7 +150,6 @@ function memberStarted(ctx: Ctx): void {
   const modelName = str(data.model);
   const effort = str(data.effort) ?? null;
   const startedAt = str(data.startedAt) ?? event.at;
-  // An unknown provider has no identity, so its epoch is 0 and the row carries a gap.
   const epoch = provider === undefined
     ? 0
     : epochAt(tx, profileIdentityKey({ provider, model: modelName ?? null, effort }), startedAt);
@@ -175,7 +163,6 @@ function memberStarted(ctx: Ctx): void {
     const predecessor = replacement ? readOutcome(tx, outcomeId(runId, replacement.memberId)) : undefined;
     row.revision = event.revision;
     row.sessionId = sessionId;
-    // A predecessor with no start holds the sentinel 0, and its replacement is still the second attempt.
     row.attemptIndex = replacement ? (predecessor ? Math.max(predecessor.attemptIndex, 1) + 1 : 2) : 1;
     row.inherited = replacement !== undefined;
     row.profileId = profileId;
@@ -234,7 +221,6 @@ function memberReported(ctx: Ctx): void {
   if (isRowRole(role)) {
     const row = readOutcome(tx, outcomeId(event.runId, memberId)) ?? sentinelRow(ctx, memberId, role);
     const next = kind === undefined ? undefined : reportDisposition(kind);
-    // A question or a blocker ends the attempt at its report, unless a halt's stop already ended it.
     if (next !== undefined && replaces(row.disposition, next)) {
       row.disposition = next;
       row.endedAt ??= event.at;
@@ -243,7 +229,6 @@ function memberReported(ctx: Ctx): void {
     return;
   }
   const result = readMemberResult(tx, outcomeId(event.runId, memberId)) ?? sentinelResult(ctx, memberId, role);
-  // As for a row, a report that is read after a halt's stop was written before it, and still stands.
   if (result.disposition === "open" || result.disposition === "host-stop" || result.disposition === "owner-stop") {
     result.disposition = "reported";
     result.reportKind = kind ?? null;
@@ -283,7 +268,6 @@ function taskIntegrated(ctx: Ctx): void {
   const data = event.data;
   const row = readOutcome(tx, outcomeId(event.runId, memberId)) ?? sentinelRow(ctx, memberId, "implementer");
   if (replaces(row.disposition, "integrated")) {
-    // A stored acceptance belongs to an integration. Only a review of this integration sets it.
     if (row.disposition !== "integrated") row.acceptance = null;
     row.disposition = "integrated";
     row.endedAt = event.at;
@@ -295,7 +279,6 @@ function taskIntegrated(ctx: Ctx): void {
   const gauge = integrationOf(data.integration);
   if (gauge) row.payload.integration = gauge;
   else delete row.payload.integration;
-  // An integration with no commit changed nothing, so the attempt is an empty result.
   if (str(data.commit) === undefined) row.flags = withFlag(row.flags, "empty-result");
   saveOutcomeRow(tx, row);
   const summary = ensureSummary(tx, event);
@@ -335,7 +318,6 @@ function reviewRecorded(ctx: Ctx): void {
   const base = str(data.baseCommit);
   const summary = ensureSummary(tx, event);
   if (head !== undefined) {
-    // The reviewed head, its tree, and its approval are one fact: a tree of another head does not stand.
     if (summary.payload.reviewedHead !== head) delete summary.payload.reviewedTree;
     summary.payload.reviewedHead = head;
   }
@@ -405,7 +387,6 @@ function repairIntegrated(ctx: Ctx): void {
     if (link.state !== "pending") continue;
     const row = readOutcome(tx, link.outcome_id);
     if (!row) continue;
-    // A row with another base is not in this round's scope. Without a commit, nothing is left to answer.
     const otherBase = base !== undefined && row.payload.baseCommit !== base;
     if (commit === undefined || otherBase) {
       setLink(tx, row.outcomeId, event.runId, event.revision, round, "clear");
@@ -414,7 +395,6 @@ function repairIntegrated(ctx: Ctx): void {
   }
   for (const id of touched) saveOutcomeRow(tx, readOutcome(tx, id)!);
   setRoundState(tx, event, round, commit === undefined ? "resolved" : "answered");
-  // A late answer after the settle still corrects the summary's rounds, as a path event does.
   const summary = readSummary(tx, event.runId);
   if (summary) {
     summary.payload.rounds = roundTotals(tx, event.runId);
@@ -441,7 +421,6 @@ function repairPaths(ctx: Ctx): void {
   }
   for (const id of touched) saveOutcomeRow(tx, readOutcome(tx, id)!);
   setRoundState(tx, event, round, changed === "omitted" ? "unknown" : "resolved");
-  // A path event after the settle still corrects the summary's rounds.
   const summary = readSummary(tx, event.runId);
   if (summary) {
     summary.payload.rounds = roundTotals(tx, event.runId);
@@ -449,11 +428,6 @@ function repairPaths(ctx: Ctx): void {
   }
 }
 
-/**
- * The run's rounds, counted per round. A round is attributed when one of its links is attributed; else unknown when
- * its state is not resolved or one of its links is pending or unknown; else unattributed, which includes a resolved
- * round with no link.
- */
 function roundTotals(tx: EvidenceDb, runId: string): RunSummaryPayload["rounds"] {
   const rounds = tx.all<{ revision: number; round: number; state: string }>(
     "SELECT revision, round, state FROM outcome_rounds WHERE run_id=?",
@@ -491,7 +465,6 @@ function ratingRecorded(ctx: Ctx): void {
   const memberId = event.memberId;
   const score = num(event.data.score);
   if (memberId === undefined || score === undefined) return;
-  // A rating never makes a row: a run that predates emission is backfilled later, and must not be shadowed.
   const row = readOutcome(tx, outcomeId(event.runId, memberId));
   if (!row) return;
   const current = row.payload.ownerRating;
@@ -527,16 +500,11 @@ function revisionAdvanced(ctx: Ctx): void {
   summary.revision = event.revision;
   if (event.data.baseChanged === true) delete summary.payload.currentBase;
   writeSummary(tx, summary);
-  // A recovery names the attempt that caused it, so the attempt takes the same disposition as a block.
   const code = str(event.data.sourceCode);
   const source = str(event.data.sourceMemberId);
   if (code !== undefined && source !== undefined) applyBlock(ctx, source, code);
 }
 
-/**
- * Freezes the integrated rows the first time they settle. A later late fact still resolves their links, because
- * the rounds predate the freeze. Totals are recounted from the rows, so a replay gives the same summary.
- */
 function runSettled(ctx: Ctx): void {
   const { tx, event } = ctx;
   const status = str(event.data.status) ?? null;
@@ -548,7 +516,6 @@ function runSettled(ctx: Ctx): void {
   for (const row of runOutcomes(tx, event.runId)) {
     if (row.disposition !== "integrated" || row.frozenAt !== null) continue;
     row.frozenAt = event.at;
-    // The backfill never claims a refusal for an integrated row, and a freeze adds none.
     if (!row.flags.includes("backfilled")) {
       row.acceptance = freezeAccepted(row.acceptance ?? null, row.payload.lastReview, status ?? "");
     }
@@ -557,7 +524,6 @@ function runSettled(ctx: Ctx): void {
   const rows = runOutcomes(tx, event.runId);
   summary.payload.attempts = attemptsOf(rows);
   summary.payload.rounds = roundTotals(tx, event.runId);
-  // A block code names the block that stopped the run. A run that settles without one keeps no code.
   if (status !== "blocked") summary.blockCode = null;
   writeSummary(tx, summary);
   const integrated = rows.filter(row => row.revision === event.revision && row.disposition === "integrated").length;
@@ -572,10 +538,6 @@ function attemptsOf(rows: readonly OutcomeRow[]): Partial<Record<Disposition, nu
   return attempts;
 }
 
-/**
- * Keeps a settled summary's attempts current. An owner cancel settles the run before the halt loop stops its
- * members, so a row can still change after the settle. The summary is written only when the counts changed.
- */
 function refreshAttempts(tx: EvidenceTx, runId: string): void {
   const summary = readSummary(tx, runId);
   if (!summary || summary.settledAt === null) return;
@@ -604,19 +566,16 @@ function ledgerGap({ tx, event }: Ctx): void {
   }
 }
 
-/** Sets a row's disposition from a block code, when the code names one and the row's precedence allows it. */
 function applyBlock(ctx: Ctx, memberId: string, code: string): void {
   const next: Disposition | undefined = Object.hasOwn(BLOCK_DISPOSITIONS, code) ? BLOCK_DISPOSITIONS[code] : undefined;
   if (next === undefined) return;
   const row = readOutcome(ctx.tx, outcomeId(ctx.event.runId, memberId));
   if (!row || !replaces(row.disposition, next)) return;
   row.disposition = next;
-  // A stop that already ended the attempt keeps its time. An attempt that was still open ends at the block.
   row.endedAt ??= ctx.event.at;
   saveOutcomeRow(ctx.tx, row);
 }
 
-/** The summary of the run. A summary made by any event other than `run.created` carries a gap. */
 function ensureSummary(tx: EvidenceTx, event: RunEvent, created = false): RunSummaryRow {
   const existing = readSummary(tx, event.runId);
   if (existing) return existing;
@@ -636,7 +595,6 @@ function ensureSummary(tx: EvidenceTx, event: RunEvent, created = false): RunSum
   };
 }
 
-/** What a new row or member result copies from its run. A run with no summary yet has a gap. */
 function factsOf(tx: EvidenceDb, event: RunEvent): Facts {
   const summary = readSummary(tx, event.runId);
   if (!summary) return { projectId: UNKNOWN, gap: true, source: "production", experimentRef: null };
@@ -658,7 +616,6 @@ function payloadFacts(facts: Facts): Pick<OutcomePayload, "projectId" | "goal" |
   };
 }
 
-/** A row with no facts yet. Its sentinels and flags hold until a `member.started` fills them. */
 function blankOutcome(ctx: Ctx, memberId: string, role: RowRole, facts: Facts, flags: Flag[]): OutcomeRow {
   return {
     outcomeId: outcomeId(ctx.event.runId, memberId),
@@ -708,7 +665,6 @@ function blankOutcome(ctx: Ctx, memberId: string, role: RowRole, facts: Facts, f
   };
 }
 
-/** A row made by an event other than `member.started`. It carries the sentinels and a gap. */
 function sentinelRow(ctx: Ctx, memberId: string, role: RowRole): OutcomeRow {
   return blankOutcome(ctx, memberId, role, factsOf(ctx.tx, ctx.event), ["gap"]);
 }
@@ -743,7 +699,6 @@ function sentinelResult(ctx: Ctx, memberId: string, role: string): MemberResultR
   return blankResult(ctx, memberId, role, factsOf(ctx.tx, ctx.event), ["gap"]);
 }
 
-/** The features a row takes from its plan (an implementer) or its discovery (a scout), both of the same revision. */
 function startFeatures(ctx: Ctx, role: RowRole): Features | undefined {
   const { event } = ctx;
   if (event.taskId === undefined) return undefined;
@@ -768,7 +723,6 @@ function applyFeatures(row: OutcomeRow, features: Features): void {
   row.payload.featureMap = features.featureMap;
 }
 
-/** The owned paths of an implementer's task, from the plan of the row's revision. Undefined when unknown. */
 function ownedPaths(row: OutcomeRow, planned: RunEvent[]): string[] | undefined {
   if (row.role !== "implementer") return undefined;
   const paths = lastPlanned(planned, row.payload.taskId, row.revision)?.data.paths;
@@ -783,7 +737,6 @@ function lastPlanned(events: RunEvent[], taskId: string | undefined, revision: n
   return found;
 }
 
-/** Every event of the run with one of the kinds, in `seq` order. Pages are read inside the caller's write. */
 function eventsOf(ctx: Ctx, kinds: readonly string[]): RunEvent[] {
   const found: RunEvent[] = [];
   let after = 0;
@@ -866,7 +819,6 @@ function replacementOf(value: unknown): OutcomePayload["replaces"] | undefined {
   return { memberId, cause: cause as ReplacementCause };
 }
 
-/** The configuration identity of `member.configured`, when its `configId` matches its six components. */
 function configIdOf(data: Data): string | undefined {
   const provider = str(data.provider);
   const promptVersion = str(data.promptVersion);

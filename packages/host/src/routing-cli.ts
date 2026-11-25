@@ -6,16 +6,13 @@ type Me = { teams?: { routing?: number; routingAuto?: number; routingPoints?: nu
 type ExplorePause = { projectId: string; explorePausedAt: string | null };
 
 const USAGE = "Usage: infinite routing status PROJECT [--json] | infinite routing explain RUN_ID TASK_ID [--json] | infinite routing pause-explore PROJECT [--json] | infinite routing resume-explore PROJECT [--json]";
-/** The newest decisions the status reads; routing-store.ts caps its project read at this many. */
 export const DECISION_LIMIT = 500;
 export const ROUTING_AUTO_NOTE = "Auto routing applies to runs created after the project's shadow period ends: 14 days and 50 recorded start decisions, whichever is later. infinite routing status PROJECT shows the progress.";
 const ROUTING_VALUE_PRESETS = new Map<string, number>([["cost", 0.5], ["balanced", 2], ["quality", 8]]);
 const clean = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 const money = (value: number) => `$${value.toFixed(2)}`;
-/** Three decimals, as status prints them. A value the host did not compute is printed as unknown, never as zero. */
 const decimal = (value: number | undefined) => value === undefined ? "unknown" : String(Math.round(value * 1000) / 1000);
 
-/** The settings the three --routing options name, checked before any request. Undefined when none is given. */
 export function requestedRouting(options: Options): Record<string, unknown> | undefined {
   if (["--routing", "--routing-value", "--routing-contributor", "--routing-points"].every(name => options[name] === undefined)) return undefined;
   const choice: Record<string, unknown> = {};
@@ -45,7 +42,6 @@ export function requestedRouting(options: Options): Record<string, unknown> | un
   return choice;
 }
 
-/** The host support checks for the routing options, run before any request. */
 export function assertRoutingSupport(choice: Record<string, unknown> | undefined, me: Me): void {
   if (choice && me.teams?.routing !== 1) throw new Error("This host does not support routing settings. Upgrade the host before using --routing.");
   if (choice?.mode === "auto" && me.teams?.routingAuto !== 1) throw new Error("This host does not support auto routing. Upgrade the host before using --routing auto.");
@@ -61,16 +57,13 @@ function profileLine(profile: StatusProfile): string {
   return `  ${name}  mean ${profile.mean} [${profile.interval[0]}, ${profile.interval[1]}] · rescue ${profile.rescue} · rows production ${profile.rows.production}, duel ${profile.rows.duel} · ${earlier} · level ${clean(profile.level)} · ${money(profile.costUsd)}${profile.greedy ? " · greedy" : ""}`;
 }
 
-/** The status of one project, in the order the plan fixes. Every text value passes through `clean`. */
 export function routingStatusLines(status: RoutingStatus): string[] {
   const lines: string[] = [];
   const auto = status.mode === "auto";
   if (status.mode === "off") lines.push(`${clean(status.projectId)} · routing off`);
   else if (auto) lines.push(`${clean(status.projectId)} · routing auto (${status.modeSource === "saved" ? "saved" : "autonomous default"})`);
   else {
-    // The autonomous default, also a saved policy without a mode, starts auto once its period ends; this line says so.
     const source = status.modeSource === "saved" ? "saved" : "autonomous default";
-    // Without an implementer that passes the fixed rules, a saved auto refuses new runs and the default stays shadow.
     const starts = status.covers.start ? ": auto starts after the shadow period" : "";
     const requested = status.modeSource === "saved" && status.requested === "auto" ? ` · requested auto${starts}`
       : status.modeSource === "autonomous-default" && status.covers.start ? " · auto starts after the shadow period" : "";
@@ -90,7 +83,6 @@ export function routingStatusLines(status: RoutingStatus): string[] {
     : `Shadow, last ${shadow.windowDays} days: ${shadow.decisions} decisions; the router matched the coordinator in ${shadow.agreements} of ${shadow.withCoordinator}${capped}`);
   const period = status.period;
   if (period.endedAt) {
-    // Only a saved shadow needs the owner to ask for auto; the autonomous default starts it on its own.
     const needs = status.modeSource === "saved" && status.requested === "shadow" ? " Auto routing needs --routing auto." : "";
     lines.push(`Shadow period: ended ${clean(period.endedAt)}.${needs}`);
   } else {
@@ -137,7 +129,6 @@ function candidateLine(candidate: CandidateRecord): string {
   return `  ${name}  mean ${decimal(candidate.thetaMean)} · deviation ${decimal(candidate.thetaSd)} · rescue ${decimal(candidate.phiMean)} · cost ${cost} · greedy utility ${decimal(candidate.greedyUtility)} · sample ${decimal(candidate.sample)} · sampled utility ${decimal(candidate.sampledUtility)}${fallback}`;
 }
 
-/** The start decisions of one task, per decision: its header, its choice, its seed, and one line per candidate. */
 export function routingExplainLines(explain: RoutingExplain): string[] {
   return explain.decisions.flatMap(decision => {
     const lines = [
@@ -153,7 +144,6 @@ export function routingExplainLines(explain: RoutingExplain): string[] {
   });
 }
 
-/** Maps the host's fixed error answers to the plan's sentences. Other failures pass through unchanged. */
 async function read<T>(call: () => Promise<T>): Promise<T> {
   try {
     return await call();
@@ -173,7 +163,6 @@ export async function handleRoutingClientCommand(positional: string[], options: 
   const explain = verb === "explain" && positional.length === 3;
   const exploration = (verb === "pause-explore" || verb === "resume-explore") && positional.length === 2;
   if (!status && !explain && !exploration) throw new Error(USAGE);
-  // Checked before the route, so an older host answers with the upgrade sentence instead of a 404.
   const me = await api.json<Me>("/me");
   if (me.teams?.routing !== 1) throw new Error("This host does not record routing decisions. Upgrade the host first.");
   const json = options["--json"] === true;

@@ -23,7 +23,6 @@ import { TeamError } from "./team-workspace.js";
 
 export type { ObjectiveUnavailable } from "./objective-record.js";
 
-/** A goal's sealed record holder: the goal, the stored objective record, and the reason its last read failed. */
 export type GoalHolder = { goal: ProductGoal; objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable };
 export type GoalObjectiveResult = "built" | "synced" | "unchanged" | ObjectiveUnavailable;
 
@@ -35,18 +34,12 @@ export const GOAL_OBJECTIVE_EVENTS: Record<ObjectiveUnavailable, string> = {
 
 const ownerOf = (goal: ProductGoal) => ({ kind: "goal" as const, goalId: goal.id });
 
-/** Stores a built record, or reports why none could be built. A result other than a record leaves the holder unchanged. */
 function store(holder: GoalHolder, built: ObjectiveRecord | "source-invalid", result: "built"): GoalObjectiveResult {
   if (built === "source-invalid") return "source-invalid";
   holder.objectiveRecord = built;
   return result;
 }
 
-/**
- * Builds the goal's first record, then adds the creation criteria as version 1's `criterion.added` entries. A refusal
- * throws its own code. Any other failure throws `objective-op-refused`, so no criterion is ever dropped silently.
- * Used by `GoalService.create`, which stores nothing when this throws.
- */
 export function createGoalObjective(holder: GoalHolder, at: string, criteria?: { inputs: readonly CriterionInput[]; context: OwnerOpContext }): GoalObjectiveResult {
   const built = goalRecord(holder.goal, at, "created");
   if (criteria !== undefined && built === "source-invalid") throw objectiveError("objective-source-invalid");
@@ -60,7 +53,6 @@ export function createGoalObjective(holder: GoalHolder, at: string, criteria?: {
   return store(holder, record, "built");
 }
 
-/** Builds a missing record at load, or copies missing directions into an existing one. Never throws. */
 export function loadGoalObjective(holder: GoalHolder, at: string): GoalObjectiveResult {
   const state = readStoredRecord(holder.objectiveRecord, ownerOf(holder.goal));
   if (state.kind === "unavailable") return state.reason;
@@ -72,7 +64,6 @@ export function loadGoalObjective(holder: GoalHolder, at: string): GoalObjective
   return "synced";
 }
 
-/** Adds the newest steering entry as the owner's direction, then copies any other missing ones. Never throws. */
 export function steerGoalObjective(holder: GoalHolder, requestId: string, at: string): GoalObjectiveResult {
   const newest = holder.goal.steering.at(-1);
   const live: LiveDirection | undefined = newest ? { revision: newest.revision, handle: requestId } : undefined;
@@ -86,11 +77,6 @@ export function steerGoalObjective(holder: GoalHolder, requestId: string, at: st
   return "synced";
 }
 
-/**
- * A goal's record for the intent check. `read` answers the held record's state, and `absent` for a goal not held. `write`
- * checks the held version, sets the held object's record in place, and saves the holder; a failed save restores the
- * previous record and rethrows. It writes no goal event.
- */
 export function goalRecordPort(holderOf: (goalId: string) => GoalHolder | undefined, save: (holder: GoalHolder) => void): GoalRecordPort {
   return {
     read(goalId) {
@@ -112,12 +98,10 @@ export function goalRecordPort(holderOf: (goalId: string) => GoalHolder | undefi
   };
 }
 
-/** The event text to add once for this result, or undefined. */
 export function goalObjectiveNote(holder: GoalHolder, result: GoalObjectiveResult): string | undefined {
   return noticeFor(holder, result, GOAL_OBJECTIVE_EVENTS);
 }
 
-/** The goal's record at `version` (default: the latest). Throws objectiveError; reads touch memory only. */
 export function goalObjectiveView(holder: GoalHolder, version?: number): ObjectiveRecordView {
   const state = readStoredRecord(holder.objectiveRecord, ownerOf(holder.goal));
   if (state.kind === "ready") return recordView(state.record, version);
@@ -125,11 +109,6 @@ export function goalObjectiveView(holder: GoalHolder, version?: number): Objecti
   throw objectiveError(holder.objectiveNotice === "source-invalid" ? "objective-source-invalid" : "objective-record-absent");
 }
 
-/**
- * Applies a correction to the holder's record and returns the corrected record. It stores nothing: the caller saves
- * the result with its receipt and event, so a failed write leaves the holder as it was. One parse of the stored
- * record, then the result is checked against the schema. Throws objectiveError.
- */
 export function correctGoalObjective(holder: GoalHolder, correction: Correction, context: OwnerOpContext): ObjectiveRecord {
   const state = readStoredRecord(holder.objectiveRecord, ownerOf(holder.goal));
   if (state.kind === "unavailable") throw objectiveError(state.reason === "record-newer" ? "objective-record-newer" : "objective-record-invalid");
@@ -137,16 +116,11 @@ export function correctGoalObjective(holder: GoalHolder, correction: Correction,
   return applyOwnerOps(state.record, correction, context);
 }
 
-/**
- * Refuses a correction that the project's switches do not allow: criterion ops need objective prompts on, and register
- * ops need the register on. Throws objectiveError before anything is applied.
- */
 export function correctionGate(project: Pick<Project, "team"> | undefined, correction: Pick<Correction, "ops">): void {
   if (correction.ops.some(op => !REGISTER_OP_NAMES.has(op.op)) && !objectivePromptsOn(project)) throw objectiveError("objective-prompts-off");
   if (correction.ops.some(op => REGISTER_OP_NAMES.has(op.op)) && !objectiveRegisterOn(project)) throw objectiveError("objective-register-off");
 }
 
-/** latestReviewed(goal.cycles)'s headCommit and cycle number, or undefined when there is none or it has no head. */
 export function ratingStamp(goal: Pick<ProductGoal, "cycles">): { commit: string; cycle: number } | undefined {
   const reviewed = latestReviewed(goal.cycles);
   return reviewed?.headCommit === undefined ? undefined : { commit: reviewed.headCommit, cycle: reviewed.cycle };
@@ -161,13 +135,6 @@ export const GOAL_DIGEST_RESTORED = "The active criteria reach this cycle's memb
 
 const DIGEST_TEXTS = new Set<string>([...Object.values(GOAL_DIGEST_EVENTS), GOAL_DIGEST_RESTORED]);
 
-/**
- * The event a cycle adds for its digest, or undefined. The newest digest event of `events` decides: a skip is added
- * unless it is the newest, and a digest is announced as restored only when it follows a skip. No persisted field.
- * With the switch off (`pinned` undefined) nothing is added.
- * It compares with the visible event list, which keeps its newest 200 events. Once the newest digest event has left that
- * list, the next skip is told again and a recovery is not announced, which keeps the visible list truthful.
- */
 export function digestEvent(events: readonly { text: string }[], pinned: GoalDigestResult | undefined): string | undefined {
   if (pinned === undefined) return undefined;
   const newest = [...events].reverse().find(event => DIGEST_TEXTS.has(event.text))?.text;
@@ -175,11 +142,6 @@ export function digestEvent(events: readonly { text: string }[], pinned: GoalDig
   return newest !== undefined && Object.values(GOAL_DIGEST_EVENTS).includes(newest) ? GOAL_DIGEST_RESTORED : undefined;
 }
 
-/**
- * The digest of the holder's latest record, for one cycle's goal context. One parse of the record. A digest that is
- * too large, or that the full digest schema refuses, is skipped with its reason; the record is never changed.
- * Today's digest; with `register`, it gains registerDigestFor(record) before the schema parse.
- */
 export function goalRecordDigest(holder: GoalHolder, configured: readonly TeamCommand[], register?: boolean): GoalDigestResult {
   const state = readStoredRecord(holder.objectiveRecord, ownerOf(holder.goal));
   if (state.kind !== "ready") return { skipped: "record-unavailable" };

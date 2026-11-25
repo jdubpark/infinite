@@ -22,7 +22,6 @@ import type { Config } from "./types.js";
 export const SUMMARY_AREAS_MAX = 64, SUMMARY_JOBS = 10, COVERAGE_DAYS_MAX = 730;
 const DAY_MS = 86_400_000;
 const ORIGINS: readonly EvalOrigin[] = ["captured", "mined"];
-/** The area names the feature map does not define, which the host always knows. */
 const BUILT_IN_AREAS = ["mixed", "root"] as const;
 const OTHER_AREA = "other";
 
@@ -38,23 +37,14 @@ export type SummaryInput = {
   project: Project;
   mining: MiningStatus;
   grader: GraderState;
-  /** The grader's launcher version, or null until a probe answered one. */
   graderVersion: number | null;
   evalIdentity: EvalIdentityState;
-  /** The last probe, shown when the state is `unavailable` because the probe aged out. */
   evalIdentityLastProbe?: { state: EvalIdentityState; at: string } | null;
-  /** Trials the project started today (`trialsSince`), and the cap the project sets (null when `trialsPerDay` is absent). */
   trials: { today: number; dailyCap: number | null };
-  /** The project's newest jobs, as `EvalJobs.projectJobs` returns them. */
   jobs: EvalJobView[];
   now: string;
 };
 
-/**
- * The corpus summary of one project: counts by state and origin, the areas of candidate and valid rows, the group stats,
- * the coverage, and the grader's state. Reads six indexed statements and one outcome read; opens no sealed payload.
- * Throws `EvidenceError` `unavailable` when the corpus module or the store is not available.
- */
 export function evalSummary(store: EvidenceStore, input: SummaryInput): EvalSummary {
   if (store.status().modules[EVAL_MODULE] !== "ready") {
     throw new EvidenceError("unavailable", "The eval corpus is unavailable.");
@@ -95,7 +85,6 @@ export function evalSummary(store: EvidenceStore, input: SummaryInput): EvalSumm
   };
 }
 
-/** Counts by origin and state. A state with no row is 0: a count over existing rows is a fact. */
 function tasksOf(rows: readonly StateRow[]): { byState: Record<EvalState, number>; byOrigin: Record<EvalOrigin, Record<EvalState, number>> } {
   const byOrigin = { captured: zeros(), mined: zeros() } as Record<EvalOrigin, Record<EvalState, number>>;
   for (const row of rows) {
@@ -108,10 +97,6 @@ function tasksOf(rows: readonly StateRow[]): { byState: Record<EvalState, number
   return { byState, byOrigin };
 }
 
-/**
- * Candidate and valid rows by area. A reference maps to a feature-map area, `mixed`, or `root`; any other reference counts
- * under `other`. Past SUMMARY_AREAS_MAX names, the names after the first 63 count under `other`.
- */
 function areaCounts(db: EvidenceDb, ref: string, project: Project): { area: string; candidate: number; valid: number }[] {
   const names = new Map<string, string>();
   for (const area of project.team?.features?.areas ?? []) names.set(db.index("area", area.id), area.id);
@@ -139,10 +124,6 @@ function areaCounts(db: EvidenceDb, ref: string, project: Project): { area: stri
   return [...folded.entries()].sort(([a], [b]) => compareText(a, b)).map(([area, total]) => ({ area, ...total }));
 }
 
-/**
- * The share of accepted attempts that a valid captured task stands for. Null when the ledger is not ready, when a read
- * was unreadable, or when no attempt is accepted: unknown is never a number.
- */
 function coverageOf(
   store: EvidenceStore,
   project: Project,
@@ -164,7 +145,6 @@ function zeros(): Record<EvalState, number> {
   return { captured: 0, candidate: 0, valid: 0, rejected: 0, retired: 0 };
 }
 
-/** Code-unit order, the order SQLite's BINARY collation gives for these keys. */
 function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }

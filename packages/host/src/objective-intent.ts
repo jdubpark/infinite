@@ -22,7 +22,6 @@ import { RECORD_DIGEST_BYTES, recordDigestBytes, teamCommandSchema } from "./tea
 import type { TeamCommand } from "./team-types.js";
 import { TeamError } from "./team-workspace.js";
 
-/** The owner's answer that takes the stated defaults. Any other text is a direction. */
 export const INTENT_DEFAULTS_ANSWER = "Use the stated defaults";
 export type IntentMode = "autonomous" | "supervised";
 export type IntentDrop = "shape" | "secret" | "cap" | "quote" | "command";
@@ -40,8 +39,6 @@ export type IntentApplied = {
   added: { assumptions: string[]; questions: string[]; criteria: string[] }; dropped: Record<IntentDrop, number>; converted: number;
   ignored: { criteria: number; outOfScope: number };
 };
-/** A goal's record in GoalService's memory (Task 10). `write` throws objectiveError("objective-version-stale") when the held version differs,
- *  and rethrows a failed save after restoring the record. */
 export type GoalRecordPort = {
   read(goalId: string): ObjectiveState;
   write(goalId: string, expectedVersion: number, next: ObjectiveRecord): void;
@@ -56,7 +53,6 @@ const L = OBJECTIVE_LIMITS;
 const NO_OWN = { token: "", url: "" };
 const SUMMARY_WITHHELD = "Summary withheld: it matched a secret shape.";
 const DIRECTION_REF = "record:direction:";
-/** Steering keeps 20 directions. An answer appends one only while the record holds fewer than this. */
 const ANSWER_DIRECTIONS_BELOW = 20;
 const DECISION_LINE_CHARS = 440;
 const DECISION_CHARS = 4_000;
@@ -66,7 +62,6 @@ const bytesOf = (value: string): number => Buffer.byteLength(value, "utf8");
 const noDrops = (): Record<IntentDrop, number> => ({ shape: 0, secret: 0, cap: 0, quote: 0, command: 0 });
 const digestOf = (value: unknown): string => createHash("sha256").update(canonicalJson(JSON.parse(JSON.stringify(value)))).digest("hex");
 
-/** Cuts text to `max` characters, the last three of them "..." when it is cut. Characters are code points. */
 function cut(text: string, max: number): string {
   const chars = Array.from(text);
   return chars.length <= max ? text : `${chars.slice(0, max - 3).join("")}...`;
@@ -92,8 +87,6 @@ function withoutDecision(question: Question): Question {
   return next;
 }
 
-/** The test a report names, as the record stores it. A command must be a configured check; any other test must pass the record's schema. */
-/** The verdict on one assumption test. `testOf` is the only rule for a command test. */
 export type TestVerdict = Verdict<AssumptionTest, "shape" | "command">;
 
 export function testOf(test: unknown, configured: readonly TeamCommand[]): TestVerdict {
@@ -108,7 +101,6 @@ export function testOf(test: unknown, configured: readonly TeamCommand[]): TestV
   return parsed.success ? { ok: true, value: parsed.data } : { ok: false, drop: "shape" };
 }
 
-/** A derived criterion's text: the quote it derives from, and the criterion without it. */
 function splitDerived(raw: unknown): { derivedFrom: string; rest: Record<string, unknown> } | undefined {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
   const { derivedFrom, ...rest } = raw as Record<string, unknown>;
@@ -116,7 +108,6 @@ function splitDerived(raw: unknown): { derivedFrom: string; rest: Record<string,
   return { derivedFrom, rest };
 }
 
-/** A derived criterion's shape, secret scan, quote, and command, in that order. */
 function criterionVerdict(raw: unknown, statement: IntentStatement | undefined, configured: readonly TeamCommand[]): Verdict<{ input: CriterionInput; derivedFrom: string }> {
   const split = splitDerived(raw);
   const parsed = split ? criterionInputSchema.safeParse(split.rest) : undefined;
@@ -133,9 +124,6 @@ function criterionVerdict(raw: unknown, statement: IntentStatement | undefined, 
   return { ok: true, value: { input: parsed.data, derivedFrom: split.derivedFrom } };
 }
 
-/** The report minus every item and criterion that fails shape, secret, command, or quote, and minus secret-shaped outOfScope ids;
- *  a secret-shaped summary becomes "Summary withheld: it matched a secret shape.". Without a statement every criterion drops as quote.
- *  Idempotent: screening a kept report drops nothing. */
 export function screenIntentReport(report: IntentCheckReport, input: { statement?: IntentStatement; configured: readonly TeamCommand[] }): {
   kept: IntentCheckReport; dropped: Record<IntentScreenDrop, number>;
 } {
@@ -179,7 +167,6 @@ export function screenIntentReport(report: IntentCheckReport, input: { statement
   return { kept, dropped };
 }
 
-/** The questions that wait on `decisionId`, as a decision. Built from the record alone, so a restart rebuilds the same decision. */
 function decisionFrom(record: ObjectiveRecord, decisionId: string): IntentDecision | undefined {
   const waiting = record.questions.filter(item => item.waits && item.decisionId === decisionId);
   if (waiting.length === 0) return undefined;
@@ -197,17 +184,14 @@ function decisionFrom(record: ObjectiveRecord, decisionId: string): IntentDecisi
   };
 }
 
-/** The blocking question for the questions that wait on `decisionId`, built from the record alone; undefined when none waits. */
 export function intentDecision(record: ObjectiveRecord, decisionId: string): IntentDecision | undefined {
   return decisionFrom(record, decisionId);
 }
 
-/** The `intent-check.applied` entry whose handle is this checker. */
 export function intentApplied(record: ObjectiveRecord, checkerMemberId: string): LogEntry | undefined {
   return record.log.find(entry => entry.op === INTENT_OPS.applied && entry.handle === checkerMemberId);
 }
 
-/** No applied entry carries `statementDigest`, or the latest one differs from the current statement's. */
 export function criteriaDue(record: ObjectiveRecord): boolean {
   for (let index = record.log.length - 1; index >= 0; index -= 1) {
     const entry = record.log[index]!;
@@ -218,13 +202,11 @@ export function criteriaDue(record: ObjectiveRecord): boolean {
   return true;
 }
 
-/** Working state of one apply: the arrays it changes, and the environment every step reads. */
 type Draft = { assumptions: Assumption[]; questions: Question[]; criteria: Criterion[] };
 type Effect = { converted: boolean; capQuestion: boolean; closed?: string; added: Partial<Record<keyof Added, string>> };
 type Step = { ok: true; draft: Draft; effect: Effect } | { ok: false; drop: IntentDrop };
 type Env = { base: ObjectiveRecord; mode: IntentMode; decisionId: string; configured: readonly TeamCommand[]; original: Map<string, Question> };
 
-/** The record's capped bytes with a draft's arrays. A draft over 32 KiB is a cap refusal. */
 function fits(draft: Draft, env: Env): boolean {
   return cappedBytes({ ...env.base, assumptions: draft.assumptions, questions: draft.questions, criteria: draft.criteria }) <= L.cappedBytes;
 }
@@ -235,7 +217,6 @@ function questionTextOf(item: IntentItem, question: NonNullable<IntentItem["ques
   return `${item.dimension}: ${question.text}${options}${tail}`;
 }
 
-/** One report item on a draft. A converted ask is assumed with no question; a remaining ask opens one, which waits in supervised mode. */
 function addItem(draft: Draft, item: IntentItem, env: Env): Step {
   const verdict = testOf(item.assumption.test, env.configured);
   if (!verdict.ok) return { ok: false, drop: verdict.drop };
@@ -255,7 +236,6 @@ function addItem(draft: Draft, item: IntentItem, env: Env): Step {
     const waits = env.mode === "supervised" || question.interrupt !== undefined;
     let opens = true;
     if (questions.filter(item => item.state === "open").length >= L.openQuestions) {
-      // The oldest open question that does not wait closes. Only a question of the record before this apply may close.
       const candidate = questions.find(item => item.state === "open" && !item.waits && env.original.has(item.id));
       if (candidate !== undefined) {
         questions = questions.map(item => (item.id === candidate.id ? { ...item, state: "default-kept" as const } : item));
@@ -293,7 +273,6 @@ function addItem(draft: Draft, item: IntentItem, env: Env): Step {
   return { ok: true, draft: next, effect };
 }
 
-/** One derived criterion on a draft: active and digest caps, then the record's own bytes. */
 function addCriterion(draft: Draft, input: CriterionInput, derivedFrom: string, env: Env): Step {
   if (draft.criteria.filter(item => item.state === "active").length >= L.activeCriteria || draft.criteria.length >= L.criteria) {
     return { ok: false, drop: "cap" };
@@ -311,8 +290,6 @@ function addCriterion(draft: Draft, input: CriterionInput, derivedFrom: string, 
   return { ok: true, draft: next, effect: { converted: false, capQuestion: false, added: { criteria: criterion.id } } };
 }
 
-/** One version up and one `intent-check.applied` entry. A bad item is dropped and counted, never thrown.
- *  Throws objectiveError("objective-log-full") past CORRECTION_LOG, and objectiveError("objective-op-refused") when the result fails objectiveRecordSchema. */
 export function applyIntentReport(record: ObjectiveRecord, report: IntentCheckReport, context: IntentApplyContext): IntentApplied {
   const statement = statementOf(record);
   const screened = screenIntentReport(report, { statement, configured: context.configured });
@@ -412,9 +389,6 @@ export function applyIntentReport(record: ObjectiveRecord, report: IntentCheckRe
   return { record: next, decision: decisionFrom(next, context.decisionId), added, dropped, converted, ignored };
 }
 
-/** The owner's answer to the questions waiting on `decisionId`; each stops waiting and drops decisionId. One version up, one `intent-check.answered` entry.
- *  Undefined when none waits, so a replayed answer writes nothing (R9). The defaults text keeps defaults only when the decision offers it.
- *  Throws objectiveError("objective-log-full"). */
 export function answerIntentQuestions(record: ObjectiveRecord, answer: { decisionId: string; runId: string; text: string; at: string }): ObjectiveRecord | undefined {
   if (answer.text.length < 1 || answer.text.length > L.directionChars) throw objectiveError("objective-op-invalid");
   const decision = decisionFrom(record, answer.decisionId);
@@ -452,7 +426,6 @@ export function answerIntentQuestions(record: ObjectiveRecord, answer: { decisio
   return sealRecord(record, { questions, statement: { ...record.statement, directions } }, [entry]);
 }
 
-/** The questions waiting on `decisionId` stop waiting; undefined when none waits. One version up, one `intent-check.released` entry. Throws objectiveError("objective-log-full"). */
 export function releaseIntentQuestions(record: ObjectiveRecord, input: { decisionId: string; runId: string; cause: IntentReleaseCause; at: string }): ObjectiveRecord | undefined {
   const waiting = record.questions.filter(item => item.waits && item.decisionId === input.decisionId);
   if (waiting.length === 0) return undefined;
@@ -474,7 +447,6 @@ export function releaseIntentQuestions(record: ObjectiveRecord, input: { decisio
   return sealRecord(record, { questions }, [entry]);
 }
 
-/** One `intent-check.skipped` entry at the current version; the body is unchanged. Undefined when the log has no room. */
 export function skipIntentCheck(record: ObjectiveRecord, input: { runId: string; revision: number; reason: IntentSkipReason; at: string }): ObjectiveRecord | undefined {
   const entry: LogEntry = {
     seq: nextSeq(record),

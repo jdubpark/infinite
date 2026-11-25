@@ -1,18 +1,10 @@
 import { HOST_REJECT_CODES } from "../permission-policy.js";
 import type { EvidenceDb } from "./types.js";
 
-/** The permission journal's tables that the count reads, by name. */
 export type RepeatCountTables = { decisions: string; controls: string; inputSeals: string };
 
 type Row = { seq: number; id: string; input_sealed: string };
 
-/**
- * How many raised requests of the assignment repeated the reject since the latest unlock of the assignment or reopen
- * of the reject. The agent repeats a reject by raising a request. A request that the host decided again was raised
- * once, so its decisions count once, at the first of them: a request counted before a reset does not count again
- * after it. The request that got the reject is no repeat of it. A decision with no request digest counts on its own,
- * as every decision did before the digest existed.
- */
 export function raisedRepeatCount(db: EvidenceDb, tables: RepeatCountTables, assignment: string, rejectId: string): number {
   const repeats = db.all<Row>(
     `SELECT seq,id,input_sealed FROM ${tables.decisions} WHERE assignment=? AND repeats=? AND `
@@ -20,7 +12,6 @@ export function raisedRepeatCount(db: EvidenceDb, tables: RepeatCountTables, ass
     assignment, rejectId, ...HOST_REJECT_CODES,
   );
   if (repeats.length === 0) return 0;
-  // Decisions and owner controls take their sequence from one counter, and that sequence is the journal's order.
   const reset = db.get<{ seq: number | null }>(
     `SELECT MAX(seq) AS seq FROM ${tables.controls} WHERE (kind='unlock' AND assignment=?) OR (kind='reopen' AND decision_id=?)`,
     assignment, rejectId,
@@ -42,7 +33,6 @@ export function raisedRepeatCount(db: EvidenceDb, tables: RepeatCountTables, ass
   return count;
 }
 
-/** The request digest in a decision's sealed copy. A copy that cannot be read gives none, so the decision counts. */
 function requestDigestOf(db: EvidenceDb, inputSeals: string, row: Row): string | undefined {
   try {
     const digest = (JSON.parse(db.open<string>(inputSeals, row.id, row.input_sealed)) as { requestDigest?: unknown }).requestDigest;

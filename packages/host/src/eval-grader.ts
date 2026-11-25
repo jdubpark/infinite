@@ -15,9 +15,7 @@ export type GraderRun = { exitCode: number | null; timedOut: boolean; stdout?: B
 export interface Grader {
   probe(canaries: readonly string[]): Promise<GraderProbe>;
   receive(job: string, name: GraderInput, input: Readable | Buffer, maxBytes: number): Promise<"stored" | "too-large" | "failed">;
-  /** Streams the trial branch's bundle into `sink`. Past `maxBytes` the stream is destroyed and nothing more is written. */
   export(job: string, sink: Writable, maxBytes: number): Promise<"exported" | "too-large" | "failed">;
-  /** `stdout` is kept, at most 64 KiB, only when `keepStdout` is true. `input` goes to the child's stdin. */
   run(job: string, dir: GraderDir, seconds: number, argv: readonly string[], options?: { input?: Buffer; keepStdout?: boolean }): Promise<GraderRun>;
   read(job: string, report: string, maxBytes: number): Promise<{ state: "read"; bytes: Buffer } | { state: "missing" | "too-large" | "failed" }>;
   digest(job: string): Promise<{ state: "read"; sha256: string } | { state: "missing" | "failed" }>;
@@ -29,11 +27,9 @@ export interface Grader {
 const JOB_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const REPORT_RE = /^reports\/round-[1-6]\.(xml|tap)$/;
 const DIGEST_RE = /^[0-9a-f]{64}\n?$/;
-/** Launcher time limits, in seconds. A round's clones and installed dependencies can hold hundreds of thousands of files, so `clean` and `remove` get the longer limit. */
 export const READ_SECONDS = 30, STOP_SECONDS = 30, RECEIVE_SECONDS = 600, DIGEST_SECONDS = 600, CLEAN_SECONDS = 600;
 export const EXPORT_SECONDS = 600;
 const LAUNCHER_SECONDS = STOP_SECONDS;
-/** Exit codes that only the launcher returns, before a child starts. */
 const REFUSED = 64, LAUNCHER_FAILED = 125, RUN_TIMEOUT = 124, MISSING = 2, TOO_LARGE = 3;
 const FAILED_RUN: GraderRun = { exitCode: null, timedOut: false, truncated: false, failed: true };
 
@@ -48,18 +44,12 @@ const probeSchema = z.object({
   freeInodes: z.number().min(0),
   ancestorsWritable: z.boolean(),
   tools: z.boolean(),
-  // Launcher version 2 prints it; version 1 prints nothing, so the host reads it as undefined.
   version: z.number().int().optional(),
 });
 
 export type Spawned = { code: number | null; out: Buffer; truncated: boolean; overflow: boolean; failed: boolean; elapsedMs: number };
 export type Channel = { held: boolean; graceMs: number };
 
-/**
- * Runs one launcher operation. The host never signals the child: it runs as another account behind sudo. A call that
- * does not close within its limit plus the grace counts as failed, and the channel stays held until the child closes,
- * so no further call starts meanwhile. The eval identity's client uses it too.
- */
 export function launch(
   channel: Channel,
   prefix: EvalGraderConfig["prefix"],
@@ -68,7 +58,6 @@ export function launch(
   limit: { ms: number; keep: number; input?: Readable | Buffer; bypass?: boolean; sink?: Writable; maxBytes?: number },
 ): Promise<Spawned> {
   const failed: Spawned = { code: null, out: Buffer.alloc(0), truncated: false, overflow: false, failed: true, elapsedMs: 0 };
-  // A bypass call (`stop`) neither waits for nor holds the channel, so it reaches a command that is still running.
   if (channel.held && !limit.bypass) return Promise.resolve(failed);
   const started = Date.now();
   return new Promise(resolve => {
@@ -96,7 +85,6 @@ export function launch(
     const timer = setTimeout(() => finish({ failed: true }), limit.ms + channel.graceMs);
     child.stdout!.on("data", (chunk: Buffer) => {
       if (limit.sink) {
-        // A streamed call writes to the sink and stops the child's output past the limit. The call still settles at close.
         if (overflow) return;
         if (total + chunk.length > (limit.maxBytes ?? 0)) {
           overflow = true;
@@ -118,7 +106,6 @@ export function launch(
         kept += take.length;
       }
     });
-    // A sink that fails (its reader closed) stops the child's output, and the call fails at close instead of throwing.
     limit.sink?.once("error", () => { sinkFailed = true; child.stdout?.destroy(); });
     child.stderr!.resume();
     child.stdin?.on("error", () => undefined);
@@ -146,7 +133,6 @@ function parseProbe(text: string) {
   return parsed.success ? parsed.data : undefined;
 }
 
-/** Launcher and grader are one account per host; the host never runs a second probe while one is open. */
 export function launcherGrader(config: () => EvalGraderConfig | undefined, options: { hostUid?: number; graceMs?: number } = {}): Grader {
   const channel: Channel = { held: false, graceMs: options.graceMs ?? GRADER_GRACE_MS };
   const hostUid = options.hostUid ?? (typeof process.getuid === "function" ? process.getuid() : -1);
@@ -260,10 +246,6 @@ async function simple(config: () => EvalGraderConfig | undefined, channel: Chann
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-/**
- * Stops every process of the grader's account. Up to three rounds: a stop, then a process inventory, one second
- * apart. A launcher that fails stops at once. Processes that remain after the third round make the stop alive.
- */
 export async function stopGrader(grader: Grader, uid: number, inventory: () => Promise<RuntimeProcess[]> = inventoryRuntimeProcesses): Promise<"stopped" | "alive" | "failed"> {
   for (let round = 1; round <= STOP_ROUNDS; round++) {
     if (!(await grader.stop())) return "failed";

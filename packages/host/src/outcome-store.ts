@@ -30,19 +30,13 @@ const BACKFILL_RUNS = "backfill_runs";
 const LEGACY_LINES = "legacy_lines";
 const DAY_MS = 86_400_000;
 const DEFAULT_SWEEP_LIMIT = 100;
-/** The goal and mission ref of a payload that does not open. It cannot equal an index, which is 64 hex characters. */
 export const UNREADABLE_REF = "unreadable";
-/** Keys per `IN (...)` statement, so no read exceeds the parameter limit. */
 const IN_CHUNK = 500;
 const LAST_SEQ = "last_seq";
-/** The four tables with a `run_deleted_at` column. The deletion stamp and the retention sweep both use them. */
 const RUN_TABLES = [OUTCOMES, OUTCOME_ROUNDS, RUN_SUMMARIES, MEMBER_RESULTS] as const;
-/** The longest replacement chain the migration follows. A deeper chain, or a cycle, gives a NULL point. */
 const POINT_CHAIN_LIMIT = 64;
-/** Rows per source that a routing read returns: the newest ones of the identity and point. */
 export const ROUTING_ROWS_PER_SOURCE = 1000;
 
-/** The kinds the projector reads. A run with an unseen event of one of these gains `gap`. */
 export const OUTCOME_KINDS: readonly string[] = [
   "run.created", "run.prepared", "member.started", "member.configured", "member.reported", "member.stopped",
   "task.integrated", "scout.completed", "task.escalated", "review.recorded", "review.tree", "repair.started",
@@ -50,10 +44,8 @@ export const OUTCOME_KINDS: readonly string[] = [
   "run.revision-advanced", "run.settled", "run.deleted", "ledger.gap",
 ];
 
-/** A member result's disposition. It is not a row disposition, because `reported` names a report, not an attempt. */
 export type MemberResultDisposition = "open" | "reported" | "stalled" | "no-report" | "limit" | "owner-stop" | "host-stop";
 
-/** Sealed in `outcomes.payload`. A row never holds an objective, instructions, a summary, a path, or a URL. */
 export type OutcomePayload = import("./outcome-gauges.js").GaugePayload & {
   projectId: string;
   taskId: string;
@@ -69,7 +61,6 @@ export type OutcomePayload = import("./outcome-gauges.js").GaugePayload & {
   rubric?: { version: 1; correctness: number; cleanliness: number; extensibility: number; docs: number; reviewerProfileId: string };
   ownerRating?: { score: number; at: string };
   landing?: { at: string; method: LandingMethod };
-  /** Set only on a row of source `legacy`: what the operator's line said. */
   legacy?: LegacyPayload;
   diff?: TeamTask["diffStat"];
   wallMs?: number;
@@ -77,7 +68,6 @@ export type OutcomePayload = import("./outcome-gauges.js").GaugePayload & {
   costCoverage: "none";
 };
 
-/** Sealed in `run_summaries.payload`. */
 export type RunSummaryPayload = {
   projectId: string;
   goal?: { id: string; cycle: number };
@@ -92,16 +82,11 @@ export type RunSummaryPayload = {
   deliveryMethod?: "merge" | "pull-request";
 };
 
-/** Sealed in `member_results.payload`. A member result has no task, so it carries no task id. */
 export type MemberResultPayload = {
   projectId: string;
   replaces?: { memberId: string; cause: ReplacementCause };
 };
 
-/**
- * One attempt's row. `projectRef`, `taskRef`, and `areaRef` are blind indexes of the payload's values. `writeOutcome`
- * derives them from `payload`, so a caller's values for them are ignored. Reads return the stored values.
- */
 export type OutcomeRow = {
   outcomeId: string;
   source: string;
@@ -130,7 +115,6 @@ export type OutcomeRow = {
   flags: Flag[];
   integrated: Level;
   accepted: Level;
-  /** The review's acceptance before an owner exclusion. A read row always has it; a write without it stores `accepted`. */
   acceptance?: Level;
   firstPass: Level;
   held: Level;
@@ -142,7 +126,6 @@ export type OutcomeRow = {
   payload: OutcomePayload;
 };
 
-/** The operator's own facts of one imported line (spec part 8). All of it is operator text or claims, so it is sealed. */
 export type LegacyPayload = {
   id: string;
   label?: string;
@@ -153,14 +136,12 @@ export type LegacyPayload = {
   supersedes?: string;
 };
 
-/** One legacy id's state. `state` and `recordedAt` are plain columns; `lineHash` is sealed. */
 export type LegacyLineState = { state: "imported" | "superseded"; lineHash: string | null; recordedAt: string };
 
 export type SignalKind = "rating" | "landing" | "revert" | "linked-fix" | "exclusion";
 export type ExclusionReason = "outside-cause" | "invalid-task" | "trial" | "other";
 export const EXCLUSION_REASONS: readonly ExclusionReason[] = ["outside-cause", "invalid-task", "trial", "other"];
 
-/** Sealed in `outcome_signals.payload`. */
 export type SignalPayload =
   | { kind: "rating"; score: number }
   | {
@@ -189,7 +170,6 @@ export type SignalRow = {
   payload: SignalPayload;
 };
 
-/** One base-branch scan. Its `payload` is sealed; `checkedAt` is the last time a refresh confirmed it. */
 export type ScanRow = {
   projectRef: string;
   seq: number;
@@ -200,14 +180,12 @@ export type ScanRow = {
   payload: { from?: string; to: string; oldest?: string };
 };
 
-/** The newest scan's head of one project. Sealed in `base_scan_state.payload`. */
 export type ScanState = {
   projectRef: string;
   seq: number;
   payload: { head: string; repository: string; baseBranch: string };
 };
 
-/** One run's summary. `projectRef` is derived on write, as for `OutcomeRow`. */
 export type RunSummaryRow = {
   runId: string;
   source: string;
@@ -223,7 +201,6 @@ export type RunSummaryRow = {
   payload: RunSummaryPayload;
 };
 
-/** One member that has no task. `projectRef` is derived on write, as for `OutcomeRow`. */
 export type MemberResultRow = {
   resultId: string;
   source: string;
@@ -248,11 +225,6 @@ export type MemberResultRow = {
   payload: MemberResultPayload;
 };
 
-/**
- * What the ledger holds for the runs of one goal or one mission. `unreadable` counts the records of those runs whose
- * payload did not open; they are left out. `unindexed` counts rows and summaries, store-wide, that the version 3
- * migration could not open and so could not index by goal or mission.
- */
 export type RollupRecords = {
   runIds: string[];
   summaries: RunSummaryRow[];
@@ -283,7 +255,6 @@ const OUTCOME_UPSERT = upsertSql(OUTCOMES, "outcome_id", OUTCOME_COLUMNS);
 const SUMMARY_UPSERT = upsertSql(RUN_SUMMARIES, "run_id", SUMMARY_COLUMNS);
 const MEMBER_UPSERT = upsertSql(MEMBER_RESULTS, "result_id", MEMBER_COLUMNS);
 
-/** The raw columns of `outcomes`. Plain columns hold ids, enumerations, numbers, and times. */
 type OutcomeSql = {
   outcome_id: string;
   source: string;
@@ -369,10 +340,6 @@ type MemberSql = {
   payload: string;
 };
 
-/**
- * The `outcomes` module (spec part 3). A `deleteRun` hook stamps and never removes, so a deleted run's rows stay
- * readable until the retention sweep. `now` stamps the deletion; it defaults to the wall clock.
- */
 export function outcomeModule(options?: { now?: () => string }): EvidenceModule {
   const now = options?.now ?? (() => new Date().toISOString());
   return {
@@ -431,7 +398,6 @@ export function outcomeModule(options?: { now?: () => string }): EvidenceModule 
   };
 }
 
-/** The version 1 tables and indexes. A new store runs them, then version 2. */
 function migrateVersion1(tx: EvidenceTx): void {
   tx.exec(
     "CREATE TABLE IF NOT EXISTS outcomes (outcome_id TEXT PRIMARY KEY, source TEXT NOT NULL, "
@@ -477,7 +443,6 @@ function migrateVersion1(tx: EvidenceTx): void {
   tx.exec("CREATE INDEX IF NOT EXISTS outcome_round_links_by_run ON outcome_round_links (run_id)");
 }
 
-/** Version 2 adds the review's acceptance, the signals, and the base-branch scans (spec part 5). */
 function migrateVersion2(tx: EvidenceTx): void {
   tx.exec("ALTER TABLE outcomes ADD COLUMN acceptance INTEGER");
   tx.exec("UPDATE outcomes SET acceptance = accepted");
@@ -500,10 +465,6 @@ function migrateVersion2(tx: EvidenceTx): void {
   tx.exec("CREATE INDEX IF NOT EXISTS outcome_signals_by_kind ON outcome_signals (kind, at)");
 }
 
-/**
- * Version 3 adds the goal and mission refs, the legacy lines, and the indexes the roll-ups read. The refs are filled
- * once from each stored payload. A payload that does not open gets `UNREADABLE_REF`, so the migration never fails on it.
- */
 function migrateVersion3(tx: EvidenceTx): void {
   tx.exec("ALTER TABLE outcomes ADD COLUMN goal_ref TEXT");
   tx.exec("ALTER TABLE outcomes ADD COLUMN mission_ref TEXT");
@@ -528,12 +489,6 @@ function migrateVersion3(tx: EvidenceTx): void {
   }
 }
 
-/**
- * Version 4 adds the decision point, the feature-map blind index, and the owner's score, and the route index the
- * routing reads seek. The three columns are filled once from each stored payload. The point of a row follows its
- * replacement chain in memory, because table order is not attempt order. A payload that does not open gets a NULL point
- * and `UNREADABLE_REF`, so the migration never fails on it.
- */
 function migrateVersion4(tx: EvidenceTx): void {
   tx.exec("ALTER TABLE outcomes ADD COLUMN point TEXT");
   tx.exec("ALTER TABLE outcomes ADD COLUMN feature_map_ref TEXT");
@@ -580,16 +535,10 @@ function migrateVersion4(tx: EvidenceTx): void {
   }
 }
 
-/** The routing point of a row, derived from its replacement. `point` is set only on an implementer row that is not legacy. */
 type RoutingPointValue = "start" | "escalation";
 type PointBase = { runId: string; source: string; role: string; attemptIndex: number; replaces: Replaces };
 type Replaces = OutcomePayload["replaces"];
 
-/**
- * A row's point: `start` with no replacement, `escalation` for an escalation's replacement, and otherwise the point of
- * the replaced member's row, which `predecessorPoint` gives. A legacy row, a scout row, or a row with no point gives null.
- * Attempt 0 is the blank row of a member whose start was never seen: its point is unknown, so it is never `start`.
- */
 function pointOf(base: PointBase, predecessorPoint: (outcomeId: string) => RoutingPointValue | null): RoutingPointValue | null {
   if (base.source === "legacy" || base.role !== "implementer" || base.attemptIndex === 0) return null;
   if (base.replaces === undefined) return "start";
@@ -597,7 +546,6 @@ function pointOf(base: PointBase, predecessorPoint: (outcomeId: string) => Routi
   return predecessorPoint(`${base.runId}:${base.replaces.memberId}`);
 }
 
-/** The refs of one stored payload. Both are `UNREADABLE_REF` when the payload does not open or does not read. */
 function migrationRefs(tx: EvidenceTx, table: string, rowId: string, sealed: string): GoalMissionRefs {
   try {
     return refsOf(tx, tx.open<GoalMissionPayload>(table, rowId, sealed));
@@ -606,11 +554,9 @@ function migrationRefs(tx: EvidenceTx, table: string, rowId: string, sealed: str
   }
 }
 
-/** The goal and mission refs a payload carries. Each is null when the payload has no such id. */
 type GoalMissionPayload = { goal?: { id: string }; missionId?: string };
 type GoalMissionRefs = { goalRef: string | null; missionRef: string | null };
 
-/** Derived on every write from the sealed ids, so a caller's value is never stored. */
 function refsOf(db: EvidenceDb, payload: GoalMissionPayload): GoalMissionRefs {
   return {
     goalRef: payload.goal === undefined ? null : db.index("goal", payload.goal.id),
@@ -623,7 +569,6 @@ export function readOutcome(db: EvidenceDb, outcomeId: string): OutcomeRow | und
   return row === undefined ? undefined : toOutcome(db, row);
 }
 
-/** The rows of one run, in `outcome_id` order. */
 export function runOutcomes(db: EvidenceDb, runId: string): OutcomeRow[] {
   return db.all<OutcomeSql>("SELECT * FROM outcomes WHERE run_id=? ORDER BY outcome_id", runId)
     .map(row => toOutcome(db, row));
@@ -631,10 +576,6 @@ export function runOutcomes(db: EvidenceDb, runId: string): OutcomeRow[] {
 
 export type OutcomeFilter = { sources: readonly string[]; role: "implementer" | "scout"; projectRef?: string; since?: string };
 
-/**
- * Rows in `outcome_id` order. A row whose payload does not open is counted and left out. `since` compares the end
- * time, or the start time of an open row, and a row with neither time is outside every window.
- */
 export function selectOutcomes(db: EvidenceDb, filter: OutcomeFilter): { rows: OutcomeRow[]; unreadable: number } {
   if (filter.sources.length === 0) return { rows: [], unreadable: 0 };
   const params: string[] = [...filter.sources, filter.role];
@@ -660,7 +601,6 @@ export function selectOutcomes(db: EvidenceDb, filter: OutcomeFilter): { rows: O
   return { rows, unreadable };
 }
 
-/** The route read's statement. Its parameters are the source, the point, the provider, the model, the effort (NULL matches NULL), `since`, and the limit. */
 export const ROUTING_EVIDENCE_SQL = "SELECT o.outcome_id, o.source, o.project_ref, o.area_ref, o.provider, o.model, o.effort, "
   + "o.profile_epoch, o.kind, o.feature_version, o.disposition, o.exclusion, o.flags, o.integrated, o.accepted, "
   + "o.first_pass, o.held, o.ended_at, o.frozen_at, o.point, o.feature_map_ref, o.owner_score, c.prompt_version "
@@ -668,14 +608,8 @@ export const ROUTING_EVIDENCE_SQL = "SELECT o.outcome_id, o.source, o.project_re
   + "WHERE o.source = ? AND o.role = 'implementer' AND o.point = ? AND o.provider = ? AND o.model = ? AND o.effort IS ? "
   + "AND o.ended_at >= ? ORDER BY o.ended_at DESC, o.outcome_id DESC LIMIT ?";
 
-/** The sources a routing read counts. `replay` and `legacy` rows never inform a choice. */
 const ROUTING_SOURCES = ["production", "duel"] as const;
 
-/**
- * Rows of one identity and point from `production` and `duel`, ended at or after `since`, each source its newest
- * ROUTING_ROWS_PER_SOURCE, returned in `outcome_id` order. Opens no payload. The caller checks that the `outcomes` and
- * `configurations` modules are ready.
- */
 export function selectRoutingEvidence(
   db: EvidenceDb,
   identity: Identity,
@@ -699,7 +633,6 @@ export function selectRoutingEvidence(
   return rows.sort((a, b) => compareKeys(a.outcomeId, b.outcomeId));
 }
 
-/** The plain columns of one route-read row. */
 type RoutingSql = Pick<OutcomeSql, "outcome_id" | "source" | "project_ref" | "area_ref" | "provider" | "model" | "effort"
   | "profile_epoch" | "kind" | "feature_version" | "disposition" | "exclusion" | "integrated" | "accepted" | "first_pass" | "held"
   | "ended_at" | "frozen_at"> & { flags: string; point: RoutingPointValue; feature_map_ref: string | null; owner_score: number | null; prompt_version: string | null };
@@ -732,10 +665,6 @@ function toRoutingEvidence(row: RoutingSql): RoutingEvidenceRow {
   };
 }
 
-/**
- * Writes the whole row. The three blind-index fields and the routing columns are derived from `payload` and the
- * predecessor's stored point, never taken from the caller.
- */
 export function writeOutcome(tx: EvidenceTx, row: OutcomeRow): void {
   const payload = row.payload;
   const refs = refsOf(tx, payload);
@@ -786,7 +715,6 @@ export function writeOutcome(tx: EvidenceTx, row: OutcomeRow): void {
   );
 }
 
-/** The routing columns of a row. The predecessor is read only when the row replaces another member for a cause but escalation. */
 function routingColumns(tx: EvidenceTx, row: OutcomeRow): { point: RoutingPointValue | null; featureMapRef: string; ownerScore: number | null } {
   const payload = row.payload;
   return {
@@ -821,7 +749,6 @@ function toSummary(db: EvidenceDb, row: SummarySql): RunSummaryRow {
   };
 }
 
-/** Writes the whole summary. The project and the goal and mission refs are derived from `payload`. */
 export function writeSummary(tx: EvidenceTx, row: RunSummaryRow): void {
   const refs = refsOf(tx, row.payload);
   tx.run(
@@ -875,10 +802,6 @@ export function writeMemberResult(tx: EvidenceTx, row: MemberResultRow): void {
   );
 }
 
-/**
- * The summary, the rows, the member results, and the signals of one run. Undefined when the store holds none of them.
- * `unreadable` counts the signals whose payload does not open; they are left out of `signals`.
- */
 export function runOutcomeView(
   store: EvidenceStore,
   runId: string,
@@ -896,13 +819,6 @@ export function runOutcomeView(
   });
 }
 
-/**
- * Removes the rows of runs whose rows were stamped more than `retentionDays` (730 by default) before `now`, at most
- * `limit` runs per call. A removed run also loses its signals; base scans stay. A run with any unstamped row is kept.
- * Legacy lines recorded at or before the cutoff go too, at most `limit` per call.
- * Never throws: it returns 0 when the store cannot take the write. It returns 0 at once, with no statement and no log
- * line, unless the `outcomes` module is ready.
- */
 export function sweepExpiredOutcomes(
   store: EvidenceStore,
   now: string,
@@ -946,10 +862,6 @@ export function sweepExpiredOutcomes(
   }
 }
 
-/**
- * What the ledger holds for the runs of one goal or mission. A run belongs when its summary or one of its rows carries
- * the ref. Every row and member result of such a run is read. This tolerant read is for display only.
- */
 export function rollupRecords(db: EvidenceDb, by: "goal" | "mission", ref: string): RollupRecords {
   const column = by === "goal" ? "goal_ref" : "mission_ref";
   const runIds = db.all<{ run_id: string }>(
@@ -1000,10 +912,6 @@ export function rollupRecords(db: EvidenceDb, by: "goal" | "mission", ref: strin
   return records;
 }
 
-/**
- * The stored state of the named legacy lines, by line ref. A ref that no line holds is absent. This strict read is for
- * the write path: a stored line that does not open throws `EvidenceError` `unavailable`.
- */
 export function readLegacyLines(db: EvidenceDb, refs: readonly string[]): Map<string, LegacyLineState> {
   const lines = new Map<string, LegacyLineState>();
   for (const keys of chunks(refs)) {
@@ -1021,7 +929,6 @@ export function readLegacyLines(db: EvidenceDb, refs: readonly string[]): Map<st
   return lines;
 }
 
-/** Writes the whole legacy line. The line hash is sealed under the ref. */
 export function writeLegacyLine(tx: EvidenceTx, ref: string, state: LegacyLineState): void {
   tx.run(LEGACY_LINE_UPSERT, ref, state.state, state.recordedAt, tx.seal(LEGACY_LINES, ref, { lineHash: state.lineHash }));
 }
@@ -1030,7 +937,6 @@ export function legacyLineCount(db: EvidenceDb): number {
   return db.get<{ n: number }>("SELECT count(*) AS n FROM legacy_lines")?.n ?? 0;
 }
 
-/** The source of each named row, by outcome id. It opens no payload. An id that no row holds is absent. */
 export function outcomeSources(db: EvidenceDb, outcomeIds: readonly string[]): Map<string, string> {
   const sources = new Map<string, string>();
   for (const keys of chunks(outcomeIds)) {
@@ -1043,12 +949,10 @@ export function outcomeSources(db: EvidenceDb, outcomeIds: readonly string[]): M
   return sources;
 }
 
-/** Removes the row only when its source is `legacy`. Returns whether it removed one. */
 export function deleteLegacyOutcome(tx: EvidenceTx, outcomeId: string): boolean {
   return tx.run("DELETE FROM outcomes WHERE outcome_id=? AND source='legacy'", outcomeId).changes > 0;
 }
 
-/** The raw columns of `legacy_lines`. The payload is sealed. */
 type LegacyLineSql = { line_ref: string; state: LegacyLineState["state"]; recorded_at: string; payload: string };
 
 function chunks<T>(items: readonly T[]): T[][] {
@@ -1132,7 +1036,6 @@ function toMember(db: EvidenceDb, row: MemberSql): MemberResultRow {
   };
 }
 
-/** Adds `gap` to each row of a run in one table. Rows that already hold it are left as they are. */
 function addGap(tx: EvidenceTx, table: string, key: string, runId: string): void {
   const rows = tx.all<{ key: string; flags: string }>(`SELECT ${key} AS key, flags FROM ${table} WHERE run_id=?`, runId);
   for (const row of rows) {
@@ -1142,7 +1045,6 @@ function addGap(tx: EvidenceTx, table: string, key: string, runId: string): void
   }
 }
 
-/** The stored form of a flag set: sorted, comma-joined, and empty for none. */
 function joinFlags(flags: readonly Flag[]): string {
   return [...flags].sort().join(",");
 }
@@ -1166,7 +1068,6 @@ const SCAN_UPSERT = "INSERT INTO base_scans (project_ref, seq, at, checked_at, c
   + "checked_at=excluded.checked_at, commits=excluded.commits, gap=excluded.gap, payload=excluded.payload";
 const SCAN_STATE_UPSERT = upsertSql(BASE_SCAN_STATE, "project_ref", ["project_ref", "seq", "payload"]);
 
-/** The raw columns of `outcome_signals`. The payload is sealed. */
 type SignalSql = {
   signal_id: string;
   run_id: string;
@@ -1191,17 +1092,14 @@ type ScanSql = {
 
 type ScanStateSql = { project_ref: string; seq: number; payload: string };
 
-/** One signal by id. Undefined when there is none, or when its payload does not open. */
 export function readSignal(db: EvidenceDb, signalId: string): SignalRow | undefined {
   return readSignalRows(db, "SELECT * FROM outcome_signals WHERE signal_id=?", signalId).signals[0];
 }
 
-/** The signals of one run, in `at` then `signal_id` order. A signal whose payload does not open is left out. */
 export function runSignals(db: EvidenceDb, runId: string): SignalRow[] {
   return readSignalRows(db, "SELECT * FROM outcome_signals WHERE run_id=? ORDER BY at, signal_id", runId).signals;
 }
 
-/** Writes the whole signal. The payload is sealed under the signal id. */
 export function writeSignal(tx: EvidenceTx, row: SignalRow): void {
   tx.run(
     SIGNAL_UPSERT,
@@ -1217,7 +1115,6 @@ export function writeSignal(tx: EvidenceTx, row: SignalRow): void {
   );
 }
 
-/** Active landings of a project's runs with `at >= since`, in `at` then `signal_id` order. */
 export function projectLandings(db: EvidenceDb, projectRef: string, since: string): SignalRow[] {
   return readSignalRows(
     db,
@@ -1239,13 +1136,11 @@ export function readScanState(db: EvidenceDb, projectRef: string): ScanState | u
   };
 }
 
-/** The newest scan of a project. */
 export function lastScan(db: EvidenceDb, projectRef: string): ScanRow | undefined {
   const row = db.get<ScanSql>("SELECT * FROM base_scans WHERE project_ref=? ORDER BY seq DESC LIMIT 1", projectRef);
   return row === undefined ? undefined : toScan(db, row);
 }
 
-/** Writes one scan and the project's scan state together. */
 export function writeScan(tx: EvidenceTx, scan: ScanRow, state: ScanState): void {
   tx.run(
     SCAN_UPSERT,
@@ -1260,16 +1155,10 @@ export function writeScan(tx: EvidenceTx, scan: ScanRow, state: ScanState): void
   tx.run(SCAN_STATE_UPSERT, state.projectRef, state.seq, tx.seal(BASE_SCAN_STATE, state.projectRef, state.payload));
 }
 
-/** Records that a refresh confirmed a scan at `at`. The stored time never moves back. */
 export function checkScan(tx: EvidenceTx, projectRef: string, seq: number, at: string): void {
   tx.run("UPDATE base_scans SET checked_at=MAX(checked_at, ?) WHERE project_ref=? AND seq=?", at, projectRef, seq);
 }
 
-/**
- * The scans that bound a landing's hold window. `last` is the newest scan from the landing on, taken at or before
- * `holdUntil`. `next` is the first scan after it. `gapInside` is true when a scan after the landing and up to `last`
- * has a gap.
- */
 export function scanPoints(
   db: EvidenceDb,
   projectRef: string,
@@ -1302,10 +1191,6 @@ export function scanPoints(
   };
 }
 
-/**
- * Summaries of a project approved at or after `approvedSince` with no active landing, deleted runs included. A
- * summary whose payload does not open is left out.
- */
 export function landingCandidates(
   db: EvidenceDb,
   projectRef: string,
@@ -1323,7 +1208,6 @@ export function landingCandidates(
     try {
       candidates.push({ runId: row.run_id, payload: db.open<RunSummaryPayload>(RUN_SUMMARIES, row.run_id, row.payload) });
     } catch {
-      // An unreadable summary is not a candidate.
     }
   }
   return candidates;

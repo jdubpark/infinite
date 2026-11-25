@@ -10,10 +10,6 @@ import type { Assumption, LogEntry, ObjectiveRecord } from "./objective-types.js
 import { TeamError } from "./team-workspace.js";
 import type { TeamCommand } from "./team-types.js";
 
-/**
- * Caps of a member's proposals. `log`, `cappedBytes`, and `assumptions` are the shares that proposals and stances may fill;
- * intent checks, receipts, and owner ops keep the rest. 16 of the record's 32 assumptions leave room for one intent check's 16 items.
- */
 export const PROPOSAL_LIMITS = {
   log: { entries: 300, bytes: 160 * 1024 },
   cappedBytes: 24 * 1024,
@@ -38,13 +34,11 @@ function noDrops(): Record<ProposalDrop, number> {
 
 const digestOf = (value: unknown): string => createHash("sha256").update(canonicalJson(JSON.parse(JSON.stringify(value)))).digest("hex");
 
-/** The inline value of an entry, or undefined for a reference. */
 function inlineOf(entry: LogEntry): Record<string, unknown> | undefined {
   const value = entry.after;
   return value !== undefined && "inline" in value && typeof value.inline === "object" && value.inline !== null ? value.inline as Record<string, unknown> : undefined;
 }
 
-/** The additions a member already holds: every proposal entry that targets the member. */
 function additionsBy(record: ObjectiveRecord, memberId: string): number {
   return record.log.reduce((total, entry) => {
     if (entry.op !== REGISTER_OPS.proposed || entry.target !== memberId) return total;
@@ -57,17 +51,12 @@ function afterOf(revision: number, added: readonly string[], addedDigest: string
   return { revision, added: [...added], addedDigest, attached: attached.map(item => ({ id: item.id, entryId: item.entryId })) };
 }
 
-/**
- * Groups attachments 16 to an entry. Record ids are at most 40 characters and entry ids are uuids, so a full first entry
- * stays under 1.8 KiB, inside the 2 KiB inline cap.
- */
 function groupAttached(items: readonly Attached[]): Attached[][] {
   const groups: Attached[][] = [];
   for (let start = 0; start < items.length; start += PROPOSAL_LIMITS.attachedPerEntry) groups.push(items.slice(start, start + PROPOSAL_LIMITS.attachedPerEntry));
   return groups.length === 0 ? [[]] : groups;
 }
 
-/** The screened proposal's assumption, as the record stores it. Its test is the screened test from `testOf`. */
 function createdAssumption(id: string, propose: Extract<MemberProposal, { propose: unknown }>["propose"], test: Assumption["test"], entry: { entryId: string; summary: string; authorRole: string }): Assumption {
   return {
     id,
@@ -82,14 +71,6 @@ function createdAssumption(id: string, propose: Extract<MemberProposal, { propos
   };
 }
 
-/**
- * One member's page of proposals, applied in journal order at one version up. Each proposal is screened once, in this order:
- * a repeated entry is skipped and not counted; a secret drops; a stance needs an existing assumption, a free slot, and the
- * capped-bytes share; a new proposal needs a valid test, the member's cap, the members' share and the record's cap of assumptions,
- * and the capped-bytes share. Member text stays in the record.
- * A page that changes nothing returns no record. A log or schema refusal counts every proposal of the page under `log` or `refused`.
- * Never throws.
- */
 export function applyProposals(record: ObjectiveRecord, proposals: readonly Proposal[], context: ProposalContext): ProposalsApplied {
   const dropped = noDrops();
   const outcomes: Outcome[] = [];
@@ -200,7 +181,6 @@ export function applyProposals(record: ObjectiveRecord, proposals: readonly Prop
     const next = sealRecord(record, { assumptions }, entries);
     return { record: next, added: addedIds, attached: attached.length, dropped };
   } catch (error) {
-    // Every proposal of the page counts under the reason that refused it, so nothing is lost from the counts.
     const reason: ProposalDrop = error instanceof TeamError && error.code === "objective-log-full" ? "log" : "refused";
     const all = noDrops();
     all[reason] = outcomes.length;

@@ -19,23 +19,18 @@ export const GOAL_RECORD_USAGE = [
   "       infinite goal record ID rate SUBJECT SCORE [--version N] [--request-id ID] [--json]",
   "       infinite goal record ID apply --file PATH [--version N] [--request-id ID] [--json]",
 ].join("\n");
-/** A correction file is read whole, so it is capped before it is read. */
 export const CORRECTION_FILE_BYTES = 64 * 1024;
 const VERSION = /^[1-9][0-9]{0,5}$/;
-// A score is 1 to 5 in whole numbers or halves; the value is checked again against at most 5 below.
 const SCORE = /^[1-5](?:\.[05])?$/;
 const SCORE_USAGE = "Give SCORE as a number from 1 to 5 in halves, such as 3 or 3.5.";
 const UUID = z.uuid();
-// The body of a file is checked with this ID and version, which only the request body later fills in.
 const PLACEHOLDER_REQUEST_ID = "00000000-0000-4000-8000-000000000000";
-// Every printed text passes through this one function. The record bounds each text; nothing is cut here.
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ");
 
 function faultOf(error: unknown): { status?: unknown; code?: unknown } {
   return typeof error === "object" && error !== null ? error as { status?: unknown; code?: unknown } : {};
 }
 
-// The goal's sentences for the four record-state codes. Reads and corrections both use them, so they are written once.
 function recordStateFailure(status: unknown, code: unknown): Error | undefined {
   if (status === 409 && code === "objective-source-invalid") return new Error("This goal's fields do not fit an objective record. The goal works as before, without one.");
   if (status === 409 && code === "objective-record-invalid") return new Error("The stored objective record cannot be read. The host keeps it unchanged.");
@@ -44,7 +39,6 @@ function recordStateFailure(status: unknown, code: unknown): Error | undefined {
   return undefined;
 }
 
-// The client's HttpError carries the status and the code, never the host's message, so each reason has a fixed sentence.
 function readFailure(error: unknown, version: string | undefined): Error | undefined {
   const { status, code } = faultOf(error);
   if (status === 404 && code === "goal-not-found") return new Error("No goal has this ID.");
@@ -57,10 +51,6 @@ function readFailure(error: unknown, version: string | undefined): Error | undef
   return undefined;
 }
 
-/**
- * A failed correction. A reply with a status and a known code gets that code's fixed sentence. A post that got no
- * reply, or a server error, may have been applied, so the sentence names the retry with the same version and request ID.
- */
 function correctionFailure(error: unknown, retry: string): Error {
   const { status, code } = faultOf(error);
   if (status === undefined || (typeof status === "number" && status >= 500)) {
@@ -72,14 +62,12 @@ function correctionFailure(error: unknown, retry: string): Error {
   if (state) return state;
   if (typeof code === "string" && Object.hasOwn(OBJECTIVE_ERRORS, code)) return new Error(OBJECTIVE_ERRORS[code as ObjectiveErrorCode].message);
   if (status === 404 && code === "goal-not-found") return new Error("No goal has this ID.");
-  // An older host has no correction route, so its answer carries no code.
   if (status === 404 && code === undefined) return new Error("This host does not accept corrections. Upgrade the host.");
   return new Error("The host refused the correction.");
 }
 
 const short = (hash: string) => hash.slice(0, 12);
 const list = (values: string[]) => values.length ? values.join(", ") : "none";
-/** The last evidence handle that a line shows: a receipt, an owner result, or a rating. Other handles print nowhere. */
 function shownHandle(evidence: string[]): string {
   const shown = evidence.filter(handle => /^(?:receipt|owner|rating):/.test(handle));
   return shown.length ? ` [${shown[shown.length - 1]}]` : "";
@@ -107,7 +95,6 @@ function thresholdText(threshold: ObjectiveRecordView["record"]["criteria"][numb
   }
 }
 
-/** The text lines of `infinite goal record`. No line shows a log value. */
 export function objectiveRecordLines(view: ObjectiveRecordView, goalId: string): string[] {
   const { record } = view;
   const lines = [
@@ -144,10 +131,6 @@ export function objectiveRecordLines(view: ObjectiveRecordView, goalId: string):
   return lines.map(clean);
 }
 
-/**
- * Reads a correction file `{ "ops": [...] }` and checks every op with the host's schema before any request.
- * Errors name the op's index, never its text: a zod message for an unknown key names the key.
- */
 export function readCorrectionFile(path: string): CorrectionOp[] {
   let size = 0;
   let text = "";
@@ -176,7 +159,6 @@ type Form =
   | { kind: "rate"; subject: string; score: number }
   | { kind: "apply" };
 
-/** The forms of `infinite goal record`. Anything else is a usage error, checked before any request. */
 function formOf(positional: string[]): Form {
   const [verb, goalId, form, target, value, ...rest] = positional;
   if (verb !== "record" || !goalId || rest.length > 0) throw new Error(GOAL_RECORD_USAGE);
@@ -193,7 +175,6 @@ function formOf(positional: string[]): Form {
   throw new Error(GOAL_RECORD_USAGE);
 }
 
-/** The one op and the command text of a form that sends one op. */
 function singleOpOf(form: Exclude<Form, { kind: "read" | "apply" }>): { op: CorrectionOp; text: string } {
   switch (form.kind) {
     case "op": return { op: { op: form.verb === "retire" ? "criterion.retire" : "criterion.confirm", id: form.id }, text: `${form.verb} ${form.id}` };
@@ -212,7 +193,6 @@ async function readView(api: GoalApi, goalId: string, version: string | undefine
   }
 }
 
-/** The text lines of `infinite goal verdicts`: one block per cycle, labelled, with no note, handle, or evaluator text. */
 export function goalVerdictLines(verdicts: GoalVerdictView[]): string[] {
   if (verdicts.length === 0) return ["No cycle of this goal has an assessment."];
   const lines: string[] = [];
@@ -251,7 +231,6 @@ export async function handleGoalClientCommand(positional: string[], options: Opt
   const form = formOf(positional);
   const goalId = positional[1];
   const requested = options["--version"];
-  // Every check runs before the first request, so a typo never reads the record.
   if (requested !== undefined && (typeof requested !== "string" || !VERSION.test(requested))) throw new Error("Give --version as a whole number of 1 or more.");
   const version = typeof requested === "string" ? requested : undefined;
   if (form.kind === "read") {
@@ -280,7 +259,6 @@ export async function handleGoalClientCommand(positional: string[], options: Opt
     formText = text;
   }
 
-  // The version the correction applies to: the one named, or the latest one read now.
   const target = version !== undefined ? Number(version) : (await readView(api, goalId, undefined)).latestVersion;
   const retry = `infinite goal record ${goalId} ${formText} --version ${target} --request-id ${requestId}`;
   const body: Correction = { requestId, version: target, ops };

@@ -158,11 +158,14 @@ export class TeamPermissionAgent {
   permissionAuthorityChanged(): Promise<void> {
     const affected = () => [...this.host.records.values()].filter(stored => this.agentEligible(stored) &&
       (this.coordinatorReviewsLive(stored) || !this.agentSwitched.has(stored.run.id)));
-    if (this.host.closed || affected().length === 0) return Promise.resolve();
-    return this.host.enqueue(async () => {
+    const ids = affected().map(stored => stored.run.id);
+    if (this.host.closed || ids.length === 0) return Promise.resolve();
+    return Promise.all(ids.map(id => this.host.enqueue(id, async () => {
       if (this.host.closed) return;
-      for (const stored of affected()) await this.retireCoordinatorReviews(stored);
-    });
+      const stored = this.host.records.get(id);
+      if (stored && this.agentEligible(stored) && (this.coordinatorReviewsLive(stored) || !this.agentSwitched.has(id)))
+        await this.retireCoordinatorReviews(stored);
+    }))).then(() => undefined);
   }
   /** Whether the permission agent holds the member's open dialog now: a hand-off or its display expansion is under way. */
   private agentHolds(sessionId: string, promptId: number | undefined) {
@@ -309,7 +312,7 @@ export class TeamPermissionAgent {
     void this.agentHandOff(stored, member, prompt).then(outcome => { entry.outcome = outcome; }, () => { /* Nothing was decided; tried again after the wait. */ })
       .finally(() => {
         entry.running = false; entry.at = Date.now();
-        void this.host.enqueue(() => this.recordAgentResult(run.id, memberId, sessionId, prompt.id, entry.outcome)).catch(() => {});
+        void this.host.enqueue(run.id, () => this.recordAgentResult(run.id, memberId, sessionId, prompt.id, entry.outcome)).catch(() => {});
       });
   }
   /** Sends the guarded display expansion once for a collapsed command dialog. The worker's ledger keeps it at most once across restarts. */
@@ -329,7 +332,7 @@ export class TeamPermissionAgent {
         expanded = receipt.state === "delivered";
       } catch { /* Refused or unknown: it is never repeated, and the dialog is decided from what it shows. */ }
       entry.running = false; entry.expandedAt = Date.now();
-      await this.host.enqueue(() => {
+      await this.host.enqueue(runId, () => {
         const current = this.host.records.get(runId);
         if (!current) return;
         this.host.event(current, expanded ? "The host expanded a collapsed permission dialog once to show its whole command."

@@ -94,7 +94,7 @@ export class TeamRecovery {
   constructor(private readonly host: RecoveryHost) {}
   reconcileDelivery(id: string, input: TeamDeliveryReconcile) {
     const body: TeamDeliveryReconcile = teamDeliveryReconcileSchema.parse(input);
-    return this.host.confirmed(id).then(() => this.host.enqueue(async () => {
+    return this.host.confirmed(id).then(() => this.host.enqueue(id, async () => {
       const stored = this.host.record(id), run = stored.run;
       if (this.host.replay(stored, "reconcile-delivery", body)) return this.host.view(stored);
       if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before reconciling delivery.");
@@ -224,7 +224,7 @@ export class TeamRecovery {
   }
   reconcileVerification(id: string, input: VerificationMutation) {
     const body = teamVerificationReconcileSchema.parse(input);
-    return this.host.confirmed(id).then(() => this.host.enqueue(async () => {
+    return this.host.confirmed(id).then(() => this.host.enqueue(id, async () => {
       const stored = this.host.record(id), run = stored.run;
       if (this.host.replay(stored, "reconcile-verification", body)) return this.host.view(stored);
       if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before reconciling verification.");
@@ -283,7 +283,7 @@ export class TeamRecovery {
   }
   continueRun(id: string, input: TeamContinue) {
     const body = teamContinueSchema.parse(input);
-    return this.host.confirmed(id).then(() => this.host.enqueue(async () => {
+    return this.host.confirmed(id).then(() => this.host.enqueue(id, async () => {
       const stored = this.host.record(id), run = stored.run;
       if (this.host.replay(stored, "continue", body)) return this.host.view(stored);
       if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before sending this action.");

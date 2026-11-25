@@ -561,7 +561,7 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
       request.status = "reviewing-evidence";
       this.recordPermissionRecoveryStep(stored, request, { decisionId: decision.id, cause, action: "collect-requested-evidence",
         decision: "complete-fresh-evidence-snapshot", consequence: "A distinct coordinator assignment will inspect the collected snapshot; command execution remains unknown." });
-      void this.host.enqueue(async () => {
+      void this.host.enqueue(stored.run.id, async () => {
         const launched = await this.startPermissionCoordinatorReview(stored, target, result.prompt, request,
           { changedPaths: result.changedPaths, evidence: result.evidence });
         if (!launched && livePermissionRecoveryStatuses.has(request.status)) {

@@ -21,7 +21,7 @@ export type TeamKernel = {
   save(stored: Stored): void;
   event(stored: Stored, text: string): void;
   record(id: string): Stored;
-  enqueue<T>(task: () => T | Promise<T>): Promise<T>;
+  enqueue<T>(runId: string, task: () => T | Promise<T>): Promise<T>;
   operation<T>(stored: Stored, kind: NonNullable<Stored["pending"]>["kind"], perform: (signal: AbortSignal) => Promise<T>, complete: (value: T) => void,
     sourceMember?: TeamMember, sourceWorkspace?: "member" | "integration"): void;
   assertRunPath(stored: Stored, path: string, create?: boolean): void;

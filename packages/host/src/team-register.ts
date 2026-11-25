@@ -29,7 +29,7 @@ export type RegisterHost = {
   holder(runId: string): RegisterHolder | undefined;
   configured(run: TeamRun): readonly TeamCommand[];        // the project's checks now
   workspace(holder: RegisterHolder): string | undefined;   // run.workspace when assertRunPath passes
-  enqueue(work: () => void): Promise<void>;                // the serial queue
+  enqueue(runId: string, work: () => void): Promise<void>;
   save(holder: RegisterHolder): void;
   event(holder: RegisterHolder, text: string): void;
   prefix(): TeamCommand | undefined;
@@ -184,7 +184,7 @@ export class TeamRegister {
     }
   }
 
-  /** In the ingest pass, inside the serial queue: applies the kept finding posts that carry `assumption`. Never throws. */
+  /** In the ingest pass, inside the per-run queue: applies the kept finding posts that carry `assumption`. Never throws. */
   propose(runId: string, member: TeamMember, posts: readonly MemberPostRecord[]): void {
     try {
       const holder = this.host.holder(runId);
@@ -252,12 +252,12 @@ export class TeamRegister {
   /** The three steps of a pass: plan in the queue, read outside it, apply in the queue. */
   private async pass(job: Job, signal: AbortSignal): Promise<void> {
     const box: { plan?: Plan } = {};
-    await this.host.enqueue(() => { box.plan = this.plan(job); });
+    await this.host.enqueue(job.holder.run.id, () => { box.plan = this.plan(job); });
     const plan = box.plan;
     if (plan === undefined || signal.aborted) return;
     const blobs = await this.readBlobs(plan, signal);
     if (signal.aborted) return;
-    await this.host.enqueue(() => this.apply(job, plan, blobs, signal));
+    await this.host.enqueue(job.holder.run.id, () => this.apply(job, plan, blobs, signal));
   }
 
   private plan(job: Job): Plan | undefined {

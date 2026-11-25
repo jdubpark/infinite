@@ -2910,7 +2910,7 @@ export class TeamService {
       if (continuationHead) await assertMemberReadOnly(run.workspace, continuationHead.headCommit, this.config.teams?.commandPrefix, signal, "integration");
       let cwd: string;
       try { cwd = run.replay ? run.workspace : await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.config.teams?.commandPrefix, signal); }
-      catch (error) { if (!onFailed || signal.aborted) throw error; failure = error instanceof TeamError ? error.code : "workspace-operation-failed"; return undefined; }
+      catch (error) { if (!onFailed || signal.aborted || (error instanceof TeamError && error.code === "team-root-unsafe")) throw error; failure = error instanceof TeamError ? error.code : "workspace-operation-failed"; return undefined; }
       this.assertRunPath(stored, cwd);
       if (continuationHead) await assertMemberReadOnly(run.workspace, continuationHead.headCommit, this.config.teams?.commandPrefix, signal, "integration");
       // Bootstrap dependencies exist only after the first implementation. A failed

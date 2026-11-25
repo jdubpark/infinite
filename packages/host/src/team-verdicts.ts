@@ -383,6 +383,8 @@ export class TeamVerdicts {
     }, { prompt: evaluatorPrompt(profile.provider, profile), profile }, () => {
       // A working copy that cannot be made costs the verdict its evaluator, never the run its review.
       const live = holder.verdict;
+      // As in `complete`: a stopped run, or one whose recovery is stopping its members, writes nothing; its next revision drops this state.
+      if (STOPPED.includes(holder.run.status) || holder.run.recovery?.status === "stopping") return;
       if (live?.verdictId === verdictId && live.status === "evaluating" && live.evaluatorMemberId === undefined) this.finish(holder, live, undefined, "evaluator-unavailable");
     });
     this.host.save(holder);

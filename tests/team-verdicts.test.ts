@@ -577,6 +577,7 @@ test("host facts compose from this run, or from the parent run", () => {
   const facts = (): Criterion[] => [
     { id: "c4", origin: "owner", statement: "Checks pass", check: { kind: "receipt", receipt: "checks-passed" }, producer: "host", threshold: { kind: "pass" }, state: "active" },
     { id: "c5", origin: "owner", statement: "Review approves", check: { kind: "receipt", receipt: "review-approved" }, producer: "host", threshold: { kind: "pass" }, state: "active" },
+    { id: "c6", origin: "owner", statement: "Merged", check: { kind: "receipt", receipt: "merged" }, producer: "host", threshold: { kind: "pass" }, state: "active" },
   ];
   const states = (f: Fixture): string => f.verdicts.detail(RUN)!.criteria.filter(item => item.id === "c4" || item.id === "c5").map(item => item.state).join(",");
   const reviewed = (change: (f: Fixture) => void): Fixture => {
@@ -587,7 +588,15 @@ test("host facts compose from this run, or from the parent run", () => {
     drive(f, "done");
     return f;
   };
-  assert.equal(states(reviewed(() => undefined)), "met,met");
+  const settled = reviewed(() => undefined);
+  assert.equal(states(settled), "met,met");
+  // The delivery is a host fact too: it comes from the ledger after the run settled, never from the run.
+  const late = (): string | undefined => settled.verdicts.detail(RUN)!.criteria.find(item => item.id === "c6")?.state;
+  assert.equal(late(), "inconclusive");
+  settled.holder.run.status = "merged";
+  settled.host.deliveryFact = "landed";
+  assert.equal(settled.verdicts.settleReceipt(settled.holder), true);
+  assert.equal(late(), "met");
   assert.equal(states(reviewed(f => {
     f.holder.run.checks[0]!.status = "failed";
     f.holder.run.review = { verdict: "changes-requested", summary: "no", revision: 1 };

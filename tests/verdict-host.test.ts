@@ -8,6 +8,9 @@ import { initialAttention } from "@infinite/attention";
 import { GoalService } from "../packages/host/src/goals.js";
 import type { CreateGoal } from "../packages/host/src/goal-types.js";
 import { composeVerdict, verdictRecord } from "../packages/host/src/verdict-compose.js";
+import { deliveryPort } from "../packages/host/src/verdict-delivery.js";
+import { applyScan } from "../packages/host/src/outcome-signals.js";
+import { outcomeModule } from "../packages/host/src/outcome-store.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { Blackboard } from "../packages/host/src/evidence/blackboard.js";
 import { EventOutbox, type OutboxEvent } from "../packages/host/src/evidence/outbox.js";
@@ -211,7 +214,7 @@ function git(f: SchedulerFixture, ...args: string[]): string {
 }
 
 /** c0, three judgements, and c4: `rank-verify` must pass. */
-function recordFor(runId: string): ObjectiveRecord {
+function recordFor(runId: string, delivery = false): ObjectiveRecord {
   const judged = (id: string, statement: string): Criterion => ({ id, origin: "owner", statement, check: { kind: "judgement", item: `item-${id}` },
     producer: "evaluator", threshold: { kind: "pass" }, state: "active" }) as Criterion;
   const body: Omit<ObjectiveRecord, "digest"> = {
@@ -222,6 +225,7 @@ function recordFor(runId: string): ObjectiveRecord {
       { id: "c0", origin: "owner", statement: "", statementOf: "objective", check: { kind: "judgement", item: "owner-text" }, producer: "evaluator", threshold: { kind: "pass" }, state: "active" } as Criterion,
       judged("c1", "Every entry has reasons"), judged("c2", "Every entry has sources"), judged("c3", "The list is ranked"),
       { id: "c4", origin: "owner", statement: "The ranking verifies", check: { kind: "command", command: commandDigest(RANK) }, producer: "host", threshold: { kind: "pass" }, state: "active" } as Criterion,
+      ...(delivery ? [{ id: "c5", origin: "owner", statement: "The run is merged", check: { kind: "receipt", receipt: "merged" }, producer: "host", threshold: { kind: "pass" }, state: "active" } as Criterion] : []),
     ],
     assumptions: [], questions: [], rubricVersion: 1,
     log: [{ seq: 1, at: AT, version: 1, actor: "owner", authority: "direction", op: "record.created", target: runId }],
@@ -233,7 +237,7 @@ function recordFor(runId: string): ObjectiveRecord {
  * Writes a standalone run that the reviewer approved: one integrated task whose author is the lineup's implementer, a change to the
  * shortlist, a final check round for `rank-verify`, and the verdict pins. The next scheduler pass reaches the approved branch.
  */
-function seedReviewed(f: SchedulerFixture, options: { rank: "passed" | "failed"; lineup?: TeamLineup; outbox?: boolean; members?: number; manager?: TeamModelProfile }): string {
+function seedReviewed(f: SchedulerFixture, options: { rank: "passed" | "failed"; lineup?: TeamLineup; outbox?: boolean; members?: number; manager?: TeamModelProfile; delivery?: boolean }): string {
   f.config.agents = { demo: { command: process.execPath, args: [] }, claude: { command: process.execPath, args: [] },
     codex: { command: process.execPath, args: [] }, opencode: { command: process.execPath, args: [] } } as Config["agents"];
   f.config.teams = { ...f.config.teams!, lineup: options.lineup ?? LINEUP };
@@ -256,7 +260,7 @@ function seedReviewed(f: SchedulerFixture, options: { rank: "passed" | "failed";
     review: { verdict: "approved", summary: "Approved.", revision: 1 },
     changes: { headCommit: head, recordedAt: AT, files: [{ path: SHORTLIST, status: "added", added: 1, removed: 0 }], truncated: false },
     checks: [{ command: RANK, status: options.rank, startedAt: AT, output: "", revision: 1, headCommit: head, round: 1 }] });
-  f.writeTeam({ objectiveRecord: recordFor(f.run.id), checkHead: head });
+  f.writeTeam({ objectiveRecord: recordFor(f.run.id, options.delivery), checkHead: head });
   return head;
 }
 
@@ -276,15 +280,15 @@ function answerAllMet(f: SchedulerFixture, member: TeamMember) {
 test("acceptance 6 end to end", { timeout: 120000 }, async () => {
   const f = schedulerFixture(), store = new EvidenceStore({ databasePath: evidenceDatabasePath(f.config.stateDir), vaultKey: f.key });
   const watch = watched(store);
+  store.register(outcomeModule({ now: () => new Date().toISOString() }));
   try {
     activeSessions(f);
-    seedReviewed(f, { rank: "failed" });
-    const teams = f.openTeam({ events: watch.outbox });
+    seedReviewed(f, { rank: "failed", delivery: true });
+    const teams = f.openTeam({ events: watch.outbox, delivery: deliveryPort(store) });
     teams.start();
     const evaluator = await launchedEvaluator(f, teams, f.run.id);
     answerAllMet(f, evaluator!);
     const view = await waitFor(() => Promise.resolve(teams.get(f.run.id)), current => TERMINAL.includes(current.status), 60000);
-    teams.close();
 
     assert.equal(view.status, "ready-for-review", JSON.stringify(view.events.slice(-5)));
     assert.equal(view.assessment?.result, "not-met");
@@ -305,6 +309,23 @@ test("acceptance 6 end to end", { timeout: 120000 }, async () => {
     const named = store.read(db => db.all<{ profile_id: string | null }>("SELECT profile_id FROM objective_verdicts"));
     assert.equal(named[0]!.profile_id, evaluator!.modelProfile?.id, "an applied answer names the evaluator");
     assert.equal(teams.verdicts.detail(f.run.id)?.evaluator?.profileId, evaluator!.modelProfile?.id);
+
+    // A landing the scan records later composes the verdict once more: one new row, no new session, no new status.
+    const first = view.assessment!.verdictId;
+    assert.deepEqual(await teams.settleReceipts(), [], "no landing is seen yet");
+    store.write(tx => applyScan(tx, { projectId: f.run.projectId, repository: "example-repo", baseBranch: "main", head: "5".repeat(40), at: new Date().toISOString(),
+      commits: 1, gap: null, expectedSeq: 0, holdDays: 30, reverts: [],
+      landings: [{ runId: f.run.id, commit: "6".repeat(40), method: "merge-commit", position: 0, reviewedHead: storedOf(teams, f.run.id).run.headCommit }] }));
+    assert.deepEqual(await teams.settleReceipts(), [f.run.id]);
+    assert.deepEqual(await teams.settleReceipts(), [], "a repeat pass writes nothing");
+    const late = teams.assessmentOf(f.run.id)!;
+    assert.notEqual(late.assessment?.verdictId, first);
+    assert.equal(late.assessment?.criteria.find(item => item.id === "c5")?.state, "met");
+    assert.equal(teams.get(f.run.id)!.status, "ready-for-review");
+    assert.equal(evaluators(teams.get(f.run.id)!).length, 1, "no new evaluator");
+    const rows = store.read(db => db.all<{ verdict_id: string }>("SELECT verdict_id FROM objective_verdicts WHERE run_id = ?", f.run.id));
+    assert.deepEqual(rows.map(row => row.verdict_id).sort(), [first, late.assessment!.verdictId].sort(), "two ledger rows");
+    teams.close();
   } finally { store.close(); f.close(); }
 });
 

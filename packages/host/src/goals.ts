@@ -720,7 +720,11 @@ export class GoalService {
         }
       } else {
       this.refresh(stored, team);
-      if (["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status)) {
+      const cycle = goal.cycles.find(value => value.teamId === team!.id)!;
+      const ended = ["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status);
+      if (!ended) delete cycle.endedAs;
+      const classified = ended && cycle.endedAs?.status === team.status && cycle.endedAs.headCommit === team.headCommit;
+      if (ended) {
         settleMetrics(stored, team.id, this.teams.reviewedObservations?.(team.id));
         if (["running", "needs-input"].includes(goal.status) && ["ready-for-review", "merged", "no-change"].includes(team.status) && team.linear && team.linear.status !== "synced") {
           if (team.linear.status === "blocked") {
@@ -730,7 +734,8 @@ export class GoalService {
         }
         if (team.members.every(member => ["stopped", "waiting"].includes(member.status))) goal.activeTeamId = undefined;
         if (goal.standing) { if (!goal.activeTeamId) this.settleCycle(stored, goal.cycles.find(value => value.teamId === team!.id)!, team); }
-        else if (["running", "needs-input"].includes(goal.status)) {
+        else if (["running", "needs-input"].includes(goal.status) && !classified) {
+          cycle.endedAs = { status: team.status, headCommit: team.headCommit };
           if (team.status === "blocked" || team.status === "cancelled") {
             const deadlineStopped = team.stopReason === "deadline" || goal.stopReason === "deadline" || goal.deadlineContinuation === true;
             if (deadlineStopped) { goal.stopReason = "deadline"; goal.deadlineContinuation = true; }

@@ -91,6 +91,7 @@ export interface GoalCycle {
   finishedAt?: string;
   baseCommit?: string;
   headCommit?: string;
+  endedAs?: { status: string; headCommit?: string };
   branch?: string;
   workspace?: string;
   brief?: TeamBrief;

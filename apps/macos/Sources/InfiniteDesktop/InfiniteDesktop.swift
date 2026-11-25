@@ -556,6 +556,7 @@ struct CreateView: View {
     @State private var busy = false
     @State private var error = ""
     @State private var clearPending = false
+    @State private var clearTarget: PendingClearTarget?
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("New session").font(.title2.weight(.semibold))
@@ -566,7 +567,9 @@ struct CreateView: View {
             }.disabled(app.pendingCreation.pendingID != nil)
             if app.pendingCreation.pendingID != nil {
                 Text("A creation request is pending. Retry uses its original agent, project, and request identity. Check the session list before starting a different request.").font(.callout).foregroundStyle(.orange)
-                Button("Clear after checking sessions…") { clearPending = true }.disabled(busy)
+                Button("Clear after checking sessions…") {
+                    if let id = app.pendingCreation.pendingID { clearTarget = PendingClearTarget(profileID: app.activeID, requestID: id); clearPending = true }
+                }.disabled(busy)
             }
             if let selected = app.projects.first(where: { $0["id"].string == project }) {
                 Text(selected["path"].string).font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
@@ -578,8 +581,11 @@ struct CreateView: View {
             }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(busy || project.isEmpty) }
         }.padding(26).frame(width: 480)
             .alert("Clear the pending creation?", isPresented: $clearPending) {
-                Button("Keep pending", role: .cancel) {}
-                Button("I checked the sessions") { app.clearCreation() }
+                Button("Keep pending", role: .cancel) { clearTarget = nil }
+                Button("I checked the sessions") {
+                    app.clearCreation(expectedProfileID: clearTarget?.profileID, expectedRequestID: clearTarget?.requestID)
+                    clearTarget = nil
+                }
             } message: { Text("The server may already have created this agent. Clearing does not stop it.") }
             .onAppear { project = app.projects.first?["id"].string ?? ""; if !app.me["providers"].array.map(\.string).contains(provider) { provider = app.me["providers"].array.first?.string ?? "" } }
     }

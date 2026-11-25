@@ -23,8 +23,7 @@ export async function* terminalPages(manager: Manager, sessionId: string, after:
           cursor = screen.seq;
           yield { snapshot: screen, cursor };
         }
-      } catch {
-      }
+      } catch {}
     }
     while (!signal.aborted) {
       changed = false;
@@ -64,6 +63,10 @@ export const terminalInputSchema = z.union([
   z.object({ op: z.literal("control"), requestId: z.uuid(), action: z.literal("release"), leaseId: z.uuid().optional(), takeover: z.literal(false).optional() }).strict(),
 ]);
 
+type TerminalInput = z.infer<typeof terminalInputSchema>;
+const MAX_PENDING_BYTES = 256 * 1024;
+const MAX_PENDING_FRAMES = 128;
+
 export function connectTerminals(server: Server, manager: Manager, authenticate: (token: string) => PairedDevice | undefined, missionManaged?: (sessionId: string) => boolean | Promise<boolean>) {
   const sockets = new WebSocketServer({ noServer: true, maxPayload: 192 * 1024, perMessageDeflate: false });
   const origin = new URL(manager.config.origin);
@@ -83,37 +86,142 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
       const abort = new AbortController();
       let device: PairedDevice | undefined, actor: ControlActor, legacy = true;
       let ready: Promise<WorkerState>, leaseId: string | undefined, managed = false;
-      let serial = Promise.resolve(), pendingBytes = 0, pendingFrames = 0, alive = true;
-      const fail = (code: number) => { abort.abort(); ws.close(code); };
+      let alive = true, open = true;
+      let renewInFlight: Promise<void> | undefined;
+      let drainPromise: Promise<void> | undefined;
+      let pendingBytes = 0;
+      const queue: Array<{ input: TerminalInput; size: number }> = [];
+      const discardQueue = () => { queue.length = 0; pendingBytes = 0; };
+      const fail = (code: number) => {
+        open = false;
+        abort.abort();
+        discardQueue();
+        ws.close(code);
+      };
       const authTimeout = setTimeout(() => fail(1008), 10000);
       const heartbeat = setInterval(() => {
-        if (!alive) { abort.abort(); ws.terminate(); return; }
-        alive = false; ws.ping();
+        if (!alive) {
+          open = false;
+          abort.abort();
+          discardQueue();
+          ws.terminate();
+          return;
+        }
+        alive = false;
+        ws.ping();
       }, 15000);
       ws.on("pong", () => {
         alive = true;
-        if (legacy && leaseId) {
-          const held = leaseId;
-          serial = serial.then(async () => {
+        if (!legacy || !leaseId || renewInFlight || !open || abort.signal.aborted) return;
+        const held = leaseId;
+        let renewal!: Promise<void>;
+        renewal = (async () => {
+          try {
             if (managed && (await manager.state(match[1])).attention?.state !== "needs-you") return;
+            if (!open || abort.signal.aborted || leaseId !== held) return;
             await manager.controlSession(match[1], { op: "control", action: "renew", actor, leaseId: held });
-          }).catch(() => { leaseId = undefined; fail(1011); });
-        }
+          } catch {
+            if (leaseId === held) leaseId = undefined;
+            fail(1011);
+          } finally {
+            if (renewInFlight === renewal) renewInFlight = undefined;
+          }
+        })();
+        renewInFlight = renewal;
       });
-      ws.on("error", () => abort.abort());
+      ws.on("error", () => { open = false; abort.abort(); discardQueue(); });
       ws.on("close", () => {
-        abort.abort(); clearTimeout(authTimeout); clearInterval(heartbeat);
-        void serial.then(async () => {
+        open = false;
+        abort.abort();
+        clearTimeout(authTimeout);
+        clearInterval(heartbeat);
+        discardQueue();
+        void Promise.allSettled([drainPromise, renewInFlight]).then(async () => {
           if (leaseId) await manager.controlSession(match[1], { op: "control", action: "release", actor, leaseId });
         }).catch(() => {});
       });
+      const active = () => open && !abort.signal.aborted;
       const send = (value: unknown) => new Promise<void>((resolve, reject) => {
         if (ws.readyState !== WebSocket.OPEN) { reject(new Error("Terminal disconnected")); return; }
         ws.send(JSON.stringify(value), error => error ? reject(error) : resolve());
       });
+      const processFrame = async (input: TerminalInput) => {
+        const state = await ready;
+        if (!active()) return;
+        const promptScopedWrite = input.op === "raw" || input.op === "input" || input.op === "control" && input.action !== "release";
+        if (managed && promptScopedWrite) {
+          const live = await manager.state(match[1]);
+          if (!active()) return;
+          if (live.attention?.state !== "needs-you") {
+            await send({ refusal: {
+              requestId: "requestId" in input ? input.requestId : undefined,
+              code: "mission-managed",
+              error: "This session is run by its mission coordinator. Talk to the coordinator from the mission.",
+            } });
+            return;
+          }
+        }
+        if (input.op === "control") {
+          if (!state.capabilities?.inputControl) {
+            await send({ refusal: { requestId: input.requestId, code: "unsupported" } }); return;
+          }
+          const normalized = normalizeControlRequest(input, actor);
+          if (!normalized.ok) {
+            await send({ refusal: { requestId: input.requestId, code: normalized.code } }); return;
+          }
+          const control = await manager.controlSession(match[1], normalized.request);
+          leaseId = control?.id;
+          if (!active()) return;
+          await send({ requestId: input.requestId, control });
+          return;
+        }
+        if (state.capabilities?.inputControl && legacy && !leaseId && !(managed && input.op === "resize")) {
+          leaseId = (await manager.controlSession(match[1], { op: "control", action: "claim", actor }))!.id;
+          if (!active()) return;
+        }
+        const suppliedLease = legacy ? leaseId : input.leaseId;
+        if (state.capabilities?.inputControl && !suppliedLease) {
+          await send({ refusal: { requestId: "requestId" in input ? input.requestId : undefined, code: "control-lost" } }); return;
+        }
+        const { leaseId: _leaseId, ...legacyInput } = input;
+        const request = {
+          ...(state.capabilities?.inputControl ? { ...input, actor, leaseId: suppliedLease } : legacyInput),
+          ...(input.op === "input" ? { force: true } : {}),
+        };
+        const receipt = await workerCall<Receipt>(manager.config.runDir, match[1], request);
+        if (input.op !== "resize" && active()) await send({ receipt });
+      };
+      const drain = () => {
+        if (drainPromise || !active()) return;
+        drainPromise = (async () => {
+          try {
+            while (queue.length > 0 && active()) {
+              const frame = queue.shift()!;
+              try {
+                await processFrame(frame.input);
+              } catch (error) {
+                if (!active()) break;
+                const workerError = error as WorkerError;
+                if (workerError.code === "control-busy" || workerError.code === "control-lost") {
+                  await send({ refusal: { requestId: "requestId" in frame.input ? frame.input.requestId : undefined, code: workerError.code } }).catch(() => fail(1011));
+                } else {
+                  fail(1011);
+                  break;
+                }
+              } finally {
+                pendingBytes = Math.max(0, pendingBytes - frame.size);
+              }
+            }
+          } finally {
+            if (!active()) discardQueue();
+            drainPromise = undefined;
+            if (queue.length > 0 && active()) drain();
+          }
+        })();
+      };
       ws.on("message", (data, binary) => {
         try {
-          if (binary || abort.signal.aborted) { fail(1008); return; }
+          if (binary || !active()) { fail(1008); return; }
           const message: unknown = JSON.parse(data.toString());
           if (!device) {
             const auth = authSchema.parse(message);
@@ -130,61 +238,20 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
             void (async () => {
               try {
                 await ready;
+                if (!active()) return;
                 for await (const page of terminalPages(manager, match[1], after, abort.signal, url.searchParams.get("snapshot") === "1")) await send(page);
                 if (!abort.signal.aborted) ws.close(1000);
-              } catch { fail(1011); }
+              } catch { if (active()) fail(1011); }
             })();
             return;
           }
           if (device.role !== "owner") { fail(1008); return; }
           const input = terminalInputSchema.parse(message);
           const size = Buffer.byteLength(data.toString());
-          if (pendingBytes + size > 256 * 1024 || ++pendingFrames > 128) { fail(1008); return; }
+          if (pendingBytes + size > MAX_PENDING_BYTES || queue.length + (drainPromise ? 1 : 0) >= MAX_PENDING_FRAMES) { fail(1008); return; }
           pendingBytes += size;
-          serial = serial.then(async () => {
-            if (abort.signal.aborted) return;
-            const state = await ready;
-            const promptScopedWrite = input.op === "raw" || input.op === "input" || input.op === "control" && input.action !== "release";
-            if (managed && promptScopedWrite && (await manager.state(match[1])).attention?.state !== "needs-you") {
-              await send({ refusal: {
-                requestId: "requestId" in input ? input.requestId : undefined,
-                code: "mission-managed",
-                error: "This session is run by its mission coordinator. Talk to the coordinator from the mission.",
-              } });
-              return;
-            }
-            if (input.op === "control") {
-              if (!state.capabilities?.inputControl) {
-                await send({ refusal: { requestId: input.requestId, code: "unsupported" } }); return;
-              }
-              const normalized = normalizeControlRequest(input, actor);
-              if (!normalized.ok) {
-                await send({ refusal: { requestId: input.requestId, code: normalized.code } }); return;
-              }
-              const control = await manager.controlSession(match[1], normalized.request);
-              leaseId = control?.id;
-              await send({ requestId: input.requestId, control });
-              return;
-            }
-            if (state.capabilities?.inputControl && legacy && !leaseId && !(managed && input.op === "resize")) {
-              leaseId = (await manager.controlSession(match[1], { op: "control", action: "claim", actor }))!.id;
-            }
-            const suppliedLease = legacy ? leaseId : input.leaseId;
-            if (state.capabilities?.inputControl && !suppliedLease) {
-              await send({ refusal: { requestId: "requestId" in input ? input.requestId : undefined, code: "control-lost" } }); return;
-            }
-            const { leaseId: _leaseId, ...legacyInput } = input;
-            const request = {
-              ...(state.capabilities?.inputControl ? { ...input, actor, leaseId: suppliedLease } : legacyInput),
-              ...(input.op === "input" ? { force: true } : {}),
-            };
-            const receipt = await workerCall<Receipt>(manager.config.runDir, match[1], request);
-            if (input.op !== "resize") await send({ receipt });
-          }).catch(async (error: WorkerError) => {
-            if (error.code === "control-busy" || error.code === "control-lost") {
-              await send({ refusal: { requestId: "requestId" in input ? input.requestId : undefined, code: error.code } }).catch(() => fail(1011));
-            } else fail(1011);
-          }).finally(() => { pendingBytes -= size; pendingFrames--; });
+          queue.push({ input, size });
+          drain();
         } catch { fail(1008); }
       });
     });

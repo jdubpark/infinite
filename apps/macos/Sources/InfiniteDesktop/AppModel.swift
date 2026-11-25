@@ -74,7 +74,17 @@ struct TeamResumeFailure: Equatable {
 
 @MainActor final class AppModel: ObservableObject {
     @Published var profiles: [HostProfile] = []
-    @Published var activeID = ""
+    @Published var activeID = "" {
+        didSet {
+            if activeID != oldValue {
+                connectionGeneration = UUID()
+                connectionProfileID = ""
+                connecting = false
+                if let aborted = takeConnectingClient() { Task { @MainActor [weak self] in await self?.deps.closeClient(aborted) } }
+                if connectedProfileID != nil { connected = false; connectedProfileID = nil }
+            }
+        }
+    }
     @Published var me: JSON = .null
     @Published var sessions: [AgentSession] = []
     /// The rows `sessions` is built from, and their version; reset with `sessions`.
@@ -148,6 +158,13 @@ struct TeamResumeFailure: Equatable {
     private static let keepAlive = 3
     let cmux = CmuxViewModel()
     private var connectionProfileID = ""
+    private(set) var connectedProfileID: String?
+    private var connectingClient: (generation: UUID, client: RemoteClient)?
+    private func takeConnectingClient(for generation: UUID? = nil) -> RemoteClient? { guard let pending = connectingClient, generation == nil || pending.generation == generation else { return nil }; connectingClient = nil; return pending.client }
+    private var creatingKinds = Set<String>()
+    private var draftEpochs: [String: Int] = [:]
+    private let draftQueue = DraftKeyQueue()
+    private let deps: AppModelDependencies
     var client: RemoteClient?
     var terminals: [String: SessionModel] = [:]
     private var pollTask: Task<Void, Never>?
@@ -156,7 +173,6 @@ struct TeamResumeFailure: Equatable {
     private var pollGeneration = UUID()
     private lazy var sessionFreshness = DisplayFreshness { [weak self] in self?.sessionsDisplayStale = $0 }
     private lazy var teamFreshness = DisplayFreshness { [weak self] in self?.teamsDisplayStale = $0 }
-    let drafts = DraftStore()
     var active: HostProfile? { profiles.first { $0.id == activeID } }
     var projects: [JSON] { me["projects"].array }
     var isOwner: Bool { me["role"].string == "owner" }
@@ -188,10 +204,7 @@ struct TeamResumeFailure: Equatable {
     func teamWorkspaceReady(_ id: String) -> Bool { !(projects.first { $0["id"].string == id }?["team"]["checks"].array.isEmpty ?? true) }
     /// The workspace a new team starts in by default: the first one with checks configured.
     var defaultTeamWorkspace: String { (projects.first { !$0["team"]["checks"].array.isEmpty } ?? projects.first)?["id"].string ?? "" }
-    init() {
-        if let data = UserDefaults.standard.data(forKey: "hostProfiles"), let value = try? JSONDecoder().decode([HostProfile].self, from: data) { profiles = value }
-        activeID = UserDefaults.standard.string(forKey: "activeHost") ?? profiles.first?.id ?? ""
-    }
+    init(deps: AppModelDependencies = .live) { self.deps = deps; (profiles, activeID) = deps.loadProfiles() }
     func start() { if active != nil { Task { await connect() } } }
     func setDisplayVisible(_ visible: Bool) {
         guard displayVisible != visible else { return }
@@ -252,10 +265,7 @@ struct TeamResumeFailure: Equatable {
         if !retained { terminals[id] = nil }
         Task { await terminal.detach(); if retained { terminal.releaseDisplay() } }
     }
-    func persistProfiles() {
-        UserDefaults.standard.set(try? JSONEncoder().encode(profiles), forKey: "hostProfiles")
-        UserDefaults.standard.set(activeID, forKey: "activeHost")
-    }
+    func persistProfiles() { deps.saveProfiles(profiles, activeID) }
     func pair(label: String, origin: String, token: String, relay: String) async throws {
         var profile = HostProfile(label: label.isEmpty ? "Server" : label, origin: origin.trimmingCharacters(in: .whitespacesAndNewlines), relayMachineID: relay.isEmpty ? nil : relay.lowercased())
         let candidate = RemoteClient(profile: profile, token: token.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -276,36 +286,43 @@ struct TeamResumeFailure: Equatable {
         let profile = active
         stopPolling(); connectionGeneration = UUID(); let generation = connectionGeneration
         let previousTerminals = Array(terminals.values); terminals.removeAll()
-        for model in teamModels.values { model.stopPolling() }
-        for model in missionModels.values { model.stopPolling() }
-        let previousClient = client; client = nil
+        for model in teamModels.values { model.stopPolling() }; for model in missionModels.values { model.stopPolling() }
+        let previousClient = client; client = nil; connectedProfileID = nil; let supersededClient = takeConnectingClient()
         connected = false; connecting = true; sessions = []; sessionList = SessionList(); resources = .null; me = .null
+        pendingCreation = DraftRecord(); pendingTeamCreation = DraftRecord(); pendingMissionCreation = DraftRecord()
         teams = []; selectedTeamID = nil; selectedMissionID = nil; teamOpenedFrom = nil; projectFilter = nil; showingHome = true; teamModels.removeAll(); teamResumeFailures = [:]; teamsFresh = false
         projectGroups = .empty; board = .empty; boardFresh = false; boardError = ""; missionModels.removeAll(); cost = nil
         halt = .clear; haltRetryAt = .distantPast
         showingUnderstanding = false; understandingWorkspaceID = nil
         sessionsLoaded = false; teamsLoaded = false
         sessionFreshness.recovered(); teamFreshness.recovered()
-        for terminal in previousTerminals { await terminal.detach() }
-        await previousClient?.close()
-        guard generation == connectionGeneration else { return }
-        selectedID = nil; secondaryID = nil; mounted = []; message = ""
-        guard let profile else { connecting = false; return }
+        if let supersededClient { await deps.closeClient(supersededClient) }
+        for terminal in previousTerminals { await terminal.detach() }; if let previousClient { await deps.closeClient(previousClient) }
+        guard generation == connectionGeneration else { return }; if activeID != (profile?.id ?? "") { connecting = false; return }
+        selectedID = nil; secondaryID = nil; mounted = []; message = ""; guard let profile else { connecting = false; return }
         do {
-            let next = RemoteClient(profile: profile, token: try DeviceKeychain.read(profile.id))
-            client = next; let identity = try await next.request("/me")
-            guard generation == connectionGeneration else { await next.close(); return }
-            me = identity
-            pendingCreation = try drafts.read("\(profile.id):create")
-            pendingTeamCreation = try drafts.read("\(profile.id):create-team")
-            pendingMissionCreation = try drafts.read("\(profile.id):create-mission")
-            connected = true; connecting = false; persistProfiles()
-            connectionError = ""
-            startPolling()
+            let next = RemoteClient(profile: profile, token: try deps.readToken(profile.id)); connectingClient = (generation, next)
+            let identity = try await deps.fetchIdentity(next)
+            guard generation == connectionGeneration, activeID == profile.id else { if generation == connectionGeneration { connecting = false }; if let stale = takeConnectingClient(for: generation) { await deps.closeClient(stale) }; return }
+            guard let (createDraft, teamDraft, missionDraft) = try await readProfileDrafts(profile.id, generation: generation), generation == connectionGeneration, activeID == profile.id else { if generation == connectionGeneration && activeID != profile.id { connecting = false }; if let stale = takeConnectingClient(for: generation) { await deps.closeClient(stale) }; return }
+            _ = takeConnectingClient(for: generation)
+            client = next; connectedProfileID = profile.id; me = identity; pendingCreation = createDraft; pendingTeamCreation = teamDraft; pendingMissionCreation = missionDraft
+            connected = true; connecting = false; persistProfiles(); connectionError = ""; startPolling()
         } catch {
+            if let stale = takeConnectingClient(for: generation) { await deps.closeClient(stale) }
             guard generation == connectionGeneration else { return }
-            connecting = false; message = error.localizedDescription; connectionError = error.localizedDescription
-            sessionFreshness.failed()
+            connecting = false; message = error.localizedDescription; connectionError = error.localizedDescription; sessionFreshness.failed()
+        }
+    }
+    private func readProfileDrafts(_ profileID: String, generation: UUID) async throws -> (DraftRecord, DraftRecord, DraftRecord)? {
+        let keys = ["\(profileID):create", "\(profileID):create-team", "\(profileID):create-mission"]
+        while true {
+            let epochs = keys.map { draftEpochs[$0, default: 0] }
+            let c = try await draftQueue.run(keys[0]) { try await self.deps.readDraft(keys[0]) }
+            let t = try await draftQueue.run(keys[1]) { try await self.deps.readDraft(keys[1]) }
+            let m = try await draftQueue.run(keys[2]) { try await self.deps.readDraft(keys[2]) }
+            guard generation == connectionGeneration, activeID == profileID else { return nil }
+            if keys.indices.allSatisfy({ draftEpochs[keys[$0], default: 0] == epochs[$0] }) { return (c, t, m) }
         }
     }
     func refresh(includeResources: Bool = true) async {
@@ -333,7 +350,7 @@ struct TeamResumeFailure: Equatable {
                 if next != sessions { sessions = next }
             }
             sessionsLoaded = true
-            if !connected { connected = true }
+            if !connected && connectedProfileID == activeID { connected = true }
             sessionFreshness.recovered()
             connectionError = ""
             if !message.isEmpty { message = "" }
@@ -452,29 +469,47 @@ struct TeamResumeFailure: Equatable {
     }
     /// Missions start from the owner's sentence in one project. Retrying resends the identical body,
     /// so the host either recovers its recorded outcome or applies it once.
-    func createMission(groupID: String, objective: String) async throws {
-        guard let client else { throw DesktopError("Connect to a server first.") }
-        let profileID = activeID
-        if pendingMissionCreation.pending == nil {
-            let requestID = UUID().uuidString.lowercased()
-            let body: JSON = .object(["requestId": .string(requestID), "groupId": .string(groupID), "objective": .string(objective.trimmingCharacters(in: .whitespacesAndNewlines))])
-            var record = DraftRecord()
-            record.pending = PendingSend(id: requestID, text: String(decoding: try body.data(), as: UTF8.self))
-            try drafts.save(record, identity: "\(profileID):create-mission"); pendingMissionCreation = record
+    private func clearPendingDraft(_ suffix: String, expectedProfileID: String? = nil, expectedRequestID: String? = nil, expectedID: @escaping @MainActor (AppModel) -> String?, clear: @escaping @MainActor (AppModel) -> Void) {
+        let profileID = activeID, generation = connectionGeneration, key = "\(generation):\(suffix)", draftKey = "\(profileID):\(suffix)"
+        guard let targetID = expectedID(self), expectedProfileID == nil || expectedProfileID == profileID, expectedRequestID == nil || expectedRequestID == targetID, !creatingKinds.contains(key) else { return }
+        creatingKinds.insert(key)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.creatingKinds.remove(key) }
+            do { try await draftQueue.run(draftKey) { try await self.deps.clearDraftIfMatching(targetID, draftKey) }; draftEpochs[draftKey, default: 0] += 1; if self.connectionGeneration == generation && self.activeID == profileID && expectedID(self) == targetID { clear(self) } }
+            catch { self.message = error.localizedDescription }
         }
-        guard let payload = pendingMissionCreation.pending?.text else { throw DesktopError("Review the pending mission request before starting another.") }
-        let result = try await client.request("/missions", body: JSON.parse(Data(payload.utf8)))
-        try drafts.save(DraftRecord(), identity: "\(profileID):create-mission")
-        guard profileID == activeID else { return }
-        pendingMissionCreation = DraftRecord()
-        await refresh()
-        let id = result["id"].string.isEmpty ? result["mission"]["id"].string : result["id"].string
-        if !id.isEmpty { selectedMissionID = id }
     }
-    func clearMissionCreation() {
-        do { try drafts.save(DraftRecord(), identity: "\(activeID):create-mission"); pendingMissionCreation = DraftRecord() }
-        catch { message = error.localizedDescription }
+    private func submitPendingCreate(kind: String, path: String, current: DraftRecord, currentID: @escaping @MainActor (AppModel) -> String?, setPending: (DraftRecord) -> Void, buildBody: (String) throws -> JSON) async throws -> JSON {
+        guard connected, let client, connectedProfileID == activeID else { throw DesktopError("Connect to a server first.") }
+        let profileID = activeID, generation = connectionGeneration, key = "\(generation):\(kind)", draftKey = "\(profileID):\(kind)"
+        guard !creatingKinds.contains(key) else { throw DesktopError("A request is already in progress.") }
+        creatingKinds.insert(key); defer { creatingKinds.remove(key) }
+        var activeRecord = current
+        if activeRecord.pending == nil {
+            let requestID = UUID().uuidString.lowercased()
+            let record = DraftRecord(pending: PendingSend(id: requestID, text: String(decoding: try buildBody(requestID).data(), as: UTF8.self)))
+            setPending(record); activeRecord = record
+            do { try await draftQueue.run(draftKey) { try await self.deps.saveDraft(record, draftKey) }; draftEpochs[draftKey, default: 0] += 1 }
+            catch { if generation == connectionGeneration && activeID == profileID { setPending(current) }; throw error }
+        }
+        guard generation == connectionGeneration && activeID == profileID else { throw DesktopError("Profile changed before sending the request.") }
+        guard let activePending = activeRecord.pending else { throw DesktopError("Review the pending request before starting another.") }
+        let result = try await deps.sendRequest(client, path, JSON.parse(Data(activePending.text.utf8)))
+        try await draftQueue.run(draftKey) { try await self.deps.clearDraftIfMatching(activePending.id, draftKey) }; draftEpochs[draftKey, default: 0] += 1
+        if activeID == profileID && currentID(self) == activePending.id { setPending(DraftRecord()) }
+        return result
     }
+    func createMission(groupID: String, objective: String) async throws {
+        let generation = connectionGeneration
+        let result = try await submitPendingCreate(kind: "create-mission", path: "/missions", current: pendingMissionCreation, currentID: { $0.pendingMissionCreation.pending?.id }, setPending: { pendingMissionCreation = $0 }) {
+            .object(["requestId": .string($0), "groupId": .string(groupID), "objective": .string(objective.trimmingCharacters(in: .whitespacesAndNewlines))])
+        }
+        guard generation == connectionGeneration else { return }
+        await refresh(); let id = result["id"].string.isEmpty ? result["mission"]["id"].string : result["id"].string
+        if generation == connectionGeneration && !id.isEmpty { selectedMissionID = id }
+    }
+    func clearMissionCreation(expectedProfileID: String? = nil, expectedRequestID: String? = nil) { clearPendingDraft("create-mission", expectedProfileID: expectedProfileID, expectedRequestID: expectedRequestID, expectedID: { $0.pendingMissionCreation.pending?.id }) { $0.pendingMissionCreation = DraftRecord() } }
     /// Resume from the Home list: the same request as the team page, with its failure kept for the row.
     func resumeTeam(_ id: String) async {
         guard !resumingTeams.contains(id), let model = teamModel(for: id) else { return }
@@ -511,87 +546,46 @@ struct TeamResumeFailure: Equatable {
         teamModels[id] = model; return model
     }
     /// A page left with an unsent direction or an unconfirmed request keeps its model.
-    private func pruneTeamModel(_ id: String) {
-        guard id != selectedTeamID, let model = teamModels[id], !model.busy, model.pending == nil, model.direction.isEmpty else { return }
-        model.stopPolling(); teamModels[id] = nil
-    }
-    private func pruneMissionModel(_ id: String) {
-        guard id != selectedMissionID, let model = missionModels[id], !model.busy, model.pending == nil, model.direction.isEmpty else { return }
-        model.stopPolling(); missionModels[id] = nil
-    }
-    private func pruneDetailModels() {
-        for id in Array(teamModels.keys) { pruneTeamModel(id) }
-        for id in Array(missionModels.keys) { pruneMissionModel(id) }
-    }
+    private func pruneTeamModel(_ id: String) { guard id != selectedTeamID, let model = teamModels[id], !model.busy, model.pending == nil, model.direction.isEmpty else { return }; model.stopPolling(); teamModels[id] = nil }
+    private func pruneMissionModel(_ id: String) { guard id != selectedMissionID, let model = missionModels[id], !model.busy, model.pending == nil, model.direction.isEmpty else { return }; model.stopPolling(); missionModels[id] = nil }
+    private func pruneDetailModels() { for id in Array(teamModels.keys) { pruneTeamModel(id) }; for id in Array(missionModels.keys) { pruneMissionModel(id) } }
     /// Leaving a team for one of its member sessions.
     func openSession(_ id: String) { selectedTeamID = nil; selectedMissionID = nil; showingUnderstanding = false; showingHome = false; showingCost = false; selectedID = id }
     func createTeam(projectID: String, provider: String, useLineup: Bool, title: String, objective: String) async throws {
-        guard let client else { throw DesktopError("Connect to a server first.") }
-        let profileID = activeID
-        if pendingTeamCreation.pending == nil {
-            let requestID = UUID().uuidString.lowercased()
-            let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
-            let request = objective.trimmingCharacters(in: .whitespacesAndNewlines)
+        let generation = connectionGeneration
+        let result = try await submitPendingCreate(kind: "create-team", path: "/teams", current: pendingTeamCreation, currentID: { $0.pendingTeamCreation.pending?.id }, setPending: { pendingTeamCreation = $0 }) { requestID in
+            let name = title.trimmingCharacters(in: .whitespacesAndNewlines), request = objective.trimmingCharacters(in: .whitespacesAndNewlines)
             let firstLine = request.split(whereSeparator: \.isNewline).first.map(String.init) ?? request
             var fields: [String: JSON] = ["requestId": .string(requestID), "projectId": .string(projectID), "provider": .string(provider),
                                           "title": .string(name.isEmpty ? String(firstLine.prefix(100)) : name), "objective": .string(request)]
             if useLineup { fields["useConfiguredLineup"] = .bool(true) }
-            var record = DraftRecord()
-            record.pending = PendingSend(id: requestID, text: String(decoding: try JSON.object(fields).data(), as: UTF8.self))
-            try drafts.save(record, identity: "\(profileID):create-team"); pendingTeamCreation = record
+            return .object(fields)
         }
-        guard let payload = pendingTeamCreation.pending?.text else { throw DesktopError("Review the pending team request before starting another.") }
-        let result = try await client.request("/teams", body: JSON.parse(Data(payload.utf8)))
-        try drafts.save(DraftRecord(), identity: "\(profileID):create-team")
-        guard profileID == activeID else { return }
-        pendingTeamCreation = DraftRecord()
-        await refresh(); selectedTeamID = result["id"].string.isEmpty ? nil : result["id"].string
-        showingCreateTeam = false
+        guard generation == connectionGeneration else { return }
+        await refresh(); if generation == connectionGeneration { selectedTeamID = result["id"].string.isEmpty ? nil : result["id"].string; showingCreateTeam = false }
     }
-    func clearTeamCreation() {
-        do { try drafts.save(DraftRecord(), identity: "\(activeID):create-team"); pendingTeamCreation = DraftRecord() }
-        catch { message = error.localizedDescription }
-    }
+    func clearTeamCreation(expectedProfileID: String? = nil, expectedRequestID: String? = nil) { clearPendingDraft("create-team", expectedProfileID: expectedProfileID, expectedRequestID: expectedRequestID, expectedID: { $0.pendingTeamCreation.pending?.id }) { $0.pendingTeamCreation = DraftRecord() } }
     func model(for id: String) -> SessionModel? {
         if let existing = terminals[id] { return existing }
         guard let session = sessions.first(where: { $0.id == id }), let client else { return nil }
-        let model = SessionModel(session: session, client: client, profileID: activeID, drafts: drafts, role: me["role"].string, supportsStream: me["capabilities"]["remoteTerminal"].int == 1, summaryModel: summaryModel)
-        model.setDisplayVisible(displayVisible)
-        terminals[id] = model; return model
+        let model = SessionModel(session: session, client: client, profileID: activeID, role: me["role"].string, supportsStream: me["capabilities"]["remoteTerminal"].int == 1, summaryModel: summaryModel)
+        model.setDisplayVisible(displayVisible); terminals[id] = model; return model
     }
     func create(provider: String, project: String, title: String) async throws {
-        guard let client else { throw DesktopError("Connect to a server first.") }
-        let profileID = activeID
-        if pendingCreation.pending == nil {
-            let requestID = UUID().uuidString.lowercased()
+        let generation = connectionGeneration
+        let result = try await submitPendingCreate(kind: "create", path: "/sessions", current: pendingCreation, currentID: { $0.pendingCreation.pending?.id }, setPending: { pendingCreation = $0 }) { requestID in
             var fields: [String: JSON] = ["requestId": .string(requestID), "provider": .string(provider), "projectId": .string(project), "title": .string(title.isEmpty ? "\(provider.capitalized) session" : title), "prompt": .string("")]
             if title.isEmpty { fields["generatedTitle"] = .bool(true) }
-            let body: JSON = .object(fields)
-            var record = DraftRecord()
-            record.pending = PendingSend(id: requestID, text: String(decoding: try body.data(), as: UTF8.self))
-            try drafts.save(record, identity: "\(profileID):create"); pendingCreation = record
+            return .object(fields)
         }
-        guard let payload = pendingCreation.pending?.text else { throw DesktopError("Review the pending creation before starting another session.") }
-        let result = try await client.request("/sessions", body: JSON.parse(Data(payload.utf8)))
-        try drafts.save(DraftRecord(), identity: "\(profileID):create")
-        guard profileID == activeID else { return }
-        pendingCreation = DraftRecord()
-        await refresh(); openSession(result["id"].string.isEmpty ? result["session"]["id"].string : result["id"].string)
-        showingCreate = false
+        guard generation == connectionGeneration else { return }
+        await refresh(); if generation == connectionGeneration { openSession(result["id"].string.isEmpty ? result["session"]["id"].string : result["id"].string); showingCreate = false }
     }
-    func clearCreation() {
-        do { try drafts.save(DraftRecord(), identity: "\(activeID):create"); pendingCreation = DraftRecord() }
-        catch { message = error.localizedDescription }
-    }
-    func end(_ id: String) async {
-        guard let model = model(for: id) else { return }
-        await model.end(); await refresh()
-    }
+    func clearCreation(expectedProfileID: String? = nil, expectedRequestID: String? = nil) { clearPendingDraft("create", expectedProfileID: expectedProfileID, expectedRequestID: expectedRequestID, expectedID: { $0.pendingCreation.pending?.id }) { $0.pendingCreation = DraftRecord() } }
+    func end(_ id: String) async { guard let model = model(for: id) else { return }; await model.end(); await refresh() }
     func forget() async {
         guard let active else { return }
-        stopPolling()
-        for terminal in terminals.values { await terminal.detach() }
-        if let client { await client.close() }
+        stopPolling(); for terminal in terminals.values { await terminal.detach() }; if let client { await client.close() }
         do { try DeviceKeychain.remove(active.id) } catch { message = error.localizedDescription; return }
         profiles.removeAll { $0.id == active.id }; activeID = profiles.first?.id ?? ""; persistProfiles(); await connect()
     }
@@ -603,7 +597,7 @@ struct TeamResumeFailure: Equatable {
     @Published var notice = ""
     @Published var attached = false
     @Published var busy = false
-    @Published private(set) var sending = false
+    @Published var sending = false
     @Published var lease: JSON = .null
     @Published var directInput = false
     @Published var holder = ""
@@ -630,15 +624,21 @@ struct TeamResumeFailure: Equatable {
     private static let readCursorsKey = "readCursors"
     let pipe = TerminalPipe()
     let client: RemoteClient
+    let deps: SessionModelDependencies
     let profileID: String
-    let drafts: DraftStore
     let role: String
     let supportsStream: Bool
     private var streamID: String?
     private var renewal: Task<Void, Never>?
-    private var attachGeneration = UUID()
-    private var controlGeneration = UUID()
-    private var saveTask: Task<Void, Never>?
+    var attachGeneration = UUID()
+    var controlGeneration = UUID()
+    var saveTask: Task<Void, Never>?
+    var saveInFlight: Task<Void, Never>?
+    var draftLoadTask: Task<Void, Never>?
+    var activeSendToken: UUID?
+    var draftVersion = 0
+    var draftLoaded = false
+    var draftTouched = false
     private var queuedRaw = Data()
     private var sendingRaw = false
     private var lastSize = (80, 24)
@@ -652,7 +652,7 @@ struct TeamResumeFailure: Equatable {
     /// terminal also needs a current screen; sending a prompt does not.
     var ready: Bool { attached && session.running }
     var screenReady: Bool { ready && snapshotReady && !rendererUnavailable }
-    var canSend: Bool { ready && !busy && draft.pending == nil && !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    var canSend: Bool { ready && !busy && draftLoaded && draft.pending == nil && !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     /// A provider prompt is answered without the input lease or an attached terminal. A mission-managed session needs only that it is running.
     var canAnswerPrompt: Bool { role != "viewer" && !answering && (managed ? session.running : ready) }
     var managed: Bool { session.managed }
@@ -662,18 +662,13 @@ struct TeamResumeFailure: Equatable {
     var prompt: JSON? { let value = session.value["attention"]["prompt"]; return value == .null ? nil : value }
     /// Another device currently holds the input lease.
     var otherHolder: String? { hasControl || holder.isEmpty ? nil : holder }
-    init(session: AgentSession, client: RemoteClient, profileID: String, drafts: DraftStore, role: String, supportsStream: Bool, summaryModel: String? = nil) {
-        self.session = session; self.client = client; self.profileID = profileID; self.drafts = drafts; self.role = role; self.supportsStream = supportsStream; self.summaryModel = summaryModel
+    init(session: AgentSession, client: RemoteClient, profileID: String, role: String, supportsStream: Bool, summaryModel: String? = nil, deps: SessionModelDependencies = .live) {
+        self.session = session; self.client = client; self.profileID = profileID; self.role = role; self.supportsStream = supportsStream; self.summaryModel = summaryModel; self.deps = deps
         readCursor = (UserDefaults.standard.dictionary(forKey: Self.readCursorsKey) as? [String: String])?["\(profileID):\(session.id)"] ?? ""
-        do { draft = try drafts.read(identity) } catch { notice = error.localizedDescription }
-        if draft.pending != nil { notice = "A previous send was not confirmed. Inspect the terminal before retrying the same send or clearing it." }
+        draftLoadTask = Task { @MainActor [weak self] in await self?.loadInitialDraft() }
     }
     func showScreen() { screenShown = true; view = .screen }
-    func setDisplayVisible(_ visible: Bool) {
-        guard displayVisible != visible else { return }
-        displayVisible = visible
-        if visible, observing { startChat() } else { stopChat() }
-    }
+    func setDisplayVisible(_ visible: Bool) { guard displayVisible != visible else { return }; displayVisible = visible; if visible, observing { startChat() } else { stopChat() } }
 
     // ---- Chat ---------------------------------------------------------------------------
     /// Polls the host's chat record while this session is observed. Messages are the provider's
@@ -700,7 +695,7 @@ struct TeamResumeFailure: Equatable {
             guard generation == chatGeneration, displayVisible, observing else { return }
             let query = messagesCursor.isEmpty ? "" : "&after=\(messagesCursor.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? messagesCursor)"
             let page: JSON
-            do { page = try await client.request("/sessions/\(session.id)/messages?limit=100\(query)") }
+            do { page = try await deps.sendRequest(client, "/sessions/\(session.id)/messages?limit=100\(query)", nil, nil) }
             catch { if generation == chatGeneration, messages.isEmpty { chatNote = error.localizedDescription }; return }
             guard generation == chatGeneration else { return }
             let incoming = page["messages"].array.map(ChatMessage.init)
@@ -739,7 +734,7 @@ struct TeamResumeFailure: Equatable {
         summaryBusy = true; summaryError = ""
         let after = readCursor.isEmpty ? "" : "?after=\(readCursor)"
         do {
-            let value = try await client.request("/sessions/\(session.id)/summary\(after)")
+            let value = try await deps.sendRequest(client, "/sessions/\(session.id)/summary\(after)", nil, nil)
             summary = ChatSummary(model: value["model"].string, text: value["text"].string, messages: value["messages"].int)
         } catch { summaryError = error.localizedDescription }
         summaryBusy = false
@@ -755,7 +750,7 @@ struct TeamResumeFailure: Equatable {
         if let option { body["option"] = .number(Double(option)) }
         if let text, !text.isEmpty { body["text"] = .string(text) }
         do {
-            let receipt = try await client.request("/sessions/\(session.id)/answer", body: .object(body), controlID: managed ? nil : lease["id"].string)
+            let receipt = try await deps.sendRequest(client, "/sessions/\(session.id)/answer", .object(body), managed ? nil : lease["id"].string)
             let result = receipt["result"].string
             notice = result == "closed" ? "Answer delivered; the dialog closed." : result == "changed" ? "The dialog changed before the answer; check it again." : "Answer delivered; the dialog is still open. Check the screen."
         } catch { notice = error.localizedDescription }
@@ -768,11 +763,6 @@ struct TeamResumeFailure: Equatable {
         guard generation == rendererGeneration, receivedScreen, snapshotReady else { return }
         rendererUnavailable = false
     }
-    func setDraft(_ text: String) {
-        draft.text = text; saveTask?.cancel()
-        saveTask = Task { try? await Task.sleep(nanoseconds: 250_000_000); if !Task.isCancelled { saveDraft() } }
-    }
-    func saveDraft() { do { try drafts.save(draft, identity: identity) } catch { notice = error.localizedDescription } }
     func attach() async {
         observing = true
         if chatTask == nil, displayVisible { startChat() }
@@ -784,10 +774,10 @@ struct TeamResumeFailure: Equatable {
         queuedRaw = Data(); sendingRaw = false
         rendererGeneration = UUID(); pipe.feed(Data(), reset: true)
         do {
-            let id = try await client.openTerminal(sessionID: session.id) { [weak self] message in
+            let id = try await deps.openTerminal(client, session.id) { [weak self] message in
                 Task { @MainActor in guard let self, self.attachGeneration == current else { return }; self.receive(message) }
             }
-            guard current == attachGeneration else { await client.closeTerminal(id); return }
+            guard current == attachGeneration else { await deps.closeTerminal(client, id); return }
             streamID = id; attached = true
             if draft.pending == nil { notice = "" }
         } catch { notice = error.localizedDescription }
@@ -835,7 +825,7 @@ struct TeamResumeFailure: Equatable {
         queuedRaw = Data(); sendingRaw = false
         renewal?.cancel()
         do {
-            let response = try await client.request("/sessions/\(session.id)/control", body: .object(["action": .string("claim"), "takeover": .bool(takeover)]))
+            let response = try await deps.sendRequest(client, "/sessions/\(session.id)/control", .object(["action": .string("claim"), "takeover": .bool(takeover)]), nil)
             guard attachment == attachGeneration, operation == controlGeneration, attached else { return }
             lease = response["control"]; holder = lease["label"].string
             guard hasControl else { throw DesktopError("Control was not granted.") }
@@ -847,7 +837,7 @@ struct TeamResumeFailure: Equatable {
                     guard !Task.isCancelled, attachment == self.attachGeneration, operation == self.controlGeneration,
                           self.lease["id"] == leaseID, self.hasControl else { return }
                     do {
-                        let result = try await self.client.request("/sessions/\(self.session.id)/control", body: .object(["action": .string("renew"), "leaseId": leaseID]))
+                        let result = try await self.deps.sendRequest(self.client, "/sessions/\(self.session.id)/control", .object(["action": .string("renew"), "leaseId": leaseID]), nil)
                         guard !Task.isCancelled, attachment == self.attachGeneration, operation == self.controlGeneration,
                               self.lease["id"] == leaseID, self.attached else { return }
                         self.lease = result["control"]
@@ -866,7 +856,7 @@ struct TeamResumeFailure: Equatable {
     func release() async {
         controlGeneration = UUID()
         let old = lease; lease = .null; directInput = false; queuedRaw = Data(); sendingRaw = false; renewal?.cancel()
-        if !old["id"].string.isEmpty { _ = try? await client.request("/sessions/\(session.id)/control", body: .object(["action": .string("release"), "leaseId": old["id"]])) }
+        if !old["id"].string.isEmpty { _ = try? await deps.sendRequest(client, "/sessions/\(session.id)/control", .object(["action": .string("release"), "leaseId": old["id"]]), nil) }
     }
     /// Sending claims the input lease itself; a lease held elsewhere is taken over.
     func ensureControl() async -> Bool {
@@ -880,26 +870,6 @@ struct TeamResumeFailure: Equatable {
         guard screenReady else { return }
         Task { if await ensureControl() { directInput = true } }
     }
-    func send(retry: Bool = false) async {
-        guard ready, !busy, retry ? draft.pending != nil : canSend else { return }
-        guard await ensureControl(), hasControl, attached else { return }
-        let generation = attachGeneration
-        let text = retry ? (draft.pending?.text ?? draft.text) : draft.text
-        let id = draft.pending?.id ?? UUID().uuidString.lowercased()
-        sending = true
-        draft.pending = PendingSend(id: id, text: text)
-        do { try drafts.save(draft, identity: identity) } catch { notice = error.localizedDescription; sending = false; return }
-        busy = true
-        do {
-            let receipt = try await client.request("/sessions/\(session.id)/input", body: .object(["requestId": .string(id), "text": .string(text), "submit": .bool(true)]), controlID: lease["id"].string)
-            guard generation == attachGeneration else { return }
-            guard receipt["state"].string == "delivered" || receipt["receipt"]["state"].string == "delivered" else { throw DesktopError("Delivery is uncertain. Inspect the terminal before retrying.", code: "delivery-unknown") }
-            if draft.text == text { draft.text = "" }; draft.pending = nil; saveDraft()
-            notice = "Delivered to the terminal."
-        } catch { if generation == attachGeneration { notice = error.localizedDescription } }
-        if generation == attachGeneration { busy = false; sending = false }
-    }
-    func clearPending() { if draft.text == draft.pending?.text { draft.text = "" }; draft.pending = nil; saveDraft(); notice = "Previous send cleared after your review." }
     func raw(_ text: String) {
         guard directInput, canUseTerminal else { return }
         let data = Data(text.utf8)
@@ -934,18 +904,18 @@ struct TeamResumeFailure: Equatable {
     }
     private func sendRaw(_ text: String, stream: String, control: UUID, leaseID: JSON) async throws {
         guard canUseTerminal, directInput, control == controlGeneration, lease["id"] == leaseID else { throw DesktopError("Terminal input stopped. Reconnect before sending input.") }
-        try await client.sendTerminal(stream, message: .object(["op": .string("raw"), "requestId": .string(UUID().uuidString.lowercased()), "text": .string(text), "leaseId": leaseID]))
+        try await deps.sendTerminal(client, stream, .object(["op": .string("raw"), "requestId": .string(UUID().uuidString.lowercased()), "text": .string(text), "leaseId": leaseID]))
     }
     func resize(_ cols: Int, _ rows: Int) async {
         lastSize = (cols, rows)
         guard hasControl, let streamID else { return }
-        try? await client.sendTerminal(streamID, message: .object(["op": .string("resize"), "cols": .number(Double(min(240, max(20, cols)))), "rows": .number(Double(min(100, max(5, rows)))), "leaseId": lease["id"]]))
+        try? await deps.sendTerminal(client, streamID, .object(["op": .string("resize"), "cols": .number(Double(min(240, max(20, cols)))), "rows": .number(Double(min(100, max(5, rows)))), "leaseId": lease["id"]]))
     }
     func connectionLost() {
         controlGeneration = UUID()
         let previous = streamID; streamID = nil; attachGeneration = UUID()
         attached = false; busy = false; sending = false; snapshotReady = false; rendererUnavailable = true; lease = .null; directInput = false; queuedRaw = Data(); renewal?.cancel()
-        if let previous { Task { await client.closeTerminal(previous) } }
+        if let previous { Task { await deps.closeTerminal(client, previous) } }
         notice = "Connection lost. Your draft stays here; reconnect to check server status."
     }
     func detach() async {
@@ -955,11 +925,11 @@ struct TeamResumeFailure: Equatable {
         controlGeneration = UUID()
         attachGeneration = UUID(); snapshotReady = false; rendererUnavailable = true
         streamID = nil; attached = false; busy = false; sending = false; lease = .null; directInput = false; queuedRaw = Data(); renewal?.cancel()
-        saveTask?.cancel(); saveDraft()
+        saveTask?.cancel(); saveTask = nil; try? await persistDraft(flush: true)
         if !previousLease["id"].string.isEmpty {
-            _ = try? await client.request("/sessions/\(session.id)/control", body: .object(["action": .string("release"), "leaseId": previousLease["id"]]))
+            _ = try? await deps.sendRequest(client, "/sessions/\(session.id)/control", .object(["action": .string("release"), "leaseId": previousLease["id"]]), nil)
         }
-        if let previous { await client.closeTerminal(previous) }
+        if let previous { await deps.closeTerminal(client, previous) }
     }
     /// Drops the screen and chat kept for display after this session left the pane cache. Attaching again reloads both.
     func releaseDisplay() {
@@ -967,29 +937,5 @@ struct TeamResumeFailure: Equatable {
         pipe.clear()
         messages = []; messagesCursor = ""; messageSource = ""; unread = 0; summary = nil
         chatNote = "Loading the conversation…"
-    }
-    private func lifecycle(_ action: String, controlID: String? = nil) async throws -> JSON {
-        let key = "\(identity):\(action)"
-        var pending = try drafts.read(key)
-        if pending.pending == nil { pending.pending = PendingSend(id: UUID().uuidString.lowercased(), text: action); try drafts.save(pending, identity: key) }
-        let result = try await client.request("/sessions/\(session.id)/\(action)", body: .object(["requestId": .string(pending.pending!.id)]), controlID: controlID)
-        try drafts.save(DraftRecord(), identity: key)
-        return result
-    }
-    func end() async {
-        guard role == "owner", !managed else { return }
-        do {
-            if !hasControl { await claim() }
-            guard hasControl else { throw DesktopError("Take control before ending this session.") }
-            _ = try await lifecycle("stop", controlID: lease["id"].string)
-            notice = "End requested. Waiting for confirmed process exit."
-        } catch { notice = error.localizedDescription }
-    }
-    func resume() async {
-        guard !managed else { return }
-        do {
-            let response = try await lifecycle("resume")
-            notice = "Resumed as \(response["id"].string.prefix(8)). Select the new session from the sidebar."
-        } catch { notice = error.localizedDescription }
     }
 }

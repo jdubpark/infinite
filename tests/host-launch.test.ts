@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -9,7 +10,7 @@ import { EGRESS_ENVIRONMENT_NAMES } from "../packages/host/src/egress.js";
 import { codeModeEnabled } from "../packages/host/src/code-mode.js";
 import { buildLaunch, headlessLaunch, headlessResumeProfile, missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
 import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv } from "../packages/host/src/worker-env.js";
-import { claudeConfigPath, codexTrustArgs, recordClaudeTrust, repositoryCodexConfig } from "../packages/host/src/workspace-trust.js";
+import { claudeConfigPath, codexTrustArgs, recordClaudeTrust, recordClaudeTrustAsync, repositoryCodexConfig } from "../packages/host/src/workspace-trust.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 
@@ -482,6 +483,30 @@ test("Claude trust takes Claude's own config lock and keeps a concurrent Claude 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("recordClaudeTrustAsync waits without blocking the event loop and recovers stale locks safely", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-claude-async-")));
+  try {
+    const config = join(root, ".claude.json"), lock = `${config}.lock`, member = join(root, "member");
+    mkdirSync(member);
+    writeFileSync(config, JSON.stringify({ numStartups: 1 }));
+    mkdirSync(lock);
+    let ticks = 0;
+    const ticker = setInterval(() => { ticks++; }, 10);
+    setTimeout(() => { rmSync(lock, { recursive: true, force: true }); }, 60);
+    try {
+      assert.equal(await recordClaudeTrustAsync(config, member, 1000), true);
+      assert.ok(ticks >= 2, "event loop timers must continue firing while waiting on the config lock");
+      assert.equal(JSON.parse(readFileSync(config, "utf8")).projects[member].hasTrustDialogAccepted, true);
+    } finally { clearInterval(ticker); }
+
+    mkdirSync(lock);
+    const old = new Date(Date.now() - 60000);
+    utimesSync(lock, old, old);
+    assert.equal(await recordClaudeTrustAsync(config, join(root, "stale-member"), 100), true);
+    assert.ok(!existsSync(lock));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("Claude trust targets the config file Claude reads, including its legacy location", () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-claude-path-")));
   try {
@@ -702,4 +727,91 @@ test("the MCP server lists entry tools only when the capability says so", () => 
   assert.equal(answer.error?.message, "Unknown tool. Only report is available.");
   const [withEntries] = teamMcpSession({ ...assignment, INFINITE_TEAM_ENTRY_TOOLS: "1" }, [{ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "entry_get", arguments: {} } }]);
   assert.equal(withEntries.result.isError, true, "an entry call with a bad argument fails inside the tool result");
+});
+
+test("concurrent stale-lock recovery never removes a newly acquired Claude lock or corrupts config JSON", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-claude-recover-")));
+  const realStatSync = fs.statSync;
+  try {
+    const config = join(root, ".claude.json"), lock = `${config}.lock`, recover = `${lock}.recover`;
+    const memberA = join(root, "member-a"), memberB = join(root, "member-b");
+    mkdirSync(memberA); mkdirSync(memberB);
+    writeFileSync(config, JSON.stringify({ numStartups: 1 }));
+    mkdirSync(lock);
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lock, old, old);
+
+    let injected = false;
+    let lockHeldDuringWorkerA = false;
+    let sameInodeDuringWorkerA = false;
+    let freshIno: number | bigint | undefined;
+    let releaseWorkerA!: () => void;
+    const workerAReady = new Promise<void>(resolve => { releaseWorkerA = resolve; });
+    fs.statSync = ((path: fs.PathLike, options?: fs.StatSyncOptions) => {
+      const info = (realStatSync as (...args: unknown[]) => fs.Stats)(path, options);
+      if (!injected && String(path) === lock) {
+        injected = true;
+        rmdirSync(lock);
+        mkdirSync(lock);
+        freshIno = realStatSync(lock).ino;
+        setTimeout(() => {
+          lockHeldDuringWorkerA = existsSync(lock);
+          sameInodeDuringWorkerA = lockHeldDuringWorkerA && realStatSync(lock).ino === freshIno;
+          writeFileSync(config, JSON.stringify({ numStartups: 2, projects: { [memberA]: { hasTrustDialogAccepted: true } } }));
+          try { rmdirSync(lock); } catch {}
+          releaseWorkerA();
+        }, 120);
+      }
+      return info;
+    }) as typeof fs.statSync;
+    syncBuiltinESMExports();
+    try {
+      assert.equal(await recordClaudeTrustAsync(config, memberB, 2000), true);
+      await workerAReady;
+    } finally {
+      fs.statSync = realStatSync;
+      syncBuiltinESMExports();
+    }
+    assert.equal(injected, true);
+    assert.equal(lockHeldDuringWorkerA, true, "fresh lock must remain held until Worker A releases it");
+    assert.equal(sameInodeDuringWorkerA, true, "fresh lock inode must not be replaced while Worker A holds it");
+    assert.deepEqual(JSON.parse(readFileSync(config, "utf8")), {
+      numStartups: 2,
+      projects: {
+        [memberA]: { hasTrustDialogAccepted: true },
+        [memberB]: { hasTrustDialogAccepted: true },
+      },
+    });
+    assert.equal(existsSync(lock), false);
+    assert.equal(existsSync(recover), false);
+
+    mkdirSync(lock);
+    utimesSync(lock, old, old);
+    mkdirSync(recover);
+    assert.throws(() => recordClaudeTrust(config, join(root, "contended"), 100), /locked/);
+    assert.equal(existsSync(lock), true, "active recovery mutex prevents another worker from deleting the lock");
+    assert.equal(existsSync(recover), true);
+    utimesSync(recover, old, old);
+    await assert.rejects(() => recordClaudeTrustAsync(config, join(root, "stale-recover"), 100), /locked/);
+    assert.equal(existsSync(lock), true, "stale recovery mutex fails closed without deleting the lock");
+    assert.equal(existsSync(recover), true, "stale recovery mutex is never removed by another worker");
+    assert.equal(JSON.parse(readFileSync(config, "utf8")).projects[join(root, "stale-recover")], undefined);
+    rmdirSync(recover);
+    rmdirSync(lock);
+
+    mkdirSync(lock);
+    utimesSync(lock, old, old);
+    const burst = Array.from({ length: 6 }, (_, index) => join(root, `burst-${index}`));
+    for (const dir of burst) mkdirSync(dir);
+    const results = await Promise.all(burst.map(dir => recordClaudeTrustAsync(config, dir, 3000)));
+    assert.deepEqual(results, burst.map(() => true));
+    const parsed = JSON.parse(readFileSync(config, "utf8")) as { projects: Record<string, { hasTrustDialogAccepted: boolean }> };
+    for (const dir of burst) assert.equal(parsed.projects[dir]?.hasTrustDialogAccepted, true);
+    assert.equal(existsSync(lock), false);
+    assert.equal(existsSync(recover), false);
+  } finally {
+    fs.statSync = realStatSync;
+    syncBuiltinESMExports();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

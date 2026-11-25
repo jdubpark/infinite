@@ -28,14 +28,15 @@ public struct FilePage: Sendable {
 public struct FileVersion: Codable, Equatable, Sendable {
     public let sha256: String
     public let size: Int
-    /// Local identity includes timestamps and inode; remote identity uses a content hash.
     public let stamp: String?
     public init(sha256: String, size: Int, stamp: String? = nil) { self.sha256 = sha256; self.size = size; self.stamp = stamp }
 }
 
+private struct SendableBox<Value>: @unchecked Sendable {
+    let value: Value
+}
+
 public enum LocalFiles {
-    /// Resolve once when the user chooses an existing root. Foundation URL
-    /// standardization collapses canonical system paths back to symbolic aliases.
     public static func canonicalRoot(_ selected: URL) throws -> URL {
         guard let resolved = realpath(selected.path, nil) else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         defer { free(resolved) }
@@ -61,8 +62,6 @@ public enum LocalFiles {
     }
     public static func location(root: URL, path: String, createParents: Bool = false) throws -> URL {
         let parts = try components(path)
-        // The folder picker resolves the trusted root once. Revalidate every
-        // ancestor on each operation so later symlink replacements fail closed.
         var current = URL(fileURLWithPath: "/", isDirectory: true)
         for part in root.pathComponents.dropFirst() {
             current.appendPathComponent(part)
@@ -147,20 +146,60 @@ public enum LocalFiles {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
         return try canonicalRoot(root)
     }
+    public static func runCancellable<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+        try Task.checkCancellation()
+        let task = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return try work()
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
     static func stage(root: URL, path: String) throws -> LocalDownload { try LocalDownload(root: root, path: path) }
-    static func install(_ staged: LocalDownload, expected: FileVersion?) throws {
+    static func install(_ staged: LocalDownload, expected: FileVersion?, isCancelled: () -> Bool = { Task.isCancelled }) throws {
+        if isCancelled() { throw CancellationError() }
         var coordinationError: NSError?, result: Result<Void, Error> = .success(())
         NSFileCoordinator().coordinate(writingItemAt: staged.destination, options: .forReplacing, error: &coordinationError) { _ in
-            result = Result { try staged.install(expected: expected) }
+            if isCancelled() {
+                result = .failure(CancellationError())
+                return
+            }
+            result = Result { try staged.install(expected: expected, isCancelled: isCancelled) }
         }
         if let coordinationError { throw coordinationError }; try result.get()
     }
+    static func installAsync(_ staged: LocalDownload, expected: FileVersion?) async throws {
+        try Task.checkCancellation()
+        let gate = LockFreeInt64(0)
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if gate.load() != 0 {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                DispatchQueue.global(qos: .userInitiated).async {
+                    guard gate.load() == 0 else {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+                    do {
+                        try install(staged, expected: expected, isCancelled: { gate.load() != 0 })
+                        continuation.resume()
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        } onCancel: {
+            gate.store(1)
+        }
+    }
 }
 
-/// Directory descriptors keep transfers anchored even if a Finder move or editor
-/// renames an ancestor. Replacements preserve the actual displaced inode, including
-/// subsequent writes by an editor that still has that file open.
-final class LocalDownload {
+final class LocalDownload: @unchecked Sendable {
     let destination: URL
     let handle: FileHandle
     private let root: URL, path: String, name: String, directoryName: String
@@ -191,11 +230,11 @@ final class LocalDownload {
               before.st_dev == after.st_dev, before.st_ino == after.st_ino else { throw DesktopError("The destination folder moved during transfer. Preview again.", code: "local-conflict") }
     }
     private func sameFile(_ before: stat, _ after: stat) -> Bool {
-        // Atomic rename changes ctime. Identity, size and mtime remain comparable.
         before.st_dev == after.st_dev && before.st_ino == after.st_ino && before.st_size == after.st_size &&
         before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec && before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec
     }
-    func install(expected: FileVersion?) throws {
+    func install(expected: FileVersion?, isCancelled: () -> Bool = { Task.isCancelled }) throws {
+        if isCancelled() { throw CancellationError() }
         try validateParent()
         guard try LocalFiles.version(parent: parent, name: name) == expected else { throw DesktopError("The destination changed since preview. No file was replaced.", code: "local-conflict") }
         let previous = try LocalFiles.info(parent: parent, name: name)
@@ -206,6 +245,7 @@ final class LocalDownload {
         try handle.synchronize()
         var incoming = stat(); guard fstat(handle.fileDescriptor, &incoming) == 0 else { throw POSIXError(.EIO) }
         try validateParent()
+        if isCancelled() { throw CancellationError() }
         if let expected, let previous {
             guard renameatx_np(directory, name, parent, name, UInt32(RENAME_SWAP)) == 0 else { throw DesktopError("The destination changed or this volume cannot replace files safely. No file was replaced.", code: "local-conflict") }
             preserve = true
@@ -216,8 +256,6 @@ final class LocalDownload {
                       let installed = try LocalFiles.info(parent: parent, name: name), sameFile(incoming, installed) else { throw DesktopError("The destination changed during replacement.", code: "local-conflict") }
                 try validateParent()
             } catch {
-                // Exchange again to restore the displaced file. If another writer
-                // replaced our download, its version is also retained, never unlinked.
                 let restored = renameatx_np(directory, name, parent, name, UInt32(RENAME_SWAP)) == 0
                 throw DesktopError(restored ? "A concurrent edit was detected and the previous file restored. Both copies are kept in \(directoryName). Preview again." : "The destination changed during replacement. The displaced file is kept in \(directoryName); review it before continuing.", code: "local-conflict")
             }
@@ -240,6 +278,9 @@ public struct FileTransfer: Sendable {
         var url = URLComponents(); url.queryItems = values.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
         return path + "?" + (url.percentEncodedQuery ?? "")
     }
+    private nonisolated func runDiskIO<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+        try await LocalFiles.runCancellable(work)
+    }
     public func list(path: String, cursor: String? = nil) async throws -> FilePage {
         _ = try LocalFiles.components(path)
         var values = ["path": path, "limit": "200"]; if let cursor { values["cursor"] = cursor }
@@ -260,25 +301,34 @@ public struct FileTransfer: Sendable {
     }
     public func upload(root: URL, localPath: String, remotePath: String, source: FileVersion, expectedRemote: FileVersion?, progress: @escaping @Sendable (Double) -> Void) async throws {
         try Task.checkCancellation()
-        guard try LocalFiles.version(root: root, path: localPath) == source else { throw DesktopError("The local source changed since preview.", code: "local-conflict") }
+        guard try await runDiskIO({ try LocalFiles.version(root: root, path: localPath) }) == source else { throw DesktopError("The local source changed since preview.", code: "local-conflict") }
         guard try await metadata(path: remotePath) == expectedRemote else { throw DesktopError("The server destination changed since preview.", code: "file-conflict") }
+        try Task.checkCancellation()
         if let expectedRemote, expectedRemote.sha256 != source.sha256 {
-            let backup = try LocalFiles.privateDirectory("Recovered Files").appendingPathComponent(UUID().uuidString, isDirectory: true)
-            try FileManager.default.createDirectory(at: backup, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            let backup = try await runDiskIO {
+                let dir = try LocalFiles.privateDirectory("Recovered Files").appendingPathComponent(UUID().uuidString, isDirectory: true)
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+                return dir
+            }
             try await download(remotePath: remotePath, root: backup, localPath: URL(fileURLWithPath: remotePath).lastPathComponent, source: expectedRemote, expectedLocal: nil, progress: { _ in })
         }
+        try Task.checkCancellation()
         let parent = remotePath.split(separator: "/").dropLast().joined(separator: "/")
         try await createDirectory(path: parent)
+        try Task.checkCancellation()
         let begun = try await client.request(prefix + "/uploads", body: .object(["path": .string(remotePath), "size": .number(Double(source.size)), "sha256": .string(source.sha256), "expectedHash": expectedRemote.map { .string($0.sha256) } ?? .null]))
         let id = begun["uploadId"].string
         guard UUID(uuidString: id) != nil else { throw DesktopError("The server returned an invalid upload receipt.") }
         do {
-            let url = try LocalFiles.location(root: root, path: localPath)
-            let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
-            guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true); defer { try? handle.close() }
+            let box = try await runDiskIO { () -> SendableBox<FileHandle> in
+                let url = try LocalFiles.location(root: root, path: localPath)
+                let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+                guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                return SendableBox(value: FileHandle(fileDescriptor: fd, closeOnDealloc: true))
+            }
+            defer { try? box.value.close() }
             var offset = 0, digest = SHA256()
-            while let bytes = try handle.read(upToCount: Self.chunkBytes), !bytes.isEmpty {
+            while let bytes = try await runDiskIO({ try box.value.read(upToCount: Self.chunkBytes) }), !bytes.isEmpty {
                 try Task.checkCancellation(); digest.update(data: bytes)
                 guard offset + bytes.count <= source.size else { throw DesktopError("The source grew during upload.", code: "local-conflict") }
                 let receipt = try await client.request(prefix + "/uploads/" + id, body: .object(["offset": .number(Double(offset)), "base64": .string(bytes.base64EncodedString())]), method: "PUT")
@@ -287,22 +337,22 @@ public struct FileTransfer: Sendable {
                 progress(Double(offset) / Double(max(1, source.size)))
             }
             guard offset == source.size, Data(digest.finalize()).hex == source.sha256,
-                  try LocalFiles.version(root: root, path: localPath) == source else { throw DesktopError("The source changed during upload; it was not committed.", code: "local-conflict") }
+                  try await runDiskIO({ try LocalFiles.version(root: root, path: localPath) }) == source else { throw DesktopError("The source changed during upload; it was not committed.", code: "local-conflict") }
             try Task.checkCancellation()
             let committed = try await client.request(prefix + "/uploads/" + id + "/commit", body: .object([:]))
             guard committed["sha256"].string == source.sha256 else { throw DesktopError("The server did not confirm the uploaded hash.") }
             progress(1)
         } catch {
-            // Cancel only this staging object. A lost commit receipt is never replayed.
             _ = try? await client.request(prefix + "/uploads/" + id, method: "DELETE")
             throw error
         }
     }
     public func download(remotePath: String, root: URL, localPath: String, source: FileVersion, expectedLocal: FileVersion?, progress: @escaping @Sendable (Double) -> Void) async throws {
         try Task.checkCancellation()
-        let staged = try LocalFiles.stage(root: root, path: localPath)
-        guard try LocalFiles.version(root: root, path: localPath) == expectedLocal else { throw DesktopError("The local destination changed since preview.", code: "local-conflict") }
-        let handle = staged.handle
+        let staged = try await runDiskIO { try LocalFiles.stage(root: root, path: localPath) }
+        guard try await runDiskIO({ try LocalFiles.version(root: root, path: localPath) }) == expectedLocal else { throw DesktopError("The local destination changed since preview.", code: "local-conflict") }
+        try Task.checkCancellation()
+        let handleBox = SendableBox(value: staged.handle)
         var offset = 0, digest = SHA256()
         repeat {
             try Task.checkCancellation()
@@ -311,12 +361,12 @@ public struct FileTransfer: Sendable {
                   let bytes = Data(base64Encoded: value["base64"].string), bytes.count <= Self.chunkBytes,
                   offset + bytes.count <= source.size, value["nextOffset"].int == offset + bytes.count,
                   !bytes.isEmpty || offset == source.size else { throw DesktopError("The server returned an inconsistent file chunk.", code: "file-conflict") }
-            try handle.write(contentsOf: bytes); digest.update(data: bytes); offset += bytes.count
+            try await runDiskIO { try handleBox.value.write(contentsOf: bytes) }; digest.update(data: bytes); offset += bytes.count
             progress(Double(offset) / Double(max(1, source.size)))
         } while offset < source.size
         guard Data(digest.finalize()).hex == source.sha256 else { throw DesktopError("The downloaded file failed its integrity check.") }
-        try handle.synchronize(); try Task.checkCancellation()
-        try LocalFiles.install(staged, expected: expectedLocal)
+        try await runDiskIO { try handleBox.value.synchronize() }; try Task.checkCancellation()
+        try await LocalFiles.installAsync(staged, expected: expectedLocal)
         progress(1)
     }
 }

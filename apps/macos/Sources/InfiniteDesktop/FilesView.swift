@@ -2,22 +2,74 @@ import SwiftUI
 import AppKit
 import InfiniteCore
 
+struct LocalFolderListingState {
+    var entries: [FileEntry] = []
+    var selection = Set<String>()
+    var loaded = false
+    var loadedKey: String?
+    var loading = false
+    var error = ""
+    var generation = UUID()
+
+    mutating func beginLoad(root: URL?, path: String) -> (generation: UUID, key: String)? {
+        guard let root else {
+            generation = UUID()
+            entries = []
+            selection = []
+            loaded = false
+            loadedKey = nil
+            loading = false
+            error = ""
+            return nil
+        }
+        let key = root.path + "\u{0}" + path
+        if key != loadedKey {
+            entries = []
+            selection = []
+            loaded = false
+            error = ""
+        }
+        let next = UUID()
+        generation = next
+        loading = true
+        error = ""
+        return (next, key)
+    }
+
+    mutating func finish(generation: UUID, key: String, entries: [FileEntry]) -> Bool {
+        guard generation == self.generation else { return false }
+        self.entries = entries
+        self.loadedKey = key
+        self.loaded = true
+        self.loading = false
+        self.error = ""
+        return true
+    }
+
+    mutating func fail(generation: UUID, message: String) -> Bool {
+        guard generation == self.generation else { return false }
+        self.entries = []
+        self.loaded = false
+        self.loading = false
+        self.error = message
+        return true
+    }
+}
+
 struct FilesView: View {
     @ObservedObject var app: AppModel
     @State private var projectID = ""
     @State private var localRoot: URL?
     @State private var localPath = ""
     @State private var remotePath = ""
-    @State private var localEntries: [FileEntry] = []
+    @State private var localState = LocalFolderListingState()
     @State private var remoteEntries: [FileEntry] = []
-    @State private var localSelection = Set<String>()
     @State private var remoteSelection = Set<String>()
     @State private var nextCursor: String?
     @State private var remoteTotal = 0
     @State private var remoteLoaded = false
     @State private var remoteLoadedPath: String?
     @State private var loadingRemote = false
-    @State private var localError = ""
     @State private var remoteError = ""
     @State private var status = ""
     @State private var failure = ""
@@ -33,7 +85,7 @@ struct FilesView: View {
         guard let client = app.client, !projectID.isEmpty else { return nil }
         return FileTransfer(client: client, projectID: projectID)
     }
-    private var localChosen: [FileEntry] { localEntries.filter { localSelection.contains($0.id) } }
+    private var localChosen: [FileEntry] { localState.entries.filter { localState.selection.contains($0.id) } }
     private var remoteChosen: [FileEntry] { remoteEntries.filter { remoteSelection.contains($0.id) } }
     private var canUpload: Bool { app.connected && app.isOwner && !busy && !localChosen.isEmpty && localChosen.allSatisfy(\.transferable) }
     private var canDownload: Bool { app.connected && localRoot != nil && !busy && !remoteChosen.isEmpty && remoteChosen.allSatisfy(\.transferable) }
@@ -91,16 +143,17 @@ struct FilesView: View {
                 Spacer(); Button("Choose folder…") { chooseFolder() }.disabled(busy)
             }
             HStack {
-                Button { localPath = parent(localPath); localSelection = []; refreshLocal() } label: { Image(systemName: "arrow.up") }.disabled(localPath.isEmpty || busy)
+                Button { localPath = parent(localPath); refreshLocal() } label: { Image(systemName: "arrow.up") }.disabled(localPath.isEmpty || busy)
                 Text(localRoot.map { $0.lastPathComponent + (localPath.isEmpty ? "" : "/" + localPath) } ?? "No folder selected")
                     .font(.caption.monospaced()).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
             }
-            if !localError.isEmpty { stateView(localError, symbol: "exclamationmark.triangle") }
+            if !localState.error.isEmpty { stateView(localState.error, symbol: "exclamationmark.triangle") }
             else if localRoot == nil { stateView("Choose a Mac folder to browse, transfer, or sync.", symbol: "folder") }
-            else if localEntries.isEmpty { stateView("This Mac folder is empty.", symbol: "folder") }
+            else if !localState.loaded && localState.loading { ProgressView("Loading Mac folder…").frame(maxWidth: .infinity, maxHeight: .infinity) }
+            else if localState.entries.isEmpty { stateView("This Mac folder is empty.", symbol: "folder") }
             else {
-                Table(localEntries, selection: $localSelection) {
-                    TableColumn("Name") { entry in entryName(entry) { localPath = entry.path; localSelection = []; refreshLocal() } }
+                Table(localState.entries, selection: $localState.selection) {
+                    TableColumn("Name") { entry in entryName(entry) { localPath = entry.path; refreshLocal() } }
                     TableColumn("Size") { entry in Text(size(entry)).foregroundStyle(.secondary) }.width(70)
                 }
             }
@@ -156,15 +209,27 @@ struct FilesView: View {
         let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.allowsMultipleSelection = false
         panel.prompt = "Choose folder"
         if panel.runModal() == .OK, let url = panel.url {
-            do { localRoot = try LocalFiles.canonicalRoot(url); localPath = ""; localSelection = []; plan = nil; refreshLocal() }
-            catch { localError = error.localizedDescription }
+            do { localRoot = try LocalFiles.canonicalRoot(url); localPath = ""; plan = nil; refreshLocal() }
+            catch { _ = localState.beginLoad(root: nil, path: ""); localRoot = nil; localState.error = error.localizedDescription }
         }
     }
     private func refresh() { refreshLocal(); refreshRemote() }
     private func refreshLocal() {
-        guard let root = localRoot else { return }
-        do { localEntries = try LocalFiles.list(root: root, path: localPath); localError = "" }
-        catch { localEntries = []; localError = error.localizedDescription }
+        guard let root = localRoot, let request = localState.beginLoad(root: root, path: localPath) else {
+            _ = localState.beginLoad(root: nil, path: "")
+            return
+        }
+        let path = localPath
+        Task {
+            do {
+                let entries = try await LocalFiles.runCancellable { try LocalFiles.list(root: root, path: path) }
+                guard localRoot == root, localPath == path else { return }
+                _ = localState.finish(generation: request.generation, key: request.key, entries: entries)
+            } catch {
+                guard localRoot == root, localPath == path else { return }
+                _ = localState.fail(generation: request.generation, message: error.localizedDescription)
+            }
+        }
     }
     private func refreshRemote(more: Bool = false) {
         let path = remotePath, cursor = more ? nextCursor : nil
@@ -200,7 +265,7 @@ struct FilesView: View {
         begin("Preparing upload…") {
             for entry in chosen {
                 try Task.checkCancellation()
-                guard let source = try await Task.detached(operation: { try LocalFiles.version(root: root, path: entry.path) }).value else { throw DesktopError("The selected local file disappeared.") }
+                guard let source = try await LocalFiles.runCancellable({ try LocalFiles.version(root: root, path: entry.path) }) else { throw DesktopError("The selected local file disappeared.") }
                 let path = SyncPlanner.joined(target, entry.name), expected = try await transfer.metadata(path: path)
                 if let expected, expected.sha256 != source.sha256, !confirmReplacement(entry.name, side: "server") { throw CancellationError() }
                 status = "Uploading " + entry.name
@@ -217,7 +282,7 @@ struct FilesView: View {
                 try Task.checkCancellation()
                 guard let source = try await transfer.metadata(path: entry.path) else { throw DesktopError("The selected server file disappeared.") }
                 let path = SyncPlanner.joined(target, entry.name)
-                let expected = try await Task.detached(operation: { try LocalFiles.version(root: root, path: path) }).value
+                let expected = try await LocalFiles.runCancellable { try LocalFiles.version(root: root, path: path) }
                 if let expected, expected.sha256 != source.sha256, !confirmReplacement(entry.name, side: "Mac") { throw CancellationError() }
                 status = "Downloading " + entry.name
                 try await transfer.download(remotePath: entry.path, root: root, localPath: path, source: source, expectedLocal: expected) { value in Task { @MainActor in progress = value } }
@@ -229,7 +294,7 @@ struct FilesView: View {
         guard let transfer, let root = localRoot else { return }
         let path = localPath, serverPath = remotePath, profile = app.activeID
         begin("Comparing folders…") {
-            let folder = try LocalFiles.location(root: root, path: path)
+            let folder = try await LocalFiles.runCancellable { try LocalFiles.location(root: root, path: path) }
             let planner = SyncPlanner(transfer: transfer, baselines: try SyncBaselines())
             plan = try await planner.preview(profileID: profile, localRoot: folder, remoteRoot: serverPath) { value in Task { @MainActor in status = value } }
             try Task.checkCancellation()

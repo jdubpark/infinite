@@ -2,15 +2,7 @@ import { ProjectContexts } from "./project-context.js";
 import { assertFreshNativeContext } from "./context-continuation.js";
 import { handoffNativePrompt, handoffPathsOverlap } from "./handoff-types.js";
 import { spawn } from "node:child_process";
-import {
-  readFileSync,
-  mkdirSync,
-  readdirSync,
-  existsSync,
-  rmSync,
-  realpathSync,
-  statSync,
-} from "node:fs";
+import { readFileSync, mkdirSync, readdirSync, existsSync, rmSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
@@ -59,7 +51,6 @@ import type {
   TeamMemberAssignment, TeamPermissionExpansionExpectation,
 } from "./types.js";
 
-/** This stop attempt was refused before any worker RPC could deliver it. */
 export class TeamStopRefused extends ContentError {}
 
 export interface CreateSession {
@@ -71,7 +62,6 @@ export interface CreateSession {
   prompt: string;
   nativeArgs?: string[];
   localUi?: boolean;
-  /** Working directory relative to the configured project root. */
   cwd?: string;
   workspace?: LaptopWorkspace & { token: string };
   resumedFrom?: string;
@@ -145,7 +135,6 @@ export function projectCwd(projectPath: string, cwd?: string): string {
   if (isAbsolute(child) || child === ".." || child.startsWith("../") || !statSync(directory).isDirectory()) throw new ContentError("The session directory must be inside its project", 400);
   return directory;
 }
-/** List rows stay small: the last message is cut and tool input stays on the detail endpoint. */
 export function publicAttention(att: Attention): Attention {
   const lastMessage = att.lastMessage?.slice(0, 280);
   const limit = att.limit ? { ...att.limit, message: att.limit.message.slice(0, 300) } : undefined;
@@ -162,12 +151,6 @@ export function publicAttention(att: Attention): Attention {
     lastMessage,
   };
 }
-/**
- * Older workers deliberately survive API upgrades and answer `state` without attention. Such a
- * row gets an attention block so list rows, the Notifier and the phone never meet a missing
- * field, but the block never invents an idle or finished state: a live old worker reads as
- * `unavailable` (the host cannot tell what it is doing) and a stopped one keeps its lifecycle.
- */
 export function withDefaultAttention(
   state: Omit<WorkerState, "attention"> & { attention?: Attention },
   now = new Date().toISOString(),
@@ -183,17 +166,17 @@ export function withDefaultAttention(
   };
 }
 export class Manager {
-  private serial: Promise<unknown> = Promise.resolve();
-  /** Holds sessions the host starts for itself while the host is short of memory or overloaded. */
+  private readonly sessionQueues = new Map<string, Promise<unknown>>();
+  private readonly conversationQueues = new Map<string, Promise<unknown>>();
+  private readonly pendingCreates = new Set<string>();
+  private createAdmission: Promise<unknown> = Promise.resolve();
   readonly hostLoad: HostLoadGate;
   private readonly handoffProjects = new Map<string, string>();
   private fuse?: FuseGate;
   private readonly listedMeta = new SealedFileCache<ListedSession>((id, raw) => listedSession(unseal<StoredSession>(this.key, `${id}:meta`, raw).session));
   private readonly savedStatus = new SealedFileCache<SavedStatus>((id, raw, mtimeMs) => ({ state: unseal<WorkerState>(this.key, `${id}:status`, raw), savedAt: new Date(mtimeMs).toISOString() }));
-  /** The launch gate: the owner's halt, then the launch-rate fuse. Without one, every session starts as before and nothing is counted. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
   private headlessChannel?: Pick<HeadlessPermissionChannel, "admit">;
-  /** The headless permission channel. Without one, every headless launch starts as before. */
   useHeadlessChannel(channel: Pick<HeadlessPermissionChannel, "admit">) { this.headlessChannel = channel; }
   reserveHandoff(projectId: string) {
     const project = this.config.projects.find(project => project.id === projectId);
@@ -273,8 +256,31 @@ export class Manager {
       ),
     );
   }
+  private serializeKeyed<T>(queues: Map<string, Promise<unknown>>, key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = queues.get(key) ?? Promise.resolve();
+    const operation = prev.then(fn);
+    const settled = operation.catch(() => {}).finally(() => {
+      if (queues.get(key) === settled) queues.delete(key);
+    });
+    queues.set(key, settled);
+    return operation;
+  }
+  private serializeSession<T>(id: string, fn: () => Promise<T>): Promise<T> { return this.serializeKeyed(this.sessionQueues, id, fn); }
+  private serializeConversation<T>(key: string, task: () => Promise<T>): Promise<T> { return this.serializeKeyed(this.conversationQueues, key, task); }
+  private reserveCreateSlot(id: string): Promise<void> {
+    const operation = this.createAdmission.then(async () => {
+      const pendingBeforeList = new Set(this.pendingCreates);
+      const listed = await this.list();
+      const active = new Set([...listed.filter(s => s.status === "running" || s.status === "starting").map(s => s.id), ...pendingBeforeList, ...this.pendingCreates]);
+      if (active.size >= this.config.maxSessions)
+        throw new Error("The configured session limit has been reached");
+      this.pendingCreates.add(id);
+    });
+    this.createAdmission = operation.catch(() => {});
+    return operation;
+  }
   setArchived(id: string, archived: boolean): Promise<StoredSession["session"]> {
-    const operation = this.serial.then(async () => {
+    return this.serializeSession(id, async () => {
       const stored = this.meta(id);
       if (stored.session.team) throw new ContentError("Team sessions cannot be archived", 409);
       if ((await this.state(id)).status !== "exited")
@@ -292,13 +298,11 @@ export class Manager {
       );
       return session;
     });
-    this.serial = operation.catch(() => {});
-    return operation;
   }
   remove(id: string): Promise<void> {
-    const operation = this.serial.then(async () => {
+    return this.serializeSession(id, async () => {
       const stored = this.meta(id);
-      if (stored.session.team && !learningPurpose(stored.session.purpose)) throw new ContentError("Team sessions cannot be removed", 409); // the trial sweep removes a learning session
+      if (stored.session.team && !learningPurpose(stored.session.purpose)) throw new ContentError("Team sessions cannot be removed", 409);
 
       let workerStateReadFailed = false;
       try {
@@ -329,8 +333,6 @@ export class Manager {
       );
       rmSync(join(this.config.stateDir, "sessions", id), { recursive: true });
     });
-    this.serial = operation.catch(() => {});
-    return operation;
   }
   async state(id: string, screen = false): Promise<WorkerState> {
     try {
@@ -338,8 +340,6 @@ export class Manager {
         await workerCall(this.config.runDir, id, { op: "state", screen }),
       );
     } catch {
-      // Dated now, unlike a listing row: a mission's stall check reads `lastActivityAt` from here, and a worker does not
-      // save its status on every activity, so a saved time would take a worker that missed one answer for quiet.
       const now = new Date().toISOString();
       const file = join(this.config.stateDir, "sessions", id, "status.sealed");
       if (existsSync(file)) {
@@ -353,27 +353,16 @@ export class Manager {
       return unavailableState(now);
     }
   }
-  /**
-   * `state(id)` for a listing. A worker is asked only when its socket file exists, since a
-   * connect to a missing socket fails the same way; a failed ask falls through to the saved status.
-   */
   private async listedState(id: string, createdAt: string): Promise<WorkerState> {
     if (existsSync(socketPath(this.config.runDir, id))) {
       try {
         return withDefaultAttention(await workerCall(this.config.runDir, id, { op: "state", screen: false }));
       } catch {
-        // Fall through to the saved status, as state() does.
       }
     }
     const saved = this.savedStatus.read(id, join(this.config.stateDir, "sessions", id, "status.sealed"), Date.now());
-    // A row without a saved status is unavailable since the session's creation, the one time its record holds.
     return saved === undefined ? unavailableState(createdAt) : listedSavedState(saved);
   }
-  /**
-   * Every session whose metadata can be read. One session's unreadable status (or a worker
-   * that fails to answer) shows that row as unavailable instead of failing the whole list;
-   * a session without readable metadata has no title or provider to show and is left out.
-   */
   async list(options: { includeFullMessage?: boolean } = {}) {
     const now = Date.now();
     const ids = readdirSync(join(this.config.stateDir, "sessions")).filter(
@@ -383,7 +372,6 @@ export class Manager {
     this.savedStatus.retain(new Set(ids), now);
     const rows = await Promise.allSettled(
       ids.map(async (id) => {
-        // meta() refuses a session whose deletion receipt exists, as it did before the cache.
         if (existsSync(this.deletedReceiptPath(id))) throw new Error("Session not found");
         const summary = this.listedMeta.read(id, join(this.config.stateDir, "sessions", id, "meta.sealed"), now);
         if (summary === undefined) throw new Error("Session not found");
@@ -400,20 +388,15 @@ export class Manager {
     const listed = rows.flatMap((row) =>
       row.status === "fulfilled" ? [row.value] : [],
     );
-    for (const observer of this.listingObservers) try { observer(listed); } catch { /* an observer never fails a listing */ }
+    for (const observer of this.listingObservers) try { observer(listed); } catch { }
     return listed;
   }
   private readonly listingObservers = new Set<(rows: Awaited<ReturnType<Manager["list"]>>) => void>();
-  /** Calls `observer` with every session listing, so a consumer that follows dialogs needs no listing of its own. */
   observeListings(observer: (rows: Awaited<ReturnType<Manager["list"]>>) => void): () => void {
     this.listingObservers.add(observer);
     return () => { this.listingObservers.delete(observer); };
   }
 
-  /**
-   * The identity of a session's meta file as the last listing kept it: it changes whenever the file is replaced.
-   * Undefined when no settled parse is kept (a file younger than the settle time, or an id that is not listed).
-   */
   metaRevision(id: string): string | undefined {
     return this.listedMeta.revision(id);
   }
@@ -421,19 +404,13 @@ export class Manager {
   setContext(projectId: string, text: string, expectedVersion: number) {
     return new ProjectContexts(this.config, this.key).setContext(projectId, text, expectedVersion);
   }
-  /** `startedBy: "owner"` states that the owner started this session; without it the session's GitHub grant is fetch only. */
   create(request: CreateSession, startedBy?: "owner"): Promise<Session & WorkerState> {
     if (request.continuation !== undefined)
       throw new ContentError("Native continuation is only available for managed coordinator team sessions", 400);
-    const operation = this.serial.then(() => this.createOnce(request, false, startedBy === "owner" ? "owner-started" : undefined));
-    this.serial = operation.catch(() => {});
-    return operation;
+    return this.serializeSession(request.requestId, () =>
+      this.createOnce(request, false, startedBy === "owner" ? "owner-started" : undefined),
+    );
   }
-  /**
-   * The team scheduler owns cwd selection, below the root its run was created under. Public create requests never accept this override.
-   * `haltScope` names every project the work covers when that is more than the request's own project; the owner's halt
-   * over any of them refuses the launch at its final admission.
-   */
   createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false,
     header: { purpose?: SessionPurpose; configId?: string; haltScope?: readonly string[] } = {}, github?: GithubGrantScope): Promise<Session & WorkerState> {
     if (!this.config.teams || request.nativeArgs !== undefined || request.localUi || request.workspace || request.resumedFrom)
@@ -455,13 +432,10 @@ export class Manager {
     const canonical = realpathSync(cwd);
     const rel = relative(root, canonical);
     if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new ContentError("Invalid team working directory", 400);
-    // Trust and the halt scope are outside the request fingerprint: a replay returns the session as first created.
-    const operation = this.serial.then(() => this.createOnce({
+    return this.serializeSession(request.requestId, () => this.createOnce({
       ...request, ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}),
       ...(header.purpose !== undefined ? { purpose: header.purpose } : {}), ...(header.configId !== undefined ? { configId: header.configId } : {}),
     }, workspaceTrusted, { team: github }, header.haltScope));
-    this.serial = operation.catch(() => {});
-    return operation;
   }
   async inspectTeamRuntime(sessionId: string, team: TeamAssignment): Promise<TeamRuntimeInspection> {
     const stored = this.meta(sessionId).session;
@@ -493,19 +467,15 @@ export class Manager {
       ...(state.attention?.since ? { since: state.attention.since } : {}), agentUid, processes: tree, identity };
   }
   retireTeamRuntime(sessionId: string, requestId: string, team: TeamAssignment, identity: string): Promise<TeamRuntimeRetirement> {
-    const operation = this.serial.then(() => this.retireTeamRuntimeOnce(sessionId, requestId, team, identity));
-    this.serial = operation.catch(() => {});
-    return operation;
+    return this.serializeSession(sessionId, () => this.retireTeamRuntimeOnce(sessionId, requestId, team, identity));
   }
   controlSession(sessionId: string, request: Extract<WorkerRequest, { op: "control" }>): Promise<ControlLease | null> {
-    const operation = this.serial.then(async () => {
+    return this.serializeSession(sessionId, async () => {
       this.meta(sessionId);
       if (request.action !== "release" && existsSync(join(this.config.stateDir, "sessions", sessionId, "retirement.sealed")))
         throw new TeamError(409, "runtime-retiring", "This runtime is being retired; its retained journal remains available read-only.");
       return workerCall<ControlLease | null>(this.config.runDir, sessionId, request);
     });
-    this.serial = operation.catch(() => {});
-    return operation;
   }
   private async retireTeamRuntimeOnce(sessionId: string, requestId: string, team: TeamAssignment, identity: string): Promise<TeamRuntimeRetirement> {
     const stored = this.meta(sessionId).session;
@@ -524,7 +494,6 @@ export class Manager {
     } else {
       const inspection = await this.inspectTeamRuntime(sessionId, team);
       if (inspection.identity !== identity) throw new TeamError(409, "runtime-identity-changed", "The runtime identity changed before retirement began.");
-      // Establish the configured process boundary before sealing a record or signaling anything.
       const boundary = this.config.teams?.commandPrefix ? agentBoundary(this.config.teams.commandPrefix, stored.cwd) : undefined;
       const agentUid = boundary ? await boundary.uid() : null;
       if (inspection.agentUid !== agentUid) throw new TeamError(409, "runtime-identity-changed", "The configured agent identity changed before retirement began.");
@@ -541,9 +510,6 @@ export class Manager {
     const sealed = unseal<WorkerState>(this.key, `${sessionId}:status`, readFileSync(join(this.config.stateDir, "sessions", sessionId, "status.sealed"), "utf8"));
     const workerPid = sealed.workerPid;
     if (!workerPid || !record.known.some(row => row.pid === workerPid)) throw new TeamError(409, "runtime-identity-changed", "The recorded worker identity is unavailable.");
-    // A prior attempt may have killed the worker but lost its acknowledgement. Rebuild only
-    // descendants of still-live, start-time-matched recorded processes and seal them before
-    // signaling so a later retry has the expanded identity set.
     record.known = mergeRecordedRuntimeTree(record.known, await inventoryRuntimeProcesses());
     writeSealed(file, this.key, scope, record);
     try {
@@ -565,7 +531,6 @@ export class Manager {
       throw error;
     }
   }
-  /** A scheduler may stop only its own member and never take over an active human lease. */
   async stopTeamSession(sessionId: string, requestId: string, team: TeamAssignment): Promise<WorkerState> {
     const stored = this.meta(sessionId).session.team;
     if (!stored || stored.runId !== team.runId || stored.memberId !== team.memberId || stored.revision !== team.revision)
@@ -576,16 +541,13 @@ export class Manager {
     await workerCall(this.config.runDir, sessionId, { op: "stop", requestId });
     return this.state(sessionId);
   }
-  /** Expand the visible command text for one exact collapsed Codex prompt, without answering it. */
   expandTeamPermission(
     sessionId: string,
     requestId: string,
     team: TeamAssignment,
     expected: TeamPermissionExpansionExpectation,
   ): Promise<Receipt> {
-    const operation = this.serial.then(() => this.expandTeamPermissionOnce(sessionId, requestId, team, expected));
-    this.serial = operation.catch(() => {});
-    return operation;
+    return this.serializeSession(sessionId, () => this.expandTeamPermissionOnce(sessionId, requestId, team, expected));
   }
   private async expandTeamPermissionOnce(
     sessionId: string,
@@ -684,9 +646,6 @@ export class Manager {
         throw new ContentError("The team member control lease changed before display expansion", 409);
       assertEligible(controlled, lease.id);
 
-      // Seal the at-most-once intent before the worker can send the toggle key. A
-      // host crash or lost acknowledgement leaves an uncertain receipt that is
-      // replayed as-is and never dispatched again.
       const receipt: Receipt = { requestId, state: "uncertain", seq: controlled.seq };
       ledger.requests[requestId] = { digest, promptKey, receipt, at: new Date().toISOString() };
       ledger.prompts[promptKey] = requestId;
@@ -707,7 +666,6 @@ export class Manager {
       } catch (error) {
         const code = (error as { code?: unknown }).code;
         if (typeof code === "string" && ["unsupported", "prompt-changed", "control-busy", "control-lost"].includes(code)) {
-          // A named worker refusal is guaranteed to precede its Ctrl+A write.
           delete ledger.requests[requestId];
           if (ledger.prompts[promptKey] === requestId) delete ledger.prompts[promptKey];
           writeSealed(file, this.key, scope, ledger);
@@ -718,17 +676,15 @@ export class Manager {
     } finally {
       if (lease) {
         try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
-        catch { /* the next state read reports an expired or lost lease */ }
+        catch { }
       }
     }
   }
-  /** Apply only the persisted, one-shot approval for this exact assigned member and prompt. */
   async answerTeamPermission(
     sessionId: string,
     requestId: string,
     team: TeamAssignment,
     decision: TeamPermissionDecision,
-    /** Whether the coordinator's authority to answer still stands. It is read under the control lease, before the key is sent. */
     current?: () => boolean,
   ): Promise<import("./types.js").Receipt & { result?: import("@infinite/attention").AnswerResult }> {
     const session = this.meta(sessionId).session;
@@ -793,21 +749,15 @@ export class Manager {
         }, 12000);
       } catch (error) {
         if ((error as { code?: unknown }).code) throw error;
-        // The worker may have written keys before its acknowledgement was lost. Never replay here.
         return { requestId, state: "uncertain", seq: controlled.seq };
       }
     } finally {
       if (lease) {
         try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
-        catch { /* a lost worker or lease is reported by the next state read */ }
+        catch { }
       }
     }
   }
-  /**
-   * Types one permission-agent decision into a session outside any team run: the exact one-shot option,
-   * under a host control lease, after the session, its directory and its control are checked again. A
-   * team member's session is refused. An error with a code, or a ContentError, means nothing was typed.
-   */
   async answerSessionPermission(sessionId: string, input: SessionPermissionAnswer): Promise<Receipt & { result?: import("@infinite/attention").AnswerResult }> {
     const session = this.meta(sessionId).session;
     if (session.team || session.workspace || session.executionLocation === "laptop" || session.runtime?.transport !== "pty" || session.runtime.nativeUi)
@@ -833,7 +783,6 @@ export class Manager {
       const controlled = await this.state(sessionId);
       if (controlled.status !== "running" || controlled.control?.id !== lease.id)
         throw new ContentError("The session or its control lease changed before the answer", 409);
-      // The owner may have revoked or replaced the delegation while the lease was claimed.
       if (input.current && !input.current())
         throw new ContentError("The permission answer was invalidated before the answer", 409);
       try {
@@ -845,22 +794,15 @@ export class Manager {
         }, 12000);
       } catch (error) {
         if ((error as { code?: unknown }).code) throw error;
-        // The worker may have typed before its acknowledgement was lost. Never replay here.
         return { requestId, state: "uncertain", seq: controlled.seq };
       }
     } finally {
       if (lease) {
         try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
-        catch { /* a lost worker or lease is reported by the next state read */ }
+        catch { }
       }
     }
   }
-  /**
-   * Deliver one permission-agent decision to this exact assigned member's dialog: its one-shot accept, or its
-   * one-shot reject with the host's fixed notice. `current` is the caller's live fence; it is read again after
-   * the control lease is held and before the worker sends a key. The worker repeats the exact-screen check
-   * before each key.
-   */
   async answerAgentPermission(
     sessionId: string,
     team: TeamAssignment,
@@ -913,17 +855,15 @@ export class Manager {
         }, 12000);
       } catch (error) {
         if ((error as { code?: unknown }).code) throw error;
-        // The worker may have written keys before its acknowledgement was lost. Never replay here.
         return { requestId: delivery.requestId, state: "uncertain", seq: controlled.seq };
       }
     } finally {
       if (lease) {
         try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
-        catch { /* a lost worker or lease is reported by the next state read */ }
+        catch { }
       }
     }
   }
-  /** Fences one permission-agent answer that is with a session outside a team run, after an owner act ended its authority. */
   async invalidateSessionPermission(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain"> {
     try {
       if (this.meta(sessionId).session.team || !/^[A-Za-z0-9._:-]{1,100}$/.test(decisionId)) return "uncertain";
@@ -933,7 +873,6 @@ export class Manager {
       return result.invalidated === true ? "invalidated" : "uncertain";
     } catch { return "uncertain"; }
   }
-  /** Fence one persisted delegated decision before its owner revokes or pauses it. */
   async invalidateTeamPermission(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain"> {
     if (!this.meta(sessionId).session.team || !/^[a-f0-9-]{36}$/i.test(decisionId)) return "uncertain";
     try {
@@ -944,9 +883,13 @@ export class Manager {
     } catch { return "uncertain"; }
   }
   resume(sessionId: string, requestId: string, startedBy?: "owner"): Promise<Session & WorkerState> {
-    const operation = this.serial.then(() => this.resumeOnce(sessionId, requestId, startedBy === "owner" ? "owner-started" : undefined));
-    this.serial = operation.catch(() => {});
-    return operation;
+    if (requestId === sessionId) throw new ContentError("Resumption needs a new request identity", 400);
+    const [first, second] = sessionId < requestId ? [sessionId, requestId] : [requestId, sessionId];
+    return this.serializeSession(first, () =>
+      this.serializeSession(second, () =>
+        this.resumeOnce(sessionId, requestId, startedBy === "owner" ? "owner-started" : undefined),
+      ),
+    );
   }
   private async resumeOnce(sessionId: string, requestId: string, github?: SessionGithubOrigin): Promise<Session & WorkerState> {
     if (this.handoffRequest(sessionId)) throw new ContentError("This session yielded to a team; inspect its handoff instead of resuming it");
@@ -969,7 +912,6 @@ export class Manager {
       return result;
     };
     if (session.team) throw new ContentError("Resume this member from its team so its assignment stays consistent");
-    // An ordinary resume has no permission channel, so the provider's own rules would decide the call the owner was asked about.
     if (session.headless?.channel && deferredCallOpen((after, limit) => this.events(sessionId, after, limit, new Set(["lifecycle"]))))
       throw new ContentError("This session ended while a call waited for the owner's answer. Start a new session instead of resuming it.", 409);
     const state = await this.state(sessionId);
@@ -987,44 +929,37 @@ export class Manager {
       const cwd = relative(realpathSync(project.path), session.cwd);
       if (cwd) request.cwd = cwd;
     }
-    // Creation metadata is durable before spawn. Recover its exact receipt even
-    // if the API stopped before it could record the resumption result.
-    if (existsSync(join(this.config.stateDir, "sessions", requestId, "meta.sealed")))
+    return this.serializeConversation(`${session.provider}:${native.id}`, async () => {
+      if (existsSync(join(this.config.stateDir, "sessions", requestId, "meta.sealed")))
+        return remember(await this.createOnce(request, false, github));
+      const ids = readdirSync(join(this.config.stateDir, "sessions")).filter(id => /^[a-f0-9-]{36}$/.test(id) && id !== sessionId);
+      const continuations = await Promise.all(ids.map(async id => {
+        let candidate: Session;
+        try { candidate = this.meta(id).session; }
+        catch { throw new ContentError("A recording cannot be authenticated. Recover it before starting another continuation."); }
+        if (candidate.provider !== session.provider) return undefined;
+        const current = await this.state(id).catch(() => unavailableState(new Date().toISOString()));
+        if (candidate.resumedFrom !== sessionId && candidate.resumeNativeSession?.id !== native.id && current.nativeSession?.id !== native.id) return undefined;
+        if (current.status === "exited") return undefined;
+        if (candidate.projectId !== session.projectId || (candidate.projectRoot ?? candidate.cwd) !== realpathSync(project.path))
+          throw new ContentError("This native conversation has a continuation in another project or codebase. Open its original session instead.", 409);
+        if (current.status !== "running" && current.status !== "starting")
+          throw new ContentError("Another continuation has not confirmed exit. Reconnect before resuming.");
+        return { ...candidate, ...current };
+      }));
+      const live = continuations.filter((candidate): candidate is Session & WorkerState => candidate !== undefined);
+      if (live.length > 1) throw new ContentError("Multiple continuations are active. Open an existing session before resuming.");
+      if (live[0]) return remember(live[0]);
       return remember(await this.createOnce(request, false, github));
-    const ids = readdirSync(join(this.config.stateDir, "sessions")).filter(id => /^[a-f0-9-]{36}$/.test(id) && id !== sessionId);
-    const continuations = await Promise.all(ids.map(async id => {
-      let candidate: Session;
-      try { candidate = this.meta(id).session; }
-      catch { throw new ContentError("A recording cannot be authenticated. Recover it before starting another continuation."); }
-      if (candidate.provider !== session.provider) return undefined;
-      const current = await this.state(id).catch(() => unavailableState(new Date().toISOString()));
-      if (candidate.resumedFrom !== sessionId && candidate.resumeNativeSession?.id !== native.id && current.nativeSession?.id !== native.id) return undefined;
-      if (current.status === "exited") return undefined;
-      if (candidate.projectId !== session.projectId || (candidate.projectRoot ?? candidate.cwd) !== realpathSync(project.path))
-        throw new ContentError("This native conversation has a continuation in another project or codebase. Open its original session instead.", 409);
-      if (current.status !== "running" && current.status !== "starting")
-        throw new ContentError("Another continuation has not confirmed exit. Reconnect before resuming.");
-      return { ...candidate, ...current };
-    }));
-    const live = continuations.filter((candidate): candidate is Session & WorkerState => candidate !== undefined);
-    if (live.length > 1) throw new ContentError("Multiple continuations are active. Open an existing session before resuming.");
-    if (live[0]) return remember(live[0]);
-    // Use the same admission queue as create, without re-entering it.
-    return remember(await this.createOnce(request, false, github));
+    });
   }
-  /**
-   * Creates the session, or returns the one its request already made. A team launch that fails before its session
-   * record exists gives its fuse launch back: the count stays, and a retry with the same id is not counted twice.
-   */
   private async createOnce(request: ManagedCreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, github?: SessionGithubOrigin, haltScope?: readonly string[]) {
     try { return await this.createRecorded(request, workspaceTrusted, github, haltScope); }
     catch (error) {
-      // A started launch stays started, and a failing fuse never hides the launch error.
-      if (request.team) try { this.fuse?.release(request.requestId); } catch { /* the launch error is the one to report */ }
+      if (request.team) try { this.fuse?.release(request.requestId); } catch { }
       throw error;
     }
   }
-  /** `github` says who decided the session's GitHub grant; see SessionGithubOrigin. `haltScope` is every project the work covers. */
   private async createRecorded(request: ManagedCreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, github?: SessionGithubOrigin, haltScope?: readonly string[]) {
     if (!request.resumedFrom && request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
     if (request.workspace && (request.provider !== "codex" || !request.localUi))
@@ -1058,167 +993,149 @@ export class Manager {
     if (!project) throw new Error("Unknown project");
     if (request.provider === "demo" && !this.config.enableDemo)
       throw new Error("Demo is disabled");
-    // Only sessions the host starts for itself wait for capacity; an owner-started session is never held.
-    if (request.team) {
-      const hold = this.hostLoad.held();
-      if (hold) throw new LaunchHeldError(hold);
-    }
-    if (
-      (await this.list()).filter(
-        (s) => s.status === "running" || s.status === "starting",
-      ).length >= this.config.maxSessions
-    )
-      throw new Error("The configured session limit has been reached");
-    // The backstop: a team session is charged before any session directory exists. A replay returned above, and a
-    // launch that its caller already admitted is recognised by its id and not charged again. The owner's halt sits in
-    // front of the fuse, so a halted launch is refused with its own code. It runs after every wait above and right
-    // before the session record is written, over every project the work covers, and it gives back any admission that
-    // the caller made for this launch, so a launch the halt refuses leaves the fuse count as it was.
-    if (request.team && this.fuse) {
-      const spanning = haltScope?.length ? this.fuse.held?.(haltScope) : undefined;
-      const admission = spanning ? { ok: false as const, launchId: id, halted: spanning }
-        : this.fuse.admit(workLaunch({ launchId: id, projectId: request.projectId, provider: request.provider, team: request.team, profile: request.teamModelProfile, purpose: request.purpose }));
-      if (!admission.ok && "halted" in admission) {
-        this.fuse.refund?.(id);
-        throw new TeamError(409, "halted", haltReason(admission.halted));
-      }
-      if (!admission.ok) throw new TeamError(409, "fuse-open", fuseReason("open" in admission ? admission.open : "write-failed"));
-    }
-    if (!request.team && [...this.handoffProjects.values()].some(path => handoffPathsOverlap(path, realpathSync(project.path)))) throw new ContentError("This project is capturing an accepted team handoff");
-    const configuredProfile = sessionAgentProfile(this.config, request.provider, request.purpose);
-    if (!configuredProfile) throw new Error("Provider is not configured on this host");
-    let profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
-    if (request.team?.role === "permission-coordinator") profile = permissionCoordinatorLaunch(request.provider, profile);
-    if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(request.provider, profile);
-    if (request.continuation) profile = withNativeContinuation(profile, request.continuation);
-    const context = withoutSharedContext(new ProjectContexts(this.config, this.key).snapshot(request.projectId), request.purpose);
-    const session: Session = {
-      id,
-      ...(request.team ? { team: request.team } : {}),
-      ...(request.teamModelProfile ? { teamModelProfile: request.teamModelProfile } : {}),
-      ...(request.purpose !== undefined ? { purpose: request.purpose } : {}),
-      ...(request.configId !== undefined ? { configId: request.configId } : {}),
-      ...(request.team && workspaceTrusted ? { workspaceTrusted: true as const } : {}),
-      backend: "infinite",
-      machineId: this.config.machine?.id,
-      executionLocation: request.workspace ? "laptop" : "cloud",
-      ...(request.resumedFrom ? { resumedFrom: request.resumedFrom, resumeNativeSession: request.resumeNativeSession } : {}),
-      provider: request.provider,
-      title: request.title,
-      ...(request.generatedTitle ? { generatedTitle: true as const } : {}),
-      projectId: request.projectId,
-      cwd: request.teamCwd ?? projectCwd(project.path, request.cwd),
-      createdAt: new Date().toISOString(),
-      status: "starting",
-      projectRoot: context.root,
-      contextSources: context.sources,
-      contextLinksVersion: context.linksVersion,
-      contextVersion: context.version,
-      context: context.text,
-      initialPrompt: request.prompt,
-      runtime: { id: randomUUID(), location: this.config.environment, transport: "pty", ...(request.localUi ? { nativeUi: request.provider as "codex" | "opencode" } : {}) },
-      ...(request.nativeArgs !== undefined ? { nativeArgs: request.nativeArgs } : {}),
-      ...(request.workspace ? { workspace: { cwd: request.workspace.cwd, roots: request.workspace.roots } } : {}),
-    };
-    if (!request.team) {
-      const userRequest = request.nativeArgs === undefined ? request.prompt : handoffNativePrompt(request.provider, request.nativeArgs);
-      let reason = "This project has not enabled automatic team handoff.";
-      if (project.team?.handoff === "auto") {
-        reason = "Handoff requires a new Claude or Codex PTY session at the project root, a supported prompt up to 12000 characters, and only supported model flags.";
-        if (!request.localUi && !request.workspace && !request.resumedFrom && ["claude", "codex"].includes(request.provider) && userRequest !== undefined && userRequest.length <= 12000 && session.cwd === realpathSync(project.path)) {
-          reason = "Handoff requires configured checks or authorization to establish them, and a reviewed model lineup.";
-          if (this.config.teams?.lineup && (project.team.checks.length || project.team.establishChecks)) session.handoff = { policy: structuredClone({
-            sourceSessionId: id, projectId: project.id, path: session.cwd, userRequest,
-            lineup: this.config.teams.lineup, project: project.team, linear: project.linear,
-            commandPrefix: this.config.teams.commandPrefix, workspaceDir: this.config.teams.workspaceDir,
-            maxMinutes: project.team.handoffMinutes ?? 60, maxMembers: 16, parallelism: 2,
-            ...(project.team.handoffExtendMinutes ? { extendMinutes: project.team.handoffExtendMinutes } : {}),
-            ...(project.team.handoffMaxTotalMinutes ? { maxTotalMinutes: project.team.handoffMaxTotalMinutes } : {}),
-          }) };
+    const assertHostLoad = () => { const hold = request.team ? this.hostLoad.held() : undefined; if (hold) throw new LaunchHeldError(hold); };
+    assertHostLoad();
+    await this.reserveCreateSlot(id);
+    try {
+      assertHostLoad();
+      if (request.team && this.fuse) {
+        const spanning = haltScope?.length ? this.fuse.held?.(haltScope) : undefined;
+        const admission = spanning ? { ok: false as const, launchId: id, halted: spanning }
+          : this.fuse.admit(workLaunch({ launchId: id, projectId: request.projectId, provider: request.provider, team: request.team, profile: request.teamModelProfile, purpose: request.purpose }));
+        if (!admission.ok && "halted" in admission) {
+          this.fuse.refund?.(id);
+          throw new TeamError(409, "halted", haltReason(admission.halted));
         }
+        if (!admission.ok) throw new TeamError(409, "fuse-open", fuseReason("open" in admission ? admission.open : "write-failed"));
       }
-      session.handoff ??= { reason };
-    }
-    const launchProfile = request.nativeArgs === undefined || request.localUi ? profile : { ...profile, args: [...profile.args, ...request.nativeArgs] };
-    // Recorded with the session: a headless launch, whether the permission channel serves it, and why not.
-    const headless = this.headlessChannel?.admit({ provider: request.provider, profile: launchProfile, session, hooks: request.nativeArgs === undefined && !request.localUi });
-    if (headless) session.headless = headless.record;
-    const coordinator = request.team?.role === "permission-coordinator" || request.team?.role === "mission-coordinator";
-    const facts = { headless: headlessLaunch(request.provider, launchProfile).headless, served: session.headless?.channel === true, excluded: coordinator };
-    // Learning runs keep a stable member identity and must not mix Code Mode into replay evidence.
-    // A resume keeps its source's choice. A source that recorded none did not ask for Code Mode, and its resume request
-    // is the one an earlier host built, so a resume that host had started still matches its fingerprint.
-    const recorded = request.recordedCodeMode ?? (request.resumedFrom === undefined ? undefined : false);
-    session.codeMode = codeModeEnabled(this.config.codeMode?.claude, request.provider, facts, recorded, request.purpose);
-    // The record says the host asked. Claude Code refuses to resume a Code Mode conversation with Code Mode off.
-    if (request.recordedCodeMode && !session.codeMode)
-      throw new ContentError("The host asked for Code Mode when this conversation started. Claude Code resumes a Code Mode conversation only with Code Mode on, and a headless resume on this host cannot ask for it. Start a new session instead of resuming it.", 409);
-    // Keep the native prompt exact. Only opted-in, qualified sessions receive the
-    // separate handoff MCP capability; the context snapshot stays in the record.
-    const prompt = request.nativeArgs !== undefined ? "" : [
-      context.text
-        ? `Shared project context (version ${context.version}, provided by the owner):\n${context.text}`
-        : "",
-      request.team ? memberLaunchPrompt(request.prompt, request.provider, session.codeMode === true) : request.prompt,
-    ]
-      .filter(Boolean)
-      .join("\n\n");
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    writeSealed(join(dir, "meta.sealed"), this.key, `${id}:meta`, {
-      session,
-      fingerprint,
-    });
-    // The session record exists now, so the launch counts as started even if the worker fails to spawn.
-    if (request.team) try { this.fuse?.started(id); } catch { /* fuse bookkeeping never fails a session */ }
-    const worker = fileURLToPath(
-      new URL(
-        import.meta.url.endsWith(".ts") ? "./worker.ts" : "./worker.js",
-        import.meta.url,
-      ),
-    );
-    const args = worker.endsWith(".ts")
-      ? ["--import", "tsx", worker]
-      : [worker];
-    const child = spawn(process.execPath, args, {
-      detached: true,
-      stdio: ["pipe", "ignore", "ignore"],
-      cwd: fileURLToPath(new URL("../../../", import.meta.url)),
-    });
-    child.on("error", () => {});
-    child.stdin.on("error", () => {});
-    // Inert unless autonomy.boundary.github is configured; the grant travels only in the private bootstrap pipe.
-    const githubScope = sessionGithubScopeFor({ team: Boolean(request.team), origin: github, repository: projectGithubRepository(project) });
-    const githubGrant = sessionGithubGrant(this.config, githubScope, { sessionId: id, projectId: request.projectId }), codexTraceRoot = prepareMemberTrace(this.config, id, request.provider, request.team, launchProfile);
-    child.stdin.end(
-      JSON.stringify({
+      if (!request.team && [...this.handoffProjects.values()].some(path => handoffPathsOverlap(path, realpathSync(project.path)))) throw new ContentError("This project is capturing an accepted team handoff");
+      const configuredProfile = sessionAgentProfile(this.config, request.provider, request.purpose);
+      if (!configuredProfile) throw new Error("Provider is not configured on this host");
+      let profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
+      if (request.team?.role === "permission-coordinator") profile = permissionCoordinatorLaunch(request.provider, profile);
+      if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(request.provider, profile);
+      if (request.continuation) profile = withNativeContinuation(profile, request.continuation);
+      const context = withoutSharedContext(new ProjectContexts(this.config, this.key).snapshot(request.projectId), request.purpose);
+      const session: Session = {
+        id,
+        ...(request.team ? { team: request.team } : {}),
+        ...(request.teamModelProfile ? { teamModelProfile: request.teamModelProfile } : {}),
+        ...(request.purpose !== undefined ? { purpose: request.purpose } : {}),
+        ...(request.configId !== undefined ? { configId: request.configId } : {}),
+        ...(request.team && workspaceTrusted ? { workspaceTrusted: true as const } : {}),
+        backend: "infinite",
+        machineId: this.config.machine?.id,
+        executionLocation: request.workspace ? "laptop" : "cloud",
+        ...(request.resumedFrom ? { resumedFrom: request.resumedFrom, resumeNativeSession: request.resumeNativeSession } : {}),
+        provider: request.provider,
+        title: request.title,
+        ...(request.generatedTitle ? { generatedTitle: true as const } : {}),
+        projectId: request.projectId,
+        cwd: request.teamCwd ?? projectCwd(project.path, request.cwd),
+        createdAt: new Date().toISOString(),
+        status: "starting",
+        projectRoot: context.root,
+        contextSources: context.sources,
+        contextLinksVersion: context.linksVersion,
+        contextVersion: context.version,
+        context: context.text,
+        initialPrompt: request.prompt,
+        runtime: { id: randomUUID(), location: this.config.environment, transport: "pty", ...(request.localUi ? { nativeUi: request.provider as "codex" | "opencode" } : {}) },
+        ...(request.nativeArgs !== undefined ? { nativeArgs: request.nativeArgs } : {}),
+        ...(request.workspace ? { workspace: { cwd: request.workspace.cwd, roots: request.workspace.roots } } : {}),
+      };
+      if (!request.team) {
+        const userRequest = request.nativeArgs === undefined ? request.prompt : handoffNativePrompt(request.provider, request.nativeArgs);
+        let reason = "This project has not enabled automatic team handoff.";
+        if (project.team?.handoff === "auto") {
+          reason = "Handoff requires a new Claude or Codex PTY session at the project root, a supported prompt up to 12000 characters, and only supported model flags.";
+          if (!request.localUi && !request.workspace && !request.resumedFrom && ["claude", "codex"].includes(request.provider) && userRequest !== undefined && userRequest.length <= 12000 && session.cwd === realpathSync(project.path)) {
+            reason = "Handoff requires configured checks or authorization to establish them, and a reviewed model lineup.";
+            if (this.config.teams?.lineup && (project.team.checks.length || project.team.establishChecks)) session.handoff = { policy: structuredClone({
+              sourceSessionId: id, projectId: project.id, path: session.cwd, userRequest,
+              lineup: this.config.teams.lineup, project: project.team, linear: project.linear,
+              commandPrefix: this.config.teams.commandPrefix, workspaceDir: this.config.teams.workspaceDir,
+              maxMinutes: project.team.handoffMinutes ?? 60, maxMembers: 16, parallelism: 2,
+              ...(project.team.handoffExtendMinutes ? { extendMinutes: project.team.handoffExtendMinutes } : {}),
+              ...(project.team.handoffMaxTotalMinutes ? { maxTotalMinutes: project.team.handoffMaxTotalMinutes } : {}),
+            }) };
+          }
+        }
+        session.handoff ??= { reason };
+      }
+      const launchProfile = request.nativeArgs === undefined || request.localUi ? profile : { ...profile, args: [...profile.args, ...request.nativeArgs] };
+      const headless = this.headlessChannel?.admit({ provider: request.provider, profile: launchProfile, session, hooks: request.nativeArgs === undefined && !request.localUi });
+      if (headless) session.headless = headless.record;
+      const coordinator = request.team?.role === "permission-coordinator" || request.team?.role === "mission-coordinator";
+      const facts = { headless: headlessLaunch(request.provider, launchProfile).headless, served: session.headless?.channel === true, excluded: coordinator };
+      const recorded = request.recordedCodeMode ?? (request.resumedFrom === undefined ? undefined : false);
+      session.codeMode = codeModeEnabled(this.config.codeMode?.claude, request.provider, facts, recorded, request.purpose);
+      if (request.recordedCodeMode && !session.codeMode)
+        throw new ContentError("The host asked for Code Mode when this conversation started. Claude Code resumes a Code Mode conversation only with Code Mode on, and a headless resume on this host cannot ask for it. Start a new session instead of resuming it.", 409);
+      const prompt = request.nativeArgs !== undefined ? "" : [
+        context.text
+          ? `Shared project context (version ${context.version}, provided by the owner):\n${context.text}`
+          : "",
+        request.team ? memberLaunchPrompt(request.prompt, request.provider, session.codeMode === true) : request.prompt,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      writeSealed(join(dir, "meta.sealed"), this.key, `${id}:meta`, {
         session,
-        profile: launchProfile,
-        stateDir: this.config.stateDir,
-        runDir: this.config.runDir,
-        key: this.key.toString("base64"),
-        prompt,
-        codeMode: session.codeMode === true,
-        ...(request.workspace ? { executorTokenHash: createHash("sha256").update(request.workspace.token).digest("hex") } : {}),
-        ...(headless?.bootstrap ? { permissionChannel: headless.bootstrap } : {}),
-        ...(githubGrant ? { github: githubGrant } : {}), ...(codexTraceRoot ? { codexTraceRoot } : {}),
-        attention: {
-          // Native CLI launches keep their exact argv: no hook settings are injected.
-          hooks: request.nativeArgs !== undefined
-            ? { claude: false, codex: false }
-            : this.config.attention?.hooks ?? DEFAULT_HOOKS,
-          idleAfterMs: this.config.attention?.idleAfterMs ?? 20000,
-          limitConfirmMs: this.config.attention?.limitConfirmMs ?? 30000,
-        },
-      } satisfies Bootstrap),
-    );
-    child.unref();
-    for (let attempt = 0; attempt < 80; attempt++) {
-      const state = await this.state(id);
-      if (state.status !== "unavailable" && (request.workspace || state.status !== "starting"))
-        return { ...session, ...state };
-      await new Promise((resolve) => setTimeout(resolve, 50));
+        fingerprint,
+      });
+      if (request.team) try { this.fuse?.started(id); } catch {}
+      const worker = fileURLToPath(
+        new URL(
+          import.meta.url.endsWith(".ts") ? "./worker.ts" : "./worker.js",
+          import.meta.url,
+        ),
+      );
+      const args = worker.endsWith(".ts")
+        ? ["--import", "tsx", worker]
+        : [worker];
+      const child = spawn(process.execPath, args, {
+        detached: true,
+        stdio: ["pipe", "ignore", "ignore"],
+        cwd: fileURLToPath(new URL("../../../", import.meta.url)),
+      });
+      child.on("error", () => {});
+      child.stdin.on("error", () => {});
+      const githubScope = sessionGithubScopeFor({ team: Boolean(request.team), origin: github, repository: projectGithubRepository(project) });
+      const githubGrant = sessionGithubGrant(this.config, githubScope, { sessionId: id, projectId: request.projectId }), codexTraceRoot = prepareMemberTrace(this.config, id, request.provider, request.team, launchProfile);
+      child.stdin.end(
+        JSON.stringify({
+          session,
+          profile: launchProfile,
+          stateDir: this.config.stateDir,
+          runDir: this.config.runDir,
+          key: this.key.toString("base64"),
+          prompt,
+          codeMode: session.codeMode === true,
+          ...(request.workspace ? { executorTokenHash: createHash("sha256").update(request.workspace.token).digest("hex") } : {}),
+          ...(headless?.bootstrap ? { permissionChannel: headless.bootstrap } : {}),
+          ...(githubGrant ? { github: githubGrant } : {}), ...(codexTraceRoot ? { codexTraceRoot } : {}),
+          attention: {
+            hooks: request.nativeArgs !== undefined
+              ? { claude: false, codex: false }
+              : this.config.attention?.hooks ?? DEFAULT_HOOKS,
+            idleAfterMs: this.config.attention?.idleAfterMs ?? 20000,
+            limitConfirmMs: this.config.attention?.limitConfirmMs ?? 30000,
+          },
+        } satisfies Bootstrap),
+      );
+      child.unref();
+      for (let attempt = 0; attempt < 80; attempt++) {
+        const state = await this.state(id);
+        if (state.status !== "unavailable" && (request.workspace || state.status !== "starting"))
+          return { ...session, ...state };
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return { ...session, ...(await this.state(id)) };
+    } finally {
+      this.pendingCreates.delete(id);
     }
-    return { ...session, ...(await this.state(id)) };
   }
   handoffRequest(id: string) {
     let cursor = 0;

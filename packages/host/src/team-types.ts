@@ -208,7 +208,15 @@ export type EstablishChecksTeamProject = Omit<TeamProject, "checks" | "establish
 };
 export type TeamProjectState = ConfiguredTeamProject | EstablishChecksTeamProject;
 export function isEstablishChecksProject(project: TeamProject): project is EstablishChecksTeamProject {
-  return project.establishChecks === true;
+  return project.establishChecks === true && project.checks.length === 0 && project.mainCheck === undefined;
+}
+export function isConfiguredChecksProject(project: TeamProject): project is ConfiguredTeamProject {
+  return project.establishChecks === undefined && project.checks.length > 0;
+}
+export function projectTeamProject(project: TeamProject): TeamProjectState {
+  if (isEstablishChecksProject(project)) return project;
+  if (isConfiguredChecksProject(project)) return project;
+  throw new Error("Invalid team project state: configure checks or set establishChecks with empty checks and no mainCheck.");
 }
 export const teamVerificationSchema = z.object({
   setup: teamCommandSchema.optional(),
@@ -559,6 +567,9 @@ const sharedTeamReportVariants = [
   verdictReportSchema,
   judgementReportSchema,
 ] as const;
+const liveTeamReportSchema = z.discriminatedUnion("kind", [...sharedTeamReportVariants,
+  strictDeliveryReconciliationReportSchema,
+  z.object({ ...questionReportShape, recommendation: questionRecommendationSchema.optional() }).strict().superRefine(refineQuestion)]);
 export const teamReportSchema = z.discriminatedUnion("kind", [...sharedTeamReportVariants,
   strictDeliveryReconciliationReportSchema,
   z.object({ ...questionReportShape, recommendation: requiredQuestionRecommendationSchema }).strict().superRefine(refineQuestion)]);
@@ -566,8 +577,9 @@ export const recordedTeamReportSchema = z.discriminatedUnion("kind", [...sharedT
   recordedDeliveryReconciliationReportSchema,
   z.object({ ...questionReportShape, recommendation: questionRecommendationSchema.optional() }).strict().superRefine(refineQuestion)]);
 export type TeamReport = z.infer<typeof recordedTeamReportSchema>;
-export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: recordedTeamReportSchema }).strict();
-export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
+export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: liveTeamReportSchema }).strict();
+export const recordedTeamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: recordedTeamReportSchema }).strict();
+export type TeamReportEnvelope = z.infer<typeof recordedTeamReportEnvelopeSchema>;
 export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole | "mission-coordinator"; taskId?: string; verificationRefused?: true; entryTools?: true; hostProfiles?: true };
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 export interface TeamMember extends TeamAssignment {

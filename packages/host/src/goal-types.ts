@@ -1,6 +1,5 @@
 import { z } from "zod";
-import { goalCycleUsageSchema, teamBriefSchema, teamLineupSchema, type TeamBrief, type TeamLineup } from "./team-types.js";
-import type { UsageTotals } from "./usage.js";
+import { goalCycleUsageSchema, teamBriefSchema, teamLineupSchema, type GoalCycleUsage, type TeamBrief, type TeamLineup } from "./team-types.js";
 import type { UsageRollup } from "./team-usage.js";
 import type { LinearTrackingView } from "./linear-types.js";
 import type { AutonomyMode } from "./autonomy.js";
@@ -44,9 +43,15 @@ export type CreateGoalState =
   | { kind: "finite"; goal: FiniteCreateGoal }
   | { kind: "standing"; goal: StandingCreateGoal };
 export function isStandingCreateGoal(goal: CreateGoal): goal is StandingCreateGoal {
-  return goal.standing !== undefined;
+  return goal.standing !== undefined && goal.maxRuns === undefined;
+}
+export function isFiniteCreateGoal(goal: CreateGoal): goal is FiniteCreateGoal {
+  return goal.standing === undefined;
 }
 export function projectCreateGoal(goal: CreateGoal): CreateGoalState {
+  if (goal.standing !== undefined && goal.maxRuns !== undefined) {
+    throw new Error("Invalid goal creation state: standing goals cannot specify maxRuns.");
+  }
   if (isStandingCreateGoal(goal)) return { kind: "standing", goal };
   return { kind: "finite", goal: goal as FiniteCreateGoal };
 }
@@ -120,7 +125,7 @@ export interface GoalCycle {
   brief?: TeamBrief;
   reason?: string;
   memberCount: number;
-  usage?: UsageTotals & UsageRollup;
+  usage?: GoalCycleUsage;
   lineup?: TeamLineup;
   deadlineStop?: { at: string; fuseOpen?: true };
   class?: CycleClass;
@@ -128,19 +133,33 @@ export interface GoalCycle {
   settledAt?: string;
   wake?: CycleWake;
 }
-export type ActiveGoalCycle = Omit<GoalCycle, "class" | "settledAt"> & { class?: never; settledAt?: never };
+export type ActiveGoalCycle = Omit<GoalCycle, "finishedAt" | "class" | "settledAt"> & {
+  finishedAt?: never;
+  class?: never;
+  settledAt?: never;
+};
+export type UnclassifiedGoalCycle = Omit<GoalCycle, "finishedAt" | "class" | "settledAt"> & {
+  finishedAt: string;
+  class?: never;
+  settledAt?: never;
+};
 export type SettledGoalCycle = Omit<GoalCycle, "class" | "settledAt"> & { class: CycleClass; settledAt: string };
 export type GoalCycleState =
   | { state: "active"; cycle: ActiveGoalCycle }
+  | { state: "unclassified"; cycle: UnclassifiedGoalCycle }
   | { state: "settled"; cycle: SettledGoalCycle };
 export function isActiveGoalCycle(cycle: GoalCycle): cycle is ActiveGoalCycle {
-  return cycle.class === undefined && cycle.settledAt === undefined;
+  return cycle.finishedAt === undefined && cycle.class === undefined && cycle.settledAt === undefined;
+}
+export function isUnclassifiedGoalCycle(cycle: GoalCycle): cycle is UnclassifiedGoalCycle {
+  return cycle.finishedAt !== undefined && cycle.class === undefined && cycle.settledAt === undefined;
 }
 export function isSettledGoalCycle(cycle: GoalCycle): cycle is SettledGoalCycle {
   return cycle.class !== undefined && cycle.settledAt !== undefined;
 }
 export function projectGoalCycle(cycle: GoalCycle): GoalCycleState {
   if (isSettledGoalCycle(cycle)) return { state: "settled", cycle };
+  if (isUnclassifiedGoalCycle(cycle)) return { state: "unclassified", cycle };
   if (isActiveGoalCycle(cycle)) return { state: "active", cycle };
   throw new Error("Invalid goal cycle state: class and settledAt must appear together.");
 }
@@ -165,7 +184,6 @@ const goalCycleBaseShape = {
   goalRevision: z.number().int().min(1),
   status: z.string().min(1),
   startedAt: z.iso.datetime(),
-  finishedAt: z.iso.datetime().optional(),
   baseCommit: z.string().min(1).optional(),
   headCommit: z.string().min(1).optional(),
   branch: z.string().min(1).optional(),
@@ -179,10 +197,15 @@ const goalCycleBaseShape = {
   assessment: goalAssessmentSchema.optional(),
   wake: z.object({ signalIds: z.array(z.string().min(1)), dropped: z.number().int().min(0), owner: z.literal(true).optional() }).strict().optional(),
 };
-export const goalCycleSchema: z.ZodType<ActiveGoalCycle | SettledGoalCycle> = z.union([
+export const goalCycleSchema: z.ZodType<ActiveGoalCycle | UnclassifiedGoalCycle | SettledGoalCycle> = z.union([
   z.object(goalCycleBaseShape).strict(),
   z.object({
     ...goalCycleBaseShape,
+    finishedAt: z.iso.datetime(),
+  }).strict(),
+  z.object({
+    ...goalCycleBaseShape,
+    finishedAt: z.iso.datetime().optional(),
     class: z.enum(["reviewed", "no-change", "failed", "excluded"]),
     settledAt: z.iso.datetime(),
   }).strict(),

@@ -12,7 +12,7 @@ import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { accountSettingPrompt, PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@infinite/attention";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
-import { buildTeamPendingOperation, createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamContinue, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryView, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
+import { buildTeamPendingOperation, createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamMemberRetireSchema, teamParallelismSchema, recordedTeamReportEnvelopeSchema, type CreateTeam, type TeamContinue, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryView, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
 import { pullRequestBranch, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
 import { reviewEvidenceProblems } from "./team-acceptance.js";
@@ -2416,7 +2416,7 @@ export class TeamService {
           else if (recoveryTurnEnd(data as unknown as SignalData) || (data.kind === "notice" && data.type === "quota_auto_resume_fired")) limit = undefined;
           continue;
         }
-        const parsed = teamReportEnvelopeSchema.safeParse(event.data);
+        const parsed = recordedTeamReportEnvelopeSchema.safeParse(event.data);
         if (!parsed.success) continue;
         const envelope = parsed.data;
         if (envelope.runId !== run.id || envelope.memberId !== member.memberId || envelope.revision !== member.revision) continue;

@@ -107,7 +107,7 @@ import { LinearService } from "./linear.js";
 import { goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
-import { type Config, type Role, type Receipt, type Session, learningPurpose } from "./types.js";
+import { type Config, type Role, type Receipt, type Session, httpControlRequestSchema, learningPurpose, normalizeControlRequest } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
 import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
@@ -1534,9 +1534,6 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     scheduleGraphForSession(request.projectId);
     res.status(201).json(withoutCodeMode(await startInProject(request.projectId, () => manager.create(nativeRequest, "owner"))));
   });
-  const controlBodySchema = z.discriminatedUnion("action", [
-    z.object({ action: z.literal("claim"), leaseId: id.optional(), takeover: z.boolean().optional() }).strict(),
-    z.object({ action: z.literal("renew"), leaseId: id }).strict(), z.object({ action: z.literal("release"), leaseId: id }).strict(), ]);
   app.use("/api/sessions/:id", async (req, res, next) => {
     if (!cmux) return next();
     const sessionId = id.parse(req.params.id);
@@ -1576,8 +1573,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     const authority = { actor: res.locals.actor, leaseId: res.locals.leaseId };
     try {
       if (action === "/control") {
-        const body = controlBodySchema.parse(req.body);
-        return void res.json({ control: await cmux.call(sessionId, { op: "control", ...body, actor: res.locals.actor }) });
+        const body = httpControlRequestSchema.parse(req.body);
+        return void res.json({ control: await cmux.call(sessionId, normalizeControlRequest(body, res.locals.actor)) });
       }
       if (action === "/input") return void res.json(await cmux.call(sessionId, { op: "input", ...inputSchema.parse(req.body), ...authority }));
       if (action === "/answer") return void res.json(await cmux.call(sessionId, { op: "answer", ...answerSchema.parse(req.body), ...authority }));
@@ -1751,10 +1748,10 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.post("/api/sessions/:id/control", refuseManagedClaim, requireRole(["owner", "controller"]), async (req, res) => {
     const sessionId = id.parse(req.params.id);
     manager.meta(sessionId);
-    const body = controlBodySchema.parse(req.body);
+    const body = httpControlRequestSchema.parse(req.body);
     if (!(await manager.state(sessionId)).capabilities?.inputControl)
       return void res.status(409).json({ error: "This session uses an older worker without input control", code: "unsupported" });
-    res.json({ control: await manager.controlSession(sessionId, { op: "control", ...body, actor: res.locals.actor }) });
+    res.json({ control: await manager.controlSession(sessionId, normalizeControlRequest(body, res.locals.actor)) });
   });
   app.post("/api/sessions/:id/raw", refuseManagedOutsideProviderPrompt, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use native input" });

@@ -12,6 +12,7 @@ import {
   isRunningTeamCheck,
   permissionDecisionReportSchema,
   projectTeamDecision,
+  recordedTeamReportEnvelopeSchema,
   recordedTeamReportSchema,
   teamCheckSchema,
   teamDecisionSchema,
@@ -280,7 +281,8 @@ test("PermissionDecisionReport and DeliveryReconciliationReport enforce variant 
   assert.equal(teamReportSchema.safeParse(legacyOwnedBranch).success, false);
   assert.equal(recordedTeamReportSchema.safeParse(legacyOwnedBranch).success, true);
   assert.equal(recordedTeamReportSchema.safeParse(legacyPullRequest).success, true);
-  assert.equal(teamReportEnvelopeSchema.safeParse({ requestId: UUID, runId: UUID, memberId: UUID2, revision: 1, report: legacyOwnedBranch }).success, true);
+  assert.equal(teamReportEnvelopeSchema.safeParse({ requestId: UUID, runId: UUID, memberId: UUID2, revision: 1, report: legacyOwnedBranch }).success, false);
+  assert.equal(recordedTeamReportEnvelopeSchema.safeParse({ requestId: UUID, runId: UUID, memberId: UUID2, revision: 1, report: legacyOwnedBranch }).success, true);
 
   // @ts-expect-error approve-once cannot specify requestedPaths
   const invalidApprovePaths: PermissionDecisionReport = {

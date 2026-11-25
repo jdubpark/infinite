@@ -7,7 +7,7 @@ import { z } from "zod";
 import { workerCall, type WorkerError } from "./ipc.js";
 import { controlActor, type PairedDevice } from "./device-control.js";
 import type { Manager } from "./manager.js";
-import type { ControlActor, Receipt, TerminalSnapshot, WorkerState } from "./types.js";
+import { normalizeControlRequest, type ControlActor, type Receipt, type TerminalSnapshot, type WorkerState } from "./types.js";
 
 export async function* terminalPages(manager: Manager, sessionId: string, after: number, signal: AbortSignal, snapshot = false) {
   let cursor = after, changed = true, wake: (() => void) | undefined, lastState = 0;
@@ -55,13 +55,13 @@ export async function* terminalPages(manager: Manager, sessionId: string, after:
 }
 
 const authSchema = z.object({ token: z.string().regex(/^[\x21-\x7e]{32,200}$/), clientId: z.uuid().optional() }).strict();
-const inputSchema = z.union([
+export const terminalInputSchema = z.union([
   z.object({ op: z.literal("raw"), requestId: z.uuid(), text: z.string().min(1).max(8192), leaseId: z.uuid().optional() }).strict(),
   z.object({ op: z.literal("input"), requestId: z.uuid(), text: z.string().min(1).max(32000).regex(/^[^\x00-\x08\x0b-\x1f\x7f]*$/), submit: z.literal(false), leaseId: z.uuid().optional() }).strict(),
   z.object({ op: z.literal("resize"), cols: z.number().int().min(20).max(240), rows: z.number().int().min(5).max(100), leaseId: z.uuid().optional() }).strict(),
   z.object({ op: z.literal("control"), requestId: z.uuid(), action: z.literal("claim"), leaseId: z.uuid().optional(), takeover: z.boolean().optional() }).strict(),
-  z.object({ op: z.literal("control"), requestId: z.uuid(), action: z.literal("renew"), leaseId: z.uuid() }).strict(),
-  z.object({ op: z.literal("control"), requestId: z.uuid(), action: z.literal("release"), leaseId: z.uuid() }).strict(),
+  z.object({ op: z.literal("control"), requestId: z.uuid(), action: z.literal("renew"), leaseId: z.uuid(), takeover: z.literal(false).optional() }).strict(),
+  z.object({ op: z.literal("control"), requestId: z.uuid(), action: z.literal("release"), leaseId: z.uuid(), takeover: z.literal(false).optional() }).strict(),
 ]);
 
 export function connectTerminals(server: Server, manager: Manager, authenticate: (token: string) => PairedDevice | undefined, missionManaged?: (sessionId: string) => boolean | Promise<boolean>) {
@@ -137,7 +137,7 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
             return;
           }
           if (device.role !== "owner") { fail(1008); return; }
-          const input = inputSchema.parse(message);
+          const input = terminalInputSchema.parse(message);
           const size = Buffer.byteLength(data.toString());
           if (pendingBytes + size > 256 * 1024 || ++pendingFrames > 128) { fail(1008); return; }
           pendingBytes += size;
@@ -157,10 +157,7 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
               if (!state.capabilities?.inputControl) {
                 await send({ refusal: { requestId: input.requestId, code: "unsupported" } }); return;
               }
-              const controlRequest = input.action === "claim"
-                ? { op: "control" as const, action: "claim" as const, actor, ...(input.leaseId ? { leaseId: input.leaseId } : {}), ...(input.takeover !== undefined ? { takeover: input.takeover } : {}) }
-                : { op: "control" as const, action: input.action, actor, leaseId: input.leaseId };
-              const control = await manager.controlSession(match[1], controlRequest);
+              const control = await manager.controlSession(match[1], normalizeControlRequest(input, actor));
               leaseId = control?.id;
               await send({ requestId: input.requestId, control });
               return;

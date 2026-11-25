@@ -1,7 +1,7 @@
 import type { ConnectorSource } from "./mcp-types.js";
 import type { CheckScan } from "./team-check-output.js";
 import type { UsageTotals } from "./usage.js";
-import type { UsageRollup } from "./team-usage.js";
+import type { StoredRollup, UsageRollup } from "./team-usage.js";
 import { z } from "zod";
 import { questionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
 import { INTERRUPT_CLASSES, REJECT_CODES, type InterruptClass, type RejectCode } from "./permission-policy.js";
@@ -41,18 +41,31 @@ export const usageRollupSchema: z.ZodType<UsageRollup> = z.object({
   partialMembers: nonNegInt,
   unavailable: z.literal(true).optional(),
 }).strict();
-export const goalCycleUsageSchema: z.ZodType<UsageTotals & UsageRollup> = z.object({
-  cost: z.number().min(0),
-  tokens: usageTokensSchema,
-  messages: nonNegInt,
-  pricing: usagePricingSchema,
-  total: usageTotalsSchema,
-  byProfile: z.record(z.string().min(1), usageTotalsSchema),
-  byProvider: providerUsageMapSchema,
-  unmeasuredMembers: nonNegInt,
-  partialMembers: nonNegInt,
-  unavailable: z.literal(true).optional(),
-}).strict();
+export type GoalCycleUsage =
+  | (UsageTotals & StoredRollup)
+  | (UsageTotals & {
+      total?: never;
+      byProfile?: never;
+      byProvider?: never;
+      unmeasuredMembers?: never;
+      partialMembers?: never;
+      unavailable?: never;
+    });
+export const goalCycleUsageSchema: z.ZodType<GoalCycleUsage> = z.union([
+  z.object({
+    cost: z.number().min(0),
+    tokens: usageTokensSchema,
+    messages: nonNegInt,
+    pricing: usagePricingSchema,
+    total: usageTotalsSchema,
+    byProfile: z.record(z.string().min(1), usageTotalsSchema),
+    byProvider: providerUsageMapSchema,
+    unmeasuredMembers: nonNegInt,
+    partialMembers: nonNegInt.optional(),
+    unavailable: z.literal(true).optional(),
+  }).strict(),
+  usageTotalsSchema,
+]);
 
 export const commitHashSchema = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i);
 export const connectorSourceSchema = z.object({ kind: z.literal("connector"), id: z.string().min(1), name: z.string().min(1) }).strict();
@@ -322,7 +335,7 @@ export interface TeamCheck {
 }
 type TeamCheckBase = Omit<TeamCheck, "status" | "finishedAt" | "exitCode" | "scan">;
 export type RunningTeamCheck = TeamCheckBase & { status: "running"; finishedAt?: never; exitCode?: never; scan?: never };
-export type PassedTeamCheck = TeamCheckBase & { status: "passed"; finishedAt: string; exitCode?: number | null; scan?: never };
+export type PassedTeamCheck = TeamCheckBase & { status: "passed"; finishedAt: string; exitCode?: 0; scan?: never };
 export type FailedTeamCheck = TeamCheckBase & { status: "failed" | "interrupted"; finishedAt: string; exitCode?: number | null; scan?: CheckScan };
 export type TeamCheckState = RunningTeamCheck | PassedTeamCheck | FailedTeamCheck;
 export function isRunningTeamCheck(check: TeamCheck): check is RunningTeamCheck {
@@ -334,6 +347,7 @@ export function isRunningTeamCheck(check: TeamCheck): check is RunningTeamCheck 
 export function isPassedTeamCheck(check: TeamCheck): check is PassedTeamCheck {
   return check.status === "passed"
     && check.finishedAt !== undefined
+    && (check.exitCode === undefined || check.exitCode === 0)
     && check.scan === undefined;
 }
 export function isFailedTeamCheck(check: TeamCheck): check is FailedTeamCheck {
@@ -357,7 +371,7 @@ const teamCheckBaseShape = {
 };
 export const teamCheckSchema: z.ZodType<TeamCheckState> = z.discriminatedUnion("status", [
   z.object({ ...teamCheckBaseShape, status: z.literal("running") }).strict(),
-  z.object({ ...teamCheckBaseShape, status: z.literal("passed"), finishedAt: z.iso.datetime(), exitCode: z.number().int().nullable().optional() }).strict(),
+  z.object({ ...teamCheckBaseShape, status: z.literal("passed"), finishedAt: z.iso.datetime(), exitCode: z.literal(0).optional() }).strict(),
   z.object({ ...teamCheckBaseShape, status: z.literal("failed"), finishedAt: z.iso.datetime(), exitCode: z.number().int().nullable().optional(), scan: checkScanSchema.optional() }).strict(),
   z.object({ ...teamCheckBaseShape, status: z.literal("interrupted"), finishedAt: z.iso.datetime(), exitCode: z.number().int().nullable().optional(), scan: checkScanSchema.optional() }).strict(),
 ]);

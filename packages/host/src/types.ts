@@ -374,6 +374,7 @@ export type TeamAnswerWorkerRequest =
 const noControlChars = /^[^\x00-\x1f\x7f]*$/;
 const uuidString = /^[a-f0-9-]{36}$/i;
 const sha256Hex = /^[a-f0-9]{64}$/i;
+const lowercaseSha256Hex = /^[0-9a-f]{64}$/;
 const controlActorSchema = z.object({
   id: z.string().min(1).max(128).regex(noControlChars),
   label: z.string().min(1).max(120).regex(noControlChars),
@@ -454,6 +455,26 @@ export const workerControlRequestSchema: z.ZodType<WorkerControlRequestState> = 
     leaseId: z.string().min(1).max(80),
   }).strict(),
 ]);
+export const httpControlRequestSchema = z.discriminatedUnion("action", [
+  z.object({ action: z.literal("claim"), leaseId: z.uuid().optional(), takeover: z.boolean().optional() }).strict(),
+  z.object({ action: z.literal("renew"), leaseId: z.uuid(), takeover: z.literal(false).optional() }).strict(),
+  z.object({ action: z.literal("release"), leaseId: z.uuid(), takeover: z.literal(false).optional() }).strict(),
+]);
+export function normalizeControlRequest(
+  body: z.infer<typeof httpControlRequestSchema>,
+  actor: ControlActor,
+): WorkerControlRequestState {
+  if (body.action === "claim") {
+    return {
+      op: "control",
+      action: "claim",
+      actor,
+      ...(body.leaseId !== undefined ? { leaseId: body.leaseId } : {}),
+      ...(body.takeover !== undefined ? { takeover: body.takeover } : {}),
+    };
+  }
+  return { op: "control", action: body.action, actor, leaseId: body.leaseId };
+}
 export type WorkerWorkspaceExportRequestState =
   | { op: "workspace-export"; method: "sync/export"; hash?: never }
   | { op: "workspace-export"; method: "sync/blob"; hash: string };
@@ -465,7 +486,7 @@ export const workerWorkspaceExportRequestSchema: z.ZodType<WorkerWorkspaceExport
   z.object({
     op: z.literal("workspace-export"),
     method: z.literal("sync/blob"),
-    hash: z.string().regex(sha256Hex),
+    hash: z.string().regex(lowercaseSha256Hex),
   }).strict(),
 ]);
 export type WorkerRequest =

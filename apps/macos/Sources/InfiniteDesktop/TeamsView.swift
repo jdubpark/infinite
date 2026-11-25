@@ -718,6 +718,7 @@ struct TeamCreateView: View {
     @State private var busy = false
     @State private var error = ""
     @State private var clearPending = false
+    @State private var clearTarget: PendingClearTarget?
     private var providers: [String] { app.teamProviders }
     private var selectedProject: JSON? { app.projects.first { $0["id"].string == project } }
     private var projectReady: Bool { app.teamWorkspaceReady(project) }
@@ -762,7 +763,9 @@ struct TeamCreateView: View {
             if !useLineup && provider == "demo" { Text("Rehearsal uses a local test process. It does not call an AI model or implement a real feature.").font(.caption).foregroundStyle(.orange) }
             if pending {
                 Text("A team request is pending. Retry uses its original request identity. Check the team list before starting a different one.").font(.callout).foregroundStyle(.orange)
-                Button("Clear after checking teams…") { clearPending = true }.disabled(busy)
+                Button("Clear after checking teams…") {
+                    if let id = app.pendingTeamCreation.pendingID { clearTarget = PendingClearTarget(profileID: app.activeID, requestID: id); clearPending = true }
+                }.disabled(busy)
             }
             if !error.isEmpty { Text(error).foregroundStyle(.red).textSelection(.enabled) }
             HStack {
@@ -779,8 +782,11 @@ struct TeamCreateView: View {
             }
         }.padding(26).frame(width: 560)
         .alert("Clear the pending team request?", isPresented: $clearPending) {
-            Button("Keep pending", role: .cancel) {}
-            Button("I checked the teams") { app.clearTeamCreation() }
+            Button("Keep pending", role: .cancel) { clearTarget = nil }
+            Button("I checked the teams") {
+                app.clearTeamCreation(expectedProfileID: clearTarget?.profileID, expectedRequestID: clearTarget?.requestID)
+                clearTarget = nil
+            }
         } message: { Text("The server may already have started this team. Clearing does not stop it.") }
         .onAppear {
             project = app.defaultTeamWorkspace

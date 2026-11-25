@@ -172,6 +172,7 @@ struct PromptEditor: NSViewRepresentable {
     @Binding var text: String
     var placeholder = ""
     var enabled: Bool
+    var editable = true
     /// Inside a glass container the editor draws no fill of its own.
     var transparent = false
     var submit: () -> Void
@@ -194,6 +195,7 @@ struct PromptEditor: NSViewRepresentable {
         context.coordinator.parent = self
         guard let view = scroll.documentView as? DraftTextView else { return }
         if view.string != text { view.string = text }
+        view.isEditable = editable
         view.placeholder = placeholder
         // Drafting remains possible while offline; enabled gates submission only.
         view.canSubmit = enabled
@@ -201,7 +203,10 @@ struct PromptEditor: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: PromptEditor
         init(_ parent: PromptEditor) { self.parent = parent }
-        func textDidChange(_ notification: Notification) { if let view = notification.object as? NSTextView { parent.text = view.string } }
+        func textDidChange(_ notification: Notification) {
+            guard parent.editable else { return }
+            if let view = notification.object as? NSTextView { parent.text = view.string }
+        }
     }
     final class DraftTextView: NSTextView {
         var onSubmit: (() -> Void)?; var canSubmit = false

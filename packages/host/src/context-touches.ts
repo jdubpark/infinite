@@ -4,10 +4,6 @@ import { setImmediate as yieldMacrotask } from "node:timers/promises";
 export type FileTouch = { path: string; reads: number; edits: number; lastAt: string };
 export type SessionTouches = {
   sessionId: string;
-  /**
-   * False until the host has read a tool input that a provider hook recorded for this session, or one that named
-   * a path. With `complete: false` the index may still find one. A gap in sight, not a fact about the agent.
-   */
   observable: boolean;
   complete: boolean;
   graphQueries: number;
@@ -21,7 +17,6 @@ export type TouchPage = {
   more: boolean;
 };
 
-/** Providers whose tool inputs can be extracted. */
 const EXTRACTABLE_PROVIDERS = new Set(["claude", "codex"]);
 const FILE_TOOLS: Record<string, { field: string; kind: "reads" | "edits" }> = {
   Read: { field: "file_path", kind: "reads" },
@@ -37,19 +32,12 @@ const RELATIVE_TOKEN = /^[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+$/;
 const ABSOLUTE_TOKEN = /^\/(?:[A-Za-z0-9_.@-]+\/)*[A-Za-z0-9_.@-]+$/;
 const EXTENSION = /^.+\.[A-Za-z0-9]{1,8}$/;
 const MAX_PATCH_DEPTH = 4;
-/** The marker `truncateInput` appends to a string it cut; a cut path names no real file. */
 const TRUNCATED = / … \[\+\d+ chars\]$/;
-/** The same marker anywhere in a command: a cut command can end inside a path, so none of its words are trusted. */
 const TRUNCATED_ANYWHERE = / … \[\+\d+ chars\]/;
 
 interface FileState { reads: number; edits: number; lastAt: string; seq: number }
 interface SessionState {
   cursor: number;
-  /**
-   * The index has read a tool input that a provider hook recorded, or one that named a path. Nothing else proves
-   * the host can see this session's tools: launch settings can differ from the current configuration, the native
-   * protocol and the notify route send turn signals without a tool input, and a headless run line carries an empty one.
-   */
   signalled: boolean;
   files: Map<string, FileState>;
   graphQueries: number;
@@ -62,11 +50,6 @@ interface SessionState {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
 
-/**
- * Turns a tool input path into a repository-relative POSIX path under `cwd`, or undefined.
- * Anything that could be an invented path (`..`, backslashes, `~`, NUL, edge whitespace,
- * trailing slash, the cwd itself) is dropped.
- */
 function repoPath(raw: unknown, cwd: string): string | undefined {
   if (typeof raw !== "string" || raw.length === 0 || raw !== raw.trim()) return undefined;
   if (raw.includes("\0") || raw.includes("\\") || raw.startsWith("~") || raw.endsWith("/") || TRUNCATED.test(raw)) return undefined;
@@ -76,12 +59,10 @@ function repoPath(raw: unknown, cwd: string): string | undefined {
   const rel = posix.isAbsolute(raw) ? posix.relative(root, posix.normalize(raw)) : posix.normalize(raw);
   if (rel === "" || rel === "." || rel === ".." || rel.startsWith("../") || posix.isAbsolute(rel)) return undefined;
   if (rel.includes("\0")) return undefined;
-  // A Git directory, including a nested repository's, holds Git state and host files, never repository content.
   if (rel.split("/").includes(".git")) return undefined;
   return rel;
 }
 
-/** Strings under `value` that carry a patch body. */
 function patchTexts(value: unknown, depth = 0): string[] {
   if (typeof value === "string") return value.includes("*** Begin Patch") ? [value] : [];
   if (depth >= MAX_PATCH_DEPTH) return [];
@@ -90,13 +71,6 @@ function patchTexts(value: unknown, depth = 0): string[] {
   return [];
 }
 
-/**
- * Splits a shell command into the words that are literally written in it. Only whitespace and the
- * command separators `;`, `&`, `|` end a word. Anything the shell would expand or splice
- * (substitution, redirection, grouping, globs, variables, escapes) taints the whole word it
- * touches, so `cat src/a.ts<(printf x)` and `cat $(printf p)src/a.ts` yield no path fragment.
- * A comment is skipped to its line end, and an unclosed quote discards the whole command.
- */
 function shellWords(command: string): string[] {
   const words: string[] = [];
   let word = "", inWord = false, tainted = false, quote: string | undefined;
@@ -125,7 +99,6 @@ function shellCommand(input: Record<string, unknown>): string | undefined {
   return typeof cmd === "string" ? cmd : undefined;
 }
 
-/** Repository-relative paths one tool-start input points at. Conservative: a missed path is acceptable. */
 export function extractTouches(
   tool: string,
   input: Record<string, unknown>,
@@ -164,7 +137,6 @@ export function extractTouches(
   return { reads: [...reads], edits: [...edits], graphQuery };
 }
 
-/** Incremental, bounded, in-memory index of the files each session's tools pointed at. */
 export class ContextTouches {
   private readonly sessions = new Map<string, SessionState>();
   private readonly maxReads: number;
@@ -182,7 +154,6 @@ export class ContextTouches {
       maxReads?: number;
       maxSessions?: number;
       maxFiles?: number;
-      /** Sessions whose journals are read at once, across every request. */
       maxConcurrent?: number;
     },
   ) {
@@ -197,9 +168,6 @@ export class ContextTouches {
       return { sessionId: source.sessionId, observable: false, complete: true, graphQueries: 0, files: [], truncated: false };
     }
     const state = this.stateFor(source.sessionId);
-    // The index is full of sessions that are still being read. Nothing is allocated for this one;
-    // it is told to come back, which keeps both the index and the wait queue within the bound.
-    // Nothing was read, so nothing is known: that is a gap, not an observed agent with no files.
     if (!state) return { sessionId: source.sessionId, observable: false, complete: false, graphQueries: 0, files: [], truncated: false };
     state.lastUsed = ++this.clock;
     state.inflight ??= this.advanceInTurn(state, source).finally(() => { state.inflight = undefined; });
@@ -207,27 +175,22 @@ export class ContextTouches {
     return this.snapshot(source.sessionId, state);
   }
 
-  /** Sessions held in the index now; never more than `maxSessions`. */
   get indexed(): number { return this.sessions.size; }
 
-  /** One advance, inside the host-wide limit on concurrent journal reads. */
   private async advanceInTurn(state: SessionState, source: TouchSource): Promise<void> {
     if (this.active < this.maxConcurrent) this.active++;
     else await new Promise<void>(resolve => this.waiters.push(resolve));
     try { await this.advance(state, source); }
     finally {
-      // A waiter inherits this slot, so the count never dips and lets a third caller in.
       const next = this.waiters.shift();
       if (next) next(); else this.active--;
     }
   }
 
-  /** The session's index entry, admitting a new one only when the index has room or an idle entry can make room. */
   private stateFor(sessionId: string): SessionState | undefined {
     const existing = this.sessions.get(sessionId);
     if (existing) return existing;
     while (this.sessions.size >= this.maxSessions) {
-      // Evict the least recently used session that is not being read.
       let victim: [string, SessionState] | undefined;
       for (const entry of this.sessions) {
         if (entry[1].inflight) continue;
@@ -305,7 +268,6 @@ export class ContextTouches {
       .map(([path, file]) => ({ path, reads: file.reads, edits: file.edits, lastAt: file.lastAt }));
     return {
       sessionId,
-      // Before the first recorded input is read the answer is not known. The view draws that as a gap.
       observable: state.signalled,
       complete: state.complete,
       graphQueries: state.graphQueries,

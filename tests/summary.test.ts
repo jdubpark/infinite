@@ -11,7 +11,6 @@ import { claimControl, startHost, waitFor } from "./helpers.js";
 
 const attention = { idleAfterMs: 3000, hooks: { claude: true, codex: true } };
 
-/** A stand-in for the OpenAI Responses API that records what it was asked. */
 async function fakeModel() {
   const requests: { auth: string; body: any }[] = [];
   let status = 200;
@@ -87,14 +86,12 @@ test("a summary covers the chat after a cursor, names its model, and is cached p
     assert.match(model.requests[0].body.input, /Person: hook dialog[\s\S]*Agent ran Bash: rm -rf build[\s\S]*Agent: Removed the build directory/);
     assert.equal(model.requests[0].body.store, false);
 
-    // The same range is served from cache; a later cursor asks the model again, for less.
     assert.equal((await host.fetchApi(`/sessions/${id}/summary`)).body.at, summary.body.at);
     assert.equal(model.requests.length, 1);
     const empty = await host.fetchApi(`/sessions/${id}/summary?after=${chat.body.cursor}`);
     assert.equal(empty.body.text, "");
     assert.equal(empty.body.messages, 0);
     assert.equal(model.requests.length, 1, "nothing new needs no model call");
-    // Cursors are journal positions: a page starting after the first message leaves it out.
     const firstMessage = (await host.fetchApi(`/sessions/${id}/events?types=message&limit=200`)).body.events[0];
     const firstPage = { body: { cursor: String(firstMessage.seq) } };
     const later = await host.fetchApi(`/sessions/${id}/summary?after=${firstPage.body.cursor}`);
@@ -130,7 +127,6 @@ test("repository briefings run automatically after a turn end, reuse the snapsho
   const receipt = join(root, "calls.jsonl");
   const fixture = join(process.cwd(), "tests/fixtures/jevcode-brief.mjs");
   const commandArgs = [fixture, receipt];
-  // Workspace maintenance may also invoke the engine (`context`, `brief`); count only the session-briefing `auto` runs.
   const autoReceipts = () => readFileSync(receipt, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)).filter((call: { args: string[] }) => call.args.includes("auto"));
   const host = await startHost({ config: { attention, repositoryBriefings: {
     command: process.execPath, args: commandArgs, model: "gpt-6-luna", automatic: true, intervalMs: 100, cooldownMs: 0, timeoutMs: 10000,
@@ -161,7 +157,6 @@ test("repository briefings run automatically after a turn end, reuse the snapsho
     assert.equal(firstReceipt.length, 1, "the turn-end event must trigger generation without a manual summary request");
     assert.deepEqual(firstReceipt[0].input.split("\n").filter(Boolean).map((line: string) => JSON.parse(line).role), ["user", "assistant", "tool", "assistant"]);
     assert.ok(firstReceipt[0].args.includes("--activity-stdin"));
-    // Jevcode's automatic run, with state, so unchanged turns are skipped and stale sections revised.
     assert.deepEqual(firstReceipt[0].args.slice(0, 5), ["auto", "--trigger", "host", "--format", "json"]);
     assert.ok(!firstReceipt[0].args.includes("--no-state"));
     assert.ok(firstReceipt[0].args.includes("--session"));
@@ -258,7 +253,6 @@ test("a failed automatic repository brief is safe and does not retry the same ch
     assert.equal(stop.status, 200);
     const exited = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.status === "exited", 15000);
     assert.equal(exited.body.status, "exited");
-    // Observe the exit-triggered run itself so an earlier failed state cannot satisfy the wait.
     const exitAttempt = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "pending", 15000);
     assert.equal(exitAttempt.body.state, "pending");
     const settled = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "failed", 15000);

@@ -23,7 +23,6 @@ export const lineup: TeamLineup = {
   reviewer: { id: "reviewer", label: "Reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
 };
 
-/** Real team and mission services over real session workers, with a two-repository project behind a fake group lookup. */
 export function missionHarness(options?: { configure?: (config: Config) => void; hostProbe?: HostLoadProbe }) {
   const root = realpathSync(mkdtempSync("/tmp/inf-mission-"));
   const receipts = join(root, "receipts");
@@ -56,7 +55,6 @@ export function missionHarness(options?: { configure?: (config: Config) => void;
       ] };
   } };
   let services: { teams: TeamService; missions: MissionService } | undefined;
-  /** `teamOptions` reach the team service as they do in the host, for a test that gives it an event outbox. */
   const open = (teamOptions?: ConstructorParameters<typeof TeamService>[6]) => {
     const manager = new Manager(config, key, options?.hostProbe);
     const teams = new TeamService(config, key, manager, (_project, start) => start(), undefined, undefined, teamOptions);
@@ -74,14 +72,11 @@ export function missionHarness(options?: { configure?: (config: Config) => void;
   const close = async (beforeRemove?: () => void) => {
     const closing = services;
     shut();
-    // A tick already under way can still launch a coordinator attempt or subteam member after close().
     await closing?.missions.idle(); await closing?.teams.idle();
     try {
-      // Workers exit 1.5 s after their child. Ask until none of them runs, so no worker or provider outlives the test.
       await endSessionWorkers(config);
       await new Promise(done => setTimeout(done, 1700));
     } finally {
-      // A test that opened a store under the root closes it here: after the services stopped, before the folder goes.
       beforeRemove?.();
       rmSync(root, { recursive: true, force: true });
     }
@@ -96,10 +91,6 @@ type FakeRun = { id: string; projectId: string; missionId: string; status: TeamV
   decisions: { id: string; memberId: string; revision: number; question: string; options: string[]; answerMode?: "approval" | "single" | "multiple"; createdAt: string; answer?: string;
     recommendation?: TeamView["decisions"][number]["recommendation"] }[] };
 
-/**
- * The real mission service over scripted coordinator sessions and subteams: each coordinator attempt
- * reports what the test tells it to, and each subteam is in whatever state the test sets.
- */
 export function scriptedMissionHarness(options?: { configure?: (config: Config) => void }) {
   const root = realpathSync(mkdtempSync("/tmp/inf-mission-script-"));
   const repo = (name: string) => { const path = join(root, name); mkdirSync(path); return path; };
@@ -112,14 +103,11 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
   type CoordinatorRequest = { requestId: string; prompt: string; continuation?: NativeContinuation };
   const attempts: { sessionId: string; assignment: TeamAssignment; prompt: string; request: CoordinatorRequest }[] = [];
   const reports = new Map<string, { report: MissionReport; note?: string }>();
-  // Each coordinator session's journaled signals and the attention the real reducer derives from them.
   const signals = new Map<string, SignalEvent[]>(), attention = new Map<string, Attention>();
   const stateReads = new Map<string, number>(), sessionStatuses = new Map<string, "running" | "exited">();
   const nativeSessions = new Map<string, { id: string; source: "hook" }>();
   const held = new Set<string>(), stops: string[] = [];
-  // While set, coordinator launches wait for host capacity with this reason, and a session not yet created does not exist.
   let launchHold: string | undefined;
-  // Each coordinator session's journaled usage records, as the provider usage readers append them.
   const usage = new Map<string, { seq: number; at: string; type: "usage"; data: unknown }[]>();
   const signal = (sessionId: string, data: Signal, at = new Date()) => {
     const journal = signals.get(sessionId)!;
@@ -212,7 +200,6 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
       if (loseCapacityReply) { loseCapacityReply = false; throw new TeamError(409, "team-operation-running", "The reply was lost after the capacity change was recorded."); }
       return view(target);
     },
-    // Mirrors TeamService.steer: a known request replays, then busy, stale, and limit refusals, then a new revision.
     async steer(id: string, body: { requestId: string; revision: number; text: string }) {
       const fingerprint = JSON.stringify(body);
       if (steerReceipts.has(body.requestId)) {
@@ -254,19 +241,14 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
   const parse = (prompt: string, label: string) => JSON.parse(prompt.split("\n").find(line => line.startsWith(label))!.slice(label.length));
   return {
     get missions() { return missions; },
-    /** Stops the mission service after its queued work and loads a new one from the sealed records, as a host restart does. */
     restart: async () => { missions.close(); await missions.idle(); missions = open(); },
     config, teams, runs, standalone, failing, created, answers, steers, capacityCalls, set,
-    /** Later steers of these subteams, or of every subteam, are refused at the steering limit. */
     limitSteering: (teamIds?: string[]) => { steerLimit = teamIds ? new Set(teamIds) : true; },
-    /** Subteam steers are refused as busy until released. */
     holdSteers: (held: boolean) => { steerBusy = held; },
-    /** The next steer is recorded by the subteam, but the mission sees a retryable error instead of its reply. */
     loseNextSteerReply: () => { loseSteerReply = true; },
     loseNextCapacityReply: () => { loseCapacityReply = true; },
     bumpNextCapacityRevision: () => { bumpCapacityRevision = true; },
     remove: () => { removed = true; },
-    /** Coordinator launches wait for host capacity with this reason until called without one. */
     holdLaunches: (reason?: string) => { launchHold = reason; },
     attempts: () => attempts.length,
     attempt,
@@ -284,7 +266,6 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
       sessionStatuses.set(sessionId, "exited");
     },
     refusals: (id: string) => unseal<{ refusals: number }>(key, "mission:" + id, readFileSync(join(config.stateDir, "missions", id + ".sealed"), "utf8")).refusals,
-    /** The attempt records one model call whose context is this many input tokens; `secondary` marks a subagent's call. */
     usage: async (n: number, contextTokens: number, secondary = false) => {
       const sessionId = (await attempt(n)).sessionId, journal = usage.get(sessionId) ?? [], at = new Date().toISOString();
       journal.push({ seq: journal.length + 1, at, type: "usage", data: { provider: "claude", providerId: "claude", modelId: "test-model", messageId: randomUUID(), partId: "",
@@ -294,30 +275,42 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
     stored: (id: string) => unseal<{ mission: Mission; attempts: { prompt: string; consumedInbox: MissionMessage[] }[]; inbox: MissionMessage[]; refusals: number }>(key, "mission:" + id, readFileSync(join(config.stateDir, "missions", id + ".sealed"), "utf8")),
     messages: async (n: number) => parse((await attempt(n)).prompt, "Messages since your last attempt (JSON): "),
     state: async (n: number) => parse((await attempt(n)).prompt, "Mission state (JSON): "),
-    /** The attempt files this report, with the optional note beside it as the mission report tool sends it. */
     report: async (n: number, report: MissionReport, note?: string) => { reports.set((await attempt(n)).sessionId, { report, ...(note === undefined ? {} : { note }) }); },
-    /** The coordinator's turn ends without a report; its session stays alive at the prompt. */
     endTurn: async (n: number, at?: Date) => { signal((await attempt(n)).sessionId, { kind: "turn-end" }, at); },
     signal: async (n: number, data: Signal) => signal((await attempt(n)).sessionId, data),
-    /** What the session worker publishes when the screen goes quiet without a dialog. */
     quietScreen: async (n: number) => {
       const sessionId = (await attempt(n)).sessionId, current = attention.get(sessionId)!;
       const decision = screenDecision(current, null, true, false, new Date().toISOString());
-      if (decision.idle) attention.set(sessionId, { ...current, state: decision.idle, since: current.state === decision.idle ? current.since : new Date().toISOString(), source: "screen" });
-      return decision.idle;
+      if (decision.kind === "idle") {
+        const since = current.state === decision.idle ? current.since : new Date().toISOString();
+        const base = {
+          since,
+          source: "screen" as const,
+          now: current.now,
+          lastActivityAt: current.lastActivityAt,
+          hooks: current.hooks,
+          hookErrors: current.hookErrors,
+          ...(current.limit ? { limit: current.limit } : {}),
+          sawTurnEnd: current.sawTurnEnd,
+        };
+        attention.set(
+          sessionId,
+          decision.idle === "turn-finished"
+            ? { ...base, state: "turn-finished", ...(current.lastMessage !== undefined ? { lastMessage: current.lastMessage } : {}) }
+            : { ...base, state: "idle" },
+        );
+        return decision.idle;
+      }
+      return undefined;
     },
-    /** Stop requests for that attempt's session report it still running until released. */
-    /** An earlier turn ended a minute ago and the provider continued in a new turn. */
     continueAfterTurnEnd: async (n: number) => {
       const sessionId = (await attempt(n)).sessionId;
       signal(sessionId, { kind: "turn-end" }, new Date(Date.now() - 60000)); signal(sessionId, { kind: "turn-start" });
     },
     holdStop: async (n: number) => { held.add((await attempt(n)).sessionId); },
     releaseStop: async (n: number) => { held.delete((await attempt(n)).sessionId); },
-    /** Subteam resumes are refused as busy and retried until released. */
     holdResume: () => { resumeBusy = true; },
     releaseResume: () => { resumeBusy = false; },
-    /** Releases the held stop and resume together, so one tick applies the resume and then consumes the report. */
     releaseStopAndResume: async (n: number) => { const sessionId = (await attempt(n)).sessionId; held.delete(sessionId); resumeBusy = false; },
     stops: async (n: number) => { const sessionId = (await attempt(n)).sessionId; return stops.filter(item => item === sessionId).length; },
     create: (objective = "Change the API and the web client") => missions.create({ requestId: randomUUID(), groupId: "shop", objective, maxSubtasks: 8, maxMinutes: 30 }),

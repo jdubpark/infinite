@@ -15,9 +15,6 @@ import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 import type { Config } from "../packages/host/src/types.js";
 import { PROJECT, graderRecord, host, profile, serveTeam, setup, teamFixture, validated, type Setup } from "./eval-run-fixture.js";
 
-// One calibration judgement over the real source build: EvalHost, the pump, the real prepareTrialSource, the grader and eval
-// launcher fixtures, a real team service, and the fixture judge. judge-pump.test.ts scripts the source build to run 60 judgements.
-
 const JUDGE_AGENT = resolve("tests/fixtures/judge-agent.mjs");
 const JUDGE: TeamModelProfile = { id: "zz-judge-profile", label: "Label Zed", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" };
 const OTHER: TeamModelProfile = { id: "claude-strong", label: "Claude strong", provider: "claude", model: "claude-opus-5-5", effort: "high", tier: "strong" };
@@ -26,15 +23,10 @@ const SEED_JOB = "job-seed";
 const PAIRS = 30;
 const DAY_MS = 86_400_000;
 
-/** A small unified diff; the resolved side holds the marker line the fixture judge looks for. */
 const patchOf = (resolved: boolean) =>
   Buffer.from(`diff --git a/a.txt b/a.txt\nnew file mode 100644\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+${resolved ? "RESOLVED-MARKER\n+fix" : "other"}\n`);
 const grade = (resolved: boolean): TrialGrade => ({ ending: "graded", expectedPassed: resolved ? 1 : 0, expectedTotal: 1, guardPassed: true, resolved, overwritten: 0, diff: null, isolation: "isolated" });
 
-/**
- * The rig of eval-trial-run.test.ts, with the judge as the lineup's judge and the fixture judge as the eval member's claude agent.
- * The eval root is reached through a link: the package writer refuses a linked path, so the pump must hand it the real one.
- */
 async function judgeRig() {
   const s = setup({ linked: true });
   s.config.teams = { ...s.config.teams, lineup: LINEUP } as Config["teams"];
@@ -46,7 +38,6 @@ async function judgeRig() {
   return { s, fx, served, h };
 }
 
-/** Two graded isolated trials of the one valid task, then a running calibration of PAIRS pairs that all name them. */
 function calibrate(s: Setup): { calibrationId: string; resolved: Buffer; unresolved: Buffer } {
   const taskId = s.r.store.read(db => db.get<{ task_id: string }>("SELECT task_id FROM eval_tasks WHERE state = 'valid' ORDER BY task_id"))?.task_id;
   assert.ok(taskId, "the store holds a valid task");
@@ -66,7 +57,6 @@ function calibrate(s: Setup): { calibrationId: string; resolved: Buffer; unresol
       finishTrial(tx, trialId, { grade: grade(isResolved), configId: null, profileEpoch: null, sessionId: null, patchKeepDays: 90,
         patch: isResolved ? resolved : unresolved }, at);
     }
-    // The pins are taken as JudgeCalibrations.create takes them. create keeps one pair per task, and the fixture mirror has too few tasks.
     const inserted = insertCalibration(tx, {
       calibrationId, requestId: randomUUID(), judgeKey, profileEpoch: epochAt(tx, judgeKey, at), promptVersion: judgePromptVersion(JUDGE.provider),
       pairsPlanned: PAIRS, judgeMinutes: 10, createdAt: at, expiresAt: new Date(Date.parse(at) + DAY_MS).toISOString(),
@@ -84,7 +74,6 @@ function calibrate(s: Setup): { calibrationId: string; resolved: Buffer; unresol
 const rowsOf = (s: Setup, id: string) => s.r.store.read(db => calibrationJudgements(db, id));
 const finals = (s: Setup, id: string) => rowsOf(s, id).filter(row => row.state === "final").length;
 
-/** Ticks the host until `done` holds; a count and a deadline bound the loop. */
 async function until(h: EvalHost, done: () => boolean, ms: number): Promise<void> {
   const deadline = Date.now() + ms;
   for (let step = 0; step < 5000 && Date.now() < deadline && !done(); step++) {
@@ -94,7 +83,6 @@ async function until(h: EvalHost, done: () => boolean, ms: number): Promise<void
   }
 }
 
-/** Cancels the calibration so no further judgement starts, then lets the one in flight end. */
 async function stop(s: Setup, h: EvalHost, calibrationId: string): Promise<void> {
   new JudgeCalibrations({ store: s.r.store, config: s.config, now: () => new Date().toISOString() }).cancel(calibrationId);
   await until(h, () => rowsOf(s, calibrationId).every(row => row.state === "final" || row.state === "dropped"), 120_000);

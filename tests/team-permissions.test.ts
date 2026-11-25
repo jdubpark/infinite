@@ -45,7 +45,6 @@ test("only a preflight or named worker refusal counts as an answer that sent not
   assert.equal(refusedBeforeSend(new ContentError("The assigned team member has no running managed terminal")), true);
   for (const code of ["prompt-changed", "control-busy", "control-lost"])
     assert.equal(refusedBeforeSend(Object.assign(new Error(code), { code })), true, code);
-  // A socket error can follow a delivered key, like a lost acknowledgement.
   for (const code of ["ECONNRESET", "EPIPE", undefined])
     assert.equal(refusedBeforeSend(Object.assign(new Error("Worker connection failed"), { code })), false, String(code));
 });
@@ -143,7 +142,7 @@ test("a lost expansion acknowledgement is sealed uncertain and a fresh Manager n
         const ledger = unseal<{ requests: Record<string, { receipt: Receipt }> }>(key, `${sessionId}:team-permission-expansions`,
           readFileSync(join(stateDir, "sessions", sessionId, "team-permission-expansions.sealed"), "utf8"));
         intentWasDurable = ledger.requests[request.requestId]?.receipt.state === "uncertain";
-        socket.destroy(); // The worker accepted the one-key request; its acknowledgement is lost.
+        socket.destroy();
       } else socket.end(JSON.stringify({ error: "unexpected request" }) + "\n");
     });
   });
@@ -385,7 +384,6 @@ test("a Codex permission review preserves a large objective and complete request
     assert.ok(existsSync(feedback.targetScratchDirectory), "the host-assigned temporary directory exists for the reviewed target");
     const scratchRelativeToTarget = relative(target.cwd, feedback.targetScratchDirectory);
     assert.ok(scratchRelativeToTarget.startsWith(`..${sep}`), "the target scratch directory stays outside its Git checkout");
-    // While the coordinator reviews, the run does not tell the person to answer the prompt.
     await waitFor(() => f.get(reviewing.id), run => run.reason === "The permission coordinator is reviewing a provider request.", 10000);
     writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
 
@@ -533,7 +531,6 @@ test("a Codex command redrawn while the answer is in progress receives no Enter"
     const reviewing = await waitFor(() => f.get(created.body.id), run =>
       run.permissionDecisions?.some(decision => decision.status === "reviewing") && existsSync(join(f.receipts, `${run.id}.judge-ready`)), 60000);
     writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
-    // Arrow keys reached the dialog before it changed, so the host cannot say nothing was sent.
     const uncertain = await waitFor(() => f.get(reviewing.id), run => !["pending", "reviewing", "approved", "answering"].includes(run.permissionDecisions?.[0]?.status ?? "pending"), 30000);
     assert.equal(uncertain.permissionDecisions[0].status, "uncertain", JSON.stringify(uncertain.permissionDecisions[0]));
     assert.equal(uncertain.permissionDecisions[0].receipt?.state, "uncertain");
@@ -652,7 +649,7 @@ test("an explicit escalation or a foreign decision report never answers the targ
       const session = await f.host.fetchApi(`/sessions/${target.sessionId}`);
       assert.equal(session.body.attention?.state, "needs-you");
       if (scenario === "permissions-escalate") {
-        await new Promise(resolve => setTimeout(resolve, 1800)); // Let several 500 ms TeamService passes observe the held prompt.
+        await new Promise(resolve => setTimeout(resolve, 1800));
         const stillEscalated = await f.get(reviewing.id);
         assert.equal(stillEscalated.permissionDecisions?.length, 1,
           "a terminal escalation for this exact prompt cannot launch another ordinary review on later ticks");
@@ -766,7 +763,6 @@ test("an owner answer supersedes a late permission report when the obsolete revi
     const targetSession = await waitFor(() => f.host.fetchApi(`/sessions/${target.sessionId}`),
       result => result.body?.attention?.state === "needs-you" && result.body?.attention?.prompt?.kind === "permission", 15000);
 
-    // Keep the report-only reviewer from stopping immediately after its target becomes obsolete.
     reviewerControl = await claimControl(f.host, coordinator.sessionId, "controller");
     const ownerAnswer = await f.host.fetchApi(`/sessions/${target.sessionId}/answer`, "owner", {
       requestId: randomUUID(), promptId: targetSession.body.attention.prompt.id, option: 0,
@@ -774,8 +770,6 @@ test("an owner answer supersedes a late permission report when the obsolete revi
     assert.equal(ownerAnswer.status, 200, JSON.stringify(ownerAnswer.body));
     await waitFor(() => f.host.fetchApi(`/sessions/${target.sessionId}`), result => !result.body?.attention?.prompt, 15000);
 
-    // If the stale report reaches the ordinary result validator, this violates the reviewer's
-    // read-only workspace check. It must be ignored because the owner's answer already won.
     writeFileSync(join(coordinator.cwd, "late-review-write.txt"), "outside the reviewer assignment\n");
     writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
     const lateReport = await waitFor(() => f.get(reviewing.id), run =>
@@ -794,10 +788,6 @@ test("an owner answer supersedes a late permission report when the obsolete revi
     assert.equal(finished.permissionDecisions?.[0]?.receipt, undefined, "a late reviewer report cannot deliver a second answer");
     assert.deepEqual(finished.tasks.map(task => task.status), ["integrated", "integrated"]);
 
-    // Reproduce a legacy host record that stopped during a generic result operation after
-    // the permission coordinator and an implementation sibling had both reported. Without
-    // operation provenance, restart must retain both reports and ask the PM to reconcile
-    // them instead of either accepting one or leaving the same run wedged.
     await f.host.stopApi();
     const stateFile = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
     const key = readFileSync(f.host.config.keyFile);
@@ -859,9 +849,6 @@ test("an unavailable reviewer with a terminal decision does not fence a later pe
     const targetPrompt = await waitFor(() => f.host.fetchApi(`/sessions/${target.sessionId}`), result =>
       result.body?.attention?.state === "needs-you" && result.body?.attention?.prompt?.kind === "permission", 15000);
 
-    // Model a new prompt after the first review became terminal, while retaining the old
-    // report-only member as unavailable. The current prompt identity remains independently
-    // validated by maybeStartPermissionReview before its new coordinator can answer it.
     const service = await f.openTeamService({ start: false });
     const internal = service as unknown as {
       records: Map<string, { run: typeof reviewing }>;
@@ -931,7 +918,6 @@ test(`a ${action} with an unresolved verification operation stays in force after
   const f = await fixture("lifecycle");
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
-    // The project has a quick check before the held one. Only the held check is certain to run when the API stops.
     const checking = await waitFor(() => f.get(created.body.id), run => run.status === "verifying" && run.checks.some(check => check.status === "running") &&
       existsSync(join(f.receipts, "check-ready.json")), 30000);
     const result = await f.host.fetchApi(`/teams/${checking.id}/${action}`, "owner", { requestId: randomUUID(), revision: checking.revision });

@@ -6,28 +6,23 @@ import type { ParsedReport } from "./eval-report.js";
 import type { TeamModelProfile } from "./team-types.js";
 import { VOID_ENDINGS, type EvalIdentityState, type TrialConfiguration, type TrialEnding, type TrialGrade, type TrialState } from "./eval-types.js";
 
-// Pure trial rules: grades, the restore set, the next slot, the isolation label, and the ending maps. No I/O, no clock.
-
 export const TRIAL_HARNESS_VERSION = 1, VOID_ATTEMPTS_MAX = 3, VOID_STREAK_PAUSE = 3;
-/** The failure in a row, for one slot, before a host cause ends the trial `void-host`. A shorter outage keeps the attempt. */
 export const TRIAL_RELEASES = 10;
 
 export type SlotRow = { taskId: string; configRef: string; slot: number; attempt: number; state: TrialState; ending: TrialEnding | null };
 
 export type GradeFacts = {
-  ending: TrialEnding; // "graded" when a grading round ran
-  expected: readonly string[]; // the task's expectedCases
-  report?: ParsedReport; // eval-report.ts; absent: no parsed report after two rounds
-  guard?: "passed" | "failed"; // absent: not run
+  ending: TrialEnding;
+  expected: readonly string[];
+  report?: ParsedReport;
+  guard?: "passed" | "failed";
   overwritten: number; diff: TrialGrade["diff"]; isolation: "isolated" | "none";
 };
 
-// The structural shape of the eval identity probe (EvalProbe, eval-identity.ts, Task 6), so this file has no dependency on it.
 type IdentityProbe = { state: EvalIdentityState; fetch?: "refused" | "open" | "skipped" };
 
 const slotKey = (taskId: string, configRef: string, slot: number) => JSON.stringify([taskId, configRef, slot]);
 
-/** Grades one trial. Only a graded trial with a parsed report can resolve; every unknown count stays null. */
 export function gradeOf(facts: GradeFacts): TrialGrade {
   const expectedTotal = facts.expected.length;
   const common = { ending: facts.ending, expectedTotal, overwritten: facts.overwritten, diff: facts.diff, isolation: facts.isolation };
@@ -39,7 +34,6 @@ export function gradeOf(facts: GradeFacts): TrialGrade {
   return { ...common, expectedPassed, guardPassed, resolved };
 }
 
-/** The files a grading commit restores from the reference: the hidden files, and the test and grading files either side changed. */
 export function restoreSet(input: { referenceChanged: readonly string[]; resultChanged: readonly string[]; hiddenFiles: readonly string[];
   gradingPaths: readonly string[]; testPath: (path: string) => boolean }): { restore: string[]; overwritten: number } {
   const covered = (path: string) => input.gradingPaths.some(grading => path === grading || path.startsWith(`${grading}/`));
@@ -51,10 +45,6 @@ export function restoreSet(input: { referenceChanged: readonly string[]; resultC
   return { restore: [...restore].sort(), overwritten };
 }
 
-/**
- * The first slot in task order, then slot, then configuration order, with no final non-void row and fewer than three attempts.
- * The rows are indexed by key, so their order does not change the answer.
- */
 export function nextSlot(input: { tasks: readonly string[]; configRefs: readonly string[]; trialsPerTask: number; rows: readonly SlotRow[] }):
   { taskId: string; configRef: string; slot: number; attempt: number } | undefined {
   const bySlot = new Map<string, SlotRow[]>();
@@ -77,24 +67,20 @@ export function nextSlot(input: { tasks: readonly string[]; configRefs: readonly
   return undefined;
 }
 
-/** `isolated` only when the eval identity is ready, its fetch of the repository is refused, and the source is clean. */
 export function isolationLabel(input: { probe: IdentityProbe; sourceClean: boolean }): "isolated" | "none" {
   return input.probe.state === "ready" && input.probe.fetch === "refused" && input.sourceClean ? "isolated" : "none";
 }
 
-/** The prompt version `trialJobDigest` digests for a profile: the implementer prompt rendered for the canonical profile. */
 export function trialPromptVersion(profile: TeamModelProfile): string {
   const canonical = JSON.parse(canonicalJson(profile)) as TeamModelProfile;
   return promptVersion("implementer", canonical.provider, canonical, false, false, false);
 }
 
-/** The profile's provider, model, and effort as the outcome ledger keys them, with null for an absent model or effort. */
 export function trialProfileKey(profile: TeamModelProfile): ProfileKey {
   const identity = profileIdentity(profile, profile.provider);
   return { provider: identity.provider, model: identity.model ?? null, effort: identity.effort ?? null };
 }
 
-/** SHA-256 hex of the canonical JSON of profileIdentityKey(profile), guidance, and knowledge. */
 export function configRef(configuration: TrialConfiguration): string {
   const profile = configuration.profile;
   const key: ProfileKey = {
@@ -106,7 +92,6 @@ export function configRef(configuration: TrialConfiguration): string {
   return createHash("sha256").update(identity, "utf8").digest("hex");
 }
 
-/** Maps a block code to the ending it implies. An unknown or absent code is a host void. */
 export function endingOfBlock(code: string | undefined): TrialEnding {
   switch (code) {
     case "task-scope-violation": return "scope-violation";

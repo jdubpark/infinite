@@ -12,7 +12,6 @@ import { PermissionJournal, permissionJournalModule, type PermissionDecision } f
 const exec = promisify(execFile);
 const ASSIGNMENT = "task-1:builder";
 
-/** An original effect reject and two repeats of it from one assignment: the assignment is locked. */
 function seedLockedAssignment(host: Host) {
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(host.config.stateDir), vaultKey: readFileSync(host.config.keyFile) });
   try {
@@ -70,14 +69,12 @@ test("owner CLI reopens a reject and unlocks an assignment; nobody else can", { 
 
     const unlocked = JSON.parse((await permissions("unlock", ASSIGNMENT, "--request-id", unlock.requestId, "--json")).stdout);
     assert.deepEqual(unlocked, { assignment: ASSIGNMENT, wasLocked: true, locked: false });
-    // A retry with the same request ID returns the recorded result; the same ID for another act is a conflict.
     assert.deepEqual((await host.fetchApi("/permissions/unlocks", "owner", unlock)).body, unlocked);
     assert.equal((await host.fetchApi("/permissions/reopenings", "owner", { ...reopen, requestId: unlock.requestId })).status, 409);
 
     const reopened = await permissions("reopen", "decision-repeat-1");
     assert.match(reopened.stdout, /^Reopened reject decision-original \(unsafe\)\. .*Nothing was allowed\.$/m);
 
-    // The delegation route closes open rejects when the owner changes the direction text.
     const workspaceId = (await host.fetchApi("/project-groups/rehearsal", "owner")).body.id as string;
     for (const direction of ["Run checks.", "Run only the focused checks."]) {
       const delegated = await host.fetchApi("/permissions/delegations", "owner", { requestId: randomUUID(), workspaceId, direction });

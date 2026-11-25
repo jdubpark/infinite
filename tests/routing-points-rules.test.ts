@@ -14,7 +14,6 @@ const codex = (id: string, model: string, effort: "high" | "xhigh", tier?: "ligh
 const contributor = (id: string): TeamModelProfile =>
   ({ id, label: id, provider: "opencode", model: "contrib/spark", variant: "high", tier: "light", dataUse: "contributor" }) as TeamModelProfile;
 
-/** The lineup the point rules are tested on. The reviewer is on claude-opus-5-5. */
 const POINT_LINEUP = {
   coordinator: claude("coord", "claude-sonnet-5-5", "high"),
   integrator: claude("integ", "claude-sonnet-5-5", "high"),
@@ -37,7 +36,6 @@ const ALL_POINTS: RoutingPoint[] = ["start", "escalation", "scout"];
 const AUTO_AT = "2026-11-01T00:00:00.000Z";
 const REVOKED_AT = "2026-11-02T00:00:00.000Z";
 
-/** A pin with the given points. Version 2 is the pin the router may act on. */
 function pin(points: RoutingPoint[], over: Partial<RoutingKnobs> = {}, version = 2, mode: "auto" | "shadow" = "auto"): TeamRunRouting {
   const knobs = { ...ROUTING_DEFAULTS, points, ...over };
   return (mode === "auto"
@@ -60,14 +58,12 @@ test("a run covers a point only under an auto pin of version 2 that lists it, wi
   assert.equal(hostSelects(covered, "escalation"), true);
   assert.equal(hostSelects(covered, "scout"), true);
 
-  // Revoked: coverage holds, but the host no longer tells members that it selects.
   const revoked = runOf(pin(ALL_POINTS), POINT_LINEUP, REVOKED_AT);
   assert.equal(coversPoint(revoked, "escalation"), true);
   assert.equal(coversPoint(revoked, "scout"), true);
   assert.equal(hostSelects(revoked, "escalation"), false);
   assert.equal(hostSelects(revoked, "scout"), false);
 
-  // Never: a version-1 pin or a shadow pin with the same points, or a pin that lists only start.
   for (const routing of [pin(ALL_POINTS, {}, 1), pin(ALL_POINTS, {}, 2, "shadow"), pin(["start"])]) {
     for (const point of ["escalation", "scout"] as const) {
       assert.equal(coversPoint(runOf(routing), point), false);
@@ -75,7 +71,6 @@ test("a run covers a point only under an auto pin of version 2 that lists it, wi
     }
   }
 
-  // Escalation needs a candidate other than the member's own profile.
   assert.deepEqual(ids(escalationCandidates(POINT_LINEUP, { allowContributor: false }, "astra-escalation")), ["sonnet-escalation"]);
   assert.equal(coversPoint(runOf(pin(ALL_POINTS)), "escalation", "astra-escalation"), true);
   assert.equal(coversPoint(runOf(pin(ALL_POINTS)), "escalation", "sonnet-escalation"), true);
@@ -86,17 +81,14 @@ test("a run covers a point only under an auto pin of version 2 that lists it, wi
   assert.equal(coversPoint(twoEscalations, "escalation"), true);
   assert.equal(coversPoint(twoEscalations, "escalation", "sonnet-escalation"), false);
 
-  // Scout needs an implementer that is not strong and passes rules 1 and 2: spark-high is a contributor.
   assert.deepEqual(ids(scoutCandidates(POINT_LINEUP, { allowContributor: false })), ["astra-xhigh", "haiku-light"]);
   const scoutLineup = withLineup({ implementers: [contributor("spark-high"), claude("opus-strong", "claude-opus-5-5", "xhigh", "strong")] });
   assert.equal(coversPoint(runOf(pin(ALL_POINTS), scoutLineup), "scout"), false);
   assert.equal(coversPoint(runOf(pin(ALL_POINTS, { allowContributor: true }), scoutLineup), "scout"), true);
-  // A strong implementer that passes rules 1 and 2 is still no scout candidate: the tier alone keeps it out.
   const strongOnly = withLineup({ implementers: [claude("sonnet-strong", "claude-sonnet-5-5", "high", "strong")] });
   assert.deepEqual(ids(scoutCandidates(strongOnly, { allowContributor: false })), []);
   assert.equal(coversPoint(runOf(pin(ALL_POINTS), strongOnly), "scout"), false);
 
-  // hostProfilesFor: an implementer when escalation is covered for it, the project manager when scout is covered.
   assert.equal(hostProfilesFor(runOf(pin(ALL_POINTS)), "implementer", "astra-escalation"), true);
   assert.equal(hostProfilesFor(runOf(pin(ALL_POINTS)), "project-manager"), true);
   assert.equal(hostProfilesFor(runOf(pin(ALL_POINTS)), "reviewer"), false);
@@ -114,7 +106,6 @@ test("the worker refuses a missing profile unless the member's assignment says t
   assert.equal(reportRefusal(assignment({ role: "project-manager" }), explore), PROFILE_REQUIRED_REFUSAL);
   assert.equal(reportRefusal(assignment({ role: "project-manager", hostProfiles: true }), explore), undefined);
 
-  // The verification rule first, unchanged: the literal that worker.ts carried before this slice.
   const plan = { kind: "plan", summary: "plan", tasks: [task("a")], verification: { checks: [{ command: "npm test" }] } } as unknown as TeamReport;
   assert.equal(PLAN_VERIFICATION_REFUSAL, "Plan rejected: this run uses the project's configured checks. Remove verification and submit a corrected plan. If the checks seem insufficient, explain that in the summary and assign tasks to run additional commands themselves and report results.");
   assert.equal(reportRefusal(assignment({ role: "project-manager", verificationRefused: true }), plan), PLAN_VERIFICATION_REFUSAL);

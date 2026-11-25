@@ -12,7 +12,6 @@ function issueLink(value: string) {
 }
 const date = (value: string) => new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 type Issue = NonNullable<LinearTrackingView["issue"]>;
-/** A team list row's issue carries no description; a goal or a team's full record does. */
 type Tracking = Omit<LinearTrackingView, "issue"> & { issue?: Pick<Issue, "identifier" | "url" | "title" | "state"> & Partial<Pick<Issue, "description">> };
 
 export function LinearTracking({ tracking, stale, compact = false }: { tracking?: Tracking; stale: boolean; compact?: boolean }) {

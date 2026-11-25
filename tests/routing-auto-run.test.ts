@@ -22,25 +22,18 @@ const REVOKED_LINE = "Host profile routing was revoked by the owner; new tasks s
 const POOL_SENTENCE = "Every task MUST include agentProfileId from this approved worker pool: ";
 const AUTO_SENTENCE = "The host assigns each plan task's worker profile; omit agentProfileId from plan tasks.";
 
-/** The stored run, prompts included: the team view strips them. */
 const storedRun = (teams: unknown, id: string): TeamRun => (teams as { record(id: string): { run: TeamRun } }).record(id).run;
 
-/** The task's rows at one point, one per revision. The mixed flow plans at revisions 2 and 3, and each start writes one row. */
 function rowsOf(store: EvidenceStore, runId: string, taskId: string, point: RoutingPoint = "start") {
   const rows = store.read(db => taskDecisions(db, runId, taskId)).rows.filter(row => row.point === point);
   assert.equal(new Set(rows.map(row => row.revision)).size, rows.length, `task ${taskId} has two rows for one revision`);
   return rows;
 }
 
-/** Waits until no member is still queued or running, so a member's process has closed before teardown. */
 async function membersClosed(teams: { get(id: string): TeamView }, id: string): Promise<TeamView> {
   return waitFor(() => Promise.resolve(teams.get(id)), view => view.members.every(member => member.status !== "queued" && member.status !== "running"), 60000);
 }
 
-/**
- * Runs the team to a terminal status. In the mixed scenario, task b's implementer question blocks the run, and the
- * revision-2 project manager asks the owner one question, so each open decision is answered with its first option as it appears.
- */
 async function settleAnswering(teams: { get(id: string): TeamView; answer(id: string, decisionId: string, input: unknown): unknown }, id: string): Promise<TeamView> {
   return waitFor(async () => {
     const view = teams.get(id);
@@ -51,15 +44,7 @@ async function settleAnswering(teams: { get(id: string): TeamView; answer(id: st
   }, view => TERMINAL.includes(view.status), 180000);
 }
 
-/**
- * A mixed run in an autonomous project whose period has ended, so the router pins `auto`. The store is the one the server
- * registers: the configuration and outcome projectors, then the routing module and its projector, on one outbox.
- * `planWithoutProfiles` writes the fixture's marker, so the project manager's plan omits every agentProfileId.
- * `points` sets the project's routing points, and `escalations` the lineup's escalation profiles, when given.
- * `scenario` and `base` replace the fixture scenario and the lineup the evaluator and escalations are added to.
- */
 async function autoRun(planWithoutProfiles: boolean, points?: RoutingPoint[], escalations?: TeamLineup["escalations"], scenario = "mixed", base: TeamLineup = mixedLineup) {
-  // The evaluator lets the autonomous project pin its run autonomous (C14); the intent check stays off, as in routing-run.
   const lineup: TeamLineup = { ...base, evaluators: [{ id: "evaluator", label: "Evaluator", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" }], ...(escalations ? { escalations } : {}) };
   const f = await fixture(scenario, lineup, {}, { noServer: true });
   if (planWithoutProfiles) writeFileSync(join(f.receipts, "plan-no-profiles"), "");
@@ -71,7 +56,6 @@ async function autoRun(planWithoutProfiles: boolean, points?: RoutingPoint[], es
   store.register(outcomeModule());
   registerRouting(store, outbox);
   outbox.registerProjector(outcomeProjector(store));
-  // The period end is stored before the run is created, so its pin is `auto` from the start.
   assert.ok(store.tryWrite(tx => { markPeriodEnded(tx, "rehearsal", "2026-11-01T00:00:00.000Z", "2026-11-16T00:00:00.000Z"); }), "the period end could not be stored");
   const project = f.host.config.projects.find(item => item.id === "rehearsal")!;
   project.autonomy = "autonomous";
@@ -94,7 +78,6 @@ test("an auto run accepts a plan without profiles and starts the router's choice
     const implementers = run.members.filter(member => member.role === "implementer");
     assert.ok(implementers.length >= 2, "both tasks' implementers are stored");
 
-    // Each task has one applied row per revision, bound to that revision's first implementer.
     for (const taskId of ["a", "b"]) {
       const rows = rowsOf(store, created.id, taskId);
       assert.ok(rows.length >= 1, `task ${taskId} has no routing row`);
@@ -109,7 +92,6 @@ test("an auto run accepts a plan without profiles and starts the router's choice
     }
     for (const member of implementers) assert.equal(member.modelProfile?.id, "astra-xhigh");
 
-    // The project manager is told the host assigns the profiles, and no member sees a routing value.
     const managerPrompts = run.members.filter(member => member.role === "project-manager").map(member => member.prompt ?? "");
     assert.ok(managerPrompts.length >= 2, "the mixed flow plans at two revisions");
     for (const prompt of managerPrompts) {
@@ -138,7 +120,6 @@ test("with the store closed an auto run starts fallback profiles and continues",
   const { f, store, teams } = await autoRun(false);
   try {
     const created = await teams.create(f.create());
-    // The plan arrives later, from the coordinator's own process, so the store is already closed when each start decides.
     store.close();
     const settled = await settleAnswering(teams, created.id);
     await membersClosed(teams, created.id);
@@ -169,7 +150,6 @@ test("revoking routing returns new tasks to the coordinator's profiles", { timeo
 
     const run = storedRun(teams, created.id);
     const implementers = run.members.filter(member => member.role === "implementer");
-    // Task a's pick, spark-high, fails rule 1 and task b's pick passes: both run the fixed-rule fallback, astra-xhigh.
     for (const member of implementers) assert.equal(member.modelProfile?.id, "astra-xhigh");
     assert.equal(rowsOf(store, created.id, "a").length, 0, "task a has a routing row after revoke");
     assert.equal(rowsOf(store, created.id, "b").length, 0, "task b has a routing row after revoke");
@@ -188,7 +168,6 @@ test("revoking routing returns new tasks to the coordinator's profiles", { timeo
 test("an auto run routes its scouts and its escalation, and no member sees a routing value", { timeout: 240000 }, async () => {
   const { f, store, teams } = await autoRun(true, ["start", "escalation", "scout"], [SONNET_ESCALATION]);
   try {
-    // The project manager explores once before it plans, and task a's first implementer escalates without naming a profile.
     writeFileSync(join(f.receipts, "explore-unnamed"), "");
     writeFileSync(join(f.receipts, "escalate-unnamed"), "");
     writeFileSync(join(f.receipts, "escalate-to"), "sonnet-escalation");
@@ -205,10 +184,8 @@ test("an auto run routes its scouts and its escalation, and no member sees a rou
     const escalated = run.members.find(member => member.role === "implementer" && member.taskId === "a" && member.prompt?.includes("The previous implementer requested escalation"));
     assert.ok(escalated, "task a did not start its escalated member");
     assert.equal(escalated.modelProfile?.id, "sonnet-escalation");
-    // Task a is planned again at later revisions, so its escalation is read from the run line of its escalation.
     assert.ok(run.events.some(event => event.text.includes("escalated to Sonnet escalation;")), "task a has no escalation run line");
 
-    // The scout and the escalation each have one applied row, bound to the member that started on the chosen profile.
     const [scoutRow] = rowsOf(store, created.id, "s1", "scout");
     assert.ok(scoutRow, "the scout has no routing row");
     assert.equal(scoutRow.state, "applied");
@@ -218,7 +195,6 @@ test("an auto run routes its scouts and its escalation, and no member sees a rou
     assert.equal(escalationRow.state, "applied");
     assert.equal(escalationRow.memberId, escalated.memberId, "the escalation row is not bound to the escalated member");
 
-    // Each task's first start row is applied to that revision's first implementer.
     const implementers = run.members.filter(member => member.role === "implementer");
     for (const taskId of ["a", "b"]) {
       for (const row of rowsOf(store, created.id, taskId)) {
@@ -228,13 +204,11 @@ test("an auto run routes its scouts and its escalation, and no member sees a rou
       }
     }
 
-    // The coordinator is told the host assigns scout profiles, and the first implementer is told the host selects the escalation.
     const coordinator = run.members.find(member => member.role === "project-manager");
     assert.ok(coordinator?.prompt?.includes("The host assigns each scout's profile; omit agentProfileId from scouts."), "the coordinator is not told the host assigns scout profiles");
     const firstA = implementers.find(member => member.taskId === "a" && !member.prompt?.includes("requested escalation"));
     assert.ok(firstA?.prompt?.includes("The host selects the stronger profile."), "the first implementer is not told the host selects its escalation");
 
-    // No member prompt or context carries a routing value.
     const rows = [...rowsOf(store, created.id, "a"), ...rowsOf(store, created.id, "b"), ...rowsOf(store, created.id, "a", "escalation"), scoutRow];
     for (const member of run.members) {
       const prompt = member.prompt ?? "";
@@ -247,7 +221,6 @@ test("an auto run routes its scouts and its escalation, and no member sees a rou
     }
     for (const role of ["project-manager", "implementer", "reviewer"] as TeamMember["role"][])
       assert.ok(!JSON.stringify(teamContext(run, undefined, undefined, role)).includes('"routing":'), `the ${role} context carries routing`);
-    // The context files and the assignments the members read carry no hostProfiles, though the coordinator and the first implementer hold it.
     assert.equal(coordinator?.hostProfiles, true, "the coordinator does not hold hostProfiles");
     assert.equal(firstA?.hostProfiles, true, "the first implementer does not hold hostProfiles");
     for (const member of [coordinator!, firstA!, scout]) {
@@ -264,8 +237,6 @@ test("an auto run routes its scouts and its escalation, and no member sees a rou
 });
 
 test("a permission review in a covered auto run reads neither hostProfiles nor the task's routing", { timeout: 240000 }, async () => {
-  // A strong coordinator reviews the dialog. The router starts task a on astra-xhigh, a Codex profile, whose session shows the
-  // fixture's Codex command dialog, and the escalation profile makes the run cover `escalation` for that implementer.
   const reviewing: TeamLineup = { ...mixedLineup, coordinator: { ...mixedLineup.coordinator, tier: "strong" } };
   const { f, store, teams } = await autoRun(true, ["start", "escalation"], [SONNET_ESCALATION], "permissions-codex", reviewing);
   try {
@@ -292,7 +263,6 @@ test("a permission review in a covered auto run reads neither hostProfiles nor t
 });
 
 test("an off run refuses a report without a profile, and the member corrects it", { timeout: 240000 }, async () => {
-  // An off project: no routing, so the plan names its profiles and the escalation is the worker's to name.
   const f = await fixture("mixed", { ...mixedLineup, escalations: [SONNET_ESCALATION] }, {}, { noServer: true });
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(f.host.config.stateDir), vaultKey: readFileSync(f.host.config.keyFile) });
   store.register(configurationModule());

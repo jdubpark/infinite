@@ -53,7 +53,6 @@ function addTask(f: Fixture, taskId: string, groupId: string | null): void {
   });
 }
 
-/** Adds a final graded trial with a patch; `minute` orders ended_at. */
 function addTrial(f: Fixture, taskId: string, resolved: boolean, patch: Buffer | undefined, minute: number, isolation: "isolated" | "none" = "isolated"): string {
   const trialId = `trial-${f.seq.n++}`;
   const at = new Date(Date.parse(NOW) + minute * 60_000).toISOString();

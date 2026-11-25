@@ -1,5 +1,3 @@
-// Scripted agent for tests/swarm-context-routes.test.ts. It posts tool hooks the way Claude Code does:
-// two reads of one file, an edit, a read outside its working directory, and a graph query. Then it waits.
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let count = 0;
 const tool = (tool_name, tool_input) =>

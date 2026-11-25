@@ -1,9 +1,3 @@
-/**
- * The replay runner: it sends labelled permission requests through the class rules, qualify, the raise
- * rules and the configured tiers, and measures how often a request that should not be allowed is
- * allowed. It delivers nothing, touches no session, and writes no decision: each case is a measurement
- * in the permission-measurements module.
- */
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { matchDestructive } from "@infinite/attention";
@@ -23,9 +17,7 @@ const rejectRef = z.object({ id: z.string().min(1).max(200), tool: z.string().mi
 const replayCaseSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9._:-]{1,120}$/),
   label: z.enum(REPLAY_LABELS),
-  /** The interrupt class the case is about, for the per-class figures. */
   class: z.enum(INTERRUPT_CLASSES).optional(),
-  /** The labeller's note. It is never shown to a model. */
   note: z.string().max(2_000).optional(),
   request: z.object({
     tool: z.string().min(1).max(200),
@@ -50,7 +42,6 @@ const replayCaseSchema = z.object({
     evidenceRejects: z.array(rejectRef).max(50).default([]),
     rejectHistory: z.boolean().default(false),
   }).strict().default({ openRejects: [], evidenceRejects: [], rejectHistory: false }),
-  /** Source files the strong tier can ask for, by path relative to the session root. */
   sources: z.record(z.string().min(1).max(512), z.string().max(200_000)).optional(),
 }).strict();
 export const replaySetSchema = z.object({
@@ -103,7 +94,6 @@ export interface ReplayResult {
   byTier: Record<string, ReplayFigures>;
 }
 
-/** The 95% Wilson score interval for `count` of `relevant`. */
 export function wilson(count: number, relevant: number, z = 1.959963984540054): RateFigure {
   if (relevant <= 0) return { count: 0, relevant: 0, rate: null, lower: 0, upper: 1 };
   const p = count / relevant, z2 = z * z;
@@ -138,7 +128,6 @@ export function setDigest(set: ReplaySet): string {
   return createHash("sha256").update(canonicalJson(JSON.parse(JSON.stringify(set)))).digest("hex");
 }
 
-/** The request a case stands for. The host's destructive detector runs on it as it does on a live request. */
 export function caseRequest(item: ReplayCase): PermissionRequest {
   const shape = { completeEvidence: true, oneShotAccept: true, oneShotReject: true, persistentOnly: false, trustPrompt: false, ...item.request.shape };
   const pattern = item.request.destructive?.pattern ?? matchDestructive(item.request.action) ?? undefined;
@@ -160,7 +149,6 @@ export function caseRequest(item: ReplayCase): PermissionRequest {
   };
 }
 
-/** Read-only collection from the case's own sources. Nothing on disk is read. */
 function collectFromCase(item: ReplayCase, paths: string[]): PermissionEvidence {
   const files: PermissionEvidence["files"] = [];
   const limitations: string[] = [];
@@ -172,7 +160,6 @@ function collectFromCase(item: ReplayCase, paths: string[]): PermissionEvidence 
   return { files, limitations, digest: createHash("sha256").update(canonicalJson({ files, limitations })).digest("hex") };
 }
 
-/** One case through class rules, qualify, raise and the tiers. Lock and replay need a journal and are not part of a measurement. */
 export async function replayCase(core: PermissionAgentCoreService, item: ReplayCase, signal?: AbortSignal): Promise<ReplayCaseResult> {
   const request = caseRequest(item);
   const base = { caseId: item.id, label: item.label, ...(item.class ? { class: item.class } : {}) };
@@ -202,7 +189,6 @@ export async function replayCase(core: PermissionAgentCoreService, item: ReplayC
 
 export interface ReplayProgress { done: number; total: number }
 
-/** Runs a whole set with bounded concurrency and stores every measurement and the result. */
 export async function runReplay(set: ReplaySet, deps: {
   core: PermissionAgentCoreService;
   measurements?: PermissionMeasurements;
@@ -262,17 +248,12 @@ export interface ReplayJob {
   error?: string;
 }
 
-/**
- * Replay jobs. One runs at a time; a request ID names one job, so a retried start returns that job.
- * A job lives in memory: a host restart ends it, and its stored measurements stay.
- */
 export class PermissionReplayJobs {
   private readonly jobs = new Map<string, ReplayJob>();
   private readonly byRequest = new Map<string, { digest: string; jobId: string }>();
 
   constructor(private readonly deps: {
     core: () => PermissionAgentCoreService | undefined; measurements?: PermissionMeasurements; concurrency?: number; now?: () => Date;
-    /** A job ended and its result is recorded. A passing replay can make the host ready, so the caller reads its authority again. */
     onSettled?: () => void;
   }) {}
 
@@ -295,7 +276,6 @@ export class PermissionReplayJobs {
     const job: ReplayJob = { id: randomUUID(), requestId, state: "running", done: 0, total: set.cases.length, startedAt: now().toISOString() };
     this.jobs.set(job.id, job);
     this.byRequest.set(requestId, { digest, jobId: job.id });
-    // Keep the last few jobs only.
     for (const old of [...this.jobs.values()].filter(item => item.state !== "running").slice(0, -5)) {
       this.jobs.delete(old.id);
       for (const [request, entry] of this.byRequest) if (entry.jobId === old.id) this.byRequest.delete(request);
@@ -309,7 +289,7 @@ export class PermissionReplayJobs {
       })
       .finally(() => {
         job.finishedAt = now().toISOString();
-        try { this.deps.onSettled?.(); } catch { /* The job's record stands without it. */ }
+        try { this.deps.onSettled?.(); } catch {}
       });
     return { job };
   }

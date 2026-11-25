@@ -13,14 +13,12 @@ export const MAX_ATTEMPT_POST_BYTES = 64 * 1024;
 export const MAX_ATTEMPT_SERVED_BYTES = 256 * 1024;
 export const MAX_ATTEMPT_READ_CALLS = 200;
 
-/** The answer to an accepted post, before the host stores the entry. The `entry_post` result type is checked against it. */
 export type PendingEntry = { entryId: string; state: "pending" };
 
 export type EntryRefusal = "entry-tools-off" | "entry-too-large" | "entry-invalid" | "entry-binding" | "entry-closed"
   | "entry-id-mismatch" | "entry-kind-forbidden" | "entry-task-forbidden" | "entry-supersede-forbidden" | "entry-secret"
   | "entry-post-limit" | "entry-read-limit" | "entry-not-found" | "entry-unavailable";
 
-/** The fixed text of each refusal. Refusals with a field path or a secret class, and the body limits, add their own text. */
 export const ENTRY_REFUSALS: Readonly<Record<EntryRefusal, string>> = {
   "entry-tools-off": "entry-tools-off: entry tools are not enabled for this member.",
   "entry-too-large": "entry-too-large: a request is at most 16 KiB.",
@@ -50,7 +48,6 @@ const SECRET_CLASSES: Readonly<Record<SecretClass, string>> = {
 
 export type EntryRouteOptions = {
   team: TeamAssignment;
-  /** The hook token and address, and every credential the host issued to this session. */
   own: () => { token: string; url: string; credentials?: readonly string[] };
   reader: () => Pick<EvidenceReader, "read">;
   running: () => boolean;
@@ -62,13 +59,11 @@ const refuse = (status: number, text: string) => new HookPayloadError(status, te
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const bytesOf = (value: unknown) => Buffer.byteLength(canonicalJson(value), "utf8");
 
-/** A post whose body is over 12 KiB. The schema refuses it too, and this check gives the status. */
 function oversizedBody(body: unknown): boolean {
   if (!isRecord(body) || body.op !== "post" || !isRecord(body.entry) || body.entry.body === undefined) return false;
   return bytesOf(body.entry.body) > MAX_ENTRY_BODY_BYTES;
 }
 
-/** The supersede rule of spec part 4: the same kind, and the target is this member's own or shares the post's task. */
 function supersedeAllowed(
   target: { kind: string; author: string; authorMemberId?: string; taskId?: string },
   entry: MemberEntryPost,
@@ -79,10 +74,6 @@ function supersedeAllowed(
   return entry.taskId !== undefined && target.taskId === entry.taskId;
 }
 
-/**
- * The worker's `team-entry` route. Checks run in the table's order and the first failure answers. Caps live in
- * this closure, so they last for one attempt. A refused call appends nothing and counts nothing.
- */
 export function createEntryRoute(options: EntryRouteOptions): { handle(body: unknown): HookReply } {
   const { team } = options;
   const binding = { runId: team.runId, memberId: team.memberId, revision: team.revision };
@@ -91,7 +82,6 @@ export function createEntryRoute(options: EntryRouteOptions): { handle(body: unk
   let readCalls = 0;
   let servedBytes = 0;
 
-  /** Runs `fn` inside one read. Any failure, including an unknown scope, answers 503. */
   const read = <T>(fn: (db: EvidenceDb, scope: MemberScope) => T): T => {
     try {
       return options.reader().read(db => {

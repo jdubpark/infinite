@@ -18,7 +18,6 @@ type MissionInput = QueueInput["missions"][number];
 const at = (minute: number) => `2026-11-21T12:${String(minute).padStart(2, "0")}:00.000Z`;
 const hash = "a".repeat(64);
 
-/** A permission dialog the answer route can deliver to: its hook matched a block on the screen. */
 function prompt(id: number, tool?: Prompt["tool"]): Prompt {
   return {
     id,
@@ -166,7 +165,6 @@ test("a session prompt that only its terminal can answer is listed and marked", 
     missions: [],
   });
 
-  // Every one of them waits on a person, so every one is listed. The marker says where the answer goes.
   assert.deepEqual(queued.decisions.map(item => [item.origin.id, item.kind === "session" && item.terminalOnly === true]), [
     ["verified", false],
     ["hook-only", true],
@@ -212,7 +210,6 @@ test("queue classifies delegated member prompts before hiding tool input", async
       attention: attention(at(1), "needs-you", prompt),
       team: { runId: f.run.id, memberId: member.memberId, revision: member.revision, role: member.role },
     };
-    // Like the real list: a row carries the tool input only when the full message is asked for.
     const manager = {
       list: async (options?: { includeFullMessage?: boolean }) =>
         [options?.includeFullMessage === true ? row : { ...row, attention: publicAttention(row.attention) }],
@@ -222,7 +219,6 @@ test("queue classifies delegated member prompts before hiding tool input", async
       goals: { decisionAnswerable: () => false }, missions: { decisionQueueCandidates: () => [] },
     });
 
-    // Without its tool input the team cannot classify the prompt and leaves it to the owner. The queue must not.
     assert.equal(teams.promptOwner(member.sessionId, publicAttention(row.attention).prompt!), "user");
     assert.equal(teams.promptOwner(member.sessionId, prompt), "undecided");
     assert.deepEqual((await read(teams)).decisions, []);

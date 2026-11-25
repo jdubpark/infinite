@@ -18,8 +18,6 @@ import type { TrialConfiguration, TrialGrade } from "../packages/host/src/eval-t
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 import type { Config } from "../packages/host/src/types.js";
 
-// The judge routes behind a real EvalHost, built as server.ts builds it: the host registers the judge tables itself.
-
 const T0 = "2026-11-22T00:00:00.000Z";
 const MARKER = "RESOLVED-MARKER";
 const JUDGE = { id: "zz-judge", label: "Judge", provider: "codex", model: "judge-model-q7", effort: "high", tier: "strong" } as TeamModelProfile;
@@ -48,7 +46,6 @@ function configOf(patch: Record<string, unknown> = {}): Config {
   } as unknown as Config;
 }
 
-/** The store carries only the configuration tables, which the server registers elsewhere; `EvalHost` registers the corpus, trial, and judge tables. `newer` stores the judge module one version ahead. */
 async function rig(options: { config?: Config; newer?: boolean } = {}): Promise<Rig> {
   const root = mkdtempSync(join(tmpdir(), "infinite-judge-routes-"));
   dirs.push(root);
@@ -97,7 +94,6 @@ async function call(r: Rig, method: string, path: string, role: string, body?: u
 
 const GRADE = (resolved: boolean): TrialGrade => ({ ending: "graded", expectedPassed: resolved ? 1 : 0, expectedTotal: 1, guardPassed: true, resolved, overwritten: 0, diff: null, isolation: "isolated" });
 
-/** Seeds `count` dev pairs of project P: a resolved and an unresolved trial per task. The resolved patch carries the marker. */
 function seedPairs(r: Rig, count: number): void {
   for (let i = 0; i < count; i++) {
     const taskId = `t-P-${String(i).padStart(3, "0")}`;
@@ -120,7 +116,6 @@ function seedPairs(r: Rig, count: number): void {
 
 const body = (requestId = REQUEST) => ({ requestId, judgeProfileId: JUDGE.id });
 
-/** The command line's API as `connection` in `client.ts` builds it: it adds `/api` to every path, and a refusal throws its status and code. */
 const cliApi = (r: Rig, role: string): EvalApi => ({
   json: async <T>(path: string, payload?: unknown, _signal?: AbortSignal, _headers?: Record<string, string>, method?: string) => {
     const reply = await call(r, method ?? (payload === undefined ? "GET" : "POST"), `/api${path}`, role, payload);

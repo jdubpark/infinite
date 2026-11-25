@@ -33,16 +33,12 @@ const TASK = capturedTaskId(RUN, MEMBER);
 const LEDGER_TASK_ID = "a";
 const SETTLE = () => new Promise<void>(resolve => setImmediate(resolve));
 
-/** A Git fake. A call waits on the gate of its commit id when the test holds one; the answer is per method and id. */
 class FakeGit implements CaptureGit {
   readonly calls: string[] = [];
-  /** The command scope in force at each name read, recorded when the read is called. */
   readonly scopes: unknown[] = [];
   readonly answers = new Map<string, unknown>();
   private readonly gates = new Map<string, { promise: Promise<void>; open: () => void }>();
-  /** When true, every call never settles, as a hung Git process would. */
   silent = false;
-  /** How often the capture closed this Git. */
   closes = 0;
 
   close(): void {
@@ -141,7 +137,6 @@ function world(setup: Setup = { capture: true }): World {
   const git = new FakeGit();
   git.answer("names", COMMIT, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
   const capture = new TaskCapture(captureOptions(root, store, git, setup));
-  // Deadline timers are unreferenced, so this keeps the loop alive while a test waits on a job.
   const hold = setInterval(() => undefined, 1_000);
   return {
     root,
@@ -160,7 +155,6 @@ function world(setup: Setup = { capture: true }): World {
   };
 }
 
-/** The end of a test: release every held read, drop the queue, and wait for the running jobs. */
 async function finish(w: World): Promise<void> {
   w.git.releaseAll();
   w.capture.close();
@@ -194,7 +188,6 @@ function approval(reviewedHead = REVIEWED, at = T0): ApprovalStart {
   return { runId: RUN, workspace: WORKSPACE, anchorCommit: ANCHOR, reviewedHead, at };
 }
 
-/** The ledger row of one attempt: integrated, frozen, accepted, with the task's area and kind. */
 function ledger(overrides: Partial<OutcomeRow> & { memberId?: string } = {}): OutcomeRow {
   const memberId = overrides.memberId ?? MEMBER;
   return {
@@ -256,10 +249,6 @@ function partsOf(store: EvidenceStore, memberId = MEMBER) {
   return store.read(db => readMaterial(db, capturedTaskId(RUN, memberId)));
 }
 
-/**
- * What a reader can compare across orders: the row without its check and decision times, and the parts. The project
- * reference is a blind index under the store's own key, so each store has its own value and it is left out.
- */
 function snapshot(store: EvidenceStore) {
   return store.read(db => {
     const row = readEvalTask(db, TASK);
@@ -304,7 +293,6 @@ test("the three facts give one result in every order", async () => {
   for (const c of cases) {
     let first: (ReturnType<typeof snapshot> & { promoted: string[] }) | undefined;
     for (const order of orders) {
-      // The host's hook: it must see each promotion once, and nothing for a capture that is refused.
       const promoted: string[] = [];
       const w = world({ capture: true, onPromoted: (_tx, task) => { promoted.push(`${task.taskId} ${task.state}`); } });
       try {
@@ -348,7 +336,6 @@ test("the three facts give one result in every order", async () => {
 });
 
 test("a later approval replaces an earlier one", async () => {
-  // Part A: the second approval's read ends first, so the first approval's late read writes nothing.
   const a = world();
   try {
     a.git.answer("names", REVIEWED_2, { state: "read", names: ["a.txt"] });
@@ -372,7 +359,6 @@ test("a later approval replaces an earlier one", async () => {
     await finish(a);
   }
 
-  // Part B: a candidate whose second approval finds a change is demoted by the next reconcile.
   const b = world();
   try {
     b.git.answer("names", REVIEWED_2, { state: "read", names: ["a.txt"] });
@@ -406,7 +392,6 @@ test("a stalled read refuses new work, never the run", async () => {
       assert.equal(row?.state, "rejected", `m${i}`);
       assert.equal(row?.reason, "capture-failed", `m${i}`);
     }
-    // The fifth returns at once; its marker is already written when the call returns.
     stalled.capture.integrated(start({ memberId: "m4" }));
     const busy = taskRow(stalled.store, "m4");
     assert.equal(busy?.state, "rejected");
@@ -428,8 +413,6 @@ test("a stalled read refuses new work, never the run", async () => {
     await finish(queued);
   }
 
-  // Five held name reads, then one read that would answer. Two jobs run at a time, so the sixth job starts when four
-  // reads have stalled, and it makes no call.
   const held = world({ capture: true, deadlineMs: 50 });
   try {
     for (let i = 1; i <= 5; i++) {
@@ -443,7 +426,6 @@ test("a stalled read refuses new work, never the run", async () => {
     assert.equal(refused?.state, "rejected");
     assert.equal(refused?.reason, "capture-failed");
     assert.equal(held.git.calls.includes(`names:${COMMIT}`), false, "the sixth job starts no read");
-    // The held reads end late. Every stall is counted off again, so capture takes new work.
     held.git.releaseAll();
     await SETTLE();
     await SETTLE();
@@ -458,7 +440,6 @@ test("a stalled read refuses new work, never the run", async () => {
 test("closing stops the read chain", async () => {
   const w = world({ capture: true, deadlineMs: 60_000 });
   try {
-    // The name read answers, and the job waits on its next read: the patch from the run's base to the member's base.
     w.git.hold(MEMBER_BASE);
     w.capture.integrated(start());
     await SETTLE();
@@ -474,7 +455,6 @@ test("closing stops the read chain", async () => {
     w.git.release(MEMBER_BASE);
     await SETTLE();
     await SETTLE();
-    // The job went on after close settled its wait, and it started no further read.
     assert.deepEqual(w.git.calls, [`names:${COMMIT}`, `patch:${MEMBER_BASE}`]);
   } finally {
     await finish(w);
@@ -490,7 +470,6 @@ test("a capture read reports to no operation", async () => {
     assert.equal(w.git.scopes.length, 1);
     assert.deepEqual(w.git.scopes, [undefined]);
 
-    // The second job is queued while the first one's read is held, and starts from the first job's completion.
     w.git.scopes.length = 0;
     w.git.hold(COMMIT);
     commandScope.run(scope, () => w.capture.integrated(start({ memberId: "m-first" })));
@@ -514,7 +493,6 @@ test("a restart turns pending facts into failures", async () => {
   git.hold(REVIEWED);
   const store1 = openStore(root, key);
   const first = new TaskCapture(captureOptions(root, store1, git, { capture: true }));
-  // X: its capture read is pending. Y: its capture read is done and its approval read is pending.
   first.integrated(start({ memberId: MEMBER }));
   first.integrated(start({ memberId: OTHER_MEMBER, commit: OTHER_COMMIT }));
   first.approved(approval());
@@ -619,7 +597,6 @@ test("a refused patch form leaves the patch missing", async () => {
     const parts = partsOf(w.store);
     assert.notEqual(parts.capsule, undefined);
     assert.equal(parts.reference, undefined);
-    // An empty reference read is a read that failed without saying so: it is missing, not stored.
     w.git.answer("names", OTHER_COMMIT, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
     w.git.answer("patch", OTHER_COMMIT, { state: "read", bytes: Buffer.alloc(0) });
     w.capture.integrated(start({ memberId: OTHER_MEMBER, commit: OTHER_COMMIT }));
@@ -637,7 +614,6 @@ test("a refused patch form leaves the patch missing", async () => {
 });
 
 test("unreadable records are never promoted", async () => {
-  // A captured task whose sealed payload does not open.
   const a = world();
   try {
     a.capture.integrated(start());
@@ -648,7 +624,6 @@ test("unreadable records are never promoted", async () => {
       tx.run("UPDATE eval_tasks SET payload=? WHERE task_id=?", "not-sealed", TASK);
     });
     a.capture.reconcile();
-    // The payload stays unreadable after the reject, so the row is read as raw columns.
     const raw = a.store.read(db => db.get<{ state: string; reason: string }>("SELECT state, reason FROM eval_tasks WHERE task_id=?", TASK));
     assert.equal(raw?.state, "rejected");
     assert.equal(raw?.reason, "unreadable");
@@ -657,7 +632,6 @@ test("unreadable records are never promoted", async () => {
     await finish(a);
   }
 
-  // A ledger row whose payload does not open.
   const b = world();
   try {
     b.capture.integrated(start());

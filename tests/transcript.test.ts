@@ -21,10 +21,8 @@ test("transcript tail joins records split across chunks and never repeats a mess
   const rest = tail.ingest(second.slice(cut));
   assert.deepEqual(rest.map(m => [m.role, m.text, m.toolName]), [["assistant", "Looking at it now.", undefined], ["tool", "npm test", "Bash"]]);
   assert.equal(tail.offset, Buffer.byteLength(first + second));
-  // The same records arriving again (a retried chunk) add nothing.
   const again = new TranscriptTail("claude");
   again.ingest(first); assert.equal(again.ingest(first).length, 0);
-  // Injected context never becomes a chat message.
   assert.deepEqual(parseTranscriptRecord(claude("user", "u2", "<system-reminder>internal</system-reminder>"), "claude", 0), []);
   assert.deepEqual(parseTranscriptRecord(JSON.stringify({ type: "assistant", uuid: "s1", isSidechain: true, message: { content: "subagent" } }), "claude", 0), []);
 });
@@ -98,13 +96,10 @@ test("relay forwards the hook, then streams the transcript from the worker's cur
     await relay("claude", JSON.stringify({ hook_event_name: "Stop", session_id: "s", transcript_path: path }), { url: server.url, token: "t" });
     assert.equal(received, expected, "every byte arrives once, in order, on UTF-8 boundaries");
     assert.ok(payloads.filter(p => p.route === "transcript").length > 1, "the file was larger than one chunk");
-    // A second event after no change streams nothing.
     const before = payloads.length;
     await relay("claude", JSON.stringify({ hook_event_name: "Stop", session_id: "s", transcript_path: path }), { url: server.url, token: "t" });
-    // The relay posts no chunk, only the end marker, because the cursor is already at the end.
     assert.deepEqual(payloads.slice(before).map(p => p.route), ["claude", "transcript"]);
     assert.equal(payloads[before + 1]?.body.end, true);
-    // A symlink or a non-transcript file is never read.
     const outside = join(root, "secret.txt"); writeFileSync(outside, "private");
     await relay("claude", JSON.stringify({ hook_event_name: "Stop", session_id: "s", transcript_path: outside }), { url: server.url, token: "t" });
     assert.ok(!received.includes("private"));
@@ -142,7 +137,6 @@ test("the tail reports each parsed row once", () => {
   const late = tail.ingest(second.slice(cut));
   assert.deepEqual(rows.map(row => (row as { uuid: string }).uuid), ["u1", "a1"]);
   assert.deepEqual([...early, ...late].map(message => message.text), ["Fix the failing test", "Looking."]);
-  // An observer that throws does not stop chat ingestion.
   const throwing = new TranscriptTail("claude", 4096, () => { throw new Error("observer failed"); });
   assert.deepEqual(throwing.ingest(first).map(message => message.role), ["user"]);
 });
@@ -165,7 +159,6 @@ test("the tail reports a pending row and counts discarded lines", () => {
   assert.equal(tail.pending, false);
 });
 
-/** A worker that acknowledges transcript bytes. With `advance` false it never moves its cursor. */
 function fakeTranscriptWorker(path: string, advance: boolean, start = 0, failAt = -1, beforeReply?: (index: number) => void) {
   const posts: Record<string, unknown>[] = [];
   let cursor = start;
@@ -192,7 +185,6 @@ test("the relay marks the end of the file", async () => {
   const options = (fetchImpl: typeof fetch) => ({ url: "http://worker.test", token: "t", fetch: fetchImpl });
   const event = (path: string) => JSON.stringify({ hook_event_name: "Stop", session_id: "s", transcript_path: path });
   try {
-    // A file that fits in one chunk: the chunk carries no end flag, and a text-less mark follows it at the file size.
     const small = join(root, "small.jsonl");
     const body = claude("user", "u1", "short") + "\n";
     writeFileSync(small, body);
@@ -203,12 +195,10 @@ test("the relay marks the end of the file", async () => {
       { path: small, offset: Buffer.byteLength(body), end: true, drain: 7 },
     ]);
 
-    // The cursor is already at the end when the stream starts: a text-less end marker closes the drain.
     const caughtUp = fakeTranscriptWorker(small, true, Buffer.byteLength(body));
     await relay("claude", event(small), options(caughtUp.fetch));
     assert.deepEqual(caughtUp.posts, [{ path: small, offset: Buffer.byteLength(body), end: true, drain: 7 }]);
 
-    // A file of several chunks: no chunk carries the flag, and the mark follows the last acknowledged chunk.
     const several = join(root, "several.jsonl");
     writeFileSync(several, "x".repeat(500 * 1024));
     const streamed = fakeTranscriptWorker(several, true);
@@ -217,12 +207,10 @@ test("the relay marks the end of the file", async () => {
     assert.ok(streamed.posts.slice(0, 3).every(post => post.end === undefined), "no chunk carries the end flag");
     assert.deepEqual(streamed.posts[3], { path: several, offset: 500 * 1024, end: true, drain: 7 });
 
-    // The worker never advances: the chunk is sent once, with no retry and no marker.
     const stalled = fakeTranscriptWorker(small, false);
     await relay("claude", event(small), options(stalled.fetch));
     assert.equal(stalled.posts.length, 1);
 
-    // The file needs more than MAX_CHUNKS (64) chunks: the budget ends the stream with no marker.
     const big = join(root, "big.jsonl");
     writeFileSync(big, Buffer.alloc(13 * 1024 * 1024, "x"));
     const long = fakeTranscriptWorker(big, true);
@@ -237,7 +225,6 @@ test("the relay sends bytes that arrive after a chunk before it marks the end", 
   try {
     const path = join(root, "growing.jsonl");
     writeFileSync(path, "x".repeat(1000));
-    // The file grows while the first chunk is in flight.
     const worker = fakeTranscriptWorker(path, true, 0, -1, index => { if (index === 0) appendFileSync(path, "y".repeat(10)); });
     await relay("claude", JSON.stringify({ hook_event_name: "Stop", session_id: "s", transcript_path: path }), { url: "http://worker.test", token: "t", fetch: worker.fetch });
     assert.deepEqual(worker.posts, [
@@ -253,7 +240,6 @@ test("the relay sends no end mark when a post after a chunk fails", async () => 
   try {
     const path = join(root, "failing.jsonl");
     writeFileSync(path, "x".repeat(500 * 1024));
-    // The second chunk post fails: the relay stops there and marks nothing.
     const worker = fakeTranscriptWorker(path, true, 0, 1);
     await relay("claude", JSON.stringify({ hook_event_name: "Stop", session_id: "s", transcript_path: path }), { url: "http://worker.test", token: "t", fetch: worker.fetch });
     assert.equal(worker.posts.length, 2);
@@ -261,10 +247,6 @@ test("the relay sends no end mark when a post after a chunk fails", async () => 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-/**
- * A worker for the secondary tests. It asks for secondaries unless `ask` is false, answers the primary
- * end mark with `wanted`, and moves a secondary's cursor only when `advance` allows that name.
- */
 function fakeSecondaryWorker(path: string, options: { ask?: boolean; wanted?: unknown[]; advance?: (name: string) => boolean; onEnd?: () => void; onSecondaryPost?: (name: string) => void; drain?: unknown } = {}) {
   const posts: Record<string, unknown>[] = [];
   const requests: { url: string; body: string }[] = [];
@@ -275,14 +257,12 @@ function fakeSecondaryWorker(path: string, options: { ask?: boolean; wanted?: un
     const raw = String(init?.body);
     requests.push({ url, body: raw });
     const body = JSON.parse(raw) as Record<string, unknown>;
-    // The drain route answers with its window, or 204 when nothing is owed.
     if (url.endsWith("/drain")) return options.drain === undefined ? new Response(null, { status: 204 }) : reply(options.drain);
     if (!url.endsWith("/transcript")) return reply({ transcript: { path, after: 0, drain: 7, ...(options.ask === false ? {} : { secondaries: true }) } });
     posts.push(body);
     if (typeof body.secondary !== "string") {
       if (body.end === true) {
         options.onEnd?.();
-        // The wanted list names where each file starts, so its cursor starts there too.
         for (const item of options.wanted ?? []) {
           const want = item as { name: string; after: number };
           cursors.set(want.name, want.after);
@@ -303,7 +283,6 @@ function fakeSecondaryWorker(path: string, options: { ask?: boolean; wanted?: un
   return { fetch: fake, posts, requests };
 }
 
-/** A primary transcript and the subagent folder Claude Code writes beside it. */
 function secondaryFixture(root: string) {
   const path = join(root, "s.jsonl");
   const folder = join(root, "s", "subagents");
@@ -320,7 +299,6 @@ function secondaryFixture(root: string) {
 
 const secondaryEvent = JSON.stringify({ hook_event_name: "Stop", session_id: "s", transcript_path: "unused" });
 
-/** A file's identity as the relay reports it: `<device>:<inode>`, exact for large inode numbers. */
 const idOf = (file: string) => {
   const info = lstatSync(file, { bigint: true });
   return `${info.dev}:${info.ino}`;
@@ -385,7 +363,6 @@ test("the relay opens only the names it listed", async () => {
       { name: "agent-link.jsonl", after: 0 },
       { name: "agent-a.jsonl", after: -1 },
       { name: "agent-b.jsonl", after: 0 },
-      // A repeated name is streamed once.
       { name: "agent-b.jsonl", after: 0 },
     ] });
     const opened: string[] = [];
@@ -410,7 +387,6 @@ test("the relay opens only the names it listed", async () => {
 test("a symbolic link in the secondary folder path is not listed", async () => {
   const root = mkdtempSync(join(tmpdir(), "infinite-secondary-link-"));
   try {
-    // The subagents folder is a link to a folder that holds a subagent transcript.
     const linked = join(root, "s.jsonl");
     writeFileSync(linked, claude("user", "u1", "short") + "\n");
     const elsewhere = join(root, "elsewhere");
@@ -422,7 +398,6 @@ test("a symbolic link in the secondary folder path is not listed", async () => {
     await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: first.fetch });
     assert.deepEqual(first.posts.at(-1)?.secondaries, { files: [], total: 0 });
 
-    // The session folder is a link to a folder whose subagents folder holds a subagent transcript.
     const other = join(root, "other");
     mkdirSync(join(other, "subagents"), { recursive: true });
     writeFileSync(join(other, "subagents", "agent-x.jsonl"), "xxxx");
@@ -440,13 +415,10 @@ test("a file replaced after the listing is not streamed", async () => {
   try {
     const { path, folder } = secondaryFixture(root);
     const wanted = [{ name: "agent-a.jsonl", after: 0 }];
-    // Control: the same reply streams the listed file when nothing replaces it.
     const control = fakeSecondaryWorker(path, { wanted });
     await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: control.fetch });
     assert.ok(control.posts.some(post => post.secondary === "agent-a.jsonl" && post.text !== undefined));
 
-    // The file is replaced with a new one of the same name while the end mark is answered. The old file stays
-    // under another name, so the new file cannot reuse its identity.
     const replaced = fakeSecondaryWorker(path, {
       wanted,
       onEnd: () => {
@@ -480,7 +452,6 @@ test("a route other than claude never lists", async () => {
   const root = mkdtempSync(join(tmpdir(), "infinite-secondary-codex-"));
   try {
     const { path } = secondaryFixture(root);
-    // The same transcript listed under claude is the positive control.
     const claudeWorker = fakeSecondaryWorker(path);
     await relay("claude", secondaryEvent, { url: "http://worker.test", token: "t", fetch: claudeWorker.fetch });
     assert.ok("secondaries" in (claudeWorker.posts.at(-1) ?? {}));

@@ -11,7 +11,6 @@ test("discovery reads a record once when its answer cannot change", async () => 
   const stateDir = mkdtempSync(join(tmpdir(), "inf-handoff-discovery-"));
   const reads: Record<string, number> = { a: 0, b: 0, c: 0 };
   const requests: Record<string, number> = { a: 0, b: 0, c: 0 };
-  // The identity of each session's meta file; undefined while the file is younger than the settle time.
   const revisions: Record<string, string | undefined> = { a: "rev-a", b: "rev-b", c: "rev-c" };
   let metaFails = false;
   let listCalls = 0;
@@ -45,7 +44,6 @@ test("discovery reads a record once when its answer cannot change", async () => 
   try {
     service.start();
     const deadline = Date.now() + 5000;
-    // Tick 2 runs its discovery in the same microtask run as its listing, so once a macrotask sees two listings, it has finished.
     while (listCalls < 2) {
       if (Date.now() > deadline) throw new Error("the handoff poller did not list twice");
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -54,16 +52,13 @@ test("discovery reads a record once when its answer cannot change", async () => 
     assert.deepEqual(reads, { a: 1, b: 1, c: 2 });
     assert.deepEqual(requests, { a: 0, b: 1, c: 2 });
 
-    // A listing row reads no record for a source whose answer it remembers.
     const reasonA = "No handoff capability for a.";
     assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: reasonA });
     assert.deepEqual(service.listedView("b"), { status: "available" });
     assert.deepEqual(reads, { a: 1, b: 1, c: 2 });
-    // A running source is never answered from memory.
     const listedC = service.listedView("c");
     assert.equal(reads.c, 4);
     assert.deepEqual(listedC, service.view("c"));
-    // Each call returns a new object, so a caller cannot change a later answer.
     const first = service.listedView("a");
     Object.assign(first, { reason: "changed" });
     assert.notEqual(first, service.listedView("a"));
@@ -76,7 +71,6 @@ test("discovery reads a record once when its answer cannot change", async () => 
     assert.throws(() => service.view("a"), { code: "ENOENT", message: "record gone" });
     assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: reasonA });
 
-    // A listing that no longer holds A makes the memory forget it, so the next row reads the record again.
     listOmitsA = true;
     const listsBefore = listCalls;
     service.start();
@@ -90,7 +84,6 @@ test("discovery reads a record once when its answer cannot change", async () => 
     assert.throws(() => service.listedView("a"), { code: "ENOENT", message: "record gone" });
     assert.equal(reads.a, readsA + 1);
 
-    // Two ticks with the listing's own revisions; the poller runs twice in that wait.
     const settleTicks = async () => {
       const target = listCalls + 2;
       service.start();
@@ -108,7 +101,6 @@ test("discovery reads a record once when its answer cannot change", async () => 
     assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: reasonA });
     assert.equal(reads.a, readsBeforeSettle + 1);
 
-    // A replaced record: the file's reason and its revision change together, as a rewritten file does.
     const replacedReason = "Replaced handoff reason for a.";
     sessions.a = { id: "a", projectId: "p", handoff: { reason: replacedReason } };
     revisions.a = "rev-a-2";
@@ -119,30 +111,23 @@ test("discovery reads a record once when its answer cannot change", async () => 
     assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: replacedReason });
     assert.equal(reads.a, readsReplaced);
 
-    // Same revision, changed stub content: a real file cannot change without its revision changing,
-    // so the memory keeps answering with the remembered reason and reads nothing.
     sessions.a = { id: "a", projectId: "p", handoff: { reason: "Changed again without a new revision." } };
     assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: replacedReason });
     assert.equal(reads.a, readsReplaced);
 
-    // The route asks first: the record is replaced and a listing has seen it (a new revision), but the handoff poller
-    // has not ticked since. The listed view must not answer from the old revision's memory.
     const routeReason = "Replaced again, and the route asks before the poller.";
     sessions.a = { id: "a", projectId: "p", handoff: { reason: routeReason } };
     revisions.a = "rev-a-3";
     const readsBeforeRoute = reads.a;
     assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: routeReason });
-    // The stale memory is dropped: discovery reads the record, then the view reads it for its own answer.
     assert.equal(reads.a, readsBeforeRoute + 2);
     assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: routeReason });
     assert.equal(reads.a, readsBeforeRoute + 2, "the new answer is remembered under the new revision");
 
-    // A file that is not settled: nothing is remembered, so every row reads the record.
     revisions.a = undefined;
     await settleTicks();
     const readsUnsettled = reads.a;
     assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: routeReason });
-    // An unremembered view reads the record twice (discovery, then its own answer), on every call.
     assert.equal(reads.a, readsUnsettled + 2);
     assert.deepEqual(service.listedView("a"), { status: "unavailable", reason: routeReason });
     assert.equal(reads.a, readsUnsettled + 4);

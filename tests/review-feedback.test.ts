@@ -30,7 +30,6 @@ type Review = { id: string; author: { login: string } | null; state: string; sub
 const review = (change: Partial<Review> = {}): Review => ({
   id: "PRR_1", author: { login: "Owner-Login" }, state: "CHANGES_REQUESTED", submittedAt: "2026-11-02T00:00:00Z", body: "Rename the flag.", commit: { oid: HEAD }, ...change,
 });
-/** The read as `gh pr view --json` prints it, passed through the one parser the host uses. */
 const read = (reviews: Review[], change: Record<string, unknown> = {}) => parsePullRequestView(JSON.stringify({
   state: "OPEN", isCrossRepository: false, baseRefName: "main", headRefName: BRANCH, headRefOid: HEAD, reviews, ...change,
 }));

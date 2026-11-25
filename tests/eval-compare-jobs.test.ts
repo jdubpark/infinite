@@ -70,7 +70,6 @@ function ready(): Fixture {
 
 type TaskSeed = { id: string; group: string; holdout: boolean; origin?: "captured" | "mined" };
 
-/** One valid task, and its root group when the group does not exist yet. */
 function seedTask(f: Fixture, seed: TaskSeed, project = PROJECT): void {
   const origin = seed.origin ?? "captured";
   f.store.write(tx => {
@@ -89,7 +88,6 @@ function seedTask(f: Fixture, seed: TaskSeed, project = PROJECT): void {
 
 const taskId = (n: number, origin: "captured" | "mined" = "captured") => `${origin}:t${String(n).padStart(3, "0")}`;
 
-/** 40 tasks, each in its own group; the groups of i % 5 in {0, 1} are holdout (16). Even tasks are captured, odd tasks mined. */
 function seedMixed(f: Fixture): void {
   for (let i = 0; i < 40; i += 1) {
     seedTask(f, { id: taskId(i, i % 2 === 0 ? "captured" : "mined"), group: `g-${String(i).padStart(2, "0")}`, holdout: i % 5 < 2,
@@ -132,7 +130,6 @@ function confirmsOf(f: Fixture): Map<string, number> {
   return new Map(rows.map(row => [row.group_id, row.confirms]));
 }
 
-/** One final original trial of its own baseline job. */
 function seedTrial(f: Fixture, trialId: string, task: string, item: TrialConfiguration, epoch = 1, endedAt = AGO(1)): void {
   const jobId = `job-of-${trialId}`;
   f.store.write(tx => {

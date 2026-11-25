@@ -8,7 +8,6 @@ import { codexMemberToolInstructions, codexSandboxInstructions, contextAccessIns
 import type { TeamDecision, TeamMember, TeamModelProfile, TeamReport, TeamRun } from "../packages/host/src/team-types.js";
 import type { ObjectiveRecord } from "../packages/host/src/objective-types.js";
 
-// Sentinels are built at run time, so the source holds no secret-shaped or run-specific text.
 const SENTINEL = ["intent", "sentinel", "run", "data"].join("-");
 const CHECKER_PROFILE: TeamModelProfile = { id: "astra-high", label: "Astra checker", provider: "codex", model: "gpt-6-astra", effort: "high" };
 const CLAUDE_PROFILE: TeamModelProfile = { id: "opus-xhigh", label: "Opus", provider: "claude", model: "claude-opus-5-5", effort: "xhigh" };
@@ -131,7 +130,6 @@ test("the checker's context holds the record, the plan, and this revision's find
   const revised = intentContext({ run: { ...runFixture(), revision: 3 }, record: RECORD, planMember, mode: "autonomous", criteriaDue: true, checks: CHECKS });
   assert.deepEqual(revised?.findings, [], "an earlier revision's findings are not this plan's");
 
-  // A member's assumption is member text, so it never reaches the checker; the room left still counts it.
   const memberStatement = ["member", "assumption", "statement"].join("-");
   const withMember = { ...RECORD, assumptions: [...RECORD.assumptions,
     { ...RECORD.assumptions[0]!, id: "a2", origin: "member", statement: memberStatement, refutedBy: `${memberStatement} refuted` }] } as ObjectiveRecord;
@@ -150,7 +148,6 @@ test("the corrected plan's feedback is bounded and labelled", () => {
   const run = { id: RUN_ID, objective: "Find ranked sources for the research brief.", steering: [] } as unknown as TeamRun;
   const record = runRecord(run, "2026-11-17T09:00:00.000Z", "run-handle");
   assert.equal(typeof record, "object", "the fixture record is built");
-  // Sixteen assumptions of 500-byte statements: with an 8,000-character answer they cannot all fit in 16 KiB.
   const assume = (index: number): IntentItem => ({
     dimension: `detail ${index}`, why: "A detail the plan can carry.", criticality: "plan", disposition: "assume",
     assumption: { statement: `${String(index).padStart(3, "0")} ${"s".repeat(496)}`, refutedBy: "a counter example", test: { kind: "owner" } },

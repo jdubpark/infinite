@@ -12,15 +12,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* Kernel vnode filters retain change flags until drained, including write/revert
- * pairs. FSEvents/FlushSync can lag completed writes and cannot certify a capture.
- * https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kqueue.2.html
- * https://facebook.github.io/watchman/docs/cookies
- * Writable shared mappings can modify bytes without a vnode event. This is a
- * change guard for an explicitly qualified writer profile, not a filesystem
- * snapshot or an arbitrary-writer consistency certificate.
- * No paths or file contents leave the helper.
- */
 #define MAX_WATCHES 65536
 #define MAX_DEPTH 512
 #define MAX_REVISION 9007199254740991ULL
@@ -47,18 +38,11 @@ static int watch_fd(int fd, bool directory, bool ancestor) {
   return 0;
 }
 
-/* Every directory is registered BEFORE enumeration. A subsequent entry change
- * invalidates this watch, because newly added/replaced entries are not covered.
- * Traversal never follows symlinks and refuses nested mounts. Capture guards
- * also refuse special files; notification watches skip their contents.
- */
 static int watch_tree(int parent, const char *name, dev_t device, unsigned int depth) {
   if (depth > MAX_DEPTH) { error("depth-limit"); return -1; }
   struct stat info;
   if (changes_only) {
     if (fstatat(parent, name, &info, AT_SYMLINK_NOFOLLOW) < 0) { error("entry-unavailable"); return -1; }
-    /* Opening a FIFO can block, and a socket cannot be opened as a vnode. Its
-     * already-registered parent detects replacement with a capturable entry. */
     if (!S_ISDIR(info.st_mode) && !S_ISREG(info.st_mode) && !S_ISLNK(info.st_mode)) return 0;
   }
   int fd = openat(parent, name, O_EVTONLY | O_SYMLINK | O_CLOEXEC | O_NONBLOCK);
@@ -70,7 +54,6 @@ static int watch_tree(int parent, const char *name, dev_t device, unsigned int d
   if (info.st_dev != device) { close(fd); error("unsupported-entry"); return -1; }
   if (!S_ISDIR(info.st_mode) && !S_ISREG(info.st_mode) && !S_ISLNK(info.st_mode)) {
     close(fd);
-    /* Sync does not capture special files. The parent watch covers replacement. */
     if (changes_only) return 0;
     error("unsupported-entry"); return -1;
   }
@@ -115,7 +98,6 @@ static int watch_ancestors(const char *root) {
 static void report(uint64_t id) {
   struct timespec immediate = {0};
   struct kevent events[256];
-  /* A busy writer must not monopolize the control channel indefinitely. */
   size_t drained = 0;
   for (;;) {
     int count = kevent(queue_fd, NULL, 0, events, 256, &immediate);
@@ -163,7 +145,6 @@ int main(int argc, char **argv) {
     }
     if (watch_ancestors(argv[i]) < 0 || watch_tree(AT_FDCWD, argv[i], info.st_dev, 0) < 0) return 2;
   }
-  /* Registration of the full tree and its ancestors precedes acknowledgement. */
   report(0);
   char line[96];
   while (fgets(line, sizeof(line), stdin)) {
@@ -176,6 +157,5 @@ int main(int argc, char **argv) {
         id == 0 || id > MAX_REVISION) return 2;
     report((uint64_t)id);
   }
-  /* Process exit releases the queue and every watched descriptor together. */
   return ferror(stdin) ? 2 : 0;
 }

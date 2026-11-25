@@ -8,7 +8,6 @@ import { StatusIcon } from "./Icon";
 
 const PREVIEW_CHARS = 280;
 
-/** "under a minute", "3 min", "2 h 5 min" since `iso`. */
 function elapsed(iso: string): string {
   const minutes = Math.floor(
     Math.max(0, Date.now() - new Date(iso).getTime()) / 60000,
@@ -18,10 +17,6 @@ function elapsed(iso: string): string {
   return `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
 }
 
-/**
- * What the session is doing now, by attention state. A pending prompt is the
- * Brief's DecisionCard, so `needs-you` with a prompt renders nothing here.
- */
 export function NowCard({
   attention,
   provider,

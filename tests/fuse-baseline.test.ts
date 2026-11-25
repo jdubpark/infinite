@@ -24,7 +24,10 @@ function launch(launchId: string, projectId: string, admittedAt: number, state: 
   return { launchId, projectId, purpose: "work", role: "implementer", profileId: "p", state, admittedAt, seq };
 }
 
-function trip(overrides: Partial<FuseTripRecord> & Pick<FuseTripRecord, "tripId" | "scope" | "cause" | "openedAt">): FuseTripRecord {
+type TripOverrides = ({ scope: "host"; projectId?: never } | { scope: "project"; projectId: string }) &
+  ({ closedAt?: never; closedBy?: never } | { closedAt: number; closedBy: "rate" | "owner" | "baseline" }) &
+  { tripId: string; cause: FuseTripRecord["cause"]; window?: FuseTripRecord["window"]; openedAt: number; ownerClose?: boolean; announcedAt?: number; launches?: number; seq?: number };
+function trip(overrides: TripOverrides): FuseTripRecord {
   return { ownerClose: false, seq: 1, ...overrides };
 }
 
@@ -109,7 +112,6 @@ test("merge takes the union and the later copy of each item", () => {
 });
 
 test("the file has seen everything up to its own seq", () => {
-  // The file is written first. An item that only the store holds, from before the file's seq, is one the file dropped.
   const staleTrip = trip({ tripId: "T", scope: "project", projectId: "a", cause: "launch-rate", openedAt: now - 30 * minute, ownerClose: true, seq: 7 });
   const staleLaunch = launch("L", "a", now - 10 * minute, "started", 6);
   const newerTrip = trip({ tripId: "N", scope: "project", projectId: "a", cause: "launch-rate", openedAt: now - 5 * minute, seq: 10 });
@@ -117,7 +119,6 @@ test("the file has seen everything up to its own seq", () => {
   const merged = mergeBaselines(baseline({ seq: 9 }), store, now);
   assert.deepEqual(merged?.trips.map((item) => item.tripId), ["N"], "the trip the file dropped stays dropped");
   assert.deepEqual(merged?.launches, []);
-  // With no file, the store is all there is.
   const alone = mergeBaselines(undefined, store, now);
   assert.deepEqual(alone?.trips.map((item) => item.tripId).sort(), ["N", "T"]);
   assert.equal(alone?.launches.length, 1);
@@ -163,7 +164,6 @@ test("a long project id is stored", () => {
   withDirectory((directory) => {
     const key = randomBytes(32);
     const file = join(directory, BASELINE_FILE);
-    // The host configuration sets no length limit on a project id, so the baseline sets none either.
     const projectId = "p".repeat(5000);
     const value = baseline({ launches: [launch("A", projectId, now)], trips: [trip({ tripId: "T", scope: "project", projectId, cause: "launch-rate", openedAt: now })] });
     assert.equal(writeBaseline(file, key, value), true);

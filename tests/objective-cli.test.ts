@@ -49,7 +49,6 @@ function view(overrides: { direction?: string } = {}): ObjectiveRecordView {
   };
 }
 
-/** A stub API. `fault` applies to every call, or only to POST when `onlyPost` is set. */
 function fakeApi(fault?: Fault | Error, onlyPost = false) {
   const paths: string[] = [];
   const calls: Call[] = [];
@@ -253,7 +252,6 @@ test("a correction file is checked before anything is sent", () => withTempDir(a
   assert.deepEqual(paths, []);
 }));
 
-// The sentences of the correction codes, written out here so that a change to the host's text fails a test.
 const CORRECTION_SENTENCES: { code: string; status: number; message: string }[] = [
   { code: "objective-prompts-off", status: 409, message: "Turn on objective prompts for this goal's project before changing its criteria." },
   { code: "objective-op-invalid", status: 400, message: "The correction is invalid." },

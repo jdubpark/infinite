@@ -86,12 +86,10 @@ test("a failed sealed write leaves no temporary file", () => {
   const directory = mkdtempSync(join(tmpdir(), "inf-vault-"));
   const key = randomBytes(32);
   try {
-    // The target is a directory, so the final rename fails after the temporary file was written.
     const target = join(directory, "record.sealed");
     mkdirSync(target);
     for (let index = 0; index < 3; index++) assert.throws(() => writeSealed(target, key, "scope", { index }));
     assert.deepEqual(readdirSync(directory), ["record.sealed"]);
-    // A write that succeeds is unchanged.
     const file = join(directory, "other.sealed");
     writeSealed(file, key, "scope", { ok: true });
     assert.deepEqual(unseal(key, "scope", readFileSync(file, "utf8")), { ok: true });

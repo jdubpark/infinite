@@ -19,7 +19,6 @@ function ago(days: number): string {
 
 let sequence = 0;
 
-/** One evidence row. A first-pass, held, integrated, accepted, current row with weight 1 unless the overrides say otherwise. */
 function row(overrides: Partial<RoutingEvidenceRow> = {}): RoutingEvidenceRow {
   sequence++;
   return {
@@ -54,21 +53,17 @@ test("the reward table", () => {
   assert.deepEqual(observe(row({ disposition: "stalled", integrated: 0, accepted: 0, firstPass: 0 }), NOW, 1)?.reward, { r: 0, w: 1 });
   assert.deepEqual(observe(row({ accepted: 0 }), NOW, 1)?.reward, { r: 0, w: 1 });
   assert.deepEqual(observe(row({ accepted: 1, held: 0 }), NOW, 1)?.reward, { r: 0, w: 1 });
-  // accepted unknown under same-model-review: no reward and no rescue observation.
   assert.equal(observe(row({ accepted: null, firstPass: 1, held: 1, flags: ["same-model-review"] }), NOW, 1), undefined);
-  // Rated 3 with held unknown: reward 0.5 at half weight, and the rescue still follows firstPass.
   const rated = observe(row({ ownerScore: 3, held: null, firstPass: 1 }), NOW, 1);
   assert.deepEqual(rated?.reward, { r: 0.5, w: 0.5 });
   assert.deepEqual(rated?.rescue, { x: 1, w: 1 });
   assert.deepEqual(observe(row({ held: null }), NOW, 1)?.reward, { r: 1, w: 0.5 });
-  // The rescue has no provisional weight: a held-unknown row keeps its time and who-chose weight only.
   assert.deepEqual(observe(row({ held: null, firstPass: 1 }), NOW, 1)?.rescue, { x: 1, w: 1 });
   assert.deepEqual(observe(row({ held: null, firstPass: 1 }), NOW, 0.5)?.rescue, { x: 1, w: 0.5 });
   assert.deepEqual(observe(row({ held: 1, firstPass: 1 }), NOW, 1)?.reward, { r: 1, w: 1 });
   const notFirst = observe(row({ held: 1, firstPass: 0 }), NOW, 1);
   assert.deepEqual(notFirst?.reward, { r: 0.5, w: 1 });
   assert.deepEqual(notFirst?.rescue, { x: 0, w: 1 });
-  // One first-pass row with held unknown adds 0.5 success and no failure mass; held 0 adds one failure.
   const provisional = observe(row({ held: null, firstPass: 1 }), NOW, 1)!.reward!;
   assert.equal(provisional.w * provisional.r, 0.5);
   assert.equal(provisional.w * (1 - provisional.r), 0);
@@ -101,7 +96,6 @@ test("time and who-chose weights", () => {
   assert.equal(observe(row({ endedAt: null }), NOW, 1), undefined);
   assert.equal(observe(row({ held: 1, firstPass: 1 }), NOW, 0.5)?.reward?.w, 0.5);
 
-  // A row older than 180 days is ignored and adds nothing to untimed. A counted row without endedAt adds one.
   const old = posterior([row({ endedAt: ago(181) })], TARGET, CURRENT, NOW, 1);
   assert.equal(old.untimed, 0);
   assert.equal(old.rows.production + old.rows.duel, 0);
@@ -143,7 +137,6 @@ test("levels hold their own rows", () => {
   assert.equal(withProject.reward[2]!.prior.strength, 12);
   assert.equal(withProject.level, "project");
 
-  // With tenant 24 and 6, the project prior strength is 20 and its parameters are 15.625 and 4.375.
   const large = posterior([
     ...Array.from({ length: 24 }, () => row({ projectRef: "other" })),
     ...Array.from({ length: 6 }, () => row({ projectRef: "other", accepted: 0 })),
@@ -151,7 +144,6 @@ test("levels hold their own rows", () => {
   assert.equal(large.reward[1]!.prior.strength, 20);
   assert.deepEqual(large.reward[1]!.posterior, { a: 15.625, b: 4.375 });
 
-  // Rows of another feature map, feature version, kind, or area count at project, never at cell.
   const mismatched = posterior([
     row({ featureMapRef: "other" }),
     row({ featureVersion: 2 }),
@@ -162,12 +154,10 @@ test("levels hold their own rows", () => {
   assert.equal(mismatched.reward[1]!.observed.rows, 4);
   assert.equal(mismatched.level, "project");
 
-  // A matching row is at cell, and it is the only row there.
   const matching = posterior([row()], TARGET, CURRENT, NOW, 1);
   assert.equal(matching.reward[2]!.observed.rows, 1);
   assert.equal(matching.level, "cell");
 
-  // A row of the other point counts nowhere.
   const other = posterior([row({ point: "escalation" }), row({ point: "escalation", projectRef: "other" })], TARGET, CURRENT, NOW, 1);
   assert.equal(other.rows.production + other.rows.duel, 0);
   assert.equal(other.level, "none");
@@ -188,7 +178,6 @@ test("earlier evidence is capped at a mass of 10", () => {
   const four = posterior(earlier(4), TARGET, current, NOW, 1);
   assert.deepEqual(four.reward[0]!.posterior, { a: 5, b: 1 });
 
-  // A null prompt version is earlier, and a current row beside the earlier rows counts in observed.
   const mixed = posterior([
     ...earlier(40, { promptVersion: null }),
     row({ projectRef: "other", profileEpoch: 2 }),
@@ -199,7 +188,6 @@ test("earlier evidence is capped at a mass of 10", () => {
 });
 
 test("the posterior does not depend on row order", () => {
-  // mulberry32, so the shuffles repeat on every run.
   let seed = 20261115;
   const random = (): number => {
     seed = (seed + 0x6d2b79f5) | 0;
@@ -255,7 +243,6 @@ test("a failure's rescue counts zero, the owner rating maps 1 to 0 and 5 to 1, a
 
 test("earlier evidence is capped at 10 below tenant, a row of another or no prompt version is earlier, phi has its own cap, and rows and level count rewards only", () => {
   const current: CurrentConfig = { epoch: 1, promptVersion: "pv" };
-  // 40 cell rows under another prompt version, held unknown: theta's earlier mass is 20 and phi's is 40; each is capped at 10.
   const cellEarlier = posterior(Array.from({ length: 40 }, () => row({ profileEpoch: 1, promptVersion: "old", held: null })), TARGET, current, NOW, 1);
   assert.deepEqual(cellEarlier.reward[2]!.earlier, { success: 20, failure: 0, rows: 40, scale: 0.5 });
   assert.deepEqual(cellEarlier.theta, { a: 11, b: 1 });
@@ -264,7 +251,6 @@ test("earlier evidence is capped at 10 below tenant, a row of another or no prom
   assert.deepEqual([cellEarlier.level, cellEarlier.earlierRows, cellEarlier.rows], ["none", 40, { production: 0, duel: 0 }]);
   assert.equal(posterior([row({ profileEpoch: 1, promptVersion: null })], TARGET, current, NOW, 1).earlierRows, 1);
   assert.equal(posterior([row({ projectRef: "other" })], TARGET, CURRENT, NOW, 1).level, "tenant");
-  // A reward without a rescue counts; a duel row counts as duel.
   const rewardOnly = posterior([row({ accepted: 1, firstPass: null, held: 1 })], TARGET, CURRENT, NOW, 1);
   assert.deepEqual([rewardOnly.level, rewardOnly.rows, rewardOnly.phi], ["cell", { production: 1, duel: 0 }, { a: 1, b: 1 }]);
   assert.deepEqual(posterior([row({ source: "duel" })], TARGET, CURRENT, NOW, 1).rows, { production: 0, duel: 1 });
@@ -279,10 +265,8 @@ test("an applied row counts at full weight", () => {
   const applied = row({ outcomeId: "applied-row" });
   assertBeta(posterior([applied], TARGET, CURRENT, NOW, 0.5, new Set(["applied-row"])).theta, { a: 2, b: 1 });
   assertBeta(posterior([applied], TARGET, CURRENT, NOW, 0.5).theta, { a: 1.5, b: 1 });
-  // A replacement's row, which is not the applied member's, keeps the half weight.
   assertBeta(posterior([applied], TARGET, CURRENT, NOW, 0.5, new Set(["other-row"])).theta, { a: 1.5, b: 1 });
 
-  // With half the rows router-chosen, the posterior is still a function of the row set, not of the order.
   const rows = Array.from({ length: 8 }, (_, index) => row({ outcomeId: `ordered-${index}`, accepted: index % 3 === 0 ? 0 : 1 }));
   const chosen = new Set(rows.filter((_, index) => index % 2 === 0).map(item => item.outcomeId));
   assert.deepEqual(posterior([...rows].reverse(), TARGET, CURRENT, NOW, 0.5, chosen), posterior(rows, TARGET, CURRENT, NOW, 0.5, chosen));

@@ -29,7 +29,6 @@ function entriesFingerprint(manifest: WorkspaceManifest): string {
   return createHash("sha256").update(JSON.stringify({ cwd: manifest.cwd, roots: manifest.roots, entries: manifest.entries })).digest("hex");
 }
 
-/** One incremental transfer at a time, independent of the terminal and first tool. */
 export async function synchronizeWorkspace(options: LaptopServiceOptions, control: ExecutorControl, signal: AbortSignal) {
   const inside = (root: string, path: string) => { const rel = relative(root, path); return !rel || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)); };
   let directory = join(dirname(options.configFile), "workspaces", options.sessionId);
@@ -75,7 +74,6 @@ export async function synchronizeWorkspace(options: LaptopServiceOptions, contro
           if (capture) {
             const begin = await control("sync/begin");
             const forceFull = Date.now() - lastFull > 60000;
-            // Clear events received during sync/begin just before capture; later events schedule another capture.
             await changeDetector?.take();
             lastCaptureStartedAt = Date.now();
             const manifest = await captureWorkspace({ roots: options.roots, cwd: options.cwd, storeDir, signal, previous, forceFull });
@@ -112,7 +110,6 @@ export async function synchronizeWorkspace(options: LaptopServiceOptions, contro
   } finally { await changeDetector?.close(); }
 }
 
-/** Check the installed executable before creating a cloud session. */
 export async function checkLaptopExecutor(): Promise<void> {
   if (process.platform === "win32") throw new Error("Laptop execution currently requires macOS or Linux.");
   let help: string;
@@ -149,7 +146,6 @@ function validateOptions(options: LaptopServiceOptions): LaptopServiceOptions {
   return { ...options, origin: origin.origin, cwd, roots };
 }
 
-/** Launch once per session. The service and its executor survive terminal detachment. */
 export async function startLaptopService(options: LaptopServiceOptions): Promise<void> {
   let validated: LaptopServiceOptions;
   try { validated = validateOptions(options); }
@@ -158,8 +154,6 @@ export async function startLaptopService(options: LaptopServiceOptions): Promise
   const child = spawn(process.execPath, [...(file.endsWith(".ts") ? ["--import", import.meta.resolve("tsx")] : []), file, "--laptop-service"], {
     cwd: validated.cwd, detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"],
   });
-  // Device credentials are passed only through private IPC, never copied into
-  // the service's arguments or environment.
   await new Promise<void>((resolve, reject) => {
     let started = false, ready = false, detached = false, finished = false;
     const timer = setTimeout(() => fail(), STARTUP_TIMEOUT);
@@ -169,7 +163,7 @@ export async function startLaptopService(options: LaptopServiceOptions): Promise
     const fail = () => {
       if (finished) return;
       finished = true; cleanup();
-      if (child.connected) try { child.disconnect(); } catch { /* Already disconnected. */ }
+      if (child.connected) try { child.disconnect(); } catch {}
       child.kill("SIGTERM");
       const killTimer = setTimeout(() => child.kill("SIGKILL"), 4000); killTimer.unref();
       child.once("exit", () => clearTimeout(killTimer));
@@ -200,9 +194,6 @@ export async function startLaptopService(options: LaptopServiceOptions): Promise
   });
 }
 
-// An inherited pipe keeps the executor tied to its service even if the service
-// is killed. Its own process group is cleaned up on exit. This is lifecycle
-// cleanup; it does not establish fencing for tools that escape that group.
 const EXECUTOR_SUPERVISOR = `
   const {spawn}=require('node:child_process');
   const child=spawn(process.argv[1],process.argv.slice(2),{detached:true,stdio:['ignore','pipe','pipe']});
@@ -295,7 +286,7 @@ async function runLaptopService(): Promise<void> {
           const state = await response.json() as { status?: unknown };
           if (state.status === "exited") stop();
         } else await response.body?.cancel();
-      } catch { /* A network outage does not replace the executor or replay work. */ }
+      } catch {}
       finally { checking = false; }
     };
     monitor = setInterval(() => { void checkSession(); }, 15000);
@@ -314,7 +305,7 @@ async function runLaptopService(): Promise<void> {
             process.send({ type: "ready" }, error => { if (error) stop(); });
           },
         });
-      } catch { /* Only transport reconnection is retried, against this same exec-server. */ }
+      } catch {}
       finally { transfer.abort(); }
       if (!abort.signal.aborted) {
         await checkSession();
@@ -327,7 +318,7 @@ async function runLaptopService(): Promise<void> {
     stop(); clearTimeout(startup); clearInterval(monitor);
     process.off("disconnect", disconnected); process.off("message", detach);
     for (const name of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(name, stop);
-    if (process.connected && process.send) try { process.send({ type: "failed" }, () => { if (process.connected) process.disconnect(); }); } catch { /* Parent already exited. */ }
+    if (process.connected && process.send) try { process.send({ type: "failed" }, () => { if (process.connected) process.disconnect(); }); } catch {}
     if (executor && executor.exitCode === null && executor.signalCode === null) {
       const child = executor;
       await new Promise<void>(resolve => {

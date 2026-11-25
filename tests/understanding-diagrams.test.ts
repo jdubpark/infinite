@@ -51,7 +51,6 @@ test("stored component graphs validate beyond the parser node limit", () => {
 });
 
 test("a component map larger than the stored ceilings is capped, validates, and says how much it drew", () => {
-  // 2,001 components in 250 top-level directories, one named directory too long for a label, one empty name, 4,500 connections.
   const components = Array.from({ length: 2001 }, (_, i) => ({ id: `cmp_${i}`, name: i === 0 ? "" : i === 1 ? "n".repeat(260) : `C${i}`,
     paths: [{ repositoryId: "repo", path: `${i === 2 ? "d".repeat(300) : `dir${i % 250}`}/c${i}` }], retired: false }));
   const relationships = Array.from({ length: 4500 }, (_, i) => ({ from: `cmp_${i % 2000}`, to: `cmp_${(i % 2000 + 1 + Math.floor(i / 2000)) % 2000}`, kind: "imports" as const }));

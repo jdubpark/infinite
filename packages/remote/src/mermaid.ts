@@ -4,7 +4,6 @@ export type ParsedMermaid =
   | { ok: true; diagram: Pick<Diagram, "direction" | "nodes" | "edges" | "groups" | "sequence">; kind: "flowchart" | "sequence"; coverage: string[] }
   | { ok: false; error: string };
 
-/** Parses the flowchart/graph/sequenceDiagram subset the briefing engine writes. Never throws. */
 export function parseMermaid(text: string): ParsedMermaid {
   try {
     if (typeof text !== "string") return failure("Mermaid input must be text.");
@@ -16,7 +15,6 @@ export function parseMermaid(text: string): ParsedMermaid {
     const lines = source.split(/\r?\n/);
     const header = lines[0]?.trim() ?? "";
     const flowHeaderMatch = /^(flowchart|graph)\s+(TD|TB|BT|LR|RL)\b(.*)$/.exec(header);
-    // Reject all same-line suffixes after the direction so no header statement is silently discarded.
     if (flowHeaderMatch && flowHeaderMatch[3].trim()) {
       return failure("Flowchart header must end after the direction.");
     }
@@ -81,8 +79,6 @@ function forbiddenConstruct(source: string): string | undefined {
     const trimmed = line.trim();
     if (/^(?:click|linkStyle|classDef)\b/.test(trimmed)) return trimmed.split(/\s/, 1)[0];
     if (/^(?:class|style)\s/.test(trimmed)) return trimmed.split(/\s/, 1)[0];
-    // A link/links line is an unsafe Mermaid directive, while the same word
-    // remains valid as a node or participant identifier.
     if (/^links?\s+[A-Za-z_][\w.-]*\s*:/.test(trimmed)) return trimmed.split(/\s/, 1)[0];
   }
   return undefined;
@@ -231,8 +227,6 @@ function parseFlowchart(body: string[], unparsedLines: string[]): { value: Pick<
       seenEdges.add(flowEdgeKey(edge));
     }
     if (duplicateEdge && pendingEdges.length === 0) {
-      // Retain distinct pairs from a mixed chain, but count its repeated pair
-      // as unparsed so repeated-edge floods still fail the coverage gate.
       unparsedLines.push(rawLine);
     }
   }

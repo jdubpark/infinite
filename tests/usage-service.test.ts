@@ -14,7 +14,6 @@ import type { Config } from "../packages/host/src/types.js";
 import type { Manager } from "../packages/host/src/manager.js";
 import type { UsageRecord } from "../packages/host/src/usage.js";
 
-/** A store in the test's own folder, as the host builds one. */
 const storeFor = (dir: string, key: Buffer) => new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: key });
 
 const step = (partId: string): UsageRecord => ({ provider: "opencode", providerId: "deepseek", modelId: "deepseek-flash", messageId: "m1", partId, modelSource: "reported",
@@ -58,15 +57,12 @@ test("lookups read the store once until the ledger changes, and one row that doe
       },
     } as unknown as Manager;
     const usage = new UsageService({ stateDir: dir } as Config, key, manager, store);
-    // Forty sessions of one run in four projects. Sessions 12 and 13 are two attempts of one member, and session 00 still runs.
     const rows = ids.map((id, index) => ({ id, provider: "opencode", projectId: `project-${index % 4}`, createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
       status: index === 0 ? "running" : "exited", team: { runId, memberId: `member-${index === 13 ? 12 : index}`, revision: 1, role: "implementer" },
       teamModelProfile: { id: "light", provider: "opencode" } }) as unknown as UsageSessionRow);
-    // A tick reads a bounded number of pages, so a ledger of this size takes more than one.
     for (let pass = 0; pass < 4; pass++) await usage.tick(rows);
     usage.recordBriefing("briefing-project", "briefing-session", new Date().toISOString(),
       { providerId: "deepseek", modelId: "deepseek-flash", tokens: { input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0.001 });
-    // The clock stands still from here, so the time the kept read may answer passes only when the test says so.
     t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     let reads = 0;
     const read = store.read.bind(store);
@@ -80,13 +76,11 @@ test("lookups read the store once until the ledger changes, and one row that doe
     assert.deepEqual(usage.member(runId, "no-such-member"), { measured: false, coverage: "none" });
     assert.equal(reads, 1, "Every lookup after the first is answered from the one read the service kept");
 
-    // The project page asks for each run's goal once, however many sessions the run has in the project.
     const asked: string[] = [];
     usage.useResolvers({ goalOfRun: id => { asked.push(id); return { id: "goal-1", title: "Goal" }; }, runTitle: () => "Run", projectName: id => id, sessionTitle: () => undefined });
     assert.equal(usage.project("project-0")?.id, "project-0");
     assert.deepEqual(asked, [runId]);
 
-    // A write drops the kept read, so the next lookup sees the new record, and reads once more.
     second.add("session-00");
     await usage.tick(rows);
     reads = 0;
@@ -94,11 +88,8 @@ test("lookups read the store once until the ledger changes, and one row that doe
     assert.equal((usage.session("session-01") as { messages: number }).messages, 1);
     assert.equal(reads, 1);
 
-    // A sealed value that does not open makes the whole ledger unavailable, also for sessions that do not use it and
-    // also when nothing writes the ledger: the kept read answers for one tick at most.
     assert.equal(usage.session("session-01").measured, true);
     const raw = new DatabaseSync(evidenceDatabasePath(dir));
-    // The project that only the briefing uses: no session and no record needs it.
     try { assert.equal(raw.prepare("UPDATE usage_projects SET encrypted_project = ? WHERE project_ref IN (SELECT project_ref FROM usage_briefings)").run("not-sealed").changes, 1); }
     finally { raw.close(); }
     let writes = 0;
@@ -131,7 +122,6 @@ test("an unreadable or misshapen ledger is discarded with a warning and the serv
       file => writeSealed(file, key, "usage", { rows: {}, cursors: {} }),
     ];
     for (const write of cases) {
-      // The import happens once per store, so each case starts from its own folder.
       const dir = mkdtempSync(join(tmpdir(), "inf-usage-"));
       try {
         write(join(dir, "usage.sealed"));
@@ -235,7 +225,6 @@ test("usage ledger prices OpenCode members, survives restart idempotently, and c
     const model = (await run.host.fetchApi("/usage/models")).body.rows.find((row: any) => row.profileId === "deepseek-high");
     assert.equal(model.medianTokens, 1504);
     assert.equal(model.usdPerMTok, model.medianUsd / 1504 * 1_000_000);
-    // DeepSeek uses the configured price; the default Muse model uses its built-in catalog entry.
     assert.equal(usage.providers.opencode.spent!.cost.toFixed(4), "0.0022");
     assert.deepEqual(usage.providers.opencode.spent!.pricing, { configured: 2, catalog: 2, provider: 0, unknown: 0 });
     assert.equal(usage.providers.opencode.budget?.usd, 10);
@@ -243,7 +232,7 @@ test("usage ledger prices OpenCode members, survives restart idempotently, and c
     assert.ok(usage.providers.claude.unmeasuredSessions >= 2, "Active coordinator and reviewer sessions count in the current period");
     assert.equal(usage.providers.claude.measured, false);
     assert.equal(usage.providers.claude.spent, undefined);
-    assert.ok(usage.providers.claude.unmeasuredSessions >= 2); // coordinator + reviewer
+    assert.ok(usage.providers.claude.unmeasuredSessions >= 2);
     const me = (await run.host.fetchApi("/me")).body;
     assert.equal(me.usage.enabled, true);
     assert.equal(me.usage.budgets.opencode.usd, 10);
@@ -251,7 +240,6 @@ test("usage ledger prices OpenCode members, survives restart idempotently, and c
     await run.host.start();
     const again = (await run.host.fetchApi("/usage")).body as UsageSummary;
     assert.equal(again.providers.opencode.spent!.messages, 4);
-    // Give the restarted service time to re-read the journals; a missing cursor would double the rows or the cost.
     await new Promise(resolve => setTimeout(resolve, 5000));
     const settled = (await run.host.fetchApi("/usage")).body as UsageSummary;
     assert.equal(settled.providers.opencode.spent!.messages, 4);
@@ -292,7 +280,7 @@ test("team task usage follows the task's revision while run and project totals r
     const file = join(run.host.config.stateDir, "teams", `${second.id}.sealed`);
     const key = readFileSync(run.host.config.keyFile);
     const stored = unseal<any>(key, `team:${second.id}`, readFileSync(file, "utf8"));
-    for (const task of stored.run.tasks) delete task.revision; // Simulate a record written before task revisions were persisted.
+    for (const task of stored.run.tasks) delete task.revision;
     writeSealed(file, key, `team:${second.id}`, stored);
     await run.host.start();
     const restored = (await run.host.fetchApi(`/teams/${second.id}`)).body;
@@ -310,12 +298,10 @@ test("one unreadable journal does not hide another measured session's usage", { 
   try {
     const team = await run.settled((await run.host.fetchApi("/teams", "owner", run.create())).body.id);
     await waitFor(() => run.host.fetchApi("/usage").then(r => r.body as UsageSummary), (u: UsageSummary) => u.providers.opencode.spent?.messages === 4, 20000);
-    // Rebuild the ledger from journals after damaging one member's journal.
     await run.host.stopApi();
     const damaged = team.members.find(member => member.modelProfile?.id === "deepseek-high")!;
     const events = join(run.host.config.stateDir, "sessions", damaged.sessionId!, "events");
     for (const name of readdirSync(events)) writeFileSync(join(events, name), "not a sealed journal\n");
-    // The ledger now lives in the evidence store, so a rebuild starts from the journals.
     const evidence = join(run.host.config.stateDir, "evidence", "evidence.sqlite3");
     for (const path of [evidence, `${evidence}-wal`, `${evidence}-shm`]) rmSync(path, { force: true });
     await run.host.start();

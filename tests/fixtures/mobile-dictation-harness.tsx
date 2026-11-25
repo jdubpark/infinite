@@ -1,5 +1,3 @@
-// Two phone dictation fields built from the app's real hook, rendered with React DOM. The native recognizer, screen
-// focus, and host API come from ./mobile-dictation-native.ts; tests/mobile-dictation-lifecycle.test.ts drives them through `window.dictation`.
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { useDictation } from "../../apps/mobile/src/dictation/useDictation";

@@ -14,6 +14,17 @@ type Frame = { type: "ready"; cwd: string } | { type: "open" | "close"; id: stri
 export type ExecutorControl = (method: string, params?: unknown) => Promise<any>;
 export interface ExecutorActivity { revision: number; busy: boolean; uncertain: boolean }
 
+type DevicePhase =
+  | { state: "disconnected"; initialReady: boolean; retired: boolean; paused: boolean }
+  | { state: "connecting"; socket: WebSocket; timeout: ReturnType<typeof setTimeout>; initialReady: boolean; retired: boolean; paused: boolean }
+  | { state: "ready"; socket: WebSocket; retired: boolean; paused: boolean }
+  | { state: "closed" };
+
+type ForwardPhase =
+  | { state: "connecting"; cloud: WebSocket; timeout: ReturnType<typeof setTimeout> }
+  | { state: "ready"; cloud: WebSocket }
+  | { state: "finished" };
+
 function parseFrame(text: string): Frame {
   const value: unknown = JSON.parse(text);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid executor tunnel frame");
@@ -44,8 +55,6 @@ function heartbeat(socket: WebSocket, failed: () => void) {
   socket.once("close", () => clearInterval(timer));
 }
 
-// Both directions share a total buffer budget. Multiplexing must not multiply
-// the native transport's memory limit by the number of provider connections.
 function send(socket: WebSocket, text: string, buffered: number, failed: () => void) {
   const bytes = Buffer.byteLength(text);
   if (socket.readyState !== WebSocket.OPEN || bytes > NATIVE_MAX_MESSAGE || buffered + bytes > NATIVE_MAX_BUFFERED) { failed(); return false; }
@@ -55,7 +64,6 @@ function send(socket: WebSocket, text: string, buffered: number, failed: () => v
 
 export interface ExecutorTunnel {
   environment: { environmentId: string; url: string; token: string; cwd: string };
-  /** Resolves after the first authenticated device has confirmed the exact cwd. */
   ready: Promise<void>;
   attach: () => { url: string; token: string };
   retire: () => void;
@@ -63,7 +71,6 @@ export interface ExecutorTunnel {
   close: () => void;
 }
 
-/** Private worker broker. The API must authorize the owner and session before calling attach. */
 export async function createExecutorTunnel(options: {
   cwd: string; onConnection?: (online: boolean) => void;
   onControl?: ExecutorControl; onActivity?: (activity: ExecutorActivity) => void;
@@ -76,7 +83,7 @@ export async function createExecutorTunnel(options: {
   const requests = new Map<string, { method: string; processId?: string; handleId?: string; writable?: boolean }>();
   const processes = new Set<string>(), handles = new Set<string>();
   const held = new Map<string, { channel: string; id: string | number }>();
-  let revision = 0, uncertain = false, retired = false, paused = false, controls = 0;
+  let revision = 0, uncertain = false, controls = 0;
   const activity = () => options.onActivity?.({ revision, busy: requests.size > 0 || processes.size > 0 || handles.size > 0, uncertain });
   const rpcKey = (channel: string, id: unknown) => `${channel}:${JSON.stringify(id)}`;
   const trackRequest = (channel: string, text: string) => {
@@ -106,82 +113,114 @@ export async function createExecutorTunnel(options: {
     }
     activity();
   };
-  let device: WebSocket | undefined, deviceReady = false, closed = false, initialReady = false;
+  let phase: DevicePhase = { state: "disconnected", initialReady: false, retired: false, paused: false };
   let resolveReady!: () => void, rejectReady!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
-  // The worker may still be setting up its waiter when startup is canceled.
   void ready.catch(() => {});
-  const buffered = () => [...channels.values()].reduce((bytes, socket) => bytes + socket.bufferedAmount, device?.bufferedAmount ?? 0);
+  const buffered = () => {
+    const deviceBytes = phase.state === "connecting" || phase.state === "ready" ? phase.socket.bufferedAmount : 0;
+    return [...channels.values()].reduce((bytes, socket) => bytes + socket.bufferedAmount, deviceBytes);
+  };
   const notify = (online: boolean) => { try { options.onConnection?.(online); } catch { close(); } };
   const dropDevice = (socket: WebSocket) => {
-    if (device !== socket) return;
-    const wasReady = deviceReady;
-    device = undefined; deviceReady = false;
-    paused = true;
+    if ((phase.state !== "connecting" && phase.state !== "ready") || phase.socket !== socket) return;
+    const wasReady = phase.state === "ready";
+    const initialReady = phase.state === "ready" ? true : phase.initialReady;
+    if (phase.state === "connecting") clearTimeout(phase.timeout);
+    phase = {
+      state: "disconnected",
+      initialReady,
+      retired: phase.retired,
+      paused: true,
+    };
     if (requests.size || processes.size || handles.size) uncertain = true;
-    socket.terminate(); activity();
+    socket.terminate();
+    activity();
     if (wasReady) notify(false);
   };
   const sendDevice = (frame: Frame) => {
-    const target = device;
-    return !!target && send(target, JSON.stringify(frame), buffered(), () => dropDevice(target));
+    if (phase.state !== "connecting" && phase.state !== "ready") return false;
+    const target = phase.socket;
+    return send(target, JSON.stringify(frame), buffered(), () => dropDevice(target));
   };
   const dropChannel = (id: string, tellDevice: boolean) => {
     const provider = channels.get(id);
     if (!provider) return;
     channels.delete(id); provider.terminate();
     if ([...requests.keys()].some(key => key.startsWith(`${id}:`))) { uncertain = true; activity(); }
-    if (tellDevice && deviceReady) sendDevice({ type: "close", id });
+    if (tellDevice && phase.state === "ready") sendDevice({ type: "close", id });
   };
   function close() {
-    if (closed) return;
-    closed = true;
-    if (!initialReady) rejectReady(new Error("Executor tunnel closed before the laptop connected"));
-    if (device) dropDevice(device);
+    if (phase.state === "closed") return;
+    const prev = phase;
+    phase = { state: "closed" };
+    if ((prev.state === "disconnected" || prev.state === "connecting") && !prev.initialReady) {
+      rejectReady(new Error("Executor tunnel closed before the laptop connected"));
+    }
+    if (prev.state === "connecting") clearTimeout(prev.timeout);
+    if (prev.state === "connecting" || prev.state === "ready") {
+      if (requests.size || processes.size || handles.size) uncertain = true;
+      prev.socket.terminate();
+      activity();
+      if (prev.state === "ready") notify(false);
+    }
     for (const socket of sockets.clients) socket.terminate();
-    sockets.close(); server.close();
+    sockets.close();
+    server.close();
   }
   server.on("upgrade", (req, socket, head) => {
     socket.on("error", () => {});
     const isDevice = req.url === "/device", isProvider = req.url === "/executor";
-    if (closed || req.headers.origin !== undefined || (!isDevice && !isProvider) ||
+    if (phase.state === "closed" || req.headers.origin !== undefined || (!isDevice && !isProvider) ||
         !authorized(req.headers.authorization, isDevice ? deviceToken : providerToken) ||
-        (isDevice ? !!device : retired || channels.size >= MAX_CHANNELS)) {
+        (isDevice ? phase.state !== "disconnected" : phase.retired || channels.size >= MAX_CHANNELS)) {
       socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); return;
     }
     sockets.handleUpgrade(req, socket, head, connection => {
       if (isDevice) {
-        device = connection;
+        if (phase.state !== "disconnected") { connection.terminate(); return; }
         const timeout = setTimeout(() => dropDevice(connection), CONNECT_TIMEOUT);
         timeout.unref();
+        phase = {
+          state: "connecting",
+          socket: connection,
+          timeout,
+          initialReady: phase.initialReady,
+          retired: phase.retired,
+          paused: phase.paused,
+        };
         heartbeat(connection, () => dropDevice(connection));
         connection.on("error", () => dropDevice(connection));
         connection.on("close", () => { clearTimeout(timeout); dropDevice(connection); });
         connection.on("message", (data, binary) => {
           try {
-            if (binary || device !== connection) throw new Error("Invalid executor tunnel frame");
+            if (binary || (phase.state !== "connecting" && phase.state !== "ready") || phase.socket !== connection) {
+              throw new Error("Invalid executor tunnel frame");
+            }
             const frame = parseFrame(data.toString());
-            if (!deviceReady) {
+            if (phase.state === "connecting") {
               if (frame.type !== "ready" || frame.cwd !== options.cwd) throw new Error("Executor workspace does not match");
-              clearTimeout(timeout); deviceReady = true;
+              clearTimeout(phase.timeout);
+              phase = { state: "ready", socket: connection, retired: phase.retired, paused: phase.paused };
               if (!sendDevice({ type: "ready", cwd: options.cwd })) return;
-              // Reconnecting an idle relay reopens transport only. An unresolved
-              // operation is never dispatched again by this broker.
-              initialReady = true; resolveReady(); notify(true);
-              if (!paused && !uncertain && !retired) for (const id of channels.keys()) dropChannel(id, false);
+              resolveReady();
+              notify(true);
+              if (phase.state === "ready" && !phase.paused && !uncertain && !phase.retired) {
+                for (const id of channels.keys()) dropChannel(id, false);
+              }
               return;
             }
             if (frame.type === "request") {
               if (!options.onControl || controls >= 8) throw new Error("Executor control unavailable");
               controls++;
               void options.onControl(frame.method, frame.params).then(
-                result => { if (device === connection) sendDevice({ type: "response", id: frame.id, result }); },
-                error => { if (device === connection) sendDevice({ type: "response", id: frame.id, error: error instanceof Error ? error.message.slice(0, 300) : "Workspace transfer failed" }); },
+                result => { if (phase.state === "ready" && phase.socket === connection) sendDevice({ type: "response", id: frame.id, result }); },
+                error => { if (phase.state === "ready" && phase.socket === connection) sendDevice({ type: "response", id: frame.id, error: error instanceof Error ? error.message.slice(0, 300) : "Workspace transfer failed" }); },
               ).finally(() => { controls--; });
             } else if (frame.type === "close") dropChannel(frame.id, false);
             else if (frame.type === "data") {
               const provider = channels.get(frame.id);
-              if (provider && !retired) { trackResponse(frame.id, frame.data); send(provider, frame.data, buffered(), () => dropChannel(frame.id, true)); }
+              if (provider && !phase.retired) { trackResponse(frame.id, frame.data); send(provider, frame.data, buffered(), () => dropChannel(frame.id, true)); }
             } else throw new Error("Invalid executor tunnel frame");
           } catch { dropDevice(connection); }
         });
@@ -193,15 +232,15 @@ export async function createExecutorTunnel(options: {
         connection.on("close", () => dropChannel(id, true));
         connection.on("message", (data, binary) => {
           if (binary) { dropChannel(id, true); return; }
-          if (channels.get(id) !== connection) return;
+          if (channels.get(id) !== connection || phase.state === "closed") return;
           try {
             const text = data.toString();
-            if (retired) {
+            if (phase.retired) {
               const rpc = JSON.parse(text);
               if (rpc.id !== undefined) send(connection, JSON.stringify({ id: rpc.id, error: { code: -32000, message: "This request was not executed. The conversation now uses the cloud environment; use its current workspace." } }), buffered(), () => dropChannel(id, false));
               return;
             }
-            if (!deviceReady || paused || uncertain) {
+            if (phase.state !== "ready" || phase.paused || uncertain) {
               const rpc = JSON.parse(text);
               if (rpc.id !== undefined) {
                 if (held.size >= MAX_PENDING_MESSAGES) throw new Error("Executor wait queue is full");
@@ -213,7 +252,7 @@ export async function createExecutorTunnel(options: {
             if (!sendDevice({ type: "data", id, data: text })) activity();
           } catch { dropChannel(id, true); }
         });
-        if (deviceReady && !sendDevice({ type: "open", id })) dropChannel(id, false);
+        if (phase.state === "ready" && !sendDevice({ type: "open", id })) dropChannel(id, false);
       }
     });
   });
@@ -229,9 +268,10 @@ export async function createExecutorTunnel(options: {
   return {
     environment: { environmentId: randomUUID(), url: `${base}/executor`, token: providerToken, cwd: options.cwd },
     ready,
-    attach: () => { if (closed) throw new Error("Executor tunnel is closed"); return { url: `${base}/device`, token: deviceToken }; },
+    attach: () => { if (phase.state === "closed") throw new Error("Executor tunnel is closed"); return { url: `${base}/device`, token: deviceToken }; },
     retire: () => {
-      retired = true;
+      if (phase.state === "closed") return;
+      phase.retired = true;
       for (const request of held.values()) {
         const provider = channels.get(request.channel);
         if (provider) send(provider, JSON.stringify({ id: request.id, error: { code: -32000, message: "This request was not executed. The conversation now uses the cloud environment; use its current workspace." } }), buffered(), () => {});
@@ -239,10 +279,9 @@ export async function createExecutorTunnel(options: {
       held.clear();
     },
     pause: value => {
-      paused = value;
-      // An idle reconnect discards transport connections, so Codex negotiates
-      // a fresh socket to the same executor rather than receiving a replay.
-      if (!value && deviceReady && !uncertain && !retired) {
+      if (phase.state === "closed") return;
+      phase.paused = value;
+      if (!value && phase.state === "ready" && !uncertain && !phase.retired) {
         for (const id of new Set([...held.values()].map(request => request.channel))) dropChannel(id, true);
         held.clear();
       }
@@ -251,7 +290,6 @@ export async function createExecutorTunnel(options: {
   };
 }
 
-/** Relay only to the locally launched executor; remote frames never select an endpoint. */
 export async function forwardExecutor(options: {
   url: string; token: string; executorUrl: string; executorToken: string; cwd: string;
   deviceHeaders?: Record<string, string>; signal?: AbortSignal; onReady?: (control: ExecutorControl) => void;
@@ -269,14 +307,21 @@ export async function forwardExecutor(options: {
     } catch { reject(new Error("Could not connect executor tunnel")); return; }
     const channels = new Map<string, { socket: WebSocket; queued: string[]; bytes: number }>();
     const controls = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
-    let ready = false, finished = false, queuedBytes = 0;
+    let queuedBytes = 0;
     const timeout = setTimeout(() => finish(new Error("Executor tunnel did not become ready")), CONNECT_TIMEOUT);
     timeout.unref();
-    const buffered = () => [...channels.values()].reduce((bytes, channel) => bytes + channel.socket.bufferedAmount, cloud.bufferedAmount + queuedBytes);
+    let phase: ForwardPhase = { state: "connecting", cloud, timeout };
+    const buffered = () => {
+      const cloudBytes = phase.state === "finished" ? 0 : phase.cloud.bufferedAmount;
+      return [...channels.values()].reduce((bytes, channel) => bytes + channel.socket.bufferedAmount, cloudBytes + queuedBytes);
+    };
     function finish(error?: Error) {
-      if (finished) return;
-      finished = true; clearTimeout(timeout); options.signal?.removeEventListener("abort", abort);
-      cloud.terminate();
+      if (phase.state === "finished") return;
+      const prev = phase;
+      phase = { state: "finished" };
+      if (prev.state === "connecting") clearTimeout(prev.timeout);
+      options.signal?.removeEventListener("abort", abort);
+      prev.cloud.terminate();
       for (const channel of channels.values()) channel.socket.terminate();
       channels.clear(); queuedBytes = 0;
       for (const call of controls.values()) call.reject(new Error("Workspace connection closed"));
@@ -284,9 +329,12 @@ export async function forwardExecutor(options: {
       if (error) reject(error); else resolve();
     }
     const abort = () => finish();
-    const sendCloud = (frame: Frame) => send(cloud, JSON.stringify(frame), buffered(), () => finish(new Error("Executor tunnel disconnected or exceeded its buffer limit")));
+    const sendCloud = (frame: Frame) => {
+      if (phase.state === "finished") return false;
+      return send(phase.cloud, JSON.stringify(frame), buffered(), () => finish(new Error("Executor tunnel disconnected or exceeded its buffer limit")));
+    };
     const control: ExecutorControl = (method, params = {}) => new Promise((resolve, reject) => {
-      if (finished || !ready || controls.size >= 8) { reject(new Error("Workspace connection unavailable")); return; }
+      if (phase.state !== "ready" || controls.size >= 8) { reject(new Error("Workspace connection unavailable")); return; }
       const id = randomUUID();
       const timer = setTimeout(() => { controls.delete(id); reject(new Error("Workspace request timed out")); }, 120000);
       controls.set(id, { resolve: value => { clearTimeout(timer); resolve(value); }, reject: error => { clearTimeout(timer); reject(error); } });
@@ -296,24 +344,27 @@ export async function forwardExecutor(options: {
       const channel = channels.get(id);
       if (!channel) return;
       channels.delete(id); queuedBytes -= channel.bytes; channel.queued.length = 0; channel.bytes = 0; channel.socket.terminate();
-      if (tellCloud && !finished) sendCloud({ type: "close", id });
+      if (tellCloud && phase.state !== "finished") sendCloud({ type: "close", id });
     };
     options.signal?.addEventListener("abort", abort, { once: true });
     cloud.on("error", () => finish(new Error("Executor tunnel connection failed")));
-    cloud.on("close", () => finish(ready ? undefined : new Error("Executor tunnel closed before it became ready")));
+    cloud.on("close", () => finish(phase.state === "ready" ? undefined : new Error("Executor tunnel closed before it became ready")));
     cloud.on("open", () => {
-      if (finished) return;
+      if (phase.state === "finished") return;
       heartbeat(cloud, () => finish(new Error("Executor tunnel heartbeat expired")));
       sendCloud({ type: "ready", cwd: options.cwd });
     });
     cloud.on("message", (data, binary) => {
-      if (finished) return;
+      if (phase.state === "finished") return;
       try {
         if (binary) throw new Error("Invalid executor tunnel frame");
         const frame = parseFrame(data.toString());
-        if (!ready) {
+        if (phase.state === "connecting") {
           if (frame.type !== "ready" || frame.cwd !== options.cwd) throw new Error("Executor workspace does not match");
-          ready = true; clearTimeout(timeout); options.onReady?.(control); return;
+          clearTimeout(phase.timeout);
+          phase = { state: "ready", cloud: phase.cloud };
+          options.onReady?.(control);
+          return;
         }
         if (frame.type === "response") {
           const call = controls.get(frame.id);
@@ -330,7 +381,7 @@ export async function forwardExecutor(options: {
           socket.on("error", failed);
           socket.on("close", failed);
           socket.on("open", () => {
-            if (finished || channels.get(frame.id) !== channel) { socket.terminate(); return; }
+            if (phase.state === "finished" || channels.get(frame.id) !== channel) { socket.terminate(); return; }
             heartbeat(socket, failed);
             const queued = channel.queued;
             channel.queued = [];
@@ -342,7 +393,7 @@ export async function forwardExecutor(options: {
           });
           socket.on("message", (message, isBinary) => {
             if (isBinary) { failed(); return; }
-            if (!finished && channels.get(frame.id) === channel) sendCloud({ type: "data", id: frame.id, data: message.toString() });
+            if (phase.state !== "finished" && channels.get(frame.id) === channel) sendCloud({ type: "data", id: frame.id, data: message.toString() });
           });
         } else if (frame.type === "close") dropChannel(frame.id, false);
         else if (frame.type === "data") {

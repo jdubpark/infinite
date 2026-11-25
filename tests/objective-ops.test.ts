@@ -48,14 +48,12 @@ function goalFixture(): ProductGoal {
   } as unknown as ProductGoal;
 }
 
-/** Version 1 of a goal's record: c0 only, one log entry. */
 function v1(): ObjectiveRecord {
   const record = goalRecord(goalFixture(), AT, "created");
   if (typeof record === "string") throw new Error(`the fixture record is ${record}`);
   return record;
 }
 
-/** The record with its criteria replaced and its digest recomputed. The log is kept as it is. */
 function withCriteria(record: ObjectiveRecord, criteria: Criterion[]): ObjectiveRecord {
   const body = { ...record, criteria };
   return { ...body, digest: recordDigest(body) };
@@ -180,7 +178,6 @@ test("c0 stays", () => {
 });
 
 test("a secret-shaped statement is refused", () => {
-  // Each shape is built at run time, so the test file holds no credential-shaped literal.
   const shapes = [
     "-----BEGIN " + "OPENSSH PRIVATE" + " KEY-----",
     "gh" + "p_" + "a".repeat(36),
@@ -216,7 +213,6 @@ test("limits refuse before anything changes", () => {
   const sixtyFive = refusal(() => applyOwnerOps(full, correction(1, [add("A 65th.")]), context));
   assert.equal(sixtyFive.code, "objective-criteria-limit");
 
-  // Five statements of 1,000 bytes make a digest of about 5.5 KiB; a sixth makes it about 6.6 KiB.
   const five = applyOwnerOps(base, correction(1, Array.from({ length: 5 }, (_, index) => add(sized("b", 1000, index)))), context);
   assert.ok(recordDigestBytes(recordDigestFor(five, configured)) <= RECORD_DIGEST_BYTES);
   const digest = refusal(() => applyOwnerOps(five, correction(2, [add(sized("b", 1000, 6))]), context));
@@ -224,15 +220,12 @@ test("limits refuse before anything changes", () => {
   assert.equal(digest.status, 409);
 });
 
-/** A string of exactly `bytes` ASCII bytes that ends in `index` (two digits), so every such statement has the same size. */
 function sized(fill: string, bytes: number, index: number): string {
   return fill.repeat(bytes - 2) + String(index).padStart(2, "0");
 }
 
-/** A log entry that is not a criterion or direction op: it counts toward the room and the bytes only. */
 const note = (seq: number): LogEntry => ({ seq, at: AT, version: 1, actor: "host", authority: "receipt", op: "record.noted", target: "record" });
 
-/** Pads the log with entries carrying `size` characters of inline value, so that its canonical bytes are exactly `bytes`. */
 function logOfBytes(record: ObjectiveRecord, bytes: number): ObjectiveRecord {
   const log = [...record.log];
   const padded = (size: number): LogEntry => ({ ...note(log.length + 1), after: { inline: "x".repeat(size) } });
@@ -252,12 +245,10 @@ test("a correction keeps room for steering", () => {
   const STEER = Array.from({ length: 20 }, (_, index) => ({ text: "steer ".repeat(1200).slice(0, 8000), revision: index + 1, at: at(index + 1) }));
   const base = v1();
 
-  // 380 entries: a one-op correction would make 381.
   const full = { ...base, log: [...base.log, ...Array.from({ length: 379 }, (_, index) => note(index + 2))] };
   assert.equal(full.log.length, 380);
   assert.equal(refusal(() => applyOwnerOps(full, correction(1, [add("One op.")]), context)).code, "objective-log-full");
 
-  // 379 entries: one op fits and leaves room for 20 steers.
   const room = { ...base, log: [...base.log, ...Array.from({ length: 378 }, (_, index) => note(index + 2))] };
   const corrected = applyOwnerOps(room, correction(1, [add("One op.")]), context);
   assert.equal(corrected.log.length, 380);
@@ -267,7 +258,6 @@ test("a correction keeps room for steering", () => {
   assert.equal(steered.log.length, 400);
   assert.ok(objectiveRecordSchema.safeParse(steered).success, "20 maximal steers fit after the correction");
 
-  // Bytes: a correction that would pass 210 KiB is refused; one that stays under it leaves room for 20 steers at the inline limit.
   const direction = { id: "s10", text: "", source: "steering", at: at(10) };
   const inlineText = "y".repeat(2048 - canonicalBytes(direction));
   const inlineSteer = Array.from({ length: 20 }, (_, index) => ({ text: inlineText, revision: index + 10, at: at(index + 10) }));
@@ -306,7 +296,6 @@ test("three corrections of distinct criteria give one record in every order", ()
   assert.equal(outcomes[0]!.version, 5, "the seeded record is version 2, then three corrections");
 });
 
-/** A small deterministic generator, so a failing seed can be replayed. */
 function generator(seed: number): () => number {
   let state = seed >>> 0;
   return () => {
@@ -346,7 +335,6 @@ test("every version rebuilds after random corrections and steering", () => {
         else if (editable.length > 0) ops = [{ op: "criterion.retire", id: pick(editable).id }];
         if (ops !== undefined) record = applyOwnerOps(record, correction(record.version, ops), context);
       }
-      // A restart: the record is read back from disk and parsed, so its keys come in schema order, not the order they were written.
       record = objectiveRecordSchema.parse(JSON.parse(JSON.stringify(record)));
       snapshots.set(record.version, normal(record));
     }
@@ -360,7 +348,6 @@ test("every version rebuilds after random corrections and steering", () => {
   }
 });
 
-/** A statement that makes the retired form of a criterion exactly `bytes` canonical bytes. Each quote adds two bytes, each letter one. */
 function statementForRetired(check: CheckInput, threshold: Threshold, bytes: number): string {
   const base = canonicalBytes({ id: "c1", origin: "owner", statement: "", check, producer: "host", threshold, state: "retired" });
   const extra = bytes - base;
@@ -409,13 +396,9 @@ test("the whole-record refusals change nothing and echo nothing", () => {
   assert.equal(crowded.log.length, 378);
 
   const cases: { name: string; record: ObjectiveRecord; ops: CorrectionOp[]; code: ObjectiveErrorCode }[] = [
-    // 378 entries and three adds make 381.
     { name: "log-full", record: crowded, ops: [add("First ok."), add(ECHO), add("Last ok.")], code: "objective-log-full" },
-    // Retired criteria of 1.46 KB and three adds of 1,000 bytes pass 32 KiB.
     { name: "too-large", record: heavy, ops: [sizedOp("", 1), sizedOp(ECHO, 2), sizedOp("", 3)], code: "objective-too-large" },
-    // Five active statements of 1,000 bytes plus two more make a digest over 6 KiB.
     { name: "digest-too-large", record: four, ops: [sizedOp("", 7), sizedOp(ECHO, 8)], code: "objective-digest-too-large" },
-    // A 1,500-byte statement passes the size check, and the record's own rule refuses it.
     { name: "op-refused", record: base, ops: [add("First ok."), add(ECHO + "a".repeat(1500 - ECHO.length)), add("Last ok.")], code: "objective-op-refused" },
   ];
   for (const item of cases) {
@@ -450,7 +433,6 @@ test("targets resolve against the input record, in either order", () => {
   assert.equal(editThenAdd.code, "objective-op-target");
 });
 
-// The ops file's own helpers are exercised above; these two keep the creation path and the digest in view.
 test("creation criteria are version 1 and never stale", () => {
   const inputs: CriterionInput[] = [
     { statement: "Lint passes.", check: { kind: "command", run: LINT }, threshold: pass },
@@ -468,7 +450,6 @@ const REQUEST_TWO = "0b1e2d3c-4a5b-4c6d-8e7f-9a0b1c2d3e4f";
 const COMMIT = "a".repeat(40);
 const COMMIT_TWO = "b".repeat(40);
 
-/** The record with its assumptions replaced and its digest recomputed. The log is kept as it is. */
 function withAssumptions(record: ObjectiveRecord, assumptions: Assumption[]): ObjectiveRecord {
   const body = { ...record, assumptions };
   return { ...body, digest: recordDigest(body) };
@@ -481,7 +462,6 @@ function assumptionOf(id: string, test: Assumption["test"], patch: Partial<Assum
   };
 }
 
-/** Version 1 with a2 (artifact test), a4 (owner test), a5 and a6 (owner tests rating quality below 4 and 3), and a7 (pinned). */
 function register(): ObjectiveRecord {
   const artifact: Assumption["test"] = { kind: "artifact", path: "research/shortlist.md", count: "/items", threshold: { kind: "count", min: 1 } };
   return withAssumptions(v1(), [
@@ -594,7 +574,6 @@ test("a rating stamps the reviewed head and moves unpinned owner tests", () => {
   assert.equal(unnamed.status, 409);
   assert.equal(unnamed.code, "objective-rating-subject");
 
-  // A member's owner test takes no rating: its threshold is the member's, and the assumption waits for adoption.
   const proposed = withAssumptions(start, [...start.assumptions,
     assumptionOf("a8", { kind: "owner", rating: { subject: "quality", below: 1 } }, { origin: "member" }),
     assumptionOf("a9", { kind: "owner", rating: { subject: "tone", below: 5 } }, { origin: "member" })]);

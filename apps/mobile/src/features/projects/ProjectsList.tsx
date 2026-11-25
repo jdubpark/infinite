@@ -9,7 +9,6 @@ import { theme } from "../../theme";
 import { CombineRow } from "./CombineRow";
 import { checkoutsOf, projectSections } from "./model";
 
-/** Manage projects: visible rows, suggested combinations, and hidden projects folded away. */
 export function ProjectsList({ connection }: { connection: Connection }) {
   const router = useRouter();
   const machine = connectionKey(connection);

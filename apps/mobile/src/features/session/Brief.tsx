@@ -43,7 +43,6 @@ import { useControlSync, useSessionControl } from "./useSessionControl";
 import { useSignals } from "./useSignals";
 import { useSteering } from "./useSteering";
 
-/** The session at a glance: what it needs or is doing, then the composer. */
 export function Brief({
   connection,
   id,
@@ -68,7 +67,6 @@ export function Brief({
     intervalMs: 1500,
     deps: [id],
     load: async () => {
-      // A poll that started before a local control change must not undo it.
       const revision = control.generation();
       const session = await api<SessionDetail>(connection, `/sessions/${id}`);
       return { session, revision, receivedAt: Date.now() };
@@ -79,17 +77,13 @@ export function Brief({
   });
   const session = poll?.session ?? null;
   useControlSync(control, poll, stale);
-  // A mission coordinator runs this session. While its provider prompt is open the person may answer in the
-  // terminal, so input and control are offered; otherwise the phone sends no text, keys, stop, resume or control.
   const missionId = session?.managedBy?.missionId;
   const needsYou = session?.attention.state === "needs-you";
   const missionLocked = Boolean(missionId) && !needsYou;
-  // A lease this phone still holds once a mission-run session no longer needs a person is released.
   const { forget } = control;
   useEffect(() => {
     if (missionLocked) forget(true);
   }, [forget, missionLocked]);
-  // `/me` is read once; a failed read is retried after the next good poll.
   const [me, setMe] = useState<Me | null>(null);
   const needMe = me === null && online;
   useEffect(() => {
@@ -108,7 +102,6 @@ export function Brief({
 
   const { events: signals } = useSignals(connection, id);
   const moments = useMemo(() => deriveMoments(signals), [signals]);
-  // Workers that enforce control take input only from the device holding the lease.
   const requiresControl = !missionLocked && session?.capabilities?.inputControl === 1;
   const steering = useSteering(connection, id, refresh, control, {
     draftKey: `${connectionKey(connection)}/${id}/brief`,
@@ -139,18 +132,14 @@ export function Brief({
   const canAnswer = permitted && online && running && controlled;
   const canSteer =
     online && running && me !== null && me.role !== "viewer" && controlled && !missionLocked;
-  // Text and Enter would land in the open dialog and pick its highlighted option.
-  // A running worker without attention cannot report one, so only the terminal types.
   const blocked = session?.attention.prompt
     ? "Answer the prompt above, or reply instead."
     : running && session?.attention.state === "unavailable"
       ? "This session predates the Brief. Use the terminal to type."
       : undefined;
   const canSend = canSteer && !session?.team && !blocked && !steering.busy && Boolean(steering.text.trim());
-  // The composer docks only for a person's own running session; its field (and mic) only once this phone may type.
   const composerShown = me !== null && me.role !== "viewer" && running && !missionId && !session?.team;
   const fieldShown = composerShown && controlled;
-  // Dictation stops whenever its field is locked or leaves the screen, so no capture outlives its stop control.
   const dictation = useDictation({
     connection,
     value: steering.text,
@@ -173,7 +162,6 @@ export function Brief({
     await control.claim(takeover);
     refresh();
   }
-  // The dock names who may type: a claim line until this phone holds the lease, then the field with its release.
   const access: ComposerAccess | undefined = !requiresControl
     ? undefined
     : control.lease
@@ -241,7 +229,6 @@ export function Brief({
             refreshControl={<RefreshControl refreshing={false} onRefresh={refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}
           >
             {prompt && session.team && !missionId ? (
-              // A member's open prompt is approved from its team, beside the coordinator's review.
               <View style={s.pointer}>
                 <View style={s.pointerHead}>
                   <StatusIcon kind="attention" size={16} />
@@ -299,16 +286,13 @@ export function Brief({
             </>}
             {session.team || missionId ? null : <Lifecycle connection={connection} session={session} role={me?.role} online={online} control={control.lease?.id} refresh={refresh} />}
           </ScrollView>
-          {/* One measured dock for every state, so the notice offset follows whatever is docked, or nothing. */}
           <View onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}>
           {missionId ? (
             <>
-              {/* A mission prompt is answered from its card, but the answer still needs this phone's lease. */}
               {needsYou && access && me && me.role !== "viewer" && running ? <ControlDock access={access} /> : null}
               <MissionManagedLine missionId={missionId} machine={connectionKey(connection)} style={s.managedLine} />
             </>
           ) : session.team ? (
-            // A team member is the coordinator's to steer, pause, or stop; direction goes to the team.
             <View style={s.managed}>
               <Glyph name="people" size={16} color={theme.colors.secondaryInk} />
               <Text style={s.managedText}>Run by the coordinator</Text>
@@ -351,10 +335,6 @@ export function Brief({
   );
 }
 
-/**
- * Where the status comes from. Hooks or provider events report the agent's own turns; without
- * them the host can only read the terminal screen, so the state is an inference from what it shows.
- */
 function sourceLabel(hooks: SessionDetail["attention"]["hooks"], source: SessionDetail["attention"]["source"]) {
   return source === "protocol" ? "Provider events" : source === "screen" ? "Read from screen" : hooks === "active" ? "Hooks active" : "No hooks · reads screen";
 }

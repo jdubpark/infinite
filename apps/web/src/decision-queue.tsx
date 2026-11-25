@@ -20,20 +20,14 @@ type QueueAnswerRequest = { requestId: string; revision: number; text: string };
 type KeyboardContext = Parameters<typeof applyDecisionQueueKey>[2];
 
 export type DecisionQueueViewProps = {
-  /** The last queue the host reported, or null before the first read and on a host without the route. It stays while a later read is in flight or fails. */
   queue: DecisionQueue | null;
-  /** When the host reported that queue. */
   readAt: string;
-  /** True while that queue is the host's current answer. Nothing is answered otherwise. */
   current: boolean;
-  /** True once the queue has gone without a refresh for about three seconds. */
   stale: boolean;
   failed: boolean;
   failureSince?: string;
-  /** True when the host has no decision queue route, so there is nothing to retry. */
   unavailable: boolean;
   role: Me["role"];
-  /** False on a host that takes no prompt answers from a client. */
   promptAnswers: boolean;
   projects: Me["projects"];
   refresh: () => void;
@@ -61,11 +55,6 @@ function shorten(text: string) {
   return line.length > 140 ? `${line.slice(0, 139)}…` : line;
 }
 
-/**
- * Every decision that waits on a person, one at a time. Nothing is sent without the person's own action on the
- * decision shown: an option is selected first and sent second, and a recommendation only marks an option.
- * Temporary states change words and disabled states in place; they add and remove no lines.
- */
 export function DecisionQueueView({ queue, readAt, current, stale, failed, failureSince, unavailable, role, promptAnswers, projects, refresh, confirmAnswered, navigateSession, answer }: DecisionQueueViewProps) {
   const api = useApi();
   const machine = useMachines().active.id;
@@ -85,7 +74,6 @@ export function DecisionQueueView({ queue, readAt, current, stale, failed, failu
   const controlSession = useRef(activeSessionId);
   const controlReady = controlSession.current === activeSessionId;
   const answerRequest = queueAnswers.use(`${machine}/${active?.key ?? ""}`);
-  // The last read of the active session. It stays while the next read is in flight, and goes when a read fails.
   const activeDetail = controlReady && activeSessionId && detail?.id === activeSessionId ? detail : null;
 
   function commit(next: DecisionQueueState) {
@@ -169,7 +157,6 @@ export function DecisionQueueView({ queue, readAt, current, stale, failed, failu
     const requestKey = `${machine}/${decision.key}`;
     const previous = queueAnswers.read(requestKey).pending;
     if ((!previous && !text.trim()) || inFlightAnswers.has(requestKey)) return;
-    // An unconfirmed answer is sent again as it was, under its own request id, so the host can answer from its receipt.
     const request = queueAnswers.begin(requestKey, previous ?? { requestId: crypto.randomUUID(), revision: decision.revision, text: text.trim() });
     inFlightAnswers.add(requestKey);
     setSubmittingKey(decision.key);

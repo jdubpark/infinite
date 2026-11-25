@@ -19,7 +19,6 @@ export type SwarmViewProps = {
   me: Me;
   sessions: SwarmSession[];
   teams: SwarmTeam[];
-  /** Freshness of the app's session and team feeds. */
   fresh: boolean;
   stale: boolean;
   seen: string;
@@ -28,13 +27,11 @@ export type SwarmViewProps = {
   openSession(sessionId: string): void;
   openTeam(teamId: string): void;
   openMission(missionId: string): void;
-  /** Starts a session; shown to owners when the host has no sessions at all. */
   onCreate?: () => void;
   focus: boolean;
   setFocus(focus: boolean): void;
 };
 
-/** The subset of GET /machine/resources the meters read. */
 type Resources = { cpu?: { usagePercent: number | null }; memory?: { totalBytes: number; availableBytes: number | null } };
 
 const VIEWS: SwarmViewName[] = ["lanes", "wall", "graph"];
@@ -42,7 +39,6 @@ const VITALS: AgentState[] = ["needs-you", "in-review", "working", "waiting", "q
 const isEditable = (target: EventTarget | null) =>
   target instanceof HTMLElement && (target.matches("input, textarea, select") || target.isContentEditable);
 
-/** The Swarm route: floating glass controls over the Lanes, Wall, or Graph canvas. */
 export function SwarmView(props: SwarmViewProps) {
   const { me, sessions, teams, stale, seen, view, setView, openSession, openTeam, openMission, onCreate, focus, setFocus } = props;
   const api = useApi();
@@ -61,7 +57,6 @@ export function SwarmView(props: SwarmViewProps) {
     if (current()) setResources(data);
   }, 5000, me);
 
-  // `now` moves with each feed update; there is no separate timer.
   const { model, now } = useMemo(() => {
     const now = Date.now();
     const model = buildSwarm({ sessions, teams, missions, now });
@@ -119,7 +114,6 @@ export function SwarmView(props: SwarmViewProps) {
     <div className="sw-top">
       <div className="sw-glass sw-capsule sw-vitals" aria-label="vitals">
         {VITALS.map(state => {
-          // The first slot counts everything that waits on a person: prompts a person owns plus open owner decisions.
           const count = state === "needs-you" ? totals.waitingOnPerson : totals.byState[state];
           const label = state === "needs-you" ? "waiting on a person" : STATE_LABEL[state];
           return <span key={state} className={`sw-vital${count ? "" : " sw-dim"}`} title={label}>
@@ -182,7 +176,6 @@ export function SwarmView(props: SwarmViewProps) {
           {terminalGlyph(selectedUnit.terminal)}
           <span className="sw-inspector-links"><button type="button" className="sw-link" onClick={() => openTeam(selectedUnit.id)}>team</button></span>
         </> : selection?.kind === "area" ? (() => {
-          // An area's ID is `area:<project>:<directory>`.
           const [, project, ...path] = selection.id.split(":");
           return <>
             <span className="sw-inspector-fact" title={path.join(":")}><small>area</small>{path.join(":")}</span>

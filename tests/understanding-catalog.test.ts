@@ -33,7 +33,6 @@ function fixture() {
   const make = () => new UnderstandingCatalog({ config, key, groups });
   const file = join(config.stateDir, "understanding", "catalogs", "workspace.sealed");
   const reopen = make;
-  // Seals a stored catalog whose policy is the given legacy object, bypassing the catalog's own writes.
   const writeStoredPolicy = (policy: Record<string, unknown>) => {
     const stored = { version: 1, workspaceId: "workspace", binding: [], scopes: {}, policyBinding: [], receipts: {}, usedIds: [],
       catalog: { revision: 0, projects: [], features: [], plans: [], componentOverrides: [], policy, coverage: [] } };
@@ -42,7 +41,6 @@ function fixture() {
   return { root, checkout, config, group, file, key, make, reopen, writeStoredPolicy, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-/** Enrolls a second repository in the fixture's group, which changes its repository set. */
 function addRepository(f: ReturnType<typeof fixture>) {
   const path = join(f.root, "second-checkout"); mkdirSync(path);
   execFileSync("git", ["init", "--quiet", path]);
@@ -328,7 +326,6 @@ test("a legacy record with a policy binding was an owner edit: it keeps its flag
     const f = fixture();
     try {
       f.make().mutate("workspace", "policy", undefined, request(0, "update", value), emptyContext);
-      // Strip the stamp as records saved before stamping looked; the next load migrates it and keeps the policy binding.
       const stored = unseal<{ catalog: { policy: Record<string, unknown> } }>(f.key, "understanding-catalog:workspace", readFileSync(f.file, "utf8"));
       delete stored.catalog.policy.editedAt; delete stored.catalog.policy.editedBy;
       writeSealed(f.file, f.key, "understanding-catalog:workspace", stored);
@@ -354,7 +351,6 @@ test("a legacy record nobody edited migrates to the default-on policy and stays 
 test("a record the first default-on build stamped as migrated, with the owner's old policy binding, stays on across a repository set change", () => {
   const f = fixture();
   try {
-    // The owner's edit under the old build wrote the binding; the first stamped build then turned the switches on and stamped "migration".
     f.make().mutate("workspace", "policy", undefined, request(0, "update", { enabled: true, synthesis: false, delivery: false, intervalMinutes: 15, dailyJobLimit: 24 }), emptyContext);
     const stored = unseal<{ policyBinding: unknown[]; catalog: { policy: Record<string, unknown> } }>(f.key, "understanding-catalog:workspace", readFileSync(f.file, "utf8"));
     assert.ok(stored.policyBinding.length > 0);

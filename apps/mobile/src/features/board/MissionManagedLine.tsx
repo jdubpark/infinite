@@ -5,11 +5,6 @@ import { theme } from "../../theme";
 
 export const MISSION_MANAGED_TEXT = "Run by its mission coordinator. Talk to the coordinator from the mission.";
 
-/**
- * The one line that replaces steering for a run or session a mission coordinator runs. Its
- * subteams, their member sessions and the coordinator's own session are read-only to people;
- * tapping the line opens the mission, where the owner talks to the coordinator.
- */
 export function MissionManagedLine({ missionId, machine, style, onLayout }: {
   missionId: string; machine: string; style?: StyleProp<ViewStyle>; onLayout?: (event: LayoutChangeEvent) => void;
 }) {

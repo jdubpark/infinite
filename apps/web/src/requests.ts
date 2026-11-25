@@ -4,7 +4,6 @@ export type CreationRequest = { requestId: string; backend: "infinite" | "cmux";
 export type LifecycleRequest = { requestId: string; action: "stop" | "resume" };
 type RequestState<Request, Result> = { pending?: Request; result?: Result; message: string };
 
-/** In-memory receipts survive screen changes; only their own request may settle them. */
 export function requestStore<Request extends { requestId: string }, Result>() {
   const empty: RequestState<Request, Result> = { message: "" };
   const values = new Map<string, RequestState<Request, Result>>();

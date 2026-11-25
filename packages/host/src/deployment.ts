@@ -45,7 +45,6 @@ export function runtimeSecurity(deployment?: Deployment) {
   };
 }
 
-/** Deployment hygiene, not a defense against an operator who changes the binary. */
 export function assertRunnerDeployment(config: {
   deployment?: Deployment;
   enableDemo: boolean;

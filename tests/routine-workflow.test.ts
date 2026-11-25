@@ -23,7 +23,6 @@ test("queued goal admission rechecks routine authority and the full execution wi
       isProjectBusy: async () => false,
       startGoal: (request, admit) => {
         const queued = goals.create(request, admit);
-        // Invalidate after create was called but before its serialized transaction.
         if (change === "authority") f.config.agents.claude = { command: "changed-provider", args: [] };
         else Date.now = () => started + 2 * 60000;
         return queued;
@@ -44,8 +43,6 @@ test("queued goal admission rechecks routine authority and the full execution wi
   }
 });
 
-// This boundary owns the composition: a due routine must pass through the real
-// goal, worker, permission-decision, host-check, and independent-review services.
 test("an owner-approved routine self-triggers a bounded goal through scoped permission approval and independent review", { timeout: 150000 }, async () => {
   const lineup: TeamLineup = { ...limitLineup, coordinator: {
     ...limitLineup.coordinator, id: "claude-coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong",
@@ -78,7 +75,6 @@ test("an owner-approved routine self-triggers a bounded goal through scoped perm
     assert.equal((await f.host.fetchApi(`/routines/${request.requestId}/pause`, "owner", stale)).status, 409);
     for (const action of ["pause", "resume", "cancel"])
       assert.equal((await f.host.fetchApi(`/routines/${request.requestId}/${action}`, "controller", { requestId: randomUUID(), revision: created.body.revision })).status, 403);
-    // A due trigger survives an API restart; no client posts a goal or team.
     await f.host.stopApi();
     await f.host.start();
     const active = await waitFor(read, value => Boolean(value.activeGoalId), 15000);

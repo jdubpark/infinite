@@ -14,8 +14,6 @@ import type { TrialTeams } from "../packages/host/src/eval-trial-pump.js";
 import { fixture } from "./team-fixture.js";
 import { PROJECT, profile, NOW, setup, STAND_IN_EVAL_UID, alive, fixtureInventory, readFileOr, gatesOnly, host, mine, validated, baseline, jobRow, trialRows, drive, launcherOps, graderRecord, reopen, wrapTeams, sessionOf, memberStarted, teamFixture, serveTeam, type TrialSql } from "./eval-run-fixture.js";
 
-// The trial pump end to end; the rig is in eval-run-fixture.ts.
-
 test("a fixture task is resolved by a member that applies the reference", { timeout: 900_000 }, async () => {
   const s = setup();
   const fx = await teamFixture(s);
@@ -24,7 +22,6 @@ test("a fixture task is resolved by a member that applies the reference", { time
   try {
     await validated(h);
     const jobId = baseline(h, 1, 1);
-    // The run is not listed to the owner at any point, so it is checked each tick while the member is still running.
     let checkedWhileRunning = false;
     await drive(s, h, () => {
       for (const row of trialRows(s, jobId)) {
@@ -46,7 +43,6 @@ test("a fixture task is resolved by a member that applies the reference", { time
     assert.equal(outcome?.experiment_ref, rows[0].trial_id, "the outcome row names the trial");
     assert.deepEqual(readdirSync(join(s.evalRoot, "trials")), [], "the trials root is empty after the job");
     assert.equal(served.service.list().some(view => view.id === rows[0].trial_id), false, "the run is not listed");
-    // The server's session filter (server.ts listSessions): the replay session exists and the filter removes it.
     const sessions = await served.manager.list();
     const learning = sessions.filter(row => learningPurpose(row.purpose));
     assert.ok(learning.length > 0, "the replay session exists");
@@ -74,7 +70,6 @@ test("an empty result, an edit outside the paths, and an undecided permission en
       endings.push(trialRows(s, jobId)[0]?.ending ?? "none");
     }
     assert.deepEqual(endings, ["no-result", "scope-violation", "permission"]);
-    // The team-replay test asserts endings only, so this owner-question check is new: no decision or question event for any run.
     const asked = served.events.filter(event => /decision|question/.test(event.kind));
     assert.deepEqual(asked.map(event => event.kind), [], "no owner question was asked");
   } finally {
@@ -89,7 +84,6 @@ test("a provider limit voids the trial, and it runs again", { timeout: 900_000 }
   const s = setup();
   const fx = await teamFixture(s);
   const served = await serveTeam(s, fx);
-  // The host's clock is real time plus an offset the test raises. The fixture's notice resets within a day.
   let offset = 0;
   const clock = () => new Date(Date.now() + offset).toISOString();
   let stated: string | undefined;
@@ -113,7 +107,6 @@ test("a provider limit voids the trial, and it runs again", { timeout: 900_000 }
     await drive(s, h, () => false, modes, 5_000);
     assert.equal(trialRows(s, jobId).length, 1, "no second trial while the provider is limited");
     assert.equal(jobRow(s, jobId)?.waiting, "provider-limit", "the job waits for the provider");
-    // One minute before the stated reset, the provider is still limited. A reset in the past leaves the 15 minute default, so 10 minutes.
     const resetMs = stated === undefined ? NaN : Date.parse(stated);
     offset = Number.isFinite(resetMs) && resetMs - Date.now() > 120_000 ? resetMs - Date.now() - 60_000 : 10 * 60_000;
     await drive(s, h, () => false, modes, 3_000);
@@ -135,7 +128,6 @@ test("a provider limit voids the trial, and it runs again", { timeout: 900_000 }
 
 test("no trial while the eval identity is busy", { timeout: 300_000 }, async () => {
   const s = setup();
-  // The identity answers busy: the probe is the only thing the test changes.
   const busy: EvalIdentity = { ...s.identity, probe: async () => ({ state: "busy" }) };
   const h = host(s, { identity: busy, ...gatesOnly });
   try {
@@ -149,14 +141,12 @@ test("no trial while the eval identity is busy", { timeout: 300_000 }, async () 
     await h.idle();
     s.r.store.close();
   }
-  // An eval-uid process that stays alive: the account cannot be stopped, so the trial is never started.
   const alive = setup();
   let planted = false;
   const aliveRow: RuntimeProcess = { pid: 2, parent: 1, group: 2, ruid: STAND_IN_EVAL_UID, euid: STAND_IN_EVAL_UID, born: "", state: "S" };
   const hAlive = host(alive, { ...gatesOnly, inventory: async () => (planted ? [aliveRow] : []) });
   try {
     await validated(hAlive);
-    // Start-up has stopped the account while nothing was planted; the row appears only before the trial starts.
     planted = true;
     const jobId = baseline(hAlive, 1, 1);
     await drive(alive, hAlive, () => jobRow(alive, jobId)?.status === "blocked", [], 120_000);
@@ -215,11 +205,9 @@ test("a restart in the middle of a trial voids it", { timeout: 900_000 }, async 
   try {
     await validated(first);
     const jobId = baseline(first, 2, 3);
-    // The member stalls: its run stays live until the host stops.
     await drive(s, first, () => memberStarted(s), ["stall"], 240_000);
     assert.ok(memberStarted(s), "the member started");
     await drive(s, first, () => false, [], 1_500);
-    // A crash between a trial's insert and its start leaves a preparing row; the second slot's row is such a row.
     const preparing = randomUUID();
     s.r.store.write(tx => {
       const running = tx.get<{ task_id: string; config_ref: string; payload: string }>("SELECT task_id, config_ref, payload FROM eval_trials WHERE job_id = ?", jobId);
@@ -245,7 +233,6 @@ test("a restart in the middle of a trial voids it", { timeout: 900_000 }, async 
     assert.ok(!("code" in view) && view.kind === "baseline" && view.trials.void === 1, "the job counts one void trial");
     const run = await served.service.replayState(rows[0].trial_id);
     assert.ok(run === undefined || run.ending === "void-host", "the run ends void-host");
-    // The new host's start-up stops, cleans, and scrubs the account before the second trial's first command.
     assert.deepEqual(launcherOps(s).slice(before, before + 3), ["stop", "clean", "scrub"], "the account is reset before any trial command");
   } finally {
     first.close();
@@ -258,8 +245,6 @@ test("a restart in the middle of a trial voids it", { timeout: 900_000 }, async 
 });
 
 test("a lost replay run voids its trial", { timeout: 900_000 }, async () => {
-  // The run's record is lost while its member runs: replayState reports no run for that trial. The team service has no
-  // call that removes a live run, so the test stands a wrapper over the service for that one answer.
   const s = setup();
   const fx = await teamFixture(s);
   const served = await serveTeam(s, fx);
@@ -291,7 +276,6 @@ test("a lost replay run voids its trial", { timeout: 900_000 }, async () => {
     s.r.store.close();
   }
 
-  // The task's row is deleted while its member runs: the trial voids, and the job does not run the task again.
   const t = setup();
   const tfx = await teamFixture(t);
   const tserved = await serveTeam(t, tfx);
@@ -324,11 +308,9 @@ test("validation and trials share the grader one step at a time", { timeout: 900
   const h = host(s, { teams: () => served.service, sessions: served.manager });
   try {
     await mine(h);
-    // The validation job and the baseline job run together: the baseline waits for the first valid task.
     const created = h.create(PROJECT, { kind: "validate", limits: { maxWallMinutes: 60 } }, randomUUID());
     assert.ok("job" in created, "the validation job is created");
     const validation = created.job.jobId;
-    // The baseline job is created once the first candidate is valid: a baseline created earlier finds no task and completes empty.
     await drive(s, h, () => (h.job(validation) as EvalJobView).counts.valid >= 1 || (h.job(validation) as EvalJobView).status === "completed",
       [], 240_000);
     const jobId = baseline(h, 1, 1);
@@ -338,7 +320,6 @@ test("validation and trials share the grader one step at a time", { timeout: 900
     const record = graderRecord(s);
     const open = new Set<string>();
     const seen = new Set<string>();
-    // A job holds the grader from its receive to its clean. A stop inside that span is the holder's own launcher step.
     for (const [op, job] of record) {
       if (!JOB_OPS.has(op) || job === undefined) continue;
       seen.add(job);
@@ -361,7 +342,6 @@ test("an unavailable store starts no trial", { timeout: 300_000 }, async () => {
   const served = await serveTeam(s, fx);
   const h = host(s, { teams: () => served.service, sessions: served.manager });
   try {
-    // An open baseline job, so only the store check stands between the pump and its start-up commands.
     baseline(h, 1, 1);
     assert.deepEqual(launcherOps(s), [], "creating the job runs no launcher command");
     s.r.store.close();
@@ -383,7 +363,6 @@ test("a graded trial leaves no run record and, later, no session", { timeout: 90
   const s = setup();
   const fx = await teamFixture(s);
   const served = await serveTeam(s, fx);
-  // The host's clock is real time plus an offset the test raises before the sweep.
   let offset = 0;
   const clock = () => new Date(Date.now() + offset).toISOString();
   const h = host(s, { teams: () => served.service, sessions: served.manager, now: clock });
@@ -403,7 +382,6 @@ test("a graded trial leaves no run record and, later, no session", { timeout: 90
     assert.ok(existsSync(directory), "the session directory exists after grading");
     offset += 2 * 3_600_000;
     h.sweep();
-    // The sweep runs in the background; the wait is bounded.
     for (let attempt = 0; attempt < 150 && (existsSync(directory) || sessionOf() !== null); attempt++) {
       await new Promise(resolve => setTimeout(resolve, 200));
     }
@@ -449,7 +427,6 @@ test("a baseline job is created, viewed, and resumed through the host", { timeou
 });
 
 test("an error in the validation step does not stop the trial step", { timeout: 900_000 }, async () => {
-  // The validation job's bundle removal throws on every tick after the job ends, so each validation step fails.
   const s = setup();
   const fx = await teamFixture(s);
   const served = await serveTeam(s, fx);
@@ -477,8 +454,6 @@ test("an error in the validation step does not stop the trial step", { timeout: 
 });
 
 test("a running member is watched while a validation step holds the chain", { timeout: 900_000 }, async () => {
-  // The chain is held in the validation step's bundle removal. The member's start time is moved 11 minutes back (trialMinutes is 10),
-  // so only the pump's own watch can end the run, outside the held chain.
   const s = setup();
   const fx = await teamFixture(s);
   const served = await serveTeam(s, fx);
@@ -490,7 +465,6 @@ test("a running member is watched while a validation step holds the chain", { ti
   const held = new Promise<void>(resolve => { release = resolve; });
   s.grader = { ...inner, remove: async job => {
     const view = ref.h?.job(job);
-    // A running validation job removes its own bundle after each task; only the removal after the job ends is held.
     if (view === undefined || "code" in view || view.kind !== "validate" || view.status !== "completed" || mode === "open") return inner.remove(job);
     if (mode === "refuse") return false;
     entered = true;
@@ -602,7 +576,6 @@ test("a clean that fails at a trial's end is run again before the next trial sta
   const served = await serveTeam(s, fx);
   const inner = s.identity;
   let failedAt = -1;
-  // The first clean after a trial is final runs for real but reports failure, as a clean that leaves the account unsure does.
   s.identity = { ...inner, clean: async () => {
     const done = await inner.clean();
     const ended = s.r.store.read(db => db.get<{ n: number }>("SELECT COUNT(*) AS n FROM eval_trials WHERE state = 'final'"))?.n ?? 0;
@@ -620,7 +593,6 @@ test("a clean that fails at a trial's end is run again before the next trial sta
     assert.ok(failedAt >= 0, "the clean at the first trial's end failed once");
     assert.equal(jobRow(s, jobId)?.status, "completed", "the second trial ran");
     const after = launcherOps(s).slice(failedAt);
-    // A trial's own start resets the account once (stop, clean, scrub). The start-up that the failed clean forces is a second reset, before the next member's receive.
     const receive = after.indexOf("receive");
     assert.ok(receive > 0, "the second trial received its source after the failure");
     assert.deepEqual(after.slice(0, receive), ["stop", "clean", "scrub", "stop", "clean", "scrub"],

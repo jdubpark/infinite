@@ -15,14 +15,6 @@ import type { Config } from "../packages/host/src/types.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { censusPast, earlierProcesses } from "./main-check-earlier.js";
 
-/*
- * The main check on its default ports (INF-388): real Git, real processes, the real census and the real removal, in a
- * temporary directory, with no command prefix and no network. A pass runs on each observation, so a test that waits
- * on retirement reports the mirror's head again, as every mirror fetch does.
- * One thing is taken out of the census: the processes this account could not inspect before the tests began
- * (main-check-earlier.ts). Where there are none, the port is the default one.
- */
-
 const PROCESSES = censusPast(await earlierProcesses());
 
 const KEY = Buffer.alloc(32, 7);
@@ -46,7 +38,6 @@ function gone(pid: number): boolean {
   }
 }
 
-/** A source repository, its bare mirror, a state directory and a team root that does not exist yet. */
 class Sandbox {
   readonly base = realpathSync(mkdtempSync(join(tmpdir(), "main-check-real-")));
   readonly source = join(this.base, "source");
@@ -81,7 +72,6 @@ class Sandbox {
     return git(this.source, "rev-parse", "HEAD");
   }
 
-  /** A new commit on main, fetched into the mirror. */
   push(change: () => void) {
     change();
     this.head = this.commit("next");
@@ -97,7 +87,6 @@ class Sandbox {
     return this.service;
   }
 
-  /** What the project source reports after a fetch, also when the head did not move. */
   fetch(projectId = "alpha") {
     this.service!.observe({ projectId, repository: `example/${projectId}`, baseBranch: "main", head: this.head, fetchedAt: new Date().toISOString() });
   }
@@ -108,7 +97,6 @@ class Sandbox {
     return view;
   }
 
-  /** The record on disk, with what the view leaves out. */
   record(projectId = "alpha"): MainCheckRecord {
     return unseal<MainCheckRecord>(KEY, recordScope(projectId), readFileSync(join(recordDirectory(this.config), `${projectId}.sealed`), "utf8"));
   }
@@ -117,7 +105,6 @@ class Sandbox {
     writeSealed(join(recordDirectory(this.config), `${projectId}.sealed`), KEY, recordScope(projectId), record);
   }
 
-  /** Waits for `ready`. With `drive`, that project's head is reported again every second, so passes keep running. */
   async until(what: string, ready: () => boolean, drive?: string) {
     const deadline = Date.now() + WAIT_MS;
     let next = Date.now() + FETCH_EVERY_MS;
@@ -131,7 +118,6 @@ class Sandbox {
     }
   }
 
-  /** The pid a long command wrote: the sleep's, whether `sh` became the sleep or left it behind. */
   pid(): number | undefined {
     if (!existsSync(this.pidFile)) return undefined;
     const pid = Number.parseInt(readFileSync(this.pidFile, "utf8"), 10);
@@ -144,8 +130,8 @@ class Sandbox {
     await this.service?.close();
     const pid = this.pid();
     if (pid !== undefined && !gone(pid)) {
-      try { process.kill(-pid, "SIGKILL"); } catch { /* Not a group leader, or already gone. */ }
-      try { process.kill(pid, "SIGKILL"); } catch { /* Already gone. */ }
+      try { process.kill(-pid, "SIGKILL"); } catch { }
+      try { process.kill(pid, "SIGKILL"); } catch { }
     }
     rmSync(this.base, { recursive: true, force: true });
   }
@@ -244,7 +230,6 @@ test("d. a real sleep past the time limit is interrupted with time-limit, the pr
     assert.ok(pid !== undefined && gone(pid), "the sleep is gone");
     const directory = sandbox.record().retiring![0]!.directory;
     assert.ok(existsSync(join(sandbox.teams, directory)), "the copy existed");
-    // The halt keeps the head, still charged once, from starting again while the directory retires.
     sandbox.halted = true;
     await sandbox.until("retirement", () => sandbox.view().retiring === 0, "alpha");
     assert.equal(existsSync(join(sandbox.teams, directory)), false);
@@ -269,7 +254,6 @@ test("e. a halt during a real long command interrupts it with halt, gives the ad
     assert.equal(view.last?.reason, "halt");
     assert.deepEqual(view.attempts, [], "the admission was given back");
     assert.ok(gone(pid), "the sleep is gone");
-    // The pass that retires the directory then finds the head due again and records the halt it waits on.
     await sandbox.until("retirement and the halt recorded", () => sandbox.view().retiring === 0 && sandbox.view().waiting === "halt", "alpha");
     assert.deepEqual(sandbox.runDirectories(), []);
     assert.equal(sandbox.view().running, undefined);
@@ -281,7 +265,6 @@ test("e. a halt during a real long command interrupts it with halt, gives the ad
 test("f. entries whose directories never existed leave retiring, with no team root at all", CASE, async () => {
   const sandbox = new Sandbox({ "tracked.txt": "one\n" }, () => [sh("true")]);
   try {
-    // The host stopped between the admission write and the copy, in an earlier boot; and an entry of this boot, retired before.
     sandbox.seed("alpha", {
       version: 1,
       attempts: [{ head: sandbox.head, checks: sandbox.digest, count: 1 }],
@@ -355,7 +338,6 @@ test("h. close during a real long command finishes it as host-stop within the bo
     assert.equal(record.running, undefined);
     assert.equal(record.retiring?.length, 1);
     assert.ok(gone(pid), "the sleep is gone");
-    // The next host start retires the directory; the halt keeps the head from starting again.
     sandbox.halted = true;
     await sandbox.start();
     await sandbox.until("retirement", () => sandbox.view().retiring === 0);
@@ -372,7 +354,6 @@ test("i. a check that leaves a real sleep behind passes when its leader exits; t
     sandbox.fetch();
     await sandbox.until("the result", () => sandbox.view().last !== undefined);
     const pid = sandbox.pid()!;
-    // The leader wrote the pid as it started the sleep.
     const spawned = statSync(sandbox.pidFile).mtimeMs;
     const took = Date.now() - spawned;
     assert.equal(gone(pid), false, `the result came ${took} ms after the sleep started, once it had ended: the check waited for its leftover`);
@@ -384,7 +365,6 @@ test("i. a check that leaves a real sleep behind passes when its leader exits; t
     await sandbox.until("the entry waiting on the sleep", () => sandbox.view().retiring === 1 && sandbox.view().waiting === "processes", "alpha");
     assert.equal(gone(pid), false, "the census found the sleep while it lives");
     assert.deepEqual(sandbox.runDirectories().length, 1, "the copy stays while the sleep lives");
-    // A halt now has nothing of this check to stop, and signals nothing.
     sandbox.halted = true;
     await sandbox.until("the sleep's own exit", () => gone(pid), "alpha");
     const lived = Date.now() - spawned;
@@ -403,20 +383,17 @@ test("j. under a command prefix the removal of a copy ends with its launcher: a 
   try {
     mkdirSync(join(sandbox.teams, directory, "integration"), { recursive: true, mode: 0o700 });
     writeFileSync(join(sandbox.teams, directory, "integration", "left.txt"), "left\n");
-    // A launcher that runs the command, leaves a sleep that holds its output, and exits with the command's status.
     const launcher = join(sandbox.base, "launcher.sh");
     const leaderFile = join(sandbox.base, "leader");
     writeFileSync(launcher, `echo $$ > '${leaderFile}'\n"$@"\nstatus=$?\nsleep 30 &\necho $! > '${sandbox.pidFile}'\nexit $status\n`);
     sandbox.config.teams!.commandPrefix = { command: "sh", args: [launcher] };
     sandbox.seed("alpha", { version: 1, retiring: [{ directory, root: sandbox.teams, witness: { boot: bootId(), processes: [], sessions: [], groups: [] } }] });
-    // The halt keeps the head from starting. This prefix has no census wrapper, so a census that found nothing stands in.
     sandbox.halted = true;
     const processes: MainCheckPorts["processes"] = { table: async () => ({ boot: bootId(), rows: [] }), start: async () => undefined, census: async () => ({ ok: true, findings: [] }) };
     const service = await sandbox.start({ processes });
     await sandbox.until("the launcher's sleep", () => sandbox.pid() !== undefined);
     const pid = sandbox.pid()!;
     const leader = Number.parseInt(readFileSync(leaderFile, "utf8"), 10);
-    // Node reaps the launcher as it emits `exit`, so a reaped launcher means the runner heard its exit.
     await sandbox.until("the launcher's exit", () => gone(leader));
     assert.equal(existsSync(join(sandbox.teams, directory, "integration")), false, "the launcher's rm ran");
     await service.close();

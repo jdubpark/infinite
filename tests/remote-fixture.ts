@@ -11,7 +11,6 @@ export async function listen(server: Server) {
   return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 }
 
-/** Real wire interception models an untrusted relay, without access to endpoint keys. */
 export async function wireProxy(origin: string) {
   const server = createServer();
   const sockets = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES + 1024 });
@@ -68,7 +67,6 @@ export async function wireProxy(origin: string) {
   };
 }
 
-/** `answer` may reply to a request in place of the default echo by returning a JSON body. */
 export async function httpRunner(answer?: (request: { path: string; body: unknown }) => unknown) {
   const token = randomBytes(32).toString("base64url"), machineId = randomUUID();
   const requests: { path: string; authorization?: string; body: unknown }[] = [];

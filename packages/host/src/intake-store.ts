@@ -74,13 +74,13 @@ export class IntakeStore {
     return structuredClone(saved);
   }
 
-  update(issueId: string, change: (record: IntakeRecord) => void): IntakeRecord {
+  update(issueId: string, change: (record: IntakeRecord) => IntakeRecord | void): IntakeRecord {
     const current = this.records.get(issueId);
     if (!current) throw new Error("This issue does not have an intake record.");
     const changed = structuredClone(current);
-    change(changed);
-    if (changed.issueId !== issueId) throw new Error("An intake record issue ID cannot be changed.");
-    const saved = structuredClone(changed);
+    const next = change(changed) ?? changed;
+    if (next.issueId !== issueId) throw new Error("An intake record issue ID cannot be changed.");
+    const saved = structuredClone(next);
     saved.updatedAt = now();
     this.trim(saved);
     writeSealed(join(this.recordsDirectory, `${issueId}.sealed`), this.key, recordScope(issueId), saved);
@@ -89,7 +89,6 @@ export class IntakeStore {
     return structuredClone(saved);
   }
 
-  /** Every record bound to the thread except skipped ones, oldest first, in the same order as `list`. */
   boundTo(thread: IntakeThread): IntakeRecord[] {
     return [...this.records.values()]
       .filter(record => record.state !== "skipped" && record.thread?.channelId === thread.channelId && record.thread.threadTs === thread.threadTs)
@@ -109,20 +108,13 @@ export class IntakeStore {
     return () => { this.listeners.delete(listener); };
   }
 
-  /** Called after each sealed write, with a copy; a listener cannot undo the write or block another listener. */
   private notify(saved: IntakeRecord) {
     for (const listener of this.listeners) {
       try { listener(structuredClone(saved)); }
-      catch { /* A listener cannot undo a persisted write or block another listener. */ }
+      catch {}
     }
   }
 
-  /**
-   * Past 200 inbound entries, the oldest handled ones are dropped; an unhandled entry is still to be applied and stays.
-   * Past 400 messages, the oldest replies (`reply:` keys) that will not be sent again, `sent` or `failed`, are dropped.
-   * A `pending` reply, including one waiting for a retry, stays, and so does every other message: the Slack surface
-   * composes those from their keys, so dropping one would post it again. When nothing more may go, a list stays over its cap.
-   */
   private trim(record: IntakeRecord) {
     let inboundExcess = record.inbound.length - 200;
     if (inboundExcess > 0) record.inbound = record.inbound.filter(entry => {

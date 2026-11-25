@@ -20,7 +20,6 @@ const DAY_MS = 86_400_000;
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const CONFIG = ["-c", "commit.gpgsign=false", "-c", "user.name=Test", "-c", "user.email=test@example.invalid"];
 const ID = "(?:[0-9a-f]{40}|[0-9a-f]{64})";
-/** The five forms of the plan's table, matched against the arguments after the six `-c` pairs, joined by spaces. */
 const FORMS = [
   new RegExp(`^merge-base --is-ancestor ${ID} ${ID}$`),
   new RegExp(`^rev-list --first-parent --max-count=501 ${ID} \\^${ID}$`),
@@ -29,20 +28,14 @@ const FORMS = [
   new RegExp(`^log --no-walk=unsorted --no-show-signature --format=%H --fixed-strings(?: --grep=This reverts commit ${ID}){1,50}(?: ${ID}){1,50}$`),
 ];
 
-/** Day N of the scan clock. Day 0 is 2026-11-13T00:00:00.000Z. */
 const day = (n: number) => new Date(Date.parse("2026-11-13T00:00:00.000Z") + n * DAY_MS).toISOString();
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", [...CONFIG, ...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
 
-/**
- * `lastHeads` holds what the source status holds: the head each project's last fetch returned, and the time of the
- * fetch that first returned it. The next fetch names them as `previousHead` and `previousSince`.
- */
 type Repos = { root: string; mirror: string; seed: string; lastHeads: Map<string, { head: string; since: string }>; close(): void };
 
-/** A bare mirror and a seed clone that pushes to it. Both live in one temporary directory. */
 function repos(): Repos {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "infinite-outcome-scan-")));
   const mirror = join(root, "mirror.git");
@@ -60,7 +53,6 @@ function commitFile(seed: string, name: string, message: string): string {
   return git(seed, "rev-parse", "HEAD");
 }
 
-/** One commit on a branch off main. The seed is left on main. */
 function branchCommit(seed: string, branch: string, name: string): string {
   git(seed, "checkout", "-q", "-b", branch, "main");
   const tip = commitFile(seed, name, `work on ${branch}`);
@@ -81,7 +73,6 @@ function head(repo: string, ref = "main"): string {
   return git(repo, "rev-parse", ref);
 }
 
-/** Bulk commits on main, made with one `git fast-import` stream. */
 function addCommits(seed: string, count: number): void {
   const parts: string[] = [];
   const tip = git(seed, "rev-parse", "main");
@@ -106,7 +97,6 @@ function openStore(root: string, name: string): EvidenceStore {
 
 type Refs = { mergeCommit?: string; reviewedHead?: string; reviewedTree?: string; currentBase?: string };
 
-/** A run approved the day before the first scan: its summary, and one accepted, integrated, frozen row. */
 function recordRun(store: EvidenceStore, runId: string, refs: Refs = {}, projectId = PROJECT): void {
   const summary: RunSummaryRow = {
     runId, source: "test", projectRef: "", revision: 1, status: "approved", blockCode: null, flags: [],
@@ -135,7 +125,6 @@ function outcomeOf(store: EvidenceStore, runId: string): OutcomeRow | undefined 
   return store.read(db => readOutcome(db, `${runId}:member`));
 }
 
-/** A fetch of the mirror's head. Its `previousHead` is the head that this project's previous fetch returned. */
 function fetchOf(repo: Repos, n: number, projectId = PROJECT): MirrorFetch {
   const current = head(repo.mirror);
   const previous = repo.lastHeads.get(projectId);
@@ -146,16 +135,13 @@ function fetchOf(repo: Repos, n: number, projectId = PROJECT): MirrorFetch {
   };
 }
 
-/** A Git runner whose every command fails with exit code 1. */
 const broken: ScanGit = async () => ({ exitCode: 1, output: "", stdout: "", interrupted: false, truncated: false });
 
-/** Moves the seed's main to `sha` and pushes it to the mirror with force. */
 function forceMain(seed: string, sha: string): void {
   git(seed, "reset", "-q", "--hard", sha);
   git(seed, "push", "-q", "--force", "origin", "main");
 }
 
-/** One scan of a fetch that the test built, with the unread fetches the test passes. */
 function scanFetch(
   store: EvidenceStore,
   repo: Repos,
@@ -263,7 +249,6 @@ test("acceptance 6", async () => {
     recordRun(store, "run-f", { mergeCommit: mergeF });
     recordRun(store, "run-g", { mergeCommit: mergeF }, "other");
 
-    // Run E lands on day 0, and its merge is reverted before day 10.
     assert.equal((await scanAt(store, repo, 0)).landings, 2);
     git(repo.seed, "revert", "--no-edit", "-m", "1", mergeE);
     push(repo.seed);
@@ -271,11 +256,9 @@ test("acceptance 6", async () => {
     assert.equal(outcomeOf(store, "run-e")?.held, 0);
     assert.equal(outcomeOf(store, "run-f")?.held, null);
 
-    // Run F's window closes at day 31 with a check at the same head.
     assert.equal((await scanAt(store, repo, 31)).state, "checked");
     assert.equal(outcomeOf(store, "run-f")?.held, 1);
 
-    // A project with no mirror is never scanned.
     const absent = await scanOnce({
       store, git: scanGit(), mirror: join(repo.root, "absent.git"), fetch: fetchOf(repo, 0, "other"), holdDays: 30,
     });
@@ -302,7 +285,6 @@ test("a jump past 500 commits is a gap", async () => {
     push(repo.seed);
     const jump = await scanAt(store, repo, 1);
     assert.deepEqual({ state: jump.state, gap: jump.gap, commits: jump.commits }, { state: "scanned", gap: "bound", commits: 500 });
-    // The scan keeps the newest 500 commits, and it does not claim the range from the previous head.
     const newest = git(repo.mirror, "rev-list", "--first-parent", "--max-count=500", "main").split("\n");
     const bounded = store.read(db => lastScan(db, db.index("project", PROJECT)));
     assert.equal(bounded?.payload.to, head(repo.mirror));
@@ -361,11 +343,9 @@ test("a failed read writes nothing and the next scan resumes", async () => {
     push(repo.seed);
     recordRun(store, "run-r", { mergeCommit: mergeR });
 
-    // Form 4 is a `log`; a refusal there fails the whole scan.
     const refusingLog: ScanGit = (cwd, args) => args[0] === "log"
       ? Promise.resolve({ exitCode: 1, output: "", stdout: "", interrupted: false, truncated: false })
       : scanGit()(cwd, args);
-    // The failed fetch is unread by any recorded scan, so the resumed scan is passed it.
     const unread = fetchOf(repo, 1);
     assert.equal((await scanFetch(store, repo, unread, { git: refusingLog })).state, "failed");
     assert.equal(store.read(db => readScanState(db, db.index("project", PROJECT)))?.seq, 1);
@@ -378,7 +358,6 @@ test("a failed read writes nothing and the next scan resumes", async () => {
     const payload = store.read(db => readSignal(db, landingSignalId("run-r")))?.payload;
     assert.ok(payload?.kind === "landing");
     assert.equal(payload.commit, mergeR);
-    // The resumed scan read every commit after the ledger's own head, so it names that head as its start.
     assert.equal(store.read(db => lastScan(db, db.index("project", PROJECT)))?.payload.from, firstHead);
   } finally {
     store.close();
@@ -396,7 +375,6 @@ test("a scan stops at its command limit", async () => {
     push(repo.seed);
     recordRun(store, "run-r", { mergeCommit: mergeR });
 
-    // A first scan with a landing runs three commands: the list, the commits, and the revert search.
     let calls = 0;
     const counting: ScanGit = (cwd, args) => { calls += 1; return scanGit()(cwd, args); };
     const stopped = await scanOnce({ store, git: counting, mirror: repo.mirror, fetch: fetchOf(repo, 0), holdDays: 30, commandLimit: 2 });
@@ -421,7 +399,6 @@ test("every scan command is a listed form, run in the mirror", async () => {
     branchCommit(repo.seed, "run-r", "r.txt");
     const mergeR = mergeBranch(repo.seed, "run-r");
     push(repo.seed);
-    // Both launchers see the same two fetches: a first scan that lands the run, then new commits with its revert.
     const first = fetchOf(repo, 0);
     git(repo.seed, "revert", "--no-edit", "-m", "1", mergeR);
     push(repo.seed);
@@ -435,7 +412,6 @@ test("every scan command is a listed form, run in the mirror", async () => {
       assert.equal(outcomeOf(store, "run-r")?.held, 0);
     };
 
-    // Through the command prefix, every logged Git command runs in the mirror and is one of the forms.
     const store = openStore(repo.root, "state");
     const receipts = join(repo.root, "receipts");
     mkdirSync(receipts);
@@ -458,7 +434,6 @@ test("every scan command is a listed form, run in the mirror", async () => {
     }
     assert.deepEqual([...used].sort(), [0, 1, 2, 3, 4], "the two scans use all five forms");
 
-    // Through the restricted launcher, the same scans are admitted, and any other mirror command is refused.
     const restrictedStore = openStore(repo.root, "restricted");
     const restrictedReceipts = join(repo.root, "restricted-receipts");
     mkdirSync(restrictedReceipts);
@@ -469,7 +444,6 @@ test("every scan command is a listed form, run in the mirror", async () => {
       assert.ok(!existsSync(refusedFile) || readFileSync(refusedFile, "utf8").trim() === "");
       const catFile = await teamCommand({ command: "git", args: ["cat-file", "-t", "HEAD"] }, repo.mirror, undefined, 30_000, restricted);
       assert.equal(catFile.exitCode, 126);
-      // A scan form is admitted only after the host's six settings: one more setting, or none, is refused.
       const form3 = ["rev-list", "--first-parent", "--max-count=500", second.head];
       const extra = await teamCommand({ command: "git", args: [...teamGitArgs(repo.mirror, []), "-c", "core.pager=cat", ...form3] }, repo.mirror, undefined, 30_000, restricted);
       assert.equal(extra.exitCode, 126);
@@ -504,7 +478,6 @@ test("a head that left and came back is a gap", async () => {
     assert.equal((await scanFetch(storeA, a, fetchOf(a, 0))).landings, 1);
     assert.equal((await scanFetch(storeB, b, fetchOf(b, 0))).landings, 1);
 
-    // Repository A: a revert moves the head to H2, its scan fails, and a forced push restores H1.
     commitFile(a.seed, "revert.txt", "revert");
     push(a.seed);
     const day10 = fetchOf(a, 10);
@@ -517,7 +490,6 @@ test("a head that left and came back is a gap", async () => {
     assert.equal(rowA?.held, null);
     assert.equal(rowA?.flags.includes("scan-gap"), true);
 
-    // Repository B, the control: no failed scan and no forced push.
     assert.equal((await scanFetch(storeB, b, fetchOf(b, 12))).state, "checked");
     assert.equal((await scanFetch(storeB, b, fetchOf(b, 31))).state, "checked");
     assert.equal(outcomeOf(storeB, "run-r")?.held, 1);
@@ -545,7 +517,6 @@ test("a restart with an unread fetch is a gap", async () => {
     push(repo.seed);
     assert.equal((await scanFetch(store, repo, fetchOf(repo, 10), { git: broken })).state, "failed");
     forceMain(repo.seed, h1);
-    // The scanner restarted, so the day 10 fetch is not passed. Its previousHead is H2, not the stored H1.
     const restarted = await scanFetch(store, repo, fetchOf(repo, 12));
     assert.deepEqual({ state: restarted.state, gap: restarted.gap }, { state: "scanned", gap: "rewrite" });
   } finally {
@@ -570,8 +541,6 @@ test("a restart after the head left and came back is a gap", async () => {
     }
     const h1 = head(repo.mirror);
 
-    // Two fetches that no scan recorded: the head moves to a revert, and a forced push restores it. Then the host
-    // restarts, so the scanner holds neither fetch.
     commitFile(repo.seed, "revert.txt", "revert");
     push(repo.seed);
     assert.equal((await scanFetch(store, repo, fetchOf(repo, 10), { git: broken })).state, "failed");
@@ -579,8 +548,6 @@ test("a restart after the head left and came back is a gap", async () => {
     const day11 = fetchOf(repo, 11);
     assert.equal((await scanFetch(store, repo, day11, { git: broken, earlier: [] })).state, "failed");
 
-    // The next fetch names the stored head as its previous head. Only the time since which that head stood, day 11,
-    // says that a fetch after the ledger's last record, day 0, moved it.
     const day12 = fetchOf(repo, 12);
     assert.deepEqual([day12.previousHead, day12.previousSince], [h1, day(11)]);
     const restarted = await scanFetch(store, repo, day12);
@@ -590,7 +557,6 @@ test("a restart after the head left and came back is a gap", async () => {
     assert.equal(row?.held, null);
     assert.equal(row?.flags.includes("scan-gap"), true);
 
-    // Control: a restart with no move. The fetches of day 10 and day 11 saw the stored head and were not recorded.
     fetchOf(control, 10);
     fetchOf(control, 11);
     const quiet = fetchOf(control, 12);
@@ -620,7 +586,6 @@ test("an unread head outside the history is a gap", async () => {
     const h1 = head(repo.mirror);
     const controlH1 = head(control.mirror);
 
-    // Repository: an unread fetch to X, then a forced push that replaces X with H3, which descends from H1 only.
     const x = commitFile(repo.seed, "x.txt", "x");
     push(repo.seed);
     const unreadX = fetchOf(repo, 1);
@@ -632,8 +597,6 @@ test("an unread head outside the history is a gap", async () => {
     const day2 = await scanFetch(store, repo, fetchOf(repo, 2), { earlier: [unreadX] });
     assert.equal(day2.gap, "rewrite");
 
-    // A third repository: X is still an ancestor of the new head, but only through a merge's second parent, so the
-    // first-parent range from H1 does not hold it and its commit was never read.
     const side = repos();
     const sideStore = openStore(side.root, "state");
     try {
@@ -660,7 +623,6 @@ test("an unread head outside the history is a gap", async () => {
       side.close();
     }
 
-    // Control: X stays in the history, so H3 descends from X and from H1.
     commitFile(control.seed, "x.txt", "x");
     push(control.seed);
     const controlX = fetchOf(control, 1);
@@ -687,7 +649,6 @@ test("the scanner remembers the fetches no scan recorded", async () => {
     const h1 = head(repo.mirror);
     assert.equal((await scanFetch(store, repo, fetchOf(repo, 0))).state, "scanned");
 
-    // The first scan the scanner runs fails. Its day 10 fetch is remembered.
     let failing = true;
     const flaky: ScanGit = (cwd, args) => (failing ? broken(cwd, args) : scanGit()(cwd, args));
     const scanner = new BaseScanner({ store, mirrorPath: () => repo.mirror, holdDays: () => 30, git: flaky, log: () => undefined });
@@ -702,9 +663,6 @@ test("the scanner remembers the fetches no scan recorded", async () => {
     assert.equal(newestScan(store)?.gap, "rewrite");
     assert.equal(newestScan(store)?.seq, 2);
 
-    // The head leaves and comes back, and then eight more scans fail at the old head. The two fetches that saw the
-    // move are dropped past the limit, and every fetch that is left names the stored head. Only the time since
-    // which that head stood, later than the ledger's last record, still says that the history between is unknown.
     const fresh = repos();
     const freshStore = openStore(fresh.root, "state");
     try {
@@ -720,7 +678,6 @@ test("the scanner remembers the fetches no scan recorded", async () => {
       remembering.notify(fetchOf(fresh, 1));
       await remembering.settled(PROJECT);
       forceMain(fresh.seed, h0);
-      // A fetch at the stored head is a commit scan here, because an unread head differs. It fails like the others.
       for (let index = 2; index <= 10; index += 1) {
         remembering.notify(fetchOf(fresh, index));
         await remembering.settled(PROJECT);
@@ -730,7 +687,6 @@ test("the scanner remembers the fetches no scan recorded", async () => {
       remembering.notify(fetchOf(fresh, 11));
       await remembering.settled(PROJECT);
       assert.deepEqual([newestScan(freshStore)?.seq, newestScan(freshStore)?.gap], [2, "rewrite"]);
-      // After the recorded scan the list is empty again: the next fetch at the same head is a check.
       remembering.notify(fetchOf(fresh, 12));
       await remembering.settled(PROJECT);
       assert.deepEqual([newestScan(freshStore)?.seq, newestScan(freshStore)?.checkedAt], [2, day(12)]);
@@ -755,23 +711,17 @@ test("fetches that all name the stored head are a check unless the head moved be
     assert.equal((await scanFetch(store, repo, fetchOf(repo, 0))).state, "scanned");
     const unread = [fetchOf(repo, 1), fetchOf(repo, 2)];
 
-    // The same chain is a gap when the first fetch says its previous head stood only since day 1: a fetch after the
-    // ledger's last record, day 0, moved the head there.
     const moved = await scanFetch(store, repo, fetchOf(repo, 3), { earlier: [{ ...unread[0]!, previousSince: day(1) }, unread[1]!] });
     assert.deepEqual({ state: moved.state, gap: moved.gap }, { state: "scanned", gap: "rewrite" });
-    // With the head standing since day 0, which the day 3 scan recorded, the chain is a check.
     const kept = await scanFetch(store, repo, fetchOf(repo, 6), { earlier: [fetchOf(repo, 4), fetchOf(repo, 5)] });
     assert.equal(kept.state, "checked");
     assert.equal(newestScan(store)?.checkedAt, day(6));
 
-    // The rule holds between two unread fetches too. The second says its previous head stood only since its own fetch,
-    // later than the first one's: a fetch between the two moved the head and is missing from the chain.
     const before = fetchOf(repo, 6.25);
     const after = { ...fetchOf(repo, 6.5), previousSince: day(6.5) };
     const missing = await scanFetch(store, repo, fetchOf(repo, 6.75), { earlier: [before, after] });
     assert.deepEqual({ state: missing.state, gap: missing.gap }, { state: "scanned", gap: "rewrite" });
 
-    // A chain in the wrong order does not continue the stored head.
     const first = fetchOf(repo, 7);
     commitFile(repo.seed, "next.txt", "next");
     push(repo.seed);
@@ -780,14 +730,12 @@ test("fetches that all name the stored head are a check unless the head moved be
     const swapped = await scanFetch(store, repo, third, { earlier: [second, first] });
     assert.equal(swapped.gap, "rewrite");
 
-    // A fetch that names no previous head, or no time since which it stood, cannot continue a stored head.
     const { previousHead: _head, ...headless } = fetchOf(repo, 10);
     const noPrevious = await scanFetch(store, repo, headless);
     assert.deepEqual({ state: noPrevious.state, gap: noPrevious.gap }, { state: "scanned", gap: "rewrite" });
     const { previousSince: _since, ...sinceless } = fetchOf(repo, 11);
     const noSince = await scanFetch(store, repo, sinceless);
     assert.deepEqual({ state: noSince.state, gap: noSince.gap }, { state: "scanned", gap: "rewrite" });
-    // The same fetch with both values is a check.
     assert.equal((await scanFetch(store, repo, fetchOf(repo, 12))).state, "checked");
   } finally {
     store.close();
@@ -811,12 +759,10 @@ test("a notice replaced during a scan stays unread", async () => {
     };
     const scanner = new BaseScanner({ store, mirrorPath: () => repo.mirror, holdDays: () => 30, git: gated, log: () => undefined });
 
-    // Scan A reads a new commit and waits at its first Git command.
     commitFile(repo.seed, "a.txt", "a");
     push(repo.seed);
     const headA = head(repo.mirror);
     scanner.notify(fetchOf(repo, 1));
-    // While it waits: the head moves to a revert, a forced push restores it, and one more fetch sees no move.
     commitFile(repo.seed, "revert.txt", "revert");
     push(repo.seed);
     scanner.notify(fetchOf(repo, 2));
@@ -826,7 +772,6 @@ test("a notice replaced during a scan stays unread", async () => {
     release();
     await scanner.settled(PROJECT);
 
-    // Scan A is recorded, and the two replaced notices are still unread: the last scan cannot be a check.
     const newest = newestScan(store);
     assert.deepEqual([newest?.seq, newest?.gap, newest?.at], [3, "rewrite", day(4)]);
     const scans = store.read(db => db.all<{ seq: number; gap: string | null }>("SELECT seq, gap FROM base_scans ORDER BY seq"));
@@ -847,8 +792,6 @@ test("a notice that arrives as a scan ends is scanned", async () => {
     const first = fetchOf(repo, 0);
     const second = fetchOf(repo, 1);
 
-    // The first scan fails, and its log line is written just before the scanner looks for a pending notice. A notice
-    // queued from there arrives after that look and before the scan's promise has settled.
     let failing = true;
     const flaky: ScanGit = (cwd, args) => (failing ? broken(cwd, args) : scanGit()(cwd, args));
     const scanner: BaseScanner = new BaseScanner({
@@ -876,7 +819,6 @@ test("a fetch whose head is not a commit id is ignored", async () => {
     await scanner.settled(PROJECT);
     assert.equal(newestScan(store)?.seq, 1);
 
-    // It is neither scanned nor kept as an unread fetch, so the next fetch still continues the stored head.
     scanner.notify({ ...fetchOf(repo, 1), head: "refs/heads/main" });
     await scanner.settled(PROJECT);
     scanner.notify(fetchOf(repo, 2));
@@ -895,7 +837,6 @@ test("a rescan of older history counts no revert from before the landing", async
   try {
     commitFile(repo.seed, "base.txt", "base");
     const tip = branchCommit(repo.seed, "run-r", "r.txt");
-    // A commit on main that names the run's head, before the merge that lands it.
     git(repo.seed, "commit", "-q", "--allow-empty", "-m", `Undo an earlier try\n\nThis reverts commit ${tip}.`);
     const merge = mergeBranch(repo.seed, "run-r");
     push(repo.seed);
@@ -904,7 +845,6 @@ test("a rescan of older history counts no revert from before the landing", async
     assert.deepEqual({ landings: landed.landings, reverts: landed.reverts }, { landings: 1, reverts: 0 });
     const reverts = () => store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM outcome_signals WHERE kind='revert'"))?.n;
 
-    // One more commit, and a fetch that cannot continue the ledger: the scan rereads the whole history.
     commitFile(repo.seed, "next.txt", "next");
     push(repo.seed);
     const { previousSince: _first, ...unproven } = fetchOf(repo, 1);
@@ -913,7 +853,6 @@ test("a rescan of older history counts no revert from before the landing", async
     assert.equal(reverts(), 0);
     assert.equal(outcomeOf(store, "run-r")?.held, null);
 
-    // A revert after the landing commit is still found by such a scan.
     git(repo.seed, "revert", "--no-edit", "-m", "1", merge);
     push(repo.seed);
     const { previousSince: _second, ...again } = fetchOf(repo, 2);
@@ -941,20 +880,16 @@ test("commits pushed back after a rewind are no reverts of an earlier landing", 
       recordRun(store, "run-r", { reviewedHead: tip });
       assert.deepEqual((await scanFetch(store, repo, fetchOf(repo, 0))).landings, 1);
 
-      // The base is rewound below the landing commit. The scan cannot see the landing commit, so it matches nothing.
       forceMain(repo.seed, a0);
       const rewound = await scanFetch(store, repo, fetchOf(repo, 1));
       assert.deepEqual({ gap: rewound.gap, reverts: rewound.reverts }, { gap: "rewrite", reverts: 0 });
 
-      // The old history comes back, all of it or only the part before the landing. It is a scan of new commits from
-      // the rewound head, and it lists a commit from before the landing that names the landed head.
       git(repo.seed, "reset", "-q", "--hard", pushed === "all" ? merge : x);
       push(repo.seed);
       const back = await scanFetch(store, repo, fetchOf(repo, 2));
       assert.deepEqual({ state: back.state, gap: back.gap, reverts: back.reverts }, { state: "scanned", gap: null, reverts: 0 }, pushed);
       assert.equal(store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM outcome_signals WHERE kind='revert'"))?.n, 0, pushed);
 
-      // The window had a rewrite inside it, so it closes unknown, with the flag.
       assert.equal((await scanFetch(store, repo, fetchOf(repo, 31))).state, "checked");
       const row = outcomeOf(store, "run-r");
       assert.deepEqual([row?.held, row?.flags.includes("scan-gap")], [null, true], pushed);
@@ -973,11 +908,8 @@ test("older history lands a tree only on the reviewed head", async () => {
     const c2 = commitFile(repo.seed, "b.txt", "two");
     push(repo.seed);
     const treeOf = (commit: string) => git(repo.seed, "rev-parse", `${commit}^{tree}`);
-    // R restores C1's tree but its base is C2, which is later than C1: no landing.
     recordRun(store, "run-r", { reviewedTree: treeOf(c1), currentBase: c2 });
-    // S reviewed C2 itself, with its base C1: it lands on C2.
     recordRun(store, "run-s", { reviewedHead: c2, reviewedTree: treeOf(c2), currentBase: c1 });
-    // U has C1's tree too, and a base that is not among the scanned commits: a scan of older history cannot place it.
     recordRun(store, "run-u", { reviewedTree: treeOf(c1), currentBase: "9".repeat(40) });
 
     const result = await scanFetch(store, repo, fetchOf(repo, 0));
@@ -990,7 +922,6 @@ test("older history lands a tree only on the reviewed head", async () => {
     assert.ok(landed?.kind === "landing");
     assert.deepEqual([landed.method, landed.commit], ["tree-equal", c2]);
 
-    // A new commit with C1's tree arrives after the ledger's head. A scan of new commits only lands both runs on it.
     git(repo.seed, "revert", "--no-edit", c2);
     push(repo.seed);
     const c3 = head(repo.mirror);

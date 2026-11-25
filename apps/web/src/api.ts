@@ -27,7 +27,6 @@ export type Session = {
   execution?: { location: "laptop" | "cloud"; state: "connecting" | "online" | "offline" | "preparing" | "paused"; cloudReady: boolean; checkpoint?: { id: string; capturedAt: string }; reason?: string; reconciliation?: "available" };
   attention?: Attention;
   usage?: UsageTotals;
-  /** Set while a mission coordinator runs this session; people may only answer its provider prompts. */
   managedBy?: { kind: "mission"; missionId: string; teamId?: string };
 };
 export type DecisionRecommendation = { answers: string[]; reason: string; outcome?: "matched" | "different" | "other" };
@@ -63,11 +62,8 @@ export type LinearTrackingView = {
 export type UsageTotals = { cost: number; tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }; messages: number; pricing: { configured: number; provider: number; unknown: number } };
 export type TeamUsage = { total: UsageTotals; byProfile: Record<string, UsageTotals>; byProvider: Partial<Record<string, UsageTotals>>; unmeasuredMembers: number };
 export type UsageBudget = { usd: number; period: "day" | "week" | "month" };
-/** A dollar figure plus the count of steps it could not price. A lower bound whenever `unpriced > 0`. */
 export type Money = { usd: number; unpriced: number };
-/** Only a provider's own API fills this in; it stays null otherwise and renders "—". */
 export type Balance = { amount: number; currency: string; asOf: string; stale: boolean } | null;
-/** `planSource` says whether a subscription fee is the config default or an owner edit; older hosts omit it. */
 export type AccountView = { id: string; kind: "metered" | "subscription"; month?: Money; planUsd?: number; planSource?: "config" | "owner"; balance: Balance };
 export type UsageSummary = {
   period: { start: string; end: string };
@@ -76,7 +72,6 @@ export type UsageSummary = {
   accounts: AccountView[];
 };
 export type UsageDaily = { tz: string; accounts: string[]; days: { date: string; usd: number; byAccount: Record<string, number> }[] };
-/** `unmeasured` counts sessions and briefing runs that produced no usage data; older hosts omit it. */
 export type UsageProjectRow = { id: string; name: string; total: Money; month: Money; spark: number[]; unmeasured?: number };
 export type UsageProject = {
   id: string; name: string; total: Money; unmeasured?: number;
@@ -100,10 +95,8 @@ export type ModelRow = {
 };
 export type Suggestion = { text: string; profileId: string; comparedTo: string; role: string; n: [number, number] };
 export type Scorecard = { rubricVersion: 1; minAttempts: number; rows: ModelRow[]; suggestions: Suggestion[] };
-/** A host-level record that a provider's account was seen at its limit. The reset time is the provider's own statement. */
 export type ProviderLimit = { provider: string; detectedAt: string; resetsAt?: string; expiresAt: string; sessionId: string; runId?: string; confidence: "corroborated" };
 export type LimitSwitch = { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string };
-/** Clock time as HH:MM with a zone abbreviation, in the viewer's time zone. */
 export const clock = (iso: string) => new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit", hour12: false, timeZoneName: "short" }).format(new Date(iso));
 export type Me = {
   role: "owner" | "controller" | "viewer";
@@ -111,7 +104,6 @@ export type Me = {
   machine?: { id: string; label: string; environment: string };
   backends?: ("infinite" | "cmux")[];
   backendProviders?: { infinite: string[]; cmux?: string[] };
-  /** `swarmContext` marks a host that serves the code map and touch endpoints the Swarm graph reads. */
   capabilities?: { signals: boolean; answer: boolean; push: boolean; dictation?: { model: string }; swarmContext?: 1 };
   providers: string[];
   projects: { id: string; name: string; linear?: { enabled: boolean }; team?: { establishChecks?: true; checks: { command: string; args: string[] }[]; setup?: { command: string; args: string[] } } }[];
@@ -121,10 +113,8 @@ export type Me = {
   providerLimits?: ProviderLimit[];
   usage?: { enabled: boolean; budgets: Partial<Record<string, UsageBudget>> };
   terminal?: { stream: boolean; duplex: boolean; raw: boolean; snapshot?: boolean; control?: boolean };
-  /** `decisionLog` marks a host that serves the owner's permission decision log. */
   permissions?: { workspaceDelegation?: number; decisionLog?: number };
 };
-// One identity per running browser tab, independent of its shared login cookie.
 const clientId = crypto.randomUUID();
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string, readonly control?: ControlLease | null) {
@@ -135,7 +125,6 @@ export function isControlRefusal(error: unknown): error is ApiError {
   return error instanceof ApiError && error.status === 409 &&
     (error.code === "control-busy" || error.code === "control-lost");
 }
-/** The host refused input for a session or team that a mission coordinator runs. Its error text is the message to show. */
 export function isMissionManaged(error: unknown): error is ApiError {
   return error instanceof ApiError && error.status === 409 && error.code === "mission-managed";
 }
@@ -188,7 +177,6 @@ export function postDecisionAnswer<T>(request: Api, answerPath: string, body: { 
   return request<T>(path, body);
 }
 const sessionReaders = new WeakMap<Api, ReturnType<typeof sessionListReader<Session>>>();
-/** The host's session list. Each read names the version of the rows this API read last, so an unchanged list answers with its version alone. */
 export function readSessions(api: Api): Promise<Session[]> {
   let read = sessionReaders.get(api);
   if (!read) sessionReaders.set(api, read = sessionListReader<Session>());
@@ -214,7 +202,6 @@ export type MessagesPage = { messages: ChatMessage[]; cursor: string | number; m
 export type ProjectFile = { path: string; name: string; text?: string; mimeType: string; size: number; modifiedAt: string; base64?: string };
 export type PendingGeneration = { id: string; capturedAt: string; receivedAt: string; reason: "session-running" | "cloud-changed" | "apply-failed" | "awaiting-apply"; category?: string; message?: string };
 export type ProjectSyncStatus = { projectId: string; lastSyncedAt?: string; appliedAt?: string; appliedManifest?: string; pendingGeneration?: PendingGeneration };
-/** Why a laptop generation waits, in the words the Create screen shows. */
 export function pendingLabel(pending: PendingGeneration) {
   if (pending.reason === "session-running") return "a session is running";
   if (pending.reason === "cloud-changed") return "cloud files changed";
@@ -222,10 +209,8 @@ export function pendingLabel(pending: PendingGeneration) {
   return "no session is running; ready to apply";
 }
 export type SourcePendingStatus = { reason: "session-running" | "fetch-failed" | "diverged" | "apply-failed"; category?: string; message?: string; since: string };
-/** Where a workspace's files come from: the laptop, or a GitHub base branch the host mirrors. */
 export type ProjectSourceStatus = { mode: "github" | "laptop"; repository?: string; baseBranch?: string; mirrorHead?: string; appliedHead?: string; fetchedAt?: string; appliedAt?: string; pending?: SourcePendingStatus; savedBranches?: string[] };
 export type ProjectDetail = { id: string; name: string; sync: ProjectSyncStatus; source?: ProjectSourceStatus };
-/** One line for a GitHub-tracked workspace, worded like the CLI status line. */
 export function sourceLabel(source: ProjectSourceStatus, now = Date.now()) {
   const head = source.appliedHead ? source.appliedHead.slice(0, 8) : "none";
   const parts = [`Follows GitHub ${source.repository}@${source.baseBranch} · host ${head} · fetched ${ago(source.fetchedAt, now)}`];
@@ -244,7 +229,6 @@ export function ago(iso?: string, now = Date.now()) {
   return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`;
 }
 
-/** One cycle's agent assessment as the host reports it: ids, enumerations, and counts only. */
 export type AssessedState = "met" | "not-met" | "inconclusive";
 export type ComposedState = AssessedState | "pending-owner";
 export type VerdictCounts = { met: number; notMet: number; inconclusive: number; pendingOwner: number };
@@ -254,7 +238,6 @@ export type GoalAssessment = {
   reason?: "no-independent-evaluator" | "evaluator-unavailable" | "record-unavailable" | "context-too-large";
   counts: VerdictCounts; criteria: { id: string; state: ComposedState }[]; at: string; progress: number;
 };
-/** One row of GET /api/goals/:id/verdicts. */
 export type GoalVerdictView = {
   cycle: number; teamId: string; verdictId: string; kind: "reviewed" | "no-change"; head: string; at: string;
   label: "Agent assessment, provisional";

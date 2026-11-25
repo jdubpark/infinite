@@ -1,9 +1,5 @@
 import { ROLE_NAME, STATE_LABEL, type AgentState, type RoleCode } from "./types";
 
-/**
- * One mark per agent state. Shape and colour carry the state together, so the
- * picture still reads without colour. Colours come from `--sw-*` variables in swarm.css.
- */
 export function StateMark({ state, size = 14, pulse = false, title }: { state: AgentState; size?: number; pulse?: boolean; title?: string }) {
   const label = title ?? STATE_LABEL[state];
   return <svg className={`sw-mark sw-mark-${state}${pulse && state === "working" ? " sw-pulse" : ""}`} width={size} height={size} viewBox="0 0 16 16" role="img" aria-label={label}>
@@ -19,12 +15,10 @@ export function StateMark({ state, size = 14, pulse = false, title }: { state: A
   </svg>;
 }
 
-/** Two-letter role code in the monospace face. */
 export function RoleChip({ role }: { role: RoleCode }) {
   return <abbr className="sw-role" title={ROLE_NAME[role]}>{role}</abbr>;
 }
 
-/** The accessible name of an agent mark: role, state, and the tool in flight when there is one. */
 export function agentName(agent: { role: RoleCode; state: AgentState; tool?: string; earlier?: boolean; limited?: boolean; stalled?: boolean }) {
   return [ROLE_NAME[agent.role], STATE_LABEL[agent.state], agent.tool ? `tool ${agent.tool}` : "", agent.earlier ? "earlier revision" : "",
     agent.limited ? "provider limit" : "", agent.stalled ? "stalled" : ""].filter(Boolean).join(", ");

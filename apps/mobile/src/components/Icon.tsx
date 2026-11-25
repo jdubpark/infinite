@@ -2,10 +2,6 @@ import { StyleSheet, Text, View, type ViewStyle } from "react-native";
 import type { StatusKind } from "../status";
 import { theme } from "../theme";
 
-/**
- * Line icons drawn from views, so they need no font or native module and stay crisp at any
- * density. Each sits in a `size` square; pair an icon-only control with an accessibility label.
- */
 export type GlyphName =
   | "back" | "forward" | "down" | "up" | "plus" | "close" | "check" | "search" | "terminal"
   | "more" | "send" | "people" | "target" | "stack" | "pause" | "play" | "stop" | "dot" | "chart" | "mic";
@@ -101,10 +97,6 @@ function Person({ size, color, w, style }: { size: number; color: string; w: num
   </View>;
 }
 
-/**
- * Linear-style work states. `progress` fills the ring by quarters; the label beside the icon
- * still carries the meaning (DESIGN.md: state with words).
- */
 const RING: Record<StatusKind, string> = {
   backlog: theme.colors.placeholder, todo: theme.colors.placeholder, progress: theme.colors.running,
   review: theme.colors.forest, done: theme.colors.forest, attention: theme.colors.warningInk,
@@ -135,7 +127,6 @@ export function StatusIcon({ kind, fraction = 0.5, size = 16 }: { kind: StatusKi
   </View>;
 }
 
-/** A pie in quarter steps, clockwise from twelve o'clock; any started work shows one quarter. */
 function Quarters({ size, color, fraction }: { size: number; color: string; fraction: number }) {
   const count = fraction <= 0 ? 0 : Math.min(4, Math.max(1, Math.round(fraction * 4)));
   const half = size / 2;

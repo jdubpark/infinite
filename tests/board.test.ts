@@ -43,7 +43,6 @@ test("the board maps missions, standalone teams, and goals to columns and hides 
   const goals = [goal("running", 15), goal("paused", 16), goal("needs-input", 17), goal("blocked", 18), goal("ready-for-review", 19),
     goal("no-opportunity", 20), goal("limit-reached", 21), goal("achieved", 22), goal("cancelled", 23)];
   const containing = (projectId: string) => ["api", "web"].includes(projectId) ? { id: "shop", name: "Shop" } : undefined;
-  // A mission that pinned "api" before folding follows the project that holds "api" now.
   const legacy = mission("working", 30, { groupId: "api", groupName: "API", repoProjectIds: ["api"], title: "Legacy mission" });
   const legacyRow = missionBoard([legacy], [], [], projects, containing).items[0]!;
   assert.equal(legacyRow.groupId, "shop");
@@ -88,11 +87,9 @@ test("the board maps missions, standalone teams, and goals to columns and hides 
 test("the board numbers repeated attempts of the same work and marks stopped older ones superseded", () => {
   const containing = () => undefined;
   const objective = "Rework the project page";
-  // The owner sent the same mission three times; the second copy differs only in whitespace.
   const first = mission("cancelled", 1, { objective }), second = mission("blocked", 2, { objective: `  Rework the\n project page ` }), third = mission("blocked", 3, { objective });
   const other = mission("working", 4, { objective: "A different mission" });
   const elsewhere = mission("blocked", 5, { objective, groupId: "docs", groupName: "Docs", repoProjectIds: ["docs"] });
-  // An older attempt that is still under way must stay visible, so it is not superseded.
   const running = team("implementing", 6, { objective }), rerun = team("blocked", 7, { objective });
   const goals = [goal("blocked", 8, { objective } as Partial<ProductGoal>), goal("blocked", 9, { objective } as Partial<ProductGoal>)];
   const { items } = missionBoard([third, other, first, elsewhere, second], [rerun, running], goals, projects, containing);
@@ -160,7 +157,6 @@ test("mission controls are owner-only and a create retry returns the recorded mi
   mkdirSync(repo); mkdirSync(receipts, { mode: 0o700 });
   execFileSync("git", ["init", "--initial-branch=main"], { cwd: repo, stdio: "ignore" });
   const strong = { provider: "claude" as const, model: "claude-opus-5-5", effort: "xhigh" as const, tier: "strong" as const };
-  // The coordinator fixture holds until released, so the mission stays live while the routes are exercised.
   const host = await startHost({ config: {
     agents: { claude: { command: process.execPath, args: [resolve("tests/fixtures/mission-agent.mjs"), "mission", receipts, "claude"] } },
     projects: [{ id: "repo", name: "Repo", path: repo, team: { checks: [{ command: process.execPath, args: ["-e", "0"] }] } }],

@@ -1,8 +1,3 @@
-/**
- * The phone's reading of a team's Jevcode summaries and agent logs. Like model.ts, this module has
- * no React Native imports so its choices can be tested under Node beside the web and CLI versions.
- */
-
 export type TeamPerson = {
   memberId: string;
   sessionId: string;
@@ -67,7 +62,6 @@ export function briefTime(status: TeamBriefView | undefined): string {
   return status?.summary?.repository?.generatedAt || status?.summary?.at || "";
 }
 
-/** Prefer the coordinator's written brief, then the newest written brief, then the coordinator's status. */
 export function chooseBrief(rows: { sessionId: string; status: TeamBriefView }[], coordinatorSessionId?: string) {
   const written = rows.filter(row => briefText(row.status));
   const coordinator = rows.find(row => row.sessionId === coordinatorSessionId);
@@ -77,7 +71,6 @@ export function chooseBrief(rows: { sessionId: string; status: TeamBriefView }[]
   return newest ?? coordinator ?? rows[0];
 }
 
-/** Terminal text with color codes removed. Trailing blank lines go before the last `maxLines` are kept, so a bottom prompt stays in view. */
 export function plainScreen(value: unknown, maxLines = 24): string {
   const raw = String(value ?? "");
   const plain = raw
@@ -99,7 +92,6 @@ export function controlEventText(event: { type?: string; data?: Record<string, u
   return typeof detail === "string" && detail.trim() ? `${label}: ${detail}` : label;
 }
 
-/** "4 min ago" for a summary's age; empty when the time is unknown. */
 export function relativeAge(iso: string | undefined, now: number): string {
   const time = Date.parse(iso ?? "");
   if (Number.isNaN(time)) return "";
@@ -109,4 +101,3 @@ export function relativeAge(iso: string | undefined, now: number): string {
   if (minutes < 48 * 60) return `${Math.round(minutes / 60)} h ago`;
   return `${Math.round(minutes / 1440)} d ago`;
 }
-

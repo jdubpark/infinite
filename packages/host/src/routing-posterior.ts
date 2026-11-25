@@ -1,10 +1,7 @@
 import { rowUse } from "./outcome-cells.js";
 import type { Beta, LevelName, LevelRecord, ProfilePosterior, RoutingEvidenceRow } from "./routing-types.js";
 
-/** Pure posterior. No I/O, no clock: the caller passes `now`. Spec Parts 3 and 4, reward version 1. */
-
 export const HALF_LIFE_DAYS = 30, MAX_AGE_DAYS = 180, LEVEL_STRENGTH = 20, EARLIER_MASS = 10;
-/** Every row is coordinator-chosen in step 1 (owner decision 5). */
 export const CHOSEN_WEIGHT = 0.5;
 
 export type RoutingTarget = { projectRef: string; areaRef: string; kind: string | null; featureVersion: number; featureMapRef: string; point: "start" | "escalation" };
@@ -26,24 +23,20 @@ function emptyTally(): Tally {
   };
 }
 
-/** Days from the attempt's end to `now`. An end after `now` is age 0. */
 function ageDays(endedAt: string, now: string): number {
   return Math.max(0, (Date.parse(now) - Date.parse(endedAt)) / DAY_MILLISECONDS);
 }
 
-/** Part 3's first matching line. `null` means no reward observation. */
 function rewardOf(row: RoutingEvidenceRow, levels: { accepted: 0 | 1 | null; firstPass: 0 | 1 | null; held: 0 | 1 | null }, nonIntegrated: boolean): { r: number; w: number } | undefined {
   if (nonIntegrated) return { r: 0, w: 1 };
   if (levels.accepted === 0) return { r: 0, w: 1 };
   if (levels.accepted === null) return undefined;
   if (levels.held === 0) return { r: 0, w: 1 };
-  // While `held` is unknown the last three lines count at half weight.
   const provisional = levels.held === null ? 0.5 : 1;
   if (row.ownerScore !== null) return { r: (row.ownerScore - 1) / 4, w: provisional };
   return { r: levels.firstPass === 1 ? 1 : 0.5, w: provisional };
 }
 
-/** The observation of one row, or undefined when the row gives none: not counted, too old, or without `endedAt`. */
 export function observe(row: RoutingEvidenceRow, now: string, chosenWeight: number): Observation | undefined {
   const use = rowUse(row, "decision");
   if (use.kind !== "counted" || row.endedAt === null) return undefined;
@@ -54,13 +47,11 @@ export function observe(row: RoutingEvidenceRow, now: string, chosenWeight: numb
   const observation: Observation = {};
   const reward = rewardOf(row, use.levels, nonIntegrated);
   if (reward !== undefined) observation.reward = { r: reward.r, w: reward.w * weight };
-  // A counted row that ended without integration needed a rescue. Otherwise the rescue follows firstPass.
   if (nonIntegrated) observation.rescue = { x: 0, w: weight };
   else if (use.levels.firstPass !== null) observation.rescue = { x: use.levels.firstPass, w: weight };
   return observation.reward || observation.rescue ? observation : undefined;
 }
 
-/** The level a row of the target's point and source lands in. Other projects are tenant; the cell needs every key to match. */
 function levelOf(row: RoutingEvidenceRow, target: RoutingTarget): LevelName {
   if (row.projectRef !== target.projectRef) return "tenant";
   const inCell = row.areaRef === target.areaRef && row.kind === target.kind
@@ -68,13 +59,11 @@ function levelOf(row: RoutingEvidenceRow, target: RoutingTarget): LevelName {
   return inCell ? "cell" : "project";
 }
 
-/** Chains the levels from tenant down to cell. Each child takes its parent's mean with strength at most 20. */
 function chain(tally: Tally): LevelRecord[] {
   const records: LevelRecord[] = [];
   let parent: Beta | undefined;
   for (const level of LEVELS) {
     const { observed, earlier } = tally[level];
-    // Earlier evidence has a mass of at most EARLIER_MASS, and it enters as labelled priors P and Q.
     const earlierMass = earlier.success + earlier.failure;
     const scale = earlierMass > EARLIER_MASS ? EARLIER_MASS / earlierMass : 1;
     const priorSuccess = scale * earlier.success, priorFailure = scale * earlier.failure;
@@ -105,10 +94,6 @@ function chain(tally: Tally): LevelRecord[] {
   return records;
 }
 
-/**
- * The posterior of one profile at one target. The result is a function of the row set: rows are sorted by outcome id first.
- * A row whose outcome id is in `routerChosen` (an applied `auto` start) has who-chose weight 1; every other row has `chosenWeight`.
- */
 export function posterior(
   rows: readonly RoutingEvidenceRow[],
   target: RoutingTarget,

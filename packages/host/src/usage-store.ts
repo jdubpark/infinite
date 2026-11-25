@@ -25,7 +25,6 @@ export interface LedgerState extends LedgerCoverage {
   seen: number;
   refused: number;
   exited: boolean;
-  /** The worker's usage-coverage record, once the fold has read it. */
   journaled?: LedgerCoverage & { finalDrain?: "complete" | "incomplete" | "skipped" };
 }
 export interface StoredSession extends LedgerState {
@@ -43,9 +42,7 @@ export interface StoredSession extends LedgerState {
   purpose?: SessionPurpose;
   configId?: string;
 }
-/** The `Ledger` type of usage-service.ts, copied here for the import. Task 3 removes the original. */
 export type SealedSession = { provider: Provider; projectId: string; createdAt: string; lastActiveAt?: string; measured: boolean; team?: TeamAssignment; profileId?: string; exited?: true };
-/** The `Ledger` type of usage-service.ts, copied here for the import. Task 3 removes the original. */
 export type SealedLedger = { cursors: Record<string, number>; sessions: Record<string, SealedSession>; rows: Record<string, UsageRecord>; briefings: Record<string, { projectId: string; at: string; record?: UsageRecord }> };
 
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -68,7 +65,6 @@ const RECORD_COLUMNS = ["record_key", "provider", "session_id", "completed_at", 
 const BRIEFING_COLUMNS = ["briefing_key", "project_ref", "at", "model_ref", "model_source", "input", "output", "reasoning",
   "cache_read", "cache_write", "reported_cost"] as const;
 
-/** Builds `INSERT ... ON CONFLICT(key) DO UPDATE` over every column but the key, so the statement lists each column once. */
 function upsert(table: string, columns: readonly string[], key: string): string {
   const update = columns.filter(column => column !== key).map(column => `${column}=excluded.${column}`).join(", ");
   return `INSERT INTO ${table} (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")}) ON CONFLICT(${key}) DO UPDATE SET ${update}`;
@@ -107,7 +103,6 @@ const SCHEMA = [
   "CREATE INDEX usage_sessions_by_project ON usage_sessions (project_ref)",
 ];
 
-/** The `usage` evidence module: the usage ledger's tables. Usage rows outlive their run, so it has no run deletion. */
 export const usageModule: EvidenceModule = {
   name: "usage",
   version: 1,
@@ -127,17 +122,12 @@ export const usageModule: EvidenceModule = {
 const opaque = (value: unknown): value is string => typeof value === "string" && OPAQUE_ID.test(value);
 const isCount = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 
-/** An ISO time with milliseconds, or undefined when the text does not parse. */
 function isoTime(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const time = Date.parse(value);
   return Number.isNaN(time) ? undefined : new Date(time).toISOString();
 }
 
-/**
- * The checked copy of a usage record, with only usage fields and normalised times. A value that fails any check is undefined.
- * `nativeId` is dropped too: nothing reads it, and no plain column may hold it.
- */
 export function ledgerRecord(value: unknown): UsageRecord | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
@@ -169,7 +159,6 @@ export function ledgerRecord(value: unknown): UsageRecord | undefined {
   };
 }
 
-/** OpenCode keys are scoped to their session. Claude and Codex keys are global, so one request seen twice keeps one row. */
 export function ledgerKey(record: UsageRecord, sessionId: string): string {
   return record.provider === "opencode" ? `opencode:${sessionId}/${record.messageId}/${record.partId}` : usageRecordKey(record);
 }
@@ -190,10 +179,6 @@ function ensureModel(tx: EvidenceTx, providerId: string, modelId: string): numbe
   return tx.run("INSERT INTO usage_models (model_key, encrypted_model) VALUES (?, ?)", key, sealed).lastInsertRowid;
 }
 
-/**
- * Stores a session's header and state. Returns false, with nothing written, when an id, a time, a purpose, or a
- * coverage value is invalid. A session id and team ids must be opaque; a config id that is not a digest is stored as null.
- */
 export function writeSession(tx: EvidenceTx, header: LedgerHeader, state: LedgerState): boolean {
   const createdAt = isoTime(header.createdAt);
   const lastActiveAt = header.lastActiveAt === undefined ? null : isoTime(header.lastActiveAt);
@@ -240,10 +225,6 @@ export function writeSession(tx: EvidenceTx, header: LedgerHeader, state: Ledger
 type Stored = { session_id?: string; input: number; output: number; reasoning: number; cache_read: number; cache_write: number; cache_write_1h: number };
 const total = (row: Stored) => row.input + row.output + row.reasoning + row.cache_read + row.cache_write;
 
-/**
- * Stores one record under its key. The record is checked again here, and a session row must exist.
- * Claude and Codex keep the larger whole record. OpenCode keeps the last copy.
- */
 export function writeRecord(tx: EvidenceTx, sessionId: string, record: UsageRecord): "inserted" | "replaced" | "kept" {
   const checked = ledgerRecord(record);
   if (!checked) throw new TypeError("A usage record must pass ledgerRecord before it is stored.");
@@ -261,7 +242,6 @@ export function writeRecord(tx: EvidenceTx, sessionId: string, record: UsageReco
     if (!larger) return "kept";
   }
   const modelRef = ensureModel(tx, checked.providerId, checked.modelId);
-  // A replaced Claude or Codex row keeps the session that first stored its key.
   const owner = prior && checked.provider !== "opencode" ? prior.session_id as string : sessionId;
   tx.run(upsert("usage_records", RECORD_COLUMNS, "record_key"), key, checked.provider, owner, checked.completedAt, modelRef,
     checked.modelSource, next.input, next.output, next.reasoning, next.cache_read, next.cache_write, next.cache_write_1h,
@@ -269,10 +249,6 @@ export function writeRecord(tx: EvidenceTx, sessionId: string, record: UsageReco
   return prior ? "replaced" : "inserted";
 }
 
-/**
- * Stores a briefing under its `${sessionId}/${at}` key. The record, when given, must pass ledgerRecord.
- * The last write for a key wins. Throws, with nothing written, for an invalid time, record, or project.
- */
 export function writeBriefing(tx: EvidenceTx, key: string, projectId: string, at: string, record?: UsageRecord): void {
   const time = isoTime(at);
   if (!time || typeof projectId !== "string") throw new TypeError("A briefing needs a project and a valid time");
@@ -286,7 +262,6 @@ export function writeBriefing(tx: EvidenceTx, key: string, projectId: string, at
     checked?.reportedCost ?? null);
 }
 
-/** Opens a model's sealed names. The row key is the model's blind index. */
 function modelNames(db: EvidenceDb, ref: number, cache: Map<number, { providerId: string; modelId: string }>) {
   const hit = cache.get(ref);
   if (hit) return hit;
@@ -297,7 +272,6 @@ function modelNames(db: EvidenceDb, ref: number, cache: Map<number, { providerId
   return names;
 }
 
-/** The sessions the ledger holds. Project ids are opened here, and nothing else is decrypted. */
 export function readSessions(db: EvidenceDb): StoredSession[] {
   const rows = db.all<Record<string, unknown> & { encrypted_project: string }>(
     "SELECT s.*, p.encrypted_project FROM usage_sessions s JOIN usage_projects p ON p.project_ref = s.project_ref ORDER BY s.session_id",
@@ -334,7 +308,6 @@ export function readSessions(db: EvidenceDb): StoredSession[] {
   });
 }
 
-/** Reads records by session and time. `from` is inclusive and `to` exclusive. Only usage fields come back. */
 export function readRecords(db: EvidenceDb, filter: { sessionIds?: string[]; from?: string; to?: string } = {}): { sessionId: string; record: UsageRecord }[] {
   const where: string[] = [];
   const params: SQLInputValue[] = [];
@@ -388,7 +361,6 @@ export function readRecords(db: EvidenceDb, filter: { sessionIds?: string[]; fro
   });
 }
 
-/** The briefings the ledger holds. A briefing without a record has no model or token figures. */
 export function readBriefings(db: EvidenceDb): { projectId: string; at: string; record?: UsageRecord }[] {
   const rows = db.all<Record<string, unknown> & { encrypted_project: string }>(
     "SELECT b.*, p.encrypted_project FROM usage_briefings b JOIN usage_projects p ON p.project_ref = b.project_ref ORDER BY b.at, b.briefing_key",
@@ -419,20 +391,13 @@ export function readBriefings(db: EvidenceDb): { projectId: string; at: string; 
   });
 }
 
-/** `pending` until the sealed ledger's import has been recorded, whatever its outcome. */
 export function importState(db: EvidenceDb): "pending" | "done" {
   return db.get("SELECT value FROM usage_meta WHERE key=?", SEALED_IMPORT) ? "done" : "pending";
 }
 
-/**
- * Imports the sealed ledger in the caller's transaction. Only `imported` reads the ledger; `absent` and `unreadable`
- * record the outcome and nothing else. A measured session is `complete` with its cursor. Any other session is
- * `none` with `unsupported`. Sessions are written before records, and a record whose session was not imported is refused.
- */
 export function importLedger(tx: EvidenceTx, ledger: SealedLedger | undefined, outcome: "imported" | "absent" | "unreadable"):
   { sessions: number; records: number; briefings: number; refused: number } {
   const counts = { sessions: 0, records: 0, briefings: 0, refused: 0 };
-  // The import runs once. A later call must not rewind cursors or records that the fold wrote since.
   if (tx.get("SELECT value FROM usage_meta WHERE key=?", SEALED_IMPORT)) return counts;
   if (outcome === "imported" && ledger) {
     const imported = new Set<string>();

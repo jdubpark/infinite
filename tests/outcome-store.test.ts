@@ -172,7 +172,6 @@ function memberRow(runId: string, memberId: string, overrides: Partial<MemberRes
   };
 }
 
-/** Appends one event for a run, as the outbox does, and returns its seq. */
 function appendEvent(store: EvidenceStore, runId: string, key: string, kind: string, memberId?: string): number {
   return store.write(tx => store.appendEvent(tx, {
     key,
@@ -285,7 +284,6 @@ test("a run deleted with unseen events is flagged", () => {
   try {
     store = open(f);
     store.register(outcomeModule({ now: () => NOW }));
-    // seq 1 to 3 belong to another run, seq 4 and 6 are R's, and seq 5 is S's. The projector has reached seq 5.
     appendEvent(store, "run-x", "x:1", "other.event");
     appendEvent(store, "run-x", "x:2", "other.event");
     appendEvent(store, "run-x", "x:3", "other.event");
@@ -301,7 +299,6 @@ test("a run deleted with unseen events is flagged", () => {
       writeSummary(tx, summaryRow("run-s"));
     });
 
-    // run-s has events only at or below last_seq, so it gains no gap.
     assert.equal(store.deleteRun("run-s"), true);
     const sFlags = store.read(db => db.get<{ flags: string }>("SELECT flags FROM outcomes WHERE outcome_id='run-s:member-1'")!.flags);
     assert.equal(sFlags, "");
@@ -333,7 +330,6 @@ test("the store sweep finds unstamped runs only", () => {
       writeOutcome(tx, outcomeRow({ outcomeId: "run-r:member-1", runId: "run-r" }));
     });
     appendEvent(store, "run-r", "r:1", "run.created");
-    // T has rows and no events.
     store.write(tx => writeSummary(tx, summaryRow("run-t")));
 
     const listed = () => store!.read(db => module.runIds!(db));
@@ -378,7 +374,6 @@ test("rows expire 730 days after their run was deleted", () => {
     seed("run-live", false);
     const count = (runId: string) => store!.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM outcomes WHERE run_id=?", runId)!.n);
 
-    // Two years, less one day, is not enough: 730 days after 2024-01-01 is 2025-12-31.
     assert.equal(sweepExpiredOutcomes(store, "2025-12-30T23:59:59.999Z"), 0);
     assert.equal(count("run-expired"), 1);
 
@@ -414,14 +409,12 @@ test("the retention sweep waits for a ready module", () => {
   console.log = (...args: unknown[]) => { logged.push(args); };
   const f = fixture();
   try {
-    // No `outcomes` module is registered on this store.
     const bare = open(f);
     try {
       assert.equal(sweepExpiredOutcomes(bare, NOW), 0);
     } finally {
       bare.close();
     }
-    // A store whose path cannot open is unavailable.
     const closed = new EvidenceStore({ databasePath: join(f.root, "missing", "\0", "evidence.db"), vaultKey: f.key });
     try {
       assert.equal(closed.status().state, "unavailable");
@@ -495,7 +488,6 @@ const HEAD = "c".repeat(40);
 const T_EARLY = "2026-11-13T11:00:00.000Z";
 const T_LATE = "2026-11-13T12:30:00.000Z";
 
-/** A signal row with a valid default; tests override only what they check. */
 function signalRow(overrides: Partial<SignalRow> & { signalId: string }): SignalRow {
   return {
     runId: "run-1",
@@ -510,12 +502,10 @@ function signalRow(overrides: Partial<SignalRow> & { signalId: string }): Signal
   };
 }
 
-/** A day offset from 2026-11-01, so scan times read as "day N". */
 function day(n: number): string {
   return new Date(Date.parse("2026-11-01T00:00:00.000Z") + n * DAY_MS).toISOString();
 }
 
-/** The version 1 module, with the statements it shipped with. A store that holds it is migrated in place. */
 function outcomesVersion1(): EvidenceModule {
   return {
     name: "outcomes",
@@ -596,7 +586,6 @@ test("a version 1 store migrates in place", () => {
     const row = store.read(db => readOutcome(db, "run-1:member-1"));
     assert.equal(row?.accepted, 1);
     assert.equal(row?.acceptance, 1);
-    // The migration rewrites no level, exclusion, or flag of an existing row.
     assert.deepEqual([row?.integrated, row?.firstPass, row?.held, row?.exclusion, row?.flags, row?.holdUntil], [1, 1, null, null, [], null]);
     const tables = store.read(db => db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table'"))
       .map(table => table.name);
@@ -633,7 +622,6 @@ test("a write without an acceptance stores the accepted level", () => {
       writeOutcome(tx, outcomeRow({ outcomeId: "run-1:none", memberId: "none", accepted: 1, acceptance: null }));
     });
     assert.equal(store.read(db => readOutcome(db, "run-1:bare"))?.acceptance, 1);
-    // An owner exclusion empties the level and keeps the review's fact.
     const kept = store.read(db => readOutcome(db, "run-1:kept"));
     assert.equal(kept?.accepted, null);
     assert.equal(kept?.acceptance, 1);
@@ -797,7 +785,6 @@ test("retention follows the configured days", () => {
       scans: db.get<{ n: number }>("SELECT count(*) AS n FROM base_scans")!.n,
     }));
 
-    // With the default 730 days, a run deleted on 2024-01-01 is not yet expired at 2025-01-01.
     assert.equal(sweepExpiredOutcomes(store, "2025-01-01T00:00:00.001Z"), 0);
     assert.deepEqual(remaining(), { outcomes: 1, signals: 1, scans: 1 });
 
@@ -833,7 +820,6 @@ const GOAL = "goal-7";
 const OTHER_GOAL = "goal-8";
 const MISSION = "mission-7";
 
-/** A row with the given goal and mission, or none. Unlike `outcomeRow`, it carries no default goal or mission. */
 function rowIn(runId: string, memberId: string, goal?: string, mission?: string): OutcomeRow {
   const payload: OutcomePayload = { ...outcomeRow().payload };
   delete payload.goal;
@@ -843,7 +829,6 @@ function rowIn(runId: string, memberId: string, goal?: string, mission?: string)
   return outcomeRow({ outcomeId: `${runId}:${memberId}`, runId, memberId, payload });
 }
 
-/** A summary with the given goal and mission, or none. */
 function summaryWith(runId: string, goal?: string, mission?: string): RunSummaryRow {
   const base = summaryRow(runId);
   const payload: RunSummaryRow["payload"] = { ...base.payload };
@@ -854,7 +839,6 @@ function summaryWith(runId: string, goal?: string, mission?: string): RunSummary
   return { ...base, payload };
 }
 
-/** Version 2 as it shipped: the version 1 statements, then the version 2 statements. */
 function outcomesVersion2(): EvidenceModule {
   const version1 = outcomesVersion1();
   return {
@@ -886,7 +870,6 @@ function outcomesVersion2(): EvidenceModule {
   };
 }
 
-/** Inserts an outcome row the way a version 2 host did, with no ref columns. `sealed` is the stored payload text. */
 function insertOutcomeAtVersion2(tx: EvidenceTx, outcomeId: string, runId: string, sealed: string): void {
   tx.run(
     "INSERT INTO outcomes (outcome_id, source, project_ref, task_ref, run_id, revision, member_id, attempt_index, "
@@ -903,7 +886,6 @@ function insertOutcomeAtVersion2(tx: EvidenceTx, outcomeId: string, runId: strin
   );
 }
 
-/** Inserts a summary the way a version 2 host did, with no ref columns. */
 function insertSummaryAtVersion2(tx: EvidenceTx, runId: string, sealed: string): void {
   tx.run(
     "INSERT INTO run_summaries (run_id, source, project_ref, revision, flags, payload) "
@@ -935,12 +917,10 @@ test("a version 2 store migrates to version 3 and indexes goals and missions", (
     store = open(f);
     store.register(outcomeModule({ now: () => NOW }));
     assert.equal(store.status().modules.outcomes, "ready");
-    // Version 3 only adds the two ref columns: every earlier column of every row keeps its value.
     const later = store.read(db => ({
       outcomes: db.all("SELECT * FROM outcomes ORDER BY outcome_id"),
       summaries: db.all("SELECT * FROM run_summaries ORDER BY run_id"),
     }));
-    // Rows of node:sqlite have no prototype; both sides are copied to plain objects before the comparison.
     const withoutRefs = (row: Record<string, unknown>) => {
       const { goal_ref: _goal, mission_ref: _mission, point: _point, feature_map_ref: _featureMap, owner_score: _score, ...rest } = row;
       return { ...rest };
@@ -1151,8 +1131,6 @@ test("a legacy row is never a run", () => {
     store.sweep(() => false);
     assert.equal(store.read(db => readOutcome(db, legacy.outcomeId))?.source, "legacy");
 
-    // A legacy row has no summary, so it is never a landing candidate. The approved production run of the same
-    // project is the one candidate, which shows that the query read this project.
     store.write(tx => writeSummary(tx, summaryRow(production.runId, { approvedAt: "2026-11-13T12:00:00.000Z" })));
     const candidates = store.read(db => landingCandidates(db, db.index("project", legacy.payload.projectId), "1970-01-01T00:00:00.000Z"));
     assert.deepEqual(candidates.map(candidate => candidate.runId), [production.runId]);
@@ -1223,7 +1201,6 @@ test("the module reports legacy counts", () => {
     });
     const counts = store.describe().counts;
     assert.equal(counts["outcomes.legacy"], 2);
-    // One row of the three is a production row; the module's outcomes count leaves the legacy rows out.
     assert.equal(counts["outcomes.outcomes"], 1);
     assert.equal(counts["outcomes.legacyLines"], 3);
   } finally {
@@ -1236,14 +1213,12 @@ const T_IN = "2026-11-13T11:00:00.000Z";
 const T_OLD = "2026-10-01T00:00:00.000Z";
 const ROUTE_SINCE = "2026-11-12T00:00:00.000Z";
 
-/** A row without a rating unless one is given, and with no replacement unless one is given. */
 function plainPayload(overrides: Partial<OutcomePayload> = {}): OutcomePayload {
   const payload: OutcomePayload = { ...outcomeRow().payload, ...overrides };
   if (!("ownerRating" in overrides)) delete payload.ownerRating;
   return payload;
 }
 
-/** Version 3 as it shipped: the version 2 statements, the goal and mission refs, and the legacy lines. */
 function outcomesVersion3(): EvidenceModule {
   const version2 = outcomesVersion2();
   return {
@@ -1269,7 +1244,6 @@ function outcomesVersion3(): EvidenceModule {
   };
 }
 
-/** Inserts an outcome row the way a version 3 host did, with no routing columns. `sealed` is the stored payload text. */
 function insertOutcomeAtVersion3(
   tx: EvidenceTx,
   row: { outcomeId: string; runId: string; memberId: string; source: string; role: string; sealed: string; attemptIndex?: number },
@@ -1294,7 +1268,6 @@ function insertOutcomeAtVersion3(
 
 type Replaces = OutcomePayload["replaces"];
 
-/** A row of member `m1`-style ids: `run-…:memberId`, with an optional replacement and rating. */
 function routingRow(runId: string, memberId: string, replaces?: Replaces, score?: number): OutcomeRow {
   const overrides: Partial<OutcomePayload> = {};
   if (replaces !== undefined) overrides.replaces = replaces;
@@ -1302,7 +1275,6 @@ function routingRow(runId: string, memberId: string, replaces?: Replaces, score?
   return outcomeRow({ outcomeId: `${runId}:${memberId}`, runId, memberId, payload: plainPayload(overrides) });
 }
 
-/** The routing columns of every outcome row, by outcome id. */
 function routingOf(store: EvidenceStore): Record<string, { point: string | null; owner_score: number | null }> {
   const rows = store.read(db => db.all<{ outcome_id: string; point: string | null; owner_score: number | null }>(
     "SELECT outcome_id, point, owner_score FROM outcomes ORDER BY outcome_id",
@@ -1317,7 +1289,6 @@ test("a version 3 store migrates to version 4 and fills the routing columns", ()
     store = open(f);
     store.register(outcomesVersion3());
     const seeded: { runId: string; memberId: string; source: string; role: string; payload: OutcomePayload | "x"; attemptIndex?: number }[] = [
-      // An integrated task with no start seen: attempt 0 has no point, and its replacement inherits none.
       { runId: "run-10", memberId: "s1", source: "production", role: "implementer", payload: plainPayload(), attemptIndex: 0 },
       { runId: "run-10", memberId: "r1", source: "production", role: "implementer", payload: plainPayload({ replaces: { memberId: "s1", cause: "stall" } }) },
       { runId: "run-1", memberId: "m1", source: "production", role: "implementer", payload: plainPayload() },
@@ -1330,7 +1301,6 @@ test("a version 3 store migrates to version 4 and fills the routing columns", ()
       { runId: "run-5", memberId: "m1", source: "production", role: "implementer", payload: plainPayload({ ownerRating: { score: 4, at: T_EARLY } }) },
       { runId: "run-6", memberId: "m1", source: "production", role: "implementer", payload: "x" },
     ];
-    // Replacements are inserted before their predecessors, so a one-pass fill in insertion order would miss every chain.
     store.write(tx => {
       for (const row of [...seeded].reverse()) {
         const outcomeId = `${row.runId}:${row.memberId}`;
@@ -1352,7 +1322,6 @@ test("a version 3 store migrates to version 4 and fills the routing columns", ()
     store.register(outcomeModule({ now: () => NOW }));
     assert.equal(store.status().modules.outcomes, "ready");
     const later = store.read(db => db.all("SELECT * FROM outcomes ORDER BY outcome_id"));
-    // Version 4 only adds the three routing columns: every earlier column of every row keeps its value.
     const withoutRouting = (row: Record<string, unknown>) => {
       const { point: _point, feature_map_ref: _featureMap, owner_score: _score, ...rest } = row;
       return { ...rest };
@@ -1415,7 +1384,6 @@ test("writes keep the routing columns", () => {
       writeOutcome(tx, routingRow("run-1", "m1"));
       writeOutcome(tx, routingRow("run-1", "m2", { memberId: "m1", cause: "escalation" }));
       writeOutcome(tx, routingRow("run-1", "m3", { memberId: "m2", cause: "stall" }));
-      // A caller's point is ignored: this row has no predecessor, so it is a start.
       writeOutcome(tx, { ...routingRow("run-2", "m1"), point: "escalation" } as OutcomeRow);
     });
     assert.deepEqual(routingOf(store), {
@@ -1453,7 +1421,6 @@ test("a row at attempt zero has no point, and its replacement inherits none", ()
   }
 });
 
-/** One outcome row for the route reads. An escalation row replaces a member named `m0`. */
 type EvidenceSpec = { runId: string; source?: string; model?: string; effort?: string | null; escalation?: boolean; endedAt: string; configId?: string | null };
 function evidenceRow(spec: EvidenceSpec): OutcomeRow {
   return outcomeRow({
@@ -1518,18 +1485,14 @@ test("routing evidence reads one identity and point, newest first, within its li
     }));
     const summary = (rows: { outcomeId: string; source: string; promptVersion: string | null }[]) =>
       rows.map(row => ({ id: row.outcomeId, source: row.source, promptVersion: row.promptVersion }));
-    // Production and duel rows only, in the identity's point, ended at or after `since`, in outcome id order.
     assert.deepEqual(summary(reads.start), [
       { id: "run-a1:m1", source: "production", promptVersion: "pv-1" },
       { id: "run-a2:m1", source: "duel", promptVersion: null },
     ]);
     assert.deepEqual(summary(reads.escalation), [{ id: "run-a6:m1", source: "production", promptVersion: null }]);
-    // An identity with a NULL effort matches only rows with a NULL effort.
     assert.deepEqual(summary(reads.nullEffort), [{ id: "run-c1:m1", source: "production", promptVersion: null }]);
     assert.deepEqual(summary(reads.otherModel), [{ id: "run-b1:m1", source: "production", promptVersion: null }]);
-    // Flags leave the read as tokens, never as the stored text: a row's flags are an array.
     for (const row of [...reads.start, ...reads.escalation]) assert.ok(Array.isArray(row.flags), row.outcomeId);
-    // The newest ROUTING_ROWS_PER_SOURCE of 1,001 production rows: the oldest one is left out.
     const bigIds = reads.big.map(row => row.outcomeId);
     assert.equal(bigIds.length, ROUTING_ROWS_PER_SOURCE);
     assert.ok(bigIds.includes("run-big-1000:m1"));

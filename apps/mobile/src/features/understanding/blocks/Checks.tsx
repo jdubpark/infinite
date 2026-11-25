@@ -11,7 +11,6 @@ const STATUS: Record<CheckSummary["status"], { ink: string; surface: string }> =
   interrupted: { ink: theme.colors.warningInk, surface: theme.colors.warningSurface },
 };
 
-/** Recorded verification commands. The output tail is the host's record, shown as terminal output. */
 export function Checks({ items }: { items: CheckSummary[] }) {
   return <View style={styles.stack}>
     {items.map((check, index) => <CheckCard key={`${check.command}/${index}`} check={check} />)}

@@ -8,10 +8,6 @@ import { theme } from "../../theme";
 import { Section, t } from "../teams/parts";
 import { boardKind, boardStatusLabel } from "./model";
 
-/**
- * Every attempt of one piece of work, oldest first. The viewed attempt is marked; the others replace
- * this screen, so the owner moves between attempts without stacking screens.
- */
 export function Attempts({ attempts, current, machine, now }: { attempts: BoardItem[]; current: string; machine: string; now: number }) {
   const router = useRouter();
   const open = (attempt: BoardItem) => {

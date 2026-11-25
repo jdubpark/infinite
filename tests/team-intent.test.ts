@@ -17,7 +17,6 @@ import type { Project, Provider } from "../packages/host/src/types.js";
 import { TeamError } from "../packages/host/src/team-workspace.js";
 import { objectiveError } from "../packages/host/src/objective-record.js";
 
-// Every identifier and secret-shaped value is built here at run time, so the source holds no real credential.
 const SECRET = "gh" + "p_" + "a".repeat(36);
 const RUN_ID = "00000000-0000-4000-8000-0000000000a1";
 const GOAL_ID = "6f1c2a3e-8b4d-4c5e-9f60-718293a4b5c6";
@@ -57,7 +56,6 @@ function memberOf(run: TeamRun, role: TeamRole, extra: Partial<TeamMember> = {})
   } as unknown as TeamMember;
 }
 
-/** A project manager whose plan passed today's checks, in the holder's run. */
 function planOf(holder: IntentHolder, revision = holder.run.revision): TeamMember {
   const member = memberOf(holder.run, "project-manager", { revision, status: "reported", report: PLAN_REPORT() });
   holder.run.members.push(member);
@@ -67,7 +65,6 @@ function planOf(holder: IntentHolder, revision = holder.run.revision): TeamMembe
 type Pending = { perform: (signal: AbortSignal) => Promise<boolean | undefined>; complete: (clean: boolean | undefined) => void; member: TeamMember };
 type Prepared = { role: string; feedback?: string; prebuilt?: { prompt: string; profile: TeamModelProfile }; member: TeamMember };
 
-/** Records every host call. Operations stay pending until `settle` runs them, as the real result operation does. */
 class FakeHost implements IntentHost {
   readonly events: string[] = [];
   readonly prepared: Prepared[] = [];
@@ -82,7 +79,6 @@ class FakeHost implements IntentHost {
   private readonly baseCommit: string;
   private readonly config: Project | undefined;
   private intent?: TeamIntent;
-  /** Replaces `hold` as the result callback of a consumed plan, so a test can observe each hold. */
   onConsume?: (holder: IntentHolder, member: TeamMember) => boolean;
 
   constructor(options: { cwd?: string; baseCommit?: string; checks?: TeamCommand[] } = {}) {
@@ -91,7 +87,6 @@ class FakeHost implements IntentHost {
     this.config = { team: { checks: options.checks ?? [CHECK] } } as unknown as Project;
   }
 
-  /** Consuming a held plan runs the result callback, which calls `hold` and records whether the plan was held. */
   attach(intent: TeamIntent): void {
     this.intent = intent;
   }
@@ -128,12 +123,10 @@ function hostAndIntent(options: { cwd?: string; baseCommit?: string; checks?: Te
   return { host, intent };
 }
 
-/** Runs every pending result operation. `clean` stands for the read-only check's outcome; the check itself is tested separately. */
 function settle(host: FakeHost, clean = true): void {
   for (const op of host.pending.splice(0)) op.complete(clean);
 }
 
-/** The checker reports as the host stores it: screened, then consumed. */
 function reportChecker(intent: TeamIntent, holder: IntentHolder, member: TeamMember, report: TeamReport): void {
   member.report = report;
   member.status = "reported";
@@ -141,7 +134,6 @@ function reportChecker(intent: TeamIntent, holder: IntentHolder, member: TeamMem
   intent.consume(holder, member);
 }
 
-/** A held plan of the current revision, then the checker launched: the state is `checking`. */
 function checkingFixture(run: Partial<TeamRun> = {}, options: { cwd?: string; baseCommit?: string } = {}) {
   const holder = holderOf(runOf(run));
   const { host, intent } = hostAndIntent(options);
@@ -155,7 +147,6 @@ function checkingFixture(run: Partial<TeamRun> = {}, options: { cwd?: string; ba
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
-// Fixtures in the style of tests/objective-intent.test.ts.
 const OWNER_TEST = { kind: "owner" };
 function askItem(dimension: string, options: { criticality?: IntentItem["criticality"]; def?: string } = {}): IntentItem {
   return {
@@ -181,7 +172,6 @@ function goalFixture(): ProductGoal {
   } as unknown as ProductGoal;
 }
 
-/** A goal's record in memory, as GoalService keeps it, behind the port the check reads and writes. */
 function goalPort(record: ObjectiveRecord): GoalRecordPort & { store: { record: ObjectiveRecord }; failing: boolean } {
   const port = {
     store: { record },
@@ -196,7 +186,6 @@ function goalPort(record: ObjectiveRecord): GoalRecordPort & { store: { record: 
   return port;
 }
 
-/** A standalone run's record with its log filled to the share, so no further entry fits. */
 function fullLog(record: ObjectiveRecord): ObjectiveRecord {
   let full = record;
   for (;;) {
@@ -242,7 +231,6 @@ test("a plan is held once per revision", () => {
   assert.equal(intent.hold(holder, pm), true, "a second hold of the same plan still holds");
   assert.deepEqual(host.events, [INTENT_EVENTS.held], "and adds no event");
 
-  // A newer plan of the same revision moves the held plan to it, and adds no event.
   const newer = planOf(holder);
   assert.equal(intent.hold(holder, newer), true, "a newer plan of the revision is held");
   assert.equal(stateOf(holder).planMemberId, newer.memberId, "planMemberId moves to the newer plan");
@@ -268,7 +256,6 @@ test("a plan is held once per revision", () => {
   assert.equal(stateOf(holder).status, "queued");
   assert.equal(host.events.filter(text => text === INTENT_EVENTS.held).length, 2, "one held event per revision");
 
-  // A revision change while the check waits releases the older revision's question, and the new plan is held at once.
   const waitingRun = checkingFixture({ autonomy: "supervised" });
   reportChecker(waitingRun.intent, waitingRun.holder, waitingRun.checker, checkReport([askItem("scope")]));
   settle(waitingRun.host);
@@ -285,20 +272,17 @@ test("a plan is held once per revision", () => {
 test("a report applies once", () => {
   const { holder, host, intent, checker } = checkingFixture({ autonomy: "supervised" });
   reportChecker(intent, holder, checker, checkReport([askItem("scope")]));
-  // The state a restart would find if it had been saved while the result operation was pending.
   const checkingState = clone(stateOf(holder));
   settle(host);
   assert.equal(stateOf(holder).status, "waiting");
   const decisionId = stateOf(holder).decisionId;
 
-  // A restart after the answer was recorded: the stored report is consumed again and changes nothing.
   const restarted = clone(holder);
   const restartedBefore = clone(restarted);
   intent.consume(restarted, checker);
   assert.equal(host.pending.length, 0, "no second operation starts");
   assert.deepEqual(clone(restarted), restartedBefore, "the state is unchanged");
 
-  // A restart where the record holds the applied entry but the state and its decision were not saved: completing the report finds the entry.
   const unsaved = clone(holder);
   unsaved.intentCheck = checkingState;
   unsaved.run.decisions = [];
@@ -330,7 +314,6 @@ test("the checker cannot block, ask, or post", () => {
   assert.equal(stateOf(holder).status, "accepting", "the second failure skips");
   assert.equal(stateOf(holder).reason, "checker-failed");
 
-  // A report from another member, or from a checker of an earlier revision, changes nothing.
   const { holder: other, host: otherHost, intent: otherIntent } = checkingFixture({ autonomy: "supervised" });
   const stranger = memberOf(other.run, "intent-checker", { revision: other.run.revision, report: checkReport([assumeItem("x")]), status: "reported" });
   other.run.members.push(stranger);
@@ -343,7 +326,6 @@ test("the checker cannot block, ask, or post", () => {
 });
 
 test("failures are bounded", () => {
-  // A stall, then a replacement on a provider that is now limited: nothing else is eligible, so the check skips.
   const first = checkingFixture({ autonomy: "supervised" });
   first.checker.status = "stopped";
   assert.equal(first.intent.failed(first.holder, first.checker), true);
@@ -356,7 +338,6 @@ test("failures are bounded", () => {
   assert.equal(stateOf(first.holder).reason, "no-eligible-profile");
   assert.equal(first.host.prepared.length, 1, "no replacement is prepared");
 
-  // Two failures: a skip with its one event and one log entry, and the held plan accepted.
   const second = checkingFixture({ autonomy: "supervised" });
   reportChecker(second.intent, second.holder, second.checker, { kind: "blocked", summary: "No access." } as unknown as TeamReport);
   second.intent.step(second.holder);
@@ -392,7 +373,6 @@ test("a checker that changes its workspace counts a failure", async () => {
 test("a stop during the read-only check is not a checker failure, and a stopped run takes no report", async () => {
   const repo = makeRepo();
   try {
-    // A pause, cancel, halt, block, or recovery aborts the check: no answer, so no failure, no event, and the state waits for the new revision.
     const { holder, host, intent, checker } = checkingFixture({ autonomy: "supervised" }, { cwd: repo.dir, baseCommit: repo.baseCommit });
     reportChecker(intent, holder, checker, checkReport([assumeItem("scope")]));
     const [op] = host.pending.splice(0);
@@ -407,8 +387,6 @@ test("a stop during the read-only check is not a checker failure, and a stopped 
   } finally {
     rmSync(repo.dir, { recursive: true, force: true });
   }
-  // A clean check that completes after the run stopped, or while a recovery stops its members, writes nothing and leaves no
-  // question waiting on it.
   for (const stop of ["paused", "cancelled", "blocked", "recovery"] as const) {
     const { holder, host, intent, checker } = checkingFixture({ autonomy: "supervised" });
     reportChecker(intent, holder, checker, checkReport([askItem("scope", { def: "the stated default" })]));
@@ -432,7 +410,6 @@ test("waiting meets answers", () => {
     settle(host);
     assert.equal(stateOf(holder).status, "waiting", scenario);
     assert.equal(holder.run.status, "needs-input", scenario);
-    // A resume sets the run back to planning; the waiting state restores needs-input on the next step.
     holder.run.status = "planning";
     assert.equal(intent.step(holder), true, `${scenario}: a waiting step still owns the run`);
     assert.equal(holder.run.status, "needs-input", `${scenario}: the step restores needs-input`);
@@ -473,7 +450,6 @@ test("waiting meets answers", () => {
 });
 
 test("a skip never loses the plan", () => {
-  // No evaluator of another family than the coordinator's.
   const noProfile = holderOf(runOf({ lineup: SAME_FAMILY_LINEUP }));
   const noProfileHost = hostAndIntent();
   assert.equal(noProfileHost.intent.hold(noProfile, planOf(noProfile)), false);
@@ -481,7 +457,6 @@ test("a skip never loses the plan", () => {
   assert.equal(noProfileHost.host.events.at(-1), INTENT_EVENTS.skipped["no-eligible-profile"]);
   assert.deepEqual(noProfileHost.host.prepared, [], "no checker is launched");
 
-  // An unreadable record.
   const unreadable = holderOf();
   unreadable.objectiveRecord = "not a record";
   const unreadableHost = hostAndIntent();
@@ -490,7 +465,6 @@ test("a skip never loses the plan", () => {
   assert.equal(unreadableHost.host.events.at(-1), INTENT_EVENTS.skipped["record-unavailable"]);
   assert.deepEqual(unreadableHost.host.prepared, []);
 
-  // A full log: nothing more is written, and no checker starts.
   const full = holderOf();
   const fullRecord = fullLog(runRecord(full.run, AT, "run-handle") as ObjectiveRecord);
   full.objectiveRecord = fullRecord;
@@ -501,7 +475,6 @@ test("a skip never loses the plan", () => {
   assert.equal((full.objectiveRecord as ObjectiveRecord).log.length, fullRecord.log.length, "the skip is not logged");
   assert.deepEqual(fullHost.host.prepared, []);
 
-  // A context over 1 MiB: the checker is stopped before it launches, and the plan is accepted.
   const large = checkingFixture({ autonomy: "supervised" });
   large.pm.report = { kind: "plan", summary: "x".repeat(1100 * 1024), tasks: [] } as unknown as TeamReport;
   assert.equal(large.intent.context(large.holder, large.checker), null, "no context is built");
@@ -569,7 +542,6 @@ test("a second pass in checking with the checker present starts nothing", () => 
 });
 
 test("a release that fails stops nothing", () => {
-  // Standalone run: the log is full, so the release, the older revision's release, and the new hold cannot write.
   const { holder, host, intent, checker } = checkingFixture({ autonomy: "supervised" });
   reportChecker(intent, holder, checker, checkReport([askItem("scope")]));
   settle(host);
@@ -593,7 +565,6 @@ test("a release that fails stops nothing", () => {
   assert.equal(stateOf(holder).status, "skipped", "a full log skips the new revision");
   assert.equal(stateOf(holder).reason, "log-full");
 
-  // Goal run: the record's write fails, so the release changes nothing and the cancel goes on.
   const goalRun = runOf({ autonomy: "supervised", goal: { id: GOAL_ID } as unknown as TeamRun["goal"] });
   const port = goalPort(goalRecord(goalFixture(), AT, "created") as ObjectiveRecord);
   const goal = holderOf(goalRun);
@@ -647,7 +618,6 @@ test("the stored report is screened", () => {
   const plan = screenedBlock(intent, holder, checker, { kind: "plan", summary: SECRET, tasks: [] });
   assert.equal(plan.summary, "The intent checker sent a plan report instead of an intent check; its text is withheld.");
 
-  // A checker that is not current stores its report screened, and sets no counts.
   const earlier = memberOf(holder.run, "intent-checker", { revision: holder.run.revision });
   const before = stateOf(holder).screened;
   const stored = intent.screen(holder, earlier, checkReport([assumeItem(`secret ${SECRET}`)]));
@@ -657,12 +627,10 @@ test("the stored report is screened", () => {
   assert.equal(earlierBlock.kind, "blocked", "an earlier checker's question is blocked too");
 });
 
-/** The stored form of a non-intent report from the checker: screen, as the host calls it. */
 function screenedBlock(intent: TeamIntent, holder: IntentHolder, member: TeamMember, report: unknown): TeamReport {
   return intent.screen(holder, member, report as TeamReport) as TeamReport & { summary: string };
 }
 
-// A seeded run of random event orders. Each seed is a fixed sequence, so a failure names its seed.
 function mulberry32(seed: number): () => number {
   let state = seed >>> 0;
   return () => {
@@ -677,7 +645,6 @@ function mulberry32(seed: number): () => number {
 test("seeded event orders keep the invariants", () => {
   const SEEDS = 200;
   const STEPS = 60;
-  // What the seeds reached in total: a run that never accepts, asks, or applies would pass the invariants trivially.
   const reached = { accepted: 0, decisions: 0, applied: 0, answered: 0 };
   for (let seed = 1; seed <= SEEDS; seed += 1) {
     const rng = mulberry32(seed);
@@ -695,7 +662,6 @@ test("seeded event orders keep the invariants", () => {
     const recordOf = (): ObjectiveRecord | undefined => (port ? port.store.record : context.holder.objectiveRecord as ObjectiveRecord | undefined);
     const where = (what: string) => `seed ${seed} step ${currentStep} (${what})`;
 
-    // Every consume is a result callback: the hold decides, and a plan that it accepts is counted once per revision.
     const deliver = (holder: IntentHolder, member: TeamMember): boolean => {
       const decisionBefore = holder.intentCheck?.decisionId;
       const held = intent.hold(holder, member);
@@ -769,14 +735,12 @@ test("seeded event orders keep the invariants", () => {
       } else if (choice === "cancel") {
         intent.release(holder, "cancelled");
       } else {
-        // A restart: the holder and its record survive as JSON, pending operations are lost, and a stored report is consumed again.
         context.holder = clone(holder);
         host.pending.length = 0;
         const reported = context.holder.run.members.find(member => member.role === "intent-checker" && member.memberId === context.holder.intentCheck?.checkerMemberId && member.report !== undefined);
         if (reported) intent.consume(context.holder, reported);
       }
 
-      // Invariants after every event.
       const current = context.holder;
       const decisionsPerRevision = new Map<number, number>();
       for (const decision of current.run.decisions) decisionsPerRevision.set(decision.revision, (decisionsPerRevision.get(decision.revision) ?? 0) + 1);
@@ -804,7 +768,6 @@ test("seeded event orders keep the invariants", () => {
   assert.ok(reached.applied > 0, `the seeds apply checker reports: ${JSON.stringify(reached)}`);
 });
 
-/** A temporary repository with one commit, for the read-only check. Removed by the caller. */
 function makeRepo(): { dir: string; baseCommit: string } {
   const dir = mkdtempSync(join(tmpdir(), "intent-readonly-"));
   const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" }).toString().trim();

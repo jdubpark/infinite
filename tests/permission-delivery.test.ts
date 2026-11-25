@@ -140,7 +140,6 @@ test("the target's evidence collection reaches the decision, and an owner halt l
   assert.deepEqual([held.handled, held.handled ? undefined : held.held], [false, true]);
   assert.equal(calls.options[0]?.collect, collect);
   assert.equal(answers.length, 0, "nothing is delivered under a halt");
-  // After the release the same request is decided from that time's evidence.
   outcome = allow(true);
   now += 31_000;
   assert.equal((await service.handle(target)).handled, true);
@@ -184,7 +183,6 @@ test("an owner act that retires the authority fences an answer in flight before 
   const { pipeline } = fakePipeline(allow());
   pipeline.applicable = () => applicable;
   const service = new InteractivePermissionDelivery({ pipeline: () => pipeline, ledger: memoryLedger() });
-  // The answer is with the session: it ends only when the fence stops it.
   let current: (() => boolean) | undefined, stop!: (result: "refused") => void, fences = 0;
   const { target } = fakeTarget();
   const started = new Promise<void>(resolve => {
@@ -197,7 +195,7 @@ test("an owner act that retires the authority fences an answer in flight before 
   assert.equal(await service.fenceRetired(), true);
   assert.equal(fences, 0, "a delivery whose authority still applies is left alone");
 
-  applicable = false; // The owner's revoke is recorded.
+  applicable = false;
   assert.equal(current!(), false, "after the revoke the target sends no key");
   assert.equal(await service.fenceRetired(), true);
   assert.equal(fences, 1, "the answer in flight is fenced at its session");
@@ -205,7 +203,6 @@ test("an owner act that retires the authority fences an answer in flight before 
   assert.deepEqual([result.handled, result.handled && result.result, result.handled && result.delivery], [true, "undeliverable", "refusal"]);
   assert.equal(await service.fenceRetired(), true, "nothing is in flight afterwards");
 
-  // A target that cannot fence its delivery makes the fence unconfirmed, and the owner is told so.
   const blind = fakeTarget({ request: request({ id: "session-2:8:abcd" }) });
   let release!: (result: "uncertain") => void;
   const blindStarted = new Promise<void>(resolve => { blind.target.answer = () => { resolve(); return new Promise(done => { release = done; }); }; });
@@ -226,7 +223,6 @@ test("an owner verdict leaves the dialog pending and makes it the owner's", asyn
   assert.equal(answers.length, 0);
   assert.equal(service.holder("session-1", 7), "owner");
   assert.equal(service.ownerClass("session-1", 7), "credentials", "the owner push names the class");
-  // The same pending request is not decided again on the next scheduler pass.
   await service.handle(target);
   assert.equal(answers.length, 0);
 });
@@ -335,12 +331,10 @@ test("a team member's task that changed while the request was decided withholds 
     task: () => teamPermissionTask(now, undefined),
   });
   assert.equal((await target.check()).ok, true);
-  // The host names a run on its own; that is no change of the member's task.
   now = { ...run, title: "A name the host wrote" };
   assert.equal((await target.check()).ok, true);
   now = { ...run, objective: "Objective, and never touch the release branch" };
   assert.deepEqual(await target.check(), { ok: false, stale: false, reason: "The member's task changed after the request was read." });
-  // A dialog that closed is reported as gone, whatever the task reads now.
   open = false;
   assert.deepEqual(await target.check(), { ok: false, stale: true, reason: "The permission dialog changed or closed." });
 });

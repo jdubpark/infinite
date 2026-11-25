@@ -10,7 +10,6 @@ import type { AgentProfile, InputControl } from "./types.js";
 import { NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 import { connectCodexEnvironments, type CodexEnvironmentClient, type CodexExecutor } from "./codex-environment.js";
 
-/** Default hybrid launches use the native frontend; ordinary cloud PTYs retain argv passthrough. */
 export function validateNativeCodexArgs(args: string[], initialPrompt = "", allowEmpty = false) {
   const values = new Set(["-m", "--model", "-c", "--config", "-a", "--ask-for-approval", "-s", "--sandbox"]);
   const flags = new Set(["--no-alt-screen", "--search"]);
@@ -26,13 +25,10 @@ export function validateNativeCodexArgs(args: string[], initialPrompt = "", allo
     else if (!value.startsWith("-") && prompt === undefined) prompt = value;
     else throw new Error("Local Codex UI supports a prompt, --model, --config, --ask-for-approval, --sandbox, --search and --no-alt-screen. Use terminal mode for other native arguments.");
   }
-  // Codex does not materialize an empty thread for a second native frontend.
-  // Hybrid launches can retain the original terminal until the first real prompt.
   if (!(prompt ?? initialPrompt).trim()) {
     if (allowEmpty) return launch;
     throw new Error("Cloud Codex's local interface requires an initial prompt. Use infinite --laptop codex to start in your laptop project, or omit --local-ui for a cloud terminal.");
   }
-  // A prompt such as "login" is text, never a provider administration command.
   return [...launch, "--", prompt ?? initialPrompt];
 }
 
@@ -40,8 +36,6 @@ type Message = { id?: number | string; method?: string; params?: Record<string, 
 type Attachment = { authority: InputControl; used: boolean };
 type Executor = CodexExecutor;
 
-/** A prepared host uses the qualified backend automatically; wrapped profiles
- * select their backend explicitly so a different Unix identity is never bypassed. */
 function appServerLaunch(profile: AgentProfile) {
   if (profile.appServerCommand) return { command: profile.appServerCommand, args: profile.appServerArgs ?? [] };
   const prepared = fileURLToPath(new URL("../../../.local/codex-handoff/bin/codex-app-server", import.meta.url));
@@ -49,11 +43,6 @@ function appServerLaunch(profile: AgentProfile) {
   return { command: profile.command, args: [...profile.args, "app-server"] };
 }
 
-/**
- * One cloud backend and one cloud observer TUI per Infinite session. Provider credentials
- * never leave this process. Every local frontend frame is fenced by the worker's lease.
- */
-/** A completed app-server item as one chat message; items without user-facing text yield none. */
 export function nativeItemMessage(item: unknown): TranscriptMessage | undefined {
   if (!item || typeof item !== "object") return undefined;
   const row = item as Record<string, unknown>;
@@ -82,7 +71,6 @@ export async function startNativeCodex(options: {
   onThread: (id: string) => void;
   onExit: () => void;
   onSignal: (signal: Signal) => void;
-  /** Completed conversation items, as the provider reports them. */
   onMessage?: (message: TranscriptMessage) => void;
   noAltScreen: boolean;
   record: (method: string) => void;
@@ -132,7 +120,6 @@ export async function startNativeCodex(options: {
       child!.stdout!.on("data", read); child!.stderr!.on("data", read);
       child!.once("error", failed); child!.once("exit", exited);
     });
-    // Continue draining diagnostics; they can contain local paths and are not public records.
     child.stdout!.resume(); child.stderr!.resume();
     if (execution) {
       environments = await connectCodexEnvironments({ endpoint, token, onDisconnect: options.onExecutionUnavailable });
@@ -176,8 +163,6 @@ export async function startNativeCodex(options: {
             };
             if (method === "thread/start") {
               if (!observer || threadId || startRequest !== undefined || message.id === undefined) { refuse(); return; }
-              // The installed app-server cannot hydrate the TUI's paginated default.
-              // Legacy history supports same-thread rejoin once a user message exists.
               message.params = { ...params, historyMode: "legacy" };
               startRequest = message.id;
             } else if (method === "thread/fork" || method === "thread/delete" || method === "thread/archive" || method === "thread/unarchive") { refuse(); return; }
@@ -191,8 +176,6 @@ export async function startNativeCodex(options: {
                 message.params = { ...message.params, cwd: executor.cwd, runtimeWorkspaceRoots: executor.roots,
                   environments: [{ environmentId: executor.environmentId, cwd: executor.cwd, runtimeWorkspaceRoots: executor.roots }] };
               }
-              // Resume/settings cwd overrides can reset Codex's sticky environment to
-              // the app-server host. The session's selected workspace stays authoritative.
               if (method === "thread/resume" || method === "thread/settings/update") {
                 message.params = { ...params };
                 delete message.params.cwd;
@@ -240,8 +223,6 @@ export async function startNativeCodex(options: {
               send(upstream, JSON.stringify({ id: checkpointRequest, method: "thread/read", params: { threadId, includeTurns: true } }));
             }
             if (observer) environments?.observe(message);
-            // Only the persistent observer records provider events, so extra UIs do
-            // not duplicate timeline entries. A provider turn ending is not task completion.
             if (observer && message.params?.threadId === threadId) {
               if (message.method === "turn/started") { lastMessage = undefined; options.onSignal({ kind: "turn-start" }); }
               if (message.method === "item/completed" && message.params?.item?.type === "agentMessage" && typeof message.params.item.text === "string")
@@ -271,7 +252,6 @@ export async function startNativeCodex(options: {
       connect(authority: InputControl) {
         options.checkControl(authority);
         if (!ready || !threadId || stopped) throw new Error("Native frontend is not ready");
-        // Unused credentials are bounded and valid only while their control lease survives.
         for (const [key, value] of attachments) { try { options.checkControl(value.authority); } catch { attachments.delete(key); } }
         if (attachments.size >= 32) throw new Error("Too many native attachments");
         const credential = randomBytes(32).toString("hex");

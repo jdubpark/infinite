@@ -1,23 +1,15 @@
 [Unit]
 Description=Infinite agent egress firewall rule (see deploy/ubuntu/egress.md)
-# Loads after the system ruleset, which may flush everything, and before agents start.
 After=nftables.service
 Before=infinite.service
-# Restarting or reloading nftables.service flushes every table, this one included, so this unit follows it. The
-# moment in between has no rule; stop agent work before touching nftables.service (see the runbook).
 PartOf=nftables.service
 ReloadPropagatedFrom=nftables.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# The file deletes and recreates only the inet infinite_egress table, in one transaction: other tables are
-# untouched, there is no moment without a rule, and a file that fails to load leaves the previous table in force.
 ExecStart=/usr/sbin/nft -f /etc/infinite-egress/firewall.nft
-# Use reload, never restart, for every change of variant: restart stops the unit first, which removes the table.
 ExecReload=/usr/sbin/nft -f /etc/infinite-egress/firewall.nft
-# Stopping the unit removes the rule: that is the full rollback. From then on the agent account's connections that
-# skip the proxy go out unlogged and unrefused, metadata addresses included. Stop agent work first (see the runbook).
 ExecStop=-/usr/sbin/nft delete table inet infinite_egress
 
 [Install]

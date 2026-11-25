@@ -6,11 +6,9 @@ import { decisionChoices, formatDecisionAnswer } from "./decision-answer";
 type DecisionProps = {
   decision: QueueDecisionRecord & { revision?: number };
   disabled: boolean;
-  /** Who asks: a team role's name on the team page, "Team" or "Mission" in the decision queue. */
   from: string;
   answer: (text: string) => void;
   readOnly: boolean;
-  /** The decision queue selects first and sends second. The team page sends a single choice on its click. */
   deferAnswer?: boolean;
   selectedAnswers?: string[];
   onSelectionChange?: (answers: string[]) => void;
@@ -24,7 +22,6 @@ export function Decision({ decision, disabled, from, answer, readOnly, deferAnsw
   const recommendedAnswers = [...new Set(recommendation?.answers ?? [])];
   const choices = decisionChoices(decision.options, recommendedAnswers, decision.answerMode);
   const multiple = decision.answerMode === "multiple";
-  // A question without options offers only the agent's own answer, and the box above it already shows that text.
   const hasOptions = decision.options.length > 0;
 
   const select = (option: string) => {

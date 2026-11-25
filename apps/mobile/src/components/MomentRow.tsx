@@ -12,7 +12,6 @@ const GLYPHS: Record<Moment["kind"], string> = {
   notice: "!",
 };
 
-/** One timeline entry; press to expand its recorded detail. */
 export function MomentRow({ moment }: { moment: Moment }) {
   const [open, setOpen] = useState(false);
   return (

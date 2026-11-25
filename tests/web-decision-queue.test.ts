@@ -176,7 +176,6 @@ test("an answered decision stays hidden until a read that began after the answer
 
 test("an answered decision the host still lists at the fifth read after the answer shows again", () => {
   assert.equal(ANSWERED_RESTORE_READ, 5);
-  // Read 4 is the first read that began after the answer to "a", so read 8 is the fifth.
   const hidden = new Map([["a", 4], ["b", 9]]);
   for (const read of [4, 5, 6, 7]) assert.deepEqual([...settleAnsweredKeys(hidden, read, new Set(["a", "b"]))], [["a", 4], ["b", 9]], `read ${read} keeps both hidden`);
   assert.deepEqual([...settleAnsweredKeys(hidden, 8, new Set(["a", "b"]))], [["b", 9]], "the fifth read shows it again");

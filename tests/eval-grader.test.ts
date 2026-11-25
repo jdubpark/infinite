@@ -30,7 +30,6 @@ test.after(() => {
   for (const dir of sandboxes) rmSync(dir, { recursive: true, force: true });
 });
 
-/** The fixture as the launcher prefix. Extra flags go before the operation, as the fixture expects. */
 function config(sb: Sandbox, extra: string[] = [], canaries: string[] = []): EvalGraderConfig {
   return {
     prefix: { command: process.execPath, args: [FIXTURE, "--root", sb.root, "--uid", String(UID), "--record", sb.record, ...extra] },
@@ -59,7 +58,6 @@ test("the probe names every unsafe state", async () => {
   const exitSixtyFour = launcherGrader(() => ({ prefix: { command: process.execPath, args: ["-e", "process.exit(64)"] }, root: sb.root, canaries: [] }));
   assert.equal((await exitSixtyFour.probe([])).state, "misconfigured");
 
-  // The default host uid is this process's, and the fixture runs as this process.
   assert.equal((await launcherGrader(() => config(sb)).probe([])).state, "misconfigured");
 
   chmodSync(sb.root, 0o755);
@@ -164,7 +162,6 @@ test("stop reaches a round that is still running", async () => {
   const sb = sandbox();
   const client = grader(sb);
   const running = client.run(JOB, ".", 60, ["sleep", "30"]);
-  // The fixture lists the run's process group once its child has started; a stop before that would find nothing.
   const groups = `${sb.root}.groups`;
   for (let i = 0; i < 200 && !(existsSync(groups) && readFileSync(groups, "utf8").trim() !== ""); i++) await sleep(25);
   const started = Date.now();
@@ -189,7 +186,6 @@ test("export keeps its limit", async () => {
   assert.equal(await g.export(JOB, countingSink(), 1 << 20), "failed", "a job without a task clone exported");
   assert.equal(sent, 0);
 
-  // C1 is the trial branch, so the export has content; the fixture's run builds it under the launcher's environment.
   const identity = "-c user.name=t -c user.email=t@example.invalid";
   const made = await g.run(JOB, "task", 60, ["/bin/sh", "-c",
     `git init -q && git ${identity} commit -q --allow-empty -m c1 && git branch trial && git ${identity} commit -q --allow-empty -m c2`]);
@@ -202,11 +198,9 @@ test("export keeps its limit", async () => {
   assert.equal(await g.export(JOB, countingSink(), 1 << 20), "exported");
   assert.ok(sent > 10, `the sink got ${sent} bytes of the bundle`);
 
-  // A sink that fails, as a closed launcher's stdin does, ends the export as failed instead of throwing.
   const broken = new Writable({ write(_chunk, _encoding, callback) { callback(new Error("the reader closed")); } });
   assert.equal(await g.export(JOB, broken, 1 << 20), "failed");
 
-  // A version 2 launcher reports its version; a version 1 launcher's probe has none.
   assert.equal((await grader(sb, { hostUid: OTHER_UID }).probe([])).version, 2);
   assert.equal((await grader(sb, { hostUid: OTHER_UID }, ["--no-version"]).probe([])).version, undefined);
 });

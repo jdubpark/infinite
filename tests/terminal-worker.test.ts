@@ -13,8 +13,6 @@ import { waitFor } from "./helpers.js";
 import type { Bootstrap, ControlActor, ControlLease, Event, Receipt, TerminalSnapshot, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
 import type { TeamAssignment } from "../packages/host/src/team-types.js";
 
-// This process supplies actual PTY output and authenticated hooks. Assertions below use only
-// worker IPC and its encrypted journal, never internal queues, timers, or a substituted clock.
 const AGENT = String.raw`
 process.stdin.setRawMode(true);
 process.stdin.setEncoding("utf8");
@@ -165,7 +163,7 @@ async function fixture(provider: "demo" | "claude" | "codex" = "demo", initialPr
       const lease = await call<ControlLease>({ op: "control", action: "claim", actor, takeover: true });
       await call({ op: "stop", requestId: randomUUID(), actor, leaseId: lease.id });
     } catch {
-      try { await call({ op: "stop", requestId: randomUUID() }); } catch { /* already stopped */ }
+      try { await call({ op: "stop", requestId: randomUUID() }); } catch { }
     }
     if (worker.exitCode === null && worker.signalCode === null)
       await Promise.race([new Promise(resolve => worker.once("exit", resolve)), new Promise(resolve => setTimeout(resolve, 3500))]);
@@ -313,7 +311,6 @@ test("worker snapshots preserve titles and refuse unhandled OSC or extended SGR 
   let title = "";
   restored.onTitleChange(value => { title = value; });
   try {
-    // Components equal to extended SGR codes are ordinary RGB data, not underline settings.
     await worker.command("sgr 38;2;21;58;59;48:2::58:21:59");
     await waitFor(async () => worker.output(), output => output.includes("SGR DONE 38;2;21;58;59;48:2::58:21:59"));
     await worker.command("title");
@@ -364,7 +361,6 @@ test("worker control fences input and resize, keeps retry receipts stable, and r
     assert.equal(observing.pid, before.pid);
     assert.deepEqual(observing.control, { id: lease.id, label: a.label, expiresAt: lease.expiresAt });
     assert.deepEqual(worker.persisted().runtime, worker.runtime);
-    // The real lease deadline is intentional: observers must not keep a disconnected owner alive.
     await new Promise(resolve => setTimeout(resolve, lease.expiresAt - Date.now() + 60));
     assert.equal((await worker.call({ op: "state" })).control, null);
     await assert.rejects(worker.call({ op: "raw", requestId: randomUUID(), text: "expired\n", actor: a, leaseId: lease.id }), { code: "control-lost" });
@@ -579,7 +575,6 @@ test("a session permission answer types one recognised option outside any run, o
     assert.deepEqual(await worker.call<Receipt & { result?: string }>(reject), receipt);
     assert.equal(intents(worker).length, 1, "a replayed request types nothing again");
 
-    // A person who takes control after the intent stops the answer before its Enter.
     await worker.call({ op: "control", action: "release", actor, leaseId: lease.id });
     await worker.command("permission");
     const next = await waitFor(() => worker.call({ op: "state" }), state => state.attention.state === "needs-you" && (state.attention.prompt?.id ?? 0) > prompt.id && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
@@ -592,7 +587,6 @@ test("a session permission answer types one recognised option outside any run, o
     assert.equal(interrupted.state, "uncertain");
     assert.equal(worker.output().match(/APPROVED/g)?.length, 1, "only the first answer reached the dialog");
 
-    // An owner act that ends the decision's authority fences it: the host's lease is dropped and its answer types nothing.
     const person = (await worker.call({ op: "state" })).control!;
     await worker.call({ op: "control", action: "release", actor: human, leaseId: person.id });
     const retired = randomUUID(), retiredActor = { id: `session-permission:${retired}`, label: "Session permission" };

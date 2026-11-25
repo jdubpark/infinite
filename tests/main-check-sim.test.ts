@@ -8,14 +8,6 @@ import type { Config } from "../packages/host/src/types.js";
 import type { Counts } from "./outcome-sim-script.js";
 import { simulate, type Variant, Violation } from "./fixtures/main-check-sim.js";
 
-/*
- * Runs the main-check simulator (tests/fixtures/main-check-sim.ts, which states the invariants I1-I10) over the default
- * corpus, and checks that each mutant below is caught through the invariant it names while the same corpus passes
- * without it.
- */
-
-// MAIN_CHECK_SIM_SEED=N runs that seed alone and skips the mutants; MAIN_CHECK_SIM_SEEDS=N runs N seeds from
-// MAIN_CHECK_SIM_BASE (default 1). Floors describe the default corpus only.
 const DEFAULT_SEEDS = 200;
 const ONLY = process.env.MAIN_CHECK_SIM_SEED;
 const COUNT = Number(process.env.MAIN_CHECK_SIM_SEEDS ?? DEFAULT_SEEDS);
@@ -26,7 +18,6 @@ const DEFAULT_CORPUS = ONLY === undefined && COUNT === DEFAULT_SEEDS && BASE_SEE
 
 const sortedCounts = (counts: Counts) => Object.entries(counts).sort(([a], [b]) => (a < b ? -1 : 1));
 
-/** Runs `seeds` one after another (each is CPU-bound on a virtual clock) and returns the first violation. */
 async function sweep(seeds: readonly number[], counts: Counts, variant: Variant = {}): Promise<Violation | undefined> {
   for (const seed of seeds) {
     try { await simulate(seed, counts, variant); }
@@ -38,18 +29,6 @@ async function sweep(seeds: readonly number[], counts: Counts, variant: Variant 
   return undefined;
 }
 
-/**
- * Floors for the default corpus at about half of what it produced, so a generator that stops producing a case fails.
- * They follow the cases the specification lists: a host stop after each kind of record write; heads that move,
- * revert, repeat, arrive late or twice; two projects; a halt during a check, and one that surely came before any other
- * stop; a command whose leader exits while its child holds the pipes; checks changing at a measured head; a
- * census that fails, finds processes or is clean; a removal that fails; acceptances at once, late, out of order,
- * stale or never (a push that reached no device), and a notice offered again once its minute in flight ended; a
- * failure told, then the checks changed, and nothing offered until the next result (I10). The
- * thinnest ran 3 to 8 times: a stop after a `told` write, the R8 ending of a record that read again, an out-of-order
- * acceptance, and a stop on a write of close(). A stop inside a command's drain ran once (`command:drain-stopped`) and
- * has no floor; the real-process tests in tests/team-command-leader.test.ts cover it.
- */
 const FLOORS: Readonly<Record<string, number>> = {
   "stop:after-create": 8, "stop:after-admission": 18, "stop:after-witness": 50, "stop:after-finish": 22, "stop:after-retire": 20,
   "stop:after-observe": 70, "stop:after-told": 2, "stop:after-waiting": 37, "stop:after-settle": 3,
@@ -85,17 +64,14 @@ test("the main check keeps its invariants across host stops, halts, faults and l
   }
 });
 
-// ---- Mutations ---------------------------------------------------------------------------------------------------
-
 type Slot = { record?: MainCheckRecord; unreadable?: true };
-/** The private service members the mutants replace or read on one instance. No file is edited. */
 type Private = {
   config: Config;
   ports: MainCheckPorts;
   slots: Map<string, Slot>;
   retirement: Map<string, string>;
   listed: boolean;
-  active?: unknown;
+  phase: { kind: string; active?: unknown };
   unwritten: Set<unknown>;
   hostBusy(projectId: string): string | undefined;
   pollHalt(active: unknown): void;
@@ -122,7 +98,7 @@ const MUTATIONS: readonly Mutation[] = [
     variant: patch(host => {
       host.hostBusy = projectId => {
         if (host.slots.get(projectId)?.record?.retiring?.length) return host.retirement.get(projectId) ?? "processes";
-        if (!host.listed || host.active || host.unwritten.size > 0) return "another-check";
+        if (!host.listed || (host.phase.kind === "running" && host.phase.active) || host.unwritten.size > 0) return "another-check";
         for (const slot of host.slots.values()) if (slot.record?.running || slot.record?.retiring?.length) return "another-check";
         return undefined;
       };

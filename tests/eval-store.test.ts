@@ -62,7 +62,6 @@ function fixture(): Fixture {
   };
 }
 
-/** A fixture with the module registered and ready. */
 function ready(): Fixture & { module: ReturnType<typeof evalCorpusModule> } {
   const f = fixture();
   const module = evalCorpusModule(f.store, () => NOW);
@@ -187,7 +186,6 @@ test("a marker and its completion are written once", () => {
     assert.equal(again, false);
     assert.equal(snapshot(f), afterComplete);
 
-    // Deleting the run's rows (no status event: the rows go) leaves nothing for a late completion to write.
     assert.equal(f.store.deleteRun(RUN), true);
     assert.equal(count(f, "eval_tasks"), 0);
     const late = f.store.write(tx => completeMaterial(tx, taskId, storeResult([SECRET_FILE], randomBytes(40), undefined), NOW));
@@ -230,12 +228,10 @@ test("deleting a cancelled run deletes its tasks; another status stamps them", (
     assert.equal(f.store.deleteRun(runC), true);
     assert.equal(count(f, "eval_tasks", "run_id=?", runC), 0);
 
-    // A run whose only status is `blocked` loses its tasks and material, even though it has an event.
     assert.equal(f.store.deleteRun(runD), true);
     assert.equal(count(f, "eval_tasks", "run_id=?", runD), 0);
     assert.equal(count(f, "eval_material", "task_id LIKE ?", `%${runD}%`), 0);
 
-    // The host never deletes a run that is ready for review, so this status means that later events were lost: delete.
     assert.equal(f.store.deleteRun(runE), true);
     assert.equal(count(f, "eval_tasks", "run_id=?", runE), 0);
     assert.equal(count(f, "eval_material", "task_id LIKE ?", `%${runE}%`), 0);
@@ -283,7 +279,6 @@ test("approval marks follow the latest approval", () => {
 test("the corpus caps hold", () => {
   const f = ready();
   try {
-    // A project at the byte cap: a stored size of 11 bytes is refused whole, 10 bytes is kept.
     const overA = capturedTaskId(RUN, "m-cap-a");
     f.store.write(tx => insertMarker(tx, captureStart("m-cap-a", COMMIT), { state: "captured", capsule: capsule() }, NOW));
     f.store.write(tx => tx.run("UPDATE eval_tasks SET material_bytes=? WHERE task_id=?", PROJECT_MATERIAL_MAX_BYTES - 10, overA));
@@ -307,7 +302,6 @@ test("the corpus caps hold", () => {
     assert.equal(stored?.material, "stored");
     assert.equal(count(f, "eval_material", "task_id=? AND part='reference'", fitsB), 1);
 
-    // A project at the row cap: one bulk write holds 20,000 rows, and the next marker is refused.
     const ref = f.store.write(tx => tx.index("project", PROJECT));
     f.store.write(tx => {
       for (let i = 0; i < PROJECT_TASK_MAX; i++) {
@@ -378,7 +372,6 @@ test("a sweep pass visits a bounded number of projects, and the next pass goes o
   const at = (days: number) => new Date(Date.parse(NOW) - days * DAY_MS).toISOString();
   const f = ready();
   try {
-    // Seventy projects, none configured: each has one row past the fallback cutoff and one younger row.
     for (let i = 0; i < 70; i++) {
       const projectId = `project-${String(i).padStart(3, "0")}`;
       f.store.write(tx => insertMarker(tx, captureStart("m-old", COMMIT, { runId: `run-walk-${i}`, projectId, at: at(400) }), { state: "captured", capsule: capsule() }, NOW));
@@ -388,7 +381,6 @@ test("a sweep pass visits a bounded number of projects, and the next pass goes o
     const pass = () => f.store.write(tx => sweepEvalTasks(tx, NOW, [], 365, SWEEP_BATCH, cursor));
     assert.equal(pass(), 64);
     assert.equal(pass(), 6);
-    // The walk reached its end, so the next pass starts over: a second old row in every project is found the same way.
     for (let i = 0; i < 70; i++) {
       const projectId = `project-${String(i).padStart(3, "0")}`;
       f.store.write(tx => insertMarker(tx, captureStart("m-old-2", COMMIT, { runId: `run-walk-${i}`, projectId, at: at(400) }), { state: "captured", capsule: capsule() }, NOW));
@@ -402,7 +394,6 @@ test("a sweep pass visits a bounded number of projects, and the next pass goes o
     f.close();
   }
 
-  // One configured project with five old rows, a row limit of two, and a fresh cursor, in a store of its own.
   const g = ready();
   try {
     for (let i = 0; i < 5; i++) {
@@ -423,7 +414,6 @@ test("a sweep pass visits a bounded number of projects, and the next pass goes o
 test("the reconcile pass visits the oldest rows of both states", () => {
   const f = ready();
   try {
-    // Two captured tasks and two candidates, with check times that interleave.
     const ids = ["m-1", "m-2", "m-3", "m-4"].map(member => {
       f.store.write(tx => insertMarker(tx, captureStart(member, COMMIT), { state: "captured", capsule: capsule() }, NOW));
       return capturedTaskId(RUN, member);
@@ -439,7 +429,6 @@ test("the reconcile pass visits the oldest rows of both states", () => {
     const first = f.store.write(tx => reconcileBatch(tx, task => { visited.push(task.taskId); return { kind: "wait" }; }, NOW, 2));
     assert.deepEqual(visited, [ids[1], ids[2]], "The two oldest checks, one of each state, oldest first");
     assert.equal(first.visited, 2);
-    // The next pass takes the two that are left, so a candidate is checked again however many captured tasks wait.
     visited.length = 0;
     f.store.write(tx => reconcileBatch(tx, task => { visited.push(task.taskId); return { kind: "wait" }; }, "2026-11-14T12:00:01.000Z", 2));
     assert.deepEqual(visited, [ids[0], ids[3]]);
@@ -451,7 +440,6 @@ test("the reconcile pass visits the oldest rows of both states", () => {
 test("the periodic passes read through an index", () => {
   const f = ready();
   try {
-    // The statements the reconcile pass, the hook's run list, and the sweep's fallback run, with their bound values.
     const statements: { sql: string; params: (string | number)[]; seek?: true }[] = [
       { sql: RECONCILE_ORDER_SQL, params: ["captured", 100] },
       { sql: RECONCILE_ORDER_SQL, params: ["candidate", 100] },

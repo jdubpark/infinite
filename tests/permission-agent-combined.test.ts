@@ -1,9 +1,3 @@
-/**
- * The permission agent's parts together: the real decision core (with an in-process reviewer launcher),
- * the real pipeline, journal, delegation record and interactive delivery. Only the reviewer process and
- * the dialog are stand-ins. Each part has its own tests against fakes of the others; this file shows
- * that they agree.
- */
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -49,7 +43,6 @@ function fixture() {
   assert.ok(state);
   const delegation = new PermissionDelegationService(config, key, groups as never);
 
-  // The reviewer process: the test sets each tier's report, and every turn is kept.
   const turns: PermissionTurn[] = [];
   const reports: { light: unknown; strong: unknown } = { light: { verdict: "refer", note: "not routine" }, strong: { verdict: "reject", code: "uncertain", note: "undecided" } };
   const launcher: PermissionTurnLauncher = {
@@ -62,14 +55,12 @@ function fixture() {
   const settings = { light, strong: [strongClaude, strongDeepSeek], maxMissRate: 0.05, minCases: 100 };
   const core = createPermissionAgentCore({
     settings, launcher,
-    // A replay result for the current policy and profiles, under the owner's threshold.
     results: { latest: binding => ({ id: "replay-1", binding, finishedAt: "2026-11-14T09:00:00.000Z", cases: 120, missRate: { count: 0, relevant: 90, rate: 0, lower: 0, upper: 0.04 } }) },
   });
   const pipeline = new HostPermissionPipeline({ core, journal, delegation, state });
   const delivery = new InteractivePermissionDelivery({ pipeline: () => pipeline, ledger: new EvidenceDeliveryLedger(store) });
 
   let seq = 0;
-  /** One pending dialog of a Codex team member, with complete tool input. */
   const dialog = (command: string, destructive = false) => {
     seq++;
     const request: PermissionRequest = {
@@ -99,14 +90,12 @@ test("the real core, pipeline, journal and delivery decide and deliver together"
   try {
     assert.deepEqual(f.core.readiness(), { ready: true, reasons: [] });
 
-    // No owner delegation: nothing is decided, recorded or delivered.
     const before = f.dialog("npm test");
     assert.equal((await f.delivery.handle(before.target)).handled, false);
     assert.deepEqual([f.turns.length, f.journal.decisions().length, before.answers.length], [0, 0, 0]);
 
     f.delegation.delegate("workspace-one", { requestId: randomUUID() }, { deviceId: "owner-device" });
 
-    // A routine request: the light tier allows it and the accept option is sent once.
     f.reports.light = { verdict: "allow", note: "a routine check" };
     const routine = f.dialog("npm test");
     const allowed = await f.delivery.handle(routine.target);
@@ -117,7 +106,6 @@ test("the real core, pipeline, journal and delivery decide and deliver together"
     assert.deepEqual([allow.tiers.map(tier => tier.tier), allow.rules], [["light"], []]);
     assert.deepEqual(f.journal.deliveries(allow.id).map(event => event.kind), ["intent", "receipt"]);
 
-    // A class request: a host rule names the owner, no model turn starts, and the dialog stays open.
     const credential = f.dialog("cat ~/.ssh/id_ed25519");
     const owner = await f.delivery.handle(credential.target);
     assert.deepEqual([owner.handled && owner.result, owner.handled && owner.interruptClass], ["owner", "credentials"]);
@@ -126,24 +114,20 @@ test("the real core, pipeline, journal and delivery decide and deliver together"
     assert.deepEqual(f.journal.decisions({ verdict: "owner" })[0].rules, ["class:credential-store"]);
     assert.equal(f.delivery.holder("session-1", credential.target.request.prompt!.id), "owner");
 
-    // A request outside the session root is raised: no light turn, and the strong turn comes from another family than the requester's.
     f.reports.strong = { verdict: "reject", code: "outside-workspace", note: "The model's own words, for the owner only." };
     const outside = f.dialog("cat /var/log/system.log");
     const rejected = await f.delivery.handle(outside.target);
     assert.deepEqual([rejected.handled && rejected.result, rejected.handled && rejected.code], ["rejected", "outside-workspace"]);
     assert.deepEqual(f.turns.slice(1).map(turn => [turn.tier, turn.profile.id]), [["strong", "strong-claude"]]);
-    // The requester gets the host's fixed notice through the reject option, never the model's note.
     assert.deepEqual(outside.answers, [{ option: 1, notice: requesterNotice("outside-workspace") }]);
     const [reject] = f.journal.decisions({ verdict: "reject" });
     assert.equal(reject.note, "The model's own words, for the owner only.");
     assert.ok(reject.rules.includes("raise:outside-root"));
 
-    // The same request again is answered from the record: the same reject, and no further model turn.
     const again = f.dialog("cat /var/log/system.log");
     const replayed = await f.delivery.handle(again.target);
     assert.deepEqual([replayed.handled && replayed.result, f.turns.length], ["rejected", 2]);
 
-    // A destructive request the strong tier allows is delivered; the strong tier decided it.
     f.reports.strong = { verdict: "allow", noInterruptClass: true, note: "removes the build output" };
     const destructive = f.dialog("rm -rf dist", true);
     const strong = await f.delivery.handle(destructive.target);

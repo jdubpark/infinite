@@ -4,7 +4,6 @@ import type { AddressInfo } from "node:net";
 import express from "express";
 import { permissionWriteFence, type PermissionFence } from "../packages/host/src/permission-write-fence.js";
 
-/** A route table like the host's: the fence is mounted once, in front of every route. */
 async function app(settle: () => Promise<PermissionFence>) {
   const server = express();
   server.use(express.json());
@@ -34,7 +33,6 @@ test("every write, a DELETE or an owner halt included, is acknowledged only afte
       release({});
       assert.deepEqual(await reply, expected);
     }
-    // A fence that was not confirmed is reported in an object reply and leaves another reply as it is.
     const uncertain = fetch(`${h.base}/api/halt`, { method: "POST" }).then(response => response.json());
     await new Promise(resolve => setTimeout(resolve, 50));
     release({ deliveryFence: "uncertain" });
@@ -43,12 +41,10 @@ test("every write, a DELETE or an owner halt included, is acknowledged only afte
     await new Promise(resolve => setTimeout(resolve, 50));
     release({ deliveryFence: "uncertain" });
     assert.deepEqual(await list, ["a"]);
-    // An error reply waits too: the write may have changed state before it failed.
     const failed = fetch(`${h.base}/api/fails`, { method: "POST" });
     await new Promise(resolve => setTimeout(resolve, 50));
     release({});
     assert.equal((await failed).status, 400);
-    // A read never waits and never settles.
     const before = calls;
     assert.deepEqual(await (await fetch(`${h.base}/api/permissions/log`)).json(), { read: true });
     assert.equal(calls, before);

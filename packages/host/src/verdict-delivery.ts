@@ -3,8 +3,6 @@ import type { EvidenceDb } from "./evidence/types.js";
 import { runSignals } from "./outcome-store.js";
 import type { DeliveryFact } from "./verdict-types.js";
 
-/** "none": no active host landing of the run, or its stored reviewedHead differs from `head`, or its `at` is before `since`.
- *  "reverted": such a landing, and an active host revert row of the run. Else "landed". Reads signals only. */
 export function deliveryFact(db: EvidenceDb, runId: string, head: string, since: string): DeliveryFact {
   const rows = runSignals(db, runId).filter(row => row.state === "active" && row.author === "host" && row.authority === "receipt");
   const landing = rows.find(row => row.kind === "landing");
@@ -15,7 +13,6 @@ export function deliveryFact(db: EvidenceDb, runId: string, head: string, since:
   return reverted ? "reverted" : "landed";
 }
 
-/** The team service's port: the fact, or undefined when the store cannot be read. Never throws. */
 export function deliveryPort(store: Pick<EvidenceStore, "read">): (runId: string, head: string, since: string) => DeliveryFact | undefined {
   return (runId, head, since) => {
     try {

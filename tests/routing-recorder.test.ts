@@ -33,7 +33,6 @@ const ALL = (store: EvidenceStore) => {
   store.register(routingModule());
 };
 
-/** A fresh store with the modules `register` adds. A fixed vault key keeps the blind indexes stable. */
 function withStore(fn: (store: EvidenceStore) => void, register: (store: EvidenceStore) => void = ALL): void {
   const root = mkdtempSync(join(tmpdir(), "infinite-routing-recorder-"));
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: Buffer.alloc(32, 7) });
@@ -66,7 +65,6 @@ function config(tx: EvidenceTx, id: string, profile: TeamModelProfile, version: 
     + "VALUES (?, ?, ?, ?, ?, 'g', 'k', 'off', 's', ?)", id, profile.provider, profile.model, effortOf(profile), version, NOW);
 }
 
-/** An implementer start that integrated, was held, and froze. `failed` makes it stall instead. */
 function integrated(spec: { id: string; profile: TeamModelProfile; configId: string; endedAt?: string; area?: string;
   projectId?: string; epoch?: number; failed?: boolean }): OutcomeRow {
   const payload: OutcomePayload = { projectId: spec.projectId ?? "rehearsal", taskId: "task-x", area: spec.area ?? AREA, featureMap: "default",
@@ -97,7 +95,6 @@ test("a shadow start writes one recorded row with both picks", () => withStore(s
     assert.equal(rows.length, 1);
     const row = rows[0]!;
     assert.equal(row.coordinatorProfileId, coordinator);
-    // The contributor profile is removed by the fixed rules, so the coordinator's pick is the only candidate.
     assert.equal(row.chosenProfileId, "astra-xhigh");
     assert.equal(row.greedyProfileId, "astra-xhigh");
     assert.equal(row.basis, "single-candidate");
@@ -113,7 +110,6 @@ test("a shadow start writes one recorded row with both picks", () => withStore(s
     assert.equal(row.payload?.projectId, "rehearsal");
     assert.equal(row.payload?.taskId, taskId);
   }
-  // The key and the seed use the task's blind index, never its plain id.
   const blind = store.read(db => db.index("task", "task-spark"));
   const row = rowsOf(store, run.id, "task-spark")[0]!;
   assert.equal(row.key, decisionKey(run.id, run.revision, blind, "start", 1));
@@ -141,7 +137,6 @@ test("a second start reuses the row whatever the store holds now", () => withSto
   const task = taskOf("task-a", { agentProfileId: "spark-high" });
   const rec = recorder(store);
   const original = store.read.bind(store) as EvidenceStore["read"];
-  // Statements that read evidence: the outcome rows and the profile epochs. The key read is not one of them.
   let evidenceStatements = 0;
   let reads = 0;
   const counting = (fn: Parameters<EvidenceStore["read"]>[0]) => {
@@ -161,7 +156,6 @@ test("a second start reuses the row whatever the store holds now", () => withSto
   assert.ok(evidenceStatements > 0, "the first start reads the evidence");
   const before = rowsOf(store, run.id, "task-a")[0]!;
 
-  // Thirty counted rows for the astra identity arrive between the two starts.
   store.write(tx => {
     for (let index = 0; index < 30; index++) {
       writeOutcome(tx, integrated({ id: `late-${index}`, profile: mixedLineup.implementers[1]!, configId: "none", endedAt: NOW }));
@@ -176,7 +170,6 @@ test("a second start reuses the row whatever the store holds now", () => withSto
   } finally {
     (store as { read: EvidenceStore["read"] }).read = original;
   }
-  // A reused row costs one read, the key read, and no evidence statement.
   assert.equal(reads, 1);
   assert.equal(evidenceStatements, 0);
   assert.equal(countRows(store), 1);
@@ -206,7 +199,6 @@ test("the posterior counts the store's rows of each candidate, OpenCode included
 test("without its evidence store the recorder logs the reason once and writes nothing", () => {
   const root = mkdtempSync(join(tmpdir(), "infinite-routing-broken-"));
   try {
-    // The evidence directory is a file, so the store opens unavailable.
     mkdirSync(join(root, "state"), { recursive: true });
     writeFileSync(join(root, "state", "evidence"), "not a directory");
     const broken = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: Buffer.alloc(32, 7) });
@@ -260,7 +252,6 @@ test("a failed read is caught, logged once, and writes no row", () => withStore(
 
 test("a payload over its limit logs its own line once and writes no row", () => withStore(store => {
   const routing = pinRouting(undefined, "autonomous", mixedLineup)!;
-  // A pinned knob padded past the limit makes the payload's JSON too large. Legal inputs alone cannot reach it.
   const padded = { ...routing, knobs: { ...routing.knobs, padding: "x".repeat(PAYLOAD_LIMIT_BYTES) } } as unknown as typeof routing;
   const run = runOf(mixedLineup, padded, "run-large");
   const lines: string[] = [];
@@ -311,7 +302,6 @@ test("an uncovered start writes no row", () => withStore(store => {
   assert.equal(countRows(store), 0);
   assert.deepEqual(lines, []);
 
-  // A run without a pinned policy reads nothing: the store is not even asked for a read.
   let reads = 0;
   const original = store.read.bind(store) as EvidenceStore["read"];
   (store as { read: EvidenceStore["read"] }).read = fn => { reads += 1; return original(fn); };
@@ -432,7 +422,6 @@ test("two profiles of one identity share the first one's prompt version", () => 
   const payload = rowsOf(store, run.id, "task-a")[0]!.payload!;
   assert.notEqual(versionOf(astra), versionOf(twin));
   assert.deepEqual(payload.current, [{ identity: identityOf(astra), epoch: 1, promptVersion: versionOf(astra) }]);
-  // One identity has one cost: the first profile's tier, whichever profile comes last.
   assert.deepEqual(payload.candidates.map(candidate => candidate.costUsd), [TIER_COSTS.light, TIER_COSTS.light]);
 }));
 
@@ -462,7 +451,6 @@ test("a strong profile is costed at the strong tier default", () => withStore(st
 }));
 
 test("eight candidates with integrated rows at all three levels stay within the payload limit", () => withStore(store => {
-  // The longest ids the schemas allow: profile id 40, label 100, model 120, project 80, task 40.
   const pad = (text: string, length: number) => `${text}-${"x".repeat(length)}`.slice(0, length);
   const projectId = pad("project", 80);
   const taskId = pad("t", 40);
@@ -474,7 +462,6 @@ test("eight candidates with integrated rows at all three levels stay within the 
   store.write(tx => {
     for (const [index, profile] of implementers.entries()) {
       config(tx, `cfg-${index}`, profile, versionOf(profile));
-      // Three levels: the task's cell, another area of the project, and another project.
       const levels = [["cell", {}], ["project", { area: "elsewhere/" }], ["tenant", { projectId: "other" }]] as const;
       for (const [level, where] of levels) {
         for (let k = 0; k < 7; k++) {
@@ -507,12 +494,10 @@ test("a shadow decision counts an applied row in full, and an auto pin records n
     return candidate.posterior!.reward.find(level => level.level === "cell")!.observed.success;
   };
 
-  // Baseline: the outcome row counts at the chosen weight.
   recorder(store).recordStart(startOf(runOf(mixedLineup, pinRouting(undefined, "autonomous", mixedLineup), "run-base"), taskOf("task-base")));
   const before = tenantSuccess("run-base", "task-base");
   assert.ok(before > 0);
 
-  // The same outcome row, now the router's applied choice: it counts in full.
   const appliedTask = taskOf("task-applied");
   const applied = { ...runOf(mixedLineup, pinRouting({ mode: "auto" }, "supervised", mixedLineup, ago(20)), "applied-run"), tasks: [appliedTask], members: [] } as unknown as TeamRun;
   recorder(store).applyStart(startOf(applied, appliedTask));
@@ -521,7 +506,6 @@ test("a shadow decision counts an applied row in full, and an auto pin records n
   const after = tenantSuccess("run-after", "task-after");
   assert.ok(Math.abs(after - 2 * before) < 1e-12, `applied success ${after} is twice the half-weight ${before}`);
 
-  // An auto pin records no shadow row and reads nothing at the start.
   const rows = countRows(store);
   const autoRun = runOf(mixedLineup, pinRouting({ mode: "auto", allowContributor: true }, "supervised", mixedLineup, ago(20)), "run-auto-skip");
   let reads = 0;
@@ -536,7 +520,6 @@ test("a shadow decision counts an applied row in full, and an auto pin records n
   assert.equal(countRows(store), rows);
 }));
 
-/** Task 6's lineup: two escalations that pass rules 1 and 2 and one more that the fixed rules remove, and a light and a strong implementer. */
 const POINT_LINEUP: TeamLineup = {
   ...mixedLineup,
   implementers: [
@@ -555,12 +538,10 @@ const POINT_LINEUP: TeamLineup = {
 const ASTRA_E = POINT_LINEUP.escalations![1]!;
 const SONNET_E = POINT_LINEUP.escalations![2]!;
 const ASTRA_I = POINT_LINEUP.implementers[1]!;
-/** A period that ended 20 days ago, so an auto pin is taken. */
 const ENDED = ago(20);
 const POINTS_PIN = { mode: "auto", points: ["start", "escalation", "scout"] } as unknown as TeamRouting;
 const AUTO_UNAVAILABLE = AUTO_LOG.unavailable;
 
-/** A run that carries the fields the recorder reads, with no events yet. */
 const pointRun = (lineup: TeamLineup, routing: TeamRun["routing"], id: string) =>
   ({ id, revision: 1, projectId: "rehearsal", lineup, routing, events: [], tasks: [], members: [] }) as unknown as TeamRun;
 const escalationInput = (run: TeamRun, task: TeamTask, ownProfileId: string | undefined, namedProfileId?: string): RouterEscalation =>
@@ -583,7 +564,6 @@ const countReads = (store: EvidenceStore, fn: () => void): number => {
   return reads;
 };
 
-/** A store whose evidence directory is a file, so it opens unavailable. */
 function withBrokenStore(fn: (store: EvidenceStore) => void): void {
   const root = mkdtempSync(join(tmpdir(), "infinite-routing-recorder-broken-"));
   try {
@@ -600,7 +580,6 @@ function withBrokenStore(fn: (store: EvidenceStore) => void): void {
   }
 }
 
-/** Task 6's evidence: ten integrated escalations of sonnet-escalation, and ten starts of astra-escalation that do not count there. */
 function seedPointRows(store: EvidenceStore): void {
   const escalated = (spec: Parameters<typeof integrated>[0]): OutcomeRow => {
     const row = integrated(spec);
@@ -637,7 +616,6 @@ test("a shadow pin of version 2 records the new points, and a version-1 pin reco
     assert.equal(scout?.role, "scout");
     assert.equal(scout?.state, "recorded");
     assert.equal(scout?.coordinatorProfileId, "astra-xhigh");
-    // Shadow rows at the new points count nowhere in the start progress.
     assert.equal(store.read(db => shadowProgress(db, "rehearsal")).decisions, 0);
 
     const before = countRows(store);
@@ -648,12 +626,10 @@ test("a shadow pin of version 2 records the new points, and a version-1 pin reco
     assert.equal(v1Rec.routeEscalation(escalationInput(old, taskOf("task-v1"), "astra-xhigh", "sonnet-escalation")), undefined);
     assert.equal(v1Rec.routeScout(scoutInput(old, scoutOf("scout-v1", "astra-xhigh"))), undefined);
     assert.equal(countRows(store), before, "a version-1 pin writes no row at a new point");
-    // A pin made before this slice keeps version 1 and routes only start, whatever its points say.
     const older = pointRun(POINT_LINEUP, { ...shadow!, algorithmVersion: 1 }, "run-shadow-older");
     assert.equal(v1Rec.routeEscalation(escalationInput(older, taskOf("task-older"), "astra-xhigh", "sonnet-escalation")), undefined);
     assert.equal(v1Rec.routeScout(scoutInput(older, scoutOf("scout-older", "astra-xhigh"))), undefined);
     assert.equal(countRows(store), before, "a version-1 pin that lists the new points writes no row at them");
-    // A version-2 pin records only the points it lists.
     const scoutOnly = pinRouting({ mode: "shadow", points: ["start", "scout"] } as unknown as TeamRouting, "supervised", POINT_LINEUP);
     assert.equal(scoutOnly?.algorithmVersion, 2);
     const partial = pointRun(POINT_LINEUP, scoutOnly, "run-shadow-scout-only");
@@ -662,7 +638,6 @@ test("a shadow pin of version 2 records the new points, and a version-1 pin reco
     assert.deepEqual(lines, []);
   });
 
-  // Without its evidence store the shadow path logs the unavailable line once over both calls, and writes nothing.
   withBrokenStore(store => {
     const shadow = pinRouting({ mode: "shadow", points: ["start", "escalation", "scout"] } as unknown as TeamRouting, "supervised", POINT_LINEUP);
     const run = pointRun(POINT_LINEUP, shadow, "run-shadow-broken");
@@ -680,41 +655,34 @@ test("an auto run routes covered points, a revoked run falls back without a run 
   const lines: string[] = [];
   const rec = recorder(store, lines);
 
-  // Covered: the escalation is the router's greedy pick, and the scout takes the lowest tier cost (the first light one).
   const run = pointRun(POINT_LINEUP, routing, "run-covered");
   assert.deepEqual(rec.routeEscalation(escalationInput(run, taskOf("task-e"), "astra-xhigh")), SONNET_E);
   const scout = scoutOf("scout-1");
   assert.deepEqual(rec.routeScout(scoutInput(run, scout)), ASTRA_I);
   assert.deepEqual(scout.routing, { profileId: "astra-xhigh", by: "router" });
-  // A kept scout routing that is still a candidate is returned without a read.
   const rowsCovered = countRows(store);
   assert.equal(countReads(store, () => { assert.deepEqual(rec.routeScout(scoutInput(run, scout)), ASTRA_I); }), 0);
   assert.equal(countRows(store), rowsCovered);
   assert.deepEqual(run.events, [], "a router pick writes no run line");
   assert.deepEqual(lines, []);
 
-  // Revoked, unnamed: the fallback profiles, with no row and no run line.
   const revoked = { ...pointRun(POINT_LINEUP, routing, "run-revoked"), routingRevokedAt: NOW } as unknown as TeamRun;
   assert.deepEqual(rec.routeEscalation(escalationInput(revoked, taskOf("task-r"), "astra-xhigh")), ASTRA_E);
   const revokedScout = scoutOf("scout-r");
   assert.deepEqual(rec.routeScout(scoutInput(revoked, revokedScout)), ASTRA_I);
   assert.deepEqual(revokedScout.routing, { profileId: "astra-xhigh", by: "fallback" });
-  // Revoked, named: today's path applies.
   assert.equal(rec.routeEscalation(escalationInput(revoked, taskOf("task-r2"), "astra-xhigh", "sonnet-escalation")), undefined);
   assert.equal(rec.routeScout(scoutInput(revoked, scoutOf("scout-r2", "haiku-light"))), undefined);
   assert.equal(countRows(store), rowsCovered, "the revoked fallbacks write no row");
   assert.deepEqual(revoked.events, [], "a revoked fallback writes no run line");
   assert.deepEqual(lines, []);
 
-  // Uncovered: the only escalation is the reviewer's model, so no escalation is covered.
   const onlyOpus = { ...POINT_LINEUP, escalations: [POINT_LINEUP.escalations![0]!] };
   const uncovered = pointRun(onlyOpus, pinRouting(POINTS_PIN, "supervised", onlyOpus, ENDED), "run-uncovered");
   assert.equal(rec.routeEscalation(escalationInput(uncovered, taskOf("task-u"), "astra-xhigh")), undefined);
-  // The member's own profile is the only escalation candidate, so the point is uncovered for that member.
   const sonnetOnly = { ...POINT_LINEUP, escalations: [SONNET_E] };
   const ownOnly = pointRun(sonnetOnly, pinRouting(POINTS_PIN, "supervised", sonnetOnly, ENDED), "run-own-only");
   assert.equal(rec.routeEscalation(escalationInput(ownOnly, taskOf("task-o"), SONNET_E.id)), undefined);
-  // A version-1 auto pin routes only start.
   const v1 = pointRun(POINT_LINEUP, pinRouting({ mode: "auto", points: ["start"] } as unknown as TeamRouting, "supervised", POINT_LINEUP, ENDED), "run-v1");
   assert.equal(rec.routeEscalation(escalationInput(v1, taskOf("task-v"), "astra-xhigh")), undefined);
   assert.equal(countRows(store), rowsCovered, "an uncovered run writes no row");

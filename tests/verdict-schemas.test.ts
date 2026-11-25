@@ -45,7 +45,6 @@ const context = {
   nonGoals: ["No new formats"], allowedPaths: ["src"], evidence: [], previousWork: [],
   deadlineAt: "2030-01-01T00:00:00.000Z", maxMembers: 4,
 };
-// Produced by the base commit's schema, not by hand.
 const BASE_CONTEXT = '{"id":"00000000-0000-4000-8000-000000000001","revision":1,"cycle":2,"successCriteria":"The export keeps its header row.","nonGoals":["No new formats"],"allowedPaths":["src"],"evidence":[],"previousWork":[],"deadlineAt":"2030-01-01T00:00:00.000Z","maxMembers":4}';
 const row = (n: number, extra: Record<string, unknown> = {}) => ({ criterion: `c${n}`, status: "met", check: "tests-pass", ...extra });
 

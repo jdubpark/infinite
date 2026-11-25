@@ -7,7 +7,6 @@ import type { TeamCommand } from "./team-types.js";
 import type { AssessedState, ComposedState, CriterionReason, DeliveryFact, VerdictCounts, VerdictReason, VerdictReport } from "./verdict-types.js";
 import { VERDICT_LIMITS } from "./verdict-types.js";
 
-/** A verdict writes only while the log stays within these bounds; otherwise the record write is skipped. */
 const VERDICT_LOG = { entries: 300, bytes: 160 * 1024 } as const;
 
 export type ComposeInput = {
@@ -15,12 +14,9 @@ export type ComposeInput = {
   head: string;
   kind: "reviewed" | "no-change";
   configured: readonly TeamCommand[];
-  /** Step 4's receipts at `head`; undefined when no pass ran there. */
   receipts?: readonly ObjectiveReceipt[];
-  /** Host facts at `head`; undefined when the host cannot tell. */
   facts: { checksPassed?: boolean; reviewApproved?: boolean; delivery?: DeliveryFact };
   changedPaths: { paths: readonly string[]; truncated: boolean };
-  /** The evaluator's screened report; absent when no evaluator answered, with `reason`. */
   report?: VerdictReport;
   reason?: VerdictReason;
 };
@@ -53,7 +49,6 @@ function safePath(path: string): boolean {
   return path.split("/").every(part => part !== "" && part !== "." && part !== "..");
 }
 
-/** Form and membership only (call 7): the host reads nothing here. */
 export function resolveHandle(handle: string, input: Pick<ComposeInput, "receipts" | "changedPaths" | "record">): boolean {
   if (handle.length < 1 || handle.length > VERDICT_LIMITS.handleChars) return false;
   if (handle.startsWith("receipt:")) return (input.receipts ?? []).some(item => item.handle === handle);
@@ -67,7 +62,6 @@ export function resolveHandle(handle: string, input: Pick<ComposeInput, "receipt
 
 type Judged = { state: ComposedState; reason?: CriterionReason; receipt?: ComposedCriterion["receipt"] };
 
-/** The receipt kind of a delivery criterion; undefined for every other criterion. */
 export function deliveryReceiptOf(criterion: Criterion): "merged" | "landed" | undefined {
   const check = criterion.check;
   return check.kind === "receipt" && (check.receipt === "merged" || check.receipt === "landed") ? check.receipt : undefined;
@@ -158,7 +152,6 @@ export function composeVerdict(input: ComposeInput): ComposedVerdict {
       judged = { state: entry.state };
     }
 
-    // Rule 1: a changed pinned file voids `met`. An unknown change list voids it for every pinned criterion.
     const pinned = criterion.pinned ?? [];
     const changed = pinned.length > 0 && (input.changedPaths.truncated || pinned.some(item => input.changedPaths.paths.includes(item.path)));
     if (judged.state === "met" && changed) judged = { ...judged, state: "inconclusive", reason: "pinned-changed" };
@@ -170,7 +163,6 @@ export function composeVerdict(input: ComposeInput): ComposedVerdict {
       composed.evaluatorState = entry.state;
       if (entry.note !== undefined) composed.note = entry.note;
     }
-    // Rule 2: the host state stands; the report's opposite is recorded. An evaluator `inconclusive` is no contradiction.
     if (criterion.producer === "host" && entry !== undefined && deliveryReceiptOf(criterion) === undefined) {
       const hostState = judged.state;
       if ((hostState === "met" && entry.state === "not-met") || (hostState === "not-met" && entry.state === "met")) composed.contradicted = true;
@@ -186,7 +178,6 @@ export function composeVerdict(input: ComposeInput): ComposedVerdict {
     else counts.pendingOwner += 1;
   }
 
-  // Rule 3. An empty list is never `met`.
   let result: AssessedState = "met";
   if (counts.notMet > 0) result = "not-met";
   else if (counts.inconclusive > 0 || criteria.length === 0) result = "inconclusive";
@@ -199,8 +190,6 @@ export function composeVerdict(input: ComposeInput): ComposedVerdict {
 
 type Meta = { verdictId: string; kind: "reviewed" | "no-change"; revision: number; head: string; at: string; supersedes?: readonly string[] };
 
-/** `latest` on every active criterion and the log entries, sealed at one version with sealRecord; "log-full" when the entries
- *  would pass 300 log entries or 160 KiB. Never writes a note. */
 export function verdictRecord(record: ObjectiveRecord, verdict: ComposedVerdict, meta: Meta): ObjectiveRecord | "log-full" {
   const version = record.version + 1;
   const handle = `verdict:${meta.verdictId}`;
@@ -210,7 +199,6 @@ export function verdictRecord(record: ObjectiveRecord, verdict: ComposedVerdict,
   for (const item of verdict.criteria) {
     const current = record.criteria.find(candidate => candidate.id === item.id);
     if (current === undefined || !activeIds.has(item.id)) continue;
-    // A superseding verdict replaces only what one of the superseded ids wrote: a newer verdict of another run stays.
     if (meta.supersedes !== undefined && (current.latest === undefined || !meta.supersedes.includes(current.latest.verdictId))) continue;
     before[item.id] = current.latest === undefined ? null : { state: current.latest.state, verdictId: current.latest.verdictId };
     after[item.id] = { state: item.state, verdictId: meta.verdictId };

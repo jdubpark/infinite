@@ -23,7 +23,6 @@ const base = (id: string, rest: Partial<Criterion> & Pick<Criterion, "check" | "
   id, origin: "owner", statement: `Statement ${id}`, state: "active", ...rest,
 });
 
-/** Part 9's criteria: c0 judgement, c1 artifact, c2 citation-form, c3 judgement, c4 command pinned, c5 owner rating 4 of 5. */
 function part9(): Criterion[] {
   return [
     { id: "c0", origin: "owner", statement: "", statementOf: "objective", check: { kind: "judgement", item: "owner-text" },
@@ -109,7 +108,6 @@ test("acceptance 6: a failing receipt overrides the evaluator", () => {
 test("the result follows the composition rules", () => {
   const good = [`file:${SHORTLIST}`];
   const receiptsAllPass = [receipt("c1", "pass"), receipt("c4", "pass")];
-  // Host command and artifact rows.
   for (const [outcome, state, reason] of [["pass", "met", undefined], ["fail", "not-met", undefined], ["unknown", "inconclusive", "receipt-unknown"]] as const) {
     const composed = composeVerdict(input({ receipts: [receipt("c1", outcome)] }));
     const c1 = find(composed.criteria, "c1");
@@ -121,12 +119,10 @@ test("the result follows the composition rules", () => {
   assert.equal(noReceipt.state, "inconclusive");
   assert.equal(noReceipt.reason, "no-receipt");
   assert.equal(find(composeVerdict(input({ receipts: [] })).criteria, "c1").reason, "no-receipt");
-  // A receipt of another commit, or of an assumption, is not read.
   assert.equal(find(composeVerdict(input({ receipts: [receipt("c1", "pass", OLD)] })).criteria, "c1").state, "inconclusive");
   const assumptionReceipt: ObjectiveReceipt = { ...receipt("c1", "pass"), subject: "assumption" };
   assert.equal(find(composeVerdict(input({ receipts: [assumptionReceipt] })).criteria, "c1").state, "inconclusive");
 
-  // Host receipt facts.
   for (const [item, facts] of [["checks-passed", { checksPassed: true }], ["review-approved", { reviewApproved: true }]] as const) {
     const criteria = part9().map(entry => (entry.id === "c2" ? { ...entry, check: { kind: "receipt", receipt: item } as const, threshold: { kind: "pass" } as const } : entry));
     const subject = (value: ComposeInput["facts"]) => find(composeVerdict(input({ record: record(criteria), facts: value })).criteria, "c2");
@@ -142,7 +138,6 @@ test("the result follows the composition rules", () => {
     assert.equal(c2.state, "inconclusive");
     assert.equal(c2.reason, "before-delivery");
   }
-  // The six pairs of kind and delivery fact. Only the fact settles a delivery criterion.
   const deliveryCriteria = (kind: "merged" | "landed") => part9().map(entry => (entry.id === "c2" ? { ...entry, check: { kind: "receipt", receipt: kind } as const, threshold: { kind: "pass" } as const } : entry));
   const delivered = (kind: "merged" | "landed", delivery: DeliveryFact | undefined, extra: Partial<ComposeInput> = {}) =>
     find(composeVerdict(input({ record: record(deliveryCriteria(kind)), facts: { checksPassed: true, reviewApproved: true, ...(delivery === undefined ? {} : { delivery }) }, ...extra })).criteria, "c2");
@@ -155,15 +150,12 @@ test("the result follows the composition rules", () => {
   }
   assert.equal(deliveryReceiptOf(deliveryCriteria("merged")[2]!), "merged");
   assert.equal(deliveryReceiptOf(part9()[2]!), undefined);
-  // A changed pinned file still voids a delivery `met`.
   const pinnedDelivery = deliveryCriteria("merged").map(entry => (entry.id === "c2" ? { ...entry, pinned: [{ path: PINNED, blob: BLOB }] } : entry));
   const voided = find(composeVerdict(input({ record: record(pinnedDelivery), facts: { delivery: "landed" }, changedPaths: { paths: [PINNED], truncated: false } })).criteria, "c2");
   assert.equal(voided.state, "inconclusive");
   assert.equal(voided.reason, "pinned-changed");
-  // citations and citation-form wait for step 7.
   assert.equal(find(composeVerdict(input()).criteria, "c2").reason, "no-receipt");
 
-  // Evaluator judgement rows.
   const noReport = composeVerdict(input({ receipts: receiptsAllPass, reason: "evaluator-unavailable" }));
   assert.equal(find(noReport.criteria, "c0").reason, "no-evaluator");
   assert.equal(find(noReport.criteria, "c3").reason, "no-evaluator");
@@ -182,27 +174,22 @@ test("the result follows the composition rules", () => {
   assert.equal(find(bareInconclusive.criteria, "c0").state, "inconclusive");
   assert.equal(find(bareInconclusive.criteria, "c0").reason, undefined);
 
-  // Result rules 1 to 3.
   const allMet = report({ c0: "met", c3: "met" }, good);
   const withCitation = part9().map(entry => (entry.id === "c2" ? { ...entry, check: { kind: "receipt", receipt: "checks-passed" } as const, threshold: { kind: "pass" } as const } : entry));
   const full = (facts: ComposeInput["facts"], extra: Partial<ComposeInput> = {}) =>
     composeVerdict(input({ record: record(withCitation, [rating("top-10", 4, HEAD)]), receipts: [receipt("c1", "pass"), receipt("c4", "pass")], facts, report: allMet, ...extra }));
   assert.equal(full({ checksPassed: true }, { changedPaths: { paths: [], truncated: false } }).result, "met");
-  // pending-owner never blocks met.
   const pending = composeVerdict(input({
     record: record(withCitation), receipts: [receipt("c1", "pass"), receipt("c4", "pass")], facts: { checksPassed: true }, report: allMet,
   }));
   assert.equal(find(pending.criteria, "c5").state, "pending-owner");
   assert.equal(pending.result, "met");
   assert.equal(pending.counts.pendingOwner, 1);
-  // One owner not-met gives not-met.
   const ownerNo = composeVerdict(input({
     record: record(withCitation, [rating("top-10", 3, HEAD)]), receipts: [receipt("c1", "pass"), receipt("c4", "pass")], facts: { checksPassed: true }, report: allMet,
   }));
   assert.equal(ownerNo.result, "not-met");
-  // One inconclusive and no not-met gives inconclusive.
   assert.equal(full({}).result, "inconclusive");
-  // not-met outranks inconclusive.
   const mixed = composeVerdict(input({ receipts: [receipt("c1", "fail")], report: allMet }));
   assert.equal(mixed.result, "not-met");
   assert.equal(mixed.counts.notMet, 1);
@@ -220,11 +207,9 @@ test("the host never upgrades: the report cannot lift an unknown, a missing inpu
   assert.equal(find(composed.criteria, "c5").state, "pending-owner");
   assert.equal(composed.result, "inconclusive");
   assert.equal(composed.evaluatorResult, "met");
-  // An evaluator inconclusive is no contradiction.
   const soft = composeVerdict(input({ receipts: [receipt("c1", "pass")], report: report({ c1: "inconclusive" }) }));
   assert.equal(find(soft.criteria, "c1").state, "met");
   assert.equal(find(soft.criteria, "c1").contradicted, undefined);
-  // The other direction: the evaluator says not-met and the receipt passes.
   const opposite = composeVerdict(input({ receipts: [receipt("c1", "pass")], report: report({ c1: "not-met" }) }));
   assert.equal(find(opposite.criteria, "c1").state, "met");
   assert.equal(find(opposite.criteria, "c1").contradicted, true);
@@ -276,7 +261,6 @@ test("handles resolve by form and membership", () => {
   assert.equal(resolveHandle("file:src/a.ts", { ...context, receipts: undefined }), true);
   assert.equal(resolveHandle(`receipt:${RUN}:1:c1`, { ...context, receipts: undefined }), false);
 
-  // A met with no handle, and a not-met with one bad handle, become inconclusive.
   const empty = composeVerdict(input({ report: report({ c0: "met" }, []) }));
   assert.equal(find(empty.criteria, "c0").state, "inconclusive");
   assert.equal(find(empty.criteria, "c0").reason, "unresolved-evidence");
@@ -296,10 +280,8 @@ test("a changed pinned file voids met", () => {
   assert.equal(state({ paths: [], truncated: true }).reason, "pinned-changed");
   assert.equal(state({ paths: ["src/a.ts"], truncated: false }).state, "met");
   assert.equal(state({ paths: [], truncated: false }).state, "met");
-  // It voids met only: a fail stays not-met, and an unpinned criterion ignores truncation.
   assert.equal(find(composeVerdict(input({ receipts: [receipt("c4", "fail")], changedPaths: { paths: [PINNED], truncated: false } })).criteria, "c4").state, "not-met");
   assert.equal(find(composeVerdict(input({ receipts: [receipt("c1", "pass")], changedPaths: { paths: [], truncated: true } })).criteria, "c1").state, "met");
-  // Precedence: the pinned rule runs before the contradiction rule, so a voided met is no contradiction.
   const voided = composeVerdict(input({ receipts, changedPaths: { paths: [PINNED], truncated: false }, report: report({ c4: "not-met" }) }));
   assert.equal(find(voided.criteria, "c4").state, "inconclusive");
   assert.equal(find(voided.criteria, "c4").contradicted, undefined);
@@ -313,15 +295,12 @@ test("owner criteria read only a rating on the head", () => {
   assert.equal(state([rating("top-10", 5, OLD)]), "pending-owner");
   assert.equal(state([]), "pending-owner");
   assert.equal(state([rating("other", 5, HEAD)]), "pending-owner");
-  // The newest rating on the head wins.
   assert.equal(state([rating("top-10", 5, HEAD), rating("top-10", 2, HEAD)]), "not-met");
   assert.equal(state([rating("top-10", 2, HEAD), rating("top-10", 5, HEAD)]), "met");
-  // Only the owner's own entry counts: an entry by another actor, or an unreadable score, is ignored.
   const forged: LogEntry = { ...rating("top-10", 5, HEAD), actor: "evaluator", authority: "claim" };
   assert.equal(state([forged]), "pending-owner");
   const text: LogEntry = { ...rating("top-10", 5, HEAD), after: { inline: { subject: "top-10", score: "5", commit: HEAD } } };
   assert.equal(state([text]), "pending-owner");
-  // The evaluator's report never sets an owner criterion.
   const lifted = composeVerdict(input({ report: report({ c5: "met" }) }));
   assert.equal(find(lifted.criteria, "c5").state, "pending-owner");
   assert.equal(find(lifted.criteria, "c5").contradicted, undefined);
@@ -365,11 +344,9 @@ test("the record write holds latest without notes and fits one entry", () => {
     assert.equal("note" in (item.latest ?? {}), false);
   }
   assert.equal(objectiveRecordSchema.safeParse(written).success, true);
-  // The write undoes cleanly.
   const rebuilt = rebuildVersion(written, start.version);
   assert.equal(rebuilt.criteria.every(item => item.latest === undefined), true);
 
-  // A second verdict keeps the first one's latest in `before`.
   const second = verdictRecord(written, composed, { ...META, verdictId: "7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d" });
   assert.notEqual(second, "log-full");
   if (second === "log-full") return;
@@ -378,7 +355,6 @@ test("the record write holds latest without notes and fits one entry", () => {
   assert.equal(JSON.stringify(secondEntry.before.inline).includes(VERDICT), true);
   assert.equal(rebuildVersion(second, written.version).criteria[0]!.latest?.verdictId, VERDICT);
 
-  // At 299 log entries a write with two entries is refused; one entry still fits.
   const crowded = record(part9(), [], 299);
   assert.equal(crowded.log.length, 299);
   const receipts = [receipt("c1", "pass"), receipt("c4", "fail")];
@@ -409,7 +385,6 @@ test("a superseding verdict replaces latest only where it names the superseded v
   const first = verdictRecord(start, composeVerdict(input({ record: start, receipts: [receipt("c1", "pass")] })), META);
   assert.notEqual(first, "log-full");
   if (first === "log-full") return;
-  // A later verdict of another id covers c1 only; c2 keeps the first verdict.
   const partial = composeVerdict(input({ record: first, receipts: [receipt("c1", "fail")] }));
   const later = verdictRecord(first, { ...partial, criteria: partial.criteria.filter(item => item.id === "c1") }, { ...META, verdictId: SECOND });
   assert.notEqual(later, "log-full");
@@ -417,10 +392,8 @@ test("a superseding verdict replaces latest only where it names the superseded v
   const latestOf = (item: ObjectiveRecord, id: string) => item.criteria.find(entry => entry.id === id)?.latest?.verdictId;
   assert.equal(latestOf(later, "c1"), SECOND);
   assert.equal(latestOf(later, "c2"), VERDICT);
-  // The superseding verdict of the first id writes c2, where it is still current, and not c1.
   const mixed = later;
   const composed = composeVerdict(input({ record: mixed, facts: { delivery: "landed" }, receipts: [receipt("c1", "pass")] }));
-  // The chain may hold ids the record never got; c1 answers against its receipt, but this verdict does not write c1.
   const answered = { ...composed, criteria: composed.criteria.map(item => (item.id === "c1" ? { ...item, contradicted: true as const, evaluatorState: "not-met" as const } : item)) };
   const superseding = verdictRecord(mixed, answered, { ...META, verdictId: THIRD, supersedes: ["0d4e5f6a-7b8c-4d9e-9fa0-2b3c4d5e6f70", VERDICT] });
   assert.notEqual(superseding, "log-full");
@@ -429,13 +402,11 @@ test("a superseding verdict replaces latest only where it names the superseded v
   assert.equal(latestOf(superseding, "c1"), SECOND);
   assert.equal(superseding.criteria.find(entry => entry.id === "c2")?.latest?.state, "met");
   assert.equal(superseding.log.filter(entry => entry.handle === `verdict:${THIRD}`).length, 1, "no contradiction entry for a criterion this verdict does not write");
-  // No criterion names the superseded verdict: the entry is still written, with empty maps.
   const empty = verdictRecord(superseding, composed, { ...META, verdictId: "9c3d4e5f-6a7b-4c8d-8e9f-1a2b3c4d5e6f", supersedes: ["0d4e5f6a-7b8c-4d9e-9fa0-2b3c4d5e6f70"] });
   assert.notEqual(empty, "log-full");
   if (empty === "log-full") return;
   assert.equal(empty.log.length, superseding.log.length + 1);
   assert.equal(objectiveRecordSchema.safeParse(empty).success, true);
-  // Every version replays.
   for (let version = 1; version <= empty.version; version += 1) assert.equal(rebuildVersion(empty, version).version, version);
   assert.equal(latestOf(rebuildVersion(empty, later.version), "c1"), SECOND);
   assert.equal(latestOf(rebuildVersion(empty, first.version), "c1"), VERDICT);

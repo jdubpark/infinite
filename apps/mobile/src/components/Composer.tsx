@@ -6,20 +6,13 @@ import type { Dictation } from "../dictation/useDictation";
 import { Button } from "./Button";
 import { GlassButton } from "./Glass";
 
-/**
- * Who may type into a session that enforces input control. `take` replaces the field with one
- * line naming the holder and the way to claim it; `held` keeps the field and adds a release.
- */
 export type ComposerAccess =
   | { kind: "take"; holder?: string; busy: boolean; disabled?: boolean; onTake: () => void }
   | { kind: "held"; onRelease: () => void };
 
-/** Past this measured height the field holds more than one line. One line is 21 units tall. */
 const ONE_LINE = 32;
-/** Text this short fits the narrow row beside the controls again, so the wide layout can let go. */
 const SHORT_TEXT = 24;
 
-/** The claim line: who holds control and the way to take it. */
 function TakeStrip({ access }: { access: Extract<ComposerAccess, { kind: "take" }> }) {
   return (
     <View style={s.strip}>
@@ -30,7 +23,6 @@ function TakeStrip({ access }: { access: Extract<ComposerAccess, { kind: "take" 
   );
 }
 
-/** The one-line reminder that this phone holds the lease, with its release. */
 function HeldRow({ onRelease }: { onRelease: () => void }) {
   return (
     <View style={s.held}>
@@ -43,10 +35,6 @@ function HeldRow({ onRelease }: { onRelease: () => void }) {
   );
 }
 
-/**
- * The control dock on its own, for a session whose input goes elsewhere (a mission prompt is
- * answered from its card) but still needs this phone to hold the lease.
- */
 export function ControlDock({ access, onLayout }: { access: ComposerAccess; onLayout?: (event: LayoutChangeEvent) => void }) {
   return (
     <View style={s.area} onLayout={onLayout}>
@@ -57,17 +45,6 @@ export function ControlDock({ access, onLayout }: { access: ComposerAccess; onLa
   );
 }
 
-/**
- * The docked text composer. The caller owns `text`, so a draft outlives the
- * screen. `pending` means the last send is uncertain: the text stays locked
- * and the button reads "Retry", which resends the same request. `blocked`
- * disables text and Send (not Interrupt) and says why, with
- * `blockedPlaceholder` in the empty field. `dictation` adds a mic beside the
- * send control, off whenever the text is read-only. `onInterrupt` adds a stop
- * key in the same row. A field that grows past one line moves its controls
- * under the text so the words keep the full width. `children` render under
- * the input row (the Terminal's key row).
- */
 export function Composer({
   canSteer,
   busy,
@@ -97,9 +74,6 @@ export function Composer({
   onLayout?: (event: LayoutChangeEvent) => void;
   dictation?: Dictation;
 }) {
-  // Wrapping is measured only in the narrow row: once the field has the full width the same text
-  // measures one line again, so the flag sticks until the text is short enough for the row. A draft
-  // cleared from outside (a delivered send) is short too, so it falls back to the row on its own.
   const [wrapped, setWrapped] = useState(false);
   const tall = text.includes("\n") || (wrapped && text.length >= SHORT_TEXT);
   const change = (value: string) => {
@@ -114,7 +88,6 @@ export function Composer({
     );
   }
   const canType = canSteer && !blocked;
-  // Drafts stay editable without control, so dictation does too; only a blocked, busy, or pending field locks.
   const editable = !blocked && !busy && !pending;
   const send = busy
     ? <View accessible accessibilityRole="progressbar" accessibilityLabel={pending ? "Retrying delivery" : "Sending"} style={s.busyButton}><ActivityIndicator color={theme.colors.forest} /></View>
@@ -126,7 +99,6 @@ export function Composer({
       <View style={s.box}>
         {access?.kind === "held" ? <HeldRow onRelease={access.onRelease} /> : null}
         {blocked ? <Text style={s.hint}>{blocked}</Text> : null}
-        {/* The field keeps one tree position across both layouts, so switching never remounts the focused input. */}
         <View style={tall ? s.column : s.row}>
           <TextInput
             accessibilityLabel="Message to agent"

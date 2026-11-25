@@ -13,13 +13,12 @@ import type { TeamCheck, TeamCommand, TeamMember, TeamRun, TeamStatus } from "./
 
 export { objectivePromptOf, registerPin } from "./objective-digest.js";
 
-/** A pass reads for at most 120 seconds, and stops starting reads while 4 reads are stalled. */
 export const REGISTER_PASS = { passMs: 120_000, stalledReads: 4 } as const;
 
 export type RegisterPass = {
   revision: number; kind: PassKind; commit?: string; state: "pending" | "done"; markedAt: string; finishedAt?: string;
-  receipts?: ObjectiveReceipt[];   // at most 40
-  wrote?: number;                  // the record version written
+  receipts?: ObjectiveReceipt[];
+  wrote?: number;
   skipped?: "record-unavailable" | "log-full" | "write-failed";
 };
 export type RegisterDrop = ProposalDrop | "record-unavailable" | "write-failed";
@@ -27,9 +26,9 @@ export type RegisterState = { pass?: RegisterPass; drops?: Partial<Record<Regist
 export type RegisterHolder = { run: TeamRun; objectiveRecord?: unknown; checkHead?: string; register?: RegisterState };
 export type RegisterHost = {
   holder(runId: string): RegisterHolder | undefined;
-  configured(run: TeamRun): readonly TeamCommand[];        // the project's checks now
-  workspace(holder: RegisterHolder): string | undefined;   // run.workspace when assertRunPath passes
-  enqueue(work: () => void): Promise<void>;                // the serial queue
+  configured(run: TeamRun): readonly TeamCommand[];
+  workspace(holder: RegisterHolder): string | undefined;
+  enqueue(runId: string, work: () => void): Promise<void>;
   save(holder: RegisterHolder): void;
   event(holder: RegisterHolder, text: string): void;
   prefix(): TeamCommand | undefined;
@@ -48,7 +47,6 @@ export const REGISTER_EVENTS = {
   proposalsDropped: "Member assumption proposals were dropped at a limit or could not be recorded.",
 } as const;
 
-/** Statuses at which a settled revision is due a pass. */
 const DUE: ReadonlySet<TeamStatus> = new Set<TeamStatus>(["ready-for-review", "merged", "blocked"]);
 
 type Target = ReturnType<typeof passReads>[number];
@@ -56,7 +54,6 @@ type Job = { holder: RegisterHolder; pass: RegisterPass };
 type Plan = { head: string; subjects: Subject[]; reads: Target[]; checks: TeamCheck[]; configured: TeamCommand[]; startedMs: number; cwd?: string };
 type Running = { job: Job; controller: AbortController; done: Promise<void> };
 
-/** The reviewed-head rule of teams.ts: the check head is the run's head, and the run is approved at this revision. */
 export function reviewedHead(holder: RegisterHolder): boolean {
   const run = holder.run;
   return run.headCommit !== undefined && holder.checkHead === run.headCommit &&
@@ -84,15 +81,9 @@ function countsOf(receipts: readonly ObjectiveReceipt[], changed: number): { pas
 
 const isLogFull = (error: unknown): boolean => error instanceof TeamError && error.code === "objective-log-full";
 
-/** The same mark: continue and verification recovery assign back a structuredClone of the holder, so its pass is a copy. */
 const sameMark = (live: RegisterPass | undefined, pass: RegisterPass): live is RegisterPass =>
   live !== undefined && (live === pass || (live.revision === pass.revision && live.kind === pass.kind && live.markedAt === pass.markedAt));
 
-/**
- * The host's test runtime for one run set. A settled revision gets one pass: the host reads the record, plans its subjects and reads,
- * reads each blob outside the serial queue, then applies the receipts through the queue. Member proposals are screened and applied
- * inside the ingest pass. The pass writes only the record and its holder's register state; it never changes a run's status.
- */
 export class TeamRegister {
   goals?: GoalRecordPort;
   private readonly queue: Job[] = [];
@@ -104,14 +95,12 @@ export class TeamRegister {
     this.reader = reader ?? blobReader(() => this.host.prefix());
   }
 
-  /** In `save`, memory only: marks a pass due. The save that calls this writes the holder, so the pass is persisted with it. */
   mark(holder: RegisterHolder): void {
     try {
       const run = holder.run;
       if (run.register !== "on" || !DUE.has(run.status) || !run.checks.some(check => check.revision === run.revision)) return;
       const kind: PassKind = reviewedHead(holder) ? "reviewed" : "check";
       const current = holder.register?.pass;
-      // One pass per revision and kind; nothing replaces a reviewed pass of the same revision.
       if (current && current.revision === run.revision && (current.kind === kind || current.kind === "reviewed")) return;
       const pass: RegisterPass = {
         revision: run.revision, kind, state: "pending", markedAt: this.host.now(),
@@ -120,14 +109,9 @@ export class TeamRegister {
       holder.register = { ...holder.register, pass };
       this.queue.push({ holder, pass });
     } catch {
-      // A mark never fails the save that calls it.
     }
   }
 
-  /**
-   * At the verdict's hold: marks a reviewed pass for the run's current revision when the reviewed-head rule holds, whatever the
-   * run's status. True when such a pass exists after the call. Saves through host.save when it marks. Never throws.
-   */
   markReviewed(holder: RegisterHolder): boolean {
     try {
       const run = holder.run;
@@ -147,14 +131,12 @@ export class TeamRegister {
     }
   }
 
-  /** The receipts of the run's latest pass when it is a reviewed pass at `head`: "pending" while it runs; undefined otherwise. */
   reviewedReceipts(runId: string, head: string): readonly ObjectiveReceipt[] | "pending" | undefined {
     const pass = this.host.holder(runId)?.register?.pass;
     if (pass === undefined || pass.kind !== "reviewed" || pass.commit !== head) return undefined;
     return pass.state === "pending" ? "pending" : (pass.receipts ?? []);
   }
 
-  /** Once at startup: marks every holder and queues every pending pass. */
   restore(holders: Iterable<RegisterHolder>): void {
     for (const holder of holders) {
       try {
@@ -162,12 +144,10 @@ export class TeamRegister {
         const pass = holder.register?.pass;
         if (pass?.state === "pending" && !this.queue.some(item => item.pass === pass)) this.queue.push({ holder, pass });
       } catch {
-        // One holder that cannot be marked does not stop the others.
       }
     }
   }
 
-  /** In the tick: starts the oldest queued pass when none runs. Never awaits, never throws. */
   drain(): void {
     try {
       while (this.running === undefined && !this.closed) {
@@ -180,11 +160,9 @@ export class TeamRegister {
         return;
       }
     } catch {
-      // The tick never fails on a pass.
     }
   }
 
-  /** In the ingest pass, inside the serial queue: applies the kept finding posts that carry `assumption`. Never throws. */
   propose(runId: string, member: TeamMember, posts: readonly MemberPostRecord[]): void {
     try {
       const holder = this.host.holder(runId);
@@ -212,28 +190,23 @@ export class TeamRegister {
       }
       if (changed) this.host.save(holder);
     } catch {
-      // A proposal that cannot be recorded is counted at the next page, never thrown into the ingest pass.
     }
   }
 
-  /** For step 5 and tests: the latest pass's receipts. */
   receipts(runId: string): readonly ObjectiveReceipt[] | undefined {
     return this.host.holder(runId)?.register?.pass?.receipts;
   }
 
-  /** For step 5 and tests: whether the run's latest pass has not finished. */
   pending(runId: string): boolean {
     return this.host.holder(runId)?.register?.pass?.state === "pending";
   }
 
-  /** Stops the queue and aborts the running pass, which then writes nothing. */
   close(): void {
     this.closed = true;
     this.queue.length = 0;
     this.running?.controller.abort();
   }
 
-  /** Settles when no pass runs, including passes that start in between. Tests only. */
   async idle(): Promise<void> {
     while (this.running !== undefined) await this.running.done;
   }
@@ -249,22 +222,20 @@ export class TeamRegister {
     this.running = { job, controller, done };
   }
 
-  /** The three steps of a pass: plan in the queue, read outside it, apply in the queue. */
   private async pass(job: Job, signal: AbortSignal): Promise<void> {
     const box: { plan?: Plan } = {};
-    await this.host.enqueue(() => { box.plan = this.plan(job); });
+    await this.host.enqueue(job.holder.run.id, () => { box.plan = this.plan(job); });
     const plan = box.plan;
     if (plan === undefined || signal.aborted) return;
     const blobs = await this.readBlobs(plan, signal);
     if (signal.aborted) return;
-    await this.host.enqueue(() => this.apply(job, plan, blobs, signal));
+    await this.host.enqueue(job.holder.run.id, () => this.apply(job, plan, blobs, signal));
   }
 
   private plan(job: Job): Plan | undefined {
     if (!this.current(job)) return undefined;
     const { holder, pass } = job;
     const run = holder.run;
-    // The commit the pass was marked at: the run's head may have moved on to a later revision since.
     const head = pass.commit ?? "";
     const state = heldRecordState(holder, this.goals);
     const subjects = state.kind === "ready" ? passSubjects(state.record, pass.kind) : [];
@@ -274,7 +245,6 @@ export class TeamRegister {
     };
   }
 
-  /** One read at a time, in order. A read starts only inside the deadline and while fewer than 4 reads are stalled. */
   private async readBlobs(plan: Plan, signal: AbortSignal): Promise<Map<string, BlobResult>> {
     const blobs = new Map<string, BlobResult>();
     for (const target of plan.reads) {
@@ -336,7 +306,6 @@ export class TeamRegister {
     this.settle(job, receipts, { wrote: applied.record.version, changed: applied.changed.length, refuted: applied.refutedOutcome });
   }
 
-  /** Ends a pass: its receipts stay, its events name only ids and counts, and the holder is saved. */
   private settle(job: Job, receipts: ObjectiveReceipt[], outcome: { skipped?: NonNullable<RegisterPass["skipped"]>; wrote?: number; changed?: number; refuted?: string[] }): void {
     const { holder, pass } = job;
     pass.state = "done";
@@ -353,7 +322,6 @@ export class TeamRegister {
     this.host.save(holder);
   }
 
-  /** Adds counts to the holder's drops. The first drop of a run adds the one fixed event. Returns whether any count was added. */
   private addDrops(holder: RegisterHolder, counts: Partial<Record<RegisterDrop, number>>): boolean {
     const entries = Object.entries(counts).filter((item): item is [RegisterDrop, number] => typeof item[1] === "number" && item[1] > 0);
     if (entries.length === 0) return false;
@@ -366,7 +334,6 @@ export class TeamRegister {
     return true;
   }
 
-  /** The job still belongs to its run and is the holder's latest pass, and the register is open. */
   private current(job: Job): boolean {
     const live = job.holder.register?.pass;
     if (this.closed || this.host.holder(job.holder.run.id) !== job.holder || !sameMark(live, job.pass)) return false;

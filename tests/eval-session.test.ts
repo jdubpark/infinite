@@ -14,19 +14,15 @@ import type { TeamAssignment } from "../packages/host/src/team-types.js";
 import type { Config, SessionPurpose } from "../packages/host/src/types.js";
 import { stopSessionWorkers } from "./helpers.js";
 
-/** A temporary state root with a project, a team workspace, and a fake agent that logs which profile ran. */
 function rig(options: { eval?: boolean } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "eval-session-")));
   const project = join(root, "project"), workspaceDir = join(root, "teams"), cwd = join(workspaceDir, "run");
   const stateDir = join(root, "state"), marks = join(root, "marks.log");
-  // The Manager refuses a run directory whose socket path passes 100 bytes, and the macOS temporary directory alone
-  // is longer than that, so the run directory alone sits under a short /tmp path and is removed with the rest.
   const runDir = mkdtempSync("/tmp/es-run-");
   for (const dir of [project, cwd, stateDir]) mkdirSync(dir, { recursive: true });
   const key = randomBytes(32);
   const keyFile = join(root, "key");
   writeFileSync(keyFile, key, { mode: 0o600 });
-  // The agent appends its label, `production` or `eval`, to the log, then exits. The worker runs it as the profile's command.
   const agent = join(root, "agent.mjs");
   writeFileSync(agent, "import { appendFileSync } from \"node:fs\";\nappendFileSync(process.argv[2], `${process.argv[3]}\\n`);\n");
   const profile = (label: string) => ({ command: process.execPath, args: [agent, marks, label] });
@@ -51,7 +47,6 @@ function rig(options: { eval?: boolean } = {}) {
     root, config, key, manager, cwd, admitted, stateDir,
     labels: () => existsSync(marks) ? readFileSync(marks, "utf8").split("\n").filter(Boolean) : [],
     close: async () => {
-      // Session workers write into the state directory until they stop, so stop them before the tree goes.
       await stopSessionWorkers(config);
       await new Promise(done => setTimeout(done, 1000));
       rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
@@ -61,7 +56,6 @@ function rig(options: { eval?: boolean } = {}) {
 }
 type Rig = ReturnType<typeof rig>;
 
-/** A team implementer session of the given purpose, in the rig's team workspace. */
 async function launch(r: Rig, purpose: SessionPurpose | undefined) {
   const id = randomUUID();
   const team: TeamAssignment = { runId: randomUUID(), memberId: randomUUID(), revision: 1, role: "implementer" };

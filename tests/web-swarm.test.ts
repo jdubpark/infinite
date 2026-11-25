@@ -6,16 +6,12 @@ import { build } from "esbuild";
 import { chromium, type Browser, type Page } from "playwright";
 import { LONG_TOOL } from "./fixtures/web-swarm-data";
 
-// Runs the web client's Swarm view in Chromium on a stand-in host: one mission with three subteams in two projects,
-// two standalone teams, quiet runs, and two solo sessions.
-// PLAYWRIGHT_CHROMIUM_PATH selects a Chromium build other than the one `npx playwright install chromium` provides.
 const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH || chromium.executablePath();
 const skip = existsSync(executablePath) ? false : "Chromium for Playwright is not installed; run `npx playwright install chromium`";
 const harness = fileURLToPath(new URL("./fixtures/web-swarm-harness.tsx", import.meta.url));
 const ORIGIN = "http://127.0.0.1/swarm";
 
 type Control = { requests: string[]; view(view: "lanes" | "wall" | "graph"): void; poll(variant: { shuffleUpdated?: boolean; flipState?: boolean; idle?: boolean; longTool?: boolean }): void };
-// Page-side code reaches the harness through `window.swarm`; functions passed to the page cannot close over test helpers.
 
 describe("web swarm view", { skip }, () => {
   let browser: Browser;
@@ -51,11 +47,9 @@ describe("web swarm view", { skip }, () => {
   test("the three views draw the same agents from one model", async () => {
     const page = await open();
     try {
-      // Five live units: two standalone teams and the mission's three subteams. Quiet runs collapse and carry no agent marks.
       assert.equal(await count(page, ".sw-lane-row[data-unit]"), 5);
       const marks = await count(page, "[data-agent]");
       assert.ok(marks >= 25, `expected the fixture's live agents, saw ${marks}`);
-      // Every run in the fixture carries a fresh updatedAt, as on a real host: a quiet row ages by its agents' last activity.
       const ages = await page.evaluate(() => [...document.querySelectorAll(".sw-quiet .sw-quiet-row .sw-quiet-cell .sw-dim")].map(node => node.textContent));
       assert.deepEqual(ages, ["5h", "1d"]);
       assert.equal(await page.evaluate(() => document.querySelector(".sw-quiet .sw-older")?.textContent), "+1 older");
@@ -65,11 +59,9 @@ describe("web swarm view", { skip }, () => {
 
       await show(page, "graph", '[data-node^="area:"]');
       assert.equal(await count(page, '[data-node^="agent:"]'), marks);
-      // Links are paths; the legend's samples are lines.
       assert.ok(await count(page, "path.sw-g-read") > 0, "observed reads are drawn");
       assert.ok(await count(page, "path.sw-g-integrated") > 0, "integrated changes are drawn");
       assert.ok(await count(page, "path.sw-g-code") > 0, "code links are drawn");
-      // The legend counts the agents without a signal, and each of them says so: in its label, and under its role when it has one.
       const marked = await page.evaluate(() => {
         const labelled = [...document.querySelectorAll('[data-node^="agent:"]')].filter(node => (node.getAttribute("aria-label") ?? "").endsWith(", no signal"));
         return {
@@ -93,7 +85,6 @@ describe("web swarm view", { skip }, () => {
     const page = await open();
     try {
       await page.evaluate(() => (window as unknown as { swarm: Control }).swarm.poll({ idle: true }));
-      // The missions feed empties on its own poll, a moment after the sessions and teams.
       await page.waitForSelector(".sw-lanes .sw-none-live");
       assert.equal(await count(page, "[data-agent]"), 0);
       assert.equal(await count(page, ".sw-quiet .sw-quiet-row"), 2, "settled runs stay listed under the line");
@@ -108,7 +99,6 @@ describe("web swarm view", { skip }, () => {
     const page = await open();
     try {
       await show(page, "wall", ".sw-tile");
-      // A narrow window leaves the inspector too little room for every fact.
       await page.setViewportSize({ width: 1120, height: 800 });
       await page.click(".sw-tile:has(.sw-mark-reported)");
       await page.waitForSelector(".sw-inspector .sw-inspector-fact");
@@ -122,7 +112,6 @@ describe("web swarm view", { skip }, () => {
       const short = facts.filter(fact => fact.fixed), long = facts.filter(fact => !fact.fixed);
       assert.ok(short.length >= 2 && long.length >= 1, "the role and model are short facts; the state is a long one");
       assert.ok(short.every(fact => !fact.cut && fact.inside), "a short fact is never cut");
-      // Only a block box draws the ellipsis; a flex box cuts its text mid-word.
       assert.ok(long.every(fact => fact.display === "block" && fact.overflow === "ellipsis"), "a long fact ends in an ellipsis");
       const links = await page.evaluate(() => {
         const inspector = document.querySelector(".sw-inspector")!.getBoundingClientRect();
@@ -139,7 +128,6 @@ describe("web swarm view", { skip }, () => {
       await show(page, "wall", ".sw-tile");
       await page.locator(".sw-tile", { hasText: LONG_TOOL }).click();
       await page.waitForSelector(".sw-inspector .sw-inspector-fact");
-      // The compact layout gives the inspector a row of its own; the narrower window leaves it the least room.
       for (const width of [1000, 720]) {
         await page.setViewportSize({ width, height: 700 });
         const measured = await page.evaluate(longTool => {
@@ -206,7 +194,6 @@ describe("web swarm view", { skip }, () => {
       const reads = await count(page, "path.sw-g-read");
       const legend = () => page.textContent(".sw-graph-legend");
       assert.ok(!(await legend())?.includes("context stale"));
-      // The first team's context starts failing; every other request keeps answering.
       await page.evaluate(() => {
         const swarm = (window as unknown as { swarm: Control & { failing: RegExp | null } }).swarm;
         const team = swarm.requests.find(path => /^\/teams\/[0-9a-f-]+\/context$/.test(path))!;

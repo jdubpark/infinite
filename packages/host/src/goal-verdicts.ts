@@ -19,19 +19,12 @@ export const CONTINUE_EVENT = "You recorded not achieved and continued the goal.
 const STEERING_ENTRIES = 20;
 const STEERING_BYTES = 24000;
 
-/** The newest cycle that holds an assessment. */
 const newestAssessed = (cycles: readonly GoalCycle[]): GoalCycle | undefined => [...cycles].reverse().find(item => item.assessment !== undefined);
 
-/** The cycle's current verdict id first, then the superseded ids newest first. */
 export function verdictIdsOf(cycle: Pick<GoalCycle, "assessment" | "supersededVerdictIds">): string[] {
   return cycle.assessment === undefined ? [] : [cycle.assessment.verdictId, ...[...(cycle.supersededVerdictIds ?? [])].reverse()];
 }
 
-/**
- * For refresh's Object.assign: {} when neither the team nor the cycle has an assessment; the team's current one with its
- * progress. Another verdict id at the cycle's revision and head also returns the superseded list (last 4); another
- * revision or head, or a team assessment that is gone, returns `supersededVerdictIds: undefined`, which drops the list.
- */
 export function cycleVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle, team: Pick<TeamView, "revision" | "assessment">): { assessment?: GoalAssessment; supersededVerdictIds?: string[] } {
   const current = team.assessment !== undefined && team.assessment.revision === team.revision ? team.assessment : undefined;
   if (current === undefined) return cycle.assessment === undefined ? {} : { assessment: undefined, supersededVerdictIds: undefined };
@@ -43,7 +36,6 @@ export function cycleVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle
   return { assessment, supersededVerdictIds: undefined };
 }
 
-/** The copy a late delivery receipt makes: the team's current verdict replaces the cycle's at the same revision and head. */
 export function lateVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle, team: Pick<TeamView, "revision" | "assessment">):
   { assessment: GoalAssessment; supersededVerdictIds: string[] } | undefined {
   const held = cycle.assessment;
@@ -54,17 +46,12 @@ export function lateVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle,
   return copy.assessment === undefined || copy.supersededVerdictIds === undefined ? undefined : { assessment: copy.assessment, supersededVerdictIds: copy.supersededVerdictIds };
 }
 
-/** True when a late receipt turned the newest cycle of an idle autonomous finite goal into a met reviewed verdict. */
 export function lateStop(goal: ProductGoal, cycle: GoalCycle, busy: boolean): boolean {
   if (goal.status !== "running" || goal.activeTeamId !== undefined || busy || goal.cycles.at(-1) !== cycle) return false;
   if (autonomyOf(goal) !== "autonomous" || goal.standing !== undefined) return false;
   return cycle.assessment?.kind === "reviewed" && cycle.assessment.result === "met";
 }
 
-/**
- * True while the next launch waits for the host to see the newest cycle's delivery: at most DELIVERY_HOLD_MS after the
- * cycle finished, for a scanned project, while the verdict is inconclusive for no reason but the missing delivery.
- */
 export function deliveryHold(goal: Pick<ProductGoal, "autonomy" | "standing" | "cycles">,
   input: { nowMs: number; scanned: boolean; detail?: Pick<VerdictDetail, "verdictId" | "revision" | "head" | "criteria"> }): boolean {
   if (autonomyOf(goal) !== "autonomous" || goal.standing !== undefined || !input.scanned) return false;
@@ -81,12 +68,10 @@ export function deliveryHold(goal: Pick<ProductGoal, "autonomy" | "standing" | "
   return open.length > 0 && open.every(item => item.reason === "before-delivery");
 }
 
-/** A cycle with a verdict fails when its result is not met and its progress is not positive. */
 export function verdictFailed(cycle: Pick<GoalCycle, "assessment">): boolean {
   return cycle.assessment !== undefined && cycle.assessment.result !== "met" && cycle.assessment.progress <= 0;
 }
 
-/** True for a pinned-autonomous finite goal whose cycle for `team` holds a current reviewed `met` assessment. */
 export function provisionalStop(goal: Pick<ProductGoal, "autonomy" | "standing" | "cycles">, team: Pick<TeamView, "id" | "revision" | "assessment">): boolean {
   if (autonomyOf(goal) !== "autonomous" || goal.standing !== undefined) return false;
   if (!goal.cycles.some(item => item.teamId === team.id)) return false;
@@ -96,7 +81,6 @@ export function provisionalStop(goal: Pick<ProductGoal, "autonomy" | "standing" 
 
 const ceilingOf = (goal: ProductGoal) => goal.ceilingAt ?? new Date(Date.parse(goal.createdAt) + (goal.maxTotalMinutes ?? goal.maxMinutes) * 60000).toISOString();
 
-/** Throws TeamError before anything is admitted. */
 export function assertVerdictAnswer(goal: ProductGoal, body: GoalOutcomeInput, nowMs: number): void {
   if (body.verdictId === undefined) return;
   if (!goal.cycles.some(item => verdictIdsOf(item).includes(body.verdictId!)))
@@ -111,17 +95,12 @@ export function assertVerdictAnswer(goal: ProductGoal, body: GoalOutcomeInput, n
     throw new TeamError(409, "goal-steering-limit", "Start a new goal with consolidated directions.");
 }
 
-/** An owner outcome on a provisional stop ends it: the host drops the stop reason and its text. Any other stop is left alone. */
 export function answerProvisional(goal: Pick<ProductGoal, "stopReason" | "reason">): void {
   if (goal.stopReason !== "provisional-met") return;
   delete goal.stopReason;
   delete goal.reason;
 }
 
-/**
- * Appends body.summary as a steering entry, syncs the record with steerGoalObjective, and sets the goal running with no
- * stopReason and no reason. Returns goalObjectiveNote's text, or undefined. Never sets `achieved`.
- */
 export function continueGoal(holder: GoalHolder, body: GoalOutcomeInput, at: string): string | undefined {
   const goal = holder.goal;
   goal.steering.push({ text: body.summary, revision: goal.revision, at });
@@ -132,11 +111,6 @@ export function continueGoal(holder: GoalHolder, body: GoalOutcomeInput, at: str
   return note;
 }
 
-/**
- * The newest assessment's criteria that are still active in the record, in record order, for the next cycle's context.
- * {} unless the project's prompts and evaluator are on, the goal is pinned autonomous, a cycle holds an assessment, and
- * the record reads.
- */
 export function criteriaRowsFor(holder: GoalHolder, project: Pick<Project, "team"> | undefined): { criteria?: CriteriaRow[] } {
   const objective = project?.team?.objective;
   if (!objectivePromptsOn(project) || objective?.evaluator !== "on") return {};

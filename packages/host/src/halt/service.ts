@@ -6,21 +6,20 @@ import type { Config } from "../types.js";
 import { HALT_EPOCHS_FILE, HALT_FILE, MAX_RECEIPTS, readHaltEpochs, readHaltRecord, writeHaltEpochs, writeHaltRecord, type HaltActor, type HaltEntry, type HaltEpochs, type HaltReceipt, type HaltRecord } from "./record.js";
 import { haltReason, STILL_HALTED, type HaltCheck, type HaltCovers, type HaltHeldBy, type HaltItemKind, type HaltOutcome, type HaltTarget, type HaltTargets, type LaunchHalted } from "./rules.js";
 
-export type HaltServiceOptions = { config: Config; key: Buffer; now?: () => number; /** How often an unreadable record is read again. */ retryMs?: number };
+export type HaltServiceOptions = { config: Config; key: Buffer; now?: () => number; retryMs?: number };
 
-/** The services a halt stops, in the order it stops them. A release resumes them in reverse. */
 export type HaltServices = { routines: HaltTargets; goals: HaltTargets; missions: HaltTargets; teams: HaltTargets };
 
 export type HaltState = { haltId: string; at: string; reason?: string; by: string };
-export type HaltView = {
-  /** False when the host cannot read its halt record. The whole host is then halted until it can. */
-  readable: boolean;
-  host?: HaltState;
-  projects: (HaltState & { projectId: string })[];
-};
+export type HaltView =
+  | { readable: false; host?: undefined; projects: [] }
+  | { readable: true; host?: HaltState; projects: (HaltState & { projectId: string })[] };
 export type HaltItem = { kind: HaltItemKind; id: string; title: string; reason?: string };
 export type HaltEngageResult = { halt: HaltView; engaged: boolean; paused: HaltItem[]; failed: HaltItem[] };
 export type HaltReleaseResult = { halt: HaltView; released: boolean; resumed: HaltItem[]; notResumed: HaltItem[] };
+
+type RecordState = { state: "readable"; record: HaltRecord } | { state: "unreadable" };
+type EpochsState = { state: "readable"; epochs: HaltEpochs } | { state: "unreadable" };
 
 const RETRY_MS = 60_000;
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -34,21 +33,14 @@ const sameTarget = (entry: HaltEntry, target: HaltTarget) =>
 const unreadableError = () => new TeamError(409, "halt-unreadable", "The host cannot read its halt record, so every launch waits. Restore the record before changing the halt.");
 const writeError = () => new TeamError(503, "write-failed", "The host could not record the halt change. Nothing changed.");
 
-/**
- * The owner's halt: one action that stops autonomous work on the whole host or in one project, and keeps it stopped
- * until the owner releases it. The sealed file is the authority: each change is written there first, then memory.
- * A missing file is no halt. A file that cannot be read halts the whole host until it can be read.
- */
 export class HaltService {
   private readonly key: Buffer;
   private readonly file: string;
   private readonly now: () => number;
   private readonly retryMs: number;
-  private record: HaltRecord = { version: 1, halts: [], receipts: [] };
-  private readable = true;
+  private recordState: RecordState = { state: "readable", record: { version: 1, halts: [], receipts: [] } };
   private readonly epochsFile: string;
-  private epochs: HaltEpochs = { version: 1, host: "", projects: {} };
-  private epochsReadable = true;
+  private epochsState: EpochsState = { state: "readable", epochs: { version: 1, host: "", projects: {} } };
   private services?: HaltServices;
   private ownedTeam: (teamId: string) => boolean = () => false;
   private serial: Promise<unknown> = Promise.resolve();
@@ -63,21 +55,15 @@ export class HaltService {
     this.load();
   }
 
-  /** The services the halt pauses and resumes. A team that a live goal or mission owns is stopped through its owner. */
   useServices(services: HaltServices, ownedTeam: (teamId: string) => boolean) {
     this.services = services;
     this.ownedTeam = ownedTeam;
   }
 
-  /** Reads memory only. The host halt wins over a project halt. */
   check(input: { projectId: string }): HaltCheck {
     return this.hold([input.projectId]) ?? { state: "clear" };
   }
 
-  /**
-   * The launch gate the schedulers and the Manager use: the halt first, then the fuse. A halted launch never reaches
-   * the fuse, so it is not counted or charged, and no role is exempt from the halt.
-   */
   gate(fuse: FuseGate): FuseGate {
     return {
       check: input => this.hold([input.projectId]) ?? fuse.check(input),
@@ -92,98 +78,91 @@ export class HaltService {
     };
   }
 
-  /**
-   * The halt epoch of a project: the host scope's epoch and the project's. It changes at every engage and every
-   * release that changes either scope, and neither a restart, a dropped receipt, nor a restored or removed halt record
-   * changes it. Undefined while the halt record or the epochs cannot be read.
-   */
   epoch(projectId: string): string | undefined {
-    if (!this.readable || !this.epochsReadable) return undefined;
-    return `${this.epochs.host}:${this.epochs.projects[projectId] ?? ""}`;
+    if (this.recordState.state !== "readable" || this.epochsState.state !== "readable") return undefined;
+    return `${this.epochsState.epochs.host}:${this.epochsState.epochs.projects[projectId] ?? ""}`;
   }
 
   view(): HaltView {
-    if (!this.readable) return { readable: false, projects: [] };
+    if (this.recordState.state !== "readable") return { readable: false, projects: [] };
     const state = (entry: HaltEntry): HaltState => ({
       haltId: entry.haltId, at: new Date(entry.at).toISOString(), ...(entry.reason === undefined ? {} : { reason: entry.reason }), by: entry.by.label,
     });
-    const host = this.record.halts.find(entry => entry.scope === "host");
+    const host = this.recordState.record.halts.find(entry => entry.scope === "host");
     return {
       readable: true,
       ...(host ? { host: state(host) } : {}),
-      projects: this.record.halts.filter(entry => entry.scope === "project").map(entry => ({ projectId: entry.projectId!, ...state(entry) })),
+      projects: this.recordState.record.halts.flatMap(entry => entry.scope === "project" ? [{ projectId: entry.projectId, ...state(entry) }] : []),
     };
   }
 
   engage(target: HaltTarget, body: { requestId: string; reason?: string }, by: HaltActor): Promise<HaltEngageResult> {
     return this.enqueue(async () => {
-      if (!await this.recover()) throw unreadableError();
+      const record = await this.recover();
+      if (!record) throw unreadableError();
       const fingerprint = digest({ action: "engage", ...target, reason: body.reason ?? null });
-      const prior = this.receipt(body.requestId, fingerprint);
+      const prior = this.receipt(record, body.requestId, fingerprint);
       if (prior) {
         if (!prior.settled) await this.finishEngage(prior);
         return this.engageResult(prior);
       }
-      const existing = this.record.halts.find(entry => sameTarget(entry, target));
+      const existing = record.halts.find(entry => sameTarget(entry, target));
       const at = this.now();
       if (existing) {
         const receipt: HaltReceipt = { requestId: body.requestId, action: "engage", fingerprint, haltId: existing.haltId, changed: false, at, by, settled: true, outcomes: [] };
-        if (!this.persist({ ...this.record, receipts: this.withReceipt(receipt) })) throw writeError();
+        if (!this.persist({ ...record, receipts: this.withReceipt(record, receipt) })) throw writeError();
         return this.engageResult(receipt);
       }
-      const entry: HaltEntry = {
-        haltId: randomUUID(), scope: target.scope, ...(target.scope === "project" ? { projectId: target.projectId } : {}), at,
-        ...(body.reason === undefined ? {} : { reason: body.reason }), requestId: body.requestId, by, settled: false,
+      const baseEntry = {
+        haltId: randomUUID(), at, ...(body.reason === undefined ? {} : { reason: body.reason }), requestId: body.requestId, by, settled: false,
       };
+      const entry: HaltEntry = target.scope === "host"
+        ? { ...baseEntry, scope: "host" }
+        : { ...baseEntry, scope: "project", projectId: target.projectId };
       const receipt: HaltReceipt = { requestId: body.requestId, action: "engage", fingerprint, haltId: entry.haltId, changed: true, at, by, settled: false, outcomes: [] };
-      // The scope's epoch is renewed first, so a verdict reached before the halt never applies after it.
       if (!this.renewEpoch(target)) throw writeError();
-      // The gate holds every new launch in scope from this write on, before any running item is paused.
-      if (!this.persist({ ...this.record, halts: [...this.record.halts, entry], receipts: this.withReceipt(receipt) })) throw writeError();
+      if (!this.persist({ ...record, halts: [...record.halts, entry], receipts: this.withReceipt(record, receipt) })) throw writeError();
       await this.finishEngage(receipt);
-      return this.engageResult(this.record.receipts.find(value => value.requestId === receipt.requestId) ?? receipt);
+      const current = this.currentRecord();
+      return this.engageResult(current?.receipts.find(value => value.requestId === receipt.requestId) ?? receipt);
     });
   }
 
   release(target: HaltTarget, body: { requestId: string; keepPaused?: boolean }, by: HaltActor): Promise<HaltReleaseResult> {
     return this.enqueue(async () => {
-      if (!await this.recover()) throw unreadableError();
+      const record = await this.recover();
+      if (!record) throw unreadableError();
       const keepPaused = body.keepPaused === true;
       const fingerprint = digest({ action: "release", ...target, keepPaused });
-      const prior = this.receipt(body.requestId, fingerprint);
+      const prior = this.receipt(record, body.requestId, fingerprint);
       if (prior) {
         if (!prior.settled) await this.finishRelease(prior);
         return this.releaseResult(prior);
       }
-      const existing = this.record.halts.find(entry => sameTarget(entry, target));
+      const existing = record.halts.find(entry => sameTarget(entry, target));
       const at = this.now();
       const receipt: HaltReceipt = {
         requestId: body.requestId, action: "release", fingerprint, ...(existing ? { haltId: existing.haltId } : {}), changed: Boolean(existing),
         keepPaused, at, by, settled: !existing, outcomes: [],
       };
-      // A release ends a halt period: the scope's epoch is renewed first, so nothing decided before it applies after.
       if (existing && !this.renewEpoch(target)) throw writeError();
-      // The gate lifts with this write. Marked items resume after it, so nothing resumes into a closed gate.
-      const halts = existing ? this.record.halts.filter(entry => entry !== existing) : this.record.halts;
-      if (!this.persist({ ...this.record, halts, receipts: this.withReceipt(receipt) })) throw writeError();
+      const halts = existing ? record.halts.filter(entry => entry !== existing) : record.halts;
+      if (!this.persist({ ...record, halts, receipts: this.withReceipt(record, receipt) })) throw writeError();
       if (!receipt.settled) await this.finishRelease(receipt);
-      return this.releaseResult(this.record.receipts.find(value => value.requestId === receipt.requestId) ?? receipt);
+      const current = this.currentRecord();
+      return this.releaseResult(current?.receipts.find(value => value.requestId === receipt.requestId) ?? receipt);
     });
   }
 
-  /**
-   * Finishes any pass a previous process left unsettled, and reads an unreadable record again every minute. A record
-   * that becomes readable has its unsettled passes finished the same way, in turn with engage and release.
-   */
   start(): Promise<void> {
     if (this.timer === undefined) {
       this.timer = setInterval(() => {
-        if (!this.readable) void this.enqueue(() => this.recover()).catch(() => {});
-        else if (!this.epochsReadable) void this.enqueue(() => this.reloadEpochs()).catch(() => {});
+        if (this.recordState.state !== "readable") void this.enqueue(() => this.recover()).catch(() => {});
+        else if (this.epochsState.state !== "readable") void this.enqueue(() => this.reloadEpochs()).catch(() => {});
       }, this.retryMs);
       this.timer.unref();
     }
-    return this.enqueue(async () => { if (this.readable) await this.finishUnsettled(); });
+    return this.enqueue(async () => { if (this.recordState.state === "readable") await this.finishUnsettled(); });
   }
 
   stop(): void {
@@ -191,31 +170,31 @@ export class HaltService {
     this.timer = undefined;
   }
 
-  /** The halt that covers a launch in any of these projects, or undefined. Reads memory only. */
+  private currentRecord(): HaltRecord | undefined {
+    return this.recordState.state === "readable" ? this.recordState.record : undefined;
+  }
+
   private hold(projectIds: readonly string[]): LaunchHalted | undefined {
-    if (!this.readable) return { state: "halted", scope: "host", haltId: "unreadable", at: this.now(), unreadable: true };
-    const entry = this.covering(projectIds);
+    if (this.recordState.state !== "readable") return { state: "halted", scope: "host", haltId: "unreadable", at: this.now(), unreadable: true };
+    const entry = this.covering(projectIds, this.recordState.record.halts);
     if (!entry) return undefined;
-    return {
-      state: "halted", scope: entry.scope, ...(entry.projectId === undefined ? {} : { projectId: entry.projectId }),
-      haltId: entry.haltId, at: entry.at, ...(entry.reason === undefined ? {} : { reason: entry.reason }),
+    const base = {
+      state: "halted" as const, haltId: entry.haltId, at: entry.at, ...(entry.reason === undefined ? {} : { reason: entry.reason }),
     };
+    return entry.scope === "host" ? { ...base, scope: "host" } : { ...base, scope: "project", projectId: entry.projectId };
   }
 
-  private covering(projectIds: readonly string[], halts: readonly HaltEntry[] = this.record.halts): HaltEntry | undefined {
-    return halts.find(entry => entry.scope === "host") ?? halts.find(entry => entry.scope === "project" && projectIds.includes(entry.projectId!));
+  private covering(projectIds: readonly string[], halts: readonly HaltEntry[]): HaltEntry | undefined {
+    return halts.find(entry => entry.scope === "host") ?? halts.find(entry => entry.scope === "project" && projectIds.includes(entry.projectId));
   }
 
-  /**
-   * Pauses every running item in the halt's scope: routines first, so they start nothing, then goals, missions, and
-   * the team runs that no live goal or mission owns. A failed item is reported; the pass goes on and the gate stays.
-   */
   private async finishEngage(receipt: HaltReceipt) {
-    const entry = this.record.halts.find(value => value.haltId === receipt.haltId);
+    const record = this.currentRecord();
+    const entry = record?.halts.find(value => value.haltId === receipt.haltId);
     let outcomes: HaltOutcome[] = [];
     if (entry && this.services) {
       const mark = { haltId: entry.haltId, reason: haltReason(entry) };
-      const covers: HaltCovers = ids => entry.scope === "host" || ids.includes(entry.projectId!);
+      const covers: HaltCovers = entry.scope === "host" ? () => true : ids => ids.includes(entry.projectId);
       const { routines, goals, missions, teams } = this.services;
       outcomes = [
         ...await this.pass("routine", () => routines.haltPause(mark, covers)),
@@ -227,17 +206,15 @@ export class HaltService {
     this.settle(receipt, outcomes, true);
   }
 
-  /**
-   * Resumes the items this halt paused, in reverse order. An item that another halt still covers moves to that halt.
-   * With `keepPaused`, nothing resumes and each item says the owner kept it paused.
-   */
   private async finishRelease(receipt: HaltReceipt) {
     let outcomes: HaltOutcome[] = [];
     if (receipt.haltId && this.services) {
       const keep = receipt.keepPaused === true;
       const haltId = receipt.haltId;
       const heldBy: HaltHeldBy = ids => {
-        const other = this.covering(ids);
+        const record = this.currentRecord();
+        if (!record) return undefined;
+        const other = this.covering(ids, record.halts);
         return other && { haltId: other.haltId, reason: haltReason(other) };
       };
       const { routines, goals, missions, teams } = this.services;
@@ -251,7 +228,6 @@ export class HaltService {
     this.settle(receipt, outcomes, false);
   }
 
-  /** One service's part of a pass. A service that fails as a whole is one failed line; the pass goes on. */
   private async pass(kind: HaltItemKind, run: () => Promise<HaltOutcome[]>): Promise<HaltOutcome[]> {
     try { return (await run()).map(clip); }
     catch (error) {
@@ -259,22 +235,23 @@ export class HaltService {
     }
   }
 
-  /** Records the pass. A failed write keeps the result in memory; a restart runs the pass again, which repeats nothing done. */
   private settle(receipt: HaltReceipt, outcomes: HaltOutcome[], engage: boolean) {
+    const record = this.currentRecord();
+    if (!record) return;
     const settled: HaltReceipt = { ...receipt, settled: true, outcomes: [...receipt.outcomes, ...outcomes].slice(0, 5000) };
-    const halts = engage ? this.record.halts.map(entry => entry.haltId === receipt.haltId ? { ...entry, settled: true } : entry) : this.record.halts;
-    const next: HaltRecord = { ...this.record, halts, receipts: this.record.receipts.map(value => value.requestId === receipt.requestId ? settled : value) };
-    if (!this.persist(next)) this.record = next;
+    const halts = engage ? record.halts.map(entry => entry.haltId === receipt.haltId ? { ...entry, settled: true } : entry) : record.halts;
+    const next: HaltRecord = { ...record, halts, receipts: record.receipts.map(value => value.requestId === receipt.requestId ? settled : value) };
+    if (!this.persist(next)) this.recordState = { state: "readable", record: next };
   }
 
-  private receipt(requestId: string, fingerprint: string): HaltReceipt | undefined {
-    const prior = this.record.receipts.find(value => value.requestId === requestId);
+  private receipt(record: HaltRecord, requestId: string, fingerprint: string): HaltReceipt | undefined {
+    const prior = record.receipts.find(value => value.requestId === requestId);
     if (prior && prior.fingerprint !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different halt action.");
     return prior;
   }
 
-  private withReceipt(receipt: HaltReceipt): HaltReceipt[] {
-    return [...this.record.receipts, receipt].slice(-MAX_RECEIPTS);
+  private withReceipt(record: HaltRecord, receipt: HaltReceipt): HaltReceipt[] {
+    return [...record.receipts, receipt].slice(-MAX_RECEIPTS);
   }
 
   private engageResult(receipt: HaltReceipt): HaltEngageResult {
@@ -293,69 +270,58 @@ export class HaltService {
     };
   }
 
-  /** True when the record is readable. A record read again after it was unreadable first finishes its unsettled passes. */
-  private async recover(): Promise<boolean> {
-    if (this.readable) return true;
-    this.load();
-    if (!this.readable) return false;
+  private async recover(): Promise<HaltRecord | undefined> {
+    if (this.recordState.state === "readable") return this.recordState.record;
+    const loaded = this.load();
+    if (loaded.state !== "readable") return undefined;
     await this.finishUnsettled();
-    return true;
+    return this.currentRecord();
   }
 
-  /** Runs every pass the record holds as unsettled. Without the services there is nothing to pause yet, so it waits. */
   private async finishUnsettled() {
-    if (!this.services) return;
-    for (const receipt of this.record.receipts.filter(value => !value.settled)) {
+    const record = this.currentRecord();
+    if (!this.services || !record) return;
+    for (const receipt of record.receipts.filter(value => !value.settled)) {
       if (receipt.action === "engage") await this.finishEngage(receipt);
       else await this.finishRelease(receipt);
     }
   }
 
-  /** Writes the file, then memory. False when the write failed; memory is unchanged then. */
   private persist(next: HaltRecord): boolean {
     if (!writeHaltRecord(this.file, this.key, next)) return false;
-    this.record = next;
+    this.recordState = { state: "readable", record: next };
     return true;
   }
 
-  /**
-   * Gives the scope a new epoch and writes the epochs, before the halt record. Epochs that cannot be read are replaced
-   * with a new host epoch, which every project's epoch includes, so no earlier epoch is continued. False when the
-   * write failed; memory is unchanged then.
-   */
   private renewEpoch(target: HaltTarget): boolean {
-    const base: HaltEpochs = this.epochsReadable ? this.epochs : { version: 1, host: randomUUID(), projects: {} };
+    const base: HaltEpochs = this.epochsState.state === "readable" ? this.epochsState.epochs : { version: 1, host: randomUUID(), projects: {} };
     const next: HaltEpochs = target.scope === "host"
       ? { ...base, host: randomUUID() }
       : { ...base, projects: { ...base.projects, [target.projectId]: randomUUID() } };
     if (!writeHaltEpochs(this.epochsFile, this.key, next)) return false;
-    this.epochs = next;
-    this.epochsReadable = true;
+    this.epochsState = { state: "readable", epochs: next };
     return true;
   }
 
-  /**
-   * Epochs that cannot be read leave the permission agent unready until they can, or until a halt change replaces them.
-   * Missing epochs (a new host, or a removed file) get a new host epoch, so a removed file never brings back an earlier
-   * epoch; they stay unready until it is written.
-   */
   private reloadEpochs() {
     const read = readHaltEpochs(this.epochsFile, this.key);
-    if (read.state === "readable") { this.epochs = read.epochs; this.epochsReadable = true; return; }
-    this.epochs = { version: 1, host: "", projects: {} };
-    this.epochsReadable = false;
+    if (read.state === "readable") { this.epochsState = { state: "readable", epochs: read.epochs }; return; }
+    this.epochsState = { state: "unreadable" };
     if (read.state === "missing") {
       const fresh: HaltEpochs = { version: 1, host: randomUUID(), projects: {} };
-      if (writeHaltEpochs(this.epochsFile, this.key, fresh)) { this.epochs = fresh; this.epochsReadable = true; }
+      if (writeHaltEpochs(this.epochsFile, this.key, fresh)) this.epochsState = { state: "readable", epochs: fresh };
     }
   }
 
-  private load() {
+  private load(): RecordState {
     this.reloadEpochs();
     const read = readHaltRecord(this.file, this.key);
-    if (read.state === "unreadable") { this.readable = false; return; }
-    this.readable = true;
-    this.record = read.state === "readable" ? read.record : { version: 1, halts: [], receipts: [] };
+    if (read.state === "unreadable") {
+      this.recordState = { state: "unreadable" };
+      return this.recordState;
+    }
+    this.recordState = { state: "readable", record: read.state === "readable" ? read.record : { version: 1, halts: [], receipts: [] } };
+    return this.recordState;
   }
 
   private enqueue<T>(task: () => T | Promise<T>): Promise<T> {

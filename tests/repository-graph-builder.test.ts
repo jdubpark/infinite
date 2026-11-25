@@ -459,7 +459,6 @@ test('map reduces to directory areas', async () => {
 test('depth is chosen to fit 120 areas', async () => {
   const f = await fixture();
   try {
-    // 144 leaf directories exceed 120 at depth 3, so depth 2 gives 48 areas plus the root.
     const nodes = [];
     for (let g = 0; g < 12; g++) for (let s = 0; s < 4; s++) for (let t = 0; t < 3; t++) {
       nodes.push(graphNode(`leaf_${g}_${s}_${t}`, `g${pad(g, 2)}/s${s}/t${t}/f.ts`));
@@ -482,8 +481,6 @@ test('depth is chosen to fit 120 areas', async () => {
 test('overflow folds into other', async () => {
   const f = await fixture();
   try {
-    // 130 top-level directories plus the root area exceed 120 at depth 1.
-    // Directory d(i) holds i + 10 symbols. The root holds 5 symbols.
     const nodes = [];
     for (let i = 0; i < 130; i++) for (let k = 0; k < i + 10; k++) {
       nodes.push(graphNode(`d${pad(i)}_${k}`, `d${pad(i)}/x.ts`));
@@ -493,7 +490,6 @@ test('overflow folds into other', async () => {
     const map = result.value.map as { areas: { id: string; files: number; symbols: number }[]; truncated: { areas: boolean } };
     assert.equal(map.areas.length, 120);
     assert.equal(map.truncated.areas, true);
-    // Kept: d011 through d129. Folded: d000 through d010 and the root (4 root files, 5 root symbols).
     assert.equal(map.areas.some(area => area.id === 'd010' || area.id === '.'), false);
     assert.equal(map.areas.some(area => area.id === 'd011'), true);
     const other = map.areas.find(area => area.id === 'other');
@@ -512,7 +508,6 @@ test('links are undirected and capped at 400', async () => {
     for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) {
       links.push(graphEdge(`n_${ids[i]}`, `n_${ids[j]}`));
     }
-    // Two opposite-direction edges on one pair count as one undirected link of weight 2.
     links.push(graphEdge('n_m01', 'n_m00'));
     const result = run(f, await withExtraGraph(f, { nodes, links }));
     assert.equal(result.code, 0, JSON.stringify(result.value));
@@ -521,7 +516,6 @@ test('links are undirected and capped at 400', async () => {
     assert.equal(map.truncated.links, true);
     assert.deepEqual(map.links[0], { source: 'm00', target: 'm01', weight: 2 });
     assert.equal(map.links.every(link => link.source < link.target), true);
-    // The 35 lexicographically last weight-1 pairs are cut, starting at (m21, m23).
     assert.equal(map.links.some(link => link.source === 'm28'), false);
     assert.equal(map.links.some(link => link.source === 'm21' && link.target === 'm23'), false);
     assert.equal(map.links.some(link => link.source === 'm21' && link.target === 'm22'), true);
@@ -534,7 +528,6 @@ test('links are undirected and capped at 400', async () => {
 test('oversized map reports too-large', async () => {
   const f = await fixture();
   try {
-    // Thirty areas with 487-character directory IDs and 435 pairs push the map past 256 KiB.
     const long = (ch: string) => ch.repeat(120);
     const ids = Array.from({ length: 30 }, (_, i) => `${long('a')}/${long('b')}/${long('c')}/${long('d')}/m${pad(i, 2)}`);
     const nodes = ids.map((id, i) => graphNode(`n${i}`, `${id}/x.ts`));

@@ -8,7 +8,6 @@ import { TeamError, teamCommand, teamGitArgs } from "./team-workspace.js";
 import { hostGithubGrantEnvironment } from "./github-grants.js";
 
 const FETCH_TIMEOUT_MS = 120_000;
-/** Longest wait between timer retries of a failing fetch; the wait doubles from the refresh interval per consecutive failure. */
 const MAX_FETCH_RETRY_MS = 60 * 60_000;
 const COMMAND_TIMEOUT_MS = 30_000;
 const STAGED_EDITS_MESSAGE = "Staged edits left in the host checkout before a refresh from GitHub";
@@ -37,53 +36,28 @@ function withoutPending(status: ProjectSourceStatus): ProjectSourceStatus {
   return next;
 }
 
-/** Why a fetch from GitHub failed, as a fixed category; the Git output is never stored. */
 export type SourceFetchCategory = "auth" | "network" | "not-found" | "other";
 export type SourcePendingReason = "session-running" | "fetch-failed" | "diverged" | "apply-failed";
 export interface ProjectSourceStatus {
   mode: "github" | "laptop";
   repository?: string;
   baseBranch?: string;
-  /**
-   * Base-branch head the host last found in the mirror: the head the last successful fetch returned, or a head that a
-   * fetch left there before it failed. `fetchedAt` is the time of the last successful fetch only.
-   */
   mirrorHead?: string;
-  /**
-   * The order stamp of the last successful fetch: its time, or one millisecond after the previous stamp when the host
-   * clock stepped back. So the stamps of one project never go back, also across a source change.
-   */
   fetchStamp?: string;
-  /** The stamp of the fetch that first returned `mirrorHead`: every successful fetch since then returned the same head. */
   mirrorHeadSince?: string;
-  /** Commit the project working tree was last fast-forwarded to. */
   appliedHead?: string;
   fetchedAt?: string;
   appliedAt?: string;
-  /** Last fetch attempt, successful or not. */
   attemptedAt?: string;
-  /** Consecutive failed fetch attempts since the last successful one; timer refreshes back off on it. */
   fetchFailures?: number;
   pending?: { reason: SourcePendingReason; category?: SourceFetchCategory | SyncFailureCategory; message?: string; since: string };
-  /** Local branches holding tracked edits a session left in the working tree before a refresh. */
   savedBranches?: string[];
 }
-/**
- * One head that a fetch of the base branch left in the host mirror. The host tells a listener of every such head: the
- * one a refresh fetched, and before that fetch any head that an earlier fetch left without a status (it failed after
- * it moved the mirror, or the host stopped). `fetchedAt` is the fetch's order stamp (see
- * `ProjectSourceStatus.fetchStamp`): the time of the fetch, and never earlier than an earlier fetch of the project.
- * `previousHead` is the head before this fetch, and `previousSince` the stamp of the fetch that first returned it;
- * both are absent when the status held neither.
- */
 export type MirrorFetch = { projectId: string; repository: string; baseBranch: string; head: string; previousHead?: string; previousSince?: string; fetchedAt: string };
 export interface ProjectSourceOptions {
-  /** Whether a cloud session is running or starting in the project directory. Teams, goals and handoffs do not count. */
   running: (projectId: string) => Promise<boolean>;
   prefix?: TeamCommand;
-  /** Called after a refresh moved the project working tree to a new HEAD. */
   onApplied?: (projectId: string, head: string) => void;
-  /** Called for every head a fetch left in the mirror, even when the head did not move: see `MirrorFetch`. */
   onMirror?: (fetch: MirrorFetch) => void;
 }
 
@@ -93,15 +67,10 @@ export class ProjectSourceError extends Error {
   }
 }
 
-/** Remote the host mirror fetches from; tests point it at a local bare repository. */
 export function mirrorRemoteUrl(source: { repository: string }, override?: string) {
   return override ?? `https://github.com/${source.repository}.git`;
 }
 
-/**
- * Keeps a bare mirror of each GitHub-tracked project on the host and fast-forwards the project working
- * tree to it when no session is using that tree. Team runs clone the mirror.
- */
 export class ProjectSourceService {
   private readonly serial = new Map<string, Promise<unknown>>();
   private readonly changing = new Set<string>();
@@ -121,7 +90,6 @@ export class ProjectSourceService {
   isGithub(projectId: string) {
     return this.config.projects.find(p => p.id === projectId)?.source?.mode === "github";
   }
-  /** Outside every project directory; agent-writable because the fetch runs as the agent identity. */
   mirrorPath(projectId: string) {
     this.project(projectId);
     const base = this.config.source?.mirrorDir ?? join(dirname(this.config.teams?.workspaceDir ?? join(this.config.stateDir, "team-workspaces")), "source-mirrors");
@@ -139,13 +107,11 @@ export class ProjectSourceService {
         repository: project.source.repository,
         baseBranch: project.source.baseBranch,
         ...(saved.savedBranches ? { savedBranches: saved.savedBranches } : {}),
-        // The order of the project's fetches does not restart with a new source.
         ...(saved.fetchStamp ? { fetchStamp: saved.fetchStamp } : {}),
       };
     }
     return { ...saved, mode: "github", repository: project.source.repository, baseBranch: project.source.baseBranch };
   }
-  /** Writes nothing, and returns false, when `expected` names a source the project no longer follows. */
   private writeStatus(projectId: string, status: ProjectSourceStatus, expected?: { repository: string; baseBranch: string }) {
     const project = this.project(projectId);
     const source = project.source?.mode === "github" ? project.source : undefined;
@@ -157,7 +123,6 @@ export class ProjectSourceService {
     renameSync(temporary, file);
     return true;
   }
-  /** Records a pending reason for the source captured at the start of a refresh; a changed source gets the current status instead. */
   private savePending(projectId: string, status: ProjectSourceStatus, pending: Omit<NonNullable<ProjectSourceStatus["pending"]>, "since">, expected?: { repository: string; baseBranch: string }) {
     if (expected && !this.sourceMatches(projectId, expected)) return this.status(projectId);
     const next: ProjectSourceStatus = {
@@ -189,19 +154,11 @@ export class ProjectSourceService {
     await this.git(parent, ["init", "--bare", mirror], signal);
     return mirror;
   }
-  /**
-   * Records a head that the mirror holds. The status takes it with the next order stamp, and a listener hears of it
-   * as a fetch. `fetched` is true for the head a fetch of this refresh returned, and false for a head that an
-   * earlier, unrecorded fetch left behind.
-   */
   private noteMirrorHead(projectId: string, status: ProjectSourceStatus, source: { repository: string; baseBranch: string }, head: string, fetched: boolean): ProjectSourceStatus {
     const now = new Date().toISOString();
-    // The stamp orders this project's fetches for a listener. It is the time of the fetch unless the host clock
-    // stepped back, and then it is one millisecond after the previous stamp.
     const lastStamp = status.fetchStamp === undefined ? Number.NaN : Date.parse(status.fetchStamp);
     const stamp = Number.isNaN(lastStamp) || Date.parse(now) > lastStamp ? now : new Date(lastStamp + 1).toISOString();
     const previousHead = status.mirrorHead;
-    // A head the status holds with no start stamp (a status written before this field) has no provable start.
     const previousSince = previousHead === undefined ? undefined : status.mirrorHeadSince;
     const next: ProjectSourceStatus = {
       ...status,
@@ -216,7 +173,7 @@ export class ProjectSourceService {
           projectId, repository: source.repository, baseBranch: source.baseBranch, head,
           ...(previousHead === undefined ? {} : { previousHead }), ...(previousSince === undefined ? {} : { previousSince }), fetchedAt: stamp,
         });
-      } catch { /* A listener failure must not fail the refresh. */ }
+      } catch {}
     }
     return next;
   }
@@ -237,7 +194,6 @@ export class ProjectSourceService {
     try {
       projectRealPath = realpathSync(projectPath);
     } catch (error) {
-      // Keep filesystem categories such as `permission` and `missing-path`; only an unclassified error means "not a root".
       const failure = syncFailure(error, projectPath);
       return failure.category === "other" ? { category: "other", message: NOT_GIT_ROOT_MESSAGE } : failure;
     }
@@ -261,7 +217,6 @@ export class ProjectSourceService {
     const source = { repository: project.source.repository, baseBranch: project.source.baseBranch };
     let status = this.status(projectId);
     if (options?.maxAgeMs !== undefined && status.fetchedAt && Date.now() - Date.parse(status.fetchedAt) < options.maxAgeMs) return status;
-    // A timer refresh retries a failing fetch at a doubling interval so an unreachable repository is not fetched every tick.
     if (options?.maxAgeMs !== undefined && status.fetchFailures && status.attemptedAt) {
       const wait = Math.min(options.maxAgeMs * 2 ** (status.fetchFailures - 1), MAX_FETCH_RETRY_MS);
       if (Date.now() - Date.parse(status.attemptedAt) < wait) return status;
@@ -273,9 +228,6 @@ export class ProjectSourceService {
     try {
       await this.ensureMirror(projectId, options?.signal);
       if (status.mirrorHead !== undefined) {
-        // Before a fetch can replace it, the host notes the head it finds in the mirror. A head that the status does
-        // not name was left by a fetch that failed after it moved the mirror, or by a host that stopped before it
-        // wrote the status. A branch that cannot be read leaves the recorded head without a start the host can vouch for.
         const held = await this.command(mirror, ["rev-parse", `refs/heads/${source.baseBranch}`], options?.signal);
         if (options?.signal?.aborted) throw options.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
         if (!this.sourceMatches(projectId, source)) return this.status(projectId);
@@ -289,7 +241,6 @@ export class ProjectSourceService {
           status = this.noteMirrorHead(projectId, status, source, heldHead, false);
         }
       }
-      // With the GitHub proxy configured, this fetch carries a host grant for exactly this repository and operation.
       const grant = hostGithubGrantEnvironment(this.config, { sid: `source:${projectId}`, project: projectId, repo: source.repository, ops: ["fetch"] });
       const fetched = await this.command(mirror, ["fetch", "--no-tags", remote, `+refs/heads/${source.baseBranch}:refs/heads/${source.baseBranch}`], options?.signal, FETCH_TIMEOUT_MS, grant);
       if (options?.signal?.aborted) throw options.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
@@ -318,7 +269,6 @@ export class ProjectSourceService {
         if (await this.git(project.path, ["rev-parse", "HEAD"], options?.signal) === status.mirrorHead) return status;
       } catch (error) {
         if (options?.signal?.aborted) throw error;
-        // A missing or unreadable working tree is reported through the apply-failed state below.
       }
     }
     if (await this.isRunning(projectId)) return this.savePending(projectId, status, { reason: "session-running" }, source);
@@ -332,7 +282,6 @@ export class ProjectSourceService {
       if (!this.sourceMatches(projectId, source)) return this.status(projectId);
       if (rootFailure) return this.savePending(projectId, status, { reason: "apply-failed", ...rootFailure }, source);
       const treeHead = await this.git(project.path, ["rev-parse", "HEAD"], options?.signal);
-      // Make the fetched base objects visible to merge-base in this detached checkout.
       await this.git(project.path, ["fetch", "--no-tags", mirror, `+refs/heads/${source.baseBranch}:refs/remotes/origin/${source.baseBranch}`], options?.signal);
       const ancestry = await this.command(project.path, ["merge-base", "--is-ancestor", treeHead, fetchedHead], options?.signal);
       if (!commandSucceeded(ancestry)) {
@@ -373,21 +322,40 @@ export class ProjectSourceService {
       return this.savePending(projectId, status, { reason: "apply-failed", ...failure }, source);
     } finally {
       this.changing.delete(projectId);
-      if (moved) try { this.options.onApplied?.(projectId, fetchedHead); } catch { /* A listener failure must not fail the refresh. */ }
+      if (moved) try { this.options.onApplied?.(projectId, fetchedHead); } catch {}
     }
   }
-  /** True only while the working tree is being fast-forwarded; new sessions in the project wait for it. */
   refreshing(projectId: string): boolean {
     return this.changing.has(projectId);
   }
-  /** Fetch the base branch into the mirror and, when nothing is running in the project, fast-forward its working tree. */
   refresh(projectId: string, options?: { maxAgeMs?: number; signal?: AbortSignal }): Promise<ProjectSourceStatus> {
+    const signal = options?.signal;
+    if (signal?.aborted) {
+      return Promise.reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+    }
     const previous = this.serial.get(projectId) ?? Promise.resolve();
-    const next = previous.then(() => this.refreshOne(projectId, options), () => this.refreshOne(projectId, options));
-    this.serial.set(projectId, next.catch(() => {}));
-    return next;
+    const run = () => {
+      if (signal?.aborted) {
+        throw signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+      }
+      return this.refreshOne(projectId, options);
+    };
+    const next = previous.then(run, run);
+    const done = next.catch(() => {});
+    this.serial.set(projectId, done);
+    void done.finally(() => {
+      if (this.serial.get(projectId) === done) this.serial.delete(projectId);
+    });
+    if (!signal) return next;
+    return new Promise<ProjectSourceStatus>((resolve, reject) => {
+      const onAbort = () => reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+      signal.addEventListener("abort", onAbort, { once: true });
+      next.then(
+        value => { signal.removeEventListener("abort", onAbort); resolve(value); },
+        error => { signal.removeEventListener("abort", onAbort); reject(error); },
+      );
+    });
   }
-  /** Runs `listener` on each minute of this refresher's timer, for work that reads GitHub on its own interval (review feedback). Returns its remover. */
   onTick(listener: () => void): () => void {
     this.tickListeners.add(listener);
     return () => { this.tickListeners.delete(listener); };

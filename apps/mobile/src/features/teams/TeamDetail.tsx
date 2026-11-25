@@ -35,13 +35,6 @@ type Tab = "overview" | "tasks" | "agents" | "activity";
 const CHECK_KIND: Record<TeamCheck["status"], StatusKind> = { running: "progress", passed: "done", failed: "blocked", interrupted: "stopped" };
 const live = (member: TeamMember) => member.status === "running" || member.status === "waiting";
 
-/**
- * One team run, tracked the way Linear tracks a project and run through its coordinator. Overview
- * opens on the coordinator card (phase, progress, latest activity, and the run's controls), then
- * what needs a person: the team's questions and agent requests the coordinator escalated or was not
- * delegated. Members are monitored, not steered: Tasks lists the plan with its assignees, Agents
- * shows what each one is doing, and Activity holds the evidence.
- */
 export function TeamDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
   const keyboardPadding = useKeyboardPadding();
@@ -55,9 +48,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const { data: me } = usePoll(() => api<Me>(connection, "/me"), 10000, [connection]);
   const sessionsPoll = usePoll(() => listSessions(connection), 4000, [connection]);
   const sessions = sessionsPoll.data;
-  // Board data only adds attempt context; a failed read leaves the screen as it was.
   const boardPoll = usePoll(() => api<BoardData>(connection, "/board").then(value => ({ items: value.items, at: Date.now() })).catch(() => ({ items: [] as BoardItem[], at: Date.now() })), 4000, [connection]);
-  // A mutation's result shows at once; a poll that started before it cannot undo it.
   const [recorded, setRecorded] = useState<TeamView | null>(null);
   const team = poll.data ? newer(recorded, poll.data) : recorded;
   const [direction, setDirection] = useState("");
@@ -71,7 +62,6 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
     refused: poll.refresh,
   });
   const fresh = poll.online;
-  // Created before the early return below, so it reads the steer rule directly rather than `controls`.
   const dictation = useDictation({
     connection,
     value: direction,
@@ -84,13 +74,11 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
     else router.replace({ pathname: "/", params: { machine, view: "teams" } });
   }
   const openSession = (sessionId: string) => router.push({ pathname: "/session/[id]", params: { id: sessionId, machine } });
-  // A mission's subteam is run by its coordinator: no owner run controls, and its questions are not the owner's.
   const owns = me?.role === "owner" && team && !team.goal && !team.missionId && team.status !== "cancelled";
   const top = <TopBar backLabel="Teams" onBack={back} right={<LiveStatus online={fresh} loading={poll.loading} seen={poll.seen} stale={poll.stale} />} />;
   if (!team) return <View style={[s.fill, s.overlayRoot]}>{top}<FloatingNotice position="top" offset={58} message={poll.stale ? "Can't reach this machine." : null} actions={poll.stale ? <Button compact title="Refresh" secondary onPress={poll.refresh} /> : null} /><View style={s.empty}><ActivityIndicator /><Text style={t.note}>{poll.loading ? "Loading…" : "Could not load the team."}</Text></View></View>;
 
   const controls = teamControls(team, me?.role, fresh);
-  // Which controls the run offers at all; a stale view disables them in place rather than removing them.
   const offered = teamControls(team, me?.role, true);
   const canContinue = canContinueBlockedTeam(team, me?.role);
   const board = boardPoll.data?.items ?? [];
@@ -98,7 +86,6 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const boardItem = findBoardItem(board, "team", id);
   const attempts = boardItem ? attemptsOf(board, boardItem) : [];
   const attemptChip = boardItem ? attemptLabel(boardItem) : undefined;
-  // A blocked goal or mission run has no owner controls here, but its owner may still cancel it.
   const cancelOrphan = !owns && offered.cancel && team.status === "blocked";
   const cancelAlert = (body: string) => Alert.alert("Cancel this team?", body, [
     { text: "Keep running", style: "cancel" },
@@ -114,12 +101,10 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const current = members.filter(member => member.revision === team.revision);
   const earlier = members.filter(member => member.revision !== team.revision);
   const approvals = pendingApprovals(team, sessions ?? []);
-  // Open agent prompts the coordinator is deciding under the run's delegation; nothing for a person to do.
   const coordinatorHandling = current.filter(member => live(member) && listed.get(member.sessionId)?.attention.state === "needs-you").length - approvals.length;
   const working = current.filter(live);
   const { kind, fraction } = teamKind(team, approvals.length);
   const coordinator = current.find(member => member.role === "project-manager");
-  // The coordinator's own activity when its session reports one; otherwise the run's latest recorded event.
   const coordinatorNow = coordinator ? listed.get(coordinator.sessionId)?.attention.now : undefined;
   const latest = coordinatorNow || team.events.at(-1)?.text;
   const checksNow = team.checks.filter(check => check.revision === team.revision);
@@ -127,7 +112,6 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const profileOf = (member?: TeamMember, task?: TeamTask): ModelProfile | undefined => member?.modelProfile
     ?? [...(team.lineup?.implementers ?? []), ...(team.lineup?.escalations ?? [])].find(value => value.id === task?.agentProfileId);
   const agentLabel = (member: TeamMember) => member.modelProfile?.label ?? providerName(member.provider ?? team.provider);
-  // A person-owned prompt is attention; a live member whose prompt the coordinator is reviewing is live with a note instead.
   const personOwned = new Set(approvals.map(item => item.member.memberId));
   const coordinatorOwned = (member: TeamMember) => member.revision === team.revision && live(member) && listed.get(member.sessionId)?.attention.state === "needs-you" && !personOwned.has(member.memberId);
   const agentState = (member: TeamMember) => personOwned.has(member.memberId) ? "attention" as const : coordinatorOwned(member) || member.status === "running" ? "live" as const : undefined;
@@ -136,7 +120,6 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
     decision={[...(team.permissionDecisions ?? [])].reverse().find(item => item.targetSessionId === member.sessionId && item.promptId === session.attention.prompt?.id)}
     onOpenSession={() => openSession(member.sessionId)} />;
   const taskOf = (member: TeamMember) => team.tasks.find(task => task.id === member.taskId);
-  // Member titles repeat the role id and often the run title; keep only what adds information.
   const work = (member: TeamMember) => {
     const task = taskOf(member)?.title;
     if (task) return task;
@@ -218,7 +201,6 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
             <Avatar label={lead?.label ?? providerName(team.provider)} provider={lead?.provider ?? team.provider} size={22} state={coordinator && live(coordinator) ? "live" : undefined} />
             <Text style={[t.body, s.fill]} numberOfLines={2}>{latest}</Text>
           </View> : null}
-          {/* The host's reason for an open agent prompt points at the member session; the approvals below answer it here. */}
           {team.reason && !approvals.length && !sessionsPoll.loading ? <Text style={kind === "blocked" ? t.error : t.warning}>{team.reason}</Text> : null}
           {owns ? <View style={s.controls}>
             {(team.status === "paused" || team.resumable) && !team.deliveryReceipt && !canContinue ? <Button compact busy={Boolean(request.pending?.label === "Resume" && request.busy)} glyph="play" title="Resume" disabled={!controls.resume || locked} onPress={() => send("/resume", "Resume")} />
@@ -413,7 +395,6 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   </View>;
 }
 
-/** An icon and a number, with the full meaning for screen readers; tapping opens its tab. */
 function Stat({ icon, value, label, onPress }: { icon: ReactNode; value: string; label: string; onPress?: () => void }) {
   const body = <>{icon}<Text style={s.statValue}>{value}</Text></>;
   return onPress
@@ -423,7 +404,6 @@ function Stat({ icon, value, label, onPress }: { icon: ReactNode; value: string;
 
 const PHASE_TONE: Partial<Record<string, string>> = { attention: theme.colors.warningInk, paused: theme.colors.warningInk, blocked: theme.colors.error, cancelled: theme.colors.placeholder, stopped: theme.colors.placeholder };
 
-/** Plan to review (and delivery) as one track; the current step takes the run's state colour. */
 function PhaseTrack({ phases, kind }: { phases: { label: string; state: PhaseState }[]; kind: string }) {
   const tone = PHASE_TONE[kind] ?? theme.colors.running;
   const now = phases.find(phase => phase.state === "current");
@@ -441,7 +421,6 @@ function PhaseTrack({ phases, kind }: { phases: { label: string; state: PhaseSta
   </View>;
 }
 
-/** A member's question. The team records the answer and continues in a new attempt. */
 function DecisionCard({ decision, member, disabled, onAnswer }: { decision: TeamDecision; member?: TeamMember; disabled: boolean; onAnswer: (text: string) => void }) {
   const [text, setText] = useState("");
   return <Card attention>
@@ -477,7 +456,6 @@ function CheckRow({ check }: { check: TeamCheck }) {
   </View>;
 }
 
-/** Times on the run's latest day show the clock only; earlier days add the date. */
 function HistoryRow({ at, day, text }: { at: string; day: string; text: string }) {
   const when = new Date(at);
   const clock = when.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });

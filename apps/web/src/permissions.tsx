@@ -26,7 +26,6 @@ type Filters = { rejected: boolean; raised: boolean; workspace: string; since: "
 
 const markRequests = requestStore<MarkRequest, { at: string }>();
 const inFlight = new Set<string>();
-// Machines whose host refused a mark from this tab because the session is not an owner CLI. Their forms show the command.
 const cliOnlyMachines = new Set<string>();
 export function clearPermissionRequests(machine: string) { markRequests.clearMachine(machine); cliOnlyMachines.delete(machine); }
 export const decisionLogAvailable = (me: Me) => me.role === "owner" && me.permissions?.decisionLog === 1;
@@ -45,7 +44,6 @@ const spans: Record<Exclude<Filters["since"], "">, number> = { "1h": 3_600_000, 
 const when = (iso: string) => new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
 const seconds = (ms: number) => `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`;
 const sessionLink = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i;
-/** One shell word, so the owner can paste the command as it is. */
 const shellWord = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
 export function verdictWords(entry: Pick<DecisionEntry, "verdict" | "code" | "interruptClass">) {
@@ -68,7 +66,6 @@ function logPath(filters: Filters, before?: string) {
   return `/permissions/log${query ? `?${query}` : ""}`;
 }
 
-/** The rail beside the permission view: the decision log, newest first, with the owner's filters. */
 export function PermissionPicker({ selected, onSelect, onOverview }: { selected: string | null; onSelect: (id: string) => void; onOverview: () => void }) {
   const api = useApi();
   const [filters, setFilters] = useState<Filters>({ rejected: false, raised: false, workspace: "", since: "" });
@@ -96,7 +93,7 @@ export function PermissionPicker({ selected, onSelect, onOverview }: { selected:
       const page = await api<{ entries: DecisionEntry[]; next?: string }>(logPath(filters, next));
       setOlder(previous => [...previous, ...page.entries]);
       setNext(page.next);
-    } catch { /* The button stays; the next press retries the same page. */ }
+    } catch {}
     finally { setLoadingOlder(false); }
   }
   const seen = new Set<string>();
@@ -133,7 +130,6 @@ export function PermissionPicker({ selected, onSelect, onOverview }: { selected:
   </>;
 }
 
-/** The permission view with no decision open: the rate figures, the flagged sessions and the replay candidates. */
 export function PermissionOverview({ onSelect }: { onSelect: (id: string) => void }) {
   const api = useApi();
   const [status, setStatus] = useState<Status | null>(null);
@@ -179,7 +175,6 @@ export function PermissionDetail({ id, me, openSession, onSelect }: { id: string
   }, 15000, id);
   if (!entry) return <div className="team-page"><h1>Permission decision</h1><p role="status">{error || "Loading decision…"}</p>{error && <button className="text-button" onClick={view.refresh}><RefreshCw size={15} />Try again</button>}</div>;
   const workspace = entry.workspaceName ?? entry.workspaceId, project = entry.projectName ?? entry.projectId;
-  // A single-project workspace carries the project's name, so the project is shown only when it adds something.
   const place = project === workspace ? workspace : `${workspace} · ${project}`;
   const requester = [entry.role, entry.provider, entry.family && `${entry.family} family`].filter(Boolean).join(" · ");
   return <div className="team-detail permission-detail">
@@ -219,7 +214,6 @@ function MarkForm({ entry, marked }: { entry: DecisionEntry; marked: () => void 
   const api = useApi(), machines = useMachines(), key = machines.active.id + "/" + entry.id;
   const request = markRequests.use(key), pending = request.pending;
   const [note, setNote] = useState(pending?.note ?? "");
-  // A browser signed in with the host's cookie is not a paired device, so the host refuses its marks with 403.
   const [cliOnly, setCliOnly] = useState(cliOnlyMachines.has(machines.active.id));
   const [busy, setBusy] = useState(false), [copied, setCopied] = useState(false), [open, setOpen] = useState(Boolean(pending));
   const mounted = useRef(true);

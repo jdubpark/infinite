@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Board, BoardItem, Mission } from "./mission-types.js";
+import type { MissionProgressPage } from "./mission-progress.js";
 import type { ProjectGroup, ProjectGroupList } from "./project-group-types.js";
 import type { TeamRun } from "./team-types.js";
 import { recommendationLine } from "./question-recommendation.js";
@@ -153,7 +154,6 @@ export function appendBoardComposer(composer: string, text: string): string {
   return composer + text;
 }
 
-/** A group holds a host project when the project is a repository's primary or any of its checkouts. */
 function groupHoldsCheckout(group: ProjectGroup, projectId: string): boolean {
   return group.repos.some(repo => repo.projectId === projectId || repo.checkouts.some(checkout => checkout.projectId === projectId));
 }
@@ -182,7 +182,6 @@ export function resolveMissionProject(
 
 const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
-/** Lines for `infinite projects`: groups, their repositories and checkouts, hidden groups, then suggestions. */
 export function projectsLines(list: ProjectGroupList, syncOf: (projectId: string) => string | undefined = () => undefined): string[] {
   const lines: string[] = [];
   const suffix = (projectId: string) => {
@@ -335,6 +334,26 @@ async function openItem(item: BoardItem, api: Api, config: ClientConfig, configP
   }
 }
 
+function formatMissionProgress(page: MissionProgressPage): string {
+  const { mission, subtasks } = page.snapshot;
+  const lines = [`${safe(mission.title)}  ${safe(mission.id)}  ·  ${safe(mission.status)}  ·  revision ${mission.revision}`];
+  if (page.resync.required) lines.push(`Current snapshot (${safe(page.resync.reason)})`);
+  else lines.push(`Retained observations since your cursor: ${page.observations.length}`);
+  if (mission.coordinator) lines.push(`Coordinator  ${safe(mission.coordinator.recordedStatus)}  ·  worker ${safe(mission.coordinator.workerStatus)}`);
+  for (const subtask of subtasks) {
+    const { child } = subtask;
+    lines.push(`${safe(subtask.title)}  ·  ${safe(subtask.status)}  ·  ${child.kind === "linked" ? safe(child.runId) : child.kind}`);
+    if (child.kind !== "linked") continue;
+    for (const member of child.assignments)
+      lines.push(`  ${safe(member.role)} ${safe(member.taskId)}  ${safe(member.recordedStatus)}  ·  worker ${safe(member.workerStatus)}`);
+    for (const check of child.checks)
+      lines.push(`  Check  ${safe(check.status)}${check.headCommit ? ` at ${safe(check.headCommit)}` : ""}`);
+    if (child.assignmentsTruncated || child.checksTruncated) lines.push("  Additional assignments or checks are available in the team record.");
+  }
+  lines.push(`Cursor  ${safe(page.cursor)}`);
+  return lines.join("\n");
+}
+
 export async function handleBoardClientCommand(
   command: "projects" | "start" | "mission" | "board",
   positional: string[], options: Options, config: ClientConfig, api: Api, configPath: string,
@@ -374,7 +393,16 @@ export async function handleBoardClientCommand(
   }
   if (command === "mission") {
     const [action, id, argument, ...rest] = positional;
-    if (!action || !id) throw new Error("Usage: infinite mission status ID | answer ID DECISION_ID TEXT | steer ID TEXT | pause|resume|cancel ID");
+    if (!action || !id) throw new Error("Usage: infinite mission status ID | progress ID [--after CURSOR] [--json] | answer ID DECISION_ID TEXT | steer ID TEXT | pause|resume|cancel ID");
+    if (action === "progress") {
+      const after = options["--after"];
+      if (argument || rest.length || (after !== undefined && (typeof after !== "string" || !after)))
+        throw new Error("Usage: infinite mission progress ID [--after CURSOR] [--json]");
+      const query = after ? `?cursor=${encodeURIComponent(after)}` : "";
+      const page = await api.json<MissionProgressPage>(`/missions/${encodeURIComponent(id)}/progress${query}`);
+      console.log(options["--json"] ? JSON.stringify(page, null, 2) : formatMissionProgress(page));
+      return true;
+    }
     if (action === "status") {
       if (argument || rest.length) throw new Error("Usage: infinite mission status ID");
       const mission = await api.json<Mission>(`/missions/${id}`);
@@ -394,7 +422,7 @@ export async function handleBoardClientCommand(
     } else if (["pause", "resume", "cancel"].includes(action)) {
       if (argument || rest.length) throw new Error(`Usage: infinite mission ${action} ID`);
       await api.json(`/missions/${id}/${action}`, { requestId, revision: current.revision });
-    } else throw new Error("Usage: infinite mission status|answer|steer|pause|resume|cancel ...");
+    } else throw new Error("Usage: infinite mission status|progress|answer|steer|pause|resume|cancel ...");
     console.log(`Mission ${id} ${action} requested.`);
     return true;
   }

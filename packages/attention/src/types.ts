@@ -19,13 +19,10 @@ export interface Prompt {
   acceptsText: boolean;
   multiSelect?: boolean;
   destructive?: { pattern: string };
-  /** Only true when the retained provider input is complete, without storage truncation. */
   tool?: { name: string; input: Record<string, unknown>; inputComplete?: boolean };
   source: PromptSource;
   hash?: string;
-  /** A screen block followed only by blank lines and key hints, as a provider's own dialog is. */
   pinned?: boolean;
-  /** Set only on host list rows: the prompt has the complete evidence a delegated coordinator review needs. */
   delegable?: boolean;
 }
 
@@ -34,7 +31,6 @@ export type AnswerResult = "closed" | "still-open" | "changed" | "refused";
 
 export type Signal =
   | { kind: "hooks-ready"; event: string }
-  /** `automatic`: the provider submitted this prompt itself (the continue after an owner's answer), not a person. */
   | { kind: "turn-start"; prompt?: string; automatic?: true }
   | { kind: "turn-end"; message?: string; backgroundTasks?: number; stopHookActive?: boolean; failed?: boolean }
   | { kind: "tool-start"; tool: string; toolUseId?: string; input: Record<string, unknown>; quiet: boolean; destructive?: { pattern: string } }
@@ -64,21 +60,29 @@ export type AttentionState =
   | "working" | "needs-you" | "turn-finished" | "idle"
   | "exited" | "unavailable" | "recording-error";
 
-export interface Attention {
-  state: AttentionState;
+type AttentionTool = { tool: string; summary: string; at: string };
+
+type AttentionBase = {
   since: string;
   source: "hook" | "osc" | "screen" | "lifecycle" | "protocol";
   now: string;
-  prompt?: Prompt;
   lastMessage?: string;
-  lastTool?: { tool: string; summary: string; at: string };
   lastActivityAt: string;
   hooks: "active" | "none";
   hookErrors: number;
   limit?: { limit: "usage" | "credits"; confidence: "single-source" | "corroborated"; resetsAt?: string; since: string; message: string };
-  /** Internal: a turn-end has been seen in this session. */
   sawTurnEnd: boolean;
-}
+};
+
+export type Attention =
+  | (AttentionBase & { state: "working"; prompt?: undefined; lastTool?: AttentionTool })
+  | (AttentionBase & { state: "needs-you"; prompt: Prompt; lastTool?: AttentionTool })
+  | (AttentionBase & { state: "needs-you"; source: "lifecycle"; prompt?: undefined; lastTool?: AttentionTool })
+  | (AttentionBase & { state: "turn-finished"; prompt?: undefined; lastTool?: undefined })
+  | (AttentionBase & { state: "idle"; prompt?: undefined; lastTool?: undefined })
+  | (AttentionBase & { state: "exited"; prompt?: undefined; lastTool?: undefined })
+  | (AttentionBase & { state: "unavailable"; prompt?: undefined; lastTool?: undefined })
+  | (AttentionBase & { state: "recording-error"; prompt?: undefined; lastTool?: undefined });
 
 export const LOUD_TOOLS = new Set([
   "Bash", "PowerShell", "Edit", "Write", "MultiEdit", "NotebookEdit",

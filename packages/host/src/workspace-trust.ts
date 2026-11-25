@@ -3,10 +3,6 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSyn
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// The owner's trust in a team root covers every member folder below it. Claude Code and
-// Codex key folder trust by the folder or its own Git root, and each member is a separate
-// clone, so a parent entry never reaches it: each launch records its exact folder instead.
-
 function trustable(cwd: string) {
   return isAbsolute(cwd) && normalize(cwd) === cwd && cwd !== "/" && !/[\x00-\x1f\x7f]/.test(cwd);
 }
@@ -22,17 +18,11 @@ function inspected(path: string, follow = false) {
   }
 }
 
-/** Codex 0.163's project root marker under `project_root_markers=[".git"]`: a `.git` file, or a `.git` folder holding `HEAD`. */
 function gitRootMarker(dir: string) {
   const git = inspected(join(dir, ".git"), true);
   return git !== undefined && (!git.isDirectory() || inspected(join(dir, ".git", "HEAD"), true) !== undefined);
 }
 
-/**
- * The `.codex` entries a trusted Codex launch in `cwd` reads as project configuration: one in the folder itself or in
- * any folder above it up to its project root, of any file type. Without a root marker only the folder itself counts.
- * A linked worktree's main checkout supplies hooks only beside a `.codex` folder of the worktree's own.
- */
 export function repositoryCodexConfig(cwd: string): string[] {
   const chain: string[] = [];
   for (let dir = cwd; ; dir = dirname(dir)) {
@@ -43,35 +33,24 @@ export function repositoryCodexConfig(cwd: string): string[] {
   return chain.map(dir => join(dir, ".codex")).filter(path => inspected(path) !== undefined);
 }
 
-/**
- * A per-launch Codex override; nothing is written to the account's configuration. In a trusted folder Codex loads the
- * repository's `.codex` settings, hooks and exec policy, and starts its MCP server commands outside the command
- * sandbox, so a member that commits one would change how every later Codex member runs. Such a folder is refused.
- * The root markers are pinned so Codex finds the same project root as this check.
- */
 export function codexTrustArgs(cwd: string): string[] {
   if (!trustable(cwd)) throw new Error("Workspace trust requires an absolute folder path");
   const planted = repositoryCodexConfig(cwd);
   if (planted.length)
     throw new Error(`Codex member not started: the repository carries Codex project configuration (${planted.join(", ")}), which a trusted Codex launch would load. Remove it from the repository to start Codex members here.`);
-  // A JSON string is a valid TOML basic string once control characters are excluded.
   return ["-c", 'project_root_markers=[".git"]', "-c", `projects={${JSON.stringify(cwd)}={trust_level="trusted"}}`];
 }
 
-/** The global config file Claude Code reads, including its legacy `.claude/.config.json`. */
 export function claudeConfigPath(home: string, configDir?: string): string {
   const primary = join(configDir || home, ".claude.json");
   const legacy = join(configDir || join(home, ".claude"), ".config.json");
   try {
     const info = statSync(legacy);
     if (info.isFile() && (info.size > 0 || ((info.mode & 0o222) !== 0 && !existsSync(primary)))) return legacy;
-  } catch { /* no legacy file */ }
+  } catch {}
   return primary;
 }
 
-// Claude Code saves this file under a proper-lockfile directory lock at `<file>.lock`, then
-// rereads and merges. Holding the same lock across the whole read-modify-write keeps either
-// writer from replacing the other's update. Its locks count as stale after ten seconds.
 const LOCK_STALE_MS = 10_000;
 const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 function withClaudeConfigLock<T>(configPath: string, waitMs: number, update: () => T): T {
@@ -81,7 +60,6 @@ function withClaudeConfigLock<T>(configPath: string, waitMs: number, update: () 
     try { mkdirSync(lock); break; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     if (Date.now() >= deadline) throw new Error("Claude config is locked by another process");
-    // A stale lock that cannot be removed is an error, not a reason to keep retrying.
     try { if (Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS) { rmdirSync(lock); continue; } }
     catch (error) { if (!gone(error)) throw error; continue; }
     pause(Math.min(200, 20 * attempt));
@@ -89,7 +67,6 @@ function withClaudeConfigLock<T>(configPath: string, waitMs: number, update: () 
   try { return update(); } finally { rmdirSync(lock); }
 }
 
-/** Mark one folder trusted in Claude Code's global config, leaving every other entry as it was. */
 export function recordClaudeTrust(configPath: string, cwd: string, lockWaitMs = 5000): boolean {
   if (!trustable(cwd)) throw new Error("Workspace trust requires an absolute folder path");
   return withClaudeConfigLock(configPath, lockWaitMs, () => {
@@ -111,9 +88,6 @@ export function recordClaudeTrust(configPath: string, cwd: string, lockWaitMs = 
   });
 }
 
-// Agent-side entry for wrappers that run providers in a separate account. It records trust
-// only for the folder this launch runs in, in that account's own Claude config. Wrappers
-// name it through the release symlink, while the module URL is the resolved file.
 const entry = process.argv[1] ? resolve(process.argv[1]) : undefined;
 if (entry && existsSync(entry) && realpathSync(entry) === fileURLToPath(import.meta.url)) {
   const requested = process.env.INFINITE_TRUSTED_WORKSPACE;

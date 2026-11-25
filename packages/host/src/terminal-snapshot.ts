@@ -1,7 +1,6 @@
 import type { Terminal } from "@xterm/headless";
 import serialize from "@xterm/addon-serialize";
 
-/** Track parser boundaries and state that the public xterm serializer omits. */
 export class TerminalSnapshots {
   private readonly serializer = new serialize.SerializeAddon();
   private parser: "ground" | "escape" | "csi" | "osc" | "string" = "ground";
@@ -37,7 +36,6 @@ export class TerminalSnapshots {
           this.stringEscape = false;
         } else {
           if (this.parser === "osc") {
-            // An embedded non-terminating ESC has parser-specific behavior; do not reconstruct it.
             if (this.stringEscape) this.statefulOsc = true;
             if (code !== 0x1b) {
               if (this.osc.length >= 4100) this.oscTruncated = true;
@@ -80,7 +78,6 @@ export class TerminalSnapshots {
         if (this.sequence === "c") {
           this.unsupported.clear(); this.modes.clear(); this.cursorStyle = "";
         } else if (["7", "8", "H"].includes(this.sequence) || this.sequence.length > 1) {
-          // Saved cursors, custom tab stops and character sets have no public serializer.
           this.unsupported.add("escape-state");
         }
         this.parser = "ground";
@@ -98,14 +95,10 @@ export class TerminalSnapshots {
         if (code === 0 || code === 2) this.titles.set(2, value);
         return;
       }
-      // These requests do not mutate a terminal's colors or frame. Other OSCs, including
-      // hyperlink/palette/default-color changes, cannot be represented by cell serialization.
       if ((code === 4 && /^\d+;\?(?:;\d+;\?)*$/.test(value)) ||
           (code >= 10 && code <= 19 && /^\?(?:;\?)*$/.test(value)) ||
           (code === 9 && !/^\d+;/.test(value))) return;
     }
-    // RIS does not restore the terminal's palette/default colors. Remain conservative for the
-    // worker lifetime even if a subsequent reset clears the visible screen and ordinary modes.
     this.statefulOsc = true;
   }
 
@@ -144,15 +137,12 @@ export class TerminalSnapshots {
       const code = Number(rawCode);
       if (code === 21 || code === 58 ||
           (code === 4 && underlineStyle !== undefined && ![0, 1].includes(Number(underlineStyle)))) {
-        // The serializer flattens extended underline styles and omits underline color. SGR0
-        // only changes future text: already-painted cells and scrollback still need full replay.
         this.extendedSgr = true;
       } else if ((code === 38 || code === 48) && !attributes[i].includes(":")) {
-        // Skip RGB / palette components so values such as 21 or 58 are not read as attributes.
         const count = attributes[i + 1] === "2" ? 4 : attributes[i + 1] === "5" ? 2 : 0;
         if (!count || i + count >= attributes.length ||
             attributes.slice(i + 1, i + count + 1).some(value => !/^\d*$/.test(value))) {
-          this.extendedSgr = true; // ambiguous mixed color syntax also needs full replay
+          this.extendedSgr = true;
           return;
         }
         i += count;
@@ -165,7 +155,6 @@ export class TerminalSnapshots {
       throw new Error("Terminal output ends inside an escape or Unicode sequence");
     if (this.unsupported.size || this.statefulOsc || this.extendedSgr || this.terminal.modes.originMode)
       throw new Error("Terminal state requires full replay");
-    // Restore into a clean terminal: otherwise disabled modes from an earlier attachment leak in.
     let ansi = "\x1bc" + this.serializer.serialize({ scrollback: 200 });
     for (const [mode, enabled] of this.modes) ansi += `\x1b[?${mode}${enabled ? "h" : "l"}`;
     ansi += this.cursorStyle;

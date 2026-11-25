@@ -1,58 +1,55 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { unseal, writeSealed } from "../vault.js";
-import { HALT_ITEM_KINDS, HALT_RESULTS, type HaltOutcome, type HaltScope } from "./rules.js";
+import { HALT_ITEM_KINDS, HALT_RESULTS, type HaltOutcome } from "./rules.js";
 
 export const HALT_FILE = "halt.sealed";
 const HALT_SEAL_SCOPE = "halt";
 
-/** The owner device that sent the request. The label is the device's own, for the owner to recognise it. */
 export type HaltActor = { deviceId: string; label: string };
-export type HaltEntry = {
+type HaltEntryBase = {
   haltId: string;
-  scope: HaltScope;
-  projectId?: string;
   at: number;
   reason?: string;
   requestId: string;
   by: HaltActor;
-  /** False until the stop pass has finished. A restart finishes an unsettled pass. */
   settled: boolean;
 };
+export type HaltEntry =
+  | (HaltEntryBase & { scope: "host"; projectId?: undefined })
+  | (HaltEntryBase & { scope: "project"; projectId: string });
 export type HaltReceipt = {
   requestId: string;
   action: "engage" | "release";
   fingerprint: string;
-  /** The halt this request engaged or released. Absent when a release found nothing halted. */
   haltId?: string;
-  /** False when the request found the scope already halted (engage) or not halted (release). */
   changed: boolean;
   keepPaused?: boolean;
   at: number;
   by: HaltActor;
-  /** False until the request's pass has finished. A restart finishes an unsettled pass. */
   settled: boolean;
   outcomes: HaltOutcome[];
 };
 export type HaltRecord = { version: 1; halts: HaltEntry[]; receipts: HaltReceipt[] };
 
-/** Requests remembered for replay. The oldest is dropped first. */
 export const MAX_RECEIPTS = 100;
 
 const uuid = z.uuid();
 const time = z.number().int();
 const text = (max: number) => z.string().max(max);
 const actorSchema = z.object({ deviceId: z.string().min(1).max(200), label: text(200) }).strict();
-const entrySchema = z.object({
+const entryBase = {
   haltId: uuid,
-  scope: z.enum(["host", "project"]),
-  projectId: z.string().min(1).optional(),
   at: time,
   reason: text(500).optional(),
   requestId: uuid,
   by: actorSchema,
   settled: z.boolean(),
-}).strict();
+};
+const entrySchema = z.discriminatedUnion("scope", [
+  z.object({ ...entryBase, scope: z.literal("host"), projectId: z.undefined().optional() }).strict(),
+  z.object({ ...entryBase, scope: z.literal("project"), projectId: z.string().min(1) }).strict(),
+]);
 const outcomeSchema = z.object({
   kind: z.enum(HALT_ITEM_KINDS),
   id: text(200),
@@ -80,7 +77,6 @@ const recordSchema: z.ZodType<HaltRecord> = z.object({
 
 export type HaltRead = { state: "missing" } | { state: "readable"; record: HaltRecord } | { state: "unreadable" };
 
-/** A missing file is no halt. Any other failure (I/O, authentication, schema) is unreadable. Never throws. */
 export function readHaltRecord(file: string, key: Buffer): HaltRead {
   let raw: string;
   try { raw = readFileSync(file, "utf8"); }
@@ -93,7 +89,6 @@ export function readHaltRecord(file: string, key: Buffer): HaltRead {
   }
 }
 
-/** False on any failure, including a record outside the schema. Never throws. */
 export function writeHaltRecord(file: string, key: Buffer, record: HaltRecord): boolean {
   try {
     if (!recordSchema.safeParse(record).success) return false;
@@ -104,15 +99,8 @@ export function writeHaltRecord(file: string, key: Buffer, record: HaltRecord): 
   }
 }
 
-/**
- * The halt epochs, kept apart from the halt record so that restoring or removing that record keeps them. Every engage
- * or release that changes a scope gives that scope a new epoch, written before the record. The permission agent reads
- * a project's epochs into the authority of each decision, so a decision reached before a halt or its release no longer
- * applies after it.
- */
 export const HALT_EPOCHS_FILE = "halt-epochs.sealed";
 const HALT_EPOCHS_SEAL_SCOPE = "halt-epochs";
-/** The host scope's epoch and each project's. A project without one has never been halted on its own. */
 export type HaltEpochs = { version: 1; host: string; projects: Record<string, string> };
 
 const epochsSchema: z.ZodType<HaltEpochs> = z.object({
@@ -123,7 +111,6 @@ const epochsSchema: z.ZodType<HaltEpochs> = z.object({
 
 export type HaltEpochsRead = { state: "missing" } | { state: "readable"; epochs: HaltEpochs } | { state: "unreadable" };
 
-/** A missing file is a host that was never halted. Any other failure is unreadable. Never throws. */
 export function readHaltEpochs(file: string, key: Buffer): HaltEpochsRead {
   let raw: string;
   try { raw = readFileSync(file, "utf8"); }
@@ -136,7 +123,6 @@ export function readHaltEpochs(file: string, key: Buffer): HaltEpochsRead {
   }
 }
 
-/** False on any failure. Never throws. */
 export function writeHaltEpochs(file: string, key: Buffer, epochs: HaltEpochs): boolean {
   try {
     if (!epochsSchema.safeParse(epochs).success) return false;

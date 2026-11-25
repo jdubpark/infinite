@@ -49,7 +49,6 @@ test.before(async () => {
   port = (proxy.address() as { port: number }).port;
 });
 test.after(async () => {
-  // Nothing the proxy sent or logged may carry the installation token or a grant.
   const everything = `${responses.join("\n")}\n${JSON.stringify(logs)}`;
   assert.equal(everything.includes(TOKEN), false);
   assert.equal(everything.includes("v2."), false);
@@ -81,7 +80,6 @@ async function send(options: { method?: string; path: string; auth?: string; hea
     void (async () => {
       const body = options.body ?? Buffer.alloc(0);
       if (!options.pieces) return req.end(body);
-      // Split the command list across separate writes so the proxy must reassemble it.
       for (let offset = 0; offset < body.length; offset += options.pieces) {
         req.write(body.subarray(offset, offset + options.pieces));
         await new Promise(next => setTimeout(next, 2));
@@ -135,7 +133,6 @@ test("a push to the granted branch is forwarded byte for byte, also when the com
     assert.deepEqual(seen.at(-1)!.body, body);
   }
   assert.deepEqual(logs.at(-1)!.refs, ["refs/heads/infinite/team-1"]);
-  // Every authenticated record names the grant's project, so two projects on one repository stay apart.
   assert.deepEqual([logs.at(-1)!.project, logs.at(-1)!.sid, logs.at(-1)!.repo], ["product-web", "session-1", "example/product"]);
 });
 
@@ -143,7 +140,6 @@ test("pushes outside the grant are refused before any request reaches GitHub", a
   const before = seen.length;
   const refused = async (auth: string, body: Buffer, reason: string) => {
     const result = await send({ method: "POST", path: "/example/product.git/git-receive-pack", auth: basic(auth), headers: receivePack, body });
-    // A policy refusal is a receive-pack report that rejects each ref; a malformed request is a plain 403.
     if (result.status === 200) assert.equal(result.headers["content-type"], "application/x-git-receive-pack-result");
     else assert.equal(result.status, 403);
     assert.match(result.body, new RegExp(reason));
@@ -155,7 +151,6 @@ test("pushes outside the grant are refused before any request reaches GitHub", a
   await refused(branchesGrant, pushBody([`${oid("0")} ${oid("1")} refs/tags/v1`]), "ref-not-branch");
   await refused(branchesGrant, pushBody([`${oid("0")} ${oid("1")} refs/heads/a\x01b`]), "command-invalid");
   await refused(branchesGrant, pushBody(Array.from({ length: 65 }, (_, index) => `${oid("0")} ${oid("1")} refs/heads/b${index}`)), "command-list-too-large");
-  // After the flush only the pack may follow; a second command list is not passed through.
   await refused(branchesGrant, pushBody([`${oid("0")} ${oid("1")} refs/heads/feature`], { afterFlush: Buffer.concat([pkt(`${oid("1")} ${oid("0")} refs/heads/main\n`), Buffer.from("0000")]) }), "pack-expected");
   await refused(branchesGrant, pushBody([`${oid("0")} ${oid("1")} refs/heads/feature`], { capabilities: "report-status push-cert=1" }), "capability-refused");
   assert.equal(seen.length, before);
@@ -174,14 +169,12 @@ test("a gzip push body is inspected after decompression and forwarded compressed
   assert.match(refused.body, /ng refs\/heads\/main Infinite GitHub proxy: ref-not-granted/);
   assert.equal(seen.length, before);
 
-  // A short command list before a large pack, gzipped, through HTTP: allowed and forwarded unchanged.
   const large = gzipSync(pushBody([`${oid("0")} ${oid("a")} refs/heads/infinite/team-1`], { afterFlush: Buffer.concat([Buffer.from("PACK\0\0\0\x02\0\0\0\0", "latin1"), randomBytes(1024 * 1024)]) }));
   const sent = await send({ method: "POST", path: "/example/product.git/git-receive-pack", auth: basic(pushGrant), headers: { ...receivePack, "content-encoding": "gzip" }, body: large });
   assert.equal(sent.status, 200, sent.body);
   assert.deepEqual(seen.at(-1)!.body, large);
 });
 
-/** A request stand-in that already holds every chunk, so it delivers them as fast as the inspector lets it. */
 function bufferedRequest(body: Buffer, chunkSize: number) {
   const req = new PassThrough();
   for (let offset = 0; offset < body.length; offset += chunkSize) req.write(body.subarray(offset, offset + chunkSize));
@@ -189,7 +182,6 @@ function bufferedRequest(body: Buffer, chunkSize: number) {
   return req;
 }
 async function rest(req: PassThrough) {
-  // The inspector leaves an accepted request paused; forwarding resumes it through pipe(), this helper by hand.
   const chunks: Buffer[] = [];
   req.on("data", chunk => chunks.push(chunk));
   const ended = new Promise(done => req.once("end", done));
@@ -199,7 +191,6 @@ async function rest(req: PassThrough) {
 }
 
 test("a gzip body is decoded chunk by chunk, so a short command list before a large pack passes in 64 KiB pieces", async () => {
-  // The review's case: before the fix, all 1 MiB arrived before zlib caught up and the raw bound refused the push.
   const pack = Buffer.concat([Buffer.from("PACK\0\0\0\x02\0\0\0\0", "latin1"), randomBytes(1024 * 1024)]);
   const plain = pushBody([`${oid("0")} ${oid("a")} refs/heads/infinite/team-1`], { afterFlush: pack });
   const gzipped = gzipSync(plain);
@@ -207,7 +198,6 @@ test("a gzip body is decoded chunk by chunk, so a short command list before a la
     const req = bufferedRequest(body, 64 * 1024);
     const inspected = await inspectReceivePack(req, gzip);
     assert.deepEqual(inspected.commands.map((command: { ref: string }) => command.ref), ["refs/heads/infinite/team-1"]);
-    // Only what the verdict needed was read, and those bytes plus the rest are the original body.
     assert.ok(Buffer.concat(inspected.raw).length <= 2 * 64 * 1024, `read ${Buffer.concat(inspected.raw).length} bytes`);
     assert.deepEqual(Buffer.concat([...inspected.raw, ...(await rest(req))]), body);
   }
@@ -219,12 +209,10 @@ test("the decoded prefix of a gzip body is bounded, so a small upload cannot exp
   assert.ok(body.length < 1024);
   await assert.rejects(inspectReceivePack(bufferedRequest(body, 64), true, { maxDecodedBytes: 1024 }), /command-list-too-large/);
   assert.equal((await inspectReceivePack(bufferedRequest(body, 64), true)).commands.length, 40);
-  // A gzip bomb (32 MiB of zeros in a few KiB) is refused at its first bytes, without decoding the rest.
   await assert.rejects(inspectReceivePack(bufferedRequest(gzipSync(Buffer.alloc(32 * 1024 * 1024, "0")), 64 * 1024), true), /command-list-empty|command-list-too-large/);
 });
 
 test("a client that leaves after sending its whole request ends the upstream request, and its place in the limit is held until then", async () => {
-  // An upstream that answers the head of a fetch and then keeps the response open.
   const held: { closed: boolean; finish: () => void }[] = [];
   const slow = http.createServer((req, res) => {
     req.resume();
@@ -256,7 +244,6 @@ test("a client that leaves after sending its whole request ends the upstream req
     assert.ok(check(), label);
   };
   try {
-    // The request is complete and the response has begun when the client leaves.
     const first = await fetchOnce();
     assert.equal(first.status, 200);
     assert.equal(held.length, 1);
@@ -266,7 +253,6 @@ test("a client that leaves after sending its whole request ends the upstream req
     busy.res.resume();
     first.req.destroy();
     await waitFor(() => held[0]!.closed, "the proxy closed its upstream request when the client left");
-    // The place is free again once the upstream request has closed.
     let next = await fetchOnce();
     for (let attempt = 0; attempt < 100 && next.status === 503; attempt++) { next.res.resume(); await new Promise(done => setTimeout(done, 10)); next = await fetchOnce(); }
     assert.equal(next.status, 200);
@@ -279,7 +265,6 @@ test("a client that leaves after sending its whole request ends the upstream req
 });
 
 test("the token cache is reported proxy-only only when mode bits deny the agent and no extended ACL can grant it", async () => {
-  // `nobody` exists on Linux and macOS and is neither the owner nor in the group of these fixtures.
   const cacheRoot = mkdtempSync(join(tmpdir(), "github-proxy-acl-"));
   try {
     const directory = join(cacheRoot, "tokens");
@@ -299,18 +284,15 @@ test("the token cache is reported proxy-only only when mode bits deny the agent 
     chmodSync(file, 0o600);
     assert.equal(await agentTokenAccess(config, probe(false)), "proxy-only");
     assert.deepEqual(probed.at(-1), [directory, file]);
-    // An ACL entry on the directory or a file, or a probe that cannot answer, leaves the verdict unknown.
     assert.equal(await agentTokenAccess(config, probe(true)), "unknown");
     assert.equal(await agentTokenAccess(config, probe(undefined)), "unknown");
     assert.equal(await agentTokenAccess(config, getfaclProbe(join(cacheRoot, "missing-getfacl"))), "unknown");
 
-    // The real probe reads getfacl's answer: output means an extended ACL, silence means none, failure means unknown.
     const fake = (name: string, script: string) => { const path = join(cacheRoot, name); writeFileSync(path, `#!/bin/sh\n${script}\n`); chmodSync(path, 0o755); return path; };
     assert.equal(await getfaclProbe(fake("acl.sh", 'printf "# file: %s\\nuser:nobody:r--\\n" "$4"'))([file]), true);
     assert.equal(await getfaclProbe(fake("none.sh", 'test "$1" = --skip-base && exit 0; echo unexpected'))([file]), false);
     assert.equal(await getfaclProbe(fake("fail.sh", "exit 1"))([file]), undefined);
 
-    // /health and doctor get the same verdict.
     const health = createGithubProxy({ config, key, log: () => {}, extendedAcl: probe(true) });
     await new Promise<void>(done => health.listen(0, "127.0.0.1", done));
     try {

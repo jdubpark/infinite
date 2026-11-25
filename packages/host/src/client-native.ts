@@ -7,8 +7,6 @@ import { WebSocket, WebSocketServer } from "ws";
 import type { ControlLease, Session, WorkerState } from "./types.js";
 import { nativeCatalogReceiver, NATIVE_COMPRESSION, NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 
-// Codex accepts only root WebSocket URLs. Keep the scoped cloud URL and device
-// key inside Infinite, and give the local TUI a short-lived loopback credential.
 async function nativeRelay(url: URL, deviceToken: string, signal: AbortSignal) {
   const token = randomBytes(32).toString("hex");
   const server = createServer((_req, res) => { res.writeHead(404); res.end(); });
@@ -59,8 +57,6 @@ async function nativeRelay(url: URL, deviceToken: string, signal: AbortSignal) {
     });
   });
   try {
-    // Codex starts a short initialize deadline after its loopback connection opens.
-    // Finish the cloud handshake before launching it so that deadline only covers RPC.
     const connected = new Promise<void>((resolve, reject) => {
       upstream.once("open", resolve);
       upstream.once("error", () => reject(new Error("Cloud connection failed or timed out.")));
@@ -119,13 +115,10 @@ export async function attachNativeCodex(config: { origin: string; token: string 
   let killTimer: ReturnType<typeof setTimeout> | undefined, detachReason: string | undefined, exitReason: string | undefined;
   const detached = () => {
     if (ended || abort.signal.aborted) return;
-    // Cut off the provider protocol first: graceful TUI cleanup cannot interrupt
-    // a cloud turn after detachment. SIGTERM also lets CLI launchers forward it.
     abort.abort(); relay?.close(); child?.kill("SIGTERM");
     if (child) killTimer = setTimeout(() => child?.kill("SIGKILL"), 2000);
   };
   process.on("SIGHUP", detached); process.on("SIGTERM", detached); process.on("SIGINT", detached);
-  // Renewal covers the cloud handshake as well as the visible native interface.
   const timer = setInterval(() => {
     if (renewing || ended) return;
     renewing = true;
@@ -157,8 +150,6 @@ export async function attachNativeCodex(config: { origin: string; token: string 
     relay?.close();
     if (child) {
       if (ttyMode) spawnSync("stty", [ttyMode], { stdio: ["inherit", "ignore", "ignore"], timeout: 2000 });
-      // stty restores line discipline, not emulator modes. A crashed or disconnected
-      // provider may leave mouse/focus reports flowing into the shell as keystrokes.
       process.stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[?25h\x1b[?1049l\x1b[0m");
     }
     if (detachReason) console.error(`\n[Infinite] ${detachReason}`);

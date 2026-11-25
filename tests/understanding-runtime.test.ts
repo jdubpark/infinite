@@ -44,7 +44,6 @@ function setup(t: test.TestContext, options: { adapter?: UnderstandingAdapter; p
   t.after(async () => { await runtime.close(); rmSync(base, { recursive: true, force: true }); });
   return { runtime, root, secondRoot, stateDir, group, config, setCatalog(value: KnowledgeCatalog) { currentCatalog = value; } };
 }
-// The waits cover child processes and Git, which take many times longer when the machine is loaded.
 async function waitUntil(predicate: () => boolean, ms = 20000) {
   const end = Date.now() + ms;
   while (Date.now() < end) { if (predicate()) return; await new Promise(resolvePromise => setTimeout(resolvePromise, 10)); }
@@ -81,7 +80,6 @@ test("stored contexts are served only for repositories whose binding still match
   const accepted = s.runtime.readWithContexts("workspace");
   assert.equal(accepted.contexts.repo?.head, accepted.knowledge.components[0].current.sources[0]?.head ?? accepted.contexts.repo?.head);
   assert.ok(accepted.contexts.repo?.generatedAt, "an accepted repository exposes its stored context");
-  // Replace the checkout with a different repository at the same path: the stored map and its context are rejected together.
   rmSync(join(s.root, ".git"), { recursive: true, force: true });
   execFileSync("git", ["init", "-q", s.root]);
   execFileSync("git", ["-C", s.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "add", "."]);
@@ -98,7 +96,6 @@ test("explicit refresh coalesces and rejects publication when the workspace bind
   const second = s.runtime.refresh("workspace");
   assert.equal(second.state, "queued");
   await waitUntil(() => Boolean(release));
-  // Invalidate the source identity at the read boundary while the adapter is awaited.
   const moved = `${s.root}-moved`;
   (await import("node:fs")).renameSync(s.root, moved);
   release!();
@@ -140,7 +137,6 @@ test("a failed job records a readable reason and clears it on the next success",
 });
 
 for (const { configuredMs, expectedBudgets } of [
-  // Each engine call leaves the 5 s re-check reserve; the mocked clock makes the capture take no time.
   { configuredMs: 180_000, expectedBudgets: [175_000, 55_000] },
   { configuredMs: 600_000, expectedBudgets: [595_000, 475_000] },
 ]) test(`workspace synthesis shares the ${configuredMs}ms deadline between component invocations and rotates repositories`, { timeout: 120000 }, async t => {
@@ -260,11 +256,9 @@ test("close settles while a job is held, with nothing else keeping the process a
     delivery: async input => ({ repositoryId: input.repositoryId, state: "ready", observedAt: new Date().toISOString(), pullRequests: [], environments: [], coverage: [] }) } });
   s.runtime.refresh("workspace");
   await waitUntil(() => entered);
-  // Nothing but close's own wait is pending here. If that wait cannot keep the process alive, the runner cancels this test and every test after it.
   const started = performance.now();
   await s.runtime.close();
   assert.ok(performance.now() - started >= 1000, "close waited for the held job up to its limit");
-  // End the held job before the test does, so it cannot resume inside a later test.
   fail!(new Error("released"));
   await waitUntil(() => !(s.runtime as unknown as { running: boolean }).running);
 });
@@ -553,7 +547,6 @@ test("maintenance publishes a repository brief with parsed diagrams, a component
     writeFileSync(join(s.root, "src", "a.ts"), `export const a = ${value};\n`);
     execFileSync("git", ["-C", s.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "change"]);
   };
-  // A failed brief must not advance the watermark: the next brief spans the skipped range.
   commit(10);
   process.env.UNDERSTANDING_FIXTURE_BRIEF_FAIL = "1";
   t.after(() => { delete process.env.UNDERSTANDING_FIXTURE_BRIEF_FAIL; });
@@ -687,7 +680,6 @@ test("a host without a summary writer reads as unavailable and says why", async 
   assert.equal(s.runtime.refresh("workspace").message, "No summary writer is configured on this host.");
 });
 
-/** Moves the clock past one 15-minute interval and runs one scheduler pass, as the host timer does. */
 function ticker(t: test.TestContext, runtime: UnderstandingRuntime) {
   let offset = 0;
   const realNow = Date.now.bind(Date);
@@ -807,7 +799,6 @@ test("a split that stopped halfway is redone from the old store on the next star
   const key = Buffer.alloc(32, 7), dir = join(s.stateDir, "understanding", "runtime"), legacy = join(s.stateDir, "understanding", "runtime.sealed");
   const file = unseal<{ day: string; workspace: Record<string, unknown> }>(key, "understanding-runtime:workspace", readFileSync(join(dir, "workspace.sealed"), "utf8"));
   writeSealed(legacy, key, "understanding-runtime", { version: 1, day: file.day, workspaces: { workspace: file.workspace } });
-  // The directory exists with a half-written file, as after a crash between two workspace writes.
   writeFileSync(join(dir, "workspace.sealed"), "half-written");
   const resumed = new UnderstandingRuntime({ config: s.config, key, groups: { list: () => ({ groups: [s.group], suggestions: [] }), get: () => s.group }, catalog: { read: () => catalog() } });
   try {

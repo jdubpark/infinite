@@ -19,7 +19,6 @@ test("acceptance 7: a provisional met stops the goal and continue resumes it", {
     assert.equal(created.status, 200, JSON.stringify(created.body));
     const id = created.body.id as string;
 
-    // Cycle 1's evaluator finds the goal's one criterion met: the goal stops for the owner, and no agent marks it achieved.
     const stopped = await f.stopped(id, value => value.stopReason === "provisional-met");
     assert.equal(stopped.status, "ready-for-review");
     assert.equal(stopped.reason, PROVISIONAL_REASON);
@@ -31,7 +30,6 @@ test("acceptance 7: a provisional met stops the goal and continue resumes it", {
     const before = (await f.host.fetchApi(`/goals/${id}/record`, "viewer")).body;
     assert.equal(typeof before.version, "number", JSON.stringify(before));
 
-    // Not achieved, and continue: the goal runs again on a new record version that carries the owner's direction.
     const summary = "Rank the founders by their sources";
     const answer = await f.host.fetchApi(`/goals/${id}/outcome`, "owner", outcomeOf(stopped, { summary, continue: true, verdictId: first!.verdictId }));
     assert.equal(answer.status, 200, JSON.stringify(answer.body));
@@ -47,7 +45,6 @@ test("acceptance 7: a provisional met stops the goal and continue resumes it", {
     assert.equal(after.record.statement.directions.at(-1).text, summary);
     assert.match(await f.prompt(id, 2, "project-manager"), new RegExp(`User direction: ${summary}`));
 
-    // Cycle 2 stops the same way, and only the owner's outcome marks the goal achieved.
     const second = await f.stopped(id, value => value.cycles.length === 2 && value.stopReason === "provisional-met");
     assert.equal(second.status, "ready-for-review");
     assert.equal(second.cycles[1]!.assessment?.result, "met");
@@ -64,7 +61,6 @@ test("continue is refused outside a provisional stop", { timeout: 60000 }, async
   const { teams, goals, advance } = stubFixture(t);
   goals.start();
 
-  // A goal that a deadline stopped, after a cycle that held an assessment and no provisional stop.
   const timed = await goals.create(finite());
   const one = await until(() => teams.launches[0], Boolean, "cycle 1 of the deadline goal");
   const notMet = assessmentOf(1, 1);
@@ -80,7 +76,6 @@ test("continue is refused outside a provisional stop", { timeout: 60000 }, async
   await assert.rejects(goals.outcome(limited.id, { ...outcomeOf(limited, { continue: true, verdictId: notMet.verdictId }) } as never), refused("goal-not-provisional"));
   assert.equal(unchanged(limited), frozen, "A refused continue changes nothing");
 
-  // A goal that a provisional met stopped: an unknown verdict, then a spent allowance.
   const stopping = await goals.create(finite());
   const three = await until(() => teams.launches[2], Boolean, "cycle 1 of the provisional goal");
   const met = assessmentOf(2, 0);
@@ -106,7 +101,6 @@ test("a standing goal records met and counts verdict failures", { timeout: 60000
     return until(() => goals.get(created.id), goal => !goal.activeTeamId && goal.cycles.length === n && goal.cycles[n - 1]!.class !== undefined, `cycle ${n} to settle`);
   };
 
-  // A met verdict never stops a standing goal: it records the assessment, and the next cycle comes at its cadence.
   const first = await settle(1, 2, 0);
   assert.equal(first.status, "running");
   assert.equal(first.stopReason, undefined);
@@ -115,7 +109,6 @@ test("a standing goal records met and counts verdict failures", { timeout: 60000
   assert.equal(first.failedCycles, 0);
   advance(30);
 
-  // Three failing verdicts in a row (fewer criteria met, then no gain) pause it.
   const second = await settle(2, 1, 1);
   assert.equal(second.cycles[1]!.class, "reviewed", "A failing verdict keeps the cycle's class");
   assert.equal(second.cycles[1]!.assessment?.progress, -1);
@@ -131,7 +124,6 @@ test("a standing goal records met and counts verdict failures", { timeout: 60000
   assert.equal(paused.cycles.length, 4);
   advance(30);
 
-  // An owner's resume resets the count.
   const resumed = await goals.resume(created.id, action(paused));
   assert.equal(resumed.status, "running");
   assert.equal(resumed.failedCycles, 0);
@@ -157,12 +149,10 @@ test("a verdict counts toward the failure stop only on a reviewed cycle", { time
   assert.equal(failing.cycles[0]!.class, "reviewed");
   assert.equal(failing.failedCycles, 1);
 
-  // An excluded cycle leaves the count alone, whatever its assessment says.
   const excluded = await settle(2, "blocked", assessmentOf(0, 2), { blockCode: "provider-limit", reason: "The provider is limited." });
   assert.equal(excluded.cycles[1]!.class, "excluded");
   assert.equal(excluded.failedCycles, 1);
 
-  // Quiet no-change cycles reset the count and never pause the goal.
   for (let n = 3; n <= 5; n++) {
     const quietly = await settle(n, "no-change", quiet(), { reason: "No further work is justified." });
     assert.equal(quietly.cycles[n - 1]!.class, "no-change");
@@ -174,7 +164,6 @@ test("a verdict counts toward the failure stop only on a reviewed cycle", { time
 test("acceptance 10 end to end", { timeout: 300000 }, async () => {
   const f = await hostFixture({ objective: { ...SWITCHES }, mode: "autonomous" });
   try {
-    // Cycle 1's evaluator finds c1 met and c2 not met, and leaves a note on c2.
     f.verdictFile(1, { kind: "verdict", result: "not-met", criteria: ["c0", "c1", "c2"].map(id => ({ id, state: id === "c2" ? "not-met" : "met",
       evidence: ["file:features/progress.json"], ...(id === "c2" ? { note: NOTE } : {}) })) });
     const created = await f.host.fetchApi("/goals", "owner", f.create({ maxRuns: 2, criteria: [criterion("Every source is named", "sources"), criterion("Every claim is checked", "claims")] } as never));
@@ -205,7 +194,6 @@ test("a supervised goal shows the verdict and changes nothing", { timeout: 30000
     assert.equal(created.status, 200, JSON.stringify(created.body));
     const id = created.body.id as string;
 
-    // Every criterion is met in cycle 1, and the supervised goal goes on to cycle 2 as it does without verdicts.
     const manager = await f.prompt(id, 2, "project-manager");
     assert.ok(!manager.includes(AGENT_ASSESSMENT), "No rows reach a supervised goal's next cycle");
     const goal = await f.stopped(id, value => value.cycles.length === 2);
@@ -253,7 +241,6 @@ test("without verdicts a goal is as today", { timeout: 300000 }, async () => {
     assert.ok(!goal.events.some(event => event.text === LATE_RECEIPT_EVENT || event.text === DELIVERY_HOLD_REASON), "No hold and no late receipt reach a goal without verdicts");
     assert.ok(goal.cycles.every(cycle => !("supersededVerdictIds" in cycle)));
 
-    // An outcome without a verdictId records as today; a verdictId that names no assessment is refused.
     const stray = await f.host.fetchApi(`/goals/${id}/outcome`, "owner", outcomeOf(goal, { verdictId: randomUUID() }));
     assert.equal(stray.status, 409, JSON.stringify(stray.body));
     assert.equal(stray.body.code, "verdict-not-found");
@@ -266,7 +253,6 @@ test("without verdicts a goal is as today", { timeout: 300000 }, async () => {
 });
 
 const HEAD = "a".repeat(40);
-/** A reviewed verdict whose one open criterion waited for the delivery. */
 const waiting = (): RunAssessment => ({ verdictId: randomUUID(), revision: 1, head: HEAD, kind: "reviewed", result: "inconclusive",
   counts: { met: 1, notMet: 0, inconclusive: 1, pendingOwner: 0 }, criteria: [{ id: "c0", state: "met" }, { id: "c1", state: "inconclusive" }], at: new Date().toISOString() });
 const detailOf = (assessment: RunAssessment, reason: string) => ({ verdictId: assessment.verdictId, revision: 1, head: HEAD,
@@ -283,14 +269,12 @@ test("a goal holds its next launch for a delivery receipt and stops provisional-
   teams.settle(teamId, "merged", { ...BRIEFED, assessment: first }, 4);
   teams.detail(teamId, detailOf(first, "before-delivery"));
 
-  // The only open criterion waits for the delivery: the goal keeps its next launch back, with one event.
   const held = await until(() => goals.get(created.id), goal => goal.reason === DELIVERY_HOLD_REASON, "the hold");
   assert.equal(held.status, "running");
   await new Promise(done => setTimeout(done, 1300));
   assert.equal(count(goals.get(created.id), DELIVERY_HOLD_REASON), 1);
   assert.equal(teams.launches.length, 1);
 
-  // The receipt arrives: the cycle holds the new verdict, the old id is kept, and the goal stops for the owner.
   const late = assessmentOf(2, 0);
   teams.settle(teamId, "merged", { assessment: late });
   await goals.syncReceipts();
@@ -305,7 +289,6 @@ test("a goal holds its next launch for a delivery receipt and stops provisional-
   assert.equal(teams.launches.length, 1);
   assert.equal(teams.cancels.length, 0);
 
-  // A later receipt that turns the verdict not-met changes the cycle and leaves the stop and its text.
   const reverted = assessmentOf(1, 1);
   teams.settle(teamId, "merged", { assessment: reverted });
   await goals.syncReceipts();
@@ -334,7 +317,6 @@ test("a hold that does not apply launches as today", { timeout: 120000 }, async 
   };
   const start = async () => { const goal = await goals.create(finite({ maxMinutes: 240 })); goals.start(); return goal.id; };
 
-  // Another reason keeps a criterion open, a not-met criterion is a result of its own, and a goal without a verdict has nothing to wait for.
   await cycleTwo(await start(), waiting(), "evaluator-unavailable");
   await cycleTwo(await start(), waiting(), "before-delivery", { counts: { met: 0, notMet: 1, inconclusive: 1, pendingOwner: 0 } });
   const quiet = await start();
@@ -343,7 +325,6 @@ test("a hold that does not apply launches as today", { timeout: 120000 }, async 
   await goals.syncReceipts();
   assert.equal(JSON.stringify(goals.get(quiet)), unread, "A goal without a verdict is neither read nor saved");
 
-  // A supervised goal and a project without scans wait for nothing.
   config.projects[0]!.autonomy = "supervised";
   await cycleTwo(await start(), waiting(), "before-delivery");
   config.projects[0]!.autonomy = "autonomous";
@@ -351,7 +332,6 @@ test("a hold that does not apply launches as today", { timeout: 120000 }, async 
   await cycleTwo(await start(), waiting(), "before-delivery");
   config.projects[0]!.source = { mode: "github", repository: "example/fixture", baseBranch: "main" };
 
-  // The hold ends 10 minutes after the cycle finished: the next launch goes on by the unchanged path.
   const id = await start();
   const launch = await until(() => teams.launches.filter(item => item.context.id === id)[0], Boolean, "cycle 1");
   const open = waiting();
@@ -383,7 +363,6 @@ test("a late receipt changes only the cycle in every other goal state", { timeou
     assert.equal(after.activeTeamId, before.activeTeamId);
   };
 
-  // The run limit, then the owner's answer: the stop is the limit's, and an achieved goal stays achieved.
   const limited = await start({ maxRuns: 1 });
   const first = waiting();
   const limitedTeam = await firstOf(limited, first);
@@ -405,7 +384,6 @@ test("a late receipt changes only the cycle in every other goal state", { timeou
   assert.equal(afterAchieved.status, "achieved");
   assert.equal(afterAchieved.outcomes.length, achieved.outcomes.length);
 
-  // An older cycle, with the next cycle's team active.
   const running = await start({ maxRuns: 3 });
   const oldTeam = await firstOf(running, waiting());
   await until(() => teams.launches.filter(item => item.context.id === running).length, length => length === 2, "cycle 2");
@@ -419,7 +397,6 @@ test("a late receipt changes only the cycle in every other goal state", { timeou
   assert.equal(teams.launches.filter(item => item.context.id === running).length, 2);
   await goals.cancel(running, action(olderChanged));
 
-  // A goal that waits for the delivery, paused by the owner, stays paused.
   const paused = await start({ maxRuns: 3 });
   const pausedFirst = waiting();
   const pausedTeam = await firstOf(paused, pausedFirst);
@@ -434,7 +411,6 @@ test("a late receipt changes only the cycle in every other goal state", { timeou
   assert.equal(stillPaused.status, "paused");
   assert.equal(teams.launches.filter(item => item.context.id === paused).length, 1);
 
-  // A standing goal between cycles: the cycle changes, and nothing stops.
   const standingGoal = await goals.create(standing());
   const standingTeam = await firstOf(standingGoal.id, waiting());
   const idle = await until(() => goals.get(standingGoal.id), goal => !goal.activeTeamId && goal.cycles[0]?.class !== undefined, "the standing cycle");
@@ -447,7 +423,6 @@ test("a late receipt changes only the cycle in every other goal state", { timeou
   assert.equal(count(standingAfter, PROVISIONAL_EVENT), 0);
   await goals.cancel(standingGoal.id, action(standingAfter));
 
-  // A run whose record is gone changes nothing.
   const gone = assessmentOf(2, 0);
   teams.settle(limitedTeam, "merged", { assessment: gone });
   teams.forget(limitedTeam);

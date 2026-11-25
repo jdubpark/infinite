@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { egressCredential } from "../packages/host/src/egress.js";
-// @ts-ignore -- a dependency-free script without type declarations
+// @ts-expect-error
 import { EgressSummary, classifyAddress, createEgressProxy, parseAuthority } from "../scripts/egress-proxy.mjs";
 
 const root = mkdtempSync(join(tmpdir(), "egress-proxy-test-"));
@@ -26,7 +26,6 @@ async function listening(server: Server) {
   return (server.address() as { port: number }).port;
 }
 
-/** A TCP echo server that counts the connections it accepted. */
 async function echoServer() {
   const state = { connections: 0 };
   const server = createNetServer(socket => { state.connections += 1; socket.pipe(socket); socket.on("error", () => {}); });
@@ -60,7 +59,6 @@ async function startProxy(policy: unknown, names: Record<string, string[]> = {},
 }
 
 interface Reply { status: number; head: string; body: string; socket: Socket }
-/** Sends raw bytes to the proxy and reads the response head; for a non-200 reply, the body until close. */
 function send(port: number, raw: string): Promise<Reply> {
   return new Promise((resolve, reject) => {
     const socket = connect(port, "127.0.0.1");
@@ -159,7 +157,6 @@ test("enforce refuses an unlisted host before resolving it, and tunnels a listed
   assert.deepEqual(fixture.lookups, [], "enforce never resolves a name it refuses");
   assert.equal(fixture.records.at(-1)?.decision, "refused");
   assert.equal(fixture.records.at(-1)?.reason, "not-listed");
-  // A wildcard covers subdomains only.
   assert.equal((await send(fixture.port, connectRequest(`svc.test:${echo.port}`, authorization))).status, 403);
   const wildcard = await send(fixture.port, connectRequest(`a.svc.test:${echo.port}`, authorization));
   assert.equal(wildcard.status, 200);
@@ -184,7 +181,6 @@ test("refuses loopback, private, shared, link-local, metadata, multicast, unspec
     "localhost": ["127.0.0.1"], "mapped.test": ["::ffff:127.0.0.1"], "ula.test": ["fd00:ec2::254"], "multicast.test": ["224.0.0.251"],
     "zero.test": ["0.0.0.0"], "linklocal6.test": ["fe80::1"], "mixed.test": ["2606:4700:4700::1111", "192.168.1.10"],
   };
-  // Every destination is listed, so the refusals below come from the address check alone, in enforce mode too.
   const literals = ["127.0.0.1", "[::1]", "[::ffff:7f00:1]", "[64:ff9b::a9fe:a9fe]", "169.254.169.254", "[fe80::1]", "[::]"];
   for (const mode of ["observe", "enforce"]) {
     const fixture = await startProxy({ mode, ports: [443], allow: [...Object.keys(names), ...literals] }, names);
@@ -201,7 +197,6 @@ test("refuses loopback, private, shared, link-local, metadata, multicast, unspec
       assert.equal(fixture.records.at(-1)?.decision, "refused");
     }
     assert.equal(echo.state.connections, 0);
-    // Each name was looked up exactly once, and an address literal never goes to the resolver.
     assert.deepEqual([...fixture.lookups].sort(), [...Object.keys(names), "localhost"].sort());
     await fixture.proxy.close();
   }
@@ -217,7 +212,6 @@ test("refuses malformed targets and ports outside the policy", async t => {
   for (const target of ["user@echo.test:443", "user:pass@echo.test:443", "echo.test", "echo.test:0443", "echo.test:70000", "echo.test:", "[::1", "::1:443", "[fe80::1%25eth0]:443", "example.1:443", "exa%6dple.test:443", "a..b:443", "echo.test:443/path", "-:443"]) {
     const reply = await send(fixture.port, connectRequest(target, authorization));
     assert.equal(reply.status, 400, target);
-    // The proxy refuses what Node's HTTP parser accepts; the parser itself refuses the rest.
     assert.ok(["bad-target", "bad-request"].includes(String(fixture.records.at(-1)?.reason)), target);
     assert.equal(fixture.records.at(-1)?.host, null, "a target that does not parse is not logged");
   }
@@ -362,7 +356,6 @@ test("oversized headers are refused and per-session tunnel limits hold", async t
 test("clients that disconnect at once cannot pile up name lookups outside the session and global limits", async t => {
   const echo = await echoServer();
   t.after(() => echo.server.close());
-  // The reviewer's case: lookups that do not settle on their own, and clients that leave as soon as they have asked.
   const waiting: (() => void)[] = [];
   const calls: string[] = [];
   const resolve = (host: string) => {
@@ -390,14 +383,12 @@ test("clients that disconnect at once cannot pile up name lookups outside the se
   assert.equal(records(SESSION).filter(record => record.reason === "dns-timeout").length, 3);
   assert.ok(records(SESSION).every(record => ["dns-timeout", "dns-busy", "too-many-connections"].includes(record.reason as string)));
 
-  // Another session is not starved: its lookups have their own allowance.
   const other = await send(fixture.port, connectRequest(`fast.test:${echo.port}`, basic("project-a", OTHER)));
   assert.equal(other.status, 200);
   other.socket.destroy();
   askAndLeave(OTHER, 10, "other");
   await until(() => records(OTHER).length === 11, "every request from the second session to be decided");
   assert.equal(fixture.proxy.state().lookups, 6);
-  // The global limit holds for a third session, but a name already being looked up is shared, not looked up again.
   const third = "7a2b3c4d-2222-4333-8444-955566677788";
   const busy = await send(fixture.port, connectRequest(`new.test:${echo.port}`, basic("project-a", third)));
   assert.equal(busy.status, 503);
@@ -413,7 +404,6 @@ test("clients that disconnect at once cannot pile up name lookups outside the se
 test("bytes sent with the CONNECT count toward the limit on what a client may send before the tunnel opens", async t => {
   const echo = await echoServer();
   t.after(() => echo.server.close());
-  // Each lookup waits, so the tunnel cannot open while the client sends.
   const waiting: (() => void)[] = [];
   const resolve = () => new Promise(done => waiting.push(() => done([{ address: "127.0.0.1", family: 4 }])));
   const allowPrivate = [`over.test:${echo.port}`, `within.test:${echo.port}`];
@@ -424,7 +414,6 @@ test("bytes sent with the CONNECT count toward the limit on what a client may se
     const socket = connect(fixture.port, "127.0.0.1");
     socket.on("error", () => {});
     socket.resume();
-    // One write: the first read carries the head and the start of these bytes, and the rest follow it.
     socket.write(connectRequest(`${host}:${echo.port}`, basic("project-a", SESSION), "x".repeat(extra)));
     return socket;
   };
@@ -436,7 +425,6 @@ test("bytes sent with the CONNECT count toward the limit on what a client may se
   assert.equal(fixture.records.at(-1)?.reason, "client-closed");
   assert.equal(echo.state.connections, 0);
 
-  // Exactly the limit is kept and reaches the destination once the tunnel opens.
   const within = open("within.test", limit);
   let echoed = 0;
   within.on("data", chunk => { echoed += chunk.length; });
@@ -464,7 +452,6 @@ test("a pending upstream connection is cancelled when its client goes away", asy
   await until(() => fixture.proxy.state().open === 0, "the slot to be released");
   await until(() => fixture.records.some(record => record.reason === "client-closed"), "the record");
 
-  // The same for plain HTTP, and for a CONNECT client that only half-closes.
   for (const [index, raw] of [
     `GET http://hang.test:443/ HTTP/1.1\r\nHost: hang.test:443\r\nProxy-Authorization: ${basic("project-a", SESSION)}\r\n\r\n`,
     connectRequest("hang.test:443", basic("project-a", SESSION)),
@@ -482,7 +469,6 @@ test("a pending upstream connection is cancelled when its client goes away", asy
 });
 
 test("an address that never answers does not hold the connection: the other family starts after a short delay", async t => {
-  // A host whose IPv6 route drops packets: the resolver lists IPv6 first, and a SYN to it neither connects nor fails.
   const echo = await echoServer();
   t.after(() => echo.server.close());
   const target = `dual.test:${echo.port}`;
@@ -499,7 +485,6 @@ test("an address that never answers does not hold the connection: the other fami
   const reply = await send(fixture.port, connectRequest(target, basic("project-a", SESSION)));
   assert.equal(reply.status, 200);
   assert.ok(Date.now() - started < 5_000, "the tunnel opened long before the connect timeout");
-  // Families alternate, so the IPv4 address is the second attempt rather than the last.
   assert.deepEqual(attempts.map(attempt => attempt.host), ["2001:db8::1", "127.0.0.1"]);
   await until(() => attempts[0].socket.destroyed, "the losing attempt to be destroyed");
   reply.socket.write("ping");
@@ -520,7 +505,6 @@ test("a failed address moves on at once, and every address failing ends the atte
     { "down.test": ["2001:db8::1", "192.0.2.10", "192.0.2.11"] }, { connectTimeoutMs: 60_000, attemptDelayMs: 60_000 },
     { connect: (options: { host: string }) => refuse(options.host) });
   t.after(() => fixture.proxy.close());
-  // The stagger delay is a minute, so only a failure can start the next attempt in time.
   const started = Date.now();
   const reply = await send(fixture.port, connectRequest("down.test:443", basic("project-a", SESSION)));
   assert.equal(reply.status, 502);
@@ -574,7 +558,6 @@ test("plain HTTP sets the forwarded body's framing for every method and refuses 
   const json = JSON.stringify({ ids: [1, 2, 3] });
   const chunked = `${json.length.toString(16)}\r\n${json}\r\n0\r\n\r\n`;
 
-  // The reviewer's case: Node does not chunk a DELETE body by itself, so the proxy must say how it is framed.
   assert.equal((await request("DELETE", "Transfer-Encoding: chunked\r\nContent-Type: application/json\r\n", chunked)).status, 200);
   assert.equal((await request("POST", `Content-Length: ${json.length}\r\n`, json)).status, 200);
   assert.equal((await request("POST", "", "")).status, 200);
@@ -592,7 +575,6 @@ test("plain HTTP sets the forwarded body's framing for every method and refuses 
     ["two different lengths", "Content-Length: 5\r\nContent-Length: 6\r\n", "hello!", 400],
     ["a list of lengths", "Content-Length: 5, 5\r\n", "hello", 400],
     ["a coding the proxy cannot reproduce", "Transfer-Encoding: gzip, chunked\r\n", "0\r\n\r\n", 501],
-    // Node's own parser refuses this one before the proxy sees it.
     ["two coding headers", "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n", "0\r\n\r\n", 400],
   ];
   for (const [label, framing, body, status] of refusals) assert.equal((await request("DELETE", framing, body)).status, status, label);

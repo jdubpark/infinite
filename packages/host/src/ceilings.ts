@@ -3,15 +3,10 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } fr
 import { posix } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// Provider ceilings: root-owned policy files that Claude Code and Codex read
-// and that agents cannot change. The install script puts the shipped templates
-// in place; this module checks what is installed.
-
 export type CeilingProvider = "claude" | "codex";
 
 export interface CeilingTarget {
   systemPath: string;
-  // Repository-relative path of the template shipped in the release.
   template: string;
 }
 
@@ -30,15 +25,11 @@ export type CeilingFileKind = "file" | "directory" | "symlink" | "other";
 
 export interface CeilingFileStat {
   uid: number;
-  // Permission bits only (st_mode & 0o7777).
   mode: number;
-  // What the path itself is. A symbolic link is reported as a link, never as its target.
   kind: CeilingFileKind;
 }
 
-// Injected so the checks run without root and without the real system paths.
 export interface CeilingFs {
-  // Describes the path itself and does not follow a symbolic link.
   stat(path: string): CeilingFileStat | undefined;
   read(path: string): Uint8Array | undefined;
 }
@@ -54,8 +45,6 @@ export const nodeCeilingFs: CeilingFs = {
     }
   },
   read(path) {
-    // O_NOFOLLOW makes a symbolic link fail instead of being followed. O_NONBLOCK keeps a named pipe from
-    // waiting for a writer. Only a regular file is returned.
     let fd: number | undefined;
     try {
       fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -69,8 +58,6 @@ export const nodeCeilingFs: CeilingFs = {
   },
 };
 
-// Absolute path of a shipped template, resolved from this module the same way
-// other host code finds files under the repository root (src and dist share depth).
 export function shippedCeilingTemplate(provider: CeilingProvider): string {
   return fileURLToPath(new URL(`../../../${CEILING_TARGETS[provider].template}`, import.meta.url));
 }
@@ -89,7 +76,6 @@ export interface CeilingCheckInput {
   provider: CeilingProvider;
   systemPath: string;
   templatePath: string;
-  // Launch arguments the host configures for this provider (args and appServerArgs).
   launchArgs: string[];
   fs: CeilingFs;
 }
@@ -104,7 +90,6 @@ function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-// Every directory above the path, nearest first, ending at the root.
 function ancestors(path: string): string[] {
   const out: string[] = [];
   for (let dir = posix.dirname(path); ; dir = posix.dirname(dir)) {
@@ -113,8 +98,6 @@ function ancestors(path: string): string[] {
   }
 }
 
-// Whoever can write a directory on the way to the file, or the target of a link on that way, can replace the file.
-// So the file must be a regular root-owned file, and every directory above it a real root-owned directory.
 function replaceable(systemPath: string, installed: CeilingFileStat, fs: CeilingFs): string[] {
   const problems: string[] = [];
   if (installed.kind === "symlink") problems.push(`${systemPath} is a symbolic link; whoever controls its target controls the ceiling`);
@@ -134,8 +117,6 @@ function replaceable(systemPath: string, installed: CeilingFileStat, fs: Ceiling
 
 const TOML_ESCAPES: Record<string, string> = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", e: "\u001b", '"': '"', "\\": "\\" };
 
-// Reads a TOML string literal: basic and literal strings, one line or several. Anything else comes back as written,
-// so a value this reader does not understand is compared as text and reported rather than assumed safe.
 function tomlString(value: string): string {
   const unescape = (text: string) =>
     text.replace(/\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|([\s\S]))/g, (whole, short?: string, long?: string, char?: string) => {
@@ -154,14 +135,9 @@ function tomlString(value: string): string {
   return value;
 }
 
-// Codex accepts exactly these two sandbox modes under the ceiling.
 const CODEX_SANDBOX_ALLOWED = new Set(["read-only", "workspace-write"]);
-// The built-in permission profiles that map to those two modes. `:danger-full-access` and any custom profile are
-// reported: the ceiling clamps a profile with full-disk write to read-only, and Codex refuses to start when it also
-// runs with approval_policy "never" (codex-cli 0.169.0, INF-257 rehearsal).
 const CODEX_PROFILE_ALLOWED = new Set([":read-only", ":workspace"]);
 
-// The key and value of a Codex `key=value` override, for the two keys that select a sandbox; undefined otherwise.
 function sandboxOverride(text: string): { key: "sandbox_mode" | "default_permissions"; value: string } | undefined {
   const equals = text.indexOf("=");
   if (equals < 0) return undefined;
@@ -170,11 +146,9 @@ function sandboxOverride(text: string): { key: "sandbox_mode" | "default_permiss
   return { key, value: tomlString(text.slice(equals + 1).trim()) };
 }
 
-// Claude Code: a flag, a flag with its value as the next argument, or the flag joined to its value with "=".
 function claudeHits(args: string[]): string[] {
   const hits: string[] = [];
   args.forEach((arg, index) => {
-    // Hidden aliases are kept on purpose: a flag absent from help can still be accepted.
     if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--enable-auto-mode"].includes(arg)) hits.push(arg);
     let mode: string | undefined;
     if (arg === "--permission-mode") mode = args[index + 1];
@@ -184,26 +158,17 @@ function claudeHits(args: string[]): string[] {
   return hits;
 }
 
-// The value joined to a short option: `-sVALUE` or `-s=VALUE`. The Codex CLI drops one "=" after the option letter
-// (codex-cli 0.167.2 reads `-s=bogus` as the value `bogus`, parse-level probe).
 const attachedValue = (arg: string) => arg.slice(arg[2] === "=" ? 3 : 2);
 
-// Codex: --sandbox, -s, or a sandbox_mode or default_permissions override is reported unless its value reads as exactly
-// one of the allowed modes or built-in profiles.
-// This is inverted on purpose. A hand-written reader cannot cover every TOML spelling, so an unusual but valid
-// spelling of an allowed mode can be reported too. That costs one warning line.
 function codexHits(args: string[]): string[] {
   const hits: string[] = [];
   args.forEach((arg, index) => {
-    // Hidden aliases are kept on purpose: --yolo is absent from codex --help but accepted by codex-cli 0.167.2 (parse-level probe).
     if (["--dangerously-bypass-approvals-and-sandbox", "--yolo"].includes(arg)) hits.push(arg);
-    // --sandbox MODE, --sandbox=MODE, -s MODE, -sMODE, -s=MODE
     let mode: string | undefined;
     if (arg === "--sandbox" || arg === "-s") mode = args[index + 1];
     else if (arg.startsWith("--sandbox=")) mode = arg.slice("--sandbox=".length);
     else if (arg.startsWith("-s") && !arg.startsWith("--")) mode = attachedValue(arg);
     if (mode !== undefined && !CODEX_SANDBOX_ALLOWED.has(mode)) hits.push(`--sandbox ${mode}`);
-    // -c KEY=VALUE, --config KEY=VALUE, --config=KEY=VALUE, -cKEY=VALUE, -c=KEY=VALUE
     let override: string | undefined;
     if (arg === "-c" || arg === "--config") override = args[index + 1];
     else if (arg.startsWith("--config=")) override = arg.slice("--config=".length);
@@ -215,7 +180,6 @@ function codexHits(args: string[]): string[] {
   return hits;
 }
 
-// Launch arguments the ceiling conflicts with. See claudeHits and codexHits for the rules.
 export function forbiddenLaunchFlags(provider: CeilingProvider, args: string[]): string[] {
   return [...new Set(provider === "claude" ? claudeHits(args) : codexHits(args))];
 }
@@ -237,7 +201,6 @@ export function checkCeiling(input: CeilingCheckInput): CeilingLine[] {
     else line("writable", "ok", "a regular root-owned file, not group- or world-writable, under root-owned directories");
 
     const template = fs.read(templatePath);
-    // The ceiling is not read while any placement check fails. Whoever controls the path could swap in other bytes.
     if (problems.length > 0) {
       line("hash", "writable", `not read: ${systemPath} is not in a safe place (see the writable line), so its hash is not computed`);
     } else if (!template) {

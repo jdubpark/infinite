@@ -6,31 +6,22 @@ import type { EvidenceModule, EvidenceTx, RunEvent } from "./types.js";
 export type OutboxEvent = Omit<RunEvent, "seq">;
 
 export interface EventProjector {
-  /** Unique among projectors, /^[a-z][a-z0-9-]{0,39}$/. The outbox keeps one cursor under this name. */
   name: string;
-  /** A module registered with the store. Its tables are the ones this projector writes. */
   module: string;
-  /** Exact kinds such as "task.integrated", or a prefix that ends with a dot, such as "duel.". */
   kinds: readonly string[];
-  /** Runs inside the projector's own transaction, once per matching event, in `seq` order. Must be synchronous. */
   project(tx: EvidenceTx, event: RunEvent): void;
 }
 
 export type FlushResult = {
-  /** True when every accepted event is in the store. False means none of this flush was stored. */
   stored: boolean;
-  /** Events the store can never accept. The caller drops them when `stored` is true. */
   refused: number;
 };
 
 export type BlockReason = "definition-changed" | "cursor-ahead";
 
 export type AdvanceResult = {
-  /** Matching events projected by the projectors that committed. */
   projected: number;
-  /** True when some projector still has stored events it has not seen, or cannot run. */
   pending: boolean;
-  /** Projectors that cannot run until someone repairs them. Each also counts as pending. */
   blocked: { name: string; reason: BlockReason }[];
 };
 
@@ -47,11 +38,6 @@ const MAX_PROJECTOR_KINDS = 64;
 const DEFAULT_PAGE = 500;
 const PROJECTOR_NAME = /^[a-z][a-z0-9-]{0,39}$/;
 
-/**
- * Stores run events first, then runs each projector over the stored events after its own cursor.
- * A flush never waits for a projection, so an event stored before its projector existed is still projected.
- * A store has one outbox. A projector that cannot run safely is blocked for the life of this object.
- */
 export class EventOutbox {
   private readonly projectors: Registered[] = [];
   private readonly blocked = new Map<string, BlockReason>();
@@ -63,7 +49,6 @@ export class EventOutbox {
     store.register(this.storageModule());
   }
 
-  /** Projectors run in registration order. Throws a TypeError for a projector the store cannot serve. */
   registerProjector(projector: EventProjector): void {
     if (!projector || typeof projector !== "object") throw new TypeError("An event projector must be an object.");
     const { name, module, kinds, project } = projector;
@@ -93,10 +78,6 @@ export class EventOutbox {
     });
   }
 
-  /**
-   * Stores the accepted events in one write, then advances the projectors once. Never throws.
-   * An unavailable store, or a write that fails, stores nothing and returns `stored: false`.
-   */
   flush(events: readonly OutboxEvent[]): FlushResult {
     try {
       return this.flushEvents(events);
@@ -105,7 +86,6 @@ export class EventOutbox {
     }
   }
 
-  /** Projects the stored events after each projector's cursor, one page per projector. Never throws. */
   advance(limit: number = DEFAULT_PAGE): AdvanceResult {
     try {
       return this.advanceProjectors(limit);
@@ -114,7 +94,6 @@ export class EventOutbox {
     }
   }
 
-  /** The outbox's own evidence module: its cursor table, and the loss count a run deletion leaves behind. */
   private storageModule(): EvidenceModule {
     return {
       name: OUTBOX_MODULE,
@@ -137,13 +116,8 @@ export class EventOutbox {
     };
   }
 
-  /**
-   * Runs inside a run's deletion, before its events are removed. For each projector it counts the run's
-   * events after the projector's cursor that the projector matches, and adds that count to `lost`.
-   */
   private recordLoss(tx: EvidenceTx, runId: string): void {
     for (const projector of this.projectors) {
-      // A stored cursor counts only when advance would trust it. Otherwise every matching event is unseen.
       const state = cursorOf(tx, projector);
       const cursor = state.trusted ? state.seq : 0;
       const unseen = tx.all<{ kind: string }>("SELECT kind FROM run_events WHERE run_id=? AND seq > ?", runId, cursor);
@@ -207,10 +181,6 @@ export class EventOutbox {
     return { projected, pending, blocked };
   }
 
-  /**
-   * One write per projector. Its rows and its cursor commit together, or neither does. A projector whose
-   * definition or cursor does not match the stored one is blocked, and its write is not run.
-   */
   private advanceProjector(projector: Registered, page: number): AdvanceResult {
     let outcome: AdvanceResult | undefined;
     let block: BlockReason | undefined;
@@ -226,7 +196,6 @@ export class EventOutbox {
         if (!matches(projector.kinds, event.kind)) continue;
         const result: unknown = projector.project(tx, event);
         if (isThenable(result)) {
-          // The write fails below. Consume the rejection so it cannot surface later as unhandled.
           result.then(undefined, () => undefined);
           throw new TypeError("An event projector must be synchronous");
         }
@@ -258,10 +227,6 @@ export class EventOutbox {
 
 type CursorState = { trusted: true; seq: number } | { trusted: false; reason: BlockReason };
 
-/**
- * The one rule for trusting a stored cursor. The stored definition matches the projector's, and the cursor
- * is not past the highest sequence number the event table has issued. A projector with no row starts at zero.
- */
 function cursorOf(tx: EvidenceTx, projector: Registered): CursorState {
   const row = tx.get<{ seq: number; definition: string }>(
     "SELECT seq, definition FROM projector_cursors WHERE name=?",
@@ -274,11 +239,6 @@ function cursorOf(tx: EvidenceTx, projector: Registered): CursorState {
   return { trusted: true, seq: row.seq };
 }
 
-/**
- * Copies one caller event into a value the outbox owns. Each known field is read once, and `data` is copied
- * through its canonical JSON, so later reads of the caller's object cannot change what is stored. Returns
- * undefined for an event that cannot be copied or that the store would refuse.
- */
 function snapshotEvent(raw: unknown): OutboxEvent | undefined {
   try {
     if (!raw || typeof raw !== "object") return undefined;
@@ -307,7 +267,6 @@ function snapshotEvent(raw: unknown): OutboxEvent | undefined {
   }
 }
 
-/** The identity of a projector's match: its module and its sorted kinds. A changed match is a new definition. */
 function definitionOf(module: string, kinds: readonly string[]): string {
   return createHash("sha256").update(canonicalJson({ module, kinds: [...kinds].sort() }), "utf8").digest("hex");
 }
@@ -317,7 +276,6 @@ function clampPage(limit: number): number {
   return Math.min(DEFAULT_PAGE, Math.max(1, Math.floor(limit)));
 }
 
-/** A prefix ends with a dot, and adding one more segment to it gives an event kind. */
 function isEventPrefix(kind: string): boolean {
   return kind.endsWith(".") && isEventKind(`${kind}x`);
 }

@@ -1,21 +1,10 @@
-/**
- * Interactive delivery of the permission agent's decisions. A requester adapter builds a target for one
- * pending dialog; this service asks the pipeline for a decision and delivers it with the live checks.
- *
- * The service decides nothing itself. It can only leave a request with the owner, refuse to deliver, or
- * deliver the pipeline's recorded verdict through a recognised one-shot option. Before a key is sent it
- * records an intent in its own durable ledger and in the decision journal, and a request whose delivery
- * result is unknown is never delivered again, also after a restart.
- */
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceModule, EvidenceTx } from "./evidence/types.js";
 import type { PermissionDeliveryService, PermissionHandled, PermissionInteractiveTarget, PermissionPipeline } from "./permission-agent-types.js";
-import type { InterruptClass } from "./permission-policy.js";
+import type { InterruptClass, RejectCode } from "./permission-policy.js";
 
-/** The last recorded delivery state of one raised request. */
 export type DeliveryLedgerState = "intent" | "receipt" | "refusal" | "uncertain" | "stale";
 
-/** Durable delivery state by request id. Both methods throw when the state cannot be read or written. */
 export interface PermissionDeliveryLedger {
   get(requestId: string): { decisionId: string; state: DeliveryLedgerState } | undefined;
   set(requestId: string, entry: { sessionId: string; decisionId: string; state: DeliveryLedgerState }): void;
@@ -24,7 +13,6 @@ export interface PermissionDeliveryLedger {
 const TABLE = "permission_delivery_requests";
 const STATES: readonly DeliveryLedgerState[] = ["intent", "receipt", "refusal", "uncertain", "stale"];
 
-/** The delivery ledger's table in the host's evidence store. It belongs to no run, so it has no run-deletion hook. */
 export const permissionDeliveryModule: EvidenceModule = {
   name: "permission-delivery",
   version: 1,
@@ -60,23 +48,18 @@ export class EvidenceDeliveryLedger implements PermissionDeliveryLedger {
   }
 }
 
-/** A requester adapter that hands pending dialogs of its sessions to the service. */
 export interface PermissionDeliverySource {
-  /** Whether the adapter would hand this pending dialog to the service now. Synchronous and cheap: the notifier asks it. */
   claims(sessionId: string, promptId: number): boolean;
 }
 
 type Options = {
-  /** Read at each use: the pipeline can be wired after this service. Without one nothing is decided. */
   pipeline: () => PermissionPipeline | undefined;
-  /** Without a ledger nothing is delivered, because an unknown result could not be kept from repeating. */
   ledger: PermissionDeliveryLedger | undefined;
   now?: () => number;
 };
 type Holder = "agent" | "owner";
 type Finished = { handled: PermissionHandled; at: number };
 
-/** A result that leaves the request with the owner is tried again after this long, never sooner. */
 const RETRY_NOT_HANDLED_MS = 30_000;
 const MEMORY_LIMIT = 2048;
 const NOT_WIRED = "The permission agent is not active on this host.";
@@ -87,11 +70,8 @@ const holderOf = (handled: PermissionHandled): Holder =>
 export class InteractivePermissionDelivery implements PermissionDeliveryService {
   private readonly inFlight = new Map<string, Promise<PermissionHandled>>();
   private readonly finished = new Map<string, Finished>();
-  /** The holder of each pending dialog by `sessionId:promptId`, for the notifier, with the class an owner result named. */
   private readonly prompts = new Map<string, { holder: Holder; interruptClass?: InterruptClass }>();
-  /** Requests whose delivery result is unknown in this process, kept even when the ledger write failed. */
   private readonly unknown = new Set<string>();
-  /** Deliveries between their recorded intent and their result, by request id, so an owner act can fence them. */
   private readonly delivering = new Map<string, { decisionId: string; target: PermissionInteractiveTarget }>();
   private readonly sources = new Set<PermissionDeliverySource>();
   private readonly now: () => number;
@@ -100,10 +80,8 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
     this.now = options.now ?? Date.now;
   }
 
-  /** Whether a pipeline and a ledger are wired, so that the service can decide and deliver anything. */
   active(): boolean { return Boolean(this.options.pipeline() && this.options.ledger); }
 
-  /** Registers a requester adapter for `holder`. Returns its removal. */
   addSource(source: PermissionDeliverySource): () => void {
     this.sources.add(source);
     return () => { this.sources.delete(source); };
@@ -128,7 +106,7 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
     if (known) return known.holder;
     for (const source of this.sources) {
       try { if (source.claims(sessionId, promptId)) return "undecided"; }
-      catch { /* An adapter that cannot answer claims nothing. */ }
+      catch {}
     }
     return "owner";
   }
@@ -145,7 +123,6 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
     return fenced;
   }
 
-  /** The host's class identifier for a dialog that a class rule or an `owner` verdict left to the owner. Never model text. */
   ownerClass(sessionId: string, promptId: number): InterruptClass | undefined {
     if (!this.active()) return undefined;
     const known = this.prompts.get(`${sessionId}:${promptId}`);
@@ -165,7 +142,6 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
   }
 
   private remember(target: PermissionInteractiveTarget, handled: PermissionHandled): PermissionHandled {
-    // Only an owner result names a class. An undeliverable request is a host limit and carries none.
     this.setHolder(target, holderOf(handled), handled.handled && handled.result === "owner" ? handled.interruptClass : undefined);
     this.finished.delete(target.request.id);
     this.finished.set(target.request.id, { handled: structuredClone(handled), at: this.now() });
@@ -185,7 +161,6 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
     const served = pipeline.serves(request.requester.projectId);
     if (!served.served) return { handled: false, reason: served.reason === "not-ready" ? "The host is not ready to serve permission requests." : "No owner delegation covers this project." };
 
-    // A request whose delivery result is unknown is never delivered again, also after a restart.
     let prior: ReturnType<PermissionDeliveryLedger["get"]>;
     try { prior = ledger.get(request.id); }
     catch { return { handled: false, reason: "The delivery record cannot be read." }; }
@@ -209,24 +184,22 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
       case "held": return { handled: false, reason: "An owner halt holds permission decisions for this project.", held: true };
       case "owner": return { handled: true, result: "owner", decisionId: outcome.decisionId, interruptClass: outcome.interruptClass };
       case "undeliverable": return { handled: true, result: "undeliverable" };
-      case "allow": return this.deliver(target, pipeline, ledger, outcome.decisionId, "accept", outcome.strongTier);
-      case "reject": {
-        const handled = await this.deliver(target, pipeline, ledger, outcome.decisionId, "reject", false, outcome.notice);
-        return handled.handled ? { ...handled, code: outcome.code } : handled;
-      }
+      case "allow": return this.deliver(target, pipeline, ledger, outcome.decisionId, { choice: "accept", strongTier: outcome.strongTier });
+      case "reject": return this.deliver(target, pipeline, ledger, outcome.decisionId, { choice: "reject", code: outcome.code, notice: outcome.notice });
     }
   }
 
   private async deliver(target: PermissionInteractiveTarget, pipeline: PermissionPipeline, ledger: PermissionDeliveryLedger,
-    decisionId: string, choice: "accept" | "reject", strongTier: boolean, notice?: string): Promise<PermissionHandled> {
+    decisionId: string, action: { choice: "accept"; strongTier: boolean } | { choice: "reject"; code: RejectCode; notice: string }): Promise<PermissionHandled> {
     const { request } = target, sessionId = request.requester.sessionId;
+    const { choice } = action;
+    const rejectCode = action.choice === "reject" ? { code: action.code } : {};
     const record = (kind: DeliveryLedgerState, detail?: string) => {
-      try { pipeline.recordDelivery(decisionId, kind, detail); } catch { /* The ledger below still fences a repeat. */ }
+      try { pipeline.recordDelivery(decisionId, kind, detail); } catch {}
     };
-    const verdict = choice === "accept" ? "allowed" as const : "rejected" as const;
     const live = await this.check(target);
     if (!live.ok) {
-      if (live.stale) { record("stale", live.reason); return { handled: true, result: "stale", decisionId }; }
+      if (live.stale) { record("stale", live.reason); return { handled: true, result: "stale", decisionId, ...rejectCode }; }
       record("refusal", live.reason);
       return { handled: false, reason: live.reason };
     }
@@ -236,50 +209,49 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
       record("refusal", "The decision no longer applies to this request.");
       return { handled: false, reason: "The decision no longer applies to this request." };
     }
-    if (choice === "accept" && request.destructive && !strongTier) {
+    if (action.choice === "accept" && request.destructive && !action.strongTier) {
       record("refusal", "A request with the destructive flag is delivered only on a strong verdict.");
       return { handled: true, result: "undeliverable", decisionId, delivery: "refusal" };
     }
     const option = choice === "accept" ? live.accept : live.reject;
     if (option === undefined) {
       record("refusal", choice === "accept" ? "The dialog offers no recognised one-shot accept." : "The dialog offers no recognised one-shot reject.");
-      return { handled: true, result: "undeliverable", decisionId, delivery: "refusal" };
+      return { handled: true, result: "undeliverable", decisionId, delivery: "refusal", ...rejectCode };
     }
 
-    // The intent is durable in both records before any key is sent. Without it nothing is sent.
     try {
       ledger.set(request.id, { sessionId, decisionId, state: "intent" });
       pipeline.recordDelivery(decisionId, "intent");
     } catch {
       try { ledger.set(request.id, { sessionId, decisionId, state: "refusal" }); } catch { this.unknown.add(request.id); }
-      return { handled: true, result: "undeliverable", decisionId, delivery: "refusal" };
+      return { handled: true, result: "undeliverable", decisionId, delivery: "refusal", ...rejectCode };
     }
     this.unknown.add(request.id);
-    // No await lies between the authority check above and this entry, so an owner act either fails that check
-    // or finds the delivery here. The target reads `current` again under its lease, before the first key.
     const current = () => { try { return pipeline.applicable(decisionId, request); } catch { return false; } };
     this.delivering.set(request.id, { decisionId, target });
     let answered: "delivered" | "refused" | "uncertain";
-    try { answered = await target.answer(option, decisionId, choice === "reject" ? notice : undefined, current); }
+    try { answered = await target.answer(option, decisionId, action.choice === "reject" ? action.notice : undefined, current); }
     catch { answered = "uncertain"; }
     finally { this.delivering.delete(request.id); }
     const kind: DeliveryLedgerState = answered === "delivered" ? "receipt" : answered === "refused" ? "refusal" : "uncertain";
     let stored = true;
     try { ledger.set(request.id, { sessionId, decisionId, state: kind }); } catch { stored = false; }
     record(kind);
-    // Only a refusal that both records hold lets the same request be tried again.
     if (kind === "refusal" && stored) this.unknown.delete(request.id);
 
-    if (answered === "delivered") return { handled: true, result: verdict, decisionId, delivery: "receipt" };
+    if (answered === "delivered") {
+      return action.choice === "accept"
+        ? { handled: true, result: "allowed", decisionId, delivery: "receipt" }
+        : { handled: true, result: "rejected", decisionId, code: action.code, delivery: "receipt" };
+    }
     const after = await this.check(target);
     if (answered === "refused") {
-      if (after.ok) return { handled: true, result: "undeliverable", decisionId, delivery: "refusal" };
-      if (after.stale) { record("stale", after.reason); return { handled: true, result: "stale", decisionId, delivery: "refusal" }; }
+      if (after.ok) return { handled: true, result: "undeliverable", decisionId, delivery: "refusal", ...rejectCode };
+      if (after.stale) { record("stale", after.reason); return { handled: true, result: "stale", decisionId, delivery: "refusal", ...rejectCode }; }
       return { handled: false, reason: after.reason };
     }
-    // An uncertain delivery is never repeated. While the dialog is still open it goes to the owner.
     return after.ok
-      ? { handled: true, result: "undeliverable", decisionId, delivery: "uncertain" }
-      : { handled: true, result: "stale", decisionId, delivery: "uncertain" };
+      ? { handled: true, result: "undeliverable", decisionId, delivery: "uncertain", ...rejectCode }
+      : { handled: true, result: "stale", decisionId, delivery: "uncertain", ...rejectCode };
   }
 }

@@ -11,7 +11,6 @@ export const INTENT_CONTEXT_BYTES = 1024 * 1024;
 
 const L = INTENT_REPORT_LIMITS;
 
-/** Fixed text only: the checker's prompt takes no run, so no run data can reach it (Trust boundary). */
 export function intentCheckerPrompt(provider: Provider, profile?: TeamModelProfile): string {
   const sections = [
     "You are the team's intent checker. Read the held plan and the objective record in your context file, and compare them. List what the owner's request leaves unspecified, and each assumption the plan relies on that the record does not support. You are read-only: you do not plan, change files, post entries, ask for permissions, or approve or block the run. Your report is a claim the host checks, not authority.",
@@ -43,11 +42,6 @@ export type IntentContext = {
   limits: { items: 16; scouts: 3; assumptionsLeft: number; criteriaLeft: number };
 };
 
-/**
- * The checker's context: the record without its log, criteria without `latest`, assumptions without
- * `proposals`; the held plan without routing; this revision's scout reports; the configured checks.
- * Undefined when the held plan is not a plan report, or the JSON is over INTENT_CONTEXT_BYTES.
- */
 export function intentContext(input: { run: TeamRun; record: ObjectiveRecord; planMember: TeamMember; mode: "autonomous" | "supervised";
   criteriaDue: boolean; checks: readonly TeamCommand[] }): IntentContext | undefined {
   const { run, record, planMember, mode, criteriaDue, checks } = input;
@@ -64,7 +58,6 @@ export function intentContext(input: { run: TeamRun; record: ObjectiveRecord; pl
     record: {
       ...rest,
       criteria: criteria.map(({ latest: _latest, ...item }) => item),
-      // A member's assumption is member text, which reaches no prompt or context file.
       assumptions: assumptions.filter(item => item.origin !== "member").map(({ proposals: _proposals, ...item }) => item),
     },
     plan: {
@@ -85,7 +78,6 @@ export function intentContext(input: { run: TeamRun; record: ObjectiveRecord; pl
   return Buffer.byteLength(JSON.stringify(context), "utf8") > INTENT_CONTEXT_BYTES ? undefined : context;
 }
 
-/** The corrected plan's feedback is at most this many UTF-8 bytes. */
 export const INTENT_FEEDBACK_BYTES = 16 * 1024;
 const FEEDBACK_LINE_BYTES = 600;
 const FEEDBACK_ANSWER_BYTES = 8 * 1024;
@@ -93,7 +85,6 @@ const FEEDBACK_MORE_BYTES = 96;
 
 const byteLength = (text: string): number => Buffer.byteLength(text, "utf8");
 
-/** `text` cut to at most `max` UTF-8 bytes on a character boundary; a cut ends with "...". */
 function cutBytes(text: string, max: number): string {
   if (byteLength(text) <= max) return text;
   let used = 0;
@@ -107,10 +98,6 @@ function cutBytes(text: string, max: number): string {
   return `${out}...`;
 }
 
-/**
- * The corrected project manager's feedback: the items the applied entry added, with their statuses, then the answer with its label.
- * Host text and the owner's answer frame the checker's items, which are claims (Trust boundary). At most INTENT_FEEDBACK_BYTES.
- */
 export function correctionFeedback(record: ObjectiveRecord, applied: LogEntry, decision: TeamDecision | undefined): string {
   const lead = `The intent check held your plan against the objective record (version ${record.version}). Its items are claims by a read-only checker, not requirements.`;
   const closing = "Submit one corrected plan. You may depend on assumed items; plan around unchecked ones. Your earlier plan and the checker's report are in memberReports of the context file.";

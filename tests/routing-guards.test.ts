@@ -20,12 +20,10 @@ function posterior(theta: Beta, phi: Beta): ProfilePosterior {
   return { reward: [], rescue: [], theta, phi, rows: { production: 0, duel: 0 }, earlierRows: 0, level: "none", untimed: 0 };
 }
 
-/** A deterministic uniform value in [0, 1) from a key. */
 function unit(key: string): number {
   return createHash("sha256").update(key).digest().readUInt32BE(0) / 2 ** 32;
 }
 
-/** Two candidates with equal posteriors and costs, so `choose` samples and explores about half the time. */
 function twoEqual(): { screened: ReturnType<typeof screen>; scored: Map<string, Scored> } {
   const lineup = lineupWith([codex("p1", "m1"), codex("p2", "m2")]);
   const screened = screen(lineup, EXPLORE_KNOBS, new Set<Provider>());
@@ -54,7 +52,6 @@ test("paused, low budget, and elevated risk never explore over 1,000 seeds", () 
   }
   assert.ok(explored > 100, `explored ${explored} of 1,000 unguarded`);
 
-  // With the budget at the minimum and no pause, exploration is allowed.
   let allowed = 0;
   for (let i = 0; i < 1000; i += 1) {
     const choice = choose(screened, scored, EXPLORE_KNOBS, "normal", `seed-${i}`)!;
@@ -63,7 +60,6 @@ test("paused, low budget, and elevated risk never explore over 1,000 seeds", () 
   }
   assert.ok(allowed > 100, `allowed ${allowed} of 1,000 at the minimum budget`);
 
-  // Elevated risk never explores: `choose` answers greedy-risk for every seed, and the guards leave it so.
   for (let i = 0; i < 1000; i += 1) {
     const choice = choose(screened, scored, EXPLORE_KNOBS, "elevated", `seed-${i}`)!;
     assert.equal(choice.basis, "greedy-risk");
@@ -90,7 +86,6 @@ test("guardExploration checks pause, then budget, then share", () => {
 });
 
 test("the share holds at every exploratory start for any interleaving, and a released row frees its place", () => {
-  // The share limit: E + 1 within s * (N + 1), so a decision counts itself.
   assert.equal(shareAllows({ exploratory: 0, of: 4 }, 0.2), true);
   assert.equal(shareAllows({ exploratory: 0, of: 3 }, 0.2), false);
   assert.equal(shareAllows({ exploratory: 9, of: 49 }, 0.2), true);
@@ -98,13 +93,10 @@ test("the share holds at every exploratory start for any interleaving, and a rel
   assert.equal(shareAllows({ exploratory: 0, of: 0 }, 0), false);
   assert.equal(shareAllows({ exploratory: 0, of: 1000 }, 0), false);
 
-  // A released row frees its place. Newest first: explorations at 1 and 2, greedy after.
   const twelve = Array.from({ length: 12 }, (_, index) => index < 2);
   assert.equal(shareAllows({ exploratory: twelve.slice(0, 9).filter(Boolean).length, of: 9 }, 0.2), false);
   assert.equal(shareAllows({ exploratory: twelve.slice(1, 10).filter(Boolean).length, of: 9 }, 0.2), true);
 
-  // The seeded run. Rows are counted in arrival order with a state; a window of 20 holds the newest counted rows.
-  // Each decision reads the newest 19 counted rows, so a window of 20 with the decision itself is what it checks.
   const WINDOW = 20;
   for (let seed = 0; seed < 1000; seed += 1) {
     type Row = { explore: boolean; state: "pending" | "applied" | "released" };
@@ -114,14 +106,12 @@ test("the share holds at every exploratory start for any interleaving, and a rel
       const action = unit(`action-${seed}-${step}`);
       const live = counted();
       if (action < 0.6 || live.length === 0) {
-        // Decide. The newest 19 counted rows are the share's window before this decision.
         const before = live.slice(-(WINDOW - 1));
         const share = { exploratory: before.filter(row => row.explore).length, of: before.length };
         const proposed: Choice = { basis: "sampled", chosen: "p2", greedy: "p1", explore: unit(`propose-${seed}-${step}`) < 0.5, candidates: [] };
         const guarded = guardExploration(proposed, { pausedAt: null, spareAttempts: 10, share }, EXPLORE_KNOBS);
         rows.push({ explore: guarded.explore, state: "pending" });
         if (guarded.explore) {
-          // The newest min(20, count) counted rows, itself included, hold at most 0.2 of explorations.
           const window = counted().slice(-WINDOW);
           const explorations = window.filter(row => row.explore).length;
           assert.ok(explorations <= 0.2 * window.length + 1e-9, `seed ${seed} step ${step}: ${explorations} of ${window.length}`);

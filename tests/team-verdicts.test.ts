@@ -114,7 +114,6 @@ test("a no-change cycle is held and released", () => {
   assert.equal(without.host.saves, 0);
 });
 
-/** A held no-change report on a cycle whose parent run (which made the head) has the given members, or is gone when `parent` is false. */
 function heldNoChange(parentMembers: (parent: TeamRun) => TeamMember[] | false) {
   const f = noChangeFixture();
   const parentRun = runOf({ id: PARENT, headCommit: BASE });
@@ -190,7 +189,6 @@ test("a verdict without an evaluator is inconclusive and releases the run", () =
 });
 
 test("a run at its attempt limit gets no evaluator", () => {
-  // The evaluator is one more member of the run. The fixture's run has one member, its author.
   const budget = (maxMembers: number) => ({ id: GOAL, revision: 1, cycle: 2, parentRunId: PARENT, maxMembers }) as never;
   const full = fixture({ goal: true, run: { goal: budget(1) } });
   assert.equal(full.verdicts.reviewed(full.holder), true);
@@ -204,7 +202,6 @@ test("a run at its attempt limit gets no evaluator", () => {
   assert.equal(full.holder.outbox.length, 1, "one row");
   assert.equal(full.verdicts.reviewed(full.holder), false, "the run proceeds");
 
-  // Room for one more: the evaluator starts. Its replacement would be a third member, so none starts.
   const room = fixture({ goal: true, run: { goal: budget(2) } });
   assert.equal(room.verdicts.reviewed(room.holder), true);
   finishPass(room.world, RUN, [receiptOf("c1", "pass")]);
@@ -590,7 +587,6 @@ test("host facts compose from this run, or from the parent run", () => {
   };
   const settled = reviewed(() => undefined);
   assert.equal(states(settled), "met,met");
-  // The delivery is a host fact too: it comes from the ledger after the run settled, never from the run.
   const late = (): string | undefined => settled.verdicts.detail(RUN)!.criteria.find(item => item.id === "c6")?.state;
   assert.equal(late(), "inconclusive");
   settled.holder.run.status = "merged";
@@ -664,7 +660,6 @@ test("a new revision or head drops the state in testing, queued, and releasing",
   }
 });
 
-// ---- Seeded sequences with restarts ----
 const SEEDS = 100;
 const crashes = { afterWrite: 0 };
 const seen = { c0Met: 0, c0NotMet: 0, contradicted: 0 };
@@ -687,7 +682,6 @@ const BAG = [
   "settle", "settle", "settle", "fail", "revision", "restart", "restart", "crash", "limit",
 ] as const;
 
-/** At most 40 steps, drawn before anything runs, so the same seed gives the same sequence with and without restarts. */
 function opsOf(seed: number): Op[] {
   const random = mulberry32(seed);
   const count = 12 + Math.floor(random() * 29);
@@ -733,11 +727,6 @@ function build(kind: SimKind): Sim {
   return sim;
 }
 
-/**
- * A restart: a new service over a JSON round trip of the holders as last saved and of the goal's record; the host's recovery then
- * consumes reported evaluators again. This replay is harsher than the real host, which fences an interrupted operation and never
- * replays it (ruling 22), so the guard that looks for the verdict's own record entry is exercised.
- */
 function restart(sim: Sim): void {
   const old = sim.host;
   if (sim.world.store) sim.world.store = { record: JSON.parse(JSON.stringify(sim.world.store.record)) as ObjectiveRecord, failing: sim.world.store.failing };
@@ -810,7 +799,6 @@ function passes(sim: Sim, pass: boolean): void {
   }
 }
 
-/** The host builds the evaluator's context at its launch, before it can report: once the verdict is evaluating and nothing was judged yet. */
 function contextStep(sim: Sim): void {
   const holder = holderOfSim(sim);
   const member = currentEvaluator(sim);
@@ -871,7 +859,6 @@ function applyOp(sim: Sim, op: Op, withRestarts: boolean): void {
   }
 }
 
-/** Everything lets go, then each held step runs until the verdict is done. */
 function drain(sim: Sim, seed: number): void {
   sim.host.limitedSet.clear();
   for (let index = 0; index < 60; index += 1) {
@@ -881,7 +868,6 @@ function drain(sim: Sim, seed: number): void {
     passes(sim, true);
     sim.verdicts.step(holder);
     contextStep(sim);
-    // The last evaluator's answer follows the seed, so the plain and the restarted run compare a verdict that holds an answer.
     report(sim, 0.15 + ((seed * 37) % 85) / 100);
     const member = currentEvaluator(sim);
     if (holder.verdict?.status === "evaluating" && member?.report !== undefined && sim.host.pending.length === 0) sim.verdicts.consume(holder, member);

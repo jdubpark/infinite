@@ -8,11 +8,6 @@ const text = (value: unknown): string | undefined => typeof value === "string" &
 
 export interface UsageContext { completedAt: string; providerId: string; modelId: string; modelSource: UsageRecord["modelSource"] }
 
-/**
- * Turns an OpenCode `step-finish` part into a usage record. Each step reports its own tokens and
- * cost, so one assistant message yields several records. Numbers are coerced to finite
- * non-negative values so malformed provider data cannot reach pricing.
- */
 export function usageFromStepFinish(part: unknown, context: UsageContext): UsageRecord | undefined {
   const step = part as Record<string, any> | null;
   if (!step || step.type !== "step-finish") return undefined;
@@ -26,10 +21,6 @@ export function usageFromStepFinish(part: unknown, context: UsageContext): Usage
     reportedCost: amount(step.cost) };
 }
 
-/**
- * Usage record for one line of `opencode run --format json` output, or undefined for any other
- * line. The model comes from the requested `provider/model` selection.
- */
 export function usageFromRunLine(line: unknown, model: string, now = new Date()): UsageRecord | undefined {
   const event = line as { type?: unknown; timestamp?: unknown; part?: unknown } | null;
   if (event?.type !== "step_finish") return undefined;
@@ -39,10 +30,6 @@ export function usageFromRunLine(line: unknown, model: string, now = new Date())
     providerId: slash < 0 ? model : model.slice(0, slash), modelId: slash < 0 ? model : model.slice(slash + 1) });
 }
 
-/**
- * The finished tool call in one line of `opencode run --format json` output, or undefined. A
- * headless turn reports progress only through these parts, so each one is evidence of activity.
- */
 export function toolFromRunLine(line: unknown): { tool: string; toolUseId?: string; ok: boolean } | undefined {
   const event = line as { type?: unknown; part?: { tool?: unknown; callID?: unknown; state?: { status?: unknown } } } | null;
   if (event?.type !== "tool_use") return undefined;
@@ -52,10 +39,6 @@ export function toolFromRunLine(line: unknown): { tool: string; toolUseId?: stri
   return { tool, ...(toolUseId ? { toolUseId } : {}), ok: event.part?.state?.status !== "error" };
 }
 
-/**
- * Reassembles newline-delimited JSON from raw terminal chunks. Lines that are not JSON objects
- * (spinners, plain text) are dropped, and a partial line over 1 MiB is discarded.
- */
 export class JsonLineAssembler {
   private partial = "";
   private discarding = false;
@@ -71,7 +54,7 @@ export class JsonLineAssembler {
       try {
         const value: unknown = JSON.parse(line);
         if (value && typeof value === "object" && !Array.isArray(value)) objects.push(value);
-      } catch { /* Not JSON output. */ }
+      } catch {}
     }
     if (this.partial.length > MAX_PARTIAL_LINE) { this.partial = ""; this.discarding = true; }
     return objects;

@@ -4,7 +4,6 @@ import { REGISTER_OPS } from "./objective-record.js";
 import type { Assumption, LogEntry, ObjectiveRecord } from "./objective-types.js";
 import { assertLogRoom, nextSeq, sealRecord } from "./objective-write.js";
 
-/** Assumption changes per `test.recorded` entry. Each entry's before and after stay inline. */
 export const RECEIPT_CHANGES_PER_ENTRY = 8;
 const RECEIPT_PREFIX = "receipt:";
 
@@ -13,12 +12,6 @@ export type ReceiptsApplied = { record: ObjectiveRecord; changed: string[]; refu
 
 type Change = { id: string; before: { id: string; status: Assumption["status"]; replaced?: { handle: string; at: number } } };
 
-/**
- * Applies host test results to the record's assumptions, one version up. Only assumption receipts with a pass or fail count, and
- * only where the outcome differs from the assumption's status. A pinned assumption keeps its status and gains the handle. The
- * first receipt for an assumption decides it. Returns undefined when nothing changes, so an unchanged register spends no log room.
- * Throws objectiveError("objective-log-full") past CORRECTION_LOG, and objectiveError("objective-op-refused") when the schema refuses the result.
- */
 export function applyReceipts(record: ObjectiveRecord, receipts: readonly ObjectiveReceipt[], context: ReceiptContext): ReceiptsApplied | undefined {
   const assumptions = [...record.assumptions];
   const seen = new Set<string>();

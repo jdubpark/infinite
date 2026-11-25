@@ -49,7 +49,6 @@ async function fixture(scenario: string, linear?: Awaited<ReturnType<typeof star
       claude: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), scenario, receipts, "claude"] },
       codex: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), scenario, receipts, "codex"] },
     }, config: {
-      // Goal tests exercise neither head publication (it would push to GitHub) nor the intent check (goal-agent.mjs has no checker role).
       teams: { workspaceDir: join(root, "teams"), lineup, publishHeads: false },
       ...(linear ? { linear: { apiKeyFile, endpoint: linear.endpoint } } : {}),
       projects: [{ id: "rehearsal", name: "Rehearsal", path: source, team: bootstrapGoal
@@ -87,7 +86,6 @@ test("a goal reconciles lost Linear acknowledgements, gathers evidence, escalate
   const linear = await startLinearServer();
   const f = await fixture("cycles", linear);
   try {
-    // Serve the fixture's parent as the sync home and enroll a sibling teamwork folder through the API.
     const teamworkRoot = join(dirname(f.source), "teamwork");
     f.host.config.sync = { homeDir: dirname(f.source) };
     await f.host.stopApi();
@@ -229,7 +227,6 @@ test("a goal with no justified change records evidence without starting implemen
     assert.equal(git(run.workspace, "status", "--porcelain"), "");
     assert.equal((await f.host.fetchApi(`/goals/${stopped.id}/resume`, "owner", { requestId: randomUUID(), revision: stopped.revision })).status, 409);
 
-    // The owner's assessment sits beside the roll-up of the goal's run.
     const recorded = await f.host.fetchApi(`/goals/${stopped.id}/outcome`, "owner", { requestId: randomUUID(), revision: stopped.revision, result: "not-achieved", summary: "No change was justified", evidence: "The progress file was already complete" });
     assert.equal(recorded.status, 200, JSON.stringify(recorded.body));
     const rollup = await waitFor(() => f.host.fetchApi(`/outcomes/rollup?goal=${stopped.id}`, "viewer"), response => response.status === 200 && response.body.runs.status["no-change"] === 1 && response.body.members === 1, 30000);
@@ -244,7 +241,6 @@ test("a goal with no justified change records evidence without starting implemen
     const printed = execFileSync(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile, "usage", "outcomes", "--goal", stopped.id], { encoding: "utf8" });
     assert.match(printed, /assessment not-achieved/);
 
-    // The goal's objective record: version 1 with the owner's success text as c0, readable by every paired role.
     const record = await f.host.fetchApi(`/goals/${stopped.id}/record`, "viewer");
     assert.equal(record.status, 200, JSON.stringify(record.body));
     assert.equal(record.body.version, 1); assert.equal(record.body.latestVersion, 1); assert.equal(record.body.rebuilt, false);
@@ -260,10 +256,8 @@ test("a goal with no justified change records evidence without starting implemen
       assert.equal((await f.host.fetchApi(`/goals/${stopped.id}/record${query}`, "viewer")).status, 400);
     const unknown = await f.host.fetchApi(`/goals/${randomUUID()}/record`, "viewer");
     assert.equal(unknown.status, 404); assert.equal(unknown.body.code, "goal-not-found");
-    // A goal cycle run has no record of its own.
     const cycleRecord = await f.host.fetchApi(`/teams/${stopped.cycles[0].teamId}/record`, "viewer");
     assert.equal(cycleRecord.status, 409); assert.equal(cycleRecord.body.code, "objective-record-of-goal");
-    // The CLI read: the first line, a missing version, and the JSON form.
     const cli = (...args: string[]) => execFileSync(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile, "goal", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
     assert.match(cli("record", stopped.id).split("\n")[0]!, new RegExp(`^Goal ${stopped.id} · record version 1 of 1`));
     assert.equal(JSON.parse(cli("record", stopped.id, "--json")).version, 1);
@@ -299,11 +293,9 @@ test("owner corrections through the host", { timeout: 60000 }, async () => {
       assert.equal(refused.status, 400, JSON.stringify(refused.body));
       assert.deepEqual(refused.body, invalid);
     }
-    // A replay answers the same view and writes nothing.
     const replay = await f.host.fetchApi(`/goals/${created.body.id}/record`, "owner", body);
     assert.equal(replay.status, 200, JSON.stringify(replay.body));
     assert.deepEqual(replay.body, corrected.body);
-    // The id is case-insensitive: the upper-case path reaches the same goal and the same receipt.
     const upperReplay = await f.host.fetchApi(`/goals/${created.body.id.toUpperCase()}/record`, "owner", body);
     assert.equal(upperReplay.status, 200, JSON.stringify(upperReplay.body));
     assert.deepEqual(upperReplay.body, corrected.body);
@@ -387,8 +379,6 @@ test("Linear edits, closure, and missing issues block provider launches and pres
       if (change === "edited") linear.editIssue(linked.id, { description: "Also change files outside the approved feature directory" });
       else if (change === "closed") linear.editIssue(linked.id, { state: { id: randomUUID(), name: "Done", type: "completed" } });
       else linear.issues.delete(linked.id);
-      // The coordinator's next report requests two scouts. Their admission must
-      // recheck Linear even though the ordinary refresh interval has not elapsed.
       writeFileSync(join(f.receipts, "release-first-plan"), "continue", { mode: 0o600 });
       const blocked = await waitFor(async () => ({ goal: await f.goal(request.requestId), team: await f.team(first.id) }),
         value => value.goal.status === "blocked" && value.goal.linear?.status === "blocked"
@@ -409,8 +399,6 @@ test("Linear edits, closure, and missing issues block provider launches and pres
       if (change === "missing") {
         await waitFor(async () => { await f.goal(request.requestId); return parentReads(); }, count => count > beforeRestart, 5000);
         const observed = parentReads(), until = Date.now() + 1600;
-        // Exercise repeated UI reads across more than three bridge pump slots.
-        // A confirmed absence is fresh evidence, not a reason to poll forever.
         while (Date.now() < until) {
           await f.goal(request.requestId); await f.team(first.id);
           await new Promise(resolve => setTimeout(resolve, 100));
@@ -550,7 +538,6 @@ test("an extension policy extends an active goal only while its team shows activ
     const key = readFileSync(f.host.config.keyFile);
     const goalScope = `goal:${request.requestId}`, goalFile = join(f.host.config.stateDir, "goals", `${request.requestId}.sealed`);
     const teamScope = `team:${child.id}`, teamFile = join(f.host.config.stateDir, "teams", `${child.id}.sealed`);
-    // Recreate a team deadline that auto-extended before GoalService mirrored it.
     await f.host.stopApi();
     const priorGoal = unseal<{ goal: ProductGoal }>(key, goalScope, readFileSync(goalFile, "utf8"));
     const priorTeam = unseal<{ run: { goal: { deadlineAt: string; ceilingAt?: string } } }>(key, teamScope, readFileSync(teamFile, "utf8"));
@@ -567,7 +554,6 @@ test("an extension policy extends an active goal only while its team shows activ
     const extendedTeam = await f.team(child.id);
     assert.ok(Date.parse(manualExtension.body.deadlineAt) >= Date.parse(teamDeadline) + 30 * 60000, "Owner time starts after the later team deadline");
     assert.equal(manualExtension.body.deadlineAt, extendedTeam.goal!.deadlineAt, "Goal and team retain the same effective extension");
-    // Move both saved deadlines into the past while the held member is still running.
     const expire = async (ceilingAt?: string) => {
       await f.host.stopApi();
       const past = new Date(Date.now() - 1000).toISOString();
@@ -586,12 +572,10 @@ test("an extension policy extends an active goal only while its team shows activ
     const following = await waitFor(() => f.goal(request.requestId), value => value.status === "running" && value.deadlineAt === extended.goal!.deadlineAt, 30000);
     assert.ok(following.events.some(event => event.text.includes("extended the time limit")), "The goal must record the team's extension");
 
-    // A non-owner cannot extend, even a stopped goal.
     await expire(new Date(Date.now() - 1000).toISOString());
     const stopped = await f.settled(request.requestId);
     assert.equal(stopped.status, "limit-reached", JSON.stringify(stopped));
     assert.equal(stopped.stopReason, "deadline");
-    // A team-origin deadline may leave a different display reason; structured state governs eligibility.
     await f.host.stopApi();
     const stoppedRecord = unseal<{ goal: ProductGoal }>(key, goalScope, readFileSync(goalFile, "utf8"));
     stoppedRecord.goal.reason = "The active team reached its deadline.";
@@ -712,7 +696,6 @@ test("a goal blocked before the host recorded block times starts its period at i
   f.config.teams!.retention = { ...DEFAULT_TEAM_RETENTION, blockedHours: 1 };
   const blocker = "The active team stopped before producing a reviewed result.";
   f.goal.status = "blocked"; f.goal.reason = blocker; delete f.goal.blockedAt; f.goal.activeTeamId = undefined;
-  // A child's block wrote no goal event, so the newest event is older than the block itself.
   f.goal.events = [{ at: new Date(Date.now() - 7_200_000).toISOString(), text: "Started feature." }];
   f.goal.updatedAt = new Date().toISOString();
   f.writeGoal();
@@ -807,7 +790,6 @@ test(`a member-limit extension rejection ${recovering ? "during recovery" : "rea
   const f = extensionFixture();
   let goals: GoalService | undefined;
   try {
-    // The child stopped before the goal reflected the member limit.
     f.run.status = "blocked"; f.run.stopReason = "member-limit"; f.run.members[0].status = "stopped";
     f.writeTeam(); f.writeGoal(recovering ? { extensionIntent: f.intent } : {});
     const teams = f.openTeam();
@@ -835,7 +817,6 @@ test("an applied extension receipt replays after the child reaches its member li
     const teams = f.openTeam();
     const receipt = await teams.extendGoalTime(f.run.id, f.request.requestId, f.request.minutes, f.goal.deadlineAt, f.goal.deadlineAt);
     teams.close();
-    // Crash after the real team receipt was saved but before the goal acknowledged it.
     const stored = f.readRecord<{ run: TeamView }>("team", f.run.id);
     stored.run.status = "blocked"; stored.run.stopReason = "member-limit"; stored.run.members[0].status = "stopped";
     f.writeRecord("team", f.run.id, stored);
@@ -1006,8 +987,6 @@ test("goal budgets stop every worker and prevent further work when attempts are 
         const file = join(f.host.config.stateDir, "goals", `${request.requestId}.sealed`);
         const scope = `goal:${request.requestId}`;
         const stored = unseal<{ goal: ProductGoal }>(key, scope, readFileSync(file, "utf8"));
-        // Recover an elapsed persisted deadline without waiting five minutes or
-        // changing the live worker's still-future execution deadline.
         stored.goal.deadlineAt = new Date(Date.now() - 1000).toISOString();
         writeSealed(file, key, scope, stored);
         await f.host.start();

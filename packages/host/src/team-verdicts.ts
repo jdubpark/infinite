@@ -20,69 +20,32 @@ import type { Provider } from "./types.js";
 
 export { verdictPin } from "./evaluator-profiles.js";
 
-/*
- * What a restart finds in each status, and what resumes it. A restart is a JSON round trip of the holder (state, run, record, outbox)
- * as last saved. Every status change, run event, row event, and assessment is made in memory and followed by one save, so a saved
- * holder never holds half of one. The one write outside the holder is a goal's record through its port.
- *
- * The host fences an operation that a restart interrupted and never replays it (ruling 22). So a reported evaluator whose
- * read-only check was cut short is not consumed again; the run is fenced and a new revision starts. The rows below say what each
- * status holds, and what this class does if it is driven again anyway.
- *
- *  status      | a restart finds                                  | what drives it
- *  ------------+--------------------------------------------------+--------------------------------------------------------------
- *  testing     | the state and `since`; the register's pass in    | reviewed/step read the pass again, and go on once it is done
- *              | its own state                                    | or VERDICT_TESTING_WAIT_MS passed; markReviewed ran once
- *  queued      | the state, failures, excluded; no evaluator      | launch chooses again, skipping excluded, and prepares once
- *  evaluating  | evaluatorMemberId set and the member present,    | the evaluator's report, or its failure. With no member,
- *              | maybe reported, with the full report in the      | step goes back to queued without a failure.
- *              | state; or no id/member (prepare did not finish)  |
- *  releasing   | composed, written, assessment, row, events       | step consumes the held report; its hold sees releasing and
- *              |                                                  | sets done. A missing held report sets done.
- *  done        | everything                                       | nothing; reviewed and holdNoChange return false
- *
- * Crash window: a goal's record is written before the save. A crash between the two leaves one verdict.recorded entry in the
- * record for a verdict with no assessment on the run and no row event; the fenced run does not replay it, so nothing is written
- * twice. complete still looks for the entry with handle verdict:<verdictId> before it writes, as a defence if it is driven again.
- * The row event goes to the holder's outbox in the same save as the state.
- */
-
 export type VerdictState = {
   revision: number; head: string; kind: "reviewed" | "no-change"; verdictId: string;
   status: "testing" | "queued" | "evaluating" | "releasing" | "done";
   failures: 0 | 1; excluded?: string[];
-  /** When the verdict entered `testing`. */
   since?: string;
-  /** For each criterion in the evaluator's context, a SHA-256 of its statement and check; the answer holds only for that. */
   judged?: Record<string, string>;
-  /** The run whose reviewed pass gives the receipts: this run, or the parent run. */
   receiptsFrom: string;
   evaluatorMemberId?: string;
-  /** The project manager whose no-change report waits. */
   heldMemberId?: string;
   choice?: { profileId: string; provider: Provider; model?: string; family: string; sharedFamily: boolean; alsoReviewed: boolean };
   report?: VerdictReport; composed?: ComposedVerdict; reason?: VerdictReason;
-  /** The ledger's delivery fact at the newest verdict. It only moves forward: landed, then reverted. */
   delivery?: "landed" | "reverted";
-  /** The ids of this state's earlier verdicts, oldest first. A late verdict replaces in the record what any of them wrote. */
   earlier?: string[];
   written?: "wrote" | "log-full" | "record-unavailable" | "write-failed";
 };
 
-/** The part of teams.ts' Stored that verdicts read and write. */
 export type VerdictHolder = { run: TeamRun; verdict?: VerdictState; objectiveRecord?: unknown; checkHead?: string };
 
-/** Closures over TeamService's private methods, built in one field initializer in teams.ts. */
 export type VerdictHost = {
   holder(runId: string): VerdictHolder | undefined;
   prepare(holder: VerdictHolder, onPrepared: (member: TeamMember) => void, prebuilt: { prompt: string; profile: TeamModelProfile }, onFailed: () => void): void;
   consume(holder: VerdictHolder, member: TeamMember): void;
   operation(holder: VerdictHolder, perform: (signal: AbortSignal) => Promise<boolean | undefined>, complete: (clean: boolean | undefined) => void, member: TeamMember): void;
   save(holder: VerdictHolder): void;
-  /** The outcome ledger's delivery fact; undefined when the store cannot be read. */
   delivery(runId: string, head: string, since: string): DeliveryFact | undefined;
   event(holder: VerdictHolder, text: string): void;
-  /** The run event "verdict.recorded". */
   emit(holder: VerdictHolder, data: VerdictEventData): void;
   configured(run: TeamRun): readonly TeamCommand[];
   limited(): Set<Provider>;
@@ -115,18 +78,14 @@ export type VerdictDetail = {
   criteria: ComposedCriterion[]; evaluator?: VerdictState["choice"]; written?: VerdictState["written"];
 };
 
-/** A verdict waits this long in `testing` for a register pass; then it goes on with the receipts that exist. */
 export const VERDICT_TESTING_WAIT_MS = 300_000;
 const DELIVERY_ORDER: readonly DeliveryFact[] = ["none", "landed", "reverted"];
-/** The criteria the state's newest composed verdict held. */
 const heldIds = (state: VerdictState): Set<string> => new Set(state.composed?.criteria.map(item => item.id));
 const STOPPED: readonly TeamRun["status"][] = ["paused", "cancelled", "blocked"];
 const EVENT_PROVIDERS: readonly Provider[] = ["claude", "codex", "opencode"];
 
-/** A reviewed run's head, and a no-change run's base, which is its head. */
 const headOf = (run: TeamRun): string | undefined => run.headCommit ?? run.baseCommit;
 
-/** True when the final round at the check head passed in every row; undefined when no round was kept at `head`. */
 function checksPassed(holder: VerdictHolder, head: string): boolean | undefined {
   if (holder.checkHead !== head) return undefined;
   const rows = finalCheckRound(holder.run, head);
@@ -134,19 +93,16 @@ function checksPassed(holder: VerdictHolder, head: string): boolean | undefined 
   return rows.every(row => row.status === "passed");
 }
 
-/** True when the run's review of its current revision approved the head; undefined when the review was not of this head. */
 function reviewApproved(run: TeamRun, head: string): boolean | undefined {
   if (run.headCommit !== head || run.review === undefined || run.review.revision !== run.revision) return undefined;
   return run.review.verdict === "approved";
 }
 
 function changedPathsOf(run: TeamRun, head: string): { paths: string[]; truncated: boolean } {
-  // A change list recorded at another head describes another tree, so it is not offered; the missing list is marked incomplete.
   if (run.changes?.headCommit !== head) return { paths: [], truncated: true };
   return { paths: run.changes.files.map(file => file.path), truncated: run.changes.truncated };
 }
 
-/** For each active criterion, a SHA-256 of its statement (c0's is the objective) and check, as the evaluator's context states them. */
 function digestsOf(record: ObjectiveRecord): Record<string, string> {
   const digests: Record<string, string> = {};
   for (const item of record.criteria) {
@@ -157,26 +113,17 @@ function digestsOf(record: ObjectiveRecord): Record<string, string> {
   return digests;
 }
 
-/** A verdict with nothing to compose from: the record did not read. */
 function emptyVerdict(reason: VerdictReason): ComposedVerdict {
   return { result: "inconclusive", reason, criteria: [], counts: { met: 0, notMet: 0, inconclusive: 0, pendingOwner: 0 }, dropped: { unknownIds: 0, handles: 0 } };
 }
 
-/** The profiles of a run's members that the evaluator must differ from or be weighed against. */
 type Cycle = { authors: TeamModelProfile[]; reviewers: TeamModelProfile[]; managers: TeamModelProfile[] };
 
-/**
- * The verdict of one revision. Holds a reviewed revision (or a goal cycle's no-change report) while a register pass, then one
- * read-only evaluator, produce the facts; composes the evaluator's report with host receipts and owner values; writes the
- * record, the run's assessment, and one row event; then lets the run go on. Every path ends in `done`. It changes no run
- * status and never marks anything achieved or approved.
- */
 export class TeamVerdicts {
   goals?: GoalRecordPort;
 
   constructor(private readonly host: VerdictHost) {}
 
-  /** The review approved the revision: true holds the run (no delivery, no settle). */
   reviewed(holder: VerdictHolder): boolean {
     if (holder.run.verdicts !== "on") return false;
     this.dropStale(holder);
@@ -187,11 +134,6 @@ export class TeamVerdicts {
     return true;
   }
 
-  /**
-   * Composes a settled run's verdict once more when the outcome ledger now shows its delivery. No evaluator runs. Returns false at the
-   * first check that fails: memory only until the ledger is asked, and the record is read after that. True when it composed. The fact
-   * is saved with a new verdict id first, so a restart between the two saves composes the same verdict and writes its record entry once.
-   */
   settleReceipt(holder: VerdictHolder): boolean {
     const run = holder.run;
     const state = holder.verdict;
@@ -200,7 +142,6 @@ export class TeamVerdicts {
     const assessment = run.assessment;
     if (assessment === undefined || assessment.revision !== state.revision || assessment.head !== state.head) return false;
     if (state.verdictId === assessment.verdictId) {
-      // Memory only: a verdict none of whose criteria waited for the delivery has nothing to settle, whatever its record names now.
       if (state.delivery === undefined && !state.composed?.criteria.some(item => item.reason === "before-delivery")) return false;
       const fact = this.host.delivery(run.id, state.head, state.since);
       if (fact === undefined || fact === "none" || fact === state.delivery) return false;
@@ -214,16 +155,13 @@ export class TeamVerdicts {
       state.verdictId = this.host.uuid();
       this.host.save(holder);
     } else if (!this.readyRecord(holder)) return false;
-    // With another id than the assessment's, a restart came between the two saves: the id and the fact are saved, the assessment is not.
     this.finish(holder, state, state.reason === undefined ? state.report : undefined, state.reason);
     return true;
   }
 
-  /** A project manager's no-change report on a goal cycle that has a parent run: true holds the report. */
   holdNoChange(holder: VerdictHolder, member: TeamMember): boolean {
     const run = holder.run;
     if (run.verdicts !== "on" || run.goal?.parentRunId === undefined) return false;
-    // The validity rule of the no-change report itself: no task, and the head still the base.
     if (run.tasks.length > 0 || run.headCommit !== run.baseCommit) return false;
     this.dropStale(holder);
     const state = holder.verdict;
@@ -242,7 +180,6 @@ export class TeamVerdicts {
     return true;
   }
 
-  /** Where a new project manager would start: true when the verdict owns the run's next step. */
   step(holder: VerdictHolder): boolean {
     if (holder.run.verdicts !== "on") return false;
     this.dropStale(holder);
@@ -253,7 +190,6 @@ export class TeamVerdicts {
     return true;
   }
 
-  /** Keeps the full report in the state and returns the stub; any other kind becomes fixed blocked text. */
   screen(holder: VerdictHolder, member: TeamMember, report: TeamReport): TeamReport {
     if (member.role !== "evaluator") return report;
     if (report.kind !== "verdict") {
@@ -264,7 +200,6 @@ export class TeamVerdicts {
     return { kind: "verdict", result: report.result, criteria: report.criteria.map(item => ({ id: item.id, state: item.state, evidence: [] })) };
   }
 
-  /** Every report of an evaluator member. Only the current evaluator's verdict report is applied. */
   consume(holder: VerdictHolder, member: TeamMember): void {
     const state = holder.verdict;
     if (!state || !this.liveEvaluator(holder, state, member)) return;
@@ -277,7 +212,6 @@ export class TeamVerdicts {
     this.host.operation(holder, signal => this.readOnly(member, signal), clean => this.complete(holder, evaluator, verdictId, revision, clean), member);
   }
 
-  /** A member that stopped without a usable report: true for an evaluator (handled), false for every other role. */
   failed(holder: VerdictHolder, member: TeamMember): boolean {
     if (member.role !== "evaluator") return false;
     const state = holder.verdict;
@@ -285,7 +219,6 @@ export class TeamVerdicts {
     return true;
   }
 
-  /** The evaluator's context at launch, or null after the verdict finished without it and the member stopped. */
   context(holder: VerdictHolder, member: TeamMember): VerdictContext | null {
     const state = holder.verdict;
     if (!state || !this.liveEvaluator(holder, state, member)) return null;
@@ -300,7 +233,6 @@ export class TeamVerdicts {
       return null;
     }
     const digests = digestsOf(record);
-    // The host builds the context on every tick while a fuse holds the launch, so save only when what the evaluator reads changed.
     if (canonicalJson(state.judged ?? null) !== canonicalJson(digests)) {
       state.judged = digests;
       this.host.save(holder);
@@ -308,7 +240,6 @@ export class TeamVerdicts {
     return built;
   }
 
-  /** The composed verdict of the run's current revision, from memory. */
   detail(runId: string): VerdictDetail | undefined {
     const holder = this.host.holder(runId);
     const state = holder?.verdict;
@@ -331,9 +262,7 @@ export class TeamVerdicts {
       revision: run.revision, head: run.headCommit, kind: "reviewed", verdictId: this.host.uuid(),
       status: "testing", failures: 0, receiptsFrom: run.id, since: this.host.now(),
     };
-    // The event comes first: markReviewed saves, so a crash between the two saves cannot lose it.
     this.host.event(holder, VERDICT_EVENTS.held);
-    // Best effort: without a pass the receipts read as absent and host criteria are inconclusive (no-receipt).
     this.host.register.markReviewed(holder);
     this.host.save(holder);
     return true;
@@ -352,7 +281,6 @@ export class TeamVerdicts {
     return true;
   }
 
-  /** One status change per call. */
   private advance(holder: VerdictHolder, state: VerdictState): void {
     switch (state.status) {
       case "testing":
@@ -375,13 +303,11 @@ export class TeamVerdicts {
   private testing(holder: VerdictHolder, state: VerdictState): void {
     const since = Date.parse(state.since ?? "");
     const waited = Date.parse(this.host.now()) - since;
-    // A missing or unparsable time counts as expired.
     if (this.host.register.reviewedReceipts(state.receiptsFrom, state.head) === "pending" && Number.isFinite(waited) && waited < VERDICT_TESTING_WAIT_MS) return;
     state.status = "queued";
     this.host.save(holder);
   }
 
-  /** The record, the choice, the context, and room for one more member, in that order; any miss finishes the verdict without an evaluator. */
   private launch(holder: VerdictHolder, state: VerdictState): void {
     const run = holder.run;
     const record = this.readyRecord(holder);
@@ -403,7 +329,6 @@ export class TeamVerdicts {
       this.finish(holder, state, undefined, "context-too-large");
       return;
     }
-    // The evaluator is one more member. A run at its limit of members settles as it would without verdicts; it is never stopped for the limit here.
     if (run.members.length >= memberLimit(run)) {
       this.finish(holder, state, undefined, "evaluator-unavailable");
       return;
@@ -423,16 +348,13 @@ export class TeamVerdicts {
       const live = holder.verdict;
       if (live?.verdictId === verdictId && live.status === "evaluating") live.evaluatorMemberId = member.memberId;
     }, { prompt: evaluatorPrompt(profile.provider, profile), profile }, () => {
-      // A working copy that cannot be made costs the verdict its evaluator, never the run its review.
       const live = holder.verdict;
-      // As in `complete`: a stopped run, or one whose recovery is stopping its members, writes nothing; its next revision drops this state.
       if (STOPPED.includes(holder.run.status) || holder.run.recovery?.status === "stopping") return;
       if (live?.verdictId === verdictId && live.status === "evaluating" && live.evaluatorMemberId === undefined) this.finish(holder, live, undefined, "evaluator-unavailable");
     });
     this.host.save(holder);
   }
 
-  /** While the evaluator exists, whatever its status, nothing starts. One that is gone was never prepared: it is replaced without a failure. */
   private evaluating(holder: VerdictHolder, state: VerdictState): void {
     if (holder.run.members.some(member => member.memberId === state.evaluatorMemberId)) return;
     state.status = "queued";
@@ -442,7 +364,6 @@ export class TeamVerdicts {
     this.host.save(holder);
   }
 
-  /** Consumes the held no-change report again; its hold sees `releasing` and lets it through. */
   private release(holder: VerdictHolder, state: VerdictState): void {
     const held = holder.run.members.find(member => member.memberId === state.heldMemberId);
     if (held?.report?.kind !== "no-change") {
@@ -453,7 +374,6 @@ export class TeamVerdicts {
     this.host.consume(holder, held);
   }
 
-  /** The read-only check of the evaluator's working copy. `undefined` is a check that a stop aborted before it answered. */
   private readOnly(member: TeamMember, signal: AbortSignal): Promise<boolean | undefined> {
     return assertMemberReadOnly(member.cwd, member.baseCommit, this.host.prefix(), signal).then(() => true, () => signal.aborted ? undefined : false);
   }
@@ -469,10 +389,7 @@ export class TeamVerdicts {
       return;
     }
     if (state.status !== "evaluating" || state.evaluatorMemberId !== evaluator) return;
-    // A stopped run, or one whose recovery is stopping its members, judges no evaluator and writes nothing: the resume or the
-    // recovery starts a new revision, which drops this state.
     if (STOPPED.includes(holder.run.status) || holder.run.recovery?.status === "stopping") return;
-    // A check that ended without a result on a run that is not stopped is a failure of the evaluator.
     if (clean !== true || state.report === undefined) {
       this.failure(holder, state);
       return;
@@ -480,7 +397,6 @@ export class TeamVerdicts {
     this.finish(holder, state, state.report);
   }
 
-  /** One replacement on a fresh choice, then the verdict finishes without an answer. */
   private failure(holder: VerdictHolder, state: VerdictState): void {
     if (state.failures >= 1) {
       this.finish(holder, state, undefined, "evaluator-unavailable");
@@ -496,18 +412,12 @@ export class TeamVerdicts {
     this.host.save(holder);
   }
 
-  /** The member is stopped before the finish's save, so a restart never finds it queued. */
   private stopEvaluator(holder: VerdictHolder, state: VerdictState, member: TeamMember, reason: VerdictReason): void {
     member.status = "stopped";
     member.stoppedReason = VERDICT_EVENTS.skipped[reason];
     this.finish(holder, state, undefined, reason);
   }
 
-  /**
-   * Composes, writes the record (once), sets the assessment, emits the row, adds the fixed events, and saves. `report` is the
-   * evaluator's answer; without it `reason` says why. A no-change verdict goes to `releasing`, every other to `done`. A late
-   * verdict (the state has earlier ids) judges the criteria its earlier verdict held, as the record states them now.
-   */
   private finish(holder: VerdictHolder, state: VerdictState, report?: VerdictReport, reason?: VerdictReason): void {
     const run = holder.run;
     const record = this.readyRecord(holder);
@@ -551,13 +461,11 @@ export class TeamVerdicts {
     if (written === "write-failed") this.host.event(holder, VERDICT_EVENTS.writeFailed);
   }
 
-  /** Drops an answer for an active criterion that the evaluator's context did not hold, or held with another statement or check. */
   private judgedOnly(state: VerdictState, record: ObjectiveRecord, report: VerdictReport): VerdictReport {
     const digests = digestsOf(record);
     return { ...report, criteria: report.criteria.filter(item => digests[item.id] === undefined || state.judged?.[item.id] === digests[item.id]) };
   }
 
-  /** Writes the verdict's entries once: an entry with this verdict's handle means a crash came between the write and the save. */
   private writeRecord(holder: VerdictHolder, state: VerdictState, record: ObjectiveRecord, composed: ComposedVerdict, supersedes?: readonly string[]): { written: "wrote" | "log-full" | "write-failed"; version: number } {
     const handle = `verdict:${state.verdictId}`;
     const existing = record.log.find(entry => entry.op === VERDICT_OPS.recorded && entry.handle === handle);
@@ -581,12 +489,10 @@ export class TeamVerdicts {
     };
   }
 
-  /** True when an evaluator's answer was recorded on some criterion; a report whose answers were all dropped names no evaluator. */
   private applied(composed: ComposedVerdict): boolean {
     return composed.criteria.some(item => item.evaluatorState !== undefined);
   }
 
-  /** Ids, enumerations, and counts only. The profile is named only when an evaluator answer was applied. */
   private rowOf(holder: VerdictHolder, state: VerdictState, composed: ComposedVerdict, record: ObjectiveRecord, version: number, answered: boolean): VerdictEventData {
     const run = holder.run;
     const choice = answered ? state.choice : undefined;
@@ -612,7 +518,6 @@ export class TeamVerdicts {
     };
   }
 
-  /** Host facts at the verdict's head: this run's for a reviewed verdict, the parent run's for a no-change one (undefined when it is gone). */
   private factsOf(holder: VerdictHolder, state: VerdictState): { checksPassed?: boolean; reviewApproved?: boolean; delivery?: DeliveryFact } {
     const source = state.kind === "reviewed" ? holder : this.host.holder(state.receiptsFrom);
     const delivery = state.delivery === undefined ? {} : { delivery: state.delivery };
@@ -622,11 +527,6 @@ export class TeamVerdicts {
     return { ...delivery, ...(passed === undefined ? {} : { checksPassed: passed }), ...(approved === undefined ? {} : { reviewApproved: approved }) };
   }
 
-  /**
-   * The change list a verdict reads, for the composition and the evaluator's context alike. A reviewed verdict reads the run's own.
-   * A no-change run never sets one: it reads the parent run's when that list is at the verdict's head, else nothing changed between
-   * the base and the head, and the list is empty and complete.
-   */
   private changeListOf(holder: VerdictHolder, state: VerdictState): { paths: string[]; truncated: boolean } {
     if (state.kind === "reviewed") return changedPathsOf(holder.run, state.head);
     const parent = this.host.holder(state.receiptsFrom)?.run;
@@ -634,13 +534,11 @@ export class TeamVerdicts {
     return { paths: [], truncated: false };
   }
 
-  /** The reviewed pass's receipts at the head; undefined while pending, when no pass ran there, or when the run is gone. */
   private receiptsOf(state: VerdictState): readonly ObjectiveReceipt[] | undefined {
     const receipts = this.host.register.reviewedReceipts(state.receiptsFrom, state.head);
     return receipts === "pending" ? undefined : receipts;
   }
 
-  /** The members the evaluator must be independent of: this run's, and for a no-change verdict also those of the parent run, which made the head. Undefined when that run is gone. */
   private cycleFor(run: TeamRun, state: VerdictState): Cycle | undefined {
     const own = this.cycleOf(run);
     if (state.kind === "reviewed") return own;
@@ -650,10 +548,6 @@ export class TeamVerdicts {
     return { authors: [...own.authors, ...before.authors], reviewers: [...own.reviewers, ...before.reviewers], managers: [...own.managers, ...before.managers] };
   }
 
-  /**
-   * Every implementer and integrator member with a profile is an author, whatever its report and revision: an escalated or stopped
-   * member's edits can be in the head, and steer and resume reset run.tasks. Every reviewer member is a reviewer, and every project manager member with a profile is a manager.
-   */
   private cycleOf(run: TeamRun): Cycle {
     const authors: TeamModelProfile[] = [];
     const reviewers: TeamModelProfile[] = [];
@@ -667,17 +561,14 @@ export class TeamVerdicts {
     return { authors, reviewers, managers };
   }
 
-  /** The state belongs to the run's current revision and head. */
   private current(run: TeamRun, state: VerdictState): boolean {
     return state.revision === run.revision && state.head === headOf(run);
   }
 
-  /** The state is evaluating, current, and this member is its evaluator. */
   private liveEvaluator(holder: VerdictHolder, state: VerdictState, member: TeamMember): boolean {
     return state.status === "evaluating" && this.current(holder.run, state) && state.evaluatorMemberId === member.memberId;
   }
 
-  /** A verdict never outlives its revision: drops a state and an assessment that are not the run's current ones, and saves. */
   private dropStale(holder: VerdictHolder): void {
     const run = holder.run;
     let changed = false;

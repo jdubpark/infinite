@@ -6,8 +6,6 @@ import { clearEgressEnvironment } from "./egress.js";
 const STARTUP_TIMEOUT = 15000;
 const STARTUP_ERROR = "The cloud executor did not become ready. No command was replayed.";
 
-// The parent's pipe bounds the helper lifetime, including parent termination.
-// Process-group cleanup is not a fence for detached tool descendants or effects.
 const SUPERVISOR = `
   const {spawn}=require('node:child_process');
   const child=spawn(process.argv[1],process.argv.slice(2),{detached:true,stdio:['ignore','pipe','pipe']});
@@ -51,7 +49,6 @@ function endpoint(child: ChildProcess): Promise<string> {
   });
 }
 
-/** Start a private executor against an already materialized cloud workspace. */
 export async function startCloudExecutor(options: { cwd: string; command?: string; commandArgs?: string[]; egress?: Record<string, string> }): Promise<{
   environment: { environmentId: string; url: string; token: string; cwd: string };
   exited: Promise<void>;
@@ -63,7 +60,6 @@ export async function startCloudExecutor(options: { cwd: string; command?: strin
     if (!(await stat(cwd)).isDirectory()) throw new Error("Not a directory");
   } catch { throw new Error("The materialized cloud working directory is unavailable."); }
   const token = randomBytes(32).toString("hex");
-  // The session's egress environment, not the worker's: inherited proxy state is cleared first, as for the session.
   const env: NodeJS.ProcessEnv = { ...process.env };
   clearEgressEnvironment(env);
   Object.assign(env, options.egress ?? {});
@@ -74,7 +70,6 @@ export async function startCloudExecutor(options: { cwd: string; command?: strin
   });
   let closed = false, closing: Promise<void> | undefined;
   const exited = new Promise<void>(resolve => child.once("close", () => { closed = true; resolve(); }));
-  // Errors must remain handled after the startup listeners have been removed.
   child.on("error", () => {});
   child.stdin.on("error", () => { child.kill("SIGTERM"); });
   const close = (): Promise<void> => closing ??= (async () => {

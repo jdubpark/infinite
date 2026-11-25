@@ -8,7 +8,6 @@ import { exclusionOf, type Disposition, type Flag, type Level } from "../package
 
 const FROZEN = "2026-11-01T00:00:00.000Z";
 
-/** One outcome row. Every required field is filled; the overrides win. The exclusion follows the disposition. */
 function row(
   overrides: Partial<Omit<OutcomeRow, "payload">> & { payload?: Partial<OutcomePayload> } = {},
 ): OutcomeRow {
@@ -66,7 +65,6 @@ function row(
 
 let sequence = 0;
 
-/** An implementer attempt that integrated: integrated yes. Each call gets its own session and member. */
 function integratedRow(overrides: Partial<Omit<OutcomeRow, "payload">> & { payload?: Partial<OutcomePayload> } = {}): OutcomeRow {
   sequence += 1;
   return row({
@@ -82,7 +80,6 @@ function integratedRow(overrides: Partial<Omit<OutcomeRow, "payload">> & { paylo
   });
 }
 
-/** An implementer attempt that stalled: integrated no, and counted. */
 function stalledRow(overrides: Partial<Omit<OutcomeRow, "payload">> & { payload?: Partial<OutcomePayload> } = {}): OutcomeRow {
   sequence += 1;
   return row({
@@ -210,8 +207,6 @@ test("one row per profile id, newest epoch only", () => {
   const card = scorecardOf([...oldEpoch, ...newEpoch]);
   assert.equal(card.rows.length, 1);
   assert.equal(card.rows[0]!.attempts, 2);
-  // An attempt keeps the epoch it started in. One that started before the advance and ends after every newer
-  // attempt must not bring the retired epoch back.
   const late = integratedRow({ profileId: "fast", profileEpoch: 1, endedAt: "2026-11-12T00:00:00.000Z" });
   const afterLate = scorecardOf([...oldEpoch, ...newEpoch, late]);
   assert.equal(afterLate.rows.length, 1);
@@ -222,31 +217,24 @@ test("one row per profile id, newest epoch only", () => {
   const lateA = integratedRow({ profileId: "fast", model: "model-a", endedAt: "2026-11-09T00:00:00.000Z" });
   const lineup = (model: string): ProfileIdentityOf => profileId => (profileId === "fast" ? { provider: "claude", model, effort: null } : undefined);
 
-  // The configured lineup says which identity the id names now. A pinned older lineup can keep ending attempts.
   const configured = scorecardOf([...modelA, ...modelB, lateA], { identity: lineup("model-b") });
   assert.equal(configured.rows.length, 1);
   assert.equal(configured.rows[0]!.attempts, 1, "only the configured model's rows count");
-  // The lineup names a model that has no row yet: the profile's row has not started.
   assert.deepEqual(scorecardOf([...modelA, ...modelB], { identity: lineup("model-c") }).rows, []);
-  // The id is not in the lineup any more: the identity that ended last stands.
   const retired = scorecardOf([...modelA, ...modelB], { identity: () => undefined });
   assert.equal(retired.rows.length, 1);
   assert.equal(retired.rows[0]!.attempts, 1, "The model that ran later is the only one counted");
   assert.equal(scorecardOf([...modelA, ...modelB, lateA], { identity: () => undefined }).rows[0]!.attempts, 3);
 
-  // The owner advanced the epoch and no attempt has started under it: the old rows are all there is, and they
-  // must not stand as the profile's row.
   assert.deepEqual(scorecardOf(oldEpoch, { epoch: () => 2 }).rows, []);
   assert.equal(scorecardOf(oldEpoch, { epoch: () => 1 }).rows[0]!.attempts, 3);
   const current = scorecardOf([...oldEpoch, ...newEpoch, late], { epoch: () => 2 });
   assert.equal(current.rows.length, 1);
   assert.equal(current.rows[0]!.attempts, 2);
-  // The epoch is asked once per identity, with the identity's own fields.
   const asked: unknown[] = [];
   scorecardOf([...oldEpoch, ...newEpoch], { epoch: identity => { asked.push(identity); return 2; } });
   assert.deepEqual(asked, [{ provider: "claude", model: "model-a", effort: null }]);
 
-  // A missing effort and the literal effort `none` are two identities. OpenCode allows the variant `none`.
   const noEffort = [1, 2].map(() => integratedRow({ profileId: "oc", provider: "opencode", effort: null }));
   const namedNone = [1, 2, 3].map(() => integratedRow({ profileId: "oc", provider: "opencode", effort: "none" }));
   const named = (effort: string | null): ProfileIdentityOf => () => ({ provider: "opencode", model: "model-a", effort });

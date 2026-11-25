@@ -6,20 +6,11 @@ import { publishTeamHead } from "./team-workspace.js";
 import { filesystemEntryExists, type TeamKernel } from "./team-kernel.js";
 import type { Stored, TeamServiceOptions } from "./teams.js";
 
-/**
- * What the publisher uses of TeamService: part of the kernel, the service options (an injected clock) and the
- * retention clock. teams.ts builds it in `publisherHost`; every member reads the service at the time of use.
- */
 export type PublisherHost = Pick<TeamKernel, "records" | "config" | "save" | "event" | "enqueue"> & {
   readonly options: TeamServiceOptions | undefined;
   retentionNow(): string;
 };
 
-/**
- * Publication of each integrated head to GitHub, so work survives the loss of its workspace: the target repository,
- * whether a head still needs pushing, the gate that holds review and delivery until it is pushed, and the background
- * push with its retry backoff. Moved from TeamService unchanged. TeamService holds one instance.
- */
 export class TeamPublisher {
   private readonly publishingRuns = new Set<string>();
   readonly publicationTasks = new Set<Promise<void>>();
@@ -38,12 +29,10 @@ export class TeamPublisher {
   }
   needsPublication(stored: Stored) {
     const { run } = stored, target = this.publicationTarget(stored);
-    // A removed or lost workspace has no head left to push, so it must not hold retention or owner removal.
     return Boolean(target && run.headCommit && run.headCommit !== run.baseCommit && !["merged", "no-change"].includes(run.status) &&
       !(run.publication?.commit === run.headCommit && run.publication.repository === target.repository) &&
       !run.workspaceRemovedAt && filesystemEntryExists(run.workspace));
   }
-  /** Review and delivery wait for the published head; a failing push keeps retrying instead of blocking, so the run continues once GitHub accepts it. */
   publicationGate(stored: Stored, role: TeamMember["role"]) {
     if ((role !== "reviewer" && role !== "delivery") || !this.needsPublication(stored)) return false;
     this.startPublication(stored);
@@ -51,14 +40,11 @@ export class TeamPublisher {
   }
   startPublication(stored: Stored) {
     const { run } = stored, target = this.publicationTarget(stored), commit = run.headCommit;
-    // Pushing a fixed commit only reads objects, so it may overlap queued workspace operations, including intents retained after a crash.
     if (!target || !commit || !this.needsPublication(stored) || this.publishingRuns.has(run.id)) return false;
     const now = this.host.options?.now?.() ?? Date.now();
     const failure = run.publication?.failure;
     if (failure?.commit === commit && now < Date.parse(failure.retryAt)) return false;
     const id = run.id, runBranch = run.branch, controller = new AbortController();
-    // A run steered after its delivery publishes to a checkpoint branch with no pull request. Its pull request moves only
-    // when delivery pushes a head the checks and the independent review passed (INF-324).
     const checkpoint = run.pullRequest && run.pullRequest.revision !== run.revision ? `${runBranch}-${commit.slice(0, 8)}` : undefined;
     this.publishingRuns.add(id);
     this.publicationControllers.set(id, controller);
@@ -66,7 +52,6 @@ export class TeamPublisher {
     task = (async () => {
       let outcome: Awaited<ReturnType<typeof publishTeamHead>> = { published: false, category: "other" };
       let branch = checkpoint ?? runBranch, diverged = false;
-      // With the GitHub proxy configured, each push carries a host grant for exactly the ref it publishes.
       const grantEnv = (ref: string) => hostGithubGrantEnvironment(this.host.config, { sid: `publish:${id}`, project: run.projectId, repo: target.repository, ops: ["push"], refs: [ref] });
       try {
         outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, branch, this.host.config.teams?.commandPrefix, controller.signal, grantEnv);
@@ -78,7 +63,7 @@ export class TeamPublisher {
       } catch {
         outcome = { published: false, category: "other" };
       }
-      await this.host.enqueue(() => {
+      await this.host.enqueue(id, () => {
         if (this.host.records.get(id) !== stored) return;
         const previousPublication = run.publication, previousEvents = run.events.slice();
         const at = this.host.retentionNow();

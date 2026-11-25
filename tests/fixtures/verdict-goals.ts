@@ -32,11 +32,8 @@ export const criterion = (statement: string, item: string) => ({ statement, chec
 const minute = 60_000;
 const sleep = (ms: number) => new Promise(resolveSleep => setTimeout(resolveSleep, ms));
 
-/* ------------------------------------------------ the real host, with the goal agent */
-
 type Mode = "autonomous" | "supervised";
 
-/** A host whose project runs goal cycles through `goal-agent.mjs` with a real evaluator member when `objective.evaluator` is on. */
 export async function hostFixture(options: { objective: Record<string, string>; mode: Mode }) {
   const root = realpathSync(mkdtempSync("/tmp/inf-verdict-goal-"));
   const source = join(root, "source"), receipts = join(root, "receipts");
@@ -62,7 +59,6 @@ export async function hostFixture(options: { objective: Record<string, string>; 
       teams: { workspaceDir: join(root, "teams"), lineup, publishHeads: false },
       projects: [{ id: "rehearsal", name: "Rehearsal", path: source, team: { checks: [{ command: process.execPath, args: ["check.mjs"] }] } as Project["team"] }],
     } });
-    // A project's mode is its enrollment's, so enroll it through the API with the objective switches and the mode.
     started.config.sync = { homeDir: dirname(source) };
     await started.stopApi();
     writeFileSync(join(started.root, "config.json"), JSON.stringify(started.config));
@@ -92,7 +88,6 @@ export async function hostFixture(options: { objective: Record<string, string>; 
   };
   const stopped = (id: string, accept: (value: ProductGoal) => boolean = () => true) => waitFor(() => goal(id),
     value => !value.activeTeamId && ["ready-for-review", "no-opportunity", "blocked", "limit-reached"].includes(value.status) && accept(value), 120000);
-  /** The goal's cycle `cycle` has its first member of `role`; the receipt holds the launch prompt the agent saw. */
   const prompt = async (id: string, cycle: number, role: string): Promise<string> => {
     const teamId = (await waitFor(() => goal(id), value => value.cycles.some(item => item.cycle === cycle), 120000)).cycles.find(item => item.cycle === cycle)!.teamId;
     const found = await waitFor(async () => readdirSync(receipts).filter(name => name.endsWith(".json")).map(name => JSON.parse(readFileSync(join(receipts, name), "utf8")))
@@ -117,9 +112,6 @@ export const outcomeOf = (goal: Pick<ProductGoal, "revision">, extra: Record<str
   requestId: randomUUID(), revision: goal.revision, result: "not-achieved", summary: "Rank the founders by their sources", evidence: "The owner read the shortlist", ...extra,
 });
 
-/* ------------------------------------------------ a team service stub, for time and verdicts the test sets */
-
-/** A team service stub: records each launch after the real request and context schemas accept it, and holds the views the test settles. */
 export function stubTeams() {
   const views = new Map<string, TeamView>();
   const launches: { request: CreateTeam; context: TeamGoalContext }[] = [];
@@ -134,12 +126,9 @@ export function stubTeams() {
       return structuredClone(found);
     },
     goalIdOf: (id: string) => views.get(id)?.goal?.id,
-    /** The run's revision and assessment, as the team service holds them; undefined once the run is forgotten. */
     assessmentOf: (id: string) => { const view = views.get(id); return view === undefined ? undefined : { revision: view.revision, assessment: view.assessment }; },
-    /** The detail of each run's newest verdict, which a test sets with `detail`. */
     verdicts: { detail: (id: string) => details.get(id) as VerdictDetail | undefined },
     detail(id: string, value: Pick<VerdictDetail, "verdictId" | "revision" | "head" | "criteria">) { details.set(id, value); },
-    /** The run's record is gone. */
     forget(id: string) { views.delete(id); details.delete(id); },
     hasDeliveryAttempt: () => false,
     async createForGoal(request: CreateTeam, context: TeamGoalContext) {
@@ -154,7 +143,6 @@ export function stubTeams() {
         goal: structuredClone(context), members: [], tasks: [], usage: usage(), branch: "main", baseCommit: "a".repeat(40) } as unknown as TeamView);
       return service.get(request.requestId);
     },
-    /** Settles a run with `members` stopped attempts. */
     settle(id: string, status: string, extra: Partial<TeamView> = {}, members = 0) {
       const view = views.get(id)!;
       Object.assign(view, { status, members: Array.from({ length: members }, () => ({ memberId: randomUUID(), role: "implementer", revision: 1, status: "stopped" })) }, extra);
@@ -167,7 +155,6 @@ export function stubTeams() {
   return service;
 }
 
-/** A run's provisional assessment: `met` and `notMet` count its two criteria. */
 export function assessmentOf(met: number, notMet: number): RunAssessment {
   return { verdictId: randomUUID(), revision: 1, head: "a".repeat(40), kind: "reviewed", result: notMet === 0 ? "met" : "not-met",
     counts: { met, notMet, inconclusive: 0, pendingOwner: 0 },
@@ -176,7 +163,6 @@ export function assessmentOf(met: number, notMet: number): RunAssessment {
 
 export const BRIEF = { title: "Feature", expectedOutcome: "Outcome" } as TeamView["brief"];
 
-/** The service on stub teams with mocked dates: a project whose evaluator and register are on. `scanned` makes it a GitHub-source project. */
 export function stubFixture(t: TestContext, mode: Mode = "autonomous", scanned = false) {
   t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T00:00:00.000Z") });
   const f = schedulerFixture();
@@ -191,7 +177,6 @@ export function stubFixture(t: TestContext, mode: Mode = "autonomous", scanned =
   return { teams, goals, advance, config: f.config };
 }
 
-/** Polls on real timers; `Date` is mocked in the stub tests, so the helper's Date-based timeout would never pass. */
 export async function until<T>(read: () => T, accept: (value: T) => boolean, what: string, ms = 8000): Promise<T> {
   const end = performance.now() + ms;
   for (;;) {

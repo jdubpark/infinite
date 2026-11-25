@@ -18,7 +18,6 @@ test("GET /api/fuse returns the view", { timeout: 60000 }, async () => {
   } finally { await host.stop(); }
 });
 
-// The in-process host exposes the fuse, so the test can open a trip through the same admission path the teams use.
 test("closing a fuse is owner only", { timeout: 60000 }, async () => {
   const host = await inProcessHost();
   try {

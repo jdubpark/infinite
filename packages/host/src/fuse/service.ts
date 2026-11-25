@@ -36,7 +36,6 @@ export type FuseScopeView = {
 
 export type FuseView = {
   authoritative: boolean;
-  /** The time of the last baseline write that failed. Absent after a write that succeeded. */
   writeFailedAt?: string;
   host: FuseScopeView;
   projects: (FuseScopeView & { projectId: string })[];
@@ -47,13 +46,11 @@ export type FuseInterrupt = {
   scope: FuseScope;
   projectId?: string;
   label: string;
-  /** `write-failed` is not a trip: the host cannot record launches, so every admission is refused. */
   cause: FuseCause | "write-failed";
   ownerClose: boolean;
   openedAt: string;
 };
 
-/** The id of the interrupt for a failing baseline write, which has no stored trip. */
 const WRITE_FAILED_ID = "write-failed";
 
 const MODULE = "fuse";
@@ -126,32 +123,21 @@ function limitsOf(fuse: FuseConfig | undefined): FuseLimits {
   };
 }
 
-/** A project name as one short line: the label goes into a push body, and the configuration sets no rule for it. */
 function plainLabel(name: string): string {
-  // Every character of the Unicode "other" classes goes (control, format, surrogate, private use, unassigned),
-  // with the line and paragraph separators and each direction control: none may shape how a notification reads.
-  // A class is used, not a list, so a character such as U+061C cannot be left out.
   const line = name.replace(/[\p{C}\p{Zl}\p{Zp}\p{Bidi_Control}]+/gu, " ").replace(/\s+/g, " ").trim();
   return [...line].slice(0, 80).join("") || "a project";
 }
 
-/** The subject a push is about: one per scope. A second trip for the same subject waits for the next UTC day. */
 function subjectOf(trip: FuseTripRecord): string {
   return trip.scope === "host" ? "host" : `project:${trip.projectId ?? ""}`;
 }
 
-/**
- * The launch-rate fuse. Memory is the working copy. The sealed file is the authority: each change is written there
- * first, then memory, then the evidence store, whose mirror may fail. Without an authoritative baseline the fuse holds
- * one unmeasurable host trip in memory and writes nothing until `tick` loads one.
- */
 export class FuseService implements FuseGate {
   private readonly key: Buffer;
   private readonly store: EvidenceStore;
   private readonly now: () => number;
   private readonly file: string;
   private readonly limits: FuseLimits;
-  /** Read when asked: the host adds mirrored projects while it runs. */
   private readonly config: Config;
   private readonly sessionExistsOf: (sessionId: string) => boolean;
   private launches = new Map<string, FuseLaunchRecord>();
@@ -160,13 +146,8 @@ export class FuseService implements FuseGate {
   private authoritative = false;
   private unmeasurableId: string | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
-  /** The time of the last failed baseline write, and the UTC day its interrupt was announced. */
   private writeFailedAt: number | undefined;
   private writeFailureAnnouncedDay: string | undefined;
-  /**
-   * What each admission of this process changed: the launch's record before it, and the trips it opened. Kept in
-   * memory only, so that a launch the owner's halt refuses before its session exists can be given back exactly.
-   */
   private readonly admissions = new Map<string, { prior?: FuseLaunchRecord; opened: string[] }>();
 
   constructor(options: FuseServiceOptions) {
@@ -188,7 +169,6 @@ export class FuseService implements FuseGate {
     if (!this.load()) this.holdUnmeasurable();
   }
 
-  /** Reads memory only. An exempt role is never judged. */
   check(input: { projectId: string; role?: LaunchRole }): FuseCheck {
     if (input.role !== undefined && EXEMPT_ROLES.has(input.role)) return { state: "closed", exempt: true };
     return fuseCheck([...this.launches.values()], [...this.trips.values()], input.projectId, this.limits, this.now());
@@ -206,19 +186,19 @@ export class FuseService implements FuseGate {
     const check = fuseCheck(launches, trips, projectId, this.limits, now);
     if (check.state === "open") {
       if (!this.authoritative || check.tripId !== undefined) return { ok: false, launchId, open: check };
-      // A rate trip is judged but not yet recorded: record it now, so the owner can see and close it.
       const seq = this.seq + 1;
-      const trip: FuseTripRecord = {
+      const tripBase = {
         tripId: randomUUID(),
-        scope: check.scope,
-        ...(check.projectId === undefined ? {} : { projectId: check.projectId }),
-        cause: "launch-rate",
-        window: "hour",
+        cause: "launch-rate" as const,
+        window: "hour" as const,
         openedAt: now,
         ownerClose: check.ownerClose,
         launches: rollingCount(launches, trips, check.scope, check.projectId, now),
         seq,
       };
+      const trip: FuseTripRecord = check.scope === "host"
+        ? { ...tripBase, scope: "host" }
+        : { ...tripBase, scope: "project", projectId: check.projectId! };
       if (!this.persist(seq, [], [trip])) return { ok: false, launchId, failure: "write-failed" };
       return { ok: false, launchId, open: { ...check, tripId: trip.tripId } };
     }
@@ -232,8 +212,6 @@ export class FuseService implements FuseGate {
       profileId: launch.profileId,
       ...(launch.assignment === undefined ? {} : { assignment: launch.assignment }),
       state: "admitted",
-      // A released launch keeps its time while that time is inside the hour, so a retry is not counted twice.
-      // Outside the hour it would not be counted at all, so it is a launch of this hour.
       admittedAt: prior?.state === "released" && prior.admittedAt > now - HOUR_MS ? prior.admittedAt : now,
       seq,
     };
@@ -243,17 +221,10 @@ export class FuseService implements FuseGate {
     const known = new Set(trips.map(trip => trip.tripId));
     this.admissions.delete(launchId);
     this.admissions.set(launchId, { ...(prior === undefined ? {} : { prior }), opened: changed.filter(trip => !known.has(trip.tripId)).map(trip => trip.tripId) });
-    // Every admission ends in started, released, or refunded, which forget it; the bound covers a caller that never does.
     if (this.admissions.size > 1000) this.admissions.delete(this.admissions.keys().next().value!);
     return { ok: true, launchId };
   }
 
-  /**
-   * Gives back an admission that the owner's halt refused before its session existed. The launch's record returns to
-   * what it was before the admission, so the count is as if the launch had never been admitted, and a trip that only
-   * this admission opened, still open and not yet announced, is removed. Only an admission that this process made and
-   * that is still admitted can be given back: after a restart the launch is settled as released and keeps its count.
-   */
   refund(launchId: string): void {
     const admission = this.admissions.get(launchId);
     this.admissions.delete(launchId);
@@ -274,7 +245,6 @@ export class FuseService implements FuseGate {
     }
     this.writeFailedAt = undefined;
     this.adopt(next);
-    // The file's higher seq already leaves the old rows out of a merge; the store drops them too.
     this.store.tryWrite(tx => {
       if (admission.prior === undefined) tx.run("DELETE FROM fuse_launches WHERE launch_id = ?", launchId);
       for (const tripId of removed) tx.run("DELETE FROM fuse_trips WHERE trip_id = ?", tripId);
@@ -296,33 +266,29 @@ export class FuseService implements FuseGate {
     const projectId = input.scope === "project" ? input.projectId : undefined;
     const now = this.now();
     const seq = this.seq + 1;
-    const closing = [...this.trips.values()]
+    const closing: FuseTripRecord[] = [...this.trips.values()]
       .filter(trip => trip.closedAt === undefined && trip.cause === "launch-rate" && trip.scope === scope && (scope === "host" || trip.projectId === projectId))
       .map((trip): FuseTripRecord => ({ ...trip, closedAt: now, closedBy: "owner", seq }));
     if (closing.length === 0) {
-      // A scope can be open with no recorded trip: every caller stops at the check, so a trip that the count alone
-      // opens (after a lowered limit, or after a clock that stepped back over an earlier close) is never written.
-      // The owner can still close it: the trip is recorded as opened and closed in one write.
       const launches = [...this.launches.values()], trips = [...this.trips.values()];
-      const limit = scope === "host" ? this.limits.host : projectLimit(this.limits, projectId!);
+      const limit = input.scope === "host" ? this.limits.host : projectLimit(this.limits, input.projectId);
       const state = scopeState(launches, trips, scope, projectId, limit, now);
       if (state.state !== "open" || state.cause !== "launch-rate") return "not-open";
-      closing.push({
+      const closedBase = {
         tripId: randomUUID(),
-        scope,
-        ...(projectId === undefined ? {} : { projectId }),
-        cause: "launch-rate",
-        window: "hour",
+        cause: "launch-rate" as const,
+        window: "hour" as const,
         openedAt: now,
         closedAt: now,
-        closedBy: "owner",
+        closedBy: "owner" as const,
         ownerClose: state.ownerClose,
         launches: rollingCount(launches, trips, scope, projectId, now),
         seq,
-      });
+      };
+      closing.push(input.scope === "host"
+        ? { ...closedBase, scope: "host" }
+        : { ...closedBase, scope: "project", projectId: input.projectId });
     }
-    // A launch stamped after now still counts, and the close time is now. After a clock that stepped back, every
-    // counted launch would lie after the close, and the close would clear nothing. So those launches move to now.
     const moved = [...this.launches.values()]
       .filter(launch => launch.admittedAt > now && (scope === "host" || launch.projectId === projectId))
       .map((launch): FuseLaunchRecord => ({ ...launch, admittedAt: now, seq }));
@@ -344,11 +310,6 @@ export class FuseService implements FuseGate {
     };
   }
 
-  /**
-   * What the owner has not been told yet. A trip that closes by itself is held back when its subject already had a
-   * trip announced today. A trip that only the owner or a readable baseline can end is always offered, because
-   * every launch of its scope waits on it. A failing baseline write is offered once per UTC day while it lasts.
-   */
   interrupts(): FuseInterrupt[] {
     const now = this.now();
     const today = utcDay(now);
@@ -360,8 +321,8 @@ export class FuseService implements FuseGate {
       .map(trip => ({
         tripId: trip.tripId,
         scope: trip.scope,
-        ...(trip.projectId === undefined ? {} : { projectId: trip.projectId }),
-        label: trip.scope === "host" ? "the host" : plainLabel(this.config.projects.find(project => project.id === trip.projectId)?.name ?? trip.projectId ?? ""),
+        ...(trip.scope === "project" ? { projectId: trip.projectId } : {}),
+        label: trip.scope === "host" ? "the host" : plainLabel(this.config.projects.find(project => project.id === trip.projectId)?.name ?? trip.projectId),
         cause: trip.cause,
         ownerClose: trip.ownerClose,
         openedAt: new Date(trip.openedAt).toISOString(),
@@ -375,27 +336,20 @@ export class FuseService implements FuseGate {
   markAnnounced(tripIds: readonly string[]): void {
     const now = this.now();
     const ids = new Set(tripIds);
-    // The write failure has no stored trip, so its announcement lives in memory, by UTC day.
     if (ids.delete(WRITE_FAILED_ID)) this.writeFailureAnnouncedDay = utcDay(now);
     const targets = [...this.trips.values()].filter(trip => ids.has(trip.tripId) && trip.announcedAt === undefined);
     if (targets.length === 0) return;
     if (!this.authoritative) {
-      // The unmeasurable trip is not in the file, so its announcement is kept in memory only.
       for (const trip of targets) this.trips.set(trip.tripId, { ...trip, announcedAt: now });
       return;
     }
     const seq = this.seq + 1;
     if (this.persist(seq, [], targets.map((trip): FuseTripRecord => ({ ...trip, announcedAt: now, seq })))) return;
-    // The announcement could not be written. It is kept in memory, or the trip would be sent again on every
-    // notifier tick for as long as writes fail. The next write that succeeds stores it.
     for (const trip of targets) this.trips.set(trip.tripId, { ...trip, announcedAt: now });
   }
 
-  /** Retries the load while no baseline is authoritative, and prunes the store. True when authoritative. */
   tick(): boolean {
     if (!this.authoritative) this.load();
-    // After a failed write the report would otherwise stay until the next launch. A write of the baseline as it
-    // is clears it as soon as the host can write again.
     else if (this.writeFailedAt !== undefined) this.persist(this.seq + 1, [], []);
     this.prune();
     return this.authoritative;
@@ -421,11 +375,6 @@ export class FuseService implements FuseGate {
     this.persist(seq, [{ ...launch, state: to, seq }], []);
   }
 
-  /**
-   * One accepted admission. First, each open rate trip without ownerClose of a scope that the check judged closed
-   * before the launch counts is closed. Then the launch counts. Then a new trip is recorded for each scope whose
-   * count now reached its limit. Returns the trip records that changed.
-   */
   private settle(before: FuseLaunchRecord[], counted: FuseLaunchRecord[], trips: FuseTripRecord[], projectId: string, now: number, seq: number): FuseTripRecord[] {
     const scopes: [FuseScope, string | undefined, number][] = [
       ["host", undefined, this.limits.host],
@@ -447,24 +396,24 @@ export class FuseService implements FuseGate {
     for (const [scope, id, limit] of scopes) {
       const state = scopeState(counted, working, scope, id, limit, now);
       if (state.state !== "open" || state.tripId !== undefined) continue;
-      const trip: FuseTripRecord = {
+      const tripBase = {
         tripId: randomUUID(),
-        scope,
-        ...(id === undefined ? {} : { projectId: id }),
-        cause: "launch-rate",
-        window: "hour",
+        cause: "launch-rate" as const,
+        window: "hour" as const,
         openedAt: now,
         ownerClose: state.ownerClose,
         launches: rollingCount(counted, working, scope, id, now),
         seq,
       };
+      const trip: FuseTripRecord = scope === "host"
+        ? { ...tripBase, scope: "host" }
+        : { ...tripBase, scope: "project", projectId: id! };
       working.push(trip);
       changed.set(trip.tripId, trip);
     }
     return [...changed.values()];
   }
 
-  /** Writes the file first, then memory, then mirrors the changed rows (a failed mirror is tolerated). */
   private persist(seq: number, launches: FuseLaunchRecord[], trips: FuseTripRecord[]): boolean {
     const launchMap = new Map(this.launches);
     for (const launch of launches) launchMap.set(launch.launchId, launch);
@@ -487,10 +436,6 @@ export class FuseService implements FuseGate {
     this.trips = new Map(baseline.trips.map(trip => [trip.tripId, trip]));
   }
 
-  /**
-   * Reads the file and the store, merges them, and settles admitted launches: a launch whose session exists is
-   * started, and any other is released. Returns false when no baseline is authoritative; then nothing changes.
-   */
   private load(): boolean {
     const now = this.now();
     const file = readBaseline(this.file, this.key);
@@ -516,8 +461,6 @@ export class FuseService implements FuseGate {
     this.authoritative = true;
     this.unmeasurableId = undefined;
     this.adopt(next);
-    // With a readable file, every trip of the merge goes to the store again. A row that an earlier failed mirror
-    // left behind the file is brought up to date at this restart.
     this.mirror(launches.filter(launch => settled.has(launch.launchId)), file === undefined ? closedHeld : next.trips);
     return true;
   }
@@ -531,7 +474,6 @@ export class FuseService implements FuseGate {
     this.unmeasurableId = trip.tripId;
   }
 
-  /** Reads the committed rows, or undefined when the store or its module is unavailable or unreadable. */
   private readStore(): FuseBaseline | undefined {
     const status = this.store.status();
     if (status.state !== "ready" || status.modules[MODULE] !== "ready") return undefined;
@@ -553,24 +495,29 @@ export class FuseService implements FuseGate {
             seq: row.seq,
           };
         });
-        const trips = db.all<{ trip_id: string; scope: FuseScope; cause: FuseCause; fuse_window: FuseWindow | null; opened_at: number; closed_at: number | null; closed_by: FuseTripRecord["closedBy"] | null; owner_close: number; announced_at: number | null; seq: number; sealed: string }>(
+        const trips = db.all<{ trip_id: string; scope: FuseScope; cause: FuseCause; fuse_window: FuseWindow | null; opened_at: number; closed_at: number | null; closed_by: "rate" | "owner" | "baseline" | null; owner_close: number; announced_at: number | null; seq: number; sealed: string }>(
           "SELECT trip_id, scope, cause, fuse_window, opened_at, closed_at, closed_by, owner_close, announced_at, seq, sealed FROM fuse_trips ORDER BY trip_id",
         ).map((row): FuseTripRecord => {
           const payload = db.open<TripPayload>("fuse_trips", row.trip_id, row.sealed);
-          return {
+          const base = {
             tripId: row.trip_id,
-            scope: row.scope,
-            ...(payload.projectId === undefined ? {} : { projectId: payload.projectId }),
             cause: row.cause,
             ...(row.fuse_window === null ? {} : { window: row.fuse_window }),
             openedAt: row.opened_at,
-            ...(row.closed_at === null ? {} : { closedAt: row.closed_at }),
-            ...(row.closed_by === null ? {} : { closedBy: row.closed_by }),
             ownerClose: row.owner_close === 1,
             ...(row.announced_at === null ? {} : { announcedAt: row.announced_at }),
             ...(payload.launches === undefined ? {} : { launches: payload.launches }),
             seq: row.seq,
           };
+          const scoped = row.scope === "host"
+            ? { ...base, scope: "host" as const }
+            : (() => {
+              if (payload.projectId === undefined) throw new Error("Missing projectId for project fuse trip.");
+              return { ...base, scope: "project" as const, projectId: payload.projectId };
+            })();
+          return row.closed_at !== null && row.closed_by !== null
+            ? { ...scoped, closedAt: row.closed_at, closedBy: row.closed_by }
+            : scoped;
         });
         const seq = Math.max(0, ...launches.map(launch => launch.seq), ...trips.map(trip => trip.seq));
         return { version: 1, seq, launches, trips };
@@ -580,7 +527,6 @@ export class FuseService implements FuseGate {
     }
   }
 
-  /** Mirrors changed rows. The file is the authority, so a failed mirror is tolerated. */
   private mirror(launches: FuseLaunchRecord[], trips: FuseTripRecord[]): void {
     if (launches.length === 0 && trips.length === 0) return;
     this.store.tryWrite(tx => {
@@ -629,9 +575,6 @@ export class FuseService implements FuseGate {
     this.store.tryWrite(tx => {
       tx.run("DELETE FROM fuse_launches WHERE admitted_at < ?", now - LAUNCH_RETENTION_MS);
       tx.run("DELETE FROM fuse_trips WHERE closed_at IS NOT NULL AND closed_at < ?", now - TRIP_RETENTION_MS);
-      // A failed mirror can leave a row open that the baseline has closed and dropped. It goes when it is old
-      // enough, unless the trip is still open in memory. Without an authoritative baseline, memory says nothing
-      // about the store's rows, so they stay.
       if (!this.authoritative) return;
       const open = new Set([...this.trips.values()].filter(trip => trip.closedAt === undefined).map(trip => trip.tripId));
       for (const row of tx.all<{ trip_id: string }>("SELECT trip_id FROM fuse_trips WHERE closed_at IS NULL AND opened_at < ?", now - TRIP_RETENTION_MS)) {

@@ -1,6 +1,5 @@
 import { z } from "zod";
 
-/** Bounds of the checker's report. The host checks meaning item by item (objective-intent.ts); this file checks shape and size. */
 export const INTENT_REPORT_LIMITS = {
   items: 16, scouts: 3, criteria: 8, outOfScope: 24, summaryChars: 4_000,
   dimensionBytes: 200, whyBytes: 500, statementBytes: 500, refutedByBytes: 500, questionBytes: 400,
@@ -15,9 +14,7 @@ export type IntentItem = {
 };
 
 const L = INTENT_REPORT_LIMITS;
-/** A non-empty string of at most `max` UTF-8 bytes. */
 export const bytes = (max: number) => z.string().min(1).refine(value => Buffer.byteLength(value, "utf8") <= max, { message: `At most ${max} bytes` });
-/** Any JSON value whose serialization is at most `max` bytes. `undefined` is refused, so the report tool's schema still builds. */
 export const boundedJson = (max: number) => z.unknown().refine(value => value !== undefined && Buffer.byteLength(JSON.stringify(value) ?? "", "utf8") <= max, { message: `JSON of at most ${max} bytes` });
 
 const questionSchema = z.object({
@@ -42,7 +39,6 @@ export const intentItemSchema: z.ZodType<IntentItem> = z.object({
     context.addIssue({ code: "custom", path: ["scout"], message: "A scout item names its scout, and only a scout item does" });
 }) as z.ZodType<IntentItem>;
 
-/** No type annotation, so z.discriminatedUnion takes it. */
 export const intentCheckReportSchema = z.object({
   kind: z.literal("intent-check"),
   summary: z.string().min(1).max(L.summaryChars),

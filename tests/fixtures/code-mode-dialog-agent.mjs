@@ -4,7 +4,6 @@ const labels = ["No, start without it", "Yes, turn on Code Mode"];
 const answerFile = process.env.CODE_MODE_DIALOG_ANSWER_FILE;
 let highlighted = process.env.CODE_MODE_DIALOG_INITIAL === "Yes" ? 1 : 0;
 let open = true;
-// With CODE_MODE_DIALOG_LIVE=yes-no the live prompt is a yes-no line under the old menu, and the keys received are recorded.
 const yesNo = process.env.CODE_MODE_DIALOG_LIVE === "yes-no";
 let received = "";
 

@@ -1,5 +1,3 @@
-// The web client's real conversation panel, polling a stand-in host. tests/web-polling.test.ts counts its requests through `window.polling`
-// and, while `hold` is set, answers each request only when the test resolves it; while `fail` is set, each request fails.
 import { createRoot } from "react-dom/client";
 import { ApiContext, type Api } from "../../apps/web/src/api";
 import type { MessagesPage } from "../../apps/web/src/api";

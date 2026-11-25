@@ -5,7 +5,6 @@ type Options = Record<string, string | boolean>;
 
 const USAGE = "Usage: infinite duels calibrate --judge PROFILE_ID [--pairs N] [--project ID[,ID...]] [--judge-minutes N] --request-id UUID [--json] | infinite duels judges [--json] | infinite duels cancel CALIBRATION [--json]. Without --pairs the host picks 36.";
 const CALIBRATE_USAGE = USAGE.split(" | ")[0]!;
-/** These mirror `calibrationRequestSchema` in `judge-calibration-jobs.ts`: pairs 30 to 60, judge minutes 2 to 30. The host checks them again. */
 const PAIRS_RANGE = [30, 60] as const;
 const MINUTES_RANGE = [2, 30] as const;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -21,13 +20,10 @@ const REFUSALS = new Map([
   ["unknown-calibration", "No calibration has this ID."],
 ]);
 const clean = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
-/** A number the host did not measure prints as unknown, never as zero. */
 const fixed = (value: number | null | undefined) => typeof value === "number" ? value.toFixed(3) : "unknown";
 const whole = (value: number | null | undefined) => typeof value === "number" ? String(value) : "unknown";
-/** The host sums only the costs it could read, so the spend is a floor, never the full bill. */
 const spend = (cost: CalibrationView["cost"]) => `known spend ${whole(cost.tokens)} tokens, ${typeof cost.spentUsd === "number" ? `$${cost.spentUsd.toFixed(2)}` : "USD unknown"}`;
 
-/** One calibration as three lines. A calibration measures a judge against known answers; the lines claim nothing more. */
 function viewLines(view: CalibrationView): string[] {
   const running = view.status === "running";
   const reason = view.reason ? ` · ${clean(view.reason)}` : "";
@@ -44,7 +40,6 @@ export function judgeLines(views: CalibrationView[]): string[] {
   return views.length === 0 ? [note, "no calibrations"] : [note, ...views.flatMap(viewLines)];
 }
 
-/** Maps the host's fixed refusals to sentences. An absent route, an older host, answers 404 without a known code. */
 async function read<T>(call: () => Promise<T>): Promise<T> {
   try {
     return await call();
@@ -58,7 +53,6 @@ async function read<T>(call: () => Promise<T>): Promise<T> {
   }
 }
 
-/** An integer option in range, or undefined when absent. A bad value is a usage error, before any call. */
 function integer(options: Options, name: string, [low, high]: readonly [number, number]): number | undefined {
   const raw = options[name];
   if (raw === undefined) return undefined;
@@ -81,7 +75,6 @@ function calibrationBody(options: Options): Record<string, unknown> {
   };
 }
 
-/** The paths carry no `/api` prefix: the client adds it to every path. */
 export async function handleDuelClientCommand(positional: string[], options: Options, api: EvalApi): Promise<boolean> {
   const [verb, first] = positional;
   const json = options["--json"] === true;

@@ -14,17 +14,12 @@ import type { CapturedPayload, EvalReason, EvalState, EvalTaskRow, MinedPayload 
 import { ATTEMPTS_MAX, FOCUSED_SECONDS, focusedArgv, GUARD_SECONDS, nextRound, PREPARE_SECONDS, restoreLists, SETUP_SECONDS, type RoundFacts, type RoundOutcome } from "./eval-validate-rules.js";
 import type { RuntimeProcess } from "./team-retirement.js";
 
-// Validation of one task: the bundle, the clone, the rounds, and the decision. Only three runner reports make a task
-// valid. An exit code can reject, and a missing or invalid report is undecided. The host reads reports only through the
-// grader's `read`, and never opens a file under the grader's root.
-
 export const HALT_POLL_MS = 10_000;
 const BUNDLE_MAX_BYTES = 1_073_741_824;
 const ROUND_OF = { R1: 1, guards: 2, B1: 3, R2: 4, B2: 5, R3: 6 } as const;
 const IDENTITY = ["-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid"];
 const PAUSE_CODES: ReadonlySet<string> = new Set(["anchor-unknown", "grader-failed", "grader-processes-alive", "bundle-missing"]);
 
-/** `tooLarge` is the job whose bundle went over the limit: its later tasks answer `too-large` without a stream. */
 export type BundleState = {
   spawn: () => ChildProcess; job: string | null; sha256: string | null; restreamedFor: string | null; tooLarge: string | null;
 };
@@ -32,7 +27,6 @@ export type ValidateContext = {
   jobId: string; projectId: string; settings: ValidationSettings; grader: Grader; graderRoot: string; uid: number;
   mirror: string; mirrorHead: string; git: Pick<MineGit, "isAncestor">; halted: () => boolean;
   inventory?: () => Promise<RuntimeProcess[]>; now: () => string;
-  /** Owned by the validation pump: the job whose bundle was last streamed, and the digest of the bytes it sent. */
   bundle: BundleState;
 };
 export type TaskValidation =
@@ -40,22 +34,21 @@ export type TaskValidation =
   | { kind: "undecided"; cause: "report-missing" | "report-invalid" | "setup-failed"; attempts: number }
   | { kind: "environment"; cause: "anchor-unknown" | "grader-failed" | "grader-processes-alive" | "halted" | "bundle-missing" | "state-changed" | "storage" };
 
+type ActiveTask = Extract<EvalTaskRow, { state: "candidate" | "valid" }>;
 type EnvCause = Extract<TaskValidation, { kind: "environment" }>["cause"];
 type Verdict = { kind: "valid"; expected: string[] } | { kind: "reject"; reason: EvalReason } | { kind: "undecided"; cause: "report-missing" | "report-invalid" | "setup-failed" };
 type Outcome = { kind: "verdict"; verdict: Verdict } | { kind: "environment"; cause: EnvCause };
 type Material = { baseDelta?: Buffer; reference?: Buffer };
-type Loaded = { kind: "task"; task: EvalTaskRow; material: Material } | { kind: "unreadable"; state: EvalState } | { kind: "absent" };
+type Loaded = { kind: "task"; task: ActiveTask; material: Material } | { kind: "unreadable"; state: EvalState } | { kind: "absent" };
 type Step = "R1" | "guards" | "B1" | "R2" | "B2" | "R3";
 type Exec = { dir: GraderDir; seconds: number; argv: string[]; input?: Buffer; keepStdout?: boolean };
 
-/** Ends a task early with its outcome. Every task still ends with `stopGrader` and `clean`. */
 export class Stop extends Error {
   constructor(readonly outcome: Outcome) {
     super("validation stopped");
   }
 }
 
-// Declared as functions, not constants, so TypeScript narrows after `if (...) fail(...)`.
 function fail(cause: EnvCause): never {
   throw new Stop({ kind: "environment", cause });
 }
@@ -66,10 +59,6 @@ function refuse(reason: EvalReason): never {
   throw new Stop({ kind: "verdict", verdict: { kind: "reject", reason } });
 }
 
-/**
- * Streams E3 into the grader once per job: stop, remove, then the bundle into `in/base.bundle`, counting its bytes. `ready`
- * only when the grader stored every byte within the limit and the bundle exited 0 without an error.
- */
 export async function prepareJob(ctx: ValidateContext, bundle: () => ChildProcess): Promise<"ready" | "too-large" | "failed"> {
   ctx.bundle.job = null;
   ctx.bundle.sha256 = null;
@@ -106,7 +95,6 @@ export async function prepareJob(ctx: ValidateContext, bundle: () => ChildProces
   out.pipe(counter);
   const result = await ctx.grader.receive(ctx.jobId, "base.bundle", counter, BUNDLE_MAX_BYTES);
   if (result !== "stored" || total > BUNDLE_MAX_BYTES) {
-    // A grader that stopped reading leaves output in the pipe, and the bundle never closes until the host drops it.
     out.destroy();
     child.kill();
   }
@@ -121,7 +109,6 @@ export async function prepareJob(ctx: ValidateContext, bundle: () => ChildProces
   return "ready";
 }
 
-/** The bundle's end: its exit code, or `error` when it could not start or failed. Listeners are attached at once. */
 function exitOf(child: ChildProcess): Promise<{ code: number | null; error: boolean }> {
   return new Promise(resolve => {
     child.once("error", () => resolve({ code: null, error: true }));
@@ -129,7 +116,6 @@ function exitOf(child: ChildProcess): Promise<{ code: number | null; error: bool
   });
 }
 
-/** Validates one candidate or valid task. The row is written only by the decision, and only when its state is unchanged. */
 export async function validateTask(store: EvidenceStore, taskId: string, ctx: ValidateContext): Promise<TaskValidation> {
   const loaded = loadTask(store, taskId);
   if (loaded.kind === "absent") return { kind: "environment", cause: "state-changed" };
@@ -157,7 +143,6 @@ function environment(cause: EnvCause): TaskValidation {
 }
 
 const paused = new Set<string>();
-/** One line per code per process. The code is an enumeration; no name, message, commit id, or case is logged. */
 function pause(code: string): void {
   if (paused.has(code)) return;
   paused.add(code);
@@ -170,7 +155,7 @@ export function loadTask(store: EvidenceStore, taskId: string): Loaded {
     if (!head || (head.state !== "candidate" && head.state !== "valid")) return { kind: "absent" };
     try {
       const task = readEvalTask(db, taskId);
-      if (!task) return { kind: "absent" };
+      if (!task || (task.state !== "candidate" && task.state !== "valid")) return { kind: "absent" };
       return { kind: "task", task, material: task.origin === "captured" ? readMaterial(db, taskId) : {} };
     } catch {
       return { kind: "unreadable", state: head.state as EvalState };
@@ -178,11 +163,8 @@ export function loadTask(store: EvidenceStore, taskId: string): Loaded {
   });
 }
 
-/** Runs one task's reads and rounds, returning its verdict. Throws `Stop` for every early end. */
-async function evaluate(task: EvalTaskRow, material: Material, ctx: ValidateContext): Promise<Verdict> {
-  const payload = task.payload as CapturedPayload | MinedPayload;
-  const mined = task.origin === "mined";
-  const ids = mined ? [payload.anchorCommit, (payload as MinedPayload).commit] : [payload.anchorCommit];
+async function evaluate(task: ActiveTask, material: Material, ctx: ValidateContext): Promise<Verdict> {
+  const ids = task.origin === "mined" ? [task.payload.anchorCommit, task.payload.commit] : [task.payload.anchorCommit];
   if (!ids.every(id => COMMIT_ID.test(id))) return { kind: "reject", reason: "unreadable" };
   for (const id of ids) {
     const answer = await ctx.git.isAncestor(ctx.mirror, id, ctx.mirrorHead);
@@ -192,20 +174,19 @@ async function evaluate(task: EvalTaskRow, material: Material, ctx: ValidateCont
 
   await ensureBundle(ctx);
   await cloneTask(ctx, ids);
-  if (mined) await tagMined(ctx, payload.anchorCommit, (payload as MinedPayload).commit);
-  else await applyCaptured(ctx, payload as CapturedPayload, material);
+  if (task.origin === "mined") await tagMined(ctx, task.payload.anchorCommit, task.payload.commit);
+  else await applyCaptured(ctx, task.payload, material);
 
   const lists = restoreLists({
     present: await changedNames(ctx),
-    hiddenFiles: payload.hiddenFiles ?? [],
-    files: payload.files ?? [],
+    hiddenFiles: task.payload.hiddenFiles ?? [],
+    files: task.payload.files ?? [],
     gradingPaths: ctx.settings.gradingPaths,
   });
   if ("reject" in lists) return { kind: "reject", reason: lists.reject };
   return rounds(ctx, lists.focus, lists.restore);
 }
 
-/** The digest check. A mismatch, a missing digest, or a job not yet streamed streams the bundle once more; a second mismatch is bundle-missing. */
 export async function ensureBundle(ctx: ValidateContext): Promise<void> {
   if (ctx.bundle.job !== ctx.jobId && (await prepareJob(ctx, ctx.bundle.spawn)) !== "ready") fail("bundle-missing");
   if (await bundleMatches(ctx)) return;
@@ -218,7 +199,6 @@ async function bundleMatches(ctx: ValidateContext): Promise<boolean> {
   return digest.state === "read" && ctx.bundle.sha256 !== null && digest.sha256 === ctx.bundle.sha256;
 }
 
-/** Stop and clean, then the clone of the bundle, then the commits it must hold. A commit missing from the bundle streams it once per job. */
 export async function cloneTask(ctx: ValidateContext, ids: string[]): Promise<void> {
   const bundlePath = posix.join(ctx.graderRoot, "jobs", ctx.jobId, "in", "base.bundle");
   for (;;) {
@@ -238,7 +218,6 @@ export async function tagMined(ctx: ValidateContext, parent: string, commit: str
   expectZero(await exec(ctx, { dir: "task", seconds: PREPARE_SECONDS, argv: ["git", "update-ref", "refs/tags/eval-reference", commit] }));
 }
 
-/** A captured task: the anchor, then base-delta (when stored), tagged eval-base; then the reference, tagged eval-reference. */
 export async function applyCaptured(ctx: ValidateContext, payload: CapturedPayload, material: Material): Promise<void> {
   if (payload.baseDelta === "missing" || (payload.baseDelta === "stored" && !material.baseDelta)) refuse("patch-missing");
   if (payload.reference !== "stored" || !material.reference) refuse("patch-missing");
@@ -264,7 +243,6 @@ export async function applyPatch(ctx: ValidateContext, name: Exclude<GraderInput
   }));
 }
 
-/** The names that differ between the two tags. Truncated output is too wide for a reference. */
 export async function changedNames(ctx: ValidateContext, from = "eval-base", to = "eval-reference"): Promise<string[]> {
   const run = await exec(ctx, {
     dir: "task", seconds: PREPARE_SECONDS, keepStdout: true,
@@ -276,7 +254,6 @@ export async function changedNames(ctx: ValidateContext, from = "eval-base", to 
   return (run.stdout ?? Buffer.alloc(0)).toString("utf8").split("\0").filter(name => name.length > 0);
 }
 
-/** The rounds that `nextRound` asks for, in its order, each in a fresh clone. */
 async function rounds(ctx: ValidateContext, focus: string[], restore: string[]): Promise<Verdict> {
   const facts: RoundFacts = {};
   for (;;) {
@@ -324,7 +301,6 @@ export async function guardChecks(ctx: ValidateContext, dir: GraderDir): Promise
   return "passed";
 }
 
-/** The focused test's exit code is never read. Its report is read through the grader, and only the report decides. */
 export async function focused(ctx: ValidateContext, dir: GraderDir, focus: string[], n: number): Promise<RoundOutcome> {
   const format = ctx.settings.reportFormat;
   const reportName = `reports/round-${n}.${format === "junit" ? "xml" : "tap"}`;
@@ -342,7 +318,6 @@ export async function focused(ctx: ValidateContext, dir: GraderDir, focus: strin
   return fail("grader-failed");
 }
 
-/** Halts a command the owner stopped. `stop` reaches the pending command; the host then waits for it to end. */
 export async function call<T>(ctx: ValidateContext, start: () => Promise<T>): Promise<T> {
   if (ctx.halted()) throw new Stop({ kind: "environment", cause: "halted" });
   const pending = start();
@@ -372,7 +347,6 @@ export function expectZero(run: GraderRun): void {
   if (run.timedOut || run.exitCode !== 0) undecided("setup-failed");
 }
 
-/** Stops every grader process, then removes the job's work. Returns the cause when either fails. */
 export async function finish(ctx: ValidateContext): Promise<EnvCause | undefined> {
   const stopped = await stopGrader(ctx.grader, ctx.uid, ctx.inventory);
   if (stopped === "alive") return "grader-processes-alive";
@@ -391,7 +365,6 @@ async function settle(ctx: ValidateContext): Promise<void> {
   if (stopped === "failed") fail("grader-failed");
 }
 
-/** The decision: one write that changes nothing when the row's state has moved since it was read. */
 function decide(store: EvidenceStore, ctx: ValidateContext, taskId: string, state: EvalState, verdict: Verdict): TaskValidation {
   return store.write((tx: EvidenceTx): TaskValidation => {
     const row = tx.get<{ state: string; attempts: number; payload: string }>(
@@ -401,7 +374,6 @@ function decide(store: EvidenceStore, ctx: ValidateContext, taskId: string, stat
     if (row === undefined || row.state !== state) return { kind: "environment", cause: "state-changed" };
     const at = ctx.now();
     if (verdict.kind === "valid") {
-      // The payload is read here, not at the task's start, so an approval written meanwhile keeps its files.
       const current = tx.open<CapturedPayload | MinedPayload>("eval_tasks", taskId, row.payload);
       tx.run(
         "UPDATE eval_tasks SET state='valid', reason=NULL, validated_at=?, attempts=0, payload=? WHERE task_id=?",
@@ -424,7 +396,6 @@ function decide(store: EvidenceStore, ctx: ValidateContext, taskId: string, stat
   });
 }
 
-/** A valid task that a reject takes is retired; any other task is rejected. Both drop its material and paths. */
 function drop(tx: EvidenceTx, taskId: string, state: string, reason: EvalReason, at: string, projectId: string): TaskValidation {
   if (state === "valid") {
     retireTask(tx, taskId, reason, at, projectId);

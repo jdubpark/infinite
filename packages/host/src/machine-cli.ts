@@ -61,7 +61,6 @@ export async function handleMachineCommand(argv: string[]) {
       relay.server.listen(config.port, "127.0.0.1", () => console.log(`Infinite relay listening on loopback port ${config.port}.${config.proxy ? "" : " Publish it through an HTTPS tunnel or reverse proxy."}`));
       if (relay.proxy && config.proxy) {
         const socket = config.proxy.socket;
-        // Replace only a stale socket left by a previous run, never another file.
         if (existsSync(socket)) { if (!lstatSync(socket).isSocket()) throw new Error("Relay proxy socket path is not a socket"); unlinkSync(socket); }
         relay.proxy.listen(socket, () => { chmodSync(socket, 0o600); console.log(`Clients connect only through the proxy socket ${socket}.`); });
       }
@@ -107,7 +106,6 @@ export async function handleMachineCommand(argv: string[]) {
     if (!positionals[1] || !values["token-file"]) throw new Error("Supply the relay HTTPS origin and --token-file");
     const tokenFile = realpathSync(resolve(values["token-file"]));
     const next = { ...config, remote: { enabled: true, relay: { url: positionals[1], tokenFile } } };
-    // Validate the complete prospective configuration before replacing the current file.
     const check = `${file}.${randomUUID()}.check`;
     try { writePrivate(check, next); readConfig(check); } finally { if (existsSync(check)) unlinkSync(check); }
     writePrivate(file, next);

@@ -1,10 +1,3 @@
-/**
- * Every Codex working-rule text main has generated for member prompts, oldest first. Any of them may be in a live prompt.
- * The list is append-only: append a text whenever the generated rule changes (for example when a member tool's result
- * schema changes), and never edit an entry. Remove an entry only when no prompt that carries it can still be live.
- * A prompt is recognised and retargeted only by exact text, so a missing entry strands its prompts.
- * This file imports nothing from team-prompts.ts.
- */
 export const KNOWN_RULE_TEXTS: readonly string[] = [
   "Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures (arguments -> fields of a successful result's structuredContent): report({report}) -> {requestId, runId, memberId, revision, message}.",
   "Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures (arguments -> fields of a successful result's structuredContent): report({report}) -> {requestId, runId, memberId, revision, message}; entry_list({kinds?, taskId?, path?, since?, limit?}) -> {notice, heads, more, cursor?, unreadable}; entry_get({entryId}) -> {notice, head, body}; entry_post({entry}) -> {entryId, state, message}.",

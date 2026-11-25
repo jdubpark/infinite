@@ -94,7 +94,6 @@ function payloadOf(spec: Spec): RoutingPayload {
   };
 }
 
-/** The plain row of a spec, with its blind indexes computed inside the write. */
 function rowOf(tx: EvidenceTx, spec: Spec): DecisionRow {
   const runId = spec.runId ?? "run-1";
   const taskId = spec.taskId ?? "task-beta-secret";
@@ -149,7 +148,6 @@ test("a decision is stored once per key", () => {
     assert.equal(store.write(tx => insertDecision(tx, rowOf(tx, { explore: true }), payloadOf({}))), false);
     const stored = store.read(db => readDecision(db, first.row.key));
     assert.deepEqual(stored, first.row);
-    // An exploratory decision is stored as 0 or 1 and read back as a boolean.
     assert.equal(stored?.explore, true);
     assert.equal(store.read(db => db.get<{ explore: number }>("SELECT explore FROM routing_decisions")?.explore), 1);
     assert.equal(store.read(db => routingModule().counts?.(db).decisions), 1);
@@ -173,7 +171,6 @@ test("plain columns hold no clear text", () => {
       for (const secret of PLAIN_SECRETS) assert.ok(!String(value).includes(secret), `${name} holds ${secret}`);
     }
     for (const secret of PLAIN_SECRETS) assert.ok(!String(sealed).includes(secret), "the sealed payload holds clear text");
-    // The payload opens to the clear values through the task read.
     const opened = store.read(db => taskDecisions(db, "run-1", "task-beta-secret"));
     assert.equal(opened.rows[0]?.payload?.taskId, "task-beta-secret");
     assert.equal(opened.rows[0]?.payload?.projectId, "proj-alpha-secret");
@@ -250,7 +247,6 @@ test("decision reads seek their indexes", () => {
   try {
     store = open(f);
     for (let ordinal = 1; ordinal <= 3; ordinal++) insertSpec(store, { ordinal, decidedAt: daysBefore(ordinal) });
-    // Record every statement the reads issue, then ask SQLite for its plan.
     const statements: { sql: string; params: unknown[] }[] = [];
     store.read(db => {
       const recording: EvidenceDb = {
@@ -275,9 +271,7 @@ test("decision reads seek their indexes", () => {
       assert.ok(!/TEMP B-TREE/.test(text), `${plan.sql}: ${text}`);
       assert.ok(/routing_by_task|routing_by_project|routing_by_time|routing_by_state|sqlite_autoindex_routing_decisions/.test(text), `${plan.sql}: ${text}`);
     }
-    // Shadow progress counts recorded rows only, so its statements seek routing_by_state.
     assert.ok(plans.some(plan => /routing_by_state/.test(plan.details.join(" | "))), "shadowProgress seeks routing_by_state");
-    // The sweep's inner select seeks the time index.
     const sweep = store.read(db => db.all<{ detail: string }>(
       "EXPLAIN QUERY PLAN SELECT key FROM routing_decisions WHERE decided_at < ? ORDER BY decided_at, key LIMIT ?",
       NOW, 100,
@@ -291,7 +285,6 @@ test("decision reads seek their indexes", () => {
 });
 
 test("the decision key is the sha256 of the plan's formula, revision included", () => {
-  // Golden: sha256 of "run-1|2|tref|start|1", computed with shasum -a 256.
   assert.equal(decisionKey("run-1", 2, "tref", "start", 1), "680d338d30412343f58997852609c82ff8f6e9ea6aa07dccaffe29fa364c6c82");
   assert.notEqual(decisionKey("run-1", 2, "tref", "start", 1), decisionKey("run-1", 1, "tref", "start", 1));
 });
@@ -318,7 +311,6 @@ test("project decisions are start rows of the project since the bound, newest fi
     insert({ taskId: "t6", projectId: "proj-b", decidedAt: daysBefore(1) });
     const keyOf = (taskId: string) => store!.read(db => decisionKey("run-1", 1, db.index("task", taskId), "start", 1));
     const read = store.read(db => projectDecisions(db, "proj-a", since));
-    // The bound is inclusive; escalation rows and other projects are left out.
     assert.deepEqual(read.rows.map(row => row.key), ["t1", "t2", "t3"].map(keyOf));
     assert.equal(read.capped, false);
     for (let index = 0; index < 498; index++) insert({ taskId: `bulk-${index}`, decidedAt: daysBefore(3) });
@@ -355,7 +347,6 @@ test("shadow progress counts start rows up to 50 and names the first time", () =
     store = open(f);
     for (let index = 0; index < 49; index++) insertSpec(store, { projectId: "proj-a", taskId: `t-${index}`, decidedAt: daysBefore(index + 1) });
     insertSpec(store, { projectId: "proj-a", taskId: "esc", point: "escalation", decidedAt: daysBefore(90) });
-    // A pending start row is not a recorded decision: it neither counts nor moves the first time.
     insertSpec(store, { projectId: "proj-a", taskId: "pend", state: "pending", decidedAt: daysBefore(60) });
     assert.deepEqual(store.read(db => shadowProgress(db, "proj-a")), { decisions: 49, capped: false, firstAt: daysBefore(49) });
     for (let index = 0; index < 3; index++) insertSpec(store, { projectId: "proj-a", taskId: `late-${index}` });
@@ -376,7 +367,6 @@ test("the sweep keeps 180 days, removes the oldest first and 100 by default, nev
     insertSpec(store, { ordinal: 2, decidedAt: daysBefore(180.5) });
     insertSpec(store, { ordinal: 3, decidedAt: daysBefore(300) });
     const left = () => store!.read(db => db.all<{ ordinal: number }>("SELECT ordinal FROM routing_decisions ORDER BY ordinal")).map(row => row.ordinal);
-    // Exactly 180 days old is kept; the oldest (300 days) goes first.
     assert.equal(sweepExpiredDecisions(store, NOW, 1), 1);
     assert.deepEqual(left(), [1, 2]);
     assert.equal(sweepExpiredDecisions(store, NOW), 1);
@@ -394,7 +384,6 @@ test("the sweep keeps 180 days, removes the oldest first and 100 by default, nev
   }
 });
 
-/** Step 1's table set, copied here so a version 1 store can be built after the module changed. */
 const V1_STATEMENTS = [
   "CREATE TABLE IF NOT EXISTS routing_decisions (key TEXT PRIMARY KEY, run_id TEXT NOT NULL, revision INTEGER NOT NULL, "
   + "task_key TEXT NOT NULL, point TEXT NOT NULL, ordinal INTEGER NOT NULL, project_ref TEXT NOT NULL, role TEXT NOT NULL, "
@@ -475,7 +464,6 @@ test("the period end is the later of 14 days and the 50th recorded start, stored
     store = open(f);
     assert.equal(store.read(db => computedPeriodEnd(db, "proj-p")), undefined);
     for (let index = 0; index < 49; index++) insertSpec(store, { projectId: "proj-p", taskId: `t-${index}`, decidedAt: iso(first + index * 60_000) });
-    // Rows that must not count: pending, applied, released, an escalation, and another project's start.
     insertSpec(store, { projectId: "proj-p", taskId: "pend", state: "pending", decidedAt: iso(first - DAY) });
     insertSpec(store, { projectId: "proj-p", taskId: "appl", state: "applied", decidedAt: iso(first - DAY) });
     insertSpec(store, { projectId: "proj-p", taskId: "rel", state: "released", decidedAt: iso(first - DAY) });
@@ -486,11 +474,9 @@ test("the period end is the later of 14 days and the 50th recorded start, stored
     assert.deepEqual(store.read(db => computedPeriodEnd(db, "proj-p")), {
       firstAt: iso(first), fiftiethAt: iso(first + 2 * DAY), endsAt: iso(first + 14 * DAY),
     });
-    // A 50th row 20 days after the first: the 50th's time is the later one.
     for (let index = 0; index < 49; index++) insertSpec(store, { projectId: "proj-late", taskId: `l-${index}`, decidedAt: iso(first + index * 60_000) });
     insertSpec(store, { projectId: "proj-late", taskId: "l-49", decidedAt: iso(first + 20 * DAY) });
     assert.equal(store.read(db => computedPeriodEnd(db, "proj-late"))?.endsAt, iso(first + 20 * DAY));
-    // Stored once: the first mark wins, and it survives a sweep of the oldest rows.
     const X = iso(first + 30 * DAY);
     const Y = iso(first + 40 * DAY);
     assert.equal(store.write(tx => markPeriodEnded(tx, "proj-p", X, NOW)), X);
@@ -516,7 +502,6 @@ test("the pause is kept per project, and a second pause keeps the first time", (
     assert.equal(store.read(db => readProjectState(db, "proj-x")).explorePausedAt, A);
     assert.equal(store.write(tx => setExplorePause(tx, "proj-x", null, NOW)), null);
     assert.equal(store.read(db => readProjectState(db, "proj-x")).explorePausedAt, null);
-    // A stored period end survives a pause and a resume.
     store.write(tx => markPeriodEnded(tx, "proj-x", A, NOW));
     store.write(tx => setExplorePause(tx, "proj-x", B, NOW));
     store.write(tx => setExplorePause(tx, "proj-x", null, NOW));
@@ -544,12 +529,10 @@ test("the share window counts the newest pending and applied starts, and stale p
     insertSpec(store, { projectId: "proj-other", taskId: "oth-1", state: "applied", explore: true, decidedAt: daysBefore(1) });
     insertSpec(store, { projectId: P, taskId: "stale-1", state: "pending", explore: true, decidedAt: daysBefore(8) });
     assert.deepEqual(store.read(db => shareWindow(db, P, 10, NOW)), { exploratory: 3, of: 5 });
-    // Twelve applied starts: window 10 caps the share at 9, the newest by time.
     for (let index = 0; index < 12; index++) {
       insertSpec(store, { projectId: "proj-q", taskId: `q-${index}`, state: "applied", explore: index < 2, decidedAt: daysBefore(30 + index) });
     }
     assert.deepEqual(store.read(db => shareWindow(db, "proj-q", 10, NOW)), { exploratory: 2, of: 9 });
-    // 101 stale pending rows: 100 are released, oldest first.
     const stale = Date.parse(NOW) - 8 * DAY_MS;
     for (let index = 0; index <= 100; index++) {
       insertSpec(store, { projectId: "proj-stale", taskId: `sp-${index}`, state: "pending", decidedAt: iso(stale - index * 1000) });
@@ -599,7 +582,6 @@ test("applied outcome ids are one identity's applied starts, newest first, at mo
   }
 });
 
-/** Records every statement a read or a write issues, so its plan can be checked. */
 type Recorded = { sql: string; params: unknown[] };
 function recording<T extends EvidenceDb>(target: T, log: Recorded[]): T {
   const wrapped: Record<string, unknown> = {
@@ -640,11 +622,9 @@ test("version 2 reads seek their indexes", () => {
       settleStart(writer, key as string, "m-2", "astra-xhigh");
       releaseRun(writer, "run-1", 2);
     });
-    // The inner selects of the two release statements, as the plan writes them.
     log.push({ sql: "SELECT key FROM routing_decisions WHERE project_ref=? AND point='start' AND state='pending' AND decided_at < ? ORDER BY decided_at, key LIMIT 100", params: ["x", NOW] });
     log.push({ sql: "SELECT key FROM routing_decisions WHERE run_id=? AND state='pending' AND revision < ? LIMIT 200", params: ["run-1", 2] });
     assert.ok(log.length >= 12, "the reads and writes issue statements");
-    // A read of many decision rows carries a bounded row limit, so its cost does not grow with the project's history.
     for (const { sql, params } of log) {
       if (!/^SELECT\b/.test(sql) || !/\bFROM routing_decisions\b/.test(sql) || /\bkey\s*=\s*\?/.test(sql)) continue;
       assert.match(sql, /\bLIMIT\b/, `${sql}: no row limit`);

@@ -14,7 +14,6 @@ const MAX_EDGES = 400;
 const MAX_LABEL = 200;
 const MAX_SOURCE = 3000;
 const MAX_ERROR_LINE = 120;
-// Stored graphs carry component maps, which can exceed the Mermaid parser limits.
 const SCHEMA_MAX_NODES = 2000;
 const SCHEMA_MAX_GROUPS = 200;
 const SCHEMA_MAX_EDGES = 4000;
@@ -26,7 +25,6 @@ const PLAIN_ARROW = /^(?:-->|---|-\.->|==>)/;
 const PIPE_LABEL = /^\|([^|]*)\|/;
 const HEADER = /^(?:flowchart|graph)\s+(LR|RL|TB|TD)$/;
 const IGNORED = /^(?:classDef|class|style|linkStyle|click)(?:\s|$)/;
-/** Diagram types outside the subset; a bare keyword line is rejected rather than read as a node. */
 const DIAGRAM_KEYWORDS = new Set(["flowchart", "graph", "sequenceDiagram", "classDiagram", "stateDiagram", "stateDiagram-v2", "erDiagram", "journey", "gantt", "pie", "gitGraph", "mindmap", "timeline", "quadrantChart", "requirementDiagram"]);
 const ENTITIES: Record<string, string> = { "&quot;": "\"", "#quot;": "\"", "&amp;": "&", "&lt;": "<", "&gt;": ">" };
 
@@ -38,7 +36,6 @@ function decodeLabel(raw: string): string {
   return text.replace(/&quot;|#quot;|&amp;|&lt;|&gt;/g, entity => ENTITIES[entity] ?? entity);
 }
 
-/** Reads one flowchart statement such as `A[Label] -->|edge| B --> C`. Returns null when outside the subset. */
 function parseStatement(line: string): Statement | null {
   let pos = 0;
   const refs: Statement["refs"] = [];
@@ -121,7 +118,6 @@ function parseSubgraph(rest: string): DiagramGroup | null {
   return ID.test(text) ? { id: text, label: text } : null;
 }
 
-/** Parses the flowchart subset the briefing engine emits. Any other line is an error, never a guess. */
 export function parseMermaidFlowchart(text: string): { ok: true; graph: ParsedFlowchart } | { ok: false; error: string } {
   if (text.length > MAX_SOURCE) return { ok: false, error: `diagram source exceeds ${MAX_SOURCE} characters` };
   const lines = text.split(/\r?\n/);
@@ -200,17 +196,12 @@ export function diagramFromMermaid(input: {
   return { ...base, direction: parsed.graph.direction, nodes, groups: parsed.graph.groups, edges: parsed.graph.edges, parseError: null };
 }
 
-/** Top-level directory of a component's first path; files at the root group under "root". */
 function groupOf(path: string | undefined): string {
   if (!path) return "root";
   const slash = path.indexOf("/");
   return slash > 0 ? path.slice(0, slash) : "root";
 }
 
-/**
- * Builds the deterministic component map within the stored graph ceilings: the first components, groups and
- * edges in input order, with labels clipped. Its coverage says how much of the map was drawn.
- */
 export function componentGraph(input: {
   repositoryId: string; head: string | null; observedAt: string;
   components: Pick<KnowledgeComponent, "id" | "name" | "paths" | "retired">[];
@@ -250,7 +241,6 @@ export function componentGraph(input: {
   };
 }
 
-/** Links a node to a component by id, else by a unique case-insensitive name match. */
 export function linkDiagramNodes(graph: DiagramGraph, components: Pick<KnowledgeComponent, "id" | "name">[]): DiagramGraph {
   const ids = new Set(components.map(component => component.id));
   const byName = new Map<string, string[]>();

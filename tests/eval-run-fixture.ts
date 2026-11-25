@@ -23,9 +23,6 @@ import type { Config } from "../packages/host/src/types.js";
 import type { Manager } from "../packages/host/src/manager.js";
 import { fixture } from "./team-fixture.js";
 
-// The rig of the trial pump tests: a validated fixture task, a baseline job, the eval launcher and the fake member of the replay
-// tests, the grader fixture, and a real team service. The rig and the validation steps follow eval-validate-run.test.ts.
-
 export const GRADER = fileURLToPath(new URL("./fixtures/grader-command.mjs", import.meta.url));
 export const LAUNCHER = fileURLToPath(new URL("./fixtures/eval-command.mjs", import.meta.url));
 export const TRIAL_AGENT = fileURLToPath(new URL("./fixtures/trial-agent.mjs", import.meta.url));
@@ -33,7 +30,6 @@ export const PROJECT = "project-a";
 export const UID = process.getuid?.() ?? 0;
 export const profile: TeamModelProfile = { id: "trial-member", label: "Trial member", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" };
 export const sandboxes: string[] = [];
-/** Stores a restarted host replaced; the test closes them after the run. */
 export const retired: EvidenceStore[] = [];
 export const NOW = "2026-11-19T00:00:00.000Z";
 
@@ -43,7 +39,6 @@ test.after(() => {
     try {
       store.close();
     } catch {
-      // A store the test already closed needs no close.
     }
   }
 });
@@ -68,8 +63,6 @@ export function commit(work: string, files: Record<string, string>, message: str
   return git(work, ["rev-parse", "HEAD"]);
 }
 
-/** A bare mirror with branch main. C0 has no test; C1 adds `add` and its passing test; C2 and C3 are rejected. */
-/** `linked` reaches the rig's directory through a link on every platform, as a host does whose eval root stands behind one (and as macOS reaches its temporary directory). */
 export function rig(linked = false): Rig {
   const made = mkdtempSync(join(tmpdir(), "infinite-eval-trial-"));
   sandboxes.push(made);
@@ -102,12 +95,10 @@ export function rig(linked = false): Rig {
   mkdirSync(root, { mode: 0o700 });
   const databasePath = evidenceDatabasePath(join(dir, "state")), vaultKey = randomBytes(32);
   const store = new EvidenceStore({ databasePath, vaultKey });
-  // The eval host registers the trials module itself, as it does on a live host.
   store.register(outcomeModule({ now: () => NOW }));
   return { dir, root, mirror, head: ids[3], ids, record: join(dir, "record.log"), store, groups: `${root}.groups`, databasePath, vaultKey };
 }
 
-/** The validation project, with the trial settings and the one candidate profile. */
 export function projectConfig() {
   return {
     id: PROJECT,
@@ -129,18 +120,12 @@ export function projectConfig() {
 
 export type Setup = { r: Rig; reference: string; receipts: string; evalRoot: string; config: Config; grader: Grader; identity: EvalIdentity };
 
-/**
- * The host's configuration: the grader fixture as `eval.grader` (version 1 when `version1` is set), and the eval launcher,
- * with the fake member, as `eval.member`. The replay team service reads the same member.
- */
 export function setup(options: { member?: boolean; version1?: boolean; linked?: boolean } = {}): Setup {
   const r = rig(options.linked);
-  // The launcher's ROOT holds only trials: its clean removes every other entry, so the home, template, and tmp stand beside it.
   const evalRoot = join(r.dir, "eval");
   const home = join(r.dir, "home"), template = join(r.dir, "template"), tmp = join(r.dir, "tmp");
   for (const directory of [join(evalRoot, "trials"), home, template, tmp]) mkdirSync(directory, { recursive: true, mode: 0o700 });
   chmodSync(evalRoot, 0o711);
-  // The reference is the validated commit's own files, which the fake member applies in `reference` mode.
   const reference = join(r.dir, "reference");
   mkdirSync(join(reference, "src"), { recursive: true });
   mkdirSync(join(reference, "tests"), { recursive: true });
@@ -172,11 +157,6 @@ export function showAt(r: Rig, commitId: string, path: string): string {
   return execFileSync("git", ["--git-dir", r.mirror, "show", `${commitId}:${path}`], { encoding: "utf8" });
 }
 
-/**
- * The eval identity as the host sees it in these tests. Every fixture runs as this one user, so the launcher's own probe can
- * never see a second account: its uid is the grader's, and the host's canaries are readable. The probe here reports the
- * account the fixture stands in for, and every other operation runs through the same-user launcher.
- */
 export const STAND_IN_EVAL_UID = UID + 1;
 export function testIdentity(config: Config): EvalIdentity {
   const inner = launcherEvalIdentity(() => config.eval?.member, { hostUid: UID + 2, graceMs: 5_000 });
@@ -185,7 +165,6 @@ export function testIdentity(config: Config): EvalIdentity {
     : { state: "ready" as const, uid: STAND_IN_EVAL_UID, storage: true, fetch: "refused" as const } };
 }
 
-/** The grader as the host sees it in these tests. The fixture runs as this user, so its probe lists no canaries. */
 export function testGrader(config: Config, version1 = false): Grader {
   const inner = launcherGrader(() => config.eval?.grader, { hostUid: UID + 1, graceMs: 5_000 });
   return { ...inner, probe: async () => {
@@ -203,7 +182,6 @@ export function alive(pid: number): boolean {
   }
 }
 
-/** The grader fixture's own process groups, as the processes of the grader's account. */
 export async function fixtureInventory(groups: string): Promise<RuntimeProcess[]> {
   const text = readFileOr(groups);
   return text.split("\n").map(Number).filter(pid => Number.isInteger(pid) && pid > 1 && alive(pid))
@@ -218,10 +196,8 @@ export function readFileOr(path: string): string {
   }
 }
 
-/** Teams and sessions that only the gates touch: a job that waits never reaches them. */
 export const gatesOnly = { teams: () => ({ providerLimits: () => [] }) as never, sessions: { list: async () => [], remove: async () => undefined } };
 
-/** The eval host over the rig, with the team service the trial pump starts runs on. */
 export function host(s: Setup, options: { identity?: EvalIdentity; teams?: EvalHostOptions["teams"]; sessions?: EvalHostOptions["sessions"];
   now?: () => string; inventory?: () => Promise<RuntimeProcess[]> } = {}): EvalHost {
   const status: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: s.r.head };
@@ -240,7 +216,6 @@ export function host(s: Setup, options: { identity?: EvalIdentity; teams?: EvalH
   } as EvalHostOptions);
 }
 
-/** Mines the fixture commits until the miner is caught up. */
 export async function mine(h: EvalHost): Promise<void> {
   for (let attempt = 0; attempt < 40; attempt++) {
     h.tick();
@@ -251,7 +226,6 @@ export async function mine(h: EvalHost): Promise<void> {
   }
 }
 
-/** Mines the fixture commits, then validates them in one validation job. */
 export async function validated(h: EvalHost): Promise<void> {
   await mine(h);
   const created = h.create(PROJECT, { kind: "validate", limits: { maxWallMinutes: 60 } }, randomUUID());
@@ -264,9 +238,7 @@ export async function validated(h: EvalHost): Promise<void> {
   throw new Error("validation did not complete");
 }
 
-/** The baseline job over the valid mined task, with the given trials per task. */
 export function baseline(h: EvalHost, trialsPerTask: number, maxTrials: number, options: { maxWallMinutes?: number } = {}): string {
-  // A group draws its set when it is created, and a baseline job reads the dev set only. Without this the one mined task is holdout in three runs of ten, and the job runs no trial.
   (h as unknown as { store: EvidenceStore }).store.write(tx => { tx.run("UPDATE eval_groups SET holdout = 0, set_at = NULL"); });
   const created = h.create(PROJECT, {
     kind: "baseline",
@@ -290,10 +262,6 @@ export function trialRows(s: Setup, jobId: string): TrialSql[] {
     "SELECT trial_id, state, ending, attempt, resolved, isolation FROM eval_trials WHERE job_id = ? ORDER BY created_at, attempt", jobId));
 }
 
-/**
- * Ticks the host until `done` holds. Each new trial takes the next mode from `modes`, written as the fake member's receipt
- * before the member starts; the default mode is `reference`. Ticks run until the budget ends, and then the test asserts.
- */
 export async function drive(s: Setup, h: EvalHost, done: () => boolean, modes: string[], budgetMs: number): Promise<void> {
   const assigned = new Set<string>();
   const deadline = Date.now() + budgetMs;
@@ -311,22 +279,15 @@ export async function drive(s: Setup, h: EvalHost, done: () => boolean, modes: s
   }
 }
 
-/** The operation names of the eval launcher's record, in call order. */
 export function launcherOps(s: Setup): string[] {
   return readFileOr(join(s.r.dir, "eval-record.log")).split("\n").filter(Boolean)
     .map(line => (JSON.parse(line) as { argv: string[] }).argv[0]);
 }
 
-/** The grader's record, in call order: each entry is the operation and its arguments. */
 export function graderRecord(s: Setup): string[][] {
   return readFileOr(s.r.record).split("\n").filter(Boolean).map(line => JSON.parse(line) as string[]);
 }
 
-/**
- * A restarted host opens the store anew: the host registers its modules on the store it is given, so a second host over the
- * same handle would register them twice. The new handle reads the same database file; the retired handle stays open for the
- * team service, which flushes its events through it.
- */
 export function reopen(s: Setup): void {
   const next = new EvidenceStore({ databasePath: s.r.databasePath, vaultKey: s.r.vaultKey });
   next.register(outcomeModule({ now: () => NOW }));
@@ -335,7 +296,6 @@ export function reopen(s: Setup): void {
   s.r.store = next;
 }
 
-/** The team service as `TrialTeams`, with some calls replaced. */
 export function wrapTeams(service: Awaited<ReturnType<typeof serveTeam>>["service"], overrides: Partial<TrialTeams> = {}): () => TrialTeams {
   const base: TrialTeams = {
     createForReplay: input => service.createForReplay(input),
@@ -352,14 +312,12 @@ export function sessionOf(s: Setup, trialId: string): string | null {
   return s.r.store.read(db => db.get<{ session_id: string | null }>("SELECT session_id FROM eval_trials WHERE trial_id = ?", trialId))?.session_id ?? null;
 }
 
-/** True once the fake member has written its start receipt. */
 export function memberStarted(s: Setup): boolean {
   return readdirSync(s.receipts).some(name => name.endsWith(".started.json"));
 }
 
 export type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-/** The team fixture, with the eval member and the validation project, whose checkout is the fixture source. */
 export async function teamFixture(s: Setup): Promise<Fixture> {
   const fx = await fixture("success", undefined, {}, { trustWorkspaces: true });
   fx.host.config.eval = s.config.eval;
@@ -367,10 +325,6 @@ export async function teamFixture(s: Setup): Promise<Fixture> {
   return fx;
 }
 
-/**
- * The team service, with its events projected into the eval store as the server projects them: configuration, then outcomes.
- * The events are also kept, so a test can read the kinds a run emitted.
- */
 export async function serveTeam(s: Setup, fx: Fixture) {
   s.r.store.register(configurationModule());
   const outbox = new EventOutbox(s.r.store);

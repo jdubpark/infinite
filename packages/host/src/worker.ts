@@ -74,7 +74,6 @@ import type {
   WorkerState,
 } from "./types.js";
 
-// Bootstrap arrives through a private pipe, never argv, environment, or logs.
 let bootstrap = "";
 process.stdin.setEncoding("utf8");
 for await (const chunk of process.stdin) {
@@ -106,9 +105,7 @@ type DeliveryRequest = Extract<WorkerRequest, { op: "input" | "raw" | "key" | "s
 type StoredReceipt = Receipt & { digest: string; result?: AnswerResult };
 const receipts = new Map<string, StoredReceipt>();
 const invalidatedTeamPermissionDecisions = new Set<string>();
-/** Permission-agent decisions for this session whose authority the owner ended. A decision id is never reused under a new authority. */
 const invalidatedSessionPermissionDecisions = new Set<string>();
-/** The receipt a client sees: the request digest stays inside the worker. */
 const publicReceipt = ({ digest: _digest, ...receipt }: StoredReceipt) =>
   receipt;
 const initial = initialAttention(
@@ -128,23 +125,19 @@ let child: ReturnType<typeof spawn> | undefined;
 let native: Awaited<ReturnType<typeof startNativeCodex>> | Awaited<ReturnType<typeof startNativeOpenCode>> | undefined;
 let executor: ExecutorTunnel | undefined;
 let hybrid: Awaited<ReturnType<typeof createHybridWorkspace>> | undefined;
-// The host terminal must answer device/cursor queries even with no client attached.
 terminal.onData((data) => {
   if (state.status === "running") child?.write(data);
 });
-// Codex TUI notifications arrive as OSC 9 inside the PTY stream.
 terminal.parser.registerOscHandler(9, (data) => {
   if (provider !== "codex" || state.status !== "running") return false;
   try {
     for (const signal of mapCodexOsc(data)) {
-      // An open prompt already covers "approval requested"; the screen supplies its options.
       if (signal.kind === "prompt-open" && attention.prompt) continue;
       record(signal, "osc");
     }
   } catch {
-    /* journal failures already went through recordingFailure() */
   }
-  return false; // let xterm keep its default handling
+  return false;
 });
 let pending = "";
 const usageLines = provider === "opencode" && session.team ? new JsonLineAssembler() : undefined;
@@ -152,7 +145,6 @@ let flushTimer: ReturnType<typeof setTimeout> | undefined;
 let snapshotQueue: (() => void)[] | undefined;
 let snapshotBytes = 0;
 let abortSnapshot: ((error: Error) => void) | undefined;
-// The worker pid lets the API tell a worker that is slow to answer from one that is gone.
 const persist = () =>
   writeSealed(join(dir, "status.sealed"), key, `${session.id}:status`, {
     ...state,
@@ -160,7 +152,6 @@ const persist = () =>
     seq: journal.seq,
     workerPid: process.pid,
   });
-/** Every journal write goes through here so a failed write always suspends the session. */
 function append(type: Event["type"], data: Event["data"]): Event {
   try {
     return journal.append(type, data);
@@ -179,7 +170,6 @@ function flush() {
   }
 }
 
-/** A short per-worker fence makes the ANSI frame and its journal cursor one atomic prefix. */
 async function snapshot(): Promise<TerminalSnapshot> {
   if (state.status === "recording-error") throw new Refusal("snapshot-unavailable");
   snapshotQueue = [];
@@ -190,10 +180,8 @@ async function snapshot(): Promise<TerminalSnapshot> {
     await new Promise<void>((resolve, reject) => {
       abortSnapshot = reject;
       deadline = setTimeout(() => reject(new Error("Terminal renderer is busy")), 1000);
-      // Empty writes are ordered behind every pending xterm write and invoke their callback.
       terminal.write("", resolve);
     });
-    // Parser callbacks can change the worker state while the write barrier is pending.
     if ((state as WorkerState).status === "recording-error") throw new Error("Recording failed during snapshot");
     return {
       ansi: snapshots.capture(),
@@ -212,7 +200,6 @@ async function snapshot(): Promise<TerminalSnapshot> {
     for (const task of queued) task();
   }
 }
-/** Replace the attention snapshot, refresh its one-line summary and expose it in `state`. */
 function publish(next: Attention) {
   attention = { ...next, now: describeNow(next, provider) };
   state = { ...state, attention };
@@ -222,12 +209,10 @@ function recordingFailure() {
   publish(
     applyLifecycle(attention, "recording-error", new Date().toISOString()),
   );
-  // Stop work when recording fails instead of silently losing the audit trail.
   try {
     child?.kill("SIGSTOP");
     native?.suspend();
   } catch {
-    /* best effort */
   }
 }
 function screen() {
@@ -241,15 +226,11 @@ const screenPrompt = () => detectPrompt(screen().split("\n"), provider);
 const hashOf = (text: string) =>
   createHash("sha256").update(text).digest("hex");
 
-// ---- Attention: signals from hooks, OSC and the screen -------------------------------------
-
 function record(
   signal: Signal,
   source: SignalData["source"],
   agent?: { id: string; type: string },
 ): SignalEvent {
-  // A signal that would drop the open prompt closes it in the journal first, so every
-  // prompt-open has exactly one prompt-closed and the timeline never waits on a lost dialog.
   const open = attention.prompt;
   if (open && dropsPrompt(attention, signal))
     record({ kind: "prompt-closed", promptId: open.id, reason: "resolved" }, source);
@@ -264,7 +245,6 @@ function record(
     data as unknown as Record<string, unknown>,
   ) as unknown as SignalEvent;
   publish(applySignal(attention, event));
-  // A successful turn, or the end of a quota wait, lifts the limit; the notice may stay on screen.
   if (recoveryTurnEnd(data) || (signal.kind === "notice" && signal.type === "quota_auto_resume_fired")) {
     limitEpisode = undefined;
     limitWatch = undefined;
@@ -273,7 +253,6 @@ function record(
   return event;
 }
 
-/** A hook announced a prompt while another is open. */
 function hookPromptWhileOpen(
   open: Prompt,
   hook: Prompt,
@@ -290,13 +269,10 @@ function hookPromptWhileOpen(
       "hook",
       agent,
     );
-  // An answer is pressing keys on this dialog: nothing may rebind or replace it meanwhile.
   if (answering === open.id) return mismatch();
   const onScreen = open.hash !== undefined ? screenPrompt() : null;
   if (onScreen && hashOf(onScreen.fingerprint) === open.hash) {
-    // Another dialog's hook (a parallel tool or a subagent) must not lend the answer its tool
-    // and flags: the answer stays bound to the dialog on screen, and the mismatch is recorded.
-    if (correlates(hook, onScreen))
+    if (correlates(hook, onScreen) && attention.state === "needs-you")
       publish({
         ...attention,
         prompt: mergeHookIntoPrompt(open, hook, onScreen),
@@ -304,7 +280,6 @@ function hookPromptWhileOpen(
     else mismatch();
     return;
   }
-  // The open prompt is hook-only, or its block has left the screen: the newer prompt replaces it.
   record(
     { kind: "prompt-closed", promptId: open.id, reason: "superseded" },
     "hook",
@@ -312,7 +287,6 @@ function hookPromptWhileOpen(
   record({ kind: "prompt-open", prompt: hook }, "hook", agent);
 }
 
-/** The open prompt's own block is on screen: the screen hash still matches. */
 function blockShown(open: Prompt) {
   if (open.hash === undefined) return false;
   const current = screenPrompt();
@@ -320,13 +294,9 @@ function blockShown(open: Prompt) {
 }
 
 let hooksReady = false;
-/** True only while the final drain runs: the relay may read the transcript after the provider exited. */
 let drainOpen = false;
 let teamReportReceipt: { requestId: string; digest: string } | undefined;
-// Every credential in the environment this session's provider was started with: a GitHub grant, an egress proxy
-// password, a native observer token. A member entry that holds one is refused.
 const issuedCredentials = new Set<string>();
-// The worker's read-only evidence connection, opened on the first entry read and closed at exit.
 let evidenceReader: EvidenceReader | undefined;
 const entryRoute = session.team?.entryTools
   ? createEntryRoute({
@@ -341,16 +311,12 @@ const entryRoute = session.team?.entryTools
       append: (type, data) => { append(type, data); },
     })
   : undefined;
-// ---- Chat: the provider's own conversation record ------------------------------------------
-// The relay streams the transcript file from the worker's cursor; the worker never opens it.
-// The watch owns the byte reader, the usage reader, the drains, and the coverage facts.
 const transcriptWatch = new TranscriptWatch({
   provider,
   requestedModel: session.teamModelProfile?.model,
   onUsage: record => { append("usage", { ...record }); },
 });
 const MESSAGE_FIELDS = new Set(["id", "role", "text", "toolName", "ts"]);
-/** Journals one chat message exactly as the provider recorded it; text is bounded at ingest. */
 function recordMessage(message: TranscriptMessage) {
   append("message", Object.fromEntries(Object.entries(message).filter(([key, value]) => MESSAGE_FIELDS.has(key) && value !== undefined)));
   if (state.capabilities?.transcript !== 1) {
@@ -368,7 +334,6 @@ let handoffReceipt: string | undefined;
 let handoffStopping = false;
 let handoffInFlight = false;
 async function onHook(route: HookRoute, body: unknown): Promise<HookReply | HookAnswer | void> {
-  // Only the permission channel's own hook command calls these routes, and only in a session the host admitted.
   if (route === "permission-check" || route === "permission-request") {
     if (!permissionChannel) throw new HookPayloadError(404);
     return route === "permission-check" ? permissionChannel.check(body) : permissionChannel.request(body);
@@ -414,7 +379,6 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | Hook
     return;
   }
   if (route === "mission-report") {
-    // A mission coordinator's assignment records the mission ID as its run ID.
     const parsed = missionReportEnvelopeSchema.safeParse(body);
     if (!parsed.success || session.team?.role !== "mission-coordinator") throw new HookPayloadError(400);
     const report = parsed.data;
@@ -434,8 +398,6 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | Hook
   if (route === "transcript") return state.status === "running" || drainOpen ? onTranscript(body) : undefined;
   if (state.status !== "running") return;
   const signals = route === "claude" ? claudeTurnSignals(mapClaudeHook(body), () => permissionChannel?.takeContinue() === true) : route === "codex" ? mapCodexHook(body) : mapCodexNotify(body);
-  // With Codex hooks off, a notify only links the session record: its turn end reaches the transcript watch, and no
-  // attention signal is journaled, because no turn-start hook would follow to show later work (INF-213).
   const linkOnly = route === "codex-notify" && !config.attention.hooks.codex;
   const agent = route === "claude" ? claudeAgent(body) : undefined;
   const b = body as Record<string, unknown>;
@@ -445,9 +407,6 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | Hook
       : typeof b.type === "string"
         ? b.type
         : route;
-  // Only the authenticated provider hook supplies its native identity. Subagent hooks do not
-  // replace the primary conversation, and terminal text / transcript filenames are never guessed.
-  // The rehearsal provider speaks the Claude hook contract.
   const hookProvider = provider === "demo" ? "claude" : provider;
   const nativeId = !b.agent_id && (
     ((hookProvider === "claude" && route === "claude") || (hookProvider === "codex" && route === "codex")) &&
@@ -462,10 +421,6 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | Hook
     state = { ...state, nativeSession: { id: nativeId, source: "hook" } };
     persist();
   }
-  // The same authenticated primary hook names the conversation file; the reply asks the relay
-  // for its bytes from where the worker left off.
-  // Every provider hook reaches the watch. A subagent hook may name the conversation file as well: the watch
-  // lets it drain the primary it already reads, and never lets it open or replace one.
   const path = b.transcript_path;
   const transcriptPath = nativeId !== undefined && typeof path === "string" && path.startsWith("/") && path.endsWith(".jsonl") && path.length <= 4096 && !/[\x00-\x1f]/.test(path)
     ? path
@@ -484,15 +439,12 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | Hook
   }
   for (const signal of linkOnly ? [] : signals) {
     if (signal.kind === "prompt-closed") {
-      // A hook's close (PermissionDenied) names no prompt; it closes the open one, unless an
-      // answer is pressing keys on it or its block is still on screen (the screen loop owns that).
       const open = attention.prompt;
       if (!open || answering === open.id || blockShown(open)) continue;
       record({ ...signal, promptId: open.id }, "hook", agent);
       continue;
     }
     if (signal.kind === "prompt-open" && attention.prompt) {
-      // Claude's Notification opens a prompt only when none is open; it repeats the dialog's hook.
       if (route === "claude" && event === "Notification") continue;
       hookPromptWhileOpen(attention.prompt, signal.prompt, agent);
       continue;
@@ -506,26 +458,15 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | Hook
 let lastOutputAt = Date.now();
 let outputSinceCheck = false;
 let missCount = 0;
-/** Prompt id with an answer in flight; the answer path, not the screen loop, closes it. */
 let answering: number | undefined;
 
-/**
- * Usage-limit observations are journaled per episode: at most one single-source and one
- * corroborated signal. An episode starts at the first observation, from a hook or the screen,
- * and ends after three checks with no match and no armed watch, or at a turn end that proves
- * recovery (`recoveryTurnEnd`): a Codex terminal turn end cannot say the turn failed.
- * A Claude hook is corroborated by the screen notice within two later checks; a Codex status row
- * only by persisting for three checks and `limitConfirmMs` without new output.
- */
 let limitWatch: { source: "hook" | "screen"; firstAt: number; checks: number; corroborated: boolean } | undefined;
-/** Set when a limit lifted; screen matches are ignored until the screen stops showing one. */
 let screenLimitSuppressed = false;
 let limitEpisode: { single?: "hook" | "screen"; corroborated: boolean; misses: number; resetsAt?: string } | undefined;
 type LimitSignal = Extract<Signal, { kind: "provider-limit" }>;
 function recordLimit(signal: LimitSignal, source: SignalData["source"], agent?: { id: string; type: string }) {
   const episode = (limitEpisode ??= { corroborated: false, misses: 0 });
   episode.misses = 0;
-  // A reset time stated by any source belongs to the episode, so a corroborating hook keeps the notice's time.
   episode.resetsAt = signal.resetsAt ?? episode.resetsAt;
   if (episode.resetsAt) signal = { ...signal, resetsAt: episode.resetsAt };
   if (signal.confidence === "corroborated") {
@@ -543,7 +484,6 @@ function recordLimitFromHook(signal: LimitSignal, agent?: { id: string; type: st
     recordLimit(signal, "hook", agent);
     return;
   }
-  // A notice already on screen is the second source for this hook.
   if (limitEpisode?.single === "screen" && !limitEpisode.corroborated) {
     limitWatch = undefined;
     recordLimit({ ...signal, confidence: "corroborated" }, "hook", agent);
@@ -558,7 +498,6 @@ function watchLimit(lines: string[], nowMs: number, freshOutput: boolean) {
   const watch = limitWatch;
   if (!found) {
     screenLimitSuppressed = false;
-    // A hook watch gets two checks after the one that armed it; a screen watch ends with its match.
     if (watch?.source === "screen" || (watch && ++watch.checks > 2)) limitWatch = undefined;
     if (!limitWatch && limitEpisode && ++limitEpisode.misses >= 3) limitEpisode = undefined;
     return;
@@ -577,7 +516,6 @@ function watchLimit(lines: string[], nowMs: number, freshOutput: boolean) {
     return;
   }
   if (freshOutput) {
-    // New output restarts the persistence count but never re-earns an episode's corroboration.
     limitWatch = { source: "screen", firstAt: nowMs, checks: 1, corroborated: watch.corroborated };
     return;
   }
@@ -589,9 +527,7 @@ function watchLimit(lines: string[], nowMs: number, freshOutput: boolean) {
   }
 }
 
-/** Runs after every output flush and once a second. */
 function checkScreen() {
-  // While a deferred call waits, no provider runs and the owner prompt is the channel's.
   if (state.status !== "running" || permissionChannel?.waiting()) return;
   try {
     const lines = screen().split("\n");
@@ -602,8 +538,6 @@ function checkScreen() {
       !outputSinceCheck &&
       nowMs - lastOutputAt >= config.attention.idleAfterMs &&
       isIdleScreen(lines, provider);
-    // Output printed before the current state began (a redraw just ahead of the Stop hook)
-    // is not new work.
     const freshOutput =
       outputSinceCheck && lastOutputAt > Date.parse(attention.since);
     const outputThisCheck = outputSinceCheck;
@@ -611,13 +545,12 @@ function checkScreen() {
     watchLimit(lines, nowMs, outputThisCheck);
     let decision = screenDecision(attention, detected, idle, freshOutput, at);
     const open = attention.prompt;
-    // A different block in place of the open one supersedes it without a blank screen between.
     const replaced =
       detected !== null &&
       open?.hash !== undefined &&
       open.options.length > 0 &&
       hashOf(detected.fingerprint) !== open.hash;
-    if (open && (decision.close || replaced) && answering !== open.id) {
+    if (open && (decision.kind === "close" || replaced) && answering !== open.id) {
       if (++missCount >= 2) {
         missCount = 0;
         record(
@@ -632,66 +565,44 @@ function checkScreen() {
           decision = screenDecision(attention, detected, idle, freshOutput, at);
       }
     } else missCount = 0;
-    // A hook prompt waiting for its block is merged only with a block that belongs to it;
-    // any other block supersedes it and opens as a screen prompt.
-    if (decision.merge && open && !correlates(open, decision.merge)) {
+    if (decision.kind === "merge" && open && !correlates(open, decision.merge)) {
       record(
         { kind: "prompt-closed", promptId: open.id, reason: "superseded" },
         "screen",
       );
       decision = screenDecision(attention, detected, idle, freshOutput, at);
     }
-    if (decision.open) {
-      const { fingerprint, ...rest } = decision.open;
-      const prompt: Prompt = {
-        ...rest,
-        id: 0,
-        hash: hashOf(fingerprint),
-        destructive: blockDestructive(rest),
-      };
-      record({ kind: "prompt-open", prompt }, "screen");
+    switch (decision.kind) {
+      case "open": {
+        const { fingerprint, ...rest } = decision.open;
+        record({ kind: "prompt-open", prompt: { ...rest, id: 0, hash: hashOf(fingerprint), destructive: blockDestructive(rest) } }, "screen");
+        break;
+      }
+      case "merge":
+        if (attention.state === "needs-you" && attention.prompt) {
+          const merged = mergeScreenIntoPrompt(attention.prompt, decision.merge, hashOf(decision.merge.fingerprint));
+          publish({ ...attention, prompt: merged });
+          record({ kind: "notice", type: "prompt-merged", promptId: merged.id, title: merged.title, ...(merged.detail !== undefined ? { detail: merged.detail } : {}) }, "screen");
+        }
+        break;
+      case "idle":
+        if (!native) {
+          const same = attention.state === decision.idle;
+          publish({ ...attention, prompt: undefined, lastTool: undefined, state: decision.idle, since: same ? attention.since : at, source: same ? attention.source : "screen" });
+        }
+        break;
+      case "working":
+        if (!native) publish({ ...attention, prompt: undefined, state: "working", since: at, source: "screen" });
+        break;
+      case "close":
+      case "none":
+        break;
     }
-    if (decision.merge && attention.prompt) {
-      const merged = mergeScreenIntoPrompt(
-        attention.prompt,
-        decision.merge,
-        hashOf(decision.merge.fingerprint),
-      );
-      publish({ ...attention, prompt: merged });
-      // The journaled prompt-open carries the hook's title; the timeline takes the dialog's.
-      record(
-        {
-          kind: "notice",
-          type: "prompt-merged",
-          promptId: merged.id,
-          title: merged.title,
-          ...(merged.detail !== undefined ? { detail: merged.detail } : {}),
-        },
-        "screen",
-      );
-    }
-    // Native adapters report actual turn transitions. A quiet screen or late
-    // observer redraw must not override those events; dialogs still use the screen.
-    if (decision.idle && !native) {
-      const same = attention.state === decision.idle;
-      publish({
-        ...attention,
-        state: decision.idle,
-        since: same ? attention.since : at,
-        source: same ? attention.source : "screen",
-      });
-    }
-    if (decision.working && !native)
-      publish({ ...attention, state: "working", since: at, source: "screen" });
-    // Keep the one-line summary current even when nothing above changed the state.
     if (describeNow(attention, provider) !== attention.now) publish(attention);
   } catch {
-    /* journal failures already went through recordingFailure() */
   }
 }
 setInterval(checkScreen, 1000).unref();
-
-// ---- Input: text, keys, stop and prompt answers, one at a time ------------------------------
 
 let serial: Promise<unknown> = Promise.resolve();
 function serialize<T>(task: () => T | Promise<T>): Promise<T> {
@@ -758,11 +669,9 @@ function checkControl(request: InputControl) {
   } else if (active) throw new Refusal("control-busy");
 }
 function refreshControl(request: InputControl) {
-  // A lease that expired while its input was being written ends; the input does not revive it.
   if (currentControl() && controller && request.leaseId === controller.lease.id && request.actor?.id === controller.actorId)
     controller.lease.expiresAt = Date.now() + CONTROL_TTL_MS;
 }
-/** A retry identifies the intended input, not the client which currently holds control. */
 function requestDigest(request: (DeliveryRequest | AnswerRequest | TeamAnswerRequest | TeamPermissionExpansionRequest)) {
   const { actor: _actor, leaseId: _leaseId, ...input } = request;
   return createHash("sha256").update(JSON.stringify(input)).digest("hex");
@@ -780,12 +689,9 @@ function deliver(
   }
   checkControl(request);
   if (handoffReceipt && request.op !== "stop") throw new Error("This session yielded to a team; further input is disabled");
-  // No provider runs while a deferred call waits: input would be lost, so it stays with the client. Stop retires the call.
   if (permissionChannel?.waiting() && request.op !== "stop") throw new Refusal("prompt-open");
   if (state.status !== "running" || !child)
     throw new Error("Session is not running");
-  // Text and Enter typed over an open dialog would pick its highlighted option. Only a
-  // terminal surface, where the person sees the dialog, may send it anyway (`force`).
   if (
     request.op === "input" &&
     request.force !== true &&
@@ -813,7 +719,6 @@ function deliver(
   receipts.set(request.requestId, receipt);
   let retireWaiting = false;
   if (request.op === "input") {
-    // Bracketed paste keeps embedded newlines inside one prompt.
     child.write(
       terminal.modes.bracketedPasteMode
         ? `\x1b[200~${request.text}\x1b[201~`
@@ -858,14 +763,12 @@ type RefusalCode =
   | "control-busy"
   | "control-lost"
   | "snapshot-unavailable";
-/** A refusal the client can act on; its `code` travels to the API as a 409. */
 class Refusal extends Error {
   constructor(readonly code: RefusalCode) {
     super(code);
   }
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-// Send arrows the way a real terminal would in the TUI's current cursor-key mode.
 const arrow = (key: "up" | "down") =>
   (terminal.modes.applicationCursorKeysMode ? "\x1bO" : "\x1b[") +
   (key === "up" ? "A" : "B");
@@ -874,7 +777,6 @@ async function answer(
   request: AnswerRequest | TeamAnswerRequest,
 ): Promise<Receipt & { result?: AnswerResult }> {
   const teamRequest = request.op === "team-answer" ? request : undefined;
-  // A permission-agent reject types only the host's fixed notice, and only after a reject option that takes text.
   const answerText = request.op === "answer" ? request.text : teamRequest?.choice === "reject" ? teamRequest.text : undefined;
   const digest = requestDigest(request);
   const previous = receipts.get(request.requestId);
@@ -913,18 +815,12 @@ async function answer(
     attention.state !== "needs-you" ||
     !prompt ||
     prompt.id !== request.promptId ||
-    !prompt.hash // hook-only prompts have no verified screen block to answer
+    !prompt.hash
   )
     throw new Refusal("prompt-changed");
   const current = screenPrompt();
   if (!current || hashOf(current.fingerprint) !== prompt.hash)
     throw new Refusal("prompt-changed");
-  // The hash ignores spacing inside lines, so a team answer also needs the reviewed text exactly,
-  // and screen-only evidence needs the dialog still pinned to the bottom of the screen. Each
-  // delegated key write checks this again, since the dialog can redraw between keys.
-  // A reject goes only through the dialog's one recognised one-shot reject option, with the same exact-screen check
-  // as an accept. A permission-agent accept no longer refuses the destructive flag: the host delivers that accept
-  // only on a strong verdict. A run reviewer's accept keeps today's qualification.
   const delegatedRoles = teamRequest?.choice === "reject" ? ["reject", "reject-with-feedback"] : ["accept"];
   const delegatedOption = !teamRequest ? undefined : teamRequest.choice === "reject" ? oneShotRejectOption(prompt)
     : teamRequest.choice === "accept" ? agentAcceptOption(prompt) : oneShotPermissionOption(prompt);
@@ -937,20 +833,15 @@ async function answer(
     throw new Refusal("prompt-changed");
   if (prompt.multiSelect || current.multiSelect)
     throw new Refusal("unsupported");
-  // Same hash, so the screen's options are the prompt's options.
   if (request.option !== undefined && !current.options.some(option => option.index === request.option))
     throw new Refusal("invalid-option");
-  // Delivery follows the dialog on screen, not the hook's kind for it.
   const yesNo = current.kind === "yes-no";
-  // A typed `y` changes the yes-no line before its Enter, so that Enter could not be checked
-  // against the reviewed screen. A delegated answer goes only to a menu.
   if (teamRequest && yesNo) throw new Refusal("unsupported");
   const feedback = current.options.find(
     (o) => o.role === "reject-with-feedback",
   );
   if (
     answerText !== undefined &&
-    // Free text only follows the "No, and tell … what to do differently" option.
     (!prompt.acceptsText ||
       yesNo ||
       !feedback ||
@@ -996,8 +887,6 @@ async function answer(
     state: "uncertain",
     seq: intent.seq,
     digest,
-    // Preserve the ordinary answer retry contract: an interrupted delivery has
-    // a refused result, while delegated answers remain explicitly uncertain.
     ...(teamRequest ? {} : { result: "refused" as AnswerResult }),
   };
   receipts.set(request.requestId, receipt);
@@ -1016,7 +905,6 @@ async function answer(
         session.team.role !== teamRequest.assignment.role || session.team.taskId !== teamRequest.assignment.taskId))
       throw new Refusal("unsupported");
     if (teamRequest && reviewedScreen && !showsReviewed(screenPrompt())) throw new Refusal("prompt-changed");
-    // The notice follows a dialog that has closed. It is typed only while no other dialog shows, since its Enter would answer one.
     if (teamRequest && !reviewedScreen && screenPrompt()) throw new Refusal("prompt-changed");
   };
   answering = prompt.id;
@@ -1034,7 +922,6 @@ async function answer(
         pty.write(arrow(key as "up" | "down"));
         await sleep(40);
       }
-      // Enter goes only once the marker sits on the chosen option of the same dialog.
       let onTarget = false;
       for (const until = Date.now() + 500; ; ) {
         await sleep(40);
@@ -1059,7 +946,6 @@ async function answer(
         }
       }
     if (result === "closed") {
-      // A turn-end hook that raced the post-check may have closed it already.
       if (attention.prompt?.id === prompt.id)
         record(
           {
@@ -1104,8 +990,6 @@ async function answer(
     refreshControl(request);
     return publicReceipt(receipt);
   } catch (error) {
-    // The intent is durable, but control loss or a worker failure may stop delivery mid-answer.
-    // Retrying this decision returns the uncertain receipt and never presses another key.
     if (teamRequest) return publicReceipt(receipt);
     throw error;
   } finally {
@@ -1195,10 +1079,8 @@ function expandTeamPermission(request: TeamPermissionExpansionRequest): Receipt 
   const receipt: StoredReceipt = { requestId: request.requestId, state: "uncertain", seq: intent.seq, digest };
   receipts.set(request.requestId, receipt);
   try {
-    // This second check is synchronous with the sole key write: no async work can
-    // interleave a screen change, assignment change, expiry, or control takeover.
     assertCurrent(pty);
-    pty!.write("\x01"); // Ctrl+A only reveals the collapsed command text.
+    pty!.write("\x01");
     append("input-result", { requestId: request.requestId, state: "delivered", op: "team-permission-expand" });
     receipt.state = "delivered";
     receipt.seq = journal.seq;
@@ -1223,13 +1105,6 @@ function validSessionPermissionAnswer(request: SessionPermissionAnswerRequest) {
     typeof request.leaseId === "string" && request.leaseId.length > 0 && request.leaseId.length <= 80;
 }
 
-/**
- * Types one permission-agent decision into a session outside any team run: one recognised one-shot
- * accept or reject, under the host's control lease, while the exact reviewed dialog is still pinned on
- * screen. A reject option that takes text is followed by the host's fixed notice once the dialog has
- * closed; no other answer carries text. A team member's session never takes this path. Once the intent
- * is journaled the answer is never typed again: a failure after it leaves the receipt uncertain.
- */
 async function answerSessionPermission(request: SessionPermissionAnswerRequest): Promise<Receipt & { result?: AnswerResult }> {
   const { actor: _actor, leaseId: _leaseId, ...input } = request;
   const digest = createHash("sha256").update(JSON.stringify(input)).digest("hex");
@@ -1262,11 +1137,8 @@ async function answerSessionPermission(request: SessionPermissionAnswerRequest):
   const choices = permissionChoices(prompt);
   const role = request.option === choices.accept ? "accept" : request.option === choices.reject ? "reject" : undefined;
   if (!role) throw new Refusal("invalid-option");
-  // The notice follows only the recognised reject that takes text, the same option the host's live check offered.
   const text = request.text;
   if (text !== undefined && (role !== "reject" || !rejectTakesText(prompt, request.option))) throw new Refusal("text-not-accepted");
-  // The hash ignores spacing inside lines, so the reviewed text must match exactly, and screen-only
-  // evidence needs the dialog pinned to the bottom of the screen. Each key write checks this again.
   const showsReviewed = (now: ReturnType<typeof screenPrompt>) => Boolean(now &&
     hashOf(now.fingerprint) === prompt.hash && now.title === prompt.title && now.detail === prompt.detail &&
     (prompt.tool || now.pinned) && !now.multiSelect && (text === undefined || now.acceptsText) &&
@@ -1274,7 +1146,6 @@ async function answerSessionPermission(request: SessionPermissionAnswerRequest):
       : text !== undefined ? option.role === "reject-with-feedback" : option.role === "reject" || option.role === "reject-with-feedback")));
   const current = screenPrompt();
   if (!current || !showsReviewed(current)) throw new Refusal("prompt-changed");
-  // A typed `y` changes the yes-no line before its Enter, so that Enter could not be checked against the reviewed screen.
   if (current.kind === "yes-no") throw new Refusal("unsupported");
   const chosen = current.options.find(option => option.index === request.option)!;
   const from = current.highlighted ?? 0;
@@ -1304,7 +1175,6 @@ async function answerSessionPermission(request: SessionPermissionAnswerRequest):
       pty!.write(arrow(key as "up" | "down"));
       await sleep(40);
     }
-    // Enter goes only once the marker sits on the chosen option of the same dialog.
     let onTarget = false;
     for (const until = Date.now() + 500; ; ) {
       await sleep(40);
@@ -1324,8 +1194,6 @@ async function answerSessionPermission(request: SessionPermissionAnswerRequest):
     if (result === "closed" && attention.prompt?.id === prompt.id)
       record({ kind: "prompt-closed", promptId: prompt.id, reason: "answered-here", label: chosen.label }, "host");
     if (result === "closed" && text !== undefined) {
-      // The notice follows a dialog that has closed, under the same lease. It is typed only while no other
-      // dialog shows, since its Enter would answer one; a refusal here leaves the receipt uncertain.
       await sleep(150);
       const noDialog = () => { assertTarget(); if (screenPrompt()) throw new Refusal("prompt-changed"); };
       noDialog();
@@ -1341,7 +1209,6 @@ async function answerSessionPermission(request: SessionPermissionAnswerRequest):
     refreshControl(request);
     return publicReceipt(receipt);
   } catch {
-    // The intent is durable. A control takeover or a changed screen mid-answer leaves the receipt uncertain.
     return publicReceipt(receipt);
   } finally {
     answering = undefined;
@@ -1368,8 +1235,6 @@ function validTeamAnswer(request: TeamAnswerRequest) {
   const rawAssignment: unknown = request.assignment;
   if (!rawAssignment || typeof rawAssignment !== "object" || Array.isArray(rawAssignment)) return false;
   const assignment = rawAssignment as TeamAssignment;
-  // A run reviewer's answer names its member and never a choice. A permission-agent delivery names its choice and
-  // no member; only its reject carries text, the host's fixed notice.
   const agentChoice = request.choice === "accept" || request.choice === "reject";
   if (request.choice !== undefined && !agentChoice) return false;
   if (agentChoice ? request.coordinatorMemberId !== undefined : !/^[a-f0-9-]{36}$/i.test(request.coordinatorMemberId ?? "")) return false;
@@ -1401,7 +1266,6 @@ const server = createServer((socket) => {
     const end = data.indexOf("\n");
     if (end < 0) return;
     socket.pause();
-    // The request is complete: the idle timeout guards slow senders, not a slow answer.
     socket.setTimeout(0);
     try {
       const request = JSON.parse(data.slice(0, end)) as WorkerRequest;
@@ -1448,7 +1312,6 @@ const server = createServer((socket) => {
           return native.connect(request);
         });
       } else if (request.op === "control") {
-        // Control changes must be able to fence an answer between its awaited terminal writes.
         result = changeControl(request);
       } else if (request.op === "team-answer-invalidate") {
         if (!/^[a-f0-9-]{36}$/i.test(request.decisionId)) throw new Error("Invalid delegated decision identity");
@@ -1461,7 +1324,6 @@ const server = createServer((socket) => {
         }
         result = { invalidated: true };
       } else if (request.op === "session-permission-invalidate") {
-        // Like a control change, this must be able to fence an answer between its awaited terminal writes.
         if (typeof request.decisionId !== "string" || !/^[A-Za-z0-9._:-]{1,100}$/.test(request.decisionId)) throw new Error("Invalid permission decision identity");
         invalidatedSessionPermissionDecisions.add(request.decisionId);
         if (invalidatedSessionPermissionDecisions.size > 512) invalidatedSessionPermissionDecisions.delete(invalidatedSessionPermissionDecisions.values().next().value!);
@@ -1493,7 +1355,6 @@ const server = createServer((socket) => {
         if (!validAnswer(request)) throw new Error("Invalid answer request");
         result = await serialize(() => {
           if (!permissionChannel?.owns(request.promptId, request.requestId)) return answer(request);
-          // The owner's answer to a deferred call: the same control rules as a dialog answer.
           if (!request.missionManaged) checkControl(request);
           return permissionChannel.answer(request);
         });
@@ -1538,7 +1399,6 @@ const server = createServer((socket) => {
           )
         )
           throw new Error("Invalid key");
-        // Waits for an in-flight answer so keystrokes never interleave with its arrows.
         result = await serialize(() => deliver(request));
       }
       socket.end(JSON.stringify({ result }) + "\n");
@@ -1553,12 +1413,9 @@ const server = createServer((socket) => {
   });
 });
 
-// ---- Launch ---------------------------------------------------------------------------------
-
 const hookToken = randomBytes(32).toString("hex");
 let resumeProvider: ((nativeSessionId: string) => void) | undefined;
 let endSession: (() => void) | undefined;
-// The headless permission channel, only when the host admitted this session to it at launch.
 const permissionChannel = config.permissionChannel && session.headless?.channel && provider === "claude"
   ? new HeadlessChannelWorker({
       sessionId: session.id,
@@ -1579,14 +1436,12 @@ const permissionChannel = config.permissionChannel && session.headless?.channel 
     })
   : undefined;
 if (permissionChannel) setInterval(() => permissionChannel.tick(), 60_000).unref();
-// Ordinary native arguments stay exact unless a scoped handoff policy was captured.
 const wantsHooks =
   !session.runtime?.nativeUi &&
   (Boolean(session.handoff?.policy) || session.nativeArgs === undefined) &&
   (Boolean(session.handoff?.policy) || Boolean(session.team) || provider === "demo" || Boolean(permissionChannel) ||
     (provider === "claude" && config.attention.hooks.claude) ||
     (provider === "codex" && config.attention.hooks.codex));
-// Hooks only add precision; the screen heuristics still work if the listener cannot start.
 const hookServer = wantsHooks
   ? await startHookServer({
       token: hookToken,
@@ -1606,7 +1461,6 @@ async function exitWorker(code: number) {
   try {
     unlinkSync(socketPath(runDir, session.id));
   } catch {
-    /* already gone */
   }
   process.exit(code);
 }
@@ -1642,21 +1496,17 @@ server.listen(socketPath(runDir, session.id), async () => {
     addProjectIdToLaunchEnv(env, session.projectId);
     addClaudeCodeModeToLaunchEnv(env, config.codeMode && !session.headless?.channel);
     if (config.codexTraceRoot) env.CODEX_ROLLOUT_TRACE_ROOT = config.codexTraceRoot;
-    // Present only with autonomy.boundary.github: Git and gh reach GitHub through the proxy with this grant.
     if (config.github) {
       env.INFINITE_GITHUB_GRANT = config.github.grant;
       env.INFINITE_GITHUB_PROXY = config.github.proxy;
     }
     if (session.team) {
       if (!hookServer) throw new Error("Team report channel could not start");
-      // The verification flag is host policy; the agent's binding stays the stable assignment identity.
       const { verificationRefused: _refused, entryTools: _entryTools, hostProfiles: _hostProfiles, ...binding } = session.team;
       env.INFINITE_TEAM_ASSIGNMENT = JSON.stringify(binding);
       if (session.team.role === "mission-coordinator")
         env.INFINITE_MISSION_ASSIGNMENT = JSON.stringify({ missionId: session.team.runId, memberId: session.team.memberId, revision: session.team.revision });
       if (session.workspaceTrusted) {
-        // A sudo profile's wrapper records Claude trust in the agent account; a provider in
-        // this account reads this account's config, so the worker records it here.
         env.INFINITE_TRUSTED_WORKSPACE = session.cwd;
         if (provider === "claude" && env.HOME && !/(^|\/)sudo$/.test(profile.command))
           try { recordClaudeTrust(claudeConfigPath(env.HOME), session.cwd); }
@@ -1668,8 +1518,6 @@ server.listen(socketPath(runDir, session.id), async () => {
       env.INFINITE_HOOK_URL = hookServer.url;
       env.INFINITE_HOOK_TOKEN = hookToken;
     }
-    // With autonomy.boundary.egress, the session reaches the network through the egress proxy under its own credential.
-    // Without the key it gets the proxy with no credential, so its requests are refused rather than sent direct.
     const egress = workerEgressEnvironment(session.projectId, session.id, process.env, Date.now(), session.purpose);
     if (egress.status === "invalid") throw new Error("The egress proxy address this worker inherited is unusable, so the session was not started");
     clearEgressEnvironment(env); Object.assign(env, egress.env);
@@ -1694,7 +1542,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       Boolean(session.team?.entryTools), Boolean(permissionChannel),
       egress.status !== "off",
       config.codeMode,
-      session.runtime?.nativeUi ? 0 : session.nativeArgs?.length, // a local native UI keeps them out of the profile
+      session.runtime?.nativeUi ? 0 : session.nativeArgs?.length,
     );
     if (session.runtime?.nativeUi === "codex") {
       if (session.workspace) {
@@ -1792,7 +1640,6 @@ server.listen(socketPath(runDir, session.id), async () => {
         if (usageLines) for (const event of usageLines.push(data)) {
           const usage = session.teamModelProfile ? usageFromRunLine(event, session.teamModelProfile.model) : undefined;
           if (usage) append("usage", { ...usage });
-          // A finished tool call is the activity a long headless turn shows; it carries no input.
           const tool = toolFromRunLine(event);
           if (tool) {
             record({ kind: "tool-start", tool: tool.tool, ...(tool.toolUseId ? { toolUseId: tool.toolUseId } : {}), input: {}, quiet: true }, "protocol");
@@ -1811,7 +1658,7 @@ server.listen(socketPath(runDir, session.id), async () => {
           try {
             flush();
           } catch {
-            return; // flush() already suspended the session
+            return;
           }
           checkScreen();
         }, 40);
@@ -1824,12 +1671,10 @@ server.listen(socketPath(runDir, session.id), async () => {
       } else output(data);
     };
     child.onData(onData);
-    /** After the provider exited, the relay reads the transcript once more, for at most FINAL_DRAIN_MS. Never rejects. */
     const finalDrain = async () => {
       try {
         if (!hookServer || !transcriptWatch.reading) return;
         const launch = drainLaunch(profile, relayPath);
-        // Without a launch the watch records the drain as skipped.
         if (!launch) return;
         const drainEnv: Record<string, string> = {};
         for (const name of ["PATH", "HOME"]) {
@@ -1840,10 +1685,9 @@ server.listen(socketPath(runDir, session.id), async () => {
         drainEnv.INFINITE_HOOK_TOKEN = hookToken;
         drainOpen = true;
         try { await runFinalDrain(launch, drainEnv); } finally { drainOpen = false; }
-      } catch { /* A failed drain loses the rows it did not read; the coverage record says so. */ }
+      } catch {}
     };
     const exited = (exitCode: number) => {
-      // The provider ended its run on a deferred call: the session stays open for the owner's answer.
       if (permissionChannel?.exited(exitCode)) return;
       native?.stop();
       void hybrid?.close().catch(() => {}); executor?.close();
@@ -1857,13 +1701,12 @@ server.listen(socketPath(runDir, session.id), async () => {
       } catch {
         recordingFailure();
       }
-      // The exit record is journaled before the drain: readers of `exited` see the gates refuse input during it.
       void (async () => {
         await finalDrain();
         try {
           if (provider !== "opencode") append("usage-coverage", { ...transcriptWatch.finish(hooksReady, true) });
           persist();
-        } catch { /* A usage failure loses usage, never the exit record. */ }
+        } catch {}
         const finish = () => { if (handoffStopping) setTimeout(finish, 100); else void exitWorker(0); };
         setTimeout(finish, 1500);
       })();
@@ -1873,7 +1716,6 @@ server.listen(socketPath(runDir, session.id), async () => {
       else exited(exitCode);
     };
     child.onExit(onExit);
-    // The owner answered a deferred call: the same conversation continues in this session, with the channel.
     resumeProvider = nativeSessionId => {
       const next = buildLaunch(
         provider, headlessResumeProfile(profile, nativeSessionId), "",

@@ -25,7 +25,6 @@ const areas: SegmentOption<Area>[] = [
   { value: "maintenance", label: "Maintenance" },
 ];
 
-/** Catalog editing and live component knowledge for the selected workspace. */
 export function KnowledgePanel({ connection, workspaceId, knowledge, readGeneration, defaultArea, openComponentId, openComponentNonce, repositories, work, offline, onComponentNavigate }: { connection: Connection; workspaceId: string; knowledge?: WorkspaceKnowledge; readGeneration: string; defaultArea: Area; openComponentId?: string; openComponentNonce?: number; repositories: UnderstandingRepository[]; work: UnderstandingWork[]; offline: boolean; onComponentNavigate?: () => void }) {
   const router = useRouter();
   const [area, setArea] = useState<Area>(defaultArea);
@@ -195,7 +194,7 @@ export function KnowledgePanel({ connection, workspaceId, knowledge, readGenerat
     let current = true;
     void Promise.resolve().then(() => { if (current) navigateComponent(openComponentId); });
     return () => { current = false; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- run once per request; the nonce makes repeat taps of one component new requests.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openComponentId, openComponentNonce]);
   const componentDetailDidLayout = (id: string) => {
     if (pendingComponentNavigation.current !== id) return;
@@ -244,7 +243,6 @@ export function KnowledgePanel({ connection, workspaceId, knowledge, readGenerat
   </View>;
 }
 
-/** Follows cursors; keeps pages already loaded when a later page fails or the page cap is hit. Auth errors throw. */
 async function loadGenerated(connection: Connection, base: string): Promise<{ data: GeneratedFromWork; error?: undefined } | { data: null; error: string }> {
   const found: GeneratedFromWork = { projects: [], plans: [], coverage: [] };
   let cursor: string | null = null;
@@ -472,7 +470,6 @@ function DeliveryArea({ delivery }: { delivery: KnowledgeDelivery[] }) {
         <Text style={k.body}>No delivery observations yet.</Text>
         <Coverage lines={item.coverage.slice(0, 1)} />
       </> : <>
-        {/* Counts the host's observed pull request list (newest 20 by state); no extra time window is applied to "recently". */}
         <Text style={k.body}>Open pull requests {item.pullRequests.filter(pr => pr.state === "open").length} · merged recently {item.pullRequests.filter(pr => pr.state === "merged").length}</Text>
         <Text style={k.meta}>Observed {date(item.observedAt ?? "")}</Text>
         {item.pullRequests.map(pr => <View key={`${pr.repositoryId}/${pr.number}`} style={k.plan}><SafeLink label={`#${pr.number} ${pr.title} · ${pr.state} · checks ${pr.checks.filter(check => check.conclusion === "success").length}/${pr.checks.length}`} url={pr.url} />{pr.checks.map((check, j) => <View key={j} style={k.edge}><Text style={k.label}>{check.name} · {check.status}{check.conclusion ? ` · ${check.conclusion}` : ""}</Text>{check.url ? <SafeLink label="Open check" url={check.url} /> : null}</View>)}</View>)}
@@ -571,7 +568,7 @@ function EvidenceItem({ evidence }: { evidence: { repositoryId: string; source: 
 }
 function Coverage({ lines }: { lines: string[] }) { return lines.map((line, i) => <Text key={`${i}/${line}`} style={k.note}>Coverage · {line}</Text>); }
 function SafeLink({ label, url }: { label: string; url: string }) {
-  const open = () => { try { const parsed = new URL(url); if (parsed.protocol === "https:" && !parsed.username && !parsed.password) void Linking.openURL(parsed.toString()); } catch { /* malformed links remain text-only */ } };
+  const open = () => { try { const parsed = new URL(url); if (parsed.protocol === "https:" && !parsed.username && !parsed.password) void Linking.openURL(parsed.toString()); } catch {} };
   return <Pressable accessibilityRole="link" onPress={open}><Text style={k.link}>{label}</Text></Pressable>;
 }
 function confirmArchive(name: string, onConfirm: () => void) { Alert.alert(`Archive ${name}?`, "This hides the record from active lists and keeps its history.", [{ text: "Cancel", style: "cancel" }, { text: "Archive", style: "destructive", onPress: onConfirm }]); }

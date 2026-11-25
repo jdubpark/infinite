@@ -21,7 +21,6 @@ const sha = (value: unknown): string => createHash("sha256").update(JSON.stringi
 const recorded = (f: Fixture) => recordIn(f).log.filter(entry => entry.op === VERDICT_OPS.recorded);
 const stateOf = (f: Fixture, id: string) => f.verdicts.detail(RUN)!.criteria.find(item => item.id === id)?.state;
 
-/** A reviewed run whose first verdict is composed and saved, then delivered: the status is `merged` and saved. */
 function delivered(options: { goal?: boolean; criteria?: Criterion[] } = {}): Fixture {
   const f = fixture({ run: { lineup: SAME_FAMILY }, record: recordOf(RUN, 1, options.criteria ?? [MERGED, LANDED]), ...(options.goal === true ? { goal: true } : {}) });
   assert.equal(f.verdicts.reviewed(f.holder), true);
@@ -33,7 +32,6 @@ function delivered(options: { goal?: boolean; criteria?: Criterion[] } = {}): Fi
   return f;
 }
 
-/** A restart: the holder as last saved, a new host and service, the world (passes, goal record, uuids) kept. */
 function reopen(f: Fixture, fact = f.host.deliveryFact): Fixture {
   const holder = JSON.parse(f.host.persisted.get(RUN)!) as FakeHolder;
   const host = new FakeHost(f.world, new Map([[RUN, holder]]));
@@ -44,7 +42,6 @@ function reopen(f: Fixture, fact = f.host.deliveryFact): Fixture {
   return { world: f.world, host, verdicts, holder };
 }
 
-/** What a pass must not touch: lengths first, then one digest of each large part. */
 function unchanged(f: Fixture, before: { saves: number; uuids: number; events: number; record: string; holder: string }): void {
   assert.equal(f.host.saves, before.saves, "nothing is saved");
   assert.equal(f.world.uuids, before.uuids, "no id is drawn");
@@ -65,7 +62,6 @@ test("a changed delivery fact composes one new verdict and a repeat composes non
   assert.equal(stateOf(f, "c3"), "inconclusive", "before the delivery is seen");
   const run = { status: f.holder.run.status, revision: f.holder.run.revision, head: f.holder.run.headCommit, members: f.holder.run.members.length, pending: f.holder.run.pending };
 
-  // A ledger without the landing changes nothing.
   f.host.deliveryFact = "none";
   let before = snapshot(f);
   assert.equal(f.verdicts.settleReceipt(f.holder), false);
@@ -88,7 +84,6 @@ test("a changed delivery fact composes one new verdict and a repeat composes non
   assert.equal(f.verdicts.detail(RUN)?.evaluatorResult, "met", "the evaluator's answer is composed again, not asked again");
   assert.deepEqual({ status: f.holder.run.status, revision: f.holder.run.revision, head: f.holder.run.headCommit, members: f.holder.run.members.length, pending: f.holder.run.pending }, run);
 
-  // A repeat draws no id and writes nothing; the fact never moves back.
   before = snapshot(f);
   assert.equal(f.verdicts.settleReceipt(f.holder), false);
   f.host.deliveryFact = "none";
@@ -96,7 +91,6 @@ test("a changed delivery fact composes one new verdict and a repeat composes non
   unchanged(f, before);
   assert.equal(f.holder.outbox.length, outbox + 1);
 
-  // A revert is a third verdict: the landed criterion turns, the merged one does not.
   f.host.deliveryFact = "reverted";
   assert.equal(f.verdicts.settleReceipt(f.holder), true);
   assert.equal(recorded(f).length, 3);
@@ -115,7 +109,6 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
     return handles;
   };
 
-  // A: save 1 throws; a restart finds the old id and no fact, and one pass gives one late verdict.
   const a = delivered();
   a.host.deliveryFact = "landed";
   a.host.failSaveIn = 1;
@@ -127,7 +120,6 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
   assert.equal(a2.host.deliveryReads, 1);
   assert.equal(a2.verdicts.settleReceipt(a2.holder), false);
 
-  // B: save 1 passes, the record write passes, save 2 throws; the restart finds the new id and composes it with no store read.
   const b = delivered();
   b.host.deliveryFact = "landed";
   b.host.failSaveIn = 2;
@@ -138,7 +130,6 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
   counts(b2, 2);
   assert.equal(b2.host.deliveryReads, 0, "the saved fact is composed without a read");
 
-  // C: as B on a goal run, where the record write saved the goal's file before the restart: the entry exists and is not written again.
   const c = delivered({ goal: true });
   c.host.deliveryFact = "landed";
   c.host.failSaveIn = 2;
@@ -152,7 +143,6 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
   assert.equal(c2.holder.outbox.length, 2);
   assert.equal(c2.holder.run.assessment?.verdictId, c2.holder.verdict!.verdictId);
 
-  // D: a restart after save 2; the next three passes write nothing.
   const d = delivered();
   d.host.deliveryFact = "landed";
   assert.equal(d.verdicts.settleReceipt(d.holder), true);
@@ -162,7 +152,6 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
   unchanged(d2, before);
   counts(d2, 2);
 
-  // E: landed, restart, reverted: three verdicts in all, each id once.
   const e = delivered();
   e.host.deliveryFact = "landed";
   assert.equal(e.verdicts.settleReceipt(e.holder), true);
@@ -172,7 +161,6 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
   counts(reopen(e2), 3);
   assert.equal(stateOf(e2, "c4"), "not-met");
 
-  // F: save 1 throws and the process lives; the next pass finishes through the saved fact with no store read.
   const f = delivered();
   f.host.deliveryFact = "landed";
   f.host.failSaveIn = 1;
@@ -182,7 +170,6 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
   assert.equal(f.host.deliveryReads, reads, "no store read");
   counts(f, 2);
 
-  // F2: save 2 throws and the process lives; memory holds the verdict, and a pass adds nothing to it.
   const g = delivered();
   g.host.deliveryFact = "landed";
   g.host.failSaveIn = 2;
@@ -197,7 +184,6 @@ test("a late verdict judges only what its earlier verdict held, and replaces wha
   const latest = (f: Fixture, id: string) => recordIn(f).criteria.find(item => item.id === id)?.latest;
   const drop = (f: Fixture, id: string) => { f.holder.verdict!.composed!.criteria = f.holder.verdict!.composed!.criteria.filter(item => item.id !== id); };
 
-  // Only `merged` waits: a revert of the landing changes nothing, on this pass or the next.
   const merged = delivered({ criteria: [MERGED] });
   merged.host.deliveryFact = "landed";
   assert.equal(merged.verdicts.settleReceipt(merged.holder), true);
@@ -208,7 +194,6 @@ test("a late verdict judges only what its earlier verdict held, and replaces wha
   unchanged(merged, kept);
   assert.equal(recorded(merged).length, 2);
 
-  // The record names `landed`, but the first verdict did not hold it: the late verdict leaves it out, and a revert composes nothing.
   const later = delivered();
   const first = later.holder.verdict!.verdictId;
   drop(later, "c4");
@@ -220,7 +205,6 @@ test("a late verdict judges only what its earlier verdict held, and replaces wha
   later.host.deliveryFact = "reverted";
   assert.equal(later.verdicts.settleReceipt(later.holder), false, "a criterion the verdicts never held starts no third verdict");
 
-  // The second verdict's record write failed: the third replaces what the first wrote.
   const failed = delivered();
   const before = structuredClone(failed.holder.objectiveRecord);
   failed.host.deliveryFact = "landed";
@@ -231,7 +215,6 @@ test("a late verdict judges only what its earlier verdict held, and replaces wha
   assert.equal(failed.verdicts.settleReceipt(failed.holder), true);
   assert.deepEqual([latest(failed, "c4")?.verdictId, latest(failed, "c4")?.state], [failed.holder.verdict!.verdictId, "not-met"]);
 
-  // A refused report kept beside a reason is no answer: the late verdict reads the reason.
   const refused = evaluating({ record: recordOf(RUN, 1, [MERGED]) });
   reportEvaluator(refused, refused.member, reportOf({ c0: "met" }));
   settle(refused.host);
@@ -243,7 +226,6 @@ test("a late verdict judges only what its earlier verdict held, and replaces wha
   assert.equal(stateOf(refused, "c0"), "inconclusive");
   assert.equal(refused.verdicts.detail(RUN)?.evaluatorResult, undefined);
 
-  // A restart between the two saves, and the record is gone: the assessment stays.
   const lost = delivered();
   lost.host.deliveryFact = "landed";
   lost.host.failSaveIn = 2;
@@ -272,7 +254,6 @@ test("a run outside the rule is returned before any store read", () => {
     ["no assessment", f => { delete f.holder.run.assessment; }],
     ["no since", f => { delete f.holder.verdict!.since; }],
     ["record unavailable", f => { f.holder.verdict!.reason = "record-unavailable"; }],
-    // The record names delivery criteria, but none of this verdict's criteria waited for the delivery.
     ["nothing waited", f => { for (const item of f.holder.verdict!.composed!.criteria) if (item.reason === "before-delivery") item.reason = "no-receipt"; }],
   ];
   for (const [name, change] of refused) {
@@ -285,7 +266,6 @@ test("a run outside the rule is returned before any store read", () => {
     assert.equal(sha(f.holder), before.holder, `${name}: the holder is as it was`);
     assert.equal(f.host.saves, before.saves, `${name}: no save`);
   }
-  // A record that is gone is seen after the ledger is asked: nothing is saved and no id is drawn.
   const gone = delivered();
   delete gone.holder.objectiveRecord;
   gone.host.deliveryFact = "landed";
@@ -297,14 +277,12 @@ test("a run outside the rule is returned before any store read", () => {
   assert.equal(noCriterion.verdicts.settleReceipt(noCriterion.holder), false);
   assert.equal(noCriterion.host.deliveryReads, 0, "no delivery criterion: no store read");
 
-  // The same run, unchanged, is the one that reads; a ready-for-review run reads too.
   const reads = delivered();
   reads.holder.run.status = "ready-for-review";
   reads.host.deliveryFact = "landed";
   assert.equal(reads.verdicts.settleReceipt(reads.holder), true);
   assert.equal(reads.host.deliveryReads, 1);
 
-  // The port over a store with no outcome module reads nothing and says so; over one with it, an unseen run is none.
   const root = mkdtempSync(join(tmpdir(), "infinite-verdict-receipts-"));
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: randomBytes(32) });
   try {

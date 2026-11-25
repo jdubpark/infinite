@@ -76,7 +76,6 @@ export function reportOf(states: Record<string, AssessedState>, note?: string, e
 
 export type FakeHolder = VerdictHolder & { outbox: VerdictEventData[] };
 export type PassEntry = { head: string; pending: boolean; receipts?: ObjectiveReceipt[] };
-/** What survives a restart outside the holders: the register's passes, the goal's record, and the uuid counter. */
 export type World = { passes: Map<string, PassEntry>; uuids: number; store?: { record: ObjectiveRecord; failing: boolean }; marks: number };
 export const newWorld = (): World => ({ passes: new Map(), uuids: 0, marks: 0 });
 
@@ -134,9 +133,7 @@ export class FakeHost implements VerdictHost {
   clock = AT;
   saves = 0;
   failNextSave = false;
-  /** The save that throws, counted from now: 1 is the next save. */
   failSaveIn = 0;
-  /** What the ledger shows for the run; undefined is a store that cannot be read. */
   deliveryFact: DeliveryFact | undefined = "none";
   deliveryReads = 0;
   verdicts?: TeamVerdicts;
@@ -219,19 +216,16 @@ export function fixture(options: { run?: Partial<TeamRun>; record?: ObjectiveRec
   return { world, host, verdicts, holder };
 }
 
-/** A goal cycle that reported no change: no task, and the head equal to the base. */
 export function noChangeFixture(run: Partial<TeamRun> = {}, record?: ObjectiveRecord): Fixture {
   const f = fixture({ goal: true, run: { status: "planning", review: undefined, headCommit: BASE, ...run }, ...(record === undefined ? {} : { record }) });
   f.holder.run.tasks.length = 0;
   return f;
 }
 
-/** The holder's record, wherever it lives. */
 export function recordIn(f: Fixture): ObjectiveRecord {
   return f.world.store ? f.world.store.record : f.holder.objectiveRecord as ObjectiveRecord;
 }
 
-/** The evaluator reports as the host stores it: screened, saved, consumed. */
 export function reportEvaluator(f: Fixture, member: TeamMember, report: TeamReport): void {
   member.report = report;
   member.status = "reported";
@@ -240,13 +234,11 @@ export function reportEvaluator(f: Fixture, member: TeamMember, report: TeamRepo
   f.verdicts.consume(f.holder, member);
 }
 
-/** No argument means a clean check; an explicit `undefined` is a check that ended without a result. */
 export function settle(host: FakeHost, ...clean: [boolean | undefined] | []): void {
   const value = clean.length === 0 ? true : clean[0];
   for (const op of host.pending.splice(0)) op.complete(value);
 }
 
-/** Steps until the state reaches `status` or five calls pass. */
 export function drive(f: Fixture, status: string): void {
   for (let index = 0; index < 5 && f.holder.verdict?.status !== status; index += 1) f.verdicts.step(f.holder);
 }
@@ -254,7 +246,6 @@ export function drive(f: Fixture, status: string): void {
 export const countOf = (texts: string[], text: string): number => texts.filter(item => item === text).length;
 export const eventTexts = (holder: VerdictHolder): string[] => holder.run.events.map(item => item.text);
 
-/** A reviewed run through the register's pass and the evaluator's launch. */
 export function evaluating(options: Parameters<typeof fixture>[0] = {}): Fixture & { member: TeamMember } {
   const f = fixture(options);
   assert.equal(f.verdicts.reviewed(f.holder), true, "the verdict holds");

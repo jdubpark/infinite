@@ -190,7 +190,6 @@ test("moved-base recovery copies from a source mirror through the restricted lau
     const moved = commit(source, "move the base");
     git(mirror, "fetch", "--no-tags", "--", source, "+refs/heads/main:refs/heads/main");
 
-    // The restriction is real: the mirror refuses object inspection but accepts the pinned fetch and rev-parse.
     const inspected = await teamCommand({ command: "git", args: teamGitArgs(mirror, ["cat-file", "-t", moved]) }, mirror, undefined, 30000, prefix);
     assert.equal(inspected.exitCode, 126);
     assert.match(inspected.output, /only the pinned base-branch fetch and rev-parse are permitted/);
@@ -239,7 +238,6 @@ test("a Git command keeps the grant of its operation and still ignores replace r
     assert.ok(gitLines.includes("INFINITE_GITHUB_GRANT=grant-for-one-push"));
     assert.ok(gitLines.includes("GIT_NO_REPLACE_OBJECTS=1"));
 
-    // A grant cannot turn replace refs back on.
     const unpinned = await teamCommand({ command: "git", args: teamGitArgs(root, ["-c", "alias.environment=!env", "environment"]) }, root, undefined, 30000, undefined, undefined, { GIT_NO_REPLACE_OBJECTS: "0" });
     assert.ok(unpinned.stdout.split("\n").includes("GIT_NO_REPLACE_OBJECTS=1"));
 

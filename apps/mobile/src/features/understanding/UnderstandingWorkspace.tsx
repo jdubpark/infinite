@@ -23,11 +23,9 @@ const views: SegmentOption<ViewMode>[] = [
   { value: "system", label: "System", glyph: "target" },
 ];
 
-/** Read-only Work and System views for one explicitly grouped workspace. */
 export function UnderstandingWorkspace({ connection, workspaceId }: { connection: Connection; workspaceId: string }) {
   const router = useRouter();
   const params = useLocalSearchParams<{ machine?: string; view?: string; component?: string }>();
-  // Keep credential changes inside the in-memory poll scope so stale responses cannot cross pairings.
   const key = `${connectionKey(connection)}|${connection.url}|${connection.relay?.machineId ?? "direct"}|${connection.token}|${connection.access?.clientId ?? ""}|${connection.access?.clientSecret ?? ""}`;
   const scope = `${key}\u0000${workspaceId}`;
   const scroll = useRef<ScrollView>(null);
@@ -35,11 +33,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   const stopped = useRef("");
   const last = useRef<ReadResult | null>(null);
   const [view, setView] = useState<ViewMode>(params.view === "system" ? "system" : "work");
-  // The checkouts from the last successful workspace list, for the halt banner. They are kept apart from the brief,
-  // so a project halt still shows when the brief read fails after the list succeeded.
   const [membership, setMembership] = useState<{ scope: string; checkouts: Checkout[] }>();
-  // Each list read takes a ticket before it starts; an answer may replace only an older read's membership, so a
-  // request that outlived a refocus or a pairing change cannot restore checkouts a newer read replaced.
   const membershipIssued = useRef(0);
   const membershipApplied = useRef(0);
 
@@ -103,14 +97,11 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
     if (last.current?.scope !== scope) last.current = null;
   }, [scope]);
 
-  // usePoll deliberately retains its last value across dependency changes. Only show a value that
-  // belongs to the current machine and workspace so a late response can never flash across scope.
   const result = poll.data?.scope === scope ? poll.data : null;
   const data = result?.state === "ready" ? result.data : undefined;
   const repoById = new Map(data?.repositories.map(repo => [repo.id, repo]) ?? []);
   const groupName = result?.groupName || data?.workspace.name || "Workspace";
   const checkouts = membership?.scope === scope ? membership.checkouts : [];
-  // The halt scope comes from the brief's repositories too, so an offline view from the cache still shows its projects' halts.
   const haltScope = workspaceHaltScope(data?.repositories ?? [], checkouts);
   const back = () => router.canGoBack() ? router.back() : router.replace({ pathname: "/(tabs)/understanding", params: { ...(params.machine ? { machine: params.machine } : {}) } });
   const revealKnowledge = (anchor: View | null) => {
@@ -214,13 +205,11 @@ function MembershipMap({ workspace, repositories, onPress }: { workspace: string
 
 function SystemView({ data, connection, workspaceId, readGeneration, offline, onComponentNavigate, initialComponent }: { data: WorkspaceUnderstanding; connection: Connection; workspaceId: string; readGeneration: string; offline: boolean; onComponentNavigate: (anchor: View | null) => void; initialComponent?: string }) {
   const anchor = useRef<View>(null);
-  // A `component` route param (from a work brief) opens that component once, when the view mounts.
   const [open, setOpen] = useState({ id: initialComponent ?? "", nonce: initialComponent ? 1 : 0 });
   return <View style={s.stack}>
     <SystemOverview connection={connection} workspaceId={workspaceId} data={data} offline={offline}
       onOpenComponent={id => { setOpen(previous => ({ id, nonce: previous.nonce + 1 })); onComponentNavigate(anchor.current); }} />
     <View ref={anchor}><KnowledgePanel onComponentNavigate={() => onComponentNavigate(anchor.current)} key={`${connectionKey(connection)}|${connection.url}|${connection.token}|${workspaceId}`} connection={connection} workspaceId={workspaceId} knowledge={data.knowledge} readGeneration={readGeneration} defaultArea="components" openComponentId={open.id} openComponentNonce={open.nonce} repositories={data.repositories} work={data.work} offline={offline} /></View>
-    {/* Only the pointers to the detail pages; the source-separation sentences belong to the Work tab. */}
     {data.coverage.filter(line => line.includes("shown here")).map((line, index) => <Text key={`coverage-${index}`} style={s.note}>{line}</Text>)}
     <Text style={s.note}>Generated from the code and the work records. It does not mean anything is deployed or approved.</Text>
   </View>;

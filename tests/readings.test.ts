@@ -211,7 +211,6 @@ test("polling reads a session record once unless a title job is due", async () =
   f.manager.list = async () => rows;
   f.manager.meta = (id: string) => { reads[id]!++; return { session: sessions[id] }; };
   try {
-    // Part 1: no writer, so no title job is ever due.
     await f.readings.tick();
     await f.readings.tick();
     assert.deepEqual(reads, { O: 1, S: 1, C: 1 });
@@ -223,7 +222,6 @@ test("polling reads a session record once unless a title job is due", async () =
     assert.equal(reads.S, 2, "a single-session read follows no listing and reads that record again");
     await f.readings.tick();
     assert.equal(reads.S, 2, "a tick after a single-session read answers from the remembered snapshot");
-    // A session's detail is built from the stored record, which carries `backend`. It is still no listing, and the caller says so.
     f.readings.merge([rows[1]!], false);
     assert.equal(reads.S, 3, "a detail read follows no listing and reads that record again");
     await f.readings.tick();
@@ -235,7 +233,6 @@ test("polling reads a session record once unless a title job is due", async () =
 
   const writer = { titleFromPrompt: async () => ({ text: "Database read consistency", model: "writer-model" }) };
 
-  // Part 1b: a replaced record. A remembered answer follows the meta file's revision, not only the row's title.
   const replaced = setup({ title: "", generatedTitle: true, prompt: "Short A" });
   let replacedPrompt = "Short A";
   let replacedRevision: string | undefined = "rev-1";
@@ -259,7 +256,6 @@ test("polling reads a session record once unless a title job is due", async () =
     assert.equal(replacedReads, beforeUnsettled + 2, "a record with no settled revision is read on every listing");
   } finally { replaced.dispose(); }
 
-  // Part 1c: title candidates behind two jobs that never answer. The queue holds at most MAX_PENDING (50) jobs.
   const titleGate = async (count: number) => {
     const settles: Array<(error: Error) => void> = [];
     const hanging = { systemOne: (_request: unknown) => new Promise((_resolve, reject) => { settles.push(reject); }) } as unknown as JevTransport;
@@ -294,7 +290,6 @@ test("polling reads a session record once unless a title job is due", async () =
     await full.fixture.readings.tick();
     assert.equal(total(full.counts), readsBeforeFull, "a full queue reads no record, although candidates wait");
 
-    // Make room: one running job ends with a failure, which backs its candidate off and starts the next queued job.
     const waitingBefore = new Set(full.ids.filter(id => !state.queue.has(`${id}:title`) && !state.active.has(`${id}:title`)));
     const countsBefore = new Map(full.counts);
     full.settles.shift()!(new Error("provider unavailable"));
@@ -305,7 +300,6 @@ test("polling reads a session record once unless a title job is due", async () =
     assert.ok(waitingBefore.has(newlyRead[0]!), "the record read for the free slot was a waiting candidate");
   } finally { full.fixture.readings.stop(); full.fixture.dispose(); }
 
-  // Part 2: a failed title job is not retried, and its record is read again only after the failure expires.
   let failedCalls = 0;
   const failing = { systemOne: async () => { failedCalls++; throw new Error("timeout"); } } as unknown as JevTransport;
   const failure = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: failing, writer });
@@ -326,14 +320,12 @@ test("polling reads a session record once unless a title job is due", async () =
     await eventually(() => failedCalls === 2);
   } finally { failure.dispose(); }
 
-  // Part 3: a title reading that is done is never read again.
   const clear = responding({ clear: 0.9 });
   const answered = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: clear.transport, writer });
   let answeredReads = 0;
   answered.manager.meta = () => { answeredReads++; return { session: answered.session }; };
   try {
     await answered.readings.tick();
-    // The rows of a session list all carry a backend; a row without one is a single-session read, which reads the record.
     const listed = [{ ...answered.row, backend: "infinite" as const }];
     await eventually(() => answered.readings.merge(listed)[0].reading?.title?.source === "jev-first-line");
     await answered.readings.tick();
@@ -341,7 +333,6 @@ test("polling reads a session record once unless a title job is due", async () =
     assert.equal(answeredReads, 1, "a finished title reading is not read again");
   } finally { answered.dispose(); }
 
-  // Part 4: a title job that never answers is pending, so its record is not read again.
   let pendingCalls = 0;
   const pending = { systemOne: async () => { pendingCalls++; return new Promise<never>(() => {}); } } as unknown as JevTransport;
   const waiting = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: pending, writer });
@@ -355,7 +346,6 @@ test("polling reads a session record once unless a title job is due", async () =
     assert.equal(pendingCalls, 1);
   } finally { waiting.readings.stop(); waiting.dispose(); }
 
-  // Part 5: with session readings off, no title job can follow, so a candidate is read once like any other session.
   const off = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: pending, writer });
   let offReads = 0;
   off.manager.meta = () => { offReads++; return { session: off.session }; };

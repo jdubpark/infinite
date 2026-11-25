@@ -29,7 +29,6 @@ import { MissionManagedLine } from "../board/MissionManagedLine";
 import { useControlSync, useSessionControl } from "./useSessionControl";
 import { KEYS, useSteering } from "./useSteering";
 
-/** The session's current screen, the raw key row and the text composer. */
 export function Terminal({
   connection,
   id,
@@ -45,7 +44,6 @@ export function Terminal({
   const control = useSessionControl(connection, id);
   const { data, online, stale, seen, refresh } = usePoll(
     async () => {
-      // A poll that started before a local control change must not undo it.
       const revision = control.generation();
       const [session, me] = await Promise.all([
         api<SessionDetail>(connection, `/sessions/${id}`),
@@ -58,21 +56,16 @@ export function Terminal({
   );
   useControlSync(control, data, stale);
   const session = data?.session ?? null;
-  // A mission coordinator runs this session. While its provider prompt is open the person may answer in the
-  // terminal, so input and control are offered; otherwise the phone sends no text, keys, stop, resume or control.
   const missionId = session?.managedBy?.missionId;
   const needsYou = session?.attention.state === "needs-you";
   const missionLocked = Boolean(missionId) && !needsYou;
   const role = data?.me.role;
   const environment = data?.me.environment ?? "";
-  // Workers that enforce control take input only from the device holding the lease.
   const requiresControl = !missionLocked && session?.capabilities?.inputControl === 1;
-  // A lease this phone still holds once a mission-run session no longer needs a person is released.
   const { forget } = control;
   useEffect(() => {
     if (missionLocked) forget(true);
   }, [forget, missionLocked]);
-  // The person sees the screen here, so text may go into an open dialog.
   const steering = useSteering(connection, id, refresh, control, {
     force: true,
     draftKey: `${connectionKey(connection)}/${id}/terminal`,
@@ -84,7 +77,6 @@ export function Terminal({
   const canSteer =
     online && running && role !== undefined && role !== "viewer" && controlled && !missionLocked;
   const canSend = canSteer && !steering.busy && Boolean(steering.text.trim());
-  // The field (and its mic) docks only while this phone may type; dictation stops with it.
   const composerShown = role !== undefined && role !== "viewer" && !missionLocked && running;
   const fieldShown = composerShown && controlled;
   const dictation = useDictation({
@@ -102,7 +94,6 @@ export function Terminal({
     await control.claim(takeover);
     refresh();
   }
-  // The dock names who may type: a claim line until this phone holds the lease, then the field with its release.
   const access: ComposerAccess | undefined = !requiresControl
     ? undefined
     : control.lease
@@ -149,7 +140,6 @@ export function Terminal({
               {session.screen || "This process has no current screen."}
             </Text>
           </ScrollView>
-          {/* One measured block for the mission line and the composer, so the notice clears whichever is taller. */}
           <View onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}>
             {missionId ? <MissionManagedLine missionId={missionId} machine={connectionKey(connection)} style={s.managedLine} /> : null}
             {composerShown ? (

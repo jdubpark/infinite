@@ -14,12 +14,10 @@ import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
 type ServiceOptions = { now?: () => number; volumeUsage?: (path: string) => Promise<VolumeUsage>; processes?: HostProcesses };
 
-/** A census that returns whatever the test scripts next. The table and start token are fixed; the witness samples are not checked here. */
 function scriptedProcesses(census: () => CensusResult): HostProcesses {
   return { table: async () => ({ boot: "test-boot", rows: [] }), start: async () => "test-start", census: async () => census() };
 }
 
-/** The run record as the last save left it on disk. */
 function savedRecord(f: ReturnType<typeof schedulerFixture>) {
   return unseal<{ pending?: { recording?: true; witness?: { processes: { pid: number; start: string }[]; sessions: number[]; groups: number[] } } }>(
     f.key, `team:${f.run.id}`, readFileSync(join(f.config.stateDir, "teams", `${f.run.id}.sealed`), "utf8"));
@@ -144,7 +142,6 @@ test("a blocked run with an unresolved operation keeps its workspace and stays b
   retention(f, { blockedHours: 1 }); f.writeTeam();
   const teams = openTeam(f, { now: () => Date.parse(at) + 3_600_001 });
   try {
-    // The host cannot see a process orphaned by an earlier restart, so elapsed time never proves the operation ended.
     (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = { id: randomUUID(), kind: "check", revision: 1 };
     teams.start(); await teams.idle();
     assert.equal(existsSync(runDirectory(f.run)), true);
@@ -175,7 +172,6 @@ test("a blocked run keeps its workspace while the host sees a process of the int
     assert.equal(looks, 1, "a look that found a process stands until the next scheduled look, though the pass runs on every tick");
     assert.equal(teams.get(f.run.id).pendingOperation?.processes, "running");
 
-    // A process that only uses the directory is not called the check's process, and still keeps the workspace.
     result = { ok: true, findings: [{ pid: 4243, reason: "working-directory" }] }; now += 10 * 60_000;
     await waitFor(() => eventCount(inUse) === 1, "the host should report a process that uses the run directory as such");
     assert.equal(teams.get(f.run.id).pendingOperation?.processes, "in-use");
@@ -280,7 +276,6 @@ test("an operation's intent says its record may be incomplete until a save holds
       operation: (stored: unknown, kind: string, perform: () => Promise<unknown>, complete: () => void) => void };
     const stored = internals.records.get(f.run.id)!;
     internals.operation(stored, "check", () => teamCommand({ command: process.execPath, args: ["-e", "setTimeout(() => {}, 1500)"] }, process.cwd()), () => {});
-    // The command has started. What a host that stopped now would find on disk: the intent, still marked as recording, without the command.
     const pid = stored.pending!.witness!.sessions[0]!;
     assert.ok(pid > 0, "the command's session and group are recorded as it starts");
     assert.deepEqual(stored.pending!.witness!.groups, [pid]);
@@ -302,13 +297,11 @@ test("a host stop inside a command's drain signals nothing, and after a restart 
   const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; } };
   type Internals = { records: Map<string, { pending?: unknown }>; operation: (stored: unknown, kind: string, perform: (signal: AbortSignal) => Promise<unknown>, complete: () => void) => void;
     refreshOperationCensus: (stored: unknown, force: boolean) => Promise<string | undefined> };
-  // Real processes and the real census. The leader leaves a sleep in its group that holds its output, then exits once released.
   const teams = openTeam(f);
   let restarted: TeamService | undefined;
   try {
     const internals = teams as unknown as Internals;
     const stored = internals.records.get(f.run.id)!;
-    // The wait for the release is counted, so a test process that ended early cannot leave the shell polling for long.
     const script = `echo $$ > '${leaderFile}'; sleep 30 & echo $! > '${leftFile}'; i=0; while [ ! -f '${release}' ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done; exit 0`;
     let commandSettled = false;
     internals.operation(stored, "check", signal => teamCommand({ command: "sh", args: ["-c", script] }, f.run.workspace, signal).finally(() => { commandSettled = true; }), () => {});
@@ -316,12 +309,9 @@ test("a host stop inside a command's drain signals nothing, and after a restart 
       "the saved intent should hold the command", 10_000);
     writeFileSync(release, "");
     const leader = pidIn(leaderFile)!;
-    // Node reaps the leader as it emits `exit`, so a reaped leader means the drain has begun.
     const deadline = Date.now() + 10_000;
     while (alive(leader) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
     assert.equal(alive(leader), false, "the leader exits once released");
-    // The drain runs on this loop after the 5 ms poll that sees the reap, so a test process late under load delays it too.
-    // Should the command still settle first, the host stop below would not fall inside the drain: skip, not fail.
     if (commandSettled) return t.skip("the command settled at the end of the drain before the host stop");
     teams.close();
     await teams.idle();
@@ -358,7 +348,6 @@ test("a blocked run whose intent was still recording when the host stopped stays
     assert.equal(existsSync(runDirectory(f.run)), true);
     assert.equal(teams.get(f.run.id).status, "blocked");
 
-    // No process outlives a boot, so a record from an earlier boot has nothing left to miss.
     witness.boot = "an-earlier-boot"; now += 10 * 60_000;
     await waitFor(() => teams.get(f.run.id).status === "cancelled", "after a reboot the run should close once the host sees no process");
     assert.equal(existsSync(runDirectory(f.run)), false);
@@ -374,7 +363,6 @@ test("a blocked run of an ended goal, with its workspace already removed, closes
   f.run.events.push({ at, text: blocker });
   rmSync(runDirectory(f.run), { recursive: true, force: true });
   retention(f, { blockedHours: 1 }); f.writeTeam();
-  // The goal has ended, so nothing retains the run.
   const teams = openTeam(f, { ownerActive: () => false });
   try {
     teams.start(); await teams.idle();
@@ -431,8 +419,6 @@ test("member retention removes an integrated clone at its recorded recovery path
   const f = schedulerFixture();
   const at = new Date(Date.now() - 1000).toISOString();
   const memberId = randomUUID();
-  // Recovered integration workspaces live at recovery/<operation>; prepareMemberWorkspace
-  // creates their member clones in the sibling recovery/members directory.
   const cwd = join(runDirectory(f.run), "recovery", "members", memberId);
   mkdirSync(cwd, { recursive: true });
   const receiptDir = join(f.config.stateDir, "recovered-member-receipts");
@@ -647,7 +633,7 @@ test("a failed permission invalidation save during block is observed without unh
   try {
     const scheduler = teams as unknown as { block(stored: unknown, error: TeamError): void; record(id: string): unknown };
     try { scheduler.block(scheduler.record(f.run.id), new TeamError(409, "test-block", "Injected failure.")); }
-    catch { /* The synchronous run-record save is expected to fail in this test. */ }
+    catch { }
     await new Promise(resolve => setTimeout(resolve, 25));
     assert.deepEqual(unhandled, []);
   } finally {
@@ -692,7 +678,6 @@ test("failed workspace removal records one event, retries later, and does not bl
     'const { spawnSync } = require("node:child_process");',
     'const marker = process.argv[1];',
     'const [command, ...args] = process.argv.slice(2);',
-    // The first attempt leaves an unreadable directory behind, which the host cannot remove either; the retry repairs it.
     'if (!fs.existsSync(marker)) { fs.writeFileSync(marker, "failed once"); fs.mkdirSync("locked", { recursive: true }); fs.writeFileSync("locked/keep", ""); fs.chmodSync("locked", 0); process.exit(73); }',
     'if (fs.existsSync("locked")) fs.chmodSync("locked", 0o755);',
     'const result = spawnSync(command, args, { stdio: "inherit" });',
@@ -846,7 +831,6 @@ test("entries the agent account cannot remove are finished by the host", async (
   f.run.events.push({ at, text: "The delivery agent reported a merged pull request for the reviewed commit." });
   f.run.members.forEach(member => { member.status = "stopped"; });
   mkdirSync(join(runDirectory(f.run), "scratch", "notes"), { recursive: true });
-  // The prefix stands in for an agent-side rm that exits non-zero on a host-owned scratch directory and removes nothing.
   f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", "process.exit(1)"] };
   retention(f, { finishedMinutes: 0 });
   f.writeTeam();
@@ -875,7 +859,6 @@ test("a cancelled run with an interrupted operation and members whose sessions a
   f.run.events.push({ at, text: "Team cancelled." }, { at, text: "The host restarted with an unresolved operation from a cancelled team. The intent will not be replayed." });
   retention(f, { cancelledMinutes: 0 });
   f.writeTeam();
-  // Both unsettled members' sessions were deleted on the host; a saved status file still answers state() as running.
   (f.manager as unknown as { meta: (id: string) => unknown }).meta = () => { throw Object.assign(new Error("Session not found"), { code: "ENOENT" }); };
   const teams = openTeam(f, { now: () => Date.parse(at) + 1000 });
   try {

@@ -1,13 +1,11 @@
 import { z } from "zod";
 
-/** The record's ID_RE, copied: team-types loads this module, and importing objective-types here would close an import cycle. */
 const ID_RE = /^[a-z][a-z0-9-]{0,39}$/;
 
 export const VERDICT_LIMITS = { criteria: 8, handles: 8, handleChars: 400, noteBytes: 500, labelBytes: 120 } as const;
 const L = VERDICT_LIMITS;
 const byteLength = (value: string): number => Buffer.byteLength(value, "utf8");
 
-/** What the outcome ledger shows for one run at one head. */
 export type DeliveryFact = "none" | "landed" | "reverted";
 
 export type AssessedState = "met" | "not-met" | "inconclusive";
@@ -16,7 +14,6 @@ export type ComposedState = AssessedState | "pending-owner";
 const assessedStates = ["met", "not-met", "inconclusive"] as const;
 const composedStates = ["met", "not-met", "inconclusive", "pending-owner"] as const;
 
-/** The evaluator's report. Notes and handles are evaluator text: they are screened and sealed, never shown. */
 export const verdictReportSchema = z.object({
   kind: z.literal("verdict"),
   result: z.enum(assessedStates),
@@ -37,13 +34,10 @@ export const verdictReportSchema = z.object({
 });
 export type VerdictReport = z.infer<typeof verdictReportSchema>;
 
-/** Why a verdict has no evaluator answer. */
 export type VerdictReason = "no-independent-evaluator" | "evaluator-unavailable" | "record-unavailable" | "context-too-large";
-/** Why one criterion is inconclusive or waits. */
 export type CriterionReason = "no-receipt" | "receipt-unknown" | "before-delivery" | "pinned-changed" | "unresolved-evidence" | "not-assessed" | "no-evaluator";
 export type VerdictCounts = { met: number; notMet: number; inconclusive: number; pendingOwner: number };
 
-/** The run's summary: ids, enumerations, and counts only. It reaches every team view and relay device. */
 export type RunAssessment = {
   verdictId: string; revision: number; head: string; kind: "reviewed" | "no-change";
   result: AssessedState; evaluatorResult?: AssessedState; reason?: VerdictReason;
@@ -64,7 +58,6 @@ export const runAssessmentSchema: z.ZodType<RunAssessment> = z.object({
   at: z.iso.datetime(),
 }).strict();
 
-/** One criterion row of the coordinator's prompt: id, status, and the record digest's check label. No note, score, or threshold. */
 export const criteriaRowSchema = z.object({
   criterion: z.string().regex(ID_RE),
   status: z.enum(composedStates),
@@ -73,10 +66,6 @@ export const criteriaRowSchema = z.object({
 export type CriteriaRow = z.infer<typeof criteriaRowSchema>;
 export const criteriaRowsSchema = z.array(criteriaRowSchema).min(1).max(L.criteria);
 
-/**
- * The coordinator's lines for the rows: id, status, and check label, led by the label that marks them an agent assessment.
- * It lives here, not beside the evaluator's prompt, so team-prompts can import it without an import cycle.
- */
 export function criteriaRowsText(rows: readonly CriteriaRow[]): string {
   return ["Agent assessment, provisional, of the latest assessed cycle:", ...rows.map(row => `- ${row.criterion}: ${row.status} (${row.check})`)].join("\n");
 }

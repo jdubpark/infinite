@@ -4,11 +4,8 @@ import type { Provider } from "./types.js";
 import { writeSealed, unseal } from "./vault.js";
 
 export interface ProviderLimit { provider: Provider; detectedAt: string; resetsAt?: string; expiresAt: string; sessionId: string; runId?: string; confidence: "corroborated" }
-/** Journal data of a `provider-limit` signal, as the worker records it. */
 export type LimitObservation = { kind: "provider-limit"; limit: "usage" | "credits"; confidence: "single-source" | "corroborated"; resetsAt?: string; message: string; source: "hook" | "screen" | "protocol"; provider: Provider };
-/** A session row, as `manager.list()` returns it, reduced to what `reconcile` reads. */
 export interface LimitRow { id: string; provider: Provider; team?: { runId: string }; attention: { limit?: { confidence: string; since: string; resetsAt?: string } } }
-/** The journal reads `reconcile` needs from the manager. */
 export interface LimitSessions {
   events(id: string, after: number, limit: number, types?: Set<string>): { events: { at: string; data: Record<string, unknown> }[]; cursor: number; more: boolean };
 }
@@ -20,23 +17,13 @@ const UNSTATED_MS = 15 * 60_000;
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const time = (value?: string) => { const ms = value === undefined ? NaN : Date.parse(value); return Number.isNaN(ms) ? undefined : ms; };
 
-/** A corroborated observation switches its member; so does a Claude hook alone, because that turn already failed. */
 export const switchesMember = (data: Record<string, unknown>): data is LimitObservation =>
   data.kind === "provider-limit" && (data.confidence === "corroborated" || (data.source === "hook" && data.provider === "claude"));
 
-/**
- * Host-level memory of corroborated provider limits, so new members of a limited provider launch on
- * their fallback. An entry lasts until the provider's stated reset, at most 24 hours, or 15 minutes
- * when no reset was stated. It ends early when a session of that provider completes a turn without
- * failing after the limit, as told by a source able to report failure (`recoveryTurnEnd`). A per-provider clear time keeps an exited session's old observation from
- * re-creating a cleared entry.
- */
 export class ProviderLimits {
   private state: State = { limits: {}, cleared: {} };
-  /** Per-session journal position, latest limit observation, and latest successful turn end. */
   private readonly sessions = new Map<string, { provider: Provider; cursor: number; limitAt?: number; turnAt?: string }>();
   constructor(private readonly file: string, private readonly key: Buffer) {
-    // The memory is advisory and every entry expires, so an unreadable file starts it empty rather than blocking startup.
     if (existsSync(file)) try {
       const stored = unseal<State>(key, SCOPE, readFileSync(file, "utf8"));
       if (!isRecord(stored) || !isRecord(stored.limits) || !isRecord(stored.cleared)) throw new Error("unexpected provider limit shape");
@@ -45,7 +32,6 @@ export class ProviderLimits {
       console.warn(`[Infinite] Provider limits cannot be read and start empty: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  /** Records a corroborated observation unless a newer one, or a later clear, is already known. */
   observe(limit: Omit<ProviderLimit, "expiresAt">) {
     const detected = time(limit.detectedAt);
     if (detected === undefined) return;
@@ -66,12 +52,6 @@ export class ProviderLimits {
     return Object.values(this.state.limits).filter(limit => Date.parse(limit.expiresAt) > now.getTime());
   }
   limited(now = new Date()): Set<Provider> { return new Set(this.active(now).map(limit => limit.provider)); }
-  /**
-   * Observes corroborated limits shown on any Claude or Codex session, then clears a provider's entry
-   * when one of its sessions journals a recovery turn end after both the entry and that session's
-   * own latest limit observation. Activity timestamps are not evidence: a repeated limit bumps them.
-   * `rows` is the session listing the caller already took for this tick.
-   */
   async reconcile(sessions: LimitSessions, rows: LimitRow[], now = new Date()) {
     for (const session of rows) {
       const shown = session.attention.limit;
@@ -81,7 +61,6 @@ export class ProviderLimits {
       if (!entry) continue;
       const seen = this.sessions.get(session.id) ?? { provider: session.provider, cursor: 0 };
       let page: ReturnType<LimitSessions["events"]>;
-      // One unreadable journal must not keep other sessions from clearing the entry.
       try { page = sessions.events(session.id, seen.cursor, 200, new Set(["signal"])); } catch { continue; }
       for (const event of page.events) {
         const at = time(event.at);
@@ -90,12 +69,10 @@ export class ProviderLimits {
         else if (recoveryTurnEnd(event.data as unknown as SignalData) && at > (time(seen.turnAt) ?? -Infinity)) seen.turnAt = event.at;
       }
       seen.cursor = page.cursor; this.sessions.set(session.id, seen);
-      // A later limit may sit in the unread tail; decide once the journal has been read to its end.
       if (page.more) continue;
       const turnAt = time(seen.turnAt);
       if (turnAt !== undefined && turnAt > Date.parse(entry.detectedAt) && (seen.limitAt === undefined || turnAt > seen.limitAt)) this.clear(session.provider, seen.turnAt);
     }
-    // A cursor lasts while its session is listed and its provider is limited; keeping it means a drained journal is not read again.
     const listed = new Set(rows.map(row => row.id)), limited = this.limited(now);
     for (const [sessionId, seen] of this.sessions) if (!listed.has(sessionId) || !limited.has(seen.provider)) this.sessions.delete(sessionId);
   }

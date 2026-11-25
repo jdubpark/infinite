@@ -82,7 +82,6 @@ test("off and shadow pins are byte-equal to step 1", () => {
     for (const [saved, autonomy] of cases) {
       const step1 = JSON.stringify(pinRouting(saved, autonomy, lineupCase, undefined));
       assert.equal(JSON.stringify(pinRouting(saved, autonomy, lineupCase)), step1, JSON.stringify({ saved, autonomy }));
-      // A saved off or shadow mode keeps step 1's pin with an end too. So does a supervised project without a mode.
       const ended = pinRouting(saved, autonomy, lineupCase, PERIOD_END);
       const autoWithEnd = saved?.mode === "auto" || (saved?.mode === undefined && autonomy === "autonomous");
       if (!autoWithEnd) {
@@ -102,7 +101,6 @@ test("off and shadow pins are byte-equal to step 1", () => {
 });
 
 test("an auto pin needs a saved auto mode or the autonomous default, and a period end", () => {
-  // The autonomous default with a stored end pins auto, and its digest is the auto digest of the same policy.
   const defaultAuto = pinRouting(undefined, "autonomous", lineup, PERIOD_END);
   assert.ok(defaultAuto);
   assert.equal(defaultAuto.mode, "auto");
@@ -113,7 +111,6 @@ test("an auto pin needs a saved auto mode or the autonomous default, and a perio
   assert.ok(effective.mode === "shadow");
   assert.equal(defaultAuto.digest, policyDigest(effective, "auto"));
   assert.notEqual(defaultAuto.digest, policyDigest(effective));
-  // A saved auto mode pins auto with an end, in either autonomy.
   for (const autonomy of ["autonomous", "supervised"] as const) {
     const savedAuto = pinRouting({ mode: "auto" }, autonomy, lineup, PERIOD_END);
     assert.ok(savedAuto);
@@ -122,7 +119,6 @@ test("an auto pin needs a saved auto mode or the autonomous default, and a perio
     assert.equal(savedAuto.source, "saved");
     assert.equal(savedAuto.periodEndedAt, PERIOD_END);
   }
-  // A saved policy with no mode keeps its own knobs and source, and the autonomous project's default decides the mode.
   const savedNoMode = pinRouting({ allowContributor: true }, "autonomous", lineup, PERIOD_END);
   assert.ok(savedNoMode);
   assert.equal(savedNoMode.mode, "auto");
@@ -131,7 +127,6 @@ test("an auto pin needs a saved auto mode or the autonomous default, and a perio
   assert.equal(savedNoMode.knobs.allowContributor, true);
   assert.equal(savedNoMode.periodEndedAt, PERIOD_END);
   assert.deepEqual(pinRouting({ allowContributor: true }, "supervised", lineup, PERIOD_END), pinRouting({ allowContributor: true }, "supervised", lineup));
-  // With an end, these give step 1's result: a saved shadow, a supervised project without a policy, points without start, no lineup.
   for (const [saved, autonomy, l, points] of [
     [{ mode: "shadow" }, "autonomous", lineup, "start"],
     [undefined, "supervised", lineup, "start"],
@@ -141,7 +136,6 @@ test("an auto pin needs a saved auto mode or the autonomous default, and a perio
     assert.deepEqual(pinRouting(saved, autonomy, l, PERIOD_END), pinRouting(saved, autonomy, l), `${points} ${autonomy}`);
   }
   assert.equal(pinRouting(undefined, "supervised", lineup, PERIOD_END), undefined);
-  // With no end, the autonomous default keeps step 1's shadow pin, byte for byte.
   const noEnd = pinRouting(undefined, "autonomous", lineup);
   assert.ok(noEnd);
   assert.equal(noEnd.mode, "shadow");
@@ -151,7 +145,6 @@ test("an auto pin needs a saved auto mode or the autonomous default, and a perio
   assert.equal("periodEndedAt" in noEnd, false);
 });
 
-/** SHA-256 hex of the digest's canonical form at one algorithm version, over the knobs a pin stores. */
 function digestAt(version: number, mode: "shadow" | "auto", knobs: RoutingKnobs): string {
   return createHash("sha256").update(canonicalJson({ algorithmVersion: version, rewardVersion: 1, mode, knobs })).digest("hex");
 }
@@ -201,7 +194,6 @@ test("the digest changes with every knob and with nothing else", () => {
   assert.ok(ordered.mode === "shadow" && repeated.mode === "shadow" && plain.mode === "shadow");
   assert.equal(policyDigest(ordered), policyDigest(plain));
   assert.equal(policyDigest(repeated), policyDigest(plain));
-  // A saved policy whose knobs equal the autonomous defaults hashes like the default, whatever its source.
   const fromSaved = effectiveRouting({ mode: "shadow", cascade: true }, "supervised");
   const fromDefault = effectiveRouting(undefined, "autonomous");
   assert.ok(fromSaved.mode === "shadow" && fromDefault.mode === "shadow");

@@ -1,24 +1,19 @@
-/** The owner's halt as `GET /api/halt` reports it. A halt is informational here: releasing it is a host CLI action. */
 export type HaltState = { haltId: string; at: string; reason?: string; by: string };
 export type ProjectHalt = HaltState & { projectId: string };
 export type HaltView = {
-  /** False when the host cannot read its halt record. The whole host is then halted until it can. */
   readable: boolean;
   host?: HaltState;
   projects: ProjectHalt[];
 };
 
-/** A screen that belongs to projects shows the halts that cover them; an overview lists every project halt compactly. */
 export type HaltPlace = { projectIds: readonly string[] } | "overview";
 
 export type HaltNotice =
   | { kind: "unreadable" }
-  /** `projects` are the project halts that stay engaged when the host halt is released. */
   | { kind: "host"; halt: HaltState; projects: ProjectHalt[] }
   | { kind: "project"; halts: ProjectHalt[] }
   | { kind: "overview"; halts: ProjectHalt[] };
 
-/** Which halt a screen shows. A host halt, readable or not, covers every screen and wins over project halts. */
 export function haltNotice(view: HaltView | null | undefined, place: HaltPlace): HaltNotice | null {
   if (!view) return null;
   if (!view.readable) return { kind: "unreadable" };
@@ -29,10 +24,6 @@ export function haltNotice(view: HaltView | null | undefined, place: HaltPlace):
   return own.length ? { kind: "project", halts: own } : null;
 }
 
-/**
- * The place of a mission page: its pinned repositories (`repoProjectIds`), which is how the host decides a project halt
- * covers a mission. Subtasks can run in only some of them, so they do not narrow the scope.
- */
 export function missionHaltPlace(repoProjectIds: readonly string[]): HaltPlace {
   return { projectIds: [...new Set(repoProjectIds)] };
 }

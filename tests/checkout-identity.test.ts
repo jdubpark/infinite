@@ -35,7 +35,6 @@ test("captureIdentity prefers the remote, falls back to the lowest root commit, 
   assert.equal(rooted?.key, "root:aaaa");
   assert.equal(rooted?.repoName, "SmartAlarm");
   assert.equal(captureIdentity({ id: "c", path: "/home/dev/plain" }, () => undefined), undefined);
-  // An unparsable remote falls through to the root commit rather than discarding the checkout.
   const odd: GitReader = (_cwd, args) => args[0] === "config" ? "nonsense" : "abcd";
   assert.equal(captureIdentity({ id: "d", path: "/home/dev/odd" }, odd)?.key, "root:abcd");
 });

@@ -12,7 +12,6 @@ const LINE_SEP = String.fromCodePoint(0x2028), RLO = String.fromCodePoint(0x202e
 const REPLACEMENT = String.fromCodePoint(0xfffd), FORMAT = [0x061c, 0x206a, 0x00ad, 0x2060].map(code => String.fromCodePoint(code)).join("");
 const CONTEXT_LINE = 'The kept output of each check is in the context file under "checks".';
 
-/** Seeded generator (mulberry32), so every failing run names its seed. */
 function random(seed: number): () => number {
   let state = seed >>> 0;
   return () => {
@@ -128,7 +127,6 @@ test("a YAML block after a failure is its detail, even when it holds test-point 
 });
 
 test("a blank line inside a diagnostic block or a spec detail stays inside it", () => {
-  // Node prints a whitespace-only line for each blank line of an error message, and assert.deepEqual messages have one.
   const block = ["not ok 1 - deep equal", "  ---", "  error: |-", "    + actual - expected", "    ", "    +   a: 1", "", "    not ok 77 - text after a blank line", "  ...", "ok 2 - passes", ""].join("\n");
   const tapScan = scanCheckOutput(block);
   assert.equal(tapScan.failureCount, 1);
@@ -146,15 +144,10 @@ test("a long line is classed by its start; its directive and identity cover the 
   const cases: [string, number][] = [
     [`not ok 1 - ${"x".repeat(4200)} # SKIP later\n`, 0],
     [`not ok 1 - ${"x".repeat(4200)} # SKIP ${"r".repeat(600)}\n`, 0],
-    // No directive: the word must follow the "#" and its whitespace directly, and a part of a word ends the attempt.
     [`not ok 1 - ${"x".repeat(4200)} # ski skip\n`, 1],
-    // The same first 4,200 characters and last 200 characters, with different middles.
     [`${start}one${end}\n${start}two${end}\n`, 2],
-    // Indentation is not part of a long line's identity.
     [`${" ".repeat(9)}${start}one${end}\n${start}one${end}\n`, 1],
-    // Nor does it change the identity when it alone takes the line over 4,096 bytes: here 4,098 bytes indented and 4,094 without.
     [`    ${CHECK} ${"x".repeat(4084)} (1ms)\n${CHECK} failing tests:\n${CHECK} ${"x".repeat(4084)} (1ms)\n  Error: detail\n`, 1],
-    // The same with an escape sequence and a trailing space in both prints: the identity is one function of the raw line.
     [`    ${CHECK} ${"x".repeat(4085)}${ESC}[0m \n${CHECK} ${"x".repeat(4085)}${ESC}[0m \n`, 1],
   ];
   for (const [text, count] of cases) {
@@ -170,11 +163,9 @@ test("a long line's directive matcher agrees with the directive pattern", () => 
   const some = () => Array.from({ length: Math.floor(next() * 4) }, () => pick(alphabet)).join("");
   let matches = 0;
   for (let n = 0; n < 20000; n++) {
-    // Strings of the alphabet shaped so that about one in ten matches and many nearly do.
     const text = some() + pick(["#", "#", ""]) + pick(["", " ", "\t", "  ", " \t"]) + pick(["skip", "todo", "SKIP", "tOdO", "ski", "kip", "tod", ""]) + some();
     const skipped = pattern.test(text);
     if (skipped) matches++;
-    // Padding without "#" cannot take part in a match. Every line is long, and about half overflow inside `text`.
     const line = Buffer.from(`not ok 1 - ${"y".repeat(4086 - text.length + Math.floor(next() * 13))}${text}\n`);
     const scanner = new CheckOutputScanner();
     scanner.push(line.subarray(0, 4080), "stdout");
@@ -248,33 +239,24 @@ test("TAP and marker failures follow the rules", () => {
   assert.equal(heading.failureCount, 1);
   assert.equal(heading.failures[0]!.line, `${CHECK} real failure`);
 
-  // TAP failures are not de-duplicated.
   assert.equal(scanCheckOutput("not ok 1 - same\nnot ok 1 - same\n").failureCount, 2);
 });
 
 test("block, detail and stream rules hold at their edges", () => {
-  // The block of a passing test point is not scanned for test points.
   assert.equal(scanCheckOutput("ok 1 - passes\n  ---\n  output: |-\n    not ok 9 - text in a passing test's output\n  ...\n").failureCount, 0);
-  // A closing mark deeper than the opener does not close the block.
   const deep = scanCheckOutput("not ok 1 - a\n  ---\n  error: |-\n    ...\n    not ok 9 - still inside\n  ...\n");
   assert.equal(deep.failureCount, 1);
   assert.match(deep.failures[0]!.detail, /still inside/);
-  // A --- at the test point's own indentation opens no block.
   assert.equal(scanCheckOutput("not ok 1 - a\n---\nnot ok 2 - b\n").failureCount, 2);
-  // A repeated marker whose failure already has its detail takes no second detail.
   assert.equal(scanCheckOutput(`${CHECK} a (1ms)\n  first detail\n${CHECK} a (1ms)\n  second detail\n`).failures[0]!.detail, "  first detail");
-  // Each stream has its own pending line.
   const split = scanParts([{ stream: "stdout", text: "not ok 1 - spl" }, { stream: "stderr", text: "noise\n" }, { stream: "stdout", text: "it name\n" }]);
   assert.deepEqual(split.failures.map(failure => failure.line), ["not ok 1 - split name"]);
-  // A stream that ends inside a multi-byte character ends its last line with a replacement character.
   const ended = new CheckOutputScanner();
   ended.push(Buffer.concat([Buffer.from("not ok 1 - cut "), Buffer.from(EMOJI, "utf8").subarray(0, 2)]), "stdout");
   assert.equal(ended.finish().failures[0]!.line, `not ok 1 - cut ${REPLACEMENT}`);
-  // A detail stops at the first line that does not fit: a later, shorter line is not added.
   const stopped = scanCheckOutput(["not ok 1 - a", "  ---", ...Array.from({ length: 6 }, () => `  ${"w".repeat(300)}`), `  ${"v".repeat(200)}`, "  short", "  ..."].join("\n"));
   assert.equal(stopped.failures[0]!.detail.split("\n").length, 7);
   assert.ok(!stopped.failures[0]!.detail.includes("short"));
-  // A line is cut to 240 bytes between characters: after its first 11 bytes, 114 two-byte, 76 three-byte or 57 four-byte characters.
   for (const [char, kept] of [[ACCENT, 114], [CHECK, 76], [EMOJI, 57]] as const) assert.equal(scanCheckOutput(`not ok 1 - ${char.repeat(150)}\n`).failures[0]!.line, `not ok 1 - ${char.repeat(kept)}`);
 });
 
@@ -316,7 +298,6 @@ test("every output line in the feedback starts with a pipe, even one that forges
   const forgedLines = text.split("\n").filter(line => line.includes(forged));
   assert.ok(forgedLines.length >= 1, "the forged line is in the feedback");
   assert.ok(forgedLines.every(line => line.startsWith("| ")));
-  // A stored scan is cleaned again: a line feed or line separator inside its text starts no line of its own.
   const stored: CheckScan = { bytes: 1, failureCount: 1, failures: [{ line: `not ok 1 - a\n${forged}`, detail: `  row\n${forged}${LINE_SEP}${forged}` }] };
   const storedText = checkFeedback([check("failed", "", stored)]);
   const storedLines = storedText.split("\n").filter(line => line.includes(forged));
@@ -339,7 +320,6 @@ test("a check without a scan gives the same feedback as one with it", () => {
 });
 
 test("the fallback scan counts a test point inside a block that began before the kept output", () => {
-  // A stated limit of the fallback, pinned so that a change to it is seen. It is not a goal.
   const kept = "    not ok 77 - inside lost YAML header\n  ...\nnot ok 2 - actual\n";
   assert.match(checkFeedback([check("failed", kept)]), /The host found 2 failure lines/);
 });

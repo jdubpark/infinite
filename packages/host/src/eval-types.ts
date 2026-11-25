@@ -19,20 +19,13 @@ export type CaptureStart = {
   runId: string;
   memberId: string;
   projectId: string;
-  /** TeamRun.workspace, the integration checkout where every read of this capture runs. */
   workspace: string;
-  /** TeamRun.baseCommit. */
   anchorCommit: string;
-  /** TeamMember.baseCommit. */
   memberBaseCommit: string;
-  /** TeamTask.commit. */
   commit: string;
-  /** The run head after this task's cherry-pick. */
   integratedHead: string;
   at: string;
-  /** TeamRun.brief?.uiChanges === true. */
   uiChanges: boolean;
-  /** Null when the member has no start time. */
   capsule: Capsule | null;
 };
 
@@ -45,11 +38,8 @@ export type ApprovalStart = {
 };
 
 export interface CaptureSink {
-  /** Cheap and synchronous. False unless the project turned capture on and the store can take it. */
   enabled(projectId: string): boolean;
-  /** Writes a marker, then reads in the background. Never throws. */
   integrated(start: CaptureStart): void;
-  /** Marks the run's captured tasks, then reads in the background. Never throws. */
   approved(start: ApprovalStart): void;
 }
 
@@ -75,27 +65,21 @@ export type BaseState = "pending" | "proven" | "not-proven" | "none";
 
 export type EvalFeatures = { role: "implementer"; area: string; kind: string | null; risk: "normal" | "elevated"; featureVersion: number };
 
-/** Sealed in `eval_tasks.payload` for a task that passed the start verdict. */
 export type CapturedPayload = {
   projectId: string;
   anchorCommit: string;
   memberBaseCommit: string;
   commit: string;
   integratedHead: string;
-  /** The reference's names and its test files, after the name read. */
   files?: string[];
   hiddenFiles?: string[];
   baseDelta?: "none" | "stored" | "missing";
   reference?: "stored" | "missing";
-  /** After the latest approval's read. */
   laterFiles?: string[];
-  /** On promotion. */
   features?: EvalFeatures;
-  /** SHA-256 hex of each expected case key, after validation. */
   expectedCases?: string[];
 };
 
-/** Sealed in `eval_tasks.payload` for a mined task. */
 export type MinedPayload = {
   projectId: string; anchorCommit: string; commit: string; commitTime: string;
   promptOrigin: "run-objective" | "commit-message"; runId?: string;
@@ -103,32 +87,80 @@ export type MinedPayload = {
   expectedCases?: string[];
 };
 
-/** Sealed in `eval_tasks.payload` for a rejected task: nothing but the project. */
 export type RejectedPayload = { projectId: string };
 
-export type EvalTaskRow = {
+type EvalTaskCommon = {
   taskId: string;
-  origin: EvalOrigin;
   runId: string;
   memberId: string;
   projectRef: string;
-  state: EvalState;
-  reason: EvalReason | null;
   material: MaterialState;
-  approval: ApprovalState | null;
   approvedAt: string | null;
   base: BaseState;
   materialBytes: number;
   capturedAt: string;
-  decidedAt: string | null;
   checkedAt: string;
   runDeletedAt: string | null;
   groupId: string | null;
   lineage: Lineage | null;
-  validatedAt: string | null;
   attempts: number;
-  payload: CapturedPayload | MinedPayload | RejectedPayload;
 };
+
+export type EvalTaskRow =
+  | (EvalTaskCommon & {
+      origin: "captured";
+      state: "captured";
+      reason: null;
+      approval: ApprovalState | null;
+      decidedAt: null;
+      validatedAt: null;
+      payload: CapturedPayload;
+    })
+  | (EvalTaskCommon & {
+      origin: "captured";
+      state: "candidate";
+      reason: null;
+      approval: ApprovalState | null;
+      decidedAt: string | null;
+      validatedAt: null;
+      payload: CapturedPayload;
+    })
+  | (EvalTaskCommon & {
+      origin: "captured";
+      state: "valid";
+      reason: null;
+      approval: ApprovalState | null;
+      decidedAt: string | null;
+      validatedAt: string | null;
+      payload: CapturedPayload;
+    })
+  | (EvalTaskCommon & {
+      origin: "mined";
+      state: "candidate";
+      reason: null;
+      approval: null;
+      decidedAt: string | null;
+      validatedAt: null;
+      payload: MinedPayload;
+    })
+  | (EvalTaskCommon & {
+      origin: "mined";
+      state: "valid";
+      reason: null;
+      approval: null;
+      decidedAt: string | null;
+      validatedAt: string | null;
+      payload: MinedPayload;
+    })
+  | (EvalTaskCommon & {
+      origin: EvalOrigin;
+      state: "rejected" | "retired";
+      reason: EvalReason | null;
+      approval: null;
+      decidedAt: string | null;
+      validatedAt: string | null;
+      payload: RejectedPayload;
+    });
 
 export type PatchRead = { state: "read"; bytes: Buffer } | { state: "too-large" } | { state: "failed" };
 export type NameRead = { state: "read"; names: string[] } | { state: "too-wide" } | { state: "failed" };
@@ -138,7 +170,6 @@ export interface CaptureGit {
   patch(cwd: string, from: string, to: string): Promise<PatchRead>;
   names(cwd: string, from: string, to: string, max: number): Promise<NameRead>;
   onBaseBranch(mirror: string, anchor: string, head: string): Promise<BaseRead>;
-  /** Stops the reads in flight and refuses later reads. */
   close?(): void;
 }
 
@@ -193,9 +224,7 @@ export const PROMPT_ORIGINS = ["assignment", "run-objective", "commit-message"] 
 export type PromptOrigin = typeof PROMPT_ORIGINS[number];
 export type ComparisonJobRequest = {
   kind: "compare" | "confirm";
-  /** compare: 2 to 4. confirm: exactly 2. */
   configurations: TrialConfiguration[];
-  /** A confirm request admits no taskIds. */
   taskFilter?: {
     taskIds?: string[]; origins?: EvalOrigin[]; areas?: string[]; promptOrigins?: PromptOrigin[];
     excludeGroups?: string[]; maxTasks?: number;
@@ -206,7 +235,6 @@ export type ComparisonJobRequest = {
   expiresAt?: string;
 };
 export type ComparisonPin = { configRef: string; profileEpoch: number; promptVersion: string };
-/** Sealed in `eval_jobs.payload` for a baseline, compare, or confirm job. Only comparison jobs have `tasks` and `pins`. */
 export type TrialJobPayload = {
   projectId: string; request: BaselineJobRequest | ComparisonJobRequest; requestDigest: string; jobDigest: string;
   tasks?: string[]; pins?: ComparisonPin[]; subject?: string;

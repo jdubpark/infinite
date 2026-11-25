@@ -13,6 +13,49 @@ const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
 type Checkpoint = { revision: number; epoch: number; manifest: WorkspaceManifest; tree?: { directory: string; cwd: string; roots: string[] } };
 type Placement = { epoch: number; phase: "laptop" | "selecting" | "cloud" | "failed"; checkpoint?: ExecutionState["checkpoint"] };
 type Execution = { environmentId: string; url: string; token: string; cwd: string; roots: string[] };
+type CloudExecutor = Awaited<ReturnType<typeof startCloudExecutor>>;
+type CloudWorkspace = { cwd: string; roots: string[] };
+type LaptopBoundary = {
+  revision: number;
+  busy: boolean;
+  uncertain: boolean;
+  online: boolean;
+  connected: boolean;
+  supported: boolean | undefined;
+  acknowledged: boolean;
+};
+type WorkspacePhase =
+  | (LaptopBoundary & {
+      kind: "laptop";
+      preparationProblem?: string;
+      reconnectDeadline: number;
+      reconnectTimer?: ReturnType<typeof setTimeout>;
+    })
+  | (LaptopBoundary & {
+      kind: "selecting";
+      cloud?: CloudExecutor;
+      cloudWorkspace?: CloudWorkspace;
+    })
+  | {
+      kind: "cloud";
+      revision: number;
+      online: boolean;
+      acknowledged: boolean;
+      cloud: CloudExecutor;
+      cloudWorkspace: CloudWorkspace;
+    }
+  | {
+      kind: "failed";
+      revision: number;
+      online: boolean;
+      acknowledged: boolean;
+      reason: string;
+      cloud?: CloudExecutor;
+    }
+  | {
+      kind: "closed";
+      closePromise: Promise<void>;
+    };
 
 async function durableJson(directory: string, name: string, value: unknown): Promise<void> {
   const temporary = join(directory, `.${name}-${randomUUID()}`);
@@ -41,7 +84,6 @@ function validCounter(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
-/** Coordinate checkpoint publication and placement; this does not fence arbitrary laptop processes. */
 export async function createHybridWorkspace(options: {
   workspace: LaptopWorkspace;
   directory: string;
@@ -53,7 +95,6 @@ export async function createHybridWorkspace(options: {
   workspaceDirectory?: string;
   sharedWorkspace?: boolean;
   sharedPoolDirectory?: string;
-  /** The session's egress variables, given to the cloud executor in place of the worker's environment. */
   egress?: Record<string, string>;
 }) {
   const directory = resolve(options.directory), scopeDirectory = join(directory, "blobs");
@@ -85,76 +126,109 @@ export async function createHybridWorkspace(options: {
   if (savedCheckpoint) {
     if (!validCounter(savedCheckpoint.revision) || !validCounter(savedCheckpoint.epoch))
       throw new Error("Hybrid workspace checkpoint state is invalid.");
-    // A restarted coordinator has not re-admitted a prepared tree or its writer
-    // boundary. Reuse verified content only; never trust an old mutable path.
     latest = { revision: savedCheckpoint.revision, epoch: savedCheckpoint.epoch,
       manifest: validateWorkspaceManifest(savedCheckpoint.manifest, options.workspace.roots) };
   }
   let epoch = Math.max(savedPlacement?.epoch ?? 0, latest?.epoch ?? 0) + 1;
-  let revision = 0, busy = false, uncertain = false, online = false, connected = false;
-  let supported: boolean | undefined, acknowledged = false, closed = false, transitioning = false;
-  let sticky = !!savedPlacement && savedPlacement.phase !== "laptop";
-  let location: "laptop" | "cloud" = sticky ? "cloud" : "laptop";
-  let failure = sticky ? "A previous cloud handoff requires recovery before execution can continue." : undefined;
-  let preparationProblem: string | undefined;
-  let cloud: Awaited<ReturnType<typeof startCloudExecutor>> | undefined;
-  let cloudWorkspace: { cwd: string; roots: string[] } | undefined;
+  const stickyAtStart = !!savedPlacement && savedPlacement.phase !== "laptop";
+  let phase: WorkspacePhase = stickyAtStart
+    ? {
+        kind: "failed",
+        revision: 0,
+        online: false,
+        acknowledged: false,
+        reason: "A previous cloud handoff requires recovery before execution can continue.",
+      }
+    : {
+        kind: "laptop",
+        revision: 0,
+        busy: false,
+        uncertain: false,
+        online: false,
+        connected: false,
+        supported: undefined,
+        acknowledged: false,
+        reconnectDeadline: 0,
+      };
   let tail: Promise<unknown> = Promise.resolve();
   const blobTransfers = createWorkspaceTransferPool();
   const admittedBlobs = new Set<Promise<unknown>>();
-  let closePromise: Promise<void> | undefined;
-  let reconnectDeadline = 0;
-  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   const abort = new AbortController();
   let state: ExecutionState;
 
   const checkpoint = (): ExecutionState["checkpoint"] => latest && ({ id: latest.manifest.id, capturedAt: latest.manifest.capturedAt });
-  const record = (data: Record<string, unknown>) => { if (!closed) options.record(data); };
-  const blocker = (): string | undefined => {
-    if (failure) return failure;
-    if (uncertain) return "A laptop operation has an uncertain outcome; reconcile it before cloud continuation.";
-    if (busy) return "A laptop operation is still active; cloud continuation is paused.";
-    if (supported !== true) return supported === false
+  const record = (data: Record<string, unknown>) => { if (phase.kind !== "closed") options.record(data); };
+  const laptopBlocker = (current: Extract<WorkspacePhase, { kind: "laptop" | "selecting" }>): string | undefined => {
+    if (current.uncertain) return "A laptop operation has an uncertain outcome; reconcile it before cloud continuation.";
+    if (current.busy) return "A laptop operation is still active; cloud continuation is paused.";
+    if (current.supported !== true) return current.supported === false
       ? "This Codex backend does not support automatic executor handoff."
       : "Provider executor handoff qualification is pending.";
-    if (!latest || !acknowledged) return preparationProblem ?? "No verified workspace checkpoint has been acknowledged in this connection.";
-    if (latest.revision !== revision) return "Completed laptop operations are not yet covered by the cloud checkpoint.";
+    if (!latest || !current.acknowledged) {
+      return (current.kind === "laptop" ? current.preparationProblem : undefined)
+        ?? "No verified workspace checkpoint has been acknowledged in this connection.";
+    }
+    if (latest.revision !== current.revision) return "Completed laptop operations are not yet covered by the cloud checkpoint.";
     return undefined;
   };
   const publish = () => {
-    if (closed) return;
-    const reason = blocker();
-    const next: ExecutionState = location === "cloud"
-      ? { location, state: failure ? "paused" : "online", cloudReady: !failure, checkpoint: checkpoint(),
-        ...(failure ? { reason: failure } : {}), ...(online ? { reconciliation: "available" as const } : {}) }
-      : { location, state: transitioning ? "preparing" : online ? "online" : connected ? "paused" : "connecting",
-        cloudReady: !reason && !transitioning, checkpoint: checkpoint(), ...(reason ? { reason } : {}) };
+    if (phase.kind === "closed") return;
+    let next: ExecutionState;
+    if (phase.kind === "cloud") {
+      next = {
+        location: "cloud",
+        state: "online",
+        cloudReady: true,
+        checkpoint: checkpoint(),
+        ...(phase.online ? { reconciliation: "available" as const } : {}),
+      };
+    } else if (phase.kind === "failed") {
+      next = {
+        location: "cloud",
+        state: "paused",
+        cloudReady: false,
+        checkpoint: checkpoint(),
+        reason: phase.reason,
+        ...(phase.online ? { reconciliation: "available" as const } : {}),
+      };
+    } else {
+      const reason = laptopBlocker(phase);
+      const transitioning = phase.kind === "selecting";
+      next = {
+        location: "laptop",
+        state: transitioning ? "preparing" : phase.online ? "online" : phase.connected ? "paused" : "connecting",
+        cloudReady: !reason && !transitioning,
+        checkpoint: checkpoint(),
+        ...(reason ? { reason } : {}),
+      };
+    }
     if (JSON.stringify(next) !== JSON.stringify(state)) { state = next; options.publish(next); }
   };
+  const currentPhase = (): WorkspacePhase => phase;
   const enqueue = <T>(action: () => Promise<T>): Promise<T> => {
     const precedingBlobs = [...admittedBlobs];
     const result = tail.then(async () => {
-      if (closed) throw new Error("Hybrid workspace is closed.");
+      if (currentPhase().kind === "closed") throw new Error("Hybrid workspace is closed.");
       await Promise.allSettled(precedingBlobs);
-      if (closed) throw new Error("Hybrid workspace is closed.");
+      if (currentPhase().kind === "closed") throw new Error("Hybrid workspace is closed.");
       const value = await action();
-      if (closed) throw new Error("Hybrid workspace is closed.");
+      if (currentPhase().kind === "closed") throw new Error("Hybrid workspace is closed.");
       return value;
     });
     tail = result.catch(() => {});
     return result;
   };
   const enqueueBlob = (params: any): Promise<{ base64: string } | { stored: true }> => {
-    if (closed) return Promise.reject(new Error("Hybrid workspace is closed."));
+    if (currentPhase().kind === "closed") return Promise.reject(new Error("Hybrid workspace is closed."));
     const previous = tail;
     const operation = previous.then(async () => {
-      if (closed) throw new Error("Hybrid workspace is closed.");
+      if (currentPhase().kind === "closed") throw new Error("Hybrid workspace is closed.");
       return blobTransfers.run(async () => {
-        if (closed) throw new Error("Hybrid workspace is closed.");
+        if (currentPhase().kind === "closed") throw new Error("Hybrid workspace is closed.");
         const result = params?.base64 === undefined
           ? { base64: await readWorkspaceBlob(storeDir, params?.hash) }
           : (await putWorkspaceBlob(storeDir, params?.hash, params.base64), { stored: true as const });
-        if (closed) throw new Error("Hybrid workspace is closed.");
+        if (currentPhase().kind === "closed") throw new Error("Hybrid workspace is closed.");
         return result;
       });
     });
@@ -162,23 +236,36 @@ export async function createHybridWorkspace(options: {
     operation.then(() => admittedBlobs.delete(operation), () => admittedBlobs.delete(operation));
     return operation;
   };
-  const placement = async (phase: Placement["phase"]) => {
-    await durableJson(directory, "placement.json", { epoch, phase, checkpoint: checkpoint() } satisfies Placement);
+  const placement = async (nextPhase: Placement["phase"]) => {
+    await durableJson(directory, "placement.json", { epoch, phase: nextPhase, checkpoint: checkpoint() } satisfies Placement);
   };
 
   async function handoff(): Promise<void> {
-    if (closed || online || !connected || sticky || transitioning || blocker()) { publish(); return; }
-    const remaining = reconnectDeadline - Date.now();
+    if (phase.kind !== "laptop" || phase.online || !phase.connected || laptopBlocker(phase)) { publish(); return; }
+    const remaining = phase.reconnectDeadline - Date.now();
     if (remaining > 0) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = setTimeout(schedule, remaining);
-      reconnectTimer.unref();
+      clearTimeout(phase.reconnectTimer);
+      const timer = setTimeout(schedule, remaining);
+      timer.unref();
+      phase.reconnectTimer = timer;
       return;
     }
-    transitioning = true; sticky = true; epoch += 1; publish();
+    clearTimeout(phase.reconnectTimer);
+    phase = {
+      kind: "selecting",
+      revision: phase.revision,
+      busy: phase.busy,
+      uncertain: phase.uncertain,
+      online: phase.online,
+      connected: phase.connected,
+      supported: phase.supported,
+      acknowledged: phase.acknowledged,
+    };
+    epoch += 1;
+    publish();
     const selected = latest!;
     const unchanged = () => {
-      if (revision !== selected.revision || busy || uncertain || supported !== true) {
+      if (phase.kind !== "selecting" || phase.revision !== selected.revision || phase.busy || phase.uncertain || phase.supported !== true) {
         stage = "verifying the unchanged laptop execution boundary";
         throw new Error("The laptop execution boundary changed during cloud preparation.");
       }
@@ -186,28 +273,27 @@ export async function createHybridWorkspace(options: {
     let stage = "recording the handoff intent";
     try {
       await placement("selecting");
-      if (closed) return;
+      if (phase.kind !== "selecting") return;
       unchanged();
       record({ action: "cloud-handoff-intent", epoch, checkpoint: selected.manifest.id });
       stage = "opening the prepared workspace";
       if (!selected.tree) throw new Error("The checkpoint has no prepared execution tree");
       const prepared = { cwd: selected.tree.cwd, roots: selected.tree.roots };
-      cloudWorkspace = prepared;
-      if (closed) return;
+      phase.cloudWorkspace = prepared;
+      if (phase.kind !== "selecting") return;
       unchanged();
       if (options.sharedWorkspace) {
-        // Inactive generations and their parent stay private during preparation.
-        // Expose just the selected tree after all host writes have finished.
         await chmod(selected.tree.directory, 0o2770);
         await chmod(dataDirectory, 0o2750);
       }
       stage = "starting the cloud executor";
       const executor = await startCloudExecutor({ cwd: prepared.cwd, command: options.command, commandArgs: options.commandArgs, egress: options.egress });
-      if (closed) { await executor.close(); return; }
-      cloud = executor;
+      if (phase.kind !== "selecting") { await executor.close(); return; }
+      phase.cloud = executor;
       void executor.exited.then(() => {
-        if (closed || cloud !== executor) return;
-        failure = "The cloud executor stopped. Execution is paused; no operation was replayed.";
+        if ((phase.kind !== "selecting" && phase.kind !== "cloud") || phase.cloud !== executor) return;
+        const reason = "The cloud executor stopped. Execution is paused; no operation was replayed.";
+        phase = { kind: "failed", revision: phase.revision, online: phase.online, acknowledged: phase.acknowledged, reason, cloud: executor };
         record({ action: "cloud-executor-stopped", epoch });
         void placement("failed").catch(() => {});
         publish();
@@ -215,35 +301,52 @@ export async function createHybridWorkspace(options: {
       unchanged();
       stage = "selecting the cloud environment";
       await options.select({ ...executor.environment, roots: prepared.roots });
-      if (closed) return;
-      location = "cloud";
+      if (phase.kind !== "selecting") return;
       stage = "recording the selected cloud environment";
       await placement("cloud");
-      if (closed) return;
+      if (phase.kind !== "selecting") return;
+      phase = {
+        kind: "cloud",
+        revision: phase.revision,
+        online: phase.online,
+        acknowledged: phase.acknowledged,
+        cloud: executor,
+        cloudWorkspace: prepared,
+      };
       record({ action: "cloud-handoff-selected", epoch, checkpoint: selected.manifest.id });
     } catch {
-      if (closed) return;
-      location = "cloud";
-      failure = `Cloud handoff failed while ${stage}; recovery is required and no operation was replayed.`;
+      const latestPhase = currentPhase();
+      if (latestPhase.kind === "closed") return;
+      const reason = `Cloud handoff failed while ${stage}; recovery is required and no operation was replayed.`;
+      const activeCloud = latestPhase.kind === "selecting" || latestPhase.kind === "failed" || latestPhase.kind === "cloud" ? latestPhase.cloud : undefined;
+      phase = {
+        kind: "failed",
+        revision: latestPhase.revision,
+        online: latestPhase.online,
+        acknowledged: latestPhase.acknowledged,
+        reason,
+        ...(activeCloud ? { cloud: activeCloud } : {}),
+      };
       await placement("failed").catch(() => {});
-      record({ action: "cloud-handoff-paused", epoch, reason: failure });
-    } finally { transitioning = false; publish(); }
+      record({ action: "cloud-handoff-paused", epoch, reason });
+    } finally { publish(); }
   }
   const schedule = () => { void enqueue(handoff).catch(() => {}); };
 
-  await placement(sticky ? savedPlacement!.phase : "laptop");
+  await placement(stickyAtStart ? savedPlacement!.phase : "laptop");
   publish();
   return {
     control(method: string, params: any): Promise<any> {
-      if (closed) return Promise.reject(new Error("Hybrid workspace is closed."));
+      if (phase.kind === "closed") return Promise.reject(new Error("Hybrid workspace is closed."));
       if (method === "sync/blob") return enqueueBlob(params);
       return enqueue(async () => {
-        if (method === "sync/status") { publish(); return { ...state, revision, epoch, acknowledged }; }
+        if (phase.kind === "closed") throw new Error("Hybrid workspace is closed.");
+        if (method === "sync/status") { publish(); return { ...state, revision: phase.revision, epoch, acknowledged: phase.acknowledged }; }
         if (method === "sync/problem") {
           if (typeof params?.reason !== "string" || !params.reason.trim())
             throw new Error("A workspace preparation problem requires a reason.");
-          if (!sticky && location === "laptop") {
-            preparationProblem = params.reason.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, 300);
+          if (phase.kind === "laptop") {
+            phase.preparationProblem = params.reason.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, 300);
             publish();
           }
           return { received: true };
@@ -254,18 +357,18 @@ export async function createHybridWorkspace(options: {
           return { missing: await hasWorkspaceBlobs(storeDir, params.hashes) };
         }
         if (method === "sync/begin") {
-          if (sticky || location !== "laptop" || transitioning || busy || uncertain || !online)
+          if (phase.kind !== "laptop" || phase.busy || phase.uncertain || !phase.online)
             throw new Error("A laptop checkpoint cannot begin in the current execution state.");
-          const startedRevision = revision;
+          const startedRevision = phase.revision;
           epoch += 1;
           await placement("laptop");
-          if (closed || !online || busy || uncertain || revision !== startedRevision)
+          if (phase.kind !== "laptop" || !phase.online || phase.busy || phase.uncertain || phase.revision !== startedRevision)
             throw new Error("Laptop activity changed before checkpoint capture began.");
-          return { revision, epoch };
+          return { revision: phase.revision, epoch };
         }
         if (method === "sync/commit") {
-          const current = () => !closed && !sticky && location === "laptop" && !transitioning && online && !busy && !uncertain &&
-            params?.revision === revision && params?.epoch === epoch;
+          const current = () => phase.kind === "laptop" && phase.online && !phase.busy && !phase.uncertain &&
+            params?.revision === phase.revision && params?.epoch === epoch;
           if (!current()) throw new Error("The laptop checkpoint belongs to a stale execution boundary.");
           if (Buffer.byteLength(JSON.stringify(params?.manifest) ?? "") > MAX_MANIFEST_BYTES)
             throw new Error("The workspace manifest exceeds the checkpoint size limit.");
@@ -283,26 +386,26 @@ export async function createHybridWorkspace(options: {
             const tree = await materializeWorkspace({ manifest, storeDir, destination, sharedGroup: options.sharedWorkspace,
               ...(previous?.tree ? { previous: { manifest: previous.manifest, roots: previous.tree.roots } } : {}) });
             if (!current()) throw new Error("Laptop activity changed while the execution tree was prepared.");
-            const candidate: Checkpoint = { revision, epoch, manifest, tree: { ...tree, directory: destination } };
+            const candidate: Checkpoint = { revision: phase.revision, epoch, manifest, tree: { ...tree, directory: destination } };
             await durableJson(directory, "checkpoint.json", candidate);
-            // New activity after this durable boundary simply makes the stored
-            // revision ineligible. Keep its complete tree and receipt together.
-            latest = candidate; acknowledged = true; preparationProblem = undefined; published = true;
+            if (phase.kind !== "laptop") throw new Error("Hybrid workspace is no longer in laptop phase.");
+            latest = candidate;
+            phase.acknowledged = true;
+            phase.preparationProblem = undefined;
+            published = true;
           } finally {
             if (!published) await rm(destination, { recursive: true, force: true }).catch(() => {});
           }
-          // Only inactive preparation trees share unchanged inodes. CAS and the
-          // baseline manifest remain available after cloud files become writable.
           if (previous?.tree) await rm(previous.tree.directory, { recursive: true, force: true }).catch(() => {});
-          record({ action: "workspace-checkpoint-published", epoch, revision, checkpoint: manifest.id, capturedAt: manifest.capturedAt });
+          record({ action: "workspace-checkpoint-published", epoch, revision: phase.revision, checkpoint: manifest.id, capturedAt: manifest.capturedAt });
           publish();
           return { checkpoint: checkpoint(), epoch };
         }
         if (method === "sync/export") {
-          if (location !== "cloud" || !cloudWorkspace || transitioning || failure)
+          if (phase.kind !== "cloud")
             throw new Error("A cloud workspace is not available for reconciliation.");
-          const manifest = await captureWorkspace({ ...cloudWorkspace, storeDir, signal: abort.signal });
-          if (closed) throw new Error("Hybrid workspace is closed.");
+          const manifest = await captureWorkspace({ ...phase.cloudWorkspace, storeDir, signal: abort.signal });
+          if (currentPhase().kind === "closed") throw new Error("Hybrid workspace is closed.");
           await durableJson(directory, "export.json", { epoch, manifest });
           record({ action: "cloud-checkpoint-exported", epoch, checkpoint: manifest.id, capturedAt: manifest.capturedAt });
           return { manifest, epoch };
@@ -311,38 +414,57 @@ export async function createHybridWorkspace(options: {
       });
     },
     connection(value: boolean): void {
-      if (closed) return;
-      const changed = online !== value;
-      online = value; connected ||= value;
-      if (changed) clearTimeout(reconnectTimer);
-      if (!value && changed) {
-        reconnectDeadline = Date.now() + 5000;
-        reconnectTimer = setTimeout(schedule, 5000);
-        reconnectTimer.unref();
+      if (phase.kind === "closed") return;
+      const changed = phase.online !== value;
+      phase.online = value;
+      if (phase.kind === "laptop" || phase.kind === "selecting") phase.connected ||= value;
+      if (phase.kind === "laptop") {
+        if (changed) {
+          clearTimeout(phase.reconnectTimer);
+          phase.reconnectTimer = undefined;
+        }
+        if (!value && changed) {
+          phase.reconnectDeadline = Date.now() + 5000;
+          const timer = setTimeout(schedule, 5000);
+          timer.unref();
+          phase.reconnectTimer = timer;
+        }
       }
       if (changed) record({ action: value ? "laptop-executor-connected" : "laptop-executor-disconnected", epoch });
-      publish(); if (!value) schedule();
+      publish();
+      if (!value) schedule();
     },
     activity(stats: { revision: number; busy: boolean; uncertain: boolean }): void {
-      if (closed || (sticky && !transitioning)) return;
-      if (!validCounter(stats.revision) || stats.revision < revision) {
-        uncertain = true;
-      } else { revision = stats.revision; busy = stats.busy; uncertain ||= stats.uncertain; }
-      publish(); if (!online) schedule();
+      if (phase.kind !== "laptop" && phase.kind !== "selecting") return;
+      if (!validCounter(stats.revision) || stats.revision < phase.revision) {
+        phase.uncertain = true;
+      } else {
+        phase.revision = stats.revision;
+        phase.busy = stats.busy;
+        phase.uncertain ||= stats.uncertain;
+      }
+      publish();
+      if (!phase.online) schedule();
     },
     providerReady(value: boolean): void {
-      if (closed) return;
-      supported = value; publish(); if (!online) schedule();
+      if (phase.kind === "closed") return;
+      if (phase.kind === "laptop" || phase.kind === "selecting") phase.supported = value;
+      publish();
+      if (!phase.online) schedule();
     },
     close(): Promise<void> {
-      if (closePromise) return closePromise;
-      closed = true; epoch += 1; abort.abort(); clearTimeout(reconnectTimer);
-      closePromise = (async () => {
+      if (phase.kind === "closed") return phase.closePromise;
+      if (phase.kind === "laptop") clearTimeout(phase.reconnectTimer);
+      const activeCloud = phase.kind === "cloud" || phase.kind === "selecting" || phase.kind === "failed" ? phase.cloud : undefined;
+      epoch += 1;
+      abort.abort();
+      const closePromise = (async () => {
         await Promise.allSettled([...admittedBlobs]);
         await tail;
         await blobTransfers.drain();
-        await cloud?.close().catch(() => {});
+        await activeCloud?.close().catch(() => {});
       })();
+      phase = { kind: "closed", closePromise };
       return closePromise;
     },
   };

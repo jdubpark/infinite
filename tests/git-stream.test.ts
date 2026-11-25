@@ -17,7 +17,6 @@ function run(cwd: string, ...args: string[]) {
   return result.stdout.trim();
 }
 
-/** A repository with a 10-byte blob and a blob one byte over the 1 MiB limit. Built with git only; no launcher. */
 function makeRepo() {
   const dir = mkdtempSync(join(tmpdir(), "git-stream-"));
   run(dir, "init", "-q", "--template=");
@@ -31,10 +30,6 @@ function makeRepo() {
   return { dir, head: run(dir, "rev-parse", "HEAD") };
 }
 
-/**
- * A fake launcher prefix: a node script that records its argv and GIT_NO_LAZY_FETCH, waits for the release file,
- * then runs the git it was given. The release file is written by the caller.
- */
 function fakePrefix(dir: string): { prefix: TeamCommand; record: string; release: string } {
   const record = join(dir, "record.json"), release = join(dir, "release"), script = join(dir, "prefix.mjs");
   writeFileSync(script, `
@@ -50,21 +45,17 @@ process.exitCode = result.status ?? 1;
 }
 
 test("a blob read is one bounded form", async () => {
-  // The form: one argument COMMIT:PATH after cat-file blob.
   assert.deepEqual(blobArgs(ID40, "docs/a.json"), ["cat-file", "blob", `${ID40}:docs/a.json`]);
   assert.deepEqual(blobArgs("b".repeat(64), "docs/a.json"), ["cat-file", "blob", `${"b".repeat(64)}:docs/a.json`]);
 
-  // Refusals: each throws TypeError.
   const refusedIds = ["A".repeat(40), "a".repeat(39)];
   for (const id of refusedIds) assert.throws(() => blobArgs(id, "docs/a.json"), TypeError, `id ${id.length}`);
   const refusedPaths = ["../a", "a:b", ".", ".git/x", "x".repeat(301), "docs/a\u0001b"];
   for (const path of refusedPaths) assert.throws(() => blobArgs(ID40, path), TypeError, JSON.stringify(path));
-  // Git reads the whole COMMIT:PATH word as a revision before it splits it, so a path may not end it in revision syntax.
   const revisionPaths = ["r-g6d9fcb43", "docs/r-gABCDEF", "r-g1", "a^", "a~1", "a^{tree}", "a^{/x}", "a@{1}", "a@", "a{b", "a}b"];
   for (const path of revisionPaths) assert.throws(() => blobArgs(ID40, path), TypeError, JSON.stringify(path));
   for (const path of ["r-g", "r-gz1", "g-1234", "-x", "HEAD", "a.b-c_d+e=f"]) assert.equal(blobArgs(ID40, path)[2], `${ID40}:${path}`);
 
-  // A reader given a refused argument resolves failed and starts no child.
   const { dir, head } = makeRepo();
   try {
     const fake = fakePrefix(dir);
@@ -82,16 +73,13 @@ test("a blob read streams within its limits", async () => {
   const { dir, head } = makeRepo();
   const signal = new AbortController().signal;
   try {
-    // Results, with no prefix.
     const direct = blobReader(() => undefined);
     const small = await direct.read(dir, head, "docs/a.json", signal);
     assert.equal(small.state, "read");
     assert.deepEqual(small.state === "read" ? small.bytes : undefined, Buffer.from(SMALL));
-    // Compare the state alone: a failing deepEqual on a megabyte of bytes makes node's assert diff exhaust memory.
     assert.equal((await direct.read(dir, head, "big.bin", signal)).state, "too-large");
     assert.deepEqual(await direct.read(dir, head, "docs/missing.json", signal), { state: "failed" });
 
-    // The fake prefix records the six settings, then B1, and GIT_NO_LAZY_FETCH=1.
     const fake = fakePrefix(dir);
     writeFileSync(fake.release, "");
     const recorded = blobReader(() => fake.prefix);
@@ -101,7 +89,6 @@ test("a blob read streams within its limits", async () => {
     assert.equal(seen.lazy, "1");
     rmSync(fake.release, { force: true });
 
-    // A stalled read: the prefix waits for the release file, the timeout is 200 ms, and the stop refuses.
     const stalledFake = join(dir, "stalled");
     mkdirSync(stalledFake);
     const hold = fakePrefix(stalledFake);

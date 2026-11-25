@@ -6,9 +6,6 @@ import { teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
 import { ENTRY_PROFILE, smallRun } from "./fixtures/team-prompt-run.js";
 
-// The criteria rows of a goal cycle and the evaluator role in the member prompts. These tests lived at the end of
-// team-prompts.test.ts; they moved here unchanged when that file reached the size limit.
-
 const GOAL_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker", "evaluator"] as const;
 const GOAL_BASE = { id: "00000000-0000-4000-8000-000000000021", revision: 1, cycle: 2, successCriteria: "Fixture success criteria.", nonGoals: [], allowedPaths: ["."], evidence: [], previousWork: [],
   deadlineAt: "2026-12-01T00:00:00.000Z", maxMembers: 2 };
@@ -30,7 +27,6 @@ const GOAL_VARIANTS: { name: string; run: () => TeamRun }[] = [
   { name: "plain", run: () => goalRunFor({}) },
   { name: "record", run: () => goalRunFor({ record: GOAL_RECORD }, "autonomous") },
 ];
-/** Pinned from the base commit, before the rows existed: sha256 of each role's prompt and of its context file. */
 const BASE_DIGESTS: Record<string, string> = {
   "plain/permission-coordinator/prompt": "ec013bfcbe048e6847387109b92ba6bdebc8761f768171f1180f6b57549403d8",
   "plain/permission-coordinator/context": "fe5cbf60907dd895160083e5e2cd2c86fe494f10b1ceab7772b84274daab570d",
@@ -52,7 +48,7 @@ const BASE_DIGESTS: Record<string, string> = {
   "plain/evaluator/context": "fe5cbf60907dd895160083e5e2cd2c86fe494f10b1ceab7772b84274daab570d",
   "record/permission-coordinator/prompt": "bf3ffce927b7c457f22e989374d17187031861e52f2131ecf80726affe94336f",
   "record/permission-coordinator/context": "391a0bcfff56a8606174793eaf8804dbad07f987e916ab6835ee2778fe22e44f",
-  "record/project-manager/prompt": "5e1ba65dde005edef175389793b546874fda86949581e16a698980d028f655fa",
+  "record/project-manager/prompt": "c96ca567692d330842dfa21bcca798f59c77c1145a616adbcd38788393393a20",
   "record/project-manager/context": "391a0bcfff56a8606174793eaf8804dbad07f987e916ab6835ee2778fe22e44f",
   "record/scout/prompt": "aba8430c810edb0cc7f4b7268f792cf815e6c472fce1c59c32691c5918c0b13c",
   "record/scout/context": "391a0bcfff56a8606174793eaf8804dbad07f987e916ab6835ee2778fe22e44f",
@@ -114,6 +110,20 @@ test("criteria rows reach only the coordinator", () => {
   }
   const manager = renderFor(run, "project-manager");
   assert.equal(/threshold|profile|score/i.test(manager.prompt.split("Agent assessment, provisional")[1]?.split("\n\n")[0] ?? ""), false, "the rows hold no number or profile");
+});
+
+test("only a project manager with a pinned goal record gets task criterion mapping instructions", () => {
+  const run = goalRunFor({ record: GOAL_RECORD });
+  const manager = renderFor(run, "project-manager").prompt;
+  assert.ok(manager.includes('"objectiveVersion":3'), "the PM gets the host-pinned objective revision");
+  assert.ok(manager.includes("every task, including each prerequisite"), "prerequisite tasks need direct references");
+  assert.ok(manager.includes("Dependencies set task order and do not provide transitive criterion coverage"));
+  assert.ok(manager.includes("not evidence that a criterion is satisfied"), "mapping cannot manufacture satisfaction");
+  assert.ok(manager.includes("other criteria may remain open"), "a cycle may target a subset");
+
+  for (const role of GOAL_ROLES.filter(role => role !== "project-manager"))
+    assert.equal(renderFor(run, role).prompt.includes("Task criterion references for this goal plan"), false, `${role}: no planning-only instruction`);
+  assert.equal(renderFor(goalRunFor({}), "project-manager").prompt.includes("Task criterion references for this goal plan"), false, "no record keeps old prompt behavior");
 });
 
 test("the evaluator's member report never reaches a context file", () => {

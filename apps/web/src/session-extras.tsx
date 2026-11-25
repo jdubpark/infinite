@@ -22,7 +22,6 @@ export function Conversation({ id }: { id: string }) {
     setStale(false);
     setLoaded(false);
     const collected = new Map<string, ChatMessage>();
-    // Hiding the tab starts a new generation: a reply to an earlier read is dropped, and returning reads again at once.
     let generation = 0, inFlight: number | undefined;
     async function poll() {
       clearTimeout(timer);
@@ -37,7 +36,6 @@ export function Conversation({ id }: { id: string }) {
         clearTimeout(staleTimer);
         staleTimer = undefined;
         setStale(false);
-        // An empty page keeps the current array, so it does not re-render the same messages every poll.
         if (page.messages.length) {
           for (const message of page.messages) collected.set(message.id, message);
           while (collected.size > 500) collected.delete(collected.keys().next().value!);
@@ -61,7 +59,6 @@ export function Conversation({ id }: { id: string }) {
       clearTimeout(staleTimer);
       staleTimer = undefined;
       if (document.visibilityState === "hidden") return;
-      // Returning clears an earlier warning; it shows again only if no read lands within the same grace period.
       setStale(false);
       staleTimer = setTimeout(() => { staleTimer = undefined; if (active) setStale(true); }, 3000);
       void poll();

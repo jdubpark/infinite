@@ -11,7 +11,6 @@ export const intakeConfigSchema = z.object({
     creatorId: z.uuid(),
     label: z.string().trim().min(1).max(80),
     commentsMirrorToSlack: z.boolean().default(false),
-    /** False leaves Linear's labelled issues alone: only the host's own direct requests start work. */
     admitIssues: z.boolean().default(true),
   }).strict(),
   slack: z.object({
@@ -19,19 +18,13 @@ export const intakeConfigSchema = z.object({
     botTokenFile: z.string().refine(isAbsolute),
     teamId: z.string().regex(/^T[A-Z0-9]{2,20}$/),
     ownerUserId: z.string().regex(/^[UW][A-Z0-9]{2,20}$/),
-    // Mention markup names users only (`<@U…>` or `<@W…>`), so a bot ID would never match.
     linearAgentUserId: z.string().regex(/^[UW][A-Z0-9]{2,20}$/).optional(),
     bindByMention: z.boolean().default(false),
-    /** True lets the owner's mention of the bot file a Linear issue and start a mission. */
     directRequests: z.boolean().default(false),
-    /** True accepts the owner's ordinary messages in joined public and private channels. Needs directRequests. */
     ownerOnlyInJoinedChannels: z.boolean().optional(),
-    /** True lets the owner's mention be a question: it is routed to a read-only answer or to a filed request. Needs directRequests. */
     answerQuestions: z.boolean().default(false),
-    /** Slack channels whose owner-authored messages can be filed directly as requests. Empty or absent disables channel intake. */
     requestChannelIds: z.array(z.string().regex(/^[CG][A-Z0-9]{2,20}$/)).max(20)
       .refine(ids => new Set(ids).size === ids.length, "requestChannelIds must be unique").optional(),
-    /** True lets the reading service choose the route when the owner gave no word. Needs answerQuestions and the jev block. */
     classify: z.boolean().default(false),
     endpoint: z.url().optional(),
   }).strict().optional(),
@@ -50,40 +43,43 @@ export type IntakeState = "queued" | "started" | "finished" | "skipped";
 export type IntakeSkipReason = "creator-mismatch" | "no-slack-thread" | "thread-unreadable" | "no-owner-mention";
 export type IntakeMessageKind = "ack" | "started" | "question" | "result" | "status" | "edit-note" | "reply";
 export interface IntakeThread { channelId: string; threadTs: string }
-export interface IntakeMessage {
-  key: string; kind: IntakeMessageKind; text: string; createdAt: string;
-  status: "pending" | "sent" | "failed"; attempts: number;
-  /** The last send may have reached Slack; look the key up in the thread before sending again. */
-  uncertain?: boolean; nextAttemptAt?: string; ts?: string; error?: string;
-  /** Slack Block Kit controls attached to the final chunk of a decision question. */
+
+interface IntakeMessageBase {
+  key: string;
+  kind: IntakeMessageKind;
+  text: string;
+  createdAt: string;
+  attempts: number;
   blocks?: Record<string, unknown>[];
 }
+
+export type IntakeMessage =
+  | (IntakeMessageBase & { status: "pending"; uncertain?: boolean; nextAttemptAt?: string; error?: string; ts?: never })
+  | (IntakeMessageBase & { status: "sent"; ts: string; uncertain?: never; nextAttemptAt?: never; error?: never })
+  | (IntakeMessageBase & { status: "failed"; error: string; uncertain?: boolean; nextAttemptAt?: never; ts?: never });
+
 export interface IntakeInbound {
   eventId: string; ts: string; text: string; receivedAt: string; handledAt?: string; outcome?: string;
-  /** An ordinary channel reply can answer a question only after that question appeared in Slack. */
   entrypoint?: "channel-message";
-  /** The mission call chosen for this event, saved before the call; a replay performs exactly this call. */
   call?: { action: "answer" | "steer" | "pause" | "resume" | "cancel" | "extend"; decisionId?: string; text?: string; minutes?: number; revision: number };
-  /** Interactive Slack action identity, stable across envelope redelivery. */
   interactionId?: string;
 }
-/** The owner's direct Slack request a record was filed from; `filedAt` is set once Linear holds the issue. */
+
 export interface IntakeDirect {
   eventId: string; ts: string; text: string; filedAt?: string;
-  /** An ordinary owner request or sponsorship reply in an opted-in channel. Absent on old records and mentions. */
   entrypoint?: "channel-message";
-  /** Where the request went: absent on records made before routing existed or with answerQuestions off, and then it is work. */
   route?: IntakeRoute & { at: string };
-  /** Set when the mention was saved with `answerQuestions` on: only such a record is routed. Any other direct record is work. */
   routable?: true;
 }
+
 export interface IntakeComment { id: string; body: string; delivered: boolean; attempts: number; error?: string }
-/** Frozen execution membership, kept sealed and never exposed through the connector API. */
+
 export interface IntakeExternalScope {
   groupId: string;
   repositories: { projectId: string; key?: string; checkouts: { projectId: string; path: string; primary: boolean }[] }[];
   selectedCheckouts: string[];
 }
+
 export interface IntakeExternal {
   connectorId: string;
   requestId: string;
@@ -91,49 +87,75 @@ export interface IntakeExternal {
   scope: IntakeExternalScope;
   filedAt?: string;
 }
-export interface IntakeRecord {
-  issueId: string; identifier: string; url: string; title: string; description: string;
-  issueCreatedAt: string; issueUpdatedAt: string;
-  state: IntakeState; rule?: string; skipReason?: IntakeSkipReason;
-  /** Why a queued record has not started: "max-active" or a refusal from the mission service. */
-  holdReason?: string;
-  /** Absent on skipped records, so a skipped issue never binds a thread. */
-  thread?: IntakeThread;
-  /** Present on a record the host filed itself from the owner's Slack mention. */
+
+interface IntakeRecordBase {
+  issueId: string;
+  identifier: string;
+  url: string;
+  title: string;
+  description: string;
+  issueCreatedAt: string;
+  issueUpdatedAt: string;
   direct?: IntakeDirect;
-  /** An authenticated connector request; its pinned mission request exists even before tracking is confirmed. */
   external?: IntakeExternal;
-  /** Saved before the mission is created and reused verbatim on every retry. */
-  request?: CreateMission;
-  missionId?: string;
-  closure?: { reason: string; at: string };
   editNotedAt?: string;
-  /** The `deadlineAt` of the last time-limit stop whose outcome comment was queued, so each stop posts once. */
   deadlineNoticeFor?: string;
-  /** The issue's title and description as the tracker returned them when the host filed it; edits are detected against this. */
   tracked?: { title: string; description: string };
   comments: { started?: IntakeComment; outcome?: IntakeComment };
   messages: IntakeMessage[];
   questions: { decisionId: string; n: number }[];
   inbound: IntakeInbound[];
-  createdAt: string; updatedAt: string;
+  createdAt: string;
+  updatedAt: string;
 }
+
+export type IntakeRecord =
+  | (IntakeRecordBase & {
+      state: "skipped";
+      skipReason: IntakeSkipReason;
+      rule?: never;
+      holdReason?: never;
+      thread?: never;
+      request?: never;
+      missionId?: never;
+      closure?: never;
+    })
+  | (IntakeRecordBase & {
+      state: "queued";
+      skipReason?: never;
+      rule?: string;
+      holdReason?: string;
+      thread?: IntakeThread;
+      request?: CreateMission;
+      missionId?: never;
+      closure?: never;
+    })
+  | (IntakeRecordBase & {
+      state: "started" | "finished";
+      skipReason?: never;
+      rule: string;
+      holdReason?: never;
+      thread?: IntakeThread;
+      request?: CreateMission;
+      missionId: string;
+      closure?: { reason: string; at: string };
+    });
+
 export interface IntakeView {
   issueId: string; identifier: string; url: string; title: string; state: IntakeState;
   skipReason?: IntakeSkipReason; holdReason?: string; missionId?: string; threadBound: boolean;
-  /** The route chosen for a direct request and why; never the request's text. */
   route?: IntakeRoute & { at: string };
   comments: { started?: "pending" | "delivered"; outcome?: "pending" | "delivered" };
   messages: { key: string; kind: IntakeMessageKind; status: IntakeMessage["status"]; ts?: string; error?: string }[];
 }
+
 export interface SlackThreadMessage { ts: string; user?: string; botId?: string; text: string; key?: string }
-/** `unreadable` is Slack's refusal (not in channel, no such thread); a thrown error is an outage. */
+
 export interface IntakeThreadReader {
   thread(binding: IntakeThread): Promise<SlackThreadMessage[] | "unreadable">;
-  /** The message's permanent link. */
   permalink?(binding: IntakeThread, ts: string): Promise<string>;
 }
-/** A stable RFC 9562 UUID: SHA-256 of `${namespace}:${value}`, first 16 bytes, version nibble 5, variant 10. */
+
 export function deterministicUuid(namespace: string, value: string): string {
   const bytes = createHash("sha256").update(`${namespace}:${value}`).digest().subarray(0, 16);
   bytes[6] = (bytes[6] & 0x0f) | 0x50;
@@ -141,4 +163,5 @@ export function deterministicUuid(namespace: string, value: string): string {
   const hex = bytes.toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
+
 export const missionRequestId = (issueId: string) => deterministicUuid("intake-mission", issueId);

@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Config } from "./types.js";
 
-/** Legacy hosts gain an opaque stable identity without exposing paths or hostnames. */
 export function machineIdentity(config: Config, key: Buffer) {
   if (config.machine) return config.machine;
   const bytes = createHash("sha256").update("infinite:machine:v1").update(key).digest().subarray(0, 16);

@@ -106,7 +106,6 @@ export interface GoalCycle {
   class?: CycleClass;
   /** The cycle's agent assessment, provisional; copied from its run. */
   assessment?: GoalAssessment;
-  /** Earlier verdict ids of this cycle at the same revision and head, oldest first, at most 4. */
   supersededVerdictIds?: string[];
   settledAt?: string;
   /** Standing goals: the pending wake this cycle consumed. */

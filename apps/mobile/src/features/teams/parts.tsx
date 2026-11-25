@@ -14,7 +14,6 @@ import type { RunRequestControl } from "./useRunRequest";
 
 export const providerName = (provider: string) => PROVIDER_NAMES[provider as Provider] ?? provider;
 
-/** The run's state as a status icon and its name, in the same chip as a session's state. */
 export function RunPill({ label, tone, kind, fraction }: { label: string; tone: Tone; kind?: StatusKind; fraction?: number }) {
   const fallback: StatusKind = tone === "amber" ? "attention" : tone === "error" ? "blocked" : tone === "muted" ? "stopped" : "progress";
   return <Chip kind={kind ?? fallback} fraction={fraction} label={label} accessibilityLabel={`State: ${label}`}
@@ -31,7 +30,6 @@ export function Section({ title, count, children, right }: { title: string; coun
   </View>;
 }
 
-/** Prose that can run to a full PRD: the first lines, then the rest on request. */
 export function Clamp({ text, lines = 6, style }: { text: string; lines?: number; style?: object }) {
   const [open, setOpen] = useState(false);
   const long = text.length > lines * 60 || text.split("\n").length > lines;
@@ -43,7 +41,6 @@ export function Clamp({ text, lines = 6, style }: { text: string; lines?: number
   </View>;
 }
 
-/** Long or secondary records start closed so state and decisions stay near the top. */
 export function Disclosure({ title, children }: { title: string; children: ReactNode }) {
   const [open, setOpen] = useState(false);
   return <View>
@@ -73,7 +70,6 @@ export function LineupView({ lineup }: { lineup: TeamLineup }) {
   </View>)}</>;
 }
 
-/** Linear's issue state by its workflow name; unknown names read as not started. */
 function linearKind(state: string): StatusKind {
   const name = state.toLowerCase();
   if (name.includes("progress")) return "progress";
@@ -84,12 +80,6 @@ function linearKind(state: string): StatusKind {
   return "todo";
 }
 
-/**
- * The run's Linear issue as a chip that opens it. Linear's issue state is separate from the run's
- * execution state; the icon carries the issue's state and the label only its identifier. A pending
- * sync or a cached record swaps the icon for a spinner rather than adding words, so the chip keeps
- * its width; tracking problems turn it red. The state and any trouble are spoken in full.
- */
 export function LinearChip({ tracking, fresh }: { tracking?: LinearTracking; fresh: boolean }) {
   if (!tracking) return null;
   const issue = tracking.issue;
@@ -105,7 +95,6 @@ export function LinearChip({ tracking, fresh }: { tracking?: LinearTracking; fre
     accessibilityLabel={`Linear ${label}${issue ? `, ${issue.state.name}` : ""}${status}${issue ? `: ${issue.title}` : ""}${tracking.reason ? `. ${tracking.reason}` : ""}`} />;
 }
 
-/** The outcome of the last request, and the controls for one whose delivery is unconfirmed. */
 export function RequestStatus({ request, canRetry, bottom = 0 }: { request: RunRequestControl; canRetry: boolean; bottom?: number }) {
   const pending = request.pending;
   useEffect(() => {
@@ -128,12 +117,10 @@ export function RequestStatus({ request, canRetry, bottom = 0 }: { request: RunR
   return null;
 }
 
-/** The floating direction field for a team or goal; `note` replaces it when steering is unavailable. */
 export function SteerBox({ value, onChange, placeholder, enabled, busy, note, onSend, dictation }: {
   value: string; onChange: (text: string) => void; placeholder: string; enabled: boolean; busy: boolean; note?: string; onSend: () => void; dictation?: Dictation;
 }) {
   if (note) return <Text style={[t.note, s.steerNote]} numberOfLines={1}>{note}</Text>;
-  // The field is read-only whenever steering is off or a send is in flight, so the mic follows it.
   const mic = dictation ? <MicButton dictation={dictation} size={40} disabled={!enabled || busy} /> : null;
   if (busy) return <View style={s.steer}>
     <TextInput accessibilityLabel="Direction" value={value} onChangeText={onChange} editable={false} multiline maxLength={8000} placeholder={placeholder} placeholderTextColor={theme.colors.placeholder} style={s.steerInput} />
@@ -148,14 +135,12 @@ export function SteerBox({ value, onChange, placeholder, enabled, busy, note, on
   </View>;
 }
 
-/** A person's choice between a few fixed values, shown as the app's toggle buttons. */
 export function Choices<T extends string | number>({ values, selected, label, disabled, onSelect }: {
   values: readonly T[]; selected: T | undefined; label: (value: T) => string; disabled?: boolean; onSelect: (value: T) => void;
 }) {
   return <View style={s.wrap}>{values.map(value => <Button key={String(value)} compact title={label(value)} secondary={selected !== value} disabled={disabled} onPress={() => onSelect(value)} />)}</View>;
 }
 
-/** Shared text styles for the team and goal screens. */
 export const t = StyleSheet.create({
   title: { fontSize: 22, lineHeight: 27, fontWeight: "600", color: theme.colors.ink, letterSpacing: -0.4 },
   body: { fontSize: 14, lineHeight: 21, color: theme.colors.ink },

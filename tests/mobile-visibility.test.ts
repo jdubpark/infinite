@@ -14,9 +14,20 @@ const standIns: Plugin = {
   },
 };
 
-type Monitor = { pollCalls: number; liveLoads: number; opens: number; closes: number; resolveFirstPoll(value: string): void; failPolls(value: boolean): void };
+type Monitor = {
+  pollCalls: number;
+  liveLoads: number;
+  opens: number;
+  closes: number;
+  resolveFirstPoll(value: string): void;
+  failPolls(value: boolean): void;
+  holdNextLiveLoad(): void;
+  resolveLiveLoad(value: string): void;
+  rejectLiveLoad(error: Error): void;
+};
+type LiveView = { data: string | null; online: boolean; loading: boolean; stale: boolean };
 type View = { read(): { poll: { data: string | null; stale: boolean }; live: { data: string | null } }; unmount(): void };
-type Runtime = { mount(): View; monitor: Monitor; setFocused(value: boolean): void };
+type Runtime = { mount(): View; mountLive(): { read(): LiveView; unmount(): void }; monitor: Monitor; setFocused(value: boolean): void };
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 test("covered phone screens pause polls and live topics, then refresh on focus", async () => {
@@ -59,6 +70,38 @@ test("covered phone screens pause polls and live topics, then refresh on focus",
     await wait(100);
     assert.equal(view.read().poll.stale, false, "stale UI remains delayed after a failed return poll");
     await waitFor(() => view.read().poll.stale, "stale UI did not appear after the existing delay", 3500);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("useLive reports online when the event stream opens before the initial load settles or after it fails", async () => {
+  const bundle = await build({ entryPoints: [harness], bundle: true, write: false, format: "esm", platform: "node", logLevel: "silent", plugins: [standIns] });
+  const runtime = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString("base64")}`) as Runtime;
+  runtime.setFocused(true);
+  runtime.monitor.holdNextLiveLoad();
+  const initialOpens = runtime.monitor.opens;
+  const view = runtime.mountLive();
+  try {
+    const deadline = Date.now() + 2000;
+    while (runtime.monitor.opens === initialOpens) {
+      assert.ok(Date.now() < deadline, "event stream did not open");
+      await wait(10);
+    }
+    await wait(20);
+    const pending = view.read();
+    assert.equal(pending.online, true);
+    assert.equal(pending.loading, true);
+    assert.equal(pending.data, null);
+    assert.equal(pending.stale, false);
+
+    runtime.monitor.rejectLiveLoad(new Error("initial load failed"));
+    await wait(20);
+    const failedLoad = view.read();
+    assert.equal(failedLoad.online, true);
+    assert.equal(failedLoad.loading, false);
+    assert.equal(failedLoad.data, null);
+    assert.equal(failedLoad.stale, false);
   } finally {
     view.unmount();
   }

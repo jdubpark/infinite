@@ -38,7 +38,6 @@ function fixture(): Fixture {
   };
 }
 
-/** A store with the `outcomes` and `configurations` modules, as the host registers them. */
 function open(f: Fixture): EvidenceStore {
   const store = new EvidenceStore({ databasePath: f.path, vaultKey: f.key });
   store.register(configurationModule());
@@ -65,7 +64,6 @@ function refOf(store: EvidenceStore, id: string): string {
   return store.read(db => db.index("legacy", id));
 }
 
-/** Every raw row of both legacy tables. Equal output means equal bytes. */
 function raw(store: EvidenceStore) {
   return store.read(db => ({
     outcomes: db.all("SELECT * FROM outcomes ORDER BY outcome_id"),
@@ -73,10 +71,6 @@ function raw(store: EvidenceStore) {
   }));
 }
 
-/**
- * A store whose `write` fails at the `n`th `INSERT INTO outcomes` of the write. The failure is injected in the test
- * only. The product code is unchanged.
- */
 function cutAt(store: EvidenceStore, n: number): EvidenceStore {
   let seen = 0;
   const write = (fn: (tx: EvidenceTx) => unknown) => store.write(tx => fn(Object.assign(Object.create(tx), {
@@ -131,9 +125,6 @@ test("the same id with another body is refused, and the rest of the batch import
 });
 
 test("a superseded line is dropped in either order across batches", () => {
-  // Compares what the test can compare across two stores: each store has its own key, so blind indexes differ.
-  // The compared facts are the line states by operator id (state, hash, time), the row of each operator id, and the
-  // count of rows.
   const snapshot = (store: EvidenceStore) => store.read(db => {
     const refs = { A: db.index("legacy", "A"), B: db.index("legacy", "B") };
     const states = readLegacyLines(db, [refs.A, refs.B]);
@@ -156,7 +147,6 @@ test("a superseded line is dropped in either order across batches", () => {
     assert.deepEqual(importLegacy(second, { dryRun: false, lines: [line("B", { supersedes: "A" })] }, OPTIONS).outcomes, ["imported"]);
     assert.deepEqual(importLegacy(second, { dryRun: false, lines: [line("A")] }, OPTIONS).outcomes, ["superseded"]);
 
-    // An edit of the dropped line is refused, as an edit of a stored line is: the first body the host saw stays.
     assert.deepEqual(importLegacy(first, { dryRun: false, lines: [line("A", { attempts: 2 })] }, OPTIONS).outcomes, ["changed"]);
     assert.deepEqual(importLegacy(first, { dryRun: false, lines: [line("A")] }, OPTIONS).outcomes, ["superseded"]);
 
@@ -174,7 +164,6 @@ test("a superseded line is dropped in either order across batches", () => {
 });
 
 test("a chain keeps its last line in every order across batches", () => {
-  // B replaced A, and C replaced B. Each store has its own key, so the facts are compared by operator id.
   const chain = [
     line("A", { recordedAt: "2026-11-01T00:00:00.000Z" }),
     line("B", { supersedes: "A", recordedAt: "2026-11-02T00:00:00.000Z" }),
@@ -203,7 +192,6 @@ test("a chain keeps its last line in every order across batches", () => {
       assert.equal(got.count, 1, order.join(" "));
       assert.deepEqual(got.states.map(([id, state]) => [id, (state as { state: string } | null)?.state]),
         [["A", "superseded"], ["B", "superseded"], ["C", "imported"]], order.join(" "));
-      // A row is removed once for each line that was stored before the line that replaced it arrived.
       assert.equal(removed, order.indexOf(0) < order.indexOf(1) ? (order.indexOf(1) < order.indexOf(2) ? 2 : 1) : (order.indexOf(1) < order.indexOf(2) ? 1 : 0), order.join(" "));
       if (expected === undefined) expected = got;
       else assert.deepEqual(got, expected, order.join(" "));
@@ -256,7 +244,6 @@ test("a dry run reports and writes nothing", () => {
 test("an unavailable store or module writes nothing", () => {
   const f = fixture();
   try {
-    // A store without the `outcomes` module.
     const bare = new EvidenceStore({ databasePath: f.path, vaultKey: f.key });
     try {
       assert.throws(
@@ -267,7 +254,6 @@ test("an unavailable store or module writes nothing", () => {
       bare.close();
     }
 
-    // A closed store.
     const closed = open(f);
     closed.close();
     assert.throws(
@@ -359,7 +345,6 @@ test("the configured retention decides what is expired", () => {
   const f = fixture();
   const store = open(f);
   try {
-    // RECORDED is 12 days and 12 hours before NOW.
     const short = importLegacy(store, { dryRun: false, lines: [line("A")] }, { ...OPTIONS, retentionDays: 12 });
     assert.deepEqual(short.outcomes, ["expired"]);
     assert.equal(store.read(db => legacyLineCount(db)), 0);

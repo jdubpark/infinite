@@ -157,29 +157,24 @@ test("later changes", () => {
 });
 
 test("promotion follows the ledger's decision rule", () => {
-  // Waits: each pending fact, an open row, an unfrozen integrated row.
   assert.deepEqual(promotion(promotionFacts({ material: "pending" }), row()), { kind: "wait" });
   assert.deepEqual(promotion(promotionFacts({ approval: "pending" }), row()), { kind: "wait" });
   assert.deepEqual(promotion(promotionFacts({ base: "pending" }), row()), { kind: "wait" });
   assert.deepEqual(promotion(promotionFacts(), row({ disposition: "open" })), { kind: "wait" });
   assert.deepEqual(promotion(promotionFacts(), row({ frozenAt: null })), { kind: "wait" });
 
-  // No ledger row.
   assert.deepEqual(promotion(promotionFacts({ runDeletedAt: "2026-11-14T00:00:00.000Z" }), undefined), { kind: "reject", reason: "ledger-missing" });
   assert.deepEqual(promotion(promotionFacts({ state: "candidate", runDeletedAt: "2026-11-14T00:00:00.000Z" }), undefined), { kind: "wait" });
   assert.deepEqual(promotion(promotionFacts(), undefined), { kind: "wait" });
 
-  // Withheld and excluded.
   assert.deepEqual(promotion(promotionFacts(), row({ flags: ["backfilled"] })), { kind: "reject", reason: "ledger-withheld" });
   assert.deepEqual(promotion(promotionFacts(), row({ flags: ["gap"] })), { kind: "reject", reason: "ledger-withheld" });
   assert.deepEqual(promotion(promotionFacts(), row({ exclusion: "owner" })), { kind: "reject", reason: "excluded" });
 
-  // Acceptance.
   assert.deepEqual(promotion(promotionFacts(), row({ flags: ["same-model-review"] })), { kind: "reject", reason: "same-model-review" });
   assert.deepEqual(promotion(promotionFacts(), row({ accepted: 0, held: 0 })), { kind: "reject", reason: "not-accepted" });
   assert.deepEqual(promotion(promotionFacts(), row({ accepted: null })), { kind: "reject", reason: "acceptance-unknown" });
 
-  // Material, approval, later change, base.
   assert.deepEqual(promotion(promotionFacts({ material: "partial" }), row()), { kind: "reject", reason: "patch-missing" });
   assert.deepEqual(promotion(promotionFacts({ approval: null }), row()), { kind: "reject", reason: "reference-unknown" });
   assert.deepEqual(promotion(promotionFacts({ approval: "unknown" }), row()), { kind: "reject", reason: "reference-unknown" });
@@ -187,7 +182,6 @@ test("promotion follows the ledger's decision rule", () => {
   assert.deepEqual(promotion(overlap, row()), { kind: "reject", reason: "reference-ambiguous" });
   assert.deepEqual(promotion(promotionFacts({ base: "not-proven" }), row()), { kind: "reject", reason: "base-not-proven" });
 
-  // Risk and the candidate.
   assert.deepEqual(promotion(promotionFacts(), row({ risk: "unknown" })), { kind: "reject", reason: "features-unknown" });
   assert.deepEqual(promotion(promotionFacts(), row()), {
     kind: "candidate",

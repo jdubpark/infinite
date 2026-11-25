@@ -23,7 +23,6 @@ function memoryLedger(): PermissionDeliveryLedger {
   return { get: id => rows.get(id), set: (id, entry) => { rows.set(id, { decisionId: entry.decisionId, state: entry.state }); } };
 }
 
-/** A pipeline fake: the team adapter and delivery are real, only the decision is scripted. */
 function fakePipeline(outcome: (request: PermissionRequest) => PermissionOutcome, served = true) {
   const calls = { decide: [] as PermissionRequest[], deliveries: [] as { decisionId: string; kind: string }[], ended: [] as string[] };
   const pipeline: PermissionPipeline = {
@@ -37,11 +36,6 @@ function fakePipeline(outcome: (request: PermissionRequest) => PermissionOutcome
   return { pipeline, calls };
 }
 
-/**
- * Starts a run whose project has no coordinator review, waits until member a shows its permission dialog, then
- * moves the run to a direct TeamService that has the permission agent wired. Member a's dialog moves its marker
- * with the arrow keys and records the option and text it received.
- */
 async function servedRun(outcome: (request: PermissionRequest) => PermissionOutcome, options: { served?: boolean; holdControl?: boolean } = {}) {
   const f = await fixture("permissions-off-navigate", lineup);
   const created = await f.host.fetchApi("/teams", "owner", f.create());
@@ -148,7 +142,6 @@ test("a person holding input control keeps the dialog: nothing is decided or sen
 });
 
 test("a coordinator review under way when the permission agent starts to serve the run never answers the dialog", { timeout: 180000 }, async () => {
-  // The run starts on a host without the permission agent, so the coordinator review takes the member's dialog.
   const f = await fixture("permissions-revoke", lineup);
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
@@ -156,7 +149,6 @@ test("a coordinator review under way when the permission agent starts to serve t
     const runId = created.body.id as string;
     await waitFor(() => f.get(runId), run => run.permissionDecisions?.some(decision => decision.status === "reviewing") === true &&
       existsSync(join(f.receipts, `${runId}.judge-ready`)), 60000);
-    // The permission agent becomes ready and serves the project while that review still runs.
     const service = await f.openTeamService({ start: false });
     const { pipeline, calls } = fakePipeline(() => ({ kind: "owner", decisionId: randomUUID(), interruptClass: "credentials" }));
     service.usePermissionAgent({ pipeline, delivery: new InteractivePermissionDelivery({ pipeline: () => pipeline, ledger: memoryLedger() }) });
@@ -169,7 +161,6 @@ test("a coordinator review under way when the permission agent starts to serve t
     assert.equal(decision.receipt, undefined, "the coordinator's approval sent no key");
     assert.equal(settled.permissionsRevokedAt, undefined, "the owner revoked nothing; the authority moved to the permission agent");
     assert.ok(settled.events.some(event => event.text === "The permission agent now decides this run's provider requests; its coordinator reviews were retired."));
-    // The dialog is still open, and it is the permission agent that decides it next.
     await waitFor(async () => calls.decide.length, count => count > 0, 60000);
     assert.equal(service.get(runId).permissionDecisions!.length, 1, "no further coordinator review starts for a served run");
   } finally { await f.close(); }
@@ -183,7 +174,6 @@ test("a coordinator answer already inside the manager when the permission agent 
     const runId = created.body.id as string;
     await waitFor(() => f.get(runId), run => run.permissionDecisions?.some(decision => decision.status === "reviewing") === true &&
       existsSync(join(f.receipts, `${runId}.judge-ready`)), 60000);
-    // The coordinator's approved answer is held as it enters the manager, after the team service's own checks passed.
     let entered = false, release!: () => void;
     const held = new Promise<void>(resolve => { release = resolve; });
     const service = await f.openTeamService({
@@ -193,7 +183,6 @@ test("a coordinator answer already inside the manager when the permission agent 
         manager.answerTeamPermission = async (...args) => { entered = true; await held; return answer(...args); };
       },
     });
-    // The permission agent is wired but does not serve the project yet, so the coordinator review decides.
     let served = false;
     const { pipeline, calls } = fakePipeline(() => ({ kind: "owner", decisionId: randomUUID(), interruptClass: "credentials" }));
     pipeline.serves = () => served ? { served: true } : { served: false, reason: "not-covered" };
@@ -202,8 +191,6 @@ test("a coordinator answer already inside the manager when the permission agent 
     writeFileSync(join(f.receipts, `${runId}.judge-release`), "release", { mode: 0o600 });
     await waitFor(async () => entered, value => value, 60000);
     assert.equal(service.get(runId).permissionDecisions![0]!.status, "answering");
-    // The agent starts to serve the run while the answer is in the manager. The scheduler cannot reach a run whose
-    // answer operation is pending, so only the manager's read under its lease stands between the approval and the key.
     served = true;
     await new Promise(resolve => setTimeout(resolve, 3000));
     release();
@@ -212,7 +199,6 @@ test("a coordinator answer already inside the manager when the permission agent 
     const decision = settled.permissionDecisions![0]!;
     assert.notEqual(decision.status, "answered", JSON.stringify(decision));
     assert.equal(decision.receipt, undefined, "the coordinator's approval sent no key");
-    // The dialog is still open, and it is the permission agent that decides it next.
     await waitFor(async () => calls.decide.length, count => count > 0, 60000);
   } finally { await f.close(); }
 });
@@ -225,7 +211,6 @@ test("a coordinator answer whose fence the worker did not confirm keeps the run 
     const runId = created.body.id as string;
     await waitFor(() => f.get(runId), run => run.permissionDecisions?.some(decision => decision.status === "reviewing") === true &&
       existsSync(join(f.receipts, `${runId}.judge-ready`)), 60000);
-    // The coordinator's answer is held as it enters the manager, and the worker's fence can be made to fail.
     let entered = false, release!: () => void, fenceWorks = false;
     const held = new Promise<void>(resolve => { release = resolve; });
     let manager!: Manager;
@@ -249,13 +234,11 @@ test("a coordinator answer whose fence the worker did not confirm keeps the run 
     const member = service.get(runId).members.find(item => item.taskId === "a")!;
     const session = manager.meta(member.sessionId).session;
     served = true;
-    // The fence fails: the coordinator's decision is retired, but the run does not switch.
     await service.permissionAuthorityChanged();
     assert.equal(service.get(runId).permissionDecisions![0]!.status, "uncertain");
     assert.equal(service.permissionAgentLive(session), false, "an unconfirmed fence blocks the switch");
     await service.permissionAuthorityChanged();
     assert.equal(service.permissionAgentLive(session), false, "and keeps blocking it");
-    // The worker confirms the fence: the run switches.
     fenceWorks = true;
     await service.permissionAuthorityChanged();
     assert.equal(service.permissionAgentLive(session), true);
@@ -274,8 +257,6 @@ test("a coordinator answer whose result was not confirmed keeps the run from swi
     const runId = created.body.id as string;
     await waitFor(() => f.get(runId), run => run.permissionDecisions?.some(decision => decision.status === "reviewing") === true &&
       existsSync(join(f.receipts, `${runId}.judge-ready`)), 60000);
-    // The coordinator's answer ends without a confirmed result, as a worker that stalls past the answer timeout does,
-    // before the permission agent serves the run. The worker's fence can be made to fail.
     let fenceWorks = false;
     let manager!: Manager;
     const service = await f.openTeamService({
@@ -297,7 +278,6 @@ test("a coordinator answer whose result was not confirmed keeps the run from swi
     const member = service.get(runId).members.find(item => item.taskId === "a")!;
     const session = manager.meta(member.sessionId).session;
     served = true;
-    // No coordinator review is live, but the uncertain answer may still be typed: the run does not switch.
     await service.permissionAuthorityChanged();
     assert.equal(service.permissionAgentLive(session), false, "an answer whose result was not confirmed blocks the switch");
     fenceWorks = true;
@@ -314,7 +294,6 @@ test("an owner act that makes the permission agent serve a run retires its coord
     const runId = created.body.id as string;
     await waitFor(() => f.get(runId), run => run.permissionDecisions?.some(decision => decision.status === "reviewing") === true &&
       existsSync(join(f.receipts, `${runId}.judge-ready`)), 60000);
-    // The service is not started, so no scheduler pass runs: only the authority change can retire the review.
     let manager!: Manager;
     const service = await f.openTeamService({ start: false, manager: value => { manager = value; } });
     let served = false;
@@ -326,14 +305,12 @@ test("an owner act that makes the permission agent serve a run retires its coord
     const member = service.get(runId).members.find(item => item.taskId === "a")!;
     const session = manager.meta(member.sessionId).session;
     served = true;
-    // Activation is a fenced switch: the agent does not serve the run while a coordinator review of it is live.
     assert.equal(service.permissionAgentLive(session), false, "the agent waits for the switch");
     await service.permissionAuthorityChanged();
     const view = service.get(runId);
     assert.equal(view.permissionDecisions![0]!.status, "stale", JSON.stringify(view.permissionDecisions));
     assert.ok(view.events.some(event => event.text === "The permission agent now decides this run's provider requests; its coordinator reviews were retired."));
     assert.equal(service.permissionAgentLive(session), true, "after the switch the agent serves the run");
-    // A revoke of the coverage ends it; the coordinator path may run again, so a return to the agent switches again.
     served = false;
     assert.equal(service.permissionAgentLive(session), false);
     served = true;

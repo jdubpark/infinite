@@ -15,7 +15,6 @@ import { recordedTeamReportSchema, teamReportSchema, type TeamBrief, type TeamMe
 import type { TeamRunRouting, TeamRunRoutingAuto } from "../packages/host/src/routing-types.js";
 import { ENTRY_PROFILE, ENTRY_PROVIDERS, smallRun } from "./fixtures/team-prompt-run.js";
 
-// The host pins zod 4 (packages/host/package.json); the root install is zod 3, which lacks toJSONSchema.
 const { z } = createRequire(new URL("../packages/host/package.json", import.meta.url))("zod") as typeof import("zod");
 
 const PROMPT_LIMIT_BYTES = 80 * 1024;
@@ -282,7 +281,6 @@ test("blocked reports accept bounded structured evidence and keep it in coordina
 });
 
 test("team question modes preserve legacy behavior and validate selectable semantics", () => {
-  // A recorded question from a member started before recommendations were required; the mode rules are the tool's too.
   const legacy = { kind: "question", question: "Which response format?", options: ["JSON", "Text"] };
   assert.deepEqual(recordedTeamReportSchema.parse(legacy), legacy, "Two legacy options do not infer approval mode");
   assert.deepEqual(recordedTeamReportSchema.parse({ ...legacy, options: [] }), { ...legacy, options: [] });
@@ -352,7 +350,6 @@ const CONTEXT_ACCESS_END = "even when their complete inline text is present.";
 const MEMBER_ROLES_UNDER_TEST = ["permission-coordinator", ...ENTRY_ROLES_UNDER_TEST, "delivery"] as const;
 const entryToolRoles = new Set<string>(ENTRY_ROLES_UNDER_TEST);
 
-/** Every property name a declared schema carries, at any depth, so a schema change cannot hide a field from the prompt. */
 function declaredFieldNames(schema: unknown): string[] {
   if (typeof schema !== "object" || schema === null) return [];
   const node = schema as Record<string, unknown>;
@@ -427,7 +424,6 @@ test("Codex tool signatures name the callable form and carry the declared result
     { name: "entry_post", schema: outputSchemas.entry_post },
   ] as const;
   const paragraph = codexMemberToolInstructions(true);
-  // The types come from the schemas, so a schema change grows every Codex member prompt: these bounds make that a decision.
   assert.ok(Buffer.byteLength(paragraph, "utf8") < 2700, "the rule with the entry tools stays under 2,700 bytes");
   assert.ok(Buffer.byteLength(codexMemberToolInstructions(false), "utf8") < 1100, "the rule with the report tool alone stays under 1,100 bytes");
   assert.ok(paragraph.startsWith("Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results."));
@@ -436,7 +432,6 @@ test("Codex tool signatures name the callable form and carry the declared result
   assert.match(paragraph, /When a program lists or reads items, print how many it listed, read, and matched/);
   assert.match(paragraph, /Read the context file with a shell call inside a program, and select only the fields needed for your next decision\./);
   assert.match(paragraph, /Tool signatures inside exec \(generated from the tools' declared schemas, no lookup needed\): await tools\.mcp__infinite_team__report\(/);
-  // The types are successful results, so the rule also says what a failed call returns.
   assert.ok(paragraph.endsWith(TOOL_FAILURE), "the rule ends with what a failed call returns");
   const sentences = paragraph.slice(0, -TOOL_FAILURE.length).split("await tools.").slice(1).map(sentence => `await tools.${sentence}`.trim());
   assert.deepEqual(sentences.map(sentence => /^await tools\.mcp__infinite_team__(\w+)\(/.exec(sentence)?.[1]), tools.map(tool => tool.name));
@@ -487,7 +482,6 @@ test("tool signature types render each schema form from the declared schema", ()
 });
 
 test("tool signature types follow the schemas the host's zod writes", () => {
-  // The expected text is written from the zod definition, not from the renderer.
   const result = z.object({
     id: z.string().uuid(),
     note: z.string().nullable(),
@@ -567,8 +561,6 @@ test("Codex argument signatures match registered MCP input schemas", { timeout: 
         .map(argument => ({ name: argument.replace(/\?$/, ""), optional: argument.endsWith("?") })).sort((a, b) => a.name.localeCompare(b.name));
       assert.deepEqual(args, actual, `${name} handwritten arguments match tools/list`);
     }
-    // What the rule says of a tool error is what the member server answers: an error result with a reason as text and
-    // no structuredContent. This is the server's contract; how a provider hands the result to a program is not tested here.
     const failed = asRecord(asRecord(await rpc("tools/call", { name: "entry_get", arguments: {} })).result);
     assert.equal(failed.isError, true);
     assert.equal("structuredContent" in failed, false);
@@ -683,7 +675,6 @@ test("a member context never carries the feature map, the eval block, or routing
   const checks = [{ command: "npm", args: ["test"] }];
   const project = { checks, features: { areas: [{ id: "host", paths: ["packages/host"] }] }, eval: { capture: true } };
   const plain = { ...base, handoff: { sourceSessionId: "session", checkpointHead: base.baseCommit, deadlineAt: "2026-11-13T12:00:00.000Z", maxMembers: 1, project } } as unknown as TeamRun;
-  // The run's own pinned policy, as a shadow run carries it, alongside the project's saved one.
   const pinned = { mode: "shadow", requested: "shadow", source: "saved", knobs: { points: ["start"], cascade: false, successValueUsd: 8, maxExploreShare: 0.2, exploreWindow: 50, minSpareAttempts: 4, allowContributor: false, listWeight: 0.25, headroomWeight: 1 }, defaults: [], algorithmVersion: 1, rewardVersion: 1, digest: "d".repeat(64) };
   const withRouting = { ...base, routing: pinned, handoff: { sourceSessionId: "session", checkpointHead: base.baseCommit, deadlineAt: "2026-11-13T12:00:00.000Z", maxMembers: 1, project: { ...project, routing } } } as unknown as TeamRun;
   const configuredPlain = project as Parameters<typeof teamContext>[2];
@@ -698,7 +689,6 @@ test("a member context never carries the feature map, the eval block, or routing
   }
 });
 
-// Moved from 31fd3fb3 because INF-343 adds planning and rewrite-review guidance across providers; contexts stay byte-identical.
 const PIN_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"] as const;
 const PIN_CHECKS = [{ command: "npm", args: ["test"] }];
 const PIN_GOAL = { id: "00000000-0000-4000-8000-000000000012", revision: 1, cycle: 1, successCriteria: "Owner success text.", nonGoals: ["Do not change billing."], allowedPaths: ["src"], evidence: [], previousWork: [], deadlineAt: "2026-12-01T00:00:00.000Z", maxMembers: 2 } as NonNullable<TeamRun["goal"]>;
@@ -716,9 +706,6 @@ function pinnedContexts() {
   const run = goalRun();
   return PIN_ROLES.map(role => JSON.stringify(teamContext(run, "Owner feedback excerpt.", { checks: PIN_CHECKS }, role), null, 2));
 }
-// INF-383 moved this pin to 36869333: the Codex working rule's signature sentences now name the callable form and the
-// nested result type, generated from the declared schemas, and the rule says what a failed call returns. No other
-// prompt or context byte changed.
 const PIN_PROMPTS_SHA256 = "3686933351c62af2577448bf68a95620e0d78e732ea5b103cb2b257164631ef8";
 const PIN_CONTEXTS_SHA256 = "9ee8fe8ac898e2d70ddbb012ba398387d526294ea61739fb7aad4385b7a7412b";
 
@@ -727,11 +714,13 @@ test("the switch off keeps every prompt and context byte", () => {
   assert.equal(sha256(pinnedContexts()), PIN_CONTEXTS_SHA256, "the full context file of every role");
 });
 
-// The owner's record digest: the same record criteria, c0 carrying the success text in the prompt only.
 const PIN_RECORD = { version: 2, criteria: [
   { id: "c0", statement: "", check: "judgement:owner-text", producer: "evaluator" as const },
   { id: "c1", statement: "The billing page shows the new total.", check: "command:npm test", producer: "host" as const },
 ] };
+const GOAL_PLAN_CRITERIA_INSTRUCTIONS = `Task criterion references for this goal plan: every task, including each prerequisite, must include "criterionRefs":{"objectiveVersion":2,"criteria":["active-id"]} using one or more active IDs from the pinned objective record above. Name only criteria this cycle's work advances; other criteria may remain open. References describe your planned coverage, not evidence that a criterion is satisfied. Dependencies set task order and do not provide transitive criterion coverage.`;
+const withoutGoalPlanCriteriaInstructions = (prompt: string) => prompt.split("\n\n")
+  .filter(paragraph => !paragraph.startsWith("Task criterion references for this goal plan:")).join("\n\n");
 
 test("the record digest replaces the success text and nothing else", () => {
   const { successCriteria, ...goalWithoutText } = PIN_GOAL;
@@ -745,7 +734,12 @@ test("the record digest replaces the success text and nothing else", () => {
       const base = teamPrompt(without, role, undefined, undefined, provider, ENTRY_PROFILE, { checks: PIN_CHECKS }, [], true);
       const next = teamPrompt(withRecord, role, undefined, undefined, provider, ENTRY_PROFILE, { checks: PIN_CHECKS }, [], true);
       assert.equal(base.split(oldSection).length, 2, `${role} ${provider}: the goal section appears once without a record`);
-      assert.equal(next, base.replace(oldSection, newSection), `${role} ${provider}: only the goal section changes`);
+      assert.equal(base.includes("Task criterion references for this goal plan:"), false, `${role} ${provider}: no mapping without a record`);
+      const planInstruction = role === "project-manager";
+      assert.equal(next.includes("Task criterion references for this goal plan:"), planInstruction, `${role} ${provider}: only a planner with a record gets mapping instructions`);
+      if (planInstruction) assert.equal(next.split(GOAL_PLAN_CRITERIA_INSTRUCTIONS).length, 2, `${role} ${provider}: the exact pinned mapping contract appears once`);
+      assert.equal(withoutGoalPlanCriteriaInstructions(next), base.replace(oldSection, newSection),
+        `${role} ${provider}: all bytes outside the goal record and PM mapping instruction stay unchanged`);
       assert.equal(next.split(successCriteria).length, 2, `${role} ${provider}: c0's text appears once`);
     }
   }
@@ -754,7 +748,6 @@ test("the record digest replaces the success text and nothing else", () => {
   assert.deepEqual(context, { ...plain, authority: { ...plain.authority, goal: { ...PIN_GOAL, record: PIN_RECORD } } });
 });
 
-// INF-280 step 2: `auto` prompts. Off and shadow runs keep their bytes; no member reads a routing value.
 const AUTO_SPARK: TeamModelProfile = { id: "spark-high", label: "Spark implementer", provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant: "high", tier: "light", dataUse: "contributor" };
 const AUTO_ASTRA: TeamModelProfile = { id: "astra-xhigh", label: "Astra implementer", provider: "codex", model: "gpt-6-astra", effort: "xhigh" };
 const AUTO_LINEUP = { coordinator: ENTRY_PROFILE, integrator: ENTRY_PROFILE, reviewer: { id: "opus-reviewer", label: "Opus reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh" }, implementers: [AUTO_SPARK, AUTO_ASTRA] } as TeamRun["lineup"];
@@ -831,7 +824,6 @@ test("a member context never carries a task's routing, in any role or snapshot",
   assert.equal(inline, teamPrompt(plain, "implementer", plain.tasks[0], undefined, "codex", AUTO_ASTRA, { checks: PIN_CHECKS }, [], true));
 });
 
-// INF-292 step 4: the escalation target and the scout rule. Off, shadow, and version-1 runs keep step 2's bytes.
 const HOST_SCOUT_SENTENCE = "The host assigns each scout's profile; omit agentProfileId from scouts.";
 const HOST_ESCALATION = `If this task exceeds your reasoning capacity or the approach is failing, you may request one explicit escalation. The host selects the stronger profile. Report {"kind":"escalate","reason":"What failed or requires deeper reasoning; identify partial edits and remaining work"}. The host checks your partial edits, stops you, and continues in the same working copy. If this task already records an escalation, ask a material user question or report blocked; do not switch models yourself.`;
 const POINTS_PIN = { ...AUTO_PIN, algorithmVersion: 2, knobs: { ...AUTO_KNOBS, points: ["start", "escalation", "scout"] } } as unknown as TeamRunRoutingAuto;
@@ -899,7 +891,6 @@ test("a scout's inline assignment never carries its routing", () => {
   assert.equal(prompt(tagged), prompt(scout as unknown as TeamScout), "the scout prompt equals the same scout without routing");
 });
 
-// INF-282 step 3: a derived criterion is marked in the goal section; an intent decision prints fixed text and its ids.
 test("derived criteria are marked in the goal section", () => {
   const derived = { ...PIN_RECORD, criteria: [...PIN_RECORD.criteria, { id: "c2", statement: "The export lists every order.", check: "command:npm test", producer: "host" as const, derived: true }] };
   const marked = goalRun({ goal: { ...PIN_GOAL, record: derived } as TeamRun["goal"] });
@@ -951,7 +942,6 @@ test("a continued delivery prompt allows one set of earlier heads, and no other 
   const delivered = "d".repeat(40), repaired = "e".repeat(40), reviewed = "f".repeat(40), branch = "infinite/team-entry";
   const repair = { runId: "00000000-0000-4000-8000-000000000011", memberId: "m-repair", revision: 2, role: "delivery", sessionId: "s-repair", title: "delivery", status: "stopped",
     cwd: "/home/dev/projects/example", baseCommit: repaired, prompt: "", cursor: 0, stopRequestId: "x", report: { kind: "delivery-repair", headCommit: repaired, summary: "CI failed." } } as TeamMember;
-  // Delivered A at revision 1; revision 2 pushed B, which needed a repair; C is the reviewed commit now.
   const run = smallRun({ revision: 2, status: "delivering", headCommit: reviewed, members: [repair], delivery: { mode: "pr", repository: "example/app", baseBranch: "main" },
     pullRequest: { revision: 1, headCommit: delivered, pullRequestUrl: "https://github.com/example/app/pull/7", summary: "Opened.", reportedAt: "2026-11-01T00:00:00.000Z", branch } });
   const prompt = teamPrompt(run, "delivery");

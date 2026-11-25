@@ -5,22 +5,14 @@ import { isScopedPath } from "./goal-types.js";
 
 export const OBJECTIVE_SCHEMA_VERSION = 1;
 export const RUBRIC_VERSION_DEFAULT = 1;
-/** Every cap of the design's owner decisions, in one place. Values to confirm. Each group names the step that first reads it. */
 export const OBJECTIVE_LIMITS = {
-  // Owner decision 1. Step 1.
   cappedBytes: 32 * 1024, activeCriteria: 8, assumptions: 32, openQuestions: 8, definitions: 16, rules: 16, logEntries: 400, logBytes: 256 * 1024,
-  // Owner decision 2. Step 3.
   intentItems: 16, scoutQuestions: 3, intentChecksPerRevision: 1,
-  // Owner decision 3. Step 6.
   followUpsPerReport: 6, openFollowUps: 24, followUpGeneration: 3, repeatWindowCycles: 10, ideas: 20,
-  // Owner decision 4. Step 4.
   newAssumptionsPerAttempt: 4, proposalsPerAssumption: 8,
-  // Owner decision 5. Step 7: the finding's run plus this many later cycles.
   usedWindowCycles: 1,
-  // Field bounds of parts 1 and 3.
   c0Bytes: 16_000, criterionBytes: 1_000, derivedFromBytes: 500, assumptionBytes: 500, noteBytes: 500, inlineValueBytes: 2 * 1024,
   evidenceHandles: 16, pinnedPaths: 8,
-  // Builder bounds (my call). Each is at or above the API that feeds it.
   criteria: 64, questions: 64, questionAssumptions: 16, allowedPaths: 32, excludedPaths: 32, pathChars: 300, nonGoals: 20, nonGoalChars: 1_000,
   ownerEvidence: 20, evidenceChars: 2_000, directions: 40, directionChars: 8_000, goalObjectiveChars: 12_000, runObjectiveChars: 24_000,
   termBytes: 100, meaningBytes: 1_000, ruleBytes: 1_000, questionBytes: 1_000, summaryBytes: 500, handleChars: 200,
@@ -37,7 +29,6 @@ export type Check =
   | { kind: "judgement"; item: string }
   | { kind: "owner-rating"; subject: string };
 export type Criterion = { id: string; origin: "owner" | "derived"; derivedFrom?: string; statement: string;
-  /** Only on a run's c0: the statement is `statement.objective`, which is not copied. */
   statementOf?: "objective";
   check: Check; producer: "host" | "evaluator" | "owner"; threshold: Threshold; pinned?: { path: string; blob: string }[];
   latest?: { state: "met" | "not-met" | "inconclusive" | "pending-owner"; note?: string; verdictId: string }; state: "active" | "retired" };
@@ -71,7 +62,6 @@ const BLOB_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const POINTER_RE = /^(?:\/[^/\x00-\x1f]{1,64}){1,8}$/;
 
 const byteLength = (value: string): number => Buffer.byteLength(value, "utf8");
-/** Characters as the goal and team APIs count them: zod's `max` counts UTF-16 code units. */
 const charLength = (value: string): number => value.length;
 const bytesBetween = (min: number, max: number) =>
   z.string().refine(value => byteLength(value) >= min && byteLength(value) <= max, `Text must be ${min} to ${max} bytes`);
@@ -194,14 +184,12 @@ const owner = z.union([
   z.strictObject({ kind: z.literal("run"), runId: z.uuid() }),
 ]);
 
-/** The producer a check implies: host for command, receipt, artifact, and citation checks; evaluator for judgement; owner for owner-rating. */
 export function producerOf(check: Check): Criterion["producer"] {
   if (check.kind === "judgement") return "evaluator";
   if (check.kind === "owner-rating") return "owner";
   return "host";
 }
 
-/** A count threshold for an artifact with a count, a share for citations, a score for owner ratings, and pass for the rest. */
 export function thresholdFits(check: Check, threshold: Threshold): boolean {
   switch (check.kind) {
     case "artifact": return check.count !== undefined ? threshold.kind === "count" : threshold.kind === "pass";
@@ -211,7 +199,6 @@ export function thresholdFits(check: Check, threshold: Threshold): boolean {
   }
 }
 
-/** Record-level rules. Each returns a fixed message, and the schema reports every one. */
 function recordProblems(record: ObjectiveRecord): string[] {
   const problems: string[] = [];
   const fail = (message: string) => { problems.push(message); };
@@ -302,7 +289,6 @@ function recordProblems(record: ObjectiveRecord): string[] {
     }
   }
 
-  // Rule 9: the direction log agrees with the steering directions, in order, with their own values.
   const directionOps = record.log.filter(entry => entry.op === "direction.appended" || entry.op === "direction.copied");
   const steered = record.statement.directions.filter(item => item.source === "steering");
   let historyOk = directionOps.length === steered.length;
@@ -348,12 +334,10 @@ export const objectiveRecordSchema: z.ZodType<ObjectiveRecord> = z.strictObject(
   for (const message of recordProblems(record as ObjectiveRecord)) context.addIssue({ code: "custom", message });
 });
 
-/** UTF-8 bytes of canonicalJson after a JSON round trip, which drops undefined values. */
 export function canonicalBytes(value: unknown): number {
   return byteLength(canonicalJson(JSON.parse(JSON.stringify(value))));
 }
 
-/** Inline when the canonical value fits 2 KiB; otherwise a reference with the digest and size. */
 export function logValueOf(value: unknown, ref: string): LogValue {
   const json = JSON.parse(JSON.stringify(value));
   const bytes = canonicalBytes(json);
@@ -361,7 +345,6 @@ export function logValueOf(value: unknown, ref: string): LogValue {
   return { ref, digest: createHash("sha256").update(canonicalJson(json)).digest("hex"), bytes };
 }
 
-/** SHA-256 hex of the canonical record without `log` and `digest`. */
 export function recordDigest(record: Omit<ObjectiveRecord, "digest" | "log"> & Partial<Pick<ObjectiveRecord, "digest" | "log">>): string {
   const body: Record<string, unknown> = { ...record };
   delete body.log;
@@ -369,7 +352,6 @@ export function recordDigest(record: Omit<ObjectiveRecord, "digest" | "log"> & P
   return createHash("sha256").update(canonicalJson(JSON.parse(JSON.stringify(body)))).digest("hex");
 }
 
-/** The bytes that count against `cappedBytes`: everything but the log, the digest, the statement, non-goals, owner evidence, and c0's statement. */
 export function cappedBytes(record: ObjectiveRecord): number {
   return canonicalBytes({
     schemaVersion: record.schemaVersion,

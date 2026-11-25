@@ -12,7 +12,6 @@ const objectFields = new Set(["nodes", "pageInfo", "team", "state", "creator", "
 
 type CapturedRequest = { operation: string; query: string; variables: Record<string, unknown> };
 
-/** Estimates the documented Linear cost: objects are 1, scalars 0.1, and connections multiply children by `first`. */
 function estimateCost(query: string, variables: Record<string, unknown>): number {
   const tokens = query.match(/\$?[A-Za-z_][A-Za-z0-9_]*|\d+|[!$():{},.[\]]/g) ?? [];
   let index = tokens.indexOf("{");

@@ -1,9 +1,5 @@
 import { createHash } from "node:crypto";
 
-// Parsers for the runner reports that validation reads (JUnit XML and TAP 13/14). Pure: no I/O, no dependency.
-// The reports are written by the grader account, so every limit holds, and a report that breaks one is invalid.
-// Each parser runs in one pass over the text, and no work grows faster than linearly in the report size.
-
 export const REPORT_MAX_BYTES = 8_388_608,
   REPORT_CASES_MAX = 20_000,
   CASE_KEY_MAX = 4_096,
@@ -30,7 +26,6 @@ const SUBTEST_PREFIX = "# Subtest: ";
 
 type Collector = { cases: Map<string, CaseStatus>; seen: number };
 
-/** Parses one report. Keys in the result are SHA-256 hex of the case key; a repeated key keeps its worse status. */
 export function parseReport(format: "junit" | "tap", bytes: Buffer): ParsedReport {
   if (bytes.length > REPORT_MAX_BYTES) return INVALID;
   const text = bytes.toString("utf8");
@@ -39,7 +34,6 @@ export function parseReport(format: "junit" | "tap", bytes: Buffer): ParsedRepor
   return wellFormed ? { state: "parsed", cases: collector.cases } : INVALID;
 }
 
-/** The stored form of a raw case key: its SHA-256 hex, the same key `parseReport` uses in its map. */
 export function caseRef(key: string): string {
   return sha256(key);
 }
@@ -48,7 +42,6 @@ function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-// Records one case occurrence. Returns false past the case limit.
 function addCase(collector: Collector, key: string, status: CaseStatus): boolean {
   collector.seen += 1;
   if (collector.seen > REPORT_CASES_MAX) return false;
@@ -58,7 +51,6 @@ function addCase(collector: Collector, key: string, status: CaseStatus): boolean
   return true;
 }
 
-// The names of the enclosing suites. Running lengths keep each key check O(1) before anything is joined.
 class Path {
   private readonly names: string[] = [];
   private readonly totals: number[] = [0];
@@ -74,7 +66,6 @@ class Path {
     this.totals.pop();
   }
 
-  /** The NUL-joined key of the path followed by `last`, or null when it would exceed the key limit. */
   keyWith(...last: string[]): string | null {
     const count = this.names.length;
     let length = this.totals[count];
@@ -84,12 +75,9 @@ class Path {
   }
 }
 
-// ---- JUnit ----
-
 type OpenCase = { name: string; classname: string; status: CaseStatus };
 
 function parseJunit(text: string, collector: Collector): boolean {
-  // A DTD or an entity declaration makes the report invalid, wherever it appears.
   if (text.includes("<!DOCTYPE") || text.includes("<!ENTITY")) return false;
 
   const open: string[] = [];
@@ -120,7 +108,6 @@ function parseJunit(text: string, collector: Collector): boolean {
       at = end + 2;
       continue;
     }
-    // A DOCTYPE, a CDATA section, or any other declaration is not part of the report format.
     if (text.startsWith("<!", lt)) return false;
 
     if (text.startsWith("</", lt)) {
@@ -180,7 +167,6 @@ function parseJunit(text: string, collector: Collector): boolean {
   return rootSeen && open.length === 0 && testcase === null;
 }
 
-// The index of the `>` that closes a tag, skipping quoted attribute values, or -1.
 function findTagEnd(text: string, from: number): number {
   let quote = 0;
   for (let i = from; i < text.length; i += 1) {
@@ -196,7 +182,6 @@ function findTagEnd(text: string, from: number): number {
   return -1;
 }
 
-// Attributes of a tag body, with their values decoded. Null when the syntax is broken.
 function parseAttributes(body: string): Map<string, string> | null {
   const attrs = new Map<string, string>();
   const n = body.length;
@@ -229,7 +214,6 @@ function isSpace(code: number): boolean {
   return code === 32 || code === 9 || code === 10 || code === 13;
 }
 
-// Decodes the five named entities and numeric references. Anything else, or a code point XML forbids, is null.
 function decodeText(raw: string): string | null {
   if (!raw.includes("&")) return raw;
   let out = "";
@@ -257,8 +241,6 @@ function decodeEntity(entity: string): string | null {
   return String.fromCodePoint(code);
 }
 
-// ---- TAP ----
-
 type TapFrame = { indent: number; children: boolean };
 
 function parseTap(text: string, collector: Collector): boolean {
@@ -279,7 +261,6 @@ function parseTap(text: string, collector: Collector): boolean {
     while (indent < line.length && line.charCodeAt(indent) === 32) indent += 1;
     const body = line.slice(indent);
 
-    // A YAML diagnostic block belongs to the result line before it, and is skipped whole.
     if (yamlIndent >= 0) {
       if (indent === yamlIndent && body === "...") yamlIndent = -1;
       continue;
@@ -341,6 +322,5 @@ function parseTap(text: string, collector: Collector): boolean {
     }
   }
 
-  // A well-formed report closes every subtest and states a plan that counts its top-level results.
   return frames.length === 0 && plan !== -1 && plan === topLevelResults;
 }

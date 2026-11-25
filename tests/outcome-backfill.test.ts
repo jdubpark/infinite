@@ -44,7 +44,6 @@ function run(extra: Partial<TeamRun> = {}): TeamRun {
   } as TeamRun;
 }
 
-/** Two integrated implementers under an approved review of the same snapshot. */
 function approvedRun(id: string): TeamRun {
   return run({
     id,
@@ -137,12 +136,10 @@ test("the tick never overwrites and stops when done", () => {
     store.register(configurationModule());
     const options = { mapOf: () => undefined, limit: 1, now: () => AT };
 
-    // R1 has a run.created event, so it is not a backfill candidate.
     store.write(tx => store.appendEvent(tx, {
       key: runEventKey("run.created", "run-1"), runId: "run-1", revision: 1, at: AT, kind: "run.created", data: { v: 1 },
     }));
 
-    // R2 has an event-derived row for m1 that must survive the tick unchanged. It has no run.created event.
     const seeded: OutcomeRow = {
       ...backfillRun(approvedRun("run-2"), context).rows[0],
       disposition: "host-stop", exclusion: "host", integrated: null, accepted: null, flags: [],
@@ -248,13 +245,11 @@ test("an unreadable record is marked and never blocks the rest", () => {
 test("a record with a missing field is marked, not left pending", () => {
   const { store, close } = openStore();
   try {
-    // A legacy record: the types require these fields, and an old record can lack them.
     const noSession = approvedRun("run-no-session");
     delete (noSession.members[0] as Partial<TeamMember>).sessionId;
     const noCreation = approvedRun("run-no-creation");
     delete (noCreation as Partial<TeamRun>).createdAt;
     noCreation.members.forEach(item => { delete (item as Partial<TeamMember>).startedAt; });
-    // The rating has no time, so the row's payload is not canonical JSON and cannot be sealed.
     const noRatingTime = approvedRun("run-no-rating-time");
     noRatingTime.tasks[0]!.ownerRating = { score: 4 } as TeamTask["ownerRating"];
     const good = approvedRun("run-good");
@@ -304,14 +299,11 @@ test("a backfilled failure has the levels of any counted failure", () => {
     assert.deepEqual(row.flags, ["backfilled"], memberId);
     return [row.disposition, row.exclusion, row.integrated, row.accepted, row.firstPass, row.held];
   };
-  // Spec part 4: a counted failure is no on every level. That follows from the disposition, not from a review.
   assert.deepEqual(levelsOf("m-stalled"), ["stalled", null, 0, 0, 0, 0]);
   assert.deepEqual(levelsOf("m-escalated"), ["escalated", null, 0, 0, 0, 0]);
   assert.deepEqual(levelsOf("m-question"), ["question", null, 0, 0, 0, 0]);
   assert.deepEqual(levelsOf("m-blocked"), ["blocked", null, 0, 0, 0, 0]);
-  // An excluded row has no levels.
   assert.deepEqual(levelsOf("m-limit"), ["limit", "limit", null, null, null, null]);
-  // An integrated row never claims a refusal: the record cannot show which review covered it.
   assert.deepEqual(levelsOf("m-done"), ["integrated", null, 1, null, null, null]);
 });
 
@@ -339,7 +331,6 @@ test("a summary that an event made first takes the record's facts", () => {
       writeSummary(tx, eventMade("run-lost", "unknown"));
       writeSummary(tx, eventMade("run-known", "project-z"));
     });
-    // This run really lost events: the ledger says so, and its flag stays.
     const stored = new EventOutbox(store).flush([{
       key: runEventKey("ledger.gap", "run-lost", ["first"]), runId: "run-lost", revision: 1, at: AT, kind: "ledger.gap", data: { v: 1, dropped: 3 },
     }]);
@@ -351,7 +342,6 @@ test("a summary that an event made first takes the record's facts", () => {
     const early = store.read(db => readSummary(db, "run-early"));
     assert.equal(early?.payload.projectId, "project-a");
     assert.equal(early?.createdAt, AT);
-    // The flag stood for the missing `run.created` facts. The record supplied them, and no event was lost.
     assert.deepEqual(early?.flags, ["backfilled"]);
     assert.deepEqual(store.read(db => readSummary(db, "run-lost"))?.flags, ["backfilled", "gap"]);
     assert.equal(early?.status, "ready-for-review");
@@ -374,7 +364,6 @@ test("the first backfill call writes every run", () => {
     const all = Array.from({ length: 25 }, (_, index) => approvedRun(`run-${String(index).padStart(2, "0")}`));
     let calls = 0;
     const drive = outcomeBackfill(store, () => { calls += 1; return all; }, { mapOf: () => undefined, limit: 20, now: () => AT });
-    // The scorecard reads these rows, so the first call leaves no run for a later minute.
     drive();
     assert.equal(calls, 1);
     for (const item of all) assert.ok(store.read(db => readSummary(db, item.id)), item.id);
@@ -444,7 +433,6 @@ test("active runs come first, and a module that is not ready ends the tick", () 
 test("a backfilled run takes the signals it already has", () => {
   const { store, close } = openStore();
   try {
-    // Events made both summaries first, with no project yet. Only one run gets an owner claim before its backfill.
     const eventMade = (runId: string): RunSummaryRow => ({
       runId, source: "production", projectRef: "", revision: 1, status: "ready-for-review", blockCode: null,
       flags: ["gap"], createdAt: null, settledAt: AT, approvedAt: null, runDeletedAt: null,
@@ -460,13 +448,9 @@ test("a backfilled run takes the signals it already has", () => {
     const runs = () => [approvedRun("run-signal"), approvedRun("run-plain")];
     assert.deepEqual(backfillTick(store, runs, options), { written: 2, remaining: 0 });
 
-    // The run-wide fix is an owner claim on an accepted row, so the row the backfill wrote is not held.
     assert.equal(store.read(db => readOutcome(db, "run-signal:m1"))?.held, 0);
-    // Control: the run with no signal keeps its unknown hold, as before.
     assert.equal(store.read(db => readOutcome(db, "run-plain:m1"))?.held, null);
 
-    // A run whose signal does not open is not written: its rows could not take the signal. It stays pending, and
-    // the runs after it are still written.
     store.write(tx => {
       writeSummary(tx, eventMade("run-broken"));
       writeSummary(tx, eventMade("run-after"));

@@ -5,7 +5,6 @@ import { Chip } from "../../../components/Glass";
 import { RichText } from "./RichText";
 import { styles } from "./styles";
 
-/** One card per subtask: its recorded status, review and rubric numbers, and its component names. */
 export function Tasks({ items, onOpenWork }: { items: TaskSummary[]; onOpenWork?: (workId: string) => void }) {
   return <View style={styles.stack}>
     {items.map(task => <TaskCard key={task.id} task={task} onOpenWork={onOpenWork} />)}

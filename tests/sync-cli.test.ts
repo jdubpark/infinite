@@ -187,7 +187,6 @@ test("infinite sync, projects, and pull round-trip a checkout through the host",
     await new Promise<void>(resolve => server.listen(join(checkout, "dev.sock"), resolve));
     const started = await exec(process.execPath, [...cli, "sync", "--project", "rehearsal"], { cwd: checkout });
     assert.match(started.stderr, /Left out 1 socket, FIFO, or device file, which sync cannot copy: dev\.sock\n/);
-    // Closing the server removes the socket; the next capture clears the recorded count.
     await new Promise(resolve => server.close(resolve));
     await waitFor(async () => readSyncState(stateFile), recorded => Boolean(recorded && !recorded.skipped), 15000);
     const state = readSyncState(stateFile);
@@ -205,7 +204,6 @@ test("infinite sync, projects, and pull round-trip a checkout through the host",
     const cwd = pulled.stdout.trim();
     assert.equal(readFileSync(join(cwd, "cloud.txt"), "utf8"), "from cloud\n");
     assert.equal(existsSync(join(checkout, "cloud.txt")), false, "pull never writes into the checkout");
-    // The running service would upload a copy pulled into its checkout.
     await assert.rejects(exec(process.execPath, [...cli, "pull", "rehearsal", "--output", join(checkout, "nested", "pulled")]),
       (error: { stderr: string }) => /Choose an --output directory outside every synced checkout/.test(error.stderr));
     assert.equal(existsSync(join(checkout, "nested")), false);
@@ -219,7 +217,6 @@ test("infinite sync, projects, and pull round-trip a checkout through the host",
     assert.equal(readFileSync(join(host.config.projects[0].path, "file.txt"), "utf8"), "second\n");
     assert.equal(existsSync(join(host.config.projects[0].path, "cloud.txt")), false, "a forced apply replaces cloud edits");
 
-    // A failed apply shows its category and the retry command; the host cannot stage beside the project directory.
     chmodSync(host.root, 0o500);
     try {
       writeFileSync(join(checkout, "file.txt"), "third\n");
@@ -229,7 +226,6 @@ test("infinite sync, projects, and pull round-trip a checkout through the host",
       assert.match((await exec(process.execPath, [...cli, "sync", "--status"])).stdout, failure);
     } finally { chmodSync(host.root, 0o700); }
 
-    // Stopping and inspecting the local service work while the host is down.
     await host.stopApi();
     const stopped = await exec(process.execPath, [...cli, "sync", "--stop"]);
     assert.match(stopped.stdout, /stopped/);
@@ -237,11 +233,9 @@ test("infinite sync, projects, and pull round-trip a checkout through the host",
     await waitFor(async () => { try { process.kill(state.pid, 0); return true; } catch { return false; } }, alive => !alive, 10000);
     const offline = await exec(process.execPath, [...cli, "sync", "--status"]);
     assert.equal(offline.stdout, "rehearsal  no local service · host unreachable\n");
-    // Without the host to vouch for the ID, a path-like project must not name the client configuration.
     await assert.rejects(exec(process.execPath, [...cli, "sync", "--stop", "--project", "../client"]), (error: { stderr: string }) => /Choose a project with --project ID/.test(error.stderr));
     assert.ok(existsSync(clientFile), "the device credentials stay in place");
 
-    // A record left behind by a killed service names a pid that no longer runs it.
     const dead = spawnSync(process.execPath, ["-e", ""]).pid;
     writeFileSync(stateFile, JSON.stringify({ ...state, pid: dead }), { mode: 0o600 });
     await host.start();
@@ -373,12 +367,10 @@ test("a cloud launch reports laptop changes that wait for an apply, then starts 
     writeFileSync(join(checkout, "file.txt"), "from laptop\n");
     await exec(process.execPath, [...cli, "sync", "--project", "rehearsal"], { cwd: checkout });
     await waitFor(() => host.fetchApi("/projects/rehearsal"), r => r.body.sync.pendingGeneration?.reason === "session-running", 30000);
-    // Infinite options come before the provider; everything after it belongs to the provider.
     const launched = await exec(process.execPath, [...cli, "--project", "rehearsal", "--detach", "--title", "Next", "claude"], { timeout: 60000 });
     assert.match(launched.stderr, /\[Infinite\] Laptop changes from \d+s ago are pending; run infinite sync --apply\n/);
     assert.match(launched.stdout, /^[0-9a-f-]{36}\n$/, "the launch continues");
     assert.equal(existsSync(join(host.config.projects[0].path, "file.txt")), false, "the session starts on the tree in place");
-    // Every listed session names where its tools run.
     const machine = (await host.fetchApi("/me")).body.machine.label;
     const lines = (await exec(process.execPath, [...cli, "list"])).stdout.trim().split("\n");
     assert.equal(lines.length, 2);

@@ -1,15 +1,3 @@
-// A fake judge for a duel run. The eval profile runs it as the judge member. Its mode comes from `RECEIPTS/RUN.mode`, a JSON
-// file the test writes before the run starts:
-//   { "mode": "prefer-a" }         reports a judgement that prefers A
-//   { "mode": "prefer-resolved" }  reports the label whose patch holds the line RESOLVED-MARKER
-//   { "mode": "edit" }             changes the working copy, then reports a judgement
-//   { "mode": "wrong-id" }         reports a judgement for another duel ID
-//   { "mode": "late" }             waits past the run's judging window, then reports a judgement
-//   { "mode": "question" }         reports a question
-//   { "mode": "exit" }             exits without a report
-//   { "mode": "permission" }       draws a dialog that the pipeline leaves to a person
-//   { "mode": "hang" }             prints nothing and waits
-// It copies the context file and every package file it reads into `RECEIPTS/RUN/read/`, so a test can inspect every byte it saw.
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -22,7 +10,6 @@ if (!receiptDir || !assignment || !process.env.INFINITE_HOOK_URL || !process.env
 const runId = assignment.runId;
 const readDir = join(receiptDir, runId, "read");
 mkdirSync(readDir, { recursive: true });
-/** Writes a receipt whole: to a temporary name first, then renamed into place, so a reader never sees half of one. */
 function writeWhole(name, bytes) {
   const temporary = join(readDir, `.${name}.tmp`);
   writeFileSync(temporary, bytes, { mode: 0o600 });

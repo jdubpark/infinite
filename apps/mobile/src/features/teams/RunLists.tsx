@@ -16,23 +16,17 @@ import { providerName, RequestStatus } from "./parts";
 import { orderedMembers } from "./summary";
 import { useRunRequest } from "./useRunRequest";
 
-/** Closed runs start folded so live work stays on the first screen. */
 function useFolds() {
   const [open, setOpen] = useState<Partial<Record<RunGroup, boolean>>>({});
   return { folded: (group: RunGroup) => group === "closed" ? !open.closed : open[group] === false, toggle: (group: RunGroup, folded: boolean) => setOpen(value => ({ ...value, [group]: folded })) };
 }
 
-/**
- * The Teams tab as a Linear-style project list: each run's state, plan progress, and the agents
- * assigned to it, grouped by what it needs from a person.
- */
 export function TeamList({ connection, me, teams, sessions, now }: { connection: Connection; me: Me; teams: TeamListItem[]; sessions: SessionRow[]; now: number }) {
   const router = useRouter();
   const machine = connectionKey(connection);
   const folds = useFolds();
   const project = (id: string) => me.projects?.find(value => value.id === id)?.name ?? id;
   const attention = new Set(sessions.filter(session => session.attention.state === "needs-you").map(session => session.id));
-  // Agent prompts the coordinator escalated or was not delegated; prompts it is deciding stay off the list.
   const approvals = new Map(teams.map(team => [team.id, pendingApprovals(team, sessions).length]));
   return <View>
     {!me.teams?.enabled ? <Text style={s.notice}>Teams need host setup.</Text>
@@ -47,7 +41,6 @@ export function TeamList({ connection, me, teams, sessions, now }: { connection:
           const open = openDecisions(team).length;
           const asks = approvals.get(team.id) ?? 0;
           const finished = ["ready-for-review", "cancelled", "no-change", "merged"].includes(team.status);
-          // Approvals are answered from the team, so they replace the host's pointer at the member session.
           const note = !asks && !finished && team.reason ? team.reason : "";
           const agents = orderedMembers(team.members.filter(member => member.revision === team.revision), team.revision);
           return <TeamRunRow key={team.id} connection={connection} team={team} role={me.role} machine={machine} now={now} kind={kind} done={done} total={total} open={open} asks={asks} note={note} agents={agents} attention={attention} project={project} onOpen={() => router.push({ pathname: "/team/[id]", params: { id: team.id, machine } })} />;
@@ -116,7 +109,6 @@ function TeamRunRow({ connection, team: received, role, machine, now, kind, done
   </View>;
 }
 
-/** The Goals tab: each goal's state, cycles used against its limit, and deadline. */
 export function GoalList({ connection, me, goals, now }: { connection: Connection; me: Me; goals: ProductGoal[]; now: number }) {
   const router = useRouter();
   const machine = connectionKey(connection);

@@ -13,7 +13,6 @@ type Entry = { scope: string; credential: string; workspaceId: string; generatio
 type Index = { entries: Entry[] };
 let indexWrites: Promise<void> = Promise.resolve();
 
-/** Caches workspace and repository labels only. Briefs, plans, code, and task text never enter the cache. */
 export async function saveUnderstandingSummary(connection: Connection, data: WorkspaceUnderstanding): Promise<void> {
   return withIndexLock(() => saveSummary(connection, data));
 }
@@ -36,7 +35,6 @@ async function saveSummary(connection: Connection, data: WorkspaceUnderstanding)
   try {
     for (let i = 0; i < chunks.length; i++) await SecureStore.setItemAsync(chunkKeys[i], chunks[i], { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
     const prior = index.entries.filter(entry => !(entry.scope === scope && entry.workspaceId === data.workspace.id));
-    // A new credential for this host invalidates every prior offline snapshot on that host.
     const retained = prior.filter(entry => entry.scope !== scope || entry.credential === credential);
     const entries = [nextEntry, ...retained].sort((a, b) => Date.parse(b.capturedAt) - Date.parse(a.capturedAt)).slice(0, WORKSPACE_LIMIT);
     await writeIndex({ entries });

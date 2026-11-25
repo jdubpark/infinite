@@ -95,7 +95,6 @@ function outcomeRow(overrides: Partial<OutcomeRow> = {}): OutcomeRow {
   };
 }
 
-/** A store with the `outcomes` module registered, as `outcome-store.test.ts` builds one. */
 function readyStore(f: Fixture): EvidenceStore {
   const store = open(f);
   store.register(outcomeModule({ now: () => NOW }));
@@ -177,26 +176,22 @@ test("a window uses the end time, or the start time", () => {
   try {
     store = readyStore(f);
     store.write(tx => {
-      // Ended exactly at the window start: in.
       writeOutcome(tx, outcomeRow({
         outcomeId: "run-1:a",
         startedAt: "2026-11-05T00:00:00.000Z",
         endedAt: "2026-11-06T00:00:00.000Z",
       }));
-      // Ended one millisecond before the window start: out.
       writeOutcome(tx, outcomeRow({
         outcomeId: "run-1:b",
         startedAt: "2026-11-05T00:00:00.000Z",
         endedAt: "2026-11-05T23:59:59.999Z",
       }));
-      // Open, so the start time is the window's time: in.
       writeOutcome(tx, outcomeRow({
         outcomeId: "run-1:c",
         disposition: "open", integrated: null, accepted: null, firstPass: null, held: null,
         startedAt: "2026-11-10T00:00:00.000Z",
         endedAt: null,
       }));
-      // Neither time: out of every window.
       writeOutcome(tx, outcomeRow({
         outcomeId: "run-1:d",
         startedAt: null,
@@ -210,7 +205,6 @@ test("a window uses the end time, or the start time", () => {
     assert.deepEqual(ids("2026-11-06T00:00:00.000Z"), ["run-1:a", "run-1:c"]);
     assert.deepEqual(ids(), ["run-1:a", "run-1:b", "run-1:c", "run-1:d"]);
 
-    // `queryCells` turns `days` into the same window, counted back from `now`.
     const query = { use: "display" as const, sources: ["production" as const], by: [], role: "implementer" as const };
     const windowed = queryCells(store, { ...query, days: 7 }, { now: NOW }).cells[0]!;
     assert.deepEqual([windowed.attempts, windowed.open], [1, 1]);
@@ -257,7 +251,6 @@ test("a refused query never reads", () => {
   const f = fixture();
   let store: EvidenceStore | undefined;
   try {
-    // No `outcomes` module is registered, so a read would fail with EvidenceError.
     store = open(f);
     assert.throws(
       () => queryCells(store!, {
@@ -292,7 +285,6 @@ test("a module that is not ready is unavailable", () => {
     f.close();
   }
 
-  // A store whose database path cannot open: its parent is a regular file.
   const blocked = fixture();
   let unopened: EvidenceStore | undefined;
   try {
@@ -376,7 +368,6 @@ test("the current epoch comes from the store", () => {
     const lookup = currentEpochs(store, NOW);
     assert.equal(lookup(identity), 2);
     assert.equal(lookup({ ...identity, effort: null }), 1, "another identity keeps its own epoch");
-    // An epoch that starts after `now` is not current yet.
     advanceEpoch(store, { profile: identity, requestId: "request-2", now: "2026-11-14T00:00:00.000Z" });
     assert.equal(currentEpochs(store, NOW)(identity), 2);
   } finally {
@@ -400,7 +391,6 @@ const OTHER_GOAL = "goal-8";
 const MISSION = "mission-7";
 const OTHER_MISSION = "mission-8";
 
-/** A row of one run, with the goal and mission given, or none. Its role is the implementer's. */
 function rowIn(runId: string, memberId: string, goal?: string, mission?: string): OutcomeRow {
   const base = outcomeRow();
   const payload: OutcomePayload = { ...base.payload };
@@ -411,7 +401,6 @@ function rowIn(runId: string, memberId: string, goal?: string, mission?: string)
   return outcomeRow({ outcomeId: `${runId}:${memberId}`, runId, memberId, payload });
 }
 
-/** A summary of one run, with the goal and mission given, or none. */
 function summaryWith(runId: string, goal?: string, mission?: string): RunSummaryRow {
   const payload: RunSummaryRow["payload"] = {
     projectId: "example",
@@ -462,7 +451,6 @@ function memberOf(runId: string, memberId: string): MemberResultRow {
   };
 }
 
-/** Every implementer row a cell counts: attempts, open, and each exclusion. */
 function rowsIn(cells: readonly Cell[]): number {
   return cells.reduce((sum, cell) => sum + cell.attempts + cell.open
     + Object.values(cell.excluded).reduce((all, n) => all + n, 0), 0);
@@ -474,15 +462,12 @@ test("a goal roll-up reads the runs of its goal", () => {
   try {
     store = readyStore(f);
     store.write(tx => {
-      // R1: the summary and one row carry the goal; a second row of R1 carries none, and still counts.
       writeSummary(tx, summaryWith("R1", GOAL));
       writeOutcome(tx, rowIn("R1", "m1", GOAL));
       writeOutcome(tx, rowIn("R1", "m2"));
       writeMemberResult(tx, memberOf("R1", "member-4"));
-      // R2: the summary has no goal; one row carries it.
       writeSummary(tx, summaryWith("R2"));
       writeOutcome(tx, rowIn("R2", "m1", GOAL));
-      // R3: another goal.
       writeSummary(tx, summaryWith("R3", OTHER_GOAL));
       writeOutcome(tx, rowIn("R3", "m1", OTHER_GOAL));
     });
@@ -495,7 +480,6 @@ test("a goal roll-up reads the runs of its goal", () => {
     const other = queryRollup(store, { kind: "goal", id: OTHER_GOAL }, { known: true, assessment: null });
     assert.equal(other.runs.total, 1);
 
-    // What the route gives passes through: the assessment and the session cost lookup.
     const assessment = { result: "achieved" as const, at: "2026-11-13T12:00:00.000Z", revision: 2 };
     const costed = queryRollup(store, { kind: "goal", id: GOAL },
       { known: true, assessment, cost: () => ({ complete: true, tokens: 100, usd: 0.25 }) });
@@ -514,9 +498,7 @@ test("a mission roll-up reads the runs of its mission", () => {
   try {
     store = readyStore(f);
     store.write(tx => {
-      // R1: its rows carry mission M.
       writeOutcome(tx, rowIn("R1", "m1", undefined, MISSION));
-      // R2: its summary carries mission N, and its row carries none.
       writeSummary(tx, summaryWith("R2", undefined, OTHER_MISSION));
       writeOutcome(tx, rowIn("R2", "m1"));
     });
@@ -632,7 +614,6 @@ test("a roll-up needs a ready module", () => {
     f.close();
   }
 
-  // A store whose database path cannot open: its parent is a regular file.
   const blocked = fixture();
   let unopened: EvidenceStore | undefined;
   try {

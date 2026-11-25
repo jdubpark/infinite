@@ -107,7 +107,6 @@ test("board deadline stop uses the time-limit label and reason suppression is sp
 });
 
 test("resume follows the time left, which an intake mission's stopped clock keeps", () => {
-  // The deadline has passed, but the clock stopped before it did, so the owner can still resume.
   const stopped = controlMission("paused", { deadlineAt: "2026-09-30T23:00:00.000Z", clockStoppedAt: "2026-09-30T22:30:00.000Z" });
   assert.equal(missionControls(stopped, "owner", true, now).resume, true);
   const spent = controlMission("paused", { deadlineAt: "2026-09-30T22:30:00.000Z", clockStoppedAt: "2026-09-30T22:30:00.000Z" });
@@ -138,7 +137,6 @@ test("each extend choice has a spoken label that marks the mission's own limit",
 });
 
 test("a stopped clock that ran past the deadline reads as expired, not as time left", () => {
-  // settleClock can record a stop time a second after the deadline, before the next host tick expires the mission.
   const late = controlMission("paused", { deadlineAt: "2026-10-01T00:00:00.000Z", clockStoppedAt: "2026-10-01T00:00:01.000Z" });
   assert.equal(missionTimeLeftMs(late, now), -1000);
   assert.equal(missionStopLine(late, now), "Its time limit has passed. Extend to continue.");

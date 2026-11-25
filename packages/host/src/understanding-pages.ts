@@ -1,7 +1,6 @@
 export const PAGE_MAX_ITEMS = 50;
 export const PAGE_MAX_BYTES = 512 * 1024;
 
-/** The cursor names the last item of the previous page, so a list that grew in front still resumes after it. */
 export function encodeCursor(index: number, key: string): string { return Buffer.from(`${index}:${key}`).toString("base64url"); }
 
 export function decodeCursor(value: string): { index: number; key: string } | null {

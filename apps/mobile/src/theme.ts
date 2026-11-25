@@ -1,6 +1,5 @@
 import { Platform } from "react-native";
 
-/** Colour tokens from DESIGN.md (frontmatter `colors`), camel-cased. */
 export const colors = {
   canvas: "#eeeee7",
   paper: "#fafaf6",
@@ -23,7 +22,6 @@ export const colors = {
   error: "#9d382a",
   terminalSurface: "#202923",
   terminalInk: "#e4e9de",
-  /** Floating controls: a translucent sheet over the content, edged by a light rim. */
   glass: "rgba(252,252,249,0.86)",
   glassRim: "rgba(34,42,39,0.10)",
   scrim: "rgba(24,30,27,0.28)",
@@ -31,13 +29,10 @@ export const colors = {
 
 export const mono = Platform.OS === "ios" ? "Menlo" : "monospace";
 
-/** DESIGN.md `rounded`: control, native-message, panel, pairing-sheet; capsule for floating controls. */
 export const radius = { control: 8, message: 10, panel: 12, card: 16, sheet: 28, capsule: 999 } as const;
 
-/** DESIGN.md `spacing`. */
 export const space = { compact: 8, label: 12, controlX: 18, inset: 20, section: 24 } as const;
 
-/** The one depth used by floating controls and sheets; content stays flat. */
 export const lift = { boxShadow: "0 6px 18px rgba(24,30,27,0.14)" } as const;
 
 export const theme = { colors, mono, radius, space, lift } as const;

@@ -66,8 +66,7 @@ export function writeSealed(
     }
     renameSync(temporary, file);
   } catch (error) {
-    // A failed write must not leave its temporary file: a caller that retries would fill the directory.
-    try { rmSync(temporary, { force: true }); } catch { /* the write error is the one to report */ }
+    try { rmSync(temporary, { force: true }); } catch {}
     throw error;
   }
   const dir = openSync(dirname(file), "r");
@@ -78,8 +77,6 @@ export function writeSealed(
   }
 }
 
-// One worker writes each journal. Records are authenticated against both session
-// and sequence. Segments bound reconnect reads without truncating old history.
 const SEGMENT_SIZE = 256;
 export class Journal {
   seq = 0;
@@ -146,7 +143,7 @@ export function readEvents(
     );
     if (!existsSync(file)) break;
     const lines = readFileSync(file, "utf8").split("\n");
-    lines.pop(); // An in-progress final write is replayed on the next read.
+    lines.pop();
     for (let i = 0; i < lines.length; i++) {
       const seq = segment * SEGMENT_SIZE + i + 1;
       if (seq <= after) continue;

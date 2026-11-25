@@ -12,12 +12,6 @@ import { createTeamSchema, teamGoalContextSchema, type CreateTeam, type TeamGoal
 import type { Project } from "../packages/host/src/types.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
-/*
- * The goal service's use of reported numbers (goals.ts): it settles a cycle's entry from the team service's one read
- * when the cycle's run ends, prunes at every write, and reads the curve. The team service is a stub whose
- * `reviewedObservations` answers what the test sets; tests/goal-metrics-host.test.ts runs the real one.
- */
-
 const lineup: TeamLineup = {
   coordinator: { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
   implementers: [{ id: "light", label: "Light worker", provider: "codex", model: "gpt-6-luna", effort: "high", tier: "light" }],
@@ -30,7 +24,6 @@ const minute = 60_000;
 const check = { command: process.execPath, args: ["-e", "0"] };
 const HEAD_A = "a".repeat(40), HEAD_B = "b".repeat(40);
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-/** Polls on real timers; `Date` is mocked, so a Date-based timeout would never pass. */
 async function until<T>(read: () => T, accept: (value: T) => boolean, ms = 8000): Promise<T> {
   const end = performance.now() + ms;
   for (;;) {
@@ -41,12 +34,10 @@ async function until<T>(read: () => T, accept: (value: T) => boolean, ms = 8000)
   }
 }
 
-/** A team service stub with the goal's one read of reported numbers. */
 function stubTeams() {
   const views = new Map<string, TeamView>();
   const launches: { request: CreateTeam; context: TeamGoalContext }[] = [];
   const observations = new Map<string, CheckObservation[] | undefined>();
-  /** Run holders read through the real `reviewedObservationsOf`, as the team service reads its records. */
   const holders = new Map<string, ObservationHolder>();
   const usage = () => ({ total: emptyUsage(), byProfile: {}, byProvider: {}, unmeasuredMembers: 0, partialMembers: 0 });
   const service = {
@@ -69,7 +60,6 @@ function stubTeams() {
         goal: structuredClone(context), members: [], tasks: [], usage: usage(), branch: "main", baseCommit: "c".repeat(40) } as unknown as TeamView);
       return service.get(request.requestId);
     },
-    /** Ends a run. A running member keeps the goal attached, so its next step settles the run again. */
     settle(id: string, status: string, member: "running" | "stopped") {
       Object.assign(views.get(id)!, { status, members: [{ memberId: randomUUID(), role: "implementer", revision: 1, status: member }] });
     },
@@ -87,7 +77,6 @@ function fixture(t: TestContext) {
   f.config.teams = { ...f.config.teams!, lineup };
   f.config.projects[0]!.team = { checks: [check], objective: { prompts: "on" } } as Project["team"];
   f.config.projects[0]!.autonomy = "autonomous";
-  // The launch needs a profile for each provider of the lineup; no agent runs.
   f.config.agents = { claude: { command: process.execPath, args: [] }, codex: { command: process.execPath, args: [] } } as typeof f.config.agents;
   const teams = stubTeams();
   const services: GoalService[] = [];
@@ -113,7 +102,6 @@ test("a finite goal sets a cycle's entry at a reviewed end, replaces it when the
   teams.observations.set(first, observed(HEAD_A, 1, [["svc_speed", 10], ["svc_size", 2]]));
   teams.settle(first, "ready-for-review", "running");
   await until(() => curve(goals, created.id), value => value.length === 2);
-  // Both series' newest point is the same check, so the identity digest orders them; the test reads them by name.
   assert.deepEqual(curve(goals, created.id).sort(), [["svc_size", [[1, 2]]], ["svc_speed", [[1, 10]]]]);
   const stored = f.readRecord<Holder>("goal", created.id);
   assert.deepEqual(stored.metrics?.entries.map(entry => [entry.run, entry.revision, entry.head, entry.values.length]), [[first, 1, HEAD_A, 2]]);
@@ -172,7 +160,6 @@ test("a standing goal settles each cycle, and its pause and an objective correct
   assert.deepEqual(curve(goals, created.id), [["svc_speed", [[1, 10]]]]);
 });
 
-/** `count` reviewed cycles that no run backs any more, as a long-lived goal holds them; each with one entry of one value. */
 function history(count: number, from = 1) {
   const at = new Date().toISOString();
   const cycles: GoalCycle[] = Array.from({ length: count }, (_, index) => ({ teamId: randomUUID(), cycle: from + index, goalRevision: 1,
@@ -227,7 +214,6 @@ test("the step's write prunes the 51st entry its settlement adds", async t => {
   assert.equal(written.dropped, 1);
 });
 
-/** Values of a shape this version never writes, as a later release could leave them before a rollback. */
 const FOREIGN: readonly [string, unknown][] = [["null", null], ["{}", {}], ["[null]", [null]], ["{ v: 2 }", { v: 2 }]];
 const EMPTY = { series: [], omittedSeries: 0, omittedValues: 0, dropped: 0 };
 

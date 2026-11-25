@@ -14,13 +14,8 @@ type EventRead = { topic: `session/${string}`; id: string; after: number };
 
 const MAX_EVENT_READS_PER_TICK = 32;
 const MAX_EVENT_READ_CONCURRENCY = 4;
-/**
- * An unchanged inline session list is sent again after this long. A phone ages its rows from when it last received
- * the list, and rows carry recorded times, so a quiet list would otherwise hold every age still.
- */
 const UNCHANGED_SESSIONS_RESEND_MS = 60_000;
 
-/** Shared change snapshots for HTTP and encrypted remote event subscribers. */
 export class LiveFeed {
   private listeners = new Set<Listener>();
   private timer?: ReturnType<typeof setInterval>;
@@ -87,7 +82,7 @@ export class LiveFeed {
             let byCursor = eventPages.get(read.topic);
             if (!byCursor) eventPages.set(read.topic, byCursor = new Map());
             byCursor.set(read.after, page);
-          } catch { /* Retry next tick. */ }
+          } catch {}
         }
       }));
       for (const listener of this.listeners) for (const topic of listener.topics) {
@@ -111,11 +106,8 @@ export class LiveFeed {
         const update = { topic, data };
         const eventBytes = Buffer.byteLength(JSON.stringify(update));
         if (eventBytes > MAX_EVENTS_EVENT_BYTES || lastRefetch !== undefined) listener.refetch.set(topic, Date.now());
-        // Keep the latch after the first refetch: a later inline event could move
-        // the phone's journal cursor past data it has not fetched yet. Repeat
-        // unchanged refetches periodically so a failed REST load can recover.
         const outgoing = listener.refetch.has(topic) ? { topic: "refetch" as const, data: { topic } } : update;
-        try { listener.emit(outgoing); } catch { /* A disconnected consumer is removed by its owner. */ }
+        try { listener.emit(outgoing); } catch {}
       }
     } finally { this.ticking = false; }
   }

@@ -1,17 +1,4 @@
 #!/bin/sh
-# Sourced by install-agent-env.sh.
-#
-# The installer never reasons about arbitrary shell: it patches a wrapper only
-# when everything from line 1 through the `export SHELL=/bin/bash` anchor is
-# byte-identical to the shipped deploy/ubuntu/agent-wrapper.sh. That prefix is
-# known straight-line code (set -eu, umask, ulimit, exports), so a hook placed
-# right after it executes on every launch. Nothing is executed to decide.
-#
-# infinite_wrapper_prefix_state FILE REFERENCE prints one of:
-#   patched   FILE starts with the reference prefix followed by the hook line
-#   patchable FILE starts with the reference prefix and no hook line
-#   drifted   FILE differs from the reference before the anchor, or lacks it
-# and prints the reference anchor line number on a second line for patchable.
 infinite_wrapper_prefix_state() {
   _infinite_file=$1
   _infinite_ref=$2

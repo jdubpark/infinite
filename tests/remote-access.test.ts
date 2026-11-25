@@ -304,7 +304,6 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
     for (const path of ["/login", "/sessions/../me", "/sessions/%2e%2e/me", "/sessions/" + randomUUID() + "/raw", "/events?topics=sessions"]) {
       await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403);
     }
-    // Workspace content moves only over a direct owner connection.
     const hash = "a".repeat(64);
     for (const [method, path] of [["POST", "/projects/project/sync/begin"], ["POST", "/projects/project/sync/has"], ["PUT", `/projects/project/sync/blob/${hash}`], ["PUT", "/projects/project/sync/blobs"],
       ["GET", `/projects/project/sync/blob/${hash}`], ["POST", "/projects/project/sync/commit"], ["POST", "/projects/project/sync/export"], ["POST", "/outcomes/signals"],
@@ -321,9 +320,7 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
     assert.deepEqual(await client.request(`/missions/${missionId}`), { count: 7, method: "GET", path: `/api/missions/${missionId}` });
     assert.deepEqual(await client.request(`/missions/${missionId}/answer/${decisionId}`, { body: {} }), { count: 8, method: "POST", path: `/api/missions/${missionId}/answer/${decisionId}` });
     assert.deepEqual(await client.request("/project-groups/shop", { method: "DELETE", body: {} }), { count: 9, method: "DELETE", path: "/api/project-groups/shop" });
-    // The phone dictates over this channel; transcript cleanup is a POST only.
     assert.deepEqual(await client.request("/dictation/cleanup", { body: { text: "um add retries" } }), { count: 10, method: "POST", path: "/api/dictation/cleanup" });
-    // A project, by its id or by one of its checkouts' host project ids, is readable by any paired role.
     assert.deepEqual(await client.request("/project-groups/shop"), { count: 11, method: "GET", path: "/api/project-groups/shop" });
     assert.deepEqual(await client.request("/project-groups/shop/understanding"), { count: 12, method: "GET", path: "/api/project-groups/shop/understanding" });
     assert.deepEqual(await client.request("/project-groups/shop/understanding/catalog"), { count: 13, method: "GET", path: "/api/project-groups/shop/understanding/catalog" });
@@ -334,21 +331,17 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
       await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
     for (const [method, path] of [["POST", `/missions/${missionId}/answer/not-a-uuid`], ["GET", `/missions/${missionId}/steer`], ["GET", "/project-groups/Shop"], ["PUT", "/project-groups/Shop"], ["GET", "/project-groups/shop/understanding/extra"], ["POST", "/project-groups/shop/understanding"], ["GET", "/dictation/cleanup"]] as const)
       await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
-    // The Swarm graph reads its code map and touch sets over this channel. All three paths are GET only.
     const contextTeam = randomUUID(), contextSession = randomUUID();
     assert.deepEqual(await client.request("/projects/project/graph/map"), { count: 17, method: "GET", path: "/api/projects/project/graph/map" });
     assert.deepEqual(await client.request(`/teams/${contextTeam}/context`), { count: 18, method: "GET", path: `/api/teams/${contextTeam}/context` });
     assert.deepEqual(await client.request(`/sessions/${contextSession}/context`), { count: 19, method: "GET", path: `/api/sessions/${contextSession}/context` });
     for (const [method, path] of [["POST", "/projects/project/graph/map"], ["GET", "/projects/project/graph"], ["POST", `/teams/${contextTeam}/context`], ["GET", "/teams/not-a-uuid/context"], ["POST", `/sessions/${contextSession}/context`]] as const)
       await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
-    // The phone extends a mission's time limit over this channel. It is a POST only.
     assert.deepEqual(await client.request(`/missions/${missionId}/extend`, { body: {} }), { count: 20, method: "POST", path: `/api/missions/${missionId}/extend` });
     await assert.rejects(client.request(`/missions/${missionId}/extend`, { method: "GET" }), (error: RemoteError) => error.status === 403);
-    // The clients' halt banner reads the halt over this channel; engaging and releasing do not travel it.
     assert.deepEqual(await client.request("/halt"), { count: 21, method: "GET", path: "/api/halt" });
     for (const [method, path] of [["POST", "/halt"], ["POST", "/halt/release"], ["GET", "/halt/release"]] as const)
       await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
-    // The decision queue is readable through this channel; writes remain outside the allowlist.
     assert.deepEqual(await client.request("/decision-queue"), { count: 22, method: "GET", path: "/api/decision-queue" });
     await assert.rejects(client.request("/decision-queue", { method: "POST", body: {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     runner.oversized();
@@ -436,7 +429,6 @@ test("the relay refuses signal writes", { timeout: 20000 }, async () => {
   const client = createRemoteClient({ url: runner.url, token: runner.token });
   try {
     await client.request("/me");
-    // Owner claims reach the host only over a direct owner connection, never through the relay.
     await assert.rejects(client.request("/outcomes/signals", { method: "POST", body: {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     assert.equal(runner.requests.length, 1, "a refused signal write does not reach the host");
   } finally { client.close(); runner.close(); }
@@ -447,7 +439,6 @@ test("the relay refuses entry withdrawals", { timeout: 20000 }, async () => {
   const client = createRemoteClient({ url: runner.url, token: runner.token });
   try {
     await client.request("/me");
-    // An owner's withdrawal of a member-visible entry reaches the host only over a direct owner connection.
     await assert.rejects(client.request(`/teams/${randomUUID()}/entries/${randomUUID()}/withdraw`, { method: "POST", body: { requestId: randomUUID() } }),
       (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     assert.equal(runner.requests.length, 1, "a refused withdrawal does not reach the host");
@@ -459,7 +450,6 @@ test("the relay refuses roll-ups and imports", { timeout: 20000 }, async () => {
   const client = createRemoteClient({ url: runner.url, token: runner.token });
   try {
     await client.request("/me");
-    // A roll-up and the owner's legacy import reach the host only over a direct connection, never through the relay.
     for (const path of [`/outcomes/rollup?goal=${randomUUID()}`, `/outcomes/rollup?mission=${randomUUID()}`])
       await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     await assert.rejects(client.request("/outcomes/legacy", { method: "POST", body: { dryRun: true, lines: [] } }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
@@ -489,7 +479,6 @@ test("the relay refuses objective records", async () => {
   const client = createRemoteClient({ url: runner.url, token: runner.token });
   try {
     await client.request("/me");
-    // The objective record is read over a direct connection only, like the roll-ups.
     for (const path of [`/goals/${randomUUID()}/record`, `/goals/${randomUUID()}/record?version=1`, `/teams/${randomUUID()}/record`])
       await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     assert.equal(runner.requests.length, 1, "a refused record read does not reach the host");
@@ -522,7 +511,6 @@ test("the relay refuses routing reads", async () => {
   const client = createRemoteClient({ url: runner.url, token: runner.token });
   try {
     await client.request("/me");
-    // The routing status and the explain read reach the host over a direct connection only, like the records.
     for (const path of [`/routing/projects/rehearsal`, `/teams/${randomUUID()}/routing/task-1`])
       await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     assert.equal(runner.requests.length, 1, "a refused routing read does not reach the host");
@@ -534,7 +522,6 @@ test("the relay refuses routing writes", async () => {
   const client = createRemoteClient({ url: runner.url, token: runner.token });
   try {
     await client.request("/me");
-    // The pause, the resume, and the revoke are owner writes over a direct owner connection only.
     for (const [method, path] of [["POST", `/routing/projects/rehearsal/explore/pause`], ["POST", `/routing/projects/rehearsal/explore/resume`], ["POST", `/teams/${randomUUID()}/routing/revoke`]] as const)
       await assert.rejects(client.request(path, { method, body: {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     assert.equal(runner.requests.length, 1, "a refused routing write does not reach the host");
@@ -546,7 +533,6 @@ test("the relay refuses corrections", async () => {
   const client = createRemoteClient({ url: runner.url, token: runner.token });
   try {
     await client.request("/me");
-    // An owner correction is written over a direct owner connection only.
     await assert.rejects(client.request(`/goals/${randomUUID()}/record`, { method: "POST", body: {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     assert.equal(runner.requests.length, 1, "a refused correction does not reach the host");
   } finally { client.close(); runner.close(); }

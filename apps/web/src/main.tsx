@@ -58,7 +58,6 @@ const time = (value: string) =>
     hour: "2-digit",
     minute: "2-digit",
   });
-// Switching sessions paints the last view immediately, but never restores authority.
 const sessionViews = new Map<string, { session: Session; events: LogEvent[]; cursor: number; seen: string }>();
 
 function Mark() {
@@ -112,7 +111,6 @@ function App() {
     const data = await api<{ goals: ProductGoal[] }>("/goals");
     if (current()) setGoals(data.goals.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
   }, 1800, me?.goals ? me : null);
-  // A failed read keeps the last received halt, so the banner never drops out for one missed poll.
   const haltFeed = useLiveRefresh(async current => {
     const view = await api<HaltView>("/halt");
     if (current()) setHalt(view);
@@ -191,14 +189,12 @@ function App() {
       </main>
     );
   const active = sessions.filter((s) => s.status === "running").length;
-  // A session, team, or goal screen shows the halt on its project; every other screen lists project halts compactly.
   const screenProject = selected ? sessions.find(session => session.id === selected)?.projectId
     : route.teamId ? teams.find(team => team.id === route.teamId)?.projectId
       : route.goalId ? goals.find(goal => goal.id === route.goalId)?.projectId
         : route.costProjectId;
   const haltPlace: HaltPlace = selected || route.teamId || route.goalId || route.costProjectId ? { projectIds: screenProject ? [screenProject] : [] } : "overview";
   const projectName = (id: string) => me.projects.find(project => project.id === id)?.name ?? id;
-  // The Swarm view is the landing page: it fills the main area at the root route and at #/swarm.
   const permissionsShown = route.permissions && decisionLogAvailable(me);
   const swarmShown = route.swarm || !(selected || creating || route.teams || route.goals || route.missionId || route.decisions || route.cost || permissionsShown);
   const swarm = <SwarmView me={me} sessions={sessions} teams={teams} fresh={host.fresh && (!me.teams || teamFeed.fresh)} stale={host.stale || Boolean(me.teams && teamFeed.stale)} seen={host.seen}
@@ -260,7 +256,6 @@ function App() {
             )}
           </p>
           {lastSeen && <small>Last checked {time(lastSeen)}</small>}
-          {/* The decision log belongs to the host, not to one workspace view, so it sits with the host's status. */}
           {decisionLogAvailable(me) && (
             <button className="text-button host-permissions" aria-current={permissionsShown ? "page" : undefined} onClick={() => route.navigatePermissions(null)}>
               <Scale size={14} />Permission decisions
@@ -370,14 +365,11 @@ function Create({
   const promptDictation = useDictation({ me, value: prompt, onChange: setPrompt, maxLength: 24000, disabled: busy || Boolean(request) || me.role !== "owner" });
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [applying, setApplying] = useState(false);
-  // An apply failure belongs to the workspace it was sent for.
   const [syncError, setSyncError] = useState<{ projectId: string; message: string } | null>(null);
   const [refreshingSource, setRefreshingSource] = useState(false);
   const [sourceError, setSourceError] = useState<{ projectId: string; message: string } | null>(null);
-  // The age text changes on every poll, so only a new pending reason or an applied generation is announced.
   const [syncNotice, setSyncNotice] = useState("");
   const syncSeen = useRef<{ projectId?: string; pending?: string; applied?: string }>({});
-  // Only a cloud host receives laptop sync; a local host is the laptop.
   const syncs = me.environment === "cloud";
   useEffect(() => {
     if (!project) return;
@@ -395,13 +387,11 @@ function Create({
     setSourceError(null);
     setSyncNotice("");
     if (!projectId || !syncs) return;
-    // Hiding the tab stops the 5-second read and starts a new generation, so an earlier reply cannot replace a later one.
     let active = true, generation = 0;
     let timer: ReturnType<typeof setInterval> | undefined;
     const load = () => {
       const started = generation;
       const current = () => active && started === generation;
-      // An unchanged detail keeps its object, so the panel does not re-render.
       api<ProjectDetail>(`/projects/${projectId}`).then(detail => { if (current()) setProject(previous => JSON.stringify(previous) === JSON.stringify(detail) ? previous : detail); }).catch(() => { if (current()) setProject(null); });
     };
     const schedule = () => {
@@ -582,7 +572,6 @@ function TerminalView({ id, readOnly }: { id: string; readOnly: boolean }) {
     let active = true,
       cursor = 0,
       retry = 1800,
-      // Hiding the tab starts a new generation: output from an earlier read is dropped, and returning reads again at once.
       generation = 0,
       inFlight: number | undefined;
     let timer: ReturnType<typeof setTimeout>;
@@ -608,7 +597,6 @@ function TerminalView({ id, readOnly }: { id: string; readOnly: boolean }) {
       } catch {
         if (current()) {
           setError("Waiting for the host. Recorded output will resume here.");
-          // Retries back off while the host is unreachable, so an offline tab does not poll every 1.8 seconds.
           timer = setTimeout(poll, retry);
           retry = Math.min(retry * 2, 15000);
         }
@@ -617,7 +605,6 @@ function TerminalView({ id, readOnly }: { id: string; readOnly: boolean }) {
       }
     };
     const resume = () => { generation++; void poll(); };
-    // Coming back online or to the window retries at once instead of waiting out the backoff.
     const retryNow = () => { if (inFlight === undefined) void poll(); };
     document.addEventListener("visibilitychange", resume);
     window.addEventListener("online", retryNow);
@@ -699,7 +686,6 @@ function SessionView({
     setSession(detail);
     setLoadError("");
     control.observe(detail, revision);
-    // Catch up from a bounded recent window, not the recording's first event.
     const after = cursor.current ?? Math.max(0, detail.seq - 200);
     const page = await api<{ events: LogEvent[]; cursor: number; more: boolean }>(
       `/sessions/${id}/events?after=${after}&types=lifecycle,input-intent,input-result,signal&limit=100`);
@@ -738,15 +724,12 @@ function SessionView({
     composer.current.style.height = `${Math.min(170, composer.current.scrollHeight)}px`;
   }, [text, tab, session !== null]);
   const requiresControl = session?.capabilities?.inputControl === 1;
-  // A mission coordinator runs managed sessions. People get the terminal fallback only while a provider prompt is open.
   const managed = Boolean(session?.managedBy);
   const managedLocked = managed && session?.attention?.state !== "needs-you";
   const answerable = connected && view.fresh && session?.status === "running" && me.role !== "viewer";
   const controlled = !requiresControl || Boolean(control.lease);
   const canSteer = answerable && !managedLocked && controlled;
-  // Provider prompts stay with the owner. Their answers need no control lease, because a managed session cannot be claimed.
   const canAnswer = answerable && (managed || controlled) && me.capabilities?.answer !== false;
-  // Input closes with the prompt, so a lease held across it goes back to the host.
   useEffect(() => {
     if (managedLocked && control.lease) void control.release();
   }, [managedLocked, control.lease]);
@@ -774,7 +757,6 @@ function SessionView({
     dictation.dismiss();
     const current = readDraft(cacheKey);
     const retrying = current.pending !== null;
-    // Only the terminal views permit typing directly into an open dialog.
     const request: PendingInput = current.pending ?? { requestId: crypto.randomUUID(), text: current.text, submit: true, ...(tab === "terminal" || tab === "screen" ? { force: true } : {}) };
     writeDraft(cacheKey, { text: current.text, pending: request });
     try {
@@ -794,7 +776,6 @@ function SessionView({
       );
     } catch (e) {
       if (isMissionManaged(e)) {
-        // Refused, not delivered: keep the draft in the tab and drop the pending request.
         settleDraft(cacheKey, request.requestId, false);
         setError(e.message);
         view.refresh();
@@ -1010,7 +991,6 @@ function SessionView({
           </div>
         </div>
         <div className="composer-feedback">
-          {/* One fixed slot: delivery errors, control messages, and receipts win; send, keys, and typing clear the dictation outcome. */}
           {dictation.notice && !error && !control.message && !notice ? <DictationNotice dictation={dictation} /> : <span className={error ? "error" : control.message ? "quiet control-message" : "receipt"} role={error ? "alert" : "status"} title={error || control.message || notice}>
             {!error && !control.message && notice && <Check size={14} aria-hidden="true" />}{error || control.message || notice}
           </span>}

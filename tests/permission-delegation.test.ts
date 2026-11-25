@@ -38,9 +38,7 @@ function makeGroup(id: string, name: string, ids: string[]): ProjectGroup {
 class FakeGroups {
   private readonly moves = new Map<string, number>();
   constructor(private groups: ProjectGroup[]) {}
-  /** A host fold: membership changes and no owner move is recorded. */
   set(groups: ProjectGroup[]) { this.groups = groups; }
-  /** An owner regrouping: every project whose holder changed is recorded as moved, as the group service does. */
   ownerRegroup(groups: ProjectGroup[]) {
     const ids = new Set([...this.groups, ...groups].flatMap(group => group.repos.flatMap(repo => repo.checkouts.map(checkout => checkout.projectId))));
     const before = new Map([...ids].map(id => [id, this.containing(id)?.id]));
@@ -630,25 +628,20 @@ test("with the real group service, an owner act on a workspace ends the entry of
     const leave = (id: string) => config.projects.splice(config.projects.findIndex(project => project.id === id), 1)[0]!;
     const notCovered = (id: string) => ({ covered: false, projectId: id, reason: "not-covered" });
 
-    // Delegated and revoked while beta, a member with no record, is away: the acts add no history for beta,
-    // so beta's first onboarding still covers it.
     let away = leave("beta");
     service.delegate(workspace, request(), actor);
     service.revoke(workspace, request(), actor);
     config.projects.push(away);
     assert.equal(service.coverProject("beta", request(), actor).covered, true);
 
-    // Revoked while alpha is away: alpha returns to the same id and path and is not covered.
     service.delegate(workspace, { ...request(), direction: "Wide." }, actor);
     away = leave("alpha");
-    // No workspace has the id alpha, so the id of the absent member names the workspace that holds it.
     const revoked = service.revoke("alpha", request(), actor);
     assert.deepEqual([revoked.workspaceId, revoked.state], [workspace, "not-delegated"]);
     config.projects.push(away);
     assert.deepEqual(service.coverage("alpha"), notCovered("alpha"));
     assert.equal(service.status().find(view => view.workspaceId === workspace)?.state, "not-delegated");
 
-    // Delegated again with narrower direction while alpha is away: alpha does not return under the older, wider entry.
     service.delegate(workspace, { ...request(), direction: "Wide." }, actor);
     away = leave("alpha");
     service.delegate(workspace, { ...request(), direction: "Narrow." }, actor);
@@ -656,7 +649,6 @@ test("with the real group service, an owner act on a workspace ends the entry of
     assert.deepEqual(service.coverage("alpha"), notCovered("alpha"));
     assert.equal(service.status().find(view => view.workspaceId === workspace)?.state, "partly-delegated");
 
-    // The same for every workspace at once, and for an ungrouped project.
     service.delegateAll(request(), actor);
     away = leave("gamma");
     service.delegateAll(request(), actor);
@@ -664,7 +656,6 @@ test("with the real group service, an owner act on a workspace ends the entry of
     assert.deepEqual(service.coverage("gamma"), notCovered("gamma"));
     assert.equal(service.coverage("alpha").covered, true);
 
-    // With no owner act while it is away, a project keeps its entry.
     away = leave("beta");
     assert.deepEqual(service.coverage("beta"), { covered: false, projectId: "beta", reason: "unknown-project" });
     config.projects.push(away);
@@ -693,7 +684,6 @@ test("with the real group service, an owner act by an id also ends the entry of 
     const { config, groups, service } = realGroups(f);
     const leave = () => config.projects.splice(config.projects.findIndex(project => project.id === "alpha"), 1)[0]!;
     const notCovered = { covered: false, projectId: "alpha", reason: "not-covered" };
-    // The stored workspace alpha holds beta, and project alpha is ungrouped under the same id.
     groups.update("alpha", { requestId: randomUUID(), revision: 1, repos: ["beta"] });
 
     service.delegateAll({ ...request(), direction: "Wide." }, actor);
@@ -727,7 +717,6 @@ test("after a failed write the stored state is read again, so a published change
     const notCovered = (id: string) => ({ covered: false, projectId: id, reason: "not-covered" });
     service.delegate("workspace-one", request(), actor);
 
-    // The revocation reached the disk before the write failed. No answer and no later write uses the older snapshot.
     const revocation = request();
     fail = "after";
     assert.throws(() => service.revoke("workspace-one", revocation, actor), /sync failed/);
@@ -737,7 +726,6 @@ test("after a failed write the stored state is read again, so a published change
     assert.deepEqual(f.service().coverage("alpha"), notCovered("alpha"));
     assert.equal(service.revoke("workspace-one", revocation, actor).state, "not-delegated", "the retried request finds its receipt");
 
-    // A change that never reached the disk did not happen.
     service.delegate("workspace-one", request(), actor);
     fail = "before";
     assert.throws(() => service.revoke("workspace-one", request(), actor), /write failed/);
@@ -745,7 +733,6 @@ test("after a failed write the stored state is read again, so a published change
     assert.equal(service.coverage("alpha").covered, true);
     assert.equal(f.service().coverage("alpha").covered, true);
 
-    // While the stored state cannot be read after a failed write, every call fails.
     fail = "before";
     assert.throws(() => service.revoke("workspace-one", request(), actor), /write failed/);
     fail = "never";
@@ -765,7 +752,6 @@ test("with the real group service, an owner act on a workspace leaves the absent
   const f = fixture(["alpha", "beta", "gamma"]);
   try {
     const { config, groups, service } = realGroups(f);
-    // The stored workspace alpha holds beta. Project alpha is a member of the workspace Other.
     groups.update("alpha", { requestId: randomUUID(), revision: 1, repos: ["beta"] });
     const other = groups.create({ requestId: randomUUID(), name: "Other", repos: ["alpha", "gamma"] }).id;
     service.delegate(other, { ...request(), direction: "Other direction." }, actor);
@@ -779,7 +765,6 @@ test("with the real group service, an owner act on a workspace leaves the absent
     assert.equal(returned.covered && returned.coverage.direction, "Other direction.");
     assert.equal(service.coverage("beta").covered, false);
 
-    // An act on Other does reach that member.
     config.projects.splice(config.projects.indexOf(away), 1);
     assert.equal(service.revoke(other, request(), actor).state, "not-delegated");
     config.projects.push(away);

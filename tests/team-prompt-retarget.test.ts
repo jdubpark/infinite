@@ -313,8 +313,6 @@ test("seeded retarget comparisons preserve quoted prompt evidence across every r
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
 test("the known working rule texts are kept byte for byte", () => {
-  // Each hash was taken from the generator's own output when its text was appended, so an edit to an entry fails here
-  // instead of losing the prompts that carry it.
   const pinned = [
     "77d618fea6ee839cec3d9641f560e0ce2749985fc0330a1463b38c75470833b5",
     "7595d799220ed280b9f93aacd694e6362570b107e7bb19ac814a8c431ae4ac10",
@@ -344,7 +342,6 @@ test("a prompt that carries any known working rule is retargeted to the current 
     const forClaude = retargetPrompt(prompt, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools });
     assert.ok(forClaude);
     assert.equal(forClaude.includes("Working rule for tools"), false, `entryTools ${entryTools} no Codex rule reaches Claude`);
-    // Every other known text, of either variant: a role can gain or lose entry tools between the launch and the retarget.
     const others = KNOWN_RULE_TEXTS.filter(rule => rule !== current);
     assert.equal(others.length, KNOWN_RULE_TEXTS.length - 1);
     for (const known of others) {

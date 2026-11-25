@@ -17,7 +17,6 @@ const contract = {
   body: { interface: "GET /settings", change: "adds theme" },
 };
 
-/** Replaces globalThis.fetch and records each call. */
 function stubFetch(respond: (url: URL, init: RequestInit) => Response | Promise<Response>) {
   const calls: { url: URL; init: RequestInit }[] = [];
   const original = globalThis.fetch;

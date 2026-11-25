@@ -1,10 +1,3 @@
-/**
- * The host permission agent's fixed policy: the request classes that always need the owner's own
- * answer, the closed list of reason codes, the notices a requester receives, and the policy text
- * that every model turn reads. Nothing here decides a request.
- */
-
-/** Request classes that the permission agent can never allow. The owner answers them. */
 export const INTERRUPT_CLASSES = [
   "production-or-staging",
   "credentials",
@@ -14,11 +7,8 @@ export const INTERRUPT_CLASSES = [
 ] as const;
 export type InterruptClass = typeof INTERRUPT_CLASSES[number];
 
-/** A model found the action itself unacceptable. These rejects stay open for their task. */
 export const EFFECT_REJECT_CODES = ["outside-workspace", "unrelated", "unsafe"] as const;
-/** A model could not establish what the action does. A clearer request gets a fresh review. */
 export const EVIDENCE_REJECT_CODES = ["incomplete", "uncertain"] as const;
-/** The host produced the result without a verdict on the action. Never open and never replayed. */
 export const HOST_REJECT_CODES = ["unavailable", "locked", "needs-owner"] as const;
 export const REJECT_CODES = [...EFFECT_REJECT_CODES, ...EVIDENCE_REJECT_CODES, ...HOST_REJECT_CODES] as const;
 export type EffectRejectCode = typeof EFFECT_REJECT_CODES[number];
@@ -30,17 +20,10 @@ export const isEffectReject = (code: string | undefined): code is EffectRejectCo
 export const isEvidenceReject = (code: string | undefined): code is EvidenceRejectCode =>
   (EVIDENCE_REJECT_CODES as readonly string[]).includes(code ?? "");
 
-/** Raised by every change to the policy text or the class list. A delegation pins the version it was recorded under. */
 export const PERMISSION_POLICY_VERSION = 2;
 
-/** A second repeat of one open reject from one assignment locks that assignment. */
 export const REPEATS_BEFORE_LOCK = 2;
 
-/**
- * The classes in force for a delegation that pinned `pinned`. A host release can add a class to an
- * existing delegation; it can never remove one, so a pinned class stays even when this release no
- * longer lists it.
- */
 export function interruptClassesInForce(pinned: readonly string[]): string[] {
   return [...new Set<string>([...INTERRUPT_CLASSES, ...pinned])];
 }
@@ -56,14 +39,10 @@ const MEANINGS: Record<RejectCode, string> = {
   "needs-owner": "the request needs the owner's own answer",
 };
 
-/**
- * The only text a requester receives for a reject. The host writes it; no model text is ever added.
- */
 export function requesterNotice(code: RejectCode): string {
   return `Permission request rejected (${code}): ${MEANINGS[code]}. This decision is final for this request.`;
 }
 
-/** The policy both tiers read. Tier instructions and the request's evidence are added by the caller. */
 export const PERMISSION_POLICY_TEXT = [
   "You decide one permission request from an agent session. You only answer that request.",
   "",

@@ -9,17 +9,14 @@ const MAX_FILE_BYTES = 16 * 1024;
 const MAX_TOTAL_BYTES = 36 * 1024;
 const MAX_REQUESTED_PATHS = 8;
 const EXCLUDED = /^(?:\.git|node_modules|.*\.env(?:\..*)?|\.npmrc|\.pypirc|\.netrc|credentials?(?:\..*)?|secrets?(?:\..*)?|private|\.local|id_rsa|id_ed25519|[^/]+\.(?:pem|key))$/i;
-/** Emitted JavaScript specifiers and the TypeScript sources they are compiled from. */
 const TYPESCRIPT_SOURCES: Record<string, string[]> = { ".js": [".ts", ".tsx"], ".mjs": [".mts"], ".cjs": [".cts"], ".jsx": [".tsx"] };
 const RELEVANT_EXTENSIONS = new Set([".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".sh", ".bash", ".py", ".json", ".yaml", ".yml", ".toml", ".mk"]);
 const SCRIPT_RUNNERS = new Set(["node", "tsx", "ts-node", "bun", "deno", "python", "python3", "sh", "bash"]);
 const SAFE_PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn"]);
 
 export interface PermissionEvidenceFile {
-  /** Repository-relative path, or an @scratch/<index>/... path for a host-approved scratch file. */
   path: string;
   sha256: string;
-  /** Complete UTF-8 file content. Oversized files are omitted and named in limitations. */
   content: string;
 }
 
@@ -34,22 +31,11 @@ export interface CollectPermissionEvidenceInput {
   cwd: string;
   changedPaths: string[];
   baseCommit?: string;
-  /** Exact scratch directories approved by the host for this permission decision. */
   approvedScratchRoots?: string[];
-  /** Additional exact paths requested by the coordinator for read-only evidence collection. */
   requestedPaths?: string[];
-  /**
-   * The exact canonical directory to read inside, with `cwd` inside it. Without it the root is the nearest
-   * repository root at or above `cwd`, which can be an ancestor of a requester's own directory.
-   */
   root?: string;
 }
 
-/**
- * Collect bounded, read-only source evidence for a permission review. This does not evaluate
- * whether a command is safe or authorize it. Unsupported or incomplete command forms are called
- * out explicitly so the coordinator can escalate rather than infer missing source.
- */
 export function collectPermissionEvidence(input: CollectPermissionEvidenceInput): PermissionEvidenceSnapshot {
   const limitations: string[] = [];
   const files = new Map<string, PermissionEvidenceFile>();
@@ -72,15 +58,12 @@ export function collectPermissionEvidence(input: CollectPermissionEvidenceInput)
     if (tokens?.words.length) collectCommandEvidence(tokens.words, tokens.environmentAssignments, root, cwd, scratchRoots, input.changedPaths, files, limitations);
   }
   collectRequestedPaths(input.requestedPaths ?? [], root, cwd, scratchRoots, files, limitations);
-  // Include changed command/config sources even when the command itself is direct. This is
-  // evidence only; scope and whether the request may use a changed file remain owner decisions.
   for (const path of input.changedPaths) {
     if (looksLikeChangedCommandDefinition(path)) addFile(path, root, cwd, scratchRoots, files, limitations);
   }
   return snapshot(files, limitations);
 }
 
-/** Stable digest for comparing a freshly collected answer-time snapshot with the reviewed one. */
 export function permissionEvidenceDigest(snapshotValue: Pick<PermissionEvidenceSnapshot, "files" | "limitations">): string {
   const canonical = {
     files: [...snapshotValue.files].sort((a, b) => a.path.localeCompare(b.path)).map(({ path, sha256, content }) => ({ path, sha256, content })),
@@ -119,8 +102,6 @@ function completeCommand(prompt: Prompt, limitations: string[]): string | undefi
 }
 
 function splitLiteralCommandChain(command: string, limitations: string[]): string[] | undefined {
-  // A screen capture may visually wrap a command, but its text cannot distinguish that from a
-  // shell newline that starts another command. Keep newlines semantic and refuse both cases.
   if (/[\n\r\0]/.test(command) || /[|;<>`]/.test(command) || /\$\(|\$\{|\$[A-Za-z_]/.test(command)) {
     limitations.push("The command uses shell composition, expansion, or multiple lines; source collection is incomplete.");
     return undefined;
@@ -150,11 +131,9 @@ function splitLiteralCommandChain(command: string, limitations: string[]): strin
 
 interface TokenizedCommand {
   words: string[];
-  /** True only when the NAME= prefix was unquoted and unescaped in the original shell text. */
   environmentAssignments: boolean[];
 }
 
-/** A deliberately small shell-word parser; any shell composition or expansion is a limitation. */
 function tokenize(command: string, limitations: string[]): TokenizedCommand | undefined {
   if (/[\n\r\0]/.test(command) || /[|;&<>`]/.test(command) || /\$\(|\$\{|\$[A-Za-z_]/.test(command)) {
     limitations.push("The command segment uses unsupported shell syntax.");
@@ -295,8 +274,6 @@ function collectPackageCommand(manager: string, args: string[], root: string, cw
     limitations.push(`The ${manager} directory or workspace selection is not mapped to one local manifest.`);
     return;
   }
-  // Normalize the supported npm selectors before resolving command sources. Script arguments
-  // after -- cannot change npm's working directory and are intentionally excluded here.
   const selectors: string[] = [];
   for (let index = 0; index < options.length; index++) {
     const arg = options[index];
@@ -512,8 +489,6 @@ function collectStaticLocalReferences(file: PermissionEvidenceFile, root: string
   const parent = scratchMatch ? join(scratchRoots[Number(scratchMatch[1])] ?? root, scratchMatch[2]) : join(root, file.path);
   for (const ref of refs) {
     let candidate = resolve(dirname(parent), ref);
-    // TypeScript ESM sources import each other by their emitted `.js` names; read the source that
-    // the test or script actually runs under a TypeScript loader when no emitted file exists.
     const sourceExtensions = TYPESCRIPT_SOURCES[extname(candidate)];
     if (sourceExtensions && !existsRegular(candidate)) {
       const source = sourceExtensions.map(extension => candidate.slice(0, -extname(candidate).length) + extension).find(existsRegular);
@@ -534,14 +509,13 @@ function findRepositoryRoot(cwd: string): string {
   const realCwd = realpathSync(cwd);
   let current = realCwd;
   for (;;) {
-    try { lstatSync(join(current, ".git")); return current; } catch { /* continue upward */ }
+    try { lstatSync(join(current, ".git")); return current; } catch {}
     const parent = dirname(current);
     if (parent === current) throw new Error("repository root not found");
     current = parent;
   }
 }
 
-/** A given root is used as it is: no upward search, and it must already be a canonical directory. */
 function exactRoot(path: string): string {
   if (!isAbsolute(path) || realpathSync(path) !== path || !statSync(path).isDirectory()) throw new Error("The root is not a canonical directory.");
   return path;

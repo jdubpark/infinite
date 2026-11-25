@@ -3,7 +3,6 @@ import { z } from "zod";
 import { MissionProgressService, missionProgressQuerySchema, type MissionProgressSources } from "./mission-progress.js";
 import type { MissionService } from "./missions.js";
 
-/** All three reads use the host's paired-device middleware. */
 export function registerMissionReadRoutes(app: Pick<Express, "get">, sources: MissionProgressSources & {
   missions: Pick<MissionService, "list" | "get">;
 }) {

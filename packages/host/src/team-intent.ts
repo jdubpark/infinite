@@ -39,14 +39,11 @@ export type IntentCheckState = {
   failures: 0 | 1 | 2; checkerMemberId?: string; decisionId?: string; correctedMemberId?: string; reason?: IntentSkipReason;
   screened?: Partial<Record<IntentScreenDrop, number>>;
 };
-/** The part of teams.ts' Stored that the check reads and writes. */
 export type IntentHolder = { run: TeamRun; intentCheck?: IntentCheckState; objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable };
-/** Closures over TeamService's private methods, built in one field initializer in teams.ts (Task 9). */
 export type IntentHost = {
   prepare(holder: IntentHolder, role: "project-manager" | "intent-checker", feedback: string | undefined,
     onPrepared: (member: TeamMember) => void, prebuilt?: { prompt: string; profile: TeamModelProfile }): void;
   consume(holder: IntentHolder, member: TeamMember): void;
-  /** teams.ts' operation(holder, "result", perform, complete, member). `undefined` is a check that was stopped before it answered. */
   operation(holder: IntentHolder, perform: (signal: AbortSignal) => Promise<boolean | undefined>, complete: (clean: boolean | undefined) => void, member: TeamMember): void;
   save(holder: IntentHolder): void;
   event(holder: IntentHolder, text: string): void;
@@ -82,14 +79,11 @@ export const INTENT_EVENTS: {
   },
 };
 
-/** Team decisions a run may hold; the decision that would be the 41st is blocked before anything is written. */
 const DECISION_LIMIT = 40;
-/** A report with no items: applying it writes nothing but the entry, so it tells whether the log has room for an applied entry. */
 const PROBE_REPORT: IntentCheckReport = { kind: "intent-check", summary: "Probe.", items: [] };
 
 const now = (): string => new Date().toISOString();
 
-/** The run's pin (Task 13): true only for "on". A run created before this slice has no pin and never checks. */
 export function intentCheckDue(run: TeamRun): boolean {
   return run.intentCheck === "on";
 }
@@ -103,16 +97,11 @@ function statementOf(record: ObjectiveRecord): IntentStatement {
   return { objective: record.statement.objective, directions: record.statement.directions.map(item => item.text) };
 }
 
-/**
- * The intent check of one run. Holds an accepted-looking plan, runs a read-only checker, applies its report to the objective record,
- * and waits for the owner. Every failure or skip accepts the held plan once and says so in one fixed event (Trust boundary).
- */
 export class TeamIntent {
   goals?: GoalRecordPort;
 
   constructor(private readonly host: IntentHost) {}
 
-  /** In the plan's result callback, before tasks are set: true holds the plan. */
   hold(holder: IntentHolder, member: TeamMember): boolean {
     const run = holder.run;
     if (!intentCheckDue(run)) return false;
@@ -125,7 +114,6 @@ export class TeamIntent {
     return this.holdNew(holder, member);
   }
 
-  /** In the tick, where a new project manager would start: true when the check owns the run's next step. */
   step(holder: IntentHolder): boolean {
     const state = holder.intentCheck;
     if (!state) return false;
@@ -145,7 +133,6 @@ export class TeamIntent {
     }
   }
 
-  /** The report stored for an intent-checker member (teams.ts line 4895). Any kind but `intent-check` becomes fixed text (R2). */
   screen(holder: IntentHolder, member: TeamMember, report: TeamReport): TeamReport {
     if (member.role !== "intent-checker") return report;
     if (report.kind !== "intent-check") {
@@ -159,7 +146,6 @@ export class TeamIntent {
     return kept;
   }
 
-  /** Every report of an intent-checker member. Only the current checker's `intent-check` report is applied. */
   consume(holder: IntentHolder, member: TeamMember): void {
     const state = holder.intentCheck;
     if (!state || state.status !== "checking" || state.revision !== holder.run.revision || state.checkerMemberId !== member.memberId) return;
@@ -173,7 +159,6 @@ export class TeamIntent {
     this.host.operation(holder, signal => this.readOnly(member, signal), clean => this.complete(holder, checker, revision, report, clean), member);
   }
 
-  /** A member that stopped without a usable report: true for an intent checker (handled), false for every other role. */
   failed(holder: IntentHolder, member: TeamMember): boolean {
     if (member.role !== "intent-checker") return false;
     const state = holder.intentCheck;
@@ -181,7 +166,6 @@ export class TeamIntent {
     return true;
   }
 
-  /** The checker's context at launch, or null after the check was skipped and the member stopped. */
   context(holder: IntentHolder, member: TeamMember): IntentContext | null {
     const state = holder.intentCheck;
     if (!state || state.status !== "checking" || state.checkerMemberId !== member.memberId) return null;
@@ -202,7 +186,6 @@ export class TeamIntent {
     return built;
   }
 
-  /** The record stops waiting on this run's decision. Never throws (R3). */
   release(holder: IntentHolder, cause: "cancelled" | "replanned"): void {
     this.releaseWaits(holder, holder.intentCheck, cause);
   }
@@ -255,7 +238,6 @@ export class TeamIntent {
     return false;
   }
 
-  /** A skip after the plan was held: the plan is accepted by the next step, through its hold. */
   private lateSkip(holder: IntentHolder, state: IntentCheckState, reason: IntentSkipReason): void {
     state.status = "accepting";
     state.reason = reason;
@@ -264,14 +246,12 @@ export class TeamIntent {
     this.host.save(holder);
   }
 
-  /** The member is stopped before the skip's save, so a restart never finds it queued. */
   private stopChecker(holder: IntentHolder, state: IntentCheckState, member: TeamMember, reason: IntentSkipReason): void {
     member.status = "stopped";
     member.stoppedReason = INTENT_EVENTS.skipped[reason];
     this.lateSkip(holder, state, reason);
   }
 
-  /** One `intent-check.skipped` entry when the log has room. Best effort: the event is the record of the skip. */
   private writeSkipLog(holder: IntentHolder, reason: IntentSkipReason): void {
     try {
       const record = this.readyRecord(holder);
@@ -279,11 +259,9 @@ export class TeamIntent {
       const next = skipIntentCheck(record, { runId: holder.run.id, revision: holder.run.revision, reason, at: now() });
       if (next) this.writeRecord(holder, record, next);
     } catch {
-      // The log is full or the record cannot be written; the skip event still says what happened.
     }
   }
 
-  /** The reason an applied entry cannot be written now, or undefined when it can. Applies an empty report, which writes nothing. */
   private probeRoom(holder: IntentHolder, record: ObjectiveRecord): IntentSkipReason | undefined {
     try {
       applyIntentReport(record, PROBE_REPORT, {
@@ -311,7 +289,6 @@ export class TeamIntent {
     return true;
   }
 
-  /** While the checker exists, whatever its status, nothing starts (R1). A checker that is gone was never prepared; it is replaced without a failure. */
   private checkingStep(holder: IntentHolder, state: IntentCheckState): boolean {
     if (holder.run.members.some(member => member.memberId === state.checkerMemberId)) return true;
     state.status = "queued";
@@ -335,7 +312,6 @@ export class TeamIntent {
     return this.correct(holder, state, decision);
   }
 
-  /** The owner's answer becomes a direction; a delegate's answer only releases the questions. A failed write is one event, and the run goes on. */
   private recordAnswer(holder: IntentHolder, decision: TeamDecision): void {
     const owner = decision.answeredBy === "owner";
     try {
@@ -356,7 +332,6 @@ export class TeamIntent {
     }
   }
 
-  /** Prepares the corrected project manager once. A missing applied entry or record accepts the plan with a late skip. */
   private correct(holder: IntentHolder, state: IntentCheckState, decision?: TeamDecision): boolean {
     if (state.correctedMemberId !== undefined) return false;
     const record = this.readyRecord(holder);
@@ -375,7 +350,6 @@ export class TeamIntent {
     return true;
   }
 
-  /** Consumes the held plan again; its result callback calls `hold`, which ends the check. */
   private consumeHeld(holder: IntentHolder, state: IntentCheckState): boolean {
     const plan = holder.run.members.find(member => member.memberId === state.planMemberId);
     if (plan?.report?.kind !== "plan") {
@@ -387,10 +361,6 @@ export class TeamIntent {
     return true;
   }
 
-  /**
-   * One checker report at a time: the read-only check first, then the apply, both in the operation's completion. A check that a
-   * pause, cancel, halt, block, or recovery aborted gave no answer: undefined, not a failure of the checker.
-   */
   private readOnly(member: TeamMember, signal: AbortSignal): Promise<boolean | undefined> {
     return assertMemberReadOnly(member.cwd, member.baseCommit, this.host.prefix(), signal).then(() => true, () => signal.aborted ? undefined : false);
   }
@@ -398,8 +368,6 @@ export class TeamIntent {
   private complete(holder: IntentHolder, checker: string, revision: number, report: IntentCheckReport, clean: boolean | undefined): void {
     const state = holder.intentCheck;
     if (!state || state.status !== "checking" || state.revision !== revision || state.checkerMemberId !== checker || holder.run.revision !== revision) return;
-    // A stopped run, or one whose recovery is stopping its members, judges no checker and writes nothing: the resume or the
-    // recovery plans a new revision, which drops this state.
     if (clean === undefined || STOPPED.includes(holder.run.status) || holder.run.recovery?.status === "stopping") return;
     if (!clean) {
       this.failure(holder, state);
@@ -415,7 +383,6 @@ export class TeamIntent {
     let current = record;
     let waitingId: string | undefined;
     if (existing) {
-      // The entry was written before a restart and the state was not: the state follows it.
       waitingId = (existing.after as { inline: { decision?: string } }).inline.decision;
     } else {
       let applied: IntentApplied;
@@ -465,7 +432,6 @@ export class TeamIntent {
     };
   }
 
-  /** A checker's failure: one replacement on a fresh choice, then a skip with the held plan accepted (the second failure). */
   private failure(holder: IntentHolder, state: IntentCheckState): void {
     state.failures = (state.failures + 1) as 1 | 2;
     if (state.failures >= 2) {
@@ -479,7 +445,6 @@ export class TeamIntent {
     this.host.save(holder);
   }
 
-  /** Releases the decision's waiting questions. Never throws: a failure is one event, and the caller goes on (R3). */
   private releaseWaits(holder: IntentHolder, state: IntentCheckState | undefined, cause: IntentReleaseCause): void {
     if (state?.decisionId === undefined) return;
     try {
@@ -498,7 +463,6 @@ export class TeamIntent {
     return [...(this.host.project(run)?.team?.checks ?? [])];
   }
 
-  /** The record in its place: a goal's through the port, a standalone run's in its sealed holder. Unreadable is unavailable. */
   private stateOfRecord(holder: IntentHolder): ObjectiveState {
     return heldRecordState(holder, this.goals);
   }

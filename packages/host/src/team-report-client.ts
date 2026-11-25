@@ -6,7 +6,6 @@ import { missionReportArgumentsSchema, missionReportEnvelopeSchema, missionRepor
 export class ReportError extends Error {}
 export const MAX_TEAM_REPORT_BYTES = 64 * 1024;
 const bindingSchema = teamReportEnvelopeSchema.pick({ runId: true, memberId: true, revision: true }).strip();
-/** The worker's loopback hook capability for one team route: the report path or the entry path. */
 export function hookCapability(env: NodeJS.ProcessEnv, route: "team-report" | "team-entry") {
   const { INFINITE_HOOK_URL: url, INFINITE_HOOK_TOKEN: token, INFINITE_TEAM_ASSIGNMENT: assignment } = env;
   if (!url || !token || !assignment) throw new ReportError("Team reporting is unavailable in this process.");
@@ -32,7 +31,6 @@ function canonical(value: unknown): string {
   if (encoded === undefined) throw new ReportError("Invalid report value.");
   return encoded;
 }
-/** A custom UUIDv8 pins retries to the same validated assignment and report, across processes. */
 function reportIdentity(value: unknown) {
   const bytes = createHash("sha256").update("infinite-team-report:v1\0").update(canonical(value)).digest().subarray(0, 16);
   bytes[6] = (bytes[6] & 0x0f) | 0x80;
@@ -40,10 +38,6 @@ function reportIdentity(value: unknown) {
   const hex = bytes.toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
-/**
- * Accept a raw report or an explicit retry envelope, always bound to this worker's assignment. An envelope is read in
- * its recorded form, and its report must still satisfy the report tool, so an envelope cannot skip a required field.
- */
 export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = process.env): TeamReportEnvelope {
   const { binding } = hookCapability(env, "team-report");
   let envelope: TeamReportEnvelope;
@@ -59,17 +53,10 @@ export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = pr
   if (Buffer.byteLength(JSON.stringify(envelope)) > MAX_TEAM_REPORT_BYTES) throw new ReportError("Report exceeds 64 KiB.");
   return envelope;
 }
-/**
- * A question without its recommendation. A worker started before recommendations existed keeps the older report schema
- * in memory and answers 400 to a question that carries one. The reporter then sends the question once more without it,
- * under its own request identity, so the member can still ask. That worker cannot record a recommendation. The
- * reporter returns the envelope the worker recorded; a retry sends the original report again and falls back the same way.
- */
 function questionForOlderWorker(report: { kind: string }): Record<string, unknown> | undefined {
   if (report.kind !== "question" || !("recommendation" in report)) return undefined;
   return Object.fromEntries(Object.entries(report).filter(([key]) => key !== "recommendation"));
 }
-/** HTTP 204 is sent by the worker only after its authenticated journal append has succeeded. */
 export async function submitTeamReport(input: unknown, env: NodeJS.ProcessEnv = process.env): Promise<TeamReportEnvelope> {
   const { endpoint, token, binding } = hookCapability(env, "team-report");
   let envelope = createReportEnvelope(input, env);
@@ -96,7 +83,6 @@ async function postTeamReport(endpoint: URL, token: string, envelope: TeamReport
       body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000), redirect: "error",
     });
   } catch {
-    // A rejection can follow a durable append whose acknowledgement was lost, so delivery stays unconfirmed, not failed.
     throw new ReportError("Team report delivery was not confirmed: the report endpoint gave this process no answer. A sandbox or network policy may block local connections, or the acknowledgement was lost. Stop and request user attention; inspect this member's recorded report before retrying the identical report, and do not bypass or submit a different report.");
   }
 }
@@ -109,7 +95,6 @@ export function reportErrorMessage(error: unknown): string {
 
 export const missionAssignmentSchema = z.object({ missionId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1) }).strict();
 export type MissionReportEnvelope = z.infer<typeof missionReportEnvelopeSchema>;
-/** The mission coordinator's capability: the worker's hook channel and its recorded mission assignment. */
 function missionReportEnvironment(env: NodeJS.ProcessEnv) {
   const { INFINITE_HOOK_URL: url, INFINITE_HOOK_TOKEN: token, INFINITE_MISSION_ASSIGNMENT: assignment } = env;
   if (!url || !token || !assignment) throw new ReportError("Mission reporting is unavailable in this process.");
@@ -125,16 +110,10 @@ function missionReportEnvironment(env: NodeJS.ProcessEnv) {
   catch { throw new ReportError("Invalid mission assignment."); }
   return { endpoint, token, binding };
 }
-/** The recorded mission assignment, when this process reports for a mission coordinator. */
 export function missionAssignment(env: NodeJS.ProcessEnv = process.env) {
   try { return missionAssignmentSchema.parse(JSON.parse(env.INFINITE_MISSION_ASSIGNMENT ?? "")); }
   catch { return undefined; }
 }
-/**
- * Accept a raw mission report, the tool's `{ report, note }` arguments, or an explicit retry envelope, always bound to
- * this coordinator's assignment. A note joins the request identity; a report without one keeps its earlier identity.
- * An envelope's report must still satisfy the report tool, like the other two forms.
- */
 export function createMissionReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = process.env): MissionReportEnvelope {
   const { binding } = missionReportEnvironment(env);
   const object = input !== null && typeof input === "object" && !Array.isArray(input);
@@ -152,7 +131,6 @@ export function createMissionReportEnvelope(input: unknown, env: NodeJS.ProcessE
   if (Buffer.byteLength(JSON.stringify(envelope)) > MAX_TEAM_REPORT_BYTES) throw new ReportError("Report exceeds 64 KiB.");
   return envelope;
 }
-/** HTTP 204 is sent by the worker only after its authenticated journal append has succeeded. */
 export async function submitMissionReport(input: unknown, env: NodeJS.ProcessEnv = process.env): Promise<MissionReportEnvelope> {
   const { endpoint, token, binding } = missionReportEnvironment(env);
   let envelope = createMissionReportEnvelope(input, env);

@@ -10,19 +10,11 @@ import { activeMember, automaticRecoveryLimit, commitId, deliveredAtRevision, di
 import { runObjectiveNote, steerRunObjective } from "./objective-runs.js";
 import type { Action, PendingOperation, Stored, VerificationMutation } from "./teams.js";
 
-/**
- * What the recovery class uses of TeamService: part of the kernel, the owner-request receipts and the run view,
- * events, member preparation, the checks and eligibility rules that stay with the service, and the publication gate.
- * teams.ts builds it in `recoveryHost`; every member reads the service at the time of use.
- */
 export type RecoveryHost = Pick<TeamKernel, "commands" | "config" | "save" | "event" | "record" | "enqueue" | "assertRunPath" | "assertBudget" | "block"> & {
   readonly linear: LinearService | undefined;
-  /** Runs whose removal is under way (team-retention.ts). */
   readonly removingRuns: ReadonlySet<string>;
   confirmed(id: string): Promise<void>;
-  /** Whether this owner request was already applied; a different request under the same id throws. */
   replay(stored: Stored, operation: string, body: Action): boolean;
-  /** Admits the owner request and records its receipt; false when it was already applied. */
   mutation(stored: Stored, operation: string, body: Action): boolean;
   view(stored: Stored): TeamView;
   emit(stored: Stored, kind: string, keyParts: readonly (string | number)[], ids: { memberId?: string; taskId?: string; revision?: number }, data: Record<string, unknown>): void;
@@ -75,21 +67,11 @@ export function recoverableUnattributedResult(stored: Stored, pending: PendingOp
       (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status))) return false;
   return true;
 }
-/**
- * Delivery evidence may name the run branch (recorded before publication) or the branch the host published the head to.
- * Once a pull request records its branch, only that branch (INF-324).
- */
 export function deliveryBranchMatches(run: TeamRun, branch: string) {
   const recorded = pullRequestBranch(run);
   return recorded ? branch === recorded : branch === run.branch || branch === teamDeliveryBranch(run);
 }
 
-/**
- * Delivery reconciliation and the bounded recovery of blocked runs: the owner's delivery and verification
- * reconciliations, continue, and resume after a verification failure; the automatic delivery recovery that inspects
- * remote state before another attempt; and the project manager's recovery after a recoverable failure. Moved from
- * TeamService unchanged. TeamService holds one instance.
- */
 export class TeamRecovery {
   constructor(private readonly host: RecoveryHost) {}
   reconcileDelivery(id: string, input: TeamDeliveryReconcile) {
@@ -199,7 +181,6 @@ export class TeamRecovery {
           delete stored.pending;
         }
         this.host.event(stored, `Owner authorized a fresh delivery reconciliation at ${head} on ${teamDeliveryBranch(run)}; prior attempt ${previous.memberId} and its delivery report remain in team history.${failedReceipt ? ` Failed operation ${failedReceipt.pendingId} (${failedReceipt.failure.code}, ${failedReceipt.failure.at}) was preserved. Operator claim, not host-verified: ${JSON.stringify(failedReceipt.attestation.text.slice(0, 500))}` : ""}`);
-        // prepareMember persists the receipt and replacement member intent together, before any copy work.
         this.host.prepareMember(stored, "delivery", undefined, feedback, member => {
           stored.deliveryAttempt = { memberId: member.memberId, revision: member.revision, headCommit: head };
           run.deliveryRecovery = { attempts: recoveryAttempts, status: "planning", revision: run.revision, headCommit: head,
@@ -209,8 +190,6 @@ export class TeamRecovery {
           run.reason = undefined; run.blockCode = undefined;
         });
       } catch (error) {
-        // A synchronous failure has not started the copy. Restore the whole run so newly added
-        // receipt fields cannot survive a rejected request, including on the next disk restore.
         this.host.commands.get(id)?.abort(); this.host.commands.delete(id);
         stored.pending = pending;
         stored.run = priorRun;
@@ -248,7 +227,6 @@ export class TeamRecovery {
           (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status)))
         throw unavailable("Members, permission decisions, delivery state, or the operation are not fully quiescent for verification reconciliation.");
       if (pending.witness) {
-        // The host's own look comes before the operator's attestation: it refuses what it can see, and proves nothing more.
         const seen = await this.host.refreshOperationCensus(stored, true);
         if (seen === "running") throw new TeamError(409, "team-operation-running", `The host still sees ${stored.census?.recorded} process(es) that match its record of the interrupted check. Reconcile verification after they have exited.`);
         if (seen === "in-use") throw new TeamError(409, "team-directory-in-use", `The host sees ${stored.census?.using} process(es) using this run's directory. Reconcile verification after they have exited or left it.`);
@@ -432,9 +410,6 @@ export class TeamRecovery {
   }
   private async startAutomaticDeliveryRecovery(stored: Stored, trackingReady: boolean) {
     const { run } = stored, recovery = run.recovery, delivery = run.deliveryRecovery;
-    // Preparing the reconciliation member is itself an asynchronous workspace operation.
-    // Leave it running when the next scheduler tick sees its pending record; otherwise
-    // this recovery would block and abort the preparation it just started.
     if (recovery?.status === "stopping" && delivery?.status === "stopping" && stored.pending?.kind === "member" &&
         !stored.pending.failure && this.host.commands.has(run.id)) return true;
     if (this.host.publicationGate(stored, "delivery")) return true;

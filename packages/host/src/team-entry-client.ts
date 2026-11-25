@@ -9,7 +9,6 @@ export type EntryCall = { op: "post"; entry: unknown } | { op: "list"; query?: u
 const NOT_CONFIRMED = "Entry delivery was not confirmed: the endpoint gave no answer. A post may still be recorded; send the identical post again to learn its id.";
 const entryIdSchema = z.uuid();
 
-/** A local failure: a fixed path and class, never the request text. */
 function invalid(error: z.ZodError): EntryError {
   return new EntryError(`entry-invalid at ${refusalPath(error.issues[0]?.path ?? []) || "request"}: the request does not match the entry schema.`);
 }
@@ -18,7 +17,6 @@ function parsed<T>(schema: z.ZodType<T>, value: unknown): T {
   if (!result.success) throw invalid(result.error);
   return result.data;
 }
-/** The worker's envelope. A post's requestId is the identity of its entry, so a retry is the same request. */
 function envelopeFor(call: EntryCall, binding: EntryBinding): Record<string, unknown> {
   if (call.op === "post") {
     const entry = parsed(memberEntryPostSchema, call.entry);
@@ -28,7 +26,6 @@ function envelopeFor(call: EntryCall, binding: EntryBinding): Record<string, unk
   return { op: "get", ...binding, entryId: parsed(entryIdSchema, call.entryId) };
 }
 
-/** Validates locally, sends the envelope to the worker's `team-entry` route, and returns the worker's `entry` answer. */
 export async function submitEntryCall(call: EntryCall, env: NodeJS.ProcessEnv = process.env): Promise<Record<string, unknown>> {
   const { endpoint, token, binding } = hookCapability(env, "team-entry");
   const body = JSON.stringify(envelopeFor(call, binding));
@@ -54,7 +51,6 @@ export async function submitEntryCall(call: EntryCall, env: NodeJS.ProcessEnv = 
   return entry as Record<string, unknown>;
 }
 
-/** The message for a failed entry call. Only the worker's answer text and fixed texts appear. */
 export function entryErrorMessage(error: unknown): string {
   if (error instanceof EntryError || error instanceof ReportError) return error.message.slice(0, 2000);
   if (error instanceof z.ZodError) return invalid(error).message;

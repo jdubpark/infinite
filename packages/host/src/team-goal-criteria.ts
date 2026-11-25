@@ -3,10 +3,6 @@ import { TeamError } from "./team-workspace.js";
 
 const invalidReport = (message: string) => new TeamError(409, "goal-task-criteria-invalid", message);
 
-/**
- * Validates only plans from project managers whose prompt the host marked with a goal-record pin.
- * Old in-flight prompts can still submit their old shape, but their reports cannot attach unbound references.
- */
 export function validateGoalTaskCriterionRefs(
   tasks: readonly TeamTaskPlan[],
   pin: TeamGoalCriteriaPlanPin | undefined,

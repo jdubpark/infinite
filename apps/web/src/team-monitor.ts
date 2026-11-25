@@ -32,7 +32,7 @@ export type BriefingView = {
   summary?: RepositorySummaryView;
 };
 
-const roleOrder = ["project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"];
+const roleOrder = ["project-manager", "scout", "implementer", "integrator", "reviewer", "evaluator", "delivery"];
 
 function rank(member: MonitorMember, revision: number) {
   const role = roleOrder.indexOf(member.role);

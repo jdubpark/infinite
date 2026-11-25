@@ -43,6 +43,7 @@ import { outcomeBackfill } from "./outcome-backfill.js";
 import { outcomeProjector } from "./outcome-projector.js";
 import { EvalHost } from "./eval-host.js";
 import { EXCLUSION_REASONS, OUTCOMES_MODULE, outcomeModule, runOutcomeView, sweepExpiredOutcomes, type SignalRow } from "./outcome-store.js";
+import { deliveryPort } from "./verdict-delivery.js";
 import { registerVerdicts, sweepExpiredVerdicts } from "./verdict-store.js";
 import { RoutingRecorder } from "./routing-recorder.js";
 import { registerRouting, sweepExpiredDecisions } from "./routing-store.js";
@@ -269,9 +270,14 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   registerVerdicts(evidence, outbox);
   // The project signal inbox. Sources record facts into it; only consumers' own scheduler passes act on them.
   const signals = new SignalService({ store: evidence });
+  // Assigned once the team service exists: a landing the scan records composes the verdicts of settled runs again.
+  let lateReceipts: () => void = () => {};
   baseScanner = new BaseScanner({
     store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT,
-    onApplied: scan => { signals.recordScan(scan); },
+    onApplied: scan => {
+      signals.recordScan(scan);
+      lateReceipts();
+    },
   });
   outbox.registerProjector(outcomeProjector(evidence));
   const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager, cost: sessionId => sessionCostOf(usage.session(sessionId)) });
@@ -286,16 +292,22 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     events: outbox,
     capture: evalHost.capture,
     entries: blackboard,
-    onMerged: id => void projectSource.refresh(id).then(status => {
-      sourceChanged(id);
-      if (status.appliedHead && !status.pending) scheduleGraphForSession(id);
-    }, () => sourceChanged(id)),
+    delivery: deliveryPort(evidence),
+    onMerged: id => {
+      // A landing seen while the run was still delivering was refused by the late verdict; the status has settled now.
+      lateReceipts();
+      void projectSource.refresh(id).then(status => {
+        sourceChanged(id);
+        if (status.appliedHead && !status.pending) scheduleGraphForSession(id);
+      }, () => sourceChanged(id));
+    },
     ownerActive: run => {
       if (ownerServices.goals?.retainsTeamRun(run.id) || ownerServices.missions?.retainsSubteamRun(run.id)) return true;
       return Boolean(run.handoff && ownerServices.handoffs?.ownsActiveTeam(run.id));
     },
   });
   teams.useEvidence(evidence);
+  lateReceipts = () => { void teams.settleReceipts().catch(() => {}); };
   teams.useRouter(new RoutingRecorder({ store: evidence }));
   // The one-time outcome backfill. Its first tick runs here, before any timer can fire, so no member event of a run
   // that predates emission is projected before that run's rows. (The constructor above can already have emitted a
@@ -407,6 +419,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   ownerServices.missions = missions;
   // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
   const sweepEvidence = () => {
+    lateReceipts();
     evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
     sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays);
     sweepExpiredVerdicts(evidence, new Date().toISOString());

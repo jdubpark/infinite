@@ -64,6 +64,7 @@ import { TeamRegister, objectivePromptOf, registerPin, type RegisterState } from
 import { TeamReplay, type JudgeCreate, type ReplayCreate, type ReplayState } from "./team-replay.js";
 import { autonomyStartEvent, intentCheckPin, startMode, verdictPin } from "./evaluator-profiles.js";
 import { TeamVerdicts, type VerdictState } from "./team-verdicts.js";
+import type { DeliveryFact } from "./verdict-types.js";
 export { TeamError } from "./team-workspace.js";
 import { changeIndex, changedPathList, diffStat } from "./team-changes.js";
 import { recommendationLine, recommendationOutcome } from "./question-recommendation.js";
@@ -95,6 +96,8 @@ export type TeamServiceOptions = {
   entries?: Blackboard;
   /** Eval capture (INF-185). It observes only: it never changes a run, and its failure is swallowed. */
   capture?: CaptureSink;
+  /** The outcome ledger's delivery fact. Without it no run gets a late verdict. */
+  delivery?: (runId: string, head: string, since: string) => DeliveryFact | undefined;
 };
 export type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string>;
   /** When a record removal first waited for its events to reach the evidence store. */
@@ -376,7 +379,7 @@ export class TeamService {
     operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m) });
   private readonly intentChecks = new TeamIntent({ prepare: (s, r, f, o, p) => this.prepareMember(s as Stored, r, undefined, f, o, p), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t), block: (s, e, m) => this.block(s as Stored, e, m), project: run => this.config.projects.find(project => project.id === run.projectId), limited: () => this.limits.limited(), prefix: () => this.config.teams?.commandPrefix });
   private readonly objectiveTests = new TeamRegister({ holder: id => this.records.get(id), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], workspace: s => { try { this.assertRunPath(s as Stored, s.run.workspace); return s.run.workspace; } catch { return undefined; } }, enqueue: work => this.enqueue(work), save: s => this.save(s as Stored), event: (s, text) => this.event(s as Stored, text), prefix: () => this.config.teams?.commandPrefix, now: timestamp });
-  readonly verdicts = new TeamVerdicts({ holder: id => this.records.get(id), prepare: (s, o, p, f) => this.prepareMember(s as Stored, "evaluator", undefined, undefined, o, p, f), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t), emit: (s, d) => this.emitWith(s as Stored, "verdict.recorded", [d.verdictId], { revision: s.run.revision }, () => d), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], limited: () => this.limits.limited(), prefix: () => this.config.teams?.commandPrefix, register: this.objectiveTests, now: timestamp, uuid: randomUUID });
+  readonly verdicts = new TeamVerdicts({ holder: id => this.records.get(id), prepare: (s, o, p, f) => this.prepareMember(s as Stored, "evaluator", undefined, undefined, o, p, f), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), delivery: (runId, head, since) => this.options?.delivery?.(runId, head, since), event: (s, t) => this.event(s as Stored, t), emit: (s, d) => this.emitWith(s as Stored, "verdict.recorded", [d.verdictId], { revision: s.run.revision }, () => d), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], limited: () => this.limits.limited(), prefix: () => this.config.teams?.commandPrefix, register: this.objectiveTests, now: timestamp, uuid: randomUUID });
   private reconciledAt = 0;
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService, private readonly titler?: Pick<Readings, "requestTitle">, private readonly options?: TeamServiceOptions) {
     this.directory = join(config.stateDir, "teams");
@@ -973,6 +976,26 @@ export class TeamService {
   missionIdOf(id: string): string | undefined { return this.record(id).run.missionId; }
   /** Read goal ownership without building a view or updating external tracking. Undefined for an unknown run. */
   goalIdOf(id: string): string | undefined { return this.records.get(id)?.run.goal?.id; }
+  /** A run's revision and assessment without building a view. Undefined for an unknown run. */
+  assessmentOf(id: string): Pick<TeamRun, "revision" | "assessment"> | undefined {
+    const run = this.records.get(id)?.run;
+    return run === undefined ? undefined : { revision: run.revision, assessment: run.assessment };
+  }
+  /** Composes each settled run's verdict again where the outcome ledger now shows its delivery. The ids of the runs with a new verdict. */
+  settleReceipts(): Promise<string[]> {
+    return this.enqueue(() => {
+      const settled: string[] = [];
+      if (this.closed) return settled;
+      for (const stored of this.records.values()) {
+        try {
+          if (this.verdicts.settleReceipt(stored)) settled.push(stored.run.id);
+        } catch {
+          // One run's failed save does not stop the pass; the next pass finishes it.
+        }
+      }
+      return settled;
+    });
+  }
   /** The goal's one read of a run's reported numbers: only at a reviewed head, and never part of a view (check-observations.ts). */
   reviewedObservations(id: string) { return reviewedObservationsOf(this.records.get(id)); }
   /** Whether a run holds a delivery attempt that has not resolved, without building a view. False for an unknown run. */

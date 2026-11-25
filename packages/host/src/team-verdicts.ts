@@ -10,12 +10,12 @@ import type { TeamRegister } from "./team-register.js";
 import { memberLimit } from "./team-types.js";
 import type { TeamCommand, TeamMember, TeamModelProfile, TeamReport, TeamRun } from "./team-types.js";
 import { assertMemberReadOnly } from "./team-workspace.js";
-import { composeVerdict, verdictRecord } from "./verdict-compose.js";
+import { composeVerdict, deliveryReceiptOf, verdictRecord } from "./verdict-compose.js";
 import type { ComposedCriterion, ComposedVerdict } from "./verdict-compose.js";
 import { evaluatorPrompt, finalCheckRound, verdictContext } from "./verdict-prompt.js";
 import type { VerdictContext } from "./verdict-prompt.js";
 import type { VerdictEventData } from "./verdict-store.js";
-import type { AssessedState, RunAssessment, VerdictCounts, VerdictReason, VerdictReport } from "./verdict-types.js";
+import type { AssessedState, DeliveryFact, RunAssessment, VerdictCounts, VerdictReason, VerdictReport } from "./verdict-types.js";
 import type { Provider } from "./types.js";
 
 export { verdictPin } from "./evaluator-profiles.js";
@@ -62,6 +62,8 @@ export type VerdictState = {
   heldMemberId?: string;
   choice?: { profileId: string; provider: Provider; model?: string; family: string; sharedFamily: boolean; alsoReviewed: boolean };
   report?: VerdictReport; composed?: ComposedVerdict; reason?: VerdictReason;
+  /** The ledger's delivery fact at the newest verdict. It only moves forward: landed, then reverted. */
+  delivery?: "landed" | "reverted";
   written?: "wrote" | "log-full" | "record-unavailable" | "write-failed";
 };
 
@@ -75,6 +77,8 @@ export type VerdictHost = {
   consume(holder: VerdictHolder, member: TeamMember): void;
   operation(holder: VerdictHolder, perform: (signal: AbortSignal) => Promise<boolean | undefined>, complete: (clean: boolean | undefined) => void, member: TeamMember): void;
   save(holder: VerdictHolder): void;
+  /** The outcome ledger's delivery fact; undefined when the store cannot be read. */
+  delivery(runId: string, head: string, since: string): DeliveryFact | undefined;
   event(holder: VerdictHolder, text: string): void;
   /** The run event "verdict.recorded". */
   emit(holder: VerdictHolder, data: VerdictEventData): void;
@@ -87,6 +91,7 @@ export type VerdictHost = {
 };
 
 export const VERDICT_EVENTS = {
+  delivery: "The host observed this run's delivery on the base branch and composed the agent assessment again.",
   held: "The host is assessing this revision against the objective record before it settles.",
   recorded: (result: AssessedState, counts: VerdictCounts) =>
     `Agent assessment, provisional: ${result}. ${counts.met} met, ${counts.notMet} not met, ${counts.inconclusive} inconclusive, ${counts.pendingOwner} waiting for the owner.`,
@@ -110,6 +115,7 @@ export type VerdictDetail = {
 
 /** A verdict waits this long in `testing` for a register pass; then it goes on with the receipts that exist. */
 export const VERDICT_TESTING_WAIT_MS = 300_000;
+const DELIVERY_ORDER: readonly DeliveryFact[] = ["none", "landed", "reverted"];
 const STOPPED: readonly TeamRun["status"][] = ["paused", "cancelled", "blocked"];
 const EVENT_PROVIDERS: readonly Provider[] = ["claude", "codex", "opencode"];
 
@@ -174,6 +180,36 @@ export class TeamVerdicts {
     if (!state) return this.startReviewed(holder);
     if (state.kind !== "reviewed" || state.status === "done") return false;
     this.advance(holder, state);
+    return true;
+  }
+
+  /**
+   * Composes a settled run's verdict once more when the outcome ledger now shows its delivery. No evaluator runs. Returns false at the
+   * first check that fails (memory only, no store read, until the ledger is asked); true when it composed. The fact is saved with a new
+   * verdict id first, so a restart between the two saves composes the same verdict and writes its record entry once.
+   */
+  settleReceipt(holder: VerdictHolder): boolean {
+    const run = holder.run;
+    const state = holder.verdict;
+    if (run.verdicts !== "on" || (run.status !== "merged" && run.status !== "ready-for-review")) return false;
+    if (state === undefined || state.status !== "done" || state.kind !== "reviewed" || !this.current(run, state) || state.since === undefined || state.reason === "record-unavailable") return false;
+    const assessment = run.assessment;
+    if (assessment === undefined || assessment.revision !== state.revision || assessment.head !== state.head) return false;
+    const record = this.readyRecord(holder);
+    if (!record) return false;
+    // A restart came between the two saves: the new id and the fact are saved, the assessment is not.
+    if (state.verdictId === assessment.verdictId) {
+      if (!record.criteria.some(item => item.state === "active" && deliveryReceiptOf(item) !== undefined)) return false;
+      const fact = this.host.delivery(run.id, state.head, state.since);
+      if (fact === undefined || fact === "none") return false;
+      const landedCriterion = record.criteria.some(item => item.state === "active" && deliveryReceiptOf(item) === "landed");
+      const wanted = fact === "reverted" && !landedCriterion ? "landed" : fact;
+      if (DELIVERY_ORDER.indexOf(wanted) <= DELIVERY_ORDER.indexOf(state.delivery ?? "none")) return false;
+      state.delivery = wanted;
+      state.verdictId = this.host.uuid();
+      this.host.save(holder);
+    }
+    this.finish(holder, state, state.reason === undefined ? state.report : undefined, state.reason, assessment.verdictId);
     return true;
   }
 
@@ -465,7 +501,7 @@ export class TeamVerdicts {
    * Composes, writes the record (once), sets the assessment, emits the row, adds the fixed events, and saves. `report` is the
    * evaluator's answer; without it `reason` says why. A no-change verdict goes to `releasing`, every other to `done`.
    */
-  private finish(holder: VerdictHolder, state: VerdictState, report?: VerdictReport, reason?: VerdictReason): void {
+  private finish(holder: VerdictHolder, state: VerdictState, report?: VerdictReport, reason?: VerdictReason, supersedes?: string): void {
     const run = holder.run;
     const record = this.readyRecord(holder);
     let composed: ComposedVerdict;
@@ -480,7 +516,7 @@ export class TeamVerdicts {
         facts: this.factsOf(holder, state), changedPaths: this.changeListOf(holder, state),
         ...(report === undefined ? {} : { report: this.judgedOnly(state, record, report) }), ...(reason === undefined ? {} : { reason }),
       });
-      const outcome = this.writeRecord(holder, state, record, composed);
+      const outcome = this.writeRecord(holder, state, record, composed, supersedes);
       written = outcome.written;
       version = outcome.version;
     }
@@ -492,6 +528,7 @@ export class TeamVerdicts {
     run.assessment = this.assessmentOf(state, composed, at);
     if (record) this.host.emit(holder, this.rowOf(holder, state, composed, record, version, this.applied(composed)));
     this.events(holder, composed, written);
+    if (supersedes !== undefined) this.host.event(holder, VERDICT_EVENTS.delivery);
     state.status = state.kind === "no-change" ? "releasing" : "done";
     this.host.save(holder);
   }
@@ -512,12 +549,12 @@ export class TeamVerdicts {
   }
 
   /** Writes the verdict's entries once: an entry with this verdict's handle means a crash came between the write and the save. */
-  private writeRecord(holder: VerdictHolder, state: VerdictState, record: ObjectiveRecord, composed: ComposedVerdict): { written: "wrote" | "log-full" | "write-failed"; version: number } {
+  private writeRecord(holder: VerdictHolder, state: VerdictState, record: ObjectiveRecord, composed: ComposedVerdict, supersedes?: string): { written: "wrote" | "log-full" | "write-failed"; version: number } {
     const handle = `verdict:${state.verdictId}`;
     const existing = record.log.find(entry => entry.op === VERDICT_OPS.recorded && entry.handle === handle);
     if (existing) return { written: "wrote", version: existing.version };
     try {
-      const next = verdictRecord(record, composed, { verdictId: state.verdictId, kind: state.kind, revision: state.revision, head: state.head, at: this.host.now() });
+      const next = verdictRecord(record, composed, { verdictId: state.verdictId, kind: state.kind, revision: state.revision, head: state.head, at: this.host.now(), ...(supersedes === undefined ? {} : { supersedes }) });
       if (next === "log-full") return { written: "log-full", version: record.version };
       writeHeldRecord(holder, this.goals, record, next);
       return { written: "wrote", version: next.version };
@@ -567,12 +604,13 @@ export class TeamVerdicts {
   }
 
   /** Host facts at the verdict's head: this run's for a reviewed verdict, the parent run's for a no-change one (undefined when it is gone). */
-  private factsOf(holder: VerdictHolder, state: VerdictState): { checksPassed?: boolean; reviewApproved?: boolean } {
+  private factsOf(holder: VerdictHolder, state: VerdictState): { checksPassed?: boolean; reviewApproved?: boolean; delivery?: DeliveryFact } {
     const source = state.kind === "reviewed" ? holder : this.host.holder(state.receiptsFrom);
-    if (!source) return {};
+    const delivery = state.delivery === undefined ? {} : { delivery: state.delivery };
+    if (!source) return delivery;
     const passed = checksPassed(source, state.head);
     const approved = reviewApproved(source.run, state.head);
-    return { ...(passed === undefined ? {} : { checksPassed: passed }), ...(approved === undefined ? {} : { reviewApproved: approved }) };
+    return { ...delivery, ...(passed === undefined ? {} : { checksPassed: passed }), ...(approved === undefined ? {} : { reviewApproved: approved }) };
   }
 
   /**

@@ -7,7 +7,6 @@ import { loadConnection } from "../store/connection";
 import { Button } from "./Button";
 import { theme } from "../theme";
 
-/** Shell for screens that act on the machine named by the `machine` route parameter. */
 export function ConnectedScreen({ missing, render }: { missing: string; render: (connection: Connection, machine?: string) => ReactNode }) {
   const { machine } = useLocalSearchParams<{ machine?: string }>();
   const router = useRouter();

@@ -12,18 +12,6 @@ import { leaseFor, type SessionControlHandle } from "./useSessionControl";
 export const KEYS = ["enter", "escape", "up", "down", "interrupt"] as const;
 export type SteeringKey = (typeof KEYS)[number];
 
-/**
- * Text input and raw keys for one session, shared by the Brief and the
- * Terminal. An uncertain text send keeps its requestId, so "Retry" resends the
- * same request and the host cannot deliver it twice. The host refuses text
- * over an open dialog (`prompt-open`) unless `force` is set, which only the
- * Terminal does: there the person sees the dialog the text lands in.
- * Every send carries this phone's control lease, and nothing is sent without
- * one when the session `requiresControl`. The unsent text and an unconfirmed
- * request stay in memory under `draftKey` across navigation. `managed` makes
- * sends no-ops; callers set it only for a mission-run session with no provider
- * prompt open, so an open prompt can still be answered from the terminal.
- */
 export function useSteering(
   connection: Connection,
   id: string,
@@ -44,7 +32,6 @@ export function useSteering(
     return () => clearTimeout(timer);
   }, [receipt]);
 
-  /** Resolves true once the host confirms delivery to the terminal. */
   async function send(): Promise<boolean> {
     if (inFlight.current || options.managed) return false;
     inFlight.current = true;
@@ -77,7 +64,6 @@ export function useSteering(
       return true;
     } catch (e) {
       if (e instanceof ControlRefusal) {
-        // Refused before anything was typed. A refused retry says nothing about the first try.
         control.refused();
         if (!retrying) {
           settleDraft(draftKey, request.requestId, false);
@@ -89,12 +75,10 @@ export function useSteering(
         );
         onDelivered();
       } else if (e instanceof ApiError && e.code === "prompt-open") {
-        // Refused before anything was typed: the text stays in the box, unsent.
         settleDraft(draftKey, request.requestId, false);
         setError("A prompt is open. Answer it above, or reply instead.");
         onDelivered();
       } else if (e instanceof ApiError && e.code === "mission-managed") {
-        // The session became mission-managed while the text was in flight. The host refused before typing, so nothing is retried.
         settleDraft(draftKey, request.requestId, false);
         setError(e.message);
         onDelivered();

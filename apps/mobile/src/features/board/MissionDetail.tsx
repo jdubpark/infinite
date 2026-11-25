@@ -25,7 +25,6 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
   const poll = usePoll(async () => {
     const [mission, me, projects, board] = await Promise.all([
       api<Mission>(connection, `/missions/${id}`), api<Me>(connection, "/me"), api<ProjectGroupList>(connection, "/project-groups"),
-      // The board only adds attempt context; the screen renders without it.
       api<BoardData>(connection, "/board").catch(() => null),
     ]);
     return { mission, me, projects, board: board?.items ?? [], at: Date.now() };

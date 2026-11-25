@@ -15,11 +15,6 @@ function platform() {
   return Platform.OS === "ios" ? "ios" : "android";
 }
 
-/**
- * Registers this phone's Expo push token with the host. Callers must first
- * confirm the host reports `capabilities.push`, so hosts that cannot send never
- * trigger a permission prompt. The token is never logged.
- */
 export async function registerForPush(
   connection: Connection,
 ): Promise<PushState> {
@@ -47,14 +42,12 @@ export async function registerForPush(
   registered.set(connectionKey(connection), connection);
   tokenListener ??= Notifications.addPushTokenListener(async () => {
     try {
-      // Native token rotation invalidates the Expo token; never send APNs/FCM data as an Expo token.
       const next = (await Notifications.getExpoPushTokenAsync({ projectId })).data;
       await Promise.allSettled([...registered.values()].map(profile => api(profile, "/devices/push", {
         body: { token: next, platform: platform() },
       })));
       await SecureStore.setItemAsync(TOKEN_KEY, next);
     } catch {
-      /* retried on next launch */
     }
   });
   return "registered";

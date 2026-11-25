@@ -2,7 +2,6 @@ import { StyleSheet, Text, View } from "react-native";
 import { initials } from "../status";
 import { theme } from "../theme";
 
-/** Muted provider fills, as the web overview uses for provider initials; they identify, not theme. */
 const TONES: Record<string, { fill: string; ink: string }> = {
   claude: { fill: "#efe2d3", ink: "#74461f" },
   codex: { fill: "#e0e5ea", ink: "#2e3c4a" },
@@ -11,7 +10,6 @@ const TONES: Record<string, { fill: string; ink: string }> = {
 };
 const NEUTRAL = { fill: theme.colors.secondarySurface, ink: theme.colors.secondaryInk };
 
-/** An agent as an assignee: model or provider initials, with a live or waiting dot. */
 export function Avatar({ label, provider, size = 24, state }: { label: string; provider?: string; size?: number; state?: "live" | "attention" }) {
   const tone = (provider && TONES[provider]) || NEUTRAL;
   const dot = Math.max(7, size * 0.34);
@@ -23,7 +21,6 @@ export function Avatar({ label, provider, size = 24, state }: { label: string; p
   </View>;
 }
 
-/** Overlapping assignees, newest work first; the rest collapse into a count. */
 export function AvatarStack({ people, size = 22, max = 4 }: { people: { key: string; label: string; provider?: string; state?: "live" | "attention" }[]; size?: number; max?: number }) {
   const shown = people.slice(0, max);
   const rest = people.length - shown.length;

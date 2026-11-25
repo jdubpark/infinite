@@ -2,7 +2,6 @@ import type { ReactNode } from "react";
 import { Pressable, StyleSheet, Text, View, type ViewStyle } from "react-native";
 import { theme } from "../theme";
 
-/** A message over the screen that never takes space from its content. */
 export function FloatingNotice({
   message,
   position = "top",

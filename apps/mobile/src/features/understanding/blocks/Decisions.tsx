@@ -3,7 +3,6 @@ import type { DecisionSummary } from "@infinite/remote";
 import { formatTime } from "./format";
 import { styles } from "./styles";
 
-/** Questions the work raised, their options, and who answered them. */
 export function Decisions({ items }: { items: DecisionSummary[] }) {
   return <View style={styles.stack}>
     {items.map(decision => <DecisionCard key={decision.id} decision={decision} />)}

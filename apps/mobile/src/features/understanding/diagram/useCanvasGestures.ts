@@ -74,7 +74,6 @@ function localPoint(point: Point, origin: Point): Point {
   return { x: point.x - origin.x, y: point.y - origin.y };
 }
 
-/** One responder handles both pan and pinch, leaving short touches available to node taps. */
 export function useCanvasGestures({ contentWidth, contentHeight, frameWidth, frameHeight, frameOrigin = ORIGIN }: CanvasSize): {
   panHandlers: GestureResponderHandlers;
   transform: Animated.AnimatedProps<ViewStyle>["transform"];

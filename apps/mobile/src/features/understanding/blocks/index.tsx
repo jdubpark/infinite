@@ -16,7 +16,6 @@ import { styles } from "./styles";
 
 export { RichText } from "./RichText";
 
-/** Basis for block kinds that carry no basis of their own. Kinds whose items label themselves (facts, rich, links, tasks) are not listed. */
 const IMPLIED_BASIS: Partial<Record<WorkBlock["kind"], Basis>> = {
   components: "source",
   checks: "host",
@@ -25,7 +24,6 @@ const IMPLIED_BASIS: Partial<Record<WorkBlock["kind"], Basis>> = {
   citations: "source",
 };
 
-/** Renders one block of a work brief. Each block shows its own basis labels. */
 export function BlockView({ block, onOpenComponent, onOpenWork }: { block: WorkBlock; onOpenComponent?: (componentId: string) => void; onOpenWork?: (workId: string) => void }) {
   const implied = IMPLIED_BASIS[block.kind];
   const view = renderBlock(block, onOpenComponent, onOpenWork);

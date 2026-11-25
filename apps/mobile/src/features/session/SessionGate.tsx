@@ -7,10 +7,6 @@ import { loadConnection } from "../../store/connection";
 import { Button } from "../../components/Button";
 import { theme } from "../../theme";
 
-/**
- * Shared shell for the `/session/[id]` routes: reads the session id from the
- * route, loads the saved pairing, and sends an unpaired phone back to `/`.
- */
 export function SessionGate({
   render,
 }: {

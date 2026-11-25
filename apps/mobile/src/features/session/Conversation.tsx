@@ -7,7 +7,6 @@ import { theme } from "../../theme";
 
 const time = (ts: string) => new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 
-/** Your messages sit right on a selected-row fill; the agent's sit left on the secondary surface. */
 export function Conversation({ connection, id, onStaleChange }: { connection: Connection; id: string; onStaleChange?: (stale: boolean) => void }) {
   const cursor = useRef<string | number>("");
   const eventCursor = useRef(0);

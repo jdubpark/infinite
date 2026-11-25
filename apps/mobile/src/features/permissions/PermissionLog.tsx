@@ -10,26 +10,18 @@ import { theme } from "../../theme";
 import { Section, t } from "../teams/parts";
 import { logPath, verdictColors, verdictWords, type Candidate, type DecisionEntry, type LogFilter, type LogPage } from "./model";
 
-/**
- * The permission agent's decisions on this host, newest first, for the owner: the sessions above
- * their workspace's usual rate, the decisions offered as replay cases, and the log itself.
- * Nothing here changes a decision.
- */
 export function PermissionLog({ connection }: { connection: Connection }) {
   const router = useRouter(), machine = connectionKey(connection);
   const [filter, setFilter] = useState<LogFilter>("all");
-  // The poll keeps its last value when the filter changes, so each page carries the filter it answers.
   const log = usePoll(() => api<LogPage>(connection, logPath(filter)).then(page => ({ filter, page })), 15000, [connection, filter]);
   const current = log.data?.filter === filter ? log.data.page : null;
   const candidates = usePoll(() => api<{ candidates: Candidate[] }>(connection, "/permissions/candidates?limit=20"), 30000, [connection]);
-  // Older pages belong to the filter they were read under; a new filter starts from the newest page again.
   const [older, setOlder] = useState<{ filter: LogFilter; entries: DecisionEntry[]; next?: string } | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const extra = older?.filter === filter ? older : null;
   const next = extra ? extra.next : current?.next;
   const seen = new Set<string>();
   const rows = current ? [...current.entries, ...(extra?.entries ?? [])].filter(entry => !seen.has(entry.id) && Boolean(seen.add(entry.id))) : [];
-  // The rate flags do not depend on the filter, so the last page's flags stay valid while a new filter loads.
   const flags = log.data?.page.rateFlags ?? [];
   const open = (id: string) => router.push({ pathname: "/permissions/[id]", params: { id, machine } });
   function back() { if (router.canGoBack()) router.back(); else router.replace({ pathname: "/", params: { machine } }); }
@@ -39,7 +31,7 @@ export function PermissionLog({ connection }: { connection: Connection }) {
     try {
       const page = await api<LogPage>(connection, logPath(filter, next));
       setOlder({ filter, entries: [...(extra?.entries ?? []), ...page.entries], next: page.next });
-    } catch { /* The button stays; the next press reads the same page. */ }
+    } catch { }
     finally { setLoadingOlder(false); }
   }
   const top = <TopBar backLabel="Home" onBack={back} right={<LiveStatus online={log.online} loading={log.loading} seen={log.seen} stale={log.stale} />} />;

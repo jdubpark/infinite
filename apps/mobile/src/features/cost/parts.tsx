@@ -14,13 +14,6 @@ import {
   type AccountView, type DailyPoint, type ModelRow, type Money, type OwnerRating, type ProjectCostRow, type Rubric, type Suggestion, type TaskUsage,
 } from "./model";
 
-/**
- * The cost screens' pieces. Figures carry the information; the only words are labels. Two markers
- * recur and the legend explains them once: "≥" before a figure whose steps were partly unpriced,
- * and "—" where the provider gave no balance.
- */
-
-/** A figure that is never shown as exact when part of it is unpriced or unmeasured, and never as $0 when nothing was measured. */
 export function MoneyText({ value, style, prefixStyle }: { value: Money & { unmeasured?: number }; style?: StyleProp<TextStyle>; prefixStyle?: StyleProp<TextStyle> }) {
   const formatted = money(value);
   return <Text accessibilityLabel={formatted.none ? "unmeasured" : formatted.atLeast ? `at least ${formatted.text}` : formatted.text} style={[style, formatted.none && s.none]}>
@@ -28,7 +21,6 @@ export function MoneyText({ value, style, prefixStyle }: { value: Money & { unme
   </Text>;
 }
 
-/** This month's metered spend, its change from last month, and the fixed plan fees beside it. */
 export function Hero({ month, delta }: { month: { start: string; spent: Money; plansUsd: number; unmeasuredSessions: number }; delta: { text: string; direction: "up" | "down" | "flat" } | null }) {
   const withPlans = { usd: month.spent.usd + month.plansUsd, unpriced: month.spent.unpriced };
   return <View style={s.hero} accessible accessibilityLabel={`${monthName(month.start)}: ${money(month.spent).atLeast ? "at least " : ""}${usd(month.spent.usd)} metered${delta ? `, ${delta.text} vs last month` : ""}; ${usd(withPlans.usd)} with plans${month.unmeasuredSessions ? `; ${month.unmeasuredSessions} sessions unmeasured` : ""}`}>
@@ -40,7 +32,6 @@ export function Hero({ month, delta }: { month: { start: string; spent: Money; p
   </View>;
 }
 
-/** The one legend: account hues, then the two markers when the figures use them. */
 export function Legend({ entries, atLeast = false, unmeasured = 0 }: { entries: { id: string; label: string; color: string }[]; atLeast?: boolean; unmeasured?: number }) {
   return <View style={s.legend}>
     {entries.map(entry => <View key={entry.id} style={s.legendItem}><View style={[s.dot, { backgroundColor: entry.color }]} /><Text style={s.muted}>{entry.label}</Text></View>)}
@@ -49,7 +40,6 @@ export function Legend({ entries, atLeast = false, unmeasured = 0 }: { entries: 
   </View>;
 }
 
-/** The caption above the bars: the range total, or the tapped day split by account. */
 export function DayCaption({ day, days, accounts, colors }: { day?: DailyPoint; days: DailyPoint[]; accounts: string[]; colors: Record<string, string> }) {
   if (!day) return <Text style={s.caption}>Last 30 days · {usd(days.reduce((sum, item) => sum + item.usd, 0))}</Text>;
   return <View style={s.captionRow}>
@@ -60,14 +50,8 @@ export function DayCaption({ day, days, accounts, colors }: { day?: DailyPoint; 
   </View>;
 }
 
-/** The owner's hand on a subscription fee: `null` asks the host for its config default. The host's error text is shown as thrown. */
 export type PlanControl = { onSave: (planUsd: number | null) => Promise<void> };
 
-/**
- * One connected account: its balance or plan fee, this month's metered spend, and a 30-day trend.
- * With `plan`, the owner taps a subscription fee to edit it in place; the card refuses an amount
- * outside the host's rule before sending and otherwise shows what the host answered.
- */
 export function AccountCard({ account, color, spark, plan }: { account: AccountView; color?: string; spark?: number[]; plan?: PlanControl }) {
   const balance = account.balance;
   const name = accountName(account.id);
@@ -119,7 +103,6 @@ export function AccountCard({ account, color, spark, plan }: { account: AccountV
   </Card>;
 }
 
-/** A project ranked by accrued cost, with its month and a 30-day trend. */
 export function ProjectRow({ project, onPress }: { project: ProjectCostRow; onPress: () => void }) {
   return <Pressable accessibilityRole="button" accessibilityLabel={`Open ${project.name}: ${usd(project.month.usd)} this month, ${usd(project.total.usd)} accrued`} onPress={onPress} hitSlop={6}
     style={({ pressed }) => [s.row, pressed && s.pressed]}>
@@ -129,19 +112,16 @@ export function ProjectRow({ project, onPress }: { project: ProjectCostRow; onPr
   </Pressable>;
 }
 
-/** Dollars by kind of work; kinds that spent nothing are left out. */
 export function KindChips({ byKind }: { byKind: { goals: number; teams: number; sessions: number; briefings: number } }) {
   const items = [["Goals", byKind.goals], ["Runs", byKind.teams], ["Sessions", byKind.sessions], ["Briefings", byKind.briefings]] as const;
   return <View style={s.legend}>{items.filter(([, value]) => value > 0).map(([label, value]) => <Chip key={label} label={`${label} ${usd(value)}`} accessibilityLabel={`${label}: ${usd(value)}`} />)}</View>;
 }
 
-/** A task's metered cost on one line: dollars, tokens, and attempts beyond the first. */
 export function CostLine({ usage }: { usage?: TaskUsage }) {
   if (!usage) return null;
   return <Text style={t.note}><MoneyText value={usage} /> · {compactTokens(usage.tokens)} tok{usage.attempts > 1 ? ` · ${usage.attempts} attempts` : ""}</Text>;
 }
 
-/** The owner's 1–5 score for a task; the host records it as the owner's claim beside the reviewer's. */
 export function RatingControl({ value, disabled, onRate, busy, error }: { value?: OwnerRating; disabled: boolean; onRate: (score: 1 | 2 | 3 | 4 | 5) => void; busy: boolean; error: string }) {
   return <View style={s.rating}>
     <View style={s.ratingRow} accessibilityRole="radiogroup" accessibilityLabel="Your rating">
@@ -163,7 +143,6 @@ export function RubricLine({ rubric }: { rubric: Rubric }) {
   return <Text style={t.note}>Reviewer rubric · correctness {rubric.correctness.score} · clean {rubric.cleanliness.score} · extend {rubric.extensibility.score} · docs {rubric.docs.score}</Text>;
 }
 
-/** One model profile in a role: how often its tasks integrated, with the uncertainty, and what they cost. */
 export function ModelCard({ row, minAttempts }: { row: ModelRow; minAttempts: number }) {
   const mean = rubricMean(row.rubric);
   const facts = [

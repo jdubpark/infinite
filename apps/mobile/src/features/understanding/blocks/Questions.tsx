@@ -10,7 +10,6 @@ const PRIORITY: Record<WorkQuestion["priority"], { label: string; ink: string; s
   medium: { label: "Medium", ink: theme.colors.secondaryInk, surface: theme.colors.secondarySurface },
 };
 
-/** Open questions for a person, with the reason they matter and the lines they came from. */
 export function Questions({ items }: { items: WorkQuestion[] }) {
   return <View style={styles.stack}>
     {items.map((item, index) => {

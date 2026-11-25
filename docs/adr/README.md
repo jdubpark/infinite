@@ -16,4 +16,5 @@ Non-obvious architectural, protocol, security, concurrency, and compatibility de
 | [0011](0011-build-watch-graph-and-test-tooling.md) | Build, Native Workspace Watch, Code Graph, and Verification Tooling | `scripts/`, `.agents/skills/` | Accepted |
 | [0012](0012-web-client-ui-and-transport-invariants.md) | Web Client UI, Transport, Freshness, and Cost Accounting Invariants | `apps/web/` | Accepted |
 | [0013](0013-ubuntu-deployment-and-isolation.md) | Ubuntu Host Deployment, Service Isolation, and Encrypted Backups | `deploy/ubuntu/` | Accepted |
+| [0014](0014-mobile-client-invariants.md) | Mobile Client Invariants, Lifecycle, and Honesty Boundaries | `apps/mobile/` | Accepted |
 | [0016](0016-wave3-per-entity-orchestration-queues.md) | Per-Entity Orchestration Queues and Orchestration Service Invariants | `packages/host/` | Accepted |

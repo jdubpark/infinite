@@ -16,7 +16,6 @@ type BriefRow = { sessionId: string; status: TeamBriefView };
 
 const roleName = (role: string) => ROLE_NAMES[role as TeamMember["role"]] ?? role;
 
-/** Up to `limit` entries, then the rest on request. */
 function Bullets({ title, items, limit = 3 }: { title: string; items: string[]; limit?: number }) {
   const [open, setOpen] = useState(false);
   const shown = items.map(item => item.trim()).filter(Boolean);
@@ -32,11 +31,6 @@ function Bullets({ title, items, limit = 3 }: { title: string; items: string[]; 
   </View>;
 }
 
-/**
- * The team brief, in the briefing contract's order: outcome, review questions,
- * changes, check evidence, and gaps, with system shape and guidance folded. It is not completion or
- * approval.
- */
 export function UnderstandingSummary({ connection, team }: { connection: Connection; team: TeamView }) {
   const [asking, setAsking] = useState(false);
   const [askError, setAskError] = useState("");
@@ -44,7 +38,6 @@ export function UnderstandingSummary({ connection, team }: { connection: Connect
   const askingRef = useRef(false);
   const current = team.members.filter(member => member.revision === team.revision);
   const targets = (current.length ? current : team.members).slice(0, 6).map(member => member.sessionId).join(",");
-  // Each poll records when it ran, so the summary's age advances without reading the clock in render.
   const poll = usePoll(async () => {
     const rows: BriefRow[] = await Promise.all(targets.split(",").filter(Boolean).map(async sessionId => {
       try { return { sessionId, status: await api<TeamBriefView>(connection, `/sessions/${sessionId}/summary?status=1`) }; }
@@ -53,7 +46,6 @@ export function UnderstandingSummary({ connection, team }: { connection: Connect
     return { rows, at: Date.now() };
   }, 4000, [connection, targets]);
   const polled = poll.data?.rows ?? [];
-  // A summary written on request shows at once and stays until a poll returns a written one.
   const keep = asked && !briefText(polled.find(row => row.sessionId === asked.sessionId)?.status);
   const rows = keep ? [...polled.filter(row => row.sessionId !== asked.sessionId), asked] : polled;
   const chosen = chooseBrief(rows, summarySessionId(team.members, team.revision));
@@ -74,7 +66,6 @@ export function UnderstandingSummary({ connection, team }: { connection: Connect
     askingRef.current = true;
     setAsking(true);
     setAskError("");
-    // A repository brief can take minutes, longer than the shared client's request limit.
     const client = createRemoteClient(connection, { randomBytes: Crypto.getRandomBytes, requestTimeoutMs: 180000 });
     try {
       const summary = await client.request<TeamBriefView["summary"]>(`/sessions/${sessionId}/summary?after=0`, { headers: { "X-Infinite-Client": await loadClientId() } });
@@ -129,10 +120,8 @@ export function UnderstandingSummary({ connection, team }: { connection: Connect
   </Card>;
 }
 
-/** 14 lines of 16 px fit the 260 px screen box after its 12 px padding; more would clip the bottom prompt. */
 const SCREEN_LINES = 14;
 
-/** One agent's current screen and recent control events. */
 export function AgentLog({ connection, member, live, onOpen, onStaleChange }: { connection: Connection; member: TeamMember; live: boolean; onOpen: () => void; onStaleChange?: (stale: boolean) => void }) {
   const poll = usePoll(async () => {
     const detail = await api<SessionDetail>(connection, `/sessions/${member.sessionId}`);

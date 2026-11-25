@@ -49,6 +49,10 @@ test("encrypted relay creates and steers real sessions while retaining roles and
     const control = await owner.request<{ control: { id: string } }>(`/sessions/${session.id}/control`, { body: { action: "claim" }, headers: ownerHeaders });
     const steeringHeaders = { ...ownerHeaders, "X-Infinite-Control": control.control.id };
     await assert.rejects(controller.request(`/sessions/${session.id}/control`, { body: { action: "claim" }, headers: controllerHeaders }), (error: RemoteError) => error.status === 409 && error.code === "control-busy");
+    for (const action of ["renew", "release"] as const)
+      await assert.rejects(owner.request(`/sessions/${session.id}/control`, { body: { action }, headers: ownerHeaders }), (error: RemoteError) => error.status === 409 && error.code === "control-lost");
+    const renewedHttp = await owner.request<{ control: { id: string } }>(`/sessions/${session.id}/control`, { body: { action: "renew", leaseId: control.control.id, takeover: false }, headers: ownerHeaders });
+    assert.equal(renewedHttp.control.id, control.control.id);
     const input = { requestId: randomUUID(), text: "private steering sentinel", submit: true };
     await owner.request(`/sessions/${session.id}/input`, { body: input, headers: steeringHeaders });
     const next = await controller.request<{ control: { id: string } }>(`/sessions/${session.id}/control`, { body: { action: "claim", takeover: true }, headers: controllerHeaders });
@@ -100,10 +104,19 @@ test("encrypted terminals carry real PTY output and receipts, enforce leases and
     const refused = randomUUID();
     terminal.send({ op: "raw", requestId: refused, text: "must not arrive\r" });
     await waitFor(async () => pages.find(page => page.refusal?.requestId === refused), value => value?.refusal?.code === "control-lost");
+    for (const action of ["renew", "release"] as const) {
+      const missingLease = randomUUID();
+      terminal.send({ op: "control", requestId: missingLease, action });
+      await waitFor(async () => pages.find(page => page.refusal?.requestId === missingLease), value => value?.refusal?.code === "control-lost");
+    }
+    assert.deepEqual(closed, []);
     const claim = randomUUID();
     terminal.send({ op: "control", requestId: claim, action: "claim" });
     const control = await waitFor(async () => pages.find(page => page.requestId === claim), value => Boolean(value?.control?.id));
     const leaseId = control!.control!.id;
+    const legacyRenew = randomUUID();
+    terminal.send({ op: "control", requestId: legacyRenew, action: "renew", leaseId, takeover: false });
+    await waitFor(async () => pages.find(page => page.requestId === legacyRenew), value => value?.control?.id === leaseId);
     const text = "encrypted terminal input sentinel", requestId = randomUUID();
     terminal.send({ op: "raw", requestId, text: text + "\r", leaseId });
     await waitFor(async () => pages.find(page => page.receipt?.requestId === requestId), value => value?.receipt?.state === "delivered");

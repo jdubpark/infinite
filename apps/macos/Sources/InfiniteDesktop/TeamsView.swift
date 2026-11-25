@@ -1,6 +1,12 @@
 import SwiftUI
 import InfiniteCore
 
+func directionSourceLabel(_ source: JSON) -> String {
+    if source["kind"].string == "github-review" { return "Owner (GitHub review)" }
+    if source["kind"].string == "connector" { return source["name"].string.isEmpty ? "Connector" : source["name"].string }
+    return source.string == "coordinator" ? "Mission coordinator" : "You"
+}
+
 func teamColor(_ team: TeamRun) -> Color {
     switch team.projectState {
     case .pending: return team.status == "ready-for-review" ? Palette.review : Palette.attention
@@ -280,7 +286,7 @@ struct TeamDetailView: View {
             section("Directions and decisions") {
                 ForEach(Array(team.steering.enumerated()), id: \.offset) { _, entry in
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("\(entry["source"]["kind"].string == "connector" ? (entry["source"]["name"].string.isEmpty ? "Connector" : entry["source"]["name"].string) : entry["source"].string == "coordinator" ? "Mission coordinator" : "You") · direction · revision \(entry["revision"].int) · \(teamDate(entry["at"].string))").font(.caption).foregroundStyle(.secondary)
+                        Text("\(directionSourceLabel(entry["source"])) · direction · revision \(entry["revision"].int) · \(teamDate(entry["at"].string))").font(.caption).foregroundStyle(.secondary)
                         Text(entry["text"].string).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
                 }

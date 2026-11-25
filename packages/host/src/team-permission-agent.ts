@@ -312,12 +312,18 @@ export class TeamPermissionAgent {
     const member = run.members.find(item => item.memberId === memberId && item.sessionId === sessionId);
     const list = run.permissionAgentDecisions ??= [];
     if (list.some(item => item.requestId === outcome.request.id && item.result === handled.result)) return;
-    const decision: TeamPermissionAgentDecision = {
-      ...(handled.decisionId ? { decisionId: handled.decisionId } : {}), requestId: outcome.request.id, memberId, sessionId,
-      role: member?.role ?? outcome.request.requester.role as TeamMember["role"], ...(member?.taskId ? { taskId: member.taskId } : {}), promptId,
-      result: handled.result, ...(handled.code ? { code: handled.code } : {}), ...(handled.interruptClass ? { interruptClass: handled.interruptClass } : {}),
-      ...(handled.delivery ? { delivery: handled.delivery } : {}), at: timestamp(),
+    const base = {
+      requestId: outcome.request.id, memberId, sessionId,
+      role: member?.role ?? outcome.request.requester.role as TeamMember["role"],
+      ...(member?.taskId ? { taskId: member.taskId } : {}), promptId, at: timestamp(),
     };
+    const decision: TeamPermissionAgentDecision = handled.result === "allowed"
+      ? { ...base, result: "allowed", decisionId: handled.decisionId, delivery: handled.delivery }
+      : handled.result === "rejected"
+      ? { ...base, result: "rejected", decisionId: handled.decisionId, code: handled.code, delivery: handled.delivery }
+      : handled.result === "owner"
+      ? { ...base, result: "owner", decisionId: handled.decisionId, interruptClass: handled.interruptClass }
+      : { ...base, result: handled.result, ...(handled.decisionId ? { decisionId: handled.decisionId } : {}), ...(handled.code ? { code: handled.code } : {}), ...(handled.delivery ? { delivery: handled.delivery } : {}) };
     list.push(decision);
     if (list.length > 200) list.splice(0, list.length - 200);
     this.host.event(stored, agentResultEvent(decision));

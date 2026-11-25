@@ -11,7 +11,7 @@
     "prepare:codex": "node scripts/build-codex-handoff.mjs",
     "postinstall": "node scripts/prepare-pty.mjs && npm run build -w @infinite/attention && npm run build -w @infinite/remote",
     "build": "npm run build -w @infinite/attention && npm run build -w @infinite/remote && npm run build -w @infinite/host && npm run build -w @infinite/web",
-    "typecheck": "npm run typecheck --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present && tsc -p tsconfig.type-tests.json",
     "test": "npm run build -w @infinite/attention && npm run build -w @infinite/remote && node scripts/run-tests.mjs",
     "dev": "tsx packages/host/src/cli.ts dev",
     "host": "node packages/host/dist/cli.js",

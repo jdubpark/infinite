@@ -1010,6 +1010,18 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     const list = JSON.parse((await exec(process.execPath, [...cli, "list", "--json"])).stdout);
     assert.equal(list[0].id, sid); assert.equal(list[0].nativeArgs, undefined);
     const monitor = start(["monitor", sid.slice(0, 8)]);
+    const enterControl = async () => {
+      let from = monitor.output().length;
+      monitor.process.write("\r");
+      await wait(() => {
+        const seen = monitor.output().slice(from);
+        if (seen.includes("Interactive. Ctrl+G")) return true;
+        if (!seen.includes("Waiting for control acknowledgement")) return false;
+        from = monitor.output().length;
+        monitor.process.write("\r");
+        return false;
+      });
+    };
     await wait(() => monitor.output().includes("NATIVE READY"));
     monitor.process.write("ignored"); await new Promise(r => setTimeout(r, 200));
     assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), "");
@@ -1018,7 +1030,7 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     await wait(() => readFileSync(join(workspace, "input.txt"), "utf8") === "steer\x1b[A\r");
     monitor.process.write("\x07ignored again"); await wait(() => monitor.output().includes("Monitoring. Enter enables interaction;")); await new Promise(r => setTimeout(r, 200));
     assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), "steer\x1b[A\r");
-    monitor.process.write("\r"); await new Promise(r => setTimeout(r, 100));
+    await enterControl();
     monitor.process.write("\x05"); await wait(() => monitor.output().includes("Local draft"), 25000);
     monitor.process.write("preserve this unsent draft"); await wait(() => monitor.output().includes("preserve this unsent draft"));
     app.closeConnections(); await new Promise<void>(r => server.close(() => r()));
@@ -1028,7 +1040,7 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     await wait(() => monitor.output().includes("Reconnected to the same session"));
     assert.equal((await app.manager.state(sid)).pid, before.pid);
     assert.equal((await app.manager.list()).length, 1);
-    monitor.process.write("\r"); await new Promise(r => setTimeout(r, 120));
+    await enterControl();
     const draftOffset = monitor.output().length;
     monitor.process.write("\x05"); await wait(() => monitor.output().slice(draftOffset).includes("preserve this unsent draft"));
     monitor.process.write("\x18"); await new Promise(r => setTimeout(r, 100)); monitor.process.write("after");

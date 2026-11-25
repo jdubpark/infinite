@@ -1,7 +1,6 @@
 import AppKit
 import SwiftUI
 
-/// Whether the desktop client has a window a person can currently see.
 struct DisplayVisibility: Equatable {
     let appHidden: Bool
     let systemSleeping: Bool

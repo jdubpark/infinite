@@ -2,8 +2,6 @@ import SwiftUI
 import InfiniteCore
 import CryptoKit
 
-/// Read-only workspace facts. Requests run only while this page is visible and are
-/// fenced by the selected host and workspace before a response can replace the page.
 struct UnderstandingView: View {
     @ObservedObject var app: AppModel
     @State private var mode: Mode = .work
@@ -242,7 +240,7 @@ struct UnderstandingView: View {
                 if item["scope"].string == "complete", !item["sourceId"].string.isEmpty {
                     if item["kind"].string == "mission" {
                         Button("Open mission", systemImage: "arrow.up.right.square") {
-                            app.selectedMissionID = item["sourceId"].string
+                            app.openMission(item["sourceId"].string)
                         }
                     } else if item["kind"].string == "team" {
                         Button("Open team", systemImage: "arrow.up.right.square") {
@@ -649,7 +647,6 @@ struct UnderstandingView: View {
         }
     }
 
-    /// Stops polling for a missing/old route or unsupported response version to avoid a retry loop.
     private func refreshWhileVisible() async {
         loading = false
         guard let group = currentGroup else { return }

@@ -2,8 +2,6 @@ import SwiftUI
 import InfiniteCore
 import CryptoKit
 
-/// Source-linked finite-state models and ordered counterexample replay for one component.
-/// A check is an explicit owner action; polling only reads its recorded run.
 struct UnderstandingBehaviorView: View {
     @ObservedObject var app: AppModel
     let group: ProjectGroup

@@ -51,7 +51,6 @@ const LOG_USAGE = "Usage: infinite permissions log [--rejected] [--raised] [--wo
 const MARK_USAGE = "Usage: infinite permissions mark DECISION_ID --wrong --note TEXT [--request-id UUID]";
 const MARK_NOTICE = "A mark is a record only and changes no decision. To change later decisions, reopen the reject or change the workspace's direction.";
 
-/** An ISO timestamp with a zone, or a span back from now such as 30m, 24h or 7d. */
 export function sinceOption(value: string, now = Date.now()): string {
   const span = /^(\d{1,4})([mhd])$/.exec(value);
   if (span) return new Date(now - Number(span[1]) * { m: 60_000, h: 3_600_000, d: 86_400_000 }[span[2] as "m" | "h" | "d"]).toISOString();
@@ -95,18 +94,12 @@ function printEntry(entry: LogEntry) {
 }
 const REPLAY_USAGE = "Usage: infinite permissions replay --set FILE [--json] [--request-id UUID]";
 const REPLAY_POLL_MS = 2_000;
-/** How long the CLI keeps asking a host that does not answer a replay start or poll, from its last answer. */
 const REPLAY_CONTACT_MS = 120_000;
 
-/** A request the host did not answer in time. The host may still have acted on it. */
 function unanswered(error: unknown): boolean {
   return (error as { name?: unknown } | null)?.name === "TimeoutError";
 }
 
-/**
- * A request that got no answer because the connection failed. Fetch reports every network failure as a TypeError;
- * an answer that refuses the request is another error.
- */
 function dropped(error: unknown): boolean {
   return error instanceof TypeError;
 }
@@ -139,7 +132,6 @@ function printView(view: WorkspaceDelegationView) {
   for (const project of view.projects) console.log(`  ${clean(project.name)}  ${clean(project.projectId)}  ${clean(project.state)}`);
 }
 
-/** Live headless sessions, and the allow rules of served ones that a class rule outranks. */
 function printHeadless(status: HeadlessChannelStatus) {
   if (!status.sessions.length) return;
   console.log("Headless sessions:");
@@ -326,12 +318,9 @@ export async function handlePermissionsClientCommand(positional: string[], optio
       const issue = parsed.error.issues[0];
       throw new Error(`The replay set is invalid at ${clean(issue.path.join(".") || "the top level", 200)}: ${clean(issue.message, 300)}`);
     }
-    // A host without the decision core reports no readiness.
     const status = await api.json<PermissionStatus>("/permissions/status");
     if (!status.readiness) throw new Error("This host does not support permission replays. Upgrade the host.");
     console.error(`[Infinite] Replaying ${parsed.data.cases.length} cases · request ${requestId}`);
-    // A busy host can answer late while it works. A start under the same request ID returns the job it started, so both are asked again.
-    // A poll is a read of a job the host answered for a moment before, so it is also asked again when the connection drops.
     let answered = Date.now();
     const ask = async <T>(path: string, body?: unknown): Promise<T> => {
       for (;;) {
@@ -349,7 +338,6 @@ export async function handlePermissionsClientCommand(positional: string[], optio
     };
     let { job } = await ask<{ job: ReplayJob }>("/permissions/replays", { requestId, set });
     let shown = -1;
-    // A replay can take many model turns. The host runs it as a job; the CLI polls until it ends.
     while (job.state === "running") {
       if (job.done !== shown) { console.error(`[Infinite] ${Number(job.done)} of ${Number(job.total)} cases`); shown = job.done; }
       await delay(REPLAY_POLL_MS);

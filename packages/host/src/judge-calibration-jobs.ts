@@ -23,11 +23,6 @@ import { JUDGE_VOID_ENDINGS, type Judgement, type JudgeEnding } from "./judge-ty
 import type { TeamModelProfile } from "./team-types.js";
 import type { Config } from "./types.js";
 
-// The calibration job: an owner-created, finite measurement of one judge profile against known answers. It selects
-// resolved and unresolved pairs of past dev-set trials, hands the pump one judgement at a time (each pair in both label
-// orders), and stores the judge's fitness only when it completes with its pins intact. It writes only judge rows.
-// The owner's request is the budget: at most 2 x pairs x 3 judge sessions (Ruling 17).
-
 export const CALIBRATION_PAGE = 20, CALIBRATION_MINUTES_DEFAULT = 10, CALIBRATION_MINUTES_MIN = 2, CALIBRATION_MINUTES_MAX = 30;
 const DAY_MS = 86_400_000;
 const REQUEST_ID_MAX = 200, PROFILE_ID_MAX = 200, PROJECTS_MAX = 20;
@@ -60,29 +55,20 @@ const refuse = (status: CalibrationRefusal["status"], code: CalibrationRefusal["
 const IDLE: NextJudgement = { kind: "idle" };
 const isVoid = (ending: JudgeEnding | null) => ending !== null && JUDGE_VOID_ENDINGS.includes(ending);
 
-/** A UUID built from a seed, shaped as version 4, so the launchers' ID checks accept it. */
 function stableUuid(seed: string): string {
   const h = createHash("sha256").update(seed).digest("hex");
   const variant = "89ab"[Number.parseInt(h.charAt(16), 16) & 3] as string;
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
-/** A stable UUID for one slot, so a retried `begin` or `finish` names the same judgement. The judge report echoes it as `duelId`. */
 export function judgementIdOf(calibrationId: string, pairIndex: number, ordering: 0 | 1, attempt: number): string {
   return stableUuid(`${calibrationId}:${pairIndex}:${ordering}:${attempt}`);
 }
 
-/**
- * The grader's job for one project of a calibration. The grader keeps one base bundle per job, and a bundle holds one
- * project's repository, so two projects never share a job.
- */
 export function graderJobOf(calibrationId: string, projectId: string): string {
   return stableUuid(`${calibrationId}:grader:${projectId}`);
 }
 
-/**
- * The state of one ordering: its deciding row, a drop, or the attempt to run next. A drop, or three attempts spent on
- * void endings, ends the pair at once, and its other ordering never starts. A row in flight counts as the attempt that holds it. */
 function orderingState(rows: readonly JudgementRow[]): { drop: true } | { result: OrderingResult } | { attempt: number } {
   if (rows.some(row => row.state === "dropped")) return { drop: true };
   const decided = rows.find(row => row.state === "final" && !isVoid(row.ending));
@@ -91,7 +77,6 @@ function orderingState(rows: readonly JudgementRow[]): { drop: true } | { result
   return { attempt: rows.length };
 }
 
-/** Every pair's state from the stored rows. A failed judge answers `preferred: null`, which scores the pair incorrect. */
 function pairStates(count: number, rows: readonly JudgementRow[]): Pair[] {
   const slots = new Map<string, JudgementRow[]>();
   for (const row of rows) {
@@ -122,9 +107,7 @@ export class JudgeCalibrations {
   private readonly store: EvidenceStore;
   private readonly config: Pick<Config, "projects" | "eval" | "teams">;
   private readonly now: () => string;
-  /** The gate that held the last start, in memory only: empty after a restart until the next step. */
   private waiting: CalibrationWait | null = null;
-  /** The judgement that failed last before any session, and how many times in a row. */
   private released = { id: "", count: 0 };
 
   constructor(options: Options) {
@@ -165,7 +148,6 @@ export class JudgeCalibrations {
       return undefined;
     });
     if (wrote !== undefined) return "replay" in wrote ? this.viewOrRefusal(wrote.replay) : wrote;
-    // A reason found before this calibration existed is not its reason.
     this.waiting = null;
     return this.viewOrRefusal(calibrationId);
   }
@@ -188,11 +170,6 @@ export class JudgeCalibrations {
     })).map(view => view.status === "running" ? { ...view, waiting: this.waiting } : view);
   }
 
-  /**
-   * The next judgement of the running calibration: the first undecided ordering of the lowest undecided pair, once
-   * every gate of Ruling 18 holds. A moved pin cancels the job with `identity-changed`. Free slots are read only
-   * when a judgement would start. With no undecided pair left the calibration completes.
-   */
   async next(gates: TrialGates): Promise<NextJudgement> {
     const at = this.now();
     const pass = this.store.write(tx => this.step(tx, gates, at));
@@ -209,16 +186,10 @@ export class JudgeCalibrations {
     return pass.start;
   }
 
-  /** Remembers a gate the pump found after `next` answered `start`. */
   hold(reason: CalibrationWait): void {
     this.waiting = reason;
   }
 
-  /**
-   * Takes back a start that failed before any judge session: the row goes, the ordering keeps its attempt, and the reason
-   * is remembered when the row's calibration is still the running one. The CALIBRATION_RELEASES-th failure in a row of
-   * one judgement ends its attempt `void-host` instead, so a cause that belongs to one pair cannot hold the calibration.
-   */
   release(judgementId: string, reason: CalibrationWait): void {
     const count = this.released.id === judgementId ? this.released.count + 1 : 1;
     const last = count >= CALIBRATION_RELEASES;
@@ -246,7 +217,6 @@ export class JudgeCalibrations {
     this.store.write(tx => { startJudgement(tx, judgementId, sessionId); });
   }
 
-  /** Records one ending and completes the calibration after its last pair. A repeated call changes nothing. */
   finish(judgementId: string, outcome: JudgementOutcome): void {
     const at = this.now();
     this.store.write(tx => {
@@ -269,7 +239,6 @@ export class JudgeCalibrations {
     return row === undefined ? [] : [row.calibrationId];
   }
 
-  /** Expires the running calibration when its expiry has passed, and deletes the rows past their keep time. */
   sweep(): void {
     const at = this.now();
     this.store.write(tx => {
@@ -284,7 +253,6 @@ export class JudgeCalibrations {
     return found === undefined ? refuse(404, "unknown-calibration") : { calibration: found };
   }
 
-  /** The same view for a repeated request, `request-conflict` for another body, `calibration-active` while one runs. */
   private replayOrActive(db: EvidenceDb, request: CalibrationRequest): { replay: string } | CalibrationRefusal | undefined {
     const stored = db.get<{ calibration_id: string }>("SELECT calibration_id FROM judge_calibrations WHERE request_id = ?", request.requestId);
     if (stored !== undefined) {
@@ -295,18 +263,12 @@ export class JudgeCalibrations {
     return activeCalibration(db) === undefined ? undefined : refuse(409, "calibration-active");
   }
 
-  /** The named projects, or every project with an eval block, in ID order. Undefined when a named project has no eval block. */
   private poolOf(named: readonly string[] | undefined): string[] | undefined {
     const withEval = new Set(this.config.projects.filter(project => project.team?.eval !== undefined).map(project => project.id));
     if (named === undefined) return [...withEval].sort();
     return named.every(id => withEval.has(id)) ? [...named].sort() : undefined;
   }
 
-  /**
-   * Round-robin over the projects in ID order, a page of up to CALIBRATION_PAGE at a time. A pair is skipped when either
-   * trial's recorded profile has the judge's provider and model. The kept pairs are then ordered by project: the grader
-   * holds one project's bundle at a time, so the pairs of one project run together and its bundle is streamed once.
-   */
   private select(judge: TeamModelProfile, projects: readonly string[], want: number): { list: CalibrationPairRef[]; perProject: { projectId: string; pairs: number }[] } {
     type Cursor = { projectId: string; queue: CalibrationPairRef[]; after: string | null | undefined; taken: number };
     const cursors: Cursor[] = projects.map(projectId => ({ projectId, queue: [], after: undefined, taken: 0 }));
@@ -346,7 +308,6 @@ export class JudgeCalibrations {
     return { judgeKey, epoch: epochAt(db, judgeKey, at), promptVersion: judgePromptVersion(judge.provider) };
   }
 
-  /** An ending that carries no state: the tallies so far, and nothing a router could read. */
   private endOf(db: EvidenceDb, row: CalibrationRow, status: "cancelled" | "expired", reason: string): CalibrationEnd {
     const done = pairStates(row.payload.pairs.length, calibrationJudgements(db, row.calibrationId)).flatMap(pair => pair.kind === "done" ? [pair] : []);
     const summary = calibrationSummary(done);
@@ -357,8 +318,6 @@ export class JudgeCalibrations {
     const states = pairStates(row.payload.pairs.length, calibrationJudgements(tx, row.calibrationId));
     const pending = states.filter(pair => pair.kind === "pending").length;
     const summary = calibrationSummary(states.flatMap(pair => pair.kind === "done" ? [pair] : []));
-    // Fewer than CALIBRATION_MIN_PAIRS pairs can be counted, now or ever: the result cannot be `ok`, so stop spending.
-    // A request holds at least that many pairs, so only dropped pairs bring the count below it.
     const short = summary.counted + pending < CALIBRATION_MIN_PAIRS;
     if (pending > 0 && !short) return;
     finishCalibration(tx, row.calibrationId, { status: "completed", reason: short ? "pairs-dropped" : null, state: short ? "not-ok" : summary.state, counted: summary.counted, correct: summary.correct,
@@ -398,7 +357,6 @@ export class JudgeCalibrations {
     } };
   }
 
-  /** The gates of Ruling 18 that depend on the host, in order. Undefined when every one holds. */
   private waitReason(db: EvidenceDb, gates: TrialGates, judge: TeamModelProfile, projectId: string, rows: readonly JudgementRow[]): CalibrationWait | undefined {
     if (gates.halted(projectId)) return "halt";
     if (gates.hostLoadHeld) return "host-load";

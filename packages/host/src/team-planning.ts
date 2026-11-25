@@ -25,7 +25,6 @@ export function plannerCorrectionFeedback(run: TeamRun, message: string): string
   return [message, ...answers].join("\n\n");
 }
 
-/** Called after structural plan validation and before installing any of the tasks on the run. */
 export function plannedTasks(run: TeamRun, report: Extract<TeamReport, { kind: "plan" }>, revision: number): TeamTask[] {
   if (run.establishChecks && !run.verification && !report.verification)
     throw new TeamError(409, "verification-required", "The first plan must establish project verification commands before implementation.");

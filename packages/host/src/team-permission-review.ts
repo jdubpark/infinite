@@ -13,7 +13,6 @@ import { coordinatorRetiredReason } from "./team-permission-agent.js";
 import { TeamPermissionRecovery } from "./team-permission-recovery.js";
 import type { Stored } from "./teams.js";
 
-/** The owner authority a permission decision is bound to: pinned policy plus current steering and answers. */
 const ownerAuthorityHash = (run: TeamRun) => permissionAuthorityHash(run.permissions, ownerDirectionLines(run));
 const permissionRecoveryRoundLimit = 2;
 function sameRecoveryRequest(request: TeamPermissionRecoveryRequest, target: TeamMember, prompt: Prompt, revision: number) {
@@ -21,11 +20,6 @@ function sameRecoveryRequest(request: TeamPermissionRecoveryRequest, target: Tea
     request.promptId === prompt.id && request.promptHash === prompt.hash && request.evidenceHash === permissionEvidenceHash(prompt);
 }
 
-/**
- * The permission coordinator's review of a member's provider request: starting the review, its evidence requests,
- * the answer checks, and guarded delivery. Moved from TeamService unchanged. It drives the recovery layer and asks
- * the agent layer whether the agent now serves the run. TeamService holds one instance.
- */
 export class TeamPermissionReview extends TeamPermissionRecovery {
   async maybeStartPermissionReview(stored: Stored, target: TeamMember, observedState?: Awaited<ReturnType<Manager["state"]>>) {
     const run = stored.run;
@@ -34,9 +28,6 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
     if (run.members.some(member => {
       if (member.memberId === target.memberId || member.revision !== run.revision || member.role !== "permission-coordinator" || !activeMember(member)) return false;
       const decision = permissionCoordinatorDecision(run, member);
-      // Keep unknown assignments and live/uncertain decisions fenced. A confirmed terminal
-      // decision cannot authorize another answer, so its unavailable report-only member must
-      // not hold up review of a later target prompt.
       return !decision || !["answered", "escalated", "stale"].includes(decision.status);
     })) return false;
     let state;
@@ -193,7 +184,6 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
     const promptHash = prompt.hash;
     if (!promptHash || prompt.id !== (recovery?.promptId ?? prompt.id)) return stopRecovery("The refreshed prompt identity is incomplete or changed.");
     const evidenceHash = permissionEvidenceHash(prompt);
-    // A decision recorded before owner authority was pinned is retired as stale on restore; it does not hold the prompt.
     if (!evidenceOverride && (run.permissionDecisions ?? []).some(prior => !(prior.status === "stale" && !prior.authorityHash) &&
         prior.targetMemberId === target.memberId && prior.targetSessionId === target.sessionId && prior.promptId === prompt.id &&
         prior.promptHash === promptHash && prior.evidenceHash === evidenceHash)) {
@@ -288,12 +278,10 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
     decision.workspaceEvidenceHash = workspaceEvidenceHash;
     const acceptedChecks = this.host.requiredChecks(run) ?? null;
     if (decision.purpose === "answer" && option !== undefined && !recovery && !evidenceOverride) {
-      // Only a complete one-shot request outside a recovery can reuse a verdict; a diagnostic or recovery review never does.
       const reuseKey = permissionReuseKey({ policyHash: digest(run.permissions!), prompt, option, targetTaskId: target.taskId, changedPaths, acceptedChecks });
       decision.reuseKey = reuseKey;
       const earlier = [...(run.permissionDecisions ?? [])].reverse().find(item => {
         const sourceTarget = run.members.find(member => member.memberId === item.targetMemberId && member.sessionId === item.targetSessionId);
-        // The verdict carries over only under the same owner authority, reviewer profile and working directory it was given for.
         return item.reuseKey === reuseKey && item.revision === run.revision && item.workspaceEvidenceHash === workspaceEvidenceHash &&
           item.purpose !== "diagnose" && !item.recoveryRequestId &&
           item.authorityHash === decision.authorityHash && item.reviewerProfileHash === decision.reviewerProfileHash &&
@@ -316,7 +304,6 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
         return false;
       }
     }
-    // A reused verdict needs no reviewer process, so launch prerequisites are checked only for a fresh turn.
     if (!this.host.config.agents[reviewer.provider]) {
       this.escalatePermissionDecision(stored, decision, "The pinned permission reviewer provider is not configured on this host.", "The permission request remains with the user because its pinned permission reviewer provider is not configured on this host.");
       stopRecovery(decision.reason!);
@@ -324,7 +311,6 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
     }
     const waitingReviewer = run.members.find(member => member.revision === run.revision &&
       member.role === "permission-coordinator" && member.status === "waiting");
-    // The reviewer has no file tools, so its read-only workspace need not follow the integration head.
     const resumesExistingReviewer = Boolean(waitingReviewer?.nativeSessionId);
     try { this.host.assertBudget(run, !resumesExistingReviewer); }
     catch (error) {
@@ -631,7 +617,6 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
     const decision = permissionCoordinatorDecision(run, member);
     if (!decision) { this.host.block(stored, new TeamError(409, "invalid-permission-decision", "The permission coordinator has no recorded decision assignment.")); return; }
     if (decision.status !== "reviewing") {
-      // A reviewer whose process is not confirmed stopped stays unavailable; a late report does not release it.
       if (member.status !== "unavailable") member.status = member.revision === run.revision && !run.permissionsRevokedAt && !stored.halt &&
         !["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"].includes(run.status) ? "waiting" : "stopped";
       this.host.event(stored, "A late permission coordinator report was ignored because its one-shot review is no longer current.");
@@ -664,7 +649,6 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
       this.host.event(stored, "The permission request remains with the user.");
     }, member);
   }
-  /** Records how a linked permission-recovery request ended once its reviewer decision is final. */
   private recordPermissionReviewOutcome(stored: Stored, decision: TeamPermissionDecision,
     result: { status: "answered" | "uncertain" | "escalated"; reason?: string; receipt?: TeamPermissionDecision["receipt"] }, summary: string, diagnosticApproval: boolean) {
     const run = stored.run;
@@ -699,7 +683,6 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
       }
       const reason = await this.permissionAnswerInvalidReason(stored, decision, coordinator);
       if (reason) return { status: "escalated" as const, reason };
-      // The owner may have answered during the asynchronous checks above; nothing reviewed before that answer may deliver.
       if (decision.authorityHash !== ownerAuthorityHash(run))
         return { status: "escalated" as const, reason: "The owner's steering or answers changed while the target session was being checked." };
       if (decision.status !== "approved" || !run.permissions || run.permissionsRevokedAt || stored.halt || this.agentEligible(stored) ||
@@ -708,8 +691,6 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
           Date.now() >= Date.parse(decision.expiresAt))
         return { status: "escalated" as const, reason: "The permission decision changed while the target session was being checked." };
       decision.status = "answering";
-      // Marked in the same save that dispatches it: until this answer is conclusively settled the run does not
-      // switch to the permission agent, whether the answer times out, its fence fails, or the host restarts.
       stored.unfencedAnswers = [...new Set([...(stored.unfencedAnswers ?? []), decision.id])];
       if (coordinator) decision.reason = summary;
       this.host.save(stored);
@@ -718,14 +699,11 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
         if (!target) return { status: "escalated" as const, reason: "The target assignment disappeared before the answer." };
         const sourceDecision = decision.reusedFromDecisionId ? run.permissionDecisions?.find(item => item.id === decision.reusedFromDecisionId) : undefined;
         const sourceCoordinatorMemberId = sourceDecision?.coordinatorMemberId;
-        // A reused approval is delivered under the reviewer that produced the source verdict; the stored decision keeps
-        // none. A live view (not a copy) so the manager's final preflight still sees a status change made meanwhile.
         const deliveryDecision = decision.coordinatorMemberId ? decision : sourceCoordinatorMemberId
           ? new Proxy(decision, { get: (current, property, receiver) => property === "coordinatorMemberId"
             ? sourceCoordinatorMemberId : Reflect.get(current, property, receiver) })
           : undefined;
         if (!deliveryDecision) return { status: "escalated" as const, reason: "The recorded reviewer assignment for this reused approval is unavailable. The request remains with the user." };
-        // The permission agent can start to serve the run while this answer is under way; the manager reads this under its lease.
         const receipt = await this.host.manager.answerTeamPermission(decision.targetSessionId, decision.answerRequestId,
           assignment(target), deliveryDecision, () => !this.agentEligible(stored));
         return receipt.state === "delivered" && receipt.result === "closed"
@@ -741,7 +719,6 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
       if (["reviewing", "approved", "answering"].includes(decision.status)) { decision.status = result.status; decision.reason = result.reason ?? decision.reason; }
       else decision.reason = "The decision changed while the answer was in flight. Inspect the target session before acting.";
       if ("receipt" in result) decision.receipt = result.receipt;
-      // A closed prompt, or an answer the worker refused or that was never sent, cannot be typed later.
       if (result.status !== "uncertain") this.host.settleAnswerMark(stored, decision.id);
       if (coordinator) coordinator.status = "waiting";
       this.recordPermissionReviewOutcome(stored, decision, result, summary ?? decision.reason ?? "", false);

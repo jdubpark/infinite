@@ -1,8 +1,6 @@
 #!/usr/bin/env node
 import { EntryError, entryErrorMessage, submitEntryCall, type EntryCall } from "./team-entry-client.js";
 
-// For providers without an MCP channel. Reads one JSON request on stdin and prints the worker's answer.
-// This command receives only the per-worker hook capability, never an owner API key.
 const MAX_REQUEST_BYTES = 64 * 1024;
 
 function requestOf(input: unknown): EntryCall {

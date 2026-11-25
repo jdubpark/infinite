@@ -9,23 +9,15 @@ import {
 import { TeamError } from "./team-workspace.js";
 import type { Role } from "./types.js";
 
-/**
- * The owner's review of the permission journal: the decision log, marks, replay candidates and the rate flag.
- * Nothing here changes a decision. Every read that can carry a model's note needs the owner role, and a mark
- * needs the paired owner CLI.
- */
 export interface PermissionReviewDependencies {
-  /** Undefined when the journal will not open. Its routes then answer 503. */
   journal: PermissionJournal | undefined;
   requireRole: (roles: Role[]) => express.RequestHandler;
   requireOwnerCli: express.RequestHandler;
-  /** Current workspace holders by project id, for display names. A decision keeps the workspace id it was recorded under. */
   workspaces: { membershipSnapshot(): ReadonlyMap<string, { id: string; name: string }> };
   projects: () => ReadonlyArray<{ id: string; name: string }>;
   now?: () => number;
 }
 
-/** A log entry as the API serves it: the recorded entry with current display names and the session's rate flag. */
 export type PermissionLogEntryView = PermissionLogEntry & {
   workspaceName?: string;
   projectName?: string;
@@ -55,7 +47,6 @@ const markBodySchema = z.object({
 }).strict();
 const unavailable = { error: "The permission journal is unavailable on this host." };
 
-/** The sessions the rate rule flags now, or null when the journal cannot be read. Informational: nothing stops on it. */
 export function permissionRateFlags(journal: PermissionJournal | undefined, nowMs = Date.now()): PermissionRateFlag[] | null {
   if (!journal) return null;
   try { return journal.rateFlags({ now: new Date(nowMs).toISOString() }); }
@@ -84,7 +75,6 @@ export function registerPermissionReviewRoutes(app: express.Express, deps: Permi
     });
   };
 
-  // The log carries the model's note, so only the owner reads it. A controller or a viewer is refused outright.
   app.get("/api/permissions/log", owner, (req, res) => {
     if (!journal) return res.status(503).json(unavailable);
     const query = logQuerySchema.parse(req.query);
@@ -107,7 +97,6 @@ export function registerPermissionReviewRoutes(app: express.Express, deps: Permi
     return res.json({ entry: views([entry], permissionRateFlags(journal, now()))[0] });
   });
 
-  // A mark is a record only. It changes no decision, no replay and no lock. A retried request id returns the first mark.
   app.post("/api/permissions/marks", owner, requireOwnerCli, (req, res) => {
     if (!journal) return res.status(503).json(unavailable);
     const body = markBodySchema.parse(req.body);
@@ -123,7 +112,6 @@ export function registerPermissionReviewRoutes(app: express.Express, deps: Permi
     }
   });
 
-  // Marked-wrong decisions and reopened rejects, each with the label it implies. The owner accepts or drops them in the replay set.
   app.get("/api/permissions/candidates", owner, (req, res) => {
     if (!journal) return res.status(503).json(unavailable);
     const query = candidateQuerySchema.parse(req.query);
@@ -134,7 +122,6 @@ export function registerPermissionReviewRoutes(app: express.Express, deps: Permi
   });
 }
 
-/** The journal validates its own input with TypeError. Here that is the caller's request, not a host fault. */
 function invalidAsBadRequest<T>(read: () => T): T {
   try { return read(); }
   catch (error) {

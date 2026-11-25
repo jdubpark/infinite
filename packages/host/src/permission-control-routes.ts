@@ -7,10 +7,6 @@ const assignment = z.string().min(1).max(500).regex(/^[^\x00-\x1f\x7f]+$/, "An a
 const reopenBodySchema = z.object({ requestId: z.uuid(), decisionId }).strict();
 const unlockBodySchema = z.object({ requestId: z.uuid(), assignment }).strict();
 
-/**
- * The owner's controls over permission rejects and locks. `guards` are the host's owner-CLI checks, the same
- * as the delegation routes. Neither route allows a request.
- */
 export function registerPermissionControlRoutes(
   app: express.Express,
   options: { guards: express.RequestHandler[]; controls: PermissionOwnerControls | undefined },

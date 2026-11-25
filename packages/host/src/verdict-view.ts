@@ -9,7 +9,6 @@ export type GoalVerdictView = {
   cycle: number; teamId: string; verdictId: string; kind: "reviewed" | "no-change"; head: string; at: string;
   label: typeof VERDICT_LABEL;
   result: AssessedState; evaluatorResult?: AssessedState; differs: boolean; reason?: VerdictReason; counts: VerdictCounts; progress: number;
-  /** The owner outcome that names this verdict. */
   owner?: { result: "achieved" | "not-achieved" | "inconclusive"; agrees?: boolean };
   criteria: {
     id: string; producer: "host" | "evaluator" | "owner"; state: ComposedState;
@@ -18,7 +17,6 @@ export type GoalVerdictView = {
     handles?: string[]; note?: string;
   }[];
   evaluator?: { profileId: string; family: string; sharedFamily: boolean; alsoReviewed: boolean };
-  /** `expired`: the run's record is gone; only the cycle's summary remains. */
   detail: "available" | "expired";
 };
 
@@ -44,7 +42,6 @@ function criterionView(criterion: VerdictDetail["criteria"][number]): Criterion 
   };
 }
 
-/** Agreement is met with achieved, or not-met with not-achieved; any other pair leaves it absent. */
 function ownerOf(goal: ProductGoal, verdictId: string, result: AssessedState): GoalVerdictView["owner"] {
   const outcome = [...goal.outcomes].reverse().find(item => item.verdictId === verdictId);
   if (outcome === undefined) return undefined;
@@ -52,10 +49,6 @@ function ownerOf(goal: ProductGoal, verdictId: string, result: AssessedState): G
   return { result: outcome.result, ...(agrees ? { agrees: true } : {}) };
 }
 
-/**
- * The goal's cycle assessments joined with each run's detail while the run's record lasts, and with the owner's answers.
- * Pure: it reads one goal view and at most one in-memory detail per cycle.
- */
 export function goalVerdictsView(goal: ProductGoal, details: (teamId: string) => VerdictDetail | undefined): { verdicts: GoalVerdictView[] } {
   const verdicts: GoalVerdictView[] = [];
   for (const cycle of goal.cycles) {

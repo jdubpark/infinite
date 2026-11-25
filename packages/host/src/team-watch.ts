@@ -2,7 +2,6 @@ import { recommendationLine, type QuestionRecommendation } from "./question-reco
 
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 
-/** An open team question as the CLI prints it: its text, the recommendation line when it has one, then its numbered options. */
 export function openQuestionLines(question: { id: unknown; question: unknown; options?: unknown; recommendation?: QuestionRecommendation }): string[] {
   const options: unknown[] = Array.isArray(question.options) ? question.options : [];
   return [`Question ${clean(question.id)}: ${clean(question.question)}`,
@@ -68,7 +67,6 @@ export function teamMonitorText(team: any, checkedAt = "", detach = false): stri
   return lines.join("\n");
 }
 
-/** Interactive watch redraws one card. A pipe prints again only when that card changes. */
 export function teamWatchFrame(previous: string | null, next: string, tty: boolean): string | null {
   if (tty) return `\x1b[H\x1b[J${next}\n`;
   if (previous === next) return null;
@@ -98,7 +96,6 @@ export type TeamBriefStatus = {
 };
 export type TeamBriefRow = { sessionId: string; status: TeamBriefStatus; fetchError?: string };
 
-/** Keep a session's last written brief visible when its refresh fails. */
 export function failedTeamBriefRow(sessionId: string, error: string, previous: TeamBriefRow[] = []): TeamBriefRow {
   const prior = previous.find(row => row.sessionId === sessionId && row.status.summary);
   return prior ? { ...prior, fetchError: error } : { sessionId, status: { state: "unknown", error }, fetchError: error };
@@ -133,7 +130,6 @@ function briefWhen(status: TeamBriefStatus | undefined): string {
   return status?.summary?.repository?.generatedAt || status?.summary?.at || "";
 }
 
-/** "Oct 18, 10:58", plus "(4 min ago)" when `now` is given. A watch that prints only on change omits `now`. */
 export function briefTime(iso: string, now?: number): string {
   const time = Date.parse(iso);
   if (!iso || Number.isNaN(time)) return clean(iso);
@@ -144,7 +140,6 @@ export function briefTime(iso: string, now?: number): string {
   return `${stamp} (${age})`;
 }
 
-/** Prefer the coordinator's written brief, then the newest written brief, then the coordinator's status. */
 export function chooseTeamBrief(rows: { sessionId: string; status: TeamBriefStatus }[], coordinatorSessionId?: string) {
   const written = rows.filter(row => briefBody(row.status));
   const coordinator = rows.find(row => row.sessionId === coordinatorSessionId);
@@ -159,7 +154,6 @@ export function summaryMember(team: any) {
   return current.find(member => member?.role === "project-manager") ?? current[0] ?? orderedTeamMembers(team)[0];
 }
 
-/** A titled list. An item given as parts prints its first part on the marker line and the rest beneath it. */
 function section(lines: string[], title: string, items: (string | string[])[], numbered = false) {
   const shown = items.map(item => (Array.isArray(item) ? item : [item]).map(part => clean(part).trim()).filter(Boolean)).filter(parts => parts.length);
   if (!shown.length) return;
@@ -172,7 +166,6 @@ function section(lines: string[], title: string, items: (string | string[])[], n
   if (shown.length > 8) lines.push(`  + ${shown.length - 8} more`);
 }
 
-/** Decisions first: they are the only part of the card that waits on the person reading it. */
 function decisionLines(lines: string[], team: any) {
   const open = (team?.decisions ?? []).filter((question: any) => !question?.answer && question?.revision === team?.revision);
   if (!open.length) return;
@@ -192,17 +185,11 @@ function teamHeading(team: any, view: string) {
   return [`${clean(team?.id)} · ${clean(team?.status)} · revision ${clean(team?.revision)} · ${view}`, short(objective || team?.title, 500)];
 }
 
-/** Whether the chosen row has no written brief and Understanding can be asked for one. */
 export function canAskForBrief(team: any, rows: { sessionId: string; status: TeamBriefStatus }[]) {
   const chosen = chooseTeamBrief(rows, summaryMember(team)?.sessionId);
   return Boolean(chosen && !briefBody(chosen.status) && (chosen.status.state === "empty" || chosen.status.state === "failed"));
 }
 
-/**
- * The default team card: decisions, then the generated reading in the order the briefing contract
- * uses (outcome, system shape, ranked review questions, changes, checks, guidance, gaps).
- * The last line is the key bar or the next command; a watch pins it below the scrolled body.
- */
 export function teamSummaryText(team: any, rows: { sessionId: string; status: TeamBriefStatus }[], checkedAt = "", interactive = false, now?: number, repainted = false): string {
   const lines = teamHeading(team, "summary");
   if (team?.reason) lines.push(`Reason: ${short(team.reason, 400)}`);
@@ -246,8 +233,6 @@ export function visibleScreen(value: unknown, maxLines = 24): string {
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "");
-  // The recorded screen already has the terminal's fixed height; keeping its blank rows (rather than
-  // trimming them) keeps the block's height steady between polls without padding a short screen.
   const lines = plain.split(/\r?\n/).slice(-maxLines);
   return lines.some(line => line.trim()) ? lines.join("\n") : "No screen is recorded for this agent.";
 }
@@ -265,7 +250,6 @@ const keys: Record<string, TeamWatchCommand> = {
   j: "down", k: "up", " ": "pageDown", g: "top", G: "bottom",
 };
 
-/** Last key in a raw terminal chunk. Ctrl+C detaches even when more bytes follow. */
 export function teamWatchCommand(chunk: string): TeamWatchCommand | null {
   let action: TeamWatchCommand | null = null;
   const text = String(chunk);
@@ -284,7 +268,6 @@ function clock(iso: unknown) {
   return Number.isNaN(time) ? short(iso, 24) : new Date(time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
-/** One agent's screen and recent control lines, under a strip that names every agent you can switch to. */
 export function teamLogsText(team: any, agents: any[], member: any, screen: unknown, events: { at?: string; text?: string }[], checkedAt = "", interactive = false, width = 80): string {
   const place = Math.max(0, agents.findIndex(item => item?.memberId === member?.memberId));
   const lines = teamHeading(team, `review logs · agent ${place + 1} of ${Math.max(agents.length, 1)}`);
@@ -308,7 +291,6 @@ export function teamLogsText(team: any, agents: any[], member: any, screen: unkn
   return lines.join("\n");
 }
 
-/** Word-wraps each line to `width`, keeping its indent and hanging continuation lines under a bullet or number. */
 export function wrapText(text: string, width: number): string[] {
   const columns = Math.max(1, Math.floor(width) || 80);
   const out: string[] = [];
@@ -335,10 +317,6 @@ export function wrapText(text: string, width: number): string[] {
 
 const heading = /^(?:[A-Z][A-Z ]+[A-Z])(?= \(\d+\)$| · |$)/;
 
-/**
- * One full-screen frame: the wrapped body scrolled to `offset`, with the card's last line pinned as
- * a key bar. The frame never writes past the last row, so the terminal does not scroll.
- */
 export function teamWatchScreen(text: string, { rows, columns, offset, color, status = "" }: { rows: number; columns: number; offset: number; color: boolean; status?: string }) {
   const all = text.split("\n");
   const footer = all.pop() ?? "";

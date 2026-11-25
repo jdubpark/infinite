@@ -4,15 +4,12 @@ import { teamDeliveryBranch, UNKNOWN_DELIVERY_BRANCH } from "./team-prompts.js";
 import { TeamError } from "./team-workspace.js";
 import type { TeamDelivery, TeamMember, TeamRun } from "./team-types.js";
 
-/** Contributor families that the host can attribute to one exact integrated head. */
 export type DeliveryReviewLineage = {
   headCommit: string;
   families: string[];
-  /** The host could not prove the complete contributor set for this head. */
   unknown: boolean;
 };
 
-/** The host's accepted review report, pinned to its reviewer, revision, round, and exact head. */
 export type DeliveryReviewApproval = {
   reviewerMemberId: string;
   revision: number;
@@ -22,7 +19,6 @@ export type DeliveryReviewApproval = {
 
 export const REVIEWER_FAMILY_REQUIRED = "reviewer-family-required" as const;
 
-/** Preserve the host's existing final delivery policy, checked-head review, and branch validation. */
 export function assertReviewedDelivery(run: TeamRun, checkHead: string | undefined, configured: TeamDelivery | undefined): void {
   if (!run.delivery || !configured || digest(configured) !== digest(run.delivery))
     throw new TeamError(409, "delivery-policy-changed", "The repository delivery policy changed or was removed; publication is blocked.");
@@ -35,9 +31,6 @@ export function deliveryReviewLineageAtBase(headCommit: string): DeliveryReviewL
   return { headCommit, families: [], unknown: false };
 }
 
-/**
- * Extend attribution only from the exact prior head. A missing or mismatched record is unprovable and stays so.
- */
 export function advanceDeliveryReviewLineage(
   current: DeliveryReviewLineage | undefined,
   input: { headBefore: string; headAfter: string; contributorFamilies: readonly (string | undefined)[] },
@@ -56,7 +49,6 @@ export function advanceDeliveryReviewLineage(
   };
 }
 
-/** Families of every real or possible author whose result came from this shared assignment workspace. */
 export function workspaceContributorFamilies(run: Pick<TeamRun, "members">, member: TeamMember): (string | undefined)[] {
   if ((member.role !== "implementer" && member.role !== "integrator") || !member.cwd || member.role === "implementer" && !member.taskId) return [undefined];
   const attempts = run.members.filter(candidate => candidate.role === member.role && candidate.revision === member.revision &&
@@ -66,14 +58,12 @@ export function workspaceContributorFamilies(run: Pick<TeamRun, "members">, memb
   return attempts.map(candidate => candidate.modelProfile ? familyOf(candidate.modelProfile) : undefined);
 }
 
-/** Families of every prior-revision writer whose retained workspace the recovery PM may inspect and copy from. */
 export function potentialRecoveryContributorFamilies(run: Pick<TeamRun, "members">, revision: number): (string | undefined)[] {
   return run.members.filter(member => member.revision === revision && (member.role === "implementer" || member.role === "integrator") &&
     (member.status !== "queued" || Boolean(member.startedAt)))
     .map(member => member.modelProfile ? familyOf(member.modelProfile) : undefined);
 }
 
-/** Conservatively include old writer workspaces before a recovery PM can carry code into a new assignment. */
 export function includeDeliveryReviewContributors(
   current: DeliveryReviewLineage | undefined,
   headCommit: string,
@@ -89,7 +79,6 @@ export function includeDeliveryReviewContributors(
   };
 }
 
-/** Carry known authorship across a host-controlled rebase that imports the exact previous reviewed delta. */
 export function rebaseDeliveryReviewLineage(
   current: DeliveryReviewLineage | undefined,
   previousHead: string,
@@ -100,7 +89,6 @@ export function rebaseDeliveryReviewLineage(
   return { ...current, headCommit: newBaseCommit, families: [...current.families] };
 }
 
-/** Inherit evidence only when the new run starts from the exact head it covers. */
 export function inheritDeliveryReviewLineage(
   source: DeliveryReviewLineage | undefined,
   inheritedHead: string,
@@ -118,7 +106,6 @@ type AcceptedReviewRun = {
   review?: { verdict: string; revision: number };
 };
 
-/** Explain why an automatic merge is held when the checked head lacks independent review. */
 export function automaticMergeReviewReason(input: {
   run: AcceptedReviewRun;
   lineage?: DeliveryReviewLineage;

@@ -14,7 +14,6 @@ const DEFAULT_SWEEP_LIMIT = 100;
 const count = z.number().int().min(0).max(8);
 const assessed = z.enum(["met", "not-met", "inconclusive"]);
 
-/** The data of a `verdict.recorded` run event. Ids, enumerations, counts, and flags only: no text. */
 export const verdictEventDataSchema = z.strictObject({
   verdictId: z.uuid(),
   projectId: z.string().regex(/^[a-z0-9-]{1,80}$/),
@@ -38,10 +37,8 @@ export const verdictEventDataSchema = z.strictObject({
   pendingOwner: count,
 });
 export type VerdictEventData = z.infer<typeof verdictEventDataSchema>;
-/** The data as stored: the host stamps `v: 1` on every run event. Data of another version, or of none, is not this shape. */
 const storedDataSchema = verdictEventDataSchema.extend({ v: z.literal(1) });
 
-/** The pattern of outcomeModule: one table, two blind indexes, a deleteRun hook that stamps and never removes. */
 export function verdictModule(options?: { now?: () => string }): EvidenceModule {
   const now = options?.now ?? (() => new Date().toISOString());
   return {
@@ -74,10 +71,6 @@ export function verdictModule(options?: { now?: () => string }): EvidenceModule 
   };
 }
 
-/**
- * Projects run events of kind "verdict.recorded" into one row each; a repeated verdictId writes nothing. Data that
- * fails the schema writes nothing and never blocks later events. The event carries its own project id.
- */
 export function verdictProjector(): EventProjector {
   return {
     name: "verdicts",
@@ -120,16 +113,11 @@ export function verdictProjector(): EventProjector {
   };
 }
 
-/** Registers the module, then its projector. */
 export function registerVerdicts(store: EvidenceStore, outbox: EventOutbox): void {
   store.register(verdictModule());
   outbox.registerProjector(verdictProjector());
 }
 
-/**
- * Deletes rows whose `at` is more than VERDICT_RETENTION_DAYS before `now`, at most `limit` (default 100) per call.
- * Never throws: it returns 0 when the module is not ready or the write fails.
- */
 export function sweepExpiredVerdicts(store: EvidenceStore, now: string, limit: number = DEFAULT_SWEEP_LIMIT): number {
   try {
     if (store.status().modules[VERDICTS_MODULE] !== "ready") return 0;

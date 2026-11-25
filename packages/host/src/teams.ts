@@ -124,7 +124,6 @@ function operationCensusEvent(kind: PendingOperation["kind"], census: Omit<Opera
 }
 export type Stored = {
   run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root?: string; anchor?: string;
-  /** Revision that already used its one correction for task-to-criterion links. */
   goalPlanCorrectionRevision?: number;
   deliveryReviewLineage?: DeliveryReviewLineage;
   deliveryReviewApproval?: DeliveryReviewApproval;

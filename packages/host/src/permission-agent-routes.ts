@@ -5,7 +5,6 @@ import type { PermissionMeasurements } from "./evidence/permission-measurements.
 import { REPLAY_SET_BYTES, replaySetSchema, type PermissionReplayJobs, type ReplayJob } from "./permission-replay.js";
 import type { PermissionReadiness } from "./permission-agent-types.js";
 
-/** The paths whose JSON body this module parses itself, with a larger limit than the host default. */
 export const PERMISSION_REPLAY_PATH = /^\/api\/permissions\/replays$/;
 
 const replayBodySchema = z.object({ requestId: z.uuid(), set: replaySetSchema }).strict();
@@ -25,7 +24,6 @@ export interface PermissionAgentStatus {
   };
 }
 
-/** Readiness and the latest replay result for the current policy and profiles, for `GET /api/permissions/status`. */
 export function permissionAgentStatus(core: PermissionAgentCoreService | undefined, measurements: PermissionMeasurements | undefined, jobs: PermissionReplayJobs | undefined): PermissionAgentStatus {
   if (!core) return { readiness: { ready: false, reasons: ["The permission agent's decision core is unavailable on this host."] }, replay: { latest: null, running: null } };
   let readiness: PermissionReadiness;
@@ -47,7 +45,6 @@ export function registerPermissionAgentRoutes(app: express.Express, deps: {
   jobs: PermissionReplayJobs | undefined;
 }) {
   const unavailable = (res: express.Response) => res.status(503).json({ error: "Permission replays are unavailable on this host." });
-  // Only the owner CLI starts a replay. It delivers nothing and writes no decision.
   app.post("/api/permissions/replays", deps.requireRole(["owner"]), deps.requireOwnerCli, express.json({ limit: REPLAY_SET_BYTES }), (req, res) => {
     if (!deps.jobs) return unavailable(res);
     const body = replayBodySchema.parse(req.body);

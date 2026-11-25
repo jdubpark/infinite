@@ -1,7 +1,5 @@
 import { z } from "zod";
 
-/** The four dimensions of rubric version 1. */
-/** The judge's package directory, under the Git metadata directory of its clone. The prompt, the writer, and the context file all name it. */
 export const JUDGE_PACKAGE_DIR = "infinite-judge";
 
 export const RUBRIC_V1_DIMENSIONS = ["correctness", "cleanliness", "extensibility", "docs"] as const;
@@ -16,7 +14,6 @@ export const judgementReportSchema = z.object({
 }).strict();
 export type JudgeScores = z.infer<typeof judgeScoresSchema>;
 export type JudgementReport = z.infer<typeof judgementReportSchema>;
-/** What a judge run keeps of an accepted judgement. The summary stays in the run record only. */
 export type Judgement = { preferred: "A" | "B" | "tie"; rubric: { a: JudgeScores; b: JudgeScores } };
 export const JUDGE_ENDINGS = ["judged", "no-result", "question", "blocked", "permission", "stalled", "changed", "mismatch", "timeout", "void-limit", "void-host", "void-owner"] as const;
 export type JudgeEnding = typeof JUDGE_ENDINGS[number];

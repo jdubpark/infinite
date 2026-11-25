@@ -12,9 +12,7 @@ import { hostEgressEnvironment } from "./egress.js";
 export class TeamError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
 }
-/** `leftover`: the leader exited and its output had not ended when the command settled, so a process it started still held it (`teamCommand`); the output is then `truncated` too. */
 export interface CommandResult { exitCode: number | null; output: string; stdout: string; interrupted: boolean; truncated: boolean; leftover: boolean }
-/** `extra` carries a host GitHub grant for one operation; without it the environment is exactly the fixed allowlist below. */
 export function teamCommandEnvironment(extra?: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const name of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"])
@@ -23,37 +21,20 @@ export function teamCommandEnvironment(extra?: Record<string, string>): NodeJS.P
   env.GIT_OPTIONAL_LOCKS = "0";
   env.GIT_CONFIG_NOSYSTEM = "1";
   env.GIT_CONFIG_GLOBAL = "/dev/null";
-  // Empty unless autonomy.boundary.egress is configured: then the egress proxy, under the host identity when the key
-  // is readable and with no credential (every request refused) when it is not.
   Object.assign(env, hostEgressEnvironment());
   return extra ? { ...env, ...extra } : env;
 }
-/** The environment of a Git command the host runs: replace refs are ignored, so a ref planted in a copy cannot change what a read prints. `extra` is the grant of one operation, as in `teamCommandEnvironment`; it cannot turn replace refs back on. */
 export function teamGitEnvironment(extra?: Record<string, string>): NodeJS.ProcessEnv { return { ...teamCommandEnvironment(extra), GIT_NO_REPLACE_OBJECTS: "1" }; }
 export function teamGitArgs(cwd: string, args: string[]) {
   return ["-c", `safe.directory=${cwd}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid", ...args];
 }
-/** What an operation learns about the commands started inside its scope. Outside a scope nothing is reported. */
 export interface CommandScope {
-  /** Before a command starts. The command waits for a returned promise and does not start when it rejects. */
   starting(): Promise<void> | undefined;
-  /** Right after the start, once for each `starting`: the child's pid, or undefined when no process was started. The child leads its own session and process group. */
   started(pid: number | undefined): void;
 }
 export const commandScope = new AsyncLocalStorage<CommandScope>();
-/** How long a command whose leader exited waits for its pipes to close. */
 export const EXIT_DRAIN_MS = 1_000;
-/** The most loop turns the decision at the end of the drain takes while output keeps arriving, so a process that prints without pause cannot hold the command. */
 const EXIT_DRAIN_TURNS = 3;
-/**
- * Commands are argv arrays, from owner configuration or an explicitly authorized plan. A command ends with its leader,
- * the process the host started. A stop while the leader runs kills the leader's process group. Once the leader exits
- * without a stop before it, the command settles with the leader's exit code when its pipes close or at the end of
- * `EXIT_DRAIN_MS`, whichever comes first; a stop after that exit settles it at once. At the end of the drain the host
- * first reads what the pipes already hold. A command whose stdout and stderr have both ended settles whole; otherwise
- * it is `leftover` and `truncated`, with the output read so far. Nothing is signalled after the exit, because the
- * group may be empty and its id reused: whatever still runs is neither waited for nor stopped.
- */
 export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string, extraEnv?: Record<string, string>, forceSettleAfterMs?: number, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
   const scope = commandScope.getStore(), ready = scope?.starting();
   const run = () => runTeamCommand(scope, command, cwd, signal, timeoutMs, prefix, input, extraEnv, forceSettleAfterMs, onOutput);
@@ -71,12 +52,10 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
     }
     scope?.started(child.pid);
     let output = "", stdout = "", interrupted = false, settled = false, truncated = false, stopRequested = false, stopTimer: NodeJS.Timeout | undefined;
-    // The leader's exit code once it exited with no stop before it, the drain after it, and the output chunks read so far.
     let leaderExit: { code: number | null } | undefined, drainTimer: NodeJS.Timeout | undefined, chunks = 0;
-    // Counts what arrives, for the drain. An observer is evidence only; a throw in it must not break the command.
     const observe = (chunk: Buffer, stream: "stdout" | "stderr") => {
       chunks += 1;
-      try { onOutput?.(chunk, stream); } catch { /* ignored */ }
+      try { onOutput?.(chunk, stream); } catch {}
     };
     const onStdoutData = (chunk: Buffer) => { observe(chunk, "stdout"); capture(chunk); stdout = (stdout + chunk.toString("utf8")).slice(-65536); };
     const onStderrData = (chunk: Buffer) => { observe(chunk, "stderr"); capture(chunk); };
@@ -96,7 +75,6 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       finish();
       resolveResult({ exitCode, output, stdout, interrupted, truncated, leftover: false });
     };
-    // A prefixed command or a leftover may hold these pipes open. Stop reading them and waiting for their close event.
     const abandon = () => {
       child.stdout?.off("data", onStdoutData);
       child.stderr?.off("data", onStderrData);
@@ -107,7 +85,6 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       child.unref();
       child.stdin?.destroy(); child.stdout?.destroy(); child.stderr?.destroy();
     };
-    // Both pipes ended: nothing holds the output any more, though Node closes their handles over later turns.
     const outputEnded = () => child.stdout!.readableEnded && child.stderr!.readableEnded;
     const settleAtLeaderExit = () => {
       if (settled || !leaderExit) return;
@@ -115,17 +92,13 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       finish();
       const left = !outputEnded();
       abandon();
-      // Output that has not ended may be incomplete: a Git helper refuses such a read.
       resolveResult({ exitCode: leaderExit.code, output, stdout, interrupted, truncated: truncated || left, leftover: left });
     };
-    // The drain timer runs before the poll phase of its loop turn, so the decision waits one turn for what the pipes
-    // already hold, and a few more while output keeps arriving.
     const decideAtDrain = (turn: number, read: number) => {
       if (settled) return;
       if (outputEnded() || chunks === read || turn >= EXIT_DRAIN_TURNS) settleAtLeaderExit();
       else setImmediate(decideAtDrain, turn + 1, chunks);
     };
-    // Node emits `exit` as it reaps the leader, so until then its pid, and the group it leads, cannot be reused.
     const onChildExit = (code: number | null) => {
       if (settled || stopRequested) return;
       leaderExit = { code };
@@ -134,8 +107,6 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
     };
     const stop = () => {
       if (stopRequested || settled) return;
-      // After the leader's exit the group holds only what the command left behind, and that is never signalled. The
-      // command settles at once, by the drain's test of whether its output has ended.
       if (leaderExit) {
         settleAtLeaderExit();
         return;
@@ -144,8 +115,6 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       interrupted = true;
       try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); }
       catch (error) {
-        // A prefix such as sudo may lead a group the host may not signal; say so rather than imply the command stopped.
-        // When the signal is allowed it ends only the prefix's own process, and nothing is written: see docs/teams.md.
         if ((error as NodeJS.ErrnoException).code === "EPERM") capture(Buffer.from("\n[The host could not stop this command (EPERM); it was left to finish and its result is not used.]\n"));
       }
       if (forceSettleAfterMs !== undefined) {
@@ -153,7 +122,6 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
           if (settled) return;
           settled = true;
           finish();
-          // The abandoned result is never observed by the caller.
           abandon();
           reject(new TeamError(409, "command-stop-unconfirmed", "A configured team command did not close after the host tried to stop it."));
         }, forceSettleAfterMs);
@@ -179,19 +147,16 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
     child.once("exit", onChildExit);
   });
 }
-/** `grantEnv` maps the pushed ref to a host GitHub grant (`push` on exactly that ref) when the GitHub proxy is configured. */
 export async function publishTeamHead(workspace: string, remoteUrl: string, commit: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal, grantEnv?: (ref: string) => Record<string, string>, timeoutMs = 120000, forceSettleAfterMs?: number): Promise<{ published: true } | { published: false; category: TeamPublicationCategory }> {
   try {
     const ref = `refs/heads/${branch}`;
     const result = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["push", remoteUrl, `${commit}:${ref}`]) }, workspace, signal, timeoutMs, prefix, undefined, grantEnv?.(ref), forceSettleAfterMs);
     if (result.exitCode === 0 && !result.interrupted && !result.truncated) return { published: true };
-    // Only Git's own ref status line marks divergence; a branch name or remote hook text must not route the head to a sibling.
     return { published: false, category: /^\s*!\s+\[rejected\]\s.*\((?:non-fast-forward|fetch first)\)\s*$/m.test(result.output) ? "rejected" : fetchCategory(result.output) };
   } catch {
     return { published: false, category: "other" };
   }
 }
-/** Streams a full bundle of one branch on stdout, with the same restricted Git invocation as other team operations. */
 export function spawnTeamBundle(workspace: string, branch: string, prefix?: TeamCommand) {
   const args = teamGitArgs(workspace, ["bundle", "create", "-", `refs/heads/${branch}`]);
   return spawn(prefix?.command ?? "git", prefix ? [...prefix.args, "git", ...args] : args, { cwd: workspace, env: teamGitEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
@@ -207,7 +172,6 @@ function strictlyInside(root: string, target: string) {
   const rel = relative(root, target);
   return Boolean(rel) && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
-/** Validate a host-owned run directory before any recursive removal. Missing targets are already removed. */
 function checkedRemovalDirectory(runDirectory: string, configuredRoot: string) {
   const root = resolve(configuredRoot), target = resolve(runDirectory);
   if (!strictlyInside(root, target)) throw unsafeTeamRoot();
@@ -234,7 +198,6 @@ function safeRemovalName(name: string) {
     throw new TeamError(409, "team-root-unsafe", "Team workspace removal found an unsafe top-level entry name.");
   return name;
 }
-/** Remove both team clones, then the host-owned run directory. `configuredRoot` is required to fail closed. */
 export async function removeTeamWorkspace(runDirectory: string, prefix?: TeamCommand, signal?: AbortSignal, configuredRoot?: string) {
   if (!configuredRoot) throw new TeamError(409, "team-root-unsafe", "Team workspace removal requires its configured team root.");
   const safe = checkedRemovalDirectory(runDirectory, configuredRoot);
@@ -242,8 +205,6 @@ export async function removeTeamWorkspace(runDirectory: string, prefix?: TeamCom
   if (prefix) {
     const entries = readdirSync(safe.target).map(safeRemovalName);
     if (entries.length) {
-      // The agent account removes what it owns; host-owned entries such as member scratch directories
-      // make this exit non-zero, so the host finishes the job below and judges success by the result.
       const result = await teamCommand({ command: "rm", args: ["-rf", "--", ...entries] }, safe.target, signal, 600000, prefix);
       if (result.interrupted) removalFailed(result);
     }
@@ -256,7 +217,6 @@ export async function removeTeamWorkspace(runDirectory: string, prefix?: TeamCom
   try { remaining = readdirSync(safe.target); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
   throw new TeamError(409, "workspace-removal-failed", `The team workspace could not be removed completely; remaining entries: ${remaining.slice(0, 8).join(", ") || "(directory)"}.`);
 }
-/** Remove the recorded member clone without following a redirected run or parent directory. */
 export async function removeMemberWorkspace(runDirectory: string, memberCwd: string, prefix?: TeamCommand, signal?: AbortSignal, configuredRoot?: string): Promise<boolean> {
   if (!configuredRoot) throw new TeamError(409, "team-root-unsafe", "Member workspace removal requires its configured team root.");
   const safe = checkedRemovalDirectory(runDirectory, configuredRoot);
@@ -321,7 +281,6 @@ function ensureHostDirectoryComponent(path: string, mode: number, create: boolea
   if (!info.isDirectory() || info.isSymbolicLink() || !hostOwned(info) || (info.mode & 0o022) !== 0) throw unsafeTeamRoot();
   if (created) chmodDirectoryNoFollow(path, (mode & 0o777) | (info.mode & 0o2000));
 }
-/** The configured default root is protected just like an anchored teamwork root. */
 export function ensureDefaultTeamRoot(root: string, create = false) {
   let anchor = dirname(resolve(root));
   while (true) {
@@ -333,12 +292,10 @@ export function ensureDefaultTeamRoot(root: string, create = false) {
   }
   return ensureHostDirectory(anchor, root, 0o750, create);
 }
-/** Create/check each component below a trusted anchor without traversing an unsafe parent. */
 export function ensureHostDirectory(anchor: string, target: string, mode: number, create = true) {
   let base: string;
   try { base = realpathSync(anchor); } catch { throw unsafeTeamRoot(); }
   assertSecureAncestors(base);
-  // Keep the suffix relative to the supplied anchor when a system alias resolves elsewhere.
   const rel = relative(resolve(anchor), resolve(target));
   if (!rel || rel === ".." || rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(rel)) throw unsafeTeamRoot();
   let current = base;
@@ -348,7 +305,6 @@ export function ensureHostDirectory(anchor: string, target: string, mode: number
   }
   return realpathSync(current);
 }
-/** Change directory modes through an opened no-follow descriptor, never through a redirected path. */
 export function chmodDirectoryNoFollow(path: string, mode: number) {
   let fd: number | undefined;
   try {
@@ -358,7 +314,6 @@ export function chmodDirectoryNoFollow(path: string, mode: number) {
     fchmodSync(fd, mode);
   } finally { if (fd !== undefined) closeSync(fd); }
 }
-/** A source handoff must preserve every tracked and untracked edit and pin the actual root. */
 export async function cleanTeamCheckpoint(source: string, expectedHead: string, prefix?: TeamCommand) {
   const canonical = realpathSync(source);
   const top = await git(canonical, ["rev-parse", "--show-toplevel"], prefix);
@@ -431,7 +386,6 @@ export async function prepareMemberWorkspace(workspace: string, memberId: string
   await git(cwd, ["checkout", "--detach", baseCommit], prefix, 30000, signal);
   return realpathSync(cwd);
 }
-/** Assign scratch outside the Git checkout; prompt-supplied temporary paths never establish ownership. */
 export function prepareMemberScratch(workspace: string, memberId: string) {
   safeWorkspaceId(memberId);
   const anchor = dirname(realpathSync(workspace));
@@ -441,7 +395,6 @@ export function prepareMemberScratch(workspace: string, memberId: string) {
   const parentInfo = lstatSync(parent);
   if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink() || !hostOwned(parentInfo) || (parentInfo.mode & 0o022) !== 0 || realpathSync(parent) !== parent)
     throw unsafeTeamRoot();
-  // Preserve the run root's shared group for newly assigned child directories.
   chmodDirectoryNoFollow(parent, 0o2750);
   const target = join(parent, memberId);
   try { mkdirSync(target, { mode: 0o700 }); }
@@ -449,7 +402,6 @@ export function prepareMemberScratch(workspace: string, memberId: string) {
   const info = lstatSync(target);
   if (!info.isDirectory() || info.isSymbolicLink() || !hostOwned(info) || realpathSync(target) !== target)
     throw unsafeTeamRoot();
-  // Team roots carry the agent's shared group. Keep the parent host-owned and non-writable.
   chmodDirectoryNoFollow(target, 0o2770);
   return target;
 }
@@ -510,7 +462,6 @@ process.stdin.on("end", () => {
   }
 });
 `;
-/** Store complete agent context in ignored Git metadata, atomically replacing only a regular prior snapshot. */
 export async function writeTeamContext(cwd: string, context: unknown, prefix?: TeamCommand, signal?: AbortSignal): Promise<number> {
   let serialized: string | undefined;
   try { serialized = JSON.stringify(context, null, 2); } catch { throw new TeamError(409, "team-context-invalid", "The team context could not be serialized safely."); }
@@ -529,7 +480,6 @@ export async function writeTeamContext(cwd: string, context: unknown, prefix?: T
     throw new TeamError(409, "team-context-write-failed", "The complete team context could not be stored safely in Git metadata; do not launch this member.");
   return Buffer.byteLength(text, "utf8");
 }
-/** Retain the reported merge object without changing the reviewed working tree. */
 export async function captureDeliveryBaseline(workspace: string, memberCwd: string, reviewedHead: string, mergeCommit: string, prefix?: TeamCommand, signal?: AbortSignal) {
   await git(workspace, ["fetch", "--no-tags", "--", memberCwd, mergeCommit], prefix, 30000, signal);
   if (await git(workspace, ["cat-file", "-t", mergeCommit], prefix, 30000, signal) !== "commit")
@@ -563,7 +513,6 @@ function quotedDiagnosticPath(path: string) {
   const bounded = [...safe].length > MAX_DIAGNOSTIC_PATH_LENGTH ? `${[...safe].slice(0, MAX_DIAGNOSTIC_PATH_LENGTH - 1).join("")}…` : safe;
   return JSON.stringify(bounded);
 }
-/** Parse NUL-delimited porcelain paths without ever interpreting filenames as records or terminal text. */
 function changedPathsFromStatus(status: string) {
   const records = status.split("\0").filter(Boolean), paths: string[] = [];
   for (let index = 0; index < records.length; index++) {
@@ -586,7 +535,6 @@ function readOnlyDiagnostic(context: ReadOnlyWorkspaceContext, base: string, hea
     : "There are no working-tree paths in the change; the difference is in HEAD only.";
   return `The ${readOnlyContextLabel[context]} is not read-only. ${headDrift} ${changed} Its report cannot advance the team.`;
 }
-/** Keep verification diagnostics separate from member blame, while refusing every HEAD or file mutation. */
 export async function assertMemberReadOnly(cwd: string, base: string, prefix?: TeamCommand, signal?: AbortSignal, context: ReadOnlyWorkspaceContext = "member") {
   const head = await teamHead(cwd, prefix, signal);
   const repositoryRoot = await git(cwd, ["rev-parse", "--show-toplevel"], prefix, 30000, signal);
@@ -660,21 +608,17 @@ async function preparePinnedWorkspaceClone(workspace: string, kind: SiblingWorks
     throw new TeamError(409, "workspace-copy-changed", `The ${kind} workspace did not match its requested clean baseline. The copy was preserved for inspection.`);
   return { workspace: realpathSync(destination), ...(branch ? { branch } : {}), baseCommit };
 }
-/** Create a disposable, detached checkout of exactly the requested integration commit. */
 export async function prepareVerificationWorkspace(workspace: string, id: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal) {
   const prepared = await preparePinnedWorkspaceClone(workspace, "verification", id, baseCommit, prefix, signal);
   return { workspace: prepared.workspace, baseCommit: prepared.baseCommit };
 }
-/** Create a recovery copy beside the original integration checkout; retries never nest under a prior copy. */
 export async function prepareRecoveredWorkspace(workspace: string, id: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal, branch?: string) {
   const prepared = await preparePinnedWorkspaceClone(workspace, "recovery", id, baseCommit, prefix, signal, branch);
   return { workspace: prepared.workspace, ...(prepared.branch ? { branch: prepared.branch } : {}), baseCommit: prepared.baseCommit };
 }
-/** Create a clean sibling from a host-refreshed source mirror, preserving the old integration copy. */
 export async function prepareRecoveryWorkspaceFromSource(workspace: string, source: string, id: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal, branch?: string) {
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(baseCommit)) throw new TeamError(409, "invalid-workspace-baseline", "The copied workspace baseline is invalid.");
   const { destination } = ensureSiblingWorkspaceParent(workspace, "recovery", id);
-  // The source mirror is only a clone argument: the restricted launcher allows no Git inspection inside it.
   await git(dirname(destination), ["clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", source, destination], prefix, 120000, signal);
   await git(destination, ["remote", "remove", "origin"], prefix, 30000, signal);
   if (await git(destination, ["cat-file", "-t", baseCommit], prefix, 30000, signal) !== "commit")
@@ -688,7 +632,6 @@ export async function prepareRecoveryWorkspaceFromSource(workspace: string, sour
   return { workspace: realpathSync(destination), ...(branch ? { branch } : {}), baseCommit };
 }
 export function teamPathAllowed(path: string, allowed: string[]) { return allowed.some(prefix => prefix === "." || path === prefix || path.startsWith(`${prefix}/`)); }
-/** List all tracked, staged, and untracked paths changed from a member's base commit. */
 export async function memberChangedPaths(cwd: string, base: string, prefix?: TeamCommand, signal?: AbortSignal) {
   const changed = [
     ...lines(await git(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", base, "--"], prefix, 30000, signal)),
@@ -697,29 +640,24 @@ export async function memberChangedPaths(cwd: string, base: string, prefix?: Tea
   ];
   return [...new Set(changed)].sort();
 }
-/** A continuation may retain partial edits only after their ownership is checked. */
 export async function assertMemberScope(cwd: string, base: string, paths?: string[], prefix?: TeamCommand, signal?: AbortSignal) {
   await git(cwd, ["merge-base", "--is-ancestor", base, "HEAD"], prefix, 30000, signal);
   const changed = await memberChangedPaths(cwd, base, prefix, signal);
   if (paths && changed.some(path => !teamPathAllowed(path, paths)))
     throw new TeamError(409, "task-scope-violation", "An agent changed files outside its assigned paths. Its changes were retained in its isolated workspace.");
 }
-/** Validate the full result (including agent-created commits), then make one host-owned commit. */
 export async function captureMemberResult(cwd: string, base: string, paths?: string[], prefix?: TeamCommand, signal?: AbortSignal) {
   await assertMemberScope(cwd, base, paths, prefix, signal);
-  // Stage only this disposable member copy; the user's source checkout is never modified.
   await git(cwd, ["add", "-A", "--", "."], prefix, 30000, signal);
   const tree = await git(cwd, ["write-tree"], prefix, 30000, signal);
   const staged = lines(await git(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", base, tree, "--"], prefix, 30000, signal));
   if (paths && staged.some(path => !teamPathAllowed(path, paths))) throw new TeamError(409, "task-scope-violation", "The staged task result contains changes outside its assigned paths.");
   const baseTree = await git(cwd, ["rev-parse", `${base}^{tree}`], prefix, 30000, signal);
   if (tree === baseTree) return undefined;
-  // commit-tree avoids provider-authored hooks and folds any child commits into one delta.
   const commit = await git(cwd, ["commit-tree", tree, "-p", base, "-m", "Implement assigned team work"], prefix, 30000, signal);
   await git(cwd, ["update-ref", "refs/heads/infinite-result", commit], prefix, 30000, signal);
   return commit;
 }
-/** Preserve a member clone's current tree in a local WIP ref before retention removes the clone. */
 export type MemberWorkSnapshot = { commit?: string; tree: string; nestedRepository: boolean };
 function hasNestedSubmoduleWork(status: string) {
   return status.split("\n").some(line => {
@@ -760,7 +698,6 @@ export async function integrateMemberResult(workspace: string, memberCwd: string
   await git(workspace, ["fetch", "--no-tags", "--", memberCwd, commit], prefix, 30000, signal);
   const result = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["cherry-pick", commit]) }, workspace, signal, 30000, prefix);
   if (result.exitCode !== 0 || result.interrupted || result.truncated) {
-    // A failed integration is preserved; no reset, forced cleanup, or automatic retry.
     throw new TeamError(409, "integration-conflict", "Task integration encountered a conflict. The team is blocked with the isolated conflict preserved.");
   }
   return teamHead(workspace, prefix, signal);
@@ -785,7 +722,6 @@ export function validateTeamPlan(tasks: TeamTaskPlan[]) {
       throw new TeamError(409, "invalid-plan", "Parallel tasks must have separate owned paths, or an explicit dependency ordering.");
   }
 }
-/** Every retained child path must remain beneath the configured workspace root, without symlinks. */
 export function assertTeamPath(root: string, path: string) {
   const rel = relative(realpathSync(root), resolve(path));
   if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new TeamError(409, "invalid-workspace", "The team workspace is outside its configured root.");

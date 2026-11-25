@@ -5,9 +5,6 @@ import { CALIBRATION_VALID_DAYS } from "./judge-calibration-rules.js";
 import type { SourceResult } from "./eval-trial.js";
 import type { Judgement, JudgeEnding } from "./judge-types.js";
 
-// The judge store: calibrations of a judge profile and the judgements that make them up. The sealed columns hold
-// every task, trial, and profile ID. Nothing here is an outcome: a judgement is a model's claim (see PRODUCT.md).
-
 export const JUDGE_MODULE = "judge-calibrations";
 export const CALIBRATION_VIEWS_MAX = 20, JUDGE_SWEEP_BATCH = 100, JUDGEMENT_SWEEP_BATCH = 500, LIVE_JUDGEMENTS_MAX = 8;
 
@@ -49,7 +46,6 @@ export const JUDGE_SESSIONS_SQL = "SELECT judgement_id, session_id, ended_at FRO
 export type CalibrationStatus = "running" | "completed" | "cancelled" | "expired";
 export type CalibrationState = "ok" | "not-ok";
 export type CalibrationPairRef = { projectId: string; taskId: string; resolvedTrialId: string; unresolvedTrialId: string };
-/** The sealed payload: the request (with the profile ID), the pair list, and the pair count of each project. */
 export type CalibrationPayload = { profileId: string; request: Record<string, unknown>; pairs: CalibrationPairRef[];
   perProject: { projectId: string; pairs: number }[] };
 export type CalibrationRow = { calibrationId: string; requestId: string; judgeKey: string; profileEpoch: number; promptVersion: string;
@@ -58,10 +54,8 @@ export type CalibrationRow = { calibrationId: string; requestId: string; judgeKe
   spentUsd: number; createdAt: string; expiresAt: string; completedAt: string | null; validUntil: string | null; payload: CalibrationPayload };
 export type NewCalibration = Pick<CalibrationRow, "calibrationId" | "requestId" | "judgeKey" | "profileEpoch" | "promptVersion" | "pairsPlanned"
   | "judgeMinutes" | "createdAt" | "expiresAt" | "payload">;
-/** How a calibration ends. `state` is set for `completed` and null for `cancelled` and `expired`. */
 export type CalibrationEnd = { status: Exclude<CalibrationStatus, "running">; reason: string | null; state: CalibrationState | null;
   counted: number; correct: number; agree: number; accuracy: number | null; lowerBound: number | null; swapAgreement: number | null };
-/** Why the next judgement waits: a gate of the schedule, `mirror` or `start-up` found by the pump, or a cause of a failed source build. */
 export type CalibrationWait = "halt" | "host-load" | "eval-identity" | "grader" | "another-job" | "another-judgement" | "provider-limit"
   | "session-slots" | "mirror" | "start-up" | Exclude<Extract<SourceResult, { kind: "environment" }>["cause"], "halted">;
 export type CalibrationView = { calibrationId: string; profileId: string; profileEpoch: number; promptVersion: string;
@@ -70,7 +64,6 @@ export type CalibrationView = { calibrationId: string; profileId: string; profil
   accuracy: number | null; lowerBound: number | null; swapAgreement: number | null; judgeMinutes: number;
   cost: { tokens: number; spentUsd: number }; createdAt: string; expiresAt: string; completedAt: string | null;
   validUntil: string | null; inForce: boolean;
-  /** The gate that holds the next judgement of a running calibration, kept in memory by the job. Null when none is known or the calibration is not running. */
   waiting: CalibrationWait | null };
 
 export type JudgementState = "preparing" | "live" | "final" | "dropped";
@@ -105,7 +98,6 @@ export function judgeCalibrationsModule(_store: EvidenceStore, _now: () => strin
   };
 }
 
-/** Inserts a `running` calibration with its sealed payload. A repeated request ID, or calibration ID, writes nothing and answers `exists`. */
 export function insertCalibration(tx: EvidenceTx, row: NewCalibration): "inserted" | "exists" {
   const changes = tx.run(
     "INSERT INTO judge_calibrations (calibration_id, request_id, judge_key, profile_epoch, prompt_version, status, pairs_planned, judge_minutes, "
@@ -132,16 +124,11 @@ export function readCalibration(db: EvidenceDb, id: string): CalibrationRow | un
   return row === undefined ? undefined : calibrationOf(db, row);
 }
 
-/** The running calibration, oldest first. Task 8 allows at most one, so this is the one. */
 export function activeCalibration(db: EvidenceDb): CalibrationRow | undefined {
   const row = db.get<CalibrationSql>(ACTIVE_CALIBRATION_SQL);
   return row === undefined ? undefined : calibrationOf(db, row);
 }
 
-/**
- * The newest completed `ok` calibration with this judge key, epoch, and prompt version whose validity has not ended
- * at `now`. A calibration is in force from its completion until `valid_until` (60 days later), exclusive.
- */
 export function calibrationInForce(db: EvidenceDb, input: { judgeKey: string; epoch: number; promptVersion: string; now: string }):
   { calibrationId: string; accuracy: number; lowerBound: number } | undefined {
   const row = db.get<{ calibration_id: string; accuracy: number | null; lower_bound: number | null }>(
@@ -151,10 +138,6 @@ export function calibrationInForce(db: EvidenceDb, input: { judgeKey: string; ep
   return { calibrationId: row.calibration_id, accuracy: row.accuracy, lowerBound: row.lower_bound };
 }
 
-/**
- * The newest CALIBRATION_VIEWS_MAX calibrations. `current` gives the judge's current epoch and prompt version for a
- * judge key, or undefined when the judge is gone; `inForce` is true only for the row `calibrationInForce` returns.
- */
 export function calibrationViews(db: EvidenceDb, now: string,
   current: (judgeKey: string) => { epoch: number; promptVersion: string } | undefined): CalibrationView[] {
   return db.all<CalibrationSql>(VIEWS_SQL).map(sql => {
@@ -172,10 +155,6 @@ export function calibrationViews(db: EvidenceDb, now: string,
   });
 }
 
-/**
- * Ends a running calibration, once. `at` is stored as `completed_at` for every ending; only a `completed` calibration
- * gets `valid_until` (`at` plus 60 days). A calibration that is not running writes nothing and answers false.
- */
 export function finishCalibration(tx: EvidenceTx, id: string, end: CalibrationEnd, at: string): boolean {
   const validUntil = end.status === "completed" ? addDays(at, CALIBRATION_VALID_DAYS) : null;
   return tx.run(
@@ -185,10 +164,6 @@ export function finishCalibration(tx: EvidenceTx, id: string, end: CalibrationEn
   ).changes === 1;
 }
 
-/**
- * Inserts a `preparing` judgement row for one (calibration, pair index, ordering, attempt). The unique key makes a
- * second insert of the same slot, or of the same judgement ID, write nothing and answer `exists`.
- */
 export function insertJudgement(tx: EvidenceTx, row: NewJudgement, at: string): "inserted" | "exists" {
   const changes = tx.run(
     "INSERT INTO judge_judgements (judgement_id, calibration_id, pair_index, ordering, attempt, project_ref, state, resolved_is_a, created_at) "
@@ -198,7 +173,6 @@ export function insertJudgement(tx: EvidenceTx, row: NewJudgement, at: string): 
   return changes === 1 ? "inserted" : "exists";
 }
 
-/** Moves a `preparing` judgement to `live` and records its session ID (null when the launch made none). Answers false for any other state. */
 export function startJudgement(tx: EvidenceTx, judgementId: string, sessionId: string | null): boolean {
   return tx.run("UPDATE judge_judgements SET state='live', session_id=? WHERE judgement_id=? AND state='preparing'", sessionId, judgementId).changes === 1;
 }
@@ -214,11 +188,6 @@ function addCost(tx: EvidenceTx, judgementId: string, cost: JudgementCost): void
   tx.run("UPDATE judge_calibrations SET tokens = tokens + ?, spent_usd = spent_usd + ? WHERE calibration_id=?", cost.tokens, cost.usd, row.calibration_id);
 }
 
-/**
- * Ends a `preparing` or `live` judgement, once. It stores the ending, the preferred label and sealed rubric of an
- * accepted judgement, and the session ID (kept until `clearJudgementSession`, which records the cost). A judgement
- * that is already final or dropped writes nothing and answers false.
- */
 export function finishJudgement(tx: EvidenceTx, judgementId: string, final: JudgementFinal, at: string): boolean {
   const rubric = final.judgement === undefined ? null : tx.seal("judge_judgements", judgementId, final.judgement.rubric);
   const changes = tx.run(
@@ -228,24 +197,20 @@ export function finishJudgement(tx: EvidenceTx, judgementId: string, final: Judg
   return changes === 1;
 }
 
-/** Ends a `preparing` or `live` judgement as dropped, with a reason. A dropped pair stays a row, so the slot is never selected again. */
 export function dropJudgement(tx: EvidenceTx, judgementId: string, reason: string, at: string): boolean {
   return tx.run("UPDATE judge_judgements SET state='dropped', drop_reason=?, ended_at=? WHERE judgement_id=? AND state IN ('preparing', 'live')",
     reason, at, judgementId).changes === 1;
 }
 
-/** Deletes a judgement row that is still `preparing`, so its slot is free again. A live, final, or dropped row is kept and the answer is false. */
 export function releaseJudgement(tx: EvidenceTx, judgementId: string): boolean {
   return tx.run("DELETE FROM judge_judgements WHERE judgement_id=? AND state='preparing'", judgementId).changes === 1;
 }
 
-/** Clears the session ID. With a cost it records it, once, and a known cost joins the calibration's totals; a cost already stored is kept. */
 export function clearJudgementSession(tx: EvidenceTx, judgementId: string, cost?: JudgementCost): void {
   if (cost !== undefined) addCost(tx, judgementId, cost);
   tx.run("UPDATE judge_judgements SET session_id=NULL WHERE judgement_id=?", judgementId);
 }
 
-/** Judgements that are `preparing` or `live`, at most LIVE_JUDGEMENTS_MAX. */
 export function liveJudgements(db: EvidenceDb): { judgementId: string; calibrationId: string; pairIndex: number; ordering: 0 | 1; attempt: number;
   state: "preparing" | "live"; sessionId: string | null }[] {
   return db.all<{ judgement_id: string; calibration_id: string; pair_index: number; ordering: 0 | 1; attempt: number; state: "preparing" | "live";
@@ -253,7 +218,6 @@ export function liveJudgements(db: EvidenceDb): { judgementId: string; calibrati
     pairIndex: row.pair_index, ordering: row.ordering, attempt: row.attempt, state: row.state, sessionId: row.session_id }));
 }
 
-/** Every judgement row of one calibration, in pair, ordering, and attempt order, rubrics opened. At most 2 x 60 x 3 rows. */
 export function calibrationJudgements(db: EvidenceDb, calibrationId: string): JudgementRow[] {
   return db.all<JudgementSql>(CALIBRATION_JUDGEMENTS_SQL, calibrationId).map(row => ({
     judgementId: row.judgement_id, calibrationId: row.calibration_id, pairIndex: row.pair_index, ordering: row.ordering, attempt: row.attempt,
@@ -263,13 +227,11 @@ export function calibrationJudgements(db: EvidenceDb, calibrationId: string): Ju
   }));
 }
 
-/** Judgements whose session was not yet removed and ended before `endedBefore`, oldest first. */
 export function judgeSessions(db: EvidenceDb, endedBefore: string, limit: number): { judgementId: string; sessionId: string; endedAt: string }[] {
   return db.all<{ judgement_id: string; session_id: string; ended_at: string }>(JUDGE_SESSIONS_SQL, endedBefore, limit)
     .map(row => ({ judgementId: row.judgement_id, sessionId: row.session_id, endedAt: row.ended_at }));
 }
 
-/** Deletes judgements, then calibrations, created more than REPORT_KEEP_DAYS before `now`, in bounded batches. */
 export function sweepJudge(tx: EvidenceTx, now: string): void {
   const cutoff = addDays(now, -REPORT_KEEP_DAYS);
   tx.run("DELETE FROM judge_judgements WHERE judgement_id IN (SELECT judgement_id FROM judge_judgements WHERE created_at < ? ORDER BY created_at LIMIT ?)",

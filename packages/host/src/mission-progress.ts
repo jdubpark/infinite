@@ -27,7 +27,6 @@ export type MissionProgressMemberSource = {
   role: TeamMember["role"];
   taskId?: string;
   status: TeamMember["status"];
-  /** Written by the team host only after it confirmed this process exited. */
   exitConfirmedAt?: string;
 };
 
@@ -58,7 +57,6 @@ export type MissionProgressChild =
       checksTruncated?: true;
     };
 
-/** A pure, bounded projection of the one team run named by a sealed mission record. */
 export function projectMissionChild(run: TeamRun, expectedMissionId: string, expectedProjectId: string): MissionProgressChild {
   if (run.replay || run.id.length === 0 || run.missionId !== expectedMissionId || run.projectId !== expectedProjectId)
     return { kind: "mismatched" };
@@ -87,7 +85,6 @@ export function projectMissionChild(run: TeamRun, expectedMissionId: string, exp
     latestUnassignedRole.add(member.role);
     selected.set(member.memberId, member);
   }
-  // Apply both row and byte caps to active assignments first. A plan can have a full page of finished writers.
   const members = [...selected.values()];
   const needsObservation = (member: TeamMember) => !member.exitConfirmedAt && (member.status === "queued" || statusAwaitingWorker.has(member.status));
   const ordered = [...members.filter(needsObservation), ...members.filter(member => !needsObservation(member))];
@@ -143,7 +140,6 @@ export type MissionProgressMissionSource = {
   subtasks: Pick<MissionSubtask, "id" | "title" | "repoProjectId" | "status" | "teamId">[];
 };
 
-/** Project bounded assignment identity from the sealed record; prompts, notes and report text stay private. */
 export function projectMissionSource({ mission, attempts }: {
   mission: Pick<Mission, "id" | "title" | "status" | "revision" | "updatedAt" | "subtasks">;
   attempts: readonly { memberId: string; sessionId: string; revision: number; status: "queued" | "running" | "reported" | "stopped" }[];
@@ -160,7 +156,6 @@ export type MissionProgressWorkerStatus = Status | "unknown" | "mismatched" | "n
 
 export type MissionProgressMember = Omit<MissionProgressMemberSource, "status"> & {
   recordedStatus: TeamMember["status"];
-  /** A direct worker read, separate from the sealed team record's status. */
   workerStatus: MissionProgressWorkerStatus;
 };
 
@@ -197,7 +192,6 @@ export type MissionProgressSnapshot = {
 export type MissionProgressObservation = {
   cursor: string;
   sequence: number;
-  /** Time the host sampled this state; source updatedAt values are intentionally omitted. */
   observedAt: string;
   snapshot: MissionProgressSnapshot;
 };
@@ -210,9 +204,7 @@ export type MissionProgressPage = {
   cursor: string;
   observedAt: string;
   resync: { required: false } | { required: true; reason: MissionProgressResyncReason };
-  /** Distinct snapshots that this host observed after the supplied cursor, if retained. */
   observations: MissionProgressObservation[];
-  /** Always the current read of sealed mission and child records, including on reset. */
   snapshot: MissionProgressSnapshot;
 };
 
@@ -268,16 +260,10 @@ function boundedSnapshot(snapshot: MissionProgressSnapshot): MissionProgressSnap
   throw new Error("Mission progress snapshot exceeded its size bound.");
 }
 
-/**
- * Read-only mission progress sampled on request. It replays only distinct snapshots this process has actually observed;
- * worker or check transitions between reads are not durable lifecycle events. Every page includes the current snapshot.
- */
 export class MissionProgressService {
   readonly generation = randomUUID();
   private readonly histories = new Map<string, History>();
-  /** Concurrent readers of one mission share a sample; a slow mission never blocks another mission. */
   private readonly inFlight = new Map<string, Promise<SampledProgress>>();
-  /** Nonblocking host-wide cap: pages report unsampled liveness instead of queuing behind slow sockets. */
   private activeWorkerReads = 0;
 
   constructor(private readonly sources: MissionProgressSources) {}

@@ -154,7 +154,6 @@ export function appendBoardComposer(composer: string, text: string): string {
   return composer + text;
 }
 
-/** A group holds a host project when the project is a repository's primary or any of its checkouts. */
 function groupHoldsCheckout(group: ProjectGroup, projectId: string): boolean {
   return group.repos.some(repo => repo.projectId === projectId || repo.checkouts.some(checkout => checkout.projectId === projectId));
 }
@@ -183,7 +182,6 @@ export function resolveMissionProject(
 
 const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
-/** Lines for `infinite projects`: groups, their repositories and checkouts, hidden groups, then suggestions. */
 export function projectsLines(list: ProjectGroupList, syncOf: (projectId: string) => string | undefined = () => undefined): string[] {
   const lines: string[] = [];
   const suffix = (projectId: string) => {

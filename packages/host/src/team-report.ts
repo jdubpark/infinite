@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { MAX_TEAM_REPORT_BYTES, ReportError, reportErrorMessage, submitTeamReport } from "./team-report-client.js";
 
-// This command receives only a per-worker reporting capability, never an owner API key.
 async function main() {
   const chunks: Buffer[] = [];
   let bytes = 0;

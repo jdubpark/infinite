@@ -24,7 +24,6 @@ type Receipt = { fingerprint: string; result: unknown };
 type Stored = {
   entries: Record<string, PermissionCoverageEntry>;
   optOuts: Record<string, PermissionOptOut>;
-  /** Every project that has had an owner act here. Onboarding covers a project only when it is absent. */
   knownProjectIds: string[];
   receipts: Record<string, Receipt>;
 };
@@ -41,30 +40,12 @@ const notFound = () => new TeamError(404, "project-group-not-found", "This proje
 const projectIds = (group: PermissionDelegationGroup): string[] =>
   [...new Set(group.repos.flatMap(repo => repo.checkouts.map(checkout => checkout.projectId)))];
 
-/**
- * Durable owner authority, recorded once for each covered host project.
- *
- * An entry covers its project only while the project is enrolled at the path the owner act saw and
- * the project group service reports the owner-move mark the act pinned. The group service bumps
- * that mark in the same write as an owner regrouping, so coverage ends with the move even when this
- * service is unavailable at that moment, and regrouping never waits on a write here. Nothing is
- * pruned: an opt-out, a revocation and the fact that a project was onboarded before all survive a
- * project that leaves the host and returns.
- *
- * A project that is not enrolled is covered by nothing, and its entry waits. An owner act on a
- * workspace reaches every project that the workspace holds, and it ends the entry of each one that
- * is not enrolled at that time: the act cannot see that project, and an older entry never outlives
- * a newer decision. It reaches no project that another workspace holds.
- *
- * One instance writes this state. A second live writer would overwrite it from its own snapshot.
- */
 export class PermissionDelegationService {
   private readonly file: string;
   private readonly writeState: StateWriter;
   private readonly clock: () => number;
   private readonly policyVersion: number;
   private state: Stored;
-  /** A write failed. It may have reached the disk or not, so the snapshot in memory is not known to be the stored state. */
   private uncertain = false;
 
   constructor(
@@ -104,7 +85,6 @@ export class PermissionDelegationService {
     return this.config.projects.find(project => project.id === projectId);
   }
 
-  /** The project's entry, when it still names this checkout and no owner regrouping has moved it since. */
   private validEntry(projectId: string, state: Stored): PermissionCoverageEntry | undefined {
     const project = this.enrolled(projectId), entry = own(state.entries, projectId);
     if (!project || !entry || own(state.optOuts, projectId)) return undefined;
@@ -141,10 +121,6 @@ export class PermissionDelegationService {
     this.state = candidate;
   }
 
-  /**
-   * After a failed write, the stored state is read again before any answer or change, so neither comes from a
-   * snapshot that the disk may have left behind. While the state cannot be read, every call fails.
-   */
   private settle() {
     if (!this.uncertain) return;
     this.state = this.load();
@@ -168,16 +144,6 @@ export class PermissionDelegationService {
     return digest({ action, target, request, actor });
   }
 
-  /**
-   * What an owner act by `id` reaches: the listed workspaces, and the entries of projects that those workspaces
-   * hold and that are not enrolled now.
-   *
-   * A workspace holds the checkouts stored in it. A project in no stored workspace is held by its own implicit
-   * workspace, which carries the project's id and is listed only while the project is enrolled. So the id can name
-   * a stored workspace, an implicit one, or both: a stored workspace keeps its id when the owner removes the
-   * checkout that the id came from. Only when the id names no workspace is it read as a project id, and it then
-   * names the workspace that holds that project.
-   */
   private target(id: string, state: Stored): { found: PermissionDelegationGroup[]; absent: string[] } {
     const listed = this.groups.list().groups as PermissionDelegationGroup[];
     const away = Object.keys(state.entries).filter(projectId => !this.enrolled(projectId));
@@ -281,7 +247,6 @@ export class PermissionDelegationService {
     };
   }
 
-  /** The owner delegates every project that is in the workspace now. This is the only act that replaces an opt-out. */
   delegate(
     workspaceId: string,
     input: { requestId: string; direction?: string | null },
@@ -297,7 +262,6 @@ export class PermissionDelegationService {
     const candidate = structuredClone(this.state);
     const { found, absent } = this.target(workspaceId, candidate);
     if (found.length === 0) throw notFound();
-    // A grant must name one workspace. A revocation below takes every match instead.
     if (found.length > 1)
       throw new TeamError(409, "permission-workspace-ambiguous", "Two workspaces share this id. Regroup so that the id names one workspace, or delegate every workspace.");
     const group = found[0]!;
@@ -326,7 +290,6 @@ export class PermissionDelegationService {
     const replacedOptOuts: string[] = [];
     for (const group of groups)
       replacedOptOuts.push(...this.applyDelegate(candidate, group, request.direction, actor, at));
-    // The owner decided for every workspace, so no entry of a project that is not enrolled now outlives the decision.
     this.endEntries(candidate, Object.keys(candidate.entries).filter(projectId => !this.enrolled(projectId)));
     return this.record(candidate, request.requestId, fingerprint, {
       views: groups.map(group => this.view(group, candidate)),
@@ -334,11 +297,6 @@ export class PermissionDelegationService {
     });
   }
 
-  /**
-   * The owner's onboarding of one project. It covers the project only the first time: a project that
-   * has had any owner act here keeps what that act left, so a repeat onboarding cannot undo a
-   * revocation or an opt-out, restore coverage after a regrouping, or drop direction text.
-   */
   coverProject(
     projectId: string,
     input: { requestId: string },
@@ -387,12 +345,10 @@ export class PermissionDelegationService {
     const replay = this.replay<WorkspaceDelegationView>(request.requestId, fingerprint);
     if (replay) return replay;
 
-    // Every workspace under this id is revoked, so no project that the id can name stays covered.
     const candidate = structuredClone(this.state);
     const { found, absent } = this.target(workspaceId, candidate);
     this.endEntries(candidate, absent);
     if (found.length === 0) {
-      // A project that left the host is in no listed workspace. Its own id still ends its entry.
       if (absent.length === 0) throw notFound();
       return this.record<WorkspaceDelegationView>(candidate, request.requestId, fingerprint,
         { workspaceId, name: workspaceId, state: "not-delegated", projects: [] });

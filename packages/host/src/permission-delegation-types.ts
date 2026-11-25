@@ -23,15 +23,12 @@ export const permissionDelegationMutationRequestSchema = z.object({
 export interface PermissionCoverageEntry {
   projectId: string;
   act: "delegate" | "onboarding";
-  /** The workspace named by the owner act; the current holder is resolved separately. */
   workspaceId: string;
   by: string;
   at: string;
   interruptClasses: string[];
   policyVersion: number;
-  /** The project's root path at the owner act. Another checkout enrolled later under the same id is not covered. */
   path: string;
-  /** The project's owner-move mark at the owner act. An owner regrouping that moves the project changes the mark. */
   moveMark: string;
   direction?: string;
 }
@@ -120,7 +117,6 @@ export interface WorkspaceDelegationView {
 export type PermissionDelegationGroup = {
   id: string;
   name: string;
-  /** True for the unstored workspace of one ungrouped project. It carries that project's id. */
   implicit?: boolean;
   repos: Array<{ checkouts: Array<{ projectId: string; name?: string }> }>;
 };

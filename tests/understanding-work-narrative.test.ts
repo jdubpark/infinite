@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import test from "node:test";
@@ -111,7 +112,9 @@ test("owner refresh runs context and brief once, then returns the cached narrati
   const result = store.refresh("workspace-1", `team:${f.run.id}`, f.run, "owner");
   assert.equal(result.queued, true);
   assert.equal(result.narrative.state, "pending");
-  const persisted = unseal<{ jobs: number; pending?: unknown }>(f.key, "understanding-work-narrative", readFileSync(join(f.stateDir, "understanding", "work-narratives", "workspace-1.sealed"), "utf8"));
+  const wsFile = join(f.stateDir, "understanding", "work-narratives", "workspace-1.sealed");
+  await waitFor(() => existsSync(wsFile) ? true : null);
+  const persisted = unseal<{ jobs: number; pending?: unknown }>(f.key, "understanding-work-narrative", readFileSync(wsFile, "utf8"));
   assert.equal(persisted.jobs, 1);
   assert.equal("pending" in persisted, false);
   const record = await waitFor(() => store.read("workspace-1", `team:${f.run.id}`));
@@ -410,4 +413,459 @@ test("a new store instance reads the sealed narrative", async t => {
   assert.deepEqual(second.read("workspace-1", `team:${f.run.id}`), saved);
   assert.equal(second.status("workspace-1", `team:${f.run.id}`, f.run).state, "ready");
   await second.close();
+});
+
+test("queued jobs refund daily quota when canceled by close or refused by gate, and run up to 2 workspaces concurrently", async t => {
+  const f = setup(t);
+  const run1 = structuredClone(f.run);
+  const run2 = { ...structuredClone(f.run), id: "run-2" };
+  const run3 = { ...structuredClone(f.run), id: "run-3" };
+  const records = [run1, run2, run3];
+  let pendingRunId: string | null = null;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let releaseAll!: () => void;
+  const gate = new Promise<void>(resolve => { releaseAll = resolve; });
+  let startedCount = 0;
+  let markTwoStarted!: () => void;
+  const twoStarted = new Promise<void>(resolve => { markTwoStarted = resolve; });
+
+  const store = new WorkNarrativeStore({
+    config: f.config, key: f.key,
+    adapter: { explainWork: async (_input, { signal }) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      startedCount++;
+      if (startedCount === 2) markTwoStarted();
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const onAbort = () => reject(new Error("aborted"));
+          signal.addEventListener("abort", onAbort, { once: true });
+          void gate.then(() => { signal.removeEventListener("abort", onAbort); resolve(); });
+        });
+        return explanation();
+      } finally {
+        inFlight--;
+      }
+    } },
+    teams: { understandingRecords: () => records, pendingOperation: (id: string) => pendingRunId === id },
+  });
+
+  assert.equal(store.refresh("workspace-1", `team:${run1.id}`, run1, "owner").queued, true);
+  assert.equal(store.refresh("workspace-2", `team:${run2.id}`, run2, "owner").queued, true);
+  assert.equal(store.refresh("workspace-1", `team:${run3.id}`, run3, "owner").queued, true);
+  await twoStarted;
+  assert.equal(maxInFlight, 2);
+
+  pendingRunId = run3.id;
+  releaseAll();
+  await waitFor(() => store.read("workspace-1", `team:${run1.id}`));
+  await waitFor(() => store.read("workspace-2", `team:${run2.id}`));
+  await waitFor(() => store.status("workspace-1", `team:${run3.id}`, run3).state === "unavailable" ? true : null);
+
+  const ws1File = join(f.stateDir, "understanding", "work-narratives", "workspace-1.sealed");
+  const ws1State = unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws1File, "utf8"));
+  assert.equal(ws1State.jobs, 1);
+
+  pendingRunId = null;
+  let markFirstBlocked!: () => void;
+  const firstBlocked = new Promise<void>(resolve => { markFirstBlocked = resolve; });
+  const closeStore = new WorkNarrativeStore({
+    config: f.config, key: f.key,
+    adapter: { explainWork: async (_input, { signal }) => {
+      markFirstBlocked();
+      return await new Promise((_, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    } },
+    teams: { understandingRecords: () => [run1, run3], pendingOperation: () => false },
+  });
+  const run4 = { ...structuredClone(f.run), id: "run-4" };
+  const closeTeams = [run1, run4];
+  const closeStore2 = new WorkNarrativeStore({
+    config: f.config, key: f.key,
+    adapter: { explainWork: async (_input, { signal }) => {
+      markFirstBlocked();
+      return await new Promise((_, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    } },
+    teams: { understandingRecords: () => closeTeams, pendingOperation: () => false },
+  });
+  await closeStore.close();
+
+  assert.equal(closeStore2.refresh("workspace-3", `team:${run1.id}`, run1, "owner").queued, true);
+  await firstBlocked;
+  assert.equal(closeStore2.refresh("workspace-3", `team:${run4.id}`, run4, "owner").queued, true);
+  const ws3File = join(f.stateDir, "understanding", "work-narratives", "workspace-3.sealed");
+  assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws3File, "utf8")).jobs, 1);
+  await closeStore2.close();
+  assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws3File, "utf8")).jobs, 1);
+  await store.close();
+});
+
+test("replacing a same-day queued narrative succeeds at the daily budget cap with zero enqueue writes", async t => {
+  const now = () => new Date("2026-10-25T12:00:00.000Z");
+  const f = setup(t, { now });
+  const root2 = join(f.directory, "workspace-2");
+  mkdirSync(join(root2, "src"), { recursive: true });
+  execFileSync("git", ["init", root2], { stdio: "ignore" });
+  writeFileSync(join(root2, "src/a.ts"), "export const other = 1;\n");
+  const base2 = commit(root2, "base2");
+  writeFileSync(join(root2, "src/a.ts"), "export const other = 2;\n");
+  const head2a = commit(root2, "work2a");
+
+  const run1 = structuredClone(f.run);
+  const run2 = { ...structuredClone(f.run), id: "run-2", workspace: root2, baseCommit: base2, headCommit: head2a };
+  const run3 = { ...structuredClone(f.run), id: "run-3" };
+  const records = [run1, run2, run3];
+  const storeDir = join(f.stateDir, "understanding", "work-narratives");
+  const wsFile = join(storeDir, "workspace-1.sealed");
+  mkdirSync(storeDir, { recursive: true });
+  writeFileSync(wsFile, seal(f.key, "understanding-work-narrative", { version: 1, day: "2026-10-25", jobs: 46, records: {}, failures: {} }));
+
+  let markStarted!: () => void;
+  let releaseFirst!: () => void;
+  const firstStarted = new Promise<void>(resolve => { markStarted = resolve; });
+  const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+  let calls = 0;
+  const store = new WorkNarrativeStore({
+    config: f.config, key: f.key, now,
+    adapter: { explainWork: async () => {
+      calls++;
+      if (calls === 1) { markStarted(); await firstGate; }
+      return explanation();
+    } },
+    teams: { understandingRecords: () => records, pendingOperation: () => false },
+  });
+
+  const realRenameSync = fs.renameSync;
+  try {
+    assert.equal(store.refresh("workspace-1", `team:${run1.id}`, run1, "owner").queued, true);
+    await firstStarted;
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(wsFile, "utf8")).jobs, 47);
+    assert.equal(store.refresh("workspace-1", `team:${run2.id}`, run2, "owner").queued, true);
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(wsFile, "utf8")).jobs, 47);
+
+    writeFileSync(join(root2, "src/a.ts"), "export const other = 3;\n");
+    const head2b = commit(root2, "work2b");
+    run2.headCommit = head2b;
+
+    let persistWrites = 0;
+    fs.renameSync = ((src: fs.PathLike, dest: fs.PathLike) => {
+      if (String(dest) === wsFile) persistWrites++;
+      return realRenameSync(src, dest);
+    }) as typeof fs.renameSync;
+    syncBuiltinESMExports();
+    try {
+      const replaced = store.refresh("workspace-1", `team:${run2.id}`, run2, "owner");
+      assert.equal(replaced.queued, true);
+      assert.equal(replaced.narrative.state, "pending");
+      assert.equal(persistWrites, 0, "replacing a queued job writes zero quota updates before dispatch");
+    } finally {
+      fs.renameSync = realRenameSync;
+      syncBuiltinESMExports();
+    }
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(wsFile, "utf8")).jobs, 47);
+
+    const excess = store.refresh("workspace-1", `team:${run3.id}`, run3, "owner");
+    assert.equal(excess.queued, false);
+    assert.match(excess.narrative.reason, /daily/);
+
+    releaseFirst();
+    const generated = await waitFor(() => store.read("workspace-1", `team:${run2.id}`));
+    assert.equal(generated.headCommit, head2b);
+    assert.equal(calls, 2);
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(wsFile, "utf8")).jobs, 48);
+  } finally {
+    fs.renameSync = realRenameSync;
+    syncBuiltinESMExports();
+    releaseFirst();
+    await store.close();
+  }
+});
+
+test("charge-at-dispatch persists zero charges for canceled or gate-refused queued jobs even when storage fails during close", async t => {
+  const now = () => new Date("2026-10-25T12:00:00.000Z");
+  const f = setup(t, { now });
+  const run1 = structuredClone(f.run);
+  const run2 = { ...structuredClone(f.run), id: "run-2" };
+  const run3 = { ...structuredClone(f.run), id: "run-3" };
+  const records = [run1, run2, run3];
+  const storeDir = join(f.stateDir, "understanding", "work-narratives");
+  mkdirSync(storeDir, { recursive: true });
+  const ws1File = join(storeDir, "workspace-1.sealed");
+  const ws2File = join(storeDir, "workspace-2.sealed");
+  const ws3File = join(storeDir, "workspace-3.sealed");
+  writeFileSync(ws1File, seal(f.key, "understanding-work-narrative", { version: 1, day: "2026-10-25", jobs: 46, records: {}, failures: {} }));
+  writeFileSync(ws2File, seal(f.key, "understanding-work-narrative", { version: 1, day: "2026-10-25", jobs: 46, records: {}, failures: {} }));
+  writeFileSync(ws3File, seal(f.key, "understanding-work-narrative", { version: 1, day: "2026-10-25", jobs: 47, records: {}, failures: {} }));
+
+  const realRenameSync = fs.renameSync;
+  let failTarget: string | null = null;
+  fs.renameSync = ((src: fs.PathLike, dest: fs.PathLike) => {
+    if (failTarget && String(dest) === failTarget) throw Object.assign(new Error("injected write failure"), { code: "EIO" });
+    return realRenameSync(src, dest);
+  }) as typeof fs.renameSync;
+  syncBuiltinESMExports();
+
+  let releaseFirst!: () => void;
+  let releaseWindDown!: () => void;
+  let store1: WorkNarrativeStore | undefined;
+  let store2: WorkNarrativeStore | undefined;
+  let store3: WorkNarrativeStore | undefined;
+  let reopened1: WorkNarrativeStore | undefined;
+  let reopened2: WorkNarrativeStore | undefined;
+  try {
+    let pendingRunId: string | null = null;
+    let markFirstStarted!: () => void;
+    const firstStarted = new Promise<void>(resolve => { markFirstStarted = resolve; });
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+    let calls = 0;
+    store1 = new WorkNarrativeStore({
+      config: f.config, key: f.key, now,
+      adapter: { explainWork: async () => {
+        calls++;
+        if (calls === 1) { markFirstStarted(); await firstGate; }
+        return explanation();
+      } },
+      teams: { understandingRecords: () => records, pendingOperation: (id: string) => pendingRunId === id },
+    });
+    assert.equal(store1.refresh("workspace-1", `team:${run1.id}`, run1, "owner").queued, true);
+    await firstStarted;
+    assert.equal(store1.refresh("workspace-1", `team:${run2.id}`, run2, "owner").queued, true);
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws1File, "utf8")).jobs, 47);
+
+    pendingRunId = run2.id;
+    releaseFirst();
+    await waitFor(() => store1!.read("workspace-1", `team:${run1.id}`));
+    await waitFor(() => store1!.status("workspace-1", `team:${run2.id}`, run2).state === "unavailable" ? true : null);
+    assert.equal(calls, 1);
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws1File, "utf8")).jobs, 47);
+    await store1.close();
+
+    reopened1 = new WorkNarrativeStore({
+      config: f.config, key: f.key, now,
+      adapter: { explainWork: async () => explanation() },
+      teams: { understandingRecords: () => records, pendingOperation: () => false },
+    });
+    assert.equal(reopened1.refresh("workspace-1", `team:${run3.id}`, run3, "owner").queued, true);
+    await waitFor(() => reopened1!.read("workspace-1", `team:${run3.id}`));
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws1File, "utf8")).jobs, 48);
+    await reopened1.close();
+
+    let markSlowStarted!: () => void;
+    let markSlowAborted!: () => void;
+    const slowStarted = new Promise<void>(resolve => { markSlowStarted = resolve; });
+    const slowAborted = new Promise<void>(resolve => { markSlowAborted = resolve; });
+    const windDownGate = new Promise<void>(resolve => { releaseWindDown = resolve; });
+    store2 = new WorkNarrativeStore({
+      config: f.config, key: f.key, now,
+      adapter: { explainWork: async (_input, { signal }) => {
+        markSlowStarted();
+        await new Promise<void>(resolve => signal.addEventListener("abort", () => { markSlowAborted(); resolve(); }, { once: true }));
+        await windDownGate;
+        throw new Error("aborted after wind-down");
+      } },
+      teams: { understandingRecords: () => records, pendingOperation: () => false },
+    });
+    assert.equal(store2.refresh("workspace-2", `team:${run1.id}`, run1, "owner").queued, true);
+    await slowStarted;
+    assert.equal(store2.refresh("workspace-2", `team:${run2.id}`, run2, "owner").queued, true);
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws2File, "utf8")).jobs, 47);
+
+    failTarget = ws2File;
+    const closingSlow = store2.close();
+    await slowAborted;
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws2File, "utf8")).jobs, 47, "queued job was never charged on disk");
+    releaseWindDown();
+    await closingSlow;
+    failTarget = null;
+
+    reopened2 = new WorkNarrativeStore({
+      config: f.config, key: f.key, now,
+      adapter: { explainWork: async () => explanation() },
+      teams: { understandingRecords: () => records, pendingOperation: () => false },
+    });
+    assert.equal(reopened2.refresh("workspace-2", `team:${run3.id}`, run3, "owner").queued, true);
+    await waitFor(() => reopened2!.read("workspace-2", `team:${run3.id}`));
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws2File, "utf8")).jobs, 48);
+    await reopened2.close();
+
+    let dispatchCalls = 0;
+    store3 = new WorkNarrativeStore({
+      config: f.config, key: f.key, now,
+      adapter: { explainWork: async () => { dispatchCalls++; return explanation(); } },
+      teams: { understandingRecords: () => records, pendingOperation: () => false },
+    });
+    failTarget = ws3File;
+    assert.equal(store3.refresh("workspace-3", `team:${run1.id}`, run1, "owner").queued, true);
+    const failedStatus = await waitFor(() => {
+      const value = store3!.status("workspace-3", `team:${run1.id}`, run1);
+      return value.state === "pending" ? null : value;
+    });
+    assert.equal(failedStatus.state, "failed");
+    assert.match(failedStatus.reason, /storage is unavailable/i);
+    assert.equal(dispatchCalls, 0, "a failed dispatch-time quota persist must not invoke the writer");
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws3File, "utf8")).jobs, 47);
+    assert.equal(store3.status("workspace-3", `team:${run1.id}`, { ...run1, headCommit: "b".repeat(40) }).state, "unavailable");
+    failTarget = null;
+    assert.equal(store3.refresh("workspace-3", `team:${run1.id}`, run1, "owner").queued, true);
+    await waitFor(() => store3!.read("workspace-3", `team:${run1.id}`));
+    assert.equal(dispatchCalls, 1);
+    assert.equal(store3.status("workspace-3", `team:${run1.id}`, run1).state, "ready");
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws3File, "utf8")).jobs, 48);
+    await store3.close();
+  } finally {
+    failTarget = null;
+    fs.renameSync = realRenameSync;
+    syncBuiltinESMExports();
+    releaseFirst?.();
+    releaseWindDown?.();
+    await Promise.allSettled([store1?.close(), store2?.close(), store3?.close(), reopened1?.close(), reopened2?.close()]);
+  }
+});
+
+test("seeded simulator verifies durable narrative quota accounting across replacements, rollovers, faults, close, and reload", async t => {
+  let seed = 0x5eed1234;
+  const rand = () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let x = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    x ^= x + Math.imul(x ^ (x >>> 7), 61 | x);
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
+  const pick = <T>(items: readonly T[]): T => items[Math.floor(rand() * items.length)]!;
+
+  let nowMs = Date.parse("2026-10-25T12:00:00.000Z");
+  const now = () => new Date(nowMs);
+  const utcDay = () => now().toISOString().slice(0, 10);
+  const f = setup(t, { now });
+  const storeDir = join(f.stateDir, "understanding", "work-narratives");
+  mkdirSync(storeDir, { recursive: true });
+  const workspaces = ["sim-ws-1", "sim-ws-2"] as const;
+  const repos = Array.from({ length: 4 }, (_, index) => {
+    const ws = workspaces[Math.floor(index / 2)]!;
+    const dir = join(f.directory, `sim-repo-${index}`);
+    mkdirSync(join(dir, "src"), { recursive: true });
+    execFileSync("git", ["init", dir], { stdio: "ignore" });
+    writeFileSync(join(dir, "src/a.ts"), `export const r${index} = 0;\n`);
+    const baseCommit = commit(dir, `base-${index}`);
+    writeFileSync(join(dir, "src/a.ts"), `export const r${index} = 1;\n`);
+    const headCommit = commit(dir, `head-${index}-1`);
+    return { ws, dir, rev: 1, run: { ...structuredClone(f.run), id: `sim-run-${index}`, workspace: dir, baseCommit, headCommit } };
+  });
+
+  const realRenameSync = fs.renameSync;
+  let failPersist = false;
+  fs.renameSync = ((src: fs.PathLike, dest: fs.PathLike) => {
+    if (failPersist && String(dest).startsWith(storeDir)) throw Object.assign(new Error("sim write fault"), { code: "EIO" });
+    return realRenameSync(src, dest);
+  }) as typeof fs.renameSync;
+  syncBuiltinESMExports();
+
+  const expectedByDay = new Map<string, number>();
+  const keyOf = (ws: string, day: string) => `${ws}:${day}`;
+  const assertDiskMatchesOracle = (label: string) => {
+    const day = utcDay();
+    for (const ws of workspaces) {
+      const file = join(storeDir, `${ws}.sealed`);
+      const expected = expectedByDay.get(keyOf(ws, day)) ?? 0;
+      if (!existsSync(file)) {
+        assert.equal(expected, 0, `${label}: ${ws} missing file must have 0 dispatches`);
+        continue;
+      }
+      const saved = unseal<{ day: string; jobs: number }>(f.key, "understanding-work-narrative", readFileSync(file, "utf8"));
+      const actual = saved.day === day ? saved.jobs : 0;
+      assert.equal(actual, expected, `${label}: ${ws} persisted jobs must equal dispatched count on ${day}`);
+      assert.ok(actual <= 48, `${label}: ${ws} persisted jobs must not exceed daily limit`);
+    }
+  };
+
+  const blockedRuns = new Set<string>();
+  let holdWriters = false;
+  const waiters: Array<() => void> = [];
+  let inFlight = 0;
+  const makeStore = () => new WorkNarrativeStore({
+    config: f.config, key: f.key, now,
+    adapter: { explainWork: async ({ root }, { signal }) => {
+      inFlight++;
+      const entry = repos.find(item => item.dir === root)!;
+      const k = keyOf(entry.ws, utcDay());
+      expectedByDay.set(k, (expectedByDay.get(k) ?? 0) + 1);
+      try {
+        if (holdWriters) {
+          await new Promise<void>((resolve, reject) => {
+            const onAbort = () => reject(new Error("aborted"));
+            signal.addEventListener("abort", onAbort, { once: true });
+            waiters.push(() => { signal.removeEventListener("abort", onAbort); resolve(); });
+          });
+        }
+        return explanation();
+      } finally {
+        inFlight--;
+      }
+    } },
+    teams: { understandingRecords: () => repos.map(item => item.run), pendingOperation: id => blockedRuns.has(id) },
+  });
+
+  let store = makeStore();
+  const settleStore = async () => {
+    holdWriters = false;
+    while (waiters.length) waiters.shift()!();
+    await waitFor(() => inFlight === 0 && repos.every(r => store.status(r.ws, `team:${r.run.id}`, r.run).state !== "pending") ? true : null);
+  };
+
+  try {
+    for (let step = 0; step < 50; step++) {
+      const action = rand();
+      if (action < 0.35) {
+        const repo = pick(repos);
+        if (rand() < 0.45) {
+          repo.rev++;
+          writeFileSync(join(repo.dir, "src/a.ts"), `export const v = ${repo.rev};\n`);
+          repo.run.headCommit = commit(repo.dir, `step-${step}-${repo.rev}`);
+        }
+        holdWriters = rand() < 0.5;
+        failPersist = rand() < 0.2;
+        store.refresh(repo.ws, `team:${repo.run.id}`, repo.run, "owner");
+        await Promise.resolve();
+        await Promise.resolve();
+        failPersist = false;
+      } else if (action < 0.52) {
+        const repo = pick(repos);
+        if (blockedRuns.has(repo.run.id)) blockedRuns.delete(repo.run.id);
+        else blockedRuns.add(repo.run.id);
+      } else if (action < 0.72) {
+        await settleStore();
+        assertDiskMatchesOracle(`step-${step}-settle`);
+      } else if (action < 0.85) {
+        failPersist = rand() < 0.5;
+        await store.close();
+        failPersist = false;
+        while (waiters.length) waiters.shift()!();
+        assertDiskMatchesOracle(`step-${step}-reopen`);
+        store = makeStore();
+      } else {
+        await settleStore();
+        assertDiskMatchesOracle(`step-${step}-before-rollover`);
+        nowMs += 86_400_000;
+      }
+    }
+    await store.close();
+    assertDiskMatchesOracle("final");
+
+    const checkFile = join(storeDir, `${workspaces[0]}.sealed`);
+    const existing = existsSync(checkFile)
+      ? unseal<{ version: 1; day: string; jobs: number; records: Record<string, unknown>; failures: Record<string, unknown> }>(f.key, "understanding-work-narrative", readFileSync(checkFile, "utf8"))
+      : { version: 1 as const, day: utcDay(), jobs: 0, records: {}, failures: {} };
+    writeFileSync(checkFile, seal(f.key, "understanding-work-narrative", { ...existing, day: utcDay(), jobs: (expectedByDay.get(keyOf(workspaces[0], utcDay())) ?? 0) + 1 }));
+    assert.throws(() => assertDiskMatchesOracle("negative-control"), /persisted jobs must equal dispatched count/);
+  } finally {
+    failPersist = false;
+    holdWriters = false;
+    while (waiters.length) waiters.shift()!();
+    fs.renameSync = realRenameSync;
+    syncBuiltinESMExports();
+    await store.close();
+  }
 });

@@ -1,12 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, mkdtempSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claimControl, startHost, waitFor } from "./helpers.js";
+import { initialAttention } from "@infinite/attention";
+import { claimControl, endSessionWorkers, startHost, waitFor } from "./helpers.js";
 import { readConfig, hashToken } from "../packages/host/src/config.js";
+import { LaunchHeldError, type HostReading } from "../packages/host/src/host-load.js";
+import { socketPath, workerCall } from "../packages/host/src/ipc.js";
+import { Manager } from "../packages/host/src/manager.js";
+import { writeSealed } from "../packages/host/src/vault.js";
+import type { Config, Session } from "../packages/host/src/types.js";
 
 test("machine setup persists private device and relay registrations without disclosing keys", () => {
   const root = realpathSync(mkdtempSync("/tmp/inf-machine-setup-"));
@@ -201,4 +208,299 @@ setInterval(() => {}, 1000);
     assert.equal(next.status, 200);
     assert.notEqual(next.body.runtime.id, resumed.body.runtime.id, "a fresh explicit request may resume a confirmed exited continuation");
   } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("concurrent resumes of distinct stopped recordings for one native conversation start a single live session", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-resume-recordings-"));
+  const fixture = join(root, "agent.mjs");
+  const nativeId = randomUUID();
+  writeFileSync(fixture, `
+if (process.env.INFINITE_HOOK_URL) await fetch(process.env.INFINITE_HOOK_URL + '/claude', {
+  method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + process.env.INFINITE_HOOK_TOKEN },
+  body: JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: ${JSON.stringify(nativeId)}, prompt: 'Smoke check' })
+});
+setInterval(() => {}, 1000);
+`);
+  const host = await startHost({ agents: { claude: { command: process.execPath, args: [fixture] } } });
+  try {
+    const stop = async (id: string) => {
+      await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.nativeSession?.id === nativeId);
+      const control = await claimControl(host, id, "owner");
+      assert.equal((await host.fetchApi(`/sessions/${id}/stop`, "owner", { requestId: randomUUID() }, control.headers)).status, 200);
+      await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.status === "exited");
+    };
+    const firstId = randomUUID();
+    const created = await host.fetchApi("/sessions", "owner", { requestId: firstId, provider: "claude", projectId: "rehearsal", title: "Recording A", prompt: "Start" });
+    assert.equal(created.status, 201);
+    await stop(firstId);
+    const second = await host.fetchApi(`/sessions/${firstId}/resume`, "owner", { requestId: randomUUID() });
+    assert.equal(second.status, 200);
+    await stop(second.body.id);
+    const results = await Promise.all([
+      host.fetchApi(`/sessions/${firstId}/resume`, "owner", { requestId: randomUUID() }),
+      host.fetchApi(`/sessions/${second.body.id}/resume`, "owner", { requestId: randomUUID() }),
+    ]);
+    assert.deepEqual(results.map(r => r.status), [200, 200]);
+    assert.equal(new Set(results.map(r => r.body.id)).size, 1);
+    const live = (await host.fetchApi("/sessions")).body.sessions.filter((s: { status: string }) => s.status === "running" || s.status === "starting");
+    assert.equal(live.length, 1);
+    assert.equal(live[0].id, results[0].body.id);
+  } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+});
+
+function controllableWorker(runDir: string, id: string, holdOnCall: number) {
+  let calls = 0;
+  let held!: () => void;
+  let release!: () => void;
+  const reached = new Promise<void>(resolve => { held = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const server = createServer(socket => {
+    socket.on("error", () => {});
+    let buffered = "";
+    socket.on("data", chunk => {
+      buffered += chunk;
+      if (!buffered.includes("\n")) return;
+      calls++;
+      const reply = () => socket.end(`${JSON.stringify({ result: { status: "running", seq: 1, screen: "", attention: initialAttention(new Date().toISOString(), false) } })}\n`);
+      if (calls === holdOnCall) {
+        held();
+        void gate.then(reply);
+      } else {
+        reply();
+      }
+    });
+  });
+  return new Promise<{ reached: Promise<void>; release: () => void; close: () => Promise<void> }>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath(runDir, id), () => resolve({
+      reached,
+      release,
+      close: () => new Promise<void>(done => server.close(() => { rmSync(socketPath(runDir, id), { force: true }); done(); })),
+    }));
+  });
+}
+
+test("create admission snapshots pending creates before listing so maxSessions is never exceeded", { timeout: 30_000 }, async () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-slot-"));
+  const stateDir = join(root, "state"), runDir = join(root, "r"), projectDir = join(root, "project"), keyFile = join(root, "key");
+  const agentScript = join(root, "agent.mjs");
+  mkdirSync(projectDir); mkdirSync(runDir);
+  const key = randomBytes(32);
+  writeFileSync(keyFile, key, { mode: 0o600 });
+  writeFileSync(agentScript, "setInterval(() => {}, 1000);\n");
+  const config: Config = {
+    port: 0, origin: "http://127.0.0.1", keyFile, stateDir, runDir, environment: "local", enableDemo: true, maxSessions: 2,
+    tokens: [], projects: [{ id: "rehearsal", name: "Rehearsal", path: projectDir }],
+    agents: { demo: { command: process.execPath, args: [agentScript] } },
+  };
+  const manager = new Manager(config, key);
+  const runningId = randomUUID(), firstId = randomUUID(), secondId = randomUUID();
+  mkdirSync(join(stateDir, "sessions", runningId), { recursive: true });
+  writeSealed(join(stateDir, "sessions", runningId, "meta.sealed"), key, `${runningId}:meta`, {
+    session: {
+      id: runningId, provider: "demo", title: "Existing worker", projectId: "rehearsal", cwd: projectDir,
+      createdAt: new Date().toISOString(), status: "running", contextVersion: 0, context: "", initialPrompt: "",
+    } as Session,
+    fingerprint: "existing-worker",
+  });
+  const workerA = await controllableWorker(runDir, runningId, 2);
+  try {
+    const createFirst = manager.create({ requestId: firstId, provider: "demo", projectId: "rehearsal", title: "First launch", prompt: "" });
+    const createSecond = manager.create({ requestId: secondId, provider: "demo", projectId: "rehearsal", title: "Second launch", prompt: "" });
+    const secondRejected = assert.rejects(createSecond, /session limit/);
+    await workerA.reached;
+    assert.equal(existsSync(socketPath(runDir, firstId)), false, "the second admission sampled the first launch before its worker socket existed");
+    const first = await createFirst;
+    assert.equal(first.status, "running");
+    assert.equal(existsSync(socketPath(runDir, firstId)), true);
+    workerA.release();
+    await secondRejected;
+    const live = (await manager.list()).filter(session => session.status === "running" || session.status === "starting");
+    assert.deepEqual(live.map(session => session.id).sort(), [runningId, firstId].sort());
+  } finally {
+    workerA.release();
+    await workerA.close();
+    await endSessionWorkers(config);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("queued team launches recheck hostLoad after create admission and release their reserved slot on hold", { timeout: 30_000 }, async () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-load-"));
+  const stateDir = join(root, "state"), runDir = join(root, "r"), projectDir = join(root, "project");
+  const teamRoot = join(root, "teams"), memberDir = join(teamRoot, "member-1"), keyFile = join(root, "key");
+  const agentScript = join(root, "agent.mjs");
+  mkdirSync(projectDir); mkdirSync(runDir); mkdirSync(memberDir, { recursive: true });
+  const key = randomBytes(32);
+  writeFileSync(keyFile, key, { mode: 0o600 });
+  writeFileSync(agentScript, "setInterval(() => {}, 1000);\n");
+  const GiB = 2 ** 30;
+  let reading: HostReading = { availableMemoryBytes: 32 * GiB, load1: 1, cpus: 16 };
+  const config: Config = {
+    port: 0, origin: "http://127.0.0.1", keyFile, stateDir, runDir, environment: "local", enableDemo: true, maxSessions: 3,
+    hostLoad: { minAvailableMemoryGiB: 8, maxLoadPerCpu: 1.5 },
+    teams: { workspaceDir: teamRoot },
+    tokens: [], projects: [{ id: "rehearsal", name: "Rehearsal", path: projectDir }],
+    agents: { demo: { command: process.execPath, args: [agentScript] } },
+  };
+  const manager = new Manager(config, key, () => reading);
+  const runningId = randomUUID(), firstId = randomUUID(), secondId = randomUUID();
+  mkdirSync(join(stateDir, "sessions", runningId), { recursive: true });
+  writeSealed(join(stateDir, "sessions", runningId, "meta.sealed"), key, `${runningId}:meta`, {
+    session: {
+      id: runningId, provider: "demo", title: "Existing worker", projectId: "rehearsal", cwd: projectDir,
+      createdAt: new Date().toISOString(), status: "running", contextVersion: 0, context: "", initialPrompt: "",
+    } as Session,
+    fingerprint: "existing-worker",
+  });
+  const workerA = await controllableWorker(runDir, runningId, 2);
+  try {
+    const runId = randomUUID();
+    const createTeam1 = manager.createTeamSession(
+      { requestId: firstId, provider: "demo", projectId: "rehearsal", title: "Team 1", prompt: "" },
+      { runId, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "task-1" },
+      memberDir,
+    );
+    const createTeam2 = manager.createTeamSession(
+      { requestId: secondId, provider: "demo", projectId: "rehearsal", title: "Team 2", prompt: "" },
+      { runId, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "task-2" },
+      memberDir,
+    );
+    const team2Rejected = assert.rejects(createTeam2, LaunchHeldError);
+    await workerA.reached;
+    reading = { availableMemoryBytes: 5.2 * GiB, load1: 1, cpus: 16 };
+    await new Promise(resolve => setTimeout(resolve, 2100));
+    workerA.release();
+    const first = await createTeam1;
+    assert.equal(first.status, "running");
+    await team2Rejected;
+    assert.equal(existsSync(join(stateDir, "sessions", secondId, "meta.sealed")), false);
+    const owner = await manager.create({ requestId: randomUUID(), provider: "demo", projectId: "rehearsal", title: "Owner after hold", prompt: "" });
+    assert.equal(owner.status, "running", "the held team launch released its reserved session slot cleanly");
+  } finally {
+    workerA.release();
+    await workerA.close();
+    await endSessionWorkers(config);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("concurrent creates with uppercase and lowercase spellings converge to one session while preserving legacy mixed-case records", { timeout: 30_000 }, async () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-uuid-case-"));
+  const stateDir = join(root, "state"), runDir = join(root, "r"), projectDir = join(root, "project"), keyFile = join(root, "key");
+  const agentScript = join(root, "agent.mjs");
+  mkdirSync(projectDir); mkdirSync(runDir);
+  const key = randomBytes(32);
+  writeFileSync(keyFile, key, { mode: 0o600 });
+  writeFileSync(agentScript, "setInterval(() => {}, 1000);\n");
+  const config: Config = {
+    port: 0, origin: "http://127.0.0.1", keyFile, stateDir, runDir, environment: "local", enableDemo: true, maxSessions: 4,
+    tokens: [], projects: [{ id: "rehearsal", name: "Rehearsal", path: projectDir }],
+    agents: { demo: { command: process.execPath, args: [agentScript] } },
+  };
+  const manager = new Manager(config, key);
+  const canonical = randomUUID().toLowerCase();
+  const upper = canonical.toUpperCase();
+  const legacyUpper = randomUUID().toUpperCase();
+  const legacyRequest = { requestId: legacyUpper, provider: "demo" as const, projectId: "rehearsal", title: "Legacy upper", prompt: "Legacy prompt" };
+  mkdirSync(join(stateDir, "sessions", legacyUpper), { recursive: true });
+  writeSealed(join(stateDir, "sessions", legacyUpper, "meta.sealed"), key, `${legacyUpper}:meta`, {
+    session: {
+      id: legacyUpper, provider: "demo", title: "Legacy upper", projectId: "rehearsal", cwd: projectDir,
+      createdAt: new Date().toISOString(), status: "exited", contextVersion: 0, context: "", initialPrompt: "Legacy prompt",
+    } as Session,
+    fingerprint: createHash("sha256").update(JSON.stringify(legacyRequest)).digest("hex"),
+  });
+  writeSealed(join(stateDir, "sessions", legacyUpper, "status.sealed"), key, `${legacyUpper}:status`, {
+    status: "exited", seq: 1, screen: "", exitCode: 0, attention: initialAttention(new Date().toISOString(), false),
+  });
+  try {
+    assert.equal(manager.meta(legacyUpper).session.id, legacyUpper);
+    assert.equal((await manager.list()).some(session => session.id === legacyUpper), true);
+    const replayedExact = await manager.create(legacyRequest);
+    assert.equal(replayedExact.id, legacyUpper);
+    assert.equal(replayedExact.status, "exited");
+    const replayedLower = await manager.create({ ...legacyRequest, requestId: legacyUpper.toLowerCase() });
+    assert.equal(replayedLower.id, legacyUpper);
+    assert.equal(replayedLower.status, "exited");
+
+    const [a, b] = await Promise.all([
+      manager.create({ requestId: upper, provider: "demo", projectId: "rehearsal", title: "Case check", prompt: "Same prompt" }),
+      manager.create({ requestId: canonical, provider: "demo", projectId: "rehearsal", title: "Case check", prompt: "Same prompt" }),
+    ]);
+    assert.equal(a.id, b.id);
+    assert.ok(a.id === upper || a.id === canonical);
+    assert.equal(a.runtime?.id, b.runtime?.id);
+    const directState = await workerCall<{ status: string }>(runDir, a.id, { op: "state" });
+    assert.equal(directState.status, "running");
+    const live = (await manager.list()).filter(session => session.status === "running" || session.status === "starting");
+    assert.deepEqual(live.map(session => session.id), [a.id]);
+    await assert.rejects(
+      manager.create({ requestId: a.id === upper ? canonical : upper, provider: "demo", projectId: "rehearsal", title: "Case check", prompt: "Different prompt" }),
+      /different session/,
+    );
+  } finally {
+    await endSessionWorkers(config);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("aliased resume receipt replay serializes with target removal and never returns unavailable for a deleted target", { timeout: 20_000 }, async () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-alias-rm-"));
+  const stateDir = join(root, "state"), runDir = join(root, "r"), projectDir = join(root, "project"), keyFile = join(root, "key");
+  mkdirSync(projectDir); mkdirSync(runDir);
+  const key = randomBytes(32);
+  writeFileSync(keyFile, key, { mode: 0o600 });
+  const config: Config = {
+    port: 0, origin: "http://127.0.0.1", keyFile, stateDir, runDir, environment: "local", enableDemo: true, maxSessions: 4,
+    tokens: [], projects: [{ id: "rehearsal", name: "Rehearsal", path: projectDir }], agents: {},
+  };
+  const manager = new Manager(config, key);
+  const sourceId = randomUUID(), targetId = randomUUID(), aliasId = randomUUID();
+  const exited = { status: "exited", seq: 2, screen: "", exitCode: 0, attention: initialAttention(new Date().toISOString(), false) };
+  for (const id of [sourceId, targetId]) {
+    mkdirSync(join(stateDir, "sessions", id), { recursive: true });
+    writeSealed(join(stateDir, "sessions", id, "meta.sealed"), key, `${id}:meta`, {
+      session: {
+        id, provider: "claude", title: "Recorded", projectId: "rehearsal", cwd: projectDir, projectRoot: projectDir,
+        createdAt: new Date().toISOString(), status: "exited", contextVersion: 0, context: "", initialPrompt: "",
+      } as Session,
+      fingerprint: `fp-${id}`,
+    });
+    writeSealed(join(stateDir, "sessions", id, "status.sealed"), key, `${id}:status`, exited);
+  }
+  mkdirSync(join(stateDir, "resumptions"), { recursive: true });
+  writeSealed(join(stateDir, "resumptions", `${aliasId}.sealed`), key, `resume:${aliasId}`, { sourceId, targetId });
+
+  const originalState = manager.state.bind(manager);
+  let markStateEntered!: () => void;
+  let releaseState!: () => void;
+  const stateEntered = new Promise<void>(resolve => { markStateEntered = resolve; });
+  const stateGate = new Promise<void>(resolve => { releaseState = resolve; });
+  let interceptTarget = true;
+  manager.state = (async (id: string, screen?: boolean) => {
+    if (interceptTarget && id.toLowerCase() === targetId) {
+      interceptTarget = false;
+      markStateEntered();
+      await stateGate;
+    }
+    return originalState(id, screen);
+  }) as Manager["state"];
+  try {
+    const replaying = manager.resume(sourceId, aliasId);
+    await stateEntered;
+    const removing = manager.remove(targetId);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(existsSync(join(stateDir, "deleted-sessions", `${targetId}.sealed`)), false, "remove waits for aliased replay to finish reading target state");
+    releaseState();
+    const replayed = await replaying;
+    assert.equal(replayed.id, targetId);
+    assert.equal(replayed.status, "exited");
+    await removing;
+    assert.equal(existsSync(join(stateDir, "deleted-sessions", `${targetId}.sealed`)), true);
+    await assert.rejects(manager.resume(sourceId, aliasId), { code: "ENOENT" });
+  } finally {
+    releaseState();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

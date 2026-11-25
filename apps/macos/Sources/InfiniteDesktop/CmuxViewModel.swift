@@ -27,11 +27,22 @@ private struct CmuxPendingCreation: Codable {
 
 @MainActor final class CmuxViewModel: ObservableObject {
     @Published var profiles: [CmuxHostProfile] = []
-    @Published var activeID = ""
+    @Published var activeID = "" {
+        didSet {
+            if activeID != oldValue {
+                connectionGeneration = UUID()
+                creationReceiptLoaded = false
+                pendingCreation = nil
+                creationPending = false
+            }
+        }
+    }
     @Published var connected = false
     @Published var connecting = false
     @Published private(set) var displayVisible = false
     @Published private(set) var disconnecting = false
+    @Published private(set) var draftEditingLocked = false
+    @Published private(set) var inputFenced = false
     @Published var attached = false
     @Published var busy = false
     @Published private(set) var sending = false
@@ -44,6 +55,7 @@ private struct CmuxPendingCreation: Codable {
     @Published var lastSeen: Date?
     @Published var draft = DraftRecord()
     @Published var creationPending = false
+    @Published private(set) var creationReceiptLoaded = false
     @Published private(set) var rendererGeneration = UUID()
     @Published private(set) var snapshotReady = false
     @Published private(set) var hasConnected = false
@@ -51,20 +63,26 @@ private struct CmuxPendingCreation: Codable {
     @Published private(set) var catalogLoaded = false
     @Published private(set) var attaching = false
     let pipe = TerminalPipe()
-    private let backend = CmuxBackend()
-    private let drafts = DraftStore()
+    private let deps: CmuxViewModelDependencies
     private var poll: Task<Void, Never>?
     private var displayGeneration = UUID()
     private var pollGeneration = UUID()
     private var saveTask: Task<Void, Never>?
+    private var saveInFlight: Task<Void, Error>?
+    private var draftVersion = 0
     private var connectionGeneration = UUID()
     private var attachmentGeneration = UUID()
+    private var inputGeneration = UUID()
+    private var activeDisconnectTask: Task<Void, Error>?
     private var outputBuffer: CmuxOutputBuffer?
     private var pendingCreation: CmuxPendingCreation?
+    private var clearingCreation = false
+    private var clearingPending = false
     private var lastSize = (80, 24)
     private var queuedInput = Data()
-    private var sendingRaw = false
+    private var rawDrainGeneration: UUID?
     private var busyAttachment: UUID?
+    private var selectionToken: UUID?
     private var snapshotReceived = false
     private var streamEnded = false
     private lazy var catalogFreshness = DisplayFreshness { [weak self] in self?.catalogDisplayStale = $0 }
@@ -72,10 +90,11 @@ private struct CmuxPendingCreation: Codable {
     var active: CmuxHostProfile? { profiles.first { $0.id == activeID } }
     var selected: CmuxTerminalRow? { terminals.first { $0.id == selectedID } }
     var rendererVisible: Bool { displayVisible && attached }
-    var canSend: Bool { connected && attached && snapshotReady && inputEnabled && !directInput && !busy && draft.pending == nil && !draft.text.isEmpty }
+    var canSend: Bool { connected && attached && snapshotReady && inputEnabled && !directInput && !busy && !inputFenced && !disconnecting && draft.pending == nil && !draft.text.isEmpty }
     private var draftIdentity: String? { selectedID.map { "cmux:\(attachedProfileID):\($0)" } }
 
-    init() {
+    init(deps: CmuxViewModelDependencies = .live()) {
+        self.deps = deps
         if let data = UserDefaults.standard.data(forKey: "cmuxProfiles"), let saved = try? JSONDecoder().decode([CmuxHostProfile].self, from: data) { profiles = saved }
         activeID = UserDefaults.standard.string(forKey: "activeCmuxProfile") ?? profiles.first?.id ?? ""
     }
@@ -132,13 +151,15 @@ private struct CmuxPendingCreation: Codable {
     func connect(invitation: String = "") async {
         guard !connecting, !disconnecting, !busy, let profile = active else { return }
         do { try await disconnect() } catch { notice = error.localizedDescription; return }
-        connecting = true; connectionStatus = invitation.isEmpty ? "Authenticating saved identity…" : "Waiting for server enrollment approval…"
+        guard activeID == profile.id else { return }
+        connecting = true; creationReceiptLoaded = false; pendingCreation = nil; creationPending = false
+        connectionStatus = invitation.isEmpty ? "Authenticating saved identity…" : "Waiting for server enrollment approval…"
         notice = invitation.isEmpty ? "Authenticating the pinned cmux server." : "Approve this device on your server. The invitation stays in memory."
         connectionGeneration = UUID(); let generation = connectionGeneration
-        let helper = Bundle.main.resourceURL!.appendingPathComponent("cmux")
+        let helper = deps.helperURL()
         do {
             let token = invitation.trimmingCharacters(in: .whitespacesAndNewlines)
-            try await backend.connect(profileID: profile.id, route: profile.route, helperURL: helper, invitation: token.isEmpty ? nil : token) { [weak self] event in
+            try await deps.connect(profile.id, profile.route, helper, token.isEmpty ? nil : token) { [weak self] event in
                 Task { @MainActor in
                     guard let self, self.connectionGeneration == generation else { return }
                     let state = event["connection"]["state"].string
@@ -146,14 +167,16 @@ private struct CmuxPendingCreation: Codable {
                     if state != "connected" { self.inputEnabled = false; self.directInput = false }
                 }
             }
-            guard generation == connectionGeneration else { return }
+            guard generation == connectionGeneration, profile.id == activeID, !disconnecting else { return }
+            await loadPendingCreation(profileID: profile.id, generation: generation)
+            guard generation == connectionGeneration, profile.id == activeID, !disconnecting else { return }
             connected = true; connecting = false; connectionStatus = "Noise encrypted · enrolled device"
             hasConnected = true
-            persistProfiles(); loadPendingCreation()
+            persistProfiles()
             await refresh()
-            guard generation == connectionGeneration else { return }
+            guard generation == connectionGeneration, profile.id == activeID, !disconnecting else { return }
             if let id = terminals.first?.id { await select(id) }
-            guard generation == connectionGeneration else { return }
+            guard generation == connectionGeneration, profile.id == activeID, !disconnecting else { return }
             startPolling()
         } catch {
             guard generation == connectionGeneration else { return }
@@ -166,7 +189,7 @@ private struct CmuxPendingCreation: Codable {
         guard displayVisible, !disconnecting else { return }
         let generation = connectionGeneration, visibility = displayGeneration
         do {
-            let snapshot = try await backend.snapshot()
+            let snapshot = try await deps.snapshot()
             guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             let tabs = snapshot["tabs"].array, panes = snapshot["panes"].array, screens = snapshot["screens"].array, workspaces = snapshot["workspaces"].array
             terminals = snapshot["terminals"].array.map { terminal in
@@ -189,27 +212,56 @@ private struct CmuxPendingCreation: Codable {
 
     func select(_ id: String) async {
         guard connected, !busy, !connecting, !disconnecting else { return }
-        do { try persistDraft() } catch { notice = error.localizedDescription; return }
-        let connection = connectionGeneration, profileID = activeID
-        saveTask?.cancel(); inputEnabled = false; directInput = false; queuedInput.removeAll()
-        attaching = true
+        let connection = connectionGeneration, profileID = activeID, priorAttachment = attachmentGeneration
+        let token = UUID()
+        selectionToken = token
+        let fencedInput = UUID()
+        inputGeneration = fencedInput
+        inputFenced = true; inputEnabled = false; directInput = false; queuedInput.removeAll()
+        saveTask?.cancel(); saveTask = nil
+        busy = true; attaching = true
+        defer {
+            if selectionToken == token {
+                selectionToken = nil
+                draftEditingLocked = false
+                inputFenced = false
+                busy = false; busyAttachment = nil; attaching = false
+            }
+        }
+        do { try await flushDraft() } catch {
+            if connectionGeneration == connection && attachmentGeneration == priorAttachment && inputGeneration == fencedInput && !disconnecting {
+                inputFenced = false
+                notice = error.localizedDescription
+            }
+            return
+        }
+        guard connection == connectionGeneration, attachmentGeneration == priorAttachment, profileID == activeID, !disconnecting, selectionToken == token else { return }
+        draftEditingLocked = true
         attachmentGeneration = UUID(); let generation = attachmentGeneration
-        rendererGeneration = UUID(); snapshotReady = false; snapshotReceived = false
-        busy = true; busyAttachment = generation; sendingRaw = false
-        defer { if generation == attachmentGeneration && connection == connectionGeneration { busy = false; busyAttachment = nil; attaching = false } }
+        busyAttachment = generation
+        saveTask?.cancel(); saveTask = nil
+        inputEnabled = false; directInput = false; queuedInput.removeAll()
+        rendererGeneration = UUID(); snapshotReady = false; snapshotReceived = false; rawDrainGeneration = nil
         outputBuffer?.cancel(); outputBuffer = nil
-        await backend.detach()
-        guard connection == connectionGeneration, generation == attachmentGeneration, profileID == activeID else { return }
-        selectedID = id; attachedProfileID = profileID; attached = false; snapshotReady = false; streamEnded = false; pipe.feed(Data(), reset: true)
-        do { draft = try drafts.read(draftIdentity!) }
-        catch { notice = error.localizedDescription; return }
+        await deps.detach()
+        guard connection == connectionGeneration, generation == attachmentGeneration, profileID == activeID, !disconnecting else { return }
+        selectedID = nil; draft = DraftRecord(); draftVersion += 1
+        attached = false; snapshotReady = false; streamEnded = false; pipe.feed(Data(), reset: true)
+        let identity = "cmux:\(profileID):\(id)"
+        do {
+            let loaded = try await deps.readDraft(identity)
+            guard connection == connectionGeneration, generation == attachmentGeneration, profileID == activeID, !disconnecting else { return }
+            selectedID = id; attachedProfileID = profileID; draft = loaded; draftVersion += 1
+            draftEditingLocked = false
+            inputFenced = false
+        } catch { notice = error.localizedDescription; return }
         let buffer = CmuxOutputBuffer { [weak self] events in
             guard let self, self.attachmentGeneration == generation else { return }
             for event in events { self.receive(event) }
         }
         outputBuffer = buffer
         do {
-            try await backend.attach(terminalID: id) { buffer.append($0) }
+            try await deps.attach(id) { buffer.append($0) }
             guard generation == attachmentGeneration else { return }
             attached = !streamEnded
             notice = draft.pending == nil ? "Draft locally. Enable input when you are ready to send." : "A previous input has no delivery receipt. Inspect the terminal before clearing it."
@@ -235,11 +287,13 @@ private struct CmuxPendingCreation: Codable {
         attachmentGeneration = UUID(); let generation = attachmentGeneration
         streamEnded = true; attached = false; snapshotReady = false; snapshotReceived = false; inputEnabled = false; directInput = false
         attaching = false
-        if busyAttachment != nil { busy = false; busyAttachment = nil }
-        sendingRaw = false; queuedInput.removeAll()
+        if busyAttachment != nil || selectionToken != nil {
+            selectionToken = nil; draftEditingLocked = false; busy = false; busyAttachment = nil
+        }
+        rawDrainGeneration = nil; queuedInput.removeAll()
         outputBuffer?.cancel(); outputBuffer = nil
         notice = message
-        Task { guard generation == attachmentGeneration else { return }; await backend.detach() }
+        Task { guard generation == attachmentGeneration else { return }; await deps.detach() }
     }
 
     func rendererRestored(_ generation: UUID) {
@@ -248,8 +302,9 @@ private struct CmuxPendingCreation: Codable {
     }
 
     func setInputEnabled(_ value: Bool) {
-        inputEnabled = value && connected && attached && snapshotReady && !busy
+        inputEnabled = value && connected && attached && snapshotReady && !busy && !inputFenced && !disconnecting
         if !inputEnabled {
+            inputGeneration = UUID()
             directInput = false; queuedInput.removeAll()
             notice = "Input disabled. Your draft stays local."
         }
@@ -260,53 +315,87 @@ private struct CmuxPendingCreation: Codable {
     }
 
     func setDraft(_ text: String) {
-        draft.text = text; saveTask?.cancel()
+        guard selectedID != nil, !disconnecting, !draftEditingLocked else { return }
+        draft.text = text; draftVersion += 1; scheduleAutosave()
+    }
+
+    private func scheduleAutosave() {
+        saveTask?.cancel()
         saveTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 250_000_000)
             guard let self, !Task.isCancelled else { return }
-            do { try self.persistDraft() } catch { self.notice = error.localizedDescription }
+            do { try await self.persistDraft() } catch { self.notice = error.localizedDescription }
         }
     }
 
     func send() async {
         guard canSend, let identity = draftIdentity, let terminalID = selectedID else { return }
-        sending = true
-        defer { sending = false }
-        let connection = connectionGeneration, attachment = attachmentGeneration, profileID = attachedProfileID
-        let current = { self.connectionGeneration == connection && self.attachmentGeneration == attachment && self.attachedProfileID == profileID && self.selectedID == terminalID && self.draftIdentity == identity }
         guard draft.text.utf8.count <= 32 * 1024 else { notice = "Send at most 32 KiB in one prompt."; return }
-        let requestID = UUID().uuidString, text = draft.text
-        draft.pending = PendingSend(id: requestID, text: text)
-        do { try drafts.save(draft, identity: identity) } catch { notice = error.localizedDescription; return }
-        busy = true; busyAttachment = attachment
-        defer { if current() { busy = false; busyAttachment = nil } }
+        saveTask?.cancel(); saveTask = nil
+        let connection = connectionGeneration, attachment = attachmentGeneration, input = inputGeneration, profileID = attachedProfileID
+        let current = { self.connectionGeneration == connection && self.attachmentGeneration == attachment && self.inputGeneration == input && !self.inputFenced && !self.disconnecting && self.attachedProfileID == profileID && self.selectedID == terminalID && self.draftIdentity == identity }
+        sending = true; busy = true; busyAttachment = attachment
+        defer { sending = false; if self.connectionGeneration == connection && self.attachmentGeneration == attachment { busy = false; busyAttachment = nil } }
+        let requestID = UUID().uuidString, text = draft.text, previousPending = draft.pending
+        draft.pending = PendingSend(id: requestID, text: text); draftVersion += 1
+        do { try await saveRecord(draft, identity: identity) }
+        catch {
+            if current() && draft.pending?.id == requestID { draft.pending = previousPending; draftVersion += 1 }
+            notice = error.localizedDescription; return
+        }
+        guard current(), !disconnecting, connected, attached, snapshotReady, inputEnabled, !directInput else {
+            if attachedProfileID == profileID && selectedID == terminalID && draftIdentity == identity && draft.pending?.id == requestID {
+                draft.pending = previousPending; draftVersion += 1
+                try? await saveRecord(draft, identity: identity)
+            }
+            if connectionGeneration == connection && !disconnecting {
+                notice = "Input stopped before sending. Your draft stays local."
+            }
+            return
+        }
         do {
-            _ = try await backend.paste(text)
+            _ = try await deps.paste(text)
             guard current() else { return }
             guard connected, attached, snapshotReady, inputEnabled, !directInput else { throw DesktopError("Input stopped before Enter. Inspect the pasted text before continuing.") }
-            _ = try await backend.send(Data([13]))
+            _ = try await deps.send(Data([13]))
             guard current() else { return }
             guard draft.pending?.id == requestID else { throw DesktopError("The pending draft changed. Inspect the terminal before continuing.") }
-            var updated = draft
-            updated.lastQueuedText = updated.pending?.text
-            if updated.text == updated.pending?.text { updated.text = "" }
-            updated.pending = nil
-            try drafts.save(updated, identity: identity)
-            draft = updated
-            notice = "Queued to connection. Delivery and agent execution are not confirmed."
+            let savedFollowUp = try await settlePendingSend(
+                requestID: requestID,
+                identity: identity,
+                recordLastQueued: true,
+                followUpErrorPrefix: "Send was queued, but your newer draft could not be saved"
+            )
+            if savedFollowUp {
+                notice = "Queued to connection. Delivery and agent execution are not confirmed."
+            }
         } catch { if current() { inputEnabled = false; directInput = false; notice = "Input outcome is uncertain. \(error.localizedDescription)" } }
     }
 
     func clearPendingAfterReview() {
-        guard !busy else { return }
-        var updated = draft
-        if updated.text == updated.pending?.text { updated.text = "" }
-        updated.pending = nil
-        do {
-            if let draftIdentity { try drafts.save(updated, identity: draftIdentity) }
-            draft = updated; notice = "Pending send cleared after your review. It was not resent."
+        guard !busy, !clearingPending, let pending = draft.pending else { return }
+        guard let identity = draftIdentity else {
+            if draft.text == pending.text { draft.text = "" }
+            draft.pending = nil; draftVersion += 1; notice = "Pending send cleared after your review. It was not resent."
+            return
         }
-        catch { notice = error.localizedDescription }
+        let pendingID = pending.id
+        clearingPending = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.clearingPending = false }
+            do {
+                let savedFollowUp = try await self.settlePendingSend(
+                    requestID: pendingID,
+                    identity: identity,
+                    recordLastQueued: false,
+                    followUpErrorPrefix: "Pending send cleared, but your newer draft could not be saved"
+                )
+                if savedFollowUp && self.draftIdentity == identity {
+                    self.notice = "Pending send cleared after your review. It was not resent."
+                }
+            } catch { self.notice = error.localizedDescription }
+        }
     }
 
     func restoreLastQueuedPrompt() {
@@ -316,21 +405,30 @@ private struct CmuxPendingCreation: Codable {
     }
 
     func raw(_ text: String) {
-        guard inputEnabled, directInput, attached, snapshotReady, connected else { return }
+        guard inputEnabled, directInput, attached, snapshotReady, connected, !inputFenced, !disconnecting else { return }
         let bytes = Data(text.utf8)
         guard queuedInput.count + bytes.count <= 32 * 1024 else {
             queuedInput.removeAll(); inputEnabled = false; directInput = false
             notice = "Input queue is full. Inspect the terminal before enabling input again."; return
         }
         queuedInput.append(bytes)
-        guard !sendingRaw else { return }; sendingRaw = true
-        let generation = attachmentGeneration
+        let generation = attachmentGeneration, input = inputGeneration
+        guard rawDrainGeneration != input else { return }
+        rawDrainGeneration = input
         Task {
-            defer { if generation == attachmentGeneration { sendingRaw = false } }
-            while !queuedInput.isEmpty && inputEnabled && directInput && attachmentGeneration == generation {
+            defer { if rawDrainGeneration == input { rawDrainGeneration = nil } }
+            while !queuedInput.isEmpty && inputEnabled && directInput && attachmentGeneration == generation && inputGeneration == input && !inputFenced && !disconnecting {
                 let bytes = queuedInput; queuedInput.removeAll()
-                do { _ = try await backend.send(bytes) }
-                catch { if generation == attachmentGeneration { queuedInput.removeAll(); inputEnabled = false; directInput = false; notice = "Input was not confirmed. \(error.localizedDescription)" }; return }
+                do {
+                    guard inputGeneration == input, !inputFenced, !disconnecting else { return }
+                    _ = try await deps.send(bytes)
+                }
+                catch {
+                    if rawDrainGeneration == input && attachmentGeneration == generation && inputGeneration == input {
+                        queuedInput.removeAll(); inputEnabled = false; directInput = false; notice = "Input was not confirmed. \(error.localizedDescription)"
+                    }
+                    return
+                }
             }
         }
     }
@@ -339,62 +437,90 @@ private struct CmuxPendingCreation: Codable {
         lastSize = (columns, rows)
         guard inputEnabled, attached else { return }
         let generation = attachmentGeneration
-        do { try await backend.resize(columns: columns, rows: rows) }
+        do { try await deps.resize(columns, rows) }
         catch { if generation == attachmentGeneration { notice = error.localizedDescription } }
     }
 
     func create(provider: String, cwd: String, name: String) async {
-        guard connected, !busy else { return }
+        guard connected, creationReceiptLoaded, !busy, !clearingCreation, !disconnecting else { return }
+        let generation = connectionGeneration, profileID = activeID
+        let current = { self.connectionGeneration == generation && self.activeID == profileID && !self.disconnecting }
         if pendingCreation == nil {
+            busy = true; busyAttachment = nil
             let argv = provider == "claude" ? ["claude"] : provider == "codex" ? ["codex"] : ["/bin/bash", "-l"]
-            pendingCreation = CmuxPendingCreation(id: UUID().uuidString, argv: argv, cwd: cwd, name: name.isEmpty ? provider.capitalized : name)
-            creationPending = true
-            do { try savePendingCreation(pendingCreation, profileID: activeID) } catch { notice = error.localizedDescription; return }
+            let created = CmuxPendingCreation(id: UUID().uuidString, argv: argv, cwd: cwd, name: name.isEmpty ? provider.capitalized : name)
+            pendingCreation = created; creationPending = true
+            do { try await savePendingCreation(created, profileID: profileID) }
+            catch {
+                if connectionGeneration == generation && activeID == profileID {
+                    if pendingCreation?.id == created.id { pendingCreation = nil; creationPending = false }
+                    busy = false
+                }
+                if current() { notice = error.localizedDescription }
+                return
+            }
+            if connectionGeneration == generation && activeID == profileID { busy = false }
         }
+        guard current(), connected else { return }
         await retryCreation()
     }
 
     func retryCreation() async {
-        guard let pendingCreation, connected, !busy, !disconnecting else { return }
+        guard let pendingCreation, connected, creationReceiptLoaded, !busy, !clearingCreation, !disconnecting else { return }
         let generation = connectionGeneration, profileID = activeID
         let identity = "cmux:\(profileID):creation"
-        let current = { self.connectionGeneration == generation && self.activeID == profileID }
-        do { try savePendingCreation(pendingCreation, profileID: profileID) } catch { notice = error.localizedDescription; return }
+        let current = { self.connectionGeneration == generation && self.activeID == profileID && !self.disconnecting }
         busy = true; busyAttachment = nil
-        defer { if current() { busy = false } }
+        defer { if connectionGeneration == generation && activeID == profileID { busy = false } }
         do {
-            let result = try await backend.createTerminal(argv: pendingCreation.argv, cwd: pendingCreation.cwd, name: pendingCreation.name, mutationID: pendingCreation.id)
-            if try drafts.read(identity).pending?.id == pendingCreation.id { try drafts.save(DraftRecord(), identity: identity) }
+            try await savePendingCreation(pendingCreation, profileID: profileID)
+            guard current(), connected, self.pendingCreation?.id == pendingCreation.id else { return }
+            let terminalID = try await deps.createTerminal(pendingCreation.argv, pendingCreation.cwd, pendingCreation.name, pendingCreation.id)
+            try await deps.clearDraftIfMatching(pendingCreation.id, identity)
             guard current(), self.pendingCreation?.id == pendingCreation.id else { return }
             self.pendingCreation = nil
             creationPending = false
             busy = false; await refresh()
             guard current() else { return }
-            await select(result.terminalID)
+            await select(terminalID)
         } catch { if current() { notice = "Creation was not confirmed. Inspect the catalog; retry uses the same mutation identity. \(error.localizedDescription)" } }
     }
 
     func clearCreationAfterReview() {
-        guard !busy else { return }
-        let previous = pendingCreation; pendingCreation = nil
-        do { try savePendingCreation(nil, profileID: activeID); creationPending = false }
-        catch { pendingCreation = previous; notice = error.localizedDescription }
+        guard !busy, !clearingCreation, creationReceiptLoaded, let target = pendingCreation else { return }
+        let profileID = activeID, generation = connectionGeneration
+        let identity = "cmux:\(profileID):creation"
+        clearingCreation = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.clearingCreation = false }
+            do {
+                try await self.deps.clearDraftIfMatching(target.id, identity)
+                if self.activeID == profileID && self.connectionGeneration == generation && self.pendingCreation?.id == target.id {
+                    self.pendingCreation = nil
+                    self.creationPending = false
+                }
+            } catch {
+                if self.activeID == profileID && self.connectionGeneration == generation {
+                    self.notice = error.localizedDescription
+                }
+            }
+        }
     }
 
     func terminate(_ id: String) async {
         guard connected, !busy, !disconnecting else { return }
         let generation = connectionGeneration, profileID = activeID
-        let current = { self.connectionGeneration == generation && self.activeID == profileID }
+        let current = { self.connectionGeneration == generation && self.activeID == profileID && !self.disconnecting }
         let identity = "cmux:\(profileID):terminate:\(id)"
         busy = true; busyAttachment = nil
-        defer { if current() { busy = false } }
+        defer { if connectionGeneration == generation && activeID == profileID { busy = false } }
         do {
-            var receipt = try drafts.read(identity)
-            let mutationID = receipt.pending?.id ?? UUID().uuidString
-            receipt.pending = PendingSend(id: mutationID, text: id)
-            try drafts.save(receipt, identity: identity)
-            try await backend.closeTerminal(id, mutationID: mutationID)
-            if try drafts.read(identity).pending?.id == mutationID { try drafts.save(DraftRecord(), identity: identity) }
+            let receipt = try await deps.acquireMutation(identity, id)
+            guard let mutationID = receipt.pending?.id else { throw DesktopError("Could not record terminal termination request.") }
+            guard current(), connected else { return }
+            try await deps.closeTerminal(id, mutationID)
+            try await deps.clearDraftIfMatching(mutationID, identity)
             guard current() else { return }
             if id == selectedID { inputEnabled = false; directInput = false; attached = false }
             notice = "The server confirmed terminal termination."; await refresh()
@@ -402,42 +528,154 @@ private struct CmuxPendingCreation: Codable {
     }
 
     func disconnect() async throws {
-        guard !disconnecting else { return }
+        if let activeDisconnectTask {
+            try await activeDisconnectTask.value
+            return
+        }
+        let fencedInput = UUID()
         disconnecting = true
-        defer { disconnecting = false }
-        try persistDraft(); saveTask?.cancel(); stopPolling()
-        connectionGeneration = UUID(); attachmentGeneration = UUID()
-        connected = false; connecting = false; attaching = false; sendingRaw = false; busyAttachment = nil
-        inputEnabled = false; directInput = false; attached = false; snapshotReady = false; snapshotReceived = false; queuedInput.removeAll()
-        outputBuffer?.cancel(); outputBuffer = nil
-        try await backend.disconnect()
-        connected = false; connecting = false; busy = false; connectionStatus = "Disconnected"
-        hasConnected = false; catalogLoaded = false; sending = false; catalogFreshness.recovered()
-        notice = "Connect to inspect your server terminals."
-        terminals = []; selectedID = nil; pipe.feed(Data(), reset: true)
-        draft = DraftRecord(); pendingCreation = nil; creationPending = false
+        draftEditingLocked = true
+        inputGeneration = fencedInput
+        inputFenced = true; inputEnabled = false; directInput = false; queuedInput.removeAll()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.activeDisconnectTask = nil }
+            try await self.performDisconnect(fencedInput: fencedInput)
+        }
+        activeDisconnectTask = task
+        try await task.value
     }
 
-    private func persistDraft() throws {
-        if let draftIdentity { try drafts.save(draft, identity: draftIdentity) }
+    private func performDisconnect(fencedInput: UUID) async throws {
+        defer {
+            disconnecting = false
+            draftEditingLocked = false
+            if !connected { inputFenced = false }
+        }
+        saveTask?.cancel(); saveTask = nil
+        do {
+            try await flushDraft()
+        } catch {
+            if inputGeneration == fencedInput && selectionToken == nil {
+                inputFenced = false
+            }
+            throw error
+        }
+        stopPolling()
+        saveTask?.cancel(); saveTask = nil
+        selectionToken = nil
+        connectionGeneration = UUID(); attachmentGeneration = UUID()
+        connected = false; connecting = false; attaching = false; rawDrainGeneration = nil; busyAttachment = nil
+        inputEnabled = false; directInput = false; attached = false; snapshotReady = false; snapshotReceived = false; queuedInput.removeAll()
+        outputBuffer?.cancel(); outputBuffer = nil
+        try await deps.disconnect()
+        connected = false; connecting = false; busy = false; connectionStatus = "Disconnected"
+        hasConnected = false; catalogLoaded = false; sending = false; creationReceiptLoaded = false; catalogFreshness.recovered()
+        notice = "Connect to inspect your server terminals."
+        terminals = []; selectedID = nil; attachedProfileID = ""; pipe.feed(Data(), reset: true)
+        draft = DraftRecord(); draftVersion += 1; pendingCreation = nil; creationPending = false
+        inputFenced = false
+    }
+
+    private func saveRecord(_ record: DraftRecord, identity: String) async throws {
+        let previous = saveInFlight
+        let task = Task { @MainActor in
+            _ = try? await previous?.value
+            try await self.deps.saveDraft(record, identity)
+        }
+        saveInFlight = task
+        try await task.value
+    }
+    private func settlePendingSend(requestID: String, identity: String, recordLastQueued: Bool, followUpErrorPrefix: String) async throws -> Bool {
+        let previous = saveInFlight
+        var editedDuringSave = false
+        let task = Task { @MainActor [weak self] in
+            _ = try? await previous?.value
+            guard let self, self.draftIdentity == identity, self.draft.pending?.id == requestID else { return }
+            let startVersion = self.draftVersion
+            var toSave = self.draft
+            let pendingText = toSave.pending?.text ?? ""
+            if recordLastQueued { toSave.lastQueuedText = pendingText }
+            if toSave.text == pendingText { toSave.text = "" }
+            toSave.pending = nil
+            try await self.deps.saveDraft(toSave, identity)
+            guard self.draftIdentity == identity, self.draft.pending?.id == requestID else { return }
+            if recordLastQueued { self.draft.lastQueuedText = pendingText }
+            editedDuringSave = self.draftVersion != startVersion
+            if !editedDuringSave && self.draft.text == pendingText {
+                self.draft.text = ""
+            }
+            self.draft.pending = nil
+            self.draftVersion += 1
+        }
+        saveInFlight = task
+        try await task.value
+        if editedDuringSave && draftIdentity == identity {
+            do {
+                try await flushDraft()
+            } catch {
+                notice = "\(followUpErrorPrefix): \(error.localizedDescription)"
+                scheduleAutosave()
+                return false
+            }
+        }
+        return true
+    }
+    private func flushDraft() async throws {
+        guard let identity = draftIdentity else { return }
+        while true {
+            guard draftIdentity == identity else { return }
+            let version = draftVersion, previous = saveInFlight
+            var wrote = false
+            var savedVersion = version
+            let task = Task { @MainActor [weak self] in
+                _ = try? await previous?.value
+                guard let self, self.draftIdentity == identity else { return }
+                let currentSnapshot = self.draft
+                savedVersion = self.draftVersion
+                try await self.deps.saveDraft(currentSnapshot, identity)
+                wrote = true
+            }
+            saveInFlight = task
+            try await task.value
+            if !wrote || draftIdentity != identity || draftVersion == savedVersion { return }
+        }
+    }
+    private func persistDraft() async throws {
+        guard let identity = draftIdentity else { return }
+        let snapshot = draft, version = draftVersion
+        let previous = saveInFlight
+        let task = Task { @MainActor [weak self] in
+            _ = try? await previous?.value
+            guard let self, self.draftVersion == version, self.draftIdentity == identity else { return }
+            try await self.deps.saveDraft(snapshot, identity)
+        }
+        saveInFlight = task
+        try await task.value
     }
     private func persistProfiles() {
         UserDefaults.standard.set(try? JSONEncoder().encode(profiles), forKey: "cmuxProfiles")
         UserDefaults.standard.set(activeID, forKey: "activeCmuxProfile")
     }
-    private func savePendingCreation(_ pendingCreation: CmuxPendingCreation?, profileID: String) throws {
+    private func savePendingCreation(_ pendingCreation: CmuxPendingCreation?, profileID: String) async throws {
         var record = DraftRecord()
         if let pendingCreation {
             record.pending = PendingSend(id: pendingCreation.id, text: String(decoding: try JSONEncoder().encode(pendingCreation), as: UTF8.self))
         }
-        try drafts.save(record, identity: "cmux:\(profileID):creation")
+        try await deps.saveDraft(record, "cmux:\(profileID):creation")
     }
-    private func loadPendingCreation() {
+    private func loadPendingCreation(profileID: String, generation: UUID) async {
         do {
-            let record = try drafts.read("cmux:\(activeID):creation")
+            let record = try await deps.readDraft("cmux:\(profileID):creation")
+            guard generation == connectionGeneration, profileID == activeID, !disconnecting else { return }
             pendingCreation = try record.pending.map { try JSONDecoder().decode(CmuxPendingCreation.self, from: Data($0.text.utf8)) }
             creationPending = pendingCreation != nil
-        } catch { notice = error.localizedDescription }
+            creationReceiptLoaded = true
+        } catch {
+            guard generation == connectionGeneration, profileID == activeID else { return }
+            creationReceiptLoaded = false
+            notice = error.localizedDescription
+        }
     }
 }
 

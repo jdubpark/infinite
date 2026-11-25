@@ -52,7 +52,7 @@ test("team session creation checks its header fields", async () => {
     const cwd = join(root, "member");
     mkdirSync(cwd);
     Object.defineProperty(manager, "config", { value: { teams: { workspaceDir: root } } });
-    Object.defineProperty(manager, "serial", { value: Promise.resolve(), writable: true });
+    Object.defineProperty(manager, "sessionQueues", { value: new Map() }); Object.defineProperty(manager, "pendingCreates", { value: new Set() }); Object.defineProperty(manager, "createAdmission", { value: Promise.resolve(), writable: true });
     const seen: unknown[] = [];
     Object.defineProperty(manager, "createOnce", { value: async (request: unknown) => { seen.push(request); return request; } });
     const request = { requestId: randomUUID(), provider: "claude" as const, projectId: "project", title: "Member", prompt: "Work" };

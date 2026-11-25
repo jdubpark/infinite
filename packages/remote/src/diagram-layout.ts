@@ -1,6 +1,5 @@
 import type { DiagramEdge, DiagramGraph } from "./understanding-diagrams.js";
 
-/** Deterministic layered layout shared by the phone, web and desktop. No DOM or Node APIs. */
 export interface LayoutOptions { nodeWidth: number; nodeHeight: number; gapX: number; gapY: number; groupPadding: number }
 export interface LayoutNode { id: string; x: number; y: number; width: number; height: number; layer: number }
 export interface LayoutEdge { from: string; to: string; label: string | null; points: { x: number; y: number }[]; back: boolean }
@@ -8,7 +7,6 @@ export interface LayoutGroup { id: string; label: string; x: number; y: number; 
 export interface GraphLayout { width: number; height: number; nodes: LayoutNode[]; edges: LayoutEdge[]; groups: LayoutGroup[] }
 
 export const defaultLayoutOptions: LayoutOptions = { nodeWidth: 150, nodeHeight: 44, gapX: 48, gapY: 28, groupPadding: 12 };
-/** Room for a group box's label above its padding. */
 export const groupLabelHeadroom = 16;
 
 type Point = { x: number; y: number };
@@ -20,14 +18,12 @@ export function layoutGraph(graph: Pick<DiagramGraph, "direction" | "nodes" | "g
   const nodes = graph.nodes;
   const groupOf = new Map(nodes.map(node => [node.id, node.group]));
   const grouped = graph.groups.length > 0 && nodes.some(node => node.group !== null);
-  // Boxes carry a label above their members, so a grouped graph starts lower and spaces rows so that boxes stay apart.
   const top = grouped ? groupLabelHeadroom : 0;
   const gapY = grouped ? Math.max(o.gapY, 2 * pad + groupLabelHeadroom + 4) : o.gapY;
   const ids = new Set(nodes.map(node => node.id));
   const edges = graph.edges.filter(edge => ids.has(edge.from) && ids.has(edge.to));
   const back = markBackEdges(nodes.map(node => node.id), edges);
 
-  // Longest-path layering over the forward edges only.
   const preds = new Map<string, string[]>();
   const succs = new Map<string, string[]>();
   edges.forEach((edge, index) => {
@@ -48,8 +44,6 @@ export function layoutGraph(graph: Pick<DiagramGraph, "direction" | "nodes" | "g
   const layers: string[][] = Array.from({ length: layerCount }, () => []);
   for (const node of nodes) layers[layerOf.get(node.id) ?? 0].push(node.id);
 
-  // Barycenter sweeps (down, up, down, up) against the adjacent layer; ties go by group id, then input order.
-  // After each sort the members of one group are made contiguous, so a box around a layer's members holds no other node.
   const rank = new Map(nodes.map((node, index) => [node.id, index]));
   const position = new Map<string, number>();
   const indexLayers = (): void => layers.forEach(row => row.forEach((id, index) => position.set(id, index)));
@@ -75,7 +69,6 @@ export function layoutGraph(graph: Pick<DiagramGraph, "direction" | "nodes" | "g
     indexLayers();
   }
 
-  // Layers advance along the flow axis; nodes within a layer advance along the other axis.
   const mainStep = lr ? o.nodeWidth + o.gapX : o.nodeHeight + gapY;
   const crossStep = lr ? o.nodeHeight + gapY : o.nodeWidth + o.gapX;
   const laidNodes: LayoutNode[] = nodes.map(node => {
@@ -97,7 +90,6 @@ export function layoutGraph(graph: Pick<DiagramGraph, "direction" | "nodes" | "g
     const maxX = Math.max(...members.map(m => m.x + m.width));
     const maxY = Math.max(...members.map(m => m.y + m.height));
     const box = { id: group.id, label: group.label, x: minX - pad, y: minY - pad - groupLabelHeadroom, width: maxX - minX + 2 * pad, height: maxY - minY + 2 * pad + groupLabelHeadroom };
-    // Members spread over several layers can still surround another node; such a box would misstate membership.
     return laidNodes.some(node => groupOf.get(node.id) !== group.id && overlaps(node, box)) ? [] : [box];
   });
 
@@ -118,7 +110,6 @@ export function layoutGraph(graph: Pick<DiagramGraph, "direction" | "nodes" | "g
   return { width, height, nodes: laidNodes, edges: layoutEdges, groups };
 }
 
-/** Reorders a layer so each group's members sit together: groups keep the order of their first member, members keep theirs. Ungrouped nodes stay where they are. */
 function contiguous(row: string[], groupOf: Map<string, string | null>): string[] {
   const blocks = new Map<string, string[]>();
   for (const id of row) {
@@ -133,7 +124,6 @@ function overlaps(a: { x: number; y: number; width: number; height: number }, b:
   return a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
 }
 
-/** Marks edges that close a cycle in a DFS over nodes in input order, so the rest form a DAG. */
 function markBackEdges(ids: string[], edges: DiagramEdge[]): boolean[] {
   const outgoing = new Map<string, number[]>();
   edges.forEach((edge, index) => push(outgoing, edge.from, index));
@@ -159,12 +149,10 @@ function push<K, V>(map: Map<K, V[]>, key: K, value: V): void {
   map.set(key, list);
 }
 
-/** Far edge in the flow direction: right side for LR, bottom for TB. */
 function far(node: LayoutNode, lr: boolean): Point {
   return lr ? { x: node.x + node.width, y: node.y + node.height / 2 } : { x: node.x + node.width / 2, y: node.y + node.height };
 }
 
-/** Near edge in the flow direction: left side for LR, top for TB. */
 function near(node: LayoutNode, lr: boolean): Point {
   return lr ? { x: node.x, y: node.y + node.height / 2 } : { x: node.x + node.width / 2, y: node.y };
 }

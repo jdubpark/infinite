@@ -2,19 +2,17 @@ import { CircleHelp, Eye, GitMerge, Minus, OctagonAlert, Pause, X } from "lucide
 import { RoleChip, StateMark, agentName } from "./marks";
 import { cost, elapsed } from "./format";
 import { allAgents, findUnit } from "./model";
-import { ROLE_NAME, STAGES, STAGE_LABEL, STATE_LABEL, type Agent, type Ghost, type Hold, type Selection, type Stage, type Swarm, type Terminal, type Unit, type ViewProps } from "./types";
+import { ROLE_NAME, STAGES, STAGE_LABEL, STATE_LABEL, type Agent, type Ghost, type Hold, type LiveUnit, type QuietUnit, type Selection, type Stage, type Swarm, type Terminal, type Unit, type ViewProps } from "./types";
 
 export const HOLD_WORDS: Record<Hold, string> = { input: "needs input", paused: "paused", blocked: "blocked" };
 export const TERMINAL_WORDS: Record<Terminal, string> = {
   "review-ready": "review ready", "merge-reported": "merge reported (agent report)", "no-change": "no change", cancelled: "cancelled",
 };
 
-/** The state in words. A reported agent is an agent's claim, so its words say so. */
 export function stateWords(state: Agent["state"]): string {
   return state === "reported" ? "reported (agent report)" : STATE_LABEL[state];
 }
 
-/** Tooltip text for an agent: role, state in words, and the flags that apply. */
 export function agentTitle(agent: Agent): string {
   return [ROLE_NAME[agent.role], stateWords(agent.state), agent.tool ? `tool ${agent.tool}` : "", agent.earlier ? "earlier revision" : "",
     agent.limited ? "provider limit" : "", agent.stalled ? "stalled" : ""].filter(Boolean).join(", ");
@@ -39,7 +37,6 @@ export function terminalGlyph(terminal: Terminal | undefined) {
   </span>;
 }
 
-/** One agent mark: a button with the agent's accessible name. Enter or double click opens its session. */
 export function AgentMark({ agent, selected, onSelect, openSession }: {
   agent: Agent; selected: boolean; onSelect(selection: Selection): void; openSession(sessionId: string): void;
 }) {
@@ -53,7 +50,6 @@ export function AgentMark({ agent, selected, onSelect, openSession }: {
   </button>;
 }
 
-/** Marks for one stage cell: six at most, five and a count beyond that. */
 function StageMarks({ agents, selection, onSelect, openSession }: { agents: Agent[]; selection: Selection; onSelect(s: Selection): void; openSession(id: string): void }) {
   const shown = agents.length > 6 ? agents.slice(0, 5) : agents;
   const extra = agents.length - shown.length;
@@ -73,7 +69,6 @@ function Checks({ checks }: { checks: Unit["checks"] }) {
 
 const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? "" : "s"}`;
 
-/** `own` marks the single unit of a team swarm: the header already names it, so the label leads with its project. */
 function UnitLabel({ unit, own, model, selection, onSelect, openTeam }: Pick<ViewProps, "model" | "selection" | "onSelect" | "openTeam"> & { unit: Unit; own: boolean }) {
   const deps = unit.dependsOn.map(id => findUnit(model, id)?.title ?? id);
   return <div className="sw-lane-label">
@@ -85,7 +80,7 @@ function UnitLabel({ unit, own, model, selection, onSelect, openTeam }: Pick<Vie
   </div>;
 }
 
-function LaneRow({ unit, own, ...props }: ViewProps & { unit: Unit; own: boolean }) {
+function LaneRow({ unit, own, ...props }: ViewProps & { unit: LiveUnit; own: boolean }) {
   const { selection, onSelect, openSession, openTeam, model } = props;
   const reached = STAGES.indexOf(unit.reached);
   const active = unit.active ? STAGES.indexOf(unit.active) : -1;
@@ -105,7 +100,7 @@ function LaneRow({ unit, own, ...props }: ViewProps & { unit: Unit; own: boolean
         <RoleChip role={agent.role} />
         <AgentMark agent={agent} selected={selection?.kind === "agent" && selection.id === agent.id} onSelect={onSelect} openSession={openSession} />
       </span>)}
-      <span className="sw-glyph-slot">{terminalGlyph(unit.terminal)}</span>
+      <span className="sw-glyph-slot" />
       <span className="sw-slots sw-num">{unit.workers ? `${running}/${limit}` : ""}</span>
       <span className="sw-cost sw-num" title={spend.title}>{spend.text}</span>
     </div>
@@ -119,7 +114,7 @@ function GhostRow({ ghost }: { ghost: Ghost }) {
   </div>;
 }
 
-function QuietRow({ unit, selection, onSelect, openTeam, now }: Pick<ViewProps, "selection" | "onSelect" | "openTeam" | "now"> & { unit: Unit }) {
+function QuietRow({ unit, selection, onSelect, openTeam, now }: Pick<ViewProps, "selection" | "onSelect" | "openTeam" | "now"> & { unit: QuietUnit }) {
   return <div className="sw-lane-row sw-quiet-row">
     <div className="sw-lane-label">
       <button type="button" className="sw-unit-title" aria-pressed={selection?.kind === "unit" && selection.id === unit.id}
@@ -142,28 +137,25 @@ function LaneSwarm({ swarm, ...props }: ViewProps & { swarm: Swarm }) {
       {swarm.kind === "mission"
         ? <button type="button" className="sw-title sw-mission-title" aria-label={"Open mission: " + swarm.title} onClick={() => props.openMission(swarm.id)}>{swarm.title}</button>
         : <span className="sw-title">{swarm.title}</span>}
-      {swarm.coordinator && <AgentMark agent={swarm.coordinator} selected={selection?.kind === "agent" && selection.id === swarm.coordinator.id} onSelect={onSelect} openSession={openSession} />}
+      {swarm.kind === "mission" && swarm.coordinator && <AgentMark agent={swarm.coordinator} selected={selection?.kind === "agent" && selection.id === swarm.coordinator.id} onSelect={onSelect} openSession={openSession} />}
       <span className="sw-spacer" />
       {swarm.kind === "mission" && <span className="sw-count sw-dim">{plural(swarm.units.length, "unit")}</span>}
       <span className="sw-count sw-dim">{plural(agents.length, "agent")}</span>
-      {/* A team's single row already carries its cost. */}
       <span className="sw-cost sw-num" title={swarm.kind === "team" ? undefined : spend.title}>{swarm.kind === "team" ? "" : spend.text}</span>
     </header>
-    {swarm.loose.length > 0 && <div className="sw-lane-row sw-solo-row">
+    {swarm.kind === "solo" && swarm.loose.length > 0 && <div className="sw-lane-row sw-solo-row">
       <div className="sw-lane-label" />
       <div className="sw-marks sw-marks-row">
         {swarm.loose.map(agent => <AgentMark key={agent.id} agent={agent} selected={selection?.kind === "agent" && selection.id === agent.id} onSelect={onSelect} openSession={openSession} />)}
       </div>
     </div>}
-    {/* A finished or blocked run inside a live mission keeps its place as one collapsed row. */}
-    {swarm.units.map(unit => unit.live
+    {swarm.kind !== "solo" && swarm.units.map(unit => unit.live
       ? <LaneRow key={unit.id} unit={unit} own={swarm.kind === "team"} {...props} />
       : <QuietRow key={unit.id} unit={unit} selection={selection} onSelect={onSelect} openTeam={props.openTeam} now={props.now} />)}
-    {swarm.ghosts.map(ghost => <GhostRow key={ghost.id} ghost={ghost} />)}
+    {swarm.kind === "mission" && swarm.ghosts.map(ghost => <GhostRow key={ghost.id} ghost={ghost} />)}
   </section>;
 }
 
-/** One row per unit on fixed stage columns. */
 export function Lanes(props: ViewProps) {
   const { model } = props;
   return <div className="sw-lanes">

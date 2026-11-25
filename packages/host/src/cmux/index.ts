@@ -356,14 +356,52 @@ export class CmuxSessions {
       } else if (pending && record.prompt) record.prompt = { ...pending, id: record.prompt.id };
       const attentionState = record.prompt || record.lifecycle === "needsInput" ? "needs-you"
         : record.lifecycle === "idle" ? "idle" : "working";
-      record.attention = {
-        ...record.attention, state: attentionState, source: record.prompt?.prompt.source ?? "lifecycle",
+      const base = {
         since: record.attention.state === attentionState ? record.attention.since : at,
-        prompt: record.prompt ? { ...record.prompt.prompt, id: record.prompt.id } : undefined,
-        now: record.prompt ? record.prompt.prompt.title : record.lifecycle === "needsInput" ? "Input requested in cmux"
-          : record.lifecycle === "idle" ? "Waiting for your direction" : "cmux session is connected",
-        lastMessage: record.lastMessage, hooks: record.hookAt ? "active" : "none", sawTurnEnd: false,
+        lastActivityAt: record.attention.lastActivityAt,
+        lastMessage: record.lastMessage,
+        hooks: (record.hookAt ? "active" : "none") as "active" | "none",
+        hookErrors: record.attention.hookErrors,
+        ...(record.attention.limit ? { limit: record.attention.limit } : {}),
+        sawTurnEnd: false,
       };
+      if (record.prompt) {
+        record.attention = {
+          ...base,
+          state: "needs-you",
+          source: record.prompt.prompt.source,
+          prompt: { ...record.prompt.prompt, id: record.prompt.id },
+          now: record.prompt.prompt.title,
+          ...(record.attention.lastTool ? { lastTool: record.attention.lastTool } : {}),
+        };
+      } else if (record.lifecycle === "needsInput") {
+        record.attention = {
+          ...base,
+          state: "needs-you",
+          source: "lifecycle",
+          prompt: undefined,
+          now: "Input requested in cmux",
+          ...(record.attention.lastTool ? { lastTool: record.attention.lastTool } : {}),
+        };
+      } else if (record.lifecycle === "idle") {
+        record.attention = {
+          ...base,
+          state: "idle",
+          source: "lifecycle",
+          prompt: undefined,
+          lastTool: undefined,
+          now: "Waiting for your direction",
+        };
+      } else {
+        record.attention = {
+          ...base,
+          state: "working",
+          source: "lifecycle",
+          prompt: undefined,
+          now: "cmux session is connected",
+          ...(record.attention.lastTool ? { lastTool: record.attention.lastTool } : {}),
+        };
+      }
     }
     this.currentControl(record);
     if (JSON.stringify(record) !== before) this.save(record);

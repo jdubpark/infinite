@@ -1,21 +1,13 @@
 import type { GraphData, GraphLink, LinkKind } from "./graph-model";
 import type { SwarmModel } from "./types";
 
-// Pure: a layered layout for the Graph view. Positions depend only on which nodes exist and on the
-// model's order, never on agent state or link weight, so a poll that changes only state moves nothing.
-//
-//   mission hub → unit hub → agents ⇢ touched code areas ⇢ neighbouring code areas
-
 export type Point = { x: number; y: number };
 export type GraphLayout = {
   width: number;
   height: number;
   at: Map<string, Point>;
-  /** Code areas sit in the touched column or the neighbour column. */
   column: Map<string, "touched" | "neighbour">;
-  /** Group labels that belong to no node, such as the solo group. */
   labels: { id: string; text: string; x: number; y: number }[];
-  /** One block per project on the code side: its heading and the rows under it. */
   projects: { id: string; label: string; y: number }[];
 };
 
@@ -24,12 +16,9 @@ export const GRID = {
   missionX: 40,
   unitX: 176,
   agentX: 312,
-  /** Left edge of the touched-area column. */
   areaX: 560,
-  /** Width kept for an area's square before its label. */
   square: 26,
   labelWidth: 176,
-  /** Space between the two area columns, where code links run. */
   gutter: 92,
   rowAgent: 22,
   rowArea: 24,
@@ -47,7 +36,6 @@ export function layoutGraph(data: GraphData, model: SwarmModel): GraphLayout {
   const at = new Map<string, Point>();
   const labels: GraphLayout["labels"] = [];
 
-  // Swarm side: one block per unit, its hub at the block's centre and its agents fanned to the right.
   let y = GRID.pad;
   for (const swarm of model.live) {
     const hubs: number[] = [];
@@ -72,8 +60,7 @@ export function layoutGraph(data: GraphData, model: SwarmModel): GraphLayout {
       y = top + rows * GRID.rowAgent + GRID.unitGap;
     }
     const mission = `mission:${swarm.id}`;
-    if (present.has(mission)) {
-      // A mission with no live unit still gets a row for its hub and coordinator.
+    if (swarm.kind === "mission" && present.has(mission)) {
       if (hubs.length === 0) { hubs.push(y + GRID.rowAgent); y += 2 * GRID.rowAgent + GRID.unitGap; }
       const centre = (hubs[0] + hubs[hubs.length - 1]) / 2;
       at.set(mission, { x: GRID.missionX, y: centre });
@@ -83,7 +70,6 @@ export function layoutGraph(data: GraphData, model: SwarmModel): GraphLayout {
   }
   const swarmBottom = y;
 
-  // Code side: one block per project, touched areas in the first column and their neighbours in the second, in path order.
   const column: GraphLayout["column"] = new Map();
   const projects: GraphLayout["projects"] = [];
   let codeY = GRID.pad;
@@ -102,7 +88,6 @@ export function layoutGraph(data: GraphData, model: SwarmModel): GraphLayout {
   return { width: neighbourRight + GRID.pad + 20, height: Math.max(swarmBottom, codeY, 160) + GRID.pad, at, column, labels, projects };
 }
 
-/** The four touch kinds run as parallel strands, so a pair of nodes linked several ways shows each link. */
 const STRAND: Partial<Record<LinkKind, number>> = { planned: -3, read: -1, edit: 1, integrated: 3 };
 
 const curve = (x1: number, y1: number, x2: number, y2: number) => {
@@ -111,13 +96,11 @@ const curve = (x1: number, y1: number, x2: number, y2: number) => {
 };
 const arc = (x: number, y1: number, y2: number, bulge: number) => `M${x},${y1} C${x + bulge},${y1} ${x + bulge},${y2} ${x},${y2}`;
 
-/** The drawn path of a link, or undefined for a link the layout shows by placement alone. */
 export function linkPath(link: GraphLink, layout: GraphLayout): string | undefined {
   const from = layout.at.get(link.source), to = layout.at.get(link.target);
   if (!from || !to) return undefined;
   switch (link.kind) {
     case "member":
-      // A coordinator sits beside its mission hub and needs no spoke.
       if (link.target.startsWith("mission:")) return undefined;
       return curve(to.x + 10, to.y, from.x - 36, from.y);
     case "dispatch":

@@ -1,4 +1,3 @@
-/** Graph data drawn in the System tab. Mermaid source is kept as text and is never evaluated. */
 export interface DiagramNode { id: string; label: string; group: string | null; componentId: string | null }
 export interface DiagramGroup { id: string; label: string }
 export interface DiagramEdge { from: string; to: string; label: string | null }

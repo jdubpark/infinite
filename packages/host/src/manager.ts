@@ -149,7 +149,7 @@ export function projectCwd(projectPath: string, cwd?: string): string {
 export function publicAttention(att: Attention): Attention {
   const lastMessage = att.lastMessage?.slice(0, 280);
   const limit = att.limit ? { ...att.limit, message: att.limit.message.slice(0, 300) } : undefined;
-  if (!att.prompt) return { ...att, lastMessage, ...(limit ? { limit } : {}) };
+  if (att.state !== "needs-you" || !att.prompt) return { ...att, lastMessage, ...(limit ? { limit } : {}) };
   const { tool, ...prompt } = att.prompt;
   return {
     ...att,
@@ -157,7 +157,6 @@ export function publicAttention(att: Attention): Attention {
     prompt: {
       ...prompt,
       ...(tool ? { tool: { name: tool.name, input: {} } } : {}),
-      // Decided on the full prompt, since the row drops the tool input the check reads.
       ...(oneShotPermissionOption(att.prompt) !== undefined ? { delegable: true } : {}),
     },
     lastMessage,

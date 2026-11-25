@@ -8,7 +8,6 @@ export type BehaviorPredicate =
   | { op: "not"; arg: BehaviorPredicate }
   | { op: "true" | "false" };
 
-/** Data only: no expressions, modules, shell commands, or executable markup. */
 export interface BehaviorModel {
   initial: string;
   states: { id: string; label: string }[];
@@ -19,7 +18,6 @@ export interface BehaviorModel {
   }[];
   properties: {
     id: string; title: string; kind: "safety" | "liveness";
-    /** Empty means every state. Reachability is checked independently of truth. */
     states: string[]; predicate: BehaviorPredicate; requirement: string;
     basis: "accepted" | "proposed"; evidence: KnowledgeEvidence[];
   }[];
@@ -27,7 +25,6 @@ export interface BehaviorModel {
 
 export interface BehaviorDefinition {
   schemaVersion: 1; id: string; title: string; componentId: string; repositoryId: string;
-  /** The captured map and complete active component plan set used to model this flow. */
   sourceSnapshotId: string; planRevisions: { id: string; revision: number }[];
   requirementRevision: string; assumptions: string[]; exclusions: string[];
   current: BehaviorModel; planned: BehaviorModel | null;

@@ -434,12 +434,12 @@ test("public attention marks only complete Codex command dialogs as delegable", 
     hash: "command-dialog-hash",
   };
   const attention = initialAttention("2026-10-19T00:00:00.000Z", false);
-  const delegated = publicAttention({ ...attention, prompt });
+  const delegated = publicAttention({ ...attention, state: "needs-you", source: "screen", prompt });
   assert.equal(delegated.prompt?.delegable, true);
 
-  const nonDelegable = publicAttention({ ...attention, prompt: { ...prompt, hash: undefined } });
+  const nonDelegable = publicAttention({ ...attention, state: "needs-you", source: "screen", prompt: { ...prompt, hash: undefined } });
   assert.equal(nonDelegable.prompt?.delegable, undefined);
-  assert.equal(publicAttention({ ...attention, prompt: { ...prompt, pinned: false } }).prompt?.delegable, undefined);
+  assert.equal(publicAttention({ ...attention, state: "needs-you", source: "screen", prompt: { ...prompt, pinned: false } }).prompt?.delegable, undefined);
 });
 
 test("a plain session says what it is doing; one unreadable status never hides the other sessions", { timeout: 60000 }, async () => {

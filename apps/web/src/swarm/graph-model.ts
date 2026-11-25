@@ -1,9 +1,6 @@
 import type { Agent, AgentState, CodeMap, SessionTouches, Swarm, SwarmModel, Unit } from "./types";
 
-// Pure: no DOM, no React, no CSS. Turns the swarm model and the code context into nodes and links.
-
 export const GRAPH_BUDGET = { agents: 60, projects: 6, areas: 120, codeLinks: 400 };
-/** Neighbours drawn per touched area, heaviest code links first. */
 const NEIGHBOURS_PER_AREA = 3;
 
 export type GraphNode = {
@@ -18,7 +15,6 @@ export type GraphNode = {
   symbols?: number;
   touched?: boolean;
   heat?: number;
-  /** An agent the host has no tool-input signal for; its observed links are not drawn. */
   unobserved?: boolean;
 };
 export type LinkKind = "member" | "dispatch" | "depends" | "planned" | "read" | "edit" | "integrated" | "code" | "contains";
@@ -27,7 +23,6 @@ export type GraphData = {
   nodes: GraphNode[];
   links: GraphLink[];
   dropped: { agents: number; projects: number; areas: number; codeLinks: number };
-  /** `none` when no project is drawn, so there is no code graph to report on. */
   codeGraph: "on" | "partial" | "off" | "none";
   unobserved: number;
 };
@@ -47,10 +42,6 @@ export const nodeId = {
 };
 const linkId = (kind: LinkKind, source: string, target: string) => `${kind}:${source}>${target}`;
 
-/**
- * The directory area a file belongs to: the longest directory prefix present in the project's
- * area set, or `.`. Without a map, the file's directory truncated to two segments.
- */
 export function areaOf(path: string, areas: ReadonlySet<string> | undefined): string {
   const dirs = path.split("/").slice(0, -1);
   if (!areas) return dirs.slice(0, 2).join("/") || ".";
@@ -61,10 +52,6 @@ export function areaOf(path: string, areas: ReadonlySet<string> | undefined): st
   return ".";
 }
 
-/**
- * The area of a planned path, which may name a file or a directory. A directory the map knows is
- * its own area; without a map, a path with no file extension is taken as a directory.
- */
 export function areaOfOwned(path: string, areas: ReadonlySet<string> | undefined): string {
   const clean = path.replace(/\/+$/, "");
   if (areas) return areaOf(`${clean}/_`, areas);
@@ -72,36 +59,44 @@ export function areaOfOwned(path: string, areas: ReadonlySet<string> | undefined
   return areaOf(isFile ? clean : `${clean}/_`, undefined);
 }
 
-/** A repository-relative POSIX path that stays inside the repository. */
 function usablePath(path: string): boolean {
   return path.length > 0 && !path.startsWith("/") && !path.split("/").includes("..") && !path.includes("\0");
 }
 
-/** The session IDs the context endpoints should be asked about: solo sessions and mission coordinators. */
 export function contextRequests(model: SwarmModel): { projects: string[]; teams: string[]; sessions: string[] } {
   const projects = new Set<string>();
   const teams: string[] = [];
   const sessions: string[] = [];
   for (const swarm of model.live) {
-    for (const unit of swarm.units) {
-      if (!unit.live) continue;
-      projects.add(unit.projectId);
-      teams.push(unit.id);
-    }
-    if (swarm.coordinator?.sessionId) sessions.push(swarm.coordinator.sessionId);
-    for (const agent of swarm.loose) {
-      sessions.push(agent.sessionId ?? agent.id);
-      // A solo session's touches land in its own project, so that project's map is wanted too.
-      if (agent.projectId) projects.add(agent.projectId);
+    switch (swarm.kind) {
+      case "mission":
+        for (const unit of swarm.units) {
+          if (!unit.live) continue;
+          projects.add(unit.projectId);
+          teams.push(unit.id);
+        }
+        if (swarm.coordinator?.sessionId) sessions.push(swarm.coordinator.sessionId);
+        break;
+      case "team":
+        for (const unit of swarm.units) {
+          if (!unit.live) continue;
+          projects.add(unit.projectId);
+          teams.push(unit.id);
+        }
+        break;
+      case "solo":
+        for (const agent of swarm.loose) {
+          sessions.push(agent.sessionId ?? agent.id);
+          if (agent.projectId) projects.add(agent.projectId);
+        }
+        break;
     }
   }
   return { projects: [...projects].sort(), teams, sessions: [...new Set(sessions)].sort() };
 }
 
-/** Sessions asked about in one cycle. A longer list is walked a batch at a time, so no session is starved. */
 export const SESSION_BATCH = 12;
 
-/** The next batch of a list that is walked round and round, `size` at a time. */
 export function nextBatch<T>(items: T[], offset: number, size: number): { batch: T[]; offset: number } {
   if (items.length <= size) return { batch: items, offset: 0 };
   const start = offset % items.length;
@@ -137,7 +132,6 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
     return areaSets.get(projectId);
   };
 
-  // 1. Agents: each once, then the agent budget. Stopped, reported, then queued agents go first.
   const placed: Placed[] = [];
   const seen = new Set<string>();
   const place = (agent: Agent, swarm: Swarm, unit?: Unit, hub?: string) => {
@@ -146,12 +140,24 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
     placed.push({ agent, swarm, unit, hub });
   };
   for (const swarm of model.live) {
-    if (swarm.coordinator) place(swarm.coordinator, swarm, undefined, swarm.kind === "mission" ? nodeId.mission(swarm.id) : undefined);
-    for (const unit of swarm.units) {
-      if (!unit.live) continue;
-      for (const agent of [...unit.agents, ...unit.side]) place(agent, swarm, unit, nodeId.unit(unit.id));
+    switch (swarm.kind) {
+      case "mission":
+        if (swarm.coordinator) place(swarm.coordinator, swarm, undefined, nodeId.mission(swarm.id));
+        for (const unit of swarm.units) {
+          if (!unit.live) continue;
+          for (const agent of [...unit.agents, ...unit.side]) place(agent, swarm, unit, nodeId.unit(unit.id));
+        }
+        break;
+      case "team":
+        for (const unit of swarm.units) {
+          if (!unit.live) continue;
+          for (const agent of [...unit.agents, ...unit.side]) place(agent, swarm, unit, nodeId.unit(unit.id));
+        }
+        break;
+      case "solo":
+        for (const agent of swarm.loose) place(agent, swarm);
+        break;
     }
-    for (const agent of swarm.loose) place(agent, swarm);
   }
   const overAgents = placed.length - GRAPH_BUDGET.agents;
   const cut = new Set<number>();
@@ -163,8 +169,8 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
   }
   const kept = placed.filter((_, index) => !cut.has(index));
 
-  // 2. Swarm side: hubs, membership, dispatch, and dependencies.
   for (const swarm of model.live) {
+    if (swarm.kind === "solo") continue;
     if (swarm.kind === "mission") {
       nodes.set(nodeId.mission(swarm.id), { id: nodeId.mission(swarm.id), kind: "mission", side: "swarm", label: swarm.title });
     }
@@ -174,6 +180,7 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
     }
   }
   for (const swarm of model.live) {
+    if (swarm.kind === "solo") continue;
     for (const unit of swarm.units) {
       if (!unit.live) continue;
       if (swarm.kind === "mission") addLink("dispatch", nodeId.mission(swarm.id), nodeId.unit(unit.id), 1);
@@ -188,7 +195,6 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
     if (hub && nodes.has(hub)) addLink("member", id, hub, 1);
   }
 
-  // 3. Touches per agent. Planned, integrated, read, and edit stay separate links.
   const areas = new Map<string, AreaCandidate>();
   const touchingAgents = new Map<string, Set<string>>();
   let unobserved = 0;
@@ -216,7 +222,6 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
       for (const path of item.changedPaths?.paths ?? []) touch("integrated", agent, path, 1);
     }
     const observed = touches[agent.sessionId ?? agent.id];
-    // No answer yet is a gap too: only a positive answer makes an agent observed.
     if (!agent.observable || observed?.observable !== true) {
       unobserved++;
       const node = nodes.get(nodeId.agent(agent.id));
@@ -229,9 +234,8 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
     }
   }
 
-  // 4. Projects: live unit projects and touched projects, the most touching agents first.
   const projectSet = new Set<string>();
-  for (const swarm of model.live) for (const unit of swarm.units) if (unit.live) projectSet.add(unit.projectId);
+  for (const swarm of model.live) if (swarm.kind !== "solo") for (const unit of swarm.units) if (unit.live) projectSet.add(unit.projectId);
   for (const area of areas.values()) projectSet.add(area.projectId);
   const rankedProjects = [...projectSet].sort((a, b) => (touchingAgents.get(b)?.size ?? 0) - (touchingAgents.get(a)?.size ?? 0) || a.localeCompare(b));
   const keptProjects = new Set(rankedProjects.slice(0, GRAPH_BUDGET.projects));
@@ -242,7 +246,6 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
   };
   for (const area of [...areas.values()]) if (!keptProjects.has(area.projectId)) dropArea(area.id);
 
-  // 5. Neighbours: the heaviest code links of each touched area, from the project's map.
   for (const area of [...areas.values()]) {
     const map = readyMap(area.projectId);
     if (!map || !area.touched) continue;
@@ -261,7 +264,6 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
     }
   }
 
-  // 6. Area budget: untouched neighbours go first, then the least touched.
   const overAreas = areas.size - GRAPH_BUDGET.areas;
   if (overAreas > 0) {
     const victims = [...areas.values()].sort((a, b) =>
@@ -272,7 +274,6 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
     dropped.areas = overAreas;
   }
 
-  // 7. Project clusters and their areas.
   for (const projectId of keptProjects) {
     nodes.set(nodeId.project(projectId), { id: nodeId.project(projectId), kind: "project", side: "code", label: projectNames[projectId] ?? projectId, projectId });
   }
@@ -286,7 +287,6 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
     addLink("contains", nodeId.project(area.projectId), area.id, 1);
   }
 
-  // 8. Code links between drawn areas only, heaviest first.
   const codeLinks = new Map<string, GraphLink>();
   for (const projectId of keptProjects) {
     const map = readyMap(projectId);
@@ -306,7 +306,6 @@ export function buildGraph({ model, maps, touches, projectNames }: GraphInput): 
   dropped.codeLinks = Math.max(0, sortedCode.length - GRAPH_BUDGET.codeLinks);
   for (const link of sortedCode.slice(0, GRAPH_BUDGET.codeLinks)) links.set(link.id, link);
 
-  // 9. Code graph state: on when every drawn project has a ready map, off when none does, none when no project is drawn.
   const projectIds = [...keptProjects];
   const withMap = projectIds.filter(id => readyMap(id)).length;
   const codeGraph: GraphData["codeGraph"] = projectIds.length === 0 ? "none" : withMap === 0 ? "off" : withMap === projectIds.length ? "on" : "partial";

@@ -23,7 +23,6 @@ interface Slot { container: Record<string, unknown> | unknown[]; key: string | n
 const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 const set = (slot: Slot, value: string) => { (slot.container as Record<string | number, unknown>)[slot.key] = value; };
 
-/** Bounds a tool input for storage: per-field limits first, then a 16 KiB (UTF-8) cap on the whole record. */
 export function truncateInput(input: Record<string, unknown>): Record<string, unknown> {
   const slots: Slot[] = [];
 
@@ -50,7 +49,6 @@ export function truncateInput(input: Record<string, unknown>): Record<string, un
   const size = () => utf8Length(JSON.stringify(out));
   if (size() <= CAP_BYTES) return out;
 
-  // Halve the largest string anywhere until the record fits, always re-cutting from the original text.
   while (size() > CAP_BYTES) {
     let best: Slot | undefined;
     let bestLen = MIN_CHARS;

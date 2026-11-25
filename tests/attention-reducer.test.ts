@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   initialAttention, applySignal, applyLifecycle, screenDecision, describeNow, mergeScreenIntoPrompt, mergeHookIntoPrompt, correlates, dropsPrompt,
 } from "../packages/attention/src/attention.js";
-import type { Prompt } from "../packages/attention/src/types.js";
+import type { Attention, Prompt } from "../packages/attention/src/types.js";
 import type { SignalEvent, SignalData } from "../packages/attention/src/types.js";
 import { detectPrompt } from "../packages/attention/src/prompts.js";
 
@@ -52,39 +52,54 @@ test("exited is terminal; late hooks do not revive it", () => {
   assert.equal(a.state, "exited");
 });
 
+test("terminal lifecycle transitions retain the last assistant message across reload", () => {
+  let a = initialAttention("t1", true);
+  a = applySignal(a, ev({ kind: "turn-end", message: "Final assistant reply.", backgroundTasks: 0 }));
+  a = applyLifecycle(a, "exited", "t2");
+  assert.equal(a.state, "exited");
+  assert.equal(a.lastMessage, "Final assistant reply.");
+  const reloaded = JSON.parse(JSON.stringify(a)) as Attention;
+  assert.equal(reloaded.lastMessage, "Final assistant reply.");
+  assert.equal(applyLifecycle(a, "unavailable", "t3").lastMessage, "Final assistant reply.");
+  assert.equal(applyLifecycle(a, "recording-error", "t4").lastMessage, "Final assistant reply.");
+});
+
 test("screen decisions open, merge, and close prompts", () => {
   const lines = ["Do you want to proceed?", "❯ 1. Yes", "  2. No, and tell Claude what to do differently"];
   const detected = detectPrompt(lines, "claude")!;
   let a = initialAttention("t", true);
   const d1 = screenDecision(a, detected, false, true, "t1");
-  assert.ok(d1.open);
+  assert.equal(d1.kind, "open");
+  if (d1.kind !== "open") throw new Error("expected open");
   assert.equal(d1.open.source, "screen");
   assert.equal(d1.open.options.length, 2);
   // A hook prompt without options gets merged, keeping its id.
   const hookOpen = ev({ kind: "prompt-open", prompt: { id: 0, kind: "permission", title: "Do you want to proceed?", options: [], acceptsText: false, source: "hook", tool: { name: "Bash", input: { command: "ls" } } } });
   a = applySignal(a, hookOpen);
   const d2 = screenDecision(a, detected, false, true, "t2");
-  assert.equal(d2.open, undefined);
+  assert.equal(d2.kind, "merge");
+  if (d2.kind !== "merge") throw new Error("expected merge");
   assert.equal(d2.merge, detected);
   const merged = mergeScreenIntoPrompt(a.prompt!, detected, "abc");
   assert.equal(merged.id, hookOpen.seq);
   assert.equal(merged.options.length, 2);
   assert.equal(merged.hash, "abc");
   assert.equal(merged.tool?.name, "Bash");
+  if (a.state !== "needs-you") throw new Error("expected needs-you");
   a = { ...a, prompt: merged };
   const d3 = screenDecision(a, null, false, true, "t3");
-  assert.deepEqual(d3.close, { promptId: hookOpen.seq, reason: "vanished" });
+  assert.deepEqual(d3, { kind: "close", close: { promptId: hookOpen.seq, reason: "vanished" } });
 });
 
 test("idle screens become turn-finished only after a turn-end", () => {
   let a = initialAttention("t", true);
-  assert.equal(screenDecision(a, null, true, false, "t1").idle, "idle");
+  assert.deepEqual(screenDecision(a, null, true, false, "t1"), { kind: "idle", idle: "idle" });
   a = applySignal(a, ev({ kind: "turn-end", backgroundTasks: 0 }));
   a = applySignal(a, ev({ kind: "turn-start" }));
-  assert.equal(screenDecision(a, null, true, false, "t2").idle, "turn-finished");
+  assert.deepEqual(screenDecision(a, null, true, false, "t2"), { kind: "idle", idle: "turn-finished" });
   a = applySignal(a, ev({ kind: "turn-end", backgroundTasks: 0 }));
   // Without hooks, new output after a finished turn is the only sign of new work.
-  assert.equal(screenDecision({ ...a, hooks: "none" }, null, false, true, "t3").working, true);
+  assert.deepEqual(screenDecision({ ...a, hooks: "none" }, null, false, true, "t3"), { kind: "working" });
 });
 
 test("with hooks active, output after a turn-end does not reopen the turn", () => {
@@ -93,12 +108,12 @@ test("with hooks active, output after a turn-end does not reopen the turn", () =
   assert.equal(a.hooks, "active");
   assert.equal(a.state, "turn-finished");
   // A redraw or late output alone keeps the finished turn.
-  assert.deepEqual(screenDecision(a, null, false, true, "t2"), {});
+  assert.deepEqual(screenDecision(a, null, false, true, "t2"), { kind: "none" });
   // Only a turn or tool hook starts work again.
   assert.equal(applySignal(a, ev({ kind: "tool-start", tool: "Bash", input: { command: "ls" }, quiet: false })).state, "working");
   assert.equal(applySignal(a, ev({ kind: "turn-start" })).state, "working");
   // An idle session still wakes up on output.
-  assert.equal(screenDecision({ ...a, state: "idle" }, null, false, true, "t3").working, true);
+  assert.deepEqual(screenDecision({ ...initialAttention("t", false), hooks: a.hooks, sawTurnEnd: a.sawTurnEnd }, null, false, true, "t3"), { kind: "working" });
 });
 
 test("a turn-end without a message clears the previous turn's message", () => {
@@ -180,7 +195,7 @@ test("a tool-start clears a stale prompt so idle detection works", () => {
   a = applySignal(a, ev({ kind: "tool-start", tool: "Bash", input: { command: "ls" }, quiet: false }));
   assert.equal(a.state, "working");
   assert.equal(a.prompt, undefined);
-  assert.equal(screenDecision(a, null, true, false, "t").idle, "idle");
+  assert.deepEqual(screenDecision(a, null, true, false, "t"), { kind: "idle", idle: "idle" });
 });
 
 const rmDialog = () => detectPrompt([
@@ -322,7 +337,7 @@ test("a hook merged into an open prompt never clears its destructive flag", () =
 });
 
 test("the now line names the hook's command when the dialog shows it", () => {
-  const needsYou = (prompt: Prompt) => ({ ...initialAttention("t", true), state: "needs-you" as const, prompt });
+  const needsYou = (prompt: Prompt): Attention => ({ ...initialAttention("t", true), state: "needs-you", prompt, lastMessage: undefined });
   const detail = "Process 42 stays alive when clients disconnect.\nBash command\nrm -rf build\nRemove the stale build directory";
   const screenOnly: Prompt = { id: 1, kind: "permission", title: "Do you want to proceed?", detail, options: [], acceptsText: false, source: "screen", hash: "h" };
   // Without a hook the first detail line is all there is.
@@ -356,6 +371,6 @@ test("the now line names a Codex command shown only in the screen dialog", () =>
     source: "screen",
     hash: "screen-hash",
   };
-  const attention = { ...initialAttention("t", true), state: "needs-you" as const, prompt };
+  const attention: Attention = { ...initialAttention("t", true), state: "needs-you", prompt, lastMessage: undefined };
   assert.equal(describeNow(attention, "codex"), "Would you like to run the following command? npm run check");
 });

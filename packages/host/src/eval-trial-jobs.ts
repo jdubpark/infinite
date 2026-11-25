@@ -11,9 +11,9 @@ import type { EvalProbe } from "./eval-identity.js";
 import { ACTIVE_PROJECT_JOBS_SQL, inWindow, JOB_EXPIRY_DAYS_MAX, JOB_TASKS_MAX, type EvalJobRow } from "./eval-jobs.js";
 import { applyComparison, comparisonJobSchema, pinsChanged, planComparison } from "./eval-compare-jobs.js";
 import { TRIAL_TASKS_SQL, type TrialTaskRow } from "./eval-sets.js";
-import { configRef, nextSlot, VOID_STREAK_PAUSE } from "./eval-trial-rules.js";
+import { configRef, nextSlot, TRIAL_RELEASES, VOID_STREAK_PAUSE } from "./eval-trial-rules.js";
 import {
-  advanceTask, jobSlots, jobTrialCount, openTrialCounts, trialCounts, trialsSince, TRIAL_KEEP_DAYS_DEFAULT, type TrialCounts,
+  advanceTask, dropTrial, jobSlots, jobTrialCount, openTrialCounts, trialCounts, trialsSince, TRIAL_KEEP_DAYS_DEFAULT, type TrialCounts,
 } from "./eval-trial-store.js";
 import {
   VOID_ENDINGS, type BaselineJobRequest, type BaselineJobView, type ComparisonJobRequest, type ComparisonJobView,
@@ -54,6 +54,9 @@ type Filter = { origins?: Set<string>; areas?: Set<string>; ids?: Set<string> };
 type Project = Config["projects"][number];
 /** `slots` asks the caller for the free session count, which is read outside the write. */
 type Pass = NextTrial | { kind: "slots" };
+
+/** Waits that hold a slot without counting: the project's preconditions and an owner's halt. */
+const WAITS_ONLY: ReadonlySet<EvalJobWait> = new Set<EvalJobWait>(["mirror", "halt"]);
 
 const NONE: NextTrial = { kind: "none" };
 const EMPTY_COUNTS: TrialCounts = { plannedTasks: 0, plannedTrials: 0, tasks: 0, skipped: 0, started: 0, graded: 0, resolved: 0, ended: 0, void: 0, voidStreak: 0, reused: 0 };
@@ -113,6 +116,8 @@ export class TrialJobs {
   private readonly store: EvidenceStore;
   private readonly config: Pick<Config, "projects" | "eval" | "teams">;
   private readonly now: () => string;
+  /** Per job: the slot whose releases are being counted, and how many in a row. */
+  private readonly released = new Map<string, { key: string; count: number }>();
 
   constructor(options: { store: EvidenceStore; config: Pick<Config, "projects" | "eval" | "teams">; now?: () => string }) {
     this.store = options.store;
@@ -256,6 +261,36 @@ export class TrialJobs {
       const counts = trialCounts(tx, [jobId]).get(jobId);
       if (counts === undefined || !VOID_ENDINGS.includes(ending) || counts.voidStreak < VOID_STREAK_PAUSE) return;
       setJob(tx, jobId, this.now(), { status: "paused", reason: "trial-voids", waiting: null });
+    });
+  }
+
+  /**
+   * A trial that could not start, in one transaction. A job that is no longer open only loses the row. Otherwise the row goes
+   * and the cause is the job's `waiting`, and the answer is "released"; a WAITS_ONLY cause is never counted and starts the count
+   * again. On the TRIAL_RELEASES-th counted release in a row for one slot of one job the row stays and the answer is "exhausted":
+   * the caller ends that trial `void-host` and skips the task. The count is in memory, so a restart starts it again.
+   */
+  release(trial: Pick<Extract<NextTrial, { kind: "trial" }>, "jobId" | "taskId" | "configRef" | "slot" | "attempt"> & { trialId: string },
+    waiting: EvalJobWait): "released" | "exhausted" {
+    return this.store.write(tx => {
+      const row = this.rowOf(tx, trial.jobId);
+      if (row === undefined || (row.status !== "scheduled" && row.status !== "running")) {
+        this.released.delete(trial.jobId);
+        dropTrial(tx, trial.trialId);
+        return "released";
+      }
+      const key = JSON.stringify([trial.taskId, trial.configRef, trial.slot, trial.attempt]);
+      const last = this.released.get(trial.jobId);
+      const count = WAITS_ONLY.has(waiting) ? 0 : last?.key === key ? last.count + 1 : 1;
+      if (count >= TRIAL_RELEASES) {
+        this.released.delete(trial.jobId);
+        return "exhausted";
+      }
+      if (count === 0) this.released.delete(trial.jobId);
+      else this.released.set(trial.jobId, { key, count });
+      dropTrial(tx, trial.trialId);
+      if (row.waiting !== waiting) setJob(tx, row.job_id, this.now(), { waiting });
+      return "released";
     });
   }
 

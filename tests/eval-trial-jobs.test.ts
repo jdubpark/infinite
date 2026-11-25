@@ -10,7 +10,7 @@ import type { Provider } from "../packages/host/src/types.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 import type { EvalProbe } from "../packages/host/src/eval-identity.js";
 import type { GraderProbe } from "../packages/host/src/eval-grader.js";
-import type { BaselineJobRequest, ComparisonJobRequest, EvalRefusal, TrialConfiguration, TrialGrade } from "../packages/host/src/eval-types.js";
+import type { BaselineJobRequest, ComparisonJobRequest, EvalJobWait, EvalRefusal, TrialConfiguration, TrialGrade } from "../packages/host/src/eval-types.js";
 import { evalCorpusModule } from "../packages/host/src/eval-store.js";
 import { ACTIVE_JOBS_SQL, ACTIVE_PROJECT_JOBS_SQL, EvalJobs } from "../packages/host/src/eval-jobs.js";
 import {
@@ -36,6 +36,7 @@ const DAY_MS = 86_400_000;
 const START = Date.parse("2026-11-16T10:00:00.000Z");
 const PROJECT = "project-trials-1";
 const BARE = "project-trials-bare";
+const OTHER = "project-trials-2";
 const REQUEST_ONE = "11111111-1111-4111-8111-111111111111";
 const REQUEST_TWO = "22222222-2222-4222-8222-222222222222";
 const REQUEST_THREE = "33333333-3333-4333-8333-333333333333";
@@ -88,6 +89,7 @@ function fixture() {
     projects: [
       project(PROJECT, { mine: true, focusedTest: FOCUSED, reportFormat: "junit", trialsPerDay: 1 }),
       project(BARE, { mine: true, focusedTest: FOCUSED, reportFormat: "junit" }),
+      project(OTHER, { mine: true, focusedTest: FOCUSED, reportFormat: "junit", trialsPerDay: 1 }),
     ],
     eval: {
       grader: { prefix: { command: "/usr/bin/sudo", args: ["-n"] }, root: "/var/lib/infinite-grader/root" },
@@ -826,6 +828,98 @@ test("an idle job past its expiry waits for its live trial to end", () => {
     voidTrial(f, trialId);
     assert.equal(f.trial.expireIdle(), 1, "the job expires once the trial is final");
     assert.equal(f.jobs.view(jobId)?.status, "expired");
+  } finally {
+    f.cleanup();
+  }
+});
+
+type Slot = { jobId: string; slot: number; attempt: number };
+
+/** One failed start: a preparing row for the slot, then its release. The answer, and whether the row is still there. */
+function release(f: Fixture, at: Slot, waiting: EvalJobWait): { answer: "released" | "exhausted"; row: boolean } {
+  const trialId = insertAt(f, at.jobId, at.attempt, { slot: at.slot, start: false });
+  const answer = f.trial.release({ jobId: at.jobId, taskId: TASK_ONE, configRef: configRef(configuration(CLAUDE)), slot: at.slot, attempt: at.attempt, trialId }, waiting);
+  return { answer, row: f.store.read(db => db.get("SELECT 1 FROM eval_trials WHERE trial_id = ?", trialId)) !== undefined };
+}
+const answers = (f: Fixture, at: Slot, waiting: EvalJobWait, count: number) => Array.from({ length: count }, () => release(f, at, waiting).answer);
+function open(f: Fixture, project = PROJECT, id = REQUEST_ONE): string {
+  const created = f.trial.create(project, request(), id);
+  assert.ok("job" in created);
+  return created.job.jobId;
+}
+
+test("a release counts one slot only: a release of another slot starts the count again", () => {
+  const f = fixture();
+  try {
+    const jobId = open(f);
+    assert.ok(answers(f, { jobId, slot: 0, attempt: 0 }, "bundle-missing", 9).every(answer => answer === "released"), "nine releases keep the attempt");
+    assert.equal(f.jobs.view(jobId)?.waiting, "bundle-missing", "the cause shows as the job's wait");
+    assert.equal(release(f, { jobId, slot: 1, attempt: 0 }, "bundle-missing").answer, "released", "another slot's first release");
+    assert.ok(answers(f, { jobId, slot: 0, attempt: 0 }, "bundle-missing", 9).every(answer => answer === "released"), "the count of the first slot started again");
+    assert.equal(release(f, { jobId, slot: 0, attempt: 0 }, "bundle-missing").answer, "exhausted", "the tenth in a row for one slot");
+    assert.equal(release(f, { jobId, slot: 0, attempt: 1 }, "bundle-missing").answer, "released", "the next attempt counts from one");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a mirror or halt wait is never counted, and it starts the count again", () => {
+  const f = fixture();
+  try {
+    const jobId = open(f);
+    const at = { jobId, slot: 0, attempt: 0 };
+    assert.ok(answers(f, at, "halt", 12).every(answer => answer === "released"));
+    assert.equal(f.jobs.view(jobId)?.waiting, "halt");
+    assert.ok(answers(f, at, "mirror", 12).every(answer => answer === "released"));
+    assert.equal(f.jobs.view(jobId)?.waiting, "mirror");
+    assert.ok(answers(f, at, "bundle-missing", 5).every(answer => answer === "released"));
+    assert.ok(answers(f, at, "halt", 3).every(answer => answer === "released"));
+    assert.ok(answers(f, at, "bundle-missing", 9).every(answer => answer === "released"), "the count was one again after the wait");
+    assert.equal(release(f, at, "bundle-missing").answer, "exhausted");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("two jobs that take turns each reach their own tenth release", () => {
+  const f = fixture();
+  try {
+    const first = open(f, PROJECT, REQUEST_ONE);
+    const second = open(f, OTHER, REQUEST_TWO);
+    const seen: string[] = [];
+    for (let turn = 1; turn <= 10; turn += 1) {
+      seen.push(release(f, { jobId: first, slot: 0, attempt: 0 }, "eval-failed").answer, release(f, { jobId: second, slot: 0, attempt: 0 }, "eval-failed").answer);
+    }
+    assert.deepEqual(seen.slice(0, 18).filter(answer => answer !== "released"), [], "nine turns each keep the attempt");
+    assert.deepEqual(seen.slice(18), ["exhausted", "exhausted"], "each job's tenth release ends its trial");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a job that is no longer open only loses the row", () => {
+  const f = fixture();
+  try {
+    const jobId = open(f);
+    assert.ok(!("code" in f.jobs.control(jobId, "cancel")));
+    const results = Array.from({ length: 10 }, () => release(f, { jobId, slot: 0, attempt: 0 }, "bundle-missing"));
+    assert.ok(results.every(result => result.answer === "released" && !result.row), "ten releases never end a trial, and each removes its row");
+    assert.equal(f.jobs.view(jobId)?.waiting, null, "no wait is written on a cancelled job");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a release removes the row; an exhausted one leaves it for the caller to end", () => {
+  const f = fixture();
+  try {
+    const jobId = open(f);
+    const at = { jobId, slot: 0, attempt: 0 };
+    const results = Array.from({ length: 10 }, () => release(f, at, "storage"));
+    assert.ok(results.slice(0, 9).every(result => result.answer === "released" && !result.row));
+    assert.deepEqual(results[9], { answer: "exhausted", row: true });
+    const state = f.store.read(db => db.get<{ state: string }>("SELECT state FROM eval_trials WHERE job_id = ?", jobId));
+    assert.equal(state?.state, "preparing");
   } finally {
     f.cleanup();
   }

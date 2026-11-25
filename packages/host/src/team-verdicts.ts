@@ -152,6 +152,9 @@ function emptyVerdict(reason: VerdictReason): ComposedVerdict {
   return { result: "inconclusive", reason, criteria: [], counts: { met: 0, notMet: 0, inconclusive: 0, pendingOwner: 0 }, dropped: { unknownIds: 0, handles: 0 } };
 }
 
+/** The profiles of a run's members that the evaluator must differ from or be weighed against. */
+type Cycle = { authors: TeamModelProfile[]; reviewers: TeamModelProfile[]; managers: TeamModelProfile[] };
+
 /**
  * The verdict of one revision. Holds a reviewed revision (or a goal cycle's no-change report) while a register pass, then one
  * read-only evaluator, produce the facts; composes the evaluator's report with host receipts and owner values; writes the
@@ -274,7 +277,7 @@ export class TeamVerdicts {
       ...(composed.evaluatorResult === undefined ? {} : { evaluatorResult: composed.evaluatorResult }),
       ...(composed.reason === undefined ? {} : { reason: composed.reason }),
       criteria: composed.criteria,
-      ...(state.choice === undefined || composed.evaluatorResult === undefined ? {} : { evaluator: state.choice }),
+      ...(state.choice === undefined || !this.applied(composed) ? {} : { evaluator: state.choice }),
       ...(state.written === undefined ? {} : { written: state.written }),
     };
   }
@@ -344,7 +347,12 @@ export class TeamVerdicts {
       this.finish(holder, state, undefined, "record-unavailable");
       return;
     }
-    const choice = chooseEvaluator(run.lineup, this.cycleOf(run), this.host.limited(), new Set(state.excluded ?? []));
+    const cycle = this.cycleFor(run, state);
+    if (cycle === undefined) {
+      this.finish(holder, state, undefined, "no-independent-evaluator");
+      return;
+    }
+    const choice = chooseEvaluator(run.lineup, cycle, this.host.limited(), new Set(state.excluded ?? []));
     if ("skipped" in choice) {
       this.finish(holder, state, undefined, choice.skipped);
       return;
@@ -476,7 +484,7 @@ export class TeamVerdicts {
     else delete state.reason;
     const at = this.host.now();
     run.assessment = this.assessmentOf(state, composed, at);
-    if (record) this.host.emit(holder, this.rowOf(holder, state, composed, record, version, report !== undefined));
+    if (record) this.host.emit(holder, this.rowOf(holder, state, composed, record, version, this.applied(composed)));
     this.events(holder, composed, written);
     state.status = state.kind === "no-change" ? "releasing" : "done";
     this.host.save(holder);
@@ -521,7 +529,12 @@ export class TeamVerdicts {
     };
   }
 
-  /** Ids, enumerations, and counts only. The profile is named only when an evaluator answered. */
+  /** True when an evaluator's answer was recorded on some criterion; a report whose answers were all dropped names no evaluator. */
+  private applied(composed: ComposedVerdict): boolean {
+    return composed.criteria.some(item => item.evaluatorState !== undefined);
+  }
+
+  /** Ids, enumerations, and counts only. The profile is named only when an evaluator answer was applied. */
   private rowOf(holder: VerdictHolder, state: VerdictState, composed: ComposedVerdict, record: ObjectiveRecord, version: number, answered: boolean): VerdictEventData {
     const run = holder.run;
     const choice = answered ? state.choice : undefined;
@@ -574,19 +587,31 @@ export class TeamVerdicts {
     return receipts === "pending" ? undefined : receipts;
   }
 
+  /** The members the evaluator must be independent of: this run's, and for a no-change verdict also those of the parent run, which made the head. Undefined when that run is gone. */
+  private cycleFor(run: TeamRun, state: VerdictState): Cycle | undefined {
+    const own = this.cycleOf(run);
+    if (state.kind === "reviewed") return own;
+    const parent = this.host.holder(state.receiptsFrom)?.run;
+    if (parent === undefined) return undefined;
+    const before = this.cycleOf(parent);
+    return { authors: [...own.authors, ...before.authors], reviewers: [...own.reviewers, ...before.reviewers], managers: [...own.managers, ...before.managers] };
+  }
+
   /**
    * Every implementer and integrator member with a profile is an author, whatever its report and revision: an escalated or stopped
-   * member's edits can be in the head, and steer and resume reset run.tasks. Every reviewer member is a reviewer.
+   * member's edits can be in the head, and steer and resume reset run.tasks. Every reviewer member is a reviewer, and every project manager member with a profile is a manager.
    */
-  private cycleOf(run: TeamRun): { authors: TeamModelProfile[]; reviewers: TeamModelProfile[] } {
+  private cycleOf(run: TeamRun): Cycle {
     const authors: TeamModelProfile[] = [];
     const reviewers: TeamModelProfile[] = [];
+    const managers: TeamModelProfile[] = [];
     for (const member of run.members) {
       if (member.modelProfile === undefined) continue;
       if (member.role === "reviewer") reviewers.push(member.modelProfile);
+      else if (member.role === "project-manager") managers.push(member.modelProfile);
       else if (member.role === "integrator" || member.role === "implementer") authors.push(member.modelProfile);
     }
-    return { authors, reviewers };
+    return { authors, reviewers, managers };
   }
 
   /** The state belongs to the run's current revision and head. */

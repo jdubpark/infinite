@@ -85,12 +85,14 @@ function makeRig(options: Options = {}) {
   } as unknown as Config;
   options.config?.(config);
   const log: string[] = [];
+  /** `probe`: the probe for a named project is not ready. `stop`: the account cannot be stopped, so the start-up cannot finish. */
+  const down = { probe: false, stop: false };
   /** The grader job and project of every source the pump asked for. */
   const sources: { jobId: string; projectId: string }[] = [];
   const identity = options.identity ?? ({
-    probe: async () => READY, receive: async () => "failed", prepare: async () => "failed", check: async () => "failed",
+    probe: async (input: Record<string, unknown>) => (down.probe && "fetchUrl" in input ? { state: "unavailable" } : READY), receive: async () => "failed", prepare: async () => "failed", check: async () => "failed",
     teamPrefix: () => undefined, setupPrefix: () => undefined,
-    stop: async () => { log.push("stop"); return true; },
+    stop: async () => { log.push("stop"); return !down.stop; },
     clean: async () => { log.push("clean"); return true; },
     scrub: async () => { log.push("scrub"); return true; },
   } as unknown as EvalIdentity);
@@ -98,8 +100,12 @@ function makeRig(options: Options = {}) {
   const judge = scriptedTeams(options.mode ?? "prefer-resolved");
   const jobs = new TrialJobs({ store, config, now });
   const judgements = new JudgeCalibrations({ store, config, now });
+  /** The mirror head the scripted source status reports; undefined means the project has no mirror yet. */
+  const mirror = { head: "head" as string | undefined };
+  /** How many of the next source builds end on an environment cause. */
+  const sourceFails = { left: 0 };
   const rig = {
-    root, store, config, log, sources, judge, jobs, judgements, now,
+    root, store, config, log, sources, judge, jobs, judgements, now, mirror, sourceFails, down,
     pump: undefined as unknown as TrialPump,
     close: () => store.close(),
   };
@@ -113,11 +119,15 @@ function makeRig(options: Options = {}) {
   rig.pump = new TrialPump({
     config, store, jobs, grader, identity, judgements, teams: options.teams ?? (() => judge.teams),
     sessions: { list: async () => [], remove: async () => undefined } as never,
-    source: { mirrorPath: () => join(root, "mirror.git"), status: () => ({ mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: "head" }) as never },
+    source: { mirrorPath: () => join(root, "mirror.git"), status: () => ({ mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: mirror.head }) as never },
     hostLoad: { held: () => undefined }, halt: () => ({ check: () => ({ state: "clear" as const }) }),
     graderProbe: async () => ({ state: "ready", storage: true, version: 2, uid: 5002 }), inventory: options.inventory ?? (async () => []), now,
     prepareSource: async (_store, _taskId, ctx) => {
       sources.push({ jobId: ctx.jobId, projectId: ctx.projectId });
+      if (sourceFails.left > 0) {
+        sourceFails.left -= 1;
+        return { kind: "environment", cause: "eval-failed" };
+      }
       return (options.prepare ?? defaultPrepare)(rig as Rig, { trialId: ctx.trialId, root: ctx.root });
     },
   });
@@ -278,6 +288,7 @@ test("a judgement waits while a trial is live", async () => {
     for (let step = 0; step < 8; step++) await r.pump.step();
     assert.equal(r.judge.creates.filter(item => item.purpose === "duel").length, 0, "no judge run starts while the trial is live");
     assert.equal(rowsOf(r, id).length, 0, "no judgement row is opened either");
+    assert.equal(viewOf(r, id).waiting, "another-job", "the view names the live trial as the gate");
     // The trial's session exits and the job is cancelled, so no further trial is ready: the trial closes, and the judgement runs after it.
     const trialId = r.judge.creates.find(item => item.purpose === "replay")!.trialId;
     r.store.write(tx => { tx.run("UPDATE eval_jobs SET status = 'cancelled' WHERE kind = 'baseline'"); });
@@ -394,6 +405,101 @@ test("a calibration that ends under a live judgement voids that judgement", asyn
     assert.deepEqual(r.judge.ended.filter(item => item.id === duel.trialId), [{ id: duel.trialId, ending: "void-owner" }]);
     assert.deepEqual(r.log.slice(mark), ["stop", "clean", "scrub"], "the account is cleaned after the cancel");
     assert.equal(r.judge.states.has(duel.trialId), false, "the run is forgotten");
+  } finally {
+    r.close();
+  }
+});
+
+test("a source build that ends on an environment cause uses no attempt", async () => {
+  const r = makeRig({ mode: "prefer-a" });
+  try {
+    r.sourceFails.left = 3;
+    const id = calibrate(r);
+    await until(r, () => r.sourceFails.left === 0, { steps: 40 });
+    assert.equal(r.sources.length, 3, "three source builds failed");
+    assert.deepEqual(rowsOf(r, id), [], "no judgement row remains");
+    assert.equal(viewOf(r, id).status, "running");
+    assert.equal(viewOf(r, id).waiting, "eval-failed");
+    await until(r, () => finalCount(r, id) >= 1, { steps: 40 });
+    const first = rowsOf(r, id)[0]!;
+    assert.equal(first.attempt, 0, "the first attempt runs once the source works");
+    assert.equal(first.ending, "judged");
+  } finally {
+    r.close();
+  }
+});
+
+test("ten source failures in a row end the attempt, and the next attempt runs", async () => {
+  const r = makeRig({ mode: "prefer-a" });
+  try {
+    r.sourceFails.left = 10;
+    const id = calibrate(r);
+    await until(r, () => finalCount(r, id) >= 1, { steps: 120 });
+    assert.equal(r.sources.length, 10, "ten source builds failed");
+    const rows = rowsOf(r, id);
+    assert.deepEqual(rows.map(row => [row.attempt, row.ending]), [[0, "void-host"]], "the tenth failure ends attempt 0");
+    await until(r, () => finalCount(r, id) >= 2, { steps: 40 });
+    assert.deepEqual(rowsOf(r, id).map(row => [row.attempt, row.ending]), [[0, "void-host"], [1, "judged"]]);
+  } finally {
+    r.close();
+  }
+});
+
+test("incomplete eval settings end the attempt at once", async () => {
+  const r = makeRig({ mode: "prefer-a" });
+  try {
+    const id = calibrate(r);
+    (r.config.projects[0] as { team?: unknown }).team = {};
+    await until(r, () => finalCount(r, id) >= 1, { steps: 20 });
+    const first = rowsOf(r, id)[0]!;
+    assert.deepEqual([first.attempt, first.ending], [0, "void-host"], "the attempt is used, not released");
+    assert.equal(r.sources.length, 0, "no source was built");
+  } finally {
+    r.close();
+  }
+});
+
+test("an identity that is not ready for the judgement's project shows eval-identity", async () => {
+  const r = makeRig({ mode: "prefer-a" });
+  try {
+    r.down.probe = true;
+    const id = calibrate(r);
+    await r.pump.step();
+    assert.equal(viewOf(r, id).waiting, "eval-identity");
+    assert.deepEqual(rowsOf(r, id), []);
+  } finally {
+    r.close();
+  }
+});
+
+test("a start-up that cannot finish shows start-up", async () => {
+  const r = makeRig({ mode: "prefer-a" });
+  try {
+    r.down.stop = true;
+    const id = calibrate(r);
+    await r.pump.step();
+    assert.equal(viewOf(r, id).waiting, "start-up");
+    assert.deepEqual(rowsOf(r, id), []);
+  } finally {
+    r.close();
+  }
+});
+
+test("a project with no mirror head uses no attempt", async () => {
+  const r = makeRig({ mode: "prefer-a" });
+  try {
+    r.mirror.head = undefined;
+    const id = calibrate(r);
+    await until(r, () => false, { steps: 12 });
+    assert.deepEqual(rowsOf(r, id), [], "no judgement row remains");
+    assert.equal(viewOf(r, id).status, "running");
+    assert.equal(viewOf(r, id).waiting, "mirror");
+    assert.equal(r.sources.length, 0, "no source was built");
+    r.mirror.head = "head";
+    await until(r, () => finalCount(r, id) >= 1, { steps: 40 });
+    const first = rowsOf(r, id)[0]!;
+    assert.equal(first.attempt, 0);
+    assert.equal(first.ending, "judged");
   } finally {
     r.close();
   }

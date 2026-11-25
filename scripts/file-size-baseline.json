@@ -3,7 +3,7 @@
   "files": {
     "apps/web/src/main.tsx": 1178,
     "packages/host/src/client.ts": 1406,
-    "packages/host/src/evidence/permission-journal.ts": 1248,
+    "packages/host/src/evidence/permission-journal.ts": 1244,
     "packages/host/src/evidence/store.ts": 1084,
     "packages/host/src/goals.ts": 1061,
     "packages/host/src/manager.ts": 1244,

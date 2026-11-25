@@ -150,7 +150,7 @@ export type MiningStatus = { state: MiningState; visited: number | null; mined: 
 export type EvalJobReason = "owner" | "validation-stuck" | "configuration-changed" | "grader-processes-alive" | "limit-reached" | "done" | "expired"
   | "trial-voids" | "eval-processes-alive" | "identity-changed";
 export type EvalJobWait = "grader" | "window" | "host-load" | "halt" | "storage" | "bundle" | "mirror" | "another-job"
-  | "eval-identity" | "provider-limit" | "session-slots" | "daily-cap";
+  | "eval-identity" | "provider-limit" | "session-slots" | "daily-cap" | "grader-failed" | "eval-failed" | "bundle-missing";
 export type ValidateJobView = {
   jobId: string; projectId: string | null; kind: "validate"; status: RoutineStatus;
   reason: EvalJobReason | null; waiting: EvalJobWait | null;

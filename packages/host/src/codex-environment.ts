@@ -4,7 +4,6 @@ import { WebSocket } from "ws";
 import { NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 
 export interface CodexExecutor {
-  /** Each placement needs a fresh ID; Codex caches connections by this ID. */
   environmentId: string;
   url: string;
   token: string;
@@ -53,7 +52,6 @@ const sameSelection = (actual: CodexEnvironmentSelection[], executor: CodexExecu
   actual.length === 1 && actual[0].environmentId === executor.environmentId && actual[0].cwd === executor.cwd &&
   actual[0].runtimeWorkspaceRoots.length === executor.roots.length && executor.roots.every(root => actual[0].runtimeWorkspaceRoots.includes(root));
 
-/** Internal provider connection. UI input leases do not authorize its mutations. */
 export async function connectCodexEnvironments(options: {
   endpoint: string;
   token: string;
@@ -66,11 +64,13 @@ export async function connectCodexEnvironments(options: {
   });
   const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   const registered = new Map<string, CodexExecutor>();
+  const registering = new Map<string, Promise<void>>();
   const turns = new Map<string, { turnId?: string; revision: number }>();
   const selected = new Map<string, string>();
   const used = new Map<string, Set<string>>();
-  let nextId = 0, closed = false, closing = false, uncertain = false;
-  let sequence: Promise<unknown> = Promise.resolve();
+  const uncertainThreads = new Set<string>();
+  const threadQueues = new Map<string, Promise<unknown>>();
+  let nextId = 0, closed = false, closing = false;
 
   function observe(value: unknown) {
     const message = object(value), params = object(message?.params);
@@ -103,8 +103,6 @@ export async function connectCodexEnvironments(options: {
       if (binary) throw new Error("Expected provider JSON");
       const message = object(JSON.parse(data.toString()));
       if (!message) throw new Error("Invalid provider JSON");
-      // Lifecycle state comes from the persistent observer via observe().
-      // Copies on this request connection can arrive after newer observer events.
       if (message.method !== undefined || typeof message.id !== "number") return;
       const entry = pending.get(message.id);
       if (!entry) return;
@@ -125,10 +123,15 @@ export async function connectCodexEnvironments(options: {
     if (socket.bufferedAmount + Buffer.byteLength(text) > NATIVE_MAX_BUFFERED) { socket.terminate(); lost(); return; }
     socket.send(text, error => { if (error) { socket.terminate(); lost(); } });
   });
-  const serial = <T>(action: () => Promise<T>): Promise<T> => {
-    const result = sequence.then(action);
-    sequence = result.catch(() => {});
-    return result;
+  const serialThread = <T>(threadId: string, action: () => Promise<T>): Promise<T> => {
+    const previous = threadQueues.get(threadId) ?? Promise.resolve();
+    const next = previous.then(action, action);
+    const settled = next.catch(() => {});
+    threadQueues.set(threadId, settled);
+    void settled.finally(() => {
+      if (threadQueues.get(threadId) === settled) threadQueues.delete(threadId);
+    });
+    return next;
   };
   const close = () => { closing = true; socket.terminate(); lost(); };
 
@@ -144,15 +147,28 @@ export async function connectCodexEnvironments(options: {
     const existing = registered.get(validated.environmentId);
     if (existing && JSON.stringify(existing) !== JSON.stringify(validated))
       throw new CodexEnvironmentError("conflict", "An environment ID cannot be rebound; use a fresh placement ID");
-    if (!existing) {
-      // Reserve before sending: a lost acknowledgement cannot make this ID safe
-      // to reuse for a different connection or silently repeat registration.
-      registered.set(validated.environmentId, validated);
-      await call("environment/add", { environmentId: validated.environmentId, execServerUrl: validated.url,
-        authBearerToken: validated.token, connectTimeoutMs: 10000 });
+    const inflight = registering.get(validated.environmentId);
+    if (inflight) return inflight;
+    const needsAdd = !existing;
+    if (needsAdd) registered.set(validated.environmentId, validated);
+    const promise = (async () => {
+      if (needsAdd) {
+        await call("environment/add", {
+          environmentId: validated.environmentId,
+          execServerUrl: validated.url,
+          authBearerToken: validated.token,
+          connectTimeoutMs: 10000,
+        });
+      }
+      const info = object(await call("environment/info", { environmentId: validated.environmentId }));
+      if (nativePath(info?.cwd) !== validated.cwd) throw new CodexEnvironmentError("rejected", "The executor reported a different working directory");
+    })();
+    registering.set(validated.environmentId, promise);
+    try {
+      await promise;
+    } finally {
+      if (registering.get(validated.environmentId) === promise) registering.delete(validated.environmentId);
     }
-    const info = object(await call("environment/info", { environmentId: validated.environmentId }));
-    if (nativePath(info?.cwd) !== validated.cwd) throw new CodexEnvironmentError("rejected", "The executor reported a different working directory");
   }
 
   async function read(threadId: string) {
@@ -166,8 +182,6 @@ export async function connectCodexEnvironments(options: {
         throw new CodexEnvironmentError("rejected", "The provider returned an invalid environment selection");
       return { environmentId: entry.environmentId, cwd: nativePath(entry.cwd), runtimeWorkspaceRoots: entry.runtimeWorkspaceRoots.map(nativePath) };
     });
-    // The protocol's top-level thread.cwd is its historical launch directory.
-    // Loaded environment selections carry the current execution directories.
     return { threadId, environments };
   }
 
@@ -185,13 +199,12 @@ export async function connectCodexEnvironments(options: {
       supportsSelection = diagnostics?.executionEnvironmentUpdates === 1;
     } catch (error) {
       if (!(error instanceof CodexEnvironmentError) || error.code !== "rejected") throw error;
-      // Older providers still support first-turn laptop registration.
     }
   } catch (error) { close(); throw error; }
 
   return {
     supportsSelection,
-    register: (executor: CodexExecutor) => serial(() => register(executor)),
+    register,
     observe,
     current: (threadId: string) => {
       const state = turns.get(threadId);
@@ -199,15 +212,9 @@ export async function connectCodexEnvironments(options: {
     },
     read,
     close,
-    /**
-     * Caller holds dispatch/results and settles the old operation first. A live
-     * selection publishes only future captures. Its callback releases the known
-     * outcome; it must never replay an operation. This method does not fence tools.
-     * Future selection is verified in this provider process, not across restart.
-     */
-    select: (request: { threadId: string; turnId?: string; executor: CodexExecutor; releaseHeldOperation?: () => void | Promise<void> }): Promise<CodexSelectionReceipt> => serial(async () => {
+    select: (request: { threadId: string; turnId?: string; executor: CodexExecutor; releaseHeldOperation?: () => void | Promise<void> }): Promise<CodexSelectionReceipt> => serialThread(request.threadId, async () => {
       if (!supportsSelection) throw new CodexEnvironmentError("unsupported", "This provider does not support qualified execution selection; cloud handoff is unavailable");
-      if (uncertain) throw new CodexEnvironmentError("uncertain", "A previous selection is unresolved; keep execution held for reconciliation");
+      if (uncertainThreads.has(request.threadId)) throw new CodexEnvironmentError("uncertain", "A previous selection is unresolved; keep execution held for reconciliation");
       const { threadId, turnId } = request;
       const captured = turns.get(threadId);
       if (!captured || captured.turnId !== turnId || (turnId && !request.releaseHeldOperation))
@@ -223,9 +230,7 @@ export async function connectCodexEnvironments(options: {
         throw new CodexEnvironmentError("conflict", "Returning to an executor requires a fresh placement ID");
       const environments = [{ environmentId: executor.environmentId, cwd: executor.cwd, runtimeWorkspaceRoots: executor.roots }];
       checkTurn();
-      // Both API calls can mutate provider state. Any loss after this point keeps
-      // the held result unpublished, even if only one selection was accepted.
-      uncertain = true;
+      uncertainThreads.add(threadId);
       try {
         if (turnId) {
           const live = object(await call("turn/settings/update", { threadId, turnId, environments }));
@@ -240,7 +245,7 @@ export async function connectCodexEnvironments(options: {
         selected.set(threadId, executor.environmentId);
         const placements = used.get(threadId) ?? new Set<string>(); placements.add(executor.environmentId); used.set(threadId, placements);
         await request.releaseHeldOperation?.();
-        uncertain = false;
+        uncertainThreads.delete(threadId);
         return { threadId, ...(turnId ? { turnId } : {}), environmentId: executor.environmentId, live: turnId ? "published" : "idle", future: "verified" };
       } catch (error) {
         if (error instanceof CodexEnvironmentError && error.code === "uncertain") throw error;

@@ -205,26 +205,62 @@ async function attach(manager: Manager, sessionId: string) {
     process.stdin.pause();
     process.exit(0);
   };
-  let inputChain = Promise.resolve();
+  const MAX_INPUT_BYTES = 65536;
+  const queued: Buffer[] = [];
+  let queuedBytes = 0;
+  let draining = false;
+  let inputFailed = false;
+  const drain = async () => {
+    if (draining || inputFailed) return;
+    draining = true;
+    try {
+      while (queued.length > 0 && !inputFailed) {
+        const chunk = queued[0]!;
+        await workerCall(manager.config.runDir, sessionId, {
+          op: "raw",
+          text: chunk.toString("utf8"),
+          requestId: randomUUID(),
+        });
+        queued.shift();
+        queuedBytes -= chunk.length;
+      }
+    } catch {
+      inputFailed = true;
+      queued.length = 0;
+      queuedBytes = 0;
+      console.error(
+        "\r\nInput was not confirmed. Check the session before retrying.",
+      );
+    } finally {
+      draining = false;
+      if (queued.length > 0 && !inputFailed) void drain();
+    }
+  };
   process.stdin.setRawMode?.(true);
   process.stdin.setEncoding("utf8");
   process.stdin.resume();
   process.stdin.on("data", (data: string) => {
     if (data.includes("\x1d")) return cleanup();
-    inputChain = inputChain
-      .then(async () => {
-        for (let offset = 0; offset < data.length; offset += 8192)
-          await workerCall(manager.config.runDir, sessionId, {
-            op: "raw",
-            text: data.slice(offset, offset + 8192),
-            requestId: randomUUID(),
-          });
-      })
-      .catch(() =>
-        console.error(
-          "\r\nInput was not confirmed. Check the session before retrying.",
-        ),
+    if (inputFailed) return;
+    const pieces: Buffer[] = [];
+    let totalBytes = 0;
+    for (let offset = 0; offset < data.length; offset += 8192) {
+      const piece = Buffer.from(data.slice(offset, offset + 8192), "utf8");
+      pieces.push(piece);
+      totalBytes += piece.length;
+    }
+    if (queuedBytes + totalBytes > MAX_INPUT_BYTES) {
+      inputFailed = true;
+      queued.length = 0;
+      queuedBytes = 0;
+      console.error(
+        "\r\nInput buffer limit reached. Check the session before retrying.",
       );
+      return;
+    }
+    queued.push(...pieces);
+    queuedBytes += totalBytes;
+    void drain();
   });
   process.on("SIGTERM", cleanup);
 }
@@ -367,7 +403,6 @@ else if (command === "plan-fleet") {
       listener.listen(port, "127.0.0.1");
     });
     try {
-      // Bind the connector first so a conflict never starts host background services.
       if (mcpServer) await bind(mcpServer, config.mcp!.port);
       await bind(server, config.port);
     } catch (error) { await stop(); throw error; }
@@ -426,7 +461,6 @@ else if (command === "plan-fleet") {
         title: values.title?.trim() || `${provider} session`,
         ...(generatedTitle ? { generatedTitle: true as const } : {}),
         prompt: values.prompt ?? "",
-      // The local CLI runs with the host's own configuration and key: the owner started this session.
       }, "owner");
       console.log(`${session.id}  ${session.status}`);
     } else if (command === "attach") await attach(manager, positionals[1]);
@@ -477,18 +511,14 @@ else if (command === "plan-fleet") {
             console.log(
               "WARNING: ~/.claude/settings.json defines allowedHttpHookUrls; add http://127.0.0.1:*/hook/claude or Infinite's Claude hooks will not run.",
             );
-        } catch {
-          /* unreadable settings are the user's concern */
-        }
+        } catch {}
       }
       if (config.push?.enabled) {
         let mode = "missing";
         if (config.push.accessTokenFile) {
           try {
             mode = (statSync(config.push.accessTokenFile).mode & 0o777).toString(8);
-          } catch {
-            /* reported as missing */
-          }
+          } catch {}
         }
         console.log(
           `Push: enabled · ${config.push.detail} bodies · token file ${config.push.accessTokenFile ?? "none"} (mode ${mode})`,

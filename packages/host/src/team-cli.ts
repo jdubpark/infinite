@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
@@ -28,18 +28,23 @@ type Api = {
 type Options = Record<string, string | boolean>;
 const commandSchema = z.object({ command: z.string().min(1).max(4096).refine(value => !value.includes("\0")), args: z.array(z.string().max(4096).refine(value => !value.includes("\0"))).max(64).default([]) }).strict();
 const projectConfigSchema = z.object({ setup: commandSchema.optional(), checks: z.array(commandSchema).max(8), establishChecks: z.literal(true).optional() }).strict();
-/** The team keys that `repo init` sets itself. Every other key of the target's team block is carried over unchanged. */
 const REPO_INIT_TEAM_KEYS: ReadonlySet<string> = new Set(["setup", "checks", "establishChecks", "handoff", "delivery", "permissions"]);
-/** The settings of an enrolled project's team block that `repo init` does not own, as the host returned them. */
 export function carriedTeamSettings(team: unknown): Record<string, unknown> {
   if (typeof team !== "object" || team === null || Array.isArray(team)) return {};
   return Object.fromEntries(Object.entries(team).filter(([key]) => !REPO_INIT_TEAM_KEYS.has(key)));
 }
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 const projectIdPattern = /^[a-z0-9-]{1,80}$/;
+const directoryDefaultValueSchema = z.object({ teamId: z.uuid(), projectId: z.uuid().optional() }).strict();
+const directoryDefaultFileSchema = z.object({
+  version: z.literal(1),
+  directory: z.string(),
+  teamId: z.uuid(),
+  projectId: z.uuid().optional(),
+}).strict();
 const directoryDefaultsSchema = z.object({
   version: z.literal(1),
-  directories: z.record(z.string(), z.object({ teamId: z.uuid(), projectId: z.uuid().optional() }).strict()),
+  directories: z.record(z.string(), directoryDefaultValueSchema),
 }).strict();
 
 function privateJson(path: string, value: unknown) {
@@ -81,7 +86,7 @@ function inferGitHubRepository(root: string): string {
         const parts = url.pathname.split("/").filter(Boolean);
         if (parts.length === 2) ownerRepo = parts.join("/");
       }
-    } catch { /* The bounded error below avoids echoing remote URLs or credentials. */ }
+    } catch {}
   }
   if (ownerRepo?.endsWith(".git")) ownerRepo = ownerRepo.slice(0, -4);
   const parsed = githubRepositorySchema.safeParse(ownerRepo);
@@ -90,7 +95,7 @@ function inferGitHubRepository(root: string): string {
 }
 function inferBaseBranch(root: string): string {
   let ref: string | undefined;
-  try { ref = git(root, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]); } catch { /* Fall back only to a local main/master branch. */ }
+  try { ref = git(root, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]); } catch {}
   if (ref !== undefined) {
     const prefix = "refs/remotes/origin/";
     if (!ref.startsWith(prefix) || ref.length === prefix.length)
@@ -99,14 +104,12 @@ function inferBaseBranch(root: string): string {
     return gitBranchSchema.parse(branch);
   }
   let branch: string | undefined;
-  try { branch = git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]); } catch { /* Detached HEAD requires explicit configuration. */ }
+  try { branch = git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]); } catch {}
   if (branch === "main" || branch === "master") return branch;
   throw new Error("Could not infer the default branch from origin/HEAD or a local main/master branch; supply --base-branch BRANCH.");
 }
-/** `baseBranch` is an explicit `--base-branch`; without it the branch comes from `origin/HEAD` or a local main/master. */
 export function inferProjectSource(root: string, option: string | undefined, baseBranch?: string): ProjectSource {
   if (option === "laptop") return { mode: "laptop" };
-  // An explicit branch is validated before inference, so a bad value is an error rather than a silent fall back to laptop mode.
   const explicit = baseBranch === undefined ? undefined : gitBranchSchema.parse(baseBranch);
   const branch = () => explicit ?? inferBaseBranch(root);
   if (option === "github") return { mode: "github", repository: inferGitHubRepository(root), baseBranch: branch() };
@@ -122,7 +125,6 @@ export function requestedDelivery(root: string, options: Options, current: { rev
   const mode = options["--delivery"] === undefined ? undefined : String(options["--delivery"]);
   if (mode === undefined) {
     if (options["--merge-method"] !== undefined) throw new Error("--merge-method requires --delivery merge.");
-    // --base-branch also names the branch a GitHub-tracked source follows, so it needs no --delivery.
     if (options["--repository"] !== undefined) throw new Error("--repository requires --delivery merge or pr.");
     return current.revision > 0 ? current.team?.delivery : undefined;
   }
@@ -225,8 +227,6 @@ function gitRootOrNonGit(directory: string): { root: string } | { nonGit: true }
     if (root === realpathSync(homedir()) || root === dirname(root)) throw new Error("The home directory and filesystem root are not supported.");
     return { root };
   }
-  // Git can describe a broken or inaccessible repository as "not a git repository".
-  // A .git marker anywhere on the ancestor chain means the directory is not a plain folder.
   for (let current = directory; ; current = dirname(current)) {
     try {
       const marker = join(current, ".git");
@@ -241,37 +241,44 @@ function gitRootOrNonGit(directory: string): { root: string } | { nonGit: true }
   }
   return { nonGit: true };
 }
-function readDirectoryDefaults(path: string) {
+function invalidDefaultDirectory(directory: string) {
+  return !isAbsolute(directory) || resolve(directory) !== directory || directory === dirname(directory) || directory === realpathSync(homedir());
+}
+function directoryDefaultPath(path: string, directory: string) {
+  const hash = createHash("sha256").update(directory).digest("hex");
+  return join(`${path}.d`, `${hash}.json`);
+}
+function readDirectoryDefault(path: string, directory: string) {
+  if (invalidDefaultDirectory(directory)) return undefined;
+  const raw = readPrivateJson(directoryDefaultPath(path, directory), undefined);
+  if (raw === undefined) return undefined;
+  const parsed = directoryDefaultFileSchema.safeParse(raw);
+  if (!parsed.success || parsed.data.directory !== directory || invalidDefaultDirectory(parsed.data.directory))
+    throw new Error("Saved directory Linear defaults are invalid; preserve private team CLI state and inspect it before retrying.");
+  return { teamId: parsed.data.teamId, ...(parsed.data.projectId ? { projectId: parsed.data.projectId } : {}) };
+}
+function readLegacyDirectoryDefaults(path: string) {
   const raw = readPrivateJson(path, { version: 1, directories: {} });
   const parsed = directoryDefaultsSchema.safeParse(raw);
-  if (!parsed.success || Object.keys(parsed.data?.directories ?? {}).some(directory => !isAbsolute(directory) || resolve(directory) !== directory || directory === dirname(directory) || directory === realpathSync(homedir())))
+  if (!parsed.success || Object.keys(parsed.data?.directories ?? {}).some(invalidDefaultDirectory))
     throw new Error("Saved directory Linear defaults are invalid; preserve private team CLI state and inspect it before retrying.");
   return parsed.data;
 }
-async function saveDirectoryDefault(path: string, directory: string, value: { teamId: string; projectId?: string }) {
-  const lockPath = `${path}.lock`;
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  let locked = false;
-  for (let attempt = 0; attempt < 50; attempt++) {
-    try { mkdirSync(lockPath, { mode: 0o700 }); locked = true; break; }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      await delay(100);
-    }
-  }
-  if (!locked) throw new Error("Timed out waiting for directory Linear defaults to be updated. Retry after the other repo init finishes.");
-  try {
-    const current = readDirectoryDefaults(path);
-    current.directories[directory] = value;
-    privateJson(path, current);
-  } finally {
-    try { rmdirSync(lockPath); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  }
+function saveDirectoryDefault(path: string, directory: string, value: { teamId: string; projectId?: string }) {
+  if (invalidDefaultDirectory(directory))
+    throw new Error("Saved directory Linear defaults are invalid; preserve private team CLI state and inspect it before retrying.");
+  const validated = directoryDefaultValueSchema.parse(value);
+  privateJson(directoryDefaultPath(path, directory), {
+    version: 1,
+    directory,
+    teamId: validated.teamId,
+    ...(validated.projectId ? { projectId: validated.projectId } : {}),
+  });
 }
-function nearestDirectoryDefault(defaults: z.infer<typeof directoryDefaultsSchema>, directory: string) {
+function nearestDirectoryDefault(path: string, directory: string) {
+  const legacy = existsSync(path) ? readLegacyDirectoryDefaults(path) : undefined;
   for (let current = directory; ; current = dirname(current)) {
-    const value = defaults.directories[current];
+    const value = readDirectoryDefault(path, current) ?? legacy?.directories[current];
     if (value) return { ...value, origin: current };
     if (current === dirname(current)) break;
   }
@@ -409,7 +416,6 @@ async function askForBrief(api: Api, team: any, rows: BriefRow[], signal: AbortS
   const footer = card.pop() ?? "";
   show([...card, "", "Refreshing the Brief. This can take a few minutes.", "", footer].join("\n"));
   try {
-    // json() caps every call at 15 seconds. A repository brief can take longer, so this uses request().
     const response = await api.request(`/sessions/${chosen.sessionId}/summary?after=0`, undefined, AbortSignal.any([signal, AbortSignal.timeout(180000)]));
     const summary = await response.json() as TeamBriefStatus["summary"];
     const ready = Boolean(summary?.repository?.brief?.summary || summary?.text);
@@ -421,12 +427,10 @@ async function askForBrief(api: Api, team: any, rows: BriefRow[], signal: AbortS
   }
 }
 
-/** One line per entry head. Host text is cleaned before it reaches the terminal. */
 function entryLine(head: EntryHead) {
   const parts = [String(head.seq), head.kind, `${head.author}/${head.authority}`, ...(head.taskId ? [`task ${head.taskId}`] : []), head.summary];
   return parts.map(part => clean(part)).join("  ");
 }
-/** Indented JSON with C1 control characters escaped, so a host body cannot move the terminal. */
 function terminalJson(value: unknown) {
   return JSON.stringify(value, null, 2).replace(/[\u007f-\u009f\u2028\u2029]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
@@ -453,15 +457,10 @@ function receipt(path: string, key: string, body: unknown) {
   privateJson(path, records);
 }
 function shellQuote(value: string) { return `'${value.replace(/'/g, `'\\''`)}'`; }
-/**
- * The request ID to send. An earlier request with the same intent and an unconfirmed result is
- * resumed under its own ID, so the host applies it at most once; only a different explicit ID is refused.
- */
 function resumePendingIntent(path: string, prefix: string, endpoint: string, intent: (body: any) => boolean, requestId: string, explicit: boolean, rawArgs: string[]): string {
   const records = readPrivateJson(path, {}) as Record<string, any>;
   const prior = Object.entries(records).find(([key, value]) => key.startsWith(prefix) && value?.state === "pending" && value.endpoint === endpoint && intent(value.body));
   if (!prior || requestId === prior[1].requestId) return requestId;
-  // A later confirmed request to the same endpoint may have superseded it; then the owner decides.
   const superseded = Object.values(records).some(value => value?.state === "confirmed" && value.endpoint === endpoint && String(value.createdAt) > String(prior[1].createdAt));
   if (!explicit && !superseded) {
     process.stderr.write(`[Infinite] Resuming earlier request ${prior[1].requestId}; its result was not confirmed.\n`);
@@ -517,7 +516,6 @@ async function postMutation(api: Api, receiptPath: string, key: string, endpoint
   return result;
 }
 
-/** One line for what repo init left in the permission-delegation record. An older host sends nothing, and nothing is printed. */
 function onboardingPermissionLine(agent: unknown): string | undefined {
   const value = agent as { coverage?: unknown; workspaceId?: unknown; reason?: unknown } | undefined;
   switch (value?.coverage) {
@@ -534,7 +532,6 @@ function onboardingPermissionLine(agent: unknown): string | undefined {
 }
 
 const BATCH_TIMEOUT = 120000, CHUNK_TIMEOUT = 60000;
-/** A host without an endpoint answers its catch-all 404, which carries no code. */
 const olderHost = (error: unknown) => (error as { status?: unknown; code?: unknown })?.status === 404 && (error as { code?: unknown }).code === undefined;
 async function uploadCommit(api: Api, projectId: string, root: string, commit: string, tempStore: string, captured: (manifestId: string) => void) {
   const detail = await api.json<any>(`/projects/${projectId}`);
@@ -546,7 +543,7 @@ async function uploadCommit(api: Api, projectId: string, root: string, commit: s
     const env = isolatedGitEnv();
     execFileSync("git", ["clone", "--template=", "--no-local", "--no-hardlinks", "--no-checkout", root, source], { encoding: "utf8", timeout: 120000, stdio: ["ignore", "ignore", "pipe"], env });
     execFileSync("git", ["-c", "core.hooksPath=/dev/null", "-C", source, "checkout", "--detach", commit], { encoding: "utf8", timeout: 30000, stdio: ["ignore", "ignore", "pipe"], env });
-    try { execFileSync("git", ["-C", source, "remote", "remove", "origin"], { stdio: "ignore", timeout: 5000, env }); } catch { /* No remote is safe. */ }
+    try { execFileSync("git", ["-C", source, "remote", "remove", "origin"], { stdio: "ignore", timeout: 5000, env }); } catch {}
     const cwd = realpathSync(source);
     const manifest = await captureWorkspace({ roots: [cwd], cwd, storeDir: tempStore });
     captured(manifest.id);
@@ -628,8 +625,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const requestedDirectory = canonicalDirectory(positional[1] ?? process.cwd());
     const gitResult = gitRootOrNonGit(requestedDirectory);
     const defaultsPath = join(stateDir, "directory-defaults.json");
-    const directoryDefaults = readDirectoryDefaults(defaultsPath);
-    const inheritedDefault = nearestDirectoryDefault(directoryDefaults, requestedDirectory);
+    const inheritedDefault = nearestDirectoryDefault(defaultsPath, requestedDirectory);
     const explicitLinearTeam = options["--linear-team"] === undefined ? undefined : z.uuid().parse(String(options["--linear-team"]));
     const explicitLinearProject = options["--linear-project"] === undefined ? undefined : z.uuid().parse(String(options["--linear-project"]));
     if ("nonGit" in gitResult) {
@@ -641,7 +637,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
         throw new Error("This directory has no inherited Linear defaults. Set them once with --linear-team UUID and --linear-project UUID.");
       const teamId = explicitLinearTeam ?? inheritedDefault!.teamId;
       const projectId = explicitLinearProject ?? (inheritedDefault?.teamId === teamId ? inheritedDefault.projectId : undefined);
-      await saveDirectoryDefault(defaultsPath, requestedDirectory, { teamId, ...(projectId ? { projectId } : {}) });
+      saveDirectoryDefault(defaultsPath, requestedDirectory, { teamId, ...(projectId ? { projectId } : {}) });
       const inheritedUsed = (!explicitLinearTeam && !explicitLinearProject)
         || (!explicitLinearTeam && Boolean(explicitLinearProject) && inheritedDefault?.teamId === teamId)
         || (Boolean(explicitLinearTeam) && !explicitLinearProject && Boolean(inheritedDefault?.projectId) && inheritedDefault?.teamId === teamId && inheritedDefault.projectId === projectId);
@@ -731,7 +727,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       if (state && syncServiceRunning(state) && state.origin === config.origin && state.root === root)
         throw new Error("Continuous sync is active for this checkout. Stop it before one-time team source capture.");
     }
-    const rootDefault = nearestDirectoryDefault(directoryDefaults, root);
+    const rootDefault = nearestDirectoryDefault(defaultsPath, root);
     const targetLinear = target.linear?.teamId ? { teamId: target.linear.teamId, ...(target.linear.projectId ? { projectId: target.linear.projectId } : {}) } : undefined;
     let effectiveLinear = targetLinear;
     let linearDefaultsFrom: string | undefined;
@@ -751,14 +747,9 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const sendLinear = Boolean(linearTeam || linearProject || (!targetLinear && rootDefault));
     const sourceSupported = me.teams?.projectSource === 1;
     const enrolledSource: ProjectSource = sourceSupported ? projectSource : { mode: "laptop" };
-    // The saved routing is carried above; the given options merge over it, and an omitted routing passes through unchanged.
     const routing = routingChoice ? { ...(target.team?.routing ?? {}), ...routingChoice } : undefined;
-    // Only an explicit off records a permission-agent opt-out; the host cannot tell it from a repeat that keeps no policy.
     const permissionOptOut = permissionMode === "off" && me.permissions?.onboardingCoverage === 1;
     const body: Record<string, any> = { requestId, revision: target.revision, team: { ...carriedTeamSettings(target.team), ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}), ...(routing ? { routing } : {}) }, ...(sourceSupported ? { source: projectSource } : {}), ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}), ...(autonomy ? { autonomy } : {}), ...(permissionOptOut ? { permissionOptOut: true } : {}) };
-    // After a lost reply, inherited settings may already be the host's mapping.
-    // An omitted mapping preserves that value; compare that intent while replay
-    // still sends the original receipt body and request ID unchanged.
     const linearIntent = (request: Record<string, any>) => request.linear === undefined ? targetLinear ?? null : request.linear;
     const teamworkIntent = (request: Record<string, any>) => request.teamwork === undefined ? target.teamwork ?? null : request.teamwork;
     requestId = body.requestId = resumePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(prior.source) === JSON.stringify(body.source) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)) && JSON.stringify(teamworkIntent(prior)) === JSON.stringify(teamworkIntent(body)) && prior.autonomy === body.autonomy && prior.permissionOptOut === body.permissionOptOut, requestId, options["--request-id"] !== undefined, rawArgs);
@@ -801,7 +792,6 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const agentLine = onboardingPermissionLine(saved?.permissionAgent);
     if (agentLine) process.stderr.write(`[Infinite] ${agentLine}\n`);
     if (sourceSupported && projectSource.mode === "github") {
-      // A project that follows GitHub refuses laptop uploads, so a service still running for it would only report errors.
       const syncStateFile = join(dirname(configPath), "sync", `${selected}.json`);
       const syncState = readSyncState(syncStateFile);
       if (syncState && syncState.origin === config.origin && syncServiceRunning(syncState) && stopSyncService(syncStateFile))
@@ -817,7 +807,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const output = await api.json<any>(`/projects/${selected}/team`);
     mappings[key] = { projectId: selected, source: sourceKind }; privateJson(mappingsPath, mappings);
     if (output.linear?.teamId) {
-      await saveDirectoryDefault(defaultsPath, root, { teamId: z.uuid().parse(output.linear.teamId), ...(output.linear.projectId ? { projectId: z.uuid().parse(output.linear.projectId) } : {}) });
+      saveDirectoryDefault(defaultsPath, root, { teamId: z.uuid().parse(output.linear.teamId), ...(output.linear.projectId ? { projectId: z.uuid().parse(output.linear.projectId) } : {}) });
     }
     if (explicitProject || uploadSource) { config.projectId = selected; privateJson(configPath, config); }
     const sourceSnapshot = uploadSource && !head.commit ? "empty cloud baseline" : uploadSource ? `local commit ${head.commit}` : detail.sync?.appliedManifest ? "existing cloud checkout retained" : "configured project checkout";
@@ -936,7 +926,6 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     let previous: string | null = null;
     let pending: ReturnType<typeof teamWatchCommand> = null;
     let wake = new AbortController();
-    // A full-screen watch keeps the last card so scrolling and resizing repaint without a request.
     let card = "";
     let notice = "";
     let status = "";
@@ -973,7 +962,6 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
         if (frame) process.stdout.write(frame);
         previous = output;
       } else {
-        // Switching view or agent starts at the top; a refresh of the same view keeps the reader's place.
         const key = `${mode}/${mode === "logs" ? memberId : ""}`;
         if (key !== view) { view = key; offset = 0; }
         card = text;
@@ -1111,7 +1099,6 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       let heads = "";
       try { heads = execFileSync("git", ["-C", root, "bundle", "list-heads", bundlePath, ref], { encoding: "utf8", timeout: 30000, stdio: ["ignore", "pipe", "pipe"], env: isolatedGitEnv({ LC_ALL: "C" }) }); }
       catch { throw new Error("The team result changed while it was being prepared. Refresh team status and retry."); }
-      // Refuse a branch that moved after the host's preflight, before fetching it locally.
       if (heads.trim().split(/\r?\n/).length !== 1 || heads.trim() !== `${teamHead} ${ref}`)
         throw new Error("The team result changed while it was being prepared. Refresh team status and retry.");
       try {
@@ -1220,7 +1207,6 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       if (rest.length) throw new Error(`Usage: infinite team ${subcommand} ID`);
       body = { requestId, revision: current.revision };
     }
-    // These actions can repeat on purpose (pause, resume, pause), so an unconfirmed one is never resumed implicitly.
     resumePendingIntent(receiptsPath, `team-${subcommand}:`, endpoint, prior => subcommand === "steer" || subcommand === "answer" ? prior.text === body.text : true, requestId, true, rawArgs);
     const key = `team-${subcommand}:${requestId}`;
     try {

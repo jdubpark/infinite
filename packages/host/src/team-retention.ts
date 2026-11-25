@@ -65,6 +65,9 @@ function pathStrictlyInside(root: string, target: string) {
   return Boolean(rel) && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
+function stopUnconfirmed(stored: Stored) {
+  return Boolean(stored.pending?.witness) && stored.pending?.failure?.code === "command-stop-unconfirmed";
+}
 export class TeamRetention {
   readonly removingRuns = new Set<string>();
   readonly deletingRuns = new Set<string>();
@@ -324,6 +327,8 @@ export class TeamRetention {
       this.assertRunRetentionSafe(stored);
       if (!(["cancelled", "merged", "no-change"].includes(run.status) && await this.membersSettled(stored)))
         throw new TeamError(409, "team-active", "Only a settled cancelled, merged or no-change run can be removed.");
+      if (stopUnconfirmed(stored) && await this.host.refreshOperationCensus(stored, true) !== "ended")
+        throw new TeamError(409, "team-operation-running", "The host still sees, or cannot rule out, processes of this run's unfinished operation. Retry removal after they have exited.");
       if (this.needsMemberWorkSaved(stored)) {
         this.startMemberWorkSave(stored);
         throw new TeamError(409, "member-work-not-saved", "Unfinished member work is being saved to GitHub before this run's workspaces are removed. Retry removal shortly.");
@@ -408,7 +413,7 @@ export class TeamRetention {
     if (stored.run.replay) return;
     try {
       const { run } = stored, retention = this.host.retentionState(stored), policy = this.host.config.teams?.retention ?? DEFAULT_TEAM_RETENTION;
-      if (run.status === "blocked" || run.status === "paused") await this.host.refreshOperationCensus(stored);
+      if (run.status === "blocked" || run.status === "paused" || run.status === "cancelled" && stopUnconfirmed(stored)) await this.host.refreshOperationCensus(stored);
       if (this.removingRuns.has(run.id) || this.ownerPreventsRemoval(run) || this.hasPendingPreparationFrom(stored)) return;
       const statusAtStart = run.status;
       const runDirectory = teamRunDirectory(run.workspace);
@@ -503,14 +508,14 @@ export class TeamRetention {
       const retentionDue = retentionMs !== undefined && elapsed >= retentionMs;
       const retryDue = this.memberWorkRetryDue(stored, now);
       if (!retentionDue && !retryDue) return;
-      const witnessed = run.status === "blocked" && Boolean(stored.pending?.witness);
+      const witnessed = run.status === "blocked" && Boolean(stored.pending?.witness) || run.status === "cancelled" && stopUnconfirmed(stored);
       if (!(await this.membersSettled(stored, witnessed))) return;
       if (this.host.needsPublication(stored)) { this.host.startPublication(stored); return; }
       if (witnessed && stored.pending) {
         const last = stored.census?.pendingId === stored.pending.id ? stored.census : undefined;
         if (last && last.state !== "ended") return;
         if (await this.host.refreshOperationCensus(stored, true) !== "ended") return;
-        if (run.status !== "blocked" || this.host.commands.has(run.id) || this.removingRuns.has(run.id)) return;
+        if (run.status !== statusAtStart || this.host.commands.has(run.id) || this.removingRuns.has(run.id)) return;
       }
       if (this.needsMemberWorkSaved(stored)) { this.startMemberWorkSave(stored); return; }
       if (!retentionDue) return;

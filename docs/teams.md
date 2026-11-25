@@ -431,13 +431,14 @@ workspace removal completes, the host closes it as `cancelled` with the last
 blocker in its reason; it does not claim the work is complete. Its record then
 uses the normal `cancelledMinutes` retention. The outcome ledger keeps the run
 as blocked: the close writes no second settled event. A blocked run that
-still holds an unresolved operation keeps its workspaces unless the host looks
+still holds an unresolved operation, and a cancelled run whose operation could
+not confirm the stop of a command, keep their workspaces unless the host looks
 and finds no process of that operation. The host records each command an
 operation starts, as the leader of its own session and process group, and while
 the operation runs it samples the process table for descendants that moved to
 other sessions or groups. The saved intent says that this record may be
 incomplete from before a command starts until a save holds it. While such a run
-is blocked or paused with no command of its own running, the host looks at most
+is blocked, paused or cancelled with no command of its own running, the host looks at most
 every ten minutes for processes that match the record, and for any process of
 the host account or of the account that runs team commands that uses the run
 directory as a working directory, open file, or command-line argument. The
@@ -461,7 +462,10 @@ recorded as host events, and a failed removal is retried on later scheduler
 ticks. A blocked run whose workspace is being removed cannot resume, continue,
 or be steered. An owner can cancel a blocked run directly after its goal or
 mission is no longer active. `DELETE /api/teams/:id` and `infinite team delete ID` remove a settled
-cancelled, merged, or no-change run (clones and record) immediately. A live
+cancelled, merged, or no-change run (clones and record) immediately. A run
+whose operation could not confirm the stop of a command is removed only when a
+look taken at that moment finds no process of that operation; otherwise the
+request receives `team-operation-running`. A live
 goal, mission, or handoff that still uses the run as its source receives
 `team-retained`; `team-in-use` means another run has a pending preparation that
 clones from this workspace. Both removals can be retried once the reference
@@ -2890,13 +2894,15 @@ through a `teams.commandPrefix` such as `sudo` as another account, the host can
 signal only the prefix's own process: `sudo` passes the stop's SIGTERM on to the
 first process of the command, but not to the processes that process started,
 and the later SIGKILL ends only `sudo`. A setup or check command whose output is
-still open ten seconds after the stop ends unconfirmed, and the run blocks with
-"A configured team command did not close after the host tried to stop it." The
-host keeps that operation's record of processes, so it starts nothing more in
-the run's directories: the run cannot be resumed or steered, and retention
-keeps the directories until a process census finds none of those processes.
-Start a new team. The command's result is never used. Size the limit for the
-project's full check on the execution host.
+still open ten seconds after the stop ends unconfirmed. The run records "A
+configured team command did not close after the host tried to stop it." as its
+reason and is blocked, unless it was already paused or cancelled. The failed
+operation keeps its record of processes, so the host starts no further
+operation for the run: it cannot be resumed or steered. Neither retention nor
+the owner's removal removes the directories of a blocked or cancelled run until
+a process census finds none of those processes. Start a new team. The
+command's result is never used. Size the limit for the project's full check on
+the execution host.
 
 Setup and check commands run with a small fixed environment, not a login shell.
 Where the agent egress boundary is configured (see

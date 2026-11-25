@@ -93,13 +93,17 @@ async function stoppedCheckFencesTheWorkspace(prefixFor: (log: string, check: st
     assert.equal(resumed.body?.code, "team-reconciliation-required", JSON.stringify(resumed.body));
     const steered = await f.host.fetchApi(`/teams/${id}/steer`, "owner", { requestId: randomUUID(), revision: blocked.revision, text: "Try again." });
     assert.equal(steered.body?.code, "team-reconciliation-required", JSON.stringify(steered.body));
+    const cancelled = await f.host.fetchApi(`/teams/${id}/cancel`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.equal(cancelled.body?.status, "cancelled", JSON.stringify(cancelled.body));
+    const removed = await f.host.fetchApi(`/teams/${id}`, "owner", undefined, {}, "DELETE");
+    assert.equal(removed.body?.code, "team-operation-running", JSON.stringify(removed.body));
     await delay(STOP_GRACE_MS);
     writeFileSync(release, "done");
     await waitFor(async () => entries(checkLog).find(entry => entry.text.startsWith("end")), Boolean, 10_000);
     const ended = entries(checkLog).find(entry => entry.text.startsWith("end"))!;
     const overlapping = entries(commands).filter(entry => entry.at >= started.at && entry.at <= ended.at);
     assert.deepEqual(overlapping, [], "the host started no command while the check it gave up on still ran");
-    assert.equal((await f.get(id)).status, "blocked");
+    assert.equal((await f.get(id)).status, "cancelled");
   } finally {
     if (checkPid !== undefined && alive(checkPid)) endCheck(checkPid);
     await f.close();

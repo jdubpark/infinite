@@ -186,6 +186,28 @@ test("a blocked run keeps its workspace while the host sees a process of the int
   } finally { await close(f, teams); }
 });
 
+test("a cancelled run whose operation could not confirm its stop keeps its workspace and refuses removal while the census sees its processes", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  f.run.status = "cancelled"; f.run.updatedAt = at;
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  retention(f, { cancelledMinutes: 1 }); f.writeTeam();
+  let result: CensusResult = { ok: true, findings: [{ pid: 4242, reason: "recorded-session" }] };
+  let now = Date.parse(at) + 60_001;
+  const teams = openTeam(f, { now: () => now, processes: scriptedProcesses(() => result) });
+  try {
+    (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = { id: randomUUID(), kind: "check", revision: 1, witness: newWitness(),
+      failure: { code: "command-stop-unconfirmed", reason: "A configured team command did not close after the host tried to stop it.", at } };
+    teams.start(); await teams.idle();
+    await waitFor(() => teams.get(f.run.id).pendingOperation?.processes === "running", "the host should look for the operation's processes");
+    await assert.rejects(teams.removeRun(f.run.id), (error: unknown) => error instanceof TeamError && error.code === "team-operation-running");
+    await new Promise(resolve => setTimeout(resolve, 1200)); await teams.idle();
+    assert.equal(existsSync(runDirectory(f.run)), true);
+    result = { ok: true, findings: [] }; now += 10 * 60_000;
+    await waitFor(() => !existsSync(runDirectory(f.run)), "the workspace should be removed once the census sees none of the operation's processes");
+  } finally { await close(f, teams); }
+});
+
 test("a blocked run whose census cannot finish keeps its workspace and says the host cannot tell", async () => {
   const f = schedulerFixture();
   const at = new Date().toISOString();

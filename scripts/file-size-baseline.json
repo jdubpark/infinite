@@ -12,7 +12,7 @@
     "packages/host/src/outcome-store.ts": 1382,
     "packages/host/src/server.ts": 2296,
     "packages/host/src/team-cli.ts": 1242,
-    "packages/host/src/teams.ts": 3607,
+    "packages/host/src/teams.ts": 3610,
     "packages/host/src/understanding-work.ts": 1021,
     "packages/host/src/worker.ts": 1904,
     "scripts/egress-proxy.mjs": 1359,

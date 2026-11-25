@@ -75,6 +75,7 @@ import { GoalService } from "./goals.js";
 import { RoutineService } from "./routines.js";
 import { createRoutineSchema, routineActionSchema } from "./routine-types.js";
 import { MissionService, missionBoard } from "./missions.js";
+import { registerMissionReadRoutes } from "./mission-read-routes.js";
 import { IntakeStore } from "./intake-store.js";
 import { IntakeLinear } from "./intake-linear.js";
 import { IntakeService } from "./intake.js";
@@ -1295,8 +1296,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/goals/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await goals[action](id.parse(req.params.id), goalActionSchema.parse(req.body))));
   app.post("/api/goals/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await goals.extend(id.parse(req.params.id), goalExtendSchema.parse(req.body))));
-  app.get("/api/missions", (_req, res) => res.json({ missions: missions.list() }));
-  app.get("/api/missions/:id", (req, res) => res.json(missions.get(id.parse(req.params.id))));
+  registerMissionReadRoutes(app, { missions, teams, manager });
   app.get("/api/intake", (_req, res) => res.json({ records: intake?.list() ?? [], ...intake?.status(), ...(intakeSlack ? { slack: intakeSlack.status() } : {}) }));
   app.post("/api/missions", requireRole(["owner"]), async (req, res) => res.json(await createMission(createMissionSchema.parse(req.body))));
   // Mission controls and answers are owner-only, so every recorded mission answer is the owner's.

@@ -109,6 +109,25 @@ const quietly = async <T>(run: () => Promise<T>): Promise<T> => {
 const config = { origin: "https://host.example.test", token: "test-token" };
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+test("mission progress resumes at the supplied cursor and prints the next cursor for automation", async () => {
+  const paths: string[] = [];
+  const lines: string[] = [];
+  const page = { cursor: "next-cursor", observations: [], resync: { required: true, reason: "host-restarted" }, snapshot: {
+    mission: { id: "m1", title: "Repair", revision: 2, status: "running" }, subtasks: [],
+  } };
+  const api = { json: async (path: string, body?: unknown) => { assert.equal(body, undefined); paths.push(path); return page; } };
+  const log = console.log;
+  console.log = (value: string) => { lines.push(value); };
+  try {
+    await handleBoardClientCommand("mission", ["progress", "m1"], { "--after": "old/cursor", "--json": true }, config, api as never, "/unused");
+    assert.deepEqual(JSON.parse(lines[0]!), page);
+    await handleBoardClientCommand("mission", ["progress", "m1"], {}, config, api as never, "/unused");
+  } finally { console.log = log; }
+  assert.deepEqual(paths, ["/missions/m1/progress?cursor=old%2Fcursor", "/missions/m1/progress"]);
+  assert.match(lines[1]!, /host-restarted/);
+  assert.match(lines[1]!, /next-cursor/);
+});
+
 test("start posts the group alone for a group id and the checkout for a checkout id", async () => {
   for (const [flag, expected] of [
     ["product", { groupId: "product", objective: "ship it" }],

@@ -4,6 +4,8 @@ import type { TeamRun } from "../packages/host/src/team-types.js";
 import type { TeamService } from "../packages/host/src/teams.js";
 import type { Counts } from "./outcome-sim-script.js";
 import { simulate, type Variant, Violation } from "./fixtures/team-run-sim.js";
+import { registerGoalPlanSimulator } from "./fixtures/goal-plan-sim.js";
+import "./fixtures/delivery-review-sim.js";
 
 /*
  * Runs the team run crash simulator (tests/fixtures/team-run-sim.ts, which states the invariants I1-I7) over the
@@ -201,3 +203,5 @@ for (const [seed, kind] of [[5, "pause"], [29, "cancel"]] as const) {
     assert.equal(violation, undefined, violation?.message);
   });
 }
+
+registerGoalPlanSimulator(test);

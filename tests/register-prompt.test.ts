@@ -42,6 +42,8 @@ const sha256 = (value: unknown) => createHash("sha256").update(JSON.stringify(va
 const placeholdered = (text: string) => text.split(reportCommand()).join("<report-command>").split(entryCommand()).join("<entry-command>");
 const promptOf = (run: TeamRun, role: TeamMember["role"]) =>
   teamPrompt(run, role, undefined, undefined, "claude", PROFILE, { checks: CHECKS }, [], true);
+const goalPlanInstruction = "Task criterion references for this goal plan:";
+const withoutGoalPlanInstruction = (text: string) => text.split("\n\n").filter(paragraph => !paragraph.startsWith(goalPlanInstruction)).join("\n\n");
 
 // Byte pin: a goal run without a register keeps every prompt byte. The value is this tree's output before Task 12,
 // moved from 96ea12db when INF-323 added the recommendation to the question format line, the only change, and from
@@ -59,7 +61,11 @@ test("without the register the goal section is byte for byte", () => {
       for (const entry of [false, true]) {
         for (const role of ROLES) {
           for (const provider of PROVIDERS) {
-            prompts.push(placeholdered(teamPrompt(runFor({ autonomy, entry, record }), role, undefined, undefined, provider, PROFILE, { checks: CHECKS }, [], true)));
+            const prompt = teamPrompt(runFor({ autonomy, entry, record }), role, undefined, undefined, provider, PROFILE, { checks: CHECKS }, [], true);
+            const hasGoalRecord = record !== undefined;
+            const shouldMapCriteria = hasGoalRecord && role === "project-manager";
+            assert.equal(prompt.includes(goalPlanInstruction), shouldMapCriteria, `${role}, record=${hasGoalRecord}, ${autonomy}, entry=${entry}, ${provider}`);
+            prompts.push(placeholdered(shouldMapCriteria ? withoutGoalPlanInstruction(prompt) : prompt));
           }
         }
       }

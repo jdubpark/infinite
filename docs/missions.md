@@ -118,6 +118,20 @@ project.
 
 ## Missions
 
+`infinite mission progress ID` reads one mission, its coordinator, and the
+subteams bound to its assignments. Each subteam lists current assignments and
+check receipts. A recorded assignment and a sampled worker status have separate
+fields. An unavailable worker keeps its assignment until the host can establish
+what happened.
+
+`infinite mission progress ID --after CURSOR --json` reads
+`GET /api/missions/:id/progress?cursor=CURSOR`. Save the returned `cursor`
+after processing the page. On reconnect, consume the retained observations in
+order. When `resync.required` is true, replace the local view with the returned
+`snapshot`. A host restart or an expired cursor can require a new snapshot.
+Observations are sampled on reads. A transition between reads may appear only
+in the underlying team record.
+
 `POST /api/missions` (owner) creates a mission for a group. A retry with the
 same `requestId` returns the recorded mission before any admission check, so it
 succeeds even after the group was edited or deleted or a handoff started. The host launches

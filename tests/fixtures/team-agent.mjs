@@ -262,6 +262,24 @@ async function waitForPeer() {
   throw new Error("Independent implementers did not overlap");
 }
 
+// Goal plans use only the active record supplied in this member's host-written context. Path checks map to the task
+// that owns that path; tasks without a narrower artifact target advance c0, the owner's success criterion.
+function withGoalCriterionRefs(tasks) {
+  if (!(receipt.prompt ?? process.argv.at(-1) ?? "").includes("Task criterion references for this goal plan:")) return tasks;
+  const context = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8"));
+  const record = context.authority?.goal?.record;
+  if (!record || !Number.isInteger(record.version) || !Array.isArray(record.criteria) || record.criteria.length === 0) return tasks;
+  const fallback = record.criteria.find(criterion => criterion.id === "c0") ?? record.criteria[0];
+  return tasks.map(task => {
+    const matching = record.criteria.filter(criterion => {
+      const check = /^(?:artifact|citation-form):(.+)$/.exec(criterion.check);
+      return check && (task.paths ?? []).some(owned => check[1] === owned || check[1].startsWith(`${owned}/`));
+    });
+    const criteria = matching.length ? matching : [fallback];
+    return { ...task, criterionRefs: { objectiveVersion: record.version, criteria: criteria.map(criterion => criterion.id) } };
+  });
+}
+
 async function main() {
   process.stdin.resume();
   if (scenario === "mcp" || scenario === "stall-slow-stop") {
@@ -307,10 +325,11 @@ async function main() {
       return;
     }
     if (scenario.startsWith("agent-blocked-") && assignment.revision > 1) {
-      await report({ kind: "plan", summary: "Replan the blocked assignment while retaining the independent report as evidence", tasks: [
+      const tasks = [
         { id: "a", title: "Build the first file", instructions: "Write a.txt with the current revision", paths: ["a.txt"], dependsOn: [] },
         { id: "b", title: "Build the second file", instructions: "Write b.txt with the current revision", paths: ["b.txt"], dependsOn: [] },
-      ] });
+      ];
+      await report({ kind: "plan", summary: "Replan the blocked assignment while retaining the independent report as evidence", tasks: withGoalCriterionRefs(tasks) });
       return;
     }
     if ((scenario === "bootstrap-replan" || scenario === "bootstrap-change") && assignment.revision === 2) {
@@ -381,7 +400,7 @@ async function main() {
       checks: [{ command: process.execPath, args: ["check.mjs"] }] };
     if (scenario === "bootstrap-change" && assignment.revision > 2)
       verification.checks[0].args.push("--different");
-    const plan = { kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks,
+    const plan = { kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks: withGoalCriterionRefs(tasks),
       // A test that starts a goal run writes plan-brief, because a goal plan must carry a brief.
       ...(scenario === "permissions-routine" || existsSync(join(receiptDir, "plan-brief")) ? { brief: {
         title: "Add matching output files", problem: "The project has no matching output files.",

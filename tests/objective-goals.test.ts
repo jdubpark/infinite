@@ -782,7 +782,8 @@ function activeSessions(f: ReturnType<typeof fixture>) {
 const BRIEF = { title: "Rank sources", problem: "Find ranked sources", evidence: [{ source: "notes.md", observation: "The notes name the sources." }],
   dataShape: "A ranked list of sources", acceptance: ["A ranked shortlist with reasons and sources"], expectedOutcome: "A ranked shortlist", uiChanges: false };
 const PLAN = { kind: "plan", summary: "Rank the sources", brief: BRIEF,
-  tasks: [{ id: "a", title: "Write the shortlist", instructions: "Write research/shortlist.md", paths: ["research/shortlist.md"], dependsOn: [], agentProfileId: "light" }] };
+  tasks: [{ id: "a", title: "Write the shortlist", instructions: "Write research/shortlist.md", paths: ["research/shortlist.md"], dependsOn: [], agentProfileId: "light",
+    criterionRefs: { objectiveVersion: 1, criteria: ["c0"] } }] };
 /** One assumption, and one derived criterion that quotes the objective (the quote rule reads the objective and the directions). */
 const ASSUME_AND_CRITERION = { kind: "intent-check", summary: "One assumption and one criterion.", items: [{ dimension: "sources", why: "The sources are not named.", criticality: "detail", disposition: "assume",
   assumption: { statement: "The sources are the notes' sources.", refutedBy: "The notes name other sources.", test: { kind: "owner" } } }],

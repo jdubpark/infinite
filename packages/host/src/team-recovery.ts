@@ -1,5 +1,6 @@
 import type { ConnectorSource } from "./mcp-types.js";
 import { inputSourceLabel, type TeamContinuation, type TeamContinue, teamContinueSchema, type TeamDeliveryReconcile, teamDeliveryReconcileSchema, type TeamMember, type TeamReport, type TeamRun, type TeamScout, type TeamTask, teamVerificationReconcileSchema, type TeamView } from "./team-types.js";
+import { includeDeliveryReviewContributors, potentialRecoveryContributorFamilies } from "./delivery-review.js";
 import { randomUUID } from "node:crypto";
 import { dirname, relative } from "node:path";
 import { pullRequestBranch, teamDeliveryBranch, UNREPORTED_ROLES } from "./team-prompts.js";
@@ -529,6 +530,8 @@ export class TeamRecovery {
         ? `Retained member workspaces for affected revision ${source.revision} are listed below. Inspect them read-only at their recorded base commits; preserve the original copies and use a new assignment to carry only approved work forward.\n${retainedMemberWorkspaces.join("\n")}`
         : "No non-permission member workspace was recorded for the affected revision.";
       const feedback = `Automatic PM recovery ${recovery.attempts} of ${automaticRecoveryLimit}. Diagnose and resolve the reported ${source.code} from member ${source.memberId} at revision ${source.revision}. The original report and every sibling report remain in team history. ${preservedCopy} ${memberCopies} Replan only within the existing objective, pinned verification, permissions, and parent scope. Do not bypass a provider denial or infer owner approval; ask the owner if a material decision is needed. Source evidence: ${source.reason}`;
+      stored.deliveryReviewLineage = includeDeliveryReviewContributors(stored.deliveryReviewLineage, head,
+        potentialRecoveryContributorFamilies(run, source.revision));
       const nextRevision = run.revision + 1;
       run.continuations = [...(run.continuations ?? []), {
         revision: run.revision, requestId: randomUUID(), at: timestamp(), reason: `Automatic PM recovery after ${source.code}: ${source.reason}`,

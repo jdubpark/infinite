@@ -11,6 +11,7 @@ const TEAM_ONE = "11111111-1111-4111-8111-111111111111";
 const TEAM_TWO = "22222222-2222-4222-8222-222222222222";
 const VERDICT_ONE = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const VERDICT_TWO = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const VERDICT_OLD = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const HEAD = "a".repeat(40);
 const AT = "2026-11-20T00:00:00.000Z";
 const LABEL = "Agent assessment, provisional";
@@ -23,8 +24,8 @@ function assessment(verdictId: string, result: "met" | "not-met", progress: numb
   };
 }
 
-function cycle(teamId: string, number: number, value: ReturnType<typeof assessment>) {
-  return { teamId, cycle: number, assessment: value };
+function cycle(teamId: string, number: number, value: ReturnType<typeof assessment>, supersededVerdictIds?: string[]) {
+  return { teamId, cycle: number, assessment: value, ...(supersededVerdictIds === undefined ? {} : { supersededVerdictIds }) };
 }
 
 function detail(): VerdictDetail {
@@ -43,8 +44,8 @@ function detail(): VerdictDetail {
 function goal() {
   return {
     id: GOAL,
-    cycles: [cycle(TEAM_ONE, 1, assessment(VERDICT_ONE, "not-met", 1)), cycle(TEAM_TWO, 2, assessment(VERDICT_TWO, "met", 0))],
-    outcomes: [{ result: "not-achieved" as const, verdictId: VERDICT_ONE, at: AT }],
+    cycles: [cycle(TEAM_ONE, 1, assessment(VERDICT_ONE, "not-met", 1)), cycle(TEAM_TWO, 2, assessment(VERDICT_TWO, "met", 0), [VERDICT_OLD])],
+    outcomes: [{ result: "not-achieved" as const, verdictId: VERDICT_ONE, at: AT }, { result: "achieved" as const, verdictId: VERDICT_OLD, at: AT }],
   };
 }
 
@@ -124,7 +125,7 @@ test("the verdicts read joins cycles, details, and owner answers", async () => {
     assert.equal(second.counts.met, 1);
     assert.equal(second.criteria.length, 0);
     assert.equal(second.differs, false);
-    assert.equal(second.owner, undefined);
+    assert.deepEqual(second.owner, { result: "achieved" });
     assert.deepEqual(server.calls, [TEAM_ONE, TEAM_TWO]);
   } finally { await server.close(); }
 });

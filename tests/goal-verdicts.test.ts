@@ -4,6 +4,9 @@ import { randomUUID } from "node:crypto";
 import { goalOutcomeSchema, type GoalCycle, type GoalAssessment, type ProductGoal } from "../packages/host/src/goal-types.js";
 import {
   CONTINUE_EVENT,
+  DELIVERY_HOLD_MS,
+  DELIVERY_HOLD_REASON,
+  LATE_RECEIPT_EVENT,
   PROVISIONAL_EVENT,
   PROVISIONAL_REASON,
   assertVerdictAnswer,
@@ -11,11 +14,16 @@ import {
   answerProvisional,
   criteriaRowsFor,
   cycleVerdict,
+  deliveryHold,
+  lateStop,
+  lateVerdict,
   provisionalStop,
   verdictFailed,
+  verdictIdsOf,
 } from "../packages/host/src/goal-verdicts.js";
 import { createGoalObjective, correctGoalObjective, goalObjectiveView, type GoalHolder } from "../packages/host/src/objective-goals.js";
 import { recordDigest, type ObjectiveRecord } from "../packages/host/src/objective-types.js";
+import type { VerdictDetail } from "../packages/host/src/team-verdicts.js";
 import type { RunAssessment } from "../packages/host/src/verdict-types.js";
 import type { Project } from "../packages/host/src/types.js";
 import { TeamError } from "../packages/host/src/team-workspace.js";
@@ -67,6 +75,37 @@ test("cycle verdicts copy the current revision and compute progress", () => {
   const plain = cycle(1);
   assert.equal(Object.keys(cycleVerdict(goal({ cycles: [plain] }), plain, team({ revision: 2, assessment: stale }))).length, 0);
   assert.equal(Object.keys(cycleVerdict(goal({ cycles: [plain] }), plain, team({ revision: 2 }))).length, 0);
+  assert.equal(Object.hasOwn(dropped, "supersededVerdictIds"), true);
+  assert.equal(dropped.supersededVerdictIds, undefined);
+  assert.equal(Object.hasOwn(gone, "supersededVerdictIds"), true);
+  const fresh = cycleVerdict(goal({ cycles: [plain] }), plain, team({ assessment: current }));
+  assert.deepEqual(Object.keys(fresh), ["assessment"]);
+  const same = cycle(1, { assessment: { ...current, progress: 1 }, supersededVerdictIds: ["old"] });
+  const again = cycleVerdict(goal({ cycles: [same] }), same, team({ revision: 2, assessment: current }));
+  assert.deepEqual(Object.keys(again), ["assessment"]);
+  const first = assessment({ revision: 1 });
+  const base = cycle(1, { assessment: { ...first, progress: 1 }, supersededVerdictIds: ["a", "b"] });
+  const later = assessment({ revision: 1 });
+  const replaced = cycleVerdict(goal({ cycles: [base] }), base, team({ assessment: later }));
+  assert.equal(replaced.assessment?.verdictId, later.verdictId);
+  assert.deepEqual(replaced.supersededVerdictIds, ["a", "b", first.verdictId]);
+  const full = cycle(1, { assessment: { ...first, progress: 1 }, supersededVerdictIds: ["a", "b", "c", "d"] });
+  assert.deepEqual(cycleVerdict(goal({ cycles: [full] }), full, team({ assessment: later })).supersededVerdictIds, ["b", "c", "d", first.verdictId]);
+  const moved = cycleVerdict(goal({ cycles: [base] }), base, team({ assessment: assessment({ head: "b".repeat(40) }) }));
+  assert.equal(Object.hasOwn(moved, "supersededVerdictIds"), true);
+  assert.equal(moved.supersededVerdictIds, undefined);
+  assert.equal(moved.assessment?.head, "b".repeat(40));
+  assert.deepEqual(verdictIdsOf(cycle(1)), []);
+  assert.deepEqual(verdictIdsOf(base), [first.verdictId, "b", "a"]);
+  const late = (held: GoalCycle, assessed: RunAssessment | undefined, revision = 1) => lateVerdict(goal({ cycles: [held] }), held, team({ revision, assessment: assessed }));
+  assert.equal(late(base, later)?.assessment.verdictId, later.verdictId);
+  assert.deepEqual(late(base, later)?.supersededVerdictIds, ["a", "b", first.verdictId]);
+  assert.equal(late(base, undefined), undefined);
+  assert.equal(late(base, later, 2), undefined);
+  assert.equal(late(plain, later), undefined);
+  assert.equal(late(base, first), undefined);
+  assert.equal(late(base, assessment({ head: "b".repeat(40) })), undefined);
+  assert.equal(late(cycle(1, { assessment: { ...first, progress: 1 } }), assessment({ revision: 2 }), 2), undefined);
   const progress: number[] = [];
   const cycles: GoalCycle[] = [];
   for (const [index, met] of [1, 3, 3].entries()) {
@@ -94,6 +133,63 @@ test("a provisional stop needs an autonomous finite goal and a met reviewed verd
   assert.equal(stop({}, good, 2), false);
   assert.equal(stop({}, null), false);
   assert.equal(provisionalStop(goal({ cycles: [] }), team({ assessment: good })), false);
+  const stopOf = (overrides: Record<string, unknown> = {}, held: RunAssessment | null = good, busy = false, newest = true) => {
+    const target = cycle(1, held === null ? {} : { assessment: { ...held, progress: 1 } });
+    const subject = goal({ cycles: newest ? [target] : [target, cycle(2)], ...overrides });
+    return lateStop(subject, target, busy);
+  };
+  assert.equal(stopOf(), true);
+  assert.equal(stopOf({ status: "paused" }), false);
+  assert.equal(stopOf({ activeTeamId: "team-1" }), false);
+  assert.equal(stopOf({}, good, true), false);
+  assert.equal(stopOf({}, good, false, false), false);
+  assert.equal(stopOf({ autonomy: "supervised" }), false);
+  assert.equal(stopOf({ standing: { shape: "objective", cadenceMinutes: 60 } }), false);
+  assert.equal(stopOf({}, assessment({ kind: "no-change" })), false);
+  assert.equal(stopOf({}, assessment({ result: "not-met" })), false);
+  assert.equal(stopOf({}, null), false);
+});
+
+const FINISHED = Date.parse("2026-01-01T00:00:00.000Z");
+const inconclusive = assessment({ result: "inconclusive", counts: { met: 0, notMet: 0, inconclusive: 1, pendingOwner: 0 } });
+const detailOf = (reasons: (string | undefined)[], overrides: Record<string, unknown> = {}) => ({
+  verdictId: inconclusive.verdictId, revision: 1, head: HEAD,
+  criteria: reasons.map((reason, index) => ({ id: `c${index}`, state: "inconclusive", ...(reason === undefined ? {} : { reason }) })),
+  ...overrides,
+}) as unknown as Pick<VerdictDetail, "verdictId" | "revision" | "head" | "criteria">;
+
+test("a delivery hold waits at most ten minutes for a receipt a goal can still get", () => {
+  assert.equal(DELIVERY_HOLD_MS, 600_000);
+  assert.match(DELIVERY_HOLD_REASON, /10 minutes/);
+  assert.match(LATE_RECEIPT_EVENT, /delivery receipt/);
+  type Hold = { goal?: Record<string, unknown>; cycle?: Partial<GoalCycle>; held?: RunAssessment | null; nowMs?: number; scanned?: boolean; detail?: ReturnType<typeof detailOf> | null };
+  const hold = (input: Hold = {}) => {
+    const held = input.held === undefined ? inconclusive : input.held;
+    const target = cycle(1, { status: "merged", finishedAt: AT, ...(held === null ? {} : { assessment: { ...held, progress: 0 } }), ...input.cycle });
+    const detail = input.detail === undefined ? detailOf(["before-delivery"]) : input.detail ?? undefined;
+    return deliveryHold(goal({ cycles: [target], ...input.goal }), { nowMs: input.nowMs ?? FINISHED + 1000, scanned: input.scanned ?? true, ...(detail === undefined ? {} : { detail }) });
+  };
+  assert.equal(hold(), true);
+  assert.equal(hold({ nowMs: FINISHED }), true);
+  assert.equal(hold({ nowMs: FINISHED + 599_999 }), true);
+  assert.equal(hold({ nowMs: FINISHED + 600_000 }), false);
+  assert.equal(hold({ nowMs: FINISHED - 1 }), false);
+  assert.equal(hold({ goal: { autonomy: "supervised" } }), false);
+  assert.equal(hold({ goal: { standing: { shape: "objective", cadenceMinutes: 60 } } }), false);
+  assert.equal(hold({ scanned: false }), false);
+  assert.equal(hold({ cycle: { status: "ready-for-review" } }), false);
+  assert.equal(hold({ cycle: { finishedAt: undefined } }), false);
+  assert.equal(hold({ held: null }), false);
+  assert.equal(hold({ held: assessment({ kind: "no-change", result: "inconclusive" }) }), false);
+  assert.equal(hold({ held: assessment({ result: "not-met" }) }), false);
+  assert.equal(hold({ held: assessment({ result: "inconclusive", counts: { met: 0, notMet: 1, inconclusive: 1, pendingOwner: 0 } }) }), false);
+  assert.equal(hold({ detail: null }), false);
+  assert.equal(hold({ detail: detailOf(["before-delivery"], { revision: 2 }) }), false);
+  assert.equal(hold({ detail: detailOf(["before-delivery"], { head: "b".repeat(40) }) }), false);
+  assert.equal(hold({ detail: detailOf(["before-delivery", "no-receipt"]) }), false);
+  assert.equal(hold({ detail: detailOf([undefined]) }), false);
+  assert.equal(hold({ detail: detailOf(["no-receipt"], { verdictId: randomUUID() }) }), true, "the team is finishing a late verdict");
+  assert.equal(hold({ detail: detailOf(["no-receipt"], { verdictId: randomUUID(), head: "b".repeat(40) }) }), false);
 });
 
 test("verdict failures follow the result and the progress", () => {
@@ -148,6 +244,12 @@ test("the outcome rules refuse a wrong verdict answer", () => {
   assert.equal(limited({ maxRuns: 2 }), "none", "One run below the limit still continues");
   assert.equal(limited({ steering: Array.from({ length: 20 }, () => ({ text: "d", revision: 1, at: AT })) }), "goal-steering-limit");
   assert.equal(limited({ objective: "x".repeat(24_001) }), "goal-steering-limit");
+  const earlier = randomUUID();
+  const replaced = stopped({}).goal;
+  replaced.cycles[0]!.supersededVerdictIds = [earlier];
+  assert.equal(refusal(replaced, outcome({ verdictId: earlier })), "none");
+  assert.equal(refusal(replaced, outcome({ verdictId: earlier, continue: true })), "goal-not-provisional");
+  assert.equal(refusal(replaced, outcome({ verdictId: replaced.cycles[0]!.assessment!.verdictId, continue: true })), "none");
   assert.equal(goalOutcomeSchema.safeParse(outcome({ verdictId: held.verdictId, continue: true, result: "achieved" })).success, false);
   assert.equal(goalOutcomeSchema.safeParse(outcome({ continue: true })).success, false);
   assert.equal(goalOutcomeSchema.safeParse(outcome({ verdictId: held.verdictId })).success, true);

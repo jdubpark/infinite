@@ -410,7 +410,8 @@ function inbox() {
     },
   };
   const add = (kind: SignalKind, runId?: string) => {
-    const signal: ProjectSignal = { seq: signals.length + 1, id: randomUUID(), projectId: "demo", kind, key: randomUUID(), at: new Date().toISOString(), ...(runId ? { runId } : {}) };
+    const base = { seq: signals.length + 1, id: randomUUID(), projectId: "demo", key: randomUUID(), at: new Date().toISOString() };
+    const signal: ProjectSignal = kind === "owner" ? { ...base, kind, text: "owner wake" } : { ...base, kind, ...(runId ? { runId } : {}) };
     signals.push(signal);
     return signal;
   };

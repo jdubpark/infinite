@@ -13,7 +13,10 @@ const witness = { boot: "boot-1", processes: [], sessions: [], groups: [] };
 const entryOf = (directory: string): Retiring => ({ directory, root: "/srv/main-check-example/teams", witness });
 
 function result(head: string, outcome: MainCheckResult["outcome"], seconds: number, checks = DIGEST): MainCheckResult {
-  return { head, checks, startedAt: at(seconds), finishedAt: at(seconds + 1), outcome, ...(outcome === "error" ? { reason: "workspace" as const } : {}), expected: 1, commands: [] };
+  const base = { head, checks, startedAt: at(seconds), finishedAt: at(seconds + 1), expected: 1, commands: [] };
+  if (outcome === "error") return { ...base, outcome, reason: "workspace" };
+  if (outcome === "interrupted") return { ...base, outcome, reason: "halt" };
+  return { ...base, outcome };
 }
 
 /** Admits `head`, finishes it with `outcome`, and retires nothing: the record as the service would write it, settled. */

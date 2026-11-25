@@ -10,7 +10,7 @@
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceModule, EvidenceTx } from "./evidence/types.js";
 import type { PermissionDeliveryService, PermissionHandled, PermissionInteractiveTarget, PermissionPipeline } from "./permission-agent-types.js";
-import type { InterruptClass } from "./permission-policy.js";
+import type { InterruptClass, RejectCode } from "./permission-policy.js";
 
 /** The last recorded delivery state of one raised request. */
 export type DeliveryLedgerState = "intent" | "receipt" | "refusal" | "uncertain" | "stale";
@@ -209,24 +209,22 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
       case "held": return { handled: false, reason: "An owner halt holds permission decisions for this project.", held: true };
       case "owner": return { handled: true, result: "owner", decisionId: outcome.decisionId, interruptClass: outcome.interruptClass };
       case "undeliverable": return { handled: true, result: "undeliverable" };
-      case "allow": return this.deliver(target, pipeline, ledger, outcome.decisionId, "accept", outcome.strongTier);
-      case "reject": {
-        const handled = await this.deliver(target, pipeline, ledger, outcome.decisionId, "reject", false, outcome.notice);
-        return handled.handled ? { ...handled, code: outcome.code } : handled;
-      }
+      case "allow": return this.deliver(target, pipeline, ledger, outcome.decisionId, { choice: "accept", strongTier: outcome.strongTier });
+      case "reject": return this.deliver(target, pipeline, ledger, outcome.decisionId, { choice: "reject", code: outcome.code, notice: outcome.notice });
     }
   }
 
   private async deliver(target: PermissionInteractiveTarget, pipeline: PermissionPipeline, ledger: PermissionDeliveryLedger,
-    decisionId: string, choice: "accept" | "reject", strongTier: boolean, notice?: string): Promise<PermissionHandled> {
+    decisionId: string, action: { choice: "accept"; strongTier: boolean } | { choice: "reject"; code: RejectCode; notice: string }): Promise<PermissionHandled> {
     const { request } = target, sessionId = request.requester.sessionId;
+    const { choice } = action;
+    const rejectCode = action.choice === "reject" ? { code: action.code } : {};
     const record = (kind: DeliveryLedgerState, detail?: string) => {
       try { pipeline.recordDelivery(decisionId, kind, detail); } catch { /* The ledger below still fences a repeat. */ }
     };
-    const verdict = choice === "accept" ? "allowed" as const : "rejected" as const;
     const live = await this.check(target);
     if (!live.ok) {
-      if (live.stale) { record("stale", live.reason); return { handled: true, result: "stale", decisionId }; }
+      if (live.stale) { record("stale", live.reason); return { handled: true, result: "stale", decisionId, ...rejectCode }; }
       record("refusal", live.reason);
       return { handled: false, reason: live.reason };
     }
@@ -236,14 +234,14 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
       record("refusal", "The decision no longer applies to this request.");
       return { handled: false, reason: "The decision no longer applies to this request." };
     }
-    if (choice === "accept" && request.destructive && !strongTier) {
+    if (action.choice === "accept" && request.destructive && !action.strongTier) {
       record("refusal", "A request with the destructive flag is delivered only on a strong verdict.");
       return { handled: true, result: "undeliverable", decisionId, delivery: "refusal" };
     }
     const option = choice === "accept" ? live.accept : live.reject;
     if (option === undefined) {
       record("refusal", choice === "accept" ? "The dialog offers no recognised one-shot accept." : "The dialog offers no recognised one-shot reject.");
-      return { handled: true, result: "undeliverable", decisionId, delivery: "refusal" };
+      return { handled: true, result: "undeliverable", decisionId, delivery: "refusal", ...rejectCode };
     }
 
     // The intent is durable in both records before any key is sent. Without it nothing is sent.
@@ -252,7 +250,7 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
       pipeline.recordDelivery(decisionId, "intent");
     } catch {
       try { ledger.set(request.id, { sessionId, decisionId, state: "refusal" }); } catch { this.unknown.add(request.id); }
-      return { handled: true, result: "undeliverable", decisionId, delivery: "refusal" };
+      return { handled: true, result: "undeliverable", decisionId, delivery: "refusal", ...rejectCode };
     }
     this.unknown.add(request.id);
     // No await lies between the authority check above and this entry, so an owner act either fails that check
@@ -260,7 +258,7 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
     const current = () => { try { return pipeline.applicable(decisionId, request); } catch { return false; } };
     this.delivering.set(request.id, { decisionId, target });
     let answered: "delivered" | "refused" | "uncertain";
-    try { answered = await target.answer(option, decisionId, choice === "reject" ? notice : undefined, current); }
+    try { answered = await target.answer(option, decisionId, action.choice === "reject" ? action.notice : undefined, current); }
     catch { answered = "uncertain"; }
     finally { this.delivering.delete(request.id); }
     const kind: DeliveryLedgerState = answered === "delivered" ? "receipt" : answered === "refused" ? "refusal" : "uncertain";
@@ -270,16 +268,20 @@ export class InteractivePermissionDelivery implements PermissionDeliveryService 
     // Only a refusal that both records hold lets the same request be tried again.
     if (kind === "refusal" && stored) this.unknown.delete(request.id);
 
-    if (answered === "delivered") return { handled: true, result: verdict, decisionId, delivery: "receipt" };
+    if (answered === "delivered") {
+      return action.choice === "accept"
+        ? { handled: true, result: "allowed", decisionId, delivery: "receipt" }
+        : { handled: true, result: "rejected", decisionId, code: action.code, delivery: "receipt" };
+    }
     const after = await this.check(target);
     if (answered === "refused") {
-      if (after.ok) return { handled: true, result: "undeliverable", decisionId, delivery: "refusal" };
-      if (after.stale) { record("stale", after.reason); return { handled: true, result: "stale", decisionId, delivery: "refusal" }; }
+      if (after.ok) return { handled: true, result: "undeliverable", decisionId, delivery: "refusal", ...rejectCode };
+      if (after.stale) { record("stale", after.reason); return { handled: true, result: "stale", decisionId, delivery: "refusal", ...rejectCode }; }
       return { handled: false, reason: after.reason };
     }
     // An uncertain delivery is never repeated. While the dialog is still open it goes to the owner.
     return after.ok
-      ? { handled: true, result: "undeliverable", decisionId, delivery: "uncertain" }
-      : { handled: true, result: "stale", decisionId, delivery: "uncertain" };
+      ? { handled: true, result: "undeliverable", decisionId, delivery: "uncertain", ...rejectCode }
+      : { handled: true, result: "stale", decisionId, delivery: "uncertain", ...rejectCode };
   }
 }

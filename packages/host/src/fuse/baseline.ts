@@ -32,20 +32,25 @@ const launchSchema = z.object({
   seq,
 }).strict();
 
-const tripSchema = z.object({
+const tripBase = {
   tripId: id,
-  scope: z.enum(["project", "host"]),
-  projectId: projectId.optional(),
   cause: z.enum(["launch-rate", "unmeasurable"]),
   window: z.enum(["hour", "day", "week"]).optional(),
   openedAt: time,
-  closedAt: time.optional(),
-  closedBy: z.enum(["rate", "owner", "baseline"]).optional(),
   ownerClose: z.boolean(),
   announcedAt: time.optional(),
   launches: z.number().int().min(0).optional(),
   seq,
-}).strict();
+};
+
+const closedFields = { closedAt: time, closedBy: z.enum(["rate", "owner", "baseline"]) };
+
+const tripSchema: z.ZodType<FuseTripRecord> = z.union([
+  z.object({ ...tripBase, scope: z.literal("host") }).strict(),
+  z.object({ ...tripBase, scope: z.literal("host"), ...closedFields }).strict(),
+  z.object({ ...tripBase, scope: z.literal("project"), projectId }).strict(),
+  z.object({ ...tripBase, scope: z.literal("project"), projectId, ...closedFields }).strict(),
+]);
 
 const baselineSchema: z.ZodType<FuseBaseline> = z.object({
   version: z.literal(1),

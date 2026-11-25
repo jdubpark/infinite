@@ -4,23 +4,13 @@ import { WITNESS_LIMIT, type ProcessWitness } from "./process-census.js";
 import { teamCommandSchema, type TeamCommand } from "./team-types.js";
 import type { Config, Project } from "./types.js";
 
-/*
- * The durable record of the main check (INF-388) and its rules as pure functions. Nothing here reads a file or a
- * clock: times, digests and witnesses come in as arguments, so the simulator and the service apply the same rules.
- */
-
-/** A final result: the check ran to its end at this commit in a clean copy. */
 export type CheckSummary = {
   head: string;
-  /** Digest of the configured setup and checks the result was measured with. */
   checks: string;
-  /** Stamp of the latest observation of this head (MirrorFetch.fetchedAt). */
   observedAt: string;
   outcome: "passed" | "failed";
   finishedAt: string;
-  /** How many commands the check had (setup counts as one). */
   expected: number;
-  /** For a failure: the 1-based position of the command that failed, and its exit code. */
   failed?: { index: number; exitCode: number | null };
 };
 export type MainCheckCommand = {
@@ -28,57 +18,49 @@ export type MainCheckCommand = {
   command: TeamCommand;
   status: "passed" | "failed" | "interrupted";
   exitCode: number | null;
-  /** Untrusted text from the command's output, at most 8 entries. For the owner's eyes only: never in a prompt or a push. */
   failures?: string[];
 };
-export type MainCheckReason = "time-limit" | "halt" | "host-stop" | "workspace" | "copy-changed" | "command-unavailable" | "stop-unconfirmed";
-export type MainCheckResult = {
+export type MainCheckInterruptReason = "time-limit" | "halt" | "host-stop";
+export type MainCheckErrorReason = "workspace" | "copy-changed" | "command-unavailable" | "stop-unconfirmed";
+export type MainCheckReason = MainCheckInterruptReason | MainCheckErrorReason;
+
+type MainCheckResultBase = {
   head: string;
   checks: string;
   startedAt: string;
   finishedAt: string;
-  outcome: "passed" | "failed" | "interrupted" | "error";
-  /** Why a check without a final result ended. */
-  reason?: MainCheckReason;
   expected: number;
   commands: MainCheckCommand[];
 };
-/** A run directory that is not yet proven quiet and removed. `directory` is the run directory's name under the team root. */
+
+export type MainCheckResult =
+  | (MainCheckResultBase & { outcome: "passed" | "failed"; reason?: never })
+  | (MainCheckResultBase & { outcome: "interrupted"; reason: MainCheckInterruptReason })
+  | (MainCheckResultBase & { outcome: "error"; reason: MainCheckErrorReason });
+
 export type Retiring = { directory: string; root: string; witness: ProcessWitness; recording?: true };
 export type MainCheckRunning = Retiring & { head: string; checks: string; startedAt: string };
 export type MainCheckWaiting = "execution-identity" | "census-unavailable" | "halt" | "host-load" | "storage" | "another-check" | "processes" | "cleanup" | "attempts";
 export type MainCheckRecord = {
   version: 1;
-  /** Newest head the mirror reported, ordered by fetch stamp. */
   observed?: { head: string; at: string };
-  /** Charged admissions per head and checks digest, newest last, at most 20. */
   attempts?: { head: string; checks: string; count: number }[];
-  /** The check in progress. Written before its copy exists. */
   running?: MainCheckRunning;
-  /** At most 8. */
   retiring?: Retiring[];
-  /** Detail of the newest finished check. */
   last?: MainCheckResult;
-  /** Final results, newest last, at most 20. */
   results?: CheckSummary[];
-  /** Derived by `settle`: the result of the most recently observed head that has a result with the current checks digest. */
   health?: CheckSummary;
-  /** Generation of the health outcome: +1 each time the outcome changes. Absent health counts as passed. */
   notice?: number;
-  /** The newest notice the push service accepted for a device. */
   told?: { notice: number; outcome: "passed" | "failed" };
   waiting?: MainCheckWaiting;
 };
-/** The project setting. The schema key is added by the wiring task; until then it is read through `mainCheckSetting`. */
 export type MainCheckSetting = { minutes?: number };
 
-/** A head is checked at most this many times per checks digest without a result. */
 export const MAX_ATTEMPTS = 3;
 export const MAX_ATTEMPT_ENTRIES = 20;
 export const MAX_RESULTS = 20;
 export const MAX_RETIRING = 8;
 export const MAX_FAILURES = 8;
-/** Setup and the at most eight configured checks. */
 const MAX_COMMANDS = 9;
 const COMMIT = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 export const PROJECT_ID = /^[a-z0-9-]+$/;
@@ -116,16 +98,20 @@ const commandSchema = z.strictObject({
   exitCode: z.number().int().nullable(),
   failures: z.array(z.string().max(4000)).max(MAX_FAILURES).optional(),
 });
-const resultSchema = z.strictObject({
+const resultBase = {
   head,
   checks: digest,
   startedAt: stamp,
   finishedAt: stamp,
-  outcome: z.enum(["passed", "failed", "interrupted", "error"]),
-  reason: z.enum(["time-limit", "halt", "host-stop", "workspace", "copy-changed", "command-unavailable", "stop-unconfirmed"]).optional(),
   expected: z.number().int().min(0).max(MAX_COMMANDS),
   commands: z.array(commandSchema).max(MAX_COMMANDS),
-});
+};
+const resultSchema: z.ZodType<MainCheckResult> = z.discriminatedUnion("outcome", [
+  z.strictObject({ ...resultBase, outcome: z.literal("passed") }),
+  z.strictObject({ ...resultBase, outcome: z.literal("failed") }),
+  z.strictObject({ ...resultBase, outcome: z.literal("interrupted"), reason: z.enum(["time-limit", "halt", "host-stop"]) }),
+  z.strictObject({ ...resultBase, outcome: z.literal("error"), reason: z.enum(["workspace", "copy-changed", "command-unavailable", "stop-unconfirmed"]) }),
+]);
 export const mainCheckRecordSchema: z.ZodType<MainCheckRecord> = z.strictObject({
   version: z.literal(1),
   observed: z.strictObject({ head, at: stamp }).optional(),
@@ -141,7 +127,6 @@ export const mainCheckRecordSchema: z.ZodType<MainCheckRecord> = z.strictObject(
 });
 const settingSchema = z.strictObject({ minutes: z.number().int().min(1).max(240).optional() });
 
-/** `project.team.mainCheck`, or undefined when it is absent or not a valid setting. */
 export function mainCheckSetting(team: unknown): MainCheckSetting | undefined {
   const value = (team as { mainCheck?: unknown } | undefined)?.mainCheck;
   if (value === undefined) return undefined;
@@ -149,10 +134,6 @@ export function mainCheckSetting(team: unknown): MainCheckSetting | undefined {
   return parsed.success ? parsed.data : undefined;
 }
 
-/**
- * R3 gate 1 without the setting: what a check needs from the project and the host. A project that lacks one of
- * these is never checked, whatever its setting says: configured checks, a team root, and a GitHub source.
- */
 export function mainCheckRunnable(config: Pick<Config, "teams">, project: Pick<Project, "id" | "team" | "source">): boolean {
   return project.team !== undefined && project.team.checks.length > 0 && config.teams !== undefined &&
     project.source?.mode === "github" && PROJECT_ID.test(project.id);
@@ -160,15 +141,12 @@ export function mainCheckRunnable(config: Pick<Config, "teams">, project: Pick<P
 
 export const isCommit = (value: string) => COMMIT.test(value);
 export const emptyRecord = (): MainCheckRecord => ({ version: 1 });
-/** Absent health, and an absent `told`, count as passed. */
 export const outcomeOf = (summary?: { outcome: "passed" | "failed" }) => summary?.outcome ?? "passed";
 
-/** The digest a result is measured with: the configured setup and checks, in order. */
 export function checksDigest(team: { setup?: TeamCommand; checks: readonly TeamCommand[] }): string {
   return createHash("sha256").update(JSON.stringify({ setup: team.setup ?? null, checks: team.checks })).digest("hex");
 }
 
-/** The record with `key` set, or removed when `value` is undefined or an empty list. */
 function assign<K extends keyof MainCheckRecord>(record: MainCheckRecord, key: K, value: MainCheckRecord[K]): MainCheckRecord {
   const next = { ...record };
   if (value === undefined || Array.isArray(value) && value.length === 0) delete next[key];
@@ -182,10 +160,6 @@ export function chargedAdmissions(record: MainCheckRecord, head: string, checks:
   return record.attempts?.find(sameAttempt(head, checks))?.count ?? 0;
 }
 
-/**
- * settle, the one health transition: among results with the current digest, the one with the newest `observedAt`
- * (the later entry on a tie). `notice` goes up by one when its outcome differs from the recorded health's.
- */
 export function settle(record: MainCheckRecord, digest: string): MainCheckRecord {
   let best: CheckSummary | undefined;
   for (const result of record.results ?? []) {
@@ -197,7 +171,6 @@ export function settle(record: MainCheckRecord, digest: string): MainCheckRecord
   return { ...next, notice: (record.notice ?? 0) + 1 };
 }
 
-/** R1. A fetch older than the observed one changes nothing; the caller settles. */
 export function observe(record: MainCheckRecord, head: string, at: string): MainCheckRecord {
   if (record.observed && Date.parse(at) < Date.parse(record.observed.at)) return record;
   const next: MainCheckRecord = { ...record, observed: { head, at } };
@@ -206,7 +179,6 @@ export function observe(record: MainCheckRecord, head: string, at: string): Main
   return next;
 }
 
-/** R2: the observed head when it needs a check, `attempts` when it used them up, or undefined. */
 export function candidate(record: MainCheckRecord, digest: string): { head: string } | { waiting: "attempts" } | undefined {
   if (record.running || !record.observed) return undefined;
   const head = record.observed.head;
@@ -215,7 +187,6 @@ export function candidate(record: MainCheckRecord, digest: string): { head: stri
   return { head };
 }
 
-/** R4, one write: the check is recorded before its copy exists, and the head is charged one admission. */
 export function admit(record: MainCheckRecord, running: MainCheckRunning): MainCheckRecord {
   const count = chargedAdmissions(record, running.head, running.checks) + 1;
   const others = (record.attempts ?? []).filter(entry => !sameAttempt(running.head, running.checks)(entry));
@@ -223,19 +194,13 @@ export function admit(record: MainCheckRecord, running: MainCheckRunning): MainC
   return assign({ ...record, running, attempts }, "waiting", undefined);
 }
 
-/** The summary a final result adds to `results`. */
-function summaryOf(result: MainCheckResult, observedAt: string): CheckSummary {
-  const outcome = result.outcome === "passed" ? "passed" : "failed";
+function summaryOf(result: Extract<MainCheckResult, { outcome: "passed" | "failed" }>, observedAt: string): CheckSummary {
+  const outcome = result.outcome;
   const index = result.commands.findIndex(command => command.status === "failed");
   const failed = outcome === "failed" && index >= 0 ? { failed: { index: index + 1, exitCode: result.commands[index]!.exitCode } } : {};
   return { head: result.head, checks: result.checks, observedAt, outcome, finishedAt: result.finishedAt, expected: result.expected, ...failed };
 }
 
-/**
- * R6, one write: `last` is set and the run directory moves to `retiring` with the witness given. A final result is
- * added with `observedAt` and drops the head's attempts; a halt or a host stop gives the admission back. The caller
- * settles.
- */
 export function finish(record: MainCheckRecord, result: MainCheckResult, entry: Retiring, observedAt: string): MainCheckRecord {
   const { running: _running, ...rest } = record;
   let next: MainCheckRecord = { ...rest, last: result, retiring: [...(record.retiring ?? []), entry] };
@@ -249,11 +214,6 @@ export function finish(record: MainCheckRecord, result: MainCheckResult, entry: 
   return assign(next, "attempts", attempts.filter(attempt => attempt.count > 0));
 }
 
-/**
- * R8: a record that still holds `running` was left by a host that stopped during the check. The run directory moves
- * to `retiring` as it is and the admission stays charged, so a commit whose check stops the host is tried at most
- * three times. The caller settles.
- */
 export function hostStart(record: MainCheckRecord, finishedAt: string, expected: number): MainCheckRecord {
   if (!record.running) return record;
   const { head, checks, startedAt, directory, root, witness, recording } = record.running;
@@ -263,13 +223,11 @@ export function hostStart(record: MainCheckRecord, finishedAt: string, expected:
   return { ...rest, retiring: [...(record.retiring ?? []), entry], last };
 }
 
-/** The entry of `directory`, in `running` or in `retiring`. */
 export function entryOf(record: MainCheckRecord, directory: string): Retiring | undefined {
   if (record.running?.directory === directory) return record.running;
   return record.retiring?.find(entry => entry.directory === directory);
 }
 
-/** The record with the witness of `directory` replaced, wherever its entry is; undefined when no entry holds it. */
 export function withWitness(record: MainCheckRecord, directory: string, witness: ProcessWitness, recording: boolean): MainCheckRecord | undefined {
   const flag = recording ? { recording: true as const } : {};
   if (record.running?.directory === directory) {
@@ -284,7 +242,6 @@ export function withWitness(record: MainCheckRecord, directory: string, witness:
   return { ...record, retiring };
 }
 
-/** R7's bookkeeping: a removed directory leaves `retiring`. */
 export function retire(record: MainCheckRecord, directory: string): MainCheckRecord {
   return assign(record, "retiring", record.retiring?.filter(entry => entry.directory !== directory));
 }
@@ -293,26 +250,16 @@ export function setWaiting(record: MainCheckRecord, waiting: MainCheckWaiting | 
   return assign(record, "waiting", waiting);
 }
 
-/**
- * R9: health is present and its outcome differs from what the owner was told. The caller checks that the setting is
- * present. While no result has the current checks, nothing is due, also after a failure was told: the next result
- * decides, so a notice always carries the result it speaks about.
- */
 export function noticeDue(record: MainCheckRecord): record is MainCheckRecord & { health: CheckSummary } {
   return record.health !== undefined && record.health.outcome !== outcomeOf(record.told);
 }
 
-/**
- * R9's acceptance: records what the owner was really told, also when health changed since the send. An older
- * generation than `told` changes nothing, and so does a generation the record never reached.
- */
 export function accept(record: MainCheckRecord, notice: number, outcome: "passed" | "failed"): MainCheckRecord {
   if (notice < (record.told?.notice ?? 0) || notice > (record.notice ?? 0)) return record;
   if (record.told?.notice === notice && record.told.outcome === outcome) return record;
   return { ...record, told: { notice, outcome } };
 }
 
-/** What the owner's read route shows: no directory, root or witness. */
 export type MainCheckView =
   | { readable: false }
   | {
@@ -320,13 +267,11 @@ export type MainCheckView =
     enabled: boolean;
     observed?: { head: string; at: string };
     running?: { head: string; checks: string; startedAt: string };
-    /** Run directories not yet proven quiet and removed. */
     retiring: number;
     attempts: { head: string; checks: string; count: number }[];
     last?: MainCheckResult;
     results: CheckSummary[];
     health?: CheckSummary;
-    /** True when `health` was measured at the observed head. */
     current: boolean;
     notice: number;
     told?: { notice: number; outcome: "passed" | "failed" };

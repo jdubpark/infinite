@@ -9,17 +9,20 @@ import {
   type SessionRow,
 } from "../../api/client";
 
-/** The host's lease lasts 30 s; renewing every 10 s keeps it while the phone is in use. */
 const RENEW_MS = 10_000;
 
 type ControlState = {
-  /** The lease this phone holds, or null. */
   lease: ControlLease | null;
-  /** The lease the host last reported, whichever device holds it. */
   holder: ControlLease | null;
   message: string;
   busy: boolean;
 };
+
+type LeasePhase =
+  | { kind: "unheld" }
+  | { kind: "claiming"; token: number; lease: ControlLease | null }
+  | { kind: "held"; lease: ControlLease; renewing: boolean; renewOnForeground: boolean }
+  | { kind: "releasing"; lease: ControlLease };
 
 const sameLease = (a: ControlLease | null, b: ControlLease | null) =>
   a === b ||
@@ -29,12 +32,6 @@ const sameLease = (a: ControlLease | null, b: ControlLease | null) =>
     a.label === b.label &&
     a.expiresAt === b.expiresAt);
 
-/**
- * One session's input lease on this phone. The Brief and Terminal routes share it, so moving
- * between them keeps control. It is released when neither route is focused, when its host lease
- * expires, or when a screen stops reaching the host. Nothing reacquires it without the person
- * asking.
- */
 class SessionControl {
   private state: ControlState = {
     lease: null,
@@ -42,13 +39,11 @@ class SessionControl {
     message: "",
     busy: false,
   };
+  private phase: LeasePhase = { kind: "unheld" };
   private listeners = new Set<() => void>();
-  /** Bumped by every local change, so a poll that started earlier cannot undo it. */
   private revision = 0;
+  private opToken = 0;
   private focused = 0;
-  private claiming = false;
-  private renewing = false;
-  private renewOnForeground = false;
   private renewTimer: ReturnType<typeof setInterval> | undefined;
   private expireTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -67,8 +62,14 @@ class SessionControl {
   };
   snapshot = () => this.state;
   generation = () => this.revision;
+
+  private currentLease(): ControlLease | null {
+    if (this.phase.kind === "held" || this.phase.kind === "claiming") return this.phase.lease;
+    return null;
+  }
+
   leaseId = () => {
-    const lease = this.state.lease;
+    const lease = this.currentLease();
     if (lease && lease.expiresAt <= Date.now()) {
       this.forget();
       return undefined;
@@ -90,7 +91,10 @@ class SessionControl {
   }
 
   private collect() {
-    if (!this.listeners.size && this.focused === 0 && !this.state.lease && !this.claiming && !this.renewing)
+    const idle =
+      this.phase.kind === "unheld" ||
+      this.phase.kind === "releasing";
+    if (!this.listeners.size && this.focused === 0 && idle)
       this.onUnused();
   }
 
@@ -98,17 +102,28 @@ class SessionControl {
     return this.focused > 0 && inForeground();
   }
 
+  private clearTimers() {
+    clearInterval(this.renewTimer);
+    clearTimeout(this.expireTimer);
+    this.renewTimer = undefined;
+    this.expireTimer = undefined;
+  }
+
   private release(lease: ControlLease) {
-    void api(this.connection, `/sessions/${this.id}/control`, {
+    return api(this.connection, `/sessions/${this.id}/control`, {
       body: { action: "release", leaseId: lease.id },
     }).catch(() => {});
   }
 
   private hold(lease: ControlLease | null) {
-    clearInterval(this.renewTimer);
-    clearTimeout(this.expireTimer);
-    this.set(lease ? { lease, holder: lease } : { lease: null });
-    if (!lease) return;
+    this.clearTimers();
+    if (!lease) {
+      this.phase = { kind: "unheld" };
+      this.set({ lease: null });
+      return;
+    }
+    this.phase = { kind: "held", lease, renewing: false, renewOnForeground: false };
+    this.set({ lease, holder: lease });
     this.expireTimer = setTimeout(
       () => this.forget(),
       Math.max(0, lease.expiresAt - Date.now()),
@@ -117,34 +132,35 @@ class SessionControl {
       this.renewTimer = setInterval(() => void this.renew(), RENEW_MS);
   }
 
-  /**
-   * Drops the local lease; `release` also tells the host so another device can take over.
-   * The dock shows the change itself, so no message is set here.
-   */
   forget = (release = false) => {
     this.revision++;
-    const previous = this.state.lease;
-    this.hold(null);
-    if (!previous) {
-      this.collect();
-      return;
+    const previous = this.currentLease();
+    this.clearTimers();
+    if (release && previous) {
+      this.phase = { kind: "releasing", lease: previous };
+      this.set({ lease: null });
+      void this.release(previous).finally(() => {
+        if (this.phase.kind === "releasing" && this.phase.lease.id === previous.id) {
+          this.phase = { kind: "unheld" };
+          this.collect();
+        }
+      });
+    } else {
+      this.phase = { kind: "unheld" };
+      this.set({ lease: null });
     }
-    if (release) this.release(previous);
     this.collect();
   };
 
-  /** Clears a refusal or error once the person has read it. */
   dismiss = () => this.set({ message: "" });
 
-  /** The host refused input for control: this phone no longer holds a lease there. */
   refused = () => this.forget();
 
-  /** Takes in a poll of the session that started at `revision`. */
   observe = (session: SessionRow, revision: number) => {
     if (revision !== this.revision) return;
     const control = session.control ?? null;
     this.set({ holder: control });
-    const held = this.state.lease;
+    const held = this.currentLease();
     if (
       held &&
       (control?.id !== held.id ||
@@ -155,8 +171,10 @@ class SessionControl {
   };
 
   claim = async (takeover = false) => {
-    if (this.claiming) return;
-    this.claiming = true;
+    if (this.phase.kind === "claiming") return;
+    const prior = this.currentLease();
+    const token = ++this.opToken;
+    this.phase = { kind: "claiming", token, lease: prior };
     const revision = ++this.revision;
     this.set({ busy: true, message: "" });
     try {
@@ -166,14 +184,11 @@ class SessionControl {
         { body: { action: "claim", ...(takeover ? { takeover: true } : {}) } },
       );
       if (this.focused === 0 || revision !== this.revision) {
-        // The person left the session or changed control while the claim was in flight.
-        if (result.control) this.release(result.control);
+        if (result.control) void this.release(result.control);
         return;
       }
-      // Polls that started while this claim was awaiting its answer must not revoke it.
       this.revision++;
       this.hold(result.control);
-      // A granted lease shows in the dock; only a refusal needs words.
       this.set({ message: result.control ? "" : "Control was not granted. Refresh and try again." });
     } catch (error) {
       if (this.active() && revision === this.revision) {
@@ -181,24 +196,29 @@ class SessionControl {
         this.set({ message: (error as Error).message });
       }
     } finally {
-      this.claiming = false;
-      this.set({ busy: false });
+      if (this.phase.kind === "claiming" && this.phase.token === token) {
+        this.phase = prior
+          ? { kind: "held", lease: prior, renewing: false, renewOnForeground: false }
+          : { kind: "unheld" };
+      }
+      if (this.phase.kind !== "claiming") this.set({ busy: false });
       this.collect();
     }
   };
 
   private async renew() {
-    const held = this.state.lease;
-    if (held && held.expiresAt <= Date.now()) {
+    if (this.phase.kind !== "held") return;
+    const held = this.phase.lease;
+    if (held.expiresAt <= Date.now()) {
       this.forget();
       return;
     }
-    if (this.renewing) {
-      if (this.active()) this.renewOnForeground = true;
+    if (this.phase.renewing) {
+      if (this.active()) this.phase.renewOnForeground = true;
       return;
     }
-    if (!held || !this.active()) return;
-    this.renewing = true;
+    if (!this.active()) return;
+    this.phase.renewing = true;
     const revision = this.revision;
     let renewed = false;
     try {
@@ -207,47 +227,49 @@ class SessionControl {
         `/sessions/${this.id}/control`,
         { body: { action: "renew", leaseId: held.id } },
       );
-      if (revision !== this.revision || this.state.lease?.id !== held.id) return;
+      if (revision !== this.revision || this.phase.kind !== "held" || this.phase.lease.id !== held.id) return;
       if (result.control?.id === held.id) {
         this.revision++;
         this.hold(result.control);
         renewed = true;
       } else this.forget();
     } catch {
-      // If return happened during this request, retry the same lease in `finally` before dropping it.
-      if (revision === this.revision && this.active() && !this.renewOnForeground) this.forget();
+      if (
+        revision === this.revision &&
+        this.active() &&
+        this.phase.kind === "held" &&
+        !this.phase.renewOnForeground
+      )
+        this.forget();
     } finally {
-      this.renewing = false;
-      if (this.renewOnForeground) {
-        this.renewOnForeground = false;
-        if (!renewed && this.state.lease && this.active()) void this.renew();
+      if (this.phase.kind === "held" && this.phase.lease.id === held.id) {
+        const retry = this.phase.renewOnForeground;
+        this.phase.renewing = false;
+        this.phase.renewOnForeground = false;
+        if (retry && !renewed && this.active()) void this.renew();
       }
       this.collect();
     }
   }
 
-  /** Counts a focused route; the lease is released once no route of this session is focused. */
   focus = () => {
     this.focused++;
     return () => {
       this.focused--;
-      // Moving between the Brief and the Terminal blurs one route as the other gains focus.
       setTimeout(() => {
         if (this.focused === 0) this.forget(true);
       }, 0);
     };
   };
 
-  /** Pause renewals in the background; on return renew a held lease without claiming anew. */
   foreground = (foreground: boolean) => {
     if (!foreground) {
       clearInterval(this.renewTimer);
       this.renewTimer = undefined;
       return;
     }
-    const lease = this.state.lease;
-    if (!lease) return;
-    if (lease.expiresAt <= Date.now()) {
+    if (this.phase.kind !== "held") return;
+    if (this.phase.lease.expiresAt <= Date.now()) {
       this.forget();
       return;
     }
@@ -268,10 +290,6 @@ function controlFor(connection: Connection, id: string) {
   return control;
 }
 
-/**
- * This phone's input control for one session: claim, explicit takeover, renewal while the
- * session is on screen, and release. Input calls read `leaseId()` when they send.
- */
 export function useSessionControl(connection: Connection, id: string) {
   const control = controlFor(connection, id);
   const state = useSyncExternalStore(control.subscribe, control.snapshot);
@@ -293,11 +311,6 @@ export function useSessionControl(connection: Connection, id: string) {
 
 export type SessionControlHandle = ReturnType<typeof useSessionControl>;
 
-/**
- * The lease to send with one input. The worker accepts lease-less input while no device holds
- * control, so a session that enforces control is refused here, before anything is sent, when
- * this phone holds no lease (for example a tap that landed just as the lease was dropped).
- */
 export function leaseFor(
   control: Pick<SessionControlHandle, "leaseId">,
   requiresControl: boolean,
@@ -311,11 +324,6 @@ export function leaseFor(
   return lease;
 }
 
-/**
- * Feeds one screen's session polls to the control: the holder shown is the host's, and a lease
- * the host no longer reports is dropped. When this screen stops reaching the host, the lease is
- * released once that screen's view becomes stale: a stale view never keeps input control.
- */
 export function useControlSync(
   control: SessionControlHandle,
   poll: { session: SessionRow; revision: number } | null,

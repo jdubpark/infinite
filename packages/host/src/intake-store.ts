@@ -74,13 +74,13 @@ export class IntakeStore {
     return structuredClone(saved);
   }
 
-  update(issueId: string, change: (record: IntakeRecord) => void): IntakeRecord {
+  update(issueId: string, change: (record: IntakeRecord) => IntakeRecord | void): IntakeRecord {
     const current = this.records.get(issueId);
     if (!current) throw new Error("This issue does not have an intake record.");
     const changed = structuredClone(current);
-    change(changed);
-    if (changed.issueId !== issueId) throw new Error("An intake record issue ID cannot be changed.");
-    const saved = structuredClone(changed);
+    const next = change(changed) ?? changed;
+    if (next.issueId !== issueId) throw new Error("An intake record issue ID cannot be changed.");
+    const saved = structuredClone(next);
     saved.updatedAt = now();
     this.trim(saved);
     writeSealed(join(this.recordsDirectory, `${issueId}.sealed`), this.key, recordScope(issueId), saved);

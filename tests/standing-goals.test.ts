@@ -305,8 +305,10 @@ test("a host signal starts the next cycle once before its cadence; the goal's ow
     head: () => readable ? signals.length : undefined,
     after: (projectId, seq, options) => readable ? signals.filter(signal => signal.projectId === projectId && signal.seq > seq && (!options?.kinds || options.kinds.includes(signal.kind))).slice(0, options?.limit ?? 50) : [],
   };
-  const record = (kind: SignalKind, extra: Partial<ProjectSignal> = {}) =>
-    signals.push({ seq: signals.length + 1, id: randomUUID(), projectId: "fixture", kind, key: randomUUID(), at: new Date().toISOString(), ...extra });
+  const record = (kind: SignalKind, extra: { text?: string; commit?: string; runId?: string } = {}) => {
+    const base = { seq: signals.length + 1, id: randomUUID(), projectId: "fixture", key: randomUUID(), at: new Date().toISOString() };
+    signals.push(kind === "owner" ? { ...base, kind, text: extra.text ?? "owner wake" } : { ...base, kind, ...(extra.commit ? { commit: extra.commit } : {}), ...(extra.runId ? { runId: extra.runId } : {}) });
+  };
   goals.useSignals(reader);
   const created = await goals.create(standing({}, 1440, ["external-commit", "delivery-landed"]));
   goals.start();
@@ -656,7 +658,7 @@ test("while Linear tracking holds new work, the goal shows the tracking reason a
   view = { status: "error", reason: "Linear could not be reached." };
   await until(() => goals.get(created.id), goal => goal.reason === "New work waits for Linear tracking: Linear could not be reached.");
 
-  view = { status: "synced" };
+  view = { status: "synced", issue: { id: randomUUID(), identifier: "INF-1", url: "https://linear.example.invalid/issue/INF-1", title: "Goal", description: null, state: { name: "Todo", type: "unstarted" }, updatedAt: "2026-11-14T00:00:00.000Z" } };
   await until(() => teams.launches.length, count => count === 2);
   const started = await until(() => [goals.get(created.id), goals.get(finite.id)], all => all.every(goal => goal.activeTeamId !== undefined));
   for (const goal of started) assert.equal(goal.reason, undefined, "The tracking reason clears once work starts");

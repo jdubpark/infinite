@@ -11,4 +11,5 @@ Non-obvious architectural, protocol, security, concurrency, and compatibility de
 | [0005](0005-mobile-freshness-and-web-swarm-invariants.md) | Mobile Freshness Hooks and Web Swarm View Contracts | `apps/mobile/`, `apps/web/` | Accepted |
 | [0006](0006-host-concurrency-and-lock-free-storage.md) | Host Lock-Free Storage, Pipeline Concurrency, and Partitioned Coordination | `packages/host/` | Accepted |
 | [0007](0007-host-state-machines-and-fail-closed-boundaries.md) | Host State Machines, Fail-Closed Halts, Eval Isolation, and Transport Boundaries | `packages/host/` | Accepted |
+| [0008](0008-wave2-domain-and-service-state-machines.md) | Wave 2A Domain, Background Service, and Session Control State Machines | `packages/host/`, `apps/mobile/`, `apps/web/` | Accepted |
 | [0016](0016-wave3-per-entity-orchestration-queues.md) | Per-Entity Orchestration Queues and Orchestration Service Invariants | `packages/host/` | Accepted |

@@ -168,13 +168,15 @@ test("rate-limit headers reach the bridge status; a limited read pauses with its
   } finally { await b.close(); }
 });
 
+const sampleIssue = { id: randomUUID(), identifier: "INF-1", url: "https://linear.example.invalid/issue/INF-1", title: "Example", description: null, state: { name: "Todo", type: "unstarted" }, updatedAt: "2026-11-13T00:00:00.000Z" };
+
 test("continuing a finished run needs a current Linear confirmation, not the older one a client sees", { timeout: 30000 }, async () => {
   const fixture = schedulerFixture();
-  fixture.run.status = "blocked"; fixture.run.members = []; fixture.run.linearTracking = true; fixture.run.linear = { status: "synced" };
+  fixture.run.status = "blocked"; fixture.run.members = []; fixture.run.linearTracking = true; fixture.run.linear = { status: "synced", issue: sampleIssue };
   fixture.writeTeam();
   let current: LinearTrackingView = { status: "pending", reason: "Waiting for Linear to confirm current requirements and execution evidence." };
   let confirmations = 0;
-  const passive: LinearTrackingView = { status: "synced" };
+  const passive: LinearTrackingView = { status: "synced", issue: sampleIssue };
   const linear = {
     updateTeam: () => passive, updateGoal: () => undefined, getGoal: () => undefined,
     getTeam: (_id: string, wantsCurrent = false) => wantsCurrent ? current : passive,
@@ -185,7 +187,7 @@ test("continuing a finished run needs a current Linear confirmation, not the old
     await assert.rejects(teams.continueRun(fixture.run.id, { requestId: randomUUID(), revision: fixture.run.revision }),
       (error: unknown) => error instanceof TeamError && error.code === "linear-reconciliation-required");
     assert.equal(confirmations, 1, "the action asked Linear for a current confirmation first");
-    current = { status: "synced" };
+    current = { status: "synced", issue: sampleIssue };
     // With a current confirmation the Linear gate passes, and the run's own continuation rules answer.
     await assert.rejects(teams.continueRun(fixture.run.id, { requestId: randomUUID(), revision: fixture.run.revision }),
       (error: unknown) => error instanceof TeamError && error.code !== "linear-reconciliation-required");
@@ -290,5 +292,5 @@ test("a run that waits for Linear tracking shows why as its reason, without repl
     `New work waits for Linear tracking: ${waiting}`);
   assert.equal(reasonOf("blocked", paused, "Checks failed."), "Checks failed.");
   assert.equal(reasonOf("paused", paused), undefined);
-  assert.equal(reasonOf("implementing", { status: "synced", checkedAt: new Date().toISOString() }), undefined);
+  assert.equal(reasonOf("implementing", { status: "synced", issue: sampleIssue, checkedAt: new Date().toISOString() }), undefined);
 });

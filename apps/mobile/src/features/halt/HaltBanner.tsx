@@ -6,10 +6,8 @@ import { Glyph } from "../../components/Icon";
 import { theme } from "../../theme";
 import { createHaltStore, haltNotice, haltSince, type HaltPlace, type HaltState, type HaltView } from "./model";
 
-// Every screen reads the same snapshot per machine; a screen opened during a halt shows it at once.
 const halts = createHaltStore();
 
-/** Reads `GET /api/halt` every four seconds while the screen is focused, and shows the newest read of any screen. */
 function useHalt(connection: Connection): HaltView | null {
   const key = connectionKey(connection);
   usePoll(async () => {
@@ -25,10 +23,6 @@ function facts(halt: HaltState) {
   return [`Since ${haltSince(halt.at)} · from ${halt.by}`, halt.reason ? `“${halt.reason}”` : ""].filter(Boolean);
 }
 
-/**
- * The owner's halt on this screen. It lasts until the owner releases it with `infinite halt off`, so it sits in the
- * content instead of floating, and it has no controls.
- */
 export function HaltBanner({ connection, place, names, style }: {
   connection: Connection; place: HaltPlace; names?: (projectId: string) => string | undefined; style?: StyleProp<ViewStyle>;
 }) {

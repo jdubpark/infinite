@@ -6,7 +6,6 @@ import { theme } from "../../theme";
 const TAB_BAR_HEIGHT = 58;
 
 export default function TabsLayout() {
-  // Android draws edge to edge, so the tab bar reserves the system navigation bar's height itself.
   const insets = useSafeAreaInsets();
   return <Tabs screenOptions={{
     headerShown: false,

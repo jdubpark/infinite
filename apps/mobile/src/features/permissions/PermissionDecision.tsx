@@ -11,13 +11,10 @@ import { theme } from "../../theme";
 import { Section, t } from "../teams/parts";
 import { deliveryLabels, isSessionId, rejectStates, seconds, verdictColors, verdictWords, when, type DecisionEntry, type Mark } from "./model";
 
-// A mark that has not been confirmed keeps its request id across screen changes, so a retry cannot record it twice.
 const pendingMarks = new Map<string, { requestId: string; note: string }>();
 
-/** One recorded decision: the request, the verdict and its reviewers, delivery, the reviewer note and the owner's marks. */
 export function PermissionDecision({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter(), machine = connectionKey(connection);
-  // The mark form sits at the end of the page: the keyboard's height is added below it, and the page follows the field.
   const keyboardPadding = useKeyboardPadding(), page = useRef<ScrollView>(null);
   useEffect(() => { if (keyboardPadding) page.current?.scrollToEnd({ animated: true }); }, [keyboardPadding]);
   const decision = usePoll(() => api<{ entry: DecisionEntry }>(connection, `/permissions/decisions/${encodeURIComponent(id)}`).then(value => value.entry), 15000, [connection, id]);
@@ -100,7 +97,6 @@ function MarkForm({ connection, decisionId, marked }: { connection: Connection; 
       marked();
     } catch (failure) {
       const status = failure instanceof ApiError ? failure.status : 0;
-      // The host refused this request outright, so a new one may be sent; otherwise delivery is unknown and the retry keeps the request id.
       if (status >= 400 && status < 500) { pendingMarks.delete(key); setPending(undefined); }
       setMessage({ text: `${(failure as Error).message}${status >= 400 && status < 500 ? "" : " Delivery is unconfirmed. Retry keeps the same request."}`, error: true });
     } finally { setBusy(false); }

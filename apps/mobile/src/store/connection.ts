@@ -3,7 +3,6 @@ import * as Crypto from "expo-crypto";
 import { useSyncExternalStore } from "react";
 import { connectionKey, type Connection } from "../api/client";
 
-/** Unchanged from the single-file app so existing pairings survive. */
 export const SECRET_KEY = "infinite.connection.v1";
 const PROFILES_KEY = "infinite.machines.v2";
 type SavedConnections = { active: string; profiles: Connection[] };
@@ -82,7 +81,6 @@ export function clearConnection(id?: string) {
     const profiles = saved.profiles.filter(profile => connectionKey(profile) !== key);
     return { active: profiles.some(profile => connectionKey(profile) === saved.active) ? saved.active : profiles[0] ? connectionKey(profiles[0]) : "", profiles };
   };
-  // Publish removal before persistence so every mounted tab stops using the machine at once.
   if (snapshot && target) publish(remove(snapshot, target));
   const next = writes.then(async () => {
     await loadConnections();
@@ -99,11 +97,6 @@ export function clearConnection(id?: string) {
 const CLIENT_KEY = "infinite.client.v1";
 let clientId: Promise<string> | undefined;
 
-/**
- * This install's client UUID, sent as `X-Infinite-Client`. The host binds input control to the
- * paired key and this id, so a copied key on another phone cannot use this phone's lease. A
- * failed read or write falls back to an id that lasts until the app restarts.
- */
 export function loadClientId(): Promise<string> {
   clientId ??= (async () => {
     const saved = await SecureStore.getItemAsync(CLIENT_KEY).catch(() => null);

@@ -21,14 +21,12 @@ import { useRunRequest } from "./useRunRequest";
 import { CostLine, MoneyText } from "../cost/parts";
 import { ASSESSMENT_LABEL, awaitsProvisionalAnswer, countsText, criterionState, newestVerdictId, ownerOutcomeLabel, PRODUCER_LABELS, resultText, type AssessedGoal } from "./goal-verdicts";
 
-/** One product goal: its outcome, limits, active cycle, earlier cycles, and the person's assessment. */
 export function GoalDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
   const keyboardPadding = useKeyboardPadding();
   const machine = connectionKey(connection);
   const poll = usePoll(async () => ({ goal: await api<ProductGoal>(connection, `/goals/${id}`), receivedAt: Date.now() }), 2000, [connection, id]);
   const { data: me } = usePoll(() => api<Me>(connection, "/me"), 10000, [connection]);
-  // A mutation's result shows at once; a poll that started before it cannot undo it.
   const [recorded, setRecorded] = useState<ProductGoal | null>(null);
   const goal: AssessedGoal | null = poll.data ? newer(recorded, poll.data.goal) : recorded;
   const activeId = goal?.activeTeamId;
@@ -41,7 +39,6 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
     refused: poll.refresh,
   });
   const fresh = poll.online;
-  // Created before the early return below, so it reads the steer rule directly rather than `controls`.
   const dictation = useDictation({
     connection,
     value: direction,
@@ -59,7 +56,6 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   if (!goal) return <View style={[s.fill, s.overlayRoot]}>{header}<FloatingNotice position="top" offset={58} message={poll.stale ? "Can't reach this machine." : null} actions={poll.stale ? <Button compact title="Refresh" secondary onPress={poll.refresh} /> : null} /><View style={s.empty}><ActivityIndicator /><Text style={t.note}>{poll.loading ? "Loading goal…" : "The goal could not be loaded. Check the machine and try again."}</Text></View></View>;
 
   const controls = goalControls(goal, me?.role, fresh, poll.data?.receivedAt);
-  // Judged at the last good poll; the host makes the final decision.
   const expired = Date.parse(goal.deadlineAt) <= (poll.data?.receivedAt ?? 0);
   const locked = request.busy || Boolean(request.pending);
   const decisions = activeTeam ? openDecisions(activeTeam) : [];
@@ -141,7 +137,6 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
       </Section>
 
       {goal.tasks?.length ? <Section title="Tasks" count={goal.tasks.length}>
-        {/* Unmeasured tasks (Claude, Codex) never read as $0: the total is "—" without a measured task, a lower bound beside one. */}
         <Text style={t.strong}>Total <MoneyText value={goal.tasks.reduce((total, task) => ({
           usd: total.usd + (task.usage?.usd ?? 0), unpriced: total.unpriced + (task.usage?.unpriced ?? 0), unmeasured: total.unmeasured + (task.usage ? 0 : 1),
         }), { usd: 0, unpriced: 0, unmeasured: 0 })} />{goal.tasks.some(task => !task.usage) ? <Text style={t.note}>  {goal.tasks.filter(task => !task.usage).length} unmeasured</Text> : null}</Text>
@@ -199,7 +194,6 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   </View>;
 }
 
-/** One cycle's agent assessment. Its criteria rows are read only when the person opens them. */
 function CycleAssessment({ connection, goalId, teamId, assessment }: { connection: Connection; goalId: string; teamId: string; assessment: GoalAssessment }) {
   return <View style={s.record}>
     <Text style={t.strong}>{ASSESSMENT_LABEL}</Text>
@@ -209,7 +203,6 @@ function CycleAssessment({ connection, goalId, teamId, assessment }: { connectio
   </View>;
 }
 
-/** Mounted only while its disclosure is open, so closed cycles make no request. */
 function CriteriaRows({ connection, goalId, teamId }: { connection: Connection; goalId: string; teamId: string }) {
   const [row, setRow] = useState<GoalVerdictView | null>(null);
   const [error, setError] = useState("");
@@ -230,7 +223,6 @@ function CriteriaRows({ connection, goalId, teamId }: { connection: Connection; 
   </View>)}</>;
 }
 
-/** A goal stopped by an agent assessment: only these two answers. "Achieved" is the person's own. */
 function ProvisionalStop({ reason, disabled, busy, onSubmit }: { reason: string; disabled: boolean; busy: boolean; onSubmit: (value: { result: GoalResult; summary: string; evidence: string; continue?: boolean }) => void }) {
   const [summary, setSummary] = useState("");
   const [evidence, setEvidence] = useState("");
@@ -250,7 +242,6 @@ function ProvisionalStop({ reason, disabled, busy, onSubmit }: { reason: string;
   </View>;
 }
 
-/** The person's judgment of the product outcome. It does not publish the changes. */
 function OutcomeForm({ disabled, busy, onSubmit }: { disabled: boolean; busy: boolean; onSubmit: (value: { result: GoalResult; summary: string; evidence: string }) => void }) {
   const [result, setResult] = useState<GoalResult>("inconclusive");
   const [summary, setSummary] = useState("");

@@ -12,7 +12,6 @@ import { theme } from "../../theme";
 
 const STALE_MESSAGE = "This project changed. Try again.";
 
-/** One project: its name, repositories and checkouts, and owner-only changes. */
 export function ProjectDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
   const [draft, setDraft] = useState<string | null>(null);
@@ -25,7 +24,6 @@ export function ProjectDetail({ connection, id }: { connection: Connection; id: 
   const group = poll.data?.group ?? null;
   const owner = poll.data?.me.role === "owner";
 
-  /** Sends one owner change against the revision on screen. Returns whether the host accepted it. */
   async function change(body: Omit<ProjectGroupUpdateRequest, "requestId" | "revision">): Promise<boolean> {
     if (!group || busy) return false;
     setBusy(true);

@@ -11,7 +11,6 @@ const MAX_PLANNED_PAGES = 20;
 const NOT_OBSERVED = "Not observed yet";
 const evidenceLabel = (head: string | null, at: string) => head ? `From commit ${short(head)}, observed ${relative(at)}` : `Observed ${relative(at)}`;
 
-/** Plain-language System sections for every repository in the workspace. */
 export function SystemOverview({ connection, workspaceId, data, offline, onOpenComponent }: {
   connection: Connection; workspaceId: string; data: WorkspaceUnderstanding; offline: boolean; onOpenComponent: (componentId: string) => void;
 }) {
@@ -193,7 +192,6 @@ function newestBrief(briefs: KnowledgeRepositoryBrief[], repositoryId: string) {
   return briefs.filter(brief => brief.repositoryId === repositoryId).sort((a, b) => b.generatedAt.localeCompare(a.generatedAt))[0];
 }
 
-/** The repository's work state; a stored repository brief means the first observation already happened. */
 function repoStateLine(repo: UnderstandingRepository, brief: KnowledgeRepositoryBrief | undefined): string {
   if (repo.state === "updating") return "Updating now";
   if (repo.state === "failed") return repo.warnings[0] ?? "The latest refresh failed";

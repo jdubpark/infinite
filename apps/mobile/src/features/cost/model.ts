@@ -1,17 +1,13 @@
-/** Usage records shared by the phone's Cost screens; kept platform-free for simple calculation tests. */
 export type Money = { usd: number; unpriced: number };
 export type Balance = { amount: number; currency: string; asOf: string; stale: boolean } | null;
-/** `planSource` says whether a subscription fee is the config default or one the owner set; older hosts omit it. */
 export type AccountView = { id: string; kind: "metered" | "subscription"; month?: Money; planUsd?: number; planSource?: "config" | "owner"; balance: Balance };
 export type UsageOverview = { month: { start: string; end: string; spent: Money; previous: Money; plansUsd: number; unmeasuredSessions: number }; accounts: AccountView[] };
 export type DailyPoint = { date: string; usd: number; byAccount: Record<string, number> };
 export type DailySeries = { tz: string; accounts: string[]; days: DailyPoint[] };
-/** `unmeasured` counts sessions and briefings that ran without usage; older hosts omit it. */
 export type ProjectCostRow = { id: string; name: string; total: Money; month: Money; spark: number[]; unmeasured?: number };
 export type ProjectsList = { projects: ProjectCostRow[] };
 export type ProjectCost = {
   id: string; name: string; total: Money; unmeasured?: number;
-  /** USD per kind of work, not counts. */
   byKind: { goals: number; teams: number; sessions: number; briefings: number };
   goals: { id: string; title: string; total: Money; tasks: number }[];
   teams: { id: string; title: string; goalId?: string; total: Money }[];
@@ -37,7 +33,6 @@ export function deviceTz(): string {
   try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch { return "UTC"; }
 }
 
-/** Dollars with cents; a priced fraction of a cent reads "<$0.01" rather than $0.00. */
 export function usd(value: number, opts?: { compact?: boolean }): string {
   if (value > 0 && value < 0.01) return "<$0.01";
   if (opts?.compact && value >= 1000) return `$${(value / 1000).toLocaleString([], { maximumFractionDigits: 1 })}K`;
@@ -45,17 +40,12 @@ export function usd(value: number, opts?: { compact?: boolean }): string {
   return `$${value.toLocaleString([], { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
-/**
- * How a figure reads: exact, a lower bound ("≥") when steps were unpriced or some work went
- * unmeasured beside measured dollars, or nothing at all ("—") when only unmeasured work exists.
- */
 export function money(value: Money & { unmeasured?: number }) {
   const unmeasured = value.unmeasured ?? 0;
   const none = value.usd === 0 && value.unpriced === 0 && unmeasured > 0;
   return { text: none ? "—" : usd(value.usd), atLeast: !none && (value.unpriced > 0 || (unmeasured > 0 && value.usd > 0)), none };
 }
 
-/** Change against last month: a percentage once last month reached a dollar, otherwise the amount. */
 export function delta(current: Money, previous: Money): { text: string; direction: "up" | "down" | "flat" } | null {
   if (previous.usd === 0) return null;
   const change = current.usd - previous.usd;
@@ -66,12 +56,7 @@ export function delta(current: Money, previous: Money): { text: string; directio
 }
 
 export const PLAN_USD_MAX = 100000;
-/**
- * A typed monthly plan fee, checked by the host's rule before the round trip: dollars from 0 to
- * 100,000 with at most two decimals. A leading "$" and a comma decimal separator are tolerated.
- */
 export function parsePlanUsd(text: string): { ok: true; value: number } | { ok: false; error: string } {
-  // One comma is a decimal separator, as some keyboards type it; thousands grouping is refused rather than guessed.
   const stripped = text.trim().replace(/^\$/, "");
   if ((stripped.match(/,/g)?.length ?? 0) > 1 || (stripped.includes(",") && stripped.includes("."))) return { ok: false, error: "One comma or dot for cents" };
   const raw = stripped.replace(",", ".");
@@ -88,7 +73,6 @@ export function compactTokens(n: number): string {
   return String(n);
 }
 
-/** Day strings are local calendar dates; parsing them through `new Date(string)` would shift them to UTC. */
 function localDate(date: string) {
   const [year, month, day] = date.slice(0, 10).split("-").map(Number);
   return new Date(year!, (month ?? 1) - 1, day ?? 1);
@@ -96,15 +80,9 @@ function localDate(date: string) {
 export function monthName(start: string): string { return localDate(start).toLocaleDateString([], { month: "long" }); }
 export function shortDay(date: string): string { return localDate(date).toLocaleDateString([], { month: "short", day: "numeric" }); }
 
-/** The shared account palette, in slot order; every client draws the same account in the same hue. */
 export const ACCOUNT_PALETTE = ["#3987E5", "#C98500", "#9085E9", "#199E70", "#D95926"] as const;
 export const OTHER_COLOR = "#8f978f";
 const KNOWN_COLORS: Record<string, string> = { deepseek: "#3987E5", meta: "#C98500", claude: "#9085E9", codex: "#199E70" };
-/**
- * Colour follows the account, never its position in one screen's list. Known accounts keep their
- * hue; any other account takes, in sorted id order, a slot no known account present is using, and
- * muted once the slots run out. A project showing only Meta draws it as the overview does.
- */
 export function accountColors(accounts: string[]): Record<string, string> {
   const taken = new Set(accounts.map(account => KNOWN_COLORS[account]).filter(Boolean));
   const free = ACCOUNT_PALETTE.filter(color => !taken.has(color));

@@ -24,7 +24,6 @@ const LIMITS = [
 ] as const;
 type LimitKey = (typeof LIMITS)[number]["key"];
 
-/** Starts a product goal. Starting it authorizes work within the scope and limits given here. */
 export function GoalCreate({ connection }: { connection: Connection }) {
   const router = useRouter();
   const keyboardPadding = useKeyboardPadding();
@@ -33,7 +32,6 @@ export function GoalCreate({ connection }: { connection: Connection }) {
   const pending = creation.pending;
   const { data: me, online, stale, refresh } = usePoll(() => api<Me>(connection, "/me"), 5000, [connection]);
   const projects = me?.projects ?? [];
-  // Older hosts lack /project-groups; the poll then stays null and the host project chips remain.
   const { data: groupList } = usePoll(() => api<ProjectGroupList>(connection, "/project-groups"), 5000, [connection]);
   const groups = groupList ? visibleGroups(groupList.groups) : null;
   const [project, setProject] = useState(pending?.projectId);
@@ -50,7 +48,6 @@ export function GoalCreate({ connection }: { connection: Connection }) {
   const [error, setError] = useState("");
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
-  // A send started before this screen remounted is still in flight; its result re-renders through the store.
   const busy = sending || Boolean(pending && inFlight.has(pending.requestId));
   const selectedGroup = groups && project ? groupContaining(pending ? groupList!.groups : groups, project) : undefined;
   const firstGroup = groups?.find(group => preferredCheckout(group)?.teamReady) ?? groups?.[0];
@@ -68,7 +65,6 @@ export function GoalCreate({ connection }: { connection: Connection }) {
     setError("");
     let request = pending;
     setRetrying(Boolean(pending));
-    // A retry resends the recorded request even if this host's settings have changed since.
     if (!request) {
       if (!projectId) return;
       const values = Object.fromEntries(LIMITS.map(limit => [limit.key, Number(limits[limit.key])])) as Record<LimitKey, number>;

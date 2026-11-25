@@ -28,14 +28,9 @@ import { decisionLogAvailable } from "../permissions/model";
 export type InboxView = "sessions" | "teams" | "goals";
 
 const GROUP_KIND: Record<InboxGroup, StatusKind> = { "Needs you": "attention", Working: "progress", Finished: "review", Exited: "stopped", Archived: "backlog" };
-/** Closed records start folded so live work stays on the first screen. */
 const FOLDED: InboxGroup[] = ["Exited", "Archived"];
 const machineName = (connection: Connection) => connection.label || new URL(connection.url).host;
 
-/**
- * The machine's work in one place. The active machine's name opens a sheet to switch, add or remove
- * machines; Sessions, Teams and Goals sit in a floating capsule above the list.
- */
 export function Inbox({
   connection,
   machines,
@@ -72,7 +67,6 @@ export function Inbox({
           b.createdAt.localeCompare(a.createdAt),
         ),
         me,
-        // Ages advance with each poll instead of reading the clock while rendering.
         at: Date.now(),
       };
     },
@@ -82,11 +76,8 @@ export function Inbox({
       return { ...previous, sessions: [...list.sessions].sort((a, b) => b.createdAt.localeCompare(a.createdAt)), at: Date.now() };
     },
   });
-  // Hosts that predate teams advertise no `teams` field and have no team routes to poll.
   const hasTeams = Boolean(data?.me.teams), hasGoals = Boolean(data?.me.goals);
-  // Only the visible tab polls quickly; the others refresh their counts slowly.
   const focused = useIsFocused();
-  // A quiet list is not sent again for a minute, so a visible Inbox also reads the clock to move its ages on.
   const clock = useClock(15_000, focused);
   const pace = (tab: InboxView) => focused && view === tab ? 4000 : 20000;
   const teamsPoll = useLive<TeamListItem[] | null>(connection, {
@@ -102,7 +93,6 @@ export function Inbox({
   const refreshAll = () => { refresh(); teamsPoll.refresh(); goalsPoll.refresh(); };
   const runs = shown === "goals" ? goalsPoll : teamsPoll;
   const all = data?.sessions ?? [];
-  // Team agents are the coordinator's to steer; they appear under their team and in search.
   const sessions = all.filter(session => !session.team);
   const teamAgents = all.length - sessions.length;
   const now = Math.max(data?.at ?? 0, clock);

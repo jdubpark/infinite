@@ -9,7 +9,6 @@ type LiveSession = { state: unknown; events: Page };
 type SignalSnapshot = { id: string; events: SignalEvent[]; exited: boolean };
 const emptySnapshot = (id: string): SignalSnapshot => ({ id, events: [], exited: false });
 
-/** Signal history follows the session stream and resumes after its last received event cursor. */
 export function useSignals(connection: Connection, id: string): { events: SignalEvent[]; loading: boolean } {
   const cursor = useRef<{ id: string; value: number }>({ id, value: 0 });
   const snapshot = useRef<SignalSnapshot | null>(null);

@@ -3,19 +3,16 @@ import type { Basis, Inline, RichNode } from "@infinite/remote";
 import { BasisLabel } from "./BasisLabel";
 import { styles } from "./styles";
 
-/** Opens https links only; anything else stays as plain text. */
 export function safeOpen(url: string) {
   try {
     const parsed = new URL(url);
     if (parsed.protocol === "https:" && !parsed.username && !parsed.password) void Linking.openURL(parsed.toString());
   } catch {
-    /* malformed links remain text-only */
   }
 }
 
 const HEADING_SIZE = { 1: 20, 2: 17, 3: 15, 4: 14 } as const;
 
-/** Shared-parser rich text rendered with native Text runs. `basis` labels the whole passage. */
 export function RichText({ nodes, basis, compact = false }: { nodes: RichNode[]; basis?: Basis; compact?: boolean }) {
   return <View style={styles.stack}>
     {basis ? <BasisLabel basis={basis} /> : null}

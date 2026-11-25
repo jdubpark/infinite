@@ -409,14 +409,16 @@ test("a superseding verdict replaces latest only where it names the superseded v
   const first = verdictRecord(start, composeVerdict(input({ record: start, receipts: [receipt("c1", "pass")] })), META);
   assert.notEqual(first, "log-full");
   if (first === "log-full") return;
-  // A later verdict of another id takes over c1 only; c2 keeps the first verdict.
-  const later = verdictRecord(first, composeVerdict(input({ record: first, receipts: [receipt("c1", "fail")] })), { ...META, verdictId: SECOND });
+  // A later verdict of another id covers c1 only; c2 keeps the first verdict.
+  const partial = composeVerdict(input({ record: first, receipts: [receipt("c1", "fail")] }));
+  const later = verdictRecord(first, { ...partial, criteria: partial.criteria.filter(item => item.id === "c1") }, { ...META, verdictId: SECOND });
   assert.notEqual(later, "log-full");
   if (later === "log-full") return;
   const latestOf = (item: ObjectiveRecord, id: string) => item.criteria.find(entry => entry.id === id)?.latest?.verdictId;
-  assert.equal(latestOf(later, "c2"), SECOND);
-  // The superseding verdict of the first id writes c1 nowhere it was replaced, and c2 where it is still current.
-  const mixed = { ...later, criteria: later.criteria.map(entry => (entry.id === "c2" ? { ...entry, latest: { state: "inconclusive" as const, verdictId: VERDICT } } : entry)) };
+  assert.equal(latestOf(later, "c1"), SECOND);
+  assert.equal(latestOf(later, "c2"), VERDICT);
+  // The superseding verdict of the first id writes c2, where it is still current, and not c1.
+  const mixed = later;
   const composed = composeVerdict(input({ record: mixed, facts: { delivery: "landed" }, receipts: [receipt("c1", "pass")] }));
   const superseding = verdictRecord(mixed, composed, { ...META, verdictId: THIRD, supersedes: VERDICT });
   assert.notEqual(superseding, "log-full");
@@ -432,8 +434,8 @@ test("a superseding verdict replaces latest only where it names the superseded v
   assert.equal(objectiveRecordSchema.safeParse(empty).success, true);
   // Every version replays.
   for (let version = 1; version <= empty.version; version += 1) assert.equal(rebuildVersion(empty, version).version, version);
-  assert.equal(rebuildVersion(empty, later.version).criteria.find(entry => entry.id === "c2")?.latest?.verdictId, SECOND);
-  assert.equal(rebuildVersion(empty, first.version).criteria.find(entry => entry.id === "c2")?.latest?.verdictId, VERDICT);
+  assert.equal(latestOf(rebuildVersion(empty, later.version), "c1"), SECOND);
+  assert.equal(latestOf(rebuildVersion(empty, first.version), "c1"), VERDICT);
 });
 
 test("a delivery receipt never records an evaluator contradiction", () => {

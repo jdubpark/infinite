@@ -4,7 +4,7 @@ import { canonicalBytes } from "./objective-types.js";
 import type { Criterion, LogEntry, ObjectiveRecord } from "./objective-types.js";
 import { nextSeq, sealRecord } from "./objective-write.js";
 import type { TeamCommand } from "./team-types.js";
-import type { AssessedState, ComposedState, CriterionReason, VerdictCounts, VerdictReason, VerdictReport } from "./verdict-types.js";
+import type { AssessedState, ComposedState, CriterionReason, DeliveryFact, VerdictCounts, VerdictReason, VerdictReport } from "./verdict-types.js";
 import { VERDICT_LIMITS } from "./verdict-types.js";
 
 /** A verdict writes only while the log stays within these bounds; otherwise the record write is skipped. */
@@ -18,7 +18,7 @@ export type ComposeInput = {
   /** Step 4's receipts at `head`; undefined when no pass ran there. */
   receipts?: readonly ObjectiveReceipt[];
   /** Host facts at `head`; undefined when the host cannot tell. */
-  facts: { checksPassed?: boolean; reviewApproved?: boolean };
+  facts: { checksPassed?: boolean; reviewApproved?: boolean; delivery?: DeliveryFact };
   changedPaths: { paths: readonly string[]; truncated: boolean };
   /** The evaluator's screened report; absent when no evaluator answered, with `reason`. */
   report?: VerdictReport;
@@ -67,6 +67,12 @@ export function resolveHandle(handle: string, input: Pick<ComposeInput, "receipt
 
 type Judged = { state: ComposedState; reason?: CriterionReason; receipt?: ComposedCriterion["receipt"] };
 
+/** The receipt kind of a delivery criterion; undefined for every other criterion. */
+export function deliveryReceiptOf(criterion: Criterion): "merged" | "landed" | undefined {
+  const check = criterion.check;
+  return check.kind === "receipt" && (check.receipt === "merged" || check.receipt === "landed") ? check.receipt : undefined;
+}
+
 function judgeHost(criterion: Criterion, input: ComposeInput): Judged {
   const check = criterion.check;
   if (check.kind === "command" || check.kind === "artifact") {
@@ -78,7 +84,11 @@ function judgeHost(criterion: Criterion, input: ComposeInput): Judged {
     return { state: "inconclusive", reason: "receipt-unknown", receipt };
   }
   if (check.kind === "receipt") {
-    if (check.receipt === "merged" || check.receipt === "landed") return { state: "inconclusive", reason: "before-delivery" };
+    if (check.receipt === "merged" || check.receipt === "landed") {
+      const delivery = input.facts.delivery;
+      if (delivery === undefined || delivery === "none") return { state: "inconclusive", reason: "before-delivery" };
+      return { state: check.receipt === "landed" && delivery === "reverted" ? "not-met" : "met" };
+    }
     const fact = check.receipt === "checks-passed" ? input.facts.checksPassed : input.facts.reviewApproved;
     if (fact === undefined) return { state: "inconclusive", reason: "no-receipt" };
     return { state: fact ? "met" : "not-met" };
@@ -161,7 +171,7 @@ export function composeVerdict(input: ComposeInput): ComposedVerdict {
       if (entry.note !== undefined) composed.note = entry.note;
     }
     // Rule 2: the host state stands; the report's opposite is recorded. An evaluator `inconclusive` is no contradiction.
-    if (criterion.producer === "host" && entry !== undefined) {
+    if (criterion.producer === "host" && entry !== undefined && deliveryReceiptOf(criterion) === undefined) {
       const hostState = judged.state;
       if ((hostState === "met" && entry.state === "not-met") || (hostState === "not-met" && entry.state === "met")) composed.contradicted = true;
     }
@@ -187,7 +197,7 @@ export function composeVerdict(input: ComposeInput): ComposedVerdict {
   return verdict;
 }
 
-type Meta = { verdictId: string; kind: "reviewed" | "no-change"; revision: number; head: string; at: string };
+type Meta = { verdictId: string; kind: "reviewed" | "no-change"; revision: number; head: string; at: string; supersedes?: string };
 
 /** `latest` on every active criterion and the log entries, sealed at one version with sealRecord; "log-full" when the entries
  *  would pass 300 log entries or 160 KiB. Never writes a note. */
@@ -200,6 +210,7 @@ export function verdictRecord(record: ObjectiveRecord, verdict: ComposedVerdict,
   for (const item of verdict.criteria) {
     const current = record.criteria.find(candidate => candidate.id === item.id);
     if (current === undefined || !activeIds.has(item.id)) continue;
+    if (meta.supersedes !== undefined && current.latest?.verdictId !== meta.supersedes) continue;
     before[item.id] = current.latest === undefined ? null : { state: current.latest.state, verdictId: current.latest.verdictId };
     after[item.id] = { state: item.state, verdictId: meta.verdictId };
   }

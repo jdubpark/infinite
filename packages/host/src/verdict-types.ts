@@ -7,6 +7,9 @@ export const VERDICT_LIMITS = { criteria: 8, handles: 8, handleChars: 400, noteB
 const L = VERDICT_LIMITS;
 const byteLength = (value: string): number => Buffer.byteLength(value, "utf8");
 
+/** What the outcome ledger shows for one run at one head. */
+export type DeliveryFact = "none" | "landed" | "reverted";
+
 export type AssessedState = "met" | "not-met" | "inconclusive";
 export type ComposedState = AssessedState | "pending-owner";
 

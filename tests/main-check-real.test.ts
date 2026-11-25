@@ -6,16 +6,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { MainCheckService, type MainCheckPorts, type MainCheckView } from "../packages/host/src/main-check.js";
-import { recordDirectory, recordScope } from "../packages/host/src/main-check-ports.js";
+import { defaultMainCheckPorts, recordDirectory, recordScope } from "../packages/host/src/main-check-ports.js";
 import { checksDigest, type MainCheckRecord } from "../packages/host/src/main-check-state.js";
 import { bootId } from "../packages/host/src/process-census.js";
 import type { TeamCommand, TeamProject } from "../packages/host/src/team-types.js";
 import { teamCommand } from "../packages/host/src/team-workspace.js";
 import type { Config } from "../packages/host/src/types.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
-import { censusPast, earlierProcesses } from "./main-check-earlier.js";
-
-const PROCESSES = censusPast(await earlierProcesses());
+import { anchorSeeded } from "./main-check-earlier.js";
 
 const KEY = Buffer.alloc(32, 7);
 const WAIT_MS = 20_000;
@@ -81,7 +79,7 @@ class Sandbox {
   async start(ports?: Partial<MainCheckPorts>) {
     this.service = new MainCheckService({
       config: this.config, key: KEY, mirrorPath: () => this.mirror,
-      halt: { check: () => ({ state: this.halted ? "halted" : "clear" }) }, hostLoad: { held: () => undefined }, ports: { processes: PROCESSES, ...ports },
+      halt: { check: () => ({ state: this.halted ? "halted" : "clear" }) }, hostLoad: { held: () => undefined }, ports,
     });
     await this.service.start();
     return this.service;
@@ -103,6 +101,10 @@ class Sandbox {
 
   seed(projectId: string, record: MainCheckRecord) {
     writeSealed(join(recordDirectory(this.config), `${projectId}.sealed`), KEY, recordScope(projectId), record);
+  }
+
+  anchor(projectId: string, directory: string) {
+    return anchorSeeded(defaultMainCheckPorts({ config: this.config, key: KEY, halt: { check: () => ({ state: "clear" }) }, hostLoad: { held: () => undefined } }).anchors, projectId, directory);
   }
 
   async until(what: string, ready: () => boolean, drive?: string) {
@@ -271,6 +273,7 @@ test("f. entries whose directories never existed leave retiring, with no team ro
       running: runningEntry(sandbox, "alpha-2026-11-20-main-check-0000f00d", "an-earlier-boot", true),
       retiring: [{ directory: "alpha-2026-11-20-main-check-0000beef", root: sandbox.teams, witness: { boot: bootId(), processes: [], sessions: [], groups: [] } }],
     });
+    await sandbox.anchor("alpha", "alpha-2026-11-20-main-check-0000beef");
     await sandbox.start();
     assert.equal(sandbox.view().retiring, 2, "R8 moved running to retiring");
     await sandbox.until("retirement", () => sandbox.view().retiring === 0);
@@ -293,6 +296,7 @@ test("g. host start with running and a real directory: retired without recording
   try {
     prepare(plain);
     plain.seed("alpha", { version: 1, attempts: [{ head: plain.head, checks: plain.digest, count: 1 }], running: runningEntry(plain, directory, bootId(), false) });
+    await plain.anchor("alpha", directory);
     await plain.start();
     await plain.until("retirement", () => plain.view().retiring === 0);
     assert.deepEqual(plain.runDirectories(), []);
@@ -305,6 +309,7 @@ test("g. host start with running and a real directory: retired without recording
   try {
     prepare(recording);
     recording.seed("alpha", { version: 1, attempts: [{ head: recording.head, checks: recording.digest, count: 1 }], running: runningEntry(recording, directory, bootId(), true) });
+    await recording.anchor("alpha", directory);
     await recording.start();
     recording.fetch("beta");
     await recording.until("both projects waiting", () => recording.view("alpha").waiting === "processes" && recording.service!.view("beta")?.readable === true && recording.view("beta").waiting === "another-check");

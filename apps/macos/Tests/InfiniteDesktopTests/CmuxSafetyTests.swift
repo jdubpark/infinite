@@ -825,8 +825,12 @@ private actor CmuxFakeBackend {
         model.activeID = "p1"
         model.setDisplayVisible(true)
         await model.connect()
-        try await Task.sleep(for: .milliseconds(50))
-        model.rendererRestored(model.rendererGeneration)
+        let snapshotDeadline = Date().addingTimeInterval(2)
+        while !model.snapshotReady && Date() < snapshotDeadline {
+            model.rendererRestored(model.rendererGeneration)
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(model.snapshotReady)
         model.setInputEnabled(true)
         model.setDraft("exit mid-paste")
 
@@ -836,7 +840,10 @@ private actor CmuxFakeBackend {
         XCTAssertTrue(model.sending)
 
         await fake.emit("term-1", .exited)
-        try await Task.sleep(for: .milliseconds(50))
+        let detachDeadline = Date().addingTimeInterval(2)
+        while model.attached && Date() < detachDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
         XCTAssertFalse(model.attached)
 
         await pasteGate.succeed(())
@@ -845,6 +852,67 @@ private actor CmuxFakeBackend {
         XCTAssertEqual(model.operation, .idle)
         XCTAssertFalse(model.busy)
         XCTAssertFalse(model.sending)
+    }
+
+    func testSendClearsBusyOperationImmediatelyWhenRendererFailsDuringPaste() async throws {
+        let fake = CmuxFakeBackend()
+        let pasteGate = CmuxDeferred<Void>()
+        let deps = CmuxViewModelDependencies(
+            helperURL: { URL(fileURLWithPath: "/nonexistent/cmux") },
+            connect: { _, _, _, _, _ in },
+            snapshot: { await fake.snapshot() },
+            attach: { id, handler in
+                await fake.setOutput(id, handler)
+                handler(.snapshot(Data("ok".utf8), columns: 80, rows: 24))
+            },
+            detach: {},
+            disconnect: {},
+            paste: { text in
+                await fake.recordPaste(text)
+                try await pasteGate.wait()
+                return .queued
+            },
+            send: { data in
+                await fake.recordSend(data)
+                return .queued
+            },
+            resize: { _, _ in },
+            createTerminal: { _, _, _, _ in "term-created" },
+            closeTerminal: { _, _ in },
+            readDraft: { await fake.read($0) },
+            saveDraft: { draft, key in await fake.save(draft, key: key) },
+            acquireMutation: { key, text in await fake.acquireMutation(key, text: text) },
+            clearDraftIfMatching: { id, key in await fake.clearIfMatching(id, key: key) }
+        )
+
+        let model = CmuxViewModel(deps: deps)
+        model.profiles = [CmuxHostProfile(id: "p1", label: "Host", route: "wss://cmux.example/v1/link")]
+        model.activeID = "p1"
+        model.setDisplayVisible(true)
+        await model.connect()
+        let snapshotDeadline = Date().addingTimeInterval(2)
+        while !model.snapshotReady && Date() < snapshotDeadline {
+            model.rendererRestored(model.rendererGeneration)
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(model.snapshotReady)
+        model.setInputEnabled(true)
+        model.setDraft("renderer fail mid-paste")
+
+        let sendTask = Task { await model.send() }
+        await pasteGate.waitUntilEntered()
+        XCTAssertTrue(model.busy)
+        XCTAssertTrue(model.sending)
+
+        model.rendererFailed("WebView crashed")
+        XCTAssertFalse(model.attached)
+        XCTAssertEqual(model.operation, .idle)
+        XCTAssertFalse(model.busy)
+        XCTAssertFalse(model.sending)
+
+        await pasteGate.succeed(())
+        await sendTask.value
+        XCTAssertEqual(model.operation, .idle)
     }
 
     func testDisconnectStaysDisconnectedWhenBackendCleanupFailsAfterTeardownStarts() async throws {

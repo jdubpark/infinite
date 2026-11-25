@@ -172,7 +172,7 @@ enum CmuxAttachmentState {
 enum CmuxOperation: Equatable {
     case idle
     case attaching(UUID)
-    case sending(UUID)
+    case sending(attachment: UUID, token: UUID)
     case mutating
 }
 

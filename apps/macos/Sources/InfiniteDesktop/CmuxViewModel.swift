@@ -346,9 +346,9 @@ import InfiniteCore
             draftEditingLocked = false
             inputFenced = false
         }
-        if let currentGen, operation == .attaching(currentGen) || operation == .sending(currentGen) {
+        if case .attaching = operation {
             operation = .idle
-        } else if case .attaching = operation {
+        } else if let currentGen, case .sending(attachment: currentGen, _) = operation {
             operation = .idle
         }
         rawDrainGeneration = nil; queuedInput.removeAll()
@@ -431,8 +431,8 @@ import InfiniteCore
         let connection = connectionGeneration, input = inputGeneration, profileID = attachmentState.attachedProfileID
         let sendToken = UUID()
         let current = { self.connectionGeneration == connection && self.attachmentState.generation == attachment && self.inputGeneration == input && !self.inputFenced && !self.disconnecting && self.attachmentState.attachedProfileID == profileID && self.selectedID == terminalID && self.draftIdentity == identity }
-        operation = .sending(sendToken)
-        defer { if self.operation == .sending(sendToken) { self.operation = .idle } }
+        operation = .sending(attachment: attachment, token: sendToken)
+        defer { if case .sending(_, token: sendToken) = self.operation { self.operation = .idle } }
         let requestID = UUID().uuidString, text = draft.text, previousPending = draft.pending
         draft.pending = PendingSend(id: requestID, text: text); draftVersion += 1
         do { try await saveRecord(draft, identity: identity) }

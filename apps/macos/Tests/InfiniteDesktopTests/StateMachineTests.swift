@@ -39,20 +39,44 @@ private actor StateMachineDeferred<Value: Sendable> {
 
 private actor ControlCallTracker {
     var releasedIDs: [String] = []
-    private var releaseWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var releaseWaiters: [(id: UUID, target: Int, continuation: CheckedContinuation<Bool, Never>)] = []
 
     func recordRelease(_ id: String) {
         releasedIDs.append(id)
-        var remaining: [(Int, CheckedContinuation<Void, Never>)] = []
-        for (target, waiter) in releaseWaiters {
-            if releasedIDs.count >= target { waiter.resume() } else { remaining.append((target, waiter)) }
+        var remaining: [(id: UUID, target: Int, continuation: CheckedContinuation<Bool, Never>)] = []
+        for waiter in releaseWaiters {
+            if releasedIDs.count >= waiter.target {
+                waiter.continuation.resume(returning: true)
+            } else {
+                remaining.append(waiter)
+            }
         }
         releaseWaiters = remaining
     }
 
-    func waitForReleaseCount(_ target: Int) async {
-        if releasedIDs.count >= target { return }
-        await withCheckedContinuation { releaseWaiters.append((target, $0)) }
+    private func expireWaiter(_ id: UUID) {
+        if let idx = releaseWaiters.firstIndex(where: { $0.id == id }) {
+            let waiter = releaseWaiters.remove(at: idx)
+            waiter.continuation.resume(returning: releasedIDs.count >= waiter.target)
+        }
+    }
+
+    func waitForReleaseCount(_ target: Int, timeout: Duration = .seconds(2)) async -> Bool {
+        if releasedIDs.count >= target { return true }
+        let waiterID = UUID()
+        let timeoutTask = Task {
+            try? await Task.sleep(for: timeout)
+            self.expireWaiter(waiterID)
+        }
+        let satisfied = await withCheckedContinuation { continuation in
+            if releasedIDs.count >= target {
+                continuation.resume(returning: true)
+            } else {
+                releaseWaiters.append((id: waiterID, target: target, continuation: continuation))
+            }
+        }
+        timeoutTask.cancel()
+        return satisfied
     }
 }
 
@@ -263,7 +287,8 @@ private actor ControlCallTracker {
         XCTAssertNil(releasedModel.otherHolder)
         await claimGate1.succeed(grantResponse)
         await claimForRelease.value
-        await tracker1.waitForReleaseCount(1)
+        let released1 = await tracker1.waitForReleaseCount(1)
+        XCTAssertTrue(released1, "Expected superseded lease to be released within timeout")
         let releasedOnRelease = await tracker1.releasedIDs
         XCTAssertEqual(releasedOnRelease, ["stale-lease"])
         guard case .unheld(let postClaim) = releasedModel.controlState else {
@@ -308,7 +333,8 @@ private actor ControlCallTracker {
         XCTAssertEqual(afterDetach, "Alice")
         await claimGate2.succeed(grantResponse)
         await claimForDetach.value
-        await tracker2.waitForReleaseCount(1)
+        let released2 = await tracker2.waitForReleaseCount(1)
+        XCTAssertTrue(released2, "Expected detached superseded lease to be released within timeout")
         let releasedOnDetach = await tracker2.releasedIDs
         XCTAssertEqual(releasedOnDetach, ["stale-lease"])
         guard case .unheld = detachedModel.controlState else {

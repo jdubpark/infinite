@@ -74,3 +74,13 @@ These checks used local provider and repository fixtures. Unobserved worker tran
 ## Verification at integration
 
 At code commit `6112b518` on main baseline `35ccee62`, `npm run check` passed on Node 22. The two test phases reported 4,694 passing, 30 skipped and zero failures. Size checks, typechecking and the host and web builds passed. On Debian with Node 22, the 55 focused regressions and all eight simulator cases passed from a Git archive of that commit. An authenticated Linux viewer CLI also observed the running coordinator, resumed child observations and recovered the current snapshot after an API restart. These checks used fixture providers and a disposable host.
+
+## Polling several missions in a fixed order
+
+On November 25, the pilot merged into main at `67a5a94f`. A local client then called the mission progress HTTP endpoint 64 times. It polled eight missions in the same order for eight rounds, allowing each response to finish before starting the next. Each mission had one coordinator and two child teams with four running workers each. Fixture sessions supplied the worker states.
+
+The endpoint directly observed 56 of the 64 child workers. It missed the same worker in each mission on all eight rounds. One host-wide counter rotated the candidates for every read. Eight intervening steps returned the next read of each mission to its original position among eight candidates. The eight-probe host cap left seven places for children after the coordinator took one.
+
+With the sampling position stored in each mission's bounded history, the same requests observed all 64 workers. The position advances past the children whose probes were admitted. In a second fixture with 16 child workers on one mission, three reads reached 16 distinct workers, up from nine. Both workloads peaked at eight concurrent worker reads before and after the fix.
+
+When another mission occupied all eight slots, the endpoint returned `not-sampled` for every child. Across 56 such pages interleaved with eight reads at available capacity, all eight children were eventually observed. An authenticated viewer CLI on a disposable host also resumed child progress and recovered its current snapshot after an API restart. The multi-mission regression runs with `node --import tsx --test tests/mission-progress.test.ts`. These results measure worker visibility on one host.

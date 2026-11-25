@@ -1,10 +1,10 @@
 # Agent runtimes and accountable autonomous work
 
-**Implementation update, November 24, 2026.** A local Infinite branch now exposes resumable mission progress, requires new goal plans to identify which pinned criteria their tasks advance, and holds automatic merges when the checked commit lacks independent model-family review. In a controlled child failure, the observer saw the worker exit and the scheduler started exactly one recovery planner. The cross-repository comparison below describes the research baselines. [Pilot evidence and limits](operations.md#implementation-pilot).
+**Implementation update, November 25, 2026.** The pilot merged into Infinite main at `67a5a94f`. New goal plans name the pinned criteria their tasks advance, mission clients can resume child progress, and automatic delivery holds a checked commit that lacks independent model-family review. In a controlled child failure, the observer saw the worker exit and the scheduler started exactly one recovery planner. The comparison below describes the research baselines. [Pilot evidence and limits](operations.md#implementation-pilot).
 
 **Pilot a resumable child-progress feed on one Infinite mission, including the case where the child disappears.** Paseo remembers which parent asked to hear from a child. Herdr tells an observer when it has missed events. Combine those two ideas so a returning coordinator can find an assigned child's latest report and check result. If the child becomes unreachable, the host must distinguish a lost observer from a dead or fenced worker before assigning replacement work. Measure recovery time and polling cost together.
 
-Two prerequisites matter more than increasing worker count. Infinite's checked-in launch fuse counts starts. Its spend display can show incomplete costs. Its delivery path checks a reviewed head, but the inspected gate does not establish independent review across every contributing model family. Close those gaps before expanding automatic delivery or metered fan-out.
+The initial study identified two gaps before expanding paid execution. The launch fuse counted starts and the spend display could show incomplete costs. The delivery path checked a reviewed head without establishing independence from every contributing model family. The merged pilot addresses the review gap. Spend per checked result remains unmeasured.
 
 The three source studies trace normal operation and failure. A second research pass checks specific operational claims against current main and resolves four design decisions. [Herdr](herdr.md) · [Paseo](paseo.md) · [Infinite](infinite.md) · [Operational findings and design decisions](operations.md).
 
@@ -69,7 +69,7 @@ Report the share of eligible cycles that reach a checked disposition without a h
 
 ## What was verified
 
-At the pinned revisions, 80 Infinite checks passed in the initial study, including the 50-seed crash simulator. The operational follow-up added 27 passing cases. Herdr passed 45 Rust and 13 manifest tests across both passes. Paseo passed 239 tests across eight suites. A separate Infinite probe confirmed that lineup validation and routing admit different writer and reviewer models from the same family. The source notes contain commands and coverage. An independent review traced the main findings back to the pinned implementations. Cross-host production throughput, live-provider recovery, a real merge, and product impact remain open.
+At the pinned revisions, 80 Infinite checks passed in the initial study, including the 50-seed crash simulator. The operational follow-up added 27 passing cases. Herdr passed 45 Rust and 13 manifest tests across both passes. Paseo passed 239 tests across eight suites. A separate Infinite probe confirmed that lineup validation and routing admit different writer and reviewer models from the same family. The source notes contain commands and coverage. An independent review traced the main findings back to the pinned implementations. Cross-host production throughput, live-provider recovery, a host-executed automatic GitHub merge and product impact remain unmeasured.
 
 ## Research ledger
 
@@ -82,6 +82,7 @@ At the pinned revisions, 80 Infinite checks passed in the initial study, includi
 | 2026-11-24, second pass | Same three source pins. Herdr release `v0.9.5` resolved separately. | Added tested restart and dead-worker distinctions. Existing intake, PR steering and retention replace several proposed greenfield features. Prioritize safe child reconciliation and role-specific clone cost. [Evidence and decisions](operations.md). |
 | 2026-11-24, implementation pilot | Infinite main advanced from `64956f4204cf` to `483d8371cfe7` | In the same local provider fixture, main started one delivery agent after a same-family review and recorded its merge report. The pilot started zero and retained the checked head for review. A paired viewer CLI recovered current child progress after an API restart. [Pilot evidence and limits](operations.md#implementation-pilot). |
 | 2026-11-24, integration | Pilot updated onto Infinite main `35ccee62eda9` | A hundred concurrent observers of one mission shared one worker probe. Across 100 distinct missions, eight probes ran and all 92 unsampled missions recovered on individually retried reads. The workload measures observation under contention. [Method and results](operations.md#implementation-pilot). |
+| 2026-11-25, pilot merge and follow-up | Merged pilot `67a5a94f`, follow-up implementation `687ba784` | In eight fixed polling rounds across eight missions, the progress endpoint observed 56 of 64 workers with one shared rotation and all 64 with a position per mission. Both runs peaked at eight simultaneous worker reads. [Method and results](operations.md#polling-several-missions-in-a-fixed-order). |
 
 ## Updating this study
 

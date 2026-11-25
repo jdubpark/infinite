@@ -124,6 +124,11 @@ check receipts. A recorded assignment and a sampled worker status have separate
 fields. An unavailable worker keeps its assignment until the host can establish
 what happened.
 
+The host allows eight simultaneous worker probes across all progress readers.
+A child marked `not-sampled` has no new liveness reading on that page. Each
+retained mission rotates through its eligible children as probe slots become
+available. Polling other missions leaves its place in that rotation intact.
+
 `infinite mission progress ID --after CURSOR --json` reads
 `GET /api/missions/:id/progress?cursor=CURSOR`. Save the returned `cursor`
 after processing the page. On reconnect, consume the retained observations in

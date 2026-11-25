@@ -155,7 +155,10 @@ try:
     size = int.from_bytes(header, "big")
     if size <= 0 or size > 1073741824:
         raise RuntimeError("invalid verification frame size")
-    with tempfile.TemporaryDirectory(prefix="iv-", dir="/tmp") as root:
+    with (
+        tempfile.TemporaryDirectory(prefix="iv-", dir="/tmp") as root,
+        tempfile.TemporaryDirectory(prefix=".iv-", dir=pathlib.Path.home()) as private_home,
+    ):
         base = pathlib.Path(root)
         payload_path = base / "payload.tar.gz"
         with payload_path.open("wb") as output:
@@ -182,6 +185,7 @@ try:
         token = secrets.token_hex(16)
         run_id = "iv-" + token
         env["INFINITE_CHECK_RUN_ID"] = run_id
+        env["INFINITE_CHECK_HOME"] = private_home
         systemd = systemd_probe(token, base, env)
         try:
             if systemd:

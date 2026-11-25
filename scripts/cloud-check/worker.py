@@ -426,8 +426,7 @@ def main() -> int:
         RUN_DIR = PAYLOAD / "j"
         RUN_DIR.mkdir(mode=0o700)
         run_id = os.environ["INFINITE_CHECK_RUN_ID"]
-        home = RUN_DIR / "h"
-        home.mkdir(mode=0o700)
+        home = pathlib.Path(os.environ["INFINITE_CHECK_HOME"])
         temp = RUN_DIR / "x"
         temp.mkdir(mode=0o700)
         marker = RUN_DIR / "cloud-executor"

@@ -4,7 +4,7 @@ import { readdirSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
-const serialFiles = new Set(["continuity.test.ts", "laptop-service.test.ts", "summary.test.ts", "worker-attention.test.ts"]);
+const serialFiles = new Set(["client-cli.test.ts", "continuity.test.ts", "laptop-service.test.ts", "main-check-real.test.ts", "summary.test.ts", "worker-attention.test.ts"]);
 const testFiles = readdirSync(new URL("../tests/", import.meta.url))
   .filter((name) => name.endsWith(".test.ts"))
   .sort();

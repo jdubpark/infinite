@@ -114,7 +114,6 @@ test("a no-change cycle is held and released", () => {
   assert.equal(without.host.saves, 0);
 });
 
-/** A held no-change report on a cycle whose parent run (which made the head) has the given members, or is gone when `parent` is false. */
 function heldNoChange(parentMembers: (parent: TeamRun) => TeamMember[] | false) {
   const f = noChangeFixture();
   const parentRun = runOf({ id: PARENT, headCommit: BASE });

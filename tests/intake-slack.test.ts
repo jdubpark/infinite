@@ -24,7 +24,6 @@ const OWNER = "U00000000", TEAMMATE = "U00000002", BOT = "U00000001";
 const BINDING: IntakeThread = { channelId: "C0000000000", threadTs: "1700000000.000100" };
 const OTHER: IntakeThread = { channelId: "C0000000001", threadTs: "1700000000.000200" };
 const THIRD: IntakeThread = { channelId: "C0000000002", threadTs: "1700000000.000300" };
-/** A configured project path that no general path rule covers. */
 const PROJECT_PATH = "/data/instances/work/api";
 const ISSUE = randomUUID();
 const NOW = new Date().toISOString();
@@ -60,7 +59,6 @@ const collector = () => { const calls: LogLine[] = []; return { calls, log: (lin
 async function surfaceFor(services: Services, stateRoot: string, options: { bindByMention?: boolean; serverTeamId?: string; wrapClient?: (client: SlackClient) => SlackClient; log?: (line: string, error: unknown) => void;
   directRequests?: boolean; direct?: (store: IntakeStore) => DirectRequest } = {}) {
   const slack = await startSlackServer({ teamId: options.serverTeamId });
-  // Every bound thread has its root, as in Slack; the fake stores posts only into a thread it knows.
   for (const thread of [BINDING, OTHER]) slack.seedThread(thread, [{ user: OWNER, text: "Export fails on empty rows" }]);
   const realClient = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint, timeoutMs: 2000 });
   const client = options.wrapClient ? options.wrapClient(realClient) : realClient;
@@ -81,7 +79,6 @@ async function surfaceFor(services: Services, stateRoot: string, options: { bind
   };
 }
 
-/** Starts a mission whose subteam asks the owner a question, which the coordinator escalates to a mission decision. */
 async function questionFlow(h: Harness, missions: Services["missions"]) {
   const { id } = await missions.create(h.create(), undefined, origin(ISSUE));
   h.release("release-dispatch");
@@ -122,7 +119,6 @@ test("a question is posted with its number and options, and an option number ans
     const { id, decision } = await questionFlow(h, services.missions);
     s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start(); await s.connected();
-    // The coordinator's own recommendation is posted before the options, and its option is marked.
     const question = `**Q1: ${decision.question}**\n\nThe asking agent recommends: JSON. Reason: The subteam recommends it, and the web client parses JSON.\n\n1. JSON (recommended)\n2. Text\n\nChoose below, or reply with a mention and your answer.`;
     await waitFor(async () => s.texts(), list => list.includes(question));
     const questionPost = s.slack.posts(BINDING).find(post => post.text === question)!;
@@ -416,7 +412,6 @@ test("a redelivered event applies an entry that a failed store write left unhand
     s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start(); await s.connected();
     await waitFor(async () => s.texts(), list => list.length === 1);
-    // The write that marks an entry handled fails once per arming, after the entry's work was done.
     const update = s.store.update.bind(s.store);
     let armed = 0;
     s.store.update = (issueId, change) => update(issueId, draft => {
@@ -426,7 +421,6 @@ test("a redelivered event applies an entry that a failed store write left unhand
     });
     const handledAt = (index: number) => s.store.get(ISSUE)!.inbound[index]?.handledAt;
 
-    // A mission action: the steer reached the mission, and the entry stayed unhandled.
     const before = sh.get(id).revision;
     armed = 1;
     const steer = await s.slack.emit(mention("also cover the CSV export"));
@@ -440,7 +434,6 @@ test("a redelivered event applies an entry that a failed store write left unhand
     assert.equal(sh.get(id).revision, before + 1, "The steer advances the revision once");
     assert.equal(s.store.get(ISSUE)!.inbound[0].outcome, "steered");
 
-    // A reply: nothing was posted, and the redelivery posts it once.
     const posts = s.texts().length;
     armed = 1;
     const status = await s.slack.emit(mention("status"));
@@ -452,7 +445,6 @@ test("a redelivered event applies an entry that a failed store write left unhand
     await until(() => handledAt(1), handled => Boolean(handled), 10000);
     await waitFor(async () => s.texts(), list => list.length === posts + 1, 10000);
 
-    // A redelivery of a handled event still does nothing.
     await s.slack.redeliver(steer);
     await s.slack.redeliver(status);
     await delay(500);
@@ -480,7 +472,6 @@ test("a restart applies a stored reply once and finds its unconfirmed message in
   const h = harness(); const services = h.open(); const s = await surfaceFor(services, h.root);
   try {
     const { id } = await services.missions.create(h.create(), undefined, origin(ISSUE));
-    // The first post reached Slack, but the record never recorded it: the thread holds the message under its key.
     const posted = await s.client.post(BINDING, ACK, `${ISSUE}:ack`);
     s.store.create(intakeRecord(ISSUE, "started", {
       thread: BINDING, missionId: id,
@@ -504,7 +495,6 @@ test("an entry that reached the mission before a crash is applied once, with no 
       thread: BINDING, missionId: id,
       inbound: [{ eventId: "Ev-crash", ts: "1700000100.888888", text: "also cover the CSV export", receivedAt: NOW }],
     }));
-    // The crash: the mission took the reply at this revision, and the surface stopped before it marked the entry handled.
     const before = sh.get(id).revision;
     await sh.missions.steer(id, { requestId: deterministicUuid("intake-slack-event", "Ev-crash"), revision: before, text: "also cover the CSV export" }, "slack");
     s.store.update(ISSUE, record => { record.inbound[0].call = { action: "steer", text: "also cover the CSV export", revision: before }; });
@@ -632,7 +622,6 @@ test("binding by mention attaches a thread to an admitted record that has none",
   } finally { await s.close(); await h.close(); }
 });
 
-// Scripted-harness tests: the coordinator and subteams are scripted, so the mission reaches states real sessions cannot.
 const until = <T,>(read: () => T, accepts: (value: T) => boolean, timeout = 30000) => waitFor(async () => read(), accepts, timeout);
 const plan = (id: string, repoProjectId: string) =>
   ({ id, repoProjectId, title: `Subtask ${id}`, objective: `Do ${id}`, size: "solo" as const, parallelism: 1, dependsOn: [] as string[] });
@@ -693,7 +682,6 @@ test("a blocked mission posts its reason and the next step", { timeout: 90000 },
     const { id } = await sh.create();
     await sh.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
     const teamId = (await until(() => sh.get(id), mission => Boolean(teamOf(mission, "a")))).subtasks[0].teamId!;
-    // The subteam's blocked status wakes the coordinator for its next attempt.
     sh.set(teamId, { status: "blocked" });
     await sh.report(2, { kind: "blocked", summary: "The API repository is unavailable" });
     const blocked = await until(() => sh.get(id), mission => mission.status === "blocked");
@@ -732,7 +720,6 @@ test("with two questions open, Qn addresses one and plain text answers the oldes
     const apiTeam = teamOf(started, "a")!, webTeam = teamOf(started, "b")!;
     const now = new Date().toISOString();
     const first = randomUUID(), second = randomUUID();
-    // Each subteam asks; the coordinator escalates each question to an owner decision in its own attempt.
     sh.set(apiTeam, { status: "needs-input", decisions: [{ id: first, memberId: randomUUID(), revision: 1, question: "Skip empty rows?", options: ["Skip", "Write blanks"], createdAt: now }] });
     await sh.report(2, { kind: "question", question: "Skip empty rows?", options: ["Skip", "Write blanks"], subtaskId: "a", childDecisionId: first });
     await until(() => sh.get(id), mission => mission.status === "needs-input");
@@ -765,13 +752,11 @@ test("a plain-text answer that reached the mission is replayed as that answer, n
       thread: BINDING, missionId: id,
       inbound: [{ eventId: "Ev-answer", ts: "1700000100.777777", text: "skip them", receivedAt: NOW }],
     }));
-    // The crash: the answer reached the mission at this revision, and the surface stopped before marking the entry handled.
     const before = sh.get(id).revision;
     await sh.missions.answer(id, decisionId, { requestId: deterministicUuid("intake-slack-event", "Ev-answer"), revision: before, text: "skip them" }, "slack");
     s.store.update(ISSUE, record => { record.inbound[0].call = { action: "answer", decisionId, text: "skip them", revision: before }; });
     await s.surface.start();
     await waitFor(async () => s.store.get(ISSUE)!.inbound[0].handledAt, handled => Boolean(handled), 30000);
-    // Routed afresh, "skip them" would now steer, because the question is answered. The saved call is replayed instead.
     assert.equal(sh.get(id).revision, before + 1, "The replay advances the revision once");
     assert.equal(sh.get(id).steering.length, 0, "No steering entry exists");
     assert.equal(sh.get(id).decisions[0].answer, "skip them", "The answer is the original text");
@@ -791,7 +776,6 @@ test("a post is marked uncertain before it is sent, so a crash inside the send i
       if (died) return new Promise<never>(() => undefined);
       observed.push(current!.store.get(ISSUE)!.messages.find(message => message.key === "ack")?.uncertain === true);
       await real.post(binding, text, key);
-      // The post reaches Slack; the process dies before the receipt comes back.
       died = true;
       current!.surface.close();
       return new Promise<never>(() => undefined);
@@ -954,10 +938,6 @@ test("questions, results, and blocked reasons reach Slack without host paths or 
 const AMBIGUOUS = "More than one request is open in this thread: TEST-1, TEST-2. Start your reply with an identifier or a question number.";
 const SECOND = "8d2c4f1a-6b3e-4a5d-9c7f-0e1d2c3b4a59";
 
-/**
- * Two requests bound to one thread: A (TEST-1, older) asked Q1, and B (TEST-2, newer) asked Q2, or B is still queued.
- * Question numbers are given up front, so each test addresses them without waiting on composition order.
- */
 async function sharedThread(options: { secondQueued?: boolean } = {}) {
   const { sh, s, close } = await scriptedSurface();
   const a = await sh.create();
@@ -977,7 +957,6 @@ async function sharedThread(options: { secondQueued?: boolean } = {}) {
   }
   await s.surface.start(); await s.connected();
   await waitFor(async () => s.texts(), list => list.length === (options.secondQueued ? 3 : 4), 20000);
-  /** Emits the event and resolves once the surface has handled it, which is when the envelope is acknowledged. */
   const send = async (event: Record<string, unknown>, eventId?: string) => {
     const envelope = await s.slack.emit(event, eventId ? { eventId } : {});
     await waitFor(async () => s.slack.acks(), acks => acks.includes(envelope), 10000);
@@ -1027,9 +1006,7 @@ test("in a shared thread, a second event for the same message and a redelivered 
     await send(first, "Ev-first");
     await until(() => sh.get(b!), mission => mission.decisions[0].answer === "yes", 20000);
     const posts = s.texts().length;
-    // A new event ID for the same message, as Slack may send for an edit.
     await send(mention("status", { ts: first.ts }), "Ev-edited");
-    // The same event ID delivered again, here with different text, as a redelivery must not be re-read.
     await send(mention("Q1 skip"), "Ev-first");
     await delay(500);
     assert.equal(s.texts().length, posts, "Neither duplicate gets a reply");
@@ -1084,7 +1061,6 @@ test("a request whose start is refused is acknowledged once with the hold reason
 test("a request that starts on its first attempt gets one acknowledgement", { timeout: 90000 }, async () => {
   const { sh, s, close } = await scriptedSurface();
   try {
-    // Admission's record, before the first start attempt has set a state or a hold reason.
     s.store.create(intakeRecord(ISSUE, "queued", { thread: BINDING }));
     await s.surface.start(); await s.connected();
     await delay(300);
@@ -1097,7 +1073,6 @@ test("a request that starts on its first attempt gets one acknowledgement", { ti
   } finally { await close(); }
 });
 
-/** A title long enough that every acknowledgement naming it is split into parts. */
 const LONG_TITLE = "Export fails on empty rows ".repeat(120).trim();
 const sentMessages = (s: Awaited<ReturnType<typeof surfaceFor>>, count: number) =>
   waitFor(async () => s.store.get(ISSUE)!.messages, list => list.length >= count && list.every(message => message.status === "sent"), 15000);
@@ -1167,7 +1142,6 @@ test("a record with more than 400 composed messages still accepts a reply and de
     await waitFor(async () => s.texts(), list => list.includes(FINISHED), 15000);
     await delay(300);
     assert.deepEqual(s.texts(), [FINISHED], "The reply is posted once");
-    // Once sent, the reply will not be sent again, so the next write may drop it; the composed messages all stay.
     const kept = s.store.get(ISSUE)!.messages;
     assert.deepEqual(kept.map(message => message.key), composed.map(message => message.key));
   } finally { await close(); }
@@ -1203,12 +1177,9 @@ test("a permanent Slack identity failure sets a reason that names Slack's code, 
   }
 });
 
-// Direct requests
-
 const URL1 = "https://linear.example.invalid/issue/TEST-1";
 const FINISHED_DIRECT = "This request has finished. Mention me in this thread to file a follow-up.";
 
-/** A stand-in for the service: it records each call and creates the unfiled record, as `requestFromSlack` does. */
 function directStub(store: IntakeStore) {
   const calls: Parameters<DirectRequest>[0][] = [];
   const direct: DirectRequest = input => {
@@ -1250,7 +1221,6 @@ test("a redelivered triggering event makes no second call, no inbound entry and 
     const envelope = await s.slack.emit(inOther("fix the export"));
     await waitFor(async () => calls(), list => list.length === 1);
     await s.slack.redeliver(envelope);
-    // The same message under a new event ID is the same request.
     await s.slack.emit(inOther("fix the export", { ts: calls()[0].ts }), { eventId: "EvOther" });
     await delay(500);
     assert.equal(calls().length, 1);
@@ -1392,14 +1362,11 @@ test("a redelivered earlier reply never files a follow-up once its record has fi
   } finally { await close(); }
 });
 
-// Answer records (INF-238)
-
 const ANSWER_START = "Answering this from the repositories, read-only. No issue was filed.";
 const ANSWER_FOOTER = 'No issue was filed. To start work, mention me with the change you want, or begin with "work:".';
 const answerOrigin = (issueId: string): MissionOrigin => ({ kind: "intake", issueId, identifier: "", url: "", rule: "owner Slack mention of the bot (question)" });
 const answerDirect = { eventId: "EvAsk", ts: "1700000000.000100", text: "which exports failed?", filedAt: NOW, route: { kind: "answer" as const, by: "owner" as const, at: NOW } };
 
-/** A scripted surface with one running answer mission whose record is bound to the thread; direct requests are stubbed. */
 async function answerSurface(state: IntakeRecord["state"] = "started") {
   const sh = scripted();
   const stateRoot = mkdtempSync(join(tmpdir(), "intake-answer-"));
@@ -1513,7 +1480,6 @@ test("a held answer announces its start once, and queued work keeps the ask hint
     const other = await services.missions.create(h.create(), undefined, origin(work));
     s.store.update(work, record => { record.state = "started"; record.missionId = other.id; delete record.holdReason; });
     await waitFor(async () => [s.texts().length, s.texts(OTHER).length], counts => counts[0] === 2 && counts[1] === 2);
-    // A further change to each record composes again and must add nothing.
     s.store.update(ISSUE, record => { record.updatedAt = new Date().toISOString(); });
     s.store.update(work, record => { record.updatedAt = new Date().toISOString(); });
     await delay(400);
@@ -1538,17 +1504,11 @@ test("with a single unfinished record the word answer is ordinary text, not a se
   } finally { await close(); }
 });
 
-// Extend replies. The mission is a stub stopped at its time limit: the real extend is a placeholder until it lands.
-
 const DEADLINE_STOP = "Approved time ran out after 30 minutes.";
 const STOPPED = `Stopped at its time limit: ${DEADLINE_STOP}\nReply with a mention and \`extend\` (or \`extend 6h\`) to give it more time, or \`cancel\`.`;
 const EXTEND_HELP = "Extend by 5 minutes to 24 hours, for example `extend 6h` or `extend 90m`.";
 const DEADLINE_MISSION = "m-deadline";
 
-/**
- * A mission service whose one mission is stopped at its time limit. `extend` records each call and moves the stop to
- * 2026-11-15 12:00 UTC unless it refuses; `steer` records the text. Nothing else about the mission is modelled.
- */
 function deadlineMissions(options: { maxMinutes?: number; refuse?: TeamError } = {}) {
   const extendCalls: { requestId: string; revision: number; minutes: number }[] = [];
   const steers: string[] = [];
@@ -1568,14 +1528,9 @@ function deadlineMissions(options: { maxMinutes?: number; refuse?: TeamError } =
   return { missions, extendCalls, steers };
 }
 
-/** Resolves once the record has handled `count` owner replies, and returns their outcomes, oldest first. */
 const handledOutcomes = (s: Awaited<ReturnType<typeof surfaceFor>>, count: number) =>
   waitFor(async () => s.store.get(ISSUE)!.inbound.filter(item => item.handledAt).map(item => item.outcome), outcomes => outcomes.length === count, 30000);
 
-/**
- * A started (or finished) record on a mission stopped at its time limit, with the surface running. The acknowledgement
- * (started only) and the stop notice are posted first; `posts` returns only what came after them.
- */
 async function deadlineSurface(options: { maxMinutes?: number; refuse?: TeamError; directRequests?: boolean; direct?: (store: IntakeStore) => DirectRequest; state?: IntakeRecord["state"] } = {}) {
   const deadline = deadlineMissions(options);
   const stateRoot = mkdtempSync(join(tmpdir(), "intake-deadline-"));

@@ -1,7 +1,3 @@
-/*
- * Graph view: flat marks on the instrument canvas. Colour comes only from the --sw-* tokens in swarm.css.
- * The layout is computed in graph-layout.ts; nothing here animates position.
- */
 .sw-graph {
   display: flex;
   flex-direction: column;
@@ -15,7 +11,6 @@
   overflow: visible;
 }
 
-/* A flat strip that names the link kinds. It scrolls with the graph and is not glass. */
 .sw-graph-legend {
   display: flex;
   align-items: center;
@@ -36,7 +31,6 @@
   padding: 80px 0;
 }
 
-/* Links. Each touch kind has its own stroke, so the four are never read as one. */
 .sw-g-link {
   fill: none;
   stroke: var(--sw-ink-2);
@@ -52,7 +46,6 @@
 .sw-g-integrated { stroke: var(--sw-ink); opacity: 0.9; }
 .sw-g-code { stroke: var(--sw-ink-3); opacity: 0.32; }
 
-/* Nodes. */
 .sw-g-node {
   cursor: pointer;
   transition: opacity 160ms ease-out;
@@ -85,7 +78,6 @@
 }
 .sw-g-area-touched { stroke: var(--sw-ink-2); }
 
-/* Text: labels wear ink tokens, never a state colour. */
 .sw-graph-label {
   fill: var(--sw-ink-2);
   font-family: var(--sw-mono);
@@ -99,7 +91,6 @@
   font-size: 9.5px;
   letter-spacing: 0.06em;
 }
-/* An agent the host has no tool-input signal for: the legend counts them, and the role says which. */
 .sw-g-nosignal {
   text-decoration: underline dotted;
   text-underline-offset: 2px;

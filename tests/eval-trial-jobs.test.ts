@@ -828,7 +828,6 @@ test("an idle job past its expiry waits for its live trial to end", () => {
 
 type Slot = { jobId: string; slot: number; attempt: number };
 
-/** One failed start: a preparing row for the slot, then its release. The answer, and whether the row is still there. */
 function release(f: Fixture, at: Slot, waiting: EvalJobWait): { answer: "released" | "exhausted"; row: boolean } {
   const trialId = insertAt(f, at.jobId, at.attempt, { slot: at.slot, start: false });
   const answer = f.trial.release({ jobId: at.jobId, taskId: TASK_ONE, configRef: configRef(configuration(CLAUDE)), slot: at.slot, attempt: at.attempt, trialId }, waiting);

@@ -37,7 +37,6 @@ type Probe = Parameters<EvalIdentity["probe"]>[0];
 
 function rig(options: { removeRefused?: boolean; baseBranch?: string; probes?: EvalProbe[]; sessionsRemoved?: string[]; forgetThrows?: boolean; replayIds?: string[];
   replayState?: (trialId: string) => Promise<unknown>; onStatus?: () => void; cost?: CostLookup; clock?: () => string; trialsNewer?: boolean; alive?: boolean;
-  /** The mirror head the scripted source status reports; without it the project has no mirror yet. */
   mirrorHead?: string; prepareSource?: TrialPumpOptions["prepareSource"] } = {}) {
   const root = mkdtempSync(join(tmpdir(), "infinite-trial-pump-"));
   dirs.push(root);
@@ -573,7 +572,6 @@ const jobOf = (r: ReturnType<typeof rig>, jobId: string) => r.store.read(db => d
 const skippedOf = (r: ReturnType<typeof rig>, jobId: string) => r.store.read(db => db.get<{ skipped: number }>(
   "SELECT skipped FROM eval_trial_counts WHERE job_id = ?", jobId))!.skipped;
 
-/** A scripted source: `answer` gets the task and the number of the build (from 1). Each build records its task, the row's slot and attempt, and the job's wait. */
 function scripted(answer: (taskId: string, build: number) => Answer) {
   const builds: Built[] = [];
   let jobId = "";
@@ -588,7 +586,6 @@ function scripted(answer: (taskId: string, build: number) => Answer) {
 const BROKEN: Answer = { kind: "environment", cause: "bundle-missing" };
 const SKIPPED: Answer = { kind: "skip", reason: "not-valid" };
 
-/** Steps until `made()` reaches `count`; a step budget keeps a stuck pump from hanging. */
 async function stepsUntil(r: ReturnType<typeof rig>, made: () => number, count: number): Promise<void> {
   for (let step = 0; step < 300 && made() < count; step++) await r.pump.step();
   assert.equal(made(), count);

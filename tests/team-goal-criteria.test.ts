@@ -165,8 +165,6 @@ test("a new goal plan gets one correction, replacement keeps its pin, and accept
     assert.deepEqual(member.goalCriteriaPlan, { objectiveVersion: 7 });
     assert.ok(member.prompt.includes('"objectiveVersion":7'));
 
-    // The fixture's initial PM has a real scheduler session. Model a host-created,
-    // pinned PM there so replacement can exercise the actual stop/requeue path.
     const stalled = stored.run.members[0]!;
     stalled.goalCriteriaPlan = member.goalCriteriaPlan;
     stalled.prompt = member.prompt;

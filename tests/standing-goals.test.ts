@@ -23,7 +23,6 @@ const lineup: TeamLineup = {
 };
 const minute = 60_000;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-/** Polls on real timers; `Date` is mocked in these tests, so the helper's Date-based timeout would never pass. */
 async function until<T>(read: () => T, accept: (value: T) => boolean, ms = 8000): Promise<T> {
   const end = performance.now() + ms;
   for (;;) {
@@ -35,17 +34,14 @@ async function until<T>(read: () => T, accept: (value: T) => boolean, ms = 8000)
 }
 const action = (goal: ProductGoal) => ({ requestId: randomUUID(), revision: goal.revision });
 
-/** A team service stub: records each launch after the real request and context schemas accept it. */
 function stubTeams() {
   const views = new Map<string, TeamView>();
   const launches: { request: CreateTeam; context: TeamGoalContext; lineup: TeamLineup }[] = [];
   const cancels: string[] = [];
-  /** Runs holding an unresolved delivery attempt. */
   const deliveryAttempts = new Set<string>();
   const usage = () => ({ total: emptyUsage(), byProfile: {}, byProvider: {}, unmeasuredMembers: 0, partialMembers: 0 });
   const service = {
     launches, cancels, deliveryAttempts,
-    /** The next creation fails with this error, or never settles (`hang`), as if the host stopped mid-call. */
     failNext: undefined as Error | "hang" | undefined,
     get(id: string) {
       const found = views.get(id);
@@ -62,7 +58,6 @@ function stubTeams() {
       if (failure) throw failure;
       const prior = views.get(request.requestId);
       if (prior) return structuredClone(prior);
-      // The team service's budget check refuses a new run whose window has lapsed.
       if (Date.now() >= Date.parse(context.deadlineAt)) throw new TeamError(409, "goal-deadline", "The goal reached its deadline.");
       launches.push(structuredClone({ request, context, lineup: selected }));
       const at = new Date().toISOString();
@@ -70,7 +65,6 @@ function stubTeams() {
         goal: structuredClone(context), members: [], tasks: [], usage: usage(), branch: "main", baseCommit: "a".repeat(40) } as unknown as TeamView);
       return service.get(request.requestId);
     },
-    /** Settles a run with `members` stopped attempts. */
     settle(id: string, status: string, extra: Partial<TeamView> = {}, members = 0) {
       const view = views.get(id)!;
       Object.assign(view, { status, members: Array.from({ length: members }, () => ({ memberId: randomUUID(), role: "implementer", revision: 1, status: "stopped" })) }, extra);
@@ -118,7 +112,6 @@ test("a standing objective runs past ten cycles, renews its allowances per cycle
     teams.settle(launch.request.requestId, "ready-for-review", { brief: { title: `Feature ${n}`, expectedOutcome: `Outcome ${n}` } as TeamView["brief"] }, 4);
     await until(() => goals.get(created.id), goal => !goal.activeTeamId);
     if (n === 2) f.config.teams!.lineup = replacement;
-    // Each gap passes the five-minute cycle limit: between cycles a standing goal has no time stop.
     advance(30);
   }
   assert.equal(teams.launches[16]!.context.previousWork.length, 16, "A 17th cycle starts with 16 reviewed cycles behind it");
@@ -201,7 +194,6 @@ test("a halt that outlasts a cycle's window releases a standing goal back to its
   const everything = () => true, none = () => undefined;
   const halt = { haltId: randomUUID(), reason: "Halted by the owner for the whole host." };
   assert.deepEqual((await goals.haltPause(halt, everything)).map(item => item.result), ["paused"]);
-  // The halt lasts far longer than the five-minute window of the cycle that ended, and one cadence passes under it.
   advance(120);
   assert.equal(teams.launches.length, 1, "A halted goal starts no cycle");
   assert.deepEqual((await goals.haltResume(halt.haltId, none, false)).map(item => item.result), ["resumed"]);
@@ -211,7 +203,6 @@ test("a halt that outlasts a cycle's window releases a standing goal back to its
   teams.settle(second.request.requestId, "ready-for-review");
   await until(() => goals.get(created.id), goal => goal.cycles.length === 2 && !goal.activeTeamId);
 
-  // A project that became supervised under the halt keeps its standing goal paused, as the owner's resume would.
   const later = { haltId: randomUUID(), reason: "Halted by the owner for the whole host." };
   await goals.haltPause(later, everything);
   f.config.projects[0]!.autonomy = "supervised";
@@ -232,7 +223,6 @@ test("a standing goal folds cycles past the newest 50, never folds the next cycl
   const { f, teams, open, advance } = fixture(t);
   const at = (minutesAgo: number) => new Date(Date.now() - minutesAgo * minute).toISOString();
   const total = { ...emptyUsage(), cost: 0.01, messages: 1 };
-  // Cycle 1 is the only reviewed cycle, so it stays the parent while 50 newer cycles accumulate.
   const cycles: GoalCycle[] = Array.from({ length: 50 }, (_, index) => ({
     teamId: randomUUID(), cycle: index + 1, goalRevision: 1, status: index === 0 ? "ready-for-review" : "no-change", class: index === 0 ? "reviewed" : "no-change",
     startedAt: at(60 * (50 - index)), finishedAt: at(60 * (50 - index) - 10), settledAt: at(60 * (50 - index) - 10), memberCount: 2, autonomy: "autonomous",
@@ -285,7 +275,6 @@ test("a standing goal resumes on its cadence after a restart and coalesces misse
   restarted.start();
   await sleep(1200);
   assert.equal(teams.launches.length, 1, "The cadence still runs from the first cycle's start");
-  // Four cadences pass while nothing runs. One cycle starts for all of them, and the next waits a full cadence.
   advance(270);
   const second = await until(() => teams.launches[1], Boolean);
   assert.equal(second.context.cycle, 2);
@@ -334,7 +323,6 @@ test("a host signal starts the next cycle once before its cadence; the goal's ow
   await sleep(1200);
   assert.equal(teams.launches.length, 2, "One wake starts one cycle");
 
-  // Owner direction between cycles wakes the goal the same way.
   await goals.steer(created.id, { ...action(goals.get(created.id)), text: "Look at the flaky check first" });
   const third = await until(() => teams.launches[2], Boolean);
   assert.match(third.request.objective, /User direction: Look at the flaky check first$/);
@@ -352,7 +340,6 @@ test("a host signal starts the next cycle once before its cadence; the goal's ow
 test("signals that arrive together start one cycle, and a cadence start with the inbox unreadable leaves a half-read batch waiting", async t => {
   const { teams, goals, advance } = fixture(t);
   const signals: ProjectSignal[] = [];
-  // The inbox answers this many more head reads, then becomes unreadable.
   let headReads = Infinity;
   const reader: SignalReader = {
     head: () => headReads-- > 0 ? signals.length : undefined,
@@ -371,7 +358,6 @@ test("signals that arrive together start one cycle, and a cadence start with the
   await until(() => goals.get(created.id), goal => !goal.activeTeamId);
   advance(10);
 
-  // One more signal than a pass reads, recorded between two passes: the start waits a pass and takes the whole batch.
   const together = batch();
   await until(() => teams.launches[1], Boolean);
   const woken = await until(() => goals.get(created.id), goal => goal.cycles.length === 2);
@@ -384,13 +370,11 @@ test("signals that arrive together start one cycle, and a cadence start with the
   await sleep(1200);
   assert.equal(teams.launches.length, 2, "The rest of the batch starts no second cycle");
 
-  // The inbox fails after one pass read half of a new batch. The gap has passed, and nothing starts early.
   const halfRead = batch();
   headReads = 2;
   await until(() => goals.get(created.id), goal => goal.signalCursor === 101);
   await sleep(1200);
   assert.equal(teams.launches.length, 2, "A wake that may be half a batch starts nothing");
-  // The cadence still starts a cycle, and it leaves the half-read batch on the goal.
   advance(1440);
   await until(() => teams.launches[2], Boolean);
   const scheduled = await until(() => goals.get(created.id), goal => goal.cycles.length === 3);
@@ -398,7 +382,6 @@ test("signals that arrive together start one cycle, and a cadence start with the
   assert.equal(scheduled.pendingWake?.signals.length, 20);
   assert.doesNotMatch(teams.launches[2]!.request.objective, /Host wake reasons/);
 
-  // With the inbox back, the whole batch starts one cycle.
   headReads = Infinity;
   teams.settle(scheduled.cycles[2]!.teamId, "no-change");
   await until(() => goals.get(created.id), goal => !goal.activeTeamId && goal.signalCursor === 102);
@@ -425,7 +408,6 @@ test("a cycle whose reported merge the host did not validate blocks the goal bef
 
 test("a finite goal keeps today's request fingerprint, record, retention, and cycle limit", async t => {
   const input = { requestId: randomUUID(), projectId: "fixture", title: "Improve the fixture", objective: "Choose scoped work", successCriteria: "The owner has evidence" };
-  // The parse before standing goals existed applied maxRuns 3 in schema key order.
   assert.equal(JSON.stringify(parseCreateGoal(input)), JSON.stringify({ ...input, nonGoals: [], allowedPaths: ["."], evidence: [], maxRuns: 3, maxMinutes: 60, maxMembers: 24, parallelism: 3 }));
 
   const { f, teams, goals } = fixture(t);
@@ -455,7 +437,6 @@ test("a launch whose run was never created passes the mode gate again after a re
   const saved = await until(() => f.readRecord<SavedLaunch>("goal", created.id).launch, Boolean);
   goals.close();
 
-  // The host restarts after the saved window lapsed, and the project became supervised meanwhile.
   advance(10);
   f.config.projects[0]!.autonomy = "supervised";
   const restarted = open();
@@ -523,7 +504,6 @@ test("pausing a launch whose run was never created keeps its wake for the resume
   await until(() => f.readRecord<SavedLaunch>("goal", created.id).launch?.wake, Boolean);
   goals.close();
 
-  // After the restart the owner pauses before the scheduler reconciles the launch.
   const restarted = open();
   restarted.useSignals(reader);
   await restarted.pause(created.id, action(restarted.get(created.id)));
@@ -603,7 +583,6 @@ test("a cancelled goal's reason says it was cancelled once no team is stopping",
   const { teams, goals } = fixture(t);
   const stopping = "The goal is stopping its active team. Existing work will remain available.";
   const cancelled = "The owner cancelled this goal. Existing work remains available.";
-  // Between cycles there is no team to stop.
   const idle = await goals.create(standing());
   goals.start();
   const first = await until(() => teams.launches[0], Boolean);
@@ -613,7 +592,6 @@ test("a cancelled goal's reason says it was cancelled once no team is stopping",
   assert.equal(stopped.status, "cancelled");
   assert.equal(stopped.reason, cancelled);
 
-  // With a cycle running, the reason says the team is stopping until it has stopped.
   const busy = await goals.create(standing());
   const run = await until(() => teams.launches[1], Boolean);
   const active = await until(() => goals.get(busy.id), goal => goal.activeTeamId === run.request.requestId);
@@ -666,7 +644,6 @@ test("while Linear tracking holds new work, the goal shows the tracking reason a
 
 test("a standing goal refuses an objective over 24,000 bytes; a finite goal keeps its character limit", async t => {
   const { goals } = fixture(t);
-  // 9,000 Hangul syllables are 27,000 bytes of UTF-8 and pass the 12,000-character schema limit.
   await assert.rejects(goals.create(standing({ objective: "\uAC00".repeat(9000) })),
     (error: unknown) => error instanceof TeamError && error.code === "standing-objective-too-large");
   await goals.create(standing({ objective: "\uAC00".repeat(8000) }));

@@ -576,7 +576,6 @@ test("a clean that fails at a trial's end is run again before the next trial sta
   const served = await serveTeam(s, fx);
   const inner = s.identity;
   let failedAt = -1;
-  // The first clean after a trial is final runs for real but reports failure, as a clean that leaves the account unsure does.
   s.identity = { ...inner, clean: async () => {
     const done = await inner.clean();
     const ended = s.r.store.read(db => db.get<{ n: number }>("SELECT COUNT(*) AS n FROM eval_trials WHERE state = 'final'"))?.n ?? 0;
@@ -594,7 +593,6 @@ test("a clean that fails at a trial's end is run again before the next trial sta
     assert.ok(failedAt >= 0, "the clean at the first trial's end failed once");
     assert.equal(jobRow(s, jobId)?.status, "completed", "the second trial ran");
     const after = launcherOps(s).slice(failedAt);
-    // A trial's own start resets the account once (stop, clean, scrub). The start-up that the failed clean forces is a second reset, before the next member's receive.
     const receive = after.indexOf("receive");
     assert.ok(receive > 0, "the second trial received its source after the failure");
     assert.deepEqual(after.slice(0, receive), ["stop", "clean", "scrub", "stop", "clean", "scrub"],

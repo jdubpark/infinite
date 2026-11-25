@@ -10,7 +10,15 @@ export const BASELINE_PATH = "scripts/comments-baseline.json";
 const TS_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]);
 const C_LIKE_EXTENSIONS = new Set([".swift", ".c", ".h", ".kt", ".kts"]);
 const HASH_EXTENSIONS = new Set([".py", ".sh"]);
-const ALL_EXTENSIONS = new Set([...TS_EXTENSIONS, ...C_LIKE_EXTENSIONS, ...HASH_EXTENSIONS]);
+const CSS_EXTENSIONS = new Set([".css"]);
+const SYSTEMD_EXTENSIONS = new Set([".service", ".timer", ".socket"]);
+const ALL_EXTENSIONS = new Set([
+  ...TS_EXTENSIONS,
+  ...C_LIKE_EXTENSIONS,
+  ...HASH_EXTENSIONS,
+  ...CSS_EXTENSIONS,
+  ...SYSTEMD_EXTENSIONS,
+]);
 const SKIPPED_SEGMENTS = new Set(["node_modules", "vendor", "generated", "dist", ".build"]);
 
 const TS_DIRECTIVE_RE = /^(?:\/\/\/\s*<reference\b[^\n]*\/>\s*$|\/\/\s*@ts-expect-error(?:\s|$)|\/\/\s*eslint-disable-next-line(?:\s+[A-Za-z0-9_@/-]+(?:\s*,\s*[A-Za-z0-9_@/-]+)*)?\s*$)/;
@@ -421,9 +429,209 @@ function extractShellComments(text) {
   return comments;
 }
 
+function isCssNewline(ch) {
+  return ch === "\n" || ch === "\r" || ch === "\f";
+}
+
+function cssLineStartsOf(text) {
+  const starts = [0];
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === "\r") {
+      if (text[i + 1] === "\n") i += 1;
+      starts.push(i + 1);
+    } else if (ch === "\n" || ch === "\f") {
+      starts.push(i + 1);
+    }
+  }
+  return starts;
+}
+
+function isHexDigit(ch) {
+  if (!ch) return false;
+  const code = ch.charCodeAt(0);
+  return (code >= 48 && code <= 57) || (code >= 65 && code <= 70) || (code >= 97 && code <= 102);
+}
+
+function isCssIdentChar(ch) {
+  if (!ch) return false;
+  const code = ch.charCodeAt(0);
+  return (
+    (code >= 48 && code <= 57) ||
+    (code >= 65 && code <= 90) ||
+    (code >= 97 && code <= 122) ||
+    code === 45 ||
+    code === 95 ||
+    code >= 128
+  );
+}
+
+function readCssEscape(text, index) {
+  const n = text.length;
+  let i = index + 1;
+  if (i >= n) return { char: "\uFFFD", nextIndex: n };
+  if (isHexDigit(text[i])) {
+    let hex = "";
+    while (i < n && hex.length < 6 && isHexDigit(text[i])) {
+      hex += text[i];
+      i += 1;
+    }
+    if (i < n) {
+      if (text[i] === "\r" && text[i + 1] === "\n") i += 2;
+      else if (text[i] === " " || text[i] === "\t" || isCssNewline(text[i])) i += 1;
+    }
+    const cp = Number.parseInt(hex, 16);
+    const char = cp === 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff) ? "\uFFFD" : String.fromCodePoint(cp);
+    return { char, nextIndex: i };
+  }
+  const ch = text[i];
+  return { char: ch, nextIndex: i + 1 };
+}
+
+function readCssIdent(text, startIndex) {
+  const n = text.length;
+  let i = startIndex;
+  let value = "";
+  while (i < n) {
+    const ch = text[i];
+    if (ch === "\\" && i + 1 < n && !isCssNewline(text[i + 1])) {
+      const esc = readCssEscape(text, i);
+      value += esc.char;
+      i = esc.nextIndex;
+      continue;
+    }
+    if (isCssIdentChar(ch)) {
+      value += ch;
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  return { value, nextIndex: i };
+}
+
+function skipCssUnquotedUrl(text, openParenIndex) {
+  const n = text.length;
+  let i = openParenIndex + 1;
+  while (i < n && (text[i] === " " || text[i] === "\t" || isCssNewline(text[i]))) {
+    i += 1;
+  }
+  if (i < n && (text[i] === '"' || text[i] === "'")) return -1;
+  while (i < n) {
+    const ch = text[i];
+    if (ch === "\\") {
+      i += text[i + 1] === "\r" && text[i + 2] === "\n" ? 3 : 2;
+      continue;
+    }
+    if (ch === ")") return i + 1;
+    i += 1;
+  }
+  return n;
+}
+
+function extractCssComments(text) {
+  const starts = cssLineStartsOf(text);
+  const comments = [];
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      i += 1;
+      while (i < n) {
+        const c = text[i];
+        if (c === "\\") {
+          i += text[i + 1] === "\r" && text[i + 2] === "\n" ? 3 : 2;
+          continue;
+        }
+        if (c === quote) {
+          i += 1;
+          break;
+        }
+        if (isCssNewline(c)) break;
+        i += 1;
+      }
+      continue;
+    }
+    if ((ch === "#" || ch === "@") && i + 1 < n && (isCssIdentChar(next) || (next === "\\" && i + 2 < n && !isCssNewline(text[i + 2])))) {
+      i = readCssIdent(text, i + 1).nextIndex;
+      continue;
+    }
+    if (isCssIdentChar(ch) || (ch === "\\" && i + 1 < n && !isCssNewline(next))) {
+      const ident = readCssIdent(text, i);
+      if (ident.value.toLowerCase() === "url" && text[ident.nextIndex] === "(") {
+        const urlEnd = skipCssUnquotedUrl(text, ident.nextIndex);
+        if (urlEnd !== -1) {
+          i = urlEnd;
+          continue;
+        }
+        i = ident.nextIndex + 1;
+        continue;
+      }
+      i = ident.nextIndex;
+      continue;
+    }
+    if (ch === "\\") {
+      i += next === "\r" && text[i + 2] === "\n" ? 3 : 2;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      const start = i;
+      i += 2;
+      while (i < n && !(text[i] === "*" && text[i + 1] === "/")) i += 1;
+      if (i < n) i += 2;
+      const end = i;
+      const startLine = offsetToLine(starts, start);
+      const endLine = offsetToLine(starts, Math.max(start, end - 1));
+      const before = text.slice(starts[startLine - 1], start);
+      let lineEnd = end;
+      while (lineEnd < n && !isCssNewline(text[lineEnd])) lineEnd += 1;
+      const after = text.slice(end, lineEnd);
+      comments.push({
+        start,
+        end,
+        startLine,
+        endLine,
+        kind: "block",
+        fullLineOnly: before.trim() === "" && after.trim() === "",
+        text: text.slice(start, end),
+      });
+      continue;
+    }
+    i += 1;
+  }
+  return comments;
+}
+
+function extractSystemdComments(text) {
+  const starts = lineStartsOf(text);
+  const comments = [];
+  const lines = text.split("\n");
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const rawLine = lines[idx];
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    let j = idx === 0 && line.startsWith("\uFEFF") ? 1 : 0;
+    while (j < line.length && (line[j] === " " || line[j] === "\t")) j += 1;
+    if (j < line.length && (line[j] === "#" || line[j] === ";")) {
+      comments.push({
+        start: starts[idx] + j,
+        end: starts[idx] + line.length,
+        startLine: idx + 1,
+        endLine: idx + 1,
+        kind: "line",
+        fullLineOnly: true,
+        text: line.slice(j),
+      });
+    }
+  }
+  return comments;
+}
+
 function isAllowedDirective(item, ext) {
   const trimmed = item.text.trim();
-  if (item.startLine === 1 && trimmed.startsWith("#!")) return true;
+  if ((TS_EXTENSIONS.has(ext) || HASH_EXTENSIONS.has(ext)) && item.startLine === 1 && trimmed.startsWith("#!")) return true;
   if (TS_EXTENSIONS.has(ext)) return TS_DIRECTIVE_RE.test(trimmed);
   if (ext === ".swift") return item.startLine === 1 && SWIFT_DIRECTIVE_RE.test(trimmed);
   if (ext === ".sh") return SHELL_DIRECTIVE_RE.test(trimmed);
@@ -437,6 +645,8 @@ export function extractComments(text, filePath) {
   else if (C_LIKE_EXTENSIONS.has(ext)) raw = extractCLikeComments(text, ext);
   else if (ext === ".py") raw = extractPythonComments(text);
   else if (ext === ".sh") raw = extractShellComments(text);
+  else if (CSS_EXTENSIONS.has(ext)) raw = extractCssComments(text);
+  else if (SYSTEMD_EXTENSIONS.has(ext)) raw = extractSystemdComments(text);
 
   const filtered = raw.filter((item) => !isAllowedDirective(item, ext));
 
@@ -462,7 +672,7 @@ export function extractComments(text, filePath) {
         end: item.end,
         kind: item.kind,
         fullLineOnly: item.fullLineOnly,
-        lines: item.kind === "block" ? item.text.split("\n") : [item.text],
+        lines: item.kind === "block" ? item.text.split(CSS_EXTENSIONS.has(ext) ? /\r\n|\r|\n|\f/ : "\n") : [item.text],
       });
     }
   }

@@ -145,10 +145,8 @@ test("a team member, a mission coordinator and a laptop session never take this 
     h.add("mission", "covered", { team: { runId: "mission", memberId: "c", revision: 1, role: "mission-coordinator" } });
     h.add("laptop", "covered", { executionLocation: "laptop", workspace: { cwd: "/home/dev/projects/infinite", roots: [] } });
     h.add("native", "covered", { runtime: { id: "n", location: "cloud", transport: "pty", nativeUi: "codex" } });
-    // The headless channel decides a served session's calls through its hooks, and its owner prompt is the owner's own.
     h.add("headless", "covered", { headless: { channel: true } });
     h.add("owner-prompt", "covered", {}, { ...permissionPrompt(1), source: "protocol" });
-    // A listing row that lost its assignment still meets the session record, which keeps it.
     h.add("disguised", "covered", { team: { runId: "r", memberId: "d", revision: 1, role: "reviewer" } });
     const rows = h.rows().map(row => row.id === "disguised" ? { ...row, team: undefined } : row);
     h.service.observe(rows);
@@ -243,7 +241,6 @@ test("only a reject option that takes text carries the host's fixed notice, and 
     assert.deepEqual(h.answered.map(answer => [answer.decisionId, answer.option, answer.notice]), [["reject-1", 2, notice], ["reject-2", 1, undefined]],
       "the notice follows the reject that takes text; a plain reject sends none");
 
-    // The team path's rule: exactly one reject without a persistent effect.
     h.add("both", "covered", {}, permissionPrompt(1, { options: [...permissionPrompt(1).options, { index: 3, label: "No", role: "reject" }] }));
     const both = (await h.service.target("both"))!;
     assert.equal(both.request.shape.oneShotReject, false);
@@ -287,7 +284,6 @@ test("an owner halt leaves the dialog with the owner, and the same dialog is han
 test("evidence collection reads only inside the session root, within its limits, and names what it skipped", async () => {
   const h = harness();
   try {
-    // A repository above the session root: collection never searches upward for its root.
     mkdirSync(join(h.root, ".git"));
     writeFileSync(join(h.root, "outside.txt"), "OUTSIDE CONTENT");
     mkdirSync(join(h.checkout, "src"));
@@ -304,7 +300,6 @@ test("evidence collection reads only inside the session root, within its limits,
       assert.ok(evidence.limitations.some(line => skipped.test(line)), `limitations name ${skipped}`);
     assert.match(evidence.digest, /^[a-f0-9]{64}$/);
 
-    // What the review read is read again before delivery: a changed source file makes the request stale.
     assert.equal((await target.check()).ok, true);
     writeFileSync(join(h.checkout, "src", "retry.ts"), "export const retries = 30;\n");
     const live = await target.check();
@@ -319,15 +314,12 @@ test("a prompt the owner submits while a request is decided leaves the dialog wi
     const target = (await h.service.target("s"))!;
     assert.equal((await target.check()).ok, true);
     assert.equal((await target.check()).ok, true, "reading the record again changes nothing");
-    // Agent output and an input without owner text are not a prompt.
     live.events.push({ seq: 2, at: "t", type: "output", data: { text: "AGENT OUTPUT" } }, { seq: 3, at: "t", type: "input-result", data: { requestId: "i0", state: "delivered" } });
     assert.equal((await target.check()).ok, true);
-    // The owner narrows the task while the review runs. The verdict was reached for the earlier task.
     live.events.push({ seq: 4, at: "t", type: "input-result", data: { requestId: "i1", state: "delivered", message: "Do not run the tests against the shared database" } });
     assert.deepEqual(await target.check(), { ok: false, stale: false, reason: "The owner submitted a prompt after the request was read." });
     assert.equal(await target.answer(0, "decision-1"), "refused");
     assert.equal(h.answered.length, 0);
-    // A request built now carries the new prompt and passes its own check.
     const next = (await h.service.target("s"))!;
     assert.match(next.request.requester.task.text, /shared database/);
     assert.equal((await next.check()).ok, true);
@@ -337,7 +329,6 @@ test("a prompt the owner submits while a request is decided leaves the dialog wi
 test("a long session record with no new owner prompt never withholds a delivery", async () => {
   const h = harness({ delivery: new FakeDelivery(() => new Promise(() => {})) });
   try {
-    // More output than one bounded read of the task covers, as after an API restart of a long session.
     for (const total of [3_000, 3_500, 7_000]) {
       const events: Event[] = Array.from({ length: total }, (_, i) => i === 5
         ? { seq: i + 1, at: "t", type: "input-result", data: { requestId: "i1", state: "delivered", message: "An early owner prompt" } }
@@ -356,7 +347,6 @@ test("a long session record with no new owner prompt never withholds a delivery"
 test("a prompt that the bounded read of the task did not reach is named as possibly missing and does not withhold", async () => {
   const h = harness({ delivery: new FakeDelivery(() => new Promise(() => {})) });
   try {
-    // The owner's prompt sits past the part of a long record that one read of the task covers.
     const events: Event[] = Array.from({ length: 7_000 }, (_, i) => i === 4_999
       ? { seq: i + 1, at: "t", type: "input-result", data: { requestId: "i1", state: "delivered", message: "A prompt far into the record" } }
       : { seq: i + 1, at: "t", type: "output", data: { text: "x" } });
@@ -385,7 +375,6 @@ test("a session record that cannot be read to its end withholds a delivery", asy
   try {
     const live = h.add("s", "covered");
     const target = (await h.service.target("s"))!;
-    // More new record than the bounded read covers before a delivery.
     for (let seq = 2; seq <= 4_000; seq++) live.events.push({ seq, at: "t", type: "output", data: { text: "x" } });
     assert.deepEqual(await target.check(), { ok: false, stale: false, reason: "The session record could not be read to its end." });
   } finally { h.close(); }
@@ -493,7 +482,6 @@ test("the manager answers only a host session outside a run, under its own lease
     await manager.answerSessionPermission(sessions.plain, { ...input, decisionId: "decision-11", notice: requesterNotice("unrelated") });
     const withNotice = requests.filter(request => request.op === "session-permission-answer").at(-1) as Extract<WorkerRequest, { op: "session-permission-answer" }>;
     assert.equal(withNotice.text, requesterNotice("unrelated"), "the worker receives the notice as the answer's text");
-    // A delegation that the owner revoked while the lease was claimed: nothing reaches the worker, and the lease is released.
     const answersBefore = requests.filter(request => request.op === "session-permission-answer").length;
     await assert.rejects(manager.answerSessionPermission(sessions.plain, { ...input, decisionId: "decision-12", current: () => false }), /invalidated before the answer/);
     assert.equal(requests.filter(request => request.op === "session-permission-answer").length, answersBefore);

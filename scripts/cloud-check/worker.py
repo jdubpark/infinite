@@ -125,12 +125,29 @@ def ensure_pin(pin: dict[str, object]) -> tuple[str, str, str]:
         raise CheckError(f"cloud checkout requires a Linux runner, got {sys.platform}")
     node = version("node", ["--version"]).removeprefix("v")
     npm = version("npm", ["--version"])
-    git = version("git", ["--version"])
     if node != pin["node"]:
         raise CheckError(f"Node version mismatch: expected {pin['node']}, got {node}")
     if npm != pin["npm"]:
         raise CheckError(f"npm version mismatch: expected {pin['npm']}, got {npm}")
-    return node, npm, git
+    return node, npm, version("git", ["--version"])
+
+
+def verify_linux_profile(expected: object, git_version: str) -> None:
+    release = platform.freedesktop_os_release()
+    actual = {
+        "distribution": release["ID"],
+        "release": release["VERSION_ID"],
+        "architecture": platform.machine(),
+        "git": git_version.removeprefix("git version "),
+        "docker": version("docker", ["version", "--format", "{{.Server.Version}}"]),
+        "compose": version("docker", ["compose", "version", "--short"]).removeprefix("v").split("+", 1)[0],
+    }
+    if not isinstance(expected, dict) or actual.keys() != expected.keys():
+        raise CheckError("invalid Linux runner profile")
+    for key, value in actual.items():
+        if value != expected[key]:
+            raise CheckError(f"runner {key} mismatch: expected {expected[key]}, got {value}")
+    print("PROFILE " + " ".join(f"{key}={value}" for key, value in actual.items()), flush=True)
 
 
 def private_env(home: pathlib.Path, temp: pathlib.Path, marker: pathlib.Path, run_id: str) -> dict[str, str]:
@@ -418,6 +435,7 @@ def main() -> int:
         env = private_env(home, temp, marker, run_id)
         GIT_ENV = env
         node, npm, git_version = ensure_pin(pin)
+        verify_linux_profile(pin.get("runner"), git_version)
         checkout = RUN_DIR / "t"
         checkout.mkdir()
         git(checkout, "init", "--quiet")

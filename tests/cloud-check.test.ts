@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,7 +18,7 @@ test("cloud dispatch preserves Git layers, worktree bytes, cwd, argv and the che
   mkdirSync(bin);
   const env = { ...process.env, HOME: dir, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", PATH: `${bin}:${process.env.PATH}` };
   const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, env, encoding: "utf8" });
-  const launch = (...args: string[]) => spawnSync("python3", [client, "--", ...args], { cwd: sub, env, encoding: "utf8" });
+  const launch = (...args: string[]) => spawnSync("python3", [client, "--runner", "fixture-runner", "--", ...args], { cwd: sub, env, encoding: "utf8" });
   git("init", "-q", "--template=");
   git("config", "user.name", "Fixture");
   git("config", "user.email", "fixture@example.invalid");
@@ -86,4 +86,13 @@ test("cloud dispatch preserves Git layers, worktree bytes, cwd, argv and the che
   assert.notEqual(wrongVersion.status, 0);
   assert.match(wrongVersion.stderr + wrongVersion.stdout, /Node version mismatch/);
   assert.doesNotMatch(wrongVersion.stdout, /check actually ran/);
+
+  writeFileSync(join(repo, ".nvmrc"), process.versions.node);
+  const profile = JSON.parse(readFileSync(new URL("../scripts/cloud-check/linux-runner.json", import.meta.url), "utf8"));
+  mkdirSync(join(repo, "scripts/cloud-check"), { recursive: true });
+  writeFileSync(join(repo, "scripts/cloud-check/linux-runner.json"), JSON.stringify({ ...profile, docker: "0.0.1" }));
+  const wrongDocker = launch("node", "-e", "console.log('check actually ran')");
+  assert.notEqual(wrongDocker.status, 0);
+  assert.match(wrongDocker.stderr + wrongDocker.stdout, /runner docker mismatch/);
+  assert.doesNotMatch(wrongDocker.stdout, /check actually ran/);
 });

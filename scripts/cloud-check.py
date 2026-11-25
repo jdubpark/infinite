@@ -343,6 +343,10 @@ def toolchain_pin(root: Path) -> bytes:
                 break
         if pin is None:
             raise RuntimeError("caller and launcher toolchain pins are missing")
+    profile = root / "scripts/cloud-check/linux-runner.json"
+    if not profile.is_file():
+        profile = Path(__file__).resolve().parent / "cloud-check/linux-runner.json"
+    pin["runner"] = json.loads(profile.read_text(encoding="utf-8"))
     return (json.dumps(pin, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
@@ -506,17 +510,17 @@ def main() -> int:
         runtime = Path(__file__).resolve().parent / "cloud-check"
         bootstrap = (runtime / "bootstrap.py").read_text(encoding="utf-8")
         worker = runtime / "worker.py"
+        on_runner = not args.runner and standing_runner()
         if args.npm_script is not None:
             event = os.environ.get("npm_lifecycle_event")
             if not event or args.runner:
                 raise RuntimeError("npm dispatch requires a lifecycle event")
-            on_runner = standing_runner()
             if on_runner and event in {"build", "desktop:build", "dev", "web", "start", "android", "ios", "export:android", "export:ios"}:
                 run_standing_build(root, args.npm_script, event, argv)
             argv = ["npm", "run", event, "--", *argv]
-            if on_runner:
-                archive = outer_archive(capture(root, cwd, argv, worker))
-                return dispatch([sys.executable, "-c", bootstrap], archive)
+        if on_runner:
+            archive = outer_archive(capture(root, cwd, argv, worker))
+            return dispatch([sys.executable, "-c", bootstrap], archive)
         aliases = enrolled_aliases(root)
         if args.runner:
             if not ALIAS_RE.fullmatch(args.runner) or args.runner not in aliases:
@@ -565,7 +569,10 @@ def main() -> int:
             ],
             archive,
         )
-    except (OSError, RuntimeError, UnicodeError, subprocess.CalledProcessError) as exc:
+    except KeyboardInterrupt:
+        print("Cloud check interrupted", file=sys.stderr)
+        return 130
+    except (OSError, RuntimeError, UnicodeError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"cloud-check: {exc}", file=sys.stderr)
         return 2
 

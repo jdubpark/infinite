@@ -185,7 +185,7 @@ Unattended work is limited by each provider's permissions, quotas, authenticatio
 
 ## Cloud verification
 
-From a workstation, enroll an SSH alias for an owner-operated test account or VM in the checkout's private Git config. Verify its SSH host key through the owner's trusted channel first. Linked worktrees share this enrollment. The workstation needs Git, Python 3.9+ and OpenSSH. The runner needs those tools, the Node version in `.nvmrc`, the npm version in `package.json`'s `packageManager` field, and the native build dependencies for the platform.
+From a workstation, enroll an SSH alias for an owner-operated test account or VM in the checkout's private Git config. Verify its SSH host key through the owner's trusted channel first. Linked worktrees share this enrollment. The workstation needs Git, Python 3.9+ and OpenSSH. Provision each Linux runner with Python 3.10+, the tools and platform in `scripts/cloud-check/linux-runner.json`, the Node version in `.nvmrc`, the npm version in `package.json`'s `packageManager` field, and the native build dependencies. The job checks the distribution, architecture, Git, Docker engine, Compose, Node and npm before installing dependencies.
 
 ```sh
 git config --local --add infinite.verifyHost VERIFY_LINUX

@@ -20,7 +20,7 @@ import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, folde
 import { KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import { correctionGate, digestEvent, correctGoalObjective, createGoalObjective, goalObjectiveNote, goalObjectiveView, goalRecordDigest, goalRecordPort, loadGoalObjective, ratingStamp, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
 import { objectivePromptsOn, objectiveRegisterOn } from "./objective-digest.js";
-import { answerProvisional, assertVerdictAnswer, continueGoal, criteriaRowsFor, cycleVerdict, deliveryHold, lateStop, lateVerdict, provisionalStop, verdictFailed, CONTINUE_EVENT, DELIVERY_HOLD_REASON, LATE_RECEIPT_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "./goal-verdicts.js";
+import { answerProvisional, assertVerdictAnswer, continueGoal, criteriaRowsFor, cycleVerdict, deliveryHold, lateVerdict, owedStop, provisionalStop, verdictFailed, CONTINUE_EVENT, DELIVERY_HOLD_REASON, LATE_RECEIPT_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "./goal-verdicts.js";
 import { correctionSchema, type CriterionInput } from "./objective-input.js";
 import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
 import { goalMetricsRead, pruneMetrics, settleMetrics } from "./goal-metrics.js";
@@ -566,7 +566,9 @@ export class GoalService {
   }
   private refresh(stored: Stored, team: TeamView) {
     const cycle = stored.goal.cycles.find(value => value.teamId === team.id)!;
+    const late = lateVerdict(stored.goal, cycle, team) !== undefined;
     Object.assign(cycle, { status: team.status, memberCount: team.members.length, baseCommit: team.baseCommit, headCommit: team.headCommit, branch: team.branch, workspace: team.workspace, brief: team.brief, reason: team.reason }, cycleVerdict(stored.goal, cycle, team));
+    if (late) this.event(stored, LATE_RECEIPT_EVENT);
     if (team.usage.total.messages > 0 || team.usage.unmeasuredMembers === 0) cycle.usage = cycleUsageSnapshot(team.usage);
     else delete cycle.usage;
     if (["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status)) cycle.finishedAt ??= now();
@@ -792,7 +794,9 @@ export class GoalService {
       this.setControl(stored, "cancel"); this.event(stored, goal.reason); this.save(stored); await this.applyControl(stored); return;
     }
     if (goal.activeTeamId) return;
-    if (this.lateReceipt(stored, goal.cycles.at(-1)) || this.holdForDelivery(stored)) return;
+    this.lateReceipt(stored, goal.cycles.at(-1));
+    if (owedStop(goal, Boolean(stored.launch || stored.control))) { this.stopProvisional(stored); this.save(stored); return; }
+    if (this.holdForDelivery(stored)) return;
     if (goal.cycles.length >= (goal.maxRuns ?? 0)) {
       goal.status = "ready-for-review"; goal.reason = "The approved feature-run limit has been reached. Review the accumulated changes; product impact has not been inferred.";
       this.event(stored, goal.reason); this.save(stored); return;
@@ -866,16 +870,13 @@ export class GoalService {
     goal.status = "ready-for-review"; goal.reason = PROVISIONAL_REASON; goal.stopReason = "provisional-met";
     this.event(stored, PROVISIONAL_EVENT);
   }
-  private lateReceipt(stored: Stored, cycle: GoalCycle | undefined): boolean {
+  private lateReceipt(stored: Stored, cycle: GoalCycle | undefined): void {
     const team = cycle === undefined ? undefined : this.teams.assessmentOf?.(cycle.teamId);
     const late = cycle === undefined || team === undefined ? undefined : lateVerdict(stored.goal, cycle, team);
-    if (cycle === undefined || late === undefined) return false;
+    if (cycle === undefined || late === undefined) return;
     Object.assign(cycle, late);
     this.event(stored, LATE_RECEIPT_EVENT);
-    const stop = lateStop(stored.goal, cycle, Boolean(stored.launch || stored.control));
-    if (stop) this.stopProvisional(stored);
     this.save(stored);
-    return stop;
   }
   async syncReceipts(): Promise<void> {
     if (this.closed) return;

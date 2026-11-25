@@ -12,7 +12,7 @@ import { TeamError } from "./team-workspace.js";
 export const PROVISIONAL_REASON = "An agent assessment, provisional, found every criterion met. Record your assessment: achieved, or not achieved with continue.";
 export const PROVISIONAL_EVENT = "Agent assessment, provisional: every criterion met. The goal stopped for your assessment and is not marked achieved.";
 export const DELIVERY_HOLD_MS = 600_000;
-export const DELIVERY_HOLD_REASON = "Waiting up to 10 minutes for the host to see this delivery on the base branch before the next feature starts.";
+export const DELIVERY_HOLD_REASON = "Waiting up to 10 minutes for the host to see this delivery on the base branch before the goal continues.";
 export const LATE_RECEIPT_EVENT = "A delivery receipt changed a cycle's agent assessment.";
 export const CONTINUE_EVENT = "You recorded not achieved and continued the goal. The next cycle reads your direction.";
 
@@ -46,10 +46,13 @@ export function lateVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle,
   return copy.assessment === undefined || copy.supersededVerdictIds === undefined ? undefined : { assessment: copy.assessment, supersededVerdictIds: copy.supersededVerdictIds };
 }
 
-export function lateStop(goal: ProductGoal, cycle: GoalCycle, busy: boolean): boolean {
-  if (goal.status !== "running" || goal.activeTeamId !== undefined || busy || goal.cycles.at(-1) !== cycle) return false;
+export function owedStop(goal: ProductGoal, busy: boolean): boolean {
+  if (goal.status !== "running" || goal.activeTeamId !== undefined || busy) return false;
   if (autonomyOf(goal) !== "autonomous" || goal.standing !== undefined) return false;
-  return cycle.assessment?.kind === "reviewed" && cycle.assessment.result === "met";
+  const cycle = goal.cycles.at(-1);
+  if (cycle?.assessment?.kind !== "reviewed" || cycle.assessment.result !== "met") return false;
+  const ids = verdictIdsOf(cycle);
+  return !goal.outcomes.some(item => item.verdictId !== undefined && ids.includes(item.verdictId));
 }
 
 export function deliveryHold(goal: Pick<ProductGoal, "autonomy" | "standing" | "cycles">,

@@ -1,4 +1,5 @@
 import SwiftUI
+import InfiniteAtomics
 import InfiniteCore
 
 struct CmuxHostProfile: Codable, Identifiable {
@@ -72,7 +73,7 @@ private struct CmuxPendingCreation: Codable {
     var active: CmuxHostProfile? { profiles.first { $0.id == activeID } }
     var selected: CmuxTerminalRow? { terminals.first { $0.id == selectedID } }
     var rendererVisible: Bool { displayVisible && attached }
-    var canSend: Bool { connected && attached && snapshotReady && inputEnabled && !directInput && !busy && draft.pendingID == nil && !draft.text.isEmpty }
+    var canSend: Bool { connected && attached && snapshotReady && inputEnabled && !directInput && !busy && draft.pending == nil && !draft.text.isEmpty }
     private var draftIdentity: String? { selectedID.map { "cmux:\(attachedProfileID):\($0)" } }
 
     init() {
@@ -84,7 +85,6 @@ private struct CmuxPendingCreation: Codable {
         guard displayVisible != visible else { return }
         displayVisible = visible
         displayGeneration = UUID()
-        // A failed catalog read clears `connected`; the established backend still resumes polling, whose next read recovers it.
         if visible, hasConnected {
             let generation = displayGeneration
             Task {
@@ -213,7 +213,7 @@ private struct CmuxPendingCreation: Codable {
             try await backend.attach(terminalID: id) { buffer.append($0) }
             guard generation == attachmentGeneration else { return }
             attached = !streamEnded
-            notice = draft.pendingID == nil ? "Draft locally. Enable input when you are ready to send." : "A previous input has no delivery receipt. Inspect the terminal before clearing it."
+            notice = draft.pending == nil ? "Draft locally. Enable input when you are ready to send." : "A previous input has no delivery receipt. Inspect the terminal before clearing it."
         } catch { buffer.cancel(); if generation == attachmentGeneration { notice = error.localizedDescription } }
     }
 
@@ -244,8 +244,6 @@ private struct CmuxPendingCreation: Codable {
     }
 
     func rendererRestored(_ generation: UUID) {
-        // A new web view can acknowledge its initial empty replay before the
-        // server snapshot arrives. Only a rendered server snapshot admits input.
         guard generation == rendererGeneration, snapshotReceived, !streamEnded else { return }
         snapshotReady = true
     }
@@ -279,7 +277,7 @@ private struct CmuxPendingCreation: Codable {
         let current = { self.connectionGeneration == connection && self.attachmentGeneration == attachment && self.attachedProfileID == profileID && self.selectedID == terminalID && self.draftIdentity == identity }
         guard draft.text.utf8.count <= 32 * 1024 else { notice = "Send at most 32 KiB in one prompt."; return }
         let requestID = UUID().uuidString, text = draft.text
-        draft.pendingID = requestID; draft.pendingText = text
+        draft.pending = PendingSend(id: requestID, text: text)
         do { try drafts.save(draft, identity: identity) } catch { notice = error.localizedDescription; return }
         busy = true; busyAttachment = attachment
         defer { if current() { busy = false; busyAttachment = nil } }
@@ -289,11 +287,11 @@ private struct CmuxPendingCreation: Codable {
             guard connected, attached, snapshotReady, inputEnabled, !directInput else { throw DesktopError("Input stopped before Enter. Inspect the pasted text before continuing.") }
             _ = try await backend.send(Data([13]))
             guard current() else { return }
-            guard draft.pendingID == requestID else { throw DesktopError("The pending draft changed. Inspect the terminal before continuing.") }
+            guard draft.pending?.id == requestID else { throw DesktopError("The pending draft changed. Inspect the terminal before continuing.") }
             var updated = draft
-            updated.lastQueuedText = updated.pendingText
-            if updated.text == updated.pendingText { updated.text = "" }
-            updated.pendingID = nil; updated.pendingText = nil
+            updated.lastQueuedText = updated.pending?.text
+            if updated.text == updated.pending?.text { updated.text = "" }
+            updated.pending = nil
             try drafts.save(updated, identity: identity)
             draft = updated
             notice = "Queued to connection. Delivery and agent execution are not confirmed."
@@ -303,8 +301,8 @@ private struct CmuxPendingCreation: Codable {
     func clearPendingAfterReview() {
         guard !busy else { return }
         var updated = draft
-        if updated.text == updated.pendingText { updated.text = "" }
-        updated.pendingID = nil; updated.pendingText = nil
+        if updated.text == updated.pending?.text { updated.text = "" }
+        updated.pending = nil
         do {
             if let draftIdentity { try drafts.save(updated, identity: draftIdentity) }
             draft = updated; notice = "Pending send cleared after your review. It was not resent."
@@ -313,7 +311,7 @@ private struct CmuxPendingCreation: Codable {
     }
 
     func restoreLastQueuedPrompt() {
-        guard draft.text.isEmpty, draft.pendingID == nil, let text = draft.lastQueuedText else { return }
+        guard draft.text.isEmpty, draft.pending == nil, let text = draft.lastQueuedText else { return }
         setDraft(text)
         notice = "Last queued prompt restored locally. Check the terminal before choosing to send it again."
     }
@@ -367,8 +365,7 @@ private struct CmuxPendingCreation: Codable {
         defer { if current() { busy = false } }
         do {
             let result = try await backend.createTerminal(argv: pendingCreation.argv, cwd: pendingCreation.cwd, name: pendingCreation.name, mutationID: pendingCreation.id)
-            // Settle only this profile's exact receipt, even if the UI moved on.
-            if try drafts.read(identity).pendingID == pendingCreation.id { try drafts.save(DraftRecord(), identity: identity) }
+            if try drafts.read(identity).pending?.id == pendingCreation.id { try drafts.save(DraftRecord(), identity: identity) }
             guard current(), self.pendingCreation?.id == pendingCreation.id else { return }
             self.pendingCreation = nil
             creationPending = false
@@ -394,11 +391,11 @@ private struct CmuxPendingCreation: Codable {
         defer { if current() { busy = false } }
         do {
             var receipt = try drafts.read(identity)
-            let mutationID = receipt.pendingID ?? UUID().uuidString
-            receipt.pendingID = mutationID
+            let mutationID = receipt.pending?.id ?? UUID().uuidString
+            receipt.pending = PendingSend(id: mutationID, text: id)
             try drafts.save(receipt, identity: identity)
             try await backend.closeTerminal(id, mutationID: mutationID)
-            if try drafts.read(identity).pendingID == mutationID { try drafts.save(DraftRecord(), identity: identity) }
+            if try drafts.read(identity).pending?.id == mutationID { try drafts.save(DraftRecord(), identity: identity) }
             guard current() else { return }
             if id == selectedID { inputEnabled = false; directInput = false; attached = false }
             notice = "The server confirmed terminal termination."; await refresh()
@@ -431,43 +428,138 @@ private struct CmuxPendingCreation: Codable {
     }
     private func savePendingCreation(_ pendingCreation: CmuxPendingCreation?, profileID: String) throws {
         var record = DraftRecord()
-        if let pendingCreation { record.pendingID = pendingCreation.id; record.pendingText = String(decoding: try JSONEncoder().encode(pendingCreation), as: UTF8.self) }
+        if let pendingCreation {
+            record.pending = PendingSend(id: pendingCreation.id, text: String(decoding: try JSONEncoder().encode(pendingCreation), as: UTF8.self))
+        }
         try drafts.save(record, identity: "cmux:\(profileID):creation")
     }
     private func loadPendingCreation() {
         do {
             let record = try drafts.read("cmux:\(activeID):creation")
-            pendingCreation = try record.pendingText.map { try JSONDecoder().decode(CmuxPendingCreation.self, from: Data($0.utf8)) }
+            pendingCreation = try record.pending.map { try JSONDecoder().decode(CmuxPendingCreation.self, from: Data($0.text.utf8)) }
             creationPending = pendingCreation != nil
         } catch { notice = error.localizedDescription }
     }
 }
 
-/// Backpressure is applied on the SDK thread before scheduling MainActor work.
-/// Exactly one drain is outstanding; overflow forces a fresh server snapshot.
-private final class CmuxOutputBuffer: @unchecked Sendable {
-    private let lock = NSLock()
-    private var events: [CmuxTerminalOutput] = []
-    private var byteCount = 0
-    private var scheduled = false
-    private var canceled = false
-    private var failed = false
-    private let deliver: @MainActor @Sendable ([CmuxTerminalOutput]) -> Void
-    init(deliver: @escaping @MainActor @Sendable ([CmuxTerminalOutput]) -> Void) { self.deliver = deliver }
+private final class LockFreeInt64: @unchecked Sendable {
+    private let storage: UnsafeMutablePointer<infinite_atomic_int64>
+
+    init(_ initial: Int64 = 0) {
+        storage = .allocate(capacity: 1)
+        infinite_atomic_init(storage, initial)
+    }
+
+    deinit {
+        storage.deallocate()
+    }
+
+    func load() -> Int64 { infinite_atomic_load(storage) }
+    func store(_ value: Int64) { infinite_atomic_store(storage, value) }
+    @discardableResult func add(_ delta: Int64) -> Int64 { infinite_atomic_fetch_add(storage, delta) + delta }
+    @discardableResult func sub(_ delta: Int64) -> Int64 { infinite_atomic_fetch_sub(storage, delta) - delta }
+}
+
+final class CmuxOutputBuffer: Sendable {
+    private static let maximumBufferedEvents = 512
+    private static let maximumBufferedBytes: Int64 = 16 * 1024 * 1024
+    private let continuation: AsyncStream<CmuxTerminalOutput>.Continuation
+    private let queuedBytes = LockFreeInt64(0)
+    private let overflowed = LockFreeInt64(0)
+    private let canceled = LockFreeInt64(0)
+    private let consumer: Task<Void, Never>
+
+    init(deliver: @escaping @MainActor @Sendable ([CmuxTerminalOutput]) -> Void) {
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: CmuxTerminalOutput.self,
+            bufferingPolicy: .bufferingOldest(Self.maximumBufferedEvents)
+        )
+        self.continuation = continuation
+        let queuedBytes = self.queuedBytes
+        let overflowed = self.overflowed
+        let canceled = self.canceled
+        self.consumer = Task { @MainActor in
+            var batch: [CmuxTerminalOutput] = []
+            var flushTask: Task<Void, Never>?
+            var deliveredOverflow = false
+            defer { flushTask?.cancel() }
+            @MainActor func deliverOverflowOnce() {
+                guard !deliveredOverflow, !Task.isCancelled, canceled.load() == 0 else { return }
+                deliveredOverflow = true
+                batch.removeAll()
+                flushTask?.cancel()
+                flushTask = nil
+                continuation.finish()
+                deliver([.invalidFrame])
+            }
+            for await event in stream {
+                if Task.isCancelled || canceled.load() != 0 { break }
+                if overflowed.load() != 0 {
+                    deliverOverflowOnce()
+                    return
+                }
+                queuedBytes.sub(Self.byteSize(of: event))
+                batch.append(event)
+                if flushTask == nil {
+                    flushTask = Task { @MainActor in
+                        await Task.yield()
+                        flushTask = nil
+                        guard !Task.isCancelled, canceled.load() == 0 else { return }
+                        if overflowed.load() != 0 {
+                            deliverOverflowOnce()
+                            return
+                        }
+                        guard !batch.isEmpty else { return }
+                        let out = batch
+                        batch.removeAll()
+                        deliver(out)
+                    }
+                }
+            }
+            if Task.isCancelled || canceled.load() != 0 { return }
+            flushTask?.cancel()
+            flushTask = nil
+            if overflowed.load() != 0 {
+                deliverOverflowOnce()
+            } else if !batch.isEmpty {
+                deliver(batch)
+            }
+        }
+    }
+
     func append(_ event: CmuxTerminalOutput) {
-        lock.lock()
-        guard !canceled, !failed else { lock.unlock(); return }
-        let size: Int
-        switch event { case .snapshot(let bytes, _, _), .bytes(let bytes): size = bytes.count; default: size = 0 }
-        if events.count >= 512 || byteCount + size > 16 * 1024 * 1024 {
-            events = [.invalidFrame]; byteCount = 0; failed = true
-        } else { events.append(event); byteCount += size }
-        let shouldSchedule = !scheduled; scheduled = true; lock.unlock()
-        if shouldSchedule { Task { @MainActor in self.flush() } }
+        guard canceled.load() == 0, overflowed.load() == 0 else { return }
+        let size = Self.byteSize(of: event)
+        if queuedBytes.add(size) > Self.maximumBufferedBytes {
+            queuedBytes.sub(size)
+            overflowed.store(1)
+            continuation.yield(.invalidFrame)
+            continuation.finish()
+            return
+        }
+        if case .dropped = continuation.yield(event) {
+            queuedBytes.sub(size)
+            overflowed.store(1)
+            continuation.finish()
+        }
     }
-    @MainActor private func flush() {
-        lock.lock(); let batch = canceled ? [] : events; events.removeAll(); byteCount = 0; scheduled = false; lock.unlock()
-        if !batch.isEmpty { deliver(batch) }
+
+    func cancel() {
+        canceled.store(1)
+        continuation.finish()
+        consumer.cancel()
     }
-    func cancel() { lock.lock(); canceled = true; events.removeAll(); byteCount = 0; lock.unlock() }
+
+    deinit {
+        canceled.store(1)
+        continuation.finish()
+        consumer.cancel()
+    }
+
+    private static func byteSize(of event: CmuxTerminalOutput) -> Int64 {
+        switch event {
+        case .snapshot(let bytes, _, _), .bytes(let bytes): return Int64(bytes.count)
+        default: return 0
+        }
+    }
 }

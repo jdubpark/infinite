@@ -1,29 +1,75 @@
 import Foundation
 import Darwin
 
-/// Native terminal bytes use the public cmux C SDK. The bundled cmux executable
-/// supplies the authenticated resource and workspace RPC APIs absent from C.
-/// All remote requests travel through normal enrolled Noise connections.
 public actor CmuxBackend {
+    private struct ConnectingSession {
+        let id: UUID
+        var helper: CmuxHelperProcess?
+        let runtimeDirectory: URL
+        let vault: CmuxIdentityVault
+    }
+
+    private struct ConnectedSession {
+        let helper: CmuxHelperProcess
+        var workspaceHelper: CmuxHelperProcess?
+        let runtimeDirectory: URL
+        let vault: CmuxIdentityVault
+        let helperURL: URL
+        let route: String
+        let deviceName: String
+    }
+
+    private enum SessionState {
+        case disconnected
+        case connecting(ConnectingSession)
+        case connected(ConnectedSession)
+        case disconnecting(Task<Void, Error>)
+        case cleanupFailed(vault: CmuxIdentityVault, runtimeDirectory: URL)
+    }
+
+    private enum TeardownOutcome {
+        case succeeded
+        case cleanupFailed(vault: CmuxIdentityVault, runtimeDirectory: URL)
+    }
+
     private let terminal = CmuxConnection()
-    private var helper: CmuxHelperProcess?
-    private var workspaceHelper: CmuxHelperProcess?
-    private var runtimeDirectory: URL?
-    private var vault: CmuxIdentityVault?
-    private var helperURL: URL?
-    private var route = ""
-    private var deviceName = "Infinite Desktop"
+    private var state: SessionState = .disconnected
+    private var rpcActive = false
+    private var rpcWaiters: [CheckedContinuation<Void, Never>] = []
 
     public init() {}
 
-    /// Enrollment needs approval at the server. Invitations are sent through
-    /// stdin and never placed in a process argument or saved profile.
+    private func acquireRPC() async {
+        if !rpcActive {
+            rpcActive = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            rpcWaiters.append(continuation)
+        }
+    }
+
+    private func releaseRPC() {
+        if !rpcWaiters.isEmpty {
+            let next = rpcWaiters.removeFirst()
+            next.resume()
+        } else {
+            rpcActive = false
+        }
+    }
+
+    private func assertStillConnecting(_ connectID: UUID) throws {
+        guard case .connecting(let current) = state, current.id == connectID else {
+            throw CmuxTransportError.notConnected
+        }
+    }
+
     public func connect(
         profileID: String, route: String, helperURL: URL,
         invitation: String? = nil, deviceName: String = "Infinite Desktop",
         onState: @escaping @Sendable (JSON) -> Void = { _ in }
     ) async throws {
-        guard helper == nil, runtimeDirectory == nil else { throw CmuxTransportError.alreadyConnected }
+        guard case .disconnected = state else { throw CmuxTransportError.alreadyConnected }
         guard let url = URL(string: route), url.user == nil, url.password == nil,
               let scheme = url.scheme?.lowercased(), ["wss", "ws", "iroh"].contains(scheme),
               scheme != "ws" || ["127.0.0.1", "localhost", "::1", "[::1]"].contains(url.host ?? ""),
@@ -34,8 +80,6 @@ public actor CmuxBackend {
         guard helperURL.isFileURL, FileManager.default.isExecutableFile(atPath: helperURL.path) else {
             throw CmuxTransportError.invalidConfiguration("This build is missing its cmux helper executable.")
         }
-        // Invitations can provide this route to the helper; the C SDK uses
-        // the supplied path literally. Give both clients the same endpoint.
         guard var endpoint = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
             throw CmuxTransportError.invalidConfiguration("The cmux route is invalid.")
         }
@@ -47,41 +91,64 @@ public actor CmuxBackend {
         }
         let vault = CmuxIdentityVault(profileID: profileID)
         let directory = try vault.materialize()
-        self.vault = vault; runtimeDirectory = directory
-        self.helperURL = helperURL; self.route = resolvedRoute; self.deviceName = deviceName
+        let connectID = UUID()
+        state = .connecting(ConnectingSession(id: connectID, helper: nil, runtimeDirectory: directory, vault: vault))
+        var helper: CmuxHelperProcess?
         do {
-            var arguments = connectionArguments(command: "connect", directory: directory)
+            var arguments = connectionArguments(command: "connect", directory: directory, route: resolvedRoute, deviceName: deviceName)
             arguments += ["--headless", "--json", "--local-socket", directory.appendingPathComponent("control.sock").path]
             if invitation != nil { arguments += ["--invite-file", "-"] }
-            let helper = try CmuxHelperProcess(executable: helperURL, arguments: arguments, observe: onState)
-            self.helper = helper
-            if let invitation { try helper.write(Data((invitation + "\n").utf8)) }
+            let spawned = try CmuxHelperProcess(executable: helperURL, arguments: arguments, observe: onState)
+            helper = spawned
+            if case .connecting(var current) = state, current.id == connectID {
+                current.helper = spawned
+                state = .connecting(current)
+            } else {
+                throw CmuxTransportError.notConnected
+            }
+            if let invitation { try await spawned.write(Data((invitation + "\n").utf8)) }
+            try assertStillConnecting(connectID)
             let deadline = Date().addingTimeInterval(65)
             var connected = false
             while Date() < deadline {
-                let state = try JSON.parse(helper.readLine(deadline: deadline))
-                if state["event"].string == "connection-snapshot", state["connection"]["state"].string == "connected" {
+                let snapshot = try JSON.parse(await spawned.readLine(deadline: deadline))
+                try assertStillConnecting(connectID)
+                if snapshot["event"].string == "connection-snapshot", snapshot["connection"]["state"].string == "connected" {
                     connected = true; break
                 }
             }
             guard connected else { throw CmuxTransportError.failed("The cmux enrollment or connection timed out.") }
-            helper.discardQueuedOutput()
-            // Save both the device secret and authenticated daemon pin before
-            // opening the second client with that identity.
+            await spawned.discardQueuedOutput()
+            try assertStillConnecting(connectID)
             try vault.save(from: directory)
-            // The CLI appends "client" to its state root; the C ABI expects the
-            // identity directory itself. Both must use the same enrolled key.
             try await terminal.connect(route: resolvedRoute, stateDirectory: directory.appendingPathComponent("client"), deviceName: deviceName)
+            try assertStillConnecting(connectID)
             try vault.save(from: directory)
+            state = .connected(ConnectedSession(
+                helper: spawned,
+                workspaceHelper: nil,
+                runtimeDirectory: directory,
+                vault: vault,
+                helperURL: helperURL,
+                route: resolvedRoute,
+                deviceName: deviceName
+            ))
         } catch {
-            await terminal.disconnect()
-            helper?.stop(); helper = nil
-            do {
-                try vault.save(from: directory)
-                try vault.eraseRuntime(directory)
-                runtimeDirectory = nil; self.vault = nil
-            } catch {
-                throw CmuxTransportError.failed("Connection failed and the identity could not be saved to Keychain. Retry disconnect before closing the app.")
+            let ownedAttempt: Bool
+            if case .connecting(let current) = state, current.id == connectID {
+                ownedAttempt = true
+            } else {
+                ownedAttempt = false
+            }
+            if ownedAttempt {
+                let teardown = beginTeardown(helper: helper, workspaceHelper: nil, vault: vault, runtimeDirectory: directory)
+                do {
+                    try await teardown.value
+                } catch {
+                    throw CmuxTransportError.failed("Connection failed and the identity could not be saved to Keychain. Retry disconnect before closing the app.")
+                }
+            } else if let helper {
+                await helper.stop()
             }
             throw error
         }
@@ -91,10 +158,8 @@ public actor CmuxBackend {
         try resource(operation: "session.snapshot")
     }
 
-    /// Mutation keys are caller-owned. Preserve the same key if reconciling an
-    /// ambiguous response; this client never retries a mutation automatically.
     public func resource(operation: String, params: [String: JSON] = [:], mutationID: String? = nil) throws -> JSON {
-        guard helper != nil, let directory = runtimeDirectory else { throw CmuxTransportError.notConnected }
+        guard case .connected(let session) = state else { throw CmuxTransportError.notConnected }
         guard !operation.isEmpty, operation.utf8.count <= 128 else {
             throw CmuxTransportError.invalidConfiguration("The resource operation is invalid.")
         }
@@ -105,7 +170,7 @@ public actor CmuxBackend {
         var request: [String: JSON] = ["protocol": .string("cmux.protocol/2"), "type": .string("request"),
                                       "id": .string(id), "operation": .string(operation), "params": .object(parameters)]
         if let mutationID { request["idempotency_key"] = .string(mutationID) }
-        let response = try CmuxUnixRequest.perform(socketPath: directory.appendingPathComponent("control.sock").path, request: .object(request))
+        let response = try CmuxUnixRequest.perform(socketPath: session.runtimeDirectory.appendingPathComponent("control.sock").path, request: .object(request))
         guard response["protocol"].string == "cmux.protocol/2", response["type"].string == "response", response["id"].string == id else {
             throw CmuxTransportError.failed("The cmux resource response did not match its request. Refresh before retrying a mutation.")
         }
@@ -115,8 +180,6 @@ public actor CmuxBackend {
         return response["result"]
     }
 
-    /// Launches exact argv in a remote directory. This never builds a shell
-    /// command from user text and never auto-retries either creation mutation.
     public func createTerminal(
         argv: [String], cwd: String, name: String,
         workspaceID: String? = nil, mutationID: String = UUID().uuidString
@@ -137,28 +200,38 @@ public actor CmuxBackend {
         return CmuxCreatedTerminal(terminalID: id, workspaceID: workspace)
     }
 
-    /// This explicitly terminates a server PTY. Disconnect and detach do not.
     public func closeTerminal(_ terminalID: String, mutationID: String = UUID().uuidString) throws {
         _ = try resource(operation: "terminal.close", params: ["terminal": .string(terminalID)], mutationID: mutationID)
     }
 
-    /// Workspace RPC has a separate handle namespace from terminal resources.
-    /// Handles remain valid for this persistent connection. A transport failure
-    /// invalidates this channel; callers must reopen their file workspace.
-    public func workspaceRPC(_ request: JSON) throws -> JSON {
-        guard helper != nil, let directory = runtimeDirectory, let helperURL else { throw CmuxTransportError.notConnected }
-        if workspaceHelper == nil {
-            workspaceHelper = try CmuxHelperProcess(executable: helperURL, arguments: connectionArguments(command: "rpc", directory: directory))
+    public func workspaceRPC(_ request: JSON) async throws -> JSON {
+        await acquireRPC()
+        defer { releaseRPC() }
+        guard case .connected(var session) = state else { throw CmuxTransportError.notConnected }
+        let process: CmuxHelperProcess
+        if let existing = session.workspaceHelper {
+            process = existing
+        } else {
+            let created = try CmuxHelperProcess(
+                executable: session.helperURL,
+                arguments: connectionArguments(command: "rpc", directory: session.runtimeDirectory, route: session.route, deviceName: session.deviceName)
+            )
+            session.workspaceHelper = created
+            state = .connected(session)
+            process = created
         }
-        guard let process = workspaceHelper else { throw CmuxTransportError.notConnected }
         do {
             var data = try request.data()
             guard data.count <= 4 * 1024 * 1024 else { throw CmuxTransportError.invalidConfiguration("The workspace request exceeds 4 MiB.") }
             data.append(10)
-            try process.write(data)
-            return try JSON.parse(process.readLine(deadline: Date().addingTimeInterval(45)))
+            try await process.write(data)
+            return try JSON.parse(await process.readLine(deadline: Date().addingTimeInterval(45)))
         } catch {
-            process.stop(); workspaceHelper = nil
+            await process.stop()
+            if case .connected(var current) = state, current.workspaceHelper === process {
+                current.workspaceHelper = nil
+                state = .connected(current)
+            }
             throw error
         }
     }
@@ -171,65 +244,136 @@ public actor CmuxBackend {
     public func resize(columns: Int, rows: Int) async throws { try await terminal.resize(columns: columns, rows: rows) }
     public func detach() async { await terminal.detach() }
 
-    public func disconnect() async throws {
-        await terminal.disconnect()
-        workspaceHelper?.stop(); workspaceHelper = nil
-        helper?.stop(); helper = nil
-        if let runtimeDirectory, let vault {
-            // Preserve identity on a Keychain failure; the caller can retry.
-            try vault.save(from: runtimeDirectory)
-            try vault.eraseRuntime(runtimeDirectory)
+    private func beginTeardown(
+        helper: CmuxHelperProcess?,
+        workspaceHelper: CmuxHelperProcess?,
+        vault: CmuxIdentityVault,
+        runtimeDirectory: URL
+    ) -> Task<Void, Error> {
+        let task = Task<Void, Error> {
+            await self.terminal.disconnect()
+            if let workspaceHelper { await workspaceHelper.stop() }
+            if let helper { await helper.stop() }
+            do {
+                try vault.save(from: runtimeDirectory)
+                try vault.eraseRuntime(runtimeDirectory)
+                self.finishTeardown(.succeeded)
+            } catch {
+                self.finishTeardown(.cleanupFailed(vault: vault, runtimeDirectory: runtimeDirectory))
+                throw error
+            }
         }
-        runtimeDirectory = nil; vault = nil; helperURL = nil; route = ""
+        state = .disconnecting(task)
+        return task
     }
 
-    private func connectionArguments(command: String, directory: URL) -> [String] {
+    private func finishTeardown(_ outcome: TeardownOutcome) {
+        switch outcome {
+        case .succeeded:
+            state = .disconnected
+        case .cleanupFailed(let vault, let runtimeDirectory):
+            state = .cleanupFailed(vault: vault, runtimeDirectory: runtimeDirectory)
+        }
+    }
+
+    public func disconnect() async throws {
+        switch state {
+        case .disconnected:
+            await terminal.disconnect()
+        case .connecting(let connecting):
+            try await beginTeardown(
+                helper: connecting.helper,
+                workspaceHelper: nil,
+                vault: connecting.vault,
+                runtimeDirectory: connecting.runtimeDirectory
+            ).value
+        case .connected(let session):
+            try await beginTeardown(
+                helper: session.helper,
+                workspaceHelper: session.workspaceHelper,
+                vault: session.vault,
+                runtimeDirectory: session.runtimeDirectory
+            ).value
+        case .disconnecting(let task):
+            try await task.value
+        case .cleanupFailed(let vault, let runtimeDirectory):
+            try await beginTeardown(
+                helper: nil,
+                workspaceHelper: nil,
+                vault: vault,
+                runtimeDirectory: runtimeDirectory
+            ).value
+        }
+    }
+
+    private func connectionArguments(command: String, directory: URL, route: String, deviceName: String) -> [String] {
         ["remote", command, route, "--state-dir", directory.path, "--device-name", deviceName,
          "--connect-timeout-seconds", "60", "--reconnect-attempts", "1"]
     }
 }
 
-/// Runs only the bundled executable with an argument vector. Output is bounded;
-/// stdin carries invitations and JSON, so secrets never enter process arguments.
-private final class CmuxHelperProcess: @unchecked Sendable {
+private enum CmuxHelperEvent: Sendable {
+    case stdout(Data)
+    case stderr(Data)
+    case terminated
+}
+
+private actor CmuxHelperProcess {
     private let process = Process()
     private let input = Pipe()
     private let output = Pipe()
     private let errorOutput = Pipe()
-    private let condition = NSCondition()
+    private let eventContinuation: AsyncStream<CmuxHelperEvent>.Continuation
     private var partial = Data()
     private var lines: [Data] = []
     private var queuedBytes = 0
     private var failure: String?
     private var standardError = Data()
     private var ended = false
+    private var terminated = false
     private var discard = false
+    private var lineWaiter: (id: UUID, continuation: CheckedContinuation<Data, Error>)?
+    private var canceledLineWaiters: Set<UUID> = []
+    private var terminationWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var canceledTerminationWaiters: Set<UUID> = []
     private let observe: (@Sendable (JSON) -> Void)?
 
     init(executable: URL, arguments: [String], observe: (@Sendable (JSON) -> Void)? = nil) throws {
         self.observe = observe
-        process.executableURL = executable; process.arguments = arguments
-        process.standardInput = input; process.standardOutput = output; process.standardError = errorOutput
-        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        let (eventStream, continuation) = AsyncStream.makeStream(of: CmuxHelperEvent.self)
+        self.eventContinuation = continuation
+        process.executableURL = executable
+        process.arguments = arguments
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = errorOutput
+        output.fileHandleForReading.readabilityHandler = { handle in
             let bytes = handle.availableData
             if bytes.isEmpty { handle.readabilityHandler = nil }
-            self?.receive(bytes)
+            continuation.yield(.stdout(bytes))
         }
-        // Keep a bounded diagnostic in memory for the local UI; never log it.
-        errorOutput.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        errorOutput.fileHandleForReading.readabilityHandler = { handle in
             let bytes = handle.availableData
             if bytes.isEmpty { handle.readabilityHandler = nil }
-            guard let self else { return }; self.condition.lock()
-            self.standardError.append(bytes)
-            if self.standardError.count > 4096 { self.standardError = self.standardError.suffix(4096) }
-            self.condition.unlock()
+            continuation.yield(.stderr(bytes))
         }
-        process.terminationHandler = { [weak self] _ in
-            guard let self else { return }; self.condition.lock()
-            self.ended = true; self.condition.broadcast(); self.condition.unlock()
+        process.terminationHandler = { _ in
+            continuation.yield(.terminated)
         }
-        do { try process.run() }
-        catch { output.fileHandleForReading.readabilityHandler = nil; errorOutput.fileHandleForReading.readabilityHandler = nil; throw error }
+        do {
+            try process.run()
+        } catch {
+            output.fileHandleForReading.readabilityHandler = nil
+            errorOutput.fileHandleForReading.readabilityHandler = nil
+            process.terminationHandler = nil
+            continuation.finish()
+            throw error
+        }
+        Task { [weak self] in
+            for await event in eventStream {
+                await self?.handle(event)
+            }
+        }
     }
 
     func write(_ data: Data) throws {
@@ -237,61 +381,208 @@ private final class CmuxHelperProcess: @unchecked Sendable {
         try input.fileHandleForWriting.write(contentsOf: data)
     }
 
-    func readLine(deadline: Date) throws -> Data {
-        condition.lock(); defer { condition.unlock() }
-        while lines.isEmpty && failure == nil && !ended {
-            guard condition.wait(until: deadline) else {
-                throw CmuxTransportError.failed("The cmux request timed out. Its remote outcome may be unknown; refresh before retrying.")
-            }
+    func readLine(deadline: Date) async throws -> Data {
+        if !lines.isEmpty {
+            let line = lines.removeFirst()
+            queuedBytes -= line.count
+            return line
         }
         if let failure { throw CmuxTransportError.failed(failure) }
-        guard !lines.isEmpty else {
-            let diagnostic = String(decoding: standardError, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            throw CmuxTransportError.failed(diagnostic.isEmpty ? "The cmux helper connection ended. Check enrollment or device revocation at the server." : diagnostic)
+        if ended { throw eofError() }
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else {
+            throw CmuxTransportError.failed("The cmux request timed out. Its remote outcome may be unknown; refresh before retrying.")
         }
-        let line = lines.removeFirst(); queuedBytes -= line.count; return line
+        let waiterID = UUID()
+        return try await withThrowingTaskGroup(of: Data.self) { group in
+            group.addTask { try await self.waitForLine(id: waiterID) }
+            group.addTask {
+                let nanoseconds = UInt64(max(0, remaining) * 1_000_000_000)
+                try await Task.sleep(nanoseconds: nanoseconds)
+                throw CmuxTransportError.failed("The cmux request timed out. Its remote outcome may be unknown; refresh before retrying.")
+            }
+            defer { group.cancelAll() }
+            return try await group.next()!
+        }
+    }
+
+    private func waitForLine(id: UUID) async throws -> Data {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled || canceledLineWaiters.remove(id) != nil {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                if !lines.isEmpty {
+                    let line = lines.removeFirst()
+                    queuedBytes -= line.count
+                    continuation.resume(returning: line)
+                    return
+                }
+                if let failure {
+                    continuation.resume(throwing: CmuxTransportError.failed(failure))
+                    return
+                }
+                if ended {
+                    continuation.resume(throwing: eofError())
+                    return
+                }
+                if let existing = lineWaiter {
+                    lineWaiter = nil
+                    existing.continuation.resume(throwing: CancellationError())
+                }
+                lineWaiter = (id, continuation)
+            }
+        } onCancel: {
+            Task { await self.cancelLineWaiter(id: id) }
+        }
+    }
+
+    private func cancelLineWaiter(id: UUID) {
+        if let existing = lineWaiter, existing.id == id {
+            lineWaiter = nil
+            existing.continuation.resume(throwing: CancellationError())
+            return
+        }
+        canceledLineWaiters.insert(id)
     }
 
     func discardQueuedOutput() {
-        condition.lock(); discard = true; lines.removeAll(); queuedBytes = 0; condition.unlock()
+        discard = true
+        lines.removeAll()
+        queuedBytes = 0
+    }
+
+    private func handle(_ event: CmuxHelperEvent) {
+        switch event {
+        case .stdout(let bytes):
+            receive(bytes)
+        case .stderr(let bytes):
+            standardError.append(bytes)
+            if standardError.count > 4096 { standardError = standardError.suffix(4096) }
+        case .terminated:
+            ended = true
+            terminated = true
+            let waiters = Array(terminationWaiters.values)
+            terminationWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+            if lines.isEmpty, let existing = lineWaiter {
+                lineWaiter = nil
+                existing.continuation.resume(throwing: failure.map { CmuxTransportError.failed($0) } ?? eofError())
+            }
+        }
     }
 
     private func receive(_ bytes: Data) {
-        condition.lock()
-        if bytes.isEmpty { ended = true; condition.broadcast(); condition.unlock(); return }
+        if bytes.isEmpty {
+            ended = true
+            if lines.isEmpty, let existing = lineWaiter {
+                lineWaiter = nil
+                existing.continuation.resume(throwing: failure.map { CmuxTransportError.failed($0) } ?? eofError())
+            }
+            return
+        }
         partial.append(bytes)
         var observed: [JSON] = []
         while let end = partial.firstIndex(of: 10) {
-            let line = Data(partial[..<end]); partial.removeSubrange(...end)
+            let line = Data(partial[..<end])
+            partial.removeSubrange(...end)
             if observe != nil, let value = try? JSON.parse(line) { observed.append(value) }
             if !discard {
                 if lines.count >= 256 || queuedBytes + line.count > 16 * 1024 * 1024 {
-                    failure = "The cmux helper output exceeded the client limit."; break
+                    failure = "The cmux helper output exceeded the client limit."
+                    break
                 }
-                lines.append(line); queuedBytes += line.count
+                lines.append(line)
+                queuedBytes += line.count
             }
         }
-        if partial.count > 16 * 1024 * 1024 { partial.removeAll(); failure = "The cmux helper frame exceeded the client limit." }
-        condition.broadcast(); condition.unlock()
+        if partial.count > 16 * 1024 * 1024 {
+            partial.removeAll()
+            failure = "The cmux helper frame exceeded the client limit."
+        }
+        if let existing = lineWaiter {
+            if let failure {
+                lineWaiter = nil
+                existing.continuation.resume(throwing: CmuxTransportError.failed(failure))
+            } else if !lines.isEmpty {
+                let line = lines.removeFirst()
+                queuedBytes -= line.count
+                lineWaiter = nil
+                existing.continuation.resume(returning: line)
+            }
+        }
         for value in observed { observe?(value) }
     }
 
-    func stop() {
+    private func eofError() -> CmuxTransportError {
+        let diagnostic = String(decoding: standardError, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return CmuxTransportError.failed(diagnostic.isEmpty ? "The cmux helper connection ended. Check enrollment or device revocation at the server." : diagnostic)
+    }
+
+    func stop() async {
         try? input.fileHandleForWriting.close()
-        if process.isRunning {
+        if process.isRunning && !terminated {
             process.interrupt()
-            let deadline = Date().addingTimeInterval(0.8)
-            condition.lock()
-            while !ended && Date() < deadline { _ = condition.wait(until: deadline) }
-            condition.unlock()
+            await withTaskGroup(of: Void.self) { group in
+                let waiterID = UUID()
+                group.addTask { await self.waitForTermination(id: waiterID) }
+                group.addTask { try? await Task.sleep(nanoseconds: 800_000_000) }
+                await group.next()
+                group.cancelAll()
+            }
             if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
         }
         output.fileHandleForReading.readabilityHandler = nil
         errorOutput.fileHandleForReading.readabilityHandler = nil
-        try? output.fileHandleForReading.close(); try? errorOutput.fileHandleForReading.close()
+        process.terminationHandler = nil
+        try? output.fileHandleForReading.close()
+        try? errorOutput.fileHandleForReading.close()
+        eventContinuation.finish()
+        ended = true
+        if let existing = lineWaiter {
+            lineWaiter = nil
+            existing.continuation.resume(throwing: failure.map { CmuxTransportError.failed($0) } ?? eofError())
+        }
+        canceledLineWaiters.removeAll()
+        canceledTerminationWaiters.removeAll()
     }
 
-    deinit { stop() }
+    private func waitForTermination(id: UUID) async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if terminated || Task.isCancelled || canceledTerminationWaiters.remove(id) != nil {
+                    continuation.resume()
+                    return
+                }
+                terminationWaiters[id] = continuation
+            }
+        } onCancel: {
+            Task { await self.cancelTerminationWaiter(id: id) }
+        }
+    }
+
+    private func cancelTerminationWaiter(id: UUID) {
+        if let waiter = terminationWaiters.removeValue(forKey: id) {
+            waiter.resume()
+            return
+        }
+        canceledTerminationWaiters.insert(id)
+    }
+
+    deinit {
+        output.fileHandleForReading.readabilityHandler = nil
+        errorOutput.fileHandleForReading.readabilityHandler = nil
+        process.terminationHandler = nil
+        if process.isRunning {
+            process.interrupt()
+            _ = Darwin.kill(process.processIdentifier, SIGKILL)
+        }
+        try? input.fileHandleForWriting.close()
+        try? output.fileHandleForReading.close()
+        try? errorOutput.fileHandleForReading.close()
+        eventContinuation.finish()
+    }
 }
 
 private enum CmuxUnixRequest {

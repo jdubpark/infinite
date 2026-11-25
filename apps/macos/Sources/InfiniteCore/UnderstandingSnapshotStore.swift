@@ -1,9 +1,20 @@
 import Foundation
 import CryptoKit
 
-/// Small encrypted, host-scoped cache for the native Understanding page.
-/// Overview and Knowledge writers merge into one versioned envelope.
-public final class UnderstandingSnapshotStore {
+private actor UnderstandingSnapshotStoreRegistry {
+    static let shared = UnderstandingSnapshotStoreRegistry()
+    private var stores: [String: UnderstandingSnapshotStore] = [:]
+
+    func store(for location: DraftLocation) -> UnderstandingSnapshotStore {
+        let key = "\(location.service)|\(location.directory)"
+        if let existing = stores[key] { return existing }
+        let created = UnderstandingSnapshotStore(location: location)
+        stores[key] = created
+        return created
+    }
+}
+
+public actor UnderstandingSnapshotStore {
     public struct Envelope: Codable, Sendable {
         public let version: Int
         public var overview: Data?
@@ -43,7 +54,6 @@ public final class UnderstandingSnapshotStore {
                 guard current.version == 1 else { throw DesktopError("Cached Understanding uses an unsupported version.") }
                 envelope = current
             } else {
-                // Migrate prior raw-overview and combined Knowledge payloads in place on next write.
                 let payload = try values.decode(Data.self, forKey: .payload)
                 envelope = try Self.migrateLegacy(payload)
             }
@@ -67,7 +77,6 @@ public final class UnderstandingSnapshotStore {
         }
     }
     private struct Archive: Codable { var snapshots: [Snapshot] }
-    private static let archiveLock = NSLock()
     private let directory: URL
     private let service: String
     private let fileName = "workspace-snapshots.sealed"
@@ -78,6 +87,10 @@ public final class UnderstandingSnapshotStore {
     private let lifetime: TimeInterval = 24 * 60 * 60
     private var key: SymmetricKey?
 
+    public static func shared(location: DraftLocation = DraftLocation(bundleID: Bundle.main.bundleIdentifier)) async -> UnderstandingSnapshotStore {
+        await UnderstandingSnapshotStoreRegistry.shared.store(for: location)
+    }
+
     public init(location: DraftLocation = DraftLocation(bundleID: Bundle.main.bundleIdentifier)) {
         directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Infinite/Understanding-\(URL(fileURLWithPath: location.directory).lastPathComponent)", isDirectory: true)
@@ -85,10 +98,6 @@ public final class UnderstandingSnapshotStore {
     }
 
     private var file: URL { directory.appendingPathComponent(fileName) }
-    private func locked<T>(_ action: () throws -> T) rethrows -> T {
-        Self.archiveLock.lock(); defer { Self.archiveLock.unlock() }
-        return try action()
-    }
     private func encryptionKey(create: Bool) throws -> SymmetricKey? {
         if let key { return key }
         if let stored = try? DeviceKeychain.read("snapshot-key", service: service),
@@ -125,19 +134,15 @@ public final class UnderstandingSnapshotStore {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
     }
     public func read(host: String, credential: String, workspace: String, membershipRevision: Int, now: Date = Date()) throws -> Snapshot? {
-        try locked {
-            try readArchive().snapshots.first {
-                $0.host == host && $0.credential == credential && $0.workspace == workspace &&
-                $0.membershipRevision == membershipRevision && now.timeIntervalSince($0.observedAt) <= lifetime && now >= $0.observedAt
-            }
+        try readArchive().snapshots.first {
+            $0.host == host && $0.credential == credential && $0.workspace == workspace &&
+            $0.membershipRevision == membershipRevision && now.timeIntervalSince($0.observedAt) <= lifetime && now >= $0.observedAt
         }
     }
     public func readRecent(host: String, credential: String, now: Date = Date()) throws -> [Snapshot] {
-        try locked {
-            try readArchive().snapshots.filter {
-                $0.host == host && $0.credential == credential && now.timeIntervalSince($0.observedAt) <= lifetime && now >= $0.observedAt
-            }.sorted { $0.observedAt > $1.observedAt }
-        }
+        try readArchive().snapshots.filter {
+            $0.host == host && $0.credential == credential && now.timeIntervalSince($0.observedAt) <= lifetime && now >= $0.observedAt
+        }.sorted { $0.observedAt > $1.observedAt }
     }
     public func mergeOverview(host: String, credential: String, workspace: String, membershipRevision: Int,
                               observedAt: Date = Date(), data: Data) throws {
@@ -166,25 +171,21 @@ public final class UnderstandingSnapshotStore {
     }
     private func merge(host: String, credential: String, workspace: String, membershipRevision: Int,
                        observedAt: Date, update: (inout Envelope) -> Void) throws {
-        try locked {
-            var archive = try readArchive()
-            let existing = archive.snapshots.first { $0.host == host && $0.credential == credential && $0.workspace == workspace && $0.membershipRevision == membershipRevision }
-            archive.snapshots.removeAll { $0.host == host && $0.credential == credential && $0.workspace == workspace }
-            var snapshot = existing ?? Snapshot(host: host, credential: credential, workspace: workspace, membershipRevision: membershipRevision)
-            update(&snapshot.envelope)
-            snapshot.observedAt = observedAt
-            archive.snapshots.insert(snapshot, at: 0)
-            archive.snapshots = Array(archive.snapshots.filter { Date().timeIntervalSince($0.observedAt) <= lifetime }.prefix(maximumSnapshots))
-            try writeArchive(archive)
-        }
+        var archive = try readArchive()
+        let existing = archive.snapshots.first { $0.host == host && $0.credential == credential && $0.workspace == workspace && $0.membershipRevision == membershipRevision }
+        archive.snapshots.removeAll { $0.host == host && $0.credential == credential && $0.workspace == workspace }
+        var snapshot = existing ?? Snapshot(host: host, credential: credential, workspace: workspace, membershipRevision: membershipRevision)
+        update(&snapshot.envelope)
+        snapshot.observedAt = observedAt
+        archive.snapshots.insert(snapshot, at: 0)
+        archive.snapshots = Array(archive.snapshots.filter { Date().timeIntervalSince($0.observedAt) <= lifetime }.prefix(maximumSnapshots))
+        try writeArchive(archive)
     }
     public func clear(host: String, credential: String, workspace: String) throws {
-        try locked {
-            var archive = try readArchive()
-            archive.snapshots.removeAll { $0.host == host && $0.credential == credential && $0.workspace == workspace }
-            if archive.snapshots.isEmpty { try? FileManager.default.removeItem(at: file) }
-            else { try writeArchive(archive) }
-        }
+        var archive = try readArchive()
+        archive.snapshots.removeAll { $0.host == host && $0.credential == credential && $0.workspace == workspace }
+        if archive.snapshots.isEmpty { try? FileManager.default.removeItem(at: file) }
+        else { try writeArchive(archive) }
     }
 }
 

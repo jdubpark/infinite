@@ -4,9 +4,32 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { startHost } from "./helpers.js";
 
 const client = fileURLToPath(new URL("../scripts/cloud-check.py", import.meta.url));
+
+test("a test host recovers if its first listener address is taken during startup", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "host-port-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const occupied = join(dir, "occupied-port");
+  const preload = join(dir, "occupy-port.mjs");
+  writeFileSync(preload, `
+    import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+    import { createServer } from 'node:net';
+    if (process.argv.includes('serve') && !existsSync(process.env.OCCUPIED_PORT)) {
+      const config = JSON.parse(readFileSync(process.argv[process.argv.indexOf('--config') + 1], 'utf8'));
+      const listener = createServer();
+      await new Promise(resolve => listener.listen(config.port, '127.0.0.1', resolve));
+      writeFileSync(process.env.OCCUPIED_PORT, String(config.port));
+      listener.unref();
+    }
+  `);
+  const host = await startHost({ env: { NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`, OCCUPIED_PORT: occupied } });
+  t.after(() => host.stop());
+  assert.ok(Number(readFileSync(occupied, "utf8")) > 0);
+  assert.equal((await host.fetchApi("/me")).status, 200);
+});
 
 test("cloud dispatch preserves Git layers, worktree bytes, cwd, argv and the check's exit status", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "cloud-check-"));

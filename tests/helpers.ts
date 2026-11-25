@@ -82,9 +82,10 @@ export interface Host {
   stop: () => Promise<void>;
 }
 
-export function apiClient(origin: string, tokens: Record<Role, string>): Host["fetchApi"] {
+export function apiClient(origin: string, tokens: Record<Role, string>, timeoutMs?: number): Host["fetchApi"] {
   return async (path, role = "owner", body, headers = {}, method) => {
     const response = await fetch(origin + "/api" + path, {
+      signal: timeoutMs === undefined ? undefined : AbortSignal.timeout(timeoutMs),
       method: method ?? (body ? "POST" : "GET"),
       headers: {
         connection: "close",
@@ -134,7 +135,13 @@ export async function endSessionWorkers(config: Config, started?: readonly numbe
   }
 }
 
-export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
+type HostOptions = { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv };
+
+export function startHost(options: HostOptions = {}): Promise<Host> {
+  return startHostWithPort(options, 3);
+}
+
+async function startHostWithPort(options: HostOptions, attemptsLeft: number): Promise<Host> {
   const root = mkdtempSync("/tmp/inf-test-");
   const port = await freePort();
   const origin = `http://127.0.0.1:${port}`;
@@ -166,6 +173,7 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
   let child: ChildProcess | undefined;
 
   const fetchApi = apiClient(origin, tokens);
+  const probeApi = apiClient(origin, tokens, 1000);
   const stopApi = async () => {
     const api = child;
     if (!api || api.exitCode !== null || api.signalCode !== null) return;
@@ -186,10 +194,10 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     });
     await waitFor(
       async () => {
+        if (api.exitCode !== null || api.signalCode !== null) throw new Error(diagnostics);
         try {
-          return (await fetchApi("/me")).status;
+          return (await probeApi("/me")).status;
         } catch {
-          if (api.exitCode !== null) throw new Error(diagnostics);
           return 0;
         }
       },
@@ -217,6 +225,10 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     await start();
   } catch (error) {
     await stop();
+    const collision = `listen EADDRINUSE: address already in use 127.0.0.1:${port}`;
+    if (attemptsLeft > 1 && options.config?.port === undefined && error instanceof Error && error.message.includes(collision)) {
+      return startHostWithPort(options, attemptsLeft - 1);
+    }
     throw error;
   }
   return { origin, root, config, tokens, fetchApi, start, stopApi, stop };

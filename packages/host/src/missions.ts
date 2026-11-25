@@ -25,7 +25,7 @@ import { KeyedQueue, PendingCreates, mapConcurrent, pauseWithPendingCreates } fr
 import { HALT_PAUSED_TEAM, KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import { missionDecisionQueueCandidates } from "./decision-queue.js";
 import { projectMissionSource } from "./mission-progress.js";
-import { MissionReview, missionSteeringFull, type MissionReviewRecord, type ReviewDirection } from "./mission-review.js";
+import { MissionReview, type MissionReviewRecord, type ReviewDirection, type ReviewForwardOp } from "./mission-review.js";
 
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
 
@@ -45,7 +45,7 @@ type Attempt = { memberId: string; sessionId: string; revision: number; prompt: 
   rotated?: RotationRule;
   usageCursor?: number; contextTokens?: number };
 type RotationRule = "idle" | "size" | "age";
-type ChildOp = { kind: "answer" | "steer" | "pause" | "resume" | "cancel" | "parallelism" | "review-forward"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; parallelism?: number; by?: "owner" | "coordinator" | "connector"; source?: ConnectorSource;
+type ChildOp = { kind: "answer" | "steer" | "pause" | "resume" | "cancel" | "parallelism"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; parallelism?: number; by?: "owner" | "coordinator" | "connector"; source?: ConnectorSource;
   halt?: { token: string; reason?: string } };
 type Stored = {
   mission: Mission;
@@ -61,7 +61,7 @@ type Stored = {
   notes: MissionMessage[];
   notified: string[];
   launches: Record<string, CreateTeam>;
-  ops: ChildOp[];
+  ops: (ChildOp | ReviewForwardOp)[];
   controlSource?: ConnectorSource;
   refusals: number;
   ownerInputs?: number;
@@ -73,6 +73,7 @@ type Stored = {
 };
 
 const now = () => new Date().toISOString();
+const steeringFull = (mission: Mission, text: string) => mission.steering.length >= 20 || Buffer.byteLength([...mission.steering.map(item => item.text), text].join("\n\n")) > 10000;
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const receiptDigest = <T extends object>(value: T & { source?: ConnectorSource | string }) => {
   const { source, ...body } = value;
@@ -135,7 +136,7 @@ export class MissionService {
   private fuse?: FuseGate;
   private readonly review = new MissionReview<Stored>((service => ({ get records() { return service.records; }, get teams() { return service.teams; },
     enqueue: (id, task) => service.enqueue(id, task), save: stored => service.save(stored), event: (stored, text) => service.event(stored, text),
-    follow: (subtask, team) => Object.assign(subtask, { status: subtaskStatus(team.status), teamStatus: team.status }), closed: () => service.closed }))(this));
+    follow: (subtask, team) => Object.assign(subtask, { status: subtaskStatus(team.status), teamStatus: team.status }), held: projectId => service.held(projectId), steeringFull }))(this));
 
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly teams: TeamService, private readonly groups: ProjectGroupLookup) {
     this.directory = join(config.stateDir, "missions");
@@ -511,7 +512,7 @@ export class MissionService {
       authorize?.();
       if (this.replay(stored, "steer", body)) return this.view(stored);
       if (!live.has(mission.status)) throw new TeamError(409, "mission-not-running", "Resume the mission before sending direction, or start a new mission if it has stopped.");
-      if (missionSteeringFull(mission, body.text))
+      if (steeringFull(mission, body.text))
         throw new TeamError(409, "mission-steering-limit", "Start a new mission with consolidated directions.");
       this.admit(stored, "steer", body);
       mission.steering.push({ text: body.text, revision: mission.revision, at: now(), ...(source ? { source } : {}) });
@@ -752,15 +753,17 @@ export class MissionService {
       delete stored.launches[subtaskId]; delete stored.bases?.[subtaskId]; this.save(stored);
     }
   }
+  private held(projectId: string) {
+    for (const other of this.records.values())
+      if (other.mission.subtasks.some(item => item.repoProjectId === projectId && (item.status === "running" || other.launches[item.id]))) return true;
+    return this.teams.activeForProject(projectId);
+  }
   private schedule(stored: Stored) {
     const mission = stored.mission;
-    const busy = new Set<string>();
-    for (const other of this.records.values())
-      for (const item of other.mission.subtasks) if (item.status === "running" || other.launches[item.id]) busy.add(item.repoProjectId);
     for (const subtask of mission.subtasks) {
       if (subtask.status !== "queued" || stored.launches[subtask.id]) continue;
       if (!subtask.dependsOn.every(id => mission.subtasks.find(item => item.id === id)?.status === "done")) continue;
-      if (busy.has(subtask.repoProjectId) || this.teams.activeForProject(subtask.repoProjectId)) { busy.add(subtask.repoProjectId); this.reportHeld(stored, subtask); continue; }
+      if (this.held(subtask.repoProjectId)) { this.reportHeld(stored, subtask); continue; }
       const base = this.baseSubtask(mission, subtask);
       const objective = [
         `Mission: ${mission.title}`,
@@ -773,7 +776,6 @@ export class MissionService {
       if (base) (stored.bases ??= {})[subtask.id] = base.teamId!;
       stored.launches[subtask.id] = { requestId: randomUUID(), projectId: subtask.repoProjectId, provider: mission.lineup.coordinator.provider, useConfiguredLineup: true,
         title: `${subtask.title} · ${mission.title}`.slice(0, 100), objective, parallelism: subtask.size === "solo" ? 1 : subtask.parallelism };
-      busy.add(subtask.repoProjectId);
       this.save(stored);
     }
   }
@@ -869,7 +871,7 @@ export class MissionService {
   private async applyOps(stored: Stored) {
     await this.applySettlements(stored);
     if (this.closed) return;
-    const remaining: ChildOp[] = [], steered: (string | undefined)[] = [];
+    const remaining: Stored["ops"] = [], steered: (string | undefined)[] = [];
     const mission = stored.mission, resumeHeld = mission.status === "paused" || (mission.status === "blocked" && mission.stopReason === "deadline") ||
       Boolean(this.fuse?.held?.(mission.repoProjectIds));
     for (const op of [...stored.ops]) {
@@ -1174,7 +1176,7 @@ export class MissionService {
       try { team = this.teams.get(subtask.teamId!); } catch (error) { if (notFound(error)) continue; throw error; }
       for (const decision of team.decisions.filter(item => item.revision === team.revision && !item.answer)) {
         const escalated = mission.decisions.find(item => item.childDecisionId === decision.id && !item.answer);
-        const answering = stored.ops.find(op => op.kind === "answer" && op.decisionId === decision.id);
+        const answering = stored.ops.find((op): op is ChildOp => op.kind === "answer" && op.decisionId === decision.id);
         open.push({ subtaskId: subtask.id, teamId: team.id, decisionId: decision.id, question: decision.question, options: decision.options,
           ...(decision.answerMode ? { answerMode: decision.answerMode } : {}), ...askedRecommendation(decision),
           ...(escalated ? { ownerDecisionId: escalated.id } : {}), ...(answering ? { answerPendingBy: answering.by ?? "owner" } : {}) });
@@ -1332,9 +1334,9 @@ export class MissionService {
         break;
       }
       case "steer-subtask": {
-        const forward = this.review.queueForward(stored, subtask!, report.text, this.connectorSource(mission));
+        const forward = this.review.queueForward(stored, subtask!, report.text, (stored.ownerInputs ?? 0) === (attempt.ownerInputs ?? 0), this.connectorSource(mission));
         if (forward.kind === "refused") return this.refuse(stored, report.kind, forward.reason, false);
-        if (forward.kind === "queued") break;
+        if (forward.kind !== "none") break;
         if (!["running", "blocked"].includes(subtask!.status) || !subtask!.teamId)
           return this.refuse(stored, report.kind, `Subtask ${subtask!.id} has no running or blocked subteam. A queued subtask receives owner direction when it starts; dispatch a follow-up subtask for finished work.`, false);
         this.queueOp(stored, { kind: "steer", subtaskId: subtask!.id, teamId: subtask!.teamId, text: report.text, by: this.connectorSource(mission) ? "connector" : "coordinator", ...(this.connectorSource(mission) ? { source: this.connectorSource(mission) } : {}) });

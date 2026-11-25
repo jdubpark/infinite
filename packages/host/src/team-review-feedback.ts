@@ -177,8 +177,8 @@ export class TeamReviewFeedback {
     let outcome: "applied" | "refused" | undefined, reason: string | undefined;
     try {
       if (!intent.mission) await this.host.steer(id, { requestId: intent.requestId, revision: intent.targetRevision, text: intent.text }, githubReviewSource(intent.reviewId));
-      else if (!this.missions || await this.missions.direct(intent.mission.missionId, { requestId: intent.requestId, runId: id, subtaskId: intent.mission.subtaskId, reviewId: intent.reviewId,
-        pullRequestUrl: intent.mission.pullRequestUrl, text: intent.text, revision: intent.targetRevision, headCommit: intent.commit }) === "waiting") return;
+      else if (await this.missions?.direct(intent.mission.missionId, { requestId: intent.requestId, runId: id, subtaskId: intent.mission.subtaskId, reviewId: intent.reviewId,
+        pullRequestUrl: intent.mission.pullRequestUrl, text: intent.text, revision: intent.targetRevision, headCommit: intent.commit }) !== "applied") return;
       outcome = "applied";
     } catch (error) {
       if (error instanceof TeamError && error.code !== "team-operation-running") { outcome = "refused"; reason = error.message; }

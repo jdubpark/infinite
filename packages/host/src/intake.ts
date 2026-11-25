@@ -639,7 +639,7 @@ export class IntakeService {
     const record = this.store.forMission(mission.id);
     if (record?.state !== "finished") return;
     this.attemptSync("observe", () => this.store.update(record.issueId, next => {
-      if (next.state === "finished") next.state = "started";
+      next.state = "started";
     }), record.identifier);
   }
 

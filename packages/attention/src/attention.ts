@@ -6,98 +6,157 @@ import { matchDestructive } from "./destructive.js";
 import { roleForLabel } from "./roles.js";
 import { dialogCommand } from "./delegation.js";
 
-const TERMINAL = new Set(["exited", "unavailable", "recording-error"]);
-
-export interface ScreenDecision {
-  open?: Omit<Prompt, "id" | "hash"> & { fingerprint: string };
-  close?: { promptId: number; reason: "vanished" };
-  merge?: DetectedPrompt;
-  idle?: "turn-finished" | "idle";
-  working?: boolean;
-}
+export type ScreenDecision =
+  | { kind: "none" }
+  | { kind: "open"; open: Omit<Prompt, "id" | "hash"> & { fingerprint: string } }
+  | { kind: "merge"; merge: DetectedPrompt }
+  | { kind: "close"; close: { promptId: number; reason: "vanished" } }
+  | { kind: "idle"; idle: "turn-finished" | "idle" }
+  | { kind: "working" };
 
 export function initialAttention(at: string, hasInitialPrompt: boolean): Attention {
-  return {
-    state: hasInitialPrompt ? "working" : "idle",
-    since: at, source: "lifecycle", now: hasInitialPrompt ? "Starting" : "Waiting for your direction",
-    lastActivityAt: at, hooks: "none", hookErrors: 0, sawTurnEnd: false,
+  const base = {
+    since: at, source: "lifecycle" as const, lastActivityAt: at, hooks: "none" as const, hookErrors: 0, sawTurnEnd: false,
   };
+  return hasInitialPrompt
+    ? { ...base, state: "working", now: "Starting" }
+    : { ...base, state: "idle", now: "Waiting for your direction" };
 }
 
-function enter(att: Attention, state: Attention["state"], source: Attention["source"], at: string): Attention {
-  return att.state === state ? { ...att, lastActivityAt: at } : { ...att, state, since: at, source, lastActivityAt: at };
+function transitionTiming(att: Attention, state: Attention["state"], source: Attention["source"], at: string) {
+  return att.state === state ? { since: att.since, source: att.source } : { since: at, source };
 }
 
 export function applyLifecycle(att: Attention, status: "exited" | "unavailable" | "recording-error", at: string): Attention {
-  return { ...enter(att, status, "lifecycle", at), prompt: undefined, now: "" };
+  return {
+    ...transitionTiming(att, status, "lifecycle", at),
+    state: status,
+    now: "",
+    lastActivityAt: at,
+    hooks: att.hooks,
+    hookErrors: att.hookErrors,
+    limit: att.limit,
+    sawTurnEnd: att.sawTurnEnd,
+  };
 }
 
-/**
- * Whether a signal proves the provider works again: a turn-end that did not fail, from a source
- * able to say a turn failed. A Claude hook reports `Stop` or `StopFailure`, and a native adapter
- * carries the turn status. A Codex terminal turn-end, from its Stop hook, notify, or OSC 9, never
- * says the turn failed, so it is no evidence that a limit lifted.
- */
 export function recoveryTurnEnd(data: SignalData): boolean {
   if (data.kind !== "turn-end" || data.failed === true) return false;
   return data.source === "protocol" || (data.provider === "claude" && data.source === "hook");
 }
 
+function updateCurrentState(
+  att: Exclude<Attention, { state: "exited" | "unavailable" | "recording-error" }>,
+  patch: { lastActivityAt: string; hooks: "active" | "none"; limit: Attention["limit"]; hookErrors: number; lastTool?: Attention["lastTool"] },
+): Attention {
+  const base = {
+    since: att.since,
+    source: att.source,
+    now: att.now,
+    lastActivityAt: patch.lastActivityAt,
+    hooks: patch.hooks,
+    hookErrors: patch.hookErrors,
+    limit: patch.limit,
+    sawTurnEnd: att.sawTurnEnd,
+  };
+  switch (att.state) {
+    case "working":
+      return { ...base, state: "working", lastTool: patch.lastTool };
+    case "needs-you":
+      return att.prompt
+        ? { ...base, state: "needs-you", prompt: att.prompt, lastTool: patch.lastTool }
+        : { ...base, source: "lifecycle", state: "needs-you", lastTool: patch.lastTool };
+    case "turn-finished":
+      return { ...base, state: "turn-finished", lastMessage: att.lastMessage };
+    case "idle":
+      return { ...base, state: "idle" };
+  }
+}
+
 export function applySignal(att: Attention, event: SignalEvent): Attention {
-  if (TERMINAL.has(att.state)) return att;
+  if (att.state === "exited" || att.state === "unavailable" || att.state === "recording-error") return att;
   const { data } = event;
   const at = event.at;
-  let next: Attention = { ...att, lastActivityAt: at };
-  if (data.source === "hook" && next.hooks === "none") next.hooks = "active";
+  const hooks = data.source === "hook" || data.kind === "hooks-ready" ? "active" : att.hooks;
   const source = data.source === "host" ? "lifecycle" : data.source;
-  // A prompt with a screen hash belongs to the screen loop: only its block leaving the screen
-  // (or an answer) closes it, so a late turn or tool hook for the same dialog keeps it open.
-  const screenOwned = next.prompt?.hash !== undefined;
+  const screenOwnedPrompt = att.state === "needs-you" && att.prompt?.hash !== undefined ? att.prompt : undefined;
+  const currentTool = att.state === "working" || att.state === "needs-you" ? att.lastTool : undefined;
+  const base = {
+    now: att.now,
+    lastActivityAt: at,
+    hooks,
+    hookErrors: att.hookErrors,
+    limit: att.limit,
+    sawTurnEnd: att.sawTurnEnd,
+  };
+
   switch (data.kind) {
-    case "hooks-ready": next.hooks = "active"; break;
+    case "hooks-ready":
+      return updateCurrentState(att, { ...base, lastTool: currentTool });
     case "turn-start":
-      next = { ...next, lastTool: undefined, lastMessage: undefined };
-      if (!screenOwned) next = { ...enter(next, "working", source, at), prompt: undefined };
-      break;
-    case "tool-start":
-      if (!data.quiet) next.lastTool = { tool: data.tool, summary: toolSummary(data.tool, data.input), at };
-      if (!screenOwned) next = { ...enter(next, "working", source, at), prompt: undefined };
-      break;
-    case "tool-end":
-      if (next.lastTool && next.lastTool.tool === data.tool) next.lastTool = undefined;
-      break;
-    case "prompt-open":
-      next = { ...enter(next, "needs-you", data.prompt.source, at), prompt: { ...data.prompt, id: event.seq } };
-      break;
-    case "prompt-closed":
-      if (next.prompt?.id === data.promptId) next = { ...enter(next, "working", source, at), prompt: undefined };
-      if (rejects(data.label)) next.lastTool = undefined;
-      break;
-    case "answer":
-      // A rejected tool never runs, so it is no longer what the agent is doing.
-      if (rejects(data.option?.label)) next.lastTool = undefined;
-      break;
-    case "turn-end":
-      next = { ...enter(next, "turn-finished", source, at), prompt: undefined, lastTool: undefined, sawTurnEnd: true };
-      next.lastMessage = data.message;
-      // A successful turn proves the provider works again; a failed or unknowable one keeps the observation.
-      if (recoveryTurnEnd(data)) next.limit = undefined;
-      break;
-    case "notice":
-      // The wait ended and the limit lifted.
-      if (data.type === "quota_auto_resume_fired") next.limit = undefined;
-      break;
-    case "provider-limit":
-      if (!(next.limit?.limit === data.limit && next.limit.confidence === "corroborated" && data.confidence === "single-source")) {
-        next.limit = { limit: data.limit, confidence: data.confidence, resetsAt: data.resetsAt, since: at, message: data.message };
+      if (screenOwnedPrompt) {
+        return { ...base, since: att.since, source: att.source, state: "needs-you", prompt: screenOwnedPrompt, lastTool: undefined };
       }
-      break;
+      return { ...base, ...transitionTiming(att, "working", source, at), state: "working", lastTool: undefined };
+    case "tool-start": {
+      const lastTool = data.quiet ? currentTool : { tool: data.tool, summary: toolSummary(data.tool, data.input), at };
+      if (screenOwnedPrompt) {
+        return { ...base, since: att.since, source: att.source, state: "needs-you", prompt: screenOwnedPrompt, lastTool };
+      }
+      return { ...base, ...transitionTiming(att, "working", source, at), state: "working", lastTool };
+    }
+    case "tool-end": {
+      const lastTool = currentTool && currentTool.tool === data.tool ? undefined : currentTool;
+      return updateCurrentState(att, { ...base, lastTool });
+    }
+    case "prompt-open":
+      return {
+        ...base,
+        ...transitionTiming(att, "needs-you", data.prompt.source, at),
+        state: "needs-you",
+        prompt: { ...data.prompt, id: event.seq },
+        lastTool: currentTool,
+      };
+    case "prompt-closed": {
+      const lastTool = rejects(data.label) ? undefined : currentTool;
+      if (att.state === "needs-you" && att.prompt?.id === data.promptId) {
+        return { ...base, ...transitionTiming(att, "working", source, at), state: "working", lastTool };
+      }
+      return updateCurrentState(att, { ...base, lastTool });
+    }
+    case "answer": {
+      const lastTool = rejects(data.option?.label) ? undefined : currentTool;
+      return updateCurrentState(att, { ...base, lastTool });
+    }
+    case "turn-end":
+      return {
+        ...base,
+        ...transitionTiming(att, "turn-finished", source, at),
+        state: "turn-finished",
+        sawTurnEnd: true,
+        lastMessage: data.message,
+        limit: recoveryTurnEnd(data) ? undefined : att.limit,
+      };
+    case "notice":
+      return updateCurrentState(att, {
+        ...base,
+        limit: data.type === "quota_auto_resume_fired" ? undefined : att.limit,
+        lastTool: currentTool,
+      });
+    case "provider-limit": {
+      const keep = att.limit?.limit === data.limit && att.limit.confidence === "corroborated" && data.confidence === "single-source";
+      const limit = keep ? att.limit : { limit: data.limit, confidence: data.confidence, resetsAt: data.resetsAt, since: at, message: data.message };
+      return updateCurrentState(att, { ...base, limit, lastTool: currentTool });
+    }
     case "error":
-      if (data.where === "hooks") next.hookErrors += 1;
-      break;
-    default: break;
+      return updateCurrentState(att, {
+        ...base,
+        hookErrors: att.hookErrors + (data.where === "hooks" ? 1 : 0),
+        lastTool: currentTool,
+      });
+    default:
+      return updateCurrentState(att, { ...base, lastTool: currentTool });
   }
-  return next;
 }
 
 function rejects(label?: string) {
@@ -106,13 +165,8 @@ function rejects(label?: string) {
   return role === "reject" || role === "reject-with-feedback";
 }
 
-/**
- * Whether recording `signal` would drop the open prompt without a `prompt-closed` of its own:
- * a turn-end always does; a turn-start or tool-start does for a hook-only prompt (no hash).
- * The worker journals the close first so every opened prompt is closed exactly once.
- */
 export function dropsPrompt(att: Attention, signal: Signal): boolean {
-  if (!att.prompt || TERMINAL.has(att.state)) return false;
+  if (att.state !== "needs-you" || !att.prompt) return false;
   if (signal.kind === "turn-end") return true;
   if (signal.kind === "turn-start" || signal.kind === "tool-start") return att.prompt.hash === undefined;
   return false;
@@ -120,13 +174,14 @@ export function dropsPrompt(att: Attention, signal: Signal): boolean {
 
 export function screenDecision(att: Attention, detected: DetectedPrompt | null, idle: boolean, outputSinceLastCheck: boolean, at: string): ScreenDecision {
   void at;
-  if (TERMINAL.has(att.state)) return {};
+  if (att.state === "exited" || att.state === "unavailable" || att.state === "recording-error") return { kind: "none" };
   if (detected) {
-    if (att.prompt) {
-      if (att.prompt.hash === undefined || att.prompt.options.length === 0) return { merge: detected };
-      return {};
+    if (att.state === "needs-you" && att.prompt) {
+      if (att.prompt.hash === undefined || att.prompt.options.length === 0) return { kind: "merge", merge: detected };
+      return { kind: "none" };
     }
     return {
+      kind: "open",
       open: {
         kind: detected.kind, title: detected.title, detail: detected.detail, options: detected.options,
         highlighted: detected.highlighted, acceptsText: detected.acceptsText, multiSelect: detected.multiSelect,
@@ -134,20 +189,12 @@ export function screenDecision(att: Attention, detected: DetectedPrompt | null, 
       },
     };
   }
-  if (att.prompt && att.prompt.hash !== undefined) return { close: { promptId: att.prompt.id, reason: "vanished" } };
-  if (idle && !att.prompt) return { idle: att.sawTurnEnd ? "turn-finished" : "idle" };
-  // With hooks active, a finished turn ends only on a turn-start or tool-start hook: a redraw or
-  // late output after the Stop hook is not new work.
-  if (outputSinceLastCheck && (att.state === "idle" || (att.state === "turn-finished" && att.hooks !== "active"))) return { working: true };
-  return {};
+  if (att.state === "needs-you" && att.prompt?.hash !== undefined) return { kind: "close", close: { promptId: att.prompt.id, reason: "vanished" } };
+  if (idle && (!att.prompt)) return { kind: "idle", idle: att.sawTurnEnd ? "turn-finished" : "idle" };
+  if (outputSinceLastCheck && (att.state === "idle" || (att.state === "turn-finished" && att.hooks !== "active"))) return { kind: "working" };
+  return { kind: "none" };
 }
 
-/**
- * The screen's block arrived for a hook prompt. What the phone shows is what the dialog shows:
- * title, detail, options, highlighted and hash come from the block. The hook keeps its tool,
- * its kind unless that is a generic menu, and its destructive flag. Multi-select from either
- * side sticks, so the answer path can refuse it.
- */
 export function mergeScreenIntoPrompt(prompt: Prompt, detected: DetectedPrompt, hash: string): Prompt {
   return {
     ...prompt,
@@ -164,11 +211,6 @@ export function mergeScreenIntoPrompt(prompt: Prompt, detected: DetectedPrompt, 
   };
 }
 
-/**
- * A hook announced the dialog the screen already shows. The open prompt keeps its id, title,
- * detail, options and hash (what the answer path verifies and the phone shows); the hook adds
- * only its kind, tool, destructive flag and multi-select. A flag never goes away once set.
- */
 export function mergeHookIntoPrompt(open: Prompt, hook: Prompt, block: DetectedPrompt): Prompt {
   const hookKind = hook.kind === "permission" || hook.kind === "question" || hook.kind === "elicitation";
   return {
@@ -181,24 +223,14 @@ export function mergeHookIntoPrompt(open: Prompt, hook: Prompt, block: DetectedP
   };
 }
 
-/** The destructive flag a dialog block's own text carries. */
 export function blockDestructive(block: { detail?: string }): { pattern: string } | undefined {
   const pattern = matchDestructive(block.detail ?? "");
   return pattern ? { pattern } : undefined;
 }
 
-/** Hook prompt titles that name no particular dialog. */
 const PLACEHOLDER_TITLES = new Set(["Permission needed", "Approval needed", "Input requested"]);
-/** A line the dialog cut short with "…" identifies a command only if this much of it is left. */
 const MIN_ELLIPSIS_PREFIX = 32;
 
-/**
- * Whether a hook-reported prompt describes this dialog block. Needles are the hook detail's
- * first six non-empty lines plus its title unless that is a placeholder; the haystack is the
- * block's detail lines and title, all whitespace-normalised. Every needle must equal a haystack
- * line, or extend a line the dialog cut short with "…". With no usable needle there is nothing
- * to prove the two belong together, so the answer is false.
- */
 export function correlates(
   hook: { title?: string; detail?: string },
   block: { title: string; detail?: string },
@@ -234,13 +266,16 @@ export function describeNow(att: Attention, provider: Provider): string {
   switch (att.state) {
     case "needs-you": {
       const p = att.prompt;
-      const command = p?.tool?.input.command;
+      if (!p) {
+        text = `${name} needs you`;
+        break;
+      }
+      const command = p.tool?.input.command;
       const [commandLine] = normalisedLines(typeof command === "string" ? command : undefined);
-      const shown = normalisedLines(p?.detail);
-      const [dialogLine] = normalisedLines(p ? dialogCommand(p) : undefined);
-      // Name the command when the dialog shows it; otherwise the dialog's first detail line.
+      const shown = normalisedLines(p.detail);
+      const [dialogLine] = normalisedLines(dialogCommand(p));
       const head = (commandLine && shown.find((l) => l === commandLine)) ?? dialogLine ?? shown[0] ?? commandLine;
-      text = p ? (head ? `${p.title} ${head}` : p.title) : `${name} needs you`;
+      text = head ? `${p.title} ${head}` : p.title;
       break;
     }
     case "working": {

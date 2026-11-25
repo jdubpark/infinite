@@ -10,7 +10,6 @@ export interface DetectedPrompt {
   highlighted?: number;
   acceptsText: boolean;
   multiSelect: boolean;
-  /** Only blank lines and key hints follow the options: the block is the screen's bottom-most UI, not transcript text. */
   pinned: boolean;
   fingerprint: string;
   blockStart: number;
@@ -21,10 +20,6 @@ const OPTION = /^([❯›>]\s*)?(\d{1,2})\.\s+(.+?)$/;
 const RULE = /^[\s─━═│┃┌┐└┘├┤╭╮╰╯\-_=*·]*$/;
 const BOX_TOP = /[╭┌]/;
 const PERMISSION = /do you want to (proceed|make this edit|create|run)|would you like to (run|make)|approve network access|needs your approval|permission/i;
-/**
- * A dialog whose title sits above its detail, as Codex draws its command and edit dialogs. The
- * header is complete once this line is reached; whatever stands above it is transcript.
- */
 const HEADER_TITLE = /^would you like to (run|make) .*\?$/i;
 const HEADER_LIMIT = 12;
 const DETAIL_LIMIT = 2000;
@@ -32,26 +27,18 @@ const QUESTION_OPTION = /^(chat about this|other|skip|type something)/i;
 const MULTI = /a to select all|n to select none/i;
 const YES_NO = /(\[(y\/N|Y\/n|y\/n)\]|\((y\/n|yes\/no)\))\s*:?\s*$/i;
 const KEY_HINT = /^(Enter to|Esc to|Press )/i;
-/**
- * The Code Mode dialog's feedback line and key hint with whitespace removed, each optional. Every other character
- * counts, so an idle cursor after an older menu is not footer text. The separator is optional: a narrow wrap can
- * leave it alone on a line, where it reads as a rule.
- */
 const CODE_MODE_FOOTER = /^(Tellushowitgoeswith\/feedback)?(Entertoconfirm·?Esctostartwithoutit)?$/i;
 
-/** The non-empty lines of `text`, each with its whitespace runs collapsed to one space. */
 export function normalisedLines(text?: string): string[] {
   return (text ?? "").split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean);
 }
 
-/** Strip box-drawing borders and surrounding whitespace. */
 export function cleanLine(line: string): string {
   return line.replace(/^[\s│┃]+|[\s│┃]+$/g, "");
 }
 
 export function detectPrompt(lines: string[], provider: Provider): DetectedPrompt | null {
   const clean = lines.map(cleanLine);
-  // This detector only claims a dialog that ends the screen, so an older menu above it is not read as open.
   const codeMode = detectCodeModeConfirmation(clean);
   if (codeMode) return codeMode;
   const block = lastOptionBlock(clean, lines);
@@ -59,21 +46,16 @@ export function detectPrompt(lines: string[], provider: Provider): DetectedPromp
     const { start, end, options, highlighted } = block;
     const above: string[] = [];
     for (let i = start - 1; i >= 0 && above.length < HEADER_LIMIT; i--) {
-      // A box's top edge ends the dialog: transcript lines above it are not its header.
       if (OPTION.test(clean[i]) || BOX_TOP.test(clean[i])) break;
       if (clean[i] === "" || RULE.test(clean[i])) continue;
       above.unshift(clean[i]);
       if (HEADER_TITLE.test(clean[i])) break;
     }
-    // The dialog's own title wins over a reason or description that happens to end with "?":
-    // a top-anchored title first, then the last permission question, then the last question.
     const headerTitle = above.findIndex((l) => HEADER_TITLE.test(l));
     const permissionQuestion = findLastIndex(above, (l) => l.endsWith("?") && PERMISSION.test(l));
     const titleIndex = headerTitle >= 0 ? headerTitle : permissionQuestion >= 0 ? permissionQuestion : findLastIndex(above, (l) => l.endsWith("?"));
     const title = titleIndex >= 0 ? above[titleIndex] : above.at(-1) ?? "";
     const detailLines = above.filter((_, i) => i !== titleIndex && above[i] !== title);
-    // A cut must be visible: delegation treats "… [+N chars]" as incomplete evidence, so a dialog
-    // whose command runs past the cap can never qualify as a complete one-shot request.
     const detail = boundedDetail(detailLines);
     const footer = clean.slice(end + 1, end + 3).join(" ");
     const multiSelect = MULTI.test(footer);
@@ -84,7 +66,6 @@ export function detectPrompt(lines: string[], provider: Provider): DetectedPromp
     const acceptsText = options.some((o) => o.role === "reject-with-feedback");
     return {
       kind, title, detail, options, highlighted, acceptsText, multiSelect, pinned,
-      // The detail (the command, path or question body) is part of the dialog's identity.
       fingerprint: [title, ...normalisedLines(detail), ...options.map((o) => o.label)].join("\n"),
       blockStart: start, blockEnd: end,
     };
@@ -107,11 +88,6 @@ export function detectPrompt(lines: string[], provider: Provider): DetectedPromp
   return null;
 }
 
-/**
- * Find the lowest block of consecutively numbered options. A wrapped option label continues on
- * the next line when that raw line is indented past the option number column, is not itself an
- * option, a question, or a key hint. A block counts only when an option carries a selection marker.
- */
 function lastOptionBlock(clean: string[], raw: string[]) {
   const firstTextCol = (line: string) => line.search(/[^\s│┃]/);
   const numberCol = (line: string) => line.search(/\d{1,2}\.\s/);
@@ -175,7 +151,6 @@ function compactedOptionAt(clean: string[], start: number, expected: string) {
   return undefined;
 }
 
-/** Claude's first-run Code Mode setting is an unnumbered, owner-reserved two-option menu. */
 function detectCodeModeConfirmation(clean: string[]): DetectedPrompt | null {
   const titleIndex = findLastIndex(clean, line => accountSettingPrompt({ title: line }));
   if (titleIndex < 0) return null;
@@ -190,8 +165,6 @@ function detectCodeModeConfirmation(clean: string[]): DetectedPrompt | null {
     const otherRole = noFirst ? "accept" : "reject";
     const second = compactedOptionAt(clean, first.end + 1, otherRole === "accept" ? "yesturnoncodemode" : "nostartwithoutit");
     if (!second) continue;
-    // Only this dialog's own footer may follow. A general key hint would also admit another prompt's line, such as
-    // "Press y to proceed or n to cancel [Y/n]", and return the older menu above it.
     const tail = clean.slice(second.end + 1).filter(line => !RULE.test(line)).join("").replace(/\s+/g, "");
     if (!CODE_MODE_FOOTER.test(tail)) continue;
     firstOption = first;
@@ -228,7 +201,6 @@ function detectCodeModeConfirmation(clean: string[]): DetectedPrompt | null {
   };
 }
 
-/** Claude's first-run folder question is an unnumbered two-option menu, not `1. Yes`. */
 function detectWorkspaceTrust(clean: string[]): DetectedPrompt | null {
   let yes = -1;
   let no = -1;

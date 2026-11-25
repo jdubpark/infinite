@@ -7,7 +7,6 @@ import type { Agent, AgentState, Selection, SwarmModel, ViewProps } from "./type
 import "./graph.css";
 
 export type GraphProps = ViewProps & {
-  /** False when the host predates the context endpoints; the view then draws without a code map or observed touches. */
   contextAvailable: boolean;
 };
 
@@ -17,15 +16,12 @@ const LINK_WORDS: Record<LinkKind, string> = {
   edit: "observed edit (tool input)", integrated: "integrated change", code: "code link", contains: "contains",
 };
 const LINK_BASE_WIDTH: Partial<Record<LinkKind, number>> = { integrated: 2.25, code: 1 };
-/** Links are drawn back to front: structure, then code, then the touch strands. */
 const LINK_ORDER: LinkKind[] = ["code", "depends", "dispatch", "member", "planned", "read", "edit", "integrated"];
 
-/** Touch lines grow with their count, up to a fixed step. */
 function linkWidth(link: GraphLink) {
   return (LINK_BASE_WIDTH[link.kind] ?? 1) * (1 + Math.min(link.weight - 1, 4) * 0.2);
 }
 
-/** An area's square grows with its symbol count and stays inside its row. */
 function areaSide(node: GraphNode) {
   return Math.min(18, Math.max(7, 6 + 0.9 * Math.sqrt(node.symbols ?? 0)));
 }
@@ -38,13 +34,22 @@ function shorten(text: string, max = LABEL_MAX, fromEnd = false) {
 function agentIndex(model: SwarmModel) {
   const index = new Map<string, Agent>();
   for (const swarm of model.live) {
-    const members = [swarm.coordinator, ...swarm.units.filter(unit => unit.live).flatMap(unit => [...unit.agents, ...unit.side]), ...swarm.loose];
-    for (const agent of members) if (agent) index.set(agent.id, agent);
+    switch (swarm.kind) {
+      case "mission":
+        if (swarm.coordinator) index.set(swarm.coordinator.id, swarm.coordinator);
+        for (const unit of swarm.units) if (unit.live) for (const agent of [...unit.agents, ...unit.side]) index.set(agent.id, agent);
+        break;
+      case "team":
+        for (const unit of swarm.units) if (unit.live) for (const agent of [...unit.agents, ...unit.side]) index.set(agent.id, agent);
+        break;
+      case "solo":
+        for (const agent of swarm.loose) index.set(agent.id, agent);
+        break;
+    }
   }
   return index;
 }
 
-/** The part of the graph a selection keeps lit: an agent's links, an area's touching agents, or a unit's members. */
 function focusOf(selection: Selection, data: GraphData): { nodes: Set<string>; links: Set<string> } | null {
   if (!selection) return null;
   const root = selection.kind === "agent" ? nodeId.agent(selection.id)
@@ -67,7 +72,6 @@ function focusOf(selection: Selection, data: GraphData): { nodes: Set<string>; l
   return { nodes, links };
 }
 
-/** Swarm topology linked to the code context in use, on a layered layout that moves only when a node appears or leaves. */
 export function Graph({ model, selection, onSelect, openSession, contextAvailable }: GraphProps) {
   const context = useSwarmContext(model, contextAvailable);
   const data = useMemo(
@@ -149,7 +153,6 @@ export function Graph({ model, selection, onSelect, openSession, contextAvailabl
                 event.stopPropagation();
                 select(node);
               };
-              // A mission hub is a label for its units, not a control: its coordinator's mark beside it is the thing to select.
               const semantics = clickable ? { role: "button", tabIndex: 0, "aria-pressed": selected, onKeyDown } : { role: "img" };
               return <g key={node.id} className={`sw-g-node${dim ? " sw-graph-dim" : ""}${clickable ? "" : " sw-g-static"}`} transform={`translate(${p.x},${p.y})`} data-node={node.id}
                 aria-label={label} {...semantics}
@@ -158,7 +161,6 @@ export function Graph({ model, selection, onSelect, openSession, contextAvailabl
                 <title>{label}</title>
                 {node.kind === "agent" && agent && <>
                   {selected && <circle className="sw-g-halo" r={11} />}
-                  {/* A wide hit area, so the small mark is easy to pick. */}
                   <rect x={-34} y={-GRID.rowAgent / 2} width={48} height={GRID.rowAgent} fill="transparent" />
                   {agent.role !== "MC" && <text className={`sw-g-role${node.unobserved ? " sw-g-nosignal" : ""}`} x={-13} y={3.5} textAnchor="end">{agent.role}</text>}
                   <g transform="translate(-7,-7)"><StateMark state={state} size={14} pulse={state === "working"} title={label} /></g>

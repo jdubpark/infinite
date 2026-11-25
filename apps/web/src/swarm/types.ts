@@ -1,8 +1,6 @@
 import type { Session, TeamModelProfile, UsageTotals } from "../api";
 import type { MissionStatus } from "../mission-model";
 
-// ---- Inputs: structural subsets of the host's session, team, and mission lists. ----
-
 export type SwarmSession = Session;
 
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering"
@@ -16,7 +14,6 @@ export type SwarmMember = {
 export type SwarmTask = {
   id: string; title: string; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; paths: string[];
   memberId?: string;
-  /** Paths the host read from Git for this task's integrated diff. */
   changedPaths?: { paths: string[]; truncated: boolean };
 };
 export type SwarmTeam = {
@@ -28,10 +25,8 @@ export type SwarmTeam = {
   checks: { status: "running" | "passed" | "failed" | "interrupted"; revision: number }[];
   decisions: { id: string; revision: number; answer?: string }[];
   discovery?: { revision: number }; review?: { revision: number }; pullRequest?: unknown; deliveryReceipt?: unknown;
-  /** Owner delegation of routine one-shot permissions; absent on runs without it. */
   permissions?: { maxDecisions: number }; permissionsRevokedAt?: string;
   permissionDecisions?: { targetSessionId: string; promptId: number; status: string }[];
-  /** `unmeasuredMembers` counts members the provider reports no usage for; their cost is unknown, not zero. */
   usage?: { total: UsageTotals; unmeasuredMembers?: number };
   workers?: { limit: number; max: number; running: number; ready: number };
 };
@@ -42,14 +37,10 @@ export type SwarmMission = {
   subtasks: { id: string; repoProjectId: string; title: string; dependsOn: string[]; status: "queued" | "running" | "done" | "cancelled" | "blocked"; teamId?: string }[];
   decisions: { id: string; answer?: string }[];
   lineup?: { coordinator: TeamModelProfile };
-  /** Sums the coordinator and subteams; `unmeasuredMembers` counts members with no usage data. */
   usage?: { total: UsageTotals; unmeasuredMembers?: number };
 };
 export type SwarmInput = { sessions: SwarmSession[]; teams: SwarmTeam[]; missions: SwarmMission[]; now: number };
 
-// ---- Model: what the three views render. ----
-
-/** Display order: the states that ask for attention lead. */
 export const AGENT_STATES = ["needs-you", "in-review", "working", "waiting", "queued", "reported", "stopped", "fault"] as const;
 export type AgentState = typeof AGENT_STATES[number];
 export const STATE_LABEL: Record<AgentState, string> = {
@@ -61,7 +52,6 @@ export const STAGES = ["plan", "scout", "build", "integrate", "check", "review",
 export type Stage = typeof STAGES[number];
 export const STAGE_LABEL: Record<Stage, string> = { plan: "plan", scout: "scout", build: "build", integrate: "integ", check: "check", review: "review", ship: "ship" };
 
-/** PM project manager, SC scout, IM implementer, IN integrator, RV reviewer, EV evaluator, DL delivery, PR permission reviewer, MC mission coordinator, SO solo session. */
 export type RoleCode = "PM" | "SC" | "IM" | "IN" | "RV" | "EV" | "DL" | "PR" | "MC" | "SO";
 export const ROLE_NAME: Record<RoleCode, string> = {
   PM: "Project manager", SC: "Scout", IM: "Implementer", IN: "Integrator", RV: "Reviewer", EV: "Evaluator", DL: "Delivery",
@@ -69,119 +59,125 @@ export const ROLE_NAME: Record<RoleCode, string> = {
 };
 
 export type Hold = "input" | "paused" | "blocked";
-/** Agent or host reports, never host verification of a merge or of completion. */
 export type Terminal = "review-ready" | "merge-reported" | "no-change" | "cancelled";
 
 export interface Agent {
-  /** Member ID, or the session ID for a mission coordinator or solo session. */
   id: string;
   sessionId?: string;
   swarmId: string;
   unitId?: string;
-  /** The unit's project, or a solo session's project; absent for a mission coordinator. */
   projectId?: string;
   role: RoleCode;
-  /** The lane stage this role sits on; absent for PR, MC, and SO. */
   stage?: Stage;
   state: AgentState;
-  /** A member of an earlier revision that is still running or waiting. */
   earlier: boolean;
   limited: boolean;
   stalled: boolean;
-  /** False when the provider records no tool inputs (anything but Claude Code and Codex). */
   observable: boolean;
   title: string;
   provider: string;
   model?: string;
   tier?: "light" | "strong";
   taskId?: string;
-  /** The loud tool the host reports as in flight; often absent. */
   tool?: string;
   lastActivityAt?: string;
-  /** When the current attention state began. */
   since?: string;
   costUsd?: number;
 }
-export interface Unit {
-  /** Team run ID. */
+
+type UnitBase = {
   id: string;
   swarmId: string;
   title: string;
   projectId: string;
   status: TeamStatus;
   revision: number;
-  live: boolean;
-  active?: Stage;
   reached: Stage;
-  hold?: Hold;
-  terminal?: Terminal;
   checks: { passed: number; failed: number; running: number };
   workers?: { running: number; limit: number };
-  /** Agents on a stage, in stage order. Empty for a unit that is not live. */
   agents: Agent[];
-  /** Agents drawn beside the lane: the permission reviewer. */
   side: Agent[];
-  /** IDs of units this one waits on, from mission subtask dependencies. */
   dependsOn: string[];
-  /** Open owner decisions of the current revision; zero for mission-managed units. */
   waiting: number;
   costUsd?: number;
-  /** Members of this run with no usage data. `costUsd` counts measured usage only. */
   unmeasured: number;
   goalCycle?: number;
   createdAt: string;
-  /** When an agent of this run last started, acted, or reported; the run's creation time when none did. */
   lastActivityAt: string;
   baseCommit: string;
   headCommit?: string;
   tasks: SwarmTask[];
-}
-/** A mission subtask that has no team yet. */
+};
+
+export type LiveUnit = UnitBase & {
+  live: true;
+  active?: Stage;
+  hold?: Hold;
+  terminal?: undefined;
+};
+
+export type QuietUnit = UnitBase & {
+  live: false;
+  active?: undefined;
+} & (
+  | { hold?: undefined; terminal: Terminal }
+  | { hold: Hold; terminal?: undefined }
+);
+
+export type Unit = LiveUnit | QuietUnit;
+
 export interface Ghost { id: string; title: string; after: string[]; status: "queued" | "blocked" | "cancelled" }
-export interface Swarm {
-  /** Mission ID, team ID, or "solo". */
+
+type SwarmBase = {
   id: string;
-  kind: "mission" | "team" | "solo";
   title: string;
   live: boolean;
+  waiting: number;
+  costUsd?: number;
+  unmeasured: number;
+  createdAt: string;
+};
+
+export type MissionSwarm = SwarmBase & {
+  kind: "mission";
   coordinator?: Agent;
   units: Unit[];
   ghosts: Ghost[];
-  /** Solo sessions; empty for other kinds. */
+};
+
+export type TeamSwarm = SwarmBase & {
+  kind: "team";
+  units: Unit[];
+};
+
+export type SoloSwarm = SwarmBase & {
+  kind: "solo";
+  live: true;
   loose: Agent[];
-  /** Person-owned prompts plus open owner decisions in this swarm. */
-  waiting: number;
-  costUsd?: number;
-  /** Agents of this swarm with no usage data; `costUsd` counts measured usage only. */
-  unmeasured: number;
-  createdAt: string;
-}
+};
+
+export type Swarm = MissionSwarm | TeamSwarm | SoloSwarm;
+
 export interface SwarmTotals {
-  /** Agents of live swarms only. */
   byState: Record<AgentState, number>;
   agents: number;
   waitingOnPerson: number;
   slots: { running: number; limit: number };
   costUsd: number;
-  /** Agents with no usage data, summed over live swarms. */
   unmeasured: number;
 }
 export interface SwarmModel {
   live: Swarm[];
   held: { id: string; title: string; status: MissionStatus; stopReason?: "deadline" }[];
-  /** Units of swarms with no live unit, each updated in the last 72 hours, newest first, at most 12. They carry no agents. */
-  quiet: Unit[];
-  /** Quiet units not shown: older than 72 hours or beyond the limit. */
+  quiet: QuietUnit[];
   quietOlder: number;
   totals: SwarmTotals;
 }
 
 export type Selection = { kind: "agent"; id: string } | { kind: "unit"; id: string } | { kind: "area"; id: string } | null;
 
-/** Page-observed activity: whether each agent's last-activity time advanced, in ten-second buckets. */
 export interface ActivityStore {
   record(agents: { id: string; lastActivityAt?: string }[], now: number): void;
-  /** Thirty values from oldest to newest, each 0 to 1. */
   buckets(id: string, now: number): number[];
 }
 
@@ -195,8 +191,6 @@ export interface ViewProps {
   activity: ActivityStore;
   now: number;
 }
-
-// ---- Host context contracts for the Graph view. ----
 
 export type CodeMap =
   | { state: "ready"; lane: string; head: string; builtAt: string;

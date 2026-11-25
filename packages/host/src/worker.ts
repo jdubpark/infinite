@@ -296,7 +296,7 @@ function hookPromptWhileOpen(
   if (onScreen && hashOf(onScreen.fingerprint) === open.hash) {
     // Another dialog's hook (a parallel tool or a subagent) must not lend the answer its tool
     // and flags: the answer stays bound to the dialog on screen, and the mismatch is recorded.
-    if (correlates(hook, onScreen))
+    if (correlates(hook, onScreen) && attention.state === "needs-you")
       publish({
         ...attention,
         prompt: mergeHookIntoPrompt(open, hook, onScreen),
@@ -617,7 +617,7 @@ function checkScreen() {
       open?.hash !== undefined &&
       open.options.length > 0 &&
       hashOf(detected.fingerprint) !== open.hash;
-    if (open && (decision.close || replaced) && answering !== open.id) {
+    if (open && (decision.kind === "close" || replaced) && answering !== open.id) {
       if (++missCount >= 2) {
         missCount = 0;
         record(
@@ -634,55 +634,39 @@ function checkScreen() {
     } else missCount = 0;
     // A hook prompt waiting for its block is merged only with a block that belongs to it;
     // any other block supersedes it and opens as a screen prompt.
-    if (decision.merge && open && !correlates(open, decision.merge)) {
+    if (decision.kind === "merge" && open && !correlates(open, decision.merge)) {
       record(
         { kind: "prompt-closed", promptId: open.id, reason: "superseded" },
         "screen",
       );
       decision = screenDecision(attention, detected, idle, freshOutput, at);
     }
-    if (decision.open) {
-      const { fingerprint, ...rest } = decision.open;
-      const prompt: Prompt = {
-        ...rest,
-        id: 0,
-        hash: hashOf(fingerprint),
-        destructive: blockDestructive(rest),
-      };
-      record({ kind: "prompt-open", prompt }, "screen");
+    switch (decision.kind) {
+      case "open": {
+        const { fingerprint, ...rest } = decision.open;
+        record({ kind: "prompt-open", prompt: { ...rest, id: 0, hash: hashOf(fingerprint), destructive: blockDestructive(rest) } }, "screen");
+        break;
+      }
+      case "merge":
+        if (attention.state === "needs-you" && attention.prompt) {
+          const merged = mergeScreenIntoPrompt(attention.prompt, decision.merge, hashOf(decision.merge.fingerprint));
+          publish({ ...attention, prompt: merged });
+          record({ kind: "notice", type: "prompt-merged", promptId: merged.id, title: merged.title, ...(merged.detail !== undefined ? { detail: merged.detail } : {}) }, "screen");
+        }
+        break;
+      case "idle":
+        if (!native) {
+          const same = attention.state === decision.idle;
+          publish({ ...attention, prompt: undefined, lastTool: undefined, state: decision.idle, since: same ? attention.since : at, source: same ? attention.source : "screen" });
+        }
+        break;
+      case "working":
+        if (!native) publish({ ...attention, prompt: undefined, state: "working", since: at, source: "screen" });
+        break;
+      case "close":
+      case "none":
+        break;
     }
-    if (decision.merge && attention.prompt) {
-      const merged = mergeScreenIntoPrompt(
-        attention.prompt,
-        decision.merge,
-        hashOf(decision.merge.fingerprint),
-      );
-      publish({ ...attention, prompt: merged });
-      // The journaled prompt-open carries the hook's title; the timeline takes the dialog's.
-      record(
-        {
-          kind: "notice",
-          type: "prompt-merged",
-          promptId: merged.id,
-          title: merged.title,
-          ...(merged.detail !== undefined ? { detail: merged.detail } : {}),
-        },
-        "screen",
-      );
-    }
-    // Native adapters report actual turn transitions. A quiet screen or late
-    // observer redraw must not override those events; dialogs still use the screen.
-    if (decision.idle && !native) {
-      const same = attention.state === decision.idle;
-      publish({
-        ...attention,
-        state: decision.idle,
-        since: same ? attention.since : at,
-        source: same ? attention.source : "screen",
-      });
-    }
-    if (decision.working && !native)
-      publish({ ...attention, state: "working", since: at, source: "screen" });
     // Keep the one-line summary current even when nothing above changed the state.
     if (describeNow(attention, provider) !== attention.now) publish(attention);
   } catch {

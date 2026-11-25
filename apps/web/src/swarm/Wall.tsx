@@ -46,13 +46,24 @@ function WallTile({ agent, selected, onSelect, openSession, activity, now }: {
 
 function WallSwarm({ swarm, ...props }: ViewProps & { swarm: Swarm }) {
   const { selection, onSelect, openSession, activity, now } = props;
-  const direct = [...(swarm.coordinator ? [swarm.coordinator] : []), ...swarm.loose];
   const sections: Section[] = [];
-  // A mission groups its tiles by unit, with its coordinator first; a team or the solo group is one cluster.
-  if (direct.length > 0) sections.push({ key: "direct", label: swarm.kind === "mission" ? "coordinator" : "", agents: direct });
-  for (const unit of swarm.units) {
-    const agents = [...unit.agents, ...unit.side];
-    if (agents.length > 0) sections.push({ key: unit.id, label: swarm.kind === "mission" ? unit.title : "", agents });
+  switch (swarm.kind) {
+    case "mission":
+      if (swarm.coordinator) sections.push({ key: "direct", label: "coordinator", agents: [swarm.coordinator] });
+      for (const unit of swarm.units) {
+        const agents = [...unit.agents, ...unit.side];
+        if (agents.length > 0) sections.push({ key: unit.id, label: unit.title, agents });
+      }
+      break;
+    case "team":
+      for (const unit of swarm.units) {
+        const agents = [...unit.agents, ...unit.side];
+        if (agents.length > 0) sections.push({ key: unit.id, label: "", agents });
+      }
+      break;
+    case "solo":
+      if (swarm.loose.length > 0) sections.push({ key: "direct", label: "", agents: swarm.loose });
+      break;
   }
   const agentCount = allAgents(swarm).length;
   const spend = cost(swarm.costUsd, swarm.unmeasured);
@@ -74,7 +85,6 @@ function WallSwarm({ swarm, ...props }: ViewProps & { swarm: Swarm }) {
   </section>;
 }
 
-/** One fixed-size tile per agent of a live unit, grouped by swarm and unit. */
 export function Wall(props: ViewProps) {
   return <div className="sw-wall">
     <div className="sw-wall-note sw-dim">activity: observed since this page opened</div>

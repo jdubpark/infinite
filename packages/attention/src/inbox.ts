@@ -4,7 +4,6 @@ export type InboxGroup = "Needs you" | "Working" | "Finished" | "Exited" | "Arch
 
 type Row = { attention: Attention; createdAt: string; archivedAt?: string };
 
-/** An archived record leaves the live groups whatever its last state was. */
 function groupFor(row: Row): InboxGroup {
   if (row.archivedAt) return "Archived";
   switch (row.attention.state) {

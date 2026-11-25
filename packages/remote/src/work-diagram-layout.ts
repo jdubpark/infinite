@@ -240,7 +240,6 @@ function layoutSequence(sequence: NonNullable<Diagram["sequence"]>): DiagramLayo
   };
 }
 
-/** Deterministic layered layout; sequence diagrams lay out as lanes and message rows. */
 export function layoutDiagram(diagram: Pick<Diagram, "direction" | "nodes" | "edges" | "groups" | "sequence">): DiagramLayout {
   if (diagram.sequence) return layoutSequence(diagram.sequence);
 
@@ -255,7 +254,6 @@ export function layoutDiagram(diagram: Pick<Diagram, "direction" | "nodes" | "ed
   const outgoing = new Map(ids.map(id => [id, [] as EdgeRef[]]));
   for (const edge of edges) outgoing.get(edge.from)?.push(edge);
 
-  // Reverse only DFS back-edges in the layering graph. The rendered edge is unchanged.
   const state = new Map<string, 0 | 1 | 2>(ids.map(id => [id, 0]));
   const reversed = new Set<number>();
   const visit = (id: string): void => {
@@ -306,7 +304,6 @@ export function layoutDiagram(diagram: Pick<Diagram, "direction" | "nodes" | "ed
       if (degree === 0) ready.push(target);
     }
   }
-  // The DFS reversal makes a DAG; this guard also ensures malformed duplicate ids terminate.
   for (const id of ids) if (!topological.includes(id)) topological.push(id);
 
   const layerById = new Map(ids.map(id => [id, 0]));

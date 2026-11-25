@@ -2,7 +2,6 @@ import { readFileSync } from "node:fs";
 import { WebSocket, type RawData } from "ws";
 import type { IntakeThread, IntakeThreadReader, SlackThreadMessage } from "./intake-types.js";
 
-/** `transient` marks failures worth retrying later; the code is Slack's error code or a transport label. */
 export class SlackError extends Error {
   constructor(readonly code: string, readonly transient: boolean) { super(`Slack request failed: ${code}`); }
 }
@@ -32,6 +31,14 @@ export interface SlackInteraction {
   state?: Record<string, Record<string, { type: string; selectedValues?: string[]; value?: string }>>;
 }
 
+type SocketPhase =
+  | { state: "idle"; attempts: number }
+  | { state: "opening"; attempts: number; pending: AbortController }
+  | { state: "handshaking"; attempts: number; socket: WebSocket }
+  | { state: "connected"; socket: WebSocket }
+  | { state: "backoff"; attempts: number; timer: NodeJS.Timeout }
+  | { state: "closed" };
+
 const DEFAULT_ENDPOINT = "https://slack.com/api";
 const UNREADABLE = new Set(["channel_not_found", "not_in_channel", "thread_not_found"]);
 const PAGE_LIMIT = 200;
@@ -39,10 +46,8 @@ const MAX_THREAD_MESSAGES = 1000;
 const MAX_THREAD_PAGES = 50;
 const MAX_RECONNECT_DELAY_MS = 60_000;
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
-/** Read methods take their arguments from a form body; write methods such as chat.postMessage take JSON. */
 const FORM_METHODS = new Set(["auth.test", "conversations.replies", "apps.connections.open", "chat.getPermalink"]);
 
-/** Slack's Web API and Socket Mode, with bot and app tokens read from files on every call. */
 export class SlackClient implements IntakeThreadReader {
   private readonly endpoint: string;
 
@@ -58,11 +63,6 @@ export class SlackClient implements IntakeThreadReader {
     return { teamId: data.team_id, userId: data.user_id, botId: data.bot_id };
   }
 
-  /**
-   * Returns the root message followed by the newest replies, oldest first, at most 1,000 in all.
-   * Pages forward to the end of the thread, reading at most 50 pages; a longer thread keeps the window read so far.
-   * A refusal Slack gives for the binding is `unreadable`; an outage throws.
-   */
   async thread(binding: IntakeThread): Promise<SlackThreadMessage[] | "unreadable"> {
     let root: SlackThreadMessage | undefined;
     const recent: SlackThreadMessage[] = [];
@@ -90,7 +90,6 @@ export class SlackClient implements IntakeThreadReader {
     return root === undefined ? [] : [root, ...recent];
   }
 
-  /** Posts into the bound thread. The key travels as message metadata so a lost response can be found later. */
   async post(binding: IntakeThread, text: string, key: string, blocks?: Record<string, unknown>[]): Promise<{ ts: string }> {
     const data = await this.call("chat.postMessage", "bot", {
       channel: binding.channelId, thread_ts: binding.threadTs, text, mrkdwn: false, parse: "none",
@@ -101,14 +100,12 @@ export class SlackClient implements IntakeThreadReader {
     return { ts: data.ts };
   }
 
-  /** The message's permanent link (`chat.getPermalink`, bot token). A response without one is an error. */
   async permalink(binding: IntakeThread, ts: string): Promise<string> {
     const data = await this.call("chat.getPermalink", "bot", { channel: binding.channelId, message_ts: ts });
     if (typeof data.permalink !== "string" || data.permalink === "") throw new SlackError("invalid_response", false);
     return data.permalink;
   }
 
-  /** Acknowledges a teammate's proposal without posting a message. Repeated acknowledgements are idempotent. */
   async acknowledgeProposal(channelId: string, ts: string): Promise<void> {
     try {
       await this.call("reactions.add", "bot", { channel: channelId, timestamp: ts, name: "eyes" });
@@ -117,35 +114,38 @@ export class SlackClient implements IntakeThreadReader {
     }
   }
 
-  /** Opens Socket Mode. The envelope is acknowledged only after `handle` resolves; a rejection leaves it for redelivery. */
   connect(handle: (envelope: SlackEnvelope) => Promise<void>): { close(): void; connected(): boolean } {
-    let socket: WebSocket | undefined;
-    let ready = false;
-    let closed = false;
-    let attempts = 0;
-    let timer: NodeJS.Timeout | undefined;
-    let pending: AbortController | undefined;
+    let phase: SocketPhase = { state: "idle", attempts: 0 };
 
-    const schedule = () => {
-      if (closed) return;
+    const schedule = (attempts: number) => {
+      if (phase.state === "closed") return;
       const wait = Math.min(MAX_RECONNECT_DELAY_MS, 1000 * 2 ** attempts);
-      attempts++;
-      timer = setTimeout(() => { timer = undefined; void open(); }, wait);
+      const timer = setTimeout(() => {
+        if (phase.state !== "backoff" || phase.timer !== timer) return;
+        phase = { state: "idle", attempts: phase.attempts };
+        void open();
+      }, wait);
+      phase = { state: "backoff", attempts: attempts + 1, timer };
     };
 
     const ack = (current: WebSocket, envelopeId: string) => {
-      if (socket === current && current.readyState === WebSocket.OPEN) current.send(JSON.stringify({ envelope_id: envelopeId }));
+      if ((phase.state === "handshaking" || phase.state === "connected") && phase.socket === current && current.readyState === WebSocket.OPEN) {
+        current.send(JSON.stringify({ envelope_id: envelopeId }));
+      }
     };
 
     const receive = (current: WebSocket, raw: RawData) => {
-      if (socket !== current) return;
+      if ((phase.state !== "handshaking" && phase.state !== "connected") || phase.socket !== current) return;
       let frame: Record<string, any>;
       try { frame = JSON.parse(String(raw)); } catch { return; }
-      if (frame.type === "hello") { ready = true; attempts = 0; return; }
-      if (frame.type === "disconnect") { ready = false; current.close(); return; }
+      if (frame.type === "hello") { phase = { state: "connected", socket: current }; return; }
+      if (frame.type === "disconnect") {
+        phase = { state: "handshaking", attempts: phase.state === "handshaking" ? phase.attempts : 0, socket: current };
+        current.close();
+        return;
+      }
       if (typeof frame.envelope_id !== "string") return;
       const envelopeId = frame.envelope_id;
-      // Every envelope with an ID goes through the handler; only its resolution acknowledges it.
       const envelope = toEnvelope(envelopeId, frame.type, frame.payload);
       Promise.resolve()
         .then(() => handle(envelope))
@@ -153,29 +153,28 @@ export class SlackClient implements IntakeThreadReader {
     };
 
     const open = async () => {
-      if (closed) return;
-      pending = new AbortController();
+      if (phase.state !== "idle") return;
+      const pending = new AbortController();
+      const attempts = phase.attempts;
+      phase = { state: "opening", attempts, pending };
       let url: string;
       try {
         const data = await this.call("apps.connections.open", "app", {}, pending.signal);
         if (typeof data.url !== "string" || !this.allowedSocketAddress(data.url)) throw new SlackError("refused_socket_address", false);
         url = data.url;
       } catch {
-        pending = undefined;
-        schedule();
+        if (phase.state !== "opening" || phase.pending !== pending) return;
+        schedule(phase.attempts);
         return;
       }
-      pending = undefined;
-      if (closed) return;
+      if (phase.state !== "opening" || phase.pending !== pending) return;
       const current = new WebSocket(url, { handshakeTimeout: this.options.timeoutMs ?? 10_000 });
-      socket = current;
+      phase = { state: "handshaking", attempts: phase.attempts, socket: current };
       current.on("message", raw => receive(current, raw));
       current.on("error", () => undefined);
       current.on("close", () => {
-        if (socket !== current) return;
-        socket = undefined;
-        ready = false;
-        schedule();
+        if ((phase.state !== "handshaking" && phase.state !== "connected") || phase.socket !== current) return;
+        schedule(phase.state === "handshaking" ? phase.attempts : 0);
       });
     };
 
@@ -183,22 +182,18 @@ export class SlackClient implements IntakeThreadReader {
 
     return {
       close() {
-        closed = true;
-        if (timer) clearTimeout(timer);
-        timer = undefined;
-        pending?.abort();
-        const current = socket;
-        socket = undefined;
-        ready = false;
-        current?.terminate();
+        const prev = phase;
+        phase = { state: "closed" };
+        if (prev.state === "backoff") clearTimeout(prev.timer);
+        else if (prev.state === "opening") prev.pending.abort();
+        else if (prev.state === "handshaking" || prev.state === "connected") prev.socket.terminate();
       },
       connected() {
-        return ready && socket !== undefined && socket.readyState === WebSocket.OPEN;
+        return phase.state === "connected" && phase.socket.readyState === WebSocket.OPEN;
       },
     };
   }
 
-  /** wss on a Slack host, or ws on loopback when the endpoint itself is a loopback override. */
   private allowedSocketAddress(address: string) {
     let url: URL;
     try { url = new URL(address); } catch { return false; }
@@ -251,7 +246,6 @@ function threadMessage(raw: Record<string, any>): SlackThreadMessage {
   });
 }
 
-/** Only supported envelope payloads are projected; unknown or malformed payloads are delivered with their ID alone. */
 function toEnvelope(envelopeId: string, type: unknown, payload: Record<string, any> | undefined): SlackEnvelope {
   if (type === "interactive") {
     const interaction = blockActions(payload);
@@ -362,7 +356,6 @@ function isRecord(value: unknown): value is Record<string, any> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Drops absent fields so optional properties are missing rather than undefined. */
 function defined<T extends object>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, field]) => field !== undefined)) as T;
 }

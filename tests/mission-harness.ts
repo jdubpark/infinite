@@ -303,8 +303,27 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
     quietScreen: async (n: number) => {
       const sessionId = (await attempt(n)).sessionId, current = attention.get(sessionId)!;
       const decision = screenDecision(current, null, true, false, new Date().toISOString());
-      if (decision.idle) attention.set(sessionId, { ...current, state: decision.idle, since: current.state === decision.idle ? current.since : new Date().toISOString(), source: "screen" });
-      return decision.idle;
+      if (decision.kind === "idle") {
+        const since = current.state === decision.idle ? current.since : new Date().toISOString();
+        const base = {
+          since,
+          source: "screen" as const,
+          now: current.now,
+          lastActivityAt: current.lastActivityAt,
+          hooks: current.hooks,
+          hookErrors: current.hookErrors,
+          ...(current.limit ? { limit: current.limit } : {}),
+          sawTurnEnd: current.sawTurnEnd,
+        };
+        attention.set(
+          sessionId,
+          decision.idle === "turn-finished"
+            ? { ...base, state: "turn-finished", ...(current.lastMessage !== undefined ? { lastMessage: current.lastMessage } : {}) }
+            : { ...base, state: "idle" },
+        );
+        return decision.idle;
+      }
+      return undefined;
     },
     /** Stop requests for that attempt's session report it still running until released. */
     /** An earlier turn ended a minute ago and the provider continued in a new turn. */

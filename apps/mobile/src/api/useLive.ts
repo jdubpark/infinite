@@ -4,59 +4,102 @@ import { openEvents, type Connection } from "./client";
 import { APP_BACKGROUND_GRACE_MS, inForeground, onForegroundChange } from "./foreground";
 import { canUseLiveFallback, invalidatesLiveLoad, isLiveOnline, LIVE_STALE_DELAY_MS, shouldMarkLiveStale, shouldRetryEmptyLiveLoad } from "./liveStatus";
 
+export type Freshness<T> =
+  | { kind: "loading" }
+  | { kind: "online"; data: T; seen: string; refreshing: boolean }
+  | { kind: "offline"; data: T | null; seen: string; stale: boolean; refreshing: boolean };
+
+function freshnessView<T>(
+  freshness: Freshness<T>,
+): { data: T | null; online: boolean; stale: boolean; loading: boolean; refreshing: boolean; seen: string } {
+  switch (freshness.kind) {
+    case "loading":
+      return { data: null, online: false, stale: false, loading: true, refreshing: false, seen: "" };
+    case "online":
+      return { data: freshness.data, online: true, stale: false, loading: false, refreshing: freshness.refreshing, seen: freshness.seen };
+    case "offline":
+      return { data: freshness.data, online: false, stale: freshness.stale, loading: false, refreshing: freshness.refreshing, seen: freshness.seen };
+  }
+}
+
 type Consumer = { after: () => number; onEvent(event: { topic: string; data: unknown }): void; onClose(): void; onRestart(): void; onOpen(): void };
-type SharedStream = { consumers: Set<Consumer>; stream?: { close(): void }; opening?: Promise<void>; restarting?: Promise<void>; generation: number };
+type StreamPhase =
+  | { kind: "idle" }
+  | { kind: "opening"; promise: Promise<void> }
+  | { kind: "live"; stream: { close(): void } }
+  | { kind: "restarting"; promise: Promise<void> };
+type SharedStream = { consumers: Set<Consumer>; phase: StreamPhase; generation: number };
 const streams = new Map<string, SharedStream>();
 function subscribeShared(connection: Connection, topics: string[], consumer: Consumer): { ready: Promise<void>; isCurrent(): boolean; close(): void; restart(): Promise<void> } {
   const key = `${connection.url}/${connection.relay?.machineId ?? "direct"}/${connection.token}/${[...topics].sort().join(",")}`;
   let shared = streams.get(key);
-  if (!shared) { shared = { consumers: new Set(), generation: 0 }; streams.set(key, shared); }
+  if (!shared) { shared = { consumers: new Set(), phase: { kind: "idle" }, generation: 0 }; streams.set(key, shared); }
   shared.consumers.add(consumer);
   const current = shared;
-  const connect = () => {
-    if (current.stream || current.opening) return current.opening ?? Promise.resolve();
+  const startOpen = (restarting: boolean) => {
     const generation = current.generation;
     const after = Math.min(...[...current.consumers].map(item => item.after()));
-    const opening = openEvents(connection, {
+    const promise = openEvents(connection, {
       topics,
       after,
       onEvent: event => { if (current.generation === generation) for (const item of current.consumers) item.onEvent(event); },
-      onClose: () => { if (current.generation === generation) { current.stream = undefined; for (const item of current.consumers) item.onClose(); } },
-    }).then(stream => { if (current.generation === generation && current.consumers.size) current.stream = stream; else stream.close(); }, error => { if (current.opening === opening) current.opening = undefined; throw error; });
-    current.opening = opening;
-    void opening.finally(() => { if (current.opening === opening) current.opening = undefined; }).catch(() => {});
-    return opening;
+      onClose: () => {
+        if (current.generation === generation) {
+          current.phase = { kind: "idle" };
+          for (const item of current.consumers) item.onClose();
+        }
+      },
+    }).then(stream => {
+      if (current.generation === generation && current.consumers.size) {
+        current.phase = { kind: "live", stream };
+        if (restarting) for (const item of [...current.consumers]) item.onOpen();
+      } else {
+        stream.close();
+        if (current.generation === generation && current.phase.kind !== "idle") current.phase = { kind: "idle" };
+      }
+    }, error => {
+      if (current.generation === generation) {
+        current.phase = { kind: "idle" };
+        if (restarting) for (const item of [...current.consumers]) item.onClose();
+      }
+      throw error;
+    });
+    current.phase = restarting ? { kind: "restarting", promise } : { kind: "opening", promise };
+    void promise.catch(() => {});
+    return promise;
+  };
+  const connect = () => {
+    switch (current.phase.kind) {
+      case "live": return Promise.resolve();
+      case "opening":
+      case "restarting":
+        return current.phase.promise;
+      case "idle":
+        return startOpen(false);
+    }
   };
   let closed = false;
   const close = () => {
     if (closed) return;
     closed = true; current.consumers.delete(consumer);
     if (!current.consumers.size) {
-      current.stream?.close(); current.stream = undefined;
+      if (current.phase.kind === "live") current.phase.stream.close();
+      current.phase = { kind: "idle" };
       streams.delete(key);
     }
   };
   const restart = () => {
     if (closed || !current.consumers.has(consumer)) return Promise.resolve();
-    if (current.restarting) return current.restarting;
+    if (current.phase.kind === "restarting") return current.phase.promise;
     current.generation++;
-    const generation = current.generation;
-    current.opening = undefined;
-    current.stream?.close(); current.stream = undefined;
+    if (current.phase.kind === "live") current.phase.stream.close();
+    current.phase = { kind: "idle" };
     for (const item of [...current.consumers]) item.onRestart();
-    const restarting = connect().then(() => {
-      if (current.generation === generation) for (const item of [...current.consumers]) item.onOpen();
-    }, error => {
-      if (current.generation === generation) for (const item of [...current.consumers]) item.onClose();
-      throw error;
-    });
-    current.restarting = restarting;
-    void restarting.finally(() => { if (current.restarting === restarting) current.restarting = undefined; }).catch(() => {});
-    return restarting;
+    return startOpen(true);
   };
   const readyGeneration = current.generation;
   const ready = connect();
-  const isCurrent = () => current.generation === readyGeneration && current.stream !== undefined && current.consumers.has(consumer) && !closed;
+  const isCurrent = () => current.generation === readyGeneration && current.phase.kind === "live" && current.consumers.has(consumer) && !closed;
   return { ready, isCurrent, close, restart };
 }
 
@@ -71,13 +114,11 @@ type LiveOptions<T> = {
   continuePolling?: (data: T | null) => boolean;
 };
 
-/** Event driven data with the existing polling result contract and a bounded fallback. */
 export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
   data: T | null; online: boolean; stale: boolean; loading: boolean; refreshing: boolean; seen: string; refresh: () => void;
 } {
-  const [data, setData] = useState<T | null>(null), [online, setOnline] = useState(false), [stale, setStale] = useState(false), [seen, setSeen] = useState("");
-  const [loading, setLoading] = useState(true), [refreshing, setRefreshing] = useState(false);
-  const current = useRef(options), value = useRef<T | null>(null), refreshRef = useRef<() => void>(() => {});
+  const [freshness, setFreshness] = useState<Freshness<T>>({ kind: "loading" });
+  const current = useRef(options), value = useRef<T | null>(null), hasValue = useRef(false), refreshRef = useRef<() => void>(() => {});
   const focused = useIsFocused(), blurred = useRef(false);
   useEffect(() => { current.current = options; });
   const topicsKey = options.topics.join(",");
@@ -87,7 +128,6 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
       refreshRef.current = () => {};
       return;
     }
-    // Regaining focus is a return like foregrounding: the view stays as received until a read or stream succeeds.
     const refocused = blurred.current;
     blurred.current = false;
     let active = true, appActive = inForeground(), streamUp = false, lastLoadOk = false, connecting = false, polling = false, appRevision = 0;
@@ -103,21 +143,49 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
     const detach = () => {
       const close = unsubscribe; unsubscribe = undefined; restartShared = undefined; close?.();
     };
+    const toOffline = (stale?: boolean) => {
+      setFreshness(prev => {
+        switch (prev.kind) {
+          case "loading": return prev;
+          case "online": return { kind: "offline", data: prev.data, seen: prev.seen, stale: stale ?? false, refreshing: prev.refreshing };
+          case "offline": return stale === undefined || prev.stale === stale ? prev : { ...prev, stale };
+        }
+      });
+    };
+    const setSeenOnly = (seen: string) => {
+      setFreshness(prev => {
+        switch (prev.kind) {
+          case "loading": return prev;
+          case "online": return { ...prev, seen };
+          case "offline": return { ...prev, seen };
+        }
+      });
+    };
     const delayStale = () => {
       if (!appActive || onlineNow() || staleTimer !== undefined) return;
       offlineSince ??= Date.now();
       staleTimer = setTimeout(() => {
         staleTimer = undefined;
-        if (active && appActive && !onlineNow() && shouldMarkLiveStale(offlineSince, Date.now())) setStale(true);
+        if (active && appActive && !onlineNow() && shouldMarkLiveStale(offlineSince, Date.now())) toOffline(true);
       }, LIVE_STALE_DELAY_MS);
     };
-    const markOnline = () => {
+    const markOnline = (seenOverride?: string) => {
       clearTimeout(staleTimer); staleTimer = undefined; offlineSince = null;
-      setStale(false); setOnline(true);
+      if (!hasValue.current) {
+        if (seenOverride !== undefined) setSeenOnly(seenOverride);
+        return;
+      }
+      const data = value.current as T;
+      setFreshness(prev => ({
+        kind: "online",
+        data,
+        seen: seenOverride ?? (prev.kind === "loading" ? stamp() : prev.seen),
+        refreshing: prev.kind === "loading" ? false : prev.refreshing,
+      }));
     };
-    const updateOnline = () => {
-      if (onlineNow()) markOnline();
-      else { setOnline(false); delayStale(); }
+    const updateOnline = (seenOverride?: string) => {
+      if (onlineNow()) markOnline(seenOverride);
+      else { toOffline(); delayStale(); }
     };
     const load = async (manual = false) => {
       if (!active || !appActive) return;
@@ -125,12 +193,23 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
       polling = true;
       const resumeLoad = resumeCatchup;
       const readRevision = revision;
-      if (manual) setRefreshing(true);
+      if (manual) {
+        setFreshness(prev => {
+          switch (prev.kind) {
+            case "loading": return prev;
+            case "online":
+            case "offline":
+              return prev.refreshing ? prev : { ...prev, refreshing: true };
+          }
+        });
+      }
       try {
         const next = await current.current.load();
         if (active && readRevision === revision) {
-          value.current = next; setData(next); setSeen(stamp());
-          lastLoadOk = true; updateOnline();
+          hasValue.current = true;
+          value.current = next;
+          lastLoadOk = true;
+          updateOnline(stamp());
           if (resumeLoad) {
             resumeCatchup = false;
             if (resumeEventSeen) reconnectAfterResume();
@@ -144,7 +223,17 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
       }
       finally {
         polling = false;
-        if (active) { setLoading(false); if (manual) setRefreshing(false); }
+        if (active) {
+          setFreshness(prev => {
+            switch (prev.kind) {
+              case "loading":
+                return { kind: "offline", data: null, seen: "", stale: false, refreshing: false };
+              case "online":
+              case "offline":
+                return manual && prev.refreshing ? { ...prev, refreshing: false } : prev;
+            }
+          });
+        }
         if ((pollAgain || shouldRetryEmptyLiveLoad(readRevision !== revision, value.current)) && active && appActive) {
           pollAgain = false; void load();
         }
@@ -185,8 +274,14 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
               ? current.current.refreshOnEvent(event.topic, event.data)
               : current.current.refreshOnEvent;
             if (invalidatesLiveLoad(next, value.current)) revision++;
-            if (next !== undefined) { value.current = next; setData(next); setLoading(false); }
-            setSeen(stamp());
+            const nextSeen = stamp();
+            if (next !== undefined) {
+              hasValue.current = true;
+              value.current = next;
+              markOnline(nextSeen);
+            } else {
+              setSeenOnly(nextSeen);
+            }
             if (next === undefined || refreshOnEvent) void load();
           },
           onClose() {
@@ -203,14 +298,14 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
           },
           onOpen() {
             if (!active || !appActive) return;
-            streamUp = true; lastLoadOk = false; retryMs = 500; clearTimers(); markOnline(); setSeen(stamp());
+            streamUp = true; lastLoadOk = false; retryMs = 500; clearTimers(); markOnline(stamp());
           },
         });
         unsubscribe = attached.close; restartShared = attached.restart;
         await attached.ready;
         if (!active || !appActive || connectRevision !== appRevision) { attached.close(); return; }
         if (!attached.isCurrent()) { waitingForSharedRestart = Boolean(restartShared); return; }
-        streamUp = true; lastLoadOk = false; retryMs = 500; clearTimers(); markOnline(); setSeen(stamp());
+        streamUp = true; lastLoadOk = false; retryMs = 500; clearTimers(); markOnline(stamp());
       } catch { failed(); }
       finally {
         connecting = false;
@@ -226,7 +321,7 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
       resumeCatchup = false; resumeEventSeen = false;
       streamUp = false; lastLoadOk = false;
       clearTimers();
-      setOnline(false); delayStale();
+      toOffline(); delayStale();
       if (restartShared) void restartShared().catch(() => {});
       else { detach(); void connect(); }
     };
@@ -234,8 +329,7 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
     if (refocused && appActive) {
       resumeStateTimer = setTimeout(() => {
         if (!active || !appActive) return;
-        if (!onlineNow()) setOnline(false);
-        setStale(false);
+        if (!onlineNow()) toOffline(false);
       }, 0);
       offlineSince = Date.now();
       delayStale();
@@ -266,7 +360,7 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
       if (streamUp && awayFor < APP_BACKGROUND_GRACE_MS) {
         resumeCatchup = true; resumeEventSeen = false;
         lastLoadOk = false;
-        setStale(false); setOnline(false); offlineSince = Date.now(); delayStale();
+        toOffline(false); offlineSince = Date.now(); delayStale();
         void load();
       } else {
         const restart = streamUp && awayFor >= APP_BACKGROUND_GRACE_MS ? restartShared : undefined;
@@ -275,8 +369,7 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
           if (!restart) detach();
         }
         lastLoadOk = false;
-        setOnline(false);
-        setStale(false);
+        toOffline(false);
         offlineSince = Date.now();
         delayStale();
         if (restart) void restart().catch(() => {});
@@ -286,9 +379,8 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
     return () => {
       active = false; clearTimers(); clearTimeout(staleTimer); clearTimeout(backgroundGrace); clearTimeout(resumeStateTimer); detach(); removeForegroundListener(); refreshRef.current = () => {};
     };
-    // The caller owns the dependency list; callbacks are read through current.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focused, connection, topicsKey, options.intervalMs, ...options.deps]);
   const refresh = useCallback(() => refreshRef.current(), []);
-  return { data, online, stale: stale && !online, loading, refreshing, seen, refresh };
+  return { ...freshnessView(freshness), refresh };
 }

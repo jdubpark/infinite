@@ -1,11 +1,9 @@
-/** Memory wire contract. Authority always comes from the authenticated host context. */
 export const MEMORY_SCHEMA_VERSION = 1 as const;
 export const MEMORY_PACKET_MAX_TOKENS = 512;
 export const MEMORY_PACKET_MAX_CLAIMS = 8;
 export const MEMORY_RECALL_MAX_CANDIDATES = 20;
 
 export type MemoryJson = null | boolean | number | string | MemoryJson[] | { [key: string]: MemoryJson };
-/** Canonical nonnegative decimal integer string; accounting uses BigInt on the host. */
 export type MemoryMicrounits = string;
 export type MemoryCapability = "read" | "propose" | "review" | "curate" | "feedback" | "share" | "publish" | "administer" | "erase";
 export type MemoryScope = "private" | "shared" | "global";

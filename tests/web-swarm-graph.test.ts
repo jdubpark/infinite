@@ -1,10 +1,8 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import type { Agent, AgentState, CodeMap, SessionTouches, Swarm, SwarmModel, SwarmTask, Unit } from "../apps/web/src/swarm/types";
+import type { Agent, AgentState, CodeMap, LiveUnit, SessionTouches, Swarm, SwarmModel, SwarmTask, TeamSwarm, Unit } from "../apps/web/src/swarm/types";
 import { areaOf, areaOfOwned, buildGraph, contextRequests, GRAPH_BUDGET, nextBatch, SESSION_BATCH, type GraphData } from "../apps/web/src/swarm/graph-model";
 import { layoutGraph } from "../apps/web/src/swarm/graph-layout";
-
-// Fixtures use neutral names only (checkout-v2, packages/host/src, web).
 
 function agent(id: string, over: Partial<Agent> = {}): Agent {
   return {
@@ -14,16 +12,16 @@ function agent(id: string, over: Partial<Agent> = {}): Agent {
   };
 }
 
-function unit(id: string, over: Partial<Unit> = {}): Unit {
+function unit(id: string, over: Partial<LiveUnit> = {}): LiveUnit {
   return {
     id, swarmId: "run-1", title: `unit ${id}`, projectId: "checkout-v2", status: "implementing", revision: 1, live: true,
-    reached: "build", checks: { passed: 0, failed: 0, running: 0 }, agents: [], side: [], dependsOn: [], waiting: 0,
+    reached: "build", checks: { passed: 0, failed: 0, running: 0 }, agents: [], side: [], dependsOn: [], waiting: 0, unmeasured: 0,
     createdAt: "2026-11-13T09:00:00.000Z", lastActivityAt: "2026-11-13T09:00:00.000Z", baseCommit: "base", tasks: [], ...over,
   };
 }
 
-function team(id: string, units: Unit[], over: Partial<Swarm> = {}): Swarm {
-  return { id, kind: "team", title: `team ${id}`, live: true, units, ghosts: [], loose: [], waiting: 0, createdAt: "2026-11-13T09:00:00.000Z", ...over };
+function team(id: string, units: Unit[], over: Partial<TeamSwarm> = {}): TeamSwarm {
+  return { id, kind: "team", title: `team ${id}`, live: true, units, waiting: 0, unmeasured: 0, createdAt: "2026-11-13T09:00:00.000Z", ...over };
 }
 
 function model(live: Swarm[]): SwarmModel {
@@ -31,7 +29,7 @@ function model(live: Swarm[]): SwarmModel {
     live, held: [], quiet: [], quietOlder: 0,
     totals: {
       byState: { "needs-you": 0, "in-review": 0, working: 0, waiting: 0, queued: 0, reported: 0, stopped: 0, fault: 0 },
-      agents: 0, waitingOnPerson: 0, slots: { running: 0, limit: 0 }, costUsd: 0,
+      agents: 0, waitingOnPerson: 0, slots: { running: 0, limit: 0 }, costUsd: 0, unmeasured: 0,
     },
   };
 }
@@ -41,7 +39,7 @@ function touches(sessionId: string, files: SessionTouches["files"], over: Partia
 }
 
 function task(id: string, memberId: string, paths: string[], changed: string[] = []): SwarmTask {
-  return { id, title: `task ${id}`, status: "running", dependsOn: [], paths, memberId, changedPaths: { paths: changed, truncated: false } };
+  return { id, title: `task ${id}`, status: "running", paths, memberId, changedPaths: { paths: changed, truncated: false } };
 }
 
 function readyMap(areas: { id: string; symbols: number }[], links: { source: string; target: string; weight: number }[] = []): CodeMap {
@@ -173,7 +171,6 @@ describe("swarm graph model", () => {
   });
 
   test("area and link budgets", () => {
-    // 130 touched directories with no code map: 120 drawn, 10 dropped.
     const files = Array.from({ length: 130 }, (_, i) => ({ path: `d${i}/x/f.ts`, reads: 1, edits: 0, lastAt: "2026-11-13T09:01:00.000Z" }));
     const member = agent("a1");
     const u = unit("unit-1", { agents: [member] });
@@ -181,7 +178,6 @@ describe("swarm graph model", () => {
     assert.equal(wide.nodes.filter(node => node.kind === "area").length, GRAPH_BUDGET.areas);
     assert.equal(wide.dropped.areas, 10);
 
-    // 30 touched areas fully linked: 435 code links, 400 kept, 35 dropped.
     const names = Array.from({ length: 30 }, (_, i) => `t${i}`);
     const links: { source: string; target: string; weight: number }[] = [];
     for (let i = 0; i < names.length; i++) for (let j = i + 1; j < names.length; j++) links.push({ source: names[i], target: names[j], weight: 1 });
@@ -206,7 +202,7 @@ describe("swarm graph model", () => {
     const coordinator = agent("sess-c", { id: "sess-c", sessionId: "sess-c", role: "MC", unitId: undefined, projectId: undefined, stage: undefined });
     const dependent = unit("unit-2", { dependsOn: ["unit-1"] });
     const first = unit("unit-1");
-    const mission: Swarm = { id: "m1", kind: "mission", title: "mission m1", live: true, units: [first, dependent], ghosts: [], loose: [], waiting: 0, coordinator, createdAt: "2026-11-13T09:00:00.000Z" };
+    const mission: Swarm = { id: "m1", kind: "mission", title: "mission m1", live: true, units: [first, dependent], ghosts: [], waiting: 0, unmeasured: 0, coordinator, createdAt: "2026-11-13T09:00:00.000Z" };
     const data = build({ model: model([mission]) });
     const linked = linkIds(data);
     assert.ok(linked.has("member:agent:sess-c>mission:m1"));
@@ -223,7 +219,6 @@ test("a planned directory is its own area", () => {
   assert.equal(areaOfOwned("src/routes/orders/create.ts", areas), "src/routes/orders");
   assert.equal(areaOfOwned("src/lib/http.ts", areas), "src/lib");
   assert.equal(areaOfOwned("docs", areas), ".");
-  // Without a map a path with no extension is a directory, cut to two segments like any other.
   assert.equal(areaOfOwned("src/routes/orders", undefined), "src/routes");
   assert.equal(areaOfOwned("src/a.ts", undefined), "src");
 });
@@ -237,13 +232,12 @@ test("layout depends on which nodes exist, not on agent state", () => {
   const working = build2("working"), waiting = build2("needs-you");
   assert.deepEqual([...waiting.at.entries()], [...working.at.entries()]);
   assert.ok(working.at.size >= 5, "the hub, both agents, and both areas are placed");
-  // Every placed node has its own position.
   const spots = new Set([...working.at.values()].map(point => `${point.x},${point.y}`));
   assert.equal(spots.size, working.at.size);
 });
 
 test("a solo session's observed touches are drawn in its own project", () => {
-  const solo: Swarm = { id: "solo", kind: "solo", title: "solo", live: true, units: [], ghosts: [], waiting: 0, createdAt: "2026-11-13T09:00:00.000Z",
+  const solo: Swarm = { id: "solo", kind: "solo", title: "solo", live: true, waiting: 0, unmeasured: 0, createdAt: "2026-11-13T09:00:00.000Z",
     loose: [agent("free", { role: "SO", stage: undefined, unitId: undefined, swarmId: "solo", projectId: "shop-api" })] };
   const live = model([solo]);
   assert.deepEqual(contextRequests(live), { projects: ["shop-api"], teams: [], sessions: ["s-free"] });
@@ -265,6 +259,5 @@ test("session context is asked for a batch at a time and reaches every session",
     offset = next.offset;
   }
   assert.equal(seen.size, 30);
-  // A short list is asked whole every cycle.
   assert.deepEqual(nextBatch(["a", "b"], 5, SESSION_BATCH), { batch: ["a", "b"], offset: 0 });
 });

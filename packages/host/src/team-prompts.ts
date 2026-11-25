@@ -1,4 +1,4 @@
-import { inputSourceLabel, ownerSteering, decisionAnswerLabel, decisionAuthorityQuestion, autoPinned, autoRouted, eligibleImplementers, escalationPool, hostSelects, scoutPool } from "./team-types.js";
+import { inputSourceLabel, ownerSteering, decisionAnswerLabel, decisionAuthorityQuestion, autoPinned, autoRouted, eligibleImplementers, escalationPool, hostSelects, scoutPool, withoutCriteria } from "./team-types.js";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { entryToolsFor } from "./entry-roles.js";
@@ -129,16 +129,12 @@ function withoutPrivateSettings<T extends object>(project: T): T {
   delete copy.objective;
   return copy as T;
 }
+/** Roles whose members stay out of the project manager's reports and recovery lists. */
+export const UNREPORTED_ROLES: ReadonlySet<TeamMember["role"]> = new Set(["permission-coordinator", "evaluator", "judge"]);
 /** A task or scout without its routing decision: no member reads which profile the router chose, or why. */
 export function withoutRouting<T extends object>(item: T): T {
   const { routing: _routing, ...rest } = item as T & { routing?: unknown };
   return rest as T;
-}
-/** The goal without its criteria rows, which only the project manager reads. The same object when it has none. */
-function withoutCriteria(goal: NonNullable<TeamRun["goal"]>): NonNullable<TeamRun["goal"]> {
-  if (!goal.criteria) return goal;
-  const { criteria: _criteria, ...rest } = goal;
-  return rest;
 }
 /**
  * The goal's JSON. With a pinned record digest, the success text leaves the JSON and the digest's criteria follow, with
@@ -193,7 +189,7 @@ export function teamContext(run: TeamRun, feedback?: string, configuredProject?:
     tasks: (run.tasks ?? []).map(withoutRouting),
     checks: run.checks ?? [],
     continuations: continuations.map(item => ({ ...item, tasks: item.tasks.map(withoutRouting) })),
-    memberReports: (run.members ?? []).filter(member => member.role !== "permission-coordinator" && member.role !== "evaluator" && member.role !== "judge").map(({ memberId, revision, role, taskId, status, baseCommit, report, stoppedReason, permissionBlocked }) => ({ memberId, revision, role, ...(taskId ? { taskId } : {}), status, baseCommit, ...(report ? { report } : {}), ...(stoppedReason ? { stoppedReason } : {}), ...(permissionBlocked ? { permissionBlocked } : {}) })),
+    memberReports: (run.members ?? []).filter(member => !UNREPORTED_ROLES.has(member.role)).map(({ memberId, revision, role, taskId, status, baseCommit, report, stoppedReason, permissionBlocked }) => ({ memberId, revision, role, ...(taskId ? { taskId } : {}), status, baseCommit, ...(report ? { report } : {}), ...(stoppedReason ? { stoppedReason } : {}), ...(permissionBlocked ? { permissionBlocked } : {}) })),
     ...(run.permissionAgentDecisions?.length ? { permissionAgentDecisions: run.permissionAgentDecisions.slice(-20) } : {}),
     feedback: feedback ?? null,
   };

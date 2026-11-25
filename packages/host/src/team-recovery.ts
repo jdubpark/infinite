@@ -2,7 +2,7 @@ import type { ConnectorSource } from "./mcp-types.js";
 import { inputSourceLabel, type TeamContinuation, type TeamContinue, teamContinueSchema, type TeamDeliveryReconcile, teamDeliveryReconcileSchema, type TeamMember, type TeamReport, type TeamRun, type TeamScout, type TeamTask, teamVerificationReconcileSchema, type TeamView } from "./team-types.js";
 import { randomUUID } from "node:crypto";
 import { dirname, relative } from "node:path";
-import { pullRequestBranch, teamDeliveryBranch } from "./team-prompts.js";
+import { pullRequestBranch, teamDeliveryBranch, UNREPORTED_ROLES } from "./team-prompts.js";
 import type { LinearService } from "./linear.js";
 import { assertMemberReadOnly, prepareRecoveredWorkspace, TeamError, teamHead } from "./team-workspace.js";
 import { activeMember, automaticRecoveryLimit, commitId, deliveredAtRevision, digest, recoveriesUsed, type TeamKernel, terminalPermissionCoordinator, timestamp } from "./team-kernel.js";
@@ -523,7 +523,7 @@ export class TeamRecovery {
       const preservedCopy = preservedWorkspace
         ? `The original integration workspace is preserved at ${preservedWorkspace}. Inspect its exact state and retained diff read-only against ${head}; its dirty or conflicted edits were not imported into the clean recovery workspace. Carry only approved work forward through a new assignment.`
         : "The integration workspace matched the recorded head and was clean.";
-      const retainedMemberWorkspaces = run.members.filter(member => member.revision === source.revision && member.role !== "permission-coordinator").slice(0, 60)
+      const retainedMemberWorkspaces = run.members.filter(member => member.revision === source.revision && !UNREPORTED_ROLES.has(member.role)).slice(0, 60)
         .map(member => `${member.memberId} (${member.role}${member.taskId ? `, task ${member.taskId}` : ""}; ${member.status}; base ${member.baseCommit}): ${member.cwd}`);
       const memberCopies = retainedMemberWorkspaces.length
         ? `Retained member workspaces for affected revision ${source.revision} are listed below. Inspect them read-only at their recorded base commits; preserve the original copies and use a new assignment to carry only approved work forward.\n${retainedMemberWorkspaces.join("\n")}`

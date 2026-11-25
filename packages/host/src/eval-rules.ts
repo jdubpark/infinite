@@ -4,7 +4,7 @@ import type { Capsule, CapturedPayload, CaptureStart, EvalFeatures, MaterialStat
 import type { OutcomeRow } from "./outcome-store.js";
 import { rowUse } from "./outcome-cells.js";
 import { isTestPath, pathArea, type FeatureMap } from "./task-features.js";
-import { decisionAuthorityQuestion, type TeamMember, type TeamRun, type TeamTask } from "./team-types.js";
+import { decisionAuthorityQuestion, withoutCriteria, type TeamMember, type TeamRun, type TeamTask } from "./team-types.js";
 
 /** Pure capture rules. No I/O, no clock. */
 
@@ -29,7 +29,7 @@ export function buildCapsule(run: TeamRun, task: TeamTask, member: TeamMember): 
     steering,
     ownerAnswers,
     ...(run.brief ? { brief: run.brief } : {}),
-    ...(run.goal ? { goal: run.goal } : {}),
+    ...(run.goal ? { goal: withoutCriteria(run.goal) } : {}),
     task: { id: task.id, title: task.title, instructions: task.instructions, paths: [...task.paths] },
   };
 }

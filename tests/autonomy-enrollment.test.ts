@@ -107,6 +107,21 @@ test("the enrollment view says whether autonomy is ready", () => {
   } finally { f.close(); }
 });
 
+test("the enrollment view names the evaluator profiles that share a model with an implementer", () => {
+  const f = fixture();
+  try {
+    const config = f.config();
+    const evaluator = (provider: "codex" | "claude", model: string) => ({ id: `${provider}-evaluator`, label: "Evaluator", provider, model, effort: "xhigh" as const, tier: "strong" as const });
+    const viewFor = (lineup: typeof mixedLineup | undefined) => {
+      if (lineup) config.teams!.lineup = lineup; else delete config.teams!.lineup;
+      return new RepoEnrollmentService(config, f.key).get("example");
+    };
+    assert.deepEqual(viewFor({ ...mixedLineup, evaluators: [evaluator("codex", "gpt-6-astra")] }).evaluatorOverlaps, ["codex-evaluator"]);
+    assert.deepEqual(viewFor({ ...mixedLineup, evaluators: [evaluator("codex", "gpt-6-other")] }).evaluatorOverlaps, []);
+    assert.deepEqual(viewFor(undefined).evaluatorOverlaps, []);
+  } finally { f.close(); }
+});
+
 test("repo init stores an explicit mode outside the team block and keeps it when omitted", async () => {
   const f = fixture();
   try {

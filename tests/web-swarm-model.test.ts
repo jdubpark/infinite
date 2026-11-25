@@ -392,3 +392,12 @@ test("unmeasured agent counts reach every cost, and costs stay as measured", () 
   assert.equal(model.totals.costUsd, 0 + 1.5 + 2 + 0.4);
   assert.equal(model.totals.unmeasured, 6 + 2 + 3 + 4 + 1);
 });
+
+test("an evaluator member is drawn with its code in the review stage", () => {
+  const model = buildSwarm(input({
+    teams: [team("checkout-v2", { status: "reviewing", members: [member("m-eval", { role: "evaluator" })] })],
+  }));
+  const agent = findAgent(model, "m-eval");
+  assert.equal(agent?.role, "EV");
+  assert.equal(agent?.stage, "review");
+});

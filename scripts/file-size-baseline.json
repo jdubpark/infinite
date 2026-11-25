@@ -14,7 +14,7 @@
     "packages/host/src/understanding-work.ts": 1021,
     "packages/host/src/worker.ts": 1746,
     "scripts/egress-proxy.mjs": 1253,
-    "tests/client-cli.test.ts": 1338,
+    "tests/client-cli.test.ts": 1349,
     "tests/evidence-outbox.test.ts": 1017,
     "tests/evidence-store.test.ts": 1247,
     "tests/goals.test.ts": 1059,

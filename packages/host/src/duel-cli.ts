@@ -33,7 +33,7 @@ function viewLines(view: CalibrationView): string[] {
   const reason = view.reason ? ` · ${clean(view.reason)}` : "";
   const projects = view.pairs.perProject.map(p => `${clean(p.projectId)} ${whole(p.pairs)}`).join(", ");
   return [
-    `calibration ${clean(view.calibrationId)} judge ${clean(view.profileId)} epoch ${whole(view.profileEpoch)} · ${clean(view.status)}${reason} · state ${view.state === null || view.state === undefined ? "none" : clean(view.state)}`,
+    `calibration ${clean(view.calibrationId)} judge ${clean(view.profileId)} epoch ${whole(view.profileEpoch)} · ${clean(view.status)}${reason} · state ${view.state === null || view.state === undefined ? "none" : clean(view.state)}${typeof view.waiting === "string" ? ` · waiting on ${clean(view.waiting)}` : ""}`,
     `pairs ${running ? "unknown" : whole(view.pairs.counted)} (${projects}) of ${whole(view.pairs.planned)} planned · correct ${running ? "unknown" : whole(view.pairs.correct)} · accuracy ${fixed(view.accuracy)} · lower bound ${fixed(view.lowerBound)} · swap agreement ${fixed(view.swapAgreement)}`,
     `${view.inForce ? "in force" : "not in force"} · judge minutes ${whole(view.judgeMinutes)} · ${spend(view.cost)} · created ${clean(view.createdAt)}${view.validUntil ? ` · valid until ${clean(view.validUntil)}` : ""}`,
   ];

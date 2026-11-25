@@ -27,7 +27,7 @@ const OTHER = { id: "zz-other", label: "Other", provider: "claude", model: "othe
 const REQUEST = "11111111-1111-4111-8111-111111111111";
 const READ_ROLES = ["owner", "controller", "viewer"];
 const VIEW_KEYS = ["accuracy", "calibrationId", "completedAt", "cost", "createdAt", "expiresAt", "inForce", "judgeMinutes", "lowerBound", "pairs",
-  "profileEpoch", "profileId", "promptVersion", "reason", "state", "status", "swapAgreement", "validUntil"];
+  "profileEpoch", "profileId", "promptVersion", "reason", "state", "status", "swapAgreement", "validUntil", "waiting"];
 const dirs: string[] = [];
 
 test.after(() => {
@@ -207,6 +207,7 @@ test("the judges view carries no task, trial, or patch field", async () => {
     await call(r, "POST", CREATE, "owner", body());
     const listed = await call(r, "GET", "/api/duels/judges", "viewer");
     assert.equal(listed.body.calibrations.length, 1);
+    assert.equal(listed.body.calibrations[0].waiting, null, "a running calibration reports that nothing holds it");
     for (const key of Object.keys(listed.body.calibrations[0])) assert.ok(VIEW_KEYS.includes(key), `unexpected key ${key}`);
     for (const secret of ["t-P-", "trial-", "other-model-q7", "judge-model-q7", MARKER, "plain"]) assert.equal(listed.text.includes(secret), false, secret);
   } finally {

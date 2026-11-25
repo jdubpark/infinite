@@ -113,7 +113,8 @@ const args = process.argv.slice(2);
 const resume = args.indexOf('--resume');
 const prompt = args.find(value => value.startsWith('native:'));
 const nativeId = resume >= 0 ? args[resume + 1] : prompt?.slice('native:'.length);
-appendFileSync(${JSON.stringify(launchLog)}, JSON.stringify({ mode: process.env.CLAUDE_CODE_EXPERIMENTAL_CODE_MODE, nativeId }) + '\\n');
+const settings = args.flatMap((value, index) => value === '--settings' ? [JSON.parse(args[index + 1]).env?.CLAUDE_CODE_EXPERIMENTAL_CODE_MODE ?? null] : []);
+appendFileSync(${JSON.stringify(launchLog)}, JSON.stringify({ mode: process.env.CLAUDE_CODE_EXPERIMENTAL_CODE_MODE, nativeId, settings }) + '\\n');
 if (process.env.INFINITE_HOOK_URL) await fetch(process.env.INFINITE_HOOK_URL + '/claude', {
   method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + process.env.INFINITE_HOOK_TOKEN },
   body: JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: nativeId, prompt: 'Resume fixture' })
@@ -121,7 +122,7 @@ if (process.env.INFINITE_HOOK_URL) await fetch(process.env.INFINITE_HOOK_URL + '
 setInterval(() => {}, 1000);
 `);
   const host = await startHost({ agents: { claude: { command: process.execPath, args: [fixture] } }, config: { codeMode: { claude: "all" } } });
-  const readLaunches = () => readFileSync(launchLog, "utf8").trim().split("\n").map(line => JSON.parse(line) as { mode?: string; nativeId: string });
+  const readLaunches = () => readFileSync(launchLog, "utf8").trim().split("\n").map(line => JSON.parse(line) as { mode?: string; nativeId: string; settings: (string | null)[] });
   const start = async (nativeId: string) => {
     const id = randomUUID();
     const created = await host.fetchApi("/sessions", "owner", { requestId: id, projectId: "rehearsal", provider: "claude", title: "Code Mode", prompt: `native:${nativeId}` });
@@ -154,6 +155,10 @@ setInterval(() => {}, 1000);
     assert.equal(Object.hasOwn(enabledResume.body, "codeMode"), false, "resume responses keep the host choice internal");
     await waitFor(() => readLaunches(), launches => launches.length === 2);
     assert.equal(readLaunches()[1]!.mode, "1");
+    // A command prefix such as sudo drops the variable, and Claude Code refuses to resume a Code Mode conversation
+    // without the request. So it also rides in an argument: in the hook layer of the first launch, and in an argument
+    // of its own on the resume, whose arguments the host writes.
+    assert.deepEqual(readLaunches().map(launch => launch.settings), [["1"], ["1"]]);
 
     const disabled = await start(nativeIds[1]!);
     assert.equal(Object.hasOwn((await host.fetchApi(`/sessions/${disabled}`)).body, "codeMode"), false);
@@ -163,6 +168,8 @@ setInterval(() => {}, 1000);
     assert.equal(disabledResume.status, 200, JSON.stringify(disabledResume.body));
     await waitFor(() => readLaunches(), launches => launches.length === 4);
     assert.equal(Object.hasOwn(readLaunches()[3]!, "mode"), false);
+    // The plain conversation never asked: its hook layer holds no request, and its resume gets no settings argument.
+    assert.deepEqual(readLaunches().slice(2).map(launch => launch.settings), [[null], []]);
 
     // A plain conversation's resume request is the one the host built before the switch existed. So a resume that an
     // earlier host had started, with the record written and the receipt not yet, is found again by its fingerprint.
@@ -201,7 +208,7 @@ setInterval(() => {}, 1000);
     const interactiveResume = await host.fetchApi(`/sessions/${recorded}/resume`, "owner", { requestId: resumeId });
     assert.equal(interactiveResume.status, 200, JSON.stringify(interactiveResume.body));
     await waitFor(() => readLaunches(), launches => launches.length === 6);
-    assert.deepEqual(readLaunches()[5], { mode: "1", nativeId: nativeIds[2] });
+    assert.deepEqual(readLaunches()[5], { mode: "1", nativeId: nativeIds[2], settings: ["1"] });
   } finally {
     await host.stop();
     rmSync(root, { recursive: true, force: true });

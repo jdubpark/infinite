@@ -22,7 +22,7 @@ const view = (over: Partial<CalibrationView> = {}): CalibrationView => ({
   pairs: { planned: 36, counted: 30, correct: 24, perProject: [{ projectId: "P", pairs: 18 }, { projectId: "Q", pairs: 12 }] },
   accuracy: 0.8, lowerBound: 0.627, swapAgreement: 0.9, judgeMinutes: 10, cost: { tokens: 10, spentUsd: 1 },
   createdAt: "2026-11-22T10:00:00.000Z", expiresAt: "2026-12-22T10:00:00.000Z", completedAt: "2026-11-22T12:00:00.000Z",
-  validUntil: "2027-01-21T12:00:00.000Z", inForce: true, ...over,
+  validUntil: "2027-01-21T12:00:00.000Z", inForce: true, waiting: null, ...over,
 });
 
 async function capture<T>(run: () => Promise<T>): Promise<string[]> {
@@ -79,6 +79,17 @@ test("unknown numbers print as unknown", () => {
   assert.ok(text.includes("lower bound unknown"));
   assert.ok(!/(^|[^\d])0\.000/.test(text));
   assert.ok(text.includes("state none"));
+});
+
+test("a waiting calibration names its gate, and an older host's view prints as before", () => {
+  const running = { status: "running" as const, state: null, inForce: false };
+  const first = (over: Partial<CalibrationView>) => judgeLines([view({ ...running, ...over })])[1]!;
+  assert.ok(first({ waiting: "host-load" }).includes("running · state none · waiting on host-load"), first({ waiting: "host-load" }));
+  assert.ok(!first({ waiting: null }).includes("waiting"));
+  const older = view(running) as Partial<CalibrationView>;
+  delete older.waiting;
+  assert.ok(!judgeLines([older as CalibrationView])[1]!.includes("waiting"));
+  assert.ok(!first({ waiting: "a\u001b[2Jb" }).includes("\u001b"));
 });
 
 test("control characters are cleaned", () => {

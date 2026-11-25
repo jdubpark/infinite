@@ -931,7 +931,9 @@ test(`a ${action} with an unresolved verification operation stays in force after
   const f = await fixture("lifecycle");
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
-    const checking = await waitFor(() => f.get(created.body.id), run => run.status === "verifying" && run.checks.some(check => check.status === "running"), 30000);
+    // The project has a quick check before the held one. Only the held check is certain to run when the API stops.
+    const checking = await waitFor(() => f.get(created.body.id), run => run.status === "verifying" && run.checks.some(check => check.status === "running") &&
+      existsSync(join(f.receipts, "check-ready.json")), 30000);
     const result = await f.host.fetchApi(`/teams/${checking.id}/${action}`, "owner", { requestId: randomUUID(), revision: checking.revision });
     assert.equal(result.status, 200);
     await f.host.stopApi();

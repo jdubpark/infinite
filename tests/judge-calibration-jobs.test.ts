@@ -11,7 +11,7 @@ import { configRef, TRIAL_HARNESS_VERSION, trialProfileKey } from "../packages/h
 import { advanceEpoch, configurationModule } from "../packages/host/src/configuration-store.js";
 import { judgeCalibrationsModule, calibrationJudgements, readCalibration } from "../packages/host/src/judge-store.js";
 import { labelDraw } from "../packages/host/src/judge-package.js";
-import { JudgeCalibrations, type JudgementOutcome, type NextJudgement } from "../packages/host/src/judge-calibration-jobs.js";
+import { JudgeCalibrations, judgementIdOf, type JudgementOutcome, type NextJudgement } from "../packages/host/src/judge-calibration-jobs.js";
 import type { TrialGates } from "../packages/host/src/eval-trial-jobs.js";
 import type { TrialConfiguration, TrialGrade } from "../packages/host/src/eval-types.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
@@ -524,5 +524,101 @@ test("a live judgement holds the next one and begin converges", async () => {
     const row = rowsOf(f, next.calibrationId)[0]!;
     assert.equal(row.state, "final");
     assert.equal(row.preferred, next.resolvedIsA ? "A" : "B");
+  } finally { f.close(); }
+});
+
+test("the view names the gate that holds the next judgement", async () => {
+  const f = ready();
+  try {
+    seedPairs(f, "P", 30);
+    const id = created(f);
+    assert.equal(view(f).waiting, null, "nothing has waited yet");
+    await f.jobs.next(gates({ hostLoadHeld: true }));
+    assert.equal(view(f).waiting, "host-load");
+    await f.jobs.next(gates({ freeSlots: async () => 0 }));
+    assert.equal(view(f).waiting, "session-slots");
+    f.jobs.hold("eval-identity");
+    assert.equal(view(f).waiting, "eval-identity", "a reason the pump found");
+    const next = await f.jobs.next(gates());
+    assert.equal(next.kind, "start");
+    assert.equal(view(f).waiting, null, "a start clears the reason");
+    if (next.kind !== "start") return;
+    assert.equal(f.jobs.begin(next), "inserted");
+    f.jobs.release(next.judgementId, "mirror");
+    assert.equal(view(f).waiting, "mirror");
+    assert.equal(rowsOf(f, id).length, 0, "a released start leaves no row");
+    const again = await f.jobs.next(gates());
+    assert.equal(again.kind === "start" ? again.judgementId : "", next.judgementId, "the same judgement runs again");
+    assert.equal(again.kind === "start" ? again.attempt : -1, 0);
+  } finally { f.close(); }
+});
+
+test("a calibration that is not running shows no wait reason", async () => {
+  const f = ready();
+  try {
+    seedPairs(f, "P", 30);
+    const id = created(f);
+    f.jobs.hold("grader");
+    const ended = f.jobs.cancel(id);
+    assert.ok("calibration" in ended);
+    assert.equal("calibration" in ended ? ended.calibration.waiting : "x", null, "a cancelled calibration waits on nothing");
+    created(f, { requestId: "request-2" });
+    const running = f.jobs.views().find(item => item.status === "running");
+    assert.equal(running?.waiting, null, "a new calibration does not show a reason found before it existed");
+  } finally { f.close(); }
+});
+
+/** Starts the next judgement and fails it before any session: the row is inserted, then released. */
+async function failStart(f: Fixture, reason = "eval-failed", as?: Partial<Start>): Promise<Start> {
+  const next = await f.jobs.next(gates());
+  assert.equal(next.kind, "start");
+  const start = { ...(next as Start), ...as };
+  assert.equal(f.jobs.begin(start), "inserted");
+  f.jobs.release(start.judgementId, reason);
+  return start;
+}
+
+test("nine releases in a row keep the attempt and the tenth ends it", async () => {
+  const f = ready();
+  try {
+    seedPairs(f, "P", 30);
+    const id = created(f);
+    for (let i = 0; i < 9; i++) assert.equal((await failStart(f)).attempt, 0, `release ${i + 1}`);
+    assert.deepEqual(rowsOf(f, id), [], "nine releases leave no row");
+    assert.equal((await failStart(f)).attempt, 0);
+    assert.deepEqual(rowsOf(f, id).map(row => [row.attempt, row.state, row.ending]), [[0, "final", "void-host"]], "the tenth ends the attempt");
+    const next = await f.jobs.next(gates());
+    assert.equal(next.kind === "start" ? next.attempt : -1, 1, "the next start is attempt 1");
+    assert.equal(f.jobs.views().find(item => item.calibrationId === id)?.waiting, null);
+  } finally { f.close(); }
+});
+
+test("a release of another judgement starts a new count", async () => {
+  const f = ready();
+  try {
+    seedPairs(f, "P", 30);
+    const id = created(f);
+    for (let i = 0; i < 5; i++) await failStart(f);
+    const other = { judgementId: judgementIdOf(id, 5, 0, 0), pairIndex: 5 };
+    await failStart(f, "eval-failed", other);
+    for (let i = 0; i < 9; i++) await failStart(f);
+    assert.deepEqual(rowsOf(f, id), [], "fourteen releases of one judgement in all, never ten in a row");
+  } finally { f.close(); }
+});
+
+test("a release for a calibration that is no longer running leaves the running one's reason", async () => {
+  const f = ready();
+  try {
+    seedPairs(f, "P", 30);
+    const first = created(f);
+    const next = await f.jobs.next(gates());
+    assert.equal(next.kind, "start");
+    if (next.kind !== "start") return;
+    assert.equal(f.jobs.begin(next), "inserted");
+    f.jobs.cancel(first);
+    created(f, { requestId: "request-2" });
+    f.jobs.release(next.judgementId, "eval-failed");
+    const running = f.jobs.views().find(item => item.status === "running");
+    assert.equal(running?.waiting, null, "the cancelled calibration's cause is not shown on the new one");
   } finally { f.close(); }
 });

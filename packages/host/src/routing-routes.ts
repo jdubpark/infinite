@@ -16,11 +16,6 @@ const TASK_ID = /^[a-z][a-z0-9-]{0,39}$/;
 export type RoutingRouteDeps = { evidence: EvidenceStore; config: () => Config;
   teams: { revokeRouting(id: string, input: unknown): Promise<unknown> } };
 
-/**
- * The routing reads (status, explain) and the owner's writes: the exploration pause and resume, and the run's revoke.
- * The reads write nothing and open no sealed payload beyond what the reads name. The pause writes only the project's
- * routing state, never the configuration. `unavailable` answers 503 `evidence-unavailable`.
- */
 export function routingRoutes(app: express.Express, deps: RoutingRouteDeps, guard: express.RequestHandler, ownerGuard: express.RequestHandler): void {
   const unavailable = (error: unknown, res: express.Response) => {
     if (error instanceof EvidenceError && error.code === "unavailable") {
@@ -30,7 +25,6 @@ export function routingRoutes(app: express.Express, deps: RoutingRouteDeps, guar
   };
   const unknownProject = (res: express.Response) => res.status(404).json({ code: "unknown-project", error: "The project is not configured on this host." });
 
-  // Pausing or resuming writes one project row. A pause keeps its first time; a resume clears it.
   const explore = (pause: boolean) => (req: express.Request, res: express.Response) => {
     const project = deps.config().projects.find(item => item.id === req.params.id);
     if (!project) return void unknownProject(res);
@@ -62,10 +56,8 @@ export function routingRoutes(app: express.Express, deps: RoutingRouteDeps, guar
         saved: project.team?.routing,
         autonomy: startMode(project, config.teams?.lineup).mode,
         lineup: config.teams?.lineup,
-        // The values a new run pins, so the status shows the prompt versions a new decision would use.
         publishHeads: (config.teams as { publishHeads?: boolean } | undefined)?.publishHeads !== false,
         entryTools: config.teams?.blackboard?.tools === true,
-        // The shape a new run of this project would pin: the criteria digest, and the register when it is on.
         objectiveDigest: objectivePromptFor(project, startMode(project, config.teams?.lineup).mode),
         codeMode: memberCodeModeExpected(config),
         now: new Date().toISOString(),
@@ -76,7 +68,6 @@ export function routingRoutes(app: express.Express, deps: RoutingRouteDeps, guar
   });
 
   app.get("/api/teams/:id/routing/:taskId", guard, (req, res) => {
-    // A UUID is case-insensitive; the host stores its ids in lower case.
     const run = uuid.safeParse(String(req.params.id).toLowerCase());
     const task = TASK_ID.test(String(req.params.taskId));
     if (!run.success || !task) return void res.status(400).json({ code: "invalid-routing-request", error: "The run or task ID is not valid." });

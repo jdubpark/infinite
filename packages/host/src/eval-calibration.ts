@@ -2,9 +2,6 @@ import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb, EvidenceTx } from "./evidence/types.js";
 import { markExposed } from "./eval-sets.js";
 
-// The calibration read: pairs of a resolved and an unresolved graded trial patch for one dev task.
-// Only a host-internal caller reads it. No route, command, log line, or event carries a pair.
-
 export const CALIBRATION_PAIRS_MAX = 20;
 
 export const CALIBRATION_TASKS_SQL = "SELECT x.task_id FROM eval_trials x JOIN eval_tasks t ON t.task_id = x.task_id "
@@ -24,7 +21,6 @@ export type CalibrationPair = {
 
 type Side = { trialId: string; patch: Buffer };
 
-/** The stored patch of one trial, or undefined when the trial has none (never stored, or swept after it expired). */
 export function readTrialPatch(db: EvidenceDb, trialId: string): Buffer | undefined {
   const stored = db.get<{ payload: string }>("SELECT payload FROM eval_trial_patches WHERE trial_id = ?", trialId);
   if (stored === undefined) return undefined;
@@ -39,11 +35,6 @@ function sideOf(tx: EvidenceTx, projectRef: string, taskId: string, resolved: 0 
   return patch === undefined ? undefined : { trialId: row.trial_id, patch };
 }
 
-/**
- * Reads at most `limit` (at most CALIBRATION_PAIRS_MAX) dev tasks that have both a resolved and an unresolved graded
- * trial, and returns the newest stored patch of each side. The group of each returned task is marked exposed in the
- * same write. `next` is the last task id read when the page was full, else null.
- */
 export function calibrationPairs(
   store: EvidenceStore,
   input: { projectId: string; after?: string; limit?: number },

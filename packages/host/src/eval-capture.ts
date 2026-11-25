@@ -28,22 +28,17 @@ export type TaskCaptureOptions = {
   config: Pick<Config, "projects" | "teams">;
   store: EvidenceStore;
   source?: Pick<ProjectSourceService, "mirrorPath" | "status">;
-  /** Default: `captureGit` with the configured Git prefix. */
   git?: CaptureGit;
   now?: () => string;
-  /** Default CAPTURE_DEADLINE_MS. */
   deadlineMs?: number;
-  /** Called for each captured row a reconcile promotes. The host joins the mined copies of the run here. */
   onPromoted?: Promoted;
 };
 
 type JobKind = "material" | "approval";
 type Job = { kind: JobKind; taskId: string; run: () => Promise<void> };
-/** A deadline wait of `bounded`: its timer, and the settling of the wait as failed. */
 type Deadline = { timer: NodeJS.Timeout; settle: () => void };
 type BaseDelta = Extract<MaterialResult, { kind: "store" }>["baseDelta"];
 
-/** The skip lines already written in this process: one per code. */
 const skipped = new Set<string>();
 
 function skip(code: "capture-busy" | "corpus-full"): void {
@@ -56,7 +51,6 @@ function emptyResult(): ReconcileResult {
   return { visited: 0, promoted: 0, rejected: 0, demoted: 0, waiting: 0, unreadable: 0 };
 }
 
-/** The promotion rule's facts for one row, with the ledger row read in the same write. */
 function decideWith(tx: EvidenceTx): Decide {
   return task => {
     let row: OutcomeRow | undefined;
@@ -77,10 +71,6 @@ function decideWith(tx: EvidenceTx): Decide {
   };
 }
 
-/**
- * Observes integrated tasks and approvals and keeps their material in the evidence store. It never changes a run:
- * `enabled`, `integrated`, and `approved` are synchronous and never throw; their Git reads run in the background.
- */
 export class TaskCapture implements CaptureSink {
   private readonly config: Pick<Config, "projects" | "teams">;
   private readonly store: EvidenceStore;
@@ -90,13 +80,10 @@ export class TaskCapture implements CaptureSink {
   private readonly deadlineMs: number;
   private readonly onPromoted: Promoted | undefined;
   private readonly queue: Job[] = [];
-  /** Task ids with a job of each kind queued or running. The restart rule must not fail these for their own half. */
   private readonly live: Record<JobKind, Map<string, number>> = { material: new Map(), approval: new Map() };
   private readonly waiters: Array<() => void> = [];
   private running = 0;
-  /** Git calls that passed their deadline and have not settled yet. */
   private stalled = 0;
-  /** The deadline waits still open. `close` settles them. */
   private readonly deadlines = new Set<Deadline>();
   private readonly sweepCursor: SweepCursor = { after: "" };
   private closed = false;
@@ -147,7 +134,6 @@ export class TaskCapture implements CaptureSink {
         this.enqueue("material", capturedTaskId(start.runId, start.memberId), () => this.captureJob(start, settings, map));
       }
     } catch {
-      // Capture never changes a run.
     }
   }
 
@@ -173,11 +159,9 @@ export class TaskCapture implements CaptureSink {
         this.enqueue("approval", task.taskId, () => this.approvalJob(task.taskId, start, task.integratedHead));
       }
     } catch {
-      // Capture never changes a run.
     }
   }
 
-  /** Runs `failPending` once in this process, then one batch. A zero result when closed or a module is not ready. */
   reconcile(): ReconcileResult {
     try {
       if (this.closed || !this.ready(EVAL_MODULE) || !this.ready(OUTCOMES_MODULE)) return emptyResult();
@@ -212,16 +196,11 @@ export class TaskCapture implements CaptureSink {
     }
   }
 
-  /** Resolves when no job is queued or running. A stalled read is not awaited. */
   idle(): Promise<void> {
     if (this.queue.length === 0 && this.running === 0) return Promise.resolve();
     return new Promise(resolve => this.waiters.push(resolve));
   }
 
-  /**
-   * Drops queued jobs, settles the open deadline waits as failed (not as stalled), and stops the Git reads in flight.
-   * A dropped job's row is failed by the next process's `failPending`.
-   */
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -235,7 +214,6 @@ export class TaskCapture implements CaptureSink {
     try {
       this.git.close?.();
     } catch {
-      // Close never throws.
     }
     this.notifyIdle();
   }
@@ -248,12 +226,10 @@ export class TaskCapture implements CaptureSink {
     return this.store.status().modules[name] === "ready";
   }
 
-  /** Writes through the store, and never after close. False when the write did not commit. */
   private write(fn: (tx: EvidenceTx) => void): boolean {
     return !this.closed && this.store.tryWrite(fn);
   }
 
-  /** Slots a new job may take. Zero when the queue is full or too many reads have stalled. */
   private freeSlots(): number {
     if (this.stalled >= CAPTURE_STALLED_MAX) return 0;
     return Math.max(0, CAPTURE_QUEUE_MAX - this.queue.length - this.running);
@@ -269,7 +245,6 @@ export class TaskCapture implements CaptureSink {
     while (!this.closed && this.running < CAPTURE_CONCURRENCY && this.queue.length > 0) {
       const job = this.queue.shift()!;
       this.running += 1;
-      // A capture read is never a command of the operation that started it: each job starts outside every scope.
       new Promise<void>(resolve => resolve(commandScope.exit(() => job.run())))
         .catch(() => undefined)
         .finally(() => {
@@ -293,11 +268,6 @@ export class TaskCapture implements CaptureSink {
     for (const resolve of this.waiters.splice(0)) resolve();
   }
 
-  /**
-   * Races one Git call against the deadline. When the deadline wins, the call counts as failed and as stalled until
-   * its promise settles; the job goes on. Starts no call once the stalled budget is spent or after close. Close settles
-   * the wait as failed without a stall, and the call's later settling changes nothing.
-   */
   private bounded<T>(call: () => Promise<T>, failed: T): Promise<T> {
     if (this.closed || this.stalled >= CAPTURE_STALLED_MAX) return Promise.resolve(failed);
     return new Promise<T>(resolve => {
@@ -343,7 +313,6 @@ export class TaskCapture implements CaptureSink {
     this.write(tx => { completeMaterial(tx, taskId, result, this.now()); });
   }
 
-  /** The reads of one capture, in order. Each stops the job at its first refusal. */
   private async referenceResult(start: CaptureStart, settings: EvalProjectSettings, map: FeatureMap | undefined): Promise<MaterialResult> {
     const workspace = start.workspace;
     const names = await this.bounded<NameRead>(
@@ -375,13 +344,11 @@ export class TaskCapture implements CaptureSink {
       files: verdict.files,
       hiddenFiles: verdict.hiddenFiles,
       baseDelta,
-      // An empty reference is a read that failed without saying so: a captured task has at least two files.
       reference: reference.state === "read" && reference.bytes.length > 0 ? { state: "stored", bytes: reference.bytes } : { state: "missing" },
       base,
     };
   }
 
-  /** Form 1 in the source mirror against the mirror's head. No head, a throw, or a timeout is `not-proven`. */
   private async baseCheck(start: CaptureStart): Promise<BaseRead> {
     try {
       const source = this.source;

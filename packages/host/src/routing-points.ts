@@ -13,12 +13,9 @@ import type { DecisionRow, RoutingPayload } from "./routing-types.js";
 import type { TeamModelProfile, TeamRun, TeamScout } from "./team-types.js";
 import type { Provider } from "./types.js";
 
-/** An escalated implementer's decision. `ownProfileId` is the member's own profile, which is never a candidate. */
 export type RouterEscalation = RouterStart & { ownProfileId: string | undefined; namedProfileId: string | undefined };
-/** A scout's decision. A scout has no task and no paths: its features are fixed. */
 export type RouterScout = { run: TeamRun; scout: TeamScout; featureMap: FeatureMap | undefined; limited: ReadonlySet<Provider> };
 
-/** One scout decision: the features are fixed, the candidates are the scout pool, and the rule is the cheapest tier. */
 export function evaluateScout(db: EvidenceDb, input: RouterScout, keys: { taskKey: string; key: string }, now: string, auto: boolean): Evaluated | undefined {
   const { run, scout } = input;
   const { routing, lineup } = run;
@@ -73,17 +70,12 @@ export function evaluateScout(db: EvidenceDb, input: RouterScout, keys: { taskKe
   return { row, payload };
 }
 
-/** A profile the router chose, looked up in the pool it came from. A missing one throws, and the caller falls back. */
 function poolNamed(pool: readonly TeamModelProfile[] | undefined, profileId: string): TeamModelProfile {
   const profile = pool?.find(item => item.id === profileId);
   if (profile === undefined) throw new Error("A routing decision names a profile outside its pool.");
   return profile;
 }
 
-/**
- * The budget, the payload limit, and one insert, as a start's decision. Returns the stored row (the first one, when the
- * key was already stored) or the failure. Only the start releases stale rows; the new points never do.
- */
 function settle(store: EvidenceStore, row: DecisionRow, payload: RoutingPayload, elapsed: number): DecisionRow | AutoFailure {
   if (elapsed > DECISION_BUDGET_MS) return "budget";
   payload.elapsedMs = Math.round(elapsed);
@@ -96,10 +88,6 @@ function settle(store: EvidenceStore, row: DecisionRow, payload: RoutingPayload,
   return holder.stored ?? row;
 }
 
-/**
- * One escalation decision at key (run, revision, task key, "escalation", 1), in the flow of a start's. Undefined when no
- * escalation profile other than the member's own passes rules 1 and 2. Every failure gives the fallback and its reason.
- */
 export function decideAutoEscalation(store: EvidenceStore, input: RouterEscalation, now: () => string, clock: () => number): AutoDecision | undefined {
   const { run, task, ownProfileId, namedProfileId } = input;
   const { lineup, routing } = run;
@@ -129,10 +117,6 @@ export function decideAutoEscalation(store: EvidenceStore, input: RouterEscalati
   }
 }
 
-/**
- * One scout decision at key (run, revision, scout key, "scout", 1), with `scoutFallback`. It reads only the routing
- * module. Undefined when no scout candidate passes rules 1 and 2.
- */
 export function decideAutoScout(store: EvidenceStore, input: RouterScout, now: () => string, clock: () => number): AutoDecision | undefined {
   const { run, scout } = input;
   const { lineup } = run;

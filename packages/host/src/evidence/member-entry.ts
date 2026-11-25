@@ -8,7 +8,6 @@ import { ENTRY_KINDS } from "./entry-types.js";
 import type { MemberEntryKind } from "./entry-types.js";
 export { ENTRY_ROLES, entryToolsFor } from "../entry-roles.js";
 
-/** Which member kinds each role may post (spec part 4). */
 export const ROLE_KINDS: Readonly<Record<"project-manager" | "scout" | "implementer" | "integrator" | "reviewer", readonly MemberEntryKind[]>> = {
   "project-manager": ["contract", "blocker"],
   scout: ["finding", "blocker"],
@@ -25,18 +24,15 @@ export const MAX_ENTRY_PATH_BYTES = 1024;
 
 const CONTROL = /[\u0000-\u001f\u007f]/;
 
-/** A trimmed, non-empty string of at most `max` characters. */
 const text = (max: number) => z.string().trim().min(1).max(max);
 const idString = z.string().min(1).max(200);
 const uuid = z.uuid();
 
-/** A summary: no control character, trimmed, at most 240 bytes as JSON string content (escapes count). */
 const summarySchema = z.string()
   .refine(value => !CONTROL.test(value), "Use no control character")
   .transform(value => value.trim())
   .pipe(z.string().min(1).refine(value => Buffer.byteLength(JSON.stringify(value), "utf8") - 2 <= MAX_ENTRY_SUMMARY_BYTES, "Use at most 240 bytes"));
 
-/** The paths: no control character, and at most 1,024 bytes as a JSON array (escapes count). */
 const pathsSchema = z.array(ownedPathSchema).max(MAX_ENTRY_PATHS).default([])
   .refine(paths => paths.every(path => !CONTROL.test(path)), "Use no control character")
   .refine(paths => Buffer.byteLength(JSON.stringify(paths), "utf8") <= MAX_ENTRY_PATH_BYTES, "Use at most 1024 path bytes");
@@ -71,7 +67,6 @@ const handoffBody = z.object({
 
 const common = { summary: summarySchema, paths: pathsSchema, taskId: taskIdSchema.optional() };
 
-/** A member's post. Each kind has its own strict shape. The canonical body is at most 12 KiB. */
 export const memberEntryPostSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("contract"), ...common, supersedes: uuid.optional(), body: contractBody }).strict(),
   z.object({ kind: z.literal("finding"), ...common, supersedes: uuid.optional(), body: findingBody }).strict(),
@@ -80,7 +75,6 @@ export const memberEntryPostSchema = z.discriminatedUnion("kind", [
 ]).refine(entry => Buffer.byteLength(canonicalJson(entry.body), "utf8") <= MAX_ENTRY_BODY_BYTES, "Use a body of at most 12 KiB");
 export type MemberEntryPost = z.infer<typeof memberEntryPostSchema>;
 
-/** A member's list query. Every field is optional, and a kinds list has no repeats. */
 export const memberListQuerySchema = z.object({
   kinds: z.array(z.enum(ENTRY_KINDS)).min(1).max(8)
     .refine(kinds => new Set(kinds).size === kinds.length, "Use each kind once")
@@ -94,7 +88,6 @@ export type MemberListQuery = z.infer<typeof memberListQuerySchema>;
 
 const binding = { runId: idString, memberId: idString, revision: z.number().int().min(0) };
 
-/** The worker's request envelope. Every operation carries the binding. */
 export const memberEntryEnvelopeSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("post"), ...binding, requestId: uuid, entry: memberEntryPostSchema }).strict(),
   z.object({ op: z.literal("list"), ...binding, query: memberListQuerySchema.optional() }).strict(),
@@ -104,7 +97,6 @@ export type MemberEntryEnvelope = z.infer<typeof memberEntryEnvelopeSchema>;
 
 export type EntryBinding = { runId: string; memberId: string; revision: number };
 
-/** A UUIDv8 of SHA-256 over the domain and the canonical binding and entry. Same bit layout as `reportIdentity`. */
 export function memberEntryId(entryBinding: EntryBinding, entry: MemberEntryPost): string {
   const bytes = createHash("sha256")
     .update("infinite-member-entry:v1\0", "utf8")
@@ -117,14 +109,12 @@ export function memberEntryId(entryBinding: EntryBinding, entry: MemberEntryPost
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-/** Whether the assignment may post this entry, by role and kind, then by task. */
 export function postAllowed(
   assignment: Pick<TeamAssignment, "role" | "taskId">,
   entry: MemberEntryPost,
 ): "ok" | "entry-kind-forbidden" | "entry-task-forbidden" {
   const kinds: readonly MemberEntryKind[] = (ROLE_KINDS as Readonly<Record<string, readonly MemberEntryKind[]>>)[assignment.role] ?? [];
   if (!kinds.includes(entry.kind)) return "entry-kind-forbidden";
-  // Only an implementer or an integrator names a task. A scout's assignment id is a discovery id, not a task.
   const namesTask = assignment.role === "implementer" || assignment.role === "integrator";
   if (entry.taskId !== undefined && (!namesTask || entry.taskId !== assignment.taskId)) return "entry-task-forbidden";
   if (entry.kind === "handoff" && assignment.taskId === undefined) return "entry-task-forbidden";
@@ -141,7 +131,6 @@ export type MemberScope = {
   dependsOn: string[];
 };
 
-/** Task, owned paths, and dependencies from `run.tasks`. A member without a known task has none. */
 export function memberScopeOf(run: TeamRun, member: TeamMember, launchSeq: number): MemberScope {
   const task: TeamTask | undefined = member.taskId ? run.tasks.find(candidate => candidate.id === member.taskId) : undefined;
   return {
@@ -155,7 +144,6 @@ export function memberScopeOf(run: TeamRun, member: TeamMember, launchSeq: numbe
   };
 }
 
-/** Schema field names that a refusal path may show. Any other key becomes `?`. */
 const FIELD_NAMES: ReadonlySet<string> = new Set([
   "entry", "body", "kind", "summary", "paths", "taskId", "supersedes", "items", "source", "observation",
   "interface", "change", "sources", "cause", "status", "detail", "issueRefs", "sourceRefs", "attemptedFixes",
@@ -164,7 +152,6 @@ const FIELD_NAMES: ReadonlySet<string> = new Set([
   "limit", "entryId", "assumption", "propose", "id", "stance", "statement", "refutedBy", "test", "criticality",
 ]);
 
-/** A zod issue path as `entry.body.items.0.source`: indexes and schema field names only. */
 export function refusalPath(path: readonly PropertyKey[]): string {
   return path.map(segment => {
     if (typeof segment === "number") return String(segment);

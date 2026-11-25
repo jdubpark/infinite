@@ -8,7 +8,6 @@ const COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const REPOSITORY = /^([^@#]+)(?:#L(\d+)(?:-L(\d+))?)?(?:@([0-9a-f]{40}|[0-9a-f]{64}))?$/;
 const SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 
-/** Form only: `path`, `path#Lfrom`, `path#Lfrom-Lto`, each with an optional `@commit`, or an https URL. Undefined for anything else. */
 export function parseCitation(text: string): RepositoryCitation | OutsideCitation | undefined {
   if (text.length > CITATION_LIMITS.chars) return undefined;
   if (SCHEME.test(text)) {
@@ -39,7 +38,6 @@ export function parseCitation(text: string): RepositoryCitation | OutsideCitatio
   return citation;
 }
 
-/** Array elements whose first 32 `sources` strings hold at least `perEntry` form-valid citations; outside citations count once per host. */
 export function qualifyingEntries(entries: readonly unknown[], perEntry: number): number {
   let qualifying = 0;
   for (const entry of entries) {
@@ -65,8 +63,6 @@ export function qualifyingEntries(entries: readonly unknown[], perEntry: number)
 
 const fold = (value: string): string => value.replace(/\s+/g, " ").trim();
 
-/** Whether `quote` appears in `text`, or in its lines `from` to `to`, after folding every whitespace run to one space and trimming.
- *  Lines are split on "\n" with a trailing "\r" removed; lines past the end are absent. */
 export function quotePresent(text: string, quote: string, lines?: { from: number; to: number }): boolean {
   const needle = fold(quote);
   if (needle === "") return false;

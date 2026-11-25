@@ -19,7 +19,6 @@ export { DECISION_BUDGET_MS } from "./routing-auto.js";
 export type { RouterStart } from "./routing-auto.js";
 export type { RouterEscalation, RouterScout } from "./routing-points.js";
 
-/** The fixed log texts of the shadow recorder. Each names no id and no value. */
 const LOG = {
   unavailable: "Routing shadow decision skipped: the evidence store is unavailable.",
   budget: `Routing shadow decision skipped: it took longer than ${DECISION_BUDGET_MS} ms.`,
@@ -29,24 +28,16 @@ const LOG = {
 
 type Reason = keyof typeof LOG;
 
-/** A shadow pin of version 2 that lists the point: its decisions are recorded, and none is applied. */
 function shadowsAt(routing: TeamRunRouting, point: RoutingPoint): boolean {
   return routing.mode === "shadow" && routing.algorithmVersion >= POINTS_ALGORITHM_VERSION && routing.knobs.points.includes(point);
 }
 
-/** The scout's fallback, with `scout.routing` set to it. Undefined when no scout candidate passes rules 1 and 2. */
 function fallbackScout(run: TeamRun, scout: TeamScout): TeamModelProfile | undefined {
   const profile = scoutFallback(run, scout);
   if (profile !== undefined) scout.routing = { profileId: profile.id, by: "fallback" };
   return profile;
 }
 
-/**
- * Records the router's pick for the implementer of a task, when the task starts, in shadow; and applies the pick of an
- * `auto` run. A shadow start writes at most one `recorded` row per run, revision, and task. An auto start writes one
- * `pending` row before its member exists. The escalation and scout points follow the same rules, under a version-2 pin
- * that lists them. Neither throws into a run.
- */
 export class RoutingRecorder {
   private readonly store: EvidenceStore;
   private readonly now: () => string;
@@ -62,16 +53,9 @@ export class RoutingRecorder {
     this.log = options.log ?? (line => console.warn(line));
   }
 
-  /**
-   * Step 1's pin. A saved `auto` mode, or the autonomous default (no saved mode in an autonomous project), reads the period
-   * end: before it is stored, the shadow pin; with it, the `auto` pin, unless no implementer passes the fixed rules. A saved
-   * `auto` then refuses with 409 `routing-no-eligible-profile`; the autonomous default logs once and pins shadow.
-   * A store failure gives the shadow pin and one log line.
-   */
   pin(saved: TeamRouting | undefined, autonomy: AutonomyMode, lineup: TeamLineup | undefined, projectId: string): TeamRunRouting | undefined {
     const shadowPin = () => pinRouting(saved, autonomy, lineup);
     const effective = effectiveRouting(saved, autonomy);
-    // The same condition as pinRouting's `auto`: a saved auto mode, or no saved mode in an autonomous project.
     const auto = saved?.mode === "auto" || (saved?.mode === undefined && autonomy === "autonomous");
     if (effective.mode !== "shadow" || !effective.knobs.points.includes("start") || lineup === undefined || !auto) return shadowPin();
 
@@ -93,7 +77,6 @@ export class RoutingRecorder {
     return pin;
   }
 
-  /** Never throws. Writes at most one shadow row. An `auto` pin returns at once: its start is `applyStart`'s. */
   recordStart(input: RouterStart): void {
     try {
       this.record(input);
@@ -102,11 +85,6 @@ export class RoutingRecorder {
     }
   }
 
-  /**
-   * The profile an `auto` run's task starts on, and `task.routing` set to it. Undefined unless the run is `auto`-pinned.
-   * A revoked run starts on the fallback profile without a run line, as the revoke wrote one. A fallback writes one run line.
-   * It throws only when no implementer passes the fixed rules, which `pin` refuses before a run exists.
-   */
   applyStart(input: RouterStart): TeamModelProfile | undefined {
     const { run, task } = input;
     const routing = run.routing;
@@ -129,11 +107,6 @@ export class RoutingRecorder {
     return decision.profile;
   }
 
-  /**
-   * The escalated implementer's profile. A shadow pin records a `recorded` row and returns undefined. An `auto` run that covers
-   * the point gets the router's pick, or its fallback with one run line. A revoked run without a named profile gets the
-   * fallback with no row and no run line. Otherwise undefined, and today's path applies. Never throws.
-   */
   routeEscalation(input: RouterEscalation): TeamModelProfile | undefined {
     const { run, task, ownProfileId, namedProfileId } = input;
     const { routing, lineup } = run;
@@ -163,11 +136,6 @@ export class RoutingRecorder {
     }
   }
 
-  /**
-   * The scout's profile, and `scout.routing` set to it. A shadow pin records a `recorded` row and returns undefined. A kept
-   * routing that is still a scout candidate returns without a read. A revoked run without a named profile gets the fallback,
-   * with no row and no run line. Otherwise the router's pick, or its fallback with one run line. Never throws.
-   */
   routeScout(input: RouterScout): TeamModelProfile | undefined {
     const { run, scout } = input;
     const { routing, lineup } = run;
@@ -223,10 +191,6 @@ export class RoutingRecorder {
     this.shadowAt(run, task.id, "start", (db, keys) => evaluateStart(db, input, frame, keys, this.now(), false));
   }
 
-  /**
-   * One shadow decision at `point` for the task or scout `id`: one read, and one insert when the key is new. A stored row for
-   * the key is kept as it is. Logs the reason of a skipped decision once; never throws.
-   */
   private shadowAt(run: TeamRun, id: string, point: RoutingPoint, evaluate: (db: EvidenceDb, keys: { taskKey: string; key: string }) => Evaluated | undefined): void {
     const modules = this.store.status().modules;
     if (REQUIRED_MODULES.some(name => modules[name] !== "ready")) {
@@ -236,7 +200,6 @@ export class RoutingRecorder {
 
     const started = this.clock();
     const decided = this.store.read(db => {
-      // The blind index of the id, never the plain id: the key and the seed are stored as plain columns.
       const taskKey = db.index("task", id);
       const key = decisionKey(run.id, run.revision, taskKey, point, 1);
       if (readDecision(db, key) !== undefined) return undefined;

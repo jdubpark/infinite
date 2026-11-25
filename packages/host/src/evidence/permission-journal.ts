@@ -29,11 +29,8 @@ const LOG_PAGE_MAX = 200;
 const CANDIDATE_PAGE_DEFAULT = 100;
 const CANDIDATE_PAGE_MAX = 500;
 const HOUR_MS = 3_600_000;
-/** A session is flagged when its last hour exceeds this many times its workspace's median active session-hour. */
 export const RATE_FLAG_FACTOR = 3;
-/** No session is flagged at or below this many decisions in the last hour. */
 export const RATE_FLAG_FLOOR = 20;
-/** The baseline window before the last hour, in days. */
 export const RATE_FLAG_BASELINE_DAYS = 7;
 
 export type PermissionTier = {
@@ -68,11 +65,6 @@ export type PermissionDecision = {
   note?: string;
   replayOf?: string;
   repeats?: string;
-  /**
-   * A digest of the raised request this decision answers. The host can decide one raised request more than once, and
-   * decisions with one digest count as one repeat. It is kept only in the sealed copy of the decision: it is no
-   * column, and a lookup does not return it. A decision of an earlier release has none and counts on its own.
-   */
   requestDigest?: string;
 };
 
@@ -112,16 +104,12 @@ export type PermissionRates = {
   medianDecisionMs: number | null;
 };
 
-/** The owner's later judgment of one decision. A record only: it changes no decision, replay or lock. */
 export type PermissionMark = {
-  /** The owner request that recorded it. A retry with the same id returns this mark. */
   requestId: string;
   decisionId: string;
   at: string;
-  /** The owner device that recorded it. */
   by: string;
   label: "wrong";
-  /** The owner's own text. */
   note: string;
 };
 
@@ -130,24 +118,19 @@ export type PermissionLogQuery = {
   rejectedOnly?: boolean;
   raisedOnly?: boolean;
   since?: string;
-  /** The `next` cursor of the previous page. */
   before?: string;
   limit?: number;
 };
 
-/** An owner control recorded against one decision. */
 export type PermissionDecisionControl = {
   kind: "reopen" | "close";
   at: string;
   reason?: string;
 };
 
-/** One decision as the owner reads it, with everything linked to it. The note is the model's, for the owner only. */
 export type PermissionLogEntry = PermissionDecision & {
   raised: boolean;
-  /** From the first tier's start to the last tier's end. Null when no model turn ran. */
   durationMs: number | null;
-  /** For a reject: whether it is still open for its task, was reopened by the owner, or closed with its task or direction. */
   rejectState?: "open" | "reopened" | "closed";
   deliveries: PermissionDelivery[];
   marks: PermissionMark[];
@@ -156,13 +139,8 @@ export type PermissionLogEntry = PermissionDecision & {
 
 export type PermissionLogPage = { entries: PermissionLogEntry[]; next?: string };
 
-/** The labels of the replay set. A candidate carries the one its owner act implies; the owner confirms or drops it. */
 export type PermissionCaseLabel = "should-allow" | "should-reject" | "should-reach-owner";
 
-/**
- * A decision that the owner marked wrong or a reject that the owner reopened, offered as a labelled replay case.
- * It holds the decision without the model's note: a replay case is request evidence, and no model text belongs in it.
- */
 export type PermissionReplayCandidate = {
   decisionId: string;
   label: PermissionCaseLabel;
@@ -170,20 +148,16 @@ export type PermissionReplayCandidate = {
   decision: Omit<PermissionDecision, "note">;
   marks: PermissionMark[];
   reopenedAt?: string;
-  /** The time of the latest owner act that offered it. */
   offeredAt: string;
 };
 
 export type PermissionReplayCandidatePage = { candidates: PermissionReplayCandidate[]; next?: string };
 
-/** A session whose decisions in the last hour exceed its workspace's usual rate. Nothing stops on it. */
 export type PermissionRateFlag = {
   sessionId: string;
   workspaceId: string;
   lastHour: number;
-  /** The median decisions per active session-hour in the workspace over the baseline window. 0 with no history. */
   baselineMedian: number;
-  /** max(RATE_FLAG_FLOOR, RATE_FLAG_FACTOR * baselineMedian). The session is flagged above it. */
   threshold: number;
 };
 
@@ -236,14 +210,12 @@ type ControlRow = {
   assignment: string | null;
 };
 
-/** The permission journal owns its tables and deliberately has no run-deletion hook. */
 export const permissionJournalModule: EvidenceModule = {
   name: MODULE,
   version: 2,
   readVersion: 1,
   migrate(tx: EvidenceTx, from: number) {
     if (from < 1) migrateDecisions(tx);
-    // Version 2: the owner's marks. Each mark is a row of its own; nothing updates or deletes one.
     if (from < 2) {
       tx.exec(
         `CREATE TABLE IF NOT EXISTS ${MARKS} (`
@@ -255,7 +227,6 @@ export const permissionJournalModule: EvidenceModule = {
   },
 };
 
-/** Version 1: decisions, delivery events, owner controls and the journal's own order. */
 function migrateDecisions(tx: EvidenceTx): void {
   tx.exec(
     `CREATE TABLE IF NOT EXISTS ${ORDER} (seq INTEGER PRIMARY KEY AUTOINCREMENT)`,
@@ -292,7 +263,6 @@ function migrateDecisions(tx: EvidenceTx): void {
   tx.exec(`CREATE INDEX IF NOT EXISTS permission_controls_assignment ON ${CONTROLS}(assignment, seq)`);
 }
 
-/** Append-only permission decisions and their delivery/owner-control history. */
 export class PermissionJournal {
   constructor(private readonly store: EvidenceStore) {
     if (store.status().modules[MODULE] !== "ready") {
@@ -313,8 +283,6 @@ export class PermissionJournal {
         return;
       }
 
-      // A replay record answers with one earlier decision of the same task and carries that decision's outcome.
-      // It is stored against the source, so no chain of replays exists and no link can cross a task.
       let replaySourceId: string | undefined;
       let replayedRepeat: string | undefined;
       if (decision.replayOf !== undefined) {
@@ -333,7 +301,6 @@ export class PermissionJournal {
           throw new TypeError("The cited decision cannot be replayed for this request.");
         }
         replaySourceId = source.id;
-        // A replayed effect reject is a repeat of that reject, whether or not the caller said so.
         if (isEffectReject(source.code ?? undefined)) replayedRepeat = source.repeats ?? source.id;
       }
 
@@ -570,11 +537,6 @@ export class PermissionJournal {
     });
   }
 
-  /**
-   * Whether a model has ever rejected a request from this assignment. The host raises every later
-   * request from such an assignment to the strong tier, so an owner reopening the reject, the reject
-   * closing with its task, and an unlock all leave this history in place.
-   */
   hasRejectHistory(assignment: string): boolean {
     requiredString(assignment, "assignment");
     const codes = [...EFFECT_REJECT_CODES, ...EVIDENCE_REJECT_CODES];
@@ -607,13 +569,6 @@ export class PermissionJournal {
     });
   }
 
-  /**
-   * Whether the host may answer an identical request from `requesterFamily` with this recorded
-   * verdict. A replay record is judged as the decision it replays. A verdict that a strong reviewer
-   * gave is not replayed to a requester of that reviewer's family, nor to a requester whose family
-   * the host could not establish (`requesterFamily: undefined`). `appendDecision` applies the same
-   * rule, so the journal never holds a replay that this query refuses.
-   */
   replayEligible(decisionId: string, options: { taskId: string; requesterFamily: string | undefined }): boolean {
     requiredString(decisionId, "decisionId");
     assertPlainObject(options, "A replay query needs a taskId and the requester's family.");
@@ -696,11 +651,6 @@ export class PermissionJournal {
     });
   }
 
-  /**
-   * Records the owner's mark on one decision as a new row. It changes no decision, no replay and no lock, and a
-   * later mark never rewrites an earlier one. A retry with the same request id returns the recorded mark; the same
-   * id with other content is refused with `PermissionMarkConflict`.
-   */
   mark(input: { requestId: string; decisionId: string; at: string; by: string; label: "wrong"; note: string }): PermissionMark {
     assertPlainObject(input, "A mark is required.");
     assertOnlyKeys(input, ["requestId", "decisionId", "at", "by", "label", "note"]);
@@ -740,10 +690,6 @@ export class PermissionJournal {
       .map(row => hydrateMark(db, row)));
   }
 
-  /**
-   * The owner's decision log, newest first, one bounded page at a time. Each entry carries its delivery events,
-   * its marks, its owner controls and the model's note: a caller serves it to the owner only.
-   */
   log(query: PermissionLogQuery = {}): PermissionLogPage {
     assertPlainObject(query, "A log query must be an object.");
     assertOnlyKeys(query, ["workspaceId", "rejectedOnly", "raisedOnly", "since", "before", "limit"]);
@@ -795,10 +741,6 @@ export class PermissionJournal {
     });
   }
 
-  /**
-   * The decisions the owner marked wrong and the rejects the owner reopened, newest owner act first, each with
-   * the label it implies. This is the read side only: the owner accepts or drops a candidate in the replay set.
-   */
   replayCandidates(query: { before?: string; limit?: number } = {}): PermissionReplayCandidatePage {
     assertPlainObject(query, "A candidate query must be an object.");
     assertOnlyKeys(query, ["before", "limit"]);
@@ -853,11 +795,6 @@ export class PermissionJournal {
     });
   }
 
-  /**
-   * Sessions whose decisions in the hour before `now` exceed RATE_FLAG_FACTOR times their workspace's median
-   * decisions per active session-hour over the RATE_FLAG_BASELINE_DAYS before that hour, and RATE_FLAG_FLOOR.
-   * A session-hour is one session's decisions in one clock hour; hours with no decision do not count.
-   */
   rateFlags(input: { now: string }): PermissionRateFlag[] {
     assertPlainObject(input, "A rate flag query is required.");
     assertOnlyKeys(input, ["now"]);
@@ -893,7 +830,6 @@ export class PermissionJournal {
   }
 }
 
-/** The same mark request id was used for different content. */
 export class PermissionMarkConflict extends Error {
   constructor() {
     super("This request ID already recorded a different mark.");
@@ -1020,10 +956,6 @@ function hydrateDecision(db: EvidenceDb, row: DecisionRow, options: { note: bool
   };
 }
 
-/**
- * The decision a replay record answers with. Every link must stay in one task and carry one outcome; a
- * citation that does not has no source.
- */
 function replaySource(db: EvidenceDb, row: DecisionRow, seen = new Set<string>()): DecisionRow | undefined {
   if (seen.has(row.id)) return undefined;
   seen.add(row.id);
@@ -1033,10 +965,6 @@ function replaySource(db: EvidenceDb, row: DecisionRow, seen = new Set<string>()
   return replaySource(db, source, seen);
 }
 
-/**
- * Whether the rules let `source`, a decision that is not itself a replay, answer the identical request of a
- * requester from `requesterFamily` now.
- */
 function replayAllowed(db: EvidenceDb, source: DecisionRow, requesterFamily: string | undefined): boolean {
   if (source.verdict === "owner" || (HOST_REJECT_CODES as readonly string[]).includes(source.code ?? "")) return false;
   const strongFamilies = (JSON.parse(source.tiers_json) as PermissionTier[])
@@ -1078,10 +1006,6 @@ function ownerReopened(db: EvidenceDb, row: DecisionRow): boolean {
   ).some(event => compareOrder(event.at, event.seq, canonical.at, canonical.seq) > 0);
 }
 
-/**
- * The one decision whose open, closed and reopened state a record shares: the reject it repeats, else the
- * decision it replays, else itself.
- */
 function canonicalDecision(db: EvidenceDb, row: DecisionRow, seen = new Set<string>()): DecisionRow | undefined {
   if (seen.has(row.id)) return undefined;
   seen.add(row.id);
@@ -1117,10 +1041,6 @@ function nextSequence(tx: EvidenceTx): number {
   return tx.run(`INSERT INTO ${ORDER} DEFAULT VALUES`).lastInsertRowid;
 }
 
-/**
- * The journal's own sequence is the order of record. Timestamps are labels: two events can carry
- * the same one, and a host clock can step backwards.
- */
 function compareOrder(_leftAt: string, leftSeq: number, _rightAt: string, rightSeq: number): number {
   return leftSeq - rightSeq;
 }
@@ -1140,7 +1060,6 @@ function hydrateMark(db: EvidenceDb, row: MarkRow): PermissionMark {
   };
 }
 
-/** The decisions of one log page with their delivery events, marks and owner controls, read in one pass each. */
 function logEntries(db: EvidenceDb, rows: DecisionRow[]): PermissionLogEntry[] {
   if (rows.length === 0) return [];
   const ids = rows.map(row => row.id);
@@ -1193,11 +1112,6 @@ function logCursor(value: unknown): { atMs: number; seq: number } {
   return { atMs: Number(match[1]), seq: Number(match[2]) };
 }
 
-/**
- * The replay label an owner act implies for a decision. A wrong allow should not have been allowed; a wrong
- * reject, a reopened reject and a needless owner route should have been allowed. The owner confirms or changes it
- * when accepting the case.
- */
 function impliedLabel(verdict: PermissionVerdict): PermissionCaseLabel {
   return verdict === "allow" ? "should-reject" : "should-allow";
 }

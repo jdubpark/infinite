@@ -3,8 +3,6 @@ import { EvidenceError, type EvidenceDb, type EvidenceModule, type EvidenceTx } 
 import { configRef, TRIAL_HARNESS_VERSION, trialPromptVersion, type SlotRow } from "./eval-trial-rules.js";
 import { VOID_ENDINGS, type TrialConfiguration, type TrialEnding, type TrialGrade, type TrialState } from "./eval-types.js";
 
-// The trial store: one row per trial, its sealed payload, its patch, and one counts row per replay job.
-
 export const EVAL_TRIALS_MODULE = "eval-trials", TRIAL_KEEP_DAYS_DEFAULT = 365, TRIAL_PATCH_KEEP_DAYS = 90,
   TRIAL_PATCH_MAX_BYTES = 1_048_576, TRIAL_PATCHES_HOST_MAX_BYTES = 268_435_456, TRIAL_SWEEP_BATCH = 100, LIVE_TRIALS_MAX = 8;
 
@@ -114,7 +112,6 @@ export function openTrialCounts(tx: EvidenceTx, jobId: string, planned: { tasks:
     jobId, planned.tasks, planned.trials);
 }
 
-/** Inserts a `preparing` row. The unique slot key makes a second insert of the same trial, or of the same attempt, `exists`. */
 export function insertTrial(tx: EvidenceTx, trial: NewTrial, at: string): "inserted" | "exists" {
   const payload: TrialPayload = { projectId: trial.projectId, taskId: trial.taskId, configuration: trial.configuration };
   const changes = tx.run(
@@ -128,7 +125,6 @@ export function insertTrial(tx: EvidenceTx, trial: NewTrial, at: string): "inser
   return changes === 1 ? "inserted" : "exists";
 }
 
-/** Removes a trial that never started. A running or graded trial is never dropped. */
 export function dropTrial(tx: EvidenceTx, trialId: string): boolean {
   return tx.run("DELETE FROM eval_trials WHERE trial_id=? AND state='preparing'", trialId).changes === 1;
 }
@@ -140,15 +136,10 @@ export function startTrial(tx: EvidenceTx, trialId: string, at: string): boolean
   return true;
 }
 
-/** Moves a running trial to grading. The schema has no grading timestamp, so `at` is not stored. */
 export function gradingTrial(tx: EvidenceTx, trialId: string, _at: string): boolean {
   return tx.run("UPDATE eval_trials SET state='grading' WHERE trial_id=? AND state='running'", trialId).changes === 1;
 }
 
-/**
- * Ends a running or grading trial, once. The grade and probes go into the sealed payload, the patch is stored when
- * its caps allow, and the counts move in the same transaction. A second call writes nothing and answers false.
- */
 export function finishTrial(tx: EvidenceTx, trialId: string, final: TrialFinal, at: string): boolean {
   const row = tx.get<{ job_id: string; state: TrialState; payload: string }>("SELECT job_id, state, payload FROM eval_trials WHERE trial_id=?", trialId);
   if (row === undefined || (row.state !== "running" && row.state !== "grading")) return false;
@@ -174,7 +165,6 @@ export function finishTrial(tx: EvidenceTx, trialId: string, final: TrialFinal, 
   return true;
 }
 
-/** Stores the patch when its caps allow, and returns what the payload should say. A dropped patch leaves the total unchanged. */
 function storePatch(tx: EvidenceTx, trialId: string, final: TrialFinal, at: string): TrialPayload["patch"] {
   const patch = final.patch;
   if (patch === undefined) return undefined;
@@ -188,12 +178,10 @@ function storePatch(tx: EvidenceTx, trialId: string, final: TrialFinal, at: stri
   return "stored";
 }
 
-/** Advances the task count of a job, and the skipped count too when the task was skipped. */
 export function advanceTask(tx: EvidenceTx, jobId: string, skipped: boolean): void {
   tx.run("UPDATE eval_trial_counts SET tasks = tasks + 1, skipped = skipped + ? WHERE job_id=?", skipped ? 1 : 0, jobId);
 }
 
-/** Clears the session id. With a cost it also records the session's tokens and cost; `"none"` records that the ledger had none. */
 export function clearTrialSession(tx: EvidenceTx, trialId: string, cost?: { tokens: number; usd: number; complete: boolean } | "none"): void {
   if (cost === undefined) {
     tx.run("UPDATE eval_trials SET session_id=NULL WHERE trial_id=?", trialId);
@@ -207,7 +195,6 @@ export function clearTrialSession(tx: EvidenceTx, trialId: string, cost?: { toke
     cost.tokens, cost.usd, cost.complete ? "complete" : "partial", trialId);
 }
 
-/** Final, non-void original trials of baseline and compare jobs that a new compare job may copy, newest first. */
 export function reusable(db: EvidenceDb, input: { taskId: string; configRef: string; promptVersion: string; profileEpoch: number;
   harness: number; since: string; limit: number }): ReuseSource[] {
   return db.all<{ trial_id: string; ending: TrialEnding; resolved: number | null; isolation: "isolated" | "none" | null; config_id: string | null;
@@ -219,7 +206,6 @@ export function reusable(db: EvidenceDb, input: { taskId: string; configRef: str
   }));
 }
 
-/** Writes a final copy row of a reused trial into one slot of a job. It counts as `reused` and nothing else. */
 export function insertCopy(tx: EvidenceTx, copy: { trialId: string; jobId: string; taskId: string; projectId: string;
   configuration: TrialConfiguration; slot: number; promptVersion: string; source: ReuseSource; keepDays: number }, at: string): void {
   const payload: TrialPayload = { projectId: copy.projectId, taskId: copy.taskId, configuration: copy.configuration };
@@ -276,7 +262,6 @@ export function jobTrialCount(db: EvidenceDb, jobId: string): number {
   return db.get<{ n: number }>(JOB_TRIALS_SQL, jobId)?.n ?? 0;
 }
 
-/** Trials a project started since a time. `projectId` is the project's id; the index is computed here. */
 export function trialsSince(db: EvidenceDb, projectId: string, since: string): number {
   return db.get<{ n: number }>(PROJECT_DAY_SQL, db.index("project", projectId), since)?.n ?? 0;
 }
@@ -306,7 +291,6 @@ export function trialSessions(db: EvidenceDb, endedBefore: string, limit: number
     .map(row => ({ trialId: row.trial_id, sessionId: row.session_id, endedAt: row.ended_at }));
 }
 
-/** Every trial row of a job, for the report pass. More than JOB_ROWS_MAX rows is `unreadable`, never a partial answer. */
 export function jobRows(db: EvidenceDb, jobId: string): JobTrialRow[] {
   const rows = db.all<{ task_id: string; config_ref: string; slot: number; attempt: number; state: TrialState; ending: TrialEnding | null;
     resolved: number | null; isolation: "isolated" | "none" | null; config_id: string | null; profile_epoch: number | null;
@@ -326,10 +310,6 @@ function releasePatch(tx: EvidenceTx, trialId: string, bytes: number): void {
   tx.run("UPDATE eval_trial_totals SET patch_bytes = patch_bytes - ? WHERE id=1", bytes);
 }
 
-/**
- * Deletes at most TRIAL_SWEEP_BATCH expired patches, then at most TRIAL_SWEEP_BATCH expired trials, and then at most
- * TRIAL_SWEEP_BATCH counts rows of jobs that are gone. Returns the number of trials it deleted.
- */
 export function sweepTrials(tx: EvidenceTx, now: string): number {
   for (const row of tx.all<{ trial_id: string; bytes: number }>(PATCHES_EXPIRED_SQL, now, TRIAL_SWEEP_BATCH)) {
     releasePatch(tx, row.trial_id, row.bytes);

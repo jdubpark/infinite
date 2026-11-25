@@ -18,7 +18,6 @@ import type { DecisionRow, ExploreGuards, RoutingKnobs, RoutingPayload } from ".
 import type { TeamModelProfile, TeamRun, TeamTask } from "./team-types.js";
 import type { Provider } from "./types.js";
 
-/** The start decision's budget. A decision that takes longer writes no row. */
 export const DECISION_BUDGET_MS = 250;
 const DAY_MS = 86_400_000;
 export const REQUIRED_MODULES = [OUTCOMES_MODULE, CONFIGURATIONS_MODULE, ROUTING_MODULE] as const;
@@ -28,9 +27,7 @@ export type RouterStart = {
   task: TeamTask;
   publishHeads: boolean;
   entryTools: boolean;
-  /** Whether the run is a goal cycle with a record: the member's prompt version then carries the record digest. */
   objectiveDigest: ObjectivePrompt;
-  /** Whether a new Claude member of this host would be asked to start in Code Mode: a Claude candidate's prompt version then carries the rule for programs. */
   codeMode: boolean;
   featureMap: FeatureMap | undefined;
   limited: ReadonlySet<Provider>;
@@ -39,7 +36,6 @@ export type RouterStart = {
 export type AutoFailure = "unavailable" | "budget" | "tooLarge" | "write" | "failed";
 export type AutoDecision = { profile: TeamModelProfile; by: "router" } | { profile: TeamModelProfile; by: "fallback"; reason: AutoFailure };
 
-/** The fixed log texts. Each names no id and no value. */
 export const AUTO_LOG: Record<AutoFailure | "pin" | "uncovered", string> = {
   unavailable: "Routing auto decision fell back: the evidence store is unavailable.",
   budget: `Routing auto decision fell back: it took longer than ${DECISION_BUDGET_MS} ms.`,
@@ -50,20 +46,16 @@ export const AUTO_LOG: Record<AutoFailure | "pin" | "uncovered", string> = {
   uncovered: "Routing auto pin stayed in shadow: no implementer profile passes the fixed rules.",
 };
 
-/** The identity a profile has in the outcome ledger: provider, model, and effort (or the OpenCode variant). */
 export function identityOf(profile: TeamModelProfile): { provider: string; model: string; effort: string | null } {
   const identity = profileIdentity(profile, profile.provider);
   return { provider: identity.provider, model: identity.model ?? profile.model, effort: identity.effort ?? null };
 }
 
-/** What one start scores before any read: the features, the screen, and one prompt version per kept identity. */
 export type StartFrame = { features: TaskFeatures; screened: Screened[]; versions: Map<string, { profile: TeamModelProfile; version: string }> };
 
-/** The frame of one implementer decision over the candidates `screened` holds, whatever the point. */
 export function frameOf(input: RouterStart, screened: Screened[]): StartFrame {
   const { task } = input;
   const features = taskFeatures({ role: "implementer", paths: task.paths, kind: task.kind, risk: task.risk }, input.featureMap);
-  // One prompt version per identity, from the first kept profile with it, in lineup order.
   const versions = new Map<string, { profile: TeamModelProfile; version: string }>();
   for (const item of screened) {
     if (item.removed !== undefined && item.removed !== "limited") continue;
@@ -92,12 +84,6 @@ function guardsAt(db: EvidenceDb, run: TeamRun, knobs: RoutingKnobs, now: string
   };
 }
 
-/**
- * Scores one implementer decision inside a read and builds its row and payload. `start` explores under the guards in
- * `auto`; `escalation` is greedy and reads no guard. A shadow decision records a `recorded` row; an `auto` decision
- * writes a `pending` row. Undefined when no candidate passes rules 1 and 2. `at.named` is the coordinator's or the
- * worker's validated profile id, or null.
- */
 export function evaluateImplementer(db: EvidenceDb, input: RouterStart, frame: StartFrame, keys: { taskKey: string; key: string },
   now: string, auto: boolean, at: { point: "start" | "escalation"; named: string | null }): Evaluated | undefined {
   const { run, task } = input;
@@ -119,7 +105,6 @@ export function evaluateImplementer(db: EvidenceDb, input: RouterStart, frame: S
   for (const [identity, { profile, version }] of frame.versions) {
     const found: CurrentConfig = { epoch: epochAt(db, identity, now), promptVersion: version };
     const rows = selectRoutingEvidence(db, identityOf(profile), at.point, since);
-    // An applied start of the router's counts at full weight, the one place a choice has a weight of 1.
     const applied = appliedOutcomeIds(db, identity, since, at.point);
     scored.set(identity, { profile, identity, posterior: posterior(rows, target, found, now, CHOSEN_WEIGHT, applied), costUsd: tierCost(profile) });
     current.push({ identity, ...found });
@@ -127,7 +112,6 @@ export function evaluateImplementer(db: EvidenceDb, input: RouterStart, frame: S
   const seed = decisionSeed(routing.digest, run.id, run.revision, keys.taskKey, at.point, 1);
   const raw = choose(frame.screened, scored, knobs, features.risk, seed, at.point);
   if (raw === undefined) return undefined;
-  // Only a start explores, so only a start reads the guards.
   const guards = auto && at.point === "start" ? guardsAt(db, run, knobs, now) : undefined;
   const choice: Choice = guards === undefined ? raw : guardExploration(raw, guards, knobs);
   const chosen = choice.candidates.find(candidate => candidate.profileId === choice.chosen)!;
@@ -178,10 +162,6 @@ export function evaluateImplementer(db: EvidenceDb, input: RouterStart, frame: S
   return { row, payload };
 }
 
-/**
- * Scores one start inside a read. A shadow start records a `recorded` row; an `auto` start adds the exploration guards
- * and writes a `pending` row. Undefined when no candidate passes rules 1 and 2.
- */
 export function evaluateStart(db: EvidenceDb, input: RouterStart, frame: StartFrame, keys: { taskKey: string; key: string },
   now: string, auto: boolean): Evaluated | undefined {
   return evaluateImplementer(db, input, frame, keys, now, auto, { point: "start", named: input.task.agentProfileId ?? null });
@@ -193,11 +173,6 @@ function profileNamed(run: TeamRun, profileId: string): TeamModelProfile {
   return profile;
 }
 
-/**
- * One auto start decision: one store read and at most one store write. The same key gives the same choice whatever the
- * store holds later. Every failure gives the fallback profile and its reason; the function never throws, except when
- * the fallback itself has no eligible profile, which `createRun`'s coverage check makes unreachable.
- */
 export function decideAutoStart(store: EvidenceStore, input: RouterStart, now: () => string, clock: () => number): AutoDecision {
   const { run, task } = input;
   const fallback = (reason: AutoFailure): AutoDecision => ({ profile: fallbackProfile(run, task), by: "fallback", reason });
@@ -223,7 +198,6 @@ export function decideAutoStart(store: EvidenceStore, input: RouterStart, now: (
     payload.elapsedMs = Math.round(elapsed);
     if (Buffer.byteLength(JSON.stringify(payload), "utf8") > PAYLOAD_LIMIT_BYTES) return fallback("tooLarge");
 
-    // A row the insert finds already stored keeps its profile: the stored choice is the one the run follows.
     const holder: { stored?: DecisionRow } = {};
     const written = store.tryWrite(tx => {
       releaseStalePending(tx, run.projectId, at);
@@ -236,10 +210,6 @@ export function decideAutoStart(store: EvidenceStore, input: RouterStart, now: (
   }
 }
 
-/**
- * The stored end of the project's shadow period. A stored end is returned as it is. Otherwise the computed end is
- * stored once it has passed, and undefined is returned while the period runs. Throws when the store cannot answer.
- */
 export function periodEnd(store: EvidenceStore, projectId: string, now: string): string | undefined {
   if (store.status().modules[ROUTING_MODULE] !== "ready") throw new Error("The routing module is unavailable.");
   const found = store.read((db): { stored: string } | { computed: string } | undefined => {

@@ -15,7 +15,6 @@ const createBody = z.strictObject({
   job: z.record(z.string(), z.unknown()),
 });
 
-/** The fixed sentence of each refusal code. None names an ID, a file, or a commit. */
 const MESSAGES: Record<EvalRefusal["code"], string> = {
   "invalid-eval-request": "The eval request is not valid.",
   "unknown-project": "The project is not configured on this host.",
@@ -35,12 +34,6 @@ const MESSAGES: Record<EvalRefusal["code"], string> = {
   "no-report": "Only compare and confirm jobs have reports.",
 };
 
-/**
- * The replay eval routes: the corpus summary, the jobs, the stored report and prior reads, and the owner's task retirement. Reads sit behind
- * `read` (owner, controller, viewer); every change sits behind `owner`. A host refusal answers its own status and code.
- * An unavailable store answers 503 `evidence-unavailable`. No route returns a capsule, a patch, a file name, a case, or
- * a commit.
- */
 export function evalRoutes(
   app: express.Express,
   deps: { host: EvalHostApi },
@@ -98,7 +91,6 @@ export function evalRoutes(
   }));
 }
 
-/** Maps a store that is unavailable to 503, and lets every other failure reach the framework's handler. */
 function guarded(handler: (req: express.Request, res: express.Response) => Promise<void>): express.RequestHandler {
   return async (req, res) => {
     try {
@@ -110,7 +102,6 @@ function guarded(handler: (req: express.Request, res: express.Response) => Promi
   };
 }
 
-/** A job body parsed by its own kind's schema, or undefined: a body with no known kind, or one that does not parse. */
 function jobOf(value: unknown): ValidateJobRequest | BaselineJobRequest | ComparisonJobRequest | undefined {
   const kind = typeof value === "object" && value !== null && "kind" in value ? value.kind : undefined;
   const parsed = kind === "validate" ? validateJobSchema.safeParse(value)
@@ -120,7 +111,6 @@ function jobOf(value: unknown): ValidateJobRequest | BaselineJobRequest | Compar
   return parsed?.success ? parsed.data : undefined;
 }
 
-/** A job ID is a UUID; the host stores it in lower case. */
 function jobId(value: unknown): string | undefined {
   const parsed = uuid.safeParse(String(value).toLowerCase());
   return parsed.success ? parsed.data : undefined;
@@ -138,7 +128,6 @@ function refuse(res: express.Response, refusal: EvalRefusal): void {
   res.status(refusal.status).json({ code: refusal.code, error: MESSAGES[refusal.code] });
 }
 
-/** Answers a host result: its refusal, or its value as JSON with 200. */
 function respond(res: express.Response, result: unknown): void {
   if (isRefusal(result)) return refuse(res, result);
   res.json(result);

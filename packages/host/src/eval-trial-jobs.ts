@@ -22,14 +22,10 @@ import {
 import { lineupProfiles, type TeamModelProfile } from "./team-types.js";
 import type { Config, Provider } from "./types.js";
 
-// The baseline job: its schema, its creation, its views, and the one step that hands out the next trial of a job.
-
 export const TRIAL_CONFIGURATIONS_MAX = 4, TRIALS_PER_TASK_DEFAULT = 3, TRIALS_PER_TASK_MAX = 5, TRIAL_TASKS_DEFAULT = 20,
   TRIAL_TASKS_MAX = 200, MAX_TRIALS_MAX = 1_000, TRIAL_SLOTS_FREE_MIN = 4, BASELINE_JOBS_MAX = 100;
-/** The baseline jobs in one status, oldest first, through `eval_jobs_status`. */
 export const BASELINE_JOBS_SQL = "SELECT * FROM eval_jobs WHERE status = ? AND kind != 'validate' ORDER BY created_at, job_id LIMIT ?";
 
-/** Rows of NEXT_TASK_SQL per read. The statement's own LIMIT is 200. */
 const TASK_PAGE = 200;
 const TASK_ID_PATTERN = /^(captured|mined):[A-Za-z0-9:._-]{1,200}$/;
 const AREA_PATTERN = /^[a-z][a-z0-9-]{0,39}$/;
@@ -37,7 +33,7 @@ const DAY_MS = 86_400_000;
 
 export type TrialGates = {
   identity: EvalProbe; grader: GraderProbe; hostLoadHeld: boolean; halted: (projectId: string) => boolean;
-  limited: ReadonlySet<Provider>;     // TeamService.providerLimits() providers and the pump's eval limits
+  limited: ReadonlySet<Provider>;
   freeSlots: () => Promise<number>; trialLive: boolean;
 };
 export type NextTrial =
@@ -47,12 +43,10 @@ export type NextTrial =
 
 type JobRequest = BaselineJobRequest | ComparisonJobRequest;
 type JobView = BaselineJobView | ComparisonJobView;
-/** The column `reported_at` is not in `EvalJobRow`; `SELECT *` carries it. */
 type ReportedRow = EvalJobRow & { reported_at?: string | null };
 type CandidateRow = Pick<TrialTaskRow, "task_id" | "origin" | "area_ref" | "holdout">;
 type Filter = { origins?: Set<string>; areas?: Set<string>; ids?: Set<string> };
 type Project = Config["projects"][number];
-/** `slots` asks the caller for the free session count, which is read outside the write. */
 type Pass = NextTrial | { kind: "slots" };
 
 /** Waits that hold a slot without counting: the project's preconditions and an owner's halt. */
@@ -72,7 +66,6 @@ const windowSchema = z.object({
   endHourUtc: z.number().int().min(1).max(24),
 }).strict().refine(window => window.endHourUtc !== window.startHourUtc, "a window must not be empty");
 
-// A profile is admitted here by provider name only; `create` refuses any profile outside the pools, and any Grok or Demo profile.
 export const baselineJobSchema = z.object({
   kind: z.literal("baseline"),
   configurations: z.array(configurationSchema).min(1).max(TRIAL_CONFIGURATIONS_MAX)
@@ -92,10 +85,6 @@ export const baselineJobSchema = z.object({
   expiresAt: z.iso.datetime().optional(),
 }).strict() as unknown as z.ZodType<BaselineJobRequest>;
 
-/**
- * SHA-256 of the canonical JSON of the validation settings, trialMinutes, eval.grader, eval.member, each configuration's
- * promptVersion("implementer", provider, profile, false, false, false), and project.team.permissions.
- */
 export function trialJobDigest(project: Project, config: Pick<Config, "eval">, configurations: readonly TrialConfiguration[]): string {
   const validation = validationSettings(project);
   return sha256(canonicalJson({
@@ -103,7 +92,6 @@ export function trialJobDigest(project: Project, config: Pick<Config, "eval">, c
     trialMinutes: project.team?.eval?.trialMinutes ?? TRIAL_MINUTES_DEFAULT,
     grader: config.eval?.grader ?? null,
     member: config.eval?.member ?? null,
-    // The sealed payload returns keys in canonical order, and promptVersion renders the profile in key order, so the profile is canonical first.
     prompts: configurations.map(configuration => {
       const profile = JSON.parse(canonicalJson(configuration.profile)) as TeamModelProfile;
       return promptVersion("implementer", profile.provider, profile, false, false, false);
@@ -139,7 +127,6 @@ export class TrialJobs {
       trialsPerTask: parsed.data.trialsPerTask ?? TRIALS_PER_TASK_DEFAULT,
       expiresAt: new Date(expiresMs).toISOString(),
     } as JobRequest;
-    // Digest the body as the client sent it, so a replay later still matches. The default expiry moves with the clock.
     const requestDigest = sha256(canonicalJson({ projectId, request: parsed.data }));
     return this.store.write(tx => {
       const existing = tx.get<EvalJobRow>("SELECT * FROM eval_jobs WHERE request_id = ?", requestId);
@@ -191,7 +178,6 @@ export class TrialJobs {
     });
   }
 
-  /** The views of the baseline, compare, and confirm rows of one page, with one counts read for all of them. */
   views(db: EvidenceDb, rows: readonly EvalJobRow[]): Map<string, JobView> {
     const baseline = rows.filter(row => row.kind !== "validate");
     const counts = trialCounts(db, baseline.map(row => row.job_id));
@@ -220,21 +206,18 @@ export class TrialJobs {
         views.set(row.job_id, { ...common, kind: "baseline", trials });
         continue;
       }
-      // A result shows only from the stored report's time, so an interim view never leaks a figure. No payload is opened.
       const reported = (row as ReportedRow).reported_at != null;
       views.set(row.job_id, {
         ...common,
         kind: row.kind === "confirm" ? "confirm" : "compare",
         set: row.kind === "confirm" ? "holdout" : "dev",
         trials: { ...trials, resolved: reported ? count.resolved : null, reused: count.reused },
-        // The state column is read, not the payload: a ready row whose payload later fails to open still shows `ready`.
         report: reported ? states.get(row.job_id) ?? "ready" : row.finished_at === null ? null : "pending",
       });
     }
     return views;
   }
 
-  /** The next trial of the job that holds the slot, or the wait that holds it. Free slots are read only when a trial would start. */
   async next(gates: TrialGates): Promise<NextTrial> {
     let free: number | undefined;
     for (;;) {
@@ -244,7 +227,6 @@ export class TrialJobs {
     }
   }
 
-  /** The cursor moves past a task that could not be read, and the task counts as skipped. */
   skip(jobId: string, taskId: string): void {
     this.store.write(tx => {
       if (this.rowOf(tx, jobId) === undefined) return;
@@ -253,7 +235,6 @@ export class TrialJobs {
     });
   }
 
-  /** Reads the counters after a trial ended. Three voids in a row pause the job. */
   record(jobId: string, ending: TrialEnding): void {
     this.store.write(tx => {
       const row = this.rowOf(tx, jobId);
@@ -302,7 +283,6 @@ export class TrialJobs {
     });
   }
 
-  /** The digest the job would pin now, from its own configurations; undefined while the settings are incomplete. */
   digest(projectId: string, jobId: string): string | undefined {
     return this.store.read(db => {
       const row = db.get<{ payload: string }>("SELECT payload FROM eval_jobs WHERE job_id = ?", jobId);
@@ -316,11 +296,6 @@ export class TrialJobs {
     return this.store.read(db => db.all<EvalJobRow>(BASELINE_JOBS_SQL, "running", BASELINE_JOBS_MAX).map(row => row.job_id));
   }
 
-  /**
-   * Ends the paused and blocked trial jobs whose expiry has passed, so they stop holding their project's holdout groups.
-   * A job with a trial that is still preparing, running, or grading waits: it expires on a later call, once that trial is final,
-   * so its report never leaves the trial out.
-   */
   expireIdle(): number {
     return this.store.write(tx => this.expireIdleIn(tx));
   }
@@ -340,7 +315,6 @@ export class TrialJobs {
   }
 
   private pass(tx: EvidenceTx, gates: TrialGates, free: number | undefined): Pass {
-    // A paused job the owner paused stays paused until its expiry; only the expiry ends it.
     this.expireIdleIn(tx);
     const refs = this.refsOf(tx);
     const rows = [
@@ -358,7 +332,6 @@ export class TrialJobs {
     return wait ?? NONE;
   }
 
-  /** One job's turn: the gates in the plan's order, then the slot. Gates run before any counts move. */
   private step(tx: EvidenceTx, row: EvalJobRow, refs: Map<string, string>, gates: TrialGates, free: number | undefined): Pass {
     const at = this.now();
     const nowMs = Date.parse(at);
@@ -401,10 +374,6 @@ export class TrialJobs {
     return this.scan(tx, row, projectId, request as BaselineJobRequest, pinned.settings, free, nowMs);
   }
 
-  /**
-   * The cursor holds the last task that is finished or skipped. The next valid task after it is the candidate: a task with
-   * a slot left starts a trial; a task without one counts as finished, and the cursor moves past it.
-   */
   private scan(
     tx: EvidenceTx,
     row: EvalJobRow,
@@ -430,7 +399,6 @@ export class TrialJobs {
       const index = page.findIndex(candidate => selected(candidate, filter));
       if (index === -1) {
         if (page.length === TASK_PAGE) {
-          // A full page with no match: the next call starts after it.
           setJob(tx, row.job_id, at, { cursor: page[page.length - 1].task_id });
           return NONE;
         }
@@ -454,10 +422,6 @@ export class TrialJobs {
     }
   }
 
-  /**
-   * The comparison scan: the sealed task list in order, after the cursor (the last finished task). A task that is no longer
-   * valid counts as skipped. The end of the list finishes the job. One call reads at most TASK_PAGE tasks.
-   */
   private scanFixed(
     tx: EvidenceTx,
     row: EvalJobRow,
@@ -491,7 +455,6 @@ export class TrialJobs {
     return NONE;
   }
 
-  /** The gates that need a free session count, then the trial for one slot. */
   private handOut(
     tx: EvidenceTx,
     row: EvalJobRow,
@@ -518,7 +481,6 @@ export class TrialJobs {
     };
   }
 
-  /** The settings and digest a job pins now, or undefined while the trial settings are incomplete. */
   private pinned(projectId: string, configurations: readonly TrialConfiguration[]): { settings: TrialSettings; digest: string } | undefined {
     const project = this.projectOf(projectId);
     if (project === undefined) return undefined;
@@ -539,7 +501,6 @@ export class TrialJobs {
     return undefined;
   }
 
-  /** Planned tasks: the valid tasks the filter selects, at most maxTasks. Planned trials: tasks x configurations x trialsPerTask, at most maxTrials. */
   private plan(db: EvidenceDb, ref: string, request: JobRequest): { tasks: number; trials: number } {
     const filter = filterOf(db, request);
     const maxTasks = request.taskFilter?.maxTasks ?? TRIAL_TASKS_DEFAULT;
@@ -576,7 +537,6 @@ export class TrialJobs {
     return this.config.projects.find(project => project.id === projectId);
   }
 
-  /** Each configured project's reference, mapped back to its id. Built from the config, not from a row. */
   private refsOf(db: EvidenceDb): Map<string, string> {
     return new Map(this.config.projects.map(project => [db.index("project", project.id), project.id]));
   }
@@ -590,7 +550,6 @@ function filterOf(db: EvidenceDb, request: JobRequest): Filter {
   const filter = request.taskFilter;
   return {
     origins: filter?.origins === undefined ? undefined : new Set(filter.origins),
-    // Rows keep the blind index of an area, not its name.
     areas: filter?.areas === undefined ? undefined : new Set(filter.areas.map(area => db.index("area", area))),
     ids: filter?.taskIds === undefined ? undefined : new Set(filter.taskIds),
   };
@@ -604,7 +563,6 @@ function selected(candidate: CandidateRow, filter: Filter): boolean {
   return true;
 }
 
-/** Writes the named columns and `updated_at`. The column names are fixed in this file. */
 function setJob(tx: EvidenceTx, jobId: string, at: string, values: Record<string, SQLInputValue>): void {
   const entries = Object.entries(values);
   tx.run(
@@ -615,7 +573,6 @@ function setJob(tx: EvidenceTx, jobId: string, at: string, values: Record<string
   );
 }
 
-/** The stored report state of each job that has one, in one query. */
 function reportStates(db: EvidenceDb, jobIds: readonly string[]): Map<string, "ready" | "unreadable"> {
   if (jobIds.length === 0) return new Map();
   const marks = jobIds.map(() => "?").join(", ");
@@ -637,7 +594,6 @@ function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-/** Code-unit order, the order SQLite's BINARY collation gives for these ASCII keys. */
 function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }

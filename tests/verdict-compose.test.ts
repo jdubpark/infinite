@@ -420,14 +420,17 @@ test("a superseding verdict replaces latest only where it names the superseded v
   // The superseding verdict of the first id writes c2, where it is still current, and not c1.
   const mixed = later;
   const composed = composeVerdict(input({ record: mixed, facts: { delivery: "landed" }, receipts: [receipt("c1", "pass")] }));
-  const superseding = verdictRecord(mixed, composed, { ...META, verdictId: THIRD, supersedes: VERDICT });
+  // The chain may hold ids the record never got; c1 answers against its receipt, but this verdict does not write c1.
+  const answered = { ...composed, criteria: composed.criteria.map(item => (item.id === "c1" ? { ...item, contradicted: true as const, evaluatorState: "not-met" as const } : item)) };
+  const superseding = verdictRecord(mixed, answered, { ...META, verdictId: THIRD, supersedes: ["0d4e5f6a-7b8c-4d9e-9fa0-2b3c4d5e6f70", VERDICT] });
   assert.notEqual(superseding, "log-full");
   if (superseding === "log-full") return;
   assert.equal(latestOf(superseding, "c2"), THIRD);
   assert.equal(latestOf(superseding, "c1"), SECOND);
   assert.equal(superseding.criteria.find(entry => entry.id === "c2")?.latest?.state, "met");
+  assert.equal(superseding.log.filter(entry => entry.handle === `verdict:${THIRD}`).length, 1, "no contradiction entry for a criterion this verdict does not write");
   // No criterion names the superseded verdict: the entry is still written, with empty maps.
-  const empty = verdictRecord(superseding, composed, { ...META, verdictId: "9c3d4e5f-6a7b-4c8d-8e9f-1a2b3c4d5e6f", supersedes: "0d4e5f6a-7b8c-4d9e-9fa0-2b3c4d5e6f70" });
+  const empty = verdictRecord(superseding, composed, { ...META, verdictId: "9c3d4e5f-6a7b-4c8d-8e9f-1a2b3c4d5e6f", supersedes: ["0d4e5f6a-7b8c-4d9e-9fa0-2b3c4d5e6f70"] });
   assert.notEqual(empty, "log-full");
   if (empty === "log-full") return;
   assert.equal(empty.log.length, superseding.log.length + 1);

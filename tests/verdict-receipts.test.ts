@@ -193,6 +193,69 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
   counts(g, 2);
 });
 
+test("a late verdict judges only what its earlier verdict held, and replaces what any earlier id wrote", () => {
+  const latest = (f: Fixture, id: string) => recordIn(f).criteria.find(item => item.id === id)?.latest;
+  const drop = (f: Fixture, id: string) => { f.holder.verdict!.composed!.criteria = f.holder.verdict!.composed!.criteria.filter(item => item.id !== id); };
+
+  // Only `merged` waits: a revert of the landing changes nothing, on this pass or the next.
+  const merged = delivered({ criteria: [MERGED] });
+  merged.host.deliveryFact = "landed";
+  assert.equal(merged.verdicts.settleReceipt(merged.holder), true);
+  merged.host.deliveryFact = "reverted";
+  const kept = snapshot(merged);
+  assert.equal(merged.verdicts.settleReceipt(merged.holder), false);
+  assert.equal(merged.verdicts.settleReceipt(merged.holder), false);
+  unchanged(merged, kept);
+  assert.equal(recorded(merged).length, 2);
+
+  // The record names `landed`, but the first verdict did not hold it: the late verdict leaves it out, and a revert composes nothing.
+  const later = delivered();
+  const first = later.holder.verdict!.verdictId;
+  drop(later, "c4");
+  later.host.deliveryFact = "landed";
+  assert.equal(later.verdicts.settleReceipt(later.holder), true);
+  assert.deepEqual(later.verdicts.detail(RUN)!.criteria.map(item => item.id).includes("c4"), false);
+  assert.equal(latest(later, "c4")?.verdictId, first, "the record keeps the first verdict's answer for it");
+  assert.equal(latest(later, "c3")?.verdictId, later.holder.verdict!.verdictId);
+  later.host.deliveryFact = "reverted";
+  assert.equal(later.verdicts.settleReceipt(later.holder), false, "a criterion the verdicts never held starts no third verdict");
+
+  // The second verdict's record write failed: the third replaces what the first wrote.
+  const failed = delivered();
+  const before = structuredClone(failed.holder.objectiveRecord);
+  failed.host.deliveryFact = "landed";
+  assert.equal(failed.verdicts.settleReceipt(failed.holder), true);
+  failed.holder.objectiveRecord = before;
+  failed.holder.verdict!.written = "write-failed";
+  failed.host.deliveryFact = "reverted";
+  assert.equal(failed.verdicts.settleReceipt(failed.holder), true);
+  assert.deepEqual([latest(failed, "c4")?.verdictId, latest(failed, "c4")?.state], [failed.holder.verdict!.verdictId, "not-met"]);
+
+  // A refused report kept beside a reason is no answer: the late verdict reads the reason.
+  const refused = evaluating({ record: recordOf(RUN, 1, [MERGED]) });
+  reportEvaluator(refused, refused.member, reportOf({ c0: "met" }));
+  settle(refused.host);
+  assert.equal(stateOf(refused, "c0"), "met");
+  refused.holder.verdict!.reason = "evaluator-unavailable";
+  refused.holder.run.status = "merged";
+  refused.host.deliveryFact = "landed";
+  assert.equal(refused.verdicts.settleReceipt(refused.holder), true);
+  assert.equal(stateOf(refused, "c0"), "inconclusive");
+  assert.equal(refused.verdicts.detail(RUN)?.evaluatorResult, undefined);
+
+  // A restart between the two saves, and the record is gone: the assessment stays.
+  const lost = delivered();
+  lost.host.deliveryFact = "landed";
+  lost.host.failSaveIn = 2;
+  assert.throws(() => lost.verdicts.settleReceipt(lost.holder));
+  const again = reopen(lost);
+  delete again.holder.objectiveRecord;
+  const assessed = again.holder.run.assessment?.verdictId;
+  assert.notEqual(again.holder.verdict!.verdictId, assessed, "the new id was saved");
+  assert.equal(again.verdicts.settleReceipt(again.holder), false);
+  assert.equal(again.holder.run.assessment?.verdictId, assessed);
+});
+
 const snapshotOf = (f: Fixture) => ({ saves: f.host.saves, uuids: f.world.uuids, holder: sha(f.holder) });
 
 test("a run outside the rule is returned before any store read", () => {

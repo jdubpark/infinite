@@ -1,0 +1,13 @@
+# Architecture Decision Records
+
+Non-obvious architectural, protocol, security, concurrency, and compatibility decisions migrated out of inline code comments live here. New and cleaned source files carry zero prose comments under `npm run check:comments` (`scripts/check-comments.mjs`).
+
+| ADR | Title | Scope | Status |
+| --- | --- | --- | --- |
+| [0001](0001-attention-prompt-lifecycle-and-screen-authority.md) | Attention Prompt Lifecycle, Screen Authority, and Delegation Evidence | `packages/attention/` | Accepted |
+| [0002](0002-remote-encrypted-channel-and-sync-contracts.md) | Remote Encrypted Channel, Wire Contracts, and Data-Only Rendering | `packages/remote/` | Accepted |
+| [0003](0003-comment-policy-and-ratchet.md) | Zero-Comment Policy with Downward Ratchet | Repository-wide | Accepted |
+| [0004](0004-macos-swift-concurrency-and-transport.md) | macOS Client Concurrency, Transport, and Sealed Storage | `apps/macos/` | Accepted |
+| [0005](0005-mobile-freshness-and-web-swarm-invariants.md) | Mobile Freshness Hooks and Web Swarm View Contracts | `apps/mobile/`, `apps/web/` | Accepted |
+| [0006](0006-host-concurrency-and-lock-free-storage.md) | Host Lock-Free Storage, Pipeline Concurrency, and Partitioned Coordination | `packages/host/` | Accepted |
+| [0007](0007-host-state-machines-and-fail-closed-boundaries.md) | Host State Machines, Fail-Closed Halts, Eval Isolation, and Transport Boundaries | `packages/host/` | Accepted |

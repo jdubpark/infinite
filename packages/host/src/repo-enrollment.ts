@@ -46,7 +46,6 @@ export interface RepoEnrollmentView {
   autonomy: AutonomyMode;
   autonomySource: AutonomySource;
   autonomyReady: boolean; autonomyReason?: NotReady;
-  /** Evaluator profiles whose model an implementer or an escalation also uses; empty without a lineup. */
   evaluatorOverlaps: string[];
 }
 

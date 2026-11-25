@@ -243,8 +243,8 @@ test("a holder whose last bytes arrive as the drain ends and that closes within 
     while (!existsSync(flag) && Date.now() < deadline);
     let turns = 0;
     const slow = () => {
-      busy(100);
-      if (++turns < 4) setImmediate(slow);
+      busy(300);
+      if (++turns < 2) setImmediate(slow);
     };
     setImmediate(slow);
   }, EXIT_DRAIN_MS));

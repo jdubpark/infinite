@@ -168,8 +168,14 @@ export class HeadlessChannelWorker {
         try { reply = await this.ask({ op: "resume", sessionRoot: deferred.sessionRoot, ...(deferred.issued ?? {}), call }, CLASS_CHECK_MS); }
         catch { reply = undefined; }
       }
-      if (reply?.result !== "ok" || this.stale(run)) {
-        const reason = this.stale(run) ? "provider-exited" : reply?.result === "withheld" ? reply.reason : "unavailable";
+      if (this.stale(run)) {
+        this.host.record({ event: "retired", callId: deferred.callId, reason: "resume-ended" });
+        this.delivery(deferred.issued, "refusal", "Headless: the resumed provider ended before the owner's allow was returned; the deferred call was retired and denied as unavailable.");
+        this.host.publish(this.view());
+        return this.deny("unavailable");
+      }
+      if (reply?.result !== "ok") {
+        const reason = reply?.result === "withheld" ? reply.reason : "unavailable";
         return settle("withheld", "stale", `Headless: the owner's allow was withheld at the resume (${reason}); the call was denied as unavailable.`, this.deny("unavailable"));
       }
       return settle("allow", "receipt", "Headless: the owner's allow was returned to the resumed call.", { decision: "allow" });

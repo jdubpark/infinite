@@ -14,6 +14,7 @@ import {
 } from "../packages/host/src/permission-headless-worker.js";
 import { ask, hookOutput, type ChannelPost } from "../packages/host/src/permission-hook.js";
 import { requesterNotice } from "../packages/host/src/permission-policy.js";
+import { Journal, writeSealed } from "../packages/host/src/vault.js";
 import type { PermissionAgentServices, PermissionOutcome, PermissionPipeline, PermissionRequest } from "../packages/host/src/permission-agent-types.js";
 import type { Config, Event, Session } from "../packages/host/src/types.js";
 import { stopSessionWorkers, waitFor } from "./helpers.js";
@@ -625,7 +626,7 @@ test("a call admitted before the provider exited changes nothing when its host r
   assert.deepEqual([ended.records, ended.channel.view().notice, ended.requests.length], [[], undefined, 2]);
 });
 
-test("an owner's allow whose resume check returns after the resumed provider exited is withheld, and the deferral is closed", async () => {
+test("an owner's allow whose resume check returns after the resumed provider exited is denied, and the deferral stays open to block an ordinary resume", async () => {
   const confirm = held();
   const w = workerRig([owner]);
   w.answerResume(confirm.reply);
@@ -636,7 +637,17 @@ test("an owner's allow whose resume check returns after the resumed provider exi
   assert.equal(w.channel.exited(0), false);
   confirm.release({ result: "ok" });
   assert.deepEqual(await returning, { decision: "deny", reason: requesterNotice("unavailable") });
-  assert.deepEqual([w.records.at(-1)?.event, w.records.at(-1)?.decision], ["delivered", "withheld"]);
+  assert.deepEqual([w.records.at(-1)?.event, w.records.at(-1)?.reason], ["retired", "resume-ended"]);
+  const r = await rig();
+  try {
+    const id = randomUUID(), dir = join(r.config.stateDir, "sessions", id);
+    mkdirSync(dir, { recursive: true });
+    writeSealed(join(dir, "meta.sealed"), r.key, `${id}:meta`, { session: { id, provider: "claude", projectId: "rehearsal", title: "Headless", cwd: r.workspace, headless: { channel: true } } });
+    const journal = new Journal(join(dir, "events"), r.key, id);
+    for (const data of w.records) journal.append("lifecycle", { permissionChannel: data });
+    assert.equal(deferredCallOpen((after, limit) => r.manager.events(id, after, limit)), true);
+    await assert.rejects(r.manager.resume(id, randomUUID()), /waited for the owner's answer/);
+  } finally { await r.stop(); }
 });
 
 test("a run that passed its bound leaves the next run's call ids intact after a resume", async () => {

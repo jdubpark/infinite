@@ -41,10 +41,10 @@ const post: ChannelPost = (url, token, body, timeoutMs) => new Promise((resolve,
   request.end(body);
 });
 
-export async function ask(route: ChannelRoute, body: string, options: { url: string; token: string; run: string; post?: ChannelPost }): Promise<ChannelAnswer> {
+export async function ask(route: ChannelRoute, body: string, options: { url: string; token: string; run: string | undefined; post?: ChannelPost }): Promise<ChannelAnswer> {
   const denied: ChannelAnswer = { decision: "deny", reason: UNAVAILABLE };
   try {
-    const response = await (options.post ?? post)(`${options.url}/permission-${route}/${options.run}`, options.token, body, RELAY_DEADLINE_MS[route] - 1000);
+    const response = await (options.post ?? post)(`${options.url}/permission-${route}${options.run ? `/${options.run}` : ""}`, options.token, body, RELAY_DEADLINE_MS[route] - 1000);
     if (response.status !== 200) return denied;
     let parsed: Partial<ChannelAnswer> | null = null;
     try { parsed = JSON.parse(response.text) as Partial<ChannelAnswer>; } catch { return denied; }
@@ -68,7 +68,7 @@ if (/permission-hook\.(?:ts|js)$/.test(entry)) {
   const deadline = setTimeout(() => finish({ decision: "deny", reason: UNAVAILABLE }), RELAY_DEADLINE_MS[route]);
   const main = async (): Promise<ChannelAnswer> => {
     const url = process.env.INFINITE_HOOK_URL, token = process.env.INFINITE_HOOK_TOKEN, run = process.argv[3];
-    if (!url || !token || !run) return { decision: "deny", reason: UNAVAILABLE };
+    if (!url || !token) return { decision: "deny", reason: UNAVAILABLE };
     let body = "";
     process.stdin.setEncoding("utf8");
     for await (const chunk of process.stdin) {

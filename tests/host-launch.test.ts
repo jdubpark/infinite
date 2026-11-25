@@ -576,6 +576,7 @@ test("a served headless Claude launch loads only the host's settings, with the c
   assert.equal(JSON.stringify(withoutMode), disabled.args[disabled.args.indexOf("--settings") + 1]);
   const quiet = JSON.parse(buildLaunch("claude", { command: "claude", args: ["-p"] }, "", hooks, relay, { claude: false, codex: false }, false, undefined, undefined, undefined, undefined, 1).args.at(-1)!);
   assert.deepEqual(Object.keys(quiet.hooks).sort(), ["PermissionRequest", "PreToolUse"]);
+  assert.match(buildLaunch("claude", profile, "go", hooks, relay, enabled, false, undefined, undefined, undefined, undefined, 0).args.join(" "), /--setting-sources {2}--settings .*permission-hook\.js check 0/);
 });
 
 test("Claude team launches load no project or local settings file, so one member cannot widen a later member", () => {

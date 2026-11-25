@@ -870,14 +870,35 @@ Each start of the provider in a served session gets a run number. The host
 writes it into that start's two channel hook commands, and the hook sends it
 back in the path of its request. The worker answers only hooks of the provider
 that runs now. A hook of a provider that exited, or a hook without a run
-number, is denied with `unavailable` and changes nothing. A `PermissionRequest`
-hook names no call, so the worker gives it the call id of the one open
-`PreToolUse` call of the same run with the same tool and input. Each run holds
-its own open calls, so a late request of an earlier run cannot take the call id
-of an identical call of the next run, and after a resume a request again takes
-its own call id. The run number is not a secret: the hook token still
-authenticates the hook. The number travels in the hook command, not in the
-environment, so the sudo `env_keep` list does not change.
+number, is denied with `unavailable` and changes nothing. The worker checks the
+run again when the host's reply to a hook arrives, so a hook that was already
+waiting on the host when its provider exited is denied the same way and changes
+nothing. The one exception is the resumed call that the owner answered: its
+answer is already used, so the worker records it as withheld and denies the
+call. A `PermissionRequest` hook names no call, so the worker gives it the call
+id of the one open `PreToolUse` call of the same run with the same tool and
+input. Each run starts with no open calls and holds its own, so a late request
+of an earlier run cannot take the call id of an identical call of the next run,
+and after a resume a request again takes its own call id.
+
+The run number is not a secret and does not authenticate anything; the hook
+token does. A process of the session holds that token and can read the live
+run's number from the hook commands. It can therefore send a request in the
+live run that takes the call id of an open identical call. Before run numbers
+this was possible only until the provider's first exit; now it is possible in
+every run. It cannot make a call run.
+
+The number travels in the hook command, not in the environment, so the sudo
+`env_keep` list does not change. A hook command without a number posts the path
+without one, and the worker refuses it. Where the hook script's path follows
+the live tree, as with an install replaced in place or a source checkout, two
+mixed-version cases follow. A worker started before an upgrade has hook
+commands without a number: the newer script posts them without one, and the
+older worker answers them as before. After a rollback in place, the older
+script drops the number, and the newer worker refuses every call of a served
+session that is still alive, until that session is restarted. Versioned
+release directories have neither problem, because each worker's hook commands
+name its own release.
 
 ## Delegated team permission decisions
 

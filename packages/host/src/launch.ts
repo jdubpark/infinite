@@ -369,8 +369,8 @@ export function buildLaunch(
   const relay = relayPath.endsWith(".ts")
     ? ["node", "--import", import.meta.resolve("tsx"), relayPath]
     : ["node", relayPath];
-  const codeModeRequest = codeMode && provider === "claude" && !channel ? { env: { [CLAUDE_CODE_MODE_ENV]: "1" } } : undefined;
-  if (hooks && provider === "claude" && enabled.claude && !channel) {
+  const codeModeRequest = codeMode && provider === "claude" && channel === false ? { env: { [CLAUDE_CODE_MODE_ENV]: "1" } } : undefined;
+  if (hooks && provider === "claude" && enabled.claude && channel === false) {
     const handler = { type: "command", command: [...relay, "claude"].join(" "), timeout: 10 };
     const settings = {
       disableAllHooks: false,
@@ -383,8 +383,8 @@ export function buildLaunch(
   } else if (codeModeRequest && nativeArgCount <= profile.args.length && !profile.args.some(arg => arg === "--settings" || arg.startsWith("--settings="))) {
     args.splice(profile.args.length - nativeArgCount, 0, "--settings", JSON.stringify(codeModeRequest));
   }
-  if (hooks && provider === "claude" && channel) args.push(...headlessChannelArgs(relayPath, channel, enabled.claude, codeMode));
-  if (team && provider === "claude" && !channel) {
+  if (hooks && provider === "claude" && channel !== false) args.push(...headlessChannelArgs(relayPath, channel, enabled.claude, codeMode));
+  if (team && provider === "claude" && channel === false) {
     if (profile.args.some(arg => arg === "--setting-sources" || arg.startsWith("--setting-sources=")))
       throw new Error("A Claude team launch chooses its own setting sources; remove --setting-sources from the profile.");
     args.push("--setting-sources", "user");

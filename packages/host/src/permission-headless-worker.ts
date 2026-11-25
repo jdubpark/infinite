@@ -168,8 +168,8 @@ export class HeadlessChannelWorker {
         try { reply = await this.ask({ op: "resume", sessionRoot: deferred.sessionRoot, ...(deferred.issued ?? {}), call }, CLASS_CHECK_MS); }
         catch { reply = undefined; }
       }
-      if (reply?.result !== "ok") {
-        const reason = reply?.result === "withheld" ? reply.reason : "unavailable";
+      if (reply?.result !== "ok" || this.stale(run)) {
+        const reason = this.stale(run) ? "provider-exited" : reply?.result === "withheld" ? reply.reason : "unavailable";
         return settle("withheld", "stale", `Headless: the owner's allow was withheld at the resume (${reason}); the call was denied as unavailable.`, this.deny("unavailable"));
       }
       return settle("allow", "receipt", "Headless: the owner's allow was returned to the resumed call.", { decision: "allow" });
@@ -178,6 +178,7 @@ export class HeadlessChannelWorker {
     let reply: ChannelReply;
     try { reply = await this.ask({ op: "class", call }, CLASS_CHECK_MS); }
     catch { return this.deny("unavailable"); }
+    if (this.stale(run)) return this.deny("unavailable");
     if (reply.result === "not-served" || reply.result === "none") {
       this.leftOpen(callKey(call, inputHash), call.toolUseId);
       return { decision: "none" };
@@ -224,6 +225,7 @@ export class HeadlessChannelWorker {
     let reply: ChannelReply;
     try { reply = await this.ask({ op: "decide", call: forwarded, requestId }, DECIDE_MS); }
     catch { return this.deny("unavailable"); }
+    if (this.stale(run)) return this.deny("unavailable");
     if (reply.result === "not-served") return { decision: "none" };
     if (reply.result === "allow") return { decision: "allow" };
     if (reply.result !== "deny") return this.deny("unavailable");

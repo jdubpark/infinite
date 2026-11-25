@@ -70,3 +70,7 @@ One hundred concurrent readers of the same mission shared one source read, one w
 The goal-planning simulator exercised 12 scripts and 20 reopen operations. Six corrected plans advanced and six repeated invalid plans stopped. Four more seeds exercised delivery attribution across Git edits and host restarts. The simulators detected six deliberately introduced faults, including losing a spent correction and accepting a different reviewer. Re-run the two groups with `node --import tsx --test --test-name-pattern='seeded team delivery|delivery simulator catches|goal-plan simulator|seeded goal' tests/team-run-sim.test.ts`.
 
 These checks used local provider and repository fixtures. Unobserved worker transitions, irreversible effects from an earlier process, live provider costs and fleet capacity remain outside the measured result. A socket failure alone cannot give a new writer ownership of the old assignment.
+
+## Verification at integration
+
+At code commit `6112b518` on main baseline `35ccee62`, `npm run check` passed on Node 22. The two test phases reported 4,694 passing, 30 skipped and zero failures. Size checks, typechecking and the host and web builds passed. On Debian with Node 22, the 55 focused regressions and all eight simulator cases passed from a Git archive of that commit. An authenticated Linux viewer CLI also observed the running coordinator, resumed child observations and recovered the current snapshot after an API restart. These checks used fixture providers and a disposable host.

@@ -21,7 +21,6 @@ const parsed = (entries: Record<string, "passed" | "failed" | "skipped">): Parse
   cases: new Map(Object.entries(entries)),
 });
 
-// A seeded generator, so a shuffle is the same on every run.
 function mulberry32(seed: number): () => number {
   let state = seed >>> 0;
   return () => {

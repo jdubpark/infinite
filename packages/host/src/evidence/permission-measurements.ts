@@ -1,8 +1,3 @@
-/**
- * The permission agent's own durable state: replay measurements, replay results, and the usage of every
- * model turn. It is not the decision journal: a replay turn decides no request, and nothing here is
- * ever replayed as a verdict. Case details and notes contain commands and paths, so they are sealed.
- */
 import { randomUUID } from "node:crypto";
 import type { EvidenceModule, EvidenceTx } from "./types.js";
 import type { EvidenceStore } from "./store.js";
@@ -37,7 +32,6 @@ export const permissionMeasurementsModule: EvidenceModule = {
   },
 };
 
-/** One case's measurement, as the runner stores it. */
 export interface ReplayCaseMeasurement {
   caseId: string;
   label: string;
@@ -93,7 +87,6 @@ export class PermissionMeasurements implements ReplayResults {
     });
   }
 
-  /** Turn usage is host usage: it belongs to no run and no budget reads it. A store failure loses one row with a warning. */
   recordUsage(usage: PermissionTurnUsage): void {
     this.store.tryWrite(tx => tx.run(
       `INSERT INTO ${USAGE} (at, purpose, tier, profile_id, provider, model, input, output, reasoning, cache_read, cache_write, cost_usd) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,

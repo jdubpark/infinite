@@ -8,7 +8,7 @@ export const LEGACY_BATCH_MAX = 50, LEGACY_LINE_BYTES = 1024, LEGACY_FILE_LINES 
 export const LEGACY_PROFILE_ID = "(legacy)", LEGACY_MEMBER_ID = "legacy";
 export type LegacyOutcome = { id: string; projectId: string; profile: { provider: string; model: string; effort?: string };
   label?: string; result: "accepted" | "rejected" | "excluded"; attempts: number; totalTokens?: number; elapsedMs?: number;
-  reviewerModel?: string; recordedAt: string; supersedes?: string };   // spec part 8
+  reviewerModel?: string; recordedAt: string; supersedes?: string };
 
 const DAY_MS = 86_400_000;
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/;
@@ -90,13 +90,12 @@ export function parseLegacyFile(text: string, now: number): { lines: LegacyOutco
   return { lines, numbers };
 }
 
-export function legacyLineHash(line: LegacyOutcome): string {     // SHA-256 hex of canonicalJson(line)
-  // JSON drops absent keys, which canonicalJson refuses; the time is normalized so its written form cannot matter.
+export function legacyLineHash(line: LegacyOutcome): string {
   const plain = JSON.parse(JSON.stringify({ ...line, recordedAt: new Date(line.recordedAt).toISOString() })) as unknown;
   return createHash("sha256").update(canonicalJson(plain)).digest("hex");
 }
 
-export function legacyOutcomeId(ref: string): string {             // "legacy:" + ref
+export function legacyOutcomeId(ref: string): string {
   return `legacy:${ref}`;
 }
 
@@ -178,15 +177,8 @@ export type LegacyEffect = { kind: "insert"; ref: string; row: OutcomeRow; state
   | { kind: "supersede"; ref: string; state: LegacyLineState; removeRow: boolean };
 export type LegacyPlan = { outcomes: LegacyLineOutcome[]; effects: LegacyEffect[]; removed: number; newLines: number };
 
-/**
- * Walks the lines in array order. Each line sees the effects of the earlier lines. For lines with one body per id, the
- * tables that result depend on the set of lines, never on their order or on how a client cut its batches: a line has
- * a row when the host saw it and no seen line names it, and it is superseded when a seen line names it. Only the
- * answer for each line depends on what came before it. Of two bodies under one id, the first that the host sees
- * stays, and the other is refused with no effect. Never reads or writes the store.
- */
 export function planLegacyBatch(lines: readonly LegacyOutcome[],
-  known: { lines: ReadonlyMap<string, LegacyLineState>; rows: ReadonlyMap<string, string> },   // by ref; outcome id -> source
+  known: { lines: ReadonlyMap<string, LegacyLineState>; rows: ReadonlyMap<string, string> },
   context: { now: string; retentionDays: number; ref: (id: string) => string }): LegacyPlan {
   const states = new Map(known.lines);
   const rows = new Map(known.rows);
@@ -195,10 +187,6 @@ export function planLegacyBatch(lines: readonly LegacyOutcome[],
   let removed = 0;
   const cutoff = Date.parse(context.now) - context.retentionDays * DAY_MS;
 
-  /**
-   * A line replaces the line it names when the host first sees the line, whether the line is stored or only
-   * completes its own mark. So a chain keeps its last line in every order, and a cycle keeps none.
-   */
   const supersede = (line: LegacyOutcome): void => {
     if (line.supersedes === undefined) return;
     const oldRef = context.ref(line.supersedes);
@@ -214,8 +202,6 @@ export function planLegacyBatch(lines: readonly LegacyOutcome[],
       rows.delete(legacyOutcomeId(oldRef));
       removed++;
     } else if (old.lineHash === null && Date.parse(old.recordedAt) < Date.parse(line.recordedAt)) {
-      // The host has not seen the named line. Its mark holds the latest time among the lines that name it, so two
-      // such lines leave one mark in either order.
       const mark: LegacyLineState = { ...old, recordedAt: line.recordedAt };
       effects.push({ kind: "supersede", ref: oldRef, state: mark, removeRow: false });
       states.set(oldRef, mark);
@@ -231,8 +217,6 @@ export function planLegacyBatch(lines: readonly LegacyOutcome[],
       outcomes.push("expired");
       continue;
     }
-    // A row that the import did not write holds this outcome id. The line is refused wherever it comes, also under a
-    // mark, so the refusal does not depend on the order. No host write makes an id of this form; this is a guard.
     const holder = rows.get(id);
     if (holder !== undefined && holder !== "legacy") {
       outcomes.push("conflict");
@@ -241,15 +225,12 @@ export function planLegacyBatch(lines: readonly LegacyOutcome[],
     const current = states.get(ref);
     if (current?.state === "superseded") {
       if (current.lineHash === null) {
-        // A mark made before its line was seen has no hash. The line completes it with its own hash and time, so the
-        // mark is the same whichever line came first. The line is not stored, and it still replaces the line it names.
         const mark: LegacyLineState = { state: "superseded", lineHash: hash, recordedAt: line.recordedAt };
         effects.push({ kind: "supersede", ref, state: mark, removeRow: false });
         states.set(ref, mark);
         supersede(line);
         outcomes.push("superseded");
       } else {
-        // The mark holds the hash of the body the host saw. Another body is an edit, refused as under an imported id.
         outcomes.push(current.lineHash === hash ? "superseded" : "changed");
       }
       continue;

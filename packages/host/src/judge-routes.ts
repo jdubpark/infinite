@@ -4,7 +4,6 @@ import type { CalibrationRefusal, JudgeCalibrations } from "./judge-calibration-
 type Refusal = CalibrationRefusal | { status: 503; code: "evidence-unavailable" };
 const CALIBRATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** The fixed sentence of each refusal code. None echoes request text, an ID, or a file name. */
 const MESSAGES: Record<Refusal["code"], string> = {
   "judge-not-configured": "The host has no judge configured.",
   "judge-profile-mismatch": "That profile is not the configured judge.",
@@ -18,11 +17,6 @@ const MESSAGES: Record<Refusal["code"], string> = {
   "evidence-unavailable": "The evidence store is unavailable.",
 };
 
-/**
- * The judge calibration routes. The list sits behind `read` (owner, controller, viewer); starting and cancelling sit behind
- * `owner`. A view carries counts, rates, and cost only: no task, trial, patch, model text, or judge summary. A store
- * with an unready module answers 503 `evidence-unavailable`.
- */
 export function judgeRoutes(
   app: express.Express,
   deps: { judgements: Pick<JudgeCalibrations, "create" | "cancel" | "views">; ready: () => boolean },

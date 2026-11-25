@@ -1,5 +1,3 @@
-// The web client's real Swarm view on a stand-in host. tests/web-swarm.test.ts drives it through `window.swarm`:
-// it switches views, delivers a new poll, and reads the requests the view sent.
 import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ApiContext, ApiError, type Api, type Me } from "../../apps/web/src/api";
@@ -10,10 +8,8 @@ import { LONG_TOOL, swarmFixture, type SwarmFixture } from "./web-swarm-data";
 type Variant = { shuffleUpdated: boolean; flipState: boolean; idle: boolean; longTool: boolean };
 const control = {
   requests: [] as string[],
-  /** `off` answers the context paths with 404, as a host that predates them does. */
   context: (new URLSearchParams(window.location.search).get("context") === "off" ? "off" : "on") as "on" | "off",
   variant: { shuffleUpdated: false, flipState: false, idle: false, longTool: false } as Variant,
-  /** Requests whose path matches fail with a server error until this is cleared. */
   failing: null as RegExp | null,
   view: (_view: SwarmViewName) => {},
   poll: (_variant: Partial<Variant>) => {},
@@ -24,23 +20,19 @@ const NOW = Date.now();
 function fixture(): SwarmFixture {
   const base = swarmFixture(NOW);
   if (control.variant.shuffleUpdated) {
-    // The host rewrites `updatedAt` on every monitor pass; a later poll can carry any order of these times.
     base.teams.forEach((team, index) => { if (team.status !== "merged" && team.status !== "cancelled" && team.status !== "blocked") team.updatedAt = new Date(NOW - ((index * 7919) % 97) * 1000).toISOString(); });
     base.missions.forEach(mission => { mission.updatedAt = new Date(NOW - 50_000).toISOString(); });
   }
   if (control.variant.idle) {
-    // A host with nothing running: only settled standalone runs remain.
     base.teams = base.teams.filter(team => !team.missionId && (team.status === "merged" || team.status === "cancelled" || team.status === "blocked"));
     base.missions = [];
     base.sessions = base.sessions.filter(session => session.status === "exited");
   }
   if (control.variant.flipState) {
-    // One working agent finishes its turn: a state change with no change to who exists.
     const working = base.sessions.find(session => session.attention?.state === "working" && session.title.includes("implementer"));
     if (working?.attention) working.attention = { ...working.attention, state: "turn-finished", lastTool: undefined };
   }
   if (control.variant.longTool) {
-    // One working agent is in a tool whose name is long, as an MCP tool's is.
     const working = base.sessions.find(session => session.attention?.state === "working" && session.title.includes("implementer"));
     if (working?.attention) working.attention = { ...working.attention, lastTool: { tool: LONG_TOOL, summary: LONG_TOOL, at: new Date(NOW - 4_000).toISOString() } };
   }

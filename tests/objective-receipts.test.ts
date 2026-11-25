@@ -61,29 +61,23 @@ test("command tests read the final round and run nothing", () => {
     assumption("a5", { kind: "command", command: RANK_DIGEST, refutesOn: "pass" }),
   ];
 
-  // The final round is 2. Its failed rank-verify refutes a4 (refutesOn "fail"); the setup entry is ignored.
   const failed = receiptsOf(criteria, assumptions, { checks: rankFails, configured: [RANK, TESTS] });
   const a4 = failed.find(receipt => receipt.id === "a4");
   assert.deepStrictEqual(a4, {
     handle: "receipt:run-1:1:a4", kind: "command", subject: "assumption", id: "a4", commit: HEAD, outcome: "fail", at: AT,
     detail: { kind: "command", observed: "failed", round: 2 },
   });
-  // The same failed result, with refutesOn "pass", leaves a5 standing.
   assert.equal(failed.find(receipt => receipt.id === "a5")?.outcome, "pass");
-  // A criterion with a command check fails on failed.
   assert.equal(failed.find(receipt => receipt.id === "c1")?.outcome, "fail");
 
-  // A passing final round sets a criterion to pass.
   const passed = receiptsOf(criteria, [], { checks: [check(RANK, "passed", 2)], configured: [RANK] });
   assert.equal(passed[0]?.outcome, "pass");
   assert.deepStrictEqual(passed[0]?.detail, { kind: "command", observed: "passed", round: 2 });
 
-  // A digest not configured now is not-configured and unknown; the result is never read as a number.
   const unconfigured = receiptsOf([], assumptions.slice(0, 1), { checks: rankFails, configured: [TESTS] });
   assert.deepStrictEqual(unconfigured[0]?.detail, { kind: "command", observed: "not-configured", round: 2 });
   assert.equal(unconfigured[0]?.outcome, "unknown");
 
-  // Interrupted, running, and absent results are unknown, and no entry in the final round is absent.
   for (const [rows, observed] of [
     [[check(RANK, "interrupted", 2)], "interrupted"],
     [[check(RANK, "running", 2)], "running"],
@@ -94,13 +88,11 @@ test("command tests read the final round and run nothing", () => {
     assert.deepStrictEqual(receipt?.detail, { kind: "command", observed, round: 2 }, observed);
   }
 
-  // The module imports no process spawner, so a command test cannot start one.
   const source = readFileSync(new URL("../packages/host/src/objective-receipts.ts", import.meta.url), "utf8");
   assert.equal(source.includes("child_process"), false);
 });
 
 test("acceptance 5, test side: an artifact test counts qualifying entries", () => {
-  // 45 entries: 31 cite a repository file and an outside host (two valid sources), 14 cite one.
   const entries = Array.from({ length: 45 }, (_, index) =>
     index < 31 ? { sources: ["research/a.md#L1", `https://example.org/${index}`] } : { sources: ["research/a.md#L1"] });
   const blobs = blobAt(ENTRIES, json({ entries }));
@@ -150,7 +142,6 @@ test("citation tests follow refutesOn", () => {
     assumption("a3", { kind: "citation", source, quote, refutesOn });
   const outcomeOf = (item: Assumption, parts: Partial<PassInput> = {}) => receiptsOf([], [item], parts)[0];
 
-  // Present with refutesOn "absent" stands; absent with "absent" is refuted; present with "present" is refuted.
   assert.deepStrictEqual(outcomeOf(citation("docs/a.md#L1-L2", "hello world", "absent"), { blobs }), {
     handle: "receipt:run-1:1:a3", kind: "citation", subject: "assumption", id: "a3", commit: HEAD, outcome: "pass", at: AT,
     detail: { kind: "citation", read: "read", present: true },
@@ -159,7 +150,6 @@ test("citation tests follow refutesOn", () => {
   assert.equal(outcomeOf(citation("docs/a.md#L1-L2", "hello world", "present"), { blobs })?.outcome, "fail");
   assert.equal(outcomeOf(citation("docs/a.md#L1-L2", "missing", "present"), { blobs })?.outcome, "pass");
 
-  // An outside source is outside-unchecked; an unparseable one is malformed. Both are unknown without `present`.
   const outside = outcomeOf(citation("https://example.com/x", "hello", "absent"), { blobs });
   assert.deepStrictEqual(outside?.detail, { kind: "citation", read: "not-run", problem: "outside-unchecked" });
   assert.equal(outside?.outcome, "unknown");
@@ -167,7 +157,6 @@ test("citation tests follow refutesOn", () => {
   assert.deepStrictEqual(malformed?.detail, { kind: "citation", read: "not-run", problem: "malformed" });
   assert.equal(malformed?.outcome, "unknown");
 
-  // A source with @commit reads that commit's blob, and the receipt names that commit.
   const pinned = new Map([[`${OTHER}:docs/a.md`, { state: "read", bytes: Buffer.from("hello world") } as BlobResult]]);
   const fromCommit = outcomeOf(citation(`docs/a.md@${OTHER}`, "hello world", "absent"), { blobs: pinned });
   assert.equal(fromCommit?.commit, OTHER);
@@ -175,7 +164,6 @@ test("citation tests follow refutesOn", () => {
 });
 
 test("a pass plans at most 40 subjects and 40 distinct reads", () => {
-  // 30 command criteria, then 20 intent-check command assumptions, then a member assumption and an owner test.
   const criteria = Array.from({ length: 30 }, (_, index) => criterion(`c${index + 1}`, { kind: "command", command: RANK_DIGEST }));
   const assumptions = [
     ...Array.from({ length: 20 }, (_, index) => assumption(`a${index + 1}`, { kind: "command", command: TESTS_DIGEST, refutesOn: "fail" })),
@@ -183,23 +171,19 @@ test("a pass plans at most 40 subjects and 40 distinct reads", () => {
     assumption("a22", { kind: "owner" }, "owner"),
   ];
   const planned = passSubjects(record({ criteria, assumptions }), "reviewed");
-  // The cap and the order: criteria first, in record order, then assumptions; member and owner-test entries never planned.
   assert.deepStrictEqual(planned.map(subject => subject.id), [
     ...criteria.map(item => item.id),
     ...assumptions.slice(0, 10).map(item => item.id),
   ]);
 
-  // Two artifact tests on one path share one read.
   const shared = [criterion("c1", { kind: "artifact", path: "data/x.json", count: "/n" }), criterion("c2", { kind: "artifact", path: "data/x.json", count: "/n" })];
   const sharedReads = passReads(passSubjects(record({ criteria: shared }), "reviewed"), HEAD);
   assert.deepStrictEqual(sharedReads, [{ commit: HEAD, path: "data/x.json" }]);
 
-  // Distinct reads stop at 40 even when 45 artifact criteria name 45 paths.
   const many = Array.from({ length: 45 }, (_, index) => criterion(`c${index + 1}`, { kind: "artifact", path: `data/${index}.json` }));
   const manyReads = passReads(passSubjects(record({ criteria: many }), "reviewed"), HEAD);
   assert.equal(manyReads.length, 40);
 
-  // A check pass plans command subjects only, and no read.
   const checkSubjects: Subject[] = passSubjects(record({
     criteria: [criterion("c1", { kind: "command", command: RANK_DIGEST }), criterion("c2", { kind: "artifact", path: "data/x.json" })],
     assumptions: [assumption("a1", { kind: "command", command: RANK_DIGEST, refutesOn: "fail" }), assumption("a2", { kind: "artifact", path: "data/x.json", count: "/n", threshold: { kind: "count", min: 1 } })],
@@ -211,30 +195,25 @@ test("a pass plans at most 40 subjects and 40 distinct reads", () => {
 test("the final round, the pointer, and the thresholds follow the plan", () => {
   const a4Fail = assumption("a4", { kind: "command", command: RANK_DIGEST, refutesOn: "fail" });
 
-  // Reviewed pass: final-round rows at another head do not count, so a4 is absent.
   const otherHead = [check(RANK, "failed", 2, { headCommit: OTHER })];
   const reviewed = receiptsOf([], [a4Fail], { checks: otherHead });
   assert.deepStrictEqual(reviewed[0]?.detail, { kind: "command", observed: "absent", round: 2 });
   assert.equal(reviewed[0]?.outcome, "unknown");
 
-  // Check pass: the same rows decide a4, and the receipt names their commit.
   const checkPass = receiptsFor(passSubjects(record({ assumptions: [a4Fail] }), "check"), passInput({ kind: "check", checks: otherHead }));
   assert.equal(checkPass[0]?.outcome, "fail");
   assert.equal(checkPass[0]?.commit, OTHER);
   assert.deepStrictEqual(checkPass[0]?.detail, { kind: "command", observed: "failed", round: 2 });
 
-  // A revision-2 row, even at a higher round, is ignored by a revision-1 pass.
   const otherRevision = [check(RANK, "passed", 1), check(RANK, "failed", 3, { revision: 2 })];
   const revisionOne = receiptsOf([], [a4Fail], { checks: otherRevision });
   assert.deepStrictEqual(revisionOne[0]?.detail, { kind: "command", observed: "passed", round: 1 });
   assert.equal(revisionOne[0]?.outcome, "pass");
 
-  // A row with no round counts as round 0, so the round-1 row decides.
   const noRound = receiptsOf([], [a4Fail], { checks: [check(RANK, "failed"), check(RANK, "passed", 1)] });
   assert.deepStrictEqual(noRound[0]?.detail, { kind: "command", observed: "passed", round: 1 });
   assert.equal(noRound[0]?.outcome, "pass");
 
-  // Thresholds on the 45-entry blob, 31 of which qualify.
   const entries = Array.from({ length: 45 }, (_, index) =>
     index < 31 ? { sources: ["research/a.md#L1", `https://example.org/${index}`] } : { sources: ["research/a.md#L1"] });
   const blobs = blobAt(ENTRIES, json({ entries }));
@@ -247,25 +226,21 @@ test("the final round, the pointer, and the thresholds follow the plan", () => {
   assert.equal(outcome(artifact({ kind: "share", min: 0.6 }, 2)), "pass");
   assert.equal(outcome(artifact({ kind: "share", min: 0.7 }, 2)), "fail");
 
-  // A count without citedPerEntry compares the total and reports no qualifying key.
   const total45 = receiptsOf([], [artifact({ kind: "count", min: 45 })], { blobs })[0];
   assert.deepStrictEqual(total45?.detail, { kind: "artifact", read: "read", total: 45 });
   assert.equal(total45?.outcome, "pass");
   assert.equal(outcome(artifact({ kind: "count", min: 46 })), "fail");
 
-  // A criterion artifact check without count passes when the blob reads.
   const noCount = receiptsOf([criterion("c1", { kind: "artifact", path: ENTRIES })], [], { blobs });
   assert.equal(noCount[0]?.outcome, "pass");
   assert.deepStrictEqual(noCount[0]?.detail, { kind: "artifact", read: "read" });
 
-  // RFC 6901: `~1` is `/` and `~0` is `~`; a non-index array segment names nothing.
   const nested = blobAt(ENTRIES, json({ "a/b": [{ "x~y": [1, 2, 3] }] }));
   const pointer = (path: string) => receiptsOf([], [assumption("a2", { kind: "artifact", path: ENTRIES, count: path, threshold: { kind: "count", min: 1 } })], { blobs: nested })[0];
   assert.deepStrictEqual(pointer("/a~1b/0/x~0y")?.detail, { kind: "artifact", read: "read", total: 3 });
   assert.deepStrictEqual(pointer("/a~1b/first/x~0y")?.detail, { kind: "artifact", read: "read", problem: "no-array" });
   assert.equal(pointer("/a~1b/first/x~0y")?.outcome, "unknown");
 
-  // A retired criterion with a command check is not planned.
   const retired: Criterion = { ...criterion("c1", { kind: "command", command: RANK_DIGEST }), state: "retired" };
   assert.deepStrictEqual(passSubjects(record({ criteria: [retired] }), "reviewed").map(subject => subject.id), []);
 });
@@ -281,7 +256,6 @@ test("member and owner tests are never planned, reads keep their own cap, and a 
   }), "reviewed");
   assert.deepStrictEqual(planned.map(subject => subject.id), ["c1", "a3"]);
 
-  // passSubjects stops at 40 subjects, so only a direct call can show the read cap.
   const subjects: Subject[] = Array.from({ length: 45 }, (_, index) => ({
     subject: "criterion", id: `c${index + 1}`, check: { kind: "artifact", path: `data/${index}.json` }, threshold: { kind: "pass" },
   }));

@@ -13,7 +13,6 @@ const codexStrongXhigh: TeamModelProfile = { id: "astra-strong-xhigh", label: "A
 const unknownStrong: TeamModelProfile = { id: "vendor-strong", label: "Unknown strong", provider: "opencode", model: "vendor/unknown-model", variant: "high", tier: "strong", dataUse: "standard" };
 const claudeLight: TeamModelProfile = { id: "haiku-high", label: "Haiku 5.5 high", provider: "claude", model: "claude-haiku-5-5", effort: "high", tier: "light", dataUse: "standard" };
 
-/** `docs/teams.md`, section "Add `lineup`": the example lineup, copied as written there. */
 const documentedLineup: TeamLineup = {
   coordinator: { id: "opus-xhigh", label: "Opus 5.5 xhigh", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong", dataUse: "standard" },
   implementers: [
@@ -133,7 +132,6 @@ const deepseekEvaluator: TeamModelProfile = { ...deepseekAuthor, id: "evaluator-
 const geminiEvaluator: TeamModelProfile = { id: "evaluator-gemini", label: "Gemini evaluator", provider: "opencode", model: "google/gemini-3-pro", variant: "high", tier: "strong", dataUse: "standard" };
 const claudeCoordinator: TeamModelProfile = { ...claudeStrong, id: "coordinator-claude" };
 
-/** Acceptance 11's lineup: coordinator of family A, reviewer of family B, implementers of family C. */
 const acceptance11 = (evaluators: TeamModelProfile[]): TeamLineup => ({
   coordinator: claudeCoordinator,
   implementers: [deepseekAuthor],

@@ -1,11 +1,3 @@
-/**
- * The permission pipeline: it decides one request and records the decision. It delivers nothing.
- *
- * Precedence, as the design orders it: coverage, class rules, qualify, lock, replay, raise, then the
- * model turns through the decision core. A host rule here can send a request to the owner, reject a
- * locked assignment, replay a recorded verdict or force the strong tier. No host rule allows: an
- * allow is recorded only from a model turn that the host validated, or replayed from one.
- */
 import { createHash } from "node:crypto";
 import { PermissionReviewHeld } from "./permission-agent-types.js";
 import type {
@@ -52,11 +44,6 @@ const bounded = (text: string) => text.length > MAX_TEXT ? text.slice(0, MAX_TEX
 const sameFamily = (left: string, right: string) => left.trim().toLowerCase() === right.trim().toLowerCase();
 const isHostCode = (code: string | undefined) => (HOST_REJECT_CODES as readonly string[]).includes(code ?? "");
 
-/**
- * What the pipeline keeps beside the journal: for each decision, the project and the authority it was
- * made under, so `applicable` answers after a restart, and the reuse key the replay step looks up. The
- * owner controls keep their request receipts here. The journal's schema is not changed.
- */
 export const permissionPipelineModule: EvidenceModule = {
   name: MODULE,
   version: 1,
@@ -78,7 +65,6 @@ export const permissionPipelineModule: EvidenceModule = {
 
 type DecisionRow = { decision_id: string; project_id: string; task_id: string; authority_hash: string };
 
-/** The pipeline's own durable state in the evidence store. */
 export class PermissionPipelineState {
   constructor(private readonly store: EvidenceStore) {
     if (store.status().modules[MODULE] !== "ready") {
@@ -86,7 +72,6 @@ export class PermissionPipelineState {
     }
   }
 
-  /** Both this module and the journal can be read and written now. */
   ready(): boolean {
     const modules = this.store.status().modules;
     return modules[MODULE] === "ready" && modules[JOURNAL_MODULE] === "ready";
@@ -111,7 +96,6 @@ export class PermissionPipelineState {
     return row && { projectId: row.project_id, taskId: row.task_id, authorityHash: row.authority_hash };
   }
 
-  /** The latest decision of the task that answered this reuse key with a reviewer's verdict, or a replay of one. */
   latestReplayable(taskId: string, reuseKey: string): string | undefined {
     return this.store.read(db => db.get<{ decision_id: string }>(
       `SELECT decision_id FROM ${DECISIONS} WHERE task_id=? AND reuse_key=? AND replayable=1 ORDER BY seq DESC LIMIT 1`,
@@ -136,7 +120,6 @@ export class PermissionPipelineState {
   }
 }
 
-/** Registers the module and opens its state, or returns undefined when the store cannot hold it. */
 export function openPermissionPipelineState(store: EvidenceStore): PermissionPipelineState | undefined {
   try {
     store.register(permissionPipelineModule);
@@ -147,11 +130,6 @@ export function openPermissionPipelineState(store: EvidenceStore): PermissionPip
 }
 
 type Covered = Extract<CoverageResult, { covered: true }>;
-/**
- * One reading of a request by the host rules, as its paths resolve at that moment: the class rule that matches, the
- * raise rules that match, and a digest of both with the task text. The decision id, the stored reuse key and the
- * review of one decision all come from the same reading.
- */
 type Reading = { match: PermissionClassMatch | undefined; raised: string[]; inputs: string };
 type Coverage = Pick<PermissionDelegationService, "coverage">;
 type Validated = {
@@ -169,13 +147,7 @@ export interface HostPermissionPipelineOptions {
   journal: PermissionJournal;
   delegation: Coverage;
   state: PermissionPipelineState;
-  /** Whether an owner halt covers the project now. Under a halt nothing is decided and nothing is delivered. */
   halted?: (projectId: string) => boolean;
-  /**
-   * The project's halt epoch: it changes at every engage and every release of a halt that covers the project, and is
-   * undefined while the halt record cannot be read. It is part of each decision's authority, so a verdict reached
-   * before a halt or its release no longer applies after it.
-   */
   haltEpoch?: (projectId: string) => string | undefined;
   now?: () => number;
 }
@@ -188,7 +160,6 @@ export class HostPermissionPipeline implements PermissionPipeline {
   private readonly haltedOf: ((projectId: string) => boolean) | undefined;
   private readonly haltEpochOf: ((projectId: string) => string | undefined) | undefined;
   private readonly clock: () => number;
-  /** One decision per request: a delivery retry while a review runs joins it instead of starting another. */
   private readonly inFlight = new Map<string, Promise<PermissionOutcome>>();
 
   constructor(options: HostPermissionPipelineOptions) {
@@ -201,26 +172,12 @@ export class HostPermissionPipeline implements PermissionPipeline {
     this.clock = options.now ?? Date.now;
   }
 
-  /**
-   * The coverage with the core's binding and the project's halt epoch in its authority. Each ends the authority that
-   * earlier decisions were made under, as a new owner act does. A change to the policy text, the class rules or a
-   * tier profile retires every verdict reached before it: none is delivered or replayed, and the same request is
-   * decided again under the rules in force. A halt does the same, and so does its release. Undefined while the
-   * epoch cannot be read.
-   */
   private inForce(coverage: Covered): Covered | undefined {
     const epoch = this.haltEpochOf ? this.haltEpochOf(coverage.projectId) : null;
     if (epoch === undefined) return undefined;
     return { ...coverage, authorityHash: sha256(["permission-authority", coverage.authorityHash, this.core.binding(), epoch]) };
   }
 
-  /**
-   * Reads the request now. The digest covers what a decision depends on besides the request, the authority and the
-   * journal: the task text, the class rule that matches and the raise rules that match as the request's paths
-   * resolve. A request whose task the owner narrowed, or whose path now resolves to another place the rules tell
-   * apart, is another request to the pipeline: no earlier verdict answers it. The reject history is left out; it
-   * comes from the journal, and it selects the tier of a fresh turn only.
-   */
   private read(request: PermissionRequest, coverage: Covered): Reading {
     const rules = this.core.readRules(request, coverage.interruptClasses);
     const match = rules.match, raised = [...new Set(rules.raised)];
@@ -235,7 +192,6 @@ export class HostPermissionPipeline implements PermissionPipeline {
     return family ? family : undefined;
   }
 
-  /** A halt that cannot be read counts as a halt. */
   halted(projectId: string): boolean {
     try { return this.haltedOf?.(projectId) ?? false; }
     catch { return true; }
@@ -282,7 +238,6 @@ export class HostPermissionPipeline implements PermissionPipeline {
     if (running) return running;
     const work = (async (): Promise<PermissionOutcome> => {
       try {
-        // A delivery retry of one raised request gets the decision already recorded, so a repeat counts once.
         return this.recordedOutcome(decisionId, request) ?? await this.decideFresh(request, served.coverage, decisionId, reading, options);
       } catch (error) {
         console.warn(`[Infinite] The permission pipeline could not decide a request (${error instanceof Error ? error.name : "error"}).`);
@@ -298,11 +253,7 @@ export class HostPermissionPipeline implements PermissionPipeline {
       const row = this.state.decision(decisionId);
       if (!row || this.halted(row.projectId)) return false;
       const current = this.coverage(row.projectId);
-      // A revoke, an owner regrouping, a new owner act, a changed direction text, an owner halt and a change to the
-      // rules or tier profiles in force each change or end the authority.
       if (!current.served || current.coverage.authorityHash !== row.authorityHash) return false;
-      // With the request, the host reads it again: the decision applies while it is the one this request gets now.
-      // A path that came to resolve elsewhere while the review ran, or a changed task text, gives another id.
       return request === undefined || decisionIdFor(request, row.authorityHash, this.read(request, current.coverage).inputs) === decisionId;
     } catch {
       return false;
@@ -319,7 +270,6 @@ export class HostPermissionPipeline implements PermissionPipeline {
   }
 
   taskEnded(taskId: string): void {
-    // Closing the task's open rejects also ends every lock that one of them held.
     try { this.journal.closeOpenRejects({ taskId, at: this.timestamp(), reason: "task-ended" }); }
     catch { console.warn("[Infinite] The permission journal could not close an ended task's rejects."); }
   }
@@ -331,14 +281,9 @@ export class HostPermissionPipeline implements PermissionPipeline {
       return { kind: "undeliverable", reason: "The permission agent could not record this decision's authority." };
     }
     if (decision.verdict !== "allow") return this.outcomeOf(decision);
-    // A second attempt at the same request (after a refused delivery or a restart) cannot read again what the
-    // review read. An allow that depended on it is left with the owner; the decision and its count stay as recorded.
     if (decision.rules.includes(READ_SOURCE)) {
       return { kind: "undeliverable", reason: "The source files that this allow depends on cannot be read again." };
     }
-    // A recorded allow answers a second attempt only while a new identical request would replay the same verdict:
-    // the assignment is not locked, no open effect reject of the task is newer, the requester's family may still
-    // receive it, and no later verdict for the request stands before it.
     const family = this.familyOf(request);
     const stillAnswers = !this.journal.isLocked(decision.assignment) && (decision.reuseKey === undefined
       ? this.journal.replayEligible(decisionId, { taskId: decision.taskId, requesterFamily: family })
@@ -371,13 +316,11 @@ export class HostPermissionPipeline implements PermissionPipeline {
       requestDigest: requestDigestFor(request),
     };
 
-    // 1. Class rules: the owner answers, no model turn runs, and nothing is replayed for it.
     const match = reading.match;
     if (match) {
       return this.record({ ...base, at: this.timestamp(), rules: [match.rule.startsWith("class:") ? match.rule : `class:${match.rule}`], tiers: [], verdict: "owner", interruptClass: match.interruptClass }, coverage, false);
     }
 
-    // 2. Qualify. A request that cannot be allowed is still reviewed when it offers a one-shot reject.
     const qualification = this.core.qualify(request);
     const canAllow = qualification.qualified && request.shape.oneShotAccept;
     if (!request.shape.oneShotReject) {
@@ -389,12 +332,10 @@ export class HostPermissionPipeline implements PermissionPipeline {
       };
     }
 
-    // 3. Lock.
     if (this.journal.isLocked(requester.assignment)) {
       return this.record({ ...base, at: this.timestamp(), ...(reuseKey ? { reuseKey } : {}), rules: ["host:locked"], tiers: [], verdict: "reject", code: "locked" }, coverage, false);
     }
 
-    // 4. Replay. The journal judges eligibility; a request that cannot be allowed never replays an allow.
     if (reuseKey) {
       const candidate = this.replayCandidate(requester.taskId, reuseKey, family);
       if (candidate && (candidate.verdict !== "allow" || canAllow)) {
@@ -405,16 +346,10 @@ export class HostPermissionPipeline implements PermissionPipeline {
       }
     }
 
-    // 5. Raise. Raise rules select the tier of a fresh turn and nothing else.
-    // The rules that match the request come from the reading the stored key was made from. The assignment's reject
-    // history comes from the journal.
     const raised = [...reading.raised];
     if (this.journal.hasRejectHistory(requester.assignment)) raised.push("raise:reject-history");
     if (!canAllow) raised.push("not-qualified");
 
-    // 6. The review, with the task's open rejects, the assignment's evidence rejects and the owner's direction.
-    // A verdict reached after the review read source files depends on what those files held then. The delivery
-    // that follows reads them again. No later request or attempt can, so the decision is marked and answers neither.
     let readSource = false;
     const collect = options.collect;
     const context: PermissionReviewContext = {
@@ -427,19 +362,16 @@ export class HostPermissionPipeline implements PermissionPipeline {
       raised,
       canAllow,
       ...(collect ? { collect: (paths: string[]) => { readSource = true; return collect(paths); } } : {}),
-      // Every turn reads the halt again: one recorded after the light turn holds the strong turn.
       held: () => this.halted(requester.projectId),
       ...(options.signal ? { signal: options.signal } : {}),
     };
     let review: PermissionReview;
     try { review = await this.core.review(request, context); }
     catch (error) {
-      // The launch gate held the turn: no verdict exists, so nothing is recorded.
       if (error instanceof PermissionReviewHeld) return { kind: "held" };
       review = { verdict: "reject", code: "unavailable", tiers: [] };
     }
 
-    // 7. Validate the report before anything is recorded, then record it.
     const verdict = this.validate(review, { canAllow, raised, family, taskId: requester.taskId });
     const rules = [
       ...raised.map(rule => rule.startsWith("raise:") ? rule : `raise:${rule}`),
@@ -462,7 +394,6 @@ export class HostPermissionPipeline implements PermissionPipeline {
     try {
       return this.record(decision, coverage, !isHostCode(decision.code));
     } catch {
-      // The journal refused the report as recorded (for example its tier list). That is a report with no verdict.
       const { note: _note, repeats: _repeats, code: _code, interruptClass: _class, ...rest } = decision;
       return this.record({
         ...rest, tiers: [], verdict: "reject", code: "unavailable", rules: [...rules, "host:invalid-review:unrecordable"],
@@ -470,21 +401,14 @@ export class HostPermissionPipeline implements PermissionPipeline {
     }
   }
 
-  /** The decision an identical request may replay now, or undefined when a fresh review is needed. */
   private replayCandidate(taskId: string, reuseKey: string, family: string | undefined): PermissionDecision | undefined {
     const candidateId = this.state.latestReplayable(taskId, reuseKey);
     if (!candidateId) return undefined;
     const candidate = this.journal.decision(candidateId);
-    // The latest verdict for the request stops the lookup when it cannot be replayed itself: an older one behind
-    // it is not consulted. That holds for an owner verdict and for a verdict that read source files.
     if (!candidate || candidate.verdict === "owner" || candidate.rules.includes(READ_SOURCE)) return undefined;
     return this.journal.replayEligible(candidateId, { taskId, requesterFamily: family }) ? candidate : undefined;
   }
 
-  /**
-   * A host rule only restricts: a report that breaks a rule is a report with no verdict, which is a reject
-   * with `unavailable`. A cited repeat counts only when it is an open effect reject of this task.
-   */
   private validate(
     review: PermissionReview,
     context: { canAllow: boolean; raised: string[]; family: string | undefined; taskId: string },
@@ -522,10 +446,6 @@ export class HostPermissionPipeline implements PermissionPipeline {
     return invalid("verdict");
   }
 
-  /**
-   * The cited reject when it is an effect reject whose original is an open reject of this task. A repeat's
-   * original is always in the repeat's own task, so membership in this task's open rejects settles both.
-   */
   private openRepeat(cited: unknown, taskId: string): string | undefined {
     if (typeof cited !== "string" || cited.length === 0) return undefined;
     const decision = this.journal.decision(cited);
@@ -534,7 +454,6 @@ export class HostPermissionPipeline implements PermissionPipeline {
     return this.journal.openRejects(taskId).some(open => open.id === original) ? cited : undefined;
   }
 
-  /** The journal first, then the pipeline's authority row: a decision without its row is never applicable. */
   private record(decision: PermissionDecision, coverage: Covered, replayable: boolean): PermissionOutcome {
     this.journal.appendDecision(decision);
     try {
@@ -565,40 +484,21 @@ export class HostPermissionPipeline implements PermissionPipeline {
   }
 }
 
-/**
- * Marks a decision whose review read source files through the adapter's collection. The verdict depends on what
- * those files held then, and the adapter can read them again only for the delivery that follows that review.
- */
 const READ_SOURCE = "host:read-source";
 
-/**
- * One raised request under one authority, read with one set of review inputs, has one decision id. A changed
- * request, a new authority or a changed input gets another.
- */
 function decisionIdFor(request: PermissionRequest, authorityHash: string, inputs: string): string {
   return `pd-${sha256(["permission-decision", request.requester.sessionId, request.id, request.evidenceHash, authorityHash, inputs]).slice(0, 32)}`;
 }
 
-/**
- * One raised request, whatever authority, reading or evidence it is decided under. The journal counts a repeat once
- * per digest. An interactive dialog is one prompt of its session: the prompt id is the sequence of the event that
- * opened it, a new dialog gets a new one, and the dialog keeps it while a hook adds its tool evidence, which changes
- * the request id and the evidence hash. A headless call has no prompt, and its request id is the call's.
- */
 function requestDigestFor(request: PermissionRequest): string {
   const raised = request.prompt ? ["prompt", request.prompt.id] : ["request", request.id, request.evidenceHash];
   return sha256(["permission-request", request.requester.sessionId, ...raised]);
 }
 
-/**
- * The stored reuse key. It changes with the authority, so a new owner act, a direction text or a change to the rules
- * in force stops replay, and with the review inputs, so a changed task text or path resolution does.
- */
 function reuseKeyFor(requestKey: string, coverage: Covered, inputs: string): string {
   return sha256(["permission-reuse", coverage.projectId, coverage.authorityHash, requestKey, inputs]);
 }
 
-/** The reviewed verdict a decision carries: itself, or the decision it replays. Replays are stored against their source. */
 function sourceOf(decision: PermissionDecision | undefined): string | undefined {
   return decision && (decision.replayOf ?? decision.id);
 }
@@ -607,25 +507,16 @@ function rejectRef(decision: PermissionDecision): PermissionRejectRef {
   return { id: decision.id, tool: decision.action.tool, action: decision.action.summary, code: decision.code! };
 }
 
-/* ---------------------------------------------------------------- owner controls */
-
 export type PermissionReopenResult = {
   decisionId: string;
-  /** The original reject whose state the decision shares. Reopening a repeat or a replay reopens it. */
   reject: string;
   code: RejectCode;
   assignment: string;
-  /** Whether the assignment is still locked, by another open reject. */
   locked: boolean;
 };
 
 export type PermissionUnlockResult = { assignment: string; wasLocked: boolean; locked: boolean };
 
-/**
- * The owner's two controls over the pipeline's state. Neither allows anything: a reopen closes a reject,
- * removes it from replay and resets its repeat count; an unlock ends the assignment's lock and resets its count.
- * A request ID makes each act safe to retry.
- */
 export class PermissionOwnerControls {
   private readonly clock: () => number;
 
@@ -687,8 +578,6 @@ export class PermissionOwnerControls {
   }
 }
 
-/* ---------------------------------------------------------------- direction text */
-
 function directionInForce(delegation: Coverage, projectId: string): string | null | undefined {
   try {
     const coverage = delegation.coverage(projectId);
@@ -698,11 +587,6 @@ function directionInForce(delegation: Coverage, projectId: string): string | nul
   }
 }
 
-/**
- * Runs an owner delegation act and closes the open rejects of each project whose direction text the act
- * changed. A project that was not covered before the act, or is not covered after it, has no change of
- * text in force, so its open rejects stay. A failed closure leaves them open, which only restricts.
- */
 export function closeRejectsOnDirectionChange<T>(
   delegation: Coverage,
   journal: Pick<PermissionJournal, "closeOpenRejects"> | undefined,

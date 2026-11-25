@@ -9,8 +9,6 @@ import { controlActor, type PairedDevice } from "./device-control.js";
 import type { Manager } from "./manager.js";
 import type { ControlActor, Receipt, TerminalSnapshot, WorkerState } from "./types.js";
 
-// A snapshot is a rendered journal prefix. Watch before capturing it; every
-// subsequent delta starts strictly after its cursor, even during heavy output.
 export async function* terminalPages(manager: Manager, sessionId: string, after: number, signal: AbortSignal, snapshot = false) {
   let cursor = after, changed = true, wake: (() => void) | undefined, lastState = 0;
   const notify = () => { changed = true; wake?.(); };
@@ -26,8 +24,6 @@ export async function* terminalPages(manager: Manager, sessionId: string, after:
           yield { snapshot: screen, cursor };
         }
       } catch {
-        // Existing workers, exited processes, and unsupported terminal state
-        // use the lossless recording path. Never guess a screen's cursor.
       }
     }
     while (!signal.aborted) {
@@ -97,7 +93,6 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
         if (legacy && leaseId) {
           const held = leaseId;
           serial = serial.then(async () => {
-            // A managed session's fallback lease is not kept alive past its provider prompt.
             if (managed && (await manager.state(match[1])).attention?.state !== "needs-you") return;
             await manager.controlSession(match[1], { op: "control", action: "renew", actor, leaseId: held });
           }).catch(() => { leaseId = undefined; fail(1011); });
@@ -106,8 +101,6 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
       ws.on("error", () => abort.abort());
       ws.on("close", () => {
         abort.abort(); clearTimeout(authTimeout); clearInterval(heartbeat);
-        // Let any in-flight claim settle before releasing. A stale release can
-        // never clear a newer owner's lease (the worker checks its generation).
         void serial.then(async () => {
           if (leaseId) await manager.controlSession(match[1], { op: "control", action: "release", actor, leaseId });
         }).catch(() => {});
@@ -176,7 +169,6 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
               await send({ refusal: { requestId: "requestId" in input ? input.requestId : undefined, code: "control-lost" } }); return;
             }
             const { leaseId: _leaseId, ...legacyInput } = input;
-            // This is a terminal surface: the person sees any open dialog, so text is not held back.
             const request = {
               ...(state.capabilities?.inputControl ? { ...input, actor, leaseId: suppliedLease } : legacyInput),
               ...(input.op === "input" ? { force: true } : {}),

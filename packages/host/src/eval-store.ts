@@ -14,9 +14,9 @@ import {
   type EvalOrigin,
   type EvalReason,
   type Lineage,
-  type EvalState,
   type EvalTaskRow,
   type MaterialState,
+  type MinedPayload,
   type RejectedPayload,
   type ReconcileResult,
   type StartReason,
@@ -31,11 +31,6 @@ export const SWEEP_BATCH = 100;
 
 const DAY_MS = 86_400_000;
 
-/**
- * The last statuses of a deleted run that keep its tasks. Any other status, or none, takes them. The host deletes a run
- * record only when it is cancelled, merged, or no-change, so any other last status belongs to a run whose later events
- * were lost, and its fate is unknown.
- */
 const KEEP_STATUSES: ReadonlySet<string> = new Set(["merged", "no-change"]);
 
 export const SCHEMA_V1 = [
@@ -72,7 +67,6 @@ export const SCHEMA_V1 = [
   )`,
 ];
 
-/** Version 2: provenance groups, mined rows, the validation fields, path rows, and the jobs and mining tables. */
 export const SCHEMA_V2 = [
   "ALTER TABLE eval_tasks ADD COLUMN group_id TEXT",
   "ALTER TABLE eval_tasks ADD COLUMN commit_ref TEXT",
@@ -158,7 +152,6 @@ type TaskRow = {
   attempts: number;
 };
 
-/** The marker's outcome: a captured task with its capsule, or a task refused before any read. */
 export type MarkerOutcome = { state: "captured"; capsule: Capsule } | { state: "rejected"; reason: StartReason };
 
 export type MaterialResult =
@@ -167,13 +160,9 @@ export type MaterialResult =
       baseDelta: { state: "none" } | { state: "stored"; bytes: Buffer } | { state: "missing" };
       reference: { state: "stored"; bytes: Buffer } | { state: "missing" }; base: BaseRead };
 
-/**
- * The promotion decision. Declared here with the shape of `eval-rules.ts`, which defines the same type.
- * Both must stay equal, so the coordinator can join them.
- */
+type CapturedActiveTask = Extract<EvalTaskRow, { origin: "captured"; state: "captured" | "candidate" | "valid" }>;
 
-export type Decide = (task: EvalTaskRow & { payload: CapturedPayload }) => Promotion | { kind: "wait"; unreadable: true };
-/** Called once for each captured row that a decision promotes to `candidate`. */
+export type Decide = (task: CapturedActiveTask) => Promotion | { kind: "wait"; unreadable: true };
 export type Promoted = (tx: EvidenceTx, task: EvalTaskRow) => void;
 
 export function evalCorpusModule(store: EvidenceStore, now: () => string): EvidenceModule {
@@ -193,7 +182,6 @@ export function evalCorpusModule(store: EvidenceStore, now: () => string): Evide
     deleteRun(tx, runId) {
       const owned = tx.get<{ n: number }>("SELECT count(*) AS n FROM eval_tasks WHERE run_id=?", runId)?.n ?? 0;
       if (owned === 0) return;
-      // Read before the store deletes the run's events: the hook runs first.
       const status = lastRunStatus(store, tx, runId);
       if (status !== undefined && KEEP_STATUSES.has(status)) {
         tx.run("UPDATE eval_tasks SET run_deleted_at=COALESCE(run_deleted_at, ?) WHERE run_id=?", now(), runId);
@@ -222,10 +210,6 @@ export function capturedTaskId(runId: string, memberId: string): string {
   return `captured:${runId}:${memberId}`;
 }
 
-/**
- * Writes the marker row, and for a captured task its capsule part. `full` when the project holds 20,000 rows. Nothing
- * is written then. The byte caps apply at completion, in `completeMaterial`.
- */
 export function insertMarker(tx: EvidenceTx, start: CaptureStart, outcome: MarkerOutcome, at: string): "inserted" | "exists" | "full" {
   const taskId = capturedTaskId(start.runId, start.memberId);
   const ref = tx.index("project", start.projectId);
@@ -276,10 +260,6 @@ export function insertMarker(tx: EvidenceTx, start: CaptureStart, outcome: Marke
   return "inserted";
 }
 
-/**
- * Completes a pending material. A reject, or a stored size that would take the project past 128 MiB or the host past
- * 512 MiB, removes every part and rejects the row. False when the row is gone or its material is not pending.
- */
 export function completeMaterial(tx: EvidenceTx, taskId: string, result: MaterialResult, at: string): boolean {
   const row = tx.get<{ material: string; project_ref: string; material_bytes: number; payload: string; captured_at: string }>(
     "SELECT material, project_ref, material_bytes, payload, captured_at FROM eval_tasks WHERE task_id=?",
@@ -322,7 +302,6 @@ export function completeMaterial(tx: EvidenceTx, taskId: string, result: Materia
   return true;
 }
 
-/** Marks the run's captured and candidate rows of this anchor. A payload that does not open is marked `unknown`. */
 export function markApproval(tx: EvidenceTx, start: ApprovalStart): { taskId: string; integratedHead: string }[] {
   const rows = tx.all<{ task_id: string; payload: string }>(
     "SELECT task_id, payload FROM eval_tasks WHERE run_id=? AND state IN ('captured', 'candidate', 'valid')",
@@ -344,10 +323,6 @@ export function markApproval(tx: EvidenceTx, start: ApprovalStart): { taskId: st
   return marked;
 }
 
-/**
- * `later` undefined records `unknown`. False unless the row is captured or candidate and its approval is pending
- * under `approvedAt`, so a read of an earlier approval writes nothing once a later one marked the row.
- */
 export function completeApproval(tx: EvidenceTx, taskId: string, approvedAt: string, later: string[] | undefined): boolean {
   const row = tx.get<{ state: string; approval: string | null; approved_at: string | null; payload: string }>(
     "SELECT state, approval, approved_at, payload FROM eval_tasks WHERE task_id=?",
@@ -368,10 +343,6 @@ export function completeApproval(tx: EvidenceTx, taskId: string, approvedAt: str
   return true;
 }
 
-/**
- * The restart rule. Material pending outside `materialInFlight` is rejected `capture-failed`; approval pending outside
- * `approvalInFlight` becomes `unknown`. Each half looks only at its own kind of job. Returns the number of tasks changed.
- */
 export function failPending(
   tx: EvidenceTx,
   materialInFlight: ReadonlySet<string>,
@@ -394,35 +365,19 @@ export function failPending(
   return touched.size;
 }
 
-/** The reconcile pass's order query, run once per state through `eval_tasks_check_captured`. */
 export const RECONCILE_ORDER_SQL = "SELECT task_id, checked_at FROM eval_tasks WHERE origin = 'captured' AND state = ? ORDER BY checked_at, task_id LIMIT ?";
-/** Captured rows of one project, read through `eval_tasks_summary`. Mined rows never count against capture's cap. */
 export const CAPTURED_COUNT_SQL = "SELECT count(*) AS n FROM eval_tasks WHERE project_ref = ? AND origin = 'captured'";
-/** Rows whose reference paths are not indexed yet, read through `eval_tasks_unindexed`. */
 export const UNINDEXED_SQL = "SELECT task_id, captured_at, payload FROM eval_tasks WHERE paths_indexed = 0 AND material IN ('stored', 'partial') ORDER BY project_ref, task_id LIMIT ?";
-/** Whether a project has a row whose paths are still unindexed. */
 export const PATHS_PENDING_SQL = "SELECT 1 AS one FROM eval_tasks WHERE project_ref = ? AND paths_indexed = 0 AND material IN ('stored','partial') LIMIT 1";
-/** Path rows written per task. */
 export const PATHS_PER_TASK_MAX = 500;
-/** Rows one `indexPaths` call handles. */
 export const PATHS_BATCH = 100;
-/** The runs with rows still held, read through `eval_tasks_live_runs`. */
 export const LIVE_RUN_IDS_SQL = "SELECT DISTINCT run_id FROM eval_tasks WHERE run_deleted_at IS NULL";
-/** The sweep visits at most this many project references a pass. */
 export const SWEEP_REFS_MAX = 64;
-/** The next project reference that has rows after `after`: one seek. */
 export const NEXT_PROJECT_REF_SQL = "SELECT project_ref AS ref FROM eval_tasks WHERE project_ref > ? ORDER BY project_ref LIMIT 1";
-/** One project's oldest rows before a cutoff, through `eval_tasks_project`. */
 export const PROJECT_OLD_SQL = "SELECT task_id FROM eval_tasks WHERE project_ref = ? AND captured_at < ? ORDER BY captured_at LIMIT ?";
-/** Where the next sweep pass goes on: after the last project reference it finished. */
 export type SweepCursor = { after: string };
-/** One task's full row, by its key. */
 export const TASK_BY_ID_SQL = `SELECT ${TASK_COLUMNS} FROM eval_tasks WHERE task_id=?`;
 
-/**
- * Visits at most `limit` captured or candidate rows, oldest `checked_at` first. A payload that does not open rejects
- * its row `unreadable`. `decide` gives the promotion; a candidate is written once, and a reject removes the material.
- */
 export function reconcileBatch(
   tx: EvidenceTx,
   decide: Decide,
@@ -443,9 +398,11 @@ export function reconcileBatch(
     if (!row) continue;
     result.visited++;
     tx.run("UPDATE eval_tasks SET checked_at=? WHERE task_id=?", at, row.task_id);
-    let task: EvalTaskRow & { payload: CapturedPayload };
+    let task: CapturedActiveTask;
     try {
-      task = taskOf(tx, row) as EvalTaskRow & { payload: CapturedPayload };
+      const opened = taskOf(tx, row);
+      if (opened.origin !== "captured" || (opened.state !== "captured" && opened.state !== "candidate" && opened.state !== "valid")) continue;
+      task = opened;
     } catch {
       dropRow(tx, row, "unreadable", at);
       result.unreadable++;
@@ -460,7 +417,7 @@ export function reconcileBatch(
       continue;
     }
     if (decision.kind === "candidate") {
-      if (row.state === "captured") {
+      if (task.state === "captured") {
         tx.run(
           "UPDATE eval_tasks SET state='candidate', decided_at=?, area_ref=?, payload=?, prompt_origin='assignment', kind=? WHERE task_id=?",
           at,
@@ -470,7 +427,7 @@ export function reconcileBatch(
           row.task_id,
         );
         result.promoted++;
-        onPromoted?.(tx, { ...task, state: "candidate" });
+        onPromoted?.(tx, { ...task, state: "candidate", decidedAt: at });
       }
       continue;
     }
@@ -486,7 +443,6 @@ export function readEvalTask(db: EvidenceDb, taskId: string): EvalTaskRow | unde
   return row === undefined ? undefined : taskOf(db, row);
 }
 
-/** Every row of the run. A payload that does not open throws. */
 export function runEvalTasks(db: EvidenceDb, runId: string): EvalTaskRow[] {
   return db.all<TaskRow>(`SELECT ${TASK_COLUMNS} FROM eval_tasks WHERE run_id=? ORDER BY captured_at, task_id`, runId)
     .map(row => taskOf(db, row));
@@ -508,12 +464,6 @@ export function readMaterial(db: EvidenceDb, taskId: string): { capsule?: Capsul
   return result;
 }
 
-/**
- * Deletes rows older than their project's retention, and older than `fallbackDays` for a project reference that no
- * configured project maps. A pass walks the references that have rows, from `cursor.after`, visits at most
- * SWEEP_REFS_MAX of them, and deletes at most `limit` rows. The cursor moves past each finished reference; when the row
- * limit ends a reference, the next pass starts at that reference again.
- */
 export function sweepEvalTasks(
   tx: EvidenceTx,
   now: string,
@@ -547,10 +497,6 @@ export function sweepEvalTasks(
   return removed;
 }
 
-/**
- * The one reject rule. Every part goes, the row resets, and no later completion can match it. The payload is replaced
- * only when the project is known; an unreadable payload stays sealed as it was.
- */
 function settle(tx: EvidenceTx, taskId: string, state: "rejected" | "retired", reason: EvalReason, at: string, projectId?: string): void {
   tx.run("DELETE FROM eval_material WHERE task_id=?", taskId);
   tx.run("DELETE FROM eval_paths WHERE task_id=?", taskId);
@@ -570,32 +516,26 @@ function rejectRow(tx: EvidenceTx, taskId: string, reason: EvalReason, at: strin
   settle(tx, taskId, "rejected", reason, at, projectId);
 }
 
-/** A valid row that a reject takes is retired; any other row is rejected. */
 function dropRow(tx: EvidenceTx, row: TaskRow, reason: EvalReason, at: string, projectId?: string): void {
   settle(tx, row.task_id, row.state === "valid" ? "retired" : "rejected", reason, at, projectId);
 }
 
-/** The one reject rule, exported. It also deletes the task's eval_paths rows. */
 export function rejectTask(tx: EvidenceTx, taskId: string, reason: EvalReason, at: string, projectId?: string): void {
   rejectRow(tx, taskId, reason, at, projectId);
 }
 
-/** As rejectTask, with state `retired`. For a task that was `valid` or a mined `candidate` taken by the duplicate rule. */
 export function retireTask(tx: EvidenceTx, taskId: string, reason: EvalReason, at: string, projectId?: string): void {
   settle(tx, taskId, "retired", reason, at, projectId);
 }
 
-/** The group row id of a run's captured tasks. */
 export function runGroupId(runId: string): string {
   return `run:${runId}`;
 }
 
-/** The path reference of one reference file, keyed by its project. */
 export function pathRef(db: EvidenceDb, projectId: string, path: string): string {
   return db.index("eval-path", `${projectId}\u0000${path}`);
 }
 
-/** Writes one path row per reference file, at most PATHS_PER_TASK_MAX. */
 function writePaths(tx: EvidenceTx, projectId: string, taskId: string, capturedAt: string, files: readonly string[]): void {
   for (const file of files.slice(0, PATHS_PER_TASK_MAX)) {
     tx.run(
@@ -607,26 +547,22 @@ function writePaths(tx: EvidenceTx, projectId: string, taskId: string, capturedA
   }
 }
 
-/** Writes the path rows that v1 left unindexed. Returns the number of rows marked indexed; a payload that does not open writes nothing. */
 export function indexPaths(tx: EvidenceTx, limit = PATHS_BATCH): number {
   const rows = tx.all<{ task_id: string; captured_at: string; payload: string }>(UNINDEXED_SQL, limit);
   for (const row of rows) {
     try {
       const payload = tx.open<CapturedPayload>("eval_tasks", row.task_id, row.payload);
       writePaths(tx, payload.projectId, row.task_id, row.captured_at, payload.files ?? []);
-    } catch {
-      // Reconcile rejects an unreadable row; its paths stay out.
-    }
+    } catch {}
     tx.run("UPDATE eval_tasks SET paths_indexed=1 WHERE task_id=?", row.task_id);
   }
   return rows.length;
 }
 
-/** Whether a project still has a row whose paths are not indexed. */
 export function pathsPending(db: EvidenceDb, projectRef: string): boolean {
   return db.get(PATHS_PENDING_SQL, projectRef) !== undefined;
 }
-/** Code-unit order, the order SQLite's BINARY collation gives for these ASCII keys. */
+
 function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
@@ -664,35 +600,97 @@ function projectIdOf(db: EvidenceDb, taskId: string, sealed: string): string | u
 }
 
 function taskOf(db: EvidenceDb, row: TaskRow): EvalTaskRow {
-  return {
+  const base = {
     taskId: row.task_id,
-    origin: row.origin as EvalOrigin,
     runId: row.run_id,
     memberId: row.member_id,
     projectRef: row.project_ref,
-    state: row.state as EvalState,
-    reason: (row.reason ?? null) as EvalReason | null,
     material: row.material as MaterialState,
-    approval: (row.approval ?? null) as ApprovalState | null,
     approvedAt: row.approved_at ?? null,
     base: row.base as BaseState,
     materialBytes: row.material_bytes,
     capturedAt: row.captured_at,
-    decidedAt: row.decided_at ?? null,
     checkedAt: row.checked_at,
     runDeletedAt: row.run_deleted_at ?? null,
     groupId: row.group_id ?? null,
     lineage: (row.lineage ?? null) as Lineage | null,
-    validatedAt: row.validated_at ?? null,
     attempts: row.attempts,
-    payload: db.open<CapturedPayload | RejectedPayload>("eval_tasks", row.task_id, row.payload),
+  };
+  if (row.state === "rejected" || row.state === "retired") {
+    return {
+      ...base,
+      origin: row.origin as EvalOrigin,
+      state: row.state,
+      reason: (row.reason ?? null) as EvalReason | null,
+      approval: null,
+      decidedAt: row.decided_at ?? null,
+      validatedAt: row.validated_at ?? null,
+      payload: db.open<RejectedPayload>("eval_tasks", row.task_id, row.payload),
+    };
+  }
+  if (row.origin === "mined") {
+    const payload = db.open<MinedPayload>("eval_tasks", row.task_id, row.payload);
+    if (row.state === "valid") {
+      return {
+        ...base,
+        origin: "mined",
+        state: "valid",
+        reason: null,
+        approval: null,
+        decidedAt: row.decided_at ?? null,
+        validatedAt: row.validated_at ?? null,
+        payload,
+      };
+    }
+    return {
+      ...base,
+      origin: "mined",
+      state: "candidate",
+      reason: null,
+      approval: null,
+      decidedAt: row.decided_at ?? null,
+      validatedAt: null,
+      payload,
+    };
+  }
+  const payload = db.open<CapturedPayload>("eval_tasks", row.task_id, row.payload);
+  const approval = (row.approval ?? null) as ApprovalState | null;
+  if (row.state === "captured") {
+    return {
+      ...base,
+      origin: "captured",
+      state: "captured",
+      reason: null,
+      approval,
+      decidedAt: null,
+      validatedAt: null,
+      payload,
+    };
+  }
+  if (row.state === "valid") {
+    return {
+      ...base,
+      origin: "captured",
+      state: "valid",
+      reason: null,
+      approval,
+      decidedAt: row.decided_at ?? null,
+      validatedAt: row.validated_at ?? null,
+      payload,
+    };
+  }
+  return {
+    ...base,
+    origin: "captured",
+    state: "candidate",
+    reason: null,
+    approval,
+    decidedAt: row.decided_at ?? null,
+    validatedAt: null,
+    payload,
   };
 }
 
-/**
- * The status of the run's last `run.settled` or `run.deleted` event. Undefined when there is no such event, when it
- * does not open, or when its status is not a string: the caller then deletes, because the fate is unknown.
- */
 function lastRunStatus(store: EvidenceStore, tx: EvidenceTx, runId: string): string | undefined {
   let last: RunEvent | undefined;
   try {
@@ -709,4 +707,3 @@ function lastRunStatus(store: EvidenceStore, tx: EvidenceTx, runId: string): str
   const status = last?.data.status;
   return typeof status === "string" ? status : undefined;
 }
-

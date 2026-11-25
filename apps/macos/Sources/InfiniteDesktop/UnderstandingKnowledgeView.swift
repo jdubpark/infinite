@@ -22,7 +22,6 @@ struct UnderstandingKnowledgeView: View {
     @State private var retryBody: JSON?
     @State private var mutationInFlight = false
     @State private var catalogConflict = false
-    private let snapshotStore = UnderstandingSnapshotStore()
 
     private var owner: Bool { app.isOwner }
     private var overviewGeneration: String { overview["observedAt"].string }
@@ -291,7 +290,7 @@ struct UnderstandingKnowledgeView: View {
             UnderstandingBehaviorView(app: app, group: group, componentID: value["id"].string,
                 currentSourceSnapshotID: value["current"]["snapshotId"].string, currentSourceState: value["current"]["state"].string,
                 behaviors: detail["behaviors"].array.filter { $0["definition"]["componentId"].string == value["id"].string },
-                onAccessDenied: { clearCache() })
+                onAccessDenied: { Task { await clearCache() } })
             VStack(alignment: .leading, spacing: 7) {
                 Text("Difference from accepted plans").font(.headline)
                 Text(value["difference"]["summary"].string.isEmpty ? "No comparison summary is available." : value["difference"]["summary"].string).textSelection(.enabled)
@@ -367,7 +366,7 @@ struct UnderstandingKnowledgeView: View {
     }
 
     private func load() async {
-        guard let client = app.client, app.connected else { loadCached(); return }
+        guard let client = app.client, app.connected else { await loadCached(); return }
         loading = true; defer { loading = false }
         let hostID = app.activeID
         let membershipRevision = group.revision
@@ -390,10 +389,10 @@ struct UnderstandingKnowledgeView: View {
                     detail = .null
                 }
             }
-            saveCache()
+            await saveCache()
         } catch {
             self.error = error.localizedDescription
-            if [401, 403, 404].contains((error as? DesktopError)?.status ?? 0) { clearCache() }
+            if [401, 403, 404].contains((error as? DesktopError)?.status ?? 0) { await clearCache() }
         }
     }
     private func loadComponent(_ id: String, overviewObservation: String? = nil) async {
@@ -412,10 +411,10 @@ struct UnderstandingKnowledgeView: View {
                   app.projectGroups.group(workspaceID)?.revision == membershipRevision else { return }
             detail = response
             componentDetails[id] = response
-            saveDetailCache(id, detail: response)
+            await saveDetailCache(id, detail: response)
         } catch {
             self.error = error.localizedDescription
-            if [401, 403, 404].contains((error as? DesktopError)?.status ?? 0) { clearCache() }
+            if [401, 403, 404].contains((error as? DesktopError)?.status ?? 0) { await clearCache() }
         }
     }
     private var cacheHost: String {
@@ -428,21 +427,34 @@ struct UnderstandingKnowledgeView: View {
         guard let active = app.active, let token = try? DeviceKeychain.read(active.id) else { return "unavailable" }
         return SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined()
     }
-    private func saveCache() {
+    private func saveCache() async {
         guard cacheCredential != "unavailable" else { return }
         guard let catalogBytes = try? catalog.data(), let componentBytes = try? JSON.array(index).data() else { return }
-        try? snapshotStore.mergeKnowledge(host: cacheHost, credential: cacheCredential, workspace: group.id,
-                                          membershipRevision: group.revision, catalog: catalogBytes, components: componentBytes)
+        let host = cacheHost
+        let credential = cacheCredential
+        let store = await UnderstandingSnapshotStore.shared()
+        try? await store.mergeKnowledge(host: host, credential: credential, workspace: group.id,
+                                        membershipRevision: group.revision, catalog: catalogBytes, components: componentBytes)
     }
-    private func saveDetailCache(_ id: String, detail: JSON) {
+    private func saveDetailCache(_ id: String, detail: JSON) async {
         guard cacheCredential != "unavailable", let bytes = try? detail.data() else { return }
-        try? snapshotStore.mergeComponentDetail(host: cacheHost, credential: cacheCredential, workspace: group.id,
-                                                membershipRevision: group.revision, id: id, detail: bytes)
+        let host = cacheHost
+        let credential = cacheCredential
+        let store = await UnderstandingSnapshotStore.shared()
+        try? await store.mergeComponentDetail(host: host, credential: credential, workspace: group.id,
+                                              membershipRevision: group.revision, id: id, detail: bytes)
     }
-    private func loadCached() {
-        guard cacheCredential != "unavailable",
-              let cached = try? snapshotStore.read(host: cacheHost, credential: cacheCredential,
-                                                   workspace: group.id, membershipRevision: group.revision),
+    private func loadCached() async {
+        let host = cacheHost
+        let credential = cacheCredential
+        let workspaceID = group.id
+        let revision = group.revision
+        guard credential != "unavailable" else { return }
+        let store = await UnderstandingSnapshotStore.shared()
+        guard let cached = try? await store.read(host: host, credential: credential,
+                                                 workspace: workspaceID, membershipRevision: revision),
+              !Task.isCancelled, cacheHost == host, cacheCredential == credential,
+              group.id == workspaceID, group.revision == revision,
               let catalogBytes = cached.envelope.catalog, let componentsBytes = cached.envelope.components,
               let cachedCatalog = try? JSON.parse(catalogBytes), let cachedComponents = try? JSON.parse(componentsBytes) else { return }
         catalog = cachedCatalog
@@ -450,9 +462,12 @@ struct UnderstandingKnowledgeView: View {
         componentDetails = cached.envelope.componentDetails.compactMapValues { try? JSON.parse($0) }
         if let selected = componentDetails[selectedComponent] { detail = selected }
     }
-    private func clearCache() {
+    private func clearCache() async {
         guard cacheCredential != "unavailable" else { return }
-        try? snapshotStore.clear(host: cacheHost, credential: cacheCredential, workspace: group.id)
+        let host = cacheHost
+        let credential = cacheCredential
+        let store = await UnderstandingSnapshotStore.shared()
+        try? await store.clear(host: host, credential: credential, workspace: group.id)
         catalog = .null; index = []; detail = .null; componentDetails = [:]
     }
     private var routeBase: String { "/project-groups/\(group.id.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? group.id)/understanding" }

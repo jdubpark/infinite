@@ -48,10 +48,7 @@ const junit = (cases: Record<string, "passed" | "failed">): Buffer => Buffer.fro
     .map(([name, status]) => `<testcase name="${name}" classname="cls">${status === "failed" ? '<failure message="x"/>' : ""}</testcase>`)
     .join("")}</testsuite></testsuites>`,
 );
-/** The stored key of the case named `name` in the suite that `junit` writes. */
 const keyOf = (name: string): string => [...parseReport("junit", junit({ [name]: "passed" })).cases.keys()][0];
-
-// Pure rules.
 
 test("every round decides as the plan says", () => {
   const passBoth = parsed({ a: "passed", b: "passed" });
@@ -113,8 +110,6 @@ test("the argv cannot carry an option", () => {
   assert.deepEqual(restoreLists({ present: many, hiddenFiles: many, files: [], gradingPaths: [] }), { reject: "reference-too-wide" });
 });
 
-// Integration: a real store, and a scripted grader that records every operation.
-
 type Fixture = { store: EvidenceStore; root: string; close: () => void };
 function open(): Fixture {
   const root = mkdtempSync(join(tmpdir(), "infinite-eval-validate-"));
@@ -137,7 +132,6 @@ function insertTask(store: EvidenceStore, taskId: string, state: "candidate" | "
   });
 }
 
-/** A plain copy of the row: the store's rows have no prototype, which `deepStrictEqual` would compare. */
 function rowOf(store: EvidenceStore, taskId: string) {
   const row = store.read(db => db.get<{ state: string; reason: string | null; attempts: number }>(
     "SELECT state, reason, attempts FROM eval_tasks WHERE task_id=?", taskId));
@@ -164,12 +158,10 @@ function context(fx: Fixture, grader: Grader, over: Partial<ValidateContext> = {
 
 type Call = { op: string; dir?: string; argv?: readonly string[]; name?: string; report?: string; stdin?: string; at: number };
 type Script = {
-  /** Overrides the fields of a run's result, by its argv. */
   result?: (argv: readonly string[]) => Partial<GraderRun> | undefined;
   reports?: (report: string) => Buffer | undefined;
   digest?: () => { state: "read"; sha256: string } | { state: "missing" | "failed" };
   diff?: string;
-  /** The focused command never exits until `stop`. */
   hang?: boolean;
   onFocused?: () => void;
 };
@@ -349,7 +341,6 @@ test("a changed bundle is streamed again", async () => {
   try {
     insertTask(fx.store, TASK, "candidate");
 
-    // The digest differs once: the bundle is streamed a second time, then the digest matches and the clone runs.
     let digests = 0;
     const once = scripted({ digest: () => (digests++ === 0 ? { state: "read", sha256: "0".repeat(64) } : { state: "read", sha256: sha256(BUNDLE) }) });
     await validateTask(fx.store, TASK, context(fx, once.grader));
@@ -358,7 +349,6 @@ test("a changed bundle is streamed again", async () => {
     assert.equal(receives.length, 2, "a second receive");
     assert.ok(clone > receives[1], "the clone follows the second receive");
 
-    // The digest differs twice: bundle-missing, and no clone.
     const attemptsBefore = rowOf(fx.store, TASK)?.attempts;
     const twice = scripted({ digest: () => ({ state: "read", sha256: "0".repeat(64) }) });
     assert.deepEqual(await validateTask(fx.store, TASK, context(fx, twice.grader)), { kind: "environment", cause: "bundle-missing" });
@@ -415,8 +405,6 @@ test("a bundle over the limit is not streamed again for its job", async () => {
   try {
     const grader: Grader = { ...scripted().grader, receive: async () => "too-large" };
     const children: ChildProcess[] = [];
-    // A bundle the grader stopped reading would block on its full pipe, so the host must stop it. This one would
-    // end by itself after 3 seconds; a clean exit means the host waited instead of stopping it.
     const counted = (): ChildProcess => {
       const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 3_000)"], { stdio: ["ignore", "pipe", "ignore"] });
       children.push(child);
@@ -441,8 +429,6 @@ test("a bundle the grader refused unread ends even with its pipe full", async ()
   const children: ChildProcess[] = [];
   let timer: NodeJS.Timeout | undefined;
   try {
-    // The grader answers once the bundle's output waits unread, and reads none of it, so megabytes of the bundle stay
-    // in the pipe and its stream can only close if dropped.
     const grader: Grader = {
       ...scripted().grader,
       receive: async (_job, _name, input) => {
@@ -482,7 +468,6 @@ test("a decision keeps what an approval wrote during the task", async () => {
     };
     const at = "2026-11-16T10:30:00.000Z";
     let approved = false;
-    // An approval lands while the first focused test runs, then the rounds carry on as in a valid run.
     const { grader } = scripted({
       reports: name => reports[name],
       onFocused: () => {
@@ -579,7 +564,6 @@ test("a row that changed meanwhile is not written", async () => {
   const fx = open();
   try {
     insertTask(fx.store, TASK, "candidate");
-    // The owner retires the task while the focused test runs. The round is then undecided, so the decision must not write.
     const { grader } = scripted({
       onFocused: () => fx.store.write(tx => tx.run("UPDATE eval_tasks SET state='retired', reason='owner-retired' WHERE task_id=?", TASK)),
     });

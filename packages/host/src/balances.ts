@@ -12,7 +12,7 @@ export class BalanceService {
   private closed = false;
   constructor(private readonly accounts: UsageConfig["accounts"], private readonly fetchImpl: typeof fetch = fetch, private readonly now = () => Date.now()) {
     for (const [id, account] of Object.entries(accounts)) if (account.balance?.source === "deepseek") {
-      try { this.keys.set(id, readFileSync(account.balance.apiKeyFile, "utf8").trim()); } catch { /* unavailable keys leave balances unavailable */ }
+      try { this.keys.set(id, readFileSync(account.balance.apiKeyFile, "utf8").trim()); } catch {}
     }
   }
   get(accountId: string): Balance { const value = this.values.get(accountId); return value ? { ...value } : null; }

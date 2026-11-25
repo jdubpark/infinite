@@ -20,7 +20,6 @@ import { hostEntryIds, hostEntryRun } from "./fixtures/host-entry-run.js";
 const MARKER = "entry-marker-7f3a";
 const TOKEN = `hook-${randomBytes(16).toString("hex")}`;
 const URL_OWN = "http://127.0.0.1:41234/hook";
-/** A credential the host issued to the session, with no known shape. */
 const ISSUED = randomBytes(32).toString("hex");
 const SIZES = { launchSeq: 0, promptBytes: 1200, contextBytes: 4000 };
 const at = (minute: number) => `2026-11-13T10:${String(minute).padStart(2, "0")}:00.000Z`;
@@ -87,7 +86,6 @@ function bindingOf(member: TeamMember) {
   return { runId: member.runId, memberId: member.memberId, revision: member.revision };
 }
 
-/** A plain post request for `member`, with its identity as the requestId. */
 function postRequest(member: TeamMember, entry: MemberEntryPost, extra: Record<string, unknown> = {}): Record<string, unknown> {
   const binding = bindingOf(member);
   return { op: "post", ...binding, requestId: memberEntryId(binding, entry), entry, ...extra };
@@ -101,7 +99,6 @@ function getRequest(member: TeamMember, entryId: string): Record<string, unknown
   return { op: "get", ...bindingOf(member), entryId };
 }
 
-/** Stores one member post through the host check, and returns its entry id. */
 function ingestPost(board: Blackboard, run: TeamRun, member: TeamMember, entry: MemberEntryPost): string {
   const requestId = memberEntryId(bindingOf(member), entry);
   const record: MemberPostRecord = { seq: 0, at: at(10), envelope: { op: "post", ...bindingOf(member), requestId, entry } };
@@ -109,7 +106,6 @@ function ingestPost(board: Blackboard, run: TeamRun, member: TeamMember, entry: 
   return requestId;
 }
 
-/** A fresh store and board with the fixture run mirrored and implA's launch recorded. */
 function world(options: { checkOutput?: string } = {}): World {
   const root = mkdtempSync(join(tmpdir(), "infinite-entry-route-"));
   const path = evidenceDatabasePath(join(root, "state"));
@@ -156,7 +152,6 @@ function world(options: { checkOutput?: string } = {}): World {
   };
 }
 
-/** The refusal a call gives. The appended list must not change. */
 function refused(h: Harness, body: unknown): { status: number; text: string } {
   const before = h.appended.length;
   try {
@@ -232,7 +227,6 @@ test("refusals are fixed and carry no member text", () => {
     h.flags.reported = true;
     check(refused(h, postRequest(implA, contract(MARKER))), 409, ENTRY_REFUSALS["entry-closed"]);
     h.flags.reported = false;
-    // A handoff body of about 16 KiB: the schema refuses it, and the body size decides the status.
     check(refused(h, { op: "post", ...bindingOf(implA), requestId: randomUUID(), entry: {
       kind: "handoff", summary: "big", paths: [], taskId: "a",
       body: { done: Array.from({ length: 12 }, () => "d".repeat(500)), remaining: Array.from({ length: 12 }, () => "r".repeat(500)), notes: `${MARKER}${"n".repeat(3900)}`, commands: [] },
@@ -242,7 +236,6 @@ test("refusals are fixed and carry no member text", () => {
     check(refused(h, postRequest(implA, contract(MARKER, { taskId: "b" }))), 403, ENTRY_REFUSALS["entry-task-forbidden"]);
     const token = `gh${"p_"}${"a".repeat(36)}`;
     check(refused(h, postRequest(implA, contract(`${MARKER} ${token}`))), 422, "entry-secret at entry.summary: this field looks like an access token. Remove it and post again.");
-    // What the host issues to a session: its own credential by value, and a GitHub grant or an egress password by shape.
     const grant = mintGithubGrant(randomBytes(32), { sub: "session", sid: "session-1", project: "project-1", repo: "owner/repository", ops: ["fetch"] });
     const proxy = egressCredential(randomBytes(32), "project-1", "session-1", Math.floor(Date.now() / 1000) + 3600);
     const inChange = (value: string) => postRequest(implA, memberEntryPostSchema.parse({ kind: "contract", summary: "ok", paths: [], body: { interface: "Shared route", change: `${MARKER} ${value}` } }));
@@ -307,7 +300,6 @@ test("reads follow the member's scope", () => {
     const implB = memberOf(w.run, hostEntryIds.implB);
     const addressed = ingestPost(w.board, w.run, implB, contract("C route", { paths: ["src/a/api.ts"] }));
 
-    // A second run with its own entries, in the same store, before any list is read.
     const otherRun = { ...entryRun(), id: randomUUID() };
     otherRun.members = otherRun.members.map(member => ({ ...member, runId: otherRun.id }));
     assert.equal(w.board.mirror(otherRun), true);
@@ -366,7 +358,6 @@ test("a forged or replaced binding is refused", () => {
     assert.deepEqual(refused(off, listRequest(implA)), { status: 403, text: ENTRY_REFUSALS["entry-tools-off"] });
     assert.deepEqual(refused(off, getRequest(implA, randomUUID())), { status: 403, text: ENTRY_REFUSALS["entry-tools-off"] });
 
-    // A member that is not running, and one that has reported, both get the closed answer on every entry call.
     h.flags.running = false;
     assert.deepEqual(refused(h, postRequest(implA, entry)), { status: 409, text: ENTRY_REFUSALS["entry-closed"] });
     assert.deepEqual(refused(h, listRequest(implA)), { status: 409, text: ENTRY_REFUSALS["entry-closed"] });

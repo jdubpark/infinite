@@ -6,7 +6,6 @@ import { Button } from "../../components/Button";
 import { theme } from "../../theme";
 import { combineLabel } from "./model";
 
-/** One suggested combination with its Combine control. The host creates the owner project on confirm. */
 export function CombineRow({ connection, suggestion, groups, onCombined, onError }: {
   connection: Connection; suggestion: ProjectGroupSuggestion; groups: ProjectGroup[];
   onCombined: () => void; onError: (message: string) => void;

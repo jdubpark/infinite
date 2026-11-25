@@ -41,11 +41,6 @@ const OSC_APPROVAL = ["approval requested", "codex: approval requested"];
 const OSC_QUESTION = ["question", "codex: question"];
 const OSC_TURN_END = ["turn complete", "codex: turn complete"];
 
-/**
- * OSC 9 notification text emitted by the Codex TUI. Only text that starts with one of the known
- * phrases (case-insensitive) opens a prompt or ends a turn; anything else is a plain notice.
- * The exact wording is unconfirmed until spike S2 captures it.
- */
 export function mapCodexOsc(text: string): Signal[] {
   if (typeof text !== "string") return [];
   const t = text.trim();

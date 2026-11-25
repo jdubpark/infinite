@@ -7,7 +7,6 @@ export class CmuxError extends Error {
   }
 }
 
-/** No shell is involved. A failed mutation is never automatically retried. */
 export function execute(command: string, args: string[], timeout = 8000): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(command, args, { timeout, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" }, (error, stdout, stderr) => {
@@ -41,7 +40,6 @@ export class CmuxClient {
     let value: Json;
     try { value = object(JSON.parse(raw)); }
     catch { throw new CmuxError("cmux-unavailable", "cmux returned an invalid response"); }
-    // CLI versions either return the result or the socket response envelope.
     if (value.ok === false) throw new CmuxError(string(value.error?.code) ?? "cmux-error", "cmux refused the operation");
     return value.ok === true && value.result !== undefined ? object(value.result) : value;
   }

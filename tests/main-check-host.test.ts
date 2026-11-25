@@ -12,18 +12,9 @@ import { inProcessHost, waitFor, type ApiResponse } from "./helpers.js";
 import { earlierProcesses } from "./main-check-earlier.js";
 import { git } from "./team-fixture.js";
 
-/*
- * The main check end to end through the real createApp (INF-388): a GitHub-mode project whose remote is a local bare
- * repository, the owner's refresh route, the real mirror fetch and onMirror, the real service on its default ports,
- * the owner's read route behind the real role check, a Notifier built as cli.ts builds it, and closeConnections.
- * No command prefix and no network.
- */
-
 const PROJECT = "alpha";
 const WAIT_MS = 20_000;
 const CASE = { timeout: 60_000 };
-// createApp builds the service on its default ports, so a case that waits for a copy to be removed cannot pass on an
-// account with processes the census cannot inspect (main-check-earlier.ts). It is skipped there, with the reason.
 const UNINSPECTED = (await earlierProcesses()).size;
 const REMOVES_A_COPY = UNINSPECTED === 0 ? CASE : { ...CASE, skip: `this account has ${UNINSPECTED} process(es) the census cannot inspect, so a main check here removes no copy while they run (docs/teams.md, Main check, limits)` };
 const COMMIT = ["-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-q", "-m"];
@@ -38,7 +29,6 @@ function gone(pid: number): boolean {
   }
 }
 
-/** A host from createApp whose one project follows `remote.git` on GitHub terms, with the main check switched on. */
 async function mainCheckHost(files: Record<string, string>, checks: (root: string) => TeamCommand[]) {
   let source = "";
   let remote = "";
@@ -62,7 +52,6 @@ async function mainCheckHost(files: Record<string, string>, checks: (root: strin
       }];
       config.source = { remoteOverrides: { [PROJECT]: remote } };
       config.teams = { workspaceDir: join(root, "teams"), storageFloor: { inodes: 0, bytes: 0 } };
-      // The endpoint is never reached: the test hands the Notifier its own sender.
       config.push = { enabled: true, endpoint: "https://push.example.invalid/send", detail: "minimal", events: ["main-check"] };
     },
   });
@@ -73,14 +62,12 @@ async function mainCheckHost(files: Record<string, string>, checks: (root: strin
     root,
     teams: join(root, "teams"),
     head: () => git(source, "rev-parse", "HEAD"),
-    /** A new commit on main, pushed to the remote; the host sees it on its next fetch. */
     push(change: () => void) {
       change();
       git(source, "add", "-A");
       git(source, ...COMMIT, "next");
       git(source, "push", "-q", remote, "HEAD:refs/heads/main");
     },
-    /** The owner's refresh: the host fetches the mirror, and onMirror reports the head. */
     async refresh() {
       const response = await host.fetchApi(`/projects/${PROJECT}/source/refresh`, "owner", {});
       assert.equal(response.status, 200, JSON.stringify(response.body));
@@ -135,8 +122,6 @@ test("a real Notifier tells the owner main is failing, then that it passes again
     };
     const { sessions, pushStore, teams, goals, fuse, permissions, mainCheck } = h.host;
     const push = h.host.config.push!;
-    // As cli.ts builds it from the same configuration; the sender and the volume sampler stand in (host-storage is off),
-    // and the test ticks it instead of starting its timer.
     const notifier = new Notifier(sessions, pushStore, sender, { detail: push.detail, events: push.events, intervalMs: 2000, machineId: h.host.config.machine?.id }, teams, goals, { sample: async () => [] }, fuse, permissions, mainCheck);
     const first = h.head();
     await h.refresh();
@@ -176,7 +161,6 @@ test("closeConnections resolves only after the main check closed: a real sleep i
     assert.equal(h.record().running?.head, h.head());
     assert.equal(gone(pid), false, "the sleep runs");
     await h.host.closeConnections();
-    // Read at once: what closeConnections waited for is on disk when it resolves.
     const record = h.record();
     assert.equal(record.running, undefined);
     assert.equal(record.last?.outcome, "interrupted");
@@ -185,7 +169,7 @@ test("closeConnections resolves only after the main check closed: a real sleep i
     assert.equal(gone(pid), true, "the sleep was ended with its check");
   } finally {
     if (pid !== undefined && !gone(pid)) {
-      try { process.kill(-pid, "SIGKILL"); } catch { /* Already gone. */ }
+      try { process.kill(-pid, "SIGKILL"); } catch { }
     }
     await new Promise<void>(resolve => h.host.server.close(() => resolve()));
     rmSync(h.root, { recursive: true, force: true });

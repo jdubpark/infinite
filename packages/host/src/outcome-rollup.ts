@@ -3,8 +3,6 @@ import { SOURCES, buildCells, isMetered, type Cell, type CostLookup } from "./ou
 import type { Disposition } from "./outcome-rules.js";
 import type { RunSummaryCounts } from "./run-events.js";
 
-/** Pure roll-up rules. No I/O, no clock, no module state. */
-
 export type RollupTarget = { kind: "goal" | "mission"; id: string };
 export type GoalAssessment = { result: "achieved" | "not-achieved" | "inconclusive"; at: string; revision: number };
 export type RollupCost = { sessions: number; complete: number; noSession: number; tokens: number | null; spentUsd: number | null };
@@ -24,7 +22,6 @@ const COUNT_KEYS: readonly (keyof RunSummaryCounts)[] = [
   "decisionsByCoordinator", "steering", "permissionEscalations", "continuations",
 ];
 
-/** The newest entry of a goal's outcomes, in time order, with its numbers only. The text stays with the goal view. */
 export function latestAssessment(outcomes: readonly GoalAssessment[]): GoalAssessment | null {
   const last = outcomes.at(-1);
   if (last === undefined) return null;
@@ -87,10 +84,6 @@ function attemptsOf(rows: readonly OutcomeRow[]): Partial<Record<Disposition, nu
   return attempts;
 }
 
-/**
- * Cost per distinct session. A session counts only when the lookup gives a complete cost, and it adds spend only when
- * one of its rows or member results has a metered provider. Sums are null when they summed nothing.
- */
 function costOf(rows: readonly OutcomeRow[], members: readonly MemberResultRow[], lookup?: CostLookup): RollupCost {
   const metered = new Map<string, boolean>();
   let noSession = 0;
@@ -127,7 +120,6 @@ function costOf(rows: readonly OutcomeRow[], members: readonly MemberResultRow[]
   };
 }
 
-/** Builds a roll-up from the records of one target's runs. Levels come from `buildCells`, one counting rule. */
 export function buildRollup(
   records: RollupRecords,
   context: { target: RollupTarget; known: boolean; assessment: GoalAssessment | null; cost?: CostLookup },
@@ -149,7 +141,6 @@ export function buildRollup(
   };
 }
 
-/** True when the host holds no record of the target and the ledger no run of it. The route answers 404. */
 export function rollupMissing(rollup: OutcomeRollup): boolean {
   return !rollup.known && rollup.runs.total === 0;
 }

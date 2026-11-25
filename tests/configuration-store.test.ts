@@ -76,7 +76,6 @@ function configuredEvent(memberId: string, at: string, data: Record<string, unkn
   };
 }
 
-/** The outbox with the configurations projector registered. The module must already be registered. */
 function setupOutbox(store: EvidenceStore): EventOutbox {
   const outbox = new EventOutbox(store);
   outbox.registerProjector(configurationProjector());
@@ -133,13 +132,11 @@ test("a configured member records its configuration once", () => {
 });
 
 test("a profile field may be absent or null", () => {
-  // A member with no model and no effort: the emitter leaves both out, and another emitter may send null.
   const absent = configuredData({}, { model: null, effort: null });
   delete absent.model;
   delete absent.effort;
   const nulls = configuredData({}, { model: null, effort: null });
   const expected = configId(components({ model: null, effort: null }));
-  // Each form is stored on its own, in an empty store, so neither passes on the other's row.
   for (const [name, data] of [["absent", absent], ["null", nulls]] as const) {
     const f = fixture();
     let store: EvidenceStore | undefined;
@@ -157,7 +154,6 @@ test("a profile field may be absent or null", () => {
       f.close();
     }
   }
-  // Both forms name one configuration.
   const f = fixture();
   let store: EvidenceStore | undefined;
   try {
@@ -279,8 +275,6 @@ test("an epoch never starts before the one before it", () => {
     store.register(configurationModule());
     const identity = profileIdentityKey(PROFILE);
     advanceEpoch(store, { profile: PROFILE, requestId: "77777777-7777-4777-8777-777777777777", now: "2026-11-10T00:00:00.000Z" });
-    // The clock stepped back. The new epoch starts with the one before it, never ahead of it, so that earlier
-    // epoch is in effect for no time and the newest one is in effect from then on.
     const next = advanceEpoch(store, { profile: PROFILE, requestId: "88888888-8888-4888-8888-888888888888", now: "2026-11-09T00:00:00.000Z" });
     assert.equal(next.epoch, 3);
     assert.equal(next.since, "2026-11-10T00:00:00.000Z");
@@ -297,7 +291,6 @@ test("a module that is not ready is unavailable", () => {
   let store: EvidenceStore | undefined;
   try {
     store = open(f);
-    // The module was never registered, as when its migration failed.
     assert.throws(
       () => advanceEpoch(store!, { profile: PROFILE, requestId: "99999999-9999-4999-8999-999999999999", now: "2026-11-01T00:00:00.000Z" }),
       (error: unknown) => error instanceof EvidenceError && error.code === "unavailable",
@@ -315,7 +308,6 @@ test("a long model name is stored", () => {
     store = open(f);
     store.register(configurationModule());
     const outbox = setupOutbox(store);
-    // An OpenCode model name may hold 180 characters.
     const model = `vendor/${"m".repeat(173)}`;
     assert.equal(model.length, 180);
     outbox.flush([configuredEvent("member-long", "2026-11-13T01:00:00.000Z", configuredData({}, { model }))]);

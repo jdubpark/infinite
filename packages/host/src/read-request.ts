@@ -3,13 +3,8 @@ import { Buffer } from "node:buffer";
 import { z } from "zod";
 import { ownedPathSchema, taskIdSchema, teamEvidenceSchema } from "./team-types.js";
 
-// Part 2 of the read-pools design: request and result shapes.
-// Part 3: the pure validator, run again by the host before launch.
-
 const NOTE_BYTES = 240;
 
-// PROPOSED: a reference is at most 2,048 characters, and evidence:N names an item from 1 to 9999; the
-// design states neither. The bound aborts, so an over-long reference gets one error, not two.
 const sourceRef = z.string().max(2048, { abort: true }).refine(value => {
   if (/^evidence:[1-9]\d{0,3}$/.test(value)) return true;
   if (/\s/.test(value)) return false;
@@ -41,7 +36,7 @@ export type ReadStep = z.infer<typeof readStepSchema>;
 export const readRequestSchema = z.strictObject({
   kind: z.literal("read"),
   summary: z.string().trim().min(1).max(2000),
-  concurrency: z.number().int().min(1).max(8).optional(), // at most the largest listConcurrency (part 1)
+  concurrency: z.number().int().min(1).max(8).optional(),
   phases: z.array(z.strictObject({
     id: taskIdSchema,
     steps: z.array(readStepSchema).min(1).max(6),
@@ -63,9 +58,6 @@ const resultBase = {
   notes: readNotesSchema.optional(),
 };
 
-// PROPOSED: the design bounds the result lists but not these strings: the list and locations summaries
-// (4,000, as today's findings), key 120, title 200, source 1,000, path 512, 16 symbols of 200, role 240,
-// and a verdict's criterion 1,000.
 const listItemSchema = z.strictObject({
   key: z.string().trim().min(1).max(120),
   title: z.string().trim().min(1).max(200),
@@ -110,30 +102,20 @@ export type ReadResult = z.infer<typeof readResultSchema>;
 const count = (max: number) => z.number().int().min(0).max(max);
 const setting = (max: number) => z.number().int().min(1).max(max);
 
-// PROPOSED: the host fills the grant within these caps (64 profiles, 64 outside profiles, 256 active
-// steps, 100 requests sent), and a grant outside them refuses every read as a host fault. An absent
-// lineage refuses every source step, and an absent reservation refuses a scout lead's request.
 export const readGrantSchema = z.strictObject({
   requester: z.enum(["project-manager", "scout-lead", "reader", "quarantined-reader"]),
   poolOn: z.boolean(),
   profiles: z.array(taskIdSchema).max(64),
   routerCoversScout: z.boolean(),
-  // Part 1 settings table: the ranges a run may pin.
   limits: z.strictObject({
     concurrency: setting(5),
     listConcurrency: setting(8),
     requestAttempts: setting(40),
     outside: z.boolean(),
   }),
-  // The run's read allowance after reservations, at most runAttempts (0 to 200). A project manager's
-  // request is charged to it. PROPOSED: the grant's allowanceLeft excludes every scout lead's reservation.
   allowanceLeft: count(200),
-  // Scout lead only, at most lead.maxAttempts (12): what remains of the attempts the host reserved for
-  // this lead at admission. Part 5: a scout lead's request and its own second attempt are funded by
-  // its reservation alone.
   reservation: count(12).optional(),
   outsideProfiles: z.array(taskIdSchema).max(64),
-  // Set by the host. The validator only reads it.
   lineage: z.strictObject({
     state: z.enum(["extends", "new", "capped"]),
     uncleared: z.array(z.strictObject({ runId: z.uuid(), head: z.string().regex(/^[0-9a-f]{40,64}$/) })).max(3),
@@ -144,8 +126,6 @@ export const readGrantSchema = z.strictObject({
 export type ReadGrant = z.infer<typeof readGrantSchema>;
 
 export type ReadErrorCode =
-  // PROPOSED: the design's table has no code for a request whose shape is wrong. A parse issue is
-  // over-ceiling only on the table's list (CEILING_PATHS); every other parse issue is malformed.
   | "malformed"
   | "not-granted"
   | "unknown-profile"
@@ -168,11 +148,6 @@ export type ReadRequestResult =
   | { ok: true; total: number; phases: number[]; keys: Record<string, string> }
   | { ok: false; errors: ReadRequestError[] };
 
-/**
- * Part 2: a step's key ignores profile, id, title and effort, so the same work is recognized however it is labelled.
- * PROPOSED: paths and refs count as sets, so order and repeats do not change the key; the design says only
- * "sorted paths" and "source refs". The step is never mutated.
- */
 export function stepKey(step: ReadStep): string {
   const instructions = step.instructions.replace(/\s+/g, " ").trim().toLowerCase();
   const paths = [...new Set(step.paths ?? [])].sort();
@@ -181,10 +156,6 @@ export function stepKey(step: ReadStep): string {
   return createHash("sha256").update(material).digest("hex");
 }
 
-/**
- * Part 3: a step costs its forEach maxItems times its lead attempts (1 plus maxAttempts); each defaults to 1.
- * PROPOSED: a step with both forEach and lead costs the product; the design gives each factor alone.
- */
 export function expandedTotal(request: ReadRequest): { total: number; phases: number[] } {
   const phases = request.phases.map(phase => phase.steps.reduce((sum, step) => sum + stepCost(step), 0));
   return { total: phases.reduce((sum, count) => sum + count, 0), phases };
@@ -203,11 +174,6 @@ function locate(request: ReadRequest): LocatedStep[] {
     phase.steps.map((step, stepIndex) => ({ step, phase: phaseIndex, path: `phases[${phaseIndex}].steps[${stepIndex}]` })));
 }
 
-/**
- * Parses the grant (an invalid one is a host fault), then the request (one error per schema issue, and
- * no rule runs), then returns every rule violation in one pass, so the member fixes the request once.
- * Never throws for any JSON value.
- */
 export function validateReadRequest(requestInput: unknown, grantInput: unknown): ReadRequestResult {
   const parsedGrant = readGrantSchema.safeParse(grantInput);
   if (!parsedGrant.success) {
@@ -227,7 +193,6 @@ export function validateReadRequest(requestInput: unknown, grantInput: unknown):
   const isLead = grant.requester === "project-manager";
 
   if (!grant.poolOn) {
-    // Acceptance 15: the pool may be off because the evidence store was unavailable, so the text names explore.
     errors.push(error("not-granted", "request", "The read pool is not available for this run.",
       "Send an explore report instead; it runs as before."));
   }
@@ -261,8 +226,6 @@ export function validateReadRequest(requestInput: unknown, grantInput: unknown):
       errors.push(error("not-granted", `${path}.lead`, "An outside-content step cannot be a lead.",
         "Remove lead, or remove source from this step."));
     }
-    // PROPOSED: part 11 gives a verifier an artifact-only context and a quarantined reader only its
-    // brief, with no clone and no entries. One step cannot be both.
     if (step.verify && step.source) {
       errors.push(error("not-granted", `${path}.source`, "A verifier step cannot read outside content.",
         "Remove source from the verifier step, or remove verify."));
@@ -290,7 +253,6 @@ export function validateReadRequest(requestInput: unknown, grantInput: unknown):
           errors.push(error("forward-reference", forEachPath, `forEach names "${step.forEach.step}", whose output is ${target.step.output}, not list.`,
             "Name a step whose output is list."));
         }
-        // PROPOSED: the design gives no total for a forEach over a forEach; the phase engine refuses it at admission as well.
         if (target.step.forEach) {
           errors.push(error("forward-reference", forEachPath, `forEach names "${step.forEach.step}", which is itself a forEach step, not one list.`,
             "Name a list step that has no forEach."));
@@ -341,8 +303,6 @@ export function validateReadRequest(requestInput: unknown, grantInput: unknown):
     }
   }
 
-  // The request-level value is accepted against the list ceiling when any phase has forEach. The
-  // scheduler must still hold a phase without forEach to the concurrency setting (part 1).
   const hasListFanout = steps.some(({ step }) => step.forEach !== undefined);
   if (request.concurrency !== undefined) {
     const cap = hasListFanout ? grant.limits.listConcurrency : grant.limits.concurrency;
@@ -357,9 +317,6 @@ export function validateReadRequest(requestInput: unknown, grantInput: unknown):
       `The expanded request is ${total} steps; the per-request limit is ${grant.limits.requestAttempts}.`,
       `Cut the steps or maxItems so the expanded total is ${grant.limits.requestAttempts} or less.`), limit: "request" });
   }
-  // Part 5: the host reserved a scout lead's attempts from the run's allowance at admission, so its
-  // request and its own second attempt are charged to the reservation alone. The per-request
-  // ceiling above counts only the request's own steps.
   if (grant.requester === "scout-lead") {
     const reservation = grant.reservation ?? 0;
     if (total + 1 > reservation) {
@@ -387,32 +344,20 @@ function sendAtMost(room: number): string {
 type RequestIssue = z.ZodError["issues"][number];
 const KEY = /^[A-Za-z][A-Za-z0-9]*$/;
 
-/** Renders an issue path the way the rule paths are written; a root issue is at `request`. */
 function issuePath(path: readonly PropertyKey[]): string {
   if (path.length === 0) return "request";
   return path.map((part, index) => (typeof part === "number" ? `[${part}]`
     : `${index === 0 ? "" : "."}${typeof part === "string" && KEY.test(part) ? part : "?"}`)).join("");
 }
 
-// Part 3's table puts too many phases or steps, and maxItems, concurrency or a lead's maxAttempts above
-// its bound, under over-ceiling. Paths are written with # for an array index; the value says what the
-// field must be for its size to count.
 const CEILING_PATHS = new Map<string, "list" | "number">([["phases", "list"], ["phases.#.steps", "list"],
   ["phases.#.steps.#.forEach.maxItems", "number"], ["concurrency", "number"], ["phases.#.steps.#.lead.maxAttempts", "number"]]);
 
-/**
- * A value of the wrong type gets one error. The schema library also reports a size issue for it (a
- * string where a list belongs has a length), which names nothing the member can fix.
- */
 function ownIssues(issues: RequestIssue[]): RequestIssue[] {
   const wrongType = new Set(issues.filter(issue => issue.code === "invalid_type").map(issue => JSON.stringify(issue.path)));
   return issues.filter(issue => issue.code === "invalid_type" || !wrongType.has(JSON.stringify(issue.path)));
 }
 
-/**
- * A too-big list or number on its own CEILING_PATHS field is over-ceiling; every other parse issue is
- * malformed. The text names schema keys and bounds only, never a value taken from the request.
- */
 function issueError(issue: RequestIssue): ReadRequestError {
   const path = issuePath(issue.path);
   const shape = issue.path.map(part => (typeof part === "number" ? "#" : String(part))).join(".");
@@ -458,10 +403,6 @@ function issueText(issue: RequestIssue, subject: string): [string, string] {
   }
 }
 
-/**
- * One line per error, then the sentence that tells the member a refusal is recoverable. The size of the
- * 409 body returned to a member is the host slice's decision.
- */
 export function refusalText(errors: ReadRequestError[]): string {
   const lines = errors.map(item => `- ${item.path}: ${item.message} Fix: ${item.fix}`);
   return [

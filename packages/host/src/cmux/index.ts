@@ -50,7 +50,6 @@ const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
 const cleanTitle = (value: string) => value.replace(/^[^\p{L}\p{N}]+\s+/u, "").trim().slice(0, 160);
 const now = () => new Date().toISOString();
 
-/** An adapter for independently managed cmux terminals. */
 export class CmuxSessions {
   private readonly client: CmuxClient;
   private readonly directory: string;
@@ -91,8 +90,6 @@ export class CmuxSessions {
     const result = new Promise<T>((resolve, reject) => {
       queue.push(async () => {
         try {
-          // Abandoned polling must not keep adding subprocess work. Mutations
-          // retain their admission and perform their own fresh safety checks.
           if (observation && Date.now() - queuedAt > OBSERVATION_WAIT_MS) throw new CmuxError("cmux-busy", "The observation expired while cmux was busy. Refresh to reconnect.");
           resolve(await operation());
         } catch (error) { reject(error); }
@@ -157,7 +154,6 @@ export class CmuxSessions {
     }).sort((a, b) => b.root.length - a.root.length)[0];
   }
 
-  /** Keep a discovered native conversation inside the project identity it first received. */
   private boundProject(record: Stored, cwd: string) {
     const configured = this.config.projects.find((project) => project.id === record.session.projectId);
     if (!configured) return undefined;
@@ -165,8 +161,6 @@ export class CmuxSessions {
     try { root = realpathSync(configured.path); } catch { return undefined; }
     if (record.session.projectRoot && record.session.projectRoot !== root) return undefined;
     if (!record.session.projectRoot) {
-      // Without a saved root, only a historical root-level cwd proves the old
-      // binding. A nested cwd could have crossed into a newly broadened root.
       if (record.session.cwd !== root) return undefined;
       record.session.projectRoot = root;
     }
@@ -208,7 +202,6 @@ export class CmuxSessions {
     const surface = hook.surfaceId ? this.tree.get(hook.surfaceId) : undefined;
     const newest = hook.surfaceId ? active.get(hook.surfaceId) : undefined;
     let record = this.nativeRecord(hook.provider, hook.nativeId);
-    // A launch receives its provider-native identity once its first hook arrives.
     record ??= [...this.records.values()].find((candidate) => !candidate.nativeId && candidate.surfaceId === hook.surfaceId && candidate.session.provider === hook.provider && hook.updatedAt >= (candidate.launchedAt ?? 0) - 1000);
     record ??= hook.cwd ? this.newRecord(hook.provider, hook.cwd, surface?.title ?? basename(hook.cwd)) : undefined;
     if (!record) return;
@@ -234,8 +227,6 @@ export class CmuxSessions {
       record.lifecycle = hook.lifecycle;
       record.session.title = cleanTitle(surface.title) || record.session.title;
     } else if (record.surfaceId === hook.surfaceId && newest && newest !== hook) {
-      // A new conversation now owns this surface. Keep the old transcript, never
-      // redirect the old session's remote input to the replacement conversation.
       record.surfaceId = undefined;
       record.workspaceId = undefined;
       record.pid = undefined;
@@ -262,7 +253,6 @@ export class CmuxSessions {
     const hooks = readHooks(this.config.cmux.hooksDir ?? join(homedir(), ".cmuxterm"));
     const active = new Map<string, HookSession>();
     for (const hook of hooks) if (hook.surfaceId && (!active.has(hook.surfaceId) || active.get(hook.surfaceId)!.updatedAt < hook.updatedAt)) active.set(hook.surfaceId, hook);
-    // Pending launches claim their native IDs before Vault adds history rows.
     for (const hook of hooks) this.mergeHook(hook, active);
     if (vault.status === "fulfilled") for (const row of array(vault.value.sessions)) {
       if (!["claude", "codex"].includes(row.agent) || !string(row.session_id) || !string(row.cwd)) continue;
@@ -277,9 +267,6 @@ export class CmuxSessions {
       record.nativeId = row.session_id;
       record.transcript = string(row.file) ?? record.transcript;
     }
-    // Every record already holds the hook and Vault changes merged above, and the next refresh's snapshot would hide
-    // them, so one record's failed journal append or save must not cost the others their saves. The first failure is
-    // thrown once every record is observed.
     let failure: { error: unknown } | undefined;
     for (const record of this.records.values()) {
       const surface = record.surfaceId ? this.tree.get(record.surfaceId) : undefined;
@@ -289,8 +276,6 @@ export class CmuxSessions {
       let unreadable = false;
       if (record.session.id === screenId && live) {
         try {
-          // A lines argument enables scrollback on some cmux versions. Read the
-          // current viewport so an old dialog in history cannot authorize input.
           const screen = await this.client.rpc("surface.read_text", { surface_id: record.surfaceId, workspace_id: record.workspaceId, scrollback: false });
           if (typeof screen.text !== "string") throw new CmuxError("snapshot-unavailable");
           if (screen.surface_id && screen.surface_id !== record.surfaceId || screen.workspace_id && screen.workspace_id !== record.workspaceId) throw new CmuxError("snapshot-unavailable");
@@ -300,8 +285,6 @@ export class CmuxSessions {
             record.columns = replay.columns;
             record.rows = replay.rows;
           }
-          // Protect a person's unfinished local prompt when chat sends a new
-          // instruction. Dim placeholder spans are not text the person typed.
           const grid = replay?.render_grid;
           const cursorRow = grid?.cursor?.row;
           const styles = array(grid?.styles);
@@ -318,14 +301,11 @@ export class CmuxSessions {
         } catch { unreadable = true; }
       }
       try {
-        // Failure to refresh native Feed must never erase a known unanswered approval.
         if (unreadable || feed.status === "rejected" && record.prompt?.feed) this.observe(record, "unavailable");
         else {
           const nativeFeed = matchingFeed(this.feed, { provider: record.session.provider as CmuxProvider, nativeId: record.nativeId, surfaceId: record.surfaceId });
           this.observe(record, status, status === "running" ? pendingPrompt(record.session.provider as CmuxProvider, record.screen, nativeFeed) : undefined);
         }
-        // Compared with the record before this refresh, on every path: observe() saves only what it changes itself, and
-        // in a lasting outage it changes nothing, so a hook or Vault change merged above is saved here.
         if (JSON.stringify(record) !== previous.get(record.session.id)) this.save(record);
       } catch (error) { failure ??= { error }; }
     }
@@ -340,10 +320,7 @@ export class CmuxSessions {
     record.session.status = status;
     if (status !== "running" && status !== "starting") {
       record.controller = undefined;
-      // An outage is not evidence that an authenticated Feed decision closed.
-      // Keep it latched in durable state until a successful observation resolves it.
       if (status !== "unavailable" || !record.prompt?.feed) record.prompt = undefined;
-      // Entering the state records its time once; a later observation of the same state changes nothing, so a listing reads the same.
       if (record.attention.state !== status) record.attention = applyLifecycle(record.attention, status as "exited" | "unavailable" | "recording-error", at);
     } else {
       if (pending?.fingerprint !== record.prompt?.fingerprint) {
@@ -356,14 +333,52 @@ export class CmuxSessions {
       } else if (pending && record.prompt) record.prompt = { ...pending, id: record.prompt.id };
       const attentionState = record.prompt || record.lifecycle === "needsInput" ? "needs-you"
         : record.lifecycle === "idle" ? "idle" : "working";
-      record.attention = {
-        ...record.attention, state: attentionState, source: record.prompt?.prompt.source ?? "lifecycle",
+      const base = {
         since: record.attention.state === attentionState ? record.attention.since : at,
-        prompt: record.prompt ? { ...record.prompt.prompt, id: record.prompt.id } : undefined,
-        now: record.prompt ? record.prompt.prompt.title : record.lifecycle === "needsInput" ? "Input requested in cmux"
-          : record.lifecycle === "idle" ? "Waiting for your direction" : "cmux session is connected",
-        lastMessage: record.lastMessage, hooks: record.hookAt ? "active" : "none", sawTurnEnd: false,
+        lastActivityAt: record.attention.lastActivityAt,
+        lastMessage: record.lastMessage,
+        hooks: (record.hookAt ? "active" : "none") as "active" | "none",
+        hookErrors: record.attention.hookErrors,
+        ...(record.attention.limit ? { limit: record.attention.limit } : {}),
+        sawTurnEnd: false,
       };
+      if (record.prompt) {
+        record.attention = {
+          ...base,
+          state: "needs-you",
+          source: record.prompt.prompt.source,
+          prompt: { ...record.prompt.prompt, id: record.prompt.id },
+          now: record.prompt.prompt.title,
+          ...(record.attention.lastTool ? { lastTool: record.attention.lastTool } : {}),
+        };
+      } else if (record.lifecycle === "needsInput") {
+        record.attention = {
+          ...base,
+          state: "needs-you",
+          source: "lifecycle",
+          prompt: undefined,
+          now: "Input requested in cmux",
+          ...(record.attention.lastTool ? { lastTool: record.attention.lastTool } : {}),
+        };
+      } else if (record.lifecycle === "idle") {
+        record.attention = {
+          ...base,
+          state: "idle",
+          source: "lifecycle",
+          prompt: undefined,
+          lastTool: undefined,
+          now: "Waiting for your direction",
+        };
+      } else {
+        record.attention = {
+          ...base,
+          state: "working",
+          source: "lifecycle",
+          prompt: undefined,
+          now: "cmux session is connected",
+          ...(record.attention.lastTool ? { lastTool: record.attention.lastTool } : {}),
+        };
+      }
     }
     this.currentControl(record);
     if (JSON.stringify(record) !== before) this.save(record);
@@ -373,7 +388,6 @@ export class CmuxSessions {
     const status = record.recordingError ? "recording-error" : record.session.status;
     return {
       status, pid: record.pid, seq: this.journals.get(record.session.id)?.seq ?? 0, screen: record.screen,
-      // The record holds no time for the error, so the last recorded activity stands for it, never the time of the read.
       attention: record.recordingError ? applyLifecycle(record.attention, "recording-error", record.attention.lastActivityAt) : record.attention,
       capabilities: { terminalSnapshot: 1, inputControl: 1 }, control: this.currentControl(record),
       runtime: record.session.runtime,
@@ -392,8 +406,6 @@ export class CmuxSessions {
       return rows();
     }, "list").catch(error => {
       if (!(error instanceof CmuxError) || error.code !== "cmux-busy") throw error;
-      // Keep managed workers visible when cmux is overloaded, without presenting
-      // a cached cmux observation as a connected runtime or valid input lease.
       return rows().map(row => ({ ...row, status: "unavailable" as const, control: null,
         attention: applyLifecycle(row.attention, "unavailable", row.attention.lastActivityAt) }));
     });
@@ -471,7 +483,7 @@ export class CmuxSessions {
     for (const argument of [command, ...argv]) this.validText(argument, true);
     const input = `export ${LAUNCH_ENV}=${quote(record.launchId!)}; exec ${[command, ...argv].map(quote).join(" ")}\r`;
     this.append(record, "input-intent", { op: "launch", launchId: record.launchId });
-    this.save(record); // The uncertain intent is durable before the external mutation.
+    this.save(record);
     try {
       const result = await this.client.rpc("workspace.create", { cwd: record.session.cwd, focus: false, initial_input: input });
       const workspaceId = string(result.workspace_id), surfaceId = string(result.surface_id);
@@ -609,8 +621,6 @@ export class CmuxSessions {
     try {
       if (answer) receipt.result = await answer();
       else if (request.op === "input" || request.op === "raw") {
-        // terminal.paste is cmux's bracketed-paste operation. Raw control bytes
-        // are refused; this adapter cannot safely provide a lossless native PTY.
         const result = await this.client.rpc("terminal.paste", { surface_id: record.surfaceId, workspace_id: record.workspaceId, text: request.text, submit_key: request.op === "input" && request.submit ? "return" : "none" });
         if (result.surface_id && result.surface_id !== record.surfaceId || result.workspace_id && result.workspace_id !== record.workspaceId) throw new CmuxError("delivery-uncertain");
         if (request.op === "input" && request.submit && result.submitted !== true) throw new CmuxError("delivery-uncertain");
@@ -619,8 +629,6 @@ export class CmuxSessions {
       } else if (request.op === "stop") {
         try { await this.client.rpc("surface.close", { workspace_id: record.workspaceId, surface_id: record.surfaceId }); }
         catch (error) {
-          // Only close a whole workspace when a fresh tree proves this is its
-          // sole surface. Never close another person's adjacent terminal.
           if (!(error instanceof CmuxError) || error.code !== "invalid_state") throw error;
           const tree = await this.client.tree();
           const owned = [...tree.values()].filter((surface) => surface.workspaceId === record.workspaceId);
@@ -636,8 +644,6 @@ export class CmuxSessions {
       this.save(record);
       return this.publicReceipt(receipt);
     } catch {
-      // The durable uncertain receipt intentionally survives API restarts. No
-      // failure path retries an input that may already have reached the agent.
       return this.publicReceipt(receipt);
     }
   }
@@ -703,6 +709,5 @@ export class CmuxSessions {
     };
   }
 
-  /** Closing the adapter does not close or interrupt any cmux terminal. */
   async close(): Promise<void> { this.closed = true; await this.draining; }
 }

@@ -155,9 +155,6 @@ setInterval(() => {}, 1000);
     assert.equal(Object.hasOwn(enabledResume.body, "codeMode"), false, "resume responses keep the host choice internal");
     await waitFor(() => readLaunches(), launches => launches.length === 2);
     assert.equal(readLaunches()[1]!.mode, "1");
-    // A command prefix such as sudo drops the variable, and Claude Code refuses to resume a Code Mode conversation
-    // without the request. So it also rides in an argument: in the hook layer of the first launch, and in an argument
-    // of its own on the resume, whose arguments the host writes.
     assert.deepEqual(readLaunches().map(launch => launch.settings), [["1"], ["1"]]);
 
     const disabled = await start(nativeIds[1]!);
@@ -168,11 +165,8 @@ setInterval(() => {}, 1000);
     assert.equal(disabledResume.status, 200, JSON.stringify(disabledResume.body));
     await waitFor(() => readLaunches(), launches => launches.length === 4);
     assert.equal(Object.hasOwn(readLaunches()[3]!, "mode"), false);
-    // The plain conversation never asked: its hook layer holds no request, and its resume gets no settings argument.
     assert.deepEqual(readLaunches().slice(2).map(launch => launch.settings), [[null], []]);
 
-    // A plain conversation's resume request is the one the host built before the switch existed. So a resume that an
-    // earlier host had started, with the record written and the receipt not yet, is found again by its fingerprint.
     const key = readFileSync(host.config.keyFile);
     const record = (id: string) => unseal<{ session: Record<string, any>; fingerprint: string }>(key, `${id}:meta`,
       readFileSync(join(host.config.stateDir, "sessions", id, "meta.sealed"), "utf8"));
@@ -187,9 +181,6 @@ setInterval(() => {}, 1000);
     assert.equal(retried.body.id, plain);
     assert.equal(readLaunches().length, 4, "the retry starts nothing");
 
-    // Claude Code resumes a Code Mode conversation only with Code Mode on. A headless run takes the request only from
-    // its --settings argument, and an owner resume has no permission channel to carry one. So the host refuses the
-    // resume through a headless profile, and starts and records nothing.
     const recorded = await start(nativeIds[2]!);
     assert.equal(readLaunches()[4]!.mode, "1");
     await stop(recorded);
@@ -201,8 +192,6 @@ setInterval(() => {}, 1000);
     assert.match(headlessResume.body.error, /asked for Code Mode.*Start a new session/);
     assert.equal(existsSync(join(host.config.stateDir, "sessions", resumeId)), false, "the refusal leaves no successor record");
     assert.equal(existsSync(join(host.config.stateDir, "resumptions", `${resumeId}.sealed`)), false, "the refusal leaves no receipt");
-    // Nothing was kept, so the same request resumes the conversation once the profile is interactive again, and the
-    // launch after the fifth is that resume, in Code Mode, whatever the setting says by then.
     host.config.agents = { claude: { command: process.execPath, args: [fixture] } };
     await setModeAndRestartApi("off");
     const interactiveResume = await host.fetchApi(`/sessions/${recorded}/resume`, "owner", { requestId: resumeId });
@@ -255,8 +244,6 @@ setInterval(() => {}, 1000);
       update(stored.session);
       writeSealed(file, key, scope, stored);
     };
-    // Legacy source metadata has no projectRoot. Its root-level cwd is the only
-    // safe proof that it still belongs to the current configured project.
     updateSession(sourceId, session => {
       delete session.projectRoot;
       session.resumeNativeSession = { id: nativeId, source: "hook" };

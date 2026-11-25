@@ -6,17 +6,14 @@ const SHA1 = "0123456789abcdef0123456789abcdef01234567";
 const SHA256 = "0123456789abcdef".repeat(4);
 
 test("citations parse by form only", () => {
-  // Repository citations.
   assert.deepStrictEqual(parseCitation("src/a.ts"), { kind: "repository", path: "src/a.ts" });
   assert.deepStrictEqual(parseCitation("src/a.ts#L7"), { kind: "repository", path: "src/a.ts", lines: { from: 7, to: 7 } });
   assert.deepStrictEqual(parseCitation("src/a.ts#L10-L24"), { kind: "repository", path: "src/a.ts", lines: { from: 10, to: 24 } });
   assert.deepStrictEqual(parseCitation(`src/a.ts@${SHA1}`), { kind: "repository", path: "src/a.ts", commit: SHA1 });
   assert.deepStrictEqual(parseCitation(`docs/b.md#L1-L2@${SHA256}`), { kind: "repository", path: "docs/b.md", lines: { from: 1, to: 2 }, commit: SHA256 });
 
-  // Outside citations: https only, host lowercased.
   assert.deepStrictEqual(parseCitation("https://Example.com/x"), { kind: "outside", host: "example.com" });
 
-  // Refused.
   const refused = [
     "../a",
     "/abs",
@@ -30,24 +27,18 @@ test("citations parse by form only", () => {
     "ftp://example.com/x",
     "a".repeat(301),
     "a".repeat(2001),
-    // Only the 2,000-character limit refuses this one: it is otherwise a valid https citation.
     `https://a.example/${"x".repeat(2001 - "https://a.example/".length)}`,
   ];
   for (const text of refused) assert.equal(parseCitation(text), undefined, `refused: ${text.slice(0, 40)}`);
 });
 
 test("qualifying entries count form-valid citations, one per outside host", () => {
-  // Two form-valid citations, one repository and one outside, qualify at perEntry 2.
   assert.equal(qualifyingEntries([{ sources: ["a.md#L1-L2", "https://a.example/1"] }], 2), 1);
-  // Two outside citations on one host count once, so the entry does not qualify.
   assert.equal(qualifyingEntries([{ sources: ["https://a.example/1", "https://a.example/2"] }], 2), 0);
-  // Non-entries, and a sources value that is not an array, never qualify.
   assert.equal(qualifyingEntries(["a.md", null, {}, { sources: "a.md" }, { sources: ["a.md", 5] }], 2), 0);
-  // Only the first 32 sources are read: the second valid source sits at index 32, the 33rd, and does not count.
   const late = ["a.md", ...Array.from({ length: 31 }, () => "../x"), "b.md"];
   assert.equal(late.length, 33);
   assert.equal(qualifyingEntries([{ sources: late }], 2), 0);
-  // The second valid source at index 31, the 32nd, does count.
   const inside = ["a.md", ...Array.from({ length: 30 }, () => "../x"), "b.md"];
   assert.equal(inside.length, 32);
   assert.equal(qualifyingEntries([{ sources: inside }], 2), 1);

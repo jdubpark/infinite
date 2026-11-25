@@ -22,7 +22,6 @@ writeFileSync(join(tokenDirectory, `${createHash("sha256").update("example/produ
 const capture = join(root, "gh-calls.jsonl");
 const lookupCapture = join(root, "gh-lookups.jsonl");
 const fakeGh = join(root, "gh.mjs");
-// The broker runs gh with a clean environment; the fixture records what it received and echoes the token to prove redaction.
 writeFileSync(fakeGh, `#!${process.execPath}
 import { appendFileSync, readdirSync } from "node:fs";
 let stdin = "";
@@ -131,7 +130,6 @@ test("pull request writes reach only pull requests whose head branch the grant c
   assert.match((await gh(prGrant, ["pr", "ready", "99"])).text, /pull-request-unresolved/);
   assert.equal(calls().length, before);
 
-  // A branch selector runs against the number the lookup resolved; reads need no lookup.
   const comment = await gh(prGrant, ["pr", "comment", "infinite/team-1", "--body", "x"]);
   assert.equal(comment.status, 200);
   assert.deepEqual(calls().at(-1).args, ["pr", "comment", "12", "--body=x", "--repo=example/product"]);

@@ -1,5 +1,3 @@
-// The web client's control lease hook against a stand-in host. tests/web-polling.test.ts claims a lease through `window.control`
-// and counts the renewals it sends.
 import { useEffect } from "react";
 import { createRoot } from "react-dom/client";
 import { ApiContext, ApiError, type Api, type ControlLease } from "../../apps/web/src/api";

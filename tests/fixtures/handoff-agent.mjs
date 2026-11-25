@@ -2,7 +2,6 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-// Read-only cmux executable boundary: lifecycle and admission belong to the host.
 if (process.argv[2] === "rpc") {
   const method = process.argv[3];
   const observations = {

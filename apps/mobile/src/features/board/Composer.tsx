@@ -15,7 +15,6 @@ import { theme } from "../../theme";
 const LAST_PROJECT_KEY = "infinite.mobile.last-project";
 const inFlight = new Set<string>();
 
-/** A project-targeted mission creator. An uncertain retry reuses its stored request body and ID. */
 export function Composer({ connection, groups, items, suggestions, owner, onCreated, onManage, onChanged }: {
   connection: Connection; groups: ProjectGroup[]; items: BoardItem[]; suggestions: ProjectGroupSuggestion[]; owner: boolean;
   onCreated: (mission: Mission) => void; onManage: () => void; onChanged: () => void;

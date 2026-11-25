@@ -11,9 +11,6 @@ import {
   PROMPT_ORIGINS, type ComparisonJobRequest, type ComparisonPin, type EvalRefusal, type TrialConfiguration,
 } from "./eval-types.js";
 
-// Comparison jobs, as functions over a transaction: the request schema, the task selection from one set, the pins,
-// the confirm subject, and the reuse copies. `TrialJobs` runs them in the write that creates the job.
-
 export const COMPARE_TASKS_MIN = 2, COMPARISON_TASKS_DEFAULT = 20;
 
 const COMPARISON_TASKS_MAX = 200, TRIALS_PER_TASK_DEFAULT = 3, TRIALS_PER_TASK_MAX = 5, MAX_TRIALS_MAX = 1_000;
@@ -22,7 +19,6 @@ const DAY_MS = 86_400_000;
 const TASK_ID_PATTERN = /^(captured|mined):[A-Za-z0-9:._-]{1,200}$/;
 const AREA_PATTERN = /^[a-z][a-z0-9-]{0,39}$/;
 
-// These repeat the baseline schema's parts. Importing them from the baseline job's module would make an import cycle.
 const configurationSchema = z.object({
   profile: z.object({ provider: z.enum(["claude", "codex", "grok", "opencode", "demo"]) }).passthrough(),
   guidance: z.literal("as-of-base"),
@@ -66,7 +62,6 @@ export type ComparisonPlan = {
   slots: number; planned: { tasks: number; trials: number };
 };
 
-/** Each configuration's `configRef`, the epoch of its profile identity at `at`, and its prompt version, in request order. */
 export function pinsOf(db: EvidenceDb, configurations: readonly TrialConfiguration[], at: string): ComparisonPin[] {
   return configurations.map(configuration => ({
     configRef: configRef(configuration),
@@ -75,13 +70,11 @@ export function pinsOf(db: EvidenceDb, configurations: readonly TrialConfigurati
   }));
 }
 
-/** SHA-256 of the canonical JSON of the pins sorted by `configRef`. */
 export function subjectOf(pins: readonly ComparisonPin[]): string {
   const sorted = [...pins].sort((a, b) => (a.configRef < b.configRef ? -1 : a.configRef > b.configRef ? 1 : 0));
   return createHash("sha256").update(canonicalJson(sorted), "utf8").digest("hex");
 }
 
-/** True when an epoch or a prompt version of any configuration is no longer the one pinned. */
 export function pinsChanged(db: EvidenceDb, configurations: readonly TrialConfiguration[], pins: readonly ComparisonPin[], at: string): boolean {
   const now = pinsOf(db, configurations, at);
   if (now.length !== pins.length) return true;
@@ -92,7 +85,6 @@ export function pinsChanged(db: EvidenceDb, configurations: readonly TrialConfig
   });
 }
 
-/** Selects the tasks from the set the kind fixes, then plans the reuse. Reads only; a refusal leaves nothing behind. */
 export function planComparison(tx: EvidenceTx, input: { projectId: string; request: ComparisonJobRequest; at: string }): ComparisonPlan | EvalRefusal {
   const { request, at } = input;
   const confirm = request.kind === "confirm";
@@ -152,10 +144,6 @@ export function planComparison(tx: EvidenceTx, input: { projectId: string; reque
   };
 }
 
-/**
- * Writes the copies, then a confirm job's group counts and subject, in the caller's transaction. The caller has opened the
- * job's counts row. A second subject row for one project throws, so the caller's write ends and nothing of the job remains.
- */
 export function applyComparison(tx: EvidenceTx, input: { jobId: string; projectId: string; request: ComparisonJobRequest;
   plan: ComparisonPlan; keepDays: number; at: string }): "scheduled" | "complete" {
   const { plan, request } = input;

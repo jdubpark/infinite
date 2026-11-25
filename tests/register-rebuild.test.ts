@@ -49,7 +49,6 @@ function goalFixture(): ProductGoal {
   } as unknown as ProductGoal;
 }
 
-/** Version 1 with three assumptions: a1 an artifact test, a2 a command test, a3 an owner test; and an owner-rated criterion c2. */
 function baseRecord(): ObjectiveRecord {
   const created = goalRecord(goalFixture(), AT, "created");
   if (typeof created === "string") throw new Error(`the fixture record is ${created}`);
@@ -81,7 +80,6 @@ function receipt(id: string, kind: "artifact" | "command", outcome: "pass" | "fa
   return { handle: `receipt:${RUN}:1:${id}`, kind, subject: "assumption", id, commit: HEAD, outcome, at: AT, detail };
 }
 
-/** The first top-level key whose canonical JSON differs. */
 function firstDiffKey(left: unknown, right: unknown): string {
   const a = left as Record<string, unknown>;
   const b = right as Record<string, unknown>;
@@ -102,35 +100,29 @@ test("every version rebuilds after random register writes", () => {
       let next: ObjectiveRecord | undefined;
       try {
         if (roll < 0.25) {
-          // Receipts for a1 and a2, each with a random outcome.
           const receipts = [random() < 0.5 ? "a1" : "a2"].map(id => receipt(id, id === "a1" ? "artifact" : "command", random() < 0.5 ? "pass" : "fail"));
           next = applyReceipts(record, receipts, { runId: RUN, revision: 1, kind: "reviewed", at })?.record;
         } else if (roll < 0.5) {
-          // A member proposal: a stance on an existing assumption, or a new test.
           const field: MemberProposal = random() < 0.4
             ? { id: "a1", stance: random() < 0.5 ? "supports" : "contradicts" }
             : { propose: { statement: `Proposed ${step} of ${seed}.`, refutedBy: "The check fails", test: { kind: "command", run: RANK, refutesOn: "fail" }, criticality: "plan" } } as MemberProposal;
           const proposal: Proposal = { entryId, memberId: "m1", revision: 1, authorRole: "reviewer", summary: `Finding ${step}.`, assumption: field };
           next = applyProposals(record, [proposal], { runId: RUN, configured: CONFIGURED, at }).record;
         } else if (roll < 0.75) {
-          // Owner ops: the owner's status for a3, and a rating for c2.
           const ops = random() < 0.5
             ? [{ op: "assumption.set" as const, id: "a3", status: random() < 0.5 ? "verified" as const : "refuted" as const }]
             : [{ op: "rating.record" as const, subject: "s1", score: 1 + Math.floor(random() * 9) / 2 }];
           next = applyOwnerOps(record, { version: record.version, ops }, { configured: CONFIGURED, requestId: REQUEST, at, rating: { commit: HEAD, cycle: 1 } });
         } else {
-          // An intent-check report with no items.
           next = applyIntentReport(record, { kind: "intent-check", summary: "Checked.", items: [] }, {
             runId: RUN, revision: 1, checkerMemberId: "m1", decisionId: REQUEST, mode: "autonomous", goal: true, configured: CONFIGURED, at,
           }).record;
         }
       } catch {
-        // A refused write changes nothing; the next step starts from the same record.
         next = undefined;
       }
       if (next !== undefined) {
         writes += 1;
-        // A JSON round trip between steps, as a restart would do.
         record = JSON.parse(JSON.stringify(next)) as ObjectiveRecord;
         snapshots.set(record.version, canonicalJson(record));
       }
@@ -148,6 +140,5 @@ test("every version rebuilds after random register writes", () => {
         `seed ${seed}, version ${version}: the rebuilt record differs at key ${firstDiffKey(JSON.parse(snapshot), rebuilt)}`);
     }
   }
-  // The check is vacuous unless the writes happened.
   assert.equal(writes > SEEDS, true, `only ${writes} writes ran across ${SEEDS} seeds`);
 });

@@ -13,7 +13,7 @@ import { runRepositoryContext } from "../packages/host/src/understanding-runtime
 import type { Config } from "../packages/host/src/types.js";
 import { teamCommandEnvironment } from "../packages/host/src/team-workspace.js";
 import { startCloudExecutor } from "../packages/host/src/cloud-executor.js";
-// @ts-ignore -- a dependency-free script without type declarations
+// @ts-expect-error
 import { verifyProxyAuthorization } from "../scripts/egress-proxy.mjs";
 
 const root = mkdtempSync(join(tmpdir(), "egress-env-test-"));
@@ -24,7 +24,6 @@ writeFileSync(keyPath, key, { mode: 0o640 });
 const egress = { proxyUrl: "http://127.0.0.1:3128", keyPath };
 const PROXY_NAMES = ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "NO_PROXY", "no_proxy", "NODE_USE_ENV_PROXY"];
 
-/** A one-commit Git checkout under `parent`. */
 function gitCheckout(parent: string): string {
   const checkout = join(parent, "checkout");
   execFileSync("git", ["init", "-q", checkout]);
@@ -32,7 +31,6 @@ function gitCheckout(parent: string): string {
   return checkout;
 }
 
-/** Inherited proxy state a child must never see, set for the duration of `body`. */
 async function withStaleProxy(body: () => Promise<void>): Promise<void> {
   const previous = new Map(PROXY_NAMES.map(name => [name, process.env[name]]));
   try {
@@ -47,7 +45,6 @@ async function withStaleProxy(body: () => Promise<void>): Promise<void> {
   }
 }
 
-/** Whether a child saw each proxy variable, and the flag's value. */
 const observedScript = (mode: string) => `const fs = require("node:fs");
 const names = ${JSON.stringify(PROXY_NAMES)};
 fs.appendFileSync(process.argv[1], JSON.stringify({ mode: ${JSON.stringify(mode)} === "argv" ? (process.argv.includes("context") ? "context" : "brief") : ${JSON.stringify(mode)}, environment: Object.fromEntries(names.map(name => [name, name === "NODE_USE_ENV_PROXY" ? (process.env[name] ?? null) : Boolean(process.env[name])])) }) + "\\n");`;
@@ -61,7 +58,6 @@ function assertProxyEnvironment(observed: Record<string, boolean | string | null
   }
 }
 
-/** The identity the proxy would accept for a proxy URL's user information. */
 function identityOf(proxyUrl: string) {
   const url = new URL(proxyUrl);
   const header = `Basic ${Buffer.from(`${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`).toString("base64")}`;
@@ -118,7 +114,6 @@ test("without a readable key, sessions and host commands still get the proxy, wi
   assert.deepEqual(workerEgressEnvironment("project-a", "0b6a3c52-6c1e-4b0e-9a55-3f1f2d0c9e71", { INFINITE_EGRESS_PROXY_URL: egress.proxyUrl }), { status: "no-key", env: uncredentialed });
   for (const proxyUrl of [undefined, "", "http://proxy.example.test:3128"])
     assert.deepEqual(workerEgressEnvironment("project-a", "0b6a3c52-6c1e-4b0e-9a55-3f1f2d0c9e71", { INFINITE_EGRESS_PROXY_URL: proxyUrl, INFINITE_EGRESS_KEY_FILE: keyPath }).status, "invalid", String(proxyUrl));
-  // The host-identity path: a team Git command run as the host account, which the firewall rule does not match.
   const inherited: NodeJS.ProcessEnv = {};
   const warn = console.warn;
   console.warn = () => {};
@@ -147,7 +142,6 @@ process.stdout.write(JSON.stringify({ decision: { action: "disabled", reason: "p
     state: async () => ({ seq: 1, capabilities: { transcript: 1 } }),
     events: () => ({ events: [{ seq: 1, type: "message", at: "2026-11-17T00:00:00.000Z", data: { id: "probe", role: "user", text: "inspect" } }], cursor: 1, more: false }),
   };
-  // A checkout of its own: the briefing resolves the session's Git root, and the suite also runs from an export without .git.
   const checkout = gitCheckout(directory);
   const session = { id: "briefing-probe", projectId: "egress-test", cwd: checkout };
   const project = { id: "egress-test", name: "Egress test", path: checkout };
@@ -198,14 +192,12 @@ test("System tab brief and context children get configured egress and discard in
     for (const configured of [false, true]) {
       rmSync(receipt, { force: true });
       installHostEgress(configured ? { autonomy: { boundary: { egress } } } : {}, {});
-      // The script prints nothing, so both calls fail after the child has recorded what it saw.
       await assert.rejects(runRepositoryContext(config, checkout, options()));
       await assert.rejects(createUnderstandingAdapter(config).brief!({ workspaceId: "workspace", root: checkout, repositoryId: "repo", context, base: null, components: [] } as never, options()));
       const lines = readFileSync(receipt, "utf8").trim().split("\n").map(line => JSON.parse(line) as { mode: string; environment: Record<string, boolean | string | null> });
       assert.deepEqual(lines.map(line => line.mode), ["context", "brief"]);
       for (const line of lines) assertProxyEnvironment(line.environment, configured, `a System tab ${line.mode} child`);
 
-      // The System tab's gh reads run as the host account and keep the host's own environment.
       rmSync(ghReceipt, { force: true });
       const github = { ...config, projects: [{ id: "repo", name: "Repository", path: checkout, source: { mode: "github", repository: "example/repo" } }] } as Config;
       const delivery = await createUnderstandingAdapter(github).delivery!({ workspaceId: "workspace", root: checkout, repositoryId: "repo", head }, options());
@@ -243,7 +235,6 @@ test("the egress block accepts only a bare loopback HTTP proxy address", () => {
 
 test("the cloud executor's exec-server gets the session's egress variables, and no inherited proxy state", { timeout: 20000 }, async () => {
   const dump = join(root, "executor-env.jsonl");
-  // Stands in for `codex exec-server`: it records its proxy environment, then announces a listening address.
   const script = `require("node:fs").writeFileSync(${JSON.stringify(dump)}, JSON.stringify(Object.fromEntries(${JSON.stringify(PROXY_NAMES)}.map(name => [name, process.env[name] ?? null]))));
 console.log("ws://127.0.0.1:43210"); setInterval(() => {}, 1000);`;
   const observe = async (options: { egress?: Record<string, string> }) => {

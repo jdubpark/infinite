@@ -1,9 +1,4 @@
 #!/bin/sh
-# Starts a disposable teams or goals host for the verify-infinite journeys.
-# Usage (from any directory): sh launch-profile.sh teams|goals
-# Steps, each of which stops the launch on failure: claim the instance, init it without starting, configure it
-# with fixture agents, start the API, and wait for it to answer. Writes .local/verify/LAST-RUN so the Doctor,
-# Drive, and Cleanup blocks read this run. Set CHECKOUT to the checkout to use.
 set -eu
 
 PROFILE="${1:-}"
@@ -20,7 +15,6 @@ EVID="$ROOT/.local/verify/$RUN/evidence"
 mkdir -p "$ROOT/.local/verify"
 printf '%s\n' "$RUN" > "$ROOT/.local/verify/LAST-RUN"
 
-# Ports 4781 and up. 4780 is never a candidate.
 PORT=""
 for CANDIDATE in 4781 4782 4783 4784 4785 4786 4787; do
   if [ -z "$(lsof -nP -iTCP:$CANDIDATE -sTCP:LISTEN 2>/dev/null)" ]; then PORT=$CANDIDATE; break; fi
@@ -40,9 +34,6 @@ nohup node --import tsx packages/host/src/cli.ts dev --config "$INST/config.json
 API=$!
 echo "$API" > "$INST/server.pid"
 echo "run $RUN port $PORT"
-# Ready means: the API process is still running, it is the only listener on the port, and an anonymous call is
-# refused with 401. A process that exits, or a port another process holds, fails the launch.
-# Each request is bounded, and the whole wait ends 60 seconds after the start.
 STATUS=""
 DEADLINE=$(( $(date +%s) + 60 ))
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do

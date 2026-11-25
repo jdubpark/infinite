@@ -43,7 +43,6 @@ function input(over: Partial<SwarmInput> = {}): SwarmInput {
   return { sessions: [], teams: [], missions: [], now: NOW, ...over };
 }
 
-// A delegated run: permission review is on and the lineup coordinator is strong.
 const DELEGATED = { permissions: { maxDecisions: 5 }, lineup: { coordinator: { tier: "strong" } } };
 
 test("state table", () => {
@@ -182,7 +181,6 @@ test("live and quiet", () => {
   assert.equal(many.quiet.length, 12);
   assert.equal(many.quietOlder, 2);
 
-  // Quiet runs are capped and aged one by one, even inside one finished mission that changed a moment ago.
   const mission14 = buildSwarm(input({
     teams: [
       ...Array.from({ length: 14 }, (_, index) => team(`sub-${index}`, { missionId: "M-1", status: "merged", createdAt: iso(HOUR + index * 60_000) })),
@@ -195,7 +193,6 @@ test("live and quiet", () => {
   assert.ok(!mission14.quiet.some(unit => unit.id === "sub-old"), "an old run does not ride on its mission's newer timestamp");
   assert.equal(mission14.quietOlder, 3);
 
-  // The host rewrites updatedAt on every save, so a settled run ages by what its agents last did.
   const churned = buildSwarm(input({
     teams: [
       team("weeks-old", { status: "merged", createdAt: iso(500 * HOUR), updatedAt: iso(2_000),
@@ -224,7 +221,6 @@ test("stable order", () => {
   assert.deepEqual(first, ["api", "checkout-v2"]);
   assert.deepEqual(second, first);
 
-  // A swarm that starts waiting on a person keeps its row: order follows creation time, never state.
   const waiting = buildSwarm(input({
     sessions: [session("s-a", { attention: attention("needs-you", { prompt: prompt(7) }) }), session("s-b", { attention: attention("working") })],
     teams: [
@@ -311,7 +307,6 @@ test("solo", () => {
   const solo = model.live.find(swarm => swarm.kind === "solo");
   assert.deepEqual(solo?.loose.map(agent => agent.id), ["S-free"]);
   assert.equal(findAgent(model, "S-free")?.role, "SO");
-  // A solo session keeps its project, which is where its touched files are drawn.
   assert.equal(findAgent(model, "S-free")?.projectId, input({ sessions: [session("S-free")] }).sessions[0].projectId);
   assert.ok(findAgent(model, "S-free")?.projectId);
   assert.equal(model.live[model.live.length - 1].kind, "solo");
@@ -381,14 +376,11 @@ test("unmeasured agent counts reach every cost, and costs stay as measured", () 
   assert.equal(swarm("zero-run")?.unmeasured, 6);
   assert.equal(swarm("mixed-run")?.costUsd, 1.5);
   assert.equal(swarm("mixed-run")?.unmeasured, 2);
-  // A mission's own count wins; without one it sums its units.
   assert.equal(swarm("m-counted")?.costUsd, 2);
   assert.equal(swarm("m-counted")?.unmeasured, 3);
   assert.equal(swarm("m-summed")?.unmeasured, 4);
-  // The solo group counts the solo sessions that have no usage.
   assert.equal(swarm("solo")?.costUsd, 0.4);
   assert.equal(swarm("solo")?.unmeasured, 1);
-  // Totals sum live swarms and leave the cost sum as it was: m-summed has no mission usage, so it adds nothing.
   assert.equal(model.totals.costUsd, 0 + 1.5 + 2 + 0.4);
   assert.equal(model.totals.unmeasured, 6 + 2 + 3 + 4 + 1);
 });

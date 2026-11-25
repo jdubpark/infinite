@@ -39,7 +39,7 @@ export function readHooks(directory: string): HookSession[] {
           updatedAt: Number.isFinite(timestamp) ? timestamp : 0,
         });
       }
-    } catch { /* Missing or incomplete hook files provide no authority. */ }
+    } catch {}
   }
   return hooks;
 }
@@ -51,11 +51,6 @@ export function processAlive(pid: number): boolean {
 
 export const LAUNCH_ENV = "INFINITE_CMUX_LAUNCH";
 
-/**
- * A hook PID alone is not authority to type. Require its foreground process group,
- * terminal and provider command. Suspended agents and background helpers fail closed.
- * Local typing and other cmux controllers remain outside this host's lease boundary.
- */
 export async function foregroundAgent(record: {
   pid?: number; hookAt?: number; launchId?: string; surfaceId?: string; tty?: string; provider: CmuxProvider;
 }, command?: string): Promise<boolean> {
@@ -67,8 +62,6 @@ export async function foregroundAgent(record: {
       const tag = `${LAUNCH_ENV}=${record.launchId}`;
       for (const line of out.split("\n")) {
         if (!line.split(/\s+/).includes(tag)) continue;
-        // Environment membership ties the process to the cmux surface as well as
-        // the launch. Never confuse another terminal inheriting the launch tag.
         if (record.surfaceId && !line.split(/\s+/).includes(`CMUX_SURFACE_ID=${record.surfaceId}`)) continue;
         const candidate = Number(line.trim().split(/\s+/, 1)[0]);
         if (Number.isSafeInteger(candidate) && candidate > 0) { pid = candidate; break; }
@@ -86,7 +79,6 @@ export async function foregroundAgent(record: {
       const match = /^\s*(\d+)\s+(\d+)\s+(-?\d+)\s+(\S+)\s+(\S+)\s+(.+?)\s*$/.exec(line);
       if (!match || (pid && Number(match[1]) !== pid) || Number(match[2]) !== Number(match[3]) || Number(match[3]) <= 0 || /[TZ]/.test(match[5]) || ["?", "??", "-"].includes(match[4]) || (tty && match[4] !== tty)) return false;
       const executable = basename(match[6]).replace(/^-/, "");
-      // An explicitly configured shell is never evidence that an agent is alive.
       return !["sh", "zsh", "bash", "fish", "dash", "ksh", "login"].includes(executable) && expected.has(executable);
     });
   } catch { return false; }

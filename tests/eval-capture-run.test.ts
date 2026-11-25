@@ -14,7 +14,6 @@ import { outcomeProjector } from "../packages/host/src/outcome-projector.js";
 import { outcomeModule } from "../packages/host/src/outcome-store.js";
 import { configurationModule, configurationProjector } from "../packages/host/src/configuration-store.js";
 
-/** Advances the outbox until the projectors have nothing pending, as the server's timer does. */
 function drain(outbox: EventOutbox): void {
   for (let pass = 0; pass < 20; pass++) if (!outbox.advance().pending) return;
 }
@@ -35,7 +34,6 @@ test("a fixture run captures its accepted task, and deleting it as cancelled rem
     project.team = { ...project.team, eval: { capture: true } };
 
     const store = new EvidenceStore({ databasePath: evidenceDatabasePath(f.host.config.stateDir), vaultKey: readFileSync(f.host.config.keyFile) });
-    // The server registers the configuration module before the outcome projector, which waits for it.
     store.register(configurationModule());
     store.register(outcomeModule());
     const outbox = new EventOutbox(store);
@@ -76,7 +74,6 @@ test("a fixture run captures its accepted task, and deleting it as cancelled rem
     assert.equal(partsB.reference, undefined);
     assert.equal(partsB.baseDelta, undefined);
 
-    // The run's integration clone is not needed after capture: moving it aside changes no row or part.
     const { checkedAt: _checkedBefore, ...stableBefore } = rowA;
     const aside = `${run.workspace}.aside`;
     renameSync(run.workspace, aside);
@@ -86,12 +83,10 @@ test("a fixture run captures its accepted task, and deleting it as cancelled rem
     assert.deepEqual(stableAfter, stableBefore);
     assert.deepEqual(store.read(db => readMaterial(db, rowA.taskId)), partsA);
 
-    // A cancelled run that is deleted takes every row and part with it.
     const cancelled = await teams.cancel(run.id, { requestId: "11111111-1111-4111-8111-111111111111", revision: run.revision });
     assert.equal(cancelled.status, "cancelled");
     await teams.removeRun(run.id);
     drain(outbox);
-    // The server's hourly sweep is what deletes a run's events, and the store runs the eval hook with them.
     store.sweep(id => teams.hasRecordFile(id));
     assert.deepEqual(rows(), []);
     assert.deepEqual(store.read(db => readMaterial(db, rowA.taskId)), {});

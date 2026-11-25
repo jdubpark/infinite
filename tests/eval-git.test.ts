@@ -38,7 +38,6 @@ function writeFiles(files: Record<string, string | Buffer>) {
   };
 }
 
-/** A prefix that records its argv (one argument per line, starting with "git") and then runs the rest. */
 function recordingPrefix(dir: string): { prefix: TeamCommand; record: string } {
   const record = join(dir, "argv.txt");
   const script = join(dir, "prefix.sh");
@@ -46,7 +45,6 @@ function recordingPrefix(dir: string): { prefix: TeamCommand; record: string } {
   return { prefix: { command: "/bin/sh", args: [script] }, record };
 }
 
-/** Writes a marker before it sleeps, so a test can tell that the read really started. */
 function sleepingPrefix(dir: string): { prefix: TeamCommand; marker: string } {
   const marker = join(dir, "started.txt");
   const script = join(dir, "sleep.sh");
@@ -54,7 +52,6 @@ function sleepingPrefix(dir: string): { prefix: TeamCommand; marker: string } {
   return { prefix: { command: "/bin/sh", args: [script] }, marker };
 }
 
-/** After a limited read, the sleeper either never wrote its pid or is gone: a slow start cannot fail the read, a live leftover can. */
 async function assertSleeperGone(marker: string) {
   const written = () => /^(\d+)\n$/.exec(existsSync(marker) ? readFileSync(marker, "utf8") : "")?.[1];
   const until = Date.now() + 5000;
@@ -174,11 +171,9 @@ test("a refused patch is failed, and a cut name list is too-wide", async () => {
   try {
     const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
     const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
-    // A launcher that refuses the form exits 1: the answer is a failed read, never an empty patch.
     const refused = captureGit(() => failingPrefix(dir));
     assert.deepEqual(await refused.patch(dir, from, to), { state: "failed" });
 
-    // About 400 names of about 180 characters each: more than 64 KiB of names, so teamCommand cuts the list.
     const wide = commit(dir, (root) => {
       for (let index = 0; index < 400; index++) {
         writeFileSync(join(root, `n${String(index).padStart(3, "0")}-${"x".repeat(170)}.txt`), "x\n");
@@ -196,17 +191,15 @@ test("a name list cut where a leftover held the output is failed, not too-wide",
   try {
     const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
     const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
-    // A launcher that leaves a sleep holding the output, then runs Git as the leader: the read settles a drain after Git exits.
     const script = join(dir, "leave.sh");
     writeFileSync(script, `#!/bin/sh\nsleep 30 &\necho $! > "${leftFile}"\nexec "$@"\n`);
     assert.deepEqual(await captureGit(() => ({ command: "/bin/sh", args: [script] })).names(dir, from, to, 500), { state: "failed" });
-    // Control: the same launcher without the sleep reads the list, so the leftover alone fails the read above.
     const plain = join(dir, "plain.sh");
     writeFileSync(plain, `#!/bin/sh\nexec "$@"\n`);
     assert.deepEqual(await captureGit(() => ({ command: "/bin/sh", args: [plain] })).names(dir, from, to, 500), { state: "read", names: ["a.txt"] });
   } finally {
     const left = Number.parseInt(existsSync(leftFile) ? readFileSync(leftFile, "utf8") : "", 10);
-    if (Number.isSafeInteger(left) && left > 1) { try { process.kill(left, "SIGKILL"); } catch { /* Already ended. */ } }
+    if (Number.isSafeInteger(left) && left > 1) { try { process.kill(left, "SIGKILL"); } catch { } }
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -275,7 +268,6 @@ test("a copy's diff settings change no patch", async () => {
     run(dir, "config", "diff.interHunkContext", "1000");
     const lines = (changed: number[] = []) => Array.from({ length: 400 }, (_, index) => (changed.includes(index + 1) ? "changed\n" : `line ${index + 1}\n`)).join("");
     const from = commit(dir, writeFiles({ "long.txt": lines() }), "from");
-    // Two changes ten lines apart: two hunks with three lines of context, or one hunk when a setting joins them.
     const to = commit(dir, writeFiles({ "long.txt": lines([200, 210]) }), "to");
 
     run(clone, "fetch", "-q", dir, "HEAD");
@@ -296,7 +288,6 @@ test("a copy's submodule setting hides no name", async () => {
   const dir = makeRepo();
   try {
     const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
-    // The link to FROM is added without `git add -A`, which would drop it.
     writeFileSync(join(dir, "a.txt"), "two\n");
     run(dir, "add", "a.txt");
     run(dir, "update-index", "--add", "--cacheinfo", `160000,${from},sub`);
@@ -331,7 +322,6 @@ test("a patch child that cannot be stopped counts until it exits", async () => {
     writeFileSync(script, "#!/bin/sh\nsleep 2\nexit 0\n");
     const seen: ChildProcess[] = [];
     let stoppedAt = 0, releasedAt = 0;
-    // A host that may not signal the child: the stop is refused, and the child runs out its sleep.
     const git = captureGit(() => ({ command: "/bin/sh", args: [script] }), 100, child => {
       seen.push(child);
       stoppedAt = Date.now();
@@ -341,7 +331,6 @@ test("a patch child that cannot be stopped counts until it exits", async () => {
     }, 200);
     const started = Date.now();
     const pending = git.patch(dir, from, to);
-    // A referenced timer keeps the loop alive: the child no longer does once it is released.
     const keep = setInterval(() => undefined, 1_000);
     try {
       const until = Date.now() + 1_500;
@@ -371,13 +360,10 @@ test("a refused stop of a child that has already ended still settles the read", 
   try {
     const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
     const big = commit(dir, writeFiles({ "big.bin": randomBytes(1_200_000) }), "big");
-    // On macOS the group of a child that has already ended refuses the signal, as another account's group does. The
-    // read must still settle, and this test holds no timer: a handle released at the refusal would end the process.
     const git = captureGit(() => undefined, 10_000, child => {
-      try { if (child.pid) process.kill(child.pid, "SIGKILL"); } catch { /* It may already be gone. */ }
+      try { if (child.pid) process.kill(child.pid, "SIGKILL"); } catch { }
       return false;
     });
-    // Compare the state alone: a failing deepEqual on a megabyte of bytes makes node's assert diff exhaust memory.
     assert.equal((await git.patch(dir, from, big)).state, "too-large");
   } finally {
     rmSync(dir, { recursive: true, force: true });

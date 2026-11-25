@@ -6,16 +6,13 @@ import type { RoutingKnobs, RoutingPoint, TeamRunRouting } from "./routing-types
 import type { TeamLineup } from "./team-types.js";
 
 export const ROUTING_ALGORITHM_VERSION = 1;
-/** A pin whose points name `escalation` or `scout`. A version-1 pin routes only `start`, whatever its points list. */
 export const POINTS_ALGORITHM_VERSION = 2;
 export const REWARD_VERSION = 1;
 
-/** The read defaults of Part 1. Nothing writes them into a saved policy, so the routine digest is unchanged by them. */
 export const ROUTING_DEFAULTS: RoutingKnobs = {
   points: ["start"], cascade: false, successValueUsd: 2, maxExploreShare: 0.2, exploreWindow: 50,
   minSpareAttempts: 4, allowContributor: false, listWeight: 0.25, headroomWeight: 1,
 };
-/** An autonomous project without a saved policy: the read defaults with the cascade on. */
 export const AUTONOMOUS_DEFAULTS: RoutingKnobs = { ...ROUTING_DEFAULTS, points: [...ROUTING_DEFAULTS.points], cascade: true };
 
 const KNOB_KEYS = ["points", "cascade", "successValueUsd", "maxExploreShare", "exploreWindow", "minSpareAttempts",
@@ -39,14 +36,10 @@ export type TeamRouting = z.infer<typeof teamRoutingSchema>;
 export type EffectiveRouting = { mode: "off" }
   | { mode: "shadow"; requested: "shadow" | "auto"; source: "saved" | "autonomous-default"; knobs: RoutingKnobs; defaults: (keyof RoutingKnobs)[] };
 
-/** Unique, in the order start, escalation, scout. Two spellings of one policy give one digest. */
 function normalizePoints(points: readonly RoutingPoint[]): RoutingPoint[] {
   return POINT_ORDER.filter(point => points.includes(point));
 }
 
-/**
- * The saved policy's knobs over `base`. A key the policy does not set (or sets to undefined) is a default and is listed.
- */
 function knobsOver(saved: TeamRouting, base: RoutingKnobs): { knobs: RoutingKnobs; defaults: (keyof RoutingKnobs)[] } {
   const knobs: Record<string, unknown> = { ...base };
   const defaults: (keyof RoutingKnobs)[] = [];
@@ -58,10 +51,6 @@ function knobsOver(saved: TeamRouting, base: RoutingKnobs): { knobs: RoutingKnob
   return { knobs: { ...(knobs as unknown as RoutingKnobs), points: normalizePoints(knobs.points as RoutingPoint[]) }, defaults };
 }
 
-/**
- * The routing mode a project runs under. A saved mode wins. Without a saved mode the project's autonomy decides:
- * an autonomous project is in shadow, a supervised one is off. A saved policy without a mode takes that same default.
- */
 export function effectiveRouting(saved: TeamRouting | undefined, autonomy: AutonomyMode): EffectiveRouting {
   if (saved === undefined) {
     if (autonomy !== "autonomous") return { mode: "off" };
@@ -73,28 +62,18 @@ export function effectiveRouting(saved: TeamRouting | undefined, autonomy: Auton
   return { mode: "shadow", requested: mode === "auto" ? "auto" : "shadow", source: "saved", knobs, defaults };
 }
 
-/** 2 when a point other than `start` is listed, else 1. */
 export function algorithmVersionOf(knobs: Pick<RoutingKnobs, "points">): number {
   return knobs.points.some(point => point !== "start") ? POINTS_ALGORITHM_VERSION : ROUTING_ALGORITHM_VERSION;
 }
 
-/**
- * SHA-256 hex of canonicalJson({ algorithmVersion, rewardVersion, mode, knobs }). `mode` defaults to shadow, so a shadow
- * digest is unchanged. The source and the requested mode are left out.
- */
 export function policyDigest(effective: Extract<EffectiveRouting, { mode: "shadow" }>, mode: "shadow" | "auto" = "shadow"): string {
   const knobs = { ...effective.knobs, points: normalizePoints(effective.knobs.points) };
   return createHash("sha256").update(canonicalJson({ algorithmVersion: algorithmVersionOf(knobs), rewardVersion: REWARD_VERSION, mode, knobs })).digest("hex");
 }
 
-/**
- * Undefined unless the effective mode is shadow, `points` holds "start", and the run has a lineup. With a stored
- * `periodEndedAt`, a saved `auto` mode or the autonomous default pins `auto`; every other input gives the shadow pin.
- */
 export function pinRouting(saved: TeamRouting | undefined, autonomy: AutonomyMode, lineup: TeamLineup | undefined, periodEndedAt?: string): TeamRunRouting | undefined {
   const effective = effectiveRouting(saved, autonomy);
   if (effective.mode !== "shadow" || !effective.knobs.points.includes("start") || !lineup) return undefined;
-  // A saved mode wins. With no saved mode, an autonomous project's default decides; a saved policy keeps its own knobs and source.
   const auto = saved?.mode === "auto" || (saved?.mode === undefined && autonomy === "autonomous");
   if (periodEndedAt !== undefined && auto) {
     return {

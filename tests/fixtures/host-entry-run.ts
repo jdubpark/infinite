@@ -1,6 +1,5 @@
 import type { TeamRun } from "../../packages/host/src/team-types.js";
 
-/** Fixed UUIDs, so the source keys of the fixture are stable across tests. */
 export const hostEntryIds = {
   run: "00000000-0000-4000-8000-0000000000f1",
   pm: "00000000-0000-4000-8000-0000000000a1",
@@ -16,11 +15,6 @@ export const hostEntryIds = {
 const COMMIT = "c".repeat(40);
 const HEAD = "d".repeat(40);
 
-/**
- * A hand-built run that holds every source kind: steering, an owner answer and a coordinator answer, an open
- * decision, a plan, a permission decision, a result, a review with a rubric, an integrated task, a pending task,
- * one finished check, and one running check.
- */
 export function hostEntryRun(): TeamRun {
   const at = "2026-11-13T10:00:00.000Z";
   return {

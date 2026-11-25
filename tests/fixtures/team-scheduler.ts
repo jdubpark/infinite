@@ -14,7 +14,6 @@ import type { TeamAssignment, TeamModelProfile, TeamReportEnvelope, TeamRun } fr
 import { TeamService } from "../../packages/host/src/teams.js";
 import { Journal, readEvents, unseal, writeSealed } from "../../packages/host/src/vault.js";
 
-/** Real scheduler records and journal, with the worker RPC boundary controlled by the test. */
 export function schedulerFixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "infinite-scheduler-")));
   const key = randomBytes(32), id = randomUUID(), sessionId = randomUUID();
@@ -47,7 +46,6 @@ export function schedulerFixture() {
     hostLoad: { held: () => undefined },
     list: async () => [],
     meta: (requestedId: string) => {
-      // The base member's session carries its assignment like a real team session, so pre-review live checks pass.
       if (requestedId === sessionId) {
         const base = run.members.find(member => member.sessionId === sessionId)!;
         return { session: { team: { runId: run.id, memberId: base.memberId, revision: base.revision, role: base.role }, cwd: base.cwd, provider: "demo", title: base.title } };

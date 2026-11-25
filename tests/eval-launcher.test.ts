@@ -7,35 +7,12 @@ import { tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// The launcher runs only as copies whose ROOT, ACCOUNT, EVAL_HOME, TEMPLATE, EVAL_TMP, and STOP_DIRS lines are
-// rewritten, as the current user. Every rewrite must match the installed file exactly as often as expected, so a
-// launcher line that moves fails the test instead of leaving an installed value in a copy. The installed file is
-// never run here. `stop` ends every process of the account and deletes its temporary files, so in every copy its
-// kill line becomes `exit 99`: a broken account check fails a test instead of ending the test runner's processes.
-// The one test that runs `stop` to the end replaces the kill line, and the one-second wait after it, with a no-op
-// and narrows STOP_DIRS to one directory. Every test but the installed-file check skips on a platform other than
-// Linux, and when the test runs as root.
-//
-// The test user may be a busy account, so two more rewrites keep its own state out of the copies:
-// - The installed launcher caps a trial's command with `prlimit --nproc=512`. On Linux that cap counts every thread
-//   the real user owns, so a user that already owns 512 threads cannot fork. The copy drops the cap, and prlimit then
-//   leaves the process limit alone. A larger cap would not do: a value above the user's hard limit fails with EPERM.
-//   The other prlimit caps stay. The installed file's own test checks, on every platform, that the prlimit command
-//   line still carries the cap.
-// - The launcher counts and removes the account's System V objects, which it reads from the kernel's tables. A copy
-//   reads tables of its own that hold the kernel's header line and no object, so a test never counts what the user
-//   owned before it. Two copies keep the kernel's tables: one that only probes, and the one that runs `stop` to the
-//   end. The `stop` test skips when the user already owns something that `stop` would remove. That decision is made
-//   by `ownSysV` and `ownEntries` below, which read the kernel and the directory without the launcher, so a
-//   launcher whose probe and `stop` disagree cannot let `stop` run against the user's own state.
 const LAUNCHER = fileURLToPath(new URL("../deploy/ubuntu/eval-command.sh", import.meta.url));
 const SKIP = process.platform !== "linux" ? "the launcher runs on Linux only"
   : process.getuid?.() === 0 ? "the launcher test must not run as root" : false;
 const TRIAL = "11111111-2222-4333-8444-555555555555";
-// The cap as the launcher's prlimit command line carries it. The same text in a comment does not match.
 const NPROC_CAP = /^( {2}\/usr\/bin\/prlimit )--nproc=512 /m;
 const IPC_TABLE = /ipc_table=\/proc\/sysvipc\/(shm|sem|msg)\b/g;
-// The fixed environment of exec and setup, sorted as the tests compare it.
 const FIXED = [
   "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT",
   "HOME", "LANG", "LC_ALL", "PATH", "TMPDIR",
@@ -43,11 +20,8 @@ const FIXED = [
 const PROXY = ["HTTPS_PROXY", "HTTP_PROXY", "NODE_USE_ENV_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"];
 
 type Sandbox = { dir: string; root: string; home: string; template: string; tmp: string; script: string };
-// `stop` names the one directory of a copy that runs stop to the end. `kernelTables` keeps the kernel's System V
-// tables in a copy that only probes.
 type Copy = { stop?: string; kernelTables?: boolean };
 
-// Replaces every match of a pattern, which must match exactly `count` times.
 function rewrite(text: string, pattern: RegExp, to: (...match: string[]) => string, count = 1): string {
   const all = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
   assert.equal(text.match(all)?.length ?? 0, count, `the launcher's text for ${pattern} moved; move this rewrite with it`);
@@ -61,7 +35,6 @@ function sandbox(account: string = userInfo().username, copy: Copy = {}): Sandbo
   const home = join(dir, "home");
   const template = join(dir, "template");
   const tmp = join(dir, "tmp");
-  // Probe and stop look here instead of the machine's shared directories, so a test sees only its own files.
   const shared = join(dir, "shared");
   mkdirSync(shared, { mode: 0o700 });
   mkdirSync(root, { mode: 0o711 });
@@ -79,7 +52,6 @@ function sandbox(account: string = userInfo().username, copy: Copy = {}): Sandbo
   for (const [name, value] of Object.entries({ ROOT: root, ACCOUNT: account, EVAL_HOME: home, TEMPLATE: template, EVAL_TMP: tmp, STOP_DIRS: copy.stop ?? shared })) {
     text = rewrite(text, new RegExp(`^${name}=.*$`, "m"), () => `${name}='${value}'`);
   }
-  // The kill line and the one-second wait after it, as one match.
   text = rewrite(text, /^ {2}kill -KILL -1 .*\n {2}\/usr\/bin\/sleep 1$/m, () => copy.stop ? "  :" : "  exit 99");
   text = rewrite(text, NPROC_CAP, (_line, command) => command);
   text = rewrite(text, IPC_TABLE, (line, name) => kernelTables ? line : `ipc_table='${join(tables, name)}'`, 3);
@@ -93,7 +65,6 @@ function sandbox(account: string = userInfo().username, copy: Copy = {}): Sandbo
   return { dir, root, home, template, tmp, script };
 }
 
-// A failed test can leave a read-only tree, which rmSync cannot empty.
 function cleanup(sb: Sandbox): void {
   spawnSync("/bin/chmod", ["-R", "u+rwx", sb.dir]);
   rmSync(sb.dir, { recursive: true, force: true });
@@ -126,7 +97,6 @@ function git(cwd: string, args: readonly string[]): string {
   return result.stdout.toString("utf8");
 }
 
-// A source repository: `trial` is at C1, so the base bundle holds only C1; C2 follows C1 on `later`.
 function makeRepo(sb: Sandbox): { bundle: Buffer; source: string; c2: string } {
   const source = join(sb.dir, "source");
   mkdirSync(source);
@@ -145,7 +115,6 @@ function makeRepo(sb: Sandbox): { bundle: Buffer; source: string; c2: string } {
   return { bundle: readFileSync(file), source, c2 };
 }
 
-// Receives and prepares TRIAL, and returns its work directory.
 function prepareTrial(sb: Sandbox, bundle: Buffer): string {
   const received = run(sb, ["receive", TRIAL, "1000000"], { input: bundle });
   assert.equal(received.status, 0, received.stderr.toString("utf8"));
@@ -164,8 +133,6 @@ function leftovers(sb: Sandbox): number {
   return JSON.parse(probe.stdout.toString("utf8")).leftovers;
 }
 
-// The test user's System V objects, read from the kernel's tables without the launcher: every row that names the
-// user as owner or as creator, as `table:id`.
 function ownSysV(): string[] {
   const uid = String(process.getuid?.());
   const own: string[] = [];
@@ -178,8 +145,6 @@ function ownSysV(): string[] {
   return own.sort();
 }
 
-// The entries the test user owns under a directory, on the directory's own file system, found without the launcher.
-// A directory that cannot be read is passed over, as the launcher's find passes over it.
 function ownEntries(dir: string): string[] {
   const uid = process.getuid?.();
   const own: string[] = [];
@@ -264,7 +229,6 @@ test("the eval launcher confines every operation to its root", { skip: SKIP }, (
     assert.equal(run(sb, ["check", TRIAL, "--", "a".repeat(39)]).status, 64);
     assert.deepEqual(readdirSync(outside), []);
 
-    // A work directory replaced by a link out of the root is refused before the command runs.
     const work = prepareTrial(sb, repo.bundle);
     rmSync(work, { recursive: true, force: true });
     symlinkSync(outside, work);
@@ -288,7 +252,6 @@ test("scrub resets the home to the template", { skip: SKIP }, () => {
     writeTree(sb.home, { ".claude/.credentials.json": login, ".claude/settings.json": '{"owner":"original"}\n' });
     assert.equal(leftovers(sb), 0);
 
-    // One planted top-level file and one changed template file: two leftovers.
     writeFileSync(join(sb.home, "planted.txt"), "x");
     writeFileSync(join(sb.template, ".claude", "settings.json"), '{"owner":"changed"}\n');
     assert.equal(leftovers(sb), 2);
@@ -332,11 +295,8 @@ test("nothing outlives a trial", { skip: SKIP }, () => {
   const sb = sandbox();
   try {
     writeTree(sb.template, { ".claude/settings.json": '{"owner":"original"}\n' });
-    // A skill a trial left in ROOT, and a home link that stands on the way to a login path.
     writeTree(join(sb.root, "stash"), { ".claude/skills/x/SKILL.md": "skill\n" });
     symlinkSync(join(sb.root, "stash", ".claude"), join(sb.home, ".claude"));
-    // Three leftovers: the link on the way to the login path; the template's settings file, which the home path
-    // reaches through the link and does not find there (cmp fails); and the stash entry in ROOT.
     assert.equal(leftovers(sb), 3);
 
     const scrubbed = run(sb, ["scrub"]);
@@ -344,14 +304,12 @@ test("nothing outlives a trial", { skip: SKIP }, () => {
     assert.equal(lstatSync(join(sb.home, ".claude")).isSymbolicLink(), false);
     assert.equal(readFileSync(join(sb.home, ".claude", "settings.json"), "utf8"), '{"owner":"original"}\n');
     assert.equal(existsSync(join(sb.home, ".claude", "skills")), false);
-    // scrub leaves ROOT alone, so only the stash entry remains.
     assert.equal(leftovers(sb), 1);
 
     assert.equal(run(sb, ["clean"]).status, 0);
     assert.equal(existsSync(join(sb.root, "stash")), false);
     assert.equal(leftovers(sb), 0);
 
-    // A file in EVAL_TMP is one leftover, and clean removes it.
     writeFileSync(join(sb.tmp, "solution.txt"), "x");
     assert.equal(leftovers(sb), 1);
     assert.equal(run(sb, ["clean"]).status, 0);
@@ -362,7 +320,6 @@ test("nothing outlives a trial", { skip: SKIP }, () => {
   }
 });
 
-// Runs the launcher from a directory its account cannot enter, as a caller in another account's home does.
 function fromClosed(sb: Sandbox, args: readonly string[]) {
   const closed = mkdtempSync(join(sb.dir, "closed-"));
   return spawnSync("/bin/sh", ["-c", 'cd "$1" && chmod 000 . && [ ! -r . ] && shift && exec /bin/sh "$@"', "sh", closed, sb.script, ...args], {
@@ -409,7 +366,6 @@ test("stop refuses another account", { skip: SKIP }, async () => {
 });
 
 test("stop removes the account's System V objects and its files in the added directories", { skip: SKIP || !["ipcrm", "ipcmk"].every(tool => existsSync(`/usr/bin/${tool}`)) && "util-linux ipcrm and ipcmk are missing" }, t => {
-  // The launcher's own list names the directories the review found, and each is used only when it exists.
   const listed = readFileSync(LAUNCHER, "utf8").match(/^STOP_DIRS="([^"]*)"$/m)?.[1].split(" ") ?? [];
   for (const dir of ["/tmp", "/var/tmp", "/dev/shm", "/dev/mqueue", "/run/lock", "/var/crash"]) assert.ok(listed.includes(dir), `${dir} is in STOP_DIRS`);
 
@@ -417,27 +373,18 @@ test("stop removes the account's System V objects and its files in the added dir
   const lockFile = join("/run/lock", `eval-launcher-test-${process.pid}`);
   let segment = "", created = false;
   try {
-    // This copy's stop removes every System V object of the test user and every entry it owns in /run/lock, so it
-    // runs only when the user owns none. The test counts them itself: the launcher's probe is under test here, and
-    // must not decide whether its own stop runs.
     const before = [...ownSysV(), ...ownEntries("/run/lock")];
     if (before.length > 0) { t.skip(`the test user already owns ${before.length} System V objects or entries in /run/lock, and stop would remove them`); return; }
     assert.equal(leftovers(sb), 0, "the probe counts nothing for a user that owns nothing");
     let writable = true;
     try { accessSync("/run/lock", constants.W_OK); } catch { writable = false; }
-    // `wx` fails on a file that already exists, so the test never takes over, and later removes, a file it did not
-    // make. Nothing is written, so no failed write can leave a file that cleanup does not know about.
     if (writable) { closeSync(openSync(lockFile, "wx")); created = true; }
     else t.diagnostic("/run/lock is not writable by the test user, so the file in it is not asserted");
     const made = spawnSync("/usr/bin/ipcmk", ["-M", "4096"], { encoding: "utf8" });
     assert.equal(made.status, 0, made.stderr);
     segment = /(\d+)\s*$/m.exec(made.stdout)?.[1] ?? "";
     assert.match(segment, /^\d+$/, `ipcmk printed no id: ${made.stdout}`);
-    // The probe reports the segment, and the file when there is one, as leftovers.
     assert.equal(leftovers(sb), writable ? 2 : 1, "the probe counts the account's shared memory and its file, and nothing else");
-    // The last look before stop, again without the launcher: the user owns what the test made and nothing else. From
-    // here to the removal the copy starts a shell and a few commands and reads the tables, with no wait, so stop can
-    // take only an object that some other process of the user makes in that short time.
     assert.deepEqual(ownSysV(), [`shm:${segment}`], "the user owns the test's segment and no other System V object");
     assert.deepEqual(ownEntries("/run/lock"), writable ? [lockFile] : [], "the user owns the test's file in /run/lock and nothing else there");
 
@@ -448,7 +395,6 @@ test("stop removes the account's System V objects and its files in the added dir
     assert.equal(existsSync(lockFile), false, "stop removed the file");
     assert.equal(leftovers(sb), 0);
   } finally {
-    // Only what the test made, and the segment only while the kernel still lists that id as the user's.
     try {
       if (segment && ownSysV().includes(`shm:${segment}`)) spawnSync("/usr/bin/ipcrm", ["-m", segment]);
     } finally {
@@ -459,13 +405,8 @@ test("stop removes the account's System V objects and its files in the added dir
 });
 
 test("the probe counts the test user's System V objects as the kernel lists them", { skip: SKIP }, t => {
-  // This copy reads the kernel's tables and never runs stop, so it also runs on a busy account, where the stop test
-  // skips. Its own shared directory is empty, so the probe's count is the user's System V objects alone.
   const sb = sandbox(undefined, { kernelTables: true });
   try {
-    // Another process of the user can make or remove an object while the probe runs. A round counts only when the
-    // user's objects were the same before and after it, and even then an object that came and went in between can
-    // put the probe one off. So one round that agrees passes, and the test fails only when every such round disagreed.
     const disagreed: string[] = [];
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const before = ownSysV(), counted = leftovers(sb), after = ownSysV();
@@ -509,11 +450,8 @@ test("the proxy credential is in no process's arguments while a command runs", {
     assert.ok(all.some(p => p.args.includes("--kill-after=10")), "the launcher's timeout is running, so its arguments were checked");
     assert.deepEqual(all.filter(p => p.args.join(" ").includes(secret)).map(p => p.args[0]), []);
   } finally {
-    // The launcher's timeout runs in a process group of its own, so the kill of the shell below does not reach the
-    // sleep. A sleep that started after the search above gave up is looked for once more, by its random duration.
     sleeperPid ||= sleeper();
-    if (sleeperPid) { try { process.kill(sleeperPid, "SIGKILL"); } catch { /* already gone */ } }
-    // A child that already ended emits no second exit event, and a wait for one would never end.
+    if (sleeperPid) { try { process.kill(sleeperPid, "SIGKILL"); } catch { } }
     if (child && child.exitCode === null && child.signalCode === null) {
       const ended = new Promise(resolve => child?.once("exit", resolve));
       child.kill("SIGKILL");
@@ -537,7 +475,6 @@ test("clean replaces a trials link or file with a directory and never follows th
     assert.deepEqual(readdirSync(trials), []);
     assert.equal(readFileSync(join(elsewhere, "keep.txt"), "utf8"), "keep\n", "the link's target is untouched");
 
-    // A plain file in its place is replaced the same way.
     rmSync(trials, { recursive: true });
     writeFileSync(trials, "x");
     assert.equal(run(sb, ["clean"]).status, 0);

@@ -8,19 +8,15 @@ import { INTERRUPT_CLASSES, type InterruptClass } from "./permission-policy.js";
 import { learningPurpose, type SessionPurpose } from "./types.js";
 import { createHash } from "node:crypto";
 
-/** The subject part of a fuse collapse id. A push service limits the id's length, and a project id has no limit, so a long one is replaced by a digest. */
 const fuseSubject = (projectId: string | undefined) =>
   projectId === undefined ? "host" : projectId.length <= 40 ? projectId : createHash("sha256").update(projectId, "utf8").digest("hex").slice(0, 32);
 
 type Row = {
   id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } }; purpose?: SessionPurpose;
-  /** A headless session's permission channel: the call that waits for the owner, and the latest call it could not hold. */
   permissionChannel?: { waiting?: { interruptClass: string }; notice?: { id: string; interruptClass?: string } };
-  /** Set by the notifier on the copy of a row that announces a permission notice. */
   permissionNotice?: true;
 };
 type TeamRow = { id: string; title: string; status: string; reason?: string; resumable?: boolean; goal?: boolean; mission?: boolean };
-/** Who a team member's open prompt waits on: the run's delegated coordinator, the owner, or a review the run has not started yet. */
 export type PromptOwner = "coordinator" | "user" | "undecided";
 type Teams = { statuses(): TeamRow[]; promptOwner?(sessionId: string, prompt: Prompt): PromptOwner };
 type GoalRow = { id: string; title: string; status: string; reason?: string };
@@ -29,7 +25,6 @@ type StorageVolume = { label: string; path: string; fullness: number; availableI
 type StorageAlert = { label: string; fullness: number; availableInodes: number; availableBytes: number; fullnessBy: "bytes" | "inodes"; critical: boolean };
 type StorageCrossing = { previous: number; warningArmed: boolean; criticalArmed: boolean };
 
-/** The owner rule shared by push delivery and the decision queue. */
 export function promptOwner(
   row: Pick<Row, "id" | "attention">,
   permissions?: Pick<PermissionDeliveryService, "holder">,
@@ -38,16 +33,14 @@ export function promptOwner(
   const prompt = row.attention.prompt;
   if (row.attention.state !== "needs-you" || !prompt) return "user";
   let holder: "agent" | "owner" | "undecided" = "owner";
-  if (permissions) try { holder = permissions.holder(row.id, prompt.id); } catch { /* An unavailable holder leaves the prompt with the owner. */ }
+  if (permissions) try { holder = permissions.holder(row.id, prompt.id); } catch {}
   if (holder !== "owner") return holder === "agent" ? "coordinator" : "undecided";
   if (!teams?.promptOwner) return "user";
   try { return teams.promptOwner(row.id, prompt); } catch { return "user"; }
 }
 
 const PUSH_STATES = new Set(["needs-you", "turn-finished", "exited", "recording-error"]);
-/** How long a delegated run may take to pick a member's prompt up for review before the owner hears about it. */
 const REVIEW_START_GRACE_MS = 45_000;
-/** A review window is five minutes; a prompt held longer than this reaches the owner even if the run never settled it. */
 const REVIEW_HOLD_LIMIT_MS = 8 * 60_000;
 const REMOVED_LIMIT = 1024;
 const GOAL_EVENTS: Record<string, { event: string; title: string; body: string; priority: "default" | "high" }> = {
@@ -70,10 +63,8 @@ const TEAM_EVENTS: Record<string, { event: string; title: string; body: string; 
 
 export class Notifier {
   private seen = new Map<string, string>();
-  /** The last headless permission notice announced for each session. */
   private notices = new Map<string, string>();
   private noticesPrimed = false;
-  /** Needs-you prompts held back because the run's coordinator may answer them, by session id. */
   private deferred = new Map<string, { key: string; since: number }>();
   private teamStatus = new Map<string, string>();
   private goalStatus = new Map<string, string>();
@@ -93,27 +84,16 @@ export class Notifier {
     private readonly goals?: { statuses(): GoalRow[] },
     private readonly storage?: { sample(): Promise<StorageVolume[]> },
     private readonly fuse?: Pick<FuseService, "interrupts" | "markAnnounced">,
-    /**
-     * Who holds an open dialog for the permission agent. Asked first; a dialog it leaves to the owner falls back to the run's coordinator review.
-     * `ownerClass` names the interrupt class for which it left a dialog to the owner, and the push names it.
-     */
     private readonly permissions?: Pick<PermissionDeliveryService, "holder" | "ownerClass">,
-    /**
-     * The main check's notices (R9). A notice is accepted when a device got its message. Any other is left alone:
-     * the service offers it again a minute after it was taken.
-     */
     private readonly mainCheck?: Pick<MainCheckService, "notices" | "accepted">,
   ) {}
-  /** After a fuse push that reached no device, the time of the next attempt, on a clock that never steps back. */
   private fuseRetryAt = 0;
   private monotonic = () => performance.now();
-  /** Lifecycle baselines are taken now, synchronously, so a change during the first interval is not absorbed as startup state. */
   start() { this.teamEvents(); this.goalEvents(); this.timer = setInterval(() => void this.tick().catch(() => {}), this.options.intervalMs); this.timer.unref(); }
   stop() { clearInterval(this.timer); }
   async tick() {
     const due: Row[] = [];
     try {
-      // A learning session (replay or gate) never reaches the owner's devices.
       const rows = ((await this.manager.list()) as unknown as Row[]).filter(row => !learningPurpose(row.purpose));
       const now = Date.now();
       for (const row of rows) {
@@ -126,8 +106,6 @@ export class Notifier {
           if (this.promptOwner(row) !== "user") { this.deferred.set(row.id, { key, since: now }); continue; }
           due.push(row);
         } else if (held && held.key === key) {
-          // A held prompt reaches the owner once it is theirs: the coordinator escalated it, the
-          // run never started a review in time, or the hold outlived any possible review.
           const owner = this.promptOwner(row);
           const heldFor = now - held.since;
           if (owner === "user" || (owner === "undecided" && heldFor >= (this.options.reviewGraceMs ?? REVIEW_START_GRACE_MS)) ||
@@ -139,8 +117,6 @@ export class Notifier {
       }
       due.push(...this.channelNotices(rows));
       this.prune("session", this.seen, new Set(rows.map(row => row.id)));
-      // A session missing from one listing keeps its hold, so a prompt that comes back unchanged
-      // can still reach the owner; the hold limit bounds how long an absent session is remembered.
       for (const [id, held] of this.deferred) if (!this.seen.has(id) && now - held.since >= (this.options.reviewHoldLimitMs ?? REVIEW_HOLD_LIMIT_MS)) this.deferred.delete(id);
       this.primed = true;
     } catch {}
@@ -151,7 +127,6 @@ export class Notifier {
     if (!due.length && !lifecycle.length && !storageDue.length && !fuseDue.length && !mainCheckDue.length) return;
     const devices = this.store.list();
     if (!devices.length) return;
-    // The fuse messages stay last: their ticket offsets are counted from the end of the list.
     const messages = [
       ...due.flatMap((row) => devices.map((d) => this.message(row, d.token))),
       ...lifecycle.flatMap((item) => devices.map((d) => this.lifecycleMessage(item, d.token))),
@@ -167,20 +142,15 @@ export class Notifier {
       console.warn(`push: sender failed (${(error as Error).name})`);
       return;
     }
-    // A main-check notice is accepted when one of the devices got an ok ticket for its message. One that reached
-    // nobody gets no answer, so it is tried again after its minute in flight, not on every tick.
     mainCheckDue.forEach((item, index) => {
       const reached = devices.some((_device, device) => tickets[mainFirst + index * devices.length + device]?.status === "ok");
       if (reached) this.mainCheck?.accepted(item.projectId, item.notice, item.outcome);
     });
-    // The sender resolves even when the push service refuses a message, with one ticket per message. A trip is
-    // marked when at least one device received it, so a push that reached nobody is offered again.
     if (fuseDue.length) {
       const first = messages.length - fuseDue.length * devices.length;
       const reached = fuseDue.filter((_item, index) =>
         devices.some((_device, device) => tickets[first + index * devices.length + device]?.status === "ok"));
       if (reached.length) this.fuse?.markAnnounced(reached.map((item) => item.tripId));
-      // A trip that reached nobody is tried again after a minute, not on every tick.
       if (reached.length < fuseDue.length) this.fuseRetryAt = this.monotonic() + 60_000;
     }
     const failures = new Set<string>();
@@ -191,15 +161,10 @@ export class Notifier {
     });
     if (failures.size) console.warn(`push: ${[...failures].join(", ")}`);
   }
-  /**
-   * R9: the main check's notices the owner may hear about now. Nothing is taken unless the event is enabled. A taken
-   * notice is in flight in the service for a minute, so with no device registered it is asked for once a minute.
-   */
   private mainCheckEvents(): MainCheckNotice[] {
     if (!this.mainCheck || !this.enabled("main-check")) return [];
     try { return this.mainCheck.notices(); } catch { return []; }
   }
-  /** The text is the host's, made from the notice's facts. No line of a command's output ever enters a push. */
   private mainCheckMessage(item: MainCheckNotice, to: string) {
     const { summary } = item;
     const head = summary.head.slice(0, 7);
@@ -225,7 +190,6 @@ export class Notifier {
       const fullnessBy = volume.fullnessBy ?? "inodes";
       const previous = this.storageStatus.get(volume.label);
       if (!previous) {
-        // Tell the owner once at startup when a volume is already high; choose its current severity and do not emit both crossings.
         const critical = volume.fullness >= 0.95;
         if (critical || volume.fullness >= 0.85) due.push({ ...volume, fullnessBy, critical });
         this.storageStatus.set(volume.label, { previous: volume.fullness, warningArmed: volume.fullness < 0.85, criticalArmed: volume.fullness < 0.95 });
@@ -245,7 +209,6 @@ export class Notifier {
     }
     return due;
   }
-  /** Open spend-fuse trips the owner has not been told about. Nothing is read or marked unless the event is enabled. */
   private fuseEvents(): FuseInterrupt[] {
     if (!this.fuse || !this.enabled("autonomy-interrupt") || this.monotonic() < this.fuseRetryAt) return [];
     try { return this.fuse.interrupts(); } catch { return []; }
@@ -272,12 +235,9 @@ export class Notifier {
       channelId: "attention" as const, priority: item.critical ? "high" as const : "default" as const, collapseId: `storage:${item.label}`,
     };
   }
-  /** An open permission prompt is the owner's unless the permission agent or the member's run can still decide it. */
   private promptOwner(row: Row): PromptOwner {
-    // The permission agent holds the push only while it can still decide the dialog; "undecided" gets the review grace.
     return promptOwner(row, this.permissions, this.teams);
   }
-  /** The class a permission dialog was left to the owner for. Only one of the host's own class identifiers is ever named. */
   private ownerClass(row: Row): InterruptClass | undefined {
     const prompt = row.attention.prompt;
     if (row.attention.state !== "needs-you" || !prompt || !this.permissions?.ownerClass) return undefined;
@@ -301,7 +261,6 @@ export class Notifier {
     this.goalsPrimed = true;
     return due;
   }
-  /** A record first seen after priming announces its start and, if it is already stuck or done, that status too. */
   private lifecycle(kind: "goal" | "team", rows: TeamRow[], statuses: Map<string, string>, primed: boolean, map: typeof TEAM_EVENTS, startedTitle: string) {
     const due: Lifecycle[] = [];
     for (const row of rows) {
@@ -348,10 +307,6 @@ export class Notifier {
       data: { url: `/${item.kind}/${item.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
       priority: item.priority, collapseId: `${item.kind}:${item.id}` };
   }
-  /**
-   * A headless call that needed the owner and could not wait was denied: the owner hears of it once, with its class.
-   * Notices present at startup are taken as already announced.
-   */
   private channelNotices(rows: Row[]): Row[] {
     const due: Row[] = [];
     for (const row of rows) {
@@ -391,7 +346,6 @@ export class Notifier {
         : row.attention.state === "exited" ? ["Session exited", `${row.title} exited`]
         : ["Recording stopped", `${row.title} stopped recording`];
     const body = this.options.detail === "full" ? (row.attention.state === "turn-finished" ? row.reading?.now?.text : undefined) || row.attention.now || minimal : minimal;
-    // A dialog the permission agent left to the owner for an interrupt class names that class, as a headless call does.
     const interrupt = this.ownerClass(row);
     return {
       to, title, body: interrupt ? `${body} (${interrupt})` : body,

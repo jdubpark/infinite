@@ -8,7 +8,6 @@ export type HostLoadProbe = () => HostReading;
 const GiB = 2 ** 30;
 export const HOST_LOAD_REASON_PREFIX = "Waiting for host capacity: ";
 
-/** Linux reports MemAvailable, which counts reclaimable cache; other platforms fall back to free memory. */
 function availableMemoryBytes() {
   if (process.platform === "linux") {
     const line = readFileSync("/proc/meminfo", "utf8").split("\n").find(item => item.startsWith("MemAvailable:"));
@@ -24,7 +23,6 @@ export const readHostLoad: HostLoadProbe = () => ({
   cpus: availableParallelism(),
 });
 
-/** An automatic launch that the host's own load would make worse. Owner-started sessions never pass through this. */
 export class LaunchHeldError extends Error {
   constructor(readonly reason: string) {
     super(reason);
@@ -32,7 +30,6 @@ export class LaunchHeldError extends Error {
   }
 }
 
-/** Only an empty reason or an earlier host-load hold may be replaced or cleared; any other reason belongs to its owner. */
 export function holdsHostLoadReason(reason: string | undefined) {
   return reason === undefined || reason.startsWith(HOST_LOAD_REASON_PREFIX);
 }
@@ -47,7 +44,6 @@ export class HostLoadGate {
     private readonly ttlMs = 2000,
   ) {}
 
-  /** The reason automatic launches must wait, or undefined. Re-reads the host at most once per ttlMs. */
   held(): string | undefined {
     if (!this.limits) return undefined;
     const now = Date.now();

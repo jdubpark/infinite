@@ -17,7 +17,6 @@ import { Choices, Disclosure, LineupView, providerName, t } from "./parts";
 
 const inFlight = new Set<string>();
 
-/** Starts a team from a feature request or PRD. Creation is an owner action. */
 export function TeamCreate({ connection }: { connection: Connection }) {
   const router = useRouter();
   const keyboardPadding = useKeyboardPadding();
@@ -36,7 +35,6 @@ export function TeamCreate({ connection }: { connection: Connection }) {
   const [provider, setProvider] = useState(pending?.provider);
   const [sending, setSending] = useState(false);
   const [retrying, setRetrying] = useState(false);
-  // A send started before this screen remounted is still in flight; its result re-renders through the store.
   const busy = sending || Boolean(pending && inFlight.has(pending.requestId));
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
@@ -51,7 +49,6 @@ export function TeamCreate({ connection }: { connection: Connection }) {
   const dictation = useDictation({ connection, value: objective, onChange: setObjective, maxLength: 24000, disabled: locked });
   async function submit() {
     if (busy || !allowed) return;
-    // A retry resends the recorded request even if this host's settings have changed since.
     if (!pending && (!projectId || !selectedProvider)) return;
     const request = pending ?? teamCreations.begin(machine, {
       requestId: Crypto.randomUUID(), projectId: projectId!, provider: selectedProvider!, useConfiguredLineup: lineupSelected,

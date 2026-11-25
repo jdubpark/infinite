@@ -32,7 +32,6 @@ export type TeamView = {
   providerLimits?: ProviderLimit[];
   usage?: TeamUsage;
   linear?: LinearTrackingView;
-  /** A mission subteam is controlled from its mission. */
   missionId?: string;
   goal?: { id: string; revision: number; cycle: number; successCriteria: string; nonGoals: string[]; allowedPaths: string[]; evidence: string[]; previousWork: string[]; deadlineAt: string; maxMembers: number; parentRunId?: string };
   brief?: TeamBrief;
@@ -42,10 +41,8 @@ export type TeamView = {
   resumable?: boolean;
   continuable?: boolean;
   continuations?: TeamContinuation[];
-  /** Omitted by older hosts. */
   workers?: { limit: number; max: number; running: number; ready: number };
 };
-/** A run as `GET /teams?view=list` lists it. The long detail (the request, check output, reports, task instructions) comes from `GET /teams/:id`. */
 export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "revision" | "status" | "createdAt" | "updatedAt"
   | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "missionId" | "resumable" | "continuable" | "workers"> & {
   members: (Omit<TeamMember, "cwd" | "baseCommit" | "modelProfile" | "usage"> & { startedAt?: string; reportedAt?: string; lastActivityAt?: string; pendingLimit?: boolean; stalledAt?: string;
@@ -83,7 +80,6 @@ const roles: Record<TeamRole, { name: string; description: string }> = {
   evaluator: { name: "Evaluator", description: "Reads the finished work and reports a provisional verdict against the objective." },
 };
 const date = (value: string) => new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-/** The name of the role that asked a decision, or "Team" when its member is no longer listed. */
 function askedBy(team: TeamView, decision: TeamDecision) {
   const member = team.members.find(item => item.memberId === decision.memberId);
   return member ? roles[member.role].name : "Team";
@@ -92,7 +88,6 @@ const statusClass = (status: TeamStatus) => ["needs-input", "blocked", "paused"]
 function Status({ status }: { status: TeamStatus }) { return <span className={"team-status " + statusClass(status)}><span className="dot" />{labels[status]}</span>; }
 function RoleGuide() { return <div className="team-roles" aria-label="Team responsibilities">{Object.entries(roles).map(([id, role]) => <div key={id}><strong>{role.name}</strong><p>{role.description}</p></div>)}</div>; }
 const leadLabel = (team: Pick<TeamListItem, "lineup" | "provider">) => team.lineup ? "Coordinator: " + team.lineup.coordinator.label : names[team.provider] ?? team.provider;
-/** Older hosts omit worker counts, so their reported parallelism backs the live status. */
 export function workerStatus(parallelism: number, workers?: NonNullable<TeamView["workers"]>) {
   if (!workers) return `Up to ${parallelism} workers`;
   const waiting = workers.ready > 0 && workers.running >= workers.limit ? ` · ${workers.ready} ready ${workers.ready === 1 ? "task" : "tasks"} waiting for a worker` : "";
@@ -102,7 +97,6 @@ export function profileSetting(profile: TeamModelProfile) { return profile.provi
 export function ModelProfile({ profile }: { profile: TeamModelProfile }) {
   return <span className="team-model-profile"><strong>{profile.label}{profile.tier && <span className="team-profile-tier">{profile.tier}</span>}</strong><span>Requested: {names[profile.provider] ?? profile.provider} · <code>{profile.model}</code> · {profileSetting(profile)}</span>{profile.limitFallback && <span>On a usage limit: <code>{profile.limitFallback}</code></span>}{profile.dataUse === "contributor" && <span className="team-data-use">Contributor data use is enabled for this profile. Its provider’s contributor terms apply.</span>}</span>;
 }
-/** Shown while the host remembers a provider at its limit. Reset times are the provider's own statement. */
 export function ProviderLimitNotice({ limits }: { limits?: ProviderLimit[] }) {
   const now = Date.now(), active = (limits ?? []).filter(limit => Date.parse(limit.expiresAt) > now);
   if (!active.length) return null;
@@ -123,7 +117,7 @@ export function Lineup({ lineup }: { lineup: TeamLineup }) {
 }
 export function EvidenceSource({ source }: { source: string }) {
   let url: URL | undefined;
-  try { const candidate = new URL(source); if (["https:", "http:"].includes(candidate.protocol) && !candidate.username && !candidate.password) url = candidate; } catch { /* Notes and repository paths stay as text. */ }
+  try { const candidate = new URL(source); if (["https:", "http:"].includes(candidate.protocol) && !candidate.username && !candidate.password) url = candidate; } catch {}
   return url ? <a href={url.href} target="_blank" rel="noopener noreferrer">{source}</a> : <span>{source}</span>;
 }
 export function EvidenceList({ evidence }: { evidence: TeamEvidence[] }) {
@@ -143,7 +137,6 @@ function SetupNotice({ me }: { me: Me }) {
   return null;
 }
 
-/** Blocked runs lead every team list; each group keeps its received order. */
 const blockedFirst = (teams: TeamListItem[]) => [...teams.filter(team => team.status === "blocked"), ...teams.filter(team => team.status !== "blocked")];
 
 export function TeamPicker({ teams, selected, loading, onSelect }: { teams: TeamListItem[]; selected: string | null; loading: boolean; onSelect: (id: string) => void }) {
@@ -459,7 +452,6 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
   const attention = memberSessions.filter(session => session.attention?.state === "needs-you");
   const selectedMember = team.members.find(member => member.memberId === agentId);
   const workersText = workerStatus(team.parallelism, team.workers);
-  /** A mission's coordinator runs this team; people read it and talk to the coordinator from the mission. */
   const missionManaged = Boolean(team.missionId);
   const continuationComposer = me.role === "owner"
     ? <form className="team-continuation-form" onSubmit={event => { event.preventDefault(); if (!busy && !pending) void mutate("/teams/" + id + "/continue", "Continue development", direction.trim() || undefined); }}>

@@ -39,7 +39,6 @@ export function BoardHome() {
     await removal;
     if (profiles.length === 1) router.replace("/pair");
   }
-  // The tab bar owns the bottom inset, including Android's system navigation area.
   if (!loaded || !connection) return <SafeAreaView edges={["top", "left", "right"]} style={s.safe}><ActivityIndicator style={s.loading} color={theme.colors.forest} /></SafeAreaView>;
   return <SafeAreaView edges={["top", "left", "right"]} style={s.safe}>
     <Board key={active} connection={connection} machines={profiles} onSelectMachine={id => void select(id)}

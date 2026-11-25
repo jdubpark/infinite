@@ -10,13 +10,11 @@ import { teamReportSchema, type TeamReport } from "../packages/host/src/team-typ
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
 const spec = readFileSync(fileURLToPath(new URL("../docs/superpowers/specs/2026-11-12-outcome-ledger-design.md", import.meta.url)), "utf8");
-// The team service and the modules split out of it, which emit through their host.
 const teamsSource = ["teams.ts", "team-retention.ts", "team-recovery.ts"]
   .map(file => readFileSync(fileURLToPath(new URL(`../packages/host/src/${file}`, import.meta.url)), "utf8")).join("\n");
 
 const LITERAL_KIND = /^"[a-z.-]+"$/;
 
-/** Kinds named in the first cell of each row of the part 1 table. */
 function specKinds(): string[] {
   const start = spec.indexOf("### Part 1."), end = spec.indexOf("### Part 2.");
   assert.ok(start >= 0 && end > start, "the spec has a part 1 table");
@@ -29,14 +27,12 @@ test("every spec event kind has an emission site, and every emitted kind is in t
   const calls = [...teamsSource.matchAll(/this\.(?:host\.)?emit(?:With)?\(\s*[\w.]+\s*,\s*([^,\s)]+)/g)];
   const emitted = calls.filter(call => LITERAL_KIND.test(call[1]!)).map(call => call[1]!.slice(1, -1));
   const computed = calls.filter(call => !LITERAL_KIND.test(call[1]!)).map(call => call[0]);
-  // The one forwarding call inside emitWith is the only place a kind is passed on as a variable.
   assert.deepEqual(computed, ["this.emit(stored, kind"], "every other emit call names its kind as a literal");
 
   const declared = specKinds();
   assert.equal(new Set(declared).size, declared.length, "no kind is listed twice");
   assert.equal(declared.length, 26, "the part 1 table lists 26 kinds");
   const sourceKinds = new Set(emitted);
-  // Both directions in one assertion, so a failure names every kind on either side.
   assert.deepEqual({
     emittedButNotInSpec: [...sourceKinds].filter(kind => !declared.includes(kind)),
     inSpecButNotEmitted: declared.filter(kind => !sourceKinds.has(kind)),
@@ -56,7 +52,6 @@ test("every member.stopped reason has an emission site", () => {
   for (const reason of MEMBER_STOP_REASONS) assert.ok(stopLiterals.has(reason), `a memberStopped call names ${reason}`);
 });
 
-// One sample per report kind. The record type forces an entry for every kind the schema accepts.
 const HASH = "a".repeat(40), MERGE = "b".repeat(40), BASE = "c".repeat(40);
 const REPORT_SAMPLES: Record<TeamReport["kind"], TeamReport> = {
   "permission-decision": { kind: "permission-decision", decisionId: randomUUID(), verdict: "approve-once", summary: "The check needs the file." },

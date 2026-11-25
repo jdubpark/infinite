@@ -15,10 +15,8 @@ function readLocation(machine: string): Location {
   const goal = hash.match(/^#\/goals\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i);
   const mission = hash.match(/^#\/missions\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i);
   const decisions = hash === "#/decisions";
-  // Project IDs are host-configured slugs, so the cost routes accept any single path segment.
   const swarm = hash.match(/^#\/swarm(?:\/(wall|graph))?$/);
   const cost = hash.match(/^#\/cost(?:\/(projects|models)(?:\/([^/]+))?)?$/);
-  // Decision ids are host-assigned, so a decision sits under its own segment and can never be read as the overview.
   const permission = hash.match(/^#\/permissions(?:\/(overview)|\/decisions\/([^/]+))?$/);
   return { id: match?.[1] ?? null, tab: (match?.[2] as SessionTab) ?? "chat", creating: hash === "#/new",
     teams: hash === "#/teams" || hash === "#/teams/new" || Boolean(team), teamId: team?.[1] ?? null, creatingTeam: hash === "#/teams/new",
@@ -29,7 +27,6 @@ function readLocation(machine: string): Location {
     permissions: Boolean(permission), permissionOverview: permission?.[1] === "overview", decisionId: permission?.[2] ? decodeURIComponent(permission[2]) : null };
 }
 
-// Only the route lives in the URL. Drafts, output and credentials never do.
 export function useSessionLocation(machine = "direct") {
   const prefix = machine === "direct" ? "" : `/machines/${machine}`;
   const [location, setLocation] = useState(() => readLocation(machine));

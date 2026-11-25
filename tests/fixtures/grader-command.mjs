@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-// Same-user stand-in for the grader launcher (deploy/ubuntu/grader-command.sh), for tests only.
-// It runs as the current user and follows the launcher's argument contract. Flags come before the operation.
-// It never signals a process group it did not start, and never deletes anything outside its --root.
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -38,7 +35,6 @@ for (; i < args.length && args[i].startsWith("--"); i++) {
 const [op, ...rest] = args.slice(i);
 if (!opts.root) process.exit(64);
 
-// The process groups this fixture started. Kept beside the root, so `clean` cannot remove it.
 const groupsFile = `${opts.root}.groups`;
 
 function exit(code, data) {
@@ -59,7 +55,6 @@ function readable(file) {
   }
 }
 
-/** Removes every entry of dir except the named ones. A missing dir is left alone. */
 function pruneTo(dir, keep) {
   if (!fs.existsSync(dir)) return;
   for (const name of fs.readdirSync(dir)) {
@@ -80,7 +75,6 @@ function probe(canaries) {
     freeInodes: opts.freeInodes,
     ancestorsWritable: opts.ancestorsWritable,
     tools: !opts.toolsMissing,
-    // Version 1 launchers print no version field; --no-version reproduces that.
     ...(opts.noVersion ? {} : { version: 2 }),
   })));
 }
@@ -117,7 +111,7 @@ function run(job, dir, secondsText, argv) {
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
-    try { process.kill(-child.pid, "SIGKILL"); } catch { /* already gone */ }
+    try { process.kill(-child.pid, "SIGKILL"); } catch { }
   }, seconds * 1000);
   child.on("error", () => { clearTimeout(timer); exit(125); });
   child.on("exit", (code) => {
@@ -141,7 +135,6 @@ function read(job, report, maxText) {
   exit(0, fs.readFileSync(file));
 }
 
-// Streams a bundle of refs/heads/trial from the task clone, as the launcher's export does. Exit 2 when the clone or the branch is missing.
 function exportTrial(job) {
   if (!JOB_RE.test(job)) exit(64);
   const cwd = jobPath(job, "work", "task");

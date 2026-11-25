@@ -10,6 +10,8 @@ let focused = true;
 let appState: AppStateStatus = "active";
 let resolveFirstPoll: ((value: string) => void) | undefined;
 let failPolls = false;
+let pendingLiveLoad: { resolve(value: string): void; reject(error: Error): void } | undefined;
+let holdNextLoad = false;
 const appStateListeners = new Set<AppStateListener>();
 
 const slot = () => (slots[cursor++] ??= {});
@@ -105,8 +107,15 @@ export const monitor = {
     resolveFirstPoll = undefined;
   },
   failPolls(value: boolean) { failPolls = value; },
+  holdNextLiveLoad() { holdNextLoad = true; },
+  resolveLiveLoad(value: string) { pendingLiveLoad?.resolve(value); pendingLiveLoad = undefined; },
+  rejectLiveLoad(error: Error) { pendingLiveLoad?.reject(error); pendingLiveLoad = undefined; },
   load() {
     this.liveLoads++;
+    if (holdNextLoad) {
+      holdNextLoad = false;
+      return new Promise<string>((resolve, reject) => { pendingLiveLoad = { resolve, reject }; });
+    }
     return Promise.resolve(`live-${this.liveLoads}`);
   },
   openEvents(_connection: unknown, _options: EventOptions) {

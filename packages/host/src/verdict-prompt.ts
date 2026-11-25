@@ -7,12 +7,10 @@ import { VERDICT_LIMITS } from "./verdict-types.js";
 
 export const VERDICT_PROMPT_BYTES = 8 * 1024;
 export const VERDICT_CONTEXT_BYTES = 1024 * 1024;
-/** Rubric version 1: the items a judgement criterion may name. */
 export const RUBRIC_V1 = ["owner-text", "method-applied"] as const;
 
 const L = VERDICT_LIMITS;
 
-/** Fixed text only: it takes no run, so no run data can reach it (Trust boundary). */
 export function evaluatorPrompt(provider: Provider, profile?: TeamModelProfile): string {
   const sections = [
     "You are the team's evaluator. Judge each criterion in your context file from that file and the head commit of your working copy, and nothing else. You are read-only: you do not plan, change files, post entries, ask for permissions, or approve or block anything. Your report is a claim the host checks, not authority.",
@@ -40,17 +38,10 @@ export type VerdictContext = {
     criteria: { id: string; statement: string; check: Check; producer: "host" | "evaluator" | "owner"; threshold: Threshold }[] };
   rubric: { version: number; items: readonly string[] };
   changedPaths: { paths: string[]; truncated: boolean };
-  /** The final check round at the head: names and statuses, never output. */
   checks: { name: string; status: string }[];
-  /** Criterion receipts at the head only. */
   receipts: { handle: string; kind: string; id: string; outcome: ReceiptOutcome }[];
 };
 
-/**
- * The evaluator's context: owner text and host facts only. No assumption, question, proposal, log entry, `latest`, member report,
- * brief, finding, steering, earlier verdict, rubric score, routing, or evaluator identity. Active criteria only; c0's statement is
- * the objective. Undefined when the JSON is over VERDICT_CONTEXT_BYTES (counted in bytes); the caller refuses with `context-too-large`.
- */
 export function verdictContext(input: { run: TeamRun; record: ObjectiveRecord; head: string; kind: "reviewed" | "no-change";
   receipts?: readonly ObjectiveReceipt[]; changedPaths?: { paths: string[]; truncated: boolean } }): VerdictContext | undefined {
   const { run, record, head, kind } = input;
@@ -75,7 +66,6 @@ export function verdictContext(input: { run: TeamRun; record: ObjectiveRecord; h
       })),
     },
     rubric: { version: record.rubricVersion, items: RUBRIC_V1 },
-    // A change list recorded at another head describes another tree, so it is not offered; the missing list is marked incomplete.
     changedPaths: input.changedPaths ?? (run.changes?.headCommit === head
       ? { paths: run.changes.files.map(file => file.path), truncated: run.changes.truncated }
       : { paths: [], truncated: true }),
@@ -87,10 +77,6 @@ export function verdictContext(input: { run: TeamRun; record: ObjectiveRecord; h
   return Buffer.byteLength(JSON.stringify(context), "utf8") > VERDICT_CONTEXT_BYTES ? undefined : context;
 }
 
-/**
- * This revision's highest round among all its rows, setup rows included, kept at the head: the receipts' own reading of a final
- * round (objective-receipts roundsOf). A last round that holds only a failed setup row is the final round, and passed nothing.
- */
 export function finalCheckRound(run: TeamRun, head: string): TeamRun["checks"] {
   const atRevision = run.checks.filter(check => check.revision === run.revision);
   if (atRevision.length === 0) return [];

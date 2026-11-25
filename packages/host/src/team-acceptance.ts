@@ -9,11 +9,9 @@ type TeamReviewReport = {
 type TeamReviewEvidenceProblem = {
   code: "ui-review-evidence-required" | "acceptance-evidence-required";
   message: string;
-  /** What the corrected reviewer must do about this problem. */
   rule: string;
 };
 
-/** Returns all brief-backed evidence problems in the order the reviewer should address them. */
 export function reviewEvidenceProblems(brief: TeamBrief | undefined, report: TeamReviewReport): TeamReviewEvidenceProblem[] {
   const problems: TeamReviewEvidenceProblem[] = [];
   if (brief?.uiChanges && report.verdict === "approved" && !report.uiEvidence) {
@@ -26,7 +24,6 @@ export function reviewEvidenceProblems(brief: TeamBrief | undefined, report: Tea
   return problems;
 }
 
-/** Returns a report problem for brief-backed reviews, preserving legacy runs without a brief. */
 function validateTeamAcceptance(
   brief: TeamBrief | undefined,
   verdict: "approved" | "changes-requested",

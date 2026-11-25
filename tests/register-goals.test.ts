@@ -20,11 +20,6 @@ const lineup: TeamLineup = {
   reviewer: { id: "reviewer", label: "Reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
 };
 
-/**
- * A host whose project has the objective switches set as given. The server fixture of `goals.test.ts` is local to that
- * file and takes no register switch, so this copies its minimum: a source repository, the `no-change` goal agent, and
- * the same create body. `restart` rewrites the switches and restarts the API, as `goals.test.ts` does for its sync home.
- */
 async function fixture(objective: { prompts: "on" | "off"; register: "on" | "off" }) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-register-goal-")));
   const source = join(root, "source"), receipts = join(root, "receipts");
@@ -80,20 +75,17 @@ test("owner results take the owner route only", { timeout: 120000 }, async () =>
     assert.equal(record.status, 200, JSON.stringify(record.body));
     const body = { requestId: randomUUID(), version: record.body.version, ops: [{ op: "assumption.set", id: "a9", status: "verified" }] };
 
-    // The owner passes the role and the gate; the id is missing, so the op is refused by name.
     const missing = await f.host.fetchApi(`/goals/${id}/record`, "owner", body);
     assert.equal(missing.status, 409, JSON.stringify(missing.body));
     assert.equal(missing.body.code, "objective-assumption-target");
     assert.equal((await f.host.fetchApi(`/goals/${id}/record`, "controller", { ...body, requestId: randomUUID() })).status, 403);
     assert.equal((await f.host.fetchApi(`/goals/${id}/record`, "viewer", { ...body, requestId: randomUUID() })).status, 403);
 
-    // Register off: a register op is refused before it is applied. Prompts are still on.
     await f.restart({ prompts: "on", register: "off" });
     const off = await f.host.fetchApi(`/goals/${id}/record`, "owner", { ...body, requestId: randomUUID() });
     assert.equal(off.status, 409, JSON.stringify(off.body));
     assert.equal(off.body.code, "objective-register-off");
 
-    // Prompts off, register on: a criterion op is refused by its own switch, also beside a register op.
     await f.restart({ prompts: "off", register: "on" });
     const retire = await f.host.fetchApi(`/goals/${id}/record`, "owner", {
       requestId: randomUUID(), version: record.body.version, ops: [{ op: "criterion.retire", id: "c1" }, { op: "assumption.set", id: "a9", status: "verified" }],
@@ -104,14 +96,12 @@ test("owner results take the owner route only", { timeout: 120000 }, async () =>
 });
 
 test("a rating needs a reviewed cycle", { timeout: 120000 }, async () => {
-  // The stamp is the latest reviewed cycle's head: ready-for-review and merged count, the rest do not.
   const cycle = (value: number, status: string, headCommit?: string) => ({ cycle: value, status, teamId: randomUUID(), goalRevision: 1, startedAt: "2026-11-18T10:00:00.000Z", memberCount: 1, ...(headCommit ? { headCommit } : {}) }) as GoalCycle;
   assert.deepEqual(ratingStamp({ cycles: [cycle(1, "blocked"), cycle(2, "ready-for-review", "H1"), cycle(3, "no-change"), cycle(4, "merged", "H4")] }), { commit: "H4", cycle: 4 });
   assert.equal(ratingStamp({ cycles: [cycle(1, "blocked"), cycle(2, "no-change")] }), undefined);
   assert.equal(ratingStamp({ cycles: [cycle(1, "ready-for-review")] }), undefined, "a reviewed cycle with no head is no stamp");
   assert.equal(ratingStamp({ cycles: [] }), undefined);
 
-  // The route: a rating with no reviewed cycle is refused by name. The goal has an owner-rating criterion on quality.
   const f = await fixture({ prompts: "on", register: "on" });
   try {
     const criterion = { statement: "The quality rating reaches three", check: { kind: "owner-rating", subject: "quality" }, threshold: { kind: "score", min: 3, of: 5 } };

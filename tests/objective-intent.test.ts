@@ -62,14 +62,12 @@ function goalFixture(): ProductGoal {
   } as unknown as ProductGoal;
 }
 
-/** Version 1 of a goal's record: c0 only, one log entry. */
 function v1(): ObjectiveRecord {
   const record = goalRecord(goalFixture(), AT, "created");
   if (typeof record === "string") throw new Error(`the fixture record is ${record}`);
   return record;
 }
 
-/** A standalone run's record, whose objective is the run's text. */
 function runFixture(): ObjectiveRecord {
   const run = { id: RUN_ID, objective: "Find ranked sources for the research brief.", steering: [] } as unknown as TeamRun;
   const record = runRecord(run, AT, "run-handle");
@@ -122,12 +120,10 @@ function derived(derivedFrom: string, statement: string) {
   return { derivedFrom, statement, check: JUDGEMENT, threshold: PASS };
 }
 
-/** Applies a report and returns the one result, failing the test on a refusal. */
 function apply(record: ObjectiveRecord, input: IntentCheckReport, overrides: Partial<IntentApplyContext> = {}) {
   return applyIntentReport(record, input, context(overrides));
 }
 
-/** An answer that must be written. */
 function answer(record: ObjectiveRecord, decisionId: string, text: string, second: number): ObjectiveRecord {
   const next = answerIntentQuestions(record, { decisionId, runId: RUN_ID, text, at: at(second) });
   assert.ok(next, "the answer is written");
@@ -157,7 +153,6 @@ function refusedWith(run: () => unknown, code: string): void {
   assert.fail(`the call was accepted, expected ${code}`);
 }
 
-/** A log padded with skipped entries to `length` entries, all at the record's version. */
 function padded(record: ObjectiveRecord, length: number): ObjectiveRecord {
   const log = [...record.log];
   while (log.length < length) {
@@ -229,7 +224,6 @@ test("every item is written down or counted", () => {
   assert.deepEqual(viaKept.record, direct.record, "the kept report gives the same record");
   assert.deepEqual(viaKept.dropped, direct.dropped);
 
-  // Past the record's byte cap, the remaining items are counted and the rest of the report is still written.
   const wide = (index: number): IntentItem => ({ ...assumeItem(`wide${index}`), assumption: { statement: `${index} ${"s".repeat(470)}`, refutedBy: "r".repeat(480), test: OWNER_TEST } });
   const half = apply(record, report(Array.from({ length: 16 }, (_, index) => wide(index))));
   const full = apply(half.record, report(Array.from({ length: 16 }, (_, index) => wide(16 + index))), { revision: 2, at: at(2) });
@@ -320,7 +314,6 @@ test("a ninth open question closes the oldest that does not wait", () => {
 });
 
 test("with 8 waiting questions, a ninth is dropped and its assumption kept", () => {
-  // Each question is as long as the report allows, so the owner's decision must shorten every line to show all eight.
   const eight = Array.from({ length: 8 }, (_, index) => {
     const item = askItem(`w${index}-${"d".repeat(190)}`, { interrupt: true });
     return { ...item, question: { ...item.question!, text: `Which one? ${"x".repeat(380)}` } };
@@ -424,7 +417,6 @@ test("intent writes keep room for steering", () => {
   assert.equal(steer(full20, 21, 20).statement.directions.length, 40);
 });
 
-/** A small deterministic generator, so a failing seed can be replayed. */
 function mulberry32(seed: number): () => number {
   let state = seed >>> 0;
   return () => {

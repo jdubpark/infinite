@@ -14,10 +14,9 @@ export type ReceiptDetail =
   | { kind: "artifact"; read: ReadState; problem?: "not-text" | "not-json" | "no-array" | "threshold-misfit" | "schema-deferred" | "empty" | "deadline" | "stalled";
       total?: number; qualifying?: number }
   | { kind: "citation"; read: ReadState; problem?: "outside-unchecked" | "malformed" | "not-text" | "deadline" | "stalled"; present?: boolean };
-/** The stored shape of a host test result (step 5 reads it). */
 export type ObjectiveReceipt = {
-  handle: string;                          // receipt:<runId>:<revision>:<id>
-  kind: ReceiptKind; subject: "criterion" | "assumption"; id: string;   // the criterion or assumption id
+  handle: string;
+  kind: ReceiptKind; subject: "criterion" | "assumption"; id: string;
   commit: string; outcome: ReceiptOutcome; at: string; detail: ReceiptDetail;
 };
 export type Subject =
@@ -37,7 +36,6 @@ type Result = { commit: string; outcome: ReceiptOutcome; detail: ReceiptDetail }
 const isCommandOrArtifact = (check: Check): check is Extract<Check, { kind: "command" | "artifact" }> =>
   check.kind === "command" || check.kind === "artifact";
 
-/** Criteria with a command or artifact check, then intent-check and owner assumptions with a command, artifact, or citation test, in record order. */
 export function passSubjects(record: ObjectiveRecord, kind: PassKind): Subject[] {
   const subjects: Subject[] = [];
   for (const criterion of record.criteria) {
@@ -54,7 +52,6 @@ export function passSubjects(record: ObjectiveRecord, kind: PassKind): Subject[]
   return subjects.slice(0, PASS_LIMITS.subjects);
 }
 
-/** The blob each subject reads at `head`, or at a repository citation's own commit. Distinct, in subject order, at most 40. */
 export function passReads(subjects: readonly Subject[], head: string): Target[] {
   const seen = new Set<string>();
   const reads: Target[] = [];
@@ -95,7 +92,6 @@ export function receiptsFor(subjects: readonly Subject[], input: PassInput): Obj
   });
 }
 
-/** The final round of this revision: the highest `round` (absent counts as 0). A reviewed pass keeps only rows at the reviewed head. */
 function roundsOf(input: PassInput): Rounds {
   const atRevision = input.checks.filter(check => check.revision === input.revision);
   const number = atRevision.length === 0 ? undefined : Math.max(...atRevision.map(check => check.round ?? 0));
@@ -137,7 +133,6 @@ function commandOutcome(subject: Subject, observed: CommandObserved): ReceiptOut
   const passed = observed === "passed";
   if (subject.subject === "criterion") return passed ? "pass" : "fail";
   if (subject.test.kind !== "command") return "unknown";
-  // refutesOn "fail": a passing test leaves the assumption standing. refutesOn "pass": a failing one does.
   return (subject.test.refutesOn === "fail") === passed ? "pass" : "fail";
 }
 
@@ -198,7 +193,6 @@ function blobOf(input: PassInput, commit: string, path: string): BlobResult {
   return input.blobs.get(`${commit}:${path}`) ?? { state: "not-run", why: "deadline" };
 }
 
-/** The read state of a blob that did not read; a deadline or stall is the problem, a failed read or a large blob is not. */
 function unreadOf(blob: BlobResult): { read: ReadState; problem?: "deadline" | "stalled" } {
   if (blob.state === "not-run") return { read: "not-run", problem: blob.why };
   if (blob.state === "failed") return { read: "read-failed" };
@@ -206,7 +200,6 @@ function unreadOf(blob: BlobResult): { read: ReadState; problem?: "deadline" | "
   return { read: "too-large" };
 }
 
-/** Strict UTF-8, or undefined. */
 function decodeStrict(bytes: Buffer): string | undefined {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -215,7 +208,6 @@ function decodeStrict(bytes: Buffer): string | undefined {
   }
 }
 
-/** RFC 6901: `~1` is `/`, `~0` is `~`, and an array segment is an index. Undefined when the pointer names nothing. */
 function pointerTarget(document: unknown, pointer: string): unknown {
   if (pointer !== "" && !pointer.startsWith("/")) return undefined;
   const segments = pointer === "" ? [] : pointer.slice(1).split("/");

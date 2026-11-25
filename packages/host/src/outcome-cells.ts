@@ -1,8 +1,6 @@
 import type { OutcomeRow } from "./outcome-store.js";
 import { exclusionOf, type Exclusion, type Level, type Levels } from "./outcome-rules.js";
 
-/** Pure outcome cells. No I/O, no clock, no module state, no store import beyond types. */
-
 export type Source = "production" | "duel" | "replay" | "legacy";
 export const SOURCES: readonly Source[] = ["production", "duel", "replay", "legacy"];
 export type CellUse = "display" | "decision";
@@ -24,7 +22,7 @@ export type Cell = {
   withheld: { backfilled: number; gap: number; unfrozen: number };
   flagged: { backfilled: number; gap: number; "empty-result": number; "same-model-review": number; "scan-gap": number };
   levels: { integrated: LevelCount; accepted: LevelCount; firstPass: LevelCount; held: LevelCount };
-  completed?: LevelCount;                          // role "scout" only
+  completed?: LevelCount;
   tokens: Spread | null; spentUsd: Spread | null; listUsd: Spread | null; minutes: Spread | null;
   ownerRating: { mean: number; n: number } | null; enough: boolean;
 };
@@ -47,7 +45,6 @@ export function checkCellQuery(query: CellQuery): void {
   if (query.use === "decision" && !query.by.includes("profile")) throw new CellQueryRefused("decision-without-profile");
 }
 
-/** The first matching rule decides the bucket of a row. It reads only the fields below, so the router can pass its rows. */
 export function rowUse(
   row: Pick<OutcomeRow, "flags" | "disposition" | "exclusion" | "frozenAt" | "integrated" | "accepted" | "firstPass" | "held">,
   use: CellUse,
@@ -66,7 +63,6 @@ export function rowUse(
   return { kind: "counted", levels, completed: row.disposition === "completed" };
 }
 
-/** Wilson score interval at 95%. Moved unchanged from scorecard.ts. */
 export function wilsonInterval(successes: number, attempts: number): [number, number] | null {
   if (!attempts) return null;
   const z = 1.959963984540054, p = successes / attempts, z2 = z * z, denominator = 1 + z2 / attempts;
@@ -75,7 +71,6 @@ export function wilsonInterval(successes: number, attempts: number): [number, nu
   return [Math.max(0, center - margin), Math.min(1, center + margin)];
 }
 
-/** Linear interpolation between closest ranks at position (n - 1) * p of the sorted values. */
 function quantile(sorted: readonly number[], p: number): number {
   const position = (sorted.length - 1) * p;
   const low = Math.floor(position), high = Math.ceil(position);
@@ -105,12 +100,10 @@ export function levelCount(values: readonly Level[]): LevelCount {
   return { yes, no, unknown, rate: decided === 0 ? null : yes / decided, interval: wilsonInterval(yes, decided) };
 }
 
-/** Today's rule (umbrella C5): only the metered provider reports a spend. */
 export function isMetered(provider: string): boolean {
   return provider === "opencode";
 }
 
-/** A cost counts only when the lookup gives a complete session. A missing fact is never zero. */
 export function completeCost(row: OutcomeRow, cost: CostLookup | undefined): SessionCost | undefined {
   if (cost === undefined || !row.sessionId) return undefined;
   const found = cost(row.sessionId);
@@ -128,7 +121,6 @@ export function rowTime(row: OutcomeRow): string | null {
   return row.endedAt ?? row.startedAt;
 }
 
-/** Key entries in a fixed order. A dimension adds its entries; a replay or legacy row adds its source. */
 export function cellKey(row: OutcomeRow, by: readonly CellDimension[]): Record<string, string> {
   const dimensions = new Set(by);
   const key: Record<string, string> = {};
@@ -137,7 +129,6 @@ export function cellKey(row: OutcomeRow, by: readonly CellDimension[]): Record<s
     key.profile = row.profileId;
     key.provider = row.provider;
     key.model = row.model;
-    // A missing effort adds no entry: OpenCode allows the variant `none`, which is another identity.
     if (row.effort !== null) key.effort = row.effort;
     key.epoch = String(row.profileEpoch);
   }
@@ -167,7 +158,6 @@ function summarize(key: Record<string, string>, rows: readonly OutcomeRow[], que
     else if (use.kind === "withheld") withheld[use.reason]++;
     else {
       counted.push({ row, levels: use.levels, completed: use.completed });
-      // A row can carry a flag this code does not know. It is ignored, and never makes a count NaN.
       for (const flag of row.flags) if (Object.hasOwn(flagged, flag)) flagged[flag]++;
     }
   }
@@ -224,7 +214,6 @@ function compareKeyValue(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-/** Cells sort by their key entries, in key order. */
 function compareCells(left: Cell, right: Cell): number {
   const leftEntries = Object.entries(left.key), rightEntries = Object.entries(right.key);
   for (let index = 0; index < Math.min(leftEntries.length, rightEntries.length); index++) {
@@ -236,7 +225,6 @@ function compareCells(left: Cell, right: Cell): number {
   return leftEntries.length - rightEntries.length;
 }
 
-/** Calls checkCellQuery. Ignores `projectId` and `days`, which the reader applies. */
 export function buildCells(rows: readonly OutcomeRow[], query: CellQuery, cost?: CostLookup): Cell[] {
   checkCellQuery(query);
   const by = [...new Set(query.by)];

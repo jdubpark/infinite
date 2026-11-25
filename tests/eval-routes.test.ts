@@ -76,7 +76,6 @@ const REQUEST_OTHER = "22222222-2222-4222-8222-222222222222";
 const READ_ROLES = ["owner", "controller", "viewer"];
 const PROJECT_WIDE = "project-wide";
 const PROJECT_PLAIN = "project-plain";
-/** Seventy feature-map areas, sorted so that the last seven are the ones the 64-area cap folds. */
 const WIDE_AREAS = Array.from({ length: 70 }, (_, index) => `area-${String(index).padStart(2, "0")}`);
 
 type Fixture = {
@@ -89,13 +88,9 @@ type Fixture = {
 };
 
 type FixtureOptions = {
-  /** False leaves the store with no ledger module, as a host that has not built one. */
   outcomes?: boolean;
-  /** True reopens the corpus at an older module version, so the store reports it unavailable (a rolled-back host). */
   rollback?: boolean;
-  /** True writes a file that is not a database, so the store opens as unavailable. */
   damaged?: boolean;
-  /** The grader's state and launcher version, and the eval identity's state, as the host's probes would report them. */
   grader?: GraderState;
   graderVersion?: number | null;
   identity?: EvalIdentityState;
@@ -103,7 +98,6 @@ type FixtureOptions = {
 
 type Reply = { status: number; text: string; body: any };
 
-/** A project that mines, captures, and validates, with one feature-map area (`host`). */
 function projectConfig() {
   return {
     id: PROJECT, name: PROJECT, path: "/unused/project", source: { mode: "github" },
@@ -114,12 +108,10 @@ function projectConfig() {
   };
 }
 
-/** A project with no `team.eval`, which behaves as it did before the sets existed. */
 function plainConfig() {
   return { id: PROJECT_PLAIN, name: PROJECT_PLAIN, path: "/unused/plain", source: { mode: "github" }, team: { features: { areas: [{ id: "host", paths: ["packages/host"] }] } } };
 }
 
-/** A project that does not mine, keeps 1,000 days of records, and has seventy areas. */
 function wideConfig() {
   return {
     id: PROJECT_WIDE, name: PROJECT_WIDE, path: "/unused/wide", source: { mode: "github" },
@@ -130,21 +122,15 @@ function wideConfig() {
   };
 }
 
-/**
- * The host API of the plan, built from the real store, the real `EvalJobs`, and the real summary, with a fake miner
- * status and grader state. `retire` is the owner's task retirement, written here as a small adapter.
- */
 function fixture(options: FixtureOptions = {}): Fixture {
   const root = mkdtempSync(join(tmpdir(), "infinite-eval-routes-"));
   const databasePath = evidenceDatabasePath(join(root, "state"));
   const vaultKey = randomBytes(32);
-  // A file that is not a database makes the store open as unavailable, as a damaged evidence file does.
   if (options.damaged === true) {
     mkdirSync(dirname(databasePath), { recursive: true });
     writeFileSync(databasePath, "not a database");
   }
   if (options.rollback === true) {
-    // A newer host builds the corpus tables; this store then reopens them at an older version.
     const newer = new EvidenceStore({ databasePath, vaultKey });
     newer.register(evalCorpusModule(newer, () => NOW));
     newer.close();
@@ -167,7 +153,6 @@ function fixture(options: FixtureOptions = {}): Fixture {
     summary: async projectId => {
       const project = config.projects.find(item => item.id === projectId);
       if (project === undefined) return { status: 404, code: "unknown-project" };
-      // The host's own count: trials a project started since 00:00 UTC of today, and the cap the project sets.
       const today = store.read(db => trialsSince(db, projectId, `${NOW.slice(0, 10)}T00:00:00.000Z`));
       return evalSummary(store, {
         project, mining: fake.mining, grader: fake.grader, graderVersion: fake.graderVersion, evalIdentity: fake.identity,
@@ -176,7 +161,6 @@ function fixture(options: FixtureOptions = {}): Fixture {
     },
     jobs: () => jobs.list(),
     job: jobId => jobs.view(jobId) ?? { status: 404, code: "unknown-job" },
-    // The host sends a baseline job to TrialJobs and a validate job to EvalJobs.
     create: (projectId, request, requestId) => request.kind === "validate"
       ? jobs.create(projectId, request, requestId)
       : trials.create(projectId, request, requestId),
@@ -197,7 +181,6 @@ function fixture(options: FixtureOptions = {}): Fixture {
   };
 }
 
-/** Retires a candidate or valid task. Any other state refuses with `task-not-active`. */
 function retireOwned(store: EvidenceStore, taskId: string): { taskId: string; state: "retired" } | EvalRefusal {
   const row = store.read(db => readEvalTask(db, taskId));
   if (row === undefined) return { status: 404, code: "unknown-task" };
@@ -217,7 +200,6 @@ function startOf(runId: string, projectId = PROJECT): CaptureStart {
   };
 }
 
-/** A captured row with stored material on `files`, as the capture service writes it. Returns its task id. */
 function captureRow(tx: EvidenceTx, runId: string, files: string[], capsule: Capsule = CAPSULE, projectId = PROJECT): string {
   const taskId = capturedTaskId(runId, MEMBER);
   insertMarker(tx, startOf(runId, projectId), { state: "captured", capsule }, CAPTURED_AT);
@@ -228,16 +210,11 @@ function captureRow(tx: EvidenceTx, runId: string, files: string[], capsule: Cap
   return taskId;
 }
 
-/**
- * Sets a row's state and area the way promotion does. The routes read these two columns, and this test does not run the
- * promotion or the validator.
- */
 function setRow(tx: EvidenceTx, taskId: string, state: string, area: string): string {
   tx.run("UPDATE eval_tasks SET state = ?, area_ref = ? WHERE task_id = ?", state, tx.index("area", area), taskId);
   return taskId;
 }
 
-/** One ledger row of an accepted implementer attempt on the project, as the outcome ledger writes it. */
 function acceptedRow(id: string, projectId = PROJECT): OutcomeRow {
   return {
     outcomeId: `${id}:m1`, source: "production", projectRef: "", taskRef: "", areaRef: "", runId: id, revision: 1, memberId: "m1",
@@ -301,14 +278,12 @@ test("the summary counts every state and keeps unknowns unknown", async () => {
     assert.deepEqual(summary.tasks.byState, { captured: 1, candidate: 5, valid: 1, rejected: 1, retired: 0 });
     assert.deepEqual(summary.tasks.byOrigin.captured, { captured: 1, candidate: 4, valid: 1, rejected: 0, retired: 0 });
     assert.deepEqual(summary.tasks.byOrigin.mined, { captured: 0, candidate: 1, valid: 0, rejected: 1, retired: 0 });
-    // The built-in names `mixed` and `root` keep their names; a reference the map does not define counts as `other`.
     assert.deepEqual(summary.tasks.byArea, [
       { area: "host", candidate: 2, valid: 1 },
       { area: "mixed", candidate: 1, valid: 0 },
       { area: "other", candidate: 1, valid: 0 },
       { area: "root", candidate: 1, valid: 0 },
     ]);
-    // The project has `team.eval`, so the sets are counted. Capture drew each run group into a set, so the split is the store's.
     const sets = f.store.read(db => setCounts(db, db.index("project", PROJECT)));
     assert.equal(sets.dev + sets.holdout, 1, "the one valid task is in exactly one set");
     assert.equal(summary.tasks.bySet.dev, sets.dev);
@@ -342,7 +317,6 @@ test("the summary bounds areas, the window, and mining", async () => {
       WIDE_AREAS.forEach((area, index) => {
         setRow(tx, captureRow(tx, `wide-${index}`, [`tests/w${index}.test.ts`], CAPSULE, PROJECT_WIDE), "candidate", area);
       });
-      // A valid captured task captured in 2020, before the 730-day window, so it must not count as valid captured.
       const old = setRow(tx, captureRow(tx, "wide-old", ["tests/old.test.ts"], CAPSULE, PROJECT_WIDE), "valid", "area-00");
       tx.run("UPDATE eval_tasks SET captured_at = ? WHERE task_id = ?", "2020-01-01T00:00:00.000Z", old);
     });
@@ -566,7 +540,6 @@ test("the summary shows the eval identity and today's trials", async () => {
     }, at));
     seed(randomUUID(), 0, NOW);
     seed(randomUUID(), 1, NOW);
-    // Yesterday, before 00:00 UTC of today: not counted.
     seed(randomUUID(), 2, "2026-11-15T23:00:00.000Z");
 
     const first = await call(server.base, "GET", `/api/eval/projects/${PROJECT}`, "viewer");
@@ -605,7 +578,6 @@ test("a baseline job is created and listed", async () => {
     const trialId = randomUUID();
     const sessionId = randomUUID();
     f.store.write(tx => setRow(tx, captureRow(tx, "run-trial", [file], { ...CAPSULE, objective }), "valid", "host"));
-    // The capture drew the group's set, holdout in three runs of ten. A baseline job reads the dev set only, so the group goes to dev.
     f.store.write(tx => { tx.run("UPDATE eval_groups SET holdout = 0, set_at = NULL"); });
 
     const created = await call(server.base, "POST", "/api/eval/jobs", "owner", { projectId: PROJECT, requestId: REQUEST, job: BASELINE_JOB });
@@ -621,7 +593,6 @@ test("a baseline job is created and listed", async () => {
     assert.equal(again.body.created, false);
     assert.equal(again.body.job.jobId, jobId);
 
-    // A trial the baseline job started, with a session and a patch held in the sealed store.
     f.store.write(tx => {
       insertTrial(tx, {
         trialId, jobId, taskId: capturedTaskId("run-trial", MEMBER), projectId: PROJECT, configuration: TRIAL_CONFIGURATION,
@@ -659,7 +630,6 @@ test("a baseline job is created and listed", async () => {
 const taskName = (n: number) => `captured:rt${String(n).padStart(3, "0")}`;
 const groupName = (n: number) => `group-route-${String(n).padStart(3, "0")}`;
 
-/** Valid tasks, each in its own group row, in the holdout set or the dev set. Returns the task ids. */
 function seedSet(f: Fixture, count: number, holdout: boolean, first = 0, projectId = PROJECT): string[] {
   const ids: string[] = [];
   f.store.write(tx => {
@@ -681,7 +651,6 @@ function seedSet(f: Fixture, count: number, holdout: boolean, first = 0, project
   return ids;
 }
 
-/** A graded, isolated, final trial of one configuration on one task. */
 function gradeTrial(f: Fixture, jobId: string, taskId: string, configuration: typeof TRIAL_CONFIGURATION, slot: number, resolved: boolean): void {
   const trialId = randomUUID();
   f.store.write(tx => {
@@ -864,7 +833,6 @@ test("the relay refuses the report and priors reads", async () => {
   const client = createRemoteClient({ url: runner.url, token: runner.token });
   try {
     await client.request("/me");
-    // The relay's allow rules name no eval path, so these reads reach the host over a direct connection only.
     for (const path of [`/eval/jobs/${randomUUID()}/report`, `/eval/projects/${PROJECT}/priors`]) {
       await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     }

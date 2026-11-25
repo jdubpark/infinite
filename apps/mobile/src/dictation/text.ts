@@ -1,7 +1,3 @@
-/**
- * Adds a dictated addition to the end of a field's draft. `dropped` counts the addition's
- * characters that did not fit under `maxLength`; the draft itself is never clipped.
- */
 export function appendDictation(draft: string, addition: string, maxLength: number): { text: string; dropped: number } {
   const spoken = addition.trim();
   if (!spoken) return { text: draft, dropped: 0 };

@@ -16,16 +16,11 @@ const issueNode = z.object({
   labels: z.object({ nodes: z.array(z.object({ name: z.string().max(200) })).max(50) }),
 });
 const comment = z.object({ id: z.uuid(), body: z.string().max(64000), issue: z.object({ id: z.uuid() }) });
-/** The intake label is not in Linear. Its message is fixed text, safe to show. */
 export class MissingLabelError extends Error {
   constructor() { super("The intake label does not exist in Linear."); this.name = "MissingLabelError"; }
 }
 const candidatePage = 40, candidatePages = 50, statePage = 40;
 
-/**
- * Reads a Slack message link: a root link (`p` plus sixteen digits) or a reply link whose `thread_ts` names the root.
- * Only https links on slack.com or one of its subdomains count.
- */
 export function parseSlackThreadLink(url: string): IntakeThread | undefined {
   let link: URL;
   try { link = new URL(url); } catch { return undefined; }
@@ -38,10 +33,8 @@ export function parseSlackThreadLink(url: string): IntakeThread | undefined {
   return { channelId: match[1], threadTs: `${match[2].slice(0, 10)}.${match[2].slice(10)}` };
 }
 
-/** The only place that knows Linear's field names for an issue's creator and its Slack thread link. */
 export function issueFacts(node: unknown): IntakeIssue {
   const parsed = issueNode.parse(node);
-  // The creator and thread fields are declared here only, beside the query text in issueFields that asks for them.
   const { creator, attachments } = z.object({
     creator: z.object({ id: z.uuid() }).nullable().optional(),
     attachments: z.object({ nodes: z.array(z.object({ url: z.string().max(4096) })).max(50) }),
@@ -56,18 +49,11 @@ export function issueFacts(node: unknown): IntakeIssue {
   };
 }
 
-/** One malformed issue must not hold back the rest of the queue; it is left out and never admitted. */
 const facts = (nodes: unknown[]) => nodes.flatMap(node => { try { return [issueFacts(node)]; } catch { return []; } });
 
-/** Linear reads and comment writes for intake. The service re-checks every fact it gets back. */
 export class IntakeLinear {
   constructor(private readonly linear: Pick<LinearService, "request">) {}
 
-  /**
-   * Issues that may qualify. The query narrows by team, label, creation time, and an open state, leaves archived issues
-   * out, and reads up to 50 pages of 40. This keeps the same 2,000-issue scan cap while bounding each query's cost.
-   * `capped` is true when more pages remain; the caller re-checks each issue.
-   */
   async candidates(filter: { teamIds: string[]; label: string; createdAfter: string }): Promise<{ issues: IntakeIssue[]; capped: boolean }> {
     const variables = {
       filter: { team: { id: { in: filter.teamIds } }, labels: { some: { name: { eqIgnoreCase: filter.label } } }, createdAt: { gt: filter.createdAfter },
@@ -93,10 +79,6 @@ export class IntakeLinear {
     return { issues: facts(nodes), capped: true };
   }
 
-  /**
-   * The current state of each issue. `deleted` only when Linear answered for that ID and returned no node. A node that
-   * fails `issueFacts` is left out of the map, so its issue changes nothing this cycle. A failed request throws.
-   */
   async states(issueIds: string[]): Promise<Map<string, IntakeIssue | "deleted">> {
     const result = new Map<string, IntakeIssue | "deleted">();
     for (let index = 0; index < issueIds.length; index += statePage) {
@@ -110,7 +92,7 @@ export class IntakeLinear {
         const id = z.object({ id: z.string() }).safeParse(node).data?.id;
         if (id === undefined || !chunk.includes(id)) continue;
         answered.add(id);
-        try { found.set(id, issueFacts(node)); } catch { /* left out of the map: this issue is unchanged this cycle */ }
+        try { found.set(id, issueFacts(node)); } catch {}
       }
       for (const id of chunk) {
         const facts = found.get(id);
@@ -121,13 +103,7 @@ export class IntakeLinear {
     return result;
   }
 
-  /**
-   * Files an issue under the client-supplied ID with the named label, which is the team's own label or else a workspace
-   * label. A missing label is an error with a fixed text. A create that fails or is not confirmed is checked by reading the
-   * ID back, so a lost response that still committed resolves and a retry never files a second issue.
-   */
   async createIssue(input: { id: string; teamId: string; title: string; description: string; label: string }, authorize?: () => void): Promise<IntakeIssue> {
-    // Only this team's labels and workspace labels can be used, so another team's same-name labels never fill the page.
     const labelData = await this.linear.request("InfiniteIntakeLabel",
       "query InfiniteIntakeLabel($filter: IssueLabelFilter!, $first: Int!) { issueLabels(filter: $filter, first: $first) { nodes { id team { id } } } }",
       { filter: { name: { eqIgnoreCase: input.label }, or: [{ team: { id: { eq: input.teamId } } }, { team: { null: true } }] }, first: 50 });
@@ -144,18 +120,13 @@ export class IntakeLinear {
       if (issue.id === input.id) return issue;
       failure = new Error("Linear did not confirm the issue.");
     } catch (error) { failure = error; }
-    // A failed read-back must not hide the creation error that caused it.
     try {
       const found = (await this.states([input.id])).get(input.id);
       if (found && found !== "deleted") return found;
-    } catch { /* the creation error below is the one to report */ }
+    } catch {}
     throw failure;
   }
 
-  /**
-   * Creates the comment under the client-supplied ID. A send that fails is checked by reading the ID back, so a lost
-   * response that still committed resolves, and a retry never posts a second copy.
-   */
   async comment(issueId: string, input: { id: string; body: string }): Promise<void> {
     let sent = false;
     try {

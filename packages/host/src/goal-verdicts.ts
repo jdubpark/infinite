@@ -15,13 +15,8 @@ export const CONTINUE_EVENT = "You recorded not achieved and continued the goal.
 const STEERING_ENTRIES = 20;
 const STEERING_BYTES = 24000;
 
-/** The newest cycle that holds an assessment. */
 const newestAssessed = (cycles: readonly GoalCycle[]): GoalCycle | undefined => [...cycles].reverse().find(item => item.assessment !== undefined);
 
-/**
- * For refresh's Object.assign: {} when neither the team nor the cycle has an assessment; the team's current one with its
- * progress; { assessment: undefined } when the cycle has one and the team's is gone or of another revision.
- */
 export function cycleVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle, team: Pick<TeamView, "revision" | "assessment">): { assessment?: GoalAssessment } {
   const current = team.assessment !== undefined && team.assessment.revision === team.revision ? team.assessment : undefined;
   if (current === undefined) return cycle.assessment === undefined ? {} : { assessment: undefined };
@@ -29,12 +24,10 @@ export function cycleVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle
   return { assessment: { ...current, progress: current.counts.met - (earlier?.assessment?.counts.met ?? 0) } };
 }
 
-/** A cycle with a verdict fails when its result is not met and its progress is not positive. */
 export function verdictFailed(cycle: Pick<GoalCycle, "assessment">): boolean {
   return cycle.assessment !== undefined && cycle.assessment.result !== "met" && cycle.assessment.progress <= 0;
 }
 
-/** True for a pinned-autonomous finite goal whose cycle for `team` holds a current reviewed `met` assessment. */
 export function provisionalStop(goal: Pick<ProductGoal, "autonomy" | "standing" | "cycles">, team: Pick<TeamView, "id" | "revision" | "assessment">): boolean {
   if (autonomyOf(goal) !== "autonomous" || goal.standing !== undefined) return false;
   if (!goal.cycles.some(item => item.teamId === team.id)) return false;
@@ -44,7 +37,6 @@ export function provisionalStop(goal: Pick<ProductGoal, "autonomy" | "standing" 
 
 const ceilingOf = (goal: ProductGoal) => goal.ceilingAt ?? new Date(Date.parse(goal.createdAt) + (goal.maxTotalMinutes ?? goal.maxMinutes) * 60000).toISOString();
 
-/** Throws TeamError before anything is admitted. */
 export function assertVerdictAnswer(goal: ProductGoal, body: GoalOutcomeInput, nowMs: number): void {
   if (body.verdictId === undefined) return;
   if (!goal.cycles.some(item => item.assessment?.verdictId === body.verdictId))
@@ -59,17 +51,12 @@ export function assertVerdictAnswer(goal: ProductGoal, body: GoalOutcomeInput, n
     throw new TeamError(409, "goal-steering-limit", "Start a new goal with consolidated directions.");
 }
 
-/** An owner outcome on a provisional stop ends it: the host drops the stop reason and its text. Any other stop is left alone. */
 export function answerProvisional(goal: Pick<ProductGoal, "stopReason" | "reason">): void {
   if (goal.stopReason !== "provisional-met") return;
   delete goal.stopReason;
   delete goal.reason;
 }
 
-/**
- * Appends body.summary as a steering entry, syncs the record with steerGoalObjective, and sets the goal running with no
- * stopReason and no reason. Returns goalObjectiveNote's text, or undefined. Never sets `achieved`.
- */
 export function continueGoal(holder: GoalHolder, body: GoalOutcomeInput, at: string): string | undefined {
   const goal = holder.goal;
   goal.steering.push({ text: body.summary, revision: goal.revision, at });
@@ -80,11 +67,6 @@ export function continueGoal(holder: GoalHolder, body: GoalOutcomeInput, at: str
   return note;
 }
 
-/**
- * The newest assessment's criteria that are still active in the record, in record order, for the next cycle's context.
- * {} unless the project's prompts and evaluator are on, the goal is pinned autonomous, a cycle holds an assessment, and
- * the record reads.
- */
 export function criteriaRowsFor(holder: GoalHolder, project: Pick<Project, "team"> | undefined): { criteria?: CriteriaRow[] } {
   const objective = project?.team?.objective;
   if (!objectivePromptsOn(project) || objective?.evaluator !== "on") return {};

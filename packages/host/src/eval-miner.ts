@@ -22,34 +22,23 @@ import type { FeatureMap } from "./task-features.js";
 import type { TeamRun } from "./team-types.js";
 import type { Config } from "./types.js";
 
-/** The owner defaults of the mining pass (see the plan's "Rulings before the build"). */
 export const MINING_BATCH = 50, MINING_BACKFILL_MAX = 2_000, MINED_TASK_MAX = 5_000, MINING_RETRY_MS = 3_600_000;
-/** The room one pass needs: a batch of capsules at their largest. */
 const MINING_ROOM_BYTES = MINING_BATCH * CAPSULE_MAX_BYTES;
-/** Commits per form-4 read of first parents: the most one `parents` call takes. */
 const PARENT_CHUNK = 50;
 
-/** Mined rows of one project, read through `eval_tasks_summary`. */
 export const MINED_COUNT_SQL = "SELECT count(*) AS n FROM eval_tasks WHERE project_ref = ? AND origin = 'mined'";
-/** The mining row of one project, read by its primary key. */
 export const MINING_ROW_SQL = "SELECT state, visited, mined, skipped, failures, retry_at, payload FROM eval_mining WHERE project_ref = ?";
-/** One project's material bytes, read through `eval_tasks_bytes`. */
 export const PROJECT_BYTES_SQL = "SELECT COALESCE(SUM(material_bytes), 0) AS n FROM eval_tasks WHERE project_ref = ?";
-/** The host's material bytes: every project's, through the same covering index. Once per pass. */
 export const HOST_BYTES_SQL = "SELECT COALESCE(SUM(material_bytes), 0) AS n FROM eval_tasks";
-/** Whether a commit already has a row, read through `eval_tasks_commit`. */
 export const EXISTING_COMMIT_SQL = "SELECT task_id FROM eval_tasks WHERE project_ref = ? AND commit_ref = ? LIMIT 1";
-/** The run group that landed a commit, read through `eval_groups_landing`. */
 export const LANDING_JOIN_SQL = "SELECT group_id FROM eval_groups WHERE project_ref = ? AND landing_ref = ? LIMIT 1";
 const UPSERT_MINING_SQL = "INSERT INTO eval_mining (project_ref, state, visited, mined, skipped, failures, retry_at, updated_at, payload) "
   + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project_ref) DO UPDATE SET state = excluded.state, visited = excluded.visited, "
   + "mined = excluded.mined, skipped = excluded.skipped, failures = excluded.failures, retry_at = excluded.retry_at, "
   + "updated_at = excluded.updated_at, payload = excluded.payload";
 
-/** Sealed in eval_mining.payload, row id project_ref. `backfill.visited` counts the backfill's own commits. */
 export type MiningCursor = { projectId: string; forward?: string; backfill?: { next: string; visited: number; done: boolean } };
 
-/** The mined task of one commit: `mined:` and the first 40 hex digits of SHA-256 over the project ref and the commit ref. */
 export function minedTaskId(projectRef: string, commitRef: string): string {
   return `mined:${createHash("sha256").update(`${projectRef}:${commitRef}`).digest("hex").slice(0, 40)}`;
 }
@@ -60,10 +49,6 @@ export type MinedInsert =
   | { kind: "rejected"; projectId: string; commit: string; reason: EvalReason };
 export type MinedCandidate = Extract<MinedInsert, { kind: "candidate" }>;
 
-/**
- * Writes one mined row with its own group. `exists` when the commit has a row already; `full` at 5,000 mined rows of the
- * project. A candidate also stores its capsule part, as `insertMarker` does for a captured task.
- */
 export function insertMined(tx: EvidenceTx, input: MinedInsert, at: string): "inserted" | "exists" | "full" {
   const projectRef = tx.index("project", input.projectId);
   const commitRef = tx.index("eval-commit", input.commit);
@@ -127,7 +112,6 @@ export type MinerOptions = {
   now?: () => string;
 };
 
-/** The counts a pass keeps, as the row holds them. */
 type Saved = { cursor: MiningCursor; visited: number; mined: number; skipped: number; failures: number };
 type Loaded = { state: MiningState | undefined; saved: Saved; retryAt: string | null };
 type MiningRow = { state: string; visited: number; mined: number; skipped: number; failures: number; retry_at: string | null; payload: string };
@@ -137,36 +121,25 @@ type CandidateVerdict = {
   promptOrigin: "run-objective" | "commit-message"; runId?: string; files: string[]; hiddenFiles: string[];
   features: EvalFeatures; paths: string[];
 };
-/** What one commit comes to. `failed` is a refused or failed read: nothing is written for it. */
 type Verdict =
   | { kind: "exists" } | { kind: "skip" } | { kind: "reject"; reason: EvalReason } | { kind: "failed" } | CandidateVerdict;
 
-/** `ok` when the commit's decision and cursor committed. `stop` ends the pass with nothing written. */
 type Outcome = "ok" | "failed" | "stop" | "full";
-/** A rewrite's head moves `forward` like a new commit and restarts the backfill below it. */
 type CursorPath = "forward" | "backfill" | "rewrite";
 type End = "budget" | "done" | Outcome;
 
 type Pass = {
   projectId: string; ref: string; mirror: string; head: string; settings: EvalProjectSettings; map: FeatureMap | undefined;
   at: string;
-  /** The row's state as last written or read. */
   state: MiningState | undefined;
-  /** The counts and cursor the store holds. */
   saved: Saved;
-  /** The cursor the walk is on. It differs from `saved` only after a rewrite answer, which is written with the next commit. */
   cursor: MiningCursor;
   budget: number;
-  /** The run records by merge commit. Built on first use, so a pass that decides no commit copies none. */
   runs?: Map<string, TeamRun>;
 };
 
 const OFF: MiningStatus = { state: "off", visited: null, mined: null, skipped: null, failures: null, backfillDone: null };
 
-/**
- * Mines the base branch of each GitHub project with mining on. A pass decides at most 50 commits, each in its own
- * write with its cursor. It never throws, and it runs one pass at a time.
- */
 export class Miner {
   private readonly config: Pick<Config, "projects">;
   private readonly store: EvidenceStore;
@@ -187,7 +160,6 @@ export class Miner {
     this.now = options.now ?? (() => new Date().toISOString());
   }
 
-  /** Starts one pass when none runs. Never throws. */
   pump(): void {
     if (this.closed || this.running !== undefined) return;
     const run: Promise<void> = this.once()
@@ -198,7 +170,6 @@ export class Miner {
     this.running = run;
   }
 
-  /** Resolves when the pass in flight, if any, has ended. */
   idle(): Promise<void> {
     return this.running ?? Promise.resolve();
   }
@@ -221,7 +192,6 @@ export class Miner {
     }
   }
 
-  /** Ends the chain: a read in flight ends without a write. */
   close(): void {
     this.closed = true;
   }
@@ -237,7 +207,6 @@ export class Miner {
     return this.config.projects.find(project => project.id === projectId);
   }
 
-  /** The next project in id order after the last one picked, with a mirror head and no retry pending. */
   private pick(at: string): string | undefined {
     const ids = this.config.projects.filter(project => mineSettings(project) !== undefined).map(project => project.id).sort(compareText);
     const ordered = [...ids.filter(id => id > this.last), ...ids.filter(id => id <= this.last)];
@@ -269,7 +238,6 @@ export class Miner {
     };
     if (this.store.read(db => pathsPending(db, ref))) return this.note(pass, "waiting");
     if (!this.hasRoom(ref)) return this.note(pass, "full");
-    // The first pass starts from the head: forward is empty, and the backfill walks down from it.
     if (pass.cursor.forward === undefined) {
       pass.cursor = { projectId, forward: head, backfill: { next: head, visited: 0, done: false } };
     }
@@ -282,7 +250,6 @@ export class Miner {
     if (end === "done") this.note(pass, "caught-up");
   }
 
-  /** Forward first, then the backfill, at most `pass.budget` commits in all. */
   private async walk(p: Pass): Promise<End> {
     const forward = p.cursor.forward;
     if (forward !== undefined && forward !== p.head) {
@@ -290,9 +257,6 @@ export class Miner {
       if (this.closed) return "stop";
       let headList: Map<string, string[]> | undefined;
       if (answer === "failed") {
-        // Form 1 also fails when a rewrite and garbage collection pruned `forward`. The head reads and Git answers that it
-        // holds no `forward`: that is a rewrite, and it takes the rewrite path. Any other failure stays failed, a read
-        // that timed out or a launcher that refused included.
         headList = await this.git.parents(p.mirror, [p.head]);
         if (this.closed) return "stop";
         if (headList?.has(p.head) !== true) return this.failed(p);
@@ -302,8 +266,6 @@ export class Miner {
         answer = "no";
       }
       if (answer === "no") {
-        // A rewrite. The head is decided first, and its write moves `forward` to it (ruling 12), so a backfill already at
-        // its bound cannot stop the forward walk. The backfill then walks down from the head's first parent.
         headList ??= await this.git.parents(p.mirror, [p.head]);
         if (this.closed) return "stop";
         const outcome = await this.decide(p, p.head, "rewrite", headList?.get(p.head));
@@ -312,14 +274,12 @@ export class Miner {
         const list = await this.git.firstParents(p.mirror, p.head, forward);
         if (this.closed) return "stop";
         if (list === undefined) return this.failed(p);
-        // The list is at most 500 commits, newest first. The oldest of them is mined first.
         const ordered = [...list.ids].reverse();
         let parents: Map<string, string[]> | undefined;
         let chunkEnd = 0;
         for (let index = 0; index < ordered.length; index++) {
           if (p.budget <= 0) return "budget";
           if (index === chunkEnd) {
-            // A chunk holds no more commits than the pass can still decide, so no read reaches past the budget.
             chunkEnd = index + Math.min(PARENT_CHUNK, p.budget, ordered.length - index);
             parents = await this.git.parents(p.mirror, ordered.slice(index, chunkEnd));
             if (this.closed) return "stop";
@@ -343,7 +303,6 @@ export class Miner {
         if (current === undefined || current.done || current.visited >= MINING_BACKFILL_MAX) break;
         if (p.budget <= 0) return "budget";
         if (index === chunkEnd) {
-          // As in the forward walk, a chunk never reads past what the pass can still decide: the budget or the bound.
           const allowed = Math.min(PARENT_CHUNK, p.budget, MINING_BACKFILL_MAX - current.visited);
           chunkEnd = index + Math.min(allowed, list.ids.length - index);
           parents = await this.git.parents(p.mirror, list.ids.slice(index, chunkEnd));
@@ -355,7 +314,6 @@ export class Miner {
     }
   }
 
-  /** Decides one commit from its first-parent list, read in a chunk by the walk, then advances the cursor in one write. */
   private async decide(p: Pass, commit: string, path: CursorPath, list: string[] | undefined): Promise<Outcome> {
     if (list === undefined) return this.failed(p);
     const parent = list[0];
@@ -365,7 +323,6 @@ export class Miner {
     return this.apply(p, commit, advance(p, path, commit, parent), verdict);
   }
 
-  /** The verdict on one commit, from its existing row or its first parent's change counts and message. */
   private async verdict(p: Pass, commit: string, parent: string | undefined): Promise<Verdict> {
     if (this.store.read(db => db.get(EXISTING_COMMIT_SQL, p.ref, db.index("eval-commit", commit))) !== undefined) {
       return { kind: "exists" };
@@ -393,7 +350,6 @@ export class Miner {
     };
   }
 
-  /** One write: the row, the group join, the counts, and the cursor. */
   private apply(p: Pass, commit: string, cursor: MiningCursor, verdict: Verdict): Outcome {
     let inserted = false as boolean;
     let full = false as boolean;
@@ -430,24 +386,20 @@ export class Miner {
     return "ok";
   }
 
-  /** Counts a refused or failed read: the row says `failing` with one more failure, and the cursor is what was saved. */
   private failed(p: Pass): "failed" {
     if (this.closed) return "failed";
     const counts = { ...p.saved, failures: p.saved.failures + 1 };
     const wasFailing = p.state === "failing";
     if (this.store.tryWrite(tx => save(tx, p.ref, "failing", counts, isoAfter(p.at, MINING_RETRY_MS), p.at))) p.state = "failing";
-    // Once when a project starts failing, not at each hourly retry. The line names no project, commit, or path.
     if (!wasFailing) console.warn("Eval mining paused (read-failed).");
     return "failed";
   }
 
-  /** Writes a state change, and nothing when the row already holds it. */
   private note(p: Pass, state: MiningState): void {
     if (this.closed || p.state === state) return;
     if (this.store.tryWrite(tx => save(tx, p.ref, state, p.saved, null, p.at))) p.state = state;
   }
 
-  /** A pass starts only when a batch of capsules fits under both byte caps and the project holds fewer than 5,000 mined rows. */
   private hasRoom(ref: string): boolean {
     return this.store.read(db => {
       const projectBytes = db.get<{ n: number }>(PROJECT_BYTES_SQL, ref)?.n ?? 0;
@@ -459,7 +411,6 @@ export class Miner {
     });
   }
 
-  /** The commits whose merge a run record names, once per pass. */
   private mergeRuns(projectId: string): Map<string, TeamRun> {
     const runs = new Map<string, TeamRun>();
     for (const run of this.runs()) {
@@ -503,10 +454,6 @@ function save(tx: EvidenceTx, ref: string, state: MiningState, saved: Saved, ret
   );
 }
 
-/**
- * The cursor after one decided commit: the forward cursor is the commit; the backfill moves to its first parent. A
- * rewrite's head does both, and keeps `visited`, so the 2,000 bound still holds.
- */
 function advance(p: Pass, path: CursorPath, commit: string, parent: string | undefined): MiningCursor {
   if (path === "forward") return { ...p.cursor, forward: commit };
   const bf = p.cursor.backfill ?? { next: commit, visited: 0, done: false };
@@ -523,10 +470,6 @@ function minedInput(projectId: string, commit: string, verdict: CandidateVerdict
   };
 }
 
-/**
- * The group step of a new candidate, in the write that inserted it. A run group that landed the commit is joined, `clear`.
- * Otherwise the lineage roots merge `devOnly`: `unclear`, or `clear` with none. More than 64 roots rejects the commit.
- */
 export function placeMined(tx: EvidenceTx, input: MinedCandidate, at: string): void {
   const projectRef = tx.index("project", input.projectId);
   const commitRef = tx.index("eval-commit", input.commit);
@@ -558,7 +501,6 @@ function isoAfter(at: string, ms: number): string {
   return new Date(Date.parse(at) + ms).toISOString();
 }
 
-/** Code-unit order, the order SQLite's BINARY collation gives for these ASCII keys. */
 function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }

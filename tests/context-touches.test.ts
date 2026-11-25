@@ -30,7 +30,6 @@ function toolStart(seq: number, tool: string, input: Record<string, unknown>): E
   };
 }
 
-/** An in-memory journal reader that honours `after` and a page size, like the vault reader. */
 function journal(events: Event[], pageSize = 200) {
   const reads: number[] = [];
   const read = (_sessionId: string, after: number): TouchPage => {
@@ -92,7 +91,6 @@ test("apply_patch headers", () => {
   assert.deepEqual(found.reads, []);
   assert.deepEqual(found.edits, ["src/a.ts", "docs/new.md", "src/b.ts", "old/c.ts"]);
 
-  // Patch text inside an array is still read; text without the Begin marker is not.
   const nested = extractTouches(
     "apply_patch",
     { patches: ["*** Begin Patch\n*** Add File: arr.ts\n*** End Patch"] },
@@ -110,7 +108,6 @@ test("paths inside a Git directory are never touches", () => {
   assert.deepEqual(extractTouches("Read", { file_path: "sub/.git/config" }, CWD, everything).reads, []);
   assert.deepEqual(extractTouches("Bash", { command: "cat .git/hooks/pre-commit.sample" }, CWD, everything).reads, []);
 
-  // Names that only start with a dot-git prefix are repository content.
   assert.deepEqual(extractTouches("Read", { file_path: ".github/workflows/ci.yml" }, CWD, everything).reads, [
     ".github/workflows/ci.yml",
   ]);
@@ -124,17 +121,14 @@ test("shell tokens need a code area", () => {
   const areas = (directory: string) => directory === "packages/host/src";
   assert.deepEqual(extractTouches("Bash", { command }, CWD, areas).reads, ["packages/host/src/teams.ts"]);
 
-  // A token without a slash, a dotfile, and an extensionless name are never reads.
   const loose = "cat README.md packages/host/src/.env packages/host/src/Makefile";
   assert.deepEqual(extractTouches("Bash", { command: loose }, CWD, () => true).reads, []);
 
-  // An absolute token counts only under cwd; a sibling directory sharing the prefix does not.
   const absolute = `cat ${CWD}/packages/host/src/teams.ts /home/dev/projects/examplex/packages/host/src/teams.ts`;
   assert.deepEqual(extractTouches("Bash", { command: absolute }, CWD, areas).reads, [
     "packages/host/src/teams.ts",
   ]);
 
-  // The array form is joined with spaces.
   assert.deepEqual(
     extractTouches("exec_command", { cmd: "cat packages/host/src/teams.ts" }, CWD, areas).reads,
     ["packages/host/src/teams.ts"],
@@ -171,7 +165,6 @@ test("path confinement", async () => {
     { tool: "Read", input: { file_path: "src/../../x.ts" } },
     { tool: "Read", input: { file_path: "src/a\u0000.ts" } },
     { tool: "Edit", input: { file_path: "../../outside.ts" } },
-    // A path the recorder cut short names no real file.
     { tool: "Read", input: { file_path: "src/very/long … [+120 chars]" } },
     { tool: "apply_patch", input: { input: "*** Begin Patch\n*** Update File: ../x.ts\n*** End Patch" } },
     { tool: "Bash", input: { command: "cat ../x.ts /etc/hosts.conf" } },
@@ -181,7 +174,6 @@ test("path confinement", async () => {
     assert.deepEqual([...found.reads, ...found.edits], [], `${tool} ${JSON.stringify(input)}`);
   }
 
-  // Controls: the same shapes inside cwd are kept.
   assert.deepEqual(extractTouches("Read", { file_path: `${CWD}/src/a.ts` }, CWD, never).reads, ["src/a.ts"]);
   assert.deepEqual(extractTouches("Read", { file_path: "./src/a.ts" }, CWD, never).reads, ["src/a.ts"]);
 
@@ -217,27 +209,18 @@ test("a session is observable only when its journal holds a recorded tool input"
     return [result.observable, result.complete, result.files.length];
   };
 
-  // Codex with its hooks off, or a session started with native arguments: the journal holds no signal at all.
   assert.deepEqual(await index([]).session(source({ provider: "codex" })), {
     sessionId: "s1", observable: false, complete: true, graphQueries: 0, files: [], truncated: false,
   });
-  // Terminal and screen readings carry no tool inputs, however many there are.
   assert.deepEqual(await facts([signal(1, { kind: "turn-start", source: "screen" }), signal(2, { kind: "prompt-open", source: "osc" })]), [false, true, 0]);
-  // A native Codex session sends turn signals over its protocol and never a tool input.
   assert.deepEqual(await facts([signal(1, { kind: "turn-start", source: "protocol" }), signal(2, { kind: "turn-end", source: "protocol" })], "codex"), [false, true, 0]);
-  // A hook signal without a tool input is not evidence either: the notify route sends those.
   assert.deepEqual(await facts([signal(1, { kind: "turn-start", source: "hook" }), signal(2, { kind: "turn-end", source: "hook" })], "codex"), [false, true, 0]);
-  // A headless run line is a tool start with an empty input and no hook behind it.
   assert.deepEqual(await facts([signal(1, { kind: "tool-start", source: "protocol", tool: "bash", toolUseId: "t1", input: {}, quiet: false })], "codex"), [false, true, 0]);
-  // One tool input recorded by a hook is the evidence, even when its path is outside the workspace and is dropped.
   assert.deepEqual(await facts([toolStart(1, "Read", { file_path: "/etc/hosts" })]), [true, true, 0]);
-  // A tool input that named a path is evidence whatever channel carried it, so found files are never hidden as a gap.
   assert.deepEqual(await facts([signal(1, { kind: "tool-start", source: "protocol", tool: "Read", toolUseId: "t1", input: { file_path: "src/a.ts" }, quiet: false })]), [true, true, 1]);
-  // While the journal is still being read nothing is known yet, and that reads as a gap, not as an agent that touched nothing.
   const slow = index([signal(1, { kind: "turn-start", source: "screen" }), toolStart(2, "Read", { file_path: "src/a.ts" })], 1);
   const first = await slow.session(source());
   assert.deepEqual([first.observable, first.complete, first.files.length], [false, false, 0]);
-  // The next request reads on and finds the input: the gap becomes an observation.
   const second = await slow.session(source());
   assert.deepEqual([second.observable, second.complete, second.files.length], [true, true, 1]);
 });
@@ -258,7 +241,6 @@ test("incremental cursor", async () => {
 });
 
 test("read budget on an output-heavy journal", async () => {
-  // Each page scans 512 KiB, returns nothing, and reports more.
   const reads: number[] = [];
   const touches = new ContextTouches({
     read: (_sessionId, after) => {
@@ -314,13 +296,11 @@ test("session eviction", async () => {
   });
   for (const id of ["a", "b", "c"]) await touches.session(source({ sessionId: id }));
 
-  // "a" was least recently used and is gone, so it is rebuilt from the start.
   const again = await touches.session(source({ sessionId: "a" }));
   assert.deepEqual(readers.a.reads, [0, 0]);
   assert.deepEqual(again.files.map((file) => file.path), ["src/a.ts"]);
   assert.equal(again.files[0].reads, 1);
 
-  // "c" is still indexed and reads only past its cursor.
   await touches.session(source({ sessionId: "c" }));
   assert.deepEqual(readers.c.reads, [0, 1]);
 });
@@ -336,23 +316,16 @@ test("concurrent calls share one advance", async () => {
 
 test("a truncated or quoted shell command invents no path", () => {
   const always = () => true;
-  // The recorder cut this command; the last word may be the start of a longer file name.
   assert.deepEqual(extractTouches("Bash", { command: "cat src/first.ts src/example.ts … [+20 chars]" }, CWD, always).reads, []);
-  // One quoted argument with a space is one word, and it is not a path.
   assert.deepEqual(extractTouches("Bash", { command: 'cat "src/example.ts backup"' }, CWD, always).reads, []);
   assert.deepEqual(extractTouches("Bash", { command: "cat 'src/example.ts backup' src/real.ts" }, CWD, always).reads, ["src/real.ts"]);
-  // An escape or an unclosed quote makes the word ambiguous.
   assert.deepEqual(extractTouches("Bash", { command: "cat src/with\\ space.ts" }, CWD, always).reads, []);
   assert.deepEqual(extractTouches("Bash", { command: 'cat "src/open.ts' }, CWD, always).reads, []);
-  // What the shell would splice or expand is never read as a path, in whole or in part.
   for (const command of ["cat src/a.ts<(printf x)", "cat $(printf prefix)src/a.ts", "cat `printf prefix`src/a.ts", "cat src/${NAME}.ts", "cat src/*.ts",
     'cat "src/$NAME.ts"', "cat src/a.ts>src/b.ts", "(cat src/a.ts)", "cat {src/a.ts,src/b.ts}"])
     assert.deepEqual(extractTouches("Bash", { command }, CWD, always).reads, [], command);
-  // A comment is not part of the command, even with an apostrophe in it.
   assert.deepEqual(extractTouches("Bash", { command: "cat src/a.ts # don't change this\ncat src/b.ts" }, CWD, always).reads.sort(), ["src/a.ts", "src/b.ts"]);
-  // Separators end a word; a redirect written as its own word leaves its neighbours whole.
   assert.deepEqual(extractTouches("Bash", { command: "cat src/a.ts|grep x;cat src/b.ts && cat src/c.ts > out.log" }, CWD, always).reads.sort(), ["src/a.ts", "src/b.ts", "src/c.ts"]);
-  // Controls: plain and fully quoted paths are kept, and a cut command still counts its graph query.
   assert.deepEqual(extractTouches("Bash", { command: 'sed -n 1,20p "src/quoted.ts" && cat src/plain.ts' }, CWD, always).reads.sort(), ["src/plain.ts", "src/quoted.ts"]);
   assert.equal(extractTouches("Bash", { command: "graphify query routes --graph out/graph.json … [+9 chars]" }, CWD, always).graphQuery, true);
 });
@@ -373,12 +346,10 @@ test("concurrent sessions are read a few at a time and never outgrow the index",
   const ids = Array.from({ length: 9 }, (_, index) => `s${index}`);
   const results = await Promise.all(ids.map((sessionId) => touches.session(source({ sessionId }))));
   assert.equal(peak, 2, "no more than two journals are read at once");
-  // Three sessions fit. The other six are told to come back and nothing is allocated or read for them.
   assert.equal(results.filter((result) => result.complete).length, 3);
   assert.deepEqual(results.filter((result) => !result.complete).map((result) => [result.observable, result.files.length]), Array(6).fill([false, 0]));
   assert.equal(largest, 3);
   assert.equal(touches.indexed, 3);
-  // Once the three are idle a refused session is admitted in place of the least recently used one.
   const later = await touches.session(source({ sessionId: "s8" }));
   assert.equal(later.complete, true);
   assert.equal(touches.indexed, 3);
@@ -398,7 +369,6 @@ test("a journal read that throws frees its slot and the session can be read agai
     maxConcurrent: 1,
   });
   await assert.rejects(touches.session(source({ sessionId: "a" })), /journal unreadable/);
-  // With one slot, a leaked slot would leave this call waiting forever.
   const [again, other] = await Promise.all([touches.session(source({ sessionId: "a" })), touches.session(source({ sessionId: "b" }))]);
   assert.equal(again.complete, true);
   assert.equal(other.complete, true);

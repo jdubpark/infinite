@@ -18,7 +18,6 @@ type AnswerBody = {
   text?: string;
 };
 
-/** The worker's refusals; any other 409 comes from the host's generic handler. */
 const REFUSALS = new Set([
   "prompt-changed",
   "unsupported",
@@ -36,25 +35,13 @@ const NOTICE_TEXT = {
   "control-lost":
     "This phone's control ended. Nothing was selected. Take control again to answer.",
 } as const;
-/** Refusals that no reload fixes: the dialog only takes keys typed in the terminal. */
 const TERMINAL_ONLY = new Set(["unsupported", "text-not-accepted"]);
 const NOTICE_MS = 30_000;
 
-/** An answer outcome that outlives its prompt: the host closes or replaces it within seconds. */
 type Notice = { kind: keyof typeof NOTICE_TEXT; promptId: number };
-/** The in-card status and the prompt it belongs to. */
 type CardState = { promptId?: number; status: DecisionStatus };
 const IDLE: CardState = { status: { kind: "idle" } };
 
-/**
- * Answers the session's open prompt. Each tap mints a new requestId; "Retry"
- * after an uncertain delivery resends the same body with the same requestId.
- * `status` belongs to the card of the prompt it was set for and resets when a
- * different prompt appears. `notice` reports a refused or changed answer above
- * whatever is shown next, until the next tap or 30 seconds. Every answer
- * carries this phone's control lease, and none is sent without one when the
- * session `requiresControl`.
- */
 export function useAnswer(
   connection: Connection,
   id: string,
@@ -69,7 +56,6 @@ export function useAnswer(
   const pendingAnswer = useRef<AnswerBody | null>(null);
   const inFlight = useRef(false);
 
-  // A new dialog starts clean: the card status of an earlier one no longer applies.
   const promptId = prompt?.id;
   const [shownPromptId, setShownPromptId] = useState(promptId);
   if (promptId !== shownPromptId) {
@@ -111,7 +97,6 @@ export function useAnswer(
         setCard({ promptId: body.promptId, status: { kind: "still-open" } });
     } catch (error) {
       if (error instanceof ControlRefusal) {
-        // Refused before any key was pressed. A refused retry says nothing about the first try.
         control.refused();
         if (retrying)
           setCard({
@@ -134,7 +119,6 @@ export function useAnswer(
         error.code !== undefined &&
         REFUSALS.has(error.code)
       ) {
-        // Refused against the host's current prompt; nothing was typed.
         pendingAnswer.current = null;
         setCard(IDLE);
         setNotice({
@@ -146,8 +130,6 @@ export function useAnswer(
         setForbidden(true);
         setCard(IDLE);
       } else {
-        // No reply, no network, or the host's generic 409: the answer may have
-        // landed, so keep the requestId for "Retry".
         const retry =
           !(error instanceof ApiError) ||
           error.status === 0 ||

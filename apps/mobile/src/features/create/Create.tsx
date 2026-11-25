@@ -35,17 +35,14 @@ export function Create({ connection }: { connection: Connection }) {
   const providers = me?.backendProviders?.[backend] ?? (backend === "infinite" ? me?.providers ?? [] : []);
   const selectedProvider = providers.find(value => value === provider) ?? providers[0];
   const projects = me?.projects ?? [];
-  // Older hosts lack /project-groups; the poll then stays null and the host project buttons remain.
   const { data: groupList } = usePoll(() => api<ProjectGroupList>(connection, "/project-groups"), 4000, [connection]);
   const groups = groupList ? visibleGroups(groupList.groups) : null;
   const selectedGroup = groups && project ? groupContaining(request ? groupList!.groups : groups, project) : undefined;
   const selectedProject = project && (selectedGroup || projects.some(item => item.id === project)) ? project : groups ? (groups[0] ? preferredCheckout(groups[0])?.projectId : undefined) : projects[0]?.id;
   const workspaceGroup = groups ? groupContaining(groups, selectedProject ?? "") : undefined;
   const checkouts = workspaceGroup ? checkoutsOf(workspaceGroup) : [];
-  // Only a cloud host receives laptop sync; a local host is the laptop.
   const syncs = me?.environment === "cloud";
   const { data: polledDetail, refresh: refreshDetail } = usePoll(() => syncs && selectedProject ? api<ProjectDetail>(connection, `/projects/${selectedProject}`) : Promise.resolve(null), 5000, [connection, selectedProject, syncs]);
-  // Keep displaying the poll's previous project until the selected project's value arrives.
   const detail = syncs && polledDetail?.id === selectedProject ? polledDetail : null;
   const displayDetail = syncs ? polledDetail : null;
   const [applying, setApplying] = useState(false);

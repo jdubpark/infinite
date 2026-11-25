@@ -52,7 +52,6 @@ const NOW = "2026-11-14T12:00:00.000Z";
 const LATER = new Date(Date.parse(NOW) + 2 * DAY_MS).toISOString();
 const JOB = "job-replay-1";
 const TASK = "task-7";
-// The project id is sealed in the payload and held only as a blind index, so it can carry a sentinel string.
 const PROJECT = "Objective-7f3a";
 const SECRET_NAME = "secret-name";
 const MODEL = "model-Sealed-9";
@@ -82,7 +81,6 @@ function fixture(): Fixture {
   };
 }
 
-/** A fixture with the trial module, and the corpus module that owns `eval_jobs`, registered and ready. */
 function ready(): Fixture {
   const f = fixture();
   f.store.register(evalCorpusModule(f.store, () => NOW));
@@ -103,7 +101,6 @@ function finalOf(grade: TrialGrade, patch?: Buffer | "too-large" | "secret-shape
   return { grade, configId: null, profileEpoch: null, sessionId: null, patchKeepDays, patch };
 }
 
-/** Plain columns of every trial table: the sealed payload column is left out. */
 function plainColumns(f: Fixture): string {
   return f.store.read(db => ["eval_trials", "eval_trial_counts", "eval_trial_patches", "eval_trial_totals"]
     .map(table => JSON.stringify(db.all<Record<string, unknown>>(`SELECT * FROM ${table}`).map(({ payload: _payload, ...rest }) => rest)))
@@ -212,7 +209,6 @@ test("the patch caps hold", () => {
     const totalBytes = () => f.store.read(db => db.get<{ n: number }>("SELECT patch_bytes AS n FROM eval_trial_totals")?.n ?? 0);
     const storedBytes = () => f.store.read(db => db.get<{ n: number }>("SELECT COALESCE(SUM(bytes), 0) AS n FROM eval_trial_patches")?.n ?? 0);
 
-    // A stored patch, then a sweep after its keep period: the total returns to the sum of the rows.
     f.store.write(tx => insertTrial(tx, newTrial("trial-1"), NOW));
     f.store.write(tx => startTrial(tx, "trial-1", NOW));
     f.store.write(tx => gradingTrial(tx, "trial-1", NOW));
@@ -226,7 +222,6 @@ test("the patch caps hold", () => {
     assert.equal(totalBytes(), 0);
     assert.ok(f.store.read(db => readTrial(db, "trial-1")), "the trial row outlives its patch");
 
-    // One byte over the per-patch cap: the payload says too-large, and nothing is stored.
     f.store.write(tx => insertTrial(tx, newTrial("trial-2", 0, 1), NOW));
     f.store.write(tx => startTrial(tx, "trial-2", NOW));
     f.store.write(tx => gradingTrial(tx, "trial-2", NOW));
@@ -234,7 +229,6 @@ test("the patch caps hold", () => {
     assert.equal(readTrialPatch(f, "trial-2"), "too-large");
     assert.equal(patchRows(), 0, "no patch row for an oversized patch");
 
-    // Exactly the per-patch cap is stored, and its sweep returns the total to zero.
     f.store.write(tx => insertTrial(tx, newTrial("trial-5", 0, 4), NOW));
     f.store.write(tx => startTrial(tx, "trial-5", NOW));
     f.store.write(tx => gradingTrial(tx, "trial-5", NOW));
@@ -244,7 +238,6 @@ test("the patch caps hold", () => {
     f.store.write(tx => sweepTrials(tx, LATER));
     assert.equal(totalBytes(), 0);
 
-    // A trial whose keep period ends before its patch's: the sweep deletes both, and the total stays exact.
     f.store.write(tx => insertTrial(tx, { ...newTrial("trial-4", 0, 3), keepDays: 1 }, NOW));
     f.store.write(tx => startTrial(tx, "trial-4", NOW));
     f.store.write(tx => finishTrial(tx, "trial-4", finalOf(GRADED, Buffer.alloc(30)), NOW));
@@ -254,7 +247,6 @@ test("the patch caps hold", () => {
     assert.equal(patchRows(), 0, "its patch goes with it");
     assert.equal(totalBytes(), 0, "and the total stays exact");
 
-    // The host total near its cap: a 20-byte patch that fills the cap exactly is stored.
     f.store.write(tx => tx.run("UPDATE eval_trial_totals SET patch_bytes = ?", TRIAL_PATCHES_HOST_MAX_BYTES - 20));
     f.store.write(tx => insertTrial(tx, newTrial("trial-6", 0, 5), NOW));
     f.store.write(tx => startTrial(tx, "trial-6", NOW));
@@ -263,7 +255,6 @@ test("the patch caps hold", () => {
     assert.equal(readTrialPatch(f, "trial-6"), "stored", "a patch that fills the host cap exactly fits");
     assert.equal(totalBytes(), TRIAL_PATCHES_HOST_MAX_BYTES);
 
-    // Ten bytes below the cap, a 20-byte patch no longer fits, so it is dropped.
     f.store.write(tx => tx.run("UPDATE eval_trial_totals SET patch_bytes = ?", TRIAL_PATCHES_HOST_MAX_BYTES - 10));
     f.store.write(tx => insertTrial(tx, newTrial("trial-3", 0, 2), NOW));
     f.store.write(tx => startTrial(tx, "trial-3", NOW));
@@ -329,7 +320,6 @@ const PROMPT = trialPromptVersion(PROFILE);
 
 type Seed = { endedAt?: string; ending?: TrialGrade["ending"]; epoch?: number; harness?: number; prompt?: string; kind?: string };
 
-/** One final original trial of its own job, with the columns a reuse test varies. */
 function seedFinal(f: Fixture, trialId: string, seed: Seed = {}): void {
   const jobId = `job-of-${trialId}`;
   const endedAt = seed.endedAt ?? AGO(1);
@@ -477,7 +467,6 @@ test("the v2 migration keeps v1 rows", () => {
     first.register(v1);
     assert.equal(first.status().modules[EVAL_TRIALS_MODULE], "ready");
     first.write(tx => {
-      // Rows as the version 1 host wrote them: the version 1 columns only.
       tx.run("INSERT INTO eval_trial_counts (job_id, planned_tasks, planned_trials, started, graded, resolved) VALUES (?, 1, 2, 1, 1, 1)", JOB);
       const payload = (id: string) => tx.seal("eval_trials", id, { projectId: PROJECT, taskId: TASK, configuration: CONFIGURATION,
         ...(id === "old-1" ? { patch: "stored" } : {}) });
@@ -538,7 +527,6 @@ test("a failed v2 migration leaves the module unavailable and the v1 store uncha
         for (const statement of SCHEMA_TRIALS_V1) tx.exec(statement);
       },
     });
-    // A v2 column that already exists makes the first ALTER fail halfway through the v2 statements.
     first.write(tx => tx.exec("CREATE TABLE eval_reports (job_id TEXT PRIMARY KEY)"));
     first.write(tx => tx.exec("ALTER TABLE eval_trial_counts ADD COLUMN reused INTEGER NOT NULL DEFAULT 0"));
     first.close();

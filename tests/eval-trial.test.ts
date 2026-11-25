@@ -15,9 +15,6 @@ import { gradeTrial, prepareTrialSource, type TrialContext } from "../packages/h
 import type { BundleState } from "../packages/host/src/eval-validate.js";
 import type { EvalGraderConfig, EvalMemberConfig, ValidationSettings } from "../packages/host/src/eval-config.js";
 
-// The trial source and the grading of one trial, on real Git. The grader is the fixture grader launcher and the eval
-// identity is the fixture eval launcher, both as this user. Each test removes its directory, restoring modes first.
-
 const GRADER_FIXTURE = fileURLToPath(new URL("./fixtures/grader-command.mjs", import.meta.url));
 const EVAL_FIXTURE = fileURLToPath(new URL("./fixtures/eval-command.mjs", import.meta.url));
 const NOW = "2026-11-17T10:00:00.000Z";
@@ -36,7 +33,6 @@ const CAPSULE = {
   ownerAnswers: [],
   task: { id: "t-1", title: "Fix the file", instructions: "Set src/x.txt to fixed.", paths: ["src/x.txt"] },
 };
-// A stand-in runner: a test file passes when it equals src/x.txt. It writes a JUnit report and exits 0, so only the report decides.
 const RUNNER = [
   "import fs from \"node:fs\";",
   "const args = process.argv.slice(2);",
@@ -57,7 +53,6 @@ const SETTINGS: ValidationSettings = {
   gradingPaths: [],
   guardChecks: [],
 };
-/** The stored key of the hidden test case, as parseReport keys a JUnit report written in the runner's shape. */
 const KEY = [...parseReport("junit", Buffer.from(
   `<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="suite"><testcase name="${HIDDEN}" classname="cls"></testcase></testsuite></testsuites>`,
 )).cases.keys()][0];
@@ -82,7 +77,6 @@ function gitStatus(cwd: string, args: string[]): number {
   return spawnSync("git", args, { cwd, stdio: "ignore" }).status ?? -1;
 }
 
-/** One commit with the given files, as this test's identity. */
 function commitFiles(work: string, files: Record<string, string>, message: string): string {
   for (const [path, content] of Object.entries(files)) {
     mkdirSync(dirname(join(work, path)), { recursive: true });
@@ -153,7 +147,6 @@ function identityOf(fx: Rig): EvalIdentity {
   return launcherEvalIdentity(() => member, { hostUid: -1, graceMs: 5_000 });
 }
 
-/** The bundle of the mirror, as the host streams it: every ref of the project. */
 const bundleOf = (mirror: string) => (): ChildProcess => spawn("git", ["-C", mirror, "bundle", "create", "-", "--all"], { stdio: ["ignore", "pipe", "ignore"] });
 
 function contextOf(fx: Rig, grader: Grader, identity: EvalIdentity, over: Partial<TrialContext> = {}): TrialContext {
@@ -167,7 +160,6 @@ function contextOf(fx: Rig, grader: Grader, identity: EvalIdentity, over: Partia
   };
 }
 
-/** Wraps an object so that each method call is recorded by name. */
 function spied<T extends object>(target: T, calls: string[], label: string): T {
   return new Proxy(target, {
     get(obj, key) {
@@ -181,7 +173,6 @@ function spied<T extends object>(target: T, calls: string[], label: string): T {
   });
 }
 
-/** Runs the focused command as a fake that exits as `run` says, and leaves every other command to the real grader. */
 function focusedAs(grader: Grader, run: Partial<GraderRun>): Grader {
   return {
     ...grader,
@@ -192,7 +183,6 @@ function focusedAs(grader: Grader, run: Partial<GraderRun>): Grader {
   };
 }
 
-/** The source of a grader whose export still holds the reference: the trial branch is set to the reference commit. */
 function exportingReference(grader: Grader): Grader {
   return {
     ...grader,
@@ -203,7 +193,6 @@ function exportingReference(grader: Grader): Grader {
   };
 }
 
-/** Commits a change in the trial workspace, as the member would, and returns the new commit. */
 function memberCommit(work: string, files: Record<string, string>): string {
   return commitFiles(work, files, "Member change");
 }
@@ -229,7 +218,6 @@ test("the trial source holds only the base", { timeout: 120_000 }, async () => {
     assert.equal(existsSync(join(workspace, HIDDEN)), false, "no hidden test file in the workspace");
     assert.equal(existsSync(join(fx.evalRoot, "trials", TRIAL, "in")), false, "the bundle directory is gone");
 
-    // A grader whose export holds the reference: the source is skipped and no trial workspace remains.
     const leaking = contextOf(fx, exportingReference(grader), identity);
     const skipped = await prepareTrialSource(fx.store, TASK, leaking);
     assert.deepEqual(skipped, { kind: "skip", reason: "source-leaked" });
@@ -281,7 +269,6 @@ test("an exit code never resolves", { timeout: 120_000 }, async () => {
       hiddenFiles: [HIDDEN], isolation: "isolated" as const,
     });
 
-    // Exit 0 and no report, in both rounds: the grade is unknown, and nothing resolves.
     const silent = memberCommit(source.workspace, { "README.md": "silent\n" });
     const noReport = await gradeTrial(fx.store, input(silent), contextOf(fx, focusedAs(grader, { exitCode: 0 }), identity));
     assert.equal(noReport.kind, "graded", JSON.stringify(noReport));
@@ -289,7 +276,6 @@ test("an exit code never resolves", { timeout: 120_000 }, async () => {
     assert.equal(noReport.grade.expectedPassed, null);
     assert.equal(noReport.grade.resolved, false);
 
-    // A parsed report that fails the expected case is not resolved, and its count is zero, not unknown.
     const wrong = memberCommit(source.workspace, { "README.md": "wrong\n" });
     const failed = await gradeTrial(fx.store, input(wrong), ctx);
     assert.equal(failed.kind, "graded", JSON.stringify(failed));
@@ -365,7 +351,6 @@ test("an unreadable task starts no trial", { timeout: 120_000 }, async () => {
   }
 });
 
-// A secret-shaped value, built at run time so that no source line holds one.
 const TOKEN = `ghp_${"a1B2".repeat(9)}`;
 
 type Source = Extract<Awaited<ReturnType<typeof prepareTrialSource>>, { kind: "ready" }>;
@@ -374,14 +359,12 @@ const inputOf = (source: Source, resultCommit: string, baseCommit = source.baseC
   taskId: TASK, baseCommit, resultCommit, workspace: source.workspace, hiddenFiles: source.hiddenFiles, isolation: source.isolation,
 });
 
-/** The stored key of a test case named `name`, as the runner reports it. */
 function keyOf(name: string): string {
   return [...parseReport("junit", Buffer.from(
     `<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="suite"><testcase name="${name}" classname="cls"></testcase></testsuite></testsuites>`,
   )).cases.keys()][0];
 }
 
-/** A grader whose export holds `target` as the trial branch, in place of the base. */
 function exportingCommit(grader: Grader, target: string): Grader {
   return {
     ...grader,
@@ -426,7 +409,6 @@ test("a task that cannot be a trial source starts no trial", { timeout: 120_000 
 test("a leak of the mirror head or of a hidden blob alone skips the source", { timeout: 120_000 }, async () => {
   const fx = rig();
   try {
-    // Two commits outside the reference: one holds the hidden file's blob only, the other is a mirror head that holds nothing hidden.
     git(fx.work, ["checkout", "-q", "-b", "blob-only", fx.anchor]);
     const blobOnly = commitFiles(fx.work, { [HIDDEN]: "fixed\n" }, "Blob only");
     git(fx.work, ["checkout", "-q", "-b", "head-only", fx.anchor]);
@@ -535,7 +517,6 @@ test("a refused, oversize, or secret-shaped result is never graded as resolved o
     assert.equal(source.kind, "ready", JSON.stringify(source));
     if (source.kind !== "ready") return;
 
-    // A patch that does not apply to the base is a refusal: scope-violation, not graded.
     const mid = memberCommit(source.workspace, { "src/x.txt": "mid\n" });
     const last = memberCommit(source.workspace, { "src/x.txt": "fixed\n" });
     const refused = await gradeTrial(fx.store, inputOf(source, last, mid), ctx);
@@ -545,7 +526,6 @@ test("a refused, oversize, or secret-shaped result is never graded as resolved o
     assert.equal(refused.grade.resolved, false);
     assert.equal(refused.grade.expectedPassed, null);
 
-    // A patch holding a secret shape is graded, but only a marker is kept.
     const secret = memberCommit(source.workspace, { "src/x.txt": "fixed\n", "notes.txt": `${TOKEN}\n` });
     const marked = await gradeTrial(fx.store, inputOf(source, secret), ctx);
     assert.equal(marked.kind, "graded", JSON.stringify(marked));
@@ -553,7 +533,6 @@ test("a refused, oversize, or secret-shaped result is never graded as resolved o
     assert.equal(marked.patch, "secret-shaped");
     assert.equal(marked.grade.resolved, true);
 
-    // A patch over the size limit is not graded and its bytes are not kept.
     const big = memberCommit(source.workspace, { "src/x.txt": "fixed\n", "big.txt": `${"x".repeat(1_100_000)}\n` });
     const large = await gradeTrial(fx.store, inputOf(source, big), ctx);
     assert.equal(large.kind, "graded", JSON.stringify(large));

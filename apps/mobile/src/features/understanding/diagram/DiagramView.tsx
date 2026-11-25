@@ -24,7 +24,6 @@ function describeDiagram(diagram: Diagram): string {
   return `${title}: ${count} components, ${changes.modified} modified, ${changes.added} added, ${changes.removed} removed; ${relationships} relationships`;
 }
 
-/** A cheap stable identity for diagram content, so a changed diagram redraws on the remount-only runtime. */
 function contentKey(diagram: Diagram): string {
   const text = JSON.stringify([diagram.id, diagram.direction, diagram.nodes, diagram.edges, diagram.groups, diagram.sequence ?? null]);
   let hash = 2166136261;
@@ -97,7 +96,6 @@ function DiagramCanvas({ diagram, layout, height, onOpenComponent, onExpand }: {
         transform: gestures.transform,
         transformOrigin: [0, 0, 0],
       }]}>
-      {/* Keyed on content and selection: react-native-svg 15 on this runtime does not apply prop updates to mounted nodes, so a remount is the reliable way to redraw. */}
       <Svg key={svgKey} width={layout.width} height={layout.height} viewBox={`0 0 ${layout.width} ${layout.height}`}>
         <ArrowMarker />
         <Rect x={0} y={0} width={layout.width} height={layout.height} fill="transparent" onPress={() => setSelectedId(undefined)} />

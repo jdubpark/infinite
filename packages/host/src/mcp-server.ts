@@ -11,7 +11,6 @@ import { mcpRequestErrorMessages } from "./mcp-requests.js";
 const BODY_LIMIT = 96 * 1024;
 const MAX_REQUESTS = 32;
 
-/** A separate, unbound listener: the CLI binds it to loopback, never the owner API. */
 export function createMcpServer(config: Config, api: McpRequestApi) {
   if (!config.mcp) throw new Error("MCP is not configured");
   const app = express();
@@ -73,7 +72,6 @@ export function createMcpServer(config: Config, api: McpRequestApi) {
     if (req.method === "POST" && !req.is("application/json")) { reject(res, 415, "JSON content type required."); return; }
     next();
   });
-  // Enforce the bound here: the SDK cannot apply its byte limit to a parsed body.
   app.use(express.json({ limit: BODY_LIMIT, inflate: false }));
   app.use(async (req, res) => {
     res.locals.handling = true;

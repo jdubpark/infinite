@@ -36,7 +36,6 @@ function file(name: string, args: string[] = ["--instance", "work"]) {
   return readFileSync(join(out, name), "utf8");
 }
 
-// A release stage made by `git archive` has no .git, so it lists the files from disk instead.
 function gitTopLevel(root: string) {
   const result = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: root, encoding: "utf8" });
   return result.status === 0 ? realpathSync(result.stdout.trim()) : undefined;
@@ -148,8 +147,6 @@ test("every tracked deploy file that names a first-instance path is rendered for
   assert.deepEqual(unlisted, []);
 });
 
-// Claude Code reads Read rules as gitignore patterns: `*` stays inside one path segment, a trailing `/**` covers
-// everything below. Checked against Claude Code 2.1.325 with mid-path and in-segment wildcards (INF-257).
 function readRuleMatches(rule: string, path: string) {
   const pattern = /^Read\(\/\/(.+)\)$/.exec(rule)?.[1];
   if (!pattern) return false;
@@ -175,13 +172,10 @@ test("the machine's one Claude ceiling denies reads of every instance's secret p
     expectDenied(tokens && `${tokens}/0123abcd.json`, `${refreshName} ReadWritePaths`);
     expectDenied((JSON.parse(file("config.example.json", args)) as { keyFile?: string }).keyFile, "config.example.json keyFile");
     const root = name ? `/srv/infinite-data/instances/${name}` : "/srv/infinite-data";
-    // The App key directory and the retained vault key are named by instances.md, not by a rendered file.
     expectDenied(`${root}/github-app/app-key`, "instances.md");
     if (name) expectDenied(`${root}/vault.key`, "instances.md");
     assert.equal(denied(`${root}/workspaces/project-a/README.md`), false);
   }
-  // The GitHub grant key and the egress proxy key are one per machine. Their paths come from the files that install
-  // them: the proxy configuration and host configuration in the two guides, and the egress proxy's example config.
   const grantKeys = [...readFileSync("deploy/ubuntu/github-proxy.md", "utf8").matchAll(/"(?:grantKeyFile|keyPath)": "([^"]+)"/g)].map(match => match[1]);
   const egressKeys = [(JSON.parse(readFileSync("deploy/ubuntu/egress/proxy.example.json", "utf8")) as { keyFile?: string }).keyFile,
     ...[...readFileSync("deploy/ubuntu/egress.md", "utf8").matchAll(/"keyPath": "([^"]+)"/g)].map(match => match[1])];

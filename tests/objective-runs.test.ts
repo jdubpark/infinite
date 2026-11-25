@@ -19,7 +19,6 @@ function openStore(f: Fixture, key: Buffer): EvidenceStore {
   return new EvidenceStore({ databasePath: evidenceDatabasePath(f.config.stateDir), vaultKey: key });
 }
 
-/** Every stored event of one run, read page by page. */
 function allEvents(store: EvidenceStore, runId: string): RunEvent[] {
   const events: RunEvent[] = [];
   let after = 0;
@@ -35,7 +34,6 @@ function eventsOfKind(store: EvidenceStore, runId: string, kind: string): RunEve
   return allEvents(store, runId).filter(event => event.kind === kind);
 }
 
-/** Scheduler internals that the tests drive directly. */
 type Internal = {
   record(id: string): unknown;
   consume(stored: unknown, member: unknown): void;
@@ -51,7 +49,6 @@ async function waitFor(check: () => boolean, message: string, timeoutMs = 5000) 
   assert.fail(message);
 }
 
-/** The project manager's record, read from the sealed store, with its report set for `consume`. */
 function reportFrom(teams: TeamService, runId: string, report: unknown) {
   const stored = internal(teams).record(runId) as { run: TeamRun; members?: never };
   const member = stored.run.members[0]!;

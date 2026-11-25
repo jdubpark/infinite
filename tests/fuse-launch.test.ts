@@ -19,10 +19,8 @@ const START = Date.parse("2026-11-13T10:00:00.000Z");
 
 type Fixture = ReturnType<typeof schedulerFixture>;
 
-/** The scheduler's private step and record, as tests/team-events.test.ts reaches them. */
 const scheduler = (teams: TeamService) => teams as unknown as { record(id: string): unknown; step(stored: unknown): Promise<void> };
 
-/** A real fuse over the fixture's evidence store, with a fake clock. */
 function rig(f: Fixture) {
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(f.config.stateDir), vaultKey: f.key });
   const clock = { now: START };
@@ -30,10 +28,6 @@ function rig(f: Fixture) {
   return { store, clock, fuse, file: join(f.config.stateDir, BASELINE_FILE) };
 }
 
-/**
- * A fixture's own ids, commit ids, times, and temporary paths, replaced by placeholders in order of first use.
- * Two fixtures that did the same work give the same text.
- */
 function normalized(text: string, f: Fixture): string {
   const names = new Map<string, string>();
   const place = (kind: string, value: string) => {
@@ -52,13 +46,11 @@ function launch(id: string, projectId = "fixture"): FuseLaunch {
   return { launchId: id, projectId, purpose: "work", role: "implementer", profileId: "spark-high" };
 }
 
-/** Trips a project with 30 launches of other sessions. */
 function trip(fuse: FuseService, projectId = "fixture") {
   for (let i = 0; i < 30; i++) fuse.admit(launch(`other-${i}`, projectId));
   assert.equal(fuse.check({ projectId }).state, "open");
 }
 
-/** The fixture's run directory sits under the long temporary path; a Unix socket path must stay short. */
 const shortRunDirs: string[] = [];
 after(() => { for (const dir of shortRunDirs) rmSync(dir, { recursive: true, force: true }); });
 function shortRun(config: Fixture["config"]) {
@@ -67,12 +59,10 @@ function shortRun(config: Fixture["config"]) {
   return { ...config, runDir };
 }
 
-/** Replaces the fake manager's running-session list. */
 function setRunning(f: Fixture, rows: unknown[]) {
   (f.manager as unknown as { list: () => Promise<unknown[]> }).list = async () => rows;
 }
 
-/** One queued implementer, launched by the scheduler's next pass. */
 function queueImplementer(f: Fixture) {
   const memberId = randomUUID(), sessionId = randomUUID();
   const queued = { ...f.run.members[0]!, memberId, sessionId, role: "implementer" as const, title: "Implementer: a", taskId: "a",
@@ -152,8 +142,6 @@ test("a member's state keeps the reason while the fuse holds a launch", async ()
   const { store, fuse } = rig(f);
   try {
     trip(fuse);
-    // The coordinator runs and waits on a person at a provider prompt. The scheduler writes that reason from the
-    // member's state on every pass, so a fuse text there would be replaced and put back each pass.
     const coordinator = f.run.members[0]!;
     f.state.attention = { state: "needs-you", prompt: { id: 1, kind: "question", title: "Which store?", options: [], acceptsText: true, source: "screen", hash: "c".repeat(64) } } as typeof f.state.attention;
     const queued = queueImplementer(f);
@@ -230,7 +218,6 @@ test("without a fuse the launch and the record are as today", async () => {
     const fusedRecord = fused.readRecord<{ run: Record<string, unknown> }>("team", fused.run.id).run;
     assert.deepEqual(Object.keys(fusedRecord).sort(), Object.keys(plainRecord).sort());
     assert.deepEqual(Object.keys(fusedRecord.members[0] as object).sort(), Object.keys(plainRecord.members[0] as object).sort());
-    // Keys alone would let a changed status or reason pass, so the whole records are compared, value for value.
     assert.equal(normalized(JSON.stringify(fused.readRecord("team", fused.run.id)), fused), normalized(JSON.stringify(plain.readRecord("team", plain.run.id)), plain));
     assert.equal(normalized(fused.launches[0]!.prompt, fused), normalized(plain.launches[0]!.prompt, plain), "the launch prompt is the same");
   } finally { store.close(); plain.close(); fused.close(); }
@@ -314,7 +301,6 @@ test("createOnce marks a created session started", { timeout: 120000 }, async ()
     assert.equal(fuse.view().host.hour.launches, counted, "the replay is not charged");
   } finally {
     store?.close();
-    // The session's worker listens under this test's own run directory, where the fixture's stop does not look. End it before the root goes.
     if (own) await stopSessionWorkers(own);
     if (workerPid) await waitFor(async () => { try { process.kill(workerPid!, 0); return true; } catch { return false; } }, running => !running, 30000);
     await host.close();

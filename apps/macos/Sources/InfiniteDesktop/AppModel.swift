@@ -248,7 +248,7 @@ struct TeamResumeFailure: Equatable {
     /// unconfirmed send, so a draft whose save failed is not lost with it; its screen and chat are released.
     private func evict(_ id: String) {
         guard let terminal = terminals[id] else { return }
-        let retained = !terminal.draft.text.isEmpty || terminal.draft.pendingID != nil
+        let retained = !terminal.draft.text.isEmpty || terminal.draft.pending != nil
         if !retained { terminals[id] = nil }
         Task { await terminal.detach(); if retained { terminal.releaseDisplay() } }
     }
@@ -455,14 +455,14 @@ struct TeamResumeFailure: Equatable {
     func createMission(groupID: String, objective: String) async throws {
         guard let client else { throw DesktopError("Connect to a server first.") }
         let profileID = activeID
-        if pendingMissionCreation.pendingID == nil {
+        if pendingMissionCreation.pending == nil {
             let requestID = UUID().uuidString.lowercased()
             let body: JSON = .object(["requestId": .string(requestID), "groupId": .string(groupID), "objective": .string(objective.trimmingCharacters(in: .whitespacesAndNewlines))])
-            var record = DraftRecord(); record.pendingID = requestID
-            record.pendingText = String(decoding: try body.data(), as: UTF8.self)
+            var record = DraftRecord()
+            record.pending = PendingSend(id: requestID, text: String(decoding: try body.data(), as: UTF8.self))
             try drafts.save(record, identity: "\(profileID):create-mission"); pendingMissionCreation = record
         }
-        guard let payload = pendingMissionCreation.pendingText else { throw DesktopError("Review the pending mission request before starting another.") }
+        guard let payload = pendingMissionCreation.pending?.text else { throw DesktopError("Review the pending mission request before starting another.") }
         let result = try await client.request("/missions", body: JSON.parse(Data(payload.utf8)))
         try drafts.save(DraftRecord(), identity: "\(profileID):create-mission")
         guard profileID == activeID else { return }
@@ -528,7 +528,7 @@ struct TeamResumeFailure: Equatable {
     func createTeam(projectID: String, provider: String, useLineup: Bool, title: String, objective: String) async throws {
         guard let client else { throw DesktopError("Connect to a server first.") }
         let profileID = activeID
-        if pendingTeamCreation.pendingID == nil {
+        if pendingTeamCreation.pending == nil {
             let requestID = UUID().uuidString.lowercased()
             let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
             let request = objective.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -536,11 +536,11 @@ struct TeamResumeFailure: Equatable {
             var fields: [String: JSON] = ["requestId": .string(requestID), "projectId": .string(projectID), "provider": .string(provider),
                                           "title": .string(name.isEmpty ? String(firstLine.prefix(100)) : name), "objective": .string(request)]
             if useLineup { fields["useConfiguredLineup"] = .bool(true) }
-            var record = DraftRecord(); record.pendingID = requestID
-            record.pendingText = String(decoding: try JSON.object(fields).data(), as: UTF8.self)
+            var record = DraftRecord()
+            record.pending = PendingSend(id: requestID, text: String(decoding: try JSON.object(fields).data(), as: UTF8.self))
             try drafts.save(record, identity: "\(profileID):create-team"); pendingTeamCreation = record
         }
-        guard let payload = pendingTeamCreation.pendingText else { throw DesktopError("Review the pending team request before starting another.") }
+        guard let payload = pendingTeamCreation.pending?.text else { throw DesktopError("Review the pending team request before starting another.") }
         let result = try await client.request("/teams", body: JSON.parse(Data(payload.utf8)))
         try drafts.save(DraftRecord(), identity: "\(profileID):create-team")
         guard profileID == activeID else { return }
@@ -562,16 +562,16 @@ struct TeamResumeFailure: Equatable {
     func create(provider: String, project: String, title: String) async throws {
         guard let client else { throw DesktopError("Connect to a server first.") }
         let profileID = activeID
-        if pendingCreation.pendingID == nil {
+        if pendingCreation.pending == nil {
             let requestID = UUID().uuidString.lowercased()
             var fields: [String: JSON] = ["requestId": .string(requestID), "provider": .string(provider), "projectId": .string(project), "title": .string(title.isEmpty ? "\(provider.capitalized) session" : title), "prompt": .string("")]
             if title.isEmpty { fields["generatedTitle"] = .bool(true) }
             let body: JSON = .object(fields)
-            var record = DraftRecord(); record.pendingID = requestID
-            record.pendingText = String(decoding: try body.data(), as: UTF8.self)
+            var record = DraftRecord()
+            record.pending = PendingSend(id: requestID, text: String(decoding: try body.data(), as: UTF8.self))
             try drafts.save(record, identity: "\(profileID):create"); pendingCreation = record
         }
-        guard let payload = pendingCreation.pendingText else { throw DesktopError("Review the pending creation before starting another session.") }
+        guard let payload = pendingCreation.pending?.text else { throw DesktopError("Review the pending creation before starting another session.") }
         let result = try await client.request("/sessions", body: JSON.parse(Data(payload.utf8)))
         try drafts.save(DraftRecord(), identity: "\(profileID):create")
         guard profileID == activeID else { return }
@@ -652,7 +652,7 @@ struct TeamResumeFailure: Equatable {
     /// terminal also needs a current screen; sending a prompt does not.
     var ready: Bool { attached && session.running }
     var screenReady: Bool { ready && snapshotReady && !rendererUnavailable }
-    var canSend: Bool { ready && !busy && draft.pendingID == nil && !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    var canSend: Bool { ready && !busy && draft.pending == nil && !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     /// A provider prompt is answered without the input lease or an attached terminal. A mission-managed session needs only that it is running.
     var canAnswerPrompt: Bool { role != "viewer" && !answering && (managed ? session.running : ready) }
     var managed: Bool { session.managed }
@@ -666,7 +666,7 @@ struct TeamResumeFailure: Equatable {
         self.session = session; self.client = client; self.profileID = profileID; self.drafts = drafts; self.role = role; self.supportsStream = supportsStream; self.summaryModel = summaryModel
         readCursor = (UserDefaults.standard.dictionary(forKey: Self.readCursorsKey) as? [String: String])?["\(profileID):\(session.id)"] ?? ""
         do { draft = try drafts.read(identity) } catch { notice = error.localizedDescription }
-        if draft.pendingID != nil { notice = "A previous send was not confirmed. Inspect the terminal before retrying the same send or clearing it." }
+        if draft.pending != nil { notice = "A previous send was not confirmed. Inspect the terminal before retrying the same send or clearing it." }
     }
     func showScreen() { screenShown = true; view = .screen }
     func setDisplayVisible(_ visible: Bool) {
@@ -789,7 +789,7 @@ struct TeamResumeFailure: Equatable {
             }
             guard current == attachGeneration else { await client.closeTerminal(id); return }
             streamID = id; attached = true
-            if draft.pendingID == nil { notice = "" }
+            if draft.pending == nil { notice = "" }
         } catch { notice = error.localizedDescription }
         busy = false
     }
@@ -839,7 +839,7 @@ struct TeamResumeFailure: Equatable {
             guard attachment == attachGeneration, operation == controlGeneration, attached else { return }
             lease = response["control"]; holder = lease["label"].string
             guard hasControl else { throw DesktopError("Control was not granted.") }
-            if draft.pendingID == nil { notice = "" }
+            if draft.pending == nil { notice = "" }
             let leaseID = lease["id"]
             renewal = Task {
                 while !Task.isCancelled {
@@ -881,25 +881,25 @@ struct TeamResumeFailure: Equatable {
         Task { if await ensureControl() { directInput = true } }
     }
     func send(retry: Bool = false) async {
-        guard ready, !busy, retry ? draft.pendingID != nil : canSend else { return }
+        guard ready, !busy, retry ? draft.pending != nil : canSend else { return }
         guard await ensureControl(), hasControl, attached else { return }
         let generation = attachGeneration
-        let text = retry ? (draft.pendingText ?? draft.text) : draft.text
-        let id = draft.pendingID ?? UUID().uuidString.lowercased()
+        let text = retry ? (draft.pending?.text ?? draft.text) : draft.text
+        let id = draft.pending?.id ?? UUID().uuidString.lowercased()
         sending = true
-        draft.pendingID = id; draft.pendingText = text
+        draft.pending = PendingSend(id: id, text: text)
         do { try drafts.save(draft, identity: identity) } catch { notice = error.localizedDescription; sending = false; return }
         busy = true
         do {
             let receipt = try await client.request("/sessions/\(session.id)/input", body: .object(["requestId": .string(id), "text": .string(text), "submit": .bool(true)]), controlID: lease["id"].string)
             guard generation == attachGeneration else { return }
             guard receipt["state"].string == "delivered" || receipt["receipt"]["state"].string == "delivered" else { throw DesktopError("Delivery is uncertain. Inspect the terminal before retrying.", code: "delivery-unknown") }
-            if draft.text == text { draft.text = "" }; draft.pendingID = nil; draft.pendingText = nil; saveDraft()
+            if draft.text == text { draft.text = "" }; draft.pending = nil; saveDraft()
             notice = "Delivered to the terminal."
         } catch { if generation == attachGeneration { notice = error.localizedDescription } }
         if generation == attachGeneration { busy = false; sending = false }
     }
-    func clearPending() { if draft.text == draft.pendingText { draft.text = "" }; draft.pendingID = nil; draft.pendingText = nil; saveDraft(); notice = "Previous send cleared after your review." }
+    func clearPending() { if draft.text == draft.pending?.text { draft.text = "" }; draft.pending = nil; saveDraft(); notice = "Previous send cleared after your review." }
     func raw(_ text: String) {
         guard directInput, canUseTerminal else { return }
         let data = Data(text.utf8)
@@ -971,8 +971,8 @@ struct TeamResumeFailure: Equatable {
     private func lifecycle(_ action: String, controlID: String? = nil) async throws -> JSON {
         let key = "\(identity):\(action)"
         var pending = try drafts.read(key)
-        if pending.pendingID == nil { pending.pendingID = UUID().uuidString.lowercased(); try drafts.save(pending, identity: key) }
-        let result = try await client.request("/sessions/\(session.id)/\(action)", body: .object(["requestId": .string(pending.pendingID!)]), controlID: controlID)
+        if pending.pending == nil { pending.pending = PendingSend(id: UUID().uuidString.lowercased(), text: action); try drafts.save(pending, identity: key) }
+        let result = try await client.request("/sessions/\(session.id)/\(action)", body: .object(["requestId": .string(pending.pending!.id)]), controlID: controlID)
         try drafts.save(DraftRecord(), identity: key)
         return result
     }

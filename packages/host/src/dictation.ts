@@ -36,11 +36,9 @@ export class DictationCleaner {
           model: this.config.model,
           instructions: INSTRUCTIONS,
           input: text,
-          // Output may be close to input length; the extra room includes reasoning tokens.
           max_output_tokens: Math.min(MAX_OUTPUT_TOKENS, Math.max(1024, text.length + 1024)),
           store: false,
         }),
-        // Keep the reply inside the encrypted remote channel's 30s request timeout, which disconnects the socket when it expires.
         signal: AbortSignal.timeout(25_000),
       });
     } catch (error) {

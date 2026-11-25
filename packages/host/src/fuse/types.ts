@@ -26,9 +26,7 @@ export type FuseOpen = {
   ownerClose: boolean;
 };
 
-/** The fuse's own judgement of a scope. */
 export type FuseState = { state: "closed"; exempt?: true } | FuseOpen;
-/** What a gate answers. `halted` comes only from the owner's halt, which the host puts in front of the fuse. */
 export type FuseCheck = FuseState | LaunchHalted;
 
 export type FuseAdmission =
@@ -41,22 +39,27 @@ export type LaunchState = "admitted" | "started" | "released";
 
 export type FuseLaunchRecord = FuseLaunch & { state: LaunchState; admittedAt: number; seq: number };
 
-export type FuseTripRecord = {
+type FuseTripBase = {
   tripId: string;
-  scope: FuseScope;
-  projectId?: string;
   cause: FuseCause;
   window?: FuseWindow;
   openedAt: number;
-  closedAt?: number;
-  closedBy?: "rate" | "owner" | "baseline";
   ownerClose: boolean;
   announcedAt?: number;
   launches?: number;
   seq: number;
 };
 
-/** Launches per rolling hour. */
+type FuseTripScope =
+  | { scope: "host"; projectId?: never }
+  | { scope: "project"; projectId: string };
+
+type FuseTripClosure =
+  | { closedAt?: never; closedBy?: never }
+  | { closedAt: number; closedBy: "rate" | "owner" | "baseline" };
+
+export type FuseTripRecord = FuseTripBase & FuseTripScope & FuseTripClosure;
+
 export type FuseLimits = { project: number; host: number; projects: Record<string, number> };
 
 export interface FuseGate {
@@ -64,8 +67,6 @@ export interface FuseGate {
   admit(launch: FuseLaunch): FuseAdmission;
   release(launchId: string): void;
   started(launchId: string): void;
-  /** The owner's halt over any of these projects, for work that spans several. Only the halt's gate has it. */
   held?(projectIds: readonly string[]): LaunchHalted | undefined;
-  /** Gives back this process's admission of a launch that the owner's halt refused before its session existed. */
   refund?(launchId: string): void;
 }

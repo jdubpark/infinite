@@ -1,7 +1,3 @@
-/**
- * The permission agent's decision core: class rules, qualification, raise rules, readiness and the
- * model turns. It records nothing and delivers nothing; the pipeline does both.
- */
 import { createHash } from "node:crypto";
 import {
   PermissionReviewHeld,
@@ -32,21 +28,16 @@ import {
 } from "./permission-reviewer.js";
 import type { TeamModelProfile } from "./team-types.js";
 
-/** Every fresh review ends inside this window. */
 export const REVIEW_WINDOW_MS = 5 * 60 * 1000;
-/** A strong turn without a valid report is retried once inside the window. */
 const STRONG_ATTEMPTS = 2;
 
-/** A rate with its 95% Wilson interval. `rate` is null when no case is relevant; the interval is then [0, 1]. */
 export interface RateFigure { count: number; relevant: number; rate: number | null; lower: number; upper: number }
 
-/** The latest replay result for one binding, as readiness reads it. */
 export interface ReplayResultSummary {
   id: string;
   binding: string;
   finishedAt: string;
   cases: number;
-  /** Cases labelled should-reject or should-reach-owner that got allow, over all such cases. */
   missRate: RateFigure;
 }
 
@@ -59,12 +50,7 @@ export interface PermissionCoreOptions {
   launcher: PermissionTurnLauncher;
   results?: ReplayResults;
   facts?: HostRuleFacts;
-  /**
-   * The host's real-path resolver. With it the class and raise rules judge real paths, so a link inside
-   * the session root cannot hide a target outside it. A replay never uses it: it reads nothing from disk.
-   */
   resolvePath?: PathResolver;
-  /** "replay" marks turn usage as a measurement. */
   purpose?: "review" | "replay";
   windowMs?: number;
   now?: () => number;
@@ -74,7 +60,6 @@ export interface PermissionAgentCoreService extends PermissionAgentCore {
   settings(): PermissionAgentSettings;
 }
 
-/** Everything a replay result depends on. */
 export interface BindingParts {
   policy: string;
   tiers: readonly string[];
@@ -95,7 +80,6 @@ export function bindingDigest(parts: BindingParts): string {
   })).digest("hex");
 }
 
-/** The binding of a replay result: the current policy text, tier texts, classes and class rules, and the tier profiles. */
 export function permissionBinding(settings: PermissionAgentSettings, facts: HostRuleFacts = {}): string {
   return bindingDigest({ policy: PERMISSION_POLICY_TEXT, tiers: tierTexts(), classes: INTERRUPT_CLASSES, classRules: classRulesDigest(facts), light: settings.light, strong: settings.strong });
 }
@@ -110,7 +94,6 @@ export function createPermissionAgentCore(options: PermissionCoreOptions): Permi
   const facts = options.facts ?? {};
   const launcher = options.launcher;
   const real = purpose === "replay" ? undefined : options.resolvePath;
-  /** The request and its reading as the host rules judge them. Within one reading each path is resolved once. */
   const read = (request: PermissionRequest) => {
     const resolved = new Map<string, string | undefined>();
     const once = real && ((path: string) => {
@@ -124,7 +107,6 @@ export function createPermissionAgentCore(options: PermissionCoreOptions): Permi
   const tierRecord = (tier: PermissionTierName, profile: TeamModelProfile, startedAt: string, endedAt: string): PermissionTier =>
     ({ tier, profileId: profile.id, family: familyOf(profile) ?? "unknown", startedAt, endedAt });
 
-  /** One turn. A held turn throws; a turn without a valid report returns undefined. */
   async function turn(tier: PermissionTierName, profile: TeamModelProfile, request: PermissionRequest, context: PermissionReviewContext,
     report: ReportOptions, deadline: number, evidence: PermissionEvidence | undefined, tiers: PermissionTier[]): Promise<PermissionReport | undefined> {
     const timeoutMs = deadline - now();
@@ -182,11 +164,9 @@ export function createPermissionAgentCore(options: PermissionCoreOptions): Permi
       const tiers: PermissionTier[] = [];
       const classes = context.interruptClasses.filter((value): value is InterruptClass => (INTERRUPT_CLASSES as readonly string[]).includes(value));
 
-      // A raised request never gets a light verdict, and a request that cannot be allowed has nothing for the light tier.
       if (context.raised.length === 0 && context.canAllow && settings.light && launcher.supports(settings.light)) {
         const light = await turn("light", settings.light, request, context, { tier: "light", canAllow: true, canCollect: false, classes }, deadline, request.evidence, tiers);
         if (light?.verdict === "allow") return { verdict: "allow", note: light.note, tiers };
-        // Refer, no report or a failed turn: the strong tier decides. The light tier can never reject.
       }
 
       if (context.requesterFamily === undefined) return unavailable(tiers, "The host cannot establish the requester's model family, so no strong tier qualifies.");
@@ -212,7 +192,6 @@ export function createPermissionAgentCore(options: PermissionCoreOptions): Permi
         if (strong?.verdict === "allow" && context.canAllow) return { verdict: "allow", note: strong.note, tiers };
         if (strong?.verdict === "reject") return { verdict: "reject", code: strong.code, note: strong.note, ...(strong.repeats ? { repeats: strong.repeats } : {}), tiers };
         if (strong?.verdict === "owner") return { verdict: "owner", interruptClass: strong.interruptClass, note: strong.note, tiers };
-        // No valid report: retry inside the window, on the next qualifying profile when there is one.
         attempt++;
         candidate++;
       }

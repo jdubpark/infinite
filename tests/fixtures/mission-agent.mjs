@@ -2,7 +2,6 @@ import { existsSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-// Plays the mission coordinator and each subteam role, deciding from the prompt the host built.
 const [receipts] = process.argv.slice(3);
 const assignment = JSON.parse(process.env.INFINITE_TEAM_ASSIGNMENT ?? "null");
 if (!assignment || !process.env.INFINITE_HOOK_URL || !process.env.INFINITE_HOOK_TOKEN)
@@ -31,9 +30,7 @@ async function coordinator() {
   const state = json("Mission state (JSON): "), messages = json("Messages since your last attempt (JSON): ");
   const held = prompt.includes("HOLD-SUBTEAM"), refusal = messages.find(message => message.type === "refused")?.reason ?? "";
   const step = (id, repoProjectId, dependsOn) => ({ id, repoProjectId, title: id, objective: "HOLD-SUBTEAM", size: "solo", dependsOn });
-  // An answer-mode mission has no subteam: the coordinator reports the answer itself.
   if (prompt.includes("ANSWER-DIRECT") && messages.some(message => message.type === "start")) { await report({ kind: "result", summary: "Rows 14, 90 and 212 were empty." }); return; }
-  // Answer-only missions: the resumed attempt's prompt omits the objective, so the state's subtask objective marks it too.
   if (prompt.includes("ANSWER-ONLY") || state.subtasks.some(subtask => subtask.objective === "NO-CHANGE-ANSWER")) {
     const answered = messages.find(message => message.type === "subtask-finished" && message.report);
     if (answered) { await report({ kind: "result", summary: answered.report.text }); return; }
@@ -91,7 +88,6 @@ async function subteam() {
     }
     if (!api) await until(() => existsSync(join(receipts, "release-web-question")));
     if (!/(?:User|Mission coordinator|Connector(?: \([^\n]*\))?) answered(?: "[^\n]*")?:/.test(prompt)) {
-      // The web question carries no recommendation: a member started before recommendations were required.
       await report(api
         ? { kind: "question", question: "Which response format should the endpoint use?", options: ["JSON", "Text"], recommendation: { answers: ["JSON"], reason: "Clients already parse JSON." } }
         : { kind: "question", question: "Should the button be primary?", options: ["Primary", "Secondary"] });

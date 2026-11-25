@@ -4,7 +4,6 @@ import { PROMPT_ORIGINS, VOID_ENDINGS, type ComparisonStats, type PairResult, ty
 export const BOOTSTRAP_RESAMPLES = 10_000;
 export const INTERVAL_LOW = 250;
 export const INTERVAL_HIGH = 9_749;
-// 1.959964 (two-sided 95%) + 0.841621 (80% power).
 export const POWER_Z = 2.801585;
 export const PLANNING_SD = [0.35, 0.41] as const;
 
@@ -38,7 +37,6 @@ function rotl(x: number, k: number): number {
   return ((x << k) | (x >>> (32 - k))) >>> 0;
 }
 
-/** xoshiro128**: four 32-bit words of state, one unsigned 32-bit output per call. */
 export function xoshiro128ss(state: readonly [number, number, number, number]): () => number {
   let s0 = state[0] >>> 0;
   let s1 = state[1] >>> 0;
@@ -58,13 +56,11 @@ export function xoshiro128ss(state: readonly [number, number, number, number]): 
   };
 }
 
-/** The seed, pair, and subgroup fix the stream: the same rows give the same interval. */
 export function bootstrapStream(seed: string, pair: string, subgroup: string): () => number {
   const digest = createHash("sha256").update(`${seed}\u0000${pair}\u0000${subgroup}`, "utf8").digest();
   return xoshiro128ss([digest.readUInt32BE(0), digest.readUInt32BE(4), digest.readUInt32BE(8), digest.readUInt32BE(12)]);
 }
 
-/** Exact two-sided sign test over the untied pairs. */
 export function signTest(wins: number, losses: number): number {
   const n = wins + losses;
   if (n === 0) return 1;
@@ -79,7 +75,6 @@ export function signTest(wins: number, losses: number): number {
   return Math.min(1, p);
 }
 
-/** Holm step-down adjustment, returned in the input order. */
 export function holm(p: readonly number[]): number[] {
   const order = p.map((value, index) => ({ value, index }));
   order.sort((x, y) => x.value - y.value || x.index - y.index);

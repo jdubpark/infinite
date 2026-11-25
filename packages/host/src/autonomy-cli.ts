@@ -29,14 +29,12 @@ export async function handleAutonomyClientCommand(positional: string[], options:
   const mode = autonomyModeSchema.safeParse(requested);
   if (!mode.success) throw new Error("Autonomy mode must be supervised or autonomous.");
   if (!PROJECT_ID.test(project)) throw new Error("Project ID must be 1 to 80 lowercase letters, digits, or hyphens.");
-  // Checked before the first request, so a typo never reads or changes the enrollment.
   const requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
   const revisionOption = options["--revision"] === undefined ? undefined : Number(options["--revision"]);
   if (revisionOption !== undefined && (!Number.isInteger(revisionOption) || revisionOption < 1)) throw new Error("--revision must be a positive integer.");
   const view = await api.json<AutonomyView>(path);
   if (view.autonomy === undefined) throw new Error("This host does not support autonomy modes. Upgrade the host.");
   if (view.autonomySource === "not-enrolled") throw new Error(`${clean(project)} is not enrolled. Run infinite repo init first; other projects stay supervised.`);
-  // A rerun after a lost reply reads the new revision, so a resend would conflict. Print the saved state instead.
   if (view.autonomySource === "saved" && view.autonomy === mode.data) { printView(project, view, options["--json"] === true); return true; }
   console.error(`[Infinite] Setting ${clean(project)} to ${mode.data} · request ${requestId}`);
   const saved = await api.json<AutonomyView>(`/projects/${encodeURIComponent(project)}/autonomy`, { requestId, revision: revisionOption ?? view.revision, mode: mode.data }, undefined, undefined, "PUT");

@@ -22,7 +22,6 @@ async function redirect(n: Notifications.Notification) {
   if (!kind || !id) return;
   const saved = await loadConnections();
   const machineId = typeof data?.machineId === "string" ? data.machineId : undefined;
-  // Older notifications without a machine are safe only when there is a single pairing.
   const connection = machineId ? saved.profiles.find(profile => profile.id === machineId || profile.machineId === machineId || profile.relay?.machineId === machineId) : saved.profiles.length === 1 ? saved.profiles[0] : undefined;
   if (!connection) { router.push("/"); return; }
   const pathname = kind.toLowerCase() === "team" ? "/team/[id]" : kind.toLowerCase() === "goal" ? "/goal/[id]" : "/session/[id]";

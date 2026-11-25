@@ -15,14 +15,11 @@ import type { Provider } from "./types.js";
 
 export type { ObjectivePrompt } from "./objective-digest.js";
 
-/** Guidance files whose blobs a configuration identity covers (umbrella C7, component 3, default set). */
 export const GUIDANCE_FILES = ["AGENTS.md", "CLAUDE.md"] as const;
 
 const GUIDANCE_READ_TIMEOUT_MS = 30_000;
 const GUIDANCE_CACHE_LIMIT = 64;
-/** Guidance reads that may run at once in the host. A stalled read that cannot be stopped keeps its place. */
 const GUIDANCE_READS_LIMIT = 4;
-/** Git's empty tree ids. Compared with the commit's id length, so a SHA-256 repository gets its own. */
 const EMPTY_TREE_SHA1 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const EMPTY_TREE_SHA256 = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321";
 const GUIDANCE_MODES = new Set(["100644", "100755", "120000"]);
@@ -35,7 +32,6 @@ export interface ConfigComponents {
   promptVersion: string;
   guidance: string;
   knowledge: "none";
-  /** `off`, or the policy digest of an `auto` run. */
   routing: string;
   shape: "team" | "trial";
 }
@@ -43,21 +39,14 @@ export type MemberConfiguration = ConfigComponents["profile"] & Omit<ConfigCompo
 
 const sha256 = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
 
-/** The routing component of a configuration: `off`, or the policy digest of an `auto` run (umbrella C7, component 5). */
 export function isRoutingComponent(value: unknown): value is string {
   return value === "off" || (typeof value === "string" && ROUTING_DIGEST.test(value));
 }
 
-/** SHA-256 hex of the canonical JSON of the key. The profile id and label are not part of it. */
 export function profileIdentityKey(profile: ProfileKey): string {
   return sha256(canonicalJson({ provider: profile.provider, model: profile.model ?? null, effort: profile.effort ?? null }));
 }
 
-/**
- * The identity that a profile id names among the given profiles. Undefined when no profile has the id, and
- * "ambiguous" when its profiles differ in provider, model, or effort. The lineup schema refuses such a lineup,
- * so "ambiguous" guards a rule that lives elsewhere.
- */
 export function profileKeyOf(profiles: readonly TeamModelProfile[], profileId: string): ProfileKey | "ambiguous" | undefined {
   const keys = new Map<string, ProfileKey>();
   for (const profile of profiles) {
@@ -70,7 +59,6 @@ export function profileKeyOf(profiles: readonly TeamModelProfile[], profileId: s
   return keys.size === 1 ? [...keys.values()][0]! : "ambiguous";
 }
 
-/** SHA-256 hex of the canonical JSON of exactly the six components (umbrella C7). */
 export function configId(components: ConfigComponents): string {
   return sha256(canonicalJson({
     profile: { provider: components.profile.provider, model: components.profile.model ?? null, effort: components.profile.effort ?? null },
@@ -90,7 +78,6 @@ const FIXTURE_TASK: TeamTask = { id: "fixture-task", title: "Fixture task", inst
 const FIXTURE_SCOUT: TeamScout = { id: "fixture-scout", title: "Fixture scout", instructions: "Fixture scout instructions.", agentProfileId: "fixture-scout", status: "pending" };
 const FIXTURE_PROFILE = { id: "fixture-profile", label: "Fixture profile", provider: "claude", model: "fixture-model", effort: "high" } as const;
 
-/** The record digest the goal fixture takes when the objective switch is on. Its shape is the digest's, not a live record. */
 const FIXTURE_RECORD: RecordDigest = {
   version: 1,
   criteria: [
@@ -98,17 +85,14 @@ const FIXTURE_RECORD: RecordDigest = {
     { id: "c1", statement: "Fixture owner criterion.", check: "command:npm test", producer: "host" },
   ],
 };
-/** The register the "register" and "register-autonomous" shapes add to the fixture record. Fixed text, never a live record. */
 const FIXTURE_REGISTER: RegisterDigest = {
   assumptions: [{ id: "a1", status: "unchecked", criticality: "plan", statement: "Fixture assumption." }],
   questions: [{ id: "q1", text: "Fixture question? Default: keep." }],
 };
-/** The two fixed criteria rows the "-criteria" shapes add. Fixed text, never a live verdict. */
 const FIXTURE_ROWS: CriteriaRow[] = [
   { criterion: "c0", status: "met", check: "judgement:owner-text" },
   { criterion: "c1", status: "not-met", check: "command:npm test" },
 ];
-/** Two fixed runs, each with its work item. Rendering them is the prompt version; no live run is read. */
 const FIXTURES: { run: TeamRun; work: TeamTask | TeamScout }[] = [
   {
     run: { id: "00000000-0000-4000-8000-000000000001", projectId: FIXED_PROJECT_ID, provider: "claude", title: "Fixture run", objective: "Fixture objective.", parallelism: 1, revision: 1, status: "implementing", createdAt: FIXED_TIME, updatedAt: FIXED_TIME, workspace: "/home/dev/projects/infinite", branch: "infinite/team-fixture", baseCommit: FIXED_BASE, tasks: [FIXTURE_TASK], members: [], decisions: [], checks: [], steering: [], events: [], round: 1 } as TeamRun,
@@ -124,17 +108,10 @@ const FIXTURES: { run: TeamRun; work: TeamTask | TeamScout }[] = [
 
 const promptCache = new Map<string, string>();
 const guidanceCache = new Map<string, string>();
-/** A read in flight and the callers that wait for its result. A caller leaves the set when its own deadline ends its wait. */
 type GuidanceRead = { waiters: Set<(digest: string | undefined) => void> };
-/** Reads in flight, by workspace and commit. A read leaves only when its child has ended. */
 const guidanceReads = new Map<string, GuidanceRead>();
-/** Callers that wait for a free place. Each is woken when a read ends, and leaves when its own deadline ends its wait. */
 const placeWaiters = new Set<() => void>();
 
-/**
- * Waits in `waiters` until a value arrives or the signal aborts, and then leaves the set. The stalled read holds no
- * reference to a caller that gave up, so callers of a read that never ends do not add up.
- */
 function waitIn<T>(waiters: Set<(value: T | undefined) => void>, signal: AbortSignal): Promise<T | undefined> {
   return new Promise(resolve => {
     const done = (value: T | undefined) => { waiters.delete(done); signal.removeEventListener("abort", onAbort); resolve(value); };
@@ -144,10 +121,6 @@ function waitIn<T>(waiters: Set<(value: T | undefined) => void>, signal: AbortSi
   });
 }
 
-/**
- * The goal fixture's run for an objective shape. `true` gives the criteria digest alone. "register" pins the run
- * supervised and adds the fixture register; "register-autonomous" pins it autonomous. A run without a goal is unchanged.
- */
 function objectiveFixture(plain: TeamRun, objectiveDigest: ObjectivePrompt): TeamRun {
   if (objectiveDigest === false || !plain.goal) return plain;
   const rows = typeof objectiveDigest === "string" && objectiveDigest.endsWith("criteria") ? { criteria: FIXTURE_ROWS } : {};
@@ -159,12 +132,6 @@ function objectiveFixture(plain: TeamRun, objectiveDigest: ObjectivePrompt): Tea
   };
 }
 
-/**
- * The fixture renders of the prompt a member is launched with: `teamPrompt`, and the rule for programs when the launch
- * asks for Code Mode (`codeMode`, which changes only a Claude member's prompt). The report command holds the Node path
- * and the reporter's own file path, which change with the install directory and not with the wording, so a placeholder
- * stands in for it. Throws when teamPrompt throws.
- */
 export function renderedPrompts(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest: ObjectivePrompt = false, codeMode = false): string[] {
   const command = reportCommand();
   if (role === "intent-checker") return [memberLaunchPrompt(intentCheckerPrompt(provider, profile), provider, codeMode).split(command).join("<report-command>")];
@@ -178,10 +145,6 @@ export function renderedPrompts(role: TeamMember["role"], provider: Provider, pr
   });
 }
 
-/**
- * The digest of `renderedPrompts`. Cached per exact render input: the prompt prints the whole profile object, so
- * every profile field is part of the key. Throws when teamPrompt throws.
- */
 export function promptVersion(role: TeamMember["role"], provider: Provider, profile: TeamModelProfile | undefined, publishHeads: boolean, entryTools = false, objectiveDigest: ObjectivePrompt = false, codeMode = false): string {
   const key = JSON.stringify([role, provider, profile ?? null, publishHeads, entryTools, objectiveDigest, codeMode]);
   const cached = promptCache.get(key);
@@ -192,18 +155,10 @@ export function promptVersion(role: TeamMember["role"], provider: Provider, prof
   return version;
 }
 
-/** The judge's prompt version. The judge prompt takes no profile, so every judge profile of one provider shares it. */
 export function judgePromptVersion(provider: Provider): string {
   return promptVersion("judge", provider, undefined, false);
 }
 
-/**
- * The guidance entries of `git diff-tree -r --raw` output, sorted by path. Each line is
- * `:000000 <mode> <zero id> <object id> A`, a tab, then the path. With `core.quotePath` on, Git writes a path that
- * holds a non-ASCII byte, a quote, a backslash, or a control character in its quoted form, so every line is ASCII
- * and a tab or a line break never appears inside a path. A line is kept when its status is `A`, its mode is a file
- * or a symbolic link, and its last path segment equals a GUIDANCE_FILES name. Malformed lines are skipped.
- */
 export function parseGuidanceTree(stdout: string): { path: string; object: string }[] {
   const entries: { path: string; object: string }[] = [];
   for (const line of stdout.split("\n")) {
@@ -213,7 +168,6 @@ export function parseGuidanceTree(stdout: string): { path: string; object: strin
     const path = line.slice(tab + 1);
     if (meta.length !== 5 || !meta[0]!.startsWith(":")) continue;
     const [, mode, , object, status] = meta;
-    // A quoted path ends with a quote. The file name itself needs no quoting when it is a guidance name.
     const name = basename(path.startsWith('"') && path.endsWith('"') ? path.slice(1, -1) : path);
     if (status !== "A" || !GUIDANCE_MODES.has(mode!) || !(GUIDANCE_FILES as readonly string[]).includes(name)) continue;
     entries.push({ path, object: object! });
@@ -221,20 +175,11 @@ export function parseGuidanceTree(stdout: string): { path: string; object: strin
   return entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
 
-/** SHA-256 over the sorted path and object id pairs. No path or object id is kept. */
 export function guidanceDigest(entries: readonly { path: string; object: string }[]): string {
   const sorted = entries.map(({ path, object }) => ({ path, object })).sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return sha256(canonicalJson(sorted));
 }
 
-/**
- * Best effort. Undefined on any failure. Never throws. Successes are cached per workspace and commit.
- *
- * Under a launcher such as sudo the host may not signal the command, so a stalled read cannot be stopped. Three
- * rules keep that bounded: one read per workspace and commit runs at a time and later callers share it; at most
- * GUIDANCE_READS_LIMIT reads run at once, and a caller that finds no free place waits for one; and a caller's wait
- * ends when its signal aborts, whether or not any child has ended.
- */
 export async function readGuidanceDigest(workspace: string, commit: string, prefix: TeamCommand | undefined, signal: AbortSignal): Promise<string | undefined> {
   const key = JSON.stringify([workspace, commit]);
   for (;;) {
@@ -253,18 +198,14 @@ export async function readGuidanceDigest(workspace: string, commit: string, pref
       });
     }
     if (read !== undefined) return waitIn(read.waiters, signal);
-    // No place is free. Wait for one, or for this caller's deadline, and look again.
     await waitIn(placeWaiters as Set<(value: undefined) => void>, signal);
   }
 }
 
-/** One read under its own time limit. It takes no caller's signal, because several callers share it. Never rejects. */
 async function guidanceRead(workspace: string, commit: string, prefix: TeamCommand | undefined, key: string): Promise<string | undefined> {
   try {
-    // One bounded read: the commit against the empty tree lists only the guidance files, so a large repository is not cut by the output cap.
     const emptyTree = commit.length === 64 ? EMPTY_TREE_SHA256 : EMPTY_TREE_SHA1;
     const pathspecs = GUIDANCE_FILES.map(name => `:(glob)**/${name}`);
-    // Quoted paths keep the output ASCII: the command decodes each output chunk on its own, and a split character would change the digest.
     const result = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["-c", "core.quotePath=true", "diff-tree", "-r", "--raw", "--no-abbrev", "--no-renames", emptyTree, commit, "--", ...pathspecs]) }, workspace, undefined, GUIDANCE_READ_TIMEOUT_MS, prefix);
     if (result.exitCode !== 0 || result.interrupted || result.truncated) return undefined;
     const digest = guidanceDigest(parseGuidanceTree(result.stdout));
@@ -276,15 +217,11 @@ async function guidanceRead(workspace: string, commit: string, prefix: TeamComma
   }
 }
 
-/** The data of `member.configured`, or undefined when any component is unknown. Never throws. */
 export async function memberConfiguration(input: {
   workspace: string; baseCommit: string; role: TeamMember["role"]; provider: Provider;
   profile?: TeamModelProfile; publishHeads: boolean; entryTools?: boolean; objectiveDigest?: ObjectivePrompt; prefix?: TeamCommand;
-  /** A trial's run is `trial`; every team's is `team`. */
   shape?: "team" | "trial";
-  /** The routing component. Absent means `off`, as every configuration before routing was stored. */
   routing?: string;
-  /** True when the host asked for Code Mode at the member's launch. It is part of the prompt version, so of the identity. */
   codeMode?: boolean;
 }, signal: AbortSignal): Promise<MemberConfiguration | undefined> {
   if (input.routing !== undefined && !isRoutingComponent(input.routing)) return undefined;

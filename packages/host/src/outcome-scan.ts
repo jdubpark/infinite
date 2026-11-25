@@ -24,7 +24,6 @@ import { OUTCOMES_MODULE } from "./outcome-store.js";
 import type { TeamCommand } from "./team-types.js";
 import { type CommandResult, teamCommand, teamGitArgs } from "./team-workspace.js";
 
-/** Runs one Git command in a directory and returns its result. The default adds the six `-c` settings. */
 export type ScanGit = (cwd: string, args: string[]) => Promise<CommandResult>;
 
 export type ScanResult = {
@@ -35,64 +34,41 @@ export type ScanResult = {
   reverts: number;
 };
 
-/**
- * The most Git commands one scan may run. A scan of 500 commits against 2,500 landed ids needs about 510. Base branch
- * commits are written by anyone with push rights, and a commit that names many landed commits adds commands, so a scan
- * past the limit fails like any other failed read.
- */
 export const SCAN_COMMAND_LIMIT = 600;
 
-/**
- * The most fetches a project keeps that no recorded scan read. Past it the oldest is dropped. The first fetch that is
- * left then says since when its previous head stood, so a dropped fetch that moved the head still breaks the chain.
- */
 export const UNREAD_LIMIT = 8;
 
-/**
- * What one recorded scan saw, for a listener such as the project signal inbox. It holds commit ids, run ids, and
- * parent lists only: no commit message or other text from Git.
- */
 export type AppliedScan = {
   projectId: string;
   head: string;
-  /** True when the scan read exactly the first-parent commits added since the ledger's stored head. */
   continuous: boolean;
-  /** The commits the scan read, oldest first. */
   commits: readonly ScanCommit[];
-  /** Every landing and revert the scan matched, including ones the ledger had already recorded. */
   landings: readonly Landing[];
   reverts: readonly RevertMatch[];
-  /** The landing and revert signals this scan wrote. */
   recorded: readonly RecordedScanSignal[];
 };
 
 export type ScanOnceInput = {
   store: EvidenceStore; git: ScanGit; mirror: string; fetch: MirrorFetch; holdDays: number;
-  /** Defaults to `SCAN_COMMAND_LIMIT`. */
   commandLimit?: number;
-  /** Fetches since the last recorded scan that no recorded scan read, oldest first, with none missing between them. */
   earlier?: readonly MirrorFetch[];
-  /** Called after a scan's write commits. A throw is ignored: it never fails or repeats the scan. */
   onApplied?: (scan: AppliedScan) => void;
 };
 
 const SKIPPED: ScanResult = { state: "skipped", commits: 0, gap: null, landings: 0, reverts: 0 };
 const FAILED: ScanResult = { state: "failed", commits: 0, gap: null, landings: 0, reverts: 0 };
 
-/** The Git runner the scanner uses: `git` in `cwd` through `teamCommand`, with the optional launcher prefix. */
 export function scanGit(prefix?: TeamCommand): ScanGit {
   return (cwd, args) => teamCommand({ command: "git", args: teamGitArgs(cwd, args) }, cwd, undefined, 30_000, prefix);
 }
 
 class ScanFailure extends Error {}
 
-/** Every id that enters a Git argument passes here first, so no argument can be an option. */
 function commitId(id: string): string {
   if (!COMMIT_ID.test(id)) throw new ScanFailure("a commit id is malformed");
   return id;
 }
 
-/** The stdout of a command that must succeed. A non-zero or null exit code, an interruption, or a truncation fails. */
 async function output(git: ScanGit, cwd: string, args: string[]): Promise<string> {
   const result = await git(cwd, args);
   if (result.interrupted || result.truncated || result.exitCode !== 0) throw new ScanFailure("a Git command failed");
@@ -105,21 +81,12 @@ function listed(stdout: string, max: number): string[] {
   return ids;
 }
 
-/** Form 1. Exit 0 is an ancestor; any other exit code is a rewrite. Only an interruption fails. */
 async function isAncestor(git: ScanGit, cwd: string, older: string, newer: string): Promise<boolean> {
   const result = await git(cwd, ["merge-base", "--is-ancestor", commitId(older), commitId(newer)]);
   if (result.interrupted) throw new ScanFailure("the ancestry check was interrupted");
   return result.exitCode === 0;
 }
 
-/**
- * Whether the unread fetches and the new one continue the ledger's record. Each fetch must name, as the head before
- * it, the head of the one before it in the chain (the stored head, for the first), and that head must have stood
- * since a fetch no later than that one (the last fetch the ledger recorded, for the first). A later start means that
- * a fetch between the two moved the head and was never read, in this process or before a restart. The times are the
- * source's fetch stamps, which never go back. A missing value never matches, and a fetch of another repository or
- * branch breaks the chain.
- */
 function continues(chain: readonly MirrorFetch[], state: { head: string; checkedAt: string }, fetch: MirrorFetch): boolean {
   let head = state.head;
   let stamp = Date.parse(state.checkedAt);
@@ -134,7 +101,6 @@ function continues(chain: readonly MirrorFetch[], state: { head: string; checked
   return chain.length > 0;
 }
 
-/** The unread heads that differ from both the stored head and the new one, distinct, in fetch order. */
 function unreadHeads(earlier: readonly MirrorFetch[], stored: string, newer: string): string[] {
   return [...new Set(earlier.map(entry => entry.head))].filter(id => id !== stored && id !== newer);
 }
@@ -145,7 +111,6 @@ function chunks<T>(items: readonly T[], size: number): T[][] {
   return pages;
 }
 
-/** Form 5 for some patterns and some commits. Every id it returns must be one of the commits given. */
 function revertArgs(patterns: readonly string[], commits: readonly string[]): string[] {
   return [
     "log", "--no-walk=unsorted", "--no-show-signature", "--format=%H", "--fixed-strings",
@@ -170,7 +135,6 @@ async function findReverts(
       if (batchHits.some(commit => !page.includes(commit))) throw new ScanFailure("a revert id was not requested");
       const found = page.filter(commit => batchHits.includes(commit));
       if (found.length === 0) continue;
-      // The batch matched in this page. Ask once per pattern which of the page's hits it names.
       for (const id of batch) {
         const named = listed(await output(git, mirror, revertArgs([id], found)), found.length);
         for (const commit of named) {
@@ -185,10 +149,6 @@ async function findReverts(
   return matchReverts(commits, landed, hits, at, older);
 }
 
-/**
- * One base branch scan of a project. Every store write happens in the last transaction, so a scan that fails for any
- * reason writes nothing. A scan is `skipped` unless the module is ready, the mirror exists, and the head is a commit id.
- */
 export async function scanOnce(input: ScanOnceInput): Promise<ScanResult> {
   const { store, mirror, fetch, holdDays } = input;
   const limit = input.commandLimit ?? SCAN_COMMAND_LIMIT;
@@ -204,14 +164,12 @@ export async function scanOnce(input: ScanOnceInput): Promise<ScanResult> {
     const state = inputs.state;
     const earlier = input.earlier ?? [];
     const sameSource = state !== undefined && state.repository === fetch.repository && state.baseBranch === fetch.baseBranch;
-    // The unread fetches and this one must continue the stored head, or the history between them is unproven.
     const continuous = state !== undefined && sameSource && continues([...earlier, fetch], state, fetch);
     if (state !== undefined && sameSource && continuous && fetch.head === state.head && earlier.every(entry => entry.head === state.head)) {
       const checked = store.write(tx => applyCheck(tx, { projectId: fetch.projectId, head: fetch.head, at: fetch.fetchedAt, expectedSeq: state.seq }));
       return { ...SKIPPED, state: checked.applied ? "checked" : "skipped" };
     }
 
-    // Newest first from Git. The scan keeps the gap and the `from` that its range proves.
     const newest = async (): Promise<string[]> =>
       listed(await output(git, mirror, ["rev-list", "--first-parent", `--max-count=${SCAN_BOUND}`, commitId(fetch.head)]), SCAN_BOUND);
     let listedIds: string[];
@@ -235,8 +193,6 @@ export async function scanOnce(input: ScanOnceInput): Promise<ScanResult> {
         from = state.head;
         listedIds = range;
       } else {
-        // A head that a fetch saw is not a first-parent commit of the range any more, so the commits that stood
-        // under it were never read. An ancestor that came back through a merge's second parent is such a head.
         gap = "rewrite";
         listedIds = await newest();
       }
@@ -244,10 +200,8 @@ export async function scanOnce(input: ScanOnceInput): Promise<ScanResult> {
       gap = "rewrite";
       listedIds = await newest();
     }
-    // Rule 3 reads older history only when the range does not start at the stored head.
     const older = gap === "first" || gap === "rewrite" || gap === "source";
 
-    // Oldest first, reversed once.
     const chronological = [...listedIds].reverse();
     const commits: ScanCommit[] = [];
     for (const page of chunks(chronological, COMMIT_PAGE)) {
@@ -297,7 +251,6 @@ export async function scanOnce(input: ScanOnceInput): Promise<ScanResult> {
           commits, landings, reverts, recorded,
         });
       } catch {
-        // The scan is recorded. A listener's failure must not report it as failed, or the next scan would reread it.
       }
     }
     return { state: applied ? "scanned" : "skipped", commits: commits.length, gap, landings: landings.length, reverts: reverts.length };
@@ -313,22 +266,15 @@ export type BaseScannerOptions = {
   holdDays: () => number;
   git?: ScanGit;
   log?: (line: string) => void;
-  /** Passed to each scan. See `ScanOnceInput.onApplied`. */
   onApplied?: (scan: AppliedScan) => void;
 };
 
-/**
- * Runs one base scan per project at a time. A notice that arrives during a scan replaces the pending notice of that
- * project and runs after the current scan. Logs at most one line per class in the life of the scanner, and names no
- * commit, project, repository, or branch.
- */
 export class BaseScanner {
   private readonly git: ScanGit;
   private readonly log: (line: string) => void;
   private readonly running = new Map<string, Promise<void>>();
   private readonly pending = new Map<string, MirrorFetch>();
   private readonly gapsLogged = new Set<ScanGap>();
-  /** Per project, the fetches that no recorded scan read, oldest first. The fetch of a running scan is the last one a scan may clear. */
   private readonly unread = new Map<string, MirrorFetch[]>();
   private failureLogged = false;
   private closed = false;
@@ -338,11 +284,8 @@ export class BaseScanner {
     this.log = options.log ?? (line => console.error(line));
   }
 
-  /** Returns at once and never throws. */
   notify(fetch: MirrorFetch): void {
     try {
-      // A head that is not a commit id cannot be scanned. The next fetch then names it as its previous head, which
-      // no stored head equals, so that scan is a gap.
       if (this.closed || !COMMIT_ID.test(fetch.head)) return;
       if (this.running.has(fetch.projectId)) {
         const replaced = this.pending.get(fetch.projectId);
@@ -352,25 +295,21 @@ export class BaseScanner {
       }
       this.start(fetch);
     } catch {
-      // A notice never throws.
     }
   }
 
-  /** Resolves when the project has no running and no pending scan. */
   async settled(projectId: string): Promise<void> {
     for (let running = this.running.get(projectId); running !== undefined; running = this.running.get(projectId)) {
       await running.catch(() => undefined);
     }
   }
 
-  /** Drops every pending notice and every unread fetch, and ignores the result of a running scan. */
   close(): void {
     this.closed = true;
     this.pending.clear();
     this.unread.clear();
   }
 
-  /** Keeps a fetch that no recorded scan read. Past `UNREAD_LIMIT` the oldest goes. */
   private remember(fetch: MirrorFetch): void {
     const list = this.unread.get(fetch.projectId) ?? [];
     list.push(fetch);
@@ -378,11 +317,9 @@ export class BaseScanner {
     this.unread.set(fetch.projectId, list);
   }
 
-  /** A recorded scan read its own fetch and every fetch before it. The fetches after it stay unread. */
   private recorded(fetch: MirrorFetch): void {
     const list = this.unread.get(fetch.projectId);
     const index = list === undefined ? -1 : list.indexOf(fetch);
-    // When the fetch itself was dropped past the limit, every fetch that is left came after it and stays unread.
     if (list === undefined || index === -1) return;
     list.splice(0, index + 1);
     if (list.length === 0) this.unread.delete(fetch.projectId);
@@ -398,8 +335,6 @@ export class BaseScanner {
       let next: MirrorFetch | undefined = first;
       while (next !== undefined) {
         const fetch: MirrorFetch = next;
-        // The scan reads the unread fetches before this one. This fetch joins the list now, so that the list stays in
-        // fetch order: a notice that is replaced while the scan runs was fetched after it.
         const earlier = [...(this.unread.get(projectId) ?? [])];
         this.remember(fetch);
         const result = await this.scan(fetch, earlier);
@@ -410,7 +345,6 @@ export class BaseScanner {
         this.pending.delete(projectId);
       }
     } finally {
-      // In the same turn as the last look at `pending`, so no notice can park behind a scan that has ended.
       this.running.delete(projectId);
     }
   }
@@ -444,7 +378,6 @@ export class BaseScanner {
         this.log(`Base branch scan gap: ${result.gap}.`);
       }
     } catch {
-      // A log line never throws.
     }
   }
 }

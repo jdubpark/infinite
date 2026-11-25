@@ -2,8 +2,6 @@ import { appendFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 
 const receiptPath = process.argv[2];
-// Optional mode after the receipt path: fail (exit 1), skip (an unrefreshed brief), empty (no brief yet)
-// or disabled (the repository is not opted in).
 const mode = ["fail", "skip", "empty", "disabled", "invalid", "large"].includes(process.argv[3]) ? process.argv[3] : null;
 const fail = mode === "fail";
 const args = process.argv.slice(mode ? 4 : 3);

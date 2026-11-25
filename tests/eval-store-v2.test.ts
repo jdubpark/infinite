@@ -55,7 +55,6 @@ function setup(): Setup {
   };
 }
 
-/** The version-1 module, built from the DDL that version 1 shipped. */
 function v1Module(): EvidenceModule {
   return {
     name: EVAL_MODULE,
@@ -114,7 +113,6 @@ function scalar(store: EvidenceStore, sql: string, ...params: string[]): number 
 const V1_COLUMNS = "task_id, origin, run_id, member_id, project_ref, state, reason, material, approval, approved_at, base, "
   + "material_bytes, captured_at, decided_at, checked_at, run_deleted_at, payload";
 
-/** A captured row written the way version 1 wrote it, with the v1 column list only. */
 function insertV1(store: EvidenceStore, memberId: string, material: "stored" | "pending"): void {
   const taskId = capturedTaskId(RUN, memberId);
   const payload = {
@@ -142,12 +140,10 @@ function insertV1(store: EvidenceStore, memberId: string, material: "stored" | "
   });
 }
 
-/** Every version-1 column of every row, in a fixed order. */
 function v1Rows(store: EvidenceStore): unknown[] {
   return store.read(db => db.all(`SELECT ${V1_COLUMNS} FROM eval_tasks ORDER BY task_id`));
 }
 
-/** The schema, the module records, and every row the store keeps. Equal before and after a refused migration. */
 function dump(store: EvidenceStore): string {
   return JSON.stringify(store.read(db => ({
     master: db.all("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name"),
@@ -319,7 +315,6 @@ test("mined rows stay out of capture's reads and cap", () => {
     assert.equal(result.visited, 1);
     assert.deepEqual(decided, [visible]);
 
-    // 19,998 more captured rows make 19,999 in all: the next marker still fits, and the one after is full.
     store.write(tx => {
       tx.run(
         "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 19998) "
@@ -412,7 +407,6 @@ test("the hot statements read through an index", () => {
     const store = f.open();
     store.register(v2Module(store));
     const ref = store.write(tx => tx.index("project", PROJECT));
-    // A planner may pick any index that leads with the same columns; each case names the ones that serve it.
     const cases: { name: string; sql: string; params: (string | number)[]; index: string[] }[] = [
       { name: "RECONCILE_ORDER_SQL", sql: RECONCILE_ORDER_SQL, params: ["captured", 100], index: ["eval_tasks_check_captured"] },
       { name: "PATHS_PENDING_SQL", sql: PATHS_PENDING_SQL, params: [ref], index: ["eval_tasks_unindexed"] },

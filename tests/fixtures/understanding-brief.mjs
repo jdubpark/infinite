@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { appendFileSync, readFileSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 
-// An optional receipt path after the mode records every invocation's arguments.
 const receipt = process.argv[3] && !process.argv[3].startsWith("--") ? process.argv[3] : null;
 if (receipt) appendFileSync(receipt, `${JSON.stringify({ args: process.argv.slice(4) })}\n`);
 const baseIndex = process.argv.indexOf("--base");

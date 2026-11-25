@@ -28,11 +28,6 @@ export class LegacyImportRefused extends Error {
 
 const UNAVAILABLE = "The outcome ledger is unavailable.";
 
-/**
- * Imports one batch of legacy lines. A dry run and a real run decide from the same stored state. A real run writes in
- * one transaction, so a throw leaves nothing of the batch. Throws `EvidenceError` `unavailable` when the module is not
- * ready or a stored line does not open, and `LegacyImportRefused` when the table would pass the cap.
- */
 export function importLegacy(store: EvidenceStore, input: { dryRun: boolean; lines: LegacyOutcome[] },
   options: { now: string; retentionDays?: number; cap?: number }): LegacyImportResult {
   if (store.status().modules[OUTCOMES_MODULE] !== "ready") throw new EvidenceError("unavailable", UNAVAILABLE);
@@ -62,7 +57,6 @@ export function importLegacy(store: EvidenceStore, input: { dryRun: boolean; lin
   });
 }
 
-/** Reads every stored state the batch can touch, then plans. A stored line that does not open throws here. */
 function decide(db: EvidenceDb, lines: readonly LegacyOutcome[], now: string, retentionDays: number): LegacyPlan {
   const refs = lines.map(line => db.index("legacy", line.id));
   const supersededRefs = lines.flatMap(line => line.supersedes === undefined ? [] : [db.index("legacy", line.supersedes)]);

@@ -10,26 +10,15 @@ import { type FeatureMap, taskFeatures } from "./task-features.js";
 import { profileIdentity, runEventKey, runSummaryCounts } from "./run-events.js";
 import type { TeamMember, TeamRun, TeamTask } from "./team-types.js";
 
-/**
- * Rows from sealed run records that predate outcome emission (spec delivery order 2). Backfilled rows carry the
- * `backfilled` flag and never overwrite an event-derived row. The functions here hold no clock, store, or Git
- * access except `backfillTick`, which writes through the store.
- */
-
 const DEFAULT_LIMIT = 20;
-/** The stop reason the team service writes for a member with no activity. */
 const NO_ACTIVITY = "No activity for ";
 const UNKNOWN = "(unknown)";
 const UNKNOWN_FEATURE_MAP = "unknown";
-/** The project a summary holds when an event other than `run.created` made it (the projector's sentinel). */
 const EVENT_UNKNOWN_PROJECT = "unknown";
-/** Run statuses after which no event will change the run. */
 const SETTLED: ReadonlySet<string> = new Set(["ready-for-review", "merged", "no-change", "cancelled"]);
 
 type WriteOutcome = "written" | "unreadable";
-/** A store failure inside the backfill. It leaves the run pending instead of marking the record. */
 class StoreFailure extends Error {}
-/** Logged once per process, so a bad record or a failing store never floods the log. */
 let loggedUnreadable = false;
 let loggedFailure = false;
 
@@ -41,11 +30,6 @@ type BackfillContext = {
 
 type Snapshot = { revision: number; tasks: TeamTask[]; review?: TeamRun["review"] };
 
-/**
- * Pure. Paths are read for features and dropped. A member whose ending the record cannot show is skipped and
- * counted. For an integrated row, accepted is yes only under an approved review of the same snapshot and is never
- * no, and held stays unknown. A counted failure is no on every level, as for any row.
- */
 export function backfillRun(run: TeamRun, context: BackfillContext): { rows: OutcomeRow[]; summary: RunSummaryRow; skipped: number; rounds: number } {
   const snapshots: Snapshot[] = [
     { revision: run.revision, tasks: run.tasks, review: run.review },
@@ -87,8 +71,6 @@ export function backfillRun(run: TeamRun, context: BackfillContext): { rows: Out
     const covering = snapshot !== undefined && snapshot.review !== undefined && snapshot.review.revision === snapshot.revision;
     const accepted = disposition === "integrated" && covering && snapshot.review?.verdict === "approved" ? 1 : null;
     const links: LinkState[] = Array.from({ length: rounds }, (): LinkState => "unknown");
-    // Only an approval is kept. A stored review that requested changes would freeze as accepted no at a later
-    // settle, and the backfill never claims that.
     const lastReview = covering && snapshot.review?.verdict === "approved" ? "approved" as const : undefined;
     const counts = roundCounts(links);
     const integrated = disposition === "integrated";
@@ -180,23 +162,11 @@ export function backfillRun(run: TeamRun, context: BackfillContext): { rows: Out
   return { rows, summary, skipped, rounds };
 }
 
-/**
- * Backfills every qualifying run that is not settled and at most `limit` settled ones, one store write each. A run
- * qualifies when the store has no `run.created` event for it and no `backfill_runs` row. An existing row or summary is
- * never overwritten. A run whose record cannot be read, or lacks a field a row needs, is marked with `skipped` -1
- * and never retried, so the write step fails only for a reason of the store.
- *
- * Returns `{ written: 0, remaining: 0 }` at once, before `runs()` is called, when the store, the `outcomes` module,
- * or the `configurations` module is not ready. A module that is not ready stays so for the life of the process, and
- * the next start tries again. Never throws.
- */
 export function backfillTick(store: EvidenceStore, runs: () => TeamRun[], options: { mapOf: (projectId: string) => FeatureMap | undefined; limit?: number; now: () => string }): { written: number; remaining: number } {
   try {
     if (!ready(store)) return { written: 0, remaining: 0 };
     const limit = options.limit !== undefined && Number.isFinite(options.limit) ? Math.max(1, Math.floor(options.limit)) : DEFAULT_LIMIT;
     const pending = runs().filter(run => !store.hasEvent(runEventKey("run.created", run.id)) && !hasBackfillRow(store, run.id));
-    // Every run that can still emit an event is written now, so none of its events is projected before its rows.
-    // Settled runs are history, and take `limit` per tick.
     const ordered = [...pending.filter(run => !SETTLED.has(run.status)), ...pending.filter(run => SETTLED.has(run.status)).slice(0, limit)];
     let written = 0;
     for (const run of ordered) {
@@ -219,18 +189,12 @@ export function backfillTick(store: EvidenceStore, runs: () => TeamRun[], option
   }
 }
 
-/**
- * The driver the server calls. Its first call writes EVERY pending run, so a reader of the rows never sees a part
- * of the history as if it were all of it. Later calls write at most `limit` settled runs, for a run whose write
- * failed. Once a call reports nothing remaining, the driver does nothing for the life of the process.
- */
 export function outcomeBackfill(store: EvidenceStore, runs: () => TeamRun[], options: { mapOf: (projectId: string) => FeatureMap | undefined; limit?: number; now: () => string }): () => void {
   let done = false;
   let first = true;
   return () => {
     if (done) return;
     const tick = backfillTick(store, runs, first ? { ...options, limit: Number.MAX_SAFE_INTEGER } : options);
-    // One fixed line: the first call writes one run after another before the host serves, and this explains the wait.
     if (first && tick.written > 0) console.log(`Outcome backfill wrote ${tick.written} run(s) at start; ${tick.remaining} remain.`);
     first = false;
     if (tick.remaining === 0) done = true;
@@ -242,7 +206,6 @@ function ready(store: EvidenceStore): boolean {
   return status.state === "ready" && status.modules[OUTCOMES_MODULE] === "ready" && status.modules[CONFIGURATIONS_MODULE] === "ready";
 }
 
-/** Writes one run inside the caller's transaction. Store errors propagate and leave the run pending. */
 function writeRun(store: EvidenceStore, tx: EvidenceTx, run: TeamRun, options: { mapOf: (projectId: string) => FeatureMap | undefined; now: () => string }): WriteOutcome {
   const map = options.mapOf(run.projectId);
   let result: ReturnType<typeof backfillRun>;
@@ -252,7 +215,6 @@ function writeRun(store: EvidenceStore, tx: EvidenceTx, run: TeamRun, options: {
       epoch: (identity, at) => { const since = text(at); return storeCall(() => epochAt(tx, identity, since)); },
       index: (cls, value) => { const plain = text(value); return storeCall(() => tx.index(cls, plain)); },
     });
-    // A legacy record can lack a field its type requires. Such a value cannot be bound, so the record is unreadable.
     if (!bindable(run, result)) throw new TypeError("The record lacks a field a row needs.");
   } catch (error) {
     if (error instanceof StoreFailure) throw error;
@@ -268,14 +230,10 @@ function writeRun(store: EvidenceStore, tx: EvidenceTx, run: TeamRun, options: {
   const existing = readSummary(tx, run.id);
   if (existing === undefined) writeSummary(tx, result.summary);
   else if (existing.payload.projectId === EVENT_UNKNOWN_PROJECT) {
-    // An event reached this run before its backfill and made a summary with no `run.created` facts. Every event
-    // fact stays. The record supplies the project, goal, mission, and creation time, and the summary is marked.
     existing.payload.projectId = result.summary.payload.projectId;
     if (result.summary.payload.goal) existing.payload.goal = result.summary.payload.goal;
     if (result.summary.payload.missionId) existing.payload.missionId = result.summary.payload.missionId;
     existing.createdAt ??= result.summary.createdAt;
-    // The gap flag stood for the missing `run.created` facts. It stays only when the ledger recorded lost events,
-    // so that a later row of the run does not copy a gap that never was.
     const lost = store.eventsIn(tx, { runId: run.id, kinds: ["ledger.gap"], after: 0, limit: 1 }).events.length > 0;
     const flags = new Set<Flag>(existing.flags);
     flags.add("backfilled");
@@ -306,24 +264,20 @@ function writeRun(store: EvidenceStore, tx: EvidenceTx, run: TeamRun, options: {
     inserted.length,
     result.skipped,
   );
-  // A run that already has signals takes them. The raw probe counts a signal whose payload does not open.
   if (tx.get("SELECT 1 AS found FROM outcome_signals WHERE run_id=? LIMIT 1", run.id) !== undefined) recomputeRun(tx, run.id);
   return "written";
 }
 
-/** A record value that a store call takes as text. A record that lacks it is unreadable, and no store call is made. */
 function text(value: unknown): string {
   if (typeof value !== "string") throw new TypeError("The record lacks a text field.");
   return value;
 }
 
-/** Whether every value the write binds is plain. The write step then fails only for a reason of the store. */
 function bindable(run: TeamRun, result: ReturnType<typeof backfillRun>): boolean {
   const plain = (value: unknown) => value === null || typeof value === "string" || typeof value === "boolean"
     || (typeof value === "number" && Number.isFinite(value));
   const columns = (row: OutcomeRow | RunSummaryRow) => Object.entries(row)
     .every(([name, value]) => name === "payload" || name === "flags" || plain(value));
-  // A payload is sealed as canonical JSON, which refuses a value that JSON cannot hold, such as a missing field.
   const sealable = (payload: unknown) => { canonicalJson(payload); return true; };
   return typeof run.id === "string" && typeof run.createdAt === "string"
     && columns(result.summary) && typeof result.summary.payload.projectId === "string" && sealable(result.summary.payload)
@@ -331,7 +285,6 @@ function bindable(run: TeamRun, result: ReturnType<typeof backfillRun>): boolean
       && typeof row.payload.taskId === "string" && typeof row.payload.area === "string" && sealable(row.payload));
 }
 
-/** Runs a store call and marks its failure, so the record is not blamed for it. */
 function storeCall<T>(call: () => T): T {
   try {
     return call();
@@ -344,16 +297,11 @@ function hasBackfillRow(store: EvidenceStore, runId: string): boolean {
   return store.read(db => db.get("SELECT 1 AS found FROM backfill_runs WHERE run_id=?", runId) !== undefined);
 }
 
-/** The snapshot of the member's revision that holds the member's task. Undefined when no snapshot holds it. */
 function snapshotOf(snapshots: readonly Snapshot[], member: TeamMember): Snapshot | undefined {
   return snapshots.find(snapshot => snapshot.revision === member.revision
     && snapshot.tasks.some(item => item.id === member.taskId));
 }
 
-/**
- * The member's ending from the record, folded by the precedence rules. Undefined when the record shows none, such
- * as an owner stop, which the record does not name.
- */
 function endingOf(run: TeamRun, member: TeamMember, task: TeamTask | undefined): Disposition | undefined {
   const candidates: (Disposition | undefined)[] = [];
   if (member.role === "scout") {
@@ -375,10 +323,6 @@ function endingOf(run: TeamRun, member: TeamMember, task: TeamTask | undefined):
   return current === "open" ? undefined : current;
 }
 
-/**
- * The correction rounds the run shows: the largest per-task review round count, and at least one when a check
- * launched by a correction round exists. Each row's links keep this many unknown rounds, so no firstPass is claimed.
- */
 function runRounds(run: TeamRun, snapshots: readonly Snapshot[]): number {
   let rounds = 0;
   for (const snapshot of snapshots) {

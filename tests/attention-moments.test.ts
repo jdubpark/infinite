@@ -75,7 +75,6 @@ test("a prompt-merged notice gives the decision row the dialog's own title and d
   const moments = deriveMoments([
     open,
     ev({ kind: "notice", type: "prompt-merged", promptId: open.seq, title: "Do you want to proceed?", detail: "Bash command\nrm -rf build\nRemove the stale build directory", source: "screen" }),
-    // A merge notice for some other prompt changes nothing.
     ev({ kind: "notice", type: "prompt-merged", promptId: open.seq + 100, title: "Elsewhere", source: "screen" }),
   ]);
   assert.equal(moments.length, 1);

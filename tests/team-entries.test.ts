@@ -19,7 +19,6 @@ import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
 type Fixture = ReturnType<typeof schedulerFixture>;
 
-/** Scheduler internals that the tests drive directly. */
 type Internal = {
   save(stored: unknown): void;
   record(id: string): unknown;
@@ -37,15 +36,10 @@ function openStore(f: Fixture, key: Buffer, busyTimeoutMs?: number): EvidenceSto
   return new EvidenceStore({ databasePath: evidenceDatabasePath(f.config.stateDir), vaultKey: key, ...(busyTimeoutMs === undefined ? {} : { busyTimeoutMs }) });
 }
 
-/** The bytes of the run's sealed record file. */
 function recordBytes(f: Fixture, runId = f.run.id): Buffer {
   return readFileSync(join(f.config.stateDir, "teams", `${runId}.sealed`));
 }
 
-/**
- * A fixture's own ids, commit ids, times, and temporary paths, replaced by placeholders in order of first use.
- * Two fixtures that did the same work give the same text.
- */
 function normalized(text: string, f: Fixture): string {
   const names = new Map<string, string>();
   const place = (kind: string, value: string) => {
@@ -60,7 +54,6 @@ function normalized(text: string, f: Fixture): string {
     .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g, "<time>");
 }
 
-/** A settled copy of the fixture run under a new id, with one owner steering text, sealed as its own record. */
 function writeSettledRun(f: Fixture, text: string): string {
   const id = randomUUID(), base = f.run.members[0]!;
   const run: TeamRun = { ...structuredClone(f.run), id, status: "cancelled",
@@ -79,12 +72,10 @@ async function waitFor(check: () => boolean, message: string, timeoutMs = 5000) 
   assert.fail(message);
 }
 
-/** A member's own clone at the run's base commit, prepared as a real attempt is. */
 async function memberClone(f: Fixture, memberId: string) {
   return prepareMemberWorkspace(f.run.workspace, memberId, f.run.baseCommit, f.config.teams?.commandPrefix);
 }
 
-/** Every object key path of a value, with array positions. Values are not compared. */
 function keyPaths(value: unknown, path = "$"): string[] {
   if (Array.isArray(value)) return value.flatMap((item, index) => keyPaths(item, `${path}[${index}]`));
   if (value && typeof value === "object") {
@@ -93,14 +84,12 @@ function keyPaths(value: unknown, path = "$"): string[] {
   return [];
 }
 
-/** The project manager reports a one-task plan, as its journal would carry it. */
 function reportPlan(f: Fixture) {
   const pm = f.run.members[0]!;
   f.report(pm.sessionId, { requestId: randomUUID(), runId: f.run.id, memberId: pm.memberId, revision: pm.revision,
     report: { kind: "plan", summary: "One task", tasks: [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [] }] } });
 }
 
-/** Writes the record, opens a service with the given blackboard, and runs one step over the plan report. */
 async function planFlow(f: Fixture, entries?: Blackboard) {
   f.writeTeam();
   reportPlan(f);
@@ -111,7 +100,6 @@ async function planFlow(f: Fixture, entries?: Blackboard) {
   return teams;
 }
 
-/** One queued implementer on task a, in its own clone, as a planned run holds it. */
 async function queuedImplementer(f: Fixture) {
   const memberId = randomUUID(), cwd = await memberClone(f, memberId);
   const member = { ...f.run.members[0]!, memberId, sessionId: randomUUID(), role: "implementer" as const, taskId: "a", cwd,
@@ -131,7 +119,6 @@ test("a service without the blackboard keeps its records as today", async () => 
     await planFlow(withEntries, new Blackboard(store));
     const plainRecord = plain.readRecord("team", plain.run.id), entryRecord = withEntries.readRecord("team", withEntries.run.id);
     assert.deepEqual(keyPaths(entryRecord), keyPaths(plainRecord));
-    // Keys alone would let a changed value pass, so the values are compared too.
     assert.equal(normalized(JSON.stringify(entryRecord), withEntries), normalized(JSON.stringify(plainRecord), plain));
   } finally { store.close(); plain.close(); withEntries.close(); }
 });
@@ -164,7 +151,6 @@ test("owner steering and answers become directions", async () => {
     ];
     f.writeTeam();
     const teams = f.openTeam({ entries });
-    // Answers come first: a steer advances the revision that the decisions name.
     await teams.answer(f.run.id, "d1", { requestId: randomUUID(), revision: 1, text: "Use SQLite" });
     await teams.answer(f.run.id, "d2", { requestId: randomUUID(), revision: 1, text: "Use the CLI" }, undefined, "coordinator");
     await teams.steer(f.run.id, { requestId: randomUUID(), revision: 1, text: "Keep the API stable" });
@@ -205,7 +191,6 @@ test("an integration and a finished check become receipts", async () => {
     assert.equal(integrationBody.commit, task.commit);
     assert.deepEqual(integrationBody.changedPaths, { paths: ["a.txt"], truncated: false });
 
-    // The check finishes in the operation, and the save that follows it stores the receipt.
     const at = new Date().toISOString();
     stored.run.checks.push({ command: { command: "node", args: ["-e", "console.log('check-ok')"] }, status: "passed", startedAt: at,
       finishedAt: at, exitCode: 0, output: "check-ok\n", revision: stored.run.revision, round: 0, headCommit: stored.run.headCommit } as TeamRun["checks"][number]);
@@ -249,7 +234,6 @@ test("a launch records its sizes and sends what it sent before", async () => {
     const launchPrompt = f.launches.at(-1)!.prompt;
     for (const text of [contextText, launchPrompt]) assert.equal(/promptBytes|contextBytes|context_bytes/.test(text), false);
 
-    // The same launch without the blackboard writes the same context file and sends the same prompt.
     plain.run.steering = [{ text: "Keep the API stable", revision: 2, at: new Date().toISOString() }];
     const other = await queuedImplementer(plain);
     const plainTeams = plain.openTeam();
@@ -264,7 +248,6 @@ test("a launch records its sizes and sends what it sent before", async () => {
 
 test("an unavailable store changes nothing", async () => {
   const plain = schedulerFixture(), f = schedulerFixture();
-  // The store's key is fixed by its first open, so the right key opens the file before the wrong one does.
   openStore(f, f.key).close();
   const bad = openStore(f, randomBytes(32));
   try {
@@ -306,7 +289,6 @@ test("an entry missed before a crash is written after a restart", async () => {
 test("a settled run's missed entries are written after a restart", async () => {
   const f = schedulerFixture(), good = openStore(f, f.key), bad = openStore(f, randomBytes(32));
   try {
-    // The run settled in a save whose entry write was lost: the store was unavailable.
     f.run.status = "cancelled";
     f.run.members[0]!.status = "stopped";
     f.run.steering = [{ text: "Keep the API stable", revision: 1, at: new Date().toISOString() }];
@@ -345,7 +327,6 @@ test("a failed entry write is retried without a save", async () => {
     assert.equal(entries.list(f.run.id, { kinds: ["direction"] }).entries.length, 0, "the save's entry write failed");
     const before = recordBytes(f);
 
-    // Within the minute the drain leaves the store alone.
     internal(teams).drainEntries();
     assert.equal(entries.list(f.run.id, { kinds: ["direction"] }).entries.length, 0);
     clock += 61_000;
@@ -365,13 +346,11 @@ test("a failing store stops the drain after one write", async () => {
     entries.retry = run => { const result = retry(run); calls.push(result); return result; };
     f.writeTeam();
     const settled = Array.from({ length: 6 }, (_, index) => writeSettledRun(f, `Direction ${index}`));
-    // The lock is held while the service starts, so its first pass fails once and leaves every run waiting.
     const blocker = new DatabaseSync(evidenceDatabasePath(f.config.stateDir));
     let teams: TeamService;
     try {
       blocker.exec("BEGIN IMMEDIATE");
       teams = f.openTeam({ entries });
-      // The fixture's own run is active, so it comes first, and it has nothing to store.
       assert.deepEqual(calls, ["done", "failed"], "the start's pass stops at its first failed write");
       clock += 61_000;
       calls.length = 0;
@@ -387,7 +366,6 @@ test("a failing store stops the drain after one write", async () => {
     const scheduler = internal(teams);
     clock += 61_000;
     calls.length = 0;
-    // The six settled runs wait.
     scheduler.drainEntries();
     assert.deepEqual(calls, ["done", "done", "done", "done"], "a pass retries four runs at most");
     scheduler.drainEntries();
@@ -407,7 +385,6 @@ test("the drain stores only what the sealed record holds", async () => {
     const teams = f.openTeam({ entries });
     const scheduler = internal(teams);
     const stored = scheduler.record(f.run.id) as { run: TeamRun };
-    // A failed entry write at a save puts the run in the backlog.
     const blocker = new DatabaseSync(evidenceDatabasePath(f.config.stateDir));
     try {
       blocker.exec("BEGIN IMMEDIATE");
@@ -418,7 +395,6 @@ test("the drain stores only what the sealed record holds", async () => {
     }
     await teams.idle();
     clock += 61_000;
-    // The live run changes a moment before its save, as a finished check does.
     stored.run.steering.push({ text: "Unsaved direction", revision: stored.run.revision, at: new Date().toISOString() });
     scheduler.drainEntries();
     const texts = () => entries.list(f.run.id, { kinds: ["direction"] }).entries
@@ -433,7 +409,6 @@ test("one failing run does not hold back the others", async () => {
   const f = schedulerFixture(), store = openStore(f, f.key);
   try {
     let clock = Date.now(), failing = true;
-    // A store whose writes fail while the flag is set. Reads and the module registration pass through.
     const flaky = {
       status: () => store.status(),
       register: (module: Parameters<EvidenceStore["register"]>[0]) => store.register(module),
@@ -443,11 +418,9 @@ test("one failing run does not hold back the others", async () => {
     const entries = new Blackboard(flaky, { now: () => clock });
     f.writeTeam();
     const settled = writeSettledRun(f, "Settled direction");
-    // The start's pass fails once, so the settled run waits.
     const teams = f.openTeam({ entries });
     assert.equal(entries.list(settled, { kinds: ["direction"] }).entries.length, 0);
 
-    // The active run's saves keep failing, a minute apart.
     clock += 61_000;
     await teams.steer(f.run.id, { requestId: randomUUID(), revision: 1, text: "First" });
     clock += 61_000;
@@ -455,7 +428,6 @@ test("one failing run does not hold back the others", async () => {
     await teams.idle();
     assert.equal(entries.held(f.run.id), true, "the active run's last save failed just now");
 
-    // The store works again for everyone else, in the same minute as that failure.
     failing = false;
     internal(teams).drainEntries();
     assert.equal(entries.list(settled, { kinds: ["direction"] }).entries.length, 1, "the settled run is not held back");
@@ -473,7 +445,6 @@ test("a record that cannot be read for a while keeps its run in the backlog", as
     const entries = new Blackboard(store, { now: () => clock });
     f.writeTeam();
     const teams = f.openTeam({ entries });
-    // A failed entry write at a save puts the run in the backlog. No later save of the run follows.
     const blocker = new DatabaseSync(evidenceDatabasePath(f.config.stateDir));
     try {
       blocker.exec("BEGIN IMMEDIATE");
@@ -488,17 +459,14 @@ test("a record that cannot be read for a while keeps its run in the backlog", as
 
     const file = join(f.config.stateDir, "teams", `${f.run.id}.sealed`);
     const before = recordBytes(f);
-    // The record file is missing during one pass. Nothing of the host removed it: a removal leaves through deleteRecord.
     renameSync(file, `${file}.aside`);
     try { internal(teams).drainEntries(); }
     finally { renameSync(`${file}.aside`, file); }
     assert.equal(stored(), 0);
 
-    // The record reads again, and the drain leaves it alone for a minute.
     internal(teams).drainEntries();
     assert.equal(stored(), 0, "the drain waits before it reads the record again");
 
-    // The next read fails another way, as under a descriptor limit or a disk fault: a folder stands in the file's place.
     clock += 61_000;
     renameSync(file, `${file}.aside`);
     mkdirSync(file);
@@ -506,7 +474,6 @@ test("a record that cannot be read for a while keeps its run in the backlog", as
     finally { rmdirSync(file); renameSync(`${file}.aside`, file); }
     assert.equal(stored(), 0);
 
-    // After another minute the record reads, and the drain stores the entry without a save.
     clock += 61_000;
     internal(teams).drainEntries();
     assert.equal(stored(), 1, "the run kept its place in the backlog through both failed reads");
@@ -536,17 +503,14 @@ test("removing a run removes its entries", async () => {
   } finally { store.close(); f.close(); }
 });
 
-/** A contract of the project manager, as the worker's post carries it. */
 const contract = (summary: string): MemberEntryPost => ({ kind: "contract", summary, paths: [],
   body: { interface: `Interface ${summary}`, change: `Change ${summary}`, sources: [] } });
 
-/** A post envelope with the content identity the worker recomputes. */
 function postEnvelope(f: Fixture, memberId: string, entry: MemberEntryPost, revision = 1) {
   const binding = { runId: f.run.id, memberId, revision };
   return { op: "post", ...binding, requestId: memberEntryId(binding, entry), entry };
 }
 
-/** The run pins the tools and the project manager holds them, as a run created with the switch on does. */
 function toolsOn(f: Fixture) {
   f.run.blackboard = { tools: true };
   f.run.members[0]!.entryTools = true;
@@ -558,14 +522,12 @@ function storedRows(f: Fixture, runId: string): number {
   finally { db.close(); }
 }
 
-/** Sets every member's entry cursor back to zero in the sealed record, as a crash before the saves would leave it. */
 function resetEntryCursors(f: Fixture) {
   const sealed = f.readRecord<{ run: TeamRun }>("team", f.run.id);
   for (const member of sealed.run.members) member.entryCursor = 0;
   writeSealed(join(f.config.stateDir, "teams", `${f.run.id}.sealed`), f.key, `team:${f.run.id}`, sealed);
 }
 
-/** The project manager stalls and its replacement is queued. With `ingestBefore`, the post is stored before the stall. */
 async function replacedProjectManager(f: Fixture, entries: Blackboard, ingestBefore: boolean) {
   const teams = f.openTeam({ entries });
   const scheduler = internal(teams);
@@ -637,12 +599,10 @@ test("with the tools on, a launch carries the digest, the flag, and the paragrap
     const scheduler = internal(teams);
     const stored = scheduler.record(f.run.id) as { run: TeamRun };
     stored.run.status = "implementing";
-    // The member is built by the service's own newMember, so the entry paragraph and the flag come from production code.
     const implementer = scheduler.newMember(stored.run, "implementer", "", stored.run.baseCommit, "a") as { memberId: string; cwd: string; sessionId: string; entryTools?: true; prompt: string };
     implementer.cwd = await memberClone(f, implementer.memberId);
     assert.equal(implementer.entryTools, true);
     stored.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "running", memberId: implementer.memberId }];
-    // The fixture's one worker slot is free only when the project manager is not counted.
     stored.run.members = [implementer as TeamRun["members"][number]];
     scheduler.save(stored);
     const mark = entries.launchMark(f.run.id);
@@ -660,7 +620,6 @@ test("with the tools on, a launch carries the digest, the flag, and the paragrap
     const prompt = f.launches.find(launch => launch.requestId === implementer.sessionId)!.prompt;
     assert.ok(prompt.includes(entryInstructions("demo")), "the launch prompt carries the entry paragraph");
 
-    // The member was created after the service loaded, so only its launch can have put it in the ingest queue.
     f.post(implementer.sessionId, "team-entry", postEnvelope(f, implementer.memberId, contract("after the launch")));
     scheduler.ingestEntries();
     assert.equal(entries.list(f.run.id, { kinds: ["contract"] }).entries.length, 1, "a member launched in this process is read without a restart");
@@ -700,7 +659,6 @@ test("a post that does not match its member is dropped and counted", async () =>
     const pm = f.run.members[0]!;
     const otherMember = randomUUID();
     f.post(pm.sessionId, "team-entry", postEnvelope(f, otherMember, contract("other member")));
-    // A handoff parses, but the project manager's role holds no handoffs.
     f.post(pm.sessionId, "team-entry", postEnvelope(f, pm.memberId, { kind: "handoff", summary: "not allowed", paths: [], taskId: "a",
       body: { done: [], remaining: [], commands: [] } }));
     f.post(pm.sessionId, "team-entry", { ...postEnvelope(f, pm.memberId, contract("bad id")), requestId: randomUUID() });
@@ -825,7 +783,6 @@ test("a silent member costs no store write and no save", async () => {
   const f = schedulerFixture(), store = openStore(f, f.key);
   try {
     toolsOn(f);
-    // The coordinator's journal holds one event that is not an entry event, so its end is past zero.
     f.post(f.run.members[0]!.sessionId, "team-usage" as never, {});
     f.writeTeam();
     const entries = new Blackboard(store);
@@ -851,7 +808,6 @@ test("an unavailable store keeps posts waiting", async () => {
   try {
     toolsOn(f);
     const pm = f.run.members[0]!;
-    // A second member, stopped in a blocked run, whose journal holds one non-entry event and no entry event.
     const quietId = randomUUID(), quietSession = randomUUID();
     await f.manager.createTeamSession({ requestId: quietSession, provider: "demo", title: "Quiet", prompt: "Wait" } as never,
       { runId: f.run.id, memberId: quietId, revision: 1, role: "reviewer" }, pm.cwd);

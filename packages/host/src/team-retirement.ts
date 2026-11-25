@@ -158,15 +158,12 @@ export async function stopRuntimeTree(known: RuntimeProcess[], workerPid: number
     if (tree.some(row => row.pid <= 1)) throw identityChanged();
     let discovered = false;
     for (const row of tree) { const prior = byPid.get(row.pid); if (prior && prior.born !== row.born) throw identityChanged(); if (!prior) { byPid.set(row.pid, row); discovered = true; } }
-    // Persist new identities before any signal can orphan them or lose its acknowledgement.
     if (discovered) await options.checkpoint?.([...byPid.values()]);
     const alive = [...byPid.values()].filter(row => { const now = current.get(row.pid); return now?.born === row.born && live(now); });
     const agentRows = alive.filter(row => options.agent && row.ruid === options.agent.uid && row.euid === options.agent.uid && row.pid !== workerPid);
     const hostRows = alive.filter(row => row.pid === workerPid || (row.ruid === hostUid && row.pid !== workerPid));
     for (const row of alive) if (!agentRows.includes(row) && !hostRows.includes(row)) unsignalable.add(row.pid);
     if (alive.length === 0) return { processes: [...byPid.values()], unsignalable: [...unsignalable].sort((a, b) => a - b) };
-    // Freeze parents before children, then inspect again. No termination handler
-    // can fork an unobserved survivor after the whole known tree is stopped.
     const stopped = (row: RuntimeProcess) => /^[Tt]/.test(row.state);
     const signal: NodeJS.Signals = alive.every(stopped) ? "SIGKILL" : "SIGSTOP";
     const depth = (row: RuntimeProcess) => {

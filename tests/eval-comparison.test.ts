@@ -123,7 +123,6 @@ function seedJob(f: Fixture, seed: JobSeed): void {
   });
 }
 
-/** Slot s of configuration c is resolved when s < rows[c][i]. */
 function seedTrials(f: Fixture, jobId: string, tasks: string[], rows: number[][], options: { configs?: TrialConfiguration[]; session?: string } = {}): string[] {
   const configs = options.configs ?? [CONFIG_A, CONFIG_B];
   const trialIds: string[] = [];
@@ -172,7 +171,6 @@ test("the report pass writes nothing while a module is not ready", () => {
   const root = mkdtempSync(join(tmpdir(), "infinite-eval-report-newer-"));
   const databasePath = evidenceDatabasePath(join(root, "state"));
   const vaultKey = randomBytes(32);
-  // A stored trials version one above the code's makes that module unavailable, as in the trial pump's test.
   const first = new EvidenceStore({ databasePath, vaultKey });
   first.register(evalCorpusModule(first, () => NOW));
   const trials = evalTrialsModule(first, () => NOW);
@@ -198,7 +196,6 @@ test("the report pass writes nothing while a module is not ready", () => {
 test("a report uses its own job id as the seed", () => {
   const f = ready();
   try {
-    // Per-task differences of the resolved counts, configuration 1 minus configuration 0; the interval's sum is -20 or -21 by seed.
     const D = [0, -2, -1, -3, -3, -2, 0, -2, -1, 2, 0, 3];
     const a = D.map(d => Math.max(0, -d));
     const b = D.map((d, i) => (a[i] as number) + d);
@@ -470,7 +467,6 @@ test("the report statistics are computed in a read, not inside the write", () =>
   try {
     fixtureP(f, "job-outside", "compare");
     const seen = { outside: 0, inside: 0 };
-    // Counts the statements that read the trial rows, and whether the store's write was open when they ran.
     const counting = <T extends object>(target: T, writing: boolean): T => new Proxy(target, {
       get(object, key) {
         const value = Reflect.get(object, key) as unknown;

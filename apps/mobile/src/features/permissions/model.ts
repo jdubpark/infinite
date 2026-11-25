@@ -1,6 +1,5 @@
 import { theme } from "../../theme";
 
-/** The owner's view of the permission journal, as `GET /api/permissions/log` and `/decisions/:id` serve it. */
 export type Verdict = "allow" | "reject" | "owner";
 export type Mark = { requestId: string; decisionId: string; at: string; by: string; label: "wrong"; note: string };
 export type DecisionEntry = {
@@ -18,7 +17,6 @@ export type LogPage = { entries: DecisionEntry[]; next?: string; rateFlags: Rate
 export type Candidate = { decisionId: string; label: string; sources: ("marked-wrong" | "reopened")[]; decision: Omit<DecisionEntry, "note">; offeredAt: string };
 export type LogFilter = "all" | "rejected" | "raised";
 
-/** Hosts that serve the log say so in `/me`; older hosts and other roles see no entry point. */
 export const decisionLogAvailable = (me: { role: string; permissions?: { decisionLog?: number } }) =>
   me.role === "owner" && me.permissions?.decisionLog === 1;
 

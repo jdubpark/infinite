@@ -10,7 +10,6 @@ interface FixtureComment { id: string; body: string; issue: { id: string } }
 type WriteOperation = "InfiniteLinearIssueCreate" | "InfiniteLinearIssueUpdate" | "InfiniteLinearCommentCreate";
 type IssueEdit = Partial<Pick<FixtureIssue, "id" | "title" | "description" | "team" | "project" | "parent" | "state" | "archivedAt">>;
 
-/** A GraphQL peer with committed writes that can lose their HTTP acknowledgement. */
 export async function startLinearServer() {
   const apiKey = randomBytes(32).toString("hex"), teamId = randomUUID();
   const issues = new Map<string, FixtureIssue>(), comments = new Map<string, FixtureComment>();
@@ -78,7 +77,6 @@ export async function startLinearServer() {
         case "InfiniteLinearIssueUpdate": {
           const issue = issues.get(variables.id), input = variables.input;
           if (!issue || typeof input?.title !== "string") throw new Error("Incomplete issue update");
-          // A held update fails before it commits; the test commits it later to model a delayed write.
           if (holdTitle) { holdTitle = false; heldTitles.push({ id: issue.id, title: input.title }); response.destroy(); return; }
           if (rejectTitle) { rejectTitle = false; data = { issueUpdate: { success: false, issue: null } }; break; }
           Object.assign(issue, { title: input.title, ...titleUpdateEdit, updatedAt: updatedAt() });
@@ -115,7 +113,6 @@ export async function startLinearServer() {
         case "InfiniteLinearIssueRemoveLabel": {
           if (!issues.has(variables.id)) throw new Error("Label change needs a known issue");
           if (rateLimitLabelChanges) { response.writeHead(200, { "Content-Type": "application/json", "retry-after": "120" }).end(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] })); return; }
-          // Linear answers an unknown (for example deleted) label with an error, not a protocol violation.
           if (!labels.has(variables.labelId)) { reply(200, { errors: [{ message: "Entity not found: IssueLabel" }] }); return; }
           const applied = issueLabels.get(variables.id) ?? new Set<string>(), adding = operation === "InfiniteLinearIssueAddLabel";
           if (adding) applied.add(variables.labelId); else applied.delete(variables.labelId);
@@ -143,11 +140,8 @@ export async function startLinearServer() {
     failLabelLookups(value: boolean) { failLabels = value; },
     rateLimitLabelLookups(value: boolean) { rateLimitLabels = value; },
     rateLimitLabelChanges(value: boolean) { rateLimitLabelChanges = value; },
-    /** Headers sent with every answer, such as Linear's rate-limit headers. */
     responseHeaders(headers: Record<string, string>) { extraHeaders = headers; },
-    /** Answers issue reads with a 429 carrying these headers until called with undefined. */
     rateLimitReads(headers: Record<string, string> | undefined) { limitedReads = headers; },
-    /** Holds each issue read this long; `readSpans` records when each one arrived and was answered. */
     delayReads(ms: number) { readDelayMs = ms; },
     readSpans,
     dropNextResponse(operation: WriteOperation, bodyIncludes?: string) { drop = { operation, bodyIncludes }; },

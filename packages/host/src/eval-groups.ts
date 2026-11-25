@@ -18,7 +18,6 @@ export const LANDINGS_DUE_SQL = "SELECT group_id, project_ref, created_at FROM e
 
 const DAY_MS = 86_400_000;
 const RUN_PREFIX = "run:";
-/** Stamped on a group past the landing window: a value that never falls due, so the group is not checked again. */
 export const LANDING_NEVER = "9999-12-31T23:59:59.999Z";
 
 type DueRow = { group_id: string; project_ref: string; created_at: string };
@@ -39,15 +38,10 @@ export function ensureGroup(tx: EvidenceTx, groupId: string, kind: "run" | "mine
   );
 }
 
-/** The root of a group: its `root_id`, or the group id itself when the group has no row. */
 export function rootOf(db: EvidenceDb, groupId: string): string {
   return db.get<{ root_id: string }>("SELECT root_id FROM eval_groups WHERE group_id = ?", groupId)?.root_id ?? groupId;
 }
 
-/**
- * Merges roots into the smallest id. `devOnly` marks the result; a merged root keeps any earlier mark. The merged root
- * is holdout only by `mergedSet`'s rule, and no other row of the root keeps a set.
- */
 export function mergeRoots(tx: EvidenceTx, roots: readonly string[], devOnly: boolean): string {
   const unique = [...new Set(roots)].sort(compareText);
   const root = unique[0];
@@ -71,10 +65,6 @@ export function mergeRoots(tx: EvidenceTx, roots: readonly string[], devOnly: bo
   return root;
 }
 
-/**
- * In a root with a captured `candidate` or `valid` task: a mined `candidate` is rejected and a mined `valid` task
- * retired, both `duplicate-of-captured`. Returns the number of rows changed.
- */
 export function applyDuplicateRule(tx: EvidenceTx, root: string, at: string): number {
   const rows = tx.all<{ task_id: string; origin: string; state: string }>(ROOT_TASKS_SQL, root);
   const captured = rows.some(row => row.origin === "captured" && (row.state === "candidate" || row.state === "valid"));
@@ -93,10 +83,6 @@ export function applyDuplicateRule(tx: EvidenceTx, root: string, at: string): nu
   return changed;
 }
 
-/**
- * Records a run group's landing and joins the mined task of that commit, if one exists. The join merges the two roots
- * without the dev-only mark and applies the duplicate rule. Returns true when a mined task was joined.
- */
 export function recordLanding(tx: EvidenceTx, input: { projectRef: string; groupId: string; landingRef: string; at: string }): boolean {
   tx.run(
     "UPDATE eval_groups SET landing_ref = ?, landing_checked_at = ? WHERE group_id = ?",
@@ -115,10 +101,6 @@ export function recordLanding(tx: EvidenceTx, input: { projectRef: string; group
   return true;
 }
 
-/**
- * The roots of the runs that may have produced this commit, or `tooWide`. A row counts when its approval is set and
- * earlier than the commit and its run group has no landing. More than 64 roots, or 1,000 rows on one path, is `tooWide`.
- */
 export function lineageRoots(
   db: EvidenceDb,
   input: { pathRefs: readonly string[]; commitTime: string },
@@ -148,7 +130,6 @@ export function lineageRoots(
   return { roots: [...roots].sort(compareText) };
 }
 
-/** Roots of one project, their devOnly roots, and the most tasks one root holds. */
 export function groupStats(db: EvidenceDb, projectRef: string): { total: number; devOnly: number; largest: number } {
   const roots = db.get<{ total: number; dev: number }>(
     "SELECT count(*) AS total, COALESCE(SUM(dev_only), 0) AS dev FROM eval_groups WHERE project_ref = ? AND root_id = group_id",
@@ -162,10 +143,6 @@ export function groupStats(db: EvidenceDb, projectRef: string): { total: number;
   return { total: roots?.total ?? 0, devOnly: roots?.dev ?? 0, largest: largest?.n ?? 0 };
 }
 
-/**
- * Deletes group rows that no task names and that no other row has as its root, oldest first, at most `limit`.
- * Returns the number deleted.
- */
 export function sweepGroups(tx: EvidenceTx, limit = GROUP_BATCH): number {
   const rows = tx.all<{ group_id: string }>(
     "SELECT g.group_id FROM eval_groups g WHERE NOT EXISTS (SELECT 1 FROM eval_tasks t WHERE t.group_id = g.group_id) "
@@ -180,10 +157,6 @@ export function sweepGroups(tx: EvidenceTx, limit = GROUP_BATCH): number {
 export type GroupPassOptions = { store: EvidenceStore; runs: () => readonly TeamRun[]; now?: () => string };
 export type GroupPassResult = { checked: number; landed: number; joined: number; indexed: number };
 
-/**
- * The groups pass. It reads landings for run groups that have none, from a run record's merge commit or from a `landing`
- * signal of the run, then indexes path rows. It never throws.
- */
 export class GroupPass {
   private readonly store: EvidenceStore;
   private readonly runs: () => readonly TeamRun[];
@@ -195,7 +168,6 @@ export class GroupPass {
     this.now = options.now ?? (() => new Date().toISOString());
   }
 
-  /** Up to 100 landing checks and 100 path-index rows. Never throws. */
   run(): GroupPassResult {
     const result: GroupPassResult = { checked: 0, landed: 0, joined: 0, indexed: 0 };
     try {
@@ -206,7 +178,6 @@ export class GroupPass {
       const oldest = isoAt(nowMs - LANDING_CHECK_DAYS * DAY_MS);
       const due = this.store.read(db => db.all<DueRow>(LANDINGS_DUE_SQL, recheck, GROUP_BATCH));
       if (due.length > 0) {
-        // The run records are copied only when a group in the window needs a merge commit.
         const inWindow = due.some(group => Date.parse(group.created_at) >= Date.parse(oldest));
         const merges = inWindow ? this.mergeCommits() : new Map<string, string>();
         const outcomes = this.store.status().modules[OUTCOMES_MODULE] === "ready";
@@ -240,12 +211,10 @@ export class GroupPass {
         result.indexed = indexPaths(tx, GROUP_BATCH);
       });
     } catch {
-      // The pass never throws; a failed step leaves its rows for the next pass.
     }
     return result;
   }
 
-  /** The merge commit of each run record, keyed by its run group id. */
   private mergeCommits(): Map<string, string> {
     const commits = new Map<string, string>();
     for (const run of this.runs()) {
@@ -255,7 +224,6 @@ export class GroupPass {
     return commits;
   }
 
-  /** The commit of the run's `landing` signal. Undefined when the signal is missing, unopenable, or not a landing. */
   private signalCommit(groupId: string): string | undefined {
     try {
       const row = this.store.read(db => readSignal(db, landingSignalId(groupId.slice(RUN_PREFIX.length))));
@@ -280,7 +248,6 @@ function isoAt(ms: number): string {
   return new Date(ms).toISOString();
 }
 
-/** Code-unit order, the order SQLite's BINARY collation gives for these ASCII keys. */
 function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }

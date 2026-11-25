@@ -72,7 +72,6 @@ function instanceText(source, name) {
   ].sort((a, b) => b.token.length - a.token.length);
   const pattern = new RegExp(rules.map(rule => rule.pattern.source).join("|"), "g");
   const replacements = new Map(rules.map(({ token, replacement }) => [token, replacement]));
-  // One pass over the original text keeps inserted instance paths from matching again.
   return source.replace(pattern, match => replacements.get(match) ?? match);
 }
 
@@ -87,7 +86,6 @@ function renderTemplate(filename, name) {
     text = text.replace(/^TasksMax=.*$/m, "TasksMax=infinity\nCPUWeight=50\nIOWeight=50\nOOMScoreAdjust=500");
   }
   if (filename === "infinite.sudoers") {
-    // The briefing and code graph wrappers name the first instance's roots, so an instance permits neither.
     text = text.replace(`, /usr/local/libexec/infinite-${name}/jevcode *`, "");
     text = text.replace(/^# Optional code graph extraction.*\n.*\/repository-graph \*\n/m,
       "# Repository briefings and the code graph need instance wrappers; until they exist, this instance permits neither.\n");

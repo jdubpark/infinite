@@ -4,7 +4,6 @@ import { readdirSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
-// These integration files are sensitive to PTY contention, filesystem events, or short lease and provider-flush windows.
 const serialFiles = new Set(["continuity.test.ts", "laptop-service.test.ts", "summary.test.ts", "worker-attention.test.ts"]);
 const testFiles = readdirSync(new URL("../tests/", import.meta.url))
   .filter((name) => name.endsWith(".test.ts"))
@@ -20,8 +19,6 @@ if (!Number.isInteger(concurrency) || concurrency < 1) {
 
 const tsx = fileURLToPath(import.meta.resolve("tsx/cli"));
 
-// A caller that keeps only the tail of this output (a host check, a CI log) loses a failure reported early in a long run,
-// so the failed tests are named again after each phase. An interactive terminal keeps the runner's own report.
 async function run(files, fileConcurrency) {
   const report = !process.stdout.isTTY;
   const child = spawn(process.execPath, [tsx, "--test", `--test-concurrency=${fileConcurrency}`, ...files.map((file) => `tests/${file}`)], {

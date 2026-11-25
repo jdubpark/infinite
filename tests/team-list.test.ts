@@ -20,7 +20,6 @@ const coordinator: TeamModelProfile = { id: "strong-coordinator", label: "Strong
 const implementer: TeamModelProfile = { id: "light-implementer", label: "Light implementer", provider: "codex", model: "example-light", effort: "medium", tier: "light" };
 const roles = ["project-manager", "implementer", "implementer", "implementer", "implementer", "implementer", "integrator", "reviewer"] as const;
 
-/** A synthetic finished run shaped like a live one: long check output, member reports, task instructions and an issue body. */
 function finishedRun(index: number): TeamView {
   const id = randomUUID(), workspace = `/srv/infinite/teams/${id}`;
   const members = roles.map((role, slot) => ({
@@ -70,7 +69,6 @@ function finishedRun(index: number): TeamView {
   };
 }
 
-/** `a.b.*.c` reads `c` from every item of the array at `a.b`. */
 function read(value: unknown, keys: string[]): unknown {
   if (!keys.length) return value;
   const [key, ...rest] = keys;
@@ -79,7 +77,6 @@ function read(value: unknown, keys: string[]): unknown {
   const entry: unknown = Object.entries(value).find(([name]) => name === key)?.[1];
   return read(entry, rest);
 }
-/** Every key path in a JSON value, with array items folded into `*`. */
 function paths(value: unknown, prefix = ""): string[] {
   if (Array.isArray(value)) return value.flatMap(item => paths(item, `${prefix}.*`));
   if (value === null || typeof value !== "object") return [];
@@ -105,7 +102,6 @@ test("a list row keeps every field client list code reads, unchanged, and nothin
     "deliveryReceipt.headCommit", "deliveryReceipt.pullRequestUrl", "deliveryReceipt.mergeCommit", "pullRequest.pullRequestUrl", "review.verdict", "review.revision", "discovery.revision",
     "permissions.mode", "permissions.maxDecisions", "permissionDecisions.*.targetSessionId", "permissionDecisions.*.promptId", "permissionDecisions.*.status",
     "usage.total", "usage.unmeasuredMembers", "checks.*.status", "checks.*.revision",
-    // A client that shows a row as a whole run computes its check summary and task order from these.
     "checks.*.command", "checks.*.phase", "tasks.*.dependsOn",
     ...["memberId", "sessionId", "role", "revision", "title", "status", "taskId", "provider", "startedAt", "reportedAt", "lastActivityAt", "stalledAt", "stoppedReason",
       "pendingLimit", "modelProfile.label", "modelProfile.provider", "modelProfile.tier", "usage.cost"].map(key => `members.*.${key}`),
@@ -126,7 +122,6 @@ test("GET /api/teams?view=list answers rows; the default list and GET /api/teams
     const created = await f.host.fetchApi("/teams", "owner", request);
     assert.equal(created.status, 200, JSON.stringify(created.body));
     assert.equal((await f.settled(created.body.id)).status, "ready-for-review");
-    // Usage is read from the ledger as journals arrive, so compare a list and a detail read taken while the run is still.
     const { row, detail } = await waitFor(async () => {
       const listed = await f.host.fetchApi("/teams?view=list");
       assert.equal(listed.status, 200, JSON.stringify(listed.body));
@@ -138,7 +133,6 @@ test("GET /api/teams?view=list answers rows; the default list and GET /api/teams
     assert.ok(detail.members.some(member => member.report), "the detail keeps member reports");
     assert.ok(detail.tasks.every(task => typeof task.instructions === "string"), "the detail keeps task instructions");
     assert.ok(Array.isArray(detail.providerLimits) && "byProfile" in detail.usage, "the detail keeps the view's computed fields");
-    // An installed client asks without a view and still reads every run in full.
     const full = (await f.host.fetchApi("/teams")).body.teams.find((team: { id: string }) => team.id === created.body.id);
     assert.equal(full.objective, request.objective);
     assert.ok(full.checks.every((check: { output?: unknown }) => typeof check.output === "string"));
@@ -164,7 +158,6 @@ test("the remote channel answers a team list over its limit with compact rows", 
     teams.list = () => views;
     assert.deepEqual((await owner.request<Listed>("/teams")).teams, rows, "rows answer in place of a refusal");
     assert.deepEqual((await owner.request<Listed>("/teams?view=list")).teams, rows, "a client that asks for rows reads them");
-    // The next reads skip the full list that could not be carried, so rows answer even though the full list would fit again.
     teams.list = () => views.slice(0, 2);
     assert.deepEqual((await owner.request<Listed>("/teams")).teams, rows);
     t.mock.timers.enable({ apis: ["Date"], now: Date.now() });

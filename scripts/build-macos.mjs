@@ -98,8 +98,6 @@ await writeFile(join(bundle, "Contents/Info.plist"), `<?xml version="1.0" encodi
 <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 <key>NSHumanReadableCopyright</key><string>Infinite personal desktop client</string>
 </dict></plist>`);
-// A stable local development signature keeps Keychain access valid across
-// rebuilds. No developer identity is written to project files.
 const signingIdentity = process.env.INFINITE_SIGN_IDENTITY ||
   execFileSync("security", ["find-identity", "-v", "-p", "codesigning"], { encoding: "utf8" }).match(/\) ([0-9A-F]{40}) "Apple Development:/)?.[1] || "-";
 await run("codesign", ["--force", "--sign", signingIdentity, join(bundle, "Contents/Resources/cmux")]);

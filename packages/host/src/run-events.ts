@@ -2,10 +2,8 @@ import { createHash } from "node:crypto";
 import type { TeamModelProfile, TeamRun, TeamTaskPlan } from "./team-types.js";
 import type { Provider } from "./types.js";
 
-/** The most events one run keeps waiting for the store. */
 export const MAX_OUTBOX_EVENTS = 2000;
 
-/** `[kind, runId, ...parts].join(":")`. A part is a string or a number. */
 export function runEventKey(kind: string, runId: string, parts: readonly (string | number)[] = []): string {
   return [kind, runId, ...parts].join(":");
 }
@@ -16,7 +14,6 @@ export interface RunSummaryCounts {
   steering: number; permissionEscalations: number; continuations: number;
 }
 
-/** Counts from the run record as it is now. Numbers only. */
 export function runSummaryCounts(run: TeamRun): RunSummaryCounts {
   return {
     tasks: run.tasks.length,
@@ -33,39 +30,34 @@ export function runSummaryCounts(run: TeamRun): RunSummaryCounts {
   };
 }
 
-/** SHA-256 hex of the JSON of one tuple per task, in order, covering every field a plan sets. */
 export function planDigest(tasks: readonly TeamTaskPlan[]): string {
-  const tuples = tasks.map(task => [task.id, task.title, task.instructions, task.agentProfileId ?? null, task.paths, task.dependsOn, task.kind ?? null, task.risk ?? null]);
+  const tuples = tasks.map(task => [
+    task.id, task.title, task.instructions, task.agentProfileId ?? null, task.paths, task.dependsOn, task.kind ?? null, task.risk ?? null,
+    ...(task.criterionRefs ? [[task.criterionRefs.objectiveVersion, task.criterionRefs.criteria]] : []),
+  ]);
   return createHash("sha256").update(JSON.stringify(tuples)).digest("hex");
 }
 
-/** The most UTF-8 bytes of an owned-path list one event keeps. The store refuses data over 16 KiB. */
 export const PATH_FIELD_BUDGET = 12 * 1024;
 
-/** `{ paths }` when the UTF-8 JSON of the list is at most `budget` bytes, else `{ pathsOmitted: true }`. */
 export function pathField(paths: readonly string[], budget = PATH_FIELD_BUDGET): { paths: string[] } | { pathsOmitted: true } {
   return Buffer.byteLength(JSON.stringify(paths), "utf8") <= budget ? { paths: [...paths] } : { pathsOmitted: true };
 }
 
-/** Why a replacement member continues a stopped one. */
 export type ReplacementCause = "stall" | "limit" | "escalation" | "answer";
 
 export interface ProfileIdentity { profileId?: string; provider: string; model?: string; effort?: string }
 
-/** Umbrella C7's profile identity. `effort` is the profile's effort, or its variant for OpenCode. */
 export function profileIdentity(profile: TeamModelProfile | undefined, provider: Provider): ProfileIdentity {
   if (!profile) return { provider };
   const effort = "effort" in profile ? profile.effort : profile.variant;
   return { profileId: profile.id, provider, model: profile.model, ...(effort === undefined ? {} : { effort }) };
 }
 
-/** Why a member stopped, by the classes of spec part 1. */
 export const MEMBER_STOP_REASONS = ["stall", "limit", "no-report", "owner", "host"] as const;
 export type MemberStopReason = typeof MEMBER_STOP_REASONS[number];
-/** The halt or retirement behind a stop. */
 export type MemberStopDetail = "pause" | "cancel" | "steer" | "block" | "retired";
 
-/** Pushes one run line stamped now, keeping the newest 300. Moved from teams.ts, which calls it under this name. */
 export function appendRunEvent(run: TeamRun, text: string): void {
   run.events.push({ at: new Date().toISOString(), text });
   if (run.events.length > 300) run.events.splice(0, run.events.length - 300);

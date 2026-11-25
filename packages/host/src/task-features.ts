@@ -1,12 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 
-/**
- * Task features: the area, kind, and risk of a team task. Pure rules only.
- * No file access, clock, or randomness. Nothing calls this module yet.
- */
-
-/** Version of these rules. Bump it when a rule changes, so each stored row says which rules produced it. */
 export const FEATURE_VERSION = 1;
 
 export const TASK_KINDS = ["feature", "fix", "refactor", "test", "docs", "investigation"] as const;
@@ -14,10 +8,6 @@ export type TaskKind = typeof TASK_KINDS[number];
 
 export type TaskRisk = "normal" | "elevated";
 
-/**
- * Risk tokens used when a project's feature map does not set its own list.
- * Singular forms only: a path also spells an entry when it holds the entry followed by `s`.
- */
 export const DEFAULT_ELEVATED_TOKENS: readonly string[] = [
   "auth",
   "authn",
@@ -49,12 +39,9 @@ export const DEFAULT_ELEVATED_TOKENS: readonly string[] = [
   "ci",
 ];
 
-/** A project's private feature map. Prefixes are repository-relative paths. */
 export interface FeatureMap {
   areas: { id: string; paths: string[] }[];
-  /** Path prefixes that always raise risk, for any owned path, including test and doc paths. */
   elevated?: string[];
-  /** Replaces the default token list when set. */
   elevatedTokens?: string[];
 }
 
@@ -64,7 +51,6 @@ export interface TaskFeatures {
   kind: TaskKind | null;
   risk: TaskRisk;
   featureVersion: number;
-  /** "default" for no map, or the map's digest. */
   featureMap: string;
 }
 
@@ -72,23 +58,11 @@ const areaIdPattern = /^[a-z][a-z0-9-]{0,39}$/;
 const reservedAreaIds = new Set(["mixed", "none", "root"]);
 const tokenPattern = /^[a-z0-9]{2,40}$/;
 const controlCharacter = /[\u0000-\u001f\u007f]/;
-/** Top-level directories whose second segment names the area, such as `apps/mobile/`. */
 const groupingRoots = new Set(["apps", "packages", "services", "libs", "crates", "cmd", "modules"]);
-/** A chunk is a run of ASCII letters and digits. Everything else in a path separates chunks. */
 const chunkSeparator = /[^A-Za-z0-9]+/;
-/**
- * The atoms of a chunk: an upper-case run that no lower-case letter follows (`HTTP` in `HTTPServer`),
- * a lower-case word with at most one leading capital, or a digit run. So `K8S2Client` gives
- * `K`, `8`, `S`, `2`, `Client`, and a lower-case compound such as `authservice` is one atom.
- */
 const atomPattern = /[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+/g;
-/** The longest list entry. A run of atoms longer than an entry plus `s` cannot match. */
 const MAX_TOKEN_LENGTH = 40;
 
-/**
- * A repository-relative path prefix. The single prefix `.` matches every path.
- * Any other prefix has no empty, `.`, or `..` segment, so `./infra`, `infra//x`, and a trailing slash are refused.
- */
 function isValidPathPrefix(prefix: string) {
   if (prefix.length < 1 || prefix.length > 300) return false;
   if (prefix === ".") return true;
@@ -106,7 +80,6 @@ const featureAreaSchema = z.object({
   paths: z.array(pathPrefixSchema).min(1).max(32),
 }).strict();
 
-/** Strict schema for a project's feature map. */
 export const featureMapSchema: z.ZodType<FeatureMap> = z.object({
   areas: z.array(featureAreaSchema).max(64),
   elevated: z.array(pathPrefixSchema).max(64).optional(),
@@ -118,34 +91,23 @@ export const featureMapSchema: z.ZodType<FeatureMap> = z.object({
   }
 });
 
-/** Whether a path is a documentation path. Matches the rule in `diffStat`. */
 export function isDocPath(path: string) {
   return path.startsWith("docs/") || path.endsWith(".md");
 }
 
-/** Whether a path is a test path. Matches the rule in `diffStat`. */
 export function isTestPath(path: string) {
   return /(^|\/)(tests?|__tests__)(\/|$)|\.(test|spec)\./i.test(path);
 }
 
-/** The paths that vote on the task's area and risk. When none is left, every path votes. */
 export function votingPaths(paths: readonly string[]): string[] {
   const voting = paths.filter(path => !isTestPath(path) && !isDocPath(path));
   return voting.length ? voting : [...paths];
 }
 
-/**
- * Whether a prefix covers a path, by whole segments. Same rule as `teamPathAllowed`: `.` covers everything,
- * so `src` covers `src/a.ts` but not `src2/a.ts`.
- */
 function prefixMatches(path: string, prefix: string) {
   return prefix === "." || path === prefix || path.startsWith(`${prefix}/`);
 }
 
-/**
- * A path a plan may own: relative, with no empty, `.`, or `..` segment, no backslash, and no control character.
- * Callers pass owned paths that the plan schema has already validated. This check is a guard, not an input route.
- */
 function isOwnedPath(path: string) {
   return path.length > 0
     && !controlCharacter.test(path)
@@ -153,10 +115,6 @@ function isOwnedPath(path: string) {
     && path.split("/").every(segment => segment !== "" && segment !== "." && segment !== "..");
 }
 
-/**
- * The fallback area: a directory name with a trailing slash, so it never equals a mapped id or a reserved name.
- * A root file is `root`.
- */
 function fallbackArea(path: string) {
   const segments = path.split("/");
   if (segments.length === 1) return "root";
@@ -164,11 +122,6 @@ function fallbackArea(path: string) {
   return `${segments[0]}/`;
 }
 
-/**
- * The area of one path. The longest matching prefix wins, and the earlier area wins a tie.
- * The `.` prefix is the weakest match, so any named prefix beats it.
- * A malformed path returns `root` and never throws.
- */
 export function pathArea(path: string, map?: FeatureMap): string {
   if (!isOwnedPath(path)) return "root";
   let best: { id: string; length: number } | undefined;
@@ -182,19 +135,12 @@ export function pathArea(path: string, map?: FeatureMap): string {
   return best?.id ?? fallbackArea(path);
 }
 
-/** The area of a task: the one area of its voting paths, or `mixed`. A task with no paths is `mixed`. */
 export function taskArea(paths: readonly string[], map?: FeatureMap): string {
   if (paths.length === 0) return "mixed";
   const areas = new Set(votingPaths(paths).map(path => pathArea(path, map)));
   return areas.size === 1 ? [...areas][0] : "mixed";
 }
 
-/**
- * Whether a path spells a list entry. It does when some run of adjacent atoms of one chunk, joined in
- * lower case, equals an entry, or an entry followed by `s`. So `OAuthClient` spells `oauth`,
- * `DockerFileBuilder` spells `dockerfile`, and `permissions` spells `permission`. Nothing marks a
- * boundary inside `author` or `authservice`, and a separator ends a chunk, so `per-mission` spells nothing.
- */
 function pathSpells(path: string, list: ReadonlySet<string>): boolean {
   for (const chunk of path.split(chunkSeparator)) {
     const atoms = (chunk.match(atomPattern) ?? []).map(atom => atom.toLowerCase());
@@ -210,11 +156,6 @@ function pathSpells(path: string, list: ReadonlySet<string>): boolean {
   return false;
 }
 
-/**
- * The risk of a task. A label can only raise risk to `elevated`.
- * Risk is elevated when the label is set, when any owned path matches an `elevated` prefix,
- * or when a voting path spells an entry of the token list.
- */
 export function taskRisk(paths: readonly string[], map?: FeatureMap, label?: "elevated"): TaskRisk {
   if (label === "elevated") return "elevated";
   const prefixes = map?.elevated ?? [];
@@ -224,7 +165,6 @@ export function taskRisk(paths: readonly string[], map?: FeatureMap, label?: "el
   return tokenHit ? "elevated" : "normal";
 }
 
-/** Canonical JSON: object keys sorted at every level, array order kept, undefined keys dropped. */
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value !== null && typeof value === "object") {
@@ -238,13 +178,11 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-/** "default" for no map. Otherwise the SHA-256 hex of the map's canonical JSON. */
 export function featureMapDigest(map?: FeatureMap): string {
   if (!map) return "default";
   return createHash("sha256").update(canonicalJson(map)).digest("hex");
 }
 
-/** The features of a task. A scout has no area, and its kind is always `investigation`. */
 export function taskFeatures(
   input: { role: "implementer" | "scout"; paths: readonly string[]; kind?: TaskKind; risk?: "elevated" },
   map?: FeatureMap,

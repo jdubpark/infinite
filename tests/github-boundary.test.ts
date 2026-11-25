@@ -44,19 +44,15 @@ test("only a session whose creation path says the owner started it gets the owne
   const fetchOnly = { sub: "unattributed", repo: repository, ops: ["fetch"] };
   assert.deepEqual(sessionGithubScopeFor({ team: false, origin: "owner-started", repository }), owner);
   assert.deepEqual(sessionGithubScopeFor({ team: false, origin: undefined, repository }), fetchOnly);
-  // A team scope handed to a session outside a team is not an owner statement either.
   assert.deepEqual(sessionGithubScopeFor({ team: false, origin: { team: owner }, repository }), fetchOnly);
   assert.equal(sessionGithubScopeFor({ team: false, origin: undefined, repository: undefined }), undefined);
   const delivery = sessionGithubScope({ kind: "team", role: "delivery", repository, delivery: { mode: "pr", repository, headBranch: "infinite/team-abc" } });
   assert.deepEqual(sessionGithubScopeFor({ team: true, origin: { team: delivery }, repository }), delivery);
-  // A team session never falls back to the owner's scope.
   assert.equal(sessionGithubScopeFor({ team: true, origin: "owner-started", repository }), undefined);
   assert.equal(sessionGithubScopeFor({ team: true, origin: undefined, repository }), undefined);
 });
 
 test("with the boundary configured, session and host grants verify in the proxy with their scope", () => {
-  // The key must sit below directories only root (here: this test's own account, via trustedUid) can write, so the
-  // fixture lives under the home directory instead of the world-writable temporary directory.
   const root = realpathSync(mkdtempSync(join(homedir(), ".github-boundary-test-")));
   const trustedUid = process.getuid!();
   try {
@@ -86,9 +82,7 @@ test("with the boundary configured, session and host grants verify in the proxy 
     assert.equal(hostEnv.GIT_CONFIG_VALUE_0, "https://github.com/");
     assert.equal(teamCommandEnvironment(hostEnv).INFINITE_GITHUB_GRANT, hostEnv.INFINITE_GITHUB_GRANT);
 
-    // Production trusts only root as the key's owner, so this test's own key mints nothing without trustedUid.
     if (trustedUid !== 0) assert.equal(sessionGithubGrant(config, sessionGithubScope({ kind: "owner", repository }), { sessionId: "session-10", projectId: "product-web" }), undefined);
-    // A key other users can read mints nothing: anyone holding it could sign their own grants.
     chmodSync(keyPath, 0o644);
     assert.equal(sessionGithubGrant(config, sessionGithubScope({ kind: "owner", repository }), { sessionId: "session-10", projectId: "product-web", trustedUid }), undefined);
     assert.deepEqual(hostGithubGrantEnvironment(config, { sid: "source:p1", project: "product-web", repo: repository, ops: ["fetch"] }, { trustedUid }), {});

@@ -570,6 +570,15 @@ export const teamAcceptanceEvidenceSchema = z.object({
 export type TeamAcceptanceEvidence = z.infer<typeof teamAcceptanceEvidenceSchema>;
 export const teamScoutPlanSchema = z.object({ id: taskId, title: z.string().trim().min(1).max(100), instructions: z.string().trim().min(1).max(4000), agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional() }).strict();
 export type TeamScoutPlan = z.infer<typeof teamScoutPlanSchema>;
+export const teamTaskCriterionRefsSchema = z.strictObject({
+  objectiveVersion: z.number().int().min(1).max(1_000_000),
+  criteria: z.array(z.string().regex(/^[a-z][a-z0-9-]{0,39}$/)).min(1).max(8),
+}).superRefine((refs, context) => {
+  if (new Set(refs.criteria).size !== refs.criteria.length)
+    context.addIssue({ code: "custom", path: ["criteria"], message: "A task may name each objective criterion only once." });
+});
+export type TeamTaskCriterionRefs = z.infer<typeof teamTaskCriterionRefsSchema>;
+export type TeamGoalCriteriaPlanPin = { objectiveVersion: number };
 export const teamTaskPlanSchema = z.object({
   id: taskId,
   title: z.string().trim().min(1).max(100),
@@ -577,6 +586,8 @@ export const teamTaskPlanSchema = z.object({
   agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional(),
   paths: z.array(ownedPath).min(1).max(32),
   dependsOn: z.array(taskId).max(12),
+  /** An explicit claim about which pinned goal criteria a task advances. It is never a satisfaction receipt. */
+  criterionRefs: teamTaskCriterionRefsSchema.optional(),
   /** Optional labels. A model may label, and `risk` may only be raised. No default. */
   kind: z.enum(TASK_KINDS).optional(),
   risk: z.literal("elevated").optional(),
@@ -643,6 +654,8 @@ export type TeamAssignment = { runId: string; memberId: string; revision: number
 /** `merged` is set only from an explicit delivery report; it is not host verification. */
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 export interface TeamMember extends TeamAssignment {
+  /** Host-only migration marker for a newly prompted goal planner; old in-flight prompts have no marker. */
+  goalCriteriaPlan?: TeamGoalCriteriaPlanPin;
   role: TeamRole;
   /** Absent on legacy runs; their members use the run's original provider. */
   provider?: Provider;
@@ -919,7 +932,7 @@ export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permis
      * neither), or `unknown` (it could not tell). No process ids.
      */
     processes?: "running" | "in-use" | "ended" | "unknown"; processesCheckedAt?: string };
-  members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback">[];
+  members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback" | "goalCriteriaPlan">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt" | "coordinatorSessionId">[];
   permissionRecovery?: { outcomes: TeamPermissionRecoveryView[] };
   usage: UsageRollup;

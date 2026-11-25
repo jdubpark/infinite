@@ -7,22 +7,17 @@ import { stopGrader } from "./eval-grader.js";
 import { type EvalIdentity, type EvalProbe, stopEvalIdentity } from "./eval-identity.js";
 import { readMaterial } from "./eval-store.js";
 import { type GradeFacts, gradeOf, isolationLabel, restoreSet } from "./eval-trial-rules.js";
-import type { Capsule, CapturedPayload, EvalFeatures, MinedPayload, PatchRead, TrialGrade } from "./eval-types.js";
+import type { Capsule, EvalFeatures, EvalTaskRow, PatchRead, TrialGrade } from "./eval-types.js";
 import { PREPARE_SECONDS, type RoundOutcome, SETUP_SECONDS } from "./eval-validate-rules.js";
 import { applyCaptured, applyPatch, changedNames, cloneTask, ensureBundle, expectZero, exec, finish, focused, guardChecks, loadTask, Stop, tagMined, type ValidateContext } from "./eval-validate.js";
 import type { GraderDir } from "./eval-grader.js";
 import { COMMIT_ID } from "./outcome-hold.js";
 import { isTestPath } from "./task-features.js";
 
-// The trial source and the grading of one trial. The grader builds both commit graphs; the eval account holds only the
-// base. The grader's clean removes the task clone, so grading rebuilds the task from the bundle, as the source does.
-// Only a parsed runner report resolves a trial. An exit code never does, and a missing report leaves the grade unknown.
-
 export const TRIAL_BUNDLE_MAX_BYTES = 1_073_741_824, GRADE_ROUNDS = 2, DIFF_OUTPUT_MAX = 65_536;
 
 export type TrialContext = ValidateContext & {
   trialId: string; identity: EvalIdentity; evalUid: number; probe: EvalProbe;
-  /** The eval launcher's ROOT. The trial's workspace is ROOT/trials/TRIAL/work. */
   root: string;
 };
 export type SourceResult =
@@ -33,11 +28,11 @@ export type GradeResult =
   | { kind: "graded"; grade: TrialGrade; patch?: Buffer | "too-large" | "secret-shaped" }
   | { kind: "environment"; cause: "grader-failed" | "grader-processes-alive" | "eval-processes-alive" | "task-gone" | "halted" };
 
+type ActiveTask = Extract<EvalTaskRow, { state: "candidate" | "valid" }>;
 type SourceCause = Extract<SourceResult, { kind: "environment" }>["cause"];
 type GradeCause = Extract<GradeResult, { kind: "environment" }>["cause"];
 type Transfer = "ok" | "storage" | "grader-failed" | "eval-failed";
 
-/** Ends the step with an environment cause. The caller's `finish` still runs. */
 function fail(cause: "grader-failed" | "bundle-missing"): never {
   throw new Stop({ kind: "environment", cause });
 }
@@ -46,12 +41,10 @@ function haltedNow(ctx: ValidateContext): void {
   if (ctx.halted()) throw new Stop({ kind: "environment", cause: "halted" });
 }
 
-/** The commits the grader's clone must hold: the anchor, and for a mined task the commit itself. */
-function cloneIds(origin: "captured" | "mined", payload: CapturedPayload | MinedPayload): string[] {
-  return origin === "mined" ? [payload.anchorCommit, payload.commit] : [payload.anchorCommit];
+function cloneIds(task: ActiveTask): string[] {
+  return task.origin === "mined" ? [task.payload.anchorCommit, task.payload.commit] : [task.payload.anchorCommit];
 }
 
-/** The capsule part of a task, or undefined when it does not open. */
 function capsuleOf(store: EvidenceStore, taskId: string): Capsule | undefined {
   try {
     return store.read(db => readMaterial(db, taskId).capsule);
@@ -70,17 +63,15 @@ function gradeCause(cause: string): GradeCause {
   return "grader-failed";
 }
 
-/** Builds the trial source for one valid task, and leaves only the base in the eval account. */
 export async function prepareTrialSource(store: EvidenceStore, taskId: string, ctx: TrialContext): Promise<SourceResult> {
   const loaded = loadTask(store, taskId);
   if (loaded.kind === "absent") return { kind: "skip", reason: "not-valid" };
   if (loaded.kind === "unreadable") return { kind: "skip", reason: "unreadable" };
   const { task, material } = loaded;
-  const payload = task.payload as CapturedPayload | MinedPayload;
-  const expected = payload.expectedCases;
-  const hidden = payload.hiddenFiles;
-  const features = payload.features;
   if (task.state !== "valid") return { kind: "skip", reason: "not-valid" };
+  const expected = task.payload.expectedCases;
+  const hidden = task.payload.hiddenFiles;
+  const features = task.payload.features;
   if (!expected?.length) return { kind: "skip", reason: "expected-missing" };
   if (!hidden?.length || !features) return { kind: "skip", reason: "not-valid" };
   const capsule = capsuleOf(store, taskId);
@@ -89,7 +80,7 @@ export async function prepareTrialSource(store: EvidenceStore, taskId: string, c
 
   let result: SourceResult;
   try {
-    result = await buildSource(ctx, task.origin, payload, material, capsule, features, hidden);
+    result = await buildSource(ctx, task, material, capsule, features, hidden);
   } catch (error) {
     if (!(error instanceof Stop)) {
       await finish(ctx);
@@ -109,13 +100,13 @@ export async function prepareTrialSource(store: EvidenceStore, taskId: string, c
 }
 
 async function buildSource(
-  ctx: TrialContext, origin: "captured" | "mined", payload: CapturedPayload | MinedPayload,
+  ctx: TrialContext, task: Extract<EvalTaskRow, { state: "valid" }>,
   material: { baseDelta?: Buffer; reference?: Buffer }, capsule: Capsule, features: EvalFeatures, hidden: string[],
 ): Promise<SourceResult> {
   await ensureBundle(ctx);
-  await cloneTask(ctx, cloneIds(origin, payload));
-  if (origin === "mined") await tagMined(ctx, payload.anchorCommit, payload.commit);
-  else await applyCaptured(ctx, payload as CapturedPayload, material);
+  await cloneTask(ctx, cloneIds(task));
+  if (task.origin === "mined") await tagMined(ctx, task.payload.anchorCommit, task.payload.commit);
+  else await applyCaptured(ctx, task.payload, material);
   expectZero(await exec(ctx, { dir: "task", seconds: PREPARE_SECONDS, argv: ["git", "update-ref", "refs/heads/trial", "refs/tags/eval-base"] }));
   const { base, reference } = await tagCommits(ctx);
   const blobs = await hiddenBlobs(ctx, hidden);
@@ -133,8 +124,8 @@ async function buildSource(
     await ctx.identity.clean();
     return { kind: "environment", cause: "eval-failed" };
   }
-  const integrated = origin === "captured" ? [(payload as CapturedPayload).integratedHead] : [];
-  const objects = [...new Set([payload.commit, ...integrated, reference, ctx.mirrorHead, ...blobs])];
+  const integrated = task.origin === "captured" ? [task.payload.integratedHead] : [];
+  const objects = [...new Set([task.payload.commit, ...integrated, reference, ctx.mirrorHead, ...blobs])];
   const verdict = await ctx.identity.check(ctx.trialId, objects);
   if (verdict === "failed") {
     await ctx.identity.clean();
@@ -150,7 +141,6 @@ async function buildSource(
   };
 }
 
-/** `eval-base` and `eval-reference` in the grader's task clone. */
 async function tagCommits(ctx: ValidateContext): Promise<{ base: string; reference: string }> {
   const run = await exec(ctx, { dir: "task", seconds: PREPARE_SECONDS, keepStdout: true, argv: ["git", "rev-parse", "eval-base", "eval-reference"] });
   expectZero(run);
@@ -159,7 +149,6 @@ async function tagCommits(ctx: ValidateContext): Promise<{ base: string; referen
   return { base: lines[0], reference: lines[1] };
 }
 
-/** The blob of each hidden file in the reference. A hidden file the reference lacks has no blob to check. */
 async function hiddenBlobs(ctx: ValidateContext, hidden: string[]): Promise<string[]> {
   if (hidden.length === 0) return [];
   const run = await exec(ctx, { dir: "task", seconds: PREPARE_SECONDS, keepStdout: true, argv: ["git", "ls-tree", "-z", "eval-reference", "--", ...hidden] });
@@ -170,7 +159,6 @@ async function hiddenBlobs(ctx: ValidateContext, hidden: string[]): Promise<stri
     .filter((blob): blob is string => blob !== undefined && COMMIT_ID.test(blob));
 }
 
-/** Stops every process of the eval account, removes its trial workspaces, resets its home, and probes it: ready or a cause. */
 async function resetEval(ctx: TrialContext): Promise<"eval-failed" | "eval-processes-alive" | undefined> {
   const stopState = await stopEvalIdentity(ctx.identity, ctx.evalUid, ctx.inventory);
   if (stopState === "alive") return "eval-processes-alive";
@@ -181,7 +169,6 @@ async function resetEval(ctx: TrialContext): Promise<"eval-failed" | "eval-proce
   return probe.state === "busy" ? "eval-processes-alive" : "eval-failed";
 }
 
-/** Streams the grader's trial bundle into the eval account. The pipe ends with the export, whatever its answer. */
 async function transferTrial(ctx: TrialContext): Promise<Transfer> {
   const pass = new PassThrough();
   pass.on("error", () => undefined);
@@ -196,7 +183,6 @@ async function transferTrial(ctx: TrialContext): Promise<Transfer> {
     },
   );
   const stored = await ctx.identity.receive(ctx.trialId, pass, TRIAL_BUNDLE_MAX_BYTES);
-  // A receive that ended before it read the pipe leaves the export waiting; the destroyed pipe frees it.
   pass.destroy();
   const exported = await exporting;
   if (exported === "too-large" || stored === "too-large") return "storage";
@@ -204,7 +190,6 @@ async function transferTrial(ctx: TrialContext): Promise<Transfer> {
   return stored === "stored" ? "ok" : "eval-failed";
 }
 
-/** Grades one trial of a task whose source was prepared. Every path ends with `finish`. */
 export async function gradeTrial(
   store: EvidenceStore,
   input: { taskId: string; baseCommit: string; resultCommit: string | undefined; workspace: string; hiddenFiles: string[]; isolation: "isolated" | "none" },
@@ -213,8 +198,7 @@ export async function gradeTrial(
   const loaded = loadTask(store, input.taskId);
   if (loaded.kind !== "task") return { kind: "environment", cause: "task-gone" };
   const { task, material } = loaded;
-  const payload = task.payload as CapturedPayload | MinedPayload;
-  const expected = payload.expectedCases ?? [];
+  const expected = task.payload.expectedCases ?? [];
   const common = { expected, isolation: input.isolation };
   if (input.resultCommit === undefined) {
     return { kind: "graded", grade: gradeOf({ ...common, ending: "no-result", overwritten: 0, diff: null }) };
@@ -234,7 +218,6 @@ export async function gradeTrial(
     const stopState = await stopEvalIdentity(ctx.identity, ctx.evalUid, ctx.inventory);
     return { kind: "environment", cause: stopState === "stopped" ? "grader-failed" : "eval-processes-alive" };
   }
-  // The patch is graded even when it holds a secret shape; only the stored copy is marked.
   const secret = findSecret(read.bytes.toString("utf8"), { token: "", url: "" }) !== undefined;
   const patch = secret ? "secret-shaped" as const : read.bytes;
 
@@ -244,7 +227,7 @@ export async function gradeTrial(
 
   let facts: Omit<GradeFacts, "expected" | "isolation">;
   try {
-    facts = await gradeSteps(ctx, task.origin, payload, material, read.bytes, expected);
+    facts = await gradeSteps(ctx, task, material, read.bytes, expected);
   } catch (error) {
     if (!(error instanceof Stop)) {
       await finish(ctx);
@@ -262,15 +245,14 @@ export async function gradeTrial(
   return { kind: "graded", grade: gradeOf({ ...common, ...facts }), patch };
 }
 
-/** The grading steps: rebuild the base, apply the result, restore the reference's tests, and run the rounds. */
 async function gradeSteps(
-  ctx: TrialContext, origin: "captured" | "mined", payload: CapturedPayload | MinedPayload,
+  ctx: TrialContext, task: ActiveTask,
   material: { baseDelta?: Buffer; reference?: Buffer }, bytes: Buffer, expected: string[],
 ): Promise<Omit<GradeFacts, "expected" | "isolation">> {
   await ensureBundle(ctx);
-  await cloneTask(ctx, cloneIds(origin, payload));
-  if (origin === "mined") await tagMined(ctx, payload.anchorCommit, payload.commit);
-  else await applyCaptured(ctx, payload as CapturedPayload, material);
+  await cloneTask(ctx, cloneIds(task));
+  if (task.origin === "mined") await tagMined(ctx, task.payload.anchorCommit, task.payload.commit);
+  else await applyCaptured(ctx, task.payload, material);
   expectZero(await exec(ctx, {
     dir: "task", seconds: PREPARE_SECONDS,
     argv: ["git", "-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", "eval-base"],
@@ -281,7 +263,7 @@ async function gradeSteps(
 
   const resultChanged = await changedNames(ctx, "eval-base", "eval-result");
   const referenceChanged = await changedNames(ctx);
-  const hidden = payload.hiddenFiles ?? [];
+  const hidden = task.payload.hiddenFiles ?? [];
   const set = restoreSet({
     referenceChanged, resultChanged, hiddenFiles: hidden, gradingPaths: ctx.settings.gradingPaths, testPath: isTestPath,
   });
@@ -304,7 +286,6 @@ function parsed(outcome: RoundOutcome): boolean {
   return outcome.kind === "report" && outcome.report.state === "parsed";
 }
 
-/** The guard checks run once every expected case passed; without checks the guard passes. */
 async function guardOf(ctx: TrialContext, restore: string[]): Promise<"passed" | "failed" | undefined> {
   if (ctx.settings.guardChecks.length === 0) return "passed";
   if (!(await prepareRound(ctx, "round-3", restore))) return undefined;
@@ -317,7 +298,6 @@ async function gradeRound(ctx: TrialContext, n: 1 | 2, focus: string[], restore:
   return focused(ctx, dir, focus, n);
 }
 
-/** A fresh clone of the task, at the result, with the restore list taken from the reference, then the project's setup. */
 async function prepareRound(ctx: ValidateContext, dir: GraderDir, restore: string[]): Promise<boolean> {
   expectZero(await exec(ctx, {
     dir: ".", seconds: PREPARE_SECONDS,
@@ -335,7 +315,6 @@ async function prepareRound(ctx: ValidateContext, dir: GraderDir, restore: strin
   return !run.timedOut && run.exitCode === 0;
 }
 
-/** The names the reference holds are restored from it. A name the reference lacks was added by the result, so it is removed. */
 async function restoreFromReference(ctx: ValidateContext, dir: GraderDir, names: string[]): Promise<void> {
   if (names.length === 0) return;
   const listed = await exec(ctx, {
@@ -356,7 +335,6 @@ async function restoreFromReference(ctx: ValidateContext, dir: GraderDir, names:
   }));
 }
 
-/** The numstat of the result and of the reference against the base. Either truncated makes the diff unknown. */
 async function diffOf(ctx: ValidateContext): Promise<GradeFacts["diff"]> {
   const result = await numstat(ctx, "eval-result");
   const reference = await numstat(ctx, "eval-reference");

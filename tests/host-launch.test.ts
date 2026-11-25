@@ -48,50 +48,39 @@ test("an interactive Claude launch that asks for Code Mode carries the request i
   const settingsOf = (args: string[]) => args.flatMap((arg, index) => arg === "--settings" ? [JSON.parse(args[index + 1]!) as Record<string, unknown>] : []);
   const build = (provider: "claude" | "codex", args: string[], hookServer: typeof hooks | null, on: typeof enabled, team: boolean, codeMode: boolean) =>
     buildLaunch(provider, { command: provider, args }, "p", hookServer, relay, on, team, undefined, undefined, undefined, undefined, false, false, codeMode).args;
-  // A session from a client and a team member: one settings argument, the hook layer, with the request beside the hooks.
   for (const team of [false, true]) {
     const asked = build("claude", ["--model", "opus"], hooks, enabled, team, true), plain = build("claude", ["--model", "opus"], hooks, enabled, team, false);
     assert.deepEqual(settingsOf(asked).map(settings => settings.env), [request]);
     assert.deepEqual(settingsOf(plain).map(settings => "env" in settings), [false]);
-    // The request is the only difference, so a launch that does not ask keeps the arguments it always had.
     const at = asked.indexOf("--settings") + 1;
     const { env: _env, ...rest } = settingsOf(asked)[0]!;
     assert.deepEqual([...asked.slice(0, at), JSON.stringify(rest), ...asked.slice(at + 1)], plain);
   }
   assert.deepEqual(build("claude", [], hooks, enabled, true, true).flatMap((arg, index, args) => arg === "--setting-sources" ? [args[index + 1]] : []), ["user"]);
-  // With the hooks off the host passes the argument for the request alone.
   for (const [hookServer, on] of [[null, enabled], [hooks, { claude: false, codex: false }]] as const) {
     assert.deepEqual(build("claude", ["--model", "opus"], hookServer, on, false, true), ["--model", "opus", ...own, "p"]);
     assert.deepEqual(build("claude", [], hookServer, on, false, false), ["p"]);
-    // Claude Code honours only the last settings argument, so the host adds none beside the launch's own.
     for (const brought of [["--settings", "/etc/own.json"], ["--settings=/etc/own.json"]])
       assert.deepEqual(build("claude", brought, hookServer, on, false, true), [...brought, "p"]);
   }
-  // Only Claude Code has this request.
   assert.deepEqual(build("codex", [], null, enabled, false, true), ["p"]);
 });
 
 test("the Code Mode request goes ahead of native arguments, which stay exact", () => {
   const own = ["--settings", JSON.stringify({ env: { CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1" } })];
-  // A native launch has no hook layer and no prompt of the host's: the profile's arguments, then the native ones.
   const native = (profileArgs: string[], typed: string[], codeMode = true) =>
     buildLaunch("claude", { command: "claude", args: [...profileArgs, ...typed] }, "", hooks, relay, { claude: false, codex: false },
       false, undefined, undefined, undefined, undefined, false, false, codeMode, typed.length).args;
-  // Nothing typed, prompt text after `--` (Claude Code reads all that follows as text), a subcommand, the host's own resume.
   for (const typed of [[], ["--model", "opus", "--", "attach the logs"], ["mcp", "list"], ["--resume", "abc"]]) {
     assert.deepEqual(native(["--verbose"], typed), ["--verbose", ...own, ...typed]);
     assert.deepEqual(native([], typed), [...own, ...typed]);
     assert.deepEqual(native(["--verbose"], typed, false), ["--verbose", ...typed], "a launch that does not ask keeps its exact arguments");
   }
-  // Behind a command prefix the argument still follows the provider and the profile's own arguments.
   const prefixed = ["-n", "-u", "agent", "--", "/opt/agents/claude", "--verbose"];
   assert.deepEqual(native(prefixed, ["--", "attach the logs"]), [...prefixed, ...own, "--", "attach the logs"]);
-  // A settings argument the owner typed wins in Claude Code, so the host adds none.
   assert.deepEqual(native(["--verbose"], ["--settings", "/etc/own.json"]), ["--verbose", "--settings", "/etc/own.json"]);
-  // A native count the profile cannot hold gives no position to trust: nothing is added, least of all among sudo's options.
   assert.deepEqual(buildLaunch("claude", { command: "sudo", args: prefixed }, "", hooks, relay, { claude: false, codex: false },
     false, undefined, undefined, undefined, undefined, false, false, true, prefixed.length + 1).args, prefixed);
-  // What the host pushes itself comes after: the handoff arguments of a native launch, and a member's with the hooks off.
   const handoff = buildLaunch("claude", { command: "claude", args: ["--verbose", "fix it"] }, "", hooks, relay, { claude: false, codex: false },
     false, undefined, "handoff-session", undefined, undefined, false, false, true, 1).args;
   assert.deepEqual(handoff.slice(0, 5), ["--verbose", ...own, "fix it", "--append-system-prompt"]);
@@ -155,7 +144,6 @@ test("claude gets --settings with relay command hooks before the prompt", () => 
   const i = launch.args.indexOf("--settings");
   assert.ok(i > 0);
   const settings = JSON.parse(launch.args[i + 1]);
-  // A project settings file must not be able to switch the host's hooks off.
   assert.equal(settings.disableAllHooks, false);
   const events = Object.keys(settings.hooks).sort();
   assert.deepEqual(events, ["Elicitation", "Notification", "PermissionDenied", "PermissionRequest", "PostToolUse", "PostToolUseFailure", "PreToolUse", "SessionEnd", "Stop", "StopFailure", "UserPromptSubmit"]);
@@ -257,10 +245,8 @@ test("mission coordinators can only read repositories and report, and only on Cl
     assert.throws(() => missionCoordinatorLaunch("claude", { command: "claude", args: [flag, "native-session"] }), /cannot configure/);
   assert.ok(!claude.args.some(arg => /dangerously-skip|permission-mode.*acceptEdits|mcp__infinite_team__report/.test(arg)));
 
-  // A stray value from a variadic flag must not become the positional prompt.
   const variadic = missionCoordinatorLaunch("claude", { command: "claude", args: ["--tools", "Read", "Bash", "--mcp-config", "a.json", "b.json", "--model", "opus"] });
   assert.ok(!variadic.args.includes("Bash") && !variadic.args.includes("a.json") && !variadic.args.includes("b.json") && variadic.args.includes("opus"));
-  // Codex merges inherited MCP servers, so it cannot yet be held to reading and reporting.
   assert.throws(() => missionCoordinatorLaunch("codex", { command: "codex", args: [] }), /require Claude Code/);
 
   const launch = buildLaunch("claude", claude, "Report the mission", hooks, relay, enabled, true);
@@ -299,13 +285,11 @@ test("the codex notify argument keeps a relay path with a space, a quote and a b
   const odd = "/opt/a b/in\"fi\\nite/hook-relay.js";
   const launch = buildLaunch("codex", { command: "codex", args: [] }, "", hooks, odd, { claude: true, codex: false });
   const value = launch.args.find((a) => a.startsWith("notify="))!.slice("notify=".length);
-  // TOML and JSON escape a quote and a backslash the same way, so the argument stays one array of three strings.
   assert.equal(value, '["node","/opt/a b/in\\"fi\\\\nite/hook-relay.js","codex-notify"]');
   assert.deepEqual(JSON.parse(value), ["node", odd, "codex-notify"]);
   const on = buildLaunch("codex", { command: "codex", args: [] }, "", hooks, odd, enabled);
   const hook = on.args.find((a) => a.startsWith("hooks.Stop="))!;
   assert.ok(hook.includes(`command=${JSON.stringify(`node ${odd} codex`)}`), hook);
-  // TOML refuses a raw DEL in a basic string and JSON leaves it raw, so the host escapes it.
   const del = buildLaunch("codex", { command: "codex", args: [] }, "", hooks, "/opt/a\x7fb/hook-relay.js", enabled);
   const delNotify = del.args.find((a) => a.startsWith("notify="))!;
   assert.equal(delNotify, 'notify=["node","/opt/a\\u007fb/hook-relay.js","codex-notify"]');
@@ -318,7 +302,6 @@ test("codex dev relay runs the TypeScript file through an absolute tsx loader", 
   const command = /command="([^"]+)"/.exec(hook)![1];
   assert.ok(command.startsWith("node --import "), command);
   assert.ok(command.endsWith(" /repo/packages/host/src/hook-relay.ts codex"), command);
-  // The loader must not be a bare `tsx`, which would resolve from the agent's working directory.
   const loader = command.split(" ")[2];
   assert.match(loader, /^file:\/\/\/.+\/tsx\//);
   const notify = JSON.parse(launch.args.find((a) => a.startsWith("notify="))!.slice("notify=".length));
@@ -344,7 +327,6 @@ test("Codex team launch configures its authenticated MCP report tool and require
       assert.equal(serverArgs[0], "--import");
       assert.match(serverArgs[1], /^file:\/\/\/.+\/tsx\//);
     }
-    // A mission coordinator's assignment reaches the host-side MCP server, which reports over loopback for the sandboxed agent.
     assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID"]);
     assert.equal(settings.get("tools.report.approval_mode"), "approve");
     assert.equal(settings.get("tools.mission_report.approval_mode"), "approve");
@@ -377,7 +359,6 @@ test("Codex forwards configured egress names to team, mission, and handoff MCP s
   assert.deepEqual(envVars(routed.args, "infinite_handoff"), [...handoffBase, ...EGRESS_ENVIRONMENT_NAMES]);
 });
 
-// A readable teamwork run path long enough that a terminal wraps it across lines.
 const memberFolder = `/srv/data/workspaces/Projects/sample/teamwork/2026-01-15-${"stop-ringing-once-i-am-up-".repeat(2)}3f2a9c1d/members/${randomUUID()}`;
 
 test("a trusted member folder reaches Codex as one per-launch override for that exact folder", () => {
@@ -389,7 +370,6 @@ test("a trusted member folder reaches Codex as one per-launch override for that 
   assert.deepEqual(quoted.args, ["-c", 'project_root_markers=[".git"]', "-c", 'projects={"/srv/a \\"b\\"\\\\c"={trust_level="trusted"}}']);
   for (const folder of ["relative/member", "/srv/a\nb", "/srv/a/../b", "/"])
     assert.throws(() => buildLaunch("codex", { command: "codex", args: [] }, "", null, relay, enabled, false, undefined, undefined, folder), /absolute folder/);
-  // Claude has no per-launch trust flag, and untrusted launches carry no override.
   assert.ok(!buildLaunch("claude", { command: "claude", args: [] }, "p", hooks, relay, enabled, true, undefined, undefined, memberFolder).args.some(arg => arg.includes("trust_level")));
   assert.ok(!buildLaunch("codex", { command: "codex", args: [] }, "p", hooks, relay, enabled, true).args.some(arg => arg.startsWith("projects=")));
 });
@@ -403,20 +383,16 @@ test("a trusted Codex launch refuses a folder whose repository carries Codex pro
     mkdirSync(member, { recursive: true });
     const launch = (cwd: string) => buildLaunch("codex", { command: "codex", args: [] }, "p", hooks, relay, enabled, true, undefined, undefined, cwd);
     const args = launch(member).args;
-    // Codex looks for the same root as the check: the root markers are pinned next to the trust override.
     const trust = args.indexOf(`projects={${JSON.stringify(member)}={trust_level="trusted"}}`);
     assert.ok(trust > 2 && args[trust - 2] === 'project_root_markers=[".git"]' && args[trust - 3] === "-c", args.join(" "));
 
-    // Above the Git root is outside the project: Codex reads no project configuration there.
     mkdirSync(join(base, ".codex"));
     assert.deepEqual(repositoryCodexConfig(member), []);
 
-    // At the Git root, in between, or in the folder itself, in any file type.
     mkdirSync(join(repo, ".codex"));
     writeFileSync(join(repo, ".codex", "config.toml"), 'model = "planted"\n');
     assert.throws(() => launch(member), (error: Error) => error.message.includes(join(repo, ".codex")) && /Codex member not started/.test(error.message));
     assert.throws(() => launch(repo), /Codex project configuration/);
-    // Codex skips a `.git` folder without HEAD when it looks for the root, so the check looks past it too.
     mkdirSync(join(repo, "packages", ".git"));
     assert.deepEqual(repositoryCodexConfig(member), [join(repo, ".codex")]);
     rmSync(join(repo, "packages", ".git"), { recursive: true });
@@ -429,7 +405,6 @@ test("a trusted Codex launch refuses a folder whose repository carries Codex pro
     rmSync(join(member, ".codex"));
     assert.deepEqual(repositoryCodexConfig(member), []);
 
-    // A worktree's `.git` file marks the root too, and a folder with no Git root counts only itself.
     const worktree = join(base, "worktree");
     mkdirSync(worktree);
     writeFileSync(join(worktree, ".git"), "gitdir: elsewhere\n");
@@ -440,7 +415,6 @@ test("a trusted Codex launch refuses a folder whose repository carries Codex pro
     mkdirSync(join(loose, ".codex"), { recursive: true });
     assert.ok(repositoryCodexConfig(loose).includes(join(loose, ".codex")));
 
-    // A folder the host cannot inspect is refused, not trusted.
     if (process.getuid?.() !== 0) {
       chmodSync(repo, 0);
       try { assert.throws(() => codexTrustArgs(member), /Cannot check/); }
@@ -481,7 +455,6 @@ test("Claude trust takes Claude's own config lock and keeps a concurrent Claude 
     assert.throws(() => recordClaudeTrust(config, member, 100), /locked/);
     assert.deepEqual(JSON.parse(readFileSync(config, "utf8")), { numStartups: 1 });
     assert.ok(existsSync(lock), "Another writer's lock must stay in place");
-    // The agent-side entry waits while a running Claude session holds the lock and saves.
     const child = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/workspace-trust.ts"), "claude"],
       { cwd: member, env: { PATH: process.env.PATH ?? "", HOME: home, INFINITE_TRUSTED_WORKSPACE: member }, stdio: "ignore" });
     const exited = new Promise<number | null>(done => child.once("exit", done));
@@ -493,13 +466,11 @@ test("Claude trust takes Claude's own config lock and keeps a concurrent Claude 
     assert.equal(await exited, 0);
     assert.deepEqual(JSON.parse(readFileSync(config, "utf8")), { ...claudeSave, projects: { ...claudeSave.projects, [member]: { hasTrustDialogAccepted: true } } });
     assert.ok(!existsSync(lock));
-    // A lock abandoned past proper-lockfile's ten-second staleness is reclaimed.
     mkdirSync(lock);
     const old = new Date(Date.now() - 60000);
     utimesSync(lock, old, old);
     assert.equal(recordClaudeTrust(config, "/srv/stale-lock-member", 100), true);
     assert.ok(!existsSync(lock));
-    // A stale lock that cannot be removed fails promptly instead of spinning past the deadline.
     mkdirSync(lock);
     writeFileSync(join(lock, "unexpected"), "");
     utimesSync(lock, old, old);
@@ -532,7 +503,6 @@ test("the agent-side Claude trust entry records only the folder it is launched i
   try {
     const home = join(root, "home"), member = join(root, "member"), other = join(root, "other");
     for (const folder of [home, member, other]) mkdirSync(folder);
-    // Wrappers call the entry through the release symlink, as /opt/infinite does on Ubuntu.
     const release = join(root, "release");
     symlinkSync(resolve("packages/host/src"), release);
     const run = (env: Record<string, string>, ...args: string[]) => spawnSync(process.execPath,
@@ -570,13 +540,11 @@ test("codex hooks stay off unless the config turns them on", () => {
       writeFileSync(join(root, "config.json"), JSON.stringify({ ...base, ...extra }));
       return readConfig(join(root, "config.json")).config;
     };
-    // No attention block: the manager falls back to DEFAULT_HOOKS.
     assert.equal(parse({}).attention, undefined);
     assert.deepEqual({ ...DEFAULT_HOOKS }, { claude: true, codex: false });
     assert.deepEqual(parse({ attention: {} }).attention?.hooks, { claude: true, codex: false });
     assert.deepEqual(parse({ attention: { hooks: { claude: false } } }).attention?.hooks, { claude: false, codex: false });
     assert.deepEqual(parse({ attention: { hooks: { codex: true } } }).attention?.hooks, { claude: true, codex: true });
-    // With the defaults, Codex launches exactly as its profile says.
     assert.deepEqual(buildLaunch("codex", { command: "codex", args: ["-a", "on-request"] }, "go", hooks, relay, DEFAULT_HOOKS).args, ["-a", "on-request", "-c", 'notify=["node","/opt/infinite/packages/host/dist/hook-relay.js","codex-notify"]', "go"]);
     assert.ok(buildLaunch("claude", { command: "claude", args: [] }, "", hooks, relay, DEFAULT_HOOKS).args.includes("--settings"));
   } finally {
@@ -595,7 +563,6 @@ test("a served headless Claude launch loads only the host's settings, with the c
   assert.deepEqual(settings.env, { CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1" });
   const commands = (event: string) => settings.hooks[event][0].hooks.map((hook: { command: string; timeout: number }) => [hook.command.split(" ").slice(-2).join(" "), hook.timeout]);
   assert.deepEqual(commands("PreToolUse"), [["/opt/infinite/packages/host/dist/hook-relay.js claude", 10], ["/opt/infinite/packages/host/dist/permission-hook.js check", 30]]);
-  // The relay would open a hook-only prompt and push the owner while the permission agent decides.
   assert.deepEqual(commands("PermissionRequest"), [["/opt/infinite/packages/host/dist/permission-hook.js request", 360]]);
   assert.equal(settings.hooks.PreToolUse[0].hooks[1].command.split(" ")[0], process.execPath);
   assert.equal(launch.args.at(-1), "go");
@@ -607,7 +574,6 @@ test("a served headless Claude launch loads only the host's settings, with the c
   normalizedArgs[launch.args.indexOf("--settings") + 1] = disabled.args[disabled.args.indexOf("--settings") + 1]!;
   assert.deepEqual(normalizedArgs, disabled.args, "the channel settings env is the only argv change");
   assert.equal(JSON.stringify(withoutMode), disabled.args[disabled.args.indexOf("--settings") + 1]);
-  // Without the signal hooks only the channel hooks remain.
   const quiet = JSON.parse(buildLaunch("claude", { command: "claude", args: ["-p"] }, "", hooks, relay, { claude: false, codex: false }, false, undefined, undefined, undefined, undefined, true).args.at(-1)!);
   assert.deepEqual(Object.keys(quiet.hooks).sort(), ["PermissionRequest", "PreToolUse"]);
 });
@@ -621,10 +587,8 @@ test("Claude team launches load no project or local settings file, so one member
   assert.deepEqual(sources(mission.args), ["user"]);
   const reviewer = buildLaunch("claude", permissionCoordinatorLaunch("claude", { command: "claude", args: ["--model", "sonnet"] }), "Review", hooks, relay, enabled, true);
   assert.deepEqual(sources(reviewer.args), ["user"]);
-  // A served member already loads no settings file at all; the two flags never meet.
   const served = buildLaunch("claude", { command: "claude", args: ["-p"] }, "go", hooks, relay, enabled, true, undefined, undefined, undefined, undefined, true);
   assert.deepEqual(sources(served.args), [""]);
-  // Owner sessions and Codex members keep their settings files.
   assert.deepEqual(sources(buildLaunch("claude", { command: "claude", args: [] }, "p", hooks, relay, enabled).args), []);
   assert.deepEqual(sources(buildLaunch("codex", { command: "codex", args: [] }, "p", hooks, relay, enabled, true).args), []);
   for (const args of [["--setting-sources", "project"], ["--setting-sources=user,project"]])
@@ -715,7 +679,6 @@ test("entry tools join the team launch only when on", () => {
   assert.equal(settings.get("tools.entry_list.approval_mode"), "approve");
   assert.equal(settings.get("tools.entry_get.approval_mode"), "approve");
 
-  // A handoff launch, or a launch that is not a team member, gets nothing new.
   assert.deepEqual(buildLaunch("claude", profile, "task", hooks, relay, enabled, false, undefined, undefined, undefined, true),
     buildLaunch("claude", profile, "task", hooks, relay, enabled, false));
   assert.deepEqual(buildLaunch("codex", codex, "task", hooks, relay, enabled, false, undefined, undefined, undefined, true),

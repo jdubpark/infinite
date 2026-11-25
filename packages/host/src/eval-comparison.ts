@@ -9,14 +9,10 @@ import {
 } from "./eval-types.js";
 import type { Config } from "./types.js";
 
-// The report pass: once for each finished job, a stored report (compare and confirm) and prior rows (baseline and compare).
-// It reads plain columns and the job's own sealed payload. It never opens a task payload.
-
 export const REPORT_CANDIDATES = 20, REPORT_SESSION_WAIT_MS = 86_400_000;
 export const REPORT_DUE_SQL = "SELECT job_id, project_ref, kind, status, reason, finished_at, payload FROM eval_jobs WHERE reported_at IS NULL "
   + "AND kind != 'validate' AND finished_at IS NOT NULL ORDER BY finished_at, job_id LIMIT 20";
 export const SESSIONS_HELD_SQL = "SELECT 1 AS held FROM eval_trials WHERE job_id = ? AND session_id IS NOT NULL LIMIT 1";
-/** At most 200 ids, one placeholder each. */
 export const REPORT_TASKS_SQL = "SELECT t.task_id, t.area_ref, t.prompt_origin, t.kind, COALESCE(r.holdout, 0) AS holdout FROM eval_tasks t "
   + "LEFT JOIN eval_groups g ON g.group_id = t.group_id LEFT JOIN eval_groups r ON r.group_id = g.root_id WHERE t.task_id IN (…)";
 
@@ -69,7 +65,6 @@ function statTrial(row: JobTrialRow, pin: ComparisonPin, configuration: number):
 }
 
 type Built = { report: ComparisonReport } | "unreadable";
-/** What a read computed for one due job; the write only stores it. */
 type Prepared = { report?: Built; unreadable: boolean; priors?: { jobId: string; projectId: string; cells: ReturnType<typeof priorCells> } };
 
 function buildReport(db: EvidenceDb, due: DueRow, payload: TrialJobPayload, project: Project | undefined, at: string): Built {
@@ -154,10 +149,8 @@ export class ComparisonPass {
     this.now = options.now ?? (() => new Date().toISOString());
   }
 
-  /** At most one finished job per call. Never throws. */
   step(): "reported" | "waiting" | "idle" {
     try {
-      // A report and its stamp are written only while both modules read and write.
       const modules = this.store.status().modules;
       if (modules[EVAL_MODULE] !== "ready" || modules[EVAL_TRIALS_MODULE] !== "ready") return "idle";
       const at = this.now();
@@ -177,10 +170,6 @@ export class ComparisonPass {
     }
   }
 
-  /**
-   * The statistics and the prior cells are computed in a read; the write then holds the lock only for the stamp and the inserts.
-   * The `reported_at IS NULL` guard in the write lets one pass win when two run.
-   */
   private report(due: DueRow, at: string): boolean {
     const prepared = this.store.read(db => this.prepare(db, due, at));
     return this.store.write(tx => {
@@ -219,19 +208,16 @@ export class ComparisonPass {
 
   private priors(db: EvidenceDb, due: DueRow, payload: TrialJobPayload): ReturnType<typeof priorCells> | undefined {
     try {
-      // Copies were counted by the job that ran them; exporting them again would count one trial twice.
       const rows = jobRows(db, due.job_id).filter(row => !row.reused);
       const ids = payload.tasks ?? [...new Set(rows.map(row => row.taskId))].sort().slice(0, TASKS_MAX);
       const known = taskRows(db, ids);
       return priorCells(payload.request.configurations, rows, priorTasks(known));
     } catch {
-      // A job whose rows cannot be built keeps its stamp, so the queue moves on.
       return undefined;
     }
   }
 }
 
-/** A stored report, or the refusal that says why there is none. */
 export function reportFor(db: EvidenceDb, jobId: string): ComparisonReport | EvalRefusal {
   const stored = db.get<{ state: "ready" | "unreadable"; payload: string }>("SELECT state, payload FROM eval_reports WHERE job_id = ?", jobId);
   if (stored !== undefined) {

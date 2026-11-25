@@ -114,8 +114,6 @@ test("two registered machines create and steer independently, with scoped file p
       fifoResult = await Promise.race([pendingPreview, new Promise<"blocked">(resolve => { deadline = setTimeout(() => resolve("blocked"), 1500); })]);
     } finally {
       clearTimeout(deadline!);
-      // Unblock the pre-fix read after the deadline so this regression cannot
-      // leave a libuv worker or the test process hanging on failure.
       try { closeSync(openSync(fifo, constants.O_WRONLY | constants.O_NONBLOCK)); } catch {}
       await pendingPreview;
     }

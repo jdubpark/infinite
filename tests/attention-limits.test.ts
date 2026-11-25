@@ -7,7 +7,7 @@ import type { Attention, SignalData, SignalEvent } from "../packages/attention/s
 
 const screen = (name: string) =>
   readFileSync(new URL(`./fixtures/screens/${name}.txt`, import.meta.url), "utf8").split("\n");
-const now = new Date("2026-10-17T20:00:00Z"); // a Saturday
+const now = new Date("2026-10-17T20:00:00Z");
 
 test("parseResetTime returns the next occurrence after now, in UTC", () => {
   assert.equal(parseResetTime("resets 3:45pm", now), "2026-10-18T15:45:00.000Z");

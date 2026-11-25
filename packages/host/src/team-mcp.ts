@@ -35,7 +35,6 @@ const entryTools = [
   { name: "entry_get", description: "Read one entry's head and body.",
     inputSchema: z.toJSONSchema(ENTRY_GET_ARGUMENTS, { target: "draft-7", io: "input" }), outputSchema: outputSchemas.entry_get, annotations: { readOnlyHint: true } },
 ];
-/** The entry call a tool name and its arguments make. The client validates the rest. */
 function entryCallFor(name: string, args: Record<string, unknown>): EntryCall {
   if (name === "entry_post") return { op: "post", entry: ENTRY_ARGUMENTS.parse(args).entry };
   if (name === "entry_list") return { op: "list", query: memberListQuerySchema.parse(args) };
@@ -45,7 +44,6 @@ const HANDOFF_RECORDED = "Handoff recorded. Stop work now; the host waits for cl
 const MISSION_RECORDED = "Mission report recorded. Stop work on this attempt.";
 const TEAM_RECORDED = "Team report recorded. Stop work on this assignment.";
 const ANSWER_MISMATCH = "Entry answer not confirmed: the host's answer did not match this tool's declared result. This is not a refusal of your request.";
-/** The worker's answer as the tool's declared result, or a fixed error that never repeats the answer or the parse issues. */
 function declared<S extends z.ZodType>(schema: S, answer: unknown, guidance: string): z.output<S> {
   const parsed = schema.safeParse(answer);
   if (!parsed.success) throw new EntryError(`${ANSWER_MISMATCH} ${guidance}`);
@@ -57,7 +55,6 @@ type RequestId = string | number;
 const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const isId = (value: unknown): value is RequestId => typeof value === "string" ? value.length <= 200 : typeof value === "number" && Number.isSafeInteger(value);
 
-/** A narrow newline-delimited MCP transport. Awaiting each frame also bounds stdin backpressure. */
 export async function runTeamMcp() {
   const handoff = Boolean(process.env.INFINITE_HANDOFF_SESSION);
   const mission = !handoff && Boolean(missionAssignment());
@@ -75,7 +72,6 @@ export async function runTeamMcp() {
   };
   const error = (id: RequestId | null, code: number, message: string) => send({ jsonrpc: "2.0", id, error: { code, message } });
   const result = (id: RequestId, value: unknown) => send({ jsonrpc: "2.0", id, result: value });
-  /** A write tool's success. Pass an object literal: the compiler then checks every field against the tool's declared result. */
   const written = <T extends keyof WriteResults>(id: RequestId, _tool: T, value: WriteResults[T]) =>
     result(id, { content: [{ type: "text", text: value.message }], structuredContent: value, isError: false });
   const handle = async (bytes: Buffer) => {
@@ -85,7 +81,6 @@ export async function runTeamMcp() {
     if (!isObject(request) || request.jsonrpc !== "2.0" || typeof request.method !== "string" || request.method.length > 100 || (request.id !== undefined && !isId(request.id))) {
       await error(isObject(request) && isId(request.id) ? request.id : null, -32600, "Invalid JSON-RPC request."); return;
     }
-    // Notifications never execute a tool, including a malformed tools/call without an ID.
     if (request.id === undefined) return;
     const id = request.id as RequestId;
     if (request.method === "ping") { await result(id, {}); return; }
@@ -118,7 +113,6 @@ export async function runTeamMcp() {
     }
     const entryCall = params.name !== selectedTool.name;
     if (entryCall && !(withEntryTools && ENTRY_TOOL_NAMES.has(params.name))) { await error(id, -32602, `Unknown tool. Only ${availableTools} ${withEntryTools ? "are" : "is"} available.`); return; }
-    // Every successful result is built by `written`, or is a worker answer that its declared result's schema accepted.
     try {
       if (entryCall) {
         const answer = await submitEntryCall(entryCallFor(params.name, params.arguments));
@@ -127,8 +121,6 @@ export async function runTeamMcp() {
           await written(id, "entry_post", { entryId: receipt.entryId, state: receipt.state, message: entryPosted(receipt.entryId) });
           return;
         }
-        // The strict schema only gates: an accepted answer holds exactly the declared fields, and the answer itself
-        // is sent so the text keeps the worker's key order.
         declared(params.name === "entry_list" ? memberListSchema : memberEntrySchema, answer, "Continue your assignment; read again later if you need it.");
         await result(id, { content: [{ type: "text", text: JSON.stringify(answer) }], structuredContent: answer, isError: false });
         return;

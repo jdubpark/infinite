@@ -40,7 +40,6 @@ type Seed = { runId?: string; taskId?: string; revision?: number; ordinal?: numb
   decidedAt?: string; chosen?: string; coordinator?: string | null; greedy?: string; explore?: boolean;
   state?: DecisionRow["state"]; memberId?: string | null; identity?: string };
 
-/** One stored start decision. Its payload names the project, task, area, and feature map it was made for. */
 function seed(store: EvidenceStore, spec: Seed): void {
   const runId = spec.runId ?? "run-1", taskId = spec.taskId ?? "task-1", revision = spec.revision ?? 1, ordinal = spec.ordinal ?? 1;
   const projectId = spec.projectId ?? "rehearsal", area = spec.area ?? "host", chosen = spec.chosen ?? "astra-xhigh";
@@ -63,7 +62,6 @@ function seed(store: EvidenceStore, spec: Seed): void {
   });
 }
 
-/** A counting view of the store: every `db.open` the status makes goes through it. */
 function counting(store: EvidenceStore): { store: Store; opens: () => number } {
   let opened = 0;
   const wrapped = {
@@ -86,7 +84,6 @@ function statusInput(overrides: Partial<Parameters<typeof routingStatus>[1]> = {
 const PAYLOAD_BASE: OutcomePayload = { projectId: "rehearsal", taskId: "task-x", area: "other", featureMap: "default",
   rounds: { run: 0, attributed: 0, unknown: 0 }, limitEvents: 0, costCoverage: "none" };
 
-/** A counted implementer row of the start point, ended and integrated at NOW, under a stored configuration. */
 function outcome(id: string, profile: TeamModelProfile, configId: string): OutcomeRow {
   const identity = profile.provider === "opencode"
     ? { provider: profile.provider, model: profile.model, effort: profile.variant ?? null }
@@ -174,7 +171,6 @@ test("status cells come from recorded decisions, at most 50, then the new task l
     assert.deepEqual(last.cell, { scope: "new-task" });
     assert.ok(counter.opens() > 0 && counter.opens() <= 50, `opened ${counter.opens()} payloads`);
 
-    // No outcome rows: unknown stays unknown. The prior mean shows, the level is none, and no count is a rate.
     for (const profile of last.profiles) {
       assert.equal(profile.mean, 0.5);
       assert.deepEqual(profile.interval, [0.025, 0.975]);
@@ -264,7 +260,6 @@ test("the status scores a shared identity at its eligible profile's cost", () =>
   let store: EvidenceStore | undefined;
   try {
     store = open(f);
-    // A contributor and B share one identity; B is the eligible profile, so the identity costs what B's tier costs.
     const shared = { provider: "codex", model: "gpt-6-astra", effort: "xhigh" } as const;
     const contributor: TeamModelProfile = { id: "a-light", label: "A", ...shared, tier: "light", dataUse: "contributor" };
     const strong: TeamModelProfile = { id: "b-strong", label: "B", ...shared, tier: "strong", dataUse: "standard" };
@@ -288,7 +283,6 @@ test("the status scores a shared identity at its eligible profile's cost", () =>
   }
 });
 
-/** A row of an earlier epoch: held, first pass, coordinator-chosen (half weight), ended now, in `projectId`. */
 function earlierRow(id: string, profile: TeamModelProfile, projectId: string): OutcomeRow {
   return { ...outcome(id, profile, "cfg-none"), payload: { ...PAYLOAD_BASE, projectId, area: "other" }, profileEpoch: 2, held: 1, firstPass: 1 };
 }
@@ -303,7 +297,6 @@ test("the status reports an earlier mass under the cap as its applied mass", () 
     store.write(tx => {
       for (let index = 0; index < 4; index++) writeOutcome(tx, earlierRow(`few-${index}`, astra, "rehearsal"));
     });
-    // Four rows stay below the cap: the applied mass is the raw mass, 2.
     const status = routingStatus(store, statusInput({ saved: { mode: "shadow" } }));
     const profile = status.cells[status.cells.length - 1]!.profiles.find(item => item.profileId === "astra-xhigh")!;
     assert.deepEqual(profile.earlier, { rows: 4, mass: 2, appliedMass: 2 });
@@ -319,10 +312,7 @@ test("the applied earlier mass sums each level's capped mass", () => {
   try {
     store = open(f);
     const astra = mixedLineup.implementers[1]!;
-    // A recorded cell: area host, kind feature, feature version 1, feature map default.
     seed(store, { area: "host" });
-    // Forty earlier rows under another project (tenant level): raw mass 20 at half weight, capped to 10 (scale 0.5).
-    // Four earlier rows in the cell: raw mass 2, under the cap (scale 1), so applied 2.
     const inCell = (id: string, projectId: string): OutcomeRow => ({
       ...earlierRow(id, astra, projectId), kind: "feature",
       payload: { ...PAYLOAD_BASE, projectId, area: "host", featureMap: "default" },
@@ -334,7 +324,6 @@ test("the applied earlier mass sums each level's capped mass", () => {
     const status = routingStatus(store, statusInput({ saved: { mode: "shadow" } }));
     const cell = status.cells.find(line => line.cell.scope === "cell")!;
     const profile = cell.profiles.find(item => item.profileId === "astra-xhigh")!;
-    // Tenant and cell each take their own scale: 20 raw becomes 10, 2 stays 2, so 22 raw and 12 applied over 44 rows.
     assert.deepEqual(profile.earlier, { rows: 44, mass: 22, appliedMass: 12 });
   } finally {
     store?.close();
@@ -342,7 +331,6 @@ test("the applied earlier mass sums each level's capped mass", () => {
   }
 });
 
-/** A counted implementer row under a stored configuration. The default is the recorded cell: area host, kind feature. */
 function integratedRow(spec: { id: string; profile: TeamModelProfile; configId: string; area?: string; kind?: string | null;
   endedAt?: string; firstPass?: 0 | 1 }): OutcomeRow {
   const base = outcome(spec.id, spec.profile, spec.configId);
@@ -372,8 +360,6 @@ test("the earlier mass is the mass the posterior adds, at most 10 per level", ()
     seed(store, { area: "host" });
     store.write(tx => {
       configRow(tx, "old", astra, "an-earlier-version");
-      // Forty rows in the cell and forty in the project, each of weight 0.5: a raw mass of 20 per level. The posterior
-      // caps each level at 10, so the raw mass is 40 and the applied mass is 20.
       for (let index = 0; index < 40; index++) writeOutcome(tx, integratedRow({ id: `cell-${index}`, profile: astra, configId: "old" }));
       for (let index = 0; index < 40; index++) writeOutcome(tx, integratedRow({ id: `project-${index}`, profile: astra, configId: "old", area: "elsewhere/" }));
     });
@@ -400,7 +386,6 @@ test("a recorded cell counts its own rows, and the new-task line counts the proj
     const cell = cellProfile(status, "astra-xhigh");
     assert.deepEqual([cell.level, cell.rows.production, newTaskProfile(status, "astra-xhigh").level], ["cell", 30, "project"]);
     for (const profile of status.cells.flatMap(line => line.profiles)) assert.ok(profile.interval[0] >= 0 && profile.interval[1] <= 1, `interval ${profile.interval}`);
-    // Beta(16, 1) has an upper bound above 1 before the clip.
     assert.equal(cell.interval[1], 1);
   } finally {
     store?.close();
@@ -451,7 +436,6 @@ test("the Code Mode flag reads the version a Claude member started in Code Mode 
     assert.deepEqual([cellProfile(on, "haiku-medium").rows.production, cellProfile(on, "haiku-medium").earlier.rows], [30, 0]);
     assert.deepEqual([cellProfile(off, "haiku-medium").rows.production, cellProfile(off, "haiku-medium").earlier.rows], [0, 30]);
     assert.deepEqual([cellProfile(on, "astra-xhigh").rows.production, cellProfile(on, "astra-xhigh").earlier.rows], [30, 0]);
-    // The other provider's evidence reads the same. Which profile the greedy pick names depends on the Claude candidate too.
     const evidenceOf = (status: RoutingStatus) => { const { greedy: _pick, ...evidence } = cellProfile(status, "astra-xhigh"); return evidence; };
     assert.deepEqual(evidenceOf(on), evidenceOf(off));
   } finally {
@@ -501,7 +485,6 @@ test("the greedy mark is the choice's greedy pick, removed profiles are marked, 
     const b: TeamModelProfile = { id: "codex-b", label: "Codex B", provider: "codex", model: "gpt-b-1", effort: "high", tier: "strong" };
     const lineup: TeamLineup = { ...mixedLineup, implementers: [mixedLineup.implementers[0]!, a, { ...b, tier: undefined }] };
     seed(store, { taskId: "t1" });
-    // With equal priors and costs the greedy pick is codex-a, the first eligible profile.
     const marks = routingStatus(store, statusInput({ lineup, saved: { mode: "shadow" } })).cells[0]!.profiles.map(profile => [profile.profileId, profile.removed ?? null, profile.greedy]);
     assert.deepEqual(marks, [["spark-high", "contributor", false], ["codex-a", null, true], ["codex-b", null, false]]);
     store.write(tx => {
@@ -510,7 +493,6 @@ test("the greedy mark is the choice's greedy pick, removed profiles are marked, 
     });
     const strong = cellProfile(routingStatus(store, statusInput({ lineup: { ...mixedLineup, implementers: [b] }, saved: { mode: "shadow" } })), "codex-b");
     assert.equal(strong.costUsd, 2.2);
-    // Integrated but not first pass: the reward keeps the mean at 0.5, and the rescue falls.
     assert.ok(strong.rescue < strong.mean, `rescue ${strong.rescue}, mean ${strong.mean}`);
   } finally {
     store?.close();
@@ -564,7 +546,6 @@ test("the status reports the requested mode, the source, the defaults, the start
     store = open(f);
     const auto = routingStatus(store, statusInput({ saved: { mode: "auto", successValueUsd: 8 } }));
     assert.deepEqual([auto.mode, auto.requested, auto.source, auto.defaults.includes("successValueUsd"), auto.defaults.includes("points")], ["shadow", "auto", "saved", false, true]);
-    // A saved mode decides; a saved policy without a mode in an autonomous project takes the autonomous default's mode.
     assert.equal(auto.modeSource, "saved");
     const noMode = routingStatus(store, statusInput({ autonomy: "autonomous", saved: { successValueUsd: 8 } }));
     assert.deepEqual([noMode.source, noMode.requested, noMode.modeSource], ["saved", "shadow", "autonomous-default"]);
@@ -609,31 +590,25 @@ test("status reports auto, the period end, and the pause", () => {
     assert.deepEqual([empty.explore.pausedAt, routingStatus(store, statusInput({ saved: { mode: "shadow" } })).explore.pausedAt], [null, null]);
 
     for (let index = 0; index < 50; index++) seed(store, { taskId: `t-${index}`, decidedAt: daysBefore(15) });
-    // The first start is 15 days old, so the end is its 14 days: a day ago. Nothing is stored yet.
     const unstored = routingStatus(store, statusInput({ saved: { mode: "auto" } }));
     assert.deepEqual([unstored.mode, unstored.period.decisions, unstored.period.endedAt, unstored.period.stored], ["auto", 50, daysBefore(1), false]);
 
-    // A stored end is the one the status shows, and it never moves.
     store.write(tx => markPeriodEnded(tx, "rehearsal", daysBefore(2), NOW));
     const stored = routingStatus(store, statusInput({ saved: { mode: "auto" } }));
     assert.deepEqual([stored.mode, stored.period.endedAt, stored.period.stored], ["auto", daysBefore(2), true]);
 
-    // Exploration is paused for the project in both modes, and the pause is not a configuration change.
     store.write(tx => setExplorePause(tx, "rehearsal", NOW, NOW));
     assert.equal(routingStatus(store, statusInput({ saved: { mode: "auto" } })).explore.pausedAt, NOW);
     assert.equal(routingStatus(store, statusInput({ saved: { mode: "shadow" } })).explore.pausedAt, NOW);
     store.write(tx => setExplorePause(tx, "rehearsal", null, NOW));
     assert.equal(routingStatus(store, statusInput({ saved: { mode: "auto" } })).explore.pausedAt, null);
 
-    // The autonomous default: no saved policy, 50 recorded starts, the first 15 days ago, gives auto.
     for (let index = 0; index < 50; index++) seed(store, { projectId: "fresh", taskId: `f-${index}`, decidedAt: daysBefore(15) });
     const fresh = routingStatus(store, statusInput({ projectId: "fresh", autonomy: "autonomous", saved: undefined }));
     assert.deepEqual([fresh.mode, fresh.period.endedAt, fresh.period.stored], ["auto", daysBefore(1), false]);
-    // Without a lineup that covers the start point, the default does not pin auto, so the status says shadow.
     const contributorsOnly: TeamLineup = { ...mixedLineup, implementers: [mixedLineup.implementers[0]!] };
     const uncovered = routingStatus(store, statusInput({ projectId: "fresh", autonomy: "autonomous", saved: undefined, lineup: contributorsOnly }));
     assert.deepEqual([uncovered.mode, uncovered.covers.reason], ["shadow", "no-eligible-profile"]);
-    // A supervised project without a policy stays off, whatever its rows say.
     assert.equal(routingStatus(store, statusInput({ projectId: "fresh" })).mode, "off");
   } finally {
     store?.close();
@@ -661,11 +636,9 @@ test("auto status counts each state and the share, and weighs applied rows in fu
     assert.equal(status.shadow.decisions, 4);
     assert.deepEqual([status.share!.of, status.share!.window, status.share!.limit], [5, 50, 0.2]);
     assert.deepEqual([status.explore.guards, status.explore.of], ["applied", 5]);
-    // In shadow, none of the state counts exist.
     const shadow = routingStatus(store, statusInput({ saved: { mode: "shadow" } }));
     assert.deepEqual([shadow.share, shadow.auto, shadow.explore.guards], [null, null, "risk-only"]);
 
-    // Past the 500-row read limit, the auto counts are capped. One transaction writes the rows, so the test stays fast.
     store.write(tx => markPeriodEnded(tx, "bulk-auto", daysBefore(1), NOW));
     const payload: RoutingPayload = {
       projectId: "bulk-auto", taskId: "bulk", area: "host", featureMap: "default", coordinatorProfileId: null, knobs: ROUTING_DEFAULTS,

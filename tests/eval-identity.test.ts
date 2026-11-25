@@ -15,7 +15,6 @@ import { teamCommand } from "../packages/host/src/team-workspace.js";
 const FIXTURE = fileURLToPath(new URL("./fixtures/eval-command.mjs", import.meta.url));
 const TRIAL = "22222222-3333-4444-8555-666666666666";
 const UID = process.getuid?.() ?? 0;
-// The fixture runs as this user, so root could read every canary; the probe's root rules need a non-root user too.
 const SKIP = UID === 0 ? "the canary and ownership checks need a non-root user" : false;
 const sandboxes: string[] = [];
 
@@ -38,7 +37,6 @@ test.after(() => {
   }
 });
 
-/** The fixture as the member's launcher prefix, with the fixture's flags before the operation. */
 function member(sb: Sandbox, extra: string[] = []): EvalMemberConfig {
   return {
     prefix: {
@@ -50,7 +48,6 @@ function member(sb: Sandbox, extra: string[] = []): EvalMemberConfig {
   };
 }
 
-/** The host runs as another uid by default, so the fixture's account is not the host's. */
 function identityFor(sb: Sandbox, extra: string[] = [], hostUid = UID + 1): EvalIdentity {
   return launcherEvalIdentity(() => member(sb, extra), { hostUid, graceMs: 30_000 });
 }
@@ -69,14 +66,11 @@ test("the eval probe names every unsafe state", { skip: SKIP }, async () => {
   const failing = join(sb.base, "fail.mjs");
   writeFileSync(failing, "process.exit(1);\n");
 
-  // No eval.member: not-configured.
   assert.equal((await launcherEvalIdentity(() => undefined).probe({ canaries: [] })).state, "not-configured");
 
-  // A launcher that exits 1: unavailable.
   const failingIdentity = launcherEvalIdentity(() => ({ ...member(sb), prefix: { command: process.execPath, args: [failing] } }), { hostUid: UID + 1 });
   assert.equal((await failingIdentity.probe({ canaries: [] })).state, "unavailable");
 
-  // Misconfigured: a root mode other than 711, a writable ancestor, the host's uid, and the grader's uid.
   chmodSync(sb.root, 0o700);
   assert.equal((await identityFor(sb).probe({ canaries: [] })).state, "misconfigured");
   chmodSync(sb.root, 0o711);
@@ -84,14 +78,11 @@ test("the eval probe names every unsafe state", { skip: SKIP }, async () => {
   assert.equal((await identityFor(sb, [], UID).probe({ canaries: [] })).state, "misconfigured");
   assert.equal((await identityFor(sb).probe({ canaries: [], graderUid: UID })).state, "misconfigured");
 
-  // Exposed: a canary the account can read. A canary with mode 0000 is not readable, so it passes.
   assert.equal((await identityFor(sb).probe({ canaries: [exposed] })).state, "exposed");
   assert.equal((await identityFor(sb).probe({ canaries: [sealed] })).state, "ready");
 
-  // Network open: the metadata endpoint answers.
   assert.equal((await identityFor(sb, ["--metadata", "open"]).probe({ canaries: [] })).state, "network-open");
 
-  // Busy: an entry in trials, a planted file in the home, a file in the temporary directory, or an entry of the root other than trials.
   mkdirSync(join(sb.root, "trials", TRIAL), { recursive: true });
   assert.equal((await identityFor(sb).probe({ canaries: [] })).state, "busy");
   rmSync(join(sb.root, "trials"), { recursive: true, force: true });
@@ -105,7 +96,6 @@ test("the eval probe names every unsafe state", { skip: SKIP }, async () => {
   assert.equal((await identityFor(sb).probe({ canaries: [] })).state, "busy");
   rmSync(join(sb.root, "other"), { recursive: true });
 
-  // Ready, with fetch skipped; with a fetch the probe reports open, and the proxy URL is never in the record.
   const ready = await identityFor(sb).probe({ canaries: [sealed] });
   assert.equal(ready.state, "ready");
   assert.equal(ready.fetch, "skipped");
@@ -124,11 +114,9 @@ test("a surviving eval process blocks trials", { skip: SKIP }, async () => {
   const identity = identityFor(sb);
   const row: RuntimeProcess = { pid: 4242, parent: 1, group: 4242, ruid: UID, euid: UID, born: "2026-11-18T00:00:00Z", state: "S" };
 
-  // The process survives all three rounds: alive, after three stops.
   assert.equal(await stopEvalIdentity(identity, UID, async () => [row]), "alive");
   assert.equal(records(sb).filter(entry => entry.argv[0] === "stop").length, 3);
 
-  // The process is gone after the second inventory: stopped.
   let calls = 0;
   assert.equal(await stopEvalIdentity(identity, UID, async () => (++calls < 2 ? [row] : [])), "stopped");
 });
@@ -157,8 +145,6 @@ test("replay commands run only through exec and setup", { skip: SKIP }, async ()
   assert.equal(third.cwd, realpathSync(outside));
 });
 
-// A scripted launcher: the config file names its exit code, its stdout, and an optional delay for one operation.
-// It records each call's argv and, for receive and a probe with --fetch, stdin.
 type Script = { exit?: number; out?: string; delayOp?: string; delayMs?: number };
 const SCRIPT = `import fs from "node:fs";
 const [cfgPath, op, ...rest] = process.argv.slice(2);
@@ -196,20 +182,17 @@ test("the eval probe judges the launcher's answer", async () => {
   const t = scripted({});
   const check = async (script: Script, canaries: string[] = []) => { rewrite(t.sb, script); return t.identity.probe({ canaries }); };
 
-  // A valid answer is ready, with storage only when both free-space floors hold.
   const ready = await check(t.probe());
   assert.equal(ready.state, "ready");
   assert.equal(ready.storage, true);
   assert.equal((await check(t.probe({ freeBytes: 1 }))).storage, false);
   assert.equal((await check(t.probe({ freeInodes: 1 }))).storage, false);
 
-  // Each identity rule alone makes the answer misconfigured: uid 0, another root, a root not owned by the account, a missing tool.
   assert.equal((await check(t.probe({ uid: 0, rootOwner: 0 }))).state, "misconfigured");
   assert.equal((await check(t.probe({ root: `${t.sb.root}-other` }))).state, "misconfigured");
   assert.equal((await check(t.probe({ rootOwner: 4243 }))).state, "misconfigured");
   assert.equal((await check(t.probe({ tools: false }))).state, "misconfigured");
 
-  // Exit 64 is the launcher's refusal; any other non-zero exit, a truncated answer, and garbage are unavailable.
   assert.equal((await check({ ...t.probe(), exit: 64 })).state, "misconfigured");
   assert.equal((await check({ ...t.probe(), exit: 2 })).state, "unavailable");
   assert.equal((await check({ out: "x".repeat(5_000) })).state, "unavailable");
@@ -246,7 +229,6 @@ test("receive, prepare, and check map the launcher's exit codes and refuse bad i
   assert.equal(await t.identity.check(TRIAL, [hash]), "clean");
   assert.equal(await t.identity.prepare(TRIAL), "ready");
 
-  // Refused without a launcher call: a trial that is not a UUID, and more than 200 objects.
   const before = t.calls().length;
   assert.equal(await t.identity.receive("not-a-trial", input(), 100), "failed");
   assert.equal(await t.identity.receive(TRIAL, input(), 0), "failed");
@@ -283,7 +265,6 @@ test("a zombie of the eval account does not keep it alive", async () => {
   assert.equal(await stopEvalIdentity(t.identity, 4242, async () => [row("Z", 4242)]), "stopped");
   assert.equal(await stopEvalIdentity(t.identity, 4242, async () => [row("S", 4243)]), "stopped");
   assert.equal(t.calls().filter(entry => entry.argv[0] === "stop").length, 2);
-  // A launcher that fails stops at once, and an inventory that throws is a failure.
   assert.equal(await stopEvalIdentity(t.identity, 4242, async () => { throw new Error("no ps"); }), "failed");
   rewrite(t.sb, { exit: 1 });
   assert.equal(await stopEvalIdentity(t.identity, 4242, async () => []), "failed");

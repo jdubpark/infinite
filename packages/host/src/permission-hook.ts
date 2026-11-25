@@ -1,22 +1,15 @@
-// The headless permission channel's hook command. Unlike the signal relay (hook-relay.ts), its stdout is a provider
-// decision, so it prints only what the session's own worker answered on the channel routes, and a deny when the
-// worker cannot answer in time. It runs inside the agent's account with the session's hook token, which reaches
-// that session's worker and no other.
 import { request as httpRequest } from "node:http";
 import { requesterNotice } from "./permission-policy.js";
 
 export type ChannelRoute = "check" | "request";
-/** The worker's answer on a channel route. `none` leaves the call to the provider's own rules. */
 export interface ChannelAnswer { decision: "defer" | "allow" | "deny" | "none"; reason?: string }
 
 const MAX_BODY = 256 * 1024;
-/** Below the hook timeouts in launch.ts, so the relay's deny always lands before the provider gives up on it. */
 export const RELAY_DEADLINE_MS: Record<ChannelRoute, number> = { check: 15_000, request: 345_000 };
 const UNAVAILABLE = requesterNotice("unavailable");
 
 const clean = (text: unknown) => String(text ?? "").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, " ").slice(0, 2000);
 
-/** The provider hook output for an answer. An empty string prints nothing. */
 export function hookOutput(route: ChannelRoute, answer: ChannelAnswer): string {
   if (route === "check") {
     if (answer.decision === "none") return "";
@@ -26,12 +19,10 @@ export function hookOutput(route: ChannelRoute, answer: ChannelAnswer): string {
     } });
   }
   if (answer.decision === "none") return "";
-  // A PermissionRequest hook cannot defer; anything but an allow is a deny.
   const behavior = answer.decision === "allow" ? { behavior: "allow" } : { behavior: "deny", message: clean(answer.reason || UNAVAILABLE) };
   return JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: behavior } });
 }
 
-/** One POST to the worker's loopback hook server. Node's fetch gives up on response headers after five minutes. */
 export type ChannelPost = (url: string, token: string, body: string, timeoutMs: number) => Promise<{ status: number; text: string }>;
 
 const post: ChannelPost = (url, token, body, timeoutMs) => new Promise((resolve, reject) => {
@@ -50,7 +41,6 @@ const post: ChannelPost = (url, token, body, timeoutMs) => new Promise((resolve,
   request.end(body);
 });
 
-/** Asks the worker. Every failure is a deny with the host's fixed notice. */
 export async function ask(route: ChannelRoute, body: string, options: { url: string; token: string; post?: ChannelPost }): Promise<ChannelAnswer> {
   const denied: ChannelAnswer = { decision: "deny", reason: UNAVAILABLE };
   try {

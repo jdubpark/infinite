@@ -6,7 +6,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startHost } from "./helpers.js";
 
-/** A small fake Responses API that records requests and can return model failures. */
 async function fakeModel() {
   const requests: { auth: string; body: any }[] = [];
   let status = 200;

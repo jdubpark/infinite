@@ -5,7 +5,6 @@ import { RECORD_DIGEST_BYTES, RECORD_REGISTER_BYTES, recordDigestBytes, recordDi
 
 const checks = [{ command: "node", args: ["check.js"] }];
 
-/** The digest below on the base commit, captured before the register existed. */
 const BASE_JSON = '{"version":2,"criteria":[{"id":"c0","statement":"","check":"judgement:owner-text","producer":"evaluator"},{"id":"c1","statement":"Tests pass.","check":"command:npm test","producer":"host"}]}';
 const BASE_BYTES = 190;
 const baseDigest = { version: 2, criteria: [
@@ -14,17 +13,14 @@ const baseDigest = { version: 2, criteria: [
 ] };
 
 const entry = (id: string, statement = `Statement ${id}.`) => ({ id, statement, check: "judgement:owner-text", producer: "owner" as const });
-/** Criteria whose bytes sum to exactly RECORD_DIGEST_BYTES, as in tests/objective-digest.test.ts. */
 const padded = (pad: number) => ({ version: 2, criteria: [entry("c0", ""), ...Array.from({ length: 5 }, (_, index) => entry(`c${index + 1}`, "x".repeat(1000))), entry("c6", "y".repeat(pad))] });
 
 test("the register setting stands alone and pins only plain runs", () => {
-  // Parsing: the key takes "on" or "off", and nothing else.
   assert.ok(teamProjectSchema.safeParse({ checks, objective: { register: "on" } }).success, "register on parses");
   assert.ok(teamProjectSchema.safeParse({ checks, objective: { register: "off", intentCheck: "off" } }).success, "register off with the intent check parses");
   assert.equal(teamProjectSchema.safeParse({ checks, objective: { register: "maybe" } }).success, false, "any other value is refused");
   assert.equal(teamProjectSchema.safeParse({ checks, objective: { registers: "on" } }).success, false, "an unknown key is refused");
 
-  // The pin: only a plain run of a project whose setting is "on".
   const plain = { mission: false, handoff: false };
   assert.equal(registerPin({ setting: "on", ...plain }), true, "a plain run of an on project pins the register");
   assert.equal(registerPin({ ...plain }), false, "an absent setting does not pin");
@@ -32,7 +28,6 @@ test("the register setting stands alone and pins only plain runs", () => {
   assert.equal(registerPin({ setting: "on", mission: true, handoff: false }), false, "a mission subteam does not pin");
   assert.equal(registerPin({ setting: "on", mission: false, handoff: true }), false, "a handoff run does not pin");
 
-  // The digest: its own 6,144-byte budget, which ten 500-byte assumptions fit and eleven do not.
   const assumption = (n: number, statement: string) => ({ id: `a${n}`, status: "unchecked", criticality: "plan", statement });
   const ten = { assumptions: Array.from({ length: 10 }, (_, index) => assumption(index + 1, "x".repeat(500))), questions: [] };
   const eleven = { assumptions: Array.from({ length: 11 }, (_, index) => assumption(index + 1, "x".repeat(500))), questions: [] };
@@ -47,7 +42,6 @@ test("the register setting stands alone and pins only plain runs", () => {
 });
 
 test("a register digest fits beside a full criteria digest, and an absent one changes nothing", () => {
-  // Six KiB of criteria, sized as in tests/objective-digest.test.ts, plus a maximal register.
   let atCap = 0;
   for (let pad = 1; pad <= 1000 && !atCap; pad += 1) if (Buffer.byteLength(JSON.stringify(padded(pad))) === RECORD_DIGEST_BYTES) atCap = pad;
   assert.ok(atCap > 0, "a criteria digest of exactly 6,144 bytes exists");
@@ -58,7 +52,6 @@ test("a register digest fits beside a full criteria digest, and an absent one ch
   assert.ok(registerDigestBytes(register as never) <= RECORD_REGISTER_BYTES, "the maximal register is within its budget");
   assert.ok(recordDigestSchema.safeParse({ ...padded(atCap), register }).success, "a full criteria digest with a maximal register parses");
 
-  // A digest without a register keeps today's bytes, and so does a digest with one, because the register is not counted.
   assert.equal(JSON.stringify(baseDigest), BASE_JSON, "a digest without a register is byte for byte the base digest");
   assert.equal(recordDigestBytes(baseDigest), BASE_BYTES, "its byte count is the base count");
   assert.equal(recordDigestBytes({ ...baseDigest, register: { assumptions: [], questions: [] } } as never), BASE_BYTES, "a register does not count against the criteria budget");

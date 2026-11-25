@@ -12,7 +12,6 @@ import { accountColors, accountName, usd, type Money } from "./model";
 import { DayCaption, KindChips, Legend, MoneyText } from "./parts";
 import { useDaily, useProject } from "./useCost";
 
-/** One project's accrued cost, its last thirty days, and the goals, runs, sessions, and briefings behind it. */
 export function ProjectCost({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter(), machine = connectionKey(connection);
   const project = useProject(connection, id), daily = useDaily(connection, id);
@@ -27,7 +26,6 @@ export function ProjectCost({ connection, id }: { connection: Connection; id: st
   const cost = project.data;
   const open = (pathname: "/goal/[id]" | "/team/[id]" | "/session/[id]", target: string) => router.push({ pathname, params: { id: target, machine } });
   const briefings = cost.briefings.runs > 0 || cost.briefings.unmeasured > 0;
-  // Older hosts report only the briefings' unmeasured count.
   const unmeasured = cost.unmeasured ?? cost.briefings.unmeasured;
   return <View style={s.fill}>
     {top}

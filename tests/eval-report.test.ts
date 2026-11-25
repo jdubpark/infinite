@@ -2,9 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { REPORT_MAX_BYTES, caseRef, parseReport, type ParsedReport } from "../packages/host/src/eval-report.js";
 
-// Reporter outputs for one fixture file, captured on Node 22 with `node --test --test-reporter=junit` and
-// `--test-reporter=tap`: a passing test, a failing one, and a skipped one, inside a nested `describe`. The host
-// name and the temporary directory are replaced by placeholders; nothing else is edited.
 const JUNIT_OUT = `<?xml version="1.0" encoding="utf-8"?>
 <testsuites>
 	<testsuite name="outer" time="0.001230" disabled="0" errors="0" tests="3" failures="1" skipped="1" hostname="host">
@@ -131,7 +128,6 @@ test("node's two reporters parse to the same statuses", () => {
   assert.equal(tap.state, "parsed");
   if (junit.state !== "parsed" || tap.state !== "parsed") return;
 
-  // Keys stay per format: a JUnit key keeps the classname, and a TAP key has none.
   assert.deepEqual(
     new Map(junit.cases),
     new Map([
@@ -148,7 +144,6 @@ test("node's two reporters parse to the same statuses", () => {
       [keyOf("outer", "is skipped"), "skipped"],
     ]),
   );
-  // Each TAP key is its JUnit key without the classname part.
   assert.deepEqual(
     [...tap.cases.keys()].sort(),
     [caseRef("outer\0passes"), caseRef("outer\0fails"), caseRef("outer\0is skipped")].sort(),

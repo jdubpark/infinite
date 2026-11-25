@@ -14,13 +14,11 @@ const GOAL_ID = "6f1c2a3e-8b4d-4c5e-9f60-718293a4b5c6";
 const AT = "2026-11-15T10:00:00.000Z";
 const judgement = { kind: "judgement", item: "owner-text" } as const;
 const test1 = { command: "npm", args: ["test"] } as TeamCommand;
-/** A criterion whose producer fits its check: a judgement is the evaluator's, as objectiveRecordSchema requires. */
 const criterion = (id: string, overrides: Record<string, unknown> = {}): Criterion => ({
   id, origin: "owner", statement: `Statement ${id}.`, check: judgement, producer: "evaluator", threshold: { kind: "pass" }, state: "active", ...overrides,
 }) as Criterion;
 const projectWith = (objective: unknown) => ({ team: { checks: [], establishChecks: true, objective } }) as unknown as Pick<Project, "team">;
 
-/** The record the host writes for a goal, with criteria appended and c0 moved last, so the digest must put c0 first. */
 function hostRecord(): ObjectiveRecord {
   const goal = {
     id: GOAL_ID, objective: "Find ranked sources for the research brief.", successCriteria: "A ranked shortlist with reasons and sources",
@@ -52,7 +50,6 @@ test("the digest lists active criteria with c0 first and empty", () => {
   assert.equal(recordDigestBytes(digest), Buffer.byteLength(JSON.stringify(digest)));
 });
 
-/** The digest of hostRecord() on the base commit, captured before Task 6 changed objective-digest.ts. */
 const BASE_DIGEST_JSON = '{"version":1,"criteria":[{"id":"c0","statement":"","check":"judgement:owner-text","producer":"evaluator"},{"id":"c1","statement":"Tests pass.","check":"command:npm test","producer":"host"},{"id":"c2","statement":"The summary is clear.","check":"judgement:owner-text","producer":"evaluator"}]}';
 
 test("the digest marks derived criteria and nothing else", () => {
@@ -120,7 +117,6 @@ test("the digest schema refuses what the rule refuses", () => {
   assert.ok(!recordDigestSchema.safeParse({ version: 2, criteria: [entry("c0", ""), entry("c1", "x".repeat(1001))] }).success, "a 1,001-byte statement fails");
   assert.ok(!recordDigestSchema.safeParse({ version: 2, criteria: [entry("c0", ""), entry("c1", "")] }).success, "an empty statement fails");
 
-  // Six 1,000-byte statements and one more, sized so the digest is exactly the cap, then one byte over.
   const padded = (pad: number) => ({ version: 2, criteria: [entry("c0", ""), ...Array.from({ length: 5 }, (_, index) => entry(`c${index + 1}`, "x".repeat(1000))), entry("c6", "y".repeat(pad))] });
   let atCap = 0;
   for (let pad = 1; pad <= 1000 && !atCap; pad += 1) if (Buffer.byteLength(JSON.stringify(padded(pad))) === RECORD_DIGEST_BYTES) atCap = pad;
@@ -139,7 +135,6 @@ test("the switch reads only on", () => {
   assert.equal(objectivePromptsOn(projectWith({ prompts: "on" })), true, "on is on");
 });
 
-/** A record with the given assumptions and questions, on the host record's other fields. */
 const registerRecord = (assumptions: Assumption[], questions: Question[]): ObjectiveRecord => ({ ...hostRecord(), assumptions, questions });
 const assumption = (id: string, origin: Assumption["origin"], status: Assumption["status"], criticality: Assumption["criticality"], statement: string): Assumption =>
   ({ id, statement, status, origin, criticality, refutedBy: "The owner refutes it.", test: { kind: "owner" }, evidence: [], proposals: [] });
@@ -150,7 +145,6 @@ test("the register digest has its own budget and no member text", () => {
   const criticalities = ["outcome", "plan", "detail"] as const;
   const assumptions = Array.from({ length: 32 }, (_, index): Assumption => {
     const n = index + 1;
-    // Every fifth is a member's, so the non-member assumptions still cover every status.
     const member = n % 5 === 0;
     return assumption(`a${n}`, member ? "member" : n % 2 === 0 ? "owner" : "intent-check", statuses[n % 4]!, criticalities[n % 3]!, member ? `MEMBER-TEXT a${n}` : `Assumption a${n} ${"x".repeat(300)}`);
   });
@@ -176,7 +170,6 @@ test("the register digest has its own budget and no member text", () => {
   assert.deepEqual(small, { assumptions: [{ id: "a1", status: "verified", criticality: "detail", statement: "Small." }], questions: [{ id: "q1", text: "Why?" }] }, "a small record keeps everything with no omitted count");
   assert.deepEqual(registerDigestFor(registerRecord([], [])), { assumptions: [], questions: [] }, "an empty record gives an empty register with no omitted count");
 
-  // The cut stops the list: a12 does not fit, so the later and smaller a13, and q1, stay out though either would fit.
   const filler = Array.from({ length: 11 }, (_, index) => assumption(`a${index + 1}`, "owner", "refuted", "outcome", "z".repeat(470)));
   const cut = registerDigestFor(registerRecord(
     [...filler, assumption("a12", "owner", "refuted", "outcome", "z".repeat(470)), assumption("a13", "owner", "unchecked", "outcome", "Small.")],

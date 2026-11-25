@@ -16,7 +16,6 @@ const limits = { minAvailableMemoryGiB: 8, maxLoadPerCpu: 1.5 };
 const healthy: HostReading = { availableMemoryBytes: 32 * GiB, load1: 1, cpus: 16 };
 const starved: HostReading = { availableMemoryBytes: 5.2 * GiB, load1: 1, cpus: 16 };
 
-/** A probe whose reading the test changes; the gate reads it through the same closure. */
 const flippable = (initial: HostReading) => {
   let reading = initial;
   const probe: HostLoadProbe = () => reading;
@@ -85,7 +84,6 @@ test("a held check run does not start until the host recovers", { timeout: 12000
   teams.start();
   try {
     const created = await teams.create(f.create());
-    // Keep both implementers behind a barrier until the real gate has refreshed its cached healthy reading.
     await waitFor(async () => teams.get(created.id), run => run.members.filter(member => member.role === "implementer"
       && member.startedAt && existsSync(join(f.receipts, `${member.memberId}.check-held`))).length === 2, 90000);
     host.set(starved);
@@ -131,9 +129,7 @@ test("a held launch stops no running session", { timeout: 90000 }, async () => {
     await waitFor(async () => teams.get(first.id), run => run.members.some(member => Boolean(member.startedAt)), 30000);
     await waitFor(() => running("project-manager: Original run"), count => count === 1, 20000);
     host.set(starved);
-    // The gate reuses its last reading for 2 s; wait past that TTL so the next launch reads the starved host.
     await new Promise(done => setTimeout(done, 2500));
-    // A second automatic launch through the same service: its hold must be visible before the original session is checked.
     const second = await teams.create({ requestId: randomUUID(), projectId: "web", provider: "claude", useConfiguredLineup: true,
       title: "Held second run", objective: "Make an independent repository change", parallelism: 1 });
     await waitFor(async () => teams.get(second.id), run => Boolean(run.reason?.startsWith(HOST_LOAD_REASON_PREFIX)), 20000);

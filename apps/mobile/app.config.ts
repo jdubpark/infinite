@@ -8,7 +8,6 @@ export default ({ config }: ConfigContext) => {
   const localFile = join(__dirname, ".local", "eas.json");
   const projectId = process.env.INFINITE_EAS_PROJECT_ID?.trim() ||
     (existsSync(localFile) ? JSON.parse(readFileSync(localFile, "utf8")).projectId : undefined);
-  // Android push needs Firebase. Cloud builds get the file from the EAS file variable; local builds read the ignored copy.
   const localFirebase = join(__dirname, ".local", "google-services.json");
   const googleServicesFile = process.env.GOOGLE_SERVICES_JSON?.trim() || (existsSync(localFirebase) ? localFirebase : undefined);
   const base = googleServicesFile ? { ...config, android: { ...config.android, googleServicesFile } } : config;

@@ -111,8 +111,6 @@ test("deferred hydration rechecks canonical grants and lineage before exposing r
     const [result] = await adapter.searchLexical({ partition, query: current.content, mode: "exact", limit: 1 });
     const hydration = adapter.hydrateCandidate(result!.candidate);
     await started;
-    // The canonical store owns grant and lineage checks; the adapter must invoke
-    // its opaque proof after the suspended read, even when epochs are unchanged.
     release({ record: current, recheckCurrent() { throw new Error(reason); } });
     await assert.rejects(hydration, error => error instanceof Error && error.message === reason);
   }
@@ -165,7 +163,6 @@ test("same-count wrong-source rebuild cannot seal or activate, including after r
   await beginRebuild(ledger, [expected]);
   await writeBatch(ledger, "cursor-1", [substituted]);
   await assert.rejects(ledger.sealRebuild({ partition, expectedSourceManifestDigest: projectionManifestDigest([expected]) }), /manifest changed/);
-  // Changing the seal declaration to the stored wrong source cannot rewrite the admitted manifest.
   await assert.rejects(ledger.sealRebuild({ partition, expectedSourceManifestDigest: projectionManifestDigest([substituted]) }), /manifest changed/);
   ledger.close();
   ledger = openLedger(path, () => partition);
@@ -185,7 +182,6 @@ test("divergent rebuild handles roll back all mappings and cursor effects; exact
   await writeBatch(ledger, "cursor-1", [first]);
   await writeBatch(ledger, "overlap", [first]);
   await assert.rejects(writeBatch(ledger, "cursor-2", [unexpected, { ...first, sourceRevision: "changed-version" }]), /handle reused/);
-  // Reusing cursor-2 with its valid payload proves the rejected batch did not consume it.
   await writeBatch(ledger, "cursor-2", [second]);
   await ledger.sealRebuild({ partition, expectedSourceManifestDigest: projectionManifestDigest([first, second]) });
   await assert.rejects(ledger.recordIndexEvent(unexpected, { eventId: unexpected.eventId, payloadHash: unexpected.payloadHash,

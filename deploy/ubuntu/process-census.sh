@@ -1,6 +1,4 @@
 #!/bin/sh
-# The process census: the host asks the agent account whether processes still use a run directory. It is
-# read-only and takes no arguments. The directory arrives on standard input, one absolute path and a newline.
 set -eu
 umask 077
 ulimit -c 0

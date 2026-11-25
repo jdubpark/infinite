@@ -1,7 +1,3 @@
-// Scripted stand-in for Codex, used by tests/codex-notify-link.test.ts. It writes one rollout under
-// $HOME/.codex/sessions, then runs its turn-end `notify` program once, as Codex does at a turn end.
-// The `notify=` argument carries the program as a TOML array of quoted strings, which JSON.parse reads.
-// With the `later-turn` argument a second turn starts after the notice and the stand-in exits inside it.
 import { spawnSync } from "node:child_process";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -33,7 +29,6 @@ console.log("stand-in turn started");
 const payload = { type: "agent-turn-complete", "thread-id": THREAD, "turn-id": "turn-1", cwd: process.cwd(), "input-messages": ["go"], "last-assistant-message": "done" };
 spawnSync(notify[0], [...notify.slice(1), JSON.stringify(payload)], { stdio: "ignore" });
 console.log("stand-in turn complete");
-// A second turn starts after the notice and is cut before it writes its context row, as an early stop does.
 if (process.argv.includes("later-turn")) {
   const later = { timestamp: "2026-11-18T09:00:05.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "turn-2" } };
   appendFileSync(rollout, JSON.stringify(later) + "\n");

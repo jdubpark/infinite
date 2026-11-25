@@ -13,12 +13,10 @@ export type JudgePackageFiles = { "A.patch": Buffer; "B.patch": Buffer; "task.js
 export const JUDGE_PACKAGE_MAX_BYTES = 3 * 1024 * 1024;
 const PACKAGE_NAMES = ["A.patch", "B.patch", "task.json", "gate.json"] as const;
 
-/** The label draw: the low bit of the first byte of sha256(seed). 0 puts the resolved trial in A for ordering 0. */
 export function labelDraw(seed: string): 0 | 1 {
   return (createHash("sha256").update(seed).digest()[0]! & 1) as 0 | 1;
 }
 
-/** The task as the judge sees it: no task ID, no brief fields beyond the acceptance criteria. */
 export function judgeTaskOf(capsule: Capsule): JudgeTask {
   return {
     title: capsule.task.title,
@@ -28,7 +26,6 @@ export function judgeTaskOf(capsule: Capsule): JudgeTask {
   };
 }
 
-/** Four files, neutral labels only. Returns undefined when the package is over the size limit. */
 export function judgePackage(input: { a: JudgeSide; b: JudgeSide; task: JudgeTask }): JudgePackageFiles | undefined {
   const task = JSON.stringify({
     title: input.task.title,
@@ -99,7 +96,6 @@ function invalidWorkspace(message: string) {
   return new TeamError(409, "invalid-workspace", message);
 }
 
-/** Store the package under the workspace's Git metadata directory, never in the working tree. */
 export async function writeJudgePackage(cwd: string, files: JudgePackageFiles, prefix: TeamCommand | undefined, signal?: AbortSignal): Promise<void> {
   let info: ReturnType<typeof lstatSync>;
   let canonical: string;

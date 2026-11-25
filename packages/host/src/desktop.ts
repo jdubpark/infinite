@@ -3,7 +3,7 @@ import { chmod, copyFile, link, lstat, mkdir, open, opendir, readFile, realpath,
 import type { FileHandle } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { cpus, freemem, loadavg, platform, totalmem, uptime } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { Config } from "./types.js";
@@ -23,7 +23,6 @@ interface Upload {
   file: string; offset: number; expiresAt: number; result?: { path: string; sha256: string; totalBytes: number };
 }
 
-/** File operations stay inside explicitly configured roots. Local agents remain trusted filesystem peers. */
 export class DesktopFiles {
   private uploads = new Map<string, Upload>();
   private queues = new Map<string, Promise<unknown>>();
@@ -33,7 +32,6 @@ export class DesktopFiles {
   private timer: ReturnType<typeof setInterval>;
   constructor(private config: Config) {
     this.staging = join(config.stateDir, "desktop-uploads");
-    // Upload handles are connection-independent but intentionally do not survive an API restart.
     this.ready = mkdir(this.staging, { recursive: true, mode: 0o700 }).then(async () => {
       for await (const entry of await opendir(this.staging))
         if (/^[a-f0-9-]{36}\.part$/.test(entry.name)) await rm(join(this.staging, entry.name), { force: true });
@@ -47,9 +45,13 @@ export class DesktopFiles {
     try { return await next; } finally { if (this.queues.get(key) === next) this.queues.delete(key); }
   }
   private async expire() {
-    for (const upload of this.uploads.values()) if (upload.expiresAt <= Date.now() && !this.queues.has(upload.id)) {
-      this.uploads.delete(upload.id); await rm(upload.file, { force: true });
+    const now = Date.now();
+    const expired: Upload[] = [];
+    for (const upload of this.uploads.values()) {
+      if (upload.expiresAt <= now && !this.queues.has(upload.id)) expired.push(upload);
     }
+    for (const upload of expired) this.uploads.delete(upload.id);
+    if (expired.length) await Promise.allSettled(expired.map(upload => rm(upload.file, { force: true })));
   }
   private async location(projectId: string, path: string, missing = false) {
     const project = this.config.projects.find(p => p.id === projectId);
@@ -58,7 +60,6 @@ export class DesktopFiles {
       throw new DesktopError("invalid-path", "Choose a relative path inside this project", 400);
     const root = await realpath(project.path), file = resolve(root, path || ".");
     if (!inside(root, file)) throw new DesktopError("invalid-path", "Path is outside this project", 403);
-    // Protect host control state even if a project was accidentally configured as its ancestor.
     for (const privatePath of [this.config.stateDir, this.config.runDir, this.config.keyFile]) {
       const protectedPath = await realpath(privatePath).catch(() => resolve(privatePath));
       if (inside(protectedPath, file)) throw new DesktopError("private-path", "Host control files are unavailable", 403);
@@ -144,7 +145,6 @@ export class DesktopFiles {
     await this.location(project, body.path, true);
     if (!body.path || !basename(body.path)) throw new DesktopError("invalid-path", "Choose a file path", 400);
     if ([...this.uploads.values()].filter(upload => !upload.result).length >= DESKTOP_LIMITS.uploads) throw new DesktopError("uploads-busy", "Finish or cancel an existing upload first", 429);
-    // Keep recent commit receipts without letting a long-running client grow the map indefinitely.
     while (this.uploads.size >= 128) {
       const oldest = [...this.uploads.values()].find(upload => upload.result);
       if (!oldest) break;
@@ -189,73 +189,73 @@ export class DesktopFiles {
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
   }
   commit(project: string, device: string, id: string) {
-    return this.serial(id, () => this.serial(`project:${project}`, async () => {
-      const upload = this.upload(project, device, id);
-      if (upload.result) return upload.result;
-      if (upload.offset !== upload.size) throw new DesktopError("upload-incomplete", "Upload all file chunks before committing", 409);
-      const digest = createHash("sha256"), staged = await open(upload.file, "r");
-      try { for await (const bytes of staged.createReadStream({ autoClose: false })) digest.update(bytes); } finally { await staged.close(); }
-      if (digest.digest("hex") !== upload.sha256) throw new DesktopError("hash-mismatch", "Uploaded content does not match its declared hash", 409);
-      if (await this.currentHash(project, upload.path) !== upload.expectedHash) throw conflict();
-      const location = await this.location(project, upload.path, true);
-      const parent = await lstat(dirname(location.file));
-      const temporary = join(dirname(location.file), `.infinite-desktop-${randomUUID()}`);
-      try {
-        await copyFile(upload.file, temporary, constants.COPYFILE_EXCL);
-        const sharedGroup = this.config.sync?.sharedGroup || Boolean(parent.mode & 0o2000);
-        const previousMode = upload.expectedHash ? (await lstat(location.file)).mode & 0o777 : 0o600;
-        const mode = sharedGroup ? (previousMode & 0o700) | 0o060 | ((previousMode & 0o100) ? 0o010 : 0) : previousMode;
-        const handle = await open(temporary, constants.O_RDONLY | constants.O_NOFOLLOW);
+    return this.serial(id, async () => {
+      const target = this.upload(project, device, id);
+      return this.serial(`project:${project}:${posix.normalize(target.path)}`, async () => {
+        const upload = this.upload(project, device, id);
+        if (upload.result) return upload.result;
+        if (upload.offset !== upload.size) throw new DesktopError("upload-incomplete", "Upload all file chunks before committing", 409);
+        const digest = createHash("sha256"), staged = await open(upload.file, "r");
+        try { for await (const bytes of staged.createReadStream({ autoClose: false })) digest.update(bytes); } finally { await staged.close(); }
+        if (digest.digest("hex") !== upload.sha256) throw new DesktopError("hash-mismatch", "Uploaded content does not match its declared hash", 409);
+        if (await this.currentHash(project, upload.path) !== upload.expectedHash) throw conflict();
+        const location = await this.location(project, upload.path, true);
+        const parent = await lstat(dirname(location.file));
+        const temporary = join(dirname(location.file), `.infinite-desktop-${randomUUID()}`);
         try {
-          // copyFile can copy the staging inode's group. The published inode is
-          // host-owned, so shared projects need the destination group and access.
-          if (sharedGroup) await handle.chown(-1, parent.gid);
-          await handle.chmod(mode); await handle.sync();
-        } finally { await handle.close(); }
-        await this.location(project, upload.path, true);
-        const currentParent = await lstat(dirname(location.file));
-        if (parent.dev !== currentParent.dev || parent.ino !== currentParent.ino || await this.currentHash(project, upload.path) !== upload.expectedHash) throw conflict();
-        if (upload.expectedHash === null) {
-          try { await link(temporary, location.file); } catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") throw conflict(); throw error; }
-          await unlink(temporary);
-        } else await rename(temporary, location.file);
-        const directory = await open(dirname(location.file), constants.O_RDONLY | constants.O_DIRECTORY); try { await directory.sync(); } finally { await directory.close(); }
-        upload.result = { path: upload.path, sha256: upload.sha256, totalBytes: upload.size };
-        await rm(upload.file, { force: true });
-        return upload.result;
-      } finally { await rm(temporary, { force: true }); }
-    }));
+          await copyFile(upload.file, temporary, constants.COPYFILE_EXCL);
+          const sharedGroup = this.config.sync?.sharedGroup || Boolean(parent.mode & 0o2000);
+          const previousMode = upload.expectedHash ? (await lstat(location.file)).mode & 0o777 : 0o600;
+          const mode = sharedGroup ? (previousMode & 0o700) | 0o060 | ((previousMode & 0o100) ? 0o010 : 0) : previousMode;
+          const handle = await open(temporary, constants.O_RDONLY | constants.O_NOFOLLOW);
+          try {
+            if (sharedGroup) await handle.chown(-1, parent.gid);
+            await handle.chmod(mode); await handle.sync();
+          } finally { await handle.close(); }
+          await this.location(project, upload.path, true);
+          const currentParent = await lstat(dirname(location.file));
+          if (parent.dev !== currentParent.dev || parent.ino !== currentParent.ino || await this.currentHash(project, upload.path) !== upload.expectedHash) throw conflict();
+          if (upload.expectedHash === null) {
+            try { await link(temporary, location.file); } catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") throw conflict(); throw error; }
+            await unlink(temporary);
+          } else await rename(temporary, location.file);
+          const directory = await open(dirname(location.file), constants.O_RDONLY | constants.O_DIRECTORY); try { await directory.sync(); } finally { await directory.close(); }
+          upload.result = { path: upload.path, sha256: upload.sha256, totalBytes: upload.size };
+          await rm(upload.file, { force: true });
+          return upload.result;
+        } finally { await rm(temporary, { force: true }); }
+      });
+    });
   }
   abort(project: string, device: string, id: string) {
     return this.serial(id, async () => { const upload = this.upload(project, device, id); this.uploads.delete(id); await rm(upload.file, { force: true }); return { aborted: true }; });
   }
   remove(project: string, path: string, expectedHash: string) {
-    return this.serial(`project:${project}`, async () => {
+    return this.serial(`project:${project}:${posix.normalize(path)}`, async () => {
       if (await this.currentHash(project, path) !== expectedHash) throw conflict();
       const location = await this.location(project, path);
       await unlink(location.file); this.hashes.delete(location.file);
       return { deleted: true, path };
     });
   }
-  directory(project: string, path: string) {
-    return this.serial(`project:${project}`, async () => {
-      // Validate the full spelling before creating any ancestors.
-      if (isAbsolute(path) || path.length > 4096 || /[\x00-\x1f\x7f\\]/.test(path) || path.split("/").some(p => p === ".." || p === ".infinite" || p.startsWith(".infinite-desktop-")))
-        throw new DesktopError("invalid-path", "Choose a relative directory path inside this project", 400);
-      const parts = path.split("/").filter(p => p && p !== ".");
-      if (!parts.length) throw new DesktopError("invalid-path", "Choose a directory path", 400);
-      let prefix = "";
-      for (const part of parts) {
-        prefix = prefix ? `${prefix}/${part}` : part;
-        const location = await this.location(project, prefix, true);
-        const parent = await lstat(dirname(location.file)), sharedGroup = this.config.sync?.sharedGroup || Boolean(parent.mode & 0o2000);
-        try { await mkdir(location.file, { mode: sharedGroup ? 0o2770 : 0o700 }); if (sharedGroup) await chmod(location.file, 0o2770); }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-        await this.location(project, prefix);
-        if (!(await lstat(location.file)).isDirectory()) throw new DesktopError("not-directory", "A file already occupies this directory path", 409);
-      }
-      return { path: prefix, created: true };
-    });
+  async directory(project: string, path: string) {
+    if (isAbsolute(path) || path.length > 4096 || /[\x00-\x1f\x7f\\]/.test(path) || path.split("/").some(p => p === ".." || p === ".infinite" || p.startsWith(".infinite-desktop-")))
+      throw new DesktopError("invalid-path", "Choose a relative directory path inside this project", 400);
+    const parts = path.split("/").filter(p => p && p !== ".");
+    if (!parts.length) throw new DesktopError("invalid-path", "Choose a directory path", 400);
+    let prefix = "";
+    for (const part of parts) {
+      prefix = prefix ? `${prefix}/${part}` : part;
+      const location = await this.location(project, prefix, true);
+      const parent = await lstat(dirname(location.file)), sharedGroup = this.config.sync?.sharedGroup || Boolean(parent.mode & 0o2000);
+      let created = false;
+      try { await mkdir(location.file, { mode: sharedGroup ? 0o2770 : 0o700 }); created = true; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      await this.location(project, prefix);
+      if (!(await lstat(location.file)).isDirectory()) throw new DesktopError("not-directory", "A file already occupies this directory path", 409);
+      if (created && sharedGroup) await chmod(location.file, 0o2770);
+    }
+    return { path: prefix, created: true };
   }
 }
 
@@ -265,7 +265,6 @@ export type HostVolume = {
   label: "state" | "workspaces"; path: string; totalBytes: number | null; availableBytes: number | null;
   totalInodes: number | null; availableInodes: number | null; fullness: number | null; fullnessBy: "bytes" | "inodes" | null;
 };
-/** Sample only the explicitly configured host storage roots, sharing statfs logic with admission checks. */
 export async function sampleVolumes(config: Pick<Config, "stateDir" | "teams">): Promise<HostVolume[]> {
   const roots: { label: HostVolume["label"]; path: string }[] = [{ label: "state", path: config.stateDir }];
   if (config.teams?.workspaceDir) roots.push({ label: "workspaces", path: config.teams.workspaceDir });
@@ -290,7 +289,6 @@ export async function sampleVolumes(config: Pick<Config, "stateDir" | "teams">):
     return true;
   }).map(({ volume }) => volume);
 }
-/** Host-wide sampling is shared across clients; unsupported values stay null. */
 export class DesktopResources {
   private previous?: { at: number; cpu: ReturnType<typeof cpuTotals>; rx: number | null; tx: number | null };
   private pending?: Promise<unknown>;

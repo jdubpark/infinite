@@ -2,7 +2,6 @@ import type { TeamRun, TeamTask } from "./team-types.js";
 
 export function diffStat(output?: string) {
   if (output === undefined) return undefined;
-  // `--numstat -z --no-renames` ends every file record with NUL: "added<TAB>removed<TAB>path".
   const rows = output.split("\0").filter(Boolean).map(line => {
     const [added, removed, path] = line.split("\t");
     return { added: added === "-" ? 0 : Number(added), removed: removed === "-" ? 0 : Number(removed), path: path ?? "" };
@@ -15,11 +14,6 @@ export function diffStat(output?: string) {
 const maxRunChangeFiles = 400;
 const maxTaskChangedPaths = 200;
 
-/**
- * Parses `git diff --name-status -z -M` (STATUS NUL path NUL, or R/C NUL old NUL new NUL) and the matching
- * `--numstat -z -M` output into the bounded run change index. A missing numstat leaves counts null; a missing
- * name-status read yields no index at all.
- */
 export function changeIndex(nameStatus: string | undefined, numstat: string | undefined, headCommit: string, at: string): TeamRun["changes"] | undefined {
   if (nameStatus === undefined) return undefined;
   const counts = new Map<string, { added: number | null; removed: number | null }>();
@@ -28,7 +22,6 @@ export function changeIndex(nameStatus: string | undefined, numstat: string | un
     for (let i = 0; i < tokens.length; i++) {
       if (!tokens[i]) continue;
       const [added, removed, ...rest] = tokens[i].split("\t");
-      // Renames under -z emit "added\tremoved\t" with an empty path, then the old and new paths as separate NUL fields.
       let path = rest.join("\t");
       if (path === "") { path = tokens[i + 2] ?? ""; i += 2; }
       if (path) counts.set(path, { added: added === "-" ? null : Number(added), removed: removed === "-" ? null : Number(removed) });
@@ -50,7 +43,6 @@ export function changeIndex(nameStatus: string | undefined, numstat: string | un
   return { headCommit, recordedAt: at, files: entries.slice(0, maxRunChangeFiles), truncated: entries.length > maxRunChangeFiles };
 }
 
-/** Bounded path list from `git diff --name-only -z`; the NUL-separated paths are kept verbatim. */
 export function changedPathList(output: string | undefined): TeamTask["changedPaths"] | undefined {
   if (output === undefined) return undefined;
   const paths = output.split("\0").filter(Boolean);

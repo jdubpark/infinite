@@ -1,5 +1,3 @@
-// The web client's decision queue view with its feed, wired as the app wires them, against the page's own /api routes.
-// tests/web-decision-view.test.ts answers those routes and records what the view sends.
 import { createRoot } from "react-dom/client";
 import { postDecisionAnswer, useApi, type Me } from "../../apps/web/src/api";
 import { DecisionQueueView } from "../../apps/web/src/decision-queue";

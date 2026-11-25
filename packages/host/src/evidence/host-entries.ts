@@ -4,7 +4,6 @@ import { decisionAuthorityQuestion } from "../team-types.js";
 import { canonicalJson } from "./crypto.js";
 import type { EntryAuthorRole, HostEntry, HostEntryKind } from "./entry-types.js";
 
-/** A summary is one line of at most this many UTF-8 bytes (spec part 3). */
 export const ENTRY_SUMMARY_BYTES = 240;
 
 type EntryFields = Omit<HostEntry, "entryId" | "kind" | "runId" | "missionId">;
@@ -12,10 +11,6 @@ type EntryFields = Omit<HostEntry, "entryId" | "kind" | "runId" | "missionId">;
 const SOURCE = /^(steering|answer|report|integration|check):(.+)$/;
 const INDEX = /^(0|[1-9]\d{0,5})$/;
 
-/**
- * The source keys the run record holds, in record order: steering, owner answers, reports, integrations,
- * then finished checks. A key holds only a host-issued UUID or a list index. Pure, and never mutates `run`.
- */
 export function hostEntrySources(run: TeamRun): string[] {
   return [
     ...steeringIndexes(run).map(index => `steering:${index}`),
@@ -26,7 +21,6 @@ export function hostEntrySources(run: TeamRun): string[] {
   ];
 }
 
-/** The entry one source names, or undefined when the record does not hold it. Pure, and never mutates `run`. */
 export function hostEntry(run: TeamRun, source: string, now: string): HostEntry | undefined {
   const match = typeof source === "string" ? SOURCE.exec(source) : null;
   if (!match) return undefined;
@@ -41,7 +35,6 @@ export function hostEntry(run: TeamRun, source: string, now: string): HostEntry 
   }
 }
 
-/** UUIDv8 of SHA-256("infinite-host-entry:v1" + NUL + canonical JSON of run, kind, and source). Never covers a task id. */
 export function hostEntryId(runId: string, kind: HostEntryKind, source: string): string {
   const bytes = createHash("sha256")
     .update("infinite-host-entry:v1\0", "utf8")
@@ -54,10 +47,6 @@ export function hostEntryId(runId: string, kind: HostEntryKind, source: string):
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-/**
- * One line with control characters and line breaks turned into spaces and white space collapsed. Cut at
- * ENTRY_SUMMARY_BYTES on a code point. The fallback is used when the text is empty after cleaning.
- */
 export function entrySummary(text: string, fallback: string): string {
   const cleaned = flatten(text);
   return cut(cleaned.length > 0 ? cleaned : flatten(fallback), ENTRY_SUMMARY_BYTES);
@@ -76,7 +65,6 @@ function reportingMembers(run: TeamRun): (TeamMember & { role: EntryAuthorRole }
   return list(run.members).filter((member): member is TeamMember & { role: EntryAuthorRole } => member.report !== undefined && member.role !== "permission-coordinator" && member.role !== "evaluator" && member.role !== "judge");
 }
 
-/** Continuation tasks, then the run's own tasks. The first integrated task of each member wins. */
 function integratedTasks(run: TeamRun): { task: TeamTask; memberId: string }[] {
   const seen = new Set<string>();
   const found: { task: TeamTask; memberId: string }[] = [];
@@ -89,7 +77,6 @@ function integratedTasks(run: TeamRun): { task: TeamTask; memberId: string }[] {
   return found;
 }
 
-/** Finished checks only. A running check has no output yet and gets an entry when it finishes. */
 function checkIndexes(run: TeamRun): number[] {
   return list(run.checks).flatMap((check, index) => (check.status === "running" ? [] : [index]));
 }
@@ -212,7 +199,6 @@ function build(run: TeamRun, kind: HostEntryKind, source: string, fields: EntryF
   };
 }
 
-/** A review report keeps its verdict and summary, and loses its rubric for every reader (C9 rule 3). */
 function withoutRubric(report: object): Record<string, unknown> {
   const copy: Record<string, unknown> = { ...report };
   delete copy.rubric;

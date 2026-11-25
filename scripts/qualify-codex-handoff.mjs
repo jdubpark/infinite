@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-// Experimental provider qualification. This does not qualify general process
-// fencing, workspace replication, or automatic recovery after an uncertain effect.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -134,8 +132,6 @@ async function runScenario(mode) {
         incoming.on("message", async data => {
           try {
             const frame = JSON.parse(data.toString());
-            // This recognizes only the fixed qualification command. It is not
-            // a production classifier for whether an arbitrary shell is safe.
             if (turnId && frame.method === "process/start" && JSON.stringify(frame.params).includes("cat marker.txt") && !receipt.refusedBeforeDispatch) {
               receipt.refusedBeforeDispatch = true;
               const heldAt = modelRequests;
@@ -198,8 +194,6 @@ async function runScenario(mode) {
     receipt.providerVersion = await version(appServer);
     receipt.executorVersion = await version(values.codex);
     await new Promise(resolve => model.listen(0, "127.0.0.1", resolve));
-    // Only the fixed fixture command runs, against the disposable roots above.
-    // This configuration belongs only to the disposable fixture HOME.
     await writeFile(join(paths.home, "config.toml"), `model = "gpt-5.1-codex"
 model_provider = "fixture"
 approval_policy = "never"

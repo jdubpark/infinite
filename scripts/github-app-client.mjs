@@ -114,7 +114,6 @@ function loadConfig(path) {
   return { tokenDirectory: value.tokenDirectory, githubCli: value.githubCli, repositories, ...(value.proxyUrl ? { proxyUrl: proxyOrigin(value.proxyUrl) } : {}) };
 }
 
-/** A bare loopback origin such as http://127.0.0.1:8417, or undefined. */
 function proxyOrigin(value) {
   if (typeof value !== "string") return undefined;
   let url;
@@ -124,11 +123,6 @@ function proxyOrigin(value) {
   return url.origin;
 }
 
-/**
- * The GitHub credential proxy and this session's grant, when both are present. The owner's client config names the
- * proxy; without it the host-provided INFINITE_GITHUB_PROXY is used. The grant only ever comes from the environment,
- * and only its shape is checked here; the proxy verifies it.
- */
 function proxyTarget(config, env) {
   const origin = config.proxyUrl ?? proxyOrigin(env.INFINITE_GITHUB_PROXY);
   if (!origin) return undefined;
@@ -143,7 +137,6 @@ function currentBranch(cwd) {
   return branch && !branch.startsWith("-") && !/[\s\u0000-\u001f\u007f]/u.test(branch) ? branch : undefined;
 }
 
-/** Sends a gh command to the proxy's broker, which runs it with the installation token the agent never sees. */
 async function brokerGh(target, ghArgs) {
   const argv = [...ghArgs];
   if (argv[0] === "pr" && argv[1] === "create" && !argv.some(arg => arg === "--head" || arg === "-H" || arg.startsWith("--head="))) {
@@ -402,7 +395,6 @@ async function credential(config, args) {
   const input = readFileSync(0, "utf8");
   if (Buffer.byteLength(input, "utf8") > 32768) fail("Git credential request is too large.");
   const values = parseCredential(input);
-  // The proxy origin gets this session's grant, never an installation token; with no grant there is no answer.
   const proxy = proxyTarget(config, process.env);
   if (proxy) {
     const origin = proxyOrigin(`${values.get("protocol") ?? ""}://${values.get("host") ?? ""}`);

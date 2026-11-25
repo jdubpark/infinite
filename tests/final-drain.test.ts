@@ -93,7 +93,6 @@ test("a drain that outlives the limit is stopped", async () => {
     const took = Date.now() - started;
     assert.ok(took >= 280, "the drain runs until its limit");
     assert.ok(took < 2000, "and resolves there");
-    // A slow start may let the stop arrive first: then no whole pid was written. A written pid must name a dead process.
     const written = () => /^\d+$/.exec(existsSync(pidFile) ? readFileSync(pidFile, "utf8") : "")?.[0];
     await waitFor(() => written() !== undefined, 5000);
     const text = written();

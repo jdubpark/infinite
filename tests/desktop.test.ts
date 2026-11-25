@@ -27,7 +27,6 @@ test("desktop transfers preserve binary bytes, retry chunks, pin reads, and reje
   try {
     const root = host.config.projects[0].path;
     host.config.sync = { sharedGroup: true };
-    // The setgid fixture uses a group this test process actually belongs to.
     chownSync(root, process.getuid!(), process.getgid!());
     assert.equal((await host.fetchApi("/projects/rehearsal/directories", "viewer", { path: "incoming/nested" })).status, 403);
     assert.equal((await host.fetchApi("/projects/rehearsal/directories", "owner", { path: "incoming/nested" })).status, 200);

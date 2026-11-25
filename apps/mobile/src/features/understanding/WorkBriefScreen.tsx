@@ -9,7 +9,6 @@ import { theme } from "../../theme";
 import { BlockView } from "./blocks";
 import { useWorkBrief, type RefreshState } from "./useWorkBrief";
 
-/** One work brief as a sectioned phone screen: a section rail, a narrative status line, and section cards. */
 export function WorkBriefScreen({ connection, workspaceId, workId, machine }: { connection: Connection; workspaceId: string; workId: string; machine?: string }) {
   const router = useRouter();
   const { poll, result, brief, canRefresh, refreshState, refreshNarrative, requestRefresh } = useWorkBrief(connection, workspaceId, workId);
@@ -34,7 +33,6 @@ export function WorkBriefScreen({ connection, workspaceId, workId, machine }: { 
     setSelected(id);
     body.current?.scrollTo({ y: offsets.current[id] ?? 0, animated: true });
   };
-  // The selected chip is the last section whose top has reached the upper part of the viewport.
   const track = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
     const y = event.nativeEvent.contentOffset.y + 24;
     let current = "";
@@ -92,7 +90,6 @@ function SectionCard({ section, onLayout, onOpenComponent, onOpenWork }: {
   </View>;
 }
 
-/** Shows narrative state in words. Only a `ready` narrative shows nothing, and no line claims more than the host recorded. Eligible readers can ask again; the host answers with the reason when it cannot run. */
 function NarrativeLine({ narrative, canRefresh, refreshState, onRefresh }: {
   narrative: WorkNarrativeStatus;
   canRefresh: boolean;
@@ -139,13 +136,11 @@ function NarrativeLine({ narrative, canRefresh, refreshState, onRefresh }: {
   </View>;
 }
 
-/** A refused refresh carries the specific reason; the brief's own status only says that no narrative exists. */
 function shownNarrative(current: WorkNarrativeStatus, fromRefresh: WorkNarrativeStatus | null): WorkNarrativeStatus {
   if (!fromRefresh || current.state !== "unavailable") return current;
   return fromRefresh.state === "unavailable" || fromRefresh.state === "failed" ? fromRefresh : current;
 }
 
-/** Section rail labels carry a count only where the section lists items. */
 function railLabel(section: WorkSection): string {
   const count = section.blocks.reduce((total, block) => total + listCount(block), 0);
   return count ? `${section.title} ${count}` : section.title;

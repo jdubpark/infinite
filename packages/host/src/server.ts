@@ -75,6 +75,7 @@ import { GoalService } from "./goals.js";
 import { RoutineService } from "./routines.js";
 import { createRoutineSchema, routineActionSchema } from "./routine-types.js";
 import { MissionService, missionBoard } from "./missions.js";
+import { registerMissionReadRoutes } from "./mission-read-routes.js";
 import { IntakeStore } from "./intake-store.js";
 import { IntakeLinear } from "./intake-linear.js";
 import { IntakeService } from "./intake.js";
@@ -143,7 +144,6 @@ const permissionRatesQuerySchema = z.object({
   message: "A session, task or workspace scope needs an id, and the host scope takes none.",
 });
 const MAX_LOGIN_ATTEMPT_BUCKETS = 1024;
-/** A recorded pid still names a process. EPERM means it runs under another account, such as the agent user. */
 function alive(pid: unknown) {
   if (!Number.isInteger(pid) || (pid as number) <= 1) return false;
   try { process.kill(pid as number, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
@@ -202,7 +202,7 @@ const inputSchema = z
     force: z.boolean().optional(),
   })
   .strict();
-export function createApp(config: Config, key: Buffer, options: { /** The configuration file the host was started with. */ configFile?: string } = {}) {
+export function createApp(config: Config, key: Buffer, options: { configFile?: string } = {}) {
   config.machine = machineIdentity(config, key);
   if ((config.cmux?.enabled || config.remote?.enabled) && runtimeSecurity(config.deployment).tenancy !== "single-tenant")
     throw new Error("Machine access and cmux require a single-tenant host");
@@ -216,16 +216,13 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   const manager = new Manager(config, key);
   const projectSync = new ProjectSync(config, key);
   const desktopFiles = new DesktopFiles(config);
-  // Session starts admitted past the sync check that the session list may not show yet.
   const startsInFlight = new Map<string, number>();
   const routineStarts = new Set<string>();
   const projectFileChanges = new Set<string>();
   const projectConfigChanges = new Set<string>();
   let sourceChanged: (projectId: string) => void = () => {};
   let sourceAppliedGraph: (projectId: string, head: string) => void = () => {};
-  // The base scanner needs the evidence store, which opens after the project source service; its notices wait for it.
   let baseScanner: BaseScanner | undefined;
-  // The main check needs the halt service, which is built later; its observations are passed through this variable.
   let mainCheck: MainCheckService | undefined;
   const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix, onApplied: (id, head) => { sourceChanged(id); sourceAppliedGraph(id, head); }, onMirror: fetch => { baseScanner?.notify(fetch); mainCheck?.observe(fetch); } });
   const repositoryGraphs = config.repositoryGraphs
@@ -235,11 +232,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     const project = config.projects.find(item => item.id === projectId);
     if (repositoryGraphs && project) void repositoryGraphs.refreshCurrent(projectId, project.path, "shared").catch(() => undefined);
   };
-  /**
-   * Whether a session may be using the project directory: one starting or running there, including cmux sessions,
-   * or one whose worker did not answer while its recorded worker or provider process still lives. Laptop-mode
-   * tools run elsewhere, and an exited session never counts. A session list that cannot be read counts as running.
-   */
   const startInProject = async <T>(projectId: string, start: () => Promise<T>, routineStart = false): Promise<T> => {
     if (routineStarts.has(projectId) && !routineStart) throw new TeamError(409, "routine-starting", "A scheduled goal is being admitted for this project. Retry after it appears.");
     if (projectConfigChanges.has(projectId)) throw new TeamError(409, "project-config-changing", "Repository setup is being updated. Retry after it finishes.");
@@ -258,16 +250,13 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   const summarizer = config.summaries ? new Summarizer(config.summaries) : undefined;
   const readings = new Readings(config, key, manager, summarizer);
   const ownerServices: { goals?: GoalService; missions?: MissionService; handoffs?: HandoffService } = {};
-  // A store that cannot open stays unavailable with a fixed reason. It never blocks the host, a run, or a removal.
   const evidence = new EvidenceStore({ databasePath: evidenceDatabasePath(config.stateDir), vaultKey: key });
   const outbox = new EventOutbox(evidence);
-  // The module registers before its projector, which reads its tables.
   evidence.register(configurationModule());
   outbox.registerProjector(configurationProjector());
   evidence.register(outcomeModule());
   registerRouting(evidence, outbox);
   registerVerdicts(evidence, outbox);
-  // The project signal inbox. Sources record facts into it; only consumers' own scheduler passes act on them.
   const signals = new SignalService({ store: evidence });
   baseScanner = new BaseScanner({
     store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT,
@@ -275,7 +264,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   });
   outbox.registerProjector(outcomeProjector(evidence));
   const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager, cost: sessionId => sessionCostOf(usage.session(sessionId)) });
-  // The launch-rate fuse is built before any service that receives it starts. It stops before the store closes.
   const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
     try { manager.meta(id); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
   } });
@@ -297,11 +285,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   });
   teams.useEvidence(evidence);
   teams.useRouter(new RoutingRecorder({ store: evidence }));
-  // The one-time outcome backfill. Its first tick runs here, before any timer can fire, so no member event of a run
-  // that predates emission is projected before that run's rows. (The constructor above can already have emitted a
-  // `run.blocked` for a record that the restart blocked; it makes only a summary, which the backfill completes.)
-  // The tick then runs after each outbox pass until no run is left.
-  // The first call writes every pending run, so the scorecard never shows a part of the history as all of it.
   const backfillOutcomes = outcomeBackfill(evidence, () => teams.understandingRecords(), {
     mapOf: projectId => config.projects.find(project => project.id === projectId)?.team?.features,
     now: () => new Date().toISOString(),
@@ -310,12 +293,10 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   const usage = new UsageService(config, key, manager, evidence);
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
-  // TeamService ticks on every host and drives the ledger from its own session listing.
   teams.useUsage(usage);
   const goals = new GoalService(config, key, teams, linear);
   ownerServices.goals = goals;
   const projectGroups = new ProjectGroupService(config, key, undefined, { appliedAt: id => projectSync.status(id).appliedAt });
-  // Each optional permission service stays undefined when its state will not open, and its routes answer 503.
   let permissionJournal: PermissionJournal | undefined;
   try {
     evidence.register(permissionJournalModule);
@@ -324,15 +305,12 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   let permissionDelegation: PermissionDelegationService | undefined;
   try { permissionDelegation = new PermissionDelegationService(config, key, projectGroups); }
   catch { console.warn("[Infinite] Permission delegation is unavailable on this host."); }
-  // The permission agent's parts. A part that is absent leaves the requests it would serve with the owner.
   const permissionAgent: PermissionAgentServices = {};
-  // The decision core. The pipeline calls its review; replays measure it, and status reports its readiness.
   let permissionMeasurements: PermissionMeasurements | undefined;
   try {
     evidence.register(permissionMeasurementsModule);
     permissionMeasurements = new PermissionMeasurements(evidence);
   } catch { permissionMeasurements = undefined; }
-  // Every reviewer launch passes this gate. It is set to the owner's halt once the halt service exists.
   const permissionTurnGate: { hold?: PermissionTurnGate } = {};
   const permissionCoreOptions = {
     settings: () => permissionAgentSettings(config),
@@ -343,27 +321,20 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       releaseCommands: config.permissionAgent?.releaseCommands ?? [],
     },
   };
-  // The live core judges real paths. A replay core gets no resolver: it reads nothing from disk.
   const permissionCore = createPermissionAgentCore({ ...permissionCoreOptions, resolvePath: realHostPath });
   permissionAgent.core = permissionCore;
   const permissionReplays = permissionMeasurements
     ? new PermissionReplayJobs({ core: () => createPermissionAgentCore({ ...permissionCoreOptions, purpose: "replay" }), measurements: permissionMeasurements,
-      // A passing replay can make the host ready: coordinator reviews of the runs it now serves are retired at once.
       onSettled: () => { void teams.permissionAuthorityChanged().catch(() => {}); } })
     : undefined;
-  // The pipeline decides and records; it is built only when a decision core exists. The owner controls need only the journal.
   const permissionState = permissionJournal ? openPermissionPipelineState(evidence) : undefined;
   const permissionControls = permissionJournal && permissionState ? new PermissionOwnerControls(permissionJournal, permissionState) : undefined;
   if (permissionAgent.core && permissionJournal && permissionDelegation && permissionState)
     permissionAgent.pipeline = new HostPermissionPipeline({
       core: permissionAgent.core, journal: permissionJournal, delegation: permissionDelegation, state: permissionState,
-      // An owner halt stops the permission agent too: while it covers the project no reviewer turn starts and no recorded verdict is delivered.
       halted: projectId => halt.check({ projectId }).state === "halted",
-      // The halt service renews a project's epoch durably at every engage and release that covers it, before either takes
-      // effect: a verdict reached before a halt or its release no longer applies, and the request is decided again.
       haltEpoch: projectId => halt.epoch(projectId),
     });
-  // Sessions outside team runs: every session listing is read for their permission dialogs, which go to the delivery service.
   const sessionPermissions = new SessionPermissionRequests(config, manager, {
     delivery: () => permissionAgent.delivery,
     serves: projectId => permissionAgent.pipeline ? permissionAgent.pipeline.serves(projectId).served : true,
@@ -371,7 +342,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     taskEnded: taskId => permissionAgent.pipeline?.taskEnded(taskId),
   });
   manager.observeListings(rows => sessionPermissions.observe(rows));
-  // Interactive delivery needs its ledger: without it nothing is delivered, so an unknown result can never repeat.
   let permissionDeliveryLedger: EvidenceDeliveryLedger | undefined;
   try {
     evidence.register(permissionDeliveryModule);
@@ -380,32 +350,22 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   const permissionDelivery = new InteractivePermissionDelivery({ pipeline: () => permissionAgent.pipeline, ledger: permissionDeliveryLedger });
   permissionAgent.delivery = permissionDelivery;
   teams.usePermissionAgent(permissionAgent);
-  /**
-   * After a write that may have changed or ended an authority, and before that write is acknowledged. Coordinator
-   * reviews of runs that the permission agent now serves are retired, and permission-agent answers in flight
-   * under an authority that no longer applies (a revoke, a changed delegation, an opt-out, a regrouping, an owner
-   * halt) are fenced at their sessions. `uncertain` when a fence was not confirmed.
-   */
   const settlePermissionAuthority = async (): Promise<PermissionFence> => {
     let confirmed = true;
     try { await teams.permissionAuthorityChanged(); } catch { confirmed = false; }
     try { if (!await permissionDelivery.fenceRetired()) confirmed = false; } catch { confirmed = false; }
     return confirmed ? {} : { deliveryFence: "uncertain" };
   };
-  // Active only when a pipeline decides, interactive delivery can record what it sends, and the host is ready.
   const permissionAgentState = () => {
     try { return permissionAgent.pipeline && permissionDelivery.active() && permissionCore.readiness().ready ? "active" as const : "inactive" as const; }
     catch { return "inactive" as const; }
   };
-  // The headless channel reads the pipeline from this registry on every call: until one is added it serves nothing.
-  // A team member's headless calls are decided only while its run is live: the same run and member checks as a dialog hand-off.
   const headlessChannel = new HeadlessPermissionChannel({ key, runDir: config.runDir, sessions: manager, services: permissionAgent,
     teamLive: session => teams.permissionAgentLive(session), teamTask: session => teams.permissionAgentTask(session) });
   permissionAgent.headless = headlessChannel;
   manager.useHeadlessChannel(headlessChannel);
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
-  // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
   const sweepEvidence = () => {
     evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
     sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays);
@@ -414,7 +374,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     signals.sweep();
   };
   let evidenceSweep: NodeJS.Timeout | undefined;
-  // A projector that fell behind catches up without waiting for the next event. Each pass is bounded.
   const advanceOutbox = () => {
     for (let pass = 0; pass < 20; pass++) {
       const result = outbox.advance();
@@ -435,8 +394,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
   const handoffs: HandoffService = new HandoffService(config, key, manager, teams, startInProject, async (sessionId, projectId) => {
     const sourcePath = realpathSync(manager.meta(sessionId).session.cwd);
-    // This callback owns one start reservation. Earlier admitted creates may not
-    // have a session row yet, especially while cmux returns a cached listing.
     for (const project of config.projects) {
       if (!handoffPathsOverlap(sourcePath, realpathSync(project.path))) continue;
       if ((startsInFlight.get(project.id) ?? 0) > (project.id === projectId ? 1 : 0) ||
@@ -453,10 +410,8 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   const assertNoHandoff = (projectId: string) => {
     if (handoffs.activeForProject(projectId)) throw new TeamError(409, "handoff-in-progress", "This project is transferring a task to a team. Wait for its checkpoint to finish.");
   };
-  // The owner's route and intake start missions through this one admission.
   const createMission = async (body: CreateMission, origin?: MissionOrigin, authorize?: () => void): Promise<Mission> => {
     authorize?.();
-    // A retry returns the recorded mission even if the group or a handoff changed since it was admitted.
     const recorded = missions.replayCreate(body);
     if (recorded) return recorded;
     const group = projectGroups.get(body.groupId);
@@ -464,17 +419,13 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       for (const checkout of repo.checkouts) assertNoHandoff(checkout.projectId);
     return missions.create({ ...body, groupId: group.id }, body, origin, authorize);
   };
-  // Intake exists only when configured; without it the intake route lists no records.
-  // One store serves the service and the Slack surface, so a record the service admits is the record the surface posts.
   const intakeStore = config.intake ? new IntakeStore(config, key) : undefined;
   const intakeSlackClient = config.intake?.slack ? new SlackClient({ botTokenFile: config.intake.slack.botTokenFile, appTokenFile: config.intake.slack.appTokenFile, endpoint: config.intake.slack.endpoint }) : undefined;
   const intake = config.intake && intakeStore ? new IntakeService(config, intakeStore, missions, new IntakeLinear(linear), { create: createMission, threads: intakeSlackClient, ...(config.intake.slack?.classify ? { router: text => readings.requestRoute(text) } : {}) }) : undefined;
   const mcp = config.mcp && intakeStore && intake ? createMcpServer(config, new McpRequestService(config, intakeStore, intake, missions, projectGroups)) : undefined;
-  // The Slack surface exists only with an intake Slack block; without one, intake runs on Linear alone.
   const intakeSlack = intakeStore && intakeSlackClient ? new IntakeSlackSurface(config, intakeStore, missions, teams, intakeSlackClient, intake ? { direct: input => intake.requestFromSlack(input) } : {}) : undefined;
   const resumable = (session: { status: string; provider: string; workspace?: unknown; team?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
     session.status === "exited" && !session.workspace && !session.team && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
-  // Native records written before executionLocation existed carry only the hybrid workspace.
   const executionLocation = (session: { executionLocation?: "cloud" | "laptop"; workspace?: unknown }): "cloud" | "laptop" =>
     session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
   const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
@@ -485,8 +436,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       return { ...session, ...(managed ? { managedBy: managed } : {}), handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
         resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
     });
-    // Provider conversation IDs survive restarts and can exist in several
-    // recordings. Only a currently verified worker PID identifies this runtime.
     const known = new Set(native.filter(s => s.status === "running" && s.nativeSession && s.pid)
       .map(s => `${s.provider}:${s.nativeSession!.id}:${s.pid}`));
     const external = cmux ? (await cmux.list()).filter(s => s.status !== "running" || !s.nativeSession || !s.pid || !known.has(`${s.provider}:${s.nativeSession.id}:${s.pid}`)) : [];
@@ -501,7 +450,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     const session = withoutCodeMode({ ...manager.meta(sessionId).session, ...(await manager.state(sessionId, true)) });
     const handoff = handoffs.view(sessionId);
     const managed = managedBy(session);
-    // One session's detail is no listing: it must not replace what the last listing left for every other session.
     const { generatedTitle: _generatedTitle, ...publicSession } = readings.merge([session], false)[0];
     return { ...publicSession, ...(managed ? { managedBy: managed } : {}), handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
       resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
@@ -519,11 +467,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     session: sessionDetail,
     events: (sessionId, after) => sessionEvents(sessionId, after),
   });
-  /**
-   * A source refresh waits only for work that uses the project tree itself: a cloud session whose working directory
-   * lies inside it (team members run in their own clones and do not count), an admitted session start, and a file or
-   * repository-setup change in flight. A failed session listing, or a session without a recorded directory, fails closed.
-   */
   async function sessionRunningInProject(projectId: string) {
     if (startsInFlight.has(projectId) || projectFileChanges.has(projectId) || projectConfigChanges.has(projectId)) return true;
     const project = config.projects.find(p => p.id === projectId);
@@ -541,10 +484,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       (["running", "starting"].includes(s.status) ||
         (["unavailable", "recording-error"].includes(s.status) && (alive(s.pid) || alive((s as { workerPid?: unknown }).workerPid)))));
   }
-  /**
-   * A sync commit or apply evaluates projectRunning only after `applying()` turns true.
-   * A start either sees that flag and is refused, or is counted before the check runs.
-   */
   const projectRunning = async (projectId: string, ignoreConfigChange = false) => {
     if (!ignoreConfigChange && projectConfigChanges.has(projectId)) return true;
     if (startsInFlight.has(projectId) || handoffs.activeForProject(projectId) || teams.activeForProject(projectId) || goals.activeForProject(projectId)) return true;
@@ -562,12 +501,9 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   const routines = new RoutineService(config, key, goals, {
     isProjectBusy: routineProjectBusy,
     startGoal: async (request, admit) => {
-      // Recover an acknowledged goal through its original idempotency key before
-      // applying busy checks: the existing goal itself reserves this project.
       try { goals.get(request.requestId); return await goals.create(request, admit); }
       catch (error) { if (!(error instanceof TeamError) || error.code !== "goal-not-found") throw error; }
       if (await routineProjectBusy(request.projectId)) throw new TeamError(409, "routine-project-busy", "This project already has active work. The routine has not launched another goal.");
-      // Close the admission gap after the asynchronous session inventory.
       if (startsInFlight.has(request.projectId) || goals.activeForProject(request.projectId) || teams.activeForProject(request.projectId))
         throw new TeamError(409, "routine-project-busy", "Work started in this project while the routine checked it.");
       routineStarts.add(request.projectId);
@@ -577,10 +513,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       } finally { routineStarts.delete(request.projectId); }
     },
   });
-  // The owner's halt sits in front of the fuse: every scheduler and the Manager backstop ask it first, so a halted
-  // launch is never charged. A team that a live goal or mission owns is paused through its owner.
   const halt = new HaltService({ config, key });
-  // A reviewer launch names no project, so the host halt (or a halt record the host cannot read) holds every one, replays included.
   permissionTurnGate.hold = () => { const view = halt.view(); return view.readable && !view.host; };
   halt.useServices({ routines, goals, missions, teams }, teamId => goals.ownsActiveTeam(teamId) || missions.ownsActiveSubteam(teamId));
   const gate = halt.gate(fuse);
@@ -590,13 +523,11 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   goals.useFuse(gate);
   missions.useFuse(gate);
   routines.useFuse(gate);
-  // A routine drops signals about the team runs of goals it started, so it never wakes on its own delivery.
   routines.useSignals(signals.reader(), goalIds => {
     const wanted = new Set(goalIds);
     return goals.understandingRecords().filter(goal => wanted.has(goal.id))
       .flatMap(goal => [...goal.cycles.map(cycle => cycle.teamId), ...(goal.activeTeamId ? [goal.activeTeamId] : [])]);
   });
-  // A standing goal reads the same inbox. It drops signals about its own cycles' runs itself.
   goals.useSignals(signals.reader());
   fuse.start();
   const desktopResources = new DesktopResources(config, listSessions);
@@ -608,7 +539,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       if (await projectRunning(projectId)) throw new DesktopError("session-running", "Stop this project's running sessions before replacing files");
       if (projectSync.applying(projectId)) throw new DesktopError("sync-applying", "A workspace sync is being applied. Retry after it finishes.");
       if (projectSource.refreshing(projectId)) throw new DesktopError("source-refreshing", "A refresh from GitHub is updating this project. Retry after it finishes.");
-      // Fence sync after checking existing sessions, while new session admission is already closed.
       startsInFlight.set(projectId, (startsInFlight.get(projectId) ?? 0) + 1); held = true;
       return await action();
     } finally {
@@ -637,8 +567,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     knowledge: { read: workspaceId => ({ schemaVersion: 1, catalog: understandingCatalog.read(workspaceId), ...understandingRuntime.read(workspaceId) }) },
   });
   async function inputAuthority(sessionId: string, res: express.Response) {
-    // Retained workers from earlier releases hash the entire request. Adding
-    // optional fields would make a pre-upgrade receipt impossible to retry.
     return (await manager.state(sessionId)).capabilities?.inputControl
       ? { actor: res.locals.actor, leaseId: res.locals.leaseId } : {};
   }
@@ -668,7 +596,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       return res.status(403).json({ error: "Host is not allowed" });
     next();
   });
-  // The sync commit manifest and a permission replay set are parsed by their own routes, after authentication.
   app.use((req, res, next) => /^\/api\/projects\/[^/]+\/sync\/commit$/.test(req.path) || PERMISSION_REPLAY_PATH.test(req.path) ? next()
     : express.json({ limit: /^\/api\/sessions\/[^/]+\/opencode(?:\/|$)/.test(req.path) ? "8mb" : "96kb" })(req, res, next));
   function authenticate(token: string) {
@@ -751,8 +678,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     res.locals.leaseId = id.optional().parse(req.get("X-Infinite-Control"));
     next();
   });
-  // No route is trusted to remember the permission fence: every write settles it before its JSON reply is sent.
-  // Both steps are in-memory reads unless an answer is in flight under an authority that the write ended.
   app.use("/api", permissionWriteFence(settlePermissionAuthority));
   const requireRole =
     (roles: Role[]): express.RequestHandler =>
@@ -782,9 +707,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     error: "This session is run by its mission coordinator. Talk to the coordinator from the mission.",
     code: "mission-managed",
   };
-  // Attach this after route matching and before role checks, using Express's
-  // decoded route params so case, escapes, and optional trailing slashes cannot
-  // skip the mission boundary.
   const refuseMissionManaged: express.RequestHandler = (req, res, next) => {
     const param = req.params.id ?? req.params[0];
     const sessionId = Array.isArray(param) ? param[0] : param;
@@ -823,7 +745,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       else next(error);
     });
   };
-  // A fallback lease on a managed session lapses within its TTL once the prompt closes; release stays open.
   const refuseManagedClaim: express.RequestHandler = (req, res, next) =>
     req.body?.action === "claim" || req.body?.action === "renew" ? refuseManagedOutsideProviderPrompt(req, res, next) : next();
   app.get("/api/me", (_req, res) =>
@@ -841,7 +762,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
         (p) => p !== "demo" || config.enableDemo,
       ),
       teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, autonomyMode: 1, routing: 1, routingAuto: 1, routingPoints: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
-      // onboardingCoverage: repo init's PUT takes permissionOptOut and answers what onboarding left in the delegation record.
       permissions: { workspaceDelegation: 1, decisionLog: 1, onboardingCoverage: 1 },
       goals: { enabled: goals.enabled() },
       missions: { enabled: missions.enabled() },
@@ -858,21 +778,16 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
         ...(repositoryBriefings ? { repositoryBriefings: { model: repositoryBriefings.model, automatic: config.repositoryBriefings!.automatic } } : {}),
         ...(config.remote?.enabled ? { remoteTerminal: 1 } : {}),
         desktop: { resources: 1, files: 1, fileTransfer: 1, chunkBytes: DESKTOP_LIMITS.chunkBytes, maxFileBytes: DESKTOP_LIMITS.maxFileBytes },
-        // The Swarm graph's read-only code map and touch endpoints.
         swarmContext: 1,
       },
     }),
   );
-  // The ledger observes: while it is unavailable every usage route answers 503 and nothing else changes.
   const usageUnavailable = { error: "The usage ledger is unavailable" };
   const ledgerUnavailable = (error: unknown) => error instanceof EvidenceError && error.code === "unavailable";
-  // A route that changes something reads the ledger first, so an unreadable ledger answers 503 before the change.
-  // The error handler below maps `unavailable` for every usage route.
   const requireLedger = () => { if (!usage.readable()) throw new EvidenceError("unavailable", "The usage ledger is unavailable."); };
   app.use("/api/usage", (_req, res, next) => usage.available() ? next() : void res.status(503).json(usageUnavailable));
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
   app.get("/api/evidence/status", (_req, res) => res.json(evidence.describe()));
-  // Linear's last rate-limit headers and this host's request count: numbers and operation names only.
   app.get("/api/linear/status", (_req, res) => res.json(linear.status()));
   app.get("/api/fuse", (_req, res) => res.json(fuse.view()));
   app.get("/api/egress", requireRole(["owner"]), (req, res) => {
@@ -895,7 +810,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     if (result === "write-failed") return void res.status(503).json({ error: "The fuse could not record the close", code: "write-failed" });
     return void res.json({ result, view: fuse.view() });
   });
-  // The owner's halt. Any paired device reads it; only the owner engages or releases it, from any owner client.
   app.get("/api/halt", (_req, res) => res.json(halt.view()));
   const haltNote = z.string().trim().min(1).max(500);
   const haltEngageSchema = z.discriminatedUnion("scope", [
@@ -917,15 +831,11 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   });
   app.post("/api/halt/release", requireRole(["owner"]), async (req, res) => {
     const body = haltReleaseSchema.parse(req.body), target = haltTarget(body);
-    // A project that left the configuration while halted can still be released.
     if (target.scope === "project" && !config.projects.some(project => project.id === target.projectId) &&
         !halt.view().projects.some(project => project.projectId === target.projectId)) throw projectMissing();
     res.json(await halt.release(target, { requestId: body.requestId, ...(body.keepPaused === undefined ? {} : { keepPaused: body.keepPaused }) }, haltActor(res)));
   });
-  // The cost of a session as the usage ledger measured it. The rules are in `sessionCostOf`.
   const sessionCost: CostLookup = sessionId => sessionCostOf(usage.session(sessionId));
-  // The configured lineup's label, then the newest held run whose member names the profile. Otherwise the scorecard shows the profile ID.
-  // Built once per request: the Cost views poll this route.
   const profileLabels = (): ((profileId: string) => string | undefined) => {
     const labels = new Map<string, string>();
     for (const run of teams.list()) for (const member of run.members) {
@@ -935,8 +845,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     for (const profile of config.teams?.lineup ? lineupProfiles(config.teams.lineup) : []) labels.set(profile.id, profile.label);
     return profileId => labels.get(profileId);
   };
-  // The identity that the configured lineup gives a profile ID now. A row of another identity behind the same ID is
-  // history: a goal or a mission can pin an older lineup and keep ending attempts under it.
   const configuredIdentity: ProfileIdentityOf = profileId => {
     const profile = config.teams?.lineup ? lineupProfiles(config.teams.lineup).find(candidate => candidate.id === profileId) : undefined;
     if (!profile) return undefined;
@@ -947,10 +855,8 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     const query = z.object({ role: z.string().trim().min(1).max(40).optional() }).strict().parse(req.query);
     const role = query.role ?? "implementer";
     try {
-      // Only implementers and scouts have outcome rows. Another role gives an empty scorecard without a read.
       if (role !== "implementer" && role !== "scout") return void res.json(scorecardFromRows([], { role, label: () => undefined, cost: sessionCost }));
       const { rows } = productionRows(evidence, role);
-      // The current epoch of each identity comes from the store, so an epoch the owner advanced never keeps its old rows.
       const epoch = currentEpochs(evidence, new Date().toISOString());
       return void res.json(scorecardFromRows(rows, { role, label: profileLabels(), identity: configuredIdentity, epoch, cost: sessionCost }));
     } catch (error) {
@@ -975,9 +881,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     return void res.json({ accounts: usage.summary().accounts });
   });
   app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { requireLedger(); await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
-  // Maps a ledger read that found the store unavailable to the usage 503 answer, whichever route made it.
   app.use("/api/usage", (error: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => ledgerUnavailable(error) ? void res.status(503).json(usageUnavailable) : next(error));
-  // Display cells over production rows, or over the sources named. Every paired device may read them, as it may read usage models.
   const outcomeCellsQuery = z.object({
     project: z.string().regex(/^[a-z0-9-]{1,80}$/).optional(),
     role: z.enum(["implementer", "scout"]).default("implementer"),
@@ -1001,7 +905,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       throw error;
     }
   });
-  // The roll-up of one goal or mission. Every paired device may read it, as it may read the cells. The goal's assessment comes from the goal record.
   const lowerUuid = z.uuid().transform(value => value.toLowerCase());
   const rollupQuery = z.union([z.strictObject({ goal: lowerUuid }), z.strictObject({ mission: lowerUuid })]);
   app.get("/api/outcomes/rollup", (req, res) => {
@@ -1018,11 +921,8 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       throw error;
     }
   });
-  // The owner's legacy batch. A line is an unauthenticated claim, so the owner key is required. The route takes no request id: a replay is idempotent by line id.
   app.post("/api/outcomes/legacy", requireRole(["owner"]), (req, res) => {
     const now = Date.now();
-    // The general handler returns each issue's message, and the message for an unknown key names the key. A key or a
-    // value of the operator's file is operator text, so a body that does not parse gets one fixed answer.
     const parsed = legacyBatchSchema(now).safeParse(req.body);
     if (!parsed.success) return void res.status(400).json({ code: "legacy-invalid", error: "The legacy batch is invalid." });
     const body = parsed.data;
@@ -1034,16 +934,13 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       throw error;
     }
   });
-  // A signal as the owner sees it. The request hash stays in the store: it only checks that a replayed request matches.
   const servedSignal = (signal: SignalRow) => ({ ...signal, payload: Object.fromEntries(Object.entries(signal.payload).filter(([name]) => name !== "request")) });
-  // The outcome rows of one run, also after the run record is removed. Every paired device may read them, as it may read usage models.
   app.get("/api/outcomes/runs/:runId", (req, res) => {
     const runId = id.parse(req.params.runId);
     try {
       if (evidence.status().modules[OUTCOMES_MODULE] !== "ready") throw new EvidenceError("unavailable", "The evidence store is unavailable.");
       const view = runOutcomeView(evidence, runId);
       if (view === undefined) return void res.status(404).json({ code: "outcomes-not-found", error: "No outcome rows exist for this run." });
-      // Blind indexes are store internals. The opened payload already names the project, the task, and the area.
       const served = (row: object) => Object.fromEntries(Object.entries(row).filter(([name]) => !["projectRef", "taskRef", "areaRef"].includes(name)));
       return void res.json({ ...(view.summary ? { summary: served(view.summary) } : {}), rows: view.rows.map(served), members: view.members.map(served), signals: view.signals.map(servedSignal), unreadable: view.unreadable });
     } catch (error) {
@@ -1051,12 +948,10 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       throw error;
     }
   });
-  // Advances one profile's epoch. The profile ID names one identity across the whole lineup.
   app.post("/api/outcomes/epochs", requireRole(["owner"]), (req, res) => {
     const body = z.object({ profileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), requestId: z.uuid() }).strict().parse(req.body);
     const profile = config.teams?.lineup ? profileKeyOf(lineupProfiles(config.teams.lineup), body.profileId) : undefined;
     if (profile === undefined) return void res.status(404).json({ code: "profile-not-found", error: "No configured profile has this ID." });
-    // The lineup schema gives one identity per profile ID, so this answer guards that rule and no loaded lineup reaches it.
     if (profile === "ambiguous") return void res.status(409).json({ code: "profile-ambiguous", error: "This profile ID names more than one configuration. Give each its own ID." });
     try {
       const advanced = advanceEpoch(evidence, { profile, requestId: body.requestId, now: new Date().toISOString() });
@@ -1068,7 +963,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       throw error;
     }
   });
-  // An owner's claim about one run: a linked fix, an exclusion, or the withdrawal of either. A member cannot write one.
   const signalIssue = z.string().regex(/^[A-Za-z][A-Za-z0-9]{0,9}-[0-9]{1,9}$/);
   const signalCommit = z.string().regex(COMMIT_ID);
   const signalTime = z.iso.datetime({ offset: true }).refine(value => Date.parse(value) <= Date.now(), "A signal time cannot be later than the request.").transform(value => new Date(value).toISOString());
@@ -1077,7 +971,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       issue: signalIssue.optional(), commit: signalCommit.optional(), at: signalTime.optional() }).strict()
       .refine(body => body.issue !== undefined || body.commit !== undefined, "A linked fix names an issue, a commit, or both."),
     z.object({ action: z.literal("record"), kind: z.literal("exclusion"), requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), reason: z.enum(EXCLUSION_REASONS) }).strict(),
-    // A withdrawal is idempotent by the signal's state, so it carries no request id.
     z.object({ action: z.literal("withdraw"), kind: z.enum(["linked-fix", "exclusion"]), signalId: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
   ]);
   const signalStatus = { "request-conflict": 409, "signal-not-withdrawable": 409, "outcome-not-found": 404, "signal-not-found": 404 } as const;
@@ -1102,7 +995,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       throw error;
     }
   });
-  app.get("/api/teams", (req, res) => res.json({ teams: z.enum(["full", "list"]).default("full").parse(req.query.view) === "list" ? teams.listItems() : teams.list() })); // Full by default, as installed clients read it; `?view=list` answers the compact rows of team-list.ts.
+  app.get("/api/teams", (req, res) => res.json({ teams: z.enum(["full", "list"]).default("full").parse(req.query.view) === "list" ? teams.listItems() : teams.list() }));
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   objectiveRoutes(app, { goals, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
@@ -1216,7 +1109,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     }));
   });
   app.get("/api/project-groups/:id", requireRole(["owner", "controller", "viewer"]), (req, res) => res.json(projectGroups.get(projectGroupIdSchema.parse(req.params.id))));
-  // An owner regrouping can end a delegation's coverage of a project. The write middleware fences answers in flight under it before the reply.
   app.post("/api/project-groups", requireRole(["owner"]), (req, res) => res.json(projectGroups.create(createProjectGroupSchema.parse(req.body))));
   app.put("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.update(projectGroupIdSchema.parse(req.params.id), updateProjectGroupSchema.parse(req.body))));
   app.delete("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.remove(projectGroupIdSchema.parse(req.params.id), z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict().parse(req.body))));
@@ -1226,7 +1118,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     const journal = permissionJournal;
     const now = Date.now();
     const rateWindow = (windowMs: number) => journal!.rates({ scope: "host", since: new Date(now - windowMs).toISOString(), until: new Date(now).toISOString() });
-    // Rates are informational: an unreadable journal reports null and never hides the delegation status.
     let rates: { lastHour: ReturnType<PermissionJournal["rates"]>; lastDay: ReturnType<PermissionJournal["rates"]> } | null = null;
     if (journal) { try { rates = { lastHour: rateWindow(HOUR_MS), lastDay: rateWindow(DAY_MS) }; } catch { rates = null; } }
     res.json({
@@ -1237,12 +1128,10 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       rates,
       rateFlags: permissionRateFlags(journal, now),
       ...permissionAgentStatus(permissionCore, permissionMeasurements, permissionReplays),
-      // Informational as well: a listing that fails reports null.
       headless: await headlessChannel.status().catch(() => null),
     });
   });
   registerPermissionAgentRoutes(app, { requireRole, requireOwnerCli, jobs: permissionReplays });
-  // Decision figures for one session, task or workspace, or for the host, over the last `hours` (one hour to seven days).
   app.get("/api/permissions/rates", requireRole(["owner", "controller"]), (req, res) => {
     if (!permissionJournal) return res.status(503).json({ error: "The permission journal is unavailable on this host." });
     const query = permissionRatesQuerySchema.parse(req.query);
@@ -1264,7 +1153,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     const body = permissionDelegationBodySchema.parse(req.body);
     const actor = { deviceId: String(res.locals.deviceId) };
     const request = { requestId: body.requestId, direction: body.direction };
-    // A changed direction text closes the open rejects of the projects it covers.
     const delegation = permissionDelegation;
     const recorded = <T>(act: () => T) => closeRejectsOnDirectionChange(delegation, permissionJournal, config.projects.map(project => project.id), act);
     if (body.all) {
@@ -1272,14 +1160,12 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       return res.json({ agent: permissionAgentState(), views: result.views, replacedOptOuts: result.replacedOptOuts });
     }
     const result = recorded(() => delegation.delegate(body.workspaceId!, request, actor));
-    // A new owner act or direction text replaces the authority. The write middleware fences answers in flight under the earlier one first.
     return res.json({ agent: permissionAgentState(), views: [result.view], replacedOptOuts: result.replacedOptOuts });
   });
   app.post("/api/permissions/revocations", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     if (!permissionDelegation) return permissionsUnavailable(res);
     const body = permissionRevocationBodySchema.parse(req.body);
     const view = permissionDelegation.revoke(body.workspaceId, { requestId: body.requestId }, { deviceId: String(res.locals.deviceId) });
-    // The revoke is recorded, so no new decision applies. The write middleware fences an answer already with a session before the reply.
     return res.json({ agent: permissionAgentState(), view });
   });
   registerPermissionControlRoutes(app, { guards: [requireRole(["owner"]), requireOwnerCli], controls: permissionControls });
@@ -1295,11 +1181,9 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/goals/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await goals[action](id.parse(req.params.id), goalActionSchema.parse(req.body))));
   app.post("/api/goals/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await goals.extend(id.parse(req.params.id), goalExtendSchema.parse(req.body))));
-  app.get("/api/missions", (_req, res) => res.json({ missions: missions.list() }));
-  app.get("/api/missions/:id", (req, res) => res.json(missions.get(id.parse(req.params.id))));
+  registerMissionReadRoutes(app, { missions, teams, manager });
   app.get("/api/intake", (_req, res) => res.json({ records: intake?.list() ?? [], ...intake?.status(), ...(intakeSlack ? { slack: intakeSlack.status() } : {}) }));
   app.post("/api/missions", requireRole(["owner"]), async (req, res) => res.json(await createMission(createMissionSchema.parse(req.body))));
-  // Mission controls and answers are owner-only, so every recorded mission answer is the owner's.
   app.post("/api/missions/:id/steer", requireRole(["owner"]), async (req, res) => res.json(await missions.steer(id.parse(req.params.id), missionTextSchema.parse(req.body))));
   app.post("/api/missions/:id/answer/:decisionId", requireRole(["owner"]), async (req, res) =>
     res.json(await missions.answer(id.parse(req.params.id), id.parse(req.params.decisionId), missionTextSchema.parse(req.body))));
@@ -1312,15 +1196,12 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   });
   app.get("/api/decision-queue", async (_req, res) => res.json(await readDecisionQueue({ manager, cmux, permissions: sessionPermissions, teams, goals, missions })));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
-  // Which files each agent's recorded tool inputs pointed at. Read-only; observed inputs are not evidence of use or of a landed change.
   const contextTouches = new ContextTouches({
-    // Only signals carry tool inputs. The type filter keeps terminal output out of the result, though each read still scans it.
     read: (sessionId, after) => manager.events(sessionId, after, 200, new Set(["signal"])),
     areas: projectId => repositoryGraphs?.areas(projectId),
   });
   const unobservedTouches = (sessionId: string): SessionTouches => ({ sessionId, observable: false, complete: true, graphQueries: 0, files: [], truncated: false });
   const sessionTouches = async (source: { sessionId: string; cwd: string; provider: string; projectId: string }) => {
-    // A cmux session has no host journal, and an unreadable journal yields no touches.
     if (!existsSync(join(config.stateDir, "sessions", source.sessionId, "meta.sealed"))) return unobservedTouches(source.sessionId);
     try { return await contextTouches.session(source); }
     catch { return unobservedTouches(source.sessionId); }
@@ -1332,7 +1213,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       ...await sessionTouches({ sessionId: member.sessionId, cwd: member.cwd, provider: member.provider ?? team.provider, projectId: team.projectId }) })));
     res.json({ teamId: team.id, revision: team.revision, members });
   });
-  // Entries and launch sizes are read-only. They follow the role rule of GET /api/teams/:id and do not refresh tracking.
   const entryQuery = z.object({
     kind: z.union([z.enum(ENTRY_KINDS), z.array(z.enum(ENTRY_KINDS)).min(1).max(8)]).optional(),
     task: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional(),
@@ -1367,7 +1247,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       return found;
     });
   });
-  // The owner's withdrawal of one entry. The answer depends only on the entry's state, so a replay is safe. The body is not stored.
   const entryWithdrawBody = z.object({ requestId: z.uuid() }).strict();
   app.post("/api/teams/:id/entries/:entryId/withdraw", requireRole(["owner"]), (req, res) => {
     const entryId = id.parse(req.params.entryId);
@@ -1392,8 +1271,8 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     let finished = false, child: ReturnType<typeof spawnTeamBundle> | undefined;
     const stop = () => {
       if (!child || finished) return;
-      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { /* Already exited. */ }
-      child.stdout.destroy(); // The host cannot signal a writer that the launcher runs as another account. Closing the pipe ends it.
+      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch {}
+      child.stdout.destroy();
     };
     const disconnect = () => { if (!res.writableEnded) { stop(); finished = true; clearTimeout(timer); } };
     req.once("aborted", disconnect);
@@ -1476,7 +1355,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     const projectId = projectSchema.parse(req.params.id);
     if (!mirroredProjects.isMirrored(projectId)) throw new TeamError(409, "project-not-mirrored", "Only mirrored projects can be forgotten.");
     if (projectConfigChanges.has(projectId)) throw new TeamError(409, "project-config-changing", "Repository setup is being updated. Retry after it finishes.");
-    // Holding the configuration lock refuses new sessions, teams and goals while the checks run.
     projectConfigChanges.add(projectId);
     try {
       if (projectSync.applying(projectId)) throw new TeamError(409, "sync-applying", "A workspace sync is being applied to this project. Retry after it finishes.");
@@ -1500,14 +1378,12 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       throw new TeamError(403, "single-tenant-required", "Repository enrollment requires a single-tenant host.");
     if (projectConfigChanges.has(projectId) || projectFileChanges.has(projectId))
       throw new TeamError(409, "project-busy", "Repository setup or files are being updated. Retry after the operation finishes.");
-    // The owner's explicit off is recorded before the enrollment is written, or nothing is written.
     if (body.permissionOptOut && !permissionDelegation) return permissionsUnavailable(res);
     const onboarding = onboardingPermissions(permissionDelegation, projectId, body, { deviceId: String(res.locals.deviceId) });
     projectConfigChanges.add(projectId);
     try {
       const { view, first } = await enrollment.enroll(projectId, body, { beforeWrite: onboarding.beforeWrite });
       const coverage = onboarding.after(first);
-      // An opt-out ends the project's coverage. The write middleware fences answers in flight under it before the reply.
       res.json({ ...view, permissionAgent: coverage });
     } finally { projectConfigChanges.delete(projectId); }
   });
@@ -1656,11 +1532,8 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     }
     const { backend: _backend, ...nativeRequest } = request;
     scheduleGraphForSession(request.projectId);
-    // Owner-only route: the owner started this session, which decides its GitHub grant under autonomy.boundary.github.
     res.status(201).json(withoutCodeMode(await startInProject(request.projectId, () => manager.create(nativeRequest, "owner"))));
   });
-  // Imported sessions keep their own transport and journal. Authorization is the same
-  // as the managed-worker routes; raw native gateways remain worker-only.
   app.use("/api/sessions/:id", async (req, res, next) => {
     if (!cmux) return next();
     const sessionId = id.parse(req.params.id);
@@ -1741,7 +1614,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     res.json(recordedMessages(manager, session, z.string().max(100).optional().parse(req.query.after),
       z.coerce.number().int().min(1).max(200).default(200).parse(req.query.limit), transcript));
   });
-  // A digest of the chat after a cursor. The text is the model's reading, labeled as such.
   app.get("/api/sessions/:id/summary", async (req, res) => {
     const sessionId = id.parse(req.params.id);
     const session = manager.meta(sessionId).session;
@@ -1884,8 +1756,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       return void res.status(409).json({ error: "This session uses an older worker without input control", code: "unsupported" });
     res.json({ control: await manager.controlSession(sessionId, { op: "control", ...body, actor: res.locals.actor }) });
   });
-  // Only a directly paired owner CLI can send terminal control bytes. Browser
-  // cookies and controller/viewer keys retain their existing narrower inputs.
   app.post("/api/sessions/:id/raw", refuseManagedOutsideProviderPrompt, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use native input" });
     const sessionId = id.parse(req.params.id);
@@ -1933,7 +1803,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
           }),
         );
       } catch (error) {
-        // A dialog is open: the text would land in it, so nothing was typed.
         if ((error as WorkerError).code === "prompt-open")
           return void res.status(409).json({
             error: "prompt-open",
@@ -1952,7 +1821,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       const body = answerSchema.parse(req.body);
       const authority = missionManagedSession(sessionId) ? { missionManaged: true as const } : await inputAuthority(sessionId, res);
       try {
-        // An answer waits for the dialog to redraw and close, so it gets more than the default 4 s.
         res.json(
           await workerCall(
             config.runDir,
@@ -2028,7 +1896,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     if (!project) return void res.status(404).json({ error: "Unknown project" });
     res.json({ id: project.id, name: project.name, path: project.path, source: projectSource.status(projectId), sync: await projectSync.liveStatus(projectId, () => projectRunning(projectId)) });
   });
-  // The directory-level code map for one graph lane: names and counts only, served from the builder's receipt.
   app.get("/api/projects/:id/graph/map", (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
@@ -2041,7 +1908,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     const enabled = Boolean(repositoryGraphs && (!config.repositoryGraphs?.projectIds || config.repositoryGraphs.projectIds.includes(projectId)));
     res.json({ enabled, state: enabled ? "enabled" : "disabled", receipts: enabled ? repositoryGraphs!.status(projectId) : [] });
   });
-  // The project signal inbox. The owner adds direction here; host sources add facts. A signal starts nothing by itself.
   const signalsUnavailable = { code: "evidence-unavailable", error: "The evidence store is unavailable." };
   const ownerSignalBody = z.object({ requestId: z.uuid(), text: z.string().trim().min(1).max(MAX_SIGNAL_TEXT_LENGTH) }).strict();
   const signalPageQuery = z.object({
@@ -2052,11 +1918,9 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     const projectId = projectSchema.parse(req.params.id);
     if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
     const body = ownerSignalBody.parse(req.body);
-    // The request ID is the key, so a replay records nothing and returns the signal stored first.
     const result = signals.record({ projectId, kind: "owner", key: body.requestId, text: body.text });
     if ("failure" in result) {
       if (result.failure === "invalid") return void res.status(400).json({ error: "Invalid signal" });
-      // The request was recorded before, and its signal is past the inbox's row limit. Nothing new is recorded.
       if (result.failure === "gone") return void res.status(410).json({ code: "signal-gone", error: "This request was recorded before. Its signal is no longer kept." });
       if (result.failure === "full") return void res.status(503).json({ code: "signal-inbox-full", error: "The signal inbox is full. Try again after old signals expire." });
       return void res.status(503).json(signalsUnavailable);
@@ -2077,7 +1941,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     if (!projectSource.isGithub(projectId)) throw new ProjectSourceError("This project follows the laptop, not GitHub.", "not-github");
     res.json(await projectSource.refresh(projectId));
   });
-  // Sync moves whole checkouts, ignored files and credentials included, so it shares laptop execution's single-tenant gate.
   app.use("/api/projects/:id/sync", (_req, res, next) => runtimeSecurity(config.deployment).tenancy === "single-tenant" ? next()
     : void res.status(403).json({ error: "Workspace sync requires a single-tenant host" }));
   const refuseGithubSync = (projectId: string, res: express.Response) => {
@@ -2099,18 +1962,15 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     const body = z.object({ hashes: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(512) }).strict().parse(req.body);
     res.json({ missing: await projectSync.missing(projectSchema.parse(req.params.id), body.hashes, syncWriter(req, res), syncGeneration(req)) });
   });
-  // A body over one chunk can never be stored; it answers 413 before it is read.
   app.put("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), requireOwnerCli, express.raw({ type: "application/octet-stream", limit: WORKSPACE_LIMITS.chunkBytes }), async (req, res) => {
     if (!Buffer.isBuffer(req.body) || !req.body.length) return void res.status(400).json({ error: "Send the chunk as application/octet-stream" });
     await projectSync.putBlob(projectSchema.parse(req.params.id), String(req.params.hash), req.body, syncWriter(req, res), syncGeneration(req));
     res.json({ stored: true });
   });
-  // A batch frames many chunks in one request, so an upload pays one round trip per batch instead of per chunk.
   app.put("/api/projects/:id/sync/blobs", requireRole(["owner"]), requireOwnerCli, express.raw({ type: "application/octet-stream", limit: WORKSPACE_LIMITS.batchBytes }), async (req, res) => {
     if (!Buffer.isBuffer(req.body) || !req.body.length) return void res.status(400).json({ error: "Send the chunk batch as application/octet-stream" });
     res.json({ stored: await projectSync.putBlobs(projectSchema.parse(req.params.id), req.body, syncWriter(req, res), syncGeneration(req)) });
   });
-  // The body wraps a manifest of up to the manifest bound with its generation; the store checks the manifest itself.
   app.post("/api/projects/:id/sync/commit", requireRole(["owner"]), requireOwnerCli, express.json({ limit: WORKSPACE_LIMITS.manifestBytes + 64 * 1024 }), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (refuseGithubSync(projectId, res)) return;
@@ -2176,7 +2036,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
       res: express.Response,
       _next: express.NextFunction,
     ) => {
-      // `error` carries the message every client displays; a failed sync operation also names its category.
       if (error instanceof TeamError) return res.status(error.status).json({ code: error.code, error: error.message });
       if (error instanceof CatalogError) return res.status(error.statusCode).json({ code: "understanding-catalog", error: error.message });
       if (error instanceof BehaviorError) return res.status(error.statusCode).json({ code: "understanding-behavior", error: error.message });
@@ -2204,7 +2063,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
         return res.status(code === "ENOENT" ? 404 : code === "EACCES" || code === "EPERM" ? 403 : 409)
           .json({ code: "file-unavailable", error: "The file operation could not be completed. Refresh the project before retrying." });
       }
-      // Workspace sync failures are about the project tree, not a session; their category never names a path.
       if (/^\/api\/projects\/[^/]+\/sync\//.test(req.path)) {
         const failure = syncFailure(error);
         return res.status(409).json({ code: "sync-failed", category: failure.category, error: failure.message, message: failure.message });
@@ -2223,7 +2081,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
           : ["invalid-cursor", "invalid-control"].includes(error.code) ? 400 : 409;
         return res.status(status).json({ code: error.code, error: error.message });
       }
-      // Never echo filesystem paths, prompts, tokens, or child process details.
       return res.status(409).json({
         error:
           "Operation could not be completed. Refresh the session before retrying. Input delivery may be uncertain.",
@@ -2231,8 +2088,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     },
   );
   const server = createServer(app);
-  // One listener per event: Node warns about a leak once more than ten listeners share one emitter,
-  // and the subsystems below plus the socket routes attached next crossed that limit.
   server.once("listening", () => {
     linear.start();
     teams.start();
@@ -2243,7 +2098,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     void intakeSlack?.start().catch(() => undefined);
     handoffs.start();
     readings.start();
-    // The timer checks each tick which projects follow GitHub, so one enrolled while the server runs is picked up too.
     projectSource.start();
     repositoryGraphs?.start();
     void repositoryBriefings?.start().catch(() => {});
@@ -2257,7 +2111,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
     outboxTimer = setInterval(advanceOutbox, 60 * 1000);
     outboxTimer.unref();
     evalHost.start();
-    // A stop or resume pass that the previous process left unfinished is finished now.
     void halt.start().catch(() => {});
     void mainCheck?.start().catch(() => {});
   });
@@ -2290,7 +2143,6 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   const closeRemote = connectRemoteAccess(server, config);
   const closeConnections = () => { const mainCheckClosed = mainCheck?.close() ?? Promise.resolve(); routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); const teamsClosed = teams.close(); halt.stop(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([teamsClosed, mainCheckClosed, mcp?.close(), repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, mcpServer: mcp?.server, closeConnections, fuse, halt, mainCheck,
-    // ownerClass is read only for a dialog the delivery service handled and left to the owner, so no session wrapper is needed.
     permissions: { holder: (sessionId: string, promptId: number) => sessionPermissions.holder(sessionId, promptId),
       ownerClass: (sessionId: string, promptId: number) => permissionDelivery.ownerClass(sessionId, promptId) }, permissionAgent };
 }

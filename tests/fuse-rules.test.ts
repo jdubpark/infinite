@@ -21,7 +21,10 @@ function launch(launchId: string, projectId: string, admittedAt: number, state: 
   return { launchId, projectId, purpose: "work", role: "implementer", profileId: "p", state, admittedAt, seq: 0 };
 }
 
-function trip(overrides: Partial<FuseTripRecord> & Pick<FuseTripRecord, "tripId" | "scope" | "cause" | "openedAt">): FuseTripRecord {
+type TripOverrides = ({ scope: "host"; projectId?: never } | { scope: "project"; projectId: string }) &
+  ({ closedAt?: never; closedBy?: never } | { closedAt: number; closedBy: "rate" | "owner" | "baseline" }) &
+  { tripId: string; cause: FuseTripRecord["cause"]; window?: FuseTripRecord["window"]; openedAt: number; ownerClose?: boolean; announcedAt?: number; launches?: number; seq?: number };
+function trip(overrides: TripOverrides): FuseTripRecord {
   return { ownerClose: false, seq: 0, ...overrides };
 }
 
@@ -53,12 +56,9 @@ test("the rolling hour counts the last hour after the last owner close", () => {
 });
 
 test("a close stamped after now is not yet a cutoff", () => {
-  // The clock stepped back after an owner close. Until the clock passes that close again, it clears nothing:
-  // a cutoff in the future would leave every new launch uncounted.
   const future = [trip({ tripId: "owner", scope: "project", projectId: "a", cause: "launch-rate", openedAt: now - 60_000, closedAt: now + HOUR_MS, closedBy: "owner", ownerClose: true })];
   const recent = [launch("x", "a", now - 600_000), launch("y", "a", now - 1_000)];
   assert.equal(rollingCount(recent, future, "project", "a", now), 2);
-  // Once the clock is past the close, it is the cutoff again.
   assert.equal(rollingCount(recent, future, "project", "a", now + HOUR_MS + 1), 0);
 });
 
@@ -101,7 +101,6 @@ test("a second rate trip in one UTC day needs the owner", () => {
 });
 
 test("an owner-close trip wins over another open rate trip of its scope", () => {
-  // A merge of two baselines can leave two open rate trips in one scope. The one that needs the owner decides.
   const both = [
     trip({ tripId: "plain", scope: "project", projectId: "a", cause: "launch-rate", openedAt: now - 3_000_000, window: "hour" }),
     trip({ tripId: "owner", scope: "project", projectId: "a", cause: "launch-rate", openedAt: now - 1_000, window: "hour", ownerClose: true }),
@@ -203,13 +202,11 @@ test("applying a result sets and clears only a fuse reason", () => {
 });
 
 test("a closed check leaves a write failure for the admission to clear", () => {
-  // `check` reads memory and cannot see a failing baseline write. Only `admit` can, so only an admission clears it.
   const writeFailed: FuseAdmission = { ok: false, launchId: "x", failure: "write-failed" };
   const holder: { reason?: string } = {};
   assert.deepEqual(applyFuseReason(holder, writeFailed), { wait: true, changed: true });
   const text = holder.reason;
 
-  // The next pass: the check is closed, the admission fails again. Nothing changes, so nothing is saved.
   assert.deepEqual(applyFuseReason(holder, { state: "closed" }), { wait: false, changed: false });
   assert.equal(holder.reason, text);
   assert.deepEqual(applyFuseReason(holder, writeFailed), { wait: true, changed: false });

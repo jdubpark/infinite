@@ -1,8 +1,9 @@
 import { approvalOwner } from "./approval";
 import {
   AGENT_STATES, STAGES,
-  type Agent, type AgentState, type Ghost, type Hold, type RoleCode, type Stage, type Swarm, type SwarmInput, type SwarmMember,
-  type SwarmMission, type SwarmModel, type SwarmSession, type SwarmTeam, type SwarmTask, type Terminal, type TeamStatus, type Unit,
+  type Agent, type AgentState, type Ghost, type Hold, type MissionSwarm, type QuietUnit, type RoleCode, type Stage,
+  type Swarm, type SwarmInput, type SwarmMember, type SwarmMission, type SwarmModel, type SwarmSession,
+  type SwarmTeam, type SwarmTask, type TeamSwarm, type Terminal, type TeamStatus, type Unit,
 } from "./types";
 
 type Attention = NonNullable<SwarmSession["attention"]>;
@@ -15,7 +16,6 @@ const LIVE_AGENT_STATES: AgentState[] = ["queued", "working", "waiting", "in-rev
 const HELD_MISSION_STATUSES: SwarmMission["status"][] = ["planning", "working", "needs-input", "paused", "blocked"];
 const OBSERVABLE_PROVIDERS = new Set(["claude", "codex"]);
 
-/** Status to the stage it is working on. Verifying runs the checks. */
 const STAGE_BY_STATUS: Partial<Record<TeamStatus, Stage>> = {
   planning: "plan", discovering: "scout", implementing: "build", integrating: "integrate",
   verifying: "check", reviewing: "review", delivering: "ship",
@@ -38,7 +38,6 @@ const ROLES = new Map<string, { code: RoleCode; stage?: Stage }>([
 const timeOf = (iso: string | undefined) => (iso === undefined ? 0 : Date.parse(iso) || 0);
 const isFault = (attention?: Attention) => attention?.state === "recording-error" || attention?.state === "unavailable";
 
-/** A member's state, applying the table's rows in order. */
 function memberState(status: string, attention: Attention | undefined, owner: Owner): AgentState {
   const state = attention?.state;
   if (status === "queued") return "queued";
@@ -49,12 +48,10 @@ function memberState(status: string, attention: Attention | undefined, owner: Ow
   if (status === "reported") return "reported";
   if (status === "stopped") return "stopped";
   if (status === "unavailable" || isFault(attention)) return "fault";
-  // A running member with no attention reading goes by its status alone.
   if (status === "running") return attention ? "waiting" : "working";
   return "waiting";
 }
 
-/** A mission coordinator stops with its status; otherwise its attention decides. */
 function coordinatorState(status: "running" | "waiting" | "stopped", session?: SwarmSession): AgentState {
   if (status === "stopped") return "stopped";
   const attention = session?.attention;
@@ -65,7 +62,6 @@ function coordinatorState(status: "running" | "waiting" | "stopped", session?: S
   return "waiting";
 }
 
-/** A solo session is running or starting; its attention decides, defaulting to waiting. */
 function soloState(session: SwarmSession): AgentState {
   if (session.status === "starting") return "queued";
   const attention = session.attention;
@@ -75,10 +71,6 @@ function soloState(session: SwarmSession): AgentState {
   return "waiting";
 }
 
-/**
- * When a run last did something. The host rewrites a run's `updatedAt` on every save, including for settled runs,
- * so a run's age comes from what its agents did.
- */
 function lastActivity(team: SwarmTeam): string {
   let latest = timeOf(team.createdAt);
   for (const member of team.members)
@@ -137,7 +129,6 @@ function memberAgent(team: SwarmTeam, member: SwarmMember, role: { code: RoleCod
   };
 }
 
-/** Stages with evidence in the current revision, plus the stage the status is working on. */
 function reachedStage(team: SwarmTeam, members: SwarmMember[], active: Stage | undefined): Stage {
   const currentIds = new Set(members.filter(member => member.revision === team.revision).map(member => member.memberId));
   const hasRole = (role: string) => members.some(member => member.revision === team.revision && member.role === role);
@@ -169,25 +160,23 @@ function buildUnit(args: {
   const byStage = (a: Agent, b: Agent) => stageIndex(a.stage) - stageIndex(b.stage);
   agents.sort(byStage);
 
+  const terminal = TERMINAL_BY_STATUS[team.status];
   const working = STAGE_BY_STATUS[team.status] !== undefined || team.status === "needs-input" || team.status === "paused";
-  const live = working || [...agents, ...side].some(agent => LIVE_AGENT_STATES.includes(agent.state));
+  const live = !terminal && (working || [...agents, ...side].some(agent => LIVE_AGENT_STATES.includes(agent.state)));
   const active = STAGE_BY_STATUS[team.status];
   const openDecisions = team.decisions.filter(decision => decision.revision === team.revision && decision.answer === undefined).length;
   const waiting = managed ? 0 : openDecisions;
+  const hold = HOLD_BY_STATUS[team.status] ?? (waiting > 0 ? "input" : undefined);
   const currentChecks = team.checks.filter(check => check.revision === team.revision);
 
-  return {
+  const base = {
     id: team.id,
     swarmId,
     title: team.title,
     projectId: team.projectId,
     status: team.status,
     revision: team.revision,
-    live,
-    active,
     reached: reachedStage(team, team.members, active),
-    hold: HOLD_BY_STATUS[team.status] ?? (waiting > 0 ? "input" : undefined),
-    terminal: TERMINAL_BY_STATUS[team.status],
     checks: {
       passed: currentChecks.filter(check => check.status === "passed").length,
       failed: currentChecks.filter(check => check.status === "failed").length,
@@ -207,15 +196,32 @@ function buildUnit(args: {
     headCommit: team.headCommit,
     tasks: team.tasks,
   };
+
+  if (live) {
+    return { ...base, live: true, active, hold };
+  }
+  if (terminal !== undefined) {
+    return { ...base, live: false, terminal };
+  }
+  return { ...base, live: false, hold: hold ?? "blocked" };
 }
 
-/** Agents a swarm shows as needing a person: needs-you agents, unit decisions, and mission decisions. */
-function waitingOn(swarm: Pick<Swarm, "units" | "coordinator" | "loose">, missionDecisions: number) {
-  const agents = [...(swarm.coordinator ? [swarm.coordinator] : []), ...swarm.units.flatMap(unit => [...unit.agents, ...unit.side]), ...swarm.loose];
-  return agents.filter(agent => agent.state === "needs-you").length + swarm.units.reduce((sum, unit) => sum + unit.waiting, 0) + missionDecisions;
+function unitWaiting(units: Unit[]): number {
+  return units.reduce((sum, unit) => sum + unit.waiting, 0);
 }
 
-/** Joins the host's session, team, and mission lists into the model the Swarm views render. */
+function waitingOn(swarm: Swarm, missionDecisions: number): number {
+  const needsYou = allAgents(swarm).filter(agent => agent.state === "needs-you").length;
+  switch (swarm.kind) {
+    case "mission":
+      return needsYou + unitWaiting(swarm.units) + missionDecisions;
+    case "team":
+      return needsYou + unitWaiting(swarm.units);
+    case "solo":
+      return needsYou;
+  }
+}
+
 export function buildSwarm(input: SwarmInput): SwarmModel {
   const sessions = new Map(input.sessions.map(session => [session.id, session]));
   const teamsById = new Map(input.teams.map(team => [team.id, team]));
@@ -258,10 +264,10 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
       }),
       sessionId: mission.coordinator.sessionId,
     } : undefined;
-    const swarm: Swarm = {
+    const swarm: MissionSwarm = {
       id: mission.id, kind: "mission", title: mission.title,
       live: (coordinator !== undefined && mission.coordinator?.status !== "stopped") || units.some(unit => unit.live),
-      coordinator, units, ghosts, loose: [],
+      coordinator, units, ghosts,
       waiting: 0, costUsd: mission.usage?.total.cost, createdAt: mission.createdAt,
       unmeasured: mission.usage?.unmeasuredMembers ?? units.reduce((sum, unit) => sum + unit.unmeasured, 0),
     };
@@ -273,11 +279,12 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
   for (const team of input.teams) {
     if (team.missionId !== undefined && missions.has(team.missionId)) continue;
     const unit = buildUnit({ team, swarmId: team.id, sessions, managed: false, dependsOn: [] });
-    const swarm: Swarm = {
-      id: team.id, kind: "team", title: team.title, live: unit.live, units: [unit], ghosts: [], loose: [],
-      waiting: waitingOn({ units: [unit], loose: [] }, 0), costUsd: team.usage?.total.cost, createdAt: team.createdAt,
+    const swarm: TeamSwarm = {
+      id: team.id, kind: "team", title: team.title, live: unit.live, units: [unit],
+      waiting: 0, costUsd: team.usage?.total.cost, createdAt: team.createdAt,
       unmeasured: unit.unmeasured,
     };
+    swarm.waiting = waitingOn(swarm, 0);
     built.push(swarm);
   }
 
@@ -289,7 +296,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
     }));
   if (loose.length > 0) {
     built.push({
-      id: "solo", kind: "solo", title: "solo", live: true, units: [], ghosts: [], loose,
+      id: "solo", kind: "solo", title: "solo", live: true, loose,
       waiting: loose.filter(agent => agent.state === "needs-you").length,
       costUsd: loose.reduce((sum, agent) => sum + (agent.costUsd ?? 0), 0),
       unmeasured: loose.filter(agent => agent.costUsd === undefined).length,
@@ -297,7 +304,6 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
     });
   }
 
-  // Order never depends on state: a swarm that starts waiting on a person keeps its row. Its marks and the vitals carry that.
   const rank = (swarm: Swarm) => (swarm.kind === "solo" ? 1 : 0);
   const live = built
     .filter(swarm => swarm.live)
@@ -308,9 +314,10 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
     .sort((a, b) => timeOf(b.createdAt) - timeOf(a.createdAt) || a.id.localeCompare(b.id))
     .map(({ id, title, status, stopReason }) => ({ id, title, status, ...(stopReason ? { stopReason } : {}) }));
 
-  // Quiet runs are counted one by one, by the age of their own last activity: a mission's twenty finished runs are twenty rows to cap, not one.
   const cutoff = input.now - QUIET_WINDOW_MS;
-  const quietAll = built.filter(swarm => !swarm.live && swarm.kind !== "solo").flatMap(swarm => swarm.units);
+  const quietAll = built
+    .flatMap(swarm => (!swarm.live ? swarm.units : []))
+    .filter((unit): unit is QuietUnit => !unit.live);
   const quiet = quietAll
     .filter(unit => timeOf(unit.lastActivityAt) >= cutoff)
     .sort((a, b) => timeOf(b.lastActivityAt) - timeOf(a.lastActivityAt) || a.id.localeCompare(b.id))
@@ -322,7 +329,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
     byState[agent.state] += 1;
     agentCount += 1;
   }
-  const units = live.flatMap(swarm => swarm.units);
+  const units = live.flatMap(swarm => swarm.kind === "solo" ? [] : swarm.units);
 
   return {
     live,
@@ -343,9 +350,15 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
   };
 }
 
-/** The coordinator, then each unit's agents and side agents, then solo sessions. */
 export function allAgents(swarm: Swarm): Agent[] {
-  return [...(swarm.coordinator ? [swarm.coordinator] : []), ...swarm.units.flatMap(unit => [...unit.agents, ...unit.side]), ...swarm.loose];
+  switch (swarm.kind) {
+    case "mission":
+      return [...(swarm.coordinator ? [swarm.coordinator] : []), ...swarm.units.flatMap(unit => [...unit.agents, ...unit.side])];
+    case "team":
+      return swarm.units.flatMap(unit => [...unit.agents, ...unit.side]);
+    case "solo":
+      return swarm.loose;
+  }
 }
 
 export function findAgent(model: SwarmModel, id: string): Agent | undefined {
@@ -354,6 +367,6 @@ export function findAgent(model: SwarmModel, id: string): Agent | undefined {
 }
 
 export function findUnit(model: SwarmModel, id: string): Unit | undefined {
-  for (const swarm of model.live) for (const unit of swarm.units) if (unit.id === id) return unit;
+  for (const swarm of model.live) if (swarm.kind !== "solo") for (const unit of swarm.units) if (unit.id === id) return unit;
   return model.quiet.find(unit => unit.id === id);
 }

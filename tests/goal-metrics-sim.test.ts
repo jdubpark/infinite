@@ -7,14 +7,6 @@ import type { TeamCheck } from "../packages/host/src/team-types.js";
 import type { Counts } from "./outcome-sim-script.js";
 import { simulate, type Variant, Violation } from "./fixtures/goal-metrics-sim.js";
 
-/*
- * Runs the reported-numbers simulator (tests/fixtures/goal-metrics-sim.ts, which states the invariants I1-I5) over the
- * default corpus, and checks that each mutant below is caught through the invariant it names while the same corpus
- * passes without it.
- */
-
-// GOAL_METRICS_SIM_SEED=N runs that seed alone and skips the mutants; GOAL_METRICS_SIM_SEEDS=N runs N seeds from
-// GOAL_METRICS_SIM_BASE (default 1). Floors describe the default corpus only.
 const DEFAULT_SEEDS = 200;
 const ONLY = process.env.GOAL_METRICS_SIM_SEED;
 const COUNT = Number(process.env.GOAL_METRICS_SIM_SEEDS ?? DEFAULT_SEEDS);
@@ -36,17 +28,6 @@ function sweep(seeds: readonly number[], counts: Counts, variant: Variant = {}):
   return undefined;
 }
 
-/**
- * Floors for the default corpus at about half of what it produced, so a generator that stops producing a case fails.
- * They follow the cases the design lists: a host stop inside a check, between the run's write and the goal's write,
- * and after a goal write; a repeated settlement; a later revision with fewer values; a fold at a launch and in the same
- * write as a settlement; retention of orphans and past 50 entries; duplicate commands, a failed first occurrence, and
- * a setup row of a checked command; reviews that approve, ask for changes, approve an earlier revision or are missing;
- * a head that moved after its checks; and reads past 8 series, with a tie at the 8th, an unconfigured command and a
- * long label. The thinnest ran 41 to 137 times: retention past 50 entries, a failed first occurrence and an approval
- * of an earlier revision. A load that pruned never ran, since every write prunes first;
- * tests/goal-metrics-service.test.ts seeds a file that needs it.
- */
 const FLOORS: Readonly<Record<string, number>> = {
   "seed:long": 11, "seed:fold": 64, "fold:at-launch": 164, "fold:with-settlement": 85, "prune:orphan": 61, "prune:cap": 20,
   "stop:in-check": 524, "stop:between-run-and-goal": 363, "stop:after-goal-write": 88, "restart": 1076,
@@ -71,17 +52,13 @@ test("reported numbers keep their invariants across host stops, folds, reopened 
   }
 });
 
-// ---- Mutations ---------------------------------------------------------------------------------------------------
-
 type Limits = { -readonly [K in keyof typeof GOAL_METRICS]: number };
-/** Runs `run` with one of the module's limits changed, and puts it back. */
 function withLimit<T>(key: keyof Limits, value: number, run: () => T): T {
   const limits = GOAL_METRICS as Limits, was = limits[key];
   limits[key] = value;
   try { return run(); } finally { limits[key] = was; }
 }
 
-/** The first-occurrence rule turned around: a later passed occurrence of a command replaces what an earlier one kept. */
 function lastOccurrence(holder: ObservationHolder, check: TeamCheck, scan: Parameters<typeof recordObservations>[2]) {
   const command = commandDigest(check.command), round = check.round ?? 0;
   const sameTriple = (revision: number, itemRound: number, head: string | undefined) => revision === check.revision && itemRound === round && head === check.headCommit;
@@ -97,7 +74,6 @@ function lastOccurrence(holder: ObservationHolder, check: TeamCheck, scan: Param
   else delete holder.checkObservations;
 }
 
-/** The read with ties on the newest time ranked by the larger identity digest: every series ranked, tie groups reversed, then cut. */
 function reversedTies(...args: Parameters<typeof goalMetricsRead>): GoalMetricsView {
   const all = withLimit("series", Number.MAX_SAFE_INTEGER, () => goalMetricsRead(...args));
   const newest = (series: GoalMetricsView["series"][number]) => series.points.reduce((max, point) => (point.at > max ? point.at : max), "");
@@ -112,7 +88,6 @@ function reversedTies(...args: Parameters<typeof goalMetricsRead>): GoalMetricsV
   return { ...all, series: shown, omittedSeries: ranked.length - shown.length };
 }
 
-/** The mutants run only on what this version writes, so they read the stored fields as its shapes. */
 const metricsOf = (holder: { metrics?: unknown }) => holder.metrics as GoalMetrics | undefined;
 const observationsOf = (holder: ObservationHolder) => holder.checkObservations as CheckObservation[] | undefined;
 

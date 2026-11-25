@@ -1,6 +1,3 @@
-// Stand-in for a team member's provider, used by tests/member-traces.test.ts. It records the trace variable it was
-// started with and its arguments, and, when the variable is set, writes a trace there as Codex's recorder would:
-// one `trace-<id>-<id>` folder with an event log and a payload file.
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 

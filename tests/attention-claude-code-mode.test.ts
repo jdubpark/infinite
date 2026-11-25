@@ -36,7 +36,6 @@ async function replayFixture() {
     const journaledSignals: Signal["kind"][] = [];
     for (const signal of signals) {
       if (attention.prompt && dropsPrompt(attention, signal)) {
-        // Mirror worker.record(): journal the prompt close before a signal drops it.
         seq++;
         const close: SignalEvent = { seq, at: `fixture-${seq}`, type: "signal", data: { kind: "prompt-closed", promptId: attention.prompt.id, reason: "resolved", source: "hook", provider: "claude" } };
         events.push(close); attention = applySignal(attention, close); journaledSignals.push(close.data.kind);
@@ -94,7 +93,6 @@ test("Code Mode moments retain activity; hook-only waiting follows plain-mode ru
   const resolution = events.findIndex(event => event.data.kind === "prompt-closed" && event.data.reason === "resolved");
   assert.equal(resolution, stop - 1);
   const beforeStop = deriveMoments(events.slice(0, resolution));
-  // Hook-only attention still waits after Write success, as in plain mode; worker.record() resolves it immediately before Stop.
   assert.equal(beforeStop.find(moment => moment.kind === "decision")?.detail, "Waiting");
   const moments = deriveMoments(events);
 
@@ -150,7 +148,6 @@ test("an unmatched REPL end preserves a running Bash tool and its permission pro
   assert.equal(attention.state, "needs-you");
 });
 
-// The hook of the provider's own continue has no marker: the worker adds it, because only the worker knows it resumed.
 test("the continue prompt hook maps to a plain turn-start with no automatic marker", () => {
   const body = {
     session_id: "00000000-0000-4000-8000-000000000001", transcript_path: "/home/dev/.claude/projects/demo/00000000-0000-4000-8000-000000000001.jsonl",

@@ -11,7 +11,6 @@ const VERDICT_ID = "2b7e1c90-5d3a-4f8e-a1b2-c3d4e5f60718";
 
 const parses = (value: unknown) => objectiveRecordSchema.safeParse(value).success;
 const withDigest = (record: any) => ({ ...record, digest: recordDigest(record) });
-/** Gives a record the direction history its steering directions need: one appended entry each, at versions 2, 3, and so on. */
 function withHistory(record: any): any {
   const steered = record.statement.directions.filter((item: any) => item.source === "steering");
   record.log = [record.log[0], ...steered.map((item: any, index: number) => ({

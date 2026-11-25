@@ -8,14 +8,6 @@ import type { Config } from "../packages/host/src/types.js";
 import { Clock, World, type WorldHooks } from "./fixtures/main-check-world.js";
 import { rand } from "./outcome-sim-script.js";
 
-/*
- * The main-check service on the simulator's fake ports (INF-388). Memory follows only a write that landed: a write
- * that throws leaves the view as it was, an admission whose write throws starts nothing, and the next pass after the
- * writes work again proceeds. The simulator does not inject failed writes: its oracle reads each decision at the time
- * of its write, and a write that lands later on a retry would need the decision's own time modelled as well.
- * Also: a stop that lands after a command's leader exited ends the check by that stop, and no Git helper runs after it.
- */
-
 const ROOT = "/srv/main-check-memory";
 const T0 = Date.parse("2026-11-20T08:00:00.000Z");
 const HEAD = "a".repeat(40);
@@ -25,7 +17,6 @@ const PASS_MS = 30_000;
 const turns = async () => { for (let turn = 0; turn < 5; turn += 1) await new Promise(resolve => setImmediate(resolve)); };
 const observed = (): MainCheckRecord => ({ ...emptyRecord(), observed: { head: HEAD, at: new Date(T0 - 60_000).toISOString() } });
 
-/** A write the fake records refuse, as a full disk or a failed rename would. */
 type Refusal = (next: MainCheckRecord, before: MainCheckRecord | undefined) => boolean;
 
 class Host {
@@ -63,7 +54,6 @@ class Host {
     return text === undefined ? undefined : JSON.parse(text) as MainCheckRecord;
   }
 
-  /** Alpha's record holds `record`; the service starts on the world's ports, `ports` replacing some, and runs its first pass. */
   async start(record: MainCheckRecord, ports: Partial<MainCheckPorts> = {}) {
     this.world.records.set("alpha", JSON.stringify(record));
     const config = {
@@ -92,7 +82,6 @@ class Host {
     return view;
   }
 
-  /** Runs the virtual timers due in the next `ms`, letting promises settle after each. */
   async advance(ms: number) {
     const target = this.clock.now + ms;
     for (let timer = this.clock.take(target); timer; timer = this.clock.take(target)) {
@@ -107,7 +96,6 @@ class Host {
 
 test("an observation whose write throws leaves memory as it was, and the fetch repeated once writes work lands", async () => {
   const host = new Host();
-  // The halt keeps the head from being admitted, so the record changes only by observations.
   host.world.faults.halt.projects.add("alpha");
   await host.start(observed());
   const before = structuredClone(host.view());
@@ -139,7 +127,6 @@ test("an admission whose write throws prepares no copy and starts no command; th
   assert.equal(host.record()?.running, undefined);
   assert.equal(host.record()?.attempts, undefined);
   host.refuse = undefined;
-  // To the periodic pass and not past it: the copy's Git commands take virtual time.
   await host.advance(T0 + PASS_MS - host.clock.now);
   assert.equal(host.calls.refused, refused, "no write was refused after the writes worked again");
   assert.equal(host.record()?.running?.head, HEAD, "the next pass admitted the head");
@@ -153,7 +140,6 @@ test("an admission whose write throws prepares no copy and starts no command; th
 test("a stop that lands after a command's leader exited ends the check by that stop, with no Git helper after it", async () => {
   const host = new Host();
   let ran = 0;
-  // The leader exited 0 with its output still open; the stop in the drain settles the command at once, not interrupted.
   const run: MainCheckPorts["run"] = (_command, _cwd, signal) => new Promise<CommandResult>(resolve => {
     ran += 1;
     signal?.addEventListener("abort", () => resolve({ exitCode: 0, output: "", stdout: "", interrupted: false, truncated: true }), { once: true });

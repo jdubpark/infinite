@@ -3,7 +3,6 @@ import { join } from "node:path";
 import type { WorkerRequest } from "./types.js";
 export const socketPath = (runDir: string, id: string) =>
   join(runDir, `${id}.sock`);
-/** Error from a worker; `code` is set when the worker refused for a reason the client can act on. */
 export type WorkerError = Error & { code?: string };
 export function workerCall<T>(
   runDir: string,

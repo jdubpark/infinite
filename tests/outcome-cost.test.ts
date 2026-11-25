@@ -6,7 +6,6 @@ import { buildRollup } from "../packages/host/src/outcome-rollup.js";
 import type { OutcomeRow, RollupRecords } from "../packages/host/src/outcome-store.js";
 import type { SessionUsage, UnmeasuredUsage } from "../packages/host/src/usage-service.js";
 
-/** A measured session of 24 tokens and 0.5 USD, or of the amounts given, with the coverage and the unpriced steps given. */
 function measured(coverage: "partial" | "complete", unpriced = 0, amounts: { input: number; cost: number } = { input: 10, cost: 0.5 }): SessionUsage {
   return {
     measured: true, coverage, cost: amounts.cost, messages: 2,
@@ -17,7 +16,6 @@ function measured(coverage: "partial" | "complete", unpriced = 0, amounts: { inp
 
 test("a session's cost is complete only with complete coverage and every step priced", () => {
   assert.deepEqual(sessionCostOf(measured("complete")), { usd: 0.5, tokens: 24, complete: true });
-  // The ledger read only a part of the session: its usage is known to be understated.
   assert.deepEqual(sessionCostOf(measured("partial")), { usd: 0.5, tokens: 24, complete: false });
   assert.deepEqual(sessionCostOf(measured("complete", 1)), { usd: 0.5, tokens: 24, complete: false });
 });
@@ -42,7 +40,6 @@ test("a roll-up leaves a partly covered session out of its sums and counts it as
   });
   const records: RollupRecords = { runIds: ["run-1"], summaries: [], rows: [row("m1", "whole"), row("m2", "part")], members: [],
     unreadable: { summaries: 0, rows: 0, members: 0 }, unindexed: 0 };
-  // The two sessions have different amounts, so the sums show which one counted: 24 tokens and 0.5 USD are the whole one's.
   const usage: Record<string, SessionUsage> = { whole: measured("complete"), part: measured("partial", 0, { input: 986, cost: 7 }) };
   const rollup = buildRollup(records, { target: { kind: "goal", id: "goal-1" }, known: true, assessment: null, cost: sessionId => sessionCostOf(usage[sessionId]!) });
   assert.deepEqual(rollup.cost, { sessions: 2, complete: 1, noSession: 0, tokens: 24, spentUsd: 0.5 });

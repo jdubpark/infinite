@@ -4,7 +4,6 @@ import { api, type Connection } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { deviceTz, type DailySeries, type ModelsScorecard, type ProjectCost, type ProjectsList, type UsageOverview } from "./model";
 
-/** Day buckets follow the phone's timezone so the bars match the owner's calendar. */
 const tz = () => `tz=${encodeURIComponent(deviceTz())}`;
 
 export function useUsageOverview(connection: Connection) {
@@ -25,7 +24,6 @@ export function useModels(connection: Connection, role: string) {
   return usePoll(() => api<ModelsScorecard>(connection, `/usage/models${query}`), 30000, [connection, role]);
 }
 
-/** Owner ratings are independent of team revisions, so a successful receipt only refreshes the view. */
 export function useTaskRating(connection: Connection, teamId: string, onRecorded: () => void) {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");

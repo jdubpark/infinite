@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-// Infinite egress proxy. Agent sessions on the Ubuntu host reach the network through it.
-// Node standard library only. It never terminates TLS: it sees host names and ports, never content.
-// Deployment, policy, and limits: deploy/ubuntu/egress.md.
 import { createServer, request as httpRequest } from "node:http";
 import { connect as netConnect, isIPv4, isIPv6 } from "node:net";
 import { lookup } from "node:dns/promises";
@@ -11,7 +8,6 @@ import { lstat, open, rename, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// The host mints credentials in this format (packages/host/src/egress.ts); both sides must agree.
 const CREDENTIAL_CONTEXT = "infinite-egress/v1";
 const MAX_CREDENTIAL_LIFETIME_SECONDS = 31 * 24 * 60 * 60;
 const PROJECT_LABEL = /^(?:_host|_none|_eval-setup|_eval|[a-z0-9-]{1,80})$/;
@@ -22,8 +18,6 @@ const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_POLICY_BYTES = 1024 * 1024;
 const MAX_SUMMARY_BYTES = 16 * 1024 * 1024;
 const KEY_BYTES = 32;
-// What a client may send before the tunnel opens: the bytes that arrive with its CONNECT and those that follow,
-// counted together (a TLS client hello fits many times over).
 const MAX_EARLY_BYTES = 64 * 1024;
 
 export const DEFAULT_LIMITS = Object.freeze({
@@ -76,17 +70,10 @@ function plainObject(value) {
   return prototype === Object.prototype || prototype === null;
 }
 
-// ---------------------------------------------------------------------------
-// Credentials
-
 export function credentialMac(key, project, session, expires) {
   return createHmac("sha256", key).update(`${CREDENTIAL_CONTEXT}\n${project}\n${session}\n${expires}`, "utf8").digest();
 }
 
-/**
- * Checks a `Proxy-Authorization` header statelessly. The user name is `PROJECT.SESSION`; the password is
- * `v1.EXPIRES.MAC`, where MAC is HMAC-SHA256 over the context, project, session, and expiry in Unix seconds.
- */
 export function verifyProxyAuthorization(header, key, nowMs = Date.now()) {
   if (header === undefined) return { ok: false, reason: "missing" };
   if (typeof header !== "string" || header.length > 512) return { ok: false, reason: "malformed" };
@@ -101,13 +88,9 @@ export function verifyProxyAuthorization(header, key, nowMs = Date.now()) {
   const nowSeconds = Math.floor(nowMs / 1000);
   const expiresAt = Number(expires);
   if (expiresAt <= nowSeconds) return { ok: false, reason: "expired" };
-  // Only the host mints credentials; a lifetime past the host's maximum is not one it made.
   if (expiresAt > nowSeconds + MAX_CREDENTIAL_LIFETIME_SECONDS) return { ok: false, reason: "bad-credential" };
   return { ok: true, project, session };
 }
-
-// ---------------------------------------------------------------------------
-// Hosts, ports, and addresses
 
 const PRINTABLE_ASCII = /^[\x21-\x7e]+$/;
 const LABEL = "[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?";
@@ -120,7 +103,6 @@ function ipv4Part(part) {
   return undefined;
 }
 
-/** The dotted form of an IPv4 address written as most resolvers read it: decimal, octal, hex, or shortened. */
 export function legacyIPv4(host) {
   const parts = host.split(".");
   if (parts.length > 4) return undefined;
@@ -133,7 +115,6 @@ export function legacyIPv4(host) {
   return [value >>> 24, (value >>> 16) & 255, (value >>> 8) & 255, value & 255].join(".");
 }
 
-/** Eight 16-bit groups of an IPv6 address, or undefined. Zone identifiers are refused. */
 export function ipv6Groups(text) {
   if (typeof text !== "string" || text.length > 45 || text.includes("%") || !isIPv6(text)) return undefined;
   let source = text;
@@ -158,7 +139,6 @@ export function ipv6Groups(text) {
   return groups;
 }
 
-/** RFC 5952 text for eight groups. */
 export function formatIPv6(groups) {
   let bestStart = -1;
   let bestLength = 0;
@@ -174,7 +154,6 @@ export function formatIPv6(groups) {
   return `${hex.slice(0, bestStart).join(":")}::${hex.slice(bestStart + bestLength).join(":")}`;
 }
 
-/** A host as the proxy compares and resolves it: `{ kind: "name" | "ipv4" | "ipv6", host }`, or undefined. */
 export function normalizeHost(raw) {
   if (typeof raw !== "string" || raw.length === 0 || raw.length > 256 || !PRINTABLE_ASCII.test(raw)) return undefined;
   if (raw.startsWith("[")) {
@@ -185,7 +164,6 @@ export function normalizeHost(raw) {
   let host = raw.toLowerCase();
   if (host.endsWith(".")) host = host.slice(0, -1);
   if (host.length === 0 || host.length > 253 || !NAME.test(host) || host.split(".").some(label => label.length > 63)) return undefined;
-  // A name whose last label is a number is an IPv4 address to resolvers; one that is not a valid address is refused.
   if (/^(?:0x[0-9a-f]*|[0-9]+)$/.test(host.split(".").at(-1))) {
     const address = legacyIPv4(host);
     return address ? { kind: "ipv4", host: address } : undefined;
@@ -193,15 +171,10 @@ export function normalizeHost(raw) {
   return { kind: "name", host };
 }
 
-/** The host as it appears in policy entries, records, and the summary: IPv6 in brackets. */
 export function hostKey(target) {
   return target.kind === "ipv6" ? `[${target.host}]` : target.host;
 }
 
-/**
- * Parses `host:port` (authority form, no user information). Without a port, `defaultPort` applies, or the parse
- * fails when there is none. Ports have no leading zeros.
- */
 export function parseAuthority(text, defaultPort) {
   if (typeof text !== "string" || text.length === 0 || text.length > 300 || !PRINTABLE_ASCII.test(text)) return undefined;
   if (/[@%\\/?#,;"'<>`{}|^]/.test(text)) return undefined;
@@ -268,7 +241,6 @@ function classifyIPv4Number(value) {
 
 function classifyIPv6(groups) {
   const [g0, g1, g2, g3, g4, g5, g6, g7] = groups;
-  // An address that carries an IPv4 address is refused; the class names what it carries when that is refused too.
   const carried = () => classifyIPv4Number(((g6 << 16) >>> 0) + g7) ?? "reserved";
   if (groups.every(group => group === 0)) return "unspecified";
   if (groups.slice(0, 7).every(group => group === 0) && g7 === 1) return "loopback";
@@ -277,16 +249,14 @@ function classifyIPv6(groups) {
   if ((g0 & 0xffc0) === 0xfe80) return "link-local";
   if ((g0 & 0xff00) === 0xff00) return "multicast";
   if ((g0 & 0xfe00) === 0xfc00) return "private";
-  // Outside global unicast (2000::/3), and the special blocks inside it, nothing is reachable on purpose.
   if ((g0 & 0xe000) !== 0x2000) return "reserved";
-  if (g0 === 0x2001 && g1 < 0x0200) return "reserved"; // IETF protocol assignments: Teredo, benchmarking, ORCHID
-  if (g0 === 0x2001 && g1 === 0x0db8) return "reserved"; // documentation
-  if (g0 === 0x2002) return "reserved"; // 6to4 carries an IPv4 address
-  if (g0 === 0x3fff && (g1 & 0xf000) === 0) return "reserved"; // documentation
+  if (g0 === 0x2001 && g1 < 0x0200) return "reserved";
+  if (g0 === 0x2001 && g1 === 0x0db8) return "reserved";
+  if (g0 === 0x2002) return "reserved";
+  if (g0 === 0x3fff && (g1 & 0xf000) === 0) return "reserved";
   return undefined;
 }
 
-/** Undefined for an address the proxy may connect to; otherwise the refused class. */
 export function classifyAddress(address) {
   if (typeof address !== "string") return "invalid";
   if (isIPv4(address)) return classifyIPv4Number(ipv4Number(address));
@@ -300,9 +270,6 @@ function canonicalAddress(address) {
   return groups ? { address: formatIPv6(groups), family: 6 } : undefined;
 }
 
-// ---------------------------------------------------------------------------
-// Policy
-
 function hostRules(list, code) {
   if (!Array.isArray(list) || list.length > 5000) fail(code);
   const exact = new Set();
@@ -311,7 +278,6 @@ function hostRules(list, code) {
     if (typeof entry !== "string") fail(code);
     if (entry.startsWith("*.")) {
       const suffix = normalizeHost(entry.slice(2));
-      // A wildcard covers subdomains of a name with at least two labels, never a top-level domain or an address.
       if (!suffix || suffix.kind !== "name" || !suffix.host.includes(".")) fail(code);
       suffixes.push(suffix.host);
     } else {
@@ -323,7 +289,6 @@ function hostRules(list, code) {
   return Object.freeze({ exact, suffixes: Object.freeze(suffixes) });
 }
 
-/** Validates a parsed policy document. Throws an EgressError whose code names the first problem. */
 export function validatePolicy(input) {
   if (!plainObject(input)) fail("policy-shape");
   const allowed = ["mode", "ports", "allow", "projects", "allowPrivate"];
@@ -358,9 +323,6 @@ function listedIn(rules, target) {
   return target.kind === "name" && rules.suffixes.some(suffix => target.host.endsWith(`.${suffix}`));
 }
 
-// ---------------------------------------------------------------------------
-// Summary
-
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const SUMMARY_HOST = /^(?:-|[a-z0-9._:\[\]-]{1,260})$/;
 const SUMMARY_PROJECT = /^(?:_unauthenticated|_host|_none|_eval-setup|_eval|[a-z0-9-]{1,80})$/;
@@ -373,7 +335,6 @@ function validCounts(value) {
   return plainObject(value) && Object.entries(value).every(([decision, count]) => DECISIONS.includes(decision) && Number.isSafeInteger(count) && count >= 0);
 }
 
-/** Per day, per project, per host: counts by decision. Bounded in days and in host entries per day. */
 export class EgressSummary {
   constructor({ maxDays = 14, maxHostsPerDay = 2000 } = {}) {
     this.maxDays = maxDays;
@@ -422,7 +383,6 @@ export class EgressSummary {
     return days;
   }
 
-  /** Rebuilds a summary from `toJSON` output, within this summary's bounds; throws on anything else. */
   static from(days, options) {
     const summary = new EgressSummary(options);
     if (!plainObject(days) || Object.keys(days).some(day => !DAY.test(day))) fail("summary-shape");
@@ -450,12 +410,8 @@ export class EgressSummary {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Files
-
 const TRUSTED_OWNERS = new Set([0, typeof process.getuid === "function" ? process.getuid() : 0]);
 
-/** Reads a regular file (no symlink) owned by root or this account, refusing the mode bits in `forbidden`. */
 async function readChecked(path, label, maxBytes, forbidden) {
   let before;
   try {
@@ -483,7 +439,6 @@ async function readChecked(path, label, maxBytes, forbidden) {
   }
 }
 
-/** The shared HMAC key: exactly 32 bytes, no access for other users, no group write. */
 export async function readKey(path) {
   const key = await readChecked(path, "key", KEY_BYTES, 0o027);
   if (key.length !== KEY_BYTES) fail("key-length");
@@ -523,7 +478,6 @@ function canonicalPath(value, code) {
   return value;
 }
 
-/** The proxy's own configuration, read once at start. */
 export async function readProxyConfig(path) {
   const raw = await readChecked(canonicalPath(resolve(path), "config-path"), "config", MAX_CONFIG_BYTES, 0o022);
   let input;
@@ -556,9 +510,6 @@ export async function readProxyConfig(path) {
     limits: Object.freeze(limits),
   };
 }
-
-// ---------------------------------------------------------------------------
-// The proxy
 
 const STATUS_TEXT = {
   400: "Bad Request",
@@ -618,11 +569,8 @@ function statusFor(reason, decision) {
   return 403;
 }
 
-/** Upstream attempts one request may hold open at once. With maxConnections clients this bounds upstream sockets at
- * four per client, well inside the service's descriptor limit. */
 const MAX_ATTEMPTS_IN_FLIGHT = 4;
 
-/** Checked addresses in RFC 8305 order: the resolver's first family first, then alternating, each family in resolver order. */
 function alternateFamilies(addresses) {
   const first = addresses.filter(entry => entry.family === addresses[0]?.family);
   const other = addresses.filter(entry => entry.family !== addresses[0]?.family);
@@ -645,7 +593,6 @@ function forwardedHeaders(rawHeaders, hostHeader) {
   for (let index = 0; index + 1 < rawHeaders.length; index += 2) {
     if (rawHeaders[index].toLowerCase() === "connection") for (const token of rawHeaders[index + 1].split(",")) connectionTokens.add(token.trim().toLowerCase());
   }
-  // No prototype: a header named `constructor` or `__proto__` is just a header.
   const headers = Object.create(null);
   for (let index = 0; index + 1 < rawHeaders.length; index += 2) {
     const name = rawHeaders[index].toLowerCase();
@@ -656,13 +603,8 @@ function forwardedHeaders(rawHeaders, hostHeader) {
   return headers;
 }
 
-// Methods whose requests carry no body unless they say so; any other method states its length, even when it is zero.
 const BODYLESS_METHODS = new Set(["GET", "HEAD", "DELETE", "OPTIONS", "TRACE"]);
 
-/**
- * How a request delimits its body, read from the raw headers. Only framing the proxy can reproduce exactly is
- * accepted: one Content-Length, or the chunked coding alone. Anything else is refused, never guessed at.
- */
 export function requestFraming(rawHeaders) {
   const lengths = [];
   const codings = [];
@@ -681,7 +623,6 @@ export function requestFraming(rawHeaders) {
   return { kind: "none" };
 }
 
-/** The forwarded body's framing, set explicitly for every method after the hop-by-hop headers are gone. */
 function frameHeaders(headers, framing, method) {
   delete headers["content-length"];
   delete headers["transfer-encoding"];
@@ -691,10 +632,6 @@ function frameHeaders(headers, framing, method) {
   return headers;
 }
 
-/**
- * Creates the proxy. `resolve(host)` returns `[{ address, family }]` (default: the system resolver, every address);
- * `log(record)` receives each record (default: one JSON line on stdout); `now()` is the clock.
- */
 export function createEgressProxy(options) {
   const key = options.key;
   if (!Buffer.isBuffer(key) || key.length !== KEY_BYTES) fail("key-length");
@@ -724,7 +661,7 @@ export function createEgressProxy(options) {
 
   const iso = (ms = clock()) => new Date(ms).toISOString();
   const say = record => {
-    try { emit(record); } catch { /* a failed log line never fails a connection */ }
+    try { emit(record); } catch {}
   };
 
   function markDirty() {
@@ -742,7 +679,6 @@ export function createEgressProxy(options) {
     return { schema: 1, updatedAt: iso(), mode: policy?.mode ?? null, policy: { loadedAt: policyLoadedAt, error: policyError }, days: summary.toJSON() };
   }
 
-  /** Writes the summary now (atomically), if there is one to write. */
   function flush() {
     if (!summaryFile) return Promise.resolve();
     writing = writing.then(async () => {
@@ -770,7 +706,6 @@ export function createEgressProxy(options) {
     }
   }
 
-  /** Re-reads the policy. A policy that fails to load leaves the last good one in force. */
   function reload() {
     reloading = reloading.then(async () => {
       try {
@@ -789,11 +724,6 @@ export function createEgressProxy(options) {
     return reloading;
   }
 
-  /**
-   * A connection's place in the global and per-session limits. The client connection holds it, and so does every
-   * piece of work started for it (the handler, a name lookup); it is freed only when all of them have settled. A
-   * client that disconnects therefore cannot leave lookups or connection attempts running outside the limits.
-   */
   function acquire(identity) {
     const id = `${identity.project}.${identity.session}`;
     const count = perSession.get(id) ?? 0;
@@ -822,11 +752,6 @@ export function createEgressProxy(options) {
     };
   }
 
-  /**
-   * The system lookup for a name. Concurrent requests for one name share a single lookup. A new lookup counts against
-   * the global and the starting session's lookup limits until it settles, however long that takes: a timeout ends a
-   * wait for it, never its count, because the system resolver cannot cancel it.
-   */
   function lookupName(host, sessionId) {
     const shared = lookupsByName.get(host);
     if (shared) return shared;
@@ -874,7 +799,6 @@ export function createEgressProxy(options) {
   async function resolveTarget(target, slot) {
     if (target.kind !== "name") return [{ address: target.host, family: target.kind === "ipv4" ? 4 : 6 }];
     const pending = lookupName(target.host, slot.id);
-    // The connection keeps its slot until the lookup it waited on settles, even when the wait below times out.
     const settled = slot.hold();
     pending.then(settled, settled);
     let timer;
@@ -892,10 +816,6 @@ export function createEgressProxy(options) {
     }
   }
 
-  /**
-   * The policy decision for one destination. Enforce refuses an unlisted host before any lookup, so the proxy never
-   * resolves a name it would refuse. Every address a name resolves to is checked; one refused address refuses the name.
-   */
   async function decide(identity, target, slot) {
     const current = policy;
     if (!current) return { refuse: true, decision: "refused", reason: "no-policy" };
@@ -918,15 +838,6 @@ export function createEgressProxy(options) {
     return { refuse: false, decision, reason: listed ? "listed" : "not-listed", addresses };
   }
 
-  /**
-   * Connects to the checked addresses, by address, so no second lookup can change the target. Attempts are staggered
-   * as RFC 8305 describes: families alternate, and the next address starts as soon as the current one fails or after
-   * `attemptDelayMs`, so an address that never answers (a route that drops packets) cannot use up the whole connect
-   * timeout. At most MAX_ATTEMPTS_IN_FLIGHT attempts are open per request: starting another retires the oldest, so a
-   * name with many silent addresses keeps moving without holding a socket for each. The first attempt to connect wins
-   * and the others are destroyed. `signal` aborts when the client goes away; every attempt in progress is then
-   * destroyed at once.
-   */
   function connectUpstream(addresses, port, signal) {
     const ordered = alternateFamilies(addresses);
     return new Promise((resolvePromise, reject) => {
@@ -997,7 +908,6 @@ export function createEgressProxy(options) {
     if (socket.destroyed || reason === "client-closed") { socket.destroy(); return; }
     const status = statusFor(reason, decision);
     const extra = status === 407 ? 'Proxy-Authenticate: Basic realm="infinite-egress"\r\n' : "";
-    // Bytes the client already sent are read and dropped, never forwarded, so the close is not a reset.
     socket.resume();
     socket.end(rawResponse(status, refusalBody(reason, entry), extra));
     setTimeout(() => socket.destroy(), 1000).unref?.();
@@ -1044,7 +954,6 @@ export function createEgressProxy(options) {
     });
     upstream.once("close", () => {
       upstreamClosed = true;
-      // A clean close lets the client read what is still queued; a failure aborts it.
       if (upstreamFailed) client.destroy();
       else {
         client.end();
@@ -1052,10 +961,8 @@ export function createEgressProxy(options) {
       }
       settle();
     });
-    // The client already carries the idle timeout set when its CONNECT arrived.
     upstream.setTimeout(limits.idleTimeoutMs, () => upstream.destroy());
     client.write("HTTP/1.1 200 Connection established\r\n\r\n");
-    // Bytes the client sent after the CONNECT head, before the tunnel opened, belong to the tunnel.
     if (head && head.length) upstream.write(head);
     client.pipe(upstream);
     upstream.pipe(client);
@@ -1073,8 +980,6 @@ export function createEgressProxy(options) {
     entry.project = auth.project;
     entry.session = auth.session;
     if (!target) return refuseSocket(client, entry, "refused", "bad-target");
-    // Bytes that arrived in the same read as the CONNECT head are held for the tunnel like those that follow, so
-    // they count toward the same limit.
     let earlyBytes = head?.length ?? 0;
     if (earlyBytes > MAX_EARLY_BYTES) return refuseSocket(client, entry, "refused", "early-data-too-large");
     const slot = acquire(auth);
@@ -1082,8 +987,6 @@ export function createEgressProxy(options) {
     const gone = new AbortController();
     const clientHold = slot.hold();
     client.once("close", () => { gone.abort(); clientHold(); });
-    // Until the tunnel opens, read what the client sends and keep it for the tunnel, so that a client leaving is seen
-    // at once, even as a half-close. Leaving before the tunnel opens ends the request and any pending connection.
     const early = [];
     let tunnelled = false;
     const keep = chunk => {
@@ -1122,7 +1025,6 @@ export function createEgressProxy(options) {
     }
   }
 
-  /** Absolute-form `http://` requests. Each response closes its connection, so one connection carries one decision. */
   async function onRequest(req, res) {
     const entry = newEntry("http");
     res.shouldKeepAlive = false;
@@ -1177,12 +1079,9 @@ export function createEgressProxy(options) {
     upstream.setTimeout(limits.idleTimeoutMs, () => upstream.destroy());
     const path = rest === "" ? "/" : rest.startsWith("?") ? `/${rest}` : rest;
     const hostHeader = target.port === 80 ? hostKey(target) : `${hostKey(target)}:${target.port}`;
-    // A fresh upstream connection per request, closed after its response: no connection is reused after a body.
     const headers = Object.assign(frameHeaders(forwardedHeaders(req.rawHeaders, hostHeader), framing, req.method), { connection: "close" });
     let outgoing;
     try {
-      // No agent: `createConnection` hands over the socket already connected to the checked address. The same
-      // address is named again so that nothing could fall back to a lookup of its own.
       outgoing = httpRequest({ method: req.method, host: entry.address, port: target.port, path, headers, setHost: false, createConnection: () => upstream });
     } catch {
       upstream.destroy();
@@ -1271,7 +1170,6 @@ export function createEgressProxy(options) {
       server.listen(target, () => {
         server.off("error", reject);
         const address = server.address();
-        // A socket handed over by systemd is checked too: the proxy serves loopback only.
         if (!address || typeof address === "string" || classifyAddress(address.address === "::ffff:127.0.0.1" ? "127.0.0.1" : address.address) !== "loopback") {
           server.close();
           reject(new EgressError("listen-not-loopback"));
@@ -1291,7 +1189,6 @@ export function createEgressProxy(options) {
       server.closeAllConnections?.();
       for (const socket of active) socket.destroy();
     });
-    // Records from the connections closed above land before the last write.
     await new Promise(resolvePromise => setImmediate(resolvePromise));
     await flush();
   }
@@ -1306,9 +1203,6 @@ export function createEgressProxy(options) {
     state: () => ({ mode: policy?.mode ?? null, policyError, open, sessions: perSession.size, lookups }),
   };
 }
-
-// ---------------------------------------------------------------------------
-// Command line
 
 function socketActivation() {
   const count = process.env.LISTEN_FDS;

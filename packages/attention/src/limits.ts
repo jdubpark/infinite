@@ -16,11 +16,6 @@ function hour24(h: string, meridiem: string): number | undefined {
   return (n % 12) + (meridiem.toLowerCase() === "pm" ? 12 : 0);
 }
 
-/**
- * Parses a provider reset hint into an ISO time: `resets 3:45pm`, `resets Mon 12:00am`, or
- * `Try again at Oct 18, 2026 3:45 PM`. Clock times are read as UTC (the host runs in UTC) and
- * resolve to the next occurrence after `now`. Returns undefined when the text has no known shape.
- */
 export function parseResetTime(text: string, now: Date): string | undefined {
   const dated = /Try again at\s+([A-Za-z]{3})[a-z]*\s+(\d{1,2}),\s+(\d{4})\s+(\d{1,2}):(\d{2})\s*([AaPp][Mm])/.exec(text);
   if (dated) {
@@ -52,15 +47,9 @@ export function parseResetTime(text: string, now: Date): string | undefined {
   return undefined;
 }
 
-/**
- * Reads a provider usage limit off the screen. Codex only counts when its own status row (the last
- * non-empty row, as a whole `·`-separated segment) says `usage limited`: transcript text can be printed by a member
- * with cat or grep and must never trigger on its own.
- */
 export function detectLimit(lines: string[], provider: Provider, now: Date): DetectedLimit | null {
   const clean = lines.map(cleanLine);
   if (provider === "claude") {
-    // The notice may be typeset with a straight or a curly apostrophe.
     const line = clean.find((l) => /You['’]ve hit your .* limit/.test(l));
     if (!line) return null;
     return { limit: "usage", resetsAt: parseResetTime(line, now), message: line.slice(0, 300) };

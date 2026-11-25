@@ -22,7 +22,6 @@ export const mcpConfigSchema = z.object({
 }).strict();
 export type McpConfig = z.infer<typeof mcpConfigSchema>;
 export type McpConnector = z.infer<typeof mcpConnectorSchema>;
-/** The authenticated connector's identity, never supplied by tool arguments. */
 export interface ConnectorSource { kind: "connector"; id: string; name: string }
 
 export const mcpStartSchema = z.object({
@@ -51,14 +50,12 @@ export interface McpRequestView {
   status: "queued" | "planning" | "working" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "cancelled";
   revision?: number;
   tracking: { state: "pending" | "linked"; identifier?: string; url?: string };
-  /** `recommendation` is what the asking agent would answer and why. It is never the person's answer. */
   questions: { id: string; question: string; options: string[]; recommendation?: { answers: string[]; reason: string } }[];
   result?: { kind: "agent-report"; summary: string };
   message?: string;
   availableActions: ("reply" | "pause" | "resume" | "cancel")[];
 }
 type Result<T> = T | Promise<T>;
-/** Only the authenticated connector ID crosses from transport into the domain. */
 export interface McpRequestApi {
   listProjects(connectorId: string): Result<McpProjectList>;
   startRequest(connectorId: string, input: McpStartInput): Result<McpRequestView>;
@@ -66,7 +63,6 @@ export interface McpRequestApi {
   replyToRequest(connectorId: string, input: McpReplyInput): Result<McpRequestView>;
   controlRequest(connectorId: string, input: McpControlInput): Result<McpRequestView>;
 }
-/** Fixed public errors; unexpected host/provider errors are never forwarded. */
 export class McpRequestError extends Error {
   constructor(readonly code: string, message: string) { super(message); this.name = "McpRequestError"; }
 }

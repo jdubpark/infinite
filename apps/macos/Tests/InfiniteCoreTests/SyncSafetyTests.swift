@@ -145,7 +145,7 @@ final class SyncSafetyTests: XCTestCase {
         XCTAssertNotEqual(DraftLocation(bundleID: "dev.infinite.desktop.beta"), DraftLocation(bundleID: "dev.infinite.desktop"))
     }
 
-    func testUnderstandingSnapshotCacheEncryptsAndScopesBoundedOfflineSnapshots() throws {
+    func testUnderstandingSnapshotCacheEncryptsAndScopesBoundedOfflineSnapshots() async throws {
         let location = DraftLocation(bundleID: "dev.infinite.test-\(UUID().uuidString.lowercased())")
         let service = "\(location.service).understanding-snapshots"
         let cacheDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -158,21 +158,26 @@ final class SyncSafetyTests: XCTestCase {
         let store = UnderstandingSnapshotStore(location: location)
         let secretText = "private workspace source snapshot"
         for index in 0..<5 {
-            try store.mergeOverview(host: "host-A", credential: "credential-A", workspace: "workspace-\(index)",
-                                    membershipRevision: index, data: Data(secretText.utf8))
+            try await store.mergeOverview(host: "host-A", credential: "credential-A", workspace: "workspace-\(index)",
+                                          membershipRevision: index, data: Data(secretText.utf8))
         }
         let encryptedFile = cacheDirectory.appendingPathComponent("workspace-snapshots.sealed")
         let ciphertext = try Data(contentsOf: encryptedFile)
         XCTAssertFalse(String(decoding: ciphertext, as: UTF8.self).contains(secretText))
 
-        let recent = try store.readRecent(host: "host-A", credential: "credential-A")
+        let recent = try await store.readRecent(host: "host-A", credential: "credential-A")
         XCTAssertEqual(recent.count, 4)
-        XCTAssertNil(try store.read(host: "other-host", credential: "credential-A", workspace: "workspace-4", membershipRevision: 4))
-        XCTAssertNil(try store.read(host: "host-A", credential: "other-credential", workspace: "workspace-4", membershipRevision: 4))
-        XCTAssertNil(try store.read(host: "host-A", credential: "credential-A", workspace: "workspace-4", membershipRevision: 3))
-        XCTAssertNotNil(try store.read(host: "host-A", credential: "credential-A", workspace: "workspace-4", membershipRevision: 4))
-        XCTAssertNil(try store.read(host: "host-A", credential: "credential-A", workspace: "workspace-4", membershipRevision: 4,
-                                    now: Date().addingTimeInterval(25 * 60 * 60)))
+        let otherHost = try await store.read(host: "other-host", credential: "credential-A", workspace: "workspace-4", membershipRevision: 4)
+        XCTAssertNil(otherHost)
+        let otherCredential = try await store.read(host: "host-A", credential: "other-credential", workspace: "workspace-4", membershipRevision: 4)
+        XCTAssertNil(otherCredential)
+        let staleRevision = try await store.read(host: "host-A", credential: "credential-A", workspace: "workspace-4", membershipRevision: 3)
+        XCTAssertNil(staleRevision)
+        let current = try await store.read(host: "host-A", credential: "credential-A", workspace: "workspace-4", membershipRevision: 4)
+        XCTAssertNotNil(current)
+        let expired = try await store.read(host: "host-A", credential: "credential-A", workspace: "workspace-4", membershipRevision: 4,
+                                           now: Date().addingTimeInterval(25 * 60 * 60))
+        XCTAssertNil(expired)
 
         let overview = try JSON.object(["schemaVersion": .number(1), "workspace": .object(["id": .string("workspace-4")])]).data()
         let catalog = try JSON.object(["revision": .number(7), "projects": .array([])]).data()
@@ -180,26 +185,90 @@ final class SyncSafetyTests: XCTestCase {
         let detail = try JSON.object(["component": .object(["id": .string("component-a")]), "relationships": .array([])]).data()
 
         // Exercise overview-first and knowledge-first writer orders, then cold-open as an offline reader.
-        try store.mergeOverview(host: "host-A", credential: "credential-A", workspace: "workspace-4",
-                                membershipRevision: 4, data: overview)
-        try store.mergeKnowledge(host: "host-A", credential: "credential-A", workspace: "workspace-4",
-                                 membershipRevision: 4, catalog: catalog, components: components)
-        try store.mergeComponentDetail(host: "host-A", credential: "credential-A", workspace: "workspace-4",
-                                       membershipRevision: 4, id: "component-a", detail: detail)
-        try assertOfflineSnapshot(UnderstandingSnapshotStore(location: location), workspace: "workspace-4",
-                                  revision: 4, overview: overview, catalog: catalog, components: components, detail: detail)
+        try await store.mergeOverview(host: "host-A", credential: "credential-A", workspace: "workspace-4",
+                                      membershipRevision: 4, data: overview)
+        try await store.mergeKnowledge(host: "host-A", credential: "credential-A", workspace: "workspace-4",
+                                       membershipRevision: 4, catalog: catalog, components: components)
+        try await store.mergeComponentDetail(host: "host-A", credential: "credential-A", workspace: "workspace-4",
+                                             membershipRevision: 4, id: "component-a", detail: detail)
+        try await assertOfflineSnapshot(UnderstandingSnapshotStore(location: location), workspace: "workspace-4",
+                                        revision: 4, overview: overview, catalog: catalog, components: components, detail: detail)
 
-        try store.mergeOverview(host: "host-A", credential: "credential-A", workspace: "workspace-4",
-                                membershipRevision: 4, data: overview)
-        try assertOfflineSnapshot(UnderstandingSnapshotStore(location: location), workspace: "workspace-4",
-                                  revision: 4, overview: overview, catalog: catalog, components: components, detail: detail)
+        try await store.mergeOverview(host: "host-A", credential: "credential-A", workspace: "workspace-4",
+                                      membershipRevision: 4, data: overview)
+        try await assertOfflineSnapshot(UnderstandingSnapshotStore(location: location), workspace: "workspace-4",
+                                        revision: 4, overview: overview, catalog: catalog, components: components, detail: detail)
+    }
+
+    func testUnderstandingSnapshotStoreSharesRegistryAndSerializesConcurrentMerges() async throws {
+        let location = DraftLocation(bundleID: "dev.infinite.concurrent-\(UUID().uuidString.lowercased())")
+        let service = "\(location.service).understanding-snapshots"
+        let cacheDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Infinite/Understanding-\(URL(fileURLWithPath: location.directory).lastPathComponent)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: cacheDirectory)
+            try? DeviceKeychain.remove("snapshot-key", service: service)
+        }
+
+        let first = await UnderstandingSnapshotStore.shared(location: location)
+        let second = await UnderstandingSnapshotStore.shared(location: location)
+        XCTAssertTrue(first === second)
+
+        let overview = try JSON.object(["schemaVersion": .number(1), "workspace": .object(["id": .string("ws-1")])]).data()
+        let catalog = try JSON.object(["revision": .number(2), "projects": .array([])]).data()
+        let components = try JSON.array([.object(["id": .string("comp-0")])]).data()
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await first.mergeOverview(host: "h", credential: "c", workspace: "ws-1", membershipRevision: 2, data: overview)
+            }
+            group.addTask {
+                try await second.mergeKnowledge(host: "h", credential: "c", workspace: "ws-1", membershipRevision: 2, catalog: catalog, components: components)
+            }
+            for index in 0..<8 {
+                let detail = try JSON.object(["component": .object(["id": .string("comp-\(index)")])]).data()
+                group.addTask {
+                    try await first.mergeComponentDetail(host: "h", credential: "c", workspace: "ws-1", membershipRevision: 2, id: "comp-\(index)", detail: detail)
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        let fetched = try await second.read(host: "h", credential: "c", workspace: "ws-1", membershipRevision: 2)
+        let snapshot = try XCTUnwrap(fetched)
+        XCTAssertEqual(snapshot.envelope.overview, overview)
+        XCTAssertEqual(snapshot.envelope.catalog, catalog)
+        XCTAssertEqual(snapshot.envelope.components, components)
+        XCTAssertEqual(snapshot.envelope.componentDetails.count, 8)
+    }
+
+    func testDraftRecordPreservesPendingWireFormatAndRejectsMissingID() throws {
+        var record = DraftRecord()
+        record.text = "draft"
+        record.pending = PendingSend(id: "req-1", text: "draft")
+        record.lastQueuedText = "prev"
+        let encoded = try JSONEncoder().encode(record)
+        let wire = try JSON.parse(encoded)
+        XCTAssertEqual(wire["pendingID"].string, "req-1")
+        XCTAssertEqual(wire["pendingText"].string, "draft")
+
+        let decoded = try JSONDecoder().decode(DraftRecord.self, from: encoded)
+        XCTAssertEqual(decoded, record)
+
+        let idOnly = try JSON.object(["text": .string(""), "pendingID": .string("req-2")]).data()
+        let decodedIDOnly = try JSONDecoder().decode(DraftRecord.self, from: idOnly)
+        XCTAssertEqual(decodedIDOnly.pending, PendingSend(id: "req-2", text: ""))
+
+        let textOnly = try JSON.object(["text": .string(""), "pendingText": .string("orphan")]).data()
+        let decodedTextOnly = try JSONDecoder().decode(DraftRecord.self, from: textOnly)
+        XCTAssertNil(decodedTextOnly.pending)
     }
 
     private func assertOfflineSnapshot(_ store: UnderstandingSnapshotStore, workspace: String, revision: Int,
                                        overview: Data, catalog: Data, components: Data, detail: Data,
-                                       file: StaticString = #filePath, line: UInt = #line) throws {
-        let cached = try XCTUnwrap(store.read(host: "host-A", credential: "credential-A", workspace: workspace,
-                                              membershipRevision: revision), file: file, line: line)
+                                       file: StaticString = #filePath, line: UInt = #line) async throws {
+        let snapshot = try await store.read(host: "host-A", credential: "credential-A", workspace: workspace, membershipRevision: revision)
+        let cached = try XCTUnwrap(snapshot, file: file, line: line)
         XCTAssertEqual(cached.envelope.overview, overview, file: file, line: line)
         XCTAssertEqual(cached.envelope.catalog, catalog, file: file, line: line)
         XCTAssertEqual(cached.envelope.components, components, file: file, line: line)

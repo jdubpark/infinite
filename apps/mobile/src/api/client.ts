@@ -7,10 +7,8 @@ import { APP_BACKGROUND_GRACE_MS, inForeground, onForegroundChange } from "./for
 
 export type Connection = { id?: string; machineId?: string; label?: string; url: string; token: string; relay?: { machineId: string }; access?: RemoteAccessToken };
 export const connectionKey = (connection: Connection) => connection.id ?? `${connection.url}/${connection.relay?.machineId ?? "direct"}`;
-/** `calls` counts api() requests in flight on this channel. */
 type Remote = { secrets: string; client: ReturnType<typeof createRemoteClient>; calls: number };
 const remotes = new Map<string, Remote>();
-/** Per channel, the session rows read last and their version; see listSessions. */
 const sessionReaders = new Map<string, ReturnType<typeof sessionListReader<SessionRow>>>();
 const remoteKey = (connection: Connection) => `${connectionKey(connection)}/${connection.url}/${connection.relay?.machineId ?? "direct"}`;
 export function closeConnection(connection: Connection) {
@@ -33,7 +31,6 @@ function drop(key: string, entry: Remote) {
   if (remotes.get(key) === entry) remotes.delete(key);
   entry.client.close();
 }
-/** Replace idle channels after the same grace used by the live stream. */
 let backgroundedAt = 0;
 let backgroundResetTimer: ReturnType<typeof setTimeout> | undefined;
 onForegroundChange((foreground) => {
@@ -72,10 +69,6 @@ export class ApiError extends Error {
 }
 
 export type ControlCode = "control-busy" | "control-lost";
-/**
- * The host refused input before anything was typed: another device holds control
- * (`control-busy`), or this phone's lease changed or expired (`control-lost`).
- */
 export class ControlRefusal extends ApiError {
   constructor(
     message: string,
@@ -91,16 +84,13 @@ export async function api<T>(
   init: {
     method?: "GET" | "POST" | "PUT" | "DELETE";
     body?: unknown;
-    /** The lease id this phone holds; the host refuses input without it. */
     control?: string;
-    /** Abort after this many milliseconds. Defaults to 12 seconds. */
     timeoutMs?: number;
   } = {},
 ): Promise<T> {
   const { timeoutMs = 12000, ...options } = init;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  // Only reads (GET without a body) are retried or dropped on timeout; mutations never are.
   const read = (init.method ?? "GET") === "GET" && init.body === undefined;
   let saved: Remote | undefined;
   try {
@@ -109,14 +99,11 @@ export async function api<T>(
       ...(init.control ? { "X-Infinite-Control": init.control } : {}),
     };
     const request = { ...options, headers, signal: controller.signal };
-    // Both direct and relayed connections use the authenticated encrypted
-    // channel. An unavailable endpoint never falls back to plaintext API calls.
     saved = remote(connection);
     try {
       try {
         return await call<T>(saved, path, request);
       } catch (error) {
-        // A backgrounded app does not reconnect; its return poll recovers instead.
         if (!read || !(error instanceof RemoteError) || error.code !== "disconnected" || !inForeground()) throw error;
         return await call<T>(saved, path, request);
       }
@@ -130,7 +117,6 @@ export async function api<T>(
       throw error;
     }
   } catch (error) {
-    // A timed-out read may have left the channel unusable; don't drop it under another call.
     if (read && controller.signal.aborted && saved && saved.calls === 0) drop(remoteKey(connection), saved);
     if ((error as Error).name === "AbortError")
       throw new ApiError(
@@ -143,7 +129,6 @@ export async function api<T>(
   }
 }
 
-/** The machine's session list. Each read names the version of the rows this connection read last, so an unchanged list answers with its version alone. */
 export function listSessions(connection: Connection): Promise<SessionRow[]> {
   const key = remoteKey(connection);
   let read = sessionReaders.get(key);
@@ -160,7 +145,6 @@ export function openEvents(connection: Connection, options: {
   return remote(connection).client.openEvents(options);
 }
 
-/** One device's input lease; the host refuses input from every other device while it lasts. */
 export type ControlLease = { id: string; label: string; expiresAt: number };
 export type SessionRow = {
   id: string;
@@ -168,12 +152,9 @@ export type SessionRow = {
   executionLocation?: "cloud" | "laptop";
   backend?: "infinite" | "cmux";
   projectId?: string;
-  /** Present on a team member; the team scheduler owns its lifecycle. */
   team?: { runId: string; memberId: string; revision: number; role: TeamRole; taskId?: string };
-  /** Set on a session a mission coordinator runs (its coordinator or a subteam member). The host refuses input, stop, resume and control for it. */
   managedBy?: { kind: "mission"; missionId: string; teamId?: string };
   resumable?: boolean;
-  /** Set once the owner archived this exited session; it leaves the live lists but keeps its record. */
   archivedAt?: string;
   title: string;
   reading?: {
@@ -188,7 +169,6 @@ export type SessionRow = {
   exitCode?: number;
   seq: number;
   attention: Attention;
-  /** Present on workers that enforce input control; older workers take shared input. */
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1 };
   control?: ControlLease | null;
   execution?: { location: "laptop" | "cloud"; state: "connecting" | "online" | "offline" | "preparing" | "paused"; cloudReady: boolean; checkpoint?: { id: string; capturedAt: string }; reason?: string; reconciliation?: "available" };
@@ -199,7 +179,6 @@ export type SessionDetail = SessionRow & {
   contextVersion: number;
   initialPrompt: string;
 };
-/** `POST /sessions/:id/answer` receipt; refusals arrive as HTTP 409 instead. */
 export type AnswerReceipt = {
   requestId: string;
   state: "delivered" | "uncertain";
@@ -220,10 +199,8 @@ export type Me = {
   usage?: { enabled: boolean; budgets?: Record<string, unknown> };
 };
 
-/** Project contract mirrored from the host (`project-group-types.ts`): a project holds repositories, each made of checkouts. */
 export type ProjectGroupKind = "owner" | "repository" | "implicit";
 export type ProjectGroupCheckout = { projectId: string; name: string; path: string; primary: boolean; teamReady: boolean; identityFrom?: "source" | "host-scan" };
-/** `projectId`, `name`, and `path` describe the primary checkout. */
 export type ProjectGroupRepo = { projectId: string; name: string; path: string; key?: string; checkouts: ProjectGroupCheckout[] };
 export type ProjectGroup = {
   id: string; name: string; kind: ProjectGroupKind; hidden: boolean; repos: ProjectGroupRepo[]; implicit: boolean; revision: number;
@@ -254,9 +231,7 @@ export type Mission = {
   id: string; groupId: string; groupName: string; repoProjectIds: string[]; title: string; objective: string;
   maxSubtasks: number; maxMinutes: number; deadlineAt: string; revision: number; status: MissionStatus;
   reason?: string;
-  /** Set while the mission is blocked because its approved time ran out; its work is kept and the owner can extend it. */
   stopReason?: "deadline";
-  /** Set while an intake mission's clock is stopped (waiting on the owner or paused); `deadlineAt` then leaves out the stopped span. */
   clockStoppedAt?: string;
   createdAt: string; updatedAt: string; lineup: TeamLineup;
   coordinator?: { memberId: string; sessionId: string; status: "running" | "waiting" | "stopped" };
@@ -266,7 +241,6 @@ export type Mission = {
   usage?: MissionUsage;
 };
 export type BoardColumn = "needs-input" | "working" | "review" | "ended";
-/** One start of the same work; older hosts send none. */
 export type BoardAttempt = { workId: string; number: number; of: number; superseded: boolean };
 export type BoardItem = {
   kind: "mission" | "team" | "goal"; id: string; title: string; groupId?: string; projectName: string;
@@ -288,7 +262,6 @@ export type MessagesPage = { messages: ChatMessage[]; cursor: string | number; m
 export type ProjectFile = { path: string; name: string; text?: string; mimeType: string; size: number; modifiedAt: string; base64?: string };
 export type PendingGeneration = { id: string; capturedAt: string; receivedAt: string; reason: "session-running" | "cloud-changed" | "apply-failed" | "awaiting-apply"; category?: string; message?: string };
 export type ProjectSyncStatus = { projectId: string; lastSyncedAt?: string; appliedAt?: string; appliedManifest?: string; pendingGeneration?: PendingGeneration };
-/** Why a laptop generation waits, in the words the Create screen shows. */
 export function pendingLabel(pending: PendingGeneration) {
   if (pending.reason === "session-running") return "a session is running";
   if (pending.reason === "cloud-changed") return "cloud files changed";
@@ -296,10 +269,8 @@ export function pendingLabel(pending: PendingGeneration) {
   return "no session is running; ready to apply";
 }
 export type SourcePendingStatus = { reason: "session-running" | "fetch-failed" | "diverged" | "apply-failed"; category?: string; message?: string; since: string };
-/** Where a workspace's files come from: the laptop, or a GitHub base branch the host mirrors. */
 export type ProjectSourceStatus = { mode: "github" | "laptop"; repository?: string; baseBranch?: string; mirrorHead?: string; appliedHead?: string; fetchedAt?: string; appliedAt?: string; pending?: SourcePendingStatus; savedBranches?: string[] };
 export type ProjectDetail = { id: string; name: string; sync: ProjectSyncStatus; source?: ProjectSourceStatus };
-/** One line for a GitHub-tracked workspace, worded like the CLI status line and the web Create screen. */
 export function sourceLabel(source: ProjectSourceStatus, now = Date.now()) {
   const head = source.appliedHead ? source.appliedHead.slice(0, 8) : "none";
   const parts = [`Follows GitHub ${source.repository}@${source.baseBranch} · host ${head} · fetched ${ago(source.fetchedAt, now)}`];
@@ -318,7 +289,6 @@ export function ago(iso?: string, now = Date.now()) {
   return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`;
 }
 
-/** One cycle's agent assessment as the host reports it: ids, enumerations, and counts only. */
 export type AssessedState = "met" | "not-met" | "inconclusive";
 export type ComposedState = AssessedState | "pending-owner";
 export type VerdictCounts = { met: number; notMet: number; inconclusive: number; pendingOwner: number };
@@ -328,7 +298,6 @@ export type GoalAssessment = {
   reason?: "no-independent-evaluator" | "evaluator-unavailable" | "record-unavailable" | "context-too-large";
   counts: VerdictCounts; criteria: { id: string; state: ComposedState }[]; at: string; progress: number;
 };
-/** One row of GET /api/goals/:id/verdicts. */
 export type GoalVerdictView = {
   cycle: number; teamId: string; verdictId: string; kind: "reviewed" | "no-change"; head: string; at: string;
   label: "Agent assessment, provisional";

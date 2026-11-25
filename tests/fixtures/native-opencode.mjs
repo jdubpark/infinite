@@ -1,4 +1,3 @@
-// Provider HTTP boundary fixture; real native UI commissioning is separate.
 import { createServer } from "node:http";
 import { randomUUID, createHash } from "node:crypto";
 import { writeFileSync, appendFileSync } from "node:fs";
@@ -33,7 +32,6 @@ if (args.includes("serve")) {
       reply(undefined, 204); emit({ type: "session.status", properties: { sessionID: session.id, status: { type: "busy" } } });
       if (text === "approval") { emit({ type: "permission.asked", properties: { id: "per_current", sessionID: session.id, permission: "bash" } }); return; }
       const messageID = randomUUID();
-      // "usage-early" finishes a step before any message.updated has named the message's model.
       if (text === "usage-early") emit({ type: "message.part.updated", properties: { part: { type: "step-finish", id: "prt_native_early", messageID, sessionID: session.id, reason: "stop", cost: 0.25,
         tokens: { input: 70, output: 30, reasoning: 0, cache: { read: 0, write: 0 } } } } });
       emit({ type: "message.updated", properties: { info: { id: messageID, sessionID: session.id, role: "assistant", ...(text === "usage" ? { providerID: "deepseek", modelID: "deepseek-flash" } : {}) } } });

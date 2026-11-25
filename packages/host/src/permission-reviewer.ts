@@ -1,16 +1,3 @@
-/**
- * The permission agent's model turns: the closed report schemas, the text a turn reads, and the
- * noninteractive tool-less launch for Claude Code and OpenCode.
- *
- * Output is closed. Claude Code constrains its final answer with `--json-schema` (it offers the model
- * exactly one tool, StructuredOutput, and the host checks the init event for that). OpenCode has no
- * schema flag, so its final text must be one JSON object. Either way the host validates the report
- * against a strict zod schema and treats anything else as no verdict.
- *
- * Codex is not offered: `codex exec` in the installed version still exposes code-mode `exec`, nested
- * `exec_command`, `request_user_input` and the collaboration tools after every feature flag that names
- * them is disabled, so the host cannot establish a tool-less Codex turn.
- */
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { chmodSync, mkdtempSync, rmSync } from "node:fs";
@@ -34,8 +21,6 @@ const MAX_NOTE = 2_000;
 const MAX_PROMPT_BYTES = 200_000;
 const MAX_INPUT_JSON = 16_000;
 
-/* ------------------------------------------------------------------ closed reports */
-
 export type LightReport = { verdict: "allow" | "refer"; note: string };
 export type StrongReport =
   | { verdict: "allow"; noInterruptClass: true; note: string }
@@ -46,17 +31,13 @@ export type PermissionReport = LightReport | StrongReport;
 
 export interface ReportOptions {
   tier: PermissionTierName;
-  /** False removes `allow` from the strong schema. */
   canAllow: boolean;
-  /** True adds the `evidence` verdict to the strong schema. */
   canCollect: boolean;
-  /** The classes an `owner` verdict may name. */
   classes: readonly InterruptClass[];
 }
 
 const note = z.string().trim().min(1).max(MAX_NOTE);
 
-/** The zod schema the host validates a report with. Every variant is strict. */
 export function reportSchema(options: ReportOptions): z.ZodType<PermissionReport> {
   if (options.tier === "light") {
     return z.object({ verdict: z.enum(["allow", "refer"]), note }).strict() as z.ZodType<PermissionReport>;
@@ -71,7 +52,6 @@ export function reportSchema(options: ReportOptions): z.ZodType<PermissionReport
   return z.union(variants as unknown as [z.ZodObject, z.ZodObject, ...z.ZodObject[]]) as unknown as z.ZodType<PermissionReport>;
 }
 
-/** The JSON Schema a CLI constrains its output with. The zod schema above is the authority. */
 export function reportJsonSchema(options: ReportOptions): Record<string, unknown> {
   if (options.tier === "light") {
     return { type: "object", additionalProperties: false, required: ["verdict", "note"], properties: {
@@ -90,15 +70,12 @@ export function reportJsonSchema(options: ReportOptions): Record<string, unknown
   } };
 }
 
-/** A report, or undefined for anything outside the closed schema. A null field counts as absent. */
 export function parseReport(value: unknown, options: ReportOptions): PermissionReport | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const cleaned = Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([, field]) => field !== null));
   const parsed = reportSchema(options).safeParse(cleaned);
   return parsed.success ? parsed.data : undefined;
 }
-
-/* ------------------------------------------------------------------ turn text */
 
 const LIGHT_TEXT = [
   "You are the light tier of the permission agent.",
@@ -135,7 +112,6 @@ export interface TurnContext {
   requesterFamily: string | undefined;
 }
 
-/** The host-written instructions of a turn: the policy, the classes, the owner's direction, the tier and the report format. */
 export function turnSystemText(options: ReportOptions, context: Pick<TurnContext, "interruptClasses" | "direction">): string {
   return [
     PERMISSION_POLICY_TEXT,
@@ -149,7 +125,6 @@ export function turnSystemText(options: ReportOptions, context: Pick<TurnContext
   ].join("\n");
 }
 
-/** The tier texts every turn can read, for the replay binding. */
 export function tierTexts(): string[] {
   const classes = [...INTERRUPT_CLASSES];
   return [LIGHT_TEXT, ...[true, false].flatMap(canAllow => [true, false].map(canCollect => strongText({ tier: "strong", canAllow, canCollect, classes }))),
@@ -158,10 +133,6 @@ export function tierTexts(): string[] {
 
 const clip = (text: string, limit: number) => text.length <= limit ? text : `${text.slice(0, limit)} [cut by the host at ${limit} characters]`;
 
-/**
- * The turn's message: host facts first, then the request, the task, the rejects and the collected files
- * inside markers that carry a fresh random boundary, as untrusted evidence.
- */
 export function turnPrompt(request: PermissionRequest, context: TurnContext & { canAllow: boolean }, evidence?: PermissionEvidence): string {
   const boundary = randomBytes(12).toString("hex");
   const scrub = (text: string) => text.split(boundary).join("");
@@ -201,8 +172,6 @@ export function turnPrompt(request: PermissionRequest, context: TurnContext & { 
   ].join("\n");
 }
 
-/* ------------------------------------------------------------------ launch */
-
 export interface PermissionTurnUsage {
   at: string;
   purpose: "review" | "replay";
@@ -222,7 +191,6 @@ export interface PermissionTurn {
   prompt: string;
   schema: Record<string, unknown>;
   timeoutMs: number;
-  /** True while an owner halt covers the request that this turn judges. The launcher reads it with the gate. */
   held?: () => boolean;
   signal?: AbortSignal;
 }
@@ -234,11 +202,9 @@ export type PermissionTurnOutcome =
   | { ok: true; output: unknown; startedAt: string; endedAt: string }
   | { ok: false; failure: PermissionTurnFailure; startedAt?: string; endedAt?: string };
 
-/** Every reviewer launch passes this gate first. False holds the launch: nothing starts. */
 export type PermissionTurnGate = (turn: { purpose: "review" | "replay"; tier: PermissionTierName; profileId: string; provider: string }) => boolean | Promise<boolean>;
 
 export interface PermissionTurnLauncher {
-  /** Whether this host has a tool-less launch for the profile's provider. */
   supports(profile: TeamModelProfile): boolean;
   run(turn: PermissionTurn): Promise<PermissionTurnOutcome>;
 }
@@ -246,11 +212,6 @@ export interface PermissionTurnLauncher {
 const ENV_NAMES = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"];
 const REVIEW_AGENT = "infinite-permission-review";
 
-/**
- * The environment of a reviewer process: the same short list a provider session receives, and nothing else of the
- * host's, plus the configured egress with the host identity. A reviewer is a model client, so without the proxy
- * variables it would reach its provider directly.
- */
 export function reviewerEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const name of ENV_NAMES) if (source[name]) env[name] = source[name];
@@ -259,7 +220,6 @@ export function reviewerEnvironment(source: NodeJS.ProcessEnv = process.env): No
 
 const BINARY: Partial<Record<Provider, string>> = { claude: "claude", opencode: "opencode" };
 
-/** The command and the words before the reviewer's own arguments, or undefined when the profile cannot launch a reviewer. */
 export function reviewerCommand(provider: Provider, profile: AgentProfile | undefined): { command: string; prefix: string[] } | undefined {
   const binary = BINARY[provider];
   if (!binary || !profile) return undefined;
@@ -269,11 +229,9 @@ export function reviewerCommand(provider: Provider, profile: AgentProfile | unde
     if (!shape.ok || !named(shape.executable)) return undefined;
     return { command: profile.command, prefix: [...shape.options, "--", shape.executable] };
   }
-  // The configured provider arguments are not used: a reviewer's arguments are fixed by the host.
   return named(profile.command) ? { command: profile.command, prefix: [] } : undefined;
 }
 
-/** Claude Code: print mode, no built-in tools, no MCP servers, no settings, hooks, skills or slash commands, no stored session. */
 export function claudeReviewerArgs(turn: Pick<PermissionTurn, "profile" | "system" | "schema">): string[] {
   const profile = turn.profile;
   if (profile.provider !== "claude") throw new Error("A Claude reviewer needs a Claude profile.");
@@ -289,7 +247,6 @@ export function claudeReviewerArgs(turn: Pick<PermissionTurn, "profile" | "syste
   ];
 }
 
-/** OpenCode: one run with a host-defined agent whose every tool is off and every permission denied. */
 export function openCodeReviewerConfig(system: string): string {
   return JSON.stringify({
     autoupdate: false,
@@ -315,20 +272,17 @@ export interface CliTurnLauncherOptions {
   gate?: PermissionTurnGate;
   onUsage?: (usage: PermissionTurnUsage) => void;
   env?: NodeJS.ProcessEnv;
-  /** Where each turn's empty working directory is made. */
   workRoot?: string;
   maxOutputBytes?: number;
   now?: () => Date;
 }
 
-/** The tool-less CLI launcher. Each turn is a fresh conversation in a fresh empty directory. */
 export function createCliTurnLauncher(options: CliTurnLauncherOptions): PermissionTurnLauncher {
   const now = options.now ?? (() => new Date());
   const maxOutput = options.maxOutputBytes ?? 4 * 1024 * 1024;
   const verified = new Map<string, Promise<boolean>>();
   const launchOf = (profile: TeamModelProfile) => reviewerCommand(profile.provider, options.agents[profile.provider]);
 
-  /** OpenCode resolves the agent's tools before a turn. The host refuses a launch unless every tool is off. */
   const openCodeToolsOff = (launch: { command: string; prefix: string[] }, env: NodeJS.ProcessEnv, cwd: string): Promise<boolean> => {
     const key = JSON.stringify(launch);
     const cached = verified.get(key);
@@ -354,7 +308,6 @@ export function createCliTurnLauncher(options: CliTurnLauncherOptions): Permissi
     async run(turn) {
       const launch = launchOf(turn.profile);
       if (!launch) return { ok: false, failure: "unsupported" };
-      // The launch gate and the turn's own halt. A source that throws holds the launch.
       const held = async () => {
         const allowed = await Promise.resolve(options.gate?.({ purpose: turn.purpose, tier: turn.tier, profileId: turn.profile.id, provider: turn.profile.provider })).then(value => value ?? true, () => false);
         if (!allowed) return true;
@@ -364,11 +317,9 @@ export function createCliTurnLauncher(options: CliTurnLauncherOptions): Permissi
       if (turn.signal?.aborted) return { ok: false, failure: "aborted" };
       const cwd = mkdtempSync(join(options.workRoot ?? tmpdir(), "infinite-permission-turn-"));
       try {
-        // The directory is empty and readable by a sudo target account; it holds no project files.
         chmodSync(cwd, 0o755);
         const env = { ...(options.env ?? reviewerEnvironment()) };
         if (turn.profile.provider === "opencode" && !(await openCodeToolsOff(launch, { ...env, ...OPENCODE_ENV }, cwd))) return { ok: false, failure: "tools-offered" };
-        // The checks above can take a minute. Both are read again here, with nothing awaited before the model starts.
         if (await held()) return { ok: false, failure: "held" };
         const startedAt = now().toISOString();
         const args = turn.profile.provider === "claude" ? claudeReviewerArgs(turn) : openCodeReviewerArgs(turn);
@@ -383,7 +334,7 @@ export function createCliTurnLauncher(options: CliTurnLauncherOptions): Permissi
         const usage = parser.usage();
         if (usage && options.onUsage) {
           try { options.onUsage({ at: endedAt, purpose: turn.purpose, tier: turn.tier, profileId: turn.profile.id, provider: turn.profile.provider, ...usage }); }
-          catch { /* usage is informational */ }
+          catch {}
         }
         if (result.spawnFailed) return { ok: false, failure: "launch-failed", startedAt, endedAt };
         if (result.stopped === "timeout" || result.stopped === "aborted") return { ok: false, failure: result.stopped, startedAt, endedAt };
@@ -408,7 +359,6 @@ interface StreamParser {
 
 const count = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 
-/** Claude Code stream-json: the init event must offer no tool but StructuredOutput and no MCP server. */
 export function claudeParser(): StreamParser {
   let initSeen = false, failure: PermissionTurnFailure | undefined, output: unknown, hasOutput = false, model = "unknown";
   let usage: { model: string; tokens: UsageTokens; costUsd?: number } | undefined;
@@ -447,7 +397,6 @@ export function claudeParser(): StreamParser {
   };
 }
 
-/** OpenCode JSON events: any tool part ends the turn with no verdict; the final text must be one JSON object. */
 export function openCodeParser(model: string): StreamParser {
   let failure: PermissionTurnFailure | undefined, lastText: string | undefined;
   const tokens: UsageTokens = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
@@ -477,7 +426,6 @@ export function openCodeParser(model: string): StreamParser {
   };
 }
 
-/** One JSON object, alone or as the only content of one fenced block. Anything else is no report. */
 export function jsonReport(text: string): unknown {
   const trimmed = text.trim();
   const fenced = /^```(?:json)?\s*\n([\s\S]*?)\n```$/.exec(trimmed);
@@ -486,7 +434,6 @@ export function jsonReport(text: string): unknown {
   try { return JSON.parse(body); } catch { return undefined; }
 }
 
-/** Why the host ended a process early. `parser` means the stream parser saw a disqualifying event. */
 type Stopped = "timeout" | "aborted" | "overflow" | "parser";
 
 function run(command: string, args: string[], options: {

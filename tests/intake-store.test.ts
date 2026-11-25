@@ -32,7 +32,7 @@ function record(
   state: IntakeRecord["state"] = "queued",
   binding?: IntakeThread,
 ): IntakeRecord {
-  return {
+  const base = {
     issueId,
     identifier: `INF-${issueId.slice(0, 3)}`,
     url: "https://example.invalid/issue",
@@ -40,8 +40,6 @@ function record(
     description: "Example description",
     issueCreatedAt,
     issueUpdatedAt: issueCreatedAt,
-    state,
-    ...(binding ? { thread: binding } : {}),
     comments: {},
     messages: [],
     questions: [],
@@ -49,6 +47,9 @@ function record(
     createdAt: issueCreatedAt,
     updatedAt: issueCreatedAt,
   };
+  if (state === "skipped") return { ...base, state, skipReason: "creator-mismatch" };
+  if (state === "queued") return { ...base, state, ...(binding ? { thread: binding } : {}) };
+  return { ...base, state, rule: "rule", missionId: "mission-1", ...(binding ? { thread: binding } : {}) };
 }
 
 test("the enable time is set once and survives a reopen", () => {
@@ -103,7 +104,7 @@ test("a returned record is a copy", () => {
     const store = h.open();
     store.create(record(A));
     const got = store.get(A)!;
-    got.state = "finished";
+    Object.assign(got, { state: "finished" });
     assert.equal(store.get(A)!.state, "queued");
   } finally { h.close(); }
 });
@@ -114,13 +115,14 @@ test("create detaches stored state from the input record and nested references",
     const store = h.open();
     const input = record(A);
     const externalThread = { ...thread };
-    input.thread = externalThread;
+    if (input.state === "queued") input.thread = externalThread;
     store.create(input);
 
-    input.state = "finished";
+    Object.assign(input, { state: "finished" });
     externalThread.channelId = "C0000000001";
     assert.equal(store.get(A)!.state, "queued");
-    assert.deepEqual(store.get(A)!.thread, thread);
+    const saved = store.get(A)!;
+    assert.deepEqual(saved.state !== "skipped" ? saved.thread : undefined, thread);
   } finally { h.close(); }
 });
 
@@ -135,13 +137,12 @@ test("update detaches stored state from callback and nested references", () => {
     store.onChange(() => { notifications += 1; });
     store.update(A, changed => {
       retained = changed;
-      changed.state = "started";
-      changed.thread = externalThread;
+      Object.assign(changed, { state: "started", rule: "rule", missionId: "mission-1", thread: externalThread });
     });
 
     const afterUpdate = store.get(A)!;
-    retained!.state = "finished";
-    retained!.thread!.threadTs = "2.000002";
+    Object.assign(retained!, { state: "finished" });
+    if (retained!.state !== "skipped") retained!.thread!.threadTs = "2.000002";
     externalThread.channelId = "C0000000001";
 
     const afterAliasMutation = store.get(A)!;
@@ -151,7 +152,7 @@ test("update detaches stored state from callback and nested references", () => {
     assert.equal(notifications, 1);
     const reopened = h.open().get(A)!;
     assert.equal(reopened.state, "started");
-    assert.deepEqual(reopened.thread, thread);
+    if (reopened.state === "started") assert.deepEqual(reopened.thread, thread);
   } finally { h.close(); }
 });
 
@@ -161,7 +162,7 @@ test("boundTo lists a thread's records oldest first and never a skipped one", ()
     const store = h.open();
     store.create(record(STARTED, "2026-01-02T00:00:00.000Z", "started", thread));
     store.create(record(FINISHED, "2026-01-01T00:00:00.000Z", "finished", thread));
-    store.create(record(SKIPPED, "2026-01-03T00:00:00.000Z", "skipped", thread));
+    store.create({ ...record(SKIPPED, "2026-01-03T00:00:00.000Z", "skipped"), thread } as IntakeRecord);
     store.create(record(A, "2026-01-04T00:00:00.000Z", "queued", { channelId: "C0000000000", threadTs: "1.000002" }));
     assert.deepEqual(store.boundTo(thread).map(item => item.issueId), [FINISHED, STARTED]);
     assert.deepEqual(store.boundTo({ channelId: "C0000000001", threadTs: "1.000001" }), []);
@@ -176,7 +177,7 @@ test("update notifies listeners after the write, and a throwing listener loses n
     store.onChange(() => { throw new Error("listener"); });
     let seen: string | undefined;
     store.onChange(r => { seen = h.open().get(A)?.state; });
-    store.update(A, r => { r.state = "started"; });
+    store.update(A, r => { Object.assign(r, { state: "started", rule: "rule", missionId: "mission-1" }); });
     assert.equal(seen, "started");
     assert.equal(h.open().get(A)!.state, "started");
   } finally { h.close(); }
@@ -189,8 +190,12 @@ test("an issue ID that is not a UUID is refused", () => {
 });
 
 type Message = IntakeRecord["messages"][number];
-const message = (key: string, kind: Message["kind"], status: Message["status"] = "sent"): Message =>
-  ({ key, kind, text: "message", createdAt: "2026-01-01T00:00:00.000Z", status, attempts: 1 });
+const message = (key: string, kind: Message["kind"], status: Message["status"] = "sent"): Message => {
+  const base = { key, kind, text: "message", createdAt: "2026-01-01T00:00:00.000Z", attempts: 1 };
+  if (status === "sent") return { ...base, status, ts: "1.000001" };
+  if (status === "failed") return { ...base, status, error: "failed" };
+  return { ...base, status };
+};
 const inbound = (eventId: string, handled: boolean): IntakeRecord["inbound"][number] =>
   ({ eventId, ts: eventId, text: "inbound", receivedAt: "2026-01-01T00:00:00.000Z", ...(handled ? { handledAt: "2026-01-01T00:00:01.000Z" } : {}) });
 
@@ -220,8 +225,7 @@ test("trimming keeps a pending reply and drops older sent and failed replies in 
   try {
     const store = h.open();
     store.create(record(A));
-    // A pending reply with an error is one the pump will retry; a failed one is final.
-    const retried = { ...message("reply:retried", "reply", "pending"), error: "Slack request failed: ratelimited", nextAttemptAt: "2026-01-01T00:00:05.000Z" };
+    const retried: Message = { key: "reply:retried", kind: "reply", text: "message", createdAt: "2026-01-01T00:00:00.000Z", status: "pending", attempts: 1, error: "Slack request failed: ratelimited", nextAttemptAt: "2026-01-01T00:00:05.000Z" };
     store.update(A, r => {
       r.messages = [message("ack", "ack"), message("reply:failed", "reply", "failed"), message("reply:pending", "reply", "pending"), retried,
         ...Array.from({ length: 400 }, (_, i) => message(`reply:event-${i}`, "reply"))];
@@ -263,7 +267,7 @@ test("create notifies listeners after the write, and a throwing listener loses n
     const seen: { issueId: string; onDisk: boolean; state: string }[] = [];
     store.onChange(r => {
       seen.push({ issueId: r.issueId, onDisk: h.open().get(A)?.state === "queued", state: r.state });
-      r.state = "finished"; // a listener's copy cannot change the stored record
+      Object.assign(r, { state: "finished" });
     });
     store.create(record(A));
     assert.deepEqual(seen, [{ issueId: A, onDisk: true, state: "queued" }], "A new record reaches listeners once, after the write");

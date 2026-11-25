@@ -10,17 +10,14 @@ export const BOARD_SECTIONS: { id: BoardSection; title: string; subtitle: string
   { id: "ended", title: "Ended", subtitle: "Stopped or completed runs.", column: "ended" },
 ];
 
-/** Filter by explicit group when available, while retaining standalone runs under All. */
 export function filterBoard(items: BoardItem[], groupId?: string) {
   return groupId ? items.filter(item => item.groupId === groupId) : items;
 }
 
-/** A superseded attempt is folded behind the newest one; a live older attempt keeps its own row. */
 export function foldAttempts(items: BoardItem[]) {
   return items.filter(item => !item.attempt?.superseded);
 }
 
-/** The board's section order and newest-updated ordering are independent of rendering. */
 export function groupBoard(items: BoardItem[], groupId?: string) {
   const selected = foldAttempts(filterBoard(items, groupId));
   return BOARD_SECTIONS.map(section => ({
@@ -30,7 +27,6 @@ export function groupBoard(items: BoardItem[], groupId?: string) {
   }));
 }
 
-/** Every attempt of the item's work the board holds, oldest first; empty when the item has one start. */
 export function attemptsOf(items: BoardItem[], item: BoardItem): BoardItem[] {
   const work = item.attempt?.workId;
   if (!work) return [];
@@ -38,7 +34,6 @@ export function attemptsOf(items: BoardItem[], item: BoardItem): BoardItem[] {
     .sort((a, b) => (a.attempt?.number ?? 0) - (b.attempt?.number ?? 0));
 }
 
-/** "Attempt 2 of 3", or nothing when the host holds a single attempt of this work. */
 export function attemptLabel(item: BoardItem) {
   return item.attempt ? `Attempt ${item.attempt.number} of ${item.attempt.of}` : undefined;
 }
@@ -79,20 +74,14 @@ export function missionShowsReason(mission: Pick<Mission, "status" | "stopReason
   return Boolean(mission.reason) && !(mission.status === "blocked" && mission.stopReason === "deadline");
 }
 
-/** Blocked because its approved time ran out; its work is kept and the owner can extend it. */
 export function missionStoppedAtLimit(mission: Pick<Mission, "status" | "stopReason">): boolean {
   return mission.status === "blocked" && mission.stopReason === "deadline";
 }
 
-/**
- * Time left before the mission stops. While an intake mission's clock is stopped, `deadlineAt`
- * does not yet include the stopped span, so the time left is counted up to `clockStoppedAt`.
- */
 export function missionTimeLeftMs(mission: Pick<Mission, "deadlineAt" | "clockStoppedAt">, now: number): number {
   return mission.clockStoppedAt ? Date.parse(mission.deadlineAt) - Date.parse(mission.clockStoppedAt) : Date.parse(mission.deadlineAt) - now;
 }
 
-/** Time left in words, rounded down to whole minutes: "2 h 15 min", "2 h", "45 min", or "less than a minute". */
 export function missionLeftLabel(ms: number): string {
   const minutes = Math.floor(ms / 60000);
   if (minutes < 1) return "less than a minute";
@@ -101,10 +90,6 @@ export function missionLeftLabel(ms: number): string {
   return rest === 0 ? `${hours} h` : `${hours} h ${rest} min`;
 }
 
-/**
- * The line under the status chips. Only a mission that can still run or be extended speaks about
- * its time: a blocked mission without a deadline stop has its reason shown instead, so it gets none.
- */
 export function missionStopLine(mission: Pick<Mission, "status" | "stopReason" | "deadlineAt" | "clockStoppedAt">, now: number): string | undefined {
   if (missionStoppedAtLimit(mission)) return "Stopped at its time limit. Its work is kept. Extend to continue, or cancel.";
   if (!["planning", "working", "needs-input", "paused"].includes(mission.status)) return undefined;
@@ -114,11 +99,6 @@ export function missionStopLine(mission: Pick<Mission, "status" | "stopReason" |
   return `Stops ${shortDate(mission.deadlineAt)}`;
 }
 
-/**
- * Extension amounts for the owner: one hour, six hours and a day, plus the mission's own limit
- * when it is a whole number of minutes from 5 to 1440 that the list does not already hold.
- * `spoken` is the accessibility label for the button.
- */
 export function missionExtendChoices(maxMinutes: number): { minutes: number; label: string; spoken: string; ownLimit: boolean }[] {
   const minutes = [60, 360, 1440];
   if (Number.isInteger(maxMinutes) && maxMinutes >= 5 && maxMinutes <= 1440 && !minutes.includes(maxMinutes)) minutes.push(maxMinutes);
@@ -138,7 +118,6 @@ export function missionSubtaskLabel(status: MissionSubtask["status"]) {
   return labels[status];
 }
 
-/** Mission controls are owner-only and pause when the view is stale. */
 export function missionControls(mission: Mission, role: Me["role"] | undefined, fresh: boolean, now: number) {
   const owner = role === "owner" && fresh;
   const live = !["cancelled", "ready-for-review"].includes(mission.status);

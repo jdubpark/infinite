@@ -40,12 +40,6 @@ type LegacyGroup = Omit<StoredGroup, "kind" | "hidden" | "members" | "detached" 
   primary?: Record<string, string>;
   repos?: Array<{ projectId: string }>;
 };
-/**
- * How often an owner regrouping moved each checkout to another project. `id` is random and written once, so a
- * state file that lost this record never matches a mark taken before the loss. An older copy of the file carries
- * its older counts under the same `id`: a procedure that restores one must replace `id`, or marks taken before a
- * later move match again.
- */
 type OwnerMoves = { id: string; counts: Record<string, number> };
 type Stored = { groups: Record<string, LegacyGroup>; receipts: Record<string, GroupReceipt>; tombstones?: string[]; ownerMoves?: OwnerMoves };
 type CurrentStored = { groups: Record<string, StoredGroup>; receipts: Record<string, GroupReceipt>; tombstones: string[]; ownerMoves: OwnerMoves };
@@ -56,7 +50,6 @@ type ProjectGroupServiceOptions = {
   now?: () => number;
 };
 
-/** A keyed read that ignores inherited properties, so a checkout id such as `constructor` cannot alias a prototype member. */
 const own = <T>(map: Record<string, T>, key: string): T | undefined => Object.hasOwn(map, key) ? map[key] : undefined;
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const notFound = () => new TeamError(404, "project-group-not-found", "This project group does not exist.");
@@ -69,7 +62,6 @@ const validOwnerMoves = (value: unknown): value is OwnerMoves => {
     && Object.values(counts as Record<string, unknown>).every(count => Number.isSafeInteger(count) && (count as number) > 0);
 };
 
-/** Owner-managed project groups. Groups organize checkout identity without changing repository policy or context. */
 export class ProjectGroupService {
   private readonly directory: string;
   private readonly file: string;
@@ -83,7 +75,6 @@ export class ProjectGroupService {
   private pending?: CurrentStored;
   private pendingIdentities?: Record<string, CheckoutIdentity>;
   private needsMigration = false;
-  /** The owner-move record exists only in memory until the next write. */
   private ownerMovesUnsaved = false;
   private readonly failedCaptureAt = new Map<string, number>();
 
@@ -218,7 +209,6 @@ export class ProjectGroupService {
     return group.members.filter(id => own(identities, id)?.key === key).length;
   }
 
-  /** Capture missing identities, then place every identified checkout in exactly one stored group. */
   private reconcile() {
     this.reconcilePending();
     let identityChanged = false;
@@ -226,8 +216,6 @@ export class ProjectGroupService {
     const time = this.clock();
     for (const project of this.config.projects) {
       const known = own(identities, project.id), source = this.sourceIdentity(project);
-      // A scanned identity gives way to the source record once the project follows GitHub: the record names the
-      // repository the host fetches, and the checkout's own metadata may carry no remote at all.
       if (known && !(source && known.from === "host-scan" && known.key !== source.key)) continue;
       const attemptedAt = this.failedCaptureAt.get(project.id);
       if (attemptedAt !== undefined && time - attemptedAt < 60_000) continue;
@@ -404,15 +392,7 @@ export class ProjectGroupService {
     return structuredClone(receipt.result);
   }
 
-  /**
-   * Every owner mutation persists through here, so a move and its count are one write. A host fold never passes.
-   * A checkout moved when it left the stored project that held it, by removal, by transfer or because the owner
-   * deleted that project, or when it joined a stored project from its own implicit one. An ungrouped checkout is
-   * held by the implicit project that carries its id, and a stored project can carry that id too, so ids alone do
-   * not tell the two apart. Giving an implicit project its own stored record in one act moves nothing.
-   */
   private record(candidate: CurrentStored, requestId: string, fingerprint: string, result: ProjectGroup) {
-    // A stored member that is not enrolled now is counted too, so a checkout that returns does not skip a move made meanwhile.
     const ids = new Set([
       ...this.config.projects.map(project => project.id),
       ...[this.state, candidate].flatMap(state => Object.values(state.groups).flatMap(group => group.members)),
@@ -429,17 +409,12 @@ export class ProjectGroupService {
     return structuredClone(result);
   }
 
-  /**
-   * A value that changes whenever an owner regrouping moves this checkout to another project, and never when the
-   * host folds it. A record that must not outlive such a move pins this mark and compares it later.
-   */
   ownerMoveMark(projectId: string): string {
     this.reconcile();
     if (this.ownerMovesUnsaved) this.persist(structuredClone(this.state));
     return `${this.state.ownerMoves.id}:${own(this.state.ownerMoves.counts, projectId) ?? 0}`;
   }
 
-  /** The id of the stored project that holds this checkout, whether or not the checkout is enrolled on the host now. */
   storedHolder(projectId: string): string | undefined {
     this.reconcile();
     return this.findContaining(this.state, projectId)?.id;
@@ -485,7 +460,6 @@ export class ProjectGroupService {
     return { groups, suggestions: this.suggestions(groups) };
   }
 
-  /** Resolve a stored group id, a host project id, or an ungrouped implicit project. */
   get(idOrProjectId: string): ProjectGroup {
     this.reconcile();
     projectGroupIdSchema.parse(idOrProjectId);
@@ -497,7 +471,6 @@ export class ProjectGroupService {
     return holding ? this.storedGroup(holding) : this.implicit(project);
   }
 
-  /** Return the named project holding an enrolled checkout, including an implicit project. */
   containing(projectId: string): { id: string; name: string } | undefined {
     this.reconcile();
     const project = this.config.projects.find(value => value.id === projectId);
@@ -506,7 +479,6 @@ export class ProjectGroupService {
     return group ? { id: group.id, name: group.name } : { id: project.id, name: project.name };
   }
 
-  /** Capture the current holder for every enrolled project after one reconciliation. */
   membershipSnapshot(): ReadonlyMap<string, { id: string; name: string }> {
     this.reconcile();
     const enrolled = new Set(this.config.projects.map(project => project.id));
@@ -563,7 +535,6 @@ export class ProjectGroupService {
       const project = this.config.projects.find(value => value.id === id);
       if (!project) throw notFound();
       current = this.findContaining(candidate, id);
-      // A retired group id never aliases the group that now holds its checkout: a stale update is refused, not redirected.
       if (current && candidate.tombstones.includes(id)) throw notFound();
       if (!current) {
         const groupId = candidate.tombstones.includes(id) ? this.slug(project.name, candidate) : id;

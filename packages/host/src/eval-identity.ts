@@ -20,9 +20,7 @@ export interface EvalIdentity {
   receive(trial: string, input: Readable, maxBytes: number): Promise<"stored" | "too-large" | "failed">;
   prepare(trial: string): Promise<"ready" | "failed">;
   check(trial: string, objects: readonly string[]): Promise<"clean" | "leaked" | "failed">;
-  /** `evalCommandPrefix(member, "exec")`: the TeamCommand prefix of every trial command. */
   teamPrefix(): TeamCommand | undefined;
-  /** `evalCommandPrefix(member, "setup")`: the TeamCommand prefix of dependency setup. */
   setupPrefix(): TeamCommand | undefined;
   stop(): Promise<boolean>;
   clean(): Promise<boolean>;
@@ -31,7 +29,6 @@ export interface EvalIdentity {
 
 const TRIAL_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const OBJECT_RE = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
-/** The launcher refuses a call with 64, and `receive` answers 3 for input over its limit. */
 const REFUSED = 64, TOO_LARGE = 3;
 
 const probeSchema = z.object({
@@ -62,7 +59,6 @@ function parseProbe(text: string) {
   return parsed.success ? parsed.data : undefined;
 }
 
-/** The eval account's launcher client. One account per host; the host never runs a second probe while one is open. */
 export function launcherEvalIdentity(config: () => EvalMemberConfig | undefined, options: { hostUid?: number; graceMs?: number } = {}): EvalIdentity {
   const channel: Channel = { held: false, graceMs: options.graceMs ?? EVAL_GRACE_MS };
   const hostUid = options.hostUid ?? (typeof process.getuid === "function" ? process.getuid() : -1);
@@ -73,7 +69,6 @@ export function launcherEvalIdentity(config: () => EvalMemberConfig | undefined,
       if (!current) return { state: "not-configured" };
       const canaries = [...new Set([...input.canaries, ...(current.canaries ?? [])])];
       const fetchArgs = input.fetchUrl ? ["--fetch", input.fetchUrl] : [];
-      // The proxy URL travels on stdin's first line, never in an argument or the environment.
       const stdin = input.fetchUrl ? Buffer.from(`${input.proxyUrl ?? ""}\n`) : undefined;
       const result = await launch(channel, current.prefix, "probe", [...fetchArgs, "--", ...canaries], { ms: EVAL_PROBE_SECONDS * 1000, keep: EVAL_PROBE_MAX, input: stdin });
       if (result.failed || result.code === null) return { state: "unavailable" };
@@ -154,10 +149,6 @@ async function simple(config: () => EvalMemberConfig | undefined, channel: Chann
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-/**
- * Stops every process of the eval account, as stopGrader does: up to three rounds of a stop and a process inventory,
- * one second apart. A failed launcher stops at once. A process that survives the third round makes the stop alive.
- */
 export async function stopEvalIdentity(identity: EvalIdentity, uid: number, inventory: () => Promise<RuntimeProcess[]> = inventoryRuntimeProcesses): Promise<"stopped" | "alive" | "failed"> {
   for (let round = 1; round <= STOP_ROUNDS; round++) {
     if (!(await identity.stop())) return "failed";
@@ -174,7 +165,6 @@ export async function stopEvalIdentity(identity: EvalIdentity, uid: number, inve
   return "alive";
 }
 
-/** The paths the probe must not read as the eval account: the evidence database, the key, the state and run directories, the workspaces, the mirrors, the projects, the grader's root, and the member's canaries. */
 export function evalCanaries(config: Config, source: Pick<ProjectSourceService, "mirrorPath">): string[] {
   const paths = [evidenceDatabasePath(config.stateDir), config.keyFile, config.stateDir, config.runDir];
   if (config.teams?.workspaceDir) paths.push(config.teams.workspaceDir);
@@ -187,7 +177,6 @@ export function evalCanaries(config: Config, source: Pick<ProjectSourceService, 
   return [...new Set(paths)];
 }
 
-/** `config.source.remoteOverrides[projectId]`, else `https://github.com/REPOSITORY.git`. */
 export function repositoryUrl(config: Pick<Config, "source">, projectId: string, repository: string): string {
   return config.source?.remoteOverrides?.[projectId] ?? `https://github.com/${repository}.git`;
 }

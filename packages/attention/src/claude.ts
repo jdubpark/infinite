@@ -51,7 +51,6 @@ export function mapClaudeHook(body: unknown): Signal[] {
     }
     case "PostToolUseFailure": return tool ? [{ kind: "tool-end", tool, toolUseId, ok: false, error: str(b.error, 1000) ?? "failed" }] : [];
     case "PermissionRequest": return [{ kind: "prompt-open", prompt: hookPrompt("permission", "Permission needed", tool, input) }];
-    // The worker binds the close (promptId 0) to the open prompt; the notice keeps the reason.
     case "PermissionDenied": return [
       { kind: "prompt-closed", promptId: 0, reason: "resolved" },
       { kind: "notice", type: "permission_denied", message: str(b.reason, 500) },
@@ -62,7 +61,6 @@ export function mapClaudeHook(body: unknown): Signal[] {
       const out: Signal[] = [{ kind: "notice", type, message: str(b.message, 500), title: str(b.title, 100) }];
       if (type === "permission_prompt") out.push({ kind: "prompt-open", prompt: hookPrompt("permission", str(b.message, 200) ?? "Permission needed", undefined, {}) });
       if (type === "elicitation_dialog" || type === "elicitation_url_dialog") out.push({ kind: "prompt-open", prompt: hookPrompt("elicitation", str(b.message, 200) ?? "Input requested", undefined, {}) });
-      // "fired" means the wait ended and the limit lifted: it is a notice only.
       if (type === "quota_auto_resume_stale" || type === "quota_auto_resume_disabled") {
         out.push({ kind: "provider-limit", limit: "usage", confidence: "corroborated", message: str(b.message, 500) ?? "Claude Code is waiting for a usage limit to reset" });
       }

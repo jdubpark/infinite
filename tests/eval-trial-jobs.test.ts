@@ -163,7 +163,6 @@ test("block changes only an open job", () => {
   assert.equal(states[2], "running:blocked:eval-processes-alive");
 });
 
-/** A valid captured task of the project, written the way the jobs test writes one. */
 function addTask(f: Fixture, taskId: string): void {
   const at = new Date(START).toISOString();
   f.store.write(tx => {
@@ -181,7 +180,6 @@ function addTask(f: Fixture, taskId: string): void {
   });
 }
 
-/** Inserts one trial row of a job, and starts it unless `start` is false. */
 function insertAt(f: Fixture, jobId: string, attempt: number, options: { taskId?: string; slot?: number; at?: string; start?: boolean } = {}): string {
   const trialId = randomUUID();
   const at = options.at ?? f.now();
@@ -485,7 +483,6 @@ const GRADED: TrialGrade = { ending: "graded", expectedPassed: 1, expectedTotal:
 const REQUEST_SIX = "66666666-6666-4666-8666-666666666666";
 const taskName = (n: number) => `captured:run-1:c${String(n).padStart(3, "0")}`;
 
-/** A valid task in its own root group, in the dev set or in the holdout set. */
 function addGrouped(f: Fixture, taskId: string, holdout: boolean): void {
   const at = new Date(START).toISOString();
   f.store.write(tx => {
@@ -511,7 +508,6 @@ function raiseCap(f: Fixture): void {
   (f.config.projects[0] as unknown as { team: { eval: Record<string, unknown> } }).team.eval.trialsPerDay = 100;
 }
 
-/** Records the trial that `next` handed out as a started, graded trial of its own slot. */
 function runTrial(f: Fixture, next: Extract<NextTrial, { kind: "trial" }>): void {
   const trialId = randomUUID();
   f.store.write(tx => {
@@ -524,7 +520,6 @@ function runTrial(f: Fixture, next: Extract<NextTrial, { kind: "trial" }>): void
   });
 }
 
-/** Runs trials until the scheduler hands out none; returns the task of each trial in order. */
 async function drain(f: Fixture): Promise<string[]> {
   const order: string[] = [];
   for (let turn = 0; turn < 100; turn += 1) {
@@ -764,7 +759,6 @@ test("a paused confirm job past its expiry gets its report and frees the holdout
     const created = f.trial.create(PROJECT, request({ expiresAt: expires }), REQUEST_ONE);
     assert.ok("job" in created);
     const jobId = created.job.jobId;
-    // The row is made a paused confirm job directly; the report and the rotation read only its kind, status, and stamps.
     f.store.write(tx => {
       tx.run("UPDATE eval_jobs SET kind = 'confirm', status = 'paused', reason = 'owner' WHERE job_id = ?", jobId);
       tx.run(
@@ -792,7 +786,6 @@ test("the job view says when the stored report is unreadable", () => {
     const created = f.trial.create(PROJECT, request(), REQUEST_ONE);
     assert.ok("job" in created);
     const jobId = created.job.jobId;
-    // A compare job that finished, whose payload cannot be opened: the pass stores an unreadable report.
     const at = f.now();
     f.store.write(tx => {
       tx.run("UPDATE eval_jobs SET kind = 'compare', status = 'completed', reason = 'done', finished_at = ?, payload = 'x' WHERE job_id = ?", at, jobId);
@@ -835,7 +828,6 @@ test("an idle job past its expiry waits for its live trial to end", () => {
 
 type Slot = { jobId: string; slot: number; attempt: number };
 
-/** One failed start: a preparing row for the slot, then its release. The answer, and whether the row is still there. */
 function release(f: Fixture, at: Slot, waiting: EvalJobWait): { answer: "released" | "exhausted"; row: boolean } {
   const trialId = insertAt(f, at.jobId, at.attempt, { slot: at.slot, start: false });
   const answer = f.trial.release({ jobId: at.jobId, taskId: TASK_ONE, configRef: configRef(configuration(CLAUDE)), slot: at.slot, attempt: at.attempt, trialId }, waiting);

@@ -10,18 +10,12 @@ import {
 } from "./store.js";
 import { EvidenceError, type EvidenceDb } from "./types.js";
 
-/** After a failed open, the reader answers `unavailable` without opening again for this long. */
 export const READER_REOPEN_MS = 5_000;
 const DEFAULT_BUSY_TIMEOUT_MS = 250;
 
 type SqliteModule = typeof import("node:sqlite");
 type ReadVersionRow = { value: unknown };
 
-/**
- * A read-only view of the evidence store for another process, such as a session worker. It never writes,
- * never creates a file, and sets no PRAGMA except `busy_timeout`. Each read is one deferred transaction that
- * first checks the read version of every module it was given.
- */
 export class EvidenceReader {
   private readonly databasePath: string;
   private readonly modules: Readonly<Record<string, number>>;
@@ -56,11 +50,6 @@ export class EvidenceReader {
     this.indexKey = deriveEvidenceKey(options.vaultKey, "blind-index");
   }
 
-  /**
-   * Runs `fn` inside one deferred read transaction. A layout the reader does not know, or an unreadable store,
-   * throws `EvidenceError("unavailable")`. A SQLite error rolls back, closes the connection, and throws the same.
-   * Any other error rolls back and is rethrown unchanged.
-   */
   read<T>(fn: (db: EvidenceDb) => T): T {
     const connection = this.connection();
     const view = evidenceView(connection, { rowKey: this.rowKey, indexKey: this.indexKey }, () => {
@@ -98,7 +87,6 @@ export class EvidenceReader {
     this.indexKey.fill(0);
   }
 
-  /** Opens on first use. A failed open is remembered for READER_REOPEN_MS, and the first one is logged. */
   private connection(): DatabaseSync {
     if (this.closed) throw new EvidenceError("unavailable", "The evidence reader is closed.");
     if (this.db) return this.db;
@@ -140,7 +128,6 @@ function rollback(db: DatabaseSync): void {
   try {
     db.exec("ROLLBACK");
   } catch {
-    // SQLite may have rolled back already. Keep the original failure.
   }
 }
 
@@ -148,6 +135,5 @@ function closeQuietly(db: DatabaseSync | undefined): void {
   try {
     db?.close();
   } catch {
-    // The connection is already gone.
   }
 }

@@ -16,7 +16,6 @@ import { inProcessHost } from "./helpers.js";
 const ID = () => randomUUID();
 const SETTLED_AGO_MS = 60_000;
 
-/** A root with a relative path: a Unix socket path must stay under 100 bytes for the Manager. */
 async function fixture() {
   mkdirSync(".local", { recursive: true, mode: 0o700 });
   const root = mkdtempSync(join(".local", "sl-"));
@@ -41,7 +40,6 @@ const exitedState = (seq: number, extra: Record<string, unknown> = {}) =>
   ({ status: "exited", seq, screen: "", attention: initialAttention(now(), false), ...extra });
 
 const recordDir = (f: Fixture, id: string) => join(f.stateDir, "sessions", id);
-/** Moves the mocked clock on, so every file written so far is settled: its newer time is old. */
 function settle() {
   mock.timers.setTime(Date.now() + SETTLED_AGO_MS);
 }
@@ -58,7 +56,6 @@ function writeStatus(f: Fixture, id: string, state: unknown, settled = true) {
   return file;
 }
 
-/** A worker that answers `state` on the session's socket, as the worker does. */
 function fakeWorker(runDir: string, id: string, state: unknown) {
   const server: Server = createServer(socket => {
     socket.on("error", () => {});
@@ -78,10 +75,6 @@ function fakeWorker(runDir: string, id: string, state: unknown) {
   });
 }
 
-/**
- * The list() body, rebuilt without the caches from meta() and the worker's answer, else the saved status dated by its
- * file, else unavailable since the session's creation.
- */
 async function oracle(manager: Manager, options: { includeFullMessage?: boolean } = {}) {
   const ids = readdirSync(join(manager.config.stateDir, "sessions")).filter(
     n => /^[a-f0-9-]{36}$/.test(n) && !existsSync(join(manager.config.stateDir, "deleted-sessions", `${n}.sealed`)),
@@ -108,7 +101,6 @@ function assertRows(actual: unknown[], expected: unknown[], message?: string) {
   assert.equal(JSON.stringify(actual), JSON.stringify(expected), `${message ?? "rows"}: key order`);
 }
 
-/** Counts sealed-file reads and socket connects until restore(). */
 function spy() {
   const reads: string[] = [], connects: string[] = [];
   const realRead = fs.readFileSync, realConnect = net.createConnection;
@@ -169,15 +161,12 @@ test("listing rows equal the rows built from meta and state, cold, warm, and aft
     mock.timers.setTime(Date.now() + 60_000);
     const later = await manager.list();
     assertRows(later, await oracle(manager), "after the clock moves on");
-    // A row without a worker carries recorded times, never the time of the call: nothing changed, so nothing differs.
     assert.equal(JSON.stringify(later), JSON.stringify(cold), "a minute later the listing is byte-identical");
     const row = (id: string) => later.find(listed => listed.id === id)!.attention;
     assert.equal(row(E).lastActivityAt, savedAttention.lastActivityAt, "the exited row keeps its saved lastActivityAt");
     const savedAt = new Date(statSync(join(recordDir(f, U1), "status.sealed")).mtimeMs).toISOString();
     assert.deepEqual([row(U1).state, row(U1).since], ["unavailable", savedAt], "a worker gone without recording its exit is unavailable since its status was saved");
     assert.deepEqual([row(U2).state, row(U2).since], ["unavailable", "2026-11-14T00:00:00.000Z"], "without a saved status, since its creation");
-    // Kept on purpose, pending the owner's decision: state() dates a worker that does not answer at the call. A
-    // mission's stall check reads lastActivityAt from it, and a worker does not save its status on every activity.
     for (const id of [E, U1, U2]) assert.equal((await manager.state(id)).attention.lastActivityAt, new Date().toISOString(), `state() dates ${id === E ? "an exited" : "an unavailable"} row at the call`);
 
     const restarted = new Manager(f.config, f.key);
@@ -208,8 +197,6 @@ test("every change shows in the next listing", { timeout: 30_000 }, async () => 
     assertRows(await manager.list(), await oracle(manager), "warm before the changes");
     assertRows(await manager.list(), await oracle(manager), "warm");
 
-    // Rewrite the status of E in place: the same byte length, the same mtime (whole milliseconds, so
-    // that utimesSync restores it exactly), a new ctime. The listing before the rewrite keeps its parse.
     const eStatus = join(recordDir(f, E), "status.sealed");
     const eStatusMtime = new Date(Math.floor(statSync(eStatus).mtimeMs));
     utimesSync(eStatus, eStatusMtime, eStatusMtime);
@@ -272,7 +259,6 @@ test("every change shows in the next listing", { timeout: 30_000 }, async () => 
     }
     assertRows(await manager.list(), await oracle(manager), "after the worker closed");
 
-    // E's status is kept now. Make its read fail: the kept state is not served.
     writeFileSync(eStatus, "x");
     assertRows(await manager.list(), await oracle(manager), "after an unreadable status");
   } finally {
@@ -285,8 +271,6 @@ test("every change shows in the next listing", { timeout: 30_000 }, async () => 
 test("a second listing of exited records reads no sealed file and connects to no worker", { timeout: 60_000 }, async t => {
   const f = await fixture();
   const spied = spy();
-  // This test runs on the real clock until its last step: it needs files that are really fresh and files that are
-  // really settled, in turn. `age` waits until every file written so far is older than the settle rule asks.
   const age = () => new Promise<void>(resolve => setTimeout(resolve, 2_200));
   const write = (id: string, name: "meta" | "status", value: unknown) => {
     mkdirSync(recordDir(f, id), { recursive: true });
@@ -300,7 +284,6 @@ test("a second listing of exited records reads no sealed file and connects to no
       write(id, "meta", { session: sessionOf(id), fingerprint: "fixture" });
       write(id, "status", exitedState(1));
     }
-    // One more record. Its meta file gets an old mtime and a new ctime below, as a restore that keeps times leaves it.
     const probeId = ID();
     const probeMeta = write(probeId, "meta", { session: sessionOf(probeId), fingerprint: "fixture" });
     write(probeId, "status", exitedState(1));
@@ -355,7 +338,6 @@ test("a second listing of exited records reads no sealed file and connects to no
     await manager.list();
     assert.equal(spied.reads.length, 0, "a settled file is kept");
 
-    // Only now the clock is mocked: it starts a minute in the past, as a clock that stepped back.
     mock.timers.enable({ apis: ["Date"], now: Date.now() - 60_000 });
     spied.reads.length = 0;
     await manager.list();
@@ -403,7 +385,6 @@ test("a caller that changes its rows changes no later listing", { timeout: 30_00
 
 test("a kept parse has a revision, and a replaced file a new one", { timeout: 60_000 }, async () => {
   const f = await fixture();
-  // Real clock: a file is settled only when its newer time is 2 s old, so the test waits between its steps.
   const age = () => new Promise<void>(resolve => setTimeout(resolve, 2_200));
   const writeRecord = (id: string, session: Session) => {
     mkdirSync(recordDir(f, id), { recursive: true });
@@ -469,17 +450,13 @@ test("a warm session list reads no session record", { timeout: 60_000 }, async t
     const ids = Array.from({ length: 30 }, () => ID());
     for (const id of ids) {
       mkdirSync(dir(id), { recursive: true });
-      // A record as the host writes it: the stored session carries `backend`.
       writeSealed(join(dir(id), "meta.sealed"), key, `${id}:meta`, { session: sessionOf(id, { backend: "infinite" }), fingerprint: "fixture" });
       writeSealed(join(dir(id), "status.sealed"), key, `${id}:status`, exitedState(1));
     }
-    // The files settle, and the handoff poller runs twice; then the listing is warm.
     await new Promise(resolve => setTimeout(resolve, 2_300));
     await host.sessions.list();
     await new Promise(resolve => setTimeout(resolve, 1_000));
     await host.sessions.list();
-    // A client with one session open reads its detail again and again. That read is no listing: it must leave the
-    // other 29 sessions as the last listing left them.
     assert.equal((await host.fetchApi(`/sessions/${ids[0]}`)).status, 200);
 
     spied = spy();

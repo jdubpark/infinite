@@ -7,10 +7,6 @@ export const JUDGE_PROMPT_BYTES = 8 * 1024;
 
 const PACKAGE = `.git/${JUDGE_PACKAGE_DIR}`;
 
-/**
- * Fixed text only: it takes no run, no profile, and no duel, so nothing that names a contestant can reach it.
- * It is the same for every judge profile of one provider.
- */
 export function judgePrompt(provider: Provider): string {
   const sections = [
     "You are a blind judge. Two patches attempt the same task. Decide which one is better, from the package described below and the repository at your working copy, and nothing else. You do not know who wrote either patch, and you must not try to find out. You do not plan, change files, post entries, ask for permissions, or approve or block anything. Your report is a claim the host checks, not authority.",

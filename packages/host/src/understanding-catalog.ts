@@ -76,7 +76,6 @@ function emptyCatalog(): KnowledgeCatalog {
   return { revision: 0, projects: [], features: [], plans: [], componentOverrides: [], policy: { ...defaults, editedAt: null, editedBy: null }, coverage: [] };
 }
 
-/** Encrypted owner knowledge, bound to one exact enrolled repository group. */
 export class UnderstandingCatalog {
   private readonly directory: string;
   private readonly fileFor: (workspaceId: string) => string;
@@ -102,7 +101,6 @@ export class UnderstandingCatalog {
     catch { throw new CatalogError(404, "This repository workspace does not exist."); }
   }
 
-  /** Captures enrolled identities without joining projects by display name. */
   private binding(group: ProjectGroup): BindingSnapshot {
     const projects = new Map(this.sources.config.projects.map(project => [project.id, project]));
     const folded = group.repos.flatMap(repo => repo.checkouts.map(checkout => ({ checkout, repo })));
@@ -137,14 +135,11 @@ export class UnderstandingCatalog {
       const value = storedSchema.parse(unseal<unknown>(this.sources.key, `understanding-catalog:${workspaceId}`, raw)) as Stored;
       if (value.workspaceId !== workspaceId) throw new Error("catalog-workspace-mismatch");
       if (value.catalog.policy.editedAt === undefined) {
-        // One-time migration: records saved before edits were stamped lack the key. Only an owner edit writes the policy
-        // binding, so a legacy record with one keeps its flags under the owner's stamp; any other record takes the
-        // default-on switches. The owner's interval and daily limit stay either way.
         const ownerEdited = value.policyBinding.length > 0;
         value.catalog.policy = ownerEdited
           ? { ...value.catalog.policy, editedAt: new Date().toISOString(), editedBy: "owner" }
           : { ...value.catalog.policy, enabled: defaults.enabled, synthesis: defaults.synthesis, delivery: defaults.delivery, editedAt: new Date().toISOString(), editedBy: "migration" };
-        try { this.persist(workspaceId, value); } catch { /* keep the migrated policy in memory; it retries on the next load */ }
+        try { this.persist(workspaceId, value); } catch {}
       }
       this.states.set(workspaceId, value);
       return value;
@@ -167,8 +162,6 @@ export class UnderstandingCatalog {
       if (!live || live.path !== saved.path || live.device !== saved.device || live.inode !== saved.inode
         || live.identity !== saved.identity || live.repositoryIdentity !== saved.repositoryIdentity) return false;
     }
-    // Extra enrolled copies of an unchanged repository do not expand a record's
-    // repository scope. Every originally pinned checkout must still match.
     return true;
   }
 
@@ -225,8 +218,6 @@ export class UnderstandingCatalog {
     for (const item of catalog.plans) item.repositoryIds = this.canonicalRepositoryIds(item.repositoryIds, current.entries);
     catalog.componentOverrides = catalog.componentOverrides.filter(item => this.scopeMatches(state.scopes[item.id], current.entries));
     for (const item of catalog.componentOverrides) item.repositoryIds = this.canonicalRepositoryIds(item.repositoryIds, current.entries);
-    // A policy the owner set, or the default-on migration stamped, holds across a repository set change; an unstamped
-    // policy turns off until the owner decides again.
     const policyWithheld = state.policyBinding.length > 0 && !this.exactMembershipMatches(state.policyBinding, current.entries) && catalog.policy.editedBy == null;
     if (policyWithheld) catalog.policy = { ...catalog.policy, enabled: false, synthesis: false, delivery: false };
     const withheld = projectsBefore !== catalog.projects.length || featuresBefore !== catalog.features.length || plansBefore !== catalog.plans.length || componentsBefore !== catalog.componentOverrides.length;

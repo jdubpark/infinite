@@ -12,11 +12,6 @@ import type { Stored } from "./teams.js";
 const permissionRecoveryStepLimit = 100;
 const permissionRecoveryOutcomeLimit = 100;
 
-/**
- * The coordinator review's bounded recovery of a provider request: display expansion, diagnosis steps and outcomes,
- * and the project-manager correction. Moved from TeamService unchanged. It builds on the permission agent, which
- * retires coordinator recovery once it serves the run.
- */
 export class TeamPermissionRecovery extends TeamPermissionAgent {
   private readonly permissionPromptFirstSeen = new Map<string, number>();
   finishLinkedPermissionRecovery(stored: Stored, decision: TeamPermissionDecision, cause: string, action: string, outcome: string, consequence: string) {

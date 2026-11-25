@@ -11,7 +11,7 @@ import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { DEFAULT_TEAM_RETENTION, type TeamMember, type TeamRun } from "../packages/host/src/team-types.js";
 import { publishTeamHead } from "../packages/host/src/team-workspace.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
-import { fixture, git, limitLineup } from "./team-fixture.js";
+import { fixture, git, independentDeliveryLineup } from "./team-fixture.js";
 
 const prefixScript = `
 const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs");
@@ -40,7 +40,7 @@ process.exit(result.status ?? 128);
 
 async function trackedFixture(scenario: string, options: { publishHeads?: boolean } = {}, prefixMode = "pass") {
   const delivery = scenario.startsWith("delivery");
-  const f = await fixture(scenario, delivery ? limitLineup : undefined, {}, { ...(delivery ? { deliveryMode: "merge" as const } : {}) });
+  const f = await fixture(scenario, delivery ? independentDeliveryLineup : undefined, {}, { ...(delivery ? { deliveryMode: "merge" as const } : {}) });
   const remote = join(f.host.root, "publication-remote.git");
   git(f.source, "clone", "--bare", f.source, remote);
   f.host.config.projects[0]!.source = { mode: "github", repository: "example/app", baseBranch: "main" };
@@ -69,7 +69,6 @@ async function until<T>(get: () => T | Promise<T>, predicate: (value: T) => bool
   assert.fail(message);
 }
 
-// The API host runs in a child process, so clock-driven backoff and retention use a direct service with an injected clock.
 function directFixture(status: "implementing" | "cancelled", retention: Partial<typeof DEFAULT_TEAM_RETENTION>) {
   const f = schedulerFixture();
   const workspaceGit = (...args: string[]) => execFileSync("git", args, { cwd: f.run.workspace, encoding: "utf8", stdio: "pipe",
@@ -454,7 +453,7 @@ process.exit(result.status ?? 128);
   const savedWork = () => teams.get(id).members.find(item => item.memberId === member.memberId)?.savedWork;
   const pidFile = join(d.receipts, "hung-snapshot-pids");
   const pids = () => existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim().split("\n").filter(Boolean).map(Number) : [];
-  const killHungChild = (pid: number) => { try { process.kill(pid, "SIGKILL"); } catch { /* already stopped */ } };
+  const killHungChild = (pid: number) => { try { process.kill(pid, "SIGKILL"); } catch { } };
   const killHungChildren = () => { for (const pid of pids()) killHungChild(pid); };
   try {
     teams.start();

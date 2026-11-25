@@ -8,15 +8,11 @@ import type { EvidenceStore } from "./store.js";
 import { EvidenceError, type EvidenceDb, type EvidenceModule, type EvidenceTx } from "./types.js";
 
 export const BLACKBOARD_MODULE = "blackboard";
-/** The layout this host writes. Version 2 adds `entries.supersedes` and `member_scopes.read_seq`. */
 export const BLACKBOARD_VERSION = 2;
-/** Raised only when a reader must change. Version 2 is the first layout a member-tools reader may open. */
 export const BLACKBOARD_READ_VERSION = 2;
-/** A host body larger than this is refused whole, never truncated (plan, phase 2). */
 export const MAX_HOST_BODY_BYTES = 1024 * 1024;
 export const MIRROR_BATCH = 64;
 export const MIRROR_RETRY_MS = 60_000;
-/** Member entries one run may hold. Posts past it are dropped at ingest and counted (spec part 4). */
 export const MAX_MEMBER_ENTRIES = 400;
 
 const DEFAULT_LIMIT = 50;
@@ -25,12 +21,9 @@ const MAX_QUERY_KINDS = 8;
 
 export type EntryQuery = { kinds?: EntryKind[]; taskId?: string; since?: number; limit?: number };
 export type EntryPage = { entries: EntryHead[]; cursor: number; more: boolean };
-/** One journaled member post, as the worker's `team-entry` event holds it. The host checks it again before it stores it. */
 export type MemberPostRecord = { seq: number; at: string; envelope: Extract<MemberEntryEnvelope, { op: "post" }> };
-/** One journaled read receipt of a member: a list or a get call, and the bytes it served. */
 export type MemberReadRecord = { seq: number; op: "list" | "get"; servedBytes: number };
 export type IngestOutcome = { result: "stored" | "unready" | "held" | "failed"; stored: number; dropped: number; invalid: number;
-  /** Seqs of this call's posts that the store holds afterwards, inserted now or already present. Only on "stored". */
   kept?: ReadonlySet<number> };
 export type LaunchSizes = { launchSeq: number | undefined; promptBytes: number; contextBytes: number; digestBytes?: number };
 export type MemberContextUsage = {
@@ -46,7 +39,6 @@ export type MemberContextUsage = {
 };
 
 type Known = "stored" | "refused";
-/** `done`: nothing is left to store. `more`: sources remain. `held`: the run waits out a failed write. */
 type MirrorResult = "done" | "more" | "held" | "failed" | "invalid" | "unready";
 type Pending = { id: string; entry: HostEntry; json: string };
 type EntryRow = {
@@ -77,14 +69,11 @@ type ScopeRow = {
   get_calls: number;
 };
 
-/** The member kinds as SQL text. A report is a member's entry too, but it is a host kind, so the cap counts by kind. */
 const MEMBER_KIND_SQL = MEMBER_ENTRY_KINDS.map(kind => `'${kind}'`).join(", ");
-/** The member count of a run, through `entries_member_kinds`. Its `kind IN` text is the index's text. */
 export const MEMBER_COUNT_SQL = `SELECT count(*) AS n FROM entries WHERE run_id=? AND kind IN (${MEMBER_KIND_SQL})`;
 
 const HEAD_COLUMNS ="seq, entry_id, scope, run_id, revision, at, kind, author, authority, state, body_bytes, supersedes, encrypted_head";
 
-/** Version 1: the tables of phase 2. */
 const SCHEMA = [
   "CREATE TABLE entries ("
   + "seq INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -122,7 +111,6 @@ const SCHEMA = [
   "CREATE INDEX member_scopes_by_run ON member_scopes (run_id)",
 ];
 
-/** Version 2: the member supersede column and the receipt cursor. Version 1 rows keep their values. */
 const SCHEMA_V2 = [
   "ALTER TABLE entries ADD COLUMN supersedes TEXT",
   "CREATE INDEX entries_by_supersedes ON entries (supersedes) WHERE supersedes IS NOT NULL",
@@ -131,11 +119,6 @@ const SCHEMA_V2 = [
   `CREATE INDEX entries_active_by_run ON entries (run_id, seq) WHERE scope='run' AND state='active' AND kind IN (${ADDRESSED_KIND_SQL})`,
 ];
 
-/**
- * Host-written entries and member launch sizes in the shared evidence store. The host mirrors each entry
- * from a saved run record, after the record is written. Entry bodies and heads are sealed. Plain columns
- * hold only opaque ids, enumerations, numbers, and times. Nothing here changes a run.
- */
 export class Blackboard {
   private readonly now: () => number;
   private readonly known = new Map<string, Map<string, Known>>();
@@ -147,7 +130,6 @@ export class Blackboard {
   private dropped = 0;
   private invalid = 0;
 
-  /** Registers the `blackboard` module. Throws a TypeError when the store already has one. */
   constructor(private readonly store: EvidenceStore, options: { now?: () => number } = {}) {
     if (Object.hasOwn(store.status().modules, BLACKBOARD_MODULE)) {
       throw new TypeError("An evidence store has one blackboard.");
@@ -156,13 +138,8 @@ export class Blackboard {
     store.register(this.storageModule());
   }
 
-  /**
-   * Stores every host entry of the run that is not stored yet, at most MIRROR_BATCH builds per call.
-   * True when no source of the run is left to store: each one is stored or was refused. Never throws.
-   */
   mirror(run: TeamRun): boolean {
     try {
-      // A save has just written the record, so an earlier failed read of it says nothing now.
       this.unreadAt.delete(run.id);
       return this.mirrorRun(run) === "done";
     } catch {
@@ -170,24 +147,17 @@ export class Blackboard {
     }
   }
 
-  /**
-   * `mirror` for the retry pass. `done`: nothing is left to store, or the value is not a run record, so a retry
-   * cannot help. `more`: sources remain (a batch limit, a held run, a store that is not ready). `failed`: a write
-   * was tried now and failed, or the pass threw. Only `failed` starts the retry pause. Never throws.
-   */
   retry(run: TeamRun): "done" | "more" | "failed" {
     try {
       const result = this.mirrorRun(run);
       if (result === "done" || result === "invalid") return "done";
       if (result !== "failed") return "more";
     } catch {
-      // A pass that throws would throw again at once, so it pauses like a failed write.
     }
     this.retryFailedAt = this.now();
     return "failed";
   }
 
-  /** False when the store is not ready, or when a retry failed under a minute ago. Never throws. */
   retryable(): boolean {
     try {
       return this.ready() && !this.recent(this.retryFailedAt, this.now());
@@ -196,7 +166,6 @@ export class Blackboard {
     }
   }
 
-  /** True while the run's last failed write is under a minute old: a write for it would not be tried. Never throws. */
   held(runId: string): boolean {
     try {
       return this.recent(this.failedAt.get(runId), this.now());
@@ -205,19 +174,13 @@ export class Blackboard {
     }
   }
 
-  /**
-   * Notes that the caller could not read the run's saved record now. It holds no write back: only `unread` reports
-   * it, so the retry pass can leave the record alone for a minute. Never throws.
-   */
   noteUnread(runId: string): void {
     try {
       this.unreadAt.set(runId, this.now());
     } catch {
-      // Without a time the next pass reads the record again.
     }
   }
 
-  /** True while the run's record could not be read under a minute ago. Never throws. */
   unread(runId: string): boolean {
     try {
       const at = this.unreadAt.get(runId);
@@ -230,7 +193,6 @@ export class Blackboard {
     }
   }
 
-  /** The highest entry seq of the run, 0 when it has none. Undefined when the store, the module, or the read fails. */
   launchMark(runId: string): number | undefined {
     try {
       if (!this.ready()) return undefined;
@@ -243,7 +205,6 @@ export class Blackboard {
     }
   }
 
-  /** Records one member's launch sizes, keeping its read counters. False when nothing is written. Never throws. */
   recordLaunch(run: TeamRun, member: TeamMember, sizes: LaunchSizes): boolean {
     try {
       const launchSeq = sizes.launchSeq;
@@ -252,8 +213,6 @@ export class Blackboard {
       if (![launchSeq, sizes.promptBytes, sizes.contextBytes, digestBytes].every(value => Number.isSafeInteger(value) && value >= 0)) {
         return false;
       }
-      // A run whose last write failed under a minute ago waits, so a locked database costs one failed write
-      // per run per minute, launches included.
       const time = this.now();
       if (this.recent(this.failedAt.get(run.id), time)) return false;
       const planned = memberScopeOf(run, member, launchSeq);
@@ -286,7 +245,6 @@ export class Blackboard {
     }
   }
 
-  /** True when the store and the module are ready. Never throws. */
   available(): boolean {
     try {
       return this.ready();
@@ -295,11 +253,6 @@ export class Blackboard {
     }
   }
 
-  /**
-   * Stores one journal page of a member: its posts, then the receipts of its reads, in one write. Each post is
-   * checked again against the member record, and a post that fails a check stores nothing and counts as invalid.
-   * Stored states depend only on the set of stored posts, so the order of a page does not matter. Never throws.
-   */
   ingest(run: TeamRun, member: TeamMember, posts: readonly MemberPostRecord[], reads: readonly MemberReadRecord[]): IngestOutcome {
     const failed: IngestOutcome = { result: "failed", stored: 0, dropped: 0, invalid: 0 };
     try {
@@ -315,7 +268,6 @@ export class Blackboard {
         counts.dropped = 0;
         counts.invalid = 0;
         kept.clear();
-        // A page of receipts only records reads, so it needs no count.
         let members = posts.length === 0 ? 0 : (tx.get<{ n: number }>(MEMBER_COUNT_SQL, run.id)?.n ?? 0);
         for (const record of posts) {
           const entry = checkedPost(run, member, record);
@@ -348,10 +300,6 @@ export class Blackboard {
     }
   }
 
-  /**
-   * The owner's withdrawal of one entry of a run. The body stays, so the owner still reads the entry. Returns
-   * undefined when the run holds no such entry. Throws EvidenceError `unavailable` when the store is not ready or the write fails.
-   */
   withdraw(runId: string, entryId: string): "withdrawn" | "unchanged" | undefined {
     this.requireReady();
     const outcome: { value: "withdrawn" | "unchanged" | undefined } = { value: undefined };
@@ -369,12 +317,11 @@ export class Blackboard {
     return outcome.value;
   }
 
-  /** Writes one member row, then applies the supersede rules to it. The caller has checked the post. */
   private insertMember(tx: EvidenceTx, run: TeamRun, member: TeamMember, record: MemberPostRecord, entry: MemberEntryPost): void {
     const id = record.envelope.requestId;
     const head: SealedHead = {
       ...(entry.taskId === undefined ? {} : { taskId: entry.taskId }),
-      authorRole: member.role as EntryAuthorRole, // The post check admits only a role with member kinds, and an evaluator has none.
+      authorRole: member.role as EntryAuthorRole,
       paths: entry.paths,
       summary: entry.summary,
     };
@@ -399,7 +346,6 @@ export class Blackboard {
     if (inserted.changes === 1) settleSupersedes(tx, run.id, id);
   }
 
-  /** One page of the run's entry heads in `seq` order. Throws EvidenceError `unavailable` when the store is not ready. */
   list(runId: string, query: EntryQuery = {}): EntryPage {
     this.requireReady();
     const limit = clampLimit(query.limit);
@@ -434,7 +380,6 @@ export class Blackboard {
     });
   }
 
-  /** One entry of the run, or undefined. Another run's entry is undefined. Throws when the store is not ready. */
   get(runId: string, entryId: string): { head: EntryHead; body: unknown } | undefined {
     this.requireReady();
     return this.store.read(db => {
@@ -450,7 +395,6 @@ export class Blackboard {
     });
   }
 
-  /** The run's launch sizes in first-launch order. Throws when the store is not ready. */
   contextUsage(runId: string): MemberContextUsage[] {
     this.requireReady();
     return this.store.read(db => db.all<ScopeRow>(
@@ -470,10 +414,6 @@ export class Blackboard {
     })));
   }
 
-  /**
-   * The digest a member's context file carries at launch. Undefined unless the member holds the entry tools. Unavailable
-   * when the store or the module is not ready, the launch seq is unknown, or the read throws. Never throws.
-   */
   memberDigest(run: TeamRun, member: TeamMember, launchSeq: number | undefined): EntryDigest | undefined {
     try {
       if (member.entryTools !== true) return undefined;
@@ -524,17 +464,13 @@ export class Blackboard {
       for (const item of pending) known.set(item.id, "stored");
     }
 
-    // A refused source counts as done: the same body would be refused again.
     return hostEntrySources(run).every(source => known.get(hostEntryId(runId, kindOf(source), source)) !== undefined) ? "done" : "more";
   }
 
-  /** True while a failure at `failedAt` is under a minute old. A clock that moved back ends the wait. */
   private recent(failedAt: number | undefined, time: number): boolean {
     return failedAt !== undefined && time >= failedAt && time - failedAt < MIRROR_RETRY_MS;
   }
 
-
-  /** The built entry and its canonical body, or undefined when the body cannot be stored. Refusals are counted. */
   private build(run: TeamRun, source: string, at: string, kind: HostEntryKind): { entry: HostEntry; json: string } | undefined {
     let entry: HostEntry | undefined;
     let json: string;
@@ -607,7 +543,6 @@ export class Blackboard {
     if (!this.ready()) throw new EvidenceError("unavailable", "The blackboard is unavailable.");
   }
 
-  /** Its tables, and the hooks that delete a run's rows, list its runs, and count its rows. */
   private storageModule(): EvidenceModule {
     return {
       name: BLACKBOARD_MODULE,
@@ -639,7 +574,6 @@ export class Blackboard {
   }
 }
 
-/** Heads come from the plain columns and the sealed head. A head whose seal fails throws. */
 function headOf(db: EvidenceDb, row: EntryRow): EntryHead {
   const sealed = db.open<SealedHead>("entries", `${row.entry_id}:head`, row.encrypted_head);
   return {
@@ -668,10 +602,6 @@ function kindOf(source: string): HostEntryKind {
   return prefix as HostEntryKind;
 }
 
-/**
- * The post's entry when it matches the member record: the run, the binding, the entry id, the role and kind, the
- * task, and the entry tools. Undefined otherwise. Never throws.
- */
 function checkedPost(run: TeamRun, member: TeamMember, record: MemberPostRecord): MemberEntryPost | undefined {
   try {
     const { envelope } = record;
@@ -688,17 +618,12 @@ function checkedPost(run: TeamRun, member: TeamMember, record: MemberPostRecord)
   }
 }
 
-/**
- * Applies the supersede rules to a row just inserted. Each rule changes only an active row, so a withdrawn row never
- * changes. The result depends only on which posts are stored, never on the order they arrived in.
- */
 function settleSupersedes(tx: EvidenceTx, runId: string, id: string): void {
   const row = tx.get<{ kind: string; author_member_id: string | null; task_key: string | null; supersedes: string | null; at: string }>(
     "SELECT kind, author_member_id, task_key, supersedes, at FROM entries WHERE entry_id=?",
     id,
   );
   if (row === undefined) return;
-  // The new row names an earlier row that it may supersede.
   if (row.supersedes !== null) {
     tx.run(
       "UPDATE entries SET state='superseded' WHERE run_id=? AND entry_id=? AND state='active' AND author='member' AND kind=? "
@@ -710,7 +635,6 @@ function settleSupersedes(tx: EvidenceTx, runId: string, id: string): void {
       row.task_key,
     );
   }
-  // A stored row that names the new row supersedes it, when the new row may be superseded by that row.
   tx.run(
     "UPDATE entries SET state='superseded' WHERE run_id=? AND entry_id=? AND state='active' AND author='member' "
     + "AND EXISTS (SELECT 1 FROM entries AS X WHERE X.run_id=? AND X.supersedes=entries.entry_id AND X.kind=entries.kind "
@@ -719,7 +643,6 @@ function settleSupersedes(tx: EvidenceTx, runId: string, id: string): void {
     id,
     runId,
   );
-  // A handoff of a task is superseded by any later handoff of that task, and it supersedes every earlier active one.
   if (row.kind === "handoff" && row.task_key !== null) {
     tx.run(
       "UPDATE entries SET state='superseded' WHERE run_id=? AND kind='handoff' AND task_key=? AND state='active' "
@@ -741,7 +664,6 @@ function settleSupersedes(tx: EvidenceTx, runId: string, id: string): void {
   }
 }
 
-/** Adds each receipt newer than the member's `read_seq` once, then moves `read_seq` to the newest. No scope row, no change. */
 function recordReads(tx: EvidenceTx, runId: string, memberId: string, reads: readonly MemberReadRecord[]): void {
   const scope = tx.get<{ read_seq: number }>("SELECT read_seq FROM member_scopes WHERE member_id=? AND run_id=?", memberId, runId);
   if (scope === undefined) return;
@@ -769,7 +691,6 @@ function recordReads(tx: EvidenceTx, runId: string, memberId: string, reads: rea
   );
 }
 
-/** The fields the mirror reads must be arrays. Anything else is not a run record. */
 function isRunShape(run: TeamRun): boolean {
   return typeof run === "object" && run !== null && typeof run.id === "string" && run.id.length > 0
     && Array.isArray(run.members) && Array.isArray(run.checks) && Array.isArray(run.steering)

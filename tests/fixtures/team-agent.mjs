@@ -4,8 +4,6 @@ import { randomUUID } from "node:crypto";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
 
-// Tests and peers poll the receipt directory while this process runs, and parse a receipt as soon as it exists.
-// A receipt with content therefore appears whole or not at all: written under another name, then renamed.
 function writeWhole(file, data) {
   const temporary = `${file}.${process.pid}.tmp`;
   writeFileSync(temporary, data, { mode: 0o600 });
@@ -16,9 +14,7 @@ if (process.argv[2] === "--command-prefix") {
   const [, receiptDir, command, ...args] = process.argv.slice(2);
   appendFileSync(join(receiptDir, "commands.jsonl"), JSON.stringify({ command, args, cwd: process.cwd() }) + "\n", { mode: 0o600 });
   const cat = command === "git" && args.includes("cat-file");
-  // refuse-cat-file: a cat-file exits 128, as a launcher that refuses the blob form does.
   if (cat && existsSync(join(receiptDir, "refuse-cat-file"))) process.exit(128);
-  // hold-cat-file: a cat-file waits, at most 30 seconds, until release-cat-file exists.
   const deadline = Date.now() + 30_000;
   while (cat && existsSync(join(receiptDir, "hold-cat-file")) && !existsSync(join(receiptDir, "release-cat-file")) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
   const child = spawn(command, args, { stdio: "inherit", env: { ...process.env, INFINITE_TEST_COMMAND_IDENTITY: "team-prefix" } });
@@ -27,7 +23,6 @@ if (process.argv[2] === "--command-prefix") {
   await new Promise(() => {});
 }
 if (process.argv[2] === "--mirror-restricted-prefix") {
-  // Models the deployed launcher: inside a bare source mirror only the pinned base-branch fetch and rev-parse run.
   const [, receiptDir, command, ...args] = process.argv.slice(2);
   const gitSubcommand = () => {
     let index = 0;
@@ -41,8 +36,6 @@ if (process.argv[2] === "--mirror-restricted-prefix") {
       if (dirname(directory) === directory) return false;
     }
   };
-  // The five base-scan forms, after exactly the six settings the host puts before a Git command. Every id is a 40 or
-  // 64 digit lower-case hex commit id.
   const scanSettings = [/^safe\.directory=\/.+$/, /^core\.hooksPath=\/dev\/null$/, /^core\.fsmonitor=false$/, /^commit\.gpgsign=false$/,
     /^user\.name=Infinite$/, /^user\.email=agent@example\.invalid$/];
   const isBaseScan = () => {
@@ -104,7 +97,7 @@ if (process.argv[2] === "--retirement-fail-prefix") {
       const deadline = Date.now() + 3000;
       while (!existsSync(join(receiptDir, "retirement-discovered-pid.json")) && Date.now() < deadline)
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-      try { process.kill(Number(workerPid), "SIGKILL"); } catch { /* Simulates a lost stop acknowledgement after worker exit. */ }
+      try { process.kill(Number(workerPid), "SIGKILL"); } catch { }
       process.stderr.write("Injected a lost retirement acknowledgement after worker exit.\n");
       process.exit(73);
     }
@@ -138,7 +131,6 @@ if (process.argv[2] === "--hold-check") {
   process.exit(0);
 }
 if (process.argv[2] === "--leave-check") {
-  // A check that passes at once and leaves a process in its group that holds its output for a minute.
   const receiptDir = process.argv[3];
   const left = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: ["ignore", "inherit", "inherit"] });
   appendFileSync(join(receiptDir, "check-leftover.pids"), `${left.pid}\n`, { mode: 0o600 });
@@ -146,9 +138,6 @@ if (process.argv[2] === "--leave-check") {
   process.exit(0);
 }
 
-// A real child process reports through its worker's authenticated report
-// channel. The receipt directory only coordinates concurrent fixture processes;
-// the runner must discover results, commits, and check outcomes through production paths.
 const [scenario, receiptDir] = process.argv.slice(2);
 const assignment = JSON.parse(process.env.INFINITE_TEAM_ASSIGNMENT ?? "null");
 if (scenario === "stall-slow-stop" || scenario === "agent-blocked-once") process.on("SIGTERM", () => setTimeout(() => process.exit(0), 2000));
@@ -162,7 +151,6 @@ const providerIndex = process.argv.indexOf("--fixture-provider");
 const receipt = { ...assignment, cwd: process.cwd(), pid: process.pid, startedAt: Date.now(),
   ...(process.env.INFINITE_TRUSTED_WORKSPACE ? { trustedWorkspace: process.env.INFINITE_TRUSTED_WORKSPACE } : {}),
   ...(providerIndex >= 0 ? { provider: process.argv[providerIndex + 1], argv: process.argv.slice(2) } : {}) };
-// A test that writes record-context keeps a copy of each member's context file.
 if (existsSync(join(receiptDir, "record-context")) && existsSync(join(".git", "infinite-team-context.json")))
   writeWhole(join(receiptDir, `${assignment.memberId}.context.json`), readFileSync(join(".git", "infinite-team-context.json")));
 if (receipt.provider === "opencode") {
@@ -187,7 +175,6 @@ if (receipt.provider === "opencode") {
 } else if (receipt.provider === "codex") {
   receipt.prompt = process.argv.at(-1);
 }
-// A limit fallback must start in the limited member's working copy, partial file included.
 if (scenario.startsWith("limit")) receipt.sawPartial = existsSync("a.txt");
 saveReceipt();
 
@@ -202,7 +189,6 @@ async function report(value, overrides = {}) {
       }
     }
     if (settings.get("tools.report.approval_mode") !== "approve") throw new Error("Codex needs the approved team report tool");
-    // Only the variables Codex forwards through env_vars reach the server, so broken forwarding fails here.
     const environment = Object.fromEntries(settings.get("env_vars").map(name => [name, process.env[name]]));
     const server = spawn(settings.get("command"), settings.get("args"), { stdio: ["pipe", "pipe", "inherit"], env: { PATH: process.env.PATH ?? "", ...environment } });
     const lines = createInterface({ input: server.stdout });
@@ -262,11 +248,25 @@ async function waitForPeer() {
   throw new Error("Independent implementers did not overlap");
 }
 
+function withGoalCriterionRefs(tasks) {
+  if (!(receipt.prompt ?? process.argv.at(-1) ?? "").includes("Task criterion references for this goal plan:")) return tasks;
+  const context = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8"));
+  const record = context.authority?.goal?.record;
+  if (!record || !Number.isInteger(record.version) || !Array.isArray(record.criteria) || record.criteria.length === 0) return tasks;
+  const fallback = record.criteria.find(criterion => criterion.id === "c0") ?? record.criteria[0];
+  return tasks.map(task => {
+    const matching = record.criteria.filter(criterion => {
+      const check = /^(?:artifact|citation-form):(.+)$/.exec(criterion.check);
+      return check && (task.paths ?? []).some(owned => check[1] === owned || check[1].startsWith(`${owned}/`));
+    });
+    const criteria = matching.length ? matching : [fallback];
+    return { ...task, criterionRefs: { objectiveVersion: record.version, criteria: criteria.map(criterion => criterion.id) } };
+  });
+}
+
 async function main() {
   process.stdin.resume();
   if (scenario === "mcp" || scenario === "stall-slow-stop") {
-    // A private runtime receipt lets the test drive the actual worker capability
-    // through a separate MCP child. It never enters a repository or API response.
     writeWhole(join(receiptDir, "mcp-capability.json"), JSON.stringify({ assignment,
       url: process.env.INFINITE_HOOK_URL, token: process.env.INFINITE_HOOK_TOKEN }));
     return;
@@ -280,12 +280,10 @@ async function main() {
     process.exit(0);
   }
   if (assignment.role === "project-manager") {
-    // Under explore-unnamed, the project manager asks for one scout before its first plan, and names no scout profile.
     if (existsSync(join(receiptDir, "explore-unnamed")) && !(receipt.prompt ?? process.argv.at(-1) ?? "").includes("The team's one discovery batch is already used")) {
       await report({ kind: "explore", summary: "Read the module before planning", tasks: [{ id: "s1", title: "Read the module", instructions: "Read the module and report what it exports" }] });
       return;
     }
-    // A project manager corrected after an intent check waits for its release while the hold flag exists.
     const corrected = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8")).feedback;
     if (typeof corrected === "string" && corrected.startsWith("The intent check held your plan") && existsSync(join(receiptDir, "intent-hold"))) {
       const until = Date.now() + 120000;
@@ -307,10 +305,11 @@ async function main() {
       return;
     }
     if (scenario.startsWith("agent-blocked-") && assignment.revision > 1) {
-      await report({ kind: "plan", summary: "Replan the blocked assignment while retaining the independent report as evidence", tasks: [
+      const tasks = [
         { id: "a", title: "Build the first file", instructions: "Write a.txt with the current revision", paths: ["a.txt"], dependsOn: [] },
         { id: "b", title: "Build the second file", instructions: "Write b.txt with the current revision", paths: ["b.txt"], dependsOn: [] },
-      ] });
+      ];
+      await report({ kind: "plan", summary: "Replan the blocked assignment while retaining the independent report as evidence", tasks: withGoalCriterionRefs(tasks) });
       return;
     }
     if ((scenario === "bootstrap-replan" || scenario === "bootstrap-change") && assignment.revision === 2) {
@@ -325,7 +324,6 @@ async function main() {
       const recoveryQuestion = join(receiptDir, `${assignment.runId}.mixed-recovery-asked`);
       if (!existsSync(recoveryQuestion)) {
         writeFileSync(recoveryQuestion, "asked", { mode: 0o600 });
-        // No recommendation: a member started before recommendations were required still reaches its decision.
         await report({ kind: "question", question: "Which display label should the second file use?", options: ["Detailed", "Compact"] });
         return;
       }
@@ -370,8 +368,6 @@ async function main() {
       tasks[0].agentProfileId = "haiku";
       tasks[1].agentProfileId = "astra-light";
     } else if (scenario === "mixed-invalid") {
-      // The first task is valid: rejection must inspect the whole plan before
-      // dispatching any member, including work preceding the invalid choice.
       tasks[0].agentProfileId = "spark-high";
       Object.assign(tasks[1], JSON.parse(readFileSync(join(receiptDir, "invalid-profile.json"), "utf8")));
     }
@@ -381,8 +377,7 @@ async function main() {
       checks: [{ command: process.execPath, args: ["check.mjs"] }] };
     if (scenario === "bootstrap-change" && assignment.revision > 2)
       verification.checks[0].args.push("--different");
-    const plan = { kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks,
-      // A test that starts a goal run writes plan-brief, because a goal plan must carry a brief.
+    const plan = { kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks: withGoalCriterionRefs(tasks),
       ...(scenario === "permissions-routine" || existsSync(join(receiptDir, "plan-brief")) ? { brief: {
         title: "Add matching output files", problem: "The project has no matching output files.",
         evidence: [{ source: "original.txt", observation: "The source describes the fixture project." }],
@@ -391,8 +386,6 @@ async function main() {
       } } : {}),
       ...(scenario === "live-limit" || scenario === "result-operation-fails-once" ? { parallelism: 1 } : {}),
       ...(scenario === "bootstrap-missing" || scenario === "bootstrap-replan" && assignment.revision > 1 ? {} : scenario.startsWith("bootstrap") ? { verification } : {}) };
-    // The first plan is what an intent-plan checker sends as its report. Its name has no .json ending, so tests that
-    // read every receipt never parse it.
     const firstPlan = join(receiptDir, `${assignment.runId}.first-plan`);
     if (!existsSync(firstPlan)) writeWhole(firstPlan, JSON.stringify(plan));
     if (scenario === "bootstrap-override") {
@@ -407,7 +400,6 @@ async function main() {
   } else if (assignment.role === "scout") {
     await report({ kind: "findings", summary: "Read the module", evidence: [{ source: "module.txt", observation: "The module exports one function." }] });
   } else if (assignment.role === "intent-checker") {
-    // The checker copies its context and launch prompt for the test, then waits, exits, edits, or reports as the flags say.
     writeWhole(join(receiptDir, `${assignment.memberId}.intent-context.json`), readFileSync(join(".git", "infinite-team-context.json")));
     writeFileSync(join(receiptDir, `${assignment.memberId}.intent-prompt.txt`), receipt.prompt ?? process.argv.at(-1) ?? "", { mode: 0o600 });
     if (existsSync(join(receiptDir, "intent-hold"))) {
@@ -428,8 +420,6 @@ async function main() {
       : { kind: "intent-check", summary: "No gap found.", items: [] };
     await report(value);
   } else if (assignment.role === "evaluator") {
-    // The evaluator copies its context and launch prompt for the test. It stalls under `stall-evaluator`, reports `verdict.json` when
-    // the test wrote one, and otherwise reports every criterion in its context met, with the first changed path as the handle.
     const context = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8"));
     writeWhole(join(receiptDir, `${assignment.memberId}.evaluator-context.json`), JSON.stringify(context));
     writeFileSync(join(receiptDir, `${assignment.memberId}.evaluator-prompt.txt`), receipt.prompt ?? process.argv.at(-1) ?? "", { mode: 0o600 });
@@ -484,7 +474,6 @@ async function main() {
         await new Promise(resolve => setTimeout(resolve, 40));
       }
     }
-    // delivery-continued: the revision the owner's steer starts blocks once, after its sibling reported.
     const shouldBlock = scenario === "agent-blocked-once" && assignment.revision === 1 || scenario === "agent-blocked-twice" && assignment.revision <= 3 ||
       scenario === "delivery-continued" && assignment.revision === 2;
     if (shouldBlock && assignment.taskId === "a") {
@@ -519,8 +508,6 @@ async function main() {
         await new Promise(resolve => setTimeout(resolve, 40));
       }
     }
-    // Under escalate-unnamed, the first implementer of task a escalates without a profile. A refused report is kept in a file,
-    // and the report repeats with the profile named in escalate-to. The escalated member writes its file, then reports as usual.
     const launchPrompt = receipt.prompt ?? process.argv.at(-1) ?? "";
     if (launchPrompt.includes("The previous implementer requested escalation")) writeFileSync(join(receiptDir, `${assignment.memberId}.escalated`), "escalated", { mode: 0o600 });
     else if (existsSync(join(receiptDir, "escalate-unnamed")) && assignment.taskId === "a" && !existsSync(join(receiptDir, `${assignment.runId}.a-escalated`))) {
@@ -543,10 +530,6 @@ async function main() {
       return;
     }
     if (scenario.startsWith("limit") && receipt.provider === "claude" && receipt.argv[receipt.argv.indexOf("--model") + 1] === "claude-haiku-5-5") {
-      // Partial work, then Claude Code's limit notice and its StopFailure hook. The notice comes
-      // first so the hook arrives as its corroboration: a hook alone switches the member before a
-      // later notice could record the host-level limit. The member idles without reporting.
-      // The stated reset is two hours ahead of this clock (read as UTC), so it is never in the past.
       writeFileSync("a.txt", "partial\n");
       const reset = new Date(Date.now() + 2 * 3600_000); reset.setUTCSeconds(0, 0);
       const hour = reset.getUTCHours();
@@ -617,15 +600,12 @@ async function main() {
       }
       if (scenario === "permissions-codex-evidence-change")
         writeFileSync(join(receiptDir, `${assignment.runId}.target-ready`), "ready", { mode: 0o600 });
-      // The Codex 0.163 command dialog layout: pinned under the transcript, key hint on the last row.
-      // Every line fits 80 columns, so the `$` line is always row 11 and the options rows 14-16.
       const options = scenario === "permissions-codex-diagnostic-evidence"
         ? ["1. Yes, proceed (y)", "2. Yes, proceed once", "3. No, and tell Codex what to do differently (esc)"]
         : ["1. Yes, proceed (y)", "2. Yes, and don't ask again for commands that start with `npm run check` (p)",
           "3. No, and tell Codex what to do differently (esc)"];
       const optionRows = marker => options.map((label, index) => `${index === marker ? "›" : " "} ${label}`);
       let marker = scenario === "permissions-codex-midway" ? 2 : 0;
-      // Like the real TUI, read keys as they arrive and without echo.
       if (scenario === "permissions-codex-midway") process.stdin.setRawMode(true);
       process.stdout.write([
         "\u001b[2J\u001b[H• Running npm run check", "", "",
@@ -638,7 +618,6 @@ async function main() {
         "  Press enter to confirm or esc to cancel",
       ].join("\r\n"));
       if (scenario === "permissions-codex-respace") {
-        // Spacing inside a line is outside the screen hash: the reviewed command must still not be answered.
         writeFileSync(join(receiptDir, `${assignment.runId}.target-ready`), "ready", { mode: 0o600 });
         await waitFor("target-change", "change the Codex command");
         process.stdout.write("\u001b[11;1H\u001b[2K  $ npm run  check");
@@ -649,8 +628,6 @@ async function main() {
           writeFileSync(join(receiptDir, `${assignment.runId}.target-key`), input, { mode: 0o600 });
         if (scenario !== "permissions-codex-midway") break;
         if (input.includes("\r")) { writeFileSync(join(receiptDir, `${assignment.runId}.enter`), "enter", { mode: 0o600 }); break; }
-        // The first arrow redraws the command with other spacing in the same write that moves the
-        // marker, so the answer reaches its chosen option only on a screen that no longer matches.
         marker = Math.max(0, marker - (input.match(/\u001b[[O]A/g)?.length ?? 0));
         process.stdout.write(`\u001b[11;1H\u001b[2K  $ npm run  check${optionRows(marker).map((row, index) => `\u001b[${14 + index};1H\u001b[2K${row}`).join("")}`);
       }
@@ -665,13 +642,11 @@ async function main() {
       const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
         method: "POST",
         headers: { Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}`, "Content-Type": "application/json" },
-        // A hook correlates with a yes-no line only when its command text is that line.
         body: JSON.stringify({ hook_event_name: "PermissionRequest", tool_name: "Bash",
           tool_input: { command: scenario === "permissions-yesno" ? "Run this command? [Y/n]" : "cat original.txt" } }),
       });
       if (response.status !== 204) throw new Error(`Provider permission hook was refused with status ${response.status}`);
       if (scenario === "permissions-off-navigate") {
-        // Like the real TUI: arrows move the marker, Enter picks the option, and the feedback option then takes one line of text.
         const labels = ["1. Yes", "2. Yes, and don't ask again for Bash commands", "3. No, and tell Claude what to do differently (esc)"];
         let marker = 0;
         const draw = () => process.stdout.write(`\u001b[2J\u001b[H\nBash command\ncat original.txt\nDo you want to proceed?\n${labels.map((label, index) => `${index === marker ? "❯" : " "} ${label}`).join("\n")}\n`);
@@ -724,8 +699,6 @@ async function main() {
         ].join("\n");
       writeFileSync("check.mjs", check + "\n");
     }
-    // Keep both processes alive after the barrier so overlap can be measured
-    // independently of the member states returned by the API.
     await new Promise(resolve => setTimeout(resolve, 150));
     const name = scenario === "scope-escape" && assignment.taskId === "a" ? " a.txt" : `${assignment.taskId}.txt`;
     writeFileSync(name, `revision ${assignment.revision}\n`);
@@ -747,8 +720,6 @@ async function main() {
       writeFileSync("tests/y.test.ts", "export {};\n");
     }
     if (scenario === "usage" && receipt.provider === "opencode") {
-      // The `opencode run --format json` stream: one line per part event, with a step-finish
-      // part for each step of the assistant message, then unrelated plain text.
       const line = (type, part) => JSON.stringify({ type, timestamp: Date.now(), sessionID: "ses_fixture", part });
       const step = (n, cost, input, output) => line("step_finish", { type: "step-finish", id: `prt_${assignment.taskId}_${n}`,
         messageID: `msg_${assignment.taskId}`, sessionID: "ses_fixture", reason: "tool-calls", cost,
@@ -863,8 +834,6 @@ async function main() {
       return;
     }
     if (scenario === "delivery-continued") {
-      // Pushes the reviewed head to the branch its prompt names, without force, and reports one pull request. A delivery
-      // that continues the pull request waits for the test, which inspects the remote first.
       const branch = launchPrompt.match(/Use deterministic head branch (\S+), base branch/)?.[1];
       if (!branch) throw new Error("The fixture could not read the delivery branch from its prompt");
       const continued = launchPrompt.includes("This run continues its pull request");
@@ -916,7 +885,6 @@ ${branch}`;
     }
     if (scenario === "reviewer-recording-error" && !existsSync(join(receiptDir, "reviewer-recording-error-started"))) {
       writeFileSync(join(receiptDir, "reviewer-recording-error-started"), "started", { mode: 0o600 });
-      // The descendant runs its own script, out of reach of writeWhole, so it writes its receipt whole the same way.
       const descendantScript = `const { existsSync, renameSync, writeFileSync } = require('node:fs'); const { join } = require('node:path'); let child; process.on('SIGTERM',()=>{}); setInterval(() => { if (!child && existsSync(join(${JSON.stringify(receiptDir)}, 'retirement-expand-tree'))) { child = require('node:child_process').spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000)"], { detached:true, stdio:'ignore' }); const file = join(${JSON.stringify(receiptDir)}, 'retirement-discovered-pid.json'); writeFileSync(file + '.tmp', JSON.stringify({ pid:child.pid }), { mode:0o600 }); renameSync(file + '.tmp', file); } }, 50);`;
       const descendant = spawn(process.execPath, ["-e", descendantScript],
         { detached: true, stdio: "ignore" });
@@ -933,7 +901,6 @@ ${branch}`;
     if (scenario === "changed-after-check")
       writeFileSync(join(process.cwd(), "..", "..", "integration", "a.txt"), "Changed after verification\n");
     await report({ kind: "review", verdict: "approved", summary: "Both requested files are present in the integrated checkout",
-      // A goal plan's brief has one acceptance criterion; a compliant reviewer reports it.
       ...(scenario === "permissions-routine" || existsSync(join(receiptDir, "plan-brief"))
         ? { acceptance: [{ criterion: 1, verdict: "verified", evidence: "The configured check validated both output files." }] } : {}),
       ...(scenario === "rubric" ? { rubric: ["a", "b"].map(taskId => ({ taskId,

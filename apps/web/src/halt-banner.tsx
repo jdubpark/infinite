@@ -6,15 +6,10 @@ const KEPT = "Sessions started directly keep running.";
 
 const since = (halt: HaltState) => `Since ${haltSince(halt.at)} · from ${halt.by}`;
 
-/**
- * The owner's halt over the current screen. Information only: the owner releases a halt with `infinite halt off`.
- * It keeps the last received state through a failed poll and stays dense, so a session record keeps its room.
- */
 export function HaltBanner({ notice, name, owner, compact = false, className = "" }: {
   notice: HaltNotice | null; name: (projectId: string) => string; owner: boolean; compact?: boolean; className?: string;
 }) {
   if (!notice) return null;
-  // A narrow list keeps its rows: a compact host halt says what is held, since when, and why, without the explanation.
   if (compact && (notice.kind === "host" || notice.kind === "unreadable")) return <div className={`halt-banner halt-compact ${className}`} role="status">
     <OctagonPause size={16} aria-hidden="true" />
     {notice.kind === "host"

@@ -5,7 +5,6 @@ import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, w
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mintGithubGrant, readGithubGrantKey, sessionGithubScope } from "../packages/host/src/github-grants.js";
-// The proxy is a plain Node script; the host and the proxy must agree on every grant.
 import { loadGrantKey, verifyGrant } from "../scripts/github-proxy.mjs";
 
 const key = randomBytes(32);
@@ -13,7 +12,6 @@ const now = Date.UTC(2026, 10, 14, 12, 0, 0);
 const nowSeconds = Math.floor(now / 1000);
 const claims = { sub: "team:delivery", sid: "session-1", project: "product-web", repo: "example/product", ops: ["fetch", "push", "pr"] as ("fetch" | "push" | "pr")[], refs: ["refs/heads/infinite/team-1"] };
 
-/** Signs an arbitrary payload the way the host does, so the proxy's own field checks are what refuses it. */
 function signed(payload: unknown, signingKey = key, version = "v2") {
   const body = `${version}.${Buffer.from(JSON.stringify(payload)).toString("base64url")}`;
   return `${body}.${createHmac("sha256", signingKey).update(body).digest("base64url")}`;
@@ -23,7 +21,6 @@ test("a host-minted grant verifies in the proxy with the same claims", () => {
   const grant = mintGithubGrant(key, { ...claims, ttlSeconds: 3600 }, now);
   const result = verifyGrant(grant, key, nowSeconds + 10);
   assert.deepEqual(result, { ok: true, claims: { ...claims, exp: nowSeconds + 3600 } });
-  // The default lifetime is the 24-hour maximum, which the proxy still accepts.
   assert.equal(verifyGrant(mintGithubGrant(key, claims, now), key, nowSeconds).ok, true);
 });
 
@@ -70,8 +67,6 @@ test("unknown or malformed fields are refused even with a valid signature", () =
 });
 
 test("the host and the proxy read the grant key only from a root-owned file below root-owned directories", () => {
-  // Tests run without root: `trustedUid` names this process's uid as the one owner accepted besides root. The fixture
-  // lives under the home directory because a shared temporary directory is world-writable and fails the rule.
   const uid = process.getuid!();
   const root = realpathSync(mkdtempSync(join(homedir(), ".github-grant-key-")));
   try {
@@ -88,8 +83,6 @@ test("the host and the proxy read the grant key only from a root-owned file belo
 
     const good = write(join(root, "grant.key"), 0o440);
     assert.equal(both(good), keyHex);
-    // The same file and directories owned by an account that is neither root nor trusted (the agent-owned key of the
-    // review): the production default, trustedUid 0, refuses them.
     if (uid !== 0) {
       assert.throws(() => host(good, 0), /unsafe/);
       assert.throws(() => proxy(good, 0), /grant-key-(?:directory-)?permissions/);

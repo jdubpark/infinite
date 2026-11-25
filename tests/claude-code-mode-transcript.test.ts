@@ -8,8 +8,6 @@ test("Claude Code Mode transcript shows the program, each nested call, and the f
   const tail = new TranscriptTail("claude");
   const raw = readFileSync(new URL("./fixtures/claude-code-mode/transcript.jsonl", import.meta.url), "utf8");
   const messages = tail.ingest(raw);
-  // The program row carries the model's own description. The nested rows carry what actually ran,
-  // so they stay: a reader must not have only the description to go on.
   assert.deepEqual(messages.map(message => [message.role, message.toolName, message.text]), [
     ["user", undefined, "In one program: run the shell command 'wc -c a.txt b.txt c.md', then write only the total number into a new file named total.txt in the current folder. Reply with only the total."],
     ["tool", "REPL", "Run wc -c and write total byte count to total.txt"],
@@ -24,7 +22,6 @@ test("Claude Code Mode transcript shows the program, each nested call, and the f
   assert.equal(tail.discarded, 0, "repl-mode, tools-used, and host-row records are valid ignored rows");
 });
 
-// The provider's own continue after an owner's answer: a meta row the chat view must not show.
 test("the provider's own continue prompt after a deferred resume is not a chat message", () => {
   const tail = new TranscriptTail("claude");
   const row = {

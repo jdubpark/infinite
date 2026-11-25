@@ -37,7 +37,6 @@ test("owner delegation covers one workspace or all, ends on an owner regroup als
     const webWorkspace = (await host.fetchApi("/project-groups/web-app", "owner")).body.id as string;
     assert.notEqual(shopWorkspace, webWorkspace);
 
-    // Only an owner CLI acts. Controllers, viewers, anonymous callers and a browser session of the owner are refused.
     const oneWorkspace = { requestId: randomUUID(), workspaceId: shopWorkspace, direction };
     assert.equal((await host.fetchApi("/permissions/delegations", "controller", oneWorkspace)).status, 403);
     assert.equal((await host.fetchApi("/permissions/delegations", "viewer", oneWorkspace)).status, 403);
@@ -60,7 +59,6 @@ test("owner delegation covers one workspace or all, ends on an owner regroup als
     });
     assert.equal(browserRevocation.status, 403, "an owner browser session without the CLI bearer cannot revoke");
 
-    // One workspace: the other stays not-delegated, and a retry with the same request ID replays the same body.
     const first = await host.fetchApi("/permissions/delegations", "owner", oneWorkspace);
     assert.equal(first.status, 200, JSON.stringify(first.body));
     assert.equal(first.body.agent, "inactive");
@@ -81,17 +79,14 @@ test("owner delegation covers one workspace or all, ends on an owner regroup als
     assert.equal((await host.fetchApi("/permissions/delegations", "owner", { ...oneWorkspace, workspaceId: webWorkspace })).status, 409,
       "the same request ID for another workspace is a conflict");
 
-    // All workspaces: both delegated, sharing the direction the owner gave.
     const everything = await host.fetchApi("/permissions/delegations", "owner", { requestId: randomUUID(), all: true, direction });
     assert.equal(everything.status, 200, JSON.stringify(everything.body));
     assert.deepEqual(everything.body.views.map((view: View) => view.workspaceId).sort(), [shopWorkspace, webWorkspace].sort());
     assert.deepEqual(everything.body.views.map((view: View) => view.state), ["delegated", "delegated"]);
     assert.deepEqual(everything.body.views.map((view: View) => view.direction), [direction, direction]);
-    // The body names exactly one target: both or neither is refused.
     assert.equal((await host.fetchApi("/permissions/delegations", "owner", { requestId: randomUUID(), workspaceId: shopWorkspace, all: true })).status, 400);
     assert.equal((await host.fetchApi("/permissions/delegations", "owner", { requestId: randomUUID() })).status, 400);
 
-    // An owner regroup moves shop-api into a new workspace. Its coverage ends and the other workspace keeps its delegation.
     const moved = await host.fetchApi("/project-groups", "owner", { requestId: randomUUID(), name: "Storefront", repos: ["shop-api"] });
     assert.equal(moved.status, 200, JSON.stringify(moved.body));
     const storefront = moved.body.id as string;
@@ -101,7 +96,6 @@ test("owner delegation covers one workspace or all, ends on an owner regroup als
     assert.deepEqual(projectStates(viewOf(regrouped.body.workspaces, storefront)), ["not-covered"]);
     assert.equal(viewOf(regrouped.body.workspaces, webWorkspace)?.state, "delegated");
 
-    // Revoke returns the workspace to not-delegated, and its retry replays.
     const revocation = { requestId: randomUUID(), workspaceId: webWorkspace };
     const revoked = await host.fetchApi("/permissions/revocations", "owner", revocation);
     assert.equal(revoked.status, 200, JSON.stringify(revoked.body));
@@ -112,10 +106,8 @@ test("owner delegation covers one workspace or all, ends on an owner regroup als
     assert.deepEqual((await host.fetchApi("/permissions/revocations", "owner", revocation)).body, revoked.body);
     assert.equal(viewOf((await host.fetchApi("/permissions/status", "owner")).body.workspaces, webWorkspace)?.state, "not-delegated");
 
-    // No permission agent yet: the rates are empty, and the capability advertises delegation.
     const settled = await host.fetchApi("/permissions/status", "owner");
     assert.equal(settled.body.agent, "inactive");
-    // No headless session runs, so the channel lists none.
     assert.deepEqual(settled.body.headless, { sessions: [], shadowed: [] });
     assert.equal(settled.body.policyVersion, PERMISSION_POLICY_VERSION);
     assert.deepEqual(settled.body.interruptClasses, [...INTERRUPT_CLASSES]);
@@ -124,7 +116,6 @@ test("owner delegation covers one workspace or all, ends on an owner regroup als
     assert.equal(settled.body.rates.lastDay.perHour, 0);
     assert.deepEqual((await host.fetchApi("/me", "owner")).body.permissions, { workspaceDelegation: 1, decisionLog: 1, onboardingCoverage: 1 });
 
-    // Scoped figures: a workspace, a session and a task need an id, the host takes none, and the window is bounded.
     const scoped = await host.fetchApi(`/permissions/rates?scope=workspace&id=${webWorkspace}&hours=24`, "controller");
     assert.equal(scoped.status, 200, JSON.stringify(scoped.body));
     assert.deepEqual([scoped.body.scope, scoped.body.id, scoped.body.hours, scoped.body.rates.decisions], ["workspace", webWorkspace, 24, 0]);
@@ -133,7 +124,6 @@ test("owner delegation covers one workspace or all, ends on an owner regroup als
       assert.equal((await host.fetchApi(`/permissions/rates?${query}`, "owner")).status, 400, query);
     assert.equal((await host.fetchApi("/permissions/rates?scope=host", "viewer")).status, 403);
 
-    // A state file that will not open leaves delegation unavailable: its routes answer 503, and regrouping still works.
     assert.equal((await host.fetchApi("/permissions/delegations", "owner", { requestId: randomUUID(), workspaceId: webWorkspace })).body.views[0].state, "delegated");
     await host.stopApi();
     const delegationFile = join(host.config.stateDir, "permission-delegations", "state.sealed");
@@ -147,7 +137,6 @@ test("owner delegation covers one workspace or all, ends on an owner regroup als
     const grouped = await host.fetchApi("/project-groups", "owner", { requestId: randomUUID(), name: "Catalog", repos: ["web-app"] });
     assert.equal(grouped.status, 200, JSON.stringify(grouped.body));
 
-    // The regrouping happened while delegation was unavailable. Once its state opens again, the moved project is not covered.
     await host.stopApi();
     writeFileSync(delegationFile, recorded, { mode: 0o600 });
     await host.start();
@@ -178,7 +167,6 @@ test("the owner reads the decision log and marks a decision; no other role reads
     role: "implementer", provider: "claude", family: "claude", evidenceHash: `evidence-${id}`, action: { tool: "Bash", summary: "npm test" },
     rules: [], tiers: [], verdict: "allow", ...overrides,
   });
-  // The journal is written before the host starts, as the decision pipeline would have written it.
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(stateDir), vaultKey: key });
   store.register(permissionJournalModule);
   const seed = new PermissionJournal(store);
@@ -188,7 +176,6 @@ test("the owner reads the decision log and marks a decision; no other role reads
     tiers: [{ tier: "strong", profileId: "strong-1", family: "gpt", startedAt: ago(40 * 60_000 + 3_000), endedAt: ago(40 * 60_000) }],
   }));
   seed.appendDelivery({ decisionId: "rejected", at: ago(39 * 60_000), kind: "intent" });
-  // A busy session: 21 decisions in the last hour in a workspace with no history is above the floor of twenty.
   for (let index = 0; index < 21; index++)
     seed.appendDecision(base(`busy-${index}`, ago(30 * 60_000 - index * 1_000), { sessionId: "busy-session", taskId: "busy-session", assignment: "busy-session" }));
   store.close();
@@ -196,20 +183,17 @@ test("the owner reads the decision log and marks a decision; no other role reads
   let host: Host | undefined;
   try {
     host = await startHost({ config: { stateDir, keyFile, projects: [{ id: "shop-api", name: "Shop API", path: shop }] } });
-    // The log, one decision and the candidates carry the owner's material: a controller, a viewer and an anonymous caller are refused.
     for (const path of ["/permissions/log", "/permissions/decisions/rejected", "/permissions/candidates"]) {
       assert.equal((await host.fetchApi(path, "controller")).status, 403, path);
       assert.equal((await host.fetchApi(path, "viewer")).status, 403, path);
       assert.equal((await host.fetchApi(path, null)).status, 401, path);
     }
-    // A controller reads the status, with the rate flag and without any note.
     const status = await host.fetchApi("/permissions/status", "controller");
     assert.equal(status.status, 200, JSON.stringify(status.body));
     assert.deepEqual(status.body.rateFlags.map((flag: { sessionId: string; lastHour: number; threshold: number }) => [flag.sessionId, flag.lastHour, flag.threshold]),
       [["busy-session", 21, 20]]);
     assert.doesNotMatch(JSON.stringify(status.body), /only the owner reads/);
 
-    // The owner's log: filters, names, linked events, the note, and the rate flag on the busy session's entries.
     const rejected = await host.fetchApi("/permissions/log?rejected=1", "owner");
     assert.equal(rejected.status, 200, JSON.stringify(rejected.body));
     assert.deepEqual(rejected.body.entries.map((entry: { id: string }) => entry.id), ["rejected"]);
@@ -234,7 +218,6 @@ test("the owner reads the decision log and marks a decision; no other role reads
     for (const query of ["limit=0", "limit=201", "rejected=yes", "since=yesterday", "before=1", "extra=1"])
       assert.equal((await host.fetchApi(`/permissions/log?${query}`, "owner")).status, 400, query);
 
-    // A mark needs the owner CLI. Controllers, viewers and an owner browser session are refused.
     const mark = { requestId: randomUUID(), decisionId: "rejected", label: "wrong", note: "The build directory is the session's own." };
     assert.equal((await host.fetchApi("/permissions/marks", "controller", mark)).status, 403);
     assert.equal((await host.fetchApi("/permissions/marks", "viewer", mark)).status, 403);
@@ -259,7 +242,6 @@ test("the owner reads the decision log and marks a decision; no other role reads
     const second = await host.fetchApi("/permissions/marks", "owner", { ...mark, requestId: randomUUID(), note: "Still wrong." });
     assert.equal(second.status, 200, JSON.stringify(second.body));
 
-    // The marks are on the decision, which is unchanged: still a reject, still open.
     const marked = await host.fetchApi("/permissions/decisions/rejected", "owner");
     assert.deepEqual([marked.body.entry.verdict, marked.body.entry.code, marked.body.entry.rejectState], ["reject", "unsafe", "open"]);
     assert.deepEqual(marked.body.entry.marks.map((row: { note: string }) => row.note), [mark.note, "Still wrong."]);
@@ -269,7 +251,6 @@ test("the owner reads the decision log and marks a decision; no other role reads
       [["rejected", "should-allow", ["marked-wrong"]]]);
     assert.doesNotMatch(JSON.stringify(candidates.body), /only the owner reads/, "a candidate carries no model note");
 
-    // The CLI prints the log and records a mark.
     const clientFile = join(root, "client.json");
     writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner }), { mode: 0o600 });
     const cli = [import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
@@ -292,7 +273,6 @@ test("the owner reads the decision log and marks a decision; no other role reads
   }
 });
 
-/** A host whose projects are committed Git roots that `repo init` can enroll, with helpers for the owner's onboarding. */
 async function onboardingHost(prefix: string, projectIds: string[]) {
   const root = mkdtempSync(join(tmpdir(), prefix));
   const projects = projectIds.map(id => {
@@ -300,7 +280,6 @@ async function onboardingHost(prefix: string, projectIds: string[]) {
     mkdirSync(path, { mode: 0o700 });
     const git = (...args: string[]) => execFileSync("git", args, { cwd: path, stdio: "ignore" });
     git("init", "--initial-branch=main");
-    // Its own remote and content, so the host never folds two fixtures into one repository's workspace.
     git("remote", "add", "origin", `https://github.com/example/${id}.git`);
     writeFileSync(join(path, "tracked.txt"), `${id}\n`);
     git("add", "tracked.txt");
@@ -308,7 +287,6 @@ async function onboardingHost(prefix: string, projectIds: string[]) {
     return { id, name: id, path };
   });
   const host = await startHost({ config: { projects, teams: { workspaceDir: join(root, "team-workspaces") } } });
-  /** The body `repo init` sends: `policy` is the coordinator policy, `optOut` an explicit `--permissions off`. */
   const body = (revision: number, options: { policy?: boolean; optOut?: boolean } = {}) => ({
     requestId: randomUUID(), revision,
     team: { checks: [{ command: "git", args: ["status", "--short"] }], handoff: "auto",
@@ -332,7 +310,6 @@ test("owner onboarding covers a project the first time only, and an off records 
   try {
     assert.equal((await f.host.fetchApi("/me", "owner")).body.permissions.onboardingCoverage, 1);
 
-    // A first onboarding with a policy covers the project in its workspace. Its replay answers the same; a repeat changes nothing.
     const firstRequest = f.body(0, { policy: true });
     const covered = await f.onboard("first", firstRequest);
     assert.equal(covered.status, 200, JSON.stringify(covered.body));
@@ -343,12 +320,10 @@ test("owner onboarding covers a project the first time only, and an off records 
     assert.deepEqual((await f.onboard("first", f.body(1, { policy: true }))).body.permissionAgent, { coverage: "unchanged" });
     assert.deepEqual(await f.entry("first"), { state: "covered", act: "onboarding" });
 
-    // An older client's `--permissions off` sends a first onboarding with no policy: it records an opt-out.
     const older = await f.onboard("older-client", f.body(0));
     assert.equal(older.status, 200, JSON.stringify(older.body));
     assert.deepEqual(older.body.permissionAgent, { coverage: "opt-out" });
     assert.deepEqual(await f.entry("older-client"), { state: "opt-out" });
-    // Only the owner's delegation replaces it. An explicit off on a repeat onboarding then removes that coverage.
     const delegated = await f.host.fetchApi("/permissions/delegations", "owner", { requestId: randomUUID(), workspaceId: await f.workspace("older-client") });
     assert.equal(delegated.status, 200, JSON.stringify(delegated.body));
     assert.deepEqual(delegated.body.replacedOptOuts, ["older-client"]);
@@ -359,7 +334,6 @@ test("owner onboarding covers a project the first time only, and an off records 
     assert.deepEqual(repeatOff.body.permissionAgent, { coverage: "opt-out" });
     assert.deepEqual(await f.entry("older-client"), { state: "opt-out" });
 
-    // An explicit off on a first onboarding covers nothing, and an off that carries a policy is refused before anything is written.
     assert.equal((await f.onboard("explicit-off", f.body(0, { optOut: true, policy: true }))).status, 400);
     assert.deepEqual(await f.entry("explicit-off"), { state: "not-covered" });
     const off = await f.onboard("explicit-off", f.body(0, { optOut: true }));
@@ -378,7 +352,6 @@ test("onboarding never covers a project that was enrolled without a delegation r
     writeFileSync(delegationFile, "not a sealed state\n", { mode: 0o600 });
     await f.host.start();
 
-    // The delegation record will not open. A first onboarding is still saved, and says that coverage was not recorded.
     const legacyFirst = f.body(0, { policy: true });
     const recoveredFirst = f.body(0, { policy: true });
     for (const [projectId, request] of [["legacy", legacyFirst], ["recovered", recoveredFirst]] as const) {
@@ -387,12 +360,9 @@ test("onboarding never covers a project that was enrolled without a delegation r
       assert.equal(saved.body.revision, 1);
       assert.deepEqual(saved.body.permissionAgent, { coverage: "unavailable", reason: "Permission delegation is unavailable on this host." });
     }
-    // An explicit off that cannot be recorded writes no enrollment.
     assert.equal((await f.onboard("refused", f.body(0, { optOut: true }))).status, 503);
     assert.equal((await f.host.fetchApi("/projects/refused/team", "owner")).body.revision, 0);
 
-    // The record opens again, empty. `legacy` now has a saved policy and no delegation record, like a project enrolled
-    // before this release, whose host saved the creating request without its mark.
     await f.host.stopApi();
     rmSync(delegationFile);
     const key = readFileSync(f.host.config.keyFile);
@@ -403,11 +373,9 @@ test("onboarding never covers a project that was enrolled without a delegation r
     writeSealed(enrollments, key, "repo-enrollments", stored);
     await f.host.start();
 
-    // A replay of the marked first request records the coverage that its first attempt could not.
     const recovered = await f.onboard("recovered", recoveredFirst);
     assert.equal(recovered.body.revision, 1);
     assert.deepEqual(recovered.body.permissionAgent, { coverage: "covered", workspaceId: await f.workspace("recovered") });
-    // The unmarked one, and a repeat onboarding with the saved policy, leave the project uncovered.
     const replayed = await f.onboard("legacy", legacyFirst);
     assert.equal(replayed.body.revision, 1);
     assert.deepEqual(replayed.body.permissionAgent, { coverage: "unchanged" });

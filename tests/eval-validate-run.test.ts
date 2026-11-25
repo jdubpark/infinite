@@ -37,7 +37,6 @@ function git(cwd: string, args: string[]): string {
   return result.stdout.trim();
 }
 
-/** One commit with the given files. Times are fixed so the run is the same each time. */
 function commit(work: string, files: Record<string, string>, message: string, time: number): string {
   for (const [path, content] of Object.entries(files)) {
     mkdirSync(dirname(join(work, path)), { recursive: true });
@@ -51,10 +50,6 @@ function commit(work: string, files: Record<string, string>, message: string, ti
   return git(work, ["rev-parse", "HEAD"]);
 }
 
-/**
- * A bare mirror with branch main and four commits. C0 has no test change. C1 adds `add` and passes its test. C2 adds a test
- * that passes at C1, so it is not fail-to-pass. C3 adds a test that passes once and fails on every later run in its job.
- */
 function rig(): Rig {
   const dir = mkdtempSync(join(tmpdir(), "infinite-eval-run-"));
   sandboxes.push(dir);
@@ -106,7 +101,6 @@ function projectConfig() {
   };
 }
 
-/** The host configuration, with the fixture launcher as `eval.grader` unless `metadata` is null. */
 function configFor(r: Rig, options: { metadata?: "open" | "closed"; noGrader?: boolean } = {}): Config {
   const prefix = { command: process.execPath, args: [FIXTURE, "--root", r.root, "--uid", String(UID), "--metadata", options.metadata ?? "closed", "--record", r.record] };
   return {
@@ -119,20 +113,11 @@ function configFor(r: Rig, options: { metadata?: "open" | "closed"; noGrader?: b
   } as unknown as Config;
 }
 
-/**
- * The launcher as the host sees it in these tests. The fixture runs as this user, so the host's own paths are readable and
- * cannot be canaries here. The probe still receives them; `seen` records each list before it is replaced with none.
- */
 function testGrader(config: Config, seen: string[][] = []): Grader {
   const inner = launcherGrader(() => config.eval?.grader, { hostUid: UID + 1, graceMs: 5_000 });
   return { ...inner, probe: canaries => { seen.push([...canaries]); return inner.probe([]); } };
 }
 
-/**
- * Records, in the host process, each grader command the host starts. `call()` invokes `run` synchronously after its halt
- * check, so a command that starts after `close()` is recorded here at once. The fixture's own record line is written only
- * after its Node process boots, so it can land later than the host's start.
- */
 function startLog(grader: Grader, started: string[]): Grader {
   return { ...grader, run: (job, dir, seconds, argv, options) => { started.push(dir); return grader.run(job, dir, seconds, argv, options); } };
 }
@@ -146,7 +131,6 @@ function alive(pid: number): boolean {
   }
 }
 
-/** The fixture's own process groups, as the processes of the grader's account. The host's processes are never listed. */
 async function fixtureInventory(groups: string): Promise<RuntimeProcess[]> {
   const text = existsSync(groups) ? readFileSync(groups, "utf8") : "";
   return text.split("\n").map(Number).filter(pid => Number.isInteger(pid) && pid > 1 && alive(pid))
@@ -155,9 +139,7 @@ async function fixtureInventory(groups: string): Promise<RuntimeProcess[]> {
 
 type HostOptions = {
   config?: Config; metadata?: "open" | "closed"; noGrader?: boolean; grader?: Grader | undefined; store?: EvidenceStore; mineGit?: MineGit;
-  /** The owner's halt state for every project, read at each check. */
   halt?: () => "clear" | "halted";
-  /** The host-load gate's hold reason, read at each check. */
   held?: () => string | undefined;
   source?: EvalHostOptions["source"];
 };
@@ -204,14 +186,12 @@ function minedRows(r: Rig): { commit: string; row: EvalTaskRow }[] {
   });
 }
 
-/** The mined row of one commit, by its task id. A rejected row keeps only its project in the payload, so the commit is not read from it. */
 function byCommit(r: Rig, commit: string): EvalTaskRow {
   const row = r.store.read(db => readEvalTask(db, minedTaskId(db.index("project", PROJECT), db.index("eval-commit", commit))));
   assert.ok(row, `a mined row for commit ${commit.slice(0, 8)}`);
   return row;
 }
 
-/** Every plain text column of every eval table, which must hold no file name and no commit id. */
 function plainText(r: Rig): string {
   return r.store.read(db => {
     const tables = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'eval_%'");
@@ -339,7 +319,6 @@ test("a restart in the middle of a task counts no attempt", { timeout: 600_000 }
     const closedAt = started.length;
     await first.idle();
     assert.deepEqual(started.slice(closedAt), [], "close halts the task in flight: no command starts after close");
-    // A restart is a new process: a new store on the same database. The corpus module registers once per store.
     const restart = (): void => {
       r.store.close();
       r.store = new EvidenceStore({ databasePath: r.databasePath, vaultKey: r.key });
@@ -347,7 +326,6 @@ test("a restart in the middle of a task counts no attempt", { timeout: 600_000 }
     restart();
     const mark = ops(r.record).length;
 
-    // A stop that fails may leave a grader process in the job's work, so the host cleans nothing and starts nothing.
     const failing = host(r, { grader: { ...testGrader(configFor(r)), stop: async () => false } });
     failing.tick();
     await failing.idle();
@@ -388,8 +366,8 @@ test("an unavailable store takes nothing and throws nothing", { timeout: 60_000 
   const unavailable = () => { throw new EvidenceError("unavailable", "The evidence store is unavailable."); };
   const store = {
     status: () => ({ state: "unavailable", modules: {} }),
-    register() { /* the capture registers its module; the store takes it and never opens */ },
-    read: unavailable, write: unavailable, tryWrite: () => false, sweep: () => 0, close() { /* nothing open */ },
+    register() { },
+    read: unavailable, write: unavailable, tryWrite: () => false, sweep: () => 0, close() { },
   } as unknown as EvidenceStore;
   const counted = <T extends object>(value: T): T => new Proxy(value, {
     get(target, key) {
@@ -451,7 +429,6 @@ test("a grader that opens its network between tasks runs no further task", { tim
     }
     assert.equal((h.job(jobId) as EvalJobView).counts.visited, 1, "one task is decided before the switch");
 
-    // The network state comes from a file the probe reads, so the pinned configuration does not change.
     writeFileSync(metadata, "open");
     const runsBefore = ops(r.record).filter(op => op === "run").length;
     for (let tick = 0; tick < 3; tick++) {
@@ -474,7 +451,6 @@ test("a grader that opens its network between tasks runs no further task", { tim
 test("a grader that can read a project's mirror runs nothing", { timeout: 600_000 }, async () => {
   const r = rig();
   const config = configFor(r);
-  // No wrapper: the probe receives the host's own canaries, and the fixture, running as this user, can read the mirror.
   const grader = launcherGrader(() => config.eval?.grader, { hostUid: UID + 1, graceMs: 5_000 });
   const h = host(r, { config, grader });
   try {
@@ -500,7 +476,6 @@ test("a mirror read that throws still records the task", { timeout: 600_000 }, a
   const r = rig();
   let broken = false;
   const status: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: r.head };
-  // The miner reads the same source, so the read fails only once mining has caught up.
   const h = host(r, {
     source: {
       mirrorPath: () => r.mirror,
@@ -530,7 +505,6 @@ test("a grader low on storage at the task's probe runs nothing", { timeout: 600_
   const r = rig();
   const base = testGrader(configFor(r));
   let low = false;
-  // Mining leaves a ready probe in the cache, which the gate reads; only the probe before the task sees the room gone.
   const grader: Grader = { ...base, probe: async canaries => ({ ...(await base.probe(canaries)), ...(low ? { storage: false } : {}) }) };
   const h = host(r, { grader });
   try {

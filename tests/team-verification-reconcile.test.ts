@@ -36,8 +36,8 @@ test("an interrupted setup check can be attested and rerun at the same head", { 
     assert.equal(resume.status, 409);
     assert.equal(resume.body.code, "team-reconciliation-required");
 
-    try { process.kill(-checkPid, "SIGKILL"); } catch { /* The fixture may use a different process group leader. */ }
-    try { process.kill(checkPid, "SIGKILL"); } catch { /* The old check process may already have exited. */ }
+    try { process.kill(-checkPid, "SIGKILL"); } catch { }
+    try { process.kill(checkPid, "SIGKILL"); } catch { }
     await waitFor(() => {
       try {
         const stat = readFileSync(`/proc/${checkPid}/stat`, "utf8");
@@ -45,7 +45,6 @@ test("an interrupted setup check can be attested and rerun at the same head", { 
       }
       catch { return true; }
     }, Boolean, 10000);
-    // The fixture's fresh check may use this release; the interrupted attempt remains sealed.
     writeFileSync(join(f.receipts, "check-release"), "release\n");
 
     const pendingId = blocked.pendingOperation!.id;
@@ -91,7 +90,7 @@ test("an interrupted setup check can be attested and rerun at the same head", { 
     await refuse(body({ attestation: { boundary: "check-only", processesStopped: true, text: "A different operator statement." } }), "request-conflict");
   } finally {
     if (dirtyPath) (await import("node:fs")).rmSync(dirtyPath, { force: true });
-    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { /* Already exited. */ } }
+    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { } }
     await f.close();
   }
 });

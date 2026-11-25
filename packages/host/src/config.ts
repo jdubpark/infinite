@@ -15,20 +15,11 @@ import { egressConfigSchema } from "./egress.js";
 import { MirroredProjects } from "./mirrored-projects.js";
 import { memberTraceSettingsSchema } from "./member-traces.js";
 
-/**
- * Provider hooks injected at launch when the config does not say. Codex hooks stay off: spike S2
- * (2026-11-13) showed that `--dangerously-bypass-hook-trust`, which the injected `-c hooks.*` need,
- * also lets hooks defined in the working directory run without review. The turn-end `notify` setting stays on
- * without hooks (INF-213).
- */
 export const DEFAULT_HOOKS = { claude: true, codex: false } as const;
-/** The name that starts the host's tracker comments when `linear.reportName` is not set. */
 export const DEFAULT_REPORT_NAME = "Infinite";
-/** The name that starts the host's tracker comments, as in "NAME agent report: ready for review.". */
 export const reportName = (config: Config): string => config.linear?.reportName ?? DEFAULT_REPORT_NAME;
 const nonNegative = z.number().min(0).finite();
 export const usageConfigSchema = z.object({
-  /** USD per million tokens, keyed `provider/model`. */
   prices: z.record(z.string().min(1), z.object({ input: nonNegative, output: nonNegative, cacheRead: nonNegative.optional(), cacheWrite: nonNegative.optional() }).strict()).default({}),
   accounts: z.record(z.string().min(1), z.object({ kind: z.enum(["metered", "subscription"]), match: z.array(z.string().min(1)).default([]), planUsd: nonNegative.optional(), balance: z.object({ source: z.literal("deepseek"), apiKeyFile: z.string().refine(isAbsolute, "Balance key file must be absolute") }).strict().optional() }).strict()).default({}),
   budgets: z.partialRecord(z.enum(["claude", "codex", "grok", "opencode", "demo"]), z.object({ usd: nonNegative, period: z.enum(["day", "week", "month"]).default("month") }).strict()).default({}),
@@ -36,7 +27,6 @@ export const usageConfigSchema = z.object({
 export type UsageConfig = z.infer<typeof usageConfigSchema>;
 export const machineLabelSchema = z.string().trim().min(1).max(80);
 
-/** Launches per rolling hour. No default: an absent key stays absent, and the service supplies 30 and 80. */
 const fuseCeilingsSchema = z.object({ launchesPerHour: z.number().int().min(1).max(1000).optional() }).strict();
 export const fuseConfigSchema = z.object({
   project: fuseCeilingsSchema.optional(),
@@ -44,11 +34,6 @@ export const fuseConfigSchema = z.object({
   projects: z.record(z.string().min(1), fuseCeilingsSchema).optional(),
 }).strict();
 export type FuseConfig = z.infer<typeof fuseConfigSchema>;
-/**
- * Settings for work that continues on its own. No defaults here. Routines and standing goals apply a 5-minute wake
- * gap at read. The mission service applies 60 minutes, 120,000 tokens, and 40 attempts for when a coordinator starts
- * a new conversation instead of resuming; zero turns that rule off.
- */
 export const continuityConfigSchema = z.object({
   wakeMinGapMinutes: z.number().int().min(0).max(1440).optional(),
   rotateIdleMinutes: z.number().int().min(0).max(10080).optional(),
@@ -56,16 +41,11 @@ export const continuityConfigSchema = z.object({
   rotateAttempts: z.number().int().min(0).max(1000).optional(),
 }).strict();
 export type ContinuityConfig = z.infer<typeof continuityConfigSchema>;
-/** Outcome measurement settings. No default here: each consumer applies its own default where it reads the value. */
 export const outcomeSettingsSchema = z.object({
   holdDays: z.number().int().min(1).max(365).optional(),
   retentionDays: z.number().int().min(30).max(3650).optional(),
 }).strict();
 
-/**
- * The GitHub credential proxy (deploy/ubuntu/github-proxy.md). `proxyUrl` is the proxy's bare loopback origin;
- * `keyPath` is the grant key the host shares with the proxy account. Absent means sessions get no grant.
- */
 export const githubBoundarySchema = z.object({
   proxyUrl: z.string().refine(value => {
     try {
@@ -76,10 +56,6 @@ export const githubBoundarySchema = z.object({
   keyPath: z.string().refine(isAbsolute, "The GitHub grant key path must be absolute"),
 }).strict();
 
-/**
- * Review feedback (INF-324): the owner's changes-requested review on a run's delivered pull request steers that run.
- * Off by default; switching it on needs the owner's GitHub login, which belongs in private runtime configuration.
- */
 export const reviewFeedbackConfigSchema = z.object({
   enabled: z.boolean().default(false),
   ownerLogin: z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/, "Use a GitHub login").optional(),
@@ -88,7 +64,6 @@ export const reviewFeedbackConfigSchema = z.object({
 
 const schema = z
   .object({
-    // Keep absent report names absent in routine authority digests; reportName() supplies the display default.
     linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional(), reportName: z.string().trim().min(1).max(40).regex(/^[A-Za-z][A-Za-z0-9 -]*$/).optional() }).strict().optional(),
     hostLoad: z.object({ minAvailableMemoryGiB: z.number().min(0).max(4096), maxLoadPerCpu: z.number().positive().max(64) }).strict().optional(),
     intake: intakeConfigSchema.optional(),
@@ -96,7 +71,6 @@ const schema = z
     codeMode: z.object({ claude: z.enum(["off", "headless", "all"]) }).strict().optional(),
     teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional(), outcomes: outcomeSettingsSchema.optional(), blackboard: z.object({ tools: z.boolean().optional() }).strict().optional(), memberTraces: memberTraceSettingsSchema.optional() }).strict().optional(),
     machine: z.object({ id: z.uuid(), label: machineLabelSchema }).strict().optional(),
-    // The permission agent's tiers, the miss-rate threshold and this host's release commands.
     permissionAgent: permissionAgentConfigSchema.optional(),
     autonomy: z.object({ defaultMode: autonomyModeSchema.optional(), fuse: fuseConfigSchema.optional(), continuity: continuityConfigSchema.optional(), boundary: z.object({ egress: egressConfigSchema.optional(), github: githubBoundarySchema.optional() }).strict().optional() }).strict().optional(),
     cmux: z.object({ enabled: z.boolean(), command: z.string().min(1).optional(), hooksDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
@@ -107,7 +81,6 @@ const schema = z
     source: z.object({ mirrorDir: z.string().refine(isAbsolute).optional(), refreshMinutes: z.number().int().min(1).max(1440).optional(), remoteOverrides: z.record(z.string(), z.string()).optional() }).strict().optional(),
     github: z.object({ reviewFeedback: reviewFeedbackConfigSchema.optional() }).strict().optional(),
     eval: evalHostSchema.optional(),
-    // Model-written chat digests. The key file is read once at startup and never logged.
     summaries: z.object({
       model: z.string().min(1).max(100),
       apiKeyFile: z.string().refine(isAbsolute, "Summary key file must be absolute"),
@@ -119,7 +92,6 @@ const schema = z
       baseUrl: z.url().default("https://api.typesafe.ai"),
       sessionReadings: z.boolean().default(true),
     }).strict().optional(),
-    // Optional cleanup for platform-generated speech transcripts. The key is read once at startup.
     dictation: z.object({
       model: z.string().min(1).max(100).default("gpt-6-luna"),
       apiKeyFile: z.string().refine(isAbsolute, "Dictation key file must be absolute"),
@@ -210,7 +182,6 @@ const schema = z
   .strict();
 export const hashToken = (token: string) =>
   createHash("sha256").update(token).digest("hex");
-/** Throws `message` unless `file` is an absolute 0600 regular file outside runtime state, run, team, and project directories. */
 export function assertPrivateCredentialFile(config: Config, file: string, message: string): void {
   try {
     if (!isAbsolute(file) || (statSync(file).mode & 0o777) !== 0o600 || !statSync(file).isFile()) throw new Error();
@@ -239,16 +210,13 @@ export function validateLinearConfig(config: Config) {
   } catch { throw new Error(message); }
 }
 const SLACK_OFFICIAL_ENDPOINT = "https://slack.com/api";
-/** Checks the intake block: Linear credential, authorship gate, Slack tokens and endpoint, and the answer project. */
 export function validateIntakeConfig(config: Config): void {
   const intake = config.intake;
   if (!intake) return;
   if (!config.linear) throw new Error("Intake requires a host Linear credential");
   if (intake.requireSlackThread && !intake.slack) throw new Error("requireSlackThread needs intake.slack");
-  // Without a Slack block no thread is read or bound, so mirroring would leave the outcome nowhere.
   if (intake.linear.commentsMirrorToSlack && !intake.slack) throw new Error("commentsMirrorToSlack needs intake.slack");
   const slack = intake.slack;
-  // Without admission and without direct requests nothing could ever start a mission.
   if (intake.linear.admitIssues === false && !slack?.directRequests && !config.mcp) throw new Error("admitIssues false needs intake.slack.directRequests or mcp");
   if (slack?.answerQuestions && !slack.directRequests) throw new Error("answerQuestions needs intake.slack.directRequests");
   if (slack?.requestChannelIds?.length && !slack.directRequests) throw new Error("requestChannelIds needs intake.slack.directRequests");
@@ -284,7 +252,6 @@ function validateMcpCredentials(config: Config): void {
     if (config.tokens.some(token => token.hash === connector.tokenHash)) throw new Error("MCP credentials must differ from device credentials");
   }
 }
-/** MCP credentials and project grants are independent of paired-device authority. */
 export function validateMcpConfig(config: Config): void {
   validateMcpCredentials(config);
   for (const connector of config.mcp?.connectors ?? []) {
@@ -376,7 +343,6 @@ export function readConfig(file: string): { config: Config; key: Buffer } {
   if (!["http:", "https:"].includes(origin.protocol))
     throw new Error("Invalid origin protocol");
   if (config.mcp) {
-    // CLI edits serialize the returned config: keep vault-owned projects in a validation-only copy.
     const effective = structuredClone(config);
     if (runtimeSecurity(effective.deployment).tenancy === "single-tenant") new MirroredProjects(effective, key);
     validateMcpConfig(effective);

@@ -5,9 +5,6 @@ import { REPORT_KEEP_DAYS, type JobTrialRow } from "./eval-trial-store.js";
 import { VOID_ENDINGS, type PromptOrigin, type ReplayPrior, type TrialConfiguration } from "./eval-types.js";
 import type { Config } from "./types.js";
 
-// The prior export: a finished baseline or compare job's graded trials, counted by cell, for the evidence router.
-// A row holds ids, enumerations, counts, and times; the profile's provider, model, and effort are plain columns.
-
 export const PRIOR_KEEP_DAYS = REPORT_KEEP_DAYS, PRIORS_MAX = 500;
 export const PRIORS_SQL = "SELECT * FROM eval_priors WHERE project_ref = ? ORDER BY generated_at DESC, prior_id LIMIT 500";
 
@@ -32,10 +29,6 @@ type PriorRow = {
 const keyOf = (cell: Pick<PriorCell, "configuration" | "areaRef" | "kind" | "promptOrigin" | "profileEpoch" | "promptVersion">) =>
   JSON.stringify([cell.configuration, cell.areaRef, cell.kind, cell.promptOrigin, cell.profileEpoch, cell.promptVersion]);
 
-/**
- * Counts the rows of one job by cell. A row counts when it is final, not void, isolated, and has a known `configId`, epoch,
- * and prompt version, and when its task has a known prompt origin. Cells are sorted by their key.
- */
 export function priorCells(configurations: readonly TrialConfiguration[], rows: readonly JobTrialRow[], tasks: ReadonlyMap<string, PriorTask>): PriorCell[] {
   const indexOf = new Map(configurations.map((configuration, index) => [configRef(configuration), index]));
   const cells = new Map<string, PriorCell & { taskIds: Set<string> }>();
@@ -65,9 +58,6 @@ export function priorCells(configurations: readonly TrialConfiguration[], rows: 
     .map(([, { taskIds, ...cell }]) => ({ ...cell, tasks: taskIds.size }));
 }
 
-/**
- * Writes one row per cell, once: a second call for the same job and cells inserts nothing. Returns the number of rows inserted.
- */
 export function writePriors(tx: EvidenceTx, input: { jobId: string; projectId: string; cells: readonly PriorCell[]; at: string }): number {
   const project = tx.index("project", input.projectId);
   const expires = new Date(Date.parse(input.at) + PRIOR_KEEP_DAYS * DAY_MS).toISOString();
@@ -84,7 +74,6 @@ export function writePriors(tx: EvidenceTx, input: { jobId: string; projectId: s
   return written;
 }
 
-/** The project's newest priors, at most PRIORS_MAX. An area the feature map no longer names reads `other`. */
 export function readPriors(db: EvidenceDb, project: Project): ReplayPrior[] {
   const names = areaNames(db, project);
   return db.all<PriorRow>(PRIORS_SQL, db.index("project", project.id)).map(row => ({
@@ -106,7 +95,6 @@ export function readPriors(db: EvidenceDb, project: Project): ReplayPrior[] {
   }));
 }
 
-/** The blind index of each area name the host knows: the feature map's areas, `mixed`, and `root`. */
 export function areaNames(db: EvidenceDb, project: Project): Map<string, string> {
   const names = new Map<string, string>();
   for (const area of project.team?.features?.areas ?? []) names.set(db.index("area", area.id), area.id);

@@ -11,13 +11,9 @@ if (request) console.log(`Initial request: ${request}\n`);
 const hookUrl = process.env.INFINITE_HOOK_URL;
 const hookToken = process.env.INFINITE_HOOK_TOKEN;
 const withHooks = request.includes("hook") && Boolean(hookUrl) && Boolean(hookToken);
-// The rehearsal keeps a Claude-format conversation record, like a real provider would, and its
-// hooks travel through the same relay code, so the chat path is exercised end to end.
 const transcriptPath = join(tmpdir(), `infinite-rehearsal-${process.pid}.jsonl`);
 if (withHooks) writeFileSync(transcriptPath, "", { mode: 0o600 });
 let records = 0;
-// With `subagent` in the request, one subagent row is written to its own file in the session's subagents
-// folder, as Claude Code writes it. The relay reads that file through the secondary listing, never through chat.
 const subagentRequest = request.includes("subagent");
 function transcribeSubagent() {
   if (!withHooks || !subagentRequest) return;
@@ -32,7 +28,6 @@ function transcribeSubagent() {
 function transcribe(type: "user" | "assistant", content: unknown, id = `msg-demo-${process.pid}-${records + 1}`) {
   if (!withHooks) return;
   const n = ++records;
-  // Assistant rows carry the usage a provider reports on each request. The counts are fixed.
   const message = type === "assistant"
     ? { id, role: type, model: "rehearsal-model", content, usage: { input_tokens: 120, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }
     : { role: type, content };
@@ -42,7 +37,6 @@ async function post(body: Record<string, unknown>) {
   await relay("claude", JSON.stringify({ session_id: "demo", transcript_path: transcriptPath, cwd: process.cwd(), permission_mode: "default", ...body }),
     { url: hookUrl!, token: hookToken! }).catch(() => {});
 }
-// Hooks go out in order on a chain that drawing and printing never await.
 let chain: Promise<void> = Promise.resolve();
 function hook(body: Record<string, unknown>) {
   if (!withHooks) return;
@@ -56,7 +50,6 @@ let lineBuffer = "";
 let awaitingYesNo = false;
 
 const HEADER = "\nBash command\n  rm -rf build\n  Remove the stale build directory\n\nDo you want to proceed?";
-// Rows the dialog occupies: the header's lines plus one per option.
 const DIALOG_ROWS = HEADER.split("\n").length + OPTIONS.length;
 
 function drawDialog() {
@@ -64,7 +57,6 @@ function drawDialog() {
   OPTIONS.forEach((label, i) => console.log(`${dialog && dialog.highlighted === i ? "❯" : " "} ${i + 1}. ${label}`));
 }
 function redraw() {
-  // Move the cursor up over the option lines and redraw them in place.
   process.stdout.write(`\x1b[${OPTIONS.length}A`);
   OPTIONS.forEach((label, i) => process.stdout.write(`\x1b[2K${dialog && dialog.highlighted === i ? "❯" : " "} ${i + 1}. ${label}\n`));
 }
@@ -72,14 +64,11 @@ const RM_INPUT = { command: "rm -rf build", description: "Remove the stale build
 const turnHooks = () => {
   transcribe("user", request);
   hook({ hook_event_name: "UserPromptSubmit", prompt: request });
-  // With `drain-early`, a final-drain post arrives while the provider still runs: the worker must ignore it.
   if (request.includes("drain-early")) chain = chain.then(() => drain({ url: hookUrl!, token: hookToken! })).catch(() => {});
   transcribe("assistant", [{ type: "text", text: "I will remove the stale build directory." }, { type: "tool_use", name: "Bash", input: RM_INPUT }]);
   hook({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: RM_INPUT, tool_use_id: "demo-1" });
 };
 const permissionHook = () => hook({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: RM_INPUT, permission_suggestions: [] });
-// `dialog-first` draws the dialog and posts every hook about 300 ms later, so the screen
-// reports the prompt before any hook does.
 const dialogFirst = request.includes("dialog-first");
 function openDialog() {
   if (!dialogFirst) turnHooks();
@@ -93,7 +82,6 @@ function selectOption(index: number) {
   const label = OPTIONS[index];
   dialog = null;
   if (process.stdin.isTTY) process.stdin.setRawMode(false);
-  // Like Claude Code and Codex, the dialog disappears once answered: erase it from the screen.
   process.stdout.write(`\x1b[${DIALOG_ROWS}A\x1b[J`);
   console.log(`\nSelected: ${label}\n`);
   if (index === 2) {
@@ -114,7 +102,7 @@ process.stdin.on("data", (chunk: string) => {
     if (rawBuffer.includes("\x1b[A")) { dialog.highlighted = Math.max(0, dialog.highlighted - 1); redraw(); rawBuffer = ""; }
     else if (rawBuffer.includes("\x1b[B")) { dialog.highlighted = Math.min(OPTIONS.length - 1, dialog.highlighted + 1); redraw(); rawBuffer = ""; }
     else if (rawBuffer.includes("\r")) { const i = dialog.highlighted; rawBuffer = ""; selectOption(i); }
-    else if (rawBuffer.startsWith("\x1b") && rawBuffer.length < 8) { /* wait for the rest of the sequence */ }
+    else if (rawBuffer.startsWith("\x1b") && rawBuffer.length < 8) {}
     else rawBuffer = "";
     return;
   }
@@ -142,11 +130,9 @@ else {
 }
 process.on("SIGTERM", () => {
   console.log("Rehearsal stopped.");
-  // Queued hooks reach the worker before the exit, but the wait never runs past 3 seconds.
   const deadline = setTimeout(() => process.exit(0), 3000);
   void chain.finally(() => {
     clearTimeout(deadline);
-    // With `late-row`, the provider writes one row after its last hook, as a provider does when stopped mid-reply.
     if (request.includes("late-row")) transcribe("assistant", [{ type: "text", text: "Stopped before the reply was finished." }], `msg-demo-${process.pid}-late`);
     process.exit(0);
   });

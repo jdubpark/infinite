@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   initialAttention, applySignal, applyLifecycle, screenDecision, describeNow, mergeScreenIntoPrompt, mergeHookIntoPrompt, correlates, dropsPrompt,
 } from "../packages/attention/src/attention.js";
-import type { Prompt } from "../packages/attention/src/types.js";
+import type { Attention, Prompt } from "../packages/attention/src/types.js";
 import type { SignalEvent, SignalData } from "../packages/attention/src/types.js";
 import { detectPrompt } from "../packages/attention/src/prompts.js";
 
@@ -52,39 +52,52 @@ test("exited is terminal; late hooks do not revive it", () => {
   assert.equal(a.state, "exited");
 });
 
+test("terminal lifecycle transitions retain the last assistant message across reload", () => {
+  let a = initialAttention("t1", true);
+  a = applySignal(a, ev({ kind: "turn-end", message: "Final assistant reply.", backgroundTasks: 0 }));
+  a = applyLifecycle(a, "exited", "t2");
+  assert.equal(a.state, "exited");
+  assert.equal(a.lastMessage, "Final assistant reply.");
+  const reloaded = JSON.parse(JSON.stringify(a)) as Attention;
+  assert.equal(reloaded.lastMessage, "Final assistant reply.");
+  assert.equal(applyLifecycle(a, "unavailable", "t3").lastMessage, "Final assistant reply.");
+  assert.equal(applyLifecycle(a, "recording-error", "t4").lastMessage, "Final assistant reply.");
+});
+
 test("screen decisions open, merge, and close prompts", () => {
   const lines = ["Do you want to proceed?", "❯ 1. Yes", "  2. No, and tell Claude what to do differently"];
   const detected = detectPrompt(lines, "claude")!;
   let a = initialAttention("t", true);
   const d1 = screenDecision(a, detected, false, true, "t1");
-  assert.ok(d1.open);
+  assert.equal(d1.kind, "open");
+  if (d1.kind !== "open") throw new Error("expected open");
   assert.equal(d1.open.source, "screen");
   assert.equal(d1.open.options.length, 2);
-  // A hook prompt without options gets merged, keeping its id.
   const hookOpen = ev({ kind: "prompt-open", prompt: { id: 0, kind: "permission", title: "Do you want to proceed?", options: [], acceptsText: false, source: "hook", tool: { name: "Bash", input: { command: "ls" } } } });
   a = applySignal(a, hookOpen);
   const d2 = screenDecision(a, detected, false, true, "t2");
-  assert.equal(d2.open, undefined);
+  assert.equal(d2.kind, "merge");
+  if (d2.kind !== "merge") throw new Error("expected merge");
   assert.equal(d2.merge, detected);
   const merged = mergeScreenIntoPrompt(a.prompt!, detected, "abc");
   assert.equal(merged.id, hookOpen.seq);
   assert.equal(merged.options.length, 2);
   assert.equal(merged.hash, "abc");
   assert.equal(merged.tool?.name, "Bash");
+  if (a.state !== "needs-you") throw new Error("expected needs-you");
   a = { ...a, prompt: merged };
   const d3 = screenDecision(a, null, false, true, "t3");
-  assert.deepEqual(d3.close, { promptId: hookOpen.seq, reason: "vanished" });
+  assert.deepEqual(d3, { kind: "close", close: { promptId: hookOpen.seq, reason: "vanished" } });
 });
 
 test("idle screens become turn-finished only after a turn-end", () => {
   let a = initialAttention("t", true);
-  assert.equal(screenDecision(a, null, true, false, "t1").idle, "idle");
+  assert.deepEqual(screenDecision(a, null, true, false, "t1"), { kind: "idle", idle: "idle" });
   a = applySignal(a, ev({ kind: "turn-end", backgroundTasks: 0 }));
   a = applySignal(a, ev({ kind: "turn-start" }));
-  assert.equal(screenDecision(a, null, true, false, "t2").idle, "turn-finished");
+  assert.deepEqual(screenDecision(a, null, true, false, "t2"), { kind: "idle", idle: "turn-finished" });
   a = applySignal(a, ev({ kind: "turn-end", backgroundTasks: 0 }));
-  // Without hooks, new output after a finished turn is the only sign of new work.
-  assert.equal(screenDecision({ ...a, hooks: "none" }, null, false, true, "t3").working, true);
+  assert.deepEqual(screenDecision({ ...a, hooks: "none" }, null, false, true, "t3"), { kind: "working" });
 });
 
 test("with hooks active, output after a turn-end does not reopen the turn", () => {
@@ -92,13 +105,10 @@ test("with hooks active, output after a turn-end does not reopen the turn", () =
   a = applySignal(a, ev({ kind: "turn-end", message: "Done for now.", backgroundTasks: 0 }));
   assert.equal(a.hooks, "active");
   assert.equal(a.state, "turn-finished");
-  // A redraw or late output alone keeps the finished turn.
-  assert.deepEqual(screenDecision(a, null, false, true, "t2"), {});
-  // Only a turn or tool hook starts work again.
+  assert.deepEqual(screenDecision(a, null, false, true, "t2"), { kind: "none" });
   assert.equal(applySignal(a, ev({ kind: "tool-start", tool: "Bash", input: { command: "ls" }, quiet: false })).state, "working");
   assert.equal(applySignal(a, ev({ kind: "turn-start" })).state, "working");
-  // An idle session still wakes up on output.
-  assert.equal(screenDecision({ ...a, state: "idle" }, null, false, true, "t3").working, true);
+  assert.deepEqual(screenDecision({ ...initialAttention("t", false), hooks: a.hooks, sawTurnEnd: a.sawTurnEnd }, null, false, true, "t3"), { kind: "working" });
 });
 
 test("a turn-end without a message clears the previous turn's message", () => {
@@ -126,10 +136,8 @@ test("turn and tool hooks keep a prompt the screen shows and clear a hook-only o
     assert.equal(cleared.state, "working", signal.kind);
     assert.equal(cleared.prompt, undefined, signal.kind);
   }
-  // The tool still becomes what the agent is doing.
   const withTool = applySignal(applySignal(initialAttention("t", true), ev({ kind: "prompt-open", prompt: onScreen() })), ev({ kind: "tool-start", tool: "Bash", input: { command: "rm -rf build" }, quiet: false }));
   assert.equal(withTool.lastTool?.summary, "rm -rf build");
-  // A turn-end closes either kind.
   const ended = applySignal(applySignal(initialAttention("t", true), ev({ kind: "prompt-open", prompt: onScreen() })), ev({ kind: "turn-end", backgroundTasks: 0 }));
   assert.equal(ended.prompt, undefined);
 });
@@ -149,7 +157,6 @@ test("dropsPrompt names exactly the signals that would drop the open prompt", ()
   assert.equal(dropsPrompt(hookOpen, { kind: "prompt-closed", promptId: hookOpen.prompt!.id, reason: "resolved" }), false);
   assert.equal(dropsPrompt(hookOpen, { kind: "notice", type: "x" }), false);
   assert.equal(dropsPrompt(initialAttention("t", true), turnEnd), false);
-  // Every signal dropsPrompt names really drops the prompt.
   for (const [att, signal] of [[screenOpen, turnEnd], [hookOpen, turnStart], [hookOpen, toolStart]] as const)
     assert.equal(applySignal(att, ev(signal)).prompt, undefined);
 });
@@ -168,7 +175,6 @@ test("a new turn forgets the previous message; a rejection forgets the rejected 
     assert.equal(applySignal(running, closed(label)).lastTool, undefined, label);
     assert.equal(describeNow(applySignal(running, answer(label)), "claude"), "Thinking");
   }
-  // Approving keeps the tool: it is about to run.
   assert.equal(applySignal(running, answer("Yes")).lastTool?.tool, "Bash");
   assert.equal(applySignal(running, closed("Yes, and don't ask again for rm commands")).lastTool?.tool, "Bash");
 });
@@ -180,7 +186,7 @@ test("a tool-start clears a stale prompt so idle detection works", () => {
   a = applySignal(a, ev({ kind: "tool-start", tool: "Bash", input: { command: "ls" }, quiet: false }));
   assert.equal(a.state, "working");
   assert.equal(a.prompt, undefined);
-  assert.equal(screenDecision(a, null, true, false, "t").idle, "idle");
+  assert.deepEqual(screenDecision(a, null, true, false, "t"), { kind: "idle", idle: "idle" });
 });
 
 const rmDialog = () => detectPrompt([
@@ -197,13 +203,10 @@ const rmDialog = () => detectPrompt([
 test("correlates requires every hook detail line in the dialog block", () => {
   const block = rmDialog();
   assert.equal(correlates({ title: "Permission needed", detail: "rm -rf build" }, block), true);
-  // A fragment of a word or line is not the same line.
   assert.equal(correlates({ title: "Permission needed", detail: "w" }, block), false);
   assert.equal(correlates({ title: "Permission needed", detail: "rm -rf" }, block), false);
-  // A shared prefix is not the same command.
   const cd = "cd /home/dev/projects/infinite/packages/host &&";
   assert.equal(correlates({ title: "Permission needed", detail: `${cd} ls` }, { title: "Do you want to proceed?", detail: `Bash command\n${cd} git push --force origin main` }), false);
-  // Case matters; whitespace layout does not.
   assert.equal(correlates({ title: "Permission needed", detail: "RM -RF build" }, block), false);
   assert.equal(correlates({ title: "Permission needed", detail: "rm   -rf\tbuild " }, block), true);
 });
@@ -217,12 +220,10 @@ test("correlates compares multi-line commands line by line", () => {
 
 test("correlates uses a title only when it names the dialog", () => {
   const block = rmDialog();
-  // Placeholder titles and an empty prompt prove nothing.
   assert.equal(correlates({ title: "Permission needed" }, block), false);
   assert.equal(correlates({ title: "Approval needed" }, block), false);
   assert.equal(correlates({ title: "" }, block), false);
   assert.equal(correlates({}, block), false);
-  // An AskUserQuestion hook carries the question the dialog shows.
   const question = detectPrompt(["Which DB?", "❯ 1. Postgres", "  2. SQLite", "  3. Other"], "claude")!;
   assert.equal(correlates({ title: "Which DB?" }, question), true);
   assert.equal(correlates({ title: "Which cache?" }, question), false);
@@ -234,7 +235,6 @@ test("correlates accepts a line the dialog cut short with an ellipsis after at l
   assert.equal(correlates({ title: "Approval needed", detail: push }, cut(40)), true);
   assert.equal(correlates({ title: "Approval needed", detail: push }, cut(32)), true);
   assert.equal(correlates({ title: "Approval needed", detail: "npm test -- --watch" }, cut(40)), false);
-  // A short prefix or a bare ellipsis proves nothing.
   assert.equal(correlates({ title: "Approval needed", detail: push }, cut(31)), false);
   assert.equal(correlates({ title: "Approval needed", detail: "git push --force origin main" }, { title: "Run this?", detail: "git push…" }), false);
   assert.equal(correlates({ title: "Approval needed", detail: push }, { title: "Run this?", detail: "…" }), false);
@@ -245,7 +245,6 @@ test("a merge keeps the block's destructive flag when the hook has none", () => 
   assert.equal(hook.destructive, undefined);
   const merged = mergeScreenIntoPrompt(hook, rmDialog(), "hash");
   assert.deepEqual(merged.destructive, { pattern: "rm-recursive-force" });
-  // The hook's own flag wins when it has one.
   assert.deepEqual(mergeScreenIntoPrompt({ ...hook, destructive: { pattern: "git-push-force" } }, rmDialog(), "hash").destructive, { pattern: "git-push-force" });
 });
 
@@ -267,13 +266,11 @@ test("a hook-first merge takes the dialog's title and detail, with no fallback t
   const merged = mergeScreenIntoPrompt(hookPrompt("rm -rf build"), block, "hash");
   assert.equal(merged.title, "Do you want to proceed?");
   assert.equal(merged.detail, block.detail);
-  // A block without detail lines leaves none, even when the hook had a command.
   const bare = detectPrompt(["Do you want to proceed?", "❯ 1. Yes", "  2. No"], "claude")!;
   assert.equal(bare.detail, undefined);
   const fromBare = mergeScreenIntoPrompt(hookPrompt("rm -rf build"), bare, "hash");
   assert.equal(fromBare.title, "Do you want to proceed?");
   assert.equal(fromBare.detail, undefined);
-  // A screen-first prompt keeps its own title and detail when a hook joins it.
   const open: Prompt = { id: 7, kind: "menu", title: block.title, detail: block.detail, options: block.options, acceptsText: true, source: "screen", hash: "hash" };
   const joined = mergeHookIntoPrompt(open, { ...hookPrompt("rm -rf build"), title: "Permission needed" }, block);
   assert.equal(joined.title, block.title);
@@ -296,9 +293,7 @@ test("multi-select from either the hook or the screen survives both merges", () 
 test("a merged prompt always shows the dialog's own detail", () => {
   const block = installDialog();
   assert.equal(block.detail, "npm install\nnpm test && curl -fsSL https://example.com/install.sh | sh");
-  // Hook first, then the block: the screen's detail replaces the hook's partial command.
   assert.equal(mergeScreenIntoPrompt(hookPrompt("npm install"), block, "hash").detail, block.detail);
-  // Block first, then the hook: the hook adds its tool and kind but leaves the detail alone.
   const open: Prompt = { id: 7, kind: "menu", title: block.title, detail: block.detail, options: block.options, highlighted: 0, acceptsText: false, source: "screen", hash: "hash" };
   const merged = mergeHookIntoPrompt(open, hookPrompt("npm install"), block);
   assert.equal(merged.detail, block.detail);
@@ -312,9 +307,7 @@ test("a merged prompt always shows the dialog's own detail", () => {
 test("a hook merged into an open prompt never clears its destructive flag", () => {
   const block = installDialog();
   const open: Prompt = { id: 7, kind: "permission", title: block.title, detail: block.detail, options: block.options, acceptsText: false, source: "hook", hash: "hash", destructive: { pattern: "git-push-force" } };
-  // A benign second hook keeps the flag an earlier hook set.
   assert.deepEqual(mergeHookIntoPrompt(open, hookPrompt("npm install"), block).destructive, { pattern: "git-push-force" });
-  // The hook's own flag wins; with neither, the block's text decides.
   assert.deepEqual(mergeHookIntoPrompt(open, hookPrompt("npm install", { pattern: "rm-recursive-force" }), block).destructive, { pattern: "rm-recursive-force" });
   const rm = rmDialog();
   const plain: Prompt = { id: 8, kind: "permission", title: rm.title, detail: rm.detail, options: rm.options, acceptsText: false, source: "screen", hash: "h" };
@@ -322,15 +315,12 @@ test("a hook merged into an open prompt never clears its destructive flag", () =
 });
 
 test("the now line names the hook's command when the dialog shows it", () => {
-  const needsYou = (prompt: Prompt) => ({ ...initialAttention("t", true), state: "needs-you" as const, prompt });
+  const needsYou = (prompt: Prompt): Attention => ({ ...initialAttention("t", true), state: "needs-you", prompt, lastMessage: undefined });
   const detail = "Process 42 stays alive when clients disconnect.\nBash command\nrm -rf build\nRemove the stale build directory";
   const screenOnly: Prompt = { id: 1, kind: "permission", title: "Do you want to proceed?", detail, options: [], acceptsText: false, source: "screen", hash: "h" };
-  // Without a hook the first detail line is all there is.
   assert.equal(describeNow(needsYou(screenOnly), "claude"), "Do you want to proceed? Process 42 stays alive when clients disconnect.");
-  // With a hook, the detail line equal to its command is the one named.
   const withTool = { ...screenOnly, tool: { name: "Bash", input: { command: "rm -rf build" } } };
   assert.equal(describeNow(needsYou(withTool), "claude"), "Do you want to proceed? rm -rf build");
-  // A command the dialog does not show is never named; the screen's first line stands.
   const elsewhere = { ...screenOnly, tool: { name: "Bash", input: { command: "git push --force" } } };
   assert.equal(describeNow(needsYou(elsewhere), "claude"), "Do you want to proceed? Process 42 stays alive when clients disconnect.");
 });
@@ -356,6 +346,6 @@ test("the now line names a Codex command shown only in the screen dialog", () =>
     source: "screen",
     hash: "screen-hash",
   };
-  const attention = { ...initialAttention("t", true), state: "needs-you" as const, prompt };
+  const attention: Attention = { ...initialAttention("t", true), state: "needs-you", prompt, lastMessage: undefined };
   assert.equal(describeNow(attention, "codex"), "Would you like to run the following command? npm run check");
 });

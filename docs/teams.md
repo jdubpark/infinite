@@ -1568,6 +1568,19 @@ to disable publication.
 
 ## Optional provider-side delivery
 
+For automatic merge, the host records the model families that contributed to the
+integrated head. A writer who leaves edits for a replacement and an integrator
+who changes the result both count. The host accepts a review for delivery only
+when the selected reviewer's family is known, differs from every contributing
+family, and approved the exact commit that passed checks. An unmerged
+continuation carries the attribution of its parent head.
+
+Missing contributor or reviewer evidence leaves the run `ready-for-review`
+with reason `reviewer-family-required`. This applies to a queued merge after
+restart as well. An earlier delivery attempt with uncertain external effects
+keeps its reconciliation requirement. The stored family is derived from the
+host-selected profile.
+
 Repositories remain review-only until an owner configures delivery once during
 enrollment:
 
@@ -2123,6 +2136,16 @@ Turn the switch on in the project's team block:
 The key has no default. Writing it at all, even as `"off"`, changes the routine approval digest of that project, so its active routines wait for owner approval again. An absent key keeps every stored digest valid. A rerun of `repo init` keeps the key.
 
 With the switch on, each goal cycle's member prompts and context file show the record's criteria in place of the success text. The digest lists the active criteria with each statement, check label, and producer. It is at most 6,144 bytes of JSON with `c0`'s statement left out, because the prompt prints `c0`'s text once. A criterion whose correction would push the digest over that cap answers `409` with `objective-digest-too-large`.
+
+Each newly assigned planner with a pinned record includes
+`criterionRefs` on every task, including prerequisites. For example,
+`{"objectiveVersion":2,"criteria":["c1"]}` links work to criterion `c1`
+in version 2. A cycle may target a subset of the active criteria. The host
+checks the links against the planning assignment, allows one corrected plan
+per run revision, and records accepted links in the team view, the plan digest,
+and each task's planning event. An older in-flight assignment can still submit
+its original report without links. Criterion satisfaction requires its own
+evidence.
 
 A cycle pins the digest it launched with. Every member of that run reads the same digest, including members started after a pause, a replan, or a host restart. The next cycle reads the latest version. A correction therefore reaches members from the next cycle. To reach a running cycle, steer it.
 

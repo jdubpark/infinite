@@ -16,7 +16,6 @@ export { handleDuelClientCommand } from "./duel-cli.js";
 export type EvalApi = { json<T = unknown>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T> };
 
 const USAGE = "Usage: infinite eval status PROJECT [--json] | infinite eval run PROJECT --file job.json --request-id UUID [--json] | infinite eval job JOB [--json] | infinite eval pause|resume|cancel JOB | infinite eval retire TASK | infinite eval report JOB [--json] | infinite eval priors PROJECT [--json]";
-/** A job file is read at most this many bytes; a larger one is refused before any call. */
 const JOB_FILE_LIMIT = 64 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const NOT_FOUND = new Map([
@@ -25,25 +24,20 @@ const NOT_FOUND = new Map([
   ["unknown-task", "No task has this ID."],
 ]);
 const clean = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
-/** A count the host did not compute prints as unknown, never as zero. */
 const count = (value: number | null | undefined) => value === null || value === undefined ? "unknown" : String(value);
 const stateCounts = (byState: Record<EvalState, number>) => EVAL_STATES.map(state => `${state} ${count(byState[state])}`).join(" · ");
 
-/** A baseline job's counts: tasks reached of planned, then the trials that started, were graded, resolved, ended, and voided. */
 function baselineCountLine(job: BaselineJobView): string {
   const { tasks, trials } = job;
   return `tasks ${count(tasks.reached)} of ${count(tasks.planned)} (skipped ${count(tasks.skipped)}) · trials started ${count(trials.started)} of ${count(trials.planned)}, graded ${count(trials.graded)}, resolved ${count(trials.resolved)}, ended ${count(trials.ended)}, void ${count(trials.void)}`;
 }
 
-/** A number the host did not compute prints as unknown, never as zero. */
 const fixed = (value: number | null | undefined, digits: number) => typeof value === "number" ? value.toFixed(digits) : "unknown";
-/** A signed figure: the sign is always shown, so a zero difference reads `+0.000`. */
 const signed = (value: number | null | undefined, digits: number) =>
   typeof value === "number" ? `${value < 0 ? "-" : "+"}${Math.abs(value).toFixed(digits)}` : "unknown";
 const intervalText = (interval: [number, number] | null) =>
   interval === null ? "unknown" : `[${signed(interval[0], 3)}, ${signed(interval[1], 3)}]`;
 
-/** A comparison job's counts. The result stays hidden until the report is ready, and an active job has no report part. */
 function comparisonCountLine(job: ComparisonJobView): string {
   const { tasks, trials } = job;
   const resolved = job.report === "ready" ? count(trials.resolved) : "hidden";
@@ -51,7 +45,6 @@ function comparisonCountLine(job: ComparisonJobView): string {
   return `tasks ${count(tasks.reached)} of ${count(tasks.planned)} (skipped ${count(tasks.skipped)}) · trials started ${count(trials.started)} of ${count(trials.planned)}, graded ${count(trials.graded)}, resolved ${resolved}, ended ${count(trials.ended)}, void ${count(trials.void)}, reused ${count(trials.reused)}${report}`;
 }
 
-/** One job as two lines: its header, then its counts. Every text value passes through `clean`. */
 export function evalJobLines(job: EvalJobView): string[] {
   const reason = job.reason ? ` · ${clean(job.reason)}` : "";
   const waiting = job.waiting ? ` · waiting ${clean(job.waiting)}` : "";
@@ -66,13 +59,11 @@ export function evalJobLines(job: EvalJobView): string[] {
   ];
 }
 
-/** A grader at launcher version 1 is ready but cannot run a trial, so the line says so. */
 const graderLine = (grader: EvalSummary["grader"]) =>
   grader.state === "ready" && typeof grader.version === "number" && grader.version < 2
     ? "grader ready (version 1: no trials)"
     : `grader ${clean(grader.state)}`;
 
-/** The identity line: the state, and for `unavailable` what the last probe answered. */
 function identityLine(identity: EvalSummary["evalIdentity"]): string {
   const state = `eval identity ${clean(identity.state)}`;
   if (identity.state !== "unavailable") return state;
@@ -81,7 +72,6 @@ function identityLine(identity: EvalSummary["evalIdentity"]): string {
   return `${state} (last probe ${clean(identity.lastProbe.state)}, ${clean(identity.lastProbe.at)})`;
 }
 
-/** The status of one project, in the order the plan fixes. Plain columns only: ids, states, counts, and hashes. */
 export function evalStatusLines(summary: EvalSummary): string[] {
   const mining = summary.mining;
   const lines = [
@@ -96,7 +86,6 @@ export function evalStatusLines(summary: EvalSummary): string[] {
       : `coverage ${Math.round(summary.coverage.share * 100)}% of ${count(summary.coverage.accepted)} accepted attempts over ${count(summary.coverage.days)} days`,
     graderLine(summary.grader),
   ];
-  // An older host sends no identity or trial fields; those lines are then left out, not shown as zero.
   if (summary.evalIdentity) lines.push(identityLine(summary.evalIdentity));
   if (summary.trials) {
     lines.push(summary.trials.dailyCap === null
@@ -112,7 +101,6 @@ const pairText = (pair: PairResult) =>
 const groupPairs = (pairs: PairResult[]) =>
   pairs.map(pair => `${pair.b} vs ${pair.a} ${signed(pair.mean, 3)} ${intervalText(pair.interval)}, p ${fixed(pair.sign.p, 4)}`).join("; ");
 
-/** A stored report as lines. It prints what the host returns: no model name is added, and a null figure prints as unknown. */
 export function evalReportLines(report: ComparisonReport): string[] {
   const { tasks } = report;
   const share = tasks.planned > 0 ? `${Math.floor(tasks.analysed / tasks.planned * 100)}%` : "unknown";
@@ -131,13 +119,11 @@ export function evalReportLines(report: ComparisonReport): string[] {
   ];
 }
 
-/** The prior export, one line per row. The model is the host's answer for the router, and unknown when null. */
 export function evalPriorLines(priors: ReplayPrior[]): string[] {
   if (priors.length === 0) return ["no priors"];
   return priors.map(p => `${clean(p.profileId)} ${clean(p.profile.provider)}/${clean(p.profile.model ?? "unknown")}/${clean(p.profile.effort ?? "unknown")} epoch ${count(p.profileEpoch)} · prompt ${clean(p.promptVersion).slice(0, 8)} · area ${clean(p.area)} · kind ${clean(p.kind ?? "none")} · origin ${clean(p.promptOrigin)}: ${count(p.resolved)} of ${count(p.trials)} trials resolved over ${count(p.tasks)} tasks · ${clean(p.jobId)} · ${clean(p.generatedAt)}`);
 }
 
-/** Maps the host's fixed answers to the plan's sentences. An absent route, an older host, answers 404 without a known code. */
 async function read<T>(call: () => Promise<T>): Promise<T> {
   try {
     return await call();
@@ -152,7 +138,6 @@ async function read<T>(call: () => Promise<T>): Promise<T> {
   }
 }
 
-/** Reads the job file, at most 64 KiB, and checks the request ID, all before any call. */
 function jobRequest(options: Options): { requestId: string; job: unknown } {
   const file = options["--file"], requestId = options["--request-id"];
   if (typeof file !== "string" || typeof requestId !== "string" || !UUID.test(requestId)) {
@@ -166,7 +151,6 @@ function jobRequest(options: Options): { requestId: string; job: unknown } {
   }
   let text: string;
   try {
-    // Reads until the end or one byte past the limit; a pipe can answer in pieces.
     const buffer = Buffer.alloc(JOB_FILE_LIMIT + 1);
     let bytes = 0;
     for (let n = -1; n !== 0 && bytes < buffer.length; bytes += n) n = readSync(fd, buffer, bytes, buffer.length - bytes, null);

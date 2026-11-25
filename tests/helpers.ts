@@ -9,10 +9,12 @@ import { workerCall } from "../packages/host/src/ipc.js";
 import { unseal } from "../packages/host/src/vault.js";
 import type { Config, Role, ControlLease } from "../packages/host/src/types.js";
 
+const DEFAULT_WAIT_MS = 10_000;
+
 export const waitFor = async <T>(
   fn: () => Promise<T>,
   accepts: (value: T) => boolean,
-  timeout = 10000,
+  timeout = DEFAULT_WAIT_MS,
 ): Promise<T> => {
   const until = Date.now() + timeout;
   let last: T | undefined;
@@ -82,10 +84,10 @@ export interface Host {
   stop: () => Promise<void>;
 }
 
-export function apiClient(origin: string, tokens: Record<Role, string>, timeoutMs?: number): Host["fetchApi"] {
+export function apiClient(origin: string, tokens: Record<Role, string>, signal?: AbortSignal): Host["fetchApi"] {
   return async (path, role = "owner", body, headers = {}, method) => {
     const response = await fetch(origin + "/api" + path, {
-      signal: timeoutMs === undefined ? undefined : AbortSignal.timeout(timeoutMs),
+      signal,
       method: method ?? (body ? "POST" : "GET"),
       headers: {
         connection: "close",
@@ -173,7 +175,6 @@ async function startHostWithPort(options: HostOptions, attemptsLeft: number): Pr
   let child: ChildProcess | undefined;
 
   const fetchApi = apiClient(origin, tokens);
-  const probeApi = apiClient(origin, tokens, 1000);
   const stopApi = async () => {
     const api = child;
     if (!api || api.exitCode !== null || api.signalCode !== null) return;
@@ -192,17 +193,20 @@ async function startHostWithPort(options: HostOptions, attemptsLeft: number): Pr
     api.stderr!.on("data", (chunk) => {
       diagnostics += chunk;
     });
-    await waitFor(
-      async () => {
+    const exited = new AbortController();
+    const abortProbe = () => exited.abort();
+    api.once("exit", abortProbe);
+    const signal = AbortSignal.any([exited.signal, AbortSignal.timeout(DEFAULT_WAIT_MS)]);
+    const probe = apiClient(origin, tokens, signal);
+    try {
+      await waitFor(async () => {
+        const response = await probe("/me").catch(() => undefined);
         if (api.exitCode !== null || api.signalCode !== null) throw new Error(diagnostics);
-        try {
-          return (await probeApi("/me")).status;
-        } catch {
-          return 0;
-        }
-      },
-      (status) => status === 200,
-    );
+        return response?.status ?? 0;
+      }, status => status === 200);
+    } finally {
+      api.off("exit", abortProbe);
+    }
   };
   const stop = async () => {
     const floor = new Promise((resolve) => setTimeout(resolve, 1700));

@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { startHost } from "./helpers.js";
 
@@ -28,6 +29,17 @@ test("a test host recovers if its first listener address is taken during startup
   const host = await startHost({ env: { NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`, OCCUPIED_PORT: occupied } });
   t.after(() => host.stop());
   assert.ok(Number(readFileSync(occupied, "utf8")) > 0);
+  assert.equal((await host.fetchApi("/me")).status, 200);
+});
+
+test("a healthy test host can take more than one second to answer its readiness probe", async t => {
+  const fetch = globalThis.fetch;
+  t.mock.method(globalThis, "fetch", async (...args: Parameters<typeof fetch>) => {
+    await delay(1400);
+    return fetch(...args);
+  });
+  const host = await startHost();
+  t.after(() => host.stop());
   assert.equal((await host.fetchApi("/me")).status, 200);
 });
 

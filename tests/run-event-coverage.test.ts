@@ -75,7 +75,7 @@ const REPORT_SAMPLES: Record<TeamReport["kind"], TeamReport> = {
 };
 
 test("every report kind reaches member.reported", async () => {
-  const schemaKinds = teamReportSchema.options.map(option => option.shape.kind.value).sort();
+  const schemaKinds = [...new Set(teamReportSchema.options.flatMap(option => "shape" in option ? [option.shape.kind.value] : option.options.map(nested => nested.shape.kind.value)))].sort();
   assert.deepEqual(Object.keys(REPORT_SAMPLES).sort(), schemaKinds, "one sample per report kind");
   for (const sample of Object.values(REPORT_SAMPLES)) assert.doesNotThrow(() => teamReportSchema.parse(sample));
 

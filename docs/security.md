@@ -866,6 +866,19 @@ waits, every other call of the session is denied. A call is denied with
 after 29 days. A session cannot be resumed after its worker ended while a call
 waited.
 
+Each start of the provider in a served session gets a run number. The host
+writes it into that start's two channel hook commands, and the hook sends it
+back in the path of its request. The worker answers only hooks of the provider
+that runs now. A hook of a provider that exited, or a hook without a run
+number, is denied with `unavailable` and changes nothing. A `PermissionRequest`
+hook names no call, so the worker gives it the call id of the one open
+`PreToolUse` call of the same run with the same tool and input. Each run holds
+its own open calls, so a late request of an earlier run cannot take the call id
+of an identical call of the next run, and after a resume a request again takes
+its own call id. The run number is not a secret: the hook token still
+authenticates the hook. The number travels in the hook command, not in the
+environment, so the sudo `env_keep` list does not change.
+
 ## Delegated team permission decisions
 
 This section describes the earlier repository-level delegation to a run's

@@ -554,19 +554,19 @@ test("codex hooks stay off unless the config turns them on", () => {
 
 test("a served headless Claude launch loads only the host's settings, with the channel hooks beside the signal relay", () => {
   const profile = { command: "claude", args: ["-p"] };
-  const launch = buildLaunch("claude", profile, "go", hooks, relay, enabled, false, undefined, undefined, undefined, undefined, true, false, true);
+  const launch = buildLaunch("claude", profile, "go", hooks, relay, enabled, false, undefined, undefined, undefined, undefined, 2, false, true);
   const sources = launch.args.indexOf("--setting-sources");
   assert.equal(launch.args[sources + 1], "");
   assert.equal(launch.args.filter(arg => arg === "--settings").length, 1);
   const settings = JSON.parse(launch.args[launch.args.indexOf("--settings") + 1]);
   assert.equal(settings.disableAllHooks, false);
   assert.deepEqual(settings.env, { CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1" });
-  const commands = (event: string) => settings.hooks[event][0].hooks.map((hook: { command: string; timeout: number }) => [hook.command.split(" ").slice(-2).join(" "), hook.timeout]);
-  assert.deepEqual(commands("PreToolUse"), [["/opt/infinite/packages/host/dist/hook-relay.js claude", 10], ["/opt/infinite/packages/host/dist/permission-hook.js check", 30]]);
-  assert.deepEqual(commands("PermissionRequest"), [["/opt/infinite/packages/host/dist/permission-hook.js request", 360]]);
+  const commands = (event: string) => settings.hooks[event][0].hooks.map((hook: { command: string; timeout: number }) => [hook.command.slice(process.execPath.length + 1), hook.timeout]);
+  assert.deepEqual(commands("PreToolUse"), [["/opt/infinite/packages/host/dist/hook-relay.js claude", 10], ["/opt/infinite/packages/host/dist/permission-hook.js check 2", 30]]);
+  assert.deepEqual(commands("PermissionRequest"), [["/opt/infinite/packages/host/dist/permission-hook.js request 2", 360]]);
   assert.equal(settings.hooks.PreToolUse[0].hooks[1].command.split(" ")[0], process.execPath);
   assert.equal(launch.args.at(-1), "go");
-  const disabled = buildLaunch("claude", profile, "go", hooks, relay, enabled, false, undefined, undefined, undefined, undefined, true, false, false);
+  const disabled = buildLaunch("claude", profile, "go", hooks, relay, enabled, false, undefined, undefined, undefined, undefined, 2, false, false);
   const disabledSettings = JSON.parse(disabled.args[disabled.args.indexOf("--settings") + 1]);
   assert.deepEqual(Object.keys(disabledSettings).sort(), ["disableAllHooks", "hooks"]);
   const withoutMode = { ...settings }; delete withoutMode.env;
@@ -574,7 +574,7 @@ test("a served headless Claude launch loads only the host's settings, with the c
   normalizedArgs[launch.args.indexOf("--settings") + 1] = disabled.args[disabled.args.indexOf("--settings") + 1]!;
   assert.deepEqual(normalizedArgs, disabled.args, "the channel settings env is the only argv change");
   assert.equal(JSON.stringify(withoutMode), disabled.args[disabled.args.indexOf("--settings") + 1]);
-  const quiet = JSON.parse(buildLaunch("claude", { command: "claude", args: ["-p"] }, "", hooks, relay, { claude: false, codex: false }, false, undefined, undefined, undefined, undefined, true).args.at(-1)!);
+  const quiet = JSON.parse(buildLaunch("claude", { command: "claude", args: ["-p"] }, "", hooks, relay, { claude: false, codex: false }, false, undefined, undefined, undefined, undefined, 1).args.at(-1)!);
   assert.deepEqual(Object.keys(quiet.hooks).sort(), ["PermissionRequest", "PreToolUse"]);
 });
 
@@ -587,7 +587,7 @@ test("Claude team launches load no project or local settings file, so one member
   assert.deepEqual(sources(mission.args), ["user"]);
   const reviewer = buildLaunch("claude", permissionCoordinatorLaunch("claude", { command: "claude", args: ["--model", "sonnet"] }), "Review", hooks, relay, enabled, true);
   assert.deepEqual(sources(reviewer.args), ["user"]);
-  const served = buildLaunch("claude", { command: "claude", args: ["-p"] }, "go", hooks, relay, enabled, true, undefined, undefined, undefined, undefined, true);
+  const served = buildLaunch("claude", { command: "claude", args: ["-p"] }, "go", hooks, relay, enabled, true, undefined, undefined, undefined, undefined, 1);
   assert.deepEqual(sources(served.args), [""]);
   assert.deepEqual(sources(buildLaunch("claude", { command: "claude", args: [] }, "p", hooks, relay, enabled).args), []);
   assert.deepEqual(sources(buildLaunch("codex", { command: "codex", args: [] }, "p", hooks, relay, enabled, true).args), []);
@@ -624,7 +624,7 @@ test("a served headless resume follows the recorded Code Mode, not the current l
   for (const [level, recorded, expected] of [["off", true, "1"], ["all", false, undefined]] as const) {
     const codeMode = codeModeEnabled(level, "claude", { headless: true, served: true, excluded: false }, recorded);
     const launch = buildLaunch("claude", headlessResumeProfile(profile, "native-session"), "", hooks, relay, enabled,
-      false, undefined, undefined, undefined, undefined, true, false, codeMode);
+      false, undefined, undefined, undefined, undefined, 2, false, codeMode);
     const settings = JSON.parse(launch.args[launch.args.indexOf("--settings") + 1]!);
     assert.equal(settings.env?.CLAUDE_CODE_EXPERIMENTAL_CODE_MODE, expected);
     assert.equal(Object.hasOwn(settings, "env"), expected !== undefined);

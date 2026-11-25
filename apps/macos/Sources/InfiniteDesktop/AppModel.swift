@@ -637,7 +637,8 @@ struct TeamResumeFailure: Equatable {
     var draftLoadTask: Task<Void, Never>?
     var activeSendToken: UUID?
     var draftVersion = 0
-    var draftLoaded = false
+    @Published var draftLoaded = false
+    @Published var clearingPending = false
     var draftTouched = false
     private var queuedRaw = Data()
     private var sendingRaw = false

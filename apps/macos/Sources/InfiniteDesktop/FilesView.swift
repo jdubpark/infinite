@@ -77,6 +77,7 @@ struct FilesView: View {
     @State private var busy = false
     @State private var canceling = false
     @State private var operation: Task<Void, Never>?
+    @State private var localListTask: Task<Void, Never>?
     @State private var plan: SyncPlan?
     @State private var showingPlan = false
     @State private var loadGeneration = UUID()
@@ -99,7 +100,7 @@ struct FilesView: View {
                     Text("Choose project").tag("")
                     ForEach(Array(app.projects.enumerated()), id: \.offset) { _, project in Text(project["name"].string).tag(project["id"].string) }
                 }.frame(maxWidth: 260).disabled(busy || !app.connected)
-                Button { refresh() } label: { Image(systemName: "arrow.clockwise") }.help("Refresh both folders").disabled(busy)
+                Button { refresh() } label: { Image(systemName: "arrow.clockwise") }.help("Refresh both folders").disabled(busy || localState.loading || loadingRemote)
             }
             HSplitView {
                 localPane.frame(minWidth: 270)
@@ -132,7 +133,7 @@ struct FilesView: View {
         .onChange(of: app.projects.map { $0["id"].string }) { _, ids in
             if !ids.contains(projectID) { projectID = ids.first ?? "" }
         }
-        .onDisappear { operation?.cancel() }
+        .onDisappear { operation?.cancel(); localListTask?.cancel() }
         .sheet(isPresented: $showingPlan) { syncSheet }
     }
 
@@ -215,18 +216,22 @@ struct FilesView: View {
     }
     private func refresh() { refreshLocal(); refreshRemote() }
     private func refreshLocal() {
+        localListTask?.cancel()
         guard let root = localRoot, let request = localState.beginLoad(root: root, path: localPath) else {
             _ = localState.beginLoad(root: nil, path: "")
+            localListTask = nil
             return
         }
         let path = localPath
-        Task {
+        localListTask = Task {
             do {
                 let entries = try await LocalFiles.runCancellable { try LocalFiles.list(root: root, path: path) }
-                guard localRoot == root, localPath == path else { return }
+                guard !Task.isCancelled, localRoot == root, localPath == path else { return }
                 _ = localState.finish(generation: request.generation, key: request.key, entries: entries)
+            } catch is CancellationError {
+                return
             } catch {
-                guard localRoot == root, localPath == path else { return }
+                guard !Task.isCancelled, localRoot == root, localPath == path else { return }
                 _ = localState.fail(generation: request.generation, message: error.localizedDescription)
             }
         }

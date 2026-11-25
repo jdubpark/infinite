@@ -422,7 +422,7 @@ struct SessionPane: View {
         } message: { Text("This stops the agent process on the server. Its recording stays available.") }
         .alert("Have you checked the terminal?", isPresented: $confirmClear) {
             Button("Keep pending send", role: .cancel) {}
-            Button("Clear after review") { model.clearPending() }
+            Button("Clear after review") { Task { await model.clearPending() } }
         } message: { Text("The previous prompt may already have been delivered. Clearing it does not cancel server work.") }
     }
     private var header: some View {
@@ -467,7 +467,9 @@ struct SessionPane: View {
     private var composer: some View {
         VStack(spacing: 8) {
             PromptEditor(text: Binding(get: { model.draft.text }, set: model.setDraft), placeholder: "Message \(providerName(session.provider))…",
-                         enabled: model.canSend && model.role != "viewer" && !promptBlocks, transparent: true, submit: { Task { await model.send() } })
+                         enabled: model.canSend && model.role != "viewer" && !promptBlocks,
+                         editable: model.draftLoaded && model.role != "viewer",
+                         transparent: true, submit: { Task { await model.send() } })
                 .frame(height: 76).glassSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             HStack(spacing: 12) {
                 Text(footer.text).font(.system(size: 11)).foregroundStyle(footer.color).lineLimit(2).help(footer.text).textSelection(.enabled)
@@ -481,7 +483,7 @@ struct SessionPane: View {
                     .disabled(model.draft.pendingID == nil || !model.ready || model.sending)
                 Button("Clear…") { confirmClear = true }
                     .frame(width: 62).opacity(model.draft.pendingID != nil && !model.sending ? 1 : 0)
-                    .disabled(model.draft.pendingID == nil || model.sending)
+                    .disabled(model.draft.pendingID == nil || model.sending || model.clearingPending)
                 Button { Task { await model.send() } } label: {
                     Group { if model.sending { ProgressView().controlSize(.small) } else { Label("Send", systemImage: "arrow.up") } }.frame(width: 72)
                 }.buttonStyle(.borderedProminent).opacity(model.draft.pendingID == nil || model.sending ? 1 : 0)

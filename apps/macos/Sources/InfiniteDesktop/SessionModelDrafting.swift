@@ -7,6 +7,10 @@ extension SessionModel {
         do {
             let loaded = try await deps.readDraft(identity)
             if draftTouched {
+                let recoveredUnsent = !loaded.text.isEmpty && loaded.text != draft.text
+                if recoveredUnsent {
+                    draft.text = draft.text.isEmpty ? loaded.text : "\(loaded.text)\n\n\(draft.text)"
+                }
                 if draft.pending == nil, let pending = loaded.pending {
                     draft.pending = pending
                 }
@@ -17,6 +21,8 @@ extension SessionModel {
                 draftVersion += 1
                 if draft.pending != nil && notice.isEmpty {
                     notice = "A previous send was not confirmed. Inspect the terminal before retrying the same send or clearing it."
+                } else if recoveredUnsent && notice.isEmpty {
+                    notice = "Recovered your saved unsent draft alongside new text."
                 }
                 try? await persistDraft(waitForInitialLoad: false, flush: true)
             } else {
@@ -173,14 +179,47 @@ extension SessionModel {
         }
     }
 
-    func clearPending() {
-        guard draftLoaded, !sending, let pending = draft.pending else { return }
+    func clearPending() async {
+        guard draftLoaded, !sending, !clearingPending, let pending = draft.pending else { return }
+        clearingPending = true
+        defer { clearingPending = false }
         draftTouched = true
-        if draft.text == pending.text { draft.text = "" }
-        draft.pending = nil
-        draftVersion += 1
-        Task { try? await persistDraft(flush: true) }
-        notice = "Previous send cleared after your review."
+        let pendingID = pending.id
+        let pendingText = pending.text
+        let previous = saveInFlight
+        let startVersion = draftVersion
+        let key = identity
+        var saveError: Error?
+        var editedDuringSave = false
+        let task = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self, self.draft.pending?.id == pendingID else { return }
+            var latest = self.draft
+            let latestStartVersion = self.draftVersion
+            if self.draftVersion == startVersion && latest.text == pendingText {
+                latest.text = ""
+            }
+            latest.pending = nil
+            do {
+                try await self.deps.saveDraft(latest, key)
+                guard self.draft.pending?.id == pendingID else { return }
+                editedDuringSave = self.draftVersion != latestStartVersion
+                if !editedDuringSave && self.draft.text == pendingText {
+                    self.draft.text = ""
+                }
+                self.draft.pending = nil
+                self.draftVersion += 1
+                self.notice = "Previous send cleared after your review."
+            } catch {
+                saveError = error
+                self.notice = error.localizedDescription
+            }
+        }
+        saveInFlight = task
+        await task.value
+        if saveError == nil && editedDuringSave {
+            try? await persistDraft(flush: true)
+        }
     }
 
     func lifecycle(_ action: String, controlID: String? = nil) async throws -> JSON {

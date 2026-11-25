@@ -69,8 +69,24 @@ private actor SessionMemoryDrafts {
 
 private actor SessionRequestLog {
     var requests: [(String, JSON?, String?)] = []
+    private var countWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
     func record(_ path: String, _ body: JSON?, _ controlID: String?) {
         requests.append((path, body, controlID))
+        var remaining: [(Int, CheckedContinuation<Void, Never>)] = []
+        for (target, waiter) in countWaiters {
+            if requests.count >= target {
+                waiter.resume()
+            } else {
+                remaining.append((target, waiter))
+            }
+        }
+        countWaiters = remaining
+    }
+
+    func waitForCount(_ target: Int) async {
+        if requests.count >= target { return }
+        await withCheckedContinuation { countWaiters.append((target, $0)) }
     }
 }
 
@@ -112,13 +128,14 @@ private actor SessionRequestLog {
         await model.draftLoadTask?.value
 
         XCTAssertTrue(model.draftLoaded)
-        XCTAssertEqual(model.draft.text, "freshly typed text")
+        XCTAssertTrue(model.draft.text.contains("old draft"))
+        XCTAssertTrue(model.draft.text.contains("freshly typed text"))
         XCTAssertEqual(model.draft.pending, PendingSend(id: "req-pending", text: "old send"))
         XCTAssertEqual(model.draft.lastQueuedText, "prev")
         XCTAssertFalse(model.canSend)
         let persisted = await drafts.read("profile-a:sess-1")
         XCTAssertEqual(persisted.pending?.id, "req-pending")
-        XCTAssertEqual(persisted.text, "freshly typed text")
+        XCTAssertEqual(persisted.text, model.draft.text)
     }
 
     func testConcurrentTypingDuringAutosaveNeverSkipsDurablePreSendSave() async throws {
@@ -268,7 +285,7 @@ private actor SessionRequestLog {
 
         let first = Task { await model.resume() }
         let second = Task { await model.resume() }
-        try await Task.sleep(for: .milliseconds(30))
+        await requestLog.waitForCount(2)
         await gate.succeed(())
         await first.value
         await second.value
@@ -390,5 +407,59 @@ private actor SessionRequestLog {
         XCTAssertEqual(requests.count, 1)
         XCTAssertEqual(requests.first?.1?["requestId"].string, capturedRequestID)
         XCTAssertEqual(requests.first?.1?["text"].string, "original prompt")
+    }
+
+    func testEarlyEditBeforeInitialDraftLoadCompletesPreservesSavedUnsentDraft() async throws {
+        let readGate = SessionDeferred<DraftRecord>()
+        let drafts = SessionMemoryDrafts()
+        let deps = SessionModelDependencies(
+            readDraft: { _ in try await readGate.wait() },
+            saveDraft: { draft, key in await drafts.save(draft, key: key) },
+            acquireMutation: { key, text in await drafts.acquireMutation(key, text: text) },
+            clearDraftIfMatching: { id, key in await drafts.clearIfMatching(id, key: key) },
+            sendRequest: { _, _, _, _ in .object([:]) },
+            openTerminal: { _, _, _ in "stream-1" },
+            closeTerminal: { _, _ in },
+            sendTerminal: { _, _, _ in }
+        )
+
+        let model = SessionModel(session: makeSession(), client: makeClient(), profileID: "profile-a", role: "owner", supportsStream: true, deps: deps)
+        XCTAssertFalse(model.draftLoaded)
+        model.setDraft("early edit")
+
+        await readGate.succeed(DraftRecord(text: "saved unsent draft"))
+        await model.draftLoadTask?.value
+
+        XCTAssertTrue(model.draftLoaded)
+        XCTAssertTrue(model.draft.text.contains("saved unsent draft"))
+        XCTAssertTrue(model.draft.text.contains("early edit"))
+        let persisted = await drafts.read("profile-a:sess-1")
+        XCTAssertEqual(persisted.text, model.draft.text)
+    }
+
+    func testClearPendingKeepsPendingVisibleWhenSaveFails() async throws {
+        let drafts = SessionMemoryDrafts()
+        let initial = DraftRecord(text: "stuck send", pending: PendingSend(id: "req-1", text: "stuck send"))
+        await drafts.save(initial, key: "profile-a:sess-1")
+        let deps = SessionModelDependencies(
+            readDraft: { await drafts.read($0) },
+            saveDraft: { _, _ in throw DesktopError("Disk locked") },
+            acquireMutation: { key, text in await drafts.acquireMutation(key, text: text) },
+            clearDraftIfMatching: { id, key in await drafts.clearIfMatching(id, key: key) },
+            sendRequest: { _, _, _, _ in .object([:]) },
+            openTerminal: { _, _, _ in "stream-1" },
+            closeTerminal: { _, _ in },
+            sendTerminal: { _, _, _ in }
+        )
+
+        let model = SessionModel(session: makeSession(), client: makeClient(), profileID: "profile-a", role: "owner", supportsStream: true, deps: deps)
+        await model.draftLoadTask?.value
+        XCTAssertEqual(model.draft.pending?.id, "req-1")
+
+        await model.clearPending()
+
+        XCTAssertEqual(model.draft.pending?.id, "req-1")
+        XCTAssertEqual(model.draft.text, "stuck send")
+        XCTAssertEqual(model.notice, "Disk locked")
     }
 }

@@ -69,6 +69,7 @@ export interface CreateSession {
   continuation?: NativeContinuation;
 }
 type ManagedCreateSession = CreateSession & { recordedCodeMode?: true };
+const canonicalRequest = <T extends CreateSession>(request: T): T => ({ ...request, requestId: request.requestId.toLowerCase(), ...(request.resumedFrom ? { resumedFrom: request.resumedFrom.toLowerCase() } : {}) });
 interface StoredSession {
   session: Session;
   fingerprint: string;
@@ -185,6 +186,7 @@ export class Manager {
   }
   releaseHandoff(projectId: string) { this.handoffProjects.delete(projectId); }
   async assertHandoffAlone(sessionId: string) {
+    sessionId = sessionId.toLowerCase();
     const source = this.meta(sessionId).session;
     for (const id of readdirSync(join(this.config.stateDir, "sessions")).filter(id => /^[a-f0-9-]{36}$/.test(id))) {
       if (id === sessionId) continue;
@@ -197,6 +199,7 @@ export class Manager {
     }
   }
   async stopHandoffSession(sessionId: string, requestId: string) {
+    sessionId = sessionId.toLowerCase();
     if (!this.meta(sessionId).session.handoff?.policy || !this.handoffRequest(sessionId))
       throw new ContentError("This session has not requested handoff", 403);
     const state = await this.state(sessionId);
@@ -242,19 +245,11 @@ export class Manager {
         "runDir is too long for a Unix socket; choose a shorter path",
       );
   }
-  private deletedReceiptPath(id: string) {
-    return join(this.config.stateDir, "deleted-sessions", `${id}.sealed`);
-  }
+  private deletedReceiptPath(id: string) { return join(this.config.stateDir, "deleted-sessions", `${id.toLowerCase()}.sealed`); }
   meta(id: string): StoredSession {
+    id = id.toLowerCase();
     if (existsSync(this.deletedReceiptPath(id))) throw Object.assign(new Error("Session not found"), { code: "ENOENT" });
-    return unseal(
-      this.key,
-      `${id}:meta`,
-      readFileSync(
-        join(this.config.stateDir, "sessions", id, "meta.sealed"),
-        "utf8",
-      ),
-    );
+    return unseal(this.key, `${id}:meta`, readFileSync(join(this.config.stateDir, "sessions", id, "meta.sealed"), "utf8"));
   }
   private serializeKeyed<T>(queues: Map<string, Promise<unknown>>, key: string, fn: () => Promise<T>): Promise<T> {
     const prev = queues.get(key) ?? Promise.resolve();
@@ -265,9 +260,10 @@ export class Manager {
     queues.set(key, settled);
     return operation;
   }
-  private serializeSession<T>(id: string, fn: () => Promise<T>): Promise<T> { return this.serializeKeyed(this.sessionQueues, id, fn); }
+  private serializeSession<T>(id: string, fn: () => Promise<T>): Promise<T> { return this.serializeKeyed(this.sessionQueues, id.toLowerCase(), fn); }
   private serializeConversation<T>(key: string, task: () => Promise<T>): Promise<T> { return this.serializeKeyed(this.conversationQueues, key, task); }
   private reserveCreateSlot(id: string): Promise<void> {
+    id = id.toLowerCase();
     const operation = this.createAdmission.then(async () => {
       const pendingBeforeList = new Set(this.pendingCreates);
       const listed = await this.list();
@@ -280,6 +276,7 @@ export class Manager {
     return operation;
   }
   setArchived(id: string, archived: boolean): Promise<StoredSession["session"]> {
+    id = id.toLowerCase();
     return this.serializeSession(id, async () => {
       const stored = this.meta(id);
       if (stored.session.team) throw new ContentError("Team sessions cannot be archived", 409);
@@ -290,26 +287,18 @@ export class Manager {
       const session = archived
         ? { ...stored.session, archivedAt: stored.session.archivedAt ?? new Date().toISOString() }
         : unarchived;
-      writeSealed(
-        join(this.config.stateDir, "sessions", id, "meta.sealed"),
-        this.key,
-        `${id}:meta`,
-        { session, fingerprint: stored.fingerprint },
-      );
+      writeSealed(join(this.config.stateDir, "sessions", id, "meta.sealed"), this.key, `${id}:meta`, { session, fingerprint: stored.fingerprint });
       return session;
     });
   }
   remove(id: string): Promise<void> {
+    id = id.toLowerCase();
     return this.serializeSession(id, async () => {
       const stored = this.meta(id);
       if (stored.session.team && !learningPurpose(stored.session.purpose)) throw new ContentError("Team sessions cannot be removed", 409);
 
       let workerStateReadFailed = false;
-      try {
-        await workerCall(this.config.runDir, id, { op: "state" });
-      } catch {
-        workerStateReadFailed = true;
-      }
+      try { await workerCall(this.config.runDir, id, { op: "state" }); } catch { workerStateReadFailed = true; }
       if (!workerStateReadFailed)
         throw new ContentError("Only an exited session with unavailable worker state can be removed", 409);
 
@@ -317,39 +306,22 @@ export class Manager {
       if (!existsSync(statusFile))
         throw new ContentError("Only an exited session with unavailable worker state can be removed", 409);
       let saved: WorkerState;
-      try {
-        saved = unseal<WorkerState>(this.key, `${id}:status`, readFileSync(statusFile, "utf8"));
-      } catch {
-        throw new ContentError("Only an exited session with unavailable worker state can be removed", 409);
-      }
+      try { saved = unseal<WorkerState>(this.key, `${id}:status`, readFileSync(statusFile, "utf8")); }
+      catch { throw new ContentError("Only an exited session with unavailable worker state can be removed", 409); }
       if (saved.status !== "exited")
         throw new ContentError("Only an exited session with unavailable worker state can be removed", 409);
 
-      writeSealed(
-        this.deletedReceiptPath(id),
-        this.key,
-        `deleted:${id}`,
-        { id, fingerprint: stored.fingerprint } satisfies DeletedSessionReceipt,
-      );
+      writeSealed(this.deletedReceiptPath(id), this.key, `deleted:${id}`, { id, fingerprint: stored.fingerprint } satisfies DeletedSessionReceipt);
       rmSync(join(this.config.stateDir, "sessions", id), { recursive: true });
     });
   }
   async state(id: string, screen = false): Promise<WorkerState> {
-    try {
-      return withDefaultAttention(
-        await workerCall(this.config.runDir, id, { op: "state", screen }),
-      );
-    } catch {
+    id = id.toLowerCase();
+    try { return withDefaultAttention(await workerCall(this.config.runDir, id, { op: "state", screen })); }
+    catch {
       const now = new Date().toISOString();
       const file = join(this.config.stateDir, "sessions", id, "status.sealed");
-      if (existsSync(file)) {
-        const saved = unseal<WorkerState>(
-          this.key,
-          `${id}:status`,
-          readFileSync(file, "utf8"),
-        );
-        return savedState(saved, now);
-      }
+      if (existsSync(file)) return savedState(unseal<WorkerState>(this.key, `${id}:status`, readFileSync(file, "utf8")), now);
       return unavailableState(now);
     }
   }
@@ -397,9 +369,7 @@ export class Manager {
     return () => { this.listingObservers.delete(observer); };
   }
 
-  metaRevision(id: string): string | undefined {
-    return this.listedMeta.revision(id);
-  }
+  metaRevision(id: string): string | undefined { return this.listedMeta.revision(id.toLowerCase()); }
   context(projectId: string) { return new ProjectContexts(this.config, this.key).context(projectId); }
   setContext(projectId: string, text: string, expectedVersion: number) {
     return new ProjectContexts(this.config, this.key).setContext(projectId, text, expectedVersion);
@@ -407,8 +377,9 @@ export class Manager {
   create(request: CreateSession, startedBy?: "owner"): Promise<Session & WorkerState> {
     if (request.continuation !== undefined)
       throw new ContentError("Native continuation is only available for managed coordinator team sessions", 400);
-    return this.serializeSession(request.requestId, () =>
-      this.createOnce(request, false, startedBy === "owner" ? "owner-started" : undefined),
+    const normalized = canonicalRequest(request);
+    return this.serializeSession(normalized.requestId, () =>
+      this.createOnce(normalized, false, startedBy === "owner" ? "owner-started" : undefined),
     );
   }
   createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false,
@@ -432,12 +403,14 @@ export class Manager {
     const canonical = realpathSync(cwd);
     const rel = relative(root, canonical);
     if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new ContentError("Invalid team working directory", 400);
-    return this.serializeSession(request.requestId, () => this.createOnce({
-      ...request, ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}),
+    const normalized = canonicalRequest(request);
+    return this.serializeSession(normalized.requestId, () => this.createOnce({
+      ...normalized, ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}),
       ...(header.purpose !== undefined ? { purpose: header.purpose } : {}), ...(header.configId !== undefined ? { configId: header.configId } : {}),
     }, workspaceTrusted, { team: github }, header.haltScope));
   }
   async inspectTeamRuntime(sessionId: string, team: TeamAssignment): Promise<TeamRuntimeInspection> {
+    sessionId = sessionId.toLowerCase();
     const stored = this.meta(sessionId).session;
     const same = (left: TeamAssignment | undefined) => Boolean(left && left.runId === team.runId && left.memberId === team.memberId &&
       left.revision === team.revision && left.role === team.role && left.taskId === team.taskId);
@@ -467,9 +440,11 @@ export class Manager {
       ...(state.attention?.since ? { since: state.attention.since } : {}), agentUid, processes: tree, identity };
   }
   retireTeamRuntime(sessionId: string, requestId: string, team: TeamAssignment, identity: string): Promise<TeamRuntimeRetirement> {
+    sessionId = sessionId.toLowerCase();
     return this.serializeSession(sessionId, () => this.retireTeamRuntimeOnce(sessionId, requestId, team, identity));
   }
   controlSession(sessionId: string, request: Extract<WorkerRequest, { op: "control" }>): Promise<ControlLease | null> {
+    sessionId = sessionId.toLowerCase();
     return this.serializeSession(sessionId, async () => {
       this.meta(sessionId);
       if (request.action !== "release" && existsSync(join(this.config.stateDir, "sessions", sessionId, "retirement.sealed")))
@@ -532,6 +507,7 @@ export class Manager {
     }
   }
   async stopTeamSession(sessionId: string, requestId: string, team: TeamAssignment): Promise<WorkerState> {
+    sessionId = sessionId.toLowerCase();
     const stored = this.meta(sessionId).session.team;
     if (!stored || stored.runId !== team.runId || stored.memberId !== team.memberId || stored.revision !== team.revision)
       throw new TeamStopRefused("This session does not belong to the team assignment", 403);
@@ -547,6 +523,7 @@ export class Manager {
     team: TeamAssignment,
     expected: TeamPermissionExpansionExpectation,
   ): Promise<Receipt> {
+    sessionId = sessionId.toLowerCase();
     return this.serializeSession(sessionId, () => this.expandTeamPermissionOnce(sessionId, requestId, team, expected));
   }
   private async expandTeamPermissionOnce(
@@ -687,6 +664,7 @@ export class Manager {
     decision: TeamPermissionDecision,
     current?: () => boolean,
   ): Promise<import("./types.js").Receipt & { result?: import("@infinite/attention").AnswerResult }> {
+    sessionId = sessionId.toLowerCase();
     const session = this.meta(sessionId).session;
     const stored = session.team;
     const validAssignment = (value: unknown): value is TeamMemberAssignment => {
@@ -812,6 +790,7 @@ export class Manager {
       current: () => boolean;
     },
   ): Promise<import("./types.js").Receipt & { result?: import("@infinite/attention").AnswerResult }> {
+    sessionId = sessionId.toLowerCase();
     const session = this.meta(sessionId).session;
     const stored = session.team;
     const sameAssignment = Boolean(stored && stored.runId === team.runId && stored.memberId === team.memberId &&
@@ -865,33 +844,35 @@ export class Manager {
     }
   }
   async invalidateSessionPermission(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain"> {
+    sessionId = sessionId.toLowerCase();
     try {
       if (this.meta(sessionId).session.team || !/^[A-Za-z0-9._:-]{1,100}$/.test(decisionId)) return "uncertain";
-      const result = await workerCall<{ invalidated: boolean }>(this.config.runDir, sessionId, {
-        op: "session-permission-invalidate", decisionId,
-      }, 4000);
+      const result = await workerCall<{ invalidated: boolean }>(this.config.runDir, sessionId, { op: "session-permission-invalidate", decisionId }, 4000);
       return result.invalidated === true ? "invalidated" : "uncertain";
     } catch { return "uncertain"; }
   }
   async invalidateTeamPermission(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain"> {
+    sessionId = sessionId.toLowerCase();
     if (!this.meta(sessionId).session.team || !/^[a-f0-9-]{36}$/i.test(decisionId)) return "uncertain";
     try {
-      const result = await workerCall<{ invalidated: boolean }>(this.config.runDir, sessionId, {
-        op: "team-answer-invalidate", decisionId,
-      }, 4000);
+      const result = await workerCall<{ invalidated: boolean }>(this.config.runDir, sessionId, { op: "team-answer-invalidate", decisionId }, 4000);
       return result.invalidated === true ? "invalidated" : "uncertain";
     } catch { return "uncertain"; }
   }
   resume(sessionId: string, requestId: string, startedBy?: "owner"): Promise<Session & WorkerState> {
+    sessionId = sessionId.toLowerCase(); requestId = requestId.toLowerCase();
     if (requestId === sessionId) throw new ContentError("Resumption needs a new request identity", 400);
     const [first, second] = sessionId < requestId ? [sessionId, requestId] : [requestId, sessionId];
-    return this.serializeSession(first, () =>
-      this.serializeSession(second, () =>
-        this.resumeOnce(sessionId, requestId, startedBy === "owner" ? "owner-started" : undefined),
-      ),
-    );
+    return this.serializeSession(first, () => this.serializeSession(second, () =>
+      this.resumeOnce(sessionId, requestId, startedBy === "owner" ? "owner-started" : undefined),
+    )).then(outcome => "aliasedTargetId" in outcome ? this.serializeSession(outcome.aliasedTargetId, async () => {
+      const target = this.meta(outcome.aliasedTargetId).session;
+      if (target.projectId !== outcome.projectId || (target.projectRoot ?? target.cwd) !== outcome.projectPath)
+        throw new ContentError("The saved continuation receipt belongs to another project or codebase. Open the original session instead.", 409);
+      return { ...target, ...(await this.state(outcome.aliasedTargetId)) };
+    }) : outcome);
   }
-  private async resumeOnce(sessionId: string, requestId: string, github?: SessionGithubOrigin): Promise<Session & WorkerState> {
+  private async resumeOnce(sessionId: string, requestId: string, github?: SessionGithubOrigin): Promise<(Session & WorkerState) | { aliasedTargetId: string; projectId: string; projectPath: string }> {
     if (this.handoffRequest(sessionId)) throw new ContentError("This session yielded to a team; inspect its handoff instead of resuming it");
     if (requestId === sessionId) throw new ContentError("Resumption needs a new request identity", 400);
     const session = this.meta(sessionId).session;
@@ -901,11 +882,14 @@ export class Manager {
     const receiptFile = join(this.config.stateDir, "resumptions", `${requestId}.sealed`);
     if (existsSync(receiptFile)) {
       const receipt = unseal<{ sourceId: string; targetId: string }>(this.key, `resume:${requestId}`, readFileSync(receiptFile, "utf8"));
-      if (receipt.sourceId !== sessionId) throw new ContentError("Request ID already belongs to a different resumption");
-      const target = this.meta(receipt.targetId).session;
-      if (target.projectId !== session.projectId || (target.projectRoot ?? target.cwd) !== realpathSync(project.path))
+      const sourceId = receipt.sourceId.toLowerCase(), targetId = receipt.targetId.toLowerCase();
+      if (sourceId !== sessionId) throw new ContentError("Request ID already belongs to a different resumption");
+      const projectPath = realpathSync(project.path);
+      if (targetId !== sessionId && targetId !== requestId) return { aliasedTargetId: targetId, projectId: session.projectId, projectPath };
+      const target = this.meta(targetId).session;
+      if (target.projectId !== session.projectId || (target.projectRoot ?? target.cwd) !== projectPath)
         throw new ContentError("The saved continuation receipt belongs to another project or codebase. Open the original session instead.", 409);
-      return { ...target, ...(await this.state(receipt.targetId)) };
+      return { ...target, ...(await this.state(targetId)) };
     }
     const remember = (result: Session & WorkerState) => {
       writeSealed(receiptFile, this.key, `resume:${requestId}`, { sourceId: sessionId, targetId: result.id });
@@ -969,10 +953,9 @@ export class Manager {
       if (request.provider === "codex") validateNativeCodexArgs(request.nativeArgs ?? [], request.nativeArgs === undefined ? request.prompt : "", Boolean(request.workspace));
       else validateNativeOpenCodeArgs(request.nativeArgs ?? [], request.nativeArgs === undefined ? request.prompt : "");
     }
+    request = canonicalRequest(request);
     const id = request.requestId;
-    const fingerprint = createHash("sha256")
-      .update(JSON.stringify(request))
-      .digest("hex");
+    const fingerprint = createHash("sha256").update(JSON.stringify(request)).digest("hex");
     const dir = join(this.config.stateDir, "sessions", id);
     const deletedPath = this.deletedReceiptPath(id);
     if (existsSync(deletedPath)) {
@@ -1138,6 +1121,7 @@ export class Manager {
     }
   }
   handoffRequest(id: string) {
+    id = id.toLowerCase();
     let cursor = 0;
     for (;;) {
       const page = this.events(id, cursor, 1, new Set(["team-handoff"]));
@@ -1147,14 +1131,8 @@ export class Manager {
     }
   }
   events(id: string, after: number, limit: number, types?: Set<string>) {
+    id = id.toLowerCase();
     this.meta(id);
-    return readEvents(
-      join(this.config.stateDir, "sessions", id, "events"),
-      this.key,
-      id,
-      after,
-      limit,
-      types,
-    );
+    return readEvents(join(this.config.stateDir, "sessions", id, "events"), this.key, id, after, limit, types);
   }
 }

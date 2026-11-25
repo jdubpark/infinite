@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import fs, { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -811,6 +811,50 @@ test("concurrent stale-lock recovery never removes a newly acquired Claude lock 
     assert.equal(existsSync(recover), false);
   } finally {
     fs.statSync = realStatSync;
+    syncBuiltinESMExports();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Claude trust aborts commit and leaves replacement lock untouched if lock inode changes mid-update", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-claude-inode-")));
+  const realWriteFileSync = fs.writeFileSync;
+  try {
+    const config = join(root, ".claude.json"), lock = `${config}.lock`, parked = `${config}.parked`;
+    const member = join(root, "member"), otherWriter = "/srv/other-writer";
+    mkdirSync(member);
+    writeFileSync(config, JSON.stringify({ numStartups: 5, projects: {} }));
+
+    let replacementIno: bigint | undefined;
+    let swapped = false;
+    fs.writeFileSync = ((file: fs.PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, options?: fs.WriteFileOptions) => {
+      const result = (realWriteFileSync as (...args: unknown[]) => unknown)(file, data, options);
+      if (!swapped && typeof file === "string" && file.endsWith(".tmp")) {
+        swapped = true;
+        renameSync(lock, parked);
+        mkdirSync(lock);
+        replacementIno = statSync(lock, { bigint: true }).ino;
+        realWriteFileSync(config, JSON.stringify({ numStartups: 6, projects: { [otherWriter]: { hasTrustDialogAccepted: true } } }));
+      }
+      return result;
+    }) as typeof fs.writeFileSync;
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(() => recordClaudeTrustAsync(config, member, 1000), /lock was lost/);
+    } finally {
+      fs.writeFileSync = realWriteFileSync;
+      syncBuiltinESMExports();
+    }
+    assert.equal(swapped, true);
+    assert.equal(existsSync(lock), true, "replacement lock owned by another writer must not be unlinked in finally");
+    assert.equal(statSync(lock, { bigint: true }).ino, replacementIno);
+    assert.deepEqual(JSON.parse(readFileSync(config, "utf8")), {
+      numStartups: 6,
+      projects: { [otherWriter]: { hasTrustDialogAccepted: true } },
+    });
+    assert.equal(readdirSync(root).some(name => name.endsWith(".tmp")), false, "aborted temporary config file is cleaned up");
+  } finally {
+    fs.writeFileSync = realWriteFileSync;
     syncBuiltinESMExports();
     rmSync(root, { recursive: true, force: true });
   }

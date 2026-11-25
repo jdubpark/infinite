@@ -112,7 +112,9 @@ test("owner refresh runs context and brief once, then returns the cached narrati
   const result = store.refresh("workspace-1", `team:${f.run.id}`, f.run, "owner");
   assert.equal(result.queued, true);
   assert.equal(result.narrative.state, "pending");
-  const persisted = unseal<{ jobs: number; pending?: unknown }>(f.key, "understanding-work-narrative", readFileSync(join(f.stateDir, "understanding", "work-narratives", "workspace-1.sealed"), "utf8"));
+  const wsFile = join(f.stateDir, "understanding", "work-narratives", "workspace-1.sealed");
+  await waitFor(() => existsSync(wsFile) ? true : null);
+  const persisted = unseal<{ jobs: number; pending?: unknown }>(f.key, "understanding-work-narrative", readFileSync(wsFile, "utf8"));
   assert.equal(persisted.jobs, 1);
   assert.equal("pending" in persisted, false);
   const record = await waitFor(() => store.read("workspace-1", `team:${f.run.id}`));
@@ -496,13 +498,13 @@ test("queued jobs refund daily quota when canceled by close or refused by gate, 
   await firstBlocked;
   assert.equal(closeStore2.refresh("workspace-3", `team:${run4.id}`, run4, "owner").queued, true);
   const ws3File = join(f.stateDir, "understanding", "work-narratives", "workspace-3.sealed");
-  assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws3File, "utf8")).jobs, 2);
+  assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws3File, "utf8")).jobs, 1);
   await closeStore2.close();
   assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws3File, "utf8")).jobs, 1);
   await store.close();
 });
 
-test("replacing a same-day queued narrative reuses its charged slot even at the daily budget cap", async t => {
+test("replacing a same-day queued narrative succeeds at the daily budget cap with zero enqueue writes", async t => {
   const now = () => new Date("2026-10-25T12:00:00.000Z");
   const f = setup(t, { now });
   const root2 = join(f.directory, "workspace-2");
@@ -541,8 +543,9 @@ test("replacing a same-day queued narrative reuses its charged slot even at the 
   try {
     assert.equal(store.refresh("workspace-1", `team:${run1.id}`, run1, "owner").queued, true);
     await firstStarted;
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(wsFile, "utf8")).jobs, 47);
     assert.equal(store.refresh("workspace-1", `team:${run2.id}`, run2, "owner").queued, true);
-    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(wsFile, "utf8")).jobs, 48);
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(wsFile, "utf8")).jobs, 47);
 
     writeFileSync(join(root2, "src/a.ts"), "export const other = 3;\n");
     const head2b = commit(root2, "work2b");
@@ -558,12 +561,12 @@ test("replacing a same-day queued narrative reuses its charged slot even at the 
       const replaced = store.refresh("workspace-1", `team:${run2.id}`, run2, "owner");
       assert.equal(replaced.queued, true);
       assert.equal(replaced.narrative.state, "pending");
-      assert.equal(persistWrites, 0, "replacing a same-day queued job reuses its charged slot with zero extra writes");
+      assert.equal(persistWrites, 0, "replacing a queued job writes zero quota updates before dispatch");
     } finally {
       fs.renameSync = realRenameSync;
       syncBuiltinESMExports();
     }
-    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(wsFile, "utf8")).jobs, 48);
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(wsFile, "utf8")).jobs, 47);
 
     const excess = store.refresh("workspace-1", `team:${run3.id}`, run3, "owner");
     assert.equal(excess.queued, false);
@@ -582,9 +585,8 @@ test("replacing a same-day queued narrative reuses its charged slot even at the 
   }
 });
 
-test("failed quota refund writes are retained for retry, backed off on reads, flushed before active writers finish closing, and verified across reload", async t => {
-  let nowMs = Date.parse("2026-10-25T12:00:00.000Z");
-  const now = () => new Date(nowMs);
+test("charge-at-dispatch persists zero charges for canceled or gate-refused queued jobs even when storage fails during close", async t => {
+  const now = () => new Date("2026-10-25T12:00:00.000Z");
   const f = setup(t, { now });
   const run1 = structuredClone(f.run);
   const run2 = { ...structuredClone(f.run), id: "run-2" };
@@ -597,13 +599,11 @@ test("failed quota refund writes are retained for retry, backed off on reads, fl
   const ws3File = join(storeDir, "workspace-3.sealed");
   writeFileSync(ws1File, seal(f.key, "understanding-work-narrative", { version: 1, day: "2026-10-25", jobs: 46, records: {}, failures: {} }));
   writeFileSync(ws2File, seal(f.key, "understanding-work-narrative", { version: 1, day: "2026-10-25", jobs: 46, records: {}, failures: {} }));
-  writeFileSync(ws3File, seal(f.key, "understanding-work-narrative", { version: 1, day: "2026-10-25", jobs: 46, records: {}, failures: {} }));
+  writeFileSync(ws3File, seal(f.key, "understanding-work-narrative", { version: 1, day: "2026-10-25", jobs: 47, records: {}, failures: {} }));
 
   const realRenameSync = fs.renameSync;
   let failTarget: string | null = null;
-  let ws1WriteAttempts = 0;
   fs.renameSync = ((src: fs.PathLike, dest: fs.PathLike) => {
-    if (String(dest) === ws1File) ws1WriteAttempts++;
     if (failTarget && String(dest) === failTarget) throw Object.assign(new Error("injected write failure"), { code: "EIO" });
     return realRenameSync(src, dest);
   }) as typeof fs.renameSync;
@@ -616,10 +616,8 @@ test("failed quota refund writes are retained for retry, backed off on reads, fl
   let store3: WorkNarrativeStore | undefined;
   let reopened1: WorkNarrativeStore | undefined;
   let reopened2: WorkNarrativeStore | undefined;
-  let reopened3: WorkNarrativeStore | undefined;
   try {
     let pendingRunId: string | null = null;
-    let armFaultOnPending = false;
     let markFirstStarted!: () => void;
     const firstStarted = new Promise<void>(resolve => { markFirstStarted = resolve; });
     const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
@@ -631,46 +629,18 @@ test("failed quota refund writes are retained for retry, backed off on reads, fl
         if (calls === 1) { markFirstStarted(); await firstGate; }
         return explanation();
       } },
-      teams: {
-        understandingRecords: () => records,
-        pendingOperation: (id: string) => {
-          if (pendingRunId !== id) return false;
-          if (armFaultOnPending) { armFaultOnPending = false; failTarget = ws1File; }
-          return true;
-        },
-      },
+      teams: { understandingRecords: () => records, pendingOperation: (id: string) => pendingRunId === id },
     });
     assert.equal(store1.refresh("workspace-1", `team:${run1.id}`, run1, "owner").queued, true);
     await firstStarted;
     assert.equal(store1.refresh("workspace-1", `team:${run2.id}`, run2, "owner").queued, true);
-    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws1File, "utf8")).jobs, 48);
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws1File, "utf8")).jobs, 47);
 
     pendingRunId = run2.id;
-    armFaultOnPending = true;
     releaseFirst();
     await waitFor(() => store1!.read("workspace-1", `team:${run1.id}`));
     await waitFor(() => store1!.status("workspace-1", `team:${run2.id}`, run2).state === "unavailable" ? true : null);
-    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws1File, "utf8")).jobs, 48);
-
-    const attemptsAfterFault = ws1WriteAttempts;
-    for (let i = 0; i < 5; i++) {
-      nowMs += 100;
-      store1.read("workspace-1", `team:${run2.id}`);
-      store1.status("workspace-1", `team:${run2.id}`, run2);
-    }
-    assert.equal(ws1WriteAttempts, attemptsAfterFault, "read and status calls back off instead of retrying failed refund writes on every read");
-
-    nowMs += 5000;
-    store1.status("workspace-1", `team:${run2.id}`, run2);
-    assert.equal(ws1WriteAttempts, attemptsAfterFault + 1, "read path retries once after the backoff window elapses");
-    store1.status("workspace-1", `team:${run2.id}`, run2);
-    assert.equal(ws1WriteAttempts, attemptsAfterFault + 1, "a repeated failure re-arms the read-path backoff");
-
-    failTarget = null;
-    store1.status("workspace-1", `team:${run2.id}`, run2);
-    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws1File, "utf8")).jobs, 48);
-    nowMs += 5000;
-    store1.status("workspace-1", `team:${run2.id}`, run2);
+    assert.equal(calls, 1);
     assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws1File, "utf8")).jobs, 47);
     await store1.close();
 
@@ -680,49 +650,16 @@ test("failed quota refund writes are retained for retry, backed off on reads, fl
       teams: { understandingRecords: () => records, pendingOperation: () => false },
     });
     assert.equal(reopened1.refresh("workspace-1", `team:${run3.id}`, run3, "owner").queued, true);
+    await waitFor(() => reopened1!.read("workspace-1", `team:${run3.id}`));
     assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws1File, "utf8")).jobs, 48);
     await reopened1.close();
-
-    let markBlocked!: () => void;
-    const blocked = new Promise<void>(resolve => { markBlocked = resolve; });
-    store2 = new WorkNarrativeStore({
-      config: f.config, key: f.key, now,
-      adapter: { explainWork: async (_input, { signal }) => {
-        markBlocked();
-        return await new Promise((_, reject) => {
-          signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
-        });
-      } },
-      teams: { understandingRecords: () => records, pendingOperation: () => false },
-    });
-    assert.equal(store2.refresh("workspace-2", `team:${run1.id}`, run1, "owner").queued, true);
-    await blocked;
-    assert.equal(store2.refresh("workspace-2", `team:${run2.id}`, run2, "owner").queued, true);
-    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws2File, "utf8")).jobs, 48);
-
-    failTarget = ws2File;
-    await assert.rejects(() => store2!.close(), /injected write failure/);
-    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws2File, "utf8")).jobs, 48);
-
-    failTarget = null;
-    await store2.close();
-    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws2File, "utf8")).jobs, 47);
-
-    reopened2 = new WorkNarrativeStore({
-      config: f.config, key: f.key, now,
-      adapter: { explainWork: async () => explanation() },
-      teams: { understandingRecords: () => records, pendingOperation: () => false },
-    });
-    assert.equal(reopened2.refresh("workspace-2", `team:${run3.id}`, run3, "owner").queued, true);
-    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws2File, "utf8")).jobs, 48);
-    await reopened2.close();
 
     let markSlowStarted!: () => void;
     let markSlowAborted!: () => void;
     const slowStarted = new Promise<void>(resolve => { markSlowStarted = resolve; });
     const slowAborted = new Promise<void>(resolve => { markSlowAborted = resolve; });
     const windDownGate = new Promise<void>(resolve => { releaseWindDown = resolve; });
-    store3 = new WorkNarrativeStore({
+    store2 = new WorkNarrativeStore({
       config: f.config, key: f.key, now,
       adapter: { explainWork: async (_input, { signal }) => {
         markSlowStarted();
@@ -732,29 +669,52 @@ test("failed quota refund writes are retained for retry, backed off on reads, fl
       } },
       teams: { understandingRecords: () => records, pendingOperation: () => false },
     });
-    assert.equal(store3.refresh("workspace-3", `team:${run1.id}`, run1, "owner").queued, true);
+    assert.equal(store2.refresh("workspace-2", `team:${run1.id}`, run1, "owner").queued, true);
     await slowStarted;
-    assert.equal(store3.refresh("workspace-3", `team:${run2.id}`, run2, "owner").queued, true);
-    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws3File, "utf8")).jobs, 48);
+    assert.equal(store2.refresh("workspace-2", `team:${run2.id}`, run2, "owner").queued, true);
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws2File, "utf8")).jobs, 47);
 
-    const closingSlow = store3.close();
+    failTarget = ws2File;
+    const closingSlow = store2.close();
     await slowAborted;
-    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws3File, "utf8")).jobs, 47, "queued refunds are persisted before waiting for active writers to wind down");
-    reopened3 = new WorkNarrativeStore({
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws2File, "utf8")).jobs, 47, "queued job was never charged on disk");
+    releaseWindDown();
+    await closingSlow;
+    failTarget = null;
+
+    reopened2 = new WorkNarrativeStore({
       config: f.config, key: f.key, now,
       adapter: { explainWork: async () => explanation() },
       teams: { understandingRecords: () => records, pendingOperation: () => false },
     });
-    assert.equal(reopened3.refresh("workspace-3", `team:${run3.id}`, run3, "owner").queued, true);
-    releaseWindDown();
-    await closingSlow;
-    await reopened3.close();
+    assert.equal(reopened2.refresh("workspace-2", `team:${run3.id}`, run3, "owner").queued, true);
+    await waitFor(() => reopened2!.read("workspace-2", `team:${run3.id}`));
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws2File, "utf8")).jobs, 48);
+    await reopened2.close();
+
+    let dispatchCalls = 0;
+    store3 = new WorkNarrativeStore({
+      config: f.config, key: f.key, now,
+      adapter: { explainWork: async () => { dispatchCalls++; return explanation(); } },
+      teams: { understandingRecords: () => records, pendingOperation: () => false },
+    });
+    failTarget = ws3File;
+    assert.equal(store3.refresh("workspace-3", `team:${run1.id}`, run1, "owner").queued, true);
+    await waitFor(() => store3!.status("workspace-3", `team:${run1.id}`, run1).state === "unavailable" ? true : null);
+    assert.equal(dispatchCalls, 0, "a failed dispatch-time quota persist must not invoke the writer");
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws3File, "utf8")).jobs, 47);
+    failTarget = null;
+    assert.equal(store3.refresh("workspace-3", `team:${run1.id}`, run1, "owner").queued, true);
+    await waitFor(() => store3!.read("workspace-3", `team:${run1.id}`));
+    assert.equal(dispatchCalls, 1);
+    assert.equal(unseal<{ jobs: number }>(f.key, "understanding-work-narrative", readFileSync(ws3File, "utf8")).jobs, 48);
+    await store3.close();
   } finally {
     failTarget = null;
     fs.renameSync = realRenameSync;
     syncBuiltinESMExports();
     releaseFirst?.();
     releaseWindDown?.();
-    await Promise.allSettled([store1?.close(), store2?.close(), store3?.close(), reopened1?.close(), reopened2?.close(), reopened3?.close()]);
+    await Promise.allSettled([store1?.close(), store2?.close(), store3?.close(), reopened1?.close(), reopened2?.close()]);
   }
 });

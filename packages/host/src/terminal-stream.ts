@@ -140,7 +140,7 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
           if (leaseId) await manager.controlSession(match[1], { op: "control", action: "release", actor, leaseId });
         }).catch(() => {});
       });
-      const active = () => open && !abort.signal.aborted;
+      const active = () => open && !abort.signal.aborted && ws.readyState === WebSocket.OPEN;
       const send = (value: unknown) => new Promise<void>((resolve, reject) => {
         if (ws.readyState !== WebSocket.OPEN) { reject(new Error("Terminal disconnected")); return; }
         ws.send(JSON.stringify(value), error => error ? reject(error) : resolve());
@@ -240,7 +240,12 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
                 await ready;
                 if (!active()) return;
                 for await (const page of terminalPages(manager, match[1], after, abort.signal, url.searchParams.get("snapshot") === "1")) await send(page);
-                if (!abort.signal.aborted) ws.close(1000);
+                if (!abort.signal.aborted) {
+                  open = false;
+                  abort.abort();
+                  discardQueue();
+                  ws.close(1000);
+                }
               } catch { if (active()) fail(1011); }
             })();
             return;

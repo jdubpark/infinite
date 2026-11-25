@@ -384,3 +384,99 @@ test("queued team launches recheck hostLoad after create admission and release t
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("concurrent creates with uppercase and lowercase spellings of the same requestId converge to one session", { timeout: 30_000 }, async () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-uuid-case-"));
+  const stateDir = join(root, "state"), runDir = join(root, "r"), projectDir = join(root, "project"), keyFile = join(root, "key");
+  const agentScript = join(root, "agent.mjs");
+  mkdirSync(projectDir); mkdirSync(runDir);
+  const key = randomBytes(32);
+  writeFileSync(keyFile, key, { mode: 0o600 });
+  writeFileSync(agentScript, "setInterval(() => {}, 1000);\n");
+  const config: Config = {
+    port: 0, origin: "http://127.0.0.1", keyFile, stateDir, runDir, environment: "local", enableDemo: true, maxSessions: 4,
+    tokens: [], projects: [{ id: "rehearsal", name: "Rehearsal", path: projectDir }],
+    agents: { demo: { command: process.execPath, args: [agentScript] } },
+  };
+  const manager = new Manager(config, key);
+  const canonical = randomUUID().toLowerCase();
+  const upper = canonical.toUpperCase();
+  try {
+    const [a, b] = await Promise.all([
+      manager.create({ requestId: upper, provider: "demo", projectId: "rehearsal", title: "Case check", prompt: "Same prompt" }),
+      manager.create({ requestId: canonical, provider: "demo", projectId: "rehearsal", title: "Case check", prompt: "Same prompt" }),
+    ]);
+    assert.equal(a.id, canonical);
+    assert.equal(b.id, canonical);
+    assert.equal(a.runtime?.id, b.runtime?.id);
+    const live = (await manager.list()).filter(session => session.status === "running" || session.status === "starting");
+    assert.deepEqual(live.map(session => session.id), [canonical]);
+    await assert.rejects(
+      manager.create({ requestId: upper, provider: "demo", projectId: "rehearsal", title: "Case check", prompt: "Different prompt" }),
+      /different session/,
+    );
+  } finally {
+    await endSessionWorkers(config);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("aliased resume receipt replay serializes with target removal and never returns unavailable for a deleted target", { timeout: 20_000 }, async () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-alias-rm-"));
+  const stateDir = join(root, "state"), runDir = join(root, "r"), projectDir = join(root, "project"), keyFile = join(root, "key");
+  mkdirSync(projectDir); mkdirSync(runDir);
+  const key = randomBytes(32);
+  writeFileSync(keyFile, key, { mode: 0o600 });
+  const config: Config = {
+    port: 0, origin: "http://127.0.0.1", keyFile, stateDir, runDir, environment: "local", enableDemo: true, maxSessions: 4,
+    tokens: [], projects: [{ id: "rehearsal", name: "Rehearsal", path: projectDir }], agents: {},
+  };
+  const manager = new Manager(config, key);
+  const sourceId = randomUUID(), targetId = randomUUID(), aliasId = randomUUID();
+  const exited = { status: "exited", seq: 2, screen: "", exitCode: 0, attention: initialAttention(new Date().toISOString(), false) };
+  for (const id of [sourceId, targetId]) {
+    mkdirSync(join(stateDir, "sessions", id), { recursive: true });
+    writeSealed(join(stateDir, "sessions", id, "meta.sealed"), key, `${id}:meta`, {
+      session: {
+        id, provider: "claude", title: "Recorded", projectId: "rehearsal", cwd: projectDir, projectRoot: projectDir,
+        createdAt: new Date().toISOString(), status: "exited", contextVersion: 0, context: "", initialPrompt: "",
+      } as Session,
+      fingerprint: `fp-${id}`,
+    });
+    writeSealed(join(stateDir, "sessions", id, "status.sealed"), key, `${id}:status`, exited);
+  }
+  mkdirSync(join(stateDir, "resumptions"), { recursive: true });
+  writeSealed(join(stateDir, "resumptions", `${aliasId}.sealed`), key, `resume:${aliasId}`, { sourceId, targetId });
+
+  const originalState = manager.state.bind(manager);
+  let markStateEntered!: () => void;
+  let releaseState!: () => void;
+  const stateEntered = new Promise<void>(resolve => { markStateEntered = resolve; });
+  const stateGate = new Promise<void>(resolve => { releaseState = resolve; });
+  let interceptTarget = true;
+  manager.state = (async (id: string, screen?: boolean) => {
+    if (interceptTarget && id.toLowerCase() === targetId) {
+      interceptTarget = false;
+      markStateEntered();
+      await stateGate;
+    }
+    return originalState(id, screen);
+  }) as Manager["state"];
+  try {
+    const replaying = manager.resume(sourceId, aliasId);
+    await stateEntered;
+    const removing = manager.remove(targetId);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(existsSync(join(stateDir, "deleted-sessions", `${targetId}.sealed`)), false, "remove waits for aliased replay to finish reading target state");
+    releaseState();
+    const replayed = await replaying;
+    assert.equal(replayed.id, targetId);
+    assert.equal(replayed.status, "exited");
+    await removing;
+    assert.equal(existsSync(join(stateDir, "deleted-sessions", `${targetId}.sealed`)), true);
+    await assert.rejects(manager.resume(sourceId, aliasId), { code: "ENOENT" });
+  } finally {
+    releaseState();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

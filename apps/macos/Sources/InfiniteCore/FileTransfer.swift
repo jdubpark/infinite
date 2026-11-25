@@ -82,10 +82,12 @@ public enum LocalFiles {
         return current
     }
     public static func list(root: URL, path: String) throws -> [FileEntry] {
+        try Task.checkCancellation()
         let directory = try location(root: root, path: path)
         return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).filter {
             !$0.lastPathComponent.hasPrefix(".infinite-desktop-")
         }.map { url in
+            try Task.checkCancellation()
             guard let value = try info(url) else { throw DesktopError("The folder changed. Refresh its listing.") }
             let name = url.lastPathComponent
             return FileEntry(path: path.isEmpty ? name : path + "/" + name, name: name, kind: kind(value), size: Int(value.st_size))
@@ -122,7 +124,8 @@ public enum LocalFiles {
         if errno == ENOENT { return nil }
         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
-    fileprivate static func version(parent: Int32, name: String) throws -> FileVersion? {
+    fileprivate static func version(parent: Int32, name: String, isCancelled: () -> Bool = { Task.isCancelled }) throws -> FileVersion? {
+        if Task.isCancelled || isCancelled() { throw CancellationError() }
         guard let expected = try info(parent: parent, name: name) else { return nil }
         guard kind(expected) == "file", expected.st_size <= FileTransfer.maximumBytes else { throw DesktopError("Choose a regular file of at most 256 MiB.") }
         let fd = openat(parent, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
@@ -132,7 +135,8 @@ public enum LocalFiles {
         var initial = stat(); guard fstat(fd, &initial) == 0, stamp(initial) == stamp(expected) else { throw DesktopError("The local file changed while opening it.", code: "local-conflict") }
         var digest = SHA256(), count = 0
         while let data = try handle.read(upToCount: 256 * 1024), !data.isEmpty {
-            try Task.checkCancellation(); digest.update(data: data); count += data.count
+            if Task.isCancelled || isCancelled() { throw CancellationError() }
+            digest.update(data: data); count += data.count
             if count > FileTransfer.maximumBytes { throw DesktopError("File transfer is limited to 256 MiB.") }
         }
         var final = stat()
@@ -159,21 +163,23 @@ public enum LocalFiles {
         }
     }
     static func stage(root: URL, path: String) throws -> LocalDownload { try LocalDownload(root: root, path: path) }
-    static func install(_ staged: LocalDownload, expected: FileVersion?, isCancelled: () -> Bool = { Task.isCancelled }) throws {
+    static func install(_ staged: LocalDownload, expected: FileVersion?, coordinator: NSFileCoordinator = NSFileCoordinator(), isCancelled: () -> Bool = { Task.isCancelled }) throws {
         if isCancelled() { throw CancellationError() }
         var coordinationError: NSError?, result: Result<Void, Error> = .success(())
-        NSFileCoordinator().coordinate(writingItemAt: staged.destination, options: .forReplacing, error: &coordinationError) { _ in
+        coordinator.coordinate(writingItemAt: staged.destination, options: .forReplacing, error: &coordinationError) { _ in
             if isCancelled() {
                 result = .failure(CancellationError())
                 return
             }
             result = Result { try staged.install(expected: expected, isCancelled: isCancelled) }
         }
+        if isCancelled() { throw CancellationError() }
         if let coordinationError { throw coordinationError }; try result.get()
     }
     static func installAsync(_ staged: LocalDownload, expected: FileVersion?) async throws {
         try Task.checkCancellation()
         let gate = LockFreeInt64(0)
+        let coordinator = SendableBox(value: NSFileCoordinator())
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 if gate.load() != 0 {
@@ -186,15 +192,20 @@ public enum LocalFiles {
                         return
                     }
                     do {
-                        try install(staged, expected: expected, isCancelled: { gate.load() != 0 })
+                        try install(staged, expected: expected, coordinator: coordinator.value, isCancelled: { gate.load() != 0 })
                         continuation.resume()
                     } catch {
-                        continuation.resume(throwing: error)
+                        if gate.load() != 0 {
+                            continuation.resume(throwing: CancellationError())
+                        } else {
+                            continuation.resume(throwing: error)
+                        }
                     }
                 }
             }
         } onCancel: {
             gate.store(1)
+            coordinator.value.cancel()
         }
     }
 }
@@ -236,7 +247,7 @@ final class LocalDownload: @unchecked Sendable {
     func install(expected: FileVersion?, isCancelled: () -> Bool = { Task.isCancelled }) throws {
         if isCancelled() { throw CancellationError() }
         try validateParent()
-        guard try LocalFiles.version(parent: parent, name: name) == expected else { throw DesktopError("The destination changed since preview. No file was replaced.", code: "local-conflict") }
+        guard try LocalFiles.version(parent: parent, name: name, isCancelled: isCancelled) == expected else { throw DesktopError("The destination changed since preview. No file was replaced.", code: "local-conflict") }
         let previous = try LocalFiles.info(parent: parent, name: name)
         guard previous.map(LocalFiles.stamp) == expected?.stamp else { throw DesktopError("The destination changed before replacement.", code: "local-conflict") }
         if let previous {

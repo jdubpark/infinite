@@ -323,10 +323,13 @@ final class SyncSafetyTests: XCTestCase {
         let stagedImmediate = try LocalFiles.stage(root: root, path: "cancelled.txt")
         try stagedImmediate.handle.write(contentsOf: Data("should not install".utf8))
 
+        let gate = AsyncStream<Void>.makeStream()
         let preCancelled = Task {
+            for await _ in gate.stream {}
             try await LocalFiles.installAsync(stagedImmediate, expected: nil)
         }
         preCancelled.cancel()
+        gate.continuation.finish()
         do {
             try await preCancelled.value
             XCTFail("Expected pre-cancelled installAsync to throw CancellationError")
@@ -337,6 +340,7 @@ final class SyncSafetyTests: XCTestCase {
         try stagedBlocked.handle.write(contentsOf: Data("blocked by coordinator".utf8))
         let coordinatorEntered = DispatchSemaphore(value: 0)
         let releaseCoordinator = DispatchSemaphore(value: 0)
+        defer { releaseCoordinator.signal() }
         DispatchQueue.global(qos: .userInitiated).async {
             var coordinationError: NSError?
             NSFileCoordinator().coordinate(writingItemAt: stagedBlocked.destination, options: .forReplacing, error: &coordinationError) { _ in
@@ -350,7 +354,6 @@ final class SyncSafetyTests: XCTestCase {
         }
         try await Task.sleep(for: .milliseconds(30))
         inFlightInstall.cancel()
-        releaseCoordinator.signal()
         do {
             try await inFlightInstall.value
             XCTFail("Expected in-flight installAsync to throw CancellationError")

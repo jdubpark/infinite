@@ -4,33 +4,36 @@ import InfiniteCore
 
 private actor CmuxDeferred<Value: Sendable> {
     private var entered = false
-    private var entryWaiter: CheckedContinuation<Void, Never>?
-    private var valueWaiter: CheckedContinuation<Value, Error>?
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var valueWaiters: [CheckedContinuation<Value, Error>] = []
     private var result: Result<Value, Error>?
 
     func waitUntilEntered() async {
         if entered { return }
-        await withCheckedContinuation { entryWaiter = $0 }
+        await withCheckedContinuation { entryWaiters.append($0) }
     }
 
     func wait() async throws -> Value {
         if let result { return try result.get() }
         entered = true
-        entryWaiter?.resume()
-        entryWaiter = nil
-        return try await withCheckedThrowingContinuation { valueWaiter = $0 }
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        return try await withCheckedThrowingContinuation { valueWaiters.append($0) }
     }
 
     func succeed(_ value: Value) {
         result = .success(value)
-        valueWaiter?.resume(returning: value)
-        valueWaiter = nil
+        let waiters = valueWaiters
+        valueWaiters.removeAll()
+        for waiter in waiters { waiter.resume(returning: value) }
     }
 
     func fail(_ error: Error) {
         result = .failure(error)
-        valueWaiter?.resume(throwing: error)
-        valueWaiter = nil
+        let waiters = valueWaiters
+        valueWaiters.removeAll()
+        for waiter in waiters { waiter.resume(throwing: error) }
     }
 }
 
@@ -526,5 +529,188 @@ private actor CmuxFakeBackend {
         let persisted = await fake.read("cmux:p1:term-1")
         XCTAssertEqual(persisted.text, "follow-up draft text")
         XCTAssertNil(persisted.pending)
+    }
+
+    func testDisconnectWhilePasteIsSuspendedFencesInputAndSkipsEnter() async throws {
+        let fake = CmuxFakeBackend()
+        let pasteGate = CmuxDeferred<Void>()
+        let flushGate = CmuxDeferred<Void>()
+        actor SaveGateFlag {
+            var gateFlush = false
+            func enable() { gateFlush = true }
+        }
+        let flag = SaveGateFlag()
+        let deps = CmuxViewModelDependencies(
+            helperURL: { URL(fileURLWithPath: "/nonexistent/cmux") },
+            connect: { _, _, _, _, _ in },
+            snapshot: { await fake.snapshot() },
+            attach: { id, handler in
+                await fake.setOutput(id, handler)
+                handler(.snapshot(Data("ok".utf8), columns: 80, rows: 24))
+            },
+            detach: {},
+            disconnect: {},
+            paste: { text in
+                await fake.recordPaste(text)
+                try await pasteGate.wait()
+                return .queued
+            },
+            send: { data in
+                await fake.recordSend(data)
+                return .queued
+            },
+            resize: { _, _ in },
+            createTerminal: { _, _, _, _ in "term-created" },
+            closeTerminal: { _, _ in },
+            readDraft: { await fake.read($0) },
+            saveDraft: { draft, key in
+                if await flag.gateFlush { try await flushGate.wait() }
+                await fake.save(draft, key: key)
+            },
+            acquireMutation: { key, text in await fake.acquireMutation(key, text: text) },
+            clearDraftIfMatching: { id, key in await fake.clearIfMatching(id, key: key) }
+        )
+
+        let model = CmuxViewModel(deps: deps)
+        model.profiles = [CmuxHostProfile(id: "p1", label: "Host", route: "wss://cmux.example/v1/link")]
+        model.activeID = "p1"
+        model.setDisplayVisible(true)
+        await model.connect()
+        try await Task.sleep(for: .milliseconds(50))
+        model.rendererRestored(model.rendererGeneration)
+        model.setInputEnabled(true)
+        model.setDraft("send during disconnect")
+
+        let sendTask = Task { await model.send() }
+        await pasteGate.waitUntilEntered()
+
+        await flag.enable()
+        let disconnectTask = Task { try await model.disconnect() }
+        await flushGate.waitUntilEntered()
+        XCTAssertTrue(model.inputFenced)
+
+        await pasteGate.succeed(())
+        await sendTask.value
+        let sentWhileFlushing = await fake.sentBytes
+        XCTAssertTrue(sentWhileFlushing.isEmpty)
+
+        await flushGate.succeed(())
+        try await disconnectTask.value
+
+        let pasted = await fake.pastedTexts
+        let sent = await fake.sentBytes
+        XCTAssertEqual(pasted, ["send during disconnect"])
+        XCTAssertTrue(sent.isEmpty)
+    }
+
+    func testConcurrentDisconnectCallsAwaitSameFlushAndShareOutcome() async throws {
+        let fake = CmuxFakeBackend()
+        let firstFlushGate = CmuxDeferred<Void>()
+        let secondFlushGate = CmuxDeferred<Void>()
+        actor GateSwitch {
+            var attempt = 0
+            func next() -> Int { attempt += 1; return attempt }
+        }
+        let switcher = GateSwitch()
+        let deps = makeDeps(fake: fake, saveDraft: { draft, key in
+            switch await switcher.next() {
+            case 1:
+                try await firstFlushGate.wait()
+            case 2:
+                try await secondFlushGate.wait()
+            default:
+                break
+            }
+            await fake.save(draft, key: key)
+        })
+
+        let model = CmuxViewModel(deps: deps)
+        model.profiles = [CmuxHostProfile(id: "p1", label: "Host", route: "wss://cmux.example/v1/link")]
+        model.activeID = "p1"
+        await model.connect()
+        await model.select("term-1")
+        model.setDraft("must flush before terminate")
+
+        let d1 = Task { try await model.disconnect() }
+        await firstFlushGate.waitUntilEntered()
+        actor Flag {
+            var completed = false
+            func mark() { completed = true }
+        }
+        let d2Flag = Flag()
+        let d2 = Task {
+            do {
+                try await model.disconnect()
+                await d2Flag.mark()
+                return "ok"
+            } catch {
+                await d2Flag.mark()
+                return error.localizedDescription
+            }
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        let completedEarly = await d2Flag.completed
+        XCTAssertFalse(completedEarly)
+
+        await firstFlushGate.fail(DesktopError("Disk full"))
+        do {
+            try await d1.value
+            XCTFail("Expected first disconnect to fail")
+        } catch let error as DesktopError {
+            XCTAssertEqual(error.localizedDescription, "Disk full")
+        }
+        let d2Result = await d2.value
+        XCTAssertEqual(d2Result, "Disk full")
+
+        let d3 = Task { try await model.disconnect() }
+        await secondFlushGate.waitUntilEntered()
+        let d4 = Task { try await model.disconnect() }
+        await secondFlushGate.succeed(())
+        try await d3.value
+        try await d4.value
+        XCTAssertFalse(model.connected)
+        let saved = await fake.read("cmux:p1:term-1")
+        XCTAssertEqual(saved.text, "must flush before terminate")
+    }
+
+    func testFailedDisconnectFlushWhileSelectIsSuspendedReleasesBusyState() async throws {
+        let fake = CmuxFakeBackend()
+        await fake.setTerminals([
+            .object(["id": .string("term-1"), "title": .string("One"), "running": .bool(true)]),
+            .object(["id": .string("term-2"), "title": .string("Two"), "running": .bool(true)]),
+        ])
+        let flushGate = CmuxDeferred<Void>()
+        let deps = makeDeps(fake: fake, saveDraft: { draft, key in
+            if key == "cmux:p1:term-1" { try await flushGate.wait() }
+            await fake.save(draft, key: key)
+        })
+
+        let model = CmuxViewModel(deps: deps)
+        model.profiles = [CmuxHostProfile(id: "p1", label: "Host", route: "wss://cmux.example/v1/link")]
+        model.activeID = "p1"
+        await model.connect()
+        await model.select("term-1")
+
+        let selectTask = Task { await model.select("term-2") }
+        await flushGate.waitUntilEntered()
+
+        let disconnectTask = Task {
+            do {
+                try await model.disconnect()
+                return ""
+            } catch {
+                return error.localizedDescription
+            }
+        }
+        await Task.yield()
+        await flushGate.fail(DesktopError("Flush blocked"))
+
+        await selectTask.value
+        let disconnectErr = await disconnectTask.value
+        XCTAssertEqual(disconnectErr, "Flush blocked")
+        XCTAssertFalse(model.busy)
+        XCTAssertFalse(model.attaching)
+        XCTAssertFalse(model.draftEditingLocked)
+        XCTAssertFalse(model.inputFenced)
     }
 }

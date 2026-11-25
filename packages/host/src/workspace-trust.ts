@@ -67,7 +67,25 @@ function staleLockStatus(path: string): "missing" | "fresh" | "stale" {
   return Date.now() - info.mtimeMs > LOCK_STALE_MS ? "stale" : "fresh";
 }
 
-function tryRecoverStaleLock(lock: string): "acquired" | "retry" | "busy" {
+function lockInode(lock: string): bigint | undefined {
+  try { return statSync(lock, { bigint: true }).ino; }
+  catch (error) {
+    if (gone(error)) return undefined;
+    throw error;
+  }
+}
+
+function assertLockOwner(lock: string, ownerIno: bigint) {
+  if (lockInode(lock) !== ownerIno) throw new Error("Claude config lock was lost to another process");
+}
+
+function releaseLockIfOwned(lock: string, ownerIno: bigint) {
+  if (lockInode(lock) !== ownerIno) return;
+  try { rmdirSync(lock); }
+  catch (error) { if (!gone(error)) throw error; }
+}
+
+function tryRecoverStaleLock(lock: string): { acquired: bigint } | "retry" | "busy" {
   const initial = staleLockStatus(lock);
   if (initial === "missing") return "retry";
   if (initial === "fresh") return "busy";
@@ -77,7 +95,7 @@ function tryRecoverStaleLock(lock: string): "acquired" | "retry" | "busy" {
     if (exists(error)) return "busy";
     throw error;
   }
-  let acquired = false;
+  let acquiredIno: bigint | undefined;
   try {
     const current = staleLockStatus(lock);
     if (current === "missing") return "retry";
@@ -89,8 +107,9 @@ function tryRecoverStaleLock(lock: string): "acquired" | "retry" | "busy" {
     }
     try {
       mkdirSync(lock);
-      acquired = true;
-      return "acquired";
+      acquiredIno = lockInode(lock);
+      if (acquiredIno === undefined) return "busy";
+      return { acquired: acquiredIno };
     } catch (error) {
       if (exists(error)) return "busy";
       throw error;
@@ -99,42 +118,52 @@ function tryRecoverStaleLock(lock: string): "acquired" | "retry" | "busy" {
     try { rmdirSync(recover); }
     catch (error) {
       if (!gone(error)) {
-        if (acquired) try { rmdirSync(lock); } catch {}
+        if (acquiredIno !== undefined) try { releaseLockIfOwned(lock, acquiredIno); } catch {}
         throw error;
       }
     }
   }
 }
 
-function withClaudeConfigLock<T>(configPath: string, waitMs: number, update: () => T): T {
+function withClaudeConfigLock<T>(configPath: string, waitMs: number, update: (assertOwned: () => void) => T): T {
   const lock = `${configPath}.lock`, deadline = Date.now() + waitMs;
+  let ownerIno: bigint | undefined;
   for (let attempt = 1; ; attempt++) {
-    try { mkdirSync(lock); break; }
-    catch (error) { if (!exists(error)) throw error; }
+    try {
+      mkdirSync(lock);
+      ownerIno = lockInode(lock);
+      if (ownerIno !== undefined) break;
+      continue;
+    } catch (error) { if (!exists(error)) throw error; }
     if (Date.now() >= deadline) throw new Error("Claude config is locked by another process");
     const recovered = tryRecoverStaleLock(lock);
-    if (recovered === "acquired") break;
+    if (typeof recovered === "object") { ownerIno = recovered.acquired; break; }
     if (recovered === "retry") continue;
     pause(Math.min(200, 20 * attempt));
   }
-  try { return update(); } finally { try { rmdirSync(lock); } catch (error) { if (!gone(error)) throw error; } }
+  try { return update(() => assertLockOwner(lock, ownerIno!)); } finally { releaseLockIfOwned(lock, ownerIno!); }
 }
 
-export async function withClaudeConfigLockAsync<T>(configPath: string, waitMs: number, update: () => T | Promise<T>): Promise<T> {
+export async function withClaudeConfigLockAsync<T>(configPath: string, waitMs: number, update: (assertOwned: () => void) => T | Promise<T>): Promise<T> {
   const lock = `${configPath}.lock`, deadline = Date.now() + waitMs;
+  let ownerIno: bigint | undefined;
   for (let attempt = 1; ; attempt++) {
-    try { mkdirSync(lock); break; }
-    catch (error) { if (!exists(error)) throw error; }
+    try {
+      mkdirSync(lock);
+      ownerIno = lockInode(lock);
+      if (ownerIno !== undefined) break;
+      continue;
+    } catch (error) { if (!exists(error)) throw error; }
     if (Date.now() >= deadline) throw new Error("Claude config is locked by another process");
     const recovered = tryRecoverStaleLock(lock);
-    if (recovered === "acquired") break;
+    if (typeof recovered === "object") { ownerIno = recovered.acquired; break; }
     if (recovered === "retry") continue;
     await delay(Math.min(200, 20 * attempt));
   }
-  try { return await update(); } finally { try { rmdirSync(lock); } catch (error) { if (!gone(error)) throw error; } }
+  try { return await update(() => assertLockOwner(lock, ownerIno!)); } finally { releaseLockIfOwned(lock, ownerIno!); }
 }
 
-function applyClaudeTrust(configPath: string, cwd: string): boolean {
+function applyClaudeTrust(configPath: string, cwd: string, assertOwned?: () => void): boolean {
   let existing: string | undefined;
   try { existing = readFileSync(configPath, "utf8"); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -147,19 +176,21 @@ function applyClaudeTrust(configPath: string, cwd: string): boolean {
   const target = existing === undefined ? configPath : realpathSync(configPath);
   const temporary = join(dirname(target), `.${basename(target)}.${randomUUID()}.tmp`);
   writeFileSync(temporary, JSON.stringify(next, null, 2), { mode: 0o600, flag: "wx" });
-  try { renameSync(temporary, target); }
-  catch (error) { rmSync(temporary, { force: true }); throw error; }
+  try {
+    assertOwned?.();
+    renameSync(temporary, target);
+  } catch (error) { rmSync(temporary, { force: true }); throw error; }
   return true;
 }
 
 export function recordClaudeTrust(configPath: string, cwd: string, lockWaitMs = 5000): boolean {
   if (!trustable(cwd)) throw new Error("Workspace trust requires an absolute folder path");
-  return withClaudeConfigLock(configPath, lockWaitMs, () => applyClaudeTrust(configPath, cwd));
+  return withClaudeConfigLock(configPath, lockWaitMs, assertOwned => applyClaudeTrust(configPath, cwd, assertOwned));
 }
 
 export function recordClaudeTrustAsync(configPath: string, cwd: string, lockWaitMs = 5000): Promise<boolean> {
   if (!trustable(cwd)) throw new Error("Workspace trust requires an absolute folder path");
-  return withClaudeConfigLockAsync(configPath, lockWaitMs, () => applyClaudeTrust(configPath, cwd));
+  return withClaudeConfigLockAsync(configPath, lockWaitMs, assertOwned => applyClaudeTrust(configPath, cwd, assertOwned));
 }
 
 const entry = process.argv[1] ? resolve(process.argv[1]) : undefined;

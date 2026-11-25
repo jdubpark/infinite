@@ -779,23 +779,34 @@ test("terminal sockets dispatch zero control claims or PTY writes after aborting
     assert.equal((await worker.call({ op: "state" })).control, null);
 
     missionManaged = async () => true;
-    let stateCalls = 0;
+    const liveState = await originalState(worker.id);
+    const managedSocket = await connect();
+    const managedClosed = new Promise<number>(resolve => managedSocket.once("close", code => resolve(code)));
+    const initialStateFrame = new Promise<void>(resolve => {
+      const onMessage = (raw: WebSocket.RawData) => {
+        if ("state" in (JSON.parse(raw.toString()) as Record<string, unknown>)) {
+          managedSocket.off("message", onMessage);
+          resolve();
+        }
+      };
+      managedSocket.on("message", onMessage);
+    });
+    managedSocket.send(JSON.stringify({ token }));
+    await initialStateFrame;
+
     let markManagedCheckReached!: () => void;
     let releaseManagedState!: (state: WorkerState) => void;
     const managedCheckReached = new Promise<void>(resolve => { markManagedCheckReached = resolve; });
     const managedStateGate = new Promise<WorkerState>(resolve => { releaseManagedState = resolve; });
-    const liveState = await originalState(worker.id);
+    let interceptedInputState = false;
     stateInterceptor = async (id, screen) => {
-      stateCalls++;
-      if (stateCalls === 2) {
+      if (!interceptedInputState) {
+        interceptedInputState = true;
         markManagedCheckReached();
         return managedStateGate;
       }
       return originalState(id, screen);
     };
-    const managedSocket = await connect();
-    const managedClosed = new Promise<number>(resolve => managedSocket.once("close", code => resolve(code)));
-    managedSocket.send(JSON.stringify({ token }));
     managedSocket.send(JSON.stringify({ op: "raw", requestId: randomUUID(), text: "ABORTED_MANAGED_WRITE\n" }));
     await managedCheckReached;
     managedSocket.send("not-json");
@@ -807,6 +818,45 @@ test("terminal sockets dispatch zero control claims or PTY writes after aborting
     assert.equal((await worker.call({ op: "state" })).control, null);
     assert.equal(worker.events().filter(event => event.type === "input-intent").length, 0);
     assert.doesNotMatch(worker.output(), /ABORTED_MANAGED_WRITE/);
+
+    missionManaged = async () => true;
+    let gracefulStateCalls = 0;
+    let markReaderReached!: () => void;
+    let markInputReached!: () => void;
+    let releaseReaderState!: (state: WorkerState) => void;
+    let releaseInputState!: (state: WorkerState) => void;
+    const readerReached = new Promise<void>(resolve => { markReaderReached = resolve; });
+    const inputReached = new Promise<void>(resolve => { markInputReached = resolve; });
+    const readerStateGate = new Promise<WorkerState>(resolve => { releaseReaderState = resolve; });
+    const inputStateGate = new Promise<WorkerState>(resolve => { releaseInputState = resolve; });
+    stateInterceptor = async (id, screen) => {
+      gracefulStateCalls++;
+      if (gracefulStateCalls === 1) return originalState(id, screen);
+      if (gracefulStateCalls === 2) {
+        markReaderReached();
+        return readerStateGate;
+      }
+      if (gracefulStateCalls === 3) {
+        markInputReached();
+        return inputStateGate;
+      }
+      return originalState(id, screen);
+    };
+    const gracefulSocket = await connect();
+    const gracefulClosed = new Promise<number>(resolve => gracefulSocket.once("close", code => resolve(code)));
+    gracefulSocket.send(JSON.stringify({ token }));
+    await readerReached;
+    gracefulSocket.send(JSON.stringify({ op: "raw", requestId: randomUUID(), text: "GRACEFUL_CLOSE_WRITE\n" }));
+    await inputReached;
+    releaseReaderState({ ...liveState, status: "exited", exitCode: 0 });
+    assert.equal(await gracefulClosed, 1000);
+    releaseInputState({ ...liveState, attention: { ...liveState.attention, state: "needs-you" } });
+    await new Promise(resolve => setTimeout(resolve, 150));
+    stateInterceptor = undefined;
+    assert.equal(controlCalls, 0);
+    assert.equal((await worker.call({ op: "state" })).control, null);
+    assert.equal(worker.events().filter(event => event.type === "input-intent").length, 0);
+    assert.doesNotMatch(worker.output(), /GRACEFUL_CLOSE_WRITE/);
   } finally {
     closeTerminals();
     server.closeAllConnections();

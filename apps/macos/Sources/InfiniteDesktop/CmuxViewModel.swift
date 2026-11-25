@@ -42,6 +42,7 @@ private struct CmuxPendingCreation: Codable {
     @Published private(set) var displayVisible = false
     @Published private(set) var disconnecting = false
     @Published private(set) var draftEditingLocked = false
+    @Published private(set) var inputFenced = false
     @Published var attached = false
     @Published var busy = false
     @Published private(set) var sending = false
@@ -71,6 +72,8 @@ private struct CmuxPendingCreation: Codable {
     private var draftVersion = 0
     private var connectionGeneration = UUID()
     private var attachmentGeneration = UUID()
+    private var inputGeneration = UUID()
+    private var activeDisconnectTask: Task<Void, Error>?
     private var outputBuffer: CmuxOutputBuffer?
     private var pendingCreation: CmuxPendingCreation?
     private var clearingCreation = false
@@ -87,7 +90,7 @@ private struct CmuxPendingCreation: Codable {
     var active: CmuxHostProfile? { profiles.first { $0.id == activeID } }
     var selected: CmuxTerminalRow? { terminals.first { $0.id == selectedID } }
     var rendererVisible: Bool { displayVisible && attached }
-    var canSend: Bool { connected && attached && snapshotReady && inputEnabled && !directInput && !busy && draft.pending == nil && !draft.text.isEmpty }
+    var canSend: Bool { connected && attached && snapshotReady && inputEnabled && !directInput && !busy && !inputFenced && !disconnecting && draft.pending == nil && !draft.text.isEmpty }
     private var draftIdentity: String? { selectedID.map { "cmux:\(attachedProfileID):\($0)" } }
 
     init(deps: CmuxViewModelDependencies = .live()) {
@@ -212,17 +215,24 @@ private struct CmuxPendingCreation: Codable {
         let connection = connectionGeneration, profileID = activeID, priorAttachment = attachmentGeneration
         let token = UUID()
         selectionToken = token
+        let fencedInput = UUID()
+        inputGeneration = fencedInput
+        inputFenced = true; inputEnabled = false; directInput = false; queuedInput.removeAll()
         saveTask?.cancel(); saveTask = nil
         busy = true; attaching = true
         defer {
             if selectionToken == token {
                 selectionToken = nil
                 draftEditingLocked = false
+                inputFenced = false
                 busy = false; busyAttachment = nil; attaching = false
             }
         }
         do { try await flushDraft() } catch {
-            if connectionGeneration == connection { notice = error.localizedDescription }
+            if connectionGeneration == connection && attachmentGeneration == priorAttachment && inputGeneration == fencedInput && !disconnecting {
+                inputFenced = false
+                notice = error.localizedDescription
+            }
             return
         }
         guard connection == connectionGeneration, attachmentGeneration == priorAttachment, profileID == activeID, !disconnecting, selectionToken == token else { return }
@@ -243,6 +253,7 @@ private struct CmuxPendingCreation: Codable {
             guard connection == connectionGeneration, generation == attachmentGeneration, profileID == activeID, !disconnecting else { return }
             selectedID = id; attachedProfileID = profileID; draft = loaded; draftVersion += 1
             draftEditingLocked = false
+            inputFenced = false
         } catch { notice = error.localizedDescription; return }
         let buffer = CmuxOutputBuffer { [weak self] events in
             guard let self, self.attachmentGeneration == generation else { return }
@@ -291,7 +302,7 @@ private struct CmuxPendingCreation: Codable {
     }
 
     func setInputEnabled(_ value: Bool) {
-        inputEnabled = value && connected && attached && snapshotReady && !busy
+        inputEnabled = value && connected && attached && snapshotReady && !busy && !inputFenced && !disconnecting
         if !inputEnabled {
             directInput = false; queuedInput.removeAll()
             notice = "Input disabled. Your draft stays local."
@@ -320,10 +331,10 @@ private struct CmuxPendingCreation: Codable {
         guard canSend, let identity = draftIdentity, let terminalID = selectedID else { return }
         guard draft.text.utf8.count <= 32 * 1024 else { notice = "Send at most 32 KiB in one prompt."; return }
         saveTask?.cancel(); saveTask = nil
-        let connection = connectionGeneration, attachment = attachmentGeneration, profileID = attachedProfileID
-        let current = { self.connectionGeneration == connection && self.attachmentGeneration == attachment && self.attachedProfileID == profileID && self.selectedID == terminalID && self.draftIdentity == identity }
+        let connection = connectionGeneration, attachment = attachmentGeneration, input = inputGeneration, profileID = attachedProfileID
+        let current = { self.connectionGeneration == connection && self.attachmentGeneration == attachment && self.inputGeneration == input && !self.inputFenced && !self.disconnecting && self.attachedProfileID == profileID && self.selectedID == terminalID && self.draftIdentity == identity }
         sending = true; busy = true; busyAttachment = attachment
-        defer { sending = false; if current() { busy = false; busyAttachment = nil } }
+        defer { sending = false; if self.connectionGeneration == connection && self.attachmentGeneration == attachment { busy = false; busyAttachment = nil } }
         let requestID = UUID().uuidString, text = draft.text, previousPending = draft.pending
         draft.pending = PendingSend(id: requestID, text: text); draftVersion += 1
         do { try await saveRecord(draft, identity: identity) }
@@ -393,7 +404,7 @@ private struct CmuxPendingCreation: Codable {
     }
 
     func raw(_ text: String) {
-        guard inputEnabled, directInput, attached, snapshotReady, connected else { return }
+        guard inputEnabled, directInput, attached, snapshotReady, connected, !inputFenced, !disconnecting else { return }
         let bytes = Data(text.utf8)
         guard queuedInput.count + bytes.count <= 32 * 1024 else {
             queuedInput.removeAll(); inputEnabled = false; directInput = false
@@ -401,12 +412,15 @@ private struct CmuxPendingCreation: Codable {
         }
         queuedInput.append(bytes)
         guard !sendingRaw else { return }; sendingRaw = true
-        let generation = attachmentGeneration
+        let generation = attachmentGeneration, input = inputGeneration
         Task {
             defer { if generation == attachmentGeneration { sendingRaw = false } }
-            while !queuedInput.isEmpty && inputEnabled && directInput && attachmentGeneration == generation {
+            while !queuedInput.isEmpty && inputEnabled && directInput && attachmentGeneration == generation && inputGeneration == input && !inputFenced && !disconnecting {
                 let bytes = queuedInput; queuedInput.removeAll()
-                do { _ = try await deps.send(bytes) }
+                do {
+                    guard inputGeneration == input, !inputFenced, !disconnecting else { return }
+                    _ = try await deps.send(bytes)
+                }
                 catch { if generation == attachmentGeneration { queuedInput.removeAll(); inputEnabled = false; directInput = false; notice = "Input was not confirmed. \(error.localizedDescription)" }; return }
             }
         }
@@ -507,14 +521,43 @@ private struct CmuxPendingCreation: Codable {
     }
 
     func disconnect() async throws {
+        if let activeDisconnectTask {
+            try await activeDisconnectTask.value
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.activeDisconnectTask = nil }
+            try await self.performDisconnect()
+        }
+        activeDisconnectTask = task
+        try await task.value
+    }
+
+    private func performDisconnect() async throws {
         guard !disconnecting else { return }
         disconnecting = true
         draftEditingLocked = true
+        let fencedInput = UUID()
+        inputGeneration = fencedInput
+        inputFenced = true; inputEnabled = false; directInput = false; queuedInput.removeAll()
+        defer {
+            disconnecting = false
+            draftEditingLocked = false
+            if !connected { inputFenced = false }
+        }
+        saveTask?.cancel(); saveTask = nil
+        do {
+            try await flushDraft()
+        } catch {
+            if inputGeneration == fencedInput && selectionToken == nil {
+                inputFenced = false
+            }
+            throw error
+        }
+        stopPolling()
+        saveTask?.cancel(); saveTask = nil
         selectionToken = nil
-        defer { disconnecting = false; draftEditingLocked = false }
-        saveTask?.cancel(); saveTask = nil
-        try await flushDraft(); stopPolling()
-        saveTask?.cancel(); saveTask = nil
         connectionGeneration = UUID(); attachmentGeneration = UUID()
         connected = false; connecting = false; attaching = false; sendingRaw = false; busyAttachment = nil
         inputEnabled = false; directInput = false; attached = false; snapshotReady = false; snapshotReceived = false; queuedInput.removeAll()
@@ -525,6 +568,7 @@ private struct CmuxPendingCreation: Codable {
         notice = "Connect to inspect your server terminals."
         terminals = []; selectedID = nil; attachedProfileID = ""; pipe.feed(Data(), reset: true)
         draft = DraftRecord(); draftVersion += 1; pendingCreation = nil; creationPending = false
+        inputFenced = false
     }
 
     private func saveRecord(_ record: DraftRecord, identity: String) async throws {

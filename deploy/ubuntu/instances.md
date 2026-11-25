@@ -705,6 +705,9 @@ against its source before enrolling it. A host-managed GitHub checkout
 without a remote needs a HEAD matching its recorded applied commit.
 Review the pins when a group gains a checkout, a repository changes, or a
 workspace moves. Existing authorized missions can finish inside the instance.
+The paired owner's `GET /api/intake/workspace-scope` request reports
+`verified`, `blocked` or `unconfigured` for the current checkout bindings.
+Slack independently checks channel membership and sharing before delivery.
 
 Grant the bot `channels:read` for public channel metadata and `groups:read`
 for private channel metadata. Have a workspace administrator reinstall the

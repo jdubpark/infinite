@@ -76,8 +76,9 @@ export function deliveryHold(goal: Pick<ProductGoal, "autonomy" | "standing" | "
   if (assessment.kind !== "reviewed" || assessment.result !== "inconclusive" || assessment.counts.notMet !== 0) return false;
   const detail = input.detail;
   if (detail === undefined || detail.revision !== assessment.revision || detail.head !== assessment.head) return false;
-  return detail.verdictId !== assessment.verdictId
-    || detail.criteria.filter(item => item.state === "inconclusive").every(item => item.reason === "before-delivery");
+  if (detail.verdictId !== assessment.verdictId) return true;
+  const open = detail.criteria.filter(item => item.state === "inconclusive");
+  return open.length > 0 && open.every(item => item.reason === "before-delivery");
 }
 
 /** A cycle with a verdict fails when its result is not met and its progress is not positive. */

@@ -27,7 +27,7 @@ import {
   type TeamRun,
 } from "../packages/host/src/team-types.js";
 import { teamReportToolInputSchema } from "../packages/host/src/team-mcp.js";
-import { terminalConnection } from "../packages/host/src/client-transport.js";
+import { terminalConnection, type TerminalControlAction } from "../packages/host/src/client-transport.js";
 import type { TerminalInput } from "@infinite/remote/protocol";
 import {
   goalCycleSchema,
@@ -48,7 +48,7 @@ import {
   recordedMissionFollowUpSchema,
   type MissionDecisionState,
 } from "../packages/host/src/mission-types.js";
-import { MissionService, trimFollowUps } from "../packages/host/src/missions.js";
+import { MissionService } from "../packages/host/src/missions.js";
 import { writeSealed } from "../packages/host/src/vault.js";
 import { validateWorkspaceManifest } from "../packages/host/src/workspace-checkpoint.js";
 import {
@@ -112,6 +112,9 @@ test("HTTP, WebSocket, and worker control boundaries normalize takeover: false a
 
     const invalidWorkerTakeover = { op: "control", action, actor: ACTOR, leaseId: UUID, takeover: true } as unknown as WorkerControlRequestState;
     assert.equal(workerControlRequestSchema.safeParse(normalizeWorkerControlRequest(invalidWorkerTakeover)).success, false);
+
+    const legacyWorkerWithExtra = { op: "control", action, actor: ACTOR, leaseId: UUID, takeover: false, unexpected: true } as unknown as WorkerControlRequestState;
+    assert.equal(workerControlRequestSchema.safeParse(normalizeWorkerControlRequest(legacyWorkerWithExtra)).success, false);
   }
 
   const claimBody = httpControlRequestSchema.parse({ action: "claim", takeover: true });
@@ -124,14 +127,19 @@ test("HTTP, WebSocket, and worker control boundaries normalize takeover: false a
   // @ts-expect-error TerminalInput release cannot set takeover: true
   const invalidRemoteReleaseTakeover: TerminalInput = { op: "control", requestId: UUID, action: "release", leaseId: UUID2, takeover: true };
   type ControlMethod = ReturnType<typeof terminalConnection>["control"];
-  const checkControlTyping = (control: ControlMethod) => {
+  const checkControlTyping = (control: ControlMethod, action: TerminalControlAction) => {
     void control("claim", true);
     void control("renew");
+    void control("renew", false);
     void control("release");
-    // @ts-expect-error client-transport control rejects takeover argument on renew
+    void control(action);
+    void control(action, false);
+    // @ts-expect-error client-transport control rejects takeover: true on renew
     void control("renew", true);
-    // @ts-expect-error client-transport control rejects takeover argument on release
+    // @ts-expect-error client-transport control rejects takeover: true on release
     void control("release", true);
+    // @ts-expect-error client-transport control rejects takeover: true on union TerminalControlAction
+    void control(action, true);
   };
   assert.ok(validRemoteRenew && validRemoteClaim && invalidRemoteRenewTakeover && invalidRemoteReleaseTakeover && checkControlTyping);
 });
@@ -173,7 +181,28 @@ test("live teamReportEnvelopeSchema and MCP JSON schema enforce structural deliv
   const recordedLegacyEnvelope: RecordedTeamReportEnvelope = { ...envelopeBase, report: legacyOwnedBranch };
   // @ts-expect-error live TeamReportEnvelope owned-branch requires remoteHeadCommit
   const invalidLiveEnvelope: TeamReportEnvelope = { ...envelopeBase, report: legacyOwnedBranch };
-  assert.ok(recordedLegacyEnvelope && invalidLiveEnvelope);
+  const prebuiltNoPubWithRemote = {
+    kind: "delivery-reconciliation" as const,
+    headCommit: HASH,
+    repository: "example/app",
+    branch: "infinite/feat",
+    baseHeadCommit: BASE_HASH,
+    disposition: "no-publication" as const,
+    remoteHeadCommit: HASH,
+    summary: "Invalid remote head on no-publication.",
+  };
+  // @ts-expect-error prebuilt no-publication variable carrying remoteHeadCommit cannot assign to live envelope report
+  const invalidNoPubLiveReport: TeamReportEnvelope["report"] = prebuiltNoPubWithRemote;
+  const prebuiltApproveWithPaths = {
+    kind: "permission-decision" as const,
+    decisionId: UUID,
+    verdict: "approve-once" as const,
+    summary: "In scope.",
+    requestedPaths: ["package.json"],
+  };
+  // @ts-expect-error prebuilt approve-once variable carrying requestedPaths cannot assign to live envelope report
+  const invalidApproveLiveReport: TeamReportEnvelope["report"] = prebuiltApproveWithPaths;
+  assert.ok(recordedLegacyEnvelope && invalidLiveEnvelope && invalidNoPubLiveReport && invalidApproveLiveReport);
 
   assert.equal(strictDeliveryReconciliationReportSchema.safeParse(legacyOwnedBranch).success, false);
   assert.equal(strictDeliveryReconciliationReportSchema.safeParse(strictOwnedBranch).success, true);
@@ -390,7 +419,7 @@ test("CreateGoal, TeamProject, MissionDecisionState, and TeamRun enforce strict 
   assert.ok(invalidForwardedMissionDecision && invalidRunCheck && invalidRunAgentDecision && invalidRunPublication);
 });
 
-test("MissionService loads legacy settled follow-ups without synthesizing settledAt from future dueAt and trims safely", () => {
+test("MissionService loads legacy settled follow-ups without synthesizing settledAt, trims via cancel transition, and persists cleanly across reload", async () => {
   const dir = mkdtempSync(join(tmpdir(), "inf-mission-legacy-followup-"));
   const stateDir = join(dir, "state");
   mkdirSync(join(stateDir, "missions"), { recursive: true });
@@ -405,8 +434,16 @@ test("MissionService loads legacy settled follow-ups without synthesizing settle
     createdAt: AT,
     state: "cancelled" as const,
   };
+  const openFollowUp = {
+    id: "f-open-current",
+    dueAt: futureDueAt,
+    reason: "Wait for CI",
+    check: "Inspect CI",
+    createdAt: AT,
+    state: "open" as const,
+  };
   assert.equal(recordedMissionFollowUpSchema.safeParse(legacyCancelled).success, true);
-  const timestampedSettled = Array.from({ length: 11 }, (_, index) => ({
+  const timestampedSettled = Array.from({ length: 10 }, (_, index) => ({
     id: `f-${index}`,
     dueAt: `2026-11-25T12:${String(index).padStart(2, "0")}:00.000Z`,
     reason: `Check ${index}`,
@@ -415,6 +452,7 @@ test("MissionService loads legacy settled follow-ups without synthesizing settle
     state: "fired" as const,
     settledAt: `2026-11-25T12:${String(index).padStart(2, "0")}:30.000Z`,
   }));
+  const missionProfile = { id: "lead", label: "Lead", provider: "claude" as const, model: "claude-opus-4-6", effort: "high" as const, tier: "strong" as const };
   const stored = {
     mission: {
       id: missionId,
@@ -424,40 +462,62 @@ test("MissionService loads legacy settled follow-ups without synthesizing settle
       title: "Legacy mission",
       objective: "Verify legacy follow-up load",
       mode: "work",
-      status: "ready-for-review",
+      revision: 1,
+      status: "working",
       createdAt: AT,
       updatedAt: LATER,
-      deadlineAt: LATER,
-      ceilingAt: LATER,
+      deadlineAt: futureDueAt,
       maxSubtasks: 4,
-      maxTotalMinutes: 60,
+      maxMinutes: 60,
+      lineup: { coordinator: missionProfile, integrator: missionProfile, reviewer: missionProfile, implementers: [missionProfile] },
       subtasks: [],
       decisions: [],
-      followUps: [legacyCancelled, ...timestampedSettled],
+      followUps: [legacyCancelled, ...timestampedSettled, openFollowUp],
       steering: [],
       events: [],
     },
+    fingerprint: "f".repeat(64),
+    folder: "legacy-mission",
+    repos: [],
     attempts: [],
     inbox: [],
     notes: [],
+    notified: [],
     launches: {},
+    ops: [],
     receipts: {},
+    refusals: 0,
   };
   writeSealed(join(stateDir, "missions", `${missionId}.sealed`), key, `mission:${missionId}`, stored);
   const config = { stateDir } as unknown as Config;
   const service = new MissionService(config, key, {} as never, { useMissionReservations() {} } as never, {} as never);
+  let reloadedService: MissionService | undefined;
   try {
     const loaded = service.peek(missionId);
     assert.ok(loaded);
     const legacyEntry = loaded.followUps?.find(item => item.id === "f-legacy-cancelled");
     assert.ok(legacyEntry);
     assert.equal(legacyEntry.state, "cancelled");
-    assert.equal(legacyEntry.settledAt, undefined);
-    trimFollowUps(loaded);
-    assert.equal(loaded.followUps?.length, 10);
-    assert.deepEqual(loaded.followUps?.map(item => item.id), timestampedSettled.slice(1).map(item => item.id));
+    const legacySettledAt: string | undefined = legacyEntry.settledAt;
+    assert.equal(legacySettledAt, undefined);
+
+    await service.cancel(missionId, { requestId: UUID2, revision: 1 });
+    await service.close();
+
+    reloadedService = new MissionService(config, key, {} as never, { useMissionReservations() {} } as never, {} as never);
+    const persisted = reloadedService.peek(missionId);
+    assert.ok(persisted);
+    assert.equal(persisted.status, "cancelled");
+    assert.equal(persisted.followUps?.length, 10);
+    assert.deepEqual(
+      persisted.followUps?.map(item => item.id),
+      [...timestampedSettled.slice(1).map(item => item.id), "f-open-current"],
+    );
+    const newlyCancelled = persisted.followUps?.find(item => item.id === "f-open-current");
+    assert.ok(newlyCancelled && newlyCancelled.state === "cancelled" && typeof newlyCancelled.settledAt === "string");
   } finally {
-    service.close();
+    await service.close();
+    await reloadedService?.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });

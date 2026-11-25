@@ -62,7 +62,7 @@ import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-openco
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
 import { JsonLineAssembler, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
-import { normalizeWorkerControlRequest, teamAnswerWorkerRequestSchema, workerControlRequestSchema,
+import { normalizeWorkerControlRequest, teamAnswerWorkerRequestSchema, workerControlRequestSchema, workerWorkspaceExportRequestSchema,
   type Bootstrap,
   type ControlActor,
   type ControlLease,
@@ -1282,10 +1282,10 @@ const server = createServer((socket) => {
             !["starting", "running"].includes(state.status)) throw new Refusal("unsupported");
         result = executor.attach();
       } else if (request.op === "workspace-export") {
-        if (!hybrid || !["sync/export", "sync/blob"].includes(request.method)) throw new Refusal("unsupported");
-        if (request.method === "sync/blob" && typeof request.hash !== "string") throw new Error("A content hash is required");
-        if (request.method === "sync/export" && request.hash !== undefined) throw new Error("sync/export does not accept a content hash");
-        result = await hybrid.control(request.method, request.method === "sync/blob" ? { hash: request.hash } : {});
+        const parsed = workerWorkspaceExportRequestSchema.safeParse(request);
+        if (!parsed.success) throw new Error(!["sync/export", "sync/blob"].includes(String((request as { method?: unknown }).method)) ? "Unsupported workspace export method" : request.method === "sync/blob" && request.hash === undefined ? "A content hash is required" : "Invalid workspace export request");
+        if (!hybrid) throw new Refusal("unsupported");
+        result = await hybrid.control(parsed.data.method, parsed.data.method === "sync/blob" ? { hash: parsed.data.hash } : {});
       } else if (request.op === "native-connect") {
         result = await serialize(() => {
           if (!native || !request.actor || !request.leaseId || state.status !== "running") throw new Refusal("unsupported");

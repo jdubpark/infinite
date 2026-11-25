@@ -15,6 +15,7 @@ export class TerminalControlError extends Error {
   }
 }
 
+export type TerminalControlAction = "claim" | "renew" | "release";
 type ConnectionOptions = { snapshot?: boolean; control?: boolean; clientId?: string };
 export function terminalConnection(origin: string, token: string, sessionId: string, after: number, signal: AbortSignal, options: ConnectionOptions = {}) {
   const url = new URL(`/api/sessions/${sessionId}/terminal?after=${after}`, origin);
@@ -90,8 +91,8 @@ export function terminalConnection(origin: string, token: string, sessionId: str
     });
   };
   function control(action: "claim", takeover?: boolean): Promise<ControlLease | null>;
-  function control(action: "renew" | "release"): Promise<ControlLease | null>;
-  function control(action: "claim" | "renew" | "release", takeover = false): Promise<ControlLease | null> {
+  function control(action: TerminalControlAction, takeover?: false): Promise<ControlLease | null>;
+  function control(action: TerminalControlAction, takeover = false): Promise<ControlLease | null> {
     const requestId = randomUUID();
     if (controls.size >= 4) return Promise.reject(new Error("A control request is already pending"));
     return new Promise((resolve, reject) => {

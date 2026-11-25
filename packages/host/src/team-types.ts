@@ -23,6 +23,8 @@ import {
   githubRepositorySchema,
   permissionDecisionReportSchema,
   teamCommandSchema,
+  type DeliveryReconciliationReport,
+  type PermissionDecisionReport,
   type TeamCheck,
   type TeamCommand,
   type TeamDecision,
@@ -562,10 +564,20 @@ export const teamReportSchema = z.discriminatedUnion("kind", [...sharedTeamRepor
 export const recordedTeamReportSchema = z.discriminatedUnion("kind", [...sharedTeamReportVariants,
   recordedDeliveryReconciliationReportSchema,
   z.object({ ...questionReportShape, recommendation: questionRecommendationSchema.optional() }).strict().superRefine(refineQuestion)]);
+export type LiveTeamReport =
+  | Exclude<z.infer<typeof liveTeamReportSchema>, { kind: "delivery-reconciliation" | "permission-decision" }>
+  | DeliveryReconciliationReport
+  | PermissionDecisionReport;
 export type TeamReport = z.infer<typeof recordedTeamReportSchema>;
 export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: liveTeamReportSchema }).strict();
 export const recordedTeamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: recordedTeamReportSchema }).strict();
-export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
+export interface TeamReportEnvelope {
+  requestId: string;
+  runId: string;
+  memberId: string;
+  revision: number;
+  report: LiveTeamReport;
+}
 export type RecordedTeamReportEnvelope = z.infer<typeof recordedTeamReportEnvelopeSchema>;
 export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole | "mission-coordinator"; taskId?: string; verificationRefused?: true; entryTools?: true; hostProfiles?: true };
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";

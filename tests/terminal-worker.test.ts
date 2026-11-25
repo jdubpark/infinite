@@ -359,6 +359,10 @@ test("worker control fences input and resize, keeps retry receipts stable, and r
     for (const action of ["renew", "release"] as const)
       await assert.rejects(worker.call({ op: "control", action, actor: b } as unknown as WorkerRequest), { code: "control-lost" });
     await assert.rejects(worker.call({ op: "control", action: "renew", actor: b, leaseId: leaseB.id, takeover: true } as unknown as WorkerRequest), /Invalid session control/);
+    await assert.rejects(worker.call({ op: "workspace-export", method: "sync/blob", hash: "A".repeat(64) } as unknown as WorkerRequest), /Invalid workspace export request/);
+    await assert.rejects(worker.call({ op: "workspace-export", method: "sync/export", extra: true } as unknown as WorkerRequest), /Invalid workspace export request/);
+    await assert.rejects(worker.call({ op: "workspace-export", method: "sync/blob" } as unknown as WorkerRequest), /A content hash is required/);
+    await assert.rejects(worker.call({ op: "workspace-export", method: "sync/export" }), { code: "unsupported" });
     await worker.call({ op: "control", action: "release", actor: b, leaseId: leaseB.id, takeover: false } as unknown as WorkerRequest);
     await worker.command("released");
     const lease = await worker.call<ControlLease>({ op: "control", action: "claim", actor: a });

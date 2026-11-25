@@ -325,7 +325,7 @@ export interface Mission {
   steering: { text: string; revision: number; at: string; source?: MissionInputSource }[];
   events: { at: string; text: string }[];
   result?: { summary: string; revision: number; at: string };
-  followUps?: MissionFollowUp[];
+  followUps?: RecordedMissionFollowUp[];
   usage?: UsageRollup;
 }
 

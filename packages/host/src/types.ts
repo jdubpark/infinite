@@ -484,7 +484,8 @@ export function normalizeControlRequest(
 }
 export function normalizeWorkerControlRequest(request: WorkerControlRequestState): WorkerControlRequestState {
   if (request.action !== "claim" && (request as { takeover?: unknown }).takeover === false) {
-    return { op: "control", action: request.action, actor: request.actor, leaseId: request.leaseId };
+    const { takeover: _takeover, ...rest } = request as WorkerControlRequestState & { takeover?: unknown };
+    return rest as WorkerControlRequestState;
   }
   return request;
 }

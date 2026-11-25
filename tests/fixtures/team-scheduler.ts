@@ -10,7 +10,7 @@ import type { EventOutbox } from "../../packages/host/src/evidence/outbox.js";
 import type { LinearService } from "../../packages/host/src/linear.js";
 import type { Manager } from "../../packages/host/src/manager.js";
 import type { Config, WorkerState } from "../../packages/host/src/types.js";
-import type { TeamAssignment, TeamModelProfile, TeamReportEnvelope, TeamRun } from "../../packages/host/src/team-types.js";
+import type { RecordedTeamReportEnvelope, TeamAssignment, TeamModelProfile, TeamRun } from "../../packages/host/src/team-types.js";
 import { TeamService, type TeamServiceOptions } from "../../packages/host/src/teams.js";
 import { Journal, readEvents, unseal, writeSealed } from "../../packages/host/src/vault.js";
 
@@ -104,7 +104,7 @@ export function schedulerFixture() {
       current.status = "exited";
       delete current.nativeSession;
     },
-    report: (session: string, envelope: TeamReportEnvelope) => {
+    report: (session: string, envelope: RecordedTeamReportEnvelope) => {
       const currentJournal = journals.get(session);
       assert.ok(currentJournal, "The report session was not launched by this fixture");
       return currentJournal.append("team-report", envelope);

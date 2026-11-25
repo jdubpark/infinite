@@ -34,6 +34,15 @@ import InfiniteCore
         XCTAssertEqual(model.run.revision, 3)
     }
 
+    func testADirectionSourceIsLabelledByItsKind() {
+        XCTAssertEqual(directionSourceLabel(.object(["kind": .string("github-review"), "name": .string("Your GitHub review")])), "Owner (GitHub review)")
+        XCTAssertEqual(directionSourceLabel(.object(["kind": .string("connector"), "name": .string("Ops bot")])), "Ops bot")
+        XCTAssertEqual(directionSourceLabel(.object(["kind": .string("connector"), "name": .string("")])), "Connector")
+        XCTAssertEqual(directionSourceLabel(.string("coordinator")), "Mission coordinator")
+        XCTAssertEqual(directionSourceLabel(.object(["kind": .string("unknown"), "name": .string("Other")])), "You")
+        XCTAssertEqual(directionSourceLabel(.null), "You")
+    }
+
     func testAListRowNeverReplacesAFullRead() {
         let model = model(run("2026-01-01T00:00:00.000Z"))
         let full = run("2026-01-01T00:00:01.000Z", objective: "Export the report")

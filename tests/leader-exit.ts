@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 
 export const LEADER_LEAVES = resolve("tests/fixtures/leader-leaves.mjs");
 export type LeftBehind = { leader: number; holder: number; witness: number };
+export type Stubborn = { leader: number; member: number };
 
 export function gone(pid: number): boolean {
   try {
@@ -22,9 +23,18 @@ export async function until(what: string, ready: () => boolean, limitMs = 10_000
   }
 }
 
-export function leftBehind(record: string): LeftBehind | undefined {
+function recorded(record: string): Record<string, number> | undefined {
   const text = existsSync(record) ? readFileSync(record, "utf8") : "";
-  return text.endsWith("\n") ? JSON.parse(text) as LeftBehind : undefined;
+  return text.endsWith("\n") ? JSON.parse(text) as Record<string, number> : undefined;
+}
+
+export function leftBehind(record: string): LeftBehind | undefined {
+  return recorded(record) as LeftBehind | undefined;
+}
+
+export async function stubbornMember(record: string): Promise<Stubborn> {
+  await until("the leader records its member that ignores SIGTERM", () => recorded(record)?.member !== undefined);
+  return recorded(record) as Stubborn;
 }
 
 export async function leaderGone(record: string): Promise<LeftBehind> {
@@ -35,8 +45,8 @@ export async function leaderGone(record: string): Promise<LeftBehind> {
 }
 
 export function endLeftBehind(record: string) {
-  const left = leftBehind(record);
-  for (const pid of left ? [left.holder, left.witness] : [])
+  const left = Object.entries(recorded(record) ?? {}).filter(([role]) => role !== "leader");
+  for (const [, pid] of left)
     if (Number.isSafeInteger(pid) && pid > 1 && !gone(pid)) process.kill(pid, "SIGKILL");
 }
 

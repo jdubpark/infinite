@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { initialAttention } from "@infinite/attention";
 import { GoalService } from "../packages/host/src/goals.js";
@@ -360,6 +360,27 @@ test("a run at its attempt limit settles without an evaluator", { timeout: 12000
     assert.equal(view.members.length, 60, "no member was added");
     assert.equal(view.assessment?.result, "inconclusive");
     assert.equal(view.assessment?.reason, "evaluator-unavailable");
+  } finally { f.close(); }
+});
+
+test("an evaluator whose working copy cannot be prepared settles the run without it", { timeout: 120000 }, async () => {
+  const f = schedulerFixture();
+  const members = join(f.run.workspace, "..", "members");
+  try {
+    activeSessions(f);
+    seedReviewed(f, { rank: "passed" });
+    // The review is approved. The host refuses a members directory that is a link, so the evaluator's checkout cannot be made.
+    rmSync(members, { recursive: true, force: true });
+    symlinkSync(join(f.run.workspace, ".."), members);
+    const teams = f.openTeam();
+    teams.start();
+    const view = await waitFor(() => Promise.resolve(teams.get(f.run.id)), current => TERMINAL.includes(current.status), 60000);
+    teams.close();
+    assert.equal(view.status, "ready-for-review", JSON.stringify(view.events.slice(-5)));
+    assert.equal(view.assessment?.result, "inconclusive");
+    assert.equal(view.assessment?.reason, "evaluator-unavailable");
+    assert.equal(evaluators(view).length, 0, "no evaluator was added");
+    assert.equal(storedOf(teams, f.run.id).pending, undefined, "no failed operation stays on the run");
   } finally { f.close(); }
 });
 

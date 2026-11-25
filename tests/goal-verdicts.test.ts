@@ -78,7 +78,7 @@ test("cycle verdicts copy the current revision and compute progress", () => {
   assert.equal(Object.hasOwn(dropped, "supersededVerdictIds"), true);
   assert.equal(dropped.supersededVerdictIds, undefined);
   assert.equal(Object.hasOwn(gone, "supersededVerdictIds"), true);
-  const fresh = cycleVerdict(goal({ cycles: [plain] }), plain, team({ assessment: current }));
+  const fresh = cycleVerdict(goal({ cycles: [plain] }), plain, team({ revision: 2, assessment: current }));
   assert.deepEqual(Object.keys(fresh), ["assessment"]);
   const same = cycle(1, { assessment: { ...current, progress: 1 }, supersededVerdictIds: ["old"] });
   const again = cycleVerdict(goal({ cycles: [same] }), same, team({ revision: 2, assessment: current }));
@@ -248,8 +248,9 @@ test("the outcome rules refuse a wrong verdict answer", () => {
   const replaced = stopped({}).goal;
   replaced.cycles[0]!.supersededVerdictIds = [earlier];
   assert.equal(refusal(replaced, outcome({ verdictId: earlier })), "none");
+  assert.equal(refusal(replaced, outcome({ verdictId: earlier, continue: true })), "none");
+  replaced.cycles.push(cycle(2, { assessment: { ...assessment(), progress: 1 } }));
   assert.equal(refusal(replaced, outcome({ verdictId: earlier, continue: true })), "goal-not-provisional");
-  assert.equal(refusal(replaced, outcome({ verdictId: replaced.cycles[0]!.assessment!.verdictId, continue: true })), "none");
   assert.equal(goalOutcomeSchema.safeParse(outcome({ verdictId: held.verdictId, continue: true, result: "achieved" })).success, false);
   assert.equal(goalOutcomeSchema.safeParse(outcome({ continue: true })).success, false);
   assert.equal(goalOutcomeSchema.safeParse(outcome({ verdictId: held.verdictId })).success, true);

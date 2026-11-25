@@ -1,5 +1,6 @@
 import type { GoalAssessment, GoalCycle, GoalOutcomeInput, ProductGoal } from "./goal-types.js";
 import type { TeamView } from "./team-types.js";
+import type { VerdictDetail } from "./team-verdicts.js";
 import type { CriteriaRow } from "./verdict-types.js";
 import type { Project } from "./types.js";
 import { autonomyOf } from "./autonomy.js";
@@ -10,6 +11,9 @@ import { TeamError } from "./team-workspace.js";
 
 export const PROVISIONAL_REASON = "An agent assessment, provisional, found every criterion met. Record your assessment: achieved, or not achieved with continue.";
 export const PROVISIONAL_EVENT = "Agent assessment, provisional: every criterion met. The goal stopped for your assessment and is not marked achieved.";
+export const DELIVERY_HOLD_MS = 600_000;
+export const DELIVERY_HOLD_REASON = "Waiting up to 10 minutes for the host to see this delivery on the base branch before the next feature starts.";
+export const LATE_RECEIPT_EVENT = "A delivery receipt changed a cycle's agent assessment.";
 export const CONTINUE_EVENT = "You recorded not achieved and continued the goal. The next cycle reads your direction.";
 
 const STEERING_ENTRIES = 20;
@@ -18,15 +22,62 @@ const STEERING_BYTES = 24000;
 /** The newest cycle that holds an assessment. */
 const newestAssessed = (cycles: readonly GoalCycle[]): GoalCycle | undefined => [...cycles].reverse().find(item => item.assessment !== undefined);
 
+/** The cycle's current verdict id first, then the superseded ids newest first. */
+export function verdictIdsOf(cycle: Pick<GoalCycle, "assessment" | "supersededVerdictIds">): string[] {
+  return cycle.assessment === undefined ? [] : [cycle.assessment.verdictId, ...[...(cycle.supersededVerdictIds ?? [])].reverse()];
+}
+
 /**
  * For refresh's Object.assign: {} when neither the team nor the cycle has an assessment; the team's current one with its
- * progress; { assessment: undefined } when the cycle has one and the team's is gone or of another revision.
+ * progress. Another verdict id at the cycle's revision and head also returns the superseded list (last 4); another
+ * revision or head, or a team assessment that is gone, returns `supersededVerdictIds: undefined`, which drops the list.
  */
-export function cycleVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle, team: Pick<TeamView, "revision" | "assessment">): { assessment?: GoalAssessment } {
+export function cycleVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle, team: Pick<TeamView, "revision" | "assessment">): { assessment?: GoalAssessment; supersededVerdictIds?: string[] } {
   const current = team.assessment !== undefined && team.assessment.revision === team.revision ? team.assessment : undefined;
-  if (current === undefined) return cycle.assessment === undefined ? {} : { assessment: undefined };
+  if (current === undefined) return cycle.assessment === undefined ? {} : { assessment: undefined, supersededVerdictIds: undefined };
   const earlier = newestAssessed(goal.cycles.filter(item => item.cycle < cycle.cycle));
-  return { assessment: { ...current, progress: current.counts.met - (earlier?.assessment?.counts.met ?? 0) } };
+  const assessment = { ...current, progress: current.counts.met - (earlier?.assessment?.counts.met ?? 0) };
+  const held = cycle.assessment;
+  if (held === undefined || held.verdictId === current.verdictId) return { assessment };
+  if (held.revision === current.revision && held.head === current.head) return { assessment, supersededVerdictIds: [...(cycle.supersededVerdictIds ?? []), held.verdictId].slice(-4) };
+  return { assessment, supersededVerdictIds: undefined };
+}
+
+/** The copy a late delivery receipt makes: the team's current verdict replaces the cycle's at the same revision and head. */
+export function lateVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle, team: Pick<TeamView, "revision" | "assessment">):
+  { assessment: GoalAssessment; supersededVerdictIds: string[] } | undefined {
+  const held = cycle.assessment;
+  const current = team.assessment;
+  if (held === undefined || current === undefined || current.revision !== team.revision) return undefined;
+  if (current.verdictId === held.verdictId || current.revision !== held.revision || current.head !== held.head) return undefined;
+  const copy = cycleVerdict(goal, cycle, team);
+  return copy.assessment === undefined || copy.supersededVerdictIds === undefined ? undefined : { assessment: copy.assessment, supersededVerdictIds: copy.supersededVerdictIds };
+}
+
+/** True when a late receipt turned the newest cycle of an idle autonomous finite goal into a met reviewed verdict. */
+export function lateStop(goal: ProductGoal, cycle: GoalCycle, busy: boolean): boolean {
+  if (goal.status !== "running" || goal.activeTeamId !== undefined || busy || goal.cycles.at(-1) !== cycle) return false;
+  if (autonomyOf(goal) !== "autonomous" || goal.standing !== undefined) return false;
+  return cycle.assessment?.kind === "reviewed" && cycle.assessment.result === "met";
+}
+
+/**
+ * True while the next launch waits for the host to see the newest cycle's delivery: at most DELIVERY_HOLD_MS after the
+ * cycle finished, for a scanned project, while the verdict is inconclusive for no reason but the missing delivery.
+ */
+export function deliveryHold(goal: Pick<ProductGoal, "autonomy" | "standing" | "cycles">,
+  input: { nowMs: number; scanned: boolean; detail?: Pick<VerdictDetail, "verdictId" | "revision" | "head" | "criteria"> }): boolean {
+  if (autonomyOf(goal) !== "autonomous" || goal.standing !== undefined || !input.scanned) return false;
+  const cycle = goal.cycles.at(-1);
+  const assessment = cycle?.assessment;
+  if (cycle === undefined || assessment === undefined || cycle.status !== "merged" || cycle.finishedAt === undefined) return false;
+  const waited = input.nowMs - Date.parse(cycle.finishedAt);
+  if (!(waited >= 0 && waited < DELIVERY_HOLD_MS)) return false;
+  if (assessment.kind !== "reviewed" || assessment.result !== "inconclusive" || assessment.counts.notMet !== 0) return false;
+  const detail = input.detail;
+  if (detail === undefined || detail.revision !== assessment.revision || detail.head !== assessment.head) return false;
+  return detail.verdictId !== assessment.verdictId
+    || detail.criteria.filter(item => item.state === "inconclusive").every(item => item.reason === "before-delivery");
 }
 
 /** A cycle with a verdict fails when its result is not met and its progress is not positive. */
@@ -47,10 +98,10 @@ const ceilingOf = (goal: ProductGoal) => goal.ceilingAt ?? new Date(Date.parse(g
 /** Throws TeamError before anything is admitted. */
 export function assertVerdictAnswer(goal: ProductGoal, body: GoalOutcomeInput, nowMs: number): void {
   if (body.verdictId === undefined) return;
-  if (!goal.cycles.some(item => item.assessment?.verdictId === body.verdictId))
+  if (!goal.cycles.some(item => verdictIdsOf(item).includes(body.verdictId!)))
     throw new TeamError(409, "verdict-not-found", "That agent assessment is not one of this goal's.");
   if (body.continue !== true) return;
-  if (goal.stopReason !== "provisional-met" || newestAssessed(goal.cycles)?.assessment?.verdictId !== body.verdictId)
+  if (goal.stopReason !== "provisional-met" || !verdictIdsOf(newestAssessed(goal.cycles) ?? {}).includes(body.verdictId))
     throw new TeamError(409, "goal-not-provisional", "Continue applies only to a goal stopped by a provisional agent assessment.");
   if (nowMs >= Date.parse(goal.deadlineAt) || nowMs >= Date.parse(ceilingOf(goal)) || goal.memberCount >= goal.maxMembers || goal.cycles.length >= (goal.maxRuns ?? 0))
     throw new TeamError(409, "goal-limit-reached", "The goal's time, member, or feature-run allowance is spent. Start a new goal to continue.");

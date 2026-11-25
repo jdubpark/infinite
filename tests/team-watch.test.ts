@@ -23,6 +23,12 @@ const team = {
   events: [{ text: "Coordinator started the fresh plan" }],
 };
 
+test("the web monitor lists an evaluator right after a reviewer", () => {
+  const member = (memberId: string, role: string) => ({ memberId, sessionId: `s-${memberId}`, role, revision: 1, title: memberId, status: "running" });
+  const ordered = monitorMembers([member("delivery", "delivery"), member("evaluator", "evaluator"), member("reviewer", "reviewer")], 1);
+  assert.deepEqual(ordered.map(item => item.memberId), ["reviewer", "evaluator", "delivery"]);
+});
+
 test("a question prints the asking agent's recommendation before its options", () => {
   const question = { id: "q1", revision: 2, question: "Which store?", options: ["SQLite", "Files"], recommendation: { answers: ["SQLite"], reason: "One writer." } };
   assert.deepEqual(openQuestionLines(question), ["Question q1: Which store?", "  The asking agent recommends: SQLite. Reason: One writer.", "  1. SQLite", "  2. Files"]);

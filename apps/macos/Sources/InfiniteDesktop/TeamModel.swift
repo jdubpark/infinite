@@ -28,6 +28,12 @@ enum MutationState: Equatable {
 }
 
 @MainActor final class TeamModel: ObservableObject {
+    private enum PollOutcome {
+        case updated
+        case skipped
+        case failed(String)
+    }
+
     private enum ReadCoverage {
         case listSeedOnly
         case fullRead(latestListRow: TeamRun?)
@@ -46,6 +52,7 @@ enum MutationState: Equatable {
 
     let role: String
     private let client: RemoteClient
+    private let sendRequest: @Sendable (RemoteClient, String, JSON?) async throws -> JSON
     private var pollTask: Task<Void, Never>?
     private var pageShown = false
     private var displayVisible = false
@@ -69,10 +76,16 @@ enum MutationState: Equatable {
     private var pollGeneration = UUID()
     private lazy var freshness = DisplayFreshness { [weak self] in self?.displayStale = $0 }
 
-    init(run: TeamRun, client: RemoteClient, role: String) {
+    init(
+        run: TeamRun,
+        client: RemoteClient,
+        role: String,
+        sendRequest: @escaping @Sendable (RemoteClient, String, JSON?) async throws -> JSON = { try await $0.request($1, body: $2) }
+    ) {
         self.run = run
         self.client = client
         self.role = role
+        self.sendRequest = sendRequest
     }
 
     var id: String { run.id }
@@ -156,22 +169,28 @@ enum MutationState: Equatable {
     }
 
     func poll() async {
-        await poll(pollGeneration)
+        _ = await performPoll(pollGeneration)
     }
 
     private func poll(_ generation: UUID) async {
-        guard displayVisible, generation == pollGeneration else { return }
+        _ = await performPoll(generation)
+    }
+
+    private func performPoll(_ generation: UUID) async -> PollOutcome {
+        guard displayVisible, generation == pollGeneration else { return .skipped }
         do {
-            let value = try await client.request("/teams/\(run.id)")
-            guard displayVisible, generation == pollGeneration else { return }
+            let value = try await sendRequest(client, "/teams/\(run.id)", nil)
+            guard displayVisible, generation == pollGeneration else { return .skipped }
             observe(TeamRun(value))
             let current = !behind
             if fresh != current { fresh = current }
             freshness.recovered()
+            return .updated
         } catch {
-            guard displayVisible, generation == pollGeneration else { return }
+            guard displayVisible, generation == pollGeneration else { return .skipped }
             if fresh { fresh = false }
             freshness.failed()
+            return .failed(error.localizedDescription)
         }
     }
 
@@ -244,7 +263,7 @@ enum MutationState: Equatable {
     private func send(_ mutation: TeamMutation, retrying: Bool) async {
         mutationState = .sending(pending: retrying ? mutation : nil)
         do {
-            let result = try await client.request(mutation.path, body: mutation.body)
+            let result = try await sendRequest(client, mutation.path, mutation.body)
             let next = TeamRun(result)
             observe(next)
             mutationState = .idle
@@ -257,10 +276,17 @@ enum MutationState: Equatable {
             notice = "Delivery unconfirmed. Retry sends this exact request."
             noticeIsError = true
         } catch let error as DesktopError where (400...499).contains(error.status) {
+            let outcome = await performPoll(pollGeneration)
             mutationState = .idle
-            notice = error.message + " The team was refreshed; review it before sending again."
+            switch outcome {
+            case .updated:
+                notice = error.message + " The team was refreshed; review it before sending again."
+            case .skipped:
+                notice = error.message
+            case .failed(let refreshError):
+                notice = "\(error.message) Could not refresh the team: \(refreshError)"
+            }
             noticeIsError = true
-            await poll()
         } catch {
             mutationState = .idle
             notice = error.localizedDescription

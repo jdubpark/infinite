@@ -788,4 +788,122 @@ private actor CmuxFakeBackend {
         let sent = await fake.sentBytes
         XCTAssertEqual(sent, [Data("new".utf8)])
     }
+
+    func testSendClearsBusyOperationWhenTerminalExitsDuringPaste() async throws {
+        let fake = CmuxFakeBackend()
+        let pasteGate = CmuxDeferred<Void>()
+        let deps = CmuxViewModelDependencies(
+            helperURL: { URL(fileURLWithPath: "/nonexistent/cmux") },
+            connect: { _, _, _, _, _ in },
+            snapshot: { await fake.snapshot() },
+            attach: { id, handler in
+                await fake.setOutput(id, handler)
+                handler(.snapshot(Data("ok".utf8), columns: 80, rows: 24))
+            },
+            detach: {},
+            disconnect: {},
+            paste: { text in
+                await fake.recordPaste(text)
+                try await pasteGate.wait()
+                return .queued
+            },
+            send: { data in
+                await fake.recordSend(data)
+                return .queued
+            },
+            resize: { _, _ in },
+            createTerminal: { _, _, _, _ in "term-created" },
+            closeTerminal: { _, _ in },
+            readDraft: { await fake.read($0) },
+            saveDraft: { draft, key in await fake.save(draft, key: key) },
+            acquireMutation: { key, text in await fake.acquireMutation(key, text: text) },
+            clearDraftIfMatching: { id, key in await fake.clearIfMatching(id, key: key) }
+        )
+
+        let model = CmuxViewModel(deps: deps)
+        model.profiles = [CmuxHostProfile(id: "p1", label: "Host", route: "wss://cmux.example/v1/link")]
+        model.activeID = "p1"
+        model.setDisplayVisible(true)
+        await model.connect()
+        try await Task.sleep(for: .milliseconds(50))
+        model.rendererRestored(model.rendererGeneration)
+        model.setInputEnabled(true)
+        model.setDraft("exit mid-paste")
+
+        let sendTask = Task { await model.send() }
+        await pasteGate.waitUntilEntered()
+        XCTAssertTrue(model.busy)
+        XCTAssertTrue(model.sending)
+
+        await fake.emit("term-1", .exited)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(model.attached)
+
+        await pasteGate.succeed(())
+        await sendTask.value
+
+        XCTAssertEqual(model.operation, .idle)
+        XCTAssertFalse(model.busy)
+        XCTAssertFalse(model.sending)
+    }
+
+    func testDisconnectStaysDisconnectedWhenBackendCleanupFailsAfterTeardownStarts() async throws {
+        let fake = CmuxFakeBackend()
+        actor DisconnectToggle {
+            var shouldFail = false
+            func enableFailure() { shouldFail = true }
+            func failIfEnabled() -> Bool { shouldFail }
+        }
+        let toggle = DisconnectToggle()
+        let deps = CmuxViewModelDependencies(
+            helperURL: { URL(fileURLWithPath: "/nonexistent/cmux") },
+            connect: { _, _, _, _, _ in },
+            snapshot: { await fake.snapshot() },
+            attach: { id, handler in
+                await fake.setOutput(id, handler)
+                handler(.snapshot(Data("ok".utf8), columns: 80, rows: 24))
+            },
+            detach: {},
+            disconnect: {
+                if await toggle.failIfEnabled() {
+                    throw DesktopError("Identity write failed")
+                }
+            },
+            paste: { _ in .queued },
+            send: { _ in .queued },
+            resize: { _, _ in },
+            createTerminal: { _, _, _, _ in "term-created" },
+            closeTerminal: { _, _ in },
+            readDraft: { await fake.read($0) },
+            saveDraft: { draft, key in await fake.save(draft, key: key) },
+            acquireMutation: { key, text in await fake.acquireMutation(key, text: text) },
+            clearDraftIfMatching: { id, key in await fake.clearIfMatching(id, key: key) }
+        )
+
+        let model = CmuxViewModel(deps: deps)
+        model.profiles = [CmuxHostProfile(id: "p1", label: "Host", route: "wss://cmux.example/v1/link")]
+        model.activeID = "p1"
+        model.setDisplayVisible(true)
+        await model.connect()
+        try await Task.sleep(for: .milliseconds(50))
+        model.rendererRestored(model.rendererGeneration)
+        model.setInputEnabled(true)
+        XCTAssertTrue(model.connected)
+
+        await toggle.enableFailure()
+        do {
+            try await model.disconnect()
+            XCTFail("Expected disconnect error")
+        } catch let error as DesktopError {
+            XCTAssertEqual(error.localizedDescription, "Identity write failed")
+        }
+
+        XCTAssertEqual(model.connectionPhase, .disconnected)
+        XCTAssertFalse(model.connected)
+        XCTAssertFalse(model.hasConnected)
+        XCTAssertFalse(model.disconnecting)
+        XCTAssertFalse(model.attached)
+        XCTAssertNil(model.selectedID)
+        XCTAssertEqual(model.notice, "Identity write failed")
+    }
 }

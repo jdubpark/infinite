@@ -2,6 +2,12 @@ import SwiftUI
 import InfiniteCore
 
 @MainActor final class MissionModel: ObservableObject {
+    private enum PollOutcome {
+        case updated
+        case skipped
+        case failed(String)
+    }
+
     @Published private(set) var mission: Mission
     @Published var direction = ""
     @Published private(set) var mutationState: MutationState = .idle
@@ -14,15 +20,22 @@ import InfiniteCore
 
     let role: String
     private let client: RemoteClient
+    private let sendRequest: @Sendable (RemoteClient, String, JSON?) async throws -> JSON
     private var pollTask: Task<Void, Never>?
     private var pageShown = false
     private var displayVisible = false
     private var pollGeneration = UUID()
 
-    init(mission: Mission, client: RemoteClient, role: String) {
+    init(
+        mission: Mission,
+        client: RemoteClient,
+        role: String,
+        sendRequest: @escaping @Sendable (RemoteClient, String, JSON?) async throws -> JSON = { try await $0.request($1, body: $2) }
+    ) {
         self.mission = mission
         self.client = client
         self.role = role
+        self.sendRequest = sendRequest
     }
 
     var id: String { mission.id }
@@ -71,19 +84,25 @@ import InfiniteCore
     }
 
     func poll() async {
-        await poll(pollGeneration)
+        _ = await performPoll(pollGeneration)
     }
 
     private func poll(_ generation: UUID) async {
-        guard displayVisible else { return }
+        _ = await performPoll(generation)
+    }
+
+    private func performPoll(_ generation: UUID) async -> PollOutcome {
+        guard displayVisible, generation == pollGeneration else { return .skipped }
         do {
-            let value = try await client.request("/missions/\(mission.id)")
-            guard displayVisible, generation == pollGeneration else { return }
+            let value = try await sendRequest(client, "/missions/\(mission.id)", nil)
+            guard displayVisible, generation == pollGeneration else { return .skipped }
             observe(Mission(value))
             if !fresh { fresh = true }
+            return .updated
         } catch {
-            guard displayVisible, generation == pollGeneration else { return }
+            guard displayVisible, generation == pollGeneration else { return .skipped }
             if fresh { fresh = false }
+            return .failed(error.localizedDescription)
         }
     }
 
@@ -128,10 +147,10 @@ import InfiniteCore
     private func send(_ mutation: TeamMutation, retrying: Bool) async {
         mutationState = .sending(pending: retrying ? mutation : nil)
         do {
-            let result = try await client.request(mutation.path, body: mutation.body)
+            let result = try await sendRequest(client, mutation.path, mutation.body)
             let next = Mission(result["mission"] == .null ? result : result["mission"])
-            mutationState = .idle
             if next.id == mission.id { observe(next) } else { await poll() }
+            mutationState = .idle
             notice = "\(mutation.label) recorded · revision \(mission.revision)."
             noticeIsError = false
             if mutation.path.hasSuffix("/steer") { direction = "" }
@@ -140,10 +159,17 @@ import InfiniteCore
             notice = "Delivery unconfirmed. Retry sends this exact request."
             noticeIsError = true
         } catch let error as DesktopError where (400...499).contains(error.status) {
+            let outcome = await performPoll(pollGeneration)
             mutationState = .idle
-            notice = error.message + " The mission was refreshed; review it before sending again."
+            switch outcome {
+            case .updated:
+                notice = error.message + " The mission was refreshed; review it before sending again."
+            case .skipped:
+                notice = error.message
+            case .failed(let refreshError):
+                notice = "\(error.message) Could not refresh the mission: \(refreshError)"
+            }
             noticeIsError = true
-            await poll()
         } catch {
             mutationState = .idle
             notice = error.localizedDescription

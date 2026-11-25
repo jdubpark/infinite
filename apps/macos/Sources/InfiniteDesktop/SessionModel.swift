@@ -31,17 +31,24 @@ import InfiniteCore
         case awaitingSnapshot(generation: UUID)
         case snapshotReceived(generation: UUID)
         case ready(generation: UUID)
-        case failed(generation: UUID)
+        case failed(generation: UUID, receivedScreen: Bool)
 
         var generation: UUID {
             switch self {
-            case .awaitingSnapshot(let g), .snapshotReceived(let g), .ready(let g), .failed(let g): return g
+            case .awaitingSnapshot(let g), .snapshotReceived(let g), .ready(let g), .failed(let g, _): return g
             }
         }
         var snapshotReady: Bool {
             switch self {
             case .snapshotReceived, .ready: return true
             case .awaitingSnapshot, .failed: return false
+            }
+        }
+        var receivedScreen: Bool {
+            switch self {
+            case .awaitingSnapshot: return false
+            case .snapshotReceived, .ready: return true
+            case .failed(_, let received): return received
             }
         }
         var isReady: Bool {
@@ -256,7 +263,7 @@ import InfiniteCore
         answering = false
     }
     func rendererFailed(_ message: String) {
-        rendererState = .failed(generation: rendererState.generation)
+        rendererState = .failed(generation: rendererState.generation, receivedScreen: rendererState.receivedScreen)
         disableDirectInput()
         notice = message
     }
@@ -300,7 +307,7 @@ import InfiniteCore
             pipe.feed(Data(message["snapshot"]["ansi"].string.utf8), reset: true, columns: message["snapshot"]["cols"].int, rows: message["snapshot"]["rows"].int)
         }
         for output in message["events"].array where output["type"].string == "output" {
-            let first = !rendererState.snapshotReady
+            let first = !rendererState.receivedScreen
             markSnapshotReceived()
             pipe.feed(Data(output["data"]["text"].string.utf8), reset: first)
         }
@@ -321,7 +328,8 @@ import InfiniteCore
     private func markSnapshotReceived() {
         switch rendererState {
         case .awaitingSnapshot(let g): rendererState = .snapshotReceived(generation: g)
-        case .snapshotReceived, .ready, .failed: break
+        case .failed(let g, false): rendererState = .failed(generation: g, receivedScreen: true)
+        case .snapshotReceived, .ready, .failed(_, true): break
         }
     }
     func observe(_ value: JSON) {
@@ -390,9 +398,8 @@ import InfiniteCore
             controlState = .held(lease: granted, generation: operation, renewal: renewal, directInput: false)
             await resize(lastSize.0, lastSize.1)
         } catch {
-            if case .claiming(operation, let other) = controlState {
-                controlState = .unheld(otherHolder: other)
-            }
+            guard case .claiming(operation, let other) = controlState else { return }
+            controlState = .unheld(otherHolder: other)
             if streamState.generation == attachment { notice = error.localizedDescription }
         }
     }

@@ -16,7 +16,7 @@ import { theme } from "../../theme";
 import { DictationNotice } from "../../dictation/DictationControls";
 import { useDictation } from "../../dictation/useDictation";
 import {
-  MEMBER_LABELS, memberKind, newer, openDecisions, pendingApprovals, ROLE_NAMES, shortDate, TEAM_LABELS, taskGroups, taskKind, canContinueBlockedTeam, teamControls, teamKind, teamPhases, teamProgress, workerStatus,
+  directionSourceLabel, MEMBER_LABELS, memberKind, newer, openDecisions, pendingApprovals, ROLE_NAMES, shortDate, TEAM_LABELS, taskGroups, taskKind, canContinueBlockedTeam, teamControls, teamKind, teamPhases, teamProgress, workerStatus,
   type ModelProfile, type PhaseState, type TeamCheck, type TeamDecision, type TeamMember, type TeamTask, type TeamView,
 } from "./model";
 import { Clamp, Disclosure, LinearChip, LineupView, ProfileLine, providerName, RequestStatus, Section, SteerBox, t } from "./parts";
@@ -371,7 +371,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
           </View>)}
         </Section> : null}
         {team.steering.length || answered.length ? <Section title="Directions and decisions" count={team.steering.length + answered.length}>
-          {team.steering.map((entry, index) => <View key={`${entry.at}/${index}`} style={s.record}><Text style={t.note}>{typeof entry.source === "object" ? entry.source.name : entry.source === "coordinator" ? "Mission coordinator" : "You"} · direction · rev {entry.revision} · {shortDate(entry.at)}</Text><Clamp text={entry.text} lines={3} /></View>)}
+          {team.steering.map((entry, index) => <View key={`${entry.at}/${index}`} style={s.record}><Text style={t.note}>{directionSourceLabel(entry.source)} · direction · rev {entry.revision} · {shortDate(entry.at)}</Text><Clamp text={entry.text} lines={3} /></View>)}
           {answered.map(decision => <View key={decision.id} style={s.record}><Text style={t.note}>Decision · rev {decision.revision}</Text><Text style={t.body}>{decision.question}</Text><Text style={t.strong}>{decision.answeredBy === "connector" ? decision.source?.name ?? "Connector" : decision.answeredBy === "coordinator" ? "Mission coordinator" : "You"}: {decision.answer}</Text><OutcomeNote recommendation={decision.recommendation} /></View>)}
         </Section> : null}
         {team.events.length ? <Section title="History" count={team.events.length}>

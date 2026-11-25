@@ -25,6 +25,7 @@ import { KeyedQueue, PendingCreates, mapConcurrent, pauseWithPendingCreates } fr
 import { HALT_PAUSED_TEAM, KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import { missionDecisionQueueCandidates } from "./decision-queue.js";
 import { projectMissionSource } from "./mission-progress.js";
+import { MissionReview, missionSteeringFull, type MissionReviewRecord, type ReviewDirection } from "./mission-review.js";
 
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
 
@@ -44,7 +45,7 @@ type Attempt = { memberId: string; sessionId: string; revision: number; prompt: 
   rotated?: RotationRule;
   usageCursor?: number; contextTokens?: number };
 type RotationRule = "idle" | "size" | "age";
-type ChildOp = { kind: "answer" | "steer" | "pause" | "resume" | "cancel" | "parallelism"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; parallelism?: number; by?: "owner" | "coordinator" | "connector"; source?: ConnectorSource;
+type ChildOp = { kind: "answer" | "steer" | "pause" | "resume" | "cancel" | "parallelism" | "review-forward"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; parallelism?: number; by?: "owner" | "coordinator" | "connector"; source?: ConnectorSource;
   halt?: { token: string; reason?: string } };
 type Stored = {
   mission: Mission;
@@ -68,6 +69,7 @@ type Stored = {
   clockStoppedAt?: string;
   blockedAt?: string;
   coordinatorNotes?: MissionCoordinatorNote[];
+  reviews?: MissionReviewRecord[];
 };
 
 const now = () => new Date().toISOString();
@@ -131,6 +133,9 @@ export class MissionService {
   private usage?: UsageService;
   private readonly listeners = new Set<(mission: Mission) => void>();
   private fuse?: FuseGate;
+  private readonly review = new MissionReview<Stored>((service => ({ get records() { return service.records; }, get teams() { return service.teams; },
+    enqueue: (id, task) => service.enqueue(id, task), save: stored => service.save(stored), event: (stored, text) => service.event(stored, text),
+    follow: (subtask, team) => Object.assign(subtask, { status: subtaskStatus(team.status), teamStatus: team.status }), closed: () => service.closed }))(this));
 
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly teams: TeamService, private readonly groups: ProjectGroupLookup) {
     this.directory = join(config.stateDir, "missions");
@@ -165,6 +170,7 @@ export class MissionService {
       }
       return undefined;
     });
+    this.review.connect(this.teams.useMissionReviews(this.review));
   }
   useUsage(service: UsageService) { this.usage = service; }
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
@@ -506,7 +512,7 @@ export class MissionService {
       authorize?.();
       if (this.replay(stored, "steer", body)) return this.view(stored);
       if (!live.has(mission.status)) throw new TeamError(409, "mission-not-running", "Resume the mission before sending direction, or start a new mission if it has stopped.");
-      if (mission.steering.length >= 20 || Buffer.byteLength([...mission.steering.map(item => item.text), body.text].join("\n\n")) > 10000)
+      if (missionSteeringFull(mission, body.text))
         throw new TeamError(409, "mission-steering-limit", "Start a new mission with consolidated directions.");
       this.admit(stored, "steer", body);
       mission.steering.push({ text: body.text, revision: mission.revision, at: now(), ...(source ? { source } : {}) });
@@ -518,6 +524,7 @@ export class MissionService {
       this.save(stored); return this.view(stored);
     });
   }
+  reviewDirection(id: string, direction: ReviewDirection) { return this.review.direct(id, direction); }
   answer(id: string, decisionId: string, input: Action & { text: string }, source?: MissionInputSource, authorize?: () => void) {
     const body = { ...missionTextSchema.parse(input), ...(source === undefined ? {} : { source }) };
     return this.enqueue(id, () => {
@@ -857,7 +864,7 @@ export class MissionService {
   }
   private connectorSource(mission: Mission): ConnectorSource | undefined {
     return [...mission.decisions].reverse().find(item => item.source)?.source
-      ?? [...mission.steering].reverse().map(item => item.source).find((source): source is ConnectorSource => typeof source === "object")
+      ?? [...mission.steering].reverse().map(item => item.source).find((source): source is ConnectorSource => typeof source === "object" && source.kind === "connector")
       ?? mission.origin?.source;
   }
   private async applyOps(stored: Stored) {
@@ -867,6 +874,10 @@ export class MissionService {
     const mission = stored.mission, resumeHeld = mission.status === "paused" || (mission.status === "blocked" && mission.stopReason === "deadline") ||
       Boolean(this.fuse?.held?.(mission.repoProjectIds));
     for (const op of [...stored.ops]) {
+      if (op.kind === "review-forward") {
+        if (await this.review.applyForward(stored, op)) remaining.push(op);
+        continue;
+      }
       let team: TeamView;
       try { team = this.teams.get(op.teamId); } catch (error) { if (notFound(error)) continue; throw error; }
       const settled = teamDone.has(team.status) || team.status === "cancelled";
@@ -1176,6 +1187,7 @@ export class MissionService {
     const mission = stored.mission;
     if (mission.decisions.some(item => !item.answer)) return true;
     if (openFollowUps(mission).length) return true;
+    if (stored.ops.some(op => op.kind === "review-forward")) return true;
     const working = (teamId: string) => {
       if (stored.ops.some(op => op.kind === "resume" && op.teamId === teamId)) return true;
       try { return this.teams.get(teamId).status !== "paused"; } catch (error) { if (notFound(error)) return false; throw error; }
@@ -1321,6 +1333,9 @@ export class MissionService {
         break;
       }
       case "steer-subtask": {
+        const forward = this.review.queueForward(stored, subtask!, report.text, this.connectorSource(mission));
+        if (forward.kind === "refused") return this.refuse(stored, report.kind, forward.reason, false);
+        if (forward.kind === "queued") break;
         if (!["running", "blocked"].includes(subtask!.status) || !subtask!.teamId)
           return this.refuse(stored, report.kind, `Subtask ${subtask!.id} has no running or blocked subteam. A queued subtask receives owner direction when it starts; dispatch a follow-up subtask for finished work.`, false);
         this.queueOp(stored, { kind: "steer", subtaskId: subtask!.id, teamId: subtask!.teamId, text: report.text, by: this.connectorSource(mission) ? "connector" : "coordinator", ...(this.connectorSource(mission) ? { source: this.connectorSource(mission) } : {}) });
@@ -1349,6 +1364,7 @@ export class MissionService {
           if (!mission.subtasks.some(item => item.status === "done")) return this.refuse(stored, report.kind, "No subtask has finished. Dispatch a subtask before reporting a result, or report blocked.");
           const stalled = stalledSubtasks(mission);
           const pending = mission.subtasks.filter(item => item.status === "running" || (item.status === "queued" && !stalled.has(item.id))).length;
+          if (stored.ops.some(op => op.kind === "review-forward")) return this.refuse(stored, report.kind, "The owner's review is still on its way to its subtask. Wait for that subteam before reporting a result.", false);
           if (pending) return this.refuse(stored, report.kind, `${pending} subtask${pending === 1 ? " is" : "s are"} still queued or running. Wait for them to finish or cancel them first.`, false);
           const unfinished = mission.subtasks.filter(item => item.status === "blocked" || stalled.has(item.id)).map(item => item.id);
           if (unfinished.length) return this.refuse(stored, report.kind, `Subtask${unfinished.length === 1 ? "" : "s"} ${unfinished.join(", ")} did not finish. Cancel each with cancel-subtask, dispatch a replacement, or report blocked.`);

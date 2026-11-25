@@ -1803,8 +1803,14 @@ that pull request steers the run the same way, once per review. Only the review
 summary is read, never inline comments. A review by another login, an approval, a
 comment, a review of an older head, and a review submitted before the switch was
 last turned on start nothing. A run accepts at most three reviews. Runs of goals,
-handoffs, replays and missions are not watched; routines start goals, so their
-runs are not watched either. Removing the run's workspace ends intake.
+handoffs and replays are not watched; routines start goals, so their runs are not
+watched either. A mission's subteam run is watched, but the owner's review does
+not steer it: the review goes to the mission's coordinator as owner direction,
+and the run continues only when the coordinator forwards it with `steer-subtask`.
+The run shows the review as applied once the mission recorded it, and records no
+steering of its own until that forward. See
+[missions](missions.md#owner-review-of-a-subtasks-pull-request). Removing the
+run's workspace ends intake.
 
 ## Project context and explicit relationships
 

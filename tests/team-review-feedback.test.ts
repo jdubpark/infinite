@@ -144,6 +144,48 @@ test("with the switch off the host reads no pull request and writes nothing", as
   } finally { f.close(); }
 });
 
+test("a mission run's review goes to its mission's coordinator instead of steering the run, and only while the switch is on", async () => {
+  for (const enabled of [false, true]) {
+    const f = schedulerFixture();
+    try {
+      f.run.missionId = "mission-1";
+      const gh = delivered(f, enabled);
+      gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
+      const before = f.readRecord<Saved>("team", f.run.id), directed: unknown[] = [], receipts = new Set<string>();
+      let answer: "waiting" | "applied" = "waiting";
+      const teams = f.openTeam(), feedback = poller(teams);
+      const port = teams.useMissionReviews({ target: () => ({ missionId: "mission-1", subtaskId: "a", revision: 4 }), applied: (_mission, requestId) => receipts.has(requestId),
+        direct: async (missionId, direction) => {
+          directed.push([missionId, direction]);
+          if (answer === "applied") receipts.add(direction.requestId);
+          return answer;
+        } });
+      await feedback.start();
+      await feedback.poll();
+      if (!enabled) {
+        assert.deepEqual([gh.commands(), directed], [[], []], "with the switch off a mission run is not read and its mission hears nothing");
+        assert.deepEqual(f.readRecord<Saved>("team", f.run.id), before);
+        continue;
+      }
+      const direction = { requestId: reviewRequestId(f.run.id, "PRR_1"), runId: f.run.id, subtaskId: "a", reviewId: "PRR_1", pullRequestUrl, text: requested, revision: 1, headCommit: gh.head };
+      assert.deepEqual(directed, [["mission-1", direction]]);
+      assert.deepEqual(f.readRecord<Saved>("team", f.run.id).reviewIntake?.intents.map(intent => intent.state), ["pending"], "a paused mission leaves the review waiting");
+
+      answer = "applied";
+      await feedback.poll();
+      const saved = f.readRecord<Saved>("team", f.run.id);
+      assert.deepEqual(directed, [["mission-1", direction], ["mission-1", direction]]);
+      assert.deepEqual([saved.reviewIntake?.intents.map(intent => intent.state), saved.run.reviewFeedback?.map(entry => entry.outcome)], [["applied"], ["applied"]]);
+      assert.deepEqual([saved.run.revision, saved.run.status, saved.run.steering], [1, "ready-for-review", []], "the run waits for its coordinator's forward");
+      assert.equal(events(saved).some(text => text.startsWith("The owner requested changes on the pull request")), false);
+
+      assert.equal(await port.stillCurrent(f.run.id, "PRR_1"), true);
+      gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED"), gh.review("PRR_2", owner, "APPROVED", "", new Date(Date.now() + 120_000).toISOString())]);
+      assert.equal(await port.stillCurrent(f.run.id, "PRR_1"), false, "an approval after the review makes it stale for the forward");
+    } finally { f.close(); }
+  }
+});
+
 test("a review submitted before the switch was last turned on starts nothing", async () => {
   const f = schedulerFixture();
   try {

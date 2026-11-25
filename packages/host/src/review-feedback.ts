@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { ReviewFeedbackEntry, ReviewFeedbackOutcome, TeamRun } from "./team-types.js";
+import type { MissionReviewTarget } from "./mission-review.js";
 
 export const REVIEW_TEXT_LIMIT = 8000;
 export const REVIEW_LIMIT = 3;
@@ -13,6 +14,7 @@ export type ReviewIntent = {
   text: string;
   requestId: string; targetRevision: number;
   state: "pending" | "applied" | "superseded" | "refused"; reason?: string;
+  mission?: MissionReviewTarget & { pullRequestUrl: string };
 };
 export type ReviewIntake = { intents: ReviewIntent[]; handled: string[]; accepted: number; ended?: { at: string; reason: string } };
 export type OwnerReview = { id: string; state: ReviewFeedbackEntry["state"]; submittedAt: string; body: string; commit?: string };
@@ -55,7 +57,7 @@ export function pullRequestViewArgs(target: { repository: string; number: number
 
 export function watchedRun(run: TeamRun, intake?: ReviewIntake) {
   return run.status === "ready-for-review" && run.delivery?.mode === "pr" && run.pullRequest?.revision === run.revision &&
-    !run.workspaceRemovedAt && !run.goal && !run.handoff && !run.missionId && !run.replay && !intake?.ended && pullRequestTarget(run) !== undefined;
+    !run.workspaceRemovedAt && !run.goal && !run.handoff && !run.replay && !intake?.ended && pullRequestTarget(run) !== undefined;
 }
 
 export function recordedDeliveryBranch(run: Pick<TeamRun, "pullRequest" | "branch" | "publication">, pr: Pick<PullRequestRead, "headRefName">) {

@@ -6,6 +6,7 @@ import { teamCommand, TeamError } from "./team-workspace.js";
 import { unseal, writeSealed } from "./vault.js";
 import type { TeamKernel } from "./team-kernel.js";
 import type { Stored } from "./teams.js";
+import type { MissionReviewDestination, MissionReviewTeams } from "./mission-review.js";
 import {
   type PullRequestRead, type ReviewIntent, intentStillCurrent, markReviewApplied, parsePullRequestView, pullRequestTarget,
   pullRequestViewArgs, recordedDeliveryBranch, recordReviewOutcome, reviewRequestId, reviewText, reviewVerdict, watchedRun,
@@ -35,8 +36,14 @@ export class TeamReviewFeedback {
   private next?: { watch: boolean; done: Promise<void> };
   private stopTick?: () => void;
   private closed = false;
+  private missions?: MissionReviewDestination;
   private readonly abort = new AbortController();
   constructor(private readonly host: ReviewFeedbackHost) {}
+
+  useMissions(destination: MissionReviewDestination): MissionReviewTeams {
+    this.missions = destination;
+    return { receipt: (runId, requestId) => Boolean(this.host.records.get(runId)?.receipts[requestId]), stillCurrent: (runId, reviewId) => this.stillCurrent(runId, reviewId) };
+  }
 
   private settings() {
     const settings = this.host.config.github?.reviewFeedback;
@@ -98,7 +105,7 @@ export class TeamReviewFeedback {
       const done = await this.host.enqueue(id, () => {
         const stored = this.current(id, intent);
         if (!stored) return true;
-        if (!stored.receipts[intent.requestId]) return false;
+        if (!(intent.mission ? this.missions?.applied(intent.mission.missionId, intent.requestId) : stored.receipts[intent.requestId])) return false;
         this.settle(stored, intent, "applied");
         return true;
       });
@@ -124,7 +131,7 @@ export class TeamReviewFeedback {
 
   private async watch(id: string, ownerLogin: string, enabledAt: string) {
     const snapshot = this.host.records.get(id);
-    if (!snapshot || !watchedRun(snapshot.run, snapshot.reviewIntake) || snapshot.reviewIntake?.intents.some(intent => intent.state === "pending")) return;
+    if (!snapshot || !watchedRun(snapshot.run, snapshot.reviewIntake) || (snapshot.run.missionId && !this.missions) || snapshot.reviewIntake?.intents.some(intent => intent.state === "pending")) return;
     const target = pullRequestTarget(snapshot.run)!;
     const read = await this.read(snapshot, target);
     if (!read || this.closed) return;
@@ -151,9 +158,12 @@ export class TeamReviewFeedback {
         if (changed || legacy) this.host.save(stored);
         return undefined;
       }
+      const mission = run.missionId ? this.missions?.target(run.id) : undefined;
+      if (run.missionId && !mission) return undefined;
       const intake = stored.reviewIntake ??= { intents: [], handled: [], accepted: 0 };
       const accepted: ReviewIntent = { reviewId: verdict.review.id, submittedAt: verdict.review.submittedAt, commit: verdict.review.commit!,
-        text: reviewText(verdict.review.body, run.pullRequest!.pullRequestUrl), requestId: reviewRequestId(run.id, verdict.review.id), targetRevision: run.revision, state: "pending" };
+        text: reviewText(verdict.review.body, run.pullRequest!.pullRequestUrl), requestId: reviewRequestId(run.id, verdict.review.id), targetRevision: run.revision, state: "pending",
+        ...(mission ? { mission: { ...mission, pullRequestUrl: run.pullRequest!.pullRequestUrl } } : {}) };
       intake.intents.push(accepted);
       recordReviewOutcome(run, verdict.review, "accepted", at);
       this.host.save(stored);
@@ -166,7 +176,9 @@ export class TeamReviewFeedback {
     if (this.closed) return;
     let outcome: "applied" | "refused" | undefined, reason: string | undefined;
     try {
-      await this.host.steer(id, { requestId: intent.requestId, revision: intent.targetRevision, text: intent.text }, githubReviewSource(intent.reviewId));
+      if (!intent.mission) await this.host.steer(id, { requestId: intent.requestId, revision: intent.targetRevision, text: intent.text }, githubReviewSource(intent.reviewId));
+      else if (!this.missions || await this.missions.direct(intent.mission.missionId, { requestId: intent.requestId, runId: id, subtaskId: intent.mission.subtaskId, reviewId: intent.reviewId,
+        pullRequestUrl: intent.mission.pullRequestUrl, text: intent.text, revision: intent.targetRevision, headCommit: intent.commit }) === "waiting") return;
       outcome = "applied";
     } catch (error) {
       if (error instanceof TeamError && error.code !== "team-operation-running") { outcome = "refused"; reason = error.message; }
@@ -177,6 +189,15 @@ export class TeamReviewFeedback {
       const stored = this.current(id, intent);
       if (stored) this.settle(stored, intent, outcome, reason);
     });
+  }
+
+  private async stillCurrent(id: string, reviewId: string) {
+    const settings = this.settings(), stored = this.host.records.get(id), enabledAt = this.enabledAt;
+    const intent = stored?.reviewIntake?.intents.find(item => item.reviewId === reviewId && item.state === "applied"), target = stored && pullRequestTarget(stored.run);
+    if (this.closed) return undefined;
+    if (!settings || !enabledAt || !stored || !intent || !target) return false;
+    const read = await this.read(stored, target);
+    return read ? intentStillCurrent(intent, stored.run, read, settings.ownerLogin, enabledAt) : undefined;
   }
 
   private current(id: string, intent: ReviewIntent) {
@@ -192,7 +213,7 @@ export class TeamReviewFeedback {
     const at = new Date(this.host.now()).toISOString(), review = { id: saved.reviewId, state: "CHANGES_REQUESTED" as const, submittedAt: saved.submittedAt };
     if (outcome === "applied") {
       markReviewApplied(intake, saved);
-      this.host.event(stored, `The owner requested changes on the pull request (review ${saved.reviewId}). The run continues from its delivered commit at revision ${saved.targetRevision + 1}.`);
+      if (!saved.mission) this.host.event(stored, `The owner requested changes on the pull request (review ${saved.reviewId}). The run continues from its delivered commit at revision ${saved.targetRevision + 1}.`);
     } else {
       Object.assign(saved, { state: outcome, ...(reason ? { reason } : {}) });
       this.host.event(stored, `The owner's review ${saved.reviewId} was not applied: ${reason ?? "the run refused it."}`);

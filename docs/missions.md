@@ -167,10 +167,10 @@ The coordinator reports through its mission report tool:
 | `dispatch` | Adds subtasks (up to `maxSubtasks` in total). Later dispatches may add more. The host adds same-repository dependency edges, shown in mission events and later coordinator mission state. |
 | `answer-child` | Answers an open subteam decision within the mission's objective and steering. Recorded as answered by the coordinator, in the mission and in the subteam. |
 | `question` | Opens a mission decision for the owner. With `subtaskId` and `childDecisionId`, the owner's answer is forwarded to that subteam decision. |
-| `steer-subtask` | Sends direction to a running or blocked subteam, such as an owner answer or direction that changes work under way. The subteam stops its members and replans under a new revision. Held while the subteam is paused; refused, and the coordinator told, when the subtask has no running or blocked subteam or the subteam refuses the direction. |
+| `steer-subtask` | Sends direction to a running or blocked subteam, such as an owner answer or direction that changes work under way. The subteam stops its members and replans under a new revision. Held while the subteam is paused; refused, and the coordinator told, when the subtask has no running or blocked subteam or the subteam refuses the direction. For a finished subtask that holds an unforwarded owner review, it forwards that review instead; see [owner review of a subtask's pull request](#owner-review-of-a-subtasks-pull-request). |
 | `resize-subtask` | Selects worker capacity with `subtaskId`, `parallelism` (1–4), and `summary`. Updates a queued subtask or durably forwards the change to its active subteam. A solo subtask permits only one worker. Lowering capacity lets running workers finish and holds new starts. |
 | `cancel-subtask` | Cancels that subtask's subteam. A subtask that never started is cancelled at once, and the coordinator is told in its next attempt. A cancelled subteam is deleted with its workspace after every member settles; the mission keeps the cancelled status and final reason, and the coordinator is asked to decide whether a replacement subtask is needed. |
-| `result` | Accepted only when every subtask is `done` or `cancelled`, at least one is `done`, and no owner decision is open. A `blocked` subtask, or a queued one whose dependency ended `blocked` or `cancelled`, must be cancelled explicitly first. Moves the mission to `ready-for-review`. |
+| `result` | Accepted only when every subtask is `done` or `cancelled`, at least one is `done`, no owner decision is open, and no owner review is on its way to its subtask. A `blocked` subtask, or a queued one whose dependency ended `blocked` or `cancelled`, must be cancelled explicitly first. Moves the mission to `ready-for-review`. |
 | `blocked` | Moves the mission to `blocked` with the summary as its reason. It may carry an optional `blocker` object, stored as agent-reported evidence. A summary-only block stays valid. |
 | `wait` | Ends the attempt without a decision. Refused while a subteam decision is open that the coordinator has neither answered nor escalated. Otherwise accepted only while something else will start a later attempt: a message that arrived during the attempt and already waits for the next one (such as a follow-up that fired while the attempt ran), an open owner decision, a subteam that is not paused, a queued subtask that can start without anyone acting, or an open follow-up. A queued subtask whose repository any paused or blocked run holds does not count, since that run keeps the repository reserved after the others finish. |
 | `follow-up` | Ends the attempt like `wait` and asks the host to start another at a set time, with `inMinutes` (5–10,080), `reason` (up to 500 characters), and `check` (up to 1,000 characters). Accepted even when nothing else would start an attempt. Refused when five follow-ups are already open, when the time falls at or after the mission deadline, or under the same open subteam decision rule as `wait`. |
@@ -377,7 +377,67 @@ subteam resumes as the halt paused it.
 Status honesty: `ready-for-review` means the coordinator reported a result after
 every subtask finished. It does not establish product impact or acceptance. Each
 subteam delivers only under its repository's own delivery policy; the mission
-does not push, merge, or deploy.
+does not push, merge, or deploy. An owner review can reopen it, as the next
+section says.
+
+### Owner review of a subtask's pull request
+
+With review feedback (`github.reviewFeedback`, see [teams](teams.md)) switched on, the host watches a
+subteam run that delivered to a pull request and waits at `ready-for-review`. A
+changes-requested review by the owner on that pull request goes to the mission's
+coordinator, never straight to the subteam. Without the switch no mission
+behaves differently.
+
+The host records the review as owner direction with the review as its source
+(`Owner (GitHub review)`), in one saved mission change under the review's
+request ID. A repeat of that ID has no second effect. The effect depends on the
+mission's status:
+
+| Mission status | Effect |
+|---|---|
+| `planning`, `working`, `needs-input` | Recorded as owner steering, and a `review-direction` message goes to the coordinator's inbox. |
+| `ready-for-review` | The mission reopens: its result moves to `earlierResults`, it returns to `working`, its deadline becomes now plus its original `maxMinutes`, and the review is recorded as above. Follow-ups the earlier result cancelled stay cancelled. |
+| `paused`, `blocked` | Nothing is recorded yet. The review waits, and one mission event says so. It is delivered when the mission is live again. |
+| `cancelled` | The review is refused. |
+
+The mission event reads "The owner's review was delivered to the coordinator".
+The subteam's run shows nothing until a forward steers it. The
+`review-direction` message carries the owner's words unchanged, the subtask,
+the subteam run, the review ID and the pull request URL. The prompt says what a
+`steer-subtask` on that subtask does. The review is direction: it adds no
+command, grant, delivery change, permission mode, or limit. Each accepted
+review that reopens a mission gives it working time once; the limits on
+subtasks, members, and coordinator attempts stay cumulative.
+
+The coordinator decides what to do with it. A `steer-subtask` report on a
+`done` subtask that holds an unforwarded review is accepted only while that
+subteam run is still `ready-for-review` with its pull request at the reviewed
+revision and head, and its workspace is present; otherwise it is refused and
+the coordinator told why. An accepted forward is queued as a `review-forward`
+operation with a stable request ID, and works once. Each time the mission
+applies its operations, the forward:
+
+1. Ends as used if the subteam already holds a receipt for its request ID.
+2. Waits while the mission is paused or blocked at its time limit, and while
+   another run holds the repository.
+3. Reads GitHub once more. If the owner has since approved or dismissed the
+   review, or it is no longer the owner's newest, the forward ends superseded.
+   A failed read is retried a minute later.
+4. Is refused if the subteam's revision or head moved. It is never rebound to
+   a later delivery.
+5. Steers the subteam with the coordinator's text under its request ID. The
+   subtask then follows the subteam's status, and the subteam continues from
+   its delivered commit on the same pull request.
+
+A superseded or refused forward is reported to the coordinator as a refused
+`steer-subtask`; it does not count toward the three refusals that block a
+mission. While a forward is queued, the coordinator cannot report a `result`.
+
+A mission started by [intake](intake.md) that a review reopens returns its
+intake record from `finished` to `started` in the same change. The record keeps
+its earlier messages and outcome comment, and the next result records its own
+outcome. A Linear issue that was closed in the meantime pauses the reopened
+mission, as for any started record.
 
 ### Follow-ups
 

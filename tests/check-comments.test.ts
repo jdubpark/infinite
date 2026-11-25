@@ -213,6 +213,22 @@ describe("check-comments extractor", () => {
         [17, 17, false],
       ],
     );
+
+    const decoded = [
+      ".a { background: \\75rl(/a/*icon*/.svg); }",
+      ".b { background: \\75 rl(/a/*icon*/.svg); }",
+      ".c { --tokens: #url(/* real comment after hash token */); }",
+    ].join("\n");
+    const decodedSummary = summarizeFileComments(decoded, "apps/web/src/decoded.css");
+    assert.equal(decodedSummary.blocks, 1);
+    assert.equal(decodedSummary.lines, 1);
+
+    const crCss = ".a{}\r/* first\rsecond */\f.b{}";
+    const crSummary = summarizeFileComments(crCss, "apps/web/src/cr.css");
+    assert.equal(crSummary.blocks, 1);
+    assert.equal(crSummary.lines, 2);
+    assert.equal(crSummary.shedLines, 2);
+    assert.deepEqual(crSummary.details[0] && [crSummary.details[0].startLine, crSummary.details[0].endLine, crSummary.details[0].fullLineOnly], [2, 3, true]);
   });
 
   test("extracts systemd unit comments per systemd.syntax(7) including # and ;, inline values, and line continuations", () => {
@@ -251,6 +267,9 @@ describe("check-comments extractor", () => {
 
     assert.equal(summarizeFileComments("[Timer]\r\n; timer comment\r\nOnCalendar=daily\r\n", "deploy/ubuntu/demo.timer").lines, 1);
     assert.equal(summarizeFileComments("[Socket]\n# socket comment\nListenStream=127.0.0.1:4785\n", "deploy/ubuntu/demo.socket").lines, 1);
+    const bomSummary = summarizeFileComments("\uFEFF# bom comment\n[Unit]\n", "deploy/ubuntu/bom.service");
+    assert.equal(bomSummary.lines, 1);
+    assert.equal(bomSummary.details[0]?.start, 1);
   });
 });
 

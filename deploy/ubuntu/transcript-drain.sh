@@ -1,7 +1,4 @@
 #!/bin/sh
-# The final transcript drain: after a provider exits, the worker runs the hook relay once more as the
-# agent account. It takes no arguments. The worker's authenticated reply names the transcript, and
-# sudo's env_keep passes the hook address and token.
 set -eu
 umask 077
 ulimit -c 0

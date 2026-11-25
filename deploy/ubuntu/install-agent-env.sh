@@ -52,8 +52,6 @@ for provider in claude codex codex-app-server grok opencode; do
     printf '%s\n' "$hook_line"
     tail -n +"$((anchor_line + 1))" "$wrapper"
   } >"$temporary"
-  # Keep the wrapper's owner, group (infinite-agent must stay able to run
-  # it) and mode; the temporary file was created root:root.
   chown --reference="$wrapper" "$temporary"
   chmod --reference="$wrapper" "$temporary"
   if [ "$(infinite_wrapper_prefix_state "$temporary" "$reference")" != patched ]; then

@@ -1,6 +1,5 @@
 import { useCallback, useSyncExternalStore } from "react";
 
-/** A text send whose delivery is unconfirmed; Retry keeps the same requestId. */
 export type PendingInput = {
   requestId: string;
   text: string;
@@ -9,7 +8,6 @@ export type PendingInput = {
 };
 type Draft = { text: string; pending: PendingInput | null };
 const EMPTY: Draft = { text: "", pending: null };
-// Drafts never leave process memory. Receipts settle here even after a screen unmounts.
 const drafts = new Map<string, Draft>();
 const listeners = new Map<string, Set<() => void>>();
 
@@ -25,7 +23,6 @@ export function writeDraft(key: string, draft: Draft) {
   listeners.get(key)?.forEach(listener => listener());
 }
 
-/** A delayed receipt can settle its own request, never a newer draft or send. */
 export function settleDraft(key: string, requestId: string, delivered: boolean) {
   const draft = readDraft(key);
   if (draft.pending?.requestId !== requestId) return;

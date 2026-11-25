@@ -37,14 +37,11 @@ export const ASSESSMENT_LABEL = "Agent assessment, provisional";
 const assessedLabels: Record<AssessedState, string> = { met: "Met", "not-met": "Not met", inconclusive: "Inconclusive" };
 const producerLabels = { "host receipt": "Host receipt", "agent assessment": ASSESSMENT_LABEL, "waiting for you": "Waiting for you", "your rating": "Your rating" } as const;
 export const countsText = (counts: VerdictCounts) => `${counts.met} met · ${counts.notMet} not met · ${counts.inconclusive} inconclusive · ${counts.pendingOwner} waiting for you`;
-/** The newest cycle assessment's id: the one the owner's answer names. */
 export const newestVerdictId = (cycles: { assessment?: GoalAssessment }[]) => [...cycles].reverse().find(cycle => cycle.assessment)?.assessment?.verdictId;
-/** One cycle's agent assessment. The criteria rows are read only when the owner opens them. */
 export function CycleAssessment({ assessment, row, loading, error, onOpen }: { assessment: GoalAssessment; row?: GoalVerdictView; loading: boolean; error: string; onOpen: () => void }) {
   return <div className="goal-assessment"><p><strong>{ASSESSMENT_LABEL}</strong></p><p className="team-prose">Result: {assessedLabels[assessment.result]}{assessment.evaluatorResult && assessment.evaluatorResult !== assessment.result && <> · The evaluator’s own result: {assessedLabels[assessment.evaluatorResult]}</>}</p><p className="quiet">{countsText(assessment.counts)}</p>
     <details onToggle={event => { if (event.currentTarget.open) onOpen(); }}><summary>Criteria</summary>{loading && !row && <p className="quiet" role="status">Loading criteria…</p>}{error && !row && <p className="error" role="alert">{error}</p>}{row?.detail === "expired" && <p className="quiet">The criteria detail is no longer kept. Only the counts above remain.</p>}{row?.detail === "available" && <ul className="goal-notes">{row.criteria.map(item => <li key={item.id}><code>{item.id}</code> · {item.state === "pending-owner" ? "Waiting for you" : assessedLabels[item.state]} · {producerLabels[item.label]}{item.receipt && <> · receipt {item.receipt.outcome}</>}{item.note && <p className="quiet">Agent note: {item.note}</p>}</li>)}</ul>}</details></div>;
 }
-/** A goal stopped by an agent assessment: its reason and the owner's two answers. */
 export function ProvisionalStop({ reason, disabled, submit }: { reason: string; disabled: boolean; submit: (value: { result: GoalResult; summary: string; evidence: string; continue?: true }) => void }) {
   const [summary, setSummary] = useState(""), [evidence, setEvidence] = useState("");
   const ready = Boolean(summary.trim() && evidence.trim());

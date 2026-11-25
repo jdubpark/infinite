@@ -1,7 +1,7 @@
 {
   "limit": 1000,
   "files": {
-    "apps/web/src/main.tsx": 1178,
+    "apps/web/src/main.tsx": 1158,
     "packages/host/src/client.ts": 1406,
     "packages/host/src/evidence/permission-journal.ts": 1244,
     "packages/host/src/evidence/store.ts": 1084,
@@ -14,7 +14,7 @@
     "packages/host/src/teams.ts": 3220,
     "packages/host/src/understanding-work.ts": 1021,
     "packages/host/src/worker.ts": 1888,
-    "scripts/egress-proxy.mjs": 1359,
+    "scripts/egress-proxy.mjs": 1253,
     "tests/client-cli.test.ts": 1343,
     "tests/evidence-outbox.test.ts": 1017,
     "tests/evidence-store.test.ts": 1252,

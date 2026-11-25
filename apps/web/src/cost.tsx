@@ -5,12 +5,10 @@ import { useMachines } from "./machines";
 import { useLiveRefresh } from "./live-refresh";
 import type { CostView } from "./session-navigation";
 
-// Day buckets follow the viewer's clock; the host receives the zone with every series request.
 export const viewerZone = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch { return "UTC"; } })();
 const zone = encodeURIComponent(viewerZone);
 const SERIES = 6;
 const seriesColor = (index: number) => `var(--series-${(index % SERIES) + 1})`;
-// Account colours are fixed per id on every client, so filtering never repaints a survivor. Same rule as the Mac AccountPalette.
 const FIXED_ACCOUNT_COLORS: Record<string, string> = { deepseek: "#3987E5", meta: "#C98500", claude: "#9085E9", codex: "#199E70" };
 const ACCOUNT_SLOTS = ["#3987E5", "#C98500", "#9085E9", "#199E70", "#D95926"];
 export function accountPalette(ids: string[]): Record<string, string> {
@@ -26,24 +24,18 @@ const accountName = (id: string) => names[id] ?? ({ deepseek: "DeepSeek", meta: 
 const roles = ["implementer", "integrator", "reviewer", "scout", "project-manager", "delivery"];
 const roleLabel: Record<string, string> = { implementer: "Implementers", integrator: "Integrator", reviewer: "Reviewer", scout: "Scouts", "project-manager": "Coordinator", delivery: "Delivery" };
 
-/** Dollars at the precision the figure deserves: cents from one cent, four places below it, "0.00" only for a true zero. */
 export function usd(value: number, currency = "USD"): string {
   const sign = value < 0 ? "−" : "", abs = Math.abs(value);
   const digits = abs === 0 ? 2 : abs >= 1000 ? 0 : abs >= 0.01 ? 2 : 4;
   const figure = abs.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
   return currency === "USD" ? `${sign}$${figure}` : `${sign}${figure} ${currency}`;
 }
-/** Axis and sparkline figures: short, no trailing zeros. */
 const compact = (value: number) => value >= 1000 ? `$${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}K` : value >= 100 ? `$${value.toFixed(0)}` : value >= 1 ? `$${Number(value.toFixed(1))}` : value >= 0.01 ? `$${Number(value.toFixed(2))}` : value > 0 ? `$${Number(value.toFixed(4))}` : "$0";
 const tokens = (value: number) => value >= 1e6 ? `${(value / 1e6).toFixed(value >= 1e7 ? 0 : 1)}M` : value >= 1000 ? `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}K` : String(value);
 const minutes = (value: number) => value >= 90 ? `${(value / 60).toFixed(1)} h` : `${Math.round(value)} min`;
 const dayLabel = (date: string) => { const [y, m, d] = date.split("-").map(Number); return new Date(y, m - 1, d).toLocaleDateString([], { month: "short", day: "numeric" }); };
 const monthName = (iso: string, style: "long" | "short" = "long") => new Date(iso).toLocaleDateString([], { month: style, timeZone: "UTC" });
 
-/**
- * A money figure that stays honest about what it could not count. Unpriced steps or unmeasured runs make a
- * non-zero figure a lower bound; a figure with nothing priced at all is "—", never $0. The marks are explained once, in the page legend.
- */
 export function Amount({ money, value, currency, unmeasured = 0 }: { money?: Money; value?: number; currency?: string; unmeasured?: number }) {
   const amount = money ? money.usd : value ?? 0;
   const unpriced = money?.unpriced ?? 0;
@@ -56,7 +48,6 @@ function Unmeasured({ count, word = "session" }: { count: number; word?: string 
   if (!count) return null;
   return <span className="cost-badge" title={`${count} ${word}${count === 1 ? "" : "s"} produced no usage data`}>{count} unmeasured</span>;
 }
-/** Explains every marker on the page, once. */
 function MarkerLegend() {
   return <ul className="cost-markers" aria-label="How to read figures">
     <li><span className="cost-money lower">≥ $</span> some steps had no price; the figure is a lower bound</li>
@@ -79,7 +70,6 @@ function useWidth<T extends HTMLElement>() {
   }, []);
   return [ref, width] as const;
 }
-/** Three clean gridline steps that cover the largest value. */
 function ticks(max: number): number[] {
   if (max <= 0) return [1, 2, 3];
   const raw = max / 3, power = 10 ** Math.floor(Math.log10(raw));
@@ -91,7 +81,6 @@ const roundedTop = (x: number, y: number, w: number, h: number) => {
   return `M${x},${y + h} V${y + r} Q${x},${y} ${x + r},${y} H${x + w - r} Q${x + w},${y} ${x + w},${y + r} V${y + h} Z`;
 };
 
-/** Thirty days stacked by account. Hover, tap, or focus a day to read it. */
 function DailyBars({ daily, colors }: { daily: UsageDaily; colors: Record<string, string> }) {
   const [wrap, width] = useWidth<HTMLDivElement>();
   const [picked, setPicked] = useState<number | null>(null);
@@ -150,7 +139,6 @@ function SeriesLegend({ accounts, colors }: { accounts: string[]; colors: Record
   return <ul className="cost-legend">{accounts.map(account => <li key={account}><i className="cost-swatch" style={{ background: colors[account] }} />{accountName(account)}</li>)}</ul>;
 }
 
-/** A 30-point trend. One series, so the chart's row names it; no legend. */
 export function Sparkline({ values, width = 104, height = 30, color = seriesColor(0) }: { values: number[]; width?: number; height?: number; color?: string }) {
   const max = Math.max(0, ...values);
   if (!values.length || max <= 0) return <span className="cost-spark-flat" aria-hidden="true" style={{ width }} />;
@@ -164,7 +152,6 @@ export function Sparkline({ values, width = 104, height = 30, color = seriesColo
     <circle cx={endX} cy={endY} r={4.5} className="cost-ring" /><circle cx={endX} cy={endY} r={3} fill={color} />
   </svg>;
 }
-/** The integrated rate with its Wilson 95% interval on a 0–100% track. */
 function IntervalBar({ row }: { row: ModelRow }) {
   const width = 120, height = 14, mid = height / 2;
   const x = (value: number) => 4 + value * (width - 8);
@@ -175,7 +162,6 @@ function IntervalBar({ row }: { row: ModelRow }) {
     <circle cx={x(row.rate)} cy={mid} r={5.5} className="cost-ring" /><circle cx={x(row.rate)} cy={mid} r={4} fill={seriesColor(0)} />
   </svg>;
 }
-/** One proportional bar for where a project's money went, with its own legend. */
 function KindBar({ byKind }: { byKind: UsageProject["byKind"] }) {
   const parts = [["goals", "Goals"], ["teams", "Teams"], ["sessions", "Sessions"], ["briefings", "Briefings"]] as const;
   const total = parts.reduce((sum, [key]) => sum + byKind[key], 0);
@@ -204,9 +190,7 @@ function Failure({ message, retry }: { message: string; retry: () => void }) {
 }
 
 const PLAN_MAX = 100000;
-/** The same rule the host applies: a whole-dollar or two-decimal figure from 0 to 100000. Returns the number or the reason. */
 export function parsePlanUsd(text: string): { value: number } | { error: string } {
-  // One comma is a decimal separator, as some keyboards type it; thousands grouping is refused rather than guessed.
   const stripped = text.trim().replace(/^\$/, "");
   if ((stripped.match(/,/g)?.length ?? 0) > 1 || (stripped.includes(",") && stripped.includes("."))) return { error: "Use one comma or dot for cents, without thousands separators." };
   const cleaned = stripped.replace(",", ".");
@@ -216,10 +200,6 @@ export function parsePlanUsd(text: string): { value: number } | { error: string 
   if (value > PLAN_MAX) return { error: `The fee must be at most ${usd(PLAN_MAX)}.` };
   return { value };
 }
-/**
- * A subscription account's monthly fee. The owner can turn the figure into an inline input; everyone else just reads it.
- * The host answers every change with the whole account list, so the card never guesses a figure it did not confirm.
- */
 function PlanFee({ account, owner, onChanged }: { account: AccountView; owner: boolean; onChanged: (accounts: AccountView[]) => void }) {
   const api = useApi();
   const [editing, setEditing] = useState(false);
@@ -413,7 +393,6 @@ export function CostPage({ me, view, projectId, navigate }: { me: Me; view: Cost
   </div>;
 }
 
-/** The rail beside the cost page: projects ranked by what they have cost. */
 export function CostPicker({ selected, onSelect }: { selected: string | null; onSelect: (id: string) => void }) {
   const api = useApi();
   const [projects, setProjects] = useState<UsageProjectRow[] | null>(null);
@@ -431,7 +410,6 @@ export function CostPicker({ selected, onSelect }: { selected: string | null; on
   </nav>;
 }
 
-/** This month at a glance, for the team list. The Cost page carries the rest. */
 export function SpendGlance({ me, open }: { me: Me; open: () => void }) {
   const api = useApi();
   const [summary, setSummary] = useState<UsageSummary | null>(null);
@@ -460,12 +438,10 @@ export function SpendGlance({ me, open }: { me: Me; open: () => void }) {
   </section>;
 }
 
-/** Per-task money, tokens, and attempts beside its model chips. */
 export function TaskCost({ usage }: { usage?: TaskUsage }) {
   if (!usage) return <span className="cost-task quiet">Unmeasured</span>;
   return <span className="cost-task"><Amount money={{ usd: usage.usd, unpriced: usage.unpriced }} /><span>{tokens(usage.tokens)} tokens</span><span>{usage.attempts} {usage.attempts === 1 ? "attempt" : "attempts"}</span>{usage.profiles.map(profile => <code key={profile}>{profile}</code>)}</span>;
 }
-/** The owner's 1–5 verdict on a task. Idempotent per request, so a retry never double-counts. */
 export function TaskRating({ teamId, taskId, rating, canRate, onRated }: { teamId: string; taskId: string; rating?: OwnerRating; canRate: boolean; onRated?: () => void }) {
   const api = useApi();
   const [local, setLocal] = useState<OwnerRating | undefined>(rating);
@@ -493,7 +469,6 @@ export function TaskRating({ teamId, taskId, rating, canRate, onRated }: { teamI
     {error && <small className="error" role="alert">{error}</small>}
   </span>;
 }
-/** `ratable` false hides the rating control entirely; the cost and any children stay. */
 export function TaskCostRow({ teamId, taskId, usage, rating, canRate, ratable = true, onRated, children }: { teamId: string; taskId: string; usage?: TaskUsage; rating?: OwnerRating; canRate: boolean; ratable?: boolean; onRated?: () => void; children?: ReactNode }) {
   return <div className="cost-task-row"><TaskCost usage={usage} />{children}{ratable && <TaskRating teamId={teamId} taskId={taskId} rating={rating} canRate={canRate} onRated={onRated} />}</div>;
 }

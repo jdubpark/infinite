@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-// GitHub credential proxy. It holds the GitHub App installation token under its own account and checks a
-// host-signed grant on every request. Node standard library only. See deploy/ubuntu/github-proxy.md.
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { closeSync, constants as fsConstants, fstatSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync } from "node:fs";
@@ -24,7 +22,6 @@ export function validRepository(value) {
   return typeof value === "string" && REPOSITORY.test(value) && !value.toLowerCase().endsWith(".git");
 }
 
-/** A full ref name, or with `pattern` a prefix ending in `/*`. Never `refs/*`, never a control or Git-special character. */
 export function validRef(value, pattern) {
   if (typeof value !== "string" || value.length === 0 || value.length > 255) return false;
   const wildcard = pattern && value.endsWith("/*");
@@ -48,11 +45,6 @@ function canonicalBase64url(text) {
   return bytes.toString("base64url") === text ? bytes : undefined;
 }
 
-/**
- * Verifies `v2.<payload>.<mac>` and returns `{ ok: true, claims }` or `{ ok: false, reason }`. The MAC is compared in
- * constant time before the payload is parsed; the payload must be canonical base64url JSON with exactly the known fields.
- * Version 2 added the project; a version 1 grant, which has none, is refused as `grant-version`.
- */
 export function verifyGrant(text, key, nowSeconds = Math.floor(Date.now() / 1000)) {
   const refuse = reason => ({ ok: false, reason });
   if (typeof text !== "string" || text.length === 0 || text.length > GRANT_MAX_LENGTH) return refuse("grant-malformed");
@@ -83,7 +75,6 @@ export function verifyGrant(text, key, nowSeconds = Math.floor(Date.now() / 1000
   return { ok: true, claims };
 }
 
-/** Exact refs match exactly; a pattern ending in `/*` matches every ref under that prefix. */
 export function refAllowed(refs, ref) {
   return Array.isArray(refs) && refs.some(pattern => pattern.endsWith("/*") ? ref.startsWith(pattern.slice(0, -1)) : ref === pattern);
 }
@@ -92,18 +83,8 @@ export class ProxyError extends Error {
   constructor(code) { super(code); this.code = code; }
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Configuration and the token cache written by github-app-refresh.mjs.
-
 const CONFIG_KEYS = new Set(["listen", "grantKeyFile", "tokenDirectory", "githubCli", "repositories", "agentUser", "upstream"]);
 
-/**
- * Reads a file that no account but root could have written or replaced: a regular root-owned file that is not group- or
- * world-writable (and, unless `otherReadable`, not open to others at all), below real directories (no symbolic links)
- * that are owned by root and not group- or world-writable. The file is opened without following a link, checked on the
- * open descriptor, and read from it, so the file checked is the file read. `trustedUid` (default 0) is the one other
- * owner accepted besides root; only tests pass their own uid. The host's readGithubGrantKey applies the same rule.
- */
 export function readTrustedFile(path, code, { otherReadable, trustedUid = 0, maxBytes = 64 * 1024 }) {
   const trusted = uid => uid === 0 || uid === trustedUid;
   if (typeof path !== "string" || !isAbsolute(path) || resolve(path) !== path) throw new ProxyError(`${code}-path`);
@@ -124,7 +105,6 @@ export function readTrustedFile(path, code, { otherReadable, trustedUid = 0, max
   } finally { closeSync(fd); }
 }
 
-/** Validates the proxy configuration. `upstream` defaults to https://github.com; loopback is allowed for tests only. */
 export function validateProxyConfig(input) {
   if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).some(key => !CONFIG_KEYS.has(key))) throw new ProxyError("config-shape");
   const listen = input.listen;
@@ -173,7 +153,6 @@ function validCachedToken(data, repository, nowMs) {
   return keys.every(key => key === "workflows" ? workflow : BASE_PERMISSIONS[key] === permissions[key]) && Object.keys(BASE_PERMISSIONS).every(key => Object.hasOwn(permissions, key));
 }
 
-/** Reads the installation token for one repository, re-reading the cache file only when it changed. */
 function tokenStore(config, now) {
   const cache = new Map();
   const ownUid = typeof process.getuid === "function" ? process.getuid() : 0;
@@ -199,9 +178,6 @@ function tokenStore(config, now) {
   };
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// The receive-pack command list (gitprotocol-pack: update-request), checked before anything reaches GitHub.
-
 const CAPABILITY_FLAGS = new Set(["report-status", "report-status-v2", "side-band-64k", "side-band", "quiet", "atomic", "ofs-delta", "push-options"]);
 const MAX_PKT = 65520;
 
@@ -211,11 +187,6 @@ function validCapability(token) {
   return /^(?:agent|session-id)=[\x21-\x7e]{1,256}$/.test(token);
 }
 
-/**
- * Incremental parser for the start of a git-receive-pack request body: optional `shallow` lines, the command list up
- * to its flush packet, push options when negotiated, then the `PACK` signature. Anything else is refused. Input may
- * arrive in arbitrary pieces; the parsed section is bounded in commands and bytes.
- */
 export class ReceivePackInspector {
   constructor({ maxCommands = 64, maxBytes = 64 * 1024 } = {}) {
     this.maxCommands = maxCommands;
@@ -232,7 +203,6 @@ export class ReceivePackInspector {
   push(chunk) {
     this.pending = this.pending.length ? Buffer.concat([this.pending, chunk]) : Buffer.from(chunk);
     for (;;) {
-      // A push of deletions only carries no pack; the caller refuses deletions with their own reason.
       if (this.stage === "complete") return { done: true, commands: this.commands, capabilities: this.capabilities };
       if (this.stage === "pack") {
         if (this.pending.length < 4) return { done: false };
@@ -292,7 +262,6 @@ export class ReceivePackInspector {
   }
 }
 
-/** Every pushed ref must be a branch (or a ref the grant names exactly), inside the grant, and never a delete. */
 export function pushRefusal(commands, claims) {
   for (const command of commands) {
     if (/^0+$/.test(command.newId)) return "delete-refused";
@@ -307,10 +276,6 @@ function pktLine(bytes) {
   return Buffer.concat([Buffer.from((bytes.length + 4).toString(16).padStart(4, "0")), bytes]);
 }
 
-/**
- * A receive-pack status report that rejects every command, so Git prints `! [remote rejected] REF (reason)` instead of
- * a bare HTTP error. Wrapped in side band 1 when the client negotiated it. Undefined when the client wants no report.
- */
 export function refusalReport(commands, capabilities, reason) {
   if (!capabilities.includes("report-status") && !capabilities.includes("report-status-v2")) return undefined;
   const report = Buffer.concat([
@@ -325,20 +290,15 @@ export function refusalReport(commands, capabilities, reason) {
   return Buffer.concat([...packets, Buffer.from("0000")]);
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// HTTP service.
-
 const RESPONSE_HEADERS = ["content-type", "content-length", "content-encoding", "cache-control", "expires", "pragma", "x-github-request-id"];
 const REQUEST_TYPES = { "git-upload-pack": "application/x-git-upload-pack-request", "git-receive-pack": "application/x-git-receive-pack-request" };
 const OWNER = "[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?";
 const GIT_PATH = new RegExp(`^/(${OWNER})/([A-Za-z0-9][A-Za-z0-9._-]{0,103})/(info/refs|git-upload-pack|git-receive-pack)$`);
 const MAX_RAW_INSPECTION_BYTES = 512 * 1024;
-/** Decoded bytes the inspector may see before it must reach a verdict; the command list itself is capped at 64 KiB. */
 const MAX_DECODED_INSPECTION_BYTES = 256 * 1024;
 const MAX_REQUEST_MS = 30 * 60_000;
 const IDLE_MS = 120_000;
 
-/** Parses the raw request target. Encoded characters, dot segments, doubled slashes, and unknown queries are refused. */
 export function parseGitRoute(method, rawUrl) {
   if (typeof rawUrl !== "string" || /[%\\\x00-\x20\x7f]/.test(rawUrl)) return { ok: false, reason: "path-invalid" };
   const q = rawUrl.indexOf("?");
@@ -377,12 +337,6 @@ function bearerGrant(header) {
   return /^Bearer ([A-Za-z0-9._-]{1,4096})$/.exec(header)?.[1];
 }
 
-/**
- * A probe for extended POSIX ACLs. Resolves true when any of `paths` carries an ACL entry beyond owner, group, and
- * other (named users or groups, a mask, or a default ACL), false when none does, and undefined when that cannot be
- * ruled out: getfacl missing, failing, slow, or answering too much. Node has no ACL interface, so this asks getfacl
- * from the `acl` package, which the Ubuntu template installs. `--skip-base` prints nothing for a base-only file.
- */
 export function getfaclProbe(getfacl = "/usr/bin/getfacl", { timeoutMs = 5000 } = {}) {
   return paths => new Promise(settle => {
     let child, output = 0, done = false;
@@ -396,12 +350,6 @@ export function getfaclProbe(getfacl = "/usr/bin/getfacl", { timeoutMs = 5000 } 
   });
 }
 
-/**
- * Whether the agent account can read the token cache: "agent-readable", "proxy-only", or "unknown". Mode bits can show
- * that the agent reads it; they cannot show that it does not, because an ACL entry can grant a named account access the
- * mode bits do not reveal (and the group bits then show the ACL mask). So "proxy-only" needs the mode bits to deny the
- * agent and the probe to rule out every extended ACL on the directory and each entry in it; otherwise "unknown".
- */
 export async function agentTokenAccess(config, extendedAcl) {
   if (!config.agentUser) return "unknown";
   let verdict, paths;
@@ -422,7 +370,6 @@ export async function agentTokenAccess(config, extendedAcl) {
     verdict = "proxy-only";
     paths = [config.tokenDirectory, ...entries.map(name => join(config.tokenDirectory, name))];
   } catch { return "unknown"; }
-  // Probe in bounded batches; a single unknown answer makes the whole verdict unknown.
   for (let index = 0; index < paths.length; index += 200) {
     const acl = await extendedAcl(paths.slice(index, index + 200));
     if (acl !== false) return "unknown";
@@ -434,10 +381,6 @@ function defaultLog(record) {
   process.stdout.write(`${JSON.stringify(record)}\n`);
 }
 
-/**
- * Creates the proxy's HTTP server (not yet listening). `options.broker` handles `POST /gh`; see createGhBroker.
- * Records are one JSON object per request with no token and no grant text.
- */
 export function createGithubProxy({ config, key, log = defaultLog, now = () => Date.now(), maxConcurrent = 32, broker, extendedAcl = getfaclProbe() } = {}) {
   const tokenFor = tokenStore(config, now);
   let active = 0;
@@ -458,8 +401,6 @@ export function createGithubProxy({ config, key, log = defaultLog, now = () => D
     };
     if (active >= maxConcurrent) { reply(503, "busy"); return; }
     active++;
-    // The request's place in the limit is held by the client connection and by each upstream request made for it,
-    // and is given back when the last of them has closed. A client that leaves cannot leave upstream work uncounted.
     let holders = 1;
     const release = () => { if (--holders === 0) active--; };
     const hold = () => {
@@ -525,7 +466,6 @@ export function createGithubProxy({ config, key, log = defaultLog, now = () => D
     if (refusal) {
       const report = refusalReport(inspected.commands, inspected.capabilities, refusal);
       if (!report) return reply(403, refusal);
-      // Nothing was forwarded. The rest of the upload is read and discarded.
       if (!inspected.ended) req.resume();
       res.writeHead(200, { "content-type": "application/x-git-receive-pack-result", "cache-control": "no-store" });
       res.end(report);
@@ -534,7 +474,6 @@ export function createGithubProxy({ config, key, log = defaultLog, now = () => D
     return forward(req, res, route, token, inspected.raw, inspected.ended, reply, done, hold);
   }
 
-  /** Forwards to GitHub with the installation token. `prefix` holds body bytes already read, `ended` whether that was all. */
   function forward(req, res, route, token, prefix, ended, reply, done, hold) {
     return new Promise(settle => {
       const target = new URL(`${config.upstream}${route.upstreamPath}`);
@@ -565,7 +504,6 @@ export function createGithubProxy({ config, key, log = defaultLog, now = () => D
       upstream.once("close", hold());
       upstream.once("timeout", () => upstream.destroy(new ProxyError("upstream-timeout")));
       upstream.once("error", error => {
-        // A client that left already has its record; nothing can be sent to it.
         if (res.destroyed) return settle();
         if (!res.headersSent) reply(502, error instanceof ProxyError ? error.code : "upstream-unavailable");
         else { res.destroy(); done({ decision: "error", reason: "upstream-aborted" }); }
@@ -573,8 +511,6 @@ export function createGithubProxy({ config, key, log = defaultLog, now = () => D
       });
       req.once("aborted", () => upstream.destroy());
       req.once("error", () => upstream.destroy());
-      // A client that leaves before its response is complete ends the upstream request too. Its own request may
-      // already be complete, in which case neither `aborted` nor `error` fires on it.
       res.once("close", () => { if (!res.writableFinished) upstream.destroy(); });
       for (const chunk of prefix) upstream.write(chunk);
       if (ended || route.kind === "advertise") upstream.end();
@@ -584,13 +520,6 @@ export function createGithubProxy({ config, key, log = defaultLog, now = () => D
   return server;
 }
 
-/**
- * Reads the request until the command list is checked, and returns the raw bytes read so far, which are forwarded
- * unchanged. A gzip body is decoded one received chunk at a time: the request stays paused until zlib has decoded that
- * chunk and the inspector has seen the output, so the raw bound measures the compressed command list rather than how
- * far the network ran ahead of zlib. The decoded bytes are bounded too, so a small compressed body cannot expand
- * without limit. On success the request is left paused for forwarding.
- */
 export function inspectReceivePack(req, gzip, { maxRawBytes = MAX_RAW_INSPECTION_BYTES, maxDecodedBytes = MAX_DECODED_INSPECTION_BYTES } = {}) {
   return new Promise((resolveInspection, reject) => {
     const inspector = new ReceivePackInspector();
@@ -603,7 +532,6 @@ export function inspectReceivePack(req, gzip, { maxRawBytes = MAX_RAW_INSPECTION
       req.off("data", onData);
       req.off("end", onEnd);
       gunzip?.destroy();
-      // A refused body is read and discarded so the response can be sent; an accepted one waits for forwarding.
       if (error) { req.resume(); reject(error); }
       else { req.pause(); resolveInspection({ ...result, raw, ended }); }
     };
@@ -640,9 +568,6 @@ export function inspectReceivePack(req, gzip, { maxRawBytes = MAX_RAW_INSPECTION
   });
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// The gh broker: an allowlist of pull request commands, run as the proxy account with the token in gh's environment.
-
 const TEXT_MAX = 1024;
 const BODY_MAX = 65536;
 const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -659,13 +584,6 @@ const VALUES = {
   sha: value => SHA.test(value),
 };
 const REPEATABLE = new Set(["label", "reviewer", "assignee"]);
-/**
- * Allowed `gh pr` subcommands. Every other gh command, and every flag not listed, is refused: notably --web, --editor,
- * --body-file with a path, --template, --recover, --fill (local Git), --jq (its $ENV would expose GH_TOKEN), --admin,
- * --delete-branch, --auto, and --watch. Commands marked `writes` act only on a pull request whose head branch is in this
- * repository and covered by the grant's refs: `create` checks `--head`, the others are resolved first (see
- * resolvePullRequest). Reads (view, list, checks) cover every pull request in the granted repository.
- */
 const GH_COMMANDS = {
   create: { op: "pr", selector: false, writes: true, required: ["head", "base", "title"],
     flags: { head: "branch", base: "branch", title: "text", body: "body", "body-file": "stdin", draft: "bool", label: "text", reviewer: "text", assignee: "text" },
@@ -687,10 +605,6 @@ function flagLabel(token) {
   return /^-{1,2}[A-Za-z][A-Za-z-]{0,40}$/.test(name) ? `:${name}` : "";
 }
 
-/**
- * Parses `argv` (without the leading `gh`) strictly against the allowlist and returns the argv to run, with the
- * repository always set from the grant. Throws ProxyError with a short reason.
- */
 export function parseGhCommand(argv, claims) {
   if (!Array.isArray(argv) || argv.length < 2 || argv.length > 64 || !argv.every(arg => typeof arg === "string" && arg.length <= BODY_MAX && !arg.includes("\0")))
     throw new ProxyError("argv-invalid");
@@ -726,8 +640,6 @@ export function parseGhCommand(argv, claims) {
       if (inline !== undefined) value = inline;
       else {
         value = argv[++index];
-        // A separate value that looks like a flag is ambiguous and refused; such text needs --flag=value. A Markdown
-        // list item ("- item") or stdin ("-") is not a flag. Every value is passed on as --flag=value, never alone.
         if (value === undefined || /^--?[A-Za-z]/.test(value)) throw new ProxyError(`flag-value-missing${flagLabel(token)}`);
       }
       if (!VALUES[kind](value)) throw new ProxyError(`flag-value-refused${flagLabel(token)}`);
@@ -751,11 +663,6 @@ export function parseGhCommand(argv, claims) {
   return { args, stdin: values.has("body-file"), resolve: spec.writes === true && spec.selector };
 }
 
-/**
- * Before a write to an existing pull request, looks it up with the token and checks that its head branch is in the
- * granted repository and covered by the grant's refs. The command then runs against the resolved number, so gh cannot
- * pick a different pull request for a branch selector. Returns a refusal reason, or undefined after rewriting `args`.
- */
 async function resolvePullRequest(githubCli, parsed, claims, token) {
   const lookup = await runGh(githubCli, ["pr", "view", parsed.args[2], "--json=number,headRefName,isCrossRepository", `--repo=${claims.repo}`], undefined, token);
   let pr;
@@ -828,7 +735,6 @@ function readJsonBody(req, max) {
   });
 }
 
-/** Handles `POST /gh` with `{ argv, stdin? }` and answers `{ code, stdout, stderr, truncated }`. */
 export function createGhBroker(config, { maxConcurrent = 4 } = {}) {
   let running = 0;
   return async (req, res, claims, token, record, reply, done) => {
@@ -854,8 +760,6 @@ export function createGhBroker(config, { maxConcurrent = 4 } = {}) {
     done({ decision: "allow", reason: "ran", status: 200, exitCode: result.code });
   };
 }
-
-// ---------------------------------------------------------------------------------------------------------------
 
 function listen(server, config) {
   const fds = Number(process.env.LISTEN_FDS);

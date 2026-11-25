@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// Prepare Infinite's backend without replacing the installed Codex frontend.
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createWriteStream } from "node:fs";
@@ -52,9 +51,6 @@ try {
   await run("tar", ["-xzf", archive, "-C", directory]);
   const source = join(directory, `codex-rust-v${version}`), workspace = join(source, "codex-rs");
   await run("patch", ["-p1", "-i", patchPath], source);
-  // The release tag stamps workspace manifests, while its lock metadata still
-  // says 0.0.0. Adjust only source-less workspace package versions; registry and
-  // Git dependencies remain unchanged and Cargo still builds with --locked.
   const lockPath = join(workspace, "Cargo.lock"), lock = await readFile(lockPath, "utf8");
   const stampedLock = lock.split("\n[[package]]\n").map(block =>
     /^source = /m.test(block) ? block : block.replace(/^version = "0\.0\.0"$/m, `version = "${version}"`)
@@ -63,8 +59,6 @@ try {
   await run("rustup", ["run", toolchain, "cargo", "build", "--locked", "-j", "4", "-p", "codex-app-server", "--bin", "codex-app-server"], workspace, {
     ...process.env, CARGO_TARGET_DIR: target, CARGO_PROFILE_DEV_DEBUG: "0", CARGO_INCREMENTAL: "0",
   });
-  // Use the companion shipped in the pinned official distribution. Its V8
-  // runtime is distributed as a binary and is not part of the app-server patch.
   const stock = join(directory, "stock");
   await mkdir(stock, { mode: 0o700 });
   await writeFile(join(stock, "package.json"), '{"name":"infinite-codex-runtime","version":"0.0.0","private":true}\n');
@@ -77,8 +71,6 @@ try {
     throw new Error("The official code-mode helper version does not match the backend.");
   const triple = `${process.arch === "x64" ? "x86_64" : "aarch64"}-${process.platform === "linux" ? "unknown-linux-musl" : "apple-darwin"}`;
   const helper = join(dirname(platformPackage), "vendor", triple, "bin", "codex-code-mode-host");
-  // Qualify the complete publishable bundle, including the helper used by
-  // code-mode-only models. Direct exec_command probes cannot detect its absence.
   const bundle = join(directory, "bin"), names = ["codex-code-mode-host", "codex-app-server"];
   await mkdir(bundle, { mode: 0o700 });
   for (const name of names) {
@@ -88,7 +80,6 @@ try {
   await run(process.execPath, [join(repository, "scripts/qualify-codex-handoff.mjs"), "--app-server", join(bundle, "codex-app-server")], repository);
   const bin = join(local, "codex-handoff", "bin");
   await mkdir(bin, { recursive: true, mode: 0o700 });
-  // Publish the same-version companion before making the new backend visible.
   for (const name of names) {
     const staged = join(bin, `.${name}-next`);
     await copyFile(join(bundle, name), staged); await chmod(staged, 0o700);

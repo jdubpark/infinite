@@ -29,6 +29,16 @@ function gone(pid: number): boolean {
   }
 }
 
+function ended(pid: number): boolean {
+  if (gone(pid)) return true;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.charAt(stat.lastIndexOf(")") + 2) === "Z";
+  } catch {
+    return false;
+  }
+}
+
 async function until(what: string, ready: () => boolean) {
   const deadline = Date.now() + WAIT_MS;
   while (!ready()) {
@@ -170,7 +180,7 @@ test("a stop while the leader runs kills its group as before", CASE, async () =>
     const settled = await result;
     assert.equal(settled.interrupted, true);
     assert.equal(settled.leftover, false);
-    await until("the sleep in the leader's group ends", () => gone(sleep));
+    await until("the sleep in the leader's group ends", () => ended(sleep));
   } finally {
     run.dispose();
   }
@@ -248,13 +258,22 @@ test("a command whose output ended while the loop was busy past the drain settle
 });
 
 const SUDO_ACCOUNT = "nobody";
+const SUDO_BASE = "/tmp";
+function sharedDirectory() {
+  const base = mkdtempSync(join(SUDO_BASE, "team-command-stop-"));
+  chmodSync(base, 0o777);
+  return base;
+}
 const sudoUnavailable = (() => {
   if (process.platform !== "linux") return "the sudo cases run on Linux";
+  const probe = sharedDirectory();
   try {
-    execFileSync("sudo", ["-n", "-u", SUDO_ACCOUNT, "--", "true"], { stdio: "ignore", timeout: 10_000 });
+    execFileSync("sudo", ["-n", "-u", SUDO_ACCOUNT, "--", "sh", "-c", ": > \"$1\"", "probe", join(probe, "probe")], { stdio: "ignore", timeout: 10_000 });
     return false;
   } catch {
-    return `sudo -n -u ${SUDO_ACCOUNT} is not permitted on this machine`;
+    return `sudo -n -u ${SUDO_ACCOUNT} cannot write to a directory under ${SUDO_BASE} on this machine`;
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
   }
 })();
 const SUDO_CASE = { timeout: 30_000, skip: sudoUnavailable };
@@ -277,12 +296,6 @@ const ignoresTerm = (leader: string) => nodeCommand([
   "require('node:fs').writeFileSync(process.argv[1], process.pid + '\\n');",
   "setInterval(() => {}, 1000);",
 ], leader);
-
-function sharedDirectory() {
-  const base = mkdtempSync(join(tmpdir(), "team-command-stop-"));
-  chmodSync(base, 0o777);
-  return base;
-}
 
 async function stopRun(command: Command, cwd: string, pidFile: string, prefix?: Command, bound?: number) {
   const controller = new AbortController();
@@ -313,7 +326,7 @@ test("a stop sends SIGTERM to the command's group first: a command that ends on 
     assert.ok(waited < STOP_GRACE_MS, `settled ${waited.toFixed(0)} ms after the stop`);
     assert.equal(settled.interrupted, true);
     assert.equal(readFileSync(marker, "utf8").trim(), "SIGTERM");
-    await until("the sleep in the leader's group ends", () => gone(sleep));
+    await until("the sleep in the leader's group ends", () => ended(sleep));
   } finally {
     run.dispose();
   }
@@ -332,7 +345,7 @@ test("a command whose group ignores SIGTERM is killed with its group when the gr
     assert.ok(waited >= STOP_GRACE_MS - 50, `settled ${waited.toFixed(0)} ms after the stop, before the grace ended`);
     assert.ok(waited < STOP_GRACE_MS + 3_000, `settled ${waited.toFixed(0)} ms after the stop`);
     assert.equal(settled.interrupted, true);
-    await until("the leader and its sleep end", () => gone(leader) && gone(sleep));
+    await until("the leader and its sleep end", () => gone(leader) && ended(sleep));
   } finally {
     run.dispose();
   }
@@ -362,7 +375,7 @@ test("a command that ignores the relayed SIGTERM outlives its prefix, and the ca
     assert.ok("error" in stopped && stopped.error instanceof TeamError && stopped.error.code === "command-stop-unconfirmed", JSON.stringify(stopped));
     assert.ok(stopped.waited >= bound - 50, `answered ${stopped.waited.toFixed(0)} ms after the stop`);
     assert.equal(gone(stopped.leader), true, "the prefix was killed when the grace ended");
-    assert.equal(gone(stopped.pid), false, "the command outside the prefix's group still runs");
+    assert.equal(ended(stopped.pid), false, "the command outside the prefix's group still runs");
   } finally {
     const pid = pidIn(pidFile);
     if (pid !== undefined && pid > 1 && !gone(pid)) process.kill(pid, "SIGKILL");
@@ -373,19 +386,19 @@ test("a command that ignores the relayed SIGTERM outlives its prefix, and the ca
 test("under sudo the relayed SIGTERM ends a command that ends on it, and the stop settles at once", SUDO_CASE, async () => {
   const base = sharedDirectory(), pidFile = join(base, "pid");
   try {
-    const stopped = await stopRun({ command: "sh", args: ["-c", `echo $$ > '${pidFile}'; exec sleep 30`] }, base, pidFile, SUDO);
+    const stopped = await stopRun({ command: "sh", args: ["-c", `echo $$ > '${pidFile}' || exit 1; exec sleep 30`] }, base, pidFile, SUDO);
     assert.ok("value" in stopped, String("error" in stopped && stopped.error));
     assert.equal(stopped.value.interrupted, true);
     assert.ok(stopped.waited < STOP_GRACE_MS, `settled ${stopped.waited.toFixed(0)} ms after the stop`);
-    await until("the command run as the other account ends", () => gone(stopped.pid));
+    await until("the command run as the other account ends", () => ended(stopped.pid));
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
 });
 
 for (const [name, script] of [
-  ["a command that ignores SIGTERM", (pidFile: string) => `trap '' TERM; echo $$ > '${pidFile}'; while :; do sleep 1; done`],
-  ["a child of a first process that ends on SIGTERM", (pidFile: string) => `sleep 30 & echo $! > '${pidFile}'; wait`],
+  ["a command that ignores SIGTERM", (pidFile: string) => `trap '' TERM; echo $$ > '${pidFile}' || exit 1; while :; do sleep 1; done`],
+  ["a child of a first process that ends on SIGTERM", (pidFile: string) => `sleep 30 & echo $! > '${pidFile}' || { kill $!; exit 1; }; wait`],
 ] as const) {
   test(`under sudo ${name} keeps running after the stop, and the caller's bound answers stop-unconfirmed`, SUDO_CASE, async () => {
     const base = sharedDirectory(), pidFile = join(base, "pid"), bound = STOP_GRACE_MS + 2_000;
@@ -395,7 +408,7 @@ for (const [name, script] of [
       group = stopped.leader;
       assert.ok("error" in stopped && stopped.error instanceof TeamError && stopped.error.code === "command-stop-unconfirmed", JSON.stringify(stopped));
       assert.ok(stopped.waited >= bound - 50, `answered ${stopped.waited.toFixed(0)} ms after the stop`);
-      assert.equal(gone(stopped.pid), false, "the process run as the other account still runs");
+      assert.equal(ended(stopped.pid), false, "the process run as the other account still runs");
     } finally {
       if (group !== undefined) try { execFileSync("sudo", ["-n", "-u", SUDO_ACCOUNT, "--", "kill", "-KILL", "--", `-${group}`], { stdio: "ignore", timeout: 10_000 }); } catch { }
       rmSync(base, { recursive: true, force: true });

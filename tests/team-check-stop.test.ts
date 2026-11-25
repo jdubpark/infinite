@@ -38,13 +38,22 @@ const SUDO_RELAY = [
   `if [ "$2" = "$check" ]; then exec sudo -n -u ${SUDO_ACCOUNT} -- "$@"; fi`,
   "exec \"$@\"",
 ].join("\n");
+const SUDO_BASE = "/tmp";
+function sharedDirectory(base: string) {
+  const shared = mkdtempSync(join(base, "team-check-stop-"));
+  chmodSync(shared, 0o777);
+  return shared;
+}
 const sudoUnavailable = (() => {
   if (process.platform !== "linux") return "the sudo case runs on Linux";
+  const probe = sharedDirectory(SUDO_BASE);
   try {
-    execFileSync("sudo", ["-n", "-u", SUDO_ACCOUNT, "--", process.execPath, "-e", ""], { stdio: "ignore", timeout: 10_000 });
+    execFileSync("sudo", ["-n", "-u", SUDO_ACCOUNT, "--", process.execPath, "-e", "require('node:fs').writeFileSync(process.argv[1], '')", join(probe, "probe")], { stdio: "ignore", timeout: 10_000 });
     return false;
   } catch {
-    return `sudo -n -u ${SUDO_ACCOUNT} cannot run this Node on this machine`;
+    return `sudo -n -u ${SUDO_ACCOUNT} cannot run this Node and write to a directory under ${SUDO_BASE} on this machine`;
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
   }
 })();
 
@@ -64,9 +73,8 @@ function entries(file: string) {
   }) : [];
 }
 
-async function stoppedCheckFencesTheWorkspace(prefixFor: (log: string, check: string) => TeamCommand, endCheck: (pid: number) => void) {
-  const shared = mkdtempSync(join(tmpdir(), "team-check-stop-"));
-  chmodSync(shared, 0o777);
+async function stoppedCheckFencesTheWorkspace(base: string, prefixFor: (log: string, check: string) => TeamCommand, endCheck: (pid: number) => void) {
+  const shared = sharedDirectory(base);
   const checkFile = join(shared, "check.cjs"), checkLog = join(shared, "check.log"), release = join(shared, "release"), commands = join(shared, "commands.log");
   writeFileSync(checkFile, CHECK, { mode: 0o644 });
   const f = await fixture("lifecycle", undefined, { teams: { checkMinutes: 0.05, commandPrefix: prefixFor(commands, checkFile) } });
@@ -114,7 +122,7 @@ async function stoppedCheckFencesTheWorkspace(prefixFor: (log: string, check: st
 test("a check that ignores the relayed SIGTERM blocks its run at the stop bound, and no command starts in the workspace until it ends", {
   timeout: 150_000, skip: process.platform === "win32" && "process groups are POSIX",
 }, async () => {
-  await stoppedCheckFencesTheWorkspace(
+  await stoppedCheckFencesTheWorkspace(tmpdir(),
     (log) => ({ command: process.execPath, args: ["-e", RELAY, log] }),
     pid => process.kill(pid, "SIGKILL"));
 });
@@ -122,7 +130,7 @@ test("a check that ignores the relayed SIGTERM blocks its run at the stop bound,
 test("under sudo, a check that ignores SIGTERM blocks its run at the stop bound, and no command starts in the workspace until it ends", {
   timeout: 150_000, skip: sudoUnavailable,
 }, async () => {
-  await stoppedCheckFencesTheWorkspace(
+  await stoppedCheckFencesTheWorkspace(SUDO_BASE,
     (log, check) => ({ command: "/bin/sh", args: ["-c", SUDO_RELAY, "prefix", log, check] }),
     pid => { try { execFileSync("sudo", ["-n", "-u", SUDO_ACCOUNT, "--", "kill", "-KILL", String(pid)], { stdio: "ignore", timeout: 10_000 }); } catch { } });
 });

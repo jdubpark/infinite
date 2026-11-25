@@ -265,6 +265,7 @@ async function waitForPeer() {
 // Goal plans use only the active record supplied in this member's host-written context. Path checks map to the task
 // that owns that path; tasks without a narrower artifact target advance c0, the owner's success criterion.
 function withGoalCriterionRefs(tasks) {
+  if (!(receipt.prompt ?? process.argv.at(-1) ?? "").includes("Task criterion references for this goal plan:")) return tasks;
   const context = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8"));
   const record = context.authority?.goal?.record;
   if (!record || !Number.isInteger(record.version) || !Array.isArray(record.criteria) || record.criteria.length === 0) return tasks;

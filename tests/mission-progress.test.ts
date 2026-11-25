@@ -241,18 +241,18 @@ test("same-mission reads coalesce and concurrent worker probes stay under the ho
       state: async () => { stateReads++; await blocker; return { status: "running" }; },
     },
   });
-  const firstRead = coalesced.read(id);
-  const secondRead = coalesced.read(id);
+  const readers = Array.from({ length: 100 }, () => coalesced.read(id));
   assert.equal(missionReads, 1);
   assert.equal(stateReads, 1);
   release();
-  const [firstPage, secondPage] = await Promise.all([firstRead, secondRead]);
-  assert.equal(firstPage.cursor, secondPage.cursor);
+  const shared = await Promise.all(readers);
+  assert.equal(new Set(shared.map(page => page.cursor)).size, 1);
 
   let active = 0;
   let maximumActive = 0;
-  const releases: (() => void)[] = [];
-  const ids = Array.from({ length: 20 }, () => randomUUID());
+  let releaseProbes!: () => void;
+  const heldProbes = new Promise<void>(resolve => { releaseProbes = resolve; });
+  const ids = Array.from({ length: 100 }, () => randomUUID());
   const bounded = new MissionProgressService({
     missions: { progressSource: requestedId => ({ ...source(), id: requestedId, coordinator: { runId: requestedId, memberId: requestedId, sessionId: requestedId, revision: 1, role: "mission-coordinator", status: "running" }, subtasks: [] }) },
     teams: { missionProgressChild: () => ({ kind: "missing" }) },
@@ -262,7 +262,7 @@ test("same-mission reads coalesce and concurrent worker probes stay under the ho
         stateReads++;
         active++;
         maximumActive = Math.max(maximumActive, active);
-        await new Promise<void>(resolve => releases.push(resolve));
+        await heldProbes;
         active--;
         return { status: "running" };
       },
@@ -270,11 +270,16 @@ test("same-mission reads coalesce and concurrent worker probes stay under the ho
   });
   const pages = Promise.all(ids.map(requestedId => bounded.read(requestedId)));
   assert.equal(maximumActive, 8);
-  assert.equal(stateReads, 9, "only eight cross-mission liveness calls start while one prior call is still blocked");
-  for (const done of releases) done();
+  assert.equal(stateReads, 9, "the shared read and eight cross-mission liveness probes started");
+  releaseProbes();
   const results = await pages;
   assert.equal(maximumActive, 8);
-  assert.equal(results.filter(page => page.snapshot.mission.coordinator?.workerStatus === "not-sampled").length, 12);
+  const unsampled = results.filter(page => page.snapshot.mission.coordinator?.workerStatus === "not-sampled");
+  assert.equal(unsampled.length, 92);
+  for (const page of unsampled) {
+    const retry = await bounded.read(page.missionId, page.cursor);
+    assert.equal(retry.snapshot.mission.coordinator?.workerStatus, "running");
+  }
 });
 
 test("child projection rejects a run whose mission or project binding does not match", () => {

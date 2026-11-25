@@ -600,7 +600,7 @@ export class IntakeSlackSurface {
     if ((element.type === "button" && action.value !== element.value)
       || (element.type === "static_select" && action.value !== undefined && !optionValues.includes(action.value))
       || (element.type === "multi_static_select" && action.selectedValues?.some(value => !optionValues.includes(value)))) { this.droppedCount += 1; return; }
-    if (message.status === "pending" && message.uncertain) {
+    if (message.status !== "sent" && message.uncertain) {
       const messages = await this.client.thread(record.thread);
       const found = Array.isArray(messages) ? messages.find(item => item.key === `${issueId}:${message.key}` && item.ts === interaction.messageTs) : undefined;
       if (found) this.patch(issueId, message.key, item => ({ ...messageBase(item), status: "sent", ts: found.ts }));

@@ -1,8 +1,58 @@
 import type { ConnectorSource } from "./mcp-types.js";
 import type { CheckScan } from "./team-check-output.js";
+import type { UsageTotals } from "./usage.js";
+import type { UsageRollup } from "./team-usage.js";
 import { z } from "zod";
 import { questionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
 import { INTERRUPT_CLASSES, REJECT_CODES, type InterruptClass, type RejectCode } from "./permission-policy.js";
+
+const nonNegInt = z.number().int().min(0);
+const usageTokensSchema = z.object({
+  input: nonNegInt,
+  output: nonNegInt,
+  reasoning: nonNegInt,
+  cacheRead: nonNegInt,
+  cacheWrite: nonNegInt,
+}).strict();
+const usagePricingSchema = z.object({
+  configured: nonNegInt,
+  catalog: nonNegInt,
+  provider: nonNegInt,
+  unknown: nonNegInt,
+}).strict();
+export const usageTotalsSchema: z.ZodType<UsageTotals> = z.object({
+  cost: z.number().min(0),
+  tokens: usageTokensSchema,
+  messages: nonNegInt,
+  pricing: usagePricingSchema,
+}).strict();
+const providerUsageMapSchema = z.object({
+  claude: usageTotalsSchema.optional(),
+  codex: usageTotalsSchema.optional(),
+  grok: usageTotalsSchema.optional(),
+  opencode: usageTotalsSchema.optional(),
+  demo: usageTotalsSchema.optional(),
+}).strict();
+export const usageRollupSchema: z.ZodType<UsageRollup> = z.object({
+  total: usageTotalsSchema,
+  byProfile: z.record(z.string().min(1), usageTotalsSchema),
+  byProvider: providerUsageMapSchema,
+  unmeasuredMembers: nonNegInt,
+  partialMembers: nonNegInt,
+  unavailable: z.literal(true).optional(),
+}).strict();
+export const goalCycleUsageSchema: z.ZodType<UsageTotals & UsageRollup> = z.object({
+  cost: z.number().min(0),
+  tokens: usageTokensSchema,
+  messages: nonNegInt,
+  pricing: usagePricingSchema,
+  total: usageTotalsSchema,
+  byProfile: z.record(z.string().min(1), usageTotalsSchema),
+  byProvider: providerUsageMapSchema,
+  unmeasuredMembers: nonNegInt,
+  partialMembers: nonNegInt,
+  unavailable: z.literal(true).optional(),
+}).strict();
 
 export const commitHashSchema = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i);
 export const connectorSourceSchema = z.object({ kind: z.literal("connector"), id: z.string().min(1), name: z.string().min(1) }).strict();
@@ -214,15 +264,20 @@ export type TeamDecisionState =
   | { state: "open"; decision: OpenTeamDecision }
   | { state: "answered"; decision: AnsweredTeamDecision };
 export function isOpenTeamDecision(decision: TeamDecision): decision is OpenTeamDecision {
-  return decision.answer === undefined;
+  return decision.answer === undefined
+    && decision.answeredBy === undefined
+    && decision.answeredAt === undefined
+    && decision.source === undefined;
 }
 export function isAnsweredTeamDecision(decision: TeamDecision): decision is AnsweredTeamDecision {
-  return decision.answer !== undefined;
+  if (typeof decision.answer !== "string" || decision.answer.length === 0) return false;
+  if (decision.source !== undefined && decision.answeredBy !== "connector") return false;
+  return true;
 }
 export function projectTeamDecision(decision: TeamDecision): TeamDecisionState {
+  if (isOpenTeamDecision(decision)) return { state: "open", decision };
   if (isAnsweredTeamDecision(decision)) return { state: "answered", decision };
-  const { answer: _answer, answeredBy: _answeredBy, source: _source, answeredAt: _answeredAt, ...open } = decision;
-  return { state: "open", decision: open };
+  throw new Error("Invalid team decision state: answer, answeredBy, answeredAt, and source are inconsistent.");
 }
 const teamDecisionBaseShape = {
   id: z.string().min(1),
@@ -271,13 +326,19 @@ export type PassedTeamCheck = TeamCheckBase & { status: "passed"; finishedAt: st
 export type FailedTeamCheck = TeamCheckBase & { status: "failed" | "interrupted"; finishedAt: string; exitCode?: number | null; scan?: CheckScan };
 export type TeamCheckState = RunningTeamCheck | PassedTeamCheck | FailedTeamCheck;
 export function isRunningTeamCheck(check: TeamCheck): check is RunningTeamCheck {
-  return check.status === "running";
+  return check.status === "running"
+    && check.finishedAt === undefined
+    && check.exitCode === undefined
+    && check.scan === undefined;
 }
 export function isPassedTeamCheck(check: TeamCheck): check is PassedTeamCheck {
-  return check.status === "passed" && check.finishedAt !== undefined;
+  return check.status === "passed"
+    && check.finishedAt !== undefined
+    && check.scan === undefined;
 }
 export function isFailedTeamCheck(check: TeamCheck): check is FailedTeamCheck {
-  return (check.status === "failed" || check.status === "interrupted") && check.finishedAt !== undefined;
+  return (check.status === "failed" || check.status === "interrupted")
+    && check.finishedAt !== undefined;
 }
 const checkScanSchema = z.object({
   bytes: z.number().int().min(0),
@@ -292,7 +353,7 @@ const teamCheckBaseShape = {
   startedAt: z.iso.datetime(),
   output: z.string(),
   revision: z.number().int().min(1),
-  round: z.number().int().min(1).optional(),
+  round: z.number().int().min(0).optional(),
 };
 export const teamCheckSchema: z.ZodType<TeamCheckState> = z.discriminatedUnion("status", [
   z.object({ ...teamCheckBaseShape, status: z.literal("running") }).strict(),

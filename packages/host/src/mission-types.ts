@@ -1,6 +1,6 @@
 import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
-import { blockerEvidenceSchema, type TeamLineup, type TeamStatus } from "./team-types.js";
+import { blockerEvidenceSchema, usageRollupSchema, type TeamLineup, type TeamStatus } from "./team-types.js";
 import type { UsageRollup } from "./team-usage.js";
 import { projectGroupIdSchema } from "./project-group-types.js";
 import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
@@ -79,30 +79,73 @@ export type QueuedMissionSubtask = MissionSubtaskPlan & {
   finalEvidence?: never;
 };
 export type ActiveMissionSubtask = MissionSubtaskPlan & {
-  status: "running" | "done" | "blocked";
+  status: "running" | "done";
   teamId: string;
   teamStatus?: TeamStatus;
   finalEvidence?: never;
 };
+export type BlockedBeforeLaunchMissionSubtask = MissionSubtaskPlan & {
+  status: "blocked";
+  teamId?: never;
+  teamStatus?: never;
+  finalEvidence?: never;
+};
+export type BlockedSubteamMissionSubtask = MissionSubtaskPlan & {
+  status: "blocked";
+  teamId: string;
+  teamStatus?: TeamStatus;
+  finalEvidence?: never;
+};
+export type BlockedMissionSubtask = BlockedBeforeLaunchMissionSubtask | BlockedSubteamMissionSubtask;
 export type CancelledMissionSubtask = MissionSubtaskPlan & {
   status: "cancelled";
   teamId?: string;
   teamStatus?: TeamStatus;
   finalEvidence?: MissionSubtaskFinalEvidence;
 };
-export type MissionSubtaskState = QueuedMissionSubtask | ActiveMissionSubtask | CancelledMissionSubtask;
+export type MissionSubtaskState =
+  | QueuedMissionSubtask
+  | ActiveMissionSubtask
+  | BlockedMissionSubtask
+  | CancelledMissionSubtask;
 export function projectMissionSubtask(subtask: MissionSubtask): MissionSubtaskState {
   if (subtask.status === "queued") {
+    if (subtask.teamId !== undefined || subtask.teamStatus !== undefined || subtask.finalEvidence !== undefined) {
+      throw new Error("Invalid mission subtask state: queued subtask cannot carry teamId, teamStatus, or finalEvidence.");
+    }
     const { teamId: _teamId, teamStatus: _teamStatus, finalEvidence: _finalEvidence, ...base } = subtask;
     return { ...base, status: "queued" };
   }
   if (subtask.status === "cancelled") {
+    if (subtask.teamId === "") {
+      throw new Error("Invalid mission subtask state: teamId cannot be empty.");
+    }
     return { ...subtask, status: "cancelled" };
   }
+  if (subtask.finalEvidence !== undefined) {
+    throw new Error(`Invalid mission subtask state: ${subtask.status} subtask cannot carry finalEvidence.`);
+  }
+  if (subtask.status === "blocked") {
+    if (subtask.teamId === undefined) {
+      if (subtask.teamStatus !== undefined) {
+        throw new Error("Invalid mission subtask state: launch-blocked subtask without teamId cannot carry teamStatus.");
+      }
+      const { teamId: _teamId, teamStatus: _teamStatus, finalEvidence: _finalEvidence, ...base } = subtask;
+      return { ...base, status: "blocked" };
+    }
+    if (subtask.teamId.length === 0) {
+      throw new Error("Invalid mission subtask state: teamId cannot be empty.");
+    }
+    const { finalEvidence: _finalEvidence, ...rest } = subtask;
+    return { ...rest, status: "blocked", teamId: subtask.teamId };
+  }
+  if (typeof subtask.teamId !== "string" || subtask.teamId.length === 0) {
+    throw new Error(`Invalid mission subtask state: ${subtask.status} subtask requires a non-empty teamId.`);
+  }
   const { finalEvidence: _finalEvidence, ...rest } = subtask;
-  return { ...rest, status: subtask.status, teamId: subtask.teamId ?? "" };
+  return { ...rest, status: subtask.status, teamId: subtask.teamId };
 }
-export const missionSubtaskSchema = z.discriminatedUnion("status", [
+export const missionSubtaskSchema: z.ZodType<MissionSubtaskState> = z.union([
   missionSubtaskPlanSchema.extend({ status: z.literal("queued") }).strict(),
   missionSubtaskPlanSchema.extend({
     status: z.literal("running"),
@@ -114,6 +157,7 @@ export const missionSubtaskSchema = z.discriminatedUnion("status", [
     teamId: z.string().min(1),
     teamStatus: z.enum(teamStatusValues).optional(),
   }).strict(),
+  missionSubtaskPlanSchema.extend({ status: z.literal("blocked") }).strict(),
   missionSubtaskPlanSchema.extend({
     status: z.literal("blocked"),
     teamId: z.string().min(1),
@@ -126,6 +170,7 @@ export const missionSubtaskSchema = z.discriminatedUnion("status", [
     finalEvidence: z.object({
       reason: z.string().optional(),
       headCommit: z.string().optional(),
+      usage: usageRollupSchema.optional(),
     }).strict().optional(),
   }).strict(),
 ]);
@@ -157,16 +202,25 @@ export type AnsweredMissionDecision = MissionDecisionCore & (
 export type MissionDecisionState =
   | { state: "open"; decision: OpenMissionDecision }
   | { state: "answered"; decision: AnsweredMissionDecision };
+const validMissionDecisionForwarding = (decision: MissionDecision) =>
+  decision.childDecisionId === undefined || decision.subtaskId !== undefined;
 export function isOpenMissionDecision(decision: MissionDecision): decision is OpenMissionDecision {
-  return decision.answer === undefined;
+  return validMissionDecisionForwarding(decision)
+    && decision.answer === undefined
+    && decision.answeredAt === undefined
+    && decision.answeredBy === undefined
+    && decision.source === undefined;
 }
 export function isAnsweredMissionDecision(decision: MissionDecision): decision is AnsweredMissionDecision {
-  return decision.answer !== undefined;
+  if (!validMissionDecisionForwarding(decision)) return false;
+  if (typeof decision.answer !== "string" || decision.answer.length === 0) return false;
+  if (decision.source !== undefined && decision.answeredBy !== "connector") return false;
+  return true;
 }
 export function projectMissionDecision(decision: MissionDecision): MissionDecisionState {
+  if (isOpenMissionDecision(decision)) return { state: "open", decision };
   if (isAnsweredMissionDecision(decision)) return { state: "answered", decision };
-  const { answer: _answer, answeredAt: _answeredAt, answeredBy: _answeredBy, source: _source, ...open } = decision;
-  return { state: "open", decision: open };
+  throw new Error("Invalid mission decision state: answer, answeredBy, answeredAt, source, or forwarding fields are inconsistent.");
 }
 const missionDecisionBaseShape = {
   id: z.string().min(1),

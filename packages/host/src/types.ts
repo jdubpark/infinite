@@ -336,12 +336,15 @@ export interface TeamPermissionExpansionExpectation {
   targetCwd: string;
   expiresAt: string;
 }
+export type TeamMemberAssignment = Omit<import("./team-types.js").TeamAssignment, "role"> & {
+  role: import("./team-types.js").TeamRole;
+};
 interface TeamAnswerWorkerRequestBase {
   op: "team-answer";
   requestId: string;
   decisionId: string;
   targetSessionId: string;
-  assignment: import("./team-types.js").TeamAssignment;
+  assignment: TeamMemberAssignment;
   targetCwd: string;
   expiresAt: string;
   policyHash: string;
@@ -360,13 +363,24 @@ export type TeamAnswerWorkerRequest =
     })
   | (TeamAnswerWorkerRequestBase & {
       coordinatorMemberId?: never;
-      choice: "accept" | "reject";
+      choice: "accept";
+      text?: never;
+    })
+  | (TeamAnswerWorkerRequestBase & {
+      coordinatorMemberId?: never;
+      choice: "reject";
       text?: string;
     });
-const controlActorSchema = z.object({ id: z.string().min(1), label: z.string().min(1) }).strict();
-const teamAssignmentSchema = z.object({
-  runId: z.string().min(1),
-  memberId: z.string().min(1),
+const noControlChars = /^[^\x00-\x1f\x7f]*$/;
+const uuidString = /^[a-f0-9-]{36}$/i;
+const sha256Hex = /^[a-f0-9]{64}$/i;
+const controlActorSchema = z.object({
+  id: z.string().min(1).max(128).regex(noControlChars),
+  label: z.string().min(1).max(120).regex(noControlChars),
+}).strict();
+const teamMemberAssignmentSchema = z.object({
+  runId: z.string().regex(uuidString),
+  memberId: z.string().regex(uuidString),
   revision: z.number().int().min(1),
   role: z.enum([
     "permission-coordinator",
@@ -379,33 +393,32 @@ const teamAssignmentSchema = z.object({
     "intent-checker",
     "evaluator",
     "judge",
-    "mission-coordinator",
   ]),
-  taskId: z.string().min(1).optional(),
+  taskId: z.string().optional(),
   verificationRefused: z.literal(true).optional(),
   entryTools: z.literal(true).optional(),
   hostProfiles: z.literal(true).optional(),
 }).strict();
 const teamAnswerBaseShape = {
   op: z.literal("team-answer"),
-  requestId: z.uuid(),
-  decisionId: z.uuid(),
-  targetSessionId: z.uuid(),
-  assignment: teamAssignmentSchema,
-  targetCwd: z.string().min(1),
-  expiresAt: z.iso.datetime(),
-  policyHash: z.string().regex(/^[a-f0-9]{64}$/i),
+  requestId: z.string().min(1).max(80),
+  decisionId: z.string().regex(uuidString),
+  targetSessionId: z.string().min(1),
+  assignment: teamMemberAssignmentSchema,
+  targetCwd: z.string().min(1).max(4096),
+  expiresAt: z.string().refine(value => Number.isInteger(Date.parse(value)), { message: "Invalid expiration timestamp" }),
+  policyHash: z.string().regex(sha256Hex),
   promptId: z.number().int().min(1),
-  promptHash: z.string().regex(/^[a-f0-9]{64}$/i),
-  evidenceHash: z.string().regex(/^[a-f0-9]{64}$/i),
+  promptHash: z.string().regex(sha256Hex),
+  evidenceHash: z.string().regex(sha256Hex),
   option: z.number().int().min(0),
   actor: controlActorSchema,
-  leaseId: z.string().min(1),
+  leaseId: z.string().min(1).max(80),
 };
 export const teamAnswerWorkerRequestSchema: z.ZodType<TeamAnswerWorkerRequest> = z.union([
   z.object({
     ...teamAnswerBaseShape,
-    coordinatorMemberId: z.uuid(),
+    coordinatorMemberId: z.string().regex(uuidString),
   }).strict(),
   z.object({
     ...teamAnswerBaseShape,
@@ -414,7 +427,7 @@ export const teamAnswerWorkerRequestSchema: z.ZodType<TeamAnswerWorkerRequest> =
   z.object({
     ...teamAnswerBaseShape,
     choice: z.literal("reject"),
-    text: z.string().min(1).optional(),
+    text: z.string().min(1).max(2000).regex(noControlChars).optional(),
   }).strict(),
 ]);
 export type WorkerControlRequestState =
@@ -425,20 +438,20 @@ export const workerControlRequestSchema: z.ZodType<WorkerControlRequestState> = 
     op: z.literal("control"),
     action: z.literal("claim"),
     actor: controlActorSchema,
-    leaseId: z.string().min(1).optional(),
+    leaseId: z.string().min(1).max(80).optional(),
     takeover: z.boolean().optional(),
   }).strict(),
   z.object({
     op: z.literal("control"),
     action: z.literal("renew"),
     actor: controlActorSchema,
-    leaseId: z.string().min(1),
+    leaseId: z.string().min(1).max(80),
   }).strict(),
   z.object({
     op: z.literal("control"),
     action: z.literal("release"),
     actor: controlActorSchema,
-    leaseId: z.string().min(1),
+    leaseId: z.string().min(1).max(80),
   }).strict(),
 ]);
 export type WorkerWorkspaceExportRequestState =
@@ -452,24 +465,18 @@ export const workerWorkspaceExportRequestSchema: z.ZodType<WorkerWorkspaceExport
   z.object({
     op: z.literal("workspace-export"),
     method: z.literal("sync/blob"),
-    hash: z.string().regex(/^[a-f0-9]{64}$/i),
+    hash: z.string().regex(sha256Hex),
   }).strict(),
 ]);
 export type WorkerRequest =
   | { op: "state"; screen?: boolean }
   | { op: "native-info" }
   | { op: "executor-connect"; token: string }
-  | { op: "workspace-export"; method: "sync/export" | "sync/blob"; hash?: string }
+  | WorkerWorkspaceExportRequestState
   | ({ op: "native-connect" } & InputControl)
   | { op: "snapshot" }
   | { op: "handoff-stop"; requestId: string }
-  | {
-      op: "control";
-      action: "claim" | "renew" | "release";
-      actor: ControlActor;
-      leaseId?: string;
-      takeover?: boolean;
-    }
+  | WorkerControlRequestState
   | ({
       op: "input";
       requestId: string;

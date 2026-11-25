@@ -1,15 +1,18 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import test from "node:test";
 import {
   buildTeamPendingOperation,
   deliveryReconciliationReportSchema,
+  isAnsweredTeamDecision,
   isEstablishChecksProject,
   isFailedTeamCheck,
+  isOpenTeamDecision,
   isPassedTeamCheck,
   isRunningTeamCheck,
   permissionDecisionReportSchema,
   projectTeamDecision,
+  recordedTeamReportSchema,
   teamCheckSchema,
   teamDecisionSchema,
   teamLineupSchema,
@@ -19,6 +22,7 @@ import {
   teamPermissionAgentDecisionSchema,
   teamProjectSchema,
   teamPublicationSchema,
+  teamReportEnvelopeSchema,
   teamReportSchema,
   type DeliveryReconciliationReport,
   type OpenTeamDecision,
@@ -33,6 +37,8 @@ import {
 } from "../packages/host/src/team-types.js";
 import {
   boardItemSchema,
+  isAnsweredMissionDecision,
+  isOpenMissionDecision,
   missionDecisionSchema,
   missionFollowUpSchema,
   missionSubtaskSchema,
@@ -48,6 +54,8 @@ import {
   createGoalSchema,
   goalCycleSchema,
   goalOutcomeSchema,
+  isActiveGoalCycle,
+  isSettledGoalCycle,
   parseCreateGoal,
   projectCreateGoal,
   projectGoalCycle,
@@ -69,6 +77,7 @@ import {
   type SessionRuntime,
   type TeamAnswerWorkerRequest,
   type WorkerControlRequestState,
+  type WorkerRequest,
   type WorkerWorkspaceExportRequestState,
 } from "../packages/host/src/types.js";
 
@@ -266,6 +275,12 @@ test("PermissionDecisionReport and DeliveryReconciliationReport enforce variant 
     assert.equal(deliveryReconciliationReportSchema.safeParse(invalid).success, false);
     assert.equal(teamReportSchema.safeParse(invalid).success, false);
   }
+  const legacyOwnedBranch = { kind: "delivery-reconciliation", headCommit: HASH, repository: "example/app", branch: "infinite/feat", baseHeadCommit: BASE_HASH, disposition: "owned-branch", summary: "Pre-upgrade worker report without remote head." };
+  const legacyPullRequest = { kind: "delivery-reconciliation", headCommit: HASH, repository: "example/app", branch: "infinite/feat", baseHeadCommit: BASE_HASH, disposition: "pull-request", remoteHeadCommit: HASH, summary: "Pre-upgrade worker report without PR URL." };
+  assert.equal(teamReportSchema.safeParse(legacyOwnedBranch).success, false);
+  assert.equal(recordedTeamReportSchema.safeParse(legacyOwnedBranch).success, true);
+  assert.equal(recordedTeamReportSchema.safeParse(legacyPullRequest).success, true);
+  assert.equal(teamReportEnvelopeSchema.safeParse({ requestId: UUID, runId: UUID, memberId: UUID2, revision: 1, report: legacyOwnedBranch }).success, true);
 
   // @ts-expect-error approve-once cannot specify requestedPaths
   const invalidApprovePaths: PermissionDecisionReport = {
@@ -336,6 +351,13 @@ test("TeamDecision, TeamCheck, TeamPermissionAgentDecision, TeamPublication, and
   if (projectedAnswered.state === "answered") {
     assert.equal(projectedAnswered.decision.answer, "Yes");
   }
+  assert.equal(isOpenTeamDecision({ ...openTeam, answeredBy: "owner" }), false);
+  assert.equal(isOpenTeamDecision({ ...openTeam, answeredAt: LATER }), false);
+  assert.equal(isOpenTeamDecision({ ...openTeam, source: CONNECTOR }), false);
+  assert.equal(isAnsweredTeamDecision({ ...ownerAnswered, source: CONNECTOR }), false);
+  assert.equal(isAnsweredTeamDecision({ ...openTeam, answer: "" }), false);
+  assert.throws(() => projectTeamDecision({ ...ownerAnswered, source: CONNECTOR }));
+  assert.throws(() => projectTeamDecision({ ...openTeam, answeredBy: "owner" }));
 
   const invalidOpenAnsweredAt: OpenTeamDecision = {
     ...openTeam,
@@ -351,8 +373,8 @@ test("TeamDecision, TeamCheck, TeamPermissionAgentDecision, TeamPublication, and
   };
   assert.ok(invalidOpenAnsweredAt && invalidOwnerSource);
 
-  const runningCheck: TeamCheckState = { command: CMD, status: "running", startedAt: AT, output: "", revision: 1 };
-  const passedCheck: TeamCheckState = { command: CMD, status: "passed", startedAt: AT, finishedAt: LATER, exitCode: 0, output: "ok", revision: 1 };
+  const runningCheck: TeamCheckState = { command: CMD, status: "running", startedAt: AT, output: "", revision: 1, round: 0 };
+  const passedCheck: TeamCheckState = { command: CMD, status: "passed", startedAt: AT, finishedAt: LATER, exitCode: 0, output: "ok", revision: 1, round: 0 };
   const failedCheck: TeamCheckState = {
     command: CMD,
     status: "failed",
@@ -361,17 +383,22 @@ test("TeamDecision, TeamCheck, TeamPermissionAgentDecision, TeamPublication, and
     exitCode: 1,
     output: "fail",
     revision: 1,
+    round: 1,
     scan: { bytes: 4, failureCount: 1, failures: [{ line: "not ok 1", detail: "boom" }] },
   };
   assert.equal(teamCheckSchema.safeParse(runningCheck).success, true);
   assert.equal(teamCheckSchema.safeParse(passedCheck).success, true);
   assert.equal(teamCheckSchema.safeParse(failedCheck).success, true);
+  assert.equal(teamCheckSchema.safeParse({ ...runningCheck, round: -1 }).success, false);
   assert.equal(teamCheckSchema.safeParse({ ...runningCheck, finishedAt: LATER }).success, false);
   assert.equal(teamCheckSchema.safeParse({ ...passedCheck, scan: failedCheck.scan }).success, false);
   assert.equal(teamCheckSchema.safeParse({ command: CMD, status: "passed", startedAt: AT, output: "ok", revision: 1 }).success, false);
   assert.equal(isRunningTeamCheck(runningCheck), true);
+  assert.equal(isRunningTeamCheck({ ...runningCheck, finishedAt: LATER }), false);
   assert.equal(isPassedTeamCheck(passedCheck), true);
+  assert.equal(isPassedTeamCheck({ ...passedCheck, scan: failedCheck.scan }), false);
   assert.equal(isFailedTeamCheck(failedCheck), true);
+  assert.equal(isFailedTeamCheck({ command: CMD, status: "failed", startedAt: AT, output: "fail", revision: 1 }), false);
 
   // @ts-expect-error running check cannot carry finishedAt
   const invalidRunningFinished: TeamCheckState = {
@@ -570,6 +597,11 @@ test("MissionFollowUp, BoardItem, MissionDecision, and MissionSubtask enforce in
   assert.equal(missionDecisionSchema.safeParse({ ...openMissionDecision, answer: "Yes", answeredBy: "owner", source: CONNECTOR }).success, false);
   assert.equal(projectMissionDecision(openMissionDecision).state, "open");
   assert.equal(projectMissionDecision(answeredMissionDecision).state, "answered");
+  assert.equal(isOpenMissionDecision({ id: UUID, question: "Q", options: [], createdAt: AT, childDecisionId: UUID2 }), false);
+  assert.equal(isOpenMissionDecision({ ...openMissionDecision, answeredAt: LATER }), false);
+  assert.equal(isAnsweredMissionDecision({ ...openMissionDecision, answer: "Yes", answeredBy: "owner", source: CONNECTOR }), false);
+  assert.throws(() => projectMissionDecision({ id: UUID, question: "Q", options: [], createdAt: AT, childDecisionId: UUID2 }));
+  assert.throws(() => projectMissionDecision({ ...openMissionDecision, answer: "Yes", answeredBy: "owner", source: CONNECTOR }));
 
   const queuedSubtask: MissionSubtaskState = {
     id: "api",
@@ -587,12 +619,58 @@ test("MissionFollowUp, BoardItem, MissionDecision, and MissionSubtask enforce in
     teamId: UUID,
     teamStatus: "implementing",
   };
+  const launchBlockedSubtask: MissionSubtaskState = {
+    ...queuedSubtask,
+    status: "blocked",
+  };
+  const teamBlockedSubtask: MissionSubtaskState = {
+    ...queuedSubtask,
+    status: "blocked",
+    teamId: UUID,
+    teamStatus: "blocked",
+  };
+  const usageTotals = {
+    cost: 0.02,
+    tokens: { input: 100, output: 50, reasoning: 0, cacheRead: 20, cacheWrite: 10 },
+    messages: 3,
+    pricing: { configured: 1, catalog: 0, provider: 0, unknown: 0 },
+  };
+  const usageRollup = {
+    total: usageTotals,
+    byProfile: { impl: usageTotals },
+    byProvider: { codex: usageTotals },
+    unmeasuredMembers: 0,
+    partialMembers: 0,
+  };
+  const cancelledSubtask: MissionSubtaskState = {
+    ...queuedSubtask,
+    status: "cancelled",
+    teamId: UUID,
+    teamStatus: "cancelled",
+    finalEvidence: {
+      headCommit: HASH,
+      reason: "Cancelled after mission stop",
+      usage: usageRollup,
+    },
+  };
   assert.equal(missionSubtaskSchema.safeParse(queuedSubtask).success, true);
   assert.equal(missionSubtaskSchema.safeParse(runningSubtask).success, true);
+  assert.equal(missionSubtaskSchema.safeParse(launchBlockedSubtask).success, true);
+  assert.equal(missionSubtaskSchema.safeParse(teamBlockedSubtask).success, true);
+  assert.equal(missionSubtaskSchema.safeParse(cancelledSubtask).success, true);
   assert.equal(missionSubtaskSchema.safeParse({ ...queuedSubtask, teamId: UUID }).success, false);
   assert.equal(missionSubtaskSchema.safeParse({ ...queuedSubtask, status: "running" }).success, false);
+  assert.equal(missionSubtaskSchema.safeParse({ ...queuedSubtask, status: "blocked", teamStatus: "blocked" }).success, false);
   assert.equal(projectMissionSubtask(queuedSubtask).status, "queued");
   assert.equal(projectMissionSubtask(runningSubtask).status, "running");
+  assert.equal(projectMissionSubtask(launchBlockedSubtask).teamId, undefined);
+  assert.equal(projectMissionSubtask(teamBlockedSubtask).teamId, UUID);
+  assert.equal(projectMissionSubtask(cancelledSubtask).status, "cancelled");
+  assert.throws(() => projectMissionSubtask({ ...queuedSubtask, status: "running" }));
+  assert.throws(() => projectMissionSubtask({ ...queuedSubtask, status: "blocked", teamStatus: "blocked" }));
+  // @ts-expect-error blocked subtask without teamId cannot carry teamStatus
+  const invalidBlockedSubtaskStatus: MissionSubtaskState = { ...queuedSubtask, status: "blocked", teamStatus: "blocked" };
+  assert.ok(invalidBlockedSubtaskStatus);
 });
 
 test("GoalOutcomeInput, CreateGoal, and GoalCycle enforce outcome, standing, and settlement states", () => {
@@ -616,6 +694,13 @@ test("GoalOutcomeInput, CreateGoal, and GoalCycle enforce outcome, standing, and
   assert.equal(goalOutcomeSchema.safeParse(continueOutcome).success, true);
   assert.equal(goalOutcomeSchema.safeParse({ ...plainOutcome, verdictId: UUID2, continue: true }).success, false);
   assert.equal(goalOutcomeSchema.safeParse({ requestId: UUID, revision: 1, result: "not-achieved", summary: "s", evidence: "e", continue: true }).success, false);
+  const parsedPlain = goalOutcomeSchema.parse({ summary: plainOutcome.summary, evidence: plainOutcome.evidence, revision: plainOutcome.revision, requestId: plainOutcome.requestId, result: plainOutcome.result });
+  const parsedContinue = goalOutcomeSchema.parse({ continue: true, evidence: continueOutcome.evidence, summary: continueOutcome.summary, verdictId: continueOutcome.verdictId, result: continueOutcome.result, revision: continueOutcome.revision, requestId: continueOutcome.requestId });
+  assert.deepEqual(Object.keys(parsedPlain), ["requestId", "revision", "result", "summary", "evidence"]);
+  assert.deepEqual(Object.keys(parsedContinue), ["requestId", "revision", "result", "summary", "evidence", "verdictId", "continue"]);
+  const digest = (body: GoalOutcomeInput) => createHash("sha256").update(JSON.stringify({ action: "outcome", ...body })).digest("hex");
+  assert.equal(digest(parsedPlain), digest(plainOutcome));
+  assert.equal(digest(parsedContinue), digest(continueOutcome));
 
   if (continueOutcome.continue === true) {
     const verdict: string = continueOutcome.verdictId;
@@ -665,6 +750,13 @@ test("GoalOutcomeInput, CreateGoal, and GoalCycle enforce outcome, standing, and
   assert.equal(projectCreateGoal(standing).kind, "standing");
   assert.equal(createGoalSchema.safeParse({ ...standing, maxRuns: 2 }).success, false);
 
+  const cycleProfile = { id: "lead", label: "Lead", provider: "claude" as const, model: "claude-opus-4-6", effort: "high" as const, tier: "strong" as const };
+  const cycleUsageTotals = {
+    cost: 0.05,
+    tokens: { input: 200, output: 100, reasoning: 0, cacheRead: 50, cacheWrite: 25 },
+    messages: 4,
+    pricing: { configured: 1, catalog: 0, provider: 0, unknown: 0 },
+  };
   const activeCycle = {
     teamId: UUID,
     cycle: 1,
@@ -672,6 +764,17 @@ test("GoalOutcomeInput, CreateGoal, and GoalCycle enforce outcome, standing, and
     status: "implementing",
     startedAt: AT,
     memberCount: 2,
+    lineup: { coordinator: cycleProfile, integrator: cycleProfile, reviewer: cycleProfile, implementers: [cycleProfile] },
+    brief: {
+      title: "Fix retry flake",
+      problem: "Retry check flakes on timer skew",
+      evidence: [{ source: "tests/retry.test.ts", observation: "Timeout at 50ms" }],
+      dataShape: "RetryState",
+      acceptance: ["Retry test passes deterministically"],
+      expectedOutcome: "Deterministic retry check",
+      uiChanges: false,
+    },
+    usage: { ...cycleUsageTotals, total: cycleUsageTotals, byProfile: { lead: cycleUsageTotals }, byProvider: { claude: cycleUsageTotals }, unmeasuredMembers: 0, partialMembers: 0 },
   };
   const settledCycle = {
     ...activeCycle,
@@ -679,11 +782,30 @@ test("GoalOutcomeInput, CreateGoal, and GoalCycle enforce outcome, standing, and
     finishedAt: LATER,
     class: "reviewed" as const,
     settledAt: LATER,
+    assessment: {
+      verdictId: UUID2,
+      revision: 1,
+      head: HASH,
+      kind: "reviewed" as const,
+      result: "not-met" as const,
+      counts: { met: 0, notMet: 1, inconclusive: 0, pendingOwner: 0 },
+      criteria: [{ id: "c0", state: "not-met" as const }],
+      at: LATER,
+      progress: -1,
+    },
   };
   assert.equal(goalCycleSchema.safeParse(activeCycle).success, true);
   assert.equal(goalCycleSchema.safeParse(settledCycle).success, true);
   assert.equal(goalCycleSchema.safeParse({ ...activeCycle, class: "reviewed" }).success, false);
   assert.equal(goalCycleSchema.safeParse({ ...activeCycle, settledAt: LATER }).success, false);
+  assert.equal(isActiveGoalCycle(activeCycle), true);
+  assert.equal(isActiveGoalCycle({ ...activeCycle, class: "reviewed" }), false);
+  assert.equal(isActiveGoalCycle({ ...activeCycle, settledAt: LATER }), false);
+  assert.equal(isSettledGoalCycle(settledCycle), true);
+  assert.equal(isSettledGoalCycle({ ...activeCycle, class: "reviewed" }), false);
+  assert.equal(isSettledGoalCycle({ ...activeCycle, settledAt: LATER }), false);
+  assert.throws(() => projectGoalCycle({ ...activeCycle, class: "reviewed" }));
+  assert.throws(() => projectGoalCycle({ ...activeCycle, settledAt: LATER }));
   const projectedActive: GoalCycleState = projectGoalCycle(activeCycle);
   const projectedSettled: GoalCycleState = projectGoalCycle(settledCycle);
   assert.equal(projectedActive.state, "active");
@@ -775,11 +897,18 @@ test("SessionHeadless, ExecutionState, SessionRuntime, PermissionChannelView, an
   const reviewerAnswer: TeamAnswerWorkerRequest = { ...baseTeamAnswer, coordinatorMemberId: randomUUID() };
   const agentAccept: TeamAnswerWorkerRequest = { ...baseTeamAnswer, choice: "accept" };
   const agentReject: TeamAnswerWorkerRequest = { ...baseTeamAnswer, choice: "reject", text: "Rejected by policy." };
+  const workerReviewer: WorkerRequest = reviewerAnswer;
+  const workerAccept: WorkerRequest = agentAccept;
+  const workerReject: WorkerRequest = agentReject;
+  assert.ok(workerReviewer && workerAccept && workerReject);
   assert.equal(teamAnswerWorkerRequestSchema.safeParse(reviewerAnswer).success, true);
+  assert.equal(teamAnswerWorkerRequestSchema.safeParse({ ...reviewerAnswer, requestId: "req-1" }).success, true);
   assert.equal(teamAnswerWorkerRequestSchema.safeParse(agentAccept).success, true);
   assert.equal(teamAnswerWorkerRequestSchema.safeParse(agentReject).success, true);
   assert.equal(teamAnswerWorkerRequestSchema.safeParse({ ...reviewerAnswer, choice: "accept" }).success, false);
   assert.equal(teamAnswerWorkerRequestSchema.safeParse({ ...agentAccept, text: "Not allowed on accept" }).success, false);
+  assert.equal(teamAnswerWorkerRequestSchema.safeParse({ ...agentReject, text: "bad\x00text" }).success, false);
+  assert.equal(teamAnswerWorkerRequestSchema.safeParse({ ...reviewerAnswer, assignment: { ...baseTeamAnswer.assignment, role: "mission-coordinator" } }).success, false);
   assert.equal(teamAnswerWorkerRequestSchema.safeParse(baseTeamAnswer).success, false);
 
   const invalidMixedTeamAnswer: TeamAnswerWorkerRequest = {
@@ -788,19 +917,43 @@ test("SessionHeadless, ExecutionState, SessionRuntime, PermissionChannelView, an
     // @ts-expect-error reviewer team-answer cannot also specify permission-agent choice
     choice: "accept",
   };
-  assert.ok(invalidMixedTeamAnswer);
+  // @ts-expect-error permission-agent accept cannot carry reject text
+  const invalidAcceptText: WorkerRequest = { ...baseTeamAnswer, choice: "accept", text: "Not allowed on accept" };
+  const invalidMissionCoordinatorAnswer: WorkerRequest = {
+    ...baseTeamAnswer,
+    coordinatorMemberId: UUID,
+    // @ts-expect-error mission-coordinator cannot be targeted by team-answer
+    assignment: { ...baseTeamAnswer.assignment, role: "mission-coordinator" },
+  };
+  assert.ok(invalidMixedTeamAnswer && invalidAcceptText && invalidMissionCoordinatorAnswer);
 
   const claimReq: WorkerControlRequestState = { op: "control", action: "claim", actor, takeover: true };
   const renewReq: WorkerControlRequestState = { op: "control", action: "renew", actor, leaseId: "lease-1" };
+  const workerClaim: WorkerRequest = claimReq;
+  const workerRenew: WorkerRequest = renewReq;
+  assert.ok(workerClaim && workerRenew);
   assert.equal(workerControlRequestSchema.safeParse(claimReq).success, true);
   assert.equal(workerControlRequestSchema.safeParse(renewReq).success, true);
   assert.equal(workerControlRequestSchema.safeParse({ op: "control", action: "renew", actor }).success, false);
   assert.equal(workerControlRequestSchema.safeParse({ op: "control", action: "release", actor, leaseId: "lease-1", takeover: true }).success, false);
+  // @ts-expect-error WorkerRequest renew requires leaseId
+  const invalidWorkerRenew: WorkerRequest = { op: "control", action: "renew", actor };
+  // @ts-expect-error WorkerRequest release forbids takeover
+  const invalidWorkerReleaseTakeover: WorkerRequest = { op: "control", action: "release", actor, leaseId: "lease-1", takeover: true };
+  assert.ok(invalidWorkerRenew && invalidWorkerReleaseTakeover);
 
   const exportReq: WorkerWorkspaceExportRequestState = { op: "workspace-export", method: "sync/export" };
   const blobReq: WorkerWorkspaceExportRequestState = { op: "workspace-export", method: "sync/blob", hash: SHA256 };
+  const workerExport: WorkerRequest = exportReq;
+  const workerBlob: WorkerRequest = blobReq;
+  assert.ok(workerExport && workerBlob);
   assert.equal(workerWorkspaceExportRequestSchema.safeParse(exportReq).success, true);
   assert.equal(workerWorkspaceExportRequestSchema.safeParse(blobReq).success, true);
   assert.equal(workerWorkspaceExportRequestSchema.safeParse({ op: "workspace-export", method: "sync/export", hash: SHA256 }).success, false);
   assert.equal(workerWorkspaceExportRequestSchema.safeParse({ op: "workspace-export", method: "sync/blob" }).success, false);
+  // @ts-expect-error WorkerRequest sync/export forbids hash
+  const invalidWorkerExportHash: WorkerRequest = { op: "workspace-export", method: "sync/export", hash: SHA256 };
+  // @ts-expect-error WorkerRequest sync/blob requires hash
+  const invalidWorkerBlobNoHash: WorkerRequest = { op: "workspace-export", method: "sync/blob" };
+  assert.ok(invalidWorkerExportHash && invalidWorkerBlobNoHash);
 });

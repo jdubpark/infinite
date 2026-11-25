@@ -1,10 +1,10 @@
 import { z } from "zod";
-import type { TeamBrief, TeamLineup } from "./team-types.js";
+import { goalCycleUsageSchema, teamBriefSchema, teamLineupSchema, type TeamBrief, type TeamLineup } from "./team-types.js";
 import type { UsageTotals } from "./usage.js";
 import type { UsageRollup } from "./team-usage.js";
 import type { LinearTrackingView } from "./linear-types.js";
 import type { AutonomyMode } from "./autonomy.js";
-import type { RunAssessment } from "./verdict-types.js";
+import { VERDICT_LIMITS, type RunAssessment } from "./verdict-types.js";
 import { signalKinds, type PendingWake } from "./signals/types.js";
 
 export function isScopedPath(value: string): boolean {
@@ -84,20 +84,21 @@ export type GoalOutcomeInput =
       verdictId: string;
       continue: true;
     });
-const goalOutcomeBaseShape = {
-  ...goalActionSchema.shape,
+const goalOutcomeDetailsShape = {
   summary: z.string().trim().min(1).max(4000),
   evidence: z.string().trim().min(1).max(8000),
 };
 export const goalOutcomeSchema: z.ZodType<GoalOutcomeInput> = z.union([
   z.object({
-    ...goalOutcomeBaseShape,
+    ...goalActionSchema.shape,
     result: z.enum(["achieved", "not-achieved", "inconclusive"]),
+    ...goalOutcomeDetailsShape,
     verdictId: z.uuid().optional(),
   }).strict(),
   z.object({
-    ...goalOutcomeBaseShape,
+    ...goalActionSchema.shape,
     result: z.literal("not-achieved"),
+    ...goalOutcomeDetailsShape,
     verdictId: z.uuid(),
     continue: z.literal(true),
   }).strict(),
@@ -132,13 +133,31 @@ export type SettledGoalCycle = Omit<GoalCycle, "class" | "settledAt"> & { class:
 export type GoalCycleState =
   | { state: "active"; cycle: ActiveGoalCycle }
   | { state: "settled"; cycle: SettledGoalCycle };
+export function isActiveGoalCycle(cycle: GoalCycle): cycle is ActiveGoalCycle {
+  return cycle.class === undefined && cycle.settledAt === undefined;
+}
 export function isSettledGoalCycle(cycle: GoalCycle): cycle is SettledGoalCycle {
   return cycle.class !== undefined && cycle.settledAt !== undefined;
 }
 export function projectGoalCycle(cycle: GoalCycle): GoalCycleState {
   if (isSettledGoalCycle(cycle)) return { state: "settled", cycle };
-  return { state: "active", cycle: cycle as ActiveGoalCycle };
+  if (isActiveGoalCycle(cycle)) return { state: "active", cycle };
+  throw new Error("Invalid goal cycle state: class and settledAt must appear together.");
 }
+const assessmentCountSchema = z.number().int().min(0).max(VERDICT_LIMITS.criteria);
+const goalAssessmentSchema: z.ZodType<GoalAssessment> = z.object({
+  verdictId: z.uuid(),
+  revision: z.number().int().min(1),
+  head: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i),
+  kind: z.enum(["reviewed", "no-change"]),
+  result: z.enum(["met", "not-met", "inconclusive"]),
+  evaluatorResult: z.enum(["met", "not-met", "inconclusive"]).optional(),
+  reason: z.enum(["no-independent-evaluator", "evaluator-unavailable", "record-unavailable", "context-too-large"]).optional(),
+  counts: z.object({ met: assessmentCountSchema, notMet: assessmentCountSchema, inconclusive: assessmentCountSchema, pendingOwner: assessmentCountSchema }).strict(),
+  criteria: z.array(z.object({ id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), state: z.enum(["met", "not-met", "inconclusive", "pending-owner"]) }).strict()).max(VERDICT_LIMITS.criteria),
+  at: z.iso.datetime(),
+  progress: z.number().int(),
+}).strict();
 const goalCycleBaseShape = {
   autonomy: z.enum(["supervised", "autonomous"]).optional(),
   teamId: z.string().min(1),
@@ -151,12 +170,16 @@ const goalCycleBaseShape = {
   headCommit: z.string().min(1).optional(),
   branch: z.string().min(1).optional(),
   workspace: z.string().min(1).optional(),
+  brief: teamBriefSchema.optional(),
   reason: z.string().optional(),
   memberCount: z.number().int().min(0),
+  usage: goalCycleUsageSchema.optional(),
+  lineup: teamLineupSchema.optional(),
   deadlineStop: z.object({ at: z.iso.datetime(), fuseOpen: z.literal(true).optional() }).strict().optional(),
+  assessment: goalAssessmentSchema.optional(),
   wake: z.object({ signalIds: z.array(z.string().min(1)), dropped: z.number().int().min(0), owner: z.literal(true).optional() }).strict().optional(),
 };
-export const goalCycleSchema = z.union([
+export const goalCycleSchema: z.ZodType<ActiveGoalCycle | SettledGoalCycle> = z.union([
   z.object(goalCycleBaseShape).strict(),
   z.object({
     ...goalCycleBaseShape,

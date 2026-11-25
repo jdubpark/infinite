@@ -524,7 +524,20 @@ export const blockerEvidenceSchema = z.object({
 });
 export type BlockerEvidence = z.infer<typeof blockerEvidenceSchema>;
 const questionReportShape = { kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), answerMode: z.enum(["approval", "single", "multiple"]).optional() };
-const teamReportVariants = [
+const recordedDeliveryReconciliationReportSchema = z.object({ kind: z.literal("delivery-reconciliation"), headCommit: commitHashSchema, repository: githubRepository, branch: gitBranch, baseHeadCommit: commitHashSchema, disposition: z.enum(["no-publication", "owned-branch", "pull-request"]), remoteHeadCommit: commitHashSchema.optional(), pullRequestUrl: z.string().trim().min(1).max(500).optional(), summary: z.string().trim().min(1).max(4000) }).strict();
+const strictDeliveryReconciliationReportSchema = recordedDeliveryReconciliationReportSchema.superRefine((report, context) => {
+  if (report.disposition === "no-publication") {
+    if (report.remoteHeadCommit !== undefined) context.addIssue({ code: "custom", path: ["remoteHeadCommit"], message: "A no-publication reconciliation cannot include remoteHeadCommit." });
+    if (report.pullRequestUrl !== undefined) context.addIssue({ code: "custom", path: ["pullRequestUrl"], message: "A no-publication reconciliation cannot include pullRequestUrl." });
+  } else if (report.disposition === "owned-branch") {
+    if (report.remoteHeadCommit === undefined) context.addIssue({ code: "custom", path: ["remoteHeadCommit"], message: "An owned-branch reconciliation requires remoteHeadCommit." });
+    if (report.pullRequestUrl !== undefined) context.addIssue({ code: "custom", path: ["pullRequestUrl"], message: "An owned-branch reconciliation cannot include pullRequestUrl." });
+  } else {
+    if (report.remoteHeadCommit === undefined) context.addIssue({ code: "custom", path: ["remoteHeadCommit"], message: "A pull-request reconciliation requires remoteHeadCommit." });
+    if (report.pullRequestUrl === undefined) context.addIssue({ code: "custom", path: ["pullRequestUrl"], message: "A pull-request reconciliation requires pullRequestUrl." });
+  }
+});
+const sharedTeamReportVariants = [
   z.object({ kind: z.literal("permission-decision"), decisionId: z.uuid(), verdict: z.enum(["approve-once", "request-evidence", "escalate"]), summary: z.string().trim().min(1).max(2000), requestedPaths: z.array(z.string().trim().min(1).max(512)).max(8).optional() }).strict().superRefine((report, context) => {
     if (report.verdict === "request-evidence" && !report.requestedPaths?.length)
       context.addIssue({ code: "custom", path: ["requestedPaths"], message: "Request evidence with at least one repository-relative or approved scratch path." });
@@ -540,27 +553,17 @@ const teamReportVariants = [
   z.object({ kind: z.literal("review"), verdict: z.enum(["approved", "changes-requested"]), summary: z.string().min(1).max(8000), uiEvidence: z.string().trim().min(1).max(4000).optional(), acceptance: z.array(teamAcceptanceEvidenceSchema).max(8).optional(), rubric: z.array(z.object({ taskId, correctness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), cleanliness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), extensibility: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), docs: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict() }).strict()).max(12).optional() }).strict(),
   z.object({ kind: z.literal("delivery"), headCommit: commitHashSchema, pullRequestUrl: z.string().trim().min(1).max(500), mergeCommit: commitHashSchema, summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("delivery-repair"), headCommit: commitHashSchema, summary: z.string().trim().min(1).max(4000) }).strict(),
-  z.object({ kind: z.literal("delivery-reconciliation"), headCommit: commitHashSchema, repository: githubRepository, branch: gitBranch, baseHeadCommit: commitHashSchema, disposition: z.enum(["no-publication", "owned-branch", "pull-request"]), remoteHeadCommit: commitHashSchema.optional(), pullRequestUrl: z.string().trim().min(1).max(500).optional(), summary: z.string().trim().min(1).max(4000) }).strict().superRefine((report, context) => {
-    if (report.disposition === "no-publication") {
-      if (report.remoteHeadCommit !== undefined) context.addIssue({ code: "custom", path: ["remoteHeadCommit"], message: "A no-publication reconciliation cannot include remoteHeadCommit." });
-      if (report.pullRequestUrl !== undefined) context.addIssue({ code: "custom", path: ["pullRequestUrl"], message: "A no-publication reconciliation cannot include pullRequestUrl." });
-    } else if (report.disposition === "owned-branch") {
-      if (report.remoteHeadCommit === undefined) context.addIssue({ code: "custom", path: ["remoteHeadCommit"], message: "An owned-branch reconciliation requires remoteHeadCommit." });
-      if (report.pullRequestUrl !== undefined) context.addIssue({ code: "custom", path: ["pullRequestUrl"], message: "An owned-branch reconciliation cannot include pullRequestUrl." });
-    } else {
-      if (report.remoteHeadCommit === undefined) context.addIssue({ code: "custom", path: ["remoteHeadCommit"], message: "A pull-request reconciliation requires remoteHeadCommit." });
-      if (report.pullRequestUrl === undefined) context.addIssue({ code: "custom", path: ["pullRequestUrl"], message: "A pull-request reconciliation requires pullRequestUrl." });
-    }
-  }),
   z.object({ kind: z.literal("pull-request"), headCommit: commitHashSchema, pullRequestUrl: z.string().trim().min(1).max(500), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("blocked"), summary: z.string().min(1).max(4000), blocker: blockerEvidenceSchema.optional() }).strict(),
   intentCheckReportSchema,
   verdictReportSchema,
   judgementReportSchema,
 ] as const;
-export const teamReportSchema = z.discriminatedUnion("kind", [...teamReportVariants,
+export const teamReportSchema = z.discriminatedUnion("kind", [...sharedTeamReportVariants,
+  strictDeliveryReconciliationReportSchema,
   z.object({ ...questionReportShape, recommendation: requiredQuestionRecommendationSchema }).strict().superRefine(refineQuestion)]);
-export const recordedTeamReportSchema = z.discriminatedUnion("kind", [...teamReportVariants,
+export const recordedTeamReportSchema = z.discriminatedUnion("kind", [...sharedTeamReportVariants,
+  recordedDeliveryReconciliationReportSchema,
   z.object({ ...questionReportShape, recommendation: questionRecommendationSchema.optional() }).strict().superRefine(refineQuestion)]);
 export type TeamReport = z.infer<typeof recordedTeamReportSchema>;
 export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: recordedTeamReportSchema }).strict();

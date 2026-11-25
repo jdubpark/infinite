@@ -422,7 +422,7 @@ struct SessionPane: View {
         } message: { Text("This stops the agent process on the server. Its recording stays available.") }
         .alert("Have you checked the terminal?", isPresented: $confirmClear) {
             Button("Keep pending send", role: .cancel) {}
-            Button("Clear after review") { model.clearPending() }
+            Button("Clear after review") { Task { await model.clearPending() } }
         } message: { Text("The previous prompt may already have been delivered. Clearing it does not cancel server work.") }
     }
     private var header: some View {
@@ -466,8 +466,17 @@ struct SessionPane: View {
     }
     private var composer: some View {
         VStack(spacing: 8) {
+            if !model.draftLoaded, let draftError = model.draftLoadError {
+                HStack(spacing: 8) {
+                    Text(draftError).font(.caption).foregroundStyle(.orange).lineLimit(2)
+                    Spacer()
+                    Button("Retry Loading Draft") { Task { await model.retryInitialDraftLoad() } }.controlSize(.small)
+                }
+            }
             PromptEditor(text: Binding(get: { model.draft.text }, set: model.setDraft), placeholder: "Message \(providerName(session.provider))…",
-                         enabled: model.canSend && model.role != "viewer" && !promptBlocks, transparent: true, submit: { Task { await model.send() } })
+                         enabled: model.canSend && model.role != "viewer" && !promptBlocks,
+                         editable: model.draftLoaded && model.role != "viewer",
+                         transparent: true, submit: { Task { await model.send() } })
                 .frame(height: 76).glassSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             HStack(spacing: 12) {
                 Text(footer.text).font(.system(size: 11)).foregroundStyle(footer.color).lineLimit(2).help(footer.text).textSelection(.enabled)
@@ -481,7 +490,7 @@ struct SessionPane: View {
                     .disabled(model.draft.pendingID == nil || !model.ready || model.sending)
                 Button("Clear…") { confirmClear = true }
                     .frame(width: 62).opacity(model.draft.pendingID != nil && !model.sending ? 1 : 0)
-                    .disabled(model.draft.pendingID == nil || model.sending)
+                    .disabled(model.draft.pendingID == nil || model.sending || model.clearingPending)
                 Button { Task { await model.send() } } label: {
                     Group { if model.sending { ProgressView().controlSize(.small) } else { Label("Send", systemImage: "arrow.up") } }.frame(width: 72)
                 }.buttonStyle(.borderedProminent).opacity(model.draft.pendingID == nil || model.sending ? 1 : 0)
@@ -556,6 +565,7 @@ struct CreateView: View {
     @State private var busy = false
     @State private var error = ""
     @State private var clearPending = false
+    @State private var clearTarget: PendingClearTarget?
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("New session").font(.title2.weight(.semibold))
@@ -566,7 +576,9 @@ struct CreateView: View {
             }.disabled(app.pendingCreation.pendingID != nil)
             if app.pendingCreation.pendingID != nil {
                 Text("A creation request is pending. Retry uses its original agent, project, and request identity. Check the session list before starting a different request.").font(.callout).foregroundStyle(.orange)
-                Button("Clear after checking sessions…") { clearPending = true }.disabled(busy)
+                Button("Clear after checking sessions…") {
+                    if let id = app.pendingCreation.pendingID { clearTarget = PendingClearTarget(profileID: app.activeID, requestID: id); clearPending = true }
+                }.disabled(busy)
             }
             if let selected = app.projects.first(where: { $0["id"].string == project }) {
                 Text(selected["path"].string).font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
@@ -578,8 +590,11 @@ struct CreateView: View {
             }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(busy || project.isEmpty) }
         }.padding(26).frame(width: 480)
             .alert("Clear the pending creation?", isPresented: $clearPending) {
-                Button("Keep pending", role: .cancel) {}
-                Button("I checked the sessions") { app.clearCreation() }
+                Button("Keep pending", role: .cancel) { clearTarget = nil }
+                Button("I checked the sessions") {
+                    app.clearCreation(expectedProfileID: clearTarget?.profileID, expectedRequestID: clearTarget?.requestID)
+                    clearTarget = nil
+                }
             } message: { Text("The server may already have created this agent. Clearing does not stop it.") }
             .onAppear { project = app.projects.first?["id"].string ?? ""; if !app.me["providers"].array.map(\.string).contains(provider) { provider = app.me["providers"].array.first?.string ?? "" } }
     }

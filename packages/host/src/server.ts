@@ -2128,7 +2128,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     repositoryGraphs?.close();
     void understandingRuntime.close();
     void understandingBehaviors.close();
-    void workNarratives.close();
+    void workNarratives.close().catch(() => {});
     linear.close();
     handoffs.close();
     readings.stop();
@@ -2140,7 +2140,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { const mainCheckClosed = mainCheck?.close() ?? Promise.resolve(); routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); const teamsClosed = teams.close(); halt.stop(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([teamsClosed, mainCheckClosed, mcp?.close(), repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  const closeConnections = () => { const mainCheckClosed = mainCheck?.close() ?? Promise.resolve(); routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); const teamsClosed = teams.close(); halt.stop(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.allSettled([teamsClosed, mainCheckClosed, mcp?.close(), repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(results => { const failed = results.find(result => result.status === "rejected"); if (failed) throw failed.reason; }); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, mcpServer: mcp?.server, closeConnections, fuse, halt, mainCheck,
     permissions: { holder: (sessionId: string, promptId: number) => sessionPermissions.holder(sessionId, promptId),
       ownerClass: (sessionId: string, promptId: number) => permissionDelivery.ownerClass(sessionId, promptId) }, permissionAgent };

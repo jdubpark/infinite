@@ -88,12 +88,25 @@ function narrativeKey(workId: string, baseCommit: string | null, headCommit: str
 function utcDay(now: Date) { return now.toISOString().slice(0, 10); }
 function unavailable(reason: string): WorkNarrativeStatus { return { state: "unavailable", reason }; }
 
+const MAX_CONCURRENCY = 2;
+
+interface QueuedNarrativeJob {
+  workspaceId: string;
+  workId: string;
+  jobKey: string;
+  expectedKey: string;
+  requestedAt: string;
+}
+
 export class WorkNarrativeStore {
   private readonly directory: string;
   private readonly states = new Map<string, StoredNarratives>();
   private readonly pending = new Map<string, { requestedAt: string; key: string }>();
   private readonly activeControllers = new Set<AbortController>();
-  private chain: Promise<void> = Promise.resolve();
+  private readonly activeWorkspaces = new Set<string>();
+  private readonly activeTasks = new Set<Promise<void>>();
+  private readonly queue: QueuedNarrativeJob[] = [];
+  private readonly storageFailures = new Map<string, { key: string; at: string; reason: string }>();
   private closed = false;
 
   constructor(private readonly options: {
@@ -118,6 +131,11 @@ export class WorkNarrativeStore {
     const pending = this.pending.get(jobKey);
     if (pending?.key === expected) return { state: "pending", requestedAt: pending.requestedAt };
     const record = this.read(workspaceId, workId);
+    const storageFailure = this.storageFailures.get(jobKey);
+    if (storageFailure) {
+      if (storageFailure.key !== expected || (record && record.key === expected)) this.storageFailures.delete(jobKey);
+      else return { state: "failed", at: storageFailure.at, reason: storageFailure.reason };
+    }
     if (record && record.key !== expected) return { state: "stale", generatedAt: record.generatedAt, reason: "The recorded work revision has advanced since this narrative was generated." };
     if (record) return { state: "ready", generatedAt: record.generatedAt, engine: record.engine, model: record.model };
     if (!this.options.adapter.explainWork || !this.options.config.repositoryBriefings) return unavailable("No summary writer is configured on this host.");
@@ -136,33 +154,60 @@ export class WorkNarrativeStore {
     const current = this.status(workspaceId, workId, run);
     if (current.state === "ready") return { narrative: current, queued: false };
     if (current.state === "pending") return { narrative: current, queued: false };
-    if (current.state === "failed") return { narrative: unavailable("A failed narrative is cooling down; try again after 10 minutes."), queued: false };
+    const jobKey = `${workspaceId}/${workId}`;
+    if (current.state === "failed" && !this.storageFailures.has(jobKey)) return { narrative: unavailable("A failed narrative is cooling down; try again after 10 minutes."), queued: false };
     if (!this.options.adapter.explainWork || !this.options.config.repositoryBriefings) return { narrative: unavailable("No summary writer is configured on this host."), queued: false };
     const gate = this.gate(workId, run);
     if (gate) return { narrative: gate, queued: false };
     const state = this.state(workspaceId);
-    if (state.jobs >= DAILY_JOBS) return { narrative: unavailable("The daily work narrative budget is exhausted."), queued: false };
     const failedAt = state.failures[workId]?.at;
     if (failedAt && this.now().getTime() - Date.parse(failedAt) < COOLDOWN_MS) return { narrative: unavailable("A failed narrative cannot be retried for 10 minutes."), queued: false };
 
-    state.jobs++;
-    try { this.persist(workspaceId, state); }
-    catch {
-      state.jobs--;
-      return { narrative: unavailable("Narrative storage is unavailable on this host."), queued: false };
-    }
-    const jobKey = `${workspaceId}/${workId}`;
+    const existingIndex = this.queue.findIndex(item => item.jobKey === jobKey);
+    const queuedOther = this.queue.filter(item => item.workspaceId === workspaceId && item.jobKey !== jobKey).length;
+    if (state.jobs + queuedOther >= DAILY_JOBS)
+      return { narrative: unavailable("The daily work narrative budget is exhausted."), queued: false };
+    if (existingIndex !== -1) this.queue.splice(existingIndex, 1);
+    this.storageFailures.delete(jobKey);
     const requestedAt = this.now().toISOString();
     const key = narrativeKey(workId, run.baseCommit ?? null, run.headCommit ?? null);
     this.pending.set(jobKey, { requestedAt, key });
-    this.chain = this.chain.then(() => this.generate(workspaceId, workId, key, requestedAt)).catch(() => {});
+    this.queue.push({ workspaceId, workId, jobKey, expectedKey: key, requestedAt });
+    queueMicrotask(() => this.pump());
     return { narrative: { state: "pending", requestedAt }, queued: true };
   }
 
   async close(): Promise<void> {
     this.closed = true;
+    const queued = this.queue.splice(0);
+    for (const job of queued) this.clearPending(job.jobKey, job.expectedKey, job.requestedAt);
     for (const controller of this.activeControllers) controller.abort();
-    await this.chain;
+    await Promise.allSettled([...this.activeTasks]);
+  }
+
+  private isCurrentPending(jobKey: string, expectedKey: string, requestedAt: string): boolean {
+    const entry = this.pending.get(jobKey);
+    return entry?.requestedAt === requestedAt && entry?.key === expectedKey;
+  }
+
+  private clearPending(jobKey: string, expectedKey: string, requestedAt: string) {
+    if (this.isCurrentPending(jobKey, expectedKey, requestedAt)) this.pending.delete(jobKey);
+  }
+
+  private pump() {
+    while (!this.closed && this.activeTasks.size < MAX_CONCURRENCY) {
+      const nextIndex = this.queue.findIndex(job => !this.activeWorkspaces.has(job.workspaceId));
+      if (nextIndex === -1) return;
+      const [job] = this.queue.splice(nextIndex, 1);
+      this.activeWorkspaces.add(job.workspaceId);
+      let task!: Promise<void>;
+      task = this.generate(job).catch(() => {}).finally(() => {
+        this.activeWorkspaces.delete(job.workspaceId);
+        this.activeTasks.delete(task);
+        this.pump();
+      });
+      this.activeTasks.add(task);
+    }
   }
 
   private gate(workId: string, run: TeamRun | null): WorkNarrativeStatus | null {
@@ -179,10 +224,10 @@ export class WorkNarrativeStore {
     return null;
   }
 
-  private async generate(workspaceId: string, workId: string, expectedKey: string, requestedAt: string) {
-    const jobKey = `${workspaceId}/${workId}`;
+  private async generate(job: QueuedNarrativeJob) {
+    const { workspaceId, workId, jobKey, expectedKey, requestedAt } = job;
     if (this.closed) {
-      if (this.pending.get(jobKey)?.requestedAt === requestedAt) this.pending.delete(jobKey);
+      this.clearPending(jobKey, expectedKey, requestedAt);
       return;
     }
     const controller = new AbortController();
@@ -192,11 +237,21 @@ export class WorkNarrativeStore {
     timeout.unref();
     const adapterOptions: UnderstandingAdapterOptions = { signal: controller.signal, timeoutMs, maxBytes: MAX_OUTPUT_BYTES };
     const currentRun = () => this.options.teams.understandingRecords().find(item => `team:${item.id}` === workId) ?? null;
-    const currentJob = () => this.pending.get(jobKey)?.requestedAt === requestedAt && this.pending.get(jobKey)?.key === expectedKey;
+    const currentJob = () => this.isCurrentPending(jobKey, expectedKey, requestedAt);
     try {
       const run = currentRun();
-      if (!run || !currentJob() || narrativeKey(workId, run.baseCommit ?? null, run.headCommit ?? null) !== expectedKey || this.gate(workId, run)) return;
-      if (this.closed) return;
+      if (this.closed || controller.signal.aborted || !run || !currentJob() || narrativeKey(workId, run.baseCommit ?? null, run.headCommit ?? null) !== expectedKey || this.gate(workId, run))
+        return;
+      const budget = this.state(workspaceId);
+      if (budget.jobs >= DAILY_JOBS) return;
+      budget.jobs++;
+      try { this.persist(workspaceId, budget); }
+      catch {
+        budget.jobs--;
+        this.storageFailures.set(jobKey, { key: expectedKey, at: this.now().toISOString(), reason: "Narrative storage is unavailable on this host." });
+        return;
+      }
+      this.storageFailures.delete(jobKey);
       const result = await this.options.adapter.explainWork!({ root: run.workspace, baseCommit: run.baseCommit, question: workQuestion(run) }, adapterOptions);
       const latest = currentRun();
       if (this.closed || !latest || !currentJob() || narrativeKey(workId, latest.baseCommit ?? null, latest.headCommit ?? null) !== expectedKey || latest.workspace !== run.workspace || this.gate(workId, latest)) return;
@@ -228,7 +283,7 @@ export class WorkNarrativeStore {
     } finally {
       this.activeControllers.delete(controller);
       clearTimeout(timeout);
-      if (this.pending.get(jobKey)?.requestedAt === requestedAt) this.pending.delete(jobKey);
+      this.clearPending(jobKey, expectedKey, requestedAt);
     }
   }
 

@@ -3,7 +3,6 @@
   "files": {
     "apps/macos/Sources/InfiniteCore/CmuxConnection.swift": 13,
     "apps/macos/Sources/InfiniteCore/CmuxIdentityVault.swift": 4,
-    "apps/macos/Sources/InfiniteCore/FileTransfer.swift": 12,
     "apps/macos/Sources/InfiniteCore/Halt.swift": 12,
     "apps/macos/Sources/InfiniteCore/Missions.swift": 46,
     "apps/macos/Sources/InfiniteCore/RemoteCipher.swift": 1,
@@ -37,8 +36,6 @@
     "apps/macos/Tests/InfiniteCoreTests/TeamRunTests.swift": 4,
     "apps/macos/Tests/InfiniteCoreTests/UsageTests.swift": 8,
     "apps/macos/Tests/InfiniteDesktopTests/DisplayFreshnessTests.swift": 3,
-    "apps/macos/Tests/InfiniteDesktopTests/ManagedSessionInputTests.swift": 2,
-    "packages/host/src/manager.ts": 101,
-    "tests/halt.test.ts": 53
+    "apps/macos/Tests/InfiniteDesktopTests/ManagedSessionInputTests.swift": 2
   }
 }

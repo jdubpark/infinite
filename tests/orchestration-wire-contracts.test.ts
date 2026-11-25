@@ -46,6 +46,7 @@ import {
 import {
   missionSubtaskSchema,
   recordedMissionFollowUpSchema,
+  type Mission,
   type MissionDecisionState,
 } from "../packages/host/src/mission-types.js";
 import { MissionService } from "../packages/host/src/missions.js";
@@ -425,32 +426,34 @@ test("MissionService loads legacy settled follow-ups without synthesizing settle
   mkdirSync(join(stateDir, "missions"), { recursive: true });
   const key = randomBytes(32);
   const missionId = UUID;
+  const historicalAt = "2020-01-01T12:00:00.000Z";
+  const historicalLater = "2020-01-01T12:05:00.000Z";
   const futureDueAt = "2099-01-01T00:00:00.000Z";
-  const legacyCancelled = {
+  const legacyCancelled: NonNullable<Mission["followUps"]>[number] = {
     id: "f-legacy-cancelled",
     dueAt: futureDueAt,
     reason: "Cancelled before future due date",
     check: "Inspect PR",
-    createdAt: AT,
-    state: "cancelled" as const,
+    createdAt: historicalAt,
+    state: "cancelled",
   };
-  const openFollowUp = {
+  const openFollowUp: NonNullable<Mission["followUps"]>[number] = {
     id: "f-open-current",
     dueAt: futureDueAt,
     reason: "Wait for CI",
     check: "Inspect CI",
-    createdAt: AT,
-    state: "open" as const,
+    createdAt: historicalAt,
+    state: "open",
   };
   assert.equal(recordedMissionFollowUpSchema.safeParse(legacyCancelled).success, true);
   const timestampedSettled = Array.from({ length: 10 }, (_, index) => ({
     id: `f-${index}`,
-    dueAt: `2026-11-25T12:${String(index).padStart(2, "0")}:00.000Z`,
+    dueAt: `2020-01-01T12:${String(index).padStart(2, "0")}:00.000Z`,
     reason: `Check ${index}`,
     check: "Inspect PR",
-    createdAt: AT,
+    createdAt: historicalAt,
     state: "fired" as const,
-    settledAt: `2026-11-25T12:${String(index).padStart(2, "0")}:30.000Z`,
+    settledAt: `2020-01-01T12:${String(index).padStart(2, "0")}:30.000Z`,
   }));
   const missionProfile = { id: "lead", label: "Lead", provider: "claude" as const, model: "claude-opus-4-6", effort: "high" as const, tier: "strong" as const };
   const stored = {
@@ -464,8 +467,8 @@ test("MissionService loads legacy settled follow-ups without synthesizing settle
       mode: "work",
       revision: 1,
       status: "working",
-      createdAt: AT,
-      updatedAt: LATER,
+      createdAt: historicalAt,
+      updatedAt: historicalLater,
       deadlineAt: futureDueAt,
       maxSubtasks: 4,
       maxMinutes: 60,

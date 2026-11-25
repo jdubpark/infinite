@@ -1282,8 +1282,8 @@ const server = createServer((socket) => {
             !["starting", "running"].includes(state.status)) throw new Refusal("unsupported");
         result = executor.attach();
       } else if (request.op === "workspace-export") {
-        const parsed = workerWorkspaceExportRequestSchema.safeParse(request);
-        if (!parsed.success) throw new Error(!["sync/export", "sync/blob"].includes(String((request as { method?: unknown }).method)) ? "Unsupported workspace export method" : request.method === "sync/blob" && request.hash === undefined ? "A content hash is required" : "Invalid workspace export request");
+        if (!["sync/export", "sync/blob"].includes(String((request as { method?: unknown }).method))) throw new Refusal("unsupported");
+        const parsed = workerWorkspaceExportRequestSchema.safeParse(request); if (!parsed.success) throw new Error(request.method === "sync/blob" && request.hash === undefined ? "A content hash is required" : "Invalid workspace export request");
         if (!hybrid) throw new Refusal("unsupported");
         result = await hybrid.control(parsed.data.method, parsed.data.method === "sync/blob" ? { hash: parsed.data.hash } : {});
       } else if (request.op === "native-connect") {

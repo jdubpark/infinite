@@ -1574,7 +1574,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     try {
       if (action === "/control") {
         const normalized = normalizeControlRequest(httpControlRequestSchema.parse(req.body), res.locals.actor);
-        return void (normalized.ok ? res.json({ control: await cmux.call(sessionId, normalized.request) }) : (await cmux.get(sessionId), res.status(409).json({ code: normalized.code, error: "Control changed or expired. This input was not sent. Refresh and take control again." })));
+        return void (normalized.ok ? res.json({ control: await cmux.call(sessionId, normalized.request) }) : (cmux.requireStored(sessionId), res.status(409).json({ code: normalized.code, error: "Control changed or expired. This input was not sent. Refresh and take control again." })));
       }
       if (action === "/input") return void res.json(await cmux.call(sessionId, { op: "input", ...inputSchema.parse(req.body), ...authority }));
       if (action === "/answer") return void res.json(await cmux.call(sessionId, { op: "answer", ...answerSchema.parse(req.body), ...authority }));

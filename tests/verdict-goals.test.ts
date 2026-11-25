@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { RunAssessment } from "../packages/host/src/verdict-types.js";
 import { TeamError } from "../packages/host/src/teams.js";
 import type { ProductGoal } from "../packages/host/src/goal-types.js";
-import { CONTINUE_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "../packages/host/src/goal-verdicts.js";
+import { CONTINUE_EVENT, DELIVERY_HOLD_REASON, LATE_RECEIPT_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "../packages/host/src/goal-verdicts.js";
 import { BRIEF, NOTE, SWITCHES, assessmentOf, criterion, finite, hostFixture, outcomeOf, standing, stubFixture, until } from "./fixtures/verdict-goals.js";
 
 const AGENT_ASSESSMENT = "Agent assessment, provisional";
@@ -250,6 +250,8 @@ test("without verdicts a goal is as today", { timeout: 300000 }, async () => {
     assert.ok(goal.cycles.every(cycle => !("assessment" in cycle)), "No cycle holds an assessment");
     assert.notEqual(goal.stopReason, "provisional-met");
     assert.ok(!goal.events.some(event => event.text === PROVISIONAL_EVENT));
+    assert.ok(!goal.events.some(event => event.text === LATE_RECEIPT_EVENT || event.text === DELIVERY_HOLD_REASON), "No hold and no late receipt reach a goal without verdicts");
+    assert.ok(goal.cycles.every(cycle => !("supersededVerdictIds" in cycle)));
 
     // An outcome without a verdictId records as today; a verdictId that names no assessment is refused.
     const stray = await f.host.fetchApi(`/goals/${id}/outcome`, "owner", outcomeOf(goal, { verdictId: randomUUID() }));
@@ -261,4 +263,194 @@ test("without verdicts a goal is as today", { timeout: 300000 }, async () => {
     assert.equal(recorded.body.outcomes.length, 1);
     assert.ok(!("verdictId" in recorded.body.outcomes[0]));
   } finally { await f.close(); }
+});
+
+const HEAD = "a".repeat(40);
+/** A reviewed verdict whose one open criterion waited for the delivery. */
+const waiting = (): RunAssessment => ({ verdictId: randomUUID(), revision: 1, head: HEAD, kind: "reviewed", result: "inconclusive",
+  counts: { met: 1, notMet: 0, inconclusive: 1, pendingOwner: 0 }, criteria: [{ id: "c0", state: "met" }, { id: "c1", state: "inconclusive" }], at: new Date().toISOString() });
+const detailOf = (assessment: RunAssessment, reason: string) => ({ verdictId: assessment.verdictId, revision: 1, head: HEAD,
+  criteria: assessment.criteria.map(item => ({ id: item.id, producer: "host", state: item.state, ...(item.state === "inconclusive" ? { reason } : {}) })) }) as never;
+const count = (goal: ProductGoal, text: string) => goal.events.filter(event => event.text === text).length;
+
+test("a goal holds its next launch for a delivery receipt and stops provisional-met when it arrives", { timeout: 60000 }, async t => {
+  const { teams, goals } = stubFixture(t, "autonomous", true);
+  const created = await goals.create(finite({ maxMinutes: 240 }));
+  goals.start();
+  const launch = await until(() => teams.launches[0], Boolean, "cycle 1");
+  const teamId = launch.request.requestId;
+  const first = waiting();
+  teams.settle(teamId, "merged", { ...BRIEFED, assessment: first }, 4);
+  teams.detail(teamId, detailOf(first, "before-delivery"));
+
+  // The only open criterion waits for the delivery: the goal keeps its next launch back, with one event.
+  const held = await until(() => goals.get(created.id), goal => goal.reason === DELIVERY_HOLD_REASON, "the hold");
+  assert.equal(held.status, "running");
+  await new Promise(done => setTimeout(done, 1300));
+  assert.equal(count(goals.get(created.id), DELIVERY_HOLD_REASON), 1);
+  assert.equal(teams.launches.length, 1);
+
+  // The receipt arrives: the cycle holds the new verdict, the old id is kept, and the goal stops for the owner.
+  const late = assessmentOf(2, 0);
+  teams.settle(teamId, "merged", { assessment: late });
+  await goals.syncReceipts();
+  const stopped = goals.get(created.id);
+  assert.equal(stopped.status, "ready-for-review");
+  assert.equal(stopped.stopReason, "provisional-met");
+  assert.equal(stopped.reason, PROVISIONAL_REASON);
+  assert.equal(stopped.cycles[0]!.assessment?.verdictId, late.verdictId);
+  assert.deepEqual(stopped.cycles[0]!.supersededVerdictIds, [first.verdictId]);
+  assert.equal(count(stopped, LATE_RECEIPT_EVENT), 1);
+  assert.equal(count(stopped, PROVISIONAL_EVENT), 1);
+  assert.equal(teams.launches.length, 1);
+  assert.equal(teams.cancels.length, 0);
+
+  // A later receipt that turns the verdict not-met changes the cycle and leaves the stop and its text.
+  const reverted = assessmentOf(1, 1);
+  teams.settle(teamId, "merged", { assessment: reverted });
+  await goals.syncReceipts();
+  const after = goals.get(created.id);
+  assert.equal(after.cycles[0]!.assessment?.verdictId, reverted.verdictId);
+  assert.deepEqual(after.cycles[0]!.supersededVerdictIds, [first.verdictId, late.verdictId]);
+  assert.equal(after.stopReason, "provisional-met");
+  assert.equal(after.reason, PROVISIONAL_REASON);
+  assert.equal(count(after, PROVISIONAL_EVENT), 1);
+  const answered = await goals.outcome(created.id, outcomeOf(after, { verdictId: first.verdictId }) as never);
+  assert.equal(answered.outcomes.length, 1, "The owner's answer names an earlier id and is accepted");
+});
+
+test("a hold that does not apply launches as today", { timeout: 120000 }, async t => {
+  const { teams, goals, advance, config } = stubFixture(t, "autonomous", true);
+  const cycleTwo = async (id: string, assessment: RunAssessment | undefined, reason: string, extra: Partial<RunAssessment> = {}) => {
+    const launch = await until(() => teams.launches.filter(item => item.context.id === id)[0], Boolean, "cycle 1");
+    const given = assessment === undefined ? undefined : { ...assessment, ...extra };
+    teams.settle(launch.request.requestId, "merged", { ...BRIEFED, ...(given ? { assessment: given } : {}) }, 4);
+    if (given) teams.detail(launch.request.requestId, detailOf(given, reason));
+    await until(() => teams.launches.filter(item => item.context.id === id).length, length => length === 2, "cycle 2");
+    const goal = goals.get(id);
+    assert.notEqual(goal.reason, DELIVERY_HOLD_REASON);
+    assert.equal(count(goal, DELIVERY_HOLD_REASON), 0);
+    await goals.cancel(id, action(goal));
+  };
+  const start = async () => { const goal = await goals.create(finite({ maxMinutes: 240 })); goals.start(); return goal.id; };
+
+  // Another reason keeps a criterion open, a not-met criterion is a result of its own, and a goal without a verdict has nothing to wait for.
+  await cycleTwo(await start(), waiting(), "evaluator-unavailable");
+  await cycleTwo(await start(), waiting(), "before-delivery", { counts: { met: 0, notMet: 1, inconclusive: 1, pendingOwner: 0 } });
+  const quiet = await start();
+  await cycleTwo(quiet, undefined, "");
+  const unread = JSON.stringify(goals.get(quiet));
+  await goals.syncReceipts();
+  assert.equal(JSON.stringify(goals.get(quiet)), unread, "A goal without a verdict is neither read nor saved");
+
+  // A supervised goal and a project without scans wait for nothing.
+  config.projects[0]!.autonomy = "supervised";
+  await cycleTwo(await start(), waiting(), "before-delivery");
+  config.projects[0]!.autonomy = "autonomous";
+  config.projects[0]!.source = { mode: "laptop" };
+  await cycleTwo(await start(), waiting(), "before-delivery");
+  config.projects[0]!.source = { mode: "github", repository: "example/fixture", baseBranch: "main" };
+
+  // The hold ends 10 minutes after the cycle finished: the next launch goes on by the unchanged path.
+  const id = await start();
+  const launch = await until(() => teams.launches.filter(item => item.context.id === id)[0], Boolean, "cycle 1");
+  const open = waiting();
+  teams.settle(launch.request.requestId, "merged", { ...BRIEFED, assessment: open }, 4);
+  teams.detail(launch.request.requestId, detailOf(open, "before-delivery"));
+  await until(() => goals.get(id).reason, reason => reason === DELIVERY_HOLD_REASON, "the hold");
+  advance(9);
+  await new Promise(done => setTimeout(done, 1200));
+  assert.equal(teams.launches.filter(item => item.context.id === id).length, 1, "Nine minutes in, the goal still waits");
+  advance(2);
+  await until(() => teams.launches.filter(item => item.context.id === id).length, length => length === 2, "the launch after the hold");
+  const released = goals.get(id);
+  assert.notEqual(released.reason, DELIVERY_HOLD_REASON);
+  assert.equal(count(released, DELIVERY_HOLD_REASON), 1);
+});
+
+test("a late receipt changes only the cycle in every other goal state", { timeout: 120000 }, async t => {
+  const { teams, goals } = stubFixture(t, "autonomous", true);
+  const start = async (extra = {}) => { const goal = await goals.create(finite({ maxMinutes: 240, ...extra })); goals.start(); return goal.id; };
+  const firstOf = async (id: string, assessment: RunAssessment, n = 1) => {
+    const launch = await until(() => teams.launches.filter(item => item.context.id === id)[n - 1], Boolean, `cycle ${n}`);
+    teams.settle(launch.request.requestId, "merged", { ...BRIEFED, assessment }, 4);
+    return launch.request.requestId;
+  };
+  const unchanged = (after: ProductGoal, before: ProductGoal) => {
+    assert.equal(after.status, before.status);
+    assert.equal(after.reason, before.reason);
+    assert.equal(after.stopReason, before.stopReason);
+    assert.equal(after.activeTeamId, before.activeTeamId);
+  };
+
+  // The run limit, then the owner's answer: the stop is the limit's, and an achieved goal stays achieved.
+  const limited = await start({ maxRuns: 1 });
+  const first = waiting();
+  const limitedTeam = await firstOf(limited, first);
+  const atLimit = await until(() => goals.get(limited), goal => goal.status === "ready-for-review" && !goal.activeTeamId, "the run limit");
+  const late = assessmentOf(2, 0);
+  teams.settle(limitedTeam, "merged", { assessment: late });
+  await goals.syncReceipts();
+  const changed = goals.get(limited);
+  assert.equal(changed.cycles[0]!.assessment?.verdictId, late.verdictId);
+  assert.deepEqual(changed.cycles[0]!.supersededVerdictIds, [first.verdictId]);
+  unchanged(changed, atLimit);
+  assert.equal(count(changed, PROVISIONAL_EVENT), 0);
+  const achieved = await goals.outcome(limited, outcomeOf(changed, { result: "achieved" }) as never);
+  const third = assessmentOf(1, 1);
+  teams.settle(limitedTeam, "merged", { assessment: third });
+  await goals.syncReceipts();
+  const afterAchieved = goals.get(limited);
+  assert.equal(afterAchieved.cycles[0]!.assessment?.verdictId, third.verdictId);
+  assert.equal(afterAchieved.status, "achieved");
+  assert.equal(afterAchieved.outcomes.length, achieved.outcomes.length);
+
+  // An older cycle, with the next cycle's team active.
+  const running = await start({ maxRuns: 3 });
+  const oldTeam = await firstOf(running, waiting());
+  await until(() => teams.launches.filter(item => item.context.id === running).length, length => length === 2, "cycle 2");
+  const busy = goals.get(running);
+  const newer = assessmentOf(2, 0);
+  teams.settle(oldTeam, "merged", { assessment: newer });
+  await goals.syncReceipts();
+  const olderChanged = goals.get(running);
+  assert.equal(olderChanged.cycles[0]!.assessment?.verdictId, newer.verdictId);
+  unchanged(olderChanged, busy);
+  assert.equal(teams.launches.filter(item => item.context.id === running).length, 2);
+  await goals.cancel(running, action(olderChanged));
+
+  // A goal that waits for the delivery, paused by the owner, stays paused.
+  const paused = await start({ maxRuns: 3 });
+  const pausedFirst = waiting();
+  const pausedTeam = await firstOf(paused, pausedFirst);
+  teams.detail(pausedTeam, detailOf(pausedFirst, "before-delivery"));
+  await until(() => goals.get(paused).reason, reason => reason === DELIVERY_HOLD_REASON, "the hold");
+  const pausedGoal = await goals.pause(paused, action(goals.get(paused)));
+  teams.settle(pausedTeam, "merged", { assessment: assessmentOf(2, 0) });
+  await goals.syncReceipts();
+  const stillPaused = goals.get(paused);
+  assert.equal(stillPaused.cycles[0]!.assessment?.result, "met");
+  unchanged(stillPaused, pausedGoal);
+  assert.equal(stillPaused.status, "paused");
+  assert.equal(teams.launches.filter(item => item.context.id === paused).length, 1);
+
+  // A standing goal between cycles: the cycle changes, and nothing stops.
+  const standingGoal = await goals.create(standing());
+  const standingTeam = await firstOf(standingGoal.id, waiting());
+  const idle = await until(() => goals.get(standingGoal.id), goal => !goal.activeTeamId && goal.cycles[0]?.class !== undefined, "the standing cycle");
+  teams.settle(standingTeam, "merged", { assessment: assessmentOf(2, 0) });
+  await goals.syncReceipts();
+  const standingAfter = goals.get(standingGoal.id);
+  assert.equal(standingAfter.cycles[0]!.assessment?.result, "met");
+  unchanged(standingAfter, idle);
+  assert.equal(standingAfter.status, "running");
+  assert.equal(count(standingAfter, PROVISIONAL_EVENT), 0);
+  await goals.cancel(standingGoal.id, action(standingAfter));
+
+  // A run whose record is gone changes nothing.
+  const gone = assessmentOf(2, 0);
+  teams.settle(limitedTeam, "merged", { assessment: gone });
+  teams.forget(limitedTeam);
+  await goals.syncReceipts();
+  assert.equal(goals.get(limited).cycles[0]!.assessment?.verdictId, third.verdictId);
 });

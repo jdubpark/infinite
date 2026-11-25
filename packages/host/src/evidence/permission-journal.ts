@@ -10,6 +10,7 @@ import {
   type RejectCode,
 } from "../permission-policy.js";
 import { canonicalJson } from "./crypto.js";
+import { raisedRepeatCount } from "./permission-repeat-count.js";
 import type { EvidenceDb, EvidenceModule, EvidenceTx } from "./types.js";
 import { EvidenceStore } from "./store.js";
 
@@ -67,6 +68,12 @@ export type PermissionDecision = {
   note?: string;
   replayOf?: string;
   repeats?: string;
+  /**
+   * A digest of the raised request this decision answers. The host can decide one raised request more than once, and
+   * decisions with one digest count as one repeat. It is kept only in the sealed copy of the decision: it is no
+   * column, and a lookup does not return it. A decision of an earlier release has none and counts on its own.
+   */
+  requestDigest?: string;
 };
 
 export type PermissionDecisionQuery = {
@@ -899,6 +906,7 @@ function normalizeDecision(value: PermissionDecision): PermissionDecision {
   assertOnlyKeys(value, [
     "id", "at", "workspaceId", "projectId", "taskId", "assignment", "sessionId", "role", "provider", "family",
     "evidenceHash", "reuseKey", "action", "rules", "tiers", "verdict", "code", "interruptClass", "note", "replayOf", "repeats",
+    "requestDigest",
   ]);
   const id = requiredString(value.id, "id");
   const at = requiredTimestamp(value.at, "at");
@@ -948,6 +956,7 @@ function normalizeDecision(value: PermissionDecision): PermissionDecision {
   const reuseKey = optionalString(value.reuseKey, "reuseKey");
   const replayOf = optionalString(value.replayOf, "replayOf");
   const repeats = optionalString(value.repeats, "repeats");
+  const requestDigest = optionalString(value.requestDigest, "requestDigest");
   if (repeats !== undefined && (verdict !== "reject" || !isEffectReject(value.code))) {
     throw new TypeError("A repeated request must be rejected with an effect reject code.");
   }
@@ -964,6 +973,7 @@ function normalizeDecision(value: PermissionDecision): PermissionDecision {
     ...(value.interruptClass === undefined ? {} : { interruptClass: value.interruptClass }),
     ...(value.note === undefined ? {} : { note: value.note }),
     ...(replayOf === undefined ? {} : { replayOf }), ...(repeats === undefined ? {} : { repeats }),
+    ...(requestDigest === undefined ? {} : { requestDigest }),
   };
 }
 
@@ -1082,21 +1092,7 @@ function canonicalDecision(db: EvidenceDb, row: DecisionRow, seen = new Set<stri
 }
 
 function repeatCountInDb(db: EvidenceDb, assignment: string, rejectId: string): number {
-  const repeats = db.all<DecisionRow>(
-    `SELECT * FROM ${DECISIONS} WHERE assignment=? AND repeats=? AND `
-    + `(code IS NULL OR code NOT IN (${placeholders(HOST_REJECT_CODES.length)}))`,
-    assignment, rejectId, ...HOST_REJECT_CODES,
-  );
-  const resets = db.all<ControlRow>(
-    `SELECT seq,kind,at,decision_id,assignment FROM ${CONTROLS} `
-    + "WHERE (kind='unlock' AND assignment=?) OR (kind='reopen' AND decision_id=?)",
-    assignment, rejectId,
-  );
-  if (resets.length === 0) return repeats.length;
-  const latestReset = resets.reduce((latest, event) => compareOrder(event.at, event.seq, latest.at, latest.seq) > 0
-    ? event
-    : latest);
-  return repeats.filter(row => compareOrder(row.at, row.seq, latestReset.at, latestReset.seq) > 0).length;
+  return raisedRepeatCount(db, { decisions: DECISIONS, controls: CONTROLS, inputSeals: INPUT_SEAL_TABLE }, assignment, rejectId);
 }
 
 function insertControl(tx: EvidenceTx, event: {

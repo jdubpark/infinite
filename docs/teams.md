@@ -2244,9 +2244,11 @@ A blocked, paused, or cancelled run gets no verdict. A standalone run gets one a
 
 **Choosing the evaluator.** The host picks a profile from the lineup's `evaluators` (see [Intent check](#intent-check) for how that list is derived) by three rules:
 
-1. The profile's model family is known and differs from the coordinator's, and the profile's model never authored work in the run. An author is any implementer or integrator member of the run, in any revision and whatever it reported. An implementer that escalated, or that stopped at a limit without a report, may have left edits that its replacement kept, and work integrated before a steer or a resume still counts. A second profile of the same model cannot pass. Counting too many authors only gives `no-independent-evaluator`.
+1. The profile's model family is known and differs from the family of the lineup's coordinator and of every project manager member of the run, and the profile's model never authored work in the run. A project manager can run on a fallback profile of another family after a provider limit. For a no-change assessment, the members of the parent run, which made the head, count as well; when that run is gone the result is `no-independent-evaluator`. A cycle's parent is always the goal's latest reviewed cycle, so a no-change cycle is never a parent. A manager of unknown family gives `no-independent-evaluator`. An author is any implementer or integrator member of the run, in any revision and whatever it reported. An implementer that escalated, or that stopped at a limit without a report, may have left edits that its replacement kept, and work integrated before a steer or a resume still counts. A second profile of the same model cannot pass. Counting too many authors only gives `no-independent-evaluator`.
 2. Among the profiles that pass, the host prefers the first whose family neither authored nor reviewed in the run, then the first whose family authored nothing, then the first.
 3. The assessment records `sharedFamily` (the evaluator's family authored integrated work) and `alsoReviewed` (its model reviewed a change in the run). Having reviewed does not exclude a profile, because the evaluator never sees its own review.
+
+The evaluator is named only when one of its answers was recorded on a criterion. If every answer was dropped, the ledger row has no profile, provider, model, or family, and the verdicts read has no `evaluator`.
 
 A profile on a limited provider is skipped. The router does not avoid `evaluators` profiles when it picks profiles for a cycle's tasks, so a lineup whose evaluators are all also implementers can end with `no-independent-evaluator`.
 
@@ -3125,7 +3127,16 @@ Each request passes these steps in order:
    a one-shot accept and a one-shot reject. A request that does not qualify
    can be rejected or sent to the owner. It is never allowed.
 3. **Lock and replay.** An assignment that repeated one rejected request twice
-   is locked and gets no model turn until the owner unlocks it. An identical
+   is locked and gets no model turn until the owner unlocks it. A repeat is a
+   request that the agent raised: one dialog of an interactive session, or
+   one headless call. The host can decide one raised request more than once,
+   after a halt release, a change to the rules in force, a changed reading,
+   or a dialog whose evidence changed while it was open. Its decisions count
+   as one repeat, at the first of them, so a request counted before an unlock
+   does not count again after it. The request that got the reject is not a
+   repeat of it. A decision recorded by a release before this rule carries no
+   mark of its request: it counts on its own, and a reject recorded then can
+   still be repeated by its own request. An identical
    request under the same authority is answered from its recorded verdict.
    A verdict belongs to the request as the host read it: the task text the
    reviewer saw, and the class and raise rules that matched as the request's

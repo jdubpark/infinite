@@ -145,7 +145,7 @@ const noLimits: ReadonlySet<Provider> = new Set();
 
 test("the evaluator rule excludes authors by model and prefers independence", () => {
   const lineup = acceptance11([deepseekEvaluator, gptReviewer]);
-  const cycle = { authors: [deepseekAuthor], reviewers: [gptReviewer] };
+  const cycle = { authors: [deepseekAuthor], reviewers: [gptReviewer], managers: [] };
   const choice = chooseEvaluator(lineup, cycle, noLimits);
   assert.ok("profile" in choice, "A profile is chosen");
   if (!("profile" in choice)) return;
@@ -171,7 +171,7 @@ test("the evaluator rule excludes authors by model and prefers independence", ()
 
 test("the evaluator rule prefers a family that authored nothing over one that authored", () => {
   const sameFamilyOtherModel: TeamModelProfile = { ...deepseekEvaluator, id: "evaluator-deepseek-pro", model: "deepseek/deepseek-pro" };
-  const cycle = { authors: [deepseekAuthor], reviewers: [gptReviewer] };
+  const cycle = { authors: [deepseekAuthor], reviewers: [gptReviewer], managers: [] };
   const choice = chooseEvaluator(acceptance11([sameFamilyOtherModel, gptReviewer]), cycle, noLimits);
   assert.ok("profile" in choice, "A profile is chosen");
   if (!("profile" in choice)) return;
@@ -179,7 +179,7 @@ test("the evaluator rule prefers a family that authored nothing over one that au
 });
 
 test("an unknown family is never eligible", () => {
-  const cycle = { authors: [], reviewers: [] };
+  const cycle = { authors: [], reviewers: [], managers: [] };
   const skipsUnknown = chooseEvaluator(acceptance11([unknownStrong, gptReviewer]), cycle, noLimits);
   assert.ok("profile" in skipsUnknown, "The known profile is chosen");
   if ("profile" in skipsUnknown) assert.equal(skipsUnknown.profile.id, "reviewer-gpt");
@@ -191,7 +191,7 @@ test("an unknown family is never eligible", () => {
 });
 
 test("limits and failures make the evaluator unavailable, not ineligible", () => {
-  const cycle = { authors: [], reviewers: [] };
+  const cycle = { authors: [], reviewers: [], managers: [] };
   const lineup = acceptance11([gptReviewer]);
   assert.deepEqual(chooseEvaluator(lineup, cycle, new Set<Provider>(["codex"])), { skipped: "evaluator-unavailable" });
   assert.deepEqual(chooseEvaluator(lineup, cycle, noLimits, new Set(["reviewer-gpt"])), { skipped: "evaluator-unavailable" });
@@ -224,4 +224,18 @@ test("evaluator overlaps name shared models", () => {
   const noDefaultModel: TeamModelProfile = { id: "default-codex", label: "Default", provider: "codex", tier: "strong", dataUse: "standard" };
   const implementerDefault: TeamLineup = { ...acceptance11([noDefaultModel]), implementers: [{ ...noDefaultModel, id: "impl-default" }] };
   assert.deepEqual(evaluatorOverlaps(implementerDefault), ["default-codex"], "A profile without a model matches another without one on that provider");
+});
+
+test("the evaluator is never of the family of a project manager that ran", () => {
+  const gptManager: TeamModelProfile = { ...gptReviewer, id: "manager-gpt", label: "GPT fallback manager" };
+  const cycle = { authors: [], reviewers: [], managers: [gptManager] };
+  assert.deepEqual(chooseEvaluator(acceptance11([gptReviewer]), cycle, noLimits), { skipped: "no-independent-evaluator" }, "only a manager-family evaluator is listed");
+  const choice = chooseEvaluator(acceptance11([gptReviewer, geminiEvaluator]), cycle, noLimits);
+  assert.ok("profile" in choice, "The other family is chosen");
+  if ("profile" in choice) assert.equal(choice.profile.id, "evaluator-gemini");
+  const unknownManager: TeamModelProfile = { ...unknownStrong, id: "manager-unknown" };
+  assert.deepEqual(chooseEvaluator(acceptance11([gptReviewer]), { authors: [], reviewers: [], managers: [unknownManager] }, noLimits), { skipped: "no-independent-evaluator" });
+  const own = chooseEvaluator(acceptance11([gptReviewer]), { authors: [], reviewers: [], managers: [claudeCoordinator] }, noLimits);
+  assert.ok("profile" in own, "A manager of the coordinator's own family changes nothing");
+  if ("profile" in own) assert.equal(own.profile.id, "reviewer-gpt");
 });

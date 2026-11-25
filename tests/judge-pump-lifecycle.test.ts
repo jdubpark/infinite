@@ -51,7 +51,7 @@ const grade = (resolved: boolean): TrialGrade => ({ ending: "graded", expectedPa
 
 type Mode = "prefer-a" | "hang";
 type Rig = ReturnType<typeof makeRig>;
-type Options = { mode?: Mode; trialsPerDay?: number; judgements?: boolean; cost?: CostLookup; trialSessions?: boolean };
+type Options = { mode?: Mode; trialsPerDay?: number; judgements?: boolean; cost?: CostLookup; trialSessions?: boolean; failCleanAt?: number };
 
 /** The pump over a real store and real jobs, with 30 seeded dev pairs whose trials ran two days before the clock. */
 function makeRig(options: Options = {}) {
@@ -78,11 +78,13 @@ function makeRig(options: Options = {}) {
   /** Launcher ops and `createForReplay` calls, in order. */
   const log: string[] = [];
   const removed: string[] = [];
+  let cleans = 0;
   const identity = {
     probe: async () => READY, receive: async () => "failed", prepare: async () => "failed", check: async () => "failed",
     teamPrefix: () => undefined, setupPrefix: () => undefined,
     stop: async () => { log.push("stop"); return true; },
-    clean: async () => { log.push("clean"); return true; },
+    // `failCleanAt` is the index, among all clean calls, of the one that reports failure.
+    clean: async () => { log.push("clean"); return cleans++ !== options.failCleanAt; },
     scrub: async () => { log.push("scrub"); return true; },
   } as unknown as EvalIdentity;
   const grader = { clean: async () => true } as unknown as Grader;
@@ -265,6 +267,24 @@ async function trialSequence(r: Rig): Promise<string[]> {
   await until(r, () => r.store.read(db => db.get<{ n: number }>("SELECT count(*) AS n FROM eval_trials WHERE trial_id NOT LIKE 'trial-zq-%' AND state = 'final'")?.n ?? 0) >= 1, 20);
   return r.log;
 }
+
+test("a clean that fails at a judgement's end is run again before the next judgement is built", async () => {
+  // The second clean call is the one at the first judgement's end; it reports failure.
+  const r = makeRig({ failCleanAt: 1 });
+  try {
+    calibrate(r);
+    await until(r, () => r.judge.creates.length >= 2, 20);
+    assert.ok(r.judge.creates.length >= 2, "a second judgement started");
+    const second = r.log.indexOf("create:duel", r.log.indexOf("create:duel") + 1);
+    assert.deepEqual(r.log.slice(0, second + 1), [
+      "stop", "clean", "scrub", "prepare", "create:duel", // start-up, then the first judgement
+      "stop", "clean", // its end: the clean fails, so no scrub
+      "stop", "clean", "scrub", "prepare", "create:duel", // the start-up runs again before the second judgement's source is built
+    ]);
+  } finally {
+    r.close();
+  }
+});
 
 test("a finish that fails once does not stall the calibration", async () => {
   const r = makeRig();

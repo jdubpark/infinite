@@ -1694,6 +1694,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       Boolean(session.team?.entryTools), Boolean(permissionChannel),
       egress.status !== "off",
       config.codeMode,
+      session.runtime?.nativeUi ? 0 : session.nativeArgs?.length, // a local native UI keeps them out of the profile
     );
     if (session.runtime?.nativeUi === "codex") {
       if (session.workspace) {

@@ -188,6 +188,7 @@ test("a delivery hold waits at most ten minutes for a receipt a goal can still g
   assert.equal(hold({ detail: detailOf(["before-delivery"], { head: "b".repeat(40) }) }), false);
   assert.equal(hold({ detail: detailOf(["before-delivery", "no-receipt"]) }), false);
   assert.equal(hold({ detail: detailOf([undefined]) }), false);
+  assert.equal(hold({ detail: detailOf([]) }), false, "a verdict with no criterion waits for nothing");
   assert.equal(hold({ detail: detailOf(["no-receipt"], { verdictId: randomUUID() }) }), true, "the team is finishing a late verdict");
   assert.equal(hold({ detail: detailOf(["no-receipt"], { verdictId: randomUUID(), head: "b".repeat(40) }) }), false);
 });

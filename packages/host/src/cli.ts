@@ -268,6 +268,7 @@ infinite projects rename|hide|show ID       Rename or hide a project
 infinite projects primary ID CHECKOUT_ID   Choose the checkout a project works in
 infinite start [--project ID] "task"       Start a mission
 infinite mission status|answer|steer|pause|resume|cancel ...
+infinite mission progress ID [--after CURSOR] [--json]  Read child assignments and check receipts
 infinite board [--project ID]              Watch the owner board
 infinite team start [OBJECTIVE] [--prd FILE] Start a team in the bound project
 infinite team status [ID] [--logs]          Show teams, or one team's Brief

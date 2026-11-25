@@ -6,7 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { fixture, git, limitLineup } from "./team-fixture.js";
 import { waitFor } from "./helpers.js";
 import { TeamError } from "../packages/host/src/teams.js";
-import { teamDeliveryReconcileSchema, type TeamDeliveryReconcile, type TeamReport } from "../packages/host/src/team-types.js";
+import { teamDeliveryReconcileSchema, type TeamDeliveryReconcile, type TeamLineup, type TeamReport } from "../packages/host/src/team-types.js";
 import { unseal } from "../packages/host/src/vault.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import { teamPrompt } from "../packages/host/src/team-prompts.js";
@@ -14,9 +14,13 @@ import type { EvidenceStore } from "../packages/host/src/evidence/store.js";
 import type { RunEvent } from "../packages/host/src/evidence/types.js";
 import { type DeliveryStored, deliveryInternals, deliveryRecord } from "./fixtures/team-delivery-record.js";
 
+const independentDeliveryLineup: TeamLineup = {
+  ...structuredClone(limitLineup),
+  reviewer: { id: "muse-reviewer", label: "Muse reviewer", provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant: "high", tier: "strong" },
+};
 
 async function blockedDeliveryRecord() {
-  const h = await deliveryRecord("merge");
+  const h = await deliveryRecord("merge", undefined, undefined, { reviewLineage: true });
   h.run.lineup = structuredClone(limitLineup);
   h.run.status = "blocked";
   h.run.reason = "Delivery was blocked before a confirmed remote result.";
@@ -97,7 +101,7 @@ function withoutUpdatedAt(stored: DeliveryStored) {
 }
 
 test("owner-authorized delivery waits for exact-head checks and review, survives API restart, and records one merge claim", { timeout: 90000 }, async () => {
-  const f = await fixture("delivery-hold", limitLineup);
+  const f = await fixture("delivery-hold", independentDeliveryLineup);
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     assert.equal(created.status, 200, JSON.stringify(created.body));
@@ -180,7 +184,7 @@ test("a completed merge report invokes the source refresh callback once", { time
 
 test("delivery rejects foreign targets, stale heads, changed files, and invalid merged baselines", { timeout: 120000 }, async () => {
   for (const [scenario, reason] of [["delivery-foreign", /configured repository/], ["delivery-stale", /reviewed commit/], ["delivery-dirty", /read-only member workspace/], ["delivery-baseline-changed", /beyond the reviewed tree/], ["delivery-baseline-tree", /must identify a commit/]] as const) {
-    const f = await fixture(scenario, limitLineup);
+    const f = await fixture(scenario, independentDeliveryLineup);
     try {
       const created = await f.host.fetchApi("/teams", "owner", f.create());
       const blocked = await f.settled(created.body.id);
@@ -193,7 +197,7 @@ test("delivery rejects foreign targets, stale heads, changed files, and invalid 
 });
 
 test("delivery repairs repeat checks and independent review before a new delivery attempt", { timeout: 90000 }, async () => {
-  const f = await fixture("delivery-repair", limitLineup);
+  const f = await fixture("delivery-repair", independentDeliveryLineup);
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     const merged = await f.settled(created.body.id);
@@ -209,7 +213,7 @@ test("delivery repairs repeat checks and independent review before a new deliver
 });
 
 test("an exited delivery without a receipt is not merged or replayed by steering", { timeout: 90000 }, async () => {
-  const f = await fixture("delivery-unreported", limitLineup);
+  const f = await fixture("delivery-unreported", independentDeliveryLineup);
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     await waitFor(() => f.get(created.body.id), run => run.status === "delivering" && existsSync(join(f.receipts, "delivery-started.json")), 40000);
@@ -337,18 +341,20 @@ test("a matching no-publication inspection allows same-head repair before checks
 test("an existing matching pull request is reused for bounded merge-policy delivery", { timeout: 30000 }, async () => {
   const h = await blockedDeliveryRecord();
   try {
+    const memberCountBefore = h.run.members.length;
     h.run.status = "delivering";
     h.consume({ kind: "delivery-reconciliation", headCommit: h.headCommit, repository: "example/app", branch: h.run.branch!,
       baseHeadCommit: h.run.baseCommit!, disposition: "pull-request", remoteHeadCommit: h.headCommit,
       pullRequestUrl: "https://github.com/example/app/pull/1", summary: "The matching reviewed PR exists and has not merged." });
-    const next = await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => run.members.length > 1 || run.status === "blocked", 15000);
+    const next = await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => run.members.length > memberCountBefore || run.status === "blocked", 15000);
     assert.notEqual(next.status, "blocked", next.reason);
     assert.equal(next.deliveryRecovery?.attempts, 1);
     assert.equal(next.deliveryReceipt, undefined, "an open PR is not a merge receipt");
     assert.equal(next.pullRequest, undefined, "merge policy still requires guarded merge delivery");
-    assert.equal(next.members.length, 2, "one coordinator continues the existing PR");
-    assert.equal(next.members[1].role, "delivery");
-    assert.equal(next.members[1].baseCommit, h.headCommit);
+    assert.equal(next.members.length, memberCountBefore + 1, "one coordinator continues the existing PR");
+    const continuation = next.members.find(member => member.role === "delivery" && member.memberId !== h.member.memberId)!;
+    assert.equal(continuation.role, "delivery");
+    assert.equal(continuation.baseCommit, h.headCommit);
   } finally { await h.f.close(); }
 });
 
@@ -541,12 +547,13 @@ test("owner delivery reconciliation refuses unsafe prior attempts without changi
 test("owner delivery reconciliation starts one strong worker at the pinned head and retains the prior report", { timeout: 90000 }, async () => {
   const h = await blockedDeliveryRecord();
   try {
+    const priorMemberCount = h.run.members.length;
     const priorAttempt = structuredClone(h.stored.deliveryAttempt);
     const priorReport = structuredClone(h.member.report);
     const request = { requestId: randomUUID(), revision: h.run.revision, text: "Check the branch, PR, and CI state before doing anything." };
     await h.teams.reconcileDelivery(h.id, request);
-    const prepared = await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => run.members.length === 2 && run.members.some(member => member.memberId !== h.member.memberId && member.status === "queued"), 10000);
-    const fresh = h.run.members.find(member => member.memberId !== h.member.memberId)!;
+    const prepared = await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => run.members.length === priorMemberCount + 1 && run.members.some(member => member.memberId !== h.member.memberId && member.status === "queued"), 10000);
+    const fresh = h.run.members.find(member => member.memberId !== h.member.memberId && member.role === "delivery" && member.status === "queued")!;
     assert.equal(fresh.role, "delivery");
     assert.equal(fresh.revision, h.run.revision);
     assert.equal(fresh.baseCommit, h.headCommit);
@@ -563,7 +570,7 @@ test("owner delivery reconciliation starts one strong worker at the pinned head 
     assert.equal(existsSync(join(h.f.receipts, "delivery-started.json")), false, "reconciliation queues a worker but does not publish directly");
 
     await h.teams.reconcileDelivery(h.id, request);
-    assert.equal(h.run.members.length, 2, "an idempotent retry must not queue another delivery member");
+    assert.equal(h.run.members.length, priorMemberCount + 1, "an idempotent retry must not queue another delivery member");
     assert.equal(h.stored.deliveryAttempt?.memberId, fresh.memberId);
   } finally { await h.f.close(); }
 });
@@ -851,12 +858,12 @@ test("restart reserves a persisted blocked delivery attempt once without replayi
     assert.equal(secondRestore.deliveryRecovery?.attempts, 1, "a second restart must not reserve another inspection attempt");
     assert.equal(secondRestore.recovery?.attempts, 1);
     assert.equal(secondRestore.members.filter(member => member.role === "delivery").length, 1, "the blocked delivery report remains historical evidence");
-    assert.equal(secondRestore.members[0]?.report?.kind, "blocked");
+    assert.equal(secondRestore.members.find(member => member.role === "delivery" && member.memberId === h.member.memberId)?.report?.kind, "blocked");
   } finally { await h.f.close(); }
 });
 
 test("failed checks never launch delivery and a weak lineup cannot opt into merge", { timeout: 90000 }, async () => {
-  const f = await fixture("delivery-failed-check", limitLineup);
+  const f = await fixture("delivery-failed-check", independentDeliveryLineup);
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     const blocked = await f.settled(created.body.id);

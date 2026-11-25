@@ -3,11 +3,10 @@ import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "n
 import { isAbsolute, join, relative } from "node:path";
 import { writeSealed, unseal } from "./vault.js";
 import type { ConnectorSource } from "./mcp-types.js";
-import { inputSourceLabel } from "./team-types.js";
 import { TeamService, TeamError, providerInputReason } from "./teams.js";
 import type { Manager } from "./manager.js";
 import type { Config } from "./types.js";
-import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type BlockerEvidence, type CreateTeam, type NativeContinuation, type TeamAssignment, type TeamView } from "./team-types.js";
+import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, inputSourceLabel, type BlockerEvidence, type CreateTeam, type NativeContinuation, type TeamAssignment, type TeamView } from "./team-types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
 import { createMissionSchema, missionActionSchema, missionExtendSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionFollowUp, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
@@ -24,6 +23,7 @@ import { applyFuseReason, workLaunch } from "./fuse/rules.js";
 import type { FuseAdmission, FuseCheck, FuseGate } from "./fuse/types.js";
 import { HALT_PAUSED_TEAM, KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import { missionDecisionQueueCandidates } from "./decision-queue.js";
+import { projectMissionSource } from "./mission-progress.js";
 
 /** The mission's only view of projects; the project group service implements it. */
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
@@ -315,6 +315,7 @@ export class MissionService {
   list() { return [...this.records.values()].map(stored => this.view(stored)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   /** Persisted mission records for the read-only Understanding view; performs no usage refresh. */
   understandingRecords() { return [...this.records.values()].map(stored => structuredClone(stored.mission)); }
+  progressSource(id: string) { return projectMissionSource(this.record(id)); }
   understandingOwnsSession(missionId: string, memberId: string, sessionId: string, projectId: string): boolean {
     const stored = this.records.get(missionId);
     return Boolean(stored && stored.mission.repoProjectIds.includes(projectId) && stored.attempts.some(attempt =>

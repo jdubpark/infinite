@@ -10,6 +10,31 @@ import { intakeEndedByRemoval } from "./review-feedback.js";
 import type { RetentionState, Stored, TeamServiceOptions } from "./teams.js";
 import { MemberTraces, removeMemberTraces, type TraceSettlementHost } from "./member-traces.js";
 
+function retentionEventAt(run: TeamRun) {
+  const event = [...run.events].reverse().find(item => {
+    switch (run.status) {
+      case "merged": return item.text.includes("reported a merged pull request");
+      case "no-change": return item.text.includes("reported no justified change");
+      case "cancelled": return item.text.startsWith("Team cancelled.");
+      case "ready-for-review": return item.text.includes("Ready for human review") || item.text.includes("reported an open pull request");
+      case "blocked": return item.text === run.reason || item.text.includes("recovery stopped after repeated unchanged remote evidence");
+      default: return false;
+    }
+  });
+  return event?.at ?? run.updatedAt ?? run.createdAt;
+}
+
+export function teamRetentionState(stored: Stored, now: () => string): RetentionState {
+  if (!stored.retention) stored.retention = { status: stored.run.status, statusAt: retentionEventAt(stored.run), integratedAt: {}, removalErrors: {} };
+  else if (stored.retention.status !== stored.run.status) {
+    stored.retention.status = stored.run.status;
+    stored.retention.statusAt = now();
+  }
+  stored.retention.integratedAt ??= {};
+  stored.retention.removalErrors ??= {};
+  return stored.retention;
+}
+
 /**
  * What the retention class uses of TeamService: part of the kernel, and the record, event and publication members it
  * shares with the rest of the service. teams.ts builds it in `retentionHost`; every member reads the service at the

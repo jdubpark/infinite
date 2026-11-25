@@ -52,7 +52,7 @@ const BASE_DIGESTS: Record<string, string> = {
   "plain/evaluator/context": "fe5cbf60907dd895160083e5e2cd2c86fe494f10b1ceab7772b84274daab570d",
   "record/permission-coordinator/prompt": "bf3ffce927b7c457f22e989374d17187031861e52f2131ecf80726affe94336f",
   "record/permission-coordinator/context": "391a0bcfff56a8606174793eaf8804dbad07f987e916ab6835ee2778fe22e44f",
-  "record/project-manager/prompt": "5e1ba65dde005edef175389793b546874fda86949581e16a698980d028f655fa",
+  "record/project-manager/prompt": "c96ca567692d330842dfa21bcca798f59c77c1145a616adbcd38788393393a20",
   "record/project-manager/context": "391a0bcfff56a8606174793eaf8804dbad07f987e916ab6835ee2778fe22e44f",
   "record/scout/prompt": "aba8430c810edb0cc7f4b7268f792cf815e6c472fce1c59c32691c5918c0b13c",
   "record/scout/context": "391a0bcfff56a8606174793eaf8804dbad07f987e916ab6835ee2778fe22e44f",
@@ -114,6 +114,20 @@ test("criteria rows reach only the coordinator", () => {
   }
   const manager = renderFor(run, "project-manager");
   assert.equal(/threshold|profile|score/i.test(manager.prompt.split("Agent assessment, provisional")[1]?.split("\n\n")[0] ?? ""), false, "the rows hold no number or profile");
+});
+
+test("only a project manager with a pinned goal record gets task criterion mapping instructions", () => {
+  const run = goalRunFor({ record: GOAL_RECORD });
+  const manager = renderFor(run, "project-manager").prompt;
+  assert.ok(manager.includes('"objectiveVersion":3'), "the PM gets the host-pinned objective revision");
+  assert.ok(manager.includes("every task, including each prerequisite"), "prerequisite tasks need direct references");
+  assert.ok(manager.includes("Dependencies set task order and do not provide transitive criterion coverage"));
+  assert.ok(manager.includes("not evidence that a criterion is satisfied"), "mapping cannot manufacture satisfaction");
+  assert.ok(manager.includes("other criteria may remain open"), "a cycle may target a subset");
+
+  for (const role of GOAL_ROLES.filter(role => role !== "project-manager"))
+    assert.equal(renderFor(run, role).prompt.includes("Task criterion references for this goal plan"), false, `${role}: no planning-only instruction`);
+  assert.equal(renderFor(goalRunFor({}), "project-manager").prompt.includes("Task criterion references for this goal plan"), false, "no record keeps old prompt behavior");
 });
 
 test("the evaluator's member report never reaches a context file", () => {

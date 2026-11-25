@@ -35,7 +35,11 @@ export function runSummaryCounts(run: TeamRun): RunSummaryCounts {
 
 /** SHA-256 hex of the JSON of one tuple per task, in order, covering every field a plan sets. */
 export function planDigest(tasks: readonly TeamTaskPlan[]): string {
-  const tuples = tasks.map(task => [task.id, task.title, task.instructions, task.agentProfileId ?? null, task.paths, task.dependsOn, task.kind ?? null, task.risk ?? null]);
+  const tuples = tasks.map(task => [
+    task.id, task.title, task.instructions, task.agentProfileId ?? null, task.paths, task.dependsOn, task.kind ?? null, task.risk ?? null,
+    // Keep the historical digest for plans without objective links.
+    ...(task.criterionRefs ? [[task.criterionRefs.objectiveVersion, task.criterionRefs.criteria]] : []),
+  ]);
   return createHash("sha256").update(JSON.stringify(tuples)).digest("hex");
 }
 

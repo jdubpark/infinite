@@ -106,8 +106,8 @@ function cancelFollowUps(mission: Mission) {
   trimFollowUps(mission);
 }
 function trimFollowUps(mission: Mission) {
-  const settled = (mission.followUps ?? []).filter(item => item.state !== "open").sort((a, b) => (a.settledAt ?? "").localeCompare(b.settledAt ?? ""));
-  const dropped = new Set(settled.slice(0, Math.max(0, settled.length - settledFollowUpsKept)));
+  const settled = (mission.followUps ?? []).filter(item => item.state !== "open").sort((a, b) => a.settledAt.localeCompare(b.settledAt));
+  const dropped = new Set<MissionFollowUp>(settled.slice(0, Math.max(0, settled.length - settledFollowUpsKept)));
   if (dropped.size) mission.followUps = mission.followUps!.filter(item => !dropped.has(item));
 }
 const messageCannotFitReason = "The next coordinator message cannot fit with the mission state, even shortened. No empty coordinator attempt was started; start a new mission with a consolidated objective.";

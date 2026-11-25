@@ -20,6 +20,7 @@ Non-obvious architectural, protocol, security, concurrency, and compatibility de
 | [0016](0016-wave3-per-entity-orchestration-queues.md) | Per-Entity Orchestration Queues and Orchestration Service Invariants | `packages/host/` | Accepted |
 | [0017](0017-host-eval-evidence-outcome-routing-invariants.md) | Host Eval, Evidence, Objective, Outcome, and Routing Invariants | `packages/host/` | Accepted |
 | [0018](0018-test-harness-and-verification-invariants.md) | Test Harness, Simulator, and Verification Invariants | `tests/` | Accepted |
+| [0019](0019-orchestration-wire-and-domain-type-invariants.md) | Orchestration Wire and Domain State-Machine Type Invariants | `packages/host/` | Accepted |
 | [0020](0020-host-orchestration-permissions-judges-invariants.md) | Host Orchestration, Permissions, Verdicts, Goals, and Judges Invariants | `packages/host/` | Accepted |
 | [0021](0021-host-core-runtime-integrations-invariants.md) | Host Core Runtime, Security, Telemetry, Memory, and Integration Invariants | `packages/host/` | Accepted |
 | [0022](0022-css-systemd-and-remaining-tests-invariants.md) | CSS, Systemd Unit, and Remaining Test Harness Invariants | `apps/web/`, `deploy/ubuntu/`, `scripts/`, `tests/` | Accepted |

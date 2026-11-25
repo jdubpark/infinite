@@ -1,4 +1,5 @@
 import type { Attention } from "@infinite/attention";
+import { z } from "zod";
 export type Role = "owner" | "controller" | "viewer";
 export type Provider = "claude" | "codex" | "grok" | "opencode" | "demo";
 export type Status =
@@ -23,69 +24,138 @@ export interface TerminalSnapshot {
   rows: number;
   capturedAt: string;
 }
-export interface SessionRuntime {
+interface SessionRuntimeBase {
   id: string;
   location: "local" | "cloud";
-  transport: "pty" | "cmux";
-  nativeUi?: "codex" | "opencode";
 }
+export type SessionRuntime =
+  | (SessionRuntimeBase & {
+      transport: "pty";
+      nativeUi?: "codex" | "opencode";
+    })
+  | (SessionRuntimeBase & {
+      transport: "cmux";
+      nativeUi?: never;
+    });
+export const sessionRuntimeSchema: z.ZodType<SessionRuntime> = z.discriminatedUnion("transport", [
+  z.object({
+    id: z.string().min(1),
+    location: z.enum(["local", "cloud"]),
+    transport: z.literal("pty"),
+    nativeUi: z.enum(["codex", "opencode"]).optional(),
+  }).strict(),
+  z.object({
+    id: z.string().min(1),
+    location: z.enum(["local", "cloud"]),
+    transport: z.literal("cmux"),
+  }).strict(),
+]);
 export interface LaptopWorkspace {
   cwd: string;
   roots: string[];
 }
-export interface ExecutionState {
-  location: "laptop" | "cloud";
-  state: "connecting" | "online" | "offline" | "preparing" | "paused";
-  cloudReady: boolean;
-  checkpoint?: { id: string; capturedAt: string };
-  reason?: string;
-  reconciliation?: "available";
+export interface ExecutionCheckpoint {
+  id: string;
+  capturedAt: string;
 }
-/** Why a team session exists. Only the host sets it, through createTeamSession. */
+interface ExecutionStateBase {
+  checkpoint?: ExecutionCheckpoint;
+}
+export type ExecutionState =
+  | (ExecutionStateBase & {
+      location: "cloud";
+      state: "online";
+      cloudReady: true;
+      reason?: never;
+      reconciliation?: "available";
+    })
+  | (ExecutionStateBase & {
+      location: "cloud";
+      state: "paused";
+      cloudReady: false;
+      reason: string;
+      reconciliation?: "available";
+    })
+  | (ExecutionStateBase & {
+      location: "laptop";
+      state: "connecting" | "online" | "offline" | "preparing" | "paused";
+      cloudReady: boolean;
+      reason?: string;
+      reconciliation?: never;
+    });
+const executionCheckpointSchema = z.object({
+  id: z.string().min(1),
+  capturedAt: z.iso.datetime(),
+}).strict();
+export const executionStateSchema: z.ZodType<ExecutionState> = z.union([
+  z.object({
+    location: z.literal("cloud"),
+    state: z.literal("online"),
+    cloudReady: z.literal(true),
+    checkpoint: executionCheckpointSchema.optional(),
+    reconciliation: z.literal("available").optional(),
+  }).strict(),
+  z.object({
+    location: z.literal("cloud"),
+    state: z.literal("paused"),
+    cloudReady: z.literal(false),
+    checkpoint: executionCheckpointSchema.optional(),
+    reason: z.string().min(1),
+    reconciliation: z.literal("available").optional(),
+  }).strict(),
+  z.object({
+    location: z.literal("laptop"),
+    state: z.enum(["connecting", "online", "offline", "preparing", "paused"]),
+    cloudReady: z.boolean(),
+    checkpoint: executionCheckpointSchema.optional(),
+    reason: z.string().min(1).optional(),
+  }).strict(),
+]);
+export type SessionHeadless =
+  | { channel: true; reason?: never; allowlist?: string[] }
+  | { channel: false; reason: string; allowlist?: string[] };
+export const sessionHeadlessSchema: z.ZodType<SessionHeadless> = z.discriminatedUnion("channel", [
+  z.object({
+    channel: z.literal(true),
+    allowlist: z.array(z.string().min(1)).optional(),
+  }).strict(),
+  z.object({
+    channel: z.literal(false),
+    reason: z.string().min(1),
+    allowlist: z.array(z.string().min(1)).optional(),
+  }).strict(),
+]);
 export type SessionPurpose = "work" | "duel" | "replay" | "gate";
 export const SESSION_PURPOSES: readonly SessionPurpose[] = ["work", "duel", "replay", "gate"];
-/**
- * The purposes whose sessions run as the eval identity: the eval agent profile, `_eval` egress, Code Mode off, and no injected context.
- * Phase 2 of duels gives a production challenger the purpose `duel`, so before that ships the eval identity must be chosen by a rule apart from the purpose.
- */
 export const LEARNING_PURPOSES: readonly SessionPurpose[] = ["replay", "gate", "duel"];
 export function learningPurpose(purpose: SessionPurpose | undefined): boolean {
   return purpose !== undefined && LEARNING_PURPOSES.includes(purpose);
 }
 export interface Session {
-  /** Host-owned (contract C8). Set only through createTeamSession, and never changed. */
   purpose?: SessionPurpose;
-  /** Host-owned (contract C7). A lowercase SHA-256 hex digest. */
   configId?: string;
-  /** Whether this Claude conversation started in Code Mode. Older records omit this and mean false. */
   codeMode?: boolean;
   handoff?: { policy?: import("./handoff-types.js").HandoffPolicy; reason?: string };
   id: string;
   managedBy?: { kind: "mission"; missionId: string; teamId?: string };
-  /** Host-owned assignment; ordinary session creation cannot supply this. */
   team?: import("./team-types.js").TeamAssignment;
   teamModelProfile?: import("./team-types.js").TeamModelProfile;
-  /** Host-owned: this member folder lies under a team root the owner trusts. */
   workspaceTrusted?: true;
   backend?: "infinite" | "cmux";
   machineId?: string;
-  /** Where this session's tools run. Laptop execution is the explicit --laptop mode. */
   executionLocation?: "cloud" | "laptop";
   resumedFrom?: string;
   resumeNativeSession?: { id: string; source: "hook" | "protocol" };
   provider: Provider;
   title: string;
-  /** Host-only marker for a title supplied by a CLI default, never a person. */
   generatedTitle?: true;
   projectId: string;
   cwd: string;
   createdAt: string;
   status: Status;
-  /** Host-owned: set when the owner archived this exited session */
   archivedAt?: string;
   pid?: number;
   exitCode?: number;
-  /** Canonical source checkout at creation; never inferred from a Linear mapping. */
   projectRoot?: string;
   contextSources?: import("./project-context.js").ContextSource[];
   contextLinksVersion?: number;
@@ -95,17 +165,61 @@ export interface Session {
   nativeArgs?: string[];
   runtime?: SessionRuntime;
   workspace?: LaptopWorkspace;
-  /** Host-owned: a headless launch, whether the permission channel serves it, and why not. */
-  headless?: { channel: boolean; reason?: string; allowlist?: string[] };
+  headless?: SessionHeadless;
 }
-/** The permission channel's live view of a headless session. */
+export interface PermissionChannelWaiting {
+  interruptClass: string;
+  tool: string;
+  since: string;
+  expiresAt: string;
+}
+export interface PermissionChannelNotice {
+  id: string;
+  interruptClass?: string;
+  at: string;
+}
 export interface PermissionChannelView {
-  /** The session was launched with the channel and its first hook call arrived. */
   served: boolean;
-  /** The one deferred call that waits for the owner. */
-  waiting?: { interruptClass: string; tool: string; since: string; expiresAt: string };
-  /** The latest request of this session that needed the owner and could not wait. The notifier pushes it once. */
-  notice?: { id: string; interruptClass?: string; at: string };
+  waiting?: PermissionChannelWaiting;
+  notice?: PermissionChannelNotice;
+}
+export type PermissionChannelViewState =
+  | { served: false; waiting?: never; notice?: PermissionChannelNotice }
+  | { served: true; waiting?: PermissionChannelWaiting; notice?: PermissionChannelNotice };
+const permissionChannelWaitingSchema = z.object({
+  interruptClass: z.string().min(1),
+  tool: z.string().min(1),
+  since: z.iso.datetime(),
+  expiresAt: z.iso.datetime(),
+}).strict();
+const permissionChannelNoticeSchema = z.object({
+  id: z.string().min(1),
+  interruptClass: z.string().min(1).optional(),
+  at: z.iso.datetime(),
+}).strict();
+export const permissionChannelViewSchema: z.ZodType<PermissionChannelViewState> = z.discriminatedUnion("served", [
+  z.object({
+    served: z.literal(false),
+    notice: permissionChannelNoticeSchema.optional(),
+  }).strict(),
+  z.object({
+    served: z.literal(true),
+    waiting: permissionChannelWaitingSchema.optional(),
+    notice: permissionChannelNoticeSchema.optional(),
+  }).strict(),
+]);
+export function projectPermissionChannelView(view: PermissionChannelView): PermissionChannelViewState {
+  if (view.served) {
+    return {
+      served: true,
+      ...(view.waiting ? { waiting: view.waiting } : {}),
+      ...(view.notice ? { notice: view.notice } : {}),
+    };
+  }
+  return {
+    served: false,
+    ...(view.notice ? { notice: view.notice } : {}),
+  };
 }
 export interface Event {
   seq: number;
@@ -119,83 +233,52 @@ export interface Project {
   path: string;
   team?: import("./team-types.js").TeamProject;
   linear?: { teamId: string; projectId?: string };
-  /** Absolute host directory that holds this project's team runs, outside every project root. */
   teamworkDir?: string;
-  /** Where the host's copy of this project comes from: GitHub (followed by the host) or laptop workspace sync. Absent means laptop. */
   source?: import("./team-types.js").ProjectSource;
-  /** Effective autonomy mode of an applied enrollment. Set only by RepoEnrollmentService; read with autonomyOf(). */
   autonomy?: import("./autonomy.js").AutonomyMode;
 }
 export interface AgentProfile {
   command: string;
   args: string[];
-  /** Optional qualified standalone Codex app-server; the regular command remains the TUI. */
   appServerCommand?: string;
   appServerArgs?: string[];
-  /** Optional data root outside private control state for a separate execution identity. */
   workspaceDir?: string;
   sharedWorkspace?: boolean;
 }
 export interface Config {
-  /** Host-only credential; never copied into provider environment variables or prompts. */
-  /** `reportName` is the name that starts the host's tracker comments, as in "NAME agent report: ready for review.". */
   linear?: { apiKeyFile: string; endpoint?: string; reportName?: string };
-  /** Launch gate for automatic launches: the host holds them while available memory is below the floor or one-minute load per CPU is above the ceiling. */
   hostLoad?: { minAvailableMemoryGiB: number; maxLoadPerCpu: number };
-  /** Linear and Slack request intake; the Linear credential above is required when this is set. */
   intake?: import("./intake-types.js").IntakeConfig;
-  /** Separate authenticated request connector; absent keeps its listener disabled. */
   mcp?: import("./mcp-types.js").McpConfig;
-  /** Claude Code Mode launch policy. Absent means off. */
   codeMode?: { claude: "off" | "headless" | "all" };
-  /** Separate working copies, writable by the host and selected provider execution account. */
   teams?: {
-    workspaceDir: string; commandPrefix?: import("./team-types.js").TeamCommand; lineup?: import("./team-types.js").TeamLineup;
-    /** Owner trust in every team root: Claude and Codex members start trusted in their own folders. */
+    workspaceDir: string;
+    commandPrefix?: import("./team-types.js").TeamCommand;
+    lineup?: import("./team-types.js").TeamLineup;
     trustWorkspaces?: boolean;
-    /** Minutes without attention activity before a member without a report is stopped and replaced. */
     stallMinutes?: number;
-    /** Minutes each configured verification command may run before the host stops it (default 60). */
     checkMinutes?: number;
-    /** How long finished, cancelled, reviewed and blocked runs keep their clones; see docs/teams.md "Workspace retention". */
     retention?: import("./team-types.js").TeamRetention;
-    /** Free inodes and bytes the workspace volume must keep for a new run to start. */
     storageFloor?: import("./team-types.js").StorageFloor;
-    /** Outcome measurement settings; they never change a routine's work, so routine approvals ignore them. */
     outcomes?: { holdDays?: number; retentionDays?: number };
-    /** Blackboard switches; they pin into each new run and stay in the routine approval digest. */
     blackboard?: { tools?: boolean };
-    /** Codex members' native traces, kept on the host; off unless set, and on only with both caps. See docs/teams.md "Member traces". */
     memberTraces?: import("./member-traces.js").MemberTraceSettings;
   };
   machine?: { id: string; label: string };
-  /** The permission agent's light and strong tiers, its miss-rate threshold and the least replay set size. */
   permissionAgent?: import("./permission-agent-config.js").PermissionAgentConfig;
-  /** Owner autonomy settings: the default mode for an enrollment with no saved mode, the fuse, continuity (wake gap and mission conversation rotation), and the agent boundary. */
   autonomy?: { defaultMode?: import("./autonomy.js").AutonomyMode; fuse?: import("./config.js").FuseConfig; continuity?: import("./config.js").ContinuityConfig; boundary?: { egress?: import("./egress.js").EgressConfig; github?: import("./github-grants.js").GithubBoundary } };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
   remote?: { enabled: boolean; relay?: { url: string; tokenFile: string } };
-  /** Token prices (USD per million) and per-provider spend budgets for the usage ledger. */
   usage?: import("./config.js").UsageConfig;
   deployment?: import("./deployment.js").Deployment;
-  /** Workspace sync. `homeDir` overrides the server home used for folder mapping; `sharedGroup` permits a separate agent account. */
   sync?: { sharedGroup?: boolean; homeDir?: string };
-  /** GitHub-tracked project sources: mirror directory, refresh period, and test-only remote overrides (refused on cloud hosts). */
   source?: { mirrorDir?: string; refreshMinutes?: number; remoteOverrides?: Record<string, string> };
-  /** Review feedback (INF-324): off unless enabled; `ownerLogin` is the only GitHub login whose review counts. */
   github?: { reviewFeedback?: { enabled?: boolean; ownerLogin?: string; pollMinutes?: number } };
-  /** Replay eval host settings: the grader identity. Outside the routine approval digest. */
   eval?: import("./eval-config.js").EvalHostConfig;
-  /** Chat digests written by a hosted model through an OpenAI-compatible Responses API. */
   summaries?: { model: string; apiKeyFile: string; baseUrl: string };
-  /** Optional Jev readings for turn-finished lines and generated session titles. */
-  /** sessionReadings false keeps the reading service for the intake route only; no session text is sent. */
   jev?: { apiKeyFile: string; model: string; baseUrl: string; sessionReadings?: boolean };
-  /** Optional cleanup for dictated text through an OpenAI-compatible Responses API. */
   dictation?: { model: string; apiKeyFile: string; baseUrl: string };
-  /** Read-only repository briefs produced by an administrator-configured host wrapper. */
   repositoryBriefings?: { command: string; args: string[]; runner?: "muse" | "deepseek" | "codex"; model?: string; automatic: boolean; intervalMs: number; cooldownMs: number; timeoutMs: number };
-  /** Optional code-only repository graph refreshes. Cache paths are assigned per project and lane. */
   repositoryGraphs?: { command: string; args: string[]; graphifyCommand: string; cacheDir: string; projectIds?: string[]; timeoutMs: number; debounceMs: number; intervalMs: number };
   port: number;
   origin: string;
@@ -230,13 +313,11 @@ export interface WorkerState {
   handoffQuiescence?: { requestId: string; verifiedAt: string; scope: "process-group-and-observed-descendants" };
   status: Status;
   pid?: number;
-  /** Written to the sealed status only; a row carries it when the worker did not answer. */
   workerPid?: number;
   exitCode?: number;
   seq: number;
   screen: string;
   attention: Attention;
-  /** `transcript` means chat messages come from the provider's own conversation record. */
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1; nativeUi?: "codex" | "opencode"; transcript?: 1 };
   control?: ControlLease | null;
   runtime?: SessionRuntime;
@@ -248,7 +329,6 @@ export interface InputControl {
   actor?: ControlActor;
   leaseId?: string;
 }
-/** Exact screen and assignment identity for a display-only Codex prompt expansion. */
 export interface TeamPermissionExpansionExpectation {
   promptId: number;
   promptHash: string;
@@ -256,6 +336,125 @@ export interface TeamPermissionExpansionExpectation {
   targetCwd: string;
   expiresAt: string;
 }
+interface TeamAnswerWorkerRequestBase {
+  op: "team-answer";
+  requestId: string;
+  decisionId: string;
+  targetSessionId: string;
+  assignment: import("./team-types.js").TeamAssignment;
+  targetCwd: string;
+  expiresAt: string;
+  policyHash: string;
+  promptId: number;
+  promptHash: string;
+  evidenceHash: string;
+  option: number;
+  actor: ControlActor;
+  leaseId: string;
+}
+export type TeamAnswerWorkerRequest =
+  | (TeamAnswerWorkerRequestBase & {
+      coordinatorMemberId: string;
+      choice?: never;
+      text?: never;
+    })
+  | (TeamAnswerWorkerRequestBase & {
+      coordinatorMemberId?: never;
+      choice: "accept" | "reject";
+      text?: string;
+    });
+const controlActorSchema = z.object({ id: z.string().min(1), label: z.string().min(1) }).strict();
+const teamAssignmentSchema = z.object({
+  runId: z.string().min(1),
+  memberId: z.string().min(1),
+  revision: z.number().int().min(1),
+  role: z.enum([
+    "permission-coordinator",
+    "project-manager",
+    "scout",
+    "implementer",
+    "integrator",
+    "reviewer",
+    "delivery",
+    "intent-checker",
+    "evaluator",
+    "judge",
+    "mission-coordinator",
+  ]),
+  taskId: z.string().min(1).optional(),
+  verificationRefused: z.literal(true).optional(),
+  entryTools: z.literal(true).optional(),
+  hostProfiles: z.literal(true).optional(),
+}).strict();
+const teamAnswerBaseShape = {
+  op: z.literal("team-answer"),
+  requestId: z.uuid(),
+  decisionId: z.uuid(),
+  targetSessionId: z.uuid(),
+  assignment: teamAssignmentSchema,
+  targetCwd: z.string().min(1),
+  expiresAt: z.iso.datetime(),
+  policyHash: z.string().regex(/^[a-f0-9]{64}$/i),
+  promptId: z.number().int().min(1),
+  promptHash: z.string().regex(/^[a-f0-9]{64}$/i),
+  evidenceHash: z.string().regex(/^[a-f0-9]{64}$/i),
+  option: z.number().int().min(0),
+  actor: controlActorSchema,
+  leaseId: z.string().min(1),
+};
+export const teamAnswerWorkerRequestSchema: z.ZodType<TeamAnswerWorkerRequest> = z.union([
+  z.object({
+    ...teamAnswerBaseShape,
+    coordinatorMemberId: z.uuid(),
+  }).strict(),
+  z.object({
+    ...teamAnswerBaseShape,
+    choice: z.literal("accept"),
+  }).strict(),
+  z.object({
+    ...teamAnswerBaseShape,
+    choice: z.literal("reject"),
+    text: z.string().min(1).optional(),
+  }).strict(),
+]);
+export type WorkerControlRequestState =
+  | { op: "control"; action: "claim"; actor: ControlActor; leaseId?: string; takeover?: boolean }
+  | { op: "control"; action: "renew" | "release"; actor: ControlActor; leaseId: string; takeover?: never };
+export const workerControlRequestSchema: z.ZodType<WorkerControlRequestState> = z.discriminatedUnion("action", [
+  z.object({
+    op: z.literal("control"),
+    action: z.literal("claim"),
+    actor: controlActorSchema,
+    leaseId: z.string().min(1).optional(),
+    takeover: z.boolean().optional(),
+  }).strict(),
+  z.object({
+    op: z.literal("control"),
+    action: z.literal("renew"),
+    actor: controlActorSchema,
+    leaseId: z.string().min(1),
+  }).strict(),
+  z.object({
+    op: z.literal("control"),
+    action: z.literal("release"),
+    actor: controlActorSchema,
+    leaseId: z.string().min(1),
+  }).strict(),
+]);
+export type WorkerWorkspaceExportRequestState =
+  | { op: "workspace-export"; method: "sync/export"; hash?: never }
+  | { op: "workspace-export"; method: "sync/blob"; hash: string };
+export const workerWorkspaceExportRequestSchema: z.ZodType<WorkerWorkspaceExportRequestState> = z.discriminatedUnion("method", [
+  z.object({
+    op: z.literal("workspace-export"),
+    method: z.literal("sync/export"),
+  }).strict(),
+  z.object({
+    op: z.literal("workspace-export"),
+    method: z.literal("sync/blob"),
+    hash: z.string().regex(/^[a-f0-9]{64}$/i),
+  }).strict(),
+]);
 export type WorkerRequest =
   | { op: "state"; screen?: boolean }
   | { op: "native-info" }
@@ -276,7 +475,6 @@ export type WorkerRequest =
       requestId: string;
       text: string;
       submit: boolean;
-      /** Type even over an open dialog; only terminal surfaces send it. */
       force?: boolean;
     } & InputControl)
   | ({ op: "raw"; requestId: string; text: string } & InputControl)
@@ -287,37 +485,14 @@ export type WorkerRequest =
     } & InputControl)
   | ({
       op: "answer";
-      /** Set by the host only for owner-authorized answers on mission-managed sessions. */
       missionManaged?: true;
       requestId: string;
       promptId: number;
       option?: number;
       text?: string;
     } & InputControl)
+  | TeamAnswerWorkerRequest
   | ({
-      /** Host-only delegated one-shot permission answer over the private worker socket. */
-      op: "team-answer";
-      requestId: string;
-      decisionId: string;
-      /** The run reviewer's member. Absent only for a permission-agent delivery, which names its `choice`. */
-      coordinatorMemberId?: string;
-      /** A permission-agent delivery: the one-shot accept, or the one-shot reject with the host's fixed notice as `text`. */
-      choice?: "accept" | "reject";
-      text?: string;
-      targetSessionId: string;
-      assignment: import("./team-types.js").TeamAssignment;
-      targetCwd: string;
-      expiresAt: string;
-      policyHash: string;
-      promptId: number;
-      promptHash: string;
-      evidenceHash: string;
-      option: number;
-      actor: ControlActor;
-      leaseId: string;
-    })
-  | ({
-      /** Host-only expansion of a verified, collapsed Codex command dialog; sends Ctrl+A only. */
       op: "team-permission-expand";
       requestId: string;
       targetSessionId: string;
@@ -327,7 +502,6 @@ export type WorkerRequest =
       leaseId: string;
     })
   | ({
-      /** Host-only permission-agent answer for a session outside any team run: one recognised one-shot option. */
       op: "session-permission-answer";
       requestId: string;
       decisionId: string;
@@ -337,7 +511,6 @@ export type WorkerRequest =
       promptHash: string;
       evidenceHash: string;
       option: number;
-      /** The host's fixed reject notice, typed after the recognised one-shot reject only when that option takes text. */
       text?: string;
       actor: ControlActor;
       leaseId: string;
@@ -353,14 +526,10 @@ export interface Bootstrap {
   runDir: string;
   key: string;
   prompt: string;
-  /** The session's recorded Code Mode choice, preserved across native relaunches. */
   codeMode: boolean;
   executorTokenHash?: string;
-  /** Set only when the host admitted this headless session to the permission channel. */
   permissionChannel?: { socket: string };
-  /** This session's GitHub grant and proxy origin, set only when `autonomy.boundary.github` is configured. */
   github?: { proxy: string; grant: string };
-  /** The directory Codex's native trace recorder writes to, set only for a Codex team member with `teams.memberTraces` on. */
   codexTraceRoot?: string;
   attention: {
     hooks: { claude: boolean; codex: boolean };

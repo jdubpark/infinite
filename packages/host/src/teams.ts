@@ -343,7 +343,7 @@ export class TeamService {
         this.save(stored); this.trackBlocked(stored);
       }
       if (stored.pending) {
-        for (const check of stored.run.checks) if (check.status === "running") { check.status = "interrupted"; check.finishedAt = timestamp(); }
+        stored.run.checks = stored.run.checks.map(check => check.status === "running" ? { ...check, status: "interrupted", finishedAt: timestamp() } : check);
         const pending = stored.pending, run = stored.run;
         const recoverableMarker = validVerificationRecovery(stored);
         const legacyGuardFailure = run.reason === LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON;
@@ -3177,18 +3177,18 @@ export class TeamService {
         this.save(stored);
       });
       for (const { context, ...entry } of commands) {
-        const check: TeamRun["checks"][number] = { ...entry, status: "running", startedAt: timestamp(), output: "", revision, round: run.round, headCommit: head };
-        await this.enqueue(stored.run.id, () => { if (!this.closed) { run.checks.push(check); this.save(stored); } });
+        const baseCheck = { ...entry, startedAt: timestamp(), revision, round: run.round, headCommit: head }, runningCheck: TeamRun["checks"][number] = { ...baseCheck, status: "running", output: "" };
+        await this.enqueue(stored.run.id, () => { if (!this.closed) { run.checks.push(runningCheck); this.save(stored); } });
         const scanner = new CheckOutputScanner(), metrics = metricObserver();
         const result = await teamCommand(entry.command, verification.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix, undefined, undefined, undefined, (chunk, stream) => { metrics.push(chunk, stream); scanner.push(chunk, stream); });
-        const status = result.interrupted ? "interrupted" : result.exitCode === 0 ? "passed" : "failed";
-        Object.assign(check, { status, finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, ...(status === "passed" ? {} : { scan: scanner.finish() }) });
-        metrics.record(stored, check);
-        results.push(check);
-        await this.enqueue(stored.run.id, () => { if (!this.closed) this.save(stored); });
+        const finishedCheck: TeamRun["checks"][number] = result.interrupted ? { ...baseCheck, status: "interrupted", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, scan: scanner.finish() }
+          : result.exitCode === 0 ? { ...baseCheck, status: "passed", finishedAt: timestamp(), exitCode: 0, output: result.output }
+          : { ...baseCheck, status: "failed", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, scan: scanner.finish() };
+        metrics.record(stored, finishedCheck); results.push(finishedCheck);
+        await this.enqueue(stored.run.id, () => { if (!this.closed) { const i = run.checks.indexOf(runningCheck); if (i >= 0) run.checks[i] = finishedCheck; this.save(stored); } });
         await this.noteLeftover(stored, result);
         if (!signal.aborted) await assertMemberReadOnly(verification.workspace, head, this.config.teams?.commandPrefix, signal, context);
-        if (check.status !== "passed") break;
+        if (finishedCheck.status !== "passed") break;
       }
       if (!this.closed && !signal.aborted) await assertMemberReadOnly(run.workspace, head, this.config.teams?.commandPrefix, signal, "integration");
       return results;

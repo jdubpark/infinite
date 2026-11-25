@@ -62,8 +62,7 @@ import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-openco
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
 import { JsonLineAssembler, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
-import {
-  teamAnswerWorkerRequestSchema,
+import { normalizeWorkerControlRequest, teamAnswerWorkerRequestSchema,
   type Bootstrap,
   type ControlActor,
   type ControlLease,
@@ -633,10 +632,9 @@ function validateControl(request: InputControl) {
     (request.leaseId !== undefined && (typeof request.leaseId !== "string" || request.leaseId.length > 80)))
     throw new Error("Invalid session control");
 }
-function changeControl(request: Extract<WorkerRequest, { op: "control" }>): ControlLease | null {
-  if (!validActor(request.actor) || !["claim", "renew", "release"].includes(request.action) ||
-    (request.takeover !== undefined && (request.action !== "claim" || typeof request.takeover !== "boolean")))
-    throw new Error("Invalid session control");
+function changeControl(rawRequest: Extract<WorkerRequest, { op: "control" }>): ControlLease | null {
+  const request = normalizeWorkerControlRequest(rawRequest);
+  if (!validActor(request.actor) || !["claim", "renew", "release"].includes(request.action) || (request.takeover !== undefined && (request.action !== "claim" || typeof request.takeover !== "boolean"))) throw new Error("Invalid session control");
   validateControl(request);
   const active = currentControl();
   const owns = active && controller?.actorId === request.actor.id && active.id === request.leaseId;

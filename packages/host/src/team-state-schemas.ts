@@ -20,11 +20,26 @@ const usagePricingSchema = z.object({
   provider: nonNegInt,
   unknown: nonNegInt,
 }).strict();
+const legacyUsagePricingSchema = z.object({
+  configured: nonNegInt,
+  catalog: nonNegInt.optional(),
+  provider: nonNegInt,
+  unknown: nonNegInt,
+}).strict();
 export const usageTotalsSchema: z.ZodType<UsageTotals> = z.object({
   cost: z.number().min(0),
   tokens: usageTokensSchema,
   messages: nonNegInt,
   pricing: usagePricingSchema,
+}).strict();
+export type LegacyUsageTotals = Omit<UsageTotals, "pricing"> & {
+  pricing: Omit<UsageTotals["pricing"], "catalog"> & { catalog?: number };
+};
+const legacyTotalsOnlyUsageSchema: z.ZodType<LegacyUsageTotals> = z.object({
+  cost: z.number().min(0),
+  tokens: usageTokensSchema,
+  messages: nonNegInt,
+  pricing: legacyUsagePricingSchema,
 }).strict();
 const providerUsageMapSchema = z.object({
   claude: usageTotalsSchema.optional(),
@@ -41,9 +56,17 @@ export const usageRollupSchema: z.ZodType<UsageRollup> = z.object({
   partialMembers: nonNegInt,
   unavailable: z.literal(true).optional(),
 }).strict();
+export const storedUsageRollupSchema: z.ZodType<StoredRollup> = z.object({
+  total: usageTotalsSchema,
+  byProfile: z.record(z.string().min(1), usageTotalsSchema),
+  byProvider: providerUsageMapSchema,
+  unmeasuredMembers: nonNegInt,
+  partialMembers: nonNegInt.optional(),
+  unavailable: z.literal(true).optional(),
+}).strict();
 export type GoalCycleUsage =
   | (UsageTotals & StoredRollup)
-  | (UsageTotals & {
+  | (LegacyUsageTotals & {
       total?: never;
       byProfile?: never;
       byProvider?: never;
@@ -64,7 +87,7 @@ export const goalCycleUsageSchema: z.ZodType<GoalCycleUsage> = z.union([
     partialMembers: nonNegInt.optional(),
     unavailable: z.literal(true).optional(),
   }).strict(),
-  usageTotalsSchema,
+  legacyTotalsOnlyUsageSchema,
 ]);
 
 export const commitHashSchema = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i);
@@ -98,16 +121,10 @@ export interface TeamPublicationFailure {
   at: string;
   retryAt: string;
 }
-export type TeamPublication = {
-  repository: string;
-  branch: string;
-  commit?: string;
-  publishedAt?: string;
-  failure?: TeamPublicationFailure;
-};
-export type TeamPublicationState =
+export type TeamPublication =
   | { repository: string; branch: string; commit: string; publishedAt: string; failure?: TeamPublicationFailure }
   | { repository: string; branch: string; commit?: never; publishedAt?: never; failure: TeamPublicationFailure };
+export type TeamPublicationState = TeamPublication;
 const teamPublicationFailureSchema = z.object({
   commit: commitHashSchema,
   category: teamPublicationCategorySchema,
@@ -130,20 +147,6 @@ export const teamPublicationSchema: z.ZodType<TeamPublicationState> = z.union([
   }).strict(),
 ]);
 
-export interface TeamPermissionAgentDecision {
-  decisionId?: string;
-  requestId: string;
-  memberId: string;
-  sessionId: string;
-  role: TeamRole;
-  taskId?: string;
-  promptId: number;
-  result: "allowed" | "rejected" | "owner" | "undeliverable" | "stale";
-  code?: RejectCode;
-  interruptClass?: InterruptClass;
-  delivery?: "receipt" | "refusal" | "uncertain";
-  at: string;
-}
 interface TeamPermissionAgentDecisionBase {
   requestId: string;
   memberId: string;
@@ -153,11 +156,12 @@ interface TeamPermissionAgentDecisionBase {
   promptId: number;
   at: string;
 }
-export type TeamPermissionAgentDecisionState =
+export type TeamPermissionAgentDecision =
   | (TeamPermissionAgentDecisionBase & { result: "allowed"; decisionId: string; delivery: "receipt"; code?: never; interruptClass?: never })
   | (TeamPermissionAgentDecisionBase & { result: "rejected"; decisionId: string; code: RejectCode; delivery: "receipt"; interruptClass?: never })
   | (TeamPermissionAgentDecisionBase & { result: "owner"; decisionId: string; interruptClass: InterruptClass; code?: never; delivery?: never })
   | (TeamPermissionAgentDecisionBase & { result: "undeliverable" | "stale"; decisionId?: string; code?: RejectCode; delivery?: "refusal" | "uncertain"; interruptClass?: never });
+export type TeamPermissionAgentDecisionState = TeamPermissionAgentDecision;
 const teamPermissionAgentDecisionBaseShape = {
   requestId: z.string().min(1),
   memberId: z.string().min(1),
@@ -214,11 +218,11 @@ const deliveryReconciliationBaseShape = {
   baseHeadCommit: commitHashSchema,
   summary: z.string().trim().min(1).max(4000),
 };
-export const deliveryReconciliationReportSchema: z.ZodType<DeliveryReconciliationReport> = z.discriminatedUnion("disposition", [
+export const deliveryReconciliationReportSchema = z.discriminatedUnion("disposition", [
   z.object({ ...deliveryReconciliationBaseShape, disposition: z.literal("no-publication") }).strict(),
   z.object({ ...deliveryReconciliationBaseShape, disposition: z.literal("owned-branch"), remoteHeadCommit: commitHashSchema }).strict(),
   z.object({ ...deliveryReconciliationBaseShape, disposition: z.literal("pull-request"), remoteHeadCommit: commitHashSchema, pullRequestUrl: z.string().trim().min(1).max(500) }).strict(),
-]);
+]) satisfies z.ZodType<DeliveryReconciliationReport>;
 
 export interface TeamSavedWorkFailure {
   category: TeamPublicationCategory;
@@ -320,39 +324,38 @@ export const teamDecisionSchema: z.ZodType<OpenTeamDecision | AnsweredTeamDecisi
   }).strict(),
 ]);
 
-export interface TeamCheck {
+interface TeamCheckBase {
   command: TeamCommand;
   phase?: "setup";
   headCommit?: string;
-  status: "running" | "passed" | "failed" | "interrupted";
   startedAt: string;
-  finishedAt?: string;
-  exitCode?: number | null;
   output: string;
   revision: number;
   round?: number;
-  scan?: CheckScan;
 }
-type TeamCheckBase = Omit<TeamCheck, "status" | "finishedAt" | "exitCode" | "scan">;
 export type RunningTeamCheck = TeamCheckBase & { status: "running"; finishedAt?: never; exitCode?: never; scan?: never };
 export type PassedTeamCheck = TeamCheckBase & { status: "passed"; finishedAt: string; exitCode?: 0; scan?: never };
 export type FailedTeamCheck = TeamCheckBase & { status: "failed" | "interrupted"; finishedAt: string; exitCode?: number | null; scan?: CheckScan };
-export type TeamCheckState = RunningTeamCheck | PassedTeamCheck | FailedTeamCheck;
+export type TeamCheck = RunningTeamCheck | PassedTeamCheck | FailedTeamCheck;
+export type TeamCheckState = TeamCheck;
 export function isRunningTeamCheck(check: TeamCheck): check is RunningTeamCheck {
-  return check.status === "running"
-    && check.finishedAt === undefined
-    && check.exitCode === undefined
-    && check.scan === undefined;
+  const raw = check as TeamCheckBase & { status: string; finishedAt?: unknown; exitCode?: unknown; scan?: unknown };
+  return raw.status === "running"
+    && raw.finishedAt === undefined
+    && raw.exitCode === undefined
+    && raw.scan === undefined;
 }
 export function isPassedTeamCheck(check: TeamCheck): check is PassedTeamCheck {
-  return check.status === "passed"
-    && check.finishedAt !== undefined
-    && (check.exitCode === undefined || check.exitCode === 0)
-    && check.scan === undefined;
+  const raw = check as TeamCheckBase & { status: string; finishedAt?: unknown; exitCode?: unknown; scan?: unknown };
+  return raw.status === "passed"
+    && typeof raw.finishedAt === "string"
+    && (raw.exitCode === undefined || raw.exitCode === 0)
+    && raw.scan === undefined;
 }
 export function isFailedTeamCheck(check: TeamCheck): check is FailedTeamCheck {
-  return (check.status === "failed" || check.status === "interrupted")
-    && check.finishedAt !== undefined;
+  const raw = check as TeamCheckBase & { status: string; finishedAt?: unknown };
+  return (raw.status === "failed" || raw.status === "interrupted")
+    && typeof raw.finishedAt === "string";
 }
 const checkScanSchema = z.object({
   bytes: z.number().int().min(0),

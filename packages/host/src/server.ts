@@ -1573,8 +1573,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     const authority = { actor: res.locals.actor, leaseId: res.locals.leaseId };
     try {
       if (action === "/control") {
-        const body = httpControlRequestSchema.parse(req.body);
-        return void res.json({ control: await cmux.call(sessionId, normalizeControlRequest(body, res.locals.actor)) });
+        const normalized = normalizeControlRequest(httpControlRequestSchema.parse(req.body), res.locals.actor);
+        return void (normalized.ok ? res.json({ control: await cmux.call(sessionId, normalized.request) }) : res.status(409).json({ code: normalized.code, error: "Control changed or expired. This input was not sent. Refresh and take control again." }));
       }
       if (action === "/input") return void res.json(await cmux.call(sessionId, { op: "input", ...inputSchema.parse(req.body), ...authority }));
       if (action === "/answer") return void res.json(await cmux.call(sessionId, { op: "answer", ...answerSchema.parse(req.body), ...authority }));
@@ -1748,10 +1748,10 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.post("/api/sessions/:id/control", refuseManagedClaim, requireRole(["owner", "controller"]), async (req, res) => {
     const sessionId = id.parse(req.params.id);
     manager.meta(sessionId);
-    const body = httpControlRequestSchema.parse(req.body);
+    const normalized = normalizeControlRequest(httpControlRequestSchema.parse(req.body), res.locals.actor);
     if (!(await manager.state(sessionId)).capabilities?.inputControl)
       return void res.status(409).json({ error: "This session uses an older worker without input control", code: "unsupported" });
-    res.json({ control: await manager.controlSession(sessionId, normalizeControlRequest(body, res.locals.actor)) });
+    res.status(normalized.ok ? 200 : 409).json(normalized.ok ? { control: await manager.controlSession(sessionId, normalized.request) } : { code: normalized.code, error: "Control changed or expired. This input was not sent. Refresh and take control again." });
   });
   app.post("/api/sessions/:id/raw", refuseManagedOutsideProviderPrompt, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use native input" });

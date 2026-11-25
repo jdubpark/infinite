@@ -1,7 +1,7 @@
 import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
-import { blockerEvidenceSchema, usageRollupSchema, type TeamLineup, type TeamStatus } from "./team-types.js";
-import type { UsageRollup } from "./team-usage.js";
+import { blockerEvidenceSchema, storedUsageRollupSchema, type TeamLineup, type TeamStatus } from "./team-types.js";
+import type { StoredRollup, UsageRollup } from "./team-usage.js";
 import { projectGroupIdSchema } from "./project-group-types.js";
 import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
 
@@ -64,7 +64,7 @@ export type MissionStatus = "planning" | "working" | "needs-input" | "paused" | 
 export interface MissionSubtaskFinalEvidence {
   reason?: string;
   headCommit?: string;
-  usage?: UsageRollup;
+  usage?: StoredRollup;
 }
 export interface MissionSubtask extends MissionSubtaskPlan {
   status: "queued" | "running" | "done" | "cancelled" | "blocked";
@@ -170,7 +170,7 @@ export const missionSubtaskSchema: z.ZodType<MissionSubtaskState> = z.union([
     finalEvidence: z.object({
       reason: z.string().optional(),
       headCommit: z.string().optional(),
-      usage: usageRollupSchema.optional(),
+      usage: storedUsageRollupSchema.optional(),
     }).strict().optional(),
   }).strict(),
 ]);
@@ -188,7 +188,11 @@ export interface MissionDecision {
   source?: ConnectorSource;
   recommendation?: DecisionRecommendation;
 }
-type MissionDecisionCore = Omit<MissionDecision, "answer" | "answeredAt" | "answeredBy" | "source">;
+type MissionDecisionBase = Omit<MissionDecision, "subtaskId" | "childDecisionId" | "answer" | "answeredAt" | "answeredBy" | "source">;
+type MissionDecisionForwarding =
+  | { subtaskId?: string; childDecisionId?: never }
+  | { subtaskId: string; childDecisionId: string };
+type MissionDecisionCore = MissionDecisionBase & MissionDecisionForwarding;
 export type OpenMissionDecision = MissionDecisionCore & {
   answer?: never;
   answeredAt?: never;
@@ -228,30 +232,39 @@ const missionDecisionBaseShape = {
   options: z.array(z.string()),
   answerMode: z.enum(["approval", "single", "multiple"]).optional(),
   createdAt: z.iso.datetime(),
-  subtaskId: subtaskId.optional(),
-  childDecisionId: z.uuid().optional(),
   recommendation: decisionRecommendationSchema.optional(),
 };
-const refineForwardedMissionDecision = (value: { subtaskId?: string; childDecisionId?: string }, context: z.RefinementCtx) => {
-  if (value.childDecisionId !== undefined && value.subtaskId === undefined) {
-    context.addIssue({ code: "custom", path: ["subtaskId"], message: "A forwarded mission decision must name its subtask." });
-  }
-};
+const directMissionDecisionShape = { ...missionDecisionBaseShape, subtaskId: subtaskId.optional() };
+const forwardedMissionDecisionShape = { ...missionDecisionBaseShape, subtaskId, childDecisionId: z.uuid() };
 export const missionDecisionSchema: z.ZodType<OpenMissionDecision | AnsweredMissionDecision> = z.union([
-  z.object(missionDecisionBaseShape).strict().superRefine(refineForwardedMissionDecision),
+  z.object(directMissionDecisionShape).strict(),
+  z.object(forwardedMissionDecisionShape).strict(),
   z.object({
-    ...missionDecisionBaseShape,
+    ...directMissionDecisionShape,
     answer: z.string().min(1),
     answeredAt: z.iso.datetime().optional(),
     answeredBy: z.enum(["owner", "coordinator"]).optional(),
-  }).strict().superRefine(refineForwardedMissionDecision),
+  }).strict(),
   z.object({
-    ...missionDecisionBaseShape,
+    ...forwardedMissionDecisionShape,
+    answer: z.string().min(1),
+    answeredAt: z.iso.datetime().optional(),
+    answeredBy: z.enum(["owner", "coordinator"]).optional(),
+  }).strict(),
+  z.object({
+    ...directMissionDecisionShape,
     answer: z.string().min(1),
     answeredAt: z.iso.datetime().optional(),
     answeredBy: z.literal("connector"),
     source: connectorSourceSchema.optional(),
-  }).strict().superRefine(refineForwardedMissionDecision),
+  }).strict(),
+  z.object({
+    ...forwardedMissionDecisionShape,
+    answer: z.string().min(1),
+    answeredAt: z.iso.datetime().optional(),
+    answeredBy: z.literal("connector"),
+    source: connectorSourceSchema.optional(),
+  }).strict(),
 ]);
 interface MissionFollowUpBase {
   id: string;

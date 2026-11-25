@@ -353,7 +353,10 @@ test("worker control fences input and resize, keeps retry receipts stable, and r
     await worker.call({ op: "resize", cols: 88, rows: 26, actor: b, leaseId: leaseB.id });
     const resized = await worker.call<TerminalSnapshot>({ op: "snapshot" });
     assert.deepEqual([resized.cols, resized.rows], [88, 26]);
-    await worker.call({ op: "control", action: "release", actor: b, leaseId: leaseB.id });
+    const renewedWithLegacyFlag = await worker.call<ControlLease>({ op: "control", action: "renew", actor: b, leaseId: leaseB.id, takeover: false } as unknown as WorkerRequest);
+    assert.equal(renewedWithLegacyFlag.id, leaseB.id);
+    await assert.rejects(worker.call({ op: "control", action: "renew", actor: b, leaseId: leaseB.id, takeover: true } as unknown as WorkerRequest), /Invalid session control/);
+    await worker.call({ op: "control", action: "release", actor: b, leaseId: leaseB.id, takeover: false } as unknown as WorkerRequest);
     await worker.command("released");
     const lease = await worker.call<ControlLease>({ op: "control", action: "claim", actor: a });
     const observing = await worker.call({ op: "state" });

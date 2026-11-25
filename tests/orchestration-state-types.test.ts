@@ -29,6 +29,7 @@ import {
   type OpenTeamDecision,
   type AnsweredTeamDecision,
   type PermissionDecisionReport,
+  type TeamCheck,
   type TeamCheckState,
   type TeamMemberSavedWork,
   type TeamPendingOperation,
@@ -396,11 +397,11 @@ test("TeamDecision, TeamCheck, TeamPermissionAgentDecision, TeamPublication, and
   assert.equal(teamCheckSchema.safeParse({ ...passedCheck, scan: failedCheck.scan }).success, false);
   assert.equal(teamCheckSchema.safeParse({ command: CMD, status: "passed", startedAt: AT, output: "ok", revision: 1 }).success, false);
   assert.equal(isRunningTeamCheck(runningCheck), true);
-  assert.equal(isRunningTeamCheck({ ...runningCheck, finishedAt: LATER }), false);
+  assert.equal(isRunningTeamCheck({ ...runningCheck, finishedAt: LATER } as unknown as TeamCheck), false);
   assert.equal(isPassedTeamCheck(passedCheck), true);
-  assert.equal(isPassedTeamCheck({ ...passedCheck, scan: failedCheck.scan }), false);
+  assert.equal(isPassedTeamCheck({ ...passedCheck, scan: failedCheck.scan } as unknown as TeamCheck), false);
   assert.equal(isFailedTeamCheck(failedCheck), true);
-  assert.equal(isFailedTeamCheck({ command: CMD, status: "failed", startedAt: AT, output: "fail", revision: 1 }), false);
+  assert.equal(isFailedTeamCheck({ command: CMD, status: "failed", startedAt: AT, output: "fail", revision: 1 } as unknown as TeamCheck), false);
 
   // @ts-expect-error running check cannot carry finishedAt
   const invalidRunningFinished: TeamCheckState = {

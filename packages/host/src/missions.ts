@@ -106,7 +106,7 @@ function cancelFollowUps(mission: Mission) {
   trimFollowUps(mission);
 }
 function trimFollowUps(mission: Mission) {
-  const settled = (mission.followUps ?? []).filter(item => item.state !== "open").sort((a, b) => a.settledAt.localeCompare(b.settledAt));
+  const settled = (mission.followUps ?? []).filter(item => item.state !== "open").sort((a, b) => (a.settledAt ?? "").localeCompare(b.settledAt ?? ""));
   const dropped = new Set<MissionFollowUp>(settled.slice(0, Math.max(0, settled.length - settledFollowUpsKept)));
   if (dropped.size) mission.followUps = mission.followUps!.filter(item => !dropped.has(item));
 }
@@ -139,6 +139,7 @@ export class MissionService {
       const id = file.slice(0, -7);
       const stored = unseal<Stored>(key, `mission:${id}`, readFileSync(join(this.directory, file), "utf8"));
       if (stored.mission.id !== id) throw new TeamError(409, "invalid-mission-record", "A mission record cannot be authenticated.");
+      for (const item of stored.mission.followUps ?? []) if (item.state !== "open" && !item.settledAt) Object.assign(item, { settledAt: item.dueAt || item.createdAt });
       this.records.set(id, stored);
       this.saved.set(id, digest(stored));
       let capacityChanged = false;
@@ -153,8 +154,7 @@ export class MissionService {
           capacityChanged = true;
         }
       }
-      if (capacityChanged) this.event(stored, "Subtask worker limits were reconciled from their persisted team capacity.");
-      if (capacityChanged) this.save(stored);
+      if (capacityChanged) { this.event(stored, "Subtask worker limits were reconciled from their persisted team capacity."); this.save(stored); }
     }
     this.teams.useMissionReservations((projectId, exceptMissionId) => {
       for (const [missionId, stored] of this.records) {

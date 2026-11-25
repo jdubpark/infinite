@@ -63,7 +63,7 @@ function snapshotRollup(cycle: GoalCycle): StoredRollup {
   if (snapshot?.total && snapshot.byProfile && snapshot.byProvider && Number.isInteger(snapshot.unmeasuredMembers))
     return { total: snapshot.total, byProfile: snapshot.byProfile, byProvider: snapshot.byProvider, unmeasuredMembers: snapshot.unmeasuredMembers };
   const rollup = emptyRollup(cycle.memberCount);
-  if (snapshot) rollup.total = snapshot;
+  if (snapshot) rollup.total = { ...snapshot, pricing: { ...snapshot.pricing, catalog: snapshot.pricing.catalog ?? 0 } };
   return rollup;
 }
 

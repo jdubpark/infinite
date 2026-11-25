@@ -60,8 +60,8 @@ export const terminalInputSchema = z.union([
   z.object({ op: z.literal("input"), requestId: z.uuid(), text: z.string().min(1).max(32000).regex(/^[^\x00-\x08\x0b-\x1f\x7f]*$/), submit: z.literal(false), leaseId: z.uuid().optional() }).strict(),
   z.object({ op: z.literal("resize"), cols: z.number().int().min(20).max(240), rows: z.number().int().min(5).max(100), leaseId: z.uuid().optional() }).strict(),
   z.object({ op: z.literal("control"), requestId: z.uuid(), action: z.literal("claim"), leaseId: z.uuid().optional(), takeover: z.boolean().optional() }).strict(),
-  z.object({ op: z.literal("control"), requestId: z.uuid(), action: z.literal("renew"), leaseId: z.uuid(), takeover: z.literal(false).optional() }).strict(),
-  z.object({ op: z.literal("control"), requestId: z.uuid(), action: z.literal("release"), leaseId: z.uuid(), takeover: z.literal(false).optional() }).strict(),
+  z.object({ op: z.literal("control"), requestId: z.uuid(), action: z.literal("renew"), leaseId: z.uuid().optional(), takeover: z.literal(false).optional() }).strict(),
+  z.object({ op: z.literal("control"), requestId: z.uuid(), action: z.literal("release"), leaseId: z.uuid().optional(), takeover: z.literal(false).optional() }).strict(),
 ]);
 
 export function connectTerminals(server: Server, manager: Manager, authenticate: (token: string) => PairedDevice | undefined, missionManaged?: (sessionId: string) => boolean | Promise<boolean>) {
@@ -157,7 +157,11 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
               if (!state.capabilities?.inputControl) {
                 await send({ refusal: { requestId: input.requestId, code: "unsupported" } }); return;
               }
-              const control = await manager.controlSession(match[1], normalizeControlRequest(input, actor));
+              const normalized = normalizeControlRequest(input, actor);
+              if (!normalized.ok) {
+                await send({ refusal: { requestId: input.requestId, code: normalized.code } }); return;
+              }
+              const control = await manager.controlSession(match[1], normalized.request);
               leaseId = control?.id;
               await send({ requestId: input.requestId, control });
               return;

@@ -85,7 +85,7 @@ export type ExecutionState =
     });
 const executionCheckpointSchema = z.object({
   id: z.string().min(1),
-  capturedAt: z.iso.datetime(),
+  capturedAt: z.string().refine(value => Number.isFinite(Date.parse(value)), { message: "Invalid checkpoint timestamp" }),
 }).strict();
 export const executionStateSchema: z.ZodType<ExecutionState> = z.union([
   z.object({
@@ -457,23 +457,36 @@ export const workerControlRequestSchema: z.ZodType<WorkerControlRequestState> = 
 ]);
 export const httpControlRequestSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("claim"), leaseId: z.uuid().optional(), takeover: z.boolean().optional() }).strict(),
-  z.object({ action: z.literal("renew"), leaseId: z.uuid(), takeover: z.literal(false).optional() }).strict(),
-  z.object({ action: z.literal("release"), leaseId: z.uuid(), takeover: z.literal(false).optional() }).strict(),
+  z.object({ action: z.literal("renew"), leaseId: z.uuid().optional(), takeover: z.literal(false).optional() }).strict(),
+  z.object({ action: z.literal("release"), leaseId: z.uuid().optional(), takeover: z.literal(false).optional() }).strict(),
 ]);
+export type NormalizedControlRequest =
+  | { ok: true; request: WorkerControlRequestState }
+  | { ok: false; code: "control-lost" };
 export function normalizeControlRequest(
   body: z.infer<typeof httpControlRequestSchema>,
   actor: ControlActor,
-): WorkerControlRequestState {
+): NormalizedControlRequest {
   if (body.action === "claim") {
     return {
-      op: "control",
-      action: "claim",
-      actor,
-      ...(body.leaseId !== undefined ? { leaseId: body.leaseId } : {}),
-      ...(body.takeover !== undefined ? { takeover: body.takeover } : {}),
+      ok: true,
+      request: {
+        op: "control",
+        action: "claim",
+        actor,
+        ...(body.leaseId !== undefined ? { leaseId: body.leaseId } : {}),
+        ...(body.takeover !== undefined ? { takeover: body.takeover } : {}),
+      },
     };
   }
-  return { op: "control", action: body.action, actor, leaseId: body.leaseId };
+  if (body.leaseId === undefined) return { ok: false, code: "control-lost" };
+  return { ok: true, request: { op: "control", action: body.action, actor, leaseId: body.leaseId } };
+}
+export function normalizeWorkerControlRequest(request: WorkerControlRequestState): WorkerControlRequestState {
+  if (request.action !== "claim" && (request as { takeover?: unknown }).takeover === false) {
+    return { op: "control", action: request.action, actor: request.actor, leaseId: request.leaseId };
+  }
+  return request;
 }
 export type WorkerWorkspaceExportRequestState =
   | { op: "workspace-export"; method: "sync/export"; hash?: never }

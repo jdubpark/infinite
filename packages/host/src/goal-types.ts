@@ -184,7 +184,7 @@ const goalCycleBaseShape = {
   goalRevision: z.number().int().min(1),
   status: z.string().min(1),
   startedAt: z.iso.datetime(),
-  baseCommit: z.string().min(1).optional(),
+  baseCommit: z.string().optional(),
   headCommit: z.string().min(1).optional(),
   branch: z.string().min(1).optional(),
   workspace: z.string().min(1).optional(),

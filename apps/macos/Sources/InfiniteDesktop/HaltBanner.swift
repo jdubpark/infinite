@@ -1,23 +1,17 @@
 import SwiftUI
 import InfiniteCore
 
-/// Which halts a page shows: the overview folds project halts into one line; any other page shows the halts on
-/// the host projects it covers in full. A host halt shows on every page.
 enum HaltPage: Equatable {
     case overview
     case projects([String])
 }
 
 extension AppModel {
-    /// The host projects a desktop project (a group of repositories) covers, every checkout included.
     func haltRepoIDs(group id: String?) -> [String] { id.flatMap(projectGroups.group)?.projectIDs ?? [] }
-    /// A halted host project's name, from whichever project lists it, else its ID.
     func haltName(_ projectID: String) -> String { projectGroups.repoName(projectID) ?? projectName(projectID) }
-    /// The desktop project that lists a halted host project, so the overview line can open it.
     func haltGroup(_ projectID: String) -> ProjectGroup? { projectGroups.groups.first { $0.projectIDs.contains(projectID) } }
 }
 
-/// The owner's halt above the page. Informational only: the owner releases a halt with the host CLI.
 struct HaltBanners: View {
     @ObservedObject var app: AppModel
     let page: HaltPage
@@ -31,12 +25,15 @@ struct HaltBanners: View {
         }()
         if halt.holdsHost || !projects.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
-                if !halt.readable { HaltBanner(kind: .unreadable, owner: app.isOwner) }
-                else if let host = halt.host { HaltBanner(kind: .host(host), owner: app.isOwner) }
+                switch halt.state {
+                case .unreadable:
+                    HaltBanner(kind: .unreadable, owner: app.isOwner)
+                case .readable(let host, _):
+                    if let host { HaltBanner(kind: .host(host), owner: app.isOwner) }
+                }
                 if page == .overview {
                     if !projects.isEmpty { HaltOverviewLine(app: app, halts: projects) }
                 } else {
-                    // Under a host halt the host banner already says what a halt holds; a project banner keeps its own facts.
                     ForEach(projects, id: \.haltID) { state in
                         HaltBanner(kind: .project(state, name: app.haltName(state.projectID ?? "")), owner: app.isOwner, explains: !halt.holdsHost)
                     }
@@ -48,7 +45,6 @@ struct HaltBanners: View {
     }
 }
 
-/// One halt in full: what it holds, since when and from which owner device, and the owner's reason.
 struct HaltBanner: View {
     enum Kind { case host(HaltState), project(HaltState, name: String), unreadable }
     let kind: Kind
@@ -111,7 +107,6 @@ struct HaltBanner: View {
     }
 }
 
-/// "since 14:05 · 3h ago · by Owner laptop", kept current while the page stays open.
 struct HaltSince: View {
     let state: HaltState
     var body: some View {
@@ -129,7 +124,6 @@ struct HaltSince: View {
     }
 }
 
-/// The overview's compact form: one line naming each halted project, each opening its own page.
 struct HaltOverviewLine: View {
     @ObservedObject var app: AppModel
     let halts: [HaltState]
@@ -137,7 +131,6 @@ struct HaltOverviewLine: View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: "pause.circle.fill").font(.system(size: 12)).foregroundStyle(Palette.paused)
             Text(halts.count == 1 ? "Project halted by the owner:" : "Projects halted by the owner:").font(.callout.weight(.medium))
-            // One line stays one line: past three halts the rest are counted, and named in the tooltip.
             ForEach(Array(halts.prefix(3).enumerated()), id: \.element.haltID) { index, state in
                 let id = state.projectID ?? ""
                 if index > 0 { Text("·").font(.callout).foregroundStyle(.tertiary) }
@@ -160,7 +153,6 @@ struct HaltOverviewLine: View {
         .background(Palette.paused.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Palette.paused.opacity(0.25)))
     }
-    /// A halt on one of several repositories or checkouts in a project names that project too.
     private func name(_ state: HaltState) -> String {
         let id = state.projectID ?? ""
         return app.haltGroup(id).map { $0.projectIDs.count > 1 ? "\(app.haltName(id)) in \($0.name)" : $0.name } ?? app.haltName(id)
@@ -170,7 +162,6 @@ struct HaltOverviewLine: View {
     }
 }
 
-/// A mission covers every repository it runs in; its list arrives with the mission's first poll.
 struct MissionHaltBanners: View {
     @ObservedObject var app: AppModel
     @ObservedObject var model: MissionModel
@@ -180,7 +171,6 @@ struct MissionHaltBanners: View {
     }
 }
 
-/// The cost page of one project shows that project's halts; the all-projects cost view shows only a host halt.
 struct CostHaltBanners: View {
     @ObservedObject var app: AppModel
     @ObservedObject var model: CostModel
@@ -189,7 +179,6 @@ struct CostHaltBanners: View {
     }
 }
 
-/// A team runs in one host project; a subteam not yet listed learns it on its first poll.
 struct TeamHaltBanners: View {
     @ObservedObject var app: AppModel
     @ObservedObject var model: TeamModel

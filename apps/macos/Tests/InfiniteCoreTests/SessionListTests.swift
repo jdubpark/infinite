@@ -1,11 +1,9 @@
 import XCTest
 @testable import InfiniteCore
 
-/// The session poll names the version it holds; these pin which answers keep, replace, or cannot stand for the list.
 final class SessionListTests: XCTestCase {
     private func json(_ text: String) throws -> JSON { try JSON.parse(Data(text.utf8)) }
 
-    /// Starts a read and takes its answer, as one poll does.
     private func poll(_ list: inout SessionList, _ text: String) throws -> SessionList.Outcome {
         let read = list.begin()
         return list.accept(try json(text), to: read)
@@ -28,7 +26,6 @@ final class SessionListTests: XCTestCase {
         XCTAssertEqual(try poll(&list, #"{"sessions":[{"id":"a"}]}"#), .replaced)
         XCTAssertEqual(list.rows.map { $0["id"].string }, ["a"])
         XCTAssertEqual(list.path, "/sessions?since=")
-        // A version outside the alphabet the host takes back is not kept.
         XCTAssertEqual(try poll(&list, #"{"version":"a b","sessions":[]}"#), .replaced)
         XCTAssertEqual(list.path, "/sessions?since=")
     }
@@ -40,7 +37,6 @@ final class SessionListTests: XCTestCase {
             XCTAssertEqual(try poll(&list, text), .unreadable, text)
             XCTAssertEqual(list.rows.map { $0["id"].string }, ["a"], text)
         }
-        // The plain read that follows replaces the rows as the app always read them, and drops the version.
         let read = list.begin()
         XCTAssertEqual(list.acceptPlain(try json(#"{"sessions":[{"id":"b"}]}"#), to: read), .replaced)
         XCTAssertEqual(list.rows.map { $0["id"].string }, ["b"])

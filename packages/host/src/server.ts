@@ -325,6 +325,7 @@ export function createApp(config: Config, key: Buffer, options: { /** The config
   // TeamService ticks on every host and drives the ledger from its own session listing.
   teams.useUsage(usage);
   const goals = new GoalService(config, key, teams, linear);
+  lateReceipts = () => { void teams.settleReceipts().then(() => goals.syncReceipts()).catch(() => {}); };
   ownerServices.goals = goals;
   const projectGroups = new ProjectGroupService(config, key, undefined, { appliedAt: id => projectSync.status(id).appliedAt });
   // Each optional permission service stays undefined when its state will not open, and its routes answer 503.

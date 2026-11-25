@@ -15,7 +15,7 @@ import {
   criteriaRowsFor,
   cycleVerdict,
   deliveryHold,
-  lateStop,
+  owedStop,
   lateVerdict,
   provisionalStop,
   verdictFailed,
@@ -133,11 +133,11 @@ test("a provisional stop needs an autonomous finite goal and a met reviewed verd
   assert.equal(stop({}, good, 2), false);
   assert.equal(stop({}, null), false);
   assert.equal(provisionalStop(goal({ cycles: [] }), team({ assessment: good })), false);
-  const stopOf = (overrides: Record<string, unknown> = {}, held: RunAssessment | null = good, busy = false, newest = true) => {
-    const target = cycle(1, held === null ? {} : { assessment: { ...held, progress: 1 } });
-    const subject = goal({ cycles: newest ? [target] : [target, cycle(2)], ...overrides });
-    return lateStop(subject, target, busy);
+  const stopOf = (overrides: Record<string, unknown> = {}, held: RunAssessment | null = good, busy = false, newest = true, extra: Partial<GoalCycle> = {}) => {
+    const target = cycle(1, { ...(held === null ? {} : { assessment: { ...held, progress: 1 } }), ...extra });
+    return owedStop(goal({ cycles: newest ? [target] : [target, cycle(2)], ...overrides }), busy);
   };
+  const answered = (verdictId?: string) => ({ outcomes: [{ result: "not-achieved", summary: "s", evidence: "e", at: AT, revision: 1, ...(verdictId === undefined ? {} : { verdictId }) }] });
   assert.equal(stopOf(), true);
   assert.equal(stopOf({ status: "paused" }), false);
   assert.equal(stopOf({ activeTeamId: "team-1" }), false);
@@ -148,6 +148,10 @@ test("a provisional stop needs an autonomous finite goal and a met reviewed verd
   assert.equal(stopOf({}, assessment({ kind: "no-change" })), false);
   assert.equal(stopOf({}, assessment({ result: "not-met" })), false);
   assert.equal(stopOf({}, null), false);
+  assert.equal(stopOf(answered(good.verdictId)), false);
+  assert.equal(stopOf(answered("earlier"), good, false, true, { supersededVerdictIds: ["earlier"] }), false);
+  assert.equal(stopOf(answered()), true);
+  assert.equal(stopOf(answered(randomUUID())), true);
 });
 
 const FINISHED = Date.parse("2026-01-01T00:00:00.000Z");

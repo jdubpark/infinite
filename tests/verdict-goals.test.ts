@@ -277,9 +277,7 @@ test("a goal holds its next launch for a delivery receipt and stops provisional-
 
   const late = assessmentOf(2, 0);
   teams.settle(teamId, "merged", { assessment: late });
-  await goals.syncReceipts();
-  const stopped = goals.get(created.id);
-  assert.equal(stopped.status, "ready-for-review");
+  const stopped = await until(() => goals.get(created.id), goal => goal.status === "ready-for-review", "the stop at the goal's own step");
   assert.equal(stopped.stopReason, "provisional-met");
   assert.equal(stopped.reason, PROVISIONAL_REASON);
   assert.equal(stopped.cycles[0]!.assessment?.verdictId, late.verdictId);
@@ -410,6 +408,26 @@ test("a late receipt changes only the cycle in every other goal state", { timeou
   unchanged(stillPaused, pausedGoal);
   assert.equal(stillPaused.status, "paused");
   assert.equal(teams.launches.filter(item => item.context.id === paused).length, 1);
+  await goals.resume(paused, action(stillPaused));
+  const resumed = await until(() => goals.get(paused), goal => goal.status !== "running" || teams.launches.filter(item => item.context.id === paused).length > 1, "the stop after the resume");
+  assert.equal(resumed.status, "ready-for-review");
+  assert.equal(resumed.stopReason, "provisional-met");
+  assert.equal(count(resumed, PROVISIONAL_EVENT), 1);
+  assert.equal(teams.launches.filter(item => item.context.id === paused).length, 1, "A cycle that turned met while the goal was paused stops it at the resume");
+
+  const active = await start({ maxRuns: 3 });
+  const activeTeam = (await until(() => teams.launches.filter(item => item.context.id === active)[0], Boolean, "cycle 1")).request.requestId;
+  const stopping = [{ memberId: randomUUID(), role: "implementer", revision: 1, status: "running" }] as never;
+  const activeFirst = waiting();
+  teams.settle(activeTeam, "merged", { ...BRIEFED, assessment: activeFirst, members: stopping });
+  await until(() => goals.get(active).cycles[0]?.assessment?.verdictId, id => id === activeFirst.verdictId, "the first verdict of an active team");
+  const activeLate = assessmentOf(1, 1);
+  teams.settle(activeTeam, "merged", { assessment: activeLate, members: stopping });
+  const copied = await until(() => goals.get(active), goal => goal.cycles[0]?.assessment?.verdictId === activeLate.verdictId, "the late verdict of an active team");
+  assert.deepEqual(copied.cycles[0]!.supersededVerdictIds, [activeFirst.verdictId]);
+  assert.equal(count(copied, LATE_RECEIPT_EVENT), 1);
+  assert.equal(copied.activeTeamId, activeTeam);
+  await goals.cancel(active, action(copied));
 
   const standingGoal = await goals.create(standing());
   const standingTeam = await firstOf(standingGoal.id, waiting());

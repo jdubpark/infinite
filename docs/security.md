@@ -456,14 +456,18 @@ changes-requested review of a delivered pull request with `gh pr view` under a
 `pr` grant, and adds no credential and no GitHub write. Only a review that GitHub
 shows as the configured owner login counts; where agents hold the owner's own
 GitHub credential, an agent could author one, so leave the feature off on such a
-machine or accept at most three continuations per run. Review text is direction,
-never a command: the host puts it into no command, command prefix, or grant, and
-it cannot change grants, delivery, permission mode, or limits. For a mission's
-run the review reaches only the mission's coordinator, as owner direction. The
-subteam continues only when the coordinator forwards it, once per review, while
-the run still waits at the reviewed head, and after the host reads GitHub again.
-A review that reopens a finished mission adds its original working time once.
-See [missions](missions.md#owner-review-of-a-subtasks-pull-request).
+machine. Otherwise accept at most three continuations per standalone run, and
+for a mission's run, owner direction to a coordinator that can dispatch subteams
+in every repository of the mission and reopen it for its original working time.
+Review text is direction, never a command: the host puts it into no command,
+command prefix, or grant, and it cannot change grants, delivery, permission mode,
+or limits. For a mission's run the review goes to the mission's coordinator, not
+to the subteam. The subteam continues only when the coordinator forwards it,
+once per review, while the run still waits at the reviewed head, and after the
+host reads GitHub again. The mission stores the review: `GET /api/missions` and
+`GET /api/missions/:id` return its text in `steering`, and a reopened mission's
+earlier result in `earlierResults`, to every client and relay device that may
+read missions. See [missions](missions.md#owner-review-of-a-subtasks-pull-request).
 
 Workspace sync runs only on single-tenant hosts. Owner CLI launches without `--project` start or reuse it for the selected home-relative checkout; an explicit `infinite sync` can also start it. Folder registration accepts only an owner bearer key, persists in sealed host state, and refuses symlink aliases, overlapping projects, and protected host paths. It uploads the entire Git root of the selected checkout, including ignored and untracked files and its `.git` directory. For a linked Git worktree it also uploads Git metadata from outside the root: the common repository's objects, refs, ref logs, packed refs, `info/`, `shallow`, `description`, and a projected config, and the worktree's own `HEAD`, `index`, ref logs, refs, in-progress merge, rebase, cherry-pick, revert, and bisect state, and a projected `config.worktree`. A Git config can carry credentials such as a token in a remote URL. Keep credentials out of synced checkouts or accept that they reach the host. A forced apply replaces the cloud tree; one previous copy is kept beside the project directory. Received chunks are plaintext files under the host's private state directory, so that directory belongs on the encrypted storage above. See [workspace sync](workspace-sync.md).
 

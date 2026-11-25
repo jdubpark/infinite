@@ -410,19 +410,27 @@ review that reopens a mission gives it working time once; the limits on
 subtasks, members, and coordinator attempts stay cumulative.
 
 The coordinator decides what to do with it. A `steer-subtask` report on a
-`done` subtask that holds an unforwarded review is accepted only while that
-subteam run is still `ready-for-review` with its pull request at the reviewed
-revision and head, and its workspace is present; otherwise it is refused and
-the coordinator told why. An accepted forward is queued as a `review-forward`
-operation with a stable request ID, and works once. Each time the mission
-applies its operations, the forward:
+`done` subtask that holds an unforwarded review is the forward. It counts only
+from a coordinator attempt that started after the review arrived, under the
+rule `result` follows: when the owner sent direction or a review after the
+attempt started, the report is not applied, the coordinator is told, and a new
+attempt considers it. The mission events then say nothing about a forward. A
+forward is accepted only while that subteam run is still `ready-for-review`
+with its pull request at the reviewed revision and head, and its workspace is
+present; otherwise it is refused and the coordinator told why. An accepted
+forward is queued as a `review-forward` operation with a stable request ID, and
+works once. Each time the mission applies its operations, the forward:
 
 1. Ends as used if the subteam already holds a receipt for its request ID.
 2. Waits while the mission is paused or blocked at its time limit, and while
    another run holds the repository.
-3. Reads GitHub once more. If the owner has since approved or dismissed the
-   review, or it is no longer the owner's newest, the forward ends superseded.
-   A failed read is retried a minute later.
+3. Reads GitHub once more. The read runs outside the mission's queue and the
+   scheduler pass, so a slow read delays no owner action and no other mission.
+   The next pass uses its answer only after step 2 lets the forward go again;
+   an answer that arrives while the forward waits is dropped, and GitHub is
+   read again when the wait ends. If the owner has since approved or dismissed
+   the review, or it is no longer the owner's newest, the forward ends
+   superseded. A failed read is retried a minute later.
 4. Is refused if the subteam's revision or head moved. It is never rebound to
    a later delivery.
 5. Steers the subteam with the coordinator's text under its request ID. The
@@ -437,7 +445,27 @@ A mission started by [intake](intake.md) that a review reopens returns its
 intake record from `finished` to `started` in the same change. The record keeps
 its earlier messages and outcome comment, and the next result records its own
 outcome. A Linear issue that was closed in the meantime pauses the reopened
-mission, as for any started record.
+mission, as for any started record. An intake service that was not running
+when the mission reopened finds the record on its next pass.
+
+**Rollback.** A host from before this change does not know the state it adds.
+Before a rollback to such a host:
+
+1. Switch review feedback off (`github.reviewFeedback.enabled: false`) and
+   restart, so no new review reaches a mission.
+2. Wait until no mission holds a queued forward: an event "The coordinator
+   forwarded the owner's review" with no later "received the owner's review"
+   or "was not forwarded" event. The older host cannot apply a
+   `review-forward` operation. The mission blocks with "The mission could not
+   advance" and logs it again on every scheduler pass.
+3. Leave no review waiting on a paused or blocked mission (its event "A review
+   is waiting"): resume the mission so the review is delivered, or cancel it.
+   The older host steers a waiting review into the subteam directly, past the
+   coordinator.
+4. Finish or cancel every live mission whose steering holds an owner review
+   (source `github-review`). The older host takes that source for a connector
+   source, so the coordinator's own `steer-subtask` reaches the subteam
+   labelled as the owner's review.
 
 ### Follow-ups
 

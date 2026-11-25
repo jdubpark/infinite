@@ -45,7 +45,7 @@ import type { Readings } from "./readings.js";
 import { projectGithubRepository, sessionGithubScope } from "./github-grants.js";
 import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
-import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, commandScope, type CommandResult, type CommandScope, teamCommand, teamHead, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
+import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, commandScope, type CommandResult, type CommandScope, STOP_SETTLE_MS, teamCommand, teamHead, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { permissionEvidenceHash } from "./team-permissions.js";
@@ -1132,7 +1132,7 @@ export class TeamService {
               : await prepareTeamWorkspace(workspaceSource.path, root, directoryName, branch, this.config.teams?.commandPrefix, signal, workspaceSource.head, anchor, workspaceSource.startCommit);
             assertParent();
             if (project.team?.setup) {
-              const setup = await teamCommand(project.team.setup, workspace.workspace, signal, 600000, this.config.teams?.commandPrefix);
+              const setup = await teamCommand(project.team.setup, workspace.workspace, signal, 600000, this.config.teams?.commandPrefix, undefined, undefined, STOP_SETTLE_MS);
               await this.noteLeftover(stored, setup);
               if (setup.exitCode !== 0 || setup.interrupted) throw new TeamError(409, "team-setup-failed", "The configured setup command failed. Inspect the isolated workspace before restarting.");
               await assertMemberReadOnly(workspace.workspace, workspace.baseCommit, this.config.teams?.commandPrefix, signal, "setup");
@@ -2562,7 +2562,7 @@ export class TeamService {
         ? role === "reviewer" ? run.verification?.setup : undefined
         : this.config.projects.find(project => project.id === run.projectId)!.team!.setup;
       if (setup) {
-        const setupCommand = this.replays.setupFor(run, this.config.teams?.commandPrefix); const result = await teamCommand(setup, cwd, signal, 600000, setupCommand.prefix, setupCommand.input);
+        const setupCommand = this.replays.setupFor(run, this.config.teams?.commandPrefix); const result = await teamCommand(setup, cwd, signal, 600000, setupCommand.prefix, setupCommand.input, undefined, STOP_SETTLE_MS);
         await this.noteLeftover(stored, result);
         if (result.exitCode !== 0 || result.interrupted) throw new TeamError(409, "team-setup-failed", "A member's configured setup command failed. Its isolated workspace was preserved.");
         await assertMemberReadOnly(cwd, member.baseCommit, this.prefixFor(run), signal, "setup");
@@ -3180,7 +3180,12 @@ export class TeamService {
         const check: TeamRun["checks"][number] = { ...entry, status: "running", startedAt: timestamp(), output: "", revision, round: run.round, headCommit: head };
         await this.enqueue(stored.run.id, () => { if (!this.closed) { run.checks.push(check); this.save(stored); } });
         const scanner = new CheckOutputScanner(), metrics = metricObserver();
-        const result = await teamCommand(entry.command, verification.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix, undefined, undefined, undefined, (chunk, stream) => { metrics.push(chunk, stream); scanner.push(chunk, stream); });
+        let result: CommandResult;
+        try { result = await teamCommand(entry.command, verification.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix, undefined, undefined, STOP_SETTLE_MS, (chunk, stream) => { metrics.push(chunk, stream); scanner.push(chunk, stream); }); }
+        catch (error) {
+          if (error instanceof TeamError && error.code === "command-stop-unconfirmed") await this.enqueue(stored.run.id, () => { if (!this.closed) { Object.assign(check, { status: "interrupted", finishedAt: timestamp() }); this.save(stored); } });
+          throw error;
+        }
         const status = result.interrupted ? "interrupted" : result.exitCode === 0 ? "passed" : "failed";
         Object.assign(check, { status, finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, ...(status === "passed" ? {} : { scan: scanner.finish() }) });
         metrics.record(stored, check);

@@ -35,6 +35,8 @@ export interface CommandScope {
 export const commandScope = new AsyncLocalStorage<CommandScope>();
 export const EXIT_DRAIN_MS = 1_000;
 const EXIT_DRAIN_TURNS = 3;
+export const STOP_GRACE_MS = 5_000;
+export const STOP_SETTLE_MS = 10_000;
 export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string, extraEnv?: Record<string, string>, forceSettleAfterMs?: number, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
   const scope = commandScope.getStore(), ready = scope?.starting();
   const run = () => runTeamCommand(scope, command, cwd, signal, timeoutMs, prefix, input, extraEnv, forceSettleAfterMs, onOutput);
@@ -105,6 +107,17 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       drainTimer = setTimeout(() => setImmediate(decideAtDrain, 1, chunks), EXIT_DRAIN_MS);
       drainTimer.unref();
     };
+    const leaderRuns = () => child.exitCode === null && child.signalCode === null;
+    const signalGroup = (name: NodeJS.Signals) => {
+      try {
+        if (child.pid && process.platform !== "win32") process.kill(-child.pid, name);
+        else child.kill(name);
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EPERM") capture(Buffer.from("\n[The host could not stop this command (EPERM); it was left to finish and its result is not used.]\n"));
+        return false;
+      }
+    };
     const stop = () => {
       if (stopRequested || settled) return;
       if (leaderExit) {
@@ -113,9 +126,11 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       }
       stopRequested = true;
       interrupted = true;
-      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EPERM") capture(Buffer.from("\n[The host could not stop this command (EPERM); it was left to finish and its result is not used.]\n"));
+      if (signalGroup("SIGTERM")) {
+        const graceTimer = setTimeout(() => {
+          if (leaderRuns()) signalGroup("SIGKILL");
+        }, STOP_GRACE_MS);
+        graceTimer.unref();
       }
       if (forceSettleAfterMs !== undefined) {
         stopTimer = setTimeout(() => {

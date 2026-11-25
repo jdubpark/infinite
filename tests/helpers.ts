@@ -91,12 +91,17 @@ export interface Host {
   stop: () => Promise<void>;
 }
 
-/** JSON requests to an API at `origin`, authenticated with the named role's device key. */
+/**
+ * JSON requests to an API at `origin`, authenticated with the named role's device key.
+ * Each request closes its connection. A test that blocks on a synchronous child call for longer than the host's
+ * keep-alive time would otherwise send its next request on a connection the host has closed, and fail with `fetch failed`.
+ */
 export function apiClient(origin: string, tokens: Record<Role, string>): Host["fetchApi"] {
   return async (path, role = "owner", body, headers = {}, method) => {
     const response = await fetch(origin + "/api" + path, {
       method: method ?? (body ? "POST" : "GET"),
       headers: {
+        connection: "close",
         ...(role ? { Authorization: `Bearer ${tokens[role]}` } : {}),
         ...(body ? { "Content-Type": "application/json" } : {}),
         ...headers,

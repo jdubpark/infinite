@@ -77,13 +77,10 @@ export class TeamPublisher {
           const previous = previousPublication?.repository === target.repository ? previousPublication : undefined;
           const attempts = previous?.failure?.commit === commit ? previous.failure.attempts + 1 : 1;
           const retryMs = Math.min(60_000 * 2 ** (attempts - 1), 60 * 60_000);
-          run.publication = {
-            repository: target.repository,
-            branch: previous?.branch ?? runBranch,
-            ...(previous?.commit ? { commit: previous.commit } : {}),
-            ...(previous?.publishedAt ? { publishedAt: previous.publishedAt } : {}),
-            failure: { commit, category: outcome.category, attempts, at, retryAt: new Date(Date.parse(at) + retryMs).toISOString() },
-          };
+          const failure = { commit, category: outcome.category, attempts, at, retryAt: new Date(Date.parse(at) + retryMs).toISOString() };
+          run.publication = previous?.commit !== undefined
+            ? { repository: target.repository, branch: previous.branch, commit: previous.commit, publishedAt: previous.publishedAt, failure }
+            : { repository: target.repository, branch: previous?.branch ?? runBranch, failure };
           const event = `Could not publish head ${commit.slice(0, 12)} to GitHub (${outcome.category}); the head is only on the host until a retry succeeds.`;
           if (!run.events.some(item => item.text === event)) this.host.event(stored, event);
           if (attempts === 3) this.host.event(stored, `Head ${commit.slice(0, 12)} failed to publish to GitHub ${target.repository} three times. Review and delivery wait, and the host keeps retrying up to hourly; check the GitHub App's access to that repository.`);

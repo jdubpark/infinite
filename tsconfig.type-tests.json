@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": true
+  },
+  "include": [
+    "tests/orchestration-state-types.test.ts",
+    "tests/orchestration-wire-contracts.test.ts"
+  ]
+}

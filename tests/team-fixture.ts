@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
-import { startHost, stopSessionWorkers, waitFor, type Host } from "./helpers.js";
+import { endSessionWorkers, startHost, waitFor, type Host } from "./helpers.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { CreateTeam, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 import type { ProjectSourceService } from "../packages/host/src/project-source.js";
@@ -146,7 +146,7 @@ process.exit(child.status ?? 1);
       host = { root, config: directConfig, origin: directConfig.origin, tokens: {} as Host["tokens"],
         fetchApi: async () => { throw new Error("The no-server fixture does not expose an API client."); },
         start: async () => {}, stopApi: async () => {},
-        stop: async () => { await stopSessionWorkers(directConfig); await new Promise(resolve => setTimeout(resolve, 1700)); rmSync(root, { recursive: true, force: true }); } };
+        stop: async () => { const floor = new Promise(resolve => setTimeout(resolve, 1700)); try { await endSessionWorkers(directConfig); await floor; } finally { rmSync(root, { recursive: true, force: true }); } } };
     } else {
       host = await startHost({ agents, config: hostConfig,
         ...(options.trustWorkspaces ? { env: { HOME: home } } : {}),
@@ -186,7 +186,7 @@ process.exit(child.status ?? 1);
           if (!["ready-for-review", "merged", "cancelled"].includes(run.status))
             await host.fetchApi(`/teams/${run.id}/cancel`, "owner", { requestId: randomUUID(), revision: run.revision });
       }
-    } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+    } finally { try { await host.stop(); } finally { rmSync(root, { recursive: true, force: true }); } }
   };
   /** Serve the fixture's parent folder as the sync home and enroll a sibling teamwork folder through the API. */
   const enrollTeamwork = async (sync: Partial<NonNullable<Config["sync"]>> = {}, teamwork = "teamwork") => {

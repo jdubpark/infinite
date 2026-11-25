@@ -55,7 +55,7 @@ import { channelToken } from "./permission-headless.js";
 import { claudeTurnSignals, HeadlessChannelWorker } from "./permission-headless-worker.js";
 import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv } from "./worker-env.js";
 import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
-import { claudeConfigPath, recordClaudeTrust } from "./workspace-trust.js";
+import { claudeConfigPath, recordClaudeTrustAsync } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
@@ -1489,7 +1489,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       if (session.workspaceTrusted) {
         env.INFINITE_TRUSTED_WORKSPACE = session.cwd;
         if (provider === "claude" && env.HOME && !/(^|\/)sudo$/.test(profile.command))
-          try { recordClaudeTrust(claudeConfigPath(env.HOME), session.cwd); }
+          try { await recordClaudeTrustAsync(claudeConfigPath(env.HOME), session.cwd); }
           catch (error) { journal.append("lifecycle", { workspaceTrust: "unrecorded", reason: error instanceof Error ? error.message : String(error) }); }
       }
     }

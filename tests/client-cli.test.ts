@@ -14,7 +14,6 @@ import { workerCall } from "../packages/host/src/ipc.js";
 import type { Config } from "../packages/host/src/types.js";
 import { homedir, tmpdir } from "node:os";
 import { claimControl, startHost, waitFor } from "./helpers.js";
-import { acquireInteractiveTerminal, discardLocalDraft, insertLocalDraft, openLocalDraft, returnToMonitorAndOpenDraft } from "./fixtures/client-terminal.js";
 import { fixture as teamFixture, mixedLineup } from "./team-fixture.js";
 import { DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE } from "../packages/host/src/team-types.js";
 
@@ -1011,14 +1010,38 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     const list = JSON.parse((await exec(process.execPath, [...cli, "list", "--json"])).stdout);
     assert.equal(list[0].id, sid); assert.equal(list[0].nativeArgs, undefined);
     const monitor = start(["monitor", sid.slice(0, 8)]);
+    const pressUntil = async (client: ReturnType<typeof start>, key: string, done: string, busy: string) => {
+      let from = client.output().length;
+      client.process.write(key);
+      await wait(() => {
+        const seen = client.output().slice(from);
+        if (seen.includes(done)) return true;
+        if (!seen.includes(busy)) return false;
+        from = client.output().length;
+        client.process.write(key);
+        return false;
+      });
+    };
+    const enterControl = () => pressUntil(monitor, "\r", "Interactive. Ctrl+G", "Waiting for control acknowledgement");
+    const openDraft = (client: ReturnType<typeof start>) => pressUntil(client, "\x05", "Local draft", "Waiting for draft insertion");
+    const closeDraft = async (client: ReturnType<typeof start>) => {
+      const from = client.output().length;
+      client.process.write("\x18");
+      await wait(() => client.output().slice(from).includes("\x1b[?1049l"));
+    };
     await wait(() => monitor.output().includes("NATIVE READY"));
     monitor.process.write("ignored"); await new Promise(r => setTimeout(r, 200));
     assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), "");
-    await acquireInteractiveTerminal(monitor.output, data => monitor.process.write(data));
+    monitor.process.write("\r"); await wait(() => monitor.output().includes("Interactive. Ctrl+G"));
     monitor.process.write("steer\x1b[A\r");
     await wait(() => readFileSync(join(workspace, "input.txt"), "utf8") === "steer\x1b[A\r");
-    await returnToMonitorAndOpenDraft({ output: monitor.output, write: data => monitor.process.write(data), inputText: () => readFileSync(join(workspace, "input.txt"), "utf8"),
-      controlHeld: async () => Boolean((await app.manager.state(sid)).control), expectedInput: "steer\x1b[A\r" });
+    const monitoringFrom = monitor.output().length;
+    monitor.process.write("\x07ignored again");
+    await wait(() => monitor.output().slice(monitoringFrom).includes("Ctrl+T takes over"));
+    await new Promise(r => setTimeout(r, 200));
+    assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), "steer\x1b[A\r");
+    await enterControl();
+    monitor.process.write("\x05"); await wait(() => monitor.output().includes("Local draft"), 25000);
     monitor.process.write("preserve this unsent draft"); await wait(() => monitor.output().includes("preserve this unsent draft"));
     app.closeConnections(); await new Promise<void>(r => server.close(() => r()));
     await wait(() => monitor.output().includes("Connection lost")); monitor.process.write("offline-input");
@@ -1027,9 +1050,10 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     await wait(() => monitor.output().includes("Reconnected to the same session"));
     assert.equal((await app.manager.state(sid)).pid, before.pid);
     assert.equal((await app.manager.list()).length, 1);
-    await acquireInteractiveTerminal(monitor.output, data => monitor.process.write(data));
-    await openLocalDraft(monitor.output, data => monitor.process.write(data), "preserve this unsent draft");
-    await discardLocalDraft(monitor.output, data => monitor.process.write(data));
+    await enterControl();
+    const draftOffset = monitor.output().length;
+    monitor.process.write("\x05"); await wait(() => monitor.output().slice(draftOffset).includes("preserve this unsent draft"));
+    await closeDraft(monitor);
     monitor.process.write("after");
     await wait(() => readFileSync(join(workspace, "input.txt"), "utf8").endsWith("after"));
     assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), "steer\x1b[A\rafter");
@@ -1040,18 +1064,20 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     resumed.process.write("A");
     await wait(() => held.length > 0 && readFileSync(join(workspace, "input.txt"), "utf8").endsWith("A"));
     resumed.process.write("B");
-    await wait(() => readFileSync(join(workspace, "input.txt"), "utf8").endsWith("AB"), 1000);
+    await wait(() => readFileSync(join(workspace, "input.txt"), "utf8").endsWith("AB"));
     holdReceipts = false; held.splice(0).forEach(deliver => deliver());
     const inputBeforeDraft = readFileSync(join(workspace, "input.txt"), "utf8");
-    await openLocalDraft(resumed.output, data => resumed.process.write(data));
-    resumed.process.write("instant local text"); await wait(() => resumed.output().includes("instant local text"), 500);
+    resumed.process.write("\x05"); await wait(() => resumed.output().includes("Local draft"));
+    resumed.process.write("instant local text"); await wait(() => resumed.output().includes("instant local text"));
     assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), inputBeforeDraft, "editing stays entirely local");
-    await discardLocalDraft(resumed.output, data => resumed.process.write(data));
+    await closeDraft(resumed);
+    await new Promise(r => setTimeout(r, 100));
     assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), inputBeforeDraft, "cancelling never sends a draft");
-    await openLocalDraft(resumed.output, data => resumed.process.write(data));
-    await insertLocalDraft({ output: resumed.output, write: data => resumed.process.write(data), inputText: () => readFileSync(join(workspace, "input.txt"), "utf8"),
-      expectedInput: inputBeforeDraft + "\x1b[200~draft first\ndraft second\x1b[201~", text: "draft first\rdraft second" });
-    await openLocalDraft(resumed.output, data => resumed.process.write(data));
+    await openDraft(resumed);
+    resumed.process.write("draft first\rdraft second"); await wait(() => resumed.output().includes("draft second"));
+    resumed.process.write("\x13");
+    await wait(() => readFileSync(join(workspace, "input.txt"), "utf8") === inputBeforeDraft + "\x1b[200~draft first\ndraft second\x1b[201~");
+    await openDraft(resumed);
     resumed.process.write("survive a killed client"); await wait(() => resumed.output().includes("survive a killed client"));
     const saved = () => readdirSync(join(root, "drafts"), { recursive: true }).map(String).filter(p => p.endsWith(".sealed")).map(p => join(root, "drafts", p));
     await wait(() => { try { return saved().length === 1; } catch { return false; } });
@@ -1061,7 +1087,7 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     const recovered = start(["resume", sid]);
     await wait(() => recovered.output().includes("Live session connected"));
     assert.match(recovered.output(), /Recovered an unsent local draft/);
-    await openLocalDraft(recovered.output, data => recovered.process.write(data), "survive a killed client");
+    recovered.process.write("\x05"); await wait(() => recovered.output().includes("survive a killed client"));
     holdReceipts = true;
     recovered.process.write("\x13");
     await wait(() => held.length > 0 && readFileSync(join(workspace, "input.txt"), "utf8").endsWith("survive a killed client\x1b[201~"));

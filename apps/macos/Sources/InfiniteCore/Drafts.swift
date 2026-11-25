@@ -65,14 +65,33 @@ public struct DraftLocation: Equatable, Sendable {
     }
 }
 
-public final class DraftStore {
+private actor DraftStoreRegistry {
+    static let shared = DraftStoreRegistry()
+    private var stores: [String: DraftStore] = [:]
+
+    func store(for location: DraftLocation) -> DraftStore {
+        let key = "\(location.service)|\(location.directory)"
+        if let existing = stores[key] { return existing }
+        let created = DraftStore(location: location)
+        stores[key] = created
+        return created
+    }
+}
+
+public actor DraftStore {
     private let directory: URL
     private let service: String
     private var key: SymmetricKey?
+
+    public static func shared(location: DraftLocation = DraftLocation(bundleID: Bundle.main.bundleIdentifier)) async -> DraftStore {
+        await DraftStoreRegistry.shared.store(for: location)
+    }
+
     public init(location: DraftLocation = DraftLocation(bundleID: Bundle.main.bundleIdentifier)) {
         directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent(location.directory, isDirectory: true)
         service = location.service
     }
+
     private func encryptionKey() throws -> SymmetricKey {
         if let key { return key }
         let value: SymmetricKey
@@ -84,7 +103,9 @@ public final class DraftStore {
         }
         key = value; return value
     }
+
     private func file(_ identity: String) -> URL { directory.appendingPathComponent(Data(SHA256.hash(data: Data(identity.utf8))).hex + ".sealed") }
+
     public func read(_ identity: String) throws -> DraftRecord {
         let path = file(identity)
         guard FileManager.default.fileExists(atPath: path.path) else { return DraftRecord() }
@@ -92,6 +113,7 @@ public final class DraftStore {
         let clear = try AES.GCM.open(AES.GCM.SealedBox(combined: bytes), using: encryptionKey(), authenticating: Data(identity.utf8))
         return try JSONDecoder().decode(DraftRecord.self, from: clear)
     }
+
     public func save(_ record: DraftRecord, identity: String) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let clear = try JSONEncoder().encode(record)
@@ -99,5 +121,24 @@ public final class DraftStore {
         guard let data = encrypted.combined else { throw DesktopError("Could not encrypt the draft.") }
         try data.write(to: file(identity), options: [.atomic, .completeFileProtection])
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file(identity).path)
+    }
+
+    public func clearIfMatching(requestID: String, identity: String) throws {
+        let current = try read(identity)
+        guard current.pending?.id == requestID else { return }
+        try save(DraftRecord(), identity: identity)
+    }
+
+    public func readOrCreatePending(
+        identity: String,
+        text: String,
+        makeID: @Sendable () -> String = { UUID().uuidString.lowercased() }
+    ) throws -> DraftRecord {
+        var current = try read(identity)
+        if current.pending == nil {
+            current.pending = PendingSend(id: makeID(), text: text)
+            try save(current, identity: identity)
+        }
+        return current
     }
 }

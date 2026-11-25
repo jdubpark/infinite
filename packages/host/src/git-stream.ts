@@ -3,18 +3,13 @@ import { COMMIT_ID } from "./outcome-hold.js";
 import { isScopedPath } from "./goal-types.js";
 import type { TeamCommand } from "./team-types.js";
 import { teamGitArgs, teamGitEnvironment } from "./team-workspace.js";
+import { leaderExited, signalGroup, watchLeader } from "./process-group.js";
 
 export type StreamRead = { state: "read"; bytes: Buffer } | { state: "too-large" } | { state: "failed" };
 export const BLOB_MAX_BYTES = 1_048_576, BLOB_READ_MS = 30_000, BLOB_RELEASE_MS = 1_000, BLOB_PATH_CHARS = 300;
 
 export function stopGroup(child: ChildProcess): boolean {
-  try {
-    if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
-    else child.kill("SIGKILL");
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "EPERM";
-  }
-  return true;
+  return signalGroup(child, "SIGKILL") !== "refused";
 }
 
 export type GitStreamInput = {
@@ -34,6 +29,7 @@ export function readGitStream(input: GitStreamInput): Promise<StreamRead> {
       resolveRead({ state: "failed" });
       return;
     }
+    const leader = watchLeader(child);
     const chunks: Buffer[] = [];
     let total = 0, decided: StreamRead | undefined, resolved = false, timer: NodeJS.Timeout | undefined, release: NodeJS.Timeout | undefined;
     const finish = (read: StreamRead) => {
@@ -52,7 +48,7 @@ export function readGitStream(input: GitStreamInput): Promise<StreamRead> {
       child.stdout?.destroy();
       child.stderr?.destroy();
       report?.(read);
-      if (!stop(child)) {
+      if (!leaderExited(child) && !stop(child)) {
         release = setTimeout(() => child.unref(), releaseMs);
         release.unref();
       }
@@ -78,7 +74,7 @@ export function readGitStream(input: GitStreamInput): Promise<StreamRead> {
     child.once("close", exitCode => {
       clear();
       if (release) clearTimeout(release);
-      finish(decided ?? (exitCode === 0 ? { state: "read", bytes: Buffer.concat(chunks) } : { state: "failed" }));
+      finish(decided ?? (exitCode === 0 && !leader.leftover ? { state: "read", bytes: Buffer.concat(chunks) } : { state: "failed" }));
     });
   });
 }

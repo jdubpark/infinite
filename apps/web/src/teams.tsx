@@ -18,6 +18,7 @@ export type TeamTask = { id: string; title: string; instructions: string; paths:
 type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; headCommit: string; tasks: TeamTask[]; review?: TeamView["review"]; brief?: TeamBrief };
 type TeamScout = { id: string; title: string; instructions: string; agentProfileId: string; status: "pending" | "running" | "waiting" | "complete"; memberId?: string; summary?: string; evidence?: TeamEvidence[] };
 type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; cwd: string; baseCommit: string; provider?: string; modelProfile?: TeamModelProfile; usage?: UsageTotals; stoppedReason?: string };
+
 export function directionSourceLabel(source: { kind: string; name: string } | string | undefined): string {
   if (typeof source === "object") return source.kind === "github-review" ? "Owner (GitHub review)" : source.name;
   return source === "coordinator" ? "Mission coordinator" : "You";

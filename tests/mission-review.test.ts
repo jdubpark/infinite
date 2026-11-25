@@ -124,12 +124,19 @@ test("a review reopens a mission at ready-for-review with a new working window, 
 
     intake.close();
     assert.equal(await h.missions.reviewDirection(id, direction("PRR_2")), "applied");
+    await h.attempt(4);
+    await pause(1000);
     assert.equal(store.get(issueId)!.state, "finished", "a stopped intake service does not see the reopen");
     assert.deepEqual(reviewStates(h, id), ["superseded", "open"], "a newer review of the same pull request replaces the open one");
     const later = intakeService();
     try {
       later.start();
-      await waitFor(async () => store.get(issueId)!.state, state => state === "started", 10000);
+      await later.poll();
+      assert.equal(store.get(issueId)!.state, "started", "the next intake pass finds the reopened mission");
+      const quiet = store.get(issueId)!.updatedAt;
+      await pause(5);
+      assert.equal(await h.missions.reviewDirection(id, direction("PRR_3")), "applied");
+      assert.equal(store.get(issueId)!.updatedAt, quiet, "a change to a live mission leaves its started record alone");
     } finally { later.close(); }
   } finally { intake.close(); h.close(); }
 });
@@ -288,6 +295,8 @@ test("a slow GitHub read holds neither its mission's queue nor the scheduler, an
     h.readReview(() => new Promise(done => { answer = done; }));
     const { id, teamId } = await forwardQueued(h, false);
     await waitFor(async () => h.githubChecks.length, count => count === 1);
+    await pause(1200);
+    assert.equal(h.githubChecks.length, 1, "one read at a time");
     h.standalone.add("api");
     const paused = await promptly(h.missions.pause(id, action(h, id)), "the owner's pause");
     const other = await h.create("Document the API");
@@ -303,13 +312,30 @@ test("a slow GitHub read holds neither its mission's queue nor the scheduler, an
   } finally { h.close(); }
 });
 
+test("a result that arrives with the forward's steer is refused while the steered subteam runs", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    let answer: (current: boolean) => void = () => {};
+    h.readReview(() => new Promise(done => { answer = done; }));
+    const { id } = await forwardQueued(h, false);
+    await waitFor(async () => h.githubChecks.length, count => count === 1);
+    await h.missions.steer(id, { ...action(h, id), text: "Keep the old flag documented." });
+    await h.attempt(4);
+    answer(true);
+    await h.report(4, { kind: "result", summary: "Renamed the flag." });
+    await until(() => h.get(id), received);
+    await until(() => h.get(id), mission => events(mission).some(text => text.startsWith("The coordinator's result report was refused:")));
+    assert.notEqual(h.get(id).status, "ready-for-review");
+  } finally { h.close(); }
+});
+
 test("while a forward is on its way the coordinator may wait but cannot report a result", { timeout: 60000 }, async () => {
   const h = scripted();
   try {
     const { id } = await forwardQueued(h, true);
     await h.missions.steer(id, { ...action(h, id), text: "Keep the old flag documented." });
     await h.report(4, { kind: "wait", summary: "Waiting for the forward." });
-    await until(() => h.get(id), mission => events(mission).includes("The coordinator is waiting for subteam progress, owner input, or a follow-up."));
+    await until(() => h.get(id), mission => events(mission).filter(text => text === "The coordinator is waiting for subteam progress, owner input, or a follow-up.").length === 2);
     await h.missions.steer(id, { ...action(h, id), text: "Mention the alias in the changelog." });
     await h.report(5, { kind: "result", summary: "Renamed the flag." });
     await until(() => h.get(id), mission => events(mission).some(text => text.endsWith("The owner's review is still on its way to its subtask. Wait for that subteam before reporting a result.")));

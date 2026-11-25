@@ -194,6 +194,24 @@ test("a mission run's review goes to its mission's coordinator instead of steeri
   }
 });
 
+test("a mission run that no mission lists is neither steered nor sent to a mission", async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.missionId = "mission-1";
+    const gh = delivered(f);
+    gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
+    const teams = f.openTeam(), feedback = poller(teams), directed: unknown[] = [];
+    teams.useMissionReviews({ target: () => undefined, applied: () => false, direct: async (missionId, direction) => {
+      directed.push([missionId, direction]);
+      return "applied";
+    } });
+    await feedback.start();
+    await feedback.poll();
+    const saved = f.readRecord<Saved>("team", f.run.id);
+    assert.deepEqual([saved.run.revision, saved.run.steering, saved.reviewIntake?.intents ?? [], directed], [1, [], [], []]);
+  } finally { f.close(); }
+});
+
 test("a restarted host acknowledges a mission run's review from its mission's receipt without reading GitHub", async () => {
   const f = schedulerFixture();
   try {

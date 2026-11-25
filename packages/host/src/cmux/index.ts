@@ -419,6 +419,8 @@ export class CmuxSessions {
     }, `get:${id}`);
   }
 
+  requireStored(id: string) { this.stored(id); }
+
   events(id: string, after = 0, limit = 200, types?: Set<string>) {
     this.stored(id);
     return readEvents(join(this.directory, id, "events"), this.key, id, after, limit, types);

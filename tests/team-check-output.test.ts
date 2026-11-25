@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
-import { CheckOutputScanner, checkFeedback, scanCheckOutput } from "../packages/host/src/team-check-output.js";
+import { CheckOutputScanner, checkFeedback, scanCheckOutput, unrecognisedTail } from "../packages/host/src/team-check-output.js";
 import type { CheckScan } from "../packages/host/src/team-check-output.js";
 import { teamCommand } from "../packages/host/src/team-workspace.js";
 import type { TeamCheck } from "../packages/host/src/team-types.js";
@@ -338,4 +338,83 @@ test("teamCommand feeds the observer while the command runs and survives an obse
   const thrown = await teamCommand(command, tmpdir(), undefined, 60000, undefined, undefined, undefined, undefined, () => { throw new Error("observer"); });
   assert.equal(thrown.exitCode, 1);
   assert.ok(thrown.output.includes("passing line padding"));
+});
+
+const JEST_OUTPUT = [
+  "FAIL modules/example/example.spec.ts (5.123 s)",
+  "  ● Example suite › does the thing",
+  "",
+  "    expect(received).toBe(expected) // Object.is equality",
+  "",
+  "    Expected: 1",
+  "    Received: 2",
+  "",
+  "      at Object.<anonymous> (modules/example/example.spec.ts:11:19)",
+  "",
+  "Test Suites: 1 failed, 510 passed, 511 total",
+  "Tests:       1 failed, 8363 passed, 8364 total",
+  "",
+].join("\n");
+
+const VITEST_OUTPUT = [
+  " FAIL  src/example.test.ts > Example suite > does the thing",
+  "AssertionError: expected 2 to be 1",
+  " ❯ src/example.test.ts:11:19",
+  " Test Files  1 failed | 3 passed (4)",
+  "      Tests  1 failed | 20 passed (21)",
+  "",
+].join("\n");
+
+test("Jest and Vitest failures yield the failing test, a missing-test line yields itself, and Console yields nothing", () => {
+  const jest = scanParts([{ stream: "stderr", text: JEST_OUTPUT }]);
+  assert.deepEqual(jest.failures.map(failure => failure.line), ["● Example suite › does the thing"]);
+  assert.ok(jest.failures[0]!.detail.includes("Expected: 1"));
+  assert.deepEqual(scanParts([{ stream: "stderr", text: "  ● Console\n\n    console.log\n      hello\n\n" }]).failures, []);
+  const vitest = scanCheckOutput(VITEST_OUTPUT);
+  assert.deepEqual(vitest.failures.map(failure => failure.line), ["FAIL  src/example.test.ts > Example suite > does the thing"]);
+  assert.ok(vitest.failures[0]!.detail.includes("AssertionError: expected 2 to be 1"));
+  assert.ok(!vitest.failures[0]!.detail.includes("Test Files"));
+  assert.deepEqual(scanCheckOutput("No tests found, exiting with code 1\n").failures.map(failure => failure.line), ["No tests found, exiting with code 1"]);
+});
+
+test("an unrecognised failure keeps the last 20 non-empty lines, cleaned, and cuts from the front to 2,000 characters", () => {
+  const rows = Array.from({ length: 25 }, (_, index) => `row ${index + 1}`);
+  const short = unrecognisedTail([...rows, "", "  "].join("\n"));
+  assert.equal(short, ["No failure line was recognised. Last lines of the output:", ...rows.slice(5)].join("\n"));
+  const long = unrecognisedTail(`${"x".repeat(3000)}\n${"y".repeat(1500)}\nend\u001b[31m\n`);
+  assert.ok(long.length <= 2000, `tail is ${long.length} characters`);
+  assert.ok(long.endsWith("\nend"));
+  assert.ok(long.startsWith("No failure line was recognised. Last lines of the output:\n"));
+});
+
+test("the unrecognised tail stays within 2,000 characters, keeps the last row and drops the first", () => {
+  const rows = Array.from({ length: 20 }, (_, index) => `row-${index + 1}-${"x".repeat(100)}`);
+  const entry = unrecognisedTail(rows.join("\n"));
+  assert.ok(entry.length <= 2000, `entry is ${entry.length} characters`);
+  assert.ok(entry.startsWith("No failure line was recognised. Last lines of the output:\n"));
+  assert.ok(entry.endsWith(rows[19]!));
+  assert.equal(entry.includes("row-1-"), false);
+});
+
+test("a tail row keeps its end, so a long line still shows its final error", () => {
+  const entry = unrecognisedTail(`${"x".repeat(100000)} ERROR: build failed\n`);
+  assert.ok(entry.endsWith("ERROR: build failed"));
+});
+
+test("no output, or only blank lines, gives the fixed no-output text", () => {
+  assert.equal(unrecognisedTail(""), "The command wrote no output.");
+  assert.equal(unrecognisedTail("\n  \n\t\n"), "The command wrote no output.");
+  assert.equal(unrecognisedTail([String.fromCodePoint(7), String.fromCodePoint(0x200b)].join("\n")), "The command wrote no output.");
+});
+
+test("a Jest warning and its coverage line are not failures", () => {
+  const warning = [
+    "  ● Validation Warning:",
+    "",
+    "    Unknown option \"testURL\" with value \"http://localhost\" was found.",
+    "",
+    "Jest: \"global\" coverage threshold for lines (80%) not met: 75%",
+    "",
+  ].join("\n");
+  assert.deepEqual(scanParts([{ stream: "stderr", text: warning }]).failures, []);
 });

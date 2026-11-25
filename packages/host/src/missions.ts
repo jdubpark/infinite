@@ -9,7 +9,7 @@ import type { Config } from "./types.js";
 import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, inputSourceLabel, type BlockerEvidence, type CreateTeam, type NativeContinuation, type TeamAssignment, type TeamView } from "./team-types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
-import { createMissionSchema, missionActionSchema, missionExtendSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionFollowUp, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
+import { createMissionSchema, missionActionSchema, missionExtendSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionFollowUp, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan, type RecordedMissionFollowUp } from "./mission-types.js";
 import { askedRecommendation, isDirectionMessage, missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionCoordinatorNote, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
 import { questionProblem, recommendationOutcome } from "./question-recommendation.js";
 import { addRollups, emptyRollup, teamUsage } from "./team-usage.js";
@@ -109,7 +109,7 @@ function cancelFollowUps(mission: Mission) {
 }
 function trimFollowUps(mission: Mission) {
   const settled = (mission.followUps ?? []).filter(item => item.state !== "open").sort((a, b) => (a.settledAt ?? "").localeCompare(b.settledAt ?? ""));
-  const dropped = new Set(settled.slice(0, Math.max(0, settled.length - settledFollowUpsKept)));
+  const dropped = new Set<RecordedMissionFollowUp>(settled.slice(0, Math.max(0, settled.length - settledFollowUpsKept)));
   if (dropped.size) mission.followUps = mission.followUps!.filter(item => !dropped.has(item));
 }
 const messageCannotFitReason = "The next coordinator message cannot fit with the mission state, even shortened. No empty coordinator attempt was started; start a new mission with a consolidated objective.";
@@ -158,8 +158,7 @@ export class MissionService {
           capacityChanged = true;
         }
       }
-      if (capacityChanged) this.event(stored, "Subtask worker limits were reconciled from their persisted team capacity.");
-      if (capacityChanged) this.save(stored);
+      if (capacityChanged) { this.event(stored, "Subtask worker limits were reconciled from their persisted team capacity."); this.save(stored); }
     }
     this.teams.useMissionReservations((projectId, exceptMissionId) => {
       for (const [missionId, stored] of this.records) {

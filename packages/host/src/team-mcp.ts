@@ -22,6 +22,7 @@ const tool = {
   outputSchema: outputSchemas.report,
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 };
+export const teamReportToolInputSchema = tool.inputSchema;
 const missionArgumentsSchema = missionReportArgumentsSchema;
 const ENTRY_ARGUMENTS = z.object({ entry: memberEntryPostSchema }).strict();
 const ENTRY_GET_ARGUMENTS = z.object({ entryId: z.uuid() }).strict();

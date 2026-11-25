@@ -509,6 +509,11 @@ test("a cmux session in the project holds a workspace sync, and cmux starts are 
   const fetchApi = apiClient(origin, { owner, controller: owner, viewer: owner });
   const listed = await fetchApi("/sessions");
   assert.ok(listed.body.sessions.some((s: { backend: string; projectId: string; status: string }) => s.backend === "cmux" && s.projectId === "project" && s.status === "running"));
+  const missingCmuxControl = await fetchApi(`/sessions/${randomUUID()}/control`, "owner", { action: "renew" });
+  assert.equal(missingCmuxControl.status, 404);
+  const existingCmuxControlLost = await fetchApi(`/sessions/${f.id}/control`, "owner", { action: "renew" });
+  assert.equal(existingCmuxControlLost.status, 409);
+  assert.equal(existingCmuxControlLost.body.code, "control-lost");
 
   const laptop = join(f.root, "laptop"), storeDir = join(f.root, "laptop-store");
   mkdirSync(laptop); writeFileSync(join(laptop, "a.txt"), "laptop\n");

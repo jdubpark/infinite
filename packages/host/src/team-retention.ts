@@ -6,6 +6,7 @@ import { runEventKey, runSummaryCounts } from "./run-events.js";
 import { hostGithubGrantEnvironment } from "./github-grants.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, snapshotMemberWork, TeamError } from "./team-workspace.js";
 import { activeMember, digest, filesystemEntryExists, type TeamKernel, teamRunDirectory } from "./team-kernel.js";
+import type { EntryIngestQueue } from "./team-entry-ingest.js";
 import { intakeEndedByRemoval } from "./review-feedback.js";
 import type { RetentionState, Stored, TeamServiceOptions } from "./teams.js";
 import { MemberTraces, removeMemberTraces, type TraceSettlementHost } from "./member-traces.js";
@@ -47,6 +48,7 @@ export type RetentionHost = Pick<TeamKernel, "records" | "commands" | "manager" 
   readonly directory: string;
   readonly recorders: Map<string, unknown>;
   readonly entryBacklog: Set<string>;
+  readonly entryQueue: EntryIngestQueue;
   readonly evidence: EvidenceStore | undefined;
   view(stored: Stored): TeamView;
   emit(stored: Stored, kind: string, keyParts: readonly (string | number)[], ids: { memberId?: string; taskId?: string; revision?: number }, data: Record<string, unknown>): void;
@@ -79,6 +81,7 @@ function pathStrictlyInside(root: string, target: string) {
  */
 export class TeamRetention {
   readonly removingRuns = new Set<string>();
+  readonly deletingRuns = new Set<string>();
   readonly removalTasks = new Set<Promise<void>>();
   private readonly memberWorkSaveRuns = new Set<string>();
   readonly memberWorkSaveTasks = new Set<Promise<void>>();
@@ -155,7 +158,7 @@ export class TeamRetention {
     }));
   }
   private recordMemberWork(stored: Stored, member: TeamMember, savedWork: NonNullable<TeamMember["savedWork"]>, eventText?: string, additionalEventText?: string) {
-    return this.host.enqueue(() => {
+    return this.host.enqueue(stored.run.id, () => {
       if (this.host.records.get(stored.run.id) !== stored) return;
       const previous = member.savedWork, previousEvents = stored.run.events.slice();
       member.savedWork = savedWork;
@@ -286,7 +289,7 @@ export class TeamRetention {
       let didFail = false, failure: unknown, result: unknown;
       try { result = await this.withRemovalSlot(remove); }
       catch (error) { didFail = true; failure = error; }
-      try { await this.host.enqueue(() => didFail ? failed(failure) : completed(result)); }
+      try { await this.host.enqueue(id, () => didFail ? failed(failure) : completed(result)); }
       catch (error) { console.warn("Could not record the result of a background team workspace removal.", error); }
       finally { this.removingRuns.delete(id); }
     })().finally(() => this.removalTasks.delete(task));
@@ -294,43 +297,51 @@ export class TeamRetention {
     return true;
   }
   async deleteRecord(stored: Stored, waitForEvidence: boolean) {
-    const finalView = this.host.view(stored);
-    if (this.host.options?.events) {
-      this.host.emit(stored, "run.deleted", [], {}, { status: stored.run.status });
-      const flushed = this.host.flushOutbox(stored);
-      const advanced = this.host.options.events.advance();
-      // A blocked projector cannot catch up without a repair, so it does not hold the deletion.
-      if (!flushed || advanced.pending && advanced.blocked.length === 0) {
-        const retention = this.host.retentionState(stored);
-        retention.evidenceHeldAt ??= this.host.retentionNow();
-        const heldFor = (this.host.options.now?.() ?? Date.now()) - Date.parse(retention.evidenceHeldAt);
-        if (waitForEvidence && heldFor < EVIDENCE_WAIT_MS)
-          throw new TeamError(503, "team-evidence-pending", "The team's run events are not yet in the evidence store; its record is kept until they are stored.");
-        console.warn("Run events for a removed team were not stored; its record is removed anyway.");
+    const id = stored.run.id;
+    const wasDeleting = this.deletingRuns.has(id);
+    this.deletingRuns.add(id);
+    try {
+      const finalView = this.host.view(stored);
+      if (this.host.options?.events) {
+        this.host.emit(stored, "run.deleted", [], {}, { status: stored.run.status });
+        const flushed = this.host.flushOutbox(stored);
+        const advanced = this.host.options.events.advance();
+        // A blocked projector cannot catch up without a repair, so it does not hold the deletion.
+        if (!flushed || advanced.pending && advanced.blocked.length === 0) {
+          const retention = this.host.retentionState(stored);
+          retention.evidenceHeldAt ??= this.host.retentionNow();
+          const heldFor = (this.host.options.now?.() ?? Date.now()) - Date.parse(retention.evidenceHeldAt);
+          if (waitForEvidence && heldFor < EVIDENCE_WAIT_MS)
+            throw new TeamError(503, "team-evidence-pending", "The team's run events are not yet in the evidence store; its record is kept until they are stored.");
+          console.warn("Run events for a removed team were not stored; its record is removed anyway.");
+        }
       }
+      try { if (!stored.run.replay) this.host.persistRetiredRunId(id); }
+      catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's deletion tombstone could not be saved; its record was kept."); }
+      for (const member of stored.run.members) this.host.entryQueue.remove(member.memberId);
+      // A host that never kept traces skips this. Otherwise a settlement pass still running over the run's traces ends
+      // first, and nothing of the run is kept after it.
+      if (this.traces.inUse(this.host.config)) {
+        await this.traces.forget(stored.run);
+        try { await removeMemberTraces(this.host.config.stateDir, id); }
+        catch { throw new TraceRemovalError(500, "team-record-removal-failed", "The settled team's member traces could not be removed; its record was kept."); }
+      }
+      try { await rmAsync(join(this.host.directory, `${id}.sealed`), { force: true }); }
+      catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's record could not be removed."); }
+      this.host.commands.get(id)?.abort();
+      this.host.commands.delete(id);
+      this.host.records.delete(id);
+      this.host.recorders.delete(id);
+      this.host.entryBacklog.delete(id);
+      // deleteRun never throws. A failed delete is repeated by the hourly sweep, so the removal does not wait on it.
+      this.host.evidence?.deleteRun(id);
+      return finalView;
+    } finally {
+      if (!wasDeleting) this.deletingRuns.delete(id);
     }
-    try { if (!stored.run.replay) this.host.persistRetiredRunId(stored.run.id); }
-    catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's deletion tombstone could not be saved; its record was kept."); }
-    // A host that never kept traces skips this. Otherwise a settlement pass still running over the run's traces ends
-    // first, and nothing of the run is kept after it.
-    if (this.traces.inUse(this.host.config)) {
-      await this.traces.forget(stored.run);
-      try { await removeMemberTraces(this.host.config.stateDir, stored.run.id); }
-      catch { throw new TraceRemovalError(500, "team-record-removal-failed", "The settled team's member traces could not be removed; its record was kept."); }
-    }
-    try { await rmAsync(join(this.host.directory, `${stored.run.id}.sealed`), { force: true }); }
-    catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's record could not be removed."); }
-    this.host.commands.get(stored.run.id)?.abort();
-    this.host.commands.delete(stored.run.id);
-    this.host.records.delete(stored.run.id);
-    this.host.recorders.delete(stored.run.id);
-    this.host.entryBacklog.delete(stored.run.id);
-    // deleteRun never throws. A failed delete is repeated by the hourly sweep, so the removal does not wait on it.
-    this.host.evidence?.deleteRun(stored.run.id);
-    return finalView;
   }
   removeRun(id: string): Promise<TeamView> {
-    return this.host.enqueue(async () => {
+    return this.host.enqueue(id, async () => {
       const stored = this.host.visible(id), run = stored.run;
       if (this.host.needsPublication(stored)) throw new TeamError(409, "head-not-published", "The integrated head must be published to GitHub before this run can be removed.");
       if (this.removingRuns.has(id)) throw new TeamError(409, "team-operation-running", "A background workspace removal is still running. Retry deletion after it settles.");
@@ -341,15 +352,22 @@ export class TeamRetention {
         this.startMemberWorkSave(stored);
         throw new TeamError(409, "member-work-not-saved", "Unfinished member work is being saved to GitHub before this run's workspaces are removed. Retry removal shortly.");
       }
-      if (!run.workspaceRemovedAt || filesystemEntryExists(teamRunDirectory(run.workspace))) {
-        this.host.assertRunPath(stored, run.workspace);
-        await removeTeamWorkspace(teamRunDirectory(run.workspace), this.host.config.teams?.commandPrefix, undefined, this.teamRoot(stored));
-        run.workspaceRemovedAt ??= this.host.retentionNow();
-        for (const member of run.members) member.workspaceRemovedAt ??= run.workspaceRemovedAt;
-        this.host.event(stored, "Workspaces removed by the owner through removeRun after the run settled.");
-        this.host.save(stored);
+      this.removingRuns.add(id);
+      this.deletingRuns.add(id);
+      try {
+        if (!run.workspaceRemovedAt || filesystemEntryExists(teamRunDirectory(run.workspace))) {
+          this.host.assertRunPath(stored, run.workspace);
+          await removeTeamWorkspace(teamRunDirectory(run.workspace), this.host.config.teams?.commandPrefix, undefined, this.teamRoot(stored));
+          run.workspaceRemovedAt ??= this.host.retentionNow();
+          for (const member of run.members) member.workspaceRemovedAt ??= run.workspaceRemovedAt;
+          this.host.event(stored, "Workspaces removed by the owner through removeRun after the run settled.");
+          this.host.save(stored);
+        }
+        return await this.deleteRecord(stored, false);
+      } finally {
+        this.deletingRuns.delete(id);
+        this.removingRuns.delete(id);
       }
-      return this.deleteRecord(stored, false);
     });
   }
   /** `operationEnded` lifts the fence of an interrupted operation. Only the retention gate passes it, and it then closes the run only after a look taken in the same pass found none of the operation's processes. */

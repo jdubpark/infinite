@@ -78,7 +78,7 @@ export class TeamPublisher {
       } catch {
         outcome = { published: false, category: "other" };
       }
-      await this.host.enqueue(() => {
+      await this.host.enqueue(id, () => {
         if (this.host.records.get(id) !== stored) return;
         const previousPublication = run.publication, previousEvents = run.events.slice();
         const at = this.host.retentionNow();

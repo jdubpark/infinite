@@ -797,7 +797,7 @@ test("a subteam's halt pause and resume are decided in its own queue, and the ow
   const subtask = (id: string, teamId: string) => ({ id, title: id, instructions: id, repoProjectId: "fixture", dependsOn: [], size: "team", status: "running", teamId });
   writeMission(f, "fixture", [subtask("a", ownerPaused), subtask("b", ownerCycled), subtask("c", turning)], missionId);
   const teams = f.openTeam();
-  const internal = teams as unknown as { record(id: string): { run: TeamRun }; enqueue<T>(task: () => Promise<T>): Promise<T> };
+  const internal = teams as unknown as { record(id: string): { run: TeamRun }; enqueue<T>(runId: string, task: () => Promise<T>): Promise<T> };
   const manager = { meta: () => { throw Object.assign(new Error("No session."), { code: "ENOENT" }); }, hostLoad: { held: () => undefined } } as unknown as Manager;
   const missions = new MissionService(f.config, f.key, manager, teams, { get: () => { throw new Error("Not queried in this test"); } });
   const stored = [...(missions as unknown as { records: Map<string, { ops: { kind: string; teamId: string }[]; ownerHalt?: { children: string[] } }> }).records.values()][0]!;
@@ -812,7 +812,7 @@ test("a subteam's halt pause and resume are decided in its own queue, and the ow
     // (c) A team pass already in the queue finds pending input before the halt's pause reaches the team.
     let open!: () => void;
     const gate = new Promise<void>(resolve => { open = resolve; });
-    const tick = internal.enqueue(async () => { await gate; internal.record(turning).run.status = "needs-input"; });
+    const tick = internal.enqueue(turning, async () => { await gate; internal.record(turning).run.status = "needs-input"; });
     const turningRevision = teams.get(turning).revision;
     const delivered = applyOps();
     await new Promise(resolve => setTimeout(resolve, 20));

@@ -73,7 +73,7 @@ function makeRegister(w: World): TeamRegister {
     holder: id => w.holders.get(id),
     configured: () => CONFIGURED,
     workspace: () => "integration-checkout",
-    enqueue: work => {
+    enqueue: (_runId, work) => {
       const next = chain.then(() => work());
       chain = next.catch(() => undefined);
       return next;

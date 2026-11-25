@@ -121,6 +121,39 @@ export class EntryIngestQueue {
   }
 }
 
+export function ingestRunMemberEntries(
+  queue: EntryIngestQueue,
+  theRun: TeamRun | undefined,
+  memberIds: readonly string[],
+  deps: Pick<IngestDeps, "events" | "entries" | "kept">,
+): { run: TeamRun; advanced: boolean; dropped: number } | undefined {
+  try {
+    if (theRun === undefined || theRun.blackboard?.tools !== true) {
+      for (const memberId of memberIds) queue.remove(memberId);
+      return undefined;
+    }
+    const members: TeamMember[] = [];
+    for (const memberId of memberIds) {
+      const member = theRun.members.find(item => item.memberId === memberId);
+      if (member === undefined || member.entryTools !== true) {
+        queue.remove(memberId);
+        continue;
+      }
+      members.push(member);
+    }
+    const done = new Set<string>();
+    const { advanced, dropped } = ingestRunEntries(theRun, { ...deps, done, members });
+    for (const member of members) {
+      const settled = done.has(member.memberId) ||
+        (member.startedAt !== undefined ? !entryIngestPending(member, done) : !ACTIVE_MEMBER_STATUSES.includes(member.status));
+      if (settled) queue.remove(member.memberId);
+    }
+    return { run: theRun, advanced, dropped };
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * One ingest pass: at most ENTRY_INGEST_MEMBERS members from the queue. It looks up only the runs of those members,
  * through `run`. Returns, for each run it read, what the caller must save.
@@ -134,32 +167,8 @@ export function ingestPass(
   for (const { runId, memberId } of queue.take(ENTRY_INGEST_MEMBERS)) groups.set(runId, [...(groups.get(runId) ?? []), memberId]);
   const results: { run: TeamRun; advanced: boolean; dropped: number }[] = [];
   for (const [runId, memberIds] of groups) {
-    try {
-      const theRun = run(runId);
-      if (theRun === undefined || theRun.blackboard?.tools !== true) {
-        for (const memberId of memberIds) queue.remove(memberId);
-        continue;
-      }
-      const members: TeamMember[] = [];
-      for (const memberId of memberIds) {
-        const member = theRun.members.find(item => item.memberId === memberId);
-        if (member === undefined || member.entryTools !== true) {
-          queue.remove(memberId);
-          continue;
-        }
-        members.push(member);
-      }
-      const done = new Set<string>();
-      const { advanced, dropped } = ingestRunEntries(theRun, { ...deps, done, members });
-      for (const member of members) {
-        const settled = done.has(member.memberId) ||
-          (member.startedAt !== undefined ? !entryIngestPending(member, done) : !ACTIVE_MEMBER_STATUSES.includes(member.status));
-        if (settled) queue.remove(member.memberId);
-      }
-      results.push({ run: theRun, advanced, dropped });
-    } catch {
-      // A run that fails keeps its members queued, and the pass goes on with the next run.
-    }
+    const result = ingestRunMemberEntries(queue, run(runId), memberIds, deps);
+    if (result) results.push(result);
   }
   return results;
 }

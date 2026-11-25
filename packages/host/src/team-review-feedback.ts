@@ -128,7 +128,7 @@ export class TeamReviewFeedback {
     const pending = this.host.records.get(id)?.reviewIntake?.intents.filter(intent => intent.state === "pending") ?? [];
     for (const intent of pending) {
       if (this.closed) return;
-      const done = await this.host.enqueue(() => {
+      const done = await this.host.enqueue(id, () => {
         const stored = this.current(id, intent);
         if (!stored) return true;
         if (!stored.receipts[intent.requestId]) return false;
@@ -144,7 +144,7 @@ export class TeamReviewFeedback {
       if (target && !read) continue;
       if (!read || !intentStillCurrent(intent, stored.run, read, ownerLogin, enabledAt)) {
         const moved = read && (read.baseRefName !== stored.run.delivery?.baseBranch || read.headRefName !== stored.run.pullRequest?.branch);
-        await this.host.enqueue(() => {
+        await this.host.enqueue(id, () => {
           const current = this.current(id, intent);
           if (current) this.settle(current, intent, "superseded", moved ? "GitHub shows the pull request on another base or head branch than the one this run delivered to."
             : "GitHub no longer shows this review as the owner's newest request for changes on the delivered head.");
@@ -162,7 +162,7 @@ export class TeamReviewFeedback {
     const target = pullRequestTarget(snapshot.run)!;
     const read = await this.read(snapshot, target);
     if (!read || this.closed) return;
-    const intent = await this.host.enqueue(() => {
+    const intent = await this.host.enqueue(id, () => {
       const stored = this.host.records.get(id);
       if (this.closed || !stored || !watchedRun(stored.run, stored.reviewIntake) || stored.reviewIntake?.intents.some(item => item.state === "pending")) return undefined;
       const { run } = stored, verdict = reviewVerdict(stored, read, ownerLogin, enabledAt), at = new Date(this.host.now()).toISOString();
@@ -210,7 +210,7 @@ export class TeamReviewFeedback {
       else console.warn("A review's steer did not run; it is retried at the next interval.", error instanceof Error ? error.message : "unknown error");
     }
     if (!outcome) return;
-    await this.host.enqueue(() => {
+    await this.host.enqueue(id, () => {
       const stored = this.current(id, intent);
       if (stored) this.settle(stored, intent, outcome, reason);
     });

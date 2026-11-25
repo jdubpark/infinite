@@ -702,7 +702,7 @@ test("lists, single reads, and an idle tick parse no record and read no sealed f
     const second = await launching.create(createInput({ title: "Second goal" }));
     // Each goal's first tick prepares its cycle, which parses its record once; both then hold an active run.
     launching.start();
-    await barrier(launching, first.id);
+    await Promise.all([barrier(launching, first.id), barrier(launching, second.id)]);
     launching.close();
     assert.ok(launching.get(first.id).activeTeamId && launching.get(second.id).activeTeamId);
 
@@ -714,7 +714,7 @@ test("lists, single reads, and an idle tick parse no record and read no sealed f
       goals.get(second.id);
       // An idle tick: the steer with a stale revision queues behind the tick and fails without a change.
       goals.start();
-      await barrier(goals, first.id);
+      await Promise.all([barrier(goals, first.id), barrier(goals, second.id)]);
       goals.close();
       assert.deepEqual(counted.counts, { parses: 0, sealed: 0 });
     } finally { counted.stop(); }

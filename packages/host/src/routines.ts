@@ -9,6 +9,7 @@ import { createRoutineSchema, routineActionSchema, type CreateRoutine, type Rout
 import type { GoalService } from "./goals.js";
 import { applyFuseReason } from "./fuse/rules.js";
 import type { FuseGate } from "./fuse/types.js";
+import { KeyedQueue, PendingCreates, mapConcurrent, pauseWithPendingCreates } from "./keyed-queue.js";
 import { readSignals } from "./signals/consume.js";
 import { addToPendingWake, type SignalReader } from "./signals/types.js";
 import { KEPT_PAUSED, LEFT_AS_IS, STILL_HALTED, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
@@ -17,7 +18,6 @@ type HookSet = {
   isProjectBusy(projectId: string): Promise<boolean>;
   startGoal(request: CreateGoal, admit: () => void): Promise<ProductGoal>;
 };
-/** The team runs of the given goals, so that a routine never wakes on its own delivery. */
 type RunsOfGoals = (goalIds: readonly string[]) => Iterable<string>;
 type LaunchIntent = { request: CreateGoal; createdAt: string; attempted?: boolean; wake?: RoutineWake };
 type Stored = {
@@ -26,12 +26,10 @@ type Stored = {
   authority: string;
   receipts: Record<string, string>;
   launch?: LaunchIntent;
-  /** Set when the owner's halt paused this routine. Any accepted owner action clears it. */
   ownerHalt?: { haltId: string };
 };
 const now = () => new Date().toISOString();
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
-/** Outcome settings and member traces change measurement, learning spend and what the host keeps, never a routine's work (umbrella C11), so they are removed before hashing. */
 function digestedTeams(teams: Config["teams"]): Config["teams"] {
   if (!teams || !("outcomes" in teams || "memberTraces" in teams)) return teams;
   const rest: Partial<NonNullable<Config["teams"]>> = { ...teams };
@@ -39,7 +37,6 @@ function digestedTeams(teams: Config["teams"]): Config["teams"] {
   delete rest.memberTraces;
   return rest as Config["teams"];
 }
-/** The eval block and the main check change what the host measures and tells the owner, never a routine's work (umbrella C11), so both are removed before hashing. */
 function digestedProjectTeam(team: Project["team"]): Project["team"] {
   if (!team || !("eval" in team || "mainCheck" in team)) return team;
   const rest: Partial<NonNullable<Project["team"]>> = { ...team };
@@ -54,12 +51,13 @@ const maxApprovalMs = 30 * 24 * 60 * 60 * 1000;
 const minute = 60_000;
 const defaultWakeMinGapMinutes = 5;
 
-/** Owner-approved finite schedules. Every occurrence still enters GoalService's full approval pipeline. */
 export class RoutineService {
   private readonly records = new Map<string, Stored>();
   private readonly saved = new Map<string, string>();
   private readonly directory: string;
-  private serial: Promise<unknown> = Promise.resolve();
+  private readonly queues = new KeyedQueue();
+  private readonly pendingCreates = new PendingCreates();
+  private readonly activeTicks = new Set<Promise<unknown>>();
   private timer?: NodeJS.Timeout;
   private closed = false;
   private tickQueued = false;
@@ -73,14 +71,13 @@ export class RoutineService {
       const id = file.slice(0, -7);
       const stored = unseal<Stored>(key, `routine:${id}`, readFileSync(join(this.directory, file), "utf8"));
       if (stored.routine.id !== id || stored.routine.occurrences.length > stored.routine.maxOccurrences) throw new TeamError(409, "invalid-routine-record", "A routine record cannot be authenticated.");
-      // An in-flight call may have reached GoalService before the host stopped. Replay the same idempotent request after restart.
       if (stored.launch?.attempted) stored.launch.attempted = false;
       this.records.set(id, stored); this.saved.set(id, digest(stored));
       if (stored.launch?.attempted === false) this.save(stored);
     }
   }
-  private enqueue<T>(task: () => T | Promise<T>): Promise<T> {
-    const next = this.serial.then(task); this.serial = next.catch(() => {}); return next;
+  private enqueue<T>(id: string, task: () => T | Promise<T>): Promise<T> {
+    return this.queues.enqueue(`routine:${id}`, task);
   }
   private record(id: string) {
     const stored = this.records.get(id);
@@ -118,13 +115,11 @@ export class RoutineService {
     }
     return true;
   }
-  /** The launch-rate fuse. A service without one starts every goal it would have started before. */
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
-  /** The project signal inbox. A service without one never reads signals and starts only on its schedule. */
   useSignals(reader: SignalReader, runsOfGoals: RunsOfGoals) { this.signals = { reader, runsOfGoals }; }
   create(input: CreateRoutine): Promise<Routine> {
     const request = createRoutineSchema.parse(input);
-    return this.enqueue(() => {
+    return this.pendingCreates.track(request.requestId, [request.goal.projectId], this.queues.enqueue("admission", () => {
       const fingerprint = digest(request), prior = this.records.get(request.requestId);
       if (prior) {
         if (prior.fingerprint !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different routine.");
@@ -148,14 +143,13 @@ export class RoutineService {
       };
       if (request.wakeOn) {
         routine.wakeOn = [...request.wakeOn];
-        // Signals recorded before the approval never wake the routine.
         const head = this.signals?.reader.head();
         if (head !== undefined) routine.signalCursor = head;
       }
       const stored: Stored = { routine, fingerprint, authority: this.authority(project), receipts: {} };
       this.records.set(routine.id, stored); this.save(stored);
       return this.view(stored);
-    });
+    }));
   }
   private replay(stored: Stored, action: string, body: RoutineAction) {
     const prior = stored.receipts[body.requestId];
@@ -165,7 +159,7 @@ export class RoutineService {
   }
   private action(id: string, action: "pause" | "resume" | "cancel", input: RoutineAction) {
     const body = routineActionSchema.parse(input);
-    return this.enqueue(() => {
+    return this.enqueue(id, () => {
       const stored = this.record(id), routine = stored.routine;
       if (this.replay(stored, action, body)) return this.view(stored);
       if (body.revision !== routine.revision) throw new TeamError(409, "stale-routine-revision", "The routine changed. Refresh it before sending this action.");
@@ -173,7 +167,6 @@ export class RoutineService {
       if (action === "pause" && routine.status === "paused") throw new TeamError(409, "routine-not-running", "This routine is already paused.");
       if (action === "resume") { const refusal = this.resumeRefusal(stored); if (refusal) throw refusal; }
       routine.revision++; stored.receipts[body.requestId] = digest({ action, ...body });
-      // The owner acted on the routine, so a halt release leaves it as the owner set it.
       stored.ownerHalt = undefined;
       if (action === "pause") { routine.status = "paused"; routine.reason = routine.activeGoalId ? "Future routine triggers are paused. The active goal retains its own controls and limits." : "Future routine triggers are paused."; }
       else if (action === "cancel") { routine.status = "cancelled"; routine.reason = routine.activeGoalId ? "Future routine triggers are cancelled. The active goal retains its own controls and limits." : "Future routine triggers are cancelled."; }
@@ -181,7 +174,6 @@ export class RoutineService {
       this.save(stored); return this.view(stored);
     });
   }
-  /** Why the routine cannot resume now, or undefined. The owner's resume and a halt release both apply these rules. */
   private resumeRefusal(stored: Stored): TeamError | undefined {
     const routine = stored.routine;
     if (routine.status !== "paused" && routine.status !== "blocked") return new TeamError(409, "routine-not-paused", "Only a paused or blocked routine can resume.");
@@ -193,64 +185,57 @@ export class RoutineService {
     const routine = stored.routine;
     routine.status = routine.occurrences.length ? "running" : "scheduled"; routine.reason = undefined; if (stored.launch) stored.launch.attempted = false;
   }
-  /**
-   * Host-internal: the owner's halt pauses each scheduled or running routine in scope, as the owner's pause does,
-   * without an owner request, and marks it. The active goal is paused by the goal pass that follows.
-   */
-  haltPause(mark: HaltMark, covers: HaltCovers) {
-    return this.enqueue(() => {
-      const outcomes: HaltOutcome[] = [];
-      for (const stored of this.records.values()) {
-        const routine = stored.routine, title = routine.goal.title;
-        if ((routine.status !== "scheduled" && routine.status !== "running") || !covers([routine.goal.projectId], routine.id)) continue;
-        try {
-          routine.revision++; routine.status = "paused"; routine.reason = mark.reason;
-          stored.ownerHalt = { haltId: mark.haltId };
-          this.save(stored);
-          outcomes.push({ kind: "routine", id: routine.id, title, result: "paused" });
-        } catch (error) { outcomes.push(pauseFailure("routine", routine.id, title, error)); }
-      }
-      return outcomes;
-    });
+  haltPause(mark: HaltMark, covers: HaltCovers): Promise<HaltOutcome[]> {
+    const task: Promise<HaltOutcome[]> = pauseWithPendingCreates<HaltOutcome>(this.pendingCreates, this.records, covers, id => this.enqueue(id, () => {
+      const stored = this.records.get(id);
+      if (!stored) return undefined;
+      const routine = stored.routine, title = routine.goal.title;
+      if ((routine.status !== "scheduled" && routine.status !== "running") || !covers([routine.goal.projectId], routine.id)) return undefined;
+      try {
+        routine.revision++; routine.status = "paused"; routine.reason = mark.reason;
+        stored.ownerHalt = { haltId: mark.haltId };
+        this.save(stored);
+        return { kind: "routine", id: routine.id, title, result: "paused" } satisfies HaltOutcome;
+      } catch (error) { return pauseFailure("routine", routine.id, title, error); }
+    })).finally(() => { this.activeTicks.delete(task); });
+    this.activeTicks.add(task);
+    return task;
   }
-  /** Host-internal: resumes each routine still paused under this halt's mark, with the owner's resume rules. */
-  haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean) {
-    return this.enqueue(() => {
-      const outcomes: HaltOutcome[] = [];
-      for (const stored of this.records.values()) {
-        const routine = stored.routine, base = { kind: "routine" as const, id: routine.id, title: routine.goal.title };
-        if (stored.ownerHalt?.haltId !== haltId) continue;
-        try {
-          if (routine.status !== "paused") {
-            stored.ownerHalt = undefined; this.save(stored);
-            outcomes.push({ ...base, result: "left", reason: LEFT_AS_IS }); continue;
-          }
-          if (keep) {
-            stored.ownerHalt = undefined; routine.reason = KEPT_PAUSED; this.save(stored);
-            outcomes.push({ ...base, result: "kept", reason: KEPT_PAUSED }); continue;
-          }
-          const other = heldBy([routine.goal.projectId]);
-          if (other) {
-            stored.ownerHalt = { haltId: other.haltId }; routine.reason = other.reason; this.save(stored);
-            outcomes.push({ ...base, result: "held", reason: STILL_HALTED }); continue;
-          }
-          const refusal = this.resumeRefusal(stored);
-          if (refusal) {
-            stored.ownerHalt = undefined;
-            // A changed approval policy blocks the routine with its own reason; any other refusal leaves it paused and says why.
-            if (routine.status === "paused") routine.reason = releaseRefusal(refusal.message);
-            this.save(stored);
-            outcomes.push({ ...base, result: "refused", reason: refusal.message }); continue;
-          }
-          routine.revision++;
-          this.applyResume(stored);
+  async haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean): Promise<HaltOutcome[]> {
+    const ids = [...this.records.keys()];
+    const outcomes = await Promise.all(ids.map(id => this.enqueue<HaltOutcome | undefined>(id, () => {
+      const stored = this.records.get(id);
+      if (!stored || stored.ownerHalt?.haltId !== haltId) return undefined;
+      const routine = stored.routine, base = { kind: "routine" as const, id: routine.id, title: routine.goal.title };
+      try {
+        if (routine.status !== "paused") {
+          stored.ownerHalt = undefined; this.save(stored);
+          return { ...base, result: "left", reason: LEFT_AS_IS } satisfies HaltOutcome;
+        }
+        if (keep) {
+          stored.ownerHalt = undefined; routine.reason = KEPT_PAUSED; this.save(stored);
+          return { ...base, result: "kept", reason: KEPT_PAUSED } satisfies HaltOutcome;
+        }
+        const other = heldBy([routine.goal.projectId]);
+        if (other) {
+          stored.ownerHalt = { haltId: other.haltId }; routine.reason = other.reason; this.save(stored);
+          return { ...base, result: "held", reason: STILL_HALTED } satisfies HaltOutcome;
+        }
+        const refusal = this.resumeRefusal(stored);
+        if (refusal) {
           stored.ownerHalt = undefined;
+          if (routine.status === "paused") routine.reason = releaseRefusal(refusal.message);
           this.save(stored);
-          outcomes.push({ ...base, result: "resumed" });
-        } catch (error) { outcomes.push({ ...base, result: "refused", reason: error instanceof Error ? error.message : "The routine could not resume." }); }
-      }
-      return outcomes;
-    });
+          return { ...base, result: "refused", reason: refusal.message } satisfies HaltOutcome;
+        }
+        routine.revision++;
+        this.applyResume(stored);
+        stored.ownerHalt = undefined;
+        this.save(stored);
+        return { ...base, result: "resumed" } satisfies HaltOutcome;
+      } catch (error) { return { ...base, result: "refused", reason: error instanceof Error ? error.message : "The routine could not resume." } satisfies HaltOutcome; }
+    })));
+    return outcomes.filter((item): item is HaltOutcome => item !== undefined);
   }
   pause(id: string, action: RoutineAction) { return this.action(id, "pause", action); }
   resume(id: string, action: RoutineAction) { return this.action(id, "resume", action); }
@@ -264,32 +249,32 @@ export class RoutineService {
     };
     this.timer = setInterval(tick, 1000); this.timer.unref(); tick();
   }
-  close() { this.closed = true; if (this.timer) clearInterval(this.timer); }
-  tick() { return this.enqueue(async () => {
-    for (const stored of this.records.values()) {
-      if (this.closed) return;
+  async close() {
+    this.closed = true;
+    if (this.timer) clearInterval(this.timer);
+    while (this.activeTicks.size > 0) await Promise.allSettled([...this.activeTicks]);
+    await this.queues.drain();
+  }
+  async tick() {
+    const ids = [...this.records.keys()];
+    const run = mapConcurrent(ids, 8, id => this.enqueue(id, async () => {
+      const stored = this.records.get(id);
+      if (!stored || this.closed) return;
       try { await this.step(stored); }
       catch (error) {
         if (this.closed) return;
         const reason = error instanceof TeamError ? error.message : "Routine state could not be reconciled. Review it before resuming.";
         this.block(stored, reason);
       }
-    }
-  }); }
+    })).finally(() => { this.activeTicks.delete(run); });
+    this.activeTicks.add(run);
+    await run;
+  }
   private block(stored: Stored, reason: string) {
     if (stored.routine.status !== "blocked" || stored.routine.reason !== reason) stored.routine.revision++;
     stored.routine.status = "blocked"; stored.routine.reason = reason;
     this.save(stored);
   }
-  /**
-   * Reads the inbox for a scheduled or running routine with `wakeOn`, folds new signals into its pending wake, and
-   * saves the cursor and the wake in one write. A signal about a team run of a goal this routine started is dropped.
-   *
-   * The result says how much of the inbox the pending wake now holds. `current`: every signal recorded so far.
-   * `behind`: one pass reads one page, and more signals wait. `unknown`: the inbox could not be read. Only a `current`
-   * pending wake starts an occurrence early or is used up by a launch, so the signals of one batch start one
-   * occurrence. Nothing more is stored for this: after a restart the saved cursor gives the same answer.
-   */
   private readWake(stored: Stored): "current" | "behind" | "unknown" {
     const routine = stored.routine;
     if (!this.signals || !routine.wakeOn?.length) return "current";
@@ -297,7 +282,6 @@ export class RoutineService {
     if (!read) return "unknown";
     let pending = routine.pendingWake;
     if (read.signals.length) {
-      // The goals this routine started, including one whose launch is not yet receipted (its ID is the request ID).
       const goalIds = new Set([
         ...routine.occurrences.map(value => value.goalId),
         ...(routine.activeGoalId ? [routine.activeGoalId] : []),
@@ -307,7 +291,6 @@ export class RoutineService {
       try {
         own = read.signals.some(signal => signal.runId !== undefined) ? new Set(this.signals.runsOfGoals([...goalIds])) : new Set();
       } catch {
-        // Which runs are this routine's own is unknown, so nothing is read: the next pass tries again.
         return "unknown";
       }
       pending = addToPendingWake(pending, read.signals.filter(signal => signal.runId === undefined || !own.has(signal.runId)), now());
@@ -319,12 +302,10 @@ export class RoutineService {
     this.save(stored);
     return state;
   }
-  /** Whether a pending wake may start the next occurrence now: not after a busy refusal, and not inside the gap. */
   private wakeDue(routine: Routine, current: number) {
     if (!routine.pendingWake || routine.wakeDeferred) return false;
     const last = routine.occurrences[routine.occurrences.length - 1];
     if (!last) return true;
-    // Without a recorded end the gap cannot be measured, so the routine waits for its schedule.
     if (!last.endedAt) return false;
     const gap = this.config.autonomy?.continuity?.wakeMinGapMinutes ?? defaultWakeMinGapMinutes;
     return current >= Date.parse(last.endedAt) + gap * minute;
@@ -336,7 +317,7 @@ export class RoutineService {
     }
     if (stored.launch && routine.status === "blocked") {
       if (stored.launch.attempted) await this.reconcileLaunch(stored);
-      else await this.replayLaunch(stored);
+      else await this.queues.enqueue(`project:${routine.goal.projectId}`, () => this.replayLaunch(stored));
       return;
     }
     if (terminal.has(routine.status) || routine.status === "paused" || (routine.status === "blocked" && (!stored.launch || stored.launch.attempted))) return;
@@ -370,54 +351,46 @@ export class RoutineService {
       this.block(stored, reason); return;
     }
     if (stored.launch) {
-      // Recovery always replays the same persisted request ID and payload.
-      await this.replayLaunch(stored); return;
+      await this.queues.enqueue(`project:${routine.goal.projectId}`, () => this.replayLaunch(stored));
+      return;
     }
     if (routine.occurrences.length >= routine.maxOccurrences) { routine.status = "completed"; routine.revision++; routine.reason = undefined; this.save(stored); return; }
-    // More signals wait than one pass reads. No occurrence starts until the pending wake holds them all.
     if (inbox === "behind") return;
-    // A pending wake may start the next occurrence before its time, when the inbox was read. Every gate below still applies.
     if (current < Date.parse(routine.nextRunAt) && !(inbox === "current" && this.wakeDue(routine, current))) return;
     if (current < Date.parse(routine.startsAt)) return;
     const budgetMinutes = routine.goal.maxTotalMinutes ?? routine.goal.maxMinutes;
     if (current + budgetMinutes * minute > Date.parse(routine.expiresAt)) {
       routine.status = "expired"; routine.revision++; routine.reason = "The remaining approval window cannot fit the full goal time budget."; this.save(stored); return;
     }
-    // A wait keeps the schedule: the first tick after the fuse closes starts one goal, and missed intervals coalesce.
     const fuse = applyFuseReason(routine, this.fuse?.check({ projectId: routine.goal.projectId }));
     if (fuse.changed) this.save(stored);
     if (fuse.wait) return;
-    if (await this.hooks.isProjectBusy(routine.goal.projectId)) {
-      routine.status = "scheduled"; routine.reason = "The project has active work. The routine will check again at its next interval."; routine.nextRunAt = new Date(current + routine.intervalMinutes * minute).toISOString();
-      // The busy rule wins over a wake: a pending wake waits for the next interval too.
-      if (routine.pendingWake) routine.wakeDeferred = true;
-      this.save(stored); return;
-    }
-    if (this.closed || terminal.has(routine.status)) return;
-    if (Date.now() >= Date.parse(routine.expiresAt)) {
-      routine.status = "expired"; routine.revision++; routine.reason = "The routine approval expired; no further goals will start."; this.save(stored); return;
-    }
-    if (Date.now() + budgetMinutes * minute > Date.parse(routine.expiresAt)) {
-      routine.status = "expired"; routine.revision++; routine.reason = "The remaining approval window cannot fit the full goal time budget."; this.save(stored); return;
-    }
-    if (!this.assertAuthority(stored)) return;
-    // The checks above waited. A signal recorded meanwhile belongs to this occurrence, so the inbox is read once more;
-    // nothing below waits before the launch intent is saved.
-    const latest = this.readWake(stored);
-    if (latest === "behind") return;
-    // An early start needs the whole inbox. A scheduled start does not wait for an unreadable inbox, and it leaves
-    // the pending wake alone: a wake that may be half a batch is never used up.
-    if (latest !== "current" && current < Date.parse(routine.nextRunAt)) return;
-    const pending = latest === "current" ? routine.pendingWake : undefined;
-    const request = createGoalSchema.parse({ requestId: randomUUID(), ...routine.goal });
-    // The goal template is unchanged by a wake. The signals are recorded on the occurrence, and the wake is cleared.
-    const wake = pending ? { signalIds: pending.signals.map(signal => signal.id), dropped: pending.dropped } : undefined;
-    stored.launch = { request, createdAt: now(), ...(wake ? { wake } : {}) };
-    if (pending) delete routine.pendingWake;
-    delete routine.wakeDeferred;
-    routine.status = "running"; routine.reason = undefined; routine.revision++;
-    this.save(stored); // The exact request is durable before GoalService can accept it.
-    await this.replayLaunch(stored);
+    await this.queues.enqueue(`project:${routine.goal.projectId}`, async () => {
+      if (this.closed || terminal.has(routine.status)) return;
+      if (await this.hooks.isProjectBusy(routine.goal.projectId)) {
+        routine.status = "scheduled"; routine.reason = "The project has active work. The routine will check again at its next interval."; routine.nextRunAt = new Date(Date.now() + routine.intervalMinutes * minute).toISOString();
+        if (routine.pendingWake) routine.wakeDeferred = true;
+        this.save(stored); return;
+      }
+      if (this.closed || terminal.has(routine.status)) return;
+      if (Date.now() >= Date.parse(routine.expiresAt)) {
+        routine.status = "expired"; routine.revision++; routine.reason = "The routine approval expired; no further goals will start."; this.save(stored); return;
+      }
+      if (Date.now() + budgetMinutes * minute > Date.parse(routine.expiresAt)) {
+        routine.status = "expired"; routine.revision++; routine.reason = "The remaining approval window cannot fit the full goal time budget."; this.save(stored); return;
+      }
+      if (!this.assertAuthority(stored)) return;
+      const latest = this.readWake(stored);
+      if (latest === "behind") return;
+      if (latest !== "current" && current < Date.parse(routine.nextRunAt)) return;
+      const pending = latest === "current" ? routine.pendingWake : undefined;
+      const request = createGoalSchema.parse({ requestId: randomUUID(), ...routine.goal });
+      const wake = pending ? { signalIds: pending.signals.map(signal => signal.id), dropped: pending.dropped } : undefined;
+      stored.launch = { request, createdAt: now(), ...(wake ? { wake } : {}) };
+      routine.status = "running"; routine.reason = undefined; routine.revision++;
+      this.save(stored);
+      await this.replayLaunch(stored);
+    });
   }
   private async replayLaunch(stored: Stored) {
     if (this.closed || !stored.launch) return;
@@ -447,6 +420,16 @@ export class RoutineService {
       this.recordLaunchReceipt(stored, goal);
     } catch (error) {
       if (this.closed) return;
+      if (error instanceof TeamError && (error.code === "routine-project-busy" || error.code === "routine-starting")) {
+        if (stored.routine.pendingWake || stored.launch.wake) stored.routine.wakeDeferred = true;
+        stored.launch = undefined;
+        stored.routine.status = "scheduled";
+        stored.routine.reason = "The project has active work. The routine will check again at its next interval.";
+        stored.routine.nextRunAt = new Date(Date.now() + stored.routine.intervalMinutes * minute).toISOString();
+        stored.routine.revision++;
+        this.save(stored);
+        return;
+      }
       const reason = error instanceof TeamError ? error.message : "The goal launch result is uncertain. Recovery will reuse the same request ID; no replacement goal will start.";
       this.block(stored, reason);
     }
@@ -459,6 +442,17 @@ export class RoutineService {
     stored.routine.activeGoalId = goal.id;
     if (!["paused", "cancelled", "blocked", "expired"].includes(stored.routine.status)) { stored.routine.status = "running"; stored.routine.reason = undefined; }
     stored.routine.nextRunAt = new Date(Date.parse(stored.launch.createdAt) + stored.routine.intervalMinutes * minute).toISOString();
+    if (stored.launch.wake && stored.routine.pendingWake) {
+      const consumed = new Set(stored.launch.wake.signalIds);
+      const remaining = stored.routine.pendingWake.signals.filter(signal => !consumed.has(signal.id));
+      const dropped = Math.max(0, stored.routine.pendingWake.dropped - stored.launch.wake.dropped);
+      if (remaining.length > 0 || dropped > 0) {
+        stored.routine.pendingWake = { ...stored.routine.pendingWake, signals: remaining, dropped };
+      } else {
+        delete stored.routine.pendingWake;
+      }
+    }
+    delete stored.routine.wakeDeferred;
     stored.launch = undefined; stored.routine.revision++; this.save(stored);
   }
   private async reconcileLaunch(stored: Stored) {

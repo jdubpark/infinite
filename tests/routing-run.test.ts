@@ -178,6 +178,10 @@ test("a goal cycle with owner criteria records the digest prompt version, with t
     assert.equal(settled.status, "ready-for-review", JSON.stringify(settled.events.slice(-5)));
     const run = storedRun(teams, created.id);
     assert.ok(run.goal?.record, "the run pins the record digest");
+    assert.deepEqual(run.tasks.map(task => [task.id, task.criterionRefs]), [
+      ["a", { objectiveVersion: 2, criteria: ["c0"] }],
+      ["b", { objectiveVersion: 2, criteria: ["c1"] }],
+    ], "the fake PM binds each task to its pinned version, and the b.txt criterion only to its owning task");
     // The router spy receives the objective digest flag for every first implementer start.
     assert.ok(limitedSeen.length >= 2, "the router saw both first implementer starts");
     for (const seen of limitedSeen) assert.equal(seen.objectiveDigest, true, `task ${seen.taskId}'s start carries the digest flag`);

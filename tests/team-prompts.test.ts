@@ -732,6 +732,9 @@ const PIN_RECORD = { version: 2, criteria: [
   { id: "c0", statement: "", check: "judgement:owner-text", producer: "evaluator" as const },
   { id: "c1", statement: "The billing page shows the new total.", check: "command:npm test", producer: "host" as const },
 ] };
+const GOAL_PLAN_CRITERIA_INSTRUCTIONS = `Task criterion references for this goal plan: every task, including each prerequisite, must include "criterionRefs":{"objectiveVersion":2,"criteria":["active-id"]} using one or more active IDs from the pinned objective record above. Name only criteria this cycle's work advances; other criteria may remain open. References describe your planned coverage, not evidence that a criterion is satisfied. Dependencies set task order and do not provide transitive criterion coverage.`;
+const withoutGoalPlanCriteriaInstructions = (prompt: string) => prompt.split("\n\n")
+  .filter(paragraph => !paragraph.startsWith("Task criterion references for this goal plan:")).join("\n\n");
 
 test("the record digest replaces the success text and nothing else", () => {
   const { successCriteria, ...goalWithoutText } = PIN_GOAL;
@@ -745,7 +748,12 @@ test("the record digest replaces the success text and nothing else", () => {
       const base = teamPrompt(without, role, undefined, undefined, provider, ENTRY_PROFILE, { checks: PIN_CHECKS }, [], true);
       const next = teamPrompt(withRecord, role, undefined, undefined, provider, ENTRY_PROFILE, { checks: PIN_CHECKS }, [], true);
       assert.equal(base.split(oldSection).length, 2, `${role} ${provider}: the goal section appears once without a record`);
-      assert.equal(next, base.replace(oldSection, newSection), `${role} ${provider}: only the goal section changes`);
+      assert.equal(base.includes("Task criterion references for this goal plan:"), false, `${role} ${provider}: no mapping without a record`);
+      const planInstruction = role === "project-manager";
+      assert.equal(next.includes("Task criterion references for this goal plan:"), planInstruction, `${role} ${provider}: only a planner with a record gets mapping instructions`);
+      if (planInstruction) assert.equal(next.split(GOAL_PLAN_CRITERIA_INSTRUCTIONS).length, 2, `${role} ${provider}: the exact pinned mapping contract appears once`);
+      assert.equal(withoutGoalPlanCriteriaInstructions(next), base.replace(oldSection, newSection),
+        `${role} ${provider}: all bytes outside the goal record and PM mapping instruction stay unchanged`);
       assert.equal(next.split(successCriteria).length, 2, `${role} ${provider}: c0's text appears once`);
     }
   }

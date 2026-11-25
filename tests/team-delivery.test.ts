@@ -3,21 +3,16 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { fixture, git, limitLineup } from "./team-fixture.js";
+import { fixture, git, independentDeliveryLineup, limitLineup } from "./team-fixture.js";
 import { waitFor } from "./helpers.js";
 import { TeamError } from "../packages/host/src/teams.js";
-import { teamDeliveryReconcileSchema, type TeamDeliveryReconcile, type TeamLineup, type TeamReport } from "../packages/host/src/team-types.js";
+import { teamDeliveryReconcileSchema, type TeamDeliveryReconcile, type TeamReport } from "../packages/host/src/team-types.js";
 import { unseal } from "../packages/host/src/vault.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import { teamPrompt } from "../packages/host/src/team-prompts.js";
 import type { EvidenceStore } from "../packages/host/src/evidence/store.js";
 import type { RunEvent } from "../packages/host/src/evidence/types.js";
 import { type DeliveryStored, deliveryInternals, deliveryRecord } from "./fixtures/team-delivery-record.js";
-
-const independentDeliveryLineup: TeamLineup = {
-  ...structuredClone(limitLineup),
-  reviewer: { id: "muse-reviewer", label: "Muse reviewer", provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant: "high", tier: "strong" },
-};
 
 async function blockedDeliveryRecord() {
   const h = await deliveryRecord("merge", undefined, undefined, { reviewLineage: true });

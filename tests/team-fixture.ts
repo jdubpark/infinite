@@ -41,6 +41,11 @@ export const limitLineup: TeamLineup = {
   ],
 };
 
+export const independentDeliveryLineup: TeamLineup = {
+  ...structuredClone(limitLineup),
+  reviewer: { id: "muse-reviewer", label: "Muse reviewer", provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant: "high", tier: "strong" },
+};
+
 /** `trustWorkspaces` also gives the host its own HOME, where a Claude member's trust is recorded. */
 export async function fixture(scenario = "success", lineup?: TeamLineup, config: Partial<Config> = {}, options: { trustWorkspaces?: boolean; env?: NodeJS.ProcessEnv; parallelism?: number; deliveryMode?: "merge" | "pr"; noServer?: boolean } = {}) {
   const root = realpathSync(mkdtempSync("/tmp/inf-team-"));

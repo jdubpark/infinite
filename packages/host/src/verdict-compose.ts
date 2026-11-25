@@ -197,7 +197,7 @@ export function composeVerdict(input: ComposeInput): ComposedVerdict {
   return verdict;
 }
 
-type Meta = { verdictId: string; kind: "reviewed" | "no-change"; revision: number; head: string; at: string; supersedes?: string };
+type Meta = { verdictId: string; kind: "reviewed" | "no-change"; revision: number; head: string; at: string; supersedes?: readonly string[] };
 
 /** `latest` on every active criterion and the log entries, sealed at one version with sealRecord; "log-full" when the entries
  *  would pass 300 log entries or 160 KiB. Never writes a note. */
@@ -210,7 +210,8 @@ export function verdictRecord(record: ObjectiveRecord, verdict: ComposedVerdict,
   for (const item of verdict.criteria) {
     const current = record.criteria.find(candidate => candidate.id === item.id);
     if (current === undefined || !activeIds.has(item.id)) continue;
-    if (meta.supersedes !== undefined && current.latest?.verdictId !== meta.supersedes) continue;
+    // A superseding verdict replaces only what one of the superseded ids wrote: a newer verdict of another run stays.
+    if (meta.supersedes !== undefined && (current.latest === undefined || !meta.supersedes.includes(current.latest.verdictId))) continue;
     before[item.id] = current.latest === undefined ? null : { state: current.latest.state, verdictId: current.latest.verdictId };
     after[item.id] = { state: item.state, verdictId: meta.verdictId };
   }
@@ -223,6 +224,7 @@ export function verdictRecord(record: ObjectiveRecord, verdict: ComposedVerdict,
   }];
   for (const item of verdict.criteria) {
     if (item.contradicted !== true || (item.state !== "met" && item.state !== "not-met")) continue;
+    if (meta.supersedes !== undefined && after[item.id] === undefined) continue;
     if (item.evaluatorState !== "met" && item.evaluatorState !== "not-met") continue;
     const value: { evaluator: "met" | "not-met"; receipt: "met" | "not-met"; handle?: string } = { evaluator: item.evaluatorState, receipt: item.state };
     if (item.receipt !== undefined) value.handle = item.receipt.handle;

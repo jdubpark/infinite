@@ -64,6 +64,8 @@ export type VerdictState = {
   report?: VerdictReport; composed?: ComposedVerdict; reason?: VerdictReason;
   /** The ledger's delivery fact at the newest verdict. It only moves forward: landed, then reverted. */
   delivery?: "landed" | "reverted";
+  /** The ids of this state's earlier verdicts, oldest first. A late verdict replaces in the record what any of them wrote. */
+  earlier?: string[];
   written?: "wrote" | "log-full" | "record-unavailable" | "write-failed";
 };
 
@@ -116,6 +118,8 @@ export type VerdictDetail = {
 /** A verdict waits this long in `testing` for a register pass; then it goes on with the receipts that exist. */
 export const VERDICT_TESTING_WAIT_MS = 300_000;
 const DELIVERY_ORDER: readonly DeliveryFact[] = ["none", "landed", "reverted"];
+/** The criteria the state's newest composed verdict held. */
+const heldIds = (state: VerdictState): Set<string> => new Set(state.composed?.criteria.map(item => item.id));
 const STOPPED: readonly TeamRun["status"][] = ["paused", "cancelled", "blocked"];
 const EVENT_PROVIDERS: readonly Provider[] = ["claude", "codex", "opencode"];
 
@@ -200,16 +204,18 @@ export class TeamVerdicts {
       if (state.delivery === undefined && !state.composed?.criteria.some(item => item.reason === "before-delivery")) return false;
       const fact = this.host.delivery(run.id, state.head, state.since);
       if (fact === undefined || fact === "none" || fact === state.delivery) return false;
-      const kinds = this.readyRecord(holder)?.criteria.filter(item => item.state === "active").map(deliveryReceiptOf);
+      const held = heldIds(state);
+      const kinds = this.readyRecord(holder)?.criteria.filter(item => item.state === "active" && held.has(item.id)).map(deliveryReceiptOf);
       if (!kinds?.some(kind => kind !== undefined)) return false;
       const wanted = fact === "reverted" && !kinds.includes("landed") ? "landed" : fact;
       if (DELIVERY_ORDER.indexOf(wanted) <= DELIVERY_ORDER.indexOf(state.delivery ?? "none")) return false;
       state.delivery = wanted;
+      state.earlier = [...(state.earlier ?? []), state.verdictId];
       state.verdictId = this.host.uuid();
       this.host.save(holder);
     } else if (!this.readyRecord(holder)) return false;
     // With another id than the assessment's, a restart came between the two saves: the id and the fact are saved, the assessment is not.
-    this.finish(holder, state, state.reason === undefined ? state.report : undefined, state.reason, assessment.verdictId);
+    this.finish(holder, state, state.reason === undefined ? state.report : undefined, state.reason);
     return true;
   }
 
@@ -499,11 +505,14 @@ export class TeamVerdicts {
 
   /**
    * Composes, writes the record (once), sets the assessment, emits the row, adds the fixed events, and saves. `report` is the
-   * evaluator's answer; without it `reason` says why. A no-change verdict goes to `releasing`, every other to `done`.
+   * evaluator's answer; without it `reason` says why. A no-change verdict goes to `releasing`, every other to `done`. A late
+   * verdict (the state has earlier ids) judges the criteria its earlier verdict held, as the record states them now.
    */
-  private finish(holder: VerdictHolder, state: VerdictState, report?: VerdictReport, reason?: VerdictReason, supersedes?: string): void {
+  private finish(holder: VerdictHolder, state: VerdictState, report?: VerdictReport, reason?: VerdictReason): void {
     const run = holder.run;
     const record = this.readyRecord(holder);
+    const supersedes = state.earlier;
+    const held = supersedes === undefined ? undefined : heldIds(state);
     let composed: ComposedVerdict;
     let written: VerdictState["written"];
     let version = 0;
@@ -512,7 +521,7 @@ export class TeamVerdicts {
       written = "record-unavailable";
     } else {
       composed = composeVerdict({
-        record, head: state.head, kind: state.kind, configured: this.host.configured(run), receipts: this.receiptsOf(state),
+        record: held === undefined ? record : { ...record, criteria: record.criteria.filter(item => held.has(item.id)) }, head: state.head, kind: state.kind, configured: this.host.configured(run), receipts: this.receiptsOf(state),
         facts: this.factsOf(holder, state), changedPaths: this.changeListOf(holder, state),
         ...(report === undefined ? {} : { report: this.judgedOnly(state, record, report) }), ...(reason === undefined ? {} : { reason }),
       });
@@ -549,7 +558,7 @@ export class TeamVerdicts {
   }
 
   /** Writes the verdict's entries once: an entry with this verdict's handle means a crash came between the write and the save. */
-  private writeRecord(holder: VerdictHolder, state: VerdictState, record: ObjectiveRecord, composed: ComposedVerdict, supersedes?: string): { written: "wrote" | "log-full" | "write-failed"; version: number } {
+  private writeRecord(holder: VerdictHolder, state: VerdictState, record: ObjectiveRecord, composed: ComposedVerdict, supersedes?: readonly string[]): { written: "wrote" | "log-full" | "write-failed"; version: number } {
     const handle = `verdict:${state.verdictId}`;
     const existing = record.log.find(entry => entry.op === VERDICT_OPS.recorded && entry.handle === handle);
     if (existing) return { written: "wrote", version: existing.version };

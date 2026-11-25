@@ -62,7 +62,7 @@ test("an ended run with a running member writes its event once and leaves the go
     const passFive = readFileSync(file);
     assert.equal(eventCount(record()), 1, "The ended run writes its event once");
     assert.equal(JSON.stringify(goals.get(f.goal.id)).includes("endedAs"), false, "The client read of the goal carries no scheduler marker");
-    assert.deepEqual(passFive, passTwo, "The goal file bytes do not change while nothing changes");
+    assert.ok(passFive.equals(passTwo), "The goal file bytes do not change while nothing changes");
 
     goals.close();
     goals = new GoalService(f.config, f.key, teams);
@@ -70,7 +70,7 @@ test("an ended run with a running member writes its event once and leaves the go
     await sleep(1200);
     const afterRestart = readFileSync(file);
     await sleep(1200);
-    assert.deepEqual(readFileSync(file), afterRestart, "A restart does not rewrite the goal file while nothing changes");
+    assert.ok(readFileSync(file).equals(afterRestart), "A restart does not rewrite the goal file while nothing changes");
     assert.equal(eventCount(record()), 1, "A restart does not repeat the event");
 
     memberStatus = "stopped";

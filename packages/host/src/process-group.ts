@@ -1,5 +1,6 @@
 import type { ChildProcess } from "node:child_process";
-import type { Socket } from "node:net";
+import { Socket } from "node:net";
+import type { Readable } from "node:stream";
 import { EXIT_DRAIN_MS } from "./team-workspace.js";
 
 const DRAIN_TURNS = 3;
@@ -22,20 +23,26 @@ export function signalGroup(child: ChildProcess, signal: NodeJS.Signals): GroupS
   return "sent";
 }
 
+const isSocket = (stream: Readable | null): stream is Socket => stream instanceof Socket;
+
 export function watchLeader(child: ChildProcess): LeaderWatch {
   const watch = { leftover: false };
-  const outputs = [child.stdout, child.stderr].filter(stream => stream !== null) as Socket[];
+  const outputs = [child.stdout, child.stderr].filter(isSocket);
   const held = () => outputs.filter(stream => !stream.readableEnded && !stream.destroyed);
+  const paused = (open: Socket[]) => open.some(stream => stream.readableFlowing === false);
   const read = () => outputs.reduce((total, stream) => total + stream.bytesRead, 0);
   let timer: NodeJS.Timeout | undefined;
   const drain = () => {
-    timer = setTimeout(() => setImmediate(decide, 1, read()), EXIT_DRAIN_MS);
+    timer = setTimeout(() => {
+      if (paused(held())) drain();
+      else setImmediate(decide, 1, read());
+    }, EXIT_DRAIN_MS);
     timer.unref();
   };
   const decide = (turn: number, seen: number) => {
     const open = held();
     if (!open.length) return;
-    if (open.some(stream => stream.readableFlowing === false)) {
+    if (paused(open)) {
       drain();
       return;
     }
@@ -51,18 +58,3 @@ export function watchLeader(child: ChildProcess): LeaderWatch {
   child.once("close", () => clearTimeout(timer));
   return watch;
 }
-
-export const GROUP_SUPERVISOR = `
-  const {spawn}=require('node:child_process');
-  const child=spawn(process.argv[1],process.argv.slice(2),{detached:true,stdio:['ignore','pipe','pipe']});
-  let stopping=false;
-  const kill=signal=>{if(child.pid&&child.exitCode===null&&child.signalCode===null)try{process.kill(-child.pid,signal)}catch{}};
-  const stop=()=>{if(stopping)return;stopping=true;kill('SIGTERM');setTimeout(()=>{kill('SIGKILL');process.exit(1)},2000)};
-  process.on('exit',()=>kill('SIGKILL'));
-  process.stdout.on('error',stop);process.stderr.on('error',stop);
-  child.stdout.pipe(process.stdout);child.stderr.pipe(process.stderr);
-  process.stdin.resume();process.stdin.on('end',stop);process.stdin.on('error',stop);
-  for(const signal of ['SIGINT','SIGTERM','SIGHUP'])process.on(signal,stop);
-  child.on('error',()=>process.exit(1));
-  child.on('exit',code=>process.exit(code??1));
-`;

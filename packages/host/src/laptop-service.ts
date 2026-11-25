@@ -11,7 +11,7 @@ import { forwardExecutor, type ExecutorControl } from "./executor-tunnel.js";
 import { captureWorkspace, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, readWorkspaceBlob, validateWorkspaceManifest, type WorkspaceManifest } from "./workspace-checkpoint.js";
 import { shouldCaptureWorkspace, watchWorkspaceChanges } from "./workspace-changes.js";
 import { transferWorkspaceBlobs } from "./workspace-transfer.js";
-import { GROUP_SUPERVISOR } from "./process-group.js";
+import { GROUP_SUPERVISOR } from "./group-supervisor.js";
 
 interface LaptopServiceOptions {
   origin: string;

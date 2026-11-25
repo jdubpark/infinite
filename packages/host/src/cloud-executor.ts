@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { clearEgressEnvironment } from "./egress.js";
-import { GROUP_SUPERVISOR } from "./process-group.js";
+import { GROUP_SUPERVISOR } from "./group-supervisor.js";
 
 const STARTUP_TIMEOUT = 15000;
 const STARTUP_ERROR = "The cloud executor did not become ready. No command was replayed.";

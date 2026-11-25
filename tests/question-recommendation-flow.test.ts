@@ -24,7 +24,6 @@ test("a retry envelope is read in its recorded form but cannot skip the recommen
 });
 
 test("a question still reaches a worker started before recommendations, without its recommendation", async () => {
-  // That worker holds the older strict schema in memory and answers 400 to the field it does not know.
   const seen: { requestId: string; report: Record<string, unknown> }[] = [];
   const worker = createServer((request, response) => {
     let body = "";
@@ -55,7 +54,6 @@ test("a subteam's recommendation reaches the coordinator, whose forwarded questi
     const dispatched = await until(() => h.get(id), mission => Boolean(mission.subtasks[0]?.teamId));
     const decisionId = randomUUID(), olderId = randomUUID(), options = ["JSON", "Text", "CSV"], question = "Which formats should the export offer?";
     const member = { answers: ["JSON", "CSV"], reason: "Both clients already parse them." }, at = new Date().toISOString();
-    // The second decision comes from a member started before recommendations were required, and takes one option.
     h.set(dispatched.subtasks[0].teamId!, { status: "needs-input", decisions: [
       { id: decisionId, memberId: randomUUID(), revision: 1, question, options, answerMode: "multiple", recommendation: member, createdAt: at },
       { id: olderId, memberId: randomUUID(), revision: 1, question: "Which format is the default?", options, createdAt: at }] });
@@ -66,7 +64,6 @@ test("a subteam's recommendation reaches the coordinator, whose forwarded questi
     const delivered = h.stored(id).attempts[1].consumedInbox.find(message => message.type === "child-decision");
     assert.deepEqual(delivered?.type === "child-decision" && delivered.recommendation, member, "The inbox message carries the answers and the reason");
 
-    // A forwarded question that names no mode takes the subteam decision's: one option for a single choice, several for a multiple one.
     const own = { answers: ["JSON", "CSV"], reason: "Every mission client reads one of them." };
     await h.report(2, { kind: "question", question: "Which format is the default?", options, subtaskId: "api-work", childDecisionId: olderId, recommendation: own });
     assert.ok((await h.messages(3)).some((message: { type: string; reason?: string }) => message.type === "refused" && /Recommend exactly one option/.test(message.reason ?? "")));

@@ -110,36 +110,29 @@ test("same-id append is idempotent only for identical content", () => withJourna
 test("decisions that answered one raised request count as one repeat, and a decision with no request digest counts alone", () => withJournal(journal => {
   const at = (minute: number) => `2026-11-14T10:${String(minute).padStart(2, "0")}:00.000Z`;
   journal.appendDecision(effectReject("original", { requestDigest: "request-a" }));
-  // The request that got the reject, decided again: no repeat of its own reject.
   journal.appendDecision(effectReject("original-again", { repeats: "original", requestDigest: "request-a", at: at(1) }));
   assert.equal(journal.repeatCount("assignment-1", "original"), 0);
-  // One other request, decided three times: one repeat.
   for (const [index, id] of ["b-1", "b-2", "b-3"].entries()) {
     journal.appendDecision(effectReject(id, { repeats: "original", requestDigest: "request-b", at: at(2 + index) }));
   }
   assert.equal(journal.repeatCount("assignment-1", "original"), 1);
   assert.equal(journal.isLocked("assignment-1"), false);
-  // A record of an earlier release has no digest. It counts as before, each on its own.
   journal.appendDecision(effectReject("old-1", { repeats: "original", at: at(5) }));
   assert.equal(journal.repeatCount("assignment-1", "original"), 2);
   assert.equal(journal.isLocked("assignment-1"), true);
   journal.appendDecision(effectReject("old-2", { repeats: "original", at: at(6) }));
   assert.equal(journal.repeatCount("assignment-1", "original"), 3);
 
-  // After an unlock a request counted before it does not count again; a new request does.
   journal.unlock({ assignment: "assignment-1", at: at(7), by: "owner" });
   journal.appendDecision(effectReject("b-4", { repeats: "original", requestDigest: "request-b", at: at(8) }));
   assert.equal(journal.repeatCount("assignment-1", "original"), 0);
   journal.appendDecision(effectReject("c-1", { repeats: "original", requestDigest: "request-c", at: at(9) }));
   journal.appendDecision(effectReject("c-2", { repeats: "original", requestDigest: "request-c", at: at(10) }));
   assert.equal(journal.repeatCount("assignment-1", "original"), 1);
-  // The digest is no column and no part of what a lookup returns.
   assert.equal("requestDigest" in journal.decision("c-1")!, false);
-  // It is part of the content that an ID stands for.
   assert.throws(() => journal.appendDecision(effectReject("c-2", { repeats: "original", requestDigest: "request-d", at: at(10) })), /different content/);
   assert.throws(() => journal.appendDecision(effectReject("bad", { requestDigest: "" })), TypeError);
 
-  // A reject of an earlier release has no digest, so its own request, decided again, still counts against it.
   journal.appendDecision(effectReject("old-original", { assignment: "assignment-2", at: at(11) }));
   journal.appendDecision(effectReject("old-original-again", { assignment: "assignment-2", repeats: "old-original", requestDigest: "request-e", at: at(12) }));
   assert.equal(journal.repeatCount("assignment-2", "old-original"), 1);
@@ -568,7 +561,6 @@ test("the owner log returns exactly the decisions each filter names, in pages th
   journal.appendDecision(decision({ id: "w1-owner-raised", at: at(2), verdict: "owner", interruptClass: "money", rules: ["class:money", "raise:payment"] }));
   journal.appendDecision(decision({ id: "w2-reject", at: at(3), workspaceId: "workspace-2", taskId: "task-2", verdict: "reject", code: "uncertain" }));
   journal.appendDecision(decision({ id: "w2-allow-raised", at: at(4), workspaceId: "workspace-2", taskId: "task-3", rules: ["raise:outside-root"] }));
-  // An equal timestamp: the journal's own order puts the later record first.
   journal.appendDecision(decision({ id: "w1-allow-tie", at: at(4), taskId: "task-4" }));
   const ids = (query: Parameters<PermissionJournal["log"]>[0]) => journal.log(query).entries.map(entry => entry.id);
 
@@ -709,15 +701,11 @@ test("a session is flagged above three times its workspace's median session-hour
       }));
     }
   };
-  // workspace-1 session-hours: 4, 6 and 10, so the median is 6 and the floor of 20 sets the threshold.
   burst("base-a", "workspace-1", 4, "2026-11-13T09:00:00.000Z");
   burst("base-b", "workspace-1", 6, "2026-11-13T10:00:00.000Z");
   burst("base-c", "workspace-1", 10, "2026-11-12T10:00:00.000Z");
-  // Eight days back is outside the baseline. Counted, these hours would lift the median to 25.
   for (const hour of ["06", "07", "08"]) burst("old", "workspace-1", 40, `2026-11-06T${hour}:10:00.000Z`);
-  // workspace-2 session-hours: three of 10, so three times the median, 30, is the threshold.
   for (const hour of ["06", "07", "08"]) burst("busy-base", "workspace-2", 10, `2026-11-13T${hour}:00:00.000Z`);
-  // The last hour.
   burst("fast", "workspace-1", 21, "2026-11-14T11:30:00.000Z");
   burst("at-floor", "workspace-1", 20, "2026-11-14T11:20:00.000Z");
   burst("busy-normal", "workspace-2", 25, "2026-11-14T11:10:00.000Z");
@@ -731,7 +719,6 @@ test("a session is flagged above three times its workspace's median session-hour
   assert.deepEqual(journal.rateFlags({ now: "2026-11-14T14:00:00.000Z" }), [], "the flag looks at the last hour only");
 }));
 
-/** The journal schema as hosts before owner marks created it. Frozen here on purpose: it is what is on disk. */
 const journalVersion1: EvidenceModule = {
   name: "permission-journal",
   version: 1,

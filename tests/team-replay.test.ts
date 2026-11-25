@@ -20,7 +20,6 @@ const features: EvalFeatures = { role: "implementer", area: "docs", kind: null, 
 const capsule = (objective: string, ownerAnswers: Capsule["ownerAnswers"] = []): Capsule => ({ objective, steering: ["Keep the change small."], ownerAnswers,
   task: { id: "a", title: "Write a.txt", instructions: "Write a.txt with the reviewed content.", paths: ["a.txt"] } });
 
-/** A real service over a fixture project, with the eval identity configured as the same-user launcher and the fake member. */
 async function replayFixture(options: { capture?: CaptureSink } = {}) {
   const f = await fixture("success", undefined, {}, { trustWorkspaces: true });
   const evalRoot = join(f.host.root, "eval");
@@ -39,7 +38,6 @@ async function replayFixture(options: { capture?: CaptureSink } = {}) {
   const outbox = { flush(items: unknown[]) { events.push(...items); return { stored: true }; }, advance() { return { pending: false, blocked: [] }; } } as unknown as EventOutbox;
   let manager: Manager | undefined;
   const service = await f.openTeamService({ events: outbox, ...(options.capture ? { capture: options.capture } : {}), manager: m => { manager = m; } });
-  /** Creates a trial whose workspace is a clone of the fixture project at its base commit, and whose member runs `mode`. */
   const start = async (mode: string, objective = "Write a.txt for the replay trial.", ownerAnswers: Capsule["ownerAnswers"] = []) => {
     const trialId = randomUUID(), work = join(evalRoot, "trials", trialId, "work");
     mkdirSync(join(evalRoot, "trials", trialId), { recursive: true, mode: 0o700 });
@@ -74,7 +72,6 @@ test("a replay run is seeded and starts one implementer", { timeout: 120000 }, a
     assert.deepEqual(forRun.find(item => item.kind === "task.planned")?.data.features, features);
     assert.equal(forRun.find(item => item.kind === "member.started")?.data.purpose, "replay");
     assert.equal(forRun.find(item => item.kind === "member.configured")?.data.shape, "trial");
-    // The member's session purpose and its prompt: the context file of the trial's workspace holds the capsule's objective.
     assert.match(readFileSync(join(work, ".git", "infinite-team-context.json"), "utf8"), /Write a\.txt for the replay trial\./);
     assert.equal((await context.getManager().list()).some(row => row.purpose === "replay"), true);
   } finally {
@@ -85,7 +82,6 @@ test("a replay run is seeded and starts one implementer", { timeout: 120000 }, a
 test("a replay run whose capsule holds an owner answer runs its member", { timeout: 120000 }, async () => {
   const context = await replayFixture();
   try {
-    // The capsule's answers are seeded as answered decisions of no member. They are context for the prompt, not a member to replace.
     const { trialId, work } = await context.start("reference", "Write a.txt for the replay trial.", [{ question: "Which style?", answer: "Compact" }]);
     const state = await context.ended(trialId);
     assert.equal(state?.ending, "settled");
@@ -110,7 +106,6 @@ test("a replay run reaches no client", { timeout: 120000 }, async () => {
     assert.ok(purposes.includes("replay"), `the member's session carries the replay purpose, saw ${JSON.stringify(purposes)}`);
     await assert.rejects(async () => context.service.get(trialId), error => (error as { status?: number; code?: string }).code === "team-not-found");
     assert.throws(() => context.service.objectiveRecord(trialId), error => (error as { code?: string }).code === "team-not-found");
-    // The owner's routes by id answer as for a run that does not exist, so none can pull the record from under the trial.
     const missing = (error: unknown) => (error as { code?: string }).code === "team-not-found";
     await assert.rejects(async () => context.service.removeRun(trialId), missing, "delete");
     await assert.rejects(async () => context.service.bundle(trialId), missing, "bundle");
@@ -126,7 +121,6 @@ test("a replay run reaches no client", { timeout: 120000 }, async () => {
 
 test("every member ending ends the trial with its name", { timeout: 120000 }, async () => {
   const context = await replayFixture();
-  // A stall is a quiet member: the owner's window is at least five minutes, so the test shortens it on the live config.
   context.f.host.config.teams!.stallMinutes = 0.05;
   try {
     const expected: Array<[string, string]> = [["question", "question"], ["blocked", "blocked"], ["escalate", "escalated"],
@@ -146,10 +140,8 @@ test("every member ending ends the trial with its name", { timeout: 120000 }, as
     const settled = await context.ended(reference.trialId);
     assert.equal(settled?.ending, "settled");
     assert.match(settled?.resultCommit ?? "", /^[0-9a-f]{40}$/, "a reference result settles with its commit");
-    // The trial member gets no host scratch directory: it works in the trial workspace alone.
     const memberContext = JSON.parse(readFileSync(join(reference.work, ".git", "infinite-team-context.json"), "utf8")) as Record<string, unknown>;
     assert.equal(memberContext.scratchDirectory, undefined, "no scratch directory is assigned to a trial member");
-    // A cancelled trial is not retired by the retention sweep: only forgetReplay removes it, even when retention is due at once.
     context.f.host.config.teams!.retention = { ...DEFAULT_TEAM_RETENTION, cancelledMinutes: 0 };
     const kept = await context.start("question");
     assert.equal((await context.ended(kept.trialId))?.ending, "question");
@@ -164,7 +156,6 @@ test("every member ending ends the trial with its name", { timeout: 120000 }, as
 test("a trials root that another account can write starts no member", { timeout: 120000 }, async () => {
   const context = await replayFixture();
   try {
-    // The eval account owns the trials root, so the check is on its mode, not its owner: group-writable is refused.
     chmodSync(join(context.evalRoot, "trials"), 0o770);
     const { trialId } = await context.start("reference");
     const state = await context.ended(trialId);
@@ -186,12 +177,10 @@ test("a stopped replay run ignores late completions", { timeout: 120000 }, async
     await context.service.endReplay(trialId, "void-owner");
     const state = await context.ended(trialId);
     assert.equal(state?.ending, "void-owner");
-    // Give a result operation that was already running time to finish; nothing may change.
     await new Promise(resolve => setTimeout(resolve, 3000));
     const after = await context.service.replayState(trialId);
     assert.equal(after?.ending, "void-owner");
     assert.equal(after?.resultCommit, undefined);
-    // The first ending stands: a later ending call changes nothing.
     await context.service.endReplay(trialId, "void-host");
     assert.equal((await context.service.replayState(trialId))?.ending, "void-owner", "a second ending does not replace the first");
     assert.equal(context.events.some(item => (item as { runId: string; kind: string }).runId === trialId && (item as { kind: string }).kind === "task.integrated"), false);
@@ -203,7 +192,6 @@ test("a stopped replay run ignores late completions", { timeout: 120000 }, async
 test("replay commands run as the eval identity", { timeout: 120000 }, async () => {
   const context = await replayFixture();
   try {
-    // A setup command, so the read-only check that follows it runs too.
     context.f.host.config.projects.find(project => project.id === "rehearsal")!.team!.setup = { command: process.execPath, args: ["-e", ""] };
     const { trialId } = await context.start("reference");
     await context.ended(trialId);
@@ -211,7 +199,6 @@ test("replay commands run as the eval identity", { timeout: 120000 }, async () =
     assert.ok(commands.length > 0, "the eval launcher ran the run's commands");
     for (const command of commands) assert.ok(command.argv.includes("exec") || command.argv.includes("setup"), command.argv.join(" "));
     assert.ok(commands.some(command => command.argv[0] === "setup"), "the setup command ran through the eval launcher");
-    // Every command that the team prefix would have recorded is absent: the fixture writes those to commands.jsonl.
     const teamCommands = join(context.f.receipts, "commands.jsonl");
     assert.equal(existsSync(teamCommands) ? readFileSync(teamCommands, "utf8").includes(trialId) : false, false);
     const removed = await waitFor(() => context.service.forgetReplay(trialId), value => value === true, 90000);
@@ -227,7 +214,6 @@ test("a replay run never acts on the world outside its workspace", { timeout: 12
   const capture = { enabled: () => true, integrated: (start: unknown) => { integrated.push(start); }, approved: () => {} } as unknown as CaptureSink;
   const context = await replayFixture({ capture });
   try {
-    // A project that follows a GitHub repository, so a run that were treated as an ordinary team would publish, save, and take a grant.
     context.f.host.config.projects.find(project => project.id === "rehearsal")!.source = { mode: "github", repository: "example/app", baseBranch: "main" };
     const manager = context.getManager() as unknown as { createTeamSession: (...args: unknown[]) => Promise<unknown> };
     const original = manager.createTeamSession.bind(manager);
@@ -236,7 +222,6 @@ test("a replay run never acts on the world outside its workspace", { timeout: 12
     const { trialId } = await context.start("reference");
     const state = await context.ended(trialId);
     assert.equal(state?.ending, "settled");
-    // Give the scheduler its next passes, which is when an ordinary run's integrated head would be pushed.
     await new Promise(resolve => setTimeout(resolve, 3000));
     assert.ok(launches.length > 0, "the member was launched");
     for (const launch of launches) assert.equal(launch[7], undefined, "a replay member gets no GitHub grant scope");
@@ -250,7 +235,6 @@ test("a replay run never acts on the world outside its workspace", { timeout: 12
   }
 });
 
-/** Installs a permission agent that serves every project and leaves each dialog to the owner. Returns the targets it was handed. */
 function leavingAgent(context: Awaited<ReturnType<typeof replayFixture>>): unknown[] {
   const handled: unknown[] = [];
   context.service.usePermissionAgent({

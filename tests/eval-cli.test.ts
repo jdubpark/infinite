@@ -67,7 +67,6 @@ test("status prints the eval identity and trials", () => {
   assert.ok(version1.includes("grader ready (version 1: no trials)"));
   assert.ok(!version1.includes("grader ready"));
 
-  // A grader that is not ready says its own state, whatever version it reports.
   const busy = evalStatusLines({ ...withTrials, grader: { state: "busy", version: 1 } as unknown as EvalSummary["grader"] });
   assert.ok(busy.includes("grader busy"));
   assert.ok(!busy.some(line => line.includes("version 1: no trials")));
@@ -87,7 +86,6 @@ test("job prints baseline counts", () => {
   ]);
   const unknown = evalJobLines({ ...baseline, trials: { ...baseline.trials, void: null as unknown as number } });
   assert.equal(unknown[1], "tasks 4 of 5 (skipped 1) · trials started 6 of 15, graded 5, resolved 4, ended 5, void unknown");
-  // A validate view keeps its two lines.
   assert.deepEqual(evalJobLines(job), [`job ${JOB_ID} running · waiting grader`, "visited 0, valid 0, rejected 0, retired 0, undecided 0"]);
 });
 
@@ -111,7 +109,6 @@ test("run sends the file and the request id", async () => {
     await refused({ "--file": good }, "a missing request id", /Usage: infinite eval run/);
     await refused({ "--file": good, "--request-id": "not-a-uuid" }, "an invalid request id", /Usage: infinite eval run/);
 
-    // Valid JSON, so only the size limit can refuse it.
     const large = join(dir, "large.json");
     writeFileSync(large, JSON.stringify({ kind: "validate", pad: "x".repeat(65 * 1024) }));
     await refused({ "--file": large, "--request-id": REQUEST_ID }, "a 65 KiB file", /larger than 64 KiB/);
@@ -167,7 +164,6 @@ test("the report prints its figures", async () => {
   assert.equal(lines[4], "1 vs 0: +0.194 [+0.056, +0.333] · sign 7-1-4, p 0.0703 (Holm 0.0703) · detectable 0.214 (planning 0.283 to 0.332)");
   assert.ok(lines.includes("attrition 0: void-limit 0, void-host 0, void-owner 0, changed 1, short 1"));
   assert.ok(lines.includes("cost 0: 4 trials, 2 resolved · per resolved: tokens 4500, spent USD 2.25, list USD unknown, minutes 30.0 (complete cost for 3 of 4)"));
-  // A null figure is unknown, never zero.
   assert.ok(lines.includes("cost 1: 4 trials, 3 resolved · per resolved: tokens unknown, spent USD unknown, list USD unknown, minutes unknown (complete cost for 4 of 4)"));
   assert.ok(lines.includes("by prompt origin assignment (n 6): 1 vs 0 +0.278 [+0.111, +0.444], p 0.1250"));
   assert.ok(lines.includes("by area host (n 6): 1 vs 0 unknown unknown, p 0.0703"));

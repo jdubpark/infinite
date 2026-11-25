@@ -55,7 +55,6 @@ test("a plan digest covers every planned field", () => {
 
 test("a path list over its byte budget is omitted", () => {
   assert.deepEqual(pathField(["a.ts"]), { paths: ["a.ts"] });
-  // The JSON of ["abcdef"] is ten bytes.
   assert.deepEqual(pathField(["abcdef"], 10), { paths: ["abcdef"] });
   assert.deepEqual(pathField(["abcdefg"], 10), { pathsOmitted: true });
 });

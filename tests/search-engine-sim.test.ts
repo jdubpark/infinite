@@ -4,13 +4,6 @@ import { admit, isOpen, type RunView, type SearchEvent, type SearchState, step }
 import type { Counts } from "./outcome-sim-script.js";
 import { type Engine, simulate, Violation } from "./search-engine-sim-script.js";
 
-/*
- * Runs the search engine's seeded simulator (tests/search-engine-sim-script.ts, which states the invariants) over the
- * default corpus, and checks that each mutant engine below is caught through the invariant it names.
- */
-
-// SEARCH_SIM_SEED=N runs that seed alone; SEARCH_SIM_SEEDS=N runs N seeds from SEARCH_SIM_BASE (default 1). Floors
-// describe the default corpus only.
 const DEFAULT_SEEDS = 600;
 const ONLY = process.env.SEARCH_SIM_SEED;
 const COUNT = Number(process.env.SEARCH_SIM_SEEDS ?? DEFAULT_SEEDS);
@@ -21,11 +14,6 @@ const DEFAULT_CORPUS = ONLY === undefined && COUNT === DEFAULT_SEEDS && BASE_SEE
 
 const sortedCounts = (counts: Counts) => Object.entries(counts).sort(([a], [b]) => (a < b ? -1 : 1));
 
-/**
- * Floors for the default corpus at about half of what it produced, so a generator that stops producing a case fails.
- * `challenger-first` ran 4 times: it needs `together`, a widening at arming, and a challenger gated before the champion.
- * `pause:again` ran once: it needs a count that engages the brake while the project is already paused.
- */
 const FLOORS: Readonly<Record<string, number>> = {
   "admission:admitted": 1360, "admission:refused-6": 349, "admission:refused-7": 334, "owner:pause": 47, "owner:resume": 51, "decision:pause": 15,
   "pause:again": 1, "class:champion-pass": 98, "class:rescued": 10, "class:challenger-first": 2, "class:none": 443, "end:resolved": 110,
@@ -49,9 +37,6 @@ test("the search engine keeps its invariants under seeded event orders", t => {
   }
 });
 
-// ---- Mutations ---------------------------------------------------------------------------------------------------
-
-/** An engine whose step output, or whose inputs, one plausible bug changed. Applied in-process; no file is edited. */
 type Mutation = { name: string; invariant: string; engine: Engine };
 
 const wrapStep = (wrap: (s: SearchState, e: SearchEvent, v: RunView) => ReturnType<typeof step>): Engine => ({ admit, step: wrap });
@@ -88,7 +73,6 @@ const MUTATIONS: readonly Mutation[] = [
     if (s.pending === undefined || e.kind === "started" || e.kind === "resume") return step(s, e, v);
     const out = step(withoutKey(s, "pending"), e, v);
     out.search.pending ??= s.pending;
-    // Only the widening is wrong: an end in this step still cancels the launch that is out.
     if (!isOpen(out.search) && !out.decisions.some(d => d.kind === "cancel-launch")) out.decisions.push({ kind: "cancel-launch", launch: out.search.launches! });
     return out;
   }) },

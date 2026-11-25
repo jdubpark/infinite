@@ -20,10 +20,6 @@ const owner = "owner-login", repository = "example-org/example-repo", branch = "
 const pullRequestUrl = `https://github.com/${repository}/pull/7`;
 const requested = "Rename the flag to --strict and keep the old name as an alias.";
 const ghRead = ["gh", "pr", "view", "7", "--json", PULL_REQUEST_FIELDS, "--repo", repository];
-/**
- * The fake `gh`, run through the teams command prefix: it logs every command and prints the pull request the test wrote.
- * Field names follow GitHub's documented `gh pr view --json` output; they are not checked against a real review here.
- */
 const fakeGh = `const fs = require("node:fs"); const [dir, command, ...args] = process.argv.slice(1);
 fs.appendFileSync(dir + "/commands.log", JSON.stringify([command, ...args]) + "\\n");
 if (command !== "gh") process.exit(3);
@@ -31,7 +27,6 @@ if (fs.existsSync(dir + "/hold")) require("node:child_process").spawn(process.ex
 if (fs.existsSync(dir + "/gate")) { const cell = new Int32Array(new SharedArrayBuffer(4)); while (!fs.existsSync(dir + "/release")) Atomics.wait(cell, 0, 0, 20); }
 process.stdout.write(fs.readFileSync(dir + "/pull-request.json", "utf8"));`;
 
-/** A run delivered as a pull request at revision 1 and ready for review, with review feedback switched as asked. */
 function delivered(f: Fixture, enabled = true) {
   const dir = join(f.config.stateDir, "fake-github"), head = f.run.baseCommit;
   mkdirSync(dir, { recursive: true });
@@ -47,14 +42,11 @@ function delivered(f: Fixture, enabled = true) {
     show: (reviews: Review[], extra: object = {}) => writeFileSync(join(dir, "pull-request.json"),
       JSON.stringify({ state: "OPEN", isCrossRepository: false, baseRefName: "main", headRefName: branch, headRefOid: head, reviews, ...extra })),
     commands: (): string[][] => existsSync(join(dir, "commands.log")) ? readFileSync(join(dir, "commands.log"), "utf8").trim().split("\n").map(line => JSON.parse(line)) : [],
-    /** Holds every later read until `release`. */
     gate: () => writeFileSync(join(dir, "gate"), ""),
-    /** Each later read also leaves a process in its own session holding the read's output open until `release`, out of the host's reach. */
     hold: () => writeFileSync(join(dir, "hold"), ""),
     release: () => writeFileSync(join(dir, "release"), ""),
   };
 }
-/** Waits until `ready` holds, checking every 20 ms for at most 10 s. */
 async function until(ready: () => boolean) {
   for (let tries = 0; !ready(); tries++) {
     assert.ok(tries < 500, "the condition holds within 10 s");
@@ -65,7 +57,6 @@ async function until(ready: () => boolean) {
 const poller = (teams: TeamService) => (teams as unknown as { reviewFeedback: TeamReviewFeedback }).reviewFeedback;
 const events = (saved: Saved) => saved.run.events.map(event => event.text);
 
-/** Stops the host after its `stopAt`-th team record write once armed: later writes of the record fail, as if the process died. */
 function hostStop(f: Fixture, stopAt: number) {
   let armed = false, writes = 0, restore: (() => void) | undefined;
   const entries = { retryable: () => false, mirror: () => {
@@ -97,12 +88,10 @@ test("one changes-requested review by the owner starts exactly one follow-up, an
     assert.ok(events(saved).includes("Owner (GitHub review) steering recorded. Earlier reports cannot satisfy the new revision."));
     assert.ok(events(saved).includes("The owner requested changes on the pull request (review PRR_1). The run continues from its delivered commit at revision 2."));
 
-    // The steered run is planning, so later polls read nothing and steer nothing.
     await feedback.poll();
     assert.equal(gh.commands().length, 1);
     teams.close();
 
-    // The follow-up delivers to the same pull request at revision 2 while GitHub still shows the same review as newest.
     const record = f.readRecord<Saved & Record<string, unknown>>("team", f.run.id);
     Object.assign(record.run, { status: "ready-for-review", pullRequest: { ...record.run.pullRequest!, revision: 2 } });
     f.writeRecord("team", f.run.id, record);
@@ -164,7 +153,6 @@ test("a review submitted before the switch was last turned on starts nothing", a
     await wait();
     const between = new Date().toISOString();
     await wait();
-    // Off, then on again: only reviews after the second switch-on count.
     f.config.github!.reviewFeedback!.enabled = false;
     poller(f.openTeam()).start();
     f.config.github!.reviewFeedback!.enabled = true;
@@ -195,7 +183,6 @@ test("whichever record write a review's steer stops after, the restarted host st
       stops++;
       stop.restart();
       const left = f.readRecord<Saved>("team", f.run.id), intent = left.reviewIntake?.intents[0];
-      // Write 1 saves the intent; write 2 is the steer's permission invalidation; write 3 is the steer with its receipt; write 4 acknowledges it.
       const expected = ([["pending", false], ["pending", false], ["pending", true], ["applied", true]] as const)[stopAt - 1];
       assert.deepEqual([intent?.state, Boolean(left.receipts[requestId(f)])], expected);
       const readsBefore = gh.commands().length, second = poller(f.openTeam());
@@ -230,7 +217,6 @@ test("a review that GitHub supersedes while the owner's halt holds it starts not
     await feedback.poll();
     assert.equal(gh.commands().length, 1, "a held intent is not read again while the halt holds it");
 
-    // The owner approves the pull request during the halt; once it lifts, the saved intent no longer holds.
     gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED"), { ...gh.review("PRR_2", owner, "APPROVED", "Looks good."), submittedAt: new Date(Date.now() + 120_000).toISOString() }]);
     halted = false;
     await feedback.poll();
@@ -275,7 +261,6 @@ test("a steer on a pull request recorded without its branch is refused until a r
   const f = schedulerFixture();
   try {
     const gh = delivered(f);
-    // A record made before the branch was kept: the delivered head was published to the branch the pull request uses.
     delete f.run.pullRequest!.branch;
     f.run.publication = { repository, branch, commit: gh.head, publishedAt: new Date().toISOString() };
     f.writeTeam();
@@ -285,7 +270,6 @@ test("a steer on a pull request recorded without its branch is refused until a r
     assert.equal(saved.run.pullRequest?.branch, undefined, "no branch is guessed or saved without a read of GitHub");
     assert.equal(saved.run.revision, 1);
 
-    // The poller's first read that GitHub confirms records the branch, even when no review counts yet.
     gh.show([]);
     const feedback = poller(teams);
     await feedback.start();
@@ -312,7 +296,6 @@ test("polls that arrive while a pass is slow coalesce into one more pass", async
         gh.gate();
         first = feedback.poll();
       } else {
-        // A review accepted under a halt is drained by the next host; GitHub has since shown a newer approval.
         gh.show([review]);
         const held = f.openTeam(), heldFeedback = poller(held);
         held.useFuse({ held: () => ({ reason: "halt" }) } as unknown as FuseGate);
@@ -344,7 +327,6 @@ test("closing the host while a pull request read runs saves nothing and steers n
       const teams = f.openTeam(), feedback = poller(teams);
       teams.useFuse({ held: () => halted ? { reason: "halt" } : undefined } as unknown as FuseGate);
       await feedback.start();
-      // For the drain, the review is first accepted under a halt, so the read in flight is the check before its steer.
       if (phase === "drain") { await feedback.poll(); halted = false; }
       const before = f.readRecord<Saved>("team", f.run.id), reads = gh.commands().length;
       gh.gate();

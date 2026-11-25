@@ -13,19 +13,16 @@ function store() {
   const file = join(dir, "provider-limits.sealed"), key = randomBytes(32);
   return { file, key, open: () => new ProviderLimits(file, key), close: () => rmSync(dir, { recursive: true, force: true }) };
 }
-/** A manager stand-in: journals of signal events read with a cursor. */
 function sessions(journals: Record<string, { at: string; data: Record<string, unknown> }[]>, pageSize = Infinity): LimitSessions {
   return {
     events: (id, after, limit) => {
       const all = (journals[id] ?? []).map((event, index) => ({ ...event, seq: index + 1 }));
-      // A manager page also ends early at its byte cap, so a page can hold fewer events than asked.
       const events = all.filter(event => event.seq > after).slice(0, Math.min(limit, pageSize));
       return { events, cursor: events.at(-1)?.seq ?? after, more: all.length > after + events.length };
     },
   };
 }
 const claudeLimit = { kind: "provider-limit", limit: "usage", confidence: "corroborated", message: "You've hit your session limit", source: "screen", provider: "claude" };
-/** A Claude `Stop` hook, as the worker journals it. */
 const claudeStop = { kind: "turn-end", source: "hook", provider: "claude" };
 
 test("a corroborated limit lasts until its stated reset, at most a day, or 15 minutes without one, across restarts", () => {

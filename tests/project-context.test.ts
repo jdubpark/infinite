@@ -33,7 +33,6 @@ test("project context is isolated, linked explicitly in one direction, and revok
     assert.equal((await links("alpha", 0, [{ projectId: "beta", relationship: "Uses the API" }], "controller")).status, 403);
     assert.equal((await links("beta", 0, [{ projectId: "gamma", relationship: "Uses the library" }])).status, 200);
 
-    // Exercise the actual CLI against the host; the selected source is never inferred.
     const client = join(root, "client.json");
     writeFileSync(client, JSON.stringify({ origin: host.origin, token: host.tokens.owner }), { mode: 0o600 });
     const cli = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", client];
@@ -56,7 +55,6 @@ test("project context is isolated, linked explicitly in one direction, and revok
     assert.equal((await links("alpha", 2, [{ projectId: "missing", relationship: "Unknown" }])).status, 404);
     assert.equal((await links("alpha", 2, [{ projectId: "alpha", relationship: "Self" }])).status, 400);
 
-    // Reusing a project ID for a different checkout must not reuse its saved context.
     await host.stopApi();
     const configFile = join(host.root, "config.json");
     const config = JSON.parse(readFileSync(configFile, "utf8"));

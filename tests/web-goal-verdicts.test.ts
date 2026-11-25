@@ -6,7 +6,6 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { ASSESSMENT_LABEL, CycleAssessment, ProvisionalStop, countsText, newestVerdictId } from "../apps/web/src/goals";
 import type { GoalAssessment, GoalVerdictView } from "../apps/web/src/api";
 
-// The tests run without the web build's JSX transform, so the classic runtime reads React from the global scope.
 (globalThis as { React?: unknown }).React = React;
 
 const assessment = (overrides: Partial<GoalAssessment> = {}): GoalAssessment => ({

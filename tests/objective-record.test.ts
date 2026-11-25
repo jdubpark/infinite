@@ -209,7 +209,6 @@ test("a rebuild refuses what it cannot undo", () => {
   assert.throws(() => rebuildVersion(late, 2), { status: 409, code: "objective-version-unavailable" });
 });
 
-/** Request ids of the corrections that wrote the log, one per version after the first, as the host writes them. */
 const REQUEST_IDS = [
   "2b7e1c90-4d3a-4f6b-8a21-5c9d0e7f1a34",
   "6a0f3d52-9e1b-4c7d-b8e4-2f5a6c7d8e90",
@@ -270,12 +269,10 @@ test("a rebuild undoes owner corrections", () => {
   } as ObjectiveRecord;
   assert.throws(() => rebuildVersion(drifted, 3), { status: 409, code: "objective-version-unavailable" });
 
-  // An edit whose logged `before` names another criterion would restore a version that never existed.
   const renamed = withEntry(record, 6, { before: { inline: { ...c1, id: "c9" } }, after: { inline: c1Edited } });
   assert.equal(objectiveRecordSchema.safeParse(renamed).success, true);
   assert.throws(() => rebuildVersion(renamed, 3), { status: 409, code: "objective-version-unavailable" });
 
-  // An edit whose logged `before` breaks the producer rule: the restored record would not parse.
   const misfit = withEntry(record, 6, { before: { inline: { ...c1, producer: "host" } }, after: { inline: c1Edited } });
   assert.equal(objectiveRecordSchema.safeParse(misfit).success, true);
   assert.throws(() => rebuildVersion(misfit, 3), { status: 409, code: "objective-version-unavailable" });
@@ -286,7 +283,6 @@ test("a rebuild undoes the intent check", () => {
   const DECISION = "9d3f2b1a-5c4e-4f70-8a1b-2c3d4e5f6a7b";
   const DECISION_TWO = "1e2f3a4b-5c6d-4e7f-8091-a2b3c4d5e6f7";
   const digestOf = (value: unknown) => createHash("sha256").update(canonicalJson(JSON.parse(JSON.stringify(value)))).digest("hex");
-  /** Seals a hand-built record the way the host does: the digest covers the record, not its log's digest. */
   const sealed = (record: Omit<ObjectiveRecord, "digest">): ObjectiveRecord => {
     const body = { ...record, digest: "" } as ObjectiveRecord;
     body.digest = recordDigest(body);
@@ -312,7 +308,6 @@ test("a rebuild undoes the intent check", () => {
   const steered: Direction = { id: "s3", text: "Use primary sources.", source: "steering", at: at(3) };
   const answer: Direction = { id: "ans1", text: "Sources must be dated.", source: "correction", at: at(4) };
 
-  // Version 2: the check adds a1, q1 (waiting on DECISION), and the derived criterion c1.
   const applied2 = {
     revision: 2, mode: "supervised", added: { assumptions: ["a1"], questions: ["q1"], criteria: ["c1"] },
     addedDigest: digestOf({ assumptions: [a1], questions: [q1], criteria: [c1] }),
@@ -324,14 +319,12 @@ test("a rebuild undoes the intent check", () => {
   };
   const v2 = sealed({ ...base, version: 2, criteria: [...base.criteria, c1], assumptions: [a1], questions: [q1], log: [...base.log, entry2] });
 
-  // Version 3: a steered direction.
   const entry3: LogEntry = {
     seq: 3, at: at(3), version: 3, actor: "owner", authority: "direction", op: "direction.appended", target: "s3",
     after: logValue(steered, "record:direction:s3"),
   };
   const v3 = sealed({ ...v2, version: 3, statement: { ...v2.statement, directions: [steered] }, log: [...v2.log, entry3] });
 
-  // Version 4: a text answer on DECISION sets q1 answered, drops its wait, and appends the correction ans1.
   const entry4: LogEntry = {
     seq: 4, at: at(4), version: 4, actor: "owner", authority: "direction", op: INTENT_OPS.answered, target: DECISION, handle: RUN_ID,
     before: { inline: { questions: [{ id: "q1", state: "open", waits: true, decisionId: DECISION }] } },
@@ -342,7 +335,6 @@ test("a rebuild undoes the intent check", () => {
     ...v3, version: 4, questions: [q1Answered], statement: { ...v3.statement, directions: [steered, answer] }, log: [...v3.log, entry4],
   });
 
-  // Version 5: a second check adds a2 and q2 (waiting on DECISION_TWO), then writes a skip at the same version.
   const applied5 = {
     revision: 5, mode: "supervised", added: { assumptions: ["a2"], questions: ["q2"], criteria: [] },
     addedDigest: digestOf({ assumptions: [a2], questions: [q2], criteria: [] }),
@@ -358,7 +350,6 @@ test("a rebuild undoes the intent check", () => {
   };
   const v5 = sealed({ ...v4, version: 5, assumptions: [a1, a2], questions: [q1Answered, q2], log: [...v4.log, entry5, entry6] });
 
-  // Version 6: the owner cancels the wait on DECISION_TWO.
   const entry7: LogEntry = {
     seq: 7, at: at(6), version: 6, actor: "host", authority: "receipt", op: INTENT_OPS.released, target: DECISION_TWO, handle: RUN_ID,
     before: { inline: { questions: [{ id: "q2", state: "open", waits: true, decisionId: DECISION_TWO }] } },
@@ -372,16 +363,13 @@ test("a rebuild undoes the intent check", () => {
     assert.deepEqual(rebuildVersion(v6, index + 1), snapshot, `version ${index + 1}`);
   }
 
-  // The applied entry's digest must match the objects it names: one byte off is a version this host cannot rebuild.
   const after2Flipped = applied2.addedDigest.replace(/.$/, last => (last === "0" ? "1" : "0"));
   const drifted = withEntry(v6, 2, { after: { inline: { ...applied2, addedDigest: after2Flipped } } });
   assert.throws(() => rebuildVersion(drifted, 1), { status: 409, code: "objective-version-unavailable" });
 
-  // A `before` that names a question the record does not hold cannot be restored.
   const missingQuestion = withEntry(v6, 4, { before: { inline: { questions: [{ id: "q9", state: "open", waits: true, decisionId: DECISION }] } } });
   assert.throws(() => rebuildVersion(missingQuestion, 3), { status: 409, code: "objective-version-unavailable" });
 
-  // An answer's correction that is no longer in the record cannot be undone.
   const noCorrection = sealed({ ...v6, statement: { ...v6.statement, directions: [steered] } });
   assert.throws(() => rebuildVersion(noCorrection, 3), { status: 409, code: "objective-version-unavailable" });
 });
@@ -473,14 +461,12 @@ test("a rebuild undoes the register", () => {
   });
   const base = goalRecord(goalFixture(), AT, "created") as ObjectiveRecord;
 
-  // Version 1: four assumptions. a1 already holds an earlier receipt handle, which version 2 replaces at index 0.
   const a1v1 = draft("a1", { test: { kind: "command", command: COMMAND, refutesOn: "fail" }, evidence: [OLD_HANDLE] });
   const a2v1 = draft("a2", { test: { kind: "command", command: COMMAND, refutesOn: "fail" } });
   const a4v1 = draft("a4", { origin: "owner", test: { kind: "owner" } });
   const a5v1 = draft("a5", { origin: "owner", test: { kind: "owner", rating: { subject: "quality", below: 4 } } });
   const v1 = [a1v1, a2v1, a4v1, a5v1];
 
-  // Version 2: a test sets a1 verified and a2 refuted, and each new handle is last in its evidence.
   const test2 = {
     revision: 2, kind: "command",
     changed: [{ id: "a1", status: "verified" }, { id: "a2", status: "refuted" }],
@@ -497,7 +483,6 @@ test("a rebuild undoes the register", () => {
   const a2v2 = { ...a2v1, status: "refuted" as const, evidence: [`receipt:${RUN_ID}:2:a2`] };
   const v2 = [a1v2, a2v2, a4v1, a5v1];
 
-  // Version 3: a member proposes a6 and attaches a stance to a2.
   const a6 = draft("a6", { origin: "member", criticality: "detail", statement: "Members keep the export format." });
   const proposal = {
     revision: 3, added: ["a6"], addedDigest: digestOf([a6]),
@@ -511,7 +496,6 @@ test("a rebuild undoes the register", () => {
   const a2v3 = { ...a2v2, proposals: [stance] };
   const v3 = [a1v2, a2v3, a4v1, a5v1, a6];
 
-  // Version 4: the owner pins a4 verified.
   const entry4: LogEntry = {
     seq: 4, at: at(4), version: 4, actor: "owner", authority: "direction", op: "assumption.set", target: "a4", handle: OWNER_REQUEST,
     before: { inline: { status: "unchecked" } },
@@ -520,7 +504,6 @@ test("a rebuild undoes the register", () => {
   const a4v4 = { ...a4v1, status: "verified" as const, ownerPinned: true, evidence: [`owner:${OWNER_REQUEST}`] };
   const v4 = [a1v2, a2v3, a4v4, a5v1, a6];
 
-  // Version 5: the owner rates quality 3, which refutes a5 (below 4).
   const entry5: LogEntry = {
     seq: 5, at: at(5), version: 5, actor: "owner", authority: "direction", op: "rating.recorded", target: "quality", handle: RATING_REQUEST,
     before: { inline: { assumptions: [{ id: "a5", status: "unchecked" }] } },
@@ -539,18 +522,15 @@ test("a rebuild undoes the register", () => {
   assert.deepEqual(rebuildVersion(v5, 3), snapshot(3, v3));
   assert.deepEqual(rebuildVersion(v5, 4), snapshot(4, v4));
 
-  // An addedDigest one byte off.
   const flipped = digestOf([a6]).replace(/.$/, last => (last === "0" ? "1" : "0"));
   const drifted = withEntry(v5, 3, { after: { inline: { ...proposal, addedDigest: flipped } } });
   assert.throws(() => rebuildVersion(drifted, 2), { status: 409, code: "objective-version-unavailable" });
 
-  // A stance that is not the assumption's last proposal.
   const stanceNotLast = sealed({
     ...v5, assumptions: v5.assumptions.map(item => (item.id === "a2" ? { ...item, proposals: [stance, { ...stance, entryId: "finding-9" }] } : item)),
   });
   assert.throws(() => rebuildVersion(stanceNotLast, 2), { status: 409, code: "objective-version-unavailable" });
 
-  // A last handle that differs from the entry's, for an owner pin and for a rating.
   const pinHandleDiffers = sealed({
     ...v5, assumptions: v5.assumptions.map(item => (item.id === "a4" ? { ...item, evidence: ["owner:other-request"] } : item)),
   });
@@ -560,14 +540,12 @@ test("a rebuild undoes the register", () => {
   });
   assert.throws(() => rebuildVersion(ratingHandleDiffers, 4), { status: 409, code: "objective-version-unavailable" });
 
-  // A current status that differs from the entry's `after`, for a rating and for an owner pin.
   const rated = { subject: "quality", score: 3, commit: COMMIT, cycle: 2 };
   const ratingStatusDiffers = withEntry(v5, 5, { after: { inline: { ...rated, changed: [{ id: "a5", status: "verified" }] } } });
   assert.throws(() => rebuildVersion(ratingStatusDiffers, 4), { status: 409, code: "objective-version-unavailable" });
   const pinStatusDiffers = withEntry(v5, 4, { after: { inline: { status: "refuted" } } });
   assert.throws(() => rebuildVersion(pinStatusDiffers, 3), { status: 409, code: "objective-version-unavailable" });
 
-  // A test whose `changed` names an assumption its `before` does not, and a proposal that carries a `before`.
   const extraChanged = withEntry(v5, 2, { after: { inline: { ...test2, changed: [...test2.changed, { id: "a5", status: "refuted" }] } } });
   assert.throws(() => rebuildVersion(extraChanged, 1), { status: 409, code: "objective-version-unavailable" });
   const proposalWithBefore = withEntry(v5, 3, { before: { inline: { assumptions: [] } } });

@@ -14,9 +14,6 @@ function alive(pid: number): boolean {
   }
 }
 
-// INF-393: a configured check ends with its leader. The second check of this scenario exits 0 at once and leaves a
-// process in its group that holds its output for a minute. With a thirty-second check limit, a check that waited for
-// that process would run into the limit and block the run; here it passes by its exit code about a second later.
 test("a check whose leader exits 0 while a process it left holds the output passes, and the process is neither waited for nor stopped", {
   timeout: 120_000, skip: process.platform === "win32" && "process groups are POSIX",
 }, async () => {

@@ -19,7 +19,6 @@ test("acceptance 7: a provisional met stops the goal and continue resumes it", {
     assert.equal(created.status, 200, JSON.stringify(created.body));
     const id = created.body.id as string;
 
-    // Cycle 1's evaluator finds the goal's one criterion met: the goal stops for the owner, and no agent marks it achieved.
     const stopped = await f.stopped(id, value => value.stopReason === "provisional-met");
     assert.equal(stopped.status, "ready-for-review");
     assert.equal(stopped.reason, PROVISIONAL_REASON);
@@ -31,7 +30,6 @@ test("acceptance 7: a provisional met stops the goal and continue resumes it", {
     const before = (await f.host.fetchApi(`/goals/${id}/record`, "viewer")).body;
     assert.equal(typeof before.version, "number", JSON.stringify(before));
 
-    // Not achieved, and continue: the goal runs again on a new record version that carries the owner's direction.
     const summary = "Rank the founders by their sources";
     const answer = await f.host.fetchApi(`/goals/${id}/outcome`, "owner", outcomeOf(stopped, { summary, continue: true, verdictId: first!.verdictId }));
     assert.equal(answer.status, 200, JSON.stringify(answer.body));
@@ -47,7 +45,6 @@ test("acceptance 7: a provisional met stops the goal and continue resumes it", {
     assert.equal(after.record.statement.directions.at(-1).text, summary);
     assert.match(await f.prompt(id, 2, "project-manager"), new RegExp(`User direction: ${summary}`));
 
-    // Cycle 2 stops the same way, and only the owner's outcome marks the goal achieved.
     const second = await f.stopped(id, value => value.cycles.length === 2 && value.stopReason === "provisional-met");
     assert.equal(second.status, "ready-for-review");
     assert.equal(second.cycles[1]!.assessment?.result, "met");
@@ -64,7 +61,6 @@ test("continue is refused outside a provisional stop", { timeout: 60000 }, async
   const { teams, goals, advance } = stubFixture(t);
   goals.start();
 
-  // A goal that a deadline stopped, after a cycle that held an assessment and no provisional stop.
   const timed = await goals.create(finite());
   const one = await until(() => teams.launches[0], Boolean, "cycle 1 of the deadline goal");
   const notMet = assessmentOf(1, 1);
@@ -80,7 +76,6 @@ test("continue is refused outside a provisional stop", { timeout: 60000 }, async
   await assert.rejects(goals.outcome(limited.id, { ...outcomeOf(limited, { continue: true, verdictId: notMet.verdictId }) } as never), refused("goal-not-provisional"));
   assert.equal(unchanged(limited), frozen, "A refused continue changes nothing");
 
-  // A goal that a provisional met stopped: an unknown verdict, then a spent allowance.
   const stopping = await goals.create(finite());
   const three = await until(() => teams.launches[2], Boolean, "cycle 1 of the provisional goal");
   const met = assessmentOf(2, 0);
@@ -106,7 +101,6 @@ test("a standing goal records met and counts verdict failures", { timeout: 60000
     return until(() => goals.get(created.id), goal => !goal.activeTeamId && goal.cycles.length === n && goal.cycles[n - 1]!.class !== undefined, `cycle ${n} to settle`);
   };
 
-  // A met verdict never stops a standing goal: it records the assessment, and the next cycle comes at its cadence.
   const first = await settle(1, 2, 0);
   assert.equal(first.status, "running");
   assert.equal(first.stopReason, undefined);
@@ -115,7 +109,6 @@ test("a standing goal records met and counts verdict failures", { timeout: 60000
   assert.equal(first.failedCycles, 0);
   advance(30);
 
-  // Three failing verdicts in a row (fewer criteria met, then no gain) pause it.
   const second = await settle(2, 1, 1);
   assert.equal(second.cycles[1]!.class, "reviewed", "A failing verdict keeps the cycle's class");
   assert.equal(second.cycles[1]!.assessment?.progress, -1);
@@ -131,7 +124,6 @@ test("a standing goal records met and counts verdict failures", { timeout: 60000
   assert.equal(paused.cycles.length, 4);
   advance(30);
 
-  // An owner's resume resets the count.
   const resumed = await goals.resume(created.id, action(paused));
   assert.equal(resumed.status, "running");
   assert.equal(resumed.failedCycles, 0);
@@ -157,12 +149,10 @@ test("a verdict counts toward the failure stop only on a reviewed cycle", { time
   assert.equal(failing.cycles[0]!.class, "reviewed");
   assert.equal(failing.failedCycles, 1);
 
-  // An excluded cycle leaves the count alone, whatever its assessment says.
   const excluded = await settle(2, "blocked", assessmentOf(0, 2), { blockCode: "provider-limit", reason: "The provider is limited." });
   assert.equal(excluded.cycles[1]!.class, "excluded");
   assert.equal(excluded.failedCycles, 1);
 
-  // Quiet no-change cycles reset the count and never pause the goal.
   for (let n = 3; n <= 5; n++) {
     const quietly = await settle(n, "no-change", quiet(), { reason: "No further work is justified." });
     assert.equal(quietly.cycles[n - 1]!.class, "no-change");
@@ -174,7 +164,6 @@ test("a verdict counts toward the failure stop only on a reviewed cycle", { time
 test("acceptance 10 end to end", { timeout: 300000 }, async () => {
   const f = await hostFixture({ objective: { ...SWITCHES }, mode: "autonomous" });
   try {
-    // Cycle 1's evaluator finds c1 met and c2 not met, and leaves a note on c2.
     f.verdictFile(1, { kind: "verdict", result: "not-met", criteria: ["c0", "c1", "c2"].map(id => ({ id, state: id === "c2" ? "not-met" : "met",
       evidence: ["file:features/progress.json"], ...(id === "c2" ? { note: NOTE } : {}) })) });
     const created = await f.host.fetchApi("/goals", "owner", f.create({ maxRuns: 2, criteria: [criterion("Every source is named", "sources"), criterion("Every claim is checked", "claims")] } as never));
@@ -205,7 +194,6 @@ test("a supervised goal shows the verdict and changes nothing", { timeout: 30000
     assert.equal(created.status, 200, JSON.stringify(created.body));
     const id = created.body.id as string;
 
-    // Every criterion is met in cycle 1, and the supervised goal goes on to cycle 2 as it does without verdicts.
     const manager = await f.prompt(id, 2, "project-manager");
     assert.ok(!manager.includes(AGENT_ASSESSMENT), "No rows reach a supervised goal's next cycle");
     const goal = await f.stopped(id, value => value.cycles.length === 2);
@@ -251,7 +239,6 @@ test("without verdicts a goal is as today", { timeout: 300000 }, async () => {
     assert.notEqual(goal.stopReason, "provisional-met");
     assert.ok(!goal.events.some(event => event.text === PROVISIONAL_EVENT));
 
-    // An outcome without a verdictId records as today; a verdictId that names no assessment is refused.
     const stray = await f.host.fetchApi(`/goals/${id}/outcome`, "owner", outcomeOf(goal, { verdictId: randomUUID() }));
     assert.equal(stray.status, 409, JSON.stringify(stray.body));
     assert.equal(stray.body.code, "verdict-not-found");

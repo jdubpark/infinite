@@ -88,7 +88,6 @@ test("repo init takes --base-branch as the followed branch when origin/HEAD is m
   const root = makeRepository("https://github.com/example/product.git");
   try {
     execFileSync("git", ["-C", root, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"], { stdio: "ignore" });
-    // No origin/HEAD and a local branch that is neither main nor master: nothing to infer the followed branch from.
     execFileSync("git", ["-C", root, "symbolic-ref", "HEAD", "refs/heads/trunk"], { stdio: "ignore" });
     assert.deepEqual(inferProjectSource(root, undefined), { mode: "laptop" });
     assert.deepEqual(inferProjectSource(root, "github", "trunk"), { mode: "github", repository: "example/product", baseBranch: "trunk" });

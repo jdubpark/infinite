@@ -45,7 +45,6 @@ const ANCHOR = "a".repeat(40);
 const MEMBER_BASE = "b".repeat(40);
 const COMMIT = "c".repeat(40);
 const HEAD = "d".repeat(40);
-/** The commit that the mined copy and the run's landing share. */
 const LANDED = "e".repeat(40);
 const OTHER_LANDING = "f".repeat(40);
 const SRC = "src/a.ts";
@@ -55,11 +54,8 @@ const LIB_C = "lib/c.ts";
 const TEST_C = "tests/c.test.ts";
 
 const COMMIT_AT = "2026-11-13T10:00:00.000Z";
-/** Six days before the commit: the captured row, inside the 90-day lineage window. */
 const CAPTURED_AT = "2026-11-07T10:00:00.000Z";
-/** Five days before the commit: the approval. */
 const APPROVED_AT = "2026-11-08T10:00:00.000Z";
-/** Ninety-one days before the commit: outside the window. */
 const OLD_CAPTURED_AT = "2026-08-14T10:00:00.000Z";
 const OLD_APPROVED_AT = "2026-08-15T10:00:00.000Z";
 const LATE_APPROVED_AT = "2026-11-14T10:00:00.000Z";
@@ -103,7 +99,6 @@ function startOf(runId: string, at: string): CaptureStart {
   };
 }
 
-/** A captured row with stored material on `files`, in the same write. Returns its task id. */
 function captureTx(tx: EvidenceTx, runId: string, files: string[], at: string): string {
   const taskId = capturedTaskId(runId, MEMBER);
   insertMarker(tx, startOf(runId, at), { state: "captured", capsule: CAPSULE }, at);
@@ -118,7 +113,6 @@ function captureTx(tx: EvidenceTx, runId: string, files: string[], at: string): 
   return taskId;
 }
 
-/** The approval of a captured row: its `approved_at` is what lineage reads. */
 function approveTx(tx: EvidenceTx, taskId: string, at: string): void {
   tx.run("UPDATE eval_tasks SET approval = 'read', approved_at = ? WHERE task_id = ?", at, taskId);
 }
@@ -130,13 +124,11 @@ function minedInput(commit: string, files: string[]): MinedCandidate {
   };
 }
 
-/** A mined candidate of `commit`, written by Task 5's `insertMined` with its own group. Returns its task id. */
 function insertMinedTx(tx: EvidenceTx, commit: string, files: string[], at: string): string {
   insertMined(tx, minedInput(commit, files), at);
   return minedTaskId(tx.index("project", PROJECT), tx.index("eval-commit", commit));
 }
 
-/** The mining step of one commit, as the miner writes it: the insert, then Task 5's `placeMined` in the same write. */
 function mineTx(tx: EvidenceTx, commit: string, files: string[], at: string): string {
   const taskId = insertMinedTx(tx, commit, files, at);
   placeMined(tx, minedInput(commit, files), at);
@@ -152,7 +144,6 @@ function landTx(tx: EvidenceTx, runId: string, commit: string, at: string): bool
   });
 }
 
-/** The promotion step: every captured row of the pass becomes a candidate, with the duplicate rule on promotion. */
 function promoteTx(tx: EvidenceTx): void {
   reconcileBatch(
     tx,
@@ -165,7 +156,6 @@ function promoteTx(tx: EvidenceTx): void {
   );
 }
 
-/** Rows that break the invariant: a root holding a captured candidate or valid row and a mined candidate or valid row. */
 function invariantBreaches(db: EvidenceDb): number {
   return db.get<{ n: number }>(
     "SELECT count(*) AS n FROM eval_groups g WHERE g.root_id = g.group_id "
@@ -181,7 +171,6 @@ function devOnlyOf(db: EvidenceDb, root: string): number {
 }
 
 test("the three group facts give one result in every order", () => {
-  // M is the mined copy with its lineage merge (or the landing join when L came first), L the landing, P the promotion.
   const orders = ["MLP", "MPL", "LMP", "LPM", "PLM", "PML"];
   const devOnlyOrders = new Set(["MLP", "MPL", "PML"]);
   const cases = [
@@ -220,7 +209,6 @@ test("the three group facts give one result in every order", () => {
         assert.deepEqual(result.parts, {}, label);
         assert.equal(result.minedRoot, result.root, label);
         assert.equal(result.devOnly, c.devOnly && devOnlyOrders.has(order) ? 1 : 0, label);
-        // Ruling 14: the smallest group id is the root, and the mined id `mined:...` sorts before `run:`.
         assert.equal(result.root, mined, label);
       } finally {
         f.cleanup();
@@ -259,7 +247,6 @@ test("a valid captured row makes a later mined copy a duplicate", () => {
       return id;
     });
     f.store.write(tx => { promoteTx(tx); });
-    // Validation passed: the captured row is valid, no longer a candidate.
     f.store.write(tx => { tx.run("UPDATE eval_tasks SET state = 'valid' WHERE task_id = ?", captured); });
     const mined = f.store.write(tx => mineTx(tx, LANDED, [SRC, TEST_B], COMMIT_AT));
     const copy = f.store.read(db => readEvalTask(db, mined));
@@ -277,11 +264,8 @@ test("lineage is bounded in time and width", () => {
     const ref = f.store.write(tx => pathRef(tx, PROJECT, SRC));
     const lineage = () => f.store.read(db => lineageRoots(db, { pathRefs: [ref], commitTime: COMMIT_AT }));
     f.store.write(tx => {
-      // Outside the 90-day window.
       approveTx(tx, captureTx(tx, "run-old", [SRC, TEST_A], OLD_CAPTURED_AT), OLD_APPROVED_AT);
-      // Approved after the commit.
       approveTx(tx, captureTx(tx, "run-late", [SRC, TEST_A], CAPTURED_AT), LATE_APPROVED_AT);
-      // Already landed.
       approveTx(tx, captureTx(tx, "run-landed", [SRC, TEST_A], CAPTURED_AT), APPROVED_AT);
       landTx(tx, "run-landed", OTHER_LANDING, COMMIT_AT);
     });
@@ -308,7 +292,6 @@ test("lineage is bounded in time and width", () => {
     });
     const sixtyFive = wide.store.read(db => lineageRoots(db, { pathRefs: [ref], commitTime: COMMIT_AT }));
     assert.deepEqual(sixtyFive, { tooWide: true });
-    // The miner rejects a commit whose lineage is too wide.
     const mined = wide.store.write(tx => mineTx(tx, LANDED, [SRC, TEST_B], COMMIT_AT));
     const copy = wide.store.read(db => readEvalTask(db, mined));
     assert.deepEqual([copy?.state, copy?.reason], ["rejected", "lineage-too-wide"]);
@@ -316,7 +299,6 @@ test("lineage is bounded in time and width", () => {
     wide.cleanup();
   }
 
-  // One root over 1,000 rows of one path, then 1,001: the row cap applies before any root is counted.
   const deep = open();
   try {
     const ref = deep.store.write(tx => pathRef(tx, PROJECT, SRC));
@@ -338,7 +320,6 @@ test("lineage is bounded in time and width", () => {
 });
 
 test("the groups pass joins a landing from either source", () => {
-  // A run record whose deliveryReceipt names the commit.
   const fromRecord = open();
   try {
     const minedId = fromRecord.store.write(tx => {
@@ -359,7 +340,6 @@ test("the groups pass joins a landing from either source", () => {
     fromRecord.cleanup();
   }
 
-  // A ledger landing signal with the commit. A signal whose payload does not open stamps the group and joins nothing.
   const fromSignal = open();
   try {
     const minedId = fromSignal.store.write(tx => {
@@ -375,7 +355,6 @@ test("the groups pass joins a landing from either source", () => {
     fromSignal.cleanup();
   }
 
-  // A run group older than 90 days is stamped and never joined, even when its run record names the commit.
   const old = open();
   try {
     const minedId = old.store.write(tx => {
@@ -432,8 +411,6 @@ test("a group past the landing window is checked once", () => {
     assert.equal(first.run().checked, 1, "the first pass checks the old group once");
     assert.equal(runReads, 0, "a group past the window needs no merge commit, so the runs are not copied");
 
-    // Eleven minutes later the group is due by the recheck age, but past the window it is stamped with a value
-    // that never falls due, so no pass reads it again and no pass copies the runs.
     runReads = 0;
     const later = new GroupPass({ store: f.store, runs, now: () => new Date(Date.parse(NOW) + 11 * 60_000).toISOString() });
     assert.equal(later.run().checked, 0, "the old group is not due again");
@@ -467,7 +444,6 @@ test("a deleted run leaves its mined copy", () => {
       groups: db.get<{ n: number }>("SELECT count(*) AS n FROM eval_groups WHERE group_id IN (?, ?)", runGroupId(RUN), mined)?.n ?? 0,
     }));
     assert.deepEqual(after, { captured: 0, paths: 0, state: "candidate", groups: 2 });
-    // Ruling 14: the run's group row has no task and is no root, so the first sweep takes it; the second takes nothing.
     assert.equal(f.store.write(tx => sweepGroups(tx)), 1, "the first sweep takes the run's group row");
     assert.equal(f.store.write(tx => sweepGroups(tx)), 0, "a second sweep takes nothing");
   } finally {
@@ -481,7 +457,6 @@ test("the sweep keeps a deleted run's group while it is another group's root", (
     f.store.write(tx => {
       approveTx(tx, captureTx(tx, "run-a", [SRC, TEST_A], CAPTURED_AT), APPROVED_AT);
       approveTx(tx, captureTx(tx, "run-b", [SRC, TEST_A], CAPTURED_AT), APPROVED_AT);
-      // A lineage merge of the two runs: the smaller id, run-a's group, is the root.
       mergeRoots(tx, [runGroupId("run-a"), runGroupId("run-b")], true);
     });
     f.store.write(tx => {
@@ -515,7 +490,6 @@ function landingRow(runId: string, commit: string): SignalRow {
 test("the hot statements read through an index", () => {
   const f = open();
   try {
-    // A planner may pick any index that leads with the same columns; each case names the ones that serve it.
     const cases: { name: string; sql: string; params: (string | number)[]; index: string[] }[] = [
       { name: "ROOT_TASKS_SQL", sql: ROOT_TASKS_SQL, params: ["run:x"], index: ["eval_groups_root"] },
       { name: "LINEAGE_SQL", sql: LINEAGE_SQL, params: ["ref", NOW, NOW, 1001], index: ["PRIMARY KEY"] },
@@ -542,7 +516,6 @@ function setOf(db: EvidenceDb, group: string): SetRow {
   return row;
 }
 
-/** A run id whose run group draws the wanted set under this store's vault key. */
 function runDrawing(tx: EvidenceTx, holdout: boolean, skip: string[] = []): string {
   for (let n = 0; n < 500; n++) {
     const runId = `draw-run-${n}`;
@@ -552,7 +525,6 @@ function runDrawing(tx: EvidenceTx, holdout: boolean, skip: string[] = []): stri
   throw new Error("no run id drew the wanted set");
 }
 
-/** A commit whose mined group draws the wanted set. */
 function commitDrawing(tx: EvidenceTx, holdout: boolean, skip: string[] = []): string {
   for (let n = 0; n < 500; n++) {
     const commit = n.toString(16).padStart(40, "9");

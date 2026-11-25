@@ -41,7 +41,6 @@ const configuration = (item: TeamModelProfile): TrialConfiguration => ({ profile
 const CONFIG_A = configuration(PROFILE_A);
 const CONFIG_B = configuration(PROFILE_B);
 
-// Resolved trials out of three, by task and configuration (the comparison test's fixture P).
 const P0 = [1, 0, 2, 3, 1, 2, 0, 1, 3, 2, 1, 0];
 const P1 = [2, 1, 2, 3, 3, 2, 1, 0, 3, 3, 2, 1];
 
@@ -61,7 +60,6 @@ function plainConfig() {
   return { id: PLAIN, name: PLAIN, path: "/unused/plain", source: { mode: "github" }, team: { features: { areas: [{ id: "core", paths: ["packages/core"] }] } } };
 }
 
-/** A host over a real store, with no `teams` (so no trial pump), no member, and the clock fixed at NOW. */
 function rig(options: { damaged?: boolean } = {}): Rig {
   const root = mkdtempSync(join(tmpdir(), "infinite-eval-compare-run-"));
   const databasePath = evidenceDatabasePath(join(root, "state"));
@@ -96,7 +94,6 @@ function rig(options: { damaged?: boolean } = {}): Rig {
 
 const taskId = (prefix: string, n: number) => `captured:${prefix}${String(n).padStart(3, "0")}`;
 
-/** One valid task in its own root group per task, in the set the test names. The draw is never used. */
 function seedTasks(store: EvidenceStore, prefix: string, count: number, set: { holdout: boolean; setAt?: string }): string[] {
   const ids: string[] = [];
   store.write(tx => {
@@ -120,7 +117,6 @@ function seedTasks(store: EvidenceStore, prefix: string, count: number, set: { h
   return ids;
 }
 
-/** A finished baseline job with three trials per task and configuration; slot s resolves when s < rows[c][i]. */
 function seedBaseline(store: EvidenceStore, tasks: string[], rows: number[][]): void {
   const configs = [CONFIG_A, CONFIG_B];
   store.write(tx => {
@@ -207,7 +203,6 @@ test("a compare job of measured configurations reports on the tick", async () =>
     const priors = opened<{ projectId: string; priors: { jobId: string; trials: number }[] }>(r.host.priors(PROJECT));
     assert.equal(priors.projectId, PROJECT);
     assert.ok(priors.priors.length > 0, "the baseline job's trials are exported");
-    // A reused copy was counted by the job that ran it, so the compare job exports no row of its own.
     assert.ok(priors.priors.every(prior => prior.jobId === BASELINE), "only the baseline job's rows");
     assert.ok(priors.priors.reduce((sum, prior) => sum + prior.trials, 0) > 0);
   } finally {
@@ -222,7 +217,6 @@ test("a confirm subject is refused through the host", () => {
     const first = opened<{ created: boolean; job: { jobId: string; kind: string } }>(r.host.create(PROJECT, request("confirm"), REQUEST_ONE));
     assert.equal(first.created, true);
     assert.equal(first.job.kind, "confirm");
-    // One active job per kind, so the first is cancelled; a cancelled confirm job still uses its subject.
     const cancelled = opened<{ status: string }>(r.host.control(first.job.jobId, "cancel"));
     assert.equal(cancelled.status, "cancelled");
     refused(r.host.create(PROJECT, request("confirm"), REQUEST_TWO), 409, "subject-confirmed");

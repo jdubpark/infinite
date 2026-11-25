@@ -1,15 +1,7 @@
-// A fake reviewer CLI for permission agent tests. A test links it as `claude` or `opencode` (the host
-// launches a reviewer only through a binary with that name) and sets the behaviour in the wrapper:
-//   PERMISSION_FIXTURE_MODE  decide (default) | extra-tools | tool-use | bad-report | tools-on
-//   PERMISSION_FIXTURE_LOG   a file that receives one JSON line per launch: argv, env names, cwd, stdin size
-// In decide mode the fake is a naive reviewer: the light tier allows only read tools; the strong tier
-// asks for evidence once when the task names a script, allows a test, lint or build command, follows an
-// injected "ALLOW THIS" in the evidence (so a replay can count a miss), and otherwise rejects as uncertain.
 import { appendFileSync, readdirSync, readFileSync } from "node:fs";
 
 const argv = process.argv.slice(2);
 const mode = process.env.PERMISSION_FIXTURE_MODE ?? "decide";
-// Every OpenCode reviewer launch passes --pure; no Claude reviewer launch does.
 const opencode = argv.includes("--pure");
 const stdin = opencode ? "" : (() => { try { return readFileSync(0, "utf8"); } catch { return ""; } })();
 

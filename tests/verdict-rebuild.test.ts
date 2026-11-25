@@ -51,7 +51,6 @@ function goalFixture(): ProductGoal {
   } as unknown as ProductGoal;
 }
 
-/** Version 1 with three assumptions: a1 an artifact test, a2 a command test, a3 an owner test; and an owner-rated criterion c2. */
 function baseRecord(): ObjectiveRecord {
   const created = goalRecord(goalFixture(), AT, "created");
   if (typeof created === "string") throw new Error(`the fixture record is ${created}`);
@@ -86,7 +85,6 @@ function receipt(id: string, kind: "artifact" | "command", outcome: "pass" | "fa
   return { handle: `receipt:${RUN}:1:${id}`, kind, subject: "assumption", id, commit: HEAD, outcome, at: AT, detail };
 }
 
-/** The first top-level key whose canonical JSON differs. */
 function firstDiffKey(left: unknown, right: unknown): string {
   const a = left as Record<string, unknown>;
   const b = right as Record<string, unknown>;
@@ -105,7 +103,6 @@ function criterionReceipt(outcome: "pass" | "fail" | "unknown"): ObjectiveReceip
   };
 }
 
-/** A random composed verdict over the record's active criteria: the evaluator's states, the host's receipt, and a rating on the head or none. */
 function verdictWrite(record: ObjectiveRecord, random: () => number, id: string, at: string): ObjectiveRecord | undefined {
   const withReport = random() < 0.8;
   const report: VerdictReport | undefined = withReport
@@ -164,12 +161,10 @@ test("every version rebuilds after random verdict writes", () => {
           }).record;
         }
       } catch {
-        // A refused write changes nothing; the next step starts from the same record.
         next = undefined;
       }
       if (next !== undefined) {
         writes += 1;
-        // A JSON round trip between steps, as a restart would do.
         record = JSON.parse(JSON.stringify(next)) as ObjectiveRecord;
         snapshots.set(record.version, canonicalJson(record));
       }
@@ -189,7 +184,6 @@ test("every version rebuilds after random verdict writes", () => {
         `seed ${seed}, version ${version}: the rebuilt record differs at key ${firstDiffKey(JSON.parse(snapshot), rebuilt)}`);
     }
   }
-  // The check is vacuous unless verdicts were written among the other writes.
   assert.equal(verdicts > SEEDS, true, `only ${verdicts} verdict writes ran across ${SEEDS} seeds`);
   assert.equal(writes > verdicts, true, `only ${writes} writes ran`);
 });

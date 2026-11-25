@@ -22,13 +22,11 @@ const TRACE = "trace-fixture-0001-thread-0001";
 const traces = (stateDir: string, ...parts: string[]) => join(stateDir, "teams", "traces", ...parts);
 const manifest = (directory: string) => JSON.parse(readFileSync(join(directory, MANIFEST), "utf8"));
 const shape = (directory: string) => ({ ...manifest(directory), at: undefined });
-/** Writes `bytes` of trace where Codex's recorder would: an event log and one payload file. */
 function writeTrace(root: string, bytes: number) {
   mkdirSync(join(root, TRACE, "payloads"), { recursive: true });
   writeFileSync(join(root, TRACE, "trace.jsonl"), "x".repeat(bytes - 2));
   writeFileSync(join(root, TRACE, "payloads", "1.json"), "{}");
 }
-/** Collects console.warn output as text while `body` runs. */
 async function warnings(body: () => Promise<void>) {
   const lines: string[] = [], warn = console.warn;
   console.warn = (...args: unknown[]) => { lines.push(args.map(arg => arg instanceof Error ? `${arg.message} ${arg.stack}` : String(arg)).join(" ")); };
@@ -67,7 +65,6 @@ test("only a Codex member launched under the host's account gets a private trace
     const config = team.host.config, receipts = team.receipts;
     const sudo = join(team.host.root, "bin", "sudo");
     mkdirSync(join(team.host.root, "bin"));
-    // A stand-in for sudo: it drops the wrapper options and runs the provider in the same account.
     writeFileSync(sudo, `#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n`);
     chmodSync(sudo, 0o700);
     const manager = new Manager(config, readFileSync(config.keyFile));
@@ -115,11 +112,6 @@ test("only a Codex member launched under the host's account gets a private trace
 type Internals = { records: Map<string, unknown>; retire(record: unknown): Promise<void>; step(record: unknown): Promise<void> };
 const internal = (teams: TeamService) => teams as unknown as Internals;
 
-/**
- * A scheduler fixture whose run is a Codex team with its project manager queued, and the setting on with `caps`. The
- * fake manager prepares the member's trace at launch, as the real one does, and then writes `bytes` of trace there,
- * plus any `extra` files by name and size, as Codex would.
- */
 function codexTeam(bytes: number, caps: { memberBytes: number; runBytes: number }, extra: Record<string, number> = {}) {
   const f = schedulerFixture();
   let clock = Date.now();
@@ -145,9 +137,7 @@ function codexTeam(bytes: number, caps: { memberBytes: number; runBytes: number 
   return {
     f, teams, pm, directory, step,
     member: () => (internal(teams).records.get(f.run.id) as { run: { members: TeamMember[] } }).run.members[0]!,
-    /** One retention pass, `advanceMs` after the last. */
     sweep: async (advanceMs = 0) => { clock += advanceMs; const internals = internal(teams); await internals.retire(internals.records.get(f.run.id)); await teams.idle(); },
-    /** The owner cancels the run, and the scheduler stops its members. */
     cancel: async () => { await teams.cancel(f.run.id, { requestId: randomUUID(), revision: 1 }); await step(); },
     close: () => { teams.close(); f.close(); },
   };
@@ -252,7 +242,6 @@ test("trace settlement and removal unlink links as themselves, leave their targe
     const inner = codexTeam(120, { memberBytes: 100, runBytes: 5000 });
     try {
       await inner.step();
-      // A link to a file and one to a directory inside the trace, and one at the name a fixed temporary file would have.
       const fileLink = join(inner.directory(), TRACE, "outside"), folderLink = join(inner.directory(), TRACE, "payloads", "folder");
       const tempLink = join(inner.directory(), `${MANIFEST}.tmp`);
       symlinkSync(join(outside, "keep.txt"), fileLink);
@@ -271,7 +260,6 @@ test("trace settlement and removal unlink links as themselves, leave their targe
     const swapped = codexTeam(120, { memberBytes: 100, runBytes: 5000 });
     try {
       await swapped.step();
-      // The member directory itself becomes a link to a directory elsewhere that holds the trace.
       const moved = join(outside, "member");
       renameSync(swapped.directory(), moved);
       symlinkSync(moved, swapped.directory());
@@ -284,7 +272,6 @@ test("trace settlement and removal unlink links as themselves, leave their targe
       noPath(logged, swapped.f.config.stateDir);
     } finally { swapped.close(); }
 
-    // The run's trace directory as a link: the link goes, its target stays, and the record is removed.
     const linkedRun = codexTeam(64, { memberBytes: 1000, runBytes: 5000 });
     try {
       await linkedRun.step();
@@ -300,7 +287,6 @@ test("trace settlement and removal unlink links as themselves, leave their targe
       noPath(logged, linkedRun.f.config.stateDir);
     } finally { linkedRun.close(); }
 
-    // A traces root that is a link is refused at launch; the warning names the member, not the path.
     const refused = codexTeam(64, { memberBytes: 100, runBytes: 5000 });
     try {
       const elsewhere = join(outside, "root");
@@ -325,7 +311,6 @@ test("retention waits out a failed record removal before it tries again", async 
   f.run.events.push({ at: iso, text: "Team cancelled." });
   f.config.teams!.retention = { ...DEFAULT_TEAM_RETENTION, cancelledMinutes: 1 };
   rmSync(dirname(f.run.workspace), { recursive: true, force: true });
-  // An entry the host cannot remove makes each removal of the record fail.
   const locked = traces(f.config.stateDir, f.run.id, randomUUID(), "locked");
   mkdirSync(locked, { recursive: true });
   writeFileSync(join(locked, "file"), "x");
@@ -365,7 +350,6 @@ test("a manifest that is a FIFO does not hold settlement waiting for a writer", 
     const ended = await Promise.race([t.cancel().then(() => true),
       new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), 5000); })]);
     clearTimeout(timer);
-    // A settlement blocked on the FIFO is released, so this test fails instead of hanging the file.
     if (!ended) closeSync(openSync(file, constants.O_WRONLY | constants.O_NONBLOCK));
     assert.ok(ended, "settlement waited for a writer on the FIFO");
     assert.ok(lstatSync(file).isFIFO(), "a manifest that is no regular file is left in place");
@@ -373,7 +357,6 @@ test("a manifest that is a FIFO does not hold settlement waiting for a writer", 
   } finally { t.close(); }
 });
 
-/** A cancelled run whose members' sessions the fake manager knows, each with a trace of the given size. */
 async function tracedRun(members: { exited: boolean; bytes: number }[], caps: { memberBytes: number; runBytes: number }) {
   const f = schedulerFixture();
   const base = f.run.members[0]!;
@@ -458,14 +441,12 @@ test("a session that still answers as live is not taken for exited when its meta
     await t.sweep(10_000);
     assert.equal(manifest(t.directory()).state, "recording", "the live state wins over missing metadata");
 
-    // A session that neither answers nor has metadata is gone.
     manager.state = async (id?: string) => id === session ? { ...await state(id), status: "unavailable" as const } : state(id);
     await t.sweep(10_000);
     assert.equal(manifest(t.directory()).state, "kept");
   } finally { t.close(); }
 });
 
-/** Entries the trace bookkeeping holds that name the run, across whatever maps and sets it keeps. */
 function traceEntries(teams: TeamService, runId: string) {
   const traces = (teams as unknown as { retention: { traces: Record<string, unknown> } }).retention.traces;
   let count = 0;
@@ -477,7 +458,6 @@ function traceEntries(teams: TeamService, runId: string) {
 }
 
 test("trace bookkeeping holds nothing for members without a trace directory, and drops a run's entries when it is deleted", async () => {
-  // A started member without a trace directory.
   const plain = schedulerFixture();
   plain.writeTeam();
   const plainTeams = plain.openTeam();
@@ -486,7 +466,6 @@ test("trace bookkeeping holds nothing for members without a trace directory, and
     assert.equal(traceEntries(plainTeams, plain.run.id), 0);
   } finally { plainTeams.close(); plain.close(); }
 
-  // A run deleted while a pass over its trace is still asking the session; the pass ends after the deletion.
   const f = await tracedRun([{ exited: true, bytes: 64 }], { memberBytes: 1000, runBytes: 5000 });
   f.run.members[0]!.status = "stopped";
   f.writeTeam();
@@ -518,7 +497,6 @@ const require = createRequire(import.meta.url);
 const SPIED = ["access", "chmod", "existsSync", "lstat", "lstatSync", "mkdir", "mkdirSync", "open", "openSync", "readdir", "readdirSync",
   "readFile", "readFileSync", "realpath", "realpathSync", "rename", "renameSync", "rm", "rmSync", "rmdir", "rmdirSync", "stat",
   "statSync", "unlink", "unlinkSync", "writeFile", "writeFileSync"];
-/** Counts calls into node:fs and node:fs/promises whose path is under `root` while `body` runs. */
 async function fsCallsUnder(root: string, body: () => Promise<void>) {
   const originals: [Record<string, unknown>, string, unknown][] = [];
   let calls = 0;
@@ -559,8 +537,6 @@ test("a host that never kept traces does no trace work in a tick or a deletion; 
     assert.equal(calls, 0, "no filesystem call touched the traces root");
   } finally { neverTeams.close(); never.close(); }
 
-  // Traces kept while the setting was on, and a host started after it was removed: the root found at start keeps
-  // deletion working.
   const once = schedulerFixture();
   once.run.status = "cancelled";
   once.run.members.forEach(member => { member.status = "stopped"; });

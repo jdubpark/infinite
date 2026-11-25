@@ -13,7 +13,6 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 type Child = { rpc: (method: string, params?: unknown) => Promise<any>; initialize: () => Promise<void>; close: () => Promise<void> };
 
-/** A `team-mcp` child with the member's capability in its environment, as the launch gives it. */
 function startChild(env: NodeJS.ProcessEnv, cwd: string): Child {
   const child: ChildProcess = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/team-mcp.ts")], {
     cwd, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ...env },
@@ -27,7 +26,6 @@ function startChild(env: NodeJS.ProcessEnv, cwd: string): Child {
     const item = pending.get(value.id);
     if (item) { pending.delete(value.id); clearTimeout(item.timer); item.resolve(value); }
   });
-  // Diagnostics stay out of the test output: they may name the capability.
   child.stderr?.resume();
   child.on("exit", () => {
     for (const item of pending.values()) { clearTimeout(item.timer); item.reject(new Error("MCP helper exited before replying")); }
@@ -56,16 +54,13 @@ function startChild(env: NodeJS.ProcessEnv, cwd: string): Child {
   return { rpc, initialize, close };
 }
 
-/** The structured answer of a tool call. */
 const answerOf = (response: any) => response.result.structuredContent ?? JSON.parse(response.result.content[0].text);
 
-/** Starts a run with the member's MCP child, after the member's capability receipt exists. */
 async function runningMember(f: Awaited<ReturnType<typeof fixture>>) {
   const created = await f.host.fetchApi("/teams", "owner", f.create());
   assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
   const running = await waitFor(() => f.get(created.body.id), run => run.members.some(member => member.status === "running") && existsSync(join(f.receipts, "mcp-capability.json")), 30000);
   const member = running.members[0]!;
-  // A human lease keeps the scheduler from stopping the member while the test drives its capability.
   await claimControl(f.host, member.sessionId, "owner");
   const capability = JSON.parse(readFileSync(join(f.receipts, "mcp-capability.json"), "utf8")) as { url: string; token: string; assignment: Record<string, unknown> };
   return { id: created.body.id as string, member, capability };
@@ -83,7 +78,6 @@ test("a member posts, lists, and reads through the MCP tools", { timeout: 60000 
     const listing = await child.rpc("tools/list");
     const names = listing.result.tools.map((tool: { name: string }) => tool.name);
     for (const name of ["entry_post", "entry_list", "entry_get"]) assert.ok(names.includes(name), `${name} is listed`);
-    // Each answer below is checked against the result type this same child advertised.
     const advertised: Record<string, unknown> = Object.fromEntries(listing.result.tools.map((tool: { name: string; outputSchema?: unknown }) => [tool.name, tool.outputSchema]));
     for (const name of ["entry_post", "entry_list", "entry_get"]) assert.ok(advertised[name], `${name} declares a result type`);
 
@@ -118,7 +112,6 @@ test("a member posts, lists, and reads through the MCP tools", { timeout: 60000 
     assert.equal(JSON.stringify(answerOf(listed)).includes(entryId), false, "the member does not list its own entry");
     assert.deepEqual(schemaRefusals(advertised.entry_list, listed.result.structuredContent), [], "entry_list answers its declared result");
     assert.equal(listed.result.content[0].text, JSON.stringify(listed.result.structuredContent), "entry_list text is the answer");
-    // A filtered list keeps the member's own entry, so one head carries every field of a real MemberHead.
     const filtered = await child.rpc("tools/call", { name: "entry_list", arguments: { kinds: ["contract"] } });
     assert.ok(filtered.result.structuredContent.heads.some((head: { entryId: string }) => head.entryId === entryId));
     assert.deepEqual(schemaRefusals(advertised.entry_list, filtered.result.structuredContent), [], "a filtered entry_list answers its declared result");
@@ -144,7 +137,6 @@ test("a secret post is refused without echo, and tools off answers 403", { timeo
     children.push(child);
     await child.initialize();
 
-    // Built at run time so that the test source holds no token-shaped text.
     const token = "gh" + "p_" + "A".repeat(36);
     const secret = await child.rpc("tools/call", { name: "entry_post", arguments: { entry: { kind: "contract", summary: "Secret check", paths: [],
       body: { interface: "none", change: `token ${token}`, sources: [] } } } });

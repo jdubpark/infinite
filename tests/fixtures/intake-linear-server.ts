@@ -4,21 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 
-/** The fields intake reads from Linear. Defaults make an unlabelled-free, open, owner-created issue in the fixture team. */
 export interface IntakeFixtureIssue {
   id: string; identifier: string; url: string; title: string; description: string;
   createdAt: string; updatedAt: string; archivedAt: string | null;
   teamId: string; stateType: string; labels: string[]; creatorId: string | null;
-  /** Attachment URLs; a Slack thread link here is how an issue names its thread. */
   attachmentUrls: string[];
 }
 export interface IntakeFixtureComment { id: string; body: string; issueId: string }
 
-/**
- * A loopback GraphQL peer for intake. Candidates are filtered by team and, as Linear does, by a state-type `nin`
- * filter, and are paged by `first` and `after`; label, creator, archived, and creation time are left to the service's
- * own re-checks, which is what the tests exercise. Its writes commit before a lost response is returned.
- */
 export async function startIntakeLinearServer(options: { clock?: () => number } = {}) {
   const apiKey = randomBytes(32).toString("hex"), teamId = randomUUID(), ownerId = randomUUID();
   const directory = mkdtempSync(join(tmpdir(), "intake-linear-"));
@@ -28,12 +21,9 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
   const calls: { operation: string; query: string; variables: Record<string, any> }[] = [];
   let editNextCreated: Partial<IntakeFixtureIssue> | undefined;
   let loseNext = false, loseNextIssue = false, refuseNextIssue = false, unavailableValue = false, count = 0;
-  /** The issue labels Linear holds; `teamId` null is a workspace label. */
   const labels: { id: string; name: string; teamId: string | null }[] = [{ id: randomUUID(), name: "infinite", teamId }];
-  /** Who Linear reports as the creator of an issue the host files; the owner unless a test changes it. */
   let creatorOfCreated: string | null = ownerId;
   const malformed = new Set<string>(), malformedCreator = new Set<string>();
-  /** While set, every description is returned with bare URLs rewritten as Markdown links, as the tracker does. */
   let rewriteLinksValue = false;
   const linked = (text: string) => rewriteLinksValue ? text.replace(/https?:\/\/[^\s<>()]+/g, url => `[${url}](<${url}>)`) : text;
   const now = options.clock ?? (() => Date.now());
@@ -130,7 +120,6 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
 
   return {
     endpoint, apiKeyFile, teamId, ownerId, calls,
-    /** Adds an issue to the fixture team; unset fields take the defaults shown in the fixture. */
     file(input: Partial<IntakeFixtureIssue> & { id?: string } = {}): IntakeFixtureIssue {
       count += 1;
       const at = stamp();
@@ -143,39 +132,25 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
       issues.set(issue.id, issue);
       return issue;
     },
-    /** Changes an issue as a person would in Linear; the update time moves forward. */
     edit(id: string, change: Partial<IntakeFixtureIssue>) {
       const issue = issues.get(id);
       if (!issue) throw new Error("Fixture has no such issue");
       Object.assign(issue, change, { updatedAt: stamp() });
     },
-    /** Returns descriptions with bare URLs rewritten as Markdown links from now on, from creates and later reads alike. */
     rewriteLinks(on: boolean) { rewriteLinksValue = on; },
-    /** Returns the issue's node in a shape that intake cannot read; the issue still exists. */
     corrupt(id: string) { malformed.add(id); },
-    /** Gives the issue a creator field that is not a Linear user ID. */
     malformCreator(id: string) { malformedCreator.add(id); },
-    /** Deletes an issue; later state reads omit it. */
     remove(id: string) { issues.delete(id); },
-    /** Comments on an issue, oldest first. */
     comments(issueId: string): IntakeFixtureComment[] {
       return [...comments.values()].filter(comment => comment.issueId === issueId);
     },
-    /** The next comment create commits, but its HTTP response is lost. */
     loseNextCommentResponse() { loseNext = true; },
-    /** The next issue create commits, but its HTTP response is lost. */
     loseNextIssueResponse() { loseNextIssue = true; },
-    /** The next issue create commits with these fields changed, as if a teammate edited the issue at once. */
     editNextCreated(change: Partial<IntakeFixtureIssue>) { editNextCreated = change; },
-    /** The next issue create is refused with a GraphQL error and commits nothing. */
     refuseNextIssue() { refuseNextIssue = true; },
-    /** Replaces the labels Linear holds. */
     setLabels(next: { name: string; teamId: string | null }[]) { labels.splice(0, labels.length, ...next.map(label => ({ id: randomUUID(), ...label }))); },
-    /** The creator Linear reports for issues the host files. */
     createdBy(id: string | null) { creatorOfCreated = id; },
-    /** Every issue Linear holds. */
     allIssues(): IntakeFixtureIssue[] { return [...issues.values()]; },
-    /** While true, every request fails with a 503. */
     unavailable(value: boolean) { unavailableValue = value; },
     async close() {
       await new Promise<void>(resolve => server.close(() => resolve()));

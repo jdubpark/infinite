@@ -14,7 +14,6 @@ const fixedRequestId = "123e4567-e89b-42d3-a456-426614174000";
 
 type Recorded = { method: string; url: string; body: unknown };
 
-/** A fake host that serves one project view and records every request. A PUT echoes the change as saved. */
 async function withFakeHost(view: Record<string, unknown>, run: (requests: Recorded[], configPath: string) => Promise<void>) {
   const dir = mkdtempSync(join(tmpdir(), "infinite-autonomy-cli-"));
   const requests: Recorded[] = [];
@@ -25,7 +24,6 @@ async function withFakeHost(view: Record<string, unknown>, run: (requests: Recor
       const body = data ? JSON.parse(data) : undefined;
       requests.push({ method: req.method ?? "GET", url: req.url ?? "", body });
       res.setHeader("content-type", "application/json");
-      // A host that enrolls repositories and sets autonomy modes, but records no routing decisions.
       if (req.url === "/api/me" && req.method === "GET") res.end(JSON.stringify({ role: "owner", projects: [], teams: { repoEnrollment: 1, autonomyMode: 1 } }));
       else if (req.url === "/api/projects/example/team" && req.method === "GET") res.end(JSON.stringify(view));
       else if (req.url === "/api/projects/example/autonomy" && req.method === "PUT") {
@@ -91,7 +89,6 @@ test("autonomy mode sends nothing for a mode already saved", async () => {
   });
 });
 
-// The client prints a refusal as "[Infinite] ..." and sets exit code 1 instead of throwing.
 async function refused(run: () => Promise<unknown>) {
   const before = process.exitCode;
   const result = await quiet(run);

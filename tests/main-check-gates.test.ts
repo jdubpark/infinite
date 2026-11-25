@@ -7,16 +7,10 @@ import type { Config } from "../packages/host/src/types.js";
 import { Clock, World, type WorldHooks } from "./fixtures/main-check-world.js";
 import { rand, type Counts } from "./outcome-sim-script.js";
 
-/*
- * The R3 gates on the simulator's fake ports (INF-388): what a project records as `waiting` when one gate or two
- * gates hold, and the owner's view of a missing, an unreadable and a switched-off record.
- */
-
 const ROOT = "/srv/main-check-gates";
 const T0 = Date.parse("2026-11-20T08:00:00.000Z");
 const HEAD = "a".repeat(40);
 const TEAM = { checks: [{ command: "npm", args: ["test"] }] } satisfies TeamProject;
-/** R2, then the R3 gates 2 to 7, in the order the specification gives them. */
 const GATES = ["attempts", "execution-identity", "census-unavailable", "halt", "host-load", "storage", "another-check"] as const;
 type Gate = typeof GATES[number];
 const readable = (view: MainCheckView | undefined) => view?.readable ? view : undefined;
@@ -40,7 +34,6 @@ const hooks = (world: () => World): WorldHooks => ({
   otherHead: head => head,
 });
 
-/** A started service whose first pass ran, with `held` gates holding for alpha, whose head needs a check. */
 async function host(held: ReadonlySet<Gate>, options: { setting?: boolean; records?: Record<string, string> } = {}) {
   let world!: World;
   const counts: Counts = {};
@@ -66,7 +59,6 @@ async function host(held: ReadonlySet<Gate>, options: { setting?: boolean; recor
   const ports = world.ports({ id: 1, stopped: false });
   const service = new MainCheckService({ config, key: Buffer.alloc(32, 7), mirrorPath: id => `${ROOT}/mirrors/${id}.git`, halt: ports.halt, hostLoad: ports.hostLoad, ports });
   await service.start();
-  // The world answers at once; the virtual clock never moves, so one pass runs and the copy never finishes.
   for (let turn = 0; turn < 5; turn += 1) await new Promise(resolve => setImmediate(resolve));
   const record = JSON.parse(world.records.get("alpha")!) as MainCheckRecord;
   return { service, record };

@@ -12,7 +12,6 @@ const shells = ["/bin/sh", ...["dash", "bash"].filter((shell) => spawnSync(shell
 const egressEnvNames = ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "NO_PROXY", "no_proxy", "NODE_USE_ENV_PROXY"] as const;
 
 function runLoader(root: string, projectId: string, shell = "/bin/sh", extraArgs: string[] = [], hostEnv: Record<string, string> = {}) {
-  // NUL-separated so a multi-line value cannot masquerade as another entry.
   const result = spawnSync(shell, [...extraArgs, "-c", 'set -eu; . "$1"; infinite_load_env "$2" "$3"; env -0', "sh", loader, root, projectId], {
     cwd: root,
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...hostEnv },

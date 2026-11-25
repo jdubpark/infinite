@@ -50,7 +50,6 @@ test("native Codex attachment fences device control, pins its conversation, and 
   const bearer = { Authorization: `Bearer ${host.tokens.owner}` };
   const create = { provider: "codex", projectId: "rehearsal", title: "Native UI", localUi: true };
   try {
-    // Invalid opt-ins are refused before creating a worker or a conversation.
     for (const change of [{ nativeArgs: [] }, { nativeArgs: ["--resume", "foreign"] }, { provider: "grok", nativeArgs: ["prompt"] }])
       assert.notEqual((await host.fetchApi("/sessions", "owner", { ...create, ...change, requestId: randomUUID() })).status, 201);
     assert.equal((await host.fetchApi("/sessions")).body.sessions.length, 0);
@@ -93,8 +92,6 @@ test("native Codex attachment fences device control, pins its conversation, and 
     await waitFor(async () => first.messages.some(message => message.method === "item/commandExecution/requestApproval"), Boolean);
     assert.equal(existsSync(workspace + "/approval-result.json"), false, "the wrapper must not approve provider requests");
     const phone = await claimControl(host, id, "controller", { takeover: true });
-    // Immediately race a stale native response against the takeover, without waiting
-    // for the periodic socket close. The worker must check every individual frame.
     first.ws.send(JSON.stringify({ id: "approval", result: { decision: "accept" } }));
     await waitFor(async () => first.ws.readyState, state => state === WebSocket.CLOSED);
     assert.equal(existsSync(workspace + "/approval-result.json"), false);
@@ -123,8 +120,6 @@ test("native Codex attachment fences device control, pins its conversation, and 
     assert.equal(restored.pid, Number(initialPid));
     assert.deepEqual(restored.thread.turns.map((turn: { text: string }) => turn.text), ["initial prompt", "approval", "phone follow-up", "work"]);
 
-    // Delay the provider handshake so the worker admits frames into its bounded
-    // queue, then changes device control before it can forward them.
     writeFileSync(workspace + "/hold-upgrades", "hold");
     const beforeQueue = (await host.fetchApi(path)).body.seq;
     const queued = new WebSocket(nativeUrl(host, id, nextControl), { headers: bearer }); clients.push(queued);
@@ -174,8 +169,6 @@ test("CLI opens a local native frontend with a loopback credential and detaches 
   const fixture = resolve("tests/fixtures/native-codex.mjs");
   const host = await startHost({ agents: { codex: { command: process.execPath, args: [fixture] } } });
   let client: IPty | undefined;
-  // Hold the cloud handshake at the network boundary, without delaying HTTP
-  // lease renewal. Codex must not spend its initialize timeout on this handshake.
   const proxy = createServer((req, res) => {
     const upstream = request(host.origin + req.url, { method: req.method, headers: { ...req.headers, host: new URL(host.origin).host } }, response => {
       res.writeHead(response.statusCode!, response.headers); response.pipe(res);
@@ -209,7 +202,6 @@ test("CLI opens a local native frontend with a loopback credential and detaches 
   };
   try {
     const bin = host.root + "/bin"; mkdirSync(bin);
-    // A fixture executable at the normal local CLI boundary; production has no test flag.
     const quote = (s: string) => "'" + s.replaceAll("'", "'\\''") + "'";
     writeFileSync(bin + "/codex", `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(fixture)} "$@"\n`, { mode: 0o700 });
     const config = host.root + "/client.json";
@@ -422,8 +414,6 @@ test("--laptop Codex uses the laptop project, hands off a verified checkpoint, a
     assert.equal(readFileSync(cwd + "/agent-edit.txt", "utf8"), "LAPTOP_UNCOMMITTED\n".repeat(2));
     assert.equal((await host.fetchApi(path)).body.execution.location, "cloud", "downloading a copy must not move execution");
 
-    // A second real relay exercises the opposite boundary: an effect without
-    // its response is unresolved, so readiness cannot authorize a replay.
     const uncertainCwd = host.root + "/uncertain"; mkdirSync(uncertainCwd);
     writeFileSync(uncertainCwd + "/marker.txt", "UNCERTAIN_PROJECT");
     await launchIn(uncertainCwd, "Uncertain operation");

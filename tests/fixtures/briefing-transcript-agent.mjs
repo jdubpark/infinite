@@ -38,7 +38,6 @@ function assistantRecord(index, text = `Historical result ${index}`) {
 }
 
 const history = [];
-// Keep enough history to cross the 200-message activity window without adding needless fixture load.
 for (let index = 0; index < 110; index++) history.push(userRecord(index), assistantRecord(index));
 writeFileSync(transcriptPath, `${history.join("\n")}\n`);
 
@@ -46,11 +45,9 @@ const base = { session_id: sessionId, transcript_path: transcriptPath };
 relay({ ...base, hook_event_name: "UserPromptSubmit", prompt: "Review the current change." });
 relay({ ...base, hook_event_name: "Stop", last_assistant_message: "The first turn has ended." });
 
-// Providers may flush their final transcript records just after the stop hook.
 while (!existsSync(releaseLateTranscript)) await sleep(10);
 await sleep(90);
 appendFileSync(transcriptPath, `${userRecord("later")}\n${assistantRecord("later", "FINAL_TRANSCRIPT_MARKER: new turn result")}\n`);
 relay({ ...base, hook_event_name: "SessionEnd", reason: "completed" });
 
-// The host test stops this fixture after the automatic brief is ready.
 await new Promise(() => {});

@@ -88,7 +88,6 @@ function addTrial(f: Fixture, project: string, taskId: string, resolved: boolean
   return trialId;
 }
 
-/** Seeds `count` dev pairs for a project. `ownModel` lists task numbers whose resolved trial used the judge's own model. */
 function seedPairs(f: Fixture, project: string, count: number, ownModel: number[] = []): void {
   for (let i = 0; i < count; i++) {
     const taskId = `t-${project}-${String(i).padStart(3, "0")}`;
@@ -118,7 +117,6 @@ const judged = (start: Start, correct: boolean): JudgementOutcome => ({
   sessionId: null,
 });
 
-/** Runs every start the job hands out, up to `max`, and returns them. */
 async function drive(f: Fixture, decide: (start: Start) => JudgementOutcome, max = 500): Promise<Start[]> {
   const starts: Start[] = [];
   for (let i = 0; i < max; i++) {

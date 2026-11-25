@@ -8,7 +8,6 @@ import { deterministicUuid, intakeConfigSchema, missionRequestId } from "../pack
 import { MirroredProjects } from "../packages/host/src/mirrored-projects.js";
 import { writeSealed } from "../packages/host/src/vault.js";
 
-// The host package pins zod 4; the root zod 3 has no z.uuid(), so reuse the host's UUID schema.
 const uuid = intakeConfigSchema.shape.linear.shape.teamIds.element;
 
 const TEAM = "11111111-1111-4111-8111-111111111111";
@@ -59,13 +58,11 @@ const baseHost = {
 };
 
 let counter = 0;
-/** Writes a config file with `intake` merged over the valid base intake block and `host` over the base host config. */
 function parsed(intake: Record<string, unknown>, host: Record<string, unknown> = {}) {
   const file = join(root, `config-${++counter}.json`);
   writeFileSync(file, JSON.stringify({ ...baseHost, ...host, intake: { ...base, ...intake } }));
   return readConfig(file).config;
 }
-/** Same as `parsed`, then runs the intake validator on the parsed config. */
 function validate(intake: Record<string, unknown>, host: Record<string, unknown> = {}) {
   const config = parsed(intake, host);
   validateIntakeConfig(config);

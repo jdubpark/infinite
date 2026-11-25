@@ -6,85 +6,11 @@ import {
 } from "../packages/host/src/search-engine.js";
 import { bump, type Counts, type Rand, rand } from "./outcome-sim-script.js";
 
-/*
- * A seeded simulator of the search engine's event orders (INF-336). Each seed runs four team runs in one project, so
- * the brake's history and the project's pause carry from run to run. A run has one to three tasks; the dispatcher
- * prepares them at random moments, and each may be admitted to a search. Members act on drawn plans: a result (with a
- * scope violation, an unchanged tree, and a gate outcome) or a leave. The model host keeps one workspace operation slot
- * with a queue, as the design's Part 7 describes: a `live` base run starts only when nothing else waits and yields when
- * something arrives; captures and gate runs wait their turn. A launch is prepared and acknowledged on later steps, so
- * its receipt can cross the hold or the wait or arrive after the end; some receipts arrive twice. Faults: production
- * work arriving, a halt (steer, pause, cancel, block, routing revoked, revision), a restart during an operation (the run
- * blocks), a restart at rest (`resume`, which loses launches not yet prepared), a gate run that the host cannot stop
- * and that reports after its search ended, launches the spend fuse refuses, events of members and launches the search
- * does not know, the owner pausing and resuming the project, the host-load hold, under which queued operations wait,
- * and a host clock that jumps forward and back: every view carries the host's time, and S7 reads that time.
- *
- * Invariants, checked after every step from the engine's output and the simulator's own records. The simulator's
- * values are the truth: a mutant engine may see a tampered view, the checks never do.
- * S0 Every state parses with searchStateSchema, and the champion stays first.
- * S1 One winner: at most one `integrate` per search, only in the step that resolves it, naming the winner. Against the
- *    gate results the simulator delivered: a search resolves exactly at the first pass, for that member, and a pass
- *    delivered before the hold always resolves it.
- * S2 Challengers: a `start-challengers` keeps the run's spareAttempts at 3 or more with them counted, fits the free slot
- *    pairs and `attempts`, names known families distinct from each other and the champion's, none limited, never while
- *    another search is wide or launching; under after-fail only once the champion failed or left, under together also
- *    at arming; launches are numbered 1, 2, … and never start while one waits for its receipt.
- * S3 An ended search changes only by the first receipt of its pending launch, which clears it and, when it names a
- *    member, marks it widened; it decides only stops, its count, a pause and a cancel; states move only forward along
- *    the design's transitions.
- * S4 Against the captures and gate results the simulator delivered: gate runs follow the order in which it delivered
- *    captures in scope and changed before the wait, one outstanding at a time, at the captured commit; when a search
- *    resolves, every such capture delivered before the winner's had a failing gate result delivered; no search ends by
- *    the wait while such a capture waits for its gate.
- * S5 Nothing is gated after a pass, also not in the step that resolves the search.
- * S6 A `live` search that ends releases the task exactly once when exhausted or abandoned and never when resolved; no
- *    acknowledged challenger works after the end, and no champion works after another result won.
- * S7 Time, from the host time of each step and the design's formulas: each cutoff (hold, wait, window) is set at most
- *    its duration after the host time of the event that sets it, and never moves; an open search is before its hold
- *    (and a `measure` one before its window), and ends by the hold, the wait or the window not before that time; the
- *    hold ends a search as `exhausted`; the hold and the window fit before the deadline; no challenger works past the
- *    wait, and a search open past the wait has a capture made before it still waiting for its gate; every run ends with
- *    every search ended.
- * S8 Classes follow Part 8 from what the simulator delivered: the pass that resolved the search, and the champion's
- *    fate delivered after the arming in earlier steps (a failed gate run, a capture out of scope or unchanged, a stall
- *    or an exit without a report); `challenger-first` only under together; no class on a search that never armed. The
- *    arming is read from the delivered failed base run and the simulator's own hold.
- * S9 A search arms only in the step of a failed base run of a `live` search, always does when it stays open, and stays armed.
- * S10 The brake and the pause: admission refuses with condition 6 exactly while the project is paused, the run has had
- *    two searches, or a search is wide or has a launch out (ended or not); a search counts toward the brake exactly
- *    once, with the oracle's class, in the first step in which the simulator has delivered a first receipt that named a
- *    member and the search has ended (so a receipt after the end counts it); a `pause` comes with every count that
- *    leaves the brake engaged, and the pause holds until the owner resumes.
- * S11 A `measure` search starts no challenger, captures nothing, holds and releases nothing; its base run comes at the
- *    boundary; it is `measured` only after a failed base run with the champion's gate result.
- * S12 A restart at rest re-derives an open search's queued base run, its waiting captures (a set: none has completed,
- *    so none has an order), its outstanding gate run, and the launch that waits for its receipt, and starts no new
- *    launch. The host resumes every open search and every ended one with a launch out.
- * S13 Receipts: every member of a launch's first receipt is a contestant or stopped in that step, and after the end
- *    exactly those are stopped; a repeated receipt, or an event of a member or launch the search does not know, does
- *    what the time passing alone does, and so does any event delivered again at once (the host contract redelivers
- *    events whose step it had not saved); no stop ever names the winner; the step that ends a search with a launch out
- *    cancels that launch once, and so does a restart that finds it ended so; every launch has its receipt by the end
- *    of the run (the model host answers a cancelled launch with the members it prepared, or none).
- * S14 A stop never names a member whose result arrived in an earlier step, and a stopped member is never captured or gated.
- *
- * Each invariant has at least one mutant engine in tests/search-engine-sim.test.ts (an in-process wrapper of `admit` or
- * `step`) that the default corpus must catch through that invariant, and the test names the seed that did.
- *
- * What it does not check: the host's I/O (Git, the operation records, the outcome ledger), plan order of integration,
- * and the record events of Part 6. It models no persistence boundary: the model host acts on each step's decisions at
- * once and never crashes between a save and an action, so the host contract's replay order, closed launches and
- * serialized brake are checked by host tests at wiring; S13 checks only the engine's side, that an event delivered
- * again changes nothing. Rule semantics with exact values stay with tests/search-engine.test.ts.
- */
-
 const RUNS_PER_SEED = 4;
 const MAX_STEPS = 800;
 const MINUTE = 60_000;
 const T0 = Date.parse("2026-11-20T10:00:00.000Z");
 const BASE = "b".repeat(40);
-/** Condition 11's floor, from the design's text. */
 const RESERVE = 3;
 const FAMILIES: Readonly<Record<string, string | undefined>> = {
   "p-claude": "anthropic", "p-claude-2": "anthropic", "p-gpt": "openai", "p-gpt-2": "openai", "p-gemini": "google",
@@ -96,14 +22,12 @@ const CHAMPION_LEAVES: readonly (readonly [number, LeaveReason])[] = [[10, "stal
   [3, "blocked"], [4, "escalate"], [5, "permission"], [2, "prep-failed"]];
 const CHALLENGER_LEAVES: readonly (readonly [number, LeaveReason])[] = [[8, "stall"], [4, "no-report"], [5, "limit"], [6, "permission"],
   [3, "question"], [3, "blocked"], [3, "escalate"], [2, "prep-failed"]];
-/** Allowed moves of `state` in one step (Part 4). */
 const NEXT: Readonly<Record<string, readonly string[]>> = {
   admitting: ["admitting", "armed", "abandoned", "measured", "exhausted"],
   armed: ["armed", "wide", "resolved", "exhausted", "abandoned"],
   wide: ["wide", "resolved", "exhausted", "abandoned"],
 };
 
-/** Part 7 and Part 3 from the design's text: a gate run is 20 minutes of clone and setup plus `gateMinutes`. */
 const allowance = (p: SearchPolicy, baseOpen: boolean) => (p.attempts + (baseOpen ? 1 : 0)) * (20 + p.gateMinutes) + p.waitMinutes;
 const windowMinutes = (p: SearchPolicy, searches: number) => 2 * (20 + p.gateMinutes) * searches;
 
@@ -112,25 +36,17 @@ type ResultPlan = { kind: "result"; scope: "ok" | "violation"; empty: boolean; g
 type Plan = ResultPlan | { kind: "leave"; reason: LeaveReason };
 type Member = { id: string; taskId: string; profileId: string; challenger: boolean; working: boolean; acked: boolean; plan: Plan };
 type Op = { kind: "base" | "capture" | "gate" | "work"; taskId?: string; memberId?: string; outcome?: GateOutcome; stale?: boolean };
-/** A `start-challengers` decision as the host keeps it: the intent (memory only), the prepared members, receipts due. */
 type Launch = { n: number; profileIds: string[]; intent: boolean; members?: Member[]; acked: boolean; due: number; delay: number; slow: boolean };
-/** What the simulator delivered to and received from one search: the facts the checks compare against. */
 type Ledger = {
   base?: GateOutcome | "yielded"; outstanding?: string; integrates: number; releases: number;
   gated: { memberId: string; outcome: GateOutcome }[]; stopped: Set<string>; resulted: Set<string>;
-  /** Delivered captures in scope and changed, in delivery order: true when delivered before the wait, so gateable. */
   okCaptures: Map<string, boolean>;
-  /** A failed base run was delivered and armed the search; the champion's fate (a failed gate run, a capture out of
-   * scope or unchanged, a stall or an exit without a report) was delivered after the arming. */
   armed: boolean; championDone: boolean;
   hold?: number; wait?: number; window?: number;
-  /** A first receipt that named a member was delivered, and the search's count toward the brake was checked. */
   widened: boolean; counted: boolean;
-  /** The class the design gives the search at its end, from the simulator's oracle. */
   oracleClass?: SearchClass;
 };
 type Task = { id: string; prepared: boolean; done: boolean; champion?: Member; search?: SearchState; ledger: Ledger; launches: Launch[] };
-/** How the simulator produced an event: a gate run that reported after its search ended, a launch receipt, a ghost. */
 type Meta = { stale?: boolean; receipt?: "first" | "again"; ghost?: boolean };
 type Project = { history: SearchClass[]; paused: boolean };
 
@@ -154,7 +70,6 @@ function drawPlan(r: Rand, challenger: boolean): Plan {
   return { kind: "leave", reason: weighted(r, challenger ? CHALLENGER_LEAVES : CHAMPION_LEAVES) };
 }
 
-/** Part 8, restated from the design's text: 10 or more widened searches, fewer than 2 rescued among the last 10. */
 function engaged(history: readonly SearchClass[]): boolean {
   if (history.length < 10) return false;
   let rescued = 0;
@@ -162,7 +77,6 @@ function engaged(history: readonly SearchClass[]): boolean {
   return rescued < 2;
 }
 
-/** The champion failed its gate or left on its own (rule 2), the condition for widening and for a rescue. */
 const championDone = (s: SearchState) => {
   const first = s.contestants[0]!;
   return (first.gate !== undefined && first.gate.result !== "pass") || first.left === "stall" || first.left === "no-report";
@@ -186,9 +100,7 @@ class RunSim {
   private steps = 0;
   private serial = 0;
   private halted = false;
-  /** The host-load hold: queued operations wait, so a restart can find work queued and none open. */
   private loadHold = false;
-  /** The host clock's error: views carry `clock + skew`, and the clock jumps forward and back now and then. */
   private skew = 0;
 
   constructor(private readonly r: Rand, private readonly engine: Engine, private readonly counts: Counts,
@@ -199,7 +111,6 @@ class RunSim {
     this.checkMinutes = r.pick([10, 30, 60]);
     const count = r.int(1, 3);
     this.tasks = Array.from({ length: count }, (_, index) => ({ id: `t${index + 1}`, prepared: false, done: false, ledger: newLedger(), launches: [] }));
-    // spareAttempts starts at 2 to 9 once every champion is prepared, so the reserve often binds.
     this.limit = 2 * count + 3 + r.int(2, 9);
     this.deadline = r.chance(0.4) ? at(T0 + r.int(150, 700) * MINUTE) : undefined;
     this.candidates = [...PROFILE_IDS].sort(() => r.next() - 0.5)
@@ -231,12 +142,10 @@ class RunSim {
     return this.halted || (this.tasks.every(task => task.prepared && (!task.search || !isOpen(task.search))) && this.current === undefined);
   }
 
-  /** The host's time, which every view and every check of S7 reads. */
   private now(): number {
     return this.clock + this.skew;
   }
 
-  /** The host clock jumps: forward, or back across moments the record already holds. */
   private jump(): void {
     const minutes = this.r.pick([-150, -60, -20, -5, 5, 20, 60]);
     this.skew += minutes * MINUTE;
@@ -247,7 +156,6 @@ class RunSim {
     return this.tasks.filter(task => task.search !== undefined && isOpen(task.search));
   }
 
-  /** A search the host sees as wide for conditions 6 and 9: `wide`, or with a launch that waits for its receipt, ended or not. */
   private wide(task: Task): boolean {
     return (task.search !== undefined && isOpen(task.search) && task.search.state === "wide") || task.launches.some(l => !l.acked);
   }
@@ -267,8 +175,6 @@ class RunSim {
     for (const m of this.members) if (m.working && (!m.challenger || m.acked)) list.push([3, later(this.r.int(0, 12), () => this.act(m))]);
     if (this.current) list.push([4, later(this.r.int(0, 12), () => this.complete())]);
     if (this.boundaryReady()) list.push([4, later(this.r.int(0, 5), () => this.boundary())]);
-    // A restart is likelier while a slow launch waits for its preparation, so that the restart loses it, and while an
-    // ended search's launch waits for its receipt, so that the restart finds the search ended.
     const endedLaunch = this.tasks.some(task => task.search && !isOpen(task.search) && task.launches.some(l => !l.acked));
     const slowLaunch = this.tasks.some(task => task.launches.some(l => l.intent && l.slow));
     if (this.openTasks().length > 0) {
@@ -297,7 +203,6 @@ class RunSim {
     return this.tasks.find(task => task.id === id)!;
   }
 
-  /** The run's spareAttempts: limit − members − launches not yet prepared − tasks not yet integrated − 3. */
   private spare(): number {
     const launching = this.tasks.flatMap(task => task.launches).filter(l => l.intent).reduce((sum, l) => sum + l.profileIds.length, 0);
     return this.limit - this.members.length - launching - this.tasks.filter(task => !task.done).length - 3;
@@ -315,13 +220,10 @@ class RunSim {
     };
   }
 
-  // ---- Actions -----------------------------------------------------------------------------------------------------
-
   private prepare(task: Task): void {
     task.prepared = true;
     const champion = this.newMember(task, this.r.pick(PROFILE_IDS), false);
     task.champion = champion;
-    // The owner resumes a paused project now and then, and the brake's count starts again; rarely the owner pauses it.
     if (this.project.paused && this.r.chance(0.3)) {
       Object.assign(this.project, { paused: false, history: [] });
       bump(this.counts, "owner:resume");
@@ -347,7 +249,6 @@ class RunSim {
       project: { paused: this.project.paused, starts: Array.from({ length: this.r.int(15, 130) }, () => this.r.chance(0.07)) },
     };
     const admission = this.engine.admit(facts);
-    // S10: conditions 1 to 5 hold unless a flip broke one; then condition 6 is the pause, two searches, or a wide search.
     if (!flips.some(Boolean)) {
       const six = this.project.paused || searches >= 2 || wide;
       const refusedAtSix = !admission.admitted && admission.condition === 6;
@@ -367,7 +268,6 @@ class RunSim {
     const task = this.task(m.taskId);
     const s = task.search;
     if (!s || !isOpen(s)) {
-      // No search holds this member: it goes on as today, outside the simulator.
       m.working = false;
       if (!m.challenger) task.done = true;
       return;
@@ -385,7 +285,6 @@ class RunSim {
       return;
     }
     if (s.mode === "live") return this.deliver(task, { kind: "result", memberId: m.id });
-    // `measure`: today's single operation captures and integrates the result, or refuses it.
     task.done = true;
     if (plan.scope === "violation" || this.r.chance(0.04)) {
       this.deliver(task, { kind: "left", memberId: m.id, reason: plan.scope === "violation" ? "scope" : "conflict" });
@@ -444,16 +343,13 @@ class RunSim {
       return;
     }
     bump(this.counts, "fault:restart-resume");
-    // A launch not yet prepared lived in memory; prepared members and their receipts are on record.
     for (const task of this.tasks) for (const l of task.launches) if (l.members === undefined && l.intent) {
       l.intent = false;
       bump(this.counts, "fault:launch-lost");
     }
-    // The host resumes every open search, and every ended one whose launch still waits for its receipt.
     for (const task of this.tasks) if (task.search && (isOpen(task.search) || task.launches.some(l => !l.acked))) this.deliver(task, { kind: "resume" });
   }
 
-  /** An event of a member or a launch the search does not know. */
   private ghost(): void {
     const task = this.r.pick(this.openTasks());
     const id = `${task.id}-ghost`;
@@ -464,7 +360,6 @@ class RunSim {
     this.deliver(task, event, { ghost: true });
   }
 
-  /** The host prepares a launch's challengers, each through the spend fuse, and owes the launch's receipt. */
   private prepareLaunch(task: Task, l: Launch): void {
     l.intent = false;
     const admitted = l.profileIds.filter(() => !this.r.chance(0.12));
@@ -472,7 +367,6 @@ class RunSim {
     l.members = admitted.map(profileId => this.newMember(task, profileId, true));
     bump(this.counts, "challengers:started", l.members.length);
     l.due = this.r.chance(0.2) ? 2 : 1;
-    // Most receipts follow at once; some arrive late enough to cross the hold, the wait, or the end.
     l.delay = this.r.chance(0.2) ? this.r.int(10, 60) : 0;
   }
 
@@ -486,10 +380,6 @@ class RunSim {
     this.deliver(task, { kind: "started", launch: l.n, challengers }, { receipt: first ? "first" : "again" });
   }
 
-  // ---- The model host ----------------------------------------------------------------------------------------------
-
-  /** One operation at a time, none started under the host-load hold: other work first, in any order (captures can
-   * overtake a queued gate run); a `live` base run starts only when nothing else waits, and yields to it. */
   private settleOps(): void {
     for (;;) {
       const op = this.current;
@@ -534,9 +424,7 @@ class RunSim {
         this.queue.push({ kind: "gate", taskId: task.id, memberId: d.memberId });
         task.ledger.outstanding = d.memberId;
       } else if (d.kind === "start-challengers") {
-        // A repeated decision prepares a launch whose intent a restart lost, or delivers the prepared one's receipt again.
         const known = task.launches.find(l => l.n === d.launch);
-        // Some launches wait long for preparation, so the hold, the wait, a halt or a restart can overtake them.
         if (known === undefined) task.launches.push({ n: d.launch, profileIds: [...d.profileIds], intent: true, acked: false, due: 0, delay: 0, slow: this.r.chance(0.2) });
         else if (known.members === undefined) known.intent = true;
         else known.due += 1;
@@ -546,9 +434,8 @@ class RunSim {
       else if (d.kind === "integrate") task.done = true;
       else if (d.kind === "release") {
         task.done = true;
-        task.champion!.working = false; // A champion that still works goes on as a single attempt, outside the simulator.
+        task.champion!.working = false;
       } else if (d.kind === "cancel-launch") {
-        // The host prepares nothing more for the launch and owes its one receipt: an empty one when nothing was prepared.
         const l = task.launches.find(item => item.n === d.launch);
         if (l !== undefined && !l.acked && l.members === undefined) {
           bump(this.counts, l.intent ? "cancel:unprepared" : "cancel:lost-in-restart");
@@ -558,7 +445,6 @@ class RunSim {
     }
   }
 
-  /** Delivers one event to a task's search: the engine's step, the checks, then the host acts on the decisions. */
   private deliver(task: Task, event: SearchEvent, meta: Meta = {}): void {
     const prev = task.search!;
     const view = this.view(task);
@@ -568,14 +454,10 @@ class RunSim {
     task.search = next;
     this.apply(task, decisions, event);
     this.checkAfter(task, prev, next);
-    // S13, last: the host contract redelivers an event whose step it had not saved. Delivered again at once, the event
-    // does what the time passing alone does.
     if (event.kind !== "resume" && event.kind !== "tick" && !isDeepStrictEqual(this.engine.step(next, event, view), this.engine.step(next, { kind: "tick" }, view))) {
       this.fail("S13", `an event delivered again did more than the time passing (event ${JSON.stringify(event)})`, task);
     }
   }
-
-  // ---- Invariants --------------------------------------------------------------------------------------------------
 
   private parse(s: SearchState, task: Task): void {
     const parsed = searchStateSchema.safeParse(s);
@@ -591,9 +473,6 @@ class RunSim {
     const stops = decisions.flatMap(d => (d.kind === "stop" ? d.memberIds : []));
     this.parse(next, task);
 
-    // S10: a search counts toward the brake once, from the receipts the simulator delivered: in the first step in which
-    // a first receipt that named a member has been delivered and the search has ended (at its end, or at a receipt that
-    // arrives after it), with the oracle's class; a pause comes with every count that leaves the brake engaged.
     const named = event.kind === "started" && meta.receipt === "first" && event.challengers.length > 0;
     const checkCount = (endedNow: boolean) => {
       if (named) ledger.widened = true;
@@ -613,7 +492,6 @@ class RunSim {
       if (expectPause) bump(this.counts, this.project.paused ? "pause:again" : "pause:first");
     };
 
-    // S13
     if (event.kind === "started" && meta.receipt === "first") {
       for (const { memberId } of event.challengers) {
         if (!next.contestants.some(c => c.memberId === memberId) && !stops.includes(memberId)) fail("S13", `${memberId} was acknowledged and is neither a contestant nor stopped`);
@@ -625,14 +503,12 @@ class RunSim {
     }
     const winner = next.winner ?? prev.winner;
     if (winner !== undefined && stops.includes(winner)) fail("S13", `the winner ${winner} was stopped`);
-    // An end with a launch out cancels it once, and so does a restart that finds the search ended with it out.
     const out = task.launches.find(l => !l.acked);
     const cancels = decisions.flatMap(d => (d.kind === "cancel-launch" ? [d.launch] : []));
     const owed = out !== undefined && !isOpen(next) && (isOpen(prev) || event.kind === "resume");
     if (!isDeepStrictEqual(cancels, owed ? [out.n] : [])) fail("S13", `cancelled ${JSON.stringify(cancels)} with launch ${out?.n ?? "none"} out`);
     if (owed) bump(this.counts, isOpen(prev) ? "cancel:at-end" : "cancel:at-restart");
 
-    // S14
     for (const id of stops) {
       if (ledger.resulted.has(id)) fail("S14", `${id} is stopped after its result arrived`);
       ledger.stopped.add(id);
@@ -642,7 +518,6 @@ class RunSim {
     }
     if (event.kind === "result" && !meta.ghost) ledger.resulted.add(event.memberId);
 
-    // S3: an ended search changes only by its launch's first receipt, which clears it and, naming a member, widens it.
     if (!isOpen(prev)) {
       const late = event.kind === "started" && meta.receipt === "first";
       const { pending: _pending, ...settled } = prev;
@@ -660,8 +535,6 @@ class RunSim {
     const first = next.contestants[0]!;
     const championId = task.champion!.id;
 
-    // Ledger: what the simulator delivered. The arming is read from the delivered failed base run and the simulator's
-    // own hold, since a hold that has passed ends the search before a base result in the same step applies.
     if (!meta.ghost) {
       if (live && event.kind === "base" && event.outcome === "fail" && ledger.base === undefined && !(ledger.hold !== undefined && now >= ledger.hold)) ledger.armed = true;
       if (event.kind === "base") ledger.base = event.outcome;
@@ -675,7 +548,6 @@ class RunSim {
     const gateable = [...ledger.okCaptures].filter(([, before]) => before).map(([id]) => id);
     const waiting = gateable.filter(id => !ledger.gated.some(g => g.memberId === id));
 
-    // S7: each cutoff the step sets is at most its design duration after the host time of the step, and none moves.
     for (const key of ["holdUntil", "waitUntil"] as const) {
       const before = prev[key];
       const after = next[key];
@@ -687,7 +559,6 @@ class RunSim {
       bump(this.counts, `cutoff:${key}`);
     }
 
-    // S7's times, from the events the simulator delivered, the host time, and the design's formulas.
     if (isOpen(next) && !meta.ghost) {
       if (live && event.kind === "result" && event.memberId === championId) ledger.hold ??= now + allowance(this.policy, ledger.base === undefined) * MINUTE;
       const left = live && event.kind === "left" && event.memberId === championId && (event.reason === "stall" || event.reason === "no-report") && ledger.base === "fail";
@@ -698,13 +569,11 @@ class RunSim {
       if (!live && event.kind === "boundary") ledger.window ??= now + windowMinutes(this.policy, event.searches) * MINUTE;
     }
 
-    // S9, first: arming is what the later checks build on.
     const failedBase = event.kind === "base" && event.outcome === "fail";
     if (prev.armedAt === undefined && next.armedAt !== undefined && !(failedBase && live)) fail("S9", "armed without a failed base run of a live search");
     if (prev.armedAt !== undefined && next.armedAt !== prev.armedAt) fail("S9", "armedAt changed");
     if (failedBase && live && prev.state === "admitting" && isOpen(next) && next.armedAt === undefined) fail("S9", "a failed base run left the search unarmed");
 
-    // S1
     const integrates = of("integrate");
     ledger.integrates += integrates.length;
     if (ledger.integrates > 1) fail("S1", "a second integrate");
@@ -722,7 +591,6 @@ class RunSim {
       if (delivered && event.outcome === "pass" && !resolvedNow && !(ledger.hold !== undefined && now >= ledger.hold)) fail("S1", `the pass of ${event.memberId} did not resolve the search`);
     }
 
-    // S2
     for (const d of of("start-challengers")) {
       if (d.kind !== "start-challengers") continue;
       if (!live) fail("S11", "a measure search started a challenger");
@@ -747,7 +615,6 @@ class RunSim {
       if (!arming && !championDone(next)) fail("S2", "a challenger while the champion still works");
     }
 
-    // S4, S5: against the captures and gate results the simulator delivered.
     const gates = of("gate");
     if (gates.length > 1) fail("S4", "two gate runs at once");
     for (const g of gates) {
@@ -768,7 +635,6 @@ class RunSim {
     }
     if (ended && next.endReason === "wait" && waiting.length > 0) fail("S4", `ended by the wait while ${waiting[0]}'s capture, delivered before it, waits for its gate`);
 
-    // S6: releases in this step.
     const releases = of("release");
     ledger.releases += releases.length;
     if (live && ended) {
@@ -777,8 +643,6 @@ class RunSim {
       if (releases.some(d => d.kind === "release" && d.memberId !== first.memberId)) fail("S6", "a release of another member than the champion");
     } else if (releases.length > 0) fail("S6", "a release while the search goes on");
 
-    // S8: the class from what the simulator delivered: the pass that resolved the search (S1 ties the resolution to it)
-    // and the champion's fate delivered in earlier steps. Then this step's fate, for later steps.
     if (ended && live && ledger.armed) {
       const winner = next.state === "resolved" && event.kind === "gated" ? event.memberId : undefined;
       const expected: SearchClass = winner === undefined ? "none" : winner === championId ? "champion-pass"
@@ -794,7 +658,6 @@ class RunSim {
       if (fate) ledger.championDone = true;
     }
 
-    // S10
     if (ended) {
       bump(this.counts, `end:${next.state}`);
       bump(this.counts, `reason:${next.endReason ?? next.state}`);
@@ -802,7 +665,6 @@ class RunSim {
     }
     checkCount(ended);
 
-    // S11
     if (!live) {
       const forbidden = decisions.filter(d => ["capture", "start-challengers", "integrate", "release", "pause", "stop"].includes(d.kind));
       if (forbidden.length > 0) fail("S11", `a measure search decided ${forbidden.map(d => d.kind).join(", ")}`);
@@ -812,10 +674,7 @@ class RunSim {
       }
     }
 
-    // S12
     if (event.kind === "resume" && isOpen(next)) {
-      // Captures that have not completed have no order yet, so they compare as a set; gate runs follow capture order. Once
-      // the wait has passed, no capture is owed: none would be gated.
       const queued = this.queue.filter(op => op.taskId === task.id && !(op.kind === "capture" && ledger.wait !== undefined && now >= ledger.wait));
       const want = { base: queued.filter(op => op.kind === "base").length, captures: queued.filter(op => op.kind === "capture").map(op => op.memberId).sort(),
         gates: queued.filter(op => op.kind === "gate").map(op => op.memberId), launches: task.launches.filter(l => !l.acked).map(l => [l.n, l.profileIds]) };
@@ -826,7 +685,6 @@ class RunSim {
     }
   }
 
-  /** Checks on the simulator's members and its own clock once the host has acted on the step's decisions. */
   private checkAfter(task: Task, prev: SearchState, next: SearchState): void {
     const now = this.now();
     const ledger = task.ledger;
@@ -858,10 +716,8 @@ class RunSim {
   }
 }
 
-/** One seed: four runs in one project whose brake history starts from a random prior, paused when it engages the brake. */
 export function simulate(seed: number, engine: Engine, counts: Counts): void {
   const r = rand(seed);
-  // A third of the projects start one widened search short of the brake's window, so that counts engage it often.
   const length = r.chance(0.33) ? 9 : r.int(0, 14);
   const history: SearchClass[] = Array.from({ length }, () => weighted(r, [[25, "rescued"], [35, "none"], [30, "champion-pass"], [10, "challenger-first"]] as const));
   const project: Project = { history, paused: engaged(history) };

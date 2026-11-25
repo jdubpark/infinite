@@ -1,10 +1,3 @@
-// A scripted stand-in for `claude --print`, for tests/permission-headless.test.ts. It reads the hooks from
-// `--settings`, runs each hook command with the hook payload on stdin, and combines their decisions the way the
-// provider does for this test: deny over defer over allow. A deferred call ends the run with the call recorded under
-// `.fake-claude/` in the working directory; `--resume ID` asks PreToolUse again for that call, once, after any
-// `hold-resume` file in the working directory is gone. Like the provider, it submits its prompt through
-// UserPromptSubmit, and after a resumed call it submits its own continue prompt the same way.
-// Tool calls "run" by appending a line to `ran.log`; a denied call's reason goes to `denied.log`.
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -43,7 +36,6 @@ async function hooks(event, payload) {
   return outputs;
 }
 
-/** One tool call through PreToolUse, the allow list, and PermissionRequest. Returns what happened. */
 async function call(tool, input, id, agent) {
   const base = { tool_name: tool, tool_input: input, ...(agent ? { agent_id: agent, agent_type: "general-purpose" } : {}) };
   const pre = await hooks("PreToolUse", { ...base, tool_use_id: id });
@@ -67,7 +59,6 @@ function run(tool, input) { appendFileSync(join(process.cwd(), "ran.log"), `${in
 function deny(tool, input, reason) { appendFileSync(join(process.cwd(), "denied.log"), `${input.command ?? tool}: ${reason}\n`); return "denied"; }
 
 if (resume) {
-  // A test can hold the resumed run before it asks for the call again, to restart the host's API in between.
   while (existsSync(join(process.cwd(), "hold-resume"))) await new Promise((done) => setTimeout(done, 50));
   if (!existsSync(marker)) {
     console.error("Error: No deferred tool marker found in the resumed session.");
@@ -75,7 +66,6 @@ if (resume) {
   }
   const deferred = JSON.parse(readFileSync(marker, "utf8"));
   rmSync(marker);
-  // A test can change the call on resume to prove the owner's answer binds to the call it was given for.
   const input = existsSync(join(process.cwd(), "change-on-resume")) ? { command: `${deferred.input.command} --and-more` } : deferred.input;
   await call(deferred.tool, input, deferred.id);
   await hooks("UserPromptSubmit", { prompt: "Continue from where you left off." });
@@ -84,11 +74,8 @@ if (resume) {
 }
 
 const steps = {
-  // An open call the pipeline allows, one it rejects, then a call a class rule reserves for the owner.
   mixed: [["Bash", { command: "make safe-build" }, "toolu_safe"], ["Bash", { command: "rm -rf scratch" }, "toolu_unsafe"], ["Bash", { command: "deploy production" }, "toolu_prod"]],
-  // A class call that the profile's allow list would have let through.
   allowlisted: [["Bash", { command: "deploy production" }, "toolu_prod"]],
-  // A subagent's class call cannot wait.
   subagent: [["Bash", { command: "deploy production" }, "toolu_sub", "agent-1"]],
 }[prompt.split(" ")[0]] ?? [];
 await hooks("UserPromptSubmit", { prompt });

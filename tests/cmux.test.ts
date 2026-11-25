@@ -14,8 +14,6 @@ import { unseal } from "../packages/host/src/vault.js";
 import type { Config, ControlLease, Receipt } from "../packages/host/src/types.js";
 import { apiClient, claimControl, startHost, waitFor } from "./helpers.js";
 
-// A real executable stands at the cmux process boundary. It supplies terminal
-// observations, but all authorization, journals and receipts belong to the adapter.
 const CLI = String.raw`
 import {readFileSync,writeFileSync,appendFileSync} from 'node:fs';
 import {dirname,join} from 'node:path';
@@ -111,8 +109,6 @@ async function fixture(t: TestContext, starting = false) {
   sessions = new CmuxSessions(config, key);
   const mutations = () => existsSync(join(root, "mutations.jsonl")) ? readFileSync(join(root, "mutations.jsonl"), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
   const restart = async () => { await sessions!.close(); sessions = new CmuxSessions(config, key); return sessions; };
-  // An unavailable CLI is a valid discovery result. Establish fixture readiness
-  // with read-only observations before testing actions; never retry a mutation.
   let row = (await sessions.list()).find(row => row.nativeSession?.id === nativeId);
   if (!row) row = (await sessions.list()).find(row => row.nativeSession?.id === nativeId);
   const trace = existsSync(join(root, "calls.jsonl")) ? readFileSync(join(root, "calls.jsonl"), "utf8").trim().split("\n").slice(-12).join("; ") : "no fixture CLI started";
@@ -210,7 +206,6 @@ test("cmux refuses unknown foreground, stale surfaces, and dialog bypasses", { t
   await assert.rejects(send(), { code: "draft-present" });
   assert.equal(f.mutations().length, 0, "remote control does not overwrite someone's local prompt draft");
   f.setState({ screen: "> " });
-  // A different native conversation takes over the same terminal locally.
   const replacement = randomUUID();
   f.hooks[replacement] = { ...f.hooks[f.nativeId], sessionId: replacement, updatedAt: Date.now() / 1000 + 1 }; f.writeHooks();
   assert.equal((await f.sessions.get(f.id)).status, "exited");
@@ -219,7 +214,6 @@ test("cmux refuses unknown foreground, stale surfaces, and dialog bypasses", { t
   assert.equal(f.mutations().length, 0);
   f.setState({ offline: true });
   assert.equal((await f.sessions.get(f.id)).status, "unavailable");
-  // An outage that lasts reads the same on every poll: the row keeps the time it became unavailable.
   const during = JSON.stringify(await f.sessions.list());
   await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(JSON.stringify(await f.sessions.list()), during);
@@ -301,7 +295,6 @@ test("a lasting cmux outage saves what the host learns meanwhile and keeps the t
     f.setState(start);
     const first = await f.sessions.get(f.id);
     assert.equal(first.status, "unavailable", outage);
-    // The terminal is renamed while the outage lasts: the next observation changes the record but not its state.
     f.setState({ workspaces: [{ id: "workspace", panes: [{ surfaces: [{ id: "surface", type: "terminal", title: `✳ Renamed during ${outage}` }] }] }] });
     const second = await f.sessions.get(f.id);
     assert.equal(second.title, `Renamed during ${outage}`);
@@ -310,7 +303,6 @@ test("a lasting cmux outage saves what the host learns meanwhile and keeps the t
     f.setState(end);
     assert.equal((await f.sessions.get(f.id)).status, "running", outage);
   }
-  // A journal that cannot be opened is a recording error, dated by the last recorded activity, never the read.
   const events = join(f.config.stateDir, "cmux", f.id, "events");
   appendFileSync(join(events, readdirSync(events).filter(name => name.endsWith(".journal")).sort().at(-1)!), "incomplete");
   await f.restart();
@@ -327,8 +319,6 @@ test("one cmux record's failed journal write does not cost another record its sa
   f.setState({ vault: [row("first.jsonl")] });
   const other = (await f.sessions.list()).find(listed => listed.nativeSession?.id === history)!;
   assert.equal(other.status, "exited");
-  // In one refresh the live terminal closes, so its record must journal the change, and the other record's
-  // transcript moves. The live record's journal cannot be written.
   const events = join(f.config.stateDir, "cmux", f.id, "events");
   for (const name of readdirSync(events)) chmodSync(join(events, name), 0o400);
   f.setState({ workspaces: [], vault: [row("moved.jsonl")] });
@@ -425,8 +415,6 @@ test("cmux creates once, resumes native history without replaying its prompt, an
   execFileSync("sh", ["-c", launches[0].params.initial_input.replace(/\r$/, "")], { cwd: f.cwd });
   assert.deepEqual(JSON.parse(readFileSync(captured, "utf8")), [request.prompt], "shell metacharacters remain one literal provider argument");
   assert.equal(existsSync(join(f.cwd, "should-not-exist")), false);
-  // Native identity arrives after a newly created workspace, while the Vault
-  // also begins listing it. The Infinite ID remains the original request ID.
   const launchedNative = randomUUID();
   f.hooks[launchedNative] = { ...f.hooks[f.nativeId], sessionId: launchedNative, surfaceId: "created-surface-1", workspaceId: "created-workspace-1", updatedAt: Date.now() / 1000 + 1 };
   f.writeHooks(); f.setState({ vault: [{ agent: "claude", session_id: launchedNative, cwd: f.cwd, file: f.transcript }] });
@@ -507,10 +495,8 @@ test("concurrent cmux observations share work and do not delay control", { timeo
 
 test("a cmux session in the project holds a workspace sync, and cmux starts are refused while one applies", { timeout: 30000 }, async (t) => {
   const f = await fixture(t);
-  // The app opens its own view of the same cmux state.
   await f.sessions.close();
   const owner = randomBytes(32).toString("base64url");
-  // Worker sockets need a short run directory.
   const runDir = mkdtempSync("/tmp/inf-cmuxrun-");
   t.after(() => rmSync(runDir, { recursive: true, force: true }));
   const config: Config = { ...f.config, runDir, tokens: [{ id: "owner", label: "Owner", role: "owner", hash: hashToken(owner) }] };
@@ -534,7 +520,6 @@ test("a cmux session in the project holds a workspace sync, and cmux starts are 
   assert.equal(commit.body.pendingGeneration?.reason, "session-running", "the cmux session runs in the project directory");
   assert.equal(existsSync(join(f.cwd, "a.txt")), false);
 
-  // Hold an apply at its running check; a cmux create for the project is refused before reaching cmux.
   let atCheck!: () => void, answer!: (running: boolean) => void;
   const reached = new Promise<void>(resolve => { atCheck = resolve; });
   const held = app.projectSync.apply("project", { running: () => { atCheck(); return new Promise<boolean>(resolve => { answer = resolve; }); } });

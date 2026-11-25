@@ -43,7 +43,6 @@ test("connector answers survive restart and reach real child prompts without bec
     assert.equal(answered.decisions[0].answeredBy, "connector");
     assert.deepEqual(answered.decisions[0].source, source);
     await assert.rejects(missions.answer(mission.id, asked.decisions[0].id, answer), conflict);
-    // Stop before the next scheduler tick so the sealed child operation, rather than a response mock, carries the source.
     h.shut(); ({ missions, teams } = h.open());
     assert.equal((await missions.answer(mission.id, asked.decisions[0].id, answer, renamed)).revision, answered.revision);
     await waitFor(async () => teams.get(apiId).decisions[0], item => item.answeredBy === "connector", 60000);
@@ -84,7 +83,6 @@ test("coordinator forwarding preserves connector steering in real child state an
     assert.equal(teamContext(steered).ownerSteering.length, 0);
     assert.deepEqual(teamContext(steered).agentSteering[0].source, source);
     assert.match(steered.events.map(item => item.text).join("\n"), /Connector \(Example bot\) steering recorded/);
-    // The real child service rejects a replay that tries to change connector authorship to owner authorship.
     const replay = { requestId: randomUUID(), revision: steered.revision, text: "Keep checks within the pinned task." };
     const direct = await teams.steer(teamId, replay, source);
     assert.equal((await teams.steer(teamId, replay, renamed)).revision, direct.revision);
@@ -121,7 +119,6 @@ test("pre-connector Slack and coordinator receipts replay after upgrade with the
     const answer = { requestId: randomUUID(), revision: team.revision, text: "JSON" };
     await teams.answer(teamId, decision.id, answer, undefined, "coordinator");
     h.shut();
-    // These are the exact historical receipt shapes: Slack had no source and coordinator had no by field.
     const legacyHash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
     const missionFile = join(h.state, "missions", `${mission.id}.sealed`);
     const missionRecord = unseal<{ receipts: Record<string, string> }>(h.key, `mission:${mission.id}`, readFileSync(missionFile, "utf8"));

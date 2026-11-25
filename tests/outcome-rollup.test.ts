@@ -16,7 +16,6 @@ import type { RunSummaryCounts } from "../packages/host/src/run-events.js";
 const FROZEN = "2026-11-01T00:00:00.000Z";
 const GOAL: RollupTarget = { kind: "goal", id: "11111111-1111-4111-8111-111111111111" };
 
-/** One outcome row. Every required field is filled; the overrides win. The exclusion follows the disposition. */
 function row(
   overrides: Partial<Omit<OutcomeRow, "payload">> & { payload?: Partial<OutcomePayload> } = {},
 ): OutcomeRow {
@@ -72,7 +71,6 @@ function row(
   };
 }
 
-/** One run summary. Settled-looking fields are null; the overrides win. */
 function summary(
   overrides: Partial<Omit<RunSummaryRow, "payload">> & { payload?: Partial<RunSummaryPayload> } = {},
 ): RunSummaryRow {
@@ -100,7 +98,6 @@ function summary(
   };
 }
 
-/** One member result. */
 function member(overrides: Partial<Omit<MemberResultRow, "payload">> = {}): MemberResultRow {
   return {
     resultId: "x1",
@@ -128,7 +125,6 @@ function member(overrides: Partial<Omit<MemberResultRow, "payload">> = {}): Memb
   };
 }
 
-/** Counts with every key at zero, for a summary that settled. */
 function counts(overrides: Partial<RunSummaryCounts> = {}): RunSummaryCounts {
   return {
     tasks: 0, integrated: 0, members: 0, round: 0, checks: 0, recoveries: 0, decisionsByOwner: 0,
@@ -137,7 +133,6 @@ function counts(overrides: Partial<RunSummaryCounts> = {}): RunSummaryCounts {
   };
 }
 
-/** Records of one goal. Every list defaults to empty. */
 function records(overrides: Partial<RollupRecords> = {}): RollupRecords {
   return {
     runIds: [],
@@ -150,7 +145,6 @@ function records(overrides: Partial<RollupRecords> = {}): RollupRecords {
   };
 }
 
-/** A rollup with no assessment and no cost lookup, for the tests that do not need them. */
 function rollupOf(input: RollupRecords, known = true, cost?: CostLookup) {
   return buildRollup(input, { target: GOAL, known, assessment: null, cost });
 }
@@ -227,7 +221,6 @@ test("cost sums complete sessions and never counts a missing one as zero", () =>
   const costs = new Map<string, SessionCost>([
     ["s1", { usd: 0.5, tokens: 1000, complete: true }],
     ["s2", { usd: 9, tokens: 9, complete: false }],
-    // A subscription session has a cost figure too. It adds tokens and never spend.
     ["s4", { usd: 7, tokens: 400, complete: true }],
   ]);
   const calls: string[] = [];

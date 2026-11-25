@@ -24,7 +24,6 @@ import { hostEntryIds, hostEntryRun } from "./fixtures/host-entry-run.js";
 
 const RUN_ID = "00000000-0000-4000-8000-0000000000f1";
 
-/** A store in a temporary directory, removed by `close`. */
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "infinite-member-entry-"));
   return {
@@ -88,10 +87,8 @@ test("posts follow the kind schemas", () => {
     assert.equal(memberEntryPostSchema.safeParse(entry).success, false, JSON.stringify(entry).slice(0, 80));
   }
 
-  // Paths: no control character, and the JSON array of the paths is at most 1,024 bytes (escapes count).
   assert.equal(memberEntryPostSchema.safeParse(contract({ paths: ["a\u0001b"] })).success, false, "a control character in a path");
   const pathsOfJsonBytes = (total: number) => {
-    // Four paths of 253, 253, 253 and 252 letters: a JSON array of 1,024 bytes. One more letter makes 1,025.
     const sizes = [253, 253, 253, total - 253 * 3];
     return sizes.map(size => "a".repeat(size));
   };
@@ -100,13 +97,10 @@ test("posts follow the kind schemas", () => {
   assert.equal(memberEntryPostSchema.safeParse(contract({ paths: pathsOfJsonBytes(1011) })).success, true, "1,024 JSON bytes pass");
   assert.equal(memberEntryPostSchema.safeParse(contract({ paths: pathsOfJsonBytes(1012) })).success, false, "1,025 JSON bytes are refused");
 
-  // Summaries: at most 240 bytes as JSON string content. Each quotation mark escapes to two bytes.
   assert.equal(memberEntryPostSchema.safeParse(contract({ summary: "\"".repeat(120) })).success, true, "120 quotation marks pass");
   assert.equal(memberEntryPostSchema.safeParse(contract({ summary: "\"".repeat(121) })).success, false, "121 quotation marks are refused");
   assert.equal(memberEntryPostSchema.safeParse(contract({ summary: "a".repeat(240) })).success, true, "240 letters pass");
 
-  // The canonical body of exactly 12,288 bytes parses, and one byte more is refused.
-  // The 2000 CJK characters are three bytes each, so the field limits alone cannot reach the cap in ASCII.
   const base = { interface: "界".repeat(2000), change: "a", sources: Array.from({ length: 8 }, () => "s".repeat(500)) };
   const size = (change: string) => Buffer.byteLength(canonicalJson({ ...base, change }), "utf8");
   const n = 12_288 - size("a") + 1;
@@ -132,7 +126,6 @@ test("no accepted post makes a head that a list cannot hold", () => {
       if (launchSeq === undefined) throw new Error("no launch mark");
       assert.equal(board.recordLaunch(run, pm, { launchSeq, promptBytes: 1200, contextBytes: 4000 }), true);
 
-      // The worst accepted post: escaped summary, four escaped paths at the byte limit, a task, and a supersede id.
       const quote = '"';
       const worst = memberEntryPostSchema.parse({
         kind: "contract",
@@ -207,7 +200,6 @@ test("roles post only their kinds and their own task", () => {
   const integratorHandoff = memberEntryPostSchema.parse(handoff("a"));
   assert.equal(postAllowed({ role: "integrator" }, integratorHandoff), "entry-task-forbidden");
 
-  // A scout's assignment id is a discovery id: a scout names no task, not even its own.
   const scoutFinding = memberEntryPostSchema.parse(finding({ taskId: "a" }));
   assert.equal(postAllowed({ role: "scout", taskId: "a" }, scoutFinding), "entry-task-forbidden");
   assert.equal(postAllowed({ role: "scout", taskId: "a" }, memberEntryPostSchema.parse(finding())), "ok");
@@ -225,11 +217,9 @@ test("roles post only their kinds and their own task", () => {
 test("the scan finds secrets and never returns them", () => {
   const port = 4780;
   const token = `h${randomBytes(24).toString("hex")}`;
-  // What the host issues to a session: a GitHub grant, an egress proxy password, and a token with no known shape.
   const grant = mintGithubGrant(randomBytes(32), { sub: "session", sid: "session-1", project: "project-1", repo: "owner/repository", ops: ["fetch"] });
   const proxy = egressCredential(randomBytes(32), "project-1", "session-1", Math.floor(Date.now() / 1000) + 3600);
   const issued = randomBytes(32).toString("hex");
-  // An empty or short issued value must refuse nothing: every text holds the empty string.
   const own = { token, url: `http://127.0.0.1:${port}/hook`, credentials: [issued, "", "short"] };
   const privateKey = "-----BEGIN " + "OPENSSH PRIVATE" + " KEY-----";
   const cases: [string, string][] = [
@@ -257,7 +247,6 @@ test("the scan finds secrets and never returns them", () => {
     if (cls === "hook-token") assert.equal(text.includes(token), false);
   }
 
-  // A credential the host issued to this session is named as that, whatever its shape.
   assert.deepEqual(findSecret({ body: { change: grant } }, { ...own, credentials: [grant] }), { path: "body.change", cls: "session-credential" });
   assert.deepEqual(findSecret({ body: { change: proxy.password } }, { ...own, credentials: [proxy.password] }), { path: "body.change", cls: "session-credential" });
 
@@ -268,7 +257,6 @@ test("the scan finds secrets and never returns them", () => {
     "v2.eyJ" + "x".repeat(20) + "." + "y".repeat(42),
     "v1.1700000000." + "y".repeat(42),
     "release v1.2.3, then v2.10.1700000000",
-    // Build and cache ids that end in a 64-character hash are no credential.
     "v1.1731628800." + "a".repeat(64),
     "v3.202311150930." + "0123456789abcdef".repeat(4),
     "a short word",
@@ -291,10 +279,8 @@ test("a session's credentials are read from the environment its provider is star
     ...egressProxyEnvironment("http://127.0.0.1:4791", key, { project: "project-1", session: "session-1" }, 3600, nowMs),
   };
   assert.deepEqual(new Set(sessionCredentials(env)), new Set([grant, observer, opencode, proxy.password]));
-  // Each one is then refused by value.
   for (const credential of sessionCredentials(env))
     assert.equal(findSecret({ body: { change: `x ${credential} y` } }, { token: "t".repeat(24), url: "http://127.0.0.1:4780/hook", credentials: sessionCredentials(env) })?.cls, "session-credential");
-  // A proxy address without a credential, the no-proxy list, and an unset variable hold none.
   assert.deepEqual(sessionCredentials({ ...egressUncredentialedEnvironment("http://127.0.0.1:4791"), PATH: "/usr/bin:/bin", INFINITE_GITHUB_GRANT: undefined }), []);
 });
 

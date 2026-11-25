@@ -13,7 +13,6 @@ import { startHost } from "./helpers.js";
 import { mixedLineup } from "./team-fixture.js";
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-// The host resolves its own zod copy, so match the error by name.
 const zodError = (error: { name?: string }) => error.name === "ZodError";
 const team = () => ({ checks: [{ command: "node", args: ["-e", "0"] }], handoff: "auto" as const });
 
@@ -191,7 +190,6 @@ test("a record that start-up did not apply cannot change its mode", async () => 
   const f = fixture();
   try {
     await new RepoEnrollmentService(f.config(), f.key).put("example", enrollRequest(0));
-    // restore skips a record whose saved teamwork folder no longer resolves; get() still reads it.
     writeSealed(f.file, f.key, "repo-enrollments", {
       version: 1,
       projects: { example: { path: realpathSync(f.projectPath), team: team(), revision: 1, teamwork: "../escape" } },
@@ -328,7 +326,6 @@ test("repo init saves routing and keeps it when omitted", { timeout: 90000 }, as
   try {
     invoke(["--routing", "shadow", "--routing-value", "quality"]);
     assert.deepEqual(await savedRouting(), { mode: "shadow", successValueUsd: 8 });
-    // The policy saved after startup reaches the status read without a restart.
     const status = (await host.fetchApi("/routing/projects/sample")).body;
     assert.deepEqual([status.mode, status.source, status.knobs.successValueUsd], ["shadow", "saved", 8]);
 
@@ -344,13 +341,11 @@ test("repo init saves routing and keeps it when omitted", { timeout: 90000 }, as
     assert.equal(auto.stderr.includes(ROUTING_AUTO_NOTE), true, "auto prints the shadow-period note on stderr");
     assert.deepEqual(await savedRouting(), { mode: "auto", successValueUsd: 8, allowContributor: true }, "auto replaces only the mode and keeps the carried value");
 
-    // Off replaces only the mode; the given deny and cost merge over the saved policy and keep nothing else.
     invoke(["--routing", "off"]);
     assert.deepEqual(await savedRouting(), { mode: "off", successValueUsd: 8, allowContributor: true }, "off replaces only the mode");
     invoke(["--routing-contributor", "deny", "--routing-value", "cost"]);
     assert.deepEqual(await savedRouting(), { mode: "off", successValueUsd: 0.5, allowContributor: false }, "deny and cost merge over the saved policy");
 
-    // A value outside the presets or the 0 to 100 range is refused, and the saved policy stays as it was.
     const kept = JSON.stringify(await savedRouting());
     for (const value of ["100.5", "-1", "abc"]) {
       assert.throws(() => invoke(["--routing-value", value]), (error: { stderr?: string }) =>
@@ -393,7 +388,6 @@ test("repo init saves routing points, refuses a list without start, and checks t
       assert.equal(JSON.stringify(await savedRouting()), kept, `--routing-points "${points}" leaves the saved policy unchanged`);
     }
 
-    // An older host that does not record routing points refuses escalation and scout, and accepts start alone.
     const oldHost = { teams: { routing: 1, routingAuto: 1 } };
     assert.throws(() => assertRoutingSupport({ points: ["start", "escalation"] }, oldHost), (error: Error) =>
       error.message === "This host does not support escalation and scout routing. Upgrade the host before using --routing-points.");

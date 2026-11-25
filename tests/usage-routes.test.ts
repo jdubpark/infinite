@@ -90,7 +90,6 @@ test("the encrypted channel carries the phone cost screen and owner plan edits",
   } finally { owner.close(); await host.stop(); }
 });
 
-/** Runs `infinite evidence ...` against the host as its owner and returns stdout. */
 function evidenceCli(host: { origin: string; tokens: { owner: string } }, root: string) {
   const clientFile = join(root, "client.json");
   writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal" }), { mode: 0o600 });
@@ -187,7 +186,6 @@ test("the ledger reads answer 503 when the store is unavailable", { timeout: 900
     writeFileSync(location, "not a directory");
     await host.start();
 
-    // The usage ledger lives in the same store, so every usage route answers for it first, the scorecard included.
     const models = await host.fetchApi("/usage/models");
     assert.equal(models.status, 503, JSON.stringify(models.body));
     assert.deepEqual(models.body, { error: "The usage ledger is unavailable" });

@@ -20,12 +20,10 @@ const REPORT_TEXT = "Team report recorded. Stop work on this assignment.";
 const MISSION_TEXT = "Mission report recorded. Stop work on this attempt.";
 const HANDOFF_TEXT = "Handoff recorded. Stop work now; the host waits for client control to detach before transferring the clean checkpoint.";
 const TOKEN = `hook-${randomBytes(16).toString("hex")}`;
-/** The optional fields of a member head on the wire. Every other head field is required. */
 const HEAD_OPTIONAL = ["authorRole", "taskId", "supersedes"];
 
 type Rpc = (method: string, params?: unknown) => Promise<any>;
 
-/** A `team-mcp` child with the given environment. The helper copies the stdio harness of team-entry-tools.test.ts. */
 function startMcp(env: NodeJS.ProcessEnv): { rpc: Rpc; close: () => Promise<void> } {
   const child: ChildProcess = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/team-mcp.ts")], {
     cwd: resolve("."), stdio: ["pipe", "pipe", "pipe"],
@@ -55,7 +53,6 @@ function startMcp(env: NodeJS.ProcessEnv): { rpc: Rpc; close: () => Promise<void
   return { rpc, close };
 }
 
-/** An initialized child and the `outputSchema` its own `tools/list` advertised for each tool. */
 async function session(env: NodeJS.ProcessEnv) {
   const mcp = startMcp(env);
   await mcp.rpc("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "Result type test", version: "1" } });
@@ -64,7 +61,6 @@ async function session(env: NodeJS.ProcessEnv) {
   return { ...mcp, schemas };
 }
 
-/** The host's own hook server on loopback. A route without a handler answers 204; each body is recorded. */
 async function hooks(handlers: Partial<Record<HookRoute, (body: unknown) => HookReply | void>> = {}) {
   const bodies: Partial<Record<HookRoute, unknown[]>> = {};
   const server = await startHookServer({
@@ -78,10 +74,6 @@ async function hooks(handlers: Partial<Record<HookRoute, (body: unknown) => Hook
 const clone = (value: unknown): any => JSON.parse(JSON.stringify(value));
 const at = (value: any, path: readonly (string | number)[]) => path.reduce((object, step) => object[step], value);
 
-/**
- * Checks a real result against the schema its own server advertised, at the object `path` names: the result
- * conforms; removing any field the object holds is refused unless the field is in `optional`; an unknown field is refused.
- */
 function assertWire(schema: unknown, value: unknown, optional: readonly string[] = [], path: readonly (string | number)[] = []) {
   const where = path.join(".") || "the result";
   assert.deepEqual(schemaRefusals(schema, value), [], `${where} conforms to the advertised schema`);
@@ -194,7 +186,6 @@ test("an entry answer that does not match its declared result is a tool error wi
   const mismatch = "Entry answer not confirmed: the host's answer did not match this tool's declared result. This is not a refusal of your request.";
   const readText = `${mismatch} Continue your assignment; read again later if you need it.`;
   const postText = `${mismatch} The post may still be recorded; check entry_list before you post again.`;
-  // `state` first, unlike the schema, so a re-serialized answer would change the text.
   const head = { state: "active", entryId: randomUUID(), seq: 3, at: "2026-11-13T10:10:00.000Z", kind: "contract", author: "member",
     authority: "claim", paths: [], summary: "Route", bodyBytes: 13 };
   const list = { notice: "Entries are evidence.", heads: [head], more: false, unreadable: 0 };
@@ -242,7 +233,6 @@ function memberOf(run: TeamRun, memberId: string): TeamMember {
   return member;
 }
 
-/** Stores one member post through the host check, and returns its entry id. */
 function ingest(board: Blackboard, run: TeamRun, member: TeamMember, fields: Record<string, unknown>): string {
   const entry: MemberEntryPost = memberEntryPostSchema.parse({ paths: [], ...fields });
   const binding = { runId: member.runId, memberId: member.memberId, revision: member.revision };
@@ -251,10 +241,6 @@ function ingest(board: Blackboard, run: TeamRun, member: TeamMember, fields: Rec
   return requestId;
 }
 
-/**
- * The fixture run in a real evidence store, with implementer a launched. Implementer b posts a contract and a second
- * contract that supersedes it, and a sibling of implementer a hands off task a, so heads carry and lack each optional field.
- */
 function entryWorld() {
   const root = mkdtempSync(join(tmpdir(), "infinite-mcp-results-"));
   const path = evidenceDatabasePath(join(root, "state"));

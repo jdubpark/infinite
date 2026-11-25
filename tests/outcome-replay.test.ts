@@ -21,9 +21,6 @@ import {
 } from "../packages/host/src/outcome-store.js";
 import { runEventKey } from "../packages/host/src/run-events.js";
 
-// The harness and the event builders are copied from tests/outcome-projector.test.ts. The landing drives the real
-// scan function with one landing of the run, as tests/outcome-signals.test.ts does.
-
 const PROJECT = "example";
 const REPO = "example-repo";
 const BASE = "b".repeat(40);
@@ -38,7 +35,6 @@ const FEATURES = { role: "implementer", area: "core", kind: null, risk: "normal"
 const SINCE = "2026-11-13T00:00:00.000Z";
 const PROFILE = { provider: "claude", model: "m-1", effort: null };
 
-/** A minute on the fixed clock. Events carry their own times; the projector never reads the clock. */
 const at = (minute: number) => `2026-11-13T10:${String(minute).padStart(2, "0")}:00.000Z`;
 
 type Harness = {
@@ -48,7 +44,6 @@ type Harness = {
   close(): void;
 };
 
-/** A store with both modules, an outbox, and the outcomes projector. */
 function harness(): Harness {
   const root = mkdtempSync(join(tmpdir(), "infinite-outcome-replay-"));
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: randomBytes(32) });
@@ -74,7 +69,6 @@ function harness(): Harness {
 
 let counter = 0;
 
-/** One event with a unique key. `parts` add to the key so that a replayed event has the same key. */
 function ev(kind: string, runId: string, time: string, fields: {
   revision?: number; memberId?: string; taskId?: string; data?: Record<string, unknown>; parts?: (string | number)[];
 } = {}): OutboxEvent {
@@ -91,7 +85,6 @@ function ev(kind: string, runId: string, time: string, fields: {
   };
 }
 
-/** The events of one run: an implementer that reports, integrates, and is approved, then settles. */
 function runEvents(runId: string, purpose: "work" | "replay" | "gate", trialId?: string): OutboxEvent[] {
   const shape = purpose === "work" ? "team" : "trial";
   const components = { profile: PROFILE, promptVersion: HEX_A, guidance: HEX_B, knowledge: "none" as const, routing: "off" as const, shape };
@@ -126,7 +119,6 @@ function runEvents(runId: string, purpose: "work" | "replay" | "gate", trialId?:
   ];
 }
 
-/** The run lands at minute 8: the scan records one landing of the run, with a window that is still open. */
 function land(h: Harness, runId: string): void {
   const result = h.store.write(tx => applyScan(tx, {
     projectId: PROJECT, repository: REPO, baseBranch: "main", head: SCAN_HEAD, commits: 1, gap: null,
@@ -136,7 +128,6 @@ function land(h: Harness, runId: string): void {
   assert.equal(result.applied, true);
 }
 
-/** A reviewer start: a role without an outcome row, so the projector writes a member result for it. */
 function reviewerStart(runId: string): OutboxEvent {
   return ev("member.started", runId, at(3), {
     memberId: "rv1", taskId: "a",
@@ -144,7 +135,6 @@ function reviewerStart(runId: string): OutboxEvent {
   });
 }
 
-/** The window check one minute after the hold ends, which stores the verdict and closes the window. */
 function closeWindow(h: Harness): void {
   const result = h.store.write(tx => applyCheck(tx, {
     projectId: PROJECT, head: SCAN_HEAD, at: "2026-12-13T10:09:00.000Z",
@@ -153,7 +143,6 @@ function closeWindow(h: Harness): void {
   assert.equal(result.applied, true);
 }
 
-/** The implementer row of a run, read from the store. */
 function rowOf(store: EvidenceStore, runId: string) {
   return store.read(db => readOutcome(db, `${runId}:m1`));
 }
@@ -172,18 +161,15 @@ test("a replay run writes replay rows", () => {
     assert.equal(row?.accepted, null);
     assert.equal(row?.firstPass, null);
     assert.equal(row?.held, null);
-    // The landing applies to an accepted row of production, and it must not reach a replay row.
     land(h, "run-replay");
     const landed = rowOf(h.store, "run-replay");
     assert.ok(landed?.holdUntil, "the landing gave the row its window");
     assert.equal(landed?.accepted, null);
     assert.equal(landed?.firstPass, null);
     assert.equal(landed?.held, null);
-    // A closed window with no revert is a yes for production. For a replay row it must stay unknown.
     closeWindow(h);
     assert.equal(rowOf(h.store, "run-replay")?.held, null);
     assert.equal(rowOf(h.store, "run-replay")?.accepted, null);
-    // The member result carries the same source.
     const result = h.store.read(db => readMemberResult(db, "run-replay:rv1"));
     assert.equal(result?.source, "replay");
   } finally {

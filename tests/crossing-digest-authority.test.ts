@@ -4,15 +4,11 @@ import { Buffer } from "node:buffer";
 import * as built from "../packages/host/src/crossing-digest.js";
 import type { ClaimInput, CrossingDigest, HostInput } from "../packages/host/src/crossing-digest.js";
 
-// Receipt space under counter growth, claims invisible to receipts, and the text rule. Special characters are built
-// from code points.
-
 const { DIGEST_LIMIT_BYTES, OMITTED_MAX, crossingDigestSchema } = built;
 type Outcome = CrossingDigest["outcome"];
 const LISTS = ["touched", "decisions", "failures", "forSiblings", "open"] as const;
 const OUTCOMES = ["complete", "partial", "failed", "refused"] as const;
 
-/** Independent measure: the test never calls the module's own byte helper. */
 const measure = (digest: CrossingDigest) => Buffer.byteLength(JSON.stringify(digest), "utf8");
 const utf8 = (value: string) => Buffer.byteLength(value, "utf8");
 
@@ -23,7 +19,6 @@ function valid(digest: CrossingDigest | undefined): CrossingDigest {
   return digest;
 }
 
-/** Receipt rows in order, each with its keys in a canonical order. */
 const receipts = (digest: CrossingDigest) => [...digest.touched, ...digest.failures]
   .filter(row => row.by === "receipt")
   .map(row => JSON.stringify(row, Object.keys(row).sort()));
@@ -33,7 +28,6 @@ test("regression: claims that only raise counters never evict a receipt", () => 
   const read = Array.from({ length: 7 }, (_, index) => String(index).padStart(2, "0") + "x".repeat(227));
   const host = valid(built.hostDigest({ outcome: "partial", read }));
   const claims = { open: Array.from({ length: 100 }, (_, index) => `q${index}`) };
-  // Seven such receipts no longer fit beside the counter reserve, so the host digest keeps six and counts one.
   assert.equal(host.touched.length, 6);
   assert.equal(host.omitted.touched, 1);
   assert.deepEqual(receipts(valid(built.withClaims(host, claims))), receipts(host));
@@ -41,7 +35,6 @@ test("regression: claims that only raise counters never evict a receipt", () => 
   assert.deepEqual(receipts(valid(built.mergeDigest(host, claimed))), receipts(host));
 });
 
-/** A stored host digest: five fixed receipt paths, one receipt path of `length` bytes, and a receipt failure. */
 function storedHost(outcome: Outcome, count: number, length: number): CrossingDigest {
   return {
     v: 1,
@@ -58,11 +51,6 @@ function storedHost(outcome: Outcome, count: number, length: number): CrossingDi
   };
 }
 
-/**
- * Host digests near the bound. A series fixes the outcome and the stored counters and steps the last path one byte
- * at a time. `bySize` keeps, for each size from 1,900 bytes up, the first digest reached in growth-prone order
- * (narrowest outcome and smallest counters first); `largest` keeps the largest digest of every series.
- */
 function boundaryDigests() {
   const bySize = new Map<number, CrossingDigest>();
   const largest: CrossingDigest[] = [];
@@ -91,10 +79,6 @@ function boundaryDigests() {
 const BOUNDARY = boundaryDigests();
 const SWEEP = [...BOUNDARY.bySize.values(), ...BOUNDARY.largest];
 
-/**
- * `count` rows in every list, none sharing a path or a signal with a receipt. Rows past the first 100 are malformed
- * unless `allValid`: dropped and counted exactly like rows over a cap, at a fraction of the cost.
- */
 function claimRows(count: number, allValid = false): ClaimInput {
   const make = <T>(row: (index: number) => T) =>
     Array.from({ length: count }, (_, index) => (allValid || index < 100 ? row(index) : null));
@@ -116,7 +100,6 @@ test("boundary sweep: withClaims keeps every receipt of a host digest from 1,900
       assert.ok(receipts(digest).length > 0, `${where}: no receipt to keep`);
       const result = valid(built.withClaims(digest, claims));
       assert.deepEqual(receipts(result), receipts(digest), where);
-      // The rows were dropped and counted: a list keeps at most 24 rows.
       for (const list of LISTS) {
         assert.ok((result.omitted[list] ?? 0) >= Math.min(OMITTED_MAX, (digest.omitted[list] ?? 0) + count - 24), `${where}: ${list}`);
       }
@@ -143,9 +126,6 @@ test("mergeDigest keeps every receipt of the older digest when the newer one hol
   }
 });
 
-// Claims are invisible to receipts: receipt rows, their order and their survival never depend on claims.
-
-/** Receipt rows per list, in order: `touched` rows marked as receipts and `failures` rows of a host class. */
 const receiptRows = (digest: CrossingDigest) => ({
   touched: digest.touched.filter(row => row.by === "receipt").map(row => JSON.stringify(row, Object.keys(row).sort())),
   failures: digest.failures.filter(row => row.class !== "claim").map(row => JSON.stringify(row, Object.keys(row).sort())),
@@ -191,13 +171,11 @@ test("reproduction: a claim on the oldest of 24 receipts does not change which r
 });
 
 test("contract: a claim on a receipt's path is dropped with its ids, and overlapping merges count omissions twice", () => {
-  // Rule (h): the claim's ids and operation do not survive, and nothing is counted.
   const held = valid(built.withClaims(valid(built.hostDigest({ outcome: "partial", read: ["a"] })), {
     touched: [{ path: "a", op: "removed", ids: ["symbol"] }, { path: "new", op: "added" }],
   }));
   assert.deepEqual(held.touched, [{ path: "a", op: "read", by: "receipt" }, { path: "new", op: "added", by: "claim" }]);
   assert.equal(held.omitted.touched, 0);
-  // The merge contract: counters add, so a digest merged with itself or with its own descendant counts twice.
   const d = valid(built.hostDigest({ outcome: "partial", read: Array.from({ length: 25 }, (_, index) => `r${index}`) }));
   assert.equal(d.omitted.touched, 1);
   assert.equal(valid(built.fitDigest(d)).omitted.touched, 1);
@@ -226,11 +204,6 @@ type Call =
   | { kind: "merge"; older: number; newer: number }
   | { kind: "fit"; target: number };
 
-/**
- * A random call sequence. Claims draw most paths and failure keys from the pools the host inputs use, so they often
- * collide with a receipt (same path with another op or with ids, same signal and place). Short paths reach the
- * 24-row cap, long ones the byte limit.
- */
 function randomCalls(seed: number, length: number): Call[] {
   const random = mulberry32(seed);
   const int = (min: number, max: number) => min + Math.floor(random() * (max - min + 1));
@@ -270,7 +243,6 @@ function randomCalls(seed: number, length: number): Call[] {
   return calls;
 }
 
-/** One call. With `erase`, every claims argument is {} and every claims-only digest is an empty digest. */
 function apply(call: Call, results: CrossingDigest[], erase: boolean): CrossingDigest | undefined {
   switch (call.kind) {
     case "host": return built.hostDigest(call.input);
@@ -281,7 +253,6 @@ function apply(call: Call, results: CrossingDigest[], erase: boolean): CrossingD
   }
 }
 
-/** The digests a call reads, so a counter's growth shows what the call itself dropped. */
 const inputsOf = (call: Call, results: CrossingDigest[]) =>
   call.kind === "merge" ? [results[call.older], results[call.newer]] : call.kind === "claims" || call.kind === "fit" ? [results[call.target]] : [];
 
@@ -314,7 +285,6 @@ test("differential: every call sequence gives the same receipt rows with its cla
       claimed.push(left);
       erased.push(right);
       calls += 1;
-      // What the erased run dropped is receipts alone: at a full list it is the cap, below it the byte fit.
       const before = (key: "touched" | "failures") => Math.min(OMITTED_MAX, inputsOf(call, erased).reduce((sum, digest) => sum + digest.omitted[key], 0));
       const grew = (key: "touched" | "failures") => right.omitted[key] > before(key);
       if (grew("touched") && right.touched.length === 24) reached.touchedCap.add(seed);
@@ -328,18 +298,14 @@ test("differential: every call sequence gives the same receipt rows with its cla
   assert.ok(collisions >= seeds.length * 4, `only ${collisions} colliding claim rows`);
 });
 
-// The text rule.
-
 const char = (code: number) => String.fromCodePoint(code);
 const escapeOf = (code: number) => "\\u{" + code.toString(16) + "}";
 const range = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, index) => from + index);
 const BIDI = [0x061c, 0x200e, 0x200f, ...range(0x202a, 0x202e), ...range(0x2066, 0x2069)];
-/** Shown as a visible escape: C0 but tab, line feed and carriage return; DEL; C1; the bidirectional controls. */
 const ESCAPED = [...range(0x00, 0x08), 0x0b, 0x0c, ...range(0x0e, 0x1f), 0x7f, ...range(0x80, 0x9f), ...BIDI];
 const LONE_HIGH = String.fromCharCode(0xd800);
 const kept = (value: string): [string, string] => [value, value];
 
-/** [input, normalized] for each class of the text rule. */
 const TEXT_CASES: [string, string][] = [
   ...ESCAPED.map((code): [string, string] => [`a${char(code)}b`, `a${escapeOf(code)}b`]),
   ["a\r\nb", "a\nb"], ["a\rb", "a\nb"], [`a${char(0x2028)}b`, "a\nb"], [`a${char(0x2029)}b`, "a\nb"],
@@ -350,7 +316,6 @@ const TEXT_CASES: [string, string][] = [
   [`a${LONE_HIGH}b`, `a${char(0xfffd)}b`],
 ];
 
-/** The seven text positions a digest holds: what, why, open, note, signal, where, and an id. */
 const textFields = (digest: CrossingDigest) => [
   digest.decisions[0]?.what, digest.decisions[0]?.why, digest.open[0], digest.forSiblings[0]?.note,
   digest.failures[0]?.signal, digest.failures[0]?.where, digest.touched[0]?.ids?.[0],
@@ -396,7 +361,6 @@ test("text rule: the reproduction keeps no override, and the schema refuses raw 
   }
 });
 
-/** Independent reference: the whole input normalized with replace, without clipping. */
 function normalizedWhole(value: string): string {
   const unsafe = new RegExp(`[${ESCAPED.map(code => `\\u{${code.toString(16)}}`).join("")}]`, "gu");
   const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
@@ -420,7 +384,6 @@ test("text rule: a clip keeps whole escapes, line breaks and characters, is maxi
         const where = `${max}-byte field, ${lead} leading bytes, tail U+${(tail.codePointAt(0) ?? 0).toString(16)}`;
         assert.ok(utf8(text) <= max && text.isWellFormed(), where);
         assert.equal(clean(text), text, `${where}: not idempotent`);
-        // The result is a prefix of the whole normalized text, cut between whole tokens, and the next token would not fit.
         let prefix = "";
         for (const token of tokens) {
           if (utf8(prefix + token) > max) break;
@@ -430,14 +393,12 @@ test("text rule: a clip keeps whole escapes, line breaks and characters, is maxi
       }
     }
   }
-  // Literal cases: an escape that would cross the bound is dropped whole.
   const bidi = char(0x202e);
   assert.equal(viaOpen("a".repeat(236) + bidi), "a".repeat(236));
   assert.equal(viaOpen("a".repeat(232) + bidi), "a".repeat(232) + escapeOf(0x202e));
   assert.equal(viaOpen("a".repeat(239) + "\r\n"), "a".repeat(239) + "\n");
   assert.equal(viaId("a".repeat(116) + char(0x07)), "a".repeat(116));
   assert.equal(viaId("a".repeat(115) + char(0x07)), "a".repeat(115) + escapeOf(0x07));
-  // Escape-shaped text typed by a member is ordinary text: kept, and stable under a second pass.
   const typed = `${"a".repeat(236)}${escapeOf(0x202e)}`;
   assert.equal(viaOpen(viaOpen(typed)), viaOpen(typed));
 });
@@ -446,9 +407,7 @@ test("text rule: text made only of expanding characters stays within every bound
   const empty = valid(built.emptyDigest("partial"));
   for (const code of [0x202e, 0x01, 0x85]) {
     const fill = char(code).repeat(240);
-    /** As many whole escapes as fit after `prefix` in `max` bytes. */
     const clipped = (prefix: string, max: number) => prefix + escapeOf(code).repeat(Math.floor((max - prefix.length) / escapeOf(code).length));
-    // One field per fixture, small enough to survive the fit: [name, claims, the field read back, expected values].
     const ids = Array.from({ length: 8 }, (_, index) => `${index}${fill}`);
     const cases: [string, ClaimInput, (digest: CrossingDigest) => unknown[], string[]][] = [
       ["decision", { decisions: [{ what: fill, why: fill }] }, digest => [digest.decisions[0]?.what, digest.decisions[0]?.why], [clipped("", 240), clipped("", 240)]],
@@ -466,7 +425,6 @@ test("text rule: text made only of expanding characters stays within every bound
       for (const value of values as string[]) assert.ok(utf8(value) <= (name === "ids" ? 120 : 240), where);
       assert.deepEqual(read(valid(built.fitDigest(valid(built.withClaims(empty, claims))))), expected, `${where}: refit`);
     }
-    // Every field at once is still within the byte bound (the fit decides which rows remain).
     valid(built.withClaims(empty, {
       decisions: [{ what: fill, why: fill }], open: [fill], forSiblings: [{ note: fill }],
       failures: [{ signal: fill, where: fill }], touched: [{ path: "src/a.ts", op: "read", ids }],

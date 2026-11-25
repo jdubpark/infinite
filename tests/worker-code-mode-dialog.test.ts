@@ -27,7 +27,6 @@ test("an old Code Mode menu above a live yes-no prompt: the owner's No sends n, 
       requestId: id, provider: "claude", projectId: "rehearsal", title: "Yes or no", prompt: "Start the session",
     });
     assert.equal(created.status, 201);
-    // The old menu's cursor is on No. Read as the open prompt, a "No" answer would be a bare Enter: the default, Yes.
     const open = await waitFor(() => runningHost.fetchApi(`/sessions/${id}`), response =>
       response.body.attention?.state === "needs-you" && Boolean(response.body.attention.prompt), 15000);
     const prompt = open.body.attention.prompt;

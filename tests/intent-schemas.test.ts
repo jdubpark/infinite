@@ -13,7 +13,6 @@ const assume = (n: number) => ({ dimension: `detail-${n}`, why: "A detail the pl
 const scout = (n: number) => ({ dimension: `scout-${n}`, why: "A fact the repository holds", criticality: "plan", disposition: "scout", assumption, scout: `Read the file for item ${n}` });
 const report = (items: unknown[], extra: Record<string, unknown> = {}) => ({ kind: "intent-check", summary: "The plan misses one outcome.", items, ...extra });
 
-/** A report at every bound: 16 items (3 scouts), 8 criteria, 24 out-of-scope ids, and a 4,000-character summary. */
 const maximal = report([
   ...Array.from({ length: 6 }, (_, index) => ask(index)),
   ...Array.from({ length: 7 }, (_, index) => assume(index)),
@@ -27,7 +26,6 @@ const maximal = report([
 test("the intent report is bounded and strict", async () => {
   assert.equal(teamReportSchema.safeParse(maximal).success, true, "a maximal report parses");
   assert.equal(intentCheckReportSchema.safeParse(maximal).success, true);
-  // team-mcp.ts builds z.toJSONSchema over the report schema when it loads; loading it proves the schema converts.
   await assert.doesNotReject(import("../packages/host/src/team-mcp.js"));
   const refused: Array<[string, unknown]> = [
     ["17 items", report([...maximal.items, assume(99)])],
@@ -64,7 +62,6 @@ const base = {
   escalations: [{ id: "escalation", label: "Escalation", provider: "claude", model: "opus", effort: "xhigh", tier: "strong" }],
   permissionReviewer: { id: "permission", label: "Permission", provider: "claude", model: "haiku", effort: "low", tier: "light" },
 };
-/** The lineup's JSON from the base commit, before the evaluators slot existed. */
 const PINNED_LINEUP = '{"coordinator":{"id":"coordinator","label":"Coordinator","provider":"claude","model":"opus","effort":"xhigh","tier":"strong"},"integrator":{"id":"integrator","label":"Integrator","provider":"claude","model":"sonnet","effort":"high","tier":"light"},"reviewer":{"id":"reviewer","label":"Reviewer","provider":"codex","model":"astra","effort":"high","tier":"strong"},"implementers":[{"id":"implementer","label":"Implementer","provider":"claude","model":"sonnet","effort":"medium","tier":"light"}],"escalations":[{"id":"escalation","label":"Escalation","provider":"claude","model":"opus","effort":"xhigh","tier":"strong"}],"permissionReviewer":{"id":"permission","label":"Permission","provider":"claude","model":"haiku","effort":"low","tier":"light"}}';
 
 test("evaluators are strong, unique, and last", () => {

@@ -6,8 +6,6 @@ import { cycleEntry, goalMetricsRead, GOAL_METRICS, pruneGoalMetrics, pruneMetri
 import { commandDigest } from "../packages/host/src/objective-input.js";
 import type { TeamCommand } from "../packages/host/src/team-types.js";
 
-/* The goal's entries of reported numbers and the curve read from them (packages/host/src/goal-metrics.ts). */
-
 const HEAD = "c".repeat(40);
 const lint: TeamCommand = { command: "npm", args: ["run", "lint"] };
 const unit: TeamCommand = { command: "npm", args: ["test"] };
@@ -111,7 +109,6 @@ test("the read shows 8 series, newest first, ties by the smaller identity digest
 test("a label is cut at 200 code points, so no character is split", () => {
   const read = (command: TeamCommand) => goalMetricsRead({ dropped: 0, entries: [{ run: "run-1", revision: 1, head: HEAD, more: 0,
     values: [{ command: commandDigest(command), name: "speed", value: 1, at: at(0) }] }] }, cycles("run-1"), [command]).series[0]!.label!;
-  // 198 code points before the emoji: a cut at 199 UTF-16 units would keep half of it.
   const cut = read({ command: "node", args: [`${"x".repeat(193)}\u{1F600}yyy`] });
   assert.equal(cut, `node ${"x".repeat(193)}\u{1F600}…`);
   assert.doesNotThrow(() => encodeURIComponent(cut), "a half character would make this throw");
@@ -120,7 +117,6 @@ test("a label is cut at 200 code points, so no character is split", () => {
   assert.equal(whole, `node ${"\u{1F600}".repeat(195)}`, "200 code points in 395 UTF-16 units stay whole");
 });
 
-/** Values of a shape this version never writes, as a later release could leave them before a rollback. */
 const FOREIGN: readonly [string, unknown][] = [
   ["null", null], ["{}", {}], ["[null]", [null]], ["{ v: 2 }", { v: 2 }],
   ["a version key beside the entries", { entries: [], dropped: 0, v: 2 }],

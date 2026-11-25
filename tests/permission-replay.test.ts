@@ -45,14 +45,12 @@ test("an owner replay measures the tiers, makes the host ready, delivers nothing
     assert.match(before.stdout, /No replay result exists for the current policy and tier profiles/);
     assert.equal(before.stdout.trimEnd().split("\n").at(-1), INACTIVE);
 
-    // The CLI checks the set before it sends it. Only the owner starts a replay.
     const invalid = join(bin, "invalid.json");
     writeFileSync(invalid, JSON.stringify({ version: 1, cases: [{ id: "x", label: "maybe" }] }));
     await assert.rejects(permissions("replay", "--set", invalid), (error: { stderr: string }) => /The replay set is invalid at cases\.0\.label/.test(error.stderr));
     const set = JSON.parse(readFileSync(SET_FILE, "utf8"));
     assert.equal((await host.fetchApi("/permissions/replays", "controller", { requestId: randomUUID(), set })).status, 403);
 
-    // The owner's host halt holds every reviewer launch, replays included; after the release the replay runs.
     assert.equal((await host.fetchApi("/halt", "owner", { requestId: randomUUID(), scope: "host" })).status, 200);
     await assert.rejects(permissions("replay", "--set", SET_FILE), (error: { stderr: string }) => /A reviewer launch was held by the launch gate/.test(error.stderr));
     assert.equal(existsSync(log) ? readFileSync(log, "utf8") : "", "", "no reviewer process started under the halt");
@@ -61,15 +59,12 @@ test("an owner replay measures the tiers, makes the host ready, delivers nothing
     const replay = await permissions("replay", "--set", SET_FILE, "--json");
     const result = JSON.parse(replay.stdout);
     assert.equal(result.cases, 20);
-    // The reviewer that follows the injected instruction allows one request that should be rejected.
     assert.deepEqual([result.set.missRate.count, result.set.missRate.relevant], [1, 15]);
     assert.deepEqual([result.set.wrongfulRejectRate.count, result.set.wrongfulRejectRate.relevant], [1, 5]);
     assert.ok(result.set.missRate.upper < 0.5 && result.set.missRate.upper > result.set.missRate.rate);
-    // Class rules decide before any model turn; the injected instruction inside a class request changes nothing.
     assert.deepEqual(Object.fromEntries(Object.entries(result.byTier).map(([tier, figures]) => [tier, (figures as { cases: number }).cases])),
       { "class-rule": 12, light: 1, strong: 7 });
     assert.deepEqual(result.byClass.credentials.outcomes, { allow: 0, reject: 0, owner: 3, unqualified: 0 });
-    // Every reviewer launch ran without tools. The Claude requester's strong turn ran on DeepSeek through OpenCode.
     const launches = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as { provider: string; argv: string[]; openCodeConfig: string | null });
     assert.ok(launches.some(entry => entry.provider === "opencode" && entry.argv[1] === "run"));
     for (const entry of launches) {
@@ -78,17 +73,14 @@ test("an owner replay measures the tiers, makes the host ready, delivers nothing
     }
 
     const status = JSON.parse((await permissions("status", "--json")).stdout);
-    // A current result under the threshold is the last thing readiness needs: the agent now serves delegated workspaces.
     assert.equal(status.agent, "active");
     assert.deepEqual(status.readiness, { ready: true, reasons: [] });
     assert.equal(status.replay.latest.id, result.id);
     assert.equal(status.replay.latest.cases, 20);
-    // Nothing was decided or delivered: the journal holds no decision and no session exists.
     assert.deepEqual([status.rates.lastHour.decisions, status.rates.lastDay.decisions], [0, 0]);
     const sessions = join(host.config.stateDir, "sessions");
     assert.deepEqual(existsSync(sessions) ? readdirSync(sessions) : [], []);
 
-    // The text form prints the same figures, by class and by tier.
     const text = (await permissions("replay", "--set", SET_FILE)).stdout;
     assert.match(text, /^ {2}Miss rate: 6\.7% \(1 of 15, 95% interval /m);
     assert.match(text, /^ {2}Tier class-rule: 12 cases, miss rate 0\.0% \(0 of 12, /m);

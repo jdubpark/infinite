@@ -69,8 +69,6 @@ test("the hash is of the canonical line", () => {
   const reordered = Object.fromEntries(Object.entries(line()).reverse()) as LegacyOutcome;
   assert.equal(legacyLineHash(reordered), legacyLineHash(withOffset));
   assert.notEqual(legacyLineHash(line({ attempts: 2 })), legacyLineHash(line()));
-  // The hash does not rely on the caller: a line that was never parsed, with its time in another written form and an
-  // absent key given as undefined, hashes like the parsed line.
   const parsed = line();
   const unparsed = { ...parsed, recordedAt: "2026-10-01T02:00:00+02:00", label: undefined } as LegacyOutcome;
   assert.equal(Date.parse(unparsed.recordedAt), Date.parse(parsed.recordedAt));
@@ -242,13 +240,11 @@ test("a superseded line is dropped in either order", () => {
   const mark = backward.effects[0];
   assert.ok(mark?.kind === "supersede" && mark.removeRow === false);
   assert.deepEqual(mark?.state, { state: "superseded", lineHash: null, recordedAt: B.recordedAt });
-  // When A arrives, its mark takes A's own hash and time. A is never inserted.
   assert.deepEqual(kinds(backward.effects), [["supersede", ref(A.id)], ["insert", ref(B.id)], ["supersede", ref(A.id)]]);
   const completed = backward.effects[2];
   assert.ok(completed?.kind === "supersede" && completed.removeRow === false);
   assert.equal(backward.removed, 0);
 
-  // Both orders leave the same line states and the same rows.
   const end = (plan: ReturnType<typeof planLegacyBatch>) => {
     const states = new Map<string, LegacyLineState>();
     const rows = new Set<string>();
@@ -273,7 +269,6 @@ test("a superseded line is dropped in either order", () => {
   assert.ok(dropped?.kind === "supersede" && dropped.removeRow === true);
   assert.equal(later.removed, 1);
 
-  // A stored mark with no hash is completed by its line, across batches too. A completed mark is left alone.
   const knownSuperseded: LegacyLineState = { state: "superseded", lineHash: null, recordedAt: B.recordedAt };
   const again = planLegacyBatch([A], { lines: new Map([[ref(A.id), knownSuperseded]]), rows: new Map() }, ctx);
   assert.deepEqual(again.outcomes, ["superseded"]);
@@ -287,10 +282,6 @@ test("a superseded line is dropped in either order", () => {
   assert.deepEqual([settled.outcomes, settled.effects], [["superseded"], []]);
 });
 
-/**
- * A model of the two tables. `run` plans one batch against the model and applies its effects in order, as the import
- * does against the store.
- */
 function model(held: Iterable<[string, string]> = []) {
   const lines = new Map<string, LegacyLineState>();
   const rows = new Map<string, string>(held);
@@ -313,7 +304,6 @@ function orders<T>(items: readonly T[]): T[][] {
   return items.flatMap((item, index) => orders([...items.slice(0, index), ...items.slice(index + 1)]).map(rest => [item, ...rest]));
 }
 
-/** The tables after the lines as one batch, and after one batch per line. */
 function ends(lines: LegacyOutcome[]) {
   const one = model();
   one.run(lines);
@@ -333,7 +323,6 @@ test("a chain keeps its last line in every order", () => {
   const C = line({ id: "op-c", supersedes: "op-b", recordedAt: "2026-10-03T00:00:00.000Z" });
   const D = line({ id: "op-d", supersedes: "op-c", recordedAt: "2026-10-04T00:00:00.000Z" });
 
-  // B replaced A, and C replaced B. Only C has a row, whichever line the host saw first.
   const three = { lines: [superseded(A), superseded(B), imported(C)], rows: [legacyOutcomeId(ref(C.id))] };
   for (const order of orders([A, B, C])) {
     for (const tables of ends(order)) assert.deepEqual(tables, three, order.map(item => item.id).join(" "));
@@ -343,7 +332,6 @@ test("a chain keeps its last line in every order", () => {
     for (const tables of ends(order)) assert.deepEqual(tables, four, order.map(item => item.id).join(" "));
   }
 
-  // The line that arrives under its own mark still replaces the line it names, and the answer counts that row.
   const late = model();
   late.run([A]);
   late.run([C]);
@@ -378,7 +366,6 @@ test("two lines that name one unseen line leave one mark", () => {
   const B = line({ id: "op-b", supersedes: "op-a", recordedAt: "2026-10-02T00:00:00.000Z" });
   const C = line({ id: "op-c", supersedes: "op-a", recordedAt: "2026-10-05T00:00:00.000Z" });
 
-  // The host never saw A: its mark holds the latest time among the lines that name it, in either order.
   const unseen = {
     lines: [[ref(A.id), { state: "superseded", lineHash: null, recordedAt: C.recordedAt }], imported(B), imported(C)],
     rows: [legacyOutcomeId(ref(B.id)), legacyOutcomeId(ref(C.id))].sort(),
@@ -386,7 +373,6 @@ test("two lines that name one unseen line leave one mark", () => {
   for (const order of orders([B, C])) {
     for (const tables of ends(order)) assert.deepEqual(tables, unseen, order.map(item => item.id).join(" "));
   }
-  // When A arrives, in any place, its mark takes A's own hash and time.
   const seen = { lines: [superseded(A), imported(B), imported(C)], rows: unseen.rows };
   for (const order of orders([A, B, C])) {
     for (const tables of ends(order)) assert.deepEqual(tables, seen, order.map(item => item.id).join(" "));
@@ -394,7 +380,6 @@ test("two lines that name one unseen line leave one mark", () => {
 });
 
 test("tables do not depend on order, repetition, or batch cuts", () => {
-  // A fixed pseudo-random sequence: the same graphs, orders, replays, and cuts on every run.
   let seed = 12345;
   const pick = (n: number) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
   const shuffled = <T>(items: readonly T[]) => {
@@ -411,7 +396,6 @@ test("tables do not depend on order, repetition, or batch cuts", () => {
       recordedAt: new Date(Date.parse(RECORDED) + pick(20) * DAY_MS).toISOString(),
       ...(pick(3) === 0 ? {} : { supersedes: ids[(index + 1 + pick(count - 1)) % count] }),
     }));
-    // Some lines never arrive, so some named lines stay unseen.
     const seen = all.filter(() => pick(5) !== 0);
     if (seen.length === 0) continue;
     let expected: unknown;
@@ -435,7 +419,6 @@ test("tables do not depend on order, repetition, or batch cuts", () => {
 });
 
 test("a conflict is refused in either order", () => {
-  // A row that the import did not write holds X's outcome id. X is refused wherever it comes, also under a mark.
   const P = line({ id: "op-p", recordedAt: "2026-10-01T00:00:00.000Z" });
   const X = line({ id: "op-x", supersedes: "op-p", recordedAt: "2026-10-02T00:00:00.000Z" });
   const Y = line({ id: "op-y", supersedes: "op-x", recordedAt: "2026-10-03T00:00:00.000Z" });
@@ -459,7 +442,6 @@ test("another body under a superseded id is refused", () => {
   const edited = line({ id: "op-a", attempts: 2, supersedes: "op-old" });
   const mark: LegacyLineState = { state: "superseded", lineHash: legacyLineHash(A), recordedAt: A.recordedAt };
   const plan = planLegacyBatch([edited, A], { lines: new Map([[ref(A.id), mark]]), rows: new Map() }, ctx);
-  // The stored hash is of another body: the edit is refused with no effect, also none of its own `supersedes`.
   assert.deepEqual(plan.outcomes, ["changed", "superseded"]);
   assert.deepEqual(plan.effects, []);
   assert.equal(plan.newLines, 0);

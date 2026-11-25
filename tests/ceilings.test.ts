@@ -15,8 +15,6 @@ const SHIPPED_HASH = createHash("sha256").update(TEMPLATE_BYTES).digest("hex");
 
 type Entry = { uid?: number; mode?: number; bytes?: Uint8Array; kind?: CeilingFileKind };
 
-// In-memory filesystem: paths map to uid, mode, kind and bytes. A path with bytes is a file, any other a directory.
-// The root and /etc are healthy unless a test replaces them.
 function fakeFs(given: Record<string, Entry>): CeilingFs {
   const files: Record<string, Entry> = { "/": { mode: 0o755 }, "/etc": { mode: 0o755 }, ...given };
   return {
@@ -31,7 +29,6 @@ function fakeFs(given: Record<string, Entry>): CeilingFs {
   };
 }
 
-// Healthy installed state: root-owned file and parent, 0644/0755, bytes equal to the template.
 function healthy(extra: Record<string, Entry> = {}) {
   return fakeFs({
     "/etc/claude-code": { mode: 0o755 },
@@ -98,12 +95,10 @@ test("a world-writable parent directory reports writable even when the file is s
   const writable = byCheck(lines, "writable");
   assert.equal(writable.status, "writable");
   assert.match(writable.detail, /\/etc\/claude-code is group- or world-writable/);
-  // The ceiling is not read while its placement is unsafe, so its hash is not computed.
   assert.equal(byCheck(lines, "hash").status, "writable");
 });
 
 test("a ceiling that is a symbolic link reports writable, even when its target matches the template", () => {
-  // The link's target can sit in a directory an agent owns. Reading through the link still gives matching bytes.
   const lines = run({ fs: healthy({ [SYSTEM]: { kind: "symlink", mode: 0o777, bytes: TEMPLATE_BYTES } }) });
   const writable = byCheck(lines, "writable");
   assert.equal(writable.status, "writable");
@@ -111,7 +106,6 @@ test("a ceiling that is a symbolic link reports writable, even when its target m
 });
 
 test("an entry that is not a regular file is reported without being opened", () => {
-  // A named pipe with no writer would block a read forever.
   const base = healthy({ [SYSTEM]: { kind: "other", mode: 0o644 } });
   const fs: CeilingFs = { stat: base.stat, read: (path) => { assert.notEqual(path, SYSTEM, "the ceiling path must not be read"); return base.read(path); } };
   const lines = run({ fs });
@@ -122,7 +116,6 @@ test("an entry that is not a regular file is reported without being opened", () 
 });
 
 test("the ceiling is not read while any placement check fails, even when the file itself is safe", () => {
-  // Whoever controls the directory can swap the file after a read, so an unsafe placement stops the read.
   const base = healthy({ "/etc/claude-code": { mode: 0o777 } });
   const reads: string[] = [];
   const fs: CeilingFs = { stat: base.stat, read: (path) => { reads.push(path); return base.read(path); } };
@@ -150,7 +143,6 @@ test("the real reader returns for a named pipe instead of waiting for a writer",
   try {
     const pipe = join(dir, "pipe");
     execFileSync("mkfifo", [pipe]);
-    // Run in a child so a blocked read cannot hang the test runner: the child is killed after the timeout.
     const probe = "import(process.env.CEILINGS_MODULE).then((m) => process.stdout.write(String(m.nodeCeilingFs.read(process.env.CEILINGS_PIPE) === undefined)))";
     const result = spawnSync(process.execPath, ["--import", "tsx", "-e", probe], {
       env: { ...process.env, CEILINGS_MODULE: pathToFileURL(resolve("packages/host/src/ceilings.ts")).href, CEILINGS_PIPE: pipe },
@@ -172,18 +164,15 @@ test("a directory higher up that another account can change reports writable", (
 test("launch flags the ceilings turn off are found in each spelling, and look-alikes are not", () => {
   for (const args of [["--permission-mode", "auto"], ["--permission-mode=auto"], ["--permission-mode=bypassPermissions"]])
     assert.equal(forbiddenLaunchFlags("claude", args).length, 1, args.join(" "));
-  // Codex reads an override value as TOML, so every string form of the same value counts.
   for (const value of ['"""danger-full-access"""', "'''danger-full-access'''", '"\\u0064anger-full-access"', '"danger\\u002Dfull-access"'])
     assert.equal(forbiddenLaunchFlags("codex", ["--config", `sandbox_mode=${value}`]).length, 1, value);
   for (const args of [["-c", "sandbox_mode='danger-full-access'"], ["--config", "sandbox_mode = \"danger-full-access\""], ["--config=sandbox_mode=danger-full-access"], ["--sandbox=danger-full-access"], ["-s", "danger-full-access"]])
     assert.equal(forbiddenLaunchFlags("codex", args).length, 1, args.join(" "));
-  // Another key whose value only mentions the mode, and a prompt that mentions the flag text.
   assert.deepEqual(forbiddenLaunchFlags("codex", ["-c", 'notes="sandbox_mode=danger-full-access"', "--sandbox", "workspace-write"]), []);
   assert.deepEqual(forbiddenLaunchFlags("claude", ["--permission-mode", "dontAsk", "--append-system-prompt", "never use --permission-mode auto"]), []);
 });
 
 test("the hidden Codex alias --yolo is checked, as the CLI accepts it", () => {
-  // Hidden from codex --help, but accepted by codex-cli 0.167.2 (parse-level probe).
   assert.deepEqual(forbiddenLaunchFlags("codex", ["--yolo"]), ["--yolo"]);
 });
 
@@ -192,27 +181,20 @@ test("the Claude flag --enable-auto-mode is checked", () => {
 });
 
 test("codex sandbox values are reported unless they read as exactly read-only or workspace-write", () => {
-  // A line-ending backslash in a multi-line TOML string joins the lines into danger-full-access.
   assert.equal(forbiddenLaunchFlags("codex", ["-c", 'sandbox_mode="""danger-\\\n full-access"""']).length, 1);
-  // Attached short and long forms that codex-cli 0.167.2 accepts.
   assert.equal(forbiddenLaunchFlags("codex", ["-sdanger-full-access"]).length, 1);
   assert.equal(forbiddenLaunchFlags("codex", ['-csandbox_mode="danger-full-access"']).length, 1);
   assert.equal(forbiddenLaunchFlags("codex", ["--sandbox=bogus"]).length, 1);
-  // A short option joined to its value with "=": the CLI drops the "=".
   assert.equal(forbiddenLaunchFlags("codex", ['-c=sandbox_mode="danger-full-access"']).length, 1);
   assert.equal(forbiddenLaunchFlags("codex", ["-s=danger-full-access"]).length, 1);
-  // A quoted key and a trailing comment are reported rather than missed.
   assert.equal(forbiddenLaunchFlags("codex", ["-c", '"sandbox_mode"="danger-full-access"']).length, 1);
   assert.equal(forbiddenLaunchFlags("codex", ["-c", 'sandbox_mode="read-only" # note']).length, 1);
-  // Allowed values in each form stay clean.
   assert.deepEqual(forbiddenLaunchFlags("codex", ["-sworkspace-write", "-c", "sandbox_mode='read-only'", '--config=sandbox_mode="workspace-write"']), []);
   assert.deepEqual(forbiddenLaunchFlags("codex", ["-s=workspace-write", "-c=sandbox_mode=read-only", "-c=model=gpt"]), []);
 });
 
 test("a codex permission-profile selection is reported unless it is a built-in profile the ceiling allows", () => {
-  // The ceiling clamps :danger-full-access to read-only (codex-cli 0.169.0), so a launch profile that selects it conflicts.
   assert.deepEqual(forbiddenLaunchFlags("codex", ["-c", 'default_permissions=":danger-full-access"']), ['-c default_permissions=":danger-full-access"']);
-  // A custom profile can grant full-disk write, which the reader cannot see, so it is reported too.
   assert.equal(forbiddenLaunchFlags("codex", ["--config=default_permissions=wide"]).length, 1);
   assert.deepEqual(forbiddenLaunchFlags("codex", ["-c", 'default_permissions=":workspace"', "-c=default_permissions=':read-only'"]), []);
 });
@@ -264,7 +246,6 @@ test("the shipped Claude template parses and sets only the keys the ceiling is m
   assert.equal(permissions.disableBypassPermissionsMode, "disable");
   assert.equal(permissions.disableAutoMode, "disable");
   assert.ok(Array.isArray(permissions.deny) && permissions.deny.length > 0);
-  // Deliberately not set: these would break the host's own hooks, MCP, and launch flags.
   for (const key of ["allowManagedHooksOnly", "allowManagedPermissionRulesOnly", "allowManagedMcpServersOnly", "disableSideloadFlags"]) {
     assert.equal(key in shipped, false, `${key} must not be set by the default ceiling`);
   }

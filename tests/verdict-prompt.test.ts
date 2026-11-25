@@ -7,7 +7,6 @@ import type { ObjectiveRecord } from "../packages/host/src/objective-types.js";
 import type { TeamMember, TeamModelProfile, TeamRun } from "../packages/host/src/team-types.js";
 import { codexMemberToolInstructions, codexSandboxInstructions, contextAccessInstructions, profileInstructions, readOnlyWorkspaceInstructions, reportingInstructions } from "../packages/host/src/team-prompts.js";
 
-// Markers are built at run time, so the source holds no run-specific text.
 const marker = (name: string): string => ["verdict", "marker", name].join("-");
 const RUN_ID = "00000000-0000-4000-8000-000000000031";
 const HEAD = "a".repeat(40);
@@ -167,7 +166,6 @@ test("an oversized context is undefined", () => {
   assert.ok(plain, "the unpadded context fits");
   const baseChars = JSON.stringify(plain).length;
   assert.ok(baseChars < VERDICT_CONTEXT_BYTES);
-  // Pick the padding so the JSON is under the limit in characters and over it in bytes.
   const extra = Math.floor((0.75 * (VERDICT_CONTEXT_BYTES - baseChars)) / count);
   const fits = build(Math.floor(extra / 3));
   assert.ok(fits, "a smaller padding still fits");

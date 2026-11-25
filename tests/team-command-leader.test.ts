@@ -6,21 +6,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { commandScope, EXIT_DRAIN_MS, TeamError, teamCommand, teamHead, type CommandResult, type CommandScope } from "../packages/host/src/team-workspace.js";
 
-/*
- * The leader rule on real processes (INF-388, INF-393). Every team command ends with its leader: once the process the
- * host started exits, the command settles when its pipes close or at the end of a drain, once the loop has read what
- * they hold; it is `leftover` and `truncated` when its output had not ended, and nothing is signalled after that exit.
- * A stop while the leader runs still kills its group.
- */
-
 const CASE = { timeout: 20_000, skip: process.platform === "win32" && "process groups are POSIX" };
 const WAIT_MS = 10_000;
 type Command = { command: string; args: string[] };
-/** The leader writes its pid, starts a background sleep in its own group that holds its pipes, writes the sleep's pid, and exits 3 at once. */
 const leaves = (leader: string, left: string): Command => ({ command: "sh", args: ["-c", `echo $$ > '${leader}'; sleep 30 & echo $! > '${left}'; exit 3`] });
-/** The same, but the leader waits for the sleep. */
 const waits = (leader: string, left: string): Command => ({ command: "sh", args: ["-c", `echo $$ > '${leader}'; sleep 30 & echo $! > '${left}'; wait`] });
-/** The leader starts a child in a session and group of its own that holds the leader's pipes, then exits 0. */
 const escapes = (leader: string, left: string): Command => ({ command: process.execPath, args: ["-e", [
   "const { spawn } = require('node:child_process');",
   "const { writeFileSync } = require('node:fs');",
@@ -52,7 +42,6 @@ function pidIn(file: string): number | undefined {
   return text.endsWith("\n") ? Number.parseInt(text, 10) : undefined;
 }
 
-/** One command, outside any scope unless one is given. Ends what the command left behind when the test is done. */
 class Run {
   readonly base = mkdtempSync(join(tmpdir(), "team-command-leader-"));
   readonly leaderFile = join(this.base, "leader");
@@ -65,22 +54,15 @@ class Run {
     return (scope ? commandScope.run(scope, run) : run()).finally(() => { this.settledAt = performance.now(); });
   }
 
-  /** The process the leader left, once its pid is written. */
   async left(): Promise<number> {
     await until("the leader writes the pid of what it leaves", () => pidIn(this.leftFile) !== undefined);
     return pidIn(this.leftFile)!;
   }
 
-  /** Node reaps the leader as it emits `exit`, so a reaped leader means the runner heard its exit. */
   async leaderExited() {
     await until("the leader is reaped", () => { const leader = pidIn(this.leaderFile); return leader !== undefined && gone(leader); });
   }
 
-  /**
-   * Whether the command settled before the test could stop it inside the drain. The drain runs on this process's loop,
-   * after the 10 ms poll that sees the reap, so a test process late under load delays the drain too. Should the drain
-   * still end first, the case is skipped: a stop after the drain proves nothing about a stop inside it.
-   */
   drainEnded(t: TestContext): boolean {
     if (this.settledAt === undefined) return false;
     t.skip("the command settled at the end of the drain before the test could stop it inside the drain");
@@ -105,7 +87,6 @@ test("a command whose output closes at its exit settles on the close, whole, not
     assert.equal(result.truncated, false, "the output closed");
     assert.equal(result.leftover, false);
     assert.equal(result.stdout, "whole\n");
-    // Two pipes: their chunks arrive in either order.
     assert.deepEqual(result.output.split("\n").filter(Boolean).sort(), ["also", "whole"]);
     assert.ok(elapsed < EXIT_DRAIN_MS, `settled ${elapsed.toFixed(0)} ms after the start: it waited out the drain`);
   } finally {
@@ -222,7 +203,6 @@ test("a Git helper refuses a read whose output a leftover held, a drain after Gi
     const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
     execFileSync("git", ["init", "-q", "--initial-branch=main"], { cwd: base, env });
     execFileSync("git", ["-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "commit", "-q", "--allow-empty", "-m", "base"], { cwd: base, env });
-    // A launcher that leaves a sleep holding the output, then runs Git as the leader.
     const launcher = join(base, "launcher.sh");
     writeFileSync(launcher, `sleep 30 &\necho $! > '${leftFile}'\nexec "$@"\n`);
     const started = performance.now();
@@ -241,19 +221,15 @@ test("a Git helper refuses a read whose output a leftover held, a drain after Gi
 
 test("a command whose output ended while the loop was busy past the drain settles whole, with no leftover", CASE, async () => {
   const run = new Run();
-  // The leader prints, leaves a holder in its group that prints once more 0.3 s later and ends, and exits 0.
   const holds = (_leader: string, left: string): Command => ({ command: "sh", args: ["-c", `echo first; (sleep 0.3; echo late) & echo $! > '${left}'; exit 0`] });
   let leader: number | undefined, busy = false, done = false;
-  // A setImmediate chain runs in the check phase of each loop turn. Once the leader's pid is gone, Node has reaped it and
-  // armed the drain; the chain then keeps the loop busy past the drain and until the holder has ended, so the drain timer
-  // runs in a turn whose poll phase has not yet read the holder's last line or the end of the output.
   const tick = () => {
     if (done) return;
     if (!busy && leader !== undefined && gone(leader)) {
       busy = true;
       const from = performance.now(), holder = pidIn(run.leftFile);
       const holding = () => holder !== undefined && !gone(holder) && performance.now() - from < 5_000;
-      while (performance.now() - from < EXIT_DRAIN_MS + 300 || holding()) { /* The host's event loop is busy. */ }
+      while (performance.now() - from < EXIT_DRAIN_MS + 300 || holding()) { }
     }
     setImmediate(tick);
   };

@@ -9,7 +9,6 @@ import type { ProjectSourceService } from "../../packages/host/src/project-sourc
 import { EventOutbox } from "../../packages/host/src/evidence/outbox.js";
 import { EvidenceStore, evidenceDatabasePath } from "../../packages/host/src/evidence/store.js";
 
-/** A run's host-private record as the delivery tests read it. */
 export type DeliveryStored = {
   run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root: string;
   checkHead?: string; halt?: string; deliveryAttempt?: { memberId: string; revision: number; headCommit: string };
@@ -25,10 +24,6 @@ export const deliveryInternals = (teams: TeamService) => teams as unknown as {
     startAutomaticRecovery(stored: DeliveryStored, trackingReady: boolean): Promise<boolean> };
 };
 
-/**
- * A run whose delivery member is reporting: checked and approved at its integration head, with a stopped scheduler, so a
- * test hands the host one delivery report at a time through `consume`.
- */
 export async function deliveryRecord(mode: "merge" | "pr", onMerged?: (projectId: string) => void,
   source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> | ((fixture: Awaited<ReturnType<typeof fixture>>) => Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">),
   options: { events?: boolean; reviewLineage?: boolean } = {}) {

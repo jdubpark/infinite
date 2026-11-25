@@ -9,7 +9,6 @@ import { hostEntryIds, hostEntryRun } from "./fixtures/host-entry-run.js";
 
 const at = "2026-11-13T10:10:00.000Z";
 
-/** A run and its implementer, with the entry tools on, the given status, and no report. */
 function memberState(status: TeamMember["status"]): { run: TeamRun; member: TeamMember } {
   const run = hostEntryRun();
   const member = run.members.find(item => item.memberId === hostEntryIds.implA);
@@ -22,7 +21,6 @@ function memberState(status: TeamMember["status"]): { run: TeamRun; member: Team
   return { run, member };
 }
 
-/** A journal `team-entry` event holding a valid member post, bound to the member's current attempt. */
 function postEvent(member: TeamMember, seq: number, summary: string): Event {
   const entry: MemberEntryPost = memberEntryPostSchema.parse({
     kind: "contract",
@@ -34,13 +32,11 @@ function postEvent(member: TeamMember, seq: number, summary: string): Event {
   return { seq, at, type: "team-entry", data: { op: "post", ...binding, requestId: memberEntryId(binding, entry), entry } };
 }
 
-/** The scripted journal's page after a cursor: every event with a higher seq. */
 function journalAfter(journal: Event[], after: number): { events: Event[]; cursor: number; more: boolean } {
   const visible = journal.filter(event => event.seq > after);
   return { events: visible, cursor: visible.at(-1)?.seq ?? after, more: false };
 }
 
-/** A fake store that records each batch of posts it is given and stores all of them. */
 function fakeEntries(): { entries: Blackboard; batches: MemberPostRecord[][] } {
   const batches: MemberPostRecord[][] = [];
   const entries = {
@@ -72,7 +68,6 @@ test("a stopped member with more to read is not settled", () => {
   const journal: Event[] = [postEvent(member, 301, "late post")];
   const { entries, batches } = fakeEntries();
   const done = new Set<string>();
-  // The first page is silent: 512 KiB of other lines, with more to read. The post sits after cursor 300.
   const events = (_id: string, after: number) => (after < 300 ? { events: [], cursor: 300, more: true } : journalAfter(journal, after));
   const deps: IngestDeps = { events, entries, done, members: [member] };
 
@@ -92,7 +87,6 @@ test("a stopped member whose page holds a post and says more is read on", () => 
   const early = postEvent(member, 10, "early post"), late = postEvent(member, 400, "late post");
   const { entries, batches } = fakeEntries();
   const done = new Set<string>();
-  // The first page holds a post and stops at its limit (200 events or 512 KiB); the rest follows on the next page.
   const events = (_id: string, after: number) => (after < 10 ? { events: [early], cursor: 200, more: true } : journalAfter([late], after));
   const deps: IngestDeps = { events, entries, done, members: [member] };
 
@@ -104,7 +98,6 @@ test("a stopped member whose page holds a post and says more is read on", () => 
   assert.equal(done.has(member.memberId), true, "the page that says no more settles the member");
 });
 
-/** A run with the blackboard tools on and one entry member per id, all with the given status. */
 function queueRun(runId: string, memberIds: string[], status: TeamMember["status"], started = true): TeamRun {
   const run = hostEntryRun();
   const base = memberState("running").member;
@@ -117,7 +110,6 @@ function queueRun(runId: string, memberIds: string[], status: TeamMember["status
   return run;
 }
 
-/** A journal with no events, so a pass reads a page and finds nothing. */
 const silentJournal = (_id: string, after: number) => ({ events: [] as Event[], cursor: after, more: false });
 
 test("the queue hands out members in turn, at most the limit a pass", () => {
@@ -229,7 +221,6 @@ test("the proposal hook sees only the posts the store holds", () => {
     return { entries, ingested };
   };
 
-  // The store keeps post 1 of two. The hook gets only that post, and an unready or held store gives it nothing.
   const { run, member } = memberState("running");
   const journal: Event[] = [postEvent(member, 1, "kept post"), postEvent(member, 2, "unkept post")];
   const { entries, ingested } = scripted([
@@ -258,7 +249,6 @@ test("the proposal hook sees only the posts the store holds", () => {
   assert.equal(member.entryCursor, 2, "an unready or held store holds the cursor");
   assert.equal(ingested.length, 3);
 
-  // A page with no post and no read calls no store and no hook.
   const quiet: IngestDeps = {
     ...deps,
     events: () => ({ events: [{ seq: 9, at, type: "heartbeat", data: {} }], cursor: 9, more: false }),
@@ -267,14 +257,12 @@ test("the proposal hook sees only the posts the store holds", () => {
   assert.equal(ingested.length, 3, "a page without posts is not stored");
   assert.deepEqual(hooked, [[1]], "a page without posts gives the hook nothing");
 
-  // A stored page whose posts the store keeps none of gives the hook nothing.
   const none = scripted([{ result: "stored", stored: 0, dropped: 0, invalid: 1, kept: new Set() }]);
   const noneJournal: Event[] = [postEvent(member, 10, "invalid post")];
   ingestRunEntries(run, { ...deps, entries: none.entries, events: (_id, after) => journalAfter(noneJournal, after) });
   assert.equal(none.ingested.length, 1, "the page is stored");
   assert.deepEqual(hooked, [[1]], "a page the store keeps nothing of gives the hook nothing");
 
-  // A throwing hook does not hold the cursor back: the next member is read.
   const state = memberState("running");
   const second = state.run.members.find(item => item.memberId === hostEntryIds.implB);
   if (!second) throw new Error("fixture member missing");

@@ -12,8 +12,6 @@ import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 import { EvalHost } from "../packages/host/src/eval-host.js";
 import { EVAL_TRIALS_MODULE, evalTrialsModule } from "../packages/host/src/eval-trial-store.js";
 
-// Reads and controls of a trial job need the trials module. The host answers 503 evidence-unavailable while it is not ready.
-
 const PROJECT = "project-unready-1";
 const CLAUDE: TeamModelProfile = { id: "claude-strong", label: "Claude strong", provider: "claude", model: "claude-opus-5-5", effort: "high", tier: "strong" };
 const LINEUP = { coordinator: CLAUDE, integrator: CLAUDE, reviewer: CLAUDE, implementers: [CLAUDE], escalations: [], fallbacks: [] };
@@ -48,7 +46,6 @@ function hostOver(root: string, store: EvidenceStore): EvalHost {
 
 type Rig = { host: EvalHost; store: EvidenceStore; baselineId: string | undefined; validateId: string; cleanup: () => void };
 
-/** Stores a validation job and, when asked, a baseline job while the trials module is ready, then reopens it not ready. */
 function rig(options: { baseline: boolean }): Rig {
   const root = mkdtempSync(join(tmpdir(), "infinite-trials-unready-"));
   dirs.push(root);
@@ -69,7 +66,6 @@ function rig(options: { baseline: boolean }): Rig {
   }
   seeded.close();
   first.close();
-  // A stored trials version one above the code's makes that module unavailable, as in evidence-store.test.ts.
   const second = new EvidenceStore({ databasePath, vaultKey });
   const trials = evalTrialsModule(second, () => new Date().toISOString());
   second.register({ ...trials, version: trials.version + 1, readVersion: trials.version + 1 });

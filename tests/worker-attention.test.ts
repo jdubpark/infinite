@@ -56,7 +56,6 @@ test("decision queue returns a session prompt and team decision with answerable 
 type SignalRow = { seq: number; data: { kind: string; promptId?: number; source: string; type?: string; title?: string; detail?: string } };
 const signalsOf = async (host: Host, id: string) =>
   (await host.fetchApi(`/sessions/${id}/events?types=signal`)).body.events as SignalRow[];
-/** Every prompt-open is closed exactly once in the journal, after it opened; answers never repeat. */
 function assertClosedOnce(signals: SignalRow[]) {
   for (const open of signals.filter((e) => e.data.kind === "prompt-open")) {
     const closes = signals.filter((e) => e.data.kind === "prompt-closed" && e.data.promptId === open.seq);
@@ -72,22 +71,21 @@ test("dialog session: screen + hook prompt merge, answer closes it, stale answer
     const id = randomUUID();
     const created = await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Dialog", prompt: "dialog hook" });
     assert.equal(created.status, 201);
-    // Wait for both halves: the screen's hash and the hook's tool, whichever arrived first.
     const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash && r.body.attention.prompt?.tool, 15000);
     const prompt = detail.body.attention.prompt;
     assert.equal(prompt.kind, "permission");
-    assert.equal(prompt.source, "hook");                 // hook opened it
-    assert.equal(prompt.options.length, 3);              // screen supplied the options
-    assert.equal(prompt.tool.name, "Bash");              // hook supplied the tool
+    assert.equal(prompt.source, "hook");
+    assert.equal(prompt.options.length, 3);
+    assert.equal(prompt.tool.name, "Bash");
     assert.deepEqual(prompt.destructive, { pattern: "rm-recursive-force" });
-    assert.match(prompt.detail, /rm -rf build/);          // the dialog's own detail, which shows the command
+    assert.match(prompt.detail, /rm -rf build/);
     assert.equal(detail.body.attention.hooks, "active");
     assert.match(detail.body.attention.now, /rm -rf build/);
 
     const list = await host.fetchApi("/sessions");
     const row = list.body.sessions.find((s: { id: string }) => s.id === id);
     assert.equal(row.attention.state, "needs-you");
-    assert.deepEqual(row.attention.prompt.tool.input, {});   // list rows omit tool input
+    assert.deepEqual(row.attention.prompt.tool.input, {});
 
     const viewer = await host.fetchApi(`/sessions/${id}/answer`, "viewer", { requestId: randomUUID(), promptId: prompt.id, option: 0 });
     assert.equal(viewer.status, 403);
@@ -101,9 +99,9 @@ test("dialog session: screen + hook prompt merge, answer closes it, stale answer
     assert.equal(answer.status, 200);
     assert.equal(answer.body.state, "delivered");
     assert.equal(answer.body.result, "closed");
-    assert.equal("digest" in answer.body, false);        // the request digest stays in the worker
+    assert.equal("digest" in answer.body, false);
     const again = await host.fetchApi(`/sessions/${id}/answer`, "controller", { requestId, promptId: prompt.id, option: 1 });
-    assert.equal(again.status, 200);                     // idempotent replay
+    assert.equal(again.status, 200);
     assert.deepEqual(again.body, answer.body);
 
     const finished = await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention.state === "turn-finished", 10000);
@@ -115,7 +113,6 @@ test("dialog session: screen + hook prompt merge, answer closes it, stale answer
     const answered = events.body.events.find((e: { data: { kind: string } }) => e.data.kind === "answer").data;
     assert.equal(answered.option.label, "Yes, and don't ask again for rm commands");
     assert.equal(answered.result, "closed");
-    // One dialog, one prompt-open, closed exactly once whatever order the hooks and screen took.
     assert.equal(kinds.filter((k: string) => k === "prompt-open").length, 1);
     assertClosedOnce(events.body.events);
   } finally {
@@ -132,7 +129,6 @@ test("screen-only yes/no prompt and idle detection without hooks", { timeout: 60
     assert.equal(detail.body.attention.prompt.kind, "yes-no");
     assert.equal(detail.body.attention.prompt.source, "screen");
     assert.equal(detail.body.attention.hooks, "none");
-    // A dialog without a "No, and tell …" option takes no free text.
     const textOnly = await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId: detail.body.attention.prompt.id, text: "yes please" });
     assert.equal(textOnly.status, 409);
     assert.equal(textOnly.body.error, "text-not-accepted");
@@ -159,7 +155,7 @@ test("feedback text follows the reject option once the dialog closes; mismatched
     const outOfRange = await host.fetchApi(`/sessions/${id}/answer`, "controller", { requestId: randomUUID(), promptId: prompt.id, option: 3 });
     assert.equal(outOfRange.status, 409);
     assert.equal(outOfRange.body.error, "invalid-option");
-    assert.equal(outOfRange.body.attention.prompt.id, prompt.id);   // still open, nothing pressed
+    assert.equal(outOfRange.body.attention.prompt.id, prompt.id);
     const textWithYes = await host.fetchApi(`/sessions/${id}/answer`, "controller", { requestId: randomUUID(), promptId: prompt.id, option: 0, text: "Use a dry run first" });
     assert.equal(textWithYes.status, 409);
     assert.equal(textWithYes.body.error, "text-not-accepted");
@@ -170,7 +166,6 @@ test("feedback text follows the reject option once the dialog closes; mismatched
     const after = await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.screen.includes("You: Keep the build directory"), 5000);
     assert.match(after.body.screen, /Selected: No, and tell Claude what to do differently/);
 
-    // Refusals journal nothing; the delivered answer records its key sequence and the text.
     const intents = (await host.fetchApi(`/sessions/${id}/events?types=input-intent`)).body.events;
     assert.equal(intents.length, 1);
     assert.deepEqual(intents[0].data.keys, ["down", "down", "enter"]);
@@ -192,27 +187,23 @@ test("hook prompts merge only into their own dialog, and never while it is being
         .map(({ data: d }) => `${d.kind}${d.type ? `/${d.type}` : ""}${d.reason ? `/${d.reason}` : ""}${d.message ? `[${d.message}]` : ""}(${d.source})`);
     const attentionOf = async (mode: string) => (await host.fetchApi(`/sessions/${ids[mode]}`)).body.attention;
 
-    // Another command's hook while the rm dialog is on screen: nothing is borrowed, the mismatch is noted.
     await waitFor(() => signals("mismatch"), (s) => s.includes("notice/prompt-mismatch[git push --force origin main](hook)"), 10000);
     const kept = (await attentionOf("mismatch")).prompt;
     assert.equal(kept.source, "screen");
     assert.equal(kept.tool, undefined);
     assert.deepEqual(kept.destructive, { pattern: "rm-recursive-force" });
 
-    // A hook prompt waiting for its block is superseded by an unrelated block, which opens from the screen.
     const replaced = await waitFor(() => attentionOf("hook-first"), (a) => a.prompt?.hash, 10000);
     assert.equal(replaced.prompt.source, "screen");
     assert.match(replaced.prompt.detail, /rm -rf build/);
     assert.doesNotMatch(replaced.prompt.detail, /git push/);
     assert.ok((await signals("hook-first")).includes("prompt-closed/superseded(screen)"));
 
-    // A second hook-only prompt replaces the first.
     const second = await waitFor(() => attentionOf("two-hooks"), (a) => a.prompt?.detail === "git push --force origin main", 10000);
     assert.equal(second.prompt.source, "hook");
     const twoHooks = await signals("two-hooks");
     assert.deepEqual(twoHooks.filter((s) => s.startsWith("prompt-")), ["prompt-open(hook)", "prompt-closed/superseded(hook)", "prompt-open(hook)"]);
 
-    // A hook that matches the dialog but arrives mid-answer is only noted; the answer completes.
     const open = await waitFor(() => attentionOf("answer-race"), (a) => a.state === "needs-you" && a.prompt?.hash, 10000);
     const answer = await host.fetchApi(`/sessions/${ids["answer-race"]}/answer`, "controller", { requestId: randomUUID(), promptId: open.prompt.id, option: 1 });
     assert.equal(answer.body.result, "closed");
@@ -221,7 +212,6 @@ test("hook prompts merge only into their own dialog, and never while it is being
     assert.ok(!race.some((s) => s.includes("superseded")), race.join(" "));
     assert.ok(race.includes("prompt-closed/answered-here(host)"), race.join(" "));
 
-    // A hook-first prompt takes the block's title and detail, and the journal says so for the timeline.
     const merged = await waitFor(() => attentionOf("merge"), (a) => a.prompt?.hash, 10000);
     assert.equal(merged.prompt.title, "Do you want to proceed?");
     assert.equal(merged.prompt.source, "hook");
@@ -234,7 +224,6 @@ test("hook prompts merge only into their own dialog, and never while it is being
     assert.equal(notice.data.title, "Do you want to proceed?");
     assert.match(notice.data.detail ?? "", /rm -rf build/);
 
-    // PermissionDenied closes the hook-only prompt it refused.
     const denied = await waitFor(() => signals("denied"), (s) => s.includes("notice/permission_denied[Denied by policy](hook)"), 10000);
     assert.deepEqual(denied.filter((s) => s.startsWith("prompt-")), ["prompt-open(hook)", "prompt-closed/resolved(hook)"]);
     const afterDenied = await attentionOf("denied");
@@ -259,7 +248,6 @@ test("composer text over an open dialog is refused unless a terminal surface for
       assert.equal(refused.body.error, "prompt-open");
       assert.equal(refused.body.attention.prompt.id, promptId);
     }
-    // Nothing was journaled or typed: the dialog is still open on its first option.
     assert.equal((await host.fetchApi(`/sessions/${id}/events?types=input-intent,input-result`)).body.events.length, 0);
     const still = (await host.fetchApi(`/sessions/${id}`)).body;
     assert.equal(still.attention.state, "needs-you");
@@ -267,7 +255,6 @@ test("composer text over an open dialog is refused unless a terminal surface for
     assert.match(still.screen, /❯ 1\. Yes/);
     assert.doesNotMatch(still.screen, /Selected:/);
 
-    // The terminal route forces it; Enter then picks the highlighted option, as a keyboard would.
     const forced = await host.fetchApi(`/sessions/${id}/input`, "controller", { requestId: randomUUID(), text: "no, stop", submit: true, force: true });
     assert.equal(forced.status, 200);
     assert.equal(forced.body.state, "delivered");
@@ -290,7 +277,6 @@ test("input control gates answers and text before the dialog guards, and refusal
     const promptId = open.body.attention.prompt.id;
     const inputEvents = async () => (await host.fetchApi(`/sessions/${id}/events?types=input-intent,input-result`)).body.events as { seq: number; type: string; data: Record<string, unknown> }[];
 
-    // The laptop holds control: the phone's answer without a lease is refused with the lease code.
     const laptop = await claimControl(host, id, "owner");
     const busy = await host.fetchApi(`/sessions/${id}/answer`, "controller", { requestId: randomUUID(), promptId, option: 1 }, { "X-Infinite-Client": randomUUID() });
     assert.equal(busy.status, 409);
@@ -298,14 +284,12 @@ test("input control gates answers and text before the dialog guards, and refusal
     assert.equal(typeof busy.body.error, "string");
     assert.equal((await inputEvents()).length, 0);
     assert.equal((await signalsOf(host, id)).filter((e) => e.data.kind === "answer").length, 0);
-    // The lease check runs before the dialog guard: lease-less text is `control-busy`, not `prompt-open`.
     const unleased = await host.fetchApi(`/sessions/${id}/input`, "controller", { requestId: randomUUID(), text: "no, stop", submit: true }, { "X-Infinite-Client": randomUUID() });
     assert.equal(unleased.status, 409);
     assert.equal(unleased.body.code, "control-busy");
     assert.notEqual(unleased.body.error, "prompt-open");
     assert.equal((await inputEvents()).length, 0);
 
-    // The phone takes over explicitly. The laptop's old lease no longer answers anything.
     const phone = await claimControl(host, id, "controller", { takeover: true });
     assert.notEqual(phone.lease.id, laptop.lease.id);
     const lost = await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId, option: 1 }, laptop.headers);
@@ -313,14 +297,12 @@ test("input control gates answers and text before the dialog guards, and refusal
     assert.equal(lost.body.code, "control-lost");
     assert.equal((await inputEvents()).length, 0);
 
-    // Holding control does not lift the dialog guard: unforced text is still `prompt-open`.
     const guarded = await host.fetchApi(`/sessions/${id}/input`, "controller", { requestId: randomUUID(), text: "no, stop", submit: true }, phone.headers);
     assert.equal(guarded.status, 409);
     assert.equal(guarded.body.error, "prompt-open");
     assert.equal(guarded.body.attention.prompt.id, promptId);
     assert.equal((await inputEvents()).length, 0);
 
-    // With the lease, the answer path is unchanged: verified keys, `closed`, and its journal trail.
     const requestId = randomUUID();
     const answer = await host.fetchApi(`/sessions/${id}/answer`, "controller", { requestId, promptId, option: 1 }, phone.headers);
     assert.equal(answer.status, 200);
@@ -350,8 +332,6 @@ test("an answer accepted just before its lease expires does not revive the lease
     await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Expiring", prompt: "dialog" });
     const open = await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
     const phone = await claimControl(host, id, "controller");
-    // The real 30 s deadline: the answer passes its lease check about 150 ms before expiry and
-    // finishes after it (two arrows, the marker check and the close check take over 200 ms).
     await new Promise((resolve) => setTimeout(resolve, phone.lease.expiresAt - Date.now() - 150));
     const answer = await host.fetchApi(`/sessions/${id}/answer`, "controller", { requestId: randomUUID(), promptId: open.body.attention.prompt.id, option: 2 }, phone.headers);
     assert.equal(answer.status, 200, JSON.stringify(answer.body));
@@ -371,7 +351,6 @@ test("a dialog drawn before its hooks opens one prompt; rejecting it clears the 
   try {
     const id = randomUUID();
     await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Screen first", prompt: "dialog-first hook" });
-    // All three hooks (UserPromptSubmit, PreToolUse, PermissionRequest) land after the block.
     const open = await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash && r.body.attention.prompt?.tool && r.body.attention.lastTool, 15000);
     const prompt = open.body.attention.prompt;
     assert.equal(prompt.title, "Do you want to proceed?");
@@ -379,14 +358,13 @@ test("a dialog drawn before its hooks opens one prompt; rejecting it clears the 
     const before = await signalsOf(host, id);
     const opens = before.filter((e) => e.data.kind === "prompt-open");
     assert.equal(opens.length, 1, JSON.stringify(before.map((e) => e.data)));
-    assert.equal(opens[0].data.source, "screen");          // the screen saw it first
+    assert.equal(opens[0].data.source, "screen");
     assert.equal(prompt.id, opens[0].seq);
     for (const kind of ["turn-start", "tool-start"]) {
       const at = before.find((e) => e.data.kind === kind);
       assert.ok(at && at.seq > opens[0].seq, `${kind} arrives after the screen's prompt-open`);
     }
 
-    // "No, and tell Claude what to do differently" with feedback.
     const answer = await host.fetchApi(`/sessions/${id}/answer`, "controller", { requestId: randomUUID(), promptId: prompt.id, text: "Keep the build directory" });
     assert.equal(answer.body.result, "closed");
     const after = (await host.fetchApi(`/sessions/${id}`)).body.attention;
@@ -404,7 +382,6 @@ test("a dialog drawn before its hooks opens one prompt; rejecting it clears the 
 
 test("a worker without attention reports a default instead of breaking the list", () => {
   const now = "2026-10-05T00:00:00.000Z";
-  // A live worker from before attention existed is not claimed to be idle or finished.
   const running = withDefaultAttention({ status: "running", seq: 4, screen: "" }, now);
   assert.equal(running.attention.state, "unavailable");
   assert.equal(running.attention.now, "");
@@ -449,11 +426,9 @@ test("a plain session says what it is doing; one unreadable status never hides t
     const broken = randomUUID();
     await host.fetchApi("/sessions", "owner", { requestId: live, provider: "demo", projectId: "rehearsal", title: "Live", prompt: "plain work" });
     await host.fetchApi("/sessions", "owner", { requestId: broken, provider: "demo", projectId: "rehearsal", title: "Broken", prompt: "" });
-    // A session started with a request is working; its line names no tool yet.
     const thinking = await waitFor(() => host.fetchApi(`/sessions/${live}`), (r) => r.body.attention?.now === "Thinking", 3000);
     assert.equal(thinking.body.attention.state, "working");
 
-    // Stop one session, wait for its worker to leave, then damage its saved status.
     await host.fetchApi(`/sessions/${broken}/stop`, "owner", { requestId: randomUUID() });
     await waitFor(async () => existsSync(join(host.config.runDir, `${broken}.sock`)), (exists) => !exists, 10000);
     writeFileSync(join(host.config.stateDir, "sessions", broken, "status.sealed"), "not a sealed status");
@@ -528,18 +503,13 @@ test("a Codex status row is corroborated only after it persists, once per episod
     const id = await startLimitSession(host, "codex", "limit");
     const rows = await waitFor(() => limitsOf(host, id), (r) => r.length >= 2, 20000);
     assert.deepEqual(rows.map((e) => [e.data.confidence, e.data.source]), [["single-source", "screen"], ["corroborated", "screen"]]);
-    // The limitConfirmMs gate (2000 ms) holds between the two journal events.
     assert.ok(Date.parse(rows[1].at) - Date.parse(rows[0].at) >= 1900, `${rows[0].at} -> ${rows[1].at}`);
-    // An unrelated line printed while the row persists neither resets nor re-earns corroboration.
-    // (the fixture prints it at 4.5 s, after corroboration; wait past it, before the 9 s clear)
     await sleepMs(2500);
     assert.equal((await limitsOf(host, id)).length, 2);
-    // An OSC turn complete (6 s) cannot report failure: the limit stays shown and the episode open.
     await waitFor(() => signalsOf(host, id), (r) => r.some((e) => e.data.kind === "turn-end" && e.data.source === "osc"), 5000);
     await sleepMs(1500);
     assert.equal((await limitsOf(host, id)).length, 2, "No new single-source follows the OSC turn end");
     assert.equal((await host.fetchApi(`/sessions/${id}`)).body.attention.limit?.confidence, "corroborated");
-    // The row disappears for five seconds, ending the episode; its return starts a new one.
     const all = await waitFor(() => limitsOf(host, id), (r) => r.length >= 4, 25000);
     assert.deepEqual(all.slice(2).map((e) => e.data.confidence), ["single-source", "corroborated"]);
     assert.ok(Date.parse(all[3].at) - Date.parse(all[2].at) >= 1900);

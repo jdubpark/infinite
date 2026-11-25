@@ -12,16 +12,13 @@ interface StoredMessage {
 }
 
 const bindingKey = (channelId: string, threadTs: string) => `${channelId}:${threadTs}`;
-/** Methods whose arguments Slack reads only from a form body; a JSON body is refused, as Slack ignores its arguments. */
 const FORM_METHODS = new Set(["auth.test", "conversations.replies", "apps.connections.open", "chat.getPermalink"]);
-/** Slack timestamps are microseconds since the epoch written as `seconds.micros`; comparing them as integers keeps order exact. */
 const toMicros = (ts: string) => {
   const [seconds, fraction = ""] = ts.split(".");
   return Number(seconds) * 1_000_000 + Number(fraction.padEnd(6, "0").slice(0, 6));
 };
 const fromMicros = (micros: number) => `${Math.floor(micros / 1_000_000)}.${String(micros % 1_000_000).padStart(6, "0")}`;
 
-/** A loopback fake of the Slack Web API and Socket Mode, with the failure modes the intake client must survive. */
 export async function startSlackServer(options: { teamId?: string; botUserId?: string } = {}) {
   const teamId = options.teamId ?? "T00000000", botUserId = options.botUserId ?? "U00000001", botId = "B00000000";
   const appToken = `xapp-1-${randomBytes(12).toString("hex")}`;
@@ -32,7 +29,6 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
   writeFileSync(appTokenFile, `${appToken}\n`, { mode: 0o600 });
   writeFileSync(botTokenFile, `${botToken}\n`, { mode: 0o600 });
 
-  // One clock for the whole fixture: every generated timestamp is later than every timestamp already in use.
   let latest = toMicros("1700000000.000000");
   const nextTs = () => fromMicros(++latest);
   const observe = (ts: string) => { latest = Math.max(latest, toMicros(ts)); };
@@ -101,7 +97,6 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
             channel: body.channel, threadTs: body.thread_ts, ts: nextTs(), text: body.text,
             user: botUserId, botId, metadata: body.metadata,
           };
-          // The post is stored before a lost response is dropped, so a retry can find it.
           posts.push(message);
           const list = threads.get(bindingKey(body.channel, body.thread_ts));
           list?.push(message);
@@ -154,11 +149,6 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
 
   return {
     endpoint, appTokenFile, botTokenFile, teamId, botUserId, botId,
-    /**
-     * Seeds a thread whose replies Slack would return. The first message of an empty thread without a `ts` is the root
-     * and takes the binding's thread timestamp. Other messages without a `ts` get a timestamp later than every timestamp
-     * already in use, so they sort after everything seeded or posted before them.
-     */
     seedThread(binding: IntakeThread, messages: { user?: string; botId?: string; text: string; ts?: string; key?: string }[]) {
       const key = bindingKey(binding.channelId, binding.threadTs);
       const list = threads.get(key) ?? [];
@@ -173,7 +163,6 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
       }
       threads.set(key, list);
     },
-    /** conversations.replies answers not_in_channel for this channel. */
     hide(channelId: string) { hidden.add(channelId); },
     posts(binding: IntakeThread) {
       return posts.filter(post => post.channel === binding.channelId && post.threadTs === binding.threadTs)
@@ -182,7 +171,6 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
     postPayloads(binding: IntakeThread) {
       return postPayloads.filter(payload => payload.channel === binding.channelId && payload.thread_ts === binding.threadTs);
     },
-    /** Sends an events_api envelope on the open Socket Mode connection and resolves with its envelope ID once sent. */
     async emit(event: Record<string, unknown>, emitOptions: { teamId?: string; eventId?: string } = {}) {
       const envelopeId = randomUUID();
       return sendFrame(envelopeId, JSON.stringify({
@@ -190,32 +178,24 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
         payload: { type: "event_callback", team_id: emitOptions.teamId ?? teamId, event_id: emitOptions.eventId ?? `Ev${randomUUID()}`, event },
       }));
     },
-    /** Sends an envelope of any Socket Mode type with the given payload, for envelopes other than events_api. */
     async emitRaw(type: string, payload: Record<string, unknown> = {}) {
       const envelopeId = randomUUID();
       return sendFrame(envelopeId, JSON.stringify({ envelope_id: envelopeId, type, accepts_response_payload: false, payload }));
     },
-    /** Sends a real Socket Mode interactive envelope containing the supplied interactive payload. */
     async emitInteraction(payload: Record<string, unknown>) {
       const envelopeId = randomUUID();
       return sendFrame(envelopeId, JSON.stringify({ envelope_id: envelopeId, type: "interactive", accepts_response_payload: true, payload }));
     },
     acks() { return [...acked]; },
-    /** Sends the same envelope again, as Slack does for an envelope that was not acknowledged. */
     async redeliver(envelopeId: string) {
       const frame = sent.get(envelopeId);
       if (!frame) throw new Error("Cannot redeliver: unknown envelope");
       await sendFrame(envelopeId, frame);
     },
-    /** The next chat.postMessage is stored, then its HTTP response is dropped. */
     loseNextPostResponse() { loseNext = true; },
-    /** Every Web API call answers 503 while true. */
     unavailable(value: boolean) { down = value; },
-    /** Every Web API call answers HTTP 429 with the body "ratelimited" while true. */
     rateLimited(value: boolean) { limited = value; },
-    /** Replaces the WebSocket address that apps.connections.open returns. */
     returnSocketAddress(url: string) { socketAddress = url; },
-    /** Terminates the open Socket Mode connection, as Slack does before it reconnects a client. */
     dropSocket() { for (const socket of sockets) socket.terminate(); },
     get calls() { return calls; },
     async close() {

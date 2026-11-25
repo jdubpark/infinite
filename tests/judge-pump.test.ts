@@ -23,10 +23,6 @@ import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 import type { Config } from "../packages/host/src/types.js";
 import { fixture, git } from "./team-fixture.js";
 
-// The pump's judgement turn. The 30-pair tests run on a rig with a scripted `TrialTeams` and a scripted judge that answers from the
-// package files the pump wrote; the real-host tests run a real team service and tests/fixtures/judge-agent.mjs. The source build is
-// scripted in both, so that 60 judgements need not build 60 real sources; the trial pump's own tests cover the real build.
-
 const T0 = "2026-11-22T00:00:00.000Z";
 const JOB = "job-1";
 const PROJECT = "pump-project";
@@ -48,7 +44,6 @@ test.after(() => {
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
 });
 
-/** A small unified diff; the resolved side holds the marker line the fixture judge looks for. */
 const patchOf = (pair: number, resolved: boolean) =>
   Buffer.from(`diff --git a/a.txt b/a.txt\nnew file mode 100644\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+${resolved ? `RESOLVED-MARKER\n+fix-${pair}` : `other-${pair}`}\n`);
 const taskOf = (pair: number) => `task-zq-${String(pair).padStart(3, "0")}`;
@@ -58,11 +53,9 @@ const grade = (resolved: boolean): TrialGrade => ({ ending: "graded", expectedPa
 type Mode = "prefer-a" | "prefer-resolved" | "hang";
 type Rig = ReturnType<typeof makeRig>;
 type Options = { mode?: Mode; pairs?: number; teams?: () => TrialTeams; identity?: EvalIdentity; prepare?: (rig: Rig, ctx: { trialId: string; root: string }) => Promise<SourceResult>;
-  /** Pairs for a second project, seeded after the first project's. */
   secondPairs?: number;
   config?: (config: Config) => void; inventory?: () => Promise<[]> };
 
-/** The pump over a real store and real jobs, with `pairs` seeded dev pairs. Every identity call and source build is logged. */
 function makeRig(options: Options = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "infinite-judge-pump-")));
   dirs.push(root);
@@ -85,9 +78,7 @@ function makeRig(options: Options = {}) {
   } as unknown as Config;
   options.config?.(config);
   const log: string[] = [];
-  /** `probe`: the probe for a named project is not ready. `stop`: the account cannot be stopped, so the start-up cannot finish. */
   const down = { probe: false, stop: false };
-  /** The grader job and project of every source the pump asked for. */
   const sources: { jobId: string; projectId: string }[] = [];
   const identity = options.identity ?? ({
     probe: async (input: Record<string, unknown>) => (down.probe && "fetchUrl" in input ? { state: "unavailable" } : READY), receive: async () => "failed", prepare: async () => "failed", check: async () => "failed",
@@ -100,9 +91,7 @@ function makeRig(options: Options = {}) {
   const judge = scriptedTeams(options.mode ?? "prefer-resolved");
   const jobs = new TrialJobs({ store, config, now });
   const judgements = new JudgeCalibrations({ store, config, now });
-  /** The mirror head the scripted source status reports; undefined means the project has no mirror yet. */
   const mirror = { head: "head" as string | undefined };
-  /** How many of the next source builds end on an environment cause. */
   const sourceFails = { left: 0 };
   const rig = {
     root, store, config, log, sources, judge, jobs, judgements, now, mirror, sourceFails, down,
@@ -159,11 +148,6 @@ function seedPairs(r: { store: EvidenceStore }, count: number, project = PROJECT
 type Scripted = { teams: TrialTeams; creates: { purpose: string; trialId: string }[]; ended: { id: string; ending: string }[]; reads: Map<string, { a: Buffer; b: Buffer }>;
   states: Map<string, ReplayState>; mode: { current: Mode } };
 
-/**
- * A `TrialTeams` with no team service. A duel run reads the package the pump wrote and answers as the mode says: `prefer-a` always A,
- * `prefer-resolved` the label whose patch holds the marker line, `hang` never answers (its member started three minutes ago).
- * A replay run ends `no-result` with its session still alive until the test sets `sessionExited`.
- */
 function scriptedTeams(mode: Mode): Scripted {
   const states = new Map<string, ReplayState>();
   const creates: Scripted["creates"] = [], ended: Scripted["ended"] = [], reads: Scripted["reads"] = new Map();
@@ -202,7 +186,6 @@ function scriptedTeams(mode: Mode): Scripted {
   return { teams, creates, ended, reads, states, mode: current };
 }
 
-/** Steps the pump until `done` holds; a bound on the steps and the time keeps a bug from spinning. */
 async function until(r: { pump: TrialPump }, done: () => boolean, options: { steps?: number; ms?: number; pause?: number } = {}): Promise<void> {
   const deadline = Date.now() + (options.ms ?? 120_000);
   for (let step = 0; step < (options.steps ?? 2000) && Date.now() < deadline && !done(); step++) {
@@ -271,7 +254,6 @@ test("an always-A judge scores no correct pair", { timeout: 240_000 }, async () 
 test("a judgement waits while a trial is live", async () => {
   const r = makeRig({ mode: "prefer-resolved" });
   try {
-    // One valid task and a baseline job: the pump starts that trial first, and its run stays alive.
     r.store.write(tx => {
       tx.run(
         "INSERT INTO eval_tasks (task_id, origin, run_id, member_id, project_ref, state, material, base, material_bytes, "
@@ -289,7 +271,6 @@ test("a judgement waits while a trial is live", async () => {
     assert.equal(r.judge.creates.filter(item => item.purpose === "duel").length, 0, "no judge run starts while the trial is live");
     assert.equal(rowsOf(r, id).length, 0, "no judgement row is opened either");
     assert.equal(viewOf(r, id).waiting, "another-job", "the view names the live trial as the gate");
-    // The trial's session exits and the job is cancelled, so no further trial is ready: the trial closes, and the judgement runs after it.
     const trialId = r.judge.creates.find(item => item.purpose === "replay")!.trialId;
     r.store.write(tx => { tx.run("UPDATE eval_jobs SET status = 'cancelled' WHERE kind = 'baseline'"); });
     r.judge.states.set(trialId, { ...r.judge.states.get(trialId)!, sessionExited: true });
@@ -326,7 +307,6 @@ test("an expired patch drops the pair", { timeout: 240_000 }, async () => {
   const r = makeRig({ mode: "prefer-resolved", pairs: 32 });
   try {
     const id = calibrate(r, { pairs: 32 });
-    // The patch of the first pair's resolved trial expires after the calibration chose its pairs.
     const first = rowsOf(r, id);
     assert.equal(first.length, 0);
     r.store.write(tx => { tx.run("DELETE FROM eval_trial_patches WHERE trial_id = ?", trialOf(0, true)); });
@@ -358,10 +338,8 @@ test("each project of a calibration gets its own grader job", { timeout: 240_000
     const first = [...jobs.get(PROJECT)!], second = [...jobs.get(SECOND)!];
     assert.equal(first.length, 1, "one grader job for the first project");
     assert.equal(second.length, 1, "one grader job for the second project");
-    // The grader keeps one base bundle per job, and a bundle holds one repository.
     assert.notEqual(first[0], second[0], "two projects never share a grader job");
     for (const job of [first[0]!, second[0]!]) assert.match(job, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, "the grader accepts the job ID");
-    // The pairs of one project run together, so the grader changes bundles once.
     const runs = r.sources.map(source => source.projectId).filter((project, at, all) => at === 0 || all[at - 1] !== project);
     assert.deepEqual(runs, [PROJECT, SECOND]);
   } finally {
@@ -509,7 +487,6 @@ test("a run that ends with a trial-only ending records void-host", async () => {
   const r = makeRig({ mode: "prefer-a" });
   try {
     const id = calibrate(r);
-    // A duel run never settles; if its state says so, the judgement is void and not a preference.
     const teams = r.judge.teams;
     const original = teams.createForReplay.bind(teams);
     teams.createForReplay = async input => {
@@ -524,13 +501,10 @@ test("a run that ends with a trial-only ending records void-host", async () => {
   }
 });
 
-// The real-host tests: a real team service and the fixture judge, with the source build scripted to a clone of the fixture project.
-
 type Real = Awaited<ReturnType<typeof realRig>>;
 
 async function realRig(mode: Mode) {
   const f = await fixture("success", undefined, {}, { trustWorkspaces: true });
-  // The host's workspace check and the package writer both want a path with no link in it.
   const base = realpathSync(f.host.root);
   const evalRoot = join(base, "eval");
   const home = join(base, "home"), template = join(base, "template"), tmp = join(base, "tmp");
@@ -602,7 +576,6 @@ test("the package reaches the judge", { timeout: 300_000 }, async () => {
       const resolvedBytes = patchOf(0, true), unresolvedBytes = patchOf(0, false);
       assert.equal(read.get("package.A.patch")!.equals(row.resolvedIsA ? resolvedBytes : unresolvedBytes), true, `ordering ${row.ordering}: A holds the right patch`);
       assert.equal(read.get("package.B.patch")!.equals(row.resolvedIsA ? unresolvedBytes : resolvedBytes), true, `ordering ${row.ordering}: B holds the right patch`);
-      // The fixture judge picked the label that holds the resolved patch, and the job read it as resolved.
       assert.equal(row.preferred, row.resolvedIsA ? "A" : "B");
       for (const [name, bytes] of read) {
         const text = bytes.toString("utf8");

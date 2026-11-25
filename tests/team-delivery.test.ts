@@ -74,7 +74,6 @@ async function restartDeliveryRecord(h: FailedDeliveryRecord) {
   h.teams.close(); await h.teams.idle();
   h.teams = await h.f.openTeamService({ source: h.source, start: false });
   bindDeliveryRecord(h, deliveryInternals(h.teams).records.get(h.id)!);
-  // One real stop-draining step clears the restart halt. Keep the scheduler off so no test agent launches.
   if (h.stored.halt) await deliveryInternals(h.teams).step(h.stored);
   assert.equal(h.stored.halt, undefined);
 }
@@ -91,7 +90,6 @@ function persistedDelivery(h: FailedDeliveryRecord) {
 function withoutUpdatedAt(stored: DeliveryStored) {
   const copy = structuredClone(stored);
   copy.run.updatedAt = "ignored save timestamp";
-  // Sealed JSON omits optional undefined fields present on the in-memory object.
   return JSON.parse(JSON.stringify(copy));
 }
 
@@ -578,7 +576,6 @@ test("attested reconciliation clears only a settled moved-base preparation failu
     const originalWorkspace = h.run.workspace;
     await restartDeliveryRecord(h);
     assert.deepEqual(h.stored.pending, pending, "the structured failure survives the generic restart reason");
-    // What the host saw of left-over processes depends on the machine; the intent's own fields do not.
     const { processes: _processes, processesCheckedAt: _checkedAt, ...operation } = h.teams.get(h.id).pendingOperation!;
     assert.deepEqual(operation, { id: pending.id, kind: "result", revision: 1, failed: true,
       failureCode: "workspace-operation-failed", sourceMemberId: h.member.memberId, sourceRole: "delivery" });
@@ -874,7 +871,6 @@ test("failed checks never launch delivery and a weak lineup cannot opt into merg
 });
 
 
-/** Every stored event of one run, read page by page. */
 function allRunEvents(store: EvidenceStore, runId: string): RunEvent[] {
   const events: RunEvent[] = [];
   let after = 0;

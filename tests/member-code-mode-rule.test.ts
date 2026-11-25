@@ -27,7 +27,6 @@ test("only a Claude member whose launch asks for Code Mode reads the rule for pr
   assert.equal(memberLaunchPrompt(PROMPT, "claude", true), `${PROMPT}\n\n${claudeProgramInstructions}`);
   assert.equal(memberLaunchPrompt(PROMPT, "claude", false), PROMPT);
   for (const provider of ["codex", "opencode", "grok"] as const) assert.equal(memberLaunchPrompt(PROMPT, provider, true), PROMPT, provider);
-  // The rule names the report tool a Claude member is told to use, and says that a reject holds inside a program.
   assert.match(claudeProgramInstructions, /mcp__infinite_team__report/);
   assert.match(claudeProgramInstructions, /A rejected call is final inside a program too/);
 });
@@ -41,7 +40,6 @@ test("a Claude member's prompt version differs with Code Mode, and every other v
     for (const provider of ["codex", "opencode"] as const)
       assert.equal(promptVersion(role, provider, undefined, true, true, false, true), promptVersion(role, provider, undefined, true, true, false), `${role} ${provider}`);
   }
-  // The version is the hash of what the member reads: each render ends with the rule, and is otherwise the same text.
   const off = renderedPrompts("implementer", "claude", undefined, true), on = renderedPrompts("implementer", "claude", undefined, true, false, false, true);
   assert.deepEqual(on, off.map(text => `${text}\n\n${claudeProgramInstructions}`));
 });
@@ -78,7 +76,6 @@ test("the mode a new Claude member would start in is read from the level and the
     ["headless level, interactive launch", interactive, "headless", false], ["all, interactive launch", interactive, "all", true],
     ["off, headless launch", headless, "off", false], ["headless level, headless launch", headless, "headless", true],
     ["all, headless launch", headless, "all", true], ["all, headless launch through sudo", viaSudo, "all", true],
-    // The channel cannot serve these shapes, and a headless run takes the request only from the channel's settings.
     ["all, headless launch that skips permissions", { command: "claude", args: ["-p", "--dangerously-skip-permissions"] }, "all", false],
     ["all, headless launch outside the default permission mode", { command: "claude", args: ["-p", "--permission-mode", "dontAsk"] }, "all", false],
     ["all, no Claude profile", undefined, "all", false],
@@ -106,14 +103,12 @@ test("a Claude member records the configuration of the mode its launch recorded"
     const f = schedulerFixture();
     const store = new EvidenceStore({ databasePath: evidenceDatabasePath(f.config.stateDir), vaultKey: f.key });
     try {
-      // One queued Claude implementer on task a.
       const memberId = randomUUID();
       f.run.members = [{ ...f.run.members[0]!, memberId, sessionId: randomUUID(), role: "implementer", title: "Implementer: a", taskId: "a",
         provider: "claude", modelProfile: claudeLight, status: "queued", cursor: 0, prompt: "Write a.txt" }];
       f.run.lineup = mixedLineup; f.run.status = "implementing"; f.run.parallelism = 2;
       f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "running", memberId }];
       f.writeTeam();
-      // The session record says whether the host asked for Code Mode. The stand-in manager returns it as the host does.
       const start = f.manager.createTeamSession;
       f.manager.createTeamSession = (async (...args: Parameters<typeof start>) => ({ ...(await start(...args)), ...(codeMode ? { codeMode: true } : {}) })) as typeof start;
       const teams = f.openTeam({ events: new EventOutbox(store) });
@@ -143,7 +138,6 @@ test("a routed start reads the mode a new Claude member would start in", async (
     try {
       f.config.agents.claude = { command: "claude", args: [] };
       f.config.codeMode = { claude: level };
-      // A run with one task ready to start, and a routing pin, so that the start goes to the router.
       f.run.members = []; f.run.lineup = lineup; f.run.status = "implementing"; f.run.parallelism = 1; f.run.headCommit = f.run.baseCommit;
       f.run.routing = pinRouting(undefined, "autonomous", lineup);
       f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "pending", agentProfileId: claudeLight.id }];
@@ -160,10 +154,6 @@ test("a routed start reads the mode a new Claude member would start in", async (
   }
 });
 
-/**
- * Starts one session on a stand-in provider that records the arguments and the Code Mode variable it started with:
- * a team member in `role`, or the owner's own session when `role` is null.
- */
 async function launchMember(level: "off" | "all" | undefined, provider: "claude" | "codex", role: string | null = "implementer", nativeArgs?: string[]) {
   const root = mkdtempSync(join(tmpdir(), "infinite-member-rule-"));
   const log = join(root, "launch.json");
@@ -184,7 +174,6 @@ setTimeout(() => process.exit(0), 300);
     const session = role === null ? await manager.create(request, "owner") : await manager.createTeamSession(request, assignment, cwd);
     await waitFor(() => existsSync(log), Boolean, 60000);
     const launch = JSON.parse(readFileSync(log, "utf8")) as { args: string[]; mode: string | null };
-    // The request as a command prefix such as sudo passes it on: in the `env` key of a settings argument, one entry per argument.
     const settingsMode = launch.args.flatMap((arg, index) => arg === "--settings"
       ? [(JSON.parse(launch.args[index + 1]!) as { env?: Record<string, string> }).env?.CLAUDE_CODE_EXPERIMENTAL_CODE_MODE ?? null] : []);
     return { session, mode: launch.mode, settingsMode, args: launch.args, prompts: launch.args.filter(arg => arg.includes("Member prompt:")) };

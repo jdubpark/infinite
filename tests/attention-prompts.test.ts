@@ -99,7 +99,6 @@ test("an old Code Mode menu above a yes-no prompt leaves the yes-no prompt open"
 });
 
 test("another prompt's key hint is not the Code Mode footer", () => {
-  // The line starts like a key hint and is a live yes-no prompt. Read as footer text, it would return the old menu.
   for (const cursor of ["no", "yes"] as const) {
     const prompt = detectPrompt([...staleCodeModeMenu(cursor), "", "Press y to proceed or n to cancel [Y/n]"], "claude");
     assert.equal(prompt?.kind, "yes-no", cursor);
@@ -110,13 +109,11 @@ test("another prompt's key hint is not the Code Mode footer", () => {
 });
 
 test("characters after an old Code Mode menu that are not its footer leave no open dialog", () => {
-  // Compared without punctuation, each of these lines lost every character and the old menu stayed open.
   for (const trailing of ["❯", ">", "›", "$", "!!!", "继续", "/"]) {
     for (const cursor of ["no", "yes"] as const)
       assert.notEqual(detectPrompt([...staleCodeModeMenu(cursor), "", trailing], "claude")?.title, "Code Mode (experimental)", `${cursor} menu, then ${trailing}`);
     assert.notEqual(detectPrompt([...screen("claude-code-mode"), trailing], "claude")?.title, "Code Mode (experimental)", `footer, then ${trailing}`);
   }
-  // One screen cannot be an open dialog and an idle composer at once.
   const idle = [...staleCodeModeMenu("no"), "", "❯"];
   assert.equal(isIdleScreen(idle, "claude"), true);
   assert.equal(detectPrompt(idle, "claude"), null);
@@ -173,7 +170,6 @@ test("transcript lines above a boxed dialog are not part of its header", () => {
   assert.equal(p.title, "Do you want to proceed?");
   assert.equal(p.detail, "Bash command\nrm -rf build\nRemove the stale build directory");
   assert.doesNotMatch(p.detail ?? "", /stale build directory first|rebuild/);
-  // The fingerprint, and so the answer hash, is the same with or without the transcript above.
   assert.equal(p.fingerprint, detectPrompt(screen("claude-permission"), "claude")!.fingerprint);
 });
 
@@ -226,7 +222,7 @@ test("fingerprint includes the dialog's detail, normalised", () => {
   const a = detectPrompt(screen("demo-dialog"), "demo")!;
   const other = detectPrompt(screen("demo-dialog").map((l) => l.replace("rm -rf build", "rm -rf /data")), "demo")!;
   const respaced = detectPrompt(screen("demo-dialog").map((l) => l.replace("  rm -rf build", "    rm   -rf  build ")), "demo")!;
-  assert.notEqual(a.fingerprint, other.fingerprint);   // same title and options, different command
+  assert.notEqual(a.fingerprint, other.fingerprint);
   assert.equal(a.fingerprint, respaced.fingerprint);
 });
 

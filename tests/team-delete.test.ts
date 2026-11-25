@@ -245,7 +245,6 @@ test("DELETE /api/teams/:id enforces ownership and removes only settled runs", {
 
     missionRecord.mission.status = "cancelled";
     run.status = "cancelled"; run.reason = "The owner cancelled this run."; run.members = []; run.workspaceRemovedAt = new Date().toISOString();
-    // The clones are already gone: point the run at the host root so deletion only has to drop the record.
     run.workspace = join(config.teams!.workspaceDir, "removed-run", "integration");
     const deleted = await call();
     assert.equal(deleted.status, 200);

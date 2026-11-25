@@ -6,14 +6,6 @@ import {
   type SearchState, step, type TeamSearch,
 } from "../packages/host/src/search-engine.js";
 
-/*
- * Behaviour of the search engine (INF-336) against the acceptance items of
- * docs/superpowers/specs/2026-11-18-search-mode-design.md that a pure module decides. Expected values come from the
- * design's text: its allowance example (4 × 35 + 60 = 200 minutes), its window (2 × (20 + gateMinutes)), its reserve
- * example (eight attempts left, one open task, one challenger), and its rules. Event orders under random interleaving
- * are the simulator's (tests/search-engine-sim.test.ts).
- */
-
 const T0 = Date.parse("2026-11-20T10:00:00.000Z");
 const at = (minutes: number) => new Date(T0 + minutes * 60_000).toISOString();
 const BASE = "b".repeat(40);
@@ -22,7 +14,6 @@ const CRITERION: Criterion = {
   id: "c1", origin: "owner", statement: "The parser test passes", check: { kind: "command", command: "digest-parser-test" },
   producer: "host", threshold: { kind: "pass" }, pinned: [{ path: "tests/parser.test.ts", blob: "a".repeat(40) }], state: "active",
 };
-/** In Part 2 order. Against an `anthropic` champion, three are eligible: openai, google, mistral. */
 const CANDIDATES = [
   { profileId: "p-gpt", family: "openai", limited: false },
   { profileId: "p-claude-2", family: "anthropic", limited: false },
@@ -40,10 +31,8 @@ function view(minutes: number, policy: TeamSearch = {}, over: Partial<RunView> =
 
 type FactsPatch = { [K in keyof AdmissionFacts]?: AdmissionFacts[K] extends object ? Partial<AdmissionFacts[K]> : AdmissionFacts[K] };
 
-/** The project's applied `start` decisions, oldest first: `oldest`, then `searches` searches among `total − 1` newer ones. */
 const starts = (total: number, searches: number, oldest = false) => [oldest, ...Array.from({ length: total - 1 }, (_, index) => index < searches)];
 
-/** Every condition holds unless a patch breaks one. */
 function facts(patch: FactsPatch = {}, policy: TeamSearch = {}): AdmissionFacts {
   const base: AdmissionFacts = {
     id: "search-1", now: at(0), policy: searchPolicy({ mode: "live", ...policy }),
@@ -65,7 +54,6 @@ function facts(patch: FactsPatch = {}, policy: TeamSearch = {}): AdmissionFacts 
   return out as AdmissionFacts;
 }
 
-/** A search and every decision it returned, stepped one event at a time. */
 class Drive {
   all: Decision[] = [];
   last: Decision[] = [];
@@ -79,7 +67,6 @@ class Drive {
     return result.decisions;
   }
 
-  /** A contestant reports a result, and its capture completes. */
   deliver(minutes: number, memberId: string, captured: Partial<Extract<SearchEvent, { kind: "captured" }>> = {}): void {
     this.at(minutes, { kind: "result", memberId });
     this.at(minutes + 1, { kind: "captured", memberId, commit: `commit-${memberId}`, tree: `tree-${memberId}`, scope: "ok", empty: false, ...captured });
@@ -97,19 +84,16 @@ function admitted(patch: FactsPatch = {}, policy: TeamSearch = {}): Drive {
   return new Drive(admission.search, policy);
 }
 
-/** Admitted and armed: the base run failed at minute 5. */
 function armed(policy: TeamSearch = {}, over: Partial<RunView> = {}): Drive {
   const drive = admitted({}, policy);
   drive.at(5, { kind: "base", outcome: "fail", ms: 60_000 }, over);
   return drive;
 }
 
-/** A launch's receipt: the challengers the spend fuse admitted, by member and profile. */
 const receipt = (launch: number, ...members: [string, string][]): SearchEvent =>
   ({ kind: "started", launch, challengers: members.map(([memberId, profileId]) => ({ memberId, profileId })) });
 const launch = (n: number, ...profileIds: string[]): Decision => ({ kind: "start-challengers", launch: n, profileIds, baseCommit: BASE });
 
-/** Armed, then the champion's result failed its gate at minute 30 and two challengers (attempts 3) started. */
 function widened(policy: TeamSearch = {}): Drive {
   const drive = armed(policy);
   drive.deliver(10, CHAMPION);
@@ -262,7 +246,6 @@ test("every result failing, the wait, and the hold each end the search as exhaus
   assert.deepEqual(allFail.last, [stop("stall", "m-c2"), { kind: "stop-operations" }, release("exhausted", "all-failed"), counted("none")]);
   assert.equal(allFail.search.class, "none");
 
-  // The champion failed at 30, so the wait ends at 90. m-c2's result was captured before then and is still gated.
   const wait = widened();
   wait.deliver(80, "m-c2");
   wait.at(91, { kind: "tick" });
@@ -271,7 +254,6 @@ test("every result failing, the wait, and the hold each end the search as exhaus
   wait.at(100, { kind: "gated", memberId: "m-c2", outcome: "fail", ms: 1000 });
   assert.deepEqual(wait.last, [{ kind: "stop-operations" }, release("exhausted", "wait"), counted("none")]);
 
-  // The champion's result arrived at 10, so the hold ends at 10 + 3 × 35 + 60 = 175, before the wait (150 + 60).
   const hold = armed();
   hold.deliver(10, CHAMPION);
   hold.at(150, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 });
@@ -291,7 +273,6 @@ test("every result failing, the wait, and the hold each end the search as exhaus
 });
 
 test("at the wait, a result that still waits for its capture does not hold the search open, and is never gated (rule 7, acceptance 10)", () => {
-  // The champion failed at 30, so the wait ends at 90.
   const drive = widened();
   drive.at(85, { kind: "result", memberId: "m-c1" });
   assert.deepEqual(drive.last, [{ kind: "capture", memberId: "m-c1" }]);
@@ -313,7 +294,6 @@ test("at the wait, a result that still waits for its capture does not hold the s
 });
 
 test("a launch's receipt: members acknowledged after the end or the wait are stopped; repeated and unknown receipts change nothing (rules 4, 6, 8)", () => {
-  // The champion's result arrived at 10, so the hold ends at 175; it fails at 174, and the receipt arrives at 175.
   const crossing = armed();
   crossing.deliver(10, CHAMPION);
   crossing.at(174, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 });
@@ -326,7 +306,6 @@ test("a launch's receipt: members acknowledged after the end or the wait are sto
   crossing.at(176, receipt(1, ["m-c1", "p-gpt"], ["m-c2", "p-gemini"]));
   assert.deepEqual([crossing.last, crossing.search], [[], ended], "a repeated receipt stops nothing twice");
 
-  // The champion failed at 30, so the wait ends at 90; the receipt arrives at 95.
   const afterWait = armed();
   afterWait.deliver(10, CHAMPION);
   afterWait.at(30, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 });
@@ -351,7 +330,6 @@ test("a launch's receipt: members acknowledged after the end or the wait are sto
   open.at(8, { kind: "left", memberId: "m-ghost", reason: "stall" });
   assert.deepEqual([open.all, open.search], [[], before], "events of a launch or a member the search does not know change nothing");
 
-  // Under together the launch at arming is still out when the champion fails: no second launch; the receipt decides.
   const inFlight = armed({ start: "together" });
   inFlight.deliver(10, CHAMPION);
   inFlight.at(30, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 });
@@ -381,15 +359,12 @@ test("the allowance counts a gate run as 20 + gateMinutes, also when the check l
   const early = admitted();
   early.at(3, { kind: "result", memberId: CHAMPION }, { checkMinutes: 10 });
   assert.equal(early.search.holdUntil, at(3 + 4 * 35 + 60), "with the base run open");
-  // Widening checks the rest of the allowance against the deadline: 3 × 35 + 60 = 165 minutes from the leave.
   const tight = armed({}, { checkMinutes: 10, deadline: at(20 + 164) });
   tight.at(20, { kind: "left", memberId: CHAMPION, reason: "stall" }, { checkMinutes: 10, deadline: at(20 + 164) });
   assert.deepEqual([tight.search.state, tight.search.endReason], ["abandoned", "deadline"]);
 });
 
 test("a search that ends with a launch out cancels it, a restart cancels it again, and the launch's one receipt clears it (acceptance 16)", () => {
-  // The champion's result arrived at 10, so the hold ends at 175. It fails at 150, and the host restarts at 176 before
-  // preparing the launch: the resume handler never runs, as the hold ends the search first.
   const drive = armed();
   drive.deliver(10, CHAMPION);
   drive.at(150, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 });
@@ -413,7 +388,6 @@ test("a search that ends with a launch out cancels it, a restart cancels it agai
 });
 
 test("a receipt that arrives after the end counts the search as widened once, and pauses when that engages the brake (acceptance 17)", () => {
-  // The champion fails at 30, so the wait ends at 90; the search ends at 176 and the receipt arrives at 180.
   const drive = armed();
   drive.deliver(10, CHAMPION);
   drive.at(30, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 });
@@ -470,7 +444,6 @@ test("the reserve: no challenger below spareAttempts 3; eight attempts left and 
   none.at(30, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 }, { spareAttempts: 3 });
   assert.deepEqual(none.last, [{ kind: "stop-operations" }, release("exhausted", "no-challenger")]);
 
-  // spareAttempts = 8 left − 1 open task − 3 = 4, so one challenger keeps it at 3.
   const one = armed({ attempts: 4 });
   one.deliver(10, CHAMPION);
   one.at(30, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 }, { spareAttempts: 8 - 1 - 3 });
@@ -506,7 +479,6 @@ test("admission counts the first failed condition, in order 1 to 7 (acceptance 1
 });
 
 test("the share counts the newest 99 applied start decisions and the new search: a window of 100 never passes the share (condition 7)", () => {
-  // 24 searches among the newest 99, the oldest decision production: one more makes 25 of 100.
   assert.deepEqual(admit(facts({ project: { starts: starts(100, 24) } }, { share: 0.249 })), { admitted: false, condition: 7 });
   assert.equal(admit(facts({ project: { starts: starts(100, 24) } }, { share: 0.25 })).admitted, true, "25 of 100 is 0.25");
   assert.equal(admit(facts({ project: { starts: [...Array<boolean>(30).fill(true), ...Array<boolean>(99).fill(false)] } })).admitted, true,
@@ -581,7 +553,6 @@ test("measure: the base run and the gate run at the boundary, inside the window,
 });
 
 test("PROPOSED: each cutoff counts from the now of the event that sets it, and a cutoff already set never moves (rule 6)", () => {
-  // The clock jumps forward to 90 for the champion's result, then back to 32 for its failed gate run.
   const drive = armed();
   drive.at(90, { kind: "result", memberId: CHAMPION });
   assert.equal(drive.search.holdUntil, at(90 + 165));
@@ -596,7 +567,6 @@ test("PROPOSED: each cutoff counts from the now of the event that sets it, and a
   drive.at(92, { kind: "tick" });
   assert.deepEqual([drive.search.state, drive.search.endReason], ["exhausted", "wait"], "the wait ends at 92");
 
-  // The base run fails at 60; the clock runs back, and the champion leaves at 25: both cutoffs count from 25.
   const left = admitted();
   left.at(60, { kind: "base", outcome: "fail", ms: 60_000 });
   left.at(25, { kind: "left", memberId: CHAMPION, reason: "stall" });

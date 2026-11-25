@@ -13,7 +13,6 @@ import type { Manager } from "../packages/host/src/manager.js";
 import type { UsageRecord } from "../packages/host/src/usage.js";
 import { teamUsage } from "../packages/host/src/team-usage.js";
 
-// FIXTURE-START
 const NOW = new Date("2026-10-21T12:00:00.000Z");
 const usageRow = (completedAt: string, modelId: string, providerId: string, partId: string, extra: Partial<UsageRecord> = {}): UsageRecord => ({
   provider: "opencode", providerId, modelId, messageId: `msg-${partId}`, partId, modelSource: "reported", completedAt,
@@ -53,7 +52,6 @@ function fixtureLedger() {
     },
   };
 }
-// FIXTURE-END
 
 function subset(actual: unknown, expected: unknown, path = "$"): void {
   if (Array.isArray(expected)) {
@@ -70,7 +68,6 @@ function subset(actual: unknown, expected: unknown, path = "$"): void {
   assert.equal(actual, expected, path);
 }
 
-/** A service over a fixture ledger sealed the way the host wrote it. */
 function fixtureService(dir: string, key: Buffer): { usage: UsageService; store: EvidenceStore } {
   writeSealed(join(dir, "usage.sealed"), key, "usage", fixtureLedger());
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: key });
@@ -179,7 +176,6 @@ test("a page and its cursor commit together", async () => {
     const flaky = { register: (module: Parameters<EvidenceStore["register"]>[0]) => store.register(module), status: () => store.status(),
       read: <T>(fn: Parameters<EvidenceStore["read"]>[0]) => store.read(fn),
       write: <T>(fn: Parameters<EvidenceStore["write"]>[0]) => {
-        // The page's records and cursor are written inside the transaction, then the write fails before commit.
         if (armed && ++writes === 2) return store.write(tx => { fn(tx); throw new Error("disk full after the page"); });
         return store.write(fn);
       },
@@ -309,10 +305,7 @@ test("a new service resumes from the stored cursors", async () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-// Task 4: Claude Code, Codex, and coverage in every roll-up
-
 type JournalEvent = { type: string; data: unknown };
-/** A manager whose journals are arrays of events; the cursor is the position of the last event read. */
 function journalManager(journals: Record<string, JournalEvent[]>, reads: string[] = []): Manager {
   return { events: (id: string, after: number, limit: number, types?: Set<string>) => {
     reads.push(`${id}:${after}`);

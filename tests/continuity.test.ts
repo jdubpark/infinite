@@ -15,7 +15,6 @@ test(
       agents: {
         codex: {
           command: process.execPath,
-          // `--` keeps any hook flags the worker appends for Codex (off by default) out of node's own option parsing.
           args: [
             "-e",
             `
@@ -178,7 +177,6 @@ test(
         before.screen.split("You: followup-confidential-marker").length - 1,
         1,
       );
-      // A session holding an open dialog must keep its attention across the API restart.
       const dialog = await fetchApi("/sessions", "owner", {
         requestId: randomUUID(),
         provider: "demo",
@@ -209,7 +207,6 @@ test(
       assert.equal(opensBefore.length, 1);
       assert.equal(dialogBefore.attention.prompt.id, opensBefore[0].seq);
       await host.stopApi();
-      // No API process or connected client exists while these PTYs make progress.
       await new Promise((resolve) => setTimeout(resolve, 3200));
       await host.start();
       const dialogAfter = (await fetchApi(`/sessions/${dialog.body.id}`)).body;
@@ -308,7 +305,6 @@ test(
         !terminalView.screen.includes("row-000"),
         "compact screen omits old scrollback",
       );
-      // Screen parsing can finish before the worker's buffered journal flush.
       const terminalOutput = await waitFor(
         async () => {
           const events = (

@@ -21,7 +21,6 @@ function ev(kind: string, time: string, data: Record<string, unknown>, memberId?
   return { key: runEventKey(kind, RUN, [counter]), runId: RUN, revision: 1, at: time, kind, ...(memberId === undefined ? {} : { memberId }), data: { v: 1, ...data } };
 }
 
-/** The events of one judge-shaped run: created, one judge started, its report, and its stop. */
 const judgeEvents = (purpose: "duel" | "replay"): OutboxEvent[] => [
   ev("run.created", at(0), { projectId: "example", purpose, trialId: RUN }),
   ev("member.started", at(1), { role: "judge", purpose, sessionId: "session-judge", startedAt: at(1), baseCommit: "b".repeat(40), provider: "claude", profileId: "judge-profile", model: "m-1" }, MEMBER),

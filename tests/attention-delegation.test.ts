@@ -41,7 +41,6 @@ test("one-shot review fails closed without complete and bounded evidence", () =>
   assert.equal(oneShotPermissionOption({ ...dialog, hash: undefined }), undefined);
   assert.equal(oneShotPermissionOption({ ...dialog, pinned: false }), undefined);
   assert.equal(oneShotPermissionOption({ ...dialog, pinned: undefined }), undefined);
-  // A second `$ ` line, from the transcript above the title or written into the reason, hides which one is the command.
   const twoCommands = { ...dialog, detail: `$ npm test\n${dialog.detail}` };
   assert.equal(dialogCommand(twoCommands), undefined);
   assert.equal(oneShotPermissionOption(twoCommands), undefined);
@@ -82,8 +81,6 @@ test("hook evidence cannot delegate the Code Mode account setting", () => {
   assert.equal(oneShotPermissionOption({ ...hookPrompt, title: "Would you like to run this command?" }), 0);
 });
 
-// The Codex 0.163 command dialog as the host's terminal rendered it on a live run: the bottom of
-// the screen, under the transcript, with its key hint on the last row.
 const codexDialog = [
   "• Running npm run check",
   "",
@@ -106,7 +103,6 @@ const codexDialog = [
 ];
 const codexComposer = ["", "• Working (12s • esc to interrupt)", "", "› Ask Codex to do anything", "", "  ? for shortcuts"];
 
-/** The prompt the worker opens for a detected block, as `screenDecision` builds it. */
 function screenPromptOf(lines: string[]): Prompt | undefined {
   const detected = detectPrompt(lines, "codex");
   if (!detected) return undefined;
@@ -122,12 +118,10 @@ test("the live Codex dialog layout is pinned and keeps its command spacing", () 
 });
 
 test("dialog text printed in the transcript is never delegable", () => {
-  // Agent output scrolls above Codex's own input area, so a copied dialog is followed by it.
   const printed = screenPromptOf([...codexDialog, ...codexComposer])!;
   assert.equal(printed.title, "Would you like to run the following command?");
   assert.equal(printed.pinned, false);
   assert.equal(oneShotPermissionOption(printed), undefined);
-  // A printed dialog above a real yes/no prompt is still not the active dialog.
   const aboveYesNo = screenPromptOf([...codexDialog, "", "Overwrite the lockfile? [Y/n]"])!;
   assert.equal(aboveYesNo.pinned, false);
   assert.equal(oneShotPermissionOption(aboveYesNo), undefined);
@@ -156,7 +150,6 @@ test("a Codex reason phrased as a question does not displace the dialog title", 
   const prompt = screenPromptOf(questionReasonDialog)!;
   assert.equal(prompt.title, "Would you like to run the following command?");
   assert.equal(prompt.kind, "permission");
-  // The header starts at the title: the transcript line above it is not part of the dialog.
   assert.doesNotMatch(prompt.detail ?? "", /• Running/);
   assert.match(prompt.detail ?? "", /inspection route\?/);
   assert.equal(prompt.pinned, true);

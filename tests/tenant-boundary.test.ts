@@ -89,7 +89,6 @@ test(
     try {
       const a = await makeTenant("a");
       const b = await makeTenant("b");
-      // Workspace sync accepts whole checkouts, so a tenant-development runner refuses every sync route.
       const absent = "0".repeat(64);
       for (const [method, route] of [["POST", "begin"], ["POST", "has"], ["PUT", `blob/${absent}`], ["GET", `blob/${absent}`], ["POST", "commit"], ["POST", "apply"], ["POST", "export"]] as const)
         assert.equal((await a.request(`/projects/workspace/sync/${route}`, method === "GET" ? undefined : {}, a.token, method)).status, 403, `${method} ${route}`);
@@ -248,13 +247,11 @@ test("single-tenant initialization permits native agents without a tenant or VM 
         config.agents.grok &&
         config.agents.opencode,
     );
-    // Preserve early personal-mode configurations as the direct single-tenant mode.
     writeFileSync(
       file,
       JSON.stringify({ ...config, deployment: { mode: "personal" } }),
     );
     assert.equal(readConfig(file).config.deployment?.mode, "single-tenant");
-    // A launcher such as sudo or a runtime needs its configured arguments too.
     const executable = join(root, "version-fixture.cjs");
     writeFileSync(
       executable,

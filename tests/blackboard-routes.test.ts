@@ -13,10 +13,6 @@ import { writeSealed } from "../packages/host/src/vault.js";
 import { hostEntryIds, hostEntryRun } from "./fixtures/host-entry-run.js";
 import { startHost } from "./helpers.js";
 
-/**
- * A state directory with a key file, a settled run record that holds a reported member, a failed check whose
- * output carries an escape sequence, and one recorded launch. The store is closed before the host starts.
- */
 function sealedState() {
   const root = mkdtempSync(join(tmpdir(), "inf-blk-routes-"));
   const stateDir = join(root, "state");
@@ -92,7 +88,6 @@ test("an unavailable store answers 503", { timeout: 90000 }, async () => {
     const withdrawn = await host.fetchApi(`/teams/${state.runId}/entries/${randomUUID()}/withdraw`, "owner", { requestId: randomUUID() });
     assert.equal(withdrawn.status, 503);
     assert.equal(withdrawn.body.code, "evidence-unavailable");
-    // The usage ledger lives in the same store, so the usage routes answer 503 with it. A route outside the store serves.
     assert.equal((await host.fetchApi("/usage")).status, 503);
     assert.equal((await host.fetchApi("/teams")).status, 200, "the rest of the host still serves");
   } finally {
@@ -137,11 +132,9 @@ test("the owner withdraws an entry and members no longer see it", { timeout: 900
     assert.equal(head.body.head.state, "withdrawn", "the owner still reads the entry, withdrawn");
     assert.equal(head.body.body.output, "\u001b[31mred", "the sealed body stays for the owner");
 
-    // The owner's list still holds the entry, and the state says it is withdrawn.
     const listed = (await host.fetchApi(`${base}?kind=check`)).body.entries[0];
     assert.equal(listed.state, "withdrawn");
 
-    // The command reports the state it finds, in text and as JSON.
     const clientFile = join(root, "client.json");
     writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal" }), { mode: 0o600 });
     const viewerFile = join(root, "viewer.json");

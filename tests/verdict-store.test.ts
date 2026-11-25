@@ -20,7 +20,6 @@ const NOW = "2026-11-21T12:00:00.000Z";
 
 type Fixture = { root: string; store: EvidenceStore; outbox: EventOutbox; close: () => void };
 
-/** Registers the ledger the way the server does. */
 function fixture(): Fixture {
   const root = mkdtempSync(join(tmpdir(), "infinite-verdicts-"));
   const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(root, "state")), vaultKey: randomBytes(32) });
@@ -63,7 +62,6 @@ function data(overrides: Record<string, unknown> = {}): Record<string, unknown> 
   };
 }
 
-/** A stored event. The host stamps `v: 1` on the data of every run event it emits. */
 function event(key: string, eventData: Record<string, unknown>, at: string = NOW, runId = "run-1"): OutboxEvent {
   return { key, runId, revision: 3, at, kind: "verdict.recorded", data: { v: 1, ...eventData } };
 }
@@ -122,7 +120,6 @@ test("a verdict event projects one row", () => {
     f.outbox.flush([event("verdict-no-project", noProject)]);
     const badProject = data({ projectId: "Not An Id" });
     f.outbox.flush([event("verdict-bad-project", badProject)]);
-    // Data without the host's version, of a later version, or with a key the schema does not name writes nothing.
     const unversioned = data(), newer = data(), noted = data({ note: "free text" });
     f.outbox.flush([{ ...event("verdict-unversioned", unversioned), data: unversioned }]);
     f.outbox.flush([event("verdict-newer", { ...newer, v: 2 })]);

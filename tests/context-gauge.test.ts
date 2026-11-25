@@ -13,7 +13,6 @@ const claudeStep = (id: string, usageFields: Record<string, unknown>, model = "m
   type: "assistant", message: { id, model, usage: usageFields, content: [] },
 });
 
-/** A synthetic Codex session: two programs, one direct call with its item event, usage rows, an image, and an orphan output. */
 function codexSession(): unknown[] {
   return [
     call("call_p1", "exec"),
@@ -72,9 +71,7 @@ test("Codex direct item is not inside a program; the two documented limits are c
   };
   const direct = [call("d", "exec"), item("d", { type: "CommandExecution", aggregated_output: "hi" }), output("d", "hi")];
   assert.deepEqual(shell(direct), {});
-  // Limit: an item that arrives before its call row counts inside a program.
   assert.deepEqual(shell([item("d", { type: "CommandExecution", aggregated_output: "hi" }), ...direct]), { shell: { calls: 1, chars: 2, maxChars: 2 } });
-  // Limit: an item that arrives after its output row counts inside a program.
   assert.deepEqual(shell([...direct, item("d", { type: "CommandExecution", aggregated_output: "hi" })]), { shell: { calls: 1, chars: 2, maxChars: 2 } });
 });
 
@@ -145,7 +142,6 @@ test("Code Mode context gauge counts real model steps and only the program resul
   for (const line of rows) tail.pushLine(line);
   const gauge = tail.snapshot();
   assert.deepEqual({ modelSteps: gauge.modelSteps, peakInputTokens: gauge.peakInputTokens }, { modelSteps: 2, peakInputTokens: 17531 });
-  // 115 is the length of the REPL result row (fixture line 12); the program call is the only tool call with a result.
   assert.deepEqual(gauge.received, { program: { calls: 1, chars: 115, maxChars: 115 } });
 });
 
@@ -185,7 +181,6 @@ test("Codex bounds: forgotten call ids, one call in flight, and recent step ids"
   for (let index = 0; index < 3000; index += 1) distinct.push(usage(`r${index}`, 1));
   assert.equal(distinct.snapshot().modelSteps, 3000);
 
-  // PROPOSED: an id seen again within the last 1,024 ids is one step; after that it counts again.
   const recent = new ContextGaugeTail("codex");
   for (const id of ["a", "b", "a"]) recent.push(usage(id, 1));
   assert.equal(recent.snapshot().modelSteps, 2);
@@ -195,7 +190,6 @@ test("Codex bounds: forgotten call ids, one call in flight, and recent step ids"
   aged.push(usage("a", 1));
   assert.equal(aged.snapshot().modelSteps, 1026);
 
-  // The window holds exactly 1,024 ids, and seeing an id again makes it recent.
   const refreshed = new ContextGaugeTail("codex");
   refreshed.push(usage("a", 1));
   for (let index = 0; index < 1023; index += 1) refreshed.push(usage(`o${index}`, 1));
@@ -205,7 +199,6 @@ test("Codex bounds: forgotten call ids, one call in flight, and recent step ids"
   refreshed.push(usage("a", 1));
   assert.equal(refreshed.snapshot().modelSteps, 1025);
 
-  // PROPOSED: a call row that repeats an id in flight changes nothing, even when the map is full.
   const repeated = new ContextGaugeTail("codex");
   for (let index = 0; index < 8192; index += 1) repeated.push(call(`f${index}`, index === 0 ? "exec" : "view_image", "function_call"));
   repeated.push(call("f0", "view_image", "function_call"));
@@ -247,7 +240,6 @@ test("a synthetic Claude row is no model step, and its content is still read", (
 });
 
 test("the Claude fixture gives one step per distinct non-synthetic message id with usage", () => {
-  // Lines that are not JSON are skipped, as the relay does.
   const rows = readFileSync(fixture("claude-session.jsonl"), "utf8").split("\n").flatMap(line => {
     try { return [JSON.parse(line) as Record<string, unknown>]; } catch { return []; }
   });
@@ -275,7 +267,6 @@ test("an id of 256 characters links rows and one of 257 does not", () => {
     claude.push(claudeStep(id, { input_tokens: 700 }));
     assert.deepEqual({ steps: claude.snapshot().modelSteps, peak: claude.snapshot().peakInputTokens }, linked ? { steps: 1, peak: 700 } : { steps: 0, peak: 0 }, `length ${length}`);
 
-    // The call row links nothing without a usable id; its output is still measured, as an unmatched `other` output.
     const codex = new ContextGaugeTail("codex");
     codex.push(call(id, "exec"));
     codex.push(output(id, "abc"));
@@ -329,7 +320,6 @@ test("hostile rows change nothing and nothing throws", () => {
     assert.deepEqual(tail.snapshot(), before);
   }
 
-  // A 5 million character output is counted by its length.
   const big = new ContextGaugeTail("claude");
   big.push({ type: "assistant", message: { id: "m_big", usage: { input_tokens: 1 }, content: [{ type: "tool_use", id: "big", name: "Bash" }] } });
   big.push({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "big", content: "a".repeat(5_000_000) }] } });

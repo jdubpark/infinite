@@ -60,7 +60,6 @@ function git(cwd: string, args: string[], input?: string): string {
   return result.stdout.trim();
 }
 
-/** Writes commits to `ref` with `git fast-import`, the first one on top of `from` when given. Returns the ids, oldest first. */
 function importCommits(mirror: string, ref: string, commits: Commit[], from?: string): string[] {
   const out: string[] = [];
   commits.forEach((commit, index) => {
@@ -75,12 +74,10 @@ function importCommits(mirror: string, ref: string, commits: Commit[], from?: st
   });
   const result = spawnSync("git", ["fast-import", "--quiet"], { cwd: mirror, input: out.join(""), encoding: "utf8" });
   if (result.status !== 0) throw new Error(`fast-import failed: ${result.stderr}`);
-  // The ids of the commits written here: the last `commits.length` of the branch, oldest first.
   const branch = git(mirror, ["rev-list", "--reverse", "--first-parent", ref]).split("\n");
   return branch.slice(branch.length - commits.length);
 }
 
-/** A bare mirror with one branch of `commits`, oldest first. */
 function mirrorWith(dir: string, commits: Commit[]): { mirror: string; ids: string[] } {
   const mirror = join(dir, "mirror.git");
   mkdirSync(mirror);
@@ -88,7 +85,6 @@ function mirrorWith(dir: string, commits: Commit[]): { mirror: string; ids: stri
   return { mirror, ids: importCommits(mirror, "refs/heads/main", commits) };
 }
 
-/** One commit with a source file and, when `withTest`, a test file. */
 function change(index: number, withTest: boolean, message?: string): Commit {
   const files: Record<string, string> = { [`src/c${index}.ts`]: `export const c${index} = ${index};\n` };
   if (withTest) files[`tests/c${index}.test.ts`] = `test("c${index}", () => {});\n`;
@@ -115,7 +111,6 @@ function minerFor(
   });
 }
 
-/** Counts the Git reads a miner makes, by form. */
 function countingGit(inner: MineGit = mineGit(() => undefined)): { git: MineGit; calls: string[] } {
   const calls: string[] = [];
   const git: MineGit = {
@@ -129,10 +124,6 @@ function countingGit(inner: MineGit = mineGit(() => undefined)): { git: MineGit;
   return { git, calls };
 }
 
-/**
- * A prefix that appends each call's arguments to `calls.txt` in the directory, and exits with `code` for the first
- * rule whose pattern matches the arguments. Otherwise it runs the git command.
- */
 function scriptedPrefix(dir: string, name: string, rules: { pattern: string; code: number }[]): TeamCommand {
   const script = join(dir, `${name}.sh`);
   const cases = rules.map(rule => `  *${rule.pattern}*) exit ${rule.code};;`).join("\n");
@@ -148,7 +139,6 @@ function callLines(dir: string): number {
   }
 }
 
-/** The sealed cursor of the project's mining row, or undefined when no row exists. */
 function cursorOf(store: EvidenceStore): MiningCursor | undefined {
   return store.read(db => {
     const ref = db.index("project", PROJECT);
@@ -178,7 +168,6 @@ function minedCount(store: EvidenceStore): number {
   return store.read(db => db.get<{ n: number }>(MINED_COUNT_SQL, db.index("project", PROJECT))?.n ?? 0);
 }
 
-/** A store whose `tryWrite` reports a failed write on its `failAt`-th call, without running the write. */
 function failingWrite(store: EvidenceStore, failAt: number): EvidenceStore {
   let calls = 0;
   const wrapped = {
@@ -194,7 +183,6 @@ function failingWrite(store: EvidenceStore, failAt: number): EvidenceStore {
   return wrapped as unknown as EvidenceStore;
 }
 
-/** `count` mined rows without material, as earlier passes leave them. */
 function fillMined(store: EvidenceStore, count: number): void {
   store.write(tx => {
     const ref = tx.index("project", PROJECT);
@@ -216,7 +204,6 @@ function fillMined(store: EvidenceStore, count: number): void {
 test("a history is mined newest first, new commits oldest first, within its bounds", async () => {
   const r = rig();
   try {
-    // Commit 0 is a root and changes no test file, so it is skipped. Every third commit up to 56 changes only source.
     const commits = Array.from({ length: 60 }, (_, index) =>
       change(index, index !== 0 && !(index % 3 === 2 && index <= 56)));
     const { mirror, ids } = mirrorWith(r.dir, commits);
@@ -228,7 +215,6 @@ test("a history is mined newest first, new commits oldest first, within its boun
     await miner.idle();
     assert.equal(miner.status(PROJECT).visited, 50, "the first pass decides 50 commits");
     assert.equal(miner.status(PROJECT).backfillDone, false);
-    // One list of 50 commits: its first parents come from one form-4 read, not one read per commit.
     const firstPassParents = counted.calls.filter(call => call === "parents").length;
     assert.ok(firstPassParents <= 2, `at most one parents read per list chunk, saw ${firstPassParents}`);
     counted.calls.length = 0;
@@ -241,7 +227,6 @@ test("a history is mined newest first, new commits oldest first, within its boun
     assert.equal(minedOf(r.store, ids[59])?.state, "candidate", "the newest commit is mined first and is a candidate");
     assert.equal(minedOf(r.store, ids[0]), undefined, "the root commit leaves no row");
 
-    // Sixty new commits take two passes. Oldest first, the pass that runs out of budget leaves the rest to the next one.
     const added = importCommits(mirror, "refs/heads/main", Array.from({ length: 60 }, (_, index) => change(60 + index, true)), head.value);
     head.value = added[added.length - 1];
     miner.pump();
@@ -257,7 +242,6 @@ test("a history is mined newest first, new commits oldest first, within its boun
 test("the backfill stops at 2,000 first-parent commits, and later heads are still mined", async () => {
   const r = rig();
   try {
-    // Source-only commits: each costs two reads (the parent and the numstat) and leaves no row.
     const commits = Array.from({ length: MINING_BACKFILL_MAX + 100 }, (_, index) => change(index, false));
     const { mirror, ids } = mirrorWith(r.dir, commits);
     const head = { value: ids[ids.length - 1] };
@@ -267,7 +251,6 @@ test("the backfill stops at 2,000 first-parent commits, and later heads are stil
     const miner = minerFor(r, { mirror, head, git });
     miner.pump();
     await miner.idle();
-    // A new commit takes one decision of the next pass, so the bound falls inside a pass, not at its end.
     [head.value] = importCommits(mirror, "refs/heads/main", [change(MINING_BACKFILL_MAX + 100, true)], head.value);
     for (let pass = 1; pass < MINING_BACKFILL_MAX / MINING_BATCH + 1; pass++) {
       miner.pump();
@@ -281,7 +264,6 @@ test("the backfill stops at 2,000 first-parent commits, and later heads are stil
     assert.ok(read.has(ids[ids.length - MINING_BACKFILL_MAX]), "the 2,000th backfill commit is read");
     assert.ok(!read.has(ids[ids.length - MINING_BACKFILL_MAX - 1]), "the 2,001st is never read");
 
-    // A rewrite after the bound: its head is mined, and the forward walk goes on from it.
     const [rewritten] = importCommits(mirror, "refs/heads/rewrite", [change(MINING_BACKFILL_MAX + 101, true)], ids[ids.length - 2]);
     head.value = rewritten;
     miner.pump();
@@ -304,8 +286,6 @@ test("a commit is mined once across a restart", async () => {
     const commits = Array.from({ length: 10 }, (_, index) => change(index, true));
     const { mirror, ids } = mirrorWith(r.dir, commits);
     const head = { value: ids[ids.length - 1] };
-    // The walk starts at the newest commit. The first write commits its decision; the second write fails, as if the
-    // process died between two commits.
     const crashing = minerFor(r, { mirror, head, store: failingWrite(r.store, 2) });
     crashing.pump();
     await crashing.idle();
@@ -368,7 +348,6 @@ test("a refused read mines nothing and claims nothing", async t => {
     assert.equal(minedCount(r.store), 0);
     assert.equal(warnings().length, 1, "a project already failing logs nothing more");
 
-    // The same for the message read: a refusal of E2 on a fresh store.
     const other = rig();
     try {
       const { mirror: mirror2, ids: ids2 } = mirrorWith(other.dir, commits);
@@ -402,10 +381,8 @@ test("a rewrite answer that cannot be followed moves no cursor", async () => {
     await first.idle();
     assert.equal(cursorOf(r.store)?.forward, ids[2]);
 
-    // Rewrite the branch: a new head on top of commit 1, which is not a descendant of the old head.
     const [rewritten] = importCommits(mirror, "refs/heads/rewrite", [change(7, true)], ids[1]);
     head.value = rewritten;
-    // A launcher that refuses every read with exit 1: form 1's exit 1 reads as a rewrite answer, and the read after it fails.
     const refused = minerFor(r, {
       mirror,
       head,
@@ -437,21 +414,17 @@ test("a rewrite whose old commits were pruned restarts the walk", async () => {
     await miner.idle();
     assert.equal(minedCount(r.store), 2, "the root is skipped; two rows");
 
-    // Rewrite the branch on top of ids[1], so ids[2] is unreachable.
     const [rewritten] = importCommits(mirror, "refs/heads/rewrite", [change(9, true)], ids[1]);
     git(mirror, ["update-ref", "refs/heads/main", rewritten]);
     head.value = rewritten;
-    // While ids[2] is still in the mirror, a failed ancestry read is a failed read, not a rewrite.
     const unread = minerFor(r, { mirror, head, git: mineGit(() => scriptedPrefix(r.dir, "ancestry", [{ pattern: "merge-base", code: 128 }])) });
     unread.pump();
     await unread.idle();
     assert.equal(miningRow(r.store)?.state, "failing", "both commits read, so the failed answer stays a failure");
     assert.equal(cursorOf(r.store)?.forward, ids[2], "the walk does not move");
 
-    // Prune ids[2] from the mirror as a gc would. The retry falls due an hour later.
     git(mirror, ["reflog", "expire", "--expire=now", "--all"]);
     git(mirror, ["gc", "--prune=now", "--quiet"]);
-    // A launcher that refuses the presence read gives no answer about ids[2], so the retry fails again in place.
     const refused = minerFor(r, {
       mirror, head,
       git: mineGit(() => scriptedPrefix(r.dir, "refused", [{ pattern: `no-walk*${ids[2]}`, code: 1 }])),
@@ -527,7 +500,6 @@ test("mined rows stop at their own cap, and host bytes take the room", async () 
     const head = { value: ids[1] };
     const room = 3_276_800;
     const other = (bytes: number) => host.store.write(tx => {
-      // A captured row of another project: its bytes count toward the host total only.
       tx.run(
         "INSERT OR REPLACE INTO eval_tasks (task_id, origin, run_id, member_id, project_ref, state, material, base, "
         + "material_bytes, captured_at, checked_at, payload, group_id, paths_indexed) "
@@ -561,7 +533,6 @@ test("mining waits while a stored row's paths are not indexed", async () => {
   try {
     const { mirror, ids } = mirrorWith(r.dir, [change(0, false), change(1, true)]);
     const head = { value: ids[1] };
-    // A captured row as the version 2 migration leaves it, before the sweep indexes its paths.
     r.store.write(tx => {
       tx.run(
         "INSERT INTO eval_tasks (task_id, origin, run_id, member_id, project_ref, state, material, base, captured_at, checked_at, payload, group_id, paths_indexed) "
@@ -593,7 +564,6 @@ test("close ends a read in flight without a write", async () => {
     const { mirror, ids } = mirrorWith(r.dir, [change(0, false), change(1, true)]);
     const started = join(r.dir, "numstat.started");
     const script = join(r.dir, "slow.sh");
-    // The numstat read marks its start, then waits a second before Git runs.
     writeFileSync(script, `#!/bin/sh\ncase "$*" in *--numstat*) : > "${started}"; sleep 1;; esac\nshift\nexec git "$@"\n`);
     const miner = minerFor(r, { mirror, head: { value: ids[1] }, git: mineGit(() => ({ command: "/bin/sh", args: [script] })) });
     miner.pump();
@@ -667,12 +637,10 @@ test("the hot statements read through an index", () => {
   try {
     const ref = r.store.read(db => db.index("project", PROJECT));
     const commitRef = r.store.read(db => db.index("eval-commit", "c".repeat(40)));
-    // A planner may pick any index that leads with the same columns; each case names the one that serves it.
     const cases: { name: string; sql: string; params: (string | number)[]; index: string }[] = [
       { name: "MINING_ROW_SQL", sql: MINING_ROW_SQL, params: [ref], index: "sqlite_autoindex_eval_mining_1" },
       { name: "MINED_COUNT_SQL", sql: MINED_COUNT_SQL, params: [ref], index: "eval_tasks_summary" },
       { name: "PROJECT_BYTES_SQL", sql: PROJECT_BYTES_SQL, params: [ref], index: "eval_tasks_bytes" },
-      // The host total reads every project's bytes through the same covering index: a full index scan, once per pass.
       { name: "HOST_BYTES_SQL", sql: HOST_BYTES_SQL, params: [], index: "eval_tasks_bytes" },
       { name: "EXISTING_COMMIT_SQL", sql: EXISTING_COMMIT_SQL, params: [ref, commitRef], index: "eval_tasks_commit" },
       { name: "LANDING_JOIN_SQL", sql: LANDING_JOIN_SQL, params: [ref, commitRef], index: "eval_groups_landing" },
@@ -687,7 +655,6 @@ test("the hot statements read through an index", () => {
   }
 });
 
-// A capsule and features are needed by the direct insert check below; they keep the shape of a real candidate.
 test("insertMined writes a candidate once and refuses a full project", () => {
   const r = rig();
   try {
@@ -703,7 +670,6 @@ test("insertMined writes a candidate once and refuses a full project", () => {
     assert.equal(r.store.read(db => readEvalTask(db, id))?.state, "candidate");
     assert.equal(r.store.read(db => readMaterial(db, id)).capsule?.objective, "Ship");
 
-    // With the inserted row, 4,999 more fill the project's 5,000.
     fillMined(r.store, MINED_TASK_MAX - 1);
     const other = { ...input, commit: "f".repeat(40) };
     assert.equal(r.store.write(tx => insertMined(tx, other, NOW)), "full");

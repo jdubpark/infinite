@@ -14,7 +14,6 @@ import { FEATURE_VERSION } from "../packages/host/src/task-features.js";
 
 const settings: EvalProjectSettings = { testPaths: { prefixes: ["tests"], suffixes: [".test.ts"] } };
 const FAKE_HEX = "a".repeat(39);
-/** A well-formed id no test mirror holds. */
 const ABSENT = "0123456789abcdef0123456789abcdef01234567";
 
 function run(cwd: string, ...args: string[]) {
@@ -33,7 +32,6 @@ function commit(dir: string, files: Record<string, string | Buffer>, message: st
   return run(dir, "rev-parse", "HEAD");
 }
 
-/** Commits the given trees in a work repository, pushes them to a bare repository, and returns that mirror and the commit ids. */
 function mirrorWith(dir: string, commits: Record<string, string | Buffer>[]) {
   const work = join(dir, "work");
   mkdirSync(work);
@@ -47,7 +45,6 @@ function mirrorWith(dir: string, commits: Record<string, string | Buffer>[]) {
   return { mirror, ids };
 }
 
-/** A prefix that records its argv (one argument per line, starting with "git") and then runs the rest. */
 function recordingPrefix(dir: string): { prefix: TeamCommand; record: string } {
   const record = join(dir, "argv.txt");
   const script = join(dir, "prefix.sh");
@@ -73,7 +70,6 @@ test("the mining forms are exact and checked", async () => {
     const argv = () => readFileSync(record, "utf8").split("\n").filter(Boolean);
     const git = mineGit(() => prefix);
 
-    // Form E1 and E2.
     assert.deepEqual(numstatArgs(base, to), ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "--no-renames", "--ignore-submodules=none", "--diff-algorithm=myers", "-z", base, to, "--"]);
     assert.equal((await git.numstat(mirror, base, to)).state, "read");
     assert.deepEqual(argv(), ["git", ...teamGitArgs(mirror, numstatArgs(base, to))]);
@@ -82,7 +78,6 @@ test("the mining forms are exact and checked", async () => {
     assert.equal((await git.message(mirror, to)).state, "read");
     assert.deepEqual(argv(), ["git", ...teamGitArgs(mirror, messageArgs(to))]);
 
-    // Forms 1 to 4 of the outcome-ledger plan's "Git commands of the scan".
     assert.equal(await git.isAncestor(mirror, base, to), "yes");
     assert.deepEqual(argv(), ["git", ...teamGitArgs(mirror, ["merge-base", "--is-ancestor", base, to])]);
     assert.equal(await git.isAncestor(mirror, to, base), "no");
@@ -97,10 +92,8 @@ test("the mining forms are exact and checked", async () => {
     assert.equal(await git.present(mirror, to), "yes");
     assert.deepEqual(argv(), ["git", ...teamGitArgs(mirror, ["log", "--no-walk=unsorted", "--no-show-signature", "--format=%H %T %P", to])]);
     assert.equal(await git.present(mirror, ABSENT), "no", "Git ran and holds no such commit");
-    // An id of the mirror's other hash length is never read as a path: the read fails.
     assert.deepEqual(await git.message(mirror, "e".repeat(to.length === 40 ? 64 : 40)), { state: "failed" });
 
-    // A malformed id never reaches an argument.
     for (const bad of ["HEAD", "-x", FAKE_HEX]) {
       rmSync(record, { force: true });
       assert.throws(() => numstatArgs(bad, to), TypeError);
@@ -119,7 +112,6 @@ test("the mining forms are exact and checked", async () => {
     assert.equal(await git.parents(mirror, Array.from({ length: 51 }, () => to)), undefined);
     assert.equal(existsSync(record), false);
 
-    // A refused launcher is a failed read.
     assert.deepEqual(await mineGit(() => failingPrefix(dir)).numstat(mirror, base, to), { state: "failed" });
     assert.deepEqual(await mineGit(() => failingPrefix(dir)).message(mirror, to), { state: "failed" });
     assert.equal(await mineGit(() => failingPrefix(dir)).present(mirror, ABSENT), "failed", "a refusal is not an answer");
@@ -133,13 +125,11 @@ test("a change-count or message read whose output a leftover held is failed, not
   const leftFile = join(dir, "left.pids");
   try {
     const { mirror, ids } = mirrorWith(dir, [{ "src/a.ts": "one\n" }, { "src/a.ts": "two\n", "tests/a.test.ts": "two\n" }]);
-    // A launcher that leaves a sleep holding the output, then runs Git as the leader: each read settles a drain after Git exits.
     const script = join(dir, "leave.sh");
     writeFileSync(script, `#!/bin/sh\nsleep 30 &\necho $! >> "${leftFile}"\nshift\nexec git "$@"\n`);
     const git = mineGit(() => ({ command: "/bin/sh", args: [script] }));
     assert.deepEqual(await git.numstat(mirror, ids[0]!, ids[1]!), { state: "failed" });
     assert.deepEqual(await git.message(mirror, ids[1]!), { state: "failed" });
-    // Control: the same launcher without the sleep reads both, so the leftover alone fails the reads above.
     const plain = join(dir, "plain.sh");
     writeFileSync(plain, `#!/bin/sh\nshift\nexec git "$@"\n`);
     const control = mineGit(() => ({ command: "/bin/sh", args: [plain] }));
@@ -147,7 +137,7 @@ test("a change-count or message read whose output a leftover held is failed, not
     assert.equal((await control.message(mirror, ids[1]!)).state, "read");
   } finally {
     const left = existsSync(leftFile) ? readFileSync(leftFile, "utf8").split("\n").filter(Boolean).map(Number) : [];
-    for (const pid of left) if (Number.isSafeInteger(pid) && pid > 1) { try { process.kill(pid, "SIGKILL"); } catch { /* Already ended. */ } }
+    for (const pid of left) if (Number.isSafeInteger(pid) && pid > 1) { try { process.kill(pid, "SIGKILL"); } catch { } }
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -203,16 +193,13 @@ test("a truncated or binary read is never small", async () => {
     ]);
     const base = ids[0]!, binary = ids[1]!, big = ids[2]!;
 
-    // A real binary change beside a test file is never counted as a small change.
     const read = await mineGit(() => undefined).numstat(mirror, base, binary);
     assert.equal(read.state, "read");
     if (read.state !== "read") return;
     assert.deepEqual(mineVerdict(read, settings, undefined), { kind: "reject", reason: "binary-change" });
 
-    // Output past 64 KiB is cut by the launcher, and the read says so.
     assert.deepEqual(await mineGit(() => undefined).numstat(mirror, binary, big), { state: "too-large" });
 
-    // A launcher that prints a record without its NUL is a failed read, and no record is read from it.
     const script = join(dir, "no-nul.sh");
     writeFileSync(script, "#!/bin/sh\nprintf '1\\t2\\tsrc/a.ts'\n");
     assert.deepEqual(await mineGit(() => ({ command: "/bin/sh", args: [script] })).numstat(mirror, base, binary), { state: "failed" });
@@ -251,7 +238,6 @@ test("the message decides revert, origin, and secrets", () => {
   assert.equal(fromRun.capsule.objective, "Ship the parser");
   assert.deepEqual(minedCapsule("x", [], { objective: "y", brief: { uiChanges: true } as NonNullable<TeamRun["brief"]> }), { reject: "ui-changes" });
 
-  // Secret shapes are built at run time, so this file holds no credential-shaped literal.
   const ghp = "gh" + "p_" + "a".repeat(36);
   const grant = "v1." + "eyJ" + "a".repeat(20) + "." + "b".repeat(43);
   for (const text of [`Fix ${ghp}`, `Fix ${grant}`]) {

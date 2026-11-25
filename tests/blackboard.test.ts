@@ -116,7 +116,6 @@ test("no run text reaches a plain column or the file", () => {
     assert.equal(board.mirror(run), true);
 
     const markers = ["wire-settings-form", "entry-plain-marker", "check-output-marker", "src/path-marker.ts"];
-    // The WAL holds the written pages only while the store is open, so it is read before the close.
     const wal = readFileSync(`${f.path}-wal`);
     assert.ok(wal.length > 0, "the write is in the WAL");
     for (const marker of markers) assert.equal(wal.includes(marker), false, `WAL: ${marker}`);
@@ -266,7 +265,6 @@ test("a failed write waits a minute before it retries", () => {
 test("a failed write also holds back launch sizes", () => {
   const f = fixture(), g = fixture();
   try {
-    // A failed mirror write holds back the run's launch sizes for the same minute.
     const store = open(f, { busyTimeoutMs: 0 });
     let clock = 1_000_000;
     const board = new Blackboard(store, { now: () => clock });
@@ -281,7 +279,6 @@ test("a failed write also holds back launch sizes", () => {
       blocker.exec("ROLLBACK");
       blocker.close();
     }
-    // The lock is gone, so a write would succeed now. The run still waits out its minute.
     clock += 59_000;
     assert.equal(board.recordLaunch(run, implA, SIZES), false);
     assert.equal(rowCount(store, "member_scopes"), 0);
@@ -290,7 +287,6 @@ test("a failed write also holds back launch sizes", () => {
     assert.equal(rowCount(store, "member_scopes"), 1);
     store.close();
 
-    // A failed launch write starts the same minute for the run's mirror.
     const second = open(g, { busyTimeoutMs: 0 });
     let later = 1_000_000;
     const other = new Blackboard(second, { now: () => later });
@@ -337,7 +333,6 @@ test("the retry pass pauses after its own failed write", () => {
     assert.equal(board.retryable(), true);
     assert.equal(board.retry(run), "done");
     assert.equal(rowCount(store, "entries"), 8);
-    // A value that is not a run record cannot be helped by a retry.
     assert.equal(board.retry(null as never), "done");
     assert.equal(board.retryable(), true);
     store.close();
@@ -371,7 +366,6 @@ test("a failed save write holds back only its own run", () => {
     }
     assert.equal(board.held(run.id), true);
     assert.equal(board.held(other.id), false);
-    // A save that fails says nothing about the other runs, so the retry pass goes on.
     assert.equal(board.retryable(), true);
     assert.equal(board.retry(run), "more", "a held run is not written");
     assert.equal(rowCount(store, "entries"), 0);
@@ -502,7 +496,6 @@ test("mirror never throws", () => {
   }
 });
 
-/** Opens one sealed member scope with the store's key, through the store's own reader. */
 function openScope(store: EvidenceStore, memberId: string, sealed: string): unknown {
   return store.read(db => db.open("member_scopes", memberId, sealed));
 }

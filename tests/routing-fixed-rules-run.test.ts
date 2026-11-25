@@ -26,10 +26,8 @@ import { limitLineup, mixedLineup } from "./team-fixture.js";
 
 type Fixture = ReturnType<typeof schedulerFixture>;
 
-/** The period end the pin reads. Any value before the test's clock works: the pin only needs the end to exist. */
 const PERIOD_END = "2026-11-16T00:00:00.000Z";
 
-/** A limit-fallback lineup whose first hop is a contributor profile, so rule 1 must skip it. */
 const contributorHop: TeamLineup = {
   ...structuredClone(limitLineup),
   implementers: [{ ...structuredClone(limitLineup.implementers[0]!), limitFallback: "contrib-light" }, structuredClone(limitLineup.implementers[1]!)],
@@ -45,12 +43,10 @@ function openStore(f: Fixture): EvidenceStore {
   return new EvidenceStore({ databasePath: evidenceDatabasePath(f.config.stateDir), vaultKey: f.key });
 }
 
-/** The task's decision rows, one per revision and point. */
 function rowsOf(store: EvidenceStore, runId: string, taskId: string) {
   return store.read(db => taskDecisions(db, runId, taskId)).rows;
 }
 
-/** Every stored event of one run, read page by page. */
 function allEvents(store: EvidenceStore, runId: string): RunEvent[] {
   const events: RunEvent[] = [];
   let after = 0;
@@ -84,14 +80,12 @@ async function waitFor(check: () => boolean, message: string, timeoutMs = 5000) 
   assert.fail(message);
 }
 
-/** The run's routing: an `auto` pin with the autonomous policy, or none. Asserts the pin, so a silent failure cannot pass. */
 function pin(f: Fixture, saved: TeamRouting | undefined) {
   if (saved === undefined) return;
   f.run.routing = pinRouting(saved, "autonomous", f.run.lineup, PERIOD_END);
   assert.equal(f.run.routing?.mode, "auto", "the auto pin did not apply");
 }
 
-/** The team service with the routing recorder attached. The caller writes the team record first. */
 function openTeam(f: Fixture, store: EvidenceStore) {
   const outbox = new EventOutbox(store);
   registerRouting(store, outbox);
@@ -100,13 +94,11 @@ function openTeam(f: Fixture, store: EvidenceStore) {
   return teams;
 }
 
-/** A member copy of the run's first member, shaped as a running implementer on `profile`. */
 function implementer(f: Fixture, memberId: string, cwd: string, profile: TeamLineup["implementers"][number], provider: "claude" | "codex" | "opencode") {
   return { ...f.run.members[0]!, memberId, role: "implementer" as const, taskId: "a", cwd, provider, modelProfile: profile,
     status: "running" as const, prompt: "Write a.txt" };
 }
 
-/** Writes a.txt in a member clone, and makes task a the member's running task. */
 async function runningTask(f: Fixture, memberId: string) {
   const cwd = await prepareMemberWorkspace(f.run.workspace, memberId, f.run.baseCommit, f.config.teams?.commandPrefix);
   f.run.headCommit = f.run.baseCommit;
@@ -161,9 +153,7 @@ test("an auto run's limit switch skips a contributor fallback (control: no pin)"
   } finally { store.close(); f.close(); }
 });
 
-/** A pending task a with agentProfileId haiku and no member, so `step` prepares its first implementer. */
 function pendingTask(f: Fixture) {
-  // A project team with no setup: the launch reads `team.setup`, which the fixture project lacks.
   f.config.projects[0]!.team = { checks: [] };
   f.run.lineup = structuredClone(contributorHop);
   f.run.status = "implementing";
@@ -209,7 +199,6 @@ test("an auto run's launch on a limited provider skips a contributor fallback (c
   } finally { store.close(); f.close(); }
 });
 
-/** A running implementer on astra-xhigh whose report escalates to `profileId`. */
 function escalatingScene(f: Fixture, profileId: string) {
   f.run.lineup = { ...structuredClone(mixedLineup), escalations: [spark] };
   const memberId = randomUUID();
@@ -341,7 +330,6 @@ test("an auto member's configuration names the policy digest (control: no pin)",
 test("a register run's member configuration names the register prompt version", { timeout: 120000 }, async () => {
   const f = schedulerFixture(), store = openStore(f);
   try {
-    // A goal run whose pinned digest carries the register: its members' prompts, and so their configurations, have the register shape.
     const goal = { id: randomUUID(), objective: "Find ranked sources.", successCriteria: "A ranked shortlist", nonGoals: [], allowedPaths: ["."], evidence: [], steering: [] };
     const created = goalRecord(goal as unknown as ProductGoal, new Date().toISOString(), "created");
     if (typeof created === "string") throw new Error(`the fixture record is ${created}`);
@@ -372,22 +360,17 @@ test("a register run's member configuration names the register prompt version", 
   } finally { store.close(); f.close(); }
 });
 
-// Task 9: the team service at the escalation and scout points.
-
 const sonnet = { id: "sonnet-escalation", label: "Sonnet escalation", provider: "claude" as const, model: "claude-sonnet-5-5", effort: "high", tier: "strong" as const };
 const opus = { id: "opus-escalation", label: "Opus escalation", provider: "claude" as const, model: "claude-opus-5-5", effort: "xhigh", tier: "strong" as const };
 const ESCALATION_LINE = "Host routing could not choose an escalation profile for task a; it is assigned Sonnet escalation.";
 const SCOUT_LINE = "Host routing could not choose a profile for scout s1; it is assigned Astra implementer.";
 
-/** The mixed lineup with two escalation profiles: sonnet passes rules 1 and 2, and opus is the reviewer's model, so rule 2 refuses it. */
 function coveredLineup(): TeamLineup {
   return { ...structuredClone(mixedLineup), escalations: [structuredClone(sonnet), structuredClone(opus)] };
 }
 
-/** An auto pin that lists the two new points. */
 const covered = (): TeamRouting => ({ mode: "auto", points: ["start", "escalation", "scout"] });
 
-/** The team service with the store the server registers: configuration and outcomes, then routing, on one outbox. */
 function openServedTeam(f: Fixture, store: EvidenceStore) {
   const outbox = new EventOutbox(store);
   store.register(configurationModule());
@@ -400,10 +383,6 @@ function openServedTeam(f: Fixture, store: EvidenceStore) {
   return teams;
 }
 
-/**
- * A running astra-xhigh implementer that reports an escalate, with `agentProfileId` when given, beside the fixture's project
- * manager. The caller sets the lineup's pin and writes the team.
- */
 async function escalating(f: Fixture, agentProfileId?: string) {
   f.run.lineup = coveredLineup();
   const projectManager = f.run.members[0]!;
@@ -415,25 +394,18 @@ async function escalating(f: Fixture, agentProfileId?: string) {
   return { member, cwd, projectManager };
 }
 
-/**
- * The project manager's explore report, naming one scout, with the project manager exited so `step` consumes it. Needs no
- * tasks yet: an explore is refused once the run has any. The caller writes the team.
- */
 function exploring(f: Fixture, agentProfileId?: string) {
   const projectManager = f.run.members[0]!;
   projectManager.report = { kind: "explore", summary: "One scout", tasks: [{ id: "s1", title: "Survey", instructions: "Read the module",
     ...(agentProfileId === undefined ? {} : { agentProfileId }) }] } as typeof projectManager.report;
   f.run.tasks = [];
   f.run.headCommit = f.run.baseCommit;
-  // The launch reads the project's team setup, which the fixture project lacks (as `pendingTask` notes).
   f.config.projects[0]!.team = { checks: [] };
   f.state.status = "exited";
   return projectManager;
 }
 
-/** Steps the team until its scout is prepared, then returns the stored run. */
 async function scoutStarted(teams: TeamService, scheduler: Internal, id: string): Promise<TeamRun> {
-  // The first step consumes the explore report into an operation; the scouts are prepared by the next step.
   await scheduler.step(scheduler.record(id));
   await waitFor(() => scheduler.record(id).pending === undefined, "the explore operation completes", 60000);
   await teams.idle();
@@ -443,7 +415,6 @@ async function scoutStarted(teams: TeamService, scheduler: Internal, id: string)
   return scheduler.record(id).run;
 }
 
-/** The replacement implementer that an escalation started, or undefined. */
 const replacementOf = (run: TeamRun, memberId: string) => run.members.find(item => item.role === "implementer" && item.memberId !== memberId);
 
 test("a covered escalation without a profile starts the router's choice, decided before the scope check", { timeout: 120000 }, async () => {
@@ -470,8 +441,6 @@ test("a covered escalation without a profile starts the router's choice, decided
     assert.ok(run.events.some(event => event.text.includes("escalated to Sonnet escalation; ")), "the escalation line names Sonnet escalation");
   } finally { store.close(); f.close(); }
 
-  // Refused before any row: naming the member's own profile while the pool also lists it (sonnet is left for the router),
-  // naming a profile outside the pool, and an unnamed escalation of a task that already escalated once.
   for (const [label, named] of [["own", "astra-xhigh"], ["outside", "spark-escalation"], ["second", undefined]] as const) {
     const g = schedulerFixture(), gstore = openStore(g);
     try {
@@ -488,7 +457,6 @@ test("a covered escalation without a profile starts the router's choice, decided
     } finally { gstore.close(); g.close(); }
   }
 
-  // The scope check fails on a path outside the task's paths: the run blocks, the row stays pending, and nothing is escalated.
   const h = schedulerFixture(), hstore = openStore(h);
   try {
     const { member, cwd } = await escalating(h);
@@ -547,7 +515,6 @@ test("an implementer with another escalation candidate launches with hostProfile
     await scheduler.step(scheduler.record(f.run.id));
     await waitFor(() => scheduler.record(f.run.id).run.members.some(item => item.role === "implementer"), "the implementer is prepared", 60000);
     await teams.idle();
-    // A queued member launches on the next pass.
     await scheduler.step(scheduler.record(f.run.id));
     await teams.idle();
     const member = scheduler.record(f.run.id).run.members.find(item => item.role === "implementer")!;
@@ -630,7 +597,6 @@ test("with the store closed an escalation and a scout start on the fallback, and
 });
 
 test("version-1 and shadow pins keep step 2's escalation and scout paths", { timeout: 400000 }, async () => {
-  // Every pin made before this slice: its points name the new points, but its version routes start only.
   const v1 = schedulerFixture(), v1store = openStore(v1);
   try {
     const { member } = await escalating(v1, "sonnet-escalation");
@@ -673,7 +639,6 @@ test("version-1 and shadow pins keep step 2's escalation and scout paths", { tim
       error instanceof TeamError && error.status === 409 && error.code === "invalid-agent-profile" && error.message === PROFILE_MESSAGES.scoutPool);
   } finally { scoutsStore.close(); scouts.close(); }
 
-  // A shadow pin of version 2 names the points and records one row per point; the named profiles still run.
   const shadow = schedulerFixture(), shadowStore = openStore(shadow);
   try {
     const { member } = await escalating(shadow, "sonnet-escalation");

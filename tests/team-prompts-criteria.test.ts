@@ -6,9 +6,6 @@ import { teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
 import { ENTRY_PROFILE, smallRun } from "./fixtures/team-prompt-run.js";
 
-// The criteria rows of a goal cycle and the evaluator role in the member prompts. These tests lived at the end of
-// team-prompts.test.ts; they moved here unchanged when that file reached the size limit.
-
 const GOAL_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker", "evaluator"] as const;
 const GOAL_BASE = { id: "00000000-0000-4000-8000-000000000021", revision: 1, cycle: 2, successCriteria: "Fixture success criteria.", nonGoals: [], allowedPaths: ["."], evidence: [], previousWork: [],
   deadlineAt: "2026-12-01T00:00:00.000Z", maxMembers: 2 };
@@ -30,7 +27,6 @@ const GOAL_VARIANTS: { name: string; run: () => TeamRun }[] = [
   { name: "plain", run: () => goalRunFor({}) },
   { name: "record", run: () => goalRunFor({ record: GOAL_RECORD }, "autonomous") },
 ];
-/** Pinned from the base commit, before the rows existed: sha256 of each role's prompt and of its context file. */
 const BASE_DIGESTS: Record<string, string> = {
   "plain/permission-coordinator/prompt": "ec013bfcbe048e6847387109b92ba6bdebc8761f768171f1180f6b57549403d8",
   "plain/permission-coordinator/context": "fe5cbf60907dd895160083e5e2cd2c86fe494f10b1ceab7772b84274daab570d",

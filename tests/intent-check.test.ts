@@ -21,21 +21,15 @@ type Stored = { run: TeamRun; objectiveRecord?: unknown };
 
 const TERMINAL = ["ready-for-review", "merged", "blocked", "cancelled"];
 const OBJECTIVE = "Create independent files and verify their integrated contents.";
-// Built at run time, so the source holds no credential-shaped literal.
 const SECRET = "gh" + "p_" + "a".repeat(36);
 const EVALUATOR: TeamModelProfile = { id: "evaluator", label: "Evaluator", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" };
 const CHECKED_LINEUP: TeamLineup = { ...mixedLineup, evaluators: [EVALUATOR] };
 
-/**
- * A host with the fake agent and the configured project. `setting` writes `objective.intentCheck`; the lineup defaults to one
- * eligible evaluator. `blackboard` turns the blackboard tools on, with an entries service on the host's evidence store.
- */
 async function start(autonomy: "autonomous" | "supervised", setting?: "on" | "off", lineup: TeamLineup = CHECKED_LINEUP, blackboard = false) {
   const f = await fixture("intent", lineup, {}, { noServer: true });
   const project = f.host.config.projects.find(item => item.id === "rehearsal")!;
   project.autonomy = autonomy;
   if (setting) project.team = { ...project.team!, objective: { intentCheck: setting } };
-  // The blackboard pins `run.blackboard` at create, so the tools flag and the entries service are both set before it.
   const store = blackboard ? new EvidenceStore({ databasePath: evidenceDatabasePath(f.host.config.stateDir), vaultKey: readFileSync(f.host.config.keyFile) }) : undefined;
   const entries = store ? new Blackboard(store) : undefined;
   if (entries) f.host.config.teams!.blackboard = { tools: true };
@@ -59,7 +53,6 @@ const until = (teams: Teams, id: string, ready: (view: TeamView) => boolean, tim
 const answerWith = (teams: Teams, id: string, decisionId: string, revision: number, text: string) =>
   teams.answer(id, decisionId, { requestId: randomUUID(), revision, text });
 
-/** An outcome ask the owner must answer, and a scout that becomes an assumption until the scout slice lands. */
 const askReport = () => ({
   kind: "intent-check", summary: "One outcome needs the owner.", items: [
     { dimension: "outcome", why: "The success check depends on the owner's naming choice.", criticality: "outcome", disposition: "ask",
@@ -70,7 +63,6 @@ const askReport = () => ({
   ],
 });
 
-/** Stops the host, optionally rewrites the sealed run record on disk, and opens the host again from disk. */
 async function restartWith(f: Fixture, teams: Teams, runId: string, edit?: (stored: SealedRun) => void): Promise<Teams> {
   await teams.close();
   await teams.idle();
@@ -78,7 +70,6 @@ async function restartWith(f: Fixture, teams: Teams, runId: string, edit?: (stor
   return f.openTeamService({});
 }
 
-/** The sealed run record as the host writes it: `teams/<id>.sealed`, scope `team:<id>`, the config's key. */
 type SealedRun = { run: TeamRun; intentCheck?: Record<string, unknown> & { status: string; planMemberId: string }; objectiveRecord?: ObjectiveRecord };
 function editSealed(f: Fixture, runId: string, edit: (stored: SealedRun) => void) {
   const file = join(f.host.config.stateDir, "teams", `${runId}.sealed`);
@@ -88,7 +79,6 @@ function editSealed(f: Fixture, runId: string, edit: (stored: SealedRun) => void
   writeSealed(file, key, `team:${runId}`, stored);
 }
 
-/** The run's plan is accepted once: one checker, the decisions named, one plan accepted, and the first plan's tasks. */
 function assertPlanAcceptedOnce(f: Fixture, teams: Teams, runId: string, view: TeamView, decisions: number) {
   assert.equal(view.status, "ready-for-review", JSON.stringify(view.events.slice(-5)));
   assert.equal(checkers(view).length, 1, "one checker per revision");
@@ -108,7 +98,6 @@ test("the check follows the run's pin", { timeout: 1500000 }, async () => {
       return { view, record: recordOf(teams, created.id) };
     } finally { await f.close(); }
   };
-  // A supervised project without the key, and an autonomous one with the off switch: no checker, no intent entry.
   for (const [autonomy, setting] of [["supervised", undefined], ["autonomous", "off"]] as const) {
     const { view, record } = await run(autonomy, setting);
     assert.equal(view.status, "ready-for-review", JSON.stringify(view.events.slice(-5)));
@@ -116,13 +105,11 @@ test("the check follows the run's pin", { timeout: 1500000 }, async () => {
     assert.ok(texts(view).every(text => !text.includes(INTENT_EVENTS.held) && !text.includes("intent check")), `${autonomy} ${setting ?? "default"}`);
     assert.equal((record?.log ?? []).filter(entry => entry.op.startsWith("intent-check.")).length, 0);
   }
-  // A supervised project with the key on and a lineup with no evaluator: the check skips and the plan is accepted.
   const skipped = await run("supervised", "on", mixedLineup);
   assert.equal(skipped.view.status, "ready-for-review", JSON.stringify(skipped.view.events.slice(-5)));
   assert.equal(checkers(skipped.view).length, 0);
   assert.ok(texts(skipped.view).includes(INTENT_EVENTS.skipped["no-eligible-profile"]), JSON.stringify(texts(skipped.view).slice(-5)));
 
-  // A run created before the slice has no pin and never checks: its checker is dropped with the pin on disk, and the plan is accepted.
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -189,8 +176,6 @@ test("acceptance 3: an outcome ask waits for the owner and the corrected plan is
 });
 
 test("the check survives a restart in every state", { timeout: 2400000 }, async () => {
-  // queued: the record holds the state hold saved before step prepares a checker. The checker member the restart drops is the one a
-  // checking host would have held, so the record is rewritten to the queued state and the member removed (team-intent.ts holdNew).
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -210,7 +195,6 @@ test("the check survives a restart in every state", { timeout: 2400000 }, async 
       assert.equal(logOps(recordOf(restarted, created.id), INTENT_OPS.applied).length, 1);
     } finally { await f.close(); }
   }
-  // checking: the checker is held by a flag; the host restarts; the checker is released.
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -228,7 +212,6 @@ test("the check survives a restart in every state", { timeout: 2400000 }, async 
       assert.equal(logOps(recordOf(restarted, created.id), INTENT_OPS.applied).length, 1);
     } finally { await f.close(); }
   }
-  // waiting: the decision stays open across the restart and is answered afterwards.
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -245,7 +228,6 @@ test("the check survives a restart in every state", { timeout: 2400000 }, async 
       assert.equal(logOps(recordOf(restarted, created.id), INTENT_OPS.answered).length, 1);
     } finally { await f.close(); }
   }
-  // correcting: the owner answered, and the corrected project manager is held by the hold flag when the host stops.
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -266,9 +248,6 @@ test("the check survives a restart in every state", { timeout: 2400000 }, async 
       assert.equal(logOps(recordOf(restarted, created.id), INTENT_OPS.answered).length, 1);
     } finally { await f.close(); }
   }
-  // accepting: the checker's empty report is applied and the state is accepting. The host writes that state in complete() and
-  // consumes the held plan on the next tick; the stop cannot be held there, so the record is rewritten to that state with the
-  // same applyIntentReport call, the checker's report stored, and the held plan kept.
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -297,7 +276,6 @@ test("the check survives a restart in every state", { timeout: 2400000 }, async 
   }
 });
 test("steering, resume, and cancel meet the pending plan", { timeout: 1500000 }, async () => {
-  // A steer while the checker runs: the new revision is checked once, and the old report is ignored.
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -314,7 +292,6 @@ test("steering, resume, and cancel meet the pending plan", { timeout: 1500000 },
       assert.equal(logOps(recordOf(teams, created.id), INTENT_OPS.applied).length, 1, "the old report was applied");
     } finally { await f.close(); }
   }
-  // A steer while waiting: the question stops waiting, and the old decision answers 404.
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -323,13 +300,11 @@ test("steering, resume, and cancel meet the pending plan", { timeout: 1500000 },
       const waiting = await until(teams, created.id, view => view.status === "needs-input");
       const old = waiting.decisions.find(item => item.answeredBy === undefined)!;
       await teams.steer(created.id, { requestId: randomUUID(), revision: waiting.revision, text: "Keep the names short." });
-      // The release runs in the next tick, after the steer's revision exists.
       const steered = await until(teams, created.id, view => texts(view).includes(INTENT_EVENTS.released.replanned));
       await assert.rejects(() => Promise.resolve(answerWith(teams, created.id, old.id, steered.revision, "alpha")), (error: { code?: string }) => error.code === "decision-not-found");
       await teams.cancel(created.id, { requestId: randomUUID(), revision: steered.revision });
     } finally { await f.close(); }
   }
-  // A cancel while waiting: the questions are released with the cancelled cause.
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -342,7 +317,6 @@ test("steering, resume, and cancel meet the pending plan", { timeout: 1500000 },
       assert.ok(cancelled.members.every(member => member.status !== "running"), "a member is still running after cancel");
     } finally { await f.close(); }
   }
-  // A pause and a resume while waiting: a new revision, the waits released, and one check in the new revision.
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -351,7 +325,6 @@ test("steering, resume, and cancel meet the pending plan", { timeout: 1500000 },
       const waiting = await until(teams, created.id, view => view.status === "needs-input");
       await teams.pause(created.id, { requestId: randomUUID(), revision: waiting.revision });
       await until(teams, created.id, view => view.status === "paused");
-      // Resume waits while the paused members stop (`members-stopping`), so it is retried until they have.
       await waitFor(async () => {
         try { await teams.resume(created.id, { requestId: randomUUID(), revision: teams.get(created.id).revision }); return true; }
         catch (error) { if ((error as { code?: string }).code === "members-stopping") return false; throw error; }
@@ -362,7 +335,6 @@ test("steering, resume, and cancel meet the pending plan", { timeout: 1500000 },
       await teams.cancel(created.id, { requestId: randomUUID(), revision: resumed.revision });
     } finally { await f.close(); }
   }
-  // The owner's halt while waiting, an answer during the halt, then the release: the answer resolves in the same revision.
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -385,7 +357,6 @@ test("steering, resume, and cancel meet the pending plan", { timeout: 1500000 },
 });
 
 test("a failed checker is replaced once and then skipped", { timeout: 1500000 }, async () => {
-  // No report: the checker exits twice, so the held plan is accepted unchecked.
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -398,7 +369,6 @@ test("a failed checker is replaced once and then skipped", { timeout: 1500000 },
       assert.equal(logOps(recordOf(teams, created.id), INTENT_OPS.skipped).length, 1);
     } finally { await f.close(); }
   }
-  // A plan report from each checker is not a check: no second project manager starts.
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -410,7 +380,6 @@ test("a failed checker is replaced once and then skipped", { timeout: 1500000 },
       assert.equal(view.members.filter(member => member.role === "project-manager").length, 1, "a plan report started a project manager");
     } finally { await f.close(); }
   }
-  // A stall: each held checker's session reports its last activity past the stall window, so the stall path stops it.
   {
     const quiet = new Set<string>();
     const f = await fixture("intent", CHECKED_LINEUP, {}, { noServer: true });
@@ -492,13 +461,11 @@ test("a cancel cut releases a waiting objective intent once on retry", async () 
 });
 
 test("cancel and steer on a full log complete", { timeout: 1500000 }, async () => {
-  // Fills the sealed record's log on disk to its share, so every intent write after the restart fails.
   const fillLog = (stored: SealedRun) => {
     const record = stored.objectiveRecord!;
     const template = record.log.find(entry => entry.op === INTENT_OPS.applied) ?? record.log[0];
     while (record.log.length < 380) record.log.push({ ...template, seq: record.log.length + 1 });
   };
-  // A cancel while the run waits on a full log: the release fails once, and the cancel still ends the run.
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -511,7 +478,6 @@ test("cancel and steer on a full log complete", { timeout: 1500000 }, async () =
       assert.equal(texts(cancelled).filter(text => text === INTENT_EVENTS.releaseUnrecorded).length, 1, JSON.stringify(texts(cancelled).slice(-5)));
     } finally { await f.close(); }
   }
-  // A steer on a full log: the new revision starts, its check is skipped with log-full, and its plan is accepted.
   {
     const { f, teams } = await start("autonomous");
     try {
@@ -530,8 +496,6 @@ test("cancel and steer on a full log complete", { timeout: 1500000 }, async () =
   }
 });
 test("the checker is read-only and owns nothing", { timeout: 1500000 }, async () => {
-  // A secret-shaped item is dropped, and the checker's context and prompt carry no run data. The blackboard tools are on, so
-  // the checks on entries and entry tools would see a leak.
   {
     const { f, teams, store, entries } = await start("autonomous", undefined, CHECKED_LINEUP, true);
     try {
@@ -563,7 +527,6 @@ test("the checker is read-only and owns nothing", { timeout: 1500000 }, async ()
       assert.equal(logOps(recordOf(teams, created.id), INTENT_OPS.applied).length, 1);
     } finally { store?.close(); await f.close(); }
   }
-  // An edit by the read-only checker counts as a failure, twice, so the plan is accepted unchecked.
   {
     const { f, teams } = await start("autonomous");
     try {

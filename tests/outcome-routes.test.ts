@@ -20,15 +20,12 @@ const lineup = {
 };
 
 const DAY_MS = 86_400_000;
-/** One hour before the test file loaded: a line recorded then is inside every retention. */
 const RECORDED = new Date(Date.now() - 3_600_000).toISOString();
 
-/** One legacy line in the operator's format. The ids and names are examples. */
 function legacyLine(id: string, extra: Record<string, unknown> = {}) {
   return { id, projectId: "alpha", profile: { provider: "opencode", model: "model-a" }, result: "accepted", attempts: 1, recordedAt: RECORDED, ...extra };
 }
 
-/** Client CLI against a started host, as the client command tests run it. The token is the given role's. */
 function clientCli(host: { origin: string; tokens: Record<string, string> }, root: string, role: "owner" | "viewer" = "owner") {
   const clientFile = join(root, `client-${role}.json`);
   writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens[role], projectId: "rehearsal" }), { mode: 0o600 });
@@ -87,8 +84,6 @@ test("the owner advances a profile epoch", { timeout: 60000 }, async () => {
 
 test("a profile id names one identity across the lineup, and a shared identity is accepted", { timeout: 60000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "inf-outcome-ambiguous-"));
-  // "shared" names two identities in two slots. The lineup schema refuses that, so a valid config never reaches the
-  // route's profile-ambiguous answer. "twin" names one identity in two slots, which is valid.
   const ambiguous = {
     coordinator: { ...coordinator, id: "shared" },
     implementers: [{ id: "shared", label: "Shared", provider: "codex", model: "gpt-6-luna", effort: "high", tier: "light" }],
@@ -189,7 +184,6 @@ test("rows outlive a cancelled run", { timeout: 120000 }, async () => {
     assert.equal(cancelled.status, 200, JSON.stringify(cancelled.body));
     const stopped = await waitFor(() => f.get(runId), run => run.status === "cancelled", 60000);
     assert.equal(stopped.status, "cancelled", JSON.stringify(stopped));
-    // The run is cancelled before its implementer session has settled, so removal waits for that.
     const removed = await waitFor(() => f.host.fetchApi(`/teams/${runId}`, "owner", undefined, undefined, "DELETE"), response => response.status === 200, 60000);
     assert.equal(removed.status, 200, JSON.stringify(removed.body));
 
@@ -200,7 +194,6 @@ test("rows outlive a cancelled run", { timeout: 120000 }, async () => {
     assert.equal(implementer.disposition, "owner-stop");
     assert.notEqual(implementer.runDeletedAt, null);
     assert.notEqual(view.body.summary.runDeletedAt, null);
-    // The cancel settled the run before the halt stopped the member, and the summary still counts the stop.
     assert.equal(view.body.summary.status, "cancelled");
     assert.equal(view.body.summary.payload.attempts["owner-stop"], 1, JSON.stringify(view.body.summary.payload.attempts));
     assert.equal(view.body.summary.payload.attempts.open, undefined);
@@ -241,9 +234,6 @@ test("a host with no events for a run rebuilds its rows at the next start", { ti
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
     const run = await f.settled(created.body.id);
     assert.equal(run.status, "ready-for-review", JSON.stringify(run));
-    // A host whose runs predate the ledger, or that lost its evidence database, holds a run's record and no
-    // `run.created` for it. The record's last waiting events are sent again at the start, so the summary can be
-    // made by an event first; the backfill then completes it.
     await f.host.stopApi();
     const database = evidenceDatabasePath(f.host.config.stateDir);
     for (const suffix of ["", "-wal", "-shm"]) rmSync(`${database}${suffix}`, { force: true });
@@ -254,7 +244,6 @@ test("a host with no events for a run rebuilds its rows at the next start", { ti
     assert.ok(view.body.summary.flags.includes("backfilled"), JSON.stringify(view.body.summary));
     assert.equal(view.body.summary.payload.projectId, run.projectId);
     assert.equal(view.body.summary.status, "ready-for-review");
-    // Only an event sets the settle time, so an event made this summary first and the backfill completed it.
     assert.notEqual(view.body.summary.settledAt, null, JSON.stringify(view.body.summary));
     assert.notEqual(view.body.summary.createdAt, null);
     assert.equal(view.body.summary.flags.includes("gap"), false, "the record supplied the facts the flag stood for");
@@ -284,7 +273,6 @@ test("display cells over a full run", { timeout: 120000 }, async () => {
     assert.equal(cells.body.unreadable, 0);
     assert.equal(cells.body.cells.reduce((sum: number, cell: { attempts: number }) => sum + cell.attempts, 0), implementerRows);
     for (const cell of cells.body.cells) {
-      // This fixture's members have no effort, and a missing effort adds no key entry.
       assert.deepEqual(Object.keys(cell.key).sort(), ["epoch", "model", "profile", "provider"]);
       assert.deepEqual(cell.sources, ["production"]);
     }
@@ -339,8 +327,6 @@ test("an advanced epoch retires a profile's scorecard row", { timeout: 180000 },
     const before = await waitFor(() => f.host.fetchApi("/usage/models"), response => response.status === 200 && response.body.rows.length === 2, 30000);
     assert.deepEqual(profiles(before.body), ["deepseek-high", lineup.implementers[0]!.id].sort());
 
-    // The owner says the backend behind this profile changed. No attempt has started under the new epoch, so the
-    // old history must not stand as the profile's row.
     const advanced = await f.host.fetchApi("/outcomes/epochs", "owner", { profileId: "deepseek-high", requestId: randomUUID() });
     assert.equal(advanced.status, 200, JSON.stringify(advanced.body));
     assert.equal(advanced.body.epoch, 2);
@@ -348,8 +334,6 @@ test("an advanced epoch retires a profile's scorecard row", { timeout: 180000 },
     assert.equal(after.status, 200, JSON.stringify(after.body));
     assert.deepEqual(profiles(after.body), [lineup.implementers[0]!.id]);
 
-    // A run that starts after the advance is stamped with the new epoch, and the profile's row starts again from
-    // those attempts only. This holds only if the projector's stamp and the route's lookup use the same identity.
     const second = await f.host.fetchApi("/teams", "owner", f.create());
     assert.ok([200, 201].includes(second.status), JSON.stringify(second.body));
     const again = await f.settled(second.body.id);
@@ -405,7 +389,6 @@ test("owner signals are owner-only and idempotent", { timeout: 180000 }, async (
     const neitherFix = await f.host.fetchApi("/outcomes/signals", "owner", { action: "record", kind: "linked-fix", requestId: randomUUID(), runId: run.id });
     assert.equal(neitherFix.status, 400);
 
-    // The time is stored in one form, and a time later than the request is refused.
     const pastZ = new Date(Date.now() - 3600_000).toISOString();
     const past = await f.host.fetchApi("/outcomes/signals", "owner", { action: "record", kind: "linked-fix", requestId: randomUUID(), runId: run.id, issue: "ABC-7", at: pastZ.replace("Z", "+00:00") });
     assert.equal(past.status, 200, JSON.stringify(past.body));
@@ -420,7 +403,6 @@ test("owner signals are owner-only and idempotent", { timeout: 180000 }, async (
     assert.equal(withdrawn.body.signal.state, "withdrawn");
     assert.equal("request" in withdrawn.body.signal.payload, false);
 
-    // A withdrawal is idempotent by state: a second one repeats, and a request id is refused.
     const again = await f.host.fetchApi("/outcomes/signals", "owner", { action: "withdraw", kind: "exclusion", signalId: first.body.signal.signalId });
     assert.equal(again.status, 200, JSON.stringify(again.body));
     assert.equal(again.body.repeated, true);
@@ -504,7 +486,6 @@ test("roll-up queries are checked", { timeout: 60000 }, async () => {
     assert.equal(mission.status, 404, JSON.stringify(mission.body));
     assert.equal(mission.body.code, "rollup-not-found");
 
-    // A mission whose record the host holds, with no run in the ledger, is a real state: zero runs, nothing known.
     const held = randomUUID();
     mkdirSync(join(host.config.stateDir, "missions"), { recursive: true });
     writeFileSync(join(host.config.stateDir, "missions", `${held}.sealed`), "", { mode: 0o600 });
@@ -517,13 +498,11 @@ test("roll-up queries are checked", { timeout: 60000 }, async () => {
     assert.equal(empty.body.runs.counts, null);
     assert.deepEqual(empty.body.implementer, []);
     assert.equal(empty.body.cost.tokens, null);
-    // A UUID is case-insensitive: an upper-case query names the same mission.
     const upper = await host.fetchApi(`/outcomes/rollup?mission=${held.toUpperCase()}`, "viewer");
     assert.equal(upper.status, 200, JSON.stringify(upper.body));
     assert.equal(upper.body.known, true);
     assert.deepEqual(upper.body.target, { kind: "mission", id: held });
 
-    // The command prints the same roll-up, and says so when the host holds nothing under the id.
     const viewer = clientCli(host, root, "viewer");
     const printed = (await viewer("usage", "outcomes", "--mission", held)).stdout;
     assert.match(printed, new RegExp(`^Mission ${held}$`, "m"), printed);
@@ -573,7 +552,6 @@ test("the legacy route answers per line", { timeout: 90000 }, async () => {
     const viewer = await host.fetchApi("/outcomes/legacy", "viewer", { dryRun: false, lines: [legacyLine("op-2026-10-01-e")] });
     assert.equal(viewer.status, 403);
 
-    // A body that does not parse gets one fixed answer. A key or a value of the operator's file is never sent back.
     const invalid = { code: "legacy-invalid", error: "The legacy batch is invalid." };
     const tooMany = Array.from({ length: 51 }, (_, index) => legacyLine(`op-2026-10-02-${index}`));
     for (const body of [
@@ -588,7 +566,6 @@ test("the legacy route answers per line", { timeout: 90000 }, async () => {
     }
     assert.equal(await legacyRows(), 4, "a refused batch stores nothing");
 
-    // The host's own retention decides what is expired: 31 days is past this host's 30, and inside the default.
     const old = await host.fetchApi("/outcomes/legacy", "owner", { dryRun: false, lines: [legacyLine("op-2026-10-04-a", { recordedAt: new Date(Date.now() - 31 * DAY_MS).toISOString() })] });
     assert.deepEqual(old.body.outcomes, ["expired"], JSON.stringify(old.body));
     assert.equal(await legacyRows(), 4, "an expired line stores nothing");
@@ -631,7 +608,6 @@ test("the legacy import is owner-only and idempotent", { timeout: 180000 }, asyn
       return true;
     });
 
-    // A changed body under a known id is refused: the command names the line, imports the rest, and exits non-zero.
     const edited = join(root, "edited.jsonl");
     writeFileSync(edited, [legacyLine("op-2026-10-01-a", { attempts: 2 }), legacyLine("op-2026-10-01-d")].map(line => JSON.stringify(line)).join("\n") + "\n");
     await assert.rejects(owner("usage", "outcomes", "import-legacy", "--file", edited), (error: { code?: number; stdout?: string }) => {
@@ -642,7 +618,6 @@ test("the legacy import is owner-only and idempotent", { timeout: 180000 }, asyn
     });
     assert.equal(await legacyRows(), 4);
 
-    // A file of 51 lines goes out as two batches. A dry run says that it checked each batch on its own.
     const many = join(root, "many.jsonl");
     writeFileSync(many, Array.from({ length: 51 }, (_, index) => JSON.stringify(legacyLine(`op-2026-10-05-${index}`))).join("\n") + "\n");
     const manyDry = (await owner("usage", "outcomes", "import-legacy", "--file", many, "--dry-run")).stdout;
@@ -689,10 +664,6 @@ test("the CLI checks the file before it sends", { timeout: 120000 }, async () =>
   }
 });
 
-/**
- * Switches the fixture's project to a GitHub source served by a local bare remote, behind the restricted mirror
- * launcher. The restricted launcher does not set the checks' identity variable, so a test creates its runs first.
- */
 async function followGithub(f: Awaited<ReturnType<typeof fixture>>) {
   const remote = join(f.host.root, "scan-remote.git");
   git(f.source, "clone", "--bare", f.source, remote);
@@ -745,7 +716,6 @@ test("an approved run lands on the next refresh", { timeout: 180000 }, async () 
     assert.equal(run.status, "ready-for-review", JSON.stringify(run));
     remote = await followGithub(f);
 
-    // The reviewed head descends from the remote's main, so this push is a fast-forward and its tree is the reviewed tree.
     const reviewed = await f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner");
     assert.equal(reviewed.status, 200, JSON.stringify(reviewed.body));
     const reviewedHead = reviewed.body.summary.payload.reviewedHead as string;

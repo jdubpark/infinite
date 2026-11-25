@@ -35,14 +35,12 @@ function goalFixture(): ProductGoal {
   } as unknown as ProductGoal;
 }
 
-/** Version 1 of a goal's record: c0 only, one log entry. */
 function v1(): ObjectiveRecord {
   const record = goalRecord(goalFixture(), AT, "created");
   if (typeof record === "string") throw new Error(`the fixture record is ${record}`);
   return record;
 }
 
-/** Version 1 with `assumptions` in place of none. The digest is recomputed, and the schema must accept the fixture. */
 function recordWith(assumptions: Assumption[], log?: LogEntry[]): ObjectiveRecord {
   const base = v1();
   const body = { ...base, assumptions, ...(log ? { log } : {}) };
@@ -74,7 +72,6 @@ function proposal(memberId: string, entryId: string, assumptionField: MemberProp
 
 const digestOf = (value: unknown): string => createHash("sha256").update(canonicalJson(JSON.parse(JSON.stringify(value)))).digest("hex");
 
-/** Entries of the proposal kind that `record` holds after `from` entries. */
 function registerEntriesAfter(record: ObjectiveRecord, from: number): LogEntry[] {
   return record.log.slice(from).filter(entry => entry.op === REGISTER_OPS.proposed);
 }
@@ -172,7 +169,6 @@ test("bad proposals are dropped and counted, never echoed", () => {
   const shape = applyProposals(base, [proposal("scout-1", "entry-shape", propose("Bad shape", { kind: "unknown-kind" }))], CONTEXT);
   assert.equal(shape.dropped.test, 1);
 
-  // Every secret shape in every place: statement, summary, and test. Each drops as secret and is never echoed.
   const shapes = [privateKey, token, proxy];
   const places = ["statement", "summary", "test"] as const;
   for (const shape of shapes) {
@@ -203,7 +199,6 @@ test("bad proposals are dropped and counted, never echoed", () => {
   const thirtyThird = applyProposals(full, [proposal("scout-1", "entry-full", propose("Thirty third"))], CONTEXT);
   assert.equal(thirtyThird.dropped.assumptions, 1);
 
-  // Capped bytes: add filler assumptions while one more would stay within the schema's own cap, then propose one that overflows.
   const filler = (index: number) => assumption(`a${index}`, { statement: "x".repeat(500), refutedBy: "y".repeat(500) });
   const fillers: Assumption[] = [];
   const sized = (list: Assumption[]) => cappedBytes({ ...base, assumptions: list } as ObjectiveRecord);
@@ -212,7 +207,6 @@ test("bad proposals are dropped and counted, never echoed", () => {
   const overflow = applyProposals(heavy, [proposal("scout-1", "entry-bytes", propose("z".repeat(500)))], CONTEXT);
   assert.equal(overflow.dropped.bytes, 1);
 
-  // Stances count against the same share: top the record up to within one stance of it, then attach one with a full summary.
   const small = (index: number) => assumption(`a${index}`, { statement: "x".repeat(100), refutedBy: "y" });
   const topped = [...fillers];
   while (sized([...topped, small(topped.length + 1)]) <= PROPOSAL_LIMITS.cappedBytes) topped.push(small(topped.length + 1));
@@ -220,7 +214,6 @@ test("bad proposals are dropped and counted, never echoed", () => {
   assert.equal(stanceOver.dropped.bytes, 1, "a stance past the capped-bytes share drops as bytes");
   assert.equal(stanceOver.record, undefined);
 
-  // Members hold at most 16 of the 32 assumptions, so one intent check's 16 items still fit.
   const memberHeld = recordWith(Array.from({ length: 16 }, (_, index) => assumption(`a${index + 1}`, { origin: "member" })));
   const seventeenth = applyProposals(memberHeld, [proposal("scout-1", "entry-share", propose("Seventeenth member assumption"))], CONTEXT);
   assert.equal(seventeenth.dropped.assumptions, 1, "a seventeenth member assumption drops as assumptions");
@@ -300,7 +293,6 @@ test("a page's stances chunk into entries of at most 16 that rebuild", () => {
 
 test("a stance on an assumption added in the same page drops as target", () => {
   const record = recordWith([]);
-  // The first proposal of an empty record receives the id a1, which the second proposal then names.
   const page = [
     proposal("scout-1", "entry-new", propose("Plan statement added here")),
     proposal("scout-1", "entry-stance", { id: "a1", stance: "supports" }),

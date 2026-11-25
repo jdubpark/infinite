@@ -457,8 +457,6 @@ test("a value of the wrong type at a ceiling path is one malformed error, never 
 });
 
 test("the worst malformed request inside the schema's list limits is refused in full, without throwing, within stated bounds", () => {
-  // Every field of 4 phases of 6 steps fails, with 16 paths of three issues each and 8 refs.
-  // Measured with zod 4.6.7 on a 617,732-byte request: 1,692 errors and 217,297 bytes of refusal text.
   const badStep = (index: number) => ({
     id: `BAD-${index}`, title: "t".repeat(101), instructions: "i".repeat(4001), agentProfileId: "BAD", output: "nothing", effort: "huge",
     forEach: { step: "BAD", maxItems: 17, extra: true }, lead: { maxAttempts: 13, extra: true }, verify: false, extra: true,

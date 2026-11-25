@@ -203,7 +203,6 @@ test("an owner outcome ends a provisional stop and only that", () => {
 const project = (team: Record<string, unknown> | undefined) => ({ team }) as unknown as Pick<Project, "team">;
 const onProject = project({ checks: [], objective: { prompts: "on", register: "on", evaluator: "on" } });
 
-/** Sets each criterion's `latest` to a verdict id (or none for undefined), and reseals the record. */
 function latestIs(holder: GoalHolder, verdictOf: (id: string) => string | undefined) {
   const { digest: _digest, ...body } = holder.objectiveRecord as ObjectiveRecord;
   const criteria = body.criteria.map(item => {

@@ -22,7 +22,6 @@ import { collectPermissionEvidence } from "../packages/host/src/team-permission-
 import { reportErrorMessage, submitTeamReport } from "../packages/host/src/team-report-client.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON } from "../packages/host/src/team-workspace.js";
 
-// The shared fallback lineup used by delivery and permission tests; the limit tests below define their own.
 import { git, limitLineup as fallbackLineup, mixedLineup, fixture } from "./team-fixture.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
@@ -284,7 +283,6 @@ test("a GitHub mission continuation fetches a new ancestor mirror head without m
     git(f.source, "clone", "--bare", f.source, mirror);
     const parentId = randomUUID(), branch = "infinite/team-parent-test";
     const parentWorkspace = join(f.host.config.teams!.workspaceDir, parentId, "integration");
-    // The host rejects a group-writable team root, so the fixture must not depend on the caller's umask.
     mkdirSync(join(f.host.config.teams!.workspaceDir, parentId), { recursive: true, mode: 0o700 });
     git(f.source, "clone", "--no-local", "--no-hardlinks", "--", mirror, parentWorkspace);
     git(parentWorkspace, "remote", "remove", "origin");
@@ -331,7 +329,6 @@ test("team runs use readable names and exact root permissions under a strict uma
   const previousUmask = process.umask(0o077);
   let f: Awaited<ReturnType<typeof fixture>> | undefined;
   try {
-    // The API subprocess inherits this umask, including after enrollment restarts it.
     f = await fixture("success", undefined, { teams: { workspaceDir,
       commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", root] },
     } });
@@ -975,7 +972,6 @@ test("a team builds concurrently in isolated copies and produces checked, review
     assert.ok(workers.every(worker => worker.cwd !== f.source && worker.finishedAt));
     assert.ok(Math.max(...workers.map(worker => worker.startedAt)) < Math.min(...workers.map(worker => worker.finishedAt)), "The implementers must actually overlap");
     assert.equal((await viewer.request<{ teams: TeamView[] }>("/teams")).teams.filter(run => run.id === id).length, 1);
-    // A standalone run's record starts at its first accepted plan and holds the objective as its text.
     const record = await f.host.fetchApi(`/teams/${id}/record`, "viewer");
     assert.equal(record.status, 200, JSON.stringify(record.body));
     assert.equal(record.body.owner.kind, "run");
@@ -1032,7 +1028,6 @@ test("a full run stores its events in order", { timeout: 120000 }, async () => {
       assert.equal(reported.length, 1, `one member.reported for ${member.role}`);
       assert.ok(started[0]!.seq < reported[0]!.seq, `${member.role} starts before it reports`);
     }
-    // Each stage's events precede the next stage's.
     const stages = [["run.created"], ["run.prepared"], ["plan.accepted"], ["task.planned"], ["task.integrated"], ["check.finished"], ["review.recorded"], ["run.settled"]];
     const seqs = stages.map(([kind]) => kinds(kind!).map(event => event.seq));
     for (let i = 1; i < seqs.length; i++)
@@ -1083,7 +1078,6 @@ test("review rubrics drop self-grading, integration records docs/tests, and owne
     assert.equal(taskB.rubric?.reviewerProfileId, reviewerProfile.id);
     assert.equal(taskA.diffStat?.docs, true);
     assert.equal(taskA.diffStat?.tests, true);
-    // The fixture's implementers write a.txt and b.txt; task a also writes docs/x.md and tests/y.test.ts.
     assert.deepEqual(finished.changes?.files.map(file => `${file.path}:${file.status}`).sort(), ["a.txt:added", "b.txt:added", "docs/x.md:added", "tests/y.test.ts:added"]);
     assert.equal(finished.changes?.headCommit, finished.headCommit);
     assert.equal(finished.changes?.truncated, false);
@@ -1136,7 +1130,6 @@ test("a full run projects its outcomes", { timeout: 120000 }, async () => {
     assert.equal(run.status, "ready-for-review", JSON.stringify(run));
     const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner"), response => response.status === 200 && response.body.rows.length === 2, 30000);
     assert.equal(view.body.summary.status, "ready-for-review", JSON.stringify(view.body));
-    // Blind indexes are store internals and are never served.
     for (const served of [view.body.summary, ...view.body.rows, ...view.body.members])
       for (const name of ["projectRef", "taskRef", "areaRef"]) assert.equal(Object.hasOwn(served, name), false, name);
     assert.equal(view.body.rows[0].payload.projectId, run.projectId);
@@ -1279,7 +1272,6 @@ test("mixed teams pin real worker launches across configuration changes, restart
       const session = await f.host.fetchApi(`/sessions/${member.sessionId}`);
       assert.equal(session.status, 200);
       assert.equal(session.body.provider, expected.provider);
-      // A trusted root covers each member's own clone: the exact folder, never a parent.
       assert.equal(session.body.workspaceTrusted, true);
       assert.equal(worker.trustedWorkspace, worker.cwd);
       const override = args.indexOf(`projects={${JSON.stringify(worker.cwd)}={trust_level="trusted"}}`);
@@ -1724,7 +1716,7 @@ test("a check past teams.checkMinutes blocks a resumable run without spending a 
     assert.equal(resumed.status, 200, JSON.stringify(resumed.body));
     assert.equal(resumed.body.revision, blocked.revision + 1);
   } finally {
-    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { /* Already exited. */ } }
+    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { } }
     await f.close();
   }
 });
@@ -1750,8 +1742,6 @@ test("pausing a running check waits for its abort and resumes once without a lat
     const duplicatePause = await f.host.fetchApi(`/teams/${id}/pause`, "owner", pause);
     assert.equal(duplicatePause.body.status, "paused");
     assert.equal(duplicatePause.body.revision, checking.revision);
-    // Allow the new revision's check to finish. The aborted process cannot turn
-    // this marker into a late success receipt for the paused revision.
     writeFileSync(join(f.receipts, "check-release"), "continue", { mode: 0o600 });
     const resume = { requestId: randomUUID(), revision: checking.revision };
     const resumed = await f.host.fetchApi(`/teams/${id}/resume`, "owner", resume);
@@ -1767,7 +1757,7 @@ test("pausing a running check waits for its abort and resumes once without a lat
     assert.ok(finished.checks.some(check => check.revision === 1 && check.status === "interrupted"));
     assert.ok(finished.checks.filter(check => check.revision === 2).every(check => check.status === "passed"));
   } finally {
-    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { /* Already exited. */ } }
+    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { } }
     await f.close();
   }
 });
@@ -1801,7 +1791,7 @@ test("steering cannot disguise a check interrupted by API restart as a new plann
     assert.equal(unchanged.members.length, checking.members.length);
     assert.equal(unchanged.review, undefined);
   } finally {
-    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { /* Already exited. */ } }
+    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { } }
     await f.close();
   }
 });
@@ -1835,8 +1825,6 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
     const running = await waitFor(() => f.get(created.body.id), run => run.members.some(member => member.status === "running") && existsSync(join(f.receipts, "mcp-capability.json")), 30000);
     const member = running.members[0];
-    // A human lease keeps the scheduler from stopping the reported worker while
-    // its receipt is retried. This uses the real worker's report ledger.
     await claimControl(f.host, member.sessionId, "owner");
     const capability = JSON.parse(readFileSync(join(f.receipts, "mcp-capability.json"), "utf8"));
     forwardTarget = capability.url;
@@ -1861,7 +1849,6 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
         const item = pending.get(value.id);
         if (item) { pending.delete(value.id); clearTimeout(item.timer); item.resolve(value); }
       });
-      // Drain diagnostics without exposing private runtime capabilities on failure.
       child.stderr.resume();
       child.on("exit", () => {
         for (const item of pending.values()) { clearTimeout(item.timer); item.reject(new Error("MCP helper exited before replying")); }
@@ -2222,7 +2209,6 @@ test("retargeting a member prompt keeps its answers, swaps reporting and profile
   assert.doesNotMatch(refreshed, /Pipe a JSON object matching the above schema to this command:/);
   assert.equal(retargetPrompt(oldHelper, { provider: "codex", profile: astra, role: "implementer", entryTools: false }), teamPrompt(run, "implementer", undefined, undefined, "codex", astra));
   assert.match(retargetPrompt(oldHelper, { provider: "codex", profile: astra, role: "implementer", entryTools: false })!, /Codex sandbox guidance:/);
-  // A Codex prompt written by an earlier release names its helper, at another release's path.
   const older = oldHelper.replace(/to this command: [^\n]+?\. The helper/, "to this command: 'node' 'dist/team-report.js'. The helper");
   assert.notEqual(older, oldHelper);
   assert.equal(refreshReportingInstructions(`${older}\n\nUser answered: Compact`, "codex", "implementer"), `${refreshed}\n\nUser answered: Compact`);
@@ -2300,13 +2286,11 @@ test("an unanswered report stays unconfirmed: a refused connection or a lost ack
     assert.match(message, /inspect this member's recorded report before retrying the identical report, and do not bypass/);
     return true;
   };
-  // Nothing listens: the request never left this process.
   const closed = createServer();
   await new Promise<void>(resolve => closed.listen(0, "127.0.0.1", resolve));
   const closedPort = (closed.address() as { port: number }).port;
   await new Promise<void>((resolve, reject) => closed.close(error => error ? reject(error) : resolve()));
   await assert.rejects(submitTeamReport({ kind: "result", summary: "The fixture could not reach its closed endpoint." }, env(closedPort)), unconfirmed);
-  // The endpoint read the whole report, then dropped the connection before answering.
   let received = 0;
   const lost = createServer((request, response) => { request.resume(); request.on("end", () => { received++; response.destroy(); }); });
   await new Promise<void>(resolve => lost.listen(0, "127.0.0.1", resolve));
@@ -2324,7 +2308,6 @@ test(`a report written during a stall stop wins over replacement${limited ? " an
     const report = { kind: "question", question: "Which scope should this assignment use?", options: ["Keep the current scope"] };
     f.manager.stopTeamSession = async () => {
       if (f.state.status !== "exited") {
-        // The pre-stop journal is empty. The report arrives only while the stop RPC is in flight.
         if (limited) f.journal.append("signal", { kind: "provider-limit", limit: "usage", confidence: "corroborated", provider: "demo", source: "protocol", message: "Usage exhausted" });
         for (let index = 0; index < 205; index++) f.journal.append("signal", { kind: "notice", type: "fixture" });
         const envelope = { requestId: randomUUID(), runId: f.run.id, memberId: member.memberId, revision: member.revision, report };
@@ -2390,7 +2373,6 @@ test(`a ${refusal} pre-delivery refusal with ${protection} ${earlierStop ? "reta
       stops++;
       if (earlierStop && stops === 1) throw new Error("Worker response timed out; delivery may be uncertain");
       if (refusal === "lease") throw Object.assign(new Error("Input control is held"), { code: "control-busy" });
-      // Exercise Manager's own state check after the scheduler observed a running member.
       return Manager.prototype.stopTeamSession.call({
         meta: () => ({ session: { team: member } }),
         state: async () => ({ ...await f.manager.state(), status: "unavailable" }),
@@ -2439,7 +2421,6 @@ test("promptOwner says who a member's prompt waits on: the coordinator, the owne
       targetCwd: member.cwd, promptId: 1, promptHash: prompt.hash!, evidenceHash: "c".repeat(64), option: 0, prompt,
       authorityHash: permissionAuthorityHash(f.run.permissions, []),
       expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), answerRequestId: randomUUID(), status: "reviewing" as const };
-    // "answering" is not observable through a reloaded service: restart recovery marks it uncertain, which is the owner's.
     for (const [status, owner] of [["pending", "coordinator"], ["reviewing", "coordinator"], ["approved", "coordinator"], ["answering", "user"],
       ["escalated", "user"], ["uncertain", "user"], ["answered", "user"], ["stale", "user"]] as const) {
       f.run.permissionDecisions = [{ ...decision, status }];
@@ -2497,11 +2478,9 @@ test("an owner answer retires outstanding permission decisions so no verdict giv
     f.writeTeam();
     const teams = f.openTeam();
     const stored = (teams as unknown as { record(id: string): { run: TeamRun } }).record(f.run.id);
-    // An answer in flight exists only in memory: restart recovery would already have marked a stored one uncertain.
     const inFlight = { ...base, id: randomUUID(), status: "answering" as const };
     stored.run.permissionDecisions!.push(inFlight);
 
-    // A mission coordinator's answer is not owner direction; it retires nothing.
     await teams.answer(f.run.id, coordinatorQuestion.id, { requestId: randomUUID(), revision: 1, text: "a" }, undefined, "coordinator");
     assert.deepEqual(teams.get(f.run.id).permissionDecisions?.map(decision => decision.status), ["pending", "reviewing", "approved", "answered", "answering"]);
     assert.deepEqual(fences, []);
@@ -2564,7 +2543,6 @@ test("an owner answer during the delivery recheck stops a reused approval before
     const stored = scheduler.record(f.run.id);
     (f.manager as any).meta = () => ({ session: { cwd: target.cwd, team: { runId: f.run.id, memberId: target.memberId,
       revision: target.revision, role: target.role } } });
-    // The first state read qualifies the prompt; the second is the delivery recheck, where the owner's answer lands.
     let stateReads = 0;
     const baseState = f.manager.state;
     (f.manager as any).state = async (...args: unknown[]) => {
@@ -2709,7 +2687,6 @@ test("permission reuse rejects changed evidence, task, role, and revision mismat
         expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: randomUUID(), answerRequestId: randomUUID(),
         status: "answered" as const, verdict: "approve-once" as const };
       f.run.permissionDecisions = [prior];
-      // An owner answer after the recorded verdict is new direction the verdict never saw.
       if (mismatch === "owner answer") f.run.decisions.push({ id: randomUUID(), memberId: target.memberId, revision: 1, question: "Run the check again?",
         options: ["yes", "no"], createdAt: new Date().toISOString(), answer: "No. Do not run that command again.", answeredBy: "owner", answeredAt: new Date().toISOString() });
       if (mismatch === "changed source contents") writeFileSync(join(target.cwd, "check.js"), "process.exitCode = 1;\n");
@@ -2861,7 +2838,6 @@ test("sequential permission prompts reuse one reviewer and resume its observed n
     f.state.attention.prompt = prompt(2, "npm run build");
     const launchesBefore = f.launches.length;
     const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): { run: TeamRun } };
-    // A task integrated meanwhile: the reviewer has no file tools, so it keeps its member and conversation.
     scheduler.record(f.run.id).run.headCommit = "f".repeat(40);
     await scheduler.step(scheduler.record(f.run.id));
     await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.length === 2 && f.launches.length > launchesBefore);
@@ -3017,7 +2993,6 @@ for (const [ending, minutes, event] of [
         startedAt: new Date(Date.now() - minutes * 60000).toISOString() };
       f.run.members.push(coordinator);
       f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of the accepted checks.", maxDecisions: 2 };
-      // The decision's target member is gone, so the review is obsolete even inside its window.
       f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "a".repeat(64), authorityHash: permissionAuthorityHash(f.run.permissions, []), targetMemberId: randomUUID(), targetSessionId: randomUUID(),
         targetCwd: coordinator.cwd, promptId: 1, promptHash: "b".repeat(64), evidenceHash: "c".repeat(64), option: 0,
         prompt: { id: 1, kind: "permission", source: "screen", hash: "b".repeat(64), pinned: true, acceptsText: false,
@@ -3025,14 +3000,11 @@ for (const [ending, minutes, event] of [
           options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No, and tell Codex what to do differently (esc)", role: "reject-with-feedback" }] },
         expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: coordinator.memberId, answerRequestId: randomUUID(), status: "reviewing" }];
       if (minutes > 0) {
-        // Keep the target request current so this case exercises review expiry rather than
-        // the earlier obsolete-request reconciliation.
         const decision = f.run.permissionDecisions[0];
         decision.targetMemberId = manager.memberId; decision.targetSessionId = manager.sessionId;
         decision.evidenceHash = permissionEvidenceHash(decision.prompt);
         f.state.attention.state = "needs-you"; f.state.attention.prompt = decision.prompt;
       }
-      // Its process keeps running after the host asks it to stop.
       f.manager.stopTeamSession = async () => f.manager.state();
       f.writeTeam();
       const teams = f.openTeam();
@@ -3065,7 +3037,6 @@ test("a permission coordinator back from an outage during a current review runs 
     f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "a".repeat(64), authorityHash: permissionAuthorityHash(f.run.permissions, []), targetMemberId: target.memberId, targetSessionId: target.sessionId,
       targetCwd: target.cwd, promptId: prompt.id, promptHash: prompt.hash, evidenceHash: permissionEvidenceHash(prompt), prompt, option: 0,
       expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: coordinator.memberId, answerRequestId: randomUUID(), status: "reviewing" }];
-    // The target still waits on the same prompt; the coordinator's own session is running again and has reported nothing yet.
     const targetState = f.manager.state, targetEvents = f.manager.events;
     f.manager.state = async (sessionId?: string) => sessionId === coordinator.sessionId ? structuredClone(idle) : targetState();
     f.manager.events = (sessionId: string, after: number, limit: number, types?: Set<string>) =>
@@ -3159,9 +3130,7 @@ test("a persisted mission team replays a legacy create identity when capacity ce
     teams.close();
     const file = join(f.host.config.stateDir, "teams", `${created.id}.sealed`), key = readFileSync(f.host.config.keyFile);
     const persisted = unseal<any>(key, `team:${created.id}`, readFileSync(file, "utf8"));
-    // This is the fingerprint a pre-upgrade createForMission wrote: derived capacity was not part of identity.
     persisted.fingerprint = createHash("sha256").update(JSON.stringify({ request: parsed, missionId, lineup: pinnedLineup })).digest("hex");
-    // A legacy pending solo child may have started from an owner-selected value and no stored ceiling.
     persisted.run.parallelism = 4;
     delete persisted.run.parallelismCeiling;
     writeSealed(file, key, `team:${created.id}`, persisted);
@@ -3192,7 +3161,6 @@ test("an old member that still shows activity is not stalled after a restart", {
     for (const member of stored.run.members) member.startedAt = startedAt;
     writeSealed(file, key, `team:${id}`, stored);
     await f.host.start();
-    // The host observes attention activity before deciding a member is stalled, so the observation is the proof.
     const observed = await waitFor(() => f.get(id), run => run.members.some(member => member.lastActivityAt), 30000);
     assert.notEqual(observed.status, "blocked", JSON.stringify(observed));
     assert.ok(observed.members.some(member => member.status === "running"), JSON.stringify(observed.members));
@@ -3399,7 +3367,6 @@ test("an unreadable record directory keeps the run's evidence", { skip: process.
 });
 
 test("a steered run keeps its integrated attempts in the scorecard", { timeout: 180000 }, async () => {
-  // The usage scenario assigns each task a configured implementer profile, which the scorecard needs.
   const lineup = structuredClone(mixedLineup);
   lineup.implementers = [lineup.implementers[0]!, { id: "deepseek-high", label: "DeepSeek implementer", provider: "opencode", model: "deepseek/deepseek-flash", variant: "high", tier: "light", dataUse: "contributor" }];
   const f = await fixture("usage", lineup);

@@ -1,4 +1,3 @@
-// Provider-boundary fixture. Real Codex commissioning is a separate manual check.
 import { createServer } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import { writeFileSync, appendFileSync, existsSync, readFileSync } from "node:fs";
@@ -24,8 +23,6 @@ if (args[0] === "exec-server") {
           appendFileSync("agent-edit.txt", contents + "\n");
           client.send(JSON.stringify({ id: request.id, result: { contents, cwd: process.cwd() } }));
         } else if (request.method === "fixture/uncertain-edit") {
-          // An observable effect without a reply exercises the real broker's
-          // uncertain-operation guard. The fixture never supplies its decision.
           appendFileSync("uncertain-effect.txt", "performed\n");
         } else client.send(JSON.stringify({ id: request.id, result: { cwd: pathToFileURL(process.cwd()).href } }));
       });
@@ -76,8 +73,6 @@ if (args[0] === "exec-server") {
           environments.set(params.environmentId, params); reply({});
           if (clientName === "infinite_execution" && replayCompletedTurn) {
             const replay = { threadId, turnId: replayCompletedTurn };
-            // Delay this connection's copy until selection registration; the
-            // persistent observer has already recorded this turn's completion.
             client.send(JSON.stringify({ method: "turn/started", params: { threadId, turn: { id: replay.turnId, status: "inProgress" } } }));
             client.send(JSON.stringify({ method: "turn/completed", params: { threadId, turn: { id: replay.turnId, status: "completed" } } }));
             writeFileSync("provider-lifecycle-replay.json", JSON.stringify(replay));
@@ -102,7 +97,6 @@ if (args[0] === "exec-server") {
         else if (method === "thread/read" || method === "thread/resume") reply({ thread: thread(), pid: process.pid });
         else if (method === "thread/list") reply({ data: [thread(), { id: foreignId }], nextCursor: "next" });
         else if (method === "thread/loaded/list") reply({ data: [threadId, foreignId] });
-        // Real provider plugin catalogs can exceed 12 MB before a turn starts.
         else if (method === "plugin/list") reply({ catalog: "a".repeat(13 * 1024 * 1024) });
         else if (method === "turn/start") {
           const text = params.input.map(item => item.text ?? "").join(""); history.push(text);
@@ -175,6 +169,5 @@ if (args[0] === "exec-server") {
     input += data.toString().replace(/\x1b\[20[01]~/g, "");
     if (input.includes("\r") && threadId) { call("turn/start", { threadId, input: [{ type: "text", text: input.split("\r")[0] }] }); input = ""; }
   });
-  // A native TUI can exit without cleaning up its terminal modes.
   process.stdout.write("\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?25l");
 }

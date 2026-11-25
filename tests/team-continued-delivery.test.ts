@@ -9,11 +9,8 @@ import { TeamError } from "../packages/host/src/teams.js";
 import type { TeamReport } from "../packages/host/src/team-types.js";
 import { deliveryInternals, deliveryRecord } from "./fixtures/team-delivery-record.js";
 
-// INF-324 step 2: a run steered after it delivered a pull request works again and updates that same pull request.
-
 const PULL_REQUEST = "https://github.com/example/app/pull/7";
 
-/** The commits a bare remote's branch pointed at, newest first. The remote logs every ref update. */
 const branchHistory = (remote: string, branch: string) => git(remote, "reflog", "show", "--format=%H", `refs/heads/${branch}`).split("\n").filter(Boolean);
 
 test("a steer on a delivered pull request recovers a blocked member, publishes only a checkpoint before review, and updates the same pull request", { timeout: 240000 }, async () => {
@@ -37,7 +34,6 @@ test("a steer on a delivered pull request recovers a blocked member, publishes o
     const id = delivered.id, branch = delivered.branch, first = delivered.headCommit!;
     assert.equal(delivered.pullRequest?.revision, 1);
     assert.equal(delivered.pullRequest?.branch, branch, "the pull request report records the branch delivery was granted");
-    // The host publishes each integrated head of a first delivery to the run's branch.
     const delivery1 = branchHistory(remote, branch);
     assert.equal(delivery1[0], first);
 
@@ -45,7 +41,6 @@ test("a steer on a delivered pull request recovers a blocked member, publishes o
     assert.equal(steered.status, 200, JSON.stringify(steered.body));
     assert.equal(steered.body.revision, 2);
 
-    // Revision 2's first implementer blocks; the project manager's recovery replans it as revision 3.
     const held = await waitFor(() => f.get(id), run => run.status === "blocked" || existsSync(join(f.receipts, "delivery-started-3.json")), 180000);
     assert.notEqual(held.status, "blocked", JSON.stringify({ reason: held.reason, recovery: held.recovery, events: held.events.slice(-6) }));
     const delivery = JSON.parse(readFileSync(join(f.receipts, "delivery-started-3.json"), "utf8")) as { head: string; branch: string; continued: boolean; prompt: string };
@@ -85,7 +80,6 @@ test("a continued delivery reports only its recorded pull request, and a steer k
     h.run.lineup = structuredClone(limitLineup);
     h.run.status = "ready-for-review"; h.stored.deliveryAttempt = undefined; h.member.status = "stopped";
     h.run.pullRequest = { revision: 1, headCommit: h.headCommit, pullRequestUrl: PULL_REQUEST, summary: "Opened for review.", reportedAt: at, branch: h.run.branch };
-    // A delivery recovery that ran before the first delivery leaves its record complete.
     h.run.deliveryRecovery = { attempts: 1, status: "complete", revision: 1, headCommit: h.headCommit, policyHash: "recorded", sourceMemberId: h.member.memberId };
     const steered = await h.teams.steer(h.id, { requestId: randomUUID(), revision: 1, text: "Use the compact label." });
     assert.equal(steered.revision, 2);
@@ -93,7 +87,6 @@ test("a continued delivery reports only its recorded pull request, and a steer k
     assert.equal(h.run.deliveryRecoveryAttempts, 1, "the recovery limit stays cumulative");
     assert.equal(h.run.pullRequest?.revision, 1, "the owner keeps the link");
 
-    // The continued revision passed its checks and review at the same head; its delivery member reports.
     Object.assign(h.run, { status: "delivering", review: { verdict: "approved", summary: "Reviewed again.", revision: 2 } });
     Object.assign(h.member, { revision: 2, status: "reported" });
     h.stored.checkHead = h.headCommit; h.stored.halt = undefined;
@@ -138,7 +131,6 @@ test("a failed delivery in a continued revision blocks for the owner instead of 
 test("a run continued from a pull request recorded without its branch blocks at delivery instead of delivering to its checkpoint", { timeout: 60000 }, async () => {
   const h = await deliveryRecord("pr");
   try {
-    // A run steered before the host kept the branch: its pull request is from revision 1, and revision 2 was published to a checkpoint.
     const checkpoint = `${h.run.branch}-${h.headCommit.slice(0, 8)}`;
     Object.assign(h.run, { lineup: structuredClone(limitLineup), revision: 2, status: "reviewing",
       pullRequest: { revision: 1, headCommit: h.headCommit, pullRequestUrl: PULL_REQUEST, summary: "Opened for review.", reportedAt: new Date().toISOString() },

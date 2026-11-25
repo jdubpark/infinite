@@ -40,7 +40,6 @@ async function upload(f: ReturnType<typeof fixture>, writer: SyncWriter, previou
   return { manifest, generation };
 }
 
-/** Make every rename into `destination` that `matches` fail, as a crash between steps would leave it. */
 function failRenames(destination: string, matches: (from: string) => boolean) {
   const fsp = createRequire(import.meta.url)("node:fs/promises") as typeof import("node:fs/promises");
   const original = fsp.rename;
@@ -53,7 +52,6 @@ function failRenames(destination: string, matches: (from: string) => boolean) {
 }
 const stages = (f: { cloud: string }) => readdirSync(dirname(f.cloud)).filter(n => n.includes("infinite-stage"));
 
-/** Push the laptop tree the way the service will: capture, upload missing blobs, commit. */
 async function push(f: ReturnType<typeof fixture>, running = false, previous?: Awaited<ReturnType<typeof captureWorkspace>>) {
   const { manifest, generation } = await upload(f, testWriter, previous);
   return { manifest, status: await f.sync.commit("example", generation, manifest, running ? busy : idle, testWriter) };
@@ -79,21 +77,17 @@ test("a setgid parent or sync.sharedGroup makes the applied tree group-writable;
   for (const setup of ["setgid", "configured", "plain"] as const) {
     const f = fixture(setup === "configured" ? { sharedGroup: true } : undefined);
     try {
-      // New directories take the parent's group; the setgid bit survives chmod only for a group the user is in.
       chownSync(f.root, process.getuid!(), process.getgid!());
       if (setup === "setgid") {
-        // The Ubuntu template's workspaces directory is setgid.
         chmodSync(f.root, 0o2700);
         assert.equal(mode(f.root) & 0o2000, 0o2000, "the fixture parent carries the setgid bit");
       }
       mkdirSync(join(f.laptop, "src"));
       writeFileSync(join(f.laptop, "src/index.ts"), "export {};\n");
       writeFileSync(join(f.laptop, "run.sh"), "#!/bin/sh\n");
-      // Set laptop modes explicitly so a restrictive umask (the server stage uses 077) cannot change the fixture.
       chmodSync(join(f.laptop, "src"), 0o755); chmodSync(join(f.laptop, "src/index.ts"), 0o644); chmodSync(join(f.laptop, "run.sh"), 0o755);
       const first = await push(f);
       writeFileSync(join(f.laptop, "src/index.ts"), "export const a = 1;\n");
-      // The second apply replaces a tree with shared directories.
       const second = await push(f, false, first.manifest);
       assert.equal(second.status.appliedManifest, second.manifest.id, setup);
       const shared = setup !== "plain";
@@ -181,7 +175,6 @@ test("an apply links unchanged files from the verified tree, a forced apply rewr
     assert.equal(statSync(join(f.cloud, "b.txt")).ino, statSync(join(previous, "b.txt")).ino, "the unchanged file is a hard link into the retired tree");
     assert.notEqual(statSync(join(f.cloud, "a.txt")).ino, statSync(join(previous, "a.txt")).ino);
     assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "2\n");
-    // An in-place cloud edit of a linked file, same size, is still drift.
     writeFileSync(join(f.cloud, "b.txt"), "edit\n");
     writeFileSync(join(f.laptop, "a.txt"), "3\n");
     const third = await push(f, false, second.manifest);
@@ -201,7 +194,6 @@ test("a failure between the two renames puts the live tree and .infinite/ back",
     const first = await push(f);
     mkdirSync(join(f.cloud, ".infinite")); writeFileSync(join(f.cloud, ".infinite/state.json"), "cloud\n");
     writeFileSync(join(f.laptop, "a.txt"), "2\n");
-    // The live tree has moved aside; publishing the new root fails.
     const restore = failRenames(f.cloud, from => from.includes(".infinite-stage-"));
     try {
       await assert.rejects(push(f, false, first.manifest), (error: ProjectSyncError) => error.code === "apply-failed" && error.category === "other");
@@ -223,12 +215,10 @@ test("an apply stopped between the two renames is recovered when the store start
     const first = await push(f);
     mkdirSync(join(f.cloud, ".infinite")); writeFileSync(join(f.cloud, ".infinite/state.json"), "cloud\n");
     writeFileSync(join(f.laptop, "a.txt"), "2\n");
-    // Neither the publication nor the rollback reaches the project path, as if the host stopped after the first rename.
     const restore = failRenames(f.cloud, () => true);
     try { await assert.rejects(push(f, false, first.manifest)); } finally { restore(); }
     assert.equal(existsSync(f.cloud), false, "the project directory is missing");
     assert.equal(stages(f).length, 1, "the stage still holds the carried .infinite/");
-    // A restarted API restores the previous copy and the carried directory, then removes the stage.
     new ProjectSync(f.config, f.key);
     const deadline = Date.now() + 5000;
     while ((existsSync(f.cloud) ? stages(f).length : 1) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
@@ -249,7 +239,6 @@ test("an apply restores a missing project directory from its previous copy befor
     writeFileSync(join(f.laptop, "a.txt"), "2\n");
     const second = await push(f, false, first.manifest);
     const previous = join(dirname(f.cloud), `.${basename(f.cloud)}.infinite-previous`);
-    // A stop right after the live tree moved aside, with no stage left to clean up.
     rmSync(previous, { recursive: true, force: true });
     renameSync(f.cloud, previous);
     writeFileSync(join(f.laptop, "a.txt"), "3\n");
@@ -274,7 +263,6 @@ test("sockets and FIFOs are left out of laptop captures and cloud scans, and the
     assert.ok(!manifest.entries.some(e => e.path === "pipe" || e.path.endsWith(".ipc")));
     const first = await push(f);
     assert.equal(first.status.appliedManifest, first.manifest.id);
-    // A stale dev-server socket in the cloud tree neither blocks the drift scan nor counts as a change.
     await socket(join(f.cloud, "dev.sock"));
     writeFileSync(join(f.laptop, "a.txt"), "2\n");
     const second = await push(f, false, first.manifest);
@@ -425,7 +413,6 @@ test("read-only directories do not block later applies, and .infinite/ is carrie
     writeFileSync(join(f.laptop, "a.txt"), "1\n");
     let last = await push(f);
     mkdirSync(join(f.cloud, ".infinite")); writeFileSync(join(f.cloud, ".infinite/state.json"), "{}\n");
-    // The third apply replaces a previous tree that holds the read-only directory.
     for (const content of ["2\n", "3\n"]) {
       writeFileSync(join(f.laptop, "a.txt"), content);
       last = await push(f, false, last.manifest);
@@ -462,7 +449,6 @@ test("sync refuses a project path that holds the host's own state, even with for
   try {
     const sync = new ProjectSync({ ...f.config, projects: [{ id: "example", name: "Example", path: f.root }] }, f.key);
     writeFileSync(join(f.laptop, "a.txt"), "1\n");
-    // A running session keeps the generation pending without touching the tree.
     await push({ ...f, sync }, true);
     const refused = (error: ProjectSyncError) => error.code === "invalid-manifest" && error.status === 500;
     await assert.rejects(sync.apply("example", { running: idle, force: true }), refused);
@@ -493,7 +479,6 @@ test("a failed apply keeps the newest generation pending with a sanitized catego
     const first = await push(f);
     writeFileSync(join(f.laptop, "a.txt"), "2\n");
     const second = await push(f, true, first.manifest);
-    // The next generation fails while the host scans a cloud file it cannot read.
     writeFileSync(join(f.cloud, "unreadable.txt"), "x\n", { mode: 0o000 });
     writeFileSync(join(f.laptop, "a.txt"), "3\n");
     const refusedScan = (error: ProjectSyncError) => error.code === "apply-failed" && error.category === "permission" && !error.message.includes(f.root);
@@ -503,7 +488,6 @@ test("a failed apply keeps the newest generation pending with a sanitized catego
     assert.equal(status.pendingGeneration?.category, "permission");
     assert.equal(status.pendingGeneration?.id, status.lastSyncedManifest, "the marker names the newest generation");
     assert.ok(status.pendingGeneration?.message && !status.pendingGeneration.message.includes(f.root), "the message never names a host path");
-    // A forced apply that fails while staging keeps the marker for the newest generation.
     await assert.rejects(f.sync.apply("example", { running: busy }), (error: ProjectSyncError) => error.code === "session-running");
     chmodSync(f.root, 0o500);
     await assert.rejects(f.sync.apply("example", { running: idle, force: true }), (error: ProjectSyncError) => error.code === "apply-failed" && error.category === "permission");
@@ -511,7 +495,6 @@ test("a failed apply keeps the newest generation pending with a sanitized catego
     status = f.sync.status("example");
     assert.deepEqual([status.pendingGeneration?.reason, status.pendingGeneration?.category], ["apply-failed", "permission"]);
     assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "1\n");
-    // Once the cause is fixed, an explicit apply clears the marker.
     chmodSync(f.root, 0o700);
     const applied = await f.sync.apply("example", { running: idle, force: true });
     assert.equal(applied.pendingGeneration, undefined);

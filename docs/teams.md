@@ -1099,6 +1099,12 @@ One trial runs host-wide at a time. Validation and trials share the grader, one 
 | `provider-limit` | The configuration's provider has an active limit. |
 | `session-slots` | Fewer than four host session slots are free. |
 | `daily-cap` | `trialsPerDay` trials have started today. |
+| `mirror` | The project has no mirror head or no base branch. |
+| `grader-failed` | A step of the trial's source in the grader failed. |
+| `eval-failed` | A step of the trial's source in the eval account failed. |
+| `bundle-missing` | The project's source bundle could not be read. |
+
+A trial whose source cannot be built keeps its attempt and is tried again, and the job's `waiting` names the cause. The tenth failure in a row for one slot ends that trial `void-host` and the job skips the task, so the next task runs; the counted causes are `grader-failed`, `eval-failed`, `bundle-missing` and `storage`. Three voids in a row still pause the job with `trial-voids`, as before, so a cause that is not the task's stops the job after three tasks. `mirror` and `halt` only wait and are never counted, however long they last. A trial ended this way counts toward `trialsPerDay`. A paused job's `waiting` is empty, so the cause is not shown after the pause. A shorter outage uses no attempt. The count is per job and in memory, so a host restart starts it again.
 
 The reasons that stop a job are `trial-voids` (three voids in a row), `eval-processes-alive` (a process of the eval account survived `stop`, and the job is blocked until the owner resumes it), and `configuration-changed`, with the validate job's reasons.
 

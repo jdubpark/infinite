@@ -9,6 +9,8 @@ import { VOID_ENDINGS, type EvalIdentityState, type TrialConfiguration, type Tri
 // Pure trial rules: grades, the restore set, the next slot, the isolation label, and the ending maps. No I/O, no clock.
 
 export const TRIAL_HARNESS_VERSION = 1, VOID_ATTEMPTS_MAX = 3, VOID_STREAK_PAUSE = 3;
+/** The failure in a row, for one slot, before a host cause ends the trial `void-host`. A shorter outage keeps the attempt. */
+export const TRIAL_RELEASES = 10;
 
 export type SlotRow = { taskId: string; configRef: string; slot: number; attempt: number; state: TrialState; ending: TrialEnding | null };
 

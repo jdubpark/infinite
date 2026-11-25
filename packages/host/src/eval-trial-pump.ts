@@ -3,7 +3,7 @@ import { evalProxyUrl } from "./egress.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { Grader, GraderProbe } from "./eval-grader.js";
 import { type EvalIdentity, type EvalProbe, evalCanaries, repositoryUrl, stopEvalIdentity } from "./eval-identity.js";
-import { EVAL_MODULE, TRIAL_ENDINGS, type CapturedPayload, type MinedPayload, type TrialEnding, type TrialConfiguration, type TrialGrade } from "./eval-types.js";
+import { EVAL_MODULE, TRIAL_ENDINGS, type EvalJobWait, type CapturedPayload, type MinedPayload, type TrialEnding, type TrialConfiguration, type TrialGrade } from "./eval-types.js";
 import type { EvalIdentityState } from "./eval-types.js";
 import { type NextTrial, type TrialGates, type TrialJobs } from "./eval-trial-jobs.js";
 import { trialSettings, type TrialSettings } from "./eval-config.js";
@@ -74,6 +74,17 @@ type JudgementLive = {
 };
 type Live = TrialLive | JudgementLive;
 type Stop = "stopped" | "alive" | "failed";
+
+/** The job's wait for a source cause that keeps the attempt. A process that survived `stop` blocks the job instead. */
+function waitOf(cause: Exclude<Extract<SourceResult, { kind: "environment" }>["cause"], "eval-processes-alive" | "grader-processes-alive">): EvalJobWait {
+  switch (cause) {
+    case "halted": return "halt";
+    case "storage": return "storage";
+    case "grader-failed": return "grader-failed";
+    case "eval-failed": return "eval-failed";
+    case "bundle-missing": return "bundle-missing";
+  }
+}
 
 /** The git ancestry check of ValidateContext. A trial never asks it, so a call is a bug and says so. */
 const NO_ANCESTRY = { isAncestor: () => Promise.reject(new Error("Trials do not check ancestry.")) } as unknown as ValidateContext["git"];
@@ -306,9 +317,7 @@ export class TrialPump {
       // The run's session is read before the run ends, so the sweep can remove it later.
       const session = await this.options.teams().replayState(row.trialId).then(state => state?.sessionId, () => undefined);
       await this.options.teams().endReplay(row.trialId, "void-host").catch(() => undefined);
-      this.options.store.write(tx => finishTrial(tx, row.trialId, this.final(gradeOf({ ending: "void-host", expected: this.expectedOf(row.taskId),
-        overwritten: 0, diff: null, isolation: "none" }), null, null, session ?? null), at));
-      this.options.jobs.record(row.jobId, "void-host");
+      this.voidHost(row.trialId, row.jobId, row.taskId, at, session ?? null);
     }
     // A judgement row left in flight is a host failure, not a verdict: it ends void-host and its ordering retries. A drop would end its pair.
     for (const { judgementId } of judged) {
@@ -338,6 +347,16 @@ export class TrialPump {
     this.started = true;
     this.dirty = false;
     return true;
+  }
+
+  /** Ends a trial row `void-host` with no member graded, and counts the void for its job. A preparing row is started first, so it counts as started. */
+  private voidHost(trialId: string, jobId: string, taskId: string, at: string, sessionId: string | null): void {
+    const final = this.final(gradeOf({ ending: "void-host", expected: this.expectedOf(taskId), overwritten: 0, diff: null, isolation: "none" }), null, null, sessionId);
+    this.options.store.write(tx => {
+      startTrial(tx, trialId, at);
+      finishTrial(tx, trialId, final, at);
+    });
+    this.options.jobs.record(jobId, "void-host");
   }
 
   /** The live trial, one step: the run's state decides whether it runs on, ends, or grades. */
@@ -455,6 +474,18 @@ export class TrialPump {
     this.live = undefined;
   }
 
+  /**
+   * A trial that could not start: the row goes and the slot keeps its attempt. The TRIAL_RELEASES-th counted failure in a row for
+   * one slot ends the trial `void-host` and the job skips the task, so the next task runs; three voids in a row still pause the
+   * job, so a cause that is not the task's stops it after three tasks. `mirror` and `halt` only wait.
+   */
+  private release(next: Trial, trialId: string, waiting: EvalJobWait): void {
+    this.cooldown = 1;
+    if (this.options.jobs.release({ ...next, trialId }, waiting) === "released") return;
+    this.voidHost(trialId, next.jobId, next.taskId, this.now(), null);
+    this.options.jobs.skip(next.jobId, next.taskId);
+  }
+
   /** Starts a trial: the row, its source, the run, and the live state. A source that cannot start ends or waits here. */
   private async begin(next: Trial, identity: EvalProbe, grader: GraderProbe): Promise<void> {
     const trialId = randomUUID();
@@ -464,11 +495,7 @@ export class TrialPump {
     }, this.now()));
     if (inserted !== "inserted") return;
     const ctx = this.contextOf(next, next.settings, trialId, identity, grader);
-    if (ctx === undefined) {
-      this.options.store.write(tx => dropTrial(tx, trialId));
-      this.cooldown = 1;
-      return;
-    }
+    if (ctx === undefined) return this.release(next, trialId, "mirror");
     let source: SourceResult;
     try {
       source = await (this.options.prepareSource ?? prepareTrialSource)(this.options.store, next.taskId, ctx);
@@ -481,10 +508,13 @@ export class TrialPump {
       return;
     }
     if (source.kind === "environment") {
-      this.cooldown = 1;
-      this.options.store.write(tx => dropTrial(tx, trialId));
-      if (source.cause === "eval-processes-alive" || source.cause === "grader-processes-alive") this.options.jobs.block(next.jobId, "eval-processes-alive");
-      return;
+      if (source.cause === "eval-processes-alive" || source.cause === "grader-processes-alive") {
+        this.cooldown = 1;
+        this.options.store.write(tx => dropTrial(tx, trialId));
+        this.options.jobs.block(next.jobId, "eval-processes-alive");
+        return;
+      }
+      return this.release(next, trialId, waitOf(source.cause));
     }
     this.options.store.write(tx => startTrial(tx, trialId, this.now()));
     const live: TrialLive = { kind: "trial", trialId, jobId: next.jobId, taskId: next.taskId, projectId: next.projectId, configuration: next.configuration,

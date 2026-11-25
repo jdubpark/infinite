@@ -1,7 +1,6 @@
 import SwiftUI
 import InfiniteCore
 
-/// The conversation as the provider recorded it: prompts, replies, and one line per tool call.
 struct ChatView: View {
     @ObservedObject var model: SessionModel
     @State private var lastVisible = true
@@ -75,13 +74,11 @@ struct ChatView: View {
     }
 }
 
-/// A dialog the agent is waiting on, answered through the host's checked key presses.
 struct PromptCard: View {
     @ObservedObject var model: SessionModel
     let prompt: JSON
     @State private var reply = ""
     private var options: [JSON] { prompt["options"].array }
-    /// Dialogs the host cannot answer by option: multi-select, or no verified on-screen block.
     private var screenOnly: Bool { prompt["multiSelect"].bool || prompt["hash"].string.isEmpty || options.isEmpty }
     private var acceptsText: Bool { prompt["acceptsText"].bool && prompt["kind"].string != "yes-no" }
     private var canAnswer: Bool { model.canAnswerPrompt }

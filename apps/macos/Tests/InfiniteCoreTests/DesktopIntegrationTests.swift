@@ -15,7 +15,6 @@ private actor TerminalMessages {
     }
 }
 
-/// Run with scripts/test-macos-integration.ts, which owns an isolated Node host.
 final class DesktopIntegrationTests: XCTestCase {
     func testEncryptedSwiftClientTransfersBinaryFilesAndSteersRealTerminal() async throws {
         let environment = ProcessInfo.processInfo.environment
@@ -44,8 +43,6 @@ final class DesktopIntegrationTests: XCTestCase {
         try await transfer.download(remotePath: "nested/swift-upload.bin", root: root, localPath: "download.bin", source: remote, expectedLocal: nil, progress: { _ in })
         XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("download.bin")), bytes)
 
-        // Change the real server file after pinning its previous version. The
-        // old hash must fail before a replacement becomes visible on this Mac.
         let changed = Data("new server content".utf8), changedHash = Data(SHA256.hash(data: changed)).hex
         let upload = try await client.request("/projects/rehearsal/uploads", body: .object(["path": .string("nested/swift-upload.bin"), "size": .number(Double(changed.count)), "sha256": .string(changedHash), "expectedHash": .string(remote.sha256)]))
         let uploadID = upload["uploadId"].string
@@ -72,8 +69,6 @@ final class DesktopIntegrationTests: XCTestCase {
         try await messages.waitFor { pages in pages.contains { $0["message"]["receipt"]["requestId"].string == inputID && $0["message"]["receipt"]["state"].string == "delivered" } }
         _ = try await client.request("/sessions/" + sessionID + "/stop", body: .object(["requestId": .string(UUID().uuidString.lowercased())]), controlID: lease)
         await client.closeTerminal(stream)
-        // Closing more than the concurrent-stream cap must not retain orphan
-        // close events or drop the encrypted connection.
         for _ in 0..<6 {
             let reopened = try await client.openTerminal(sessionID: sessionID) { _ in }
             await client.closeTerminal(reopened)

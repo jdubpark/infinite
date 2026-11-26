@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { replyDeadline } from "./deadline.js";
 import type { ControlLease, Event, Receipt, TerminalOpen, TerminalSnapshot, WorkerState } from "./types.js";
 
 export type TerminalPage = {
@@ -85,7 +86,7 @@ export function terminalConnection(origin: string, token: string, sessionId: str
     const size = Buffer.byteLength(text);
     if (pendingBytes + size > 256 * 1024 || pending.size >= 128 || socket.bufferedAmount > 256 * 1024) return Promise.reject(new Error("Input buffer limit reached"));
     return new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => fail(new Error("Terminal acknowledgement timed out")), 15000);
+      const timer = replyDeadline(15000, () => { if (pending.has(requestId)) fail(new Error("Terminal acknowledgement timed out")); });
       timer.unref();
       pending.set(requestId, { timer, size, resolve, reject }); pendingBytes += size;
       try { send({ op, requestId, text, ...(op === "input" ? { submit: false } : {}), ...(lease ? { leaseId: lease.id } : {}) }); }
@@ -98,7 +99,7 @@ export function terminalConnection(origin: string, token: string, sessionId: str
     const requestId = randomUUID();
     if (controls.size >= 4) return Promise.reject(new Error("A control request is already pending"));
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => fail(new Error("Terminal acknowledgement timed out")), 15000);
+      const timer = replyDeadline(15000, () => { if (controls.has(requestId)) fail(new Error("Terminal acknowledgement timed out")); });
       timer.unref();
       controls.set(requestId, { timer, resolve, reject });
       try {

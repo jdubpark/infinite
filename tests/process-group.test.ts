@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { signalGroup, watchLeader } from "../packages/host/src/process-group.js";
-import { GROUP_SUPERVISOR } from "../packages/host/src/group-supervisor.js";
+import { signalGroup, spawnGroup, watchLeader } from "../packages/host/src/process-group.js";
+import { SUPERVISOR_GRACE_MS, supervisorArgs } from "../packages/host/src/group-supervisor.js";
 import { EXIT_DRAIN_MS } from "../packages/host/src/team-workspace.js";
 import { blobReader } from "../packages/host/src/git-stream.js";
 import { captureGit } from "../packages/host/src/eval-git.js";
@@ -15,7 +15,7 @@ import { createUnderstandingAdapter } from "../packages/host/src/understanding-a
 import { RepositoryBriefings } from "../packages/host/src/repository-briefings.js";
 import { startCloudExecutor } from "../packages/host/src/cloud-executor.js";
 import type { Config } from "../packages/host/src/types.js";
-import { LEADER_LEAVES, endLeftBehind, gone, leaderGone, leftBehind, stubbornMember, until, within } from "./leader-exit.js";
+import { LEADER_LEAVES, endLeftBehind, gone, groupSignals, leaderGone, leftBehind, stubbornMember, until, within } from "./leader-exit.js";
 
 const CASE = { timeout: 600_000, skip: process.platform === "win32" && "process groups are POSIX" };
 const SETTLE_MS = EXIT_DRAIN_MS + 5_000;
@@ -24,12 +24,13 @@ const pause = (ms: number) => new Promise(done => setTimeout(done, ms));
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
 const AUTHOR = ["-c", "user.name=Example", "-c", "user.email=dev@example.invalid"];
 
-type Ending = "exits" | "is killed" | "runs";
+type Ending = "exits" | "is killed" | "runs" | "ignores SIGTERM" | "leaves its group empty";
 type Run = { settled: Promise<string>; stop(): unknown };
-type Place = { name: string; held: RegExp; stopped?: RegExp; escalationMs?: number; start(record: string, base: string, ending: Ending): Run };
+type Place = { name: string; held: RegExp; stopped?: RegExp; graceMs: number; start(record: string, base: string, ending: Ending): Run };
+const ENDINGS: Record<Ending, string> = { exits: "", "is killed": "-killed", runs: "-running", "ignores SIGTERM": "-stubborn", "leaves its group empty": "-alone" };
 
 function mode(ending: Ending, action: "print" | "exec") {
-  return ending === "runs" ? "running" : ending === "is killed" ? `${action}-killed` : action;
+  return `${action}${ENDINGS[ending]}`;
 }
 
 function scratch() {
@@ -134,6 +135,7 @@ const places: Place[] = [
     name: "a Git stream read",
     held: /^resolved \{"state":"failed"\}$/,
     stopped: /^resolved \{"state":"failed"\}$/,
+    graceMs: 0,
     start(record, base, ending) {
       const { root, head } = checkout(base);
       const controller = new AbortController();
@@ -145,6 +147,7 @@ const places: Place[] = [
     name: "a Git patch read that names a missing commit",
     held: /^resolved \{"state":"failed"\}$/,
     stopped: /^resolved \{"state":"failed"\}$/,
+    graceMs: 0,
     start(record, base, ending) {
       const { root, head } = checkout(base);
       const git = captureGit(() => ({ command: process.execPath, args: [LEADER_LEAVES, record, mode(ending, "exec")] }));
@@ -155,6 +158,7 @@ const places: Place[] = [
     name: "a repository graph build",
     held: /left a process holding its output/,
     stopped: /closed before refresh completed/,
+    graceMs: 2_000,
     start(record, base, ending) {
       const project = join(base, "project");
       mkdirSync(project);
@@ -167,7 +171,7 @@ const places: Place[] = [
     name: "a repository context read",
     held: /^rejected context-output-held/,
     stopped: /^rejected context-aborted/,
-    escalationMs: 500,
+    graceMs: 500,
     start(record, base, ending) {
       const controller = new AbortController();
       const config = { projects: [], repositoryBriefings: briefing(record, ending) } as unknown as Config;
@@ -178,7 +182,7 @@ const places: Place[] = [
     name: "a System tab brief",
     held: /^rejected understanding-output-held$/,
     stopped: /^rejected understanding-process-cancelled$/,
-    escalationMs: 500,
+    graceMs: 500,
     start(record, base, ending) {
       const controller = new AbortController();
       const config = { projects: [], repositoryBriefings: briefing(record, ending) } as unknown as Config;
@@ -191,7 +195,7 @@ const places: Place[] = [
     name: "a session repository brief",
     held: /^rejected .*Reason: output-held$/,
     stopped: /^rejected /,
-    escalationMs: 3_000,
+    graceMs: 3_000,
     start(record, base, ending) {
       const { root } = checkout(base);
       const manager = {
@@ -205,7 +209,7 @@ const places: Place[] = [
   {
     name: "a cloud executor",
     held: /^resolved/,
-    escalationMs: 2_000,
+    graceMs: SUPERVISOR_GRACE_MS,
     start(record, base, ending) {
       const started = startCloudExecutor({ cwd: base, command: process.execPath, commandArgs: [LEADER_LEAVES, record, mode(ending, "print"), "ws://127.0.0.1:43210\n"] });
       return { settled: outcome(started.then(executor => executor.exited)), stop: () => started.then(executor => executor.close(), () => undefined) };
@@ -359,20 +363,21 @@ test("bytes arriving in each of the first two drain turns hold the output open u
   }
 });
 
-test("the executor supervisor stops its group while the leader runs and exits with the leader without signalling after it", CASE, async () => {
+test("the executor supervisor ends a group member that ignores SIGTERM when stopped, and exits with its leader without signalling after it", CASE, async () => {
   const running = scratch(), exited = scratch();
   try {
-    const live = spawn(process.execPath, ["-e", GROUP_SUPERVISOR, process.execPath, LEADER_LEAVES, running.record, "exec", "sleep", "30"], { stdio: ["pipe", "pipe", "pipe"] });
+    const live = spawn(process.execPath, supervisorArgs(process.execPath, [LEADER_LEAVES, running.record, "print-running", "ready\n"], {}), { stdio: ["pipe", "pipe", "pipe"] });
     live.stdout.resume();
     live.stderr.resume();
     const liveExit = new Promise(done => live.once("exit", done));
-    await until("the running leader records what it leaves", () => leftBehind(running.record) !== undefined);
-    const inGroup = leftBehind(running.record)!;
+    const { member } = await stubbornMember(running.record);
     live.stdin.end();
-    await within(liveExit, SETTLE_MS, "the stopped supervisor exits");
-    await until("the process in the running leader's group ends", () => gone(inGroup.witness));
+    await Promise.all([
+      within(liveExit, SETTLE_MS, "the stopped supervisor exits"),
+      until("the group member that ignores SIGTERM ends", () => gone(member), SUPERVISOR_GRACE_MS + 3_000),
+    ]);
 
-    const ended = spawn(process.execPath, ["-e", GROUP_SUPERVISOR, process.execPath, LEADER_LEAVES, exited.record, "print", "ready\n"], { stdio: ["pipe", "pipe", "pipe"] });
+    const ended = spawn(process.execPath, supervisorArgs(process.execPath, [LEADER_LEAVES, exited.record, "print", "ready\n"], {}), { stdio: ["pipe", "pipe", "pipe"] });
     ended.stdout.resume();
     ended.stderr.resume();
     const endedExit = new Promise<number | null>(done => ended.once("exit", done));
@@ -462,23 +467,58 @@ test("a stop inside the drain after a signal ended the leader settles the spawne
   }
 });
 
-test("a stop whose SIGTERM ends a running leader sends no SIGKILL after it, so a group member that ignores SIGTERM outlives the escalation delay", CASE, async t => {
-  for (const place of places.filter(candidate => candidate.escalationMs !== undefined)) {
-    await t.test(place.name, async () => {
+test("a stop ends the leader and a group member that ignores SIGTERM within the place's grace, whether the leader obeys SIGTERM or ignores it", CASE, async t => {
+  for (const place of places) {
+    for (const ending of ["runs", "ignores SIGTERM"] as const) {
+      await t.test(`${place.name} whose leader ${ending}`, async () => {
+        const { base, record } = scratch();
+        let run: Run | undefined, stopped = false;
+        try {
+          run = place.start(record, base, ending);
+          const { leader, member } = await stubbornMember(record);
+          stopped = true;
+          const stopping = Promise.resolve(run.stop());
+          await until("the leader and its group member that ignores SIGTERM end", () => gone(leader) && gone(member), place.graceMs + 3_000);
+          const settled = await within(run.settled, SETTLE_MS, `${place.name} settles after the stop`);
+          if (place.stopped) assert.match(settled, place.stopped);
+          await within(stopping, SETTLE_MS, "the stop returns");
+        } finally {
+          try {
+            if (run && !stopped) await run.stop();
+          } finally {
+            endLeftBehind(record);
+            rmSync(base, { recursive: true, force: true });
+          }
+        }
+      });
+    }
+  }
+});
+
+test("a stop after the leader has ended and left its group empty sends that group no signal", CASE, async t => {
+  for (const place of places.filter(candidate => candidate.stopped)) {
+    await t.test(place.name, async st => {
       const { base, record } = scratch();
-      let run: Run | undefined, stopped = false;
+      let run: Run | undefined, stopped = false, settled = false;
       try {
-        run = place.start(record, base, "runs");
-        const { leader, member } = await stubbornMember(record);
-        stopped = true;
-        const stoppedAt = performance.now();
-        const stopping = Promise.resolve(run.stop());
-        await until("the leader ends on the SIGTERM", () => gone(leader));
-        const settled = await within(run.settled, SETTLE_MS, `${place.name} settles after the stop`);
-        if (place.stopped) assert.match(settled, place.stopped);
-        await within(stopping, SETTLE_MS, "the stop returns");
-        await pause(Math.max(0, stoppedAt + place.escalationMs! + 500 - performance.now()));
-        assert.equal(gone(member), false, "the group member that ignores SIGTERM was not signalled after the leader ended");
+        run = place.start(record, base, "leaves its group empty");
+        void run.settled.then(() => { settled = true; });
+        const left = await leaderGone(record);
+        if (settled) {
+          st.skip("the spawner settled before the test could stop it inside the drain");
+          return;
+        }
+        const signals = groupSignals(left.group);
+        try {
+          stopped = true;
+          const stopping = Promise.resolve(run.stop());
+          assert.match(await within(run.settled, SETTLE_MS, `${place.name} settles after the stop`), place.stopped!);
+          await within(stopping, SETTLE_MS, "the stop returns");
+          await pause(place.graceMs + 500);
+        } finally {
+          signals.restore();
+        }
+        assert.deepEqual(signals.sent, [], "no signal went to the emptied group after its leader ended");
       } finally {
         try {
           if (run && !stopped) await run.stop();
@@ -489,4 +529,26 @@ test("a stop whose SIGTERM ends a running leader sends no SIGKILL after it, so a
       }
     });
   }
+});
+
+function report(child: ChildProcess, input?: string) {
+  return new Promise<string>(done => {
+    let out = "", err = "";
+    child.stdout!.on("data", (chunk: Buffer) => { out += chunk.toString("utf8"); });
+    child.stderr!.on("data", (chunk: Buffer) => { err += chunk.toString("utf8"); });
+    child.once("error", error => done(`error ${(error as NodeJS.ErrnoException).code}`));
+    child.once("close", (code, signal) => done(JSON.stringify({ code, signal, out, err })));
+    child.stdin!.on("error", () => {});
+    child.stdin!.end(input);
+  });
+}
+
+test("a grouped spawn reports the status, signal, output and missing command that a direct spawn reports", CASE, async () => {
+  const stdio: StdioOptions = ["pipe", "pipe", "pipe"];
+  for (const script of ["exit 0", "exit 3", "printf out; printf err >&2; exit 4", "cat", "kill -s TERM $$", "kill -s KILL $$", "kill -s USR1 $$", "kill -s PIPE $$"]) {
+    const direct = await report(spawn("/bin/sh", ["-c", script], { stdio }), "input");
+    assert.equal(await report(spawnGroup("/bin/sh", ["-c", script], { stdio }, 500), "input"), direct, script);
+  }
+  const missing = "no-such-command-for-a-grouped-spawn";
+  assert.equal(await report(spawnGroup(missing, [], { stdio }, 500)), await report(spawn(missing, [], { stdio })));
 });

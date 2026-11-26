@@ -11,7 +11,7 @@ import { forwardExecutor, type ExecutorControl } from "./executor-tunnel.js";
 import { captureWorkspace, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, readWorkspaceBlob, validateWorkspaceManifest, type WorkspaceManifest } from "./workspace-checkpoint.js";
 import { shouldCaptureWorkspace, watchWorkspaceChanges } from "./workspace-changes.js";
 import { transferWorkspaceBlobs } from "./workspace-transfer.js";
-import { GROUP_SUPERVISOR } from "./group-supervisor.js";
+import { supervisorArgs } from "./group-supervisor.js";
 
 interface LaptopServiceOptions {
   origin: string;
@@ -254,8 +254,8 @@ async function runLaptopService(): Promise<void> {
     });
     if (abort.signal.aborted) throw new Error(STARTUP_ERROR);
     const executorToken = randomBytes(32).toString("hex");
-    executor = spawn(process.execPath, ["-e", GROUP_SUPERVISOR, "codex", "exec-server", "--listen", "ws://127.0.0.1:0", "--ws-auth", "capability-token",
-      "--ws-token-sha256", createHash("sha256").update(executorToken).digest("hex")], { cwd: options.cwd, stdio: ["pipe", "pipe", "pipe"] });
+    executor = spawn(process.execPath, supervisorArgs("codex", ["exec-server", "--listen", "ws://127.0.0.1:0", "--ws-auth", "capability-token",
+      "--ws-token-sha256", createHash("sha256").update(executorToken).digest("hex")], { cwd: options.cwd }), { cwd: options.cwd, stdio: ["pipe", "pipe", "pipe"] });
     executor.on("error", stop); executor.on("exit", stop);
     executor.stdin?.on("error", stop);
     const executorUrl = await executorEndpoint(executor, abort.signal);

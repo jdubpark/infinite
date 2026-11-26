@@ -1,6 +1,7 @@
-import type { ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { Socket } from "node:net";
 import type { Readable } from "node:stream";
+import { anchoredCommand } from "./group-supervisor.js";
 import { EXIT_DRAIN_MS } from "./team-workspace.js";
 
 const DRAIN_TURNS = 3;
@@ -21,6 +22,16 @@ export function signalGroup(child: ChildProcess, signal: NodeJS.Signals): GroupS
     return (error as NodeJS.ErrnoException).code === "EPERM" ? "refused" : "leader-exited";
   }
   return "sent";
+}
+
+export function spawnGroup(command: string, args: readonly string[], options: SpawnOptions & { cwd?: string }, graceMs: number): ChildProcess {
+  const [file, argv] = anchoredCommand(command, args, options, graceMs);
+  return spawn(file, argv, { ...options, detached: process.platform !== "win32" });
+}
+
+export function terminateGroup(child: ChildProcess, graceMs: number): void {
+  if (signalGroup(child, "SIGTERM") === "leader-exited") return;
+  setTimeout(() => signalGroup(child, "SIGKILL"), graceMs).unref();
 }
 
 const isSocket = (stream: Readable | null): stream is Socket => stream instanceof Socket;

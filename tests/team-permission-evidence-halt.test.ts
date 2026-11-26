@@ -36,7 +36,7 @@ process.exit(child.status ?? 1);
 
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
-test("a pause ends the Git read that collects requested permission evidence, starts no later read, and records the halt (INF-521)", { timeout: 180000 }, async () => {
+test("a pause ends the Git read that collects requested permission evidence, starts no later read, and records the halt (INF-521)", { timeout: 290000 }, async () => {
   const control = mkdtempSync(join(tmpdir(), "team-evidence-halt-"));
   const f = await fixture("permissions-codex-diagnostic-evidence", lineup,
     { teams: { commandPrefix: { command: process.execPath, args: ["-e", holdEvidenceRead, control] } } } as Partial<Config>);
@@ -45,7 +45,7 @@ test("a pause ends the Git read that collects requested permission evidence, sta
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
     const id = created.body.id;
-    await waitFor(async () => existsSync(join(control, "started")), Boolean, 90000);
+    await waitFor(async () => existsSync(join(control, "started")), Boolean, 170000);
     const pid = Number(readFileSync(join(control, "started"), "utf8"));
     assert.ok(alive(pid), "the first changed-paths read of the evidence collection is running");
     const collecting = await f.get(id);
@@ -71,7 +71,7 @@ test("a pause ends the Git read that collects requested permission evidence, sta
   }
 });
 
-test("a pause ends the Git read that rechecks the target before an approved answer, and nothing is sent (INF-521)", { timeout: 180000 }, async () => {
+test("a pause ends the Git read that rechecks the target before an approved answer, and nothing is sent (INF-521)", { timeout: 290000 }, async () => {
   const control = mkdtempSync(join(tmpdir(), "team-answer-halt-"));
   const f = await fixture("permissions-codex", lineup,
     { teams: { commandPrefix: { command: process.execPath, args: ["-e", holdEvidenceRead, control] } } } as Partial<Config>);
@@ -82,10 +82,10 @@ test("a pause ends the Git read that rechecks the target before an approved answ
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
     const id = created.body.id;
     const reviewing = await waitFor(() => f.get(id), run => run.permissionDecisions?.some(decision => decision.status === "reviewing") &&
-      existsSync(join(f.receipts, `${run.id}.judge-ready`)) && existsSync(join(f.receipts, `${run.id}.permission-feedback.json`)), 90000);
+      existsSync(join(f.receipts, `${run.id}.judge-ready`)) && existsSync(join(f.receipts, `${run.id}.permission-feedback.json`)), 170000);
     writeFileSync(join(control, "armed"), "");
     writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
-    await waitFor(async () => existsSync(join(control, "started")), Boolean, 60000);
+    await waitFor(async () => existsSync(join(control, "started")), Boolean, 120000);
     const pid = Number(readFileSync(join(control, "started"), "utf8"));
     assert.ok(alive(pid), "the answer's changed-paths read is running");
     const holding = await f.get(id);

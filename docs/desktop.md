@@ -16,9 +16,11 @@ record below.
 
 Open **Understand** and choose a workspace. **Work** retains the original
 mission, team, and goal states and recorded results. **System** opens retained
-repository briefs and requested work. **Knowledge** adds owner-maintained
-projects, features, component plans, and a component map with sourced
-relationships. Each component separates **Current**, **Planned**, and
+repository briefs and requested work. **Knowledge** (`UnderstandingKnowledgeView`)
+adds owner-maintained projects, features, component plans, and a component map
+with sourced relationships, and **Behaviors** (`UnderstandingBehaviorView`)
+inspects and runs bounded finite-state safety checks ([behavior verification](behavior-verification.md)).
+Each component separates **Current**, **Planned**, and
 **Difference**, with source paths, revisions, observation times, and coverage.
 
 Owners can edit the catalog, request a source refresh, and configure bounded
@@ -37,8 +39,10 @@ Hosts without the endpoint show upgrade guidance.
 
 ## Layout
 
-The main window is a sidebar beside one page. The sidebar starts with project
-search and **Home**, badged with the number of board rows that need input, then
+The main window is a sidebar beside one page. An active host or project halt
+displays a top **Halt** banner across routes (`HaltBanner`). The sidebar starts
+with project search, **Home** (badged with the number of board rows that need
+input, `⌘1`), **Understand**, and **Cost** (`CostView`, `⌘5`), then
 **Projects**: every project from `GET /api/project-groups` (see
 [missions](missions.md)), owner-created groups first with their repository
 count, then the implicit single-repository projects. A dot marks a project with
@@ -303,8 +307,12 @@ Resources include CPU, memory, swap, project filesystem capacity, network
 throughput, and available provider-process CPU/RSS. Process figures do not include
 an unverified descendant tree. Unavailable counters and the initial sample without
 a rate remain unavailable rather than zero. Inventory covers managed/discovered
-sessions, not every process or agent on the machine. GPU monitoring, inode
-reporting, and durable resource history are not established by this sampler.
+sessions, not every process or agent on the machine. The host resource sampler
+(`packages/host/src/desktop.ts`) reports per-project and host-volume inode counts
+(`totalInodes`, `availableInodes`), displayed by `infinite resources`; the Mac
+app's `ResourceView` currently displays byte capacity on `disks` and omits volume
+and inode rows. GPU monitoring and durable resource history are not established
+by this sampler.
 
 The app is optional. The separately installed [laptop CLI](cli.md) supports
 provider sessions, resource monitoring, lifecycle control, and workspace sync.

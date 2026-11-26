@@ -1,6 +1,6 @@
 # Managed tenants with operator confidentiality
 
-Status: accepted product direction, development foundation implemented. Confidential execution, client attestation, key release, encrypted relay, and live VM provisioning are not implemented. The development server now runs the owner-controlled single-tenant pilot; no multi-tenant VMs have been provisioned. See [single-tenant commissioning](../deploy/ubuntu/commissioning.md).
+Status: accepted product direction, development foundation implemented. Confidential execution, client attestation, user-controlled key release, an operator-attested multi-tenant relay with forward secrecy, and live VM provisioning are not implemented (a single-tenant application-encrypted blind relay is implemented; see [remote machines](remote-machines.md)). The development server now runs the owner-controlled single-tenant pilot; no multi-tenant VMs have been provisioned. See [single-tenant commissioning](../deploy/ubuntu/commissioning.md).
 
 ## Decisions
 
@@ -40,7 +40,7 @@ flowchart TB
   K -->|Release only after verification| D
 ```
 
-This diagram is the target, not the current transport. Today the browser/mobile clients send plaintext application messages over their configured HTTP/TLS connection to a single runner; ordinary TLS termination must not be moved into an operator-controlled relay and described as end-to-end encryption.
+This diagram is the confidential multi-tenant target, not the current trust boundary. Today, mobile and macOS clients exclusively use the single-tenant `@infinite/remote` pre-shared-key encrypted WebSocket channel (no forward secrecy; no hardware attestation), and the browser client uses same-origin HTTP/TLS against its local host and `@infinite/remote` for paired remote machines. Ordinary TLS termination must not be moved into an operator-controlled relay and described as attested end-to-end encryption.
 
 The operator plane can know account identifiers, tenant UUIDs, quota allocations, lifecycle status, billing, ciphertext sizes, network endpoints, and timing. It must never receive prompts, session titles, output, repository paths/content, provider keys, plaintext logs, backup keys, or recovery material. Avoid crash reports, analytics, push notification bodies, and support bundles containing these contents. Resource metadata itself is not anonymous.
 
@@ -74,7 +74,7 @@ Encrypted backups need authenticated tenant/volume identities, versioned manifes
 The current runnable foundation is deliberately smaller than the target:
 
 - Direct `single-tenant` execution still runs native agents without a tenant UUID, Proxmox, or attestation. It imposes no new context isolation on that one user's existing session collection.
-- `infinite plan-fleet FILE` emits a secret-free plan with a distinct KVM VM, disk owner, network identity, quotas, and runner deployment mode per tenant. It checks identity collisions and resource budgets, rejects secret-bearing unknown fields, and refuses private data on the current backend. It does not call Proxmox or install firewall rules.
+- `npm run host -- plan-fleet FILE` emits a secret-free plan with a distinct KVM VM, disk owner, network identity, quotas, and runner deployment mode per tenant. It checks identity collisions and resource budgets, rejects secret-bearing unknown fields, and refuses private data on the current backend. It does not call Proxmox or install firewall rules.
 - `tenant-development` initialization creates a separate runner with only the synthetic rehearsal provider. Its `/api/me` response explicitly reports `operatorConfidential: false`, no attestation, and a synthetic-only data policy.
 - Requesting `confidential` execution fails before initialization creates configuration or keys. No environment variable or configuration boolean can turn this development implementation into an attestation provider.
 - Two independent runner instances are integration-tested for cross-tenant key, session, context, recording, and steering rejection. These are application-boundary tests on the local machine, not proof of KVM, firewall, or hardware isolation.

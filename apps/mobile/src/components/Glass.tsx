@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Animated, Modal, Pressable, StyleSheet, Text, View, type StyleProp, type ViewStyle } from "react-native";
+import { Animated, Modal, Pressable, StyleSheet, Text, useWindowDimensions, View, type StyleProp, type ViewStyle } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { StatusKind } from "../status";
 import { theme } from "../theme";
@@ -64,6 +64,8 @@ export function Segmented<T extends string>({ options, value, onChange, style }:
 
 export function Sheet({ visible, onClose, title, children }: { visible: boolean; onClose: () => void; title: string; children: ReactNode }) {
   const insets = useSafeAreaInsets();
+  const { height } = useWindowDimensions();
+  const maxHeight = Math.max(240, height - insets.top - 16);
   const [{ rise, translateY }] = useState(() => {
     const value = new Animated.Value(0);
     return { rise: value, translateY: value.interpolate({ inputRange: [0, 1], outputRange: [420, 0] }) };
@@ -74,10 +76,10 @@ export function Sheet({ visible, onClose, title, children }: { visible: boolean;
   }, [visible, rise]);
   return <Modal visible={visible} transparent animationType="fade" statusBarTranslucent navigationBarTranslucent onRequestClose={onClose}>
     <Pressable accessibilityRole="button" accessibilityLabel="Close" style={s.scrim} onPress={onClose} />
-    <Animated.View accessibilityViewIsModal style={[s.sheet, { paddingBottom: Math.max(insets.bottom, 12) + 8, transform: [{ translateY }] }]}>
+    <Animated.View accessibilityViewIsModal style={[s.sheet, { maxHeight, paddingBottom: Math.max(insets.bottom, 12) + 8, transform: [{ translateY }] }]}>
       <View style={s.grabber} />
       <View style={s.sheetHead}>
-        <Text style={s.sheetTitle} accessibilityRole="header">{title}</Text>
+        <Text style={s.sheetTitle} numberOfLines={2} accessibilityRole="header">{title}</Text>
         <GlassButton glyph="close" label="Close" size={34} onPress={onClose} />
       </View>
       {children}
@@ -160,8 +162,8 @@ const s = StyleSheet.create({
   sheet: { position: "absolute", left: 8, right: 8, bottom: 8, borderRadius: theme.radius.sheet, backgroundColor: theme.colors.paper,
     paddingHorizontal: 12, paddingTop: 8, ...theme.lift },
   grabber: { alignSelf: "center", width: 38, height: 5, borderRadius: 3, backgroundColor: theme.colors.fieldRule, marginBottom: 6 },
-  sheetHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 8, paddingBottom: 6 },
-  sheetTitle: { fontSize: 17, fontWeight: "700", color: theme.colors.ink },
+  sheetHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingHorizontal: 8, paddingBottom: 6 },
+  sheetTitle: { fontSize: 17, fontWeight: "700", color: theme.colors.ink, flexShrink: 1 },
   sheetRow: { flexDirection: "row", alignItems: "center", gap: 12, minHeight: 52, paddingHorizontal: 10, borderRadius: theme.radius.card },
   sheetRowPressed: { backgroundColor: theme.colors.secondarySurface },
   sheetIcon: { width: 28, alignItems: "center" },

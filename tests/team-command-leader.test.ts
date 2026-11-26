@@ -435,24 +435,28 @@ test("a stop ends a group member that ignores SIGTERM whose leader obeys it: thr
   }
 });
 
-test("a prefixed command that ended with its group empty is sent no signal by a later stop", PREFIX_CASE, async () => {
-  const base = mkdtempSync(join(tmpdir(), "team-command-done-"));
-  const controller = new AbortController();
-  let leader: number | undefined;
-  const scope: CommandScope = { starting: () => undefined, started: pid => { leader = pid; } };
-  try {
-    const result = await commandScope.run(scope, () => teamOperationCommand({ command: "sh", args: ["-c", "exit 0"] }, base, controller.signal, 60_000, RELAY));
-    assert.equal(result.exitCode, 0);
-    await until("the prefix is reaped", () => gone(leader!));
-    const seen: number[] = [];
-    const kill = process.kill;
-    process.kill = ((pid: number, signal?: string | number) => { if (signal !== 0) seen.push(pid); return kill.call(process, pid, signal); }) as typeof process.kill;
+test("an anchor whose command ends by itself exits with its status and has started no sleeper, so nothing of it outlives the command", { ...PREFIX_CASE, skip: process.platform !== "linux" && "the anchor runs under dash on Linux" }, async () => {
+  const anchor = spawn("sh", ["-c", TEAM_ANCHOR, "sh", "3", "sh", "-c", "exit 5"], { detached: true, stdio: "ignore" });
+  const exit = await new Promise<number | null>(resolve => anchor.once("exit", code => resolve(code)));
+  assert.equal(exit, 5);
+  const left = execFileSync("ps", ["-e", "-o", "pgid=,args="], { encoding: "utf8" }).split("\n").filter(line => line.trim().startsWith(`${anchor.pid} `));
+  assert.deepEqual(left, [], "no process of the anchor's group remains");
+});
+
+test("a hangup, interrupt or quit sent to the anchor alone is handled like SIGTERM: the group gets SIGTERM and the anchor's KILL ends what ignores it", { ...PREFIX_CASE, skip: process.platform !== "linux" && "the anchor runs under dash on Linux" }, async () => {
+  for (const signal of ["SIGHUP", "SIGINT", "SIGQUIT"] as const) {
+    const base = mkdtempSync(join(tmpdir(), "team-command-hup-"));
+    const marker = join(base, "marker"), pidFile = join(base, "pid");
+    const anchor = spawn("sh", ["-c", TEAM_ANCHOR, "sh", "3", ...[endsOnTerm(marker, pidFile)].flatMap(command => [command.command, ...command.args])], { detached: true, stdio: "ignore" });
     try {
-      controller.abort();
-      await new Promise(resolve => setTimeout(resolve, 200));
-    } finally { process.kill = kill; }
-    assert.deepEqual(seen, [], "no signal was sent after the command ended");
-  } finally { rmSync(base, { recursive: true, force: true }); }
+      await until("the command writes its pid", () => pidIn(pidFile) !== undefined);
+      process.kill(anchor.pid!, signal);
+      await until(`the command got SIGTERM after ${signal}`, () => existsSync(marker) && readFileSync(marker, "utf8") === "SIGTERM");
+    } finally {
+      try { process.kill(-anchor.pid!, "SIGKILL"); } catch { }
+      rmSync(base, { recursive: true, force: true });
+    }
+  }
 });
 
 test("the anchor keeps the command's stdin and default SIGINT and SIGQUIT, passes its exit status, and a second SIGTERM starts no second sleeper", { ...PREFIX_CASE, skip: process.platform !== "linux" && "the anchor runs under dash on Linux" }, async () => {

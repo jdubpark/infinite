@@ -12,6 +12,7 @@ import { anchorDirectory, defaultMainCheckPorts, recordDirectory, recordScope } 
 import { checksDigest, type MainCheckRecord } from "../packages/host/src/main-check-state.js";
 import { bootId } from "../packages/host/src/process-census.js";
 import type { TeamCommand, TeamProject } from "../packages/host/src/team-types.js";
+import { TEAM_ANCHOR } from "../packages/host/src/group-supervisor.js";
 import { teamCommand } from "../packages/host/src/team-workspace.js";
 import type { Config } from "../packages/host/src/types.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
@@ -379,6 +380,32 @@ test("i. a check that leaves a real sleep behind passes when its leader exits; t
     assert.ok(lived >= 3_500, `the sleep ended ${lived} ms after it started, before its 4 seconds`);
     await sandbox.until("retirement", () => sandbox.view().retiring === 0, "alpha");
     assert.deepEqual(sandbox.runDirectories(), []);
+  } finally {
+    await sandbox.dispose();
+  }
+});
+
+const RELAY_PREFIX: TeamCommand = { command: process.execPath, args: ["-e", [
+  "const { spawn } = require('node:child_process');",
+  "const child = spawn(process.argv[1], process.argv.slice(2), { stdio: 'inherit', detached: true });",
+  "process.on('SIGTERM', () => child.kill('SIGTERM'));",
+  "child.on('exit', code => process.exit(code ?? 1));",
+].join("\n")] };
+
+test("n. under a command prefix the check's command runs behind the anchor, and a time-limit stop ends a member that ignores SIGTERM outside the host's reach; without a prefix the command runs as it is", CASE, async () => {
+  const sandbox = new Sandbox({ "tracked.txt": "one\n" }, own => [sh(`(trap '' TERM; echo $$ > '${own.pidFile}'; exec sleep 30) & wait`)]);
+  const seen: TeamCommand[] = [];
+  try {
+    sandbox.config.teams!.commandPrefix = RELAY_PREFIX;
+    const run: MainCheckPorts["run"] = (command, cwd, signal, _timeoutMs, prefix, input, extraEnv, forceSettleAfterMs, onOutput) => { seen.push(command); return teamCommand(command, cwd, signal, 1_500, prefix, input, extraEnv, forceSettleAfterMs, onOutput); };
+    await sandbox.start({ run });
+    sandbox.fetch();
+    await sandbox.until("the end of the check", () => sandbox.view().last !== undefined);
+    assert.equal(seen[0]?.command, "sh");
+    assert.equal(seen[0]?.args[1], TEAM_ANCHOR, "the command runs behind the anchor");
+    const pid = sandbox.pid();
+    assert.ok(pid !== undefined);
+    await sandbox.until("the member that ignores SIGTERM ended", () => gone(pid));
   } finally {
     await sandbox.dispose();
   }

@@ -7,7 +7,7 @@ import type { PendingOperation, Stored, TeamServiceOptions } from "./teams.js";
 export const COMMAND_STOP_STATEMENT_REASON = "The host stopped a configured team command but cannot confirm that it ended, and its process census cannot tell whether that command's processes still run. While the census cannot tell, the owner's statement is the only way out: after checking the host, run `infinite team processes-ended RUN_ID` (POST /api/teams/RUN_ID/processes-ended); Resume is accepted after that.";
 export const commandStopReasons = new Set([COMMAND_STOP_UNCONFIRMED_REASON, COMMAND_STOP_STATEMENT_REASON]);
 export const HALT_CENSUS_MS = 30_000;
-const ANCHOR_SETTLE_MS = STOP_GRACE_MS + 500;
+export const ANCHOR_SETTLE_MS = STOP_GRACE_MS + 2_000;
 
 export type OwnerStatement = { requestId: string; at: string; detail: string };
 export type TakenCensus = { at: string; operation?: { pendingId: string; result: CensusResult }; leftover?: { record: StoredLeftover; result: CensusResult } };

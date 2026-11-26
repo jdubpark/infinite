@@ -7,7 +7,8 @@ import type { MirrorFetch } from "./project-source.js";
 import { storageShortfall } from "./storage.js";
 import { CheckOutputScanner, unrecognisedTail } from "./team-check-output.js";
 import { DEFAULT_STORAGE_FLOOR, type TeamCommand, type TeamProject } from "./team-types.js";
-import { commandScope, TeamError, type CommandResult, type CommandScope } from "./team-workspace.js";
+import { teamAnchored } from "./group-supervisor.js";
+import { commandScope, STOP_GRACE_MS, TeamError, type CommandResult, type CommandScope } from "./team-workspace.js";
 import type { Config, Project } from "./types.js";
 
 export type { CheckSummary, MainCheckRecord, MainCheckResult, MainCheckView, MainCheckWaiting } from "./main-check-state.js";
@@ -506,7 +507,7 @@ export class MainCheckService {
       active.timers.limit = this.timer(() => this.stop(active, "time-limit"), timeoutMs);
       let result: CommandResult;
       try {
-        result = await this.ports.run(step.command, workspace, signal, timeoutMs, prefix, undefined, undefined, STOP_BOUND_MS, (chunk, stream) => scanner.push(chunk, stream));
+        result = await this.ports.run(prefix ? teamAnchored(step.command, STOP_GRACE_MS) : step.command, workspace, signal, timeoutMs, prefix, undefined, undefined, STOP_BOUND_MS, (chunk, stream) => scanner.push(chunk, stream));
       } catch (error) {
         return { outcome: "error", reason: codeOf(error) === "command-stop-unconfirmed" ? "stop-unconfirmed" : "command-unavailable" };
       } finally {

@@ -7,8 +7,9 @@ import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Manager } from "../packages/host/src/manager.js";
 import { newWitness, type CensusResult, type HostProcesses, type ProcessWitness } from "../packages/host/src/process-census.js";
+import { ANCHOR_SETTLE_MS } from "../packages/host/src/team-command-fence.js";
 import { handleTeamClientCommand } from "../packages/host/src/team-cli.js";
-import { COMMAND_STOP_UNCONFIRMED_REASON, STOP_GRACE_MS } from "../packages/host/src/team-workspace.js";
+import { COMMAND_STOP_UNCONFIRMED_REASON } from "../packages/host/src/team-workspace.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
@@ -191,10 +192,10 @@ test("under a prefix the watch of a stopped command takes its census after the a
     try {
       const internals = teams as unknown as { fence: { watch(stored: unknown): void }; records: Map<string, unknown> };
       internals.fence.watch(internals.records.get(f.run.id));
-      await delay(prefixed ? STOP_GRACE_MS - 1_000 : 500);
+      await delay(prefixed ? ANCHOR_SETTLE_MS - 1_000 : 500);
       assert.equal(seen.count, prefixed ? 0 : 1, prefixed ? "no census before the grace ended" : "a census at once");
       if (prefixed) {
-        await delay(2_000);
+        await delay(1_500);
         assert.equal(seen.count, 1, "the census follows the grace");
       }
     } finally { await close(f, teams); }

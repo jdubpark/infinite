@@ -1,9 +1,9 @@
-import type { AssessedState, ComposedState, GoalAssessment, GoalVerdictView, VerdictCounts } from "../../api/client";
+import type { AssessedState, ComposedState, GoalAssessment, VerdictCounts } from "../../api/client";
 import type { GoalCycle, GoalResult, ProductGoal } from "./model";
 
 export const ASSESSMENT_LABEL = "Agent assessment, provisional";
+export const REMOTE_CRITERIA_NOTE = "Per-criterion verdict details are unavailable over remote access. View them in the web client or with infinite goal verdicts.";
 export const ASSESSED_LABELS: Record<AssessedState, string> = { met: "Met", "not-met": "Not met", inconclusive: "Inconclusive" };
-export const PRODUCER_LABELS: Record<GoalVerdictView["criteria"][number]["label"], string> = { "host receipt": "Host receipt", "agent assessment": ASSESSMENT_LABEL, "waiting for you": "Waiting for you", "your rating": "Your rating" };
 export type AssessedGoal = Omit<ProductGoal, "cycles" | "outcomes"> & {
   stopReason?: "deadline" | "member-limit" | "provisional-met";
   cycles: (GoalCycle & { assessment?: GoalAssessment })[];

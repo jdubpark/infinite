@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { basename, dirname } from "node:path";
 import type { ProjectSource } from "./team-types.js";
 
@@ -14,16 +14,68 @@ export interface WorkspaceRepositoryBinding { companyId: string; repositoryId: s
 
 export type GitReader = (cwd: string, args: string[]) => string | undefined;
 
+export type GitCommandResult =
+  | { ok: true; stdout: string }
+  | { ok: false; status: number | null; stderr: string; errorCode?: string; signal?: string };
+
+export type GitResultReader = (cwd: string, args: string[]) => GitCommandResult;
+export type AsyncGitReader = (cwd: string, args: string[]) => Promise<string | undefined>;
+export type AsyncGitResultReader = (cwd: string, args: string[]) => Promise<GitCommandResult>;
+
 const READ_ONLY_GIT = ["-c", "safe.directory=*", "-c", "core.fsmonitor=false"];
 
-export const readGit: GitReader = (cwd, args) => {
+export const readGitResult: GitResultReader = (cwd, args) => {
   try {
-    return execFileSync("git", [...READ_ONLY_GIT, "-C", cwd, ...args], {
-      encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    const stdout = execFileSync("git", [...READ_ONLY_GIT, "-C", cwd, ...args], {
+      encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
     }).trim();
-  } catch {
-    return undefined;
+    return { ok: true, stdout };
+  } catch (error) {
+    const err = error as { status?: unknown; stderr?: unknown; code?: unknown; signal?: unknown };
+    const stderr = typeof err.stderr === "string"
+      ? err.stderr.trim()
+      : Buffer.isBuffer(err.stderr) ? err.stderr.toString("utf8").trim() : "";
+    return {
+      ok: false,
+      status: typeof err.status === "number" ? err.status : null,
+      stderr,
+      ...(typeof err.code === "string" ? { errorCode: err.code } : {}),
+      ...(typeof err.signal === "string" ? { signal: err.signal } : {}),
+    };
   }
+};
+
+export const readGitResultAsync: AsyncGitResultReader = (cwd, args) => new Promise(resolvePromise => {
+  execFile("git", [...READ_ONLY_GIT, "-C", cwd, ...args], {
+    encoding: "utf8", timeout: 5000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+  }, (error, stdout, stderr) => {
+    if (!error) {
+      resolvePromise({ ok: true, stdout: stdout.trim() });
+      return;
+    }
+    const err = error as { code?: unknown; signal?: unknown; killed?: unknown };
+    const killed = err.killed === true;
+    const status = !killed && typeof err.code === "number" ? err.code : null;
+    const errorCode = typeof err.code === "string" ? err.code : killed ? "ETIMEDOUT" : undefined;
+    const signal = typeof err.signal === "string" ? err.signal : undefined;
+    resolvePromise({
+      ok: false,
+      status,
+      stderr: typeof stderr === "string" ? stderr.trim() : "",
+      ...(errorCode !== undefined ? { errorCode } : {}),
+      ...(signal !== undefined ? { signal } : {}),
+    });
+  });
+});
+
+export const readGit: GitReader = (cwd, args) => {
+  const result = readGitResult(cwd, args);
+  return result.ok ? result.stdout : undefined;
+};
+
+export const readGitAsync: AsyncGitReader = async (cwd, args) => {
+  const result = await readGitResultAsync(cwd, args);
+  return result.ok ? result.stdout : undefined;
 };
 
 const GENERIC_FOLDERS = new Set(["codebase", "code", "src", "repo", "app", "main", "worktree"]);
@@ -72,11 +124,25 @@ export function expectedIdentity(project: { id: string; path: string; source?: P
   return sourceIdentity(project, at) ?? captureIdentity(project, git, at);
 }
 
+export async function expectedIdentityAsync(project: { id: string; path: string; source?: ProjectSource }, git: AsyncGitReader, at = new Date().toISOString()): Promise<CheckoutIdentity | undefined> {
+  return sourceIdentity(project, at) ?? captureIdentityAsync(project, git, at);
+}
+
 export function captureIdentity(project: { id: string; path: string }, git: GitReader, at = new Date().toISOString()): CheckoutIdentity | undefined {
   const remote = git(project.path, ["config", "--get", "remote.origin.url"]);
   const normalized = remote ? normalizeRemote(remote) : undefined;
   if (normalized) return { projectId: project.id, key: normalized.key, repoName: normalized.repoName, capturedAt: at, from: "host-scan" };
   const roots = git(project.path, ["rev-list", "--max-parents=0", "HEAD"]);
+  const root = roots?.split(/\s+/).map(line => line.trim()).filter(line => /^[0-9a-f]{4,64}$/i.test(line)).sort()[0];
+  if (!root) return undefined;
+  return { projectId: project.id, key: `root:${root.toLowerCase()}`, repoName: repoNameFromPath(project.path), capturedAt: at, from: "host-scan" };
+}
+
+export async function captureIdentityAsync(project: { id: string; path: string }, git: AsyncGitReader, at = new Date().toISOString()): Promise<CheckoutIdentity | undefined> {
+  const remote = await git(project.path, ["config", "--get", "remote.origin.url"]);
+  const normalized = remote ? normalizeRemote(remote) : undefined;
+  if (normalized) return { projectId: project.id, key: normalized.key, repoName: normalized.repoName, capturedAt: at, from: "host-scan" };
+  const roots = await git(project.path, ["rev-list", "--max-parents=0", "HEAD"]);
   const root = roots?.split(/\s+/).map(line => line.trim()).filter(line => /^[0-9a-f]{4,64}$/i.test(line)).sort()[0];
   if (!root) return undefined;
   return { projectId: project.id, key: `root:${root.toLowerCase()}`, repoName: repoNameFromPath(project.path), capturedAt: at, from: "host-scan" };

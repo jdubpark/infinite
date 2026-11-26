@@ -550,10 +550,12 @@ test("a cmux session in the project holds a workspace sync, and cmux starts are 
   const laptop = join(f.root, "laptop"), storeDir = join(f.root, "laptop-store");
   mkdirSync(laptop); writeFileSync(join(laptop, "a.txt"), "laptop\n");
   const manifest = await captureWorkspace({ roots: [laptop], cwd: laptop, storeDir });
-  const { generation } = (await fetchApi("/projects/project/sync/begin", "owner", {})).body;
-  for (const hash of (await fetchApi("/projects/project/sync/has", "owner", { hashes: [...new Set(manifest.entries.flatMap(e => e.chunks ?? []))] })).body.missing)
-    await fetch(`${origin}/api/projects/project/sync/blob/${hash}`, { method: "PUT", headers: { Authorization: `Bearer ${owner}`, "Content-Type": "application/octet-stream" }, body: Buffer.from(await readWorkspaceBlob(storeDir, hash), "base64") });
-  const commit = await fetchApi("/projects/project/sync/commit", "owner", { generation, manifest });
+  const publisher = { "X-Infinite-Sync-Publisher": randomUUID() };
+  const { generation } = (await fetchApi("/projects/project/sync/begin", "owner", {}, publisher)).body;
+  const syncHeaders = { ...publisher, "X-Infinite-Sync-Generation": generation };
+  for (const hash of (await fetchApi("/projects/project/sync/has", "owner", { hashes: [...new Set(manifest.entries.flatMap(e => e.chunks ?? []))] }, syncHeaders)).body.missing)
+    await fetch(`${origin}/api/projects/project/sync/blob/${hash}`, { method: "PUT", headers: { Authorization: `Bearer ${owner}`, "Content-Type": "application/octet-stream", ...syncHeaders }, body: Buffer.from(await readWorkspaceBlob(storeDir, hash), "base64") });
+  const commit = await fetchApi("/projects/project/sync/commit", "owner", { generation, manifest }, syncHeaders);
   assert.equal(commit.body.pendingGeneration?.reason, "session-running", "the cmux session runs in the project directory");
   assert.equal(existsSync(join(f.cwd, "a.txt")), false);
 

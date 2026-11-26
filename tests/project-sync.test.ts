@@ -7,7 +7,8 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { execFileSync } from "node:child_process";
 import { createServer, type Server } from "node:net";
 import { ProjectSync, ProjectSyncError, type SyncWriter } from "../packages/host/src/project-sync.js";
-import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
+import { writeSealed } from "../packages/host/src/vault.js";
+import { captureWorkspace, encodeChunkBatch, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
 import { hashToken } from "../packages/host/src/config.js";
 import type { Config } from "../packages/host/src/types.js";
 
@@ -287,22 +288,46 @@ test("competing publishers cannot replace a live generation and foreign commits 
     assert.equal((await f.sync.begin("example", testWriter)).generation, generation, "the same identified publisher resumes its upload token");
     await assert.rejects(f.sync.begin("example", otherWriter), (error: ProjectSyncError) => error.code === "sync-in-progress");
     await assert.rejects(f.sync.commit("example", generation, manifest, idle, otherWriter), (error: ProjectSyncError) => error.code === "stale-generation");
-    await assert.rejects(f.sync.commit("example", generation, manifest, idle, { deviceId: testWriter.deviceId }), (error: ProjectSyncError) => error.code === "stale-generation");
+    await assert.rejects(f.sync.commit("example", generation, manifest, idle, { deviceId: "other-device", publisherId: testWriter.publisherId }), (error: ProjectSyncError) => error.code === "stale-generation");
     await assert.rejects(f.sync.commit("example", generation, manifest, idle, testWriter), (error: ProjectSyncError) => error.code === "missing-content");
     assert.throws(() => f.sync.status("nope"), (error: ProjectSyncError) => error.code === "unknown-project");
-    await assert.rejects(f.sync.missing("nope", []), (error: ProjectSyncError) => error.code === "unknown-project");
+    await assert.rejects(f.sync.missing("nope", [], testWriter, randomUUID()), (error: ProjectSyncError) => error.code === "unknown-project");
     await assert.rejects(f.sync.readBlob("nope", "0".repeat(64)), (error: ProjectSyncError) => error.code === "unknown-project");
     assert.equal(existsSync(join(f.config.stateDir, "projects", "nope")), false, "unknown projects leave no state behind");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test("headerless legacy publishers conflict while active and only the exact generation can commit", async () => {
+test("missing or invalid publisher and generation identities are refused with 400 and legacy leases are cleared on startup", async () => {
   const f = fixture();
   try {
-    const legacy = { deviceId: "paired-owner" }, unknown = { deviceId: "paired-owner" };
-    const { generation } = await f.sync.begin("example", legacy);
-    await assert.rejects(f.sync.begin("example", unknown), (error: ProjectSyncError) => error.code === "sync-in-progress");
-    await assert.rejects(f.sync.commit("example", randomUUID(), {}, idle, legacy), (error: ProjectSyncError) => error.code === "stale-generation");
+    const invalidHeaders = (error: ProjectSyncError) => error instanceof ProjectSyncError && error.status === 400 && error.code === "invalid-sync-headers";
+    const missingPublisher = { deviceId: "paired-owner" } as unknown as SyncWriter;
+    const badPublisher: SyncWriter = { deviceId: "paired-owner", publisherId: "not-a-uuid" };
+    const { generation } = await f.sync.begin("example", testWriter);
+    const bytes = Buffer.from("chunk\n"), hash = "0".repeat(64), batch = encodeChunkBatch([{ hash, bytes }]);
+
+    await assert.rejects(f.sync.begin("example", missingPublisher), invalidHeaders);
+    await assert.rejects(f.sync.begin("example", badPublisher), invalidHeaders);
+    for (const writer of [missingPublisher, badPublisher]) {
+      await assert.rejects(f.sync.missing("example", [], writer, generation), invalidHeaders);
+      await assert.rejects(f.sync.putBlob("example", hash, bytes, writer, generation), invalidHeaders);
+      await assert.rejects(f.sync.putBlobs("example", batch, writer, generation), invalidHeaders);
+      await assert.rejects(f.sync.commit("example", generation, {}, idle, writer), invalidHeaders);
+    }
+    for (const badGeneration of ["", "not-a-uuid", undefined as unknown as string]) {
+      await assert.rejects(f.sync.missing("example", [], testWriter, badGeneration), invalidHeaders);
+      await assert.rejects(f.sync.putBlob("example", hash, bytes, testWriter, badGeneration), invalidHeaders);
+      await assert.rejects(f.sync.putBlobs("example", batch, testWriter, badGeneration), invalidHeaders);
+      await assert.rejects(f.sync.commit("example", badGeneration, {}, idle, testWriter), invalidHeaders);
+    }
+    assert.equal((await f.sync.begin("example", testWriter)).generation, generation, "rejected requests keep the active lease intact");
+
+    writeSealed(join(f.config.stateDir, "projects", "example", "sync", "upload-lease.sealed"), f.key, "project-sync:example:upload-lease", {
+      generation: randomUUID(), writer: { deviceId: "paired-owner" }, updatedAt: new Date().toISOString(), committing: false,
+    });
+    const restarted = new ProjectSync(f.config, f.key);
+    const fresh = await restarted.begin("example", { deviceId: "paired-owner", publisherId: randomUUID() });
+    assert.match(fresh.generation, /^[0-9a-f-]{36}$/, "a legacy headerless lease on disk is discarded during recovery");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 

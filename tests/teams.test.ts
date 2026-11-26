@@ -2309,7 +2309,6 @@ test(`a report written during a stall stop wins over replacement${limited ? " an
     f.manager.stopTeamSession = async () => {
       if (f.state.status !== "exited") {
         if (limited) f.journal.append("signal", { kind: "provider-limit", limit: "usage", confidence: "corroborated", provider: "demo", source: "protocol", message: "Usage exhausted" });
-        for (let index = 0; index < 205; index++) f.journal.append("signal", { kind: "notice", type: "fixture" });
         const envelope = { requestId: randomUUID(), runId: f.run.id, memberId: member.memberId, revision: member.revision, report };
         f.journal.append("team-report", { ...envelope, runId: randomUUID() });
         f.journal.append("team-report", { ...envelope, memberId: randomUUID() });

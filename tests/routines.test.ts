@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { afterEach, beforeEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -47,7 +47,9 @@ function setup(overrides: { busy?: (id: string) => Promise<boolean>; launch?: (r
   return { root, config, key, goals, launched, createService, create };
 }
 const action = (revision: number) => ({ requestId: randomUUID(), revision });
-const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const wait = (ms: number) => mock.timers.tick(ms);
+beforeEach(() => mock.timers.enable({ apis: ["Date"], now: Date.now() }));
+afterEach(() => mock.timers.reset());
 
 test("routine launch intent survives restart and replays the same goal request after an uncertain acknowledgement", async () => {
   const f = setup();

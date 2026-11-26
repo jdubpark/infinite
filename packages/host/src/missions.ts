@@ -40,7 +40,7 @@ type Attempt = { memberId: string; sessionId: string; revision: number; prompt: 
   stopping?: true;
   continuation?: NativeContinuation;
   nativeConfirmed?: boolean;
-  resumeFailed?: boolean;
+  resumeFailed?: boolean; deliveryUncertain?: boolean;
   consumedInbox?: MissionMessage[];
   consumedNotes?: MissionMessage[];
   ownerInputs?: number;
@@ -1056,7 +1056,7 @@ export class MissionService {
     endAttempt(attempt);
     const applied = Boolean(attempt.report) && live.has(mission.status);
     if (attempt.report) {
-      if (applied) { delete stored.deliveredUnapplied; this.keepNote(stored, attempt); this.consume(stored, attempt.report!, attempt); }
+      if (applied) { this.keepNote(stored, attempt); this.consume(stored, attempt.report!, attempt); }
       else this.event(stored, "A coordinator report arrived after the mission stopped; it was not applied.");
       delete attempt.note;
     } else if (attempt.missedReport && live.has(mission.status) && !attempt.stopping)
@@ -1091,8 +1091,8 @@ export class MissionService {
     if (profile.provider === "claude") {
       for (let index = stored.attempts.length - 1; index >= 0; index--) {
         const previous = stored.attempts[index], nativeSessionId = previous.continuation?.nativeSessionId;
-        const failedLater = (id: string) => stored.attempts.slice(index + 1).some(attempt => attempt.resumeFailed && attempt.continuation?.nativeSessionId === id);
-        if (previous.nativeConfirmed && nativeSessionId && !failedLater(nativeSessionId)) { continuation = { mode: "resume", nativeSessionId }; break; }
+        const retired = (id: string) => stored.attempts.slice(index).some(attempt => (attempt.resumeFailed || attempt.deliveryUncertain) && attempt.continuation?.nativeSessionId === id);
+        if (previous.nativeConfirmed && nativeSessionId && !retired(nativeSessionId)) { continuation = { mode: "resume", nativeSessionId }; break; }
         if (previous.rotated) break;
       }
       rotated = continuation && this.rotation(stored, continuation.nativeSessionId);
@@ -1388,12 +1388,13 @@ export class MissionService {
           const reason = `A subteam's bounded recovery is still in progress. Reassess the mission blocker after it finishes. Your deferred report was: ${report.summary}`;
           this.event(stored, `The coordinator's blocked report was deferred: ${reason}`);
           stored.notes.push({ type: "refused", kind: report.kind, reason });
-          break;
+          stored.refusals = 0; this.settle(stored); return;
         }
         this.stop(stored, "blocked", report.summary);
         this.event(stored, "The coordinator reported that the mission is blocked.");
         break;
     }
+    delete stored.deliveredUnapplied;
     if (report.kind !== "steer-subtask") stored.refusals = 0;
     this.settle(stored);
   }

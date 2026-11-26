@@ -30,13 +30,14 @@ export function matchLandings(commits: readonly ScanCommit[], candidates: readon
     const base = candidate.base === undefined ? undefined : positions.get(candidate.base);
     return base === undefined ? !older : position > base;
   };
+  const headOf = (candidate: LandingCandidate) => (candidate.reviewedHead === undefined ? {} : { reviewedHead: candidate.reviewedHead });
   commits.forEach((commit, position) => {
     for (const candidate of candidates) {
       if (landed.has(candidate.runId)) continue;
       if (candidate.base !== undefined && candidate.reviewedHead === candidate.base) continue;
       if (candidate.mergeCommit !== undefined && commit.id === candidate.mergeCommit) {
         landed.add(candidate.runId);
-        landings.push({ runId: candidate.runId, commit: commit.id, method: "merge-commit", position });
+        landings.push({ runId: candidate.runId, commit: commit.id, method: "merge-commit", position, ...headOf(candidate) });
       } else if (candidate.reviewedHead !== undefined && commit.parents[1] === candidate.reviewedHead) {
         landed.add(candidate.runId);
         landings.push({
@@ -48,7 +49,7 @@ export function matchLandings(commits: readonly ScanCommit[], candidates: readon
         });
       } else if (candidate.reviewedTree !== undefined && commit.tree === candidate.reviewedTree && afterBase(candidate, commit, position)) {
         landed.add(candidate.runId);
-        landings.push({ runId: candidate.runId, commit: commit.id, method: "tree-equal", position });
+        landings.push({ runId: candidate.runId, commit: commit.id, method: "tree-equal", position, ...headOf(candidate) });
       }
     }
   });

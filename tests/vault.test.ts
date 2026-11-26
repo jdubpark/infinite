@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { closeSync, fstatSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, fstatSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Event } from "../packages/host/src/types.js";
@@ -540,4 +540,19 @@ test("seeded durable-state journal simulator enforces invariants across batches,
     assert.equal(caught.invariant, invariant, `mutant ${mutant} failed wrong invariant: ${caught.message}`);
     t.diagnostic(`mutant ${mutant} caught by ${caught.invariant}: ${caught.message}`);
   }
+});
+
+test("a batch that fails in its second segment leaves the first segment readable and refuses every later append", () => {
+  const directory = mkdtempSync(join(tmpdir(), "inf-vault-"));
+  const key = randomBytes(32);
+  const journal = new Journal(directory, key, "latch");
+  journal.appendAll("output", Array.from({ length: 250 }, (_, index) => ({ text: String(index) })));
+  mkdirSync(join(directory, "0000000001.journal"));
+  assert.throws(() => journal.appendAll("output", Array.from({ length: 20 }, () => ({ text: "x" }))), { code: "EISDIR" });
+  assert.equal(journal.seq, 256);
+  rmdirSync(join(directory, "0000000001.journal"));
+  assert.throws(() => journal.append("output", { text: "later" }), /Journal closed/);
+  assert.equal(journal.seq, 256);
+  const events = readEvents(directory, key, "latch", 0, 1000).events;
+  assert.deepEqual(events.map(event => event.seq), Array.from({ length: 256 }, (_, index) => index + 1));
 });

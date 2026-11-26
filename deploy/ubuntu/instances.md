@@ -700,11 +700,17 @@ app and the owner's account, including `intake.slack.linearAgentUserId` for
 Linear's Slack agent. The intake binding must post only into the issue's
 recorded Slack thread.
 
-For an organization-isolated instance, set `intake.slack.organizationScope`
-and populate its `channelIds` array only with channels the owner has bound to
+Every Slack-enabled instance must set `intake.slack.organizationScope` with a
+nonempty `workspaces` list. This is required for all Slack intake, not only
+organization-isolated instances; there is no unscoped compatibility mode. A
+configuration with a Slack block but no workspace pins is refused. To run
+Linear-only intake, remove the Slack block; `/api/intake/workspace-scope` then
+reports `unconfigured`.
+
+Set `channelIds` only when the owner wants an additional channel allowlist for
 this instance, its repositories and the people allowed to see their results.
 An empty array denies every channel. Omitting `channelIds` from the object
-applies the metadata check to every otherwise eligible channel. The host uses
+allows every otherwise verified internal channel. The host uses
 `conversations.info` to check membership and a single workspace, and rejects
 shared channels, pending shares and DMs. A workspace match can still include
 guests or other audiences. Record the owner's audience decision separately.
@@ -715,7 +721,7 @@ Set `organizationScope.workspaces` to the exact checkouts in the intake
 mission's group. Each entry names a `projectId`, its canonical absolute
 `path`, and its GitHub `repository` as `owner/repo`. For a local answer
 workspace, set `repository` to `null` and supply its Git `rootCommit`.
-Missing workspace pins keep scoped intake closed. Check the live checkout
+Missing workspace pins keep Slack intake closed. Check the live checkout
 against its source before enrolling it. A host-managed GitHub checkout
 without a remote needs a HEAD matching its recorded applied commit.
 Review the pins when a group gains a checkout, a repository changes, or a
@@ -726,13 +732,16 @@ Slack independently checks channel membership and sharing before delivery.
 
 Grant the bot `channels:read` for public channel metadata and `groups:read`
 for private channel metadata. Have a workspace administrator reinstall the
-app to grant the added scopes on an existing installation. If the owner explicitly
-asks to keep existing intake running, retain its existing configuration and
-approved use while the grant is pending. Before admitting private work, use
+app to grant the added scopes on an existing installation. Before admitting private work, use
 an owner-approved test item to check the intended channel, repository and
 reply destination. Confirm an unbound channel creates no work or reply.
 [Slack method scopes](https://docs.slack.dev/reference/methods/conversations.info/)
 and [Slack app reinstallation](https://docs.slack.dev/app-management/distribution/)
+
+On a Slack-enabled host, both ends of a cross-project context link must be
+pinned; excluded links contribute no text or relationship to new sessions,
+including between two unlisted projects because no common enrollment is
+proven. Hosts without Slack continue explicit owner-granted links.
 
 Set `intake.slack.directRequests` to `true` to let the owner's mention of the
 bot file the Linear issue and start the mission. The first test issue through

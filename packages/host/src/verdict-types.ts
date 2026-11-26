@@ -26,6 +26,8 @@ export const VERDICT_LIMITS = { criteria: CRITERIA_ROWS_MAX, handles: 8, handleC
 const L = VERDICT_LIMITS;
 const byteLength = (value: string): number => Buffer.byteLength(value, "utf8");
 
+export type DeliveryFact = "none" | "landed" | "reverted";
+
 export const verdictReportSchema = z.object({
   kind: z.literal("verdict"),
   result: z.enum(ASSESSED_STATES),

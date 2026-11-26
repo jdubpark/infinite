@@ -10,12 +10,12 @@ import type { TeamRegister } from "./team-register.js";
 import { memberLimit } from "./team-types.js";
 import type { TeamCommand, TeamMember, TeamModelProfile, TeamReport, TeamRun } from "./team-types.js";
 import { assertMemberReadOnly } from "./team-workspace.js";
-import { composeVerdict, verdictRecord } from "./verdict-compose.js";
+import { composeVerdict, deliveryReceiptOf, verdictRecord } from "./verdict-compose.js";
 import type { ComposedCriterion, ComposedVerdict } from "./verdict-compose.js";
 import { evaluatorPrompt, finalCheckRound, verdictContext } from "./verdict-prompt.js";
 import type { VerdictContext } from "./verdict-prompt.js";
 import type { VerdictEventData } from "./verdict-store.js";
-import type { AssessedState, RunAssessment, VerdictCounts, VerdictReason, VerdictReport } from "./verdict-types.js";
+import type { AssessedState, DeliveryFact, RunAssessment, VerdictCounts, VerdictReason, VerdictReport } from "./verdict-types.js";
 import type { Provider } from "./types.js";
 
 export { verdictPin } from "./evaluator-profiles.js";
@@ -42,6 +42,8 @@ export type VerdictState = {
   heldMemberId?: string;
   choice?: { profileId: string; provider: Provider; model?: string; family: string; sharedFamily: boolean; alsoReviewed: boolean };
   report?: VerdictReport; composed?: ComposedVerdict; reason?: VerdictReason;
+  delivery?: "landed" | "reverted";
+  earlier?: string[];
   written?: "wrote" | "log-full" | "record-unavailable" | "write-failed";
   commit?: VerdictPendingCommit;
 };
@@ -50,10 +52,11 @@ export type VerdictHolder = { run: TeamRun; verdict?: VerdictState; objectiveRec
 
 export type VerdictHost = {
   holder(runId: string): VerdictHolder | undefined;
-  prepare(holder: VerdictHolder, onPrepared: (member: TeamMember) => void, prebuilt: { prompt: string; profile: TeamModelProfile }): void;
+  prepare(holder: VerdictHolder, onPrepared: (member: TeamMember) => void, prebuilt: { prompt: string; profile: TeamModelProfile }, onFailed: () => void): void;
   consume(holder: VerdictHolder, member: TeamMember): void;
   operation(holder: VerdictHolder, perform: (signal: AbortSignal) => Promise<boolean | undefined>, complete: (clean: boolean | undefined) => void, member: TeamMember): void;
   save(holder: VerdictHolder): void;
+  delivery(runId: string, head: string, since: string): DeliveryFact | undefined;
   event(holder: VerdictHolder, text: string): void;
   emit(holder: VerdictHolder, data: VerdictEventData): void;
   configured(run: TeamRun): readonly TeamCommand[];
@@ -65,6 +68,7 @@ export type VerdictHost = {
 };
 
 export const VERDICT_EVENTS = {
+  delivery: "The host observed this run's delivery on the base branch and composed the agent assessment again.",
   held: "The host is assessing this revision against the objective record before it settles.",
   recorded: (result: AssessedState, counts: VerdictCounts) =>
     `Agent assessment, provisional: ${result}. ${counts.met} met, ${counts.notMet} not met, ${counts.inconclusive} inconclusive, ${counts.pendingOwner} waiting for the owner.`,
@@ -87,6 +91,8 @@ export type VerdictDetail = {
 };
 
 export const VERDICT_TESTING_WAIT_MS = 300_000;
+const DELIVERY_ORDER: readonly DeliveryFact[] = ["none", "landed", "reverted"];
+const heldIds = (state: VerdictState): Set<string> => new Set(state.composed?.criteria.map(item => item.id));
 const STOPPED: readonly TeamRun["status"][] = ["paused", "cancelled", "blocked"];
 const EVENT_PROVIDERS: readonly Provider[] = ["claude", "codex", "opencode"];
 
@@ -185,6 +191,32 @@ export class TeamVerdicts {
     if (!state) return this.startReviewed(holder);
     if (state.kind !== "reviewed" || state.status === "done") return false;
     this.advance(holder, state);
+    return true;
+  }
+
+  settleReceipt(holder: VerdictHolder): boolean {
+    const run = holder.run;
+    const state = holder.verdict;
+    if (run.verdicts !== "on" || (run.status !== "merged" && run.status !== "ready-for-review")) return false;
+    if (state?.status === "recording") return this.recover(holder);
+    if (state === undefined || state.status !== "done" || state.kind !== "reviewed" || !this.current(run, state) || state.since === undefined || state.reason === "record-unavailable") return false;
+    const assessment = run.assessment;
+    if (assessment === undefined || assessment.revision !== state.revision || assessment.head !== state.head) return false;
+    if (state.verdictId === assessment.verdictId) {
+      if (state.delivery === undefined && !state.composed?.criteria.some(item => item.reason === "before-delivery")) return false;
+      const fact = this.host.delivery(run.id, state.head, state.since);
+      if (fact === undefined || fact === "none" || fact === state.delivery) return false;
+      const held = heldIds(state);
+      const kinds = this.readyRecord(holder)?.criteria.filter(item => item.state === "active" && held.has(item.id)).map(deliveryReceiptOf);
+      if (!kinds?.some(kind => kind !== undefined)) return false;
+      const wanted = fact === "reverted" && !kinds.includes("landed") ? "landed" : fact;
+      if (DELIVERY_ORDER.indexOf(wanted) <= DELIVERY_ORDER.indexOf(state.delivery ?? "none")) return false;
+      state.delivery = wanted;
+      state.earlier = [...(state.earlier ?? []), state.verdictId];
+      state.verdictId = this.host.uuid();
+      this.host.save(holder);
+    } else if (!this.readyRecord(holder)) return false;
+    this.finish(holder, state, state.reason === undefined ? state.report : undefined, state.reason);
     return true;
   }
 
@@ -405,7 +437,11 @@ export class TeamVerdicts {
     this.host.prepare(holder, member => {
       const live = holder.verdict;
       if (live?.verdictId === verdictId && live.status === "evaluating") live.evaluatorMemberId = member.memberId;
-    }, { prompt: evaluatorPrompt(profile.provider, profile), profile });
+    }, { prompt: evaluatorPrompt(profile.provider, profile), profile }, () => {
+      const live = holder.verdict;
+      if (STOPPED.includes(holder.run.status) || holder.run.recovery?.status === "stopping") return;
+      if (live?.verdictId === verdictId && live.status === "evaluating" && live.evaluatorMemberId === undefined) this.finish(holder, live, undefined, "evaluator-unavailable");
+    });
     this.host.save(holder);
   }
 
@@ -473,8 +509,9 @@ export class TeamVerdicts {
   }
 
   private composeFor(holder: VerdictHolder, state: VerdictState, record: ObjectiveRecord, report?: VerdictReport, reason?: VerdictReason): ComposedVerdict {
+    const held = state.earlier === undefined ? undefined : heldIds(state);
     return composeVerdict({
-      record, head: state.head, kind: state.kind, configured: this.host.configured(holder.run), receipts: this.receiptsOf(state),
+      record: held === undefined ? record : { ...record, criteria: record.criteria.filter(item => held.has(item.id)) }, head: state.head, kind: state.kind, configured: this.host.configured(holder.run), receipts: this.receiptsOf(state),
       facts: this.factsOf(holder, state), changedPaths: this.changeListOf(holder, state),
       ...(report === undefined ? {} : { report: this.judgedOnly(state, record, report) }), ...(reason === undefined ? {} : { reason }),
     });
@@ -578,6 +615,7 @@ export class TeamVerdicts {
     holder.run.assessment = this.assessmentOf(state, composed, at);
     if (emitted) this.host.emit(holder, this.rowOf(holder, state, composed, emitted.rubricVersion, emitted.version, this.applied(composed)));
     this.events(holder, composed, written);
+    if (state.earlier !== undefined) this.host.event(holder, VERDICT_EVENTS.delivery);
     state.status = state.kind === "no-change" ? "releasing" : "done";
     try { this.host.save(holder); }
     catch (error) {
@@ -616,7 +654,7 @@ export class TeamVerdicts {
     const existing = record.log.find(entry => entry.op === VERDICT_OPS.recorded && entry.handle === handle);
     if (existing) return { written: "wrote", version: existing.version };
     try {
-      const next = verdictRecord(record, composed, { verdictId: state.verdictId, kind: state.kind, revision: state.revision, head: state.head, at });
+      const next = verdictRecord(record, composed, { verdictId: state.verdictId, kind: state.kind, revision: state.revision, head: state.head, at, ...(state.earlier === undefined ? {} : { supersedes: state.earlier }) });
       if (next === "log-full") return { written: "log-full", version: record.version };
       writeHeldRecord(holder, this.goals, record, next);
       return { written: "wrote", version: next.version };
@@ -663,12 +701,13 @@ export class TeamVerdicts {
     };
   }
 
-  private factsOf(holder: VerdictHolder, state: VerdictState): { checksPassed?: boolean; reviewApproved?: boolean } {
+  private factsOf(holder: VerdictHolder, state: VerdictState): { checksPassed?: boolean; reviewApproved?: boolean; delivery?: DeliveryFact } {
     const source = state.kind === "reviewed" ? holder : this.host.holder(state.receiptsFrom);
-    if (!source) return {};
+    const delivery = state.delivery === undefined ? {} : { delivery: state.delivery };
+    if (!source) return delivery;
     const passed = checksPassed(source, state.head);
     const approved = reviewApproved(source.run, state.head);
-    return { ...(passed === undefined ? {} : { checksPassed: passed }), ...(approved === undefined ? {} : { reviewApproved: approved }) };
+    return { ...delivery, ...(passed === undefined ? {} : { checksPassed: passed }), ...(approved === undefined ? {} : { reviewApproved: approved }) };
   }
 
   private changeListOf(holder: VerdictHolder, state: VerdictState): { paths: string[]; truncated: boolean } {

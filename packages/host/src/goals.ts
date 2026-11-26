@@ -22,7 +22,7 @@ import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, folde
 import { KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import { correctionGate, digestEvent, correctGoalObjective, createGoalObjective, goalObjectiveNote, goalObjectiveView, goalRecordDigest, goalRecordPort, loadGoalObjective, ratingStamp, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
 import { objectivePromptsOn, objectiveRegisterOn } from "./objective-digest.js";
-import { answerProvisional, assertVerdictAnswer, continueGoal, criteriaRowsFor, cycleVerdict, provisionalStop, verdictFailed, CONTINUE_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "./goal-verdicts.js";
+import { answerProvisional, applyLateVerdict, assertVerdictAnswer, continueGoal, criteriaRowsFor, cycleVerdict, deliveryHold, holdReasonChange, lateVerdict, markProvisional, owedStop, provisionalStop, verdictFailed, withdrawProvisional, CONTINUE_EVENT, DELIVERY_HOLD_REASON, LATE_RECEIPT_EVENT, PROVISIONAL_EVENT } from "./goal-verdicts.js";
 import { correctionSchema, type CriterionInput } from "./objective-input.js";
 import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
 import { goalMetricsRead, pruneMetrics, settleMetrics } from "./goal-metrics.js";
@@ -577,7 +577,9 @@ export class GoalService {
   }
   private refresh(stored: Stored, team: TeamView) {
     const cycle = stored.goal.cycles.find(value => value.teamId === team.id)!;
+    const late = lateVerdict(stored.goal, cycle, team) !== undefined;
     Object.assign(cycle, { status: team.status, memberCount: team.members.length, baseCommit: team.baseCommit, headCommit: team.headCommit, branch: team.branch, workspace: team.workspace, brief: team.brief, reason: team.reason }, cycleVerdict(stored.goal, cycle, team));
+    if (late) { withdrawProvisional(stored.goal, cycle); this.event(stored, LATE_RECEIPT_EVENT); }
     if (team.usage.total.messages > 0 || team.usage.unmeasuredMembers === 0) cycle.usage = cycleUsageSnapshot(team.usage);
     else delete cycle.usage;
     if (["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status)) cycle.finishedAt ??= now();
@@ -779,10 +781,11 @@ export class GoalService {
             goal.status = goal.cycles.some(cycle => ["ready-for-review", "merged"].includes(cycle.status)) ? "ready-for-review" : "no-opportunity";
             goal.reason = team.reason ?? "The coordinator found no further work justified by the available evidence.";
           } else {
-            const stop = provisionalStop(goal, team);
-            goal.status = stop ? "ready-for-review" : "running"; goal.reason = stop ? PROVISIONAL_REASON : undefined;
-            if (stop) goal.stopReason = "provisional-met";
-            this.event(stored, stop ? PROVISIONAL_EVENT : "A feature passed checks and independent review. The next feature will use its recorded commit.");
+            if (provisionalStop(goal, team)) this.stopProvisional(stored);
+            else {
+              goal.status = "running"; goal.reason = undefined;
+              this.event(stored, "A feature passed checks and independent review. The next feature will use its recorded commit.");
+            }
           }
         }
       } else if (["running", "needs-input"].includes(goal.status)) {
@@ -826,6 +829,9 @@ export class GoalService {
       this.setControl(stored, "cancel"); this.event(stored, goal.reason); this.save(stored); await this.applyControl(stored); return;
     }
     if (goal.activeTeamId) return;
+    this.lateReceipt(stored, goal.cycles.at(-1));
+    if (owedStop(goal, Boolean(stored.launch || stored.control))) { this.stopProvisional(stored); this.save(stored); return; }
+    if (this.holdForDelivery(stored)) return;
     if (goal.cycles.length >= (goal.maxRuns ?? 0)) {
       goal.status = "ready-for-review"; goal.reason = "The approved feature-run limit has been reached. Review the accumulated changes; product impact has not been inferred.";
       this.event(stored, goal.reason); this.save(stored); return;
@@ -893,6 +899,34 @@ export class GoalService {
     const reason = trackingHoldReason(stored.goal.linear);
     if (stored.goal.reason === reason) return;
     stored.goal.reason = reason; this.save(stored);
+  }
+  private stopProvisional(stored: Stored) {
+    markProvisional(stored.goal);
+    this.event(stored, PROVISIONAL_EVENT);
+  }
+  private lateReceipt(stored: Stored, cycle: GoalCycle | undefined): void {
+    const team = cycle === undefined ? undefined : this.teams.assessmentOf?.(cycle.teamId);
+    if (cycle === undefined || team === undefined || !applyLateVerdict(stored.goal, cycle, team)) return;
+    this.event(stored, LATE_RECEIPT_EVENT);
+    this.save(stored);
+  }
+  async syncReceipts(): Promise<void> {
+    if (this.closed) return;
+    await mapConcurrent([...this.records.keys()], 8, id => this.enqueue(id, () => {
+      const stored = this.records.get(id);
+      if (!stored || this.closed) return;
+      try { for (const cycle of stored.goal.cycles) if (cycle.assessment !== undefined) this.lateReceipt(stored, cycle); } catch {}
+    }));
+  }
+  private holdForDelivery(stored: Stored): boolean {
+    const goal = stored.goal, cycle = goal.cycles.at(-1);
+    const scanned = this.config.projects.find(item => item.id === goal.projectId)?.source?.mode === "github";
+    const detail = cycle?.assessment === undefined ? undefined : this.teams.verdicts?.detail(cycle.teamId);
+    const holds = deliveryHold(goal, { nowMs: Date.now(), scanned, detail });
+    const change = holdReasonChange(goal, holds);
+    if (change === "hold") this.event(stored, DELIVERY_HOLD_REASON);
+    if (change !== undefined) this.save(stored);
+    return holds;
   }
   private runCreated(requestId: string) { return this.teams.goalIdOf(requestId) !== undefined; }
   private withdrawLaunch(stored: Stored) {

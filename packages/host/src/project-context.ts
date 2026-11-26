@@ -15,13 +15,15 @@ export interface ContextSource { projectId: string; version: number; relationshi
 export class ProjectContexts {
   constructor(private readonly config: Pick<Config, "stateDir" | "projects" | "intake">, private readonly key: Buffer) {}
 
-  private linkAllowed(source: string, target: string): boolean {
+  private linkAllowed(source: string, target: string, savedTargetRoot?: string): boolean {
     const slack = this.config.intake?.slack;
     if (!slack) return true;
     const pins = slack.organizationScope?.workspaces;
     return [source, target].every(id => {
       const pin = pins?.find(p => p.projectId === id);
-      return pin !== undefined && this.config.projects.some(p => p.id === id && p.path === pin.path);
+      if (!pin || this.config.projects.find(p => p.id === id)?.path !== pin.path) return false;
+      if (id === target && savedTargetRoot !== undefined && savedTargetRoot !== pin.path) return false;
+      try { return this.root(id) === pin.path; } catch { return false; }
     });
   }
 
@@ -62,7 +64,7 @@ export class ProjectContexts {
     const links = storedLinks.parse(unseal(this.key, `context-links:${id}`, readFileSync(file, "utf8")));
     return {
       ...links,
-      links: links.links.filter(link => this.linkAllowed(id, link.projectId)),
+      links: links.links.filter(link => this.linkAllowed(id, link.projectId, link.root)),
       ...(links.root !== root ? { binding: "review-required" as const } : {}),
     };
   }

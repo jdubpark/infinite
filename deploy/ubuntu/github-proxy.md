@@ -27,9 +27,9 @@ and any grant format other than the current one (`v2`).
 | Other team members | the run's repository | fetch | none |
 | Mission and permission coordinators | none | none | none |
 | Host mirror fetch | the project's repository | fetch | none, 15-minute grant |
-| Host team head publication | the delivery repository | push | the one published ref, 15-minute grant |
+| Host team head publication | the delivery repository, or the project's GitHub source | push | the one published ref, 15-minute grant |
 | Host pull request read (review feedback, recorded branch lookup) | the run's delivery repository | pr | none, 15-minute grant |
-| Host save of a member's unfinished work | the delivery repository, or the project's GitHub source | push | the one `-wip-MEMBER` branch it pushes, 15-minute grant |
+| Host save of a member's unfinished work | the delivery repository, or the project's GitHub source | push | the one exact ref it pushes: `-wip-MEMBER`, or `-wip-MEMBER-COMMIT8` on a retry after a rejection; 15-minute grant |
 
 The project repository is the GitHub source of a GitHub-tracked project, or the
 team delivery repository otherwise. A project with neither gets no grant.

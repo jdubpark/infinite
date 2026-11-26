@@ -512,10 +512,9 @@ it, so a lost response does not post a second comment. With
   Present only when `intake.slack` is configured. `dropped` counts inbound events
   that were refused, and `reason` says why the surface is not connected.
 
-`GET /api/intake/workspace-scope` (owner-only) reports the live verification
-status of `intake.slack.organizationScope` (`"verified"`, `"blocked"`, or
-`"unconfigured"`), including any checkout pin or membership mismatch that holds
-scoped intake closed (`403 intake-audience-denied`).
+`GET /api/intake/workspace-scope` (owner-only) returns HTTP 200 with `{ "state": "verified" | "blocked" | "unconfigured" }` by running `intakeAudience.workspacesAllowed()` against the configured `intake.mission.groupId` and `intake.slack.organizationScope.workspaces` checkout pins (plus `answerProjectId`). It checks only local checkout/workspace binding—it does not call Slack `conversations.info`, does not return mismatch details, and does not return `403` when `"blocked"`.
+
+Separately, live Slack channel and membership verification (`conversations.info`, rejecting IMs, MPIMs, shared/external/org-shared channels, non-allowlisted channels, and channels the bot has not joined, alongside `workspacesAllowed()`) runs during Slack event handling, thread reads, and replies. Intake mission creation enforces `organizationScope` checkout bounds and refuses out-of-scope missions with `403 intake-audience-denied`.
 
 Both surfaces summarise an unexpected error as its name and code, and write the
 full error to the host log. Failures with fixed text, a mission refusal, a Slack

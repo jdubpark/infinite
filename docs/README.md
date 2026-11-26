@@ -1,6 +1,6 @@
 # Infinite Documentation and Research Index
 
-This index maps every subsystem, Architecture Decision Record (ADR), runbook, and source file in Infinite (verified against `main` at `e0160091`), for both engineers onboarding onto the codebase and AI coding agents gathering task context.
+This index maps every subsystem, Architecture Decision Record (ADR), runbook, and source file in Infinite (verified against `main` at `638140c4`), for both engineers onboarding onto the codebase and AI coding agents gathering task context.
 
 Source files carry zero prose comments (`npm run check:comments`, [ADR-0003](adr/0003-comment-policy-and-ratchet.md)). Non-obvious design invariants live in `docs/adr/0001`–`0022` and this `docs/` tree rather than inline comments. Check the relevant ADR before refactoring concurrency, wire schemas, or security checks.
 
@@ -13,10 +13,10 @@ All six diagrams share Infinite's `DESIGN.md` visual vocabulary and distinguish 
 | Figure | Diagram | Best used when researching |
 | --- | --- | --- |
 | **FIG 01** | [System Topology](diagrams/system-topology.svg) | End-to-end overview: 4 clients, transport, host planes, detached workers, encrypted storage |
-| **FIG 02** | [Orchestration Hierarchy & Team Pipeline](diagrams/orchestration-hierarchy.svg) | Intake/MCP -> Mission -> Routine -> Goal -> TeamRun -> Session, `KeyedQueue` lock order, 14 states, 10 roles, Blackboard |
+| **FIG 02** | [Orchestration Hierarchy & Team Pipeline](diagrams/orchestration-hierarchy.svg) | Two execution paths—`Intake/MCP -> Mission -> Subtask TeamRuns` and `Routine -> Goal -> TeamRun Cycles -> Session`—plus `KeyedQueue` lock order, 14 states, 10 roles, Blackboard |
 | **FIG 03** | [Evidence Store, Routing & Self-Improvement](diagrams/self-improvement-loop.svg) | `evidence.sqlite3` (15 modules, 4 projectors), Thompson routing, Verdicts, Replay Eval, Judge Calibration, unwired boundaries |
 | **FIG 04** | [Security & Hard Isolation Boundaries](diagrams/security-boundaries.svg) | 7 Ubuntu service accounts, 3 `nftables` tables, egress & GitHub proxies, ceilings, backups, org isolation, deployment modes |
-| **FIG 05** | [Session Protocol & Permission Pipeline](diagrams/session-protocol-and-permissions.svg) | Worker 5-step serialized PTY write queue, `@infinite/attention`, Halt -> Fuse -> 5-step `HostPermissionPipeline` |
+| **FIG 05** | [Session Protocol & Permission Pipeline](diagrams/session-protocol-and-permissions.svg) | Worker serialized queue (5-step delivery receipt protocol + `resize`), `@infinite/attention`, Halt -> Fuse -> 5-step `HostPermissionPipeline` |
 | **FIG 06** | [Understanding & Four-Client Matrix](diagrams/understanding-and-clients.svg) | Graphify code maps, Jevcode briefings, Understanding fence, BFS/TLA+ checker, Usage, Memory, and CLI/Web/Mobile/macOS parity |
 
 ---
@@ -43,7 +43,7 @@ All six diagrams share Infinite's `DESIGN.md` visual vocabulary and distinguish 
 | E2E encrypted channel (`infinite-remote-v1`) & relay | `packages/remote/src/{protocol,index,session-list}.ts`, `packages/host/src/{remote-access,relay}.ts`, `apps/macos/Sources/InfiniteCore/RemoteCipher.swift` | [0002](adr/0002-remote-encrypted-channel-and-sync-contracts.md), [0021](adr/0021-host-core-runtime-integrations-invariants.md) | [remote-machines.md](remote-machines.md) |
 | Laptop CLI, `Ctrl+E` drafts, `--laptop` & `--local-ui` | `packages/host/src/{cli,client,client-entry,client-transport,client-native,client-opencode,client-draft,client-draft-store,hybrid-workspace,executor-tunnel,native-bridge}.ts` | [0006](adr/0006-host-concurrency-and-lock-free-storage.md), [0011](adr/0011-build-watch-graph-and-test-tooling.md) | [cli.md](cli.md), [hybrid-execution.md](hybrid-execution.md) |
 | Workspace sync & GitHub bare mirrors | `packages/host/src/{sync-service,project-sync,project-source,workspace-checkpoint,workspace-transfer,workspace-watch}.ts`, `scripts/native/workspace-watch.c` | [0006](adr/0006-host-concurrency-and-lock-free-storage.md), [0011](adr/0011-build-watch-graph-and-test-tooling.md) | [workspace-sync.md](workspace-sync.md) |
-| Projects over Checkouts (`INF-98`) & Project Contexts | `packages/host/src/{checkout-identity,project-groups,project-context,repo-enrollment}.ts` | [0021](adr/0021-host-core-runtime-integrations-invariants.md) | [missions.md](missions.md) |
+| Projects over Checkouts & Project Contexts | `packages/host/src/{checkout-identity,project-groups,project-context,repo-enrollment}.ts` | [0021](adr/0021-host-core-runtime-integrations-invariants.md) | [missions.md](missions.md) |
 | `KeyedQueue`, `PendingCreates`, acyclic lock ordering | `packages/host/src/keyed-queue.ts`, `teams.ts`, `goals.ts`, `missions.ts`, `routines.ts`, `manager.ts` | [0006](adr/0006-host-concurrency-and-lock-free-storage.md), [0009](adr/0009-wave2-lockfree-services-and-swift-actors.md), [0016](adr/0016-wave3-per-entity-orchestration-queues.md) | [architecture.md](architecture.md#concurrency-storage-and-type-safety) |
 | Team runs, planning, worktrees, publisher, recovery | `packages/host/src/{teams,team-kernel,team-types,team-state-schemas,team-planning,team-workspace,team-publisher,team-recovery,team-retention,team-retirement,team-acceptance,delivery-review}.ts` | [0016](adr/0016-wave3-per-entity-orchestration-queues.md), [0019](adr/0019-orchestration-wire-and-domain-type-invariants.md), [0020](adr/0020-host-orchestration-permissions-judges-invariants.md) | [teams.md](teams.md) |
 | Goals, standing cycles, Objective Record, Verdicts | `packages/host/src/{goals,goal-types,goal-standing,goal-verdicts,goal-metrics,objective-*,team-intent,team-register,team-verdicts,verdict-*,evaluator-profiles}.ts` | [0017](adr/0017-host-eval-evidence-outcome-routing-invariants.md), [0019](adr/0019-orchestration-wire-and-domain-type-invariants.md), [0020](adr/0020-host-orchestration-permissions-judges-invariants.md) | [teams.md](teams.md) |
@@ -81,7 +81,7 @@ All six diagrams share Infinite's `DESIGN.md` visual vocabulary and distinguish 
 | [`docs/architecture.md`](architecture.md) | Master system architecture: all 6 diagrams, runtime protocols, orchestration, governance, eval, storage, API index |
 | [`docs/cli.md`](cli.md) | Laptop CLI installation, pairing, command families, `Ctrl+E` drafts, `--laptop`, `--local-ui` |
 | [`docs/teams.md`](teams.md) | Deep reference for Teams, Goals, Routines, Blackboard, Objective Record, Verdicts, Eval, Routing, Permissions, Halt/Fuse, Main Check |
-| [`docs/missions.md`](missions.md) | Projects over Checkouts (`INF-98`), cross-repo Missions, read-only coordinator, Board & Attempts |
+| [`docs/missions.md`](missions.md) | Projects over Checkouts, cross-repo Missions, read-only coordinator, Board & Attempts |
 | [`docs/swarm.md`](swarm.md) | Read-only Web Swarm visualization (`#/swarm`, Wall, Graph) and Decision Queue (`#/decisions`) |
 | [`docs/intake.md`](intake.md) | Linear + Slack Socket Mode intake, `ask:`/`work:` routing, Block Kit controls, verified `organizationScope` (`#304`) |
 | [`docs/mcp.md`](mcp.md) | External loopback/HTTPS `/mcp` request connector (plus cross-link to internal stdio `infinite-team` MCP) |
@@ -141,4 +141,4 @@ Historical design specifications live under `docs/superpowers/specs/`. Use this 
 
 - **Shipped & live-wired:** `mobile-attention-brief`, `cloud-first-execution`, `usage-ledger-and-limit-fallback`, `cost-and-agent-effectiveness`, `github-source-tracking`, `projects-over-checkouts`, `system-tab-self-explaining`, `work-briefs`, `workspace-retention`, `team-blackboard`, `member-usage-capture`, `outcome-ledger`, `replay-eval`, `evidence-router`, `continuous-autonomy`, `objective-record`, `linear-slack-intake`, `swarm-dashboard`, `hard-boundary`, `host-permission-agent`, `wake-primitives`, `review-feedback`, `waiting-task`.
 - **Partially shipped / foundation only:** `duels` (Phase 1 judge calibration + `source: "duel"` hooks shipped; live duels open), `read-pools-and-context-crossings` (`crossing-digest` / `context-touches` live; `read-phases` / `read-request` unwired), `search-mode` (`search-engine.ts` pure state machine built & tested; unwired), `delegated-adoption` (`C19` cross-family merge review live; Class A auto-adoption open), `self-improving-teams` (umbrella; blackboard, usage, outcomes, replay eval, and evidence router shipped; live duels and improvement gate open).
-- **Spec-only (no host service yet):** `improvement-gate` (`INF-189`; only underlying eval confirm comparisons and `SessionPurpose = "gate"` exist).
+- **Spec-only (no host service yet):** `improvement-gate` (only underlying eval confirm comparisons and `SessionPurpose = "gate"` exist).

@@ -10,6 +10,7 @@ export type TerminalPage = {
   snapshot?: TerminalSnapshot; receipt?: Receipt; error?: string;
   requestId?: string; control?: ControlLease | null;
   refusal?: { requestId?: string; code: string; error?: string };
+  resizeRefusal?: { requestId?: string; code: string; error?: string };
 };
 export class TerminalAccessError extends Error {}
 export class TerminalControlError extends Error {

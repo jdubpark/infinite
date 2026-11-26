@@ -21,7 +21,7 @@
     "tests/halt.test.ts": 1209,
     "tests/intake-slack.test.ts": 1647,
     "tests/intake.test.ts": 1624,
-    "tests/missions.test.ts": 2575,
+    "tests/missions.test.ts": 2576,
     "tests/outcome-store.test.ts": 1612,
     "tests/team-events.test.ts": 1779,
     "tests/teams.test.ts": 3434

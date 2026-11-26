@@ -13,18 +13,19 @@ import type { Bootstrap, ControlLease, Event, Receipt, WorkerRequest, WorkerStat
 
 const BURST = 4 * 1024 * 1024;
 const AGENT = String.raw`
+import { execFileSync } from "node:child_process";
 process.stdin.setRawMode(true);
 process.stdin.setEncoding("utf8");
 process.stdout.write("READY\r\n");
 const burst = size => {
   let text = "";
   for (let row = 1; text.length < size; row++) text += "\x1b[3" + (row % 7 + 1) + "mROW " + row + " café 界 " + "lorem ipsum dolor sit amet ".repeat(3) + "\x1b[0m\r\n";
-  process.stdout.write(text + "BURST DONE\r\n");
+  return Buffer.from(text + "BURST DONE\r\n");
 };
-let burstOnResize = 0;
+let burstOnResize;
 process.stdout.on("resize", () => {
-  if (burstOnResize) burst(burstOnResize);
-  burstOnResize = 0;
+  if (burstOnResize) process.stdout.write(burstOnResize);
+  burstOnResize = undefined;
 });
 let pending = "";
 process.stdin.on("data", data => {
@@ -33,11 +34,13 @@ process.stdin.on("data", data => {
   while ((end = pending.indexOf("\n")) >= 0) {
     const command = pending.slice(0, end);
     pending = pending.slice(end + 1);
-    if (command === "size") process.stdout.write("SIZE " + process.stdout.getWindowSize().join("x") + "\r\n");
-    else if (command.startsWith("burst-on-resize ")) {
-      burstOnResize = Number(command.slice(16));
+    if (command === "size") {
+      const [rows, cols] = execFileSync("stty", ["size"], { stdio: ["inherit", "pipe", "ignore"], encoding: "utf8" }).trim().split(" ");
+      process.stdout.write("SIZE " + cols + "x" + rows + "\r\n");
+    } else if (command.startsWith("burst-on-resize ")) {
+      burstOnResize = burst(Number(command.slice(16)));
       process.stdout.write("ARMED\r\n");
-    } else burst(Number(command));
+    } else process.stdout.write(burst(Number(command)));
   }
 });
 `;

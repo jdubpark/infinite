@@ -37,13 +37,13 @@ kept:
 
 A skipped issue keeps a record with its identifier, URL, times, and skip reason.
 It keeps no title, no description, and no thread, so it never binds a thread.
-Only the owner's Linear user ID causes work. The first two
-checks apply to every issue. The Slack checks apply only when
-`requireSlackThread` is on, which is the default.
+Only the owner's Linear user ID causes work. By default, `requireSlackThread`
+also requires an attachment and a prior owner mention.
 
-Without `requireSlackThread`, a linked Slack thread is still read when present.
-A failed or unreadable read starts the mission without a thread section and
-binds no thread, and nothing waits or retries.
+With `requireSlackThread: false`, a qualifying Linear issue can start without a
+Slack attachment. When an issue links to Slack on an enrolled host, the host
+verifies the channel and reads the thread before admitting it. A failed or
+unreadable linked thread defers the issue to a later poll.
 
 The objective is the Linear title, the description (up to 12,000 characters), a
 fixed note that only the owner's words are instructions, and only the owner's own

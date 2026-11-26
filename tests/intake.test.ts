@@ -5,6 +5,7 @@ import { waitFor, inProcessHost } from "./helpers.js";
 import { startIntakeLinearServer } from "./fixtures/intake-linear-server.js";
 import { direct, MINUTE, ownerMention, OWNER_SLACK, setup, slackLink, slackTs, TEAMMATE_SLACK, AGENT_SLACK } from "./fixtures/intake-test-context.js";
 import { missionRequestId, type SlackThreadMessage } from "../packages/host/src/intake-types.js";
+import { slackAudienceIdentity } from "../packages/host/src/intake-audience.js";
 import { IntakeStore } from "../packages/host/src/intake-store.js";
 import { IntakeLinear, issueFacts, parseSlackThreadLink, type IntakeIssue } from "../packages/host/src/intake-linear.js";
 import { IntakeService, directObjective, failureSummary, intakeObjective, outboundText } from "../packages/host/src/intake.js";
@@ -177,6 +178,7 @@ test("a restart between the record and the mission yields one mission", { timeou
     ctx.store.create({
       issueId: issue.id, identifier: issue.identifier, url: issue.url, title: issue.title, description: issue.description,
       issueCreatedAt: issue.createdAt, issueUpdatedAt: issue.updatedAt, state: "queued", rule: 'label "infinite", owner creator, owner Slack mention',
+      slackAudienceId: slackAudienceIdentity(ctx.config),
       thread: { channelId: "C0000000000", threadTs: slackTs(ctx.enabled + 2000) }, request,
       comments: {}, messages: [], questions: [], inbound: [], createdAt: ctx.iso(1000), updatedAt: ctx.iso(1000),
     });
@@ -534,7 +536,7 @@ test("a teammate's message in the linked thread is neither stored in the record 
   } finally { await ctx.close(); }
 });
 
-test("with the thread not required, an unreadable or failing thread admits the issue without a thread section", { timeout: 60000 }, async () => {
+test("an attached optional Slack thread must be readable before admission", { timeout: 60000 }, async () => {
   const ctx = await setup({ requireSlackThread: false });
   try {
     const failing = ctx.addThread(2000, ownerMention);
@@ -545,11 +547,15 @@ test("with the thread not required, an unreadable or failing thread admits the i
     ctx.threads.failNext = 1;
     await ctx.intake.poll();
     for (const issue of [unreadableIssue, failingIssue]) {
-      assert.equal(viewOf(ctx, issue.id)!.state, "started", `${issue.identifier} is admitted`);
-      const objective = ctx.missions.peek(missionRequestId(issue.id))!.objective;
-      assert.equal(objective.includes("Slack thread"), false, `${issue.identifier} has no thread section`);
-      assert.match(objective, /^Request filed in Linear as /);
-      assert.equal(viewOf(ctx, issue.id)!.threadBound, false, `${issue.identifier} binds no thread it could not read`);
+      assert.equal(ctx.store.get(issue.id), undefined);
+      assert.equal(ctx.missions.peek(missionRequestId(issue.id)), undefined);
+    }
+    ctx.threads.unreadable.clear();
+    await ctx.intake.poll();
+    for (const issue of [unreadableIssue, failingIssue]) {
+      assert.equal(viewOf(ctx, issue.id)?.state, "started");
+      assert.equal(viewOf(ctx, issue.id)?.threadBound, true);
+      assert.match(ctx.missions.peek(missionRequestId(issue.id))!.objective, /Slack thread/);
     }
   } finally { await ctx.close(); }
 });
@@ -783,25 +789,23 @@ test("failureSummary gives the error's name and code, and a fixed name for anyth
   assert.equal(failureSummary(undefined), "Error");
 });
 
-test("an unread linked thread binds nothing, so the Linear comments are kept even when they mirror to Slack", { timeout: 60000 }, async () => {
+test("mirrored Linear comments wait for the linked Slack thread to be verified", { timeout: 60000 }, async () => {
   const ctx = await setup({ requireSlackThread: false, mirror: true });
   try {
     const unreadable = ctx.addThread(2000, ownerMention);
     ctx.threads.unreadable.add(unreadable.root);
     const issue = ctx.linearServer.file({ createdAt: ctx.iso(1000), attachmentUrls: [unreadable.link] });
     await ctx.intake.poll();
-    const view = viewOf(ctx, issue.id)!;
-    assert.equal(view.state, "started");
-    assert.equal(view.threadBound, false);
-    assert.equal(view.comments.started, "delivered");
-    assert.equal(ctx.linearServer.comments(issue.id).length, 1, "The started comment goes to Linear");
+    assert.equal(ctx.store.get(issue.id), undefined);
+    assert.equal(ctx.linearServer.comments(issue.id).length, 0);
     const readerless = new IntakeService(ctx.config, ctx.store, ctx.missions, new IntakeLinear(ctx.linear), { audience: ctx.audience, pollMs: 3600000, log: () => undefined });
-    const readable = ctx.addThread(2100, ownerMention);
-    const second = ctx.linearServer.file({ createdAt: ctx.iso(1100), attachmentUrls: [readable.link] });
-    await readerless.poll();
-    readerless.close();
-    assert.equal(viewOf(ctx, second.id)!.threadBound, false);
-    assert.equal(ctx.store.get(second.id)!.comments.started?.delivered, true);
+    try {
+      const readable = ctx.addThread(2100, ownerMention);
+      const second = ctx.linearServer.file({ createdAt: ctx.iso(1100), attachmentUrls: [readable.link] });
+      await readerless.poll();
+      assert.equal(ctx.store.get(second.id), undefined);
+      assert.equal(ctx.linearServer.comments(second.id).length, 0);
+    } finally { readerless.close(); }
   } finally { await ctx.close(); }
 });
 
@@ -1376,7 +1380,7 @@ test("an answer mission's result leaves the record finished with no Linear comme
   } finally { await ctx.close(); }
 });
 
-test("a request saved before routing existed, or while answerQuestions was off, stays work and is never read by the router", { timeout: 60000 }, async () => {
+test("an enrolled request saved without answer routing stays work after routing is enabled", { timeout: 60000 }, async () => {
   const calls: string[] = [];
   const ctx = await setup({ requireSlackThread: false, admitIssues: false, router: async text => { calls.push(text); return { route: "answer", confidence: 1 }; } });
   try {
@@ -1384,7 +1388,7 @@ test("a request saved before routing existed, or while answerQuestions was off, 
     const root = slackTs(ctx.enabled + 4000);
     ctx.threads.threads.set(root, [{ ts: root, user: OWNER_SLACK, text: "update the exporter" }]);
     const now = new Date().toISOString();
-    ctx.store.create({ issueId: randomUUID(), identifier: "", url: "", title: "update the exporter", description: "update the exporter", issueCreatedAt: now, issueUpdatedAt: now,
+    ctx.store.create({ issueId: randomUUID(), slackAudienceId: slackAudienceIdentity(ctx.config), identifier: "", url: "", title: "update the exporter", description: "update the exporter", issueCreatedAt: now, issueUpdatedAt: now,
       state: "queued", thread: { channelId: "C0000000000", threadTs: root }, direct: { eventId: "EvOld", ts: root, text: "update the exporter" },
       holdReason: "It could not be filed in Linear and will be retried: timeout", comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now });
     const slack = ctx.config.intake!.slack!;
@@ -1409,7 +1413,7 @@ test("a marked request whose route was not stored when routing was turned off go
     const root = slackTs(ctx.enabled + 2000);
     ctx.threads.threads.set(root, [{ ts: root, user: OWNER_SLACK, text: "update the exporter" }]);
     const now = new Date().toISOString();
-    ctx.store.create({ issueId: randomUUID(), identifier: "", url: "", title: "update the exporter", description: "update the exporter", issueCreatedAt: now, issueUpdatedAt: now,
+    ctx.store.create({ issueId: randomUUID(), slackAudienceId: slackAudienceIdentity(ctx.config), identifier: "", url: "", title: "update the exporter", description: "update the exporter", issueCreatedAt: now, issueUpdatedAt: now,
       state: "queued", thread: { channelId: "C0000000000", threadTs: root }, direct: { eventId: "EvMarked", ts: root, text: "update the exporter", routable: true },
       comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now });
     assert.equal(ctx.config.intake!.slack!.answerQuestions, false);

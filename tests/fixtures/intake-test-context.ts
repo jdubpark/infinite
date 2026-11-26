@@ -53,8 +53,10 @@ export async function setup(options: { groupId?: string; maxActive?: number; req
       slack: { appTokenFile: "/srv/infinite-data/slack-app-token", botTokenFile: "/srv/infinite-data/slack-bot-token", teamId: "T00000000",
         ownerUserId: OWNER_SLACK, linearAgentUserId: AGENT_SLACK, bindByMention: false, directRequests: true,
         answerQuestions: options.answerQuestions ?? false, classify: options.classify ?? false,
-        organizationScope: { workspaces: target.projects.map(project => ({ projectId: project.id, path: project.path, repository: null,
-          rootCommit: git(project.path, "rev-list", "--max-parents=0", "HEAD") })) } },
+        organizationScope: { workspaces: target.projects.map(project => ({
+          projectId: project.id, path: project.path,
+          ...(options.scripted ? { repository: `example/${project.id}` } : { repository: null, rootCommit: git(project.path, "rev-list", "--max-parents=0", "HEAD") }),
+        })) } },
       mission: { groupId: options.groupId ?? "shop", maxSubtasks: 8, maxMinutes: 30 },
       maxActive: options.maxActive ?? 3,
       requireSlackThread: options.requireSlackThread ?? true,

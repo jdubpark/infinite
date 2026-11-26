@@ -3,6 +3,8 @@ import { HANDOFF_INSTRUCTIONS } from "./handoff-types.js";
 import { sessionExecutionIdentity, type AgentProfile, type Config, type ExecutionIdentity, type Provider, type SessionPurpose } from "./types.js";
 import { dirname, join } from "node:path";
 import { teamModelProfileSchema, type TeamModelProfile } from "./team-types.js";
+import { parseMissionCoordinatorProvider, type MissionCoordinatorProvider } from "./mission-types.js";
+export { parseMissionCoordinatorProvider };
 import { TeamError } from "./team-workspace.js";
 import { codexTrustArgs } from "./workspace-trust.js";
 import { sudoShape } from "./sudo-profile.js";
@@ -191,31 +193,29 @@ export function permissionCoordinatorLaunch(provider: Provider, profile: AgentPr
   return { ...profile, args: merged };
 }
 
-export function missionCoordinatorLaunch(provider: Provider, profile: AgentProfile): AgentProfile {
-  if (provider === "claude") {
-    const args: string[] = [];
-    const valueFlags = new Set(["--permission-mode", "--settings", "--agents", "--plugin-dir", "--permission-prompt-tool"]);
-    const listFlags = new Set(["--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools", "--mcp-config"]);
-    for (let index = 0; index < profile.args.length; index++) {
-      const arg = profile.args[index], flag = arg.split("=")[0];
-      if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--session-id", "--resume", "-r", "--continue", "-c"].includes(flag))
-        throw new Error(`Mission coordinator profile cannot configure ${flag}.`);
-      if (arg.startsWith("-c") && arg !== "--" && !arg.startsWith("--"))
-        throw new Error("Mission coordinator profile cannot configure -c.");
-      if (arg.startsWith("-r") && !arg.startsWith("--"))
-        throw new Error("Mission coordinator profile cannot configure -r.");
-      if (valueFlags.has(flag)) { if (!arg.includes("=")) index++; continue; }
-      if (listFlags.has(flag)) {
-        if (!arg.includes("=")) while (index + 1 < profile.args.length && !profile.args[index + 1].startsWith("-")) index++;
-        continue;
-      }
-      args.push(arg);
+export function missionCoordinatorLaunch(provider: MissionCoordinatorProvider, profile: AgentProfile): AgentProfile {
+  if (provider !== "claude") throw new Error("Mission coordinators require Claude Code.");
+  const args: string[] = [];
+  const valueFlags = new Set(["--permission-mode", "--settings", "--agents", "--plugin-dir", "--permission-prompt-tool"]);
+  const listFlags = new Set(["--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools", "--mcp-config"]);
+  for (let index = 0; index < profile.args.length; index++) {
+    const arg = profile.args[index], flag = arg.split("=")[0];
+    if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--session-id", "--resume", "-r", "--continue", "-c"].includes(flag))
+      throw new Error(`Mission coordinator profile cannot configure ${flag}.`);
+    if (arg.startsWith("-c") && arg !== "--" && !arg.startsWith("--"))
+      throw new Error("Mission coordinator profile cannot configure -c.");
+    if (arg.startsWith("-r") && !arg.startsWith("--"))
+      throw new Error("Mission coordinator profile cannot configure -r.");
+    if (valueFlags.has(flag)) { if (!arg.includes("=")) index++; continue; }
+    if (listFlags.has(flag)) {
+      if (!arg.includes("=")) while (index + 1 < profile.args.length && !profile.args[index + 1].startsWith("-")) index++;
+      continue;
     }
-    args.push("--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep",
-      "--allowedTools", "Read", "Glob", "Grep", "mcp__infinite_team__mission_report", "--strict-mcp-config", "--disable-slash-commands");
-    return { ...profile, args };
+    args.push(arg);
   }
-  throw new Error("Mission coordinators require Claude Code.");
+  args.push("--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep",
+    "--allowedTools", "Read", "Glob", "Grep", "mcp__infinite_team__mission_report", "--strict-mcp-config", "--disable-slash-commands");
+  return { ...profile, args };
 }
 
 const CLAUDE_EVENTS = [
@@ -386,9 +386,8 @@ export function buildLaunch(
     for (const [key, value] of Object.entries({
       command: process.execPath,
       args: serverArgs,
-      env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID", ...hostEgressEnvVars],
+      env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_PROJECT_ID", ...hostEgressEnvVars],
       "tools.report.approval_mode": "approve",
-      "tools.mission_report.approval_mode": "approve",
       ...(withEntryTools ? {
         "env.INFINITE_TEAM_ENTRY_TOOLS": "1",
         "tools.entry_post.approval_mode": "approve",

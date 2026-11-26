@@ -11,7 +11,7 @@ import type { Mission } from "../packages/host/src/mission-types.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
-import { mixedLineup } from "./team-fixture.js";
+import { lineup as missionLineup } from "./mission-harness.js";
 
 const owner = { deviceId: "test-device", label: "Test owner" };
 const scope = { scope: "project", projectId: "fixture" } as const;
@@ -57,7 +57,7 @@ test("a halt release after restart settles a subteam whose pause reached it befo
       id: missionId, groupId: "fixture-group", groupName: "Fixture", repoProjectIds: ["fixture"],
       title: "Mission", objective: "Complete one subtask", maxSubtasks: 1, maxMinutes: 60,
       deadlineAt: new Date(Date.now() + 60 * 60000).toISOString(), revision: 1, status: "working",
-      createdAt: at, updatedAt: at, lineup: mixedLineup,
+      createdAt: at, updatedAt: at, lineup: missionLineup,
       subtasks: [{ id: "a", repoProjectId: "fixture", title: "Subteam", objective: "Complete the task", size: "team", parallelism: 1, dependsOn: [], status: "running", teamId }],
       decisions: [], steering: [], events: [],
     };
@@ -138,7 +138,7 @@ test("mission view sets canAnswerPaused only while an owner halt matches the pau
     status: "needs-input",
     createdAt: at,
     updatedAt: at,
-    lineup: mixedLineup,
+    lineup: missionLineup,
     subtasks: [],
     decisions: [
       { id: decision1, question: "First choice?", options: ["A", "B"], createdAt: at },

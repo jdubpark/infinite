@@ -306,6 +306,14 @@ device key and a separate client config. Reserve browser login for the
 dedicated HTTPS hostname. [OpenSSH local forwarding](https://man.openbsd.org/ssh.1#L)
 and [Infinite CLI pairing](../../packages/host/src/client.ts)
 
+If a legacy service must remain on a shared hostname, set
+`"browserSessions": false` in its private config and restart it. Browser login
+then stops before body parsing, existing cookies are ignored, and the web
+entry returns a static unavailable page. Paired bearer APIs, event streams,
+native sockets, and machine access remain enabled. The in-memory cookie
+sessions end when the service restarts. Keep browser sessions disabled until
+the service has its own private HTTPS hostname.
+
 ```sh
 ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:4781:127.0.0.1:4781 SSH_HOST
 ```

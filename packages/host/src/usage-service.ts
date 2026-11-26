@@ -453,6 +453,14 @@ export class UsageService {
     const rows = sessions.flatMap(session => data.bySession.get(session.sessionId) ?? []).sort((a, b) => data.order.get(a)! - data.order.get(b)!);
     return { ...sumUsage(this.priced(rows)), measured: true, coverage: coverage.coverage as "partial" | "complete", ...(coverage.reason ? { coverageReason: coverage.reason } : {}) };
   }
+  memberFinal(runId: string, memberId: string): SessionUsage | UnmeasuredUsage {
+    let data: Ledger;
+    try { data = this.ledger(); } catch { return { measured: false, coverage: "none", unavailable: true }; }
+    const sessions = data.byMember.get(memberKey(runId, memberId)) ?? [];
+    if (!sessions.length) return { measured: false, coverage: "none" };
+    if (sessions.some(session => !session.exited)) return { measured: false, coverage: "none", coverageReason: "running" };
+    return this.member(runId, memberId);
+  }
   sessions(ids: string[]): UsageTotals {
     let data: Ledger;
     try { data = this.ledger(); } catch { return sumUsage([]); }

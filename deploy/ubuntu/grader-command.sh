@@ -2,6 +2,8 @@
 set -eu
 ROOT=/var/lib/infinite-grader/root
 ACCOUNT=infinite-grader
+PRLIMIT_NPROC=512
+STOP_KILL_MODE=kill
 JOBS=$ROOT/jobs
 JOBDIR=
 REAL_JOB=
@@ -142,14 +144,19 @@ op_receive() {
 run_child() {
   child_seconds=$1
   shift
-  status=0
-  /usr/bin/setsid -w /usr/bin/prlimit --nproc=512 --fsize=4294967296 --core=0 --nofile=4096 \
-    /usr/bin/timeout --kill-after=10 "$child_seconds" \
+  set -- /usr/bin/timeout --kill-after=10 "$child_seconds" \
     /usr/bin/env -i \
       PATH=/usr/local/bin:/usr/bin:/bin HOME="$JOBDIR/home" TMPDIR="$JOBDIR/tmp" \
       LANG=C.UTF-8 LC_ALL=C.UTF-8 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
       GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 CI=1 \
-    "$@" || status=$?
+    "$@"
+  if [ "$PRLIMIT_NPROC" = off ]; then
+    set -- /usr/bin/setsid -w /usr/bin/prlimit --fsize=4294967296 --core=0 --nofile=4096 "$@"
+  else
+    set -- /usr/bin/setsid -w /usr/bin/prlimit --nproc="$PRLIMIT_NPROC" --fsize=4294967296 --core=0 --nofile=4096 "$@"
+  fi
+  status=0
+  "$@" || status=$?
 }
 
 finish_child() {
@@ -220,7 +227,11 @@ op_digest() {
 
 op_stop() {
   [ $# -eq 0 ] || refuse
-  kill -KILL -1 2>/dev/null || true
+  case "$STOP_KILL_MODE" in
+    kill) kill -KILL -1 2>/dev/null || true ;;
+    refuse) exit 99 ;;
+    *) refuse ;;
+  esac
   /usr/bin/sleep 1
   uid=$(/usr/bin/id -u)
   status=0
@@ -260,6 +271,67 @@ op_remove() {
   open_tree "${JOBS:?}/$1"
   /usr/bin/rm -rf -- "${JOBS:?}/$1"
 }
+
+valid_abs_path() {
+  case "$1" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    /|*/|*[[:cntrl:]\"\\]*) return 1 ;;
+  esac
+  case "/$1/" in
+    */../*) return 1 ;;
+  esac
+  return 0
+}
+
+allow_test_overrides() {
+  [ "$(/usr/bin/id -u)" -ne 0 ] || return 1
+  [ "$(/usr/bin/id -un)" != "$ACCOUNT" ] || return 1
+  [ -z "${SUDO_USER+set}" ] && [ -z "${SUDO_UID+set}" ] && [ -z "${SUDO_GID+set}" ] && [ -z "${SUDO_COMMAND+set}" ] || return 1
+  [ -z "${DOAS_USER+set}" ] && [ -z "${PKEXEC_UID+set}" ] || return 1
+  self_real=$(/usr/bin/realpath -e -- "$0" 2>/dev/null) || return 1
+  case "$self_real" in
+    /usr/local/libexec/*|/usr/local/sbin/*|/usr/libexec/*|/usr/sbin/*|/sbin/*|/usr/bin/*|/bin/*|/opt/infinite*) return 1 ;;
+  esac
+  return 0
+}
+
+load_test_overrides() {
+  if allow_test_overrides; then
+    if [ "${INFINITE_GRADER_TEST_ROOT+set}" = set ]; then
+      valid_abs_path "$INFINITE_GRADER_TEST_ROOT" || refuse
+      ROOT=$INFINITE_GRADER_TEST_ROOT
+    fi
+    if [ "${INFINITE_GRADER_TEST_ACCOUNT+set}" = set ]; then
+      case "$INFINITE_GRADER_TEST_ACCOUNT" in
+        ''|root|*[!A-Za-z0-9._-]*) refuse ;;
+      esac
+      ACCOUNT=$INFINITE_GRADER_TEST_ACCOUNT
+    fi
+    if [ "${INFINITE_GRADER_TEST_PRLIMIT_NPROC+set}" = set ]; then
+      case "$INFINITE_GRADER_TEST_PRLIMIT_NPROC" in
+        off) PRLIMIT_NPROC=off ;;
+        *)
+          valid_count "$INFINITE_GRADER_TEST_PRLIMIT_NPROC" && [ "$INFINITE_GRADER_TEST_PRLIMIT_NPROC" -ge 1 ] || refuse
+          PRLIMIT_NPROC=$INFINITE_GRADER_TEST_PRLIMIT_NPROC
+          ;;
+      esac
+    fi
+    if [ "${INFINITE_GRADER_TEST_STOP_KILL_MODE+set}" = set ]; then
+      case "$INFINITE_GRADER_TEST_STOP_KILL_MODE" in
+        kill|refuse) STOP_KILL_MODE=$INFINITE_GRADER_TEST_STOP_KILL_MODE ;;
+        *) refuse ;;
+      esac
+    fi
+  fi
+  unset INFINITE_GRADER_TEST_ROOT INFINITE_GRADER_TEST_ACCOUNT \
+    INFINITE_GRADER_TEST_PRLIMIT_NPROC INFINITE_GRADER_TEST_STOP_KILL_MODE
+}
+
+load_test_overrides
+JOBS=$ROOT/jobs
 
 [ "$(/usr/bin/id -un)" = "$ACCOUNT" ] || refuse
 [ "$(/usr/bin/id -u)" -ne 0 ] || refuse

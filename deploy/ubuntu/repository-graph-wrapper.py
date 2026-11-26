@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 """Run the installed code graph builder within the deployment's workspace roots."""
 
 import argparse
@@ -7,19 +7,32 @@ from pathlib import Path
 import re
 
 WORKSPACES = Path("/srv/infinite-data/workspaces")
+TEAM_WORKSPACES = Path("/srv/infinite-data/team-workspaces")
 CACHE = Path("/srv/infinite-data/repository-graphs")
 BUILDER = "/opt/infinite/scripts/repository_graph.py"
 GRAPHIFY = "/usr/local/bin/graphify"
 
-def inside(value, root):
+def inside(value, *roots):
     path = Path(value)
     if not path.is_absolute():
         raise ValueError("An absolute path is required.")
+    if ".." in path.parts:
+        raise ValueError("The requested path is outside its assigned root.")
     resolved = path.resolve()
-    if resolved == root or root not in resolved.parents:
+    matched = None
+    matched_resolved = None
+    for root in roots:
+        if root.is_symlink():
+            raise ValueError("Symlinked repository or cache paths are not supported.")
+        resolved_root = root.resolve()
+        if resolved != resolved_root and resolved_root in resolved.parents:
+            matched = root
+            matched_resolved = resolved_root
+            break
+    if matched is None:
         raise ValueError("The requested path is outside its assigned root.")
     cursor = path
-    while cursor != root and cursor != cursor.parent:
+    while cursor != matched and cursor != matched_resolved and cursor != cursor.parent:
         if cursor.is_symlink():
             raise ValueError("Symlinked repository or cache paths are not supported.")
         cursor = cursor.parent
@@ -39,11 +52,11 @@ def main():
         raise ValueError("Use the installed extractor and an exact commit or HEAD.")
     if not 1 <= args.timeout_seconds <= 300 or not 1 <= args.max_workers <= 2:
         raise ValueError("The extraction budget exceeds the deployment limit.")
-    command = ["/usr/bin/python3", BUILDER, "--repo", inside(args.repo, WORKSPACES),
+    command = ["/usr/bin/python3", BUILDER, "--repo", inside(args.repo, WORKSPACES, TEAM_WORKSPACES),
                "--cache-dir", inside(args.cache_dir, CACHE), "--ref", args.ref,
                "--graphify", GRAPHIFY, "--timeout-seconds", str(args.timeout_seconds),
                "--max-workers", str(args.max_workers)]
-    if args.seed_cache_dir:
+    if args.seed_cache_dir is not None:
         command.extend(["--seed-cache-dir", inside(args.seed_cache_dir, CACHE)])
     os.umask(0o077)
     env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8",

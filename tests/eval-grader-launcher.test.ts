@@ -8,36 +8,30 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const LAUNCHER = fileURLToPath(new URL("../deploy/ubuntu/grader-command.sh", import.meta.url));
+const SUDOERS = fileURLToPath(new URL("../deploy/ubuntu/grader.sudoers", import.meta.url));
 const SKIP = process.platform !== "linux" ? "the launcher runs on Linux only"
   : process.getuid?.() === 0 ? "the launcher test must not run as root" : false;
 const JOB = "11111111-2222-4333-8444-555555555555";
 const OTHER = "66666666-7777-4888-8999-aaaaaaaaaaaa";
 const UNUSED = "99999999-8888-4777-8666-555555555555";
 
-const NPROC_CAP = /--nproc=512 /;
-
-type Sandbox = { dir: string; root: string; script: string };
+type Sandbox = { dir: string; root: string; env: Record<string, string> };
 
 function sandbox(account: string = userInfo().username): Sandbox {
   const dir = mkdtempSync(join(tmpdir(), "grader-launcher-"));
   const root = join(dir, "root");
   mkdirSync(root, { mode: 0o700 });
   chmodSync(root, 0o700);
-  const script = join(dir, "grader-command.sh");
-  const source = readFileSync(LAUNCHER, "utf8");
-  const kill = /^ {2}kill -KILL -1 .*$/m;
-  assert.equal(source.match(new RegExp(kill.source, "gm"))?.length, 1, "the launcher's kill line moved; move this guard with it");
-  assert.equal(source.match(new RegExp(NPROC_CAP.source, "g"))?.length, 1, "the launcher's --nproc=512 cap moved; move this guard with it");
-  const text = source
-    .replace(/^ROOT=.*$/m, `ROOT='${root}'`)
-    .replace(/^ACCOUNT=.*$/m, `ACCOUNT='${account}'`)
-    .replace(kill, "  exit 99")
-    .replace(NPROC_CAP, "");
-  assert.doesNotMatch(text, /kill -KILL -1/);
-  assert.doesNotMatch(text, /--nproc=/);
-  writeFileSync(script, text, { mode: 0o700 });
-  chmodSync(script, 0o700);
-  return { dir, root, script };
+  return {
+    dir,
+    root,
+    env: {
+      INFINITE_GRADER_TEST_ROOT: root,
+      INFINITE_GRADER_TEST_ACCOUNT: account,
+      INFINITE_GRADER_TEST_PRLIMIT_NPROC: "off",
+      INFINITE_GRADER_TEST_STOP_KILL_MODE: "refuse",
+    },
+  };
 }
 
 function cleanup(sb: Sandbox): void {
@@ -50,17 +44,60 @@ function jobPath(sb: Sandbox, ...parts: string[]): string {
 }
 
 function grader(sb: Sandbox, args: readonly string[], options: { input?: string; env?: NodeJS.ProcessEnv } = {}) {
-  return spawnSync("/bin/sh", [sb.script, ...args], {
+  return spawnSync("/bin/sh", [LAUNCHER, ...args], {
     input: options.input,
-    env: options.env ?? { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
+    env: { ...sb.env, ...(options.env ?? { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" }) },
     maxBuffer: 1 << 20,
     timeout: 60_000,
   });
 }
 
-test("the installed launcher keeps its process cap", () => {
+test("the installed launcher keeps its hardened production defaults and process cap", () => {
   const source = readFileSync(LAUNCHER, "utf8");
-  assert.equal(source.match(new RegExp(NPROC_CAP.source, "g"))?.length, 1, "the installed launcher must still cap the child with --nproc=512");
+  assert.match(source, /^ROOT=\/var\/lib\/infinite-grader\/root$/m);
+  assert.match(source, /^ACCOUNT=infinite-grader$/m);
+  assert.match(source, /^PRLIMIT_NPROC=512$/m);
+  assert.match(source, /^STOP_KILL_MODE=kill$/m);
+  assert.match(source, /\/usr\/bin\/setsid -w \/usr\/bin\/prlimit --nproc="\$PRLIMIT_NPROC" --fsize=4294967296 --core=0 --nofile=4096/);
+  assert.match(source, /allow_test_overrides\(\) \{\n  \[ "\$\(\/usr\/bin\/id -u\)" -ne 0 \] \|\| return 1/m);
+  assert.match(source, /\[ "\$\(\/usr\/bin\/id -u\)" -ne 0 \] \|\| refuse/);
+  assert.match(readFileSync(SUDOERS, "utf8"), /^Defaults!\/usr\/local\/libexec\/infinite\/grader-command env_reset$/m);
+});
+
+test("test overrides are ignored under privilege escalation and reject invalid values", { skip: SKIP }, () => {
+  const sb = sandbox();
+  try {
+    const baseEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" };
+    const bare = spawnSync("/bin/sh", [LAUNCHER, "probe", "--"], { env: baseEnv, timeout: 60_000 });
+    assert.equal(bare.status, 64);
+
+    for (const marker of ["SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_COMMAND", "DOAS_USER", "PKEXEC_UID"]) {
+      const escalated = grader(sb, ["probe", "--"], { env: { ...baseEnv, [marker]: "1000" } });
+      assert.equal(escalated.status, 64, `${marker} must disable test overrides`);
+      assert.equal(escalated.stdout.toString("utf8"), "");
+    }
+    const emptySudo = grader(sb, ["probe", "--"], { env: { ...baseEnv, SUDO_USER: "" } });
+    assert.equal(emptySudo.status, 64, "even empty SUDO_USER must disable test overrides");
+
+    const invalidCases: Array<Record<string, string>> = [
+      { INFINITE_GRADER_TEST_STOP_KILL_MODE: "skip" },
+      { INFINITE_GRADER_TEST_STOP_KILL_MODE: "invalid" },
+      { INFINITE_GRADER_TEST_PRLIMIT_NPROC: "0" },
+      { INFINITE_GRADER_TEST_PRLIMIT_NPROC: "01" },
+      { INFINITE_GRADER_TEST_PRLIMIT_NPROC: "abc" },
+      { INFINITE_GRADER_TEST_ROOT: "relative/root" },
+      { INFINITE_GRADER_TEST_ROOT: `${sb.root}/` },
+      { INFINITE_GRADER_TEST_ROOT: `${sb.dir}/../root` },
+      { INFINITE_GRADER_TEST_ACCOUNT: "root" },
+    ];
+    for (const override of invalidCases) {
+      const rejected = grader(sb, ["probe", "--"], { env: { ...baseEnv, ...override } });
+      assert.equal(rejected.status, 64, JSON.stringify(override));
+    }
+    assert.equal(grader(sb, ["stop"]).status, 99, "STOP_KILL_MODE=refuse exits 99 when reached as matching account");
+  } finally {
+    cleanup(sb);
+  }
 });
 
 test("the launcher starts the child with an empty environment", { skip: SKIP }, () => {
@@ -173,8 +210,8 @@ test("clean and remove work from a directory the account cannot enter", { skip: 
   const sb = sandbox();
   const fromClosed = (args: readonly string[]) => {
     const closed = mkdtempSync(join(sb.dir, "closed-"));
-    return spawnSync("/bin/sh", ["-c", 'cd "$1" && chmod 000 . && [ ! -r . ] && shift && exec /bin/sh "$@"', "sh", closed, sb.script, ...args], {
-      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
+    return spawnSync("/bin/sh", ["-c", 'cd "$1" && chmod 000 . && [ ! -r . ] && shift && exec /bin/sh "$@"', "sh", closed, LAUNCHER, ...args], {
+      env: { ...sb.env, PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
       maxBuffer: 1 << 20,
       timeout: 60_000,
     });

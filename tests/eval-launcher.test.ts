@@ -8,25 +8,18 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const LAUNCHER = fileURLToPath(new URL("../deploy/ubuntu/eval-command.sh", import.meta.url));
+const SUDOERS = fileURLToPath(new URL("../deploy/ubuntu/eval.sudoers", import.meta.url));
 const SKIP = process.platform !== "linux" ? "the launcher runs on Linux only"
   : process.getuid?.() === 0 ? "the launcher test must not run as root" : false;
 const TRIAL = "11111111-2222-4333-8444-555555555555";
-const NPROC_CAP = /^( {2}\/usr\/bin\/prlimit )--nproc=512 /m;
-const IPC_TABLE = /ipc_table=\/proc\/sysvipc\/(shm|sem|msg)\b/g;
 const FIXED = [
   "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT",
   "HOME", "LANG", "LC_ALL", "PATH", "TMPDIR",
 ];
 const PROXY = ["HTTPS_PROXY", "HTTP_PROXY", "NODE_USE_ENV_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"];
 
-type Sandbox = { dir: string; root: string; home: string; template: string; tmp: string; script: string };
+type Sandbox = { dir: string; root: string; home: string; template: string; tmp: string; env: Record<string, string> };
 type Copy = { stop?: string; kernelTables?: boolean };
-
-function rewrite(text: string, pattern: RegExp, to: (...match: string[]) => string, count = 1): string {
-  const all = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
-  assert.equal(text.match(all)?.length ?? 0, count, `the launcher's text for ${pattern} moved; move this rewrite with it`);
-  return text.replace(all, to);
-}
 
 function sandbox(account: string = userInfo().username, copy: Copy = {}): Sandbox {
   const kernelTables = copy.kernelTables === true || copy.stop !== undefined;
@@ -43,26 +36,23 @@ function sandbox(account: string = userInfo().username, copy: Copy = {}): Sandbo
   mkdirSync(tmp, { mode: 0o700 });
   chmodSync(tmp, 0o700);
   mkdirSync(template, { mode: 0o755 });
-  const script = join(dir, "eval-command.sh");
-  const source = readFileSync(LAUNCHER, "utf8");
-  const tables = join(dir, "sysvipc");
-  mkdirSync(tables, { mode: 0o700 });
-  for (const name of ["shm", "sem", "msg"]) writeFileSync(join(tables, name), `${readFileSync(`/proc/sysvipc/${name}`, "utf8").split("\n", 1)[0]}\n`);
-  let text = source;
-  for (const [name, value] of Object.entries({ ROOT: root, ACCOUNT: account, EVAL_HOME: home, TEMPLATE: template, EVAL_TMP: tmp, STOP_DIRS: copy.stop ?? shared })) {
-    text = rewrite(text, new RegExp(`^${name}=.*$`, "m"), () => `${name}='${value}'`);
+  const env: Record<string, string> = {
+    INFINITE_EVAL_TEST_ROOT: root,
+    INFINITE_EVAL_TEST_ACCOUNT: account,
+    INFINITE_EVAL_TEST_HOME: home,
+    INFINITE_EVAL_TEST_TEMPLATE: template,
+    INFINITE_EVAL_TEST_TMP: tmp,
+    INFINITE_EVAL_TEST_STOP_DIRS: copy.stop ?? shared,
+    INFINITE_EVAL_TEST_PRLIMIT_NPROC: "off",
+    INFINITE_EVAL_TEST_STOP_KILL_MODE: copy.stop ? "skip" : "refuse",
+  };
+  if (!kernelTables) {
+    const tables = join(dir, "sysvipc");
+    mkdirSync(tables, { mode: 0o700 });
+    for (const name of ["shm", "sem", "msg"]) writeFileSync(join(tables, name), `${readFileSync(`/proc/sysvipc/${name}`, "utf8").split("\n", 1)[0]}\n`);
+    env.INFINITE_EVAL_TEST_SYSVIPC_DIR = tables;
   }
-  text = rewrite(text, /^ {2}kill -KILL -1 .*\n {2}\/usr\/bin\/sleep 1$/m, () => copy.stop ? "  :" : "  exit 99");
-  text = rewrite(text, NPROC_CAP, (_line, command) => command);
-  text = rewrite(text, IPC_TABLE, (line, name) => kernelTables ? line : `ipc_table='${join(tables, name)}'`, 3);
-  assert.match(text, copy.stop ? /^ {2}:$/m : /^ {2}exit 99$/m, "the kill line was not replaced");
-  assert.doesNotMatch(text, /kill -KILL -1/);
-  assert.doesNotMatch(text, /^ {2}\/usr\/bin\/sleep 1$/m, "the wait after the kill line was not replaced");
-  assert.doesNotMatch(text, /--nproc=/);
-  assert.equal(text.includes("/proc/sysvipc/"), kernelTables, "only a copy that asks for the kernel's tables reads them");
-  writeFileSync(script, text, { mode: 0o700 });
-  chmodSync(script, 0o700);
-  return { dir, root, home, template, tmp, script };
+  return { dir, root, home, template, tmp, env };
 }
 
 function cleanup(sb: Sandbox): void {
@@ -71,10 +61,10 @@ function cleanup(sb: Sandbox): void {
 }
 
 function run(sb: Sandbox, args: readonly string[], options: { input?: string | Buffer; cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
-  return spawnSync("/bin/sh", [sb.script, ...args], {
+  return spawnSync("/bin/sh", [LAUNCHER, ...args], {
     input: options.input,
     cwd: options.cwd ?? sb.dir,
-    env: options.env ?? { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
+    env: { ...sb.env, ...(options.env ?? { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" }) },
     maxBuffer: 1 << 20,
     timeout: 120_000,
   });
@@ -172,9 +162,58 @@ function writeTree(base: string, files: Record<string, string>): void {
   }
 }
 
-test("the installed launcher keeps its process cap", () => {
+test("the installed launcher keeps its hardened production defaults and process cap", () => {
   const source = readFileSync(LAUNCHER, "utf8");
-  assert.equal(source.match(new RegExp(NPROC_CAP.source, "gm"))?.length, 1, "the installed launcher's prlimit command must still cap a trial's command with --nproc=512");
+  assert.match(source, /^ROOT=\/var\/lib\/infinite-eval\/root$/m);
+  assert.match(source, /^ACCOUNT=infinite-eval$/m);
+  assert.match(source, /^PRLIMIT_NPROC=512$/m);
+  assert.match(source, /^SYSVIPC_DIR=\/proc\/sysvipc$/m);
+  assert.match(source, /^STOP_KILL_MODE=kill$/m);
+  assert.match(source, /\/usr\/bin\/prlimit --nproc="\$PRLIMIT_NPROC" --fsize=4294967296 --core=0 --nofile=4096/);
+  assert.match(source, /allow_test_overrides\(\) \{\n  \[ "\$\(\/usr\/bin\/id -u\)" -ne 0 \] \|\| return 1/m);
+  assert.match(source, /\[ "\$\(\/usr\/bin\/id -u\)" -ne 0 \] \|\| refuse/);
+  assert.match(readFileSync(SUDOERS, "utf8"), /^Defaults!\/usr\/local\/libexec\/infinite\/eval-command !env_keep$/m);
+});
+
+test("test overrides are ignored under privilege escalation and reject invalid values", { skip: SKIP }, () => {
+  const sb = sandbox();
+  try {
+    const baseEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" };
+    const bare = spawnSync("/bin/sh", [LAUNCHER, "probe", "--"], { cwd: sb.dir, env: baseEnv, timeout: 60_000 });
+    assert.equal(bare.status, 64);
+
+    for (const marker of ["SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_COMMAND", "DOAS_USER", "PKEXEC_UID"]) {
+      const escalated = run(sb, ["probe", "--"], { env: { ...baseEnv, [marker]: "1000" } });
+      assert.equal(escalated.status, 64, `${marker} must disable test overrides`);
+      assert.equal(escalated.stdout.toString("utf8"), "");
+    }
+    const emptySudo = run(sb, ["probe", "--"], { env: { ...baseEnv, SUDO_USER: "" } });
+    assert.equal(emptySudo.status, 64, "even empty SUDO_USER must disable test overrides");
+
+    const invalidCases: Array<Record<string, string>> = [
+      { INFINITE_EVAL_TEST_STOP_KILL_MODE: "invalid" },
+      { INFINITE_EVAL_TEST_PRLIMIT_NPROC: "0" },
+      { INFINITE_EVAL_TEST_PRLIMIT_NPROC: "01" },
+      { INFINITE_EVAL_TEST_PRLIMIT_NPROC: "abc" },
+      { INFINITE_EVAL_TEST_ROOT: "relative/root" },
+      { INFINITE_EVAL_TEST_ROOT: `${sb.root}/` },
+      { INFINITE_EVAL_TEST_ROOT: `${sb.dir}/../root` },
+      { INFINITE_EVAL_TEST_HOME: "relative/home" },
+      { INFINITE_EVAL_TEST_TEMPLATE: "relative/template" },
+      { INFINITE_EVAL_TEST_TMP: "relative/tmp" },
+      { INFINITE_EVAL_TEST_SYSVIPC_DIR: "relative/ipc" },
+      { INFINITE_EVAL_TEST_ACCOUNT: "root" },
+      { INFINITE_EVAL_TEST_STOP_DIRS: "relative" },
+      { INFINITE_EVAL_TEST_STOP_DIRS: "   " },
+    ];
+    for (const override of invalidCases) {
+      const rejected = run(sb, ["probe", "--"], { env: { ...baseEnv, ...override } });
+      assert.equal(rejected.status, 64, JSON.stringify(override));
+    }
+    assert.equal(run(sb, ["stop"]).status, 99, "STOP_KILL_MODE=refuse exits 99 when reached as matching account");
+  } finally {
+    cleanup(sb);
+  }
 });
 
 test("the eval launcher starts commands with a fixed environment", { skip: SKIP }, () => {
@@ -322,8 +361,8 @@ test("nothing outlives a trial", { skip: SKIP }, () => {
 
 function fromClosed(sb: Sandbox, args: readonly string[]) {
   const closed = mkdtempSync(join(sb.dir, "closed-"));
-  return spawnSync("/bin/sh", ["-c", 'cd "$1" && chmod 000 . && [ ! -r . ] && shift && exec /bin/sh "$@"', "sh", closed, sb.script, ...args], {
-    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
+  return spawnSync("/bin/sh", ["-c", 'cd "$1" && chmod 000 . && [ ! -r . ] && shift && exec /bin/sh "$@"', "sh", closed, LAUNCHER, ...args], {
+    env: { ...sb.env, PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
     maxBuffer: 1 << 20,
     timeout: 120_000,
   });
@@ -434,9 +473,9 @@ test("the proxy credential is in no process's arguments while a command runs", {
     const repo = makeRepo(sb);
     const work = prepareTrial(sb, repo.bundle);
     const secret = `credential-part-${randomInt(1_000_000, 9_000_000)}`;
-    child = spawn("/bin/sh", [sb.script, "setup", "--", "/bin/sleep", duration], {
+    child = spawn("/bin/sh", [LAUNCHER, "setup", "--", "/bin/sleep", duration], {
       cwd: work,
-      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
+      env: { ...sb.env, PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
       stdio: ["pipe", "ignore", "ignore"],
     });
     child.stdin?.end(`http://user:${secret}@127.0.0.1:9/\n`);

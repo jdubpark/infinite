@@ -4,16 +4,21 @@ import { randomUUID } from "node:crypto";
 import {
   applyMissionProgressPage,
   compactAssignments,
+  currentAssignmentCount,
   initialMissionProgressState,
+  isAwaitingExitMember,
   MAX_PROGRESS_OBSERVATIONS,
   missionProgressResyncNotice,
   parseMissionProgressCursor,
+  resolveMissionChild,
   type MissionProgressMember,
   type MissionProgressObservation,
   type MissionProgressPage,
   type MissionProgressResyncReason,
   type MissionProgressSnapshot,
 } from "../apps/web/src/mission-inspector/progress-store.ts";
+import { MissionProgressService, projectMissionChild } from "../packages/host/src/mission-progress.js";
+import type { TeamRun } from "../packages/host/src/team-types.js";
 
 const MISSION_ID = "11111111-1111-4111-8111-111111111111";
 const OTHER_MISSION_ID = "22222222-2222-4222-8222-222222222222";
@@ -311,11 +316,25 @@ test("compactAssignments splits active from finished and links prior stopped/rep
   });
 
   const oldImpl1 = member({ memberId: "m-old-1", taskId: "task-a", recordedStatus: "stopped", workerStatus: "exited", revision: 1 });
-  const oldImpl2 = member({ memberId: "m-old-2", taskId: "task-a", recordedStatus: "reported", workerStatus: "exited", revision: 2 });
+  const oldImpl2 = member({
+    memberId: "m-old-2",
+    taskId: "task-a",
+    recordedStatus: "reported",
+    exitConfirmedAt: "2026-11-26T00:05:00.000Z",
+    workerStatus: "exited",
+    revision: 2,
+  });
   const activeImpl = member({ memberId: "m-active", taskId: "task-a", recordedStatus: "running", workerStatus: "running", revision: 3 });
   const unavailableReviewer = member({ memberId: "m-rev", role: "reviewer", recordedStatus: "unavailable", workerStatus: "unavailable", revision: 3 });
   const queuedPm = member({ memberId: "m-pm", role: "project-manager", recordedStatus: "queued", workerStatus: "not-sampled", revision: 3 });
-  const finishedScout = member({ memberId: "m-scout-done", role: "scout", recordedStatus: "reported", workerStatus: "exited", revision: 1 });
+  const finishedScout = member({
+    memberId: "m-scout-done",
+    role: "scout",
+    recordedStatus: "reported",
+    exitConfirmedAt: "2026-11-26T00:04:00.000Z",
+    workerStatus: "exited",
+    revision: 1,
+  });
   const finishedOtherTask = member({ memberId: "m-task-b", taskId: "task-b", recordedStatus: "stopped", workerStatus: "exited", revision: 1 });
 
   const result = compactAssignments([
@@ -398,4 +417,196 @@ test("resync clears prior observations so matching sequences in new generation o
     makePage(GEN_2, INST_2, 4, { required: false }, [makeObservation(GEN_2, INST_2, 4, "cancelled")]),
   );
   assert.equal(afterStaleInst2, state);
+});
+
+test("compactAssignments keeps reported workers without exitConfirmedAt active until exit is established", () => {
+  const reportedRunning: MissionProgressMember = {
+    runId: "run-1",
+    memberId: "m-reported-live",
+    sessionId: "s-reported-live",
+    revision: 2,
+    role: "implementer",
+    taskId: "task-a",
+    recordedStatus: "reported",
+    workerStatus: "running",
+  };
+  const reportedConfirmed: MissionProgressMember = {
+    ...reportedRunning,
+    memberId: "m-reported-confirmed",
+    exitConfirmedAt: "2026-11-26T00:10:00.000Z",
+    workerStatus: "exited",
+  };
+
+  assert.equal(isAwaitingExitMember(reportedRunning), true);
+  assert.equal(isAwaitingExitMember(reportedConfirmed), false);
+
+  const liveOnly = compactAssignments([reportedRunning]);
+  assert.equal(liveOnly.active.length, 1);
+  assert.equal(liveOnly.active[0]?.member.memberId, "m-reported-live");
+  assert.equal(liveOnly.finished.length, 0);
+
+  const afterConfirm = compactAssignments([reportedConfirmed]);
+  assert.equal(afterConfirm.active.length, 0);
+  assert.deepEqual(afterConfirm.finished.map(item => item.memberId), ["m-reported-confirmed"]);
+});
+
+test("resolveMissionChild requires a verified linked child and distinguishes unavailable or loading progress from not-created", () => {
+  const mission = { id: MISSION_ID };
+  const linkedSubtask = { id: "api", repoProjectId: "repo-api", teamId: "run-api" };
+  const uncreatedSubtask = { id: "web", repoProjectId: "repo-web" };
+
+  assert.equal(
+    resolveMissionChild(mission, linkedSubtask, null, { progressLoading: true }).kind,
+    "loading",
+  );
+  assert.equal(
+    resolveMissionChild(mission, uncreatedSubtask, null, { progressLoading: true }).kind,
+    "loading",
+  );
+  const failed = resolveMissionChild(mission, linkedSubtask, null, { progressError: "timeout" });
+  assert.equal(failed.kind, "unavailable");
+  if (failed.kind === "unavailable") assert.match(failed.reason, /timeout/);
+
+  const baseSnapshot = makeSnapshot(3);
+  const verified = resolveMissionChild(mission, linkedSubtask, baseSnapshot);
+  assert.equal(verified.kind, "linked");
+  if (verified.kind === "linked") assert.equal(verified.verifiedTeamId, "run-api");
+
+  const mismatchedSnapshot: MissionProgressSnapshot = {
+    ...baseSnapshot,
+    subtasks: [{ ...baseSnapshot.subtasks[0]!, child: { kind: "mismatched" } }],
+  };
+  assert.equal(resolveMissionChild(mission, linkedSubtask, mismatchedSnapshot).kind, "mismatched");
+
+  const missingSnapshot: MissionProgressSnapshot = {
+    ...baseSnapshot,
+    subtasks: [{ ...baseSnapshot.subtasks[0]!, child: { kind: "missing" } }],
+  };
+  assert.equal(resolveMissionChild(mission, linkedSubtask, missingSnapshot).kind, "missing");
+
+  const wrongRunSnapshot: MissionProgressSnapshot = {
+    ...baseSnapshot,
+    subtasks: [{
+      ...baseSnapshot.subtasks[0]!,
+      child: {
+        kind: "linked",
+        runId: "run-other-team",
+        missionId: MISSION_ID,
+        projectId: "repo-api",
+        revision: 3,
+        status: "implementing",
+        assignments: [],
+        checks: [],
+      },
+    }],
+  };
+  assert.equal(resolveMissionChild(mission, linkedSubtask, wrongRunSnapshot).kind, "mismatched");
+  assert.equal(resolveMissionChild(mission, { id: "api", repoProjectId: "repo-api" }, baseSnapshot).kind, "mismatched");
+
+  const notCreatedSnapshot: MissionProgressSnapshot = {
+    ...baseSnapshot,
+    subtasks: [
+      { id: "web", title: "Web", repoProjectId: "repo-web", status: "queued", child: { kind: "not-created" } },
+      { id: "api", title: "API", repoProjectId: "repo-api", status: "running", child: { kind: "not-created" } },
+    ],
+  };
+  assert.equal(resolveMissionChild(mission, uncreatedSubtask, notCreatedSnapshot).kind, "not-created");
+  assert.equal(resolveMissionChild(mission, linkedSubtask, notCreatedSnapshot).kind, "unavailable");
+  assert.equal(
+    resolveMissionChild(mission, { id: "unlisted", repoProjectId: "repo-api" }, baseSnapshot).kind,
+    "unavailable",
+  );
+});
+
+test("real projectMissionChild projection feeds replaced implementer prior attempts into compactAssignments", async () => {
+  const childRunId = randomUUID();
+  const replacedId = randomUUID();
+  const replacementId = randomUUID();
+  const replacementSession = randomUUID();
+  const run = {
+    id: childRunId,
+    projectId: "repo-api",
+    missionId: MISSION_ID,
+    revision: 2,
+    status: "implementing",
+    updatedAt: "2026-11-26T02:00:00.000Z",
+    tasks: [{ id: "task-api", revision: 2, memberId: replacementId }],
+    members: [
+      {
+        runId: childRunId,
+        memberId: replacedId,
+        sessionId: randomUUID(),
+        revision: 2,
+        role: "implementer",
+        taskId: "task-api",
+        status: "stopped",
+        exitConfirmedAt: "2026-11-26T01:55:00.000Z",
+      },
+      {
+        runId: childRunId,
+        memberId: replacementId,
+        sessionId: replacementSession,
+        revision: 2,
+        role: "implementer",
+        taskId: "task-api",
+        status: "running",
+      },
+    ],
+    checks: [],
+  } as unknown as TeamRun;
+
+  const service = new MissionProgressService({
+    missions: {
+      progressSource: () => ({
+        id: MISSION_ID,
+        title: "Mission with replacement",
+        status: "working",
+        revision: 2,
+        updatedAt: "2026-11-26T02:00:00.000Z",
+        subtasks: [{ id: "api", title: "API", repoProjectId: "repo-api", status: "running", teamId: childRunId }],
+      }),
+    },
+    teams: { missionProgressChild: () => projectMissionChild(run, MISSION_ID, "repo-api") },
+    manager: {
+      meta: sessionId => ({
+        session: {
+          team: sessionId === replacementSession
+            ? { runId: childRunId, memberId: replacementId, revision: 2, role: "implementer", taskId: "task-api" }
+            : undefined,
+        },
+      }),
+      state: async () => ({ status: "running" }),
+    },
+  });
+
+  const page = await service.read(MISSION_ID);
+  const resolved = resolveMissionChild(
+    { id: MISSION_ID },
+    { id: "api", repoProjectId: "repo-api", teamId: childRunId },
+    page.snapshot,
+  );
+  assert.equal(resolved.kind, "linked");
+  if (resolved.kind !== "linked") return;
+  const compacted = compactAssignments(resolved.child.assignments);
+  assert.equal(resolved.child.assignments.length, 2);
+  assert.equal(currentAssignmentCount(resolved.child.assignments), 1);
+  assert.equal(compacted.active.length, 1);
+  assert.equal(compacted.active[0]?.member.memberId, replacementId);
+  assert.deepEqual(compacted.active[0]?.priorAttempts.map(item => item.memberId), [replacedId]);
+  assert.equal(compacted.finished.length, 0);
+
+  const finishedWithReplacement: MissionProgressMember[] = [
+    { ...resolved.child.assignments[0]!, recordedStatus: "stopped", exitConfirmedAt: "2026-11-26T02:05:00.000Z" },
+    resolved.child.assignments[1]!,
+    {
+      runId: childRunId,
+      memberId: randomUUID(),
+      sessionId: randomUUID(),
+      revision: 2,
+      role: "reviewer",
+      recordedStatus: "running",
+      workerStatus: "running",
+    },
+  ];
+  assert.equal(currentAssignmentCount(finishedWithReplacement), 2);
 });

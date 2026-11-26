@@ -654,3 +654,67 @@ test("remote router round-trips valid percent-encoded path segments to Express a
     await host.stop();
   }
 });
+
+test("the relay carries mission progress and team entry reads and denies mutations or unrelated subpaths", { timeout: 20000 }, async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  const missionId = randomUUID();
+  const teamId = randomUUID();
+  const entryId = randomUUID();
+  const v8EntryId = "12345678-1234-8123-8123-123456789abc";
+  const cursor = `mp1.${randomUUID()}.${missionId}.${randomUUID()}.4`;
+  try {
+    assert.deepEqual(
+      await client.request(`/missions/${missionId}/progress`),
+      { count: 1, method: "GET", path: `/api/missions/${missionId}/progress` },
+    );
+    assert.deepEqual(
+      await client.request(`/missions/${missionId}/progress?cursor=${encodeURIComponent(cursor)}`),
+      { count: 2, method: "GET", path: `/api/missions/${missionId}/progress?cursor=${encodeURIComponent(cursor)}` },
+    );
+    assert.deepEqual(
+      await client.request(`/teams/${teamId}/entries`),
+      { count: 3, method: "GET", path: `/api/teams/${teamId}/entries` },
+    );
+    assert.deepEqual(
+      await client.request(`/teams/${teamId}/entries?kind=check&since=10`),
+      { count: 4, method: "GET", path: `/api/teams/${teamId}/entries?kind=check&since=10` },
+    );
+    assert.deepEqual(
+      await client.request(`/teams/${teamId}/entries/${entryId}`),
+      { count: 5, method: "GET", path: `/api/teams/${teamId}/entries/${entryId}` },
+    );
+    assert.deepEqual(
+      await client.request(`/teams/${teamId}/entries/${v8EntryId}`),
+      { count: 6, method: "GET", path: `/api/teams/${teamId}/entries/${v8EntryId}` },
+    );
+
+    const denied: readonly [method: "GET" | "POST" | "PUT" | "DELETE", path: string][] = [
+      ["POST", `/missions/${missionId}/progress`],
+      ["GET", `/missions/${missionId}/progress/extra`],
+      ["GET", "/missions/not-a-uuid/progress"],
+      ["GET", `/missions/${missionId}/%70rogress`],
+      ["POST", `/teams/${teamId}/entries`],
+      ["PUT", `/teams/${teamId}/entries/${entryId}`],
+      ["POST", `/teams/${teamId}/entries/${entryId}`],
+      ["DELETE", `/teams/${teamId}/entries/${entryId}`],
+      ["GET", `/teams/${teamId}/entries/not-a-uuid`],
+      ["GET", `/teams/${teamId}/entries/${entryId}/withdraw`],
+      ["POST", `/teams/${teamId}/entries/${entryId}/withdraw`],
+      ["GET", `/teams/${teamId}/entries/${entryId}/extra`],
+      ["GET", "/teams/not-a-uuid/entries"],
+      ["GET", `/teams/${teamId}/%65ntries`],
+    ];
+    for (const [method, path] of denied) {
+      await assert.rejects(
+        client.request(path, { method, body: method === "GET" ? undefined : {} }),
+        (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied",
+        `${method} ${path} must be denied`,
+      );
+    }
+    assert.equal(runner.requests.length, 6, "denied inspector mutations and subpaths never reach the host");
+  } finally {
+    client.close();
+    runner.close();
+  }
+});

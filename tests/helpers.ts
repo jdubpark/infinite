@@ -25,6 +25,12 @@ export const waitFor = async <T>(
   throw new Error(`Condition was not reached; last state: ${JSON.stringify(last)}`);
 };
 
+export async function moveWorkerClock(worker: ChildProcess, file: string, ms: number) {
+  writeFileSync(file, String(ms));
+  worker.kill("SIGUSR2");
+  await waitFor(async () => readFileSync(file, "utf8"), text => text === `moved ${ms}`);
+}
+
 export function processes(): { pid: number; parent: number; command: string }[] {
   return execFileSync("ps", ["-ww", "-eo", "pid=,ppid=,args="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).split("\n").flatMap(line => {
     const row = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
@@ -195,7 +201,7 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
         return 0;
       }
     };
-    const lock = join(config.runDir, "server.lock"), step = options.startStepMs ?? 10000;
+    const lock = join(config.runDir, "server.lock"), step = options.startStepMs ?? 20000;
     const loaded = () => { try { return readFileSync(lock, "utf8") === String(api.pid); } catch { return false; } };
     await waitFor(async () => loaded() || await answer() === 200, (ready) => ready, step);
     await waitFor(answer, (status) => status === 200, step);

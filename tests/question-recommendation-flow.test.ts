@@ -5,8 +5,9 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { waitFor } from "./helpers.js";
 import { scriptedMissionHarness as scripted } from "./mission-harness.js";
+import { HookPayloadError, startHookServer } from "../packages/host/src/hooks.js";
 import { recommendationLine } from "../packages/host/src/question-recommendation.js";
-import { createMissionReportEnvelope, createReportEnvelope, submitMissionReport, submitTeamReport } from "../packages/host/src/team-report-client.js";
+import { createMissionReportEnvelope, createReportEnvelope, ReportError, submitMissionReport, submitTeamReport } from "../packages/host/src/team-report-client.js";
 import type { Mission } from "../packages/host/src/mission-types.js";
 
 const until = (read: () => Mission, accepts: (mission: Mission) => boolean) => waitFor(async () => read(), accepts, 60000);
@@ -25,25 +26,123 @@ test("a retry envelope is read in its recorded form but cannot skip the recommen
 
 test("a question still reaches a worker started before recommendations, without its recommendation", async () => {
   const seen: { requestId: string; report: Record<string, unknown> }[] = [];
+  let responseHeaders: Record<string, string> = {};
   const worker = createServer((request, response) => {
     let body = "";
     request.on("data", chunk => { body += chunk; });
-    request.on("end", () => { seen.push(JSON.parse(body)); response.writeHead("recommendation" in seen.at(-1)!.report ? 400 : 204).end(); });
+    request.on("end", () => {
+      seen.push(JSON.parse(body));
+      const status = "recommendation" in seen.at(-1)!.report ? 400 : 204;
+      response.writeHead(status, responseHeaders).end();
+    });
   });
   await new Promise<void>(resolve => worker.listen(0, "127.0.0.1", resolve));
   try {
     const runId = randomUUID(), memberId = randomUUID(), question = { kind: "question", question: "Which format?", options: ["JSON", "Text"] };
     const env = { INFINITE_HOOK_URL: `http://127.0.0.1:${(worker.address() as AddressInfo).port}/hook`, INFINITE_HOOK_TOKEN: "capability",
       INFINITE_TEAM_ASSIGNMENT: JSON.stringify({ runId, memberId, revision: 1 }), INFINITE_MISSION_ASSIGNMENT: JSON.stringify({ missionId: runId, memberId, revision: 1 }) };
-    for (const submit of [submitTeamReport, submitMissionReport]) {
-      seen.length = 0;
-      const recorded = await submit({ ...question, recommendation: { answers: ["JSON"], reason: "Clients parse it." } }, env);
-      assert.deepEqual(seen.map(envelope => "recommendation" in envelope.report), [true, false], "the question is sent once more without the field");
-      assert.deepEqual(recorded.report, question);
-      assert.equal(recorded.requestId, seen[1].requestId);
-      assert.notEqual(seen[0].requestId, seen[1].requestId, "a different report has a different identity");
+    for (const headers of [{}, { "X-Infinite-Hook-Capabilities": "transcript, question-recommendation-v2" }] as Record<string, string>[]) {
+      responseHeaders = headers;
+      for (const submit of [submitTeamReport, submitMissionReport]) {
+        seen.length = 0;
+        const recorded = await submit({ ...question, recommendation: { answers: ["JSON"], reason: "Clients parse it." } }, env);
+        assert.deepEqual(seen.map(envelope => "recommendation" in envelope.report), [true, false], "the question is sent once more without the field");
+        assert.deepEqual(recorded.report, question);
+        assert.equal(recorded.requestId, seen[1].requestId);
+        assert.notEqual(seen[0].requestId, seen[1].requestId, "a different report has a different identity");
+      }
     }
   } finally { worker.close(); }
+});
+
+test("real HTTP 400 validation errors on a question report are never masked or retried without recommendation", async () => {
+  const runId = randomUUID(), memberId = randomUUID();
+  const question = { kind: "question", question: "Which format?", options: ["JSON", "Text"], recommendation: { answers: ["JSON"], reason: "Clients parse it." } };
+  const makeEnv = (url: string) => ({
+    INFINITE_HOOK_URL: url,
+    INFINITE_HOOK_TOKEN: "capability",
+    INFINITE_TEAM_ASSIGNMENT: JSON.stringify({ runId, memberId, revision: 1 }),
+    INFINITE_MISSION_ASSIGNMENT: JSON.stringify({ missionId: runId, memberId, revision: 1 }),
+  });
+
+  const hookSeen: { route: string; body: { requestId: string; report: Record<string, unknown> } }[] = [];
+  let hookError = new HookPayloadError(400);
+  const hookServer = await startHookServer({
+    token: "capability",
+    onPayload: (route, body) => {
+      hookSeen.push({ route, body: body as { requestId: string; report: Record<string, unknown> } });
+      throw hookError;
+    },
+    onError: () => {},
+  });
+  try {
+    for (const [error, expectedPattern] of [
+      [new HookPayloadError(400), /Report refused(?: or unconfirmed)? \(400\)/],
+      [new HookPayloadError(400, "Invalid question: options conflict"), /^Invalid question: options conflict$/],
+    ] as const) {
+      hookError = error;
+      for (const submit of [submitTeamReport, submitMissionReport]) {
+        hookSeen.length = 0;
+        await assert.rejects(
+          () => submit(question, makeEnv(hookServer.url)),
+          caught => caught instanceof ReportError && expectedPattern.test(caught.message),
+        );
+        assert.equal(hookSeen.length, 1, "current hook server 400 must not retry or strip recommendation");
+        assert.equal("recommendation" in hookSeen[0].body.report, true);
+      }
+    }
+  } finally { hookServer.close(); }
+
+  const rawSeen: { requestId: string; report: Record<string, unknown> }[] = [];
+  let replySpec: { headers?: Record<string, string>; body: string } = { body: "" };
+  const rawServer = createServer((request, response) => {
+    let body = "";
+    request.on("data", chunk => { body += chunk; });
+    request.on("end", () => {
+      rawSeen.push(JSON.parse(body));
+      response.writeHead(400, replySpec.headers).end(replySpec.body);
+    });
+  });
+  await new Promise<void>(resolve => rawServer.listen(0, "127.0.0.1", resolve));
+  try {
+    const rawUrl = `http://127.0.0.1:${(rawServer.address() as AddressInfo).port}/hook`;
+    const noRetryCases: { label: string; headers?: Record<string, string>; body: string; expected: RegExp }[] = [
+      { label: "capability header with empty body", headers: { "X-Infinite-Hook-Capabilities": "transcript, QUESTION-RECOMMENDATION" }, body: "", expected: /Report refused(?: or unconfirmed)? \(400\)/ },
+      { label: "plain-text validation body without capability header", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: "Invalid question: duplicate options", expected: /^Invalid question: duplicate options$/ },
+      { label: "whitespace-only body without capability header", body: "   ", expected: /Report refused(?: or unconfirmed)? \(400\)/ },
+    ];
+    for (const testCase of noRetryCases) {
+      replySpec = { headers: testCase.headers, body: testCase.body };
+      for (const submit of [submitTeamReport, submitMissionReport]) {
+        rawSeen.length = 0;
+        await assert.rejects(
+          () => submit(question, makeEnv(rawUrl)),
+          caught => caught instanceof ReportError && testCase.expected.test(caught.message),
+          testCase.label,
+        );
+        assert.equal(rawSeen.length, 1, `${testCase.label}: must send exactly one request`);
+        assert.equal("recommendation" in rawSeen[0].report, true, `${testCase.label}: must preserve recommendation`);
+      }
+    }
+
+    replySpec = { body: "" };
+    for (const submit of [submitTeamReport, submitMissionReport]) {
+      rawSeen.length = 0;
+      await assert.rejects(
+        () => submit(question, makeEnv(rawUrl)),
+        caught => caught instanceof ReportError && /Report refused(?: or unconfirmed)? \(400\)/.test(caught.message),
+      );
+      assert.deepEqual(rawSeen.map(envelope => "recommendation" in envelope.report), [true, false], "legacy fallback retries at most once");
+      assert.notEqual(rawSeen[0].requestId, rawSeen[1].requestId);
+
+      rawSeen.length = 0;
+      await assert.rejects(
+        () => submit({ kind: "result", summary: "Finished." }, makeEnv(rawUrl)),
+        caught => caught instanceof ReportError && /Report refused(?: or unconfirmed)? \(400\)/.test(caught.message),
+      );
+      assert.equal(rawSeen.length, 1, "non-question bare 400 never retries");
+    }
+  } finally { rawServer.close(); }
 });
 
 test("a subteam's recommendation reaches the coordinator, whose forwarded question keeps its own, and the owner's answer records how it compared", { timeout: 60000 }, async () => {

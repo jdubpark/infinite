@@ -11,16 +11,22 @@ test("hook server accepts authenticated JSON and rejects the rest", async () => 
       fetch(`${server.url}${path}`, { method: "POST", body, headers: { "Content-Type": "application/json", ...(auth ? { Authorization: auth } : {}) } });
     let r = await post("/claude", JSON.stringify({ hook_event_name: "Stop" }), "Bearer secret");
     assert.equal(r.status, 204);
+    assert.equal(r.headers.get("x-infinite-hook-capabilities"), "question-recommendation");
     r = await post("/codex", JSON.stringify({ hook_event_name: "Stop" }), "Bearer wrong");
     assert.equal(r.status, 401);
+    assert.equal(r.headers.get("x-infinite-hook-capabilities"), null);
     r = await post("/claude", "not json", "Bearer secret");
     assert.equal(r.status, 400);
+    assert.equal(r.headers.get("x-infinite-hook-capabilities"), "question-recommendation");
     r = await post("/claude", JSON.stringify([{ hook_event_name: "Stop" }]), "Bearer secret");
     assert.equal(r.status, 400);
+    assert.equal(r.headers.get("x-infinite-hook-capabilities"), "question-recommendation");
     r = await post("/elsewhere", "{}", "Bearer secret");
     assert.equal(r.status, 404);
+    assert.equal(r.headers.get("x-infinite-hook-capabilities"), null);
     r = await post("/claude", JSON.stringify({ big: "x".repeat(300 * 1024) }), "Bearer secret");
     assert.equal(r.status, 413);
+    assert.equal(r.headers.get("x-infinite-hook-capabilities"), "question-recommendation");
     assert.deepEqual(received, [{ route: "claude", body: { hook_event_name: "Stop" } }]);
     assert.equal(errors, 4);
   } finally {
@@ -54,8 +60,12 @@ test("report acceptance is refused when validation or durable recording fails", 
     method: "POST", headers: { Authorization: "Bearer scoped-report-capability", "Content-Type": "application/json" }, body: "{}",
   });
   try {
-    assert.equal((await post()).status, 409, "A rejected report must not receive an acceptance receipt");
+    const refused = await post();
+    assert.equal(refused.status, 409, "A rejected report must not receive an acceptance receipt");
+    assert.equal(refused.headers.get("x-infinite-hook-capabilities"), "question-recommendation");
     failure = "storage";
-    assert.equal((await post()).status, 500, "A failed journal append must not receive an acceptance receipt");
+    const failed = await post();
+    assert.equal(failed.status, 500, "A failed journal append must not receive an acceptance receipt");
+    assert.equal(failed.headers.get("x-infinite-hook-capabilities"), "question-recommendation");
   } finally { server.close(); }
 });

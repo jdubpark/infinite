@@ -4023,9 +4023,11 @@ refuses a question without one, and the refusal names the shape to send, so a
 member whose prompt predates this rule can add it. A question a member's
 session recorded before this rule still becomes a decision, with no
 recommendation. A session started before this rule keeps a worker that does
-not know the field. When that worker refuses a question for it, the reporter
-sends the question once more without its recommendation, so the member can
-still ask. The decision stores the
+not know the field. Current workers advertise
+`X-Infinite-Hook-Capabilities: question-recommendation`, so real HTTP 400
+validation errors surface without retry. Only when an older worker without that
+capability answers with an empty HTTP 400 does the reporter send the question
+once more without its recommendation, so the member can still ask. The decision stores the
 recommendation and clients show it first, as the asking agent's. A worker's
 question reaches the project manager's recovery with its recommendation
 appended to the reason. When the decision is answered, by the owner, a mission

@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createConnection } from "node:net";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import headless from "@xterm/headless";
@@ -25,6 +26,7 @@ process.stdin.setEncoding("utf8");
 process.stdout.write("READY\r\n\x1b[?2004h\x1b[?25l\x1b[?1006h");
 let pending = "";
 let permissionOpen = false;
+let permissionHold;
 let collapsedPermissionOpen = false;
 let expansionCount = 0;
 let feedbackOpen = false;
@@ -61,7 +63,9 @@ process.stdin.on("data", data => {
     return;
   }
   if (permissionOpen && data.includes("\x1b[B")) {
-    setTimeout(() => process.stdout.write("\x1b[2J\x1b[Hnpm run check\r\nPermission needed\r\n  1. No\r\n❯ 2. Yes, proceed once\r\n"), 150);
+    const moved = () => process.stdout.write("\x1b[2J\x1b[Hnpm run check\r\nPermission needed\r\n  1. No\r\n❯ 2. Yes, proceed once\r\n");
+    if (permissionHold) fetch(permissionHold).then(moved, () => {});
+    else setTimeout(moved, 150);
     return;
   }
   if (permissionOpen && data.includes("\r")) {
@@ -75,8 +79,9 @@ process.stdin.on("data", data => {
     const command = pending.slice(0, end); pending = pending.slice(end + 1);
     if (command === "burst") {
       for (let i = 1; i <= 320; i++) process.stdout.write("\x1b[32mROW " + i + " café 界\x1b[0m\r\n");
-    } else if (command === "permission") {
+    } else if (command.split(" ")[0] === "permission") {
       permissionOpen = true;
+      permissionHold = command.split(" ")[1];
       process.stdout.write("\x1b[2J\x1b[Hnpm run check\r\nPermission needed\r\n❯ 1. No\r\n  2. Yes, proceed once\r\n");
       fetch(process.env.INFINITE_HOOK_URL + "/claude", {
         method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + process.env.INFINITE_HOOK_TOKEN },
@@ -132,7 +137,7 @@ process.stdin.on("data", data => {
 `;
 
 async function fixture(provider: "demo" | "claude" | "codex" = "demo", initialPrompt = "", team?: TeamAssignment) {
-  const root = mkdtempSync("/tmp/inf-worker-");
+  const root = mkdtempSync(join(tmpdir(), "inf-worker-"));
   const id = randomUUID();
   const key = randomBytes(32);
   const runDir = join(root, "run");
@@ -184,6 +189,25 @@ async function fixture(provider: "demo" | "claude" | "codex" = "demo", initialPr
   } catch (error) { await stop(); throw error; }
   return { id, root, stateDir, runDir, key, session: bootstrap.session, cwd: realpathSync(root), runtime, call, events, output, command, stop, persisted: () => unseal<WorkerState>(key, `${id}:status`, readFileSync(join(stateDir, "sessions", id, "status.sealed"), "utf8")) };
 }
+
+async function dialogHold() {
+  let arrive!: () => void;
+  let release!: () => void;
+  const arrived = new Promise<void>(resolve => { arrive = resolve; });
+  const released = new Promise<void>(resolve => { release = resolve; });
+  const server = createServer((_request, response) => {
+    arrive();
+    void released.then(() => response.end());
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  return {
+    url: `http://127.0.0.1:${(server.address() as { port: number }).port}/`,
+    reached: (answer: Promise<unknown>) => Promise.race([arrived, answer.then(() => { throw new Error("The answer ended before its first key reached the dialog"); })]),
+    release,
+    close: () => { server.closeAllConnections(); server.close(); },
+  };
+}
+type DialogHold = Awaited<ReturnType<typeof dialogHold>>;
 
 function teamAnswerRequest(worker: Awaited<ReturnType<typeof fixture>>, team: TeamAssignment, prompt: NonNullable<WorkerState["attention"]["prompt"]>, requestId: string, actor: ControlActor, leaseId: string, decisionId: string) {
   const option = oneShotPermissionOption(prompt);
@@ -502,8 +526,10 @@ test("delegated answers stay bound to the assigned one-shot prompt and stop afte
   } finally { await worker.stop(); }
 
   const takeoverWorker = await fixture("demo", "", team);
+  let takeoverHold: DialogHold | undefined;
   try {
-    await takeoverWorker.command("permission");
+    takeoverHold = await dialogHold();
+    await takeoverWorker.command(`permission ${takeoverHold.url}`);
     const open = await waitFor(() => takeoverWorker.call({ op: "state" }), state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
     const human = { id: "human-control", label: "Human" };
     const humanLease = await takeoverWorker.call<ControlLease>({ op: "control", action: "claim", actor: human });
@@ -512,8 +538,9 @@ test("delegated answers stay bound to the assigned one-shot prompt and stop afte
     const hostLease = await takeoverWorker.call<ControlLease>({ op: "control", action: "claim", actor });
     const request = teamAnswerRequest(takeoverWorker, team, open.attention.prompt!, randomUUID(), actor, hostLease.id, decisionId);
     const pending = takeoverWorker.call(request);
-    await waitFor(async () => takeoverWorker.events(), events => events.some(event => event.type === "input-intent" && event.data.requestId === request.requestId));
+    await takeoverHold.reached(pending);
     const takeover = await takeoverWorker.call<ControlLease>({ op: "control", action: "claim", actor: human, takeover: true });
+    takeoverHold.release();
     const interrupted = await pending as Receipt & { result?: string };
     assert.equal(interrupted.state, "uncertain");
     assert.equal(interrupted.result, undefined);
@@ -523,17 +550,20 @@ test("delegated answers stay bound to the assigned one-shot prompt and stop afte
     assert.equal(takeoverWorker.events().filter(event => event.type === "input-intent" && event.data.requestId === request.requestId).length, 1);
     assert.equal(takeoverWorker.events().filter(event => event.type === "input-result" && event.data.requestId === request.requestId).length, 0);
     assert.doesNotMatch(takeoverWorker.output(), /APPROVED/);
-  } finally { await takeoverWorker.stop(); }
+  } finally { takeoverHold?.close(); await takeoverWorker.stop(); }
 
   const invalidationWorker = await fixture("demo", "", team);
+  let invalidationHold: DialogHold | undefined;
   try {
-    await invalidationWorker.command("permission");
+    invalidationHold = await dialogHold();
+    await invalidationWorker.command(`permission ${invalidationHold.url}`);
     const open = await waitFor(() => invalidationWorker.call({ op: "state" }), state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
     const hostLease = await invalidationWorker.call<ControlLease>({ op: "control", action: "claim", actor });
     const request = teamAnswerRequest(invalidationWorker, team, open.attention.prompt!, randomUUID(), actor, hostLease.id, decisionId);
     const pending = invalidationWorker.call<Receipt & { result?: string }>(request);
-    await waitFor(async () => invalidationWorker.events(), events => events.some(event => event.type === "input-intent" && event.data.requestId === request.requestId));
+    await invalidationHold.reached(pending);
     assert.deepEqual(await invalidationWorker.call({ op: "team-answer-invalidate", decisionId }), { invalidated: true });
+    invalidationHold.release();
     const interrupted = await pending;
     assert.equal(interrupted.state, "uncertain");
     assert.equal(interrupted.result, undefined);
@@ -544,7 +574,7 @@ test("delegated answers stay bound to the assigned one-shot prompt and stop afte
     assert.equal(afterInvalidation.attention.state, "needs-you");
     assert.equal(afterInvalidation.control, null);
     await assert.rejects(invalidationWorker.call({ ...request, requestId: randomUUID() }), { code: "unsupported" });
-  } finally { await invalidationWorker.stop(); }
+  } finally { invalidationHold?.close(); await invalidationWorker.stop(); }
 });
 
 function sessionAnswerRequest(worker: Awaited<ReturnType<typeof fixture>>, prompt: NonNullable<WorkerState["attention"]["prompt"]>, actor: ControlActor, leaseId: string, decisionId: string, option: number) {
@@ -571,7 +601,9 @@ test("a session permission answer types one recognised option outside any run, o
   } finally { await member.stop(); }
 
   const worker = await fixture("demo");
+  let hold: DialogHold | undefined;
   try {
+    hold = await dialogHold();
     await worker.command("permission");
     const prompt = (await opened(worker)).attention.prompt!;
     const human = { id: "human-control", label: "Human" };
@@ -593,13 +625,14 @@ test("a session permission answer types one recognised option outside any run, o
     assert.equal(intents(worker).length, 1, "a replayed request types nothing again");
 
     await worker.call({ op: "control", action: "release", actor, leaseId: lease.id });
-    await worker.command("permission");
+    await worker.command(`permission ${hold.url}`);
     const next = await waitFor(() => worker.call({ op: "state" }), state => state.attention.state === "needs-you" && (state.attention.prompt?.id ?? 0) > prompt.id && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
     const nextLease = await worker.call<ControlLease>({ op: "control", action: "claim", actor });
     const accept = sessionAnswerRequest(worker, next.attention.prompt!, actor, nextLease.id, decisionId, 1);
     const pending = worker.call<Receipt & { result?: string }>(accept);
-    await waitFor(async () => worker.events(), events => events.some(event => event.type === "input-intent" && event.data.requestId === accept.requestId));
+    await hold.reached(pending);
     await worker.call<ControlLease>({ op: "control", action: "claim", actor: human, takeover: true });
+    hold.release();
     const interrupted = await pending;
     assert.equal(interrupted.state, "uncertain");
     assert.equal(worker.output().match(/APPROVED/g)?.length, 1, "only the first answer reached the dialog");
@@ -614,7 +647,7 @@ test("a session permission answer types one recognised option outside any run, o
     await assert.rejects(worker.call(sessionAnswerRequest(worker, next.attention.prompt!, retiredActor, retiredLease.id, retired, 1)), { code: "control-lost" });
     assert.equal(intents(worker).length, journaled, "a fenced decision journals and types nothing");
     assert.equal(worker.output().match(/APPROVED/g)?.length, 1);
-  } finally { await worker.stop(); }
+  } finally { hold?.close(); await worker.stop(); }
 });
 
 test("a session reject that takes text is followed by the host's fixed notice, and no other answer takes text", { timeout: 40_000 }, async () => {
@@ -652,8 +685,10 @@ test("a session reject that takes text is followed by the host's fixed notice, a
 
 test("ordinary interrupted answer retries return the refused receipt without typing again", { timeout: 20_000 }, async () => {
   const worker = await fixture("demo");
+  let hold: DialogHold | undefined;
   try {
-    await worker.command("permission");
+    hold = await dialogHold();
+    await worker.command(`permission ${hold.url}`);
     const open = await waitFor(() => worker.call({ op: "state" }), state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash));
     const prompt = open.attention.prompt!;
     const host = { id: "ordinary-answer-host", label: "Host" };
@@ -661,8 +696,9 @@ test("ordinary interrupted answer retries return the refused receipt without typ
     const hostLease = await worker.call<ControlLease>({ op: "control", action: "claim", actor: host });
     const request = { op: "answer" as const, requestId: randomUUID(), promptId: prompt.id, option: 1, actor: host, leaseId: hostLease.id };
     const pending = worker.call(request);
-    await waitFor(async () => worker.events(), events => events.some(event => event.type === "input-intent" && event.data.requestId === request.requestId));
+    await hold.reached(pending);
     await worker.call({ op: "control", action: "claim", actor: human, takeover: true });
+    hold.release();
     await assert.rejects(pending, { code: "control-lost" });
 
     const retry = await worker.call<Receipt & { result?: string }>(request);
@@ -671,7 +707,7 @@ test("ordinary interrupted answer retries return the refused receipt without typ
     assert.equal(worker.events().filter(event => event.type === "input-intent" && event.data.requestId === request.requestId).length, 1);
     assert.equal(worker.events().filter(event => event.type === "input-result" && event.data.requestId === request.requestId).length, 0);
     assert.doesNotMatch(worker.output(), /APPROVED/);
-  } finally { await worker.stop(); }
+  } finally { hold?.close(); await worker.stop(); }
 });
 
 test("a host-authorized mission answer does not require an input-control lease", { timeout: 20_000 }, async () => {

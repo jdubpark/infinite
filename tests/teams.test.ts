@@ -2306,17 +2306,19 @@ test(`a report written during a stall stop wins over replacement${limited ? " an
   try {
     const member = f.run.members[0];
     const report = { kind: "question", question: "Which scope should this assignment use?", options: ["Keep the current scope"] };
+    f.manager.events = (read => (id: string, after: number, limit: number, types?: Set<string>) => read(id, after, after ? limit : 1, types))(f.manager.events);
     f.manager.stopTeamSession = async () => {
       if (f.state.status !== "exited") {
         if (limited) f.journal.append("signal", { kind: "provider-limit", limit: "usage", confidence: "corroborated", provider: "demo", source: "protocol", message: "Usage exhausted" });
-        for (let index = 0; index < 205; index++) f.journal.append("signal", { kind: "notice", type: "fixture" });
         const envelope = { requestId: randomUUID(), runId: f.run.id, memberId: member.memberId, revision: member.revision, report };
-        f.journal.append("team-report", { ...envelope, runId: randomUUID() });
-        f.journal.append("team-report", { ...envelope, memberId: randomUUID() });
-        f.journal.append("team-report", { ...envelope, revision: member.revision + 1 });
+        const other = (question: string) => ({ ...report, question });
+        f.journal.append("team-report", { ...envelope, runId: randomUUID(), report: other("Which scope should another run use?") });
+        f.journal.append("team-report", { ...envelope, memberId: randomUUID(), report: other("Which scope should another member use?") });
+        f.journal.append("team-report", { ...envelope, revision: member.revision + 1, report: other("Which scope should the next attempt use?") });
         f.journal.append("team-report", envelope);
         f.journal.append("lifecycle", { status: "exited" });
         f.state.status = "exited";
+        f.journal.append("usage-coverage", { coverage: "none", records: 0, provider: "demo" });
       }
       return f.manager.state();
     };
@@ -2324,11 +2326,40 @@ test(`a report written during a stall stop wins over replacement${limited ? " an
     const teams = f.openTeam(); teams.start();
     const result = await waitFor(async () => teams.get(f.run.id), run => run.decisions.length > 0 || run.members.length > 1 || run.status === "blocked");
     assert.equal(result.members.length, 1, "A final report must prevent a replacement launch");
-    assert.deepEqual(result.members[0].report, report);
+    assert.deepEqual(result.members[0].report, report, "The member must hold the report naming this run, member and attempt");
     assert.equal(result.members[0].stalledAt, undefined);
     assert.equal(result.members[0].stoppedReason, undefined);
     assert.equal(result.status, "needs-input");
     assert.equal(result.decisions[0].question, report.question, "The ordinary reported path must consume the late report");
+  } finally { f.close(); }
+});
+
+test("a stall stop's own pass pages through the journal and records the report before any later pass", async () => {
+  const f = schedulerFixture();
+  try {
+    const member = f.run.members[0];
+    const report = { kind: "question", question: "Which scope should this assignment use?", options: ["Keep the current scope"] };
+    f.manager.events = (read => (id: string, after: number, limit: number, types?: Set<string>) => read(id, after, after ? limit : 1, types))(f.manager.events);
+    f.writeTeam();
+    const teams = f.openTeam();
+    let closing: Promise<void> | undefined;
+    f.manager.stopTeamSession = async () => {
+      if (f.state.status !== "exited") {
+        f.journal.append("signal", { kind: "notice", type: "fixture" });
+        f.journal.append("team-report", { requestId: randomUUID(), runId: f.run.id, memberId: member.memberId, revision: member.revision, report });
+        f.journal.append("lifecycle", { status: "exited" });
+        f.state.status = "exited";
+        f.journal.append("usage-coverage", { coverage: "none", records: 0, provider: "demo" });
+        closing = teams.close();
+      }
+      return f.manager.state();
+    };
+    teams.start();
+    await waitFor(async () => closing !== undefined, Boolean);
+    await closing;
+    const saved = f.readRecord<{ run: TeamRun }>("team", f.run.id).run.members[0];
+    assert.equal(saved.status, "reported", "The stop's pass must page past the first entry; the closed host runs no later pass");
+    assert.deepEqual(saved.report, report);
   } finally { f.close(); }
 });
 

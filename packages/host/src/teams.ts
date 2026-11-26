@@ -457,6 +457,7 @@ export class TeamService {
   }
   useUsage(service: UsageService) { this.usage = service; }
   useMissionReservations(lookup: MissionReservationLookup) { this.missionReservations = lookup; }
+  useMissionReviews(destination: Parameters<TeamReviewFeedback["useMissions"]>[0]) { return this.reviewFeedback.useMissions(destination); }
   useEvidence(store: EvidenceStore) { this.evidence = store; }
   useRouter(router: RoutingRecorder) { this.router = router; }
   useFuse(fuse: FuseGate) { this.fuse = fuse; }

@@ -619,12 +619,16 @@ export type MissionMessage = (
   | { type: "connector-direction"; source: import("./mcp-types.js").ConnectorSource; text: string }
   | { type: "owner-answer"; decisionId: string; question: string; answer: string; forwardedTo?: { subtaskId: string; childDecisionId: string } }
   | { type: "owner-direction"; text: string }
-  | { type: "repository-held"; subtaskId: string; repoProjectId: string; teamId: string; teamStatus: string; reason?: string }
+  | { type: "review-direction"; subtaskId: string; teamId: string; reviewId: string; pullRequestUrl: string; text: string }
+  | { type: "repository-held"; subtaskId: string; repoProjectId: string; teamId: string; teamStatus: string; reason?: string; reviewId?: string }
   | { type: "resumed" }
   | { type: "follow-up"; followUpId: string; dueAt: string; reason: string; check: string }
   | { type: "refused"; kind: string; reason: string }
 ) & { truncated?: string };
-export const isDirectionMessage = (message: MissionMessage) => message.type === "owner-direction" || message.type === "connector-direction";
+export const isDirectionMessage = (message: MissionMessage) => message.type === "owner-direction" || message.type === "connector-direction" || message.type === "review-direction";
+const reviewDirectionGuidance = (messages: MissionMessage[]) => messages.some(message => message.type === "review-direction" || message.type === "repository-held" && message.reviewId)
+  ? "A review-direction message is the owner's own changes-requested review of a subtask's pull request, quoted unchanged; it is owner direction. A steer-subtask report on that subtask continues its subteam from the delivered commit and updates the same pull request. The host accepts it once per review, only while that subteam still waits for review at the reviewed head, and reads GitHub again before it steers. Decide as for any owner direction: forward it, ask the owner, or do something else in scope. A repository-held message with a reviewId means the forward of that review waits until those runs release the subtask's repository; until then a result is refused, so ask the owner, set a follow-up, or report blocked."
+  : "";
 export type MissionCoordinatorNote = { at: string; text: string };
 export type MissionPromptRepo = { projectId: string; name: string; path: string; teamReady: boolean };
 export type MissionOpenChildDecision = { subtaskId: string; teamId: string; decisionId: string; question: string; options: string[]; answerMode?: "approval" | "single" | "multiple";
@@ -778,7 +782,7 @@ function waitingMessageSentence(waiting: number, messageCount: number, included:
   const count = waiting + messageCount - included;
   return count ? `${count} more message${count === 1 ? " is" : "s are"} waiting; the host delivers ${count === 1 ? "it" : "them"} in your next attempt. Open subteam decisions are always listed in the mission state as openChildDecisions.` : "";
 }
-const fixedMessageFields = new Set(["source", "type", "kind", "subtaskId", "teamId", "decisionId", "childDecisionId", "outcomeId", "repoProjectId", "status", "teamStatus", "execution", "followUpId", "dueAt"]);
+const fixedMessageFields = new Set(["source", "type", "kind", "subtaskId", "teamId", "decisionId", "childDecisionId", "outcomeId", "repoProjectId", "status", "teamStatus", "execution", "followUpId", "dueAt", "reviewId", "pullRequestUrl"]);
 const messageTruncation = (message: MissionMessage) => `Shortened by the host to fit the prompt budget. Full record: ${"teamId" in message && message.teamId
   ? `subteam ${message.teamId}; its members read it in ${TEAM_CONTEXT_PATH}.`
   : "this mission's attempt history; ask the owner for omitted owner text."}`;
@@ -854,6 +858,7 @@ export function missionPromptWithMessageCount(mission: Mission, repos: MissionPr
     `Mission state (JSON): ${JSON.stringify(state)}`,
     notes,
     `Messages since your last attempt (JSON): ${JSON.stringify(includedMessages)}`,
+    reviewDirectionGuidance(includedMessages),
     waitingMessageSentence(context.waiting, messages.length, includedMessages.length),
     mission.mode === "answer" ? "Ask the owner only what the repositories cannot settle. Do not publish, merge, deploy, change repository remotes, or approve provider permissions." : `Escalate to the owner only what the objective and owner direction do not settle, such as product, scope, or risk decisions. A result means every subtask finished; it does not establish product impact or acceptance. Do not publish, merge, deploy, change repository remotes, or approve provider permissions; each subteam delivers only under its own repository's policy.`,
     `Write summaries and questions in plain English. Lead with concrete facts. Do not invent evidence or claim checks or outcomes you did not observe.`,
@@ -874,6 +879,7 @@ export function missionFollowUpPromptWithMessageCount(mission: Mission, repos: M
     `Mission state: ${JSON.stringify(state)}`,
     mission.mode === "answer" ? answerGuidance() : intakeGuidance(mission, repos, context.answerProjectId),
     `Messages since your last attempt (JSON): ${JSON.stringify(includedMessages)}`,
+    reviewDirectionGuidance(includedMessages),
     waitingMessageSentence(context.waiting, messages.length, includedMessages.length),
     "Every attempt must end with exactly one structured mission report, then stop.",
     missionReportingInstructions(provider),

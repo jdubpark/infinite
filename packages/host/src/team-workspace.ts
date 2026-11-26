@@ -42,9 +42,14 @@ export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSig
 }
 function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, prefix: TeamCommand | undefined, input: string | undefined, extraEnv: Record<string, string> | undefined, forceSettleAfterMs: number | undefined, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
   return new Promise((resolveResult, reject) => {
-    const env = command.command === "git" ? teamGitEnvironment(extraEnv) : teamCommandEnvironment(extraEnv);
+    if (signal?.aborted) {
+      scope?.started(undefined);
+      resolveResult({ exitCode: null, output: "", stdout: "", interrupted: true, truncated: false, leftover: false });
+      return;
+    }
     let child: ReturnType<typeof spawn>;
     try {
+      const env = command.command === "git" ? teamGitEnvironment(extraEnv) : teamCommandEnvironment(extraEnv);
       child = spawn(prefix?.command ?? command.command, prefix ? [...prefix.args, command.command, ...command.args] : command.args, { cwd, env, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
     } catch (error) {
       scope?.started(undefined);

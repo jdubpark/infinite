@@ -315,6 +315,7 @@ export interface Mission {
   reason?: string;
   stopReason?: "deadline";
   clockStoppedAt?: string;
+  canAnswerPaused?: true;
   createdAt: string;
   updatedAt: string;
   lineup: TeamLineup;

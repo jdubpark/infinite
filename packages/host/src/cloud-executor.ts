@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { clearEgressEnvironment } from "./egress.js";
-import { GROUP_SUPERVISOR } from "./group-supervisor.js";
+import { supervisorArgs } from "./group-supervisor.js";
 
 const STARTUP_TIMEOUT = 15000;
 const STARTUP_ERROR = "The cloud executor did not become ready. No command was replayed.";
@@ -49,9 +49,9 @@ export async function startCloudExecutor(options: { cwd: string; command?: strin
   const env: NodeJS.ProcessEnv = { ...process.env };
   clearEgressEnvironment(env);
   Object.assign(env, options.egress ?? {});
-  const child = spawn(process.execPath, ["-e", GROUP_SUPERVISOR, options.command ?? "codex", ...(options.commandArgs ?? []), "exec-server",
+  const child = spawn(process.execPath, supervisorArgs(options.command ?? "codex", [...(options.commandArgs ?? []), "exec-server",
     "--listen", "ws://127.0.0.1:0", "--ws-auth", "capability-token",
-    "--ws-token-sha256", createHash("sha256").update(token).digest("hex")], {
+    "--ws-token-sha256", createHash("sha256").update(token).digest("hex")], { cwd, env }), {
     cwd, env, stdio: ["pipe", "pipe", "pipe"],
   });
   let closed = false, closing: Promise<void> | undefined;

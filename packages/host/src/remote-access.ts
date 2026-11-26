@@ -88,13 +88,15 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   }
   if (raw[1] === "missions" && raw.length >= 3 && UUID.test(decoded[2])) {
     if (raw.length === 3) return method === "GET";
+    if (raw.length === 4 && raw[3] === "progress") return method === "GET";
     if (raw.length === 4) return method === "POST" && ["steer", "pause", "resume", "cancel", "extend"].includes(raw[3]);
     return raw.length === 5 && method === "POST" && raw[3] === "answer" && UUID.test(decoded[4]);
   }
   if (raw[1] === "teams" && raw.length >= 3 && UUID.test(decoded[2])) {
     if (raw.length === 3) return method === "GET";
-    if (raw.length === 4 && raw[3] === "context") return method === "GET";
+    if (raw.length === 4 && ["context", "context-usage", "entries"].includes(raw[3])) return method === "GET";
     if (raw.length === 4) return method === "POST" && ["steer", "pause", "resume", "continue", "cancel"].includes(raw[3]);
+    if (raw.length === 5 && raw[3] === "entries" && UUID.test(decoded[4])) return method === "GET";
     return raw.length === 6 && method === "POST" && raw[3] === "decisions" && UUID.test(decoded[4]) && raw[5] === "answer";
   }
   if (["POST", "DELETE"].includes(method) && rawPathname === "/api/devices/push") return true;

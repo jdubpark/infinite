@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmdirSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Journal, readEvents, unseal, writeSealed } from "../packages/host/src/vault.js";
@@ -97,4 +97,87 @@ test("a failed sealed write leaves no temporary file", () => {
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("one appendAll batch crossing two segment boundaries writes each event once and reports its segment", () => {
+  const directory = mkdtempSync(join(tmpdir(), "inf-vault-"));
+  const key = randomBytes(32);
+  try {
+    const seen: { seq: number; segment: string }[] = [];
+    const journal = new Journal(directory, key, "session-b", {
+      onAppend: (event, meta) => seen.push({ seq: event.seq, segment: meta.segment }),
+    });
+    for (let i = 0; i < 990; i++) journal.append("output", { text: `lead ${i}` });
+    seen.length = 0;
+    const events = journal.appendAll(
+      "output",
+      Array.from({ length: 300 }, (_, i) => ({ text: `batch ${i}` })),
+    );
+    assert.equal(events.length, 300);
+    assert.equal(journal.seq, 1290);
+    const read = readEvents(directory, key, "session-b", 0, 5000).events;
+    assert.deepEqual(
+      read.map((e) => e.seq),
+      Array.from({ length: 1290 }, (_, i) => i + 1),
+    );
+    assert.deepEqual(
+      seen.map((e) => e.seq),
+      Array.from({ length: 300 }, (_, i) => 991 + i),
+    );
+    for (const entry of seen)
+      assert.equal(entry.segment, `${String(Math.floor((entry.seq - 1) / 256)).padStart(10, "0")}.journal`);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("appendAll hands onAppend each event with its own size, after the data is on disk, with seq already at that event", () => {
+  const directory = mkdtempSync(join(tmpdir(), "inf-vault-"));
+  const key = randomBytes(32);
+  try {
+    const calls: { seq: number; segment: string; bytes: number; onDisk: number; journalSeq: number }[] = [];
+    const journal: Journal = new Journal(directory, key, "session-c", {
+      onAppend: (event, meta) =>
+        calls.push({
+          seq: event.seq,
+          segment: meta.segment,
+          bytes: meta.bytes,
+          onDisk: statSync(join(directory, meta.segment)).size,
+          journalSeq: journal.seq,
+        }),
+    });
+    for (let i = 0; i < 250; i++) journal.append("output", { text: "x" });
+    calls.length = 0;
+    journal.appendAll("output", Array.from({ length: 12 }, (_, i) => ({ text: "y".repeat(i + 1) })));
+    assert.equal(calls.length, 12);
+    const previous = new Map<string, number>();
+    for (const call of calls) {
+      assert.equal(call.journalSeq, call.seq);
+      assert.ok(call.onDisk >= call.bytes);
+      const lines = readFileSync(join(directory, call.segment), "utf8").split("\n");
+      const upTo = lines
+        .slice(0, call.seq - Math.floor((call.seq - 1) / 256) * 256)
+        .reduce((sum, line) => sum + Buffer.byteLength(line) + 1, 0);
+      assert.equal(call.bytes, upTo);
+      assert.ok(call.bytes > (previous.get(call.segment) ?? 0));
+      previous.set(call.segment, call.bytes);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a batch that fails in its second segment leaves the first segment readable and refuses every later append", () => {
+  const directory = mkdtempSync(join(tmpdir(), "inf-vault-"));
+  const key = randomBytes(32);
+  const journal = new Journal(directory, key, "latch");
+  journal.appendAll("output", Array.from({ length: 250 }, (_, index) => ({ text: String(index) })));
+  mkdirSync(join(directory, "0000000001.journal"));
+  assert.throws(() => journal.appendAll("output", Array.from({ length: 20 }, () => ({ text: "x" }))), { code: "EISDIR" });
+  assert.equal(journal.seq, 256);
+  rmdirSync(join(directory, "0000000001.journal"));
+  assert.throws(() => journal.append("output", { text: "later" }), /Journal closed/);
+  assert.equal(journal.seq, 256);
+  const events = readEvents(directory, key, "latch", 0, 1000).events;
+  assert.deepEqual(events.map(event => event.seq), Array.from({ length: 256 }, (_, index) => index + 1));
 });

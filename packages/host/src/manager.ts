@@ -11,7 +11,8 @@ import {
   initialAttention,
   type Attention,
 } from "@infinite/attention";
-import { readEvents, unseal, writeSealed } from "./vault.js";
+import { unseal, writeSealed } from "./vault.js";
+import { readIndexedEvents } from "./signal-index.js";
 import { canonicalOrResolved, collectLivePermissionSockets, ensureSocketDir, existingWorkerSocket, readRecordedSocketPath, removeWorkerSockets, trustedWorkerSocket, workerCall, workerCallAt, type SocketTarget } from "./ipc.js";
 import { SealedFileCache, listedSavedState, listedSession, savedState, unavailableState, type ListedSession, type SavedStatus } from "./session-listing.js";
 import { assertRunnerDeployment } from "./deployment.js";
@@ -1128,6 +1129,6 @@ export class Manager {
   }
   events(id: string, after: number, limit: number, types?: Set<string>) {
     this.meta(id);
-    return readEvents(join(this.config.stateDir, "sessions", id, "events"), this.key, id, after, limit, types);
+    return readIndexedEvents(join(this.config.stateDir, "sessions", id), this.key, id, after, limit, types);
   }
 }

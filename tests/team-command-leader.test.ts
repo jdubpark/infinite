@@ -193,6 +193,29 @@ test("a stop while the leader runs kills its group as before", CASE, async () =>
   }
 });
 
+test("a command whose stop comes before its start never starts, whether it was asked for after the stop or stopped while it waited for its turn, and its scope hears of no process (INF-505)", CASE, async () => {
+  const stopped = new Run(), waiting = new Run();
+  const heard: (number | undefined)[] = [];
+  const started = (pid: number | undefined) => { heard.push(pid); };
+  let open!: () => void;
+  const turn = new Promise<void>(resolve => { open = resolve; });
+  try {
+    stopped.controller.abort();
+    const asked = await stopped.start(waits, { starting: () => undefined, started });
+    const queued = waiting.start(waits, { starting: () => turn, started });
+    waiting.controller.abort();
+    open();
+    const results = [asked, await queued];
+    assert.deepEqual(heard, [undefined, undefined], "the scope heard of a started process");
+    for (const result of results) assert.deepEqual(result, { exitCode: null, output: "", stdout: "", interrupted: true, truncated: false, leftover: false });
+    assert.deepEqual([existsSync(stopped.leaderFile), existsSync(waiting.leaderFile)], [false, false], "a command ran");
+  } finally {
+    open();
+    stopped.dispose();
+    waiting.dispose();
+  }
+});
+
 test("a command inside a scope that records it ends with its leader the same way", CASE, async t => {
   const run = new Run();
   let recorded: number | undefined;

@@ -58,11 +58,13 @@ import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrustAsync } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize, TERMINAL_SIZE_INDEX_FILE, TerminalBarrier, TerminalSizeIndex } from "./terminal-size.js";
+import { SignalIndex } from "./signal-index.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
 import { JsonLineAssembler, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
+import { WorkerScreenActivity } from "./worker-screen-activity.js";
 import { normalizeWorkerControlRequest, teamAnswerWorkerRequestSchema, workerControlRequestSchema, workerWorkspaceExportRequestSchema,
   type Bootstrap,
   type ControlActor,
@@ -89,10 +91,12 @@ const provider = session.provider;
 const key = Buffer.from(config.key, "base64");
 config.key = "";
 const dir = join(stateDir, "sessions", session.id);
-const journal = new Journal(join(dir, "events"), key, session.id);
+let signalIndex: SignalIndex | undefined;
+const journal = new Journal(join(dir, "events"), key, session.id, { onAppend: (event, meta) => { signalIndex?.observe(event, meta); } });
 if (journal.seq !== 0)
   throw new Error("Refusing to start a second process for an existing session");
 const sizeIndex = new TerminalSizeIndex(join(dir, TERMINAL_SIZE_INDEX_FILE), key, session.id);
+signalIndex = new SignalIndex(dir, key, session.id, journal.seq);
 const terminal = new headless.Terminal({ ...DEFAULT_TERMINAL_SIZE, scrollback: 5000, allowProposedApi: true });
 const snapshots = new TerminalSnapshots(terminal);
 type AnswerRequest = Extract<WorkerRequest, { op: "answer" }>;
@@ -168,10 +172,13 @@ function appendAll(type: Event["type"], items: Event["data"][]): Event[] {
 function flush() {
   clearTimeout(flushTimer);
   flushTimer = undefined;
+  const startSeq = journal.seq;
+  const flushedBytes = pending.length;
   const chunks: Event["data"][] = [];
   for (let at = 0; at < pending.length; at += 8192) chunks.push({ text: pending.slice(at, at + 8192) });
   pending = "";
   appendAll("output", chunks);
+  if (journal.seq - startSeq >= 32 || flushedBytes >= 64 * 1024) signalIndex?.checkpoint(journal.seq);
   const covered = sizeIndex.coveredSeq(journal.seq);
   if (covered !== undefined && covered - lastPersistedCoverage >= 256) persist();
 }
@@ -448,8 +455,7 @@ async function onHook(route: HookRoute, body: unknown, run?: string): Promise<Ho
   return reply;
 }
 
-let lastOutputAt = Date.now();
-let outputSinceCheck = false;
+const screenActivity = new WorkerScreenActivity(config.attention.idleAfterMs);
 let missCount = 0;
 let answering: number | undefined;
 
@@ -527,16 +533,10 @@ function checkScreen() {
     const detected = detectPrompt(lines, provider);
     const nowMs = Date.now();
     const at = new Date(nowMs).toISOString();
-    const idle =
-      !outputSinceCheck &&
-      nowMs - lastOutputAt >= config.attention.idleAfterMs &&
-      isIdleScreen(lines, provider);
-    const freshOutput =
-      outputSinceCheck && lastOutputAt > Date.parse(attention.since);
-    const outputThisCheck = outputSinceCheck;
-    outputSinceCheck = false;
-    watchLimit(lines, nowMs, outputThisCheck);
-    let decision = screenDecision(attention, detected, idle, freshOutput, at);
+    const activity = screenActivity.evaluate(attention, lines, provider, isIdleScreen(lines, provider), nowMs);
+    if (activity.changed) publish(activity.attention);
+    watchLimit(lines, nowMs, activity.substantiveChange);
+    let decision = screenDecision(attention, detected, activity.idle, activity.freshOutput, at);
     const open = attention.prompt;
     const replaced =
       detected !== null &&
@@ -555,7 +555,7 @@ function checkScreen() {
           "screen",
         );
         if (replaced)
-          decision = screenDecision(attention, detected, idle, freshOutput, at);
+          decision = screenDecision(attention, detected, activity.idle, activity.freshOutput, at);
       }
     } else missCount = 0;
     if (decision.kind === "merge" && open && !correlates(open, decision.merge)) {
@@ -563,7 +563,7 @@ function checkScreen() {
         { kind: "prompt-closed", promptId: open.id, reason: "superseded" },
         "screen",
       );
-      decision = screenDecision(attention, detected, idle, freshOutput, at);
+      decision = screenDecision(attention, detected, activity.idle, activity.freshOutput, at);
     }
     switch (decision.kind) {
       case "open": {
@@ -580,12 +580,13 @@ function checkScreen() {
         break;
       case "idle":
         if (!native) {
+          screenActivity.clearSpinner();
           const same = attention.state === decision.idle;
-          publish({ ...attention, prompt: undefined, lastTool: undefined, state: decision.idle, since: same ? attention.since : at, source: same ? attention.source : "screen" });
+          publish({ ...attention, spinnerOnlySince: undefined, prompt: undefined, lastTool: undefined, state: decision.idle, since: same ? attention.since : at, source: same ? attention.source : "screen" });
         }
         break;
       case "working":
-        if (!native) publish({ ...attention, prompt: undefined, state: "working", since: at, source: "screen" });
+        if (!native) publish({ ...attention, spinnerOnlySince: undefined, prompt: undefined, state: "working", since: at, source: "screen" });
         break;
       case "close":
       case "none":
@@ -1406,7 +1407,6 @@ const permissionChannel = config.permissionChannel && session.headless?.channel 
       },
       publish: view => { state = { ...state, permissionChannel: view }; persist(); },
       resume: nativeSessionId => {
-        if (state.status === "recording-error") throw new Error("Recording failed");
         if (!resumeProvider) throw new Error("The provider cannot be resumed");
         resumeProvider(nativeSessionId);
       },
@@ -1414,7 +1414,7 @@ const permissionChannel = config.permissionChannel && session.headless?.channel 
       refusal: code => new Refusal(code),
     })
   : undefined;
-if (permissionChannel) setInterval(() => permissionChannel.tick(), 60_000).unref();
+if (permissionChannel) setInterval(() => { try { permissionChannel.tick(); } catch { recordingFailure(); } }, 60_000).unref();
 const wantsHooks =
   !session.runtime?.nativeUi &&
   (Boolean(session.handoff?.policy) || session.nativeArgs === undefined) &&
@@ -1630,8 +1630,7 @@ server.listen(workerSocket, async () => {
       } catch {
         recordingFailure();
       }
-      lastOutputAt = Date.now();
-      outputSinceCheck = true;
+      screenActivity.noteRawOutput(Date.now());
       const flushed = pending.length >= 256 * 1024;
       if (flushed) try { flush(); } catch {}
       if (!flushTimer)
@@ -1664,9 +1663,7 @@ server.listen(workerSocket, async () => {
       } catch {}
     };
     const exited = (exitCode: number) => {
-      let resumable = false;
-      try { resumable = permissionChannel?.exited(exitCode) === true; } catch { recordingFailure(); }
-      if (resumable) return;
+      if (permissionChannel?.exited(exitCode)) return;
       native?.stop();
       void hybrid?.close().catch(() => {}); executor?.close();
       try {
@@ -1675,6 +1672,7 @@ server.listen(workerSocket, async () => {
         state = { ...state, status: "exited", exitCode, control: null };
         publish(applyLifecycle(attention, "exited", new Date().toISOString()));
         append("lifecycle", { status: "exited", exitCode });
+        signalIndex?.checkpoint(journal.seq);
         persist();
       } catch {
         recordingFailure();
@@ -1686,6 +1684,7 @@ server.listen(workerSocket, async () => {
         await finalDrain();
         try {
           if (provider !== "opencode") append("usage-coverage", { ...transcriptWatch.finish(hooksReady, true) });
+          signalIndex?.checkpoint(journal.seq);
           persist();
         } catch {}
         const finish = () => { if (handoffStopping) setTimeout(finish, 100); else void exitWorker(0); };
@@ -1720,6 +1719,7 @@ server.listen(workerSocket, async () => {
         status: "exited",
         error: (error as Error).message,
       });
+      signalIndex?.checkpoint(journal.seq);
       persist();
     } catch {}
     void exitWorker(1);

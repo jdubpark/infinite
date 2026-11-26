@@ -91,8 +91,9 @@ function isActiveMember(member: Pick<TeamMember, "revision" | "status">, current
   return member.revision === currentRevision && ACTIVE_MEMBER_STATUSES.has(member.status);
 }
 
-function attemptKey(member: Pick<TeamMember, "taskId" | "role">): string {
-  return member.taskId ? `task:${member.taskId}` : `role:${member.role}`;
+function attemptKey(member: Pick<TeamMember, "revision" | "planRevision" | "taskId" | "role">): string {
+  const scopeRevision = member.planRevision ?? member.revision;
+  return `${scopeRevision}\0${member.role}\0${member.taskId ?? ""}`;
 }
 
 export function partitionMobileRoster<T extends TeamMember>(members: readonly T[], revision: number): MobileRosterPartition<T> {
@@ -105,16 +106,28 @@ export function partitionMobileRoster<T extends TeamMember>(members: readonly T[
     return left.index - right.index;
   });
 
+  const memberIds = new Set(members.map(member => member.memberId));
   const replacedBy = new Map<string, string>();
   const replaces = new Map<string, string>();
+
+  for (const { member } of chronological) {
+    const explicit = member.replaces?.memberId ?? member.replacesMemberId;
+    if (explicit && explicit !== member.memberId && memberIds.has(explicit)) {
+      replacedBy.set(explicit, member.memberId);
+      replaces.set(member.memberId, explicit);
+    }
+  }
+
   const lastFinishedByKey = new Map<string, T>();
 
   for (const { member } of chronological) {
     const key = attemptKey(member);
-    const previous = lastFinishedByKey.get(key);
-    if (previous && previous.memberId !== member.memberId) {
-      replacedBy.set(previous.memberId, member.memberId);
-      replaces.set(member.memberId, previous.memberId);
+    if (!replaces.has(member.memberId)) {
+      const previous = lastFinishedByKey.get(key);
+      if (previous && previous.memberId !== member.memberId && !replacedBy.has(previous.memberId)) {
+        replacedBy.set(previous.memberId, member.memberId);
+        replaces.set(member.memberId, previous.memberId);
+      }
     }
     if (!isActiveMember(member, revision)) lastFinishedByKey.set(key, member);
     else lastFinishedByKey.delete(key);
@@ -136,11 +149,91 @@ export function partitionMobileRoster<T extends TeamMember>(members: readonly T[
   return { active, finished };
 }
 
+const ENTRY_STATE_RANK: Record<TeamEntryHead["state"], number> = {
+  active: 0,
+  superseded: 1,
+  withdrawn: 2,
+};
+
 export function mergeMobileEntries(existing: readonly TeamEntryHead[], page: Pick<TeamEntryPage, "entries">): TeamEntryHead[] {
   const byId = new Map<string, TeamEntryHead>();
   for (const entry of existing) byId.set(entry.entryId, entry);
-  for (const entry of page.entries) byId.set(entry.entryId, entry);
+  const incomingIds = new Set<string>();
+  for (const entry of page.entries) {
+    byId.set(entry.entryId, entry);
+    incomingIds.add(entry.entryId);
+  }
+  for (const entry of page.entries) {
+    if (!entry.supersedes || entry.state === "withdrawn" || incomingIds.has(entry.supersedes)) continue;
+    const prior = byId.get(entry.supersedes);
+    if (prior && prior.state === "active") {
+      byId.set(prior.entryId, { ...prior, state: "superseded" });
+    }
+  }
   return [...byId.values()].sort((left, right) => left.seq - right.seq);
+}
+
+export type MobileEvidenceFeedState = {
+  key: string;
+  entries: TeamEntryHead[];
+  cursor: number;
+  more: boolean;
+  revalidateCursor: number;
+  lastLoadedAt?: string;
+  lastRevalidatedAtMs?: number;
+};
+
+export function createMobileEvidenceFeedState(key: string): MobileEvidenceFeedState {
+  return {
+    key,
+    entries: [],
+    cursor: 0,
+    more: false,
+    revalidateCursor: 0,
+  };
+}
+
+export function applyMobileEvidencePage(
+  state: MobileEvidenceFeedState,
+  page: TeamEntryPage,
+  options: { mode?: "incremental" | "revalidate"; observedAt?: string } = {},
+): MobileEvidenceFeedState {
+  const mode = options.mode ?? "incremental";
+  const entries = mergeMobileEntries(state.entries, page);
+  const cursor = Math.max(state.cursor, page.cursor);
+  const more = mode === "incremental"
+    ? (page.cursor >= state.cursor ? page.more : state.more)
+    : (page.cursor > state.cursor ? page.more : state.more);
+  return {
+    ...state,
+    entries,
+    cursor,
+    more,
+    ...(options.observedAt ? { lastLoadedAt: options.observedAt } : {}),
+  };
+}
+
+export function applyMobileEvidenceHead(
+  state: MobileEvidenceFeedState,
+  head: TeamEntryHead,
+): MobileEvidenceFeedState {
+  return {
+    ...state,
+    entries: mergeMobileEntries(state.entries, { entries: [head] }),
+  };
+}
+
+export function resolveSelectedEntryHead(
+  detailHead: TeamEntryHead | undefined,
+  listHead: TeamEntryHead | undefined,
+): TeamEntryHead | undefined {
+  if (!listHead) return detailHead;
+  if (!detailHead) return listHead;
+  if (detailHead.entryId !== listHead.entryId) return listHead;
+  if (ENTRY_STATE_RANK[detailHead.state] > ENTRY_STATE_RANK[listHead.state]) {
+    return { ...listHead, state: detailHead.state };
+  }
+  return listHead;
 }
 
 export function filterMobileEntries(entries: readonly TeamEntryHead[], kind: TeamEntryKind | "all"): TeamEntryHead[] {

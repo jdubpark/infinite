@@ -395,6 +395,7 @@ export type MissionProgressSnapshot = {
     title: string;
     repoProjectId: string;
     status: MissionSubtask["status"];
+    replacesSubtaskId?: string;
     child: MissionProgressChild;
   }[];
   subtasksTruncated?: true;

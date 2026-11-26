@@ -51,18 +51,33 @@ export function TeamOverviewGroups({
       <Card style={s.card}>
         {waitReasons.map((reason, index) => {
           const member = reason.memberId ? memberById.get(reason.memberId) : undefined;
+          const memberRole = member ? (ROLE_NAMES[member.role] ?? member.role) : undefined;
+          const memberTaskTitle = member?.taskId ? taskById.get(member.taskId)?.title : undefined;
+          const since = shortDate(reason.since);
+          const resetsAt = shortDate(reason.resetsAt);
           const timing = [
-            reason.since ? `Since ${shortDate(reason.since)}` : undefined,
-            reason.resetsAt ? `Resets ${shortDate(reason.resetsAt)}` : undefined,
+            since ? `Since ${since}` : undefined,
+            resetsAt ? `Resets ${resetsAt}` : undefined,
           ].filter(Boolean).join(" · ");
-          return <View key={`${reason.kind}/${reason.decisionId ?? reason.memberId ?? reason.taskId ?? index}`} style={[s.waitRow, index > 0 && [s.waitRowGap, s.rowRule]]}>
+          const blockedByTitles = (reason.blockedByTaskIds ?? [])
+            .map(id => taskById.get(id)?.title)
+            .filter((title): title is string => Boolean(title));
+          return <View key={`${reason.kind}/${reason.decisionId ?? reason.memberId ?? reason.taskId ?? "run"}/${index}`} style={[s.waitRow, index > 0 && [s.waitRowGap, s.rowRule]]}>
             <View style={s.waitHead}>
               <Chip label={waitReasonLabel(reason.kind)} tone={waitReasonTone(reason.kind)} />
-              {timing ? <Text style={[t.note, s.fill]} numberOfLines={1}>{timing}</Text> : null}
+              {timing ? <Text style={[t.note, s.timing]}>{timing}</Text> : null}
             </View>
             <Clamp text={reason.summary} lines={3} />
+            {blockedByTitles.length ? <Text style={t.note}>Blocked by: {blockedByTitles.join(", ")}</Text> : null}
             {member ? <View style={s.actions}>
-              <Button compact secondary glyph="terminal" title="Open log" onPress={() => onSelectMember(member)} />
+              <Button
+                compact
+                secondary
+                glyph="terminal"
+                title="Open log"
+                accessibilityLabel={`Open log for ${memberRole}${memberTaskTitle ? `, ${memberTaskTitle}` : ""}`}
+                onPress={() => onSelectMember(member)}
+              />
             </View> : null}
           </View>;
         })}
@@ -115,21 +130,29 @@ export function TeamOverviewGroups({
     <Section title="Compact roster" count={active.length}>
       {active.length ? <Card style={s.rosterCard}>
         {active.map(({ member }, index) => {
+          const roleName = ROLE_NAMES[member.role] ?? member.role;
           const taskTitle = member.taskId ? taskById.get(member.taskId)?.title : undefined;
+          const notices = memberScreenNotices(member);
+          const accessibilityParts = [
+            `${roleName}${taskTitle ? `, ${taskTitle}` : ""}`,
+            MEMBER_LABELS[member.status] ?? member.status,
+            ...notices.map(notice => notice.text),
+            "Open agent log",
+          ];
           return <Pressable
             key={member.memberId}
             accessibilityRole="button"
-            accessibilityLabel={`${ROLE_NAMES[member.role] ?? member.role}, ${MEMBER_LABELS[member.status] ?? member.status}. Open agent log`}
+            accessibilityLabel={accessibilityParts.join(". ")}
             onPress={() => onSelectMember(member)}
             style={({ pressed }) => [s.rosterRow, index > 0 && s.rowRule, pressed && s.pressed]}
           >
             <StatusIcon kind={memberKind(member.status)} size={14} />
             <View style={s.fill}>
               <Text style={s.memberTitle} numberOfLines={1}>
-                {ROLE_NAMES[member.role] ?? member.role}{taskTitle ? ` · ${taskTitle}` : ""}
+                {roleName}{taskTitle ? ` · ${taskTitle}` : ""}
               </Text>
               <Text style={t.note} numberOfLines={1}>{MEMBER_LABELS[member.status] ?? member.status}</Text>
-              {memberScreenNotices(member).map(notice => (
+              {notices.map(notice => (
                 <Text key={notice.kind} style={notice.tone === "error" ? t.error : t.warning} numberOfLines={2}>
                   {notice.text}
                 </Text>
@@ -142,28 +165,40 @@ export function TeamOverviewGroups({
       {finished.length ? <Disclosure title={`Finished (${finished.length})`}>
         {finished.map(({ member, replacedByMemberId }) => {
           const replacement = replacedByMemberId ? memberById.get(replacedByMemberId) : undefined;
+          const roleName = ROLE_NAMES[member.role] ?? member.role;
           const taskTitle = member.taskId ? taskById.get(member.taskId)?.title : undefined;
+          const replacementRole = replacement ? (ROLE_NAMES[replacement.role] ?? replacement.role) : undefined;
+          const replacementTaskTitle = replacement?.taskId ? taskById.get(replacement.taskId)?.title : undefined;
+          const notices = memberScreenNotices(member);
           return <View key={member.memberId} style={s.finishedRow}>
             <View style={s.rowHead}>
               <StatusIcon kind={memberKind(member.status)} size={13} />
               <Text style={[s.memberTitle, s.fill]} numberOfLines={1}>
-                {ROLE_NAMES[member.role] ?? member.role}{taskTitle ? ` · ${taskTitle}` : ""}
+                {roleName}{taskTitle ? ` · ${taskTitle}` : ""}
               </Text>
               <Text style={t.note}>{MEMBER_LABELS[member.status] ?? member.status}{member.revision !== team.revision ? ` · rev ${member.revision}` : ""}</Text>
             </View>
-            {memberScreenNotices(member).map(notice => (
+            {notices.map(notice => (
               <Text key={notice.kind} style={notice.tone === "error" ? t.error : t.warning} numberOfLines={2}>
                 {notice.text}
               </Text>
             ))}
             {member.stoppedReason ? <Text style={t.warning} numberOfLines={2}>Stopped: {member.stoppedReason}</Text> : null}
             <View style={s.actions}>
-              <Button compact secondary glyph="terminal" title="Open log" onPress={() => onSelectMember(member)} />
+              <Button
+                compact
+                secondary
+                glyph="terminal"
+                title="Open log"
+                accessibilityLabel={`Open log for ${roleName}${taskTitle ? `, ${taskTitle}` : ""}`}
+                onPress={() => onSelectMember(member)}
+              />
               {replacement && isFailedOrStopped(member) ? <Button
                 compact
                 secondary
                 glyph="forward"
                 title="Jump to replacement"
+                accessibilityLabel={`Jump to replacement ${replacementRole}${replacementTaskTitle ? `, ${replacementTaskTitle}` : ""}`}
                 onPress={() => onSelectMember(replacement)}
               /> : null}
             </View>
@@ -180,6 +215,7 @@ const s = StyleSheet.create({
   waitRow: { gap: 6 },
   waitRowGap: { paddingTop: 10 },
   waitHead: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 },
+  timing: { flexShrink: 1 },
   groupRow: { gap: 6, paddingTop: 8 },
   rowRule: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: theme.colors.rule },
   rowHead: { flexDirection: "row", alignItems: "center", gap: 8 },

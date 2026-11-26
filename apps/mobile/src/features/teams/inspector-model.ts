@@ -54,22 +54,25 @@ export type MemberScreenNotice = {
 };
 
 export function memberScreenNotices(
-  member: Pick<TeamMember, "spinnerOnlySince" | "stalledAt">,
+  member: Pick<TeamMember, "spinnerOnlySince" | "stalledAt"> & Partial<Pick<TeamMember, "status">>,
   formatTime: (iso: string) => string = shortDate,
 ): MemberScreenNotice[] {
   const notices: MemberScreenNotice[] = [];
-  if (member.spinnerOnlySince) {
+  const suppressSpinner = Boolean(member.stalledAt) || member.status === "stopped" || member.status === "reported";
+  if (member.spinnerOnlySince?.trim() && !suppressSpinner) {
+    const formatted = formatTime(member.spinnerOnlySince).trim();
     notices.push({
       kind: "spinner-only",
       tone: "warning",
-      text: `Spinner-only screen since ${formatTime(member.spinnerOnlySince)}`,
+      text: formatted ? `Spinner-only screen since ${formatted}` : "Spinner-only screen",
     });
   }
-  if (member.stalledAt) {
+  if (member.stalledAt?.trim()) {
+    const formatted = formatTime(member.stalledAt).trim();
     notices.push({
       kind: "stalled",
       tone: "error",
-      text: `Stalled since ${formatTime(member.stalledAt)}`,
+      text: formatted ? `Stalled since ${formatted}` : "Stalled",
     });
   }
   return notices;

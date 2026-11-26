@@ -103,9 +103,9 @@ export type TeamView = {
   permissionsRevokedAt?: string;
   permissionDecisions?: PermissionDecision[];
 };
-export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "workers" | "waitReasons" | "revision" | "status" | "createdAt" | "updatedAt"
+export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "workers" | "revision" | "status" | "createdAt" | "updatedAt"
   | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "linear" | "goal" | "missionId" | "resumable" | "continuable" | "permissionsRevokedAt"> & {
-  members: (Omit<TeamMember, "modelProfile"> & { modelProfile?: Pick<ModelProfile, "label" | "provider" | "tier"> })[];
+  members: (Omit<TeamMember, "modelProfile" | "spinnerOnlySince"> & { modelProfile?: Pick<ModelProfile, "label" | "provider" | "tier"> })[];
   tasks: Pick<TeamTask, "id" | "title" | "status" | "paths" | "memberId" | "ownerRating">[];
   checks: Pick<TeamCheck, "status" | "revision">[];
   lineup?: Pick<TeamLineup, "coordinator">;
@@ -356,6 +356,9 @@ export function directionSourceLabel(source: { kind: string; name: string } | st
   return source === "coordinator" ? "Mission coordinator" : "You";
 }
 
-export function shortDate(iso: string) {
-  return new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+export function shortDate(iso?: string): string {
+  if (!iso?.trim()) return "";
+  const date = new Date(iso);
+  if (!Number.isFinite(date.getTime())) return "";
+  return date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }

@@ -23,7 +23,7 @@ import {
   resyncNoticeForReason,
 } from "../apps/mobile/src/features/board/mission-progress-model.ts";
 import type { MissionProgressPage, TeamEntryHead } from "../apps/mobile/src/api/client.ts";
-import type { TeamMember, TeamTask, TeamView, TeamWaitReason, TeamWaitReasonKind } from "../apps/mobile/src/features/teams/model.ts";
+import { shortDate, type TeamMember, type TeamTask, type TeamView, type TeamWaitReason, type TeamWaitReasonKind } from "../apps/mobile/src/features/teams/model.ts";
 
 const makeTask = (id: string, status: TeamTask["status"], criteria?: string[], objectiveVersion = 3): TeamTask => ({
   id,
@@ -470,6 +470,14 @@ test("orderMobileWaitReasons places actionable and stall reasons ahead of schedu
   assert.deepEqual(input, snapshot);
 });
 
+test("shortDate guards empty, undefined, and invalid timestamps", () => {
+  assert.equal(shortDate(undefined), "");
+  assert.equal(shortDate(""), "");
+  assert.equal(shortDate("   "), "");
+  assert.equal(shortDate("not-a-date"), "");
+  assert.notEqual(shortDate("2026-11-26T00:12:00.000Z"), "");
+});
+
 test("spinnerOnlySince and stalledAt metadata are preserved in roster partitions and formatted into screen notices", () => {
   const members: TeamMember[] = [
     makeMember("m-spin", {
@@ -498,15 +506,37 @@ test("spinnerOnlySince and stalledAt metadata are preserved in roster partitions
   assert.deepEqual(memberScreenNotices(finishedStall, iso => `fmt(${iso})`), [
     { kind: "stalled", tone: "error", text: "Stalled since fmt(2026-11-26T00:15:00.000Z)" },
   ]);
+
+  assert.deepEqual(
+    memberScreenNotices({ status: "running", spinnerOnlySince: "invalid-date" }),
+    [{ kind: "spinner-only", tone: "warning", text: "Spinner-only screen" }],
+  );
+  assert.deepEqual(
+    memberScreenNotices({ status: "running", stalledAt: "invalid-date" }, () => "   "),
+    [{ kind: "stalled", tone: "error", text: "Stalled" }],
+  );
+  assert.deepEqual(
+    memberScreenNotices({ status: "running", spinnerOnlySince: "2026-11-26T00:12:00.000Z" }, () => ""),
+    [{ kind: "spinner-only", tone: "warning", text: "Spinner-only screen" }],
+  );
+
   assert.deepEqual(
     memberScreenNotices({
+      status: "running",
       spinnerOnlySince: "2026-11-26T00:12:00.000Z",
       stalledAt: "2026-11-26T00:15:00.000Z",
     }, iso => iso),
     [
-      { kind: "spinner-only", tone: "warning", text: "Spinner-only screen since 2026-11-26T00:12:00.000Z" },
       { kind: "stalled", tone: "error", text: "Stalled since 2026-11-26T00:15:00.000Z" },
     ],
+  );
+  assert.deepEqual(
+    memberScreenNotices({ status: "stopped", spinnerOnlySince: "2026-11-26T00:12:00.000Z" }, iso => iso),
+    [],
+  );
+  assert.deepEqual(
+    memberScreenNotices({ status: "reported", spinnerOnlySince: "2026-11-26T00:12:00.000Z" }, iso => iso),
+    [],
   );
   assert.deepEqual(memberScreenNotices(members[2]!), []);
 });

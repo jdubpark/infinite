@@ -752,10 +752,11 @@ type RefusalCode =
   | "text-not-accepted"
   | "control-busy"
   | "control-lost"
-  | "snapshot-unavailable";
+  | "snapshot-unavailable"
+  | "resize-refused";
 class Refusal extends Error {
-  constructor(readonly code: RefusalCode) {
-    super(code);
+  constructor(readonly code: RefusalCode, message: string = code) {
+    super(message);
   }
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -1311,6 +1312,7 @@ const server = createServer((socket) => {
         if (!isPtyTerminalSize(request.cols, request.rows)) throw new Error("Invalid terminal size");
         result = await serialize(async () => {
           checkControl(request);
+          let drainRefused = false;
           await withTerminalBarrier(() => {
             terminal.resize(request.cols, request.rows);
             const terminalSize = { cols: terminal.cols, rows: terminal.rows };
@@ -1324,8 +1326,9 @@ const server = createServer((socket) => {
           }, () => {
             child?.resize(request.cols, request.rows);
           }, () => {
+            drainRefused = true;
             child?.resize(terminal.cols, terminal.rows);
-          });
+          }).catch(error => { throw drainRefused ? new Refusal("resize-refused", (error as Error).message) : error; });
           return { ok: true };
         });
       } else if (request.op === "answer") {

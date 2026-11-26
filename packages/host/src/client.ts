@@ -240,12 +240,24 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   let tailIncomplete = false;
   const stop = () => { restoreTerminal(); process.exit(0); };
   const owner = me.role === "owner" && me.terminal.raw;
-  const resize = () => {
+  const RESIZE_RETRY_MS = [250, 500, 1000];
+  let resizeRetry: ReturnType<typeof setTimeout> | undefined, resizeAttempts = 0;
+  const sendSize = () => {
     if (!interactive || !online || !process.stdout.isTTY) return;
     const cols = Math.max(20, Math.min(240, process.stdout.columns || 120)), rows = Math.max(5, Math.min(100, process.stdout.rows || 32));
-    screen.resize(cols, rows);
     if (duplex) { try { duplex.resize(cols, rows); } catch {} }
-    else void api.json(`/sessions/${session.id}/resize`, { cols, rows }).catch(() => {});
+    else void api.json(`/sessions/${session.id}/resize`, { cols, rows }).catch(refusedResize);
+  };
+  const refusedResize = () => {
+    if (resizeRetry || resizeAttempts >= RESIZE_RETRY_MS.length || abort.signal.aborted) return;
+    resizeRetry = setTimeout(() => { resizeRetry = undefined; sendSize(); }, RESIZE_RETRY_MS[resizeAttempts++]);
+    resizeRetry.unref();
+  };
+  const resize = () => {
+    if (!interactive || !online || !process.stdout.isTTY) return;
+    clearTimeout(resizeRetry); resizeRetry = undefined; resizeAttempts = 0;
+    screen.resize(Math.max(20, Math.min(240, process.stdout.columns || 120)), Math.max(5, Math.min(100, process.stdout.rows || 32)));
+    sendSize();
   };
   const loseControl = (message: string) => {
     clearInterval(renewal); renewal = undefined;
@@ -418,7 +430,8 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
         for await (const page of duplex ? duplex.pages() : legacyPages()) {
             clearTimeout(watchdog); watchdog = setTimeout(() => stalled.abort(), 20000);
             if (page.error) throw new Error("Stream interrupted");
-            if (page.refusal) loseControl(new TerminalControlError(page.refusal.code).message);
+            if (page.refusal?.code === "resize-refused") refusedResize();
+            else if (page.refusal) loseControl(new TerminalControlError(page.refusal.code).message);
             if (page.snapshot) {
               render = terminalRenderer();
               await screen.snapshot(render(page.snapshot.ansi), page.snapshot.cols, page.snapshot.rows);

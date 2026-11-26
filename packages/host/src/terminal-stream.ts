@@ -275,7 +275,7 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
               } catch (error) {
                 if (!active()) break;
                 const workerError = error as WorkerError;
-                if (workerError.code === "control-busy" || workerError.code === "control-lost") {
+                if (workerError.code === "control-busy" || workerError.code === "control-lost" || workerError.code === "resize-refused") {
                   await send({ refusal: { requestId: "requestId" in frame.input ? frame.input.requestId : undefined, code: workerError.code } }).catch(() => fail(1011));
                 } else {
                   fail(1011);

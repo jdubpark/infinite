@@ -3,6 +3,30 @@ import type { TeamContinuation, TeamMember, TeamRun, TeamTask } from "./team-typ
 
 export type InterruptedSourceCode = "agent-question" | "agent-blocked";
 
+export type InterruptedTaskEvent = Pick<RunEvent, "kind" | "revision" | "at" | "data">;
+
+export interface InterruptedRunFilter {
+  projectId?: string;
+  cutoffMs?: number;
+}
+
+export type InterruptedTaskMember = Pick<TeamMember, "memberId" | "revision" | "role" | "taskId">;
+
+export type InterruptedTaskItem = Pick<TeamTask, "id" | "status" | "dependsOn">;
+
+export type InterruptedTaskContinuation = Pick<TeamContinuation, "revision" | "reason" | "at"> & {
+  tasks: readonly InterruptedTaskItem[];
+};
+
+export type InterruptedTaskRun = Pick<
+  TeamRun,
+  "id" | "projectId" | "replay" | "revision" | "status" | "blockCode" | "createdAt" | "updatedAt"
+> & {
+  tasks: readonly InterruptedTaskItem[];
+  members: readonly InterruptedTaskMember[];
+  continuations?: readonly InterruptedTaskContinuation[];
+};
+
 export interface InterruptedTaskSample {
   runId: string;
   projectId: string;
@@ -60,12 +84,70 @@ function isInterruptedSourceCode(value: unknown): value is InterruptedSourceCode
   return value === "agent-question" || value === "agent-blocked";
 }
 
+function validFromRevision(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : undefined;
+}
+
 function sourceCodeFromContinuationReason(reason: string): InterruptedSourceCode | undefined {
   const match = RECOVERY_REASON_RE.exec(reason);
   return match ? (match[1] as InterruptedSourceCode) : undefined;
 }
 
-function transitiveDependents(tasks: readonly TeamTask[], sourceTaskId: string): Set<string> {
+export function runMayHaveInterruptedWork(
+  run: Pick<InterruptedTaskRun, "replay" | "projectId" | "createdAt" | "updatedAt" | "continuations">,
+  filter?: InterruptedRunFilter,
+): boolean {
+  if (run.replay) return false;
+  if (filter?.projectId !== undefined && run.projectId !== filter.projectId) return false;
+  if (filter?.cutoffMs === undefined) return true;
+  const runActivityMs = parseTime(run.updatedAt) ?? parseTime(run.createdAt);
+  if (runActivityMs === undefined || runActivityMs >= filter.cutoffMs) return true;
+  for (const continuation of run.continuations ?? []) {
+    const atMs = parseTime(continuation.at);
+    if (atMs !== undefined && atMs >= filter.cutoffMs) return true;
+  }
+  return false;
+}
+
+export function snapshotInterruptedRun(run: TeamRun): InterruptedTaskRun {
+  return {
+    id: run.id,
+    projectId: run.projectId,
+    ...(run.replay ? { replay: structuredClone(run.replay) } : {}),
+    revision: run.revision,
+    status: run.status,
+    ...(run.blockCode === undefined ? {} : { blockCode: run.blockCode }),
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+    tasks: run.tasks.map(task => ({
+      id: task.id,
+      status: task.status,
+      dependsOn: [...task.dependsOn],
+    })),
+    members: run.members.map(member => ({
+      memberId: member.memberId,
+      revision: member.revision,
+      role: member.role,
+      ...(member.taskId === undefined ? {} : { taskId: member.taskId }),
+    })),
+    ...(run.continuations === undefined
+      ? {}
+      : {
+        continuations: run.continuations.map(continuation => ({
+          revision: continuation.revision,
+          reason: continuation.reason,
+          at: continuation.at,
+          tasks: continuation.tasks.map(task => ({
+            id: task.id,
+            status: task.status,
+            dependsOn: [...task.dependsOn],
+          })),
+        })),
+      }),
+  };
+}
+
+function transitiveDependents(tasks: readonly InterruptedTaskItem[], sourceTaskId: string): Set<string> {
   const dependentsOf = new Map<string, string[]>();
   for (const task of tasks) {
     for (const depId of task.dependsOn) {
@@ -87,20 +169,20 @@ function transitiveDependents(tasks: readonly TeamTask[], sourceTaskId: string):
   return visited;
 }
 
-function findMember(run: TeamRun, memberId: string, revision: number): TeamMember | undefined {
+function findMember(run: InterruptedTaskRun, memberId: string, revision: number): InterruptedTaskMember | undefined {
   return run.members.find(member => member.memberId === memberId && member.revision === revision)
     ?? run.members.find(member => member.memberId === memberId);
 }
 
-function countUnblockedInterrupted(tasks: readonly TeamTask[], sourceTaskId: string): number {
+function countUnblockedInterrupted(tasks: readonly InterruptedTaskItem[], sourceTaskId: string): number {
   const excluded = transitiveDependents(tasks, sourceTaskId);
   return tasks.filter(task => task.status !== "integrated" && !excluded.has(task.id)).length;
 }
 
 function evaluateAttributedTasks(
-  run: TeamRun,
+  run: InterruptedTaskRun,
   revision: number,
-  tasks: readonly TeamTask[],
+  tasks: readonly InterruptedTaskItem[],
   sourceMemberId: string | undefined,
 ): { ok: true; sourceTaskId?: string; interruptedCount: number } | { ok: false; sourceMemberId?: string; sourceTaskId?: string; reason: string } {
   if (!sourceMemberId) {
@@ -130,8 +212,8 @@ function evaluateAttributedTasks(
 }
 
 export function computeInterruptedTaskMetrics(
-  runs: readonly TeamRun[],
-  eventsForRun: (runId: string) => readonly RunEvent[],
+  runs: readonly InterruptedTaskRun[],
+  eventsForRun: (runId: string) => readonly InterruptedTaskEvent[],
   options?: InterruptedTaskOptions,
 ): InterruptedTaskReport {
   const windowDays = options?.days ?? DEFAULT_DAYS;
@@ -159,7 +241,7 @@ export function computeInterruptedTaskMetrics(
     if (run.revision <= 1 && continuations.length === 0 && run.status !== "blocked") continue;
 
     const events = eventsForRun(run.id);
-    const continuationsByRevision = new Map<number, TeamContinuation>();
+    const continuationsByRevision = new Map<number, InterruptedTaskContinuation>();
     for (const continuation of continuations) {
       continuationsByRevision.set(continuation.revision, continuation);
     }
@@ -170,30 +252,18 @@ export function computeInterruptedTaskMetrics(
         && event.data.cause === "automatic-recovery"
         && isInterruptedSourceCode(event.data.sourceCode),
     );
-
+    const validRecoveryEvents: Array<{ event: InterruptedTaskEvent; fromRevision: number }> = [];
+    const missingFromRecoveryEvents: InterruptedTaskEvent[] = [];
     for (const event of recoveryEvents) {
-      const sourceCode = event.data.sourceCode as InterruptedSourceCode;
-      const fromRevision = typeof event.data.fromRevision === "number" && Number.isSafeInteger(event.data.fromRevision)
-        ? event.data.fromRevision
-        : undefined;
-      if (fromRevision === undefined) {
-        if (!inWindow(event.at, cutoffMs, now)) continue;
-        unknownRecoveries += 1;
-        samples.push({
-          runId: run.id,
-          projectId: run.projectId,
-          kind: "recovery",
-          revision: Math.max(1, event.revision - 1),
-          at: event.at,
-          sourceCode,
-          interruptedCount: 0,
-          unknown: true,
-          unknownReason: "missing-from-revision",
-        });
-        continue;
-      }
+      const fromRevision = validFromRevision(event.data.fromRevision);
+      if (fromRevision !== undefined) validRecoveryEvents.push({ event, fromRevision });
+      else missingFromRecoveryEvents.push(event);
+    }
 
+    for (const { event, fromRevision } of validRecoveryEvents) {
+      if (handledRevisions.has(fromRevision)) continue;
       handledRevisions.add(fromRevision);
+      const sourceCode = event.data.sourceCode as InterruptedSourceCode;
       const snapshot = continuationsByRevision.get(fromRevision);
       const at = snapshot && parseTime(snapshot.at) !== undefined ? snapshot.at : event.at;
       if (!inWindow(at, cutoffMs, now)) continue;
@@ -249,6 +319,28 @@ export function computeInterruptedTaskMetrics(
         sourceMemberId: sourceMemberId!,
         ...(evaluation.sourceTaskId ? { sourceTaskId: evaluation.sourceTaskId } : {}),
         interruptedCount: evaluation.interruptedCount,
+      });
+    }
+
+    for (const event of missingFromRecoveryEvents) {
+      const sourceCode = event.data.sourceCode as InterruptedSourceCode;
+      const fallbackRevision = Number.isInteger(event.revision) && event.revision > 1 ? event.revision - 1 : undefined;
+      if (fallbackRevision !== undefined && handledRevisions.has(fallbackRevision)) continue;
+      const snapshot = fallbackRevision === undefined ? undefined : continuationsByRevision.get(fallbackRevision);
+      const at = snapshot && parseTime(snapshot.at) !== undefined ? snapshot.at : event.at;
+      if (!inWindow(at, cutoffMs, now)) continue;
+      if (fallbackRevision !== undefined) handledRevisions.add(fallbackRevision);
+      unknownRecoveries += 1;
+      samples.push({
+        runId: run.id,
+        projectId: run.projectId,
+        kind: "recovery",
+        revision: fallbackRevision ?? Math.max(1, event.revision),
+        at,
+        sourceCode,
+        interruptedCount: 0,
+        unknown: true,
+        unknownReason: "missing-from-revision",
       });
     }
 

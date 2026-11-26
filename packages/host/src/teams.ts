@@ -1,5 +1,6 @@
 import type { ConnectorSource } from "./mcp-types.js";
 import { runMayOverlapWindow, snapshotRepairRun, type RepairMetricsRun, type RepairRunFilter } from "./repair-metrics.js";
+import { runMayHaveInterruptedWork, snapshotInterruptedRun, type InterruptedRunFilter, type InterruptedTaskRun } from "./interrupted-task-metrics.js";
 import { withoutMainCheck, type HandoffPolicy, type TeamHandoffContext } from "./handoff-types.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
@@ -757,12 +758,9 @@ export class TeamService {
   listItems(): TeamListItem[] { return this.list().map(teamListItem); }
   understandingRecords() { return [...this.records.values()].filter(stored => !stored.run.replay).map(stored => structuredClone(stored.run)); }
   repairMetricsRuns(filter?: RepairRunFilter): RepairMetricsRun[] { return [...this.records.values()].flatMap(stored => runMayOverlapWindow(stored.run, filter) ? [snapshotRepairRun(stored.run)] : []); }
+  interruptedTaskRuns(filter?: InterruptedRunFilter): InterruptedTaskRun[] { return [...this.records.values()].flatMap(stored => runMayHaveInterruptedWork(stored.run, filter) ? [snapshotInterruptedRun(stored.run)] : []); }
   pendingOperation(runId: string): boolean { return Boolean(this.records.get(runId)?.pending); }
-  understandingOwnsSession(runId: string, memberId: string, sessionId: string, projectId: string): boolean {
-    const stored = this.records.get(runId);
-    return Boolean(stored && stored.run.projectId === projectId && stored.run.members.some(member =>
-      member.memberId === memberId && member.sessionId === sessionId && member.runId === runId));
-  }
+  understandingOwnsSession(runId: string, memberId: string, sessionId: string, projectId: string): boolean { const stored = this.records.get(runId); return Boolean(stored && stored.run.projectId === projectId && stored.run.members.some(member => member.memberId === memberId && member.sessionId === sessionId && member.runId === runId)); }
   statuses() { return [...this.records.values()].filter(stored => !stored.run.replay).map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal && !stored.run.missionId, goal: Boolean(stored.run.goal), mission: Boolean(stored.run.missionId) })); }
   decisionQueueCandidates() { return [...this.records.values()].flatMap(stored => {
     const run = stored.run, held = heldWaiting(stored), decisions = run.decisions.filter(item => item.revision === run.revision && !item.answer);

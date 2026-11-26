@@ -75,23 +75,6 @@ final class TeamRunTests: XCTestCase {
         XCTAssertEqual(run(["updatedAt": .string("2026-10-18T09:00:00.000Z")]).lastActivityAt, "2026-10-18T09:00:00.000Z")
     }
 
-    func testLastActivityPrefersAuthoritativeHostFieldAndFallsBackForLegacyPayloads() {
-        let events: JSON = .array([["at": "2026-10-18T01:00:00.000Z", "text": "Plan reported."], ["at": "2026-10-18T02:30:00.000Z", "text": "Checks passed."]].map { .object($0.mapValues { .string($0) }) })
-        let authoritative = run([
-            "updatedAt": .string("2026-10-18T09:00:00.000Z"),
-            "lastActivityAt": .string("2026-10-18T04:15:00.000Z"),
-            "events": events,
-        ])
-        XCTAssertEqual(authoritative.lastActivityAt, "2026-10-18T04:15:00.000Z")
-
-        let emptyHostField = run([
-            "updatedAt": .string("2026-10-18T09:00:00.000Z"),
-            "lastActivityAt": .string(""),
-            "events": events,
-        ])
-        XCTAssertEqual(emptyHostField.lastActivityAt, "2026-10-18T02:30:00.000Z")
-    }
-
     func testBlockedRunsSortFirstAndKeepTheOrderWithinEachGroup() {
         let ready = run(["id": .string("ready"), "status": .string("ready-for-review")])
         let blockedA = run(["id": .string("blocked-a"), "status": .string("blocked")])

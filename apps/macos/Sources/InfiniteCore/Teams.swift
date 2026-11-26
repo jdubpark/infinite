@@ -102,11 +102,7 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
         let (done, total) = progress
         return max(floor, total > 0 ? Double(done) / Double(total) : 0)
     }
-    public var lastActivityAt: String {
-        let recorded = value["lastActivityAt"].string
-        if !recorded.isEmpty { return recorded }
-        return events.map { $0["at"].string }.filter { !$0.isEmpty }.max() ?? updatedAt
-    }
+    public var lastActivityAt: String { events.map { $0["at"].string }.max() ?? updatedAt }
     public var linearIssue: String { value["linear"]["issue"]["identifier"].string }
     public var offersResume: Bool {
         typedStatus == .blocked && value["resumable"].bool && Self.absent(value["goal"]) && Self.absent(value["deliveryReceipt"]) && !managedByMission

@@ -293,6 +293,12 @@ import InfiniteCore
             notice = error.localizedDescription
         }
     }
+    private static func eventDimensions(_ event: JSON) -> TerminalDimensions? {
+        let type = event["type"].string
+        guard type == "lifecycle" || type == "output" else { return nil }
+        let data = event["data"]
+        return TerminalDimensions(json: data) ?? TerminalDimensions(json: data["terminalSize"])
+    }
     func receive(_ event: JSON) {
         if event["type"].string == "terminal-closed" {
             connectionLost()
@@ -302,18 +308,56 @@ import InfiniteCore
             return
         }
         let message = event["message"]
+        let topSize = TerminalDimensions(json: message)
         if message["snapshot"] != .null {
+            let snapshot = message["snapshot"]
+            let size = TerminalDimensions(json: snapshot) ?? TerminalDimensions(json: message["open"]) ?? topSize
             markSnapshotReceived()
-            pipe.feed(Data(message["snapshot"]["ansi"].string.utf8), reset: true, columns: message["snapshot"]["cols"].int, rows: message["snapshot"]["rows"].int)
+            pipe.feed(Data(snapshot["ansi"].string.utf8), reset: true, columns: size?.columns, rows: size?.rows)
+        } else if message["open"] != .null {
+            let size = TerminalDimensions(json: message["open"]) ?? topSize
+            markSnapshotReceived()
+            pipe.feed(Data(), reset: true, columns: size?.columns, rows: size?.rows)
         }
-        for output in message["events"].array where output["type"].string == "output" {
-            let first = !rendererState.receivedScreen
-            markSnapshotReceived()
-            pipe.feed(Data(output["data"]["text"].string.utf8), reset: first)
+        if message["type"].string == "resize" || message["resize"] != .null,
+           let resizeSize = TerminalDimensions(json: message["resize"]) ?? topSize {
+            pipe.feed(Data(), reset: false, columns: resizeSize.columns, rows: resizeSize.rows)
+        }
+        if case .array(let events) = message["events"] {
+            let hasEventSizes = events.contains { Self.eventDimensions($0) != nil }
+            if events.isEmpty {
+                if let topSize {
+                    pipe.feed(Data(), reset: false, columns: topSize.columns, rows: topSize.rows)
+                }
+            } else {
+                var appliedTopSize = hasEventSizes
+                for item in events {
+                    let type = item["type"].string
+                    if type == "lifecycle" {
+                        let size = Self.eventDimensions(item) ?? (!appliedTopSize ? topSize : nil)
+                        if let size {
+                            appliedTopSize = true
+                            pipe.feed(Data(), reset: false, columns: size.columns, rows: size.rows)
+                        }
+                    } else if type == "output" {
+                        let first = !rendererState.receivedScreen
+                        markSnapshotReceived()
+                        let fallbackSize = !appliedTopSize ? topSize : nil
+                        let size = Self.eventDimensions(item) ?? fallbackSize ?? (first ? pipe.activeDimensions : nil)
+                        if size != nil { appliedTopSize = true }
+                        pipe.feed(Data(item["data"]["text"].string.utf8), reset: first, columns: size?.columns, rows: size?.rows)
+                    }
+                }
+            }
         }
         if message["state"] != .null {
+            let state = message["state"]
+            if pipe.activeDimensions == nil,
+               let stateSize = TerminalDimensions(json: state["terminalSize"]) ?? TerminalDimensions(json: state) {
+                pipe.feed(Data(), reset: false, columns: stateSize.columns, rows: stateSize.rows)
+            }
             var value = session.value.object
-            for (key, item) in message["state"].object { value[key] = item }
+            for (key, item) in state.object { value[key] = item }
             observe(.object(value))
         }
         if message["refusal"] != .null {

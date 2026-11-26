@@ -112,8 +112,10 @@ final class TeamRunTests: XCTestCase {
         XCTAssertTrue(run(["lineup": .object(["coordinator": .object(["label": .string("Opus")])])]).hasLineup)
     }
 
-    private func task(_ id: String, _ status: String, after: [String] = [], summary: String = "") -> JSON {
-        .object(["id": .string(id), "title": .string("Task " + id), "status": .string(status), "dependsOn": .array(after.map { .string($0) }), "paths": .array([.string("src/\(id).mjs")]), "summary": .string(summary)])
+    private func task(_ id: String, _ status: String, after: [String] = [], summary: String = "", limitations: [JSON]? = nil) -> JSON {
+        var fields: [String: JSON] = ["id": .string(id), "title": .string("Task " + id), "status": .string(status), "dependsOn": .array(after.map { .string($0) }), "paths": .array([.string("src/\(id).mjs")]), "summary": .string(summary)]
+        if let limitations { fields["limitations"] = .array(limitations) }
+        return .object(fields)
     }
     private func check(_ status: String, revision: Int = 2, args: [String] = ["test"], phase: String? = nil) -> JSON {
         var fields: [String: JSON] = ["command": .object(["command": .string("npm"), "args": .array(args.map { .string($0) })]), "status": .string(status), "revision": .number(Double(revision)), "output": .string("")]
@@ -162,5 +164,43 @@ final class TeamRunTests: XCTestCase {
         let clean = run(["status": .string("ready-for-review"), "tasks": .array([task("a", "integrated")]), "checks": .array([check("passed")])])
         XCTAssertFalse(clean.reviewSteps.contains { $0.urgent })
         XCTAssertFalse(clean.reviewSteps.contains { $0.title == "Read the diff" })
+    }
+
+    func testStructuredTaskLimitationsOverrideSummaryScraping() {
+        let singleTask = task("a", "integrated", summary: "Limitations:\n- Legacy note that should be ignored.", limitations: [.string("  No simulator run.  ")])
+        XCTAssertEqual(TeamRun.limitations(of: singleTask), ["No simulator run."])
+        let singleSteps = run(["status": .string("ready-for-review"), "tasks": .array([singleTask])]).reviewSteps
+        XCTAssertEqual(singleSteps.first, TeamRun.ReviewStep(
+            title: "Resolve a flagged limitation",
+            detail: "Task a: No simulator run.",
+            action: .direction("In \"Task a\" the agent reported this limitation: No simulator run.\nResolve it or explain why it is acceptable."),
+            urgent: false
+        ))
+
+        let multiTask = task("b", "integrated", summary: "Done.", limitations: [.string("  No simulator run.  "), .string("   "), .number(7), .string("Skipped live check.")])
+        XCTAssertEqual(TeamRun.limitations(of: multiTask), ["No simulator run.", "Skipped live check."])
+        let multiSteps = run(["status": .string("ready-for-review"), "tasks": .array([multiTask])]).reviewSteps
+        XCTAssertEqual(multiSteps.first, TeamRun.ReviewStep(
+            title: "Resolve flagged limitations",
+            detail: "Task b: No simulator run. · Skipped live check.",
+            action: .direction("In \"Task b\" the agent reported these limitations:\n- No simulator run.\n- Skipped live check.\nResolve them or explain why they are acceptable."),
+            urgent: false
+        ))
+
+        let emptyArrayTask = task("c", "integrated", summary: "Limitations:\n- Should never be scraped.", limitations: [])
+        XCTAssertEqual(TeamRun.limitations(of: emptyArrayTask), [])
+        let emptySteps = run(["status": .string("ready-for-review"), "tasks": .array([emptyArrayTask])]).reviewSteps
+        XCTAssertFalse(emptySteps.contains { $0.title.lowercased().contains("limitation") })
+
+        let blankArrayTask = task("d", "integrated", summary: "Limitations:\n- Should never be scraped.", limitations: [.string(" \n\t ")])
+        XCTAssertEqual(TeamRun.limitations(of: blankArrayTask), [])
+        let blankSteps = run(["status": .string("ready-for-review"), "tasks": .array([blankArrayTask])]).reviewSteps
+        XCTAssertFalse(blankSteps.contains { $0.title.lowercased().contains("limitation") })
+
+        let legacyTask = task("e", "integrated", summary: "Done.\n\nLimitations:\n- Legacy fallback gap.")
+        XCTAssertEqual(TeamRun.limitations(of: legacyTask), ["Legacy fallback gap."])
+        let legacySteps = run(["status": .string("ready-for-review"), "tasks": .array([legacyTask])]).reviewSteps
+        XCTAssertEqual(legacySteps.first?.title, "Resolve a flagged limitation")
+        XCTAssertEqual(legacySteps.first?.detail, "Task e: Legacy fallback gap.")
     }
 }

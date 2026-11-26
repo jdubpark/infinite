@@ -187,6 +187,18 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
         return body.isEmpty ? nil : body
     }
 
+    public static func limitations(of task: JSON) -> [String] {
+        if case .array(let items) = task["limitations"] {
+            return items.compactMap { item -> String? in
+                guard case .string(let text) = item else { return nil }
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+        }
+        guard let legacy = limitations(task["summary"].string) else { return [] }
+        return [legacy]
+    }
+
     public struct ReviewStep: Equatable, Sendable {
         public enum Action: Equatable, Sendable { case direction(String), copy(String) }
         public let title: String
@@ -204,8 +216,16 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
             steps.append(.init(title: "Address the reviewer's changes", detail: "The reviewer did not approve this revision.", action: .direction("Address every change the reviewer requested, then rerun the checks."), urgent: true))
         }
         for task in tasks {
-            guard let note = Self.limitations(task["summary"].string) else { continue }
-            steps.append(.init(title: "Resolve a flagged limitation", detail: "\(task["title"].string): \(note)", action: .direction("In \"\(task["title"].string)\" the agent reported this limitation: \(note)\nResolve it or explain why it is acceptable."), urgent: false))
+            let notes = Self.limitations(of: task)
+            guard !notes.isEmpty else { continue }
+            let taskTitle = task["title"].string
+            if notes.count == 1, let note = notes.first {
+                steps.append(.init(title: "Resolve a flagged limitation", detail: "\(taskTitle): \(note)", action: .direction("In \"\(taskTitle)\" the agent reported this limitation: \(note)\nResolve it or explain why it is acceptable."), urgent: false))
+            } else {
+                let detail = notes.joined(separator: " · ")
+                let bullets = notes.map { "- \($0)" }.joined(separator: "\n")
+                steps.append(.init(title: "Resolve flagged limitations", detail: "\(taskTitle): \(detail)", action: .direction("In \"\(taskTitle)\" the agent reported these limitations:\n\(bullets)\nResolve them or explain why they are acceptable."), urgent: false))
+            }
         }
         if !baseCommit.isEmpty {
             let target = headCommit.isEmpty ? branch : headCommit

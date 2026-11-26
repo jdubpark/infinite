@@ -422,9 +422,11 @@ extension RemoteClient {
     public func usageProject(_ id: String, tz: String) async throws -> ProjectUsage {
         try await request(Self.usageProjectPath(id, tz: tz)).decoded()
     }
+    private static let pathSegmentAllowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
     static func usageProjectPath(_ id: String, tz: String) -> String { "/usage/projects/" + pathSegment(id) + query([("tz", tz)]) }
+    static func accountPlanPath(_ account: String) -> String { "/usage/accounts/" + pathSegment(account) + "/plan" }
     static func pathSegment(_ id: String) -> String {
-        id.addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")) ?? id
+        id.addingPercentEncoding(withAllowedCharacters: pathSegmentAllowed) ?? id
     }
     public func usageModels(role: String? = nil) async throws -> Scorecard { try await request("/usage/models" + Self.query([("role", role)])).decoded() }
     public func refreshBalances() async throws -> [AccountView] {
@@ -434,7 +436,7 @@ extension RemoteClient {
     public func setPlan(account: String, planUsd: Double?) async throws -> [AccountView] {
         struct Reply: Decodable { var accounts: [AccountView] }
         let body: JSON = .object(["planUsd": planUsd.map { .number($0) } ?? .null])
-        return try await request("/usage/accounts/" + Self.pathSegment(account) + "/plan", body: body, method: "PUT").decoded(Reply.self).accounts
+        return try await request(Self.accountPlanPath(account), body: body, method: "PUT").decoded(Reply.self).accounts
     }
     public func rateTask(team: String, task: String, score: Int, note: String? = nil, requestID: String) async throws -> JSON {
         var body: [String: JSON] = ["requestId": .string(requestID), "score": .number(Double(score))]

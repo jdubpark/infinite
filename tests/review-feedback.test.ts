@@ -4,8 +4,8 @@ import { parseGhCommand } from "../scripts/github-proxy.mjs";
 import { reviewFeedbackConfigSchema } from "../packages/host/src/config.js";
 import { runRecord } from "../packages/host/src/objective-record.js";
 import {
-  REVIEW_TEXT_LIMIT, type ReviewIntake, type ReviewVerdict, intakeEndedByRemoval, intentStillCurrent, markReviewApplied, parsePullRequestView, pullRequestTarget,
-  pullRequestViewArgs, recordReviewOutcome, reviewRequestId, reviewText, reviewVerdict,
+  REVIEW_TEXT_LIMIT, type ReviewIntake, type ReviewVerdict, intakeEndedByRemoval, intentStillCurrent, markReviewApplied, parsePullRequestBranchView, parsePullRequestView,
+  pullRequestBranchViewArgs, pullRequestTarget, pullRequestViewArgs, recordReviewOutcome, resolvePullRequestBranch, reviewRequestId, reviewText, reviewVerdict,
 } from "../packages/host/src/review-feedback.js";
 import { ownerDirectionLines } from "../packages/host/src/team-prompts.js";
 import { type TeamRun, githubReviewSource, teamMutationSchema } from "../packages/host/src/team-types.js";
@@ -235,4 +235,37 @@ test("review feedback is off unless configured, and switching it on needs the ow
   assert.equal(reviewFeedbackConfigSchema.safeParse({ enabled: true, ownerLogin: "not a login" }).success, false);
   assert.equal(reviewFeedbackConfigSchema.safeParse({ enabled: true, ownerLogin: OWNER, extra: 1 }).success, false);
   assert.deepEqual(reviewFeedbackConfigSchema.parse({ enabled: true, ownerLogin: OWNER }), { enabled: true, ownerLogin: OWNER, pollMinutes: 5 });
+});
+
+test("on-demand legacy pull request branch lookup uses a pr-only read and validates the branch strictly", () => {
+  const target = pullRequestTarget(delivered());
+  assert.deepEqual(target, { repository: REPOSITORY, number: 7 });
+  const claims = { repo: REPOSITORY, ops: ["pr"], refs: [] };
+  const parsed = parseGhCommand(pullRequestBranchViewArgs(target!), claims);
+  assert.equal(parsed.resolve, false);
+  assert.equal(parsed.stdin, false);
+  assert.throws(() => parseGhCommand(pullRequestBranchViewArgs(target!), { ...claims, ops: [] }), /pr-not-granted/);
+  assert.equal(pullRequestTarget(delivered(run => { run.pullRequest!.pullRequestUrl = `${URL}?tab=files`; })), undefined);
+  assert.equal(pullRequestTarget(delivered(run => { run.pullRequest!.pullRequestUrl = `${URL}#diff`; })), undefined);
+
+  const view = (extra: Record<string, unknown> = {}) => parsePullRequestBranchView(JSON.stringify({
+    state: "OPEN", isCrossRepository: false, baseRefName: "main", headRefName: BRANCH, ...extra,
+  }));
+  assert.equal(view().headRefName, BRANCH);
+  for (const invalidBranch of ["../escape", "bad branch", "-flag", "foo..bar", "branch.lock", ""]) {
+    assert.throws(() => view({ headRefName: invalidBranch }), `rejects invalid git branch ${JSON.stringify(invalidBranch)}`);
+  }
+
+  const legacy = delivered(run => { delete run.pullRequest!.branch; });
+  assert.deepEqual(resolvePullRequestBranch(legacy, view()), { ok: true, branch: BRANCH });
+  assert.deepEqual(resolvePullRequestBranch(delivered(run => {
+    delete run.pullRequest!.branch;
+    run.publication = { repository: REPOSITORY, branch: `${BRANCH}-aaaaaaaa`, commit: HEAD };
+  }), view({ headRefName: `${BRANCH}-aaaaaaaa` })), { ok: true, branch: `${BRANCH}-aaaaaaaa` });
+  assert.deepEqual(resolvePullRequestBranch(legacy, view({ state: "CLOSED" })), { ok: false, reason: "closed" });
+  assert.deepEqual(resolvePullRequestBranch(legacy, view({ state: "MERGED" })), { ok: false, reason: "merged" });
+  assert.deepEqual(resolvePullRequestBranch(legacy, view({ isCrossRepository: true })), { ok: false, reason: "fork" });
+  assert.deepEqual(resolvePullRequestBranch(legacy, view({ baseRefName: "release" })), { ok: false, reason: "base" });
+  assert.deepEqual(resolvePullRequestBranch(legacy, view({ headRefName: "main" })), { ok: false, reason: "branch" });
+  assert.deepEqual(resolvePullRequestBranch(legacy, view({ headRefName: "unrelated-branch" })), { ok: false, reason: "branch" });
 });

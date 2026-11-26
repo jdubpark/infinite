@@ -48,6 +48,18 @@ export function pullRequestBranch(run: Pick<TeamRun, "pullRequest">) {
   return run.pullRequest?.branch;
 }
 const continuedPullRequest = (run: TeamRun) => run.pullRequest && run.pullRequest.revision !== run.revision ? run.pullRequest : undefined;
+export function deliveryPromptStale(run: TeamRun, member: TeamMember): boolean {
+  if (member.role !== "delivery") return false;
+  const branch = pullRequestBranch(run);
+  const continued = continuedPullRequest(run);
+  if (continued && branch && !member.prompt.includes(`This run continues its pull request ${continued.pullRequestUrl} on branch ${branch}`)) return true;
+  const publication = run.publication;
+  if (publication && publication.commit === run.headCommit && publication.repository === run.delivery?.repository) {
+    if (continued && branch && publication.branch !== branch) return !member.prompt.includes(`${publication.branch} as a checkpoint`);
+    if (!continued) return !member.prompt.includes(`The host has already published ${run.headCommit}`);
+  }
+  return false;
+}
 function continuedDeliveryText(run: TeamRun, branch: string) {
   const delivered = continuedPullRequest(run);
   if (!delivered) return "";

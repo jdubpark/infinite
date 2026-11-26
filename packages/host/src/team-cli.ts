@@ -523,7 +523,10 @@ function onboardingPermissionLine(agent: unknown): string | undefined {
 }
 
 const BATCH_TIMEOUT = 120000, CHUNK_TIMEOUT = 60000;
-const olderHost = (error: unknown) => (error as { status?: unknown; code?: unknown })?.status === 404 && (error as { code?: unknown }).code === undefined;
+export const olderHost = (error: unknown): boolean => {
+  const failure = error as { status?: unknown; code?: unknown } | null | undefined;
+  return failure?.status === 404 && (failure.code === "route-not-found" || failure.code === undefined);
+};
 async function uploadCommit(api: Api, projectId: string, root: string, commit: string, tempStore: string, captured: (manifestId: string) => void) {
   const detail = await api.json<any>(`/projects/${projectId}`);
   if (detail.sync?.pendingGeneration) throw new Error("The cloud project has a pending sync generation. Resolve it before capturing local source.");

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 import { createClientApi, HttpError, type ClientApi } from "../packages/host/src/client-api.js";
-import { askForBrief } from "../packages/host/src/team-cli.js";
+import { askForBrief, olderHost } from "../packages/host/src/team-cli.js";
+import { inProcessHost } from "./helpers.js";
 
 async function withServer(
   handler: (req: IncomingMessage, res: ServerResponse) => void,
@@ -202,4 +204,46 @@ test("askForBrief uses Api.json with a 180s timeout override and handles non-OK 
       for (const timer of timers) clearTimeout(timer);
     }
   });
+});
+
+test("olderHost recognizes structured route-not-found and legacy uncoded 404 without misclassifying domain 404s", () => {
+  assert.equal(olderHost(new HttpError(404, "Host returned HTTP 404 (route-not-found).", "route-not-found")), true);
+  assert.equal(olderHost({ status: 404, code: "route-not-found" }), true);
+  assert.equal(olderHost(new HttpError(404, "Host returned HTTP 404.")), true);
+  assert.equal(olderHost({ status: 404 }), true);
+
+  for (const domainCode of ["team-not-found", "session-not-found", "mission-not-found", "goal-not-found", "unknown-project", "project-not-found", ""]) {
+    assert.equal(olderHost(new HttpError(404, "missing", domainCode)), false, domainCode);
+    assert.equal(olderHost({ status: 404, code: domainCode }), false, domainCode);
+  }
+  for (const other of [null, undefined, "404", new Error("missing"), { status: 403, code: "route-not-found" }, { status: 409 }, { status: 500 }]) {
+    assert.equal(olderHost(other), false);
+  }
+});
+
+test("unknown API routes return structured route-not-found 404s distinct from domain 404s", { timeout: 20000 }, async () => {
+  const host = await inProcessHost();
+  try {
+    for (const [method, path] of [
+      ["GET", "/no-such-route"],
+      ["POST", "/no-such-route"],
+      ["PUT", "/projects/rehearsal/sync/no-such-route"],
+    ] as const) {
+      const response = await host.fetchApi(path, "owner", method === "GET" ? undefined : {}, {}, method);
+      assert.equal(response.status, 404, `${method} ${path}`);
+      assert.deepEqual(response.body, { code: "route-not-found", error: "Endpoint not found" });
+    }
+
+    const api = createClientApi({ origin: host.origin, token: host.tokens.owner });
+    await assert.rejects(
+      api.request("/projects/rehearsal/sync/no-such-route", {}, undefined, undefined, "PUT"),
+      (error: unknown) => error instanceof HttpError && error.status === 404 && error.code === "route-not-found" && olderHost(error),
+    );
+    await assert.rejects(
+      api.json(`/teams/${randomUUID()}`),
+      (error: unknown) => error instanceof HttpError && error.status === 404 && error.code === "team-not-found" && !olderHost(error),
+    );
+  } finally {
+    await host.stop();
+  }
 });

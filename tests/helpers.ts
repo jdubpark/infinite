@@ -240,7 +240,7 @@ export async function claimControl(
   return { lease, headers: { "X-Infinite-Client": clientId, "X-Infinite-Control": lease.id } };
 }
 
-export async function inProcessHost(options?: { configure?: (config: Config) => void }) {
+export async function inProcessHost(options?: { configure?: (config: Config) => void; appOptions?: Parameters<typeof createApp>[2] }) {
   const root = realpathSync(mkdtempSync("/tmp/inf-psync-guard-"));
   const workspace = join(root, "workspace"); mkdirSync(workspace);
   const key = randomBytes(32);
@@ -254,7 +254,7 @@ export async function inProcessHost(options?: { configure?: (config: Config) => 
     tokens: roles.map(role => ({ id: role, label: role, role, hash: hashToken(tokens[role]) })),
   };
   options?.configure?.(config);
-  const host = createApp(config, key);
+  const host = createApp(config, key, options?.appOptions);
   await new Promise<void>(resolve => host.server.listen(0, "127.0.0.1", resolve));
   config.port = (host.server.address() as { port: number }).port;
   const origin = `http://127.0.0.1:${config.port}`;

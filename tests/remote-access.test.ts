@@ -550,3 +550,106 @@ test("the relay refuses corrections", async () => {
     assert.equal(runner.requests.length, 1, "a refused correction does not reach the host");
   } finally { client.close(); runner.close(); }
 });
+
+test("remote router round-trips valid percent-encoded path segments to Express and rejects traversal, separator, control, malformed, and double-encoded segments", { timeout: 30000 }, async () => {
+  const encodedAccounts = [
+    { id: "team alpha", encoded: "team%20alpha", planUsd: 11.25 },
+    { id: "claude+work", encoded: "claude%2Bwork", planUsd: 22.5 },
+    { id: "alice@example.com", encoded: "alice%40example.com", planUsd: 33.75 },
+    { id: "café", encoded: "caf%C3%A9", planUsd: 44 },
+    { id: "100%", encoded: "100%25", planUsd: 55 },
+    { id: "a%b", encoded: "a%25b", planUsd: 66 },
+  ];
+  const host = await inProcessHost({
+    configure: config => {
+      config.remote = { enabled: true };
+      config.usage = {
+        prices: {},
+        budgets: {},
+        accounts: Object.fromEntries(encodedAccounts.map(account => [account.id, { kind: "subscription" as const, match: [], planUsd: 10 }])),
+      };
+    },
+  });
+  const owner = createRemoteClient({ url: host.origin, token: host.tokens.owner });
+  const runner = await httpRunner();
+  const runnerClient = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    for (const account of encodedAccounts) {
+      const reply = await owner.request<{ accounts: { id: string; planUsd?: number; planSource?: string }[] }>(
+        `/usage/accounts/${account.encoded}/plan`,
+        { method: "PUT", body: { planUsd: account.planUsd } },
+      );
+      const updated = reply.accounts.find(item => item.id === account.id);
+      assert.equal(updated?.planUsd, account.planUsd, `Express decoded ${account.encoded} once to ${account.id}`);
+      assert.equal(updated?.planSource, "owner");
+    }
+
+    assert.deepEqual(
+      await runnerClient.request("/permissions/decisions/pd%3A123"),
+      { count: 1, method: "GET", path: "/api/permissions/decisions/pd%3A123" },
+    );
+    assert.deepEqual(
+      await runnerClient.request("/project-groups/shop/understanding/behaviors/account%3Aflow.v2"),
+      { count: 2, method: "GET", path: "/api/project-groups/shop/understanding/behaviors/account%3Aflow.v2" },
+    );
+    assert.deepEqual(
+      await runnerClient.request("/usage/projects/my-project?tz=America%2FNew_York"),
+      { count: 3, method: "GET", path: "/api/usage/projects/my-project?tz=America%2FNew_York" },
+    );
+
+    const beforeRejections = runner.requests.length;
+    const rejected: readonly [method: "GET" | "PUT", path: string][] = [
+      ["PUT", "/usage/accounts/%2e%2e/plan"],
+      ["PUT", "/usage/accounts/%2E%2E/plan"],
+      ["PUT", "/usage/accounts/.%2e/plan"],
+      ["PUT", "/usage/accounts/%2e./plan"],
+      ["PUT", "/usage/accounts/../plan"],
+      ["PUT", "/usage/accounts/%2e/plan"],
+      ["PUT", "/usage/accounts/%2E/plan"],
+      ["PUT", "/usage/accounts/./plan"],
+      ["PUT", "/usage/accounts/a%2fb/plan"],
+      ["PUT", "/usage/accounts/a%2Fb/plan"],
+      ["PUT", "/usage/accounts/a%5cb/plan"],
+      ["PUT", "/usage/accounts/a%5Cb/plan"],
+      ["PUT", "/usage/accounts/a%00b/plan"],
+      ["PUT", "/usage/accounts/a%0ab/plan"],
+      ["PUT", "/usage/accounts/a%0db/plan"],
+      ["PUT", "/usage/accounts/a%1fb/plan"],
+      ["PUT", "/usage/accounts/a%7fb/plan"],
+      ["PUT", "/usage/accounts/a%ZZb/plan"],
+      ["PUT", "/usage/accounts/a%2/plan"],
+      ["PUT", "/usage/accounts/a%/plan"],
+      ["PUT", "/usage/accounts/%C0%AF/plan"],
+      ["PUT", "/usage/accounts/%FF/plan"],
+      ["PUT", "/usage/accounts/%252e%252e/plan"],
+      ["PUT", "/usage/accounts/%252e/plan"],
+      ["PUT", "/usage/accounts/%252f/plan"],
+      ["PUT", "/usage/accounts/%255c/plan"],
+      ["PUT", "/usage/accounts/%2500/plan"],
+      ["PUT", "/usage/accounts/%25252e%25252e/plan"],
+      ["PUT", "/usage/accounts/a%2520b/plan"],
+      ["PUT", "/usage/accounts//plan"],
+      ["PUT", `/usage/accounts/${"a".repeat(201)}/plan`],
+      ["PUT", "/usage/%61ccounts/claude/plan"],
+      ["PUT", "/usage/accounts/claude/%70lan"],
+      ["GET", "/%6de"],
+      ["GET", "/sessions/%2e%2e/me"],
+      ["GET", "/sessions/%252e%252e/me"],
+      ["GET", "/permissions/decisions/pd%2f1"],
+      ["GET", "/usage/projects/a%2Fb?tz=UTC"],
+    ];
+    for (const [method, path] of rejected) {
+      await assert.rejects(
+        runnerClient.request(path, { method, body: method === "PUT" ? { planUsd: 1 } : undefined }),
+        (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied",
+        `${method} ${path} must be denied`,
+      );
+    }
+    assert.equal(runner.requests.length, beforeRejections, "rejected encoded paths never reach the upstream HTTP server");
+  } finally {
+    owner.close();
+    runnerClient.close();
+    runner.close();
+    await host.stop();
+  }
+});

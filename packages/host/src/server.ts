@@ -11,7 +11,7 @@ import { z } from "zod";
 import { existsSync, realpathSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { Manager, publicAttention } from "./manager.js";
-import { MainCheckService } from "./main-check.js";
+import { MainCheckService, type HostProcesses } from "./main-check.js";
 import { mainCheckRoute } from "./main-check-route.js";
 import { hashToken, validateLinearConfig, validateMcpConfig } from "./config.js";
 import { runtimeSecurity } from "./deployment.js";
@@ -204,7 +204,7 @@ const inputSchema = z
     force: z.boolean().optional(),
   })
   .strict();
-export function createApp(config: Config, key: Buffer, options: { configFile?: string } = {}) {
+export function createApp(config: Config, key: Buffer, options: { configFile?: string; processCensus?: HostProcesses } = {}) {
   config.machine = machineIdentity(config, key);
   if ((config.cmux?.enabled || config.remote?.enabled) && runtimeSecurity(config.deployment).tenancy !== "single-tenant")
     throw new Error("Machine access and cmux require a single-tenant host");
@@ -275,7 +275,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     graphs: repositoryGraphs,
     events: outbox,
     capture: evalHost.capture,
-    entries: blackboard,
+    entries: blackboard, ...(options.processCensus ? { processes: options.processCensus } : {}),
     onMerged: id => void projectSource.refresh(id).then(status => {
       sourceChanged(id);
       if (status.appliedHead && !status.pending) scheduleGraphForSession(id);
@@ -512,7 +512,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   permissionTurnGate.hold = () => { const view = halt.view(); return view.readable && !view.host; };
   halt.useServices({ routines, goals, missions, teams }, teamId => goals.ownsActiveTeam(teamId) || missions.ownsActiveSubteam(teamId));
   const gate = halt.gate(fuse);
-  mainCheck = new MainCheckService({ config, key, mirrorPath: id => projectSource.mirrorPath(id), halt, hostLoad: manager.hostLoad });
+  mainCheck = new MainCheckService({ config, key, mirrorPath: id => projectSource.mirrorPath(id), halt, hostLoad: manager.hostLoad, ...(options.processCensus ? { ports: { processes: options.processCensus } } : {}) });
   manager.useFuse(gate);
   teams.useFuse(gate);
   goals.useFuse(gate);
@@ -2016,7 +2016,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     );
   });
   app.use("/api", (_req, res) =>
-    res.status(404).json({ error: "Endpoint not found" }),
+    res.status(404).json({ code: "route-not-found", error: "Endpoint not found" }),
   );
   const serveWeb = express.static(fileURLToPath(new URL("../../../apps/web/dist/", import.meta.url)));
   app.use((req, res, next) => {

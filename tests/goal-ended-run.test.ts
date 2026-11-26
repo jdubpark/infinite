@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { waitFor } from "./helpers.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import type { ProductGoal } from "../packages/host/src/goal-types.js";
+import { PROVISIONAL_REASON, PROVISIONAL_WITHDRAWN_REASON } from "../packages/host/src/goal-verdicts.js";
+import type { RunAssessment } from "../packages/host/src/verdict-types.js";
 import type { TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 import { GoalService } from "../packages/host/src/goals.js";
 import { TeamService } from "../packages/host/src/teams.js";
@@ -77,5 +79,32 @@ test("an ended run with a running member writes its event once and leaves the go
     const detached = await waitFor(async () => record(), goal => goal.activeTeamId === undefined, 10000);
     assert.equal(eventCount(detached), 1, "The detaching pass does not write the event again");
     assert.equal(detached.status, "ready-for-review", "The run detaches and the goal reaches its feature-run limit as before");
+  } finally { goals?.close(); teams?.close(); f.close(); }
+});
+
+test("a later not-met verdict that the goal's own refresh copies withdraws the provisional reason", { timeout: 60000 }, async () => {
+  const f = endedRunFixture();
+  const verdict = (result: RunAssessment["result"], met: number): RunAssessment => ({
+    verdictId: randomUUID(), revision: 1, head: "a".repeat(40), kind: "reviewed", result,
+    counts: { met, notMet: 1 - met, inconclusive: 0, pendingOwner: 0 }, criteria: [{ id: "c0", state: met ? "met" : "not-met" }], at: new Date().toISOString(),
+  });
+  const first = verdict("met", 1), reverted = verdict("not-met", 0);
+  const stopped: ProductGoal = { ...f.goal, status: "ready-for-review", stopReason: "provisional-met", reason: PROVISIONAL_REASON,
+    cycles: [{ ...f.goal.cycles[0], assessment: { ...first, progress: 1 } }] };
+  f.writeRecord("goal", f.goal.id, { goal: stopped, receipts: {}, fingerprint: "fixture" });
+  const record = () => f.readRecord<{ goal: ProductGoal }>("goal", f.goal.id).goal;
+  let goals: GoalService | undefined;
+  let teams: TeamService | undefined;
+  try {
+    teams = new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { ownerActive: () => false });
+    const getTeam = teams.get.bind(teams);
+    teams.get = id => ({ ...getTeam(id), revision: 1, assessment: reverted });
+    goals = new GoalService(f.config, f.key, teams);
+    goals.start();
+    const copied = await waitFor(async () => record(), goal => goal.cycles[0].assessment?.verdictId === reverted.verdictId, 10000);
+    assert.equal(copied.activeTeamId, f.goal.activeTeamId, "the copy came through the refresh of the still-active team");
+    assert.equal(copied.status, "ready-for-review");
+    assert.equal(copied.stopReason, "provisional-met");
+    assert.equal(copied.reason, PROVISIONAL_WITHDRAWN_REASON);
   } finally { goals?.close(); teams?.close(); f.close(); }
 });

@@ -4,7 +4,7 @@ import { allAgents } from "./model";
 import { agentTitle, stateWords } from "./Lanes";
 import { AGENT_STATES, type ActivityStore, type Agent, type Selection, type Swarm, type ViewProps } from "./types";
 
-type Section = { key: string; label: string; agents: Agent[] };
+type Section = { key: string; label: string; agents: Agent[]; waitSummary?: string; waitCount?: number };
 const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? "" : "s"}`;
 
 function sortByState(agents: Agent[]): Agent[] {
@@ -16,7 +16,7 @@ function WallTile({ agent, selected, onSelect, openSession, activity, now }: {
 }) {
   const buckets = activity.buckets(agent.id, now);
   const tier = agent.tier === "strong" ? "S" : agent.tier === "light" ? "L" : "";
-  const flags = [agent.limited ? "lim" : "", agent.stalled ? "stall" : "", agent.earlier ? "earlier" : ""].filter(Boolean);
+  const flags = [agent.limited ? "lim" : "", agent.stalled ? "stall" : "", agent.spinnerOnly ? "spin" : "", agent.earlier ? "earlier" : ""].filter(Boolean);
   const open = () => { if (agent.sessionId) openSession(agent.sessionId); };
   const classes = ["sw-tile", selected ? "sw-tile-selected" : "", agent.state === "needs-you" ? "sw-tile-needs" : ""].filter(Boolean).join(" ");
   return <button type="button" className={classes} data-agent={agent.id} aria-label={agentName(agent)} aria-pressed={selected}
@@ -52,13 +52,25 @@ function WallSwarm({ swarm, ...props }: ViewProps & { swarm: Swarm }) {
       if (swarm.coordinator) sections.push({ key: "direct", label: "coordinator", agents: [swarm.coordinator] });
       for (const unit of swarm.units) {
         const agents = [...unit.agents, ...unit.side];
-        if (agents.length > 0) sections.push({ key: unit.id, label: unit.title, agents });
+        if (agents.length > 0) sections.push({
+          key: unit.id,
+          label: unit.title,
+          agents,
+          waitCount: unit.waitReasons.length,
+          waitSummary: unit.waitReasons.map(reason => reason.summary).join(" · "),
+        });
       }
       break;
     case "team":
       for (const unit of swarm.units) {
         const agents = [...unit.agents, ...unit.side];
-        if (agents.length > 0) sections.push({ key: unit.id, label: "", agents });
+        if (agents.length > 0) sections.push({
+          key: unit.id,
+          label: "",
+          agents,
+          waitCount: unit.waitReasons.length,
+          waitSummary: unit.waitReasons.map(reason => reason.summary).join(" · "),
+        });
       }
       break;
     case "solo":
@@ -67,15 +79,17 @@ function WallSwarm({ swarm, ...props }: ViewProps & { swarm: Swarm }) {
   }
   const agentCount = allAgents(swarm).length;
   const spend = cost(swarm.costUsd, swarm.unmeasured);
+  const teamWaitReasons = swarm.kind === "team" ? swarm.units[0]?.waitReasons ?? [] : [];
   return <section className="sw-wall-swarm" aria-label={swarm.title}>
     <header className="sw-swarm-head">
       <span className="sw-title">{swarm.title}</span>
+      {teamWaitReasons.length > 0 && <span className="sw-tag" title={teamWaitReasons.map(reason => reason.summary).join(" · ")}>{teamWaitReasons.length === 1 ? "1 wait" : `${teamWaitReasons.length} waits`}</span>}
       <span className="sw-spacer" />
       <span className="sw-count sw-dim">{plural(agentCount, "agent")}</span>
       <span className="sw-cost sw-num" title={spend.title}>{spend.text}</span>
     </header>
     <div className="sw-wall-sections">{sections.map(section => <div key={section.key} className="sw-wall-section">
-      {swarm.kind === "mission" && <div className="sw-wall-unit sw-dim">{section.label}</div>}
+      {swarm.kind === "mission" && <div className="sw-wall-unit sw-dim"><span className="sw-wall-unit-label">{section.label}</span>{(section.waitCount ?? 0) > 0 && <span className="sw-tag" title={section.waitSummary}>{section.waitCount === 1 ? "1 wait" : `${section.waitCount} waits`}</span>}</div>}
       <div className="sw-wall-grid">
         {sortByState(section.agents).map(agent => <WallTile key={agent.id} agent={agent}
           selected={selection?.kind === "agent" && selection.id === agent.id}

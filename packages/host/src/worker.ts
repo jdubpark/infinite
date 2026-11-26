@@ -65,7 +65,7 @@ import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js"
 import { JsonLineAssembler, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
 import { WorkerScreenActivity } from "./worker-screen-activity.js";
-import { normalizeWorkerControlRequest, teamAnswerWorkerRequestSchema, workerControlRequestSchema, workerWorkspaceExportRequestSchema,
+import { normalizeWorkerControlRequest, resolveBootstrapExecutionIdentity, teamAnswerWorkerRequestSchema, workerControlRequestSchema, workerWorkspaceExportRequestSchema,
   type Bootstrap,
   type ControlActor,
   type ControlLease,
@@ -86,6 +86,7 @@ for await (const chunk of process.stdin) {
 const config = JSON.parse(bootstrap) as Bootstrap;
 bootstrap = "";
 const { session, profile, stateDir, runDir, socketDir } = config;
+const executionIdentity = resolveBootstrapExecutionIdentity(config);
 const workerSocket = socketPath({ runDir, socketDir: ensureSocketDir(socketDir ?? runDir, socketDir !== undefined ? "socketDir" : "runDir") }, session.id);
 const provider = session.provider;
 const key = Buffer.from(config.key, "base64");
@@ -159,8 +160,11 @@ const persist = () => {
   });
 };
 function append(type: Event["type"], data: Event["data"]): Event {
+  return appendAll(type, [data])[0];
+}
+function appendAll(type: Event["type"], items: Event["data"][]): Event[] {
   try {
-    return journal.append(type, data);
+    return journal.appendAll(type, items);
   } catch (error) {
     recordingFailure();
     throw error;
@@ -170,13 +174,11 @@ function flush() {
   clearTimeout(flushTimer);
   flushTimer = undefined;
   const startSeq = journal.seq;
-  let flushedBytes = 0;
-  while (pending.length) {
-    const data = pending.slice(0, 8192);
-    pending = pending.slice(8192);
-    flushedBytes += data.length;
-    append("output", { text: data });
-  }
+  const flushedBytes = pending.length;
+  const chunks: Event["data"][] = [];
+  for (let at = 0; at < pending.length; at += 8192) chunks.push({ text: pending.slice(at, at + 8192) });
+  pending = "";
+  appendAll("output", chunks);
   if (journal.seq - startSeq >= 32 || flushedBytes >= 64 * 1024) signalIndex?.checkpoint(journal.seq);
   const covered = sizeIndex.coveredSeq(journal.seq);
   if (covered !== undefined && covered - lastPersistedCoverage >= 256) persist();
@@ -1493,7 +1495,7 @@ server.listen(workerSocket, async () => {
       env.INFINITE_HOOK_URL = hookServer.url;
       env.INFINITE_HOOK_TOKEN = hookToken;
     }
-    const egress = workerEgressEnvironment(session.projectId, session.id, process.env, Date.now(), session.purpose);
+    const egress = workerEgressEnvironment(session.projectId, session.id, process.env, Date.now(), executionIdentity);
     if (egress.status === "invalid") throw new Error("The egress proxy address this worker inherited is unusable, so the session was not started");
     clearEgressEnvironment(env); Object.assign(env, egress.env);
     if (egress.status === "no-key") journal.append("lifecycle", { egress: "no-credential" });
@@ -1628,6 +1630,8 @@ server.listen(workerSocket, async () => {
         recordingFailure();
       }
       screenActivity.noteRawOutput(Date.now());
+      const flushed = pending.length >= 256 * 1024;
+      if (flushed) try { flush(); } catch {}
       if (!flushTimer)
         flushTimer = setTimeout(() => {
           try {
@@ -1637,6 +1641,7 @@ server.listen(workerSocket, async () => {
           }
           checkScreen();
         }, 40);
+      return flushed;
     };
     const onData = (data: string) => terminalBarrier.dispatch(() => output(data), Buffer.byteLength(data, "utf8"));
     child.onData(onData);
@@ -1701,7 +1706,7 @@ server.listen(workerSocket, async () => {
       pty.onData(onData);
       pty.onExit(onExit);
     };
-    endSession = () => exited(0);
+    endSession = () => terminalBarrier.dispatch(() => exited(0));
   } catch (error) {
     state = { ...state, status: "exited", exitCode: 1 };
     publish(applyLifecycle(attention, "exited", new Date().toISOString()));

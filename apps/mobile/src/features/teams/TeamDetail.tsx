@@ -373,7 +373,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       </View> : null}
 
       {tab === "activity" ? <View>
-        <TeamEvidenceSection connection={connection} team={team} me={me ?? null} onOpenSession={openSession} />
+        <TeamEvidenceSection connection={connection} team={team} onOpenSession={openSession} />
         <Section title="Checks" count={team.checks.length}>
           {team.checks.length ? team.checks.map((check, index) => <CheckRow key={`${check.startedAt}/${index}`} check={check} />) : <Text style={t.note}>None yet.</Text>}
         </Section>

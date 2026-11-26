@@ -137,6 +137,13 @@ order. When `resync.required` is true, replace the local view with the returned
 Observations are sampled on reads. A transition between reads may appear only
 in the underlying team record.
 
+`infinite mission watch ID [--json]` keeps that live progress feed full screen
+alongside linked subteam blackboard entries (`j`/`k` or `↑`/`↓` select subtask,
+`e` toggle entries, `Enter` toggle detail, `f` toggle follow, `q` or Ctrl+C
+detach). The web client (`apps/web/src/mission-inspector/`) and phone app
+(`MissionProgressSection`) render the same `GET /api/missions/:id/progress`
+snapshot and cursor stream.
+
 `POST /api/missions` (owner) creates a mission for a group. A retry with the
 same `requestId` returns the recorded mission before any admission check, so it
 succeeds even after the group was edited or deleted or a handoff started. The host launches
@@ -703,6 +710,6 @@ their repository and status. Each subtask opens the existing team detail.
 | `POST /api/missions/:id/extend` | Extend the working-time limit by 5–1,440 minutes (`requestId`, `revision`, `minutes`) | Owner |
 | `POST /api/missions/:id/pause`, `/resume`, `/cancel` | Pause, resume, or cancel a mission (`requestId`, `revision`) | Owner |
 | `GET /api/board` | Unified 4-column Board view (`needs-input`, `working`, `review`, `ended`) across missions, standalone teams, and goals | Any paired device |
-| `GET/POST/PUT/DELETE /api/project-groups[/:id]` | Inspect and manage repository groups, primary checkouts, and visibility (`INF-98`) | Reads: any; mutations: Owner |
+| `GET/POST/PUT/DELETE /api/project-groups[/:id]` | Inspect and manage repository groups, primary checkouts, and visibility | Reads: any; mutations: Owner |
 
 See [Orchestration Hierarchy](diagrams/orchestration-hierarchy.svg) and [System Architecture](architecture.md#orchestration-stack-and-state-machines) for the complete mission-to-team ownership chain.

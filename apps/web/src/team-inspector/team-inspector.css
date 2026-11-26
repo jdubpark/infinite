@@ -20,12 +20,24 @@
 .ti-pill.is-inconclusive, .ti-pill.is-pending-owner { border-color: #dfc491; background: #f7e8ce; color: #724314; }
 .ti-pill.is-withdrawn { border-color: #dfb9b3; background: #faeae7; color: #9d382a; }
 .ti-pill.is-superseded { border-color: #d5d9d1; background: #eceee8; color: var(--muted); }
+.ti-pill.is-wait-attention { border-color: #dfb9b3; background: #faeae7; color: #9d382a; }
+.ti-pill.is-wait-warning { border-color: #dfc491; background: #f7e8ce; color: #724314; }
+.ti-pill.is-wait-muted { border-color: #d5d9d1; background: #eef1e9; color: var(--muted); }
 .ti-task-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .ti-task-chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; padding: 3px 8px; border-radius: 6px; background: #eef1e9; color: var(--ink); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ti-summary-box { padding: 14px 16px; border: 1px solid var(--rule); border-radius: 10px; background: var(--paper); display: flex; flex-direction: column; gap: 10px; }
 .ti-claims-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .ti-claims-list li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-size: 12px; line-height: 1.5; padding-top: 8px; border-top: 1px solid var(--rule); }
 .ti-claims-list li:first-child { padding-top: 0; border-top: 0; }
+.ti-wait-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.ti-wait-item { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; padding-top: 10px; border-top: 1px solid var(--rule); }
+.ti-wait-item:first-child { padding-top: 0; border-top: 0; }
+.ti-wait-main { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 8px; flex: 1 1 260px; min-width: 0; font-size: 12px; line-height: 1.5; }
+.ti-wait-summary { color: var(--ink); overflow-wrap: anywhere; }
+.ti-wait-meta { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.ti-wait-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.ti-roster-flag.is-warning { color: #724314; }
+.ti-roster-flag.is-attention { color: #9d382a; }
 .ti-roster { display: flex; flex-direction: column; gap: 10px; }
 .ti-roster-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .ti-roster-head h3 { margin: 0; font-size: 14px; }

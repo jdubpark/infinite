@@ -159,6 +159,8 @@ export function SwarmView(props: SwarmViewProps) {
             {stateWords(selectedAgent.state)}{selectedAgent.since ? ` ${elapsed(selectedAgent.since, now)}` : ""}
           </span>
           {selectedAgent.tool && <span className="sw-inspector-fact" title={selectedAgent.tool}>{selectedAgent.tool}</span>}
+          {selectedAgent.stalled && <span className="sw-inspector-fact sw-flag" title="Stalled without substantive activity">stalled</span>}
+          {selectedAgent.spinnerOnly && <span className="sw-inspector-fact sw-flag" title="Spinner-only screen without substantive changes">spinner-only</span>}
           {selectedAgent.costUsd !== undefined && <span className="sw-inspector-fact sw-fixed sw-num">{usd(selectedAgent.costUsd)}</span>}
           {selectedAgent.taskId && <span className="sw-inspector-fact" title={selectedAgent.taskId}><small>task</small>{selectedAgent.taskId}</span>}
           <span className="sw-inspector-links">
@@ -174,6 +176,12 @@ export function SwarmView(props: SwarmViewProps) {
           {(selectedUnit.costUsd !== undefined || selectedUnit.unmeasured > 0) && <span className="sw-inspector-fact sw-fixed sw-num" title={unitSpend.title}>{unitSpend.text}</span>}
           {holdGlyph(selectedUnit.hold)}
           {terminalGlyph(selectedUnit.terminal)}
+          {selectedUnit.waitReasons.length > 0 && (
+            <span className="sw-inspector-fact" title={selectedUnit.waitReasons.map(reason => reason.summary).join("\n")}>
+              <small>wait {selectedUnit.waitReasons.length}</small>
+              {selectedUnit.waitReasons[0]!.summary}
+            </span>
+          )}
           <span className="sw-inspector-links"><button type="button" className="sw-link" onClick={() => openTeam(selectedUnit.id)}>team</button></span>
         </> : selection?.kind === "area" ? (() => {
           const [, project, ...path] = selection.id.split(":");

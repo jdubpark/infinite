@@ -51,9 +51,11 @@ export type TeamTask = {
 };
 export type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; headCommit: string; tasks: TeamTask[]; review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string; acceptance?: TeamAcceptanceEvidence[] }; brief?: TeamBrief };
 export type TeamMember = {
-  memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string;
+  memberId: string; sessionId: string; role: TeamRole; revision: number; planRevision?: number; title: string; status: string;
   taskId?: string; provider?: string; modelProfile?: ModelProfile; stoppedReason?: string;
   startedAt?: string; reportedAt?: string; lastActivityAt?: string; spinnerOnlySince?: string; stalledAt?: string;
+  replacesMemberId?: string;
+  replaces?: { memberId: string; cause?: string };
 };
 export type TeamWaitReasonKind =
   | "worker-slot"
@@ -103,9 +105,9 @@ export type TeamView = {
   permissionsRevokedAt?: string;
   permissionDecisions?: PermissionDecision[];
 };
-export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "workers" | "revision" | "status" | "createdAt" | "updatedAt"
+export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "workers" | "waitReasons" | "revision" | "status" | "createdAt" | "updatedAt"
   | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "linear" | "goal" | "missionId" | "resumable" | "continuable" | "permissionsRevokedAt"> & {
-  members: (Omit<TeamMember, "modelProfile" | "spinnerOnlySince"> & { modelProfile?: Pick<ModelProfile, "label" | "provider" | "tier"> })[];
+  members: (Omit<TeamMember, "modelProfile"> & { modelProfile?: Pick<ModelProfile, "label" | "provider" | "tier"> })[];
   tasks: Pick<TeamTask, "id" | "title" | "status" | "paths" | "memberId" | "ownerRating">[];
   checks: Pick<TeamCheck, "status" | "revision">[];
   lineup?: Pick<TeamLineup, "coordinator">;

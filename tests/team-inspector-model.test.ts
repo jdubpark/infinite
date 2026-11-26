@@ -7,10 +7,12 @@ import {
   entryAuthorityMeta,
   filterEntries,
   mergeEntryPage,
+  orderWaitReasons,
   parseTeamEntryHash,
   partitionRoster,
+  waitReasonMeta,
 } from "../apps/web/src/team-inspector/model.ts";
-import type { TeamEntryHead } from "../apps/web/src/team-inspector/types.ts";
+import type { TeamEntryHead, TeamWaitReason, TeamWaitReasonKind } from "../apps/web/src/team-inspector/types.ts";
 import type { TeamMember, TeamView } from "../apps/web/src/teams.tsx";
 
 function baseTeam(): TeamView {
@@ -205,4 +207,43 @@ test("entryAuthorityMeta and deep-link hash helpers distinguish authorities and 
   assert.equal(parseTeamEntryHash(`#/teams/${tid}/entries/${eid}`, "other"), null);
   assert.equal(buildTeamEntryHash("box-1", tid, eid), `#/machines/box-1/teams/${tid}/entries/${eid}`);
   assert.equal(buildTeamEntryHash("direct", tid), `#/teams/${tid}`);
+});
+
+test("waitReasonMeta and orderWaitReasons classify and prioritize host wait reasons", () => {
+  assert.deepEqual(waitReasonMeta("owner-decision"), { label: "Owner decision", tone: "attention" });
+  assert.deepEqual(waitReasonMeta("provider-prompt"), { label: "Provider prompt", tone: "attention" });
+  assert.deepEqual(waitReasonMeta("stalled"), { label: "Stalled", tone: "attention" });
+  assert.deepEqual(waitReasonMeta("spinner-only"), { label: "Spinner-only screen", tone: "warning" });
+  assert.deepEqual(waitReasonMeta("provider-limit"), { label: "Provider limit", tone: "warning" });
+  assert.deepEqual(waitReasonMeta("worker-slot"), { label: "Worker slot", tone: "muted" });
+  assert.deepEqual(waitReasonMeta("dependency"), { label: "Task dependency", tone: "muted" });
+  assert.deepEqual(waitReasonMeta("integration-order"), { label: "Integration order", tone: "muted" });
+  assert.deepEqual(waitReasonMeta("linear-sync"), { label: "Linear sync", tone: "muted" });
+  assert.deepEqual(waitReasonMeta("custom-kind" as TeamWaitReasonKind), { label: "custom-kind", tone: "muted" });
+
+  const input: TeamWaitReason[] = [
+    { kind: "linear-sync", summary: "Linear sync" },
+    { kind: "dependency", summary: "Task dependency" },
+    { kind: "worker-slot", summary: "Worker slot" },
+    { kind: "provider-limit", summary: "Provider limit" },
+    { kind: "spinner-only", summary: "Spinner only" },
+    { kind: "stalled", summary: "Stalled" },
+    { kind: "provider-prompt", summary: "Provider prompt" },
+    { kind: "owner-decision", summary: "Owner decision" },
+    { kind: "integration-order", summary: "Integration order" },
+  ];
+  assert.deepEqual(
+    orderWaitReasons(input).map(item => item.kind),
+    [
+      "owner-decision",
+      "provider-prompt",
+      "stalled",
+      "spinner-only",
+      "provider-limit",
+      "worker-slot",
+      "dependency",
+      "integration-order",
+      "linear-sync",
+    ],
+  );
 });

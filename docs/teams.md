@@ -65,7 +65,7 @@ infinite team start --prd docs/checkout-prd.md
 infinite team status
 infinite team status TEAM_ID
 infinite team status TEAM_ID --logs
-infinite team watch TEAM_ID
+infinite team watch TEAM_ID [--logs | --board]
 infinite team steer TEAM_ID "Keep the existing checkout layout"
 infinite team answer TEAM_ID QUESTION_ID "Use the existing retry policy"
 infinite team continue TEAM_ID "Preserve the current checkout design"
@@ -76,15 +76,17 @@ questions. `infinite team status TEAM_ID` prints that team's decisions and
 Jevcode summary, wrapped to the terminal width. Each open decision shows the
 `infinite team answer` command that answers it.
 
-`infinite team watch TEAM_ID` keeps that summary full screen and refreshes it
-every two seconds. The bottom line lists the keys for the current view:
+`infinite team watch TEAM_ID [--logs | --board]` keeps that summary, blackboard
+entry inspector, or review log full screen and refreshes it every two seconds.
+The bottom line lists the keys for the current view:
 
 | Key | Action |
 | --- | --- |
+| `b` | Open the blackboard entry board (`Enter` detail, `p` kind filter, `f` follow, `o` member logs) |
 | `l` | Open the review log |
-| `s` or `b` | Return to the summary |
-| `←` `→`, or `n` `p` | Next or previous agent |
-| `↑` `↓`, or `j` `k` | Scroll one line |
+| `s` | Return to the summary |
+| `←` `→`, or `n` `p` | Next or previous agent (in summary/log views) |
+| `↑` `↓`, or `j` `k` | Scroll one line or move selection in board view |
 | Space, Page Up, Page Down | Scroll one page |
 | `g` `G`, Home, End | Jump to the top or bottom |
 | `a` | Ask Jevcode for a summary when it is empty or failed |
@@ -93,8 +95,11 @@ every two seconds. The bottom line lists the keys for the current view:
 A refresh keeps your scroll position; switching view or agent starts at the
 top. A failed refresh keeps the last card on screen under a notice. A
 non-interactive watch prints again only when the visible text changes.
-`--logs` starts in the review log. `infinite team status TEAM_ID --logs` prints
-the current revision's review logs once. `--json` still prints the team record.
+`--logs` starts in the review log and `--board` starts in the blackboard entry
+view. `infinite team status TEAM_ID --logs` prints the current revision's review
+logs once. `--json` still prints the team record. The web client
+(`apps/web/src/team-inspector/`) and phone app (`TeamEvidenceSection`,
+`TeamOverviewGroups`) show the same blackboard entries and outcome groups.
 Set `NO_COLOR` to drop bold headings and the highlighted key bar.
 
 Repository setup records a private binding between the local Git root and the
@@ -2665,7 +2670,7 @@ into tracked configuration examples, screenshots, or repository reports.
 
 ## Usage and budgets
 
-The sealed host ledger records measured OpenCode token usage. Configure a `usage` block to expose the Cost view, account mapping, and budgets. The dated built-in catalog prices DeepSeek and Meta models; custom prices can override it. The ledger records Claude Code and Codex tokens for sessions whose hooks stream a transcript. Each figure states its coverage. Those records are not priced yet, so they count as unpriced steps. The web client, API, and CLI read the same ledger.
+The sealed host ledger records measured OpenCode token usage. Configure a `usage` block to expose the Cost view, account mapping, and budgets. The dated built-in catalog prices DeepSeek and Meta models; custom prices can override it. The ledger records Claude Code and Codex tokens for sessions whose hooks stream a transcript. Each figure states its coverage. Those records are not priced yet, so they count as unpriced steps. The web client, API, and CLI read the same ledger. `infinite usage repairs [--project ID] [--days N] [--json]` (`GET /api/usage/repair-loops`) summarizes baseline repair-loop latency, priced token/USD medians (excluding unmeasured loops rather than zeroing them), and cold-replacement/failed-resume denominators.
 
 ```json
 {
@@ -4274,9 +4279,9 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | `GET /api/teams/:id/context-usage` | None; returns recorded launch and blackboard read sizes per member (`member_scopes`) | Any paired device |
 | `GET /api/teams/:id/routing/:taskId` | None; explains the shadow or auto routing decision for a task | Any paired device |
 | `POST /api/teams/:id/reconcile-delivery`, `/reconcile-verification` | `requestId`, `revision`, reconciliation attestation fields (standalone runs) | Owner |
-| `GET /api/teams/:id/members/:memberId/runtime`, `POST /api/teams/:id/members/:memberId/retire` | Inspect live process census or retire a member runtime tree (`SIGSTOP` -> `SIGKILL`) | Reads: any; `retire`: Owner |
+| `GET /api/teams/:id/members/:memberId/runtime`, `POST /api/teams/:id/members/:memberId/retire` | Inspect live process census or retire a member runtime tree (`SIGSTOP` -> `SIGKILL`) | Owner |
 | `POST /api/teams/:id/permissions/revoke`, `/routing/revoke` | `requestId`, `revision`; revokes active permission delegation or auto routing for the run | Owner |
-| `GET /api/teams/:id/bundle` | None; downloads the run's inspection bundle | Owner |
+| `GET /api/teams/:id/bundle` | None; downloads the run's inspection bundle | Owner bearer key (owner CLI; session cookies refused) |
 
 Related subsystem routes documented in their respective sections above and in [System Architecture](architecture.md#api-surface-index): `/api/routines/*` (scheduled routines), `/api/fuse` and `POST /api/fuse/close` (launch-rate fuse), `/api/permissions/*` (host permission agent journal, delegations, unlocks, and replay), `/api/routing/*` (project routing status and exploration pause/resume), `/api/outcomes/*` (outcome ledger), `/api/eval/*` (replay eval jobs and priors), and `/api/duels/judges/*` (judge calibrations).
 

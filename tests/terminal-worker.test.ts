@@ -976,7 +976,7 @@ test("a live terminal stream outlasts one unavailable state read and ends after 
   } as unknown as Manager;
   const streamed: string[] = [];
   try {
-    for await (const page of terminalPages(manager, id, 0, new AbortController().signal)) if ("state" in page) streamed.push(page.state.status);
+    for await (const page of terminalPages(manager, id, 0, new AbortController().signal, false, { status: "running" } as WorkerState)) if ("state" in page) streamed.push(page.state.status);
     assert.deepEqual(streamed, statuses);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });

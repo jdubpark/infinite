@@ -8,6 +8,7 @@ import { signalGroup, watchLeader } from "../packages/host/src/process-group.js"
 import { GROUP_SUPERVISOR } from "../packages/host/src/group-supervisor.js";
 import { EXIT_DRAIN_MS } from "../packages/host/src/team-workspace.js";
 import { blobReader } from "../packages/host/src/git-stream.js";
+import { captureGit } from "../packages/host/src/eval-git.js";
 import { RepositoryGraphs } from "../packages/host/src/repository-graphs.js";
 import { runRepositoryContext } from "../packages/host/src/understanding-runtime.js";
 import { createUnderstandingAdapter } from "../packages/host/src/understanding-adapter.js";
@@ -20,6 +21,8 @@ const CASE = { timeout: 600_000, skip: process.platform === "win32" && "process 
 const SETTLE_MS = EXIT_DRAIN_MS + 5_000;
 const BUFFERED = 131_072;
 const pause = (ms: number) => new Promise(done => setTimeout(done, ms));
+const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+const AUTHOR = ["-c", "user.name=Example", "-c", "user.email=dev@example.invalid"];
 
 type Ending = "exits" | "is killed" | "runs";
 type Run = { settled: Promise<string>; stop(): unknown };
@@ -37,12 +40,17 @@ function scratch() {
 function checkout(base: string) {
   const root = join(base, "checkout");
   mkdirSync(root);
-  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
-  execFileSync("git", ["init", "-q", "--initial-branch=main"], { cwd: root, env });
+  execFileSync("git", ["init", "-q", "--initial-branch=main"], { cwd: root, env: GIT_ENV });
   writeFileSync(join(root, "a.txt"), "content\n");
-  execFileSync("git", ["add", "a.txt"], { cwd: root, env });
-  execFileSync("git", ["-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "commit", "-q", "-m", "base"], { cwd: root, env });
-  return { root, head: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, env, encoding: "utf8" }).trim() };
+  execFileSync("git", ["add", "a.txt"], { cwd: root, env: GIT_ENV });
+  execFileSync("git", [...AUTHOR, "commit", "-q", "-m", "base"], { cwd: root, env: GIT_ENV });
+  return { root, head: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, env: GIT_ENV, encoding: "utf8" }).trim() };
+}
+
+function changed(root: string) {
+  writeFileSync(join(root, "a.txt"), "changed\n");
+  execFileSync("git", [...AUTHOR, "commit", "-q", "-am", "change"], { cwd: root, env: GIT_ENV });
+  return execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, env: GIT_ENV, encoding: "utf8" }).trim();
 }
 
 function watched(args: string[]) {
@@ -131,6 +139,16 @@ const places: Place[] = [
       const controller = new AbortController();
       const reader = blobReader(() => ({ command: process.execPath, args: [LEADER_LEAVES, record, mode(ending, "exec")] }));
       return { settled: outcome(reader.read(root, head, "a.txt", controller.signal)), stop: () => controller.abort() };
+    },
+  },
+  {
+    name: "a Git patch read that names a missing commit",
+    held: /^resolved \{"state":"failed"\}$/,
+    stopped: /^resolved \{"state":"failed"\}$/,
+    start(record, base, ending) {
+      const { root, head } = checkout(base);
+      const git = captureGit(() => ({ command: process.execPath, args: [LEADER_LEAVES, record, mode(ending, "exec")] }));
+      return { settled: outcome(git.patch(root, head, "0".repeat(40))), stop: () => git.close() };
     },
   },
   {
@@ -394,6 +412,22 @@ test("every spawner settles about a drain after its leader exits while an escape
         }
       }
     });
+  }
+});
+
+test("a patch read whose escaped holder keeps only stderr open fails instead of returning the patch", CASE, async () => {
+  const { base, record } = scratch();
+  const git = captureGit(() => ({ command: process.execPath, args: [LEADER_LEAVES, record, "exec-stderr"] }));
+  try {
+    const { root, head } = checkout(base);
+    const settled = outcome(git.patch(root, head, changed(root)));
+    const left = await leaderGone(record);
+    assert.equal(await within(settled, SETTLE_MS, "the patch read settles after its leader exits"), 'resolved {"state":"failed"}');
+    assert.equal(gone(left.holder), false, "the holder that keeps stderr open runs on");
+  } finally {
+    git.close();
+    endLeftBehind(record);
+    rmSync(base, { recursive: true, force: true });
   }
 });
 

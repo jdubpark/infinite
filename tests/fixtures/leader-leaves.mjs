@@ -22,7 +22,7 @@ if (mode === "running") {
 } else {
   const [action, ending] = mode.split("-");
   const idle = ["-e", "setTimeout(() => {}, 30000)"];
-  const holder = spawn(process.execPath, idle, { detached: true, stdio: ["ignore", "inherit", "inherit"] });
+  const holder = spawn(process.execPath, idle, { detached: true, stdio: ["ignore", ending === "stderr" ? "ignore" : "inherit", "inherit"] });
   const witness = spawn(process.execPath, idle, { stdio: "ignore" });
   holder.unref();
   witness.unref();

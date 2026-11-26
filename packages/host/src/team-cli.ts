@@ -1158,7 +1158,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     outputTeam(await postMutation(api, receiptsPath, key, endpoint, body), Boolean(options["--json"]));
     return true;
   }
-  if (["steer", "answer", "pause", "resume", "cancel", "continue", "revoke-permissions", "revoke-routing", "reconcile-verification"].includes(subcommand ?? "")) {
+  if (["steer", "answer", "pause", "resume", "cancel", "continue", "revoke-permissions", "revoke-routing", "reconcile-verification", "processes-ended"].includes(subcommand ?? "")) {
     if (!id) throw new Error(`Usage: infinite team ${subcommand} ID ...`);
     const current = await api.json<any>(`/teams/${id}`);
     const requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
@@ -1201,7 +1201,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       endpoint = `/teams/${id}/decisions/${questionId}/answer`; body = { requestId, revision: current.revision, text };
     } else {
       if (rest.length) throw new Error(`Usage: infinite team ${subcommand} ID`);
-      body = { requestId, revision: current.revision };
+      body = subcommand === "processes-ended" ? { requestId } : { requestId, revision: current.revision };
     }
     resumePendingIntent(receiptsPath, `team-${subcommand}:`, endpoint, prior => subcommand === "steer" || subcommand === "answer" ? prior.text === body.text : true, requestId, true, rawArgs);
     const key = `team-${subcommand}:${requestId}`;
@@ -1220,5 +1220,5 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     return true;
   }
-  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|delete|entries|entry|reconcile-delivery|reconcile-verification|retire-member|cancel|revoke-permissions|revoke-routing ...");
+  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|delete|entries|entry|reconcile-delivery|reconcile-verification|processes-ended|retire-member|cancel|revoke-permissions|revoke-routing ...");
 }

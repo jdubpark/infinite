@@ -317,7 +317,7 @@ test("a host stop inside a command's drain signals nothing, and after a restart 
   const pidIn = (file: string) => { const text = existsSync(file) ? readFileSync(file, "utf8") : ""; return text.endsWith("\n") ? Number.parseInt(text, 10) : undefined; };
   const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; } };
   type Internals = { records: Map<string, { pending?: unknown }>; operation: (stored: unknown, kind: string, perform: (signal: AbortSignal) => Promise<unknown>, complete: () => void) => void;
-    refreshOperationCensus: (stored: unknown, force: boolean) => Promise<string | undefined> };
+    fence: { refresh: (stored: unknown, force: boolean) => Promise<string | undefined> } };
   const teams = openTeam(f);
   let restarted: TeamService | undefined;
   try {
@@ -341,7 +341,7 @@ test("a host stop inside a command's drain signals nothing, and after a restart 
     assert.equal(alive(pidIn(leftFile)!), true, "the host stop signalled nothing after the leader's exit");
     restarted = openTeam(f);
     const restartedInternals = restarted as unknown as Internals;
-    assert.equal(await restartedInternals.refreshOperationCensus(restartedInternals.records.get(f.run.id)!, true), "running", "the census finds the sleep in the recorded group");
+    assert.equal(await restartedInternals.fence.refresh(restartedInternals.records.get(f.run.id)!, true), "running", "the census finds the sleep in the recorded group");
   } finally {
     const left = pidIn(leftFile);
     if (left !== undefined && Number.isSafeInteger(left) && left > 1 && alive(left)) process.kill(left, "SIGKILL");

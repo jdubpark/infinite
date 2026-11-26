@@ -10,6 +10,7 @@ import type { EntryIngestQueue } from "./team-entry-ingest.js";
 import { intakeEndedByRemoval } from "./review-feedback.js";
 import type { RetentionState, Stored, TeamServiceOptions } from "./teams.js";
 import { MemberTraces, removeMemberTraces, type TraceSettlementHost } from "./member-traces.js";
+import { processesCleared, type CommandFence } from "./team-command-fence.js";
 
 function retentionEventAt(run: TeamRun) {
   const event = [...run.events].reverse().find(item => {
@@ -54,6 +55,7 @@ export type RetentionHost = Pick<TeamKernel, "records" | "commands" | "manager" 
   needsPublication(stored: Stored): boolean;
   startPublication(stored: Stored): boolean;
   refreshOperationCensus(stored: Stored, force?: boolean): Promise<NonNullable<Stored["census"]>["state"] | undefined>;
+  readonly fence: CommandFence;
   closeStaleBlockedRun(stored: Stored, hours: number): Promise<void>;
 };
 
@@ -317,15 +319,15 @@ export class TeamRetention {
     }
   }
   removeRun(id: string): Promise<TeamView> {
-    return this.host.enqueue(id, async () => {
+    return this.host.fence.take(id, true).then(taken => this.host.enqueue(id, async () => {
       const stored = this.host.visible(id), run = stored.run;
       if (this.host.needsPublication(stored)) throw new TeamError(409, "head-not-published", "The integrated head must be published to GitHub before this run can be removed.");
       if (this.removingRuns.has(id)) throw new TeamError(409, "team-operation-running", "A background workspace removal is still running. Retry deletion after it settles.");
       this.assertRunRetentionSafe(stored);
       if (!(["cancelled", "merged", "no-change"].includes(run.status) && await this.membersSettled(stored)))
         throw new TeamError(409, "team-active", "Only a settled cancelled, merged or no-change run can be removed.");
-      if (stored.pending?.witness && await this.host.refreshOperationCensus(stored, true) !== "ended")
-        throw new TeamError(409, "team-operation-running", "The host still sees, or cannot rule out, processes of this run's unfinished operation. Retry removal after they have exited.");
+      if (taken) this.host.fence.apply(stored, taken);
+      if (stored.pending?.witness && (taken?.pendingId !== stored.pending.id || !processesCleared(stored))) throw this.operationRunning(stored);
       if (this.needsMemberWorkSaved(stored)) {
         this.startMemberWorkSave(stored);
         throw new TeamError(409, "member-work-not-saved", "Unfinished member work is being saved to GitHub before this run's workspaces are removed. Retry removal shortly.");
@@ -346,7 +348,13 @@ export class TeamRetention {
         this.deletingRuns.delete(id);
         this.removingRuns.delete(id);
       }
-    });
+    }));
+  }
+  private operationRunning(stored: Stored) {
+    const census = stored.census?.pendingId === stored.pending?.id ? stored.census : undefined;
+    return census?.state === "unknown"
+      ? new TeamError(409, "team-operation-running", "The host cannot tell whether processes of this run's unfinished operation still run. After checking the host, state that they ended with `infinite team processes-ended RUN_ID`, then retry removal.")
+      : new TeamError(409, "team-operation-running", "The host still sees, or cannot rule out, processes of this run's unfinished operation. Retry removal after they have exited.");
   }
   private async membersSettled(stored: Stored, operationEnded = false) {
     const { run } = stored;
@@ -510,8 +518,9 @@ export class TeamRetention {
       if (this.host.needsPublication(stored)) { this.host.startPublication(stored); return; }
       if (witnessed && stored.pending) {
         const last = stored.census?.pendingId === stored.pending.id ? stored.census : undefined;
-        if (last && last.state !== "ended") return;
-        if (await this.host.refreshOperationCensus(stored, true) !== "ended") return;
+        if (last && !processesCleared(stored)) return;
+        await this.host.refreshOperationCensus(stored, true);
+        if (!processesCleared(stored)) return;
         if (run.status !== statusAtStart || this.host.commands.has(run.id) || this.removingRuns.has(run.id)) return;
       }
       if (this.needsMemberWorkSaved(stored)) { this.startMemberWorkSave(stored); return; }

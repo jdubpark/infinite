@@ -1,5 +1,7 @@
 # Swarm view
 
+> **Scope note:** This page documents the read-only **web Swarm visualization** (`#/swarm`, `#/swarm/wall`, `#/swarm/graph`) and the **Decision Queue** (`#/decisions`). For multi-agent orchestration lifecycles, mission-to-subteam scheduling, and the Blackboard, see [System Architecture](architecture.md#orchestration-stack-and-state-machines), [Missions](missions.md), and [Blackboard and member entry tools](teams.md#blackboard-and-member-entry-tools).
+
 The Swarm view is the web client's landing page. It shows the agents on the
 active machine: how they are organised into teams and missions, what each one
 is doing now, and which parts of the code they are working in. It is

@@ -1,4 +1,5 @@
 import { deterministicUuid, type IntakeConfig, type IntakeInbound, type IntakeMessage, type IntakeMessageKind, type IntakeRecord, type IntakeThread, type SlackThreadMessage } from "./intake-types.js";
+import { KeyedQueue } from "./keyed-queue.js";
 import type { IntakeStore } from "./intake-store.js";
 import type { Mission, MissionDecision } from "./mission-types.js";
 import type { MissionService } from "./missions.js";
@@ -148,6 +149,7 @@ export class IntakeSlackSurface {
   private state: SurfaceState = { kind: "idle" };
   private droppedCount = 0;
   private readonly timers = new Map<string, NodeJS.Timeout>();
+  private readonly inboundThreads = new KeyedQueue();
   private readonly drainTimers = new Map<string, NodeJS.Timeout>();
   private readonly pumping = new Set<string>();
   private readonly draining = new Set<string>();
@@ -225,7 +227,7 @@ export class IntakeSlackSurface {
   }
 
   private begin(botUserId: string): void {
-    this.state = { kind: "running", botUserId, connection: this.client.connect(envelope => this.receive(envelope)) };
+    this.state = { kind: "running", botUserId, connection: this.client.connect(envelope => this.receiveInOrder(envelope)) };
     this.unsubscribers = [
       this.store.onChange(record => this.reconcile(record.issueId)),
       this.missions.onChange(mission => {
@@ -542,6 +544,13 @@ export class IntakeSlackSurface {
       const index = draft.messages.findIndex(item => item.key === key);
       if (index !== -1) draft.messages[index] = change(draft.messages[index]);
     });
+  }
+
+  private receiveInOrder(envelope: SlackEnvelope): Promise<void> {
+    const channel = envelope.interaction?.channelId ?? envelope.event?.channel;
+    const thread = envelope.interaction?.threadTs ?? envelope.interaction?.messageTs ?? envelope.event?.threadTs ?? envelope.event?.ts;
+    if (!channel || !thread) return this.receive(envelope);
+    return this.inboundThreads.enqueue(JSON.stringify([channel, thread]), () => this.receive(envelope));
   }
 
   private async receive(envelope: SlackEnvelope): Promise<void> {

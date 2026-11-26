@@ -279,7 +279,7 @@ export function TeamCreate({ me, connected, done }: { me: Me; connected: boolean
 function eventLabel(event: LogEvent) {
   if (event.type === "signal") return String(event.data.kind ?? "Signal");
   if (event.type === "input-result") return event.data.state === "delivered" ? "Input delivered" : "Input";
-  if (event.type === "lifecycle") return String(event.data.status ?? "Session updated");
+  if (event.type === "lifecycle") return `${String(event.data.status ?? "Session updated")}${event.data.outputTailIncomplete ? " (the recording may be missing the session’s last output)" : ""}`;
   return event.type;
 }
 function eventDetail(event: LogEvent) {

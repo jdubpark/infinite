@@ -169,7 +169,9 @@ Application records are encrypted with AES-256-GCM. Each record has a fresh 96-b
 
 The 256-bit key is a separate 0600 file outside the data directory, loaded into the API and worker memory. Encrypting a backup of the state directory is useful only if the attacker does not also obtain this key. Back up the key separately through an owner-controlled channel; losing it loses the recording. The local development layout is not a protected production key management system.
 
-Metadata and context use atomic encrypted writes. Workers fsync recording entries, serialize input, and refuse to silently continue after a detected recording error. Output events are durable when their flush returns, and every other event when its append returns. A worker flushes buffered output roughly 40 ms after it arrives, or as soon as about 256 Ki characters are buffered; a flush writes its output events in 8192-character chunks and syncs them once per journal segment. While a snapshot or resize waits for the terminal renderer, the worker queues new output and the session's end. When the renderer drains, or as soon as the queue passes about 2 MiB and the worker gives up that snapshot or resize, the worker replays the whole queue in order through the same flushes and answers state requests between them. Buffered output is not yet durable if the worker or machine dies; this is distinct from client disconnection. While a flush runs, the host can read its output events before they are synced; the same window exists between any single event's write and its sync. If a write or sync fails while the session is running, the worker enters `recording-error` and its sequence number counts only the events of journal segments that were already synced before the failure, and none of the failing segment's events, although events already written can remain readable in the journal.
+Metadata and context use atomic encrypted writes. Workers fsync recording entries, serialize input, and refuse to silently continue after a detected recording error. Output events are durable when their flush returns, and every other event when its append returns. A worker flushes buffered output roughly 40 ms after it arrives, or as soon as about 256 Ki characters are buffered; a flush writes its output events in 8192-character chunks and syncs them once per journal segment. While a snapshot or resize waits for the terminal renderer, the worker queues new output and the session's end. When the renderer drains, or as soon as the queue passes about 2 MiB and the worker gives up that snapshot or resize, the worker replays the whole queue in order through the same flushes and answers state requests between them. Buffered output is not yet durable if the worker or machine dies; this is distinct from client disconnection. While a flush runs, the host can read its output events before they are synced; the same window exists between any single event's write and its sync. If a write or sync fails while the session is running, the worker enters `recording-error` and its sequence number counts only the events of journal segments that were already synced before the failure, and none of the failing segment's events, although events already written can remain readable in the journal. After a failed write or sync, the session's journal takes no more events and ends at the failure, even if the disk recovers; the worker stays in `recording-error`, refuses owner answers and headless resumes, and still saves the child's exit code in its status file when the child exits.
+
+When the provider's terminal closes, the worker reads whatever the terminal still holds and records it before the exit, because Node can report the end of a terminal's output while the kernel still holds some of it. If the worker cannot confirm that it read everything, the exit event and the session's state carry `outputTailIncomplete: true`, and the clients say that the recording may be missing the session's last output. This happens when another process still holds the terminal open after the provider exits, so that node-pty closes it 200 ms later, or when the read stops before the terminal reports that it closed. Output written to the terminal after that is not recorded. The marker covers every terminal the session has run, so a resumed session's final exit still reports an earlier terminal's unconfirmed tail; an end that the permission channel forces while a terminal is alive leaves that terminal out, because the ended session records no later output by design. On Windows the worker does not read the terminal this way and sets no marker.
 
 Owner context is bound to a project ID and its canonical checkout path. Reusing an ID for another path does not import its saved text. Legacy context without a codebase binding is withheld until the owner saves context for the current project. Sessions retain source project IDs, context versions, relationship purposes, and the relationship version used at creation. Two projects sharing a directory still have separate context records.
 
@@ -562,15 +564,19 @@ Slack surface:
   comes from that thread's records and contains counts and state. The host
   neither stores the teammate's proposal text on arrival nor sends their
   status request to a model. Channel membership grants no mission controls.
-- When `intake.slack.organizationScope` is configured (typically on dedicated
-  secondary instances; see [instances](../deploy/ubuntu/instances.md)), the host
-  additionally enforces fail-closed channel and workspace pins (`#304`): live
+- Every configured Slack intake requires `intake.slack.organizationScope`
+  with a nonempty workspace pin list (see
+  [instances](../deploy/ubuntu/instances.md)); there is no unscoped or
+  compatibility mode. The host enforces fail-closed channel and workspace pins
+  (`#304`): live
   Slack `conversations.info` checks confirm a single-workspace non-shared
   channel (`is_shared=false`, `shared_team_ids=[teamId]`, `is_member=true`) in
   the optional `channelIds` allowlist, and `createIntakeAudienceGuard` verifies
   an exact 1:1 canonical `realpath` and Git remote / root-commit match for every
   checkout in `intake.mission.groupId` (`GET /api/intake/workspace-scope`,
-  refusing mismatches with `403 intake-audience-denied`).
+  refusing mismatches with `403 intake-audience-denied`). Intake records are
+  bound to an immutable digest of that audience; a changed or unprovable record
+  cannot be read, delivered, rebound, replayed, or acted on by Slack intake.
 - The thread the issue links is read once, at admission. The objective keeps only
   the owner's own messages from it. Messages from anyone else, and bot messages,
   are read at admission to check authorship and are not stored, shown to agents,

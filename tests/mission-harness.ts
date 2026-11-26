@@ -5,19 +5,22 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { endSessionWorkers, waitFor } from "./helpers.js";
 import { unseal } from "../packages/host/src/vault.js";
 import { Manager } from "../packages/host/src/manager.js";
+import { captureIdentity, readGit } from "../packages/host/src/checkout-identity.js";
+import { createIntakeAudienceGuard } from "../packages/host/src/intake-audience.js";
+import { ProjectContexts } from "../packages/host/src/project-context.js";
 import type { HostLoadProbe } from "../packages/host/src/host-load.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { MissionService, type ProjectGroupLookup } from "../packages/host/src/missions.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { CreateTeam, NativeContinuation, TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
-import type { CreateMission, MissionReport } from "../packages/host/src/mission-types.js";
+import type { CreateMission, MissionLineup, MissionReport } from "../packages/host/src/mission-types.js";
 import type { MissionMessage } from "../packages/host/src/team-prompts.js";
 import type { MissionReviewDestination } from "../packages/host/src/mission-review.js";
 import { emptyRollup, type UsageRollup } from "../packages/host/src/team-usage.js";
 import { applySignal, initialAttention, screenDecision, type Attention, type Signal, type SignalEvent } from "@infinite/attention";
 
 export const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-export const lineup: TeamLineup = {
+export const lineup: MissionLineup = {
   coordinator: { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
   implementers: [{ id: "light", label: "Light worker", provider: "codex", model: "gpt-6-luna", effort: "high", tier: "light" }],
   integrator: { id: "integrator", label: "Integrator", provider: "claude", model: "claude-opus-5-5", effort: "high", tier: "strong" },
@@ -47,17 +50,18 @@ export function missionHarness(options?: { configure?: (config: Config) => void;
     teams: { workspaceDir: join(root, "teams"), lineup } };
   options?.configure?.(config);
   const at = new Date().toISOString();
+  const repos = [{ projectId: "api", name: "API", path: api }, { projectId: "web", name: "Web", path: web }].map(({ projectId, name, path }) => ({
+    projectId, name, path, key: captureIdentity({ id: projectId, path }, readGit, at)?.key,
+    checkouts: [{ projectId, name, path, primary: true, teamReady: true }],
+  }));
   const groups: ProjectGroupLookup = { get: id => {
     if (id !== "shop") throw new TeamError(404, "project-group-not-found", "This project does not exist.");
-    return { id, name: "Shop", kind: "owner", hidden: false, implicit: false, revision: 1, createdAt: at, updatedAt: at,
-      repos: [
-        { projectId: "api", name: "API", path: api, checkouts: [{ projectId: "api", name: "API", path: api, primary: true, teamReady: true }] },
-        { projectId: "web", name: "Web", path: web, checkouts: [{ projectId: "web", name: "Web", path: web, primary: true, teamReady: true }] },
-      ] };
+    return { id, name: "Shop", kind: "owner", hidden: false, implicit: false, revision: 1, createdAt: at, updatedAt: at, repos };
   } };
   let services: { teams: TeamService; missions: MissionService } | undefined;
   const open = (teamOptions?: ConstructorParameters<typeof TeamService>[6]) => {
-    const manager = new Manager(config, key, options?.hostProbe);
+    const audience = createIntakeAudienceGuard({ config, groups });
+    const manager = new Manager(config, key, options?.hostProbe, { projectContexts: new ProjectContexts(config, key, audience.workspaceBindings) });
     const teams = new TeamService(config, key, manager, (_project, start) => start(), undefined, undefined, teamOptions);
     const missions = new MissionService(config, key, manager, teams, groups);
     teams.start(); missions.start();

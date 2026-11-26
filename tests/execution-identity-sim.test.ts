@@ -8,6 +8,7 @@ import type { Attention } from "@infinite/attention";
 import { readDecisionQueue } from "../packages/host/src/decision-queue-read.js";
 import { installHostEgress } from "../packages/host/src/egress.js";
 import { sessionRequestFingerprint } from "../packages/host/src/launch.js";
+import { existingWorkerSocket } from "../packages/host/src/ipc.js";
 import { Manager, type CreateSession } from "../packages/host/src/manager.js";
 import { Notifier } from "../packages/host/src/notifier.js";
 import { PushStore } from "../packages/host/src/push.js";
@@ -170,7 +171,7 @@ async function runSimulation(options: { seed: number; steps: number; fault?: Fau
     await waitForCondition(() => readMarks().length > beforeMarks);
     await waitForCondition(async () => {
       const state = await manager.state(id);
-      return state.status === "exited" && !existsSync(join(socketDir, `${id}.sock`)) && !existsSync(join(runDir, `${id}.sock`));
+      return state.status === "exited" && existingWorkerSocket(manager.socketTarget, id) === undefined;
     });
     if (fault === "allow-prod-duel-remove" && kind === "duel-prod") {
       const metaPath = join(stateDir, "sessions", id, "meta.sealed");

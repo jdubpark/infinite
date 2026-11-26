@@ -16,6 +16,7 @@ export type Session = {
   createdAt: string;
   archivedAt?: string;
   pid?: number;
+  outputTailIncomplete?: true;
   seq: number;
   screen?: string;
   initialPrompt?: string;

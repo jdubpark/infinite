@@ -453,6 +453,30 @@ export class UsageService {
     const rows = sessions.flatMap(session => data.bySession.get(session.sessionId) ?? []).sort((a, b) => data.order.get(a)! - data.order.get(b)!);
     return { ...sumUsage(this.priced(rows)), measured: true, coverage: coverage.coverage as "partial" | "complete", ...(coverage.reason ? { coverageReason: coverage.reason } : {}) };
   }
+  memberFinal(runId: string, memberId: string): SessionUsage | UnmeasuredUsage {
+    let data: Ledger;
+    try { data = this.ledger(); } catch { return { measured: false, coverage: "none", unavailable: true }; }
+    const sessions = data.byMember.get(memberKey(runId, memberId)) ?? [];
+    if (!sessions.length) return { measured: false, coverage: "none" };
+    const ordered = [...sessions].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.sessionId.localeCompare(b.sessionId));
+    if (ordered.some(session => !session.exited)) return { measured: false, coverage: "none", coverageReason: "running" };
+    if (ordered.every(session => session.coverage === "none")) {
+      const reason = ordered.find(session => session.reason)?.reason;
+      return { measured: false, coverage: "none", ...(reason ? { coverageReason: reason } : {}) };
+    }
+    const incomplete = ordered.find(session => session.coverage !== "complete" && session.reason)
+      ?? ordered.find(session => session.coverage !== "complete");
+    const rows = ordered.flatMap(session => data.bySession.get(session.sessionId) ?? []).sort((a, b) => data.order.get(a)! - data.order.get(b)!);
+    if (incomplete) {
+      return {
+        ...sumUsage(this.priced(rows)),
+        measured: true,
+        coverage: "partial",
+        ...(incomplete.reason ? { coverageReason: incomplete.reason } : {}),
+      };
+    }
+    return { ...sumUsage(this.priced(rows)), measured: true, coverage: "complete" };
+  }
   sessions(ids: string[]): UsageTotals {
     let data: Ledger;
     try { data = this.ledger(); } catch { return sumUsage([]); }

@@ -41,6 +41,7 @@ import {
   scanInputs,
   SignalRequestError,
 } from "../packages/host/src/outcome-signals.js";
+import { deliveryFact } from "../packages/host/src/verdict-delivery.js";
 import { importLegacy } from "../packages/host/src/outcome-import.js";
 import { legacyOutcomeId } from "../packages/host/src/outcome-legacy.js";
 import type { LandingMethod, ScanGap } from "../packages/host/src/outcome-rules.js";
@@ -758,6 +759,29 @@ test("a revert is stored under its landing's run", () => {
     assert.equal(revertSignal?.runId, RUN);
     assert.equal(signalsOf(h.store, RUN_B).some(signal => signal.kind === "revert"), false);
     assert.equal(rowOf(h.store, RUN, "m1")?.held, 0);
+  } finally {
+    h.close();
+  }
+});
+
+test("a delivery fact reads the run's landing and revert at one head", () => {
+  const h = harness();
+  try {
+    h.flush(standardRun(RUN));
+    const fact = (head: string, since = day(0)) => h.store.read(db => deliveryFact(db, RUN, head, since));
+    assert.equal(fact(HEAD), "none");
+    land(h, RUN, day(1));
+    assert.equal(fact(HEAD), "landed");
+    assert.equal(fact(HEAD, day(2)), "none");
+    revert(h, RUN, day(10));
+    assert.equal(fact(HEAD), "reverted");
+    h.store.write(tx => tx.run("UPDATE outcome_signals SET state='withdrawn' WHERE kind='revert'"));
+    assert.equal(fact(HEAD), "landed");
+    h.flush(standardRun(RUN_B));
+    const landing: Landing = { runId: RUN_B, commit: MERGE, method: "merge-parent", position: 0, reviewedHead: HEAD };
+    assert.equal(scanOf(h, { at: day(11), landings: [landing] }).applied, true);
+    assert.equal(h.store.read(db => deliveryFact(db, RUN_B, HEAD, day(0))), "landed");
+    assert.equal(h.store.read(db => deliveryFact(db, RUN_B, COMMIT_2, day(0))), "none");
   } finally {
     h.close();
   }

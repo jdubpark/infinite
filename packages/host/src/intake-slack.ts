@@ -1,4 +1,5 @@
 import { deterministicUuid, type IntakeConfig, type IntakeInbound, type IntakeMessage, type IntakeMessageKind, type IntakeRecord, type IntakeThread, type SlackThreadMessage } from "./intake-types.js";
+import { KeyedQueue } from "./keyed-queue.js";
 import type { IntakeStore } from "./intake-store.js";
 import type { Mission, MissionDecision } from "./mission-types.js";
 import type { MissionService } from "./missions.js";
@@ -11,6 +12,7 @@ import { recommendationLine } from "./question-recommendation.js";
 import { failureSummary, isAnswerRecord, outboundText, slackMessageAfter } from "./intake.js";
 import { explicitRoute } from "./intake-route.js";
 import { formatThreadStatus } from "./slack-thread-status.js";
+import { intakeRecordAudienceAllowed, intakeRecordAudienceIdentityMatches } from "./intake-audience.js";
 
 const IDENTITY_RETRY_MS = 30_000;
 const RETRY_DELAYS_MS = [5_000, 30_000, 120_000];
@@ -147,6 +149,7 @@ export class IntakeSlackSurface {
   private state: SurfaceState = { kind: "idle" };
   private droppedCount = 0;
   private readonly timers = new Map<string, NodeJS.Timeout>();
+  private readonly inboundThreads = new KeyedQueue();
   private readonly drainTimers = new Map<string, NodeJS.Timeout>();
   private readonly pumping = new Set<string>();
   private readonly draining = new Set<string>();
@@ -156,12 +159,15 @@ export class IntakeSlackSurface {
 
   private readonly log: (line: string, error: unknown) => void;
   private readonly direct?: DirectRequest;
+  private readonly audience?: { recordAllowed(record: IntakeRecord, mission?: Mission): boolean };
 
   constructor(private readonly config: Config, private readonly store: IntakeStore, private readonly missions: MissionService,
     private readonly teams: Pick<TeamService, "get">, private readonly client: SlackClient,
-    options: { log?: (line: string, error: unknown) => void; direct?: DirectRequest } = {}) {
+    options: { log?: (line: string, error: unknown) => void; direct?: DirectRequest;
+      audience?: { recordAllowed(record: IntakeRecord, mission?: Mission): boolean } } = {}) {
     this.slack = config.intake?.slack;
     this.direct = options.direct;
+    this.audience = options.audience;
     this.log = options.log ?? ((line, error) => console.warn(line, error));
   }
 
@@ -221,7 +227,7 @@ export class IntakeSlackSurface {
   }
 
   private begin(botUserId: string): void {
-    this.state = { kind: "running", botUserId, connection: this.client.connect(envelope => this.receive(envelope)) };
+    this.state = { kind: "running", botUserId, connection: this.client.connect(envelope => this.receiveInOrder(envelope)) };
     this.unsubscribers = [
       this.store.onChange(record => this.reconcile(record.issueId)),
       this.missions.onChange(mission => {
@@ -254,8 +260,19 @@ export class IntakeSlackSurface {
   }
 
   private organizationChannelAllowed(channelId: string): Promise<boolean> {
-    const check = this.client.organizationChannelAllowed;
-    return check ? check.call(this.client, channelId) : Promise.resolve(!this.slack?.organizationScope);
+    return this.client.organizationChannelAllowed(channelId);
+  }
+
+  private recordAudienceAllowed(record: IntakeRecord): boolean {
+    if (record.external) return false;
+    if (!intakeRecordAudienceIdentityMatches(this.config, record)) return false;
+    const mission = record.missionId ? this.missions.peek(record.missionId) : undefined;
+    if (this.slack) return this.audience?.recordAllowed(record, mission) ?? false;
+    return intakeRecordAudienceAllowed(this.config, record, mission);
+  }
+
+  private requireRecordAudience(record: IntakeRecord): void {
+    if (!this.recordAudienceAllowed(record)) throw new SlackError("organization_scope_denied", false);
   }
 
   private async requireOrganizationSource(thread: IntakeThread | undefined): Promise<void> {
@@ -270,7 +287,7 @@ export class IntakeSlackSurface {
   private async reconcileAuthorized(issueId: string): Promise<void> {
     if (this.state.kind !== "running") return;
     const record = this.store.get(issueId);
-    if (!record?.thread) return;
+    if (!record?.thread || !this.recordAudienceAllowed(record)) return;
     try {
       if (!await this.organizationChannelAllowed(record.thread.channelId)) {
         this.deferReconcile(issueId);
@@ -397,7 +414,8 @@ export class IntakeSlackSurface {
   private questionNumber(draft: IntakeRecord, decisionId: string): number {
     const existing = draft.questions.find(question => question.decisionId === decisionId);
     if (existing) return existing.n;
-    const others = this.store.list().filter(record => record.issueId !== draft.issueId && sameThread(record.thread, draft.thread));
+    const others = this.store.list().filter(record => record.issueId !== draft.issueId && sameThread(record.thread, draft.thread)
+      && this.recordAudienceAllowed(record));
     const highest = Math.max(0, ...others.flatMap(record => record.questions.map(question => question.n)), ...draft.questions.map(question => question.n));
     const n = highest + 1;
     draft.questions.push({ decisionId, n });
@@ -432,7 +450,7 @@ export class IntakeSlackSurface {
     try {
       while (this.state.kind === "running") {
         const record = this.store.get(issueId);
-        if (!record?.thread) return;
+        if (!record?.thread || !this.recordAudienceAllowed(record)) return;
         const message = record.messages.find((item): item is Extract<IntakeMessage, { status: "pending" }> => item.status === "pending");
         if (!message) return;
         const due = message.nextAttemptAt ? Date.parse(message.nextAttemptAt) : 0;
@@ -456,6 +474,8 @@ export class IntakeSlackSurface {
 
   private async deliver(issueId: string, thread: IntakeThread, message: Extract<IntakeMessage, { status: "pending" }>): Promise<boolean> {
     const key = message.key, transport = `${issueId}:${key}`;
+    const record = this.store.get(issueId);
+    if (!record || !sameThread(record.thread, thread) || !this.recordAudienceAllowed(record)) return false;
     try {
       if (!await this.organizationChannelAllowed(thread.channelId)) { this.wake(issueId, Date.now() + RETRY_EVERY_MS); return false; }
     } catch (error) {
@@ -526,6 +546,13 @@ export class IntakeSlackSurface {
     });
   }
 
+  private receiveInOrder(envelope: SlackEnvelope): Promise<void> {
+    const channel = envelope.interaction?.channelId ?? envelope.event?.channel;
+    const thread = envelope.interaction?.threadTs ?? envelope.interaction?.messageTs ?? envelope.event?.threadTs ?? envelope.event?.ts;
+    if (!channel || !thread) return this.receive(envelope);
+    return this.inboundThreads.enqueue(JSON.stringify([channel, thread]), () => this.receive(envelope));
+  }
+
   private async receive(envelope: SlackEnvelope): Promise<void> {
     if (this.state.kind !== "running") return;
     if (envelope.interaction) { await this.receiveInteraction(envelope); return; }
@@ -558,7 +585,7 @@ export class IntakeSlackSurface {
     if (channelMessage && (!text || addressedToSomeoneElse(text))) { this.droppedCount += 1; return; }
     const eventId = envelope.eventId ?? envelope.envelopeId;
     if (mapped && inThread && text.toLowerCase() === "status") {
-      await this.postThreadStatus(this.store.boundTo(thread), ts, owner, thread);
+      await this.postThreadStatus(this.store.boundTo(thread).filter(record => this.recordAudienceAllowed(record)), ts, owner, thread);
       return;
     }
     if (!owner) {
@@ -575,7 +602,7 @@ export class IntakeSlackSurface {
       return;
     }
 
-    const bound = this.store.boundTo(thread);
+    const bound = this.store.boundTo(thread).filter(record => this.recordAudienceAllowed(record));
     if (bound.some(record => record.direct && (record.direct.eventId === eventId || record.direct.ts === ts))) return;
     if (bound.length === 0) {
       if (mention && slack.bindByMention && await this.bind(thread, text)) return;
@@ -614,6 +641,7 @@ export class IntakeSlackSurface {
   }
 
   private async postThreadStatus(bound: IntakeRecord[], ts: string, owner: boolean, thread: IntakeThread): Promise<void> {
+    bound = bound.filter(record => this.recordAudienceAllowed(record));
     if (!bound.length) return;
     if (!await this.organizationChannelAllowed(thread.channelId)) return;
     const key = `reply:thread-status:${ts}`;
@@ -630,14 +658,15 @@ export class IntakeSlackSurface {
     const slack = this.slack, interaction = envelope.interaction;
     if (!slack || !interaction || interaction.type !== "block_actions" || interaction.teamId !== slack.teamId || interaction.userId !== slack.ownerUserId
       || interaction.actions.length !== 1) { this.droppedCount += 1; return; }
-    if (!await this.organizationChannelAllowed(interaction.channelId)) { this.droppedCount += 1; return; }
     const action = interaction.actions[0]!;
     const match = /^(infinite-decision:([0-9a-f-]{36}):([^:]{1,128}))(?:\:(?:submit|other))?$/.exec(action.blockId);
     if (!match || !action.actionTs || !action.actionId.startsWith("infinite_decision_")) { this.droppedCount += 1; return; }
     const [, baseBlockId, issueId, decisionId] = match;
     const record = this.store.get(issueId);
     if (!record?.thread || record.thread.channelId !== interaction.channelId
-      || (interaction.threadTs !== undefined && interaction.threadTs !== record.thread.threadTs)) { this.droppedCount += 1; return; }
+      || (interaction.threadTs !== undefined && interaction.threadTs !== record.thread.threadTs)
+      || !this.recordAudienceAllowed(record)) { this.droppedCount += 1; return; }
+    if (!await this.organizationChannelAllowed(interaction.channelId)) { this.droppedCount += 1; return; }
     const message = record.messages.find(item => item.kind === "question" && item.blocks?.some(block => block.block_id === action.blockId));
     if (!message) { this.droppedCount += 1; return; }
     const controlBlock = message.blocks?.find(block => block.block_id === action.blockId);
@@ -656,6 +685,7 @@ export class IntakeSlackSurface {
       if (found) this.patch(issueId, message.key, item => ({ ...messageBase(item), status: "sent", ts: found.ts }));
     }
     const persisted = this.store.get(issueId)!;
+    if (!this.recordAudienceAllowed(persisted)) { this.droppedCount += 1; return; }
     const sent = persisted.messages.find(item => item.key === message.key);
     if (!sent || sent.status !== "sent" || sent.ts !== interaction.messageTs) { this.droppedCount += 1; return; }
     const identity = `${interaction.channelId}:${interaction.messageTs}:${action.actionTs}:${action.actionId}`;
@@ -753,7 +783,8 @@ export class IntakeSlackSurface {
   private async bind(thread: IntakeThread, text: string): Promise<boolean> {
     if (!await this.organizationChannelAllowed(thread.channelId)) return false;
     const matches = this.store.list().filter(record =>
-      !record.thread && (record.state === "started" || record.state === "queued") && mentionsIdentifier(text, record.identifier));
+      this.recordAudienceAllowed(record) && !record.thread && (record.state === "started" || record.state === "queued")
+      && mentionsIdentifier(text, record.identifier));
     if (matches.length !== 1) return false;
     this.store.update(matches[0].issueId, draft => { if (draft.state !== "skipped") draft.thread = thread; });
     return true;
@@ -767,19 +798,22 @@ export class IntakeSlackSurface {
         if (this.state.kind !== "running") return;
         const record = this.store.get(issueId);
         const entry = record?.inbound.find(item => !item.handledAt);
-        if (!record || !entry) return;
+        if (!record || !entry || !this.recordAudienceAllowed(record)) return;
         await this.requireOrganizationSource(record.thread);
         await this.apply(record, entry);
       }
     } catch (error) {
       this.noteFailure(issueId, "inbound", error);
-      if (error instanceof SlackError && (error.transient || error.code === "organization_scope_denied")) this.retryDrain(issueId);
+      const current = this.store.get(issueId);
+      if (current && this.recordAudienceAllowed(current) && error instanceof SlackError
+        && (error.transient || error.code === "organization_scope_denied")) this.retryDrain(issueId);
     } finally {
       this.draining.delete(issueId);
     }
   }
 
   private async apply(record: IntakeRecord, entry: IntakeInbound): Promise<void> {
+    this.requireRecordAudience(record);
     await this.requireOrganizationSource(record.thread);
     const { outcome, reply } = await this.act(record, entry);
     await this.requireOrganizationSource(record.thread);
@@ -793,6 +827,7 @@ export class IntakeSlackSurface {
   }
 
   private async act(record: IntakeRecord, entry: IntakeInbound): Promise<Outcome> {
+    this.requireRecordAudience(record);
     await this.requireOrganizationSource(record.thread);
     if (entry.call) return this.perform(record, entry, entry.call);
     if (record.state === "finished") return { outcome: "finished", reply: `This request has finished. ${this.followUp()}` };
@@ -851,6 +886,7 @@ export class IntakeSlackSurface {
   }
 
   private async perform(record: IntakeRecord, entry: IntakeInbound, saved: SavedCall): Promise<Outcome> {
+    this.requireRecordAudience(record);
     await this.requireOrganizationSource(record.thread);
     try {
       const missionId = record.missionId;
@@ -862,7 +898,7 @@ export class IntakeSlackSurface {
         this.rememberCall(record.issueId, entry.eventId, call);
         try {
           await this.requireOrganizationSource(record.thread);
-          await this.run(missionId, requestId, call);
+          await this.run(missionId, requestId, call, () => this.requireRecordAudience(record));
           break;
         } catch (error) {
           if (attempt === 1 && error instanceof TeamError && error.code === "stale-mission-revision") {
@@ -886,14 +922,14 @@ export class IntakeSlackSurface {
     }
   }
 
-  private run(missionId: string, requestId: string, call: SavedCall): Promise<unknown> {
+  private run(missionId: string, requestId: string, call: SavedCall, authorize: () => void): Promise<unknown> {
     const { revision } = call;
-    if (call.action === "steer") return this.missions.steer(missionId, { requestId, revision, text: call.text! }, "slack");
-    if (call.action === "answer") return this.missions.answer(missionId, call.decisionId!, { requestId, revision, text: call.text! }, "slack");
-    if (call.action === "pause") return this.missions.pause(missionId, { requestId, revision });
-    if (call.action === "resume") return this.missions.resume(missionId, { requestId, revision });
-    if (call.action === "extend") return this.missions.extend(missionId, { requestId, revision, minutes: call.minutes! });
-    return this.missions.cancel(missionId, { requestId, revision });
+    if (call.action === "steer") return this.missions.steer(missionId, { requestId, revision, text: call.text! }, "slack", authorize);
+    if (call.action === "answer") return this.missions.answer(missionId, call.decisionId!, { requestId, revision, text: call.text! }, "slack", authorize);
+    if (call.action === "pause") return this.missions.pause(missionId, { requestId, revision }, undefined, "slack", authorize);
+    if (call.action === "resume") return this.missions.resume(missionId, { requestId, revision }, "slack", authorize);
+    if (call.action === "extend") return this.missions.extend(missionId, { requestId, revision, minutes: call.minutes! }, authorize);
+    return this.missions.cancel(missionId, { requestId, revision }, "slack", authorize);
   }
 
   private extendedText(missionId: string, minutes: number): string {

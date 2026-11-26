@@ -44,6 +44,7 @@ import { outcomeBackfill } from "./outcome-backfill.js";
 import { outcomeProjector } from "./outcome-projector.js";
 import { EvalHost } from "./eval-host.js";
 import { EXCLUSION_REASONS, OUTCOMES_MODULE, outcomeModule, runOutcomeView, sweepExpiredOutcomes, type SignalRow } from "./outcome-store.js";
+import { deliveryPort } from "./verdict-delivery.js";
 import { registerVerdicts, sweepExpiredVerdicts } from "./verdict-store.js";
 import { RoutingRecorder } from "./routing-recorder.js";
 import { registerRouting, sweepExpiredDecisions } from "./routing-store.js";
@@ -217,7 +218,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     projectSync.applying(projectId) || projectSource.refreshing(projectId) || await projectRunning(projectId, true) });
   validateLinearConfig(config);
   validateMcpConfig(config);
-  const manager = new Manager(config, key);
+  let intakeAudience: ReturnType<typeof createIntakeAudienceGuard> | undefined;
+  const manager = new Manager(config, key, undefined, { projectContexts: new ProjectContexts(config, key, () => intakeAudience?.workspaceBindings()) });
   const projectSync = new ProjectSync(config, key);
   const desktopFiles = new DesktopFiles(config);
   const startsInFlight = new Map<string, number>();
@@ -262,9 +264,13 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   registerRouting(evidence, outbox);
   registerVerdicts(evidence, outbox);
   const signals = new SignalService({ store: evidence });
+  let lateReceipts: () => void = () => {};
   baseScanner = new BaseScanner({
     store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT,
-    onApplied: scan => { signals.recordScan(scan); },
+    onApplied: scan => {
+      signals.recordScan(scan);
+      lateReceipts();
+    },
   });
   outbox.registerProjector(outcomeProjector(evidence));
   const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager, cost: sessionId => sessionCostOf(usage.session(sessionId)) });
@@ -278,16 +284,21 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     events: outbox,
     capture: evalHost.capture,
     entries: blackboard, ...(options.processCensus ? { processes: options.processCensus } : {}),
-    onMerged: id => void projectSource.refresh(id).then(status => {
-      sourceChanged(id);
-      if (status.appliedHead && !status.pending) scheduleGraphForSession(id);
-    }, () => sourceChanged(id)),
+    delivery: deliveryPort(evidence),
+    onMerged: id => {
+      lateReceipts();
+      void projectSource.refresh(id).then(status => {
+        sourceChanged(id);
+        if (status.appliedHead && !status.pending) scheduleGraphForSession(id);
+      }, () => sourceChanged(id));
+    },
     ownerActive: run => {
       if (ownerServices.goals?.retainsTeamRun(run.id) || ownerServices.missions?.retainsSubteamRun(run.id)) return true;
       return Boolean(run.handoff && ownerServices.handoffs?.ownsActiveTeam(run.id));
     },
   });
   teams.useEvidence(evidence);
+  lateReceipts = () => { void teams.settleReceipts().catch(() => {}); };
   teams.useRouter(new RoutingRecorder({ store: evidence }));
   const backfillOutcomes = outcomeBackfill(evidence, () => teams.understandingRecords(), {
     mapOf: projectId => config.projects.find(project => project.id === projectId)?.team?.features,
@@ -299,6 +310,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   usage.useBalances(balances);
   teams.useUsage(usage);
   const goals = new GoalService(config, key, teams, linear);
+  lateReceipts = () => { void teams.settleReceipts().then(() => goals.syncReceipts()).catch(() => {}); };
   ownerServices.goals = goals;
   const projectGroups = new ProjectGroupService(config, key, undefined, { appliedAt: id => projectSync.status(id).appliedAt });
   let permissionJournal: PermissionJournal | undefined;
@@ -371,6 +383,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
   const sweepEvidence = () => {
+    lateReceipts();
     evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
     sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays);
     sweepExpiredVerdicts(evidence, new Date().toISOString());
@@ -395,7 +408,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     sessionTitle: sessionId => { try { return manager.meta(sessionId).session.title; } catch { return undefined; } },
   });
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
-  const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
+  const cmux = config.cmux?.enabled ? new CmuxSessions(config, key, manager.projectContexts) : undefined;
   const handoffs: HandoffService = new HandoffService(config, key, manager, teams, startInProject, async (sessionId, projectId) => {
     const sourcePath = realpathSync(manager.meta(sessionId).session.cwd);
     for (const project of config.projects) {
@@ -414,13 +427,13 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   const assertNoHandoff = (projectId: string) => {
     if (handoffs.activeForProject(projectId)) throw new TeamError(409, "handoff-in-progress", "This project is transferring a task to a team. Wait for its checkpoint to finish.");
   };
-  const intakeAudience = createIntakeAudienceGuard({ config, groups: projectGroups, sourceAppliedHead: projectId => projectSource.status(projectId).appliedHead });
+  intakeAudience = createIntakeAudienceGuard({ config, groups: projectGroups, sourceAppliedHead: projectId => projectSource.status(projectId).appliedHead });
   const createMission = createIntakeMissionCreator({ config, missions, groups: projectGroups, audience: intakeAudience, assertNoHandoff });
   const intakeStore = config.intake ? new IntakeStore(config, key) : undefined;
   const intakeSlackClient = config.intake?.slack ? new SlackClient({ botTokenFile: config.intake.slack.botTokenFile, appTokenFile: config.intake.slack.appTokenFile, endpoint: config.intake.slack.endpoint, teamId: config.intake.slack.teamId, organizationScope: config.intake.slack.organizationScope, workspaceAllowed: intakeAudience.workspacesAllowed }) : undefined;
-  const intake = config.intake && intakeStore ? new IntakeService(config, intakeStore, missions, new IntakeLinear(linear), { create: createMission, threads: intakeSlackClient, ...(config.intake.slack?.classify ? { router: text => readings.requestRoute(text) } : {}) }) : undefined;
+  const intake = config.intake && intakeStore ? new IntakeService(config, intakeStore, missions, new IntakeLinear(linear), { create: createMission, threads: intakeSlackClient, audience: intakeAudience, ...(config.intake.slack?.classify ? { router: text => readings.requestRoute(text) } : {}) }) : undefined;
   const mcp = config.mcp && intakeStore && intake ? createMcpServer(config, new McpRequestService(config, intakeStore, intake, missions, projectGroups)) : undefined;
-  const intakeSlack = intakeStore && intakeSlackClient ? new IntakeSlackSurface(config, intakeStore, missions, teams, intakeSlackClient, intake ? { direct: input => intake.requestFromSlack(input) } : {}) : undefined;
+  const intakeSlack = intakeStore && intakeSlackClient && intake ? new IntakeSlackSurface(config, intakeStore, missions, teams, intakeSlackClient, { audience: intakeAudience, direct: input => intake.requestFromSlack(input) }) : undefined;
   const resumable = (session: { status: string; provider: string; workspace?: unknown; team?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
     session.status === "exited" && !session.workspace && !session.team && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
   const executionLocation = (session: { executionLocation?: "cloud" | "laptop"; workspace?: unknown }): "cloud" | "laptop" =>
@@ -867,7 +880,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.get("/api/usage/daily", (req, res, next) => { try { const query = z.object({ days: z.coerce.number().int().min(1).max(366).default(30), tz: z.string().default("UTC"), project: z.string().optional() }).strict().parse(req.query); return void res.json(usage.daily({ days: query.days, tz: query.tz, projectId: query.project })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone or day range" }); return next(error); } });
   app.get("/api/usage/projects", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query); return void res.json(usage.projects({ tz: query.tz })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
   app.get("/api/usage/projects/:id", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query), result = usage.project(String(req.params.id), { tz: query.tz }); if (!result) return void res.status(404).json({ error: "Project usage not found" }); return void res.json(result); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
-  registerRepairMetricsRoute(app, { runs: () => teams.understandingRecords(), memberUsage: (runId, memberId) => usage.member(runId, memberId), readable: () => usage.readable() });
+  registerRepairMetricsRoute(app, { runs: filter => teams.repairMetricsRuns(filter), memberUsage: (runId, memberId) => usage.memberFinal(runId, memberId), evidence, readable: () => usage.readable() });
   app.put("/api/usage/accounts/:id/plan", requireRole(["owner"]), (req, res) => {
     const accounts = config.usage?.accounts, accountId = String(req.params.id);
     const account = accounts && Object.hasOwn(accounts, accountId) ? accounts[accountId] : undefined;
@@ -1182,7 +1195,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.post("/api/goals/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await goals.extend(id.parse(req.params.id), goalExtendSchema.parse(req.body))));
   registerMissionReadRoutes(app, { missions, teams, manager });
   app.get("/api/intake", (_req, res) => res.json({ records: intake?.list() ?? [], ...intake?.status(), ...(intakeSlack ? { slack: intakeSlack.status() } : {}) }));
-  app.get("/api/intake/workspace-scope", requireRole(["owner"]), (_req, res) => res.json({ state: !config.intake?.slack?.organizationScope ? "unconfigured" : intakeAudience.workspacesAllowed() ? "verified" : "blocked" }));
+  app.get("/api/intake/workspace-scope", requireRole(["owner"]), (_req, res) => res.json({ state: !config.intake?.slack ? "unconfigured" : intakeAudience.workspacesAllowed() ? "verified" : "blocked" }));
   app.post("/api/missions", requireRole(["owner"]), async (req, res) => res.json(await createMission(createMissionSchema.parse(req.body))));
   app.post("/api/missions/:id/steer", requireRole(["owner"]), async (req, res) => res.json(await missions.steer(id.parse(req.params.id), missionTextSchema.parse(req.body))));
   app.post("/api/missions/:id/answer/:decisionId", requireRole(["owner"]), async (req, res) =>
@@ -1987,17 +2000,15 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.get("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     res.json({ base64: await projectSync.readBlob(projectSchema.parse(req.params.id), String(req.params.hash)) });
   });
-  const projectContexts = new ProjectContexts(config, key);
   app.get("/api/projects/:id/context-links", (req, res) => {
-    return res.json(projectContexts.listLinks(String(req.params.id)));
+    return res.json(manager.projectContexts.listLinks(String(req.params.id)));
   });
   app.put("/api/projects/:id/context-links", requireRole(["owner"]), (req, res) => {
-    return res.json(projectContexts.setLinks(String(req.params.id), contextLinksRequest.parse(req.body)));
+    return res.json(manager.projectContexts.setLinks(String(req.params.id), contextLinksRequest.parse(req.body)));
   });
   app.get("/api/projects/:id/context", (req, res) => {
-    if (!config.projects.some((p) => p.id === req.params.id))
-      return res.status(404).json({ error: "Unknown project" });
-    return res.json(manager.context(req.params.id));
+    if (!config.projects.some((p) => p.id === req.params.id)) return res.status(404).json({ error: "Unknown project" });
+    return res.json(manager.projectContexts.context(req.params.id));
   });
   app.put("/api/projects/:id/context", requireRole(["owner"]), (req, res) => {
     if (!config.projects.some((p) => p.id === req.params.id))
@@ -2010,7 +2021,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       .strict()
       .parse(req.body);
     return res.json(
-      manager.setContext(
+      manager.projectContexts.setContext(
         String(req.params.id),
         body.text,
         body.expectedVersion,

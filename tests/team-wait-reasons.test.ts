@@ -545,3 +545,77 @@ test("TeamService restores active stage and stall detection after owner answers 
     f.close();
   }
 });
+
+test("stopObsoletePermissionCoordinators keeps escalated prompt open across target disconnect, reload, and reconnect until prompt closes", async () => {
+  const f = schedulerFixture();
+  try {
+    const target = f.run.members[0]!;
+    const reviewerSessionId = randomUUID();
+    const decisionId = randomUUID();
+    const prompt = { id: 7, kind: "permission" as const, title: "Run build?", options: [], acceptsText: false, source: "screen" as const, hash: "h7" };
+    f.run.permissions = { mode: "coordinator", scope: "Allow project checks", maxDecisions: 5 };
+    const reviewer: TeamMember = {
+      ...target,
+      memberId: randomUUID(),
+      sessionId: reviewerSessionId,
+      role: "permission-coordinator",
+      title: "permission-coordinator",
+      status: "queued",
+      stopRequestId: randomUUID(),
+    };
+    f.run.members.push(reviewer);
+    f.run.permissionDecisions = [{
+      id: decisionId,
+      revision: 1,
+      policyHash: "p",
+      authorityHash: "auth-1",
+      targetMemberId: target.memberId,
+      targetSessionId: target.sessionId,
+      targetCwd: target.cwd,
+      promptId: 7,
+      promptHash: "h7",
+      evidenceHash: "e7",
+      prompt,
+      option: 0,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      coordinatorMemberId: reviewer.memberId,
+      coordinatorSessionId: reviewerSessionId,
+      answerRequestId: randomUUID(),
+      status: "reviewing",
+    }];
+    f.state.status = "unavailable";
+    f.writeTeam();
+
+    let teams = f.openTeam();
+    type Scheduler = {
+      record(id: string): { run: TeamRun };
+      step(stored: { run: TeamRun }): Promise<void>;
+    };
+    let scheduler = teams as unknown as Scheduler;
+    await scheduler.step(scheduler.record(f.run.id));
+    await teams.close();
+
+    teams = f.openTeam();
+    scheduler = teams as unknown as Scheduler;
+    const afterDisconnect = teams.get(f.run.id);
+    assert.equal(afterDisconnect.members[0]?.status, "unavailable");
+    assert.equal(afterDisconnect.permissionDecisions?.[0]?.status, "escalated");
+    assert.equal(afterDisconnect.permissionDecisions?.[0]?.promptClosedAt, undefined);
+    assert.equal(afterDisconnect.waitReasons?.some((r) => r.kind === "provider-prompt" && r.decisionId === decisionId), true);
+
+    f.state.status = "running";
+    f.state.attention = { ...f.state.attention, state: "needs-you", prompt, lastActivityAt: new Date().toISOString() };
+    await scheduler.step(scheduler.record(f.run.id));
+    const afterReconnect = teams.get(f.run.id);
+    assert.equal(afterReconnect.permissionDecisions?.[0]?.promptClosedAt, undefined);
+    assert.equal(afterReconnect.waitReasons?.some((r) => r.kind === "provider-prompt" && r.decisionId === decisionId), true);
+
+    f.state.attention = { ...f.state.attention, state: "working", prompt: undefined, lastActivityAt: new Date().toISOString() };
+    await scheduler.step(scheduler.record(f.run.id));
+    const afterClose = teams.get(f.run.id);
+    assert.ok(afterClose.permissionDecisions?.[0]?.promptClosedAt);
+    assert.equal(afterClose.waitReasons?.some((r) => r.kind === "provider-prompt"), false);
+  } finally {
+    f.close();
+  }
+});

@@ -1986,7 +1986,7 @@ export class TeamService {
           obsolete = state.status !== "running" || state.attention.state !== "needs-you" || !prompt ||
             prompt.id !== decision.promptId || prompt.hash !== decision.promptHash ||
             permissionEvidenceHash(prompt) !== decision.evidenceHash;
-          promptClosed = obsolete;
+          promptClosed = obsolete && (state.status === "running" || state.status === "exited");
           if (obsolete && state.status === "running" && state.attention.state === "needs-you" &&
               (!state.control || state.control.expiresAt <= Date.now()) && prompt && recovery)
             continuedAfterExpansion = this.advanceExpandedPermissionPrompt(stored, recovery, target, prompt);

@@ -6,7 +6,8 @@ import {
   type Attention,
   type Signal,
 } from "@infinite/attention";
-import { evaluateStallRecovery } from "../packages/host/src/stall-recovery.js";
+import { evaluateStallRecovery, syncObservedMemberState } from "../packages/host/src/stall-recovery.js";
+import { describeTeamWaitReasons } from "../packages/host/src/team-wait-reasons.js";
 import { WorkerScreenActivity } from "../packages/host/src/worker-screen-activity.js";
 import type { TeamMember, TeamReport, TeamRun } from "../packages/host/src/team-types.js";
 
@@ -811,126 +812,47 @@ test("evaluateStallRecovery guards reject non-active run statuses, non-running m
   }
 
   const integratedTaskMember = makeMember();
-  assert.equal(
-    evaluateStallRecovery(
-      baseArgs(
-        makeRun({
-          tasks: [{ id: "task-a", title: "A", instructions: "A", paths: ["a.ts"], dependsOn: [], revision: 1, status: "integrated", memberId: "m1" }],
-          members: [integratedTaskMember],
-        }),
-        integratedTaskMember,
-      ),
-    ).action,
-    "none",
-  );
+  assert.equal(evaluateStallRecovery(baseArgs(makeRun({
+    tasks: [{ id: "task-a", title: "A", instructions: "A", paths: ["a.ts"], dependsOn: [], revision: 1, status: "integrated", memberId: "m1" }],
+    members: [integratedTaskMember],
+  }), integratedTaskMember)).action, "none");
 
   const completedDiscoveryMember = makeMember({ role: "scout" });
-  assert.equal(
-    evaluateStallRecovery(
-      baseArgs(
-        makeRun({
-          discovery: {
-            revision: 1,
-            summary: "Done",
-            completedAt: iso(T0 + 1000),
-            tasks: [{ id: "task-a", title: "S", instructions: "S", status: "complete", memberId: "m1" }],
-          },
-          members: [completedDiscoveryMember],
-        }),
-        completedDiscoveryMember,
-      ),
-    ).action,
-    "none",
-  );
+  assert.equal(evaluateStallRecovery(baseArgs(makeRun({
+    discovery: { revision: 1, summary: "Done", completedAt: iso(T0 + 1000), tasks: [{ id: "task-a", title: "S", instructions: "S", status: "complete", memberId: "m1" }] },
+    members: [completedDiscoveryMember],
+  }), completedDiscoveryMember)).action, "none");
 
   const withDecision = makeMember();
-  assert.equal(
-    evaluateStallRecovery(
-      baseArgs(
-        makeRun({
-          members: [withDecision],
-          decisions: [{ id: "d1", memberId: "m1", revision: 1, question: "Q?", options: ["Y"], createdAt: iso(T0) }],
-        }),
-        withDecision,
-      ),
-    ).action,
-    "none",
-  );
+  assert.equal(evaluateStallRecovery(baseArgs(makeRun({
+    members: [withDecision],
+    decisions: [{ id: "d1", memberId: "m1", revision: 1, question: "Q?", options: ["Y"], createdAt: iso(T0) }],
+  }), withDecision)).action, "none");
 
   const withLiveRecovery = makeMember();
-  assert.equal(
-    evaluateStallRecovery(
-      baseArgs(
-        makeRun({
-          members: [withLiveRecovery],
-          permissionRecovery: {
-            requests: [
-              {
-                id: "pr1",
-                revision: 1,
-                targetMemberId: "m1",
-                targetSessionId: "s1",
-                promptId: 1,
-                promptHash: "h",
-                evidenceHash: "e",
-                targetCwd: "/home/dev/projects/infinite/ws/m1",
-                policyHash: "p",
-                expiresAt: iso(T0 + 60_000),
-                status: "expanding",
-                rounds: 1,
-              },
-            ],
-            steps: [],
-            outcomes: [],
-          },
-        }),
-        withLiveRecovery,
-      ),
-    ).action,
-    "none",
-  );
+  assert.equal(evaluateStallRecovery(baseArgs(makeRun({
+    members: [withLiveRecovery],
+    permissionRecovery: {
+      requests: [{
+        id: "pr1", revision: 1, targetMemberId: "m1", targetSessionId: "s1", promptId: 1, promptHash: "h", evidenceHash: "e",
+        targetCwd: "/home/dev/projects/infinite/ws/m1", policyHash: "p", expiresAt: iso(T0 + 60_000), status: "expanding", rounds: 1,
+      }],
+      steps: [], outcomes: [],
+    },
+  }), withLiveRecovery)).action, "none");
 
   const uncertainStalled = makeMember({ stalledAt: iso(T0 + 1000), status: "stopped" });
-  assert.equal(
-    evaluateStallRecovery(
-      baseArgs(
-        makeRun({
-          members: [uncertainStalled],
-          permissionDecisions: [
-            {
-              id: "pd1",
-              revision: 1,
-              policyHash: "p",
-              targetMemberId: "m1",
-              targetSessionId: "s1",
-              targetCwd: "/home/dev/projects/infinite/ws/m1",
-              promptId: 1,
-              promptHash: "h",
-              evidenceHash: "e",
-              prompt: { id: 1, kind: "permission", title: "T", options: [], acceptsText: false, source: "screen" },
-              option: 0,
-              expiresAt: iso(T0 + 60_000),
-              answerRequestId: "ar1",
-              status: "uncertain",
-            },
-          ],
-        }),
-        uncertainStalled,
-        "replace",
-      ),
-    ).action,
-    "none",
-  );
+  assert.equal(evaluateStallRecovery(baseArgs(makeRun({
+    members: [uncertainStalled],
+    permissionDecisions: [{
+      id: "pd1", revision: 1, policyHash: "p", targetMemberId: "m1", targetSessionId: "s1", targetCwd: "/home/dev/projects/infinite/ws/m1",
+      promptId: 1, promptHash: "h", evidenceHash: "e", prompt: { id: 1, kind: "permission", title: "T", options: [], acceptsText: false, source: "screen" },
+      option: 0, expiresAt: iso(T0 + 60_000), answerRequestId: "ar1", status: "uncertain",
+    }],
+  }), uncertainStalled, "replace")).action, "none");
 
-  const stalledWithSingleSourceLimit = makeMember({
-    stalledAt: iso(T0 + 1000),
-    status: "stopped",
-    pendingLimit: true,
-  });
-  const replaceAfterSingleSourceLimit = evaluateStallRecovery(
-    baseArgs(makeRun({ members: [stalledWithSingleSourceLimit] }), stalledWithSingleSourceLimit, "replace"),
-  );
-  assert.equal(replaceAfterSingleSourceLimit.action, "replace");
+  const stalledWithSingleSourceLimit = makeMember({ stalledAt: iso(T0 + 1000), status: "stopped", pendingLimit: true });
+  assert.equal(evaluateStallRecovery(baseArgs(makeRun({ members: [stalledWithSingleSourceLimit] }), stalledWithSingleSourceLimit, "replace")).action, "replace");
 
   const escalatedOld = makeMember({ memberId: "m-esc-1", sessionId: "s-esc-1", status: "stopped", report: { kind: "escalate", reason: "Needs stronger model" } });
   const escalatedNew = makeMember({ memberId: "m-esc-2", sessionId: "s-esc-2", status: "running" });
@@ -980,4 +902,31 @@ test("evaluateStallRecovery guards reject non-active run statuses, non-running m
   });
   assert.equal(evaluateStallRecovery({ ...baseArgs(historicalEscRun, historicalEscMember, "detect"), activePrompt: null }).action, "initiate-stop");
   assert.equal(evaluateStallRecovery({ ...baseArgs(historicalEscRun, historicalEscMember, "detect"), attentionState: "needs-you", activePrompt: { id: 9, hash: "h9" } }).action, "none");
+
+  const reconnectingMember = makeMember({ memberId: "m-reconn", sessionId: "s-reconn", status: "unavailable" });
+  const prompt = { id: 11, kind: "permission" as const, title: "Run command?", options: [], acceptsText: false, source: "screen" as const, hash: "h11" };
+  let reconnectRun = makeRun({
+    tasks: [{ id: "task-a", title: "A", instructions: "A", paths: ["a.ts"], dependsOn: [], revision: 1, status: "running", memberId: "m-reconn" }],
+    members: [reconnectingMember],
+    permissionDecisions: [{
+      id: "pd-reconn", revision: 1, policyHash: "p", targetMemberId: "m-reconn", targetSessionId: "s-reconn", targetCwd: reconnectingMember.cwd,
+      promptId: 11, promptHash: "h11", evidenceHash: "e11", prompt, option: 0, expiresAt: iso(T0 + 60_000), answerRequestId: "ar-reconn", status: "escalated",
+    }],
+  });
+  syncObservedMemberState(reconnectRun, reconnectingMember, { status: "unavailable", attention: { state: "unavailable", lastActivityAt: iso(T0) } }, iso(T0 + 2000));
+  assert.equal(reconnectRun.permissionDecisions![0]!.promptClosedAt, undefined);
+  reconnectRun = JSON.parse(JSON.stringify(reconnectRun)) as TeamRun;
+  const reloadedMember = reconnectRun.members[0]!;
+  assert.equal(describeTeamWaitReasons(reconnectRun, [], T0 + 3000).some((r) => r.kind === "provider-prompt" && r.decisionId === "pd-reconn"), true);
+
+  reloadedMember.status = "running";
+  syncObservedMemberState(reconnectRun, reloadedMember, { status: "running", attention: { state: "needs-you", lastActivityAt: iso(T0 + 4000), prompt } }, iso(T0 + 4000));
+  assert.equal(reconnectRun.permissionDecisions![0]!.promptClosedAt, undefined);
+  assert.equal(describeTeamWaitReasons(reconnectRun, [], T0 + 4000).some((r) => r.kind === "provider-prompt" && r.decisionId === "pd-reconn"), true);
+  assert.equal(evaluateStallRecovery({ ...baseArgs(reconnectRun, reloadedMember, "detect"), attentionState: "needs-you", activePrompt: { id: 11, hash: "h11" } }).action, "none");
+
+  syncObservedMemberState(reconnectRun, reloadedMember, { status: "running", attention: { state: "working", lastActivityAt: iso(T0 + 5000) } }, iso(T0 + 5000));
+  assert.equal(reconnectRun.permissionDecisions![0]!.promptClosedAt, iso(T0 + 5000));
+  assert.equal(describeTeamWaitReasons(reconnectRun, [], T0 + 5000).some((r) => r.kind === "provider-prompt"), false);
+  assert.equal(evaluateStallRecovery({ ...baseArgs(reconnectRun, reloadedMember, "detect"), activePrompt: null }).action, "initiate-stop");
 });

@@ -26,8 +26,18 @@ const SECONDS_TIMER_RE = /\b\d+(?:\.\d+)?s\b/g;
 const TOKEN_TICKER_RE = /(?:[↑↓]\s*)?\b\d[\d,]*(?:\.\d+)?[kKmM]?\s+tokens?\b/gi;
 const COST_TICKER_RE = /\$\d[\d,]*(?:\.\d+)?\b/g;
 const LABELED_TICKER_RE = /\b(?:tokens?|cost)\s*[:=]\s*\$?\d[\d,]*(?:\.\d+)?[kKmM]?\b/gi;
-const PROVIDER_CHROME_RE =
-  /\b(?:esc to interrupt|ctrl\+c to interrupt|context\s+(?:left|used|remaining)|\d+(?:\.\d+)?%\s*context|context\s*[:=]\s*\d+(?:\.\d+)?%|\d[\d,]*(?:\.\d+)?[kKmM]?\s+tokens?|tokens?\s*[:=]\s*\d)\b/i;
+const PROVIDER_CHROME_RE = new RegExp(
+  [
+    /\besc to interrupt\b/.source,
+    /\bctrl\+c to interrupt\b/.source,
+    /\bcontext\s+(?:left|used|remaining)\b/.source,
+    /\b\d+(?:\.\d+)?%\s*context\b/.source,
+    /\bcontext\s*[:=]\s*\d+(?:\.\d+)?%(?=\s|$|[|,·•)])/.source,
+    /\b\d[\d,]*(?:\.\d+)?[kKmM]?\s+tokens?\b/.source,
+    /\btokens?\s*[:=]\s*\d[\d,]*(?:\.\d+)?[kKmM]?\b/.source,
+  ].join("|"),
+  "i",
+);
 const PROVIDER_MODEL_STATUS_RE =
   /^(?:[\s\u2800-\u28ff◐◓◑◒◴◷◶◵·✢✳✶✻✽•◦]*)(?:claude(?:-[a-z0-9._-]+)?|gpt-[a-z0-9._-]+|codex|opencode|grok(?:-[a-z0-9._-]+)?|o[134](?:-[a-z0-9._-]+)?)\b.*(?:[|·•]\s*(?:\$\d|\d+(?:\.\d+)?%|\d[\d,]*(?:\.\d+)?[kKmM]?\s+tokens?|\d{1,2}:\d{2}|context|cached|reasoning))/i;
 const STATUS_PERCENT_RE = /\b\d+(?:\.\d+)?%/g;

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import headless from "@xterm/headless";
 import {
   applyLifecycle,
   applySignal,
@@ -12,7 +13,7 @@ import {
   type Attention,
   type SignalEvent,
 } from "@infinite/attention";
-import { WorkerScreenActivity } from "../packages/host/src/worker-screen-activity.js";
+import { WorkerLimitWatch, WorkerScreenActivity, type LimitSignal } from "../packages/host/src/worker-screen-activity.js";
 
 test("substantiveScreenFingerprint ignores Braille, circle, ASCII spinners, timers, status tickers, and trailing spaces", () => {
   const brailleFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"].map(
@@ -313,28 +314,159 @@ test("substantiveScreenFingerprint preserves progress percentages and amounts ou
     substantiveScreenFingerprint(["claude-sonnet-4-5 | 42% | $0.04"], "claude"),
     substantiveScreenFingerprint(["claude-sonnet-4-5 | 43% | $0.08"], "claude"),
   );
+  assert.equal(
+    substantiveScreenFingerprint(["tokens: 9"], "codex"),
+    substantiveScreenFingerprint(["tokens: 10"], "codex"),
+  );
+  assert.equal(
+    substantiveScreenFingerprint(["tokens: 1200"], "codex"),
+    substantiveScreenFingerprint(["tokens: 1,250"], "codex"),
+  );
+  assert.equal(
+    substantiveScreenFingerprint(["tokens: 1.2k"], "codex"),
+    substantiveScreenFingerprint(["tokens: 1.9k"], "codex"),
+  );
+  assert.equal(
+    substantiveScreenFingerprint(["context: 42%"], "codex"),
+    substantiveScreenFingerprint(["context: 43%"], "codex"),
+  );
+  assert.equal(
+    substantiveScreenFingerprint(["context=99.5%"], "codex"),
+    substantiveScreenFingerprint(["context=12%"], "codex"),
+  );
 });
 
-test("WorkerScreenActivity exposes rawOutputSinceCheck independently of substantiveChange for limit corroboration", () => {
+test("WorkerScreenActivity and WorkerLimitWatch corroborate identical Codex repaints while resetting on changed display rows", () => {
   const t0 = Date.parse("2026-11-26T06:00:00.000Z");
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const tracker = new WorkerScreenActivity(3000, t0);
+  const emitted: LimitSignal[] = [];
+  const limits = new WorkerLimitWatch("codex", 2000, (signal) => emitted.push(signal));
+  let att: Attention = initialAttention(iso(t0), true);
+  const limitFrame = ["  The usage limit applies to this workspace.", "  gpt-5-codex · ~/workspace · usage limited"];
+
+  tracker.noteRenderedOutput(limitFrame, "codex", t0);
+  const c1 = tracker.evaluate(att, limitFrame, "codex", false, t0);
+  att = c1.attention;
+  assert.equal(c1.displayChanged, true);
+  limits.watch(limitFrame, t0, c1.displayChanged);
+  assert.deepEqual(emitted.map((s) => s.confidence), ["single-source"]);
+
+  for (const offset of [800, 1600, 2200]) {
+    tracker.noteRenderedOutput(limitFrame, "codex", t0 + offset);
+    const check = tracker.evaluate(att, limitFrame, "codex", false, t0 + offset);
+    att = check.attention;
+    assert.equal(check.rawOutputSinceCheck, true);
+    assert.equal(check.displayChanged, false);
+    limits.watch(limitFrame, t0 + offset, check.displayChanged);
+  }
+  assert.deepEqual(emitted.map((s) => s.confidence), ["single-source", "corroborated"]);
+
+  const spinnerEmitted: LimitSignal[] = [];
+  const spinnerTracker = new WorkerScreenActivity(3000, t0);
+  const spinnerLimits = new WorkerLimitWatch("codex", 2000, (signal) => spinnerEmitted.push(signal));
+  let spinAtt: Attention = initialAttention(iso(t0), true);
+  const frame0 = ["⠋ Working (1s)", "  gpt-5-codex · ~/workspace · usage limited"];
+  const frame1 = ["⠙ Working (2s)", "  gpt-5-codex · ~/workspace · usage limited"];
+  const frame2 = ["⠹ Working (3s)", "  gpt-5-codex · ~/workspace · usage limited"];
+
+  spinnerTracker.noteRenderedOutput(frame0, "codex", t0);
+  const s0 = spinnerTracker.evaluate(spinAtt, frame0, "codex", false, t0);
+  spinAtt = s0.attention;
+  spinnerLimits.watch(frame0, t0, s0.displayChanged);
+  for (const [offset, frame] of [[1000, frame1], [2100, frame2]] as const) {
+    spinnerTracker.noteRenderedOutput(frame, "codex", t0 + offset);
+    const sc = spinnerTracker.evaluate(spinAtt, frame, "codex", false, t0 + offset);
+    spinAtt = sc.attention;
+    assert.equal(sc.substantiveChange, false);
+    assert.equal(sc.displayChanged, true);
+    spinnerLimits.watch([...frame], t0 + offset, sc.displayChanged);
+  }
+  assert.deepEqual(spinnerEmitted.map((s) => s.confidence), ["single-source"]);
+});
+
+test("WorkerScreenActivity does not date pre-turn-end text by a later cursor redraw before the check window closes", () => {
+  const t0 = Date.parse("2026-11-26T06:30:00.000Z");
   const iso = (ms: number) => new Date(ms).toISOString();
   const tracker = new WorkerScreenActivity(3000, t0);
   let att: Attention = initialAttention(iso(t0), true);
 
-  tracker.noteRawOutput(t0 + 100);
-  const first = tracker.evaluate(att, ["⠋ Working (1s)", "gpt-5-codex · ~/workspace · usage limited"], "codex", false, t0 + 100);
-  att = first.attention;
-  assert.equal(first.rawOutputSinceCheck, true);
-  assert.equal(first.substantiveChange, true);
+  const initial = ["• Working (1s)"];
+  tracker.noteRenderedOutput(initial, "codex", t0 + 100);
+  att = tracker.evaluate(att, initial, "codex", false, t0 + 140).attention;
 
-  tracker.noteRawOutput(t0 + 1000);
-  const spinnerRedraw = tracker.evaluate(att, ["⠙ Working (2s)", "gpt-5-codex · ~/workspace · usage limited"], "codex", false, t0 + 1000);
-  att = spinnerRedraw.attention;
-  assert.equal(spinnerRedraw.rawOutputSinceCheck, true);
-  assert.equal(spinnerRedraw.substantiveChange, false);
-  assert.equal(spinnerRedraw.spinnerOnly, true);
+  const finalScreen = ["• Working (2s)", "Finished updating the module."];
+  tracker.noteRenderedOutput(finalScreen, "codex", t0 + 1000);
+  att = applySignal(att, {
+    seq: 2,
+    at: iso(t0 + 1002),
+    type: "signal",
+    data: { kind: "turn-end", backgroundTasks: 0, source: "osc", provider: "codex" },
+  });
+  tracker.noteRenderedOutput(finalScreen, "codex", t0 + 1015);
 
-  const quiet = tracker.evaluate(att, ["⠙ Working (2s)", "gpt-5-codex · ~/workspace · usage limited"], "codex", false, t0 + 2000);
-  assert.equal(quiet.rawOutputSinceCheck, false);
-  assert.equal(quiet.substantiveChange, false);
+  const afterCursorRedraw = tracker.evaluate(att, finalScreen, "codex", false, t0 + 1040);
+  assert.equal(afterCursorRedraw.freshOutput, false);
+  assert.equal(screenDecision(afterCursorRedraw.attention, null, afterCursorRedraw.idle, afterCursorRedraw.freshOutput, iso(t0 + 1040)).kind, "none");
+
+  const withBoundary = new WorkerScreenActivity(3000, t0);
+  let att2: Attention = initialAttention(iso(t0), true);
+  withBoundary.noteRenderedOutput(initial, "codex", t0 + 100);
+  att2 = withBoundary.evaluate(att2, initial, "codex", false, t0 + 140).attention;
+  withBoundary.markTurnEnd(finalScreen, "codex", t0 + 1002);
+  att2 = applySignal(att2, {
+    seq: 3,
+    at: iso(t0 + 1002),
+    type: "signal",
+    data: { kind: "turn-end", backgroundTasks: 0, source: "osc", provider: "codex" },
+  });
+  withBoundary.noteRenderedOutput(finalScreen, "codex", t0 + 1015);
+  const boundedCheck = withBoundary.evaluate(att2, finalScreen, "codex", false, t0 + 1040);
+  assert.equal(boundedCheck.substantiveChange, false);
+  assert.equal(boundedCheck.freshOutput, false);
+
+  const nextTurnScreen = [...finalScreen, "Running follow-up verification."];
+  withBoundary.noteRenderedOutput(nextTurnScreen, "codex", t0 + 5000);
+  const nextTurn = withBoundary.evaluate(boundedCheck.attention, nextTurnScreen, "codex", false, t0 + 5040);
+  assert.equal(nextTurn.substantiveChange, true);
+  assert.equal(nextTurn.freshOutput, true);
+  assert.equal(nextTurn.attention.lastActivityAt, iso(t0 + 5000));
+});
+
+test("queued xterm writes do not lose hookless output activity when a periodic check runs before render completes", async () => {
+  const t0 = Date.parse("2026-11-26T07:00:00.000Z");
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const Terminal = (headless as unknown as { Terminal: typeof headless.Terminal }).Terminal;
+  const term = new Terminal({ cols: 80, rows: 10, allowProposedApi: true });
+  const readLines = () => {
+    const buf = term.buffer.active;
+    const rows: string[] = [];
+    for (let i = buf.baseY; i < buf.baseY + term.rows; i++) rows.push(buf.getLine(i)?.translateToString(true) ?? "");
+    return rows.join("\n").trimEnd().split("\n");
+  };
+  const tracker = new WorkerScreenActivity(3000, t0);
+  let att: Attention = initialAttention(iso(t0), true);
+
+  await new Promise<void>((resolve) => term.write("Idle prompt\r\n› ", resolve));
+  tracker.noteRenderedOutput(readLines(), "codex", t0 + 100);
+  att = tracker.evaluate(att, readLines(), "codex", true, t0 + 100).attention;
+  att = { ...att, state: "idle", since: iso(t0 + 4000) };
+
+  const rendered = new Promise<void>((resolve) => {
+    term.write("\r\nApplied edit to worker.ts\r\n", () => {
+      tracker.noteRenderedOutput(readLines(), "codex", t0 + 5000);
+      resolve();
+    });
+  });
+  const prematureCheck = tracker.evaluate(att, readLines(), "codex", true, t0 + 5001);
+  assert.equal(prematureCheck.rawOutputSinceCheck, false);
+  assert.equal(prematureCheck.substantiveChange, false);
+
+  await rendered;
+  const afterRender = tracker.evaluate(prematureCheck.attention, readLines(), "codex", false, t0 + 5040);
+  assert.equal(afterRender.rawOutputSinceCheck, true);
+  assert.equal(afterRender.substantiveChange, true);
+  assert.equal(afterRender.freshOutput, true);
+  assert.equal(afterRender.attention.lastActivityAt, iso(t0 + 5000));
+  term.dispose();
 });

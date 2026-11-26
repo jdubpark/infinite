@@ -5,9 +5,9 @@ import type { ObjectiveReceipt } from "../packages/host/src/objective-receipts.j
 import { rebuildVersion } from "../packages/host/src/objective-record.js";
 import { canonicalBytes, objectiveRecordSchema, recordDigest } from "../packages/host/src/objective-types.js";
 import type { Criterion, LogEntry, ObjectiveRecord } from "../packages/host/src/objective-types.js";
-import { composeVerdict, resolveHandle, verdictRecord } from "../packages/host/src/verdict-compose.js";
+import { composeVerdict, deliveryReceiptOf, resolveHandle, verdictRecord } from "../packages/host/src/verdict-compose.js";
 import type { ComposeInput, ComposedCriterion } from "../packages/host/src/verdict-compose.js";
-import type { AssessedState, VerdictReport } from "../packages/host/src/verdict-types.js";
+import type { AssessedState, DeliveryFact, VerdictReport } from "../packages/host/src/verdict-types.js";
 
 const RUN = "5f0c1d2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f";
 const VERDICT = "0b9d7c1e-2f3a-4b5c-9d6e-1a2b3c4d5e6f";
@@ -138,6 +138,22 @@ test("the result follows the composition rules", () => {
     assert.equal(c2.state, "inconclusive");
     assert.equal(c2.reason, "before-delivery");
   }
+  const deliveryCriteria = (kind: "merged" | "landed") => part9().map(entry => (entry.id === "c2" ? { ...entry, check: { kind: "receipt", receipt: kind } as const, threshold: { kind: "pass" } as const } : entry));
+  const delivered = (kind: "merged" | "landed", delivery: DeliveryFact | undefined, extra: Partial<ComposeInput> = {}) =>
+    find(composeVerdict(input({ record: record(deliveryCriteria(kind)), facts: { checksPassed: true, reviewApproved: true, ...(delivery === undefined ? {} : { delivery }) }, ...extra })).criteria, "c2");
+  for (const [kind, delivery, state, reason] of [
+    ["merged", "none", "inconclusive", "before-delivery"], ["merged", "landed", "met", undefined], ["merged", "reverted", "met", undefined],
+    ["landed", "none", "inconclusive", "before-delivery"], ["landed", "landed", "met", undefined], ["landed", "reverted", "not-met", undefined],
+  ] as const) {
+    assert.equal(delivered(kind, delivery).state, state, `${kind} with ${delivery}`);
+    assert.equal(delivered(kind, delivery).reason, reason, `${kind} with ${delivery}`);
+  }
+  assert.equal(deliveryReceiptOf(deliveryCriteria("merged")[2]!), "merged");
+  assert.equal(deliveryReceiptOf(part9()[2]!), undefined);
+  const pinnedDelivery = deliveryCriteria("merged").map(entry => (entry.id === "c2" ? { ...entry, pinned: [{ path: PINNED, blob: BLOB }] } : entry));
+  const voided = find(composeVerdict(input({ record: record(pinnedDelivery), facts: { delivery: "landed" }, changedPaths: { paths: [PINNED], truncated: false } })).criteria, "c2");
+  assert.equal(voided.state, "inconclusive");
+  assert.equal(voided.reason, "pinned-changed");
   assert.equal(find(composeVerdict(input()).criteria, "c2").reason, "no-receipt");
 
   const noReport = composeVerdict(input({ receipts: receiptsAllPass, reason: "evaluator-unavailable" }));
@@ -353,9 +369,56 @@ test("the record write holds latest without notes and fits one entry", () => {
 
 test("composition is pure and leaves its inputs unchanged", () => {
   const given = input({ receipts: [receipt("c1", "pass")], report: report({ c0: "met", c1: "not-met" }) });
+  given.facts.delivery = "reverted";
   const before = JSON.stringify(given);
   const first = composeVerdict(given);
   const second = composeVerdict(given);
   assert.equal(JSON.stringify(given), before);
   assert.equal(JSON.stringify(first), JSON.stringify(second));
+});
+
+test("a superseding verdict replaces latest only where it names the superseded verdict", () => {
+  const SECOND = "7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+  const THIRD = "8b2c3d4e-5f6a-4b7c-9d8e-0f1a2b3c4d5e";
+  const criteria = part9().map(entry => (entry.id === "c2" ? { ...entry, check: { kind: "receipt", receipt: "merged" } as const, threshold: { kind: "pass" } as const } : entry));
+  const start = record(criteria);
+  const first = verdictRecord(start, composeVerdict(input({ record: start, receipts: [receipt("c1", "pass")] })), META);
+  assert.notEqual(first, "log-full");
+  if (first === "log-full") return;
+  const partial = composeVerdict(input({ record: first, receipts: [receipt("c1", "fail")] }));
+  const later = verdictRecord(first, { ...partial, criteria: partial.criteria.filter(item => item.id === "c1") }, { ...META, verdictId: SECOND });
+  assert.notEqual(later, "log-full");
+  if (later === "log-full") return;
+  const latestOf = (item: ObjectiveRecord, id: string) => item.criteria.find(entry => entry.id === id)?.latest?.verdictId;
+  assert.equal(latestOf(later, "c1"), SECOND);
+  assert.equal(latestOf(later, "c2"), VERDICT);
+  const mixed = later;
+  const composed = composeVerdict(input({ record: mixed, facts: { delivery: "landed" }, receipts: [receipt("c1", "pass")] }));
+  const answered = { ...composed, criteria: composed.criteria.map(item => (item.id === "c1" ? { ...item, contradicted: true as const, evaluatorState: "not-met" as const } : item)) };
+  const superseding = verdictRecord(mixed, answered, { ...META, verdictId: THIRD, supersedes: ["0d4e5f6a-7b8c-4d9e-9fa0-2b3c4d5e6f70", VERDICT] });
+  assert.notEqual(superseding, "log-full");
+  if (superseding === "log-full") return;
+  assert.equal(latestOf(superseding, "c2"), THIRD);
+  assert.equal(latestOf(superseding, "c1"), SECOND);
+  assert.equal(superseding.criteria.find(entry => entry.id === "c2")?.latest?.state, "met");
+  assert.equal(superseding.log.filter(entry => entry.handle === `verdict:${THIRD}`).length, 1, "no contradiction entry for a criterion this verdict does not write");
+  const empty = verdictRecord(superseding, composed, { ...META, verdictId: "9c3d4e5f-6a7b-4c8d-8e9f-1a2b3c4d5e6f", supersedes: ["0d4e5f6a-7b8c-4d9e-9fa0-2b3c4d5e6f70"] });
+  assert.notEqual(empty, "log-full");
+  if (empty === "log-full") return;
+  assert.equal(empty.log.length, superseding.log.length + 1);
+  assert.equal(objectiveRecordSchema.safeParse(empty).success, true);
+  for (let version = 1; version <= empty.version; version += 1) assert.equal(rebuildVersion(empty, version).version, version);
+  assert.equal(latestOf(rebuildVersion(empty, later.version), "c1"), SECOND);
+  assert.equal(latestOf(rebuildVersion(empty, first.version), "c1"), VERDICT);
+});
+
+test("a delivery receipt never records an evaluator contradiction", () => {
+  const criteria = part9().map(entry => (entry.id === "c2" ? { ...entry, check: { kind: "receipt", receipt: "landed" } as const, threshold: { kind: "pass" } as const } : entry));
+  for (const delivery of ["landed", "reverted"] as const) {
+    const withReport = report({ c0: "met", c2: delivery === "landed" ? "not-met" : "met" });
+    const composed = composeVerdict(input({ record: record(criteria), facts: { delivery }, report: withReport }));
+    const c2 = find(composed.criteria, "c2");
+    assert.equal(c2.state, delivery === "landed" ? "met" : "not-met");
+    assert.equal(c2.contradicted, undefined);
+  }
 });

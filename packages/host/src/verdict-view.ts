@@ -1,4 +1,5 @@
-import type { ProductGoal } from "./goal-types.js";
+import type { GoalCycle, ProductGoal } from "./goal-types.js";
+import { verdictIdsOf } from "./goal-verdicts.js";
 import type { ReceiptOutcome } from "./objective-receipts.js";
 import type { VerdictDetail } from "./team-verdicts.js";
 import type { AssessedState, ComposedState, CriterionReason, VerdictCounts, VerdictReason } from "./verdict-types.js";
@@ -42,10 +43,11 @@ function criterionView(criterion: VerdictDetail["criteria"][number]): Criterion 
   };
 }
 
-function ownerOf(goal: ProductGoal, verdictId: string, result: AssessedState): GoalVerdictView["owner"] {
-  const outcome = [...goal.outcomes].reverse().find(item => item.verdictId === verdictId);
+function ownerOf(goal: ProductGoal, cycle: GoalCycle, result: AssessedState): GoalVerdictView["owner"] {
+  const ids = verdictIdsOf(cycle);
+  const outcome = [...goal.outcomes].reverse().find(item => item.verdictId !== undefined && ids.includes(item.verdictId));
   if (outcome === undefined) return undefined;
-  const agrees = (result === "met" && outcome.result === "achieved") || (result === "not-met" && outcome.result === "not-achieved");
+  const agrees = outcome.verdictId === ids[0] && ((result === "met" && outcome.result === "achieved") || (result === "not-met" && outcome.result === "not-achieved"));
   return { result: outcome.result, ...(agrees ? { agrees: true } : {}) };
 }
 
@@ -56,7 +58,7 @@ export function goalVerdictsView(goal: ProductGoal, details: (teamId: string) =>
     if (assessment === undefined) continue;
     const found = details(cycle.teamId);
     const detail = found !== undefined && found.verdictId === assessment.verdictId ? found : undefined;
-    const owner = ownerOf(goal, assessment.verdictId, assessment.result);
+    const owner = ownerOf(goal, cycle, assessment.result);
     const evaluator = detail?.evaluator;
     verdicts.push({
       cycle: cycle.cycle, teamId: cycle.teamId, verdictId: assessment.verdictId, kind: assessment.kind, head: assessment.head, at: assessment.at,

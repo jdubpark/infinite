@@ -44,6 +44,7 @@ import { outcomeBackfill } from "./outcome-backfill.js";
 import { outcomeProjector } from "./outcome-projector.js";
 import { EvalHost } from "./eval-host.js";
 import { EXCLUSION_REASONS, OUTCOMES_MODULE, outcomeModule, runOutcomeView, sweepExpiredOutcomes, type SignalRow } from "./outcome-store.js";
+import { deliveryPort } from "./verdict-delivery.js";
 import { registerVerdicts, sweepExpiredVerdicts } from "./verdict-store.js";
 import { RoutingRecorder } from "./routing-recorder.js";
 import { registerRouting, sweepExpiredDecisions } from "./routing-store.js";
@@ -262,9 +263,13 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   registerRouting(evidence, outbox);
   registerVerdicts(evidence, outbox);
   const signals = new SignalService({ store: evidence });
+  let lateReceipts: () => void = () => {};
   baseScanner = new BaseScanner({
     store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT,
-    onApplied: scan => { signals.recordScan(scan); },
+    onApplied: scan => {
+      signals.recordScan(scan);
+      lateReceipts();
+    },
   });
   outbox.registerProjector(outcomeProjector(evidence));
   const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager, cost: sessionId => sessionCostOf(usage.session(sessionId)) });
@@ -278,16 +283,21 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     events: outbox,
     capture: evalHost.capture,
     entries: blackboard, ...(options.processCensus ? { processes: options.processCensus } : {}),
-    onMerged: id => void projectSource.refresh(id).then(status => {
-      sourceChanged(id);
-      if (status.appliedHead && !status.pending) scheduleGraphForSession(id);
-    }, () => sourceChanged(id)),
+    delivery: deliveryPort(evidence),
+    onMerged: id => {
+      lateReceipts();
+      void projectSource.refresh(id).then(status => {
+        sourceChanged(id);
+        if (status.appliedHead && !status.pending) scheduleGraphForSession(id);
+      }, () => sourceChanged(id));
+    },
     ownerActive: run => {
       if (ownerServices.goals?.retainsTeamRun(run.id) || ownerServices.missions?.retainsSubteamRun(run.id)) return true;
       return Boolean(run.handoff && ownerServices.handoffs?.ownsActiveTeam(run.id));
     },
   });
   teams.useEvidence(evidence);
+  lateReceipts = () => { void teams.settleReceipts().catch(() => {}); };
   teams.useRouter(new RoutingRecorder({ store: evidence }));
   const backfillOutcomes = outcomeBackfill(evidence, () => teams.understandingRecords(), {
     mapOf: projectId => config.projects.find(project => project.id === projectId)?.team?.features,
@@ -299,6 +309,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   usage.useBalances(balances);
   teams.useUsage(usage);
   const goals = new GoalService(config, key, teams, linear);
+  lateReceipts = () => { void teams.settleReceipts().then(() => goals.syncReceipts()).catch(() => {}); };
   ownerServices.goals = goals;
   const projectGroups = new ProjectGroupService(config, key, undefined, { appliedAt: id => projectSync.status(id).appliedAt });
   let permissionJournal: PermissionJournal | undefined;
@@ -371,6 +382,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
   const sweepEvidence = () => {
+    lateReceipts();
     evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
     sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays);
     sweepExpiredVerdicts(evidence, new Date().toISOString());

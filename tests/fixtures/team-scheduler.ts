@@ -11,7 +11,7 @@ import type { LinearService } from "../../packages/host/src/linear.js";
 import type { Manager } from "../../packages/host/src/manager.js";
 import type { Config, WorkerState } from "../../packages/host/src/types.js";
 import type { RecordedTeamReportEnvelope, TeamAssignment, TeamModelProfile, TeamRun } from "../../packages/host/src/team-types.js";
-import { TeamService } from "../../packages/host/src/teams.js";
+import { TeamService, type TeamServiceOptions } from "../../packages/host/src/teams.js";
 import { Journal, readEvents, unseal, writeSealed } from "../../packages/host/src/vault.js";
 
 export function schedulerFixture() {
@@ -120,7 +120,7 @@ export function schedulerFixture() {
       return () => { rmdirSync(file); renameSync(backup, file); };
     },
     writeTeam: (extra: object = {}) => writeRecord("team", id, { run, prepared: true, fingerprint: "fixture", receipts: {}, ...extra }),
-    openTeam: (options?: { events?: EventOutbox; entries?: Blackboard; linear?: LinearService }) => {
+    openTeam: (options?: { events?: EventOutbox; entries?: Blackboard; linear?: LinearService; delivery?: TeamServiceOptions["delivery"] }) => {
       const { linear, ...serviceOptions } = options ?? {};
       const service = new TeamService(config, key, manager as unknown as Manager, (_project, start) => start(), linear, undefined, options ? serviceOptions : undefined);
       services.push(service); return service;

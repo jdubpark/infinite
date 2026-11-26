@@ -9,10 +9,10 @@ final class DisplayFreshnessTests: XCTestCase {
 
         freshness.failed()
         try await Task.sleep(for: .milliseconds(100))
-        freshness.failed() // A manual refresh must not reveal the warning early.
+        freshness.failed()
         XCTAssertEqual(warnings, [])
         try await Task.sleep(for: .milliseconds(1_900))
-        freshness.failed() // The normal two-second poll must not restart it either.
+        freshness.failed()
         XCTAssertEqual(warnings, [])
         try await Task.sleep(for: .milliseconds(1_300))
         XCTAssertEqual(warnings, [true])
@@ -39,7 +39,6 @@ final class DisplayFreshnessTests: XCTestCase {
 
     @MainActor func testFirstCatalogFailureEventuallyShowsOfflineWithoutCachedData() async throws {
         let model = CmuxViewModel()
-        // No backend is connected: snapshot fails locally without accessing a server.
         model.setDisplayVisible(true)
         await model.refresh()
         XCTAssertFalse(model.connected)

@@ -84,7 +84,8 @@ import { createMcpServer } from "./mcp-server.js";
 import { McpRequestService } from "./mcp-requests.js";
 import { IntakeSlackSurface } from "./intake-slack.js";
 import { SlackClient } from "./slack-client.js";
-import { createMissionSchema, missionActionSchema, missionExtendSchema, missionTextSchema, type CreateMission, type Mission, type MissionOrigin } from "./mission-types.js";
+import { createIntakeAudienceGuard, createIntakeMissionCreator } from "./intake-audience.js";
+import { createMissionSchema, missionActionSchema, missionExtendSchema, missionTextSchema } from "./mission-types.js";
 import { ProjectGroupService } from "./project-groups.js";
 import { PermissionDelegationService } from "./permission-delegation.js";
 import type { PermissionAgentServices } from "./permission-agent-types.js";
@@ -411,17 +412,10 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   const assertNoHandoff = (projectId: string) => {
     if (handoffs.activeForProject(projectId)) throw new TeamError(409, "handoff-in-progress", "This project is transferring a task to a team. Wait for its checkpoint to finish.");
   };
-  const createMission = async (body: CreateMission, origin?: MissionOrigin, authorize?: () => void): Promise<Mission> => {
-    authorize?.();
-    const recorded = missions.replayCreate(body);
-    if (recorded) return recorded;
-    const group = projectGroups.get(body.groupId);
-    for (const repo of group.repos)
-      for (const checkout of repo.checkouts) assertNoHandoff(checkout.projectId);
-    return missions.create({ ...body, groupId: group.id }, body, origin, authorize);
-  };
+  const intakeAudience = createIntakeAudienceGuard({ config, groups: projectGroups, sourceAppliedHead: projectId => projectSource.status(projectId).appliedHead });
+  const createMission = createIntakeMissionCreator({ config, missions, groups: projectGroups, audience: intakeAudience, assertNoHandoff });
   const intakeStore = config.intake ? new IntakeStore(config, key) : undefined;
-  const intakeSlackClient = config.intake?.slack ? new SlackClient({ botTokenFile: config.intake.slack.botTokenFile, appTokenFile: config.intake.slack.appTokenFile, endpoint: config.intake.slack.endpoint }) : undefined;
+  const intakeSlackClient = config.intake?.slack ? new SlackClient({ botTokenFile: config.intake.slack.botTokenFile, appTokenFile: config.intake.slack.appTokenFile, endpoint: config.intake.slack.endpoint, teamId: config.intake.slack.teamId, organizationScope: config.intake.slack.organizationScope, workspaceAllowed: intakeAudience.workspacesAllowed }) : undefined;
   const intake = config.intake && intakeStore ? new IntakeService(config, intakeStore, missions, new IntakeLinear(linear), { create: createMission, threads: intakeSlackClient, ...(config.intake.slack?.classify ? { router: text => readings.requestRoute(text) } : {}) }) : undefined;
   const mcp = config.mcp && intakeStore && intake ? createMcpServer(config, new McpRequestService(config, intakeStore, intake, missions, projectGroups)) : undefined;
   const intakeSlack = intakeStore && intakeSlackClient ? new IntakeSlackSurface(config, intakeStore, missions, teams, intakeSlackClient, intake ? { direct: input => intake.requestFromSlack(input) } : {}) : undefined;
@@ -1184,6 +1178,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.post("/api/goals/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await goals.extend(id.parse(req.params.id), goalExtendSchema.parse(req.body))));
   registerMissionReadRoutes(app, { missions, teams, manager });
   app.get("/api/intake", (_req, res) => res.json({ records: intake?.list() ?? [], ...intake?.status(), ...(intakeSlack ? { slack: intakeSlack.status() } : {}) }));
+  app.get("/api/intake/workspace-scope", requireRole(["owner"]), (_req, res) => res.json({ state: !config.intake?.slack?.organizationScope ? "unconfigured" : intakeAudience.workspacesAllowed() ? "verified" : "blocked" }));
   app.post("/api/missions", requireRole(["owner"]), async (req, res) => res.json(await createMission(createMissionSchema.parse(req.body))));
   app.post("/api/missions/:id/steer", requireRole(["owner"]), async (req, res) => res.json(await missions.steer(id.parse(req.params.id), missionTextSchema.parse(req.body))));
   app.post("/api/missions/:id/answer/:decisionId", requireRole(["owner"]), async (req, res) =>

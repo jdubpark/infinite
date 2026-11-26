@@ -2,8 +2,6 @@ import SwiftUI
 import InfiniteCore
 import CryptoKit
 
-/// Knowledge catalog and component map. Every mutation is an explicit owner action
-/// against the last observed catalog revision; conflicts keep the editor open.
 struct UnderstandingKnowledgeView: View {
     @ObservedObject var app: AppModel
     let group: ProjectGroup

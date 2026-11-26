@@ -1,7 +1,6 @@
 import SwiftUI
 import InfiniteCore
 
-/// Home: one text box that hands a mission to a project, above the board grouped by what each row needs next.
 struct HomeView: View {
     @ObservedObject var app: AppModel
     private var filter: ProjectGroup? { app.projectFilter.flatMap(app.projectGroups.group) }
@@ -19,7 +18,6 @@ struct HomeView: View {
     }
 }
 
-/// The selected project's name and repositories, with the way back to every project.
 struct ProjectHeader: View {
     @ObservedObject var app: AppModel
     let group: ProjectGroup
@@ -36,8 +34,6 @@ struct ProjectHeader: View {
     }
 }
 
-/// A mission starts from a sentence in the chosen project. The main coordinator splits it into
-/// subtasks; nothing starts in a repository directly from here.
 struct MissionStartBox: View {
     @ObservedObject var app: AppModel
     @State private var objective = ""
@@ -49,7 +45,6 @@ struct MissionStartBox: View {
     private var pending: Bool { app.pendingMissionCreation.pendingID != nil }
     private var ready: Bool { app.connected && app.isOwner && !busy && !group.isEmpty }
     private var canStart: Bool { ready && (pending || !objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
-    /// The first line of the request waiting for confirmation, read back from its saved body.
     private var pendingSummary: String {
         guard let text = app.pendingMissionCreation.pendingText, let value = try? JSON.parse(Data(text.utf8)) else { return "" }
         let request = value["objective"].string
@@ -119,7 +114,6 @@ struct MissionStartBox: View {
     }
 
     private func reset() {
-        // A pending request keeps the project it was sent to, so a retry is the identical request.
         if pending, !pendingGroup.isEmpty { group = pendingGroup; return }
         if let filter = app.projectFilter, app.projectGroups.group(filter) != nil { group = filter; return }
         if group.isEmpty || app.projectGroups.group(group) == nil { group = app.projectGroups.groups.first?.id ?? "" }
@@ -137,7 +131,6 @@ struct MissionStartBox: View {
     }
 }
 
-/// The board: Needs input, Working, Ready for review, then a folded Ended section.
 struct BoardList: View {
     @ObservedObject var app: AppModel
     let filter: ProjectGroup?
@@ -195,8 +188,6 @@ struct BoardList: View {
     }
 }
 
-/// One mission, team run, or goal on one row: status, title, where it runs and what it is doing,
-/// its state in words, and how long ago it last changed.
 struct BoardRow: View {
     @ObservedObject var app: AppModel
     let item: BoardItem
@@ -248,7 +239,6 @@ struct BoardRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            // A goal has no Mac page; its row stays legible but takes no clicks.
             .allowsHitTesting(opens)
             .accessibilityLabel("\(item.title), \(item.statusLabel), \(caption)")
             .accessibilityHint(item.kind == .mission ? "Opens the mission" : item.kind == .team ? "Opens the team" : "")
@@ -262,7 +252,7 @@ struct BoardRow: View {
     }
     private func open() {
         switch item.kind {
-        case .mission: app.selectedMissionID = item.id
+        case .mission: app.openMission(item.id)
         case .team: app.openTeam(item.id)
         default: break
         }

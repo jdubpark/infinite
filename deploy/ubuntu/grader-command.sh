@@ -4,6 +4,7 @@ ROOT=/var/lib/infinite-grader/root
 ACCOUNT=infinite-grader
 PRLIMIT_NPROC=512
 STOP_KILL_MODE=kill
+OVERRIDE_ACTIVE=0
 JOBS=$ROOT/jobs
 JOBDIR=
 REAL_JOB=
@@ -119,8 +120,13 @@ op_probe() {
   else
     meta=closed
   fi
-  printf '{"uid":%s,"root":"%s","rootMode":"%s","rootOwner":%s,"readable":[%s],"metadata":"%s","freeBytes":%s,"freeInodes":%s,"ancestorsWritable":%s,"tools":%s,"version":2}\n' \
-    "$uid" "$ROOT" "$mode" "$owner" "$readable" "$meta" "$((avail * bsize))" "$inodes" "$ancestors" "$tools"
+  if [ "$OVERRIDE_ACTIVE" -eq 1 ]; then
+    printf '{"uid":%s,"root":"%s","rootMode":"%s","rootOwner":%s,"readable":[%s],"metadata":"%s","freeBytes":%s,"freeInodes":%s,"ancestorsWritable":%s,"tools":%s,"stopKillMode":"%s","version":2}\n' \
+      "$uid" "$ROOT" "$mode" "$owner" "$readable" "$meta" "$((avail * bsize))" "$inodes" "$ancestors" "$tools" "$STOP_KILL_MODE"
+  else
+    printf '{"uid":%s,"root":"%s","rootMode":"%s","rootOwner":%s,"readable":[%s],"metadata":"%s","freeBytes":%s,"freeInodes":%s,"ancestorsWritable":%s,"tools":%s,"version":2}\n' \
+      "$uid" "$ROOT" "$mode" "$owner" "$readable" "$meta" "$((avail * bsize))" "$inodes" "$ancestors" "$tools"
+  fi
 }
 
 op_receive() {
@@ -332,6 +338,7 @@ load_test_overrides() {
     elif [ "$override_active" -eq 1 ]; then
       STOP_KILL_MODE=refuse
     fi
+    OVERRIDE_ACTIVE=$override_active
   fi
   unset INFINITE_GRADER_TEST_ROOT INFINITE_GRADER_TEST_ACCOUNT \
     INFINITE_GRADER_TEST_PRLIMIT_NPROC INFINITE_GRADER_TEST_STOP_KILL_MODE

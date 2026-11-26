@@ -330,14 +330,42 @@ test("secondary and primary repository-graph wrappers enforce strict instance ro
   const laneCache = join(cacheRoot, "lane", "shared");
   const seedCache = join(cacheRoot, "lane", "seed");
   const other = join(sandbox, "other");
+  const gitCmd = (cwd: string, args: string[]) => {
+    const res = spawnSync("git", args, {
+      cwd,
+      env: {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_AUTHOR_NAME: "deploy-test",
+        GIT_AUTHOR_EMAIL: "deploy-test@example.invalid",
+        GIT_COMMITTER_NAME: "deploy-test",
+        GIT_COMMITTER_EMAIL: "deploy-test@example.invalid",
+      },
+      encoding: "utf8",
+    });
+    assert.equal(res.status, 0, `git ${args.join(" ")}: ${res.stderr}`);
+  };
   mkdirSync(repoA, { recursive: true });
   mkdirSync(teamRepo, { recursive: true });
   mkdirSync(laneCache, { recursive: true });
   mkdirSync(seedCache, { recursive: true });
   mkdirSync(tmpAgent, { recursive: true });
   mkdirSync(other, { recursive: true });
+  gitCmd(repoA, ["init", "--quiet"]);
+  gitCmd(teamRepo, ["init", "--quiet"]);
   symlinkSync(other, join(ws, "out-link"));
   symlinkSync(repoA, join(ws, "in-link"));
+
+  const externalGit = join(sandbox, "external-repo");
+  mkdirSync(externalGit, { recursive: true });
+  gitCmd(externalGit, ["init", "--quiet"]);
+  gitCmd(externalGit, ["commit", "--quiet", "--allow-empty", "-m", "init"]);
+  const linkedWorktree = join(ws, "linked-worktree");
+  gitCmd(externalGit, ["worktree", "add", "--quiet", "--detach", linkedWorktree]);
+  const fakeGitDir = join(ws, "fake-gitdir");
+  mkdirSync(fakeGitDir, { recursive: true });
+  writeFileSync(join(fakeGitDir, ".git"), `gitdir: ${join(externalGit, ".git")}\n`);
 
   const stubBuilder = join(sandbox, "stub-builder.py");
   writeFileSync(stubBuilder, "import json, os, sys\nprint(json.dumps({'cwd': os.getcwd(), 'argv': sys.argv[1:], 'env': dict(os.environ)}))\n", { mode: 0o700 });
@@ -375,12 +403,34 @@ test("secondary and primary repository-graph wrappers enforce strict instance ro
       assert.equal(payload.env.SECRET_CALLER_VAR, undefined);
     }
 
-    for (const bad of [join(ws, "out-link"), join(ws, "in-link"), other, ws]) {
+    for (const bad of [join(ws, "out-link"), join(ws, "in-link"), linkedWorktree, fakeGitDir, other, ws]) {
       const denied = runGraph(isolatedWrapper, ["--repo", bad, "--cache-dir", laneCache, "--ref", "HEAD", "--graphify", stubGraphify]);
       assert.notEqual(denied.status, 0, `${label} ${bad}`);
       assert.match(denied.stderr, /Repository graph request refused:/);
     }
   }
+
+  const gitRootSb = realpathSync(tmp());
+  const gitRootWs = join(gitRootSb, "workspaces");
+  const gitRootChild = join(gitRootWs, "child");
+  const gitRootCache = join(gitRootSb, "repository-graphs", "lane");
+  mkdirSync(gitRootChild, { recursive: true });
+  mkdirSync(join(gitRootSb, "team-workspaces"), { recursive: true });
+  mkdirSync(gitRootCache, { recursive: true });
+  mkdirSync(join(gitRootSb, "tmp", "agent"), { recursive: true });
+  gitCmd(gitRootWs, ["init", "--quiet"]);
+  const gitRootGraphWrapper = join(gitRootSb, "gitroot-graph-wrapper.py");
+  writeFileSync(
+    gitRootGraphWrapper,
+    readFileSync(workWrapper, "utf8")
+      .replaceAll("/srv/infinite-data/instances/work", gitRootSb)
+      .replaceAll("/opt/infinite-work/scripts/repository_graph.py", stubBuilder)
+      .replaceAll("/usr/local/bin/graphify", stubGraphify),
+    { mode: 0o700 },
+  );
+  const gitRootDenied = runGraph(gitRootGraphWrapper, ["--repo", gitRootChild, "--cache-dir", gitRootCache, "--ref", "HEAD", "--graphify", stubGraphify]);
+  assert.notEqual(gitRootDenied.status, 0);
+  assert.match(gitRootDenied.stderr, /Repository graph request refused: The requested path is outside its assigned root/);
 
   const ancestorSb = realpathSync(tmp());
   const realParent = join(ancestorSb, "real-parent");
@@ -437,6 +487,7 @@ test("secondary and primary jevcode wrappers enforce strict instance root isolat
     ["relative repo", ["auto", "--repo", "project-a"]],
     ["missing repo value", ["auto", "--repo"]],
     ["first-instance log path", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--log", "/srv/infinite-data/control/state"]],
+    ["in-instance tmp log refused", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--log", "/srv/infinite-data/instances/work/tmp/agent/session.jsonl"]],
     ["agent-home jev api key as log", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--log", "/srv/infinite-data/instances/work/agent-home/.config/jevcode/jev-api-key"]],
     ["agent-home codex auth as equals log", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--log=/srv/infinite-data/instances/work/agent-home/.codex/auth.json"]],
     ["unsupported state-dir flag", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--state-dir=/srv/infinite-data/agent-home/.jevcode"]],
@@ -472,9 +523,11 @@ test("secondary and primary jevcode wrappers enforce strict instance root isolat
   const ws = join(sb, "workspaces");
   const teamWs = join(sb, "team-workspaces");
   const realRepo = join(ws, "real-repo");
+  const realRepoSub = join(realRepo, "packages", "sub");
   const teamRepo = join(teamWs, "run-1", "member");
   const outside = join(sb, "outside");
   mkdirSync(join(realRepo, "src"), { recursive: true });
+  mkdirSync(realRepoSub, { recursive: true });
   mkdirSync(teamRepo, { recursive: true });
   mkdirSync(join(sb, "agent-home", ".config", "jevcode"), { recursive: true });
   mkdirSync(join(sb, "tmp", "agent"), { recursive: true });
@@ -526,10 +579,16 @@ test("secondary and primary jevcode wrappers enforce strict instance root isolat
         realRepo,
       ],
       [
-        "team workspace repo with instance log",
-        ["auto", `--repo=${teamRepo}`, "--log", join(sb, "tmp", "agent", "session.jsonl")],
+        "team workspace repo with activity-stdin",
+        ["auto", `--repo=${teamRepo}`, "--activity-stdin", "--format", "json"],
         sb,
         teamRepo,
+      ],
+      [
+        "subdirectory repo with top-level relative focus",
+        ["brief", "--repo", realRepoSub, "--focus", "src", "--format", "json", "--no-state"],
+        sb,
+        realRepoSub,
       ],
       [
         "brief with leading-slash question and relative focus",
@@ -572,7 +631,9 @@ test("secondary and primary jevcode wrappers enforce strict instance root isolat
       ["symlink repo pointing inside", ["auto", "--repo", join(ws, "in-link")], sb],
       ["relative focus symlink pointing outside", ["brief", "--repo", realRepo, "--focus", "focus-out-link"], sb],
       ["relative focus symlink pointing inside", ["brief", "--repo", realRepo, "--focus", "focus-in-link"], sb],
+      ["subdirectory repo with top-level focus symlink outside", ["brief", "--repo", realRepoSub, "--focus", "focus-out-link"], sb],
       ["cwd via symlink pointing outside", ["show"], join(ws, "out-link")],
+      ["log flag refused even under tmp", ["auto", "--repo", realRepo, "--log", join(sb, "tmp", "agent", "session.jsonl")], sb],
       ["agent-home api key as log", ["auto", "--repo", realRepo, "--log", join(sb, "agent-home", ".config", "jevcode", "jev-api-key")], sb],
     ] as Array<[string, string[], string]>) {
       const res = runJevcode(scopedWrapper, args, cwd);

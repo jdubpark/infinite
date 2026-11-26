@@ -48,7 +48,9 @@ function assertOverridesActive(sb: Sandbox): void {
     timeout: 60_000,
   });
   assert.equal(probe.status, 0, `probe before destructive op failed: ${probe.stderr.toString("utf8")}`);
-  assert.equal((JSON.parse(probe.stdout.toString("utf8")) as { root?: string }).root, sb.root, "launcher overrides are not active");
+  const parsed = JSON.parse(probe.stdout.toString("utf8")) as { root?: string; stopKillMode?: string };
+  assert.equal(parsed.root, sb.root, "launcher overrides are not active");
+  assert.equal(parsed.stopKillMode, "refuse", "launcher stopKillMode override is not active");
   verifiedSandboxes.add(sb);
 }
 
@@ -118,14 +120,16 @@ test("test overrides are ignored under privilege escalation and reject invalid v
 
     const envWithoutKillMode = { ...sb.env, ...baseEnv };
     delete envWithoutKillMode.INFINITE_GRADER_TEST_STOP_KILL_MODE;
-    const sleeper = spawn("sleep", [String(randomInt(100_000, 900_000))], { stdio: "ignore" });
-    try {
-      const defaultStop = spawnSync("/bin/sh", [LAUNCHER, "stop"], { env: envWithoutKillMode, timeout: 60_000 });
-      assert.equal(defaultStop.status, 99, "omitting STOP_KILL_MODE under overrides must default to refuse, never kill");
-      assert.equal(sleeper.exitCode, null);
-      assert.equal(sleeper.signalCode, null);
-    } finally {
-      sleeper.kill("SIGKILL");
+    const omittedProbe = spawnSync("/bin/sh", [LAUNCHER, "probe", "--"], { env: envWithoutKillMode, timeout: 60_000 });
+    assert.equal(omittedProbe.status, 0, omittedProbe.stderr.toString("utf8"));
+    const omittedInfo = JSON.parse(omittedProbe.stdout.toString("utf8")) as { root?: string; stopKillMode?: string };
+    assert.equal(omittedInfo.root, sb.root);
+    assert.equal(omittedInfo.stopKillMode, "refuse", "omitting STOP_KILL_MODE under overrides must default to refuse, never kill");
+
+    const canUnshare = spawnSync("/usr/bin/unshare", ["-U", "--map-current-user", "-p", "--fork", "--kill-child", "/bin/true"], { timeout: 10_000 }).status === 0;
+    if (canUnshare) {
+      const isolatedStop = spawnSync("/usr/bin/unshare", ["-U", "--map-current-user", "-p", "--fork", "--kill-child", "/bin/sh", LAUNCHER, "stop"], { env: envWithoutKillMode, timeout: 60_000 });
+      assert.equal(isolatedStop.status, 99, "omitted STOP_KILL_MODE exits 99 inside isolated PID namespace");
     }
   } finally {
     cleanup(sb);

@@ -10,6 +10,7 @@ STOP_DIRS="/tmp /var/tmp /dev/shm /dev/mqueue /run/lock /var/crash"
 PRLIMIT_NPROC=512
 SYSVIPC_DIR=/proc/sysvipc
 STOP_KILL_MODE=kill
+OVERRIDE_ACTIVE=0
 TRIALS=$ROOT/trials
 TRIAL_DIR=
 REAL_TRIAL=
@@ -188,8 +189,13 @@ op_probe() {
   leftovers=$(count_leftovers)
   printf '{"version":1,"uid":%s,"root":"%s","rootMode":"%s","rootOwner":%s,"readable":[%s],"metadata":"%s",' \
     "$uid" "$ROOT" "$mode" "$owner" "$readable" "$meta"
-  printf '"freeBytes":%s,"freeInodes":%s,"ancestorsWritable":%s,"tools":%s,"trials":%s,"leftovers":%s,"fetch":"%s"}\n' \
-    "$((avail * bsize))" "$inodes" "$ancestors" "$tools" "$trials" "$leftovers" "$fetch"
+  if [ "$OVERRIDE_ACTIVE" -eq 1 ]; then
+    printf '"freeBytes":%s,"freeInodes":%s,"ancestorsWritable":%s,"tools":%s,"trials":%s,"leftovers":%s,"stopKillMode":"%s","fetch":"%s"}\n' \
+      "$((avail * bsize))" "$inodes" "$ancestors" "$tools" "$trials" "$leftovers" "$STOP_KILL_MODE" "$fetch"
+  else
+    printf '"freeBytes":%s,"freeInodes":%s,"ancestorsWritable":%s,"tools":%s,"trials":%s,"leftovers":%s,"fetch":"%s"}\n' \
+      "$((avail * bsize))" "$inodes" "$ancestors" "$tools" "$trials" "$leftovers" "$fetch"
+  fi
 }
 
 count_entries() {
@@ -538,6 +544,8 @@ allow_test_overrides() {
 load_test_overrides() {
   if allow_test_overrides; then
     override_active=0
+    has_stop_dirs=0
+    has_sysvipc_dir=0
     if [ "${INFINITE_EVAL_TEST_ROOT+set}" = set ]; then
       override_active=1
       valid_abs_path "$INFINITE_EVAL_TEST_ROOT" || refuse
@@ -567,6 +575,7 @@ load_test_overrides() {
     fi
     if [ "${INFINITE_EVAL_TEST_STOP_DIRS+set}" = set ]; then
       override_active=1
+      has_stop_dirs=1
       stop_count=0
       set -f
       # shellcheck disable=SC2086
@@ -590,18 +599,24 @@ load_test_overrides() {
     fi
     if [ "${INFINITE_EVAL_TEST_SYSVIPC_DIR+set}" = set ]; then
       override_active=1
+      has_sysvipc_dir=1
       valid_abs_path "$INFINITE_EVAL_TEST_SYSVIPC_DIR" || refuse
       SYSVIPC_DIR=$INFINITE_EVAL_TEST_SYSVIPC_DIR
     fi
     if [ "${INFINITE_EVAL_TEST_STOP_KILL_MODE+set}" = set ]; then
       override_active=1
       case "$INFINITE_EVAL_TEST_STOP_KILL_MODE" in
-        skip|refuse) STOP_KILL_MODE=$INFINITE_EVAL_TEST_STOP_KILL_MODE ;;
+        skip)
+          [ "$has_stop_dirs" -eq 1 ] && [ "$has_sysvipc_dir" -eq 1 ] || refuse
+          STOP_KILL_MODE=skip
+          ;;
+        refuse) STOP_KILL_MODE=refuse ;;
         *) refuse ;;
       esac
     elif [ "$override_active" -eq 1 ]; then
       STOP_KILL_MODE=refuse
     fi
+    OVERRIDE_ACTIVE=$override_active
   fi
   unset INFINITE_EVAL_TEST_ROOT INFINITE_EVAL_TEST_ACCOUNT INFINITE_EVAL_TEST_HOME \
     INFINITE_EVAL_TEST_TEMPLATE INFINITE_EVAL_TEST_TMP INFINITE_EVAL_TEST_STOP_DIRS \

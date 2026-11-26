@@ -51,7 +51,9 @@ function sandbox(account: string = CURRENT_USER, copy: Copy = {}): Sandbox {
     INFINITE_EVAL_TEST_PRLIMIT_NPROC: "off",
     INFINITE_EVAL_TEST_STOP_KILL_MODE: copy.stop ? "skip" : "refuse",
   };
-  if (!kernelTables) {
+  if (kernelTables) {
+    env.INFINITE_EVAL_TEST_SYSVIPC_DIR = "/proc/sysvipc";
+  } else {
     const tables = join(dir, "sysvipc");
     mkdirSync(tables, { mode: 0o700 });
     for (const name of ["shm", "sem", "msg"]) writeFileSync(join(tables, name), `${readFileSync(`/proc/sysvipc/${name}`, "utf8").split("\n", 1)[0]}\n`);
@@ -69,7 +71,10 @@ function assertOverridesActive(sb: Sandbox): void {
     timeout: 60_000,
   });
   assert.equal(probe.status, 0, `probe before destructive op failed: ${probe.stderr.toString("utf8")}`);
-  assert.equal((JSON.parse(probe.stdout.toString("utf8")) as { root?: string }).root, sb.root, "launcher overrides are not active");
+  const parsed = JSON.parse(probe.stdout.toString("utf8")) as { root?: string; stopKillMode?: string };
+  assert.equal(parsed.root, sb.root, "launcher overrides are not active");
+  assert.equal(parsed.stopKillMode, sb.env.INFINITE_EVAL_TEST_STOP_KILL_MODE, "launcher stopKillMode override is not active");
+  assert.notEqual(parsed.stopKillMode, "kill");
   verifiedSandboxes.add(sb);
 }
 
@@ -139,8 +144,9 @@ function envNames(stdout: Buffer): string[] {
 function leftovers(sb: Sandbox): number {
   const probe = run(sb, ["probe", "--"]);
   assert.equal(probe.status, 0, probe.stderr.toString("utf8"));
-  const parsed = JSON.parse(probe.stdout.toString("utf8")) as { root: string; leftovers: number };
+  const parsed = JSON.parse(probe.stdout.toString("utf8")) as { root: string; stopKillMode?: string; leftovers: number };
   assert.equal(parsed.root, sb.root);
+  assert.equal(parsed.stopKillMode, sb.env.INFINITE_EVAL_TEST_STOP_KILL_MODE);
   verifiedSandboxes.add(sb);
   return parsed.leftovers;
 }
@@ -233,18 +239,28 @@ test("test overrides are ignored under privilege escalation and reject invalid v
       const rejected = run(sb, ["probe", "--"], { env: { ...baseEnv, ...override } });
       assert.equal(rejected.status, 64, JSON.stringify(override));
     }
+    const envWithoutStopDirs = { ...sb.env, ...baseEnv, INFINITE_EVAL_TEST_STOP_KILL_MODE: "skip" };
+    delete envWithoutStopDirs.INFINITE_EVAL_TEST_STOP_DIRS;
+    assert.equal(spawnSync("/bin/sh", [LAUNCHER, "probe", "--"], { cwd: sb.dir, env: envWithoutStopDirs, timeout: 60_000 }).status, 64, "STOP_KILL_MODE=skip requires explicit STOP_DIRS");
+
+    const envWithoutSysv = { ...sb.env, ...baseEnv, INFINITE_EVAL_TEST_STOP_KILL_MODE: "skip" };
+    delete envWithoutSysv.INFINITE_EVAL_TEST_SYSVIPC_DIR;
+    assert.equal(spawnSync("/bin/sh", [LAUNCHER, "probe", "--"], { cwd: sb.dir, env: envWithoutSysv, timeout: 60_000 }).status, 64, "STOP_KILL_MODE=skip requires explicit SYSVIPC_DIR");
+
     assert.equal(run(sb, ["stop"]).status, 99, "STOP_KILL_MODE=refuse exits 99 when reached as matching account");
 
     const envWithoutKillMode = { ...sb.env, ...baseEnv };
     delete envWithoutKillMode.INFINITE_EVAL_TEST_STOP_KILL_MODE;
-    const sleeper = spawn("sleep", [String(randomInt(100_000, 900_000))], { stdio: "ignore" });
-    try {
-      const defaultStop = spawnSync("/bin/sh", [LAUNCHER, "stop"], { cwd: sb.dir, env: envWithoutKillMode, timeout: 60_000 });
-      assert.equal(defaultStop.status, 99, "omitting STOP_KILL_MODE under overrides must default to refuse, never kill");
-      assert.equal(sleeper.exitCode, null);
-      assert.equal(sleeper.signalCode, null);
-    } finally {
-      sleeper.kill("SIGKILL");
+    const omittedProbe = spawnSync("/bin/sh", [LAUNCHER, "probe", "--"], { cwd: sb.dir, env: envWithoutKillMode, timeout: 60_000 });
+    assert.equal(omittedProbe.status, 0, omittedProbe.stderr.toString("utf8"));
+    const omittedInfo = JSON.parse(omittedProbe.stdout.toString("utf8")) as { root?: string; stopKillMode?: string };
+    assert.equal(omittedInfo.root, sb.root);
+    assert.equal(omittedInfo.stopKillMode, "refuse", "omitting STOP_KILL_MODE under overrides must default to refuse, never kill");
+
+    const canUnshare = spawnSync("/usr/bin/unshare", ["-U", "--map-current-user", "-p", "--fork", "--kill-child", "/bin/true"], { timeout: 10_000 }).status === 0;
+    if (canUnshare) {
+      const isolatedStop = spawnSync("/usr/bin/unshare", ["-U", "--map-current-user", "-p", "--fork", "--kill-child", "/bin/sh", LAUNCHER, "stop"], { cwd: sb.dir, env: envWithoutKillMode, timeout: 60_000 });
+      assert.equal(isolatedStop.status, 99, "omitted STOP_KILL_MODE exits 99 inside isolated PID namespace");
     }
   } finally {
     cleanup(sb);

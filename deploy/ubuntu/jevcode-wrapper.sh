@@ -153,7 +153,6 @@ for arg in "$@"; do
         repo_path=$LAST_RESOLVED
         seen_repo=1
         ;;
-      log) require_inside_roots "$arg" "$WORKSPACES" "$TEAM_WORKSPACES" "$TMPDIR" ;;
       focus) record_focus "$arg" ;;
       token) check_token "$arg" ;;
       session) check_session "$arg" ;;
@@ -178,8 +177,7 @@ for arg in "$@"; do
       repo_path=$LAST_RESOLVED
       seen_repo=1
       ;;
-    --log) expect=log ;;
-    --log=*) require_inside_roots "${arg#--log=}" "$WORKSPACES" "$TEAM_WORKSPACES" "$TMPDIR" ;;
+    --log|--log=*) refuse '--log is not permitted; use --activity-stdin' ;;
     --focus) expect=focus ;;
     --focus=*) record_focus "${arg#--focus=}" ;;
     --trigger|--format|--runner) expect=token ;;
@@ -210,6 +208,7 @@ if [ "$seen_repo" -eq 0 ]; then
   require_inside_roots "$cwd" "$WORKSPACES" "$TEAM_WORKSPACES"
   repo_path=$LAST_RESOLVED
 fi
+focus_base=$repo_path
 if [ -e "$repo_path" ] && [ ! -d "$repo_path" ]; then
   refuse 'repository path must be a directory'
 fi
@@ -217,6 +216,9 @@ if [ -d "$repo_path" ]; then
   git_top=$(GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null /usr/bin/git -c 'safe.directory=*' -C "$repo_path" rev-parse --show-toplevel 2>/dev/null) || git_top=
   if [ -n "$git_top" ]; then
     require_inside_roots "$git_top" "$WORKSPACES" "$TEAM_WORKSPACES"
+    focus_base=$LAST_RESOLVED
+    git_dir=$(GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null /usr/bin/git -c 'safe.directory=*' -C "$repo_path" rev-parse --path-format=absolute --git-dir 2>/dev/null) || refuse 'cannot resolve git directory'
+    require_inside_roots "$git_dir" "$WORKSPACES" "$TEAM_WORKSPACES"
     git_common=$(GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null /usr/bin/git -c 'safe.directory=*' -C "$repo_path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || refuse 'cannot resolve git common directory'
     require_inside_roots "$git_common" "$WORKSPACES" "$TEAM_WORKSPACES"
   elif [ -e "$repo_path/.git" ] || [ -L "$repo_path/.git" ]; then
@@ -226,7 +228,7 @@ fi
 if [ -n "$PENDING_FOCUS" ]; then
   while IFS= read -r rel_focus; do
     [ -n "$rel_focus" ] || continue
-    require_inside_roots "$repo_path/$rel_focus" "$WORKSPACES" "$TEAM_WORKSPACES"
+    require_inside_roots "$focus_base/$rel_focus" "$WORKSPACES" "$TEAM_WORKSPACES"
   done <<EOF
 $PENDING_FOCUS
 EOF

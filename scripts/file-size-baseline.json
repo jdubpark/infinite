@@ -24,6 +24,6 @@
     "tests/missions.test.ts": 2574,
     "tests/outcome-store.test.ts": 1612,
     "tests/team-events.test.ts": 1779,
-    "tests/teams.test.ts": 3403
+    "tests/teams.test.ts": 3434
   }
 }

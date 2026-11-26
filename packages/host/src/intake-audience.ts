@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import type { CreateMission, Mission, MissionOrigin } from "./mission-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
+import type { IntakeRecord } from "./intake-types.js";
 import { normalizeRemote, readGit, type GitReader } from "./checkout-identity.js";
 import { TeamError } from "./team-workspace.js";
 import type { MissionService } from "./missions.js";
@@ -12,17 +14,65 @@ type AudienceDependencies = { config: AudienceConfig; groups: GroupReader; git?:
 
 const repositoryKey = (repository: string) => normalizeRemote(`https://github.com/${repository}.git`)?.key;
 
+export function slackAudienceIdentity(config: Pick<Config, "intake">): string | undefined {
+  const intake = config.intake, slack = intake?.slack, scope = slack?.organizationScope;
+  if (!slack) return undefined;
+  if (!scope?.workspaces?.length || !intake?.mission.groupId || !slack.teamId || !slack.ownerUserId) return undefined;
+  const workspaces = scope.workspaces.map(pin => ({
+    projectId: pin.projectId,
+    path: pin.path,
+    repository: pin.repository?.toLowerCase() ?? null,
+    rootCommit: pin.rootCommit?.toLowerCase() ?? null,
+  })).sort((a, b) => a.projectId.localeCompare(b.projectId));
+  if (new Set(workspaces.map(pin => pin.projectId)).size !== workspaces.length
+    || new Set(workspaces.map(pin => pin.path)).size !== workspaces.length) return undefined;
+  const canonical = {
+    teamId: slack.teamId,
+    ownerUserId: slack.ownerUserId,
+    groupId: intake.mission.groupId,
+    workspaces,
+    channelIds: scope.channelIds === undefined ? null : [...scope.channelIds].sort(),
+  };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+export function intakeRecordAudienceIdentityMatches(config: Pick<Config, "intake">, record: IntakeRecord): boolean {
+  if (!config.intake?.slack) return record.slackAudienceId === undefined && record.thread === undefined && record.direct === undefined;
+  if (record.external && !record.thread && !record.direct && record.slackAudienceId === undefined) return true;
+  const identity = slackAudienceIdentity(config);
+  return identity !== undefined && record.slackAudienceId === identity;
+}
+
+export function intakeRecordAudienceAllowed(config: Pick<Config, "intake">, record: IntakeRecord, mission?: Mission): boolean {
+  if (!intakeRecordAudienceIdentityMatches(config, record)) return false;
+  if (!config.intake?.slack || record.external && !record.thread && !record.direct && record.slackAudienceId === undefined) return true;
+  const pins = new Set(config.intake.slack.organizationScope.workspaces.map(pin => pin.projectId));
+  if (record.request && (record.request.groupId !== config.intake.mission.groupId
+    || record.request.checkouts?.some(projectId => !pins.has(projectId)))) return false;
+  if (record.missionId !== undefined) {
+    if (!mission || mission.id !== record.missionId || mission.groupId !== config.intake.mission.groupId
+      || mission.repoProjectIds.length === 0 || new Set(mission.repoProjectIds).size !== mission.repoProjectIds.length
+      || mission.repoProjectIds.some(projectId => !pins.has(projectId))) return false;
+    if (record.request && record.request.requestId !== mission.id) return false;
+  }
+  return true;
+}
+
 export function createIntakeAudienceGuard({ config, groups, git = readGit, realpath = realpathSync, sourceAppliedHead }: AudienceDependencies) {
-  const scope = config.intake?.slack?.organizationScope;
-  const configuredGroupId = config.intake?.mission.groupId;
+  const slackConfigured = config.intake?.slack !== undefined;
+  const organizationScope = () => config.intake?.slack?.organizationScope;
+  const configuredGroupId = () => config.intake?.mission.groupId;
 
   const workspacesAllowed = (): boolean => {
-    if (!scope) return true;
+    if (!slackConfigured) return true;
+    const scope = organizationScope();
+    if (!scope) return false;
     const pins = scope.workspaces;
-    if (!pins?.length || !configuredGroupId) return false;
+    const groupId = configuredGroupId();
+    if (!pins?.length || !groupId) return false;
     let group: ProjectGroup;
-    try { group = groups.get(configuredGroupId); } catch { return false; }
-    if (group.id !== configuredGroupId || group.hidden || group.repos.length === 0) return false;
+    try { group = groups.get(groupId); } catch { return false; }
+    if (group.id !== groupId || group.hidden || group.repos.length === 0) return false;
 
     const checkoutRows = group.repos.flatMap(repo => repo.checkouts.map(checkout => ({ repo, checkout })));
     if (checkoutRows.length === 0 || checkoutRows.length !== pins.length) return false;
@@ -85,13 +135,32 @@ export function createIntakeAudienceGuard({ config, groups, git = readGit, realp
     return true;
   };
 
+  const recordAllowedWith = (record: IntakeRecord, mission: Mission | undefined, allowed: () => boolean): boolean => {
+    if (!intakeRecordAudienceIdentityMatches(config, record)) return false;
+    if (!config.intake?.slack || record.external && !record.thread && !record.direct && record.slackAudienceId === undefined) return true;
+    return allowed() && intakeRecordAudienceAllowed(config, record, mission);
+  };
+
   return {
     workspacesAllowed,
     missionAllowed(request: CreateMission): boolean {
-      if (!scope) return true;
-      if (request.groupId !== configuredGroupId || !workspacesAllowed()) return false;
+      if (!slackConfigured) return true;
+      const scope = organizationScope();
+      if (!scope) return false;
+      if (request.groupId !== configuredGroupId() || !workspacesAllowed()) return false;
       const pins = new Set(scope.workspaces?.map(pin => pin.projectId) ?? []);
       return !request.checkouts?.some(projectId => !pins.has(projectId));
+    },
+    recordAllowed(record: IntakeRecord, mission?: Mission): boolean {
+      return recordAllowedWith(record, mission, workspacesAllowed);
+    },
+    snapshotRecordAllowed(): (record: IntakeRecord, mission?: Mission) => boolean {
+      let checked = false, snapshot = false;
+      const allowed = () => {
+        if (!checked) { snapshot = workspacesAllowed(); checked = true; }
+        return snapshot;
+      };
+      return (record, mission) => recordAllowedWith(record, mission, allowed);
     },
   };
 }
@@ -101,16 +170,16 @@ export function createIntakeMissionCreator({ config, missions, groups, audience,
   assertNoHandoff: (projectId: string) => void;
 }) {
   return async (body: CreateMission, origin?: MissionOrigin, authorize?: () => void): Promise<Mission> => {
-    authorize?.();
-    const recorded = missions.replayCreate(body);
-    if (recorded) return recorded;
-    const authorizeCreate = () => {
+    const authorizeRequest = () => {
       authorize?.();
-      if (origin?.kind === "intake" && config.intake?.slack?.organizationScope && !missions.replayCreate(body) && !audience.missionAllowed(body))
+      if (origin?.kind === "intake" && origin.source === undefined && config.intake?.slack && !audience.missionAllowed(body))
         throw new TeamError(403, "intake-audience-denied", "The intake mission is outside the configured Slack workspace audience.");
     };
+    authorizeRequest();
+    const recorded = missions.replayCreate(body);
+    if (recorded) return recorded;
     const group = groups.get(body.groupId);
     for (const repo of group.repos) for (const checkout of repo.checkouts) assertNoHandoff(checkout.projectId);
-    return missions.create({ ...body, groupId: group.id }, body, origin, authorizeCreate);
+    return missions.create({ ...body, groupId: group.id }, body, origin, authorizeRequest);
   };
 }

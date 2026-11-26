@@ -256,6 +256,7 @@ export function Brief({
                 provider={session.provider}
                 pickedLine={session.reading?.now?.text}
                 exitCode={session.exitCode}
+                outputTailIncomplete={session.outputTailIncomplete}
                 onOpenTerminal={openTerminal}
               />
             )}

@@ -21,7 +21,15 @@ infinite usage projects
 infinite usage project PROJECT_ID
 infinite usage goal GOAL_ID
 infinite usage models [--role implementer]
+infinite usage outcomes [--run ID | --goal ID | --mission ID]
+infinite usage repairs [--project ID] [--days N] [--json]
 infinite usage --json
+infinite cost [--json]
+infinite cost plan ACCOUNT USD
+infinite cost plan ACCOUNT reset
+infinite fuse [--json]
+infinite fuse close --host
+infinite fuse close --project PROJECT_ID
 infinite evidence status               # evidence store state, modules, sizes, and event count
 infinite evidence status --json
 infinite egress                        # hosts agents reached through the egress proxy, per project
@@ -41,7 +49,7 @@ infinite close SESSION_ID  # confirm before ending its provider process
 
 `close` requires an explicit session ID or unique prefix and an owner key. It shows the selected process and asks for confirmation; `--yes` confirms noninteractive use. Another client's active input lease blocks closing unless `--takeover` is explicitly supplied. A delivered receipt confirms the stop request reached the worker; check `list` for the resulting process status. An uncertain response is reported and never retried automatically. Closing ends the provider process; Ctrl+] only detaches the terminal client.
 
-`usage` prints the current and previous month, plan fees, account balances, and a 30-day bar chart in the local timezone. `projects`, `project`, `goal`, and `models` show the corresponding roll-up. Every form accepts `--json`; `models` accepts `--role ROLE`. Unpriced totals are marked `≥`. Balances are shown only when the provider returned one; otherwise the CLI prints `—`. Budgets are informational. See [Usage and budgets](teams.md#usage-and-budgets).
+`usage` prints the current and previous month, plan fees, account balances, and a 30-day bar chart in the local timezone. `projects`, `project`, `goal`, and `models` show the corresponding roll-up; `repairs` reports baseline repair-loop latency, measured token/USD medians (excluding unmeasured loops rather than zeroing them), and cold-replacement/failed-resume counts (`GET /api/usage/repair-loops`, accepting `--project` and `--days 1..366`). Every form accepts `--json`; `models` accepts `--role ROLE`. Unpriced totals are marked `≥`. Balances are shown only when the provider returned one; otherwise the CLI prints `—`. Budgets are informational. See [Usage and budgets](teams.md#usage-and-budgets).
 
 `evidence status` prints the state of the host's evidence store, the reason when it is unavailable, each module's state, the file and WAL sizes, and the event count. `--json` prints the host's full status. Any paired device can read it. See [Evidence store](architecture.md#evidence-store).
 
@@ -63,6 +71,12 @@ infinite understand create projects|features|plans --workspace WORKSPACE_ID --re
 infinite understand update projects|features|plans|components ENTITY_ID --workspace WORKSPACE_ID --revision N --request-id UUID --file INPUT.json
 infinite understand archive projects|features|plans ENTITY_ID --workspace WORKSPACE_ID --revision N --request-id UUID
 infinite understand policy --workspace WORKSPACE_ID --revision N --request-id UUID --file POLICY.json
+infinite understand behaviors --workspace WORKSPACE_ID [--json]
+infinite understand behavior BEHAVIOR_ID --workspace WORKSPACE_ID [--json]
+infinite understand behavior-suite BEHAVIOR_ID --workspace WORKSPACE_ID [--json]
+infinite understand behavior-save --workspace WORKSPACE_ID --revision N --request-id UUID --file DEFINITION.json [--json]
+infinite understand behavior-run BEHAVIOR_ID --workspace WORKSPACE_ID --revision N --request-id UUID [--json]
+infinite understand check --file definition.json [--json]
 ```
 
 With no workspace selector, `understand` lists visible workspaces using existing
@@ -102,6 +116,8 @@ infinite projects show PROJECT_ID
 infinite projects primary PROJECT_ID CHECKOUT_ID
 infinite start [--project PROJECT_ID] "task"
 infinite mission status MISSION_ID [--json]
+infinite mission progress MISSION_ID [--after CURSOR] [--json]
+infinite mission watch MISSION_ID [--json]
 infinite mission answer MISSION_ID DECISION_ID "text"
 infinite mission steer MISSION_ID "text"
 infinite mission pause|resume|cancel MISSION_ID
@@ -125,8 +141,12 @@ mission on that checkout. Mission controls read the
 current revision before submitting an action. `board` refreshes every two
 seconds in a terminal: use Up/Down to select a row, Tab to change the composer
 target, Enter to open the selected row or submit a mission, `a` to answer its
-open decision, and `q` or Ctrl+C to exit. Missions open their decision and
-subtask summary; team rows use `infinite team watch`.
+open decision, and `q` or Ctrl+C to exit. In an interactive terminal, opening a
+mission row launches `infinite mission watch` (non-TTY prints its decision and
+subtask summary); `infinite mission watch MISSION_ID [--json]` follows live
+mission progress (`GET /api/missions/:id/progress`) and linked subteam
+blackboard entries (`j`/`k` or `↑`/`↓` subtask, `e` entries, `Enter` detail,
+`f` follow, `q` quit). Team rows use `infinite team watch`.
 
 ## Project signals
 
@@ -172,6 +192,7 @@ Initialize a project from a clean Git checkout, then start and control teams fro
 infinite repo init [DIRECTORY] [--project PROJECT_ID] [--source github|laptop] [--teamwork PATH|none]
 infinite repo init --delivery pr --repository OWNER/REPO --base-branch main
 infinite repo refresh [--project PROJECT_ID]
+infinite repo link|unlink|links ...
 infinite repo init --check-json '[{"command":"make","args":["test"]}]'
 infinite repo init --linear-team TEAM_UUID --linear-project PROJECT_UUID
 infinite team start "Add a feature"
@@ -180,13 +201,14 @@ infinite team status
 infinite team status TEAM_ID
 infinite team status TEAM_ID --json
 infinite team status TEAM_ID --logs
-infinite team watch TEAM_ID
-infinite team watch TEAM_ID --logs
+infinite team watch TEAM_ID [--logs | --board]
 infinite team pull TEAM_ID [--json]
 infinite team steer TEAM_ID "Keep the change within the API package"
 infinite team answer TEAM_ID QUESTION_ID "Use the existing route"
 infinite team pause TEAM_ID
 infinite team resume TEAM_ID
+infinite team continue TEAM_ID ["direction"]
+infinite team revoke-routing TEAM_ID
 infinite team cancel TEAM_ID
 infinite team delete TEAM_ID [--json]
 infinite team entries TEAM_ID [--kind KIND] [--task TASK_ID] [--since SEQ] [--json]
@@ -194,16 +216,20 @@ infinite team entry TEAM_ID ENTRY_ID [--json]
 infinite team entry TEAM_ID ENTRY_ID withdraw [--json]
 ```
 
+Additional orchestration and evaluation command families follow the same paired owner CLI conventions (`--json` supported across read commands): `infinite goal ...`, `infinite routine ...`, `infinite autonomy ...`, `infinite routing ...`, `infinite eval ...`, `infinite duels ...`, `infinite permissions ...`, `infinite signal ...`, and `infinite halt ...`. See [Goals and agent teams](teams.md) and [docs/README.md](README.md) for full details.
+
 `team entries` lists a team's stored entries, one line each, with the next `--since` value when more remain. `team entry` prints one entry's head and its body as indented JSON. Entry text is data: the output escapes control characters, and nothing in it runs. `team entry ... withdraw` needs an owner device key. It withdraws one entry, so members stop listing and getting it while the owner still reads its body. The command says whether the entry changed, or was already withdrawn.
 
 `infinite team status` without an ID lists each team. `infinite team status TEAM_ID`
 prints that team's open decisions and Jevcode summary. `infinite team watch
-TEAM_ID` keeps it full screen: `l` opens one agent's review log, `←` `→` or
-`n` `p` change agents, `s` or `b` returns to the summary, `↑` `↓`, `j` `k`,
-Space, and Page Up or Down scroll, `a` asks Jevcode when the summary is empty or
-failed, and `q` or Ctrl+C detaches. The bottom line always lists the keys for
-the current view. A non-interactive watch prints again only when the visible
-text changes. `--logs` starts in the review log, and
+TEAM_ID` keeps it full screen: `b` opens the blackboard entry board (`↑`/`↓`
+entry, `Enter` detail, `p` kind filter, `f` follow, `o` member logs), `l` opens
+one agent's review log, `←` `→` or `n` `p` change agents in log view, `s`
+returns to the summary, `↑` `↓`, `j` `k`, Space, and Page Up or Down scroll,
+`a` asks Jevcode when the summary is empty or failed, and `q` or Ctrl+C detaches.
+The bottom line always lists the keys for the current view. A non-interactive
+watch prints again only when the visible text changes. `--logs` starts in the
+review log, `--board` starts in the blackboard entry view, and
 `infinite team status TEAM_ID --logs` prints the current revision's logs once.
 `team delete` removes a settled cancelled, merged, or no-change run and its
 workspace. Repeating the command after removal prints `already removed` and
@@ -271,7 +297,7 @@ Ordinary provider launches from an enrolled directory also use its saved project
 
 Team mutations save a private request receipt before sending and do not retry an uncertain request. Supply `--request-id UUID` only when deliberately resuming the same request. `status` and `watch` show the host's workspace, branch, Linear URL, and pending questions. Ctrl+C detaches from `watch`; it does not stop the team.
 
-For terminal sessions, `resume` attaches to the existing OS process. It does not invoke the provider's resume command, fork a conversation, or submit the initial request again. An exited process remains available as a recording through `monitor`; restarting it requires explicit native-provider recovery. For example, `infinite codex resume NATIVE_ID` passes that native command through and creates a new Infinite recording. Use `infinite resume INFINITE_ID` while the existing process is alive.
+For terminal sessions, `resume` attaches to the existing OS process. It does not invoke the provider's resume command, fork a conversation, or submit the initial request again. An exited process remains available as a recording through `monitor`; continuing a confirmed exited session uses explicit host resumption (`POST /api/sessions/:id/resume` or Resume in the web/mobile/Mac clients), which creates a new runtime and recording without resending the initial prompt. Fresh CLI launches refuse provider-native resume flags (`codex resume`, Claude `-c`/`-r`/`--resume`/`--fork-session`, Grok `-c`/`-r`, OpenCode `-c`/`-s`) with HTTP 400 (`assertFreshNativeContext`) so a new recording never splices into an unrecorded conversation. Use `infinite resume INFINITE_ID` while the existing process is alive.
 
 ## The app's cmux workspaces from a terminal
 

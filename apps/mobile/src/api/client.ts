@@ -167,6 +167,7 @@ export type SessionRow = {
   createdAt: string;
   pid?: number;
   exitCode?: number;
+  outputTailIncomplete?: true;
   seq: number;
   attention: Attention;
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1 };
@@ -308,3 +309,130 @@ export type GoalVerdictView = {
   evaluator?: { profileId: string; family: string; sharedFamily: boolean; alsoReviewed: boolean };
   detail: "available" | "expired";
 };
+
+export const TEAM_ENTRY_KINDS = ["contract", "finding", "blocker", "handoff", "report", "integration", "check", "direction"] as const;
+export type TeamEntryKind = (typeof TEAM_ENTRY_KINDS)[number];
+export type TeamEntryAuthority = "receipt" | "claim" | "direction";
+export type TeamEntryState = "active" | "superseded" | "withdrawn";
+export type TeamEntryAuthorKind = "host" | "member" | "owner";
+export type TeamEntryHead = {
+  entryId: string;
+  seq: number;
+  scope?: "run" | "mission";
+  runId?: string;
+  revision: number;
+  at: string;
+  kind: TeamEntryKind;
+  author: TeamEntryAuthorKind;
+  authority: TeamEntryAuthority;
+  authorRole?: TeamRole | "mission-coordinator";
+  authorMemberId?: string;
+  taskId?: string;
+  supersedes?: string;
+  headCommit?: string;
+  paths?: string[];
+  subtaskIds?: string[];
+  unreadRequired?: string[];
+  summary: string;
+  bodyBytes: number;
+  state: TeamEntryState;
+};
+export type TeamEntryPage = { entries: TeamEntryHead[]; cursor: number; more: boolean };
+export type TeamEntryDetail = { head: TeamEntryHead; body: unknown };
+export type TeamEntryQuery = { kinds?: TeamEntryKind[]; taskId?: string; since?: number; limit?: number };
+
+export type MissionProgressWorkerStatus = "starting" | "running" | "exited" | "unavailable" | "recording-error" | "unknown" | "mismatched" | "not-sampled";
+export type MissionProgressMember = {
+  runId: string;
+  memberId: string;
+  sessionId: string;
+  revision: number;
+  role: TeamRole;
+  taskId?: string;
+  recordedStatus: "queued" | "running" | "waiting" | "reported" | "stopped" | "unavailable";
+  exitConfirmedAt?: string;
+  workerStatus: MissionProgressWorkerStatus;
+};
+export type MissionProgressCheck = {
+  revision: number;
+  round?: number;
+  headCommit?: string;
+  status: "running" | "passed" | "failed" | "interrupted";
+  startedAt: string;
+  finishedAt?: string;
+  exitCode?: number | null;
+};
+export type MissionProgressLinkedChild = {
+  kind: "linked";
+  runId: string;
+  missionId: string;
+  projectId: string;
+  revision: number;
+  status: TeamStatus;
+  assignments: MissionProgressMember[];
+  checks: MissionProgressCheck[];
+  assignmentsTruncated?: true;
+  checksTruncated?: true;
+};
+export type MissionProgressChild = { kind: "not-created" } | { kind: "missing" } | { kind: "mismatched" } | MissionProgressLinkedChild;
+export type MissionProgressSnapshot = {
+  mission: {
+    id: string;
+    title: string;
+    status: MissionStatus;
+    revision: number;
+    coordinator?: {
+      runId: string;
+      memberId: string;
+      sessionId: string;
+      revision: number;
+      role: "mission-coordinator";
+      recordedStatus: "queued" | "running" | "reported" | "stopped";
+      workerStatus: MissionProgressWorkerStatus;
+    };
+  };
+  subtasks: {
+    id: string;
+    title: string;
+    repoProjectId: string;
+    status: MissionSubtask["status"];
+    replacesSubtaskId?: string;
+    child: MissionProgressChild;
+  }[];
+  subtasksTruncated?: true;
+};
+export type MissionProgressObservation = {
+  cursor: string;
+  sequence: number;
+  observedAt: string;
+  snapshot: MissionProgressSnapshot;
+};
+export type MissionProgressResyncReason = "initial" | "invalid-cursor" | "host-restarted" | "mission-mismatch" | "history-evicted" | "retention-gap" | "cursor-ahead";
+export type MissionProgressPage = {
+  missionId: string;
+  generation: string;
+  cursor: string;
+  observedAt: string;
+  resync: { required: false } | { required: true; reason: MissionProgressResyncReason };
+  observations: MissionProgressObservation[];
+  snapshot: MissionProgressSnapshot;
+};
+
+export function listTeamEntries(connection: Connection, teamId: string, query: TeamEntryQuery = {}): Promise<TeamEntryPage> {
+  const params = new URLSearchParams();
+  if (query.kinds) for (const kind of query.kinds) params.append("kind", kind);
+  if (query.taskId) params.set("task", query.taskId);
+  if (query.since !== undefined) params.set("since", String(query.since));
+  if (query.limit !== undefined) params.set("limit", String(query.limit));
+  const suffix = params.toString();
+  return api<TeamEntryPage>(connection, `/teams/${teamId}/entries${suffix ? `?${suffix}` : ""}`);
+}
+
+export function getTeamEntry(connection: Connection, teamId: string, entryId: string): Promise<TeamEntryDetail> {
+  return api<TeamEntryDetail>(connection, `/teams/${teamId}/entries/${entryId}`);
+}
+
+export function getMissionProgress(connection: Connection, missionId: string, cursor?: string): Promise<MissionProgressPage> {
+  const suffix = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  return api<MissionProgressPage>(connection, `/missions/${missionId}/progress${suffix}`);
+}

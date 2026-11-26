@@ -3,7 +3,7 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, readFil
 import { connect } from "node:net";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
-import { learningPurpose, type Config, type SessionPurpose } from "./types.js";
+import type { Config, ExecutionIdentity } from "./types.js";
 
 const CREDENTIAL_CONTEXT = "infinite-egress/v1";
 export const SESSION_CREDENTIAL_SECONDS = 30 * 24 * 60 * 60;
@@ -108,8 +108,8 @@ export function egressUncredentialedEnvironment(proxyUrl: string): Record<string
   return proxyEnvironment(value);
 }
 
-export function sessionEgressIdentity(projectId: string | undefined, sessionId: string, purpose?: SessionPurpose): EgressIdentity {
-  if (learningPurpose(purpose)) return { project: EVAL_EGRESS_PROJECT, session: sessionId };
+export function sessionEgressIdentity(projectId: string | undefined, sessionId: string, executionIdentity: ExecutionIdentity = "production"): EgressIdentity {
+  if (executionIdentity === "eval") return { project: EVAL_EGRESS_PROJECT, session: sessionId };
   return { project: projectId && PROJECT_ID.test(projectId) ? projectId : "_none", session: sessionId };
 }
 
@@ -149,7 +149,7 @@ export function agentModelClientEnvironment(base: NodeJS.ProcessEnv = process.en
   return env;
 }
 
-export function workerEgressEnvironment(projectId: string | undefined, sessionId: string, env: NodeJS.ProcessEnv = process.env, nowMs = Date.now(), purpose?: SessionPurpose):
+export function workerEgressEnvironment(projectId: string | undefined, sessionId: string, env: NodeJS.ProcessEnv = process.env, nowMs = Date.now(), executionIdentity: ExecutionIdentity = "production"):
   { status: "off" | "on" | "no-key" | "invalid"; env: Record<string, string> } {
   const proxyUrl = env[WORKER_PROXY_URL], keyPath = env[WORKER_KEY_FILE];
   if (proxyUrl === undefined && keyPath === undefined) return { status: "off", env: {} };
@@ -158,7 +158,7 @@ export function workerEgressEnvironment(projectId: string | undefined, sessionId
   if (!keyPath || !isAbsolute(keyPath)) return refused;
   let key: Buffer;
   try { key = readEgressKey(keyPath); } catch { return refused; }
-  return { status: "on", env: egressProxyEnvironment(proxyUrl, key, sessionEgressIdentity(projectId, sessionId, purpose), SESSION_CREDENTIAL_SECONDS, nowMs) };
+  return { status: "on", env: egressProxyEnvironment(proxyUrl, key, sessionEgressIdentity(projectId, sessionId, executionIdentity), SESSION_CREDENTIAL_SECONDS, nowMs) };
 }
 
 export function evalProxyUrl(project: "_eval" | "_eval-setup", session: string, lifetimeSeconds: number, nowMs = Date.now()): string | undefined {

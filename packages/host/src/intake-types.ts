@@ -38,10 +38,10 @@ export const intakeConfigSchema = z.object({
           context.addIssue({ code: "custom", path: ["rootCommit"], message: "Local-only workspaces must pin their Git root commit" });
         if (workspace.repository !== null && workspace.rootCommit !== undefined)
           context.addIssue({ code: "custom", path: ["rootCommit"], message: "GitHub workspaces must not set rootCommit" });
-      })).max(64)
+      })).min(1, "organizationScope.workspaces must pin at least one workspace").max(64)
         .refine(workspaces => new Set(workspaces.map(value => value.projectId)).size === workspaces.length, "organizationScope.workspaces projectIds must be unique")
-        .refine(workspaces => new Set(workspaces.map(value => value.path)).size === workspaces.length, "organizationScope.workspaces paths must be unique").optional(),
-    }).strict().optional(),
+        .refine(workspaces => new Set(workspaces.map(value => value.path)).size === workspaces.length, "organizationScope.workspaces paths must be unique"),
+    }).strict(),
     classify: z.boolean().default(false),
     endpoint: z.url().optional(),
   }).strict().optional(),
@@ -57,7 +57,7 @@ export const intakeConfigSchema = z.object({
 export type IntakeConfig = z.infer<typeof intakeConfigSchema>;
 export interface SlackOrganizationScope {
   channelIds?: string[];
-  workspaces?: { projectId: string; path: string; repository: string | null; rootCommit?: string }[];
+  workspaces: { projectId: string; path: string; repository: string | null; rootCommit?: string }[];
 }
 
 export type IntakeState = "queued" | "started" | "finished" | "skipped";
@@ -113,6 +113,7 @@ interface IntakeRecordBase {
   issueId: string;
   identifier: string;
   url: string;
+  slackAudienceId?: string;
   title: string;
   description: string;
   issueCreatedAt: string;

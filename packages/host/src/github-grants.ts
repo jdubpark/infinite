@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
 import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
-import type { Config, Project } from "./types.js";
+import type { Config, ExecutionIdentity, Project } from "./types.js";
 import type { TeamAssignment, TeamDelivery } from "./team-types.js";
 
 export const GITHUB_GRANT_VERSION = "v2";
@@ -130,7 +130,8 @@ export function sessionGithubScope(context: GithubSessionContext): GithubGrantSc
 
 export type SessionGithubOrigin = { team: GithubGrantScope | undefined } | "owner-started";
 
-export function sessionGithubScopeFor(input: { team: boolean; origin: SessionGithubOrigin | undefined; repository: string | undefined }): GithubGrantScope | undefined {
+export function sessionGithubScopeFor(input: { team: boolean; origin: SessionGithubOrigin | undefined; repository: string | undefined; executionIdentity?: ExecutionIdentity }): GithubGrantScope | undefined {
+  if (input.executionIdentity === "eval") return undefined;
   if (input.team) return typeof input.origin === "object" ? input.origin.team : undefined;
   return sessionGithubScope({ kind: input.origin === "owner-started" ? "owner" : "unattributed", repository: input.repository });
 }

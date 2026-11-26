@@ -33,12 +33,14 @@ const emptyToken = join(root, "slack-empty-token");
 writeFileSync(emptyToken, "\n");
 chmodSync(emptyToken, 0o600);
 
+const defaultWorkspace = { projectId: "work-repo", path: join(root, "work-repo"), repository: "Example/work-repo" };
 const slack = {
   appTokenFile,
   botTokenFile,
   teamId: "T00000000",
   ownerUserId: "U00000000",
   linearAgentUserId: "U11111111",
+  organizationScope: { workspaces: [defaultWorkspace] },
 };
 const base = {
   linear: { teamIds: [TEAM], creatorId: OWNER, label: "infinite" },
@@ -108,18 +110,19 @@ test("request channels are optional, bounded unique Slack channel IDs and requir
   const tooManyChannels = Array.from({ length: 21 }, (_, index) => `C${String(index).padStart(3, "0")}`);
   assert.throws(() => parsed({ slack: { ...slack, requestChannelIds: tooManyChannels } }));
 });
-test("organization source scope is opt-in with an optional unique channel grant", () => {
-  assert.equal(parsed({}).intake!.slack!.organizationScope, undefined);
-  assert.deepEqual(parsed({ slack: { ...slack, organizationScope: {} } }).intake!.slack!.organizationScope, {});
-  assert.deepEqual(parsed({ slack: { ...slack, organizationScope: { channelIds: [] } } }).intake!.slack!.organizationScope?.channelIds, []);
-  assert.deepEqual(parsed({ slack: { ...slack, organizationScope: { channelIds: ["C123", "G456"] } } }).intake!.slack!.organizationScope?.channelIds, ["C123", "G456"]);
-  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { channelIds: ["C123", "C123"] } } }), /unique/);
-  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { channelIds: ["U123"] } } }));
-  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { channelIds: ["C123"], unexpected: true } } }));
+test("Slack requires a nonempty workspace audience and keeps channel IDs optional", () => {
+  assert.throws(() => parsed({ slack: { ...slack, organizationScope: undefined } }), /organizationScope|workspaces/);
+  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { workspaces: [] } } }), /workspaces/);
+  assert.deepEqual(parsed({}).intake!.slack!.organizationScope!.workspaces, [defaultWorkspace]);
+  assert.equal(parsed({}).intake!.slack!.organizationScope!.channelIds, undefined);
+  assert.deepEqual(parsed({ slack: { ...slack, organizationScope: { workspaces: [defaultWorkspace], channelIds: [] } } }).intake!.slack!.organizationScope!.channelIds, []);
+  assert.deepEqual(parsed({ slack: { ...slack, organizationScope: { workspaces: [defaultWorkspace], channelIds: ["C123", "G456"] } } }).intake!.slack!.organizationScope!.channelIds, ["C123", "G456"]);
+  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { workspaces: [defaultWorkspace], channelIds: ["C123", "C123"] } } }), /unique/);
+  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { workspaces: [defaultWorkspace], channelIds: ["U123"] } } }));
+  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { workspaces: [defaultWorkspace], channelIds: ["C123"], unexpected: true } } }));
 });
 test("organization workspace pins require canonical paths and unique validated repository bindings", () => {
   const workspace = { projectId: "work-repo", path: "/srv/work/work-repo", repository: "Example/work-repo" };
-  assert.equal(parsed({}).intake!.slack!.organizationScope?.workspaces, undefined);
   assert.deepEqual(parsed({ slack: { ...slack, organizationScope: { workspaces: [workspace] } } }).intake!.slack!.organizationScope?.workspaces, [workspace]);
   const localWorkspace = { ...workspace, repository: null, rootCommit: "a".repeat(40) };
   assert.doesNotThrow(() => parsed({ slack: { ...slack, organizationScope: { workspaces: [localWorkspace] } } }));
@@ -171,6 +174,27 @@ test("a loopback Slack endpoint is local-only", () => {
     assert.throws(() => validate({ slack: { ...slack, endpoint } }, { environment: "local" }), /official HTTPS endpoint/, endpoint);
 });
 test("the answer repository is a configured project", () => assert.throws(() => validate({ mission: { groupId: "work", answerProjectId: "missing" } }), /answerProjectId/));
+test("intake rejects non-Claude or non-strong mission coordinators at config parse time while allowing standalone Codex team lineups", () => {
+  const claudeStrong = { id: "lead", label: "Lead", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" };
+  const codexStrong = { id: "codex-lead", label: "Codex lead", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" };
+  const opencodeStrong = { id: "oc-lead", label: "OpenCode lead", provider: "opencode", model: "vendor/strong", variant: "high", tier: "strong" };
+  const implementer = { id: "light", label: "Light", provider: "codex", model: "gpt-6-luna", effort: "high", tier: "light" };
+  const claudeLight = { ...claudeStrong, id: "lead-light", tier: "light" };
+  const teamsWith = (coordinator: Record<string, unknown>, reviewer: Record<string, unknown> = claudeStrong) => ({
+    workspaceDir: join(root, "teams"),
+    lineup: { coordinator, integrator: claudeStrong, reviewer, implementers: [implementer] },
+  });
+
+  assert.doesNotThrow(() => parsed({}, { teams: teamsWith(claudeStrong) }));
+  assert.throws(() => parsed({}, { teams: teamsWith(codexStrong) }), /Mission coordinators require Claude Code; Codex merges inherited MCP server tables/);
+  assert.throws(() => parsed({}, { teams: teamsWith(opencodeStrong) }), /Mission coordinators require Claude Code/);
+  assert.throws(() => parsed({}, { teams: teamsWith(claudeLight) }), /mission coordinator must be a strong profile/);
+  assert.throws(() => parsed({}, { teams: teamsWith(claudeStrong, claudeLight) }), /mission reviewer must be a strong profile/);
+
+  const standaloneFile = join(root, `config-${++counter}.json`);
+  writeFileSync(standaloneFile, JSON.stringify({ ...baseHost, teams: teamsWith(codexStrong) }));
+  assert.equal(readConfig(standaloneFile).config.teams?.lineup?.coordinator.provider, "codex");
+});
 test("hostLoad accepts the spec default and rejects a zero load ceiling", () => {
   assert.deepEqual(parsed({}, { hostLoad: { minAvailableMemoryGiB: 8, maxLoadPerCpu: 1.5 } }).hostLoad, { minAvailableMemoryGiB: 8, maxLoadPerCpu: 1.5 });
   assert.throws(() => parsed({}, { hostLoad: { minAvailableMemoryGiB: 8, maxLoadPerCpu: 0 } }));

@@ -13,11 +13,14 @@ import type { MissionService } from "../packages/host/src/missions.js";
 import type { TeamService } from "../packages/host/src/teams.js";
 import type { Config } from "../packages/host/src/types.js";
 import { waitFor } from "./helpers.js";
-import { startSlackServer } from "./fixtures/slack-server.js";
+import { startSlackServer, testIntakeAudience } from "./fixtures/slack-server.js";
+import { slackAudienceIdentity } from "../packages/host/src/intake-audience.js";
 
 const delay = (ms: number) => new Promise(done => setTimeout(done, ms));
 const OWNER = "U00000000";
 const BINDING: IntakeThread = { channelId: "C0000000000", threadTs: "1700000000.000100" };
+const PROJECT_PATH = "/data/instances/work/api";
+const TEST_SCOPE = { workspaces: [{ projectId: "api", path: PROJECT_PATH, repository: "Example/api" }] };
 const ACK = 'Started on TEST-1 "Export fails on empty rows". I\'ll post questions and the result here.\nReply with a mention to answer or steer.';
 
 let sequence = 0;
@@ -31,7 +34,7 @@ test("an uncertain failed question message reconciles on matching button click a
   const decision: { id: string; memberId: string; revision: number; question: string; options: string[]; answerMode: "single"; createdAt: string; answer?: string } = {
     id: randomUUID(), memberId: randomUUID(), revision: 1, question: "Skip empty rows?", options: ["Skip", "Write blanks"], answerMode: "single", createdAt: now,
   };
-  const mission = { id: randomUUID(), revision: 1, status: "needs-input", decisions: [decision], subtasks: [], events: [] } as unknown as Mission;
+  const mission = { id: randomUUID(), groupId: "shop", repoProjectIds: ["api"], revision: 1, status: "needs-input", decisions: [decision], subtasks: [], events: [] } as unknown as Mission;
   const listeners = new Set<(value: Mission) => void>();
   let answers = 0;
   const missions = {
@@ -47,21 +50,23 @@ test("an uncertain failed question message reconciles on matching button click a
   } as unknown as MissionService;
   const teams = { get: () => { throw new Error("unused"); } } as unknown as TeamService;
   slack.seedThread(BINDING, [{ user: OWNER, text: "Export fails on empty rows" }]);
-  const client = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint, timeoutMs: 2000 });
+  const client = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint, timeoutMs: 2000,
+    teamId: slack.teamId, organizationScope: TEST_SCOPE, workspaceAllowed: () => true });
   const config = {
     stateDir: join(root, "intake"),
     runDir: join(root, "run"),
-    projects: [{ id: "api", name: "API", path: "/data/instances/work/api" }],
+    projects: [{ id: "api", name: "API", path: PROJECT_PATH }],
     intake: {
       linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
-      slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER, bindByMention: false, endpoint: slack.endpoint },
+      slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER, bindByMention: false,
+        endpoint: slack.endpoint, organizationScope: TEST_SCOPE },
       mission: { groupId: "shop", maxSubtasks: 8, maxMinutes: 30 },
       maxActive: 3,
       requireSlackThread: true,
     },
   } as unknown as Config;
   const store = new IntakeStore({ stateDir: join(root, "intake") } as Config, randomBytes(32));
-  const surface = new IntakeSlackSurface(config, store, missions, teams, client, { log: () => {} });
+  const surface = new IntakeSlackSurface(config, store, missions, teams, client, { log: () => {}, audience: testIntakeAudience(config) });
   try {
     const questionKey = `q:${decision.id}`;
     const blockId = `infinite-decision:${issueId}:${decision.id}`;
@@ -71,6 +76,7 @@ test("an uncertain failed question message reconciles on matching button click a
       issueId,
       identifier: "TEST-1",
       url: "https://linear.example.invalid/issue/TEST-1",
+      slackAudienceId: slackAudienceIdentity(config)!,
       title: "Export fails on empty rows",
       description: "Rows with no values fail the export.",
       issueCreatedAt: now,

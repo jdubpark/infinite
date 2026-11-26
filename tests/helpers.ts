@@ -31,6 +31,11 @@ export async function moveWorkerClock(worker: ChildProcess, file: string, ms: nu
   await waitFor(async () => readFileSync(file, "utf8"), text => text === `moved ${ms}`);
 }
 
+export async function settleAll(work: readonly Promise<unknown>[]) {
+  const failure = (await Promise.allSettled(work)).find(result => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
+}
+
 export function processes(): { pid: number; parent: number; command: string }[] {
   return execFileSync("ps", ["-ww", "-eo", "pid=,ppid=,args="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).split("\n").flatMap(line => {
     const row = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
@@ -145,8 +150,8 @@ export async function endSessionWorkers(config: Config, started?: readonly numbe
 
 export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
   const root = mkdtempSync(join(tmpdir(), "inf-"));
-  const port = await freePort();
-  const origin = `http://127.0.0.1:${port}`;
+  const initialPort = options.config?.port ?? await freePort();
+  let listenerOrigin = `http://127.0.0.1:${initialPort}`;
   const tokens: Record<Role, string> = {
     owner: randomBytes(32).toString("base64url"),
     controller: randomBytes(32).toString("base64url"),
@@ -157,8 +162,8 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
   const keyFile = join(root, "key");
   writeFileSync(keyFile, randomBytes(32), { mode: 0o600 });
   const config: Config = {
-    port,
-    origin,
+    port: initialPort,
+    origin: listenerOrigin,
     keyFile,
     stateDir: join(root, "state"),
     runDir: join(root, "run"),
@@ -170,11 +175,21 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     agents: options.agents ?? { demo: demoProfile() },
     ...options.config,
   };
+  const syncConfigOrigin = options.config?.origin === undefined || options.config.origin === listenerOrigin;
   const configFile = join(root, "config.json");
   writeFileSync(configFile, JSON.stringify(config));
   let child: ChildProcess | undefined;
 
-  const fetchApi = apiClient(origin, tokens);
+  let client = apiClient(listenerOrigin, tokens);
+  const fetchApi: Host["fetchApi"] = (...args) => client(...args);
+  const bindPort = (nextPort: number) => {
+    const previousListener = listenerOrigin;
+    config.port = nextPort;
+    listenerOrigin = `http://127.0.0.1:${nextPort}`;
+    if (syncConfigOrigin || config.origin === previousListener) config.origin = listenerOrigin;
+    writeFileSync(configFile, JSON.stringify(config));
+    client = apiClient(listenerOrigin, tokens);
+  };
   const stopApi = async () => {
     const api = child;
     if (!api || api.exitCode !== null || api.signalCode !== null) return;
@@ -190,20 +205,30 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     });
     child = api;
     let diagnostics = "";
+    const stderrDone = new Promise<void>((resolveStderr) => {
+      api.stderr!.once("end", resolveStderr);
+      api.stderr!.once("close", resolveStderr);
+    });
     api.stderr!.on("data", (chunk) => {
       diagnostics += chunk;
     });
     await waitFor(
       async () => {
+        let status = 0;
         try {
-          return (await fetchApi("/me")).status;
+          status = (await fetchApi("/me")).status;
         } catch {
-          if (api.exitCode !== null) throw new Error(diagnostics);
-          return 0;
+          status = 0;
         }
+        if (status === 200) return 200;
+        if (api.exitCode !== null || api.signalCode !== null) {
+          await Promise.race([stderrDone, new Promise((resolveTimeout) => setTimeout(resolveTimeout, 1000))]);
+          throw new Error(diagnostics || `Host exited before listening (${api.signalCode ?? api.exitCode})`);
+        }
+        return status;
       },
       (status) => status === 200,
-      20000,
+      45000,
     );
   };
   const stop = async () => {
@@ -223,13 +248,23 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     }
   };
 
+  const canRebind = options.config?.port === undefined;
   try {
-    await start();
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await start();
+        break;
+      } catch (error) {
+        if (!canRebind || attempt >= 4 || !/EADDRINUSE/.test(String(error))) throw error;
+        await stopApi();
+        bindPort(await freePort());
+      }
+    }
   } catch (error) {
     await stop();
     throw error;
   }
-  return { origin, root, config, tokens, fetchApi, start, stopApi, stop };
+  return { origin: listenerOrigin, root, config, tokens, fetchApi, start, stopApi, stop };
 }
 
 export async function claimControl(

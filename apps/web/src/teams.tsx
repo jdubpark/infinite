@@ -10,14 +10,18 @@ import { requestStore } from "./requests";
 import { LinearTracking } from "./linear";
 import { DictationNotice, MicButton, useDictation } from "./dictation";
 import { Decision } from "./team-decision";
+import { TeamOverview } from "./team-inspector/TeamOverview";
+import { TeamEvidenceBoard } from "./team-inspector/TeamEvidenceBoard";
+import { buildTeamEntryHash, parseTeamEntryHash } from "./team-inspector/model";
+import type { TeamAcceptanceEvidence, TeamCriterionRefs, TeamGoalRecord, TeamRunAssessment, TeamWaitReason } from "./team-inspector/types";
 
 type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 type TeamRole = "project-manager" | "intent-checker" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery" | "evaluator";
 type TeamCommand = { command: string; args: string[] };
-export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; limitations?: string[]; agentProfileId?: string; escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string }; limitSwitches?: LimitSwitch[]; usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric };
-type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; headCommit: string; tasks: TeamTask[]; review?: TeamView["review"]; brief?: TeamBrief };
+export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; revision?: number; memberId?: string; commit?: string; summary?: string; limitations?: string[]; agentProfileId?: string; criterionRefs?: TeamCriterionRefs; changedPaths?: { paths: string[]; truncated: boolean }; reviewRounds?: number; escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string }; limitSwitches?: LimitSwitch[]; usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric };
+type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; baseCommit?: string; headCommit: string; tasks: TeamTask[]; review?: TeamView["review"]; brief?: TeamBrief };
 type TeamScout = { id: string; title: string; instructions: string; agentProfileId: string; status: "pending" | "running" | "waiting" | "complete"; memberId?: string; summary?: string; evidence?: TeamEvidence[] };
-type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; cwd: string; baseCommit: string; provider?: string; modelProfile?: TeamModelProfile; usage?: UsageTotals; stoppedReason?: string };
+export type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; cwd: string; baseCommit: string; provider?: string; modelProfile?: TeamModelProfile; usage?: UsageTotals; stoppedReason?: string; startedAt?: string; reportedAt?: string; lastActivityAt?: string; spinnerOnlySince?: string; pendingLimit?: boolean; stalledAt?: string };
 
 export function directionSourceLabel(source: { kind: string; name: string } | string | undefined): string {
   if (typeof source === "object") return source.kind === "github-review" ? "Owner (GitHub review)" : source.name;
@@ -29,9 +33,9 @@ export type TeamView = {
   id: string; projectId: string; provider: string; title: string; objective: string; parallelism: number;
   revision: number; status: TeamStatus; createdAt: string; updatedAt: string; lastActivityAt?: string; workspace: string;
   branch: string; baseCommit: string; headCommit?: string; tasks: TeamTask[]; members: TeamMember[];
-  decisions: TeamDecision[]; checks: { command: TeamCommand; status: "running" | "passed" | "failed" | "interrupted"; startedAt: string; finishedAt?: string; exitCode?: number | null; output: string; revision: number }[];
+  decisions: TeamDecision[]; checks: { command: TeamCommand; phase?: "setup"; headCommit?: string; round?: number; status: "running" | "passed" | "failed" | "interrupted"; startedAt: string; finishedAt?: string; exitCode?: number | null; output: string; revision: number }[];
   steering: { text: string; revision: number; at: string; source?: { kind: "connector" | "github-review"; id: string; name: string } | "coordinator" | "slack" }[]; events: { at: string; text: string }[];
-  reason?: string; review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string }; round: number;
+  reason?: string; review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string; acceptance?: TeamAcceptanceEvidence[] }; round: number;
   deliveryReceipt?: { pullRequestUrl: string; headCommit: string; mergeCommit: string; summary: string };
   pullRequest?: { revision: number; headCommit: string; pullRequestUrl: string; summary: string; reportedAt: string };
   lineup?: TeamLineup;
@@ -39,7 +43,8 @@ export type TeamView = {
   usage?: TeamUsage;
   linear?: LinearTrackingView;
   missionId?: string;
-  goal?: { id: string; revision: number; cycle: number; successCriteria: string; nonGoals: string[]; allowedPaths: string[]; evidence: string[]; previousWork: string[]; deadlineAt: string; maxMembers: number; parentRunId?: string };
+  goal?: { id: string; revision: number; cycle: number; successCriteria: string; nonGoals: string[]; allowedPaths: string[]; evidence: string[]; previousWork: string[]; deadlineAt: string; maxMembers: number; parentRunId?: string; record?: TeamGoalRecord };
+  assessment?: TeamRunAssessment;
   brief?: TeamBrief;
   discovery?: { revision: number; summary: string; tasks: TeamScout[]; completedAt?: string };
   noChange?: { summary: string; evidence: TeamEvidence[] };
@@ -48,10 +53,11 @@ export type TeamView = {
   continuable?: boolean;
   continuations?: TeamContinuation[];
   workers?: { limit: number; max: number; running: number; ready: number };
+  waitReasons?: TeamWaitReason[];
 };
 export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "revision" | "status" | "createdAt" | "updatedAt" | "lastActivityAt"
-  | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "missionId" | "resumable" | "continuable" | "workers"> & {
-  members: (Omit<TeamMember, "cwd" | "baseCommit" | "modelProfile" | "usage"> & { startedAt?: string; reportedAt?: string; lastActivityAt?: string; pendingLimit?: boolean; stalledAt?: string;
+  | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "missionId" | "resumable" | "continuable" | "workers" | "waitReasons"> & {
+  members: (Omit<TeamMember, "cwd" | "baseCommit" | "modelProfile" | "usage"> & { startedAt?: string; reportedAt?: string; lastActivityAt?: string; spinnerOnlySince?: string; pendingLimit?: boolean; stalledAt?: string;
     modelProfile?: Pick<TeamModelProfile, "label" | "provider" | "tier">; usage?: Pick<UsageTotals, "cost"> })[];
   tasks: (Pick<TeamTask, "id" | "title" | "status" | "paths" | "memberId" | "ownerRating"> & { changedPaths?: { paths: string[]; truncated: boolean } })[];
   checks: Pick<TeamView["checks"][number], "status" | "revision">[];
@@ -273,7 +279,7 @@ export function TeamCreate({ me, connected, done }: { me: Me; connected: boolean
 function eventLabel(event: LogEvent) {
   if (event.type === "signal") return String(event.data.kind ?? "Signal");
   if (event.type === "input-result") return event.data.state === "delivered" ? "Input delivered" : "Input";
-  if (event.type === "lifecycle") return String(event.data.status ?? "Session updated");
+  if (event.type === "lifecycle") return `${String(event.data.status ?? "Session updated")}${event.data.outputTailIncomplete ? " (the recording may be missing the session’s last output)" : ""}`;
   return event.type;
 }
 function eventDetail(event: LogEvent) {
@@ -387,7 +393,10 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
     } finally { inFlight.delete(body.requestId); if (mounted.current) setBusy(false); }
   }
   const action = (name: string, label: string) => void mutate("/teams/" + id + "/" + name, label);
-  const [mode, setMode] = useState<"summary" | "logs">("summary");
+  const initialHash = parseTeamEntryHash(window.location.hash, id);
+  const [mode, setMode] = useState<"summary" | "board" | "logs">(initialHash?.entryId ? "board" : "summary");
+  const [selectedEntryId, setSelectedEntryId] = useState<string | null>(initialHash?.entryId ?? null);
+  const [boardMemberFilter, setBoardMemberFilter] = useState("all");
   const [agentId, setAgentId] = useState("");
   const [briefs, setBriefs] = useState<{ sessionId: string; status: BriefingView }[]>([]);
   const [briefError, setBriefError] = useState("");
@@ -396,6 +405,37 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
   const [logEvents, setLogEvents] = useState<LogEvent[]>([]);
   const [followLog, setFollowLog] = useState(true);
   const logCursor = useRef<number | null>(null);
+  useEffect(() => {
+    const parsed = parseTeamEntryHash(window.location.hash, id);
+    if (parsed?.entryId) {
+      setMode("board");
+      setSelectedEntryId(parsed.entryId);
+    }
+    const onHashChange = () => {
+      const next = parseTeamEntryHash(window.location.hash, id);
+      if (next?.entryId) {
+        setMode("board");
+        setSelectedEntryId(next.entryId);
+      } else if (next && !next.entryId) {
+        setSelectedEntryId(null);
+      }
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, [id]);
+  function selectMode(next: "summary" | "board" | "logs") {
+    setMode(next);
+    if (next !== "board") {
+      setSelectedEntryId(null);
+      const current = parseTeamEntryHash(window.location.hash, id);
+      if (current?.entryId) history.replaceState(null, "", buildTeamEntryHash(machine, id));
+    }
+  }
+  function selectBoardEntry(entryId: string | null) {
+    setSelectedEntryId(entryId);
+    const current = parseTeamEntryHash(window.location.hash, id);
+    if (current) history.replaceState(null, "", buildTeamEntryHash(machine, id, entryId));
+  }
   const orderedMembers = team ? monitorMembers(team.members, team.revision) : [];
   const summaryTargets = orderedMembers.filter(member => member.revision === team?.revision).slice(0, 6);
   const summaryKey = mode === "summary" ? (summaryTargets.length ? summaryTargets : orderedMembers.slice(0, 1)).map(member => member.sessionId).join(",") : "";
@@ -470,7 +510,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       </form>
     : <p className="quiet">Only an owner can continue this blocked run.</p>;
   return <div className="team-detail">
-    <header className="team-detail-heading"><div><p className="team-eyebrow">{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)}</p><h1>{team.title}</h1><div className="team-detail-meta"><Status status={team.status} /><span>Revision {team.revision}</span><span className="team-workers" title={workersText}>{workersText}</span><span className="team-freshness" role="status">{view.stale ? "Showing last received state; controls are disabled." : ""}</span></div></div><div className="team-heading-actions"><div className="team-view-switch" role="group" aria-label="Team view"><button type="button" aria-pressed={mode === "summary"} onClick={() => setMode("summary")}>Summary</button><button type="button" aria-pressed={mode === "logs"} onClick={() => setMode("logs")}>Review logs</button></div><button className="text-button team-refresh" disabled={view.refreshing} onClick={view.refresh} aria-busy={view.refreshing}><RefreshCw className={view.refreshing ? "is-refreshing" : ""} size={14} />Refresh team</button></div></header>
+    <header className="team-detail-heading"><div><p className="team-eyebrow">{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)}</p><h1>{team.title}</h1><div className="team-detail-meta"><Status status={team.status} /><span>Revision {team.revision}</span><span className="team-workers" title={workersText}>{workersText}</span><span className="team-freshness" role="status">{view.stale ? "Showing last received state; controls are disabled." : ""}</span></div></div><div className="team-heading-actions"><div className="team-view-switch" role="group" aria-label="Team view"><button type="button" aria-pressed={mode === "summary"} onClick={() => selectMode("summary")}>Summary</button><button type="button" aria-pressed={mode === "board"} onClick={() => selectMode("board")}>Board</button><button type="button" aria-pressed={mode === "logs"} onClick={() => selectMode("logs")}>Review logs</button></div><button className="text-button team-refresh" disabled={view.refreshing} onClick={view.refresh} aria-busy={view.refreshing}><RefreshCw className={view.refreshing ? "is-refreshing" : ""} size={14} />Refresh team</button></div></header>
     <div className="team-detail-body">
       {team.reason && <p className="team-notice" role="status">{team.reason}</p>}
       <LinearTracking tracking={team.linear} stale={view.stale} />
@@ -482,6 +522,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       {openDecisions.length > 0 && <section className="team-section team-decisions"><h2>{missionManaged ? "Open decisions" : "Decisions for you"} <span className="quiet">{openDecisions.length}</span></h2>{openDecisions.map(decision => <Decision key={decision.id} decision={decision} disabled={!canSteer || team.status === "paused" || busy || Boolean(pending)} from={askedBy(team, decision)} answer={text => void mutate("/teams/" + id + "/decisions/" + decision.id + "/answer", "Answer", text)} readOnly={missionManaged} />)}</section>}
       {attention.length > 0 && <section className="team-section team-decisions"><h2>Agent sessions need you</h2><p className="quiet">The host answers ordinary prompts in a member’s own workspace. These sessions still wait on a provider prompt; respond in the session.</p>{attention.map(session => <button className="team-session-link" key={session.id} onClick={() => openSession(session.id)}><span><strong>{session.title}</strong><small>{session.attention?.now ?? "Open the session to respond."}</small></span><ArrowUpRight size={18} /></button>)}</section>}
       <ProviderLimitNotice limits={team.providerLimits} />
+      <TeamOverview team={team} sessions={sessions} onOpenSession={openSession} onInspectMemberEntries={memberId => { setSelectedEntryId(null); setBoardMemberFilter(memberId); selectMode("board"); }} onViewMemberLogs={memberId => { setAgentId(memberId); selectMode("logs"); }} />
       <section className="team-section"><h2>Your request</h2><p className="team-prose">{team.objective}</p></section>
       {mode === "logs" ? <>
         <div className="team-agent-switch" role="tablist" aria-label="Agents">{orderedMembers.map(member => <button type="button" role="tab" key={member.memberId} aria-selected={member.memberId === agentId} onClick={() => setAgentId(member.memberId)}><strong><span className={"team-agent-dot" + (["running", "waiting"].includes(member.status) ? " live" : "")} />{roles[member.role].name}</strong><span>{member.status}{member.revision === team.revision ? "" : ` · revision ${member.revision}`}</span></button>)}</div>
@@ -491,8 +532,9 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
           return <div className="team-agent-stepper"><button type="button" className="text-button" onClick={() => step(-1)}>‹ Previous</button><span className="quiet">Agent {index + 1} of {orderedMembers.length}</span><button type="button" className="text-button" onClick={() => step(1)}>Next ›</button></div>;
         })()}
         {selectedMember ? <TeamLogs member={selectedMember} session={logSession?.id === selectedMember.sessionId ? logSession : null} events={logEvents} stale={logs.stale} follow={followLog} setFollow={setFollowLog} onOpen={() => openSession(selectedMember.sessionId)} /> : <p className="quiet">This run has no agents yet.</p>}
-        <button type="button" className="text-button team-back-summary" onClick={() => setMode("summary")}>Back to summary</button>
-      </> : <RepositorySummary team={team} rows={briefs} failed={briefing.failed} asking={asking} error={briefError} onRequest={sessionId => void requestSummary(sessionId)} />}
+        <button type="button" className="text-button team-back-summary" onClick={() => selectMode("summary")}>Back to summary</button>
+      </> : mode === "board" ? <TeamEvidenceBoard team={team} me={me} fresh={fresh} sessions={sessions} selectedEntryId={selectedEntryId} memberFilter={boardMemberFilter} onMemberFilterChange={setBoardMemberFilter} onSelectEntry={selectBoardEntry} onOpenSession={openSession} onViewMemberLogs={memberId => { setAgentId(memberId); selectMode("logs"); }} />
+        : <RepositorySummary team={team} rows={briefs} failed={briefing.failed} asking={asking} error={briefError} onRequest={sessionId => void requestSummary(sessionId)} />}
       <details className="team-run-details"><summary>Run details</summary>
       {team.brief && <section className="team-section"><h2>Opportunity brief <span className="quiet">(agent proposal)</span></h2><TeamBriefView brief={team.brief} /></section>}
       {team.discovery && <section className="team-section"><h2>Discovery</h2><p className="team-prose">{team.discovery.summary}</p>{team.discovery.tasks.map(task => <article className="team-task" key={task.id}><div className="team-task-heading"><h3>{task.title}</h3><span className="team-task-state">{task.status}</span></div>{team.lineup?.implementers.find(profile => profile.id === task.agentProfileId) && <ModelProfile profile={team.lineup.implementers.find(profile => profile.id === task.agentProfileId)!} />}{task.summary && <p className="team-prose">{task.summary}</p>}{task.evidence && <EvidenceList evidence={task.evidence} />}<details><summary>Scout instructions</summary><p className="team-prose">{task.instructions}</p></details></article>)}</section>}

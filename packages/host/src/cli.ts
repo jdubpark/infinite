@@ -335,12 +335,12 @@ infinite projects group NAME REPO_ID...    Create a multi-repository project
 infinite projects rename|hide|show ID       Rename or hide a project
 infinite projects primary ID CHECKOUT_ID   Choose the checkout a project works in
 infinite start [--project ID] "task"       Start a mission
-infinite mission status|answer|steer|pause|resume|cancel ...
+infinite mission status|watch|answer|steer|pause|resume|cancel ...
 infinite mission progress ID [--after CURSOR] [--json]  Read child assignments and check receipts
 infinite board [--project ID]              Watch the owner board
 infinite team start [OBJECTIVE] [--prd FILE] Start a team in the bound project
 infinite team status [ID] [--logs]          Show teams, or one team's Brief
-infinite team watch ID [--logs]             Follow the summary; l logs, n/p agents, b summary
+infinite team watch ID [--logs | --board]   Follow the summary, board, or logs; b board, l logs, s summary
 infinite team steer ID TEXT                 Steer an active team
 infinite team answer ID QUESTION_ID TEXT    Answer a pending question
 infinite routine create --file FILE [--request-id UUID] [--json]
@@ -353,6 +353,7 @@ infinite routing resume-explore PROJECT
 infinite signal add --project ID TEXT [--request-id UUID] [--json]
 infinite signal list --project ID [--after SEQ] [--json]
 infinite egress [--project ID] [--json]    Hosts agents reached through the egress proxy
+infinite usage repairs [--project ID] [--days N] [--json]  Repair loop latency and recovery metrics
 
 Ctrl+] detaches. Ctrl+G returns to monitor mode. Flags after a provider
 name belong to that provider and use cloud paths.

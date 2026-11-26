@@ -18,7 +18,7 @@ Infinite separates shipped runtime behavior from unattached foundations and unfi
 
 | Mode | Target | Runtime status | Operator confidentiality |
 | --- | --- | --- | --- |
-| `single-tenant` (default; legacy alias `personal`) | Owner-controlled Ubuntu 24.04 server running all four native providers | Active pilot. Authenticated tool runs, API-restart continuity, encrypted backups/restores, egress/GitHub proxies, and paired CLI/web/mobile/macOS clients are running. | Owner trusts the host and guest root. Roles (`owner`, `controller`, `viewer`) share one tenant bucket. |
+| `single-tenant` (default; legacy alias `personal`) | Owner-controlled Ubuntu 24.04 server running all four native providers | Active pilot. Commissioned checks verify authenticated tool runs for all four providers, API-restart continuity, encrypted local backups/restores, and paired laptop CLI plus desktop and phone-sized browser access over Tailscale Serve HTTPS (native Android validation excluded). Optional egress/GitHub proxies, blind relay, and native macOS/mobile clients are implemented and configurable separately. | Owner trusts the host and guest root. Roles (`owner`, `controller`, `viewer`) share one tenant bucket. |
 | `tenant-development` | Multi-tenant Proxmox KVM development boundary (`npm run host -- plan-fleet`) | Synthetic rehearsal only. Accepts only the `demo` provider; refuses native providers, remote access, cmux, and workspace sync. | None (`operatorConfidential: false`, `dataPolicy: "synthetic-only"`). |
 | `confidential` | Managed multi-tenant confidential VMs (AMD SEV-SNP, Intel TDX, Confidential Space, or Nitro) | Hard-refused at init until hardware TEE attestation, measured immutable images, and user-controlled key release exist. | Target requires zero operator decryption. See [managed tenants](docs/multi-tenant.md). |
 
@@ -29,9 +29,9 @@ See the [commissioning record](deploy/ubuntu/commissioning.md) for verified host
 | Layer | Live-wired in host and clients | Implemented, not wired into live runtime | Spec-only or partial |
 | --- | --- | --- | --- |
 | Session Runtime and Transport | Detached PTY workers (`worker.ts`), AES-256-GCM vault and 256-record journals, `@infinite/attention`, verified answers, 30s control leases, SSE `/api/events`, `?since=` versioning, `infinite-remote-v1` E2E WS, blind relay, cmux bridge, `--laptop` Codex handoff, `--local-ui` Codex/OpenCode, batched workspace sync | None | Claude/Grok native UI adapters; automatic host-reboot worker recovery |
-| Orchestration and Intake | `TeamService` (14 states, 10 roles), `GoalService` (finite and standing), `MissionService` (cross-repo DAG, read-only Claude coordinator), `RoutineService` (30d authority-pinned), `HandoffService`, `ProjectGroups` (`INF-98`), Blackboard (`evidence/blackboard.ts`), Linear + Slack Socket intake with verified `organizationScope` (`#304`), external `/mcp` connector + internal stdio `infinite-team` MCP | `read-phases.ts` / `read-request.ts` (read-pool models), `search-engine.ts` (Search Mode pure state machine) | None |
-| Governance and Security | `HaltService` kill switch, `FuseService` hourly launch fuse, `hostLoad` gate, 5-step `HostPermissionPipeline` (class rules v8, 2-tier tool-less cross-family review, `permissionWriteFence`), 7-account Ubuntu isolation, 3 `nftables` tables, egress and GitHub credential proxies, provider ceilings, freeze-watchdog `age` backups | None | Metered USD admission reservations (current fuse caps launch count, not dollars) |
-| Evidence, Routing and Evaluation | Single-writer encrypted SQLite `EvidenceStore` (15 modules, 4 `EventOutbox` projectors), `ObjectiveRecord` + `TeamIntent` + `TeamRegister` + `TeamVerdicts`, `OutcomeLedger` + `BaseScanner` + `SignalService`, hierarchical Beta-Binomial Thompson `RoutingRecorder` (shadow/auto), `EvalHost` + `Grader` + `TrialPump` + Bootstrap/Holm comparisons + Phase 1 blind `JudgeCalibrations` | None | Live production duels (`INF-188` Phase 2), Improvement Gate candidate registry (`INF-189`), Class A automated lesson/prompt adoption |
+| Orchestration and Intake | `TeamService` (14 states, 10 roles), `GoalService` (finite and standing), `MissionService` (cross-repo DAG, read-only Claude coordinator), `RoutineService` (30d authority-pinned), `HandoffService`, `ProjectGroups`, Blackboard (`evidence/blackboard.ts`), Linear + Slack Socket intake with verified `organizationScope`, external `/mcp` connector + internal stdio `infinite-team` MCP | `read-phases.ts` / `read-request.ts` (read-pool models), `search-engine.ts` (Search Mode pure state machine) | None |
+| Governance and Security | `HaltService` autonomous-work halt, `FuseService` hourly launch fuse, `hostLoad` gate, 5-step `HostPermissionPipeline` (class rules v8, 2-tier tool-less cross-family review, `permissionWriteFence`) plus legacy repository-level `permission-coordinator` fallback, 7-account Ubuntu isolation, 3 `nftables` tables, egress and GitHub credential proxies, provider ceilings, freeze-watchdog `age` backups | None | Metered USD admission reservations (current fuse caps launch count, not dollars) |
+| Evidence, Routing and Evaluation | Single-writer encrypted SQLite `EvidenceStore` (15 modules, 4 `EventOutbox` projectors), `ObjectiveRecord` + `TeamIntent` + `TeamRegister` + `TeamVerdicts`, `OutcomeLedger` + `BaseScanner` + `SignalService`, hierarchical Beta-Binomial Thompson `RoutingRecorder` (shadow/auto), `EvalHost` + `Grader` + `TrialPump` + Bootstrap/Holm comparisons + Phase 1 blind `JudgeCalibrations` | None | Live production duels (Phase 2), Improvement Gate candidate registry, Class A automated lesson/prompt adoption |
 | Understanding, Telemetry and Memory | `RepositoryGraphs` (Graphify code maps), `RepositoryBriefings` (`jevcode auto`), `UnderstandingRuntime` + plan/source fence + `WorkBriefService`, finite BFS/TLA+ `BehaviorChecker`, TypeSafe Jev `Readings`, `UsageService` + `BalanceService` + `ProviderLimits` + `Scorecard` | `packages/host/src/memory/` (17-table encrypted SQLite store, Ed25519 witness recovery, Lexical and fail-closed `HonchoMemoryAdapter`), `deploy/ubuntu/memory/` Honcho v3.4.0 qualification suite | Honcho production ingestion and semantic recall (gated on AGPL-3.0 review and metered egress proxy) |
 
 ---
@@ -63,16 +63,16 @@ deploy/
 scripts/       Zero-dependency egress & GitHub proxies, GitHub App token refresher, Graphify builder,
                comment & file-size ratchets, macOS/CLI/Codex handoff builders, test runner
 docs/          System architecture, 6 SVG diagrams, subsystem guides, 22 ADRs (docs/adr/)
-tests/         443 test suites: unit, live PTY continuity, OS-boundary launchers, Playwright smoke,
-               compile-time type tests, and seeded crash/fault/differential simulators
+tests/         Discovered test suites (tests/*.test.ts): unit, live PTY continuity, OS-boundary launchers,
+               Playwright smoke, compile-time type tests, and seeded crash/fault/differential simulators
 verification/  Formal finite-state safety models (Understanding refresh fence) + TLA+/TLC exports
 ```
 
 ### Five Design Invariants
 
 1. **Detached execution and encrypted truth.** Every session runs in its own worker process (`packages/host/src/worker.ts`) behind a private Unix socket (`0600`). Output, input intent, receipts, and signals write to 256-record AES-256-GCM journal segments (`packages/host/src/vault.ts`) before or alongside PTY writes; a recording failure suspends the native process with `SIGSTOP` (`recording-error`) rather than continuing unrecorded.
-2. **Receipts over inference.** A delivered receipt confirms bytes reached the PTY, never that an agent accepted or completed a task. Evaluator verdicts (`TeamVerdicts`) are provisional agent assessments and never mark a product goal `achieved` without an explicit owner outcome. Merges are recorded as agent reports and validated against Git commits before a next cycle starts. No score, reward, routing decision, or usage figure enters an agent prompt.
-3. **Fail-closed governance.** `HaltService` runs ahead of `FuseService` and every launch or permission path with zero exempt roles; unreadable halt or fuse state stops launches host-wide. Provider permissions stay with the owner unless delegated to the separate two-tier tool-less `HostPermissionPipeline`, where five interrupt classes (production/staging, credentials, money, destructive outside workspace, global/account settings) always escalate to the owner.
+2. **Receipts over inference.** A delivered receipt confirms bytes reached the PTY, never that an agent accepted or completed a task. Evaluator verdicts (`TeamVerdicts`) are provisional agent assessments and never mark a product goal `achieved` without an explicit human outcome (owner or controller). Merges are recorded as agent reports and validated against Git commits before a next cycle starts. No score, reward, routing decision, or usage figure enters an agent prompt.
+3. **Fail-closed governance.** `HaltService` runs ahead of `FuseService` across autonomous and team launches (routines, goals, missions, teams, `Manager.createTeamSession` for `request.team` launches, replay eval trials, and main checks) as well as permission review and delivery, with zero exempt autonomous roles; an unreadable halt record fails closed across those gated autonomous launches and permission reviews host-wide. Separately, `FuseService` enforces rolling hourly launch limits across fuse-gated autonomous launches (`routines`, `goals`, `missions`, `teams`, and `Manager.createTeamSession`) and fails closed for non-exempt launches when its baseline is unreadable (`unmeasurable`), while exempting `permission-coordinator` and not gating `MainCheckService` (which checks halt and `hostLoad` directly). Ordinary interactive sessions started directly by the owner keep running during a halt and can still start—halt is an autonomous-work stop, not a host-wide kill switch for interactive sessions. Provider permissions stay with the owner unless explicitly delegated through one of two paths (check both when auditing): workspace-level delegation to the separate two-tier tool-less `HostPermissionPipeline` (where five interrupt classes—production/staging, credentials, money, destructive outside workspace, global/account settings—always escalate to the owner), or the legacy repository-level delegation (`project.team.permissions`, enabled by default on first `infinite repo init` unless `--permissions off`) that lets a strong `permission-coordinator` decide bounded one-shot requests for team runs not served by the permission agent.
 4. **Partitioned concurrency and compile-time state machines.** Global mutexes and lockfiles have been replaced by per-entity `KeyedQueue` chains with strict acyclic lock ordering (`Routine -> Goal -> Mission -> Team -> Session`, [ADR-0016](docs/adr/0016-wave3-per-entity-orchestration-queues.md)), atomic temp-`fsync`-rename storage, Swift actors on macOS, and discriminated-union state machines pinned by compile-time `@ts-expect-error` tests ([ADR-0019](docs/adr/0019-orchestration-wire-and-domain-type-invariants.md)).
 5. **Zero inline prose comments; invariants live in ADRs.** `npm run check:comments` enforces zero prose comments across all checked TypeScript, JavaScript, Swift, Python, C, shell, CSS, and systemd source files ([ADR-0003](docs/adr/0003-comment-policy-and-ratchet.md)). Non-obvious invariants live in [`docs/adr/0001`–`0022`](docs/adr/README.md).
 
@@ -122,23 +122,42 @@ infinite claude
 infinite codex --model MODEL
 infinite grok
 infinite opencode --model deepseek/deepseek-flash
-infinite list | resume | monitor | close SESSION_ID | resources --watch | cmux
+infinite list
+infinite resume SESSION_ID
+infinite monitor SESSION_ID
+infinite close SESSION_ID
+infinite resources --watch
+infinite cmux
 
 # One-way workspace sync, hybrid laptop execution & experimental local TUI
 infinite sync                         # incremental 256 KiB batched chunk upload
-infinite pull                         # export cloud tree into a new directory
+infinite pull PROJECT_ID --output DIR # export cloud tree into a new directory
 infinite --laptop codex               # tools run locally; cloud handoff on loss (qualified backend)
 infinite --local-ui codex "Prompt"    # local Codex TUI over cloud backend
 infinite --local-ui opencode          # local OpenCode TUI (supports empty sessions)
 
 # Orchestration, governance, evaluation & understanding
-infinite board | start "Task" | mission progress ID | projects
-infinite team start | status | watch | entries | steer | answer
-infinite goal ... | routine ... | autonomy ... | routing ... | eval ... | duels ...
-infinite permissions ... | halt ... | fuse ... | cost | usage | understand check --file def.json
+infinite projects
+infinite board
+infinite start "Task"
+infinite mission progress MISSION_ID
+infinite team start "Task"
+infinite team status TEAM_ID
+infinite team watch TEAM_ID
+infinite team entries TEAM_ID
+infinite team steer TEAM_ID "Note"
+infinite team answer TEAM_ID QUESTION_ID "Choice"
+infinite routine list
+infinite routing status PROJECT_ID
+infinite permissions status
+infinite halt
+infinite fuse
+infinite cost
+infinite usage
+infinite understand check --file def.json
 ```
 
-Press `Enter` to claim steering, `Ctrl+G` to monitor read-only, `Ctrl+E` for the AES-GCM encrypted local draft editor, or `Ctrl+]` to detach. See [CLI contract](docs/cli.md), [workspace sync](docs/workspace-sync.md), and [hybrid execution](docs/hybrid-execution.md).
+Additional CLI command families cover goals (`infinite goal`), autonomy (`infinite autonomy`), replay eval (`infinite eval`), judge calibration (`infinite duels`), and project signals (`infinite signal`). Press `Enter` to claim steering, `Ctrl+G` to monitor read-only, `Ctrl+E` for the AES-GCM encrypted local draft editor, or `Ctrl+]` to detach. See [CLI contract](docs/cli.md), [workspace sync](docs/workspace-sync.md), and [hybrid execution](docs/hybrid-execution.md).
 
 ### Browser (`apps/web`)
 
@@ -178,7 +197,7 @@ npm run export:ios -w @infinite/mobile
 1. **`npm run check:size`** (`scripts/check-file-size.mjs`): 1,000-line cap on new source files; downward-only baseline across 24 grandfathered files.
 2. **`npm run check:comments`** (`scripts/check-comments.mjs`): zero-comment policy across `.ts/.tsx/.js/.mjs/.swift/.py/.sh/.c/.h/.kt/.css/.service/.timer/.socket` (`scripts/comments-baseline.json` is at `0`).
 3. **`npm run typecheck`**: TypeScript strict check across all workspaces plus `tsconfig.type-tests.json` (`@ts-expect-error` state-machine and wire-contract tests).
-4. **`npm test`** (`scripts/run-tests.mjs`): 443 test suites (440 parallel + 3 serial contention-sensitive suites; use `INFINITE_TEST_CONCURRENCY=1` on small runners), covering 12-PTY live API-restart continuity, vault/SQLite crypto, OS-boundary eval/grader launchers, Playwright browser smoke, and seeded crash/fault/differential simulators.
+4. **`npm test`** (`scripts/run-tests.mjs`): discovers every top-level `tests/*.test.ts` file, running parallelizable suites concurrently (default concurrency 4; override with `--concurrency=` or `INFINITE_TEST_CONCURRENCY=1` on small runners) followed by contention-sensitive suites listed in `serialFiles` sequentially, covering 12-PTY live API-restart continuity, vault/SQLite crypto, OS-boundary eval/grader launchers, Playwright browser smoke, and seeded crash/fault/differential simulators.
 5. **`npm run build`**: sequential build of `@infinite/attention -> @infinite/remote -> @infinite/host -> @infinite/web`.
 
 End-to-end browser verification against a disposable host uses `.agents/skills/verify-infinite/scripts/drive.mjs session --instance DIR`.

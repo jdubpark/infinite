@@ -23,8 +23,12 @@ infinite usage goal GOAL_ID
 infinite usage models [--role implementer]
 infinite usage outcomes [--run ID | --goal ID | --mission ID]
 infinite usage --json
-infinite cost [plan ACCOUNT USD | reset] [--json]
-infinite fuse [close --host | --project ID]
+infinite cost [--json]
+infinite cost plan ACCOUNT USD
+infinite cost plan ACCOUNT reset
+infinite fuse [--json]
+infinite fuse close --host
+infinite fuse close --project PROJECT_ID
 infinite evidence status               # evidence store state, modules, sizes, and event count
 infinite evidence status --json
 infinite egress                        # hosts agents reached through the egress proxy, per project
@@ -66,7 +70,11 @@ infinite understand create projects|features|plans --workspace WORKSPACE_ID --re
 infinite understand update projects|features|plans|components ENTITY_ID --workspace WORKSPACE_ID --revision N --request-id UUID --file INPUT.json
 infinite understand archive projects|features|plans ENTITY_ID --workspace WORKSPACE_ID --revision N --request-id UUID
 infinite understand policy --workspace WORKSPACE_ID --revision N --request-id UUID --file POLICY.json
-infinite understand behaviors|behavior ID|behavior-suite ID|behavior-save|behavior-run --workspace WORKSPACE_ID
+infinite understand behaviors --workspace WORKSPACE_ID [--json]
+infinite understand behavior BEHAVIOR_ID --workspace WORKSPACE_ID [--json]
+infinite understand behavior-suite BEHAVIOR_ID --workspace WORKSPACE_ID [--json]
+infinite understand behavior-save --workspace WORKSPACE_ID --revision N --request-id UUID --file DEFINITION.json [--json]
+infinite understand behavior-run BEHAVIOR_ID --workspace WORKSPACE_ID --revision N --request-id UUID [--json]
 infinite understand check --file definition.json [--json]
 ```
 

@@ -4274,9 +4274,9 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | `GET /api/teams/:id/context-usage` | None; returns recorded launch and blackboard read sizes per member (`member_scopes`) | Any paired device |
 | `GET /api/teams/:id/routing/:taskId` | None; explains the shadow or auto routing decision for a task | Any paired device |
 | `POST /api/teams/:id/reconcile-delivery`, `/reconcile-verification` | `requestId`, `revision`, reconciliation attestation fields (standalone runs) | Owner |
-| `GET /api/teams/:id/members/:memberId/runtime`, `POST /api/teams/:id/members/:memberId/retire` | Inspect live process census or retire a member runtime tree (`SIGSTOP` -> `SIGKILL`) | Reads: any; `retire`: Owner |
+| `GET /api/teams/:id/members/:memberId/runtime`, `POST /api/teams/:id/members/:memberId/retire` | Inspect live process census or retire a member runtime tree (`SIGSTOP` -> `SIGKILL`) | Owner |
 | `POST /api/teams/:id/permissions/revoke`, `/routing/revoke` | `requestId`, `revision`; revokes active permission delegation or auto routing for the run | Owner |
-| `GET /api/teams/:id/bundle` | None; downloads the run's inspection bundle | Owner |
+| `GET /api/teams/:id/bundle` | None; downloads the run's inspection bundle | Owner bearer key (owner CLI; session cookies refused) |
 
 Related subsystem routes documented in their respective sections above and in [System Architecture](architecture.md#api-surface-index): `/api/routines/*` (scheduled routines), `/api/fuse` and `POST /api/fuse/close` (launch-rate fuse), `/api/permissions/*` (host permission agent journal, delegations, unlocks, and replay), `/api/routing/*` (project routing status and exploration pause/resume), `/api/outcomes/*` (outcome ledger), `/api/eval/*` (replay eval jobs and priors), and `/api/duels/judges/*` (judge calibrations).
 

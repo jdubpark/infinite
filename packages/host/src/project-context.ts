@@ -13,7 +13,17 @@ const storedContext = z.object({ version: z.number().int().min(0), text: z.strin
 export interface ContextSource { projectId: string; version: number; relationship?: string }
 
 export class ProjectContexts {
-  constructor(private readonly config: Config, private readonly key: Buffer) {}
+  constructor(private readonly config: Pick<Config, "stateDir" | "projects" | "intake">, private readonly key: Buffer) {}
+
+  private linkAllowed(source: string, target: string): boolean {
+    const slack = this.config.intake?.slack;
+    if (!slack) return true;
+    const pins = slack.organizationScope?.workspaces;
+    return [source, target].every(id => {
+      const pin = pins?.find(p => p.projectId === id);
+      return pin !== undefined && this.config.projects.some(p => p.id === id && p.path === pin.path);
+    });
+  }
 
   root(id: string) {
     projectId.parse(id);
@@ -50,7 +60,11 @@ export class ProjectContexts {
     const file = join(this.config.stateDir, "context-links", `${id}.sealed`);
     if (!existsSync(file)) return { version: 0, root, links: [] as z.infer<typeof storedLinks>["links"] };
     const links = storedLinks.parse(unseal(this.key, `context-links:${id}`, readFileSync(file, "utf8")));
-    return { ...links, ...(links.root !== root ? { binding: "review-required" as const } : {}) };
+    return {
+      ...links,
+      links: links.links.filter(link => this.linkAllowed(id, link.projectId)),
+      ...(links.root !== root ? { binding: "review-required" as const } : {}),
+    };
   }
 
   listLinks(id: string) {
@@ -65,6 +79,7 @@ export class ProjectContexts {
     const seen = new Set<string>();
     const links = body.links.map(link => {
       if (link.projectId === id || seen.has(link.projectId)) throw new ContentError("Context relationships must name distinct other projects.", 400);
+      if (!this.linkAllowed(id, link.projectId)) throw new ContentError("Context links must stay within the enrolled workspace audience.", 403);
       seen.add(link.projectId);
       const existing = !("binding" in previous) ? previous.links.find(value => value.projectId === link.projectId) : undefined;
       return { ...link, root: existing?.root ?? this.root(link.projectId) };

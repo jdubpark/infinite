@@ -1,10 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { ProjectContexts } from "../packages/host/src/project-context.js";
+import { intakeConfigSchema } from "../packages/host/src/intake-types.js";
 import { startHost } from "./helpers.js";
 
 test("project context is isolated, linked explicitly in one direction, and revoked for future sessions", { timeout: 60000 }, async () => {
@@ -73,4 +76,40 @@ test("project context is isolated, linked explicitly in one direction, and revok
     await exec(process.execPath, [...cli, "repo", "unlink", "beta", "--project", "alpha"]);
     assert.equal((await launch("alpha")).context, "reviewed-new-context", "explicit owner review recovers a changed codebase without its old context");
   } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("workspace enrollment bounds saved context links on reads and writes in both directions", t => {
+  const root = mkdtempSync(join(tmpdir(), "linked-context-scope-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const projects = ["alpha", "beta", "outside", "unknown"].map(id => {
+    const path = join(root, id);
+    mkdirSync(path);
+    return { id, name: id, path };
+  });
+  const config = { projects, stateDir: join(root, "state") };
+  const key = randomBytes(32);
+  const prior = new ProjectContexts(config, key);
+  for (const { id } of projects) prior.setContext(id, id + " context", 0);
+  const link = (projectId: string) => ({ projectId, relationship: "uses " + projectId });
+  prior.setLinks("alpha", { expectedVersion: 0, links: [link("beta"), link("outside")] });
+  prior.setLinks("outside", { expectedVersion: 0, links: [link("alpha")] });
+
+  const intake = intakeConfigSchema.parse({
+    linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "work" },
+    mission: { groupId: "work" },
+    slack: {
+      teamId: "T000", ownerUserId: "U000", appTokenFile: join(root, "app"), botTokenFile: join(root, "bot"),
+      organizationScope: { workspaces: projects.slice(0, 2).map(p => ({ projectId: p.id, path: p.path, repository: "example/" + p.id })) },
+    },
+  });
+  const scoped = new ProjectContexts({ ...config, intake }, key);
+  assert.deepEqual(scoped.listLinks("alpha").links, [link("beta")]);
+  const alpha = scoped.snapshot("alpha");
+  assert.deepEqual(alpha.sources.map(s => s.projectId), ["alpha", "beta"]);
+  assert.match(alpha.text, /beta context/);
+  assert.doesNotMatch(alpha.text, /outside/);
+  assert.deepEqual(scoped.listLinks("outside").links, []);
+  assert.equal(scoped.snapshot("outside").text, "outside context");
+  assert.throws(() => scoped.setLinks("alpha", { expectedVersion: 1, links: [link("outside")] }), /workspace audience/);
+  assert.throws(() => scoped.setLinks("outside", { expectedVersion: 1, links: [link("unknown")] }), /workspace audience/);
 });

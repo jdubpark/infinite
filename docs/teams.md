@@ -1792,12 +1792,14 @@ applies to every such steer, whether or not review feedback (below) is switched 
 - When the delivery of a continued revision fails, the run blocks for the owner
   without automatic delivery recovery.
 - A pull request recorded before the host kept its branch has no recorded branch,
-  and the host does not infer one. A new steer on that run is refused with
-  `delivery-branch-unknown`. A run that was already continued from such a record
-  blocks at delivery with the same code instead of delivering. Only review
-  feedback's read of GitHub records the branch, and only while the run waits for
-  review at its delivered revision. With review feedback off, such a run refuses
-  every new steer and never gets its branch recorded; start a new run instead.
+  and the host does not infer one locally. On steer or continued delivery, the
+  host performs an on-demand read-only `gh pr view` against the pinned delivery
+  repository, validates the head branch against `gitBranchSchema` and the run's
+  owned delivery branch, persists it on `pullRequest.branch`, and continues.
+  If the lookup fails or GitHub reports a closed, merged, fork, retargeted, or
+  unmatched branch, the steer fails or delivery blocks with
+  `delivery-branch-unknown` without mutating the run. Review feedback's read of
+  GitHub also backfills `pullRequest.branch` when switched on.
 
 With `github.reviewFeedback` switched on, the owner's changes-requested review of
 that pull request steers the run the same way, once per review. Only the review
@@ -3720,7 +3722,7 @@ Limits of this first slice, stated in full:
 - A project that lets the team establish its own checks has none configured and cannot use this.
 - The result of a head that main has already left can still be announced, with the commit it was measured at.
 - Tests cannot prove that a deployed launcher admits the forms the check uses. Audit the launcher before the setting is turned on in any project.
-- If the host's API process stops in the short window while a command of the check is starting, the run directory is not removed until the host boots again, and no main check on the host starts until then: that project waits on `processes` and the others on `another-check`.
+- If the host's API process ends before it has recorded the end of the check, for example when it crashes or is killed, in the short window while a command of the check is starting, the run directory is not removed until the host boots again, and no main check on the host starts until then: that project waits on `processes` and the others on `another-check`. An orderly stop records the end of a running check first. Once the end is recorded, the record holds the process id of every command the check started, even while the host still reads a command's start time, and the copy is removed once a census finds nothing of the run, without a reboot. Earlier versions also held the copy until the next boot when the host stopped after recording the end, while it still read a command's start time. A copy held that way at the upgrade still waits for the host to boot again. The record does not say whether the end of the check or a host start after a crash marked such a copy, and only a host start can leave a command's process id out of the record.
 - Preparing the copy has no time limit of its own. It ends by the Git helpers' own limits, a halt, or a host stop.
 - Two different heads observed with the same stamp are ordered by their results' order in the record. Fetches of one mirror are serial, so their stamps differ in practice.
 - The host may not signal a command that the command prefix runs as another account. A halt, a time limit or a host stop then cannot end the command. The check is recorded as an error ten seconds later, the command runs on, and no main check on the host starts until the command has ended: that project waits on `processes` and the others on `another-check`. A team's checks have the same limit.

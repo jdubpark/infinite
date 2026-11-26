@@ -7,8 +7,8 @@ import { unseal, writeSealed } from "./vault.js";
 import type { TeamKernel } from "./team-kernel.js";
 import type { Stored } from "./teams.js";
 import {
-  type PullRequestRead, type ReviewIntent, intentStillCurrent, markReviewApplied, parsePullRequestView, pullRequestTarget,
-  pullRequestViewArgs, recordedDeliveryBranch, recordReviewOutcome, reviewRequestId, reviewText, reviewVerdict, watchedRun,
+  type PullRequestRead, type ReviewIntent, intentStillCurrent, markReviewApplied, parsePullRequestBranchView, parsePullRequestView, pullRequestBranchViewArgs,
+  pullRequestTarget, pullRequestViewArgs, recordedDeliveryBranch, recordReviewOutcome, resolvePullRequestBranch, reviewRequestId, reviewText, reviewVerdict, watchedRun,
 } from "./review-feedback.js";
 
 export type ReviewFeedbackHost = Pick<TeamKernel, "records" | "config" | "save" | "event" | "enqueue"> & {
@@ -17,13 +17,23 @@ export type ReviewFeedbackHost = Pick<TeamKernel, "records" | "config" | "save" 
   steer(id: string, input: { requestId: string; revision: number; text: string }, source: GithubReviewSource): Promise<unknown>;
   held(projectId: string): boolean;
   now(): number;
+  block?(stored: Stored, error: unknown): void;
+  step?(stored: Stored): Promise<void>;
+  rebuildDeliveryPrompts?(stored: Stored): () => void;
 };
+
+type LegacyBranchReadResult =
+  | { kind: "aborted" }
+  | { kind: "error"; error: TeamError }
+  | { kind: "parsed"; parsed: ReturnType<typeof parsePullRequestBranchView> };
 
 type Marker = { enabled: boolean; enabledAt?: string };
 const MARKER_FILE = "review-feedback.sealed", MARKER_SCOPE = "team:review-feedback";
 const SETTLED_INTENT_LIMIT = 20;
 const READ_TIMEOUT_MS = 60_000;
 const READ_SETTLE_MS = 5_000;
+const LEGACY_BRANCH_PREFIX = "This run's pull request was recorded before the host kept its branch";
+const TERMINAL_OR_PAUSED = new Set(["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"]);
 const UNWATCHED: Record<string, string> = {
   closed: "was closed", merged: "was merged", fork: "comes from a fork", base: "targets another base branch", branch: "is not on the branch this run delivered to", "not-delivered": "is not this run's delivery",
 };
@@ -36,6 +46,7 @@ export class TeamReviewFeedback {
   private stopTick?: () => void;
   private closed = false;
   private readonly abort = new AbortController();
+  private readonly branchLookups = new Map<string, Promise<void>>();
   constructor(private readonly host: ReviewFeedbackHost) {}
 
   private settings() {
@@ -59,7 +70,9 @@ export class TeamReviewFeedback {
     return this.pass(false);
   }
   close() { this.closed = true; this.stopTick?.(); this.abort.abort(); return this.settled(); }
-  settled(): Promise<void> { return this.next?.done ?? this.running ?? Promise.resolve(); }
+  async settled(): Promise<void> {
+    await Promise.allSettled([this.next?.done ?? this.running ?? Promise.resolve(), ...this.branchLookups.values()]);
+  }
   poll() {
     this.lastPoll = this.host.now();
     return this.pass(true);
@@ -133,7 +146,10 @@ export class TeamReviewFeedback {
       if (this.closed || !stored || !watchedRun(stored.run, stored.reviewIntake) || stored.reviewIntake?.intents.some(item => item.state === "pending")) return undefined;
       const { run } = stored, verdict = reviewVerdict(stored, read, ownerLogin, enabledAt), at = new Date(this.host.now()).toISOString();
       const legacy = verdict.kind !== "unwatched" && !run.pullRequest!.branch;
-      if (legacy) run.pullRequest!.branch = recordedDeliveryBranch(run, read);
+      if (legacy) {
+        run.pullRequest!.branch = recordedDeliveryBranch(run, read);
+        this.host.rebuildDeliveryPrompts?.(stored);
+      }
       if (verdict.kind === "quiet" || verdict.kind === "known") {
         if (legacy) this.host.save(stored);
         return undefined;
@@ -204,11 +220,124 @@ export class TeamReviewFeedback {
     this.host.save(stored);
   }
 
-  private async read(stored: Stored, target: { repository: string; number: number }): Promise<PullRequestRead | undefined> {
-    const { config } = this.host, run = stored.run;
+  ensureLegacyPullRequestBranch(stored: Stored): boolean {
+    const run = stored.run;
+    if (!run.pullRequest || run.pullRequest.branch) return true;
+    if (this.closed || this.abort.signal.aborted) return false;
+    const target = pullRequestTarget(run);
+    if (!target) throw new TeamError(409, "delivery-branch-unknown", `${LEGACY_BRANCH_PREFIX}, and its pull request URL does not match the pinned delivery repository. Start a new run for further changes.`);
+    if (this.branchLookups.has(run.id)) return false;
+    const snapshot = { runId: run.id, projectId: run.projectId, root: stored.root, revision: run.revision, pullRequestUrl: run.pullRequest.pullRequestUrl };
+    const task = this.completeLegacyBranchLookup(stored, snapshot, target).finally(() => {
+      if (this.branchLookups.get(run.id) === task) this.branchLookups.delete(run.id);
+    });
+    this.branchLookups.set(run.id, task);
+    return false;
+  }
+
+  async resolveLegacyPullRequestBranch(stored: Stored): Promise<string | undefined> {
+    const run = stored.run;
+    if (!run.pullRequest) return undefined;
+    if (run.pullRequest.branch) return run.pullRequest.branch;
+    if (this.closed || this.abort.signal.aborted) throw new TeamError(503, "host-closing", "The host is shutting down; retry steering after it restarts.");
+    const target = pullRequestTarget(run);
+    if (!target) throw new TeamError(409, "delivery-branch-unknown", `${LEGACY_BRANCH_PREFIX}, and its pull request URL does not match the pinned delivery repository. Start a new run for further changes.`);
+    const outcome = await this.readLegacyBranch({ runId: run.id, projectId: run.projectId, root: stored.root }, target);
+    if (outcome.kind === "aborted") throw new TeamError(503, "host-closing", "The host is shutting down; retry steering after it restarts.");
+    if (outcome.kind === "error") throw outcome.error;
+    if (this.closed || this.host.records.get(run.id) !== stored || !stored.run.pullRequest) {
+      throw new TeamError(409, "delivery-branch-unknown", `${LEGACY_BRANCH_PREFIX}, and the run changed while reading GitHub.`);
+    }
+    if (stored.run.pullRequest.branch) return stored.run.pullRequest.branch;
+    const resolution = resolvePullRequestBranch(stored.run, outcome.parsed);
+    if (!resolution.ok) {
+      throw new TeamError(409, "delivery-branch-unknown", `${LEGACY_BRANCH_PREFIX}, and ${target.repository}#${target.number} ${UNWATCHED[resolution.reason]}, so the host will not continue it. Start a new run for further changes.`);
+    }
+    this.persistResolvedBranch(stored, resolution.branch);
+    return resolution.branch;
+  }
+
+  private async completeLegacyBranchLookup(
+    stored: Stored,
+    snapshot: { runId: string; projectId: string; root?: string; revision: number; pullRequestUrl: string },
+    target: { repository: string; number: number },
+  ): Promise<void> {
+    const outcome = await this.readLegacyBranch(snapshot, target);
+    if (outcome.kind === "aborted" || this.closed || this.abort.signal.aborted) return;
+    await this.host.enqueue(snapshot.runId, async () => {
+      const current = this.host.records.get(snapshot.runId);
+      if (this.closed || this.abort.signal.aborted || !current || current !== stored) return;
+      const run = current.run;
+      if (!run.pullRequest || run.pullRequest.pullRequestUrl !== snapshot.pullRequestUrl || run.pullRequest.branch) return;
+      if (run.revision !== snapshot.revision || current.halt || TERMINAL_OR_PAUSED.has(run.status)) return;
+      if (outcome.kind === "error") {
+        this.host.block?.(current, outcome.error);
+        return;
+      }
+      const resolution = resolvePullRequestBranch(run, outcome.parsed);
+      if (!resolution.ok) {
+        this.host.block?.(current, new TeamError(409, "delivery-branch-unknown", `${LEGACY_BRANCH_PREFIX}, and ${target.repository}#${target.number} ${UNWATCHED[resolution.reason]}, so the host will not continue it. Start a new run for further changes.`));
+        return;
+      }
+      this.persistResolvedBranch(current, resolution.branch);
+      if (!this.closed && !this.abort.signal.aborted) await this.host.step?.(current);
+    }).catch(() => {});
+  }
+
+  private persistResolvedBranch(stored: Stored, branch: string): void {
+    stored.run.pullRequest!.branch = branch;
+    const rollbackPrompts = this.host.rebuildDeliveryPrompts?.(stored);
+    try { this.host.save(stored); }
+    catch (error) {
+      delete stored.run.pullRequest!.branch;
+      rollbackPrompts?.();
+      throw error;
+    }
+  }
+
+  private async readLegacyBranch(
+    snapshot: { runId: string; projectId: string; root?: string },
+    target: { repository: string; number: number },
+  ): Promise<LegacyBranchReadResult> {
+    if (this.closed || this.abort.signal.aborted) return { kind: "aborted" };
+    let result: Awaited<ReturnType<typeof teamCommand>>;
     try {
-      const result = await teamCommand({ command: "gh", args: pullRequestViewArgs(target) }, stored.root ?? config.teams?.workspaceDir ?? this.host.directory, this.abort.signal,
-        READ_TIMEOUT_MS, config.teams?.commandPrefix, undefined, hostGithubGrantEnvironment(config, { sid: `review:${run.id}`, project: run.projectId, repo: target.repository, ops: ["pr"] }), READ_SETTLE_MS);
+      const { config } = this.host;
+      result = await teamCommand(
+        { command: "gh", args: pullRequestBranchViewArgs(target) },
+        snapshot.root ?? config.teams?.workspaceDir ?? this.host.directory,
+        this.abort.signal,
+        READ_TIMEOUT_MS,
+        config.teams?.commandPrefix,
+        undefined,
+        hostGithubGrantEnvironment(config, { sid: `review:${snapshot.runId}`, project: snapshot.projectId, repo: target.repository, ops: ["pr"] }),
+        READ_SETTLE_MS,
+      );
+    } catch {
+      if (this.closed || this.abort.signal.aborted) return { kind: "aborted" };
+      return { kind: "error", error: new TeamError(409, "delivery-branch-unknown", `${LEGACY_BRANCH_PREFIX}, and reading ${target.repository}#${target.number} on GitHub failed because gh could not be started. Check GitHub CLI access and retry, or start a new run.`) };
+    }
+    if (this.closed || this.abort.signal.aborted) return { kind: "aborted" };
+    if (result.exitCode !== 0 || result.interrupted || result.truncated) {
+      const detail = result.interrupted ? "command interrupted" : result.truncated ? "output truncated" : `gh exited with ${result.exitCode ?? "unknown"}`;
+      return { kind: "error", error: new TeamError(409, "delivery-branch-unknown", `${LEGACY_BRANCH_PREFIX}, and reading ${target.repository}#${target.number} on GitHub failed (${detail}). Check GitHub CLI access and retry, or start a new run.`) };
+    }
+    try {
+      return { kind: "parsed", parsed: parsePullRequestBranchView(result.stdout) };
+    } catch {
+      return { kind: "error", error: new TeamError(409, "delivery-branch-unknown", `${LEGACY_BRANCH_PREFIX}, and GitHub returned an unreadable pull request or invalid head branch for ${target.repository}#${target.number}. Retry, or start a new run.`) };
+    }
+  }
+
+  private runPullRequestView(stored: Stored, target: { repository: string; number: number }, args: string[]) {
+    const { config } = this.host, run = stored.run;
+    return teamCommand({ command: "gh", args }, stored.root ?? config.teams?.workspaceDir ?? this.host.directory, this.abort.signal,
+      READ_TIMEOUT_MS, config.teams?.commandPrefix, undefined, hostGithubGrantEnvironment(config, { sid: `review:${run.id}`, project: run.projectId, repo: target.repository, ops: ["pr"] }), READ_SETTLE_MS);
+  }
+
+  private async read(stored: Stored, target: { repository: string; number: number }): Promise<PullRequestRead | undefined> {
+    try {
+      const result = await this.runPullRequestView(stored, target, pullRequestViewArgs(target));
       if (result.exitCode !== 0 || result.interrupted || result.truncated) throw new Error(`gh exited with ${result.exitCode}${result.truncated ? " (output truncated)" : ""}`);
       return parsePullRequestView(result.stdout);
     } catch (error) {

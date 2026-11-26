@@ -87,7 +87,7 @@ async function start(env: Record<string, string>) {
   };
 }
 
-test("state calls are answered within the host's timeout while a 4 MiB output burst is recorded on a slow journal disk", { timeout: 150_000 }, async () => {
+test("a 4 MiB output burst on a slow journal disk is synced in bounded flushes while state calls answer within the host's timeout", { timeout: 150_000 }, async () => {
   const worker = await start({ INFINITE_TEST_JOURNAL_SYNC_DELAY_MS: "100" });
   try {
     await worker.burst(BURST);
@@ -105,6 +105,7 @@ test("state calls are answered within the host's timeout while a 4 MiB output bu
     const chunks = worker.output();
     assert.ok(chunks.join("").length > BURST, "the whole burst is recorded");
     assert.ok(chunks.every(text => text.length <= 8192), "output events keep their 8192-character chunks");
+    assert.ok(worker.synced().largest <= 40, `one sync holds at most 256 KiB of output plus one read, not ${worker.synced().largest} events`);
   } finally {
     await worker.stop();
   }

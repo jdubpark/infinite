@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { responseText, Summarizer, transcriptText } from "../packages/host/src/summary.js";
-import { claimControl, startHost, waitFor } from "./helpers.js";
+import { claimControl, demoProfile, startHost, waitFor } from "./helpers.js";
 
 const attention = { idleAfterMs: 3000, hooks: { claude: true, codex: true } };
 
@@ -289,11 +289,30 @@ test("automatic brief uses the latest transcript after a delayed provider flush 
   const transcript = join(root, "provider-session.jsonl");
   const receipt = join(root, "calls.jsonl");
   const releaseLateTranscript = join(root, "release-late-transcript");
+  const blockerId = randomUUID();
+  const gateEntered = join(root, "gate-entered");
+  const gateRelease = join(root, "gate-release");
   const agent = join(process.cwd(), "tests/fixtures/briefing-transcript-agent.mjs");
   const cli = join(process.cwd(), "tests/fixtures/jevcode-brief.mjs");
-  const host = await startHost({ agents: { claude: { command: process.execPath, args: ["--import", import.meta.resolve("tsx"), agent, transcript, releaseLateTranscript] } }, config: { attention,
-    repositoryBriefings: { command: process.execPath, args: [cli, receipt], model: "gpt-6-luna", automatic: true, intervalMs: 2000, cooldownMs: 0, timeoutMs: 20000 },
-  } });
+  const host = await startHost({
+    agents: {
+      demo: demoProfile(),
+      claude: { command: process.execPath, args: ["--import", import.meta.resolve("tsx"), agent, transcript, releaseLateTranscript] },
+    },
+    config: {
+      attention,
+      repositoryBriefings: {
+        command: process.execPath,
+        args: [cli, receipt, "gate", blockerId, gateEntered, gateRelease],
+        model: "gpt-6-luna",
+        automatic: true,
+        intervalMs: 100,
+        cooldownMs: 0,
+        timeoutMs: 45000,
+      },
+    },
+  });
+  let blockerSummary: Promise<{ status: number; body: any }> | undefined;
   try {
     const project = host.config.projects[0].path;
     execFileSync("git", ["init", "-q"], { cwd: project });
@@ -303,12 +322,30 @@ test("automatic brief uses the latest transcript after a delayed provider flush 
     execFileSync("git", ["-C", project, "add", "README.md"]);
     execFileSync("git", ["-C", project, "commit", "-qm", "fixture"]);
 
+    await host.fetchApi("/sessions", "owner", { requestId: blockerId, provider: "demo", projectId: "rehearsal", title: "Queue gate", prompt: "hold queue" });
+    blockerSummary = host.fetchApi(`/sessions/${blockerId}/summary`, "viewer");
+    await waitFor(async () => existsSync(gateEntered), entered => entered, 20000);
+
     const id = randomUUID();
     await host.fetchApi("/sessions", "owner", { requestId: id, provider: "claude", projectId: "rehearsal", title: "Long transcript", prompt: "Inspect the recent work." });
     await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.status === "running" && r.body.capabilities?.transcript === 1, 20000);
     const queued = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "pending", 25000);
     assert.equal(queued.body.state, "pending", "the Stop hook has been observed before the late transcript append");
+
+    const beforeLateSeq = (await host.fetchApi(`/sessions/${id}`)).body.seq;
     writeFileSync(releaseLateTranscript, "release");
+    await waitFor(
+      () => host.fetchApi(`/sessions/${id}/messages?after=${beforeLateSeq}`),
+      r => r.body.messages.some((message: { text: string }) => message.text.includes("FINAL_TRANSCRIPT_MARKER")),
+      20000,
+    );
+    const stillQueued = await host.fetchApi(`/sessions/${id}/summary?status=1`);
+    assert.equal(stillQueued.body.state, "pending", "the automatic brief stays queued until the late transcript append is recorded");
+
+    writeFileSync(gateRelease, "release");
+    const blockerResult = await blockerSummary;
+    assert.equal(blockerResult.status, 200);
+
     const status = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "ready" || r.body.state === "failed", 30000);
     assert.equal(status.body.state, "ready");
     assert.match(status.body.summary.text, /FINAL_TRANSCRIPT_MARKER/);
@@ -317,7 +354,8 @@ test("automatic brief uses the latest transcript after a delayed provider flush 
     assert.equal(status.body.summary.repository.activity.truncated, true);
     assert.ok(status.body.summary.repository.coverage.some((line: string) => /Session activity: 200 of \d+ recorded messages included; activity outside the bounded message or page limits omitted/.test(line)), "the public coverage identifies the bounded activity window");
 
-    const calls = readFileSync(receipt, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const calls = readFileSync(receipt, "utf8").trim().split("\n").map(line => JSON.parse(line))
+      .filter((call: { args: string[] }) => call.args[call.args.indexOf("--session") + 1] === id);
     assert.equal(calls.length, 1, "the provider transcript should produce one automatic checkpoint");
     assert.ok(calls[0].args.includes("--activity-stdin"));
     const activity = calls[0].input.split("\n").filter(Boolean).map((line: string) => JSON.parse(line));
@@ -325,6 +363,8 @@ test("automatic brief uses the latest transcript after a delayed provider flush 
     assert.ok(activity.some((message: { text: string }) => message.text.includes("FINAL_TRANSCRIPT_MARKER")), "the delayed final transcript append must be in the collected snapshot");
     assert.ok(status.body.summary.repository.evidence.some((item: { source: string; text: string }) => item.source === "activity:1" && item.text.includes("FINAL_TRANSCRIPT_MARKER")), "the cited activity evidence survives into the public summary");
   } finally {
+    if (existsSync(root) && !existsSync(gateRelease)) writeFileSync(gateRelease, "release");
+    if (blockerSummary) await Promise.race([blockerSummary.catch(() => {}), new Promise(resolve => setTimeout(resolve, 5000))]);
     await host.stop();
     rmSync(root, { recursive: true, force: true });
   }

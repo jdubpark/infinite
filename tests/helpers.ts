@@ -145,8 +145,8 @@ export async function endSessionWorkers(config: Config, started?: readonly numbe
 
 export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
   const root = mkdtempSync(join(tmpdir(), "inf-"));
-  const port = await freePort();
-  let origin = `http://127.0.0.1:${port}`;
+  const initialPort = options.config?.port ?? await freePort();
+  let listenerOrigin = `http://127.0.0.1:${initialPort}`;
   const tokens: Record<Role, string> = {
     owner: randomBytes(32).toString("base64url"),
     controller: randomBytes(32).toString("base64url"),
@@ -157,8 +157,8 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
   const keyFile = join(root, "key");
   writeFileSync(keyFile, randomBytes(32), { mode: 0o600 });
   const config: Config = {
-    port,
-    origin,
+    port: initialPort,
+    origin: listenerOrigin,
     keyFile,
     stateDir: join(root, "state"),
     runDir: join(root, "run"),
@@ -170,19 +170,20 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     agents: options.agents ?? { demo: demoProfile() },
     ...options.config,
   };
-  origin = config.origin;
+  const syncConfigOrigin = options.config?.origin === undefined || options.config.origin === listenerOrigin;
   const configFile = join(root, "config.json");
   writeFileSync(configFile, JSON.stringify(config));
   let child: ChildProcess | undefined;
 
-  let client = apiClient(origin, tokens);
+  let client = apiClient(listenerOrigin, tokens);
   const fetchApi: Host["fetchApi"] = (...args) => client(...args);
   const bindPort = (nextPort: number) => {
+    const previousListener = listenerOrigin;
     config.port = nextPort;
-    origin = `http://127.0.0.1:${nextPort}`;
-    config.origin = origin;
+    listenerOrigin = `http://127.0.0.1:${nextPort}`;
+    if (syncConfigOrigin || config.origin === previousListener) config.origin = listenerOrigin;
     writeFileSync(configFile, JSON.stringify(config));
-    client = apiClient(origin, tokens);
+    client = apiClient(listenerOrigin, tokens);
   };
   const stopApi = async () => {
     const api = child;
@@ -242,7 +243,7 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     }
   };
 
-  const canRebind = options.config?.port === undefined && options.config?.origin === undefined;
+  const canRebind = options.config?.port === undefined;
   try {
     for (let attempt = 0; ; attempt++) {
       try {
@@ -258,7 +259,7 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     await stop();
     throw error;
   }
-  return { origin, root, config, tokens, fetchApi, start, stopApi, stop };
+  return { origin: listenerOrigin, root, config, tokens, fetchApi, start, stopApi, stop };
 }
 
 export async function claimControl(

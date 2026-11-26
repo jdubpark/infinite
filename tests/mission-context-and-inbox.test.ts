@@ -7,11 +7,15 @@ import { applySignal, initialAttention, type Attention, type Signal, type Signal
 import { Manager } from "../packages/host/src/manager.js";
 import {
   classifyAttemptDelivery,
-  hasPendingCoordinatorInbox,
+  launchedProviderPrompt,
   reconcileDeliveredUnapplied,
   returnConsumedMessages,
+  selectCoordinatorContinuation,
+  settleCoordinatorReport,
   settleUnappliedConsumed,
+  transcriptMatchesAttemptPrompt,
   type ConsumedAttempt,
+  type LaunchPromptContext,
   type MissionQueueState,
 } from "../packages/host/src/mission-coordinator.js";
 import { MissionService, type ProjectGroupLookup } from "../packages/host/src/missions.js";
@@ -21,6 +25,7 @@ import type { TeamService } from "../packages/host/src/teams.js";
 import { TeamError } from "../packages/host/src/teams.js";
 import type { CreateTeam, NativeContinuation, TeamAssignment, TeamView } from "../packages/host/src/team-types.js";
 import { emptyRollup } from "../packages/host/src/team-usage.js";
+import { MAX_RECORDED_MESSAGE } from "../packages/host/src/transcript.js";
 import type { Config, Event } from "../packages/host/src/types.js";
 import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
 import { waitFor } from "./helpers.js";
@@ -31,6 +36,7 @@ type PromptMessage = MissionMessage & {
   reason?: string;
   check?: string;
   answer?: string;
+  kind?: string;
   forwardedTo?: { subtaskId: string; childDecisionId: string };
 };
 
@@ -53,6 +59,8 @@ const confirmDurableDelivery = async (h: ReturnType<typeof scriptedMissionHarnes
 function customCoordinatorHarness(options?: {
   realManager?: boolean;
   emitInitialTurnStart?: boolean;
+  sessionContext?: { text: string; version: number };
+  onMeta?: (sessionId: string, fallback: () => unknown) => unknown;
   onEvents?: (
     sessionId: string,
     after: number,
@@ -80,6 +88,7 @@ function customCoordinatorHarness(options?: {
   const attention = new Map<string, Attention>(), stateReads = new Map<string, number>(), sessionStatuses = new Map<string, "running" | "exited">();
   const nativeSessions = new Map<string, { id: string; source: "hook" }>();
   let launchHold: string | undefined;
+  let sessionContext = options?.sessionContext;
 
   const pushSignal = (sessionId: string, data: Signal, source: "hook" | "screen" = "hook", at = new Date()) => {
     const journal = signals.get(sessionId)!;
@@ -110,7 +119,8 @@ function customCoordinatorHarness(options?: {
     writeSealed(join(sessionDir, "meta.sealed"), key, `${sessionId}:meta`, {
       session: {
         id: sessionId, team: assignment, provider: "claude", title: "Mission coordinator", projectId: "api",
-        cwd: config.projects[0].path, createdAt: new Date().toISOString(), status: "running", contextVersion: 0, context: "", initialPrompt: "",
+        cwd: config.projects[0].path, createdAt: new Date().toISOString(), status: "running",
+        contextVersion: sessionContext?.version ?? 0, context: sessionContext?.text ?? "", initialPrompt: "",
       },
       fingerprint: "fixture",
     });
@@ -131,10 +141,11 @@ function customCoordinatorHarness(options?: {
     const filed = reports.get(sessionId), current = attempts.find(item => item.sessionId === sessionId)!;
     if (!filed || cursor > 0) return { events: [], cursor, more: false };
     const { runId, memberId, revision } = current.assignment;
-    return {
-      events: [{ seq: 1, at: new Date().toISOString(), type: "mission-report", data: { requestId: randomUUID(), missionId: runId, memberId, revision, ...filed } }],
-      cursor: 1, more: false,
-    };
+    return { events: [{ seq: 1, at: new Date().toISOString(), type: "mission-report", data: { requestId: randomUUID(), missionId: runId, memberId, revision, ...filed } }], cursor: 1, more: false };
+  };
+  const defaultMeta = (sessionId: string) => {
+    if (launchHold !== undefined && !attempts.some(item => item.sessionId === sessionId)) throw Object.assign(new Error("No such session"), { code: "ENOENT" });
+    return sessionContext ? { session: { context: sessionContext.text, contextVersion: sessionContext.version } } : {};
   };
   const manager = {
     async createTeamSession(request: CoordinatorRequest, assignment: TeamAssignment) {
@@ -153,8 +164,8 @@ function customCoordinatorHarness(options?: {
       return options?.onEvents ? options.onEvents(sessionId, cursor, limit, types, fallback) : fallback();
     },
     meta(sessionId: string) {
-      if (launchHold !== undefined && !attempts.some(item => item.sessionId === sessionId)) throw Object.assign(new Error("No such session"), { code: "ENOENT" });
-      return {};
+      const fallback = () => defaultMeta(sessionId);
+      return options?.onMeta ? options.onMeta(sessionId, fallback) : fallback();
     },
     hostLoad: { held: () => launchHold },
     async state(sessionId: string) {
@@ -173,20 +184,13 @@ function customCoordinatorHarness(options?: {
     async createForMission(request: CreateTeam, missionId: string) {
       const existing = runs.get(request.requestId);
       if (existing) return structuredClone(existing);
-      const created = {
-        id: request.requestId, projectId: request.projectId, missionId, title: request.title, status: "implementing",
-        revision: 1, decisions: [], tasks: [], members: [], updatedAt: new Date().toISOString(), parallelism: request.parallelism, usage: emptyRollup(),
-      } as unknown as TeamView;
+      const created = { id: request.requestId, projectId: request.projectId, missionId, title: request.title, status: "implementing", revision: 1, decisions: [], tasks: [], members: [], updatedAt: new Date().toISOString(), parallelism: request.parallelism, usage: emptyRollup() } as unknown as TeamView;
       runs.set(request.requestId, created);
       return structuredClone(created);
     },
     get(id: string) { const value = runs.get(id); if (!value) throw new TeamError(404, "team-not-found", "This team does not exist."); return structuredClone(value); },
     list: () => [...runs.values()].map(item => structuredClone(item)),
-    async answer(id: string, decisionId: string, body: { text: string }) {
-      const target = runs.get(id)!, decision = target.decisions.find(item => item.id === decisionId);
-      if (decision) decision.answer = body.text;
-      return structuredClone(target);
-    },
+    async answer(id: string, decisionId: string, body: { text: string }) { const target = runs.get(id)!, decision = target.decisions.find(item => item.id === decisionId); if (decision) decision.answer = body.text; return structuredClone(target); },
     async pause(id: string) { const target = runs.get(id)!; target.status = "paused"; return structuredClone(target); },
     async resume(id: string) { const target = runs.get(id)!; target.status = "implementing"; return structuredClone(target); },
     async cancel(id: string) { const target = runs.get(id)!; target.status = "cancelled"; return structuredClone(target); },
@@ -213,6 +217,7 @@ function customCoordinatorHarness(options?: {
     get missions() { return missions; },
     config, key, runs, attempt, attempts: () => attempts.length,
     holdLaunches: (reason?: string) => { launchHold = reason; },
+    setSessionContext: (next?: { text: string; version: number }) => { sessionContext = next; },
     pushSignal: async (n: number, data: Signal, source: "hook" | "screen" = "hook") => pushSignal((await attempt(n)).sessionId, data, source),
     pushTranscriptMessage: async (n: number, role: "user" | "assistant" | "tool", text: string) => pushTranscriptMessage((await attempt(n)).sessionId, role, text),
     pushUsage: async (n: number, tokens: number) => pushUsage((await attempt(n)).sessionId, tokens),
@@ -230,7 +235,7 @@ function customCoordinatorHarness(options?: {
   };
 }
 
-test("INF-455: observeContext emits redacted bounded warnings on unexpected manager.events failures, deduplicates across ticks, and clears on recovery", { timeout: 60000 }, async () => {
+test("INF-455: observeContext emits redacted bounded warnings for EIO, EACCES, and ENOTDIR, deduplicates across ticks, and clears on recovery", { timeout: 60000 }, async () => {
   let failingSessionId: string | undefined;
   let failureError: Error | undefined;
   let usageReads = 0;
@@ -245,6 +250,12 @@ test("INF-455: observeContext emits redacted bounded warnings on unexpected mana
       return fallback();
     },
   });
+  const pauseResumeHeld = async (id: string, revision: number) => {
+    await h.missions.pause(id, { requestId: randomUUID(), revision });
+    await until(() => h.missions.get(id), mission => mission.coordinator?.status === "stopped");
+    await h.missions.resume(id, { requestId: randomUUID(), revision: h.missions.get(id).revision });
+    return until(() => h.missions.get(id), mission => mission.reason === "Waiting for host capacity: memory is low");
+  };
   try {
     const { id } = await h.missions.create(missionRequest(240));
     const first = await h.attempt(1);
@@ -264,35 +275,39 @@ test("INF-455: observeContext emits redacted bounded warnings on unexpected mana
     assert.match(warnings[0], /\(EIO\)/);
     assert.doesNotMatch(warnings[0], /secret-line|disk read failed|\n/);
 
-    await h.missions.pause(id, { requestId: randomUUID(), revision: held1.revision });
-    await until(() => h.missions.get(id), mission => mission.coordinator?.status === "stopped");
-    await h.missions.resume(id, { requestId: randomUUID(), revision: h.missions.get(id).revision });
-    const held2 = await until(() => h.missions.get(id), mission => mission.reason === "Waiting for host capacity: memory is low");
+    const held2 = await pauseResumeHeld(id, held1.revision);
     assert.equal(usageReads, 2);
     assert.equal(warnings.length, 1);
 
     failureError = undefined;
     await h.pushUsage(1, 40000);
-    await h.missions.pause(id, { requestId: randomUUID(), revision: held2.revision });
-    await until(() => h.missions.get(id), mission => mission.coordinator?.status === "stopped");
-    await h.missions.resume(id, { requestId: randomUUID(), revision: h.missions.get(id).revision });
-    const held3 = await until(() => h.missions.get(id), mission => mission.reason === "Waiting for host capacity: memory is low");
+    const held3 = await pauseResumeHeld(id, held2.revision);
     assert.equal(usageReads, 3);
     assert.equal(warnings.length, 1);
 
     failureError = Object.assign(new Error("EACCES: permission denied, open '/private/state/sessions/meta.sealed'"), { code: "EACCES" });
-    await h.missions.pause(id, { requestId: randomUUID(), revision: held3.revision });
-    await until(() => h.missions.get(id), mission => mission.coordinator?.status === "stopped");
-    await h.missions.resume(id, { requestId: randomUUID(), revision: h.missions.get(id).revision });
-    const held4 = await until(() => h.missions.get(id), mission => mission.reason === "Waiting for host capacity: memory is low");
+    const held4 = await pauseResumeHeld(id, held3.revision);
     assert.equal(usageReads, 4);
     assert.equal(warnings.length, 2);
     assert.match(warnings[1], /\(EACCES\)/);
     assert.doesNotMatch(warnings[1], /\/private\/state|meta\.sealed|permission denied/);
 
     failureError = undefined;
+    await h.pushUsage(1, 50000);
+    const held5 = await pauseResumeHeld(id, held4.revision);
+    assert.equal(usageReads, 5);
+    assert.equal(warnings.length, 2);
+
+    failureError = Object.assign(new Error("ENOTDIR: not a directory, scandir '/private/sessions/bad/events'"), { code: "ENOTDIR" });
+    const held6 = await pauseResumeHeld(id, held5.revision);
+    assert.equal(usageReads, 6);
+    assert.equal(warnings.length, 3);
+    assert.match(warnings[2], /\(ENOTDIR\)/);
+    assert.doesNotMatch(warnings[2], /\/private\/sessions|not a directory/);
+
+    failureError = undefined;
     await h.pushUsage(1, 130000);
-    await h.missions.pause(id, { requestId: randomUUID(), revision: held4.revision });
+    await h.missions.pause(id, { requestId: randomUUID(), revision: held6.revision });
     await until(() => h.missions.get(id), mission => mission.coordinator?.status === "stopped");
     h.holdLaunches();
     await h.missions.resume(id, { requestId: randomUUID(), revision: h.missions.get(id).revision });
@@ -305,7 +320,7 @@ test("INF-455: observeContext emits redacted bounded warnings on unexpected mana
   }
 });
 
-test("INF-455: real Manager missing-session ENOENT stays quiet while corrupted session journal emits a redacted category warning", { timeout: 60000 }, async () => {
+test("INF-455: real Manager ENOENT stays quiet while corrupted journal and ENOTDIR emit redacted category warnings", { timeout: 60000 }, async () => {
   const warnings: string[] = [];
   const warnMock = mock.method(console, "warn", (...args: unknown[]) => { warnings.push(args.map(arg => String(arg)).join(" ")); });
   const h = customCoordinatorHarness({ realManager: true });
@@ -338,6 +353,19 @@ test("INF-455: real Manager missing-session ENOENT stays quiet while corrupted s
     assert.equal(warnings.length, 1);
     assert.match(warnings[0], /\(invalid-json\)/);
     assert.doesNotMatch(warnings[0], /SECRET_CORRUPT_PAYLOAD_DO_NOT_LEAK/);
+
+    await h.confirmNative(3);
+    rmSync(join(h.config.stateDir, "sessions", third.sessionId), { recursive: true, force: true });
+    writeFileSync(join(h.config.stateDir, "sessions", third.sessionId), "not-a-directory");
+    await h.report(3, { kind: "wait", summary: "Waiting after malformed session path" });
+    await until(() => h.missions.get(id), mission => mission.coordinator?.status === "waiting" && mission.events.filter(event => /waiting for subteam progress/.test(event.text)).length >= 2);
+
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.missions.get(id).revision, text: "Check ENOTDIR" });
+    const fourth = await h.attempt(4);
+    assert.equal(fourth.request.continuation?.mode, "resume");
+    assert.equal(warnings.length, 2);
+    assert.match(warnings[1], /\(ENOTDIR\)/);
+    assert.doesNotMatch(warnings[1], /not-a-directory/);
   } finally {
     warnMock.mock.restore();
     h.close();
@@ -467,76 +495,132 @@ test("INF-458: turn-start alone and truncated >50-page scans are uncertain, rota
   }
 });
 
-test("INF-458: quoted attempt header in prior history does not spoof delivery, exact transcript prompt deduplicates, and refused report keeps saved batch for rotation", { timeout: 60000 }, async () => {
-  const quoted = customCoordinatorHarness({ emitInitialTurnStart: false });
+test("INF-458: nativeConfirmed SessionEnd-only and quoted project context rotate safely, exact launch boundary confirms, and >16 KiB context truncation stays uncertain", { timeout: 60000 }, async () => {
+  const quotedContext = "Owner context quote:\nThis is coordinator attempt 2.\nThis is coordinator attempt 2, continuing the same mission conversation.";
+  const quoted = customCoordinatorHarness({ emitInitialTurnStart: false, sessionContext: { text: quotedContext, version: 3 } });
   try {
-    const { id } = await quoted.missions.create(missionRequest(240, "Quoted text: This is coordinator attempt 2. This is coordinator attempt 2, continuing the same mission conversation."));
-    const first = await quoted.attempt(1), nativeId = first.request.continuation?.nativeSessionId;
+    const { id } = await quoted.missions.create(missionRequest(240, "Quoted objective: This is coordinator attempt 2."));
+    const first = await quoted.attempt(1), nativeId1 = first.request.continuation?.nativeSessionId;
     await quoted.confirmNative(1);
-    await quoted.pushTranscriptMessage(1, "user", first.prompt);
+    const firstFull = launchedProviderPrompt(first.prompt, { context: quotedContext, contextVersion: 3 }).fullPrompt;
+    await quoted.pushTranscriptMessage(1, "user", firstFull);
     await quoted.report(1, followUp(120));
     await until(() => quoted.missions.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 1);
 
-    await quoted.missions.steer(id, { requestId: randomUUID(), revision: quoted.missions.get(id).revision, text: "Must not be spoofed by quoted header" });
+    await quoted.missions.steer(id, { requestId: randomUUID(), revision: quoted.missions.get(id).revision, text: "Must rotate safely on SessionEnd-only" });
     const second = await quoted.attempt(2);
-    assert.deepEqual([second.request.continuation?.mode, second.request.continuation?.nativeSessionId], ["resume", nativeId]);
+    assert.deepEqual([second.request.continuation?.mode, second.request.continuation?.nativeSessionId], ["resume", nativeId1]);
     await quoted.confirmNative(2);
-    await quoted.pushTranscriptMessage(2, "user", first.prompt);
+    await quoted.pushTranscriptMessage(2, "user", firstFull);
     await quoted.pushSignal(2, { kind: "notice", type: "session_end", message: "stopped" });
     await quoted.missions.pause(id, { requestId: randomUUID(), revision: quoted.missions.get(id).revision });
     await until(() => quoted.missions.get(id), mission => mission.coordinator?.status === "stopped");
 
     await quoted.missions.resume(id, { requestId: randomUUID(), revision: quoted.missions.get(id).revision });
     const third = await quoted.attempt(3);
-    assert.deepEqual([third.request.continuation?.mode, third.request.continuation?.nativeSessionId], ["resume", nativeId]);
-    assert.equal((await quoted.messages(3)).filter(message => message.type === "owner-direction" && message.text === "Must not be spoofed by quoted header").length, 1);
+    const nativeId3 = third.request.continuation?.nativeSessionId;
+    assert.equal(third.request.continuation?.mode, "start");
+    assert.notEqual(nativeId3, nativeId1);
+    assert.equal((await quoted.messages(3)).filter(message => message.type === "owner-direction" && message.text === "Must rotate safely on SessionEnd-only").length, 1);
 
     await quoted.confirmNative(3);
-    await quoted.pushTranscriptMessage(3, "user", third.prompt);
+    const thirdFull = launchedProviderPrompt(third.prompt, { context: quotedContext, contextVersion: 3 }).fullPrompt;
+    await quoted.pushTranscriptMessage(3, "user", thirdFull);
     await quoted.missions.pause(id, { requestId: randomUUID(), revision: quoted.missions.get(id).revision });
     await until(() => quoted.missions.get(id), mission => mission.coordinator?.status === "stopped");
 
     await quoted.missions.resume(id, { requestId: randomUUID(), revision: quoted.missions.get(id).revision });
     const fourth = await quoted.attempt(4);
-    assert.deepEqual([fourth.request.continuation?.mode, fourth.request.continuation?.nativeSessionId], ["resume", nativeId]);
-    assert.equal((await quoted.messages(4)).filter(message => message.type === "owner-direction" && message.text === "Must not be spoofed by quoted header").length, 0);
+    assert.deepEqual([fourth.request.continuation?.mode, fourth.request.continuation?.nativeSessionId], ["resume", nativeId3]);
+    assert.equal((await quoted.messages(4)).filter(message => message.type === "owner-direction" && message.text === "Must rotate safely on SessionEnd-only").length, 0);
+
+    await quoted.confirmNative(4);
+    await quoted.report(4, followUp(120));
+    await until(() => quoted.missions.get(id), mission => mission.coordinator?.status === "waiting" && openFollowUpCount(mission) === 2);
+
+    const hugeContext = "C".repeat(MAX_RECORDED_MESSAGE + 512);
+    quoted.setSessionContext({ text: hugeContext, version: 4 });
+    await quoted.missions.steer(id, { requestId: randomUUID(), revision: quoted.missions.get(id).revision, text: "Must stay uncertain when context overflows 16 KiB" });
+    const fifth = await quoted.attempt(5);
+    assert.deepEqual([fifth.request.continuation?.mode, fifth.request.continuation?.nativeSessionId], ["resume", nativeId3]);
+    await quoted.confirmNative(5);
+    const truncatedFifth = launchedProviderPrompt(fifth.prompt, { context: hugeContext, contextVersion: 4 }).fullPrompt.slice(0, MAX_RECORDED_MESSAGE);
+    assert.equal(transcriptMatchesAttemptPrompt(truncatedFifth, fifth.prompt, 5, { context: hugeContext, contextVersion: 4 }), false);
+    assert.equal(transcriptMatchesAttemptPrompt(truncatedFifth, fifth.prompt, 5, { unreadable: true }), false);
+    await quoted.pushTranscriptMessage(5, "user", truncatedFifth);
+    await quoted.missions.pause(id, { requestId: randomUUID(), revision: quoted.missions.get(id).revision });
+    await until(() => quoted.missions.get(id), mission => mission.coordinator?.status === "stopped");
+
+    await quoted.missions.resume(id, { requestId: randomUUID(), revision: quoted.missions.get(id).revision });
+    const sixth = await quoted.attempt(6);
+    assert.equal(sixth.request.continuation?.mode, "start");
+    assert.notEqual(sixth.request.continuation?.nativeSessionId, nativeId3);
+    assert.equal((await quoted.messages(6)).filter(message => message.type === "owner-direction" && message.text === "Must stay uncertain when context overflows 16 KiB").length, 1);
   } finally {
     quoted.close();
   }
+});
 
-  const refusedThenRotate = scriptedMissionHarness();
+test("INF-458: refused reports and deferred steer-subtask retain saved deliveredUnapplied until accepted, restoring them on rotation", { timeout: 60000 }, async () => {
+  const preparePausedDeliveredSubtask = async (h: ReturnType<typeof scriptedMissionHarness>, steerText: string) => {
+    const { id } = await h.missions.create(missionRequest(240));
+    const first = await h.attempt(1), nativeId = first.request.continuation?.nativeSessionId;
+    await h.confirmNative(1);
+    await h.report(1, { kind: "dispatch", summary: "Run API subtask", subtasks: [plan("a", "api")] });
+    await until(() => h.get(id), mission => Boolean(mission.subtasks.find(item => item.id === "a")?.teamId));
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: steerText });
+    const second = await h.attempt(2);
+    assert.deepEqual([second.request.continuation?.mode, second.request.continuation?.nativeSessionId], ["resume", nativeId]);
+    await confirmDurableDelivery(h, 2);
+    await h.missions.pause(id, { requestId: randomUUID(), revision: h.get(id).revision });
+    await until(() => h.get(id), mission => mission.coordinator?.status === "stopped");
+    await h.missions.resume(id, { requestId: randomUUID(), revision: h.get(id).revision });
+    const third = await h.attempt(3);
+    assert.deepEqual([third.request.continuation?.mode, third.request.continuation?.nativeSessionId], ["resume", nativeId]);
+    assert.equal((await h.messages(3) as PromptMessage[]).filter(message => message.type === "owner-direction").length, 0);
+    await h.confirmNative(3);
+    return { id, nativeId };
+  };
+
+  const refusedImmediate = scriptedMissionHarness();
   mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
   try {
-    const { id } = await refusedThenRotate.missions.create(missionRequest(240));
-    const first = await refusedThenRotate.attempt(1), nativeId = first.request.continuation?.nativeSessionId;
-    await refusedThenRotate.confirmNative(1);
-    await refusedThenRotate.report(1, { kind: "dispatch", summary: "Run API subtask", subtasks: [plan("a", "api")] });
-    await until(() => refusedThenRotate.get(id), mission => Boolean(mission.subtasks.find(item => item.id === "a")?.teamId));
-
-    await refusedThenRotate.missions.steer(id, { requestId: randomUUID(), revision: refusedThenRotate.get(id).revision, text: "Keep batch across refused report" });
-    const second = await refusedThenRotate.attempt(2);
-    assert.deepEqual([second.request.continuation?.mode, second.request.continuation?.nativeSessionId], ["resume", nativeId]);
-    await confirmDurableDelivery(refusedThenRotate, 2);
-    await refusedThenRotate.missions.pause(id, { requestId: randomUUID(), revision: refusedThenRotate.get(id).revision });
-    await until(() => refusedThenRotate.get(id), mission => mission.coordinator?.status === "stopped");
-
-    await refusedThenRotate.missions.resume(id, { requestId: randomUUID(), revision: refusedThenRotate.get(id).revision });
-    const third = await refusedThenRotate.attempt(3);
-    assert.deepEqual([third.request.continuation?.mode, third.request.continuation?.nativeSessionId], ["resume", nativeId]);
-    assert.equal((await refusedThenRotate.messages(3) as PromptMessage[]).filter(message => message.type === "owner-direction").length, 0);
-    await refusedThenRotate.confirmNative(3);
-    await refusedThenRotate.usage(3, 130000);
-    await refusedThenRotate.report(3, { kind: "result", summary: "Premature result while subtask a runs" });
-
-    const fourth = await refusedThenRotate.attempt(4);
+    const { nativeId } = await preparePausedDeliveredSubtask(refusedImmediate, "Keep batch across refused report");
+    await refusedImmediate.usage(3, 130000);
+    await refusedImmediate.report(3, { kind: "result", summary: "Premature result while subtask a runs" });
+    const fourth = await refusedImmediate.attempt(4);
     assert.equal(fourth.request.continuation?.mode, "start");
     assert.notEqual(fourth.request.continuation?.nativeSessionId, nativeId);
-    const fourthMessages = await refusedThenRotate.messages(4) as PromptMessage[];
-    assert.equal(fourthMessages.filter(message => message.type === "owner-direction" && message.text === "Keep batch across refused report").length, 1);
-  } finally {
-    refusedThenRotate.close();
-    mock.timers.reset();
-  }
+    assert.equal((await refusedImmediate.messages(4) as PromptMessage[]).filter(message => message.type === "owner-direction" && message.text === "Keep batch across refused report").length, 1);
+  } finally { refusedImmediate.close(); mock.timers.reset(); }
+
+  const deferredRefused = scriptedMissionHarness();
+  try {
+    const { nativeId } = await preparePausedDeliveredSubtask(deferredRefused, "Keep batch across refused deferred steer");
+    deferredRefused.limitSteering();
+    await deferredRefused.usage(3, 130000);
+    await deferredRefused.report(3, { kind: "steer-subtask", subtaskId: "a", text: "Adjust API response codes" });
+    const fourth = await deferredRefused.attempt(4);
+    assert.equal(fourth.request.continuation?.mode, "start");
+    assert.notEqual(fourth.request.continuation?.nativeSessionId, nativeId);
+    const fourthMessages = await deferredRefused.messages(4) as PromptMessage[];
+    assert.equal(fourthMessages.filter(message => message.type === "owner-direction" && message.text === "Keep batch across refused deferred steer").length, 1);
+    assert.equal(fourthMessages.filter(message => message.type === "refused" && message.kind === "steer-subtask").length, 1);
+  } finally { deferredRefused.close(); }
+
+  const deferredAccepted = scriptedMissionHarness();
+  try {
+    const { id } = await preparePausedDeliveredSubtask(deferredAccepted, "Clear only after deferred steer succeeds");
+    deferredAccepted.holdSteers(true);
+    await deferredAccepted.report(3, { kind: "steer-subtask", subtaskId: "a", text: "Refine API validation" });
+    await until(() => deferredAccepted.get(id), mission => mission.coordinator?.status === "waiting" && mission.events.some(event => /sent direction to subtask a/.test(event.text)));
+    const readDelivered = () => (deferredAccepted.stored(id) as unknown as { deliveredUnapplied?: unknown[] }).deliveredUnapplied;
+    assert.equal(readDelivered()?.length, 1);
+    deferredAccepted.holdSteers(false);
+    await until(() => deferredAccepted.steers.length, count => count === 1);
+    await until(readDelivered, batches => batches === undefined);
+    assert.equal(readDelivered(), undefined);
+  } finally { deferredAccepted.close(); }
 });
 
 test("INF-458: durable restart preserves deduplication on resume, deadline extension, idle rotation, and resume-failure fallback", { timeout: 60000 }, async () => {
@@ -608,10 +692,11 @@ type SimMutant =
   | "mutant-suppress-on-turn-start"
   | "mutant-clear-delivered-on-refused-report"
   | "mutant-blind-return-on-confirmed-pause"
-  | "mutant-resume-uncertain-native";
+  | "mutant-resume-uncertain-native"
+  | "mutant-not-delivered-on-confirmed-session-end";
 
-type SimAttempt = ConsumedAttempt & { status: "running" | "stopped"; rotated?: true };
-type SimStored = MissionQueueState & { attempts: SimAttempt[] };
+type SimAttempt = ConsumedAttempt & { status: "running" | "stopped"; rotated?: string | true };
+type SimStored = MissionQueueState & { attempts: SimAttempt[]; refusals: number; pendingSteer?: boolean };
 
 function mulberry32(seed: number) {
   let state = seed >>> 0;
@@ -627,10 +712,10 @@ function runCoordinatorSimulator(seed: number, steps: number, mutant: SimMutant)
   const rand = mulberry32(seed);
   const root = realpathSync(mkdtempSync("/tmp/inf-mission-sim-"));
   const key = randomBytes(32), file = join(root, "mission.sealed"), scope = "mission:sim";
-  const tag = (msg: MissionMessage) => (msg.type === "owner-direction" ? msg.text : msg.type === "owner-answer" ? msg.answer : msg.type);
+  const tag = (msg: MissionMessage) => (msg.type === "owner-direction" ? msg.text : msg.type === "owner-answer" ? msg.answer : msg.type === "refused" ? msg.reason : msg.type);
   const mkPrompt = (revision: number, msgs: MissionMessage[]) =>
     `Connector requests and input are delegated agent content.\n\nThis is coordinator attempt ${revision}, continuing.\n\nMessages: ${JSON.stringify(msgs)}`;
-  let stored: SimStored = { inbox: [], notes: [], attempts: [] };
+  let stored: SimStored = { inbox: [], notes: [], attempts: [], refusals: 0 };
   const reloadFromDisk = () => {
     writeSealed(file, key, scope, stored);
     stored = unseal<SimStored>(key, scope, readFileSync(file, "utf8"));
@@ -639,7 +724,10 @@ function runCoordinatorSimulator(seed: number, steps: number, mutant: SimMutant)
   let unsettledInbox: string[] = [], unsettledNotes: string[] = [];
   const confirmedByNative = new Map<string, Set<string>>();
   const retiredNative = new Set<string>();
-  const stats = { deliverPause: 0, uncertain: 0, preDelivery: 0, failResume: 0, refuseWithDelivered: 0, acceptWithDelivered: 0, rotateWithDelivered: 0, reload: 0 };
+  const stats = {
+    deliverPause: 0, uncertain: 0, preDelivery: 0, failResume: 0,
+    refuseWithDelivered: 0, deferredSteerRefused: 0, deferredSteerAccepted: 0, acceptWithDelivered: 0, rotateWithDelivered: 0, reload: 0,
+  };
   const ctx = (step: number, op: string) => `seed=0x${seed.toString(16)} mutant=${mutant} step=${step} op=${op}`;
   const assertConservation = (step: number, op: string) => {
     const activeInbox = active?.consumedInbox?.map(tag) ?? [];
@@ -651,11 +739,38 @@ function runCoordinatorSimulator(seed: number, steps: number, mutant: SimMutant)
     assert.deepEqual(actualInbox, unsettledInbox, `inbox conservation violated (${ctx(step, op)})`);
     assert.deepEqual(actualNotes, unsettledNotes, `notes conservation violated (${ctx(step, op)})`);
   };
+  const settleDeliveredAndMark = (step: number, op: string, accepted: boolean) => {
+    if (accepted) {
+      const settledIn = new Set((stored.deliveredUnapplied ?? []).flatMap(batch => batch.inbox.map(tag)));
+      const settledNo = new Set((stored.deliveredUnapplied ?? []).flatMap(batch => batch.notes.map(tag)));
+      unsettledInbox = unsettledInbox.filter(item => !settledIn.has(item));
+      unsettledNotes = unsettledNotes.filter(item => !settledNo.has(item));
+      settleCoordinatorReport(stored, "accepted");
+    } else {
+      settleCoordinatorReport(stored, mutant === "mutant-clear-delivered-on-refused-report" ? "accepted" : "refused");
+      stored.refusals++;
+    }
+    assertConservation(step, op);
+  };
   try {
     for (let step = 0; step < steps; step++) {
+      if (!active && stored.pendingSteer) {
+        delete stored.pendingSteer;
+        const accepted = rand() < 0.5;
+        if (accepted) {
+          if (stored.deliveredUnapplied?.length) stats.deferredSteerAccepted++;
+          settleDeliveredAndMark(step, "apply-deferred-steer-accept", true);
+        } else {
+          if (stored.deliveredUnapplied?.length) stats.deferredSteerRefused++;
+          const reason = `steer-refused-${nextSeq++}`;
+          stored.inbox.push({ type: "refused", kind: "steer-subtask", reason });
+          unsettledInbox.push(reason);
+          settleDeliveredAndMark(step, "apply-deferred-steer-refuse", false);
+        }
+        continue;
+      }
       if (!active) {
-        const hasSaved = Boolean(stored.deliveredUnapplied?.length);
-        const enqueueNew = !stored.inbox.length ? (!hasSaved || rand() < 0.75) : rand() < 0.25;
+        const enqueueNew = !stored.inbox.length || rand() < 0.25;
         if (enqueueNew) {
           const id = `i${nextSeq++}`;
           stored.inbox.push({ type: "owner-direction", text: id });
@@ -668,23 +783,17 @@ function runCoordinatorSimulator(seed: number, steps: number, mutant: SimMutant)
           assertConservation(step, "enqueue");
           continue;
         }
-        if (!hasPendingCoordinatorInbox(stored)) continue;
         const forceRotate = rand() < 0.2;
-        let continuation: NativeContinuation | undefined;
-        if (!forceRotate) {
-          for (let index = stored.attempts.length - 1; index >= 0; index--) {
-            const prev = stored.attempts[index], nid = prev.continuation?.nativeSessionId;
-            const retired = (id: string) => stored.attempts.slice(index).some(item =>
-              (item.resumeFailed || (mutant !== "mutant-resume-uncertain-native" && item.deliveryUncertain)) && item.continuation?.nativeSessionId === id);
-            if (prev.nativeConfirmed && nid && !retired(nid)) { continuation = { mode: "resume", nativeSessionId: nid }; break; }
-            if (prev.rotated) break;
-          }
-        }
-        const rotated = Boolean(forceRotate);
-        continuation ??= { mode: "start", nativeSessionId: `nat-${nextSeq++}` };
+        const attemptsForSelection = mutant === "mutant-resume-uncertain-native"
+          ? stored.attempts.map(({ deliveryUncertain: _ignored, ...rest }) => rest)
+          : stored.attempts;
+        const { continuation, rotated } = selectCoordinatorContinuation(
+          attemptsForSelection,
+          () => (forceRotate ? "context" : undefined),
+          () => `nat-${nextSeq++}`,
+        );
         if (continuation.mode === "start" && stored.deliveredUnapplied?.length) stats.rotateWithDelivered++;
         reconcileDeliveredUnapplied(stored, continuation.mode === "resume" ? continuation.nativeSessionId : undefined);
-        if (!stored.inbox.length) { assertConservation(step, "wake-empty"); continue; }
         if (continuation.mode === "resume") {
           assert.equal(retiredNative.has(continuation.nativeSessionId), false, `resumed retired native session (${ctx(step, "wake")})`);
           const seen = confirmedByNative.get(continuation.nativeSessionId) ?? new Set<string>();
@@ -706,7 +815,7 @@ function runCoordinatorSimulator(seed: number, steps: number, mutant: SimMutant)
         const revision = stored.attempts.length + 1;
         active = {
           sessionId: `sess-${revision}`, revision, prompt: mkPrompt(revision, [...takeInbox, ...takeNotes]),
-          continuation, status: "running", ...(rotated ? { rotated: true } : {}), consumedInbox: takeInbox, consumedNotes: takeNotes,
+          continuation, status: "running", ...(rotated ? { rotated } : {}), consumedInbox: takeInbox, consumedNotes: takeNotes,
         };
         stored.attempts.push(active);
         assertConservation(step, "wake");
@@ -719,24 +828,25 @@ function runCoordinatorSimulator(seed: number, steps: number, mutant: SimMutant)
         stored.inbox.push({ type: "owner-direction", text: id });
         unsettledInbox.push(id);
         assertConservation(step, "enqueue-mid-attempt");
-      } else if (roll < 0.18) {
+      } else if (roll < 0.16) {
         reloadFromDisk();
         stats.reload++;
         active = stored.attempts.at(-1)!;
         assertConservation(step, "reload");
-      } else if (roll < 0.40) {
+      } else if (roll < 0.36) {
         active.nativeConfirmed = true;
         active.status = "stopped";
         const nativeId = active.continuation!.nativeSessionId;
         const confirmedItems = [...(active.consumedInbox ?? []), ...(active.consumedNotes ?? [])].map(tag);
-        const mode = rand() < 0.5 ? "transcript" : "tool";
-        const events: Event[] = mode === "transcript"
-          ? [{ seq: 1, at: new Date().toISOString(), type: "message", data: { id: "u1", role: "user", text: active.prompt } }]
+        const contextMeta: LaunchPromptContext | undefined = rand() < 0.5 ? { context: "Shared notes", contextVersion: 2 } : undefined;
+        const promptText = launchedProviderPrompt(active.prompt, contextMeta).fullPrompt;
+        const events: Event[] = rand() < 0.5
+          ? [{ seq: 1, at: new Date().toISOString(), type: "message", data: { id: "u1", role: "user", text: promptText } }]
           : [{ seq: 1, at: new Date().toISOString(), type: "signal", data: { kind: "tool-start", source: "hook", provider: "claude" } }];
         if (mutant === "mutant-blind-return-on-confirmed-pause") {
           returnConsumedMessages(stored, active);
         } else {
-          const outcome = settleUnappliedConsumed(stored, active, () => ({ events, cursor: 1, more: false }));
+          const outcome = settleUnappliedConsumed(stored, active, () => ({ events, cursor: 1, more: false }), contextMeta);
           assert.equal(outcome.kind, "confirmed", `expected confirmed (${ctx(step, "deliver-pause")})`);
         }
         const seen = confirmedByNative.get(nativeId) ?? new Set<string>();
@@ -750,17 +860,26 @@ function runCoordinatorSimulator(seed: number, steps: number, mutant: SimMutant)
         active.status = "stopped";
         const nativeId = active.continuation!.nativeSessionId;
         const uncertainKind = rand();
-        const reader = uncertainKind < 0.4
+        const sessionEndOnly = uncertainKind >= 0.75;
+        const reader = uncertainKind < 0.25
           ? () => ({ events: [{ seq: 1, at: new Date().toISOString(), type: "signal" as const, data: { kind: "turn-start", source: "hook", provider: "claude" } }], cursor: 1, more: false })
-          : uncertainKind < 0.7
+          : uncertainKind < 0.5
             ? () => { throw new Error("read failed"); }
-            : (_id: string, after: number) => ({ events: [], cursor: after + 1, more: true });
+            : uncertainKind < 0.75
+              ? (_id: string, after: number) => ({ events: [], cursor: after + 1, more: true })
+              : () => ({ events: [{ seq: 1, at: new Date().toISOString(), type: "signal" as const, data: { kind: "notice", type: "session_end", source: "hook", provider: "claude" } }], cursor: 1, more: false });
         if (mutant === "mutant-suppress-on-turn-start") {
           assert.equal(classifyAttemptDelivery(active, reader).kind, "uncertain", `mutant precondition (${ctx(step, "uncertain")})`);
           const inbox = active.consumedInbox ?? [], notes = active.consumedNotes ?? [];
           (stored.deliveredUnapplied ??= []).push({ nativeSessionId: nativeId, inbox: [...inbox], notes: [...notes] });
           delete active.consumedInbox;
           delete active.consumedNotes;
+        } else if (mutant === "mutant-not-delivered-on-confirmed-session-end" && sessionEndOnly) {
+          assert.equal(classifyAttemptDelivery(active, reader).kind, "uncertain", `mutant precondition (${ctx(step, "session-end")})`);
+          const seen = confirmedByNative.get(nativeId) ?? new Set<string>();
+          for (const item of [...(active.consumedInbox ?? []), ...(active.consumedNotes ?? [])].map(tag)) seen.add(item);
+          confirmedByNative.set(nativeId, seen);
+          returnConsumedMessages(stored, active);
         } else {
           const outcome = settleUnappliedConsumed(stored, active, reader);
           assert.equal(outcome.kind, "uncertain", `expected uncertain (${ctx(step, "uncertain")})`);
@@ -769,18 +888,15 @@ function runCoordinatorSimulator(seed: number, steps: number, mutant: SimMutant)
         stats.uncertain++;
         active = undefined;
         assertConservation(step, "uncertain-delivery");
-      } else if (roll < 0.65) {
-        active.nativeConfirmed = true;
+      } else if (roll < 0.64 && active.continuation?.mode === "start") {
+        active.nativeConfirmed = false;
         active.status = "stopped";
-        const outcome = settleUnappliedConsumed(stored, active, () => ({
-          events: [{ seq: 1, at: new Date().toISOString(), type: "signal", data: { kind: "notice", type: "session_end", source: "hook", provider: "claude" } }],
-          cursor: 1, more: false,
-        }));
+        const outcome = settleUnappliedConsumed(stored, active, () => ({ events: [], cursor: 0, more: false }));
         assert.equal(outcome.kind, "not-delivered", `expected not-delivered (${ctx(step, "pre-delivery-pause")})`);
         stats.preDelivery++;
         active = undefined;
         assertConservation(step, "pre-delivery-pause");
-      } else if (roll < 0.75 && active.continuation?.mode === "resume") {
+      } else if (roll < 0.72 && active.continuation?.mode === "resume") {
         active.resumeFailed = true;
         active.status = "stopped";
         retiredNative.add(active.continuation.nativeSessionId);
@@ -788,32 +904,28 @@ function runCoordinatorSimulator(seed: number, steps: number, mutant: SimMutant)
         stats.failResume++;
         active = undefined;
         assertConservation(step, "fail-resume");
-      } else if (roll < 0.88) {
-        active.nativeConfirmed = true;
-        active.status = "stopped";
+      } else if (roll < 0.82) {
+        active.nativeConfirmed = true; active.status = "stopped";
         if (stored.deliveredUnapplied?.length) stats.refuseWithDelivered++;
-        const consumedIn = new Set((active.consumedInbox ?? []).map(tag));
-        const consumedNo = new Set((active.consumedNotes ?? []).map(tag));
-        unsettledInbox = unsettledInbox.filter(item => !consumedIn.has(item));
-        unsettledNotes = unsettledNotes.filter(item => !consumedNo.has(item));
-        delete active.consumedInbox;
-        delete active.consumedNotes;
-        if (mutant === "mutant-clear-delivered-on-refused-report") delete stored.deliveredUnapplied;
-        active = undefined;
-        assertConservation(step, "refuse-report");
+        const consumedIn = new Set((active.consumedInbox ?? []).map(tag)), consumedNo = new Set((active.consumedNotes ?? []).map(tag));
+        unsettledInbox = unsettledInbox.filter(item => !consumedIn.has(item)); unsettledNotes = unsettledNotes.filter(item => !consumedNo.has(item));
+        delete active.consumedInbox; delete active.consumedNotes; active = undefined;
+        settleDeliveredAndMark(step, "refuse-report", false);
+      } else if (roll < 0.91) {
+        active.nativeConfirmed = true; active.status = "stopped";
+        const consumedIn = new Set((active.consumedInbox ?? []).map(tag)), consumedNo = new Set((active.consumedNotes ?? []).map(tag));
+        unsettledInbox = unsettledInbox.filter(item => !consumedIn.has(item)); unsettledNotes = unsettledNotes.filter(item => !consumedNo.has(item));
+        delete active.consumedInbox; delete active.consumedNotes; active = undefined;
+        settleCoordinatorReport(stored, "deferred-steer");
+        stored.pendingSteer = true;
+        assertConservation(step, "deferred-steer");
       } else {
-        active.nativeConfirmed = true;
-        active.status = "stopped";
+        active.nativeConfirmed = true; active.status = "stopped";
         if (stored.deliveredUnapplied?.length) stats.acceptWithDelivered++;
-        const settledIn = new Set([...(stored.deliveredUnapplied ?? []).flatMap(b => b.inbox.map(tag)), ...(active.consumedInbox ?? []).map(tag)]);
-        const settledNo = new Set([...(stored.deliveredUnapplied ?? []).flatMap(b => b.notes.map(tag)), ...(active.consumedNotes ?? []).map(tag)]);
-        unsettledInbox = unsettledInbox.filter(item => !settledIn.has(item));
-        unsettledNotes = unsettledNotes.filter(item => !settledNo.has(item));
-        delete stored.deliveredUnapplied;
-        delete active.consumedInbox;
-        delete active.consumedNotes;
-        active = undefined;
-        assertConservation(step, "accept-report");
+        const consumedIn = new Set((active.consumedInbox ?? []).map(tag)), consumedNo = new Set((active.consumedNotes ?? []).map(tag));
+        unsettledInbox = unsettledInbox.filter(item => !consumedIn.has(item)); unsettledNotes = unsettledNotes.filter(item => !consumedNo.has(item));
+        delete active.consumedInbox; delete active.consumedNotes; active = undefined;
+        settleDeliveredAndMark(step, "accept-report", true);
       }
     }
     reloadFromDisk();
@@ -825,12 +937,15 @@ function runCoordinatorSimulator(seed: number, steps: number, mutant: SimMutant)
   }
 }
 
-test("INF-458: seeded durable-state simulator enforces conservation, ordering, zero-duplicate resume, and catches named broken mutants", t => {
+test("INF-458: seeded durable-state simulator drives production settlement/selection and catches named broken mutants", t => {
   const baseSeed = Number(process.env.MISSION_SIM_SEED ?? 0x51a7c3f1) >>> 0;
   t.diagnostic(`mission-coordinator simulator baseSeed=0x${baseSeed.toString(16)}`);
-  const totals = { deliverPause: 0, uncertain: 0, preDelivery: 0, failResume: 0, refuseWithDelivered: 0, acceptWithDelivered: 0, rotateWithDelivered: 0, reload: 0 };
+  const totals = {
+    deliverPause: 0, uncertain: 0, preDelivery: 0, failResume: 0,
+    refuseWithDelivered: 0, deferredSteerRefused: 0, deferredSteerAccepted: 0, acceptWithDelivered: 0, rotateWithDelivered: 0, reload: 0,
+  };
   for (let offset = 0; offset < 4; offset++) {
-    const run = runCoordinatorSimulator((baseSeed + offset) >>> 0, 180, "none");
+    const run = runCoordinatorSimulator((baseSeed + offset) >>> 0, 220, "none");
     for (const key of Object.keys(totals) as (keyof typeof totals)[]) totals[key] += run[key];
   }
   for (const [key, count] of Object.entries(totals)) {
@@ -841,10 +956,11 @@ test("INF-458: seeded durable-state simulator enforces conservation, ordering, z
     { name: "mutant-clear-delivered-on-refused-report", pattern: /conservation violated/ },
     { name: "mutant-blind-return-on-confirmed-pause", pattern: /duplicate redelivery/ },
     { name: "mutant-resume-uncertain-native", pattern: /resumed retired native session/ },
+    { name: "mutant-not-delivered-on-confirmed-session-end", pattern: /duplicate redelivery/ },
   ];
   for (const { name, pattern } of mutants) {
     assert.throws(
-      () => runCoordinatorSimulator(baseSeed, 240, name),
+      () => runCoordinatorSimulator(baseSeed, 280, name),
       pattern,
       `simulator failed to catch ${name} (seed=0x${baseSeed.toString(16)})`,
     );

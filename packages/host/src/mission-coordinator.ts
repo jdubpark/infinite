@@ -15,6 +15,12 @@ export type CoordinatorEventReader = (
   types?: Set<string>,
 ) => ReturnType<Manager["events"]>;
 
+export type LaunchPromptContext = {
+  context?: string;
+  contextVersion?: number;
+  unreadable?: true;
+};
+
 export type DeliveredUnappliedBatch = {
   nativeSessionId: string;
   inbox: MissionMessage[];
@@ -29,6 +35,7 @@ export type ConsumedAttempt = {
   nativeConfirmed?: boolean;
   resumeFailed?: boolean;
   deliveryUncertain?: boolean;
+  rotated?: string | true;
   report?: MissionReport;
   consumedInbox?: MissionMessage[];
   consumedNotes?: MissionMessage[];
@@ -45,10 +52,11 @@ export type AttemptDeliveryStatus =
   | { kind: "not-delivered" }
   | { kind: "uncertain"; nativeSessionId: string };
 
+export type CoordinatorReportOutcome = "accepted" | "refused" | "deferred-steer" | "deferred-blocked";
+
 export function isMissingSessionError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
-  const code = (error as { code?: unknown }).code;
-  return code === "ENOENT" || code === "ENOTDIR";
+  return (error as { code?: unknown }).code === "ENOENT";
 }
 
 export function classifyContextReadError(error: unknown): string {
@@ -113,6 +121,18 @@ export class CoordinatorContextReadTracker {
   }
 }
 
+export function launchedProviderPrompt(
+  attemptPrompt: string,
+  sessionMeta?: LaunchPromptContext,
+): { fullPrompt: string; coordinatorPromptOffset: number } {
+  const context = sessionMeta?.context;
+  if (typeof context === "string" && context.length > 0 && typeof sessionMeta?.contextVersion === "number") {
+    const prefix = `Shared project context (version ${sessionMeta.contextVersion}, provided by the owner):\n${context}\n\n`;
+    return { fullPrompt: `${prefix}${attemptPrompt}`, coordinatorPromptOffset: prefix.length };
+  }
+  return { fullPrompt: attemptPrompt, coordinatorPromptOffset: 0 };
+}
+
 function revisionMarkerEnd(prompt: string, revision: number): number {
   const period = `This is coordinator attempt ${revision}.`;
   const periodIndex = prompt.indexOf(period);
@@ -123,47 +143,54 @@ function revisionMarkerEnd(prompt: string, revision: number): number {
   return -1;
 }
 
-export function transcriptMatchesAttemptPrompt(recordedText: string, attemptPrompt: string, revision: number): boolean {
-  const expected = attemptPrompt.trim();
+export function transcriptMatchesAttemptPrompt(
+  recordedText: string,
+  attemptPrompt: string,
+  revision: number,
+  sessionMeta?: LaunchPromptContext,
+): boolean {
+  if (sessionMeta?.unreadable) return false;
+  const { fullPrompt, coordinatorPromptOffset } = launchedProviderPrompt(attemptPrompt, sessionMeta);
+  const expected = fullPrompt.trim();
   const actual = recordedText.trim();
   if (!expected || !actual) return false;
   if (actual === expected) return true;
-  if (expected.length > MAX_RECORDED_MESSAGE && actual === expected.slice(0, MAX_RECORDED_MESSAGE).trimEnd()) {
-    return true;
+  if (expected.length <= MAX_RECORDED_MESSAGE) return false;
+  const markerEnd = revisionMarkerEnd(attemptPrompt, revision);
+  if (markerEnd < 0) return false;
+  const leadingTrim = fullPrompt.length - fullPrompt.trimStart().length;
+  const requiredEnd = coordinatorPromptOffset - leadingTrim + markerEnd;
+  if (requiredEnd > MAX_RECORDED_MESSAGE) return false;
+  return actual === expected.slice(0, MAX_RECORDED_MESSAGE).trimEnd();
+}
+
+export function readSessionPromptContext(
+  sessionId: string,
+  readMeta: (id: string) => unknown,
+): LaunchPromptContext | undefined {
+  try {
+    const meta = readMeta(sessionId) as { session?: { context?: unknown; contextVersion?: unknown } } | undefined;
+    const session = meta && typeof meta === "object" ? meta.session : undefined;
+    if (!session || typeof session !== "object") return undefined;
+    return {
+      ...(typeof session.context === "string" ? { context: session.context } : {}),
+      ...(typeof session.contextVersion === "number" ? { contextVersion: session.contextVersion } : {}),
+    };
+  } catch {
+    return { unreadable: true };
   }
-  if (actual.startsWith("Shared project context (version ")) {
-    const minPrefixLength = revisionMarkerEnd(expected, revision);
-    const headerEnd = expected.indexOf("\n\n");
-    const leadingLine = headerEnd >= 0 ? expected.slice(0, headerEnd) : expected;
-    const boundary = `\n\n${leadingLine}`;
-    let index = actual.indexOf(boundary);
-    while (index >= 0) {
-      const body = actual.slice(index + 2);
-      if (body === expected) return true;
-      if (
-        minPrefixLength > 0
-        && body.length >= minPrefixLength
-        && recordedText.length >= MAX_RECORDED_MESSAGE
-        && expected.startsWith(body)
-      ) {
-        return true;
-      }
-      index = actual.indexOf(boundary, index + 2);
-    }
-  }
-  return false;
 }
 
 export function classifyAttemptDelivery(
   attempt: ConsumedAttempt,
   readEvents: CoordinatorEventReader,
+  sessionMeta?: LaunchPromptContext,
 ): AttemptDeliveryStatus {
   const nativeSessionId = attempt.continuation?.nativeSessionId;
   if (!nativeSessionId || !attempt.nativeConfirmed) return { kind: "not-delivered" };
   if (attempt.report !== undefined) return { kind: "confirmed", nativeSessionId };
   try {
     let cursor = 0;
-    let sawTurnStart = false;
     for (let pages = 0; pages < MAX_SCAN_PAGES; pages++) {
       const page = readEvents(attempt.sessionId, cursor, 200, new Set(["signal", "message"]));
       for (const event of page.events) {
@@ -171,33 +198,57 @@ export function classifyAttemptDelivery(
           if (
             event.data.role === "user"
             && typeof event.data.text === "string"
-            && transcriptMatchesAttemptPrompt(event.data.text, attempt.prompt, attempt.revision)
+            && transcriptMatchesAttemptPrompt(event.data.text, attempt.prompt, attempt.revision, sessionMeta)
           ) {
             return { kind: "confirmed", nativeSessionId };
           }
         } else if (event.type === "signal" && event.data.source === "hook") {
           const kind = typeof event.data.kind === "string" ? event.data.kind : "";
-          if (kind === "turn-start") {
-            sawTurnStart = true;
-          } else if (kind === "tool-start" || kind === "tool-end") {
+          if (kind === "tool-start" || kind === "tool-end" || (kind === "turn-end" && event.data.failed !== true)) {
             return { kind: "confirmed", nativeSessionId };
-          } else if (kind === "turn-end") {
-            if (event.data.failed === true) sawTurnStart = true;
-            else return { kind: "confirmed", nativeSessionId };
           }
         }
       }
-      if (!page.more) {
-        return sawTurnStart ? { kind: "uncertain", nativeSessionId } : { kind: "not-delivered" };
-      }
-      if (page.cursor <= cursor) {
-        return { kind: "uncertain", nativeSessionId };
-      }
+      if (!page.more || page.cursor <= cursor) return { kind: "uncertain", nativeSessionId };
       cursor = page.cursor;
     }
     return { kind: "uncertain", nativeSessionId };
   } catch {
     return { kind: "uncertain", nativeSessionId };
+  }
+}
+
+export function selectCoordinatorContinuation<R>(
+  attempts: readonly Pick<ConsumedAttempt, "continuation" | "nativeConfirmed" | "resumeFailed" | "deliveryUncertain" | "rotated">[],
+  evaluateRotation: (nativeSessionId: string) => R | undefined,
+  createNativeSessionId: () => string,
+): { continuation: NativeContinuation; rotated: R | undefined } {
+  let candidate: NativeContinuation | undefined;
+  for (let index = attempts.length - 1; index >= 0; index--) {
+    const previous = attempts[index], nativeSessionId = previous.continuation?.nativeSessionId;
+    const retired = (id: string) => attempts.slice(index).some(
+      attempt => (attempt.resumeFailed || attempt.deliveryUncertain) && attempt.continuation?.nativeSessionId === id,
+    );
+    if (previous.nativeConfirmed && nativeSessionId && !retired(nativeSessionId)) {
+      candidate = { mode: "resume", nativeSessionId };
+      break;
+    }
+    if (previous.rotated) break;
+  }
+  const rotated = candidate ? evaluateRotation(candidate.nativeSessionId) : undefined;
+  if (rotated !== undefined) candidate = undefined;
+  return { continuation: candidate ?? { mode: "start", nativeSessionId: createNativeSessionId() }, rotated };
+}
+
+export function settleCoordinatorReport(
+  stored: MissionQueueState & { refusals: number },
+  outcome: CoordinatorReportOutcome,
+): void {
+  if (outcome === "accepted") {
+    delete stored.deliveredUnapplied;
+    stored.refusals = 0;
+  } else if (outcome === "deferred-blocked") {
+    stored.refusals = 0;
   }
 }
 
@@ -238,6 +289,7 @@ export function settleUnappliedConsumed(
   stored: MissionQueueState,
   attempt: ConsumedAttempt,
   readEvents: CoordinatorEventReader,
+  sessionMeta?: LaunchPromptContext,
 ): AttemptDeliveryStatus {
   const inbox = attempt.consumedInbox ?? [];
   const notes = attempt.consumedNotes ?? [];
@@ -246,7 +298,7 @@ export function settleUnappliedConsumed(
     delete attempt.consumedNotes;
     return { kind: "not-delivered" };
   }
-  const delivery = classifyAttemptDelivery(attempt, readEvents);
+  const delivery = classifyAttemptDelivery(attempt, readEvents, sessionMeta);
   if (delivery.kind === "not-delivered") {
     returnConsumedMessages(stored, attempt);
     return delivery;
@@ -268,10 +320,6 @@ export function settleUnappliedConsumed(
   delete attempt.consumedInbox;
   delete attempt.consumedNotes;
   return delivery;
-}
-
-export function hasPendingCoordinatorInbox(stored: MissionQueueState): boolean {
-  return stored.inbox.length > 0 || Boolean(stored.deliveredUnapplied?.some(batch => batch.inbox.length > 0));
 }
 
 export function reconcileDeliveredUnapplied(stored: MissionQueueState, resumedNativeSessionId: string | undefined): void {

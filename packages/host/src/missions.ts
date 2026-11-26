@@ -26,9 +26,11 @@ import { missionDecisionQueueCandidates } from "./decision-queue.js";
 import { projectMissionSource } from "./mission-progress.js";
 import {
   CoordinatorContextReadTracker,
-  hasPendingCoordinatorInbox,
+  readSessionPromptContext,
   reconcileDeliveredUnapplied,
   returnConsumedMessages,
+  selectCoordinatorContinuation,
+  settleCoordinatorReport,
   settleUnappliedConsumed,
   type DeliveredUnappliedBatch,
 } from "./mission-coordinator.js";
@@ -926,7 +928,7 @@ export class MissionService {
     if (this.closed) return;
     stored.ops = remaining;
     for (const reason of steered) {
-      if (reason === undefined) stored.refusals = 0;
+      if (reason === undefined) settleCoordinatorReport(stored, "accepted");
       else if (live.has(stored.mission.status)) this.refuse(stored, "steer-subtask", reason);
       else this.event(stored, `A steer was not applied: ${reason}`);
     }
@@ -1062,7 +1064,7 @@ export class MissionService {
     } else if (attempt.missedReport && live.has(mission.status) && !attempt.stopping)
       this.refuse(stored, "missing", "Your previous attempt ended without a mission report. File exactly one report in every attempt; report wait when nothing needs a decision.");
     if (!applied && (attempt.stopping && live.has(mission.status) || mission.status === "paused" || mission.status === "blocked" && mission.stopReason === "deadline"))
-      settleUnappliedConsumed(stored, attempt, (sessionId, after, limit, types) => this.manager.events(sessionId, after, limit, types));
+      settleUnappliedConsumed(stored, attempt, (sessionId, after, limit, types) => this.manager.events(sessionId, after, limit, types), readSessionPromptContext(attempt.sessionId, id => this.manager.meta(id)));
     this.save(stored);
   }
   private keepNote(stored: Stored, attempt: Attempt) {
@@ -1080,28 +1082,17 @@ export class MissionService {
   }
   private async wake(stored: Stored) {
     const mission = stored.mission, last = stored.attempts.at(-1);
-    if ((last && last.status !== "stopped") || !hasPendingCoordinatorInbox(stored)) return;
-    const blockMaxAttempts = () => {
+    if ((last && last.status !== "stopped") || !stored.inbox.length) return;
+    if (stored.attempts.length >= maxAttempts) {
       this.stop(stored, "blocked", `The mission coordinator reached its limit of ${maxAttempts} attempts. Review the subtasks before starting a new mission.`);
-      this.event(stored, mission.reason!); this.save(stored);
-    };
-    if (stored.inbox.length && stored.attempts.length >= maxAttempts) { blockMaxAttempts(); return; }
+      this.event(stored, mission.reason!); this.save(stored); return;
+    }
     const revision = stored.attempts.length + 1, profile = mission.lineup.coordinator;
     let continuation: NativeContinuation | undefined, rotated: RotationRule | undefined;
     if (profile.provider === "claude") {
-      for (let index = stored.attempts.length - 1; index >= 0; index--) {
-        const previous = stored.attempts[index], nativeSessionId = previous.continuation?.nativeSessionId;
-        const retired = (id: string) => stored.attempts.slice(index).some(attempt => (attempt.resumeFailed || attempt.deliveryUncertain) && attempt.continuation?.nativeSessionId === id);
-        if (previous.nativeConfirmed && nativeSessionId && !retired(nativeSessionId)) { continuation = { mode: "resume", nativeSessionId }; break; }
-        if (previous.rotated) break;
-      }
-      rotated = continuation && this.rotation(stored, continuation.nativeSessionId);
-      if (rotated) continuation = undefined;
-      continuation ??= { mode: "start", nativeSessionId: randomUUID() };
+      ({ continuation, rotated } = selectCoordinatorContinuation(stored.attempts, nativeSessionId => this.rotation(stored, nativeSessionId), randomUUID));
     }
     reconcileDeliveredUnapplied(stored, continuation?.mode === "resume" ? continuation.nativeSessionId : undefined);
-    if (!stored.inbox.length) return;
-    if (stored.attempts.length >= maxAttempts) { blockMaxAttempts(); return; }
     const inbox = stored.inbox.slice(0, messageLimit), notes = stored.notes.slice(0, messageLimit - inbox.length);
     const waiting = stored.inbox.length + stored.notes.length - inbox.length - notes.length;
     const undelivered = stored.inbox.filter(isDirectionMessage).length;
@@ -1186,6 +1177,7 @@ export class MissionService {
     return ready.some(item => holdersOf(runs, item.repoProjectId).every(run => !waitsOnPerson(run.status)));
   }
   private refuse(stored: Stored, kind: string, reason: string, wake = true) {
+    settleCoordinatorReport(stored, "refused");
     stored.refusals++;
     this.event(stored, `The coordinator's ${kind} report was refused: ${reason}`);
     if (stored.refusals >= 3) {
@@ -1388,14 +1380,13 @@ export class MissionService {
           const reason = `A subteam's bounded recovery is still in progress. Reassess the mission blocker after it finishes. Your deferred report was: ${report.summary}`;
           this.event(stored, `The coordinator's blocked report was deferred: ${reason}`);
           stored.notes.push({ type: "refused", kind: report.kind, reason });
-          stored.refusals = 0; this.settle(stored); return;
+          settleCoordinatorReport(stored, "deferred-blocked"); this.settle(stored); return;
         }
         this.stop(stored, "blocked", report.summary);
         this.event(stored, "The coordinator reported that the mission is blocked.");
         break;
     }
-    delete stored.deliveredUnapplied;
-    if (report.kind !== "steer-subtask") stored.refusals = 0;
+    settleCoordinatorReport(stored, report.kind === "steer-subtask" ? "deferred-steer" : "accepted");
     this.settle(stored);
   }
 }

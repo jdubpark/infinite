@@ -98,3 +98,35 @@ test("a failed sealed write leaves no temporary file", () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("one appendAll batch crossing two segment boundaries writes each event once and reports its segment", () => {
+  const directory = mkdtempSync(join(tmpdir(), "inf-vault-"));
+  const key = randomBytes(32);
+  try {
+    const seen: { seq: number; segment: string }[] = [];
+    const journal = new Journal(directory, key, "session-b", {
+      onAppend: (event, meta) => seen.push({ seq: event.seq, segment: meta.segment }),
+    });
+    for (let i = 0; i < 990; i++) journal.append("output", { text: `lead ${i}` });
+    seen.length = 0;
+    const events = journal.appendAll(
+      "output",
+      Array.from({ length: 300 }, (_, i) => ({ text: `batch ${i}` })),
+    );
+    assert.equal(events.length, 300);
+    assert.equal(journal.seq, 1290);
+    const read = readEvents(directory, key, "session-b", 0, 5000).events;
+    assert.deepEqual(
+      read.map((e) => e.seq),
+      Array.from({ length: 1290 }, (_, i) => i + 1),
+    );
+    assert.deepEqual(
+      seen.map((e) => e.seq),
+      Array.from({ length: 300 }, (_, i) => 991 + i),
+    );
+    for (const entry of seen)
+      assert.equal(entry.segment, `${String(Math.floor((entry.seq - 1) / 256)).padStart(10, "0")}.journal`);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

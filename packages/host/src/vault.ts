@@ -113,12 +113,13 @@ export class Journal {
   }
   appendAll(type: Event["type"], items: Event["data"][]): Event[] {
     const at = new Date().toISOString();
+    const first = this.seq;
     const events = items.map(
-      (data, index): Event => ({ seq: this.seq + index + 1, at, type, data }),
+      (data, index): Event => ({ seq: first + index + 1, at, type, data }),
     );
     for (let start = 0; start < events.length; ) {
       const segment = Math.floor((events[start].seq - 1) / SEGMENT_SIZE);
-      const end = Math.min(events.length, (segment + 1) * SEGMENT_SIZE - this.seq);
+      const end = Math.min(events.length, (segment + 1) * SEGMENT_SIZE - first);
       const bytes = Buffer.from(
         events
           .slice(start, end)

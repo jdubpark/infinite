@@ -53,6 +53,8 @@ const proxied = (port: number, expectLength = 0) => inImmediate(async () => {
         let body = "";
         response.setEncoding("utf8");
         response.on("data", chunk => { body += chunk; });
+        response.on("aborted", () => reject(new Error("proxied body was cut")));
+        response.on("close", () => { if (!response.complete) reject(new Error("proxied body was cut before its end")); });
         response.on("end", () => resolve({ status: response.statusCode ?? 0, body: expectLength ? String(body.length) : body }));
       });
       outgoing.on("error", reject);
@@ -112,7 +114,7 @@ test("native proxy: an upstream that never answers fails with 502 after 15 s", a
   }
 });
 
-test("native proxy: a multi-chunk body whose response arrived during a host stall past 15 s is delivered whole", async () => {
+test("native proxy: a multi-chunk body whose response arrived during a host stall past 15 s is delivered whole", { timeout: 60000 }, async () => {
   const upstream = await peer("httpstream", true, true);
   try {
     const { outcome } = await timed(() => proxied(upstream.port, 1));

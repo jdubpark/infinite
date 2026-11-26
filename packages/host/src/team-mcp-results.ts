@@ -1,39 +1,66 @@
 import { z } from "zod";
-import { ENTRY_KINDS, type MemberHead } from "./evidence/entry-types.js";
-import type { MemberEntry, MemberList } from "./evidence/entry-reads.js";
-import type { PendingEntry } from "./team-entry-route.js";
-import type { TeamRole } from "./team-types.js";
+import { ENTRY_KINDS, type MemberEntry, type MemberHead, type MemberList, type PendingEntry } from "./evidence/entry-types.js";
+import type { TeamRole } from "./team-role.js";
 import type { Check, Exact } from "./wire-shape.js";
 
 export type { Check, Exact, Shape } from "./wire-shape.js";
 
+declare const DEFINED_WIRE_VALUE: unique symbol;
+export type DefinedWireUnknown = z.ZodUnknown & { readonly [DEFINED_WIRE_VALUE]: true };
+
+function isDefinedJsonTree(value: unknown, seen = new Set<unknown>()): boolean {
+  if (value === undefined) return false;
+  if (value === null || typeof value !== "object") return true;
+  if (seen.has(value)) return true;
+  seen.add(value);
+  if (Array.isArray(value)) return value.every(item => isDefinedJsonTree(item, seen));
+  for (const entry of Object.values(value as Record<string, unknown>)) {
+    if (!isDefinedJsonTree(entry, seen)) return false;
+  }
+  return true;
+}
+
+const definedWireValue = (): DefinedWireUnknown =>
+  z.unknown().refine(value => isDefinedJsonTree(value), "Wire value must not contain undefined.") as DefinedWireUnknown;
+
 type OutputAllowsUndefined<T> = 0 extends 1 & T ? true
-  : unknown extends T ? false
+  : unknown extends T ? true
   : [Extract<T, undefined>] extends [never] ? false : true;
 
 type SchemaListNoUndefined<T extends readonly unknown[]> =
-  T extends readonly [infer Head, ...infer Tail]
+  T extends readonly [] ? true
+  : T extends readonly [infer Head, ...infer Tail]
     ? NoExplicitUndefined<Head> extends true ? SchemaListNoUndefined<Tail> : false
     : T extends readonly (infer Item)[] ? NoExplicitUndefined<Item>
-    : true;
+    : false;
 
 export type NoExplicitUndefined<S> =
-  S extends z.ZodExactOptional<infer Inner>
+  0 extends 1 & S ? false
+  : S extends { readonly [DEFINED_WIRE_VALUE]: true } ? true
+  : S extends z.ZodExactOptional<infer Inner>
     ? OutputAllowsUndefined<z.output<S>> extends true ? false : NoExplicitUndefined<Inner>
   : S extends z.ZodOptional<any> ? false
   : S extends z.ZodUndefined ? false
+  : S extends z.ZodUnknown ? false
+  : S extends z.ZodAny ? false
   : S extends z.ZodObject<infer Fields, any>
     ? false extends { [K in keyof Fields]: NoExplicitUndefined<Fields[K]> }[keyof Fields] ? false : true
   : S extends z.ZodArray<infer Item> ? NoExplicitUndefined<Item>
   : S extends z.ZodTuple<infer Items, infer Rest>
     ? SchemaListNoUndefined<Items> extends true
-      ? Rest extends z.ZodType ? NoExplicitUndefined<Rest> : true
+      ? [Rest] extends [null] ? true
+      : Rest extends z.ZodType ? NoExplicitUndefined<Rest> : false
       : false
   : S extends z.ZodUnion<infer Options> ? SchemaListNoUndefined<Options>
+  : S extends z.ZodIntersection<infer Left, infer Right>
+    ? NoExplicitUndefined<Left> extends true ? NoExplicitUndefined<Right> : false
   : S extends z.ZodNullable<infer Inner> ? NoExplicitUndefined<Inner>
   : S extends z.ZodReadonly<infer Inner> ? NoExplicitUndefined<Inner>
-  : S extends z.ZodRecord<any, infer Value> ? NoExplicitUndefined<Value>
-  : S extends z.ZodType
+  : S extends z.ZodLazy<infer Inner> ? NoExplicitUndefined<Inner>
+  : S extends z.ZodPipe<any, infer Out> ? NoExplicitUndefined<Out>
+  : S extends z.ZodRecord<infer Key, infer Value>
+    ? NoExplicitUndefined<Key> extends true ? NoExplicitUndefined<Value> : false
+  : S extends { _zod: { def: { type: "string" | "number" | "boolean" | "null" | "never" | "literal" | "enum" } } }
     ? OutputAllowsUndefined<z.output<S>> extends true ? false : true
   : false;
 
@@ -46,6 +73,12 @@ type SampleExactOptionalSchema = z.ZodObject<{ id: z.ZodString; at: z.ZodExactOp
 type SampleUndefinedUnionSchema = z.ZodObject<{ id: z.ZodString; at: z.ZodUnion<[z.ZodString, z.ZodUndefined]> }>;
 type SampleTupleSchema = z.ZodObject<{ pair: z.ZodTuple<[z.ZodString, z.ZodNumber], null> }>;
 type SampleTupleOptionalSchema = z.ZodObject<{ pair: z.ZodTuple<[z.ZodString, z.ZodOptional<z.ZodNumber>], null> }>;
+type SampleLazyOptionalSchema = z.ZodLazy<z.ZodObject<{ at: z.ZodOptional<z.ZodString> }>>;
+type SampleLazyExactOptionalSchema = z.ZodLazy<z.ZodObject<{ at: z.ZodExactOptional<z.ZodString> }>>;
+type SampleBareUnknownSchema = z.ZodObject<{ body: z.ZodUnknown }>;
+type SampleBareAnySchema = z.ZodObject<{ body: z.ZodAny }>;
+type SampleTransformSchema = z.ZodPipe<z.ZodString, z.ZodTransform<string, string>>;
+type SampleLiteralUndefinedSchema = z.ZodLiteral<undefined>;
 
 export type ExactCases = [
   Check<Exact<Head, { id: string; tags: readonly string[]; body: unknown; kind: "b" | "a"; at?: string }>>,
@@ -54,6 +87,7 @@ export type ExactCases = [
   Check<Exact<{ rest: [string, ...number[]] }, { rest: readonly [string, ...number[]] }>>,
   Check<WireSchemaMatches<SampleExactOptionalSchema, { id: string; at?: string }>>,
   Check<WireSchemaMatches<SampleTupleSchema, { pair: [string, number] }>>,
+  Check<WireSchemaMatches<SampleLazyExactOptionalSchema, { at?: string }>>,
   // @ts-expect-error An optional key added on the second side.
   Check<Exact<{ id: string }, { id: string; added?: number }>>,
   // @ts-expect-error An optional key added on the first side.
@@ -88,6 +122,16 @@ export type ExactCases = [
   Check<WireSchemaMatches<SampleTupleSchema, { pair: [number, string] }>>,
   // @ts-expect-error Wire schema tuple containing `.optional()`.
   Check<WireSchemaMatches<SampleTupleOptionalSchema, { pair: [string, number?] }>>,
+  // @ts-expect-error Lazy wrapper containing `.optional()` fails NoExplicitUndefined.
+  Check<NoExplicitUndefined<SampleLazyOptionalSchema>>,
+  // @ts-expect-error Bare `z.unknown()` fails NoExplicitUndefined.
+  Check<NoExplicitUndefined<SampleBareUnknownSchema>>,
+  // @ts-expect-error Bare `z.any()` fails NoExplicitUndefined.
+  Check<NoExplicitUndefined<SampleBareAnySchema>>,
+  // @ts-expect-error Uninspected ZodTransform fails closed in NoExplicitUndefined.
+  Check<NoExplicitUndefined<SampleTransformSchema>>,
+  // @ts-expect-error Literal `undefined` fails NoExplicitUndefined.
+  Check<NoExplicitUndefined<SampleLiteralUndefinedSchema>>,
 ];
 
 const TEAM_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker"] as const satisfies readonly TeamRole[];
@@ -140,7 +184,7 @@ export type MemberListMatches = Check<WireSchemaMatches<typeof memberListSchema,
 export const memberEntrySchema = z.object({
   notice: z.string(),
   head: memberHeadSchema,
-  body: z.unknown(),
+  body: definedWireValue(),
 }).strict();
 export type MemberEntryMatches = Check<WireSchemaMatches<typeof memberEntrySchema, MemberEntry>>;
 

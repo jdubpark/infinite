@@ -5,6 +5,9 @@ import type { StoredRollup, UsageRollup } from "./team-usage.js";
 import { z } from "zod";
 import { questionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
 import { INTERRUPT_CLASSES, REJECT_CODES, type InterruptClass, type RejectCode } from "./permission-policy.js";
+import { TEAM_ROLE_VALUES, type TeamRole } from "./team-role.js";
+
+export { TEAM_ROLE_VALUES, type TeamRole } from "./team-role.js";
 
 const nonNegInt = z.number().int().min(0);
 const usageTokensSchema = z.object({
@@ -97,8 +100,6 @@ export const connectorSourceSchema = z.object({ kind: z.literal("connector"), id
 const decisionRecommendationSchema = questionRecommendationSchema.extend({
   outcome: z.enum(["matched", "different", "other"]).optional(),
 }).strict();
-export const TEAM_ROLE_VALUES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker", "evaluator", "judge"] as const;
-export type TeamRole = typeof TEAM_ROLE_VALUES[number];
 const teamPublicationCategorySchema = z.enum(["auth", "network", "not-found", "rejected", "nested-repository", "other"]);
 export type TeamPublicationCategory = z.infer<typeof teamPublicationCategorySchema>;
 

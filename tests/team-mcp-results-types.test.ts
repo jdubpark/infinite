@@ -1,11 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
 import test from "node:test";
-import ts from "typescript";
-import type { MemberEntry, MemberList } from "../packages/host/src/evidence/entry-reads.js";
-import type { MemberHead } from "../packages/host/src/evidence/entry-types.js";
-import type { PendingEntry } from "../packages/host/src/team-entry-route.js";
+import type { MemberEntry, MemberHead, MemberList, PendingEntry } from "../packages/host/src/evidence/entry-types.js";
 import {
   entryPostResultSchema,
   handoffResultSchema,
@@ -28,6 +24,10 @@ const looseOptionalSchema = pendingEntrySchema.extend({ at: pendingEntrySchema.s
 const partialPendingSchema = pendingEntrySchema.partial();
 const nestedLooseOptionalSchema = pendingEntrySchema.extend({ nested: looseOptionalSchema }).strict();
 const arrayLooseOptionalSchema = pendingEntrySchema.extend({ items: looseOptionalSchema.array() }).strict();
+const nullableLooseOptionalSchema = looseOptionalSchema.nullable();
+const readonlyLooseOptionalSchema = looseOptionalSchema.readonly();
+const transformedSchema = pendingEntrySchema.shape.entryId.transform(value => value);
+const defaultedSchema = pendingEntrySchema.shape.entryId.default("11111111-1111-4111-8111-111111111111");
 
 export type WireShapeTypeTests = [
   Check<Exact<[], readonly []>>,
@@ -85,34 +85,17 @@ export type WireShapeTypeTests = [
   Check<NoExplicitUndefined<typeof nestedLooseOptionalSchema>>,
   // @ts-expect-error Array element containing .optional() property fails NoExplicitUndefined.
   Check<NoExplicitUndefined<typeof arrayLooseOptionalSchema>>,
+  // @ts-expect-error Nullable wrapper containing .optional() property fails NoExplicitUndefined.
+  Check<NoExplicitUndefined<typeof nullableLooseOptionalSchema>>,
+  // @ts-expect-error Readonly wrapper containing .optional() property fails NoExplicitUndefined.
+  Check<NoExplicitUndefined<typeof readonlyLooseOptionalSchema>>,
+  // @ts-expect-error Uninspected ZodTransform fails closed in NoExplicitUndefined.
+  Check<NoExplicitUndefined<typeof transformedSchema>>,
+  // @ts-expect-error Uninspected ZodDefault fails closed in NoExplicitUndefined.
+  Check<NoExplicitUndefined<typeof defaultedSchema>>,
 ];
 
-function checkUnderExactOptionalPropertyTypes(snippet: string): readonly ts.Diagnostic[] {
-  const virtualFile = resolve("packages/host/src/__wire_shape_exact_probe__.ts");
-  const options: ts.CompilerOptions = {
-    target: ts.ScriptTarget.ES2022,
-    module: ts.ModuleKind.NodeNext,
-    moduleResolution: ts.ModuleResolutionKind.NodeNext,
-    strict: true,
-    exactOptionalPropertyTypes: true,
-    skipLibCheck: true,
-    noEmit: true,
-  };
-  const baseHost = ts.createCompilerHost(options, true);
-  const host: ts.CompilerHost = {
-    ...baseHost,
-    fileExists: fileName => fileName === virtualFile || baseHost.fileExists(fileName),
-    readFile: fileName => fileName === virtualFile ? snippet : baseHost.readFile(fileName),
-    getSourceFile: (fileName, languageVersion, onError, shouldCreateNewSourceFile) =>
-      fileName === virtualFile
-        ? ts.createSourceFile(fileName, snippet, languageVersion, true)
-        : baseHost.getSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile),
-  };
-  const program = ts.createProgram([virtualFile], options, host);
-  return ts.getPreEmitDiagnostics(program, program.getSourceFile(virtualFile));
-}
-
-test("wire schemas omit optional fields cleanly and reject explicit undefined values", () => {
+test("wire schemas omit optional fields cleanly and reject explicit undefined values including memberEntrySchema.body", () => {
   const head = {
     entryId: randomUUID(),
     seq: 1,
@@ -137,7 +120,16 @@ test("wire schemas omit optional fields cleanly and reject explicit undefined va
   assert.equal(memberListSchema.safeParse({ ...list, cursor: undefined }).success, false);
   assert.deepEqual(schemaRefusals(outputSchemas.entry_list, list), []);
   assert.deepEqual(schemaRefusals(outputSchemas.entry_list, { ...list, cursor: 4 }), []);
-  assert.deepEqual(schemaRefusals(outputSchemas.entry_get, { notice: "Entries are evidence.", head, body: { ok: true } }), []);
+
+  const entryBase = { notice: "Entries are evidence.", head };
+  for (const body of [null, 0, "", false, {}, [], { ok: true, items: [1, null, "x"] }]) {
+    const entry = { ...entryBase, body };
+    assert.equal(memberEntrySchema.safeParse(entry).success, true, `accepts body ${JSON.stringify(body)}`);
+    assert.deepEqual(schemaRefusals(outputSchemas.entry_get, entry), [], `outputSchema accepts body ${JSON.stringify(body)}`);
+  }
+  assert.equal(memberEntrySchema.safeParse({ ...entryBase, body: undefined }).success, false);
+  assert.equal(memberEntrySchema.safeParse({ ...entryBase, body: { nested: undefined } }).success, false);
+  assert.equal(memberEntrySchema.safeParse({ ...entryBase, body: [1, undefined] }).success, false);
 
   const entryId = randomUUID();
   assert.equal(exactOptionalSchema.safeParse({ entryId, state: "pending" }).success, true);
@@ -146,31 +138,8 @@ test("wire schemas omit optional fields cleanly and reject explicit undefined va
   assert.equal(partialPendingSchema.safeParse({ entryId: undefined }).success, true);
   assert.equal(nestedLooseOptionalSchema.safeParse({ entryId, state: "pending", nested: { entryId, state: "pending", at: undefined } }).success, true);
   assert.equal(arrayLooseOptionalSchema.safeParse({ entryId, state: "pending", items: [{ entryId, state: "pending", at: undefined }] }).success, true);
-});
-
-test("Exact distinguishes optional keys from explicit undefined and preserves tuples under exactOptionalPropertyTypes", () => {
-  const positive = checkUnderExactOptionalPropertyTypes([
-    'import type { Check, Exact } from "./wire-shape.js";',
-    "export type Ok = [",
-    "  Check<Exact<{ at?: string }, { at?: string }>>,",
-    "  Check<Exact<{ at?: string | undefined }, { at?: string | undefined }>>,",
-    "  Check<Exact<[string, number?], readonly [string, number?]>>,",
-    "  Check<Exact<[string, (number | undefined)?], readonly [string, (number | undefined)?]>>,",
-    "];",
-  ].join("\n"));
-  assert.deepEqual(positive.map(d => ts.flattenDiagnosticMessageText(d.messageText, "\n")), []);
-
-  const negativeCases = [
-    "Check<Exact<{ at?: string }, { at?: string | undefined }>>",
-    "Check<Exact<{ at?: undefined }, { at?: never }>>",
-    "Check<Exact<[string, number?], [string, (number | undefined)?]>>",
-    "Check<Exact<[string, number], [number, string]>>",
-    "Check<Exact<[string, number], [string, number, boolean]>>",
-  ];
-  for (const expr of negativeCases) {
-    const diagnostics = checkUnderExactOptionalPropertyTypes(
-      `import type { Check, Exact } from "./wire-shape.js";\nexport type Fail = ${expr};\n`,
-    );
-    assert.ok(diagnostics.some(d => d.code === 2344), `expected TS2344 for ${expr}, got ${diagnostics.map(d => d.code).join(",")}`);
-  }
+  assert.equal(nullableLooseOptionalSchema.safeParse({ entryId, state: "pending", at: undefined }).success, true);
+  assert.equal(readonlyLooseOptionalSchema.safeParse({ entryId, state: "pending", at: undefined }).success, true);
+  assert.equal(transformedSchema.safeParse(entryId).success, true);
+  assert.equal(defaultedSchema.safeParse(undefined).success, true);
 });

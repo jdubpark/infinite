@@ -163,7 +163,7 @@ test("a mission coordinator waits at check and at admit", async () => {
     },
   } as unknown as Manager;
   const groups: ProjectGroupLookup = { get: () => { throw new Error("Not queried in this test"); } };
-  const missions = new MissionService(config, key, manager, { useMissionReservations() {}, isActiveRun() { return false; } } as unknown as TeamService, groups);
+  const missions = new MissionService(config, key, manager, { useMissionReservations() {}, useMissionReviews() {}, isActiveRun() { return false; } } as unknown as TeamService, groups);
   const gate = stubGate(openRate);
   missions.useFuse(gate);
   const mission = {

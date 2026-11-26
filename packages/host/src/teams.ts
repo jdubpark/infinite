@@ -38,6 +38,7 @@ import { assertTaskProfiles, fallbackProfile, fallbackRule, routingComponent } f
 import { ENTRY_DROP_TEXT, ENTRY_INGEST_MEMBERS, ENTRY_INGEST_MS, EntryIngestQueue, ingestRunMemberEntries } from "./team-entry-ingest.js";
 import { MAX_OUTBOX_EVENTS, appendRunEvent as runEvent, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
 import { taskFeatures } from "./task-features.js";
+import { recordedTaskLimitations, taskLimitations } from "./team-task-limitations.js";
 import { teamUsage } from "./team-usage.js";
 import { teamListItem, type TeamListItem } from "./team-list.js";
 import { teamLastActivityAt, TeamSaveTracker } from "./team-activity.js";
@@ -276,7 +277,7 @@ export class TeamService {
   private readonly permissions = new TeamPermissionReview(this.permissionHost());
   private readonly reviewFeedback = new TeamReviewFeedback((service => ({ get records() { return service.records; }, get config() { return service.config; },
     get key() { return service.key; }, get directory() { return service.directory; }, save: stored => service.save(stored), event: (stored, text) => service.event(stored, text),
-    enqueue: (runId, task) => service.enqueue(runId, task), steer: (id, input, source) => service.steer(id, input, source), held: projectId => Boolean(service.fuse?.held?.([projectId])),
+    enqueue: (runId, task) => service.enqueue(runId, task), steer: (id, input, source, censusReuseMs) => service.steer(id, input, source, censusReuseMs), held: projectId => Boolean(service.fuse?.held?.([projectId])),
     now: () => service.options?.now?.() ?? Date.now(), block: (stored, error) => service.block(stored, error), step: stored => service.step(stored),
     rebuildDeliveryPrompts: stored => service.rebuildDeliveryPrompts(stored) }) satisfies ReviewFeedbackHost)(this));
   private readonly directory: string;
@@ -458,6 +459,7 @@ export class TeamService {
   }
   useUsage(service: UsageService) { this.usage = service; }
   useMissionReservations(lookup: MissionReservationLookup) { this.missionReservations = lookup; }
+  useMissionReviews(destination: Parameters<TeamReviewFeedback["useMissions"]>[0]) { return this.reviewFeedback.useMissions(destination); }
   useEvidence(store: EvidenceStore) { this.evidence = store; }
   useRouter(router: RoutingRecorder) { this.router = router; }
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
@@ -601,7 +603,7 @@ export class TeamService {
       const attempts = withUsage.members.filter(member => member.taskId === task.id && member.revision === revision);
       const usage = attempts.flatMap(member => member.usage?.messages ? [member.usage] : []);
       const coverage = combineCoverage(attempts.map(member => member.usage ?? { coverage: "none" as const }));
-      return { ...task, revision, ...(usage.length ? { usage: { usd: Math.round(usage.reduce((n, row) => n + row.cost, 0) * 1_000_000) / 1_000_000, unpriced: usage.reduce((n, row) => n + row.pricing.unknown, 0), tokens: usage.reduce((n, row) => n + Object.values(row.tokens).reduce((a, b) => a + b, 0), 0), attempts: attempts.length, profiles: [...new Set(attempts.map(member => member.modelProfile?.id).filter((id): id is string => Boolean(id)))].sort(), coverage: coverage.coverage as "partial" | "complete", ...(coverage.reason ? { coverageReason: coverage.reason } : {}) } } : {}) };
+      return { ...task, revision, limitations: taskLimitations(task), ...(usage.length ? { usage: { usd: Math.round(usage.reduce((n, row) => n + row.cost, 0) * 1_000_000) / 1_000_000, unpriced: usage.reduce((n, row) => n + row.pricing.unknown, 0), tokens: usage.reduce((n, row) => n + Object.values(row.tokens).reduce((a, b) => a + b, 0), 0), attempts: attempts.length, profiles: [...new Set(attempts.map(member => member.modelProfile?.id).filter((id): id is string => Boolean(id)))].sort(), coverage: coverage.coverage as "partial" | "complete", ...(coverage.reason ? { coverageReason: coverage.reason } : {}) } } : {}) };
     }), members: withUsage.members, usage: withUsage.rollup, providerLimits: this.limits.active(), workers };
   }
   private save(stored: Stored) {
@@ -3098,7 +3100,7 @@ export class TeamService {
       if (member.role === "integrator" && run.deliveryRecovery?.status === "replanning" && run.deliveryRecovery.revision === run.revision)
         run.deliveryRecovery.integratedHeadCommit = head;
       if (task) {
-        task.status = "integrated"; task.commit = commit; task.summary = report.summary; task.diffStat = diffStat(diff);
+        task.status = "integrated"; task.commit = commit; task.summary = report.summary; task.limitations = recordedTaskLimitations(report); task.diffStat = diffStat(diff);
         if (changedPaths) task.changedPaths = changedPaths; else delete task.changedPaths;
         this.emitWith(stored, "task.integrated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
           commit, headCommit: head, baseCommit: run.baseCommit, memberBaseCommit: member.baseCommit, diff: task.diffStat,

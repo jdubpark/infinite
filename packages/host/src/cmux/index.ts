@@ -277,15 +277,32 @@ export class CmuxSessions {
       let unreadable = false;
       if (record.session.id === screenId && live) {
         try {
+          const validReplaySize = (value?: Record<string, unknown>) =>
+            value && Number.isInteger(value.columns) && Number.isInteger(value.rows) &&
+            (value.columns as number) > 0 && (value.columns as number) <= 1000 &&
+            (value.rows as number) > 0 && (value.rows as number) <= 1000
+              ? { cols: value.columns as number, rows: value.rows as number }
+              : undefined;
+          const beforeReplay = await this.client.rpc("terminal.replay", { surface_id: record.surfaceId, workspace_id: record.workspaceId }).catch(() => undefined);
+          if (beforeReplay?.surface_id && beforeReplay.surface_id !== record.surfaceId) throw new CmuxError("snapshot-unavailable");
           const screen = await this.client.rpc("surface.read_text", { surface_id: record.surfaceId, workspace_id: record.workspaceId, scrollback: false });
           if (typeof screen.text !== "string") throw new CmuxError("snapshot-unavailable");
           if (screen.surface_id && screen.surface_id !== record.surfaceId || screen.workspace_id && screen.workspace_id !== record.workspaceId) throw new CmuxError("snapshot-unavailable");
-          const replay = await this.client.rpc("terminal.replay", { surface_id: record.surfaceId, workspace_id: record.workspaceId }).catch(() => undefined);
-          if (replay?.surface_id && replay.surface_id !== record.surfaceId) throw new CmuxError("snapshot-unavailable");
-          if (replay && Number.isInteger(replay.columns) && Number.isInteger(replay.rows) && replay.columns > 0 && replay.columns <= 1000 && replay.rows > 0 && replay.rows <= 1000) {
-            record.columns = replay.columns;
-            record.rows = replay.rows;
-          }
+          const afterReplay = await this.client.rpc("terminal.replay", { surface_id: record.surfaceId, workspace_id: record.workspaceId }).catch(() => undefined);
+          if (afterReplay?.surface_id && afterReplay.surface_id !== record.surfaceId) throw new CmuxError("snapshot-unavailable");
+          const previousSize = record.columns && record.rows ? { cols: record.columns, rows: record.rows } : undefined;
+          const beforeSize = validReplaySize(beforeReplay);
+          const afterSize = validReplaySize(afterReplay);
+          const consistentSize = beforeSize && afterSize && beforeSize.cols === afterSize.cols && beforeSize.rows === afterSize.rows ? afterSize : undefined;
+          const emitResize = (size: { cols: number; rows: number }) => {
+            record.columns = size.cols;
+            record.rows = size.rows;
+            if (!previousSize || previousSize.cols !== size.cols || previousSize.rows !== size.rows) {
+              this.append(record, "lifecycle", { event: "resize", cols: size.cols, rows: size.rows });
+            }
+          };
+          if (consistentSize) emitResize(consistentSize);
+          const replay = afterReplay ?? beforeReplay;
           const grid = replay?.render_grid;
           const cursorRow = grid?.cursor?.row;
           const styles = array(grid?.styles);
@@ -297,8 +314,9 @@ export class CmuxSessions {
           record.draft = Boolean(row && /^[\s│┃]*[>›❯]\s*\S/.test(row));
           if (record.screen !== screen.text) {
             record.screen = screen.text.slice(-512 * 1024);
-            this.append(record, "output", { text: `\u001b[2J\u001b[H${record.screen.replace(/\r?\n/g, "\r\n")}`, snapshot: true });
+            this.append(record, "output", { text: `\u001b[2J\u001b[H${record.screen.replace(/\r?\n/g, "\r\n")}`, snapshot: true, ...(consistentSize ? { cols: consistentSize.cols, rows: consistentSize.rows } : {}) });
           }
+          if (!consistentSize && afterSize) emitResize(afterSize);
         } catch { unreadable = true; }
       }
       try {
@@ -392,6 +410,7 @@ export class CmuxSessions {
       attention: record.recordingError ? applyLifecycle(record.attention, "recording-error", record.attention.lastActivityAt) : record.attention,
       capabilities: { terminalSnapshot: 1, inputControl: 1 }, control: this.currentControl(record),
       runtime: record.session.runtime,
+      ...(record.columns && record.rows ? { terminalSize: { cols: record.columns, rows: record.rows } } : {}),
       ...(record.nativeId ? { nativeSession: { id: record.nativeId, source: "hook" as const } } : {}),
     };
   }

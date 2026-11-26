@@ -8,7 +8,12 @@ import type { FuseGate } from "../packages/host/src/fuse/types.js";
 import { PULL_REQUEST_BRANCH_FIELDS, PULL_REQUEST_FIELDS, type ReviewIntake, reviewRequestId } from "../packages/host/src/review-feedback.js";
 import type { TeamReviewFeedback } from "../packages/host/src/team-review-feedback.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
+import { MissionReview, type MissionReviewRecord, type ReviewForwardOp } from "../packages/host/src/mission-review.js";
+import type { Mission, MissionSubtask } from "../packages/host/src/mission-types.js";
+import type { MissionMessage } from "../packages/host/src/team-prompts.js";
 import type { Manager } from "../packages/host/src/manager.js";
+import { newWitness, type CensusResult, type HostProcesses } from "../packages/host/src/process-census.js";
+import { COMMAND_STOP_UNCONFIRMED_REASON } from "../packages/host/src/team-workspace.js";
 import { TeamService, type TeamServiceOptions } from "../packages/host/src/teams.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
@@ -57,6 +62,21 @@ async function until(ready: () => boolean) {
 
 const poller = (teams: TeamService) => (teams as unknown as { reviewFeedback: TeamReviewFeedback }).reviewFeedback;
 const events = (saved: Saved) => saved.run.events.map(event => event.text);
+
+type Census = { result: CensusResult; count: number; now: number };
+const RUNNING: CensusResult = { ok: true, findings: [{ pid: 101, reason: "recorded-group" }] };
+const ENDED: CensusResult = { ok: true, findings: [] };
+
+function censusTeams(f: Fixture, seen: Census) {
+  const processes: HostProcesses = { table: async () => ({ boot: "test-boot", rows: [] }), start: async () => "test-start",
+    census: async () => { seen.count++; return seen.result; } };
+  return new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { now: () => seen.now, processes });
+}
+
+function stoppedCheck(revision: number) {
+  return { id: randomUUID(), kind: "check", revision, witness: { ...newWitness(), processes: [{ pid: 101, start: "start-101" }], sessions: [101], groups: [101] },
+    failure: { code: "command-stop-unconfirmed", reason: COMMAND_STOP_UNCONFIRMED_REASON, at: new Date().toISOString() } };
+}
 
 function hostStop(f: Fixture, stopAt: number) {
   let armed = false, writes = 0, restore: (() => void) | undefined;
@@ -142,6 +162,139 @@ test("with the switch off the host reads no pull request and writes nothing", as
     assert.deepEqual(gh.commands(), []);
     assert.deepEqual(f.readRecord<Saved>("team", f.run.id), before);
     assert.equal(existsSync(join(f.config.stateDir, "teams", "review-feedback.sealed")), false, "no switch record is written while the switch was never on");
+  } finally { f.close(); }
+});
+
+test("a mission run's review goes to its mission's coordinator instead of steering the run, and only while the switch is on", async () => {
+  for (const enabled of [false, true]) {
+    const f = schedulerFixture();
+    try {
+      f.run.missionId = "mission-1";
+      const gh = delivered(f, enabled);
+      gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
+      const before = f.readRecord<Saved>("team", f.run.id), directed: unknown[] = [], receipts = new Set<string>();
+      let answer: "waiting" | "applied" = "waiting";
+      const teams = f.openTeam(), feedback = poller(teams);
+      await feedback.start();
+      await feedback.poll();
+      assert.deepEqual(gh.commands(), [], "a mission run is not read before its missions are connected");
+      const port = teams.useMissionReviews({ target: () => ({ missionId: "mission-1", subtaskId: "a" }), applied: (_mission, requestId) => receipts.has(requestId),
+        direct: async (missionId, direction) => {
+          directed.push([missionId, direction]);
+          if (answer === "applied") receipts.add(direction.requestId);
+          return answer;
+        } });
+      await feedback.poll();
+      if (!enabled) {
+        assert.deepEqual([gh.commands(), directed], [[], []], "with the switch off a mission run is not read and its mission hears nothing");
+        assert.deepEqual(f.readRecord<Saved>("team", f.run.id), before);
+        continue;
+      }
+      const direction = { requestId: reviewRequestId(f.run.id, "PRR_1"), runId: f.run.id, subtaskId: "a", reviewId: "PRR_1", pullRequestUrl, text: requested, revision: 1, headCommit: gh.head };
+      assert.deepEqual(directed, [["mission-1", direction]]);
+      assert.deepEqual(f.readRecord<Saved>("team", f.run.id).reviewIntake?.intents.map(intent => intent.state), ["pending"], "a paused mission leaves the review waiting");
+
+      answer = "applied";
+      await feedback.poll();
+      const saved = f.readRecord<Saved>("team", f.run.id);
+      assert.deepEqual(directed, [["mission-1", direction], ["mission-1", direction]]);
+      assert.deepEqual([saved.reviewIntake?.intents.map(intent => intent.state), saved.run.reviewFeedback?.map(entry => entry.outcome)], [["applied"], ["applied"]]);
+      assert.deepEqual([saved.run.revision, saved.run.status, saved.run.steering], [1, "ready-for-review", []], "the run waits for its coordinator's forward");
+      assert.equal(events(saved).some(text => text.startsWith("The owner requested changes on the pull request")), false);
+
+      assert.equal(await port.stillCurrent(f.run.id, "PRR_1"), true);
+      gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED"), gh.review("PRR_2", owner, "APPROVED", "", new Date(Date.now() + 120_000).toISOString())]);
+      assert.equal(await port.stillCurrent(f.run.id, "PRR_1"), false, "an approval after the review makes it stale for the forward");
+      gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
+      f.config.github!.reviewFeedback!.enabled = false;
+      assert.equal(await port.stillCurrent(f.run.id, "PRR_1"), false, "with the switch off no forward goes ahead");
+    } finally { f.close(); }
+  }
+});
+
+test("a mission run that no mission lists is neither steered nor sent to a mission", async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.missionId = "mission-1";
+    const gh = delivered(f);
+    gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
+    const teams = f.openTeam(), feedback = poller(teams), directed: unknown[] = [];
+    teams.useMissionReviews({ target: () => undefined, applied: () => false, direct: async (missionId, direction) => {
+      directed.push([missionId, direction]);
+      return "applied";
+    } });
+    await feedback.start();
+    await feedback.poll();
+    const saved = f.readRecord<Saved>("team", f.run.id);
+    assert.deepEqual([saved.run.revision, saved.run.steering, saved.reviewIntake?.intents ?? [], directed], [1, [], [], []]);
+  } finally { f.close(); }
+});
+
+test("a restarted host acknowledges a mission run's review from its mission's receipt without reading GitHub", async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.missionId = "mission-1";
+    const gh = delivered(f);
+    gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
+    const receipts = new Set<string>(), directed: string[] = [];
+    const destination = { target: () => ({ missionId: "mission-1", subtaskId: "a" }), applied: (_mission: string, requestId: string) => receipts.has(requestId),
+      direct: async (_mission: string, direction: { requestId: string }) => {
+        directed.push(direction.requestId);
+        receipts.add(direction.requestId);
+        return "waiting" as const;
+      } };
+    const first = f.openTeam();
+    first.useMissionReviews(destination);
+    await poller(first).start();
+    await poller(first).poll();
+    assert.deepEqual(f.readRecord<Saved>("team", f.run.id).reviewIntake?.intents.map(intent => intent.state), ["pending"], "the mission's reply was lost");
+    const reads = gh.commands().length, second = f.openTeam();
+    second.useMissionReviews(destination);
+    await poller(second).start();
+    const saved = f.readRecord<Saved>("team", f.run.id);
+    assert.deepEqual([saved.reviewIntake?.intents.map(intent => intent.state), gh.commands().length - reads, directed.length], [["applied"], 0, 1]);
+  } finally { f.close(); }
+});
+
+test("a coordinator's forward of a mission run's review reads GitHub once more and steers the run once, also when the mission's save was lost", async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.missionId = "mission-1";
+    const gh = delivered(f), forwarded = "The owner asks for --strict with the old name kept as an alias.";
+    gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
+    const subtask = { id: "a", title: "Subtask a", objective: "Do a", repoProjectId: f.run.projectId, size: "solo", parallelism: 1, dependsOn: [], status: "done", teamId: f.run.id } as unknown as MissionSubtask;
+    const stored = { mission: { id: "mission-1", status: "working", revision: 1, maxMinutes: 30, steering: [], subtasks: [subtask] } as unknown as Mission,
+      receipts: {} as Record<string, string>, inbox: [] as MissionMessage[], notes: [] as MissionMessage[], notified: [] as string[], ops: [] as ReviewForwardOp[], refusals: 0, reviews: undefined as MissionReviewRecord[] | undefined };
+    const connect = (teams: TeamService, record: typeof stored) => {
+      const review = new MissionReview({ records: new Map([["mission-1", record]]), teams, enqueue: async (_id, task) => task(), save: () => {}, event: () => {},
+        follow: () => {}, held: () => false, steeringFull: () => false });
+      review.connect(teams.useMissionReviews(review));
+      return review;
+    };
+    const settle = async (review: MissionReview<typeof stored>, record: typeof stored) => {
+      for (let passes = 0; await review.applyForward(record, record.ops[0]!); passes++) {
+        assert.ok(passes < 250, "the forward settles within 5 s");
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+    };
+    const teams = f.openTeam(), review = connect(teams, stored), feedback = poller(teams);
+    await feedback.start();
+    await feedback.poll();
+    assert.deepEqual(stored.inbox.splice(0).map(message => message.type), ["review-direction"]);
+    assert.deepEqual(review.queueForward(stored, subtask, forwarded, true), { kind: "queued" });
+    const lost = structuredClone(stored), reads = gh.commands().length;
+    await settle(review, stored);
+    let saved = f.readRecord<Saved>("team", f.run.id);
+    assert.equal(gh.commands().length - reads, 1, "GitHub is read once more before the steer");
+    assert.deepEqual([saved.run.revision, saved.run.steering.map(item => [item.text, item.source])], [2, [[forwarded, "coordinator"]]]);
+    assert.deepEqual(stored.reviews?.map(item => item.state), ["forwarded"]);
+
+    const restarted = f.openTeam();
+    await settle(connect(restarted, lost), lost);
+    saved = f.readRecord<Saved>("team", f.run.id);
+    assert.equal(saved.run.revision, 2, "the restarted mission finds the run's receipt and steers nothing more");
+    assert.deepEqual(lost.reviews?.map(item => item.state), ["forwarded"]);
+    assert.equal(gh.commands().length - reads, 1);
   } finally { f.close(); }
 });
 
@@ -442,5 +595,100 @@ test("on-demand legacy pull request branch lookup fails cleanly without corrupti
       assert.deepEqual(after, before, `${item.name}: run stays uncorrupted on disk`);
       assert.equal(after.receipts[requestId], undefined, `${item.name}: no steer receipt recorded`);
     } finally { f.close(); }
+  }
+});
+
+test("a review whose steer meets a stopped command that may still run waits with one event, and steers the run once after the command ended", async () => {
+  const f = schedulerFixture();
+  const seen: Census = { result: RUNNING, count: 0, now: Date.now() };
+  let teams: TeamService | undefined;
+  try {
+    const gh = delivered(f), submittedAt = new Date(Date.now() + 60_000).toISOString();
+    gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED", requested, submittedAt)]);
+    Object.assign(f.run, { status: "blocked", blockCode: "command-stop-unconfirmed", reason: COMMAND_STOP_UNCONFIRMED_REASON });
+    const intent = { reviewId: "PRR_1", submittedAt, commit: gh.head, text: requested, requestId: reviewRequestId(f.run.id, "PRR_1"), targetRevision: 1, state: "pending" };
+    f.writeTeam({ pending: stoppedCheck(1), reviewIntake: { intents: [intent], handled: [], accepted: 1 } });
+    teams = censusTeams(f, seen);
+    (teams as unknown as { records: Map<string, { halt?: string }> }).records.get(f.run.id)!.halt = undefined;
+    const service = teams, steer = service.steer.bind(service);
+    let steers = 0;
+    service.steer = (...args: Parameters<TeamService["steer"]>) => { steers++; return steer(...args); };
+    const feedback = poller(service);
+    await feedback.start();
+    await feedback.poll();
+    await feedback.poll();
+    let saved = f.readRecord<Saved>("team", f.run.id);
+    assert.deepEqual(saved.reviewIntake?.intents.map(item => item.state), ["pending"], "the review waits instead of being refused");
+    const waits = events(saved).filter(text => text.startsWith("The owner's review PRR_1 waits for this run."));
+    assert.equal(waits.length, 1, JSON.stringify(events(saved).slice(-4)));
+    assert.ok(waits[0]!.includes(`The stopped command of team run ${f.run.id} may still be running.`), waits[0]);
+    assert.ok(steers >= 2, `the review tried its steer on each pass: ${steers}`);
+    assert.equal(seen.count, 1, "retries within 30 seconds reuse the census");
+    assert.equal(saved.run.steering.length, 0);
+
+    seen.result = ENDED;
+    seen.now += 31_000;
+    await feedback.poll();
+    await feedback.poll();
+    saved = f.readRecord<Saved>("team", f.run.id);
+    assert.deepEqual(saved.reviewIntake?.intents.map(item => item.state), ["applied"]);
+    assert.deepEqual(saved.run.steering.map(item => item.text), [requested], "the review steered the run once");
+    assert.equal(saved.run.revision, 2);
+  } finally {
+    await teams?.close();
+    f.close();
+  }
+});
+
+test("a coordinator's forward that meets a stopped command that may still run waits with one event and no refusal, and steers the run once after the command ended", async () => {
+  const f = schedulerFixture();
+  const seen: Census = { result: RUNNING, count: 0, now: Date.now() };
+  let teams: TeamService | undefined;
+  try {
+    f.run.missionId = "mission-1";
+    const gh = delivered(f), forwarded = "The owner asks for --strict with the old name kept as an alias.";
+    gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
+    const subtask = { id: "a", title: "Subtask a", objective: "Do a", repoProjectId: f.run.projectId, size: "solo", parallelism: 1, dependsOn: [], status: "done", teamId: f.run.id } as unknown as MissionSubtask;
+    const stored = { mission: { id: "mission-1", status: "working", revision: 1, maxMinutes: 30, steering: [], subtasks: [subtask] } as unknown as Mission,
+      receipts: {} as Record<string, string>, inbox: [] as MissionMessage[], notes: [] as MissionMessage[], notified: [] as string[], ops: [] as ReviewForwardOp[], refusals: 0, reviews: undefined as MissionReviewRecord[] | undefined };
+    const recorded: string[] = [];
+    const service = teams = censusTeams(f, seen);
+    const review = new MissionReview({ records: new Map([["mission-1", stored]]), teams: service, enqueue: async (_id, task) => task(), save: () => {},
+      event: (_record, text) => { recorded.push(text); }, follow: () => {}, held: () => false, steeringFull: () => false });
+    review.connect(service.useMissionReviews(review));
+    const feedback = poller(service);
+    await feedback.start();
+    await feedback.poll();
+    assert.deepEqual(stored.inbox.splice(0).map(message => message.type), ["review-direction"]);
+    assert.deepEqual(review.queueForward(stored, subtask, forwarded, true), { kind: "queued" });
+    (service as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = stoppedCheck(1);
+    const steer = service.steer.bind(service);
+    let steers = 0;
+    service.steer = (...args: Parameters<TeamService["steer"]>) => { steers++; return steer(...args); };
+    for (let passes = 0; steers < 3; passes++) {
+      assert.ok(passes < 500, "the forward tries its steer three times within 10 s");
+      assert.equal(await review.applyForward(stored, stored.ops[0]!), true, `the forward waits: ${recorded.at(-1)}`);
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    const waits = recorded.filter(text => text.startsWith("The owner's review PRR_1 for subtask a waits for its subteam."));
+    assert.equal(waits.length, 1, JSON.stringify(recorded.slice(-4)));
+    assert.ok(waits[0]!.includes(`The stopped command of team run ${f.run.id} may still be running.`), waits[0]);
+    assert.deepEqual(stored.reviews?.map(item => item.state), ["forwarding"]);
+    assert.equal(stored.refusals, 0);
+    assert.deepEqual(stored.inbox, [], "the coordinator is not told of a refusal");
+    assert.equal(seen.count, 1, "retries within 30 seconds reuse the census");
+
+    seen.result = ENDED;
+    seen.now += 31_000;
+    for (let passes = 0; await review.applyForward(stored, stored.ops[0]!); passes++) {
+      assert.ok(passes < 500, "the forward settles within 10 s");
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    const saved = f.readRecord<Saved>("team", f.run.id);
+    assert.deepEqual([saved.run.revision, saved.run.steering.map(item => [item.text, item.source])], [2, [[forwarded, "coordinator"]]], "the forward steered the run once");
+    assert.deepEqual(stored.reviews?.map(item => item.state), ["forwarded"]);
+  } finally {
+    await teams?.close();
+    f.close();
   }
 });

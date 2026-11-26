@@ -1864,8 +1864,14 @@ that pull request steers the run the same way, once per review. Only the review
 summary is read, never inline comments. A review by another login, an approval, a
 comment, a review of an older head, and a review submitted before the switch was
 last turned on start nothing. A run accepts at most three reviews. Runs of goals,
-handoffs, replays and missions are not watched; routines start goals, so their
-runs are not watched either. Removing the run's workspace ends intake.
+handoffs and replays are not watched; routines start goals, so their runs are not
+watched either. A mission's subteam run is watched, but the owner's review does
+not steer it: the review goes to the mission's coordinator as owner direction,
+and the run continues only when the coordinator forwards it with `steer-subtask`.
+The run shows the review as applied once the mission recorded it, and records no
+steering of its own until that forward. See
+[missions](missions.md#owner-review-of-a-subtasks-pull-request). Removing the
+run's workspace ends intake.
 
 ## Project context and explicit relationships
 
@@ -3040,7 +3046,15 @@ keeps the request and retries it, with the same 30-second reuse. The goal's
 reason, or one event of the mission for each answer it gets, says that the
 request waits for the run's stopped command. While the look cannot tell, that
 answer names the owner's statement for the run; while the look sees the
-command's processes, the host refuses the statement.
+command's processes, the host refuses the statement. The owner's review on
+GitHub waits the same way, whether it steers the run directly or through the
+mission coordinator's forward: the run records one event for each answer to a
+direct review, the mission one for each answer to its forward, and the wait
+does not count as a refusal of the coordinator's report. The owner's pause or
+cancel of the goal, or a halt, replaces a goal's Resume or steer that waits this
+way; a replaced steer's direction stays in the goal's steering and does not
+reach the run. A mission's pause or cancel is not held by such a request: the
+request waits while the mission is paused, and a cancel drops it.
 
 The look supports no prefix, or a `sudo` prefix whose launcher has the
 `process-census` wrapper beside it. Under any other prefix, the instance
@@ -3851,7 +3865,7 @@ Limits of this first slice, stated in full:
 - A project that lets the team establish its own checks has none configured and cannot use this.
 - The result of a head that main has already left can still be announced, with the commit it was measured at.
 - Tests cannot prove that a deployed launcher admits the forms the check uses. Audit the launcher before the setting is turned on in any project.
-- If the host's API process stops in the short window while a command of the check is starting, the run directory is not removed until the host boots again, and no main check on the host starts until then: that project waits on `processes` and the others on `another-check`.
+- If the host's API process ends before it has recorded the end of the check, for example when it crashes or is killed, in the short window while a command of the check is starting, the run directory is not removed until the host boots again, and no main check on the host starts until then: that project waits on `processes` and the others on `another-check`. An orderly stop records the end of a running check first. Once the end is recorded, the record holds the process id of every command the check started, even while the host still reads a command's start time, and the copy is removed once a census finds nothing of the run, without a reboot. Earlier versions also held the copy until the next boot when the host stopped after recording the end, while it still read a command's start time. A copy held that way at the upgrade still waits for the host to boot again. The record does not say whether the end of the check or a host start after a crash marked such a copy, and only a host start can leave a command's process id out of the record.
 - Preparing the copy has no time limit of its own. It ends by the Git helpers' own limits, a halt, or a host stop.
 - Two different heads observed with the same stamp are ordered by their results' order in the record. Fetches of one mirror are serial, so their stamps differ in practice.
 - The host may not signal a command that the command prefix runs as another account. A halt, a time limit or a host stop reaches it only as far as the prefix passes the SIGTERM on: `sudo` passes it to the command's first process, not to the processes that process started. The check is recorded as an error ten seconds later, the command runs on, and no main check on the host starts until the command has ended: that project waits on `processes` and the others on `another-check`. A team's checks have the same limit.

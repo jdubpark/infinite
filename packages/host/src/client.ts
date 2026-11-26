@@ -421,8 +421,13 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
               render = terminalRenderer();
               await screen.snapshot(render(page.snapshot.ansi), page.snapshot.cols, page.snapshot.rows);
               progress.stop();
+            } else if (!interactive && typeof page.open?.cols === "number" && typeof page.open?.rows === "number") {
+              screen.resize(page.open.cols, page.open.rows);
             }
             for (const event of page.events ?? []) {
+              if (!interactive && event.type === "lifecycle" && typeof event.data.cols === "number" && typeof event.data.rows === "number") {
+                screen.resize(event.data.cols, event.data.rows);
+              }
               if (event.type === "output") {
                 const text = render(String(event.data.text));
                 if (text) progress.stop();

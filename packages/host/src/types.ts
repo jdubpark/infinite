@@ -18,6 +18,15 @@ export interface ControlLease {
   label: string;
   expiresAt: number;
 }
+export interface TerminalSize {
+  cols: number;
+  rows: number;
+}
+export interface TerminalOpen {
+  cursor: number;
+  cols?: number;
+  rows?: number;
+}
 export interface TerminalSnapshot {
   ansi: string;
   seq: number;
@@ -324,6 +333,8 @@ export interface WorkerState {
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1; nativeUi?: "codex" | "opencode"; transcript?: 1 };
   control?: ControlLease | null;
   runtime?: SessionRuntime;
+  terminalSize?: TerminalSize;
+  sizeIndexCoveredSeq?: number;
   nativeSession?: { id: string; source: "hook" | "protocol" };
   execution?: ExecutionState;
   permissionChannel?: PermissionChannelView;

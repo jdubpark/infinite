@@ -5,6 +5,7 @@ import {
   closeSync,
   writeSync,
   fsyncSync,
+  fstatSync,
   renameSync,
   rmSync,
   readFileSync,
@@ -79,13 +80,17 @@ export function writeSealed(
 
 export const SEGMENT_SIZE = 256;
 export const MAX_EVENT_PAGE_BYTES = 512 * 1024;
+export interface JournalAppendMeta {
+  segment: string;
+  bytes: number;
+}
 export class Journal {
   seq = 0;
   constructor(
     readonly directory: string,
     readonly key: Buffer,
     readonly sessionId: string,
-    private readonly options?: { onAppend?: (event: Event) => void },
+    private readonly options?: { onAppend?: (event: Event, meta: JournalAppendMeta) => void },
   ) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const segments = readdirSync(directory)
@@ -106,23 +111,23 @@ export class Journal {
   append(type: Event["type"], data: Event["data"]): Event {
     const seq = this.seq + 1;
     const event: Event = { seq, at: new Date().toISOString(), type, data };
-    const file = join(
-      this.directory,
-      `${String(Math.floor((seq - 1) / SEGMENT_SIZE)).padStart(10, "0")}.journal`,
-    );
+    const segment = `${String(Math.floor((seq - 1) / SEGMENT_SIZE)).padStart(10, "0")}.journal`;
+    const file = join(this.directory, segment);
     const bytes = Buffer.from(
       seal(this.key, `${this.sessionId}:${seq}`, event) + "\n",
     );
     const fd = openSync(file, "a", 0o600);
+    let segmentBytes = 0;
     try {
       let offset = 0;
       while (offset < bytes.length) offset += writeSync(fd, bytes, offset);
       fsyncSync(fd);
+      segmentBytes = fstatSync(fd).size;
     } finally {
       closeSync(fd);
     }
     this.seq = seq;
-    this.options?.onAppend?.(event);
+    this.options?.onAppend?.(event, { segment, bytes: segmentBytes });
     return event;
   }
 }

@@ -136,8 +136,8 @@ export class CmuxSessions {
     const sessionDir = join(this.directory, id);
     let signalIndex: SignalIndex | undefined;
     const journal = new Journal(join(sessionDir, "events"), this.key, id, {
-      onAppend: (event) => {
-        signalIndex?.observe(event);
+      onAppend: (event, meta) => {
+        signalIndex?.observe(event, meta);
       },
     });
     signalIndex = new SignalIndex(sessionDir, this.key, id, journal.seq);

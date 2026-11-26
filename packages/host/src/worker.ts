@@ -91,7 +91,7 @@ const key = Buffer.from(config.key, "base64");
 config.key = "";
 const dir = join(stateDir, "sessions", session.id);
 let signalIndex: SignalIndex | undefined;
-const journal = new Journal(join(dir, "events"), key, session.id, { onAppend: event => { signalIndex?.observe(event); } });
+const journal = new Journal(join(dir, "events"), key, session.id, { onAppend: (event, meta) => { signalIndex?.observe(event, meta); } });
 if (journal.seq !== 0)
   throw new Error("Refusing to start a second process for an existing session");
 const sizeIndex = new TerminalSizeIndex(join(dir, TERMINAL_SIZE_INDEX_FILE), key, session.id);

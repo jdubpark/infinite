@@ -1,6 +1,6 @@
 # Infinite System Architecture
 
-This document describes the Infinite runtime at commit `b6523dab`: the implemented single-tenant runner, its multi-tier autonomous orchestration stack, fail-closed governance, encrypted storage and evidence pipelines, workspace intelligence, client surfaces, concurrency invariants, and Ubuntu hard-isolation boundaries.
+This document describes the Infinite runtime (verified against `main` at `e0160091`): the implemented single-tenant runner, its multi-tier autonomous orchestration stack, fail-closed governance, encrypted storage and evidence pipelines, workspace intelligence, client surfaces, concurrency invariants, and Ubuntu hard-isolation boundaries.
 
 For managed multi-tenant operator confidentiality, hardware limits, and release gates, see [managed tenants](multi-tenant.md). For task-oriented navigation and a file-level lookup index, see [docs/README.md](README.md).
 
@@ -21,7 +21,7 @@ Infinite separates agent execution lifetime from API and client lifetimes. Nativ
 | `apps/mobile/` (`@infinite/mobile`) | Expo / React Native client (fixed light theme): Board, Sessions Brief, Understand and native SVG diagrams, Teams/Goals/Missions, Cost, Permissions, Expo Push | `src/api/client.ts`, `src/features/board/`, `src/features/understanding/` |
 | `apps/macos/` (`InfiniteDesktop`) | SwiftUI + CryptoKit desktop client: WKWebView xterm, split panes, Keychain-sealed `DraftStore` actor, Files and Sync, Understand, Cost, Resources, native cmux client | `Sources/InfiniteCore/`, `Sources/InfiniteDesktop/` |
 | `deploy/ubuntu/` & `deploy/proxmox/` | Seven-account Ubuntu 24.04 hardening, `nftables` firewalls, egress and GitHub proxies, ceilings, freeze-watchdog `age` backups, secondary instances, synthetic Proxmox fleet planner | `deploy/ubuntu/README.md`, `deploy/ubuntu/instances.md`, `deploy/proxmox/README.md` |
-| `scripts/`, `tests/`, `verification/` | Zero-dependency proxy daemons, Graphify builder, comment and file-size ratchets, 417 test suites (including seeded simulators and compile-time type tests), formal BFS/TLA+ models | `scripts/egress-proxy.mjs`, `scripts/github-proxy.mjs`, `scripts/run-tests.mjs` |
+| `scripts/`, `tests/`, `verification/` | Zero-dependency proxy daemons, Graphify builder, comment and file-size ratchets, 443 test suites (including seeded simulators and compile-time type tests), formal BFS/TLA+ models | `scripts/egress-proxy.mjs`, `scripts/github-proxy.mjs`, `scripts/run-tests.mjs` |
 
 ### Honesty and Authority Rules
 
@@ -40,13 +40,13 @@ Every subsystem enforces four invariants from [PRODUCT.md](../PRODUCT.md):
 
 ### Detached Worker Lifecycle and Vault Storage
 
-Each session spawns one detached `packages/host/src/worker.ts` daemon owning a `node-pty` terminal (`120×32` default) and an `@xterm/headless` screen emulator (5,000-line scrollback). The API server (`packages/host/src/server.ts`) talks to workers exclusively over private Unix domain sockets (`<runDir>/<sessionId>.sock`, mode `0600`, path ≤100 bytes) using single-request NDJSON frames (`packages/host/src/ipc.ts`, timeouts: 4 s default, 12 s `answer`, 300 s `workspace-export`). Restarting or crashing the HTTP server leaves workers untouched; on startup, `Manager` rediscovers live workers via their sockets and sealed metadata.
+Each session spawns one detached `packages/host/src/worker.ts` daemon owning a `node-pty` terminal (`120×32` default) and an `@xterm/headless` screen emulator (5,000-line scrollback). The API server (`packages/host/src/server.ts`) talks to workers exclusively over private Unix domain sockets (`<socketDir or runDir>/<sessionId>.sock`, mode `0600`, path ≤100 bytes, with configurable `socketDir` and lock-free per-host socket namespacing) using single-request NDJSON frames (`packages/host/src/ipc.ts`, timeouts: 4 s default, 12 s `answer`, 300 s `workspace-export`). Restarting or crashing the HTTP server leaves workers untouched; on startup, `Manager` rediscovers live workers via their sockets and sealed metadata.
 
 Session metadata and journals are encrypted by `packages/host/src/vault.ts`:
 
 - **Master key:** 32 random bytes (`0600`) stored outside `stateDir` (on Ubuntu: `/run/infinite-key/vault.key`, restored explicitly after host reboot).
 - **Record sealing:** AES-256-GCM with fresh 96-bit nonces and scope-bound AAD (`infinite:v1:<scope>`). Every file write uses `O_CREAT|O_EXCL` temp file (`0600`) -> `fsync` -> atomic `renameSync` -> parent directory `fsync`.
-- **Segmented journals:** Append-only 256-record segments (`0000000000.journal`, mode `0600`, AAD `<sessionId>:<seq>`, `fsync` per append). Workers buffer PTY output for at most 40 ms (8 KiB chunks). Any journal write error latches `recording-error` and sends `SIGSTOP` to the child process rather than continuing unrecorded.
+- **Segmented journals and side indexes:** Append-only 256-record segments (`0000000000.journal`, mode `0600`, AAD `<sessionId>:<seq>`, `fsync` per append), paired with a segmented encrypted signal index for `O(signals)` `ContextTouches` and signal-only reads plus a durable PTY-dimension size index so replay frames carry authoritative server dimensions. Workers buffer PTY output for at most 40 ms (8 KiB chunks). Any journal write error latches `recording-error` and sends `SIGSTOP` to the child process rather than continuing unrecorded.
 - **Session states:** `starting -> running -> exited`, plus fault states `unavailable` (socket unreachable) and `recording-error`.
 
 Host power loss or worker crash leaves the recording intact without silently restarting the process. An owner can explicitly resume a confirmed `exited` session with a known native conversation ID (`POST /api/sessions/:id/resume`), creating a fresh runtime UUID without resending the initial prompt. Fresh launches refuse provider resume flags (`assertFreshNativeContext` in `packages/host/src/context-continuation.ts`) so recordings never silently splice into an unrecorded conversation.
@@ -214,7 +214,7 @@ See the bottom panel of [FIG 06](diagrams/understanding-and-clients.svg) for the
 
 - **Freshness and Anti-Jump:** Web and mobile show last successful refresh time, treat stale responses started before backgrounding as ineligible to mark a returning view fresh, wait ~3 seconds before showing offline banners while immediately disabling steering controls, and never silently reclaim a control lease on foreground return.
 - **Local Drafts:** Web and mobile retain drafts and uncertain `requestId`s in process/tab memory only (discarded on reload/exit; never synced cross-device). CLI `Ctrl+E` persists per-client HKDF-derived AES-GCM draft files with PID liveness recovery; macOS `DraftStore` actor seals drafts under a device-only Keychain `SymmetricKey`.
-- **Verified Transport Gap (`b6523dab`):** Mobile's `WorkBriefScreen` calls `GET/POST /api/project-groups/:id/understanding/work/:workId[/refresh]`, which are served by `packages/host/src/server.ts` but currently omitted from `packages/host/src/remote-access.ts` `allowedPath()` (producing `403 remote-endpoint-denied` over remote channels).
+- **Verified Transport Gap:** Mobile's `WorkBriefScreen` calls `GET/POST /api/project-groups/:id/understanding/work/:workId[/refresh]`, which are served by `packages/host/src/server.ts` but currently omitted from `packages/host/src/remote-access.ts` `allowedPath()` (producing `403 remote-endpoint-denied` over remote channels).
 
 ---
 

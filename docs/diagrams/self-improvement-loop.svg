@@ -193,6 +193,6 @@
     <text x="610" y="931" font-family="'Instrument Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.2" fill="#59645e">Isolated Grader / Risk Gate</text>
     <rect x="790" y="921" width="13" height="11" rx="3" fill="#f3f4ef" stroke="#929c94" stroke-width="1.3" stroke-dasharray="4 3"/>
     <text x="808" y="931" font-family="'Instrument Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.2" fill="#59645e">Implemented Unwired / Spec-Only</text>
-    <text x="1412" y="931" text-anchor="end" font-family="'SFMono-Regular', ui-monospace, Menlo, Monaco, Consolas, monospace" font-size="10.2" fill="#59645e">Honest status separation per PRODUCT.md · Verified b6523dab</text>
+    <text x="1412" y="931" text-anchor="end" font-family="'SFMono-Regular', ui-monospace, Menlo, Monaco, Consolas, monospace" font-size="10.2" fill="#59645e">Status boundaries per PRODUCT.md · See docs/architecture.md &amp; ADR-0017</text>
   </g>
 </svg>

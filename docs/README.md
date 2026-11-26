@@ -1,6 +1,6 @@
 # Infinite Documentation and Research Index
 
-This index maps every subsystem, Architecture Decision Record (ADR), runbook, and source file in Infinite at commit `b6523dab`, for both engineers onboarding onto the codebase and AI coding agents gathering task context.
+This index maps every subsystem, Architecture Decision Record (ADR), runbook, and source file in Infinite (verified against `main` at `e0160091`), for both engineers onboarding onto the codebase and AI coding agents gathering task context.
 
 Source files carry zero prose comments (`npm run check:comments`, [ADR-0003](adr/0003-comment-policy-and-ratchet.md)). Non-obvious design invariants live in `docs/adr/0001`–`0022` and this `docs/` tree rather than inline comments. Check the relevant ADR before refactoring concurrency, wire schemas, or security checks.
 

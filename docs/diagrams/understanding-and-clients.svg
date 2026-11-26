@@ -154,7 +154,7 @@
   <text x="550" y="822" font-family="'Instrument Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.8" font-weight="400" fill="#59645e">Halt, Cost, Permissions, Dictation</text>
   <text x="836" y="822" font-family="'Instrument Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.8" font-weight="400" fill="#59645e">Halt, Cost, Permissions, Dictation, Push</text>
   <text x="1122" y="822" font-family="'Instrument Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10.8" font-weight="400" fill="#59645e">Halt, Cost, Resources window, Native cmux</text>
-  <text x="52" y="852" font-family="'SFMono-Regular', ui-monospace, Menlo, Monaco, Consolas, monospace" font-size="10" fill="#724314">* Verified gap on b6523dab: Mobile calls GET/POST .../understanding/work/:workId[/refresh], currently missing from remote-access.ts allowedPath() (403).</text>
+  <text x="52" y="852" font-family="'SFMono-Regular', ui-monospace, Menlo, Monaco, Consolas, monospace" font-size="10" fill="#724314">* Known transport gap: Mobile calls GET/POST .../understanding/work/:workId[/refresh], currently missing from remote-access.ts allowedPath() (403).</text>
   <g class="legend">
     <line x1="28" y1="876" x2="1412" y2="876" stroke="#d5d9d1" stroke-width="1"/>
     <rect x="28" y="889" width="13" height="11" rx="3" fill="#e6f0eb" stroke="#23654e" stroke-width="1.3"/>

@@ -2,6 +2,7 @@ import type express from "express";
 import type { ChildProcess } from "node:child_process";
 import { type EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
 import { EvidenceError, type EvidenceDb, type EvidenceTx } from "./evidence/types.js";
+import { evalBudgetSource, summarizeProjectBudgets, type EvalBudgetSource, type EvalUsageReader } from "./eval-budget.js";
 import { TaskCapture } from "./eval-capture.js";
 import { type Grader, type GraderProbe, launcherGrader, PROBE_FRESH_MS, stopGrader } from "./eval-grader.js";
 import { applyDuplicateRule, GroupPass, rootOf, sweepGroups } from "./eval-groups.js";
@@ -35,6 +36,7 @@ import {
   type ValidateJobRequest,
 } from "./eval-types.js";
 import { type BundleState, type TaskValidation, type ValidateContext, validateTask } from "./eval-validate.js";
+import type { FuseGate } from "./fuse/types.js";
 import type { HaltService } from "./halt/service.js";
 import type { HostLoadGate } from "./host-load.js";
 import type { Manager } from "./manager.js";
@@ -63,6 +65,8 @@ export type EvalHostOptions = {
   sessions?: Pick<Manager, "list" | "remove">;
   identity?: EvalIdentity;
   cost?: CostLookup;
+  usage?: () => EvalUsageReader;
+  fuse?: () => Pick<FuseGate, "check">;
 };
 
 type Probed = { at: number; probe: GraderProbe };
@@ -79,6 +83,7 @@ export class EvalHost implements EvalHostApi {
   private readonly git: MineGit;
   private readonly inventory: () => Promise<RuntimeProcess[]>;
   private readonly now: () => string;
+  private readonly budget: EvalBudgetSource | undefined;
   private readonly groups: GroupPass;
   private readonly miner: Miner;
   private readonly evalJobs: EvalJobs;
@@ -114,8 +119,9 @@ export class EvalHost implements EvalHostApi {
     this.miner = new Miner({ config: this.config, store: this.store, source: this.source, git: this.git, runs: options.runs, now: this.now });
     this.store.register(evalTrialsModule(this.store, this.now));
     this.store.register(judgeCalibrationsModule(this.store, this.now));
-    this.judgements = new JudgeCalibrations({ store: this.store, config: this.config, now: this.now });
-    this.trialJobs = new TrialJobs({ store: this.store, config: this.config, now: this.now });
+    this.budget = evalBudgetSource({ usage: options.usage, fuse: options.fuse });
+    this.judgements = new JudgeCalibrations({ store: this.store, config: this.config, now: this.now, budget: this.budget });
+    this.trialJobs = new TrialJobs({ store: this.store, config: this.config, now: this.now, budget: this.budget });
     this.comparison = new ComparisonPass({ store: this.store, config: this.config, now: this.now });
     this.evalJobs = new EvalJobs({
       store: this.store, config: this.config, now: this.now,
@@ -181,8 +187,10 @@ export class EvalHost implements EvalHostApi {
     if (project === undefined) return refusal(404, "unknown-project");
     if (!this.ready() || !this.trialsReady()) return refusal(503, "evidence-unavailable");
     const grader = await this.graderState();
-    const day = `${this.now().slice(0, 10)}T00:00:00.000Z`;
+    const at = this.now();
+    const day = `${at.slice(0, 10)}T00:00:00.000Z`;
     const identity = this.trials?.identityStatus() ?? { state: "not-configured" as const };
+    const budgets = summarizeProjectBudgets(project.team?.eval?.providerBudgets, this.config.usage?.budgets, this.budget, new Date(at));
     return this.guard(() => evalSummary(this.store, {
       project,
       mining: this.miner.status(projectId),
@@ -190,9 +198,13 @@ export class EvalHost implements EvalHostApi {
       graderVersion: this.probed?.probe.version ?? null,
       evalIdentity: identity.state,
       evalIdentityLastProbe: identity.lastProbe,
-      trials: { today: this.trialsToday(projectId, day), dailyCap: project.team?.eval?.trialsPerDay ?? null },
+      trials: {
+        today: this.trialsToday(projectId, day),
+        dailyCap: project.team?.eval?.trialsPerDay ?? null,
+        ...(budgets.length > 0 ? { budgets } : {}),
+      },
       jobs: this.evalJobs.projectJobs(projectId, SUMMARY_JOBS),
-      now: this.now(),
+      now: at,
     }));
   }
 

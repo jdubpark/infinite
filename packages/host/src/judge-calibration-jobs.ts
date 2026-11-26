@@ -2,7 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { judgePromptVersion, profileIdentityKey } from "./config-identity.js";
 import { epochAt } from "./configuration-store.js";
+import { evaluateFuse, evaluateProviderBudget, type EvalBudgetSource } from "./eval-budget.js";
 import { calibrationPairs } from "./eval-calibration.js";
+import { isEvalProvider, providerBudgetConstraints } from "./eval-config.js";
 import { JOB_EXPIRY_DAYS_MAX } from "./eval-jobs.js";
 import { trialProfileKey } from "./eval-trial-rules.js";
 import { TRIAL_SLOTS_FREE_MIN, type TrialGates } from "./eval-trial-jobs.js";
@@ -47,7 +49,7 @@ export type JudgementOutcome = { ending: JudgeEnding; judgement?: Judgement; ses
   | { dropped: "patch-missing" | "source-skipped" | "not-isolated" | "package-too-large" };
 
 type Start = Extract<NextJudgement, { kind: "start" }>;
-type Options = { store: EvidenceStore; config: Pick<Config, "projects" | "eval" | "teams">; now: () => string };
+type Options = { store: EvidenceStore; config: Pick<Config, "projects" | "eval" | "teams" | "usage">; now: () => string; budget?: EvalBudgetSource };
 type Pair = { kind: "pending"; ordering: 0 | 1; attempt: number } | { kind: "dropped" } | { kind: "done"; first: OrderingResult; second: OrderingResult };
 type Pins = { judgeKey: string; epoch: number; promptVersion: string };
 
@@ -105,8 +107,9 @@ function modelOf(db: EvidenceDb, trialId: string): { provider: string; model: st
 
 export class JudgeCalibrations {
   private readonly store: EvidenceStore;
-  private readonly config: Pick<Config, "projects" | "eval" | "teams">;
+  private readonly config: Pick<Config, "projects" | "eval" | "teams" | "usage">;
   private readonly now: () => string;
+  private readonly budget: EvalBudgetSource | undefined;
   private waiting: CalibrationWait | null = null;
   private released = { id: "", count: 0 };
 
@@ -114,6 +117,7 @@ export class JudgeCalibrations {
     this.store = options.store;
     this.config = options.config;
     this.now = options.now;
+    this.budget = options.budget;
   }
 
   create(body: unknown): { calibration: CalibrationView } | CalibrationRefusal {
@@ -346,7 +350,7 @@ export class JudgeCalibrations {
     }
     const pending = states[index] as Extract<Pair, { kind: "pending" }>;
     const pair = row.payload.pairs[index] as CalibrationPairRef;
-    const wait = this.waitReason(tx, gates, judge, pair.projectId, rows);
+    const wait = this.waitReason(tx, gates, judge, pair.projectId, rows, at);
     if (wait !== undefined) return { kind: "wait", reason: wait };
     const draw = labelDraw(`${row.calibrationId}:${index}`) === 0;
     return { kind: "slots", start: {
@@ -357,14 +361,24 @@ export class JudgeCalibrations {
     } };
   }
 
-  private waitReason(db: EvidenceDb, gates: TrialGates, judge: TeamModelProfile, projectId: string, rows: readonly JudgementRow[]): CalibrationWait | undefined {
+  private waitReason(db: EvidenceDb, gates: TrialGates, judge: TeamModelProfile, projectId: string, rows: readonly JudgementRow[], at: string): CalibrationWait | undefined {
     if (gates.halted(projectId)) return "halt";
+    const fuse = evaluateFuse(this.budget?.fuseCheck, projectId);
+    if (fuse.state === "halted") return "halt";
     if (gates.hostLoadHeld) return "host-load";
     if (gates.identity.state !== "ready" || this.config.eval?.member?.agents?.[judge.provider] === undefined) return "eval-identity";
     if (gates.grader.state !== "ready") return "grader";
     if (gates.trialLive) return "another-job";
     if (liveJudgements(db).length > 0 || rows.some(row => row.state === "preparing" || row.state === "live")) return "another-judgement";
+    if (fuse.state === "open") return "spend-fuse";
     if (gates.limited.has(judge.provider)) return "provider-limit";
+    if (isEvalProvider(judge.provider)) {
+      const project = this.config.projects.find(item => item.id === projectId);
+      const constraints = providerBudgetConstraints(judge.provider, project?.team?.eval?.providerBudgets, this.config.usage?.budgets);
+      const verdict = evaluateProviderBudget(judge.provider, constraints, this.budget?.providerSpend, new Date(at));
+      if (verdict.state === "exceeded") return "provider-budget";
+      if (verdict.state === "unmeasurable") return "budget-unmeasurable";
+    }
     return undefined;
   }
 }

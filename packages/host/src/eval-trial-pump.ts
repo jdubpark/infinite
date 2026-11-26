@@ -502,7 +502,7 @@ export class TrialPump {
         resolved: readTrialPatch(db, start.resolvedTrialId), unresolved: readTrialPatch(db, start.unresolvedTrialId) }));
       if (resolved === undefined || unresolved === undefined) return dropped("patch-missing");
       const project = this.options.config.projects.find(item => item.id === start.projectId);
-      const found = trialSettings(project);
+      const found = trialSettings(project, this.options.config.usage?.budgets);
       const graderJob = graderJobOf(start.calibrationId, start.projectId);
       if (!("settings" in found)) {
         this.cooldown = 1;

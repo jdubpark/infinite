@@ -56,8 +56,9 @@ export type NewCalibration = Pick<CalibrationRow, "calibrationId" | "requestId" 
   | "judgeMinutes" | "createdAt" | "expiresAt" | "payload">;
 export type CalibrationEnd = { status: Exclude<CalibrationStatus, "running">; reason: string | null; state: CalibrationState | null;
   counted: number; correct: number; agree: number; accuracy: number | null; lowerBound: number | null; swapAgreement: number | null };
-export type CalibrationWait = "halt" | "host-load" | "eval-identity" | "grader" | "another-job" | "another-judgement" | "provider-limit"
-  | "session-slots" | "mirror" | "start-up" | Exclude<Extract<SourceResult, { kind: "environment" }>["cause"], "halted">;
+export type CalibrationWait = "halt" | "host-load" | "eval-identity" | "grader" | "another-job" | "another-judgement" | "spend-fuse"
+  | "provider-limit" | "provider-budget" | "budget-unmeasurable" | "session-slots" | "mirror" | "start-up"
+  | Exclude<Extract<SourceResult, { kind: "environment" }>["cause"], "halted">;
 export type CalibrationView = { calibrationId: string; profileId: string; profileEpoch: number; promptVersion: string;
   status: CalibrationRow["status"]; reason: string | null; state: "ok" | "not-ok" | null;
   pairs: { planned: number; counted: number; correct: number; perProject: { projectId: string; pairs: number }[] };

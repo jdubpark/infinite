@@ -5,7 +5,10 @@ import { promptVersion } from "./config-identity.js";
 import { canonicalJson } from "./evidence/crypto.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb, EvidenceTx } from "./evidence/types.js";
-import { trialSettings, validationSettings, TRIAL_MINUTES_DEFAULT, type TrialSettings } from "./eval-config.js";
+import {
+  hasTrialBudgetFor, isEvalProvider, providerBudgetConstraints, trialSettings, validationSettings, TRIAL_MINUTES_DEFAULT, type TrialSettings,
+} from "./eval-config.js";
+import { evaluateFuse, evaluateProviderBudget, type EvalBudgetSource } from "./eval-budget.js";
 import type { GraderProbe } from "./eval-grader.js";
 import type { EvalProbe } from "./eval-identity.js";
 import { ACTIVE_PROJECT_JOBS_SQL, inWindow, JOB_EXPIRY_DAYS_MAX, JOB_TASKS_MAX, type EvalJobRow } from "./eval-jobs.js";
@@ -90,14 +93,16 @@ export function trialJobDigest(project: Project, config: Pick<Config, "eval">, c
 
 export class TrialJobs {
   private readonly store: EvidenceStore;
-  private readonly config: Pick<Config, "projects" | "eval" | "teams">;
+  private readonly config: Pick<Config, "projects" | "eval" | "teams" | "usage">;
   private readonly now: () => string;
+  private readonly budget: EvalBudgetSource | undefined;
   private readonly released = new Map<string, { key: string; count: number }>();
 
-  constructor(options: { store: EvidenceStore; config: Pick<Config, "projects" | "eval" | "teams">; now?: () => string }) {
+  constructor(options: { store: EvidenceStore; config: Pick<Config, "projects" | "eval" | "teams" | "usage">; now?: () => string; budget?: EvalBudgetSource }) {
     this.store = options.store;
     this.config = options.config;
     this.now = options.now ?? (() => new Date().toISOString());
+    this.budget = options.budget;
   }
 
   create(projectId: string, request: JobRequest, requestId: string): { created: boolean; job: JobView } | EvalRefusal {
@@ -122,16 +127,21 @@ export class TrialJobs {
         if (payload.requestDigest !== requestDigest) return refusal(409, "request-conflict");
         return { created: false, job: this.viewOf(tx, existing) };
       }
-      const found = trialSettings(project);
+      const found = trialSettings(project, this.config.usage?.budgets);
       if ("missing" in found) return refusal(409, "eval-config-incomplete");
       const approval = this.profileRefusal(project, normalized.configurations, found.settings.candidateProfiles);
       if (approval !== undefined) return approval;
+      if (!this.providersCovered(found.settings, normalized.configurations)) return refusal(409, "eval-config-incomplete");
       const ref = tx.index("project", projectId);
       if (tx.get(ACTIVE_PROJECT_JOBS_SQL, ref, normalized.kind) !== undefined) return refusal(409, "job-active");
       const jobId = randomUUID();
       const at = this.now();
       const comparison = normalized.kind === "baseline" ? undefined : planComparison(tx, { projectId, request: normalized, at });
       if (comparison !== undefined && "code" in comparison) return comparison;
+      if (comparison === undefined || comparison.planned.trials > 0) {
+        const budgetRefusal = this.creationRefusal(projectId, found.settings, normalized.configurations, new Date(at));
+        if (budgetRefusal !== undefined) return budgetRefusal;
+      }
       const payload: TrialJobPayload = {
         projectId,
         request: normalized,
@@ -342,6 +352,8 @@ export class TrialJobs {
       return NONE;
     }
     if (gates.halted(projectId)) return this.waitOn(tx, row, "halt");
+    const fuse = evaluateFuse(this.budget?.fuseCheck, projectId);
+    if (fuse.state === "halted") return this.waitOn(tx, row, "halt");
     if (request.windows !== undefined && !inWindow(request.windows, nowMs)) return this.waitOn(tx, row, "window");
     if (gates.hostLoadHeld) return this.waitOn(tx, row, "host-load");
     const agents = this.config.eval?.member?.agents;
@@ -350,9 +362,12 @@ export class TrialJobs {
     if (gates.grader.state !== "ready" || (gates.grader.version ?? 0) < 2) return this.waitOn(tx, row, "grader");
     if (gates.grader.storage !== true || gates.identity.storage !== true) return this.waitOn(tx, row, "storage");
     if (gates.trialLive) return this.waitOn(tx, row, "another-job");
-    if (request.configurations.some(configuration => gates.limited.has(configuration.profile.provider))) return this.waitOn(tx, row, "provider-limit");
+    if (fuse.state === "open") return this.waitOn(tx, row, "spend-fuse");
+    const blocks = this.providerBlocks(request.configurations, pinned.settings, gates.limited, new Date(nowMs));
+    const jobWait = this.jobProviderWait(request.configurations, blocks, row.kind !== "baseline");
+    if (jobWait !== undefined) return this.waitOn(tx, row, jobWait);
     if (row.kind !== "baseline") return this.scanFixed(tx, row, projectId, payload, pinned.settings, free, nowMs);
-    return this.scan(tx, row, projectId, request as BaselineJobRequest, pinned.settings, free, nowMs);
+    return this.scan(tx, row, projectId, request as BaselineJobRequest, pinned.settings, free, nowMs, blocks);
   }
 
   private scan(
@@ -363,12 +378,14 @@ export class TrialJobs {
     settings: TrialSettings,
     free: number | undefined,
     nowMs: number,
+    blocks: ReadonlyMap<Provider, "provider-limit" | "provider-budget" | "budget-unmeasurable">,
   ): Pass {
     const at = this.now();
     const filter = filterOf(tx, request);
     const maxTasks = request.taskFilter?.maxTasks ?? TRIAL_TASKS_DEFAULT;
     const trialsPerTask = request.trialsPerTask ?? TRIALS_PER_TASK_DEFAULT;
     const configRefs = request.configurations.map(configuration => configRef(configuration));
+    const eligibleRefs = configRefs.filter((_, index) => !blocks.has(request.configurations[index]!.profile.provider));
     let reached = (trialCounts(tx, [row.job_id]).get(row.job_id) ?? EMPTY_COUNTS).tasks;
     let cursor = row.cursor;
     for (;;) {
@@ -388,10 +405,11 @@ export class TrialJobs {
       }
       if (index > 0) cursor = page[index - 1].task_id;
       const candidate = page[index];
-      const pick = nextSlot({
-        tasks: [candidate.task_id], configRefs, trialsPerTask, rows: jobSlots(tx, row.job_id, candidate.task_id),
+      const rows = jobSlots(tx, row.job_id, candidate.task_id);
+      const allPick = nextSlot({
+        tasks: [candidate.task_id], configRefs, trialsPerTask, rows,
       });
-      if (pick === undefined) {
+      if (allPick === undefined) {
         advanceTask(tx, row.job_id, false);
         reached += 1;
         cursor = candidate.task_id;
@@ -399,6 +417,14 @@ export class TrialJobs {
         continue;
       }
       if (index > 0) setJob(tx, row.job_id, at, { cursor });
+      const pick = eligibleRefs.length === configRefs.length
+        ? allPick
+        : nextSlot({ tasks: [candidate.task_id], configRefs: eligibleRefs, trialsPerTask, rows });
+      if (pick === undefined) {
+        const blocked = request.configurations.find(item => configRef(item) === allPick.configRef);
+        const wait = blocked === undefined ? "budget-unmeasurable" : (blocks.get(blocked.profile.provider) ?? "budget-unmeasurable");
+        return this.waitOn(tx, row, wait);
+      }
       return this.handOut(tx, row, projectId, request.configurations, settings, free, nowMs, candidate.task_id, pick);
     }
   }
@@ -450,7 +476,7 @@ export class TrialJobs {
     const at = this.now();
     if (free === undefined) return { kind: "slots" };
     if (free < TRIAL_SLOTS_FREE_MIN) return this.waitOn(tx, row, "session-slots");
-    if (trialsSince(tx, projectId, utcDayStart(nowMs)) >= settings.trialsPerDay) return this.waitOn(tx, row, "daily-cap");
+    if (settings.trialsPerDay !== null && trialsSince(tx, projectId, utcDayStart(nowMs)) >= settings.trialsPerDay) return this.waitOn(tx, row, "daily-cap");
     const configuration = configurations.find(item => configRef(item) === pick.configRef);
     if (configuration === undefined) return NONE;
     const started: Record<string, SQLInputValue> = row.status === "scheduled" ? { status: "running", started_at: at } : {};
@@ -465,9 +491,77 @@ export class TrialJobs {
   private pinned(projectId: string, configurations: readonly TrialConfiguration[]): { settings: TrialSettings; digest: string } | undefined {
     const project = this.projectOf(projectId);
     if (project === undefined) return undefined;
-    const found = trialSettings(project);
+    const found = trialSettings(project, this.config.usage?.budgets);
     if ("missing" in found) return undefined;
+    if (!this.providersCovered(found.settings, configurations)) return undefined;
     return { settings: found.settings, digest: trialJobDigest(project, this.config, configurations) };
+  }
+
+  private providersCovered(settings: TrialSettings, configurations: readonly TrialConfiguration[]): boolean {
+    return configurations.every(configuration =>
+      isEvalProvider(configuration.profile.provider)
+      && hasTrialBudgetFor(configuration.profile.provider, settings, this.config.usage?.budgets));
+  }
+
+  private providerBlock(
+    provider: Provider,
+    settings: TrialSettings,
+    limited: ReadonlySet<Provider> | undefined,
+    now: Date,
+  ): "provider-limit" | "provider-budget" | "budget-unmeasurable" | undefined {
+    if (limited?.has(provider)) return "provider-limit";
+    if (!isEvalProvider(provider)) return "budget-unmeasurable";
+    const constraints = providerBudgetConstraints(provider, settings.providerBudgets, this.config.usage?.budgets);
+    const verdict = evaluateProviderBudget(provider, constraints, this.budget?.providerSpend, now);
+    if (verdict.state === "exceeded") return "provider-budget";
+    if (verdict.state === "unmeasurable") return "budget-unmeasurable";
+    if (verdict.state === "unconfigured" && settings.trialsPerDay === null) return "budget-unmeasurable";
+    return undefined;
+  }
+
+  private providerBlocks(
+    configurations: readonly TrialConfiguration[],
+    settings: TrialSettings,
+    limited: ReadonlySet<Provider>,
+    now: Date,
+  ): Map<Provider, "provider-limit" | "provider-budget" | "budget-unmeasurable"> {
+    const blocks = new Map<Provider, "provider-limit" | "provider-budget" | "budget-unmeasurable">();
+    for (const provider of new Set(configurations.map(configuration => configuration.profile.provider))) {
+      const block = this.providerBlock(provider, settings, limited, now);
+      if (block !== undefined) blocks.set(provider, block);
+    }
+    return blocks;
+  }
+
+  private jobProviderWait(
+    configurations: readonly TrialConfiguration[],
+    blocks: ReadonlyMap<Provider, "provider-limit" | "provider-budget" | "budget-unmeasurable">,
+    requireAll: boolean,
+  ): "provider-limit" | "provider-budget" | "budget-unmeasurable" | undefined {
+    if (blocks.size === 0) return undefined;
+    if (!requireAll && configurations.some(configuration => !blocks.has(configuration.profile.provider))) return undefined;
+    for (const reason of ["provider-limit", "provider-budget", "budget-unmeasurable"] as const) {
+      if (configurations.some(configuration => blocks.get(configuration.profile.provider) === reason)) return reason;
+    }
+    return undefined;
+  }
+
+  private creationRefusal(
+    projectId: string,
+    settings: TrialSettings,
+    configurations: readonly TrialConfiguration[],
+    now: Date,
+  ): EvalRefusal | undefined {
+    const fuse = evaluateFuse(this.budget?.fuseCheck, projectId);
+    if (fuse.state === "open") return refusal(409, "spend-fuse-open");
+    let unmeasurable = false;
+    for (const provider of new Set(configurations.map(configuration => configuration.profile.provider))) {
+      const block = this.providerBlock(provider, settings, undefined, now);
+      if (block === "provider-budget") return refusal(409, "provider-budget-exceeded");
+      if (block === "budget-unmeasurable") unmeasurable = true;
+    }
+    if (unmeasurable) return refusal(409, "provider-budget-unmeasurable");
+    return undefined;
   }
 
   private profileRefusal(project: Project, configurations: readonly TrialConfiguration[], candidates: readonly TeamModelProfile[]): EvalRefusal | undefined {

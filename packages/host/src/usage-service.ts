@@ -3,7 +3,10 @@ import { join } from "node:path";
 import type { Config, Provider, SessionPurpose } from "./types.js";
 import type { Manager } from "./manager.js";
 import { writeSealed, unseal } from "./vault.js";
-import { accountOf, listPriceUsage, periodStart, priceUsage, sumUsage, type Pricing, type UsageRecord, type UsageTokens, type UsageTotals } from "./usage.js";
+import {
+  accountOf, listPriceUsage, periodEnd, periodStart, priceUsage, sumUsage,
+  type Pricing, type ProviderSpendSnapshot, type UsagePeriod, type UsageRecord, type UsageTokens, type UsageTotals,
+} from "./usage.js";
 import { usagePlanSchema, type AccountView, type Balance, type BriefingUsage, type Money, type TaskUsage, type UsageResolvers } from "./usage-api.js";
 import { EvidenceError } from "./evidence/types.js";
 import type { EvidenceStore } from "./evidence/store.js";
@@ -17,7 +20,7 @@ import {
 
 export { combineCoverage };
 
-type Period = "day" | "week" | "month";
+type Period = UsagePeriod;
 export interface SessionUsage extends UsageTotals { measured: true; coverage: "partial" | "complete"; coverageReason?: LedgerCoverageReason; list?: Money }
 export type UnmeasuredUsage = { measured: false; coverage: "none"; coverageReason?: LedgerCoverageReason; unavailable?: true };
 export type UsageSummary = {
@@ -51,8 +54,6 @@ const PAGE = 200;
 const MAX_PAGES = 20;
 const EXIT_GRACE_MS = 60_000;
 const REASON = /^[a-z][a-z0-9-]{0,39}$/;
-const periodEnd = (period: Period, start: Date) => period === "month" ? new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1))
-  : new Date(start.getTime() + (period === "week" ? 7 : 1) * 86_400_000);
 const SCOPE = "usage";
 const PLAN_SCOPE = "usage-plans";
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -517,6 +518,88 @@ export class UsageService {
     return sumUsage(this.priced(ids.flatMap(id => data.bySession.get(id) ?? [])));
   }
 
+  private providerWindow(data: Snapshot, provider: Provider, period: Period, now: Date, includePrevious: boolean) {
+    const start = periodStart(period, now);
+    const end = periodEnd(period, start);
+    const observed = provider === "opencode";
+    const sessions = data.sessions.filter(s => s.provider === provider);
+    const unmeasuredBriefings = provider === "opencode"
+      ? data.briefings.filter(row => !row.record && Date.parse(row.at) >= start.getTime() && Date.parse(row.at) <= now.getTime()).length
+      : 0;
+    const unmeasuredSessions = sessions.filter(s => {
+      const at = Date.parse(s.lastActiveAt ?? s.createdAt);
+      return !measured(s) && at >= start.getTime() && at < end.getTime();
+    }).length + unmeasuredBriefings;
+    const partialSessions = sessions.filter(s => {
+      const at = Date.parse(s.lastActiveAt ?? s.createdAt);
+      return partial(s) && at >= start.getTime() && at < end.getTime();
+    }).length;
+    const within = (from: Date, to: Date) => {
+      const rows = this.priced(sessions.filter(measured).flatMap(s => data.bySession.get(s.sessionId) ?? [])
+        .filter(record => { const at = Date.parse(record.completedAt); return at >= from.getTime() && at < to.getTime(); }));
+      if (provider === "opencode") rows.push(...data.briefings.flatMap(row => row.record && Date.parse(row.at) >= from.getTime() && Date.parse(row.at) < to.getTime() ? this.priced([row.record]) : []));
+      return rows;
+    };
+    const current = sumUsage(within(start, new Date(now.getTime() + 1)));
+    const previous = includePrevious && observed ? sumUsage(within(periodStart(period, new Date(start.getTime() - 1)), start)) : undefined;
+    return { start, end, observed, unmeasuredSessions, partialSessions, current, previous };
+  }
+
+  providerSpend(provider: Provider, period: Period, now = new Date()): ProviderSpendSnapshot {
+    const start = periodStart(period, now);
+    const end = periodEnd(period, start);
+    const window = { kind: period, start: start.toISOString(), end: end.toISOString() };
+    let data: Snapshot;
+    try {
+      data = this.snapshot();
+    } catch {
+      return { measured: false, provider, period: window, reason: "ledger-unavailable" };
+    }
+    const metrics = this.providerWindow(data, provider, period, now, false);
+    if (!metrics.observed) {
+      return {
+        measured: false,
+        provider,
+        period: window,
+        reason: "provider-unmeasured",
+        tokens: metrics.current.tokens,
+        messages: metrics.current.messages,
+        unmeasuredSessions: metrics.unmeasuredSessions,
+        partialSessions: metrics.partialSessions,
+      };
+    }
+    const unpriced = metrics.current.pricing.unknown;
+    const gap = metrics.unmeasuredSessions > 0 ? "unmeasured-sessions" as const
+      : metrics.partialSessions > 0 ? "partial-sessions" as const
+      : unpriced > 0 ? "unpriced-records" as const
+      : undefined;
+    if (gap !== undefined) {
+      return {
+        measured: false,
+        provider,
+        period: window,
+        reason: gap,
+        usd: metrics.current.cost,
+        tokens: metrics.current.tokens,
+        messages: metrics.current.messages,
+        unpriced,
+        unmeasuredSessions: metrics.unmeasuredSessions,
+        partialSessions: metrics.partialSessions,
+      };
+    }
+    return {
+      measured: true,
+      provider,
+      period: window,
+      usd: metrics.current.cost,
+      tokens: metrics.current.tokens,
+      messages: metrics.current.messages,
+      unpriced: 0,
+      unmeasuredSessions: 0,
+      partialSessions: 0,
+    };
+  }
+
   summary(now = new Date()): UsageSummary {
     const data = this.snapshot();
     const monthStart = periodStart("month", now);
@@ -524,23 +607,14 @@ export class UsageService {
     for (const provider of PROVIDERS) {
       const budget = this.config.usage?.budgets[provider];
       const period: Period = budget?.period ?? "month";
-      const start = periodStart(period, now), previousStart = periodStart(period, new Date(start.getTime() - 1));
-      const observed = provider === "opencode";
-      const sessions = data.sessions.filter(s => s.provider === provider);
-      const unmeasuredBriefings = provider === "opencode" ? data.briefings.filter(row => !row.record && Date.parse(row.at) >= start.getTime() && Date.parse(row.at) <= now.getTime()).length : 0;
-      const unmeasuredSessions = sessions.filter(s => !measured(s) && Date.parse(s.lastActiveAt ?? s.createdAt) >= start.getTime()).length + unmeasuredBriefings;
-      const partialSessions = sessions.filter(s => partial(s) && Date.parse(s.lastActiveAt ?? s.createdAt) >= start.getTime()).length;
-      const within = (from: Date, to: Date) => {
-        const rows = this.priced(sessions.filter(measured).flatMap(s => data.bySession.get(s.sessionId) ?? [])
-          .filter(record => { const at = Date.parse(record.completedAt); return at >= from.getTime() && at < to.getTime(); }));
-        if (provider === "opencode") rows.push(...data.briefings.flatMap(row => row.record && Date.parse(row.at) >= from.getTime() && Date.parse(row.at) < to.getTime() ? this.priced([row.record]) : []));
-        return rows;
-      };
-      const current = sumUsage(within(start, new Date(now.getTime() + 1)));
+      const metrics = this.providerWindow(data, provider, period, now, true);
       providers[provider] = {
-        period: { start: start.toISOString(), end: periodEnd(period, start).toISOString() },
-        measured: observed, unmeasuredSessions, partialSessions, recorded: { tokens: current.tokens, messages: current.messages },
-        ...(observed ? { spent: current, previous: sumUsage(within(previousStart, start)) } : {}),
+        period: { start: metrics.start.toISOString(), end: metrics.end.toISOString() },
+        measured: metrics.observed,
+        unmeasuredSessions: metrics.unmeasuredSessions,
+        partialSessions: metrics.partialSessions,
+        recorded: { tokens: metrics.current.tokens, messages: metrics.current.messages },
+        ...(metrics.observed ? { spent: metrics.current, previous: metrics.previous } : {}),
         ...(budget ? { budget: { usd: budget.usd, period } } : {}),
       };
     }

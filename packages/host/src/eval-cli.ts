@@ -88,9 +88,19 @@ export function evalStatusLines(summary: EvalSummary): string[] {
   ];
   if (summary.evalIdentity) lines.push(identityLine(summary.evalIdentity));
   if (summary.trials) {
-    lines.push(summary.trials.dailyCap === null
-      ? "trials off"
-      : `trials today ${count(summary.trials.today)} of ${count(summary.trials.dailyCap)}`);
+    const budgets = summary.trials.budgets ?? [];
+    if (summary.trials.dailyCap === null && budgets.length === 0) {
+      lines.push("trials off");
+    } else {
+      lines.push(summary.trials.dailyCap === null
+        ? `trials today ${count(summary.trials.today)}`
+        : `trials today ${count(summary.trials.today)} of ${count(summary.trials.dailyCap)}`);
+      for (const item of budgets) {
+        const spent = item.spentUsd === null ? "unknown" : `$${item.spentUsd.toFixed(2)}`;
+        const state = item.state === "unmeasurable" && item.reason ? `${item.state} (${clean(item.reason)})` : item.state;
+        lines.push(`budget ${clean(item.provider)} (${clean(item.source)}/${clean(item.period)}): ${spent} of $${item.limitUsd.toFixed(2)} · ${state}`);
+      }
+    }
   }
   for (const job of summary.jobs) lines.push(...evalJobLines(job));
   return lines;

@@ -314,7 +314,7 @@ These are the owner's choices. The design does not impose them.
 - The `canaries` of the member and of the grader, the egress lists, and the network rule.
 - Whether cron and `at` deny the account, as the install of [the eval member account](../deploy/ubuntu/eval.md) says.
 - `/proc` hiding, a private `/tmp`, a disk quota, and a memory limit for the account.
-- The `trialsPerDay` cap, the job windows, and the choice of the candidate profiles.
+- The `providerBudgets` / `usage.budgets` ceilings, optional `trialsPerDay` cap, the job windows, and the choice of the candidate profiles.
 
 ### What stays reachable
 

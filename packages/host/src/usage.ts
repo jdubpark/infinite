@@ -1,6 +1,39 @@
 import type { UsageConfig } from "./config.js";
 import { PRICE_CATALOG, type CatalogPrice } from "./price-catalog.js";
 
+export type UsagePeriod = "day" | "week" | "month";
+export type ProviderSpendUnmeasurableReason =
+  | "ledger-unavailable"
+  | "provider-unmeasured"
+  | "unmeasured-sessions"
+  | "partial-sessions"
+  | "unpriced-records"
+  | "invalid-measurement";
+export type ProviderSpendSnapshot =
+  | {
+      measured: true;
+      provider: "claude" | "codex" | "grok" | "opencode" | "demo";
+      period: { kind: UsagePeriod; start: string; end: string };
+      usd: number;
+      tokens: UsageTokens;
+      messages: number;
+      unpriced: 0;
+      unmeasuredSessions: 0;
+      partialSessions: 0;
+    }
+  | {
+      measured: false;
+      provider: "claude" | "codex" | "grok" | "opencode" | "demo";
+      period: { kind: UsagePeriod; start: string; end: string };
+      reason: ProviderSpendUnmeasurableReason;
+      usd?: number;
+      tokens?: UsageTokens;
+      messages?: number;
+      unpriced?: number;
+      unmeasuredSessions?: number;
+      partialSessions?: number;
+    };
+
 export interface UsageTokens { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }
 export interface UsageRecord {
   provider: "opencode" | "claude" | "codex";
@@ -55,7 +88,7 @@ function glob(pattern: string, value: string) {
   return new RegExp(`^${escaped}$`).test(value);
 }
 
-export function periodStart(period: "day" | "week" | "month", now: Date): Date {
+export function periodStart(period: UsagePeriod, now: Date): Date {
   const year = now.getUTCFullYear();
   const month = now.getUTCMonth();
   const day = now.getUTCDate();
@@ -63,6 +96,12 @@ export function periodStart(period: "day" | "week" | "month", now: Date): Date {
   if (period === "day") return new Date(Date.UTC(year, month, day));
   const daysSinceMonday = (now.getUTCDay() + 6) % 7;
   return new Date(Date.UTC(year, month, day - daysSinceMonday));
+}
+
+export function periodEnd(period: UsagePeriod, start: Date): Date {
+  return period === "month"
+    ? new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1))
+    : new Date(start.getTime() + (period === "week" ? 7 : 1) * 86_400_000);
 }
 
 export function sumUsage(rows: { cost: number; pricing: Pricing; tokens: UsageTokens }[]): UsageTotals {

@@ -31,6 +31,7 @@ import { onboardingPermissions } from "./permission-onboarding.js";
 import { HandoffService } from "./handoffs.js";
 import { handoffPathsOverlap } from "./handoff-types.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
+import { inspectHybridSessions } from "./workspace-pool-gc.js";
 import { UsageService } from "./usage-service.js";
 import { EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
 import { EventOutbox } from "./evidence/outbox.js";
@@ -216,11 +217,10 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   const mirroredProjects = runtimeSecurity(config.deployment).tenancy === "single-tenant" ? new MirroredProjects(config, key) : undefined;
   const enrollment = new RepoEnrollmentService(config, key, { isBusy: async projectId =>
     projectSync.applying(projectId) || projectSource.refreshing(projectId) || await projectRunning(projectId, true) });
-  validateLinearConfig(config);
   validateMcpConfig(config);
   let intakeAudience: ReturnType<typeof createIntakeAudienceGuard> | undefined;
   const manager = new Manager(config, key, undefined, { projectContexts: new ProjectContexts(config, key, () => intakeAudience?.workspaceBindings()) });
-  const projectSync = new ProjectSync(config, key);
+  const projectSync = new ProjectSync(config, key, { inspectHybridSessions: () => inspectHybridSessions(config.stateDir, listSessions) });
   const desktopFiles = new DesktopFiles(config);
   const startsInFlight = new Map<string, number>();
   const routineStarts = new Set<string>();
@@ -388,7 +388,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays);
     sweepExpiredVerdicts(evidence, new Date().toISOString());
     sweepExpiredDecisions(evidence, new Date().toISOString());
-    signals.sweep();
+    signals.sweep(); projectSync.scheduleGarbageCollection(true);
   };
   let evidenceSweep: NodeJS.Timeout | undefined;
   const advanceOutbox = () => {
@@ -1679,7 +1679,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     try {
       if (manager.meta(sessionId).session.team)
         return void res.status(409).json({ code: "team-session", error: "Team sessions cannot be deleted individually" });
-      await manager.remove(sessionId);
+      await manager.remove(sessionId); projectSync.scheduleGarbageCollection(true);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT")
         return void res.status(404).json({ code: "not-found", error: "Session not found" });
@@ -2145,7 +2145,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     linear.close();
     handoffs.close();
     readings.stop();
-    projectSource.stop();
+    projectSource.stop(); void projectSync.close();
     halt.stop();
     closeEvidence();
     void mainCheck?.close();
@@ -2153,7 +2153,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { const mainCheckClosed = mainCheck?.close() ?? Promise.resolve(); routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); const teamsClosed = teams.close(); halt.stop(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.allSettled([teamsClosed, mainCheckClosed, mcp?.close(), repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(results => { const failed = results.find(result => result.status === "rejected"); if (failed) throw failed.reason; }); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  const closeConnections = () => { const mainCheckClosed = mainCheck?.close() ?? Promise.resolve(); routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); const teamsClosed = teams.close(); halt.stop(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.allSettled([teamsClosed, mainCheckClosed, projectSync.close(), mcp?.close(), repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(results => { const failed = results.find(result => result.status === "rejected"); if (failed) throw failed.reason; }); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, mcpServer: mcp?.server, closeConnections, fuse, halt, mainCheck,
     permissions: { holder: (sessionId: string, promptId: number) => sessionPermissions.holder(sessionId, promptId),
       ownerClass: (sessionId: string, promptId: number) => permissionDelivery.ownerClass(sessionId, promptId) }, permissionAgent };

@@ -6,14 +6,20 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 const teamOperationFailureFile = "team-operation-failure.test.ts";
+const mainCheckRealFile = "main-check-real.test.ts";
 const processIsolationImage = "buildpack-deps@sha256:c4e7382cc1abefe0bbaaf99324fad5122f9def4d3840fbfad17d3c2fd77b9dc9";
 const focusedTeamOperationFailure = process.argv.includes("--team-operation-failure");
-const serialFiles = new Set(["client-cli.test.ts", "main-check-real.test.ts"]);
+const focusedMainCheckReal = process.argv.includes("--main-check-real");
+if (focusedTeamOperationFailure && focusedMainCheckReal) {
+  throw new Error("Choose one focused suite at a time.");
+}
+const serialFiles = new Set(["client-cli.test.ts"]);
 const testFiles = readdirSync(new URL("../tests/", import.meta.url))
   .filter((name) => name.endsWith(".test.ts"))
   .sort();
-const selectedFiles = focusedTeamOperationFailure ? [teamOperationFailureFile] : testFiles;
-const parallelFiles = selectedFiles.filter((name) => name !== teamOperationFailureFile && !serialFiles.has(name));
+const selectedFiles = focusedTeamOperationFailure ? [teamOperationFailureFile]
+  : focusedMainCheckReal ? [mainCheckRealFile] : testFiles;
+const parallelFiles = selectedFiles.filter((name) => name !== teamOperationFailureFile && name !== mainCheckRealFile && !serialFiles.has(name));
 const serial = selectedFiles.filter((name) => serialFiles.has(name));
 const requestedConcurrency = process.argv.find((arg) => arg.startsWith("--concurrency="))?.split("=", 2)[1]
   ?? process.env.INFINITE_TEST_CONCURRENCY;
@@ -33,8 +39,8 @@ if (!/^iv-[0-9a-f]{32}$/.test(runId ?? "") || basename(checkout) !== "t" ||
 
 const tsx = fileURLToPath(import.meta.resolve("tsx/cli"));
 
-async function runInPrivateLinuxContainer() {
-  if (process.platform !== "linux") return run([teamOperationFailureFile], 1);
+async function runInPrivateLinuxContainer(file) {
+  if (process.platform !== "linux") return run([file], 1);
 
   const runnerUid = process.getuid?.() ?? -1;
   const runnerGid = process.getgid?.() ?? -1;
@@ -55,7 +61,7 @@ async function runInPrivateLinuxContainer() {
 [ "$(node --version)" = "$EXPECTED_NODE" ] || exit 82
 printf 'PROCESS VIEW image=%s distribution=%s/%s node=%s git=%s uid=%s\\n' "$PROCESS_IMAGE" "$ID" "$VERSION_ID" "$(node --version)" "$(git --version)" "$(id -u)"
 mkdir -p /tmp/home
-exec node --import tsx --test --test-concurrency=1 tests/${teamOperationFailureFile}`;
+exec node --import tsx --test --test-concurrency=1 tests/${file}`;
   const args = [
     "run", "--rm", "--init", "--platform", "linux/amd64",
     "--label", `io.infinite.check=${runId}`,
@@ -103,6 +109,7 @@ async function run(files, fileConcurrency) {
   if (code !== 0) throw new Error(`Test process failed (${signal ?? code})`);
 }
 
-if (selectedFiles.includes(teamOperationFailureFile)) await runInPrivateLinuxContainer();
+if (selectedFiles.includes(teamOperationFailureFile)) await runInPrivateLinuxContainer(teamOperationFailureFile);
 if (parallelFiles.length) await run(parallelFiles, concurrency);
 if (serial.length) await run(serial, 1);
+if (selectedFiles.includes(mainCheckRealFile)) await runInPrivateLinuxContainer(mainCheckRealFile);

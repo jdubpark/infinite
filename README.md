@@ -193,7 +193,7 @@ npm run check
 python3 scripts/cloud-check.py -- node --import tsx --test tests/chat.test.ts
 ```
 
-The failed-operation cleanup tests need their own process table so the host can see when the last command has ended. `npm test` runs them in a disposable, digest-pinned container on the enrolled Linux guest. Run this suite alone with `infinite-check -- node scripts/run-tests.mjs --team-operation-failure`.
+The failed-operation cleanup tests and real main-check tests need private process tables because they inspect process retirement. `npm test` runs both suites in disposable, digest-pinned containers on the enrolled Linux guest: the four failed-operation tests run before parallel tests, and `main-check-real.test.ts` runs after parallel tests and the serial CLI tests. To run either suite alone, use `infinite-check -- node scripts/run-tests.mjs --team-operation-failure` or `infinite-check -- node scripts/run-tests.mjs --main-check-real`.
 
 Each run transfers the current Git revision, staged and unstaged edits, deletions, and eligible nonignored untracked files into a disposable cloud checkout. Git history stops at the captured commit. Ignored inputs, credentials, Git remotes and unrelated refs stay outside the snapshot. The runner installs dependencies with `npm ci` from that checkout's lockfile. The receipt identifies the source snapshot, lockfile, platform, tool versions, and exit status. Concurrent calls use separate directories. Keep commands that share build output, a service, or a browser session in a single invocation.
 
@@ -278,7 +278,7 @@ npm run export:ios -w @infinite/mobile
 1. **`npm run check:size`** (`scripts/check-file-size.mjs`): 1,000-line cap on new source files; downward-only baseline across 24 grandfathered files.
 2. **`npm run check:comments`** (`scripts/check-comments.mjs`): zero-comment policy across `.ts/.tsx/.js/.mjs/.swift/.py/.sh/.c/.h/.kt/.css/.service/.timer/.socket` (`scripts/comments-baseline.json` is at `0`).
 3. **`npm run typecheck`** runs a strict TypeScript check across all workspaces plus `tsconfig.mcp-exact.json` and `tsconfig.type-tests.json` (`@ts-expect-error` state-machine and wire-contract tests).
-4. **`npm test`** discovers every top-level `tests/*.test.ts` file in the captured checkout. `scripts/run-tests.mjs` runs four files concurrently by default, then runs the files in `serialFiles` one at a time. Set `INFINITE_TEST_CONCURRENCY=1` on small runners or pass `--concurrency=N` directly to the test runner. The suite covers 12-PTY live API-restart continuity, vault and SQLite encryption, eval and grader process isolation, Playwright browser smoke, and seeded crash and differential simulations.
+4. **`npm test`** discovers every top-level `tests/*.test.ts` file in the captured checkout. `scripts/run-tests.mjs` runs the failed-operation suite first, four files concurrently by default, then serial CLI tests and the isolated main-check suite. Set `INFINITE_TEST_CONCURRENCY=1` on small runners or pass `--concurrency=N` directly to the test runner. The suite covers 12-PTY live API-restart continuity, vault and SQLite encryption, eval and grader process isolation, Playwright browser smoke, and seeded crash and differential simulations.
 5. **`npm run build`**: sequential build of `@infinite/attention -> @infinite/remote -> @infinite/host -> @infinite/web`.
 
 End-to-end browser verification against a disposable host uses `.agents/skills/verify-infinite/scripts/drive.mjs session --instance DIR`.

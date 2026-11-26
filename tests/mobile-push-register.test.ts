@@ -22,17 +22,21 @@ function loadPush() {
     },
   });
   const require = nodeModule.createRequire(import.meta.url);
+  const loadRegisterModule = () => {
+    const resolved = require.resolve("../apps/mobile/src/push/register.ts");
+    delete require.cache[resolved];
+    return require(resolved) as typeof import("../apps/mobile/src/push/register.ts");
+  };
   return {
-    ...(require("../apps/mobile/src/push/register.ts") as typeof import("../apps/mobile/src/push/register.ts")),
+    ...loadRegisterModule(),
+    reloadRegisterModule: loadRegisterModule,
     ...(require("./fixtures/mobile-push-native.ts") as typeof import("./fixtures/mobile-push-native.ts")),
   };
 }
 
 const env = loadPush();
 const skip = !env && "module.registerHooks requires Node 22.15+";
-const flush = async () => {
-  for (let i = 0; i < 8; i += 1) await Promise.resolve();
-};
+const flush = () => new Promise<void>(resolve => setImmediate(resolve));
 const machineA = { id: "machine-a", url: "http://127.0.0.1:4101", token: "tok-a" };
 const machineB = { id: "machine-b", url: "http://127.0.0.1:4102", token: "tok-b" };
 
@@ -149,6 +153,170 @@ test("unregisterPush deletes the rotated token accepted by a disconnecting machi
   } finally {
     await unregisterPush(machineA);
     await unregisterPush(machineB);
+    t.mock.timers.reset();
+    pushTestControl.reset();
+  }
+});
+
+test("persisted per-profile rotated token survives app restart so unregisterPush still deletes it", { skip }, async t => {
+  const { pushTestControl, reloadRegisterModule } = env!;
+  pushTestControl.reset();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const beforeRestart = reloadRegisterModule();
+  let afterRestart = beforeRestart;
+  try {
+    assert.equal(await beforeRestart.registerForPush(machineA), "registered");
+    assert.equal(await beforeRestart.registerForPush(machineB), "registered");
+    pushTestControl.clearCalls();
+
+    pushTestControl.setTokenFetcher(async () => ({ data: "ExponentPushToken[rot-persisted-a]" }));
+    pushTestControl.setApiHandler(async (connection, _path, init) => {
+      if (init?.method !== "DELETE" && connection.id === "machine-b") {
+        throw new Error("machine-b offline");
+      }
+      return {};
+    });
+
+    pushTestControl.emitTokenRotation({ type: "android", data: "fcm-persisted-a" });
+    await flush();
+    assert.equal(pushTestControl.storedToken(), "ExponentPushToken[initial]");
+
+    afterRestart = reloadRegisterModule();
+    pushTestControl.clearCalls();
+    await afterRestart.unregisterPush(machineA);
+    await flush();
+
+    const deletedForA = pushTestControl
+      .calls()
+      .filter(call => call.key === "machine-a" && call.method === "DELETE" && call.path === "/devices/push")
+      .map(call => (call.body as { token: string }).token)
+      .sort();
+    assert.deepEqual(deletedForA, ["ExponentPushToken[initial]", "ExponentPushToken[rot-persisted-a]"]);
+  } finally {
+    await beforeRestart.unregisterPush(machineA);
+    await beforeRestart.unregisterPush(machineB);
+    await afterRestart.unregisterPush(machineA);
+    await afterRestart.unregisterPush(machineB);
+    t.mock.timers.reset();
+    pushTestControl.reset();
+  }
+});
+
+test("late registerForPush continuation after unregisterPush does not re-pair or re-attach listeners", { skip }, async () => {
+  const { getPushStates, pushTestControl, registerForPush, unregisterPush } = env!;
+  pushTestControl.reset();
+  try {
+    let releaseRegisterPost!: () => void;
+    pushTestControl.setTokenFetcher(async () => ({ data: "ExponentPushToken[late-register]" }));
+    pushTestControl.setApiHandler(async (_connection, _path, init) => {
+      if (init?.method !== "DELETE") {
+        await new Promise<void>(resolve => {
+          releaseRegisterPost = resolve;
+        });
+      }
+      return {};
+    });
+
+    const pendingRegister = registerForPush(machineA);
+    await flush();
+    assert.equal(typeof releaseRegisterPost, "function");
+
+    await unregisterPush(machineA);
+    releaseRegisterPost();
+    await pendingRegister;
+    await flush();
+
+    assert.equal(pushTestControl.tokenListenerCount(), 0);
+    assert.equal(pushTestControl.appStateListenerCount(), 0);
+    assert.equal(getPushStates()["machine-a"], undefined);
+
+    const postCount = pushTestControl.calls().filter(call => call.method === "POST").length;
+    assert.equal(postCount, 1);
+
+    pushTestControl.emitTokenRotation({ type: "ios", data: "apns-after-disconnect" });
+    await flush();
+    assert.equal(pushTestControl.calls().filter(call => call.method === "POST").length, 1);
+    assert.equal(getPushStates()["machine-a"], undefined);
+  } finally {
+    await unregisterPush(machineA);
+    pushTestControl.reset();
+  }
+});
+
+test("registerForPush recovering SecureStore restores all storage-degraded registered profiles", { skip }, async t => {
+  const { PUSH_ROTATION_RETRY_DELAYS_MS, getPushStates, pushTestControl, registerForPush, unregisterPush } = env!;
+  pushTestControl.reset();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    assert.equal(await registerForPush(machineA), "registered");
+    assert.equal(await registerForPush(machineB), "registered");
+    pushTestControl.clearCalls();
+
+    let failSecureStore = true;
+    const realStore = new Map<string, string>();
+    pushTestControl.setTokenFetcher(async () => ({ data: "ExponentPushToken[rot-storage-recovery]" }));
+    pushTestControl.setSecureSetHandler(async (key, value) => {
+      if (failSecureStore) throw new Error("keychain locked");
+      realStore.set(key, value);
+    });
+
+    pushTestControl.emitTokenRotation({ type: "ios", data: "apns-storage-recovery" });
+    await flush();
+    for (const delay of PUSH_ROTATION_RETRY_DELAYS_MS) {
+      t.mock.timers.tick(delay);
+      await flush();
+    }
+    assert.equal(getPushStates()["machine-a"], "degraded");
+    assert.equal(getPushStates()["machine-b"], "degraded");
+
+    failSecureStore = false;
+    assert.equal(await registerForPush(machineA), "registered");
+    await flush();
+
+    assert.equal(getPushStates()["machine-a"], "registered");
+    assert.equal(getPushStates()["machine-b"], "registered");
+    assert.equal(realStore.get("infinite.push.v1"), "ExponentPushToken[rot-storage-recovery]");
+  } finally {
+    await unregisterPush(machineA);
+    await unregisterPush(machineB);
+    t.mock.timers.reset();
+    pushTestControl.reset();
+  }
+});
+
+test("clearPushState drops cached status, cancels in-flight registration, and stops rotation tracking", { skip }, async t => {
+  const { clearPushState, getPushStates, pushTestControl, registerForPush, unregisterPush } = env!;
+  pushTestControl.reset();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    assert.equal(await registerForPush(machineA), "registered");
+    assert.equal(getPushStates()["machine-a"], "registered");
+    assert.equal(pushTestControl.tokenListenerCount(), 1);
+
+    clearPushState(machineA);
+    assert.equal(getPushStates()["machine-a"], undefined);
+    assert.equal(pushTestControl.tokenListenerCount(), 0);
+    assert.equal(pushTestControl.appStateListenerCount(), 0);
+
+    let releaseRegisterPost!: () => void;
+    pushTestControl.setApiHandler(async (_connection, _path, init) => {
+      if (init?.method !== "DELETE") {
+        await new Promise<void>(resolve => {
+          releaseRegisterPost = resolve;
+        });
+      }
+      return {};
+    });
+    const inFlight = registerForPush(machineA);
+    await flush();
+    clearPushState(machineA);
+    releaseRegisterPost();
+    await inFlight;
+    await flush();
+    assert.equal(getPushStates()["machine-a"], undefined);
+    assert.equal(pushTestControl.tokenListenerCount(), 0);
+  } finally {
+    await unregisterPush(machineA);
     t.mock.timers.reset();
     pushTestControl.reset();
   }

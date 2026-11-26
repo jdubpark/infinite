@@ -7,6 +7,7 @@ import { api, connectionKey, type Connection } from "../api/client";
 import { onForegroundChange } from "../api/foreground";
 
 const TOKEN_KEY = "infinite.push.v1";
+const PROFILE_TOKENS_KEY = "infinite.push.profiles.v1";
 export const PUSH_ROTATION_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000] as const;
 export type PushState = "registered" | "degraded" | "denied" | "unavailable";
 
@@ -21,14 +22,56 @@ let lastRotatedDevicePushToken: Notifications.DevicePushToken | null = null;
 let pendingToken: string | null = null;
 let lastRotatedToken: string | null = null;
 let tokenStored = true;
+let profileTokenWrites: Promise<void> = Promise.resolve();
 const registered = new Map<string, Connection>();
 const acceptedTokenByProfile = new Map<string, string>();
+const profileGeneration = new Map<string, number>();
 const pendingProfiles = new Set<string>();
 let states: Record<string, PushState> = {};
 const stateListeners = new Set<() => void>();
 
 function platform() {
   return Platform.OS === "ios" ? "ios" : "android";
+}
+
+function bumpProfileGeneration(key: string): number {
+  const next = (profileGeneration.get(key) ?? 0) + 1;
+  profileGeneration.set(key, next);
+  return next;
+}
+
+function isCurrentProfileGeneration(key: string, generation: number): boolean {
+  return profileGeneration.get(key) === generation;
+}
+
+async function readPersistedProfileTokens(): Promise<Record<string, string>> {
+  const raw = await SecureStore.getItemAsync(PROFILE_TOKENS_KEY).catch(() => null);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const valid: Record<string, string> = {};
+    for (const [entryKey, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof value === "string" && value) valid[entryKey] = value;
+    }
+    return valid;
+  } catch {
+    return {};
+  }
+}
+
+function writePersistedProfileTokens(mutate: (current: Record<string, string>) => boolean): Promise<void> {
+  const next = profileTokenWrites.then(async () => {
+    const current = await readPersistedProfileTokens();
+    if (!mutate(current)) return;
+    if (Object.keys(current).length === 0) {
+      await SecureStore.deleteItemAsync(PROFILE_TOKENS_KEY);
+    } else {
+      await SecureStore.setItemAsync(PROFILE_TOKENS_KEY, JSON.stringify(current));
+    }
+  });
+  profileTokenWrites = next.catch(() => {});
+  return next;
 }
 
 function notifyStateListeners() {
@@ -138,6 +181,19 @@ function scheduleRetryOrDegrade(generation: number, attempt: number) {
   markPendingDegraded();
 }
 
+async function persistRegisteredAcceptedTokens() {
+  await writePersistedProfileTokens(current => {
+    let changed = false;
+    for (const [profileKey, accepted] of acceptedTokenByProfile) {
+      if (registered.has(profileKey) && current[profileKey] !== accepted) {
+        current[profileKey] = accepted;
+        changed = true;
+      }
+    }
+    return changed;
+  });
+}
+
 async function syncRotation(generation: number, attempt: number) {
   if (generation !== rotationGeneration || !registered.size || !activeProjectId) return;
   rotationInFlight = true;
@@ -161,6 +217,7 @@ async function syncRotation(generation: number, attempt: number) {
       else targets.push([key, profile]);
     }
 
+    const acceptedKeys: string[] = [];
     if (targets.length > 0) {
       const results = await Promise.allSettled(
         targets.map(([, profile]) =>
@@ -176,6 +233,7 @@ async function syncRotation(generation: number, attempt: number) {
           pendingProfiles.delete(key);
           if (registered.has(key)) {
             acceptedTokenByProfile.set(key, token);
+            acceptedKeys.push(key);
             setPushState(key, "registered");
           }
         } else if (!registered.has(key)) {
@@ -184,7 +242,24 @@ async function syncRotation(generation: number, attempt: number) {
       }
     }
 
+    if (acceptedKeys.length > 0 && (pendingProfiles.size > 0 || tokenStored)) {
+      await writePersistedProfileTokens(current => {
+        let changed = false;
+        for (const key of acceptedKeys) {
+          if (!registered.has(key)) continue;
+          if (current[key] !== token) {
+            current[key] = token;
+            changed = true;
+          }
+        }
+        return changed;
+      });
+      if (generation !== rotationGeneration || !registered.size) return;
+    }
+
     if (pendingProfiles.size === 0 && !tokenStored) {
+      await persistRegisteredAcceptedTokens();
+      if (generation !== rotationGeneration || !registered.size) return;
       await SecureStore.setItemAsync(TOKEN_KEY, token);
       if (generation !== rotationGeneration || !registered.size) return;
       tokenStored = true;
@@ -246,10 +321,19 @@ export function subscribePushStates(listener: () => void): () => void {
   };
 }
 
+export function clearPushState(connection: Connection) {
+  const key = connectionKey(connection);
+  bumpProfileGeneration(key);
+  removeProfileFromRotation(key);
+  deletePushState(key);
+  flushPendingStoreIfReady();
+}
+
 export async function registerForPush(
   connection: Connection,
 ): Promise<PushState> {
   const key = connectionKey(connection);
+  const regGen = bumpProfileGeneration(key);
   const projectId: string | undefined =
     Constants.expoConfig?.extra?.eas?.projectId ??
     Constants.easConfig?.projectId;
@@ -259,16 +343,20 @@ export async function registerForPush(
     setPushState(key, "unavailable");
     return "unavailable";
   }
-  if (Platform.OS === "android")
+  if (Platform.OS === "android") {
     await Notifications.setNotificationChannelAsync("attention", {
       name: "Needs your attention",
       importance: Notifications.AndroidImportance.MAX,
     });
+    if (!isCurrentProfileGeneration(key, regGen)) return states[key] ?? "unavailable";
+  }
   const current = await Notifications.getPermissionsAsync();
+  if (!isCurrentProfileGeneration(key, regGen)) return states[key] ?? "unavailable";
   const status =
     current.status === "granted"
       ? current.status
       : (await Notifications.requestPermissionsAsync()).status;
+  if (!isCurrentProfileGeneration(key, regGen)) return states[key] ?? "unavailable";
   if (status !== "granted") {
     removeProfileFromRotation(key);
     flushPendingStoreIfReady();
@@ -277,9 +365,11 @@ export async function registerForPush(
   }
   const startGeneration = rotationGeneration;
   const token = (await Notifications.getExpoPushTokenAsync({ projectId })).data;
+  if (!isCurrentProfileGeneration(key, regGen)) return states[key] ?? "unavailable";
   await api(connection, "/devices/push", {
     body: { token, platform: platform() },
   });
+  if (!isCurrentProfileGeneration(key, regGen)) return states[key] ?? "unavailable";
   activeProjectId = projectId;
   registered.set(key, connection);
   attachListeners();
@@ -290,7 +380,8 @@ export async function registerForPush(
     (pendingToken !== null && pendingToken !== token);
 
   if (supersededByRotation) {
-    if (!acceptedTokenByProfile.has(key)) acceptedTokenByProfile.set(key, token);
+    const shouldRecord = !acceptedTokenByProfile.has(key);
+    if (shouldRecord) acceptedTokenByProfile.set(key, token);
     if (!pendingProfiles.has(key)) {
       pendingProfiles.add(key);
       if (lastRotatedDevicePushToken && !pendingDevicePushToken) {
@@ -305,18 +396,35 @@ export async function registerForPush(
       }
     }
     if (!Object.hasOwn(states, key)) setPushState(key, "registered");
+    if (shouldRecord) {
+      await writePersistedProfileTokens(persisted => {
+        if (!registered.has(key) || Object.hasOwn(persisted, key)) return false;
+        persisted[key] = token;
+        return true;
+      }).catch(() => {});
+    }
     return states[key] ?? "registered";
   }
 
   acceptedTokenByProfile.set(key, token);
   pendingProfiles.delete(key);
+  await writePersistedProfileTokens(persisted => {
+    if (!registered.has(key) || persisted[key] === token) return false;
+    persisted[key] = token;
+    return true;
+  });
+  if (!isCurrentProfileGeneration(key, regGen)) return states[key] ?? "unavailable";
   if (pendingProfiles.size === 0) {
+    await persistRegisteredAcceptedTokens();
+    if (!isCurrentProfileGeneration(key, regGen)) return states[key] ?? "unavailable";
     await SecureStore.setItemAsync(TOKEN_KEY, token);
+    if (!isCurrentProfileGeneration(key, regGen)) return states[key] ?? "unavailable";
     if (rotationGeneration === startGeneration) {
       tokenStored = true;
       pendingToken = null;
       pendingDevicePushToken = null;
       clearRetryTimer();
+      restoreRegisteredStates();
     }
   }
   if (rotationGeneration === startGeneration) {
@@ -329,15 +437,22 @@ export async function registerForPush(
 
 export async function unregisterPush(connection: Connection) {
   const key = connectionKey(connection);
+  bumpProfileGeneration(key);
   const acceptedToken = acceptedTokenByProfile.get(key) ?? null;
   const activeRotatedToken = pendingToken;
   acceptedTokenByProfile.delete(key);
   removeProfileFromRotation(key);
   deletePushState(key);
-  const storedToken = await SecureStore.getItemAsync(TOKEN_KEY).catch(() => null);
+  await profileTokenWrites;
+  const [storedToken, persistedTokens] = await Promise.all([
+    SecureStore.getItemAsync(TOKEN_KEY).catch(() => null),
+    readPersistedProfileTokens(),
+  ]);
+  const persistedProfileToken = persistedTokens[key] ?? null;
   flushPendingStoreIfReady();
   const tokens = new Set<string>();
   if (acceptedToken) tokens.add(acceptedToken);
+  if (persistedProfileToken) tokens.add(persistedProfileToken);
   if (storedToken) tokens.add(storedToken);
   if (activeRotatedToken) tokens.add(activeRotatedToken);
   if (tokens.size > 0) {
@@ -350,5 +465,10 @@ export async function unregisterPush(connection: Connection) {
       ),
     );
   }
+  await writePersistedProfileTokens(current => {
+    if (registered.has(key) || !Object.hasOwn(current, key)) return false;
+    delete current[key];
+    return true;
+  }).catch(() => {});
   if (!registered.size) await SecureStore.deleteItemAsync(TOKEN_KEY).catch(() => {});
 }

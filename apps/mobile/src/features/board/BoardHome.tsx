@@ -5,7 +5,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { api, closeConnection, type Me } from "../../api/client";
 import { identifyConnection } from "../../store/connection";
 import { forgetMachine, useSharedMachine } from "../../store/machines";
-import { getPushStates, registerForPush, subscribePushStates, unregisterPush, type PushState } from "../../push/register";
+import { clearPushState, getPushStates, registerForPush, subscribePushStates, unregisterPush, type PushState } from "../../push/register";
 import { Board } from "./Board";
 import { theme } from "../../theme";
 
@@ -26,7 +26,11 @@ export function BoardHome() {
       const me = await api<Me>(profile, "/me");
       if (!live) return;
       if (me.machine?.id) await identifyConnection(profile, me.machine.id);
-      if (!live || !me.capabilities?.push) return;
+      if (!live) return;
+      if (!me.capabilities?.push) {
+        clearPushState(profile);
+        return;
+      }
       await registerForPush(profile);
     })().catch(() => {});
     return () => { live = false; };

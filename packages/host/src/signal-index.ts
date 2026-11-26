@@ -59,7 +59,8 @@ export interface SignalIndexRead {
   segments: SignalSegmentDescriptor[];
 }
 
-export interface SignalIndexState {
+export interface ActiveSignalIndexState {
+  disabled?: false;
   coveredSeq: number;
   count: number;
   segmentCount: number;
@@ -69,6 +70,8 @@ export interface SignalIndexState {
   tipSegment?: string;
   tipBytes?: number;
 }
+
+export type SignalIndexState = { disabled: true } | ActiveSignalIndexState;
 
 export type JournalTipProbe =
   | { kind: "empty" }
@@ -262,9 +265,9 @@ export function readSignalIndexState(
   if (!existsSync(file)) return undefined;
   try {
     const parsed = unseal<unknown>(key, `${sessionId}:signal-index-state`, readFileSync(file, "utf8"));
+    if (!isRecord(parsed) || parsed.v !== 1) return undefined;
+    if (parsed.disabled === true) return { disabled: true };
     if (
-      !isRecord(parsed) ||
-      parsed.v !== 1 ||
       typeof parsed.coveredSeq !== "number" ||
       !Number.isSafeInteger(parsed.coveredSeq) ||
       parsed.coveredSeq < 0 ||
@@ -284,7 +287,10 @@ export function readSignalIndexState(
       (parsed.lastSegment !== undefined &&
         (typeof parsed.lastSegment !== "string" || !SEGMENT_FILE_RE.test(parsed.lastSegment))) ||
       (parsed.tipSegment !== undefined &&
-        (typeof parsed.tipSegment !== "string" || !/^\d{10}\.journal$/.test(parsed.tipSegment))) ||
+        (typeof parsed.tipSegment !== "string" ||
+          !/^\d{10}\.journal$/.test(parsed.tipSegment) ||
+          parsed.coveredSeq <= 0 ||
+          Number(parsed.tipSegment.slice(0, 10)) !== Math.floor((parsed.coveredSeq - 1) / SEGMENT_SIZE))) ||
       (parsed.tipBytes !== undefined &&
         (typeof parsed.tipBytes !== "number" || !Number.isSafeInteger(parsed.tipBytes) || parsed.tipBytes < 0))
     ) {
@@ -323,12 +329,17 @@ export function probeJournalTip(eventsDir: string, hint?: JournalTipHint): Journ
     return { kind: "error" };
   }
   const segments = new Set<number>();
+  let maxSegment = -1;
   for (const name of names) {
-    if (/^\d{10}\.journal$/.test(name)) segments.add(Number(name.slice(0, 10)));
+    if (/^\d{10}\.journal$/.test(name)) {
+      const index = Number(name.slice(0, 10));
+      segments.add(index);
+      if (index > maxSegment) maxSegment = index;
+    }
   }
-  let lastSegment = -1;
-  while (segments.has(lastSegment + 1)) lastSegment++;
-  if (lastSegment < 0) return { kind: "empty" };
+  if (maxSegment < 0) return { kind: "empty" };
+  if (segments.size !== maxSegment + 1) return { kind: "error" };
+  const lastSegment = maxSegment;
   const segment = `${String(lastSegment).padStart(10, "0")}.journal`;
   const lastFile = join(eventsDir, segment);
   let info;
@@ -387,18 +398,67 @@ function probeExactTipForSeq(eventsDir: string, seq: number): JournalAppendMeta 
   return { segment, bytes: info.size };
 }
 
-function purgeSignalSidecars(sessionDir: string, signalsDir: string, stateFile: string): void {
-  const prefix = `${join(sessionDir, "events")}/`;
-  for (const key of tipCache.keys()) {
-    if (key.startsWith(prefix)) tipCache.delete(key);
+function isUnchangedJournalTip(eventsDir: string, tipSegment: string, tipBytes: number): boolean {
+  const segIndex = Number(tipSegment.slice(0, 10));
+  const nextSegment = `${String(segIndex + 1).padStart(10, "0")}.journal`;
+  try {
+    const info = statSync(join(eventsDir, tipSegment));
+    if (!info.isFile() || info.size !== tipBytes) return false;
+  } catch {
+    return false;
   }
   try {
-    if (existsSync(stateFile)) rmSync(stateFile, { force: true });
+    statSync(join(eventsDir, nextSegment));
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
+}
+
+function capEventPageBytes(page: EventPage): EventPage {
+  if (page.events.length <= 1) return page;
+  let totalBytes = 0;
+  for (let i = 0; i < page.events.length; i++) {
+    const eventBytes = 68 + Math.ceil(Buffer.byteLength(JSON.stringify(page.events[i]), "utf8") / 3) * 4;
+    if (i > 0 && (totalBytes >= MAX_EVENT_PAGE_BYTES || totalBytes + eventBytes > MAX_EVENT_PAGE_BYTES)) {
+      return { events: page.events.slice(0, i), cursor: page.events[i - 1].seq, more: true };
+    }
+    totalBytes += eventBytes;
+  }
+  return page;
+}
+
+function invalidateStaleSidecars(
+  sessionDir: string,
+  signalsDir: string,
+  stateFile: string,
+  key: Buffer,
+  sessionId: string,
+): void {
+  const prefix = `${join(sessionDir, "events")}/`;
+  for (const cacheKey of tipCache.keys()) {
+    if (cacheKey.startsWith(prefix)) tipCache.delete(cacheKey);
+  }
+  try { if (existsSync(stateFile)) rmSync(stateFile, { force: true }); } catch {}
+  try {
     if (existsSync(signalsDir) && lstatSync(signalsDir).isDirectory()) {
       rmSync(signalsDir, { recursive: true, force: true });
     }
-    if (existsSync(sessionDir)) fsyncDirectory(sessionDir);
   } catch {}
+  try { if (existsSync(sessionDir)) fsyncDirectory(sessionDir); } catch {}
+  const stateRemains = existsSync(stateFile);
+  const segmentsRemain = listSignalSegments(signalsDir).kind !== "empty";
+  if (!stateRemains && !segmentsRemain) return;
+  try {
+    writeSealed(stateFile, key, `${sessionId}:signal-index-state`, { v: 1, disabled: true });
+  } catch (error) {
+    throw new Error(
+      `Failed to invalidate stale signal index sidecars: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!readSignalIndexState(stateFile, key, sessionId)?.disabled) {
+    throw new Error("Failed to verify durable signal index invalidation marker");
+  }
 }
 
 function findStartSegment(segments: readonly SignalSegmentDescriptor[], after: number): number {
@@ -418,7 +478,7 @@ function findStartSegment(segments: readonly SignalSegmentDescriptor[], after: n
 }
 
 function stateMatchesSegments(
-  state: SignalIndexState,
+  state: ActiveSignalIndexState,
   segments: readonly SignalSegmentDescriptor[],
   lastLines: number,
   lastSeq: number,
@@ -476,18 +536,23 @@ export class SignalIndex {
       this.disabled = true;
       return;
     }
-    const state = readSignalIndexState(this.stateFile, key, sessionId);
+    const rawState = readSignalIndexState(this.stateFile, key, sessionId);
+    if (rawState?.disabled) {
+      this.disabled = true;
+      return;
+    }
+    const state = rawState;
     const listed = listSignalSegments(this.signalsDir);
     if (listed.kind === "corrupt") {
       if (state !== undefined && state.coveredSeq > initialJournalSeq) {
-        purgeSignalSidecars(sessionDir, this.signalsDir, this.stateFile);
+        invalidateStaleSidecars(sessionDir, this.signalsDir, this.stateFile, key, sessionId);
       }
       this.disabled = true;
       return;
     }
     if (listed.kind === "empty") {
       if (state !== undefined && state.coveredSeq > initialJournalSeq) {
-        purgeSignalSidecars(sessionDir, this.signalsDir, this.stateFile);
+        invalidateStaleSidecars(sessionDir, this.signalsDir, this.stateFile, key, sessionId);
         this.disabled = true;
         return;
       }
@@ -515,7 +580,7 @@ export class SignalIndex {
       lastSeq > initialJournalSeq ||
       (state !== undefined && state.coveredSeq > initialJournalSeq);
     if (ahead) {
-      purgeSignalSidecars(sessionDir, this.signalsDir, this.stateFile);
+      invalidateStaleSidecars(sessionDir, this.signalsDir, this.stateFile, key, sessionId);
       this.disabled = true;
       return;
     }
@@ -660,7 +725,7 @@ export class SignalIndex {
 
 function inspectFinalSegment(
   segments: readonly SignalSegmentDescriptor[],
-  state: SignalIndexState | undefined,
+  state: ActiveSignalIndexState | undefined,
   key: Buffer,
   sessionId: string,
   tipSeq: number,
@@ -745,15 +810,30 @@ export function readSignalEvents(
   readTail?: EventPageReader,
 ): EventPage {
   const eventsDir = join(sessionDir, "events");
-  const fallback: EventPageReader =
+  const rawFallback: EventPageReader =
     readTail ?? ((from, count, types) => readEvents(eventsDir, key, sessionId, from, count, types));
+  const fallback = (from: number, count: number): EventPage => capEventPageBytes(rawFallback(from, count, SIGNAL_ONLY));
   if (!Number.isSafeInteger(after) || after < 0) {
-    return fallback(after, limit, SIGNAL_ONLY);
+    return fallback(after, limit);
   }
-  const state = readSignalIndexState(join(sessionDir, SIGNAL_INDEX_STATE_FILE), key, sessionId);
+  const rawState = readSignalIndexState(join(sessionDir, SIGNAL_INDEX_STATE_FILE), key, sessionId);
+  if (rawState?.disabled) {
+    return fallback(after, limit);
+  }
+  const state = rawState;
+  if (
+    state !== undefined &&
+    state.coveredSeq > 0 &&
+    after >= state.coveredSeq &&
+    state.tipSegment !== undefined &&
+    state.tipBytes !== undefined &&
+    isUnchangedJournalTip(eventsDir, state.tipSegment, state.tipBytes)
+  ) {
+    return { events: [], cursor: after, more: false };
+  }
   const listed = listSignalSegments(join(sessionDir, SIGNAL_INDEX_DIR));
   if (listed.kind === "corrupt" || (listed.kind === "empty" && state === undefined)) {
-    return fallback(after, limit, SIGNAL_ONLY);
+    return fallback(after, limit);
   }
   const tipHint =
     state !== undefined && state.tipSegment !== undefined && state.tipBytes !== undefined
@@ -761,27 +841,27 @@ export function readSignalEvents(
       : undefined;
   const tip = probeJournalTip(eventsDir, tipHint);
   if (tip.kind === "empty") return { events: [], cursor: after, more: false };
-  if (tip.kind === "error") return fallback(after, limit, SIGNAL_ONLY);
+  if (tip.kind === "error") return fallback(after, limit);
   const tipSeq = tip.seq;
   if (after >= tipSeq) return { events: [], cursor: after, more: false };
   if (limit <= 0) return { events: [], cursor: after, more: true };
 
   if (listed.kind === "empty") {
     if (!state || !stateMatchesSegments(state, [], 0, 0, tipSeq) || state.coveredSeq <= after) {
-      return fallback(after, limit, SIGNAL_ONLY);
+      return fallback(after, limit);
     }
     if (state.coveredSeq >= tipSeq) return { events: [], cursor: tipSeq, more: false };
-    return fallback(state.coveredSeq, limit, SIGNAL_ONLY);
+    return fallback(state.coveredSeq, limit);
   }
 
   const inspected = inspectFinalSegment(listed.segments, state, key, sessionId, tipSeq);
   if (!inspected || inspected.covered <= after) {
-    return fallback(after, limit, SIGNAL_ONLY);
+    return fallback(after, limit);
   }
   const { validSegments, lastSignalSeq, covered, cachedFinal } = inspected;
   if (after >= lastSignalSeq) {
     if (covered >= tipSeq) return { events: [], cursor: tipSeq, more: false };
-    return fallback(covered, limit, SIGNAL_ONLY);
+    return fallback(covered, limit);
   }
 
   const events: Event[] = [];
@@ -797,7 +877,7 @@ export function readSignalEvents(
         const entry = cachedFinal.entries[i];
         if (entry.seq > covered || entry.seq <= prevSeq) {
           if (events.length > 0) return { events, cursor: events[events.length - 1].seq, more: true };
-          return fallback(Math.max(after, lastValidSeq), limit, SIGNAL_ONLY);
+          return fallback(Math.max(after, lastValidSeq), limit);
         }
         prevSeq = entry.seq;
         if (entry.seq <= after) {
@@ -828,7 +908,7 @@ export function readSignalEvents(
     const fullCheck = !isFinal && (!raw.ok || !raw.hasTrailingNewline || raw.lines.length !== SIGNAL_SEGMENT_SIZE);
     if (fullCheck || !raw.ok || raw.lines.length === 0 || raw.lines.length > SIGNAL_SEGMENT_SIZE) {
       if (events.length > 0) return { events, cursor: events[events.length - 1].seq, more: true };
-      return fallback(Math.max(after, lastValidSeq), limit, SIGNAL_ONLY);
+      return fallback(Math.max(after, lastValidSeq), limit);
     }
     if (!isFinal && s === startIdx && seg.startSeq <= after) {
       const segTail = unsealSegmentLine(
@@ -850,7 +930,7 @@ export function readSignalEvents(
       const entry = unsealSegmentLine(key, sessionId, seg, i, line, segPrevSeq);
       if (!entry || entry.seq > covered) {
         if (events.length > 0) return { events, cursor: events[events.length - 1].seq, more: true };
-        return fallback(Math.max(after, lastValidSeq), limit, SIGNAL_ONLY);
+        return fallback(Math.max(after, lastValidSeq), limit);
       }
       segPrevSeq = entry.seq;
       if (entry.seq <= after) {
@@ -881,7 +961,7 @@ export function readSignalEvents(
   if (events.length > 0) {
     return { events, cursor: covered, more: true };
   }
-  return fallback(covered, limit, SIGNAL_ONLY);
+  return fallback(covered, limit);
 }
 
 export function readIndexedEvents(

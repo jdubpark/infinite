@@ -57,6 +57,7 @@ export class CmuxSessions {
   private readonly directory: string;
   private readonly records = new Map<string, Stored>();
   private readonly journals = new Map<string, Journal>();
+  private readonly signalIndexes = new Map<string, SignalIndex>();
   private readonly unreadable = new Set<string>();
   private readonly mutations: (() => Promise<void>)[] = [];
   private readonly observations: (() => Promise<void>)[] = [];
@@ -142,6 +143,7 @@ export class CmuxSessions {
     });
     signalIndex = new SignalIndex(sessionDir, this.key, id, journal.seq);
     this.journals.set(id, journal);
+    this.signalIndexes.set(id, signalIndex);
     return journal;
   }
 
@@ -741,5 +743,12 @@ export class CmuxSessions {
     };
   }
 
-  async close(): Promise<void> { this.closed = true; await this.draining; }
+  async close(): Promise<void> {
+    this.closed = true;
+    while (this.draining) await this.draining;
+    for (const [id, index] of this.signalIndexes) {
+      const journal = this.journals.get(id);
+      if (journal) index.checkpoint(journal.seq);
+    }
+  }
 }

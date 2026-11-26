@@ -342,7 +342,7 @@ test("seeded durable-state simulator verifies per-step invariants across faults 
     const state = readSignalIndexState(join(sessionDir, SIGNAL_INDEX_STATE_FILE), key, sessionId);
     const covered = Math.max(
       index.entries.at(-1)?.seq ?? 0,
-      index.intact && state && state.coveredSeq <= tip ? state.coveredSeq : 0,
+      index.intact && state && !state.disabled && state.coveredSeq <= tip ? state.coveredSeq : 0,
     );
     if (covered <= after) return fallback(after, limit, SIGNAL_ONLY);
     const matching = index.entries.filter(entry => entry.seq > after);

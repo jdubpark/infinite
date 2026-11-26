@@ -164,16 +164,21 @@ function appendBulkJournalEvents(
 
 function withIoCounters<T>(
   eventsDir: string,
-  fn: (counts: { journalReads: number; decipherCalls: number }) => T,
+  fn: (counts: { journalReads: number; decipherCalls: number; readdirCalls: number }) => T,
 ): T {
-  const counts = { journalReads: 0, decipherCalls: 0 };
+  const counts = { journalReads: 0, decipherCalls: 0, readdirCalls: 0 };
   const origRead = fs.readFileSync;
+  const origReaddir = fs.readdirSync;
   const origDecipher = crypto.createDecipheriv;
   const readSpy = mock.method(fs, "readFileSync", ((...args: Parameters<typeof fs.readFileSync>) => {
     const path = String(args[0]);
     if (path.startsWith(eventsDir) && path.endsWith(".journal")) counts.journalReads++;
     return origRead.apply(fs, args);
   }) as typeof fs.readFileSync);
+  const readdirSpy = mock.method(fs, "readdirSync", ((...args: Parameters<typeof fs.readdirSync>) => {
+    counts.readdirCalls++;
+    return origReaddir.apply(fs, args);
+  }) as typeof fs.readdirSync);
   const decipherSpy = mock.method(
     crypto,
     "createDecipheriv",
@@ -187,6 +192,7 @@ function withIoCounters<T>(
     return fn(counts);
   } finally {
     readSpy.mock.restore();
+    readdirSpy.mock.restore();
     decipherSpy.mock.restore();
     syncBuiltinESMExports();
   }
@@ -374,6 +380,29 @@ test("large output-heavy, zero-signal, unchanged-tip, and 520-signal journals bo
     });
     assert.equal(heavyTailCalls, 0);
     assert.deepEqual(idlePage, { events: [], cursor: heavyLastSeq, more: false });
+
+    const caughtUpHeavy = withIoCounters(heavyEventsDir, counts => {
+      const page = readSignalEvents(heavyDir, key, heavyId, heavyLastSeq, 200, (after, limit, types) => {
+        heavyTailCalls++;
+        return readEvents(heavyEventsDir, key, heavyId, after, limit, types);
+      });
+      assert.equal(counts.readdirCalls, 0, "caught-up idle poll must not call readdirSync on events/ or signals/");
+      assert.equal(counts.journalReads, 0);
+      assert.equal(counts.decipherCalls, 1);
+      return page;
+    });
+    assert.equal(heavyTailCalls, 0);
+    assert.deepEqual(caughtUpHeavy, { events: [], cursor: heavyLastSeq, more: false });
+
+    const caughtUpOutput = withIoCounters(eventsDir, counts => {
+      const page = readSignalEvents(sessionDir, key, id, lastSeq, 200, countingTail);
+      assert.equal(counts.readdirCalls, 0, "caught-up idle poll on multi-MB output session must make 0 readdirSync calls");
+      assert.equal(counts.journalReads, 0);
+      assert.equal(counts.decipherCalls, 1);
+      return page;
+    });
+    assert.equal(tailCalls, 0);
+    assert.deepEqual(caughtUpOutput, { events: [], cursor: lastSeq, more: false });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -477,6 +506,19 @@ test("pagination parity, strict MAX_EVENT_PAGE_BYTES across index-tail boundary,
     }
     assert.ok(pageCount >= 2, "indexed + unindexed large signals must split across pages");
     assert.deepEqual(collected.map(e => e.seq), [b1.seq, b2.seq, b3.seq, b4.seq]);
+
+    const tailCapId = randomUUID();
+    const tailCapDir = writeSessionMeta(stateDir, key, tailCapId);
+    const tailCapEvents = join(tailCapDir, "events");
+    const tailCapJournal = new Journal(tailCapEvents, key, tailCapId);
+    const blob300k = "U".repeat(300 * 1024);
+    const u1 = tailCapJournal.append("signal", toolStartData("Write", { file_path: "src/u1.ts", blob: blob300k }, "u1"));
+    const u2 = tailCapJournal.append("signal", toolStartData("Write", { file_path: "src/u2.ts", blob: blob300k }, "u2"));
+    assert.equal(readEvents(tailCapEvents, key, tailCapId, 0, 200, SIGNAL_ONLY).events.length, 2);
+    const capPage1 = readSignalEvents(tailCapDir, key, tailCapId, 0, 200);
+    assert.deepEqual(capPage1, { events: [u1], cursor: u1.seq, more: true });
+    const capPage2 = readSignalEvents(tailCapDir, key, tailCapId, capPage1.cursor, 200);
+    assert.deepEqual(capPage2, { events: [u2], cursor: u2.seq, more: false });
 
     const cmuxCli = join(root, "cmux-stub.mjs");
     writeFileSync(
@@ -727,6 +769,89 @@ test("legacy zero-probe fallback, tip-read error fallback, torn segment, crash g
     const regrownPage = drainPages((after, limit) => readSignalEvents(rollbackDir, key, rollbackId, after, limit), 0, 200);
     assert.deepEqual(regrownPage.events, [keptSig, freshSig]);
     assert.equal(regrownPage.cursor, reopenedRbJournal.seq);
+
+    const gapId = randomUUID();
+    const gapDir = join(root, gapId);
+    const gapEvents = join(gapDir, "events");
+    const gapIndex = new SignalIndex(gapDir, key, gapId, 0);
+    const gapItems: { type: Event["type"]; data: Event["data"] }[] = [];
+    for (let i = 0; i < SEGMENT_SIZE; i++) gapItems.push({ type: "output", data: { text: `g-${i}\n` } });
+    gapItems.push({ type: "signal", data: toolStartData("Read", { file_path: "src/seg1.ts" }, "gap-257") });
+    const gapCreated = appendBulkJournalEvents(gapEvents, gapIndex, key, gapId, gapItems);
+    const gapSig = gapCreated.at(-1)!;
+    assert.equal(gapSig.seq, SEGMENT_SIZE + 1);
+    rmSync(join(gapEvents, "0000000000.journal"), { force: true });
+    assert.equal(probeJournalTip(gapEvents).kind, "error");
+    assert.deepEqual(readSignalEvents(gapDir, key, gapId, SEGMENT_SIZE, 200), {
+      events: [gapSig],
+      cursor: gapSig.seq,
+      more: false,
+    });
+
+    const stickyId = randomUUID();
+    const stickyDir = join(root, stickyId);
+    const stickyEvents = join(stickyDir, "events");
+    const stickyIndex = new SignalIndex(stickyDir, key, stickyId, 0);
+    const stickyCreated = appendBulkJournalEvents(stickyEvents, stickyIndex, key, stickyId, rbItems);
+    const stickyKept = stickyCreated[0];
+    rmSync(join(stickyEvents, "0000000001.journal"), { force: true });
+    const origRm = fs.rmSync;
+    const origOpen = fs.openSync;
+    const rmFail = mock.method(fs, "rmSync", ((...args: Parameters<typeof fs.rmSync>) => {
+      if (String(args[0]).includes(SIGNAL_INDEX_DIR)) {
+        throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+      }
+      return origRm.apply(fs, args);
+    }) as typeof fs.rmSync);
+    syncBuiltinESMExports();
+    let reopenedStickyJournal!: Journal;
+    let reopenedStickyIndex!: SignalIndex;
+    try {
+      reopenedStickyJournal = new Journal(stickyEvents, key, stickyId);
+      reopenedStickyIndex = new SignalIndex(stickyDir, key, stickyId, reopenedStickyJournal.seq);
+    } finally {
+      rmFail.mock.restore();
+      syncBuiltinESMExports();
+    }
+    assert.equal(reopenedStickyIndex.isDisabled, true);
+    assert.equal(existsSync(join(stickyDir, SIGNAL_INDEX_DIR)), true);
+    assert.deepEqual(readSignalIndexState(join(stickyDir, SIGNAL_INDEX_STATE_FILE), key, stickyId), { disabled: true });
+    for (let i = 0; i < 5; i++) reopenedStickyJournal.append("output", { text: `sticky-${i}\n` });
+    const stickyFresh = reopenedStickyJournal.append("signal", toolStartData("Read", { file_path: "src/sticky.ts" }, "sf"));
+    for (let i = 0; i < 5; i++) reopenedStickyJournal.append("output", { text: `sticky-after-${i}\n` });
+    assert.ok(reopenedStickyJournal.seq > stickyCreated.at(-1)!.seq);
+    const stickyPage = drainPages((after, limit) => readSignalEvents(stickyDir, key, stickyId, after, limit), 0, 200);
+    assert.deepEqual(stickyPage.events, [stickyKept, stickyFresh]);
+    assert.equal(stickyPage.cursor, reopenedStickyJournal.seq);
+    assert.equal(new SignalIndex(stickyDir, key, stickyId, reopenedStickyJournal.seq).isDisabled, true);
+
+    const hardId = randomUUID();
+    const hardDir = join(root, hardId);
+    const hardEvents = join(hardDir, "events");
+    const hardIndex = new SignalIndex(hardDir, key, hardId, 0);
+    appendBulkJournalEvents(hardEvents, hardIndex, key, hardId, rbItems);
+    rmSync(join(hardEvents, "0000000001.journal"), { force: true });
+    const hardJournal = new Journal(hardEvents, key, hardId);
+    const hardRmFail = mock.method(fs, "rmSync", ((...args: Parameters<typeof fs.rmSync>) => {
+      if (String(args[0]).includes(SIGNAL_INDEX_DIR)) {
+        throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+      }
+      return origRm.apply(fs, args);
+    }) as typeof fs.rmSync);
+    const hardOpenFail = mock.method(fs, "openSync", ((...args: Parameters<typeof fs.openSync>) => {
+      if (String(args[0]).includes(SIGNAL_INDEX_STATE_FILE)) {
+        throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      }
+      return origOpen.apply(fs, args);
+    }) as typeof fs.openSync);
+    syncBuiltinESMExports();
+    try {
+      assert.throws(() => new SignalIndex(hardDir, key, hardId, hardJournal.seq), /Failed to invalidate stale signal index sidecars/);
+    } finally {
+      hardRmFail.mock.restore();
+      hardOpenFail.mock.restore();
+      syncBuiltinESMExports();
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -801,7 +926,7 @@ test("real worker writes segmented signals and state, survives poisoned output o
     assert.equal(indexed.intact, true);
     assert.ok(indexed.entries.length >= 3);
     const state = readSignalIndexState(stateFile, hostKey, sessionId);
-    assert.ok(state);
+    assert.ok(state && !state.disabled);
     assert.equal(state.coveredSeq, journalTipSeq(join(sessionDir, "events")));
     assert.equal(state.count, indexed.entries.length);
 

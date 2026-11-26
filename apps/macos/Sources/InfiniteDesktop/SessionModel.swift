@@ -316,7 +316,6 @@ import InfiniteCore
             pipe.feed(Data(snapshot["ansi"].string.utf8), reset: true, columns: size?.columns, rows: size?.rows)
         } else if message["open"] != .null {
             let size = TerminalDimensions(json: message["open"]) ?? topSize
-            markSnapshotReceived()
             pipe.feed(Data(), reset: true, columns: size?.columns, rows: size?.rows)
         }
         if message["type"].string == "resize" || message["resize"] != .null,

@@ -203,4 +203,30 @@ final class TeamRunTests: XCTestCase {
         XCTAssertEqual(legacySteps.first?.title, "Resolve a flagged limitation")
         XCTAssertEqual(legacySteps.first?.detail, "Task e: Legacy fallback gap.")
     }
+
+    func testTwentyMaxLengthLimitationsSplitIntoSendableSteeringDirections() {
+        let notes: [String] = (1...20).map { index in
+            let tag = String(format: "L%02d:", index)
+            return tag + String(repeating: "x", count: 1000 - tag.count)
+        }
+        let maxTask = task("big", "integrated", summary: "Done.", limitations: notes.map { .string($0) })
+        let steps = run(["status": .string("ready-for-review"), "tasks": .array([maxTask])]).reviewSteps
+        let limitationSteps = steps.filter { $0.title.lowercased().contains("limitation") }
+        XCTAssertGreaterThan(limitationSteps.count, 1)
+
+        var directions: [String] = []
+        for step in limitationSteps {
+            guard case .direction(let text) = step.action else {
+                XCTFail("Expected direction action for limitation review step")
+                continue
+            }
+            XCTAssertLessThanOrEqual(text.count, TeamRun.maxSteeringDirectionChars)
+            XCTAssertLessThanOrEqual(text.utf16.count, TeamRun.maxSteeringDirectionChars)
+            directions.append(text)
+        }
+        let combined = directions.joined(separator: "\n")
+        for note in notes {
+            XCTAssertTrue(combined.contains(note), "Missing limitation in split review steps")
+        }
+    }
 }

@@ -44,6 +44,7 @@ import InfiniteCore
 
     func testSessionModelForwardsOpenAndNonSnapshotReplayDimensionsAndReplaysInOrder() {
         let model = makeModel()
+        let initialGeneration = model.rendererGeneration
         var live: [FeedRecord] = []
         model.pipe.receive = { data, reset, cols, rows in
             live.append(FeedRecord(data: data, reset: reset, columns: cols, rows: rows))
@@ -55,13 +56,24 @@ import InfiniteCore
             "cols": .number(120),
             "rows": .number(32),
         ])]))
-        XCTAssertTrue(model.rendererState.snapshotReady)
+        XCTAssertEqual(model.rendererState, .awaitingSnapshot(generation: initialGeneration))
+        XCTAssertFalse(model.rendererState.snapshotReady)
+        XCTAssertFalse(model.rendererState.receivedScreen)
+        model.rendererRestored(initialGeneration)
+        XCTAssertEqual(model.rendererState, .awaitingSnapshot(generation: initialGeneration))
+        XCTAssertFalse(model.canUseTerminal)
+
         model.receive(.object(["message": .object([
             "events": .array([.object(["seq": .number(1), "type": .string("output"), "data": .object(["text": .string("WIDE\r\n")])])]),
             "cursor": .number(1),
             "cols": .number(120),
             "rows": .number(32),
         ])]))
+        XCTAssertEqual(model.rendererState, .snapshotReceived(generation: initialGeneration))
+        XCTAssertTrue(model.rendererState.snapshotReady)
+        model.rendererRestored(initialGeneration)
+        XCTAssertEqual(model.rendererState, .ready(generation: initialGeneration))
+
         model.receive(.object(["message": .object([
             "events": .array([.object(["seq": .number(2), "type": .string("lifecycle"), "data": .object(["event": .string("resize"), "cols": .number(88), "rows": .number(26)])])]),
             "cursor": .number(2),
@@ -77,7 +89,7 @@ import InfiniteCore
 
         XCTAssertEqual(live, [
             FeedRecord(data: Data(), reset: true, columns: 120, rows: 32),
-            FeedRecord(data: Data("WIDE\r\n".utf8), reset: false, columns: 120, rows: 32),
+            FeedRecord(data: Data("WIDE\r\n".utf8), reset: true, columns: 120, rows: 32),
             FeedRecord(data: Data(), reset: false, columns: 88, rows: 26),
             FeedRecord(data: Data("NARROW\r\n".utf8), reset: false, columns: 88, rows: 26),
         ])
@@ -200,13 +212,13 @@ import InfiniteCore
         XCTAssertTrue(queue.enqueue(data: Data("C".utf8), reset: false, dimensions: size88))
         XCTAssertTrue(queue.enqueue(data: Data(), reset: false, dimensions: size100))
 
-        XCTAssertEqual(queue.dequeue(), TerminalFeedStep(data: Data("AB".utf8), reset: true, dimensions: size120))
-        XCTAssertEqual(queue.dequeue(), TerminalFeedStep(data: Data("C".utf8), reset: false, dimensions: size88))
-        XCTAssertEqual(queue.dequeue(), TerminalFeedStep(data: Data(), reset: false, dimensions: size100))
+        XCTAssertEqual(queue.dequeue(), TerminalFeedStep(data: Data("AB".utf8), reset: true, dimensions: size120, completesReplay: true))
+        XCTAssertEqual(queue.dequeue(), TerminalFeedStep(data: Data("C".utf8), reset: false, dimensions: size88, completesReplay: false))
+        XCTAssertEqual(queue.dequeue(), TerminalFeedStep(data: Data(), reset: false, dimensions: size100, completesReplay: false))
         XCTAssertNil(queue.dequeue())
 
         XCTAssertTrue(queue.enqueue(data: Data("LIVE".utf8), reset: false, dimensions: nil))
-        XCTAssertEqual(queue.dequeue(), TerminalFeedStep(data: Data("LIVE".utf8), reset: false, dimensions: nil))
+        XCTAssertEqual(queue.dequeue(), TerminalFeedStep(data: Data("LIVE".utf8), reset: false, dimensions: nil, completesReplay: false))
         XCTAssertNil(queue.dequeue())
 
         let oversized = Data(repeating: 0x42, count: TerminalFeedQueue.maxPendingBytes + 1)
@@ -215,10 +227,81 @@ import InfiniteCore
         let pauseStep = try XCTUnwrap(queue.dequeue())
         XCTAssertTrue(pauseStep.reset)
         XCTAssertNil(pauseStep.dimensions)
+        XCTAssertFalse(pauseStep.completesReplay)
         XCTAssertTrue(queue.enqueue(data: Data("dropped".utf8), reset: false, dimensions: size100))
         XCTAssertNil(queue.dequeue())
         XCTAssertTrue(queue.enqueue(data: Data("RECOVERED".utf8), reset: true, dimensions: size100))
         XCTAssertFalse(queue.overflowed)
-        XCTAssertEqual(queue.dequeue(), TerminalFeedStep(data: Data("RECOVERED".utf8), reset: true, dimensions: size100))
+        XCTAssertEqual(queue.dequeue(), TerminalFeedStep(data: Data("RECOVERED".utf8), reset: true, dimensions: size100, completesReplay: true))
+    }
+
+    func testDistinctResizesWithoutInterveningOutputArePreservedWhileDuplicateSizesCoalesce() throws {
+        let size120 = try XCTUnwrap(TerminalDimensions(columns: 120, rows: 32))
+        let size80 = try XCTUnwrap(TerminalDimensions(columns: 80, rows: 24))
+
+        let pipe = TerminalPipe()
+        pipe.feed(Data("WIDE".utf8), reset: true, columns: 120, rows: 32)
+        pipe.feed(Data(), reset: false, columns: 80, rows: 24)
+        pipe.feed(Data(), reset: false, columns: 80, rows: 24)
+        pipe.feed(Data(), reset: false, columns: 120, rows: 32)
+        pipe.feed(Data("AFTER".utf8), reset: false, columns: 120, rows: 32)
+
+        let pipeSteps = try XCTUnwrap(pipe.replaySteps())
+        XCTAssertEqual(pipeSteps, [
+            TerminalFeedStep(data: Data("WIDE".utf8), reset: true, dimensions: size120, completesReplay: false),
+            TerminalFeedStep(data: Data(), reset: false, dimensions: size80, completesReplay: false),
+            TerminalFeedStep(data: Data("AFTER".utf8), reset: false, dimensions: size120, completesReplay: true),
+        ])
+
+        var queue = TerminalFeedQueue()
+        XCTAssertTrue(queue.enqueue(data: Data("WIDE".utf8), reset: true, dimensions: size120))
+        XCTAssertTrue(queue.enqueue(data: Data(), reset: false, dimensions: size80))
+        XCTAssertTrue(queue.enqueue(data: Data(), reset: false, dimensions: size80))
+        XCTAssertTrue(queue.enqueue(data: Data(), reset: false, dimensions: size120))
+        XCTAssertEqual(queue.dequeue(), TerminalFeedStep(data: Data("WIDE".utf8), reset: true, dimensions: size120, completesReplay: true))
+        XCTAssertEqual(queue.dequeue(), TerminalFeedStep(data: Data(), reset: false, dimensions: size80, completesReplay: false))
+        XCTAssertEqual(queue.dequeue(), TerminalFeedStep(data: Data(), reset: false, dimensions: size120, completesReplay: false))
+        XCTAssertNil(queue.dequeue())
+    }
+
+    func testMultiEntryReplayDefersReadinessAndViewportFollowUntilFinalStepCompletes() throws {
+        let size120 = try XCTUnwrap(TerminalDimensions(columns: 120, rows: 32))
+        let size88 = try XCTUnwrap(TerminalDimensions(columns: 88, rows: 26))
+
+        let pipe = TerminalPipe()
+        pipe.feed(Data("AT_120".utf8), reset: true, columns: 120, rows: 32)
+        pipe.feed(Data(), reset: false, columns: 88, rows: 26)
+        pipe.feed(Data("AT_88".utf8), reset: false, columns: 88, rows: 26)
+
+        let steps = try XCTUnwrap(pipe.replaySteps())
+        XCTAssertEqual(steps.count, 2)
+        XCTAssertTrue(steps[0].reset)
+        XCTAssertFalse(steps[0].completesReplay)
+        XCTAssertFalse(steps[1].reset)
+        XCTAssertTrue(steps[1].completesReplay)
+
+        var queue = TerminalFeedQueue()
+        let generation = UUID()
+        let staleGeneration = UUID()
+        XCTAssertTrue(queue.enqueueReplay(steps, generation: generation))
+        XCTAssertTrue(queue.isReplayingHistory)
+        XCTAssertFalse(queue.effectiveFollow(desired: true))
+
+        let first = try XCTUnwrap(queue.dequeue())
+        XCTAssertEqual(first, TerminalFeedStep(data: Data("AT_120".utf8), reset: true, dimensions: size120, completesReplay: false))
+        XCTAssertFalse(queue.completeStep(first, generation: generation, currentGeneration: generation))
+        XCTAssertTrue(queue.isReplayingHistory)
+        XCTAssertFalse(queue.effectiveFollow(desired: true))
+
+        let second = try XCTUnwrap(queue.dequeue())
+        XCTAssertEqual(second, TerminalFeedStep(data: Data("AT_88".utf8), reset: false, dimensions: size88, completesReplay: true))
+        XCTAssertFalse(queue.completeStep(second, generation: staleGeneration, currentGeneration: generation))
+        XCTAssertTrue(queue.isReplayingHistory)
+        XCTAssertFalse(queue.effectiveFollow(desired: true))
+
+        XCTAssertTrue(queue.completeStep(second, generation: generation, currentGeneration: generation))
+        XCTAssertFalse(queue.isReplayingHistory)
+        XCTAssertTrue(queue.effectiveFollow(desired: true))
+        XCTAssertFalse(queue.effectiveFollow(desired: false))
     }
 }

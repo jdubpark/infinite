@@ -1,7 +1,8 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, rmSync, realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { accessSync, chmodSync, constants as fsConstants, existsSync, lstatSync, mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, rmSync, realpathSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { hashToken } from "../packages/host/src/config.js";
 import { createApp } from "../packages/host/src/server.js";
@@ -14,9 +15,9 @@ export const waitFor = async <T>(
   accepts: (value: T) => boolean,
   timeout = 10000,
 ): Promise<T> => {
-  const until = Date.now() + timeout;
+  const until = performance.now() + timeout;
   let last: T | undefined;
-  while (Date.now() < until) {
+  while (performance.now() < until) {
     last = await fn();
     if (accepts(last)) return last;
     await new Promise((r) => setTimeout(r, 100));
@@ -274,4 +275,43 @@ export async function inProcessHost(options?: { configure?: (config: Config) => 
       }
     },
   };
+}
+
+function hasSecureAncestors(directory: string, trustedUid: number): boolean {
+  let current = directory;
+  for (; ; current = dirname(current)) {
+    let info;
+    try { info = lstatSync(current); } catch { return false; }
+    if (info.isSymbolicLink() || !info.isDirectory()) return false;
+    if ((info.uid !== 0 && info.uid !== trustedUid) || (info.mode & 0o022) !== 0) return false;
+    if (current === "/") return true;
+  }
+}
+
+export function mkdtempSecure(prefix: string): string {
+  const uid = process.getuid!();
+  const candidates = [
+    process.env.XDG_RUNTIME_DIR,
+    process.platform === "linux" ? `/run/user/${uid}` : undefined,
+    tmpdir(),
+    process.env.XDG_CACHE_HOME,
+  ].filter((value): value is string => Boolean(value));
+  for (const candidate of candidates) {
+    try {
+      const canonical = realpathSync(candidate);
+      accessSync(canonical, fsConstants.W_OK | fsConstants.X_OK);
+      if (!hasSecureAncestors(canonical, uid)) continue;
+      const root = realpathSync(mkdtempSync(join(canonical, prefix)));
+      chmodSync(root, 0o700);
+      return root;
+    } catch { }
+  }
+  const cacheRoot = join(realpathSync(homedir()), ".cache");
+  if (!existsSync(cacheRoot)) mkdirSync(cacheRoot, { mode: 0o700 });
+  const stagingRoot = join(cacheRoot, "infinite-test-staging");
+  if (!existsSync(stagingRoot)) mkdirSync(stagingRoot, { mode: 0o700 });
+  chmodSync(stagingRoot, 0o700);
+  const root = realpathSync(mkdtempSync(join(stagingRoot, prefix)));
+  chmodSync(root, 0o700);
+  return root;
 }

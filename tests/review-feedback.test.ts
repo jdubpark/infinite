@@ -110,6 +110,43 @@ test("only GitHub's documented pull request fields are read, and anything else i
   assert.throws(() => read([review({ commit: { oid: "HEAD" } })]));
 });
 
+test("parsePullRequestView accepts live gh pr view --json reviews output including empty author login and empty commit oid", () => {
+  const liveFixture = JSON.stringify({
+    baseRefName: "main",
+    headRefName: BRANCH,
+    headRefOid: HEAD,
+    isCrossRepository: false,
+    reviews: [
+      { id: "PRR_kwDOExample0000000001", author: { login: "review-bot" }, authorAssociation: "CONTRIBUTOR", body: "Automated review note.", submittedAt: "2026-11-01T10:00:00Z", includesCreatedEdit: false, reactionGroups: [], state: "COMMENTED", commit: { oid: OLD } },
+      { id: "PRR_kwDOExample0000000002", author: { login: "" }, authorAssociation: "NONE", body: "", submittedAt: "2026-11-01T11:00:00Z", includesCreatedEdit: false, reactionGroups: [], state: "COMMENTED", commit: { oid: "" } },
+      { id: "PRR_kwDOExample0000000003", author: { login: "Owner-Login" }, authorAssociation: "OWNER", body: "Draft review.", submittedAt: null, includesCreatedEdit: false, reactionGroups: [], state: "PENDING", commit: { oid: HEAD } },
+      { id: "PRR_kwDOExample0000000004", author: { login: "someone-else" }, authorAssociation: "MEMBER", body: "Superseded comment.", submittedAt: "2026-11-01T12:00:00Z", includesCreatedEdit: true, reactionGroups: [{ content: "THUMBS_UP", users: { totalCount: 1 } }], state: "DISMISSED", commit: { oid: OLD } },
+      { id: "PRR_kwDOExample0000000005", author: { login: "collaborator" }, authorAssociation: "MEMBER", body: "", submittedAt: "2026-11-01T13:00:00Z", includesCreatedEdit: false, reactionGroups: [], state: "APPROVED", commit: { oid: HEAD } },
+      { id: "PRR_kwDOExample0000000006", author: { login: "Owner-Login" }, authorAssociation: "OWNER", body: "Rename the flag.", submittedAt: "2026-11-02T00:00:00Z", includesCreatedEdit: false, reactionGroups: [], state: "CHANGES_REQUESTED", commit: { oid: HEAD } },
+    ],
+    state: "OPEN",
+  });
+  const parsed = parsePullRequestView(liveFixture);
+  assert.equal(parsed.reviews.length, 6);
+  const verdict = reviewVerdict({ run: delivered() }, parsed, OWNER, ENABLED);
+  assert.deepEqual(verdict.kind === "start" && { id: verdict.review.id, body: verdict.review.body, commit: verdict.review.commit, branch: verdict.branch },
+    { id: "PRR_kwDOExample0000000006", body: "Rename the flag.", commit: HEAD, branch: BRANCH });
+
+  const missingCommitFixture = JSON.stringify({
+    baseRefName: "main", headRefName: BRANCH, headRefOid: HEAD, isCrossRepository: false, state: "OPEN",
+    reviews: [{ id: "PRR_kwDOExample0000000007", author: { login: "Owner-Login" }, authorAssociation: "OWNER", body: "Rename the flag.", submittedAt: "2026-11-02T00:00:00Z", includesCreatedEdit: false, reactionGroups: [], state: "CHANGES_REQUESTED", commit: { oid: "" } }],
+  });
+  const missingCommitVerdict = reviewVerdict({ run: delivered() }, parsePullRequestView(missingCommitFixture), OWNER, ENABLED);
+  assert.equal(missingCommitVerdict.kind, "skip");
+  assert.equal(missingCommitVerdict.kind === "skip" && missingCommitVerdict.outcome, "stale-head");
+
+  const emptyReviewsFixture = JSON.stringify({
+    baseRefName: "main", headRefName: BRANCH, headRefOid: HEAD, isCrossRepository: false, reviews: [], state: "MERGED",
+  });
+  const emptyVerdict = reviewVerdict({ run: delivered() }, parsePullRequestView(emptyReviewsFixture), OWNER, ENABLED);
+  assert.deepEqual(emptyVerdict, { kind: "unwatched", reason: "merged" });
+});
+
 test("the one read of a pull request is a read the GitHub proxy allows under the pr operation with no refs", () => {
   const target = pullRequestTarget(delivered());
   assert.deepEqual(target, { repository: REPOSITORY, number: 7 });

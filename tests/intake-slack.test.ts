@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -14,7 +14,7 @@ import type { Config } from "../packages/host/src/types.js";
 import { waitFor } from "./helpers.js";
 import { missionHarness as harness, scriptedMissionHarness as scripted } from "./mission-harness.js";
 import type { MissionService } from "../packages/host/src/missions.js";
-import { TeamError, type TeamService } from "../packages/host/src/teams.js";
+import type { TeamService } from "../packages/host/src/teams.js";
 import type { Mission, MissionReport, MissionSubtaskPlan } from "../packages/host/src/mission-types.js";
 import type { TeamPublication } from "../packages/host/src/team-types.js";
 import { startSlackServer } from "./fixtures/slack-server.js";
@@ -627,7 +627,7 @@ const plan = (id: string, repoProjectId: string) =>
   ({ id, repoProjectId, title: `Subtask ${id}`, objective: `Do ${id}`, size: "solo" as const, parallelism: 1, dependsOn: [] as string[] });
 const teamOf = (mission: Mission, subtaskId: string) => mission.subtasks.find(item => item.id === subtaskId)?.teamId;
 
-async function scriptedSurface(options: { bindByMention?: boolean; wrapClient?: (client: SlackClient) => SlackClient; wrapTeams?: (teams: TeamService) => TeamService; wrapMissions?: (missions: MissionService) => MissionService; log?: (line: string, error: unknown) => void } = {}) {
+async function scriptedSurface(options: { bindByMention?: boolean; wrapClient?: (client: SlackClient) => SlackClient; wrapTeams?: (teams: TeamService) => TeamService; wrapMissions?: (missions: MissionService) => MissionService; log?: (line: string, error: unknown) => void; directRequests?: boolean; direct?: (store: IntakeStore) => DirectRequest } = {}) {
   const sh = scripted();
   const stateRoot = mkdtempSync(join(tmpdir(), "intake-scripted-"));
   const teams = options.wrapTeams ? options.wrapTeams(sh.teams as unknown as TeamService) : sh.teams as unknown as TeamService;
@@ -1504,144 +1504,137 @@ test("with a single unfinished record the word answer is ordinary text, not a se
   } finally { await close(); }
 });
 
-const DEADLINE_STOP = "Approved time ran out after 30 minutes.";
+const DEADLINE_STOP = "The approved time limit has expired. Subteams are paused and their workspaces are kept. Extend the time limit to continue, or cancel the mission.";
 const STOPPED = `Stopped at its time limit: ${DEADLINE_STOP}\nReply with a mention and \`extend\` (or \`extend 6h\`) to give it more time, or \`cancel\`.`;
 const EXTEND_HELP = "Extend by 5 minutes to 24 hours, for example `extend 6h` or `extend 90m`.";
-const DEADLINE_MISSION = "m-deadline";
-
-function deadlineMissions(options: { maxMinutes?: number; refuse?: TeamError } = {}) {
-  const extendCalls: { requestId: string; revision: number; minutes: number }[] = [];
-  const steers: string[] = [];
-  let mission = { id: DEADLINE_MISSION, revision: 3, status: "blocked", stopReason: "deadline", reason: DEADLINE_STOP,
-    maxMinutes: options.maxMinutes ?? 30, deadlineAt: "2026-11-15T11:30:00.000Z", decisions: [], subtasks: [], steering: [], events: [] } as unknown as Mission;
-  const missions = {
-    peek: (id: string) => (id === DEADLINE_MISSION ? mission : undefined),
-    onChange: () => () => undefined,
-    extend: async (_id: string, input: { requestId: string; revision: number; minutes: number }) => {
-      extendCalls.push({ requestId: input.requestId, revision: input.revision, minutes: input.minutes });
-      if (options.refuse) throw options.refuse;
-      mission = { ...mission, status: "working", stopReason: undefined, deadlineAt: "2026-11-15T12:00:00.000Z" } as unknown as Mission;
-      return mission;
-    },
-    steer: async (_id: string, input: { text: string }) => { steers.push(input.text); return mission; },
-  } as unknown as MissionService;
-  return { missions, extendCalls, steers };
-}
-
 const handledOutcomes = (s: Awaited<ReturnType<typeof surfaceFor>>, count: number) =>
   waitFor(async () => s.store.get(ISSUE)!.inbound.filter(item => item.handledAt).map(item => item.outcome), outcomes => outcomes.length === count, 30000);
 
-async function deadlineSurface(options: { maxMinutes?: number; refuse?: TeamError; directRequests?: boolean; direct?: (store: IntakeStore) => DirectRequest; state?: IntakeRecord["state"] } = {}) {
-  const deadline = deadlineMissions(options);
-  const stateRoot = mkdtempSync(join(tmpdir(), "intake-deadline-"));
-  const s = await surfaceFor({ missions: deadline.missions, teams: {} as unknown as TeamService }, stateRoot,
-    { ...(options.directRequests !== undefined ? { directRequests: options.directRequests } : {}), ...(options.direct ? { direct: options.direct } : {}) });
-  const state = options.state ?? "started";
-  s.store.create(intakeRecord(ISSUE, state, { thread: BINDING, missionId: DEADLINE_MISSION }));
-  await s.surface.start(); await s.connected();
-  const setup = state === "started" ? 2 : 1;
-  await waitFor(async () => s.texts(), list => list.length === setup, 30000);
-  return { s, deadline, posts: () => s.texts().slice(setup), close: async () => { s.surface.close(); await s.slack.close(); rmSync(stateRoot, { recursive: true, force: true }); } };
+async function deadlineSurface(t: TestContext, options: { maxMinutes?: number; mode?: "deadline" | "running" | "cancelled"; wrapMissions?: (missions: MissionService) => MissionService; directRequests?: boolean; direct?: (store: IntakeStore) => DirectRequest; state?: IntakeRecord["state"] } = {}) {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-15T11:00:00Z") });
+  const { sh, s, close: closeSurface } = await scriptedSurface({ wrapMissions: options.wrapMissions, directRequests: options.directRequests, direct: options.direct });
+  let closed = false;
+  const close = async () => { if (closed) return; closed = true; try { await closeSurface(); } finally { t.mock.timers.reset(); } };
+  t.after(close);
+  try {
+    const minutes = options.maxMinutes ?? 30, capped = Math.min(minutes, 1440), mode = options.mode ?? "deadline", state = options.state ?? "started";
+    const created = await sh.missions.create({ requestId: randomUUID(), groupId: "shop", objective: "Change the API and the web client", maxSubtasks: 8, maxMinutes: capped });
+    if (minutes > 1440) (sh.missions as unknown as { records: Map<string, { mission: Mission }> }).records.get(created.id)!.mission.maxMinutes = minutes;
+    if (mode === "deadline") {
+      await sh.attempt(1); t.mock.timers.tick(capped * 60000);
+      await until(() => sh.get(created.id), mission => mission.status === "blocked" && mission.stopReason === "deadline");
+    } else if (mode === "cancelled") await sh.missions.cancel(created.id, { requestId: randomUUID(), revision: created.revision });
+    s.store.create(intakeRecord(ISSUE, state, { thread: BINDING, missionId: created.id }));
+    await s.surface.start(); await s.connected();
+    const setup = state === "started" && mode !== "running" ? 2 : state === "started" ? 1 : 0;
+    if (setup > 0) await waitFor(async () => s.texts(), list => list.length === setup, 30000);
+    return { sh, s, id: created.id, posts: () => s.texts().slice(setup), close };
+  } catch (error) { await close(); throw error; }
 }
 
-test("extend commands parse to minutes: bare extend uses the mission's maxMinutes, and units and bare numbers are hours or minutes", { timeout: 120000 }, async () => {
-  const { s, deadline, close } = await deadlineSurface();
+test("extend commands parse to minutes: bare extend uses the mission's maxMinutes, and units and bare numbers are hours or minutes", { timeout: 120000 }, async t => {
+  const { sh, s, id, close } = await deadlineSurface(t);
   try {
     const cases: [string, number][] = [["extend", 30], ["EXTEND", 30], ["extend 6", 360], ["extend 6h", 360], ["extend 6 hours", 360],
       ["extend 1 hour", 60], ["extend 2hr", 120], ["extend 2 hrs", 120], ["extend 90m", 90], ["extend 90 min", 90],
       ["extend 90 minutes", 90], ["extend 45mins", 45], ["extend 30 minute", 30], ["extend 5m", 5], ["extend 24", 1440], ["extend 1440m", 1440]];
     for (const [index, [text, minutes]] of cases.entries()) {
-      await s.slack.emit(mention(text));
-      await handledOutcomes(s, index + 1);
-      assert.equal(deadline.extendCalls.at(-1)?.minutes, minutes, text);
+      const before = Date.parse(sh.get(id).deadlineAt), rev = sh.get(id).revision;
+      await s.slack.emit(mention(text)); await handledOutcomes(s, index + 1);
+      const after = sh.get(id);
+      assert.equal(Date.parse(after.deadlineAt) - before, minutes * 60000, text);
+      assert.equal(after.revision, rev + 1, text);
+      if (index === 0) { assert.notEqual(after.status, "blocked"); assert.equal(after.stopReason, undefined); }
     }
-    assert.equal(deadline.extendCalls.length, cases.length, "Every command made exactly one call");
-    assert.equal(deadline.extendCalls[0].revision, 3, "The call carries the mission's revision");
   } finally { await close(); }
 });
 
-test("a bare extend is capped at 1440 minutes when the mission's maxMinutes is larger", { timeout: 60000 }, async () => {
-  const { s, deadline, close } = await deadlineSurface({ maxMinutes: 2000 });
+test("a bare extend is capped at 1440 minutes when the mission's maxMinutes is larger", { timeout: 60000 }, async t => {
+  const { sh, s, id, close } = await deadlineSurface(t, { maxMinutes: 2000 });
   try {
-    await s.slack.emit(mention("extend"));
-    await handledOutcomes(s, 1);
-    assert.equal(deadline.extendCalls[0].minutes, 1440);
+    const before = Date.parse(sh.get(id).deadlineAt);
+    await s.slack.emit(mention("extend")); await handledOutcomes(s, 1);
+    assert.equal(Date.parse(sh.get(id).deadlineAt) - before, 1440 * 60000); assert.notEqual(sh.get(id).status, "blocked");
   } finally { await close(); }
 });
 
-test("out-of-range and malformed extend commands get the help reply and make no call", { timeout: 120000 }, async () => {
-  const { s, deadline, posts, close } = await deadlineSurface();
+test("out-of-range and malformed extend commands get the help reply and make no call", { timeout: 120000 }, async t => {
+  const { sh, s, id, posts, close } = await deadlineSurface(t);
   try {
-    const bad = ["extend 4m", "extend 25", "extend 0", "extend 6x", "extend 1.5h", "extend 6 days", "extend 6h please", "extend 1440",
-      "extend -1h", "extend .5h", "extend +2h"];
-    for (const [index, text] of bad.entries()) {
-      await s.slack.emit(mention(text));
-      await handledOutcomes(s, index + 1);
-    }
+    const beforeRev = sh.get(id).revision, beforeDeadline = sh.get(id).deadlineAt;
+    const bad = ["extend 4m", "extend 25", "extend 0", "extend 6x", "extend 1.5h", "extend 6 days", "extend 6h please", "extend 1440", "extend -1h", "extend .5h", "extend +2h"];
+    for (const [index, text] of bad.entries()) { await s.slack.emit(mention(text)); await handledOutcomes(s, index + 1); }
     await waitFor(async () => posts(), list => list.length === bad.length, 30000);
     assert.deepEqual([...new Set(posts())], [EXTEND_HELP]);
-    assert.deepEqual(deadline.extendCalls, [], "No call was made");
+    assert.equal(sh.get(id).revision, beforeRev, "No call was made"); assert.equal(sh.get(id).deadlineAt, beforeDeadline); assert.equal(sh.get(id).status, "blocked");
     assert.deepEqual(s.store.get(ISSUE)!.inbound.map(item => item.outcome), bad.map(() => "invalid-extend"));
   } finally { await close(); }
 });
 
-test("a sentence that begins with extend is steering, not a command", { timeout: 60000 }, async () => {
-  const { s, deadline, posts, close } = await deadlineSurface();
+test("a sentence that begins with extend is steering, not a command", { timeout: 60000 }, async t => {
+  const { sh, s, id, posts, close } = await deadlineSurface(t, { mode: "running" });
   try {
-    await s.slack.emit(mention("extend the API to cover CSV exports"));
-    await s.slack.emit(mention("extended the deadline for the CSV work"));
+    const beforeDeadline = sh.get(id).deadlineAt;
+    await s.slack.emit(mention("extend the API to cover CSV exports")); await s.slack.emit(mention("extended the deadline for the CSV work"));
     await handledOutcomes(s, 2);
-    assert.deepEqual(deadline.steers, ["extend the API to cover CSV exports", "extended the deadline for the CSV work"]);
-    assert.deepEqual(deadline.extendCalls, [], "No extend call was made");
-    assert.deepEqual(posts(), [], "Steering draws no reply");
+    assert.deepEqual(sh.get(id).steering.map(item => item.text), ["extend the API to cover CSV exports", "extended the deadline for the CSV work"]);
+    assert.equal(sh.get(id).deadlineAt, beforeDeadline, "No extend call was made"); assert.deepEqual(posts(), [], "Steering draws no reply");
   } finally { await close(); }
 });
 
-test("a successful extend replies with the amount added and the new stop time", { timeout: 120000 }, async () => {
-  const { s, posts, close } = await deadlineSurface();
+test("a deadline-stopped mission posts how to extend, resumes on extend, and replies with the new stop time", { timeout: 120000 }, async t => {
+  const { sh, s, id, posts, close } = await deadlineSurface(t);
   try {
-    await s.slack.emit(mention("extend 6h"));
-    await waitFor(async () => posts(), list => list.length === 1, 30000);
-    assert.equal(posts()[0], "Extended by 6 hours. The mission now stops at 2026-11-15 12:00 UTC.");
-    await s.slack.emit(mention("extend 90m"));
-    await waitFor(async () => posts(), list => list.length === 2, 30000);
-    assert.equal(posts()[1], "Extended by 90 minutes. The mission now stops at 2026-11-15 12:00 UTC.");
-    await s.slack.emit(mention("extend 1h"));
-    await waitFor(async () => posts(), list => list.length === 3, 30000);
-    assert.equal(posts()[2], "Extended by 1 hour. The mission now stops at 2026-11-15 12:00 UTC.");
+    assert.equal(s.texts().at(-1), STOPPED); assert.equal(s.store.get(ISSUE)!.state, "started", "The record stays started while the owner may extend");
+    await s.slack.emit(mention("extend 6h")); await waitFor(async () => posts(), list => list.length === 1, 30000);
+    assert.equal(posts()[0], "Extended by 6 hours. The mission now stops at 2026-11-15 17:30 UTC.");
+    assert.equal(sh.get(id).status, "planning"); assert.equal(sh.get(id).stopReason, undefined);
+    await s.slack.emit(mention("extend 90m")); await waitFor(async () => posts(), list => list.length === 2, 30000);
+    assert.equal(posts()[1], "Extended by 90 minutes. The mission now stops at 2026-11-15 19:00 UTC.");
+    await s.slack.emit(mention("extend 1h")); await waitFor(async () => posts(), list => list.length === 3, 30000);
+    assert.equal(posts()[2], "Extended by 1 hour. The mission now stops at 2026-11-15 20:00 UTC.");
   } finally { await close(); }
 });
 
-test("a refused extend replies with the mission's refusal and nothing else", { timeout: 60000 }, async () => {
-  const refusal = new TeamError(409, "mission-not-extendable", "This mission cannot be extended.");
-  const { s, posts, close } = await deadlineSurface({ refuse: refusal });
+test("extend retries once on a revision conflict and refuses when a second conflict persists", { timeout: 90000 }, async t => {
+  let bumps = 1;
+  const wrapMissions = (missions: MissionService) => new Proxy(missions, { get: (target, property) => {
+    if (property === "extend") return async (missionId: string, input: { requestId: string; revision: number; minutes: number }) => {
+      if (bumps > 0) { bumps -= 1; await target.extend(missionId, { requestId: randomUUID(), revision: target.peek(missionId)!.revision, minutes: 30 }); }
+      return target.extend(missionId, input);
+    };
+    const value = Reflect.get(target, property); return typeof value === "function" ? value.bind(target) : value;
+  } });
+  const { sh, s, id, posts, close } = await deadlineSurface(t, { wrapMissions });
   try {
-    await s.slack.emit(mention("extend 6h"));
-    await waitFor(async () => posts(), list => list.length === 1, 30000);
-    assert.equal(posts()[0], "This mission cannot be extended.");
+    await s.slack.emit(mention("extend 1h")); await waitFor(async () => posts(), list => list.length === 1, 30000);
+    assert.equal(posts()[0], "Extended by 1 hour. The mission now stops at 2026-11-15 13:00 UTC.");
+    assert.equal(sh.get(id).status, "planning"); assert.equal(s.store.get(ISSUE)!.inbound[0].outcome, "extended");
+    bumps = 2;
+    await s.slack.emit(mention("extend 1h")); await waitFor(async () => posts(), list => list.length === 2, 30000);
+    assert.equal(posts()[1], "The mission changed. Refresh it before sending this action.");
+    assert.equal(s.store.get(ISSUE)!.inbound[1].outcome, "refused");
+  } finally { await close(); }
+});
+
+test("a refused extend on a non-extendable mission replies with the mission's refusal and nothing else", { timeout: 60000 }, async t => {
+  const { s, posts, close } = await deadlineSurface(t, { mode: "cancelled" });
+  try {
+    await s.slack.emit(mention("extend 6h")); await waitFor(async () => posts(), list => list.length === 1, 30000);
+    assert.equal(posts()[0], "Only a running mission, or one stopped by its time limit, can be extended.");
     assert.equal(s.store.get(ISSUE)!.inbound[0].outcome, "refused");
   } finally { await close(); }
 });
 
-test("a mission stopped at its time limit posts the stop, the reason, and how to extend it", { timeout: 60000 }, async () => {
-  const { s, close } = await deadlineSurface();
-  try {
-    assert.equal(s.texts().at(-1), STOPPED);
-    assert.equal(s.store.get(ISSUE)!.state, "started", "The record stays started while the owner may extend");
-  } finally { await close(); }
-});
-
-test("in a finished thread an extend command gets the finished line, and a sentence that begins with extend files a follow-up", { timeout: 60000 }, async () => {
+test("in a finished thread an extend command gets the finished line, and a sentence that begins with extend files a follow-up", { timeout: 60000 }, async t => {
   const filed: string[] = [];
   const direct: DirectRequest = input => { filed.push(input.text); return "accepted"; };
-  const { s, deadline, posts, close } = await deadlineSurface({ directRequests: true, direct: () => direct, state: "finished" });
+  const { sh, s, id, posts, close } = await deadlineSurface(t, { directRequests: true, direct: () => direct, state: "finished", mode: "running" });
   try {
-    await s.slack.emit(mention("extend 6h"));
-    await waitFor(async () => posts(), list => list.length === 1, 30000);
+    const beforeDeadline = sh.get(id).deadlineAt;
+    await s.slack.emit(mention("extend 6h")); await waitFor(async () => posts(), list => list.length === 1, 30000);
     assert.equal(posts()[0], FINISHED_DIRECT);
-    await s.slack.emit(mention("extend the API to cover CSV exports"));
-    await waitFor(async () => filed, list => list.length === 1, 30000);
-    assert.deepEqual(filed, ["extend the API to cover CSV exports"]);
-    assert.deepEqual(deadline.extendCalls, []);
+    await s.slack.emit(mention("extend the API to cover CSV exports")); await waitFor(async () => filed, list => list.length === 1, 30000);
+    assert.deepEqual(filed, ["extend the API to cover CSV exports"]); assert.equal(sh.get(id).deadlineAt, beforeDeadline);
   } finally { await close(); }
 });

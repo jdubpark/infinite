@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { forwardExecutor, type ExecutorControl } from "./executor-tunnel.js";
 import { captureWorkspace, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, readWorkspaceBlob, validateWorkspaceManifest, type WorkspaceManifest } from "./workspace-checkpoint.js";
+import { recordClientLaptopState, removeClientLaptopState } from "./workspace-pool-gc.js";
 import { shouldCaptureWorkspace, watchWorkspaceChanges } from "./workspace-changes.js";
 import { transferWorkspaceBlobs } from "./workspace-transfer.js";
 import { supervisorArgs } from "./group-supervisor.js";
@@ -38,11 +39,13 @@ export async function synchronizeWorkspace(options: LaptopServiceOptions, contro
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const storeDir = { directory: join(directory, "objects"), sharedPoolDirectory: join(dirname(dirname(directory)), "workspace-pool") };
   if (options.roots.some(root => inside(root, storeDir.sharedPoolDirectory))) throw new Error("Workspace cache must be outside the selected project");
-  const changeDetector = await watchWorkspaceChanges(options.roots, join(storeDir.directory, "watch-cache"));
+  let changeDetector: Awaited<ReturnType<typeof watchWorkspaceChanges>> | undefined;
   let previous: WorkspaceManifest | undefined, recovered: string | undefined, lastFull = 0;
   let committed: { revision: number; epoch: number; id: string; entriesFingerprint: string } | undefined;
   let previousIterationFailed = false, lastCaptureStartedAt = 0;
   try {
+    await recordClientLaptopState(directory, options.sessionId);
+    changeDetector = await watchWorkspaceChanges(options.roots, join(storeDir.directory, "watch-cache"));
     while (!signal.aborted) {
       try {
         const status = await control("sync/status");
@@ -108,7 +111,10 @@ export async function synchronizeWorkspace(options: LaptopServiceOptions, contro
       }
       await delay(3000, undefined, { signal }).catch(() => {});
     }
-  } finally { await changeDetector?.close(); }
+  } finally {
+    await changeDetector?.close();
+    await removeClientLaptopState(directory);
+  }
 }
 
 export async function checkLaptopExecutor(): Promise<void> {

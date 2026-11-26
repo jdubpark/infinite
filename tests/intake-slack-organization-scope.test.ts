@@ -119,6 +119,34 @@ test("a persisted inbound action waits through revocation and applies once after
   } finally { await s.close(); }
 });
 
+test("steering stays in arrival order while another thread can finish authorization", { timeout: 30000 }, async () => {
+  const s = await scopedSurface();
+  let release = () => {};
+  try {
+    const { id } = await s.harness.create();
+    s.store.create(record(id, "started", { thread: BINDING, missionId: id, slackAudienceId: slackAudienceIdentity(s.config) }));
+    await s.connect();
+    await waitFor(async () => s.store.get(id)?.messages[0]?.status, status => status === "sent");
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const check = s.client.organizationChannelAllowed.bind(s.client);
+    let firstStarted = false;
+    s.client.organizationChannelAllowed = async channel => {
+      if (channel === BINDING.channelId && !firstStarted) { firstStarted = true; await held; }
+      return check(channel);
+    };
+    await s.slack.emit(mention(BINDING.channelId, "1700000900.000101", "Keep the schema", BINDING.threadTs));
+    await waitFor(async () => firstStarted, Boolean);
+    const second = await s.slack.emit(mention(BINDING.channelId, "1700000900.000102", "Update the migration", BINDING.threadTs));
+    const independent = await s.slack.emit(mention(OTHER.channelId, "1700000900.000103", "status", OTHER.threadTs));
+    await waitFor(async () => s.slack.acks(), acks => acks.includes(independent));
+    assert.equal(s.slack.acks().includes(second), false);
+    assert.deepEqual(s.store.get(id)?.inbound, []);
+    release();
+    await waitFor(async () => s.harness.get(id).steering, items => items.length === 2);
+    assert.deepEqual(s.harness.get(id).steering.map(item => item.text), ["Keep the schema", "Update the migration"]);
+  } finally { release(); await s.close(); }
+});
+
 test("a queued Slack mutation rechecks the sealed audience before committing", { timeout: 60000 }, async () => {
   const s = await scopedSurface();
   let releaseQueue = () => {};

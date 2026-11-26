@@ -191,6 +191,120 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
         return body.isEmpty ? nil : body
     }
 
+    public static func limitations(of task: JSON) -> [String] {
+        if case .array(let items) = task["limitations"] {
+            return items.compactMap { item -> String? in
+                guard case .string(let text) = item else { return nil }
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+        }
+        guard let legacy = limitations(task["summary"].string) else { return [] }
+        return [legacy]
+    }
+
+    public static let maxSteeringDirectionChars = 8_000
+
+    private static func utf16Prefix(_ text: String, maxUnits: Int) -> String {
+        guard maxUnits > 0 else { return "" }
+        guard text.utf16.count > maxUnits else { return text }
+        var result = ""
+        var used = 0
+        for character in text {
+            let cost = character.utf16.count
+            if used + cost > maxUnits {
+                if result.isEmpty {
+                    for scalar in character.unicodeScalars {
+                        let scalarCost = scalar.utf16.count
+                        if used + scalarCost > maxUnits { break }
+                        result.unicodeScalars.append(scalar)
+                        used += scalarCost
+                    }
+                }
+                break
+            }
+            result.append(character)
+            used += cost
+        }
+        return result
+    }
+
+    private static func utf16Chunks(_ text: String, maxUnits: Int) -> [String] {
+        guard maxUnits > 0 else { return [] }
+        guard text.utf16.count > maxUnits else { return [text] }
+        var chunks: [String] = []
+        var current = ""
+        var used = 0
+        for character in text {
+            let cost = character.utf16.count
+            if cost <= maxUnits {
+                if used + cost > maxUnits, !current.isEmpty {
+                    chunks.append(current)
+                    current = ""
+                    used = 0
+                }
+                current.append(character)
+                used += cost
+            } else {
+                for scalar in character.unicodeScalars {
+                    let scalarCost = scalar.utf16.count
+                    if used + scalarCost > maxUnits, !current.isEmpty {
+                        chunks.append(current)
+                        current = ""
+                        used = 0
+                    }
+                    if scalarCost <= maxUnits {
+                        current.unicodeScalars.append(scalar)
+                        used += scalarCost
+                    }
+                }
+            }
+        }
+        if !current.isEmpty { chunks.append(current) }
+        return chunks
+    }
+
+    private static func limitationDirection(taskTitle: String, notes: [String]) -> String {
+        if notes.count == 1, let note = notes.first {
+            return "In \"\(taskTitle)\" the agent reported this limitation: \(note)\nResolve it or explain why it is acceptable."
+        }
+        let bullets = notes.map { "- \($0)" }.joined(separator: "\n")
+        return "In \"\(taskTitle)\" the agent reported these limitations:\n\(bullets)\nResolve them or explain why they are acceptable."
+    }
+
+    private static func limitationReviewSteps(taskTitle: String, notes: [String]) -> [ReviewStep] {
+        guard !notes.isEmpty else { return [] }
+        let singleWrapperCost = limitationDirection(taskTitle: "", notes: [""]).utf16.count
+        let multiWrapperCost = limitationDirection(taskTitle: "", notes: ["", ""]).utf16.count
+        let maxTitleUnits = max(0, min(200, maxSteeringDirectionChars - max(singleWrapperCost, multiWrapperCost) - 16))
+        let directionTitle = taskTitle.utf16.count > maxTitleUnits && limitationDirection(taskTitle: taskTitle, notes: notes).utf16.count > maxSteeringDirectionChars
+            ? utf16Prefix(taskTitle, maxUnits: maxTitleUnits)
+            : taskTitle
+        let singleBudget = max(1, maxSteeringDirectionChars - limitationDirection(taskTitle: directionTitle, notes: [""]).utf16.count)
+        let expanded = notes.flatMap { note -> [String] in
+            note.utf16.count <= singleBudget ? [note] : utf16Chunks(note, maxUnits: singleBudget)
+        }
+        var groups: [[String]] = []
+        var current: [String] = []
+        for note in expanded {
+            let candidate = current + [note]
+            if !current.isEmpty && limitationDirection(taskTitle: directionTitle, notes: candidate).utf16.count > maxSteeringDirectionChars {
+                groups.append(current)
+                current = [note]
+            } else {
+                current = candidate
+            }
+        }
+        if !current.isEmpty { groups.append(current) }
+        return groups.map { group in
+            let direction = limitationDirection(taskTitle: directionTitle, notes: group)
+            if group.count == 1, let note = group.first {
+                return ReviewStep(title: "Resolve a flagged limitation", detail: "\(taskTitle): \(note)", action: .direction(direction), urgent: false)
+            }
+            return ReviewStep(title: "Resolve flagged limitations", detail: "\(taskTitle): \(group.joined(separator: " · "))", action: .direction(direction), urgent: false)
+        }
+    }
+
     public struct ReviewStep: Equatable, Sendable {
         public enum Action: Equatable, Sendable { case direction(String), copy(String) }
         public let title: String
@@ -208,8 +322,8 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
             steps.append(.init(title: "Address the reviewer's changes", detail: "The reviewer did not approve this revision.", action: .direction("Address every change the reviewer requested, then rerun the checks."), urgent: true))
         }
         for task in tasks {
-            guard let note = Self.limitations(task["summary"].string) else { continue }
-            steps.append(.init(title: "Resolve a flagged limitation", detail: "\(task["title"].string): \(note)", action: .direction("In \"\(task["title"].string)\" the agent reported this limitation: \(note)\nResolve it or explain why it is acceptable."), urgent: false))
+            let notes = Self.limitations(of: task)
+            steps.append(contentsOf: Self.limitationReviewSteps(taskTitle: task["title"].string, notes: notes))
         }
         if !baseCommit.isEmpty {
             let target = headCommit.isEmpty ? branch : headCommit

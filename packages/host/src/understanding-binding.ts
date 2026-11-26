@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { realpathSync, statSync, type Stats } from "node:fs";
+import { lstatSync, realpathSync, statSync, type Stats } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import type { UnderstandingArtifact, UnderstandingPinnedSource } from "@infinite/remote";
-import { expectedIdentity, readGit } from "./checkout-identity.js";
+import { expectedIdentity, readGit, readGitResult, type GitResultReader } from "./checkout-identity.js";
+import { isMissingSessionError } from "./mission-coordinator.js";
 import type { Mission } from "./mission-types.js";
 import type { ProjectGroup, ProjectGroupRepo } from "./project-group-types.js";
 import type { Project, Session } from "./types.js";
@@ -57,17 +58,29 @@ export function pathInside(root: string, candidate: string): boolean {
   return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !isAbsolute(child));
 }
 
-export function readGitHead(cwd: string): string | null | undefined {
+export function readGitHead(cwd: string, git: GitResultReader = readGitResult): string | null | undefined {
   let canonicalCwd: string;
   try { canonicalCwd = realpathSync(cwd); } catch { return undefined; }
-  const toplevel = readGit(canonicalCwd, ["rev-parse", "--show-toplevel"]);
-  if (!toplevel) return undefined;
-  try { if (realpathSync(toplevel) !== canonicalCwd) return undefined; } catch { return undefined; }
-  const raw = readGit(canonicalCwd, ["rev-parse", "--verify", "HEAD^{commit}"]);
-  if (raw && /^[a-f0-9]{40,64}$/i.test(raw)) return raw.toLowerCase();
-  const symbolic = readGit(canonicalCwd, ["symbolic-ref", "--quiet", "HEAD"]);
-  if (!symbolic || !symbolic.startsWith("refs/heads/")) return undefined;
-  return readGit(canonicalCwd, ["show-ref", "--verify", "--quiet", symbolic]) === undefined ? null : undefined;
+  const toplevel = git(canonicalCwd, ["rev-parse", "--show-toplevel"]);
+  if (!toplevel.ok || !toplevel.stdout) return undefined;
+  try { if (realpathSync(toplevel.stdout) !== canonicalCwd) return undefined; } catch { return undefined; }
+  const head = git(canonicalCwd, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+  if (head.ok) return /^[a-f0-9]{40,64}$/i.test(head.stdout) ? head.stdout.toLowerCase() : undefined;
+  if (head.status !== 1 || head.stderr !== "" || head.errorCode !== undefined || head.signal !== undefined) return undefined;
+  const symbolic = git(canonicalCwd, ["symbolic-ref", "--quiet", "HEAD"]);
+  if (!symbolic.ok || !symbolic.stdout.startsWith("refs/heads/")) return undefined;
+  const refCheck = git(canonicalCwd, ["show-ref", "--verify", "--quiet", symbolic.stdout]);
+  if (refCheck.ok) return undefined;
+  if (refCheck.status !== 1 || refCheck.stderr !== "" || refCheck.errorCode !== undefined || refCheck.signal !== undefined) return undefined;
+  const refPathResult = git(canonicalCwd, ["rev-parse", "--git-path", symbolic.stdout]);
+  if (!refPathResult.ok || !refPathResult.stdout) return undefined;
+  const refPath = isAbsolute(refPathResult.stdout) ? refPathResult.stdout : resolve(canonicalCwd, refPathResult.stdout);
+  try {
+    lstatSync(refPath);
+    return undefined;
+  } catch (error) {
+    return isMissingSessionError(error) ? null : undefined;
+  }
 }
 
 export function captureProjectBinding(project: Project, expectedKey: string | undefined): ProjectBinding | undefined {
@@ -83,10 +96,15 @@ export function captureMissionPinnedRepositories(
   repoProjectIds: readonly string[],
   projects: readonly Project[],
   group: ProjectGroup,
+  recordedPaths?: Record<string, string>,
 ): Record<string, PinnedRepositoryBinding> {
   const ids = [...new Set(repoProjectIds)].sort((a, b) => a.localeCompare(b));
   if (!ids.length || ids.length > 64 || ids.some(id => !projectIdSchema.safeParse(id).success)) {
     throw new Error("mission-brief-source-unavailable");
+  }
+  if (recordedPaths !== undefined) {
+    const recordedIds = Object.keys(recordedPaths).sort((a, b) => a.localeCompare(b));
+    if (!sameSortedIds(recordedIds, ids)) throw new Error("mission-brief-source-unavailable");
   }
   const projectById = new Map(projects.map(project => [project.id, project] as const));
   const groupRepoByCheckout = new Map<string, ProjectGroupRepo>();
@@ -103,6 +121,12 @@ export function captureMissionPinnedRepositories(
       enrolledPath = realpathSync(resolve(project.path));
       info = statSync(enrolledPath);
     } catch { throw new Error("mission-brief-source-unavailable"); }
+    if (recordedPaths !== undefined) {
+      let recordedPath: string;
+      try { recordedPath = realpathSync(resolve(recordedPaths[projectId]!)); }
+      catch { throw new Error("mission-brief-source-unavailable"); }
+      if (recordedPath !== enrolledPath) throw new Error("mission-brief-source-unavailable");
+    }
     const identity = expectedIdentity({ ...project, path: enrolledPath }, readGit);
     if (!identity || (groupRepo.key && identity.key !== groupRepo.key)) throw new Error("source-identity-changed");
     const head = readGitHead(enrolledPath);
@@ -161,11 +185,17 @@ export function sessionAppliesToRepository(
     && mission.repoProjectIds.some(projectId => checkouts.has(projectId));
 }
 
+export type SessionMetaLookup =
+  | { state: "found"; session: Session }
+  | { state: "missing" }
+  | { state: "unreadable" };
+
 export interface MissionBindingContext {
   missionsById: ReadonlyMap<string, Mission>;
+  recordedRepoPaths?(missionId: string): Record<string, string> | undefined;
   liveProjectBinding(projectId: string): ProjectBinding | undefined;
   liveRepoHead(enrolledPath: string): string | null | undefined;
-  readSession(sessionId: string): Session | undefined;
+  readSession(sessionId: string): SessionMetaLookup;
   ownedTeamSession(session: Session): { runId: string; memberId: string } | undefined;
 }
 
@@ -210,9 +240,20 @@ export function validateMissionPinnedBinding(
 
   const mission = context.missionsById.get(binding.runId);
   if (!mission || !sameSortedIds(sortedUnique(mission.repoProjectIds), bindingIds)) return false;
+  const recordedPaths = context.recordedRepoPaths?.(binding.runId);
+  if (recordedPaths !== undefined) {
+    const recordedIds = Object.keys(recordedPaths).sort((a, b) => a.localeCompare(b));
+    if (!sameSortedIds(recordedIds, bindingIds)) return false;
+  }
 
   for (const projectId of bindingIds) {
     const expected = pinnedRepos[projectId]!;
+    if (recordedPaths !== undefined) {
+      let recordedPath: string;
+      try { recordedPath = realpathSync(resolve(recordedPaths[projectId]!)); }
+      catch { return false; }
+      if (recordedPath !== expected.enrolledPath) return false;
+    }
     const liveProject = context.liveProjectBinding(projectId);
     if (
       !liveProject
@@ -226,8 +267,10 @@ export function validateMissionPinnedBinding(
   }
 
   const retained = bindingIds.every(projectId => pinnedRepos[projectId]!.head !== null);
-  const session = context.readSession(artifact.sessionId);
-  if (!session) return retained;
+  const lookup = context.readSession(artifact.sessionId);
+  if (lookup.state === "unreadable") return false;
+  if (lookup.state === "missing") return retained;
+  const session = lookup.session;
   if (
     session.team?.role !== "mission-coordinator"
     || session.projectId !== binding.projectId
@@ -244,7 +287,7 @@ export function validateMissionPinnedBinding(
     sourceCwd = realpathSync(session.cwd);
     rootStat = statSync(root);
     cwdStat = statSync(sourceCwd);
-  } catch { return retained; }
+  } catch (error) { return isMissingSessionError(error) ? retained : false; }
 
   if (!pathInside(binding.enrolledPath, root)) return false;
   return root === binding.root

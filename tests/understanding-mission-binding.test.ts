@@ -142,9 +142,12 @@ function makeMultiRepoFixture(temp: string, options: { briefScript?: string; bri
     team: { runId: missionId, memberId, revision: 1, role: "mission-coordinator" },
   };
   const setLiveSession = (next: Session | undefined) => { liveSession = next; };
+  let metaError: Error | undefined;
+  const setMetaError = (next: Error | undefined) => { metaError = next; };
   const manager = {
     meta: (id: string) => {
-      if (!liveSession || liveSession.id !== id) throw new Error("unknown session");
+      if (metaError) throw metaError;
+      if (!liveSession || liveSession.id !== id) throw Object.assign(new Error("unknown session"), { code: "ENOENT" });
       return { session: liveSession };
     },
     state: async () => ({ seq: 1, capabilities: { transcript: 1 } }),
@@ -209,6 +212,7 @@ function makeMultiRepoFixture(temp: string, options: { briefScript?: string; bri
     callCount,
     getSession: () => liveSession!,
     setLiveSession,
+    setMetaError,
     setGroupRepos,
     setMissionRecords,
     setOwnsSession,
@@ -396,8 +400,15 @@ test("mission brief invalidates on identity change, membership drift, workspace 
       f.getSession().cwd = f.missionFolder;
       assert.equal(service.get("platform").repositories.find(repo => repo.id === "api")!.current.length, 1);
 
+      f.setMetaError(Object.assign(new Error("permission denied"), { code: "EACCES" }));
+      assert.deepEqual(service.get("platform").repositories.find(repo => repo.id === "api")!.current, [], "EACCES on session metadata must fail closed");
+      f.setMetaError(new SyntaxError("corrupt session metadata"));
+      assert.deepEqual(service.get("platform").repositories.find(repo => repo.id === "api")!.current, [], "corrupt session metadata must fail closed");
+      f.setMetaError(undefined);
+      assert.equal(service.get("platform").repositories.find(repo => repo.id === "api")!.current.length, 1);
+
       f.setLiveSession(undefined);
-      assert.equal(service.get("platform").repositories.find(repo => repo.id === "api")!.current.length, 1, "mission brief stays visible after session removal while all pinned heads match");
+      assert.equal(service.get("platform").repositories.find(repo => repo.id === "api")!.current.length, 1, "mission brief stays visible after ENOENT session removal while all pinned heads match");
 
       const movedWeb = join(f.root, "moved-web");
       renameSync(f.webPath, movedWeb);
@@ -725,6 +736,14 @@ test("integration with real ProjectGroupService and MissionService binds multi-r
         });
       }
 
+      const webAltPath = join(temp, "web-alt");
+      git(webPath, "worktree", "add", "--detach", webAltPath, "HEAD");
+      config.projects[1]!.path = webAltPath;
+      assert.ok(understanding.get(createdGroup.id).repositories.every(repo => repo.current.length === 0), "redirecting a secondary project to a different worktree invalidates retained mission briefs");
+      await assert.rejects(briefings.summarize(session, "0"), /Repository brief could not be generated/);
+      config.projects[1]!.path = webPath;
+      assert.ok(understanding.get(createdGroup.id).repositories.every(repo => repo.current.length === 1));
+
       commitFile(webPath, "web.txt", "web v2\n", "advance web in integration");
       const stale = understanding.get(createdGroup.id);
       assert.ok(stale.repositories.every(repo => repo.current.length === 0));
@@ -753,6 +772,26 @@ test("readGitHead rejects enclosing parent repositories and corrupt refs, and re
     mkdirSync(unbornPath, { recursive: true });
     execFileSync("git", ["init", "-q"], { cwd: unbornPath });
     assert.equal(readGitHead(unbornPath), null, "an initialized unborn repository reports null head");
+    const symbolicRef = git(unbornPath, "symbolic-ref", "--quiet", "HEAD");
+    const looseRefPath = join(unbornPath, ".git", symbolicRef);
+    mkdirSync(join(unbornPath, ".git", "refs", "heads"), { recursive: true });
+    writeFileSync(looseRefPath, "not-a-commit\n");
+    assert.equal(readGitHead(unbornPath), undefined, "a corrupt loose branch ref must not report unborn");
+    writeFileSync(looseRefPath, "0".repeat(40) + "\n");
+    assert.equal(readGitHead(unbornPath), undefined, "a branch ref pointing at a missing commit object must not report unborn");
+    rmSync(looseRefPath);
+    assert.equal(readGitHead(unbornPath), null);
+    assert.equal(readGitHead(unbornPath, (_cwd, args) => {
+      if (args[0] === "rev-parse" && args[1] === "--show-toplevel") return { ok: true, stdout: unbornPath };
+      if (args[0] === "rev-parse" && args[1] === "--verify") return { ok: false, status: null, stderr: "", errorCode: "ETIMEDOUT" };
+      return { ok: true, stdout: symbolicRef };
+    }), undefined, "a git timeout during rev-parse must fail closed as unavailable");
+    assert.equal(readGitHead(unbornPath, (_cwd, args) => {
+      if (args[0] === "rev-parse" && args[1] === "--show-toplevel") return { ok: true, stdout: unbornPath };
+      if (args[0] === "rev-parse" && args[1] === "--verify") return { ok: false, status: 1, stderr: "" };
+      if (args[0] === "symbolic-ref") return { ok: true, stdout: symbolicRef };
+      return { ok: false, status: 128, stderr: "fatal: unable to read refs" };
+    }), undefined, "a git permission or fatal read failure during show-ref must not report unborn");
     writeFileSync(join(unbornPath, ".git", "HEAD"), "0".repeat(40) + "\n");
     assert.equal(readGitHead(unbornPath), undefined, "a broken detached HEAD is unavailable, not unborn");
 
@@ -883,7 +922,12 @@ test("queued mission brief keys its cached report by the captured heads rather t
         await new Promise(resolve => setTimeout(resolve, 20));
       }
       const queuedMissionJob = briefings.summarize(missionSession, "0");
-      await new Promise(resolve => setTimeout(resolve, 50));
+      const pendingDeadline = Date.now() + 5000;
+      while (Date.now() < pendingDeadline) {
+        if ((await briefings.status(missionSession)).state === "pending") break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.equal((await briefings.status(missionSession)).state, "pending", "mission job entered pending status before HEAD moved");
 
       const webHead2 = commitFile(webPath, "web.txt", "web v2\n", "advance while queued");
       writeFileSync(release, "go\n");

@@ -17,6 +17,7 @@ import type { TeamRun } from "./team-types.js";
 import type { GoalService } from "./goals.js";
 import { writeSealed, unseal } from "./vault.js";
 import { CatalogError } from "./understanding-catalog.js";
+import { isMissingSessionError } from "./mission-coordinator.js";
 import { pageOf } from "./understanding-pages.js";
 import {
   bindingSchema,
@@ -33,6 +34,7 @@ import {
   validateMissionPinnedBinding,
   type Binding,
   type ProjectBinding,
+  type SessionMetaLookup,
 } from "./understanding-binding.js";
 
 const MAX_GENERATIONS_PER_PROJECT = 16;
@@ -84,7 +86,8 @@ export interface UnderstandingSources {
   key: Buffer;
   manager: Manager;
   groups: { list(): ProjectGroupList; get(id: string): ProjectGroup };
-  missions: Pick<MissionService, "understandingRecords" | "understandingOwnsSession">;
+  missions: Pick<MissionService, "understandingRecords" | "understandingOwnsSession">
+    & Partial<Pick<MissionService, "understandingRepoPaths">>;
   teams: Pick<TeamService, "understandingRecords" | "understandingOwnsSession">;
   goals: Pick<GoalService, "understandingRecords">;
   briefings?: Pick<RepositoryBriefings, "useRetention" | "understandingStatuses">;
@@ -183,7 +186,8 @@ export class UnderstandingService {
         const mission = this.sources.missions.understandingRecords().find(item => item.id === runId);
         if (!mission || !mission.repoProjectIds.includes(project.id)) throw new Error("mission-brief-source-unavailable");
         const group = this.groupForProject(project.id);
-        const pinnedRepositories = captureMissionPinnedRepositories(mission.repoProjectIds, this.sources.config.projects, group);
+        const recordedPaths = this.sources.missions.understandingRepoPaths?.(runId);
+        const pinnedRepositories = captureMissionPinnedRepositories(mission.repoProjectIds, this.sources.config.projects, group, recordedPaths);
         const primary = Object.hasOwn(pinnedRepositories, project.id) ? pinnedRepositories[project.id] : undefined;
         if (!primary) throw new Error("mission-brief-source-unavailable");
         const rootStat = statSync(root), cwdStat = statSync(sourceCwd);
@@ -220,6 +224,23 @@ export class UnderstandingService {
     if (pinnedRepositories) {
       const primary = Object.hasOwn(pinnedRepositories, session.projectId) ? pinnedRepositories[session.projectId] : undefined;
       if (!primary || summary.repository.head !== primary.head) throw new Error("The enrolled source changed while its brief was generated.");
+      if (summary.repository.decision.action !== "run") {
+        const captureDigest = digest(capture.binding);
+        const expectedPinnedSourcesDigest = digest(pinnedSourcesFromBinding(pinnedRepositories));
+        const matching = this.state.generations.some(entry =>
+          entry.artifact.sessionId === session.id
+          && entry.artifact.sourceProjectId === session.projectId
+          && entry.artifact.head === primary.head
+          && entry.artifact.fingerprint === summary.repository.fingerprint
+          && entry.artifact.generatedAt === summary.repository.generatedAt
+          && entry.artifact.brief.summary === summary.repository.brief.summary
+          && entry.artifact.pinnedSources !== undefined
+          && digest(entry.artifact.pinnedSources) === expectedPinnedSourcesDigest
+          && digest(entry.binding) === captureDigest,
+        );
+        if (matching) return;
+        throw new Error("The briefing engine skipped refresh while a bound mission repository changed.");
+      }
     }
     const brief = summary.repository.brief;
     const artifactId = randomUUID();
@@ -382,9 +403,11 @@ export class UnderstandingService {
       if (!heads.has(enrolledPath)) heads.set(enrolledPath, readGitHead(enrolledPath));
       return heads.get(enrolledPath);
     };
-    const readSession = (sessionId: string): Session | undefined => {
-      try { return this.sources.manager.meta(sessionId).session; } catch { return undefined; }
+    const readSession = (sessionId: string): SessionMetaLookup => {
+      try { return { state: "found", session: this.sources.manager.meta(sessionId).session }; }
+      catch (error) { return isMissingSessionError(error) ? { state: "missing" } : { state: "unreadable" }; }
     };
+    const recordedRepoPaths = (missionId: string) => this.sources.missions.understandingRepoPaths?.(missionId);
     const rows = this.workRows(group, missionRecords, teamRecords);
     const currentWork = rows.filter(item => item.scope === "complete");
     const briefingStates = new Map((this.sources.briefings?.understandingStatuses() ?? []).map(value => [value.sessionId, value]));
@@ -405,6 +428,7 @@ export class UnderstandingService {
             if (isMissionBindingEntry(entry.binding, entry.artifact.pinnedSources)) {
               bindings.set(key, validateMissionPinnedBinding(entry.binding, entry.artifact, {
                 missionsById,
+                recordedRepoPaths,
                 liveProjectBinding,
                 liveRepoHead,
                 readSession,

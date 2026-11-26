@@ -238,6 +238,7 @@ export class RepositoryBriefings {
   private readonly inFlight = new Map<string, Job>();
   private readonly reports = new Map<string, RepositorySummary>();
   private readonly latest = new Map<string, BriefingStatus>();
+  private readonly latestSourceKey = new Map<string, string>();
   private readonly statusUpdatedAt = new Map<string, number>();
   private readonly controllers = new Set<AbortController>();
   private readonly lastAttempt = new Map<string, number>();
@@ -301,6 +302,26 @@ export class RepositoryBriefings {
 
   async status(session: Session): Promise<BriefingStatus> {
     const current = this.latest.get(session.id);
+    if (session.team?.role === "mission-coordinator" && this.retention?.cacheKey) {
+      let liveKey: string | undefined;
+      try {
+        const location = await this.location(session);
+        this.rememberLocation(session.id, location);
+        liveKey = await this.retention.cacheKey(session, location);
+      } catch {
+        if (current && (current.state === "failed" || current.state === "pending" || current.state === "running")) {
+          const { summary: _stale, ...rest } = current;
+          return rest;
+        }
+        return { state: "unavailable", error: "This session source is unavailable for repository briefing." };
+      }
+      if (!current) return { state: "empty" };
+      if (!current.summary) return current;
+      if (liveKey && this.latestSourceKey.get(session.id) === liveKey) return current;
+      if (current.state === "ready") return { state: "empty" };
+      const { summary: _stale, ...rest } = current;
+      return rest;
+    }
     if (current) return current;
     try {
       const location = await this.location(session);
@@ -335,16 +356,20 @@ export class RepositoryBriefings {
     if (this.isClosed()) throw new Error("Repository brief service closed");
     if (messages.length === 0) return { engine: "jevcode", model: this.model, text: "", from, to, messages: 0, at: new Date().toISOString() };
     let key = baseKey;
+    let sourceKey: string | undefined;
     if (pinnedLookup) {
       try {
-        const sourceKey = await this.retention!.cacheKey!(session, location);
+        sourceKey = await this.retention!.cacheKey!(session, location);
         if (this.isClosed()) throw new Error("Repository brief service closed");
         if (sourceKey) key = `${baseKey}:${sourceKey}`;
       } catch {
         key = `${baseKey}:uncached:${Date.now()}`;
       }
       const cached = this.reports.get(key);
-      if (cached) return cached;
+      if (cached) {
+        this.setStatus(session.id, { state: "ready", summary: cached }, sourceKey);
+        return cached;
+      }
     }
     const baseline = location.baseline ?? await this.captureHead(location.root);
     const nextLocation = { ...location, baseline };
@@ -413,15 +438,21 @@ export class RepositoryBriefings {
     const to = activity.cursor;
     const baseKey = rangeKey(session.id, "0", activity.messages);
     let key = baseKey;
+    let sourceKey: string | undefined;
     if (this.retention?.cacheKey && session.team?.role === "mission-coordinator") {
       try {
-        const sourceKey = await this.retention.cacheKey(session, location);
+        sourceKey = await this.retention.cacheKey(session, location);
         if (sourceKey) key = `${baseKey}:${sourceKey}`;
       } catch {
         key = `${baseKey}:uncached:${Date.now()}`;
       }
     }
-    if (this.reports.has(key) || this.inFlight.has(key)) return;
+    const cached = this.reports.get(key);
+    if (cached) {
+      if (this.latest.get(session.id)?.state === "pending") this.setStatus(session.id, { state: "ready", summary: cached }, sourceKey);
+      return;
+    }
+    if (this.inFlight.has(key)) return;
     const priorAttempt = this.lastAttempt.get(session.id) ?? 0;
     const dueAt = Math.max(Date.now() + DEBOUNCE_MS, priorAttempt + this.config.cooldownMs);
     const job: Job = { key, session, location, messages: activity.messages, observedMessages: activity.observedMessages, truncated: activity.truncated,
@@ -514,7 +545,11 @@ export class RepositoryBriefings {
             const sourceKey = this.retention?.cacheKey && ready.session.team?.role === "mission-coordinator"
               ? await this.retention.cacheKey(ready.session, ready.location) : undefined;
             ready.key = sourceKey ? `${baseKey}:${sourceKey}` : baseKey;
-            if (this.reports.has(ready.key)) continue;
+            const cached = this.reports.get(ready.key);
+            if (cached) {
+              this.setStatus(ready.session.id, { state: "ready", summary: cached }, sourceKey);
+              continue;
+            }
             const matching = this.pending.get(ready.key);
             if (matching) { ready.waiters.push(...matching.waiters); this.pending.delete(ready.key); }
           }
@@ -541,7 +576,7 @@ export class RepositoryBriefings {
             this.reports.set(reportKey, summary);
             if (this.reports.size > MAX_CACHE) this.reports.delete(this.reports.keys().next().value!);
           }
-          this.setStatus(ready.session.id, { state: "ready", summary });
+          this.setStatus(ready.session.id, { state: "ready", summary }, capturedSourceKey);
           for (const waiter of ready.waiters) waiter.resolve(summary);
         } catch (error) {
           this.inFlight.delete(ready.key);
@@ -636,13 +671,19 @@ export class RepositoryBriefings {
     while (this.locations.size > MAX_STATUS) this.locations.delete(this.locations.keys().next().value!);
   }
 
-  private setStatus(id: string, status: BriefingStatus): void {
+  private setStatus(id: string, status: BriefingStatus, sourceKey?: string): void {
     this.latest.delete(id);
     this.latest.set(id, status);
+    if (status.summary) {
+      if (sourceKey !== undefined) this.latestSourceKey.set(id, sourceKey);
+    } else {
+      this.latestSourceKey.delete(id);
+    }
     this.statusUpdatedAt.set(id, Date.now());
     while (this.latest.size > MAX_STATUS) {
       const oldest = this.latest.keys().next().value!;
       this.latest.delete(oldest);
+      this.latestSourceKey.delete(oldest);
       this.statusUpdatedAt.delete(oldest);
     }
   }

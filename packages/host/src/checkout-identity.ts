@@ -14,16 +14,38 @@ export interface WorkspaceRepositoryBinding { companyId: string; repositoryId: s
 
 export type GitReader = (cwd: string, args: string[]) => string | undefined;
 
+export type GitCommandResult =
+  | { ok: true; stdout: string }
+  | { ok: false; status: number | null; stderr: string; errorCode?: string; signal?: string };
+
+export type GitResultReader = (cwd: string, args: string[]) => GitCommandResult;
+
 const READ_ONLY_GIT = ["-c", "safe.directory=*", "-c", "core.fsmonitor=false"];
 
-export const readGit: GitReader = (cwd, args) => {
+export const readGitResult: GitResultReader = (cwd, args) => {
   try {
-    return execFileSync("git", [...READ_ONLY_GIT, "-C", cwd, ...args], {
-      encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    const stdout = execFileSync("git", [...READ_ONLY_GIT, "-C", cwd, ...args], {
+      encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
     }).trim();
-  } catch {
-    return undefined;
+    return { ok: true, stdout };
+  } catch (error) {
+    const err = error as { status?: unknown; stderr?: unknown; code?: unknown; signal?: unknown };
+    const stderr = typeof err.stderr === "string"
+      ? err.stderr.trim()
+      : Buffer.isBuffer(err.stderr) ? err.stderr.toString("utf8").trim() : "";
+    return {
+      ok: false,
+      status: typeof err.status === "number" ? err.status : null,
+      stderr,
+      ...(typeof err.code === "string" ? { errorCode: err.code } : {}),
+      ...(typeof err.signal === "string" ? { signal: err.signal } : {}),
+    };
   }
+};
+
+export const readGit: GitReader = (cwd, args) => {
+  const result = readGitResult(cwd, args);
+  return result.ok ? result.stdout : undefined;
 };
 
 const GENERIC_FOLDERS = new Set(["codebase", "code", "src", "repo", "app", "main", "worktree"]);

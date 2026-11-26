@@ -1,3 +1,5 @@
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import type { Manager } from "./manager.js";
 import type { MissionReport } from "./mission-types.js";
 import type { MissionMessage } from "./team-prompts.js";
@@ -53,6 +55,11 @@ export type AttemptDeliveryStatus =
   | { kind: "uncertain"; nativeSessionId: string };
 
 export type CoordinatorReportOutcome = "accepted" | "refused" | "deferred-steer" | "deferred-blocked";
+
+export function sameRealPath(left: string, right: string): boolean {
+  try { return realpathSync(left) === realpathSync(right); }
+  catch { return resolve(left) === resolve(right); }
+}
 
 export function isMissingSessionError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;

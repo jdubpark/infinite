@@ -1,0 +1,13 @@
+[Unit]
+Description=Verify private filesystem boundaries between Infinite instances
+RequiresMountsFor=/srv/infinite-data
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/infinite-verify-instance-boundaries --manifest /etc/infinite-instance-boundaries/instances.json
+WorkingDirectory=/
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+TimeoutStartSec=60s

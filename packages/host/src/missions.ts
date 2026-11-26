@@ -202,7 +202,7 @@ export class MissionService {
       (mission.status !== "blocked" || mission.stopReason === "deadline") && !["ready-for-review", "cancelled"].includes(mission.status) &&
       mission.subtasks.some(subtask => subtask.teamId === teamId));
   }
-  enabled() { return missionLineupSchema.safeParse(this.config.teams?.lineup).success; }
+  enabled() { return this.records.size > 0 || missionLineupSchema.safeParse(this.config.teams?.lineup).success; }
   private enqueue<T>(id: string, task: () => T | Promise<T>): Promise<T> {
     return this.queues.enqueue(id, task);
   }

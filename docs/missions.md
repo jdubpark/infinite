@@ -155,8 +155,11 @@ runs in `dontAsk` mode with only Read, Glob, Grep, and its mission report tool,
 and only its report MCP server. Mission coordinators require Claude Code; Codex
 and other non-Claude providers are excluded from mission coordinator schemas
 (`missionCoordinatorProviderSchema`, `missionLineupSchema`), intake config
-validation (`readConfig`), `MissionService.enabled()`, `POST /api/missions`, and
-`missionCoordinatorLaunch`. Codex deep-merges inherited `[mcp_servers.*]` tables
+validation (`readConfig`), `POST /api/missions`, and `missionCoordinatorLaunch`.
+`MissionService.enabled()` requires a valid Claude mission lineup unless saved
+mission records already exist, so owners can still inspect and control existing
+missions after switching `teams.lineup.coordinator` while new mission creation
+is rejected. Codex deep-merges inherited `[mcp_servers.*]` tables
 across configuration layers (neither `-c mcp_servers={}` nor profiles clear
 inherited servers), and redirecting `CODEX_HOME` breaks credentials and OAuth
 refresh across the host-to-agent `sudo` boundary while leaving system config and

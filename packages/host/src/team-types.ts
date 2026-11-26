@@ -246,8 +246,10 @@ const modelProfileFields = {
   limitFallback: z.string().regex(ID_RE).optional(),
 };
 const effort = z.enum(["low", "medium", "high", "xhigh", "max"]);
+export const claudeTeamModelProfileSchema = z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("claude"), model: modelProfileFields.model, effort, tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict();
+export type ClaudeTeamModelProfile = z.infer<typeof claudeTeamModelProfileSchema>;
 export const teamModelProfileSchema = z.discriminatedUnion("provider", [
-  z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("claude"), model: modelProfileFields.model, effort, tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict(),
+  claudeTeamModelProfileSchema,
   z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("codex"), model: modelProfileFields.model, effort, tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict(),
   z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("opencode"), model: z.string().max(180).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$/), variant: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/).optional(), tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict(),
 ]);
@@ -612,8 +614,11 @@ export interface TeamMember extends TeamAssignment {
   startedAt?: string;
   reportedAt?: string;
   lastActivityAt?: string;
+  spinnerOnlySince?: string;
   pendingLimit?: boolean;
+  pendingCapacity?: boolean;
   stalledAt?: string;
+  stalledSourceMemberId?: string;
   report?: TeamReport;
   cursor: number;
   entryCursor?: number;
@@ -755,15 +760,39 @@ export interface TeamRun {
   review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string; acceptance?: TeamAcceptanceEvidence[] };
   round: number;
 }
+export type TeamWaitReasonKind =
+  | "worker-slot"
+  | "dependency"
+  | "owner-decision"
+  | "provider-prompt"
+  | "provider-limit"
+  | "integration-order"
+  | "linear-sync"
+  | "spinner-only"
+  | "stalled";
+
+export interface TeamWaitReason {
+  kind: TeamWaitReasonKind;
+  summary: string;
+  taskId?: string;
+  memberId?: string;
+  decisionId?: string;
+  blockedByTaskIds?: string[];
+  since?: string;
+  resetsAt?: string;
+}
+
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permissionRecovery"> & {
   lastActivityAt: string;
   pendingOperation?: TeamPendingOperation;
+  publishing?: boolean;
   members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback" | "goalCriteriaPlan">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt" | "coordinatorSessionId">[];
   permissionRecovery?: { outcomes: TeamPermissionRecoveryView[] };
   usage: UsageRollup;
   providerLimits: ProviderLimit[];
   workers: { limit: number; max: number; running: number; ready: number };
+  waitReasons?: TeamWaitReason[];
   resumable: boolean;
   continuable: boolean;
 };

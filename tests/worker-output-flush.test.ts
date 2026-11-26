@@ -17,30 +17,37 @@ import { execFileSync } from "node:child_process";
 process.stdin.setRawMode(true);
 process.stdin.setEncoding("utf8");
 process.stdout.write("READY\r\n");
-const burst = size => {
+let pending = "", row = 0;
+const rows = size => {
   let text = "";
-  for (let row = 1; text.length < size; row++) text += "\x1b[3" + (row % 7 + 1) + "mROW " + row + " café 界 " + "lorem ipsum dolor sit amet ".repeat(3) + "\x1b[0m\r\n";
-  return Buffer.from(text + "BURST DONE\r\n");
+  while (text.length < size) {
+    row++;
+    text += "\x1b[3" + (row % 7 + 1) + "mROW " + row + " café 界 " + "lorem ipsum dolor sit amet ".repeat(3) + "\x1b[0m\r\n";
+  }
+  return text;
 };
 let burstOnResize;
 process.stdout.on("resize", () => {
   if (burstOnResize) process.stdout.write(burstOnResize);
   burstOnResize = undefined;
 });
-let pending = "";
 process.stdin.on("data", data => {
   pending += data;
   let end;
   while ((end = pending.indexOf("\n")) >= 0) {
-    const command = pending.slice(0, end);
+    const line = pending.slice(0, end);
     pending = pending.slice(end + 1);
-    if (command === "size") {
-      const [rows, cols] = execFileSync("stty", ["size"], { stdio: ["inherit", "pipe", "ignore"], encoding: "utf8" }).trim().split(" ");
-      process.stdout.write("SIZE " + cols + "x" + rows + "\r\n");
-    } else if (command.startsWith("burst-on-resize ")) {
-      burstOnResize = burst(Number(command.slice(16)));
+    if (line.startsWith("flood ")) {
+      const [delay, size] = line.slice(6).split(" ").map(Number);
+      setTimeout(() => process.stdout.write(rows(size) + "BURST DONE\r\n", () => process.exit(0)), delay);
+    } else if (line === "exit") process.stdout.write(rows(64 * 1024), () => setTimeout(() => process.stdout.write(rows(12 * 1024) + "BURST DONE\r\n", () => process.exit(0)), 300));
+    else if (line === "size") {
+      const [height, width] = execFileSync("stty", ["size"], { stdio: ["inherit", "pipe", "ignore"], encoding: "utf8" }).trim().split(" ");
+      process.stdout.write("SIZE " + width + "x" + height + "\r\n");
+    } else if (line.startsWith("burst-on-resize ")) {
+      burstOnResize = rows(Number(line.slice(16))) + "BURST DONE\r\n";
       process.stdout.write("ARMED\r\n");
-    } else process.stdout.write(burst(Number(command)));
+    } else process.stdout.write(rows(Number(line)) + "BURST DONE\r\n");
   }
 });
 `;
@@ -175,6 +182,36 @@ test("a full snapshot queue on a slow journal disk is released in order while st
     await waitFor(async () => worker.output().join("").includes("BURST DONE"), Boolean);
     const rows = [...worker.output().join("").matchAll(/ROW (\d+) /g)].map(match => Number(match[1]));
     assert.ok(rows.length > 1000 && rows.every((row, index) => row === index + 1), "every row is recorded once, in order");
+  } finally {
+    await worker.stop();
+  }
+});
+
+test("a child's last output, written while a journal sync blocks the worker just before it exits, is recorded", { timeout: 60_000 }, async () => {
+  const worker = await start({ INFINITE_TEST_JOURNAL_SYNC_DELAY_MS: "700" });
+  try {
+    await worker.call<Receipt>({ op: "raw", requestId: randomUUID(), text: "exit\n" });
+    await waitFor(() => worker.call({ op: "state" }), state => state.status === "exited", 30_000);
+    const text = worker.output().join("");
+    const rows = [...text.matchAll(/ROW (\d+) /g)].map(match => Number(match[1]));
+    assert.match(text, /BURST DONE/, "the child's last line is recorded");
+    assert.ok(rows.length > 500 && rows.every((row, index) => row === index + 1), "every row is recorded once, in order");
+  } finally {
+    await worker.stop();
+  }
+});
+
+test("a child that exits while a full snapshot queue is released keeps the output it wrote before exiting", { timeout: 120_000 }, async () => {
+  const worker = await start({ INFINITE_TEST_JOURNAL_SYNC_DELAY_MS: "700", INFINITE_TEST_TERMINAL_DRAIN_DELAY_MS: "900" });
+  try {
+    await worker.call<Receipt>({ op: "raw", requestId: randomUUID(), text: `flood 1100 ${2 * 1024 * 1024 + 16 * 1024}\n` });
+    try { await worker.call({ op: "snapshot" }, 60_000); }
+    catch (error) { if ((error as WorkerError).code !== "snapshot-unavailable") throw error; }
+    await waitFor(() => worker.call({ op: "state" }), state => state.status === "exited", 60_000);
+    const text = worker.output().join("");
+    const rows = [...text.matchAll(/ROW (\d+) /g)].map(match => Number(match[1]));
+    assert.match(text, /BURST DONE/, "the child's last line is recorded");
+    assert.ok(rows.every((row, index) => row === index + 1), "every row is recorded once, in order");
   } finally {
     await worker.stop();
   }

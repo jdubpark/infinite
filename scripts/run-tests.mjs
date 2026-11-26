@@ -4,7 +4,7 @@ import { readdirSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
-const serialFiles = new Set(["client-cli.test.ts", "continuity.test.ts", "laptop-service.test.ts", "main-check-real.test.ts", "summary.test.ts", "worker-attention.test.ts"]);
+const serialFiles = new Set(["client-cli.test.ts", "main-check-real.test.ts"]);
 const testFiles = readdirSync(new URL("../tests/", import.meta.url))
   .filter((name) => name.endsWith(".test.ts"))
   .sort();
@@ -42,4 +42,4 @@ async function run(files, fileConcurrency) {
 }
 
 await run(parallelFiles, concurrency);
-await run(serial, 1);
+if (serial.length) await run(serial, 1);

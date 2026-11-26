@@ -62,9 +62,14 @@ export function teamLastActivityAt(run: TeamRun): string {
   return run.lastActivityAt ?? deriveTeamLastActivityAt(run);
 }
 
-function normalizeMember(member: TeamMember) {
-  const { cursor: _cursor, entryCursor: _entryCursor, pendingLimit, ...rest } = member;
-  return { ...rest, ...(pendingLimit ? { pendingLimit: true } : {}) };
+function normalizeMember(member: TeamMember, includeSpinner = true) {
+  const { cursor: _cursor, entryCursor: _entryCursor, pendingLimit, pendingCapacity, spinnerOnlySince, ...rest } = member;
+  return {
+    ...rest,
+    ...(includeSpinner && spinnerOnlySince ? { spinnerOnlySince } : {}),
+    ...(pendingLimit ? { pendingLimit: true } : {}),
+    ...(pendingCapacity ? { pendingCapacity: true } : {}),
+  };
 }
 
 function normalizeLinear(linear: TeamRun["linear"], status: TeamRun["status"]) {
@@ -89,7 +94,8 @@ export function persistedDigest(stored: Stored): string {
 
 function stateDigests(stored: Stored): { runState: string; activity: string } {
   const { updatedAt: _updatedAt, lastActivityAt: _lastActivityAt, linear, members, ...runRest } = stored.run;
-  const normalizedMembers = members.map(normalizeMember);
+  const normalizedMembers = members.map(member => normalizeMember(member, true));
+  const activityMembers = members.map(member => normalizeMember(member, false));
   const {
     run: _run,
     census,
@@ -115,7 +121,7 @@ function stateDigests(stored: Stored): { runState: string; activity: string } {
       ...(linear ? { linear: normalizeLinear(linear, stored.run.status) } : {}),
     },
   });
-  const activity = digest({ ...runRest, members: normalizedMembers });
+  const activity = digest({ ...runRest, members: activityMembers });
   return { runState, activity };
 }
 

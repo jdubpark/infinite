@@ -216,6 +216,8 @@ test("stop retires a waiting call unanswered, and the session cannot be resumed 
     await waitFor(() => live(r, id), s => s.status === "exited", 20_000);
     assert.equal(r.log("ran.log"), "");
     assert.deepEqual(r.channelEvents(id).map(event => [event.event, event.reason]).at(-1), ["retired", "stopped"]);
+    const exits = r.manager.events(id, 0, 500, new Set(["lifecycle"])).events.filter(event => event.data.status === "exited");
+    assert.deepEqual(exits.map(event => event.data.outputTailIncomplete), [undefined]);
     await assert.rejects(r.manager.resume(id, randomUUID()), /waited for the owner's answer/);
   } finally { await r.stop(); }
 });

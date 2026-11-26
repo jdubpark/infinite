@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
@@ -11,7 +11,9 @@ import { MAX_REQUEST_BYTES, MAX_EVENTS_BUFFERED_BYTES, MAX_EVENTS_EVENT_BYTES } 
 import { connectRemoteAccess } from "../packages/host/src/remote-access.js";
 import { createRelayServer } from "../packages/host/src/relay.js";
 import { hashToken } from "../packages/host/src/config.js";
+import { createGoalSchema, type ProductGoal } from "../packages/host/src/goal-types.js";
 import type { Config } from "../packages/host/src/types.js";
+import { writeSealed } from "../packages/host/src/vault.js";
 import { inProcessHost, startHost, waitFor } from "./helpers.js";
 import { httpRunner, listen, wireProxy } from "./remote-fixture.js";
 
@@ -651,6 +653,188 @@ test("remote router round-trips valid percent-encoded path segments to Express a
     owner.close();
     runnerClient.close();
     runner.close();
+    await host.stop();
+  }
+});
+
+test("the relay carries mission progress and team entry reads and denies mutations or unrelated subpaths", { timeout: 20000 }, async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  const missionId = randomUUID();
+  const teamId = randomUUID();
+  const entryId = randomUUID();
+  const v8EntryId = "12345678-1234-8123-8123-123456789abc";
+  const cursor = `mp1.${randomUUID()}.${missionId}.${randomUUID()}.4`;
+  try {
+    assert.deepEqual(
+      await client.request(`/missions/${missionId}/progress`),
+      { count: 1, method: "GET", path: `/api/missions/${missionId}/progress` },
+    );
+    assert.deepEqual(
+      await client.request(`/missions/${missionId}/progress?cursor=${encodeURIComponent(cursor)}`),
+      { count: 2, method: "GET", path: `/api/missions/${missionId}/progress?cursor=${encodeURIComponent(cursor)}` },
+    );
+    assert.deepEqual(
+      await client.request(`/teams/${teamId}/entries`),
+      { count: 3, method: "GET", path: `/api/teams/${teamId}/entries` },
+    );
+    assert.deepEqual(
+      await client.request(`/teams/${teamId}/entries?kind=check&since=10`),
+      { count: 4, method: "GET", path: `/api/teams/${teamId}/entries?kind=check&since=10` },
+    );
+    assert.deepEqual(
+      await client.request(`/teams/${teamId}/entries/${entryId}`),
+      { count: 5, method: "GET", path: `/api/teams/${teamId}/entries/${entryId}` },
+    );
+    assert.deepEqual(
+      await client.request(`/teams/${teamId}/entries/${v8EntryId}`),
+      { count: 6, method: "GET", path: `/api/teams/${teamId}/entries/${v8EntryId}` },
+    );
+
+    const denied: readonly [method: "GET" | "POST" | "PUT" | "DELETE", path: string][] = [
+      ["POST", `/missions/${missionId}/progress`],
+      ["GET", `/missions/${missionId}/progress/extra`],
+      ["GET", "/missions/not-a-uuid/progress"],
+      ["GET", `/missions/${missionId}/%70rogress`],
+      ["POST", `/teams/${teamId}/entries`],
+      ["PUT", `/teams/${teamId}/entries/${entryId}`],
+      ["POST", `/teams/${teamId}/entries/${entryId}`],
+      ["DELETE", `/teams/${teamId}/entries/${entryId}`],
+      ["GET", `/teams/${teamId}/entries/not-a-uuid`],
+      ["GET", `/teams/${teamId}/entries/${entryId}/withdraw`],
+      ["POST", `/teams/${teamId}/entries/${entryId}/withdraw`],
+      ["GET", `/teams/${teamId}/entries/${entryId}/extra`],
+      ["GET", "/teams/not-a-uuid/entries"],
+      ["GET", `/teams/${teamId}/%65ntries`],
+    ];
+    for (const [method, path] of denied) {
+      await assert.rejects(
+        client.request(path, { method, body: method === "GET" ? undefined : {} }),
+        (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied",
+        `${method} ${path} must be denied`,
+      );
+    }
+    assert.equal(runner.requests.length, 6, "denied inspector mutations and subpaths never reach the host");
+  } finally {
+    client.close();
+    runner.close();
+  }
+});
+
+test("the relay carries understanding work brief reads and refreshes, enforces roles, and denies invalid work paths", { timeout: 30000 }, async () => {
+  const goalId = randomUUID();
+  const workId = `goal:${goalId}`;
+  const encodedWorkId = encodeURIComponent(workId);
+  const host = await inProcessHost({
+    configure: config => {
+      config.remote = { enabled: true };
+      const request = createGoalSchema.parse({
+        requestId: goalId,
+        projectId: "rehearsal",
+        title: "Remote work brief goal",
+        objective: "Verify remote work brief access",
+        successCriteria: "Work brief opens over remote channel",
+      });
+      const { requestId: id, ...input } = request;
+      const at = new Date(Date.UTC(2026, 0, 1, 0, 0, 0)).toISOString();
+      const strong = { id: "fixture-strong", label: "Fixture reviewer", provider: "codex" as const, model: "fixture", tier: "strong" as const };
+      const goal: ProductGoal = {
+        ...input, id, revision: 1, status: "cancelled", createdAt: at, updatedAt: at, deadlineAt: at,
+        lineup: { coordinator: strong, integrator: strong, reviewer: strong, implementers: [], escalations: [] },
+        cycles: [], memberCount: 0, steering: [], events: [], outcomes: [],
+      };
+      mkdirSync(join(config.stateDir, "goals"), { recursive: true });
+      writeSealed(join(config.stateDir, "goals", `${id}.sealed`), readFileSync(config.keyFile), `goal:${id}`, { goal, fingerprint: "fixture", receipts: {} });
+    },
+  });
+  const owner = createRemoteClient({ url: host.origin, token: host.tokens.owner });
+  const controller = createRemoteClient({ url: host.origin, token: host.tokens.controller });
+  const viewer = createRemoteClient({ url: host.origin, token: host.tokens.viewer });
+  let runner: Awaited<ReturnType<typeof httpRunner>> | undefined;
+  let runnerClient: RemoteClient | undefined;
+  try {
+    runner = await httpRunner();
+    runnerClient = createRemoteClient({ url: runner.url, token: runner.token });
+    const listed = await owner.request<{ groups: { id: string; repos: { checkouts: { projectId: string }[] }[] }[] }>("/project-groups");
+    const workspace = listed.groups.find(group => group.repos.some(repo => repo.checkouts.some(checkout => checkout.projectId === "rehearsal")));
+    assert.ok(workspace, "rehearsal checkout has a canonical workspace");
+    const workPath = `/project-groups/${encodeURIComponent(workspace.id)}/understanding/work/${encodedWorkId}`;
+
+    for (const reader of [owner, controller, viewer]) {
+      const brief = await reader.request<{ schemaVersion: number; workId: string; narrative: { state: string } }>(workPath);
+      assert.equal(brief.schemaVersion, 1);
+      assert.equal(brief.workId, workId);
+      assert.equal(brief.narrative.state, "unavailable");
+    }
+
+    for (const writer of [owner, controller]) {
+      const refreshed = await writer.request<{ narrative: { state: string } }>(`${workPath}/refresh`, { method: "POST", body: {} });
+      assert.equal(refreshed.narrative.state, "unavailable");
+    }
+
+    await assert.rejects(
+      viewer.request(`${workPath}/refresh`, { method: "POST", body: {} }),
+      (error: RemoteError) => error.status === 403 && error.code !== "remote-endpoint-denied",
+      "viewer refresh reaches Express role enforcement instead of the remote allowlist",
+    );
+
+    await assert.rejects(
+      viewer.request(`/project-groups/${encodeURIComponent(workspace.id)}/understanding/work/${encodeURIComponent(`team:${randomUUID()}`)}`),
+      (error: RemoteError) => error.status === 404 && error.code === "understanding-work",
+      "missing work briefs return 404 understanding-work through remote transport",
+    );
+
+    const teamId = randomUUID();
+    const missionId = randomUUID();
+    const allowed: readonly [method: "GET" | "POST", path: string][] = [
+      ["GET", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}`],
+      ["GET", `/project-groups/shop/understanding/work/${encodeURIComponent(`mission:${missionId}`)}`],
+      ["GET", `/project-groups/shop/understanding/work/${encodeURIComponent(`goal:${goalId}`)}`],
+      ["GET", `/project-groups/shop/understanding/work/team:${teamId}`],
+      ["POST", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/refresh`],
+      ["POST", `/project-groups/shop/understanding/work/${encodeURIComponent(`mission:${missionId}`)}/refresh`],
+      ["POST", `/project-groups/shop/understanding/work/${encodeURIComponent(`goal:${goalId}`)}/refresh`],
+    ];
+    for (let index = 0; index < allowed.length; index++) {
+      const [method, path] = allowed[index]!;
+      assert.deepEqual(
+        await runnerClient.request(path, { method, body: method === "POST" ? {} : undefined }),
+        { count: index + 1, method, path: `/api${path}` },
+      );
+    }
+
+    const denied: readonly [method: "GET" | "POST" | "PUT" | "DELETE", path: string][] = [
+      ["POST", "/project-groups/shop/understanding/work"],
+      ["POST", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}`],
+      ["PUT", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}`],
+      ["DELETE", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}`],
+      ["GET", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/refresh`],
+      ["PUT", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/refresh`],
+      ["DELETE", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/refresh`],
+      ["GET", `/project-groups/shop/understanding/work/${encodeURIComponent(`session:${teamId}`)}`],
+      ["GET", "/project-groups/shop/understanding/work/goal%3Anot-a-uuid"],
+      ["GET", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId.toUpperCase()}`)}`],
+      ["GET", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/extra`],
+      ["POST", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/extra`],
+      ["POST", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/refresh/extra`],
+      ["GET", `/project-groups/shop/understanding/%77ork/${encodeURIComponent(`team:${teamId}`)}`],
+      ["POST", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/%72efresh`],
+      ["GET", `/project-groups/shop/understanding/work/team%253A${teamId}`],
+    ];
+    for (const [method, path] of denied) {
+      await assert.rejects(
+        runnerClient.request(path, { method, body: method === "GET" ? undefined : {} }),
+        (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied",
+        `${method} ${path} must be denied`,
+      );
+    }
+    assert.equal(runner.requests.length, allowed.length, "denied work brief requests never reach the host");
+  } finally {
+    owner.close();
+    controller.close();
+    viewer.close();
+    runnerClient?.close();
+    runner?.close();
     await host.stop();
   }
 });

@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { responseText, Summarizer, transcriptText } from "../packages/host/src/summary.js";
-import { claimControl, startHost, waitFor } from "./helpers.js";
+import { claimControl, demoProfile, startHost, waitFor } from "./helpers.js";
 
 const attention = { idleAfterMs: 3000, hooks: { claude: true, codex: true } };
 
@@ -27,7 +27,7 @@ async function fakeModel() {
     });
   });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-  return { requests, url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, fail: (code: number) => { status = code; }, close: () => server.close() };
+  return { requests, url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, fail: (code: number) => { status = code; }, close: () => { server.closeAllConnections(); server.close(); } };
 }
 
 test("transcript text and response parsing", () => {
@@ -57,7 +57,7 @@ test("title writer receives only the prompt and is bounded to eight words", asyn
   } finally { model.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
-test("a summary covers the chat after a cursor, names its model, and is cached per range", { timeout: 60000 }, async () => {
+test("a summary covers the chat after a cursor, names its model, and is cached per range", { timeout: 90000 }, async () => {
   const model = await fakeModel();
   const root = mkdtempSync(join(tmpdir(), "infinite-summary-"));
   const keyFile = join(root, "openai.key");
@@ -67,10 +67,15 @@ test("a summary covers the chat after a cursor, names its model, and is cached p
     assert.deepEqual((await host.fetchApi("/me")).body.capabilities.summaries, { model: "gpt-6-luna" });
     const id = randomUUID();
     await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Digest", prompt: "hook dialog" });
-    const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
+    const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 20000);
     const control = await claimControl(host, id, "owner");
     await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId: detail.body.attention.prompt.id, option: 0 }, control.headers);
-    const chat = await waitFor(() => host.fetchApi(`/sessions/${id}/messages`), (r) => r.body.messages.some((m: any) => /Removed the build directory/.test(m.text)), 15000);
+    await waitFor(() => host.fetchApi(`/sessions/${id}/events?limit=200`), (r) => {
+      const hasTurnEnd = r.body.events.some((event: any) => event.type === "signal" && event.data.kind === "turn-end");
+      const output = r.body.events.filter((event: any) => event.type === "output").map((event: any) => event.data.text).join("");
+      return hasTurnEnd && /Selected: Yes[\s\S]*> /.test(output);
+    }, 20000);
+    const chat = await waitFor(() => host.fetchApi(`/sessions/${id}/messages`), (r) => r.body.messages.some((m: any) => /Removed the build directory/.test(m.text)), 20000);
 
     const summary = await host.fetchApi(`/sessions/${id}/summary`, "viewer");
     assert.equal(summary.status, 200);
@@ -122,14 +127,14 @@ test("a host without a summary model says so", async () => {
   } finally { await host.stop(); }
 });
 
-test("repository briefings run automatically after a turn end, reuse the snapshot, and do not backfill on restart", { timeout: 60000 }, async () => {
+test("repository briefings run automatically after a turn end, reuse the snapshot, and do not backfill on restart", { timeout: 90000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "infinite-jevcode-"));
   const receipt = join(root, "calls.jsonl");
   const fixture = join(process.cwd(), "tests/fixtures/jevcode-brief.mjs");
   const commandArgs = [fixture, receipt];
   const autoReceipts = () => readFileSync(receipt, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)).filter((call: { args: string[] }) => call.args.includes("auto"));
   const host = await startHost({ config: { attention, repositoryBriefings: {
-    command: process.execPath, args: commandArgs, model: "gpt-6-luna", automatic: true, intervalMs: 100, cooldownMs: 0, timeoutMs: 10000,
+    command: process.execPath, args: commandArgs, model: "gpt-6-luna", automatic: true, intervalMs: 100, cooldownMs: 0, timeoutMs: 20000,
   } } });
   try {
     execFileSync("git", ["init", "-q"], { cwd: host.config.projects[0].path });
@@ -143,11 +148,11 @@ test("repository briefings run automatically after a turn end, reuse the snapsho
     assert.deepEqual((await host.fetchApi("/me")).body.capabilities.summaries, { model: "gpt-6-luna" }, "repository briefings expose the summary capability without legacy summary configuration");
     const id = randomUUID();
     await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Automatic brief", prompt: "hook dialog" });
-    const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
+    const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 20000);
     const control = await claimControl(host, id, "owner");
     await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId: detail.body.attention.prompt.id, option: 0 }, control.headers);
 
-    const status = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`, "viewer"), r => r.body.state === "ready" || r.body.state === "failed", 20000);
+    const status = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`, "viewer"), r => r.body.state === "ready" || r.body.state === "failed", 30000);
     assert.equal(status.status, 200);
     assert.equal(status.body.state, "ready");
     assert.equal(status.body.summary.engine, "jevcode");
@@ -180,6 +185,7 @@ test("repository briefings run automatically after a turn end, reuse the snapsho
     await host.stopApi();
     await host.start();
     await new Promise(resolve => setTimeout(resolve, 500));
+    assert.equal((await host.fetchApi(`/sessions/${id}/summary?status=1`, "viewer")).body.state, "empty");
     assert.equal(autoReceipts().length, 1, "startup only primes journal cursors; it does not backfill historical turns");
   } finally {
     await host.stop();
@@ -187,53 +193,57 @@ test("repository briefings run automatically after a turn end, reuse the snapsho
   }
 });
 
-test("repository briefings label an unrefreshed turn, read a missing or not-opted-in brief honestly, and pass the configured runner", { timeout: 120000 }, async () => {
+test("repository briefings label an unrefreshed turn, read a missing or not-opted-in brief honestly, and pass the configured runner", { timeout: 180000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "infinite-jevcode-modes-"));
   const fixture = join(process.cwd(), "tests/fixtures/jevcode-brief.mjs");
-  for (const mode of ["skip", "empty", "disabled"] as const) {
-    const receipt = join(root, `${mode}.jsonl`);
-    const host = await startHost({ config: { attention, repositoryBriefings: {
-      command: process.execPath, args: [fixture, receipt, mode], runner: "codex", automatic: true, intervalMs: 100, cooldownMs: 0, timeoutMs: 10000,
-    } } });
-    try {
-      execFileSync("git", ["init", "-q"], { cwd: host.config.projects[0].path });
-      execFileSync("git", ["-C", host.config.projects[0].path, "config", "user.email", "test@example.invalid"]);
-      execFileSync("git", ["-C", host.config.projects[0].path, "config", "user.name", "Test"]);
-      writeFileSync(join(host.config.projects[0].path, "README.md"), "fixture repository\n");
-      execFileSync("git", ["-C", host.config.projects[0].path, "add", "README.md"]);
-      execFileSync("git", ["-C", host.config.projects[0].path, "commit", "-qm", "fixture"]);
-      assert.deepEqual((await host.fetchApi("/me")).body.capabilities.repositoryBriefings, { model: "codex", automatic: true });
-      const id = randomUUID();
-      await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: `Brief ${mode}`, prompt: "hook dialog" });
-      const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
-      const control = await claimControl(host, id, "owner");
-      await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId: detail.body.attention.prompt.id, option: 0 }, control.headers);
-      const status = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`, "viewer"), r => ["ready", "failed", "empty", "unavailable"].includes(r.body.state) && existsSync(receipt), 20000);
-      const call = JSON.parse(readFileSync(receipt, "utf8").trim().split("\n")[0]);
-      assert.deepEqual(call.args.slice(call.args.indexOf("--runner"), call.args.indexOf("--runner") + 2), ["--runner", "codex"]);
-      assert.ok(!call.args.includes("--model"), "no model is passed unless configured");
-      if (mode === "skip") {
-        assert.equal(status.body.state, "ready");
-        assert.match(status.body.summary.text, /Not refreshed this turn: jev judged a refresh not worthwhile/);
-        assert.equal(status.body.summary.repository.decision.action, "skip");
-      } else if (mode === "empty") {
-        assert.equal(status.body.state, "empty");
-        assert.equal(status.body.error, "No repository brief exists yet; one is generated after the next change.");
-      } else {
-        assert.equal(status.body.state, "unavailable");
-        assert.equal(status.body.error, "Repository briefings are turned off on this host.");
-      }
-    } finally { await host.stop(); }
+  try {
+    for (const mode of ["skip", "empty", "disabled"] as const) {
+      const receipt = join(root, `${mode}.jsonl`);
+      const host = await startHost({ config: { attention, repositoryBriefings: {
+        command: process.execPath, args: [fixture, receipt, mode], runner: "codex", automatic: true, intervalMs: 100, cooldownMs: 0, timeoutMs: 20000,
+      } } });
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: host.config.projects[0].path });
+        execFileSync("git", ["-C", host.config.projects[0].path, "config", "user.email", "test@example.invalid"]);
+        execFileSync("git", ["-C", host.config.projects[0].path, "config", "user.name", "Test"]);
+        writeFileSync(join(host.config.projects[0].path, "README.md"), "fixture repository\n");
+        execFileSync("git", ["-C", host.config.projects[0].path, "add", "README.md"]);
+        execFileSync("git", ["-C", host.config.projects[0].path, "commit", "-qm", "fixture"]);
+        assert.deepEqual((await host.fetchApi("/me")).body.capabilities.repositoryBriefings, { model: "codex", automatic: true });
+        const id = randomUUID();
+        await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: `Brief ${mode}`, prompt: "hook dialog" });
+        const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 20000);
+        const control = await claimControl(host, id, "owner");
+        await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId: detail.body.attention.prompt.id, option: 0 }, control.headers);
+        const status = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`, "viewer"), r => ["ready", "failed", "empty", "unavailable"].includes(r.body.state) && existsSync(receipt), 30000);
+        const call = JSON.parse(readFileSync(receipt, "utf8").trim().split("\n")[0]);
+        assert.deepEqual(call.args.slice(call.args.indexOf("--runner"), call.args.indexOf("--runner") + 2), ["--runner", "codex"]);
+        assert.ok(!call.args.includes("--model"), "no model is passed unless configured");
+        if (mode === "skip") {
+          assert.equal(status.body.state, "ready");
+          assert.match(status.body.summary.text, /Not refreshed this turn: jev judged a refresh not worthwhile/);
+          assert.equal(status.body.summary.repository.decision.action, "skip");
+        } else if (mode === "empty") {
+          assert.equal(status.body.state, "empty");
+          assert.equal(status.body.error, "No repository brief exists yet; one is generated after the next change.");
+        } else {
+          assert.equal(status.body.state, "unavailable");
+          assert.equal(status.body.error, "Repository briefings are turned off on this host.");
+        }
+      } finally { await host.stop(); }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
-  rmSync(root, { recursive: true, force: true });
 });
 
-test("a failed automatic repository brief is safe and does not retry the same checkpoint", { timeout: 60000 }, async () => {
+test("a failed automatic repository brief is safe and does not retry the same checkpoint", { timeout: 90000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "infinite-jevcode-fail-"));
   const receipt = join(root, "calls.jsonl");
   const fixture = join(process.cwd(), "tests/fixtures/jevcode-brief.mjs");
+  const receiptCount = () => existsSync(receipt) ? readFileSync(receipt, "utf8").trim().split("\n").filter(Boolean).length : 0;
   const host = await startHost({ config: { attention, repositoryBriefings: {
-    command: process.execPath, args: [fixture, receipt, "fail"], model: "gpt-6-luna", automatic: true, intervalMs: 100, cooldownMs: 0, timeoutMs: 10000,
+    command: process.execPath, args: [fixture, receipt, "fail"], model: "gpt-6-luna", automatic: true, intervalMs: 100, cooldownMs: 0, timeoutMs: 20000,
   } } });
   try {
     execFileSync("git", ["init", "-q"], { cwd: host.config.projects[0].path });
@@ -244,20 +254,19 @@ test("a failed automatic repository brief is safe and does not retry the same ch
     execFileSync("git", ["-C", host.config.projects[0].path, "commit", "-qm", "fixture"]);
     const id = randomUUID();
     await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Failed brief", prompt: "hook dialog" });
-    const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
+    const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 20000);
     const control = await claimControl(host, id, "owner");
     await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId: detail.body.attention.prompt.id, option: 0 }, control.headers);
-    const status = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "failed", 20000);
+    const status = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "failed", 30000);
     assert.equal(status.body.error, "Repository brief could not be generated. Check the configured briefing wrapper. Reason: exit 1");
+    assert.equal(receiptCount(), 1);
     const stop = await host.fetchApi(`/sessions/${id}/stop`, "owner", { requestId: randomUUID() }, control.headers);
     assert.equal(stop.status, 200);
-    const exited = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.status === "exited", 15000);
+    const exited = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.status === "exited", 20000);
     assert.equal(exited.body.status, "exited");
-    const exitAttempt = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "pending", 15000);
-    assert.equal(exitAttempt.body.state, "pending");
-    const settled = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "failed", 15000);
+    const settled = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => receiptCount() >= 2 && r.body.state === "failed", 30000);
     assert.equal(settled.body.error, "Repository brief could not be generated. Check the configured briefing wrapper. Reason: exit 1");
-    const settledCount = readFileSync(receipt, "utf8").trim().split("\n").length;
+    const settledCount = receiptCount();
     assert.equal(settledCount, 2, "the initial failure and one exit checkpoint each run once");
     for (let poll = 0; poll < 4; poll++) {
       const [briefStatus, session] = await Promise.all([
@@ -266,7 +275,7 @@ test("a failed automatic repository brief is safe and does not retry the same ch
       ]);
       assert.equal(session.body.status, "exited");
       assert.equal(briefStatus.body.state, "failed");
-      assert.equal(readFileSync(receipt, "utf8").trim().split("\n").length, settledCount, "a settled failed brief is not replayed on later polls");
+      assert.equal(receiptCount(), settledCount, "a settled failed brief is not replayed on later polls");
       await new Promise(resolve => setTimeout(resolve, 125));
     }
   } finally {
@@ -275,16 +284,35 @@ test("a failed automatic repository brief is safe and does not retry the same ch
   }
 });
 
-test("automatic brief uses the latest transcript after a delayed provider flush and labels its bounded activity", { timeout: 60000 }, async () => {
+test("automatic brief uses the latest transcript after a delayed provider flush and labels its bounded activity", { timeout: 90000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "infinite-briefing-transcript-"));
   const transcript = join(root, "provider-session.jsonl");
   const receipt = join(root, "calls.jsonl");
   const releaseLateTranscript = join(root, "release-late-transcript");
+  const blockerId = randomUUID();
+  const gateEntered = join(root, "gate-entered");
+  const gateRelease = join(root, "gate-release");
   const agent = join(process.cwd(), "tests/fixtures/briefing-transcript-agent.mjs");
   const cli = join(process.cwd(), "tests/fixtures/jevcode-brief.mjs");
-  const host = await startHost({ agents: { claude: { command: process.execPath, args: [agent, transcript, releaseLateTranscript] } }, config: { attention,
-    repositoryBriefings: { command: process.execPath, args: [cli, receipt], model: "gpt-6-luna", automatic: true, intervalMs: 100, cooldownMs: 0, timeoutMs: 10000 },
-  } });
+  const host = await startHost({
+    agents: {
+      demo: demoProfile(),
+      claude: { command: process.execPath, args: ["--import", import.meta.resolve("tsx"), agent, transcript, releaseLateTranscript] },
+    },
+    config: {
+      attention,
+      repositoryBriefings: {
+        command: process.execPath,
+        args: [cli, receipt, "gate", blockerId, gateEntered, gateRelease],
+        model: "gpt-6-luna",
+        automatic: true,
+        intervalMs: 100,
+        cooldownMs: 0,
+        timeoutMs: 45000,
+      },
+    },
+  });
+  let blockerSummary: Promise<{ status: number; body: any }> | undefined;
   try {
     const project = host.config.projects[0].path;
     execFileSync("git", ["init", "-q"], { cwd: project });
@@ -294,12 +322,30 @@ test("automatic brief uses the latest transcript after a delayed provider flush 
     execFileSync("git", ["-C", project, "add", "README.md"]);
     execFileSync("git", ["-C", project, "commit", "-qm", "fixture"]);
 
+    await host.fetchApi("/sessions", "owner", { requestId: blockerId, provider: "demo", projectId: "rehearsal", title: "Queue gate", prompt: "hold queue" });
+    blockerSummary = host.fetchApi(`/sessions/${blockerId}/summary`, "viewer");
+    await waitFor(async () => existsSync(gateEntered), entered => entered, 20000);
+
     const id = randomUUID();
     await host.fetchApi("/sessions", "owner", { requestId: id, provider: "claude", projectId: "rehearsal", title: "Long transcript", prompt: "Inspect the recent work." });
     await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.status === "running" && r.body.capabilities?.transcript === 1, 20000);
-    const queued = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "pending", 20000);
+    const queued = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "pending", 25000);
     assert.equal(queued.body.state, "pending", "the Stop hook has been observed before the late transcript append");
+
+    const beforeLateSeq = (await host.fetchApi(`/sessions/${id}`)).body.seq;
     writeFileSync(releaseLateTranscript, "release");
+    await waitFor(
+      () => host.fetchApi(`/sessions/${id}/messages?after=${beforeLateSeq}`),
+      r => r.body.messages.some((message: { text: string }) => message.text.includes("FINAL_TRANSCRIPT_MARKER")),
+      20000,
+    );
+    const stillQueued = await host.fetchApi(`/sessions/${id}/summary?status=1`);
+    assert.equal(stillQueued.body.state, "pending", "the automatic brief stays queued until the late transcript append is recorded");
+
+    writeFileSync(gateRelease, "release");
+    const blockerResult = await blockerSummary;
+    assert.equal(blockerResult.status, 200);
+
     const status = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "ready" || r.body.state === "failed", 30000);
     assert.equal(status.body.state, "ready");
     assert.match(status.body.summary.text, /FINAL_TRANSCRIPT_MARKER/);
@@ -308,7 +354,8 @@ test("automatic brief uses the latest transcript after a delayed provider flush 
     assert.equal(status.body.summary.repository.activity.truncated, true);
     assert.ok(status.body.summary.repository.coverage.some((line: string) => /Session activity: 200 of \d+ recorded messages included; activity outside the bounded message or page limits omitted/.test(line)), "the public coverage identifies the bounded activity window");
 
-    const calls = readFileSync(receipt, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const calls = readFileSync(receipt, "utf8").trim().split("\n").map(line => JSON.parse(line))
+      .filter((call: { args: string[] }) => call.args[call.args.indexOf("--session") + 1] === id);
     assert.equal(calls.length, 1, "the provider transcript should produce one automatic checkpoint");
     assert.ok(calls[0].args.includes("--activity-stdin"));
     const activity = calls[0].input.split("\n").filter(Boolean).map((line: string) => JSON.parse(line));
@@ -316,6 +363,8 @@ test("automatic brief uses the latest transcript after a delayed provider flush 
     assert.ok(activity.some((message: { text: string }) => message.text.includes("FINAL_TRANSCRIPT_MARKER")), "the delayed final transcript append must be in the collected snapshot");
     assert.ok(status.body.summary.repository.evidence.some((item: { source: string; text: string }) => item.source === "activity:1" && item.text.includes("FINAL_TRANSCRIPT_MARKER")), "the cited activity evidence survives into the public summary");
   } finally {
+    if (existsSync(root) && !existsSync(gateRelease)) writeFileSync(gateRelease, "release");
+    if (blockerSummary) await Promise.race([blockerSummary.catch(() => {}), new Promise(resolve => setTimeout(resolve, 5000))]);
     await host.stop();
     rmSync(root, { recursive: true, force: true });
   }

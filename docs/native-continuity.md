@@ -52,16 +52,16 @@ The public [chat guide](https://www.onorca.dev/docs/agents/native-chat) describe
 - Preserve local drafts while reconnecting, but retain Infinite's rule against replaying uncertain raw keys or approval responses. Orca has specific SSH-reattach input buffering; it is not a general safe-retry contract. [Buffering boundary](https://github.com/stablyai/orca/blob/e2da3a1eb1962f31ad01f0e2172119d95ae10015/src/renderer/src/components/terminal-pane/pty-connection/ssh-reattach-input-buffering.ts).
 - Client disconnection must not expire active Infinite work. Orca's SSH guide describes a five-minute grace default, while this source uses `0` for unlimited grace and bounds empty relays separately. Define and test Infinite's lifetime contract directly rather than importing a documented timeout. [Grace default](https://github.com/stablyai/orca/blob/e2da3a1eb1962f31ad01f0e2172119d95ae10015/src/shared/ssh-types.ts), [grace lifecycle](https://github.com/stablyai/orca/blob/e2da3a1eb1962f31ad01f0e2172119d95ae10015/src/relay/relay-grace-branch.ts).
 
-The useful MVP subset is the session model, bounded snapshot/subscription protocol, structured mobile projection, and safe control/receipt handling. A separate public relay fleet, Electron desktop shell, and automatic hibernation are not prerequisites for Infinite's current Tailscale deployment.
+The core runner implements the session model, bounded snapshot/subscription protocol, structured transcript projection, and safe control/receipt handling. A standalone blind ciphertext relay (`packages/host/src/relay.ts`) and a native SwiftUI macOS client (`apps/macos`) are now shipped as optional layers alongside direct Tailscale deployments; automatic process hibernation remains unimplemented.
 
 ## Applied to the runner
 
-The 2026-10-05 implementation applies these reviewed patterns without changing existing provider processes:
+The runner implements these patterns without changing existing provider processes:
 
 - A persistent runtime UUID sits beside the Infinite session ID. Provider-native conversation IDs come from authenticated Claude/Codex hooks, or from the private Codex/OpenCode protocols in local UI mode; account pinning and other provider adapters remain incomplete.
 - CLI attachment negotiates a bounded ANSI snapshot with its exact journal cursor, followed by newer events. Unsupported terminal state falls back to replay. This is screen restoration, not a workspace/process checkpoint.
 - Detached workers enforce expiring, device-bound input and resize control. Explicit takeover fences stale clients; API restart preserves ownership and the running process. Viewers cannot claim control, and controller keys still cannot send raw terminal bytes.
-- Browser and React Native views distinguish cached and fresh state, refresh on foreground, retain local drafts, and require explicit control after reconnect. The phone shows the signal timeline and the current screen; it does not page through raw recording events, which remain on the host. The UI exposes compact attention summaries; provider-native structured transcripts remain unimplemented.
+- Browser, React Native, and macOS views distinguish cached and fresh state, refresh on foreground, retain local drafts, and require explicit control after reconnect. Structured provider transcripts are captured through the hook relay and exit `transcript-drain` wrapper (`GET /api/sessions/:id/messages`, `source: "transcript"`) and rendered in the Chat/Conversation views on web, mobile, and macOS; sessions without transcripts fall back to recorded inputs and hook replies (`source: "recording"`). Raw recording logs remain on the host.
 
 The feedback behind these choices is specific rather than a popularity ranking: Orca's [reconnect report](https://github.com/stablyai/orca/issues/8591) describes stale state and stuck input ownership, while its [mobile parity request](https://github.com/stablyai/orca/issues/22754) asks for richer history and lifecycle visibility. The latter is a source-comparison report, not a live usability study.
 
@@ -123,7 +123,9 @@ Native attachment requires an owner device and current input control. It pins re
 
 These results do not establish automatic draft recovery, synchronized laptop files, Android runtime behavior, or execution-host reboot recovery. Ordinary terminal sessions retain their original transport.
 
-## Implementation order
+## Historical implementation sequence and remaining work
+
+Steps 1–4 and 6 below (durable runtime identity, experimental Codex and OpenCode `--local-ui` adapters, snapshot-plus-delta attachment, structured transcripts, and one-way workspace sync) plus `--laptop` Codex hybrid handoff have shipped. Claude and Grok native-UI adapters (step 5) and execution-host reboot recovery checkpoints (step 7) remain unimplemented.
 
 1. Introduce the durable conversation/provider/runtime mapping and capability contract required by native adapters. Keep account and workspace identity pinned through attachment and recovery. Distinguish execution ownership from the client currently controlling input or terminal dimensions.
 2. Commission Codex's local native UI against a persistent cloud app server with a disposable real conversation. Verify disconnect during a tool call, a second client's steering, native history reload, and the same conversation ID before making it the default. Keep existing PTY sessions attached to their original runtime until an explicit adoption path is verified.

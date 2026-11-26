@@ -6,12 +6,12 @@ import { cost } from "./usage";
 export type SessionTab = "chat" | "screen" | "terminal" | "files" | "context";
 export type CostView = "overview" | "projects" | "models";
 export type SwarmViewName = "lanes" | "wall" | "graph";
-type Location = { id: string | null; tab: SessionTab; creating: boolean; teams: boolean; teamId: string | null; creatingTeam: boolean; goals: boolean; goalId: string | null; creatingGoal: boolean; missionId: string | null; decisions: boolean; cost: boolean; costView: CostView; costProjectId: string | null; swarm: boolean; swarmView: SwarmViewName; permissions: boolean; permissionOverview: boolean; decisionId: string | null };
+type Location = { id: string | null; tab: SessionTab; creating: boolean; teams: boolean; teamId: string | null; teamEntryId: string | null; creatingTeam: boolean; goals: boolean; goalId: string | null; creatingGoal: boolean; missionId: string | null; decisions: boolean; cost: boolean; costView: CostView; costProjectId: string | null; swarm: boolean; swarmView: SwarmViewName; permissions: boolean; permissionOverview: boolean; decisionId: string | null };
 
 function readLocation(machine: string): Location {
   const hash = window.location.hash.replace(new RegExp(`^#/machines/${machine}(?=/|$)`), "#");
   const match = hash.match(/^#\/sessions\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})(?:\/(chat|screen|terminal|files|context))?$/i);
-  const team = hash.match(/^#\/teams\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i);
+  const team = hash.match(/^#\/teams\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})(?:\/entries\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}))?$/i);
   const goal = hash.match(/^#\/goals\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i);
   const mission = hash.match(/^#\/missions\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i);
   const decisions = hash === "#/decisions";
@@ -19,7 +19,7 @@ function readLocation(machine: string): Location {
   const cost = hash.match(/^#\/cost(?:\/(projects|models)(?:\/([^/]+))?)?$/);
   const permission = hash.match(/^#\/permissions(?:\/(overview)|\/decisions\/([^/]+))?$/);
   return { id: match?.[1] ?? null, tab: (match?.[2] as SessionTab) ?? "chat", creating: hash === "#/new",
-    teams: hash === "#/teams" || hash === "#/teams/new" || Boolean(team), teamId: team?.[1] ?? null, creatingTeam: hash === "#/teams/new",
+    teams: hash === "#/teams" || hash === "#/teams/new" || Boolean(team), teamId: team?.[1] ?? null, teamEntryId: team?.[2] ?? null, creatingTeam: hash === "#/teams/new",
     goals: hash === "#/goals" || hash === "#/goals/new" || Boolean(goal), goalId: goal?.[1] ?? null, creatingGoal: hash === "#/goals/new",
     missionId: mission?.[1] ?? null, decisions,
     swarm: Boolean(swarm), swarmView: (swarm?.[1] as SwarmViewName | undefined) ?? "lanes",

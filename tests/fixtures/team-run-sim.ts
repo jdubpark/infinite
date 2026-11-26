@@ -29,6 +29,9 @@ const EVENT: Record<Kind, string> = {
   continue: "Owner continued the run from its clean integration commit",
 };
 const SETTLED: ReadonlySet<TeamStatus> = new Set(["cancelled", "merged", "no-change", "ready-for-review"]);
+const STOP_REASON = "Stopping active team members; any human input lease remains authoritative.";
+const OPEN_DECISIONS: ReadonlySet<string> = new Set(["pending", "reviewing", "approved", "answering"]);
+const openDecisions = (saved: Saved) => (saved.run.permissionDecisions ?? []).filter(decision => OPEN_DECISIONS.has(decision.status)).length;
 const T0 = Date.parse("2026-11-13T10:00:00.000Z");
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g;
 export const RERUN = (seed: number) => `TEAM_SIM_SEED=${seed} node --import tsx --test tests/team-run-sim.test.ts`;
@@ -224,7 +227,7 @@ class Host {
   }
 
   bytes(): Buffer { return readFileSync(this.file); }
-  read(): Saved { return unseal<Saved>(this.f.key, `team:${this.f.run.id}`, readFileSync(this.file, "utf8")); }
+  read(bytes = this.bytes()): Saved { return unseal<Saved>(this.f.key, `team:${this.f.run.id}`, bytes.toString("utf8")); }
 
   private guard<T extends object>(life: Life, target: T, path = ""): T {
     return new Proxy(target, { get: (object, key) => {
@@ -360,6 +363,14 @@ class Sim {
     writes.forEach((saved, index) => this.durableCheck(saved, `${what}'s write ${index + 1}`));
   }
 
+  private stopReasonChecks(writes: readonly Saved[], request: Request, what: string) {
+    if (request.kind !== "pause" && request.kind !== "cancel") return;
+    writes.forEach((saved, index) => {
+      if (saved.halt === request.kind && saved.receipts[request.body.requestId] && saved.run.reason !== STOP_REASON)
+        this.fail("I3", `${what}'s write ${index + 1} carries its receipt while its halt is set, but the run's reason is ${JSON.stringify(saved.run.reason)}, not the stop reason`);
+    });
+  }
+
   private effect(saved: Saved, invariant: string, request?: Request) {
     const want = expected(this.model), got = project(saved);
     if (!isDeepStrictEqual(want, got)) this.fail(invariant, `${request ? `after the acknowledged ${request.kind}, ` : ""}${difference(want, got)}`);
@@ -381,10 +392,13 @@ class Sim {
     const request = this.build(step), pre = this.model, before = this.host.bytes();
     const result = await this.host.call(service => send(service, this.f.run.id, request), request.kind, step.stopAt);
     this.durableChecks(result.writes, `the ${request.kind}`);
+    this.stopReasonChecks(result.writes, request, `the ${request.kind}`);
     if (result.stopped) {
       if (request.body.revision !== pre.revision) this.fail("I7", `a ${request.kind} issued against revision ${request.body.revision} wrote the record at revision ${pre.revision} before the stop`);
       if (SETTLED.has(pre.status)) this.fail("I5", `a new ${request.kind} wrote the ${pre.status} record before the stop`);
       bump(this.counts, `cut:${request.kind}:${step.stopAt}`);
+      const atStop = result.writes.at(-1)!;
+      if (!atStop.receipts[request.body.requestId] && openDecisions(atStop) < openDecisions(this.host.read(before))) bump(this.counts, `withdrawn:${request.kind}`);
       const post = acknowledge(pre, request), name = `intermediate:${request.kind}:${step.stopAt}`, change = INTERMEDIATE[`${request.kind}:${step.stopAt}`];
       const allowed: Allowed = [["the state before it", pre], ["the state after it", post], ...(change ? [[name, { ...pre, ...change(pre) }] as const] : [])];
       const saved = await this.reopen(), held = match(saved, allowed);
@@ -392,6 +406,7 @@ class Sim {
       if (held === undefined) this.unexpected(saved, allowed, "the reopened record");
       const retry = await this.host.call(service => send(service, this.f.run.id, request), request.kind);
       this.durableChecks(retry.writes, `the retried ${request.kind}`);
+      this.stopReasonChecks(retry.writes, request, `the retried ${request.kind}`);
       if (retry.error !== undefined) this.fail("I1", `the host admitted the ${request.kind} before the stop, and refused its retry (${code(retry.error)})`);
       this.acknowledged(request, pre, retry.value!, true);
     } else if (result.error !== undefined) {

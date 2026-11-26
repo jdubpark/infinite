@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Blackboard } from "../packages/host/src/evidence/blackboard.js";
 import type { FuseGate } from "../packages/host/src/fuse/types.js";
-import { PULL_REQUEST_FIELDS, type ReviewIntake, reviewRequestId } from "../packages/host/src/review-feedback.js";
+import { PULL_REQUEST_BRANCH_FIELDS, PULL_REQUEST_FIELDS, type ReviewIntake, reviewRequestId } from "../packages/host/src/review-feedback.js";
 import type { TeamReviewFeedback } from "../packages/host/src/team-review-feedback.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
 import type { Manager } from "../packages/host/src/manager.js";
@@ -20,6 +20,7 @@ const owner = "owner-login", repository = "example-org/example-repo", branch = "
 const pullRequestUrl = `https://github.com/${repository}/pull/7`;
 const requested = "Rename the flag to --strict and keep the old name as an alias.";
 const ghRead = ["gh", "pr", "view", "7", "--json", PULL_REQUEST_FIELDS, "--repo", repository];
+const ghBranchRead = ["gh", "pr", "view", "7", "--json", PULL_REQUEST_BRANCH_FIELDS, "--repo", repository];
 const fakeGh = `const fs = require("node:fs"); const [dir, command, ...args] = process.argv.slice(1);
 fs.appendFileSync(dir + "/commands.log", JSON.stringify([command, ...args]) + "\\n");
 if (command !== "gh") process.exit(3);
@@ -381,4 +382,65 @@ test("close settles within its bound while a process the host cannot stop holds 
     assert.ok(Date.now() - started < 12_000, `close took ${Date.now() - started} ms`);
     await teams.idle();
   } finally { gh.release(); f.close(); }
+});
+
+test("steering a legacy pull request without a branch resolves and persists the branch on demand even with review feedback off, then reuses it", async () => {
+  const f = schedulerFixture();
+  try {
+    const gh = delivered(f, false);
+    delete f.run.pullRequest!.branch;
+    f.run.publication = { repository, branch, commit: gh.head, publishedAt: new Date().toISOString() };
+    f.writeTeam();
+    gh.show([]);
+    const teams = f.openTeam();
+
+    const first = await teams.steer(f.run.id, { requestId: randomUUID(), revision: 1, text: "Keep the old flag name as an alias." });
+    assert.equal(first.revision, 2);
+    assert.equal(first.pullRequest?.branch, branch);
+    assert.deepEqual(gh.commands(), [ghBranchRead], "one read-only gh pr view resolves the missing branch");
+    let saved = f.readRecord<Saved>("team", f.run.id);
+    assert.equal(saved.run.pullRequest?.branch, branch);
+    assert.equal(saved.run.revision, 2);
+
+    const second = await teams.steer(f.run.id, { requestId: randomUUID(), revision: 2, text: "Document the alias in help output." });
+    assert.equal(second.revision, 3);
+    assert.equal(second.pullRequest?.branch, branch);
+    assert.deepEqual(gh.commands(), [ghBranchRead], "subsequent steering reuses the persisted branch without calling gh again");
+    saved = f.readRecord<Saved>("team", f.run.id);
+    assert.equal(saved.run.revision, 3);
+  } finally { f.close(); }
+});
+
+test("on-demand legacy pull request branch lookup fails cleanly without corrupting the run", async () => {
+  type FailureCase = { name: string; setup: (f: Fixture, gh: ReturnType<typeof delivered>) => void; expectedCommands: number; match: RegExp };
+  const cases: FailureCase[] = [
+    { name: "gh lookup failure", setup: () => {}, expectedCommands: 1, match: /failed/ },
+    { name: "invalid branch name", setup: (_f, gh) => gh.show([], { headRefName: "../escape" }), expectedCommands: 1, match: /invalid head branch/ },
+    { name: "fork pull request", setup: (_f, gh) => gh.show([], { isCrossRepository: true }), expectedCommands: 1, match: /comes from a fork/ },
+    { name: "closed pull request", setup: (_f, gh) => gh.show([], { state: "CLOSED" }), expectedCommands: 1, match: /was closed/ },
+    { name: "unowned head branch", setup: (_f, gh) => gh.show([], { headRefName: "someone-elses-branch" }), expectedCommands: 1, match: /not on the branch this run delivered to/ },
+    { name: "cross-repo pull request URL", setup: (f, gh) => { f.run.pullRequest!.pullRequestUrl = "https://github.com/other-org/example-repo/pull/7"; gh.show([]); }, expectedCommands: 0, match: /does not match the pinned delivery repository/ },
+  ];
+  for (const item of cases) {
+    const f = schedulerFixture();
+    try {
+      const gh = delivered(f, false);
+      delete f.run.pullRequest!.branch;
+      f.run.publication = { repository, branch, commit: gh.head, publishedAt: new Date().toISOString() };
+      item.setup(f, gh);
+      f.writeTeam();
+      const before = f.readRecord<Saved>("team", f.run.id);
+      const teams = f.openTeam();
+      const requestId = randomUUID();
+      await assert.rejects(
+        teams.steer(f.run.id, { requestId, revision: 1, text: "Keep the alias." }),
+        error => error instanceof Error && (error as { code?: string }).code === "delivery-branch-unknown" && item.match.test(error.message),
+        item.name,
+      );
+      assert.equal(gh.commands().length, item.expectedCommands, item.name);
+      const after = f.readRecord<Saved>("team", f.run.id);
+      assert.deepEqual(after, before, `${item.name}: run stays uncorrupted on disk`);
+      assert.equal(after.receipts[requestId], undefined, `${item.name}: no steer receipt recorded`);
+    } finally { f.close(); }
+  }
 });

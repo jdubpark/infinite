@@ -1,17 +1,48 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fixture, git, limitLineup } from "./team-fixture.js";
 import { waitFor } from "./helpers.js";
 import { TeamError } from "../packages/host/src/teams.js";
+import { PULL_REQUEST_BRANCH_FIELDS } from "../packages/host/src/review-feedback.js";
 import type { TeamReport } from "../packages/host/src/team-types.js";
 import { deliveryInternals, deliveryRecord } from "./fixtures/team-delivery-record.js";
 
 const PULL_REQUEST = "https://github.com/example/app/pull/7";
 
 const branchHistory = (remote: string, branch: string) => git(remote, "reflog", "show", "--format=%H", `refs/heads/${branch}`).split("\n").filter(Boolean);
+
+function stubGh(stateDir: string, mode: { exitCode: number; stdout?: string; stderr?: string; startedFile?: string; waitForFile?: string }) {
+  const dir = join(stateDir, `fake-gh-${randomUUID().slice(0, 8)}`);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "response.json"), JSON.stringify(mode));
+  const script = `const fs = require("node:fs"); const { spawnSync } = require("node:child_process");
+const [dir, command, ...args] = process.argv.slice(1);
+if (command === "gh") {
+  fs.appendFileSync(dir + "/gh.log", JSON.stringify([command, ...args]) + "\\n");
+  const response = JSON.parse(fs.readFileSync(dir + "/response.json", "utf8"));
+  if (response.startedFile) fs.writeFileSync(response.startedFile, "started");
+  const finish = () => {
+    if (response.stdout) process.stdout.write(response.stdout);
+    if (response.stderr) process.stderr.write(response.stderr);
+    process.exit(response.exitCode);
+  };
+  if (response.waitForFile) {
+    const timer = setInterval(() => {
+      if (fs.existsSync(response.waitForFile)) { clearInterval(timer); finish(); }
+    }, 25);
+  } else {
+    finish();
+  }
+} else {
+  const child = spawnSync(command, args, { stdio: "inherit" });
+  process.exit(child.status ?? 1);
+}`;
+  const ghCalls = (): string[][] => existsSync(join(dir, "gh.log")) ? readFileSync(join(dir, "gh.log"), "utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
+  return { commandPrefix: { command: process.execPath, args: ["-e", script, dir] }, ghCalls, dir };
+}
 
 test("a steer on a delivered pull request recovers a blocked member, publishes only a checkpoint before review, and updates the same pull request", { timeout: 240000 }, async () => {
   const f = await fixture("delivery-continued", limitLineup, {}, { deliveryMode: "pr" });
@@ -131,6 +162,8 @@ test("a failed delivery in a continued revision blocks for the owner instead of 
 test("a run continued from a pull request recorded without its branch blocks at delivery instead of delivering to its checkpoint", { timeout: 60000 }, async () => {
   const h = await deliveryRecord("pr");
   try {
+    const gh = stubGh(h.f.host.config.stateDir, { exitCode: 1, stderr: "Could not resolve to a PullRequest" });
+    h.f.host.config.teams!.commandPrefix = gh.commandPrefix;
     const checkpoint = `${h.run.branch}-${h.headCommit.slice(0, 8)}`;
     Object.assign(h.run, { lineup: structuredClone(limitLineup), revision: 2, status: "reviewing",
       pullRequest: { revision: 1, headCommit: h.headCommit, pullRequestUrl: PULL_REQUEST, summary: "Opened for review.", reportedAt: new Date().toISOString() },
@@ -139,10 +172,218 @@ test("a run continued from a pull request recorded without its branch blocks at 
       review: { verdict: "approved", summary: "Reviewed the continued head.", revision: 2 } });
     h.member.status = "stopped"; h.stored.deliveryAttempt = undefined; h.stored.checkHead = h.headCommit;
     await deliveryInternals(h.teams).step(h.stored);
+    await h.teams.idle();
+    assert.deepEqual(gh.ghCalls(), [["gh", "pr", "view", "7", "--json", PULL_REQUEST_BRANCH_FIELDS, "--repo", "example/app"]]);
     assert.deepEqual([h.run.status, h.run.blockCode], ["blocked", "delivery-branch-unknown"], JSON.stringify(h.run.events.slice(-3)));
     assert.match(h.run.reason ?? "", /recorded before the host kept its branch/);
     assert.deepEqual(h.run.members.filter(member => member.role === "delivery" && member.revision === 2), [], "no delivery is granted the checkpoint");
     assert.equal(h.stored.deliveryAttempt, undefined);
     assert.equal(h.run.pullRequest?.branch, undefined);
   } finally { await h.f.close(); }
+});
+
+test("redelivering a legacy pull request missing its branch resolves and persists the branch on demand, then reuses it", { timeout: 60000 }, async () => {
+  const h = await deliveryRecord("pr");
+  try {
+    const gh = stubGh(h.f.host.config.stateDir, { exitCode: 0, stdout: JSON.stringify({ state: "OPEN", isCrossRepository: false, baseRefName: "main", headRefName: h.run.branch }) });
+    h.f.host.config.teams!.commandPrefix = gh.commandPrefix;
+    const checkpoint = `${h.run.branch}-${h.headCommit.slice(0, 8)}`;
+    Object.assign(h.run, { lineup: structuredClone(limitLineup), revision: 2, status: "reviewing",
+      pullRequest: { revision: 1, headCommit: h.headCommit, pullRequestUrl: PULL_REQUEST, summary: "Opened for review.", reportedAt: new Date().toISOString() },
+      publication: { repository: h.run.delivery!.repository, branch: checkpoint, commit: h.headCommit, publishedAt: new Date().toISOString() },
+      tasks: [{ id: "a", title: "a", instructions: "Change the label.", paths: ["src/a.ts"], dependsOn: [], revision: 2, status: "integrated", commit: h.headCommit }],
+      review: { verdict: "approved", summary: "Reviewed the continued head.", revision: 2 } });
+    h.member.status = "stopped"; h.stored.deliveryAttempt = undefined; h.stored.checkHead = h.headCommit;
+    const internals = deliveryInternals(h.teams);
+    await internals.step(h.stored);
+    const queued = await waitFor(
+      () => Promise.resolve(h.run.members.filter(member => member.role === "delivery" && member.revision === 2)),
+      members => members.length === 1,
+      10000,
+    );
+
+    assert.deepEqual(gh.ghCalls(), [["gh", "pr", "view", "7", "--json", PULL_REQUEST_BRANCH_FIELDS, "--repo", "example/app"]]);
+    assert.equal(h.run.pullRequest?.branch, h.run.branch);
+    assert.equal(h.run.status, "delivering", JSON.stringify(h.run.events.slice(-4)));
+    assert.equal(queued.length, 1);
+    assert.ok(queued[0]!.prompt.includes(`This run continues its pull request ${PULL_REQUEST} on branch ${h.run.branch}`));
+
+    const persisted = await h.teams.steer(h.id, { requestId: randomUUID(), revision: 2, text: "Adjust spacing." });
+    assert.equal(persisted.revision, 3);
+    assert.equal(persisted.pullRequest?.branch, h.run.branch);
+    assert.equal(gh.ghCalls().length, 1, "subsequent steer reuses the persisted branch without another gh lookup");
+  } finally { await h.f.close(); }
+});
+
+test("launching a restored unlaunched delivery member resolves a legacy pull request branch before rebuilding its prompt", { timeout: 60000 }, async () => {
+  const h = await deliveryRecord("pr");
+  try {
+    const gh = stubGh(h.f.host.config.stateDir, { exitCode: 0, stdout: JSON.stringify({ state: "OPEN", isCrossRepository: false, baseRefName: "main", headRefName: h.run.branch }) });
+    h.f.host.config.teams!.commandPrefix = gh.commandPrefix;
+    const at = new Date().toISOString();
+    const checkpoint = `${h.run.branch}-${h.headCommit.slice(0, 8)}`;
+    Object.assign(h.run, { lineup: structuredClone(limitLineup), revision: 2, status: "delivering",
+      pullRequest: { revision: 1, headCommit: h.headCommit, pullRequestUrl: PULL_REQUEST, summary: "Opened for review.", reportedAt: at },
+      publication: { repository: h.run.delivery!.repository, branch: checkpoint, commit: h.headCommit, publishedAt: at },
+      tasks: [{ id: "a", title: "a", instructions: "Change the label.", paths: ["src/a.ts"], dependsOn: [], revision: 2, status: "integrated", commit: h.headCommit }],
+      review: { verdict: "approved", summary: "Reviewed the continued head.", revision: 2 } });
+    Object.assign(h.member, { revision: 2, status: "queued", prompt: "Legacy delivery prompt before branch was persisted." });
+    delete h.member.startedAt;
+    h.stored.deliveryAttempt = undefined;
+    h.stored.checkHead = h.headCommit;
+
+    let launchedPrompt = "";
+    let launchedRefs: string[] | undefined;
+    const manager = (h.teams as unknown as {
+      manager: {
+        list: () => Promise<{ status: string }[]>;
+        createTeamSession: (
+          request: { prompt: string },
+          assignment: unknown,
+          cwd: string,
+          profile: unknown,
+          root: string,
+          trusted: unknown,
+          header: unknown,
+          github?: { refs?: string[] },
+        ) => Promise<{ status: string }>;
+      };
+    }).manager;
+    manager.createTeamSession = async (request, _assignment, _cwd, _profile, _root, _trusted, _header, github) => {
+      launchedPrompt = request.prompt;
+      launchedRefs = github?.refs;
+      return { status: "running" };
+    };
+
+    await deliveryInternals(h.teams).step(h.stored);
+    await h.teams.idle();
+
+    assert.deepEqual(gh.ghCalls(), [["gh", "pr", "view", "7", "--json", PULL_REQUEST_BRANCH_FIELDS, "--repo", "example/app"]]);
+    assert.equal(h.run.pullRequest?.branch, h.run.branch);
+    assert.equal(h.run.status, "delivering", JSON.stringify(h.run.events.slice(-4)));
+    assert.equal(h.member.status, "running");
+    assert.deepEqual(launchedRefs, [`refs/heads/${h.run.branch}`]);
+    assert.ok(launchedPrompt.includes(`This run continues its pull request ${PULL_REQUEST} on branch ${h.run.branch}`));
+    assert.ok(launchedPrompt.includes(`${checkpoint} as a checkpoint`));
+  } finally { await h.f.close(); }
+});
+
+test("launching a restored queued delivery member rebuilds a stale pre-branch prompt even when pullRequest.branch is already saved", { timeout: 60000 }, async () => {
+  const h = await deliveryRecord("pr");
+  try {
+    const gh = stubGh(h.f.host.config.stateDir, { exitCode: 1, stderr: "gh should not be invoked when branch is already persisted" });
+    h.f.host.config.teams!.commandPrefix = gh.commandPrefix;
+    const at = new Date().toISOString();
+    Object.assign(h.run, { lineup: structuredClone(limitLineup), revision: 2, status: "delivering",
+      pullRequest: { revision: 1, headCommit: h.headCommit, pullRequestUrl: PULL_REQUEST, summary: "Opened for review.", reportedAt: at, branch: h.run.branch },
+      publication: undefined,
+      tasks: [{ id: "a", title: "a", instructions: "Change the label.", paths: ["src/a.ts"], dependsOn: [], revision: 2, status: "integrated", commit: h.headCommit }],
+      review: { verdict: "approved", summary: "Reviewed the continued head.", revision: 2 } });
+    Object.assign(h.member, { revision: 2, status: "queued", prompt: "Stale pre-branch prompt persisted before crash." });
+    delete h.member.startedAt;
+    h.stored.deliveryAttempt = undefined;
+    h.stored.checkHead = h.headCommit;
+
+    let launchedPrompt = "";
+    let launchedRefs: string[] | undefined;
+    const manager = (h.teams as unknown as {
+      manager: {
+        createTeamSession: (
+          request: { prompt: string },
+          assignment: unknown,
+          cwd: string,
+          profile: unknown,
+          root: string,
+          trusted: unknown,
+          header: unknown,
+          github?: { refs?: string[] },
+        ) => Promise<{ status: string }>;
+      };
+    }).manager;
+    manager.createTeamSession = async (request, _assignment, _cwd, _profile, _root, _trusted, _header, github) => {
+      launchedPrompt = request.prompt;
+      launchedRefs = github?.refs;
+      return { status: "running" };
+    };
+
+    await deliveryInternals(h.teams).step(h.stored);
+
+    assert.deepEqual(gh.ghCalls(), []);
+    assert.equal(h.member.status, "running");
+    assert.deepEqual(launchedRefs, [`refs/heads/${h.run.branch}`]);
+    assert.ok(launchedPrompt.includes(`This run continues its pull request ${PULL_REQUEST} on branch ${h.run.branch}`));
+  } finally { await h.f.close(); }
+});
+
+test("aborting an in-flight legacy branch lookup on host shutdown leaves the run unblocked and retryable", { timeout: 60000 }, async () => {
+  const h = await deliveryRecord("pr");
+  try {
+    const startedFile = join(h.f.host.config.stateDir, "gh-abort-started");
+    const waitForFile = join(h.f.host.config.stateDir, "gh-abort-never");
+    const gh = stubGh(h.f.host.config.stateDir, { exitCode: 0, stdout: "{}", startedFile, waitForFile });
+    h.f.host.config.teams!.commandPrefix = gh.commandPrefix;
+    Object.assign(h.run, { lineup: structuredClone(limitLineup), revision: 2, status: "reviewing",
+      pullRequest: { revision: 1, headCommit: h.headCommit, pullRequestUrl: PULL_REQUEST, summary: "Opened for review.", reportedAt: new Date().toISOString() },
+      tasks: [{ id: "a", title: "a", instructions: "Change the label.", paths: ["src/a.ts"], dependsOn: [], revision: 2, status: "integrated", commit: h.headCommit }],
+      review: { verdict: "approved", summary: "Reviewed the continued head.", revision: 2 } });
+    h.member.status = "stopped"; h.stored.deliveryAttempt = undefined; h.stored.checkHead = h.headCommit;
+
+    await deliveryInternals(h.teams).step(h.stored);
+    await waitFor(() => Promise.resolve(existsSync(startedFile)), started => started, 10000);
+    await h.teams.close();
+
+    assert.equal(h.run.status, "reviewing");
+    assert.equal(h.run.blockCode, undefined);
+    assert.equal(h.run.pullRequest?.branch, undefined);
+    assert.equal(h.stored.deliveryAttempt, undefined);
+  } finally { await h.f.close(); }
+});
+
+test("a slow legacy branch lookup runs off the scheduler tick without stalling another team or owner pause", { timeout: 60000 }, async () => {
+  const h = await deliveryRecord("pr");
+  try {
+    const startedFile = join(h.f.host.config.stateDir, "gh-slow-started");
+    const releaseFile = join(h.f.host.config.stateDir, "gh-slow-release");
+    const gh = stubGh(h.f.host.config.stateDir, {
+      exitCode: 0,
+      stdout: JSON.stringify({ state: "OPEN", isCrossRepository: false, baseRefName: "main", headRefName: h.run.branch }),
+      startedFile,
+      waitForFile: releaseFile,
+    });
+    h.f.host.config.teams!.commandPrefix = gh.commandPrefix;
+    Object.assign(h.run, { lineup: structuredClone(limitLineup), revision: 2, status: "reviewing",
+      pullRequest: { revision: 1, headCommit: h.headCommit, pullRequestUrl: PULL_REQUEST, summary: "Opened for review.", reportedAt: new Date().toISOString() },
+      tasks: [{ id: "a", title: "a", instructions: "Change the label.", paths: ["src/a.ts"], dependsOn: [], revision: 2, status: "integrated", commit: h.headCommit }],
+      review: { verdict: "approved", summary: "Reviewed the continued head.", revision: 2 } });
+    h.member.status = "stopped"; h.stored.deliveryAttempt = undefined; h.stored.checkHead = h.headCommit;
+
+    const otherId = randomUUID();
+    const otherStored = structuredClone(h.stored);
+    otherStored.run.id = otherId;
+    otherStored.run.status = "paused";
+    otherStored.run.pullRequest = undefined;
+    const internals = deliveryInternals(h.teams);
+    internals.records.set(otherId, otherStored);
+    let otherSteps = 0;
+    const originalStep = internals.step.bind(h.teams);
+    internals.step = async stored => {
+      if (stored.run.id === otherId) { otherSteps += 1; return; }
+      return originalStep(stored);
+    };
+
+    h.teams.start();
+    await waitFor(() => Promise.resolve(existsSync(startedFile)), started => started, 10000);
+    await waitFor(() => Promise.resolve(otherSteps), count => count >= 2, 10000);
+    const paused = await h.teams.pause(h.id, { requestId: randomUUID(), revision: 2 });
+    assert.equal(paused.status, "paused", "owner pause completes without waiting on slow gh pr view");
+    assert.equal(existsSync(releaseFile), false, "pause completed while gh pr view was still running");
+
+    writeFileSync(releaseFile, "go");
+    await h.teams.idle();
+    assert.equal(h.run.status, "paused", "completion revalidation does not unpause or block a paused run");
+    assert.equal(h.run.pullRequest?.branch, undefined);
+  } finally {
+    await h.teams.close();
+    await h.f.close();
+  }
 });

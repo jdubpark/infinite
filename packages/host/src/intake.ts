@@ -229,10 +229,10 @@ export class IntakeService {
   private readonly log: (line: string, error: unknown) => void;
   private readonly pollMs: number;
   private readonly pendingMentions = new Map<string, string>();
-  private recordAudienceAllowed(record: IntakeRecord): boolean {
+  private recordAudienceAllowed(record: IntakeRecord, check = this.options.audience?.recordAllowed): boolean {
     if (!intakeRecordAudienceIdentityMatches(this.config, record)) return false;
     const mission = record.missionId ? this.missions.peek(record.missionId) : undefined;
-    if (this.config.intake?.slack) return this.options.audience?.recordAllowed(record, mission) ?? false;
+    if (this.config.intake?.slack) return check?.(record, mission) ?? false;
     return intakeRecordAudienceAllowed(this.config, record, mission);
   }
 
@@ -259,7 +259,8 @@ export class IntakeService {
     private readonly linear: IntakeLinear,
     private readonly options: { threads?: IntakeThreadReader; pollMs?: number; create?: (request: CreateMission, origin: MissionOrigin, authorize?: () => void) => Promise<Mission>; log?: (line: string, error: unknown) => void;
       router?: (text: string) => Promise<RouteReading | undefined>; routeWaitMs?: number;
-      audience?: { recordAllowed(record: IntakeRecord, mission?: Mission): boolean } } = {},
+      audience?: { recordAllowed(record: IntakeRecord, mission?: Mission): boolean;
+        snapshotRecordAllowed?: () => (record: IntakeRecord, mission?: Mission) => boolean } } = {},
   ) {
     this.pollMs = options.pollMs ?? 30000;
     this.log = options.log ?? ((line, error) => console.warn(line, error));
@@ -327,7 +328,10 @@ export class IntakeService {
   }
 
   list(): IntakeView[] {
-    return this.store.list().filter(record => this.recordAudienceAllowed(record)).map(record => {
+    const records = this.store.list();
+    const scopedCheck = this.config.intake?.slack ? this.options.audience?.snapshotRecordAllowed?.() : undefined;
+    const check = scopedCheck ?? this.options.audience?.recordAllowed;
+    return records.filter(record => this.recordAudienceAllowed(record, check)).map(record => {
       const started = record.comments.started, outcome = record.comments.outcome;
       return {
         issueId: record.issueId, identifier: record.identifier, url: record.url, title: record.title, state: record.state,

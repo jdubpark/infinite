@@ -1,10 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { randomBytes, randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ProjectGroup } from "../packages/host/src/project-group-types.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { IntakeRecord } from "../packages/host/src/intake-types.js";
 import type { Mission } from "../packages/host/src/mission-types.js";
 import { createIntakeAudienceGuard, createIntakeMissionCreator, intakeRecordAudienceAllowed, slackAudienceIdentity } from "../packages/host/src/intake-audience.js";
+import { IntakeService } from "../packages/host/src/intake.js";
+import { IntakeStore } from "../packages/host/src/intake-store.js";
+import type { MissionService } from "../packages/host/src/missions.js";
 import { SlackClient, SlackError } from "../packages/host/src/slack-client.js";
 import { startSlackServer } from "./fixtures/slack-server.js";
 
@@ -19,6 +26,7 @@ const project = (repository: string | null = "Example/alpha") => ({
 
 function setup(options: { pins?: { projectId: string; path: string; repository: string | null; rootCommit?: string }[]; repository?: string | null; hidden?: boolean; answerProjectId?: string; noRemote?: boolean; observedRemote?: string; multipleRoots?: boolean } = {}) {
   const repository = options.repository === undefined ? "Example/alpha" : options.repository;
+  const gitCalls: string[] = [];
   const configuredProject = project(repository);
   const config = {
     intake: {
@@ -35,6 +43,7 @@ function setup(options: { pins?: { projectId: string; path: string; repository: 
       checkouts: [{ projectId: "alpha", name: "Alpha", path: "/srv/work/alpha", primary: true, teamReady: true, identityFrom: "source" }] }],
   };
   const git = (_cwd: string, args: string[]) => {
+    gitCalls.push(args.join(" "));
     if (args[0] === "rev-parse" && args[1] === "--show-toplevel") return "/srv/work/alpha";
     if (args[0] === "rev-parse" && args[1] === "--verify") return repository ? HEAD_COMMIT : ROOT_COMMIT;
     if (args[0] === "remote" && args[1] === "-v") {
@@ -46,7 +55,7 @@ function setup(options: { pins?: { projectId: string; path: string; repository: 
   };
   const guard = createIntakeAudienceGuard({ config, groups: { get: () => group }, git, realpath: path => path,
     sourceAppliedHead: () => HEAD_COMMIT });
-  return { guard, config, group };
+  return { guard, config, group, gitCalls };
 }
 
 test("opt-in Slack audience admits only the fully pinned default group and same-org checkouts", () => {
@@ -85,6 +94,30 @@ test("a sealed intake record is usable only for its exact Slack audience and mis
   assert.equal(current.guard.recordAllowed(record, mission), false,
     "Reconfiguring the approved group invalidates the sealed record without changing its audit copy");
   assert.equal(record.slackAudienceId, audienceId);
+});
+
+test("intake list snapshots live workspace verification once per call and disposes it afterward", () => {
+  const current = setup();
+  const root = mkdtempSync(join(tmpdir(), "intake-audience-list-"));
+  current.config.stateDir = root;
+  const store = new IntakeStore(current.config, randomBytes(32));
+  const now = new Date().toISOString(), audienceId = slackAudienceIdentity(current.config)!;
+  for (let index = 0; index < 12; index++) store.create({ issueId: randomUUID(), identifier: `TEST-${index}`, url: "https://example.invalid/issue",
+    title: "Review alpha", description: "Review alpha", issueCreatedAt: now, issueUpdatedAt: now, state: "queued", slackAudienceId: audienceId,
+    comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now });
+  const service = new IntakeService(current.config, store, { peek: () => undefined } as unknown as MissionService, {} as any,
+    { audience: current.guard });
+  try {
+    assert.equal(current.guard.workspacesAllowed(), true);
+    const readsPerScan = current.gitCalls.length;
+    assert.ok(readsPerScan > 0);
+    current.gitCalls.length = 0;
+    assert.equal(service.list().length, 12);
+    assert.equal(current.gitCalls.length, readsPerScan, "A list scans each pinned checkout once, regardless of record count");
+    current.gitCalls.length = 0;
+    assert.equal(service.list().length, 12);
+    assert.equal(current.gitCalls.length, readsPerScan, "The next list call rechecks live Git identity instead of reusing a stale result");
+  } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test("an intake replay is checked against the current workspace before looking up a prior mission", async () => {

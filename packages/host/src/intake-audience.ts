@@ -135,6 +135,12 @@ export function createIntakeAudienceGuard({ config, groups, git = readGit, realp
     return true;
   };
 
+  const recordAllowedWith = (record: IntakeRecord, mission: Mission | undefined, allowed: () => boolean): boolean => {
+    if (!intakeRecordAudienceIdentityMatches(config, record)) return false;
+    if (!config.intake?.slack || record.external && !record.thread && !record.direct && record.slackAudienceId === undefined) return true;
+    return allowed() && intakeRecordAudienceAllowed(config, record, mission);
+  };
+
   return {
     workspacesAllowed,
     missionAllowed(request: CreateMission): boolean {
@@ -146,9 +152,15 @@ export function createIntakeAudienceGuard({ config, groups, git = readGit, realp
       return !request.checkouts?.some(projectId => !pins.has(projectId));
     },
     recordAllowed(record: IntakeRecord, mission?: Mission): boolean {
-      if (!intakeRecordAudienceIdentityMatches(config, record)) return false;
-      if (!config.intake?.slack || record.external && !record.thread && !record.direct && record.slackAudienceId === undefined) return true;
-      return workspacesAllowed() && intakeRecordAudienceAllowed(config, record, mission);
+      return recordAllowedWith(record, mission, workspacesAllowed);
+    },
+    snapshotRecordAllowed(): (record: IntakeRecord, mission?: Mission) => boolean {
+      let checked = false, snapshot = false;
+      const allowed = () => {
+        if (!checked) { snapshot = workspacesAllowed(); checked = true; }
+        return snapshot;
+      };
+      return (record, mission) => recordAllowedWith(record, mission, allowed);
     },
   };
 }

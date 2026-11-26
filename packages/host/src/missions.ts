@@ -364,7 +364,8 @@ export class MissionService {
     return folder;
   }
 
-  private replay(stored: Stored, action: string, body: Action & object) {
+  private authorizeAndCheckReplay(stored: Stored, action: string, body: Action & object, authorize?: () => void) {
+    authorize?.();
     const prior = stored.receipts[body.requestId];
     if (!prior) return false;
     if (prior !== receiptDigest({ action, ...body })) throw new TeamError(409, "request-conflict", "This request ID belongs to a different mission action.");
@@ -385,8 +386,7 @@ export class MissionService {
     const body = missionExtendSchema.parse(input);
     return this.enqueue(id, () => {
       const stored = this.record(id), mission = stored.mission;
-      authorize?.();
-      if (this.replay(stored, "extend", body)) return this.view(stored);
+      if (this.authorizeAndCheckReplay(stored, "extend", body, authorize)) return this.view(stored);
       const deadlineBlocked = mission.status === "blocked" && mission.stopReason === "deadline";
       if (!(live.has(mission.status) || mission.status === "paused" || deadlineBlocked))
         throw new TeamError(409, "mission-not-extendable", "Only a running mission, or one stopped by its time limit, can be extended.");
@@ -415,8 +415,7 @@ export class MissionService {
     const reason = body.reason;
     return this.enqueue(id, () => {
       const stored = this.record(id), mission = stored.mission;
-      authorize?.();
-      if (this.replay(stored, action, body)) return this.view(stored);
+      if (this.authorizeAndCheckReplay(stored, action, body, authorize)) return this.view(stored);
       if (action === "pause" && !live.has(mission.status)) throw new TeamError(409, "mission-not-running", "Only a running mission can be paused.");
       if (action === "resume" && mission.status !== "paused") throw new TeamError(409, "mission-not-paused", "Only a paused mission can resume.");
       if (action === "resume" && typeof body.source === "object" && (stored.ownerHalt || this.fuse?.held?.(mission.repoProjectIds)))
@@ -517,8 +516,7 @@ export class MissionService {
     const body = { ...missionTextSchema.parse(input), ...(source === undefined ? {} : { source }) };
     return this.enqueue(id, () => {
       const stored = this.record(id), mission = stored.mission;
-      authorize?.();
-      if (this.replay(stored, "steer", body)) return this.view(stored);
+      if (this.authorizeAndCheckReplay(stored, "steer", body, authorize)) return this.view(stored);
       if (!live.has(mission.status)) throw new TeamError(409, "mission-not-running", "Resume the mission before sending direction, or start a new mission if it has stopped.");
       if (steeringFull(mission, body.text))
         throw new TeamError(409, "mission-steering-limit", "Start a new mission with consolidated directions.");
@@ -537,8 +535,7 @@ export class MissionService {
     const body = { ...missionTextSchema.parse(input), ...(source === undefined ? {} : { source }) };
     return this.enqueue(id, () => {
       const stored = this.record(id), mission = stored.mission;
-      authorize?.();
-      if (this.replay(stored, `answer:${decisionId}`, body)) return this.view(stored);
+      if (this.authorizeAndCheckReplay(stored, `answer:${decisionId}`, body, authorize)) return this.view(stored);
       const decision = mission.decisions.find(item => item.id === decisionId);
       if (!decision) throw new TeamError(404, "decision-not-found", "This decision does not exist.");
       if (decision.answer) throw new TeamError(409, "decision-answered", "This decision already has an answer.");

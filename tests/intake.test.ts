@@ -1,112 +1,21 @@
 import test, { mock } from "node:test";
 import assert from "node:assert/strict";
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { waitFor, inProcessHost } from "./helpers.js";
-import { git, missionHarness, scriptedMissionHarness } from "./mission-harness.js";
-import { startIntakeLinearServer, type IntakeFixtureIssue } from "./fixtures/intake-linear-server.js";
-import { missionRequestId, type IntakeRecord, type IntakeThread, type IntakeThreadReader, type SlackThreadMessage } from "../packages/host/src/intake-types.js";
+import { startIntakeLinearServer } from "./fixtures/intake-linear-server.js";
+import { direct, MINUTE, ownerMention, OWNER_SLACK, setup, slackLink, slackTs, TEAMMATE_SLACK, AGENT_SLACK } from "./fixtures/intake-test-context.js";
+import { missionRequestId, type SlackThreadMessage } from "../packages/host/src/intake-types.js";
 import { IntakeStore } from "../packages/host/src/intake-store.js";
 import { IntakeLinear, issueFacts, parseSlackThreadLink, type IntakeIssue } from "../packages/host/src/intake-linear.js";
 import { IntakeService, directObjective, failureSummary, intakeObjective, outboundText } from "../packages/host/src/intake.js";
-import { intakeRecordAudienceAllowed } from "../packages/host/src/intake-audience.js";
-import { LinearFailure, LinearService } from "../packages/host/src/linear.js";
+import { LinearFailure } from "../packages/host/src/linear.js";
 import { SlackError } from "../packages/host/src/slack-client.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { MissionService } from "../packages/host/src/missions.js";
 import type { Mission } from "../packages/host/src/mission-types.js";
 import { TeamError } from "../packages/host/src/teams.js";
 import type { IntakeView } from "../packages/host/src/intake-types.js";
-import type { RouteReading } from "../packages/host/src/intake-route.js";
 
-const OWNER_SLACK = "U00000000", TEAMMATE_SLACK = "U22222222", AGENT_SLACK = "U11111111";
-const MINUTE = 60000;
-
-const slackTs = (ms: number) => `${Math.floor(ms / 1000)}.${String(ms % 1000).padStart(3, "0")}000`;
-const slackLink = (ts: string) => `https://example.slack.com/archives/C0000000000/p${ts.replace(".", "")}`;
-
-const ownerMention = (root: string): SlackThreadMessage[] => [{ ts: root, user: OWNER_SLACK, text: `Please export this <@${AGENT_SLACK}>` }];
-
-class FakeThreads implements IntakeThreadReader {
-  readonly threads = new Map<string, SlackThreadMessage[]>();
-  readonly unreadable = new Set<string>();
-  failNext = 0;
-  failure: Error = new Error("Slack is unavailable");
-  permalinkFails = false;
-  gate?: Promise<void>;
-  waiting = 0;
-  async organizationChannelAllowed(_channelId: string): Promise<boolean> { return true; }
-  async permalink(binding: IntakeThread, ts: string): Promise<string> {
-    if (this.permalinkFails) throw new SlackError("internal_error", true);
-    return `https://example.slack.com/archives/${binding.channelId}/p${ts.replace(".", "")}`;
-  }
-  async thread(binding: IntakeThread): Promise<SlackThreadMessage[] | "unreadable"> {
-    if (this.gate) { this.waiting += 1; await this.gate; }
-    if (this.failNext > 0) { this.failNext -= 1; throw this.failure; }
-    if (this.unreadable.has(binding.threadTs)) return "unreadable";
-    return this.threads.get(binding.threadTs) ?? [];
-  }
-}
-
-async function setup(options: { groupId?: string; maxActive?: number; requireSlackThread?: boolean; mirror?: boolean; scripted?: boolean; admitIssues?: boolean; answerQuestions?: boolean; classify?: boolean; router?: (text: string) => Promise<RouteReading | undefined>; routeWaitMs?: number; reportName?: string;
-  wrapMissions?: (missions: MissionService) => MissionService } = {}) {
-  const linearServer = await startIntakeLinearServer();
-  const threads = new FakeThreads();
-  const control: { blocked?: Error } = {};
-  let config!: Config;
-  const configure = (target: Config) => {
-    config = target;
-    target.linear = { apiKeyFile: linearServer.apiKeyFile, endpoint: linearServer.endpoint, ...(options.reportName ? { reportName: options.reportName } : {}) };
-    target.intake = {
-      linear: { teamIds: [linearServer.teamId], creatorId: linearServer.ownerId, label: "infinite", commentsMirrorToSlack: options.mirror ?? false, admitIssues: options.admitIssues ?? true },
-      slack: { appTokenFile: "/srv/infinite-data/slack-app-token", botTokenFile: "/srv/infinite-data/slack-bot-token", teamId: "T00000000",
-        ownerUserId: OWNER_SLACK, linearAgentUserId: AGENT_SLACK, bindByMention: false, directRequests: true,
-        answerQuestions: options.answerQuestions ?? false, classify: options.classify ?? false,
-        organizationScope: { workspaces: target.projects.map(project => ({ projectId: project.id, path: project.path, repository: null,
-          rootCommit: git(project.path, "rev-list", "--max-parents=0", "HEAD") })) } },
-      mission: { groupId: options.groupId ?? "shop", maxSubtasks: 8, maxMinutes: 30 },
-      maxActive: options.maxActive ?? 3,
-      requireSlackThread: options.requireSlackThread ?? true,
-    };
-  };
-  const built = options.scripted ? scriptedMissionHarness({ configure }) : missionHarness({ configure });
-  let missions: MissionService;
-  if ("open" in built) { built.open(); missions = built.services().missions; }
-  else missions = built.missions;
-  if (options.wrapMissions) missions = options.wrapMissions(missions);
-  const storeKey = randomBytes(32);
-  const store = new IntakeStore(config, storeKey);
-  const audience = { recordAllowed: (record: IntakeRecord, mission?: Mission) => intakeRecordAudienceAllowed(config, record, mission) };
-  const enabled = Date.parse(store.enabledAt());
-  const linearService = new LinearService(config, randomBytes(32));
-  const logged: { line: string; error: unknown }[] = [];
-  const service = (linear = new IntakeLinear(linearService)) => new IntakeService(config, store, missions, linear, { threads, audience, pollMs: 3600000, ...(options.router ? { router: options.router } : {}), ...(options.routeWaitMs ? { routeWaitMs: options.routeWaitMs } : {}),
-    log: (line, error) => logged.push({ line, error }),
-    create: async (request, origin) => {
-      if (control.blocked) throw control.blocked;
-      return missions.create(request, undefined, origin);
-    } });
-  const intake = service();
-  const addThread = (offset: number, messages: (root: string) => SlackThreadMessage[]) => {
-    const root = slackTs(enabled + offset);
-    threads.threads.set(root, messages(root));
-    return { root, link: slackLink(root) };
-  };
-  const issue = (overrides: Partial<IntakeFixtureIssue> = {}, offset = 2000): IntakeFixtureIssue => {
-    const thread = addThread(offset, ownerMention);
-    return linearServer.file({ createdAt: new Date(enabled + 3000).toISOString(), attachmentUrls: [thread.link], ...overrides });
-  };
-  return {
-    h: built, scripted: built as ReturnType<typeof scriptedMissionHarness>, store, storeKey, missions, threads, control, logged, linear: linearService, linearServer, config, enabled, intake, service, audience, addThread, issue,
-    iso: (offset: number) => new Date(enabled + offset).toISOString(),
-    list: () => intake.list(),
-    close: async () => {
-      intake.close();
-      linearService.close();
-      await linearServer.close();
-      await built.close();
-    },
-  };
-}
 type Ctx = Awaited<ReturnType<typeof setup>>;
 
 const viewOf = (ctx: Ctx, issueId: string): IntakeView | undefined => ctx.list().find(view => view.issueId === issueId);
@@ -938,13 +847,6 @@ test("failureSummary keeps the fixed text of a Slack or Linear request failure, 
   } finally { await ctx.close(); }
 });
 
-function direct(ctx: Ctx, text = "Export fails on empty rows\nPlease fix the exporter", more: (root: string) => SlackThreadMessage[] = () => [], offset = 2000) {
-  const root = slackTs(ctx.enabled + offset);
-  const thread: IntakeThread = { channelId: "C0000000000", threadTs: root };
-  ctx.threads.threads.set(root, [{ ts: root, user: OWNER_SLACK, text }, ...more(root)]);
-  return { thread, ts: root, eventId: `Ev${randomUUID().slice(0, 8)}`, text };
-}
-
 test("a direct request files one issue and starts a mission whose objective marks each author", { timeout: 60000 }, async () => {
   const ctx = await setup({ requireSlackThread: false });
   try {
@@ -1123,41 +1025,6 @@ test("a first save that lands on disk but reports failure leaves one record afte
     assert.equal(ctx.intake.requestFromSlack(request), "accepted");
     const reopened = new IntakeStore(ctx.config, ctx.storeKey);
     assert.equal(reopened.list().filter(record => record.direct?.ts === request.ts).length, 1);
-  } finally { await ctx.close(); }
-});
-
-test("records from a previous Slack audience stay sealed and disappear from runtime intake views", async () => {
-  const ctx = await setup({ requireSlackThread: false });
-  try {
-    const request = direct(ctx);
-    assert.equal(ctx.intake.requestFromSlack(request), "accepted");
-    const [sealed] = ctx.store.list();
-    assert.ok(sealed?.slackAudienceId);
-    assert.equal(ctx.intake.list().length, 1);
-
-    ctx.config.intake!.mission.groupId = "another-audience";
-    assert.deepEqual(ctx.intake.list(), []);
-    assert.equal(ctx.store.get(sealed!.issueId)!.slackAudienceId, sealed!.slackAudienceId,
-      "The sealed record remains available for audit without a runtime audience assignment");
-  } finally { await ctx.close(); }
-});
-
-test("removing Slack keeps queued Slack requests out of Linear intake processing", { timeout: 60000 }, async () => {
-  const ctx = await setup({ requireSlackThread: false });
-  try {
-    const request = direct(ctx);
-    assert.equal(ctx.intake.requestFromSlack(request), "accepted");
-    const [sealed] = ctx.store.list();
-    assert.ok(sealed?.slackAudienceId);
-
-    ctx.intake.close();
-    ctx.config.intake!.slack = undefined;
-    const linearOnly = ctx.service();
-    await linearOnly.poll();
-    assert.equal(ctx.linearServer.allIssues().length, 0, "A removed Slack installation cannot file an old Slack request");
-    assert.equal(ctx.missions.list().length, 0);
-    assert.equal(ctx.store.get(sealed!.issueId)!.slackAudienceId, sealed!.slackAudienceId);
-    linearOnly.close();
   } finally { await ctx.close(); }
 });
 

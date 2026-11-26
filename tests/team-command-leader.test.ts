@@ -193,6 +193,20 @@ test("a stop while the leader runs kills its group as before", CASE, async () =>
   }
 });
 
+test("a command asked for after its stop never starts, and its scope hears of no process (INF-505)", CASE, async () => {
+  const run = new Run();
+  const heard: (number | undefined)[] = [];
+  try {
+    run.controller.abort();
+    const result = await run.start(waits, { starting: () => undefined, started: pid => { heard.push(pid); } });
+    assert.deepEqual(heard, [undefined], "the scope heard of a started process");
+    assert.deepEqual(result, { exitCode: null, output: "", stdout: "", interrupted: true, truncated: false, leftover: false });
+    assert.equal(existsSync(run.leaderFile), false, "the command ran");
+  } finally {
+    run.dispose();
+  }
+});
+
 test("a command inside a scope that records it ends with its leader the same way", CASE, async t => {
   const run = new Run();
   let recorded: number | undefined;

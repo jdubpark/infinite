@@ -438,10 +438,13 @@ step that starts it, and while the operation runs it samples the process table
 for descendants that moved to other sessions or groups. The saved intent says
 that this record may be incomplete from before a command starts until a save
 holds it. When an operation fails, the host ends the operation's commands that
-are still running, as a halt does, and starts no further command for it. The
-saved failure holds every command that has started, so it marks the record
-incomplete only while a command is still starting, not while the host still
-reads a command's start time. While such a run
+are still running, as a halt does, and refuses the commands that have not
+started: one that the operation asks for later, and one that was still waiting
+for its turn to start. Such a command is refused at its turn or, when its turn
+came before the failure, just before its start, because its stop came first.
+The saved failure holds every command that has started, so it marks
+the record incomplete only while a command is still starting, not while the host
+still reads a command's start time. While such a run
 is blocked or paused with no command of its own running, the host looks at most
 every ten minutes for processes that match the record, and for any process of
 the host account or of the account that runs team commands that uses the run
@@ -456,8 +459,12 @@ cannot finish; when a process of those accounts refuses inspection; when the
 record overflowed; or when an earlier API process stopped while the record was
 marked incomplete and the host has not rebooted since. In the last four cases
 the host says it cannot tell. Earlier versions also marked a failure's record
-incomplete while the host still read a command's start time; a run held that
-way at the upgrade waits until the host boots again.
+incomplete while the host still read a command's start time. A run that such a
+version left marked this way is held as above until the host boots again: only
+a reboot lets the retention policy close it. Its events say that the host cannot
+tell whether the interrupted operation left processes, because "the host stopped
+while the operation was starting a command, so its record of the operation's
+processes may be incomplete".
 The host never signals or stops a process it
 finds. The look has stated limits: it does not inspect other accounts or a
 process that left its recorded session and group and no longer uses the run
@@ -2922,7 +2929,9 @@ Every command that the host's team command runner starts for a team (setup,
 checks, member setup, the Git commands it runs and, under a command prefix,
 workspace removal) ends with the process that the host started for it.
 While that process runs, a stop (the time limit, a pause, a cancel, a block or a
-host stop) kills its process group. Once that process has exited, the host sends
+host stop) kills its process group. A command whose stop comes before its start,
+for example while it waits for its turn to start, is never started: it returns
+as interrupted, with no output. Once that process has exited, the host sends
 no signal to anything the command started: the group may be empty by then, and
 its id may already belong to an unrelated process. The host reads output that is
 still open for at most one second. It then reads what the pipes already hold:

@@ -16,6 +16,7 @@ type Saved = { run: { status: string }; pending?: { recording?: true; failure?: 
 type Stored = { run: TeamRun; pending?: { recording?: true; witness?: Witness }; census?: { state: string; detail?: string } };
 type Internals = {
   records: Map<string, Stored>;
+  recorders: Map<string, { inFlight: number; spawning: number }>;
   save: (stored: unknown) => void;
   enqueue: (runId: string, task: () => unknown) => Promise<unknown>;
   operation: (stored: unknown, kind: string, perform: (signal: AbortSignal) => Promise<unknown>, complete: () => void) => void;
@@ -97,6 +98,13 @@ async function waitFor(check: () => boolean, message: string, timeoutMs = 5000) 
   assert.fail(message);
 }
 
+function outcomeOf(command: Promise<CommandResult> | undefined) {
+  return Promise.race([
+    command!.then(result => result.interrupted ? "stopped" : `exited ${result.exitCode}`, (error: unknown) => error instanceof TeamError ? error.code : String(error)),
+    new Promise(resolve => setTimeout(resolve, 5000, "still running")),
+  ]);
+}
+
 test("a host stop after a failed operation was saved while the start token of its ended command was still being read holds the run's workspace no longer than the command's processes (INF-505)", CASE, async () => {
   const stops: [string, (saved: Saved, pid: number | undefined) => boolean][] = [
     ["after the failure's save", saved => saved.pending?.failure !== undefined],
@@ -173,7 +181,7 @@ test("after a host stop at a failed operation's save, a process left in its comm
   }
 });
 
-test("a failed operation stops its commands: a running one is stopped, one still starting keeps the record incomplete and is stopped as it spawns, and one asked for after the failure never starts (INF-505)", CASE, async () => {
+test("a failed operation stops its commands: a running one is stopped, one still starting keeps the record incomplete until it is refused before its spawn, and one asked for after the failure never starts (INF-505)", CASE, async () => {
   const f = blockedRunFixture();
   const teams = openTeam(f);
   const internals = internalsOf(teams), stored = internals.records.get(f.run.id)!, save = internals.save;
@@ -207,13 +215,52 @@ test("a failed operation stops its commands: a running one is stopped, one still
     await new Promise(resolve => setTimeout(resolve, 50));
     open();
     await waitFor(() => commands.late !== undefined, "a branch should ask for a command after the failure", 15_000);
-    const outcome = (command: Promise<CommandResult> | undefined) => Promise.race([
-      command!.then(result => result.interrupted ? "stopped" : `exited ${result.exitCode}`, (error: unknown) => error instanceof TeamError ? error.code : String(error)),
-      new Promise(resolve => setTimeout(resolve, 5000, "still running")),
-    ]);
-    const [running, starting, late] = await Promise.all([outcome(commands.running), outcome(commands.starting), outcome(commands.late)]);
-    assert.deepEqual({ failureRecording, running, starting, late, spawned: stored.pending?.witness?.groups.length },
-      { failureRecording: true, running: "stopped", starting: "stopped", late: "command-unavailable", spawned: 2 });
+    const [running, starting, late] = await Promise.all([outcomeOf(commands.running), outcomeOf(commands.starting), outcomeOf(commands.late)]);
+    const deadline = Date.now() + 5000;
+    while (savedRecord(f).pending?.recording && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+    assert.deepEqual({ failureRecording, running, starting, late, spawned: stored.pending?.witness?.groups.length, recordingAfter: savedRecord(f).pending?.recording === true },
+      { failureRecording: true, running: "stopped", starting: "stopped", late: "command-unavailable", spawned: 1, recordingAfter: false });
+  } finally {
+    open();
+    for (const pid of stored.pending?.witness?.groups ?? []) {
+      try { process.kill(-pid, "SIGKILL"); } catch {}
+    }
+    await teams.close();
+    f.close();
+  }
+});
+
+test("a command asked for after an operation rejected but before its failure was saved is refused at its turn in the queue, and leaves no count behind (INF-505)", CASE, async () => {
+  const f = blockedRunFixture();
+  const teams = openTeam(f);
+  const internals = internalsOf(teams), stored = internals.records.get(f.run.id)!;
+  const sleep = { command: "sleep", args: ["30"] };
+  let open!: () => void, failed = false;
+  const gate = new Promise<void>(resolve => { open = resolve; });
+  const commands: { running?: Promise<CommandResult>; queued?: Promise<CommandResult> } = {};
+  try {
+    internals.operation(stored, "check", signal => {
+      void (async () => {
+        await waitFor(() => failed, "the operation should reject", 15_000);
+        commands.queued = handled(teamCommand(sleep, f.run.workspace, signal));
+      })().catch(() => {});
+      return (async () => {
+        commands.running = handled(teamCommand(sleep, f.run.workspace, signal));
+        await waitFor(() => stored.pending?.recording === undefined, "a witness save should mark the record complete once the running command is recorded");
+        void internals.enqueue(f.run.id, () => gate);
+        throw new TeamError(409, "workspace-operation-failed", "The check failed.");
+      })().catch(error => {
+        failed = true;
+        throw error;
+      });
+    }, () => {});
+    await waitFor(() => commands.queued !== undefined, "a branch should ask for a command before the failure is saved", 15_000);
+    const recorder = internals.recorders.get(f.run.id)!;
+    const queued = { inFlight: recorder.inFlight, spawning: recorder.spawning, failureSaved: savedRecord(f).pending?.failure !== undefined };
+    open();
+    const [running, refused] = await Promise.all([outcomeOf(commands.running), outcomeOf(commands.queued)]);
+    assert.deepEqual({ queued, running, refused, after: { inFlight: recorder.inFlight, spawning: recorder.spawning }, spawned: stored.pending?.witness?.groups.length },
+      { queued: { inFlight: 1, spawning: 1, failureSaved: false }, running: "stopped", refused: "command-unavailable", after: { inFlight: 0, spawning: 0 }, spawned: 1 });
   } finally {
     open();
     for (const pid of stored.pending?.witness?.groups ?? []) {

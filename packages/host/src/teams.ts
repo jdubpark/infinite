@@ -2162,8 +2162,9 @@ export class TeamService {
             if (state.status === "exited") {
               if (member.stalledAt && journalDrained) {
                 const stall = evaluateStallRecovery({ run, member, attentionState: state.attention.state, quietForMs: quietFor(member), stallWindowMs: this.stallWindowFor(member), journalDrained, hasDeliveryAttempt: Boolean(stored.deliveryAttempt), nowMs: Date.now(), phase: "detect" });
-                if (stall.action === "suppress-duplicate") { member.status = "stopped"; this.save(stored); continue; }
-                if (stall.action === "initiate-stop" || stall.action === "end-replay") { await this.replaceStalledMember(stored, member, state.attention.state); if (stored.pending || run.status === "blocked") return; continue; }
+                if (stall.action === "suppress-duplicate" || (stall.action === "none" && stall.guard === "current-assignment" && stall.reason !== "inactive-run-status")) { member.status = "stopped"; this.save(stored); }
+                else if (stall.action === "initiate-stop" || stall.action === "end-replay") { await this.replaceStalledMember(stored, member, state.attention.state); if (stored.pending || run.status === "blocked") return; }
+                continue;
               }
               if (member.role === "permission-coordinator") {
                 const decision = permissionCoordinatorDecision(run, member);

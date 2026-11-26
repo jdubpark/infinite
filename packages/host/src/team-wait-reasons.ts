@@ -48,69 +48,84 @@ export function describeTeamWaitReasons(
   const activeMembers = run.members.filter(
     member => member.revision === run.revision && ACTIVE_MEMBER_STATUSES.includes(member.status),
   );
+  const blocked = run.status === "blocked";
 
-  if (run.linearTracking && run.linear && run.linear.status !== "synced") {
-    reasons.push({
-      kind: "linear-sync",
-      summary: run.linear.reason ? `Waiting on Linear sync: ${run.linear.reason}` : "Waiting for Linear tracking confirmation.",
-      ...(run.linear.checkedAt ? { since: run.linear.checkedAt } : {}),
-    });
-  } else if (run.linearTracking && !run.linear && run.status !== "blocked") {
-    reasons.push({
-      kind: "linear-sync",
-      summary: "Waiting for initial Linear tracking confirmation.",
-    });
-  }
-
-  for (const decision of run.decisions) {
-    if (decision.revision !== run.revision || decision.answer) continue;
-    const member = run.members.find(item => item.memberId === decision.memberId);
-    reasons.push({
-      kind: "owner-decision",
-      decisionId: decision.id,
-      memberId: decision.memberId,
-      ...(member?.taskId ? { taskId: member.taskId } : {}),
-      since: decision.createdAt,
-      summary: `Waiting for owner decision: ${decision.question}`,
-    });
+  if (!blocked && run.linearTracking) {
+    if (run.linear && run.linear.status !== "synced" && run.linear.status !== "blocked") {
+      reasons.push({
+        kind: "linear-sync",
+        summary: run.linear.reason ? `Waiting on Linear sync: ${run.linear.reason}` : "Waiting for Linear tracking confirmation.",
+        ...(run.linear.checkedAt ? { since: run.linear.checkedAt } : {}),
+      });
+    } else if (!run.linear) {
+      reasons.push({
+        kind: "linear-sync",
+        summary: "Waiting for initial Linear tracking confirmation.",
+      });
+    }
   }
 
   const promptedMemberIds = new Set<string>();
-  for (const decision of run.permissionDecisions ?? []) {
-    if (decision.revision !== run.revision || !OPEN_PERMISSION_STATUSES.has(decision.status)) continue;
-    const target = activeMembers.find(member => member.memberId === decision.targetMemberId && !member.report);
-    if (!target) continue;
-    promptedMemberIds.add(target.memberId);
-    reasons.push({
-      kind: "provider-prompt",
-      decisionId: decision.id,
-      memberId: target.memberId,
-      ...(target.taskId ? { taskId: target.taskId } : {}),
-      summary:
-        decision.status === "escalated"
-          ? "Provider prompt escalated for owner response."
-          : decision.status === "reviewing"
-            ? "Permission coordinator is reviewing a provider prompt."
-            : "Waiting on a provider prompt.",
-    });
-  }
-  if (
-    promptedMemberIds.size === 0 &&
-    (run.reason === PROVIDER_INPUT_REASON || run.reason === PERMISSION_REVIEW_REASON || run.reason === PERMISSION_AGENT_REASON)
-  ) {
-    reasons.push({
-      kind: "provider-prompt",
-      summary: run.reason,
-    });
+  if (!blocked) {
+    for (const decision of run.decisions) {
+      if (decision.revision !== run.revision || decision.answer) continue;
+      const member = run.members.find(item => item.memberId === decision.memberId);
+      reasons.push({
+        kind: "owner-decision",
+        decisionId: decision.id,
+        memberId: decision.memberId,
+        ...(member?.taskId ? { taskId: member.taskId } : {}),
+        since: decision.createdAt,
+        summary: `Waiting for owner decision: ${decision.question}`,
+      });
+    }
+
+    const latestPermissionByTarget = new Map<string, { decision: NonNullable<WaitReasonsRun["permissionDecisions"]>[number]; target: TeamView["members"][number] }>();
+    for (const decision of run.permissionDecisions ?? []) {
+      if (decision.revision !== run.revision || !OPEN_PERMISSION_STATUSES.has(decision.status)) continue;
+      const target = activeMembers.find(member => member.memberId === decision.targetMemberId && !member.report);
+      if (!target) continue;
+      latestPermissionByTarget.set(target.memberId, { decision, target });
+    }
+    for (const { decision, target } of latestPermissionByTarget.values()) {
+      promptedMemberIds.add(target.memberId);
+      reasons.push({
+        kind: "provider-prompt",
+        decisionId: decision.id,
+        memberId: target.memberId,
+        ...(target.taskId ? { taskId: target.taskId } : {}),
+        summary:
+          decision.status === "escalated"
+            ? "Provider prompt escalated for owner response."
+            : decision.status === "reviewing"
+              ? "Permission coordinator is reviewing a provider prompt."
+              : "Waiting on a provider prompt.",
+      });
+    }
+    if (
+      promptedMemberIds.size === 0 &&
+      (run.reason === PROVIDER_INPUT_REASON || run.reason === PERMISSION_REVIEW_REASON || run.reason === PERMISSION_AGENT_REASON)
+    ) {
+      reasons.push({
+        kind: "provider-prompt",
+        summary: run.reason,
+      });
+    }
   }
 
   const coveredProviders = new Set<string>();
+  const activeUnreported = activeMembers.filter(member => !member.report);
   for (const limit of providerLimits) {
     if (Date.parse(limit.expiresAt) <= nowMs) continue;
-    const matched = activeMembers.find(
-      member => !member.report && (member.modelProfile?.provider ?? member.provider ?? run.provider) === limit.provider,
+    const matched = activeUnreported.find(
+      member => (member.modelProfile?.provider ?? member.provider ?? run.provider) === limit.provider,
     );
-    const relevant = limit.runId === run.id || limit.provider === run.provider || Boolean(matched) || run.blockCode === "provider-limit";
+    const hasActiveOtherProvider = activeUnreported.some(
+      member => (member.modelProfile?.provider ?? member.provider ?? run.provider) !== limit.provider,
+    );
+    const relevant = blocked
+      ? run.blockCode === "provider-limit" && (limit.runId === run.id || limit.provider === run.provider || Boolean(matched))
+      : Boolean(matched) || (!hasActiveOtherProvider && (limit.runId === run.id || limit.provider === run.provider));
     if (!relevant) continue;
     coveredProviders.add(limit.provider);
     reasons.push({
@@ -121,19 +136,21 @@ export function describeTeamWaitReasons(
       summary: `Provider ${limit.provider} limit active${limit.resetsAt ? `, resets ${limit.resetsAt}` : ""}.`,
     });
   }
-  for (const member of activeMembers) {
-    if (member.report || !member.pendingLimit) continue;
-    const provider = member.modelProfile?.provider ?? member.provider ?? run.provider;
-    if (coveredProviders.has(provider)) continue;
-    reasons.push({
-      kind: "provider-limit",
-      memberId: member.memberId,
-      ...(member.taskId ? { taskId: member.taskId } : {}),
-      summary: `${member.title} is observing a pending ${provider} limit.`,
-    });
+  if (!blocked) {
+    for (const member of activeUnreported) {
+      if (!member.pendingLimit) continue;
+      const provider = member.modelProfile?.provider ?? member.provider ?? run.provider;
+      if (coveredProviders.has(provider)) continue;
+      reasons.push({
+        kind: "provider-limit",
+        memberId: member.memberId,
+        ...(member.taskId ? { taskId: member.taskId } : {}),
+        summary: `${member.title} is observing a pending ${provider} limit.`,
+      });
+    }
   }
 
-  const stalledActive = activeMembers.filter(member => !member.report && Boolean(member.stalledAt));
+  const stalledActive = blocked ? [] : activeUnreported.filter(member => Boolean(member.stalledAt));
   for (const member of stalledActive) {
     reasons.push({
       kind: "stalled",
@@ -143,7 +160,7 @@ export function describeTeamWaitReasons(
       summary: `${member.title} stalled without substantive activity and is stopping.`,
     });
   }
-  if (stalledActive.length === 0 && run.status === "blocked" && (run.blockCode === "member-stalled" || run.reason === MEMBER_STALL_REASON)) {
+  if (stalledActive.length === 0 && blocked && (run.blockCode === "member-stalled" || run.reason === MEMBER_STALL_REASON)) {
     const lastStalled = [...run.members].reverse().find(member => member.revision === run.revision && Boolean(member.stalledAt));
     reasons.push({
       kind: "stalled",
@@ -152,34 +169,34 @@ export function describeTeamWaitReasons(
     });
   }
 
-  for (const member of activeMembers) {
-    if (member.report || member.stalledAt || !member.spinnerOnlySince) continue;
-    reasons.push({
-      kind: "spinner-only",
-      memberId: member.memberId,
-      ...(member.taskId ? { taskId: member.taskId } : {}),
-      since: member.spinnerOnlySince,
-      summary: `${member.title} is showing spinner or status redraws without substantive screen changes.`,
-    });
-  }
+  if (!blocked) {
+    for (const member of activeUnreported) {
+      if (member.stalledAt || !member.spinnerOnlySince || promptedMemberIds.has(member.memberId) || member.pendingLimit) continue;
+      reasons.push({
+        kind: "spinner-only",
+        memberId: member.memberId,
+        ...(member.taskId ? { taskId: member.taskId } : {}),
+        since: member.spinnerOnlySince,
+        summary: `${member.title} is showing spinner or status redraws without substantive screen changes.`,
+      });
+    }
 
-  for (const member of activeMembers) {
-    if (member.role !== "implementer" || member.status !== "reported" || member.report?.kind !== "result" || !member.taskId) continue;
-    const position = run.tasks.findIndex(task => task.id === member.taskId);
-    if (position <= 0) continue;
-    const preceding = run.tasks.slice(0, position).filter(task => task.status !== "integrated").map(task => task.id);
-    if (preceding.length === 0) continue;
-    reasons.push({
-      kind: "integration-order",
-      taskId: member.taskId,
-      memberId: member.memberId,
-      blockedByTaskIds: preceding,
-      ...(member.reportedAt ? { since: member.reportedAt } : {}),
-      summary: `Task ${member.taskId} reported and is waiting to integrate after ${preceding.join(", ")}.`,
-    });
-  }
+    for (const member of activeMembers) {
+      if (member.role !== "implementer" || member.status !== "reported" || member.report?.kind !== "result" || !member.taskId) continue;
+      const position = run.tasks.findIndex(task => task.id === member.taskId);
+      if (position <= 0) continue;
+      const preceding = run.tasks.slice(0, position).filter(task => task.status !== "integrated").map(task => task.id);
+      if (preceding.length === 0) continue;
+      reasons.push({
+        kind: "integration-order",
+        taskId: member.taskId,
+        memberId: member.memberId,
+        blockedByTaskIds: preceding,
+        ...(member.reportedAt ? { since: member.reportedAt } : {}),
+        summary: `Task ${member.taskId} reported and is waiting to integrate after ${preceding.join(", ")}.`,
+      });
+    }
 
-  if (run.status !== "blocked") {
     for (const task of run.tasks) {
       if ((task.revision ?? run.revision) !== run.revision || task.status !== "pending") continue;
       const blockedBy = task.dependsOn.filter(depId => run.tasks.find(item => item.id === depId)?.status !== "integrated");

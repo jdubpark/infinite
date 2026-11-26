@@ -13,6 +13,7 @@ export interface ScreenActivityEvaluation {
   spinnerOnlySince?: string;
 }
 
+const ANSI_ESCAPE_RE = /\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])/g;
 const BRAILLE_SPINNER_RE = /[\u2800-\u28ff]+/g;
 const CIRCLE_SPINNER_RE = /[◐◓◑◒◴◷◶◵]/g;
 const CLAUDE_SPINNER_RE = /(?:^|\s)[·✢✳✶✻✽](?=\s|$)/g;
@@ -30,7 +31,7 @@ const STATUS_PERCENT_RE = /\b\d+(?:\.\d+)?%/g;
 const EMPTY_PARENS_RE = /\(\s*[·•,|/\-\s]*\)/g;
 
 function normalizeLine(raw: string, provider: Provider): string {
-  let line = raw.replace(/\s+$/g, "");
+  let line = raw.replace(ANSI_ESCAPE_RE, "").replace(/\s+$/g, "");
   if (!line) return "";
   const statusLine = STATUS_CUE_RE.test(line);
   line = line

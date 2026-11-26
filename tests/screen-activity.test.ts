@@ -44,6 +44,16 @@ test("substantiveScreenFingerprint ignores Braille, circle, ASCII spinners, time
     "codex",
   );
   assert.equal(codexStatusA, codexStatusB);
+
+  const ansiA = substantiveScreenFingerprint(
+    ["\x1b]0;claude\x07\x1b[36m⠋\x1b[0m Working (12s) \x1b[90m| 1.2k tokens\x1b[0m"],
+    "claude",
+  );
+  const ansiB = substantiveScreenFingerprint(
+    ["\x1b]9;progress\x1b\\\x1b[33m⠙\x1b[0m Working (15s) \x1b[90m| 1.5k tokens\x1b[0m"],
+    "claude",
+  );
+  assert.equal(ansiA, ansiB);
 });
 
 test("substantiveScreenFingerprint changes on genuine new lines or text", () => {
@@ -169,4 +179,31 @@ test("applySignal and applyLifecycle clear spinnerOnlySince and prompt detection
   );
   assert.ok(detected);
   assert.equal(detected.kind, "permission");
+});
+
+test("WorkerScreenActivity only sets spinnerOnlySince when attention.state is working and clears it on non-working states", () => {
+  const t0 = Date.parse("2026-11-26T03:00:00.000Z");
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const tracker = new WorkerScreenActivity(3000, t0);
+
+  let working = initialAttention(iso(t0), true);
+  tracker.noteRawOutput(t0 + 100);
+  working = tracker.evaluate(working, ["⠋ Working (1s)"], "codex", false, t0 + 100).attention;
+  tracker.noteRawOutput(t0 + 1000);
+  working = tracker.evaluate(working, ["⠙ Working (2s)"], "codex", false, t0 + 1000).attention;
+  assert.equal(working.spinnerOnlySince, iso(t0 + 1000));
+
+  for (const state of ["idle", "turn-finished", "needs-you"] as const) {
+    const nonWorking: Attention =
+      state === "needs-you"
+        ? {
+            ...working,
+            state: "needs-you",
+            prompt: { id: 1, kind: "permission", title: "Approve?", options: [], acceptsText: false, source: "screen" },
+          }
+        : { ...working, state, prompt: undefined, lastTool: undefined };
+    tracker.noteRawOutput(t0 + 2000);
+    const res = tracker.evaluate(nonWorking, ["⠹ Working (3s)"], "codex", false, t0 + 2000);
+    assert.equal(res.attention.spinnerOnlySince, undefined);
+  }
 });

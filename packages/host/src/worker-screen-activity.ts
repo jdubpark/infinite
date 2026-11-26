@@ -69,7 +69,18 @@ export class WorkerScreenActivity {
         nextAttention = { ...nextAttention, lastActivityAt: at };
         changed = true;
       }
-    } else if (result.spinnerOnly && result.spinnerOnlySince !== undefined) {
+    }
+
+    if (nextAttention.state !== "working") {
+      const cleared = withoutSpinnerOnly(nextAttention);
+      if (cleared !== nextAttention) {
+        nextAttention = cleared;
+        changed = true;
+      }
+      if (this.screenState?.spinnerOnlySinceMs !== undefined) {
+        this.screenState = { ...this.screenState, spinnerOnlySinceMs: undefined };
+      }
+    } else if (!result.substantiveChange && result.spinnerOnly && result.spinnerOnlySince !== undefined) {
       if (nextAttention.spinnerOnlySince !== result.spinnerOnlySince) {
         nextAttention = { ...nextAttention, spinnerOnlySince: result.spinnerOnlySince };
         changed = true;

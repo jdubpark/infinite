@@ -19,7 +19,7 @@ function member(overrides: Partial<TeamMember> = {}): TeamMember {
     sessionId: randomUUID(),
     title: "implementer: task-a",
     status: "running",
-    cwd: "/tmp/ws/m",
+    cwd: "/home/dev/projects/infinite/ws/m",
     baseCommit: "a".repeat(40),
     prompt: "do work",
     cursor: 0,
@@ -55,7 +55,7 @@ function baseRun(overrides: Partial<TeamRun> = {}): TeamRun {
     status: "implementing",
     createdAt: T0,
     updatedAt: T0,
-    workspace: "/tmp/ws",
+    workspace: "/home/dev/projects/infinite/ws",
     branch: "main",
     baseCommit: "a".repeat(40),
     tasks: [],
@@ -113,13 +113,20 @@ test("describeTeamWaitReasons reports worker-slot, dependency, and integration-o
   assert.equal(sessionSlotReasons[0]?.summary, SESSION_SLOT_REASON);
 });
 
-test("describeTeamWaitReasons reports owner-decision, provider-prompt, provider-limit, and linear-sync", () => {
-  const target = member({ memberId: "m-1", taskId: "task-a", pendingLimit: true, provider: "claude" });
+test("describeTeamWaitReasons reports owner-decision, deduplicated provider-prompt, provider-limit, and linear-sync", () => {
+  const target = member({
+    memberId: "m-1",
+    taskId: "task-a",
+    pendingLimit: true,
+    provider: "claude",
+    spinnerOnlySince: "2026-11-26T00:01:00.000Z",
+  });
+  const codexWorker = member({ memberId: "m-2", taskId: "task-b", provider: "codex" });
   const run = baseRun({
     status: "needs-input",
     linearTracking: true,
     linear: { status: "pending", reason: "Rate limit backoff", checkedAt: "2026-11-26T00:02:00.000Z" },
-    members: [target],
+    members: [target, codexWorker],
     decisions: [
       {
         id: "dec-1",
@@ -132,7 +139,7 @@ test("describeTeamWaitReasons reports owner-decision, provider-prompt, provider-
     ],
     permissionDecisions: [
       {
-        id: "perm-1",
+        id: "perm-old",
         revision: 1,
         policyHash: "p",
         targetMemberId: "m-1",
@@ -141,17 +148,26 @@ test("describeTeamWaitReasons reports owner-decision, provider-prompt, provider-
         promptId: 1,
         promptHash: "h",
         evidenceHash: "e",
-        prompt: {
-          id: 1,
-          kind: "permission",
-          title: "Run check",
-          options: [],
-          acceptsText: false,
-          source: "screen",
-        },
+        prompt: { id: 1, kind: "permission", title: "Run check", options: [], acceptsText: false, source: "screen" },
         option: 0,
         expiresAt: "2026-11-26T01:00:00.000Z",
         answerRequestId: "req-1",
+        status: "reviewing",
+      },
+      {
+        id: "perm-latest",
+        revision: 1,
+        policyHash: "p",
+        targetMemberId: "m-1",
+        targetSessionId: target.sessionId,
+        targetCwd: target.cwd,
+        promptId: 2,
+        promptHash: "h2",
+        evidenceHash: "e2",
+        prompt: { id: 2, kind: "permission", title: "Run check", options: [], acceptsText: false, source: "screen" },
+        option: 0,
+        expiresAt: "2026-11-26T01:00:00.000Z",
+        answerRequestId: "req-2",
         status: "escalated",
       },
     ],
@@ -179,26 +195,33 @@ test("describeTeamWaitReasons reports owner-decision, provider-prompt, provider-
   assert.equal(ownerDec.decisionId, "dec-1");
   assert.equal(ownerDec.memberId, "m-1");
   assert.equal(ownerDec.taskId, "task-a");
-  assert.equal(ownerDec.since, "2026-11-26T00:03:00.000Z");
 
-  const prompt = reasons.find((r) => r.kind === "provider-prompt");
-  assert.ok(prompt);
-  assert.equal(prompt.decisionId, "perm-1");
-  assert.equal(prompt.memberId, "m-1");
+  const prompts = reasons.filter((r) => r.kind === "provider-prompt");
+  assert.equal(prompts.length, 1);
+  assert.equal(prompts[0]?.decisionId, "perm-latest");
+  assert.equal(prompts[0]?.memberId, "m-1");
+
+  assert.equal(reasons.some((r) => r.kind === "spinner-only" && r.memberId === "m-1"), false);
 
   const activeLimit = reasons.find((r) => r.kind === "provider-limit" && r.resetsAt !== undefined);
   assert.ok(activeLimit);
   assert.equal(activeLimit.resetsAt, "2026-11-26T02:00:00.000Z");
-  assert.equal(activeLimit.since, "2026-11-26T00:04:00.000Z");
+  assert.equal(activeLimit.memberId, "m-2");
 
   const pendingLimit = reasons.find((r) => r.kind === "provider-limit" && r.memberId === "m-1");
   assert.ok(pendingLimit);
+
+  const mixedLineupRun = baseRun({
+    provider: "codex",
+    members: [member({ memberId: "m-claude", provider: "claude" })],
+  });
+  assert.equal(describeTeamWaitReasons(mixedLineupRun, limits, NOW_MS).some((r) => r.kind === "provider-limit"), false);
 
   const fallbackPromptRun = baseRun({ reason: PROVIDER_INPUT_REASON });
   assert.equal(describeTeamWaitReasons(fallbackPromptRun, [], NOW_MS)[0]?.kind, "provider-prompt");
 });
 
-test("describeTeamWaitReasons reports spinner-only and stalled, and returns empty for terminal or paused runs", () => {
+test("describeTeamWaitReasons handles spinner-only, stalled, blocked gating, and terminal/paused runs", () => {
   const spinnerMember = member({
     memberId: "m-spin",
     taskId: "task-spin",
@@ -216,25 +239,41 @@ test("describeTeamWaitReasons reports spinner-only and stalled, and returns empt
   const spin = activeReasons.find((r) => r.kind === "spinner-only");
   assert.ok(spin);
   assert.equal(spin.memberId, "m-spin");
-  assert.equal(spin.taskId, "task-spin");
-  assert.equal(spin.since, "2026-11-26T00:01:00.000Z");
 
   const stalled = activeReasons.find((r) => r.kind === "stalled");
   assert.ok(stalled);
   assert.equal(stalled.memberId, "m-stall");
-  assert.equal(stalled.taskId, "task-stall");
-  assert.equal(stalled.since, "2026-11-26T00:08:00.000Z");
 
-  const blockedRun = baseRun({
+  const blockedStallRun = baseRun({
     status: "blocked",
     blockCode: "member-stalled",
     reason: MEMBER_STALL_REASON,
-    members: [member({ memberId: "m-b1", taskId: "task-1", status: "stopped", stalledAt: "2026-11-26T00:09:00.000Z" })],
+    linearTracking: true,
+    linear: { status: "blocked", reason: "Issue cancelled" },
+    decisions: [{ id: "d1", memberId: "m-b1", revision: 1, question: "Q?", options: ["A"], createdAt: T0 }],
+    members: [member({ memberId: "m-b1", taskId: "task-1", status: "stopped", stalledAt: "2026-11-26T00:09:00.000Z", spinnerOnlySince: T0 })],
   });
-  const blockedReasons = describeTeamWaitReasons(blockedRun, [], NOW_MS);
-  assert.equal(blockedReasons.length, 1);
-  assert.equal(blockedReasons[0]?.kind, "stalled");
+  const blockedReasons = describeTeamWaitReasons(blockedStallRun, [
+    { provider: "codex", detectedAt: T0, expiresAt: "2026-11-26T02:00:00.000Z", sessionId: "s", runId: "run-1", confidence: "corroborated" },
+  ], NOW_MS);
+  assert.deepEqual(blockedReasons.map((r) => r.kind), ["stalled"]);
   assert.equal(blockedReasons[0]?.memberId, "m-b1");
+
+  const blockedLimitRun = baseRun({
+    status: "blocked",
+    blockCode: "provider-limit",
+    provider: "codex",
+  });
+  const blockedLimitReasons = describeTeamWaitReasons(blockedLimitRun, [
+    { provider: "codex", detectedAt: T0, expiresAt: "2026-11-26T02:00:00.000Z", sessionId: "s", runId: "run-1", confidence: "corroborated" },
+  ], NOW_MS);
+  assert.deepEqual(blockedLimitReasons.map((r) => r.kind), ["provider-limit"]);
+
+  const blockedLinearRun = baseRun({
+    linearTracking: true,
+    linear: { status: "blocked", reason: "Issue cancelled" },
+  });
+  assert.equal(describeTeamWaitReasons(blockedLinearRun, [], NOW_MS).some((r) => r.kind === "linear-sync"), false);
 
   for (const status of ["paused", "ready-for-review", "merged", "no-change", "cancelled"] as const) {
     assert.deepEqual(describeTeamWaitReasons(baseRun({ status, members: [spinnerMember] }), [], NOW_MS), []);

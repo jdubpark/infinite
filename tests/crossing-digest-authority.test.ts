@@ -4,7 +4,7 @@ import { Buffer } from "node:buffer";
 import * as built from "../packages/host/src/crossing-digest.js";
 import type { ClaimInput, CrossingDigest, HostInput } from "../packages/host/src/crossing-digest.js";
 
-const { DIGEST_LIMIT_BYTES, OMITTED_MAX, crossingDigestSchema } = built;
+const { DIGEST_LIMIT_BYTES, OMITTED_MAX, crossingDigestSchema, storedCrossingDigestSchema } = built;
 type Outcome = CrossingDigest["outcome"];
 const LISTS = ["touched", "decisions", "failures", "forSiblings", "open"] as const;
 const OUTCOMES = ["complete", "partial", "failed", "refused"] as const;
@@ -429,5 +429,210 @@ test("text rule: text made only of expanding characters stays within every bound
       decisions: [{ what: fill, why: fill }], open: [fill], forSiblings: [{ note: fill }],
       failures: [{ signal: fill, where: fill }], touched: [{ path: "src/a.ts", op: "read", ids }],
     }));
+  }
+});
+
+function preNormalizedStored(input: string): CrossingDigest {
+  return {
+    v: 1,
+    outcome: "partial",
+    touched: [{ path: "src/a.ts", op: "read", by: "receipt", ids: [input] }],
+    decisions: [{ what: input, why: input }],
+    failures: [{ signal: input, where: input, class: "check", by: "receipt" }],
+    forSiblings: [{ note: input, paths: ["src/b.ts"] }],
+    open: [input],
+    omitted: counts(0),
+  };
+}
+
+test("stored reader: pre-normalization payloads normalize cleanly across every text field while strict schema rejects them", () => {
+  for (const [input, expected] of TEXT_CASES) {
+    const label = JSON.stringify(input);
+    const raw = preNormalizedStored(input);
+    const snapshot = structuredClone(raw);
+    const strict = crossingDigestSchema.safeParse(raw);
+    const expectedStrict = input === expected;
+    assert.equal(strict.success, expectedStrict, `strict schema mismatch for ${label}`);
+
+    const parsed = storedCrossingDigestSchema.safeParse(raw);
+    assert.equal(parsed.success, true, `stored schema rejected ${label}`);
+    const loaded = valid(parsed.data);
+    assert.deepEqual(textFields(loaded), Array.from({ length: 7 }, () => expected), `stored schema output for ${label}`);
+
+    const read = valid(built.readStoredCrossingDigest(raw));
+    assert.deepEqual(read, loaded, `readStoredCrossingDigest mismatch for ${label}`);
+    assert.deepEqual(raw, snapshot, `read mutated input for ${label}`);
+
+    const roundTripped = valid(built.readStoredCrossingDigest(JSON.parse(JSON.stringify(read))));
+    assert.deepEqual(roundTripped, read, `round-trip changed ${label}`);
+    assert.equal(JSON.stringify(roundTripped), JSON.stringify(read), `round-trip bytes changed ${label}`);
+  }
+});
+
+test("stored reader: strict schema rejects raw control/bidi/line-break/surrogate text in every individual text field", () => {
+  const empty = valid(built.emptyDigest("partial"));
+  const bad = `x${char(0x202e)}y\r\n${char(0x07)}${LONE_HIGH}z${String.fromCharCode(0xdfff)}`;
+  const expected = `x${escapeOf(0x202e)}y\n${escapeOf(0x07)}${char(0xfffd)}z${char(0xfffd)}`;
+  const fieldCases: [string, CrossingDigest, (digest: CrossingDigest) => string | undefined][] = [
+    ["touched.ids", { ...empty, touched: [{ path: "src/a.ts", op: "read", by: "claim", ids: [bad] }] }, d => d.touched[0]?.ids?.[0]],
+    ["decisions.what", { ...empty, decisions: [{ what: bad, why: "ok" }] }, d => d.decisions[0]?.what],
+    ["decisions.why", { ...empty, decisions: [{ what: "ok", why: bad }] }, d => d.decisions[0]?.why],
+    ["failures.signal", { ...empty, failures: [{ signal: bad, class: "check", by: "receipt" }] }, d => d.failures[0]?.signal],
+    ["failures.where", { ...empty, failures: [{ signal: "ok", where: bad, class: "check", by: "receipt" }] }, d => d.failures[0]?.where],
+    ["forSiblings.note", { ...empty, forSiblings: [{ note: bad }] }, d => d.forSiblings[0]?.note],
+    ["open", { ...empty, open: [bad] }, d => d.open[0]],
+  ];
+  for (const [label, raw, pickField] of fieldCases) {
+    assert.equal(crossingDigestSchema.safeParse(raw).success, false, `strict schema accepted raw ${label}`);
+    const loaded = valid(built.readStoredCrossingDigest(raw));
+    assert.equal(pickField(loaded), expected, `stored reader did not normalize ${label}`);
+    assert.equal(crossingDigestSchema.safeParse(loaded).success, true, `normalized ${label} failed strict schema`);
+  }
+});
+
+test("stored reader: legacy omitted shape, near-limit clipping, and escape-driven 2 KiB refit stay valid and idempotent", () => {
+  const legacyOmitted = {
+    v: 1,
+    outcome: "complete",
+    touched: [{ path: "src/a.ts", op: "changed", by: "receipt", ids: [`${"a".repeat(116)}${char(0x07)}`] }],
+    decisions: [{ what: `${"b".repeat(236)}${char(0x202e)}`, why: "kept\r\nreason" }],
+    failures: [],
+    forSiblings: [],
+    open: [],
+    omitted: { touched: 1, decisions: 2, failures: 0 },
+  };
+  assert.equal(crossingDigestSchema.safeParse(legacyOmitted).success, false);
+  const loadedLegacy = valid(built.readStoredCrossingDigest(legacyOmitted));
+  assert.deepEqual(loadedLegacy.omitted, { touched: 1, decisions: 2, failures: 0 });
+  assert.equal(loadedLegacy.touched[0]?.ids?.[0], "a".repeat(116));
+  assert.equal(loadedLegacy.decisions[0]?.what, "b".repeat(236));
+  assert.equal(loadedLegacy.decisions[0]?.why, "kept\nreason");
+  assert.deepEqual(built.readStoredCrossingDigest(loadedLegacy), loadedLegacy);
+
+  const expanding = char(0x7f).repeat(240);
+  const expandingId = char(0x7f).repeat(120);
+  const nearLimitRaw: CrossingDigest = {
+    v: 1,
+    outcome: "failed",
+    touched: [{ path: "src/receipt.ts", op: "changed", by: "receipt", ids: [expandingId] }],
+    decisions: [{ what: expanding, why: expanding }],
+    failures: [{ signal: expanding, where: expanding, class: "check", by: "receipt" }],
+    forSiblings: [{ note: expanding }],
+    open: [expanding],
+    omitted: counts(0),
+  };
+  assert.ok(measure(nearLimitRaw) <= DIGEST_LIMIT_BYTES, `pre-norm fixture was ${measure(nearLimitRaw)} bytes`);
+  assert.equal(crossingDigestSchema.safeParse(nearLimitRaw).success, false);
+  const refitted = valid(built.readStoredCrossingDigest(nearLimitRaw));
+  assert.ok(measure(refitted) <= DIGEST_LIMIT_BYTES);
+  assert.equal(refitted.touched.length, 1);
+  assert.equal(refitted.failures.length, 1);
+  assert.equal(refitted.open.length, 0);
+  assert.equal(refitted.omitted.open, 1);
+  const refittedAgain = valid(built.readStoredCrossingDigest(refitted));
+  assert.deepEqual(refittedAgain, refitted);
+  assert.equal(JSON.stringify(refittedAgain), JSON.stringify(refitted));
+});
+
+test("stored reader: round-trip idempotence holds across builder-produced digests", () => {
+  const minimal: CrossingDigest = {
+    ...valid(built.emptyDigest("complete")),
+    touched: [{ path: "src/a.ts", op: "read", by: "claim", ids: [] }],
+    forSiblings: [{ note: `typed ${escapeOf(0x202e)} literal`, paths: [] }],
+    omitted: { touched: 0, decisions: 0, failures: 0 },
+  };
+  assert.deepEqual(built.readStoredCrossingDigest(minimal), minimal);
+  assert.equal(JSON.stringify(built.readStoredCrossingDigest(minimal)), JSON.stringify(minimal));
+
+  for (const seed of [101, 102, 103, 104, 105]) {
+    const sequence = randomCalls(seed, 16);
+    const results: CrossingDigest[] = [];
+    for (const call of sequence) {
+      const produced = valid(apply(call, results, false));
+      results.push(produced);
+      const parsed = valid(built.readStoredCrossingDigest(JSON.parse(JSON.stringify(produced))));
+      assert.deepEqual(parsed, produced, `seed ${seed} changed already-normalized digest`);
+      assert.equal(JSON.stringify(parsed), JSON.stringify(produced), `seed ${seed} changed serialized bytes`);
+    }
+  }
+});
+
+test("stored reader: malformed, corrupt, over-bound, or unrecognized payloads fail closed", () => {
+  const base = valid(built.emptyDigest("partial"));
+  const hugeArray = Array.from({ length: 200_000 }, (_, index) => `q${index}`);
+  const cyclic: Record<string, unknown> = { ...base };
+  cyclic.open = [cyclic];
+  const oversizedRaw: CrossingDigest = {
+    v: 1,
+    outcome: "partial",
+    touched: Array.from({ length: 12 }, (_, index) => ({ path: `src/${index}/${"p".repeat(200)}.ts`, op: "changed", by: "receipt" })),
+    decisions: [],
+    failures: [],
+    forSiblings: [],
+    open: [],
+    omitted: counts(0),
+  };
+  assert.ok(measure(oversizedRaw) > DIGEST_LIMIT_BYTES);
+
+  const malformed: [string, unknown][] = [
+    ["null", null],
+    ["undefined", undefined],
+    ["number", 42],
+    ["string", "partial"],
+    ["boolean", true],
+    ["array", [base]],
+    ["empty object", {}],
+    ["outcome only (accepted by fitDigest, must fail closed here)", { outcome: "partial" }],
+    ["missing v", (({ v: _v, ...rest }) => rest)(base)],
+    ["v: 0", { ...base, v: 0 }],
+    ["v: 2", { ...base, v: 2 }],
+    ["v: '1'", { ...base, v: "1" }],
+    ["unknown root field", { ...base, extra: "nope" }],
+    ["unknown touched field", { ...base, touched: [{ path: "src/a.ts", op: "read", by: "receipt", extra: 1 }] }],
+    ["unknown decision field", { ...base, decisions: [{ what: "w", why: "y", extra: 1 }] }],
+    ["unknown failure field", { ...base, failures: [{ signal: "s", class: "check", by: "receipt", extra: 1 }] }],
+    ["unknown sibling field", { ...base, forSiblings: [{ note: "n", extra: 1 }] }],
+    ["unknown omitted field", { ...base, omitted: { ...base.omitted, extra: 1 } }],
+    ["own __proto__ key", JSON.parse(`${JSON.stringify(base).slice(0, -1)},"__proto__":{"evil":true}}`)],
+    ["inherited properties via Object.create", Object.create(base)],
+    ["Date instance", new Date()],
+    ["Map instance", new Map()],
+    ["invalid outcome", { ...base, outcome: "winning" }],
+    ["invalid op", { ...base, touched: [{ path: "src/a.ts", op: "renamed", by: "receipt" }] }],
+    ["invalid by", { ...base, touched: [{ path: "src/a.ts", op: "read", by: "host" }] }],
+    ["mismatched failure class/by (host class as claim)", { ...base, failures: [{ signal: "s", class: "check", by: "claim" }] }],
+    ["mismatched failure class/by (claim class as receipt)", { ...base, failures: [{ signal: "s", class: "claim", by: "receipt" }] }],
+    ["path with leading slash", { ...base, touched: [{ path: "/abs.ts", op: "read", by: "receipt" }] }],
+    ["path with ..", { ...base, touched: [{ path: "a/../b.ts", op: "read", by: "receipt" }] }],
+    ["path with control char", { ...base, touched: [{ path: `a${char(0x07)}b.ts`, op: "read", by: "receipt" }] }],
+    ["path with bidi char", { ...base, touched: [{ path: `a${char(0x202e)}b.ts`, op: "read", by: "receipt" }] }],
+    ["sibling path with control char", { ...base, forSiblings: [{ note: "n", paths: [`a${char(0x85)}b.ts`] }] }],
+    ["non-string open entry", { ...base, open: [123] }],
+    ["non-string decision what", { ...base, decisions: [{ what: null, why: "y" }] }],
+    ["non-string failure signal", { ...base, failures: [{ signal: ["x"], class: "check", by: "receipt" }] }],
+    ["non-string id", { ...base, touched: [{ path: "src/a.ts", op: "read", by: "claim", ids: [7] }] }],
+    ["oversized text field (241 bytes)", { ...base, open: ["a".repeat(241)] }],
+    ["oversized id field (121 bytes)", { ...base, touched: [{ path: "src/a.ts", op: "read", by: "claim", ids: ["a".repeat(121)] }] }],
+    ["touched over cap", { ...base, touched: Array.from({ length: 25 }, (_, index) => ({ path: `f${index}`, op: "read", by: "receipt" })) }],
+    ["decisions over cap", { ...base, decisions: Array.from({ length: 7 }, (_, index) => ({ what: `w${index}`, why: "y" })) }],
+    ["failures over cap", { ...base, failures: Array.from({ length: 7 }, (_, index) => ({ signal: `s${index}`, class: "check", by: "receipt" })) }],
+    ["forSiblings over cap", { ...base, forSiblings: Array.from({ length: 5 }, (_, index) => ({ note: `n${index}` })) }],
+    ["open over cap", { ...base, open: ["1", "2", "3", "4", "5"] }],
+    ["ids over cap", { ...base, touched: [{ path: "src/a.ts", op: "read", by: "claim", ids: ["1", "2", "3", "4", "5", "6", "7", "8", "9"] }] }],
+    ["sibling paths over cap", { ...base, forSiblings: [{ note: "n", paths: ["1", "2", "3", "4", "5", "6", "7", "8", "9"] }] }],
+    ["huge array", { ...base, open: hugeArray }],
+    ["cyclic object", cyclic],
+    ["missing required omitted counter", { ...base, omitted: { touched: 0, decisions: 0 } }],
+    ["negative counter", { ...base, omitted: { touched: -1, decisions: 0, failures: 0 } }],
+    ["fractional counter", { ...base, omitted: { touched: 1.5, decisions: 0, failures: 0 } }],
+    ["NaN counter", { ...base, omitted: { touched: Number.NaN, decisions: 0, failures: 0 } }],
+    ["over-max counter", { ...base, omitted: { touched: OMITTED_MAX + 1, decisions: 0, failures: 0 } }],
+    ["string counter", { ...base, omitted: { touched: "0", decisions: 0, failures: 0 } }],
+    ["oversized raw payload (> 2 KiB)", oversizedRaw],
+  ];
+
+  for (const [label, payload] of malformed) {
+    assert.equal(storedCrossingDigestSchema.safeParse(payload).success, false, `stored schema accepted ${label}`);
+    assert.equal(built.readStoredCrossingDigest(payload), undefined, `readStoredCrossingDigest accepted ${label}`);
   }
 });

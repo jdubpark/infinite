@@ -35,42 +35,124 @@ export const boundedText = (max: number) => z.string().refine(
   value => bytes(value) <= max && !LONE_SURROGATE.test(value) && !UNSAFE_TEXT.test(value),
   `Use at most ${max} well-formed UTF-8 bytes in the normal form of the text rule`,
 );
+const rawBoundedText = (max: number) => z.string().refine(
+  value => bytes(value) <= max,
+  `Use at most ${max} UTF-8 bytes`,
+);
 const text = boundedText(TEXT_BYTES);
 const shortText = boundedText(SHORT_BYTES);
 const repoPath = z.string().refine(isRepoPath, "Use a repository path of 1 to 300 UTF-8 bytes without control, separator or direction characters, lone surrogates, a leading slash or a .. segment");
 const authority = z.enum(AUTHORITIES);
 const counter = z.number().int().min(0).max(OMITTED_MAX);
+const MAX_PLAIN_DEPTH = 4;
+const MAX_PLAIN_ARRAY = 64;
+const MAX_PLAIN_KEYS = 32;
 
-export const crossingDigestSchema = z.object({
-  v: z.literal(1),
-  outcome: z.enum(OUTCOMES),
-  touched: z.array(z.object({
-    path: repoPath,
-    ids: z.array(shortText).max(ID_LIMIT).optional(),
-    op: z.enum(OPS),
-    by: authority,
-  }).strict()).max(CAPS.touched),
-  decisions: z.array(z.object({ what: text, why: text }).strict()).max(CAPS.decisions),
-  failures: z.array(z.object({
-    signal: text,
-    where: text.optional(),
-    class: z.enum(CLASSES),
-    by: authority,
-  }).strict().refine(row => (row.class === "claim") === (row.by === "claim"), "A failure is a claim exactly when its class is claim")).max(CAPS.failures),
-  forSiblings: z.array(z.object({
-    note: text,
-    paths: z.array(repoPath).max(SIBLING_PATH_LIMIT).optional(),
-  }).strict()).max(CAPS.forSiblings),
-  open: z.array(text).max(CAPS.open),
-  omitted: z.object({
-    touched: counter,
-    decisions: counter,
-    failures: counter,
-    forSiblings: counter.optional(),
-    open: counter.optional(),
-  }).strict(),
-}).strict();
+function digestObjectSchema<T extends z.ZodType<string>, S extends z.ZodType<string>>(
+  textField: T,
+  shortTextField: S,
+) {
+  return z.object({
+    v: z.literal(1),
+    outcome: z.enum(OUTCOMES),
+    touched: z.array(z.object({
+      path: repoPath,
+      ids: z.array(shortTextField).max(ID_LIMIT).optional(),
+      op: z.enum(OPS),
+      by: authority,
+    }).strict()).max(CAPS.touched),
+    decisions: z.array(z.object({ what: textField, why: textField }).strict()).max(CAPS.decisions),
+    failures: z.array(z.object({
+      signal: textField,
+      where: textField.optional(),
+      class: z.enum(CLASSES),
+      by: authority,
+    }).strict().refine(row => (row.class === "claim") === (row.by === "claim"), "A failure is a claim exactly when its class is claim")).max(CAPS.failures),
+    forSiblings: z.array(z.object({
+      note: textField,
+      paths: z.array(repoPath).max(SIBLING_PATH_LIMIT).optional(),
+    }).strict()).max(CAPS.forSiblings),
+    open: z.array(textField).max(CAPS.open),
+    omitted: z.object({
+      touched: counter,
+      decisions: counter,
+      failures: counter,
+      forSiblings: counter.optional(),
+      open: counter.optional(),
+    }).strict(),
+  }).strict();
+}
+
+export const crossingDigestSchema = digestObjectSchema(text, shortText);
 export type CrossingDigest = z.infer<typeof crossingDigestSchema>;
+
+function isPlainTree(value: unknown, depth = 0): boolean {
+  if (value === null || typeof value !== "object") return true;
+  if (depth > MAX_PLAIN_DEPTH) return false;
+  if (Array.isArray(value)) {
+    return value.length <= MAX_PLAIN_ARRAY && value.every(item => isPlainTree(item, depth + 1));
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return false;
+  if (Object.hasOwn(value, "__proto__")) return false;
+  const keys = Object.keys(value);
+  if (keys.length > MAX_PLAIN_KEYS) return false;
+  return keys.every(key => isPlainTree((value as Row)[key], depth + 1));
+}
+
+function normalizeDigestText(digest: CrossingDigest): CrossingDigest {
+  return {
+    v: digest.v,
+    outcome: digest.outcome,
+    touched: digest.touched.map(row => ({
+      path: row.path,
+      op: row.op,
+      by: row.by,
+      ...(row.ids === undefined ? {} : { ids: row.ids.map(id => cleanText(id, SHORT_BYTES)) }),
+    })),
+    decisions: digest.decisions.map(row => ({
+      what: cleanText(row.what),
+      why: cleanText(row.why),
+    })),
+    failures: digest.failures.map(row => ({
+      signal: cleanText(row.signal),
+      ...(row.where === undefined ? {} : { where: cleanText(row.where) }),
+      class: row.class,
+      by: row.by,
+    })),
+    forSiblings: digest.forSiblings.map(row => ({
+      note: cleanText(row.note),
+      ...(row.paths === undefined ? {} : { paths: [...row.paths] }),
+    })),
+    open: digest.open.map(item => cleanText(item)),
+    omitted: {
+      touched: digest.omitted.touched,
+      decisions: digest.omitted.decisions,
+      failures: digest.omitted.failures,
+      ...(digest.omitted.forSiblings === undefined ? {} : { forSiblings: digest.omitted.forSiblings }),
+      ...(digest.omitted.open === undefined ? {} : { open: digest.omitted.open }),
+    },
+  };
+}
+
+function normalizeStoredDigest(digest: CrossingDigest): CrossingDigest {
+  const normalized = normalizeDigestText(digest);
+  const bounded = digestBytes(normalized) <= DIGEST_LIMIT_BYTES
+    ? normalized
+    : combine(normalized.outcome, [normalized]);
+  return checked("storedCrossingDigestSchema", bounded);
+}
+
+export const storedCrossingDigestSchema = z.unknown()
+  .refine(value => isPlainTree(value), "Use a plain crossing digest object")
+  .pipe(digestObjectSchema(rawBoundedText(TEXT_BYTES), rawBoundedText(SHORT_BYTES)))
+  .refine(digest => digestBytes(digest) <= DIGEST_LIMIT_BYTES, `Use at most ${DIGEST_LIMIT_BYTES} bytes as JSON`)
+  .transform(normalizeStoredDigest);
+
+export function readStoredCrossingDigest(value: unknown): CrossingDigest | undefined {
+  const parsed = storedCrossingDigestSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
 type Touched = CrossingDigest["touched"][number];
 type Failure = CrossingDigest["failures"][number];
 type Decision = CrossingDigest["decisions"][number];

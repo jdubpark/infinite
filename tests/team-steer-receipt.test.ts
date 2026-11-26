@@ -69,11 +69,12 @@ async function stopInFence(f: Fixture, act: (teams: TeamService) => Promise<Team
     },
   });
   const first = f.openTeam();
-  type Deliver = { deliverApprovedDecision(stored: Saved, decision: TeamPermissionDecision): Promise<void> };
-  const host = first as unknown as Deliver & { record(id: string): Saved; permissions?: Deliver };
-  const delivery = host.permissions ?? host;
+  const host = first as unknown as {
+    record(id: string): Saved;
+    permissions: { deliverApprovedDecision(stored: Saved, decision: TeamPermissionDecision): Promise<void> };
+  };
   const stored = host.record(f.run.id);
-  await delivery.deliverApprovedDecision(stored, stored.run.permissionDecisions![0]!);
+  await host.permissions.deliverApprovedDecision(stored, stored.run.permissionDecisions![0]!);
   await answering;
   void act(first);
   await fencing;

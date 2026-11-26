@@ -4,6 +4,7 @@ import { chmod, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { replyDeadline } from "./deadline.js";
 
 const run = promisify(execFile);
 const BARRIER_TIMEOUT_MS = 15000;
@@ -79,7 +80,7 @@ export async function createWorkspaceWatch(roots: string[], cacheDir: string, op
   }
   function awaitReply(id: number): Promise<WorkspaceWatchRevision> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => fail("Workspace watch barrier timed out"), BARRIER_TIMEOUT_MS);
+      const timer = replyDeadline(BARRIER_TIMEOUT_MS, () => { if (pending.has(id)) fail("Workspace watch barrier timed out"); });
       pending.set(id, { resolve, reject, timer });
     });
   }

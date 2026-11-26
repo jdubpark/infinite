@@ -1,7 +1,7 @@
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readdir, readFile, readlink, realpath, stat } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { sudoShape } from "./sudo-profile.js";
 import type { TeamCommand } from "./team-types.js";
@@ -497,7 +497,8 @@ function problemText(error: unknown): string {
 }
 
 const entry = process.argv[1] ? resolve(process.argv[1]) : undefined;
-if (entry && existsSync(entry) && realpathSync(entry) === fileURLToPath(import.meta.url)) void runCommandLine();
+const self = fileURLToPath(import.meta.url);
+if (/^process-census\.(?:js|ts)$/.test(basename(self)) && entry && existsSync(entry) && existsSync(self) && realpathSync(entry) === realpathSync(self)) void runCommandLine();
 
 async function runCommandLine(): Promise<void> {
   if (process.argv.length !== 2) {

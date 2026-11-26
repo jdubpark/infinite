@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { accountOf, periodStart, priceUsage, sumUsage, type UsageRecord } from "../packages/host/src/usage.js";
+import { accountOf, listPriceUsage, periodStart, priceUsage, sumUsage, type UsageRecord } from "../packages/host/src/usage.js";
 import type { UsageConfig } from "../packages/host/src/config.js";
 
 const base: UsageRecord = {
@@ -70,4 +70,34 @@ test("configured price beats the built-in catalog and accounts match globs", () 
   assert.deepEqual(priceUsage({ ...base, tokens: { ...base.tokens, input: 1_000_000 } }, { "deepseek/deepseek-flash": { input: 3, output: 2 } }), { cost: 3, pricing: "configured" });
   assert.equal(accountOf("deepseek", "deepseek-flash", { deepseek: { kind: "metered", match: ["deepseek/*"] } }), "deepseek");
   assert.equal(accountOf("meta", "muse-spark", { deepseek: { kind: "metered", match: ["deepseek/*"] } }), "meta");
+});
+
+test("Codex records with positive cacheWrite stay unpriced while zero cacheWrite and Claude price normally", () => {
+  const prices: UsageConfig["prices"] = {
+    "openai/gpt-5.4": { input: 2, output: 8, cacheRead: 0.2, cacheWrite: 2 },
+    "anthropic/claude-sonnet": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+  };
+  const codexBase: UsageRecord = {
+    ...base,
+    provider: "codex",
+    providerId: "openai",
+    modelId: "gpt-5.4",
+    tokens: { input: 100_000, output: 50_000, reasoning: 0, cacheRead: 10_000, cacheWrite: 5_000 },
+    reportedCost: 0,
+  };
+  assert.deepEqual(listPriceUsage(codexBase, prices), { cost: 0, pricing: "unknown" });
+  assert.deepEqual(priceUsage(codexBase, prices), { cost: 0, pricing: "unknown" });
+  assert.deepEqual(
+    listPriceUsage({ ...codexBase, tokens: { ...codexBase.tokens, cacheWrite: 0 } }, prices),
+    { cost: 0.602, pricing: "configured" },
+  );
+  const claudeRecord: UsageRecord = {
+    ...base,
+    provider: "claude",
+    providerId: "anthropic",
+    modelId: "claude-sonnet",
+    tokens: { input: 100_000, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 100_000 },
+    reportedCost: 0,
+  };
+  assert.deepEqual(listPriceUsage(claudeRecord, prices), { cost: 0.675, pricing: "configured" });
 });

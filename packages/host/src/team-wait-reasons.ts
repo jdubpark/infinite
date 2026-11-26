@@ -1,5 +1,6 @@
 import type { ProviderLimit } from "./provider-limits.js";
-import { MEMBER_STALL_REASON } from "./stall-recovery.js";
+import { MEMBER_STALL_REASON, type LivePromptRef } from "./stall-recovery.js";
+import { isDeferredWorkerMember, PROVIDER_LIMIT_HOLD_PREFIX } from "./team-diagnostics.js";
 import { ACTIVE_MEMBER_STATUSES, type TeamPermissionDecision, type TeamRun, type TeamView, type TeamWaitReason, type TeamWaitReasonKind } from "./team-types.js";
 
 export const MAX_WAIT_REASON_SUMMARY = 240;
@@ -57,15 +58,22 @@ export type WaitReasonsRun = Pick<
   | "blockCode"
 > & {
   members: readonly TeamView["members"][number][];
-  permissionDecisions?: readonly Pick<TeamPermissionDecision, "id" | "revision" | "targetMemberId" | "status">[];
+  permissionDecisions?: readonly Pick<
+    TeamPermissionDecision,
+    "id" | "revision" | "targetMemberId" | "targetSessionId" | "promptId" | "promptHash" | "status" | "promptClosedAt"
+  >[];
 };
 
+export interface DescribeTeamWaitReasonsOptions {
+  livePrompts?: ReadonlyMap<string, LivePromptRef | null>;
+}
+
 function holdsSlot(member: TeamView["members"][number], revision: number): boolean {
-  const deferred = member.status === "queued" && (member.pendingLimit === true || member.pendingCapacity === true);
   return (
     member.revision === revision &&
     (member.role === "scout" || member.role === "implementer") &&
-    ((!deferred && ["queued", "running", "unavailable"].includes(member.status)) || (member.status === "reported" && !member.exitConfirmedAt))
+    ((!isDeferredWorkerMember(member) && ["queued", "running", "unavailable"].includes(member.status)) ||
+      (member.status === "reported" && !member.exitConfirmedAt))
   );
 }
 
@@ -73,6 +81,7 @@ export function describeTeamWaitReasons(
   run: WaitReasonsRun,
   providerLimits: readonly ProviderLimit[],
   nowMs = Date.now(),
+  options?: DescribeTeamWaitReasonsOptions,
 ): TeamWaitReason[] {
   if (TERMINAL_STATUSES.has(run.status) || run.status === "paused") return [];
 
@@ -81,6 +90,7 @@ export function describeTeamWaitReasons(
     member => member.revision === run.revision && ACTIVE_MEMBER_STATUSES.includes(member.status),
   );
   const blocked = run.status === "blocked";
+  const livePrompts = options?.livePrompts;
 
   if (!blocked && run.linearTracking) {
     if (run.linear && run.linear.status !== "synced" && run.linear.status !== "blocked") {
@@ -115,8 +125,15 @@ export function describeTeamWaitReasons(
     const latestPermissionByTarget = new Map<string, { decision: NonNullable<WaitReasonsRun["permissionDecisions"]>[number]; target: TeamView["members"][number] }>();
     for (const decision of run.permissionDecisions ?? []) {
       if (decision.revision !== run.revision || !OPEN_PERMISSION_STATUSES.has(decision.status)) continue;
-      const target = activeMembers.find(member => member.memberId === decision.targetMemberId && !member.report);
+      if (decision.status !== "uncertain" && decision.promptClosedAt !== undefined) continue;
+      const target = activeMembers.find(
+        member => member.memberId === decision.targetMemberId && member.sessionId === decision.targetSessionId && !member.report,
+      );
       if (!target) continue;
+      if (decision.status !== "uncertain" && livePrompts?.has(target.sessionId)) {
+        const live = livePrompts.get(target.sessionId);
+        if (!live || live.id !== decision.promptId || (live.hash !== undefined && live.hash !== decision.promptHash)) continue;
+      }
       latestPermissionByTarget.set(target.memberId, { decision, target });
     }
     for (const { decision, target } of latestPermissionByTarget.values()) {
@@ -145,40 +162,65 @@ export function describeTeamWaitReasons(
     }
   }
 
-  const coveredProviders = new Set<string>();
+  const activeLimits = providerLimits.filter(limit => Date.parse(limit.expiresAt) > nowMs);
   const activeUnreported = activeMembers.filter(member => !member.report);
-  for (const limit of providerLimits) {
-    if (Date.parse(limit.expiresAt) <= nowMs) continue;
-    const matched = activeUnreported.find(
-      member => (member.modelProfile?.provider ?? member.provider ?? run.provider) === limit.provider,
-    );
-    const hasActiveOtherProvider = activeUnreported.some(
-      member => (member.modelProfile?.provider ?? member.provider ?? run.provider) !== limit.provider,
-    );
-    const relevant = blocked
-      ? run.blockCode === "provider-limit" && (limit.runId === run.id || limit.provider === run.provider || Boolean(matched))
-      : Boolean(matched) || (!hasActiveOtherProvider && (limit.runId === run.id || limit.provider === run.provider));
-    if (!relevant) continue;
-    coveredProviders.add(limit.provider);
-    reasons.push({
-      kind: "provider-limit",
-      ...(matched ? { memberId: matched.memberId, ...(matched.taskId ? { taskId: matched.taskId } : {}) } : {}),
-      since: limit.detectedAt,
-      ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}),
-      summary: `Provider ${limit.provider} limit active${limit.resetsAt ? `, resets ${limit.resetsAt}` : ""}.`,
-    });
-  }
-  if (!blocked) {
+  if (blocked) {
+    if (run.blockCode === "provider-limit") {
+      for (const limit of activeLimits) {
+        const matched = run.members.find(
+          member =>
+            member.revision === run.revision &&
+            (member.sessionId === limit.sessionId ||
+              (member.pendingLimit === true && (member.modelProfile?.provider ?? member.provider ?? run.provider) === limit.provider)),
+        );
+        const relevant = limit.runId === run.id || limit.provider === run.provider || Boolean(matched);
+        if (!relevant) continue;
+        reasons.push({
+          kind: "provider-limit",
+          ...(matched ? { memberId: matched.memberId, ...(matched.taskId ? { taskId: matched.taskId } : {}) } : {}),
+          since: limit.detectedAt,
+          ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}),
+          summary: `Provider ${limit.provider} limit active${limit.resetsAt ? `, resets ${limit.resetsAt}` : ""}.`,
+        });
+      }
+    }
+  } else {
+    let emittedLimit = false;
     for (const member of activeUnreported) {
-      if (!member.pendingLimit) continue;
       const provider = member.modelProfile?.provider ?? member.provider ?? run.provider;
-      if (coveredProviders.has(provider)) continue;
-      reasons.push({
-        kind: "provider-limit",
-        memberId: member.memberId,
-        ...(member.taskId ? { taskId: member.taskId } : {}),
-        summary: `${member.title} is observing a pending ${provider} limit.`,
-      });
+      const observedLimit = activeLimits.find(limit => limit.sessionId === member.sessionId);
+      if (!member.pendingLimit && !observedLimit) continue;
+      emittedLimit = true;
+      const matchedLimit = observedLimit ?? activeLimits.find(limit => limit.provider === provider);
+      if (matchedLimit) {
+        reasons.push({
+          kind: "provider-limit",
+          memberId: member.memberId,
+          ...(member.taskId ? { taskId: member.taskId } : {}),
+          since: matchedLimit.detectedAt,
+          ...(matchedLimit.resetsAt ? { resetsAt: matchedLimit.resetsAt } : {}),
+          summary: `Provider ${matchedLimit.provider} limit active${matchedLimit.resetsAt ? `, resets ${matchedLimit.resetsAt}` : ""}.`,
+        });
+      } else {
+        reasons.push({
+          kind: "provider-limit",
+          memberId: member.memberId,
+          ...(member.taskId ? { taskId: member.taskId } : {}),
+          summary: `${member.title} is observing a pending ${provider} limit.`,
+        });
+      }
+    }
+    if (!emittedLimit && activeUnreported.length === 0) {
+      const limitHeld = Boolean(run.reason?.startsWith(PROVIDER_LIMIT_HOLD_PREFIX));
+      for (const limit of activeLimits) {
+        if (limit.runId !== run.id && !(limitHeld && limit.provider === run.provider)) continue;
+        reasons.push({
+          kind: "provider-limit",
+          since: limit.detectedAt,
+          ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}),
+          summary: `Provider ${limit.provider} limit active${limit.resetsAt ? `, resets ${limit.resetsAt}` : ""}.`,
+        });
+      }
     }
   }
 
@@ -253,12 +295,7 @@ export function describeTeamWaitReasons(
       });
     }
     if (run.discovery && !run.discovery.completedAt && run.discovery.revision === run.revision) {
-      const scoutSlots = run.members.filter(
-        member =>
-          member.revision === run.revision &&
-          member.role === "scout" &&
-          (["queued", "running", "unavailable"].includes(member.status) || (member.status === "reported" && !member.exitConfirmedAt)),
-      ).length;
+      const scoutSlots = run.members.filter(member => member.role === "scout" && holdsSlot(member, run.revision)).length;
       if (scoutSlots >= run.parallelism) {
         for (const scout of run.discovery.tasks) {
           if (scout.status !== "pending") continue;

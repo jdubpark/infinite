@@ -1,12 +1,13 @@
 import { rowUse } from "./outcome-cells.js";
-import type { Beta, LevelName, LevelRecord, ProfilePosterior, RoutingEvidenceRow } from "./routing-types.js";
+import type { Beta, LevelName, LevelRecord, ProfilePosterior, RoutingEvidenceRow, RoutingPoint } from "./routing-types.js";
 
-export const HALF_LIFE_DAYS = 30, MAX_AGE_DAYS = 180, LEVEL_STRENGTH = 20, EARLIER_MASS = 10;
+export const HALF_LIFE_DAYS = 30, MAX_AGE_DAYS = 180, LEVEL_STRENGTH = 20, EARLIER_MASS = 10, MIN_COST_ROWS = 5;
 export const CHOSEN_WEIGHT = 0.5;
 
-export type RoutingTarget = { projectRef: string; areaRef: string; kind: string | null; featureVersion: number; featureMapRef: string; point: "start" | "escalation" };
+export type RoutingTarget = { projectRef: string; areaRef: string; kind: string | null; featureVersion: number; featureMapRef: string; point: RoutingPoint };
 export type CurrentConfig = { epoch: number; promptVersion: string };
 export type Observation = { reward?: { r: number; w: number }; rescue?: { x: 0 | 1; w: number } };
+export type ObservedCost = { listUsd: number | null; level: LevelName | "none"; rows: number };
 
 const DAY_MILLISECONDS = 86_400_000;
 const LEVELS: readonly LevelName[] = ["tenant", "project", "cell"];
@@ -150,6 +151,50 @@ export function posterior(
     level,
     untimed,
   };
+}
+
+export function observedCost(
+  rows: readonly RoutingEvidenceRow[],
+  target: RoutingTarget,
+  currentEpoch: number,
+  now: string,
+): ObservedCost {
+  const buckets: Record<LevelName, { weightedSum: number; weight: number; rows: number }> = {
+    cell: { weightedSum: 0, weight: 0, rows: 0 },
+    project: { weightedSum: 0, weight: 0, rows: 0 },
+    tenant: { weightedSum: 0, weight: 0, rows: 0 },
+  };
+  const ordered = rows
+    .filter(row => (row.source === "production" || row.source === "duel") && row.point === target.point
+      && row.profileEpoch === currentEpoch && row.endedAt !== null && row.listUsd !== null
+      && Number.isFinite(row.listUsd) && row.listUsd >= 0)
+    .sort((left, right) => (left.outcomeId < right.outcomeId ? -1 : left.outcomeId > right.outcomeId ? 1 : 0));
+  for (const row of ordered) {
+    if (rowUse(row, "decision").kind !== "counted") continue;
+    const age = ageDays(row.endedAt!, now);
+    if (!Number.isFinite(age) || age > MAX_AGE_DAYS) continue;
+    const weight = 0.5 ** (age / HALF_LIFE_DAYS);
+    const level = levelOf(row, target);
+    const scopes: readonly LevelName[] = level === "cell" ? ["cell", "project", "tenant"]
+      : level === "project" ? ["project", "tenant"]
+      : ["tenant"];
+    for (const scope of scopes) {
+      buckets[scope].weightedSum += weight * row.listUsd!;
+      buckets[scope].weight += weight;
+      buckets[scope].rows++;
+    }
+  }
+  for (const level of ["cell", "project", "tenant"] as const) {
+    const bucket = buckets[level];
+    if (bucket.rows >= MIN_COST_ROWS && bucket.weight > 0) {
+      return {
+        listUsd: Math.round((bucket.weightedSum / bucket.weight) * 1_000_000) / 1_000_000,
+        level,
+        rows: bucket.rows,
+      };
+    }
+  }
+  return { listUsd: null, level: "none", rows: buckets.tenant.rows };
 }
 
 export function betaMean(beta: Beta): number {

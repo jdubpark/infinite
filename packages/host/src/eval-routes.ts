@@ -32,6 +32,9 @@ const MESSAGES: Record<EvalRefusal["code"], string> = {
   "report-not-ready": "The job has no report yet.",
   "report-unreadable": "The job's record cannot be read, so it has no report.",
   "no-report": "Only compare and confirm jobs have reports.",
+  "provider-budget-exceeded": "The configured provider budget has been exhausted.",
+  "provider-budget-unmeasurable": "Provider spend cannot be measured to verify the configured budget.",
+  "spend-fuse-open": "The spend fuse is open and blocks new eval trials.",
 };
 
 export function evalRoutes(

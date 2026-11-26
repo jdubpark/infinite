@@ -5,7 +5,7 @@ import { writeSealed, unseal } from "./vault.js";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { autonomyStartEvent, startMode } from "./evaluator-profiles.js";
 import { TeamService, TeamError } from "./teams.js";
-import { HALT_CENSUS_MS } from "./team-command-fence.js";
+import { deliverControl, holdForStoppedCommand, supersedeWaiting } from "./goal-waiting-control.js";
 import { goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalParallelismSchema, goalSteerSchema, parseCreateGoal, type CreateGoal, type CycleClass, type GoalCycle, type GoalOutcomeInput, type GoalReasonCode, type ProductGoal } from "./goal-types.js";
 import { SHARED_INPUT_LIMITS } from "./schema-primitives.js";
 import type { Config } from "./types.js";
@@ -26,6 +26,7 @@ import { answerProvisional, applyLateVerdict, assertVerdictAnswer, continueGoal,
 import { correctionSchema, type CriterionInput } from "./objective-input.js";
 import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
 import { goalMetricsRead, pruneMetrics, settleMetrics } from "./goal-metrics.js";
+import { cancelReleasedGoalRun } from "./goal-released-run.js";
 
 type Action = { requestId: string; revision: number };
 type PendingControl = { action: "pause" | "resume" | "cancel" | "steer" | "parallelism"; requestId: string; teamId: string; revision: number; text?: string; parallelism?: number; halt?: HaltRunMark; waiting?: true };
@@ -160,10 +161,7 @@ export class GoalService {
     this.save(stored);
   }
   statuses() { return [...this.records.values()].map(({ goal }) => ({ id: goal.id, title: goal.title, status: goal.status, reason: goal.reason })); }
-  ownsActiveTeam(teamId: string) {
-    return [...this.records.values()].some(({ goal }) =>
-      !terminal.has(goal.status) && goal.activeTeamId === teamId);
-  }
+  ownsActiveTeam(teamId: string) { return [...this.records.values()].some(({ goal }) => !terminal.has(goal.status) && goal.activeTeamId === teamId); }
   retainsTeamRun(teamId: string) {
     return [...this.records.values()].some(({ goal, launch }) => !terminal.has(goal.status) && (goal.standing
       ? goal.activeTeamId === teamId || launch?.request.requestId === teamId || latestReviewed(goal.cycles)?.teamId === teamId
@@ -294,6 +292,8 @@ export class GoalService {
   pause(id: string, input: Action) { return this.action(id, "pause", goalActionSchema.parse(input)); }
   resume(id: string, input: Action) { return this.action(id, "resume", goalActionSchema.parse(input)); }
   cancel(id: string, input: Action) { return this.action(id, "cancel", goalActionSchema.parse(input)); }
+  cancelReleasedRun(teamId: string, body: Action) { return cancelReleasedGoalRun({ records: this.records, terminal, teams: this.teams,
+    enqueue: (id, task) => this.enqueue(id, task), refresh: (stored, team) => this.refresh(stored, team), event: (stored, text) => this.event(stored, text), save: stored => this.save(stored) }, teamId, body); }
   private action(id: string, action: "pause" | "resume" | "cancel", body: Action) {
     return this.enqueue(id, () => {
       const stored = this.record(id), goal = stored.goal;
@@ -303,7 +303,7 @@ export class GoalService {
       if (action === "resume" && goal.standing && autonomyOf(this.config.projects.find(value => value.id === goal.projectId)) !== "autonomous")
         throw new TeamError(409, "standing-requires-autonomy", "This standing goal can resume only after its project is autonomous again.");
       if (action === "resume" && !goal.standing && Date.now() >= Date.parse(goal.deadlineAt)) throw new TeamError(409, "goal-deadline", "This goal's time limit has expired. Extend it or start a new goal to approve more time.");
-      if (action !== "resume" && body.revision === goal.revision) this.supersedeWaiting(stored, `The owner's ${action}`);
+      if (action !== "resume" && body.revision === goal.revision) supersedeWaiting(stored, `The owner's ${action}`, { event: text => this.event(stored, text) });
       this.admit(stored, action, body);
       goal.status = action === "pause" ? "paused" : action === "cancel" ? "cancelled" : "running";
       if (goal.standing) {
@@ -326,7 +326,7 @@ export class GoalService {
       try {
         if (stored.control?.action === "steer" && !await this.applyControl(stored) && !stored.control?.waiting) throw new TeamError(409, "goal-control-pending", "The previous goal action is still being applied.");
         if (!pausable(goal)) return undefined;
-        this.supersedeWaiting(stored, "The halt");
+        supersedeWaiting(stored, "The halt", { event: text => this.event(stored, text) });
         goal.revision++; goal.status = "paused"; goal.reason = mark.reason;
         const token = randomUUID();
         this.setControl(stored, "pause", { halt: { token, reason: mark.reason } });
@@ -604,19 +604,12 @@ export class GoalService {
     }
     const body = { requestId: control.requestId, revision: control.revision };
     try {
-      if (control.action === "steer") await this.teams.steer(control.teamId, { ...body, text: control.text! }, undefined, HALT_CENSUS_MS);
-      else if (control.action === "pause" && control.halt) await this.teams.haltPauseChild(control.teamId, control.halt.token, control.halt.reason);
-      else if (control.action === "resume") await this.teams.resume(control.teamId, body, undefined, HALT_CENSUS_MS);
-      else await this.teams[control.action](control.teamId, body);
+      await deliverControl(this.teams, control, body);
     } catch (error) {
       if (this.closed) return false;
       if (!(error instanceof TeamError)) throw error;
       if (["members-stopping", "team-operation-running"].includes(error.code)) return false;
-      if (error.code === "team-command-running") {
-        control.waiting = true;
-        this.awaitStoppedCommand(stored, `The goal's ${control.action} waits for its team. ${error.message}`);
-        return false;
-      }
+      if (holdForStoppedCommand(stored, control, error, { event: text => this.event(stored, text), save: () => this.save(stored) })) return false;
       if (error.code === "stale-team-revision" && ["pause", "cancel"].includes(control.action)) {
         let team: TeamView;
         try { team = this.teams.get(control.teamId); }
@@ -645,20 +638,6 @@ export class GoalService {
     }
     if (this.closed) return false;
     stored.control = undefined; this.save(stored); return true;
-  }
-  private supersedeWaiting(stored: Stored, by: string) {
-    const control = stored.control;
-    if (!control?.waiting) return;
-    stored.control = undefined;
-    this.event(stored, control.action === "steer"
-      ? `${by} replaced the goal's steer that waited for its team. The direction stays in the goal's steering; the team did not receive it.`
-      : `${by} replaced the goal's ${control.action} that waited for its team.`);
-  }
-  private awaitStoppedCommand(stored: Stored, reason: string) {
-    if (stored.goal.reason === reason) return;
-    stored.goal.reason = reason;
-    this.event(stored, reason);
-    this.save(stored);
   }
   private async launch(stored: Stored) {
     const pending = stored.launch!;

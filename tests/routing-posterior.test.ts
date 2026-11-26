@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  MIN_COST_ROWS,
   observe,
+  observedCost,
   posterior,
   type CurrentConfig,
   type RoutingTarget,
@@ -44,6 +46,7 @@ function row(overrides: Partial<RoutingEvidenceRow> = {}): RoutingEvidenceRow {
     point: "start",
     featureMapRef: "fm",
     ownerScore: null,
+    listUsd: null,
     promptVersion: "pv",
     ...overrides,
   };
@@ -270,4 +273,55 @@ test("an applied row counts at full weight", () => {
   const rows = Array.from({ length: 8 }, (_, index) => row({ outcomeId: `ordered-${index}`, accepted: index % 3 === 0 ? 0 : 1 }));
   const chosen = new Set(rows.filter((_, index) => index % 2 === 0).map(item => item.outcomeId));
   assert.deepEqual(posterior([...rows].reverse(), TARGET, CURRENT, NOW, 0.5, chosen), posterior(rows, TARGET, CURRENT, NOW, 0.5, chosen));
+});
+
+test("observedCost pools hierarchically from cell to project to tenant once five complete rows exist", () => {
+  assert.equal(MIN_COST_ROWS, 5);
+  assert.deepEqual(observedCost([], TARGET, 1, NOW), { listUsd: null, level: "none", rows: 0 });
+
+  const fourCell = Array.from({ length: 4 }, (_, index) => row({ outcomeId: `c-${index}`, listUsd: 0.9 }));
+  assert.deepEqual(observedCost(fourCell, TARGET, 1, NOW), { listUsd: null, level: "none", rows: 4 });
+
+  const fiveCell = [...fourCell, row({ outcomeId: "c-4", listUsd: 1.4 })];
+  assert.deepEqual(observedCost(fiveCell, TARGET, 1, NOW), { listUsd: 1, level: "cell", rows: 5 });
+
+  const projectRows = [
+    ...fourCell,
+    row({ outcomeId: "p-1", areaRef: "other-area", listUsd: 2.0 }),
+  ];
+  assert.deepEqual(observedCost(projectRows, TARGET, 1, NOW), { listUsd: 1.12, level: "project", rows: 5 });
+
+  const tenantRows = [
+    ...Array.from({ length: 2 }, (_, index) => row({ outcomeId: `p-${index}`, listUsd: 1.0 })),
+    ...Array.from({ length: 3 }, (_, index) => row({ outcomeId: `t-${index}`, projectRef: "other", listUsd: 3.0 })),
+  ];
+  assert.deepEqual(observedCost(tenantRows, TARGET, 1, NOW), { listUsd: 2.2, level: "tenant", rows: 5 });
+});
+
+test("observedCost applies 30-day half-life weighting, ignores earlier epochs and ineligible rows, and is order-independent", () => {
+  const weighted = [
+    row({ outcomeId: "w-1", listUsd: 1.0, endedAt: NOW }),
+    row({ outcomeId: "w-2", listUsd: 1.0, endedAt: NOW }),
+    row({ outcomeId: "w-3", listUsd: 1.0, endedAt: NOW }),
+    row({ outcomeId: "w-4", listUsd: 1.0, endedAt: NOW }),
+    row({ outcomeId: "w-5", listUsd: 4.0, endedAt: ago(30) }),
+  ];
+  const expected = Math.round(((4 * 1.0 + 0.5 * 4.0) / 4.5) * 1_000_000) / 1_000_000;
+  assert.deepEqual(observedCost(weighted, TARGET, 1, NOW), { listUsd: expected, level: "cell", rows: 5 });
+  assert.deepEqual(observedCost([...weighted].reverse(), TARGET, 1, NOW), { listUsd: expected, level: "cell", rows: 5 });
+
+  const ignored = [
+    row({ outcomeId: "ig-1", source: "legacy", listUsd: 99 }),
+    row({ outcomeId: "ig-2", source: "replay", listUsd: 99 }),
+    row({ outcomeId: "ig-3", point: "escalation", listUsd: 99 }),
+    row({ outcomeId: "ig-4", profileEpoch: 2, listUsd: 99 }),
+    row({ outcomeId: "ig-5", listUsd: null }),
+    row({ outcomeId: "ig-6", flags: ["backfilled"], listUsd: 99 }),
+    row({ outcomeId: "ig-7", frozenAt: null, listUsd: 99 }),
+    row({ outcomeId: "ig-8", disposition: "limit", listUsd: 99 }),
+    row({ outcomeId: "ig-9", endedAt: ago(181), listUsd: 99 }),
+    row({ outcomeId: "ig-10", endedAt: null, listUsd: 99 }),
+  ];
+  assert.deepEqual(observedCost([...weighted, ...ignored], TARGET, 1, NOW), { listUsd: expected, level: "cell", rows: 5 });
+  assert.deepEqual(observedCost(weighted, TARGET, 2, NOW), { listUsd: null, level: "none", rows: 0 });
 });

@@ -54,6 +54,7 @@ const now = () => new Date().toISOString();
 
 export class CmuxSessions {
   private readonly client: CmuxClient;
+  private readonly projectContexts: ProjectContexts;
   private readonly directory: string;
   private readonly records = new Map<string, Stored>();
   private readonly journals = new Map<string, Journal>();
@@ -68,7 +69,8 @@ export class CmuxSessions {
   private available = false;
   private closed = false;
 
-  constructor(readonly config: CmuxConfig, readonly key: Buffer) {
+  constructor(readonly config: CmuxConfig, readonly key: Buffer, projectContexts?: ProjectContexts) {
+    this.projectContexts = projectContexts ?? new ProjectContexts(config, key);
     this.client = new CmuxClient(config.cmux?.command ?? "cmux");
     this.directory = join(config.stateDir, "cmux");
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
@@ -489,7 +491,7 @@ export class CmuxSessions {
       if (!this.available) throw new CmuxError("cmux-unavailable");
       if ([...this.records.values()].filter((row) => ["running", "starting"].includes(row.session.status)).length >= this.config.maxSessions) throw new CmuxError("session-limit");
       if (request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
-      const context = new ProjectContexts(this.config, this.key).snapshot(project.id);
+      const context = this.projectContexts.snapshot(project.id);
       const record = this.newRecord(request.provider as CmuxProvider, projectCwd(project.path, request.cwd), request.title, request.requestId);
       if (!record) throw new CmuxError("unknown-project");
       record.session.initialPrompt = request.prompt;

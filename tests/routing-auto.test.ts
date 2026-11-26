@@ -159,15 +159,28 @@ test("an auto start writes one pending row and returns its choice", () => withSt
   assert.equal(row.policyDigest, routing.digest);
   assert.equal(row.chosenProfileId, chosenA.id);
   assert.equal(row.explore, false, "the first decision never explores");
-  assert.equal(row.basis, "greedy-share", "an empty window refuses exploration");
+  assert.equal(row.chosenProfileId, row.greedyProfileId);
+  assert.ok(row.basis === "sampled" || row.basis === "greedy-share");
   assert.deepEqual(a.routing, { profileId: chosenA.id, by: "router" });
   assert.deepEqual(row.payload?.guards, { pausedAt: null, spareAttempts: spareAttempts(run), share: { exploratory: 0, of: 0 } });
+
+  let blockedByShare = row.basis === "greedy-share";
+  for (let index = 0; index < 16 && !blockedByShare; index++) {
+    const probeRun = runOf(mixedLineup, routing, `run-empty-share-${index}`, `rehearsal-empty-${index}`);
+    const probeTask = taskOf("task-probe");
+    probeRun.tasks.push(probeTask);
+    rec.applyStart(startOf(probeRun, probeTask));
+    const probeRow = rowsOf(store, probeRun.id, "task-probe")[0]!;
+    assert.equal(probeRow.explore, false);
+    if (probeRow.basis === "greedy-share") blockedByShare = true;
+  }
+  assert.equal(blockedByShare, true, "an empty window refuses exploration");
 
   const rowB = rowsOf(store, run.id, "task-b")[0]!;
   assert.equal(rowB.coordinatorProfileId, null);
   assert.equal(rowB.chosenProfileId, chosenB.id);
   assert.deepEqual(b.routing, { profileId: chosenB.id, by: "router" });
-  assert.equal(countRows(store), 2);
+  assert.equal(rowsOf(store, run.id, "task-a").length + rowsOf(store, run.id, "task-b").length, 2);
 }));
 
 test("an off run and a shadow run apply no profile and read nothing", () => withStore(store => {
@@ -438,7 +451,7 @@ const escalated = (spec: Parameters<typeof integrated>[0]): OutcomeRow => {
 test("an escalation decision is greedy over escalation evidence only, and writes one pending row", () => {
   withStore(store => {
     const routing = pinRouting(POINTS_PIN, "supervised", POINT_LINEUP, ENDED)!;
-    assert.equal(routing.algorithmVersion, 2);
+    assert.equal(routing.algorithmVersion, 3);
     const run = runOf(POINT_LINEUP, routing, "run-escalation");
     const task = taskOf("task-e");
     run.tasks.push(task);
@@ -455,7 +468,7 @@ test("an escalation decision is greedy over escalation evidence only, and writes
     assert.equal(row.ordinal, 1);
     assert.equal(row.role, "implementer");
     assert.equal(row.mode, "auto");
-    assert.equal(row.algorithmVersion, 2);
+    assert.equal(row.algorithmVersion, 3);
     assert.equal(row.state, "pending");
     assert.equal(row.basis, "greedy-point");
     assert.equal(row.explore, false);

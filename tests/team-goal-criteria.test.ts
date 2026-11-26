@@ -165,14 +165,25 @@ test("a new goal plan gets one correction, replacement keeps its pin, and accept
     assert.deepEqual(member.goalCriteriaPlan, { objectiveVersion: 7 });
     assert.ok(member.prompt.includes('"objectiveVersion":7'));
 
-    const stalled = stored.run.members[0]!;
-    stalled.goalCriteriaPlan = member.goalCriteriaPlan;
-    stalled.prompt = member.prompt;
-    fixture.state.status = "exited";
-    await scheduler.replaceStalledMember(stored, stalled);
+    const obsolete = stored.run.members[0]!;
+    await scheduler.replaceStalledMember(stored, obsolete);
+    await teams.idle();
+    assert.equal(stored.pending, undefined, "the host queued no replacement for the superseded PM");
+    assert.equal(stored.run.members.length, 2, "obsolete planner is not replaced once a newer planner exists");
+
+    await fixture.manager.createTeamSession(
+      { requestId: member.sessionId, provider: member.provider ?? "demo", title: member.title, prompt: member.prompt },
+      { runId: stored.run.id, memberId: member.memberId, revision: member.revision, role: member.role },
+      member.cwd,
+    );
+    member.status = "running";
+    member.startedAt = obsolete.startedAt;
+    member.lastActivityAt = obsolete.startedAt;
+    await scheduler.replaceStalledMember(stored, member);
     await waitFor(() => stored.pending === undefined && stored.run.members.length >= 3, "the marked PM replacement is prepared");
     await teams.idle();
     const replacement = stored.run.members.at(-1)!;
+    assert.equal(replacement.stalledSourceMemberId, member.memberId, "the replacement points to the stalled current planner");
     assert.deepEqual(replacement.goalCriteriaPlan, member.goalCriteriaPlan, "the replacement keeps the exact objective pin");
     assert.ok(replacement.prompt.includes("every task, including each prerequisite"), "the saved prompt keeps the contract");
 

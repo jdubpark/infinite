@@ -252,3 +252,53 @@ export type GoalVerdictView = {
   evaluator?: { profileId: string; family: string; sharedFamily: boolean; alsoReviewed: boolean };
   detail: "available" | "expired";
 };
+
+export type RepairLoopCause = "review" | "check" | "delivery";
+export type RepairLoopOutcome = "resolved" | "blocked" | "cancelled" | "superseded" | "unresolved" | "in-progress";
+export type RepairEventCoverage = "complete" | "incomplete";
+export type RepairLoopSample = {
+  runId: string;
+  projectId: string;
+  revision: number;
+  cause: RepairLoopCause;
+  outcome: RepairLoopOutcome;
+  rounds: number;
+  attempts: number;
+  coldReplacements: number;
+  failedResumes: number;
+  startedAt: string;
+  finishedAt?: string;
+  durationMs?: number;
+  failedCommit?: string;
+  passingCommit?: string;
+  measured: boolean;
+  unfinished?: true;
+  tokens?: number;
+  usd?: number;
+};
+export type RepairLoopTotals = {
+  runsExamined: number;
+  eventCoverage?: RepairEventCoverage;
+  incompleteRuns?: number;
+  loopsTotal: number;
+  resolved: number;
+  unresolved: number;
+  inProgress: number;
+  byCause: Record<RepairLoopCause, number>;
+  coldReplacements: number;
+  failedResumes: number;
+  measuredLoops: number;
+  unmeasuredLoops: number;
+  unfinishedLoops?: number;
+  unmeasuredMembers: number;
+  medianMinutes: number | null;
+  p90Minutes: number | null;
+  medianTokens: number | null;
+  medianUsd: number | null;
+};
+export type RepairLoopReport = {
+  windowDays: number;
+  projectId?: string;
+  totals: RepairLoopTotals;
+  loops: RepairLoopSample[];
+};

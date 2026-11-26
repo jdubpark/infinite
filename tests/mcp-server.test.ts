@@ -214,8 +214,8 @@ test("CLI releases both listeners on startup failure and graceful shutdown", { t
   try {
     for (const occupied of ["mcp", "owner", "shutdown"] as const) {
       const blocked = await reserve();
-      if (occupied === "shutdown") await new Promise<void>(resolve => blocked.socket.close(() => resolve()));
       const spare = await reserve();
+      if (occupied === "shutdown") await new Promise<void>(resolve => blocked.socket.close(() => resolve()));
       await new Promise<void>(resolve => spare.socket.close(() => resolve()));
       const directory = join(root, occupied);
       mkdirSync(directory);

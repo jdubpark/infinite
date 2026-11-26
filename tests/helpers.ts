@@ -148,7 +148,7 @@ export async function endSessionWorkers(config: Config, started?: readonly numbe
   }
 }
 
-export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
+export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv; startStepMs?: number } = {}): Promise<Host> {
   const root = mkdtempSync(join(tmpdir(), "inf-"));
   const initialPort = options.config?.port ?? await freePort();
   let listenerOrigin = `http://127.0.0.1:${initialPort}`;
@@ -212,24 +212,24 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     api.stderr!.on("data", (chunk) => {
       diagnostics += chunk;
     });
-    await waitFor(
-      async () => {
-        let status = 0;
-        try {
-          status = (await fetchApi("/me")).status;
-        } catch {
-          status = 0;
-        }
-        if (status === 200) return 200;
-        if (api.exitCode !== null || api.signalCode !== null) {
-          await Promise.race([stderrDone, new Promise((resolveTimeout) => setTimeout(resolveTimeout, 1000))]);
-          throw new Error(diagnostics || `Host exited before listening (${api.signalCode ?? api.exitCode})`);
-        }
-        return status;
-      },
-      (status) => status === 200,
-      45000,
-    );
+    const answer = async () => {
+      let status = 0;
+      try {
+        status = (await fetchApi("/me")).status;
+      } catch {
+        status = 0;
+      }
+      if (status === 200) return 200;
+      if (api.exitCode !== null || api.signalCode !== null) {
+        await Promise.race([stderrDone, new Promise((resolveTimeout) => setTimeout(resolveTimeout, 1000))]);
+        throw new Error(diagnostics || `Host exited before listening (${api.signalCode ?? api.exitCode})`);
+      }
+      return status;
+    };
+    const lock = join(config.runDir, "server.lock"), step = options.startStepMs ?? 45000;
+    const loaded = () => { try { return readFileSync(lock, "utf8") === String(api.pid); } catch { return false; } };
+    await waitFor(async () => loaded() || await answer() === 200, (ready) => ready, step);
+    await waitFor(answer, (status) => status === 200, step);
   };
   const stop = async () => {
     const floor = new Promise((resolve) => setTimeout(resolve, 1700));

@@ -314,6 +314,22 @@ test("cost spreads use complete costs only", () => {
   assert.equal(noLookup.tokens, null);
   assert.equal(noLookup.spentUsd, null);
   assert.equal(noLookup.listUsd, null);
+
+  const withPersisted = only(buildCells([
+    row({ provider: "codex", payload: { costCoverage: "complete", listUsd: 1.25 } }),
+    row({ provider: "codex", payload: { costCoverage: "complete", listUsd: 1.75 } }),
+    row({ provider: "codex", payload: { costCoverage: "partial", listUsd: 9.99 } }),
+    row({ provider: "codex", payload: { costCoverage: "none" } }),
+  ], query({ by: [] })));
+  assert.equal(withPersisted.spentUsd, null);
+  assert.deepEqual(withPersisted.listUsd, { n: 2, median: 1.5, iqr: [1.375, 1.625] });
+
+  const lookupList: CostLookup = sessionId => sessionId === "s1"
+    ? { usd: 0, tokens: 1200, complete: false, listUsd: 0.85 }
+    : undefined;
+  const fromLookup = only(buildCells([row({ provider: "claude", sessionId: "s1" })], query({ by: [] }), lookupList));
+  assert.equal(fromLookup.spentUsd, null);
+  assert.deepEqual(fromLookup.listUsd, { n: 1, median: 0.85, iqr: [0.85, 0.85] });
 });
 
 test("minutes, ratings, and times", () => {

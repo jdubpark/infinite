@@ -8,14 +8,17 @@ import { usagePlanSchema, type AccountView, type Balance, type BriefingUsage, ty
 import { EvidenceError } from "./evidence/types.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceTx } from "./evidence/types.js";
-import type { UsageCoverage } from "./transcript-usage.js";
+import { OUTCOMES_MODULE } from "./outcome-store.js";
+import { refreshOutcomeCostsForSessions } from "./outcome-cost.js";
 import {
-  SESSION_PURPOSES, importLedger, importState, ledgerRecord, readBriefings, readRecords, readSessions, usageModule, writeBriefing, writeRecord, writeSession,
+  SESSION_PURPOSES, combineCoverage, importLedger, importState, ledgerRecord, readBriefings, readRecords, readSessions, usageModule, writeBriefing, writeRecord, writeSession,
   type LedgerCoverage, type LedgerCoverageReason, type LedgerHeader, type LedgerState, type SealedLedger, type StoredSession,
 } from "./usage-store.js";
 
+export { combineCoverage };
+
 type Period = "day" | "week" | "month";
-export interface SessionUsage extends UsageTotals { measured: true; coverage: "partial" | "complete"; coverageReason?: LedgerCoverageReason }
+export interface SessionUsage extends UsageTotals { measured: true; coverage: "partial" | "complete"; coverageReason?: LedgerCoverageReason; list?: Money }
 export type UnmeasuredUsage = { measured: false; coverage: "none"; coverageReason?: LedgerCoverageReason; unavailable?: true };
 export type UsageSummary = {
   period: { start: string; end: string };
@@ -81,15 +84,6 @@ export function ledgerCoverage(input: { provider: Provider; measuredLaunch: bool
   }
   if (!closed) return valid > 0 ? { coverage: "partial", reason: "running" } : { coverage: "none", reason: "running" };
   return valid > 0 ? { coverage: "partial", reason: "drain-incomplete" } : { coverage: "none", reason: "unsupported" };
-}
-
-export function combineCoverage(parts: readonly { coverage: UsageCoverage; coverageReason?: LedgerCoverageReason }[]): LedgerCoverage {
-  const live = parts.filter(part => part.coverage !== "none");
-  if (live.length === 0) return { coverage: "none" };
-  if (live.every(part => part.coverage === "complete")) return { coverage: "complete" };
-  const gap = live.find(part => part.coverage === "partial" && part.coverageReason !== "running");
-  if (!gap) return { coverage: "partial", reason: "running" };
-  return gap.coverageReason === undefined ? { coverage: "partial" } : { coverage: "partial", reason: gap.coverageReason };
 }
 
 export class UsageService {
@@ -222,6 +216,9 @@ export class UsageService {
               const written = this.write(tx => {
                 if (!writeSession(tx, header, stateOf(next))) return false;
                 for (const record of records) writeRecord(tx, session.id, record);
+                if (this.store.status().modules[OUTCOMES_MODULE] === "ready") {
+                  refreshOutcomeCostsForSessions(tx, [{ sessionId: session.id, runId: header.team?.runId, memberId: header.team?.memberId, exited: next.exited }], this.config.usage?.prices);
+                }
                 return true;
               });
               if (!written) {
@@ -236,7 +233,13 @@ export class UsageService {
         }
         const final: Row = { ...current, exited: closes(complete, current.journaled) };
         if (final.exited) this.exitedAt.delete(session.id);
-        if (keyed(final) !== saved) this.write(tx => writeSession(tx, header, stateOf(final)));
+        if (keyed(final) !== saved) {
+          this.write(tx => {
+            if (writeSession(tx, header, stateOf(final)) && this.store.status().modules[OUTCOMES_MODULE] === "ready") {
+              refreshOutcomeCostsForSessions(tx, [{ sessionId: session.id, runId: header.team?.runId, memberId: header.team?.memberId, exited: final.exited }], this.config.usage?.prices);
+            }
+          });
+        }
       }
       this.tickFailed = false;
     } catch (error) {
@@ -323,6 +326,9 @@ export class UsageService {
   }
   private price(record: UsageRecord): { cost: number; pricing: Pricing } {
     return record.provider === "opencode" ? priceUsage(record, this.config.usage?.prices) : { cost: 0, pricing: "unknown" };
+  }
+  private listMoney(records: UsageRecord[]): Money {
+    return this.money(records.map(record => priceUsage(record, this.config.usage?.prices)));
   }
   private priced(records: UsageRecord[]) {
     return records.map(record => ({ ...this.price(record), tokens: record.tokens }));
@@ -441,7 +447,8 @@ export class UsageService {
     try { data = this.ledger(); } catch { return { measured: false, coverage: "none", unavailable: true }; }
     const session = data.byId.get(sessionId);
     if (!session || !measured(session)) return { measured: false, coverage: "none", ...(session?.reason ? { coverageReason: session.reason } : {}) };
-    return { ...sumUsage(this.priced(data.bySession.get(sessionId) ?? [])), measured: true, coverage: session.coverage as "partial" | "complete", ...(session.reason ? { coverageReason: session.reason } : {}) };
+    const rows = data.bySession.get(sessionId) ?? [];
+    return { ...sumUsage(this.priced(rows)), measured: true, coverage: session.coverage as "partial" | "complete", list: this.listMoney(rows), ...(session.reason ? { coverageReason: session.reason } : {}) };
   }
   member(runId: string, memberId: string): SessionUsage | UnmeasuredUsage {
     let data: Ledger;
@@ -451,7 +458,7 @@ export class UsageService {
     const coverage = combineCoverage(ordered.map(session => ({ coverage: session.coverage, coverageReason: session.reason })));
     if (coverage.coverage === "none") return { measured: false, coverage: "none" };
     const rows = sessions.flatMap(session => data.bySession.get(session.sessionId) ?? []).sort((a, b) => data.order.get(a)! - data.order.get(b)!);
-    return { ...sumUsage(this.priced(rows)), measured: true, coverage: coverage.coverage as "partial" | "complete", ...(coverage.reason ? { coverageReason: coverage.reason } : {}) };
+    return { ...sumUsage(this.priced(rows)), measured: true, coverage: coverage.coverage as "partial" | "complete", list: this.listMoney(rows), ...(coverage.reason ? { coverageReason: coverage.reason } : {}) };
   }
   memberFinal(runId: string, memberId: string): SessionUsage | UnmeasuredUsage {
     let data: Ledger;

@@ -1,24 +1,28 @@
 import type { AutonomyMode } from "./autonomy.js";
 import { promptVersion, type ObjectivePrompt } from "./config-identity.js";
+import type { UsageConfig } from "./config.js";
 import { CONFIGURATIONS_MODULE, epochAt } from "./configuration-store.js";
 import type { EvidenceDb } from "./evidence/types.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import { EvidenceError } from "./evidence/types.js";
 import { OUTCOMES_MODULE, selectRoutingEvidence } from "./outcome-store.js";
+import type { ProviderLimitEvent } from "./provider-limits.js";
 import { profileIdentity } from "./run-events.js";
-import { choose, RESCUE_USD, screen, TIER_COSTS, tierCost, type Screened, type Scored } from "./routing-choice.js";
+import { choose, expectedCost, RESCUE_USD, screen, TIER_COSTS, type Screened, type Scored } from "./routing-choice.js";
+import { readProviderHeadrooms } from "./routing-headroom.js";
 import { effectiveRouting, type TeamRouting } from "./routing-policy.js";
 import {
-  betaMean, betaSd, CHOSEN_WEIGHT, MAX_AGE_DAYS, posterior, type CurrentConfig, type RoutingTarget,
+  betaMean, betaSd, CHOSEN_WEIGHT, MAX_AGE_DAYS, observedCost, posterior, type CurrentConfig, type RoutingTarget,
 } from "./routing-posterior.js";
 import {
   appliedOutcomeIds, computedPeriodEnd, projectCells, projectDecisions, readProjectState, ROUTING_MODULE, shadowProgress, shareWindow, taskDecisions,
 } from "./routing-store.js";
 import type {
-  DecisionRow, ExplainedDecision, Identity, ProfilePosterior, RoutingEvidenceRow, RoutingExplain, RoutingKnobs, RoutingMode, RoutingStatus, StatusCell,
+  CostsBasis, DecisionRow, ExplainedDecision, Identity, ProfilePosterior, ProviderHeadroom, RoutingEvidenceRow, RoutingExplain, RoutingKnobs, RoutingMode, RoutingStatus, StatusCell,
   StatusProfile,
 } from "./routing-types.js";
 import type { TeamLineup, TeamModelProfile } from "./team-types.js";
+import type { Provider } from "./types.js";
 
 export const STATUS_CELL_LIMIT = 50, SHADOW_WINDOW_DAYS = 30;
 const Z_90 = 1.645;
@@ -38,6 +42,9 @@ export type RoutingStatusInput = {
   objectiveDigest: ObjectivePrompt;
   codeMode: boolean;
   now: string;
+  limited?: ReadonlySet<Provider>;
+  limitHistory?: readonly ProviderLimitEvent[];
+  prices?: UsageConfig["prices"];
 };
 
 const round3 = (value: number) => Math.round(value * 1000) / 1000;
@@ -77,18 +84,28 @@ function readEvidence(db: EvidenceDb, screened: readonly Screened[], publishHead
   return { representative, rows, current, applied };
 }
 
-function scoreAt(screened: readonly Screened[], evidence: Evidence, target: RoutingTarget, knobs: RoutingKnobs, now: string): StatusProfile[] {
+function scoreAt(
+  screened: readonly Screened[],
+  evidence: Evidence,
+  target: RoutingTarget,
+  knobs: RoutingKnobs,
+  now: string,
+  headrooms: ReadonlyMap<Provider, ProviderHeadroom>,
+): StatusProfile[] {
   const posteriors = new Map<string, ProfilePosterior>();
   const scored = new Map<string, Scored>();
   for (const [identity, profile] of evidence.representative) {
-    const found = posterior(evidence.rows.get(identity) ?? [], target, evidence.current.get(identity)!, now, CHOSEN_WEIGHT, evidence.applied.get(identity));
+    const rows = evidence.rows.get(identity) ?? [];
+    const current = evidence.current.get(identity)!;
+    const found = posterior(rows, target, current, now, CHOSEN_WEIGHT, evidence.applied.get(identity));
+    const cost = expectedCost(profile, observedCost(rows, target, current.epoch, now).listUsd);
     posteriors.set(identity, found);
-    scored.set(identity, { profile, identity, posterior: found, costUsd: tierCost(profile) });
+    scored.set(identity, { profile, identity, posterior: found, costUsd: cost.costUsd, costBasis: cost.basis, headroom: headrooms.get(profile.provider) });
   }
   const choice = choose(screened, scored, knobs, STATUS_RISK, "status");
   return screened.map(item => {
     const found = posteriors.get(item.identity)!;
-    const cost = scored.get(item.identity)!.costUsd;
+    const entry = scored.get(item.identity)!;
     const theta = found.theta, mean = betaMean(theta), sd = betaSd(theta);
     const earlier = found.reward.reduce((sum, level) => {
       const raw = level.earlier.success + level.earlier.failure;
@@ -103,7 +120,8 @@ function scoreAt(screened: readonly Screened[], evidence: Evidence, target: Rout
       interval: [round3(clip(mean - Z_90 * sd)), round3(clip(mean + Z_90 * sd))],
       rescue: round3(betaMean(found.phi)),
       level: found.level,
-      costUsd: cost,
+      costUsd: entry.costUsd,
+      ...(entry.costBasis === undefined ? {} : { costBasis: entry.costBasis }),
       greedy: choice?.greedy === item.profile.id,
     };
   });
@@ -135,6 +153,9 @@ export function routingStatus(store: EvidenceStore, input: RoutingStatusInput): 
     const endedAt = state.periodEndedAt ?? (computed !== undefined && Date.parse(computed.endsAt) <= Date.parse(input.now) ? computed.endsAt : null);
     const mode: RoutingMode = effective.mode === "off" ? "off" : pinsAuto && endedAt !== null ? "auto" : "shadow";
     const autoMode = mode === "auto";
+    const headrooms = input.lineup
+      ? readProviderHeadrooms(db, input.lineup.implementers.map(profile => profile.provider), input.limited ?? new Set(), input.limitHistory ?? [], input.prices, input.now)
+      : new Map<Provider, ProviderHeadroom>();
     let cells: { cell: StatusCell; profiles: StatusProfile[] }[] = [];
     let cellsCapped = false, unreadableCells = 0;
     if (knobs && reason === null && input.lineup) {
@@ -153,14 +174,17 @@ export function routingStatus(store: EvidenceStore, input: RoutingStatusInput): 
         };
         cells.push({
           cell: { scope: "cell", area: cell.payload.area, taskKind: cell.kind, featureVersion: cell.featureVersion, featureMap: cell.payload.featureMap },
-          profiles: scoreAt(screened, evidence, target, knobs, input.now),
+          profiles: scoreAt(screened, evidence, target, knobs, input.now, headrooms),
         });
       }
       const newTask: RoutingTarget = {
         projectRef, areaRef: db.index("area", NEW_TASK_AREA), kind: null, featureVersion: 0, featureMapRef: "", point: "start",
       };
-      cells.push({ cell: { scope: "new-task" }, profiles: scoreAt(screened, evidence, newTask, knobs, input.now) });
+      cells.push({ cell: { scope: "new-task" }, profiles: scoreAt(screened, evidence, newTask, knobs, input.now, headrooms) });
     }
+    const bases = cells.flatMap(entry => entry.profiles.filter(profile => profile.removed === undefined).map(profile => profile.costBasis ?? "tier-default"));
+    const observedBases = bases.filter(basis => basis === "observed").length;
+    const costsBasis: CostsBasis = observedBases === 0 ? "tier-default" : observedBases === bases.length ? "observed" : "mixed";
     const exploring = autoMode ? rows.filter(row => row.state === "pending" || row.state === "applied") : recorded;
     const explore: RoutingStatus["explore"] = {
       exploratory: exploring.filter(row => row.explore).length, of: exploring.length, guards: autoMode ? "applied" : "risk-only",
@@ -176,8 +200,9 @@ export function routingStatus(store: EvidenceStore, input: RoutingStatusInput): 
       knobs,
       defaults: effective.mode === "shadow" ? effective.defaults : [],
       covers: { start: reason === null, reason },
-      costs: { lightUsd: TIER_COSTS.light, strongUsd: TIER_COSTS.strong, rescueUsd: RESCUE_USD, basis: "tier-default" },
-      headroom: "not-modelled",
+      costs: { lightUsd: TIER_COSTS.light, strongUsd: TIER_COSTS.strong, rescueUsd: RESCUE_USD, basis: costsBasis },
+      headroom: "modelled",
+      ...(headrooms.size > 0 ? { providers: Object.fromEntries(headrooms) } : {}),
       interval: "normal-approx-90",
       chosenWeight: CHOSEN_WEIGHT,
       limits: "not-applied",

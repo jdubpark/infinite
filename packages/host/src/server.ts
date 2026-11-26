@@ -73,7 +73,7 @@ import { CellQueryRefused, type CellQuery, type CostLookup } from "./outcome-cel
 import { currentEpochs, productionRows, queryCells, queryRollup } from "./outcome-reads.js";
 import { latestAssessment, rollupMissing, type RollupTarget } from "./outcome-rollup.js";
 import { importLegacy, LegacyImportRefused } from "./outcome-import.js";
-import { sessionCostOf } from "./outcome-cost.js";
+import { sessionCostOf, syncOutcomeCosts } from "./outcome-cost.js";
 import { legacyBatchSchema } from "./outcome-legacy.js";
 import { GoalService } from "./goals.js";
 import { RoutineService } from "./routines.js";
@@ -272,7 +272,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       lateReceipts();
     },
   });
-  outbox.registerProjector(outcomeProjector(evidence));
+  outbox.registerProjector(outcomeProjector(evidence, { prices: config.usage?.prices }));
   const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager, cost: sessionId => sessionCostOf(usage.session(sessionId)) });
   const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
     try { manager.meta(id); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
@@ -302,10 +302,10 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   teams.useRouter(new RoutingRecorder({ store: evidence }));
   const backfillOutcomes = outcomeBackfill(evidence, () => teams.understandingRecords(), {
     mapOf: projectId => config.projects.find(project => project.id === projectId)?.team?.features,
-    now: () => new Date().toISOString(),
+    now: () => new Date().toISOString(), prices: config.usage?.prices,
   });
   backfillOutcomes();
-  const usage = new UsageService(config, key, manager, evidence);
+  const usage = new UsageService(config, key, manager, evidence); syncOutcomeCosts(evidence, config.usage?.prices);
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
   teams.useUsage(usage);

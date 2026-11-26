@@ -26,7 +26,7 @@ export type Cell = {
   tokens: Spread | null; spentUsd: Spread | null; listUsd: Spread | null; minutes: Spread | null;
   ownerRating: { mean: number; n: number } | null; enough: boolean;
 };
-export type SessionCost = { usd: number; tokens: number; complete: boolean };
+export type SessionCost = { usd: number; tokens: number; complete: boolean; listUsd?: number };
 export type CostLookup = (sessionId: string) => SessionCost | undefined;
 export type RowUse = { kind: "open" } | { kind: "excluded"; exclusion: Exclusion }
   | { kind: "withheld"; reason: "backfilled" | "gap" | "unfrozen" } | { kind: "counted"; levels: Levels; completed: boolean };
@@ -166,12 +166,18 @@ function summarize(key: Record<string, string>, rows: readonly OutcomeRow[], que
   const levelOf = (pick: (levels: Levels) => Level): LevelCount =>
     scout ? levelCount([]) : levelCount(counted.map(item => pick(item.levels)));
 
-  const tokens: number[] = [], usd: number[] = [], minutes: number[] = [];
+  const tokens: number[] = [], usd: number[] = [], listUsd: number[] = [], minutes: number[] = [];
   for (const { row } of counted) {
-    const found = completeCost(row, cost);
+    const raw = cost !== undefined && row.sessionId ? cost(row.sessionId) : undefined;
+    const found = raw?.complete ? raw : undefined;
     if (found !== undefined) {
       tokens.push(found.tokens);
       if (isMetered(row.provider)) usd.push(found.usd);
+    }
+    if (row.payload.costCoverage === "complete" && typeof row.payload.listUsd === "number" && Number.isFinite(row.payload.listUsd)) {
+      listUsd.push(row.payload.listUsd);
+    } else if (raw?.listUsd !== undefined && Number.isFinite(raw.listUsd)) {
+      listUsd.push(raw.listUsd);
     }
     const rowMinute = rowMinutes(row);
     if (rowMinute !== undefined) minutes.push(rowMinute);
@@ -199,7 +205,7 @@ function summarize(key: Record<string, string>, rows: readonly OutcomeRow[], que
     },
     tokens: spread(tokens),
     spentUsd: spread(usd),
-    listUsd: null,
+    listUsd: spread(listUsd),
     minutes: spread(minutes),
     ownerRating: ratings.length ? { mean: ratings.reduce((sum, value) => sum + value, 0) / ratings.length, n: ratings.length } : null,
     enough: counted.length >= MIN_COUNTED_ROWS,

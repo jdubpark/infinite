@@ -5,6 +5,7 @@ import type { EvidenceStore } from "./evidence/store.js";
 import { EvidenceError } from "./evidence/types.js";
 import { memberCodeModeExpected } from "./launch.js";
 import { objectivePromptFor } from "./objective-digest.js";
+import type { ProviderLimit, ProviderLimitEvent } from "./provider-limits.js";
 import { routingExplain, routingStatus } from "./routing-reads.js";
 import { ROUTING_MODULE, setExplorePause } from "./routing-store.js";
 import { teamActionSchema } from "./team-types.js";
@@ -13,8 +14,15 @@ import type { Config } from "./types.js";
 const uuid = z.uuid();
 const TASK_ID = /^[a-z][a-z0-9-]{0,39}$/;
 
-export type RoutingRouteDeps = { evidence: EvidenceStore; config: () => Config;
-  teams: { revokeRouting(id: string, input: unknown): Promise<unknown> } };
+export type RoutingRouteDeps = {
+  evidence: EvidenceStore;
+  config: () => Config;
+  teams: {
+    revokeRouting(id: string, input: unknown): Promise<unknown>;
+    providerLimits?: () => ProviderLimit[];
+    providerLimitHistory?: () => ProviderLimitEvent[];
+  };
+};
 
 export function routingRoutes(app: express.Express, deps: RoutingRouteDeps, guard: express.RequestHandler, ownerGuard: express.RequestHandler): void {
   const unavailable = (error: unknown, res: express.Response) => {
@@ -61,6 +69,9 @@ export function routingRoutes(app: express.Express, deps: RoutingRouteDeps, guar
         objectiveDigest: objectivePromptFor(project, startMode(project, config.teams?.lineup).mode),
         codeMode: memberCodeModeExpected(config),
         now: new Date().toISOString(),
+        limited: new Set((deps.teams.providerLimits?.() ?? []).map(item => item.provider)),
+        limitHistory: deps.teams.providerLimitHistory?.() ?? [],
+        prices: config.usage?.prices,
       }));
     } catch (error) {
       unavailable(error, res);

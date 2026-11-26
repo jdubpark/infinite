@@ -9,6 +9,15 @@ import type { UsageRecord, UsageTokens } from "./usage.js";
 export { SESSION_PURPOSES };
 export type LedgerCoverageReason = UsageCoverageReason | "running";
 export interface LedgerCoverage { coverage: UsageCoverage; reason?: LedgerCoverageReason }
+
+export function combineCoverage(parts: readonly { coverage: UsageCoverage; coverageReason?: LedgerCoverageReason }[]): LedgerCoverage {
+  const live = parts.filter(part => part.coverage !== "none");
+  if (live.length === 0) return { coverage: "none" };
+  if (live.every(part => part.coverage === "complete")) return { coverage: "complete" };
+  const gap = live.find(part => part.coverage === "partial" && part.coverageReason !== "running");
+  if (!gap) return { coverage: "partial", reason: "running" };
+  return gap.coverageReason === undefined ? { coverage: "partial" } : { coverage: "partial", reason: gap.coverageReason };
+}
 export interface LedgerHeader {
   sessionId: string;
   provider: Provider;

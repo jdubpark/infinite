@@ -3,19 +3,29 @@ import { recoveryTurnEnd, type SignalData } from "@infinite/attention";
 import type { Provider } from "./types.js";
 import { writeSealed, unseal } from "./vault.js";
 
-export interface ProviderLimit { provider: Provider; detectedAt: string; resetsAt?: string; expiresAt: string; sessionId: string; runId?: string; confidence: "corroborated" }
+export interface ProviderLimit { provider: Provider; limit?: "usage" | "credits"; detectedAt: string; resetsAt?: string; expiresAt: string; sessionId: string; runId?: string; confidence: "corroborated" }
+export interface ProviderLimitEvent { provider: Provider; limit: "usage" | "credits"; detectedAt: string; resetsAt?: string; sessionId: string; runId?: string }
 export type LimitObservation = { kind: "provider-limit"; limit: "usage" | "credits"; confidence: "single-source" | "corroborated"; resetsAt?: string; message: string; source: "hook" | "screen" | "protocol"; provider: Provider };
 export interface LimitRow { id: string; provider: Provider; team?: { runId: string }; attention: { limit?: { confidence: string; since: string; resetsAt?: string } } }
 export interface LimitSessions {
   events(id: string, after: number, limit: number, types?: Set<string>): { events: { at: string; data: Record<string, unknown> }[]; cursor: number; more: boolean };
 }
-type State = { limits: Partial<Record<Provider, ProviderLimit>>; cleared: Partial<Record<Provider, string>> };
+type State = { limits: Partial<Record<Provider, ProviderLimit>>; cleared: Partial<Record<Provider, string>>; history?: ProviderLimitEvent[] };
 
 const SCOPE = "provider-limits";
 const DAY_MS = 86_400_000;
+const HISTORY_DAYS = 30;
+const MAX_HISTORY = 500;
 const UNSTATED_MS = 15 * 60_000;
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const time = (value?: string) => { const ms = value === undefined ? NaN : Date.parse(value); return Number.isNaN(ms) ? undefined : ms; };
+
+function validEvent(value: unknown): value is ProviderLimitEvent {
+  return isRecord(value) && typeof value.provider === "string" && (value.limit === "usage" || value.limit === "credits")
+    && typeof value.detectedAt === "string" && time(value.detectedAt) !== undefined && typeof value.sessionId === "string"
+    && (value.resetsAt === undefined || (typeof value.resetsAt === "string" && time(value.resetsAt) !== undefined))
+    && (value.runId === undefined || typeof value.runId === "string");
+}
 
 export const switchesMember = (data: Record<string, unknown>): data is LimitObservation =>
   data.kind === "provider-limit" && (data.confidence === "corroborated" || (data.source === "hook" && data.provider === "claude"));
@@ -27,7 +37,8 @@ export class ProviderLimits {
     if (existsSync(file)) try {
       const stored = unseal<State>(key, SCOPE, readFileSync(file, "utf8"));
       if (!isRecord(stored) || !isRecord(stored.limits) || !isRecord(stored.cleared)) throw new Error("unexpected provider limit shape");
-      this.state = stored;
+      const history = Array.isArray(stored.history) ? stored.history.filter(validEvent) : undefined;
+      this.state = { limits: stored.limits, cleared: stored.cleared, ...(history && history.length > 0 ? { history } : {}) };
     } catch (error) {
       console.warn(`[Infinite] Provider limits cannot be read and start empty: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -40,6 +51,22 @@ export class ProviderLimits {
     const { resetsAt, ...entry } = limit, resets = time(resetsAt);
     this.state.limits[limit.provider] = { ...entry, ...(resets === undefined ? {} : { resetsAt }),
       expiresAt: new Date(resets === undefined ? detected + UNSTATED_MS : Math.min(resets, detected + DAY_MS)).toISOString() };
+    const event: ProviderLimitEvent = {
+      provider: limit.provider,
+      limit: limit.limit ?? "usage",
+      detectedAt: limit.detectedAt,
+      ...(resets === undefined ? {} : { resetsAt }),
+      sessionId: limit.sessionId,
+      ...(limit.runId === undefined ? {} : { runId: limit.runId }),
+    };
+    const cutoff = detected - HISTORY_DAYS * DAY_MS;
+    const kept = (this.state.history ?? []).filter(item => {
+      const at = time(item.detectedAt);
+      return at !== undefined && at >= cutoff && !(item.provider === event.provider && item.detectedAt === event.detectedAt);
+    });
+    kept.push(event);
+    kept.sort((a, b) => (time(a.detectedAt) ?? 0) - (time(b.detectedAt) ?? 0));
+    this.state.history = kept.slice(-MAX_HISTORY);
     this.save();
   }
   clear(provider: Provider, at = new Date().toISOString()) {
@@ -52,6 +79,13 @@ export class ProviderLimits {
     return Object.values(this.state.limits).filter(limit => Date.parse(limit.expiresAt) > now.getTime());
   }
   limited(now = new Date()): Set<Provider> { return new Set(this.active(now).map(limit => limit.provider)); }
+  history(now = new Date()): ProviderLimitEvent[] {
+    const nowMs = now.getTime(), cutoff = nowMs - HISTORY_DAYS * DAY_MS;
+    return (this.state.history ?? []).filter(item => {
+      const at = time(item.detectedAt);
+      return at !== undefined && at >= cutoff && at <= nowMs;
+    });
+  }
   async reconcile(sessions: LimitSessions, rows: LimitRow[], now = new Date()) {
     for (const session of rows) {
       const shown = session.attention.limit;

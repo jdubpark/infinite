@@ -597,3 +597,28 @@ test("usage interrupted options parse", () => {
   assert.equal(parsed.options["--days"], "14");
   assert.equal(parsed.options["--json"], true);
 });
+
+test("routing status and explain lines reflect observed costs, modelled headroom, and candidate pressure", () => {
+  const observed = routingStatusLines(routingStatusFixture({
+    costs: { lightUsd: 0.4, strongUsd: 2.2, rescueUsd: 1.5, basis: "observed" },
+    headroom: "modelled",
+    cells: [],
+  } as Partial<RoutingStatus>));
+  assert.equal(observed.at(-1), "Costs are observed list USD (rescue default $1.50). Limit headroom is modelled. Intervals are 90% normal approximations. Coordinator-chosen history counts at half weight.");
+
+  const mixed = routingStatusLines(routingStatusFixture({
+    costs: { lightUsd: 0.4, strongUsd: 2.2, rescueUsd: 1.5, basis: "mixed" },
+    headroom: "modelled",
+    cells: [],
+  } as Partial<RoutingStatus>));
+  assert.equal(mixed.at(-1), "Costs use observed list USD where available; tier defaults: light $0.40, strong $2.20, rescue $1.50. Limit headroom is modelled. Intervals are 90% normal approximations. Coordinator-chosen history counts at half weight.");
+
+  const withPressure = routingExplainLines(explainAnswer([explainDecision({
+    payload: explainPayload([
+      { profileId: "ops-light", identity: "codex/gpt/high", tier: "light", thetaMean: 0.5, thetaSd: 0.1, phiMean: 0.5, costUsd: 0.4, pressure: 0.625, greedyUtility: 0.2, sample: 0.7, sampledUtility: 0.3 },
+      { profileId: "ops-calm", identity: "claude/sonnet/high", tier: "light", thetaMean: 0.5, thetaSd: 0.1, phiMean: 0.5, costUsd: 0.4, pressure: 0, greedyUtility: 0.9, sample: 0.7, sampledUtility: 0.8 },
+    ]),
+  })]));
+  assert.equal(withPressure[3], "  ops-light  mean 0.5 · deviation 0.1 · rescue 0.5 · cost $0.40 · pressure 0.625 · greedy utility 0.2 · sample 0.7 · sampled utility 0.3");
+  assert.equal(withPressure[4], "  ops-calm  mean 0.5 · deviation 0.1 · rescue 0.5 · cost $0.40 · greedy utility 0.9 · sample 0.7 · sampled utility 0.8");
+});

@@ -86,6 +86,8 @@ export interface JournalAppendMeta {
 }
 export class Journal {
   seq = 0;
+  private failure: unknown;
+  private failed = false;
   constructor(
     readonly directory: string,
     readonly key: Buffer,
@@ -112,6 +114,10 @@ export class Journal {
     return this.appendAll(type, [data])[0];
   }
   appendAll(type: Event["type"], items: readonly Event["data"][]): Event[] {
+    if (this.failed) throw new Error("Journal closed after a failed write", { cause: this.failure });
+    return this.write(type, items);
+  }
+  private write(type: Event["type"], items: readonly Event["data"][]): Event[] {
     const at = new Date().toISOString();
     const first = this.seq;
     const events = items.map(
@@ -125,15 +131,21 @@ export class Journal {
         .map((event) => seal(this.key, `${this.sessionId}:${event.seq}`, event) + "\n");
       const bytes = Buffer.from(lines.join(""));
       const name = `${String(segment).padStart(10, "0")}.journal`;
-      const fd = openSync(join(this.directory, name), "a", 0o600);
       let segmentBytes = 0;
       try {
-        let offset = 0;
-        while (offset < bytes.length) offset += writeSync(fd, bytes, offset);
-        fsyncSync(fd);
-        segmentBytes = fstatSync(fd).size;
-      } finally {
-        closeSync(fd);
+        const fd = openSync(join(this.directory, name), "a", 0o600);
+        try {
+          let offset = 0;
+          while (offset < bytes.length) offset += writeSync(fd, bytes, offset);
+          fsyncSync(fd);
+          segmentBytes = fstatSync(fd).size;
+        } finally {
+          closeSync(fd);
+        }
+      } catch (error) {
+        this.failed = true;
+        this.failure = error;
+        throw error;
       }
       let size = segmentBytes - bytes.length;
       try {

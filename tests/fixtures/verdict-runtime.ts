@@ -8,7 +8,7 @@ import { recordDigest } from "../../packages/host/src/objective-types.js";
 import type { Criterion, LogEntry, ObjectiveRecord } from "../../packages/host/src/objective-types.js";
 import { evaluatorPrompt } from "../../packages/host/src/verdict-prompt.js";
 import type { VerdictEventData } from "../../packages/host/src/verdict-store.js";
-import type { AssessedState, VerdictReport } from "../../packages/host/src/verdict-types.js";
+import type { AssessedState, DeliveryFact, VerdictReport } from "../../packages/host/src/verdict-types.js";
 import { TeamVerdicts, VERDICT_EVENTS, VERDICT_TESTING_WAIT_MS } from "../../packages/host/src/team-verdicts.js";
 import type { VerdictHolder, VerdictHost } from "../../packages/host/src/team-verdicts.js";
 import type { TeamCommand, TeamLineup, TeamMember, TeamModelProfile, TeamReport, TeamRole, TeamRun } from "../../packages/host/src/team-types.js";
@@ -138,6 +138,8 @@ export class FakeHost implements VerdictHost {
   saves = 0;
   failNextSave = false;
   failSaveAt = 0;
+  deliveryFact: DeliveryFact | undefined = "none";
+  deliveryReads = 0;
   verdicts?: TeamVerdicts;
 
   constructor(readonly world: World, readonly holders: Map<string, FakeHolder>) {}
@@ -169,6 +171,7 @@ export class FakeHost implements VerdictHost {
     this.saves += 1;
     this.persisted.set(holder.run.id, JSON.stringify(holder));
   }
+  delivery(): DeliveryFact | undefined { this.deliveryReads += 1; return this.deliveryFact; }
   event(holder: VerdictHolder, text: string): void {
     this.log.push(`event:${text}`);
     holder.run.events.push({ at: AT, text });

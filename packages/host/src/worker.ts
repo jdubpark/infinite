@@ -179,12 +179,12 @@ function flush() {
   if (covered !== undefined && covered - lastPersistedCoverage >= 256) persist();
 }
 
-function withTerminalBarrier<T>(fn: () => T, beforeDrain?: () => void): Promise<T> {
+function withTerminalBarrier<T>(fn: () => T, beforeDrain?: () => void, refused?: () => void): Promise<T> {
   if (state.status === "recording-error") return Promise.reject(new Error("Recording failed"));
   return terminalBarrier.run(flush, done => terminal.write("", done), () => {
     if ((state as WorkerState).status === "recording-error") throw new Error("Recording failed during snapshot");
     return fn();
-  }, beforeDrain);
+  }, beforeDrain, refused);
 }
 
 async function snapshot(): Promise<TerminalSnapshot> {
@@ -1323,6 +1323,8 @@ const server = createServer((socket) => {
             refreshControl(request);
           }, () => {
             child?.resize(request.cols, request.rows);
+          }, () => {
+            child?.resize(terminal.cols, terminal.rows);
           });
           return { ok: true };
         });

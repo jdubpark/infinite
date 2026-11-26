@@ -68,20 +68,27 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertEqual(board.items.first?.column, .working)
     }
 
-    func testFilteringByProjectMatchesGroupIDOrProjectNameWhenUngrouped() {
-        let storefront = ProjectGroup(.object(["id": .string("storefront"), "name": .string("Storefront"), "repos": .array([])]))
-        let notes = ProjectGroup(.object(["id": .string("notes"), "name": .string("Notes"), "implicit": .bool(true), "repos": .array([])]))
+    func testFilteringByProjectMatchesOnlyCanonicalGroupID() {
+        let appOne = ProjectGroup(.object(["id": .string("app-1"), "name": .string("App"), "repos": .array([])]))
+        let appTwo = ProjectGroup(.object(["id": .string("app-2"), "name": .string("App"), "repos": .array([])]))
+        let emptyID = ProjectGroup(.object(["id": .string(""), "name": .string("App"), "repos": .array([])]))
         let board = Board(.object(["items": .array([
-            item("mission", column: "working", updatedAt: "1"),
-            item("team-no-group", column: "review", updatedAt: "2", groupID: nil, kind: "team"),
-            item("notes-goal", column: "working", updatedAt: "3", groupID: "notes", project: "Notes", kind: "goal"),
-            item("elsewhere", column: "working", updatedAt: "4", groupID: "other"),
+            item("app1-mission", column: "working", updatedAt: "6", groupID: "app-1", project: "App"),
+            item("app2-team", column: "review", updatedAt: "5", groupID: "app-2", project: "App", kind: "team"),
+            item("missing-group", column: "review", updatedAt: "4", groupID: nil, project: "App", kind: "team"),
+            item("empty-group", column: "working", updatedAt: "3", groupID: "", project: "App", kind: "goal"),
+            item("orphan-group", column: "working", updatedAt: "2", groupID: "unmapped:group:app-1", project: "App"),
+            item("orphan-project", column: "ended", updatedAt: "1", groupID: "unmapped:project:legacy", project: "App", kind: "team"),
         ])]))
-        XCTAssertEqual(Set(board.items(in: storefront).map(\.id)), ["mission", "team-no-group"])
-        XCTAssertEqual(board.items(in: notes).map(\.id), ["notes-goal"])
-        XCTAssertEqual(board.items(in: nil).count, 4)
-        XCTAssertEqual(board.columns(in: storefront).map(\.column), [.working, .review])
-        XCTAssertEqual(board.count(.working, in: notes), 1)
+        XCTAssertEqual(board.items(in: appOne).map(\.id), ["app1-mission"])
+        XCTAssertEqual(board.items(in: appTwo).map(\.id), ["app2-team"])
+        XCTAssertEqual(board.items(in: emptyID), [])
+        XCTAssertEqual(board.items(in: nil).map(\.id), ["app1-mission", "app2-team", "missing-group", "empty-group", "orphan-group", "orphan-project"])
+        XCTAssertEqual(board.columns(in: appOne).map(\.column), [.working])
+        XCTAssertEqual(board.columns(in: appTwo).map(\.column), [.review])
+        XCTAssertEqual(board.count(.working, in: appOne), 1)
+        XCTAssertEqual(board.count(.review, in: appOne), 0)
+        XCTAssertEqual(board.count(.review, in: appTwo), 1)
     }
 
     func testBoardItemReadsKindsSubtaskProgressAndLabels() throws {
@@ -101,18 +108,23 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertEqual(BoardItem(try parse(#"{"id":"m","subtasks":{"total":4,"running":0,"done":3}}"#)).progressFraction, 0.75)
     }
 
-    func testCaptionDetailDropsOnlyTheProgressTheRowAlreadyShows() throws {
-        func item(_ detail: String, done: Int = 1, total: Int = 3) throws -> BoardItem {
-            BoardItem(try parse(#"{"id":"m","kind":"mission","detail":"\#(detail)","subtasks":{"total":\#(total),"running":1,"done":\#(done)}}"#))
+    func testCaptionDetailPreservesHostDetailVerbatim() {
+        func item(_ detail: String, done: Int = 1, total: Int = 3) -> BoardItem {
+            BoardItem(.object([
+                "id": .string("m"),
+                "kind": .string("mission"),
+                "detail": .string(detail),
+                "subtasks": .object(["total": .number(Double(total)), "running": .number(1), "done": .number(Double(done))]),
+            ]))
         }
-        XCTAssertEqual(try item("Running: Call api /health from web. 1 of 3 subtasks done").detailBesideProgress, "Running: Call api /health from web")
-        XCTAssertEqual(try item("1 of 3 subtasks done").detailBesideProgress, "")
-        XCTAssertEqual(try item("1 of 1 subtask done", total: 1).detailBesideProgress, "")
-        XCTAssertEqual(try item("Running: X. 0 of 1 subtasks done", done: 0, total: 1).detailBesideProgress, "Running: X")
-        XCTAssertEqual(try item("Running: X. 21 of 3 subtasks done").detailBesideProgress, "Running: X. 21 of 3 subtasks done")
-        XCTAssertEqual(try item("2 of 3 subtasks done").detailBesideProgress, "2 of 3 subtasks done")
-        XCTAssertEqual(try item("Should web wait for the merge?").detailBesideProgress, "Should web wait for the merge?")
-        XCTAssertEqual(BoardItem(try parse(#"{"id":"m","detail":"0 of 0 subtasks done"}"#)).detailBesideProgress, "0 of 0 subtasks done")
+        XCTAssertEqual(item("Running: Call api /health from web").detailBesideProgress, "Running: Call api /health from web")
+        XCTAssertEqual(item("").detailBesideProgress, "")
+        XCTAssertEqual(item("Planning subtasks", done: 0, total: 0).detailBesideProgress, "Planning subtasks")
+        XCTAssertEqual(item("Should web wait for the merge?").detailBesideProgress, "Should web wait for the merge?")
+        XCTAssertEqual(item("Running: Show 1 of 2 subtasks done", done: 1, total: 2).detailBesideProgress, "Running: Show 1 of 2 subtasks done")
+        XCTAssertEqual(item("Running: Check summary. 1 of 2 subtasks done", done: 1, total: 2).detailBesideProgress, "Running: Check summary. 1 of 2 subtasks done")
+        XCTAssertEqual(item("1 of 2 subtasks done", done: 1, total: 2).detailBesideProgress, "1 of 2 subtasks done")
+        XCTAssertEqual(BoardItem(.object(["id": .string("m"), "detail": .string("Planning subtasks")])).detailBesideProgress, "Planning subtasks")
     }
 
     func testMissionDecodesDecisionsSubtasksAndOwnerControls() throws {

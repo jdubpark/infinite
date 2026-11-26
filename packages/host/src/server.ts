@@ -62,7 +62,7 @@ import { withoutCodeMode } from "./session-listing.js";
 import { parseGoalCreateBody } from "./objective-input.js";
 import { routingRoutes } from "./routing-routes.js";
 import { spawnTeamBundle } from "./team-workspace.js";
-import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
+import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamRemovalSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
 import { scorecardFromRows, type ProfileIdentityOf } from "./scorecard.js";
 import { profileIdentity } from "./run-events.js";
 import { CellQueryRefused, type CellQuery, type CostLookup } from "./outcome-cells.js";
@@ -1257,7 +1257,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     const teamId = id.parse(req.params.id);
     if (goals.ownsActiveTeam(teamId)) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal.");
     if (missions.ownsActiveSubteam(teamId)) throw new TeamError(409, "mission-owned-team", "Control this subteam from its mission.");
-    return res.json(await teams.removeRun(teamId));
+    return res.json(await teams.removeRun(teamId, teamRemovalSchema.parse(req.body ?? {})));
   });
   app.post("/api/teams/:id/tasks/:taskId/rating", requireRole(["owner"]), (req, res) =>
     res.json(teams.rateTask(id.parse(req.params.id), z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).parse(req.params.taskId), teamTaskRatingSchema.parse(req.body))));

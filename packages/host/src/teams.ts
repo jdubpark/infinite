@@ -7,7 +7,8 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { type Config, type Session, learningPurpose } from "./types.js";
 import { TeamStopRefused, type Manager } from "./manager.js";
-import { bootId, extendWitness, hostProcesses, newWitness, recordCommand, type CensusResult, type HostProcesses, type ProcessWitness } from "./process-census.js";
+import { bootId, extendWitness, hostProcesses, mergeWitness, newWitness, recordCommand, type CensusResult, type HostProcesses, type ProcessWitness } from "./process-census.js";
+import { CENSUS_TTL_MS, censusCounts, countsKey, leftoverCensusEvent, leftoverView, notedLeftover, settledLeftover, type StoredLeftover } from "./team-leftover.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { accountSettingPrompt, PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@infinite/attention";
@@ -113,7 +114,6 @@ export type PendingOperation = { id: string; kind: "prepare" | "member" | "resul
   recording?: true;
 };
 type OperationCensus = { pendingId: string; at: string; state: "running" | "in-use" | "ended" | "unknown"; recorded?: number; using?: number; detail?: string };
-const CENSUS_TTL_MS = 10 * 60_000;
 const WITNESS_SAVE_MS = 200;
 type OperationRecorder = { pendingId: string; inFlight: number; sampling?: true; save?: NodeJS.Timeout };
 function operationCensusEvent(kind: PendingOperation["kind"], census: Omit<OperationCensus, "at" | "pendingId">) {
@@ -129,6 +129,7 @@ export type Stored = {
   deliveryReviewApproval?: DeliveryReviewApproval;
   retention?: RetentionState;
   census?: OperationCensus;
+  leftover?: StoredLeftover;
   outbox?: OutboxEvent[];
   ledgerStatus?: TeamRun["status"];
   permissionTaskEnded?: true;
@@ -171,7 +172,7 @@ const clock = (iso: string) => `${iso.slice(11, 16)} UTC`;
 export const memberTimeLimitReason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
 export const memberStallReason = "An agent showed no activity twice on the same assignment. Its workspace was preserved.";
 export const checkTimeoutReason = "A configured check ran past the team check time limit (teams.checkMinutes) and was stopped. No correction round was used; the integrated work was preserved.";
-export const commandLeftoverEvent = "A configured command exited while a process it started still held its output. The host judged the command by its exit code and neither waited for that process nor stopped it.";
+export const commandLeftoverEvent = "A configured command exited while a process it started still held its output. The host judged the command by its exit code and neither waited for that process nor stopped it. It keeps this run's directories until a process census finds none of that command's processes.";
 export const repeatedCheckFailureReason = "The same required verification command failed again against an unchanged integration commit. No further identical repair was attempted; inspect the check output and continue with owner direction.";
 const repairLimitReason = "The team exhausted its two correction rounds. Review the check and agent evidence before continuing manually.";
 const promptTooLargeReason = "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.";
@@ -599,7 +600,7 @@ export class TeamService {
     const ready = run.tasks.filter(task => task.status === "pending" && task.dependsOn.every(id => run.tasks.find(item => item.id === id)?.status === "integrated")).length +
       (run.discovery && run.discovery.revision === run.revision && !run.discovery.completedAt ? run.discovery.tasks.filter(task => task.status === "pending").length : 0);
     const workers = { limit: run.parallelism, max, running: members.filter(member => holdsWorkerSlot(member, run.revision)).length, ready };
-    return { ...safeRun, ...(stored.pending ? { pendingOperation: buildTeamPendingOperation({ id: stored.pending.id, kind: stored.pending.kind, revision: stored.pending.revision, failure: stored.pending.failure, source: stored.pending.source, census: stored.census?.pendingId === stored.pending.id ? stored.census : undefined }) } : {}), tasks: safeRun.tasks.map(task => {
+    return { ...safeRun, ...(stored.pending ? { pendingOperation: buildTeamPendingOperation({ id: stored.pending.id, kind: stored.pending.kind, revision: stored.pending.revision, failure: stored.pending.failure, source: stored.pending.source, census: stored.census?.pendingId === stored.pending.id ? stored.census : undefined }) } : {}), ...(stored.leftover ? { leftoverProcesses: leftoverView(stored.leftover) } : {}), tasks: safeRun.tasks.map(task => {
       const revision = task.revision ?? safeRun.revision;
       const attempts = withUsage.members.filter(member => member.taskId === task.id && member.revision === revision);
       const usage = attempts.flatMap(member => member.usage?.messages ? [member.usage] : []);
@@ -770,7 +771,13 @@ export class TeamService {
   }
   private event(stored: Stored, text: string) { runEvent(stored.run, text); }
   private async noteLeftover(stored: Stored, result: CommandResult) {
-    if (result.leftover) await this.enqueue(stored.run.id, () => { if (!this.closed) { this.event(stored, commandLeftoverEvent); this.save(stored); } });
+    if (!result.leftover) return;
+    await this.enqueue(stored.run.id, () => {
+      if (this.closed) return;
+      stored.leftover = notedLeftover(stored.leftover, stored.pending?.witness, stored.pending?.id, timestamp());
+      this.event(stored, commandLeftoverEvent);
+      this.save(stored);
+    });
   }
   list(): TeamView[] { return [...this.records.values()].filter(stored => !stored.run.replay).map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   listItems(): TeamListItem[] { return this.list().map(teamListItem); }
@@ -878,7 +885,7 @@ export class TeamService {
       publicationTarget: stored => service.publicationTarget(stored),
       needsPublication: stored => service.needsPublication(stored),
       startPublication: stored => service.startPublication(stored),
-      refreshOperationCensus: (stored, force) => service.refreshOperationCensus(stored, force),
+      refreshOperationCensus: (stored, force, withLeftover) => service.refreshOperationCensus(stored, force, withLeftover),
       closeStaleBlockedRun: (stored, hours) => service.closeStaleBlockedRun(stored, hours),
     };
   }
@@ -886,7 +893,7 @@ export class TeamService {
   private get removalTasks() { return this.retention.removalTasks; }
   private get memberWorkSaveTasks() { return this.retention.memberWorkSaveTasks; }
   private get memberWorkSaveControllers() { return this.retention.memberWorkSaveControllers; }
-  removeRun(id: string): Promise<TeamView> { return this.retention.removeRun(id); }
+  removeRun(id: string, removal: { processesEnded?: true } = {}): Promise<TeamView> { return this.retention.removeRun(id, removal); }
   private retire(...args: Parameters<TeamRetention["retire"]>) { return this.retention.retire(...args); }
 
   private publisherHost(): PublisherHost {
@@ -1790,35 +1797,43 @@ export class TeamService {
     timer.unref();
     this.sampleTimers.add(timer);
   }
-  private async refreshOperationCensus(stored: Stored, force = false): Promise<OperationCensus["state"] | undefined> {
-    const { run } = stored, pending = stored.pending;
-    if (!pending?.witness || this.commands.has(run.id)) return undefined;
+  private async refreshOperationCensus(stored: Stored, force = false, withLeftover = false): Promise<OperationCensus["state"] | undefined> {
+    const { run } = stored, pending = stored.pending?.witness ? stored.pending : undefined, leftover = withLeftover ? stored.leftover : undefined;
+    const witness = pending?.witness && leftover ? mergeWitness(pending.witness, leftover.witness) : pending?.witness ?? leftover?.witness;
+    if (!witness || this.commands.has(run.id)) return undefined;
     const now = this.options?.now?.() ?? Date.now();
-    const previous = stored.census?.pendingId === pending.id ? stored.census : undefined;
-    if (!force && previous && now - Date.parse(previous.at) < CENSUS_TTL_MS) return previous.state;
+    const previous = pending && stored.census?.pendingId === pending.id ? stored.census : undefined;
+    if (!force && !leftover && previous && now - Date.parse(previous.at) < CENSUS_TTL_MS) return previous.state;
     const processes = this.options?.processes ?? hostProcesses;
     let result: CensusResult;
-    try { result = await processes.census(pending.witness, teamRunDirectory(run.workspace), this.config.teams?.commandPrefix); }
+    try { result = await processes.census(witness, teamRunDirectory(run.workspace), this.config.teams?.commandPrefix); }
     catch (error) { result = { ok: false, problem: error instanceof Error ? error.message : "The census failed." }; }
-    if (this.records.get(run.id) !== stored || stored.pending?.id !== pending.id || this.commands.has(run.id)) return undefined;
-    const count = (reasons: string[]) => result.ok ? result.findings.filter(finding => reasons.includes(finding.reason)).length : 0;
-    const recorded = count(["recorded-process", "recorded-session", "recorded-group"]), using = count(["working-directory", "open-file", "command-line"]);
-    const unreadable = count(["unreadable"]);
-    const recorder = this.recorderOf(stored, pending);
-    const incomplete = pending.recording && !recorder && pending.witness.boot === bootId();
-    const census: Omit<OperationCensus, "at" | "pendingId"> = !result.ok ? { state: "unknown", detail: result.problem.slice(0, 200) }
-      : recorded > 0 ? { state: "running", recorded, ...(using ? { using } : {}) }
-        : using > 0 ? { state: "in-use", using }
-          : unreadable > 0 ? { state: "unknown", detail: `${unreadable} process(es) of the accounts it inspects could not be inspected` }
-            : incomplete ? { state: "unknown", detail: "the host stopped while the operation was starting a command, so its record of the operation's processes may be incomplete" }
-              : recorder && recorder.inFlight > 0 ? { state: "unknown", detail: "a command of the operation is still starting" }
-                : { state: "ended" };
-    stored.census = { pendingId: pending.id, at: new Date(now).toISOString(), ...census };
-    if (previous?.state !== census.state || previous.recorded !== census.recorded || previous.using !== census.using || previous.detail !== census.detail) {
-      this.event(stored, operationCensusEvent(pending.kind, census));
-      this.save(stored);
+    if (this.records.get(run.id) !== stored || (pending && stored.pending?.id !== pending.id) || (leftover && stored.leftover !== leftover) || this.commands.has(run.id)) return undefined;
+    const counts = censusCounts(result), at = new Date(now).toISOString();
+    let state: OperationCensus["state"] = "ended";
+    if (pending) {
+      const recorder = this.recorderOf(stored, pending);
+      const incomplete = pending.recording && !recorder && pending.witness?.boot === bootId();
+      const census: Omit<OperationCensus, "at" | "pendingId"> = counts.state !== "ended" ? counts
+        : incomplete ? { state: "unknown", detail: "the host stopped while the operation was starting a command, so its record of the operation's processes may be incomplete" }
+          : recorder && recorder.inFlight > 0 ? { state: "unknown", detail: "a command of the operation is still starting" }
+            : counts;
+      stored.census = { pendingId: pending.id, at, ...census };
+      if (previous?.state !== census.state || previous.recorded !== census.recorded || previous.using !== census.using || previous.detail !== census.detail) {
+        this.event(stored, operationCensusEvent(pending.kind, census));
+        this.save(stored);
+      }
+      state = census.state;
     }
-    return census.state;
+    if (leftover) {
+      stored.leftover = counts.state === "ended" ? undefined : { ...leftover, census: { ...counts, at } };
+      if (!leftover.census || countsKey(leftover.census) !== countsKey(counts)) {
+        this.event(stored, leftoverCensusEvent(counts));
+        this.save(stored);
+      }
+      if (state === "ended") state = counts.state;
+    }
+    return state;
   }
   private replaceCheck(stored: Stored, running: TeamRun["checks"][number], finished: TeamRun["checks"][number], observe?: () => void) {
     return this.enqueue(stored.run.id, () => {
@@ -1850,6 +1865,7 @@ export class TeamService {
     void commandScope.run(this.commandRecorder(stored, pending.id), () => perform(controller.signal)).then(value => this.enqueue(stored.run.id, () => {
       if (this.closed || stored.pending?.id !== pending.id) return;
       this.commands.delete(stored.run.id);
+      stored.leftover = settledLeftover(stored.leftover, pending);
       try { this.assertBudget(stored.run); } catch (error) { this.block(stored, error); return; }
       if (stored.run.stopReason) { this.block(stored, new TeamError(409, "goal-budget-exhausted", "The goal exhausted its execution budget.")); return; }
       const held = ["paused", "cancelled", "blocked"].includes(stored.run.status) ? stored.run.status : undefined;
@@ -1860,6 +1876,7 @@ export class TeamService {
     }), error => this.enqueue(stored.run.id, () => {
       if (this.closed || stored.pending?.id !== pending.id) return;
       this.commands.delete(stored.run.id);
+      stored.leftover = settledLeftover(stored.leftover, pending);
       const failed = stored.pending;
       if (this.recorderOf(stored, failed)?.inFlight === 0) delete failed.recording;
       failed.failure = { code: error instanceof TeamError ? error.code : "workspace-operation-failed",

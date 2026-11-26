@@ -28,6 +28,7 @@ import {
   type TeamCheck,
   type TeamCommand,
   type TeamDecision,
+  type TeamLeftoverProcesses,
   type TeamMemberSavedWork,
   type TeamPendingOperation,
   type TeamPermissionAgentDecision,
@@ -405,6 +406,7 @@ export const teamMemberRetireSchema = z.object({ requestId: z.uuid(), revision: 
   identity: z.string().regex(/^[a-f0-9]{64}$/), text: z.string().trim().min(1).max(4000) }).strict();
 export type TeamMemberRetire = z.infer<typeof teamMemberRetireSchema>;
 export const teamActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
+export const teamRemovalSchema = z.object({ processesEnded: z.literal(true).optional() }).strict();
 export const teamContinueSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000).optional() }).strict();
 export type TeamContinue = z.infer<typeof teamContinueSchema>;
 export const teamTaskRatingSchema = z.object({ requestId: z.uuid(), score: z.number().int().min(1).max(5), note: z.string().trim().max(1000).optional() }).strict();
@@ -744,6 +746,7 @@ export interface TeamRun {
 }
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permissionRecovery"> & {
   pendingOperation?: TeamPendingOperation;
+  leftoverProcesses?: TeamLeftoverProcesses;
   members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback" | "goalCriteriaPlan">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt" | "coordinatorSessionId">[];
   permissionRecovery?: { outcomes: TeamPermissionRecoveryView[] };

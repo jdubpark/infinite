@@ -1,0 +1,64 @@
+import { mergeWitness, newWitness, type CensusResult, type ProcessWitness } from "./process-census.js";
+import type { TeamLeftoverProcesses } from "./team-state-schemas.js";
+
+export const CENSUS_TTL_MS = 10 * 60_000;
+
+export type CensusCounts =
+  | { state: "running"; recorded: number; using?: number }
+  | { state: "in-use"; using: number }
+  | { state: "unknown"; detail: string }
+  | { state: "ended" };
+export type LeftoverCensus = Exclude<CensusCounts, { state: "ended" }> & { at: string };
+export type StoredLeftover = { since: string; operation?: string; witness: ProcessWitness; census?: LeftoverCensus };
+
+export function censusCounts(result: CensusResult): CensusCounts {
+  if (!result.ok) return { state: "unknown", detail: result.problem.slice(0, 200) };
+  const count = (reasons: string[]) => result.findings.filter(finding => reasons.includes(finding.reason)).length;
+  const recorded = count(["recorded-process", "recorded-session", "recorded-group"]);
+  const using = count(["working-directory", "open-file", "command-line"]);
+  const unreadable = count(["unreadable"]);
+  if (recorded > 0) return { state: "running", recorded, ...(using ? { using } : {}) };
+  if (using > 0) return { state: "in-use", using };
+  if (unreadable > 0) return { state: "unknown", detail: `${unreadable} process(es) of the accounts it inspects could not be inspected` };
+  return { state: "ended" };
+}
+
+export function countsKey(census: CensusCounts) {
+  switch (census.state) {
+    case "running": return `running:${census.recorded}:${census.using ?? 0}`;
+    case "in-use": return `in-use:${census.using}`;
+    case "unknown": return `unknown:${census.detail}`;
+    case "ended": return "ended";
+  }
+}
+
+export function notedLeftover(previous: StoredLeftover | undefined, witness: ProcessWitness | undefined, operation: string | undefined, at: string): StoredLeftover {
+  const seen = witness ?? newWitness();
+  return { since: previous?.since ?? at, ...(operation ? { operation } : {}), witness: previous ? mergeWitness(previous.witness, seen) : structuredClone(seen) };
+}
+
+export function settledLeftover(leftover: StoredLeftover | undefined, operation: { id: string; witness?: ProcessWitness }): StoredLeftover | undefined {
+  if (!leftover || leftover.operation !== operation.id || !operation.witness) return leftover;
+  return { ...leftover, witness: mergeWitness(leftover.witness, operation.witness) };
+}
+
+export function leftoverCensusEvent(census: CensusCounts) {
+  switch (census.state) {
+    case "running":
+      return `The host still sees ${census.recorded} process(es) left behind by an earlier command of this run${census.using ? `, and ${census.using} more using this run's directory` : ""}. It keeps this run's directories until a census finds none.`;
+    case "in-use":
+      return `The host sees ${census.using} process(es) using this run's directory after an earlier command of this run left a process behind. It keeps this run's directories until a census finds none.`;
+    case "unknown":
+      return `The host cannot tell whether a process left behind by an earlier command of this run still runs: ${census.detail}. It keeps this run's directories; after checking, the owner can remove the run with processesEnded (docs/teams.md).`;
+    case "ended":
+      return "The host sees no process left behind by an earlier command of this run, and none using this run's directory. Its directories can be removed.";
+  }
+}
+
+export function attestedRemovalEvent(detail: string) {
+  return `The owner stated that the processes of this run's earlier commands have ended. The host's census could not tell (${detail}); the host removes this run on the owner's statement.`;
+}
+
+export function leftoverView(leftover: StoredLeftover): TeamLeftoverProcesses {
+  return leftover.census ? { since: leftover.since, state: leftover.census.state, checkedAt: leftover.census.at } : { since: leftover.since, state: "unchecked" };
+}

@@ -168,6 +168,28 @@ The GitHub CLI wrapper selects the repository from explicit arguments or the
 checkout's GitHub origin. Conflicting targets and non-GitHub destinations cannot
 receive an app token. It does not retry failed mutations using another identity.
 
+## Review feedback
+
+Review feedback is off by default: `github.reviewFeedback.enabled` defaults to
+`false`, and turning it on needs `ownerLogin`, the owner's GitHub login. While it
+is on, the host only reads GitHub for it:
+
+- **What.** For each run that delivered a pull request and waits at
+  `ready-for-review`, a mission's subteam run included, the host runs
+  `gh pr view NUMBER --json state,isCrossRepository,baseRefName,headRefName,headRefOid,reviews --repo OWNER/REPO`.
+- **How often.** Once per watched run every `pollMinutes` (default 5, from 1 to
+  1440). There is one more read before the host applies a review, and one before
+  a mission coordinator's forward steers the subteam. A failed forward read is
+  retried a minute later. Each read times out after 60 seconds.
+- **Through what.** With the [GitHub credential proxy](github-proxy.md), each
+  read carries a host-signed grant for that one repository with only the `pr`
+  operation, valid for 15 minutes, and goes through the proxy's `gh pr view`
+  broker. Without the proxy, the host passes no grant, and `gh` uses the
+  account's own GitHub CLI setup.
+
+No new App permission is needed: **Pull requests: Read and write** in the table
+above already covers reading a pull request and its reviews.
+
 ## Verify and operate
 
 Run the status command as the agent account. It reports expiry without exposing

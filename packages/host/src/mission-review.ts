@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ConnectorSource } from "./mcp-types.js";
 import type { Mission, MissionSubtask } from "./mission-types.js";
-import type { MissionMessage } from "./team-prompts.js";
+import { queuedForwardText, type MissionMessage } from "./team-prompts.js";
 import { githubReviewSource, type TeamView } from "./team-types.js";
 import { TeamError } from "./team-workspace.js";
 import { deterministicUuid } from "./intake-types.js";
@@ -31,7 +31,7 @@ export type MissionReviewRecord =
   | ReviewFields & { state: "forwarded"; forwardRequestId: string }
   | ReviewFields & { state: "superseded" | "refused"; reason: string };
 export type ReviewForwardOp = { kind: "review-forward"; subtaskId: string; teamId: string; requestId: string; text: string; source?: ConnectorSource };
-type ForwardRequest = { kind: "none" } | { kind: "refused"; reason: string } | { kind: "late" } | { kind: "queued" };
+type ForwardRequest = { kind: "none" } | { kind: "refused"; reason: string } | { kind: "late" } | { kind: "queued" } | { kind: "waiting" };
 type ForwardRead = { state: "reading" } | { state: "read"; current: boolean } | { state: "failed"; at: number };
 type MissionReviewStored = {
   mission: Mission;
@@ -101,7 +101,7 @@ export class MissionReview<S extends MissionReviewStored> implements MissionRevi
 
   queueForward(stored: S, subtask: MissionSubtask, text: string, sawReview: boolean, source?: ConnectorSource): ForwardRequest {
     const review = subtask.status === "done" ? stored.reviews?.filter(item => item.subtaskId === subtask.id && item.state === "open").at(-1) : undefined;
-    if (!review) return { kind: "none" };
+    if (!review) return this.alreadyQueued(stored, subtask);
     if (!sawReview || stored.inbox.some(message => message.type === "review-direction" && message.reviewId === review.reviewId)) {
       this.host.event(stored, `The coordinator's steer-subtask report for subtask ${subtask.id} was not applied: that attempt had not received the owner's latest direction or review. A new attempt will consider it.`);
       stored.inbox.push({ type: "refused", kind: "steer-subtask", reason: `Your previous attempt had not received the owner's latest direction or review. Read it before you forward the owner's review of subtask ${subtask.id} with steer-subtask.` });
@@ -118,6 +118,19 @@ export class MissionReview<S extends MissionReviewStored> implements MissionRevi
     stored.ops.push({ kind: "review-forward", subtaskId: subtask.id, teamId: review.runId, requestId: forwardRequestId, text, ...(source ? { source } : {}) });
     for (const batch of stored.deliveredUnapplied ?? []) batch.inbox = batch.inbox.filter(message => message.type !== "review-direction" || message.reviewId !== review.reviewId);
     return { kind: "queued" };
+  }
+
+  queuedForwards(stored: S) {
+    return (stored.reviews ?? []).filter(item => item.state === "forwarding").map(item => ({ subtaskId: item.subtaskId, reviewId: item.reviewId }));
+  }
+
+  private alreadyQueued(stored: S, subtask: MissionSubtask): ForwardRequest {
+    const queued = subtask.status === "done" ? stored.reviews?.find(item => item.subtaskId === subtask.id && item.state === "forwarding") : undefined;
+    if (!queued) return { kind: "none" };
+    const reason = queuedForwardText(subtask.id, queued.reviewId);
+    this.host.event(stored, `The coordinator's steer-subtask report for subtask ${subtask.id} was not applied: ${reason}`);
+    stored.notes.push({ type: "refused", kind: "steer-subtask", reason });
+    return { kind: "waiting" };
   }
 
   async applyForward(stored: S, op: ReviewForwardOp): Promise<boolean> {

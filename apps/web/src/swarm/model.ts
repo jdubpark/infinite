@@ -14,7 +14,6 @@ const QUIET_WINDOW_MS = 72 * HOUR_MS;
 const QUIET_LIMIT = 12;
 const LIVE_AGENT_STATES: AgentState[] = ["queued", "working", "waiting", "in-review", "needs-you"];
 const HELD_MISSION_STATUSES: SwarmMission["status"][] = ["planning", "working", "needs-input", "paused", "blocked"];
-const OBSERVABLE_PROVIDERS = new Set(["claude", "codex"]);
 
 const STAGE_BY_STATUS: Partial<Record<TeamStatus, Stage>> = {
   planning: "plan", discovering: "scout", implementing: "build", integrating: "integrate",
@@ -71,7 +70,13 @@ function soloState(session: SwarmSession): AgentState {
   return "waiting";
 }
 
+function isProviderObservable(provider: string, capabilities: SwarmInput["providerCapabilities"]): boolean {
+  if (capabilities === undefined) return provider.length > 0;
+  return capabilities[provider]?.observesToolInputs === true;
+}
+
 function lastActivity(team: SwarmTeam): string {
+  if (team.lastActivityAt && timeOf(team.lastActivityAt) > 0) return team.lastActivityAt;
   let latest = timeOf(team.createdAt);
   for (const member of team.members)
     latest = Math.max(latest, timeOf(member.startedAt), timeOf(member.lastActivityAt), timeOf(member.reportedAt));
@@ -82,7 +87,8 @@ const stageIndex = (stage: Stage | undefined) => (stage === undefined ? STAGES.l
 
 function sessionAgent(args: {
   id: string; swarmId: string; unitId?: string; projectId?: string; role: RoleCode; stage?: Stage; state: AgentState; earlier: boolean;
-  session?: SwarmSession; title: string; provider: string; model?: string; tier?: "light" | "strong"; taskId?: string; costUsd?: number;
+  session?: SwarmSession; title: string; provider: string; providerCapabilities?: SwarmInput["providerCapabilities"];
+  model?: string; tier?: "light" | "strong"; taskId?: string; costUsd?: number;
 }): Agent {
   const attention = args.session?.attention;
   return {
@@ -97,7 +103,7 @@ function sessionAgent(args: {
     earlier: args.earlier,
     limited: Boolean(attention?.limit),
     stalled: false,
-    observable: OBSERVABLE_PROVIDERS.has(args.provider),
+    observable: isProviderObservable(args.provider, args.providerCapabilities),
     title: args.title,
     provider: args.provider,
     model: args.model,
@@ -110,14 +116,21 @@ function sessionAgent(args: {
   };
 }
 
-function memberAgent(team: SwarmTeam, member: SwarmMember, role: { code: RoleCode; stage?: Stage }, swarmId: string, sessions: Map<string, SwarmSession>): Agent {
+function memberAgent(
+  team: SwarmTeam,
+  member: SwarmMember,
+  role: { code: RoleCode; stage?: Stage },
+  swarmId: string,
+  sessions: Map<string, SwarmSession>,
+  providerCapabilities?: SwarmInput["providerCapabilities"],
+): Agent {
   const session = sessions.get(member.sessionId);
   const attention = session?.attention;
   const owner: Owner = attention?.state === "needs-you" ? approvalOwner(team, member.sessionId, attention.prompt) : "person";
   const agent = sessionAgent({
     id: member.memberId, swarmId, unitId: team.id, projectId: team.projectId, role: role.code, stage: role.stage,
     state: memberState(member.status, attention, owner), earlier: member.revision !== team.revision, session,
-    title: member.title, provider: member.provider ?? team.provider, model: member.modelProfile?.label,
+    title: member.title, provider: member.provider ?? team.provider, providerCapabilities, model: member.modelProfile?.label,
     tier: member.modelProfile?.tier, taskId: member.taskId, costUsd: member.usage?.cost,
   });
   return {
@@ -146,15 +159,16 @@ function reachedStage(team: SwarmTeam, members: SwarmMember[], active: Stage | u
 
 function buildUnit(args: {
   team: SwarmTeam; swarmId: string; sessions: Map<string, SwarmSession>; managed: boolean; dependsOn: string[];
+  providerCapabilities?: SwarmInput["providerCapabilities"];
 }): Unit {
-  const { team, swarmId, sessions, managed, dependsOn } = args;
+  const { team, swarmId, sessions, managed, dependsOn, providerCapabilities } = args;
   const shown = team.members.filter(member => member.revision === team.revision || member.status === "running" || member.status === "waiting");
   const agents: Agent[] = [];
   const side: Agent[] = [];
   for (const member of shown) {
     const role = ROLES.get(member.role);
     if (!role) continue;
-    const agent = memberAgent(team, member, role, swarmId, sessions);
+    const agent = memberAgent(team, member, role, swarmId, sessions, providerCapabilities);
     (role.code === "PR" ? side : agents).push(agent);
   }
   const byStage = (a: Agent, b: Agent) => stageIndex(a.stage) - stageIndex(b.stage);
@@ -244,7 +258,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
         .filter(subtask => subtask.teamId === team.id)
         .flatMap(subtask => subtask.dependsOn)
         .flatMap(dep => mission.subtasks.find(subtask => subtask.id === dep)?.teamId ?? []);
-      return buildUnit({ team, swarmId: mission.id, sessions, managed: true, dependsOn });
+      return buildUnit({ team, swarmId: mission.id, sessions, managed: true, dependsOn, providerCapabilities: input.providerCapabilities });
     });
     const titles = new Map(mission.subtasks.map(subtask => [subtask.id, subtask.title]));
     const ghosts: Ghost[] = mission.subtasks.flatMap(subtask => {
@@ -259,6 +273,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
         state: coordinatorState(mission.coordinator.status, coordinatorSession), earlier: false,
         session: coordinatorSession, title: coordinatorSession?.title ?? "Mission coordinator",
         provider: coordinatorSession?.provider ?? mission.lineup?.coordinator.provider ?? "",
+        providerCapabilities: input.providerCapabilities,
         model: mission.lineup?.coordinator.label, tier: mission.lineup?.coordinator.tier,
         costUsd: coordinatorSession?.usage?.cost,
       }),
@@ -278,7 +293,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
 
   for (const team of input.teams) {
     if (team.missionId !== undefined && missions.has(team.missionId)) continue;
-    const unit = buildUnit({ team, swarmId: team.id, sessions, managed: false, dependsOn: [] });
+    const unit = buildUnit({ team, swarmId: team.id, sessions, managed: false, dependsOn: [], providerCapabilities: input.providerCapabilities });
     const swarm: TeamSwarm = {
       id: team.id, kind: "team", title: team.title, live: unit.live, units: [unit],
       waiting: 0, costUsd: team.usage?.total.cost, createdAt: team.createdAt,
@@ -292,7 +307,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
     .filter(session => (session.status === "running" || session.status === "starting") && !session.archivedAt && !session.managedBy && !memberSessions.has(session.id))
     .map(session => sessionAgent({
       id: session.id, swarmId: "solo", projectId: session.projectId, role: "SO", state: soloState(session), earlier: false, session,
-      title: session.title, provider: session.provider, costUsd: session.usage?.cost,
+      title: session.title, provider: session.provider, providerCapabilities: input.providerCapabilities, costUsd: session.usage?.cost,
     }));
   if (loose.length > 0) {
     built.push({

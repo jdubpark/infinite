@@ -15,7 +15,7 @@ export type TeamListMember = Pick<ViewMember, "memberId" | "sessionId" | "role" 
 };
 export type TeamListTask = Pick<ViewTask, "id" | "title" | "status" | "paths" | "dependsOn" | "memberId" | "changedPaths" | "ownerRating">;
 
-export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "status" | "revision" | "parallelism" | "createdAt" | "updatedAt"
+export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "status" | "revision" | "parallelism" | "createdAt" | "updatedAt" | "lastActivityAt"
   | "workspace" | "branch" | "baseCommit" | "headCommit" | "reason" | "missionId" | "permissionsRevokedAt" | "decisions" | "workers" | "resumable" | "continuable"> & {
   members: TeamListMember[];
   tasks: TeamListTask[];
@@ -51,11 +51,11 @@ function taskRow(task: ViewTask): TeamListTask {
 }
 
 export function teamListItem(view: TeamView): TeamListItem {
-  const { id, projectId, provider, title, status, revision, parallelism, createdAt, updatedAt, workspace, branch, baseCommit, headCommit, reason,
+  const { id, projectId, provider, title, status, revision, parallelism, createdAt, updatedAt, lastActivityAt, workspace, branch, baseCommit, headCommit, reason,
     missionId, permissionsRevokedAt, decisions, workers, resumable, continuable, lineup, goal, linear, review, discovery, deliveryReceipt, pullRequest,
     permissions, permissionDecisions, usage } = view;
   return {
-    id, projectId, provider, title, status, revision, parallelism, createdAt, updatedAt, workspace, branch, baseCommit, headCommit, reason,
+    id, projectId, provider, title, status, revision, parallelism, createdAt, updatedAt, lastActivityAt, workspace, branch, baseCommit, headCommit, reason,
     missionId, permissionsRevokedAt, decisions, workers, resumable, continuable,
     members: view.members.map(memberRow),
     tasks: view.tasks.map(taskRow),

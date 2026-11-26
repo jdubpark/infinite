@@ -12,6 +12,13 @@ CACHE = Path("/srv/infinite-data/repository-graphs")
 BUILDER = "/opt/infinite/scripts/repository_graph.py"
 GRAPHIFY = "/usr/local/bin/graphify"
 
+def check_no_symlink_ancestors(root):
+    cursor = Path("/")
+    for part in root.parts[1:]:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError("Symlinked repository or cache paths are not supported.")
+
 def inside(value, *roots):
     path = Path(value)
     if not path.is_absolute():
@@ -22,8 +29,7 @@ def inside(value, *roots):
     matched = None
     matched_resolved = None
     for root in roots:
-        if root.is_symlink():
-            raise ValueError("Symlinked repository or cache paths are not supported.")
+        check_no_symlink_ancestors(root)
         resolved_root = root.resolve()
         if resolved != resolved_root and resolved_root in resolved.parents:
             matched = root

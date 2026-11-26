@@ -300,17 +300,21 @@ allow_test_overrides() {
 
 load_test_overrides() {
   if allow_test_overrides; then
+    override_active=0
     if [ "${INFINITE_GRADER_TEST_ROOT+set}" = set ]; then
+      override_active=1
       valid_abs_path "$INFINITE_GRADER_TEST_ROOT" || refuse
       ROOT=$INFINITE_GRADER_TEST_ROOT
     fi
     if [ "${INFINITE_GRADER_TEST_ACCOUNT+set}" = set ]; then
+      override_active=1
       case "$INFINITE_GRADER_TEST_ACCOUNT" in
         ''|root|*[!A-Za-z0-9._-]*) refuse ;;
       esac
       ACCOUNT=$INFINITE_GRADER_TEST_ACCOUNT
     fi
     if [ "${INFINITE_GRADER_TEST_PRLIMIT_NPROC+set}" = set ]; then
+      override_active=1
       case "$INFINITE_GRADER_TEST_PRLIMIT_NPROC" in
         off) PRLIMIT_NPROC=off ;;
         *)
@@ -320,10 +324,13 @@ load_test_overrides() {
       esac
     fi
     if [ "${INFINITE_GRADER_TEST_STOP_KILL_MODE+set}" = set ]; then
+      override_active=1
       case "$INFINITE_GRADER_TEST_STOP_KILL_MODE" in
-        kill|refuse) STOP_KILL_MODE=$INFINITE_GRADER_TEST_STOP_KILL_MODE ;;
+        refuse) STOP_KILL_MODE=refuse ;;
         *) refuse ;;
       esac
+    elif [ "$override_active" -eq 1 ]; then
+      STOP_KILL_MODE=refuse
     fi
   fi
   unset INFINITE_GRADER_TEST_ROOT INFINITE_GRADER_TEST_ACCOUNT \

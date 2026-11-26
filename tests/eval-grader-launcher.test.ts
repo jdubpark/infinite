@@ -9,15 +9,20 @@ import { fileURLToPath } from "node:url";
 
 const LAUNCHER = fileURLToPath(new URL("../deploy/ubuntu/grader-command.sh", import.meta.url));
 const SUDOERS = fileURLToPath(new URL("../deploy/ubuntu/grader.sudoers", import.meta.url));
+const CURRENT_USER = userInfo().username;
 const SKIP = process.platform !== "linux" ? "the launcher runs on Linux only"
-  : process.getuid?.() === 0 ? "the launcher test must not run as root" : false;
+  : process.getuid?.() === 0 ? "the launcher test must not run as root"
+  : ["infinite-eval", "infinite-grader"].includes(CURRENT_USER) || /^infinite-[a-z0-9-]+-(?:eval|grader)$/.test(CURRENT_USER)
+    ? `the launcher test must not run as production service account ${CURRENT_USER}` : false;
 const JOB = "11111111-2222-4333-8444-555555555555";
 const OTHER = "66666666-7777-4888-8999-aaaaaaaaaaaa";
 const UNUSED = "99999999-8888-4777-8666-555555555555";
+const DESTRUCTIVE_OPS = new Set(["clean", "remove", "stop"]);
 
-type Sandbox = { dir: string; root: string; env: Record<string, string> };
+type Sandbox = { dir: string; root: string; account: string; env: Record<string, string> };
+const verifiedSandboxes = new WeakSet<Sandbox>();
 
-function sandbox(account: string = userInfo().username): Sandbox {
+function sandbox(account: string = CURRENT_USER): Sandbox {
   const dir = mkdtempSync(join(tmpdir(), "grader-launcher-"));
   const root = join(dir, "root");
   mkdirSync(root, { mode: 0o700 });
@@ -25,6 +30,7 @@ function sandbox(account: string = userInfo().username): Sandbox {
   return {
     dir,
     root,
+    account,
     env: {
       INFINITE_GRADER_TEST_ROOT: root,
       INFINITE_GRADER_TEST_ACCOUNT: account,
@@ -32,6 +38,18 @@ function sandbox(account: string = userInfo().username): Sandbox {
       INFINITE_GRADER_TEST_STOP_KILL_MODE: "refuse",
     },
   };
+}
+
+function assertOverridesActive(sb: Sandbox): void {
+  if (verifiedSandboxes.has(sb) || sb.account !== CURRENT_USER) return;
+  const probe = spawnSync("/bin/sh", [LAUNCHER, "probe", "--"], {
+    env: { ...sb.env, PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
+    maxBuffer: 1 << 20,
+    timeout: 60_000,
+  });
+  assert.equal(probe.status, 0, `probe before destructive op failed: ${probe.stderr.toString("utf8")}`);
+  assert.equal((JSON.parse(probe.stdout.toString("utf8")) as { root?: string }).root, sb.root, "launcher overrides are not active");
+  verifiedSandboxes.add(sb);
 }
 
 function cleanup(sb: Sandbox): void {
@@ -44,6 +62,7 @@ function jobPath(sb: Sandbox, ...parts: string[]): string {
 }
 
 function grader(sb: Sandbox, args: readonly string[], options: { input?: string; env?: NodeJS.ProcessEnv } = {}) {
+  if (args[0] && DESTRUCTIVE_OPS.has(args[0])) assertOverridesActive(sb);
   return spawnSync("/bin/sh", [LAUNCHER, ...args], {
     input: options.input,
     env: { ...sb.env, ...(options.env ?? { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" }) },
@@ -80,6 +99,7 @@ test("test overrides are ignored under privilege escalation and reject invalid v
     assert.equal(emptySudo.status, 64, "even empty SUDO_USER must disable test overrides");
 
     const invalidCases: Array<Record<string, string>> = [
+      { INFINITE_GRADER_TEST_STOP_KILL_MODE: "kill" },
       { INFINITE_GRADER_TEST_STOP_KILL_MODE: "skip" },
       { INFINITE_GRADER_TEST_STOP_KILL_MODE: "invalid" },
       { INFINITE_GRADER_TEST_PRLIMIT_NPROC: "0" },
@@ -95,6 +115,18 @@ test("test overrides are ignored under privilege escalation and reject invalid v
       assert.equal(rejected.status, 64, JSON.stringify(override));
     }
     assert.equal(grader(sb, ["stop"]).status, 99, "STOP_KILL_MODE=refuse exits 99 when reached as matching account");
+
+    const envWithoutKillMode = { ...sb.env, ...baseEnv };
+    delete envWithoutKillMode.INFINITE_GRADER_TEST_STOP_KILL_MODE;
+    const sleeper = spawn("sleep", [String(randomInt(100_000, 900_000))], { stdio: "ignore" });
+    try {
+      const defaultStop = spawnSync("/bin/sh", [LAUNCHER, "stop"], { env: envWithoutKillMode, timeout: 60_000 });
+      assert.equal(defaultStop.status, 99, "omitting STOP_KILL_MODE under overrides must default to refuse, never kill");
+      assert.equal(sleeper.exitCode, null);
+      assert.equal(sleeper.signalCode, null);
+    } finally {
+      sleeper.kill("SIGKILL");
+    }
   } finally {
     cleanup(sb);
   }
@@ -209,6 +241,7 @@ test("clean and remove empty a read-only tree", { skip: SKIP }, () => {
 test("clean and remove work from a directory the account cannot enter", { skip: SKIP }, () => {
   const sb = sandbox();
   const fromClosed = (args: readonly string[]) => {
+    if (args[0] && DESTRUCTIVE_OPS.has(args[0])) assertOverridesActive(sb);
     const closed = mkdtempSync(join(sb.dir, "closed-"));
     return spawnSync("/bin/sh", ["-c", 'cd "$1" && chmod 000 . && [ ! -r . ] && shift && exec /bin/sh "$@"', "sh", closed, LAUNCHER, ...args], {
       env: { ...sb.env, PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },

@@ -295,7 +295,8 @@ test("secondary and primary repository-graph wrappers enforce strict instance ro
   const workOut = render(["--instance", "work"]);
   const workWrapper = join(workOut, "repository-graph-wrapper.py");
   const primaryWrapper = resolve("deploy/ubuntu/repository-graph-wrapper.py");
-  const runGraph = (script: string, args: string[]) => spawnSync("python3", [script, ...args], { encoding: "utf8" });
+  const runGraph = (script: string, args: string[], env?: NodeJS.ProcessEnv) =>
+    spawnSync("python3", [script, ...args], { encoding: "utf8", env });
 
   const workRefusals: Array<[string, string[]]> = [
     ["first-instance workspace", ["--repo", "/srv/infinite-data/workspaces/project-a", "--cache-dir", "/srv/infinite-data/instances/work/repository-graphs/lane/shared", "--ref", "HEAD"]],
@@ -315,44 +316,97 @@ test("secondary and primary repository-graph wrappers enforce strict instance ro
     assert.match(result.stderr, /Repository graph request refused: (?:The requested path is outside its assigned root|An absolute path is required)/, label);
   }
 
-  for (const repo of ["/srv/infinite-data/instances/work/workspaces/project-a", "/srv/infinite-data/instances/work/team-workspaces/run-1/member"]) {
-    const allowed = runGraph(workWrapper, ["--repo", repo, "--cache-dir", "/srv/infinite-data/instances/work/repository-graphs/lane/shared", "--ref", "HEAD"]);
-    assert.doesNotMatch(allowed.stderr, /outside its assigned root|absolute path|Symlinked/, repo);
-  }
-
   const primaryRefusal = runGraph(primaryWrapper, ["--repo", "/srv/infinite-data/instances/work/workspaces/project-a", "--cache-dir", "/srv/infinite-data/repository-graphs/lane/shared", "--ref", "HEAD"]);
   assert.notEqual(primaryRefusal.status, 0);
   assert.match(primaryRefusal.stderr, /outside its assigned root/);
-  const primaryAllowed = runGraph(primaryWrapper, ["--repo", "/srv/infinite-data/workspaces/project-a", "--cache-dir", "/srv/infinite-data/repository-graphs/lane/shared", "--ref", "HEAD"]);
-  assert.doesNotMatch(primaryAllowed.stderr, /outside its assigned root|absolute path|Symlinked/);
 
-  const sandbox = tmp();
-  const symlinkProbe = spawnSync("python3", [
-    "-c",
-    [
-      "import importlib.util, os, pathlib, sys",
-      "spec = importlib.util.spec_from_file_location('rgw', sys.argv[1])",
-      "mod = importlib.util.module_from_spec(spec)",
-      "spec.loader.exec_module(mod)",
-      "base = pathlib.Path(sys.argv[2])",
-      "ws = base / 'workspaces'",
-      "other = base / 'other'",
-      "(ws / 'real').mkdir(parents=True)",
-      "other.mkdir(parents=True)",
-      "(ws / 'out-link').symlink_to(other)",
-      "(ws / 'in-link').symlink_to(ws / 'real')",
-      "assert mod.inside(str(ws / 'real'), ws) == str((ws / 'real').resolve())",
-      "for bad in [ws / 'out-link', ws / 'in-link', other, ws, ws / 'real' / '..' / 'real']:",
-      "    try:",
-      "        mod.inside(str(bad), ws)",
-      "        raise AssertionError(f'accepted {bad}')",
-      "    except ValueError:",
-      "        pass",
-    ].join("\n"),
-    workWrapper,
-    sandbox,
-  ], { encoding: "utf8" });
-  assert.equal(symlinkProbe.status, 0, symlinkProbe.stderr || symlinkProbe.stdout);
+  const sandbox = realpathSync(tmp());
+  const ws = join(sandbox, "workspaces");
+  const teamWs = join(sandbox, "team-workspaces");
+  const cacheRoot = join(sandbox, "repository-graphs");
+  const tmpAgent = join(sandbox, "tmp", "agent");
+  const repoA = join(ws, "project-a");
+  const teamRepo = join(teamWs, "run-1", "member");
+  const laneCache = join(cacheRoot, "lane", "shared");
+  const seedCache = join(cacheRoot, "lane", "seed");
+  const other = join(sandbox, "other");
+  mkdirSync(repoA, { recursive: true });
+  mkdirSync(teamRepo, { recursive: true });
+  mkdirSync(laneCache, { recursive: true });
+  mkdirSync(seedCache, { recursive: true });
+  mkdirSync(tmpAgent, { recursive: true });
+  mkdirSync(other, { recursive: true });
+  symlinkSync(other, join(ws, "out-link"));
+  symlinkSync(repoA, join(ws, "in-link"));
+
+  const stubBuilder = join(sandbox, "stub-builder.py");
+  writeFileSync(stubBuilder, "import json, os, sys\nprint(json.dumps({'cwd': os.getcwd(), 'argv': sys.argv[1:], 'env': dict(os.environ)}))\n", { mode: 0o700 });
+  const stubGraphify = join(sandbox, "stub-graphify");
+  writeFileSync(stubGraphify, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+
+  for (const [label, sourceFile, rootToken, builderToken] of [
+    ["secondary", workWrapper, "/srv/infinite-data/instances/work", "/opt/infinite-work/scripts/repository_graph.py"],
+    ["primary", primaryWrapper, "/srv/infinite-data", "/opt/infinite/scripts/repository_graph.py"],
+  ] as const) {
+    const isolatedWrapper = join(sandbox, `${label}-graph-wrapper.py`);
+    const text = readFileSync(sourceFile, "utf8")
+      .replaceAll(rootToken, sandbox)
+      .replaceAll(builderToken, stubBuilder)
+      .replaceAll("/usr/local/bin/graphify", stubGraphify);
+    writeFileSync(isolatedWrapper, text, { mode: 0o700 });
+
+    for (const [caseName, repo, extra] of [
+      ["workspace", repoA, []],
+      ["team-workspace", teamRepo, ["--seed-cache-dir", seedCache]],
+    ] as const) {
+      const ok = runGraph(isolatedWrapper, ["--repo", repo, "--cache-dir", laneCache, "--ref", "HEAD", "--graphify", stubGraphify, ...extra], {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        SECRET_CALLER_VAR: "must-not-leak",
+      });
+      assert.equal(ok.status, 0, `${label}/${caseName}: ${ok.stderr}`);
+      const payload = JSON.parse(ok.stdout) as { cwd: string; argv: string[]; env: Record<string, string> };
+      assert.equal(payload.cwd, cacheRoot, `${label}/${caseName}`);
+      assert.deepEqual(payload.argv, [
+        "--repo", repo, "--cache-dir", laneCache, "--ref", "HEAD", "--graphify", stubGraphify,
+        "--timeout-seconds", "120", "--max-workers", "2", ...extra,
+      ], `${label}/${caseName}`);
+      assert.equal(payload.env.HOME, join(cacheRoot, "tool-home"));
+      assert.equal(payload.env.TMPDIR, tmpAgent);
+      assert.equal(payload.env.SECRET_CALLER_VAR, undefined);
+    }
+
+    for (const bad of [join(ws, "out-link"), join(ws, "in-link"), other, ws]) {
+      const denied = runGraph(isolatedWrapper, ["--repo", bad, "--cache-dir", laneCache, "--ref", "HEAD", "--graphify", stubGraphify]);
+      assert.notEqual(denied.status, 0, `${label} ${bad}`);
+      assert.match(denied.stderr, /Repository graph request refused:/);
+    }
+  }
+
+  const ancestorSb = realpathSync(tmp());
+  const realParent = join(ancestorSb, "real-parent");
+  mkdirSync(join(realParent, "workspaces", "repo"), { recursive: true });
+  mkdirSync(join(realParent, "team-workspaces"), { recursive: true });
+  mkdirSync(join(realParent, "repository-graphs", "lane"), { recursive: true });
+  mkdirSync(join(realParent, "tmp", "agent"), { recursive: true });
+  const linkParent = join(ancestorSb, "link-parent");
+  symlinkSync(realParent, linkParent);
+  const ancestorWrapper = join(ancestorSb, "ancestor-graph-wrapper.py");
+  writeFileSync(
+    ancestorWrapper,
+    readFileSync(workWrapper, "utf8")
+      .replaceAll("/srv/infinite-data/instances/work", linkParent)
+      .replaceAll("/opt/infinite-work/scripts/repository_graph.py", stubBuilder)
+      .replaceAll("/usr/local/bin/graphify", stubGraphify),
+    { mode: 0o700 },
+  );
+  const ancestorRefused = runGraph(ancestorWrapper, [
+    "--repo", join(linkParent, "workspaces", "repo"),
+    "--cache-dir", join(linkParent, "repository-graphs", "lane"),
+    "--ref", "HEAD",
+    "--graphify", stubGraphify,
+  ]);
+  assert.notEqual(ancestorRefused.status, 0);
+  assert.match(ancestorRefused.stderr, /Symlinked repository or cache paths are not supported/);
 });
 
 test("secondary and primary jevcode wrappers enforce strict instance root isolation", {
@@ -366,6 +420,10 @@ test("secondary and primary jevcode wrappers enforce strict instance root isolat
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
     encoding: "utf8",
   });
+  const gitInit = (dir: string) => {
+    const res = spawnSync("git", ["init", "--quiet"], { cwd: dir, encoding: "utf8" });
+    assert.equal(res.status, 0, res.stderr);
+  };
 
   const workRefusals: Array<[string, string[]]> = [
     ["first-instance workspace", ["auto", "--repo", "/srv/infinite-data/workspaces/project-a"]],
@@ -379,6 +437,8 @@ test("secondary and primary jevcode wrappers enforce strict instance root isolat
     ["relative repo", ["auto", "--repo", "project-a"]],
     ["missing repo value", ["auto", "--repo"]],
     ["first-instance log path", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--log", "/srv/infinite-data/control/state"]],
+    ["agent-home jev api key as log", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--log", "/srv/infinite-data/instances/work/agent-home/.config/jevcode/jev-api-key"]],
+    ["agent-home codex auth as equals log", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--log=/srv/infinite-data/instances/work/agent-home/.codex/auth.json"]],
     ["unsupported state-dir flag", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--state-dir=/srv/infinite-data/agent-home/.jevcode"]],
     ["first-instance absolute focus", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--focus", "/srv/infinite-data/workspaces/project-a"]],
     ["traversing relative focus", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--focus", "../../workspaces/project-a"]],
@@ -398,75 +458,175 @@ test("secondary and primary jevcode wrappers enforce strict instance root isolat
     assert.match(result.stderr, /^jevcode request refused:/, label);
   }
 
-  const validWorkCases: Array<[string, string[]]> = [
-    ["auto host briefing args", ["--report-usage", "auto", "--trigger", "host", "--format", "json", "--activity-stdin", "--session", "sess-1", "--repo", "/srv/infinite-data/instances/work/workspaces/project-a", "--timeout", "300", "--base", "a".repeat(40), "--runner", "codex", "--model", "meta/muse-spark-1.3-contributor"]],
-    ["workspace repo with relative focus", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/project-a", "--focus", "packages/host"]],
-    ["team workspace repo with instance log", ["auto", "--repo=/srv/infinite-data/instances/work/team-workspaces/run-1/member", "--log", "/srv/infinite-data/instances/work/tmp/agent/session.jsonl"]],
-    ["brief with leading-slash question", ["brief", "--repo", "/srv/infinite-data/instances/work/workspaces/project-a", "--focus", "", "--question", "/api/sessions summary", "--format", "json", "--no-state"]],
-    ["brief with equals leading-slash question", ["brief", "--repo", "/srv/infinite-data/instances/work/workspaces/project-a", "--question=/api/sessions summary", "--format", "json", "--no-state"]],
-    ["context call", ["context", "--repo", "/srv/infinite-data/instances/work/workspaces/project-a"]],
-  ];
-  for (const [label, args] of validWorkCases) {
-    const result = runJevcode(workWrapper, args);
-    assert.notEqual(result.status, 64, `${label}: stderr=${result.stderr}`);
-    assert.doesNotMatch(result.stderr, /^jevcode request refused:/, label);
-  }
-
-  for (const args of [["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/project-a"], ["auto", "--repo", "/etc/passwd"]]) {
+  for (const args of [
+    ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/project-a"],
+    ["auto", "--repo", "/etc/passwd"],
+    ["auto", "--repo", "/srv/infinite-data/workspaces/project-a", "--log", "/srv/infinite-data/agent-home/.config/jevcode/jev-api-key"],
+  ]) {
     const refused = runJevcode(primaryWrapper, args);
     assert.equal(refused.status, 64, args.join(" "));
     assert.match(refused.stderr, /^jevcode request refused:/);
   }
-  for (const args of [["auto", "--repo", "/srv/infinite-data/workspaces/project-a"], ["auto", "--repo", "/srv/infinite-data/team-workspaces/run-1/member"]]) {
-    const allowed = runJevcode(primaryWrapper, args);
-    assert.notEqual(allowed.status, 64, `${args.join(" ")}: stderr=${allowed.stderr}`);
-    assert.doesNotMatch(allowed.stderr, /^jevcode request refused:/);
-  }
 
   const sb = realpathSync(tmp());
   const ws = join(sb, "workspaces");
+  const teamWs = join(sb, "team-workspaces");
   const realRepo = join(ws, "real-repo");
+  const teamRepo = join(teamWs, "run-1", "member");
   const outside = join(sb, "outside");
   mkdirSync(join(realRepo, "src"), { recursive: true });
-  mkdirSync(join(sb, "team-workspaces"), { recursive: true });
-  mkdirSync(join(sb, "agent-home"), { recursive: true });
+  mkdirSync(teamRepo, { recursive: true });
+  mkdirSync(join(sb, "agent-home", ".config", "jevcode"), { recursive: true });
   mkdirSync(join(sb, "tmp", "agent"), { recursive: true });
   mkdirSync(outside, { recursive: true });
+  gitInit(realRepo);
+  gitInit(teamRepo);
+  writeFileSync(join(sb, "agent-home", ".config", "jevcode", "jev-api-key"), "test-jev-key\n", { mode: 0o600 });
+  writeFileSync(join(sb, "tmp", "agent", "session.jsonl"), "{}\n");
   symlinkSync(outside, join(ws, "out-link"));
   symlinkSync(realRepo, join(ws, "in-link"));
   symlinkSync(outside, join(realRepo, "focus-out-link"));
   symlinkSync(join(realRepo, "src"), join(realRepo, "focus-in-link"));
-  const scopedWrapper = join(sb, "jevcode-scoped.sh");
-  writeFileSync(scopedWrapper, readFileSync(workWrapper, "utf8").replaceAll("/srv/infinite-data/instances/work", sb), { mode: 0o700 });
 
-  for (const [label, args, cwd] of [
-    ["symlink repo pointing outside", ["auto", "--repo", join(ws, "out-link")], sb],
-    ["symlink repo pointing inside", ["auto", "--repo", join(ws, "in-link")], sb],
-    ["relative focus symlink pointing outside", ["brief", "--repo", realRepo, "--focus", "focus-out-link"], sb],
-    ["relative focus symlink pointing inside", ["brief", "--repo", realRepo, "--focus", "focus-in-link"], sb],
-    ["cwd via symlink pointing outside", ["show"], join(ws, "out-link")],
-  ] as Array<[string, string[], string]>) {
-    const res = runJevcode(scopedWrapper, args, cwd);
-    assert.equal(res.status, 64, `${label}: stderr=${res.stderr}`);
-    assert.match(res.stderr, /^jevcode request refused:/, label);
+  const stubCli = join(sb, "stub-jevcode-cli.mjs");
+  writeFileSync(stubCli, [
+    "process.stdout.write(JSON.stringify({",
+    "  cwd: process.cwd(),",
+    "  argv: process.argv.slice(2),",
+    "  env: {",
+    "    HOME: process.env.HOME,",
+    "    TMPDIR: process.env.TMPDIR,",
+    "    npm_config_store_dir: process.env.npm_config_store_dir,",
+    "    COREPACK_HOME: process.env.COREPACK_HOME,",
+    "    PATH: process.env.PATH,",
+    "    JEV_API_KEY: process.env.JEV_API_KEY,",
+    "  },",
+    "}));",
+  ].join("\n"));
+
+  const makeIsolatedJevcode = (sourceFile: string, rootToken: string, outFile: string) => {
+    const text = readFileSync(sourceFile, "utf8")
+      .replaceAll(rootToken, sb)
+      .replaceAll("/opt/infinite-agents/v1", join(sb, "agents", "v1"))
+      .replace("exec /usr/local/bin/node /opt/jevcode-repo-agent/dist/cli.js \"$@\"", `exec "${process.execPath}" "${stubCli}" "$@"`);
+    writeFileSync(outFile, text, { mode: 0o700 });
+    return outFile;
+  };
+
+  for (const [label, sourceFile, rootToken] of [
+    ["secondary", workWrapper, "/srv/infinite-data/instances/work"],
+    ["primary", primaryWrapper, "/srv/infinite-data"],
+  ] as const) {
+    const scopedWrapper = makeIsolatedJevcode(sourceFile, rootToken, join(sb, `${label}-jevcode-scoped.sh`));
+    const validCases: Array<[string, string[], string, string]> = [
+      [
+        "auto host briefing args",
+        ["--report-usage", "auto", "--trigger", "host", "--format", "json", "--activity-stdin", "--session", "sess-1", "--repo", realRepo, "--timeout", "300", "--base", "a".repeat(40), "--runner", "codex", "--model", "meta/muse-spark-1.3-contributor"],
+        sb,
+        realRepo,
+      ],
+      [
+        "team workspace repo with instance log",
+        ["auto", `--repo=${teamRepo}`, "--log", join(sb, "tmp", "agent", "session.jsonl")],
+        sb,
+        teamRepo,
+      ],
+      [
+        "brief with leading-slash question and relative focus",
+        ["brief", "--repo", realRepo, "--focus", "src", "--question", "/api/sessions summary", "--format", "json", "--no-state"],
+        sb,
+        realRepo,
+      ],
+      [
+        "brief with empty focus and equals leading-slash question",
+        ["brief", "--repo", realRepo, "--focus", "", "--question=/api/sessions summary", "--format", "json", "--no-state"],
+        sb,
+        realRepo,
+      ],
+      [
+        "context call",
+        ["context", "--repo", realRepo],
+        sb,
+        realRepo,
+      ],
+      [
+        "implicit physical cwd inside repo",
+        ["show"],
+        realRepo,
+        realRepo,
+      ],
+    ];
+    for (const [caseName, args, cwd, expectedCwd] of validCases) {
+      const ok = runJevcode(scopedWrapper, args, cwd);
+      assert.equal(ok.status, 0, `${label}/${caseName}: stderr=${ok.stderr}`);
+      const payload = JSON.parse(ok.stdout) as { cwd: string; argv: string[]; env: Record<string, string> };
+      assert.equal(payload.cwd, expectedCwd, `${label}/${caseName}`);
+      assert.deepEqual(payload.argv, args, `${label}/${caseName}`);
+      assert.equal(payload.env.HOME, join(sb, "agent-home"));
+      assert.equal(payload.env.TMPDIR, join(sb, "tmp", "agent"));
+      assert.equal(payload.env.JEV_API_KEY, "test-jev-key");
+    }
+
+    for (const [caseName, args, cwd] of [
+      ["symlink repo pointing outside", ["auto", "--repo", join(ws, "out-link")], sb],
+      ["symlink repo pointing inside", ["auto", "--repo", join(ws, "in-link")], sb],
+      ["relative focus symlink pointing outside", ["brief", "--repo", realRepo, "--focus", "focus-out-link"], sb],
+      ["relative focus symlink pointing inside", ["brief", "--repo", realRepo, "--focus", "focus-in-link"], sb],
+      ["cwd via symlink pointing outside", ["show"], join(ws, "out-link")],
+      ["agent-home api key as log", ["auto", "--repo", realRepo, "--log", join(sb, "agent-home", ".config", "jevcode", "jev-api-key")], sb],
+    ] as Array<[string, string[], string]>) {
+      const res = runJevcode(scopedWrapper, args, cwd);
+      assert.equal(res.status, 64, `${label}/${caseName}: stderr=${res.stderr}`);
+      assert.match(res.stderr, /^jevcode request refused:/, `${label}/${caseName}`);
+    }
   }
-  const realOk = runJevcode(scopedWrapper, ["brief", "--repo", realRepo, "--focus", "src"], sb);
-  assert.notEqual(realOk.status, 64, realOk.stderr);
-  assert.doesNotMatch(realOk.stderr, /^jevcode request refused:/);
-  const cwdOk = runJevcode(scopedWrapper, ["show"], realRepo);
-  assert.notEqual(cwdOk.status, 64, cwdOk.stderr);
-  assert.doesNotMatch(cwdOk.stderr, /^jevcode request refused:/);
+
+  const gitRootSb = realpathSync(tmp());
+  const gitRootWs = join(gitRootSb, "workspaces");
+  const childDir = join(gitRootWs, "child");
+  const escapedWorktree = join(gitRootWs, "escaped-worktree");
+  const externalGit = join(gitRootSb, "external-repo");
+  mkdirSync(childDir, { recursive: true });
+  mkdirSync(escapedWorktree, { recursive: true });
+  mkdirSync(externalGit, { recursive: true });
+  mkdirSync(join(gitRootSb, "team-workspaces"), { recursive: true });
+  mkdirSync(join(gitRootSb, "agent-home"), { recursive: true });
+  mkdirSync(join(gitRootSb, "tmp", "agent"), { recursive: true });
+  gitInit(gitRootWs);
+  gitInit(externalGit);
+  writeFileSync(join(escapedWorktree, ".git"), `gitdir: ${join(externalGit, ".git")}\n`);
+  const gitRootWrapper = join(gitRootSb, "jevcode-gitroot.sh");
+  writeFileSync(
+    gitRootWrapper,
+    readFileSync(workWrapper, "utf8")
+      .replaceAll("/srv/infinite-data/instances/work", gitRootSb)
+      .replace("exec /usr/local/bin/node /opt/jevcode-repo-agent/dist/cli.js \"$@\"", `exec "${process.execPath}" "${stubCli}" "$@"`),
+    { mode: 0o700 },
+  );
+  const gitTopRefused = runJevcode(gitRootWrapper, ["auto", "--repo", childDir], gitRootSb);
+  assert.equal(gitTopRefused.status, 64, gitTopRefused.stderr);
+  assert.match(gitTopRefused.stderr, /^jevcode request refused: path is outside its assigned root/);
+  const gitWorktreeRefused = runJevcode(gitRootWrapper, ["auto", "--repo", escapedWorktree], gitRootSb);
+  assert.equal(gitWorktreeRefused.status, 64, gitWorktreeRefused.stderr);
+  assert.match(gitWorktreeRefused.stderr, /^jevcode request refused:/);
 
   const symRootSb = realpathSync(tmp());
   const realTarget = join(symRootSb, "target");
-  mkdirSync(join(realTarget, "repo"), { recursive: true });
-  symlinkSync(realTarget, join(symRootSb, "workspaces"));
-  mkdirSync(join(symRootSb, "team-workspaces"), { recursive: true });
-  mkdirSync(join(symRootSb, "agent-home"), { recursive: true });
-  mkdirSync(join(symRootSb, "tmp", "agent"), { recursive: true });
-  const symRootWrapper = join(symRootSb, "jevcode-symroot.sh");
-  writeFileSync(symRootWrapper, readFileSync(workWrapper, "utf8").replaceAll("/srv/infinite-data/instances/work", symRootSb), { mode: 0o700 });
-  const symRootRefused = runJevcode(symRootWrapper, ["auto", "--repo", join(symRootSb, "workspaces", "repo")], symRootSb);
-  assert.equal(symRootRefused.status, 64, symRootRefused.stderr);
-  assert.match(symRootRefused.stderr, /^jevcode request refused: symlinked root is not supported/);
+  mkdirSync(join(realTarget, "workspaces", "repo"), { recursive: true });
+  mkdirSync(join(realTarget, "team-workspaces"), { recursive: true });
+  mkdirSync(join(realTarget, "agent-home"), { recursive: true });
+  mkdirSync(join(realTarget, "tmp", "agent"), { recursive: true });
+  const linkParent = join(symRootSb, "link-parent");
+  symlinkSync(realTarget, linkParent);
+  const ancestorWrapper = join(symRootSb, "jevcode-ancestor.sh");
+  writeFileSync(
+    ancestorWrapper,
+    readFileSync(workWrapper, "utf8")
+      .replaceAll("/srv/infinite-data/instances/work", linkParent)
+      .replace("exec /usr/local/bin/node /opt/jevcode-repo-agent/dist/cli.js \"$@\"", `exec "${process.execPath}" "${stubCli}" "$@"`),
+    { mode: 0o700 },
+  );
+  const ancestorRefused = runJevcode(ancestorWrapper, ["auto", "--repo", join(linkParent, "workspaces", "repo")], symRootSb);
+  assert.equal(ancestorRefused.status, 64, ancestorRefused.stderr);
+  assert.match(ancestorRefused.stderr, /^jevcode request refused: symlinked root is not supported/);
 });

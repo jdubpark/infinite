@@ -537,29 +537,36 @@ allow_test_overrides() {
 
 load_test_overrides() {
   if allow_test_overrides; then
+    override_active=0
     if [ "${INFINITE_EVAL_TEST_ROOT+set}" = set ]; then
+      override_active=1
       valid_abs_path "$INFINITE_EVAL_TEST_ROOT" || refuse
       ROOT=$INFINITE_EVAL_TEST_ROOT
     fi
     if [ "${INFINITE_EVAL_TEST_ACCOUNT+set}" = set ]; then
+      override_active=1
       case "$INFINITE_EVAL_TEST_ACCOUNT" in
         ''|root|*[!A-Za-z0-9._-]*) refuse ;;
       esac
       ACCOUNT=$INFINITE_EVAL_TEST_ACCOUNT
     fi
     if [ "${INFINITE_EVAL_TEST_HOME+set}" = set ]; then
+      override_active=1
       valid_abs_path "$INFINITE_EVAL_TEST_HOME" || refuse
       EVAL_HOME=$INFINITE_EVAL_TEST_HOME
     fi
     if [ "${INFINITE_EVAL_TEST_TEMPLATE+set}" = set ]; then
+      override_active=1
       valid_abs_path "$INFINITE_EVAL_TEST_TEMPLATE" || refuse
       TEMPLATE=$INFINITE_EVAL_TEST_TEMPLATE
     fi
     if [ "${INFINITE_EVAL_TEST_TMP+set}" = set ]; then
+      override_active=1
       valid_abs_path "$INFINITE_EVAL_TEST_TMP" || refuse
       EVAL_TMP=$INFINITE_EVAL_TEST_TMP
     fi
     if [ "${INFINITE_EVAL_TEST_STOP_DIRS+set}" = set ]; then
+      override_active=1
       stop_count=0
       set -f
       # shellcheck disable=SC2086
@@ -572,6 +579,7 @@ load_test_overrides() {
       STOP_DIRS=$INFINITE_EVAL_TEST_STOP_DIRS
     fi
     if [ "${INFINITE_EVAL_TEST_PRLIMIT_NPROC+set}" = set ]; then
+      override_active=1
       case "$INFINITE_EVAL_TEST_PRLIMIT_NPROC" in
         off) PRLIMIT_NPROC=off ;;
         *)
@@ -581,14 +589,18 @@ load_test_overrides() {
       esac
     fi
     if [ "${INFINITE_EVAL_TEST_SYSVIPC_DIR+set}" = set ]; then
+      override_active=1
       valid_abs_path "$INFINITE_EVAL_TEST_SYSVIPC_DIR" || refuse
       SYSVIPC_DIR=$INFINITE_EVAL_TEST_SYSVIPC_DIR
     fi
     if [ "${INFINITE_EVAL_TEST_STOP_KILL_MODE+set}" = set ]; then
+      override_active=1
       case "$INFINITE_EVAL_TEST_STOP_KILL_MODE" in
-        kill|skip|refuse) STOP_KILL_MODE=$INFINITE_EVAL_TEST_STOP_KILL_MODE ;;
+        skip|refuse) STOP_KILL_MODE=$INFINITE_EVAL_TEST_STOP_KILL_MODE ;;
         *) refuse ;;
       esac
+    elif [ "$override_active" -eq 1 ]; then
+      STOP_KILL_MODE=refuse
     fi
   fi
   unset INFINITE_EVAL_TEST_ROOT INFINITE_EVAL_TEST_ACCOUNT INFINITE_EVAL_TEST_HOME \

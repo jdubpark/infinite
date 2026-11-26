@@ -9,19 +9,24 @@ import { fileURLToPath } from "node:url";
 
 const LAUNCHER = fileURLToPath(new URL("../deploy/ubuntu/eval-command.sh", import.meta.url));
 const SUDOERS = fileURLToPath(new URL("../deploy/ubuntu/eval.sudoers", import.meta.url));
+const CURRENT_USER = userInfo().username;
 const SKIP = process.platform !== "linux" ? "the launcher runs on Linux only"
-  : process.getuid?.() === 0 ? "the launcher test must not run as root" : false;
+  : process.getuid?.() === 0 ? "the launcher test must not run as root"
+  : ["infinite-eval", "infinite-grader"].includes(CURRENT_USER) || /^infinite-[a-z0-9-]+-(?:eval|grader)$/.test(CURRENT_USER)
+    ? `the launcher test must not run as production service account ${CURRENT_USER}` : false;
 const TRIAL = "11111111-2222-4333-8444-555555555555";
 const FIXED = [
   "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT",
   "HOME", "LANG", "LC_ALL", "PATH", "TMPDIR",
 ];
 const PROXY = ["HTTPS_PROXY", "HTTP_PROXY", "NODE_USE_ENV_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"];
+const DESTRUCTIVE_OPS = new Set(["clean", "scrub", "stop"]);
 
-type Sandbox = { dir: string; root: string; home: string; template: string; tmp: string; env: Record<string, string> };
+type Sandbox = { dir: string; root: string; home: string; template: string; tmp: string; account: string; env: Record<string, string> };
 type Copy = { stop?: string; kernelTables?: boolean };
+const verifiedSandboxes = new WeakSet<Sandbox>();
 
-function sandbox(account: string = userInfo().username, copy: Copy = {}): Sandbox {
+function sandbox(account: string = CURRENT_USER, copy: Copy = {}): Sandbox {
   const kernelTables = copy.kernelTables === true || copy.stop !== undefined;
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "eval-launcher-")));
   const root = join(dir, "root");
@@ -52,7 +57,20 @@ function sandbox(account: string = userInfo().username, copy: Copy = {}): Sandbo
     for (const name of ["shm", "sem", "msg"]) writeFileSync(join(tables, name), `${readFileSync(`/proc/sysvipc/${name}`, "utf8").split("\n", 1)[0]}\n`);
     env.INFINITE_EVAL_TEST_SYSVIPC_DIR = tables;
   }
-  return { dir, root, home, template, tmp, env };
+  return { dir, root, home, template, tmp, account, env };
+}
+
+function assertOverridesActive(sb: Sandbox): void {
+  if (verifiedSandboxes.has(sb) || sb.account !== CURRENT_USER) return;
+  const probe = spawnSync("/bin/sh", [LAUNCHER, "probe", "--"], {
+    cwd: sb.dir,
+    env: { ...sb.env, PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
+    maxBuffer: 1 << 20,
+    timeout: 60_000,
+  });
+  assert.equal(probe.status, 0, `probe before destructive op failed: ${probe.stderr.toString("utf8")}`);
+  assert.equal((JSON.parse(probe.stdout.toString("utf8")) as { root?: string }).root, sb.root, "launcher overrides are not active");
+  verifiedSandboxes.add(sb);
 }
 
 function cleanup(sb: Sandbox): void {
@@ -61,6 +79,7 @@ function cleanup(sb: Sandbox): void {
 }
 
 function run(sb: Sandbox, args: readonly string[], options: { input?: string | Buffer; cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
+  if (args[0] && DESTRUCTIVE_OPS.has(args[0])) assertOverridesActive(sb);
   return spawnSync("/bin/sh", [LAUNCHER, ...args], {
     input: options.input,
     cwd: options.cwd ?? sb.dir,
@@ -120,7 +139,10 @@ function envNames(stdout: Buffer): string[] {
 function leftovers(sb: Sandbox): number {
   const probe = run(sb, ["probe", "--"]);
   assert.equal(probe.status, 0, probe.stderr.toString("utf8"));
-  return JSON.parse(probe.stdout.toString("utf8")).leftovers;
+  const parsed = JSON.parse(probe.stdout.toString("utf8")) as { root: string; leftovers: number };
+  assert.equal(parsed.root, sb.root);
+  verifiedSandboxes.add(sb);
+  return parsed.leftovers;
 }
 
 function ownSysV(): string[] {
@@ -191,6 +213,7 @@ test("test overrides are ignored under privilege escalation and reject invalid v
     assert.equal(emptySudo.status, 64, "even empty SUDO_USER must disable test overrides");
 
     const invalidCases: Array<Record<string, string>> = [
+      { INFINITE_EVAL_TEST_STOP_KILL_MODE: "kill" },
       { INFINITE_EVAL_TEST_STOP_KILL_MODE: "invalid" },
       { INFINITE_EVAL_TEST_PRLIMIT_NPROC: "0" },
       { INFINITE_EVAL_TEST_PRLIMIT_NPROC: "01" },
@@ -211,6 +234,18 @@ test("test overrides are ignored under privilege escalation and reject invalid v
       assert.equal(rejected.status, 64, JSON.stringify(override));
     }
     assert.equal(run(sb, ["stop"]).status, 99, "STOP_KILL_MODE=refuse exits 99 when reached as matching account");
+
+    const envWithoutKillMode = { ...sb.env, ...baseEnv };
+    delete envWithoutKillMode.INFINITE_EVAL_TEST_STOP_KILL_MODE;
+    const sleeper = spawn("sleep", [String(randomInt(100_000, 900_000))], { stdio: "ignore" });
+    try {
+      const defaultStop = spawnSync("/bin/sh", [LAUNCHER, "stop"], { cwd: sb.dir, env: envWithoutKillMode, timeout: 60_000 });
+      assert.equal(defaultStop.status, 99, "omitting STOP_KILL_MODE under overrides must default to refuse, never kill");
+      assert.equal(sleeper.exitCode, null);
+      assert.equal(sleeper.signalCode, null);
+    } finally {
+      sleeper.kill("SIGKILL");
+    }
   } finally {
     cleanup(sb);
   }
@@ -360,6 +395,7 @@ test("nothing outlives a trial", { skip: SKIP }, () => {
 });
 
 function fromClosed(sb: Sandbox, args: readonly string[]) {
+  if (args[0] && DESTRUCTIVE_OPS.has(args[0])) assertOverridesActive(sb);
   const closed = mkdtempSync(join(sb.dir, "closed-"));
   return spawnSync("/bin/sh", ["-c", 'cd "$1" && chmod 000 . && [ ! -r . ] && shift && exec /bin/sh "$@"', "sh", closed, LAUNCHER, ...args], {
     env: { ...sb.env, PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },

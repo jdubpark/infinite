@@ -12,10 +12,28 @@ export TMPDIR=/srv/infinite-data/tmp/agent
 export npm_config_store_dir=/srv/infinite-data/agent-home/.pnpm-store
 export COREPACK_HOME=/srv/infinite-data/agent-home/.cache/corepack
 export PATH=/opt/infinite-agents/v1/bin:/usr/local/bin:/usr/bin:/bin
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CEILING_DIRECTORIES
 
 refuse() {
   printf 'jevcode request refused: %s\n' "$1" >&2
   exit 64
+}
+
+check_root_ancestors() {
+  cursor=$1
+  while [ "$cursor" != / ]; do
+    case "$cursor" in
+      */) cursor=${cursor%/} ;;
+      *) break ;;
+    esac
+  done
+  while [ "$cursor" != / ]; do
+    if [ -L "$cursor" ]; then
+      refuse 'symlinked root is not supported'
+    fi
+    cursor=${cursor%/*}
+    if [ -z "$cursor" ]; then cursor=/; fi
+  done
 }
 
 check_no_symlinks() {
@@ -56,9 +74,7 @@ require_inside_roots() {
   esac
   resolved=$(/usr/bin/realpath -m -- "$candidate") || refuse 'cannot resolve path'
   for root in "$@"; do
-    if [ -L "$root" ]; then
-      refuse 'symlinked root is not supported'
-    fi
+    check_root_ancestors "$root"
     resolved_root=$(/usr/bin/realpath -m -- "$root") || refuse 'cannot resolve root'
     case "$resolved" in
       "$resolved_root"/*)
@@ -137,7 +153,7 @@ for arg in "$@"; do
         repo_path=$LAST_RESOLVED
         seen_repo=1
         ;;
-      log) require_inside_roots "$arg" "$WORKSPACES" "$TEAM_WORKSPACES" "$AGENT_HOME" "$TMPDIR" ;;
+      log) require_inside_roots "$arg" "$WORKSPACES" "$TEAM_WORKSPACES" "$TMPDIR" ;;
       focus) record_focus "$arg" ;;
       token) check_token "$arg" ;;
       session) check_session "$arg" ;;
@@ -163,7 +179,7 @@ for arg in "$@"; do
       seen_repo=1
       ;;
     --log) expect=log ;;
-    --log=*) require_inside_roots "${arg#--log=}" "$WORKSPACES" "$TEAM_WORKSPACES" "$AGENT_HOME" "$TMPDIR" ;;
+    --log=*) require_inside_roots "${arg#--log=}" "$WORKSPACES" "$TEAM_WORKSPACES" "$TMPDIR" ;;
     --focus) expect=focus ;;
     --focus=*) record_focus "${arg#--focus=}" ;;
     --trigger|--format|--runner) expect=token ;;
@@ -194,6 +210,19 @@ if [ "$seen_repo" -eq 0 ]; then
   require_inside_roots "$cwd" "$WORKSPACES" "$TEAM_WORKSPACES"
   repo_path=$LAST_RESOLVED
 fi
+if [ -e "$repo_path" ] && [ ! -d "$repo_path" ]; then
+  refuse 'repository path must be a directory'
+fi
+if [ -d "$repo_path" ]; then
+  git_top=$(GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null /usr/bin/git -c 'safe.directory=*' -C "$repo_path" rev-parse --show-toplevel 2>/dev/null) || git_top=
+  if [ -n "$git_top" ]; then
+    require_inside_roots "$git_top" "$WORKSPACES" "$TEAM_WORKSPACES"
+    git_common=$(GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null /usr/bin/git -c 'safe.directory=*' -C "$repo_path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || refuse 'cannot resolve git common directory'
+    require_inside_roots "$git_common" "$WORKSPACES" "$TEAM_WORKSPACES"
+  elif [ -e "$repo_path/.git" ] || [ -L "$repo_path/.git" ]; then
+    refuse 'cannot resolve git repository'
+  fi
+fi
 if [ -n "$PENDING_FOCUS" ]; then
   while IFS= read -r rel_focus; do
     [ -n "$rel_focus" ] || continue
@@ -208,8 +237,10 @@ else
   cd / || refuse 'cannot change directory'
 fi
 
-if [ -r "$AGENT_HOME/.config/jevcode/jev-api-key" ]; then
-  JEV_API_KEY=$(/bin/cat "$AGENT_HOME/.config/jevcode/jev-api-key")
+check_root_ancestors "$AGENT_HOME"
+key_file=$AGENT_HOME/.config/jevcode/jev-api-key
+if [ ! -L "$AGENT_HOME/.config" ] && [ ! -L "$AGENT_HOME/.config/jevcode" ] && [ ! -L "$key_file" ] && [ -f "$key_file" ] && [ -r "$key_file" ]; then
+  JEV_API_KEY=$(/bin/cat "$key_file")
   export JEV_API_KEY
 fi
 

@@ -1,20 +1,28 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import * as Crypto from "expo-crypto";
+import { useIsFocused } from "expo-router";
 import {
-  connectionKey, getTeamEntry, listTeamEntries, TEAM_ENTRY_KINDS, withdrawTeamEntry,
-  type Connection, type Me, type TeamEntryDetail, type TeamEntryHead, type TeamEntryKind,
+  connectionKey, getTeamEntry, listTeamEntries, TEAM_ENTRY_KINDS,
+  type Connection, type TeamEntryDetail, type TeamEntryKind,
 } from "../../api/client";
+import { inForeground, onForegroundChange } from "../../api/foreground";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
 import { Card, Chip, Sheet } from "../../components/Glass";
 import { theme } from "../../theme";
-import { authorityLabel, entryAuthorLabel, filterMobileEntries, formatEntryBodySummary, mergeMobileEntries } from "./inspector-model";
+import {
+  applyMobileEvidenceHead, applyMobileEvidencePage, authorityLabel, createMobileEvidenceFeedState,
+  entryAuthorLabel, filterMobileEntries, formatEntryBodySummary, resolveSelectedEntryHead, sliceVisibleMobileEntries,
+  type MobileEvidenceFeedState,
+} from "./inspector-model";
 import { shortDate, type TeamView } from "./model";
 import { Disclosure, Section, t } from "./parts";
 
 const PAGE_LIMIT = 100;
-const MAX_AUTO_PAGES = 5;
+const MAX_INCREMENTAL_PAGES = 5;
+const MAX_REVALIDATE_PAGES = 5;
+const REVALIDATE_INTERVAL_MS = 30_000;
+const VISIBLE_ENTRY_STEP = 60;
 
 const KIND_LABELS: Record<TeamEntryKind | "all", string> = {
   all: "All",
@@ -28,13 +36,6 @@ const KIND_LABELS: Record<TeamEntryKind | "all", string> = {
   handoff: "handoff",
 };
 
-type ExtraState = {
-  key: string;
-  entries: TeamEntryHead[];
-  cursor: number;
-  more: boolean;
-};
-
 type SheetState = {
   key: string;
   selectedId: string | null;
@@ -44,21 +45,39 @@ type SheetState = {
   error: string;
 };
 
+type ScopedError = {
+  key: string;
+  message: string;
+  lastSuccessAt?: string;
+};
+
+type LoadMoreToken = {
+  key: string;
+  epoch: number;
+  id: number;
+};
+
+type VisibleLimitState = {
+  key: string;
+  limit: number;
+};
+
 export function TeamEvidenceSection({
   connection,
   team,
-  me,
   onOpenSession,
 }: {
   connection: Connection;
   team: TeamView;
-  me: Me | null;
   onOpenSession: (sessionId: string) => void;
 }) {
   const scopeKey = `${connectionKey(connection)}/${team.id}`;
   const [kindFilter, setKindFilter] = useState<TeamEntryKind | "all">("all");
-  const [extraState, setExtraState] = useState<ExtraState>({ key: scopeKey, entries: [], cursor: 0, more: false });
-  const [loadingMore, setLoadingMore] = useState(false);
+  const filterScopeKey = `${scopeKey}/${kindFilter}`;
+  const [feedState, setFeedState] = useState<MobileEvidenceFeedState>(() => createMobileEvidenceFeedState(scopeKey));
+  const [loadMoreToken, setLoadMoreToken] = useState<LoadMoreToken | null>(null);
+  const [visibleLimitState, setVisibleLimitState] = useState<VisibleLimitState>({ key: filterScopeKey, limit: VISIBLE_ENTRY_STEP });
+  const [pollError, setPollError] = useState<ScopedError | null>(null);
   const [sheetState, setSheetState] = useState<SheetState>({
     key: scopeKey,
     selectedId: null,
@@ -67,116 +86,198 @@ export function TeamEvidenceSection({
     loading: false,
     error: "",
   });
-  const [withdrawing, setWithdrawing] = useState(false);
 
   const epochRef = useRef(0);
-  const highWaterRef = useRef<{ key: string; cursor: number }>({ key: scopeKey, cursor: 0 });
+  const loadMoreIdRef = useRef(0);
+  const feedRef = useRef<MobileEvidenceFeedState>(feedState);
+  const lastSuccessAtRef = useRef<{ key: string; at: string }>({ key: scopeKey, at: "" });
+  const manualRefreshRef = useRef(false);
+  const focused = useIsFocused();
+  const focusedRef = useRef(focused);
+
+  const commitFeed = useCallback((targetKey: string, updater: (prev: MobileEvidenceFeedState) => MobileEvidenceFeedState) => {
+    const base = feedRef.current.key === targetKey ? feedRef.current : createMobileEvidenceFeedState(targetKey);
+    const updated = updater(base);
+    if (updated === base) return;
+    feedRef.current = updated;
+    setFeedState(updated);
+  }, []);
 
   useEffect(() => {
     epochRef.current += 1;
-    highWaterRef.current = { key: scopeKey, cursor: 0 };
+    feedRef.current = createMobileEvidenceFeedState(scopeKey);
+    lastSuccessAtRef.current = { key: scopeKey, at: "" };
+    manualRefreshRef.current = false;
     return () => {
       epochRef.current += 1;
     };
   }, [scopeKey]);
 
+  useEffect(() => {
+    focusedRef.current = focused;
+    epochRef.current += 1;
+    const removeForeground = onForegroundChange(() => {
+      epochRef.current += 1;
+      setLoadMoreToken(null);
+    });
+    return () => {
+      focusedRef.current = false;
+      epochRef.current += 1;
+      removeForeground();
+    };
+  }, [focused]);
+
   const poll = usePoll(async () => {
     const epoch = epochRef.current;
+    const targetKey = scopeKey;
     const targetTeamId = team.id;
-    let entries: TeamEntryHead[] = [];
-    let since = 0;
-    let cursor = 0;
-    let more = false;
-    for (let pageIndex = 0; pageIndex < MAX_AUTO_PAGES; pageIndex += 1) {
-      const page = await listTeamEntries(connection, targetTeamId, { since, limit: PAGE_LIMIT });
-      if (epoch !== epochRef.current) return null;
-      entries = mergeMobileEntries(entries, page);
-      cursor = page.cursor;
-      more = page.more;
-      if (!page.more || page.cursor <= since) break;
-      since = page.cursor;
+    const isCurrent = () => epoch === epochRef.current && focusedRef.current && inForeground();
+    if (!isCurrent()) return null;
+
+    setLoadMoreToken(prev => (prev && (prev.key !== targetKey || prev.epoch !== epoch) ? null : prev));
+
+    const current = feedRef.current.key === targetKey
+      ? feedRef.current
+      : createMobileEvidenceFeedState(targetKey);
+    const nowMs = Date.now();
+    const forceRevalidate = manualRefreshRef.current;
+    manualRefreshRef.current = false;
+    const needsRevalidate = current.entries.length > 0 && (
+      forceRevalidate
+      || current.revalidateCursor > 0
+      || (current.lastRevalidatedAtMs !== undefined && nowMs - current.lastRevalidatedAtMs >= REVALIDATE_INTERVAL_MS)
+    );
+
+    try {
+      let since = current.cursor;
+      let fetchedAny = false;
+      for (let pageIndex = 0; pageIndex < MAX_INCREMENTAL_PAGES; pageIndex += 1) {
+        const page = await listTeamEntries(connection, targetTeamId, { since, limit: PAGE_LIMIT });
+        if (!isCurrent()) return null;
+        fetchedAny = true;
+        const observedAt = new Date().toISOString();
+        lastSuccessAtRef.current = { key: targetKey, at: observedAt };
+        commitFeed(targetKey, prev => {
+          const applied = applyMobileEvidencePage(prev, page, { mode: "incremental", observedAt });
+          return applied.lastRevalidatedAtMs === undefined && applied.entries.length > 0
+            ? { ...applied, lastRevalidatedAtMs: nowMs }
+            : applied;
+        });
+        if (!page.more || page.cursor <= since) break;
+        since = page.cursor;
+      }
+
+      if (needsRevalidate) {
+        let revalidateSince = forceRevalidate ? 0 : (feedRef.current.key === targetKey ? feedRef.current.revalidateCursor : 0);
+        const upperBound = feedRef.current.key === targetKey ? feedRef.current.cursor : 0;
+        let completedSweep = true;
+        for (let pageIndex = 0; pageIndex < MAX_REVALIDATE_PAGES; pageIndex += 1) {
+          const page = await listTeamEntries(connection, targetTeamId, { since: revalidateSince, limit: PAGE_LIMIT });
+          if (!isCurrent()) return null;
+          const observedAt = new Date().toISOString();
+          lastSuccessAtRef.current = { key: targetKey, at: observedAt };
+          commitFeed(targetKey, prev => applyMobileEvidencePage(prev, page, { mode: "revalidate", observedAt }));
+          if (!page.more || page.cursor <= revalidateSince || page.cursor >= upperBound) {
+            revalidateSince = 0;
+            completedSweep = true;
+            break;
+          }
+          revalidateSince = page.cursor;
+          completedSweep = false;
+        }
+        if (isCurrent()) {
+          commitFeed(targetKey, prev => {
+            const nextAt = completedSweep ? Date.now() : prev.lastRevalidatedAtMs;
+            if (prev.revalidateCursor === revalidateSince && prev.lastRevalidatedAtMs === nextAt) return prev;
+            return {
+              ...prev,
+              revalidateCursor: revalidateSince,
+              ...(nextAt !== undefined ? { lastRevalidatedAtMs: nextAt } : {}),
+            };
+          });
+        }
+      }
+
+      if (!isCurrent()) return null;
+      setPollError(prev => (prev?.key === targetKey ? null : prev));
+      return fetchedAny ? { key: targetKey, at: Date.now() } : null;
+    } catch (error) {
+      if (isCurrent()) {
+        const lastSuccessAt = lastSuccessAtRef.current.key === targetKey && lastSuccessAtRef.current.at
+          ? lastSuccessAtRef.current.at
+          : undefined;
+        setPollError({
+          key: targetKey,
+          message: error instanceof Error ? error.message : "Could not load blackboard entries.",
+          ...(lastSuccessAt ? { lastSuccessAt } : {}),
+        });
+      }
+      throw error;
     }
-    const tail = highWaterRef.current.key === scopeKey ? highWaterRef.current.cursor : 0;
-    if (more && tail > cursor) {
-      const tailPage = await listTeamEntries(connection, targetTeamId, { since: tail, limit: PAGE_LIMIT });
-      if (epoch !== epochRef.current) return null;
-      entries = mergeMobileEntries(entries, tailPage);
-      cursor = Math.max(cursor, tailPage.cursor);
-      more = tailPage.more;
-    }
-    if (highWaterRef.current.key === scopeKey) {
-      highWaterRef.current.cursor = Math.max(highWaterRef.current.cursor, cursor);
-    }
-    return { key: scopeKey, entries, cursor, more };
   }, 4000, [connection, team.id, scopeKey]);
 
-  const scopedPoll = poll.data?.key === scopeKey ? poll.data : null;
-  const scopedExtra = extraState.key === scopeKey ? extraState : null;
+  const scopedFeed = feedState.key === scopeKey ? feedState : createMobileEvidenceFeedState(scopeKey);
   const scopedSheet = sheetState.key === scopeKey
     ? sheetState
     : { key: scopeKey, selectedId: null, historyIds: [], detail: null, loading: false, error: "" };
 
-  const polledEntries = scopedPoll?.entries ?? [];
-  const mergedEntries = mergeMobileEntries(polledEntries, { entries: scopedExtra?.entries ?? [] });
-  const visibleEntries = [...filterMobileEntries(mergedEntries, kindFilter)].reverse();
-  const pollCursor = scopedPoll?.cursor ?? 0;
-  const extraCursor = scopedExtra?.cursor ?? 0;
-  const effectiveCursor = Math.max(pollCursor, extraCursor);
-  const hasMore = extraCursor > pollCursor
-    ? Boolean(scopedExtra?.more)
-    : Boolean(scopedPoll?.more || (scopedExtra && scopedExtra.cursor === pollCursor && scopedExtra.more));
+  const mergedEntries = scopedFeed.entries;
+  const allVisibleEntries = [...filterMobileEntries(mergedEntries, kindFilter)].reverse();
+  const visibleLimit = visibleLimitState.key === filterScopeKey ? visibleLimitState.limit : VISIBLE_ENTRY_STEP;
+  const { visible: displayedEntries, hiddenCount } = sliceVisibleMobileEntries(allVisibleEntries, visibleLimit);
+  const hasMore = scopedFeed.more;
+  const loadingMore = loadMoreToken?.key === scopeKey;
+  const activePollError = pollError?.key === scopeKey ? pollError.message : "";
+  const lastUpdatedAt = (pollError?.key === scopeKey ? pollError.lastSuccessAt : undefined) ?? scopedFeed.lastLoadedAt;
+  const isStale = poll.stale || Boolean(activePollError);
 
   async function loadNewerEntries() {
     if (loadingMore || !hasMore) return;
     const epoch = epochRef.current;
+    const requestId = ++loadMoreIdRef.current;
     const targetKey = scopeKey;
     const targetTeamId = team.id;
-    setLoadingMore(true);
+    const isCurrent = () => epoch === epochRef.current && focusedRef.current && inForeground();
+    const startCursor = feedRef.current.key === targetKey ? feedRef.current.cursor : scopedFeed.cursor;
+    setLoadMoreToken({ key: targetKey, epoch, id: requestId });
     try {
-      const page = await listTeamEntries(connection, targetTeamId, { since: effectiveCursor, limit: PAGE_LIMIT });
-      if (epoch !== epochRef.current) return;
-      if (highWaterRef.current.key === targetKey) {
-        highWaterRef.current.cursor = Math.max(highWaterRef.current.cursor, page.cursor);
-      }
-      setExtraState(prev => ({
-        key: targetKey,
-        entries: mergeMobileEntries(prev.key === targetKey ? prev.entries : [], page),
-        cursor: Math.max(prev.key === targetKey ? prev.cursor : 0, page.cursor),
-        more: page.more,
-      }));
+      const page = await listTeamEntries(connection, targetTeamId, { since: startCursor, limit: PAGE_LIMIT });
+      if (!isCurrent()) return;
+      const observedAt = new Date().toISOString();
+      lastSuccessAtRef.current = { key: targetKey, at: observedAt };
+      commitFeed(targetKey, prev => applyMobileEvidencePage(prev, page, { mode: "incremental", observedAt }));
+      setPollError(prev => (prev?.key === targetKey ? null : prev));
     } catch (error) {
-      if (epoch === epochRef.current) {
+      if (isCurrent()) {
         Alert.alert("Could not load entries", error instanceof Error ? error.message : "Request failed.");
       }
     } finally {
-      if (epoch === epochRef.current) setLoadingMore(false);
+      setLoadMoreToken(prev => (prev && prev.id === requestId ? null : prev));
     }
   }
 
   useEffect(() => {
     const selectedId = scopedSheet.selectedId;
     if (!selectedId) return;
-    const epoch = epochRef.current;
     const targetKey = scopeKey;
     const targetTeamId = team.id;
     let active = true;
     getTeamEntry(connection, targetTeamId, selectedId)
       .then(result => {
-        if (active && epoch === epochRef.current) {
-          setSheetState(prev => (prev.key === targetKey && prev.selectedId === selectedId
-            ? { ...prev, detail: result, loading: false }
-            : prev));
-        }
+        if (!active) return;
+        commitFeed(targetKey, prev => applyMobileEvidenceHead(prev, result.head));
+        setSheetState(prev => (prev.key === targetKey && prev.selectedId === selectedId
+          ? { ...prev, detail: result, loading: false }
+          : prev));
       })
       .catch(error => {
-        if (active && epoch === epochRef.current) {
-          setSheetState(prev => (prev.key === targetKey && prev.selectedId === selectedId
-            ? { ...prev, error: error instanceof Error ? error.message : "Could not load entry detail.", loading: false }
-            : prev));
-        }
+        if (!active) return;
+        setSheetState(prev => (prev.key === targetKey && prev.selectedId === selectedId
+          ? { ...prev, error: error instanceof Error ? error.message : "Could not load entry detail.", loading: false }
+          : prev));
       });
     return () => { active = false; };
-  }, [connection, team.id, scopeKey, scopedSheet.selectedId]);
+  }, [commitFeed, connection, team.id, scopeKey, scopedSheet.selectedId]);
 
   function openEntry(entryId: string) {
     setSheetState({
@@ -226,47 +327,10 @@ export function TeamEvidenceSection({
     });
   }
 
-  function confirmWithdraw(head: TeamEntryHead) {
-    const epoch = epochRef.current;
-    const targetKey = scopeKey;
-    const targetTeamId = team.id;
-    Alert.alert("Withdraw this entry?", "Marks the entry as withdrawn on the host blackboard. It remains visible as withdrawn.", [
-      { text: "Keep entry", style: "cancel" },
-      {
-        text: "Withdraw",
-        style: "destructive",
-        onPress: () => {
-          void (async () => {
-            if (epoch !== epochRef.current) return;
-            setWithdrawing(true);
-            try {
-              const result = await withdrawTeamEntry(connection, targetTeamId, head.entryId, Crypto.randomUUID());
-              if (epoch !== epochRef.current) return;
-              const updatedHead: TeamEntryHead = { ...head, state: result.state };
-              setExtraState(prev => ({
-                key: targetKey,
-                entries: mergeMobileEntries(prev.key === targetKey ? prev.entries : [], { entries: [updatedHead] }),
-                cursor: prev.key === targetKey ? prev.cursor : 0,
-                more: prev.key === targetKey ? prev.more : false,
-              }));
-              setSheetState(prev => (prev.key === targetKey && prev.detail?.head.entryId === head.entryId
-                ? { ...prev, detail: { ...prev.detail, head: updatedHead } }
-                : prev));
-              poll.refresh();
-            } catch (error) {
-              if (epoch === epochRef.current) {
-                Alert.alert("Withdraw failed", error instanceof Error ? error.message : "Could not withdraw entry.");
-              }
-            } finally {
-              if (epoch === epochRef.current) setWithdrawing(false);
-            }
-          })();
-        },
-      },
-    ]);
-  }
-
-  const detailHead = scopedSheet.detail?.head ?? mergedEntries.find(item => item.entryId === scopedSheet.selectedId);
+  const listHead = scopedSheet.selectedId
+    ? mergedEntries.find(item => item.entryId === scopedSheet.selectedId)
+    : undefined;
+  const detailHead = resolveSelectedEntryHead(scopedSheet.detail?.head, listHead);
   const formatted = scopedSheet.detail ? formatEntryBodySummary(scopedSheet.detail.body) : null;
   const authorMember = detailHead?.authorMemberId
     ? team.members.find(member => member.memberId === detailHead.authorMemberId)
@@ -275,7 +339,7 @@ export function TeamEvidenceSection({
   return <Section
     title="Evidence"
     count={mergedEntries.length}
-    right={<Pressable accessibilityRole="button" onPress={poll.refresh} hitSlop={8}><Text style={s.refresh}>Refresh</Text></Pressable>}
+    right={<Pressable accessibilityRole="button" onPress={() => { manualRefreshRef.current = true; poll.refresh(); }} hitSlop={8}><Text style={s.refresh}>Refresh</Text></Pressable>}
   >
     <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.filters}>
       {(["all", ...TEAM_ENTRY_KINDS] as const).map(kind => <Chip
@@ -294,12 +358,20 @@ export function TeamEvidenceSection({
       onPress={() => void loadNewerEntries()}
     /> : null}
 
-    {poll.loading && !mergedEntries.length ? <ActivityIndicator style={s.loader} color={theme.colors.forest} /> : null}
-    {!poll.loading && poll.stale && !mergedEntries.length ? <Text style={t.warning}>Could not load blackboard entries.</Text> : null}
-    {!poll.loading && !poll.stale && !visibleEntries.length ? <Text style={t.note}>No matching entries yet.</Text> : null}
+    {isStale && mergedEntries.length > 0 ? <Card attention style={s.staleBanner}>
+      <Text style={t.warning}>
+        Evidence may be stale{lastUpdatedAt ? ` · last updated ${shortDate(lastUpdatedAt)}` : ""}.{activePollError ? ` ${activePollError}` : ""}
+      </Text>
+    </Card> : null}
 
-    {visibleEntries.length ? <Card style={s.listCard}>
-      {visibleEntries.map((entry, index) => {
+    {poll.loading && !mergedEntries.length ? <ActivityIndicator style={s.loader} color={theme.colors.forest} /> : null}
+    {!poll.loading && isStale && !mergedEntries.length ? <Text style={t.warning}>
+      Could not load blackboard entries.{activePollError ? ` ${activePollError}` : ""}
+    </Text> : null}
+    {!poll.loading && !isStale && !displayedEntries.length ? <Text style={t.note}>No matching entries yet.</Text> : null}
+
+    {displayedEntries.length ? <Card style={s.listCard}>
+      {displayedEntries.map((entry, index) => {
         const author = entryAuthorLabel(entry.author, entry.authorRole);
         return <Pressable
           key={entry.entryId}
@@ -319,10 +391,17 @@ export function TeamEvidenceSection({
             <Chip label={entry.kind} />
             {entry.state !== "active" ? <Chip label={entry.state} tone={entry.state === "withdrawn" ? "error" : "attention"} /> : null}
           </View>
-          <Text style={[t.body, entry.state === "withdrawn" && s.withdrawnText]} numberOfLines={3}>{entry.summary}</Text>
+          <Text style={[t.body, entry.state !== "active" && s.inactiveText]} numberOfLines={3}>{entry.summary}</Text>
         </Pressable>;
       })}
     </Card> : null}
+
+    {hiddenCount > 0 ? <Button
+      compact
+      secondary
+      title={`Show older (${hiddenCount} hidden)`}
+      onPress={() => setVisibleLimitState({ key: filterScopeKey, limit: visibleLimit + VISIBLE_ENTRY_STEP })}
+    /> : null}
 
     <Sheet
       visible={Boolean(scopedSheet.selectedId)}
@@ -398,15 +477,6 @@ export function TeamEvidenceSection({
               onOpenSession(authorMember.sessionId);
             }}
           /> : null}
-          {me?.role === "owner" && detailHead && detailHead.state !== "withdrawn" ? (
-            connection.relay ? <Text style={t.note}>Direct host connection required to withdraw entries.</Text> : <Button
-              compact
-              destructive
-              title={withdrawing ? "Withdrawing…" : "Withdraw entry"}
-              disabled={withdrawing}
-              onPress={() => confirmWithdraw(detailHead)}
-            />
-          ) : null}
         </View>
       </ScrollView>
     </Sheet>
@@ -425,7 +495,8 @@ const s = StyleSheet.create({
   seq: { fontFamily: theme.mono, fontSize: 12, fontWeight: "700", color: theme.colors.secondaryInk },
   commit: { fontFamily: theme.mono, fontSize: 11, color: theme.colors.mutedInk },
   entryTags: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
-  withdrawnText: { color: theme.colors.mutedInk },
+  staleBanner: { gap: 6 },
+  inactiveText: { color: theme.colors.mutedInk },
   sheetScroll: { flexShrink: 1 },
   sheetBody: { gap: 10, paddingHorizontal: 8, paddingBottom: 12 },
   detailSections: { gap: 8 },

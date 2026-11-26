@@ -1,9 +1,11 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { useIsFocused } from "expo-router";
 import {
-  getMissionProgress, listTeamEntries,
+  connectionKey, getMissionProgress, listTeamEntries,
   type Connection, type MissionProgressPage, type MissionProgressSnapshot, type TeamEntryHead,
 } from "../../api/client";
+import { inForeground, onForegroundChange } from "../../api/foreground";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
 import { Card, Chip, Sheet } from "../../components/Glass";
@@ -11,10 +13,11 @@ import { Glyph, StatusIcon } from "../../components/Icon";
 import { age, type StatusKind } from "../../status";
 import { theme } from "../../theme";
 import { authorityLabel, entryAuthorLabel, mergeMobileEntries } from "../teams/inspector-model";
-import { shortDate, TEAM_LABELS } from "../teams/model";
+import { shortDate } from "../teams/model";
 import { Disclosure, Section, t } from "../teams/parts";
 import {
-  applyMissionProgressPage, createMissionProgressState, dismissMissionProgressNotice, linkedTeamIdOf, partitionMissionSubtasks,
+  applyMissionProgressPage, createMissionProgressState, dismissMissionProgressNotice, linkedTeamIdOf,
+  partitionMissionSubtasks, summarizeMissionProgressChild,
   type MissionProgressState,
 } from "./mission-progress-model";
 
@@ -44,23 +47,15 @@ function subtaskIconKind(status: MissionProgressSnapshot["subtasks"][number]["st
   }
 }
 
-function summarizeChild(child: MissionProgressSnapshot["subtasks"][number]["child"]): string {
-  if (child.kind === "not-created") return "Team not created yet";
-  if (child.kind === "missing") return "Child team record missing";
-  if (child.kind === "mismatched") return "Child team mismatch";
-  const teamLabel = TEAM_LABELS[child.status] ?? child.status;
-  const activeWorkers = child.assignments.filter(member => member.recordedStatus === "running" || member.recordedStatus === "waiting").length;
-  const latestCheck = child.checks[child.checks.length - 1];
-  const checkText = latestCheck
-    ? `check ${latestCheck.status}${latestCheck.exitCode !== undefined ? ` (${String(latestCheck.exitCode)})` : ""}${latestCheck.headCommit ? ` · ${latestCheck.headCommit.slice(0, 8)}` : ""}`
-    : undefined;
-  return [teamLabel, `${activeWorkers}/${child.assignments.length} active`, checkText].filter(Boolean).join(" · ");
-}
-
 type PreviewState = {
   missionId: string;
   teamId: string;
   title: string;
+};
+
+type ScopedError = {
+  key: string;
+  message: string;
 };
 
 export function MissionProgressSection({
@@ -76,12 +71,16 @@ export function MissionProgressSection({
   onOpenTeam: (teamId: string) => void;
   onOpenSession: (sessionId: string) => void;
 }) {
+  const scopeKey = `${connectionKey(connection)}/${missionId}`;
   const [rawState, dispatch] = useReducer(reducer, missionId, createMissionProgressState);
   const state = rawState.missionId === missionId ? rawState : createMissionProgressState(missionId);
   const cursorRef = useRef<string | undefined>(undefined);
   const pollGenRef = useRef(0);
   const activeMissionIdRef = useRef(missionId);
+  const focused = useIsFocused();
+  const focusedRef = useRef(focused);
 
+  const [pollError, setPollError] = useState<ScopedError | null>(null);
   const [previewTeam, setPreviewTeam] = useState<PreviewState | null>(null);
   const [previewEntries, setPreviewEntries] = useState<TeamEntryHead[]>([]);
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -96,16 +95,41 @@ export function MissionProgressSection({
     };
   }, [connection, missionId]);
 
+  useEffect(() => {
+    focusedRef.current = focused;
+    pollGenRef.current += 1;
+    const removeForeground = onForegroundChange(() => {
+      pollGenRef.current += 1;
+    });
+    return () => {
+      focusedRef.current = false;
+      pollGenRef.current += 1;
+      removeForeground();
+    };
+  }, [focused]);
+
   const poll = usePoll(async () => {
     const gen = pollGenRef.current;
     const targetMissionId = missionId;
-    const page = await getMissionProgress(connection, targetMissionId, cursorRef.current);
-    if (gen !== pollGenRef.current || activeMissionIdRef.current !== targetMissionId || page.missionId !== targetMissionId) {
-      return null;
+    const targetKey = scopeKey;
+    const isCurrent = () =>
+      gen === pollGenRef.current && focusedRef.current && inForeground() && activeMissionIdRef.current === targetMissionId;
+    if (!isCurrent()) return null;
+    try {
+      const page = await getMissionProgress(connection, targetMissionId, cursorRef.current);
+      if (!isCurrent() || page.missionId !== targetMissionId) {
+        return null;
+      }
+      cursorRef.current = page.cursor;
+      dispatch({ type: "page", page });
+      setPollError(prev => (prev?.key === targetKey ? null : prev));
+      return { missionId: targetMissionId, page, at: Date.now() };
+    } catch (error) {
+      if (isCurrent()) {
+        setPollError({ key: targetKey, message: error instanceof Error ? error.message : "Could not load live mission progress." });
+      }
+      throw error;
     }
-    cursorRef.current = page.cursor;
-    dispatch({ type: "page", page });
-    return { missionId: targetMissionId, page, at: Date.now() };
   }, 3000, [connection, missionId]);
 
   const activePreview = previewTeam?.missionId === missionId ? previewTeam : null;
@@ -126,7 +150,6 @@ export function MissionProgressSection({
 
   useEffect(() => {
     if (!activePreview) return;
-    const gen = pollGenRef.current;
     const targetTeamId = activePreview.teamId;
     let active = true;
     void (async () => {
@@ -135,20 +158,20 @@ export function MissionProgressSection({
         let since = 0;
         for (let pageIndex = 0; pageIndex < MAX_PREVIEW_PAGES; pageIndex += 1) {
           const page = await listTeamEntries(connection, targetTeamId, { since, limit: PREVIEW_PAGE_LIMIT });
-          if (!active || gen !== pollGenRef.current) return;
+          if (!active) return;
           accumulated = mergeMobileEntries(accumulated, page);
           if (!page.more || page.cursor <= since) break;
           since = page.cursor;
         }
-        if (active && gen === pollGenRef.current) {
+        if (active) {
           setPreviewEntries(accumulated.slice(-10).reverse());
         }
       } catch (error) {
-        if (active && gen === pollGenRef.current) {
+        if (active) {
           setPreviewError(error instanceof Error ? error.message : "Could not load team entries.");
         }
       } finally {
-        if (active && gen === pollGenRef.current) {
+        if (active) {
           setPreviewLoading(false);
         }
       }
@@ -161,6 +184,8 @@ export function MissionProgressSection({
   const subtasks = snapshot?.subtasks ?? [];
   const { active, finished } = partitionMissionSubtasks(subtasks);
   const subtaskById = new Map(subtasks.map(item => [item.id, item]));
+  const activePollError = pollError?.key === scopeKey ? pollError.message : "";
+  const isStale = poll.stale || Boolean(activePollError);
 
   return <Section title="Live progress" count={subtasks.length || undefined}>
     {state.resyncNotice ? <Card attention style={s.banner}>
@@ -168,8 +193,17 @@ export function MissionProgressSection({
       <Button compact secondary title="Dismiss" onPress={() => dispatch({ type: "dismissNotice" })} />
     </Card> : null}
 
+    {isStale && snapshot ? <Card attention style={s.banner}>
+      <Text style={[t.warning, s.fill]}>
+        Live progress may be stale{state.lastUpdatedAt ? ` · last updated ${shortDate(state.lastUpdatedAt)}` : ""}.{activePollError ? ` ${activePollError}` : ""}
+      </Text>
+      <Button compact secondary title="Retry" onPress={poll.refresh} />
+    </Card> : null}
+
     {poll.loading && !snapshot ? <ActivityIndicator style={s.loader} color={theme.colors.forest} /> : null}
-    {!poll.loading && poll.stale && !snapshot ? <Text style={t.warning}>Could not load live mission progress.</Text> : null}
+    {!poll.loading && isStale && !snapshot ? <Text style={t.warning}>
+      Could not load live mission progress.{activePollError ? ` ${activePollError}` : ""}
+    </Text> : null}
 
     {snapshot?.mission.coordinator ? <Card style={s.coordinatorCard}>
       <View style={s.rowHead}>
@@ -188,6 +222,7 @@ export function MissionProgressSection({
     {active.length ? <Card style={s.listCard}>
       {active.map(({ subtask, replacedBySubtaskId }, index) => {
         const teamId = linkedTeamIdOf(subtask.child);
+        const childSummary = summarizeMissionProgressChild(subtask.child);
         const replacement = replacedBySubtaskId ? subtaskById.get(replacedBySubtaskId) : undefined;
         const replacementTeamId = replacement ? linkedTeamIdOf(replacement.child) : undefined;
         return <View key={subtask.id} style={[s.itemWrap, index > 0 && s.rowRule]}>
@@ -195,14 +230,14 @@ export function MissionProgressSection({
             accessibilityRole="button"
             accessibilityState={{ disabled: !teamId }}
             disabled={!teamId}
-            accessibilityLabel={`${subtask.title}, ${repoName(subtask.repoProjectId)}, ${summarizeChild(subtask.child)}`}
+            accessibilityLabel={`${subtask.title}, ${repoName(subtask.repoProjectId)}, ${childSummary}`}
             onPress={() => { if (teamId) openPreview(teamId, subtask.title); }}
             style={({ pressed }) => [s.itemRow, pressed && Boolean(teamId) && s.pressed]}
           >
             <StatusIcon kind={subtaskIconKind(subtask.status)} size={15} />
             <View style={s.fill}>
               <Text style={s.itemTitle} numberOfLines={1}>{subtask.title}</Text>
-              <Text style={t.note} numberOfLines={2}>{repoName(subtask.repoProjectId)} · {summarizeChild(subtask.child)}</Text>
+              <Text style={t.note} numberOfLines={2}>{repoName(subtask.repoProjectId)} · {childSummary}</Text>
             </View>
             {teamId ? <Glyph name="forward" size={12} color={theme.colors.mutedInk} /> : null}
           </Pressable>
@@ -222,13 +257,14 @@ export function MissionProgressSection({
     {finished.length ? <Disclosure title={`Finished subtasks (${finished.length})`}>
       {finished.map(({ subtask, replacedBySubtaskId }) => {
         const teamId = linkedTeamIdOf(subtask.child);
+        const childSummary = summarizeMissionProgressChild(subtask.child);
         const replacement = replacedBySubtaskId ? subtaskById.get(replacedBySubtaskId) : undefined;
         const replacementTeamId = replacement ? linkedTeamIdOf(replacement.child) : undefined;
         return <View key={subtask.id} style={s.finishedRow}>
           <Pressable
             accessibilityRole="button"
             accessibilityState={{ disabled: !teamId }}
-            accessibilityLabel={`${subtask.title}, ${repoName(subtask.repoProjectId)}, ${summarizeChild(subtask.child)}`}
+            accessibilityLabel={`${subtask.title}, ${repoName(subtask.repoProjectId)}, ${childSummary}`}
             disabled={!teamId}
             onPress={() => { if (teamId) openPreview(teamId, subtask.title); }}
             style={({ pressed }) => [s.itemRowCompact, pressed && Boolean(teamId) && s.pressed]}
@@ -236,7 +272,7 @@ export function MissionProgressSection({
             <StatusIcon kind={subtaskIconKind(subtask.status)} size={14} />
             <View style={s.fill}>
               <Text style={s.itemTitle} numberOfLines={1}>{subtask.title}</Text>
-              <Text style={t.note} numberOfLines={2}>{repoName(subtask.repoProjectId)} · {summarizeChild(subtask.child)}</Text>
+              <Text style={t.note} numberOfLines={2}>{repoName(subtask.repoProjectId)} · {childSummary}</Text>
             </View>
             {teamId ? <Glyph name="forward" size={12} color={theme.colors.mutedInk} /> : null}
           </Pressable>
@@ -272,12 +308,13 @@ export function MissionProgressSection({
         {previewEntries.map(entry => <View key={entry.entryId} style={s.previewEntry}>
           <View style={s.rowHead}>
             <Text style={s.seq}>seq {entry.seq}</Text>
-            <Chip label={authorityLabel(entry.authority)} />
+            <Chip label={authorityLabel(entry.authority)} tone={entry.authority === "direction" ? "attention" : undefined} />
             <Chip label={entry.kind} />
+            {entry.state !== "active" ? <Chip label={entry.state} tone={entry.state === "withdrawn" ? "error" : "attention"} /> : null}
             <Text style={t.note}>{shortDate(entry.at)}</Text>
           </View>
           <Text style={t.note}>{entryAuthorLabel(entry.author, entry.authorRole)}</Text>
-          <Text style={t.body} numberOfLines={2}>{entry.summary}</Text>
+          <Text style={[t.body, entry.state !== "active" && s.inactiveEntryText]} numberOfLines={2}>{entry.summary}</Text>
         </View>)}
         {activePreview ? <Button
           title="Open team"
@@ -313,4 +350,5 @@ const s = StyleSheet.create({
   sheetScroll: { flexShrink: 1 },
   sheetBody: { gap: 10, paddingHorizontal: 8, paddingBottom: 12 },
   previewEntry: { gap: 4, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.colors.rule },
+  inactiveEntryText: { color: theme.colors.mutedInk },
 });

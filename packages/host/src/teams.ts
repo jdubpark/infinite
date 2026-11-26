@@ -14,7 +14,7 @@ import { accountSettingPrompt, PROVIDER_NAMES, recoveryTurnEnd, type Prompt, typ
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { buildTeamPendingOperation, createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamMemberRetireSchema, teamParallelismSchema, teamProcessesEndedSchema, recordedTeamReportEnvelopeSchema, type CreateTeam, type TeamContinue, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamProcessesEnded, type TeamPermissionRecoveryView, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
-import { pullRequestBranch, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
+import { deliveryPromptStale, pullRequestBranch, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
 import { reviewEvidenceProblems } from "./team-acceptance.js";
 import { memberCodeModeExpected, teamModelLaunch } from "./launch.js";
 import { CheckOutputScanner, checkFeedback } from "./team-check-output.js";
@@ -275,7 +275,8 @@ export class TeamService {
   private readonly reviewFeedback = new TeamReviewFeedback((service => ({ get records() { return service.records; }, get config() { return service.config; },
     get key() { return service.key; }, get directory() { return service.directory; }, save: stored => service.save(stored), event: (stored, text) => service.event(stored, text),
     enqueue: (runId, task) => service.enqueue(runId, task), steer: (id, input, source) => service.steer(id, input, source), held: projectId => Boolean(service.fuse?.held?.([projectId])),
-    now: () => service.options?.now?.() ?? Date.now() }) satisfies ReviewFeedbackHost)(this));
+    now: () => service.options?.now?.() ?? Date.now(), block: (stored, error) => service.block(stored, error), step: stored => service.step(stored),
+    rebuildDeliveryPrompts: stored => service.rebuildDeliveryPrompts(stored) }) satisfies ReviewFeedbackHost)(this));
   private readonly directory: string;
   private usage?: UsageService;
   private evidence?: EvidenceStore;
@@ -288,7 +289,7 @@ export class TeamService {
     operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m) });
   private readonly intentChecks = new TeamIntent({ prepare: (s, r, f, o, p) => this.prepareMember(s as Stored, r, undefined, f, o, p), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t), block: (s, e, m) => this.block(s as Stored, e, m), project: run => this.config.projects.find(project => project.id === run.projectId), limited: () => this.limits.limited(), prefix: () => this.config.teams?.commandPrefix });
   private readonly objectiveTests = new TeamRegister({ holder: id => this.records.get(id), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], workspace: s => { try { this.assertRunPath(s as Stored, s.run.workspace); return s.run.workspace; } catch { return undefined; } }, enqueue: (runId, work) => this.enqueue(runId, work), save: s => this.save(s as Stored), event: (s, text) => this.event(s as Stored, text), prefix: () => this.config.teams?.commandPrefix, now: timestamp });
-  readonly verdicts = new TeamVerdicts({ holder: id => this.records.get(id), prepare: (s, o, p) => this.prepareMember(s as Stored, "evaluator", undefined, undefined, o, p), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t), emit: (s, d) => this.emitWith(s as Stored, "verdict.recorded", [d.verdictId], { revision: s.run.revision }, () => d), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], limited: () => this.limits.limited(), prefix: () => this.config.teams?.commandPrefix, register: this.objectiveTests, now: timestamp, uuid: randomUUID });
+  readonly verdicts = new TeamVerdicts({ holder: id => this.records.get(id), prepare: (s, o, p) => this.prepareMember(s as Stored, "evaluator", undefined, undefined, o, p), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t), emit: (s, d) => this.emitWith(s as Stored, "verdict.recorded", [d.verdictId], { revision: s.verdict?.revision ?? s.run.revision }, () => d), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], limited: () => this.limits.limited(), prefix: () => this.config.teams?.commandPrefix, register: this.objectiveTests, now: timestamp, uuid: randomUUID });
   private reconciledAt = 0;
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService, private readonly titler?: Pick<Readings, "requestTitle">, private readonly options?: TeamServiceOptions) {
     this.directory = join(config.stateDir, "teams");
@@ -450,18 +451,14 @@ export class TeamService {
       for (const stored of this.records.values()) this.entryBacklog.add(stored.run.id);
       this.drainEntries();
     }
-    this.objectiveTests.restore(this.records.values());
+    this.objectiveTests.restore(this.records.values()); this.verdicts.restore(this.records.values());
   }
   useUsage(service: UsageService) { this.usage = service; }
   useMissionReservations(lookup: MissionReservationLookup) { this.missionReservations = lookup; }
   useEvidence(store: EvidenceStore) { this.evidence = store; }
   useRouter(router: RoutingRecorder) { this.router = router; }
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
-  useGoalRecords(port: GoalRecordPort) {
-    this.intentChecks.goals = port;
-    this.objectiveTests.goals = port;
-    this.verdicts.goals = port;
-  }
+  useGoalRecords(port: GoalRecordPort) { this.intentChecks.goals = port; this.objectiveTests.goals = port; this.verdicts.goals = port; this.verdicts.restore(this.records.values()); }
   private fuseWait(stored: Stored, result: FuseCheck | FuseAdmission): boolean {
     const keeps = memberStateReasons.has(stored.run.reason ?? "");
     const fuse = applyFuseReason(keeps ? {} : stored.run, result);
@@ -1188,11 +1185,11 @@ export class TeamService {
       if (pending && !this.commands.has(id)) throw new TeamError(409, "team-reconciliation-required", "This team has an unresolved workspace or verification operation. Inspect its evidence and start a new team rather than replaying uncertain work.");
       if (pending && pending.kind !== "check") throw new TeamError(409, "team-operation-running", "A workspace operation is in progress. Retry steering after it settles.");
       if (stored.run.workspaceRemovedAt) throw new TeamError(409, "team-workspace-removed", "This run's workspaces were removed under the retention policy; start a new run.");
-      if (stored.run.pullRequest && !pullRequestBranch(stored.run)) throw new TeamError(409, "delivery-branch-unknown", "This run's pull request was recorded before the host kept its branch, so a steer cannot tell which branch to continue. With review feedback switched on, the host records the branch at its next read of the pull request; retry then, or start a new run.");
       if (Buffer.byteLength(stored.run.steering.map(item => item.text).join("")) + Buffer.byteLength(body.text) > 32 * 1024) throw new TeamError(409, "team-steering-limit", "This team reached its 32 KiB steering limit. Start a new team with consolidated requirements.");
       if (stored.run.steering.length >= 20) throw new TeamError(409, "team-steering-limit", "This team reached its steering limit. Start a new team from the reviewed integration branch.");
       const receipt = this.admit(stored, "steer", body);
       if (!receipt) return this.view(stored);
+      if (stored.run.pullRequest && !pullRequestBranch(stored.run)) await this.reviewFeedback.resolveLegacyPullRequestBranch(stored);
       this.commands.get(id)?.abort();
       await this.invalidatePermissionDecisions(stored, "The team revision changed before the permission request could be answered.");
       this.recordReceipt(stored, body.requestId, receipt);
@@ -2082,6 +2079,7 @@ export class TeamService {
       }
       if (await this.startAutomaticRecovery(stored, trackingReady)) return;
       if (!stored.prepared) return;
+      this.verdicts.recover(stored);
       if (["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"].includes(run.status)) {
         await this.stopObsoletePermissionCoordinators(stored); return;
       }
@@ -2296,6 +2294,7 @@ export class TeamService {
         await assertMemberReadOnly(run.workspace, run.headCommit!, this.config.teams?.commandPrefix, undefined, "integration");
         this.assertBudget(run);
         if (run.delivery) {
+          if (run.pullRequest && !pullRequestBranch(run) && !this.reviewFeedback.ensureLegacyPullRequestBranch(stored)) return;
           this.assertDelivery(stored);
           if (stored.deliveryAttempt) throw new TeamError(409, "delivery-reconciliation-required", "Delivery started without a confirmed report. Inspect the recorded branch and pull request before retrying.");
           if (this.holdAutomaticMerge(stored)) return;
@@ -2362,9 +2361,7 @@ export class TeamService {
   private handOffPermission(...args: Parameters<TeamPermissionReview["handOffPermission"]>) { return this.permissions.handOffPermission(...args); }
   private maybeStartPermissionReview(...args: Parameters<TeamPermissionReview["maybeStartPermissionReview"]>) { return this.permissions.maybeStartPermissionReview(...args); }
   private consumePermissionCoordinator(...args: Parameters<TeamPermissionReview["consumePermissionCoordinator"]>) { return this.permissions.consumePermissionCoordinator(...args); }
-  private assertDelivery(stored: Stored) {
-    assertReviewedDelivery(stored.run, stored.checkHead, this.config.projects.find(project => project.id === stored.run.projectId)?.team?.delivery);
-  }
+  private assertDelivery(stored: Stored) { assertReviewedDelivery(stored.run, stored.checkHead, this.config.projects.find(project => project.id === stored.run.projectId)?.team?.delivery); }
   private holdAutomaticMerge(stored: Stored, queued?: TeamMember): boolean {
     const { run } = stored;
     if (run.delivery?.mode !== "merge") return false;
@@ -2602,15 +2599,18 @@ export class TeamService {
     return { publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"), objectiveDigest: objectivePromptOf(run), codeMode: memberCodeModeExpected(this.config),
       limited: this.limits.limited(), featureMap: (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features };
   }
+  private rebuildDeliveryPrompts(stored: Stored, target?: TeamMember): () => void {
+    const run = stored.run, members = target ? [target] : run.members.filter(m => m.role === "delivery" && m.revision === run.revision && m.status === "queued");
+    const saved = members.filter(m => !this.hasLaunch(m) && deliveryPromptStale(run, m)).map(m => ({ m, prompt: m.prompt, scratch: m.scratchDirectory }));
+    for (const { m } of saved) { m.prompt = teamPrompt(run, "delivery", undefined, m.contextFeedback, m.provider ?? run.provider, m.modelProfile, this.config.projects.find(p => p.id === run.projectId)?.team, this.permissionRecoveryHistory(run), this.publishHeadsEnabled()); delete m.scratchDirectory; }
+    return () => { for (const { m, prompt, scratch } of saved) { m.prompt = prompt; if (scratch === undefined) delete m.scratchDirectory; else m.scratchDirectory = scratch; } };
+  }
   private async launch(stored: Stored, member: TeamMember) {
     if (member.entryTools === true) this.entryQueue.add(stored.run.id, member.memberId);
     if (this.publicationGate(stored, member.role)) return;
-    const run = stored.run, publication = run.publication;
-    if (member.role === "delivery" && !this.hasLaunch(member) && publication && publication.commit === run.headCommit &&
-        publication.repository === run.delivery?.repository && !member.prompt.includes(`The host has already published ${run.headCommit}`)) {
-      member.prompt = teamPrompt(run, "delivery", undefined, member.contextFeedback, member.provider ?? run.provider, member.modelProfile,
-        this.config.projects.find(project => project.id === run.projectId)?.team, this.permissionRecoveryHistory(run), this.publishHeadsEnabled());
-    }
+    const run = stored.run;
+    if (member.role === "delivery" && run.pullRequest && !pullRequestBranch(run) && !this.reviewFeedback.ensureLegacyPullRequestBranch(stored)) return;
+    if (member.role === "delivery" && !this.hasLaunch(member) && deliveryPromptStale(run, member)) { this.rebuildDeliveryPrompts(stored, member); this.save(stored); }
     this.assertBudget(stored.run);
     this.assertRunPath(stored, member.cwd);
     if (!this.hasLaunch(member)) {

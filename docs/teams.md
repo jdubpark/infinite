@@ -1798,12 +1798,14 @@ applies to every such steer, whether or not review feedback (below) is switched 
 - When the delivery of a continued revision fails, the run blocks for the owner
   without automatic delivery recovery.
 - A pull request recorded before the host kept its branch has no recorded branch,
-  and the host does not infer one. A new steer on that run is refused with
-  `delivery-branch-unknown`. A run that was already continued from such a record
-  blocks at delivery with the same code instead of delivering. Only review
-  feedback's read of GitHub records the branch, and only while the run waits for
-  review at its delivered revision. With review feedback off, such a run refuses
-  every new steer and never gets its branch recorded; start a new run instead.
+  and the host does not infer one locally. On steer or continued delivery, the
+  host performs an on-demand read-only `gh pr view` against the pinned delivery
+  repository, validates the head branch against `gitBranchSchema` and the run's
+  owned delivery branch, persists it on `pullRequest.branch`, and continues.
+  If the lookup fails or GitHub reports a closed, merged, fork, retargeted, or
+  unmatched branch, the steer fails or delivery blocks with
+  `delivery-branch-unknown` without mutating the run. Review feedback's read of
+  GitHub also backfills `pullRequest.branch` when switched on.
 
 With `github.reviewFeedback` switched on, the owner's changes-requested review of
 that pull request steers the run the same way, once per review. Only the review

@@ -556,12 +556,15 @@ test("a grouped spawn reports the status, signal, output and missing command tha
 test("a grouped stop closes the caller's pipes well before its grace, because the sleeper it leaves holds none of them", CASE, async () => {
   const graceMs = 5_000;
   const child = spawnGroup(process.execPath, ["-e", "process.stdout.write('ready'); setInterval(() => {}, 1000)"], { stdio: ["pipe", "pipe", "pipe"] }, graceMs);
-  const closed = new Promise<number>(done => child.once("close", () => done(Date.now())));
+  const closed = new Promise<number>(done => child.once("close", () => done(performance.now())));
   await new Promise<void>((ready, fail) => { child.stdout!.once("data", () => ready()); child.once("error", fail); });
-  const stopped = Date.now();
+  const stopped = performance.now();
   terminateGroup(child, graceMs);
-  const elapsed = (await closed) - stopped;
+  const elapsed = Math.round((await closed) - stopped);
   assert.ok(elapsed < graceMs / 2, `close arrived ${elapsed} ms after the stop, with a grace of ${graceMs} ms`);
+  assert.ok(performance.now() - stopped < graceMs, "the sleeper still holds the group, which it keeps for the grace after the command ends");
+  process.kill(-child.pid!, "SIGKILL");
+  await until("the sleeper's group ends after a group SIGKILL", () => gone(-child.pid!), 3_000);
 });
 
 test("a grouped spawn refuses a fourth stdio entry and an ipc entry, because its anchor keeps the caller's stderr on descriptor 3", () => {

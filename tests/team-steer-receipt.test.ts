@@ -116,6 +116,28 @@ for (const status of ["paused", "blocked"] as const) {
   });
 }
 
+test("a host stop between a resume's permission withdrawal and its own write leaves the decision withdrawn with a reason that holds whether or not the resume completes", async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.status = "paused"; f.run.members[0]!.status = "stopped";
+    delegatedRun(f);
+    const request = { requestId: randomUUID(), revision: 1 }, withdrawn = [["stale", "A resume started before the permission request could be answered."]];
+    const decisions = (saved: Saved) => saved.run.permissionDecisions?.map(decision => [decision.status, decision.reason]);
+    const stop = hostStop(f, 1), first = f.openTeam({ entries: stop.entries });
+    stop.arm();
+    await first.resume(f.run.id, request).catch(() => undefined);
+    assert.ok(stop.stopped(), "the resume's permission withdrawal is a record write of its own");
+    stop.restart();
+    const left = f.readRecord<Saved>("team", f.run.id);
+    assert.deepEqual([left.run.status, left.run.revision, left.receipts[request.requestId]], ["paused", 1, undefined], "the host stopped after the withdrawal and before the resume's own write");
+    assert.deepEqual(decisions(left), withdrawn);
+    const retried = await f.openTeam().resume(f.run.id, request);
+    assert.deepEqual([retried.status, retried.revision, count(retried, "Team resumed with a fresh plan.")], ["planning", 2, 1]);
+    assert.deepEqual(decisions(f.readRecord<Saved>("team", f.run.id)), withdrawn, "the retried resume neither restores the decision nor changes its reason");
+    assert.equal(f.permissionAnswers(), 0, "no provider answer is sent for the withdrawn decision");
+  } finally { f.close(); }
+});
+
 test("whichever record write an agent-only revocation stops after, a retry of the same request records it exactly once", async () => {
   const agent = { delivery: {}, pipeline: { serves: () => ({ served: true }), taskEnded: () => {} } } as unknown as PermissionAgentServices;
   const request = { requestId: randomUUID(), revision: 1 };

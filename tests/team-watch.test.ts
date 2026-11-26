@@ -126,8 +126,12 @@ test("the summary card reads the coordinator brief and the log card returns to i
 
 test("watch keys switch views and agents, scroll, and detach", () => {
   assert.equal(teamWatchCommand("l"), "logs");
-  assert.equal(teamWatchCommand("b"), "summary");
+  assert.equal(teamWatchCommand("b"), "board");
   assert.equal(teamWatchCommand("s"), "summary");
+  assert.equal(teamWatchCommand("\r"), "enter");
+  assert.equal(teamWatchCommand("\n"), "enter");
+  assert.equal(teamWatchCommand("f"), "follow");
+  assert.equal(teamWatchCommand("o"), "openMember");
   assert.equal(teamWatchCommand("n"), "next");
   assert.equal(teamWatchCommand("p"), "prev");
   assert.equal(teamWatchCommand("\u001b[C"), "next");

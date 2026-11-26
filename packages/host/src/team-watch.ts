@@ -1,6 +1,6 @@
 import { recommendationLine, type QuestionRecommendation } from "./question-recommendation.js";
 
-const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+export const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 
 export function openQuestionLines(question: { id: unknown; question: unknown; options?: unknown; recommendation?: QuestionRecommendation }): string[] {
   const options: unknown[] = Array.isArray(question.options) ? question.options : [];
@@ -8,11 +8,11 @@ export function openQuestionLines(question: { id: unknown; question: unknown; op
     ...(question.recommendation ? [`  ${clean(recommendationLine(question.recommendation))}`] : []),
     ...options.map((option, index) => `  ${index + 1}. ${clean(option)}`)];
 }
-const short = (value: unknown, max: number) => {
+export const short = (value: unknown, max: number) => {
   const text = clean(value).trim();
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 };
-const roleNames: Record<string, string> = {
+export const roleNames: Record<string, string> = {
   "project-manager": "Coordinator",
   "intent-checker": "Intent checker",
   scout: "Scout",
@@ -166,7 +166,7 @@ function section(lines: string[], title: string, items: (string | string[])[], n
   if (shown.length > 8) lines.push(`  + ${shown.length - 8} more`);
 }
 
-function decisionLines(lines: string[], team: any) {
+export function decisionLines(lines: string[], team: any) {
   const open = (team?.decisions ?? []).filter((question: any) => !question?.answer && question?.revision === team?.revision);
   if (!open.length) return;
   lines.push("", `DECISIONS FOR YOU (${open.length})`);
@@ -180,7 +180,7 @@ function decisionLines(lines: string[], team: any) {
   if (open.length > 3) lines.push(`  + ${open.length - 3} more`);
 }
 
-function teamHeading(team: any, view: string) {
+export function teamHeading(team: any, view: string) {
   const objective = clean(team?.objective).trim();
   return [`${clean(team?.id)} · ${clean(team?.status)} · revision ${clean(team?.revision)} · ${view}`, short(objective || team?.title, 500)];
 }
@@ -237,7 +237,7 @@ export function visibleScreen(value: unknown, maxLines = 24): string {
   return lines.some(line => line.trim()) ? lines.join("\n") : "No screen is recorded for this agent.";
 }
 
-export type TeamWatchCommand = "logs" | "summary" | "next" | "prev" | "ask" | "detach" | "up" | "down" | "pageUp" | "pageDown" | "top" | "bottom";
+export type TeamWatchCommand = "logs" | "summary" | "board" | "next" | "prev" | "ask" | "detach" | "up" | "down" | "pageUp" | "pageDown" | "top" | "bottom" | "enter" | "follow" | "openMember";
 
 const keySequences: [string, TeamWatchCommand][] = [
   ["\u001b[A", "up"], ["\u001bOA", "up"], ["\u001b[B", "down"], ["\u001bOB", "down"],
@@ -246,8 +246,9 @@ const keySequences: [string, TeamWatchCommand][] = [
   ["\u001b[H", "top"], ["\u001bOH", "top"], ["\u001b[1~", "top"], ["\u001b[F", "bottom"], ["\u001bOF", "bottom"], ["\u001b[4~", "bottom"],
 ];
 const keys: Record<string, TeamWatchCommand> = {
-  l: "logs", s: "summary", b: "summary", n: "next", p: "prev", a: "ask", q: "detach",
+  l: "logs", s: "summary", b: "board", n: "next", p: "prev", a: "ask", q: "detach",
   j: "down", k: "up", " ": "pageDown", g: "top", G: "bottom",
+  "\r": "enter", "\n": "enter", f: "follow", o: "openMember",
 };
 
 export function teamWatchCommand(chunk: string): TeamWatchCommand | null {

@@ -491,7 +491,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
 const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "fuse", "resources", "close", "sync", "pull", "team", "repo", "routine", "autonomy", "routing", "signal", "halt", "egress", "permissions", "goal", "eval", "duels"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
 const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--autonomy", "--profile", "--run", "--by", "--sources", "--days", "--judge", "--pairs", "--judge-minutes", "--member", "--issue", "--commit", "--at", "--reason", "--withdraw", "--goal", "--mission", "--kind", "--task", "--since", "--direction", "--note", "--set", "--limit", "--before", "--after", "--version", "--routing", "--routing-value", "--routing-contributor", "--routing-points"]);
-const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--host", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs", "--dry-run", "--all", "--clear-direction", "--wrong", "--rejected", "--raised", "--keep-paused"]);
+const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--host", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs", "--board", "--dry-run", "--all", "--clear-direction", "--wrong", "--rejected", "--raised", "--keep-paused"]);
 
 export function clientCommandCandidate(args: readonly string[]): string | undefined {
   for (let index = 0; index < args.length; index++) {
@@ -530,7 +530,7 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   if (options["--watch"] && command !== "resources") throw new Error("--watch applies to infinite resources");
   if (options["--yes"] && command !== "close") throw new Error("--yes applies to infinite close");
   if (options["--logs"] && command !== "team") throw new Error("--logs applies to infinite team status or infinite team watch");
-  if (options["--logs"] && options["--json"]) throw new Error("Use either --logs or --json");
+  if (options["--logs"] && options["--json"]) throw new Error("Use either --logs or --json"); if (options["--board"] && (command !== "team" || options["--logs"] || options["--json"])) throw new Error(command !== "team" ? "--board applies to infinite team watch" : options["--logs"] ? "Use either --board or --logs" : "Use either --board or --json");
   if (command === "resources" && positional.length) throw new Error("infinite resources takes no arguments");
   if (command === "close" && positional.length !== 1) throw new Error("Usage: infinite close SESSION_ID [--yes] [--takeover]");
   return { command, args: providers.has(command) ? args : positional, options, includes };

@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { HANDOFF_INSTRUCTIONS } from "./handoff-types.js";
-import type { AgentProfile, Config, ExecutionIdentity, Provider } from "./types.js";
+import { sessionExecutionIdentity, type AgentProfile, type Config, type ExecutionIdentity, type Provider, type SessionPurpose } from "./types.js";
 import { dirname, join } from "node:path";
 import { teamModelProfileSchema, type TeamModelProfile } from "./team-types.js";
 import { TeamError } from "./team-workspace.js";
@@ -7,6 +8,36 @@ import { codexTrustArgs } from "./workspace-trust.js";
 import { sudoShape } from "./sudo-profile.js";
 import { EGRESS_ENVIRONMENT_NAMES } from "./egress.js";
 import { CLAUDE_CODE_MODE_ENV, codeModeEnabled } from "./code-mode.js";
+
+const HOST_LAUNCH_FIELDS = ["executionIdentity", "purpose", "configId", "team", "teamCwd", "teamModelProfile", "recordedCodeMode"] as const;
+
+export function hasHostLaunchFields(request: object): boolean {
+  return HOST_LAUNCH_FIELDS.some(field => field in request);
+}
+
+export function stripHostLaunchFields<T extends object>(request: T): T {
+  const cleaned = { ...request } as Record<string, unknown>;
+  for (const field of HOST_LAUNCH_FIELDS) delete cleaned[field];
+  return cleaned as T;
+}
+
+export function sessionRequestFingerprint(request: { requestId: string }, targetId: string): string {
+  const canonical = targetId === request.requestId ? request : { ...request, requestId: targetId };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+export function matchesSessionRequestFingerprint(
+  storedFingerprint: string,
+  request: { requestId: string; purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity },
+  targetId: string,
+  resolvedIdentity: ExecutionIdentity,
+): boolean {
+  if (storedFingerprint === sessionRequestFingerprint(request, targetId)) return true;
+  if (request.executionIdentity === undefined) return false;
+  if (sessionExecutionIdentity({ purpose: request.purpose }) !== resolvedIdentity) return false;
+  const { executionIdentity: _executionIdentity, ...legacy } = request;
+  return storedFingerprint === sessionRequestFingerprint(legacy, targetId);
+}
 
 export function sessionAgentProfile(config: Pick<Config, "agents" | "eval">, provider: Provider, executionIdentity: ExecutionIdentity = "production"): AgentProfile | undefined {
   if (executionIdentity !== "eval") return config.agents[provider];

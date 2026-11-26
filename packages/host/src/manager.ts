@@ -27,7 +27,7 @@ import type { FuseGate } from "./fuse/types.js";
 import { haltReason } from "./halt/rules.js";
 import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotRejectOption, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
-import { headlessLaunch, missionCoordinatorLaunch, permissionCoordinatorLaunch, sessionAgentProfile, teamModelLaunch, withoutSharedContext } from "./launch.js";
+import { hasHostLaunchFields, headlessLaunch, matchesSessionRequestFingerprint, missionCoordinatorLaunch, permissionCoordinatorLaunch, sessionAgentProfile, sessionRequestFingerprint, stripHostLaunchFields, teamModelLaunch, withoutSharedContext } from "./launch.js";
 import { withNativeContinuation } from "./native-continuation.js";
 import { SESSION_PERMISSION_ACTOR_LABEL, isRequesterNotice, sessionPermissionRequestId, type SessionPermissionAnswer } from "./permission-session-requests.js";
 import { deferredCallOpen, type HeadlessPermissionChannel } from "./permission-headless.js";
@@ -36,7 +36,7 @@ import { TeamError } from "./team-workspace.js";
 import { prepareMemberTrace } from "./member-traces.js";
 import { projectGithubRepository, sessionGithubGrant, sessionGithubScopeFor, type GithubGrantScope, type SessionGithubOrigin } from "./github-grants.js";
 import {
-  isEvalSession, resolveLaunchExecutionIdentity,
+  isEvalSession, resolveLaunchExecutionIdentity, sessionExecutionIdentity,
   type Bootstrap, type Config, type ControlLease, type ExecutionIdentity, type LaptopWorkspace, type Provider,
   type Receipt, type Session, type SessionPurpose, type TeamMemberAssignment, type TeamPermissionExpansionExpectation,
   type WorkerRequest, type WorkerState,
@@ -374,17 +374,18 @@ export class Manager {
   create(request: CreateSession, startedBy?: "owner"): Promise<Session & WorkerState> {
     if (request.continuation !== undefined)
       throw new ContentError("Native continuation is only available for managed coordinator team sessions", 400);
-    const untrusted = request as CreateSession & Record<string, unknown>;
-    if (untrusted.executionIdentity !== undefined || untrusted.purpose !== undefined || untrusted.team !== undefined)
+    if (hasHostLaunchFields(request))
       throw new ContentError("Host-owned launch fields cannot be supplied when creating a session", 400);
     return this.serializeSession(request.requestId, () =>
-      this.createOnce(request, false, startedBy === "owner" ? "owner-started" : undefined),
+      this.createOnce(stripHostLaunchFields(request), false, startedBy === "owner" ? "owner-started" : undefined),
     );
   }
   createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false,
     header: { purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity; configId?: string; haltScope?: readonly string[] } = {}, github?: GithubGrantScope): Promise<Session & WorkerState> {
     if (!this.config.teams || request.nativeArgs !== undefined || request.localUi || request.workspace || request.resumedFrom)
       throw new ContentError("Team sessions require a configured team workspace and managed launch", 400);
+    if (hasHostLaunchFields(request))
+      throw new ContentError("Host-owned launch fields must be supplied through the team launch header", 400);
     const resolvedIdentity = resolveLaunchExecutionIdentity(header);
     if (!resolvedIdentity.ok) throw new ContentError(resolvedIdentity.message, 400);
     if (header.configId !== undefined && !/^[0-9a-f]{64}$/.test(header.configId)) throw new ContentError("The session config ID must be a lowercase SHA-256 digest", 400);
@@ -404,7 +405,7 @@ export class Manager {
     const rel = relative(root, canonical);
     if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new ContentError("Invalid team working directory", 400);
     return this.serializeSession(request.requestId, () => this.createOnce({
-      ...request, ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}),
+      ...stripHostLaunchFields(request), ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}),
       ...(header.purpose !== undefined ? { purpose: header.purpose } : {}),
       ...(header.executionIdentity !== undefined ? { executionIdentity: header.executionIdentity } : {}),
       ...(header.configId !== undefined ? { configId: header.configId } : {}),
@@ -951,20 +952,19 @@ export class Manager {
       else validateNativeOpenCodeArgs(request.nativeArgs ?? [], request.nativeArgs === undefined ? request.prompt : "");
     }
     const id = request.requestId;
-    const fingerprintFor = (targetId: string) => createHash("sha256").update(JSON.stringify(targetId === id ? request : { ...request, requestId: targetId })).digest("hex");
-    const fingerprint = fingerprintFor(id);
+    const fingerprint = sessionRequestFingerprint(request, id);
     const dir = join(this.config.stateDir, "sessions", id);
     const deletedId = this.deletedReceiptEntry(id);
     if (deletedId !== undefined) {
       const deleted = unseal<DeletedSessionReceipt>(this.key, `deleted:${deletedId}`, readFileSync(this.deletedReceiptPath(deletedId), "utf8"));
       if (deleted.id !== deletedId) throw new Error("Invalid deleted session receipt");
-      if (deleted.fingerprint !== fingerprintFor(deletedId)) throw new Error("Request ID already belongs to a different session");
+      if (!matchesSessionRequestFingerprint(deleted.fingerprint, request, deletedId, executionIdentity)) throw new Error("Request ID already belongs to a different session");
       throw new ContentError("This session was deleted and cannot be started again", 410);
     }
     const existingId = this.sessionDirEntry(id);
     if (existingId !== undefined && existsSync(join(this.config.stateDir, "sessions", existingId, "meta.sealed"))) {
       const stored = this.meta(existingId);
-      if (stored.fingerprint !== fingerprintFor(existingId))
+      if (!matchesSessionRequestFingerprint(stored.fingerprint, request, existingId, executionIdentity) || sessionExecutionIdentity(stored.session) !== executionIdentity)
         throw new Error("Request ID already belongs to a different session");
       return { ...stored.session, ...(await this.state(existingId)) };
     }

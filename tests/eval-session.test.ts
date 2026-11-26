@@ -11,7 +11,7 @@ import { readDecisionQueue } from "../packages/host/src/decision-queue-read.js";
 import { installHostEgress, sessionEgressIdentity } from "../packages/host/src/egress.js";
 import type { FuseGate, FuseLaunch } from "../packages/host/src/fuse/types.js";
 import { sessionGithubScopeFor } from "../packages/host/src/github-grants.js";
-import { sessionAgentProfile, withoutSharedContext } from "../packages/host/src/launch.js";
+import { sessionAgentProfile, sessionRequestFingerprint, withoutSharedContext } from "../packages/host/src/launch.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { Notifier } from "../packages/host/src/notifier.js";
 import { ProjectContexts } from "../packages/host/src/project-context.js";
@@ -233,8 +233,14 @@ test("executionIdentity is host-owned, strictly validated, and unspoofable acros
     assert.throws(() => r.manager.createTeamSession(req(), team, r.cwd, undefined, join(r.cwd, ".."), true, { purpose: "gate", executionIdentity: "production" }), bad400);
     assert.throws(() => r.manager.createTeamSession(req(), team, r.cwd, undefined, join(r.cwd, ".."), true, { purpose: "work", executionIdentity: "eval" }), bad400);
     assert.throws(() => r.manager.createTeamSession(req(), team, r.cwd, undefined, join(r.cwd, ".."), true, { executionIdentity: "sandbox" as never }), bad400);
+    assert.throws(() => r.manager.createTeamSession({ ...req(), executionIdentity: "eval" } as never, team, r.cwd, undefined, join(r.cwd, ".."), true, {}), bad400);
+    assert.throws(() => r.manager.createTeamSession({ ...req(), purpose: "replay" } as never, team, r.cwd, undefined, join(r.cwd, ".."), true, {}), bad400);
+    assert.throws(() => r.manager.createTeamSession({ ...req(), configId: "a".repeat(64) } as never, team, r.cwd, undefined, join(r.cwd, ".."), true, {}), bad400);
+    const protoSpoof = Object.assign(Object.create({ executionIdentity: "eval" }), req());
+    assert.throws(() => r.manager.createTeamSession(protoSpoof as never, team, r.cwd, undefined, join(r.cwd, ".."), true, {}), bad400);
     assert.throws(() => r.manager.create({ ...req(), executionIdentity: "eval" } as never), bad400);
     assert.throws(() => r.manager.create({ ...req(), purpose: "replay" } as never), bad400);
+    assert.throws(() => r.manager.create(protoSpoof as never), bad400);
 
     for (const spoof of [{ executionIdentity: "eval" }, { executionIdentity: "production" }, { purpose: "duel" }, { purpose: "replay" }]) {
       const response = await fetch(`${origin}/api/sessions`, {
@@ -296,6 +302,46 @@ test("executionIdentity is host-owned, strictly validated, and unspoofable acros
     assert.equal(existsSync(join(r.stateDir, "sessions", evalDuelId)), false);
     assert.equal(existsSync(join(r.stateDir, "sessions", evalReplayId)), false);
     assert.equal(existsSync(join(r.stateDir, "sessions", legacyDuelId)), false);
+
+    for (const legacyPurpose of ["replay", "gate", "duel"] as const) {
+      const legacyReq = req();
+      const legacyFingerprint = sessionRequestFingerprint({ ...legacyReq, team, teamCwd: r.cwd, purpose: legacyPurpose }, legacyReq.requestId);
+      const dir = join(r.stateDir, "sessions", legacyReq.requestId);
+      mkdirSync(dir, { recursive: true });
+      writeSealed(join(dir, "meta.sealed"), r.key, `${legacyReq.requestId}:meta`, {
+        session: {
+          id: legacyReq.requestId, team, purpose: legacyPurpose, provider: "claude", title: legacyReq.title, projectId: "fixture", cwd: r.cwd,
+          createdAt: "2026-11-26T00:00:00.000Z", status: "exited", contextVersion: 0, context: "", initialPrompt: legacyReq.prompt,
+        },
+        fingerprint: legacyFingerprint,
+      });
+      writeSealed(join(dir, "status.sealed"), r.key, `${legacyReq.requestId}:status`, {
+        status: "exited", seq: 1, screen: "", attention: att("exited"),
+      });
+
+      const retried = await r.manager.createTeamSession(legacyReq, team, r.cwd, undefined, join(r.cwd, ".."), true, { purpose: legacyPurpose, executionIdentity: "eval" });
+      assert.equal(retried.id, legacyReq.requestId);
+      assert.equal(retried.purpose, legacyPurpose);
+
+      if (legacyPurpose === "duel") {
+        await assert.rejects(
+          () => r.manager.createTeamSession(legacyReq, team, r.cwd, undefined, join(r.cwd, ".."), true, { purpose: "duel", executionIdentity: "production" }),
+          /Request ID already belongs to a different session/,
+        );
+      }
+
+      await r.manager.remove(legacyReq.requestId);
+      await assert.rejects(
+        () => r.manager.createTeamSession(legacyReq, team, r.cwd, undefined, join(r.cwd, ".."), true, { purpose: legacyPurpose, executionIdentity: "eval" }),
+        (error: { status?: number }) => error.status === 410,
+      );
+      if (legacyPurpose === "duel") {
+        await assert.rejects(
+          () => r.manager.createTeamSession(legacyReq, team, r.cwd, undefined, join(r.cwd, ".."), true, { purpose: "duel", executionIdentity: "production" }),
+          /Request ID already belongs to a different session/,
+        );
+      }
+    }
   } finally {
     app.closeConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));

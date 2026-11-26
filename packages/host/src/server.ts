@@ -1,4 +1,5 @@
 import express from "express";
+import { browserSessionCookie } from "./browser-session.js";
 import { ProjectContexts, contextLinksRequest } from "./project-context.js";
 import { createServer } from "node:http";
 import { connectTerminals, terminalPages } from "./terminal-stream.js";
@@ -591,6 +592,11 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       return res.status(403).json({ error: "Host is not allowed" });
     next();
   });
+  app.post("/api/login", (_req, res, next) => {
+    if (config.browserSessions === false)
+      return res.status(403).json({ code: "browser-sessions-disabled", error: "Browser sign-in is disabled on this instance" });
+    next();
+  });
   app.use((req, res, next) => /^\/api\/projects\/[^/]+\/sync\/commit$/.test(req.path) || PERMISSION_REPLAY_PATH.test(req.path) ? next()
     : express.json({ limit: /^\/api\/sessions\/[^/]+\/opencode(?:\/|$)/.test(req.path) ? "8mb" : "96kb" })(req, res, next));
   function authenticate(token: string) {
@@ -605,11 +611,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       const device = authenticate(bearer);
       return device ? { device, credentialHash: device.hash, instance: "legacy", bearer: true } : undefined;
     }
-    const value = req.headers.cookie
-      ?.split(";")
-      .map((v) => v.trim())
-      .find((v) => v.startsWith("infinite="))
-      ?.slice(9);
+    if (config.browserSessions === false) return undefined;
+    const value = browserSessionCookie(req);
     const session = value ? cookies.get(hashToken(value)) : undefined;
     if (!session || session.expires <= Date.now()) return undefined;
     const device = config.tokens.find(token => token.hash === session.device.hash);
@@ -1446,13 +1449,11 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     res.json({ ok: true });
   });
   app.post("/api/logout", (req, res) => {
-    const value = req.headers.cookie
-      ?.split(";")
-      .map((v) => v.trim())
-      .find((v) => v.startsWith("infinite="))
-      ?.slice(9);
-    if (value) cookies.delete(hashToken(value));
-    res.clearCookie("infinite", { path: "/api" });
+    if (config.browserSessions !== false) {
+      const value = browserSessionCookie(req);
+      if (value) cookies.delete(hashToken(value));
+      res.clearCookie("infinite", { path: "/api" });
+    }
     res.json({ ok: true });
   });
   app.get("/api/sessions", (req, res) => sendSessionList(req, res, listSessions));
@@ -2018,11 +2019,13 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.use("/api", (_req, res) =>
     res.status(404).json({ error: "Endpoint not found" }),
   );
-  app.use(
-    express.static(
-      fileURLToPath(new URL("../../../apps/web/dist/", import.meta.url)),
-    ),
-  );
+  const serveWeb = express.static(fileURLToPath(new URL("../../../apps/web/dist/", import.meta.url)));
+  app.use((req, res, next) => {
+    if (config.browserSessions === false) return res.status(503).type("html").send(
+      "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Browser sign-in disabled</title><main><h1>Browser sign-in is disabled</h1><p>Do not enter a device key here. Connect with a paired CLI or native app.</p></main></html>",
+    );
+    serveWeb(req, res, next);
+  });
   app.use(
     (
       error: unknown,

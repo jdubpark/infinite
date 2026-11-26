@@ -5,14 +5,11 @@ import type { MissionProgressPage } from "./mission-progress.js";
 import type { ProjectGroup, ProjectGroupList } from "./project-group-types.js";
 import type { TeamRun } from "./team-types.js";
 import { recommendationLine } from "./question-recommendation.js";
+import type { ClientApi as Api } from "./client-api.js";
 import { boundTeamProject } from "./team-cli.js";
 import { teamWatchFrame } from "./team-watch.js";
 
 type ClientConfig = { origin: string; token: string };
-type Api = {
-  request(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<Response>;
-  json<T>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T>;
-};
 type Options = Record<string, string | boolean>;
 const safe = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ").trim();
 const short = (value: unknown, max: number) => {

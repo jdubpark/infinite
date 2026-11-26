@@ -24,6 +24,7 @@ function makeRepo() {
   run(dir, "config", "user.email", "placeholder@example.invalid");
   mkdirSync(join(dir, "docs"));
   writeFileSync(join(dir, "docs", "a.json"), SMALL);
+  writeFileSync(join(dir, "docs", "empty.txt"), "");
   writeFileSync(join(dir, "big.bin"), Buffer.alloc(1_048_577, 0x61));
   run(dir, "add", "-A");
   run(dir, "commit", "-q", "-m", "fixture");
@@ -77,6 +78,7 @@ test("a blob read streams within its limits", async () => {
     const small = await direct.read(dir, head, "docs/a.json", signal);
     assert.equal(small.state, "read");
     assert.deepEqual(small.state === "read" ? small.bytes : undefined, Buffer.from(SMALL));
+    assert.deepEqual(await direct.read(dir, head, "docs/empty.txt", signal), { state: "read", bytes: Buffer.alloc(0) });
     assert.equal((await direct.read(dir, head, "big.bin", signal)).state, "too-large");
     assert.deepEqual(await direct.read(dir, head, "docs/missing.json", signal), { state: "failed" });
 

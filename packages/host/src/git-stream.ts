@@ -6,7 +6,28 @@ import { teamGitArgs, teamGitEnvironment } from "./team-workspace.js";
 import { leaderExited, signalGroup, watchLeader } from "./process-group.js";
 
 export type StreamRead = { state: "read"; bytes: Buffer } | { state: "too-large" } | { state: "failed" };
+export type GitStreamRead =
+  | { state: "read"; bytes: Buffer }
+  | { state: "empty" }
+  | { state: "missing" }
+  | { state: "too-large" }
+  | { state: "failed" };
 export const BLOB_MAX_BYTES = 1_048_576, BLOB_READ_MS = 30_000, BLOB_RELEASE_MS = 1_000, BLOB_PATH_CHARS = 300;
+const STDERR_MAX_BYTES = 4_096;
+const MISSING_REF_FATAL = /^fatal:\s*(?:bad object\b|bad revision\b|ambiguous argument\b.*\bunknown revision\b|invalid object name\b|not a valid object name\b|could not parse object\b)/i;
+
+function isMissingRefStderr(stderr: string, refs: readonly string[] | undefined): boolean {
+  if (refs === undefined || refs.length === 0) return false;
+  const lines = stderr.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  let lastFatal: string | undefined;
+  for (let index = lines.length - 1; index >= 0; index--) {
+    if (/^fatal:/i.test(lines[index]!)) {
+      lastFatal = lines[index]!;
+      break;
+    }
+  }
+  return lastFatal !== undefined && MISSING_REF_FATAL.test(lastFatal) && refs.some(ref => lastFatal.includes(ref));
+}
 
 export function stopGroup(child: ChildProcess): boolean {
   return signalGroup(child, "SIGKILL") !== "refused";
@@ -15,11 +36,12 @@ export function stopGroup(child: ChildProcess): boolean {
 export type GitStreamInput = {
   cwd: string; args: readonly string[]; prefix: TeamCommand | undefined; maxBytes: number; timeoutMs: number; signal: AbortSignal;
   stop: (child: ChildProcess) => boolean; releaseMs: number; env?: Record<string, string>;
-  decided?: (read: StreamRead) => void;
+  decided?: (read: GitStreamRead) => void;
+  missingRefs?: readonly string[];
 };
 
-export function readGitStream(input: GitStreamInput): Promise<StreamRead> {
-  const { cwd, args, prefix, maxBytes, timeoutMs, signal, stop, releaseMs, env, decided: report } = input;
+export function readGitStream(input: GitStreamInput): Promise<GitStreamRead> {
+  const { cwd, args, prefix, maxBytes, timeoutMs, signal, stop, releaseMs, env, decided: report, missingRefs } = input;
   if (signal.aborted) return Promise.resolve({ state: "failed" });
   return new Promise(resolveRead => {
     let child: ChildProcess;
@@ -31,8 +53,9 @@ export function readGitStream(input: GitStreamInput): Promise<StreamRead> {
     }
     const leader = watchLeader(child);
     const chunks: Buffer[] = [];
-    let total = 0, decided: StreamRead | undefined, resolved = false, timer: NodeJS.Timeout | undefined, release: NodeJS.Timeout | undefined;
-    const finish = (read: StreamRead) => {
+    let stderrTail = Buffer.alloc(0);
+    let total = 0, decided: GitStreamRead | undefined, resolved = false, timer: NodeJS.Timeout | undefined, release: NodeJS.Timeout | undefined;
+    const finish = (read: GitStreamRead) => {
       if (resolved) return;
       resolved = true;
       resolveRead(read);
@@ -41,7 +64,7 @@ export function readGitStream(input: GitStreamInput): Promise<StreamRead> {
       if (timer) clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
     };
-    const decide = (read: StreamRead) => {
+    const decide = (read: GitStreamRead) => {
       if (decided) return;
       decided = read;
       clear();
@@ -64,19 +87,45 @@ export function readGitStream(input: GitStreamInput): Promise<StreamRead> {
       chunks.push(chunk);
     });
     child.stdout!.on("error", () => decide({ state: "failed" }));
-    child.stderr!.on("data", () => {});
+    child.stderr!.on("data", (chunk: Buffer) => {
+      if (decided || chunk.length === 0) return;
+      if (chunk.length >= STDERR_MAX_BYTES) {
+        stderrTail = Buffer.from(chunk.subarray(chunk.length - STDERR_MAX_BYTES));
+        return;
+      }
+      const combined = Buffer.concat([stderrTail, chunk]);
+      stderrTail = combined.length > STDERR_MAX_BYTES
+        ? Buffer.from(combined.subarray(combined.length - STDERR_MAX_BYTES))
+        : combined;
+    });
+    child.stderr!.on("error", () => decide({ state: "failed" }));
     child.once("error", () => {
       decide({ state: "failed" });
       clear();
       if (release) clearTimeout(release);
       finish(decided ?? { state: "failed" });
     });
-    child.once("close", exitCode => {
+    child.once("close", (exitCode, closeSignal) => {
       clear();
       if (release) clearTimeout(release);
-      finish(decided ?? (exitCode === 0 && !leader.leftover ? { state: "read", bytes: Buffer.concat(chunks) } : { state: "failed" }));
+      if (decided || leader.leftover) {
+        finish(decided ?? { state: "failed" });
+        return;
+      }
+      if (exitCode === 0 && closeSignal === null && child.stdout!.readableEnded) {
+        finish(total === 0 ? { state: "empty" } : { state: "read", bytes: Buffer.concat(chunks) });
+        return;
+      }
+      const stderr = stderrTail.toString("utf8");
+      finish(exitCode === 128 && closeSignal === null && isMissingRefStderr(stderr, missingRefs) ? { state: "missing" } : { state: "failed" });
     });
   });
+}
+
+function toBlobRead(read: GitStreamRead): StreamRead {
+  if (read.state === "empty") return { state: "read", bytes: Buffer.alloc(0) };
+  if (read.state === "missing") return { state: "failed" };
+  return read;
 }
 
 const REVISION_SYNTAX = /[\^~{}@]|-g[0-9A-Fa-f]+$/;
@@ -128,8 +177,8 @@ export function blobReader(
           answer({ state: "failed" });
           return;
         }
-        readGitStream({ cwd, args, prefix: command, maxBytes: BLOB_MAX_BYTES, timeoutMs, signal, stop: countedStop, releaseMs, env: { GIT_NO_LAZY_FETCH: "1" }, decided: answer })
-          .then(answer, () => answer({ state: "failed" }));
+        readGitStream({ cwd, args, prefix: command, maxBytes: BLOB_MAX_BYTES, timeoutMs, signal, stop: countedStop, releaseMs, env: { GIT_NO_LAZY_FETCH: "1" }, decided: read => answer(toBlobRead(read)) })
+          .then(read => answer(toBlobRead(read)), () => answer({ state: "failed" }));
       });
     },
     stalled: () => stalled,

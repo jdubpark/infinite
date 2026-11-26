@@ -8,7 +8,7 @@ export type GoalCreationRequest = {
   nonGoals: string[]; allowedPaths: string[]; evidence: string[]; maxRuns: number; maxMinutes: number; maxMembers: number;
 };
 export type MissionCreationRequest = { requestId: string; groupId: string; objective: string };
-export type RunRequest = { requestId: string; revision: number; path: string; label: string; fields: Record<string, string> };
+export type RunRequest = { requestId: string; revision: number; path: string; label: string; fields: Record<string, string | number> };
 type RequestState<Request, Result> = { pending?: Request; result?: Result; message: string };
 
 function requestStore<Request extends { requestId: string }, Result>() {

@@ -267,23 +267,27 @@ export class ProjectSync {
     writeJson(file, value);
   }
 
-  async begin(projectId: string, writer: SyncWriter) {
+  async begin(projectId: string, writer: SyncWriter, options: { expectEmpty?: boolean } = {}) {
     const verifiedWriter = this.requireWriter(writer);
     await this.ready(projectId);
     this.project(projectId);
     const now = Date.now(), active = this.expireLease(projectId, now);
+    if (active && (active.value.committing || !this.sameWriter(active.value.writer, verifiedWriter))) this.conflict(active, now);
+    if (options.expectEmpty) {
+      if (this.changing.has(projectId))
+        throw new ProjectSyncError("A workspace sync is being applied to this project. Retry after it finishes.", "sync-applying");
+      if (this.read<Received>(projectId, "received") || this.read<Applied>(projectId, "applied") || this.readPending(projectId))
+        throw new ProjectSyncError("This project already received a workspace sync generation; inspect its status before uploading again.", "cloud-changed");
+    }
+    const emptyConfirmed = options.expectEmpty ? { emptyConfirmed: true as const } : {};
     if (active) {
-      if (this.sameWriter(active.value.writer, verifiedWriter)) {
-        if (active.value.committing) this.conflict(active, now);
-        this.touchLease(projectId, active, now);
-        return { generation: active.value.generation };
-      }
-      this.conflict(active, now);
+      this.touchLease(projectId, active, now);
+      return { generation: active.value.generation, ...emptyConfirmed };
     }
     const value: UploadLease = { generation: randomUUID(), writer: verifiedWriter, updatedAt: new Date(now).toISOString(), committing: false };
     this.writeLease(projectId, value);
     this.uploads.set(projectId, { value, expiresAt: now + UPLOAD_LEASE_MS, lastActivityAt: now, lastPersistedAt: now });
-    return { generation: value.generation };
+    return { generation: value.generation, ...emptyConfirmed };
   }
   async missing(projectId: string, hashes: string[], writer: SyncWriter, generation: string) {
     await this.ready(projectId);

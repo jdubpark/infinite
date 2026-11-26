@@ -1962,7 +1962,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.post("/api/projects/:id/sync/begin", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (refuseGithubSync(projectId, res)) return;
-    res.json(await projectSync.begin(projectId, syncWriter(req, res)));
+    res.json(await projectSync.begin(projectId, syncWriter(req, res), z.object({ expectEmpty: z.boolean().optional() }).strict().parse(req.body ?? {})));
   });
   app.post("/api/projects/:id/sync/has", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     const { writer, generation } = syncLease(req, res);

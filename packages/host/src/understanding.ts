@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, type Stats } from "node:fs";
+import { realpath, stat } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { z } from "zod";
 import { parseMermaid } from "@infinite/remote";
 import type { Diagram, GeneratedCatalogPage, GeneratedPlan, GeneratedProject, UnderstandingArtifact, UnderstandingLink, UnderstandingPlan, UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding, WorkspaceKnowledge } from "@infinite/remote";
 import { MAX_RESPONSE_BYTES } from "@infinite/remote/protocol";
-import { expectedIdentity, readGit } from "./checkout-identity.js";
+import { expectedIdentityAsync, readGitAsync } from "./checkout-identity.js";
 import type { RepositorySummary, RepositoryBriefings } from "./repository-briefings.js";
 import type { Manager } from "./manager.js";
 import type { Project, Session, Config } from "./types.js";
@@ -21,7 +22,7 @@ import { isMissingSessionError } from "./mission-coordinator.js";
 import { pageOf } from "./understanding-pages.js";
 import {
   bindingSchema,
-  captureMissionPinnedRepositories,
+  captureMissionPinnedRepositoriesAsync,
   captureProjectBinding,
   entryMatchesCheckouts,
   isMissionBindingEntry,
@@ -108,6 +109,7 @@ export class UnderstandingService {
       persist: (session, location, summary, captured) => this.persist(session, location.root, summary, captured),
       cacheKey: async (session, location) => session.team?.role === "mission-coordinator" ? digest(await this.capture(session, location.root)) : undefined,
       captureKey: captured => (captured as Capture | undefined)?.binding.missionRole === "mission-coordinator" ? digest(captured) : undefined,
+      available: async (session, location) => session.team?.role === "mission-coordinator" ? this.missionSourceAvailable(session, location.root) : true,
     });
   }
 
@@ -164,15 +166,47 @@ export class UnderstandingService {
     return undefined;
   }
 
+  private async missionSourceAvailable(session: Session, rootInput: string): Promise<boolean> {
+    try {
+      if (session.workspace || session.executionLocation === "laptop") return false;
+      const live = this.sources.manager.meta(session.id).session;
+      if (live.projectId !== session.projectId || live.cwd !== session.cwd || digest(live.team ?? null) !== digest(session.team ?? null)) return false;
+      const project = this.project(session.projectId);
+      const canonicalProject = await realpath(resolve(project.path));
+      const root = await realpath(rootInput);
+      if (!pathInside(canonicalProject, root)) return false;
+      const owner = this.ownedTeamSession(session);
+      if (!owner) return false;
+      const mission = this.sources.missions.understandingRecords().find(item => item.id === owner.runId);
+      if (!mission || !mission.repoProjectIds.includes(project.id)) return false;
+      const group = this.groupForProject(project.id);
+      const groupProjectIds = new Set(group.repos.flatMap(repo => repo.checkouts.map(checkout => checkout.projectId)));
+      const ids = [...new Set(mission.repoProjectIds)].sort((a, b) => a.localeCompare(b));
+      if (!ids.length || ids.length > 64) return false;
+      const recordedPaths = this.sources.missions.understandingRepoPaths?.(owner.runId);
+      if (recordedPaths !== undefined) {
+        const recordedIds = Object.keys(recordedPaths).sort((a, b) => a.localeCompare(b));
+        if (recordedIds.length !== ids.length || !recordedIds.every((value, index) => value === ids[index])) return false;
+      }
+      for (const projectId of ids) {
+        const item = this.sources.config.projects.find(entry => entry.id === projectId);
+        if (!item || !groupProjectIds.has(projectId)) return false;
+        const enrolledPath = await realpath(resolve(item.path));
+        if (recordedPaths !== undefined && await realpath(resolve(recordedPaths[projectId]!)) !== enrolledPath) return false;
+      }
+      return true;
+    } catch { return false; }
+  }
+
   private async capture(session: Session, rootInput: string): Promise<Capture> {
     if (session.workspace || session.executionLocation === "laptop") throw new Error("source-unavailable");
     const live = this.sources.manager.meta(session.id).session;
     if (live.projectId !== session.projectId || live.cwd !== session.cwd || digest(live.team ?? null) !== digest(session.team ?? null)) throw new Error("session-source-rebound");
     const project = this.project(session.projectId);
     const enrolledPath = resolve(project.path);
-    const canonicalProject = realpathSync(enrolledPath);
-    const root = realpathSync(rootInput);
-    const sourceCwd = realpathSync(session.cwd);
+    const canonicalProject = await realpath(enrolledPath);
+    const root = await realpath(rootInput);
+    const sourceCwd = await realpath(session.cwd);
     const isMissionCoordinator = session.team?.role === "mission-coordinator";
     if (!isMissionCoordinator && !pathInside(root, sourceCwd)) throw new Error("source-cwd-outside-root");
     const sourceKind = session.team ? "team" : "project";
@@ -187,10 +221,10 @@ export class UnderstandingService {
         if (!mission || !mission.repoProjectIds.includes(project.id)) throw new Error("mission-brief-source-unavailable");
         const group = this.groupForProject(project.id);
         const recordedPaths = this.sources.missions.understandingRepoPaths?.(runId);
-        const pinnedRepositories = captureMissionPinnedRepositories(mission.repoProjectIds, this.sources.config.projects, group, recordedPaths);
+        const pinnedRepositories = await captureMissionPinnedRepositoriesAsync(mission.repoProjectIds, this.sources.config.projects, group, recordedPaths);
         const primary = Object.hasOwn(pinnedRepositories, project.id) ? pinnedRepositories[project.id] : undefined;
         if (!primary) throw new Error("mission-brief-source-unavailable");
-        const rootStat = statSync(root), cwdStat = statSync(sourceCwd);
+        const [rootStat, cwdStat] = await Promise.all([stat(root), stat(sourceCwd)]);
         return { binding: bindingSchema.parse({
           projectId: project.id, sourceKind, enrolledPath: primary.enrolledPath, root, sourceCwd,
           projectDevice: primary.projectDevice, projectInode: primary.projectInode,
@@ -203,8 +237,8 @@ export class UnderstandingService {
       const member = this.sources.teams.understandingRecords().find(run => run.id === runId)?.members.find(item => item.memberId === memberId && item.sessionId === session.id);
       if (member && resolve(member.cwd) !== resolve(session.cwd)) throw new Error("team-source-rebound");
     } else if (!pathInside(canonicalProject, root)) throw new Error("source-outside-project");
-    const projectStat = statSync(canonicalProject), rootStat = statSync(root), cwdStat = statSync(sourceCwd);
-    const identity = expectedIdentity({ ...project, path: canonicalProject }, readGit);
+    const [projectStat, rootStat, cwdStat] = await Promise.all([stat(canonicalProject), stat(root), stat(sourceCwd)]);
+    const identity = await expectedIdentityAsync({ ...project, path: canonicalProject }, readGitAsync);
     const group = this.groupForProject(project.id);
     const repo = group.repos.find(value => value.checkouts.some(checkout => checkout.projectId === project.id));
     const expectedKey = repo?.key;
@@ -240,6 +274,17 @@ export class UnderstandingService {
         );
         if (matching) return;
         throw new Error("The briefing engine skipped refresh while a bound mission repository changed.");
+      }
+    } else if (summary.repository.decision.action !== "run") {
+      const matchesTuple = (entry: Entry) =>
+        entry.artifact.sourceProjectId === session.projectId
+        && entry.artifact.fingerprint === summary.repository.fingerprint
+        && entry.artifact.generatedAt === summary.repository.generatedAt
+        && entry.artifact.brief.summary === summary.repository.brief.summary;
+      const leakedMission = this.state.generations.some(entry => isMissionBindingEntry(entry.binding, entry.artifact.pinnedSources) && matchesTuple(entry));
+      const matchedSingleRepo = this.state.generations.some(entry => !isMissionBindingEntry(entry.binding, entry.artifact.pinnedSources) && matchesTuple(entry));
+      if (leakedMission && !matchedSingleRepo) {
+        throw new Error("The briefing engine returned a skipped mission brief for a single-repository session.");
       }
     }
     const brief = summary.repository.brief;

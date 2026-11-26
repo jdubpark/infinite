@@ -127,7 +127,9 @@ type BriefingRetention = {
   persist(session: Session, location: Location, summary: RepositorySummary, captured: unknown): Promise<void>;
   cacheKey?(session: Session, location: Location): Promise<string | undefined>;
   captureKey?(captured: unknown): string | undefined;
+  available?(session: Session, location: Location): Promise<boolean>;
 };
+type LatestStatus = { status: BriefingStatus; sourceKey?: string; updatedAt: number };
 
 type Lifecycle =
   | { kind: "idle"; timer?: NodeJS.Timeout; polling: boolean }
@@ -237,9 +239,7 @@ export class RepositoryBriefings {
   private readonly pending = new Map<string, Job>();
   private readonly inFlight = new Map<string, Job>();
   private readonly reports = new Map<string, RepositorySummary>();
-  private readonly latest = new Map<string, BriefingStatus>();
-  private readonly latestSourceKey = new Map<string, string>();
-  private readonly statusUpdatedAt = new Map<string, number>();
+  private readonly latest = new Map<string, LatestStatus>();
   private readonly controllers = new Set<AbortController>();
   private readonly lastAttempt = new Map<string, number>();
   private retention?: BriefingRetention;
@@ -301,28 +301,53 @@ export class RepositoryBriefings {
   }
 
   async status(session: Session): Promise<BriefingStatus> {
-    const current = this.latest.get(session.id);
+    const initial = this.latest.get(session.id);
     if (session.team?.role === "mission-coordinator" && this.retention?.cacheKey) {
+      if (initial && !initial.status.summary && (initial.status.state === "failed" || initial.status.state === "pending" || initial.status.state === "running")) {
+        return initial.status;
+      }
+      if (!initial?.status.summary) {
+        try {
+          const location = await this.location(session);
+          this.rememberLocation(session.id, location);
+          const available = this.retention.available ? await this.retention.available(session, location) : true;
+          const current = this.latest.get(session.id);
+          if (current && !current.status.summary && (current.status.state === "failed" || current.status.state === "pending" || current.status.state === "running")) {
+            return current.status;
+          }
+          if (!available) return { state: "unavailable", error: "This session source is unavailable for repository briefing." };
+          if (!current?.status.summary) return { state: "empty" };
+        } catch {
+          const current = this.latest.get(session.id);
+          if (current && (current.status.state === "failed" || current.status.state === "pending" || current.status.state === "running")) {
+            const { summary: _stale, ...rest } = current.status;
+            return rest;
+          }
+          return { state: "unavailable", error: "This session source is unavailable for repository briefing." };
+        }
+      }
       let liveKey: string | undefined;
       try {
         const location = await this.location(session);
         this.rememberLocation(session.id, location);
         liveKey = await this.retention.cacheKey(session, location);
       } catch {
-        if (current && (current.state === "failed" || current.state === "pending" || current.state === "running")) {
-          const { summary: _stale, ...rest } = current;
+        const current = this.latest.get(session.id);
+        if (current && (current.status.state === "failed" || current.status.state === "pending" || current.status.state === "running")) {
+          const { summary: _stale, ...rest } = current.status;
           return rest;
         }
         return { state: "unavailable", error: "This session source is unavailable for repository briefing." };
       }
+      const current = this.latest.get(session.id);
       if (!current) return { state: "empty" };
-      if (!current.summary) return current;
-      if (liveKey && this.latestSourceKey.get(session.id) === liveKey) return current;
-      if (current.state === "ready") return { state: "empty" };
-      const { summary: _stale, ...rest } = current;
+      if (!current.status.summary) return current.status;
+      if (liveKey && current.sourceKey === liveKey) return current.status;
+      if (current.status.state === "ready") return { state: "empty" };
+      const { summary: _stale, ...rest } = current.status;
       return rest;
     }
-    if (current) return current;
+    if (initial) return initial.status;
     try {
       const location = await this.location(session);
       this.rememberLocation(session.id, location);
@@ -337,8 +362,8 @@ export class RepositoryBriefings {
   }
 
   understandingStatuses() {
-    return [...this.latest.entries()].map(([sessionId, status]) => ({ sessionId, state: status.state,
-      attemptedAt: this.lastAttempt.get(sessionId), updatedAt: this.statusUpdatedAt.get(sessionId)!, ...(status.error ? { error: status.error } : {}) }));
+    return [...this.latest.entries()].map(([sessionId, entry]) => ({ sessionId, state: entry.status.state,
+      attemptedAt: this.lastAttempt.get(sessionId), updatedAt: entry.updatedAt, ...(entry.status.error ? { error: entry.status.error } : {}) }));
   }
 
   async summarize(session: Session, from: string): Promise<RepositorySummary | Omit<RepositorySummary, "repository">> {
@@ -367,7 +392,7 @@ export class RepositoryBriefings {
       }
       const cached = this.reports.get(key);
       if (cached) {
-        this.setStatus(session.id, { state: "ready", summary: cached }, sourceKey);
+        if (!this.hasActiveJob(session.id)) this.setStatus(session.id, { state: "ready", summary: cached }, sourceKey);
         return cached;
       }
     }
@@ -449,7 +474,10 @@ export class RepositoryBriefings {
     }
     const cached = this.reports.get(key);
     if (cached) {
-      if (this.latest.get(session.id)?.state === "pending") this.setStatus(session.id, { state: "ready", summary: cached }, sourceKey);
+      for (const [pendingKey, pendingJob] of this.pending) {
+        if (pendingJob.session.id === session.id && pendingJob.automatic && pendingJob.waiters.length === 0) this.pending.delete(pendingKey);
+      }
+      if (!this.hasActiveJob(session.id)) this.setStatus(session.id, { state: "ready", summary: cached }, sourceKey);
       return;
     }
     if (this.inFlight.has(key)) return;
@@ -466,7 +494,8 @@ export class RepositoryBriefings {
       sameRange.dueAt = Math.min(sameRange.dueAt, job.dueAt);
       sameRange.automatic = true;
     } else this.pending.set(key, job);
-    this.setStatus(session.id, { state: "pending", ...(this.latest.get(session.id)?.summary ? { summary: this.latest.get(session.id)!.summary } : {}) });
+    const previousSummary = this.latest.get(session.id)?.status.summary;
+    this.setStatus(session.id, { state: "pending", ...(previousSummary ? { summary: previousSummary } : {}) });
     this.trimPending();
     void this.drain();
   }
@@ -522,7 +551,8 @@ export class RepositoryBriefings {
         if (this.pending.size >= MAX_PENDING) { rejectPromise(new Error("Repository briefing queue is full")); return; }
         this.pending.set(job.key, { ...job, waiters: [...job.waiters, { resolve: resolvePromise, reject: rejectPromise }] });
       }
-      this.setStatus(job.session.id, { state: "pending", ...(this.latest.get(job.session.id)?.summary ? { summary: this.latest.get(job.session.id)!.summary } : {}) });
+      const previousSummary = this.latest.get(job.session.id)?.status.summary;
+      this.setStatus(job.session.id, { state: "pending", ...(previousSummary ? { summary: previousSummary } : {}) });
       void this.drain();
     });
   }
@@ -547,14 +577,15 @@ export class RepositoryBriefings {
             ready.key = sourceKey ? `${baseKey}:${sourceKey}` : baseKey;
             const cached = this.reports.get(ready.key);
             if (cached) {
-              this.setStatus(ready.session.id, { state: "ready", summary: cached }, sourceKey);
+              if (!this.hasActiveJob(ready.session.id)) this.setStatus(ready.session.id, { state: "ready", summary: cached }, sourceKey);
               continue;
             }
             const matching = this.pending.get(ready.key);
             if (matching) { ready.waiters.push(...matching.waiters); this.pending.delete(ready.key); }
           }
           if (this.isClosed()) { for (const waiter of ready.waiters) waiter.reject(new Error("Repository brief service closed")); break; }
-          this.setStatus(ready.session.id, { state: "running", ...(this.latest.get(ready.session.id)?.summary ? { summary: this.latest.get(ready.session.id)!.summary } : {}) });
+          const runningSummary = this.latest.get(ready.session.id)?.status.summary;
+          this.setStatus(ready.session.id, { state: "running", ...(runningSummary ? { summary: runningSummary } : {}) });
           const queueKey = ready.key;
           this.inFlight.set(queueKey, ready);
           this.lastAttempt.delete(ready.session.id);
@@ -583,7 +614,8 @@ export class RepositoryBriefings {
           const notReady = error instanceof NotReady;
           const notOptedIn = error instanceof NotOptedIn;
           const message = notOptedIn ? NOT_OPTED_IN_MESSAGE : notReady ? NOT_READY_MESSAGE : `${FAILED_MESSAGE} Reason: ${failureReason(error)}`;
-          this.setStatus(ready.session.id, { state: notOptedIn ? "unavailable" : notReady ? "empty" : "failed", ...(this.latest.get(ready.session.id)?.summary ? { summary: this.latest.get(ready.session.id)!.summary } : {}), error: message });
+          const failedSummary = this.latest.get(ready.session.id)?.status.summary;
+          this.setStatus(ready.session.id, { state: notOptedIn ? "unavailable" : notReady ? "empty" : "failed", ...(failedSummary ? { summary: failedSummary } : {}), error: message });
           for (const waiter of ready.waiters) waiter.reject(new Error(message));
         }
       }
@@ -607,6 +639,7 @@ export class RepositoryBriefings {
     const repoTarget = inside(job.location.root, job.location.cwd) ? job.location.cwd : job.location.root;
     const args = [...this.config.args, "auto", "--trigger", "host", "--format", "json", "--activity-stdin", "--session", job.session.id,
       "--repo", repoTarget, "--timeout", String(Math.ceil(this.config.timeoutMs / 1000))];
+    if (job.session.team?.role === "mission-coordinator") args.push("--no-state");
     if (job.location.baseline) args.push("--base", job.location.baseline);
     if (this.config.runner) args.push("--runner", this.config.runner);
     if (this.config.model) args.push("--model", this.config.model);
@@ -671,20 +704,21 @@ export class RepositoryBriefings {
     while (this.locations.size > MAX_STATUS) this.locations.delete(this.locations.keys().next().value!);
   }
 
+  private hasActiveJob(sessionId: string): boolean {
+    for (const job of this.inFlight.values()) if (job.session.id === sessionId) return true;
+    for (const job of this.pending.values()) if (job.session.id === sessionId) return true;
+    return false;
+  }
+
   private setStatus(id: string, status: BriefingStatus, sourceKey?: string): void {
+    const previous = this.latest.get(id);
+    const resolvedKey = status.summary
+      ? (sourceKey !== undefined ? sourceKey : previous?.sourceKey)
+      : undefined;
     this.latest.delete(id);
-    this.latest.set(id, status);
-    if (status.summary) {
-      if (sourceKey !== undefined) this.latestSourceKey.set(id, sourceKey);
-    } else {
-      this.latestSourceKey.delete(id);
-    }
-    this.statusUpdatedAt.set(id, Date.now());
+    this.latest.set(id, { status, ...(resolvedKey !== undefined ? { sourceKey: resolvedKey } : {}), updatedAt: Date.now() });
     while (this.latest.size > MAX_STATUS) {
-      const oldest = this.latest.keys().next().value!;
-      this.latest.delete(oldest);
-      this.latestSourceKey.delete(oldest);
-      this.statusUpdatedAt.delete(oldest);
+      this.latest.delete(this.latest.keys().next().value!);
     }
   }
 

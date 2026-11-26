@@ -1,13 +1,16 @@
 import { createHash } from "node:crypto";
 import { lstatSync, realpathSync, statSync, type Stats } from "node:fs";
+import { lstat, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import type { UnderstandingArtifact, UnderstandingPinnedSource } from "@infinite/remote";
-import { expectedIdentity, readGit, readGitResult, type GitResultReader } from "./checkout-identity.js";
+import { expectedIdentity, expectedIdentityAsync, readGit, readGitResult, readGitResultAsync, type AsyncGitReader, type AsyncGitResultReader, type GitResultReader } from "./checkout-identity.js";
 import { isMissingSessionError } from "./mission-coordinator.js";
 import type { Mission } from "./mission-types.js";
 import type { ProjectGroup, ProjectGroupRepo } from "./project-group-types.js";
 import type { Project, Session } from "./types.js";
+
+const MAX_MISSION_PROBE_CONCURRENCY = 4;
 
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 
@@ -83,6 +86,31 @@ export function readGitHead(cwd: string, git: GitResultReader = readGitResult): 
   }
 }
 
+export async function readGitHeadAsync(cwd: string, git: AsyncGitResultReader = readGitResultAsync): Promise<string | null | undefined> {
+  let canonicalCwd: string;
+  try { canonicalCwd = await realpath(cwd); } catch { return undefined; }
+  const toplevel = await git(canonicalCwd, ["rev-parse", "--show-toplevel"]);
+  if (!toplevel.ok || !toplevel.stdout) return undefined;
+  try { if (await realpath(toplevel.stdout) !== canonicalCwd) return undefined; } catch { return undefined; }
+  const head = await git(canonicalCwd, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+  if (head.ok) return /^[a-f0-9]{40,64}$/i.test(head.stdout) ? head.stdout.toLowerCase() : undefined;
+  if (head.status !== 1 || head.stderr !== "" || head.errorCode !== undefined || head.signal !== undefined) return undefined;
+  const symbolic = await git(canonicalCwd, ["symbolic-ref", "--quiet", "HEAD"]);
+  if (!symbolic.ok || !symbolic.stdout.startsWith("refs/heads/")) return undefined;
+  const refCheck = await git(canonicalCwd, ["show-ref", "--verify", "--quiet", symbolic.stdout]);
+  if (refCheck.ok) return undefined;
+  if (refCheck.status !== 1 || refCheck.stderr !== "" || refCheck.errorCode !== undefined || refCheck.signal !== undefined) return undefined;
+  const refPathResult = await git(canonicalCwd, ["rev-parse", "--git-path", symbolic.stdout]);
+  if (!refPathResult.ok || !refPathResult.stdout) return undefined;
+  const refPath = isAbsolute(refPathResult.stdout) ? refPathResult.stdout : resolve(canonicalCwd, refPathResult.stdout);
+  try {
+    await lstat(refPath);
+    return undefined;
+  } catch (error) {
+    return isMissingSessionError(error) ? null : undefined;
+  }
+}
+
 export function captureProjectBinding(project: Project, expectedKey: string | undefined): ProjectBinding | undefined {
   try {
     const enrolledPath = realpathSync(project.path), info = statSync(enrolledPath);
@@ -139,6 +167,79 @@ export function captureMissionPinnedRepositories(
       head,
     };
   }
+  return pinned;
+}
+
+export async function captureMissionPinnedRepositoriesAsync(
+  repoProjectIds: readonly string[],
+  projects: readonly Project[],
+  group: ProjectGroup,
+  recordedPaths?: Record<string, string>,
+  options: { concurrency?: number; git?: AsyncGitResultReader } = {},
+): Promise<Record<string, PinnedRepositoryBinding>> {
+  const ids = [...new Set(repoProjectIds)].sort((a, b) => a.localeCompare(b));
+  if (!ids.length || ids.length > 64 || ids.some(id => !projectIdSchema.safeParse(id).success)) {
+    throw new Error("mission-brief-source-unavailable");
+  }
+  if (recordedPaths !== undefined) {
+    const recordedIds = Object.keys(recordedPaths).sort((a, b) => a.localeCompare(b));
+    if (!sameSortedIds(recordedIds, ids)) throw new Error("mission-brief-source-unavailable");
+  }
+  const projectById = new Map(projects.map(project => [project.id, project] as const));
+  const groupRepoByCheckout = new Map<string, ProjectGroupRepo>();
+  for (const repo of group.repos) {
+    for (const checkout of repo.checkouts) groupRepoByCheckout.set(checkout.projectId, repo);
+  }
+  const gitResult = options.git ?? readGitResultAsync;
+  const gitAsync: AsyncGitReader = async (cwd, args) => {
+    const res = await gitResult(cwd, args);
+    return res.ok ? res.stdout : undefined;
+  };
+  const limit = Math.max(1, Math.min(options.concurrency ?? MAX_MISSION_PROBE_CONCURRENCY, ids.length));
+  const results = new Map<string, PinnedRepositoryBinding>();
+  let cursor = 0;
+  let failure: unknown;
+  const worker = async () => {
+    while (failure === undefined) {
+      const index = cursor++;
+      if (index >= ids.length) return;
+      const projectId = ids[index]!;
+      try {
+        const project = projectById.get(projectId);
+        const groupRepo = groupRepoByCheckout.get(projectId);
+        if (!project || !groupRepo) throw new Error("mission-brief-source-unavailable");
+        let enrolledPath: string, info: Stats;
+        try {
+          enrolledPath = await realpath(resolve(project.path));
+          info = await stat(enrolledPath);
+        } catch { throw new Error("mission-brief-source-unavailable"); }
+        if (recordedPaths !== undefined) {
+          let recordedPath: string;
+          try { recordedPath = await realpath(resolve(recordedPaths[projectId]!)); }
+          catch { throw new Error("mission-brief-source-unavailable"); }
+          if (recordedPath !== enrolledPath) throw new Error("mission-brief-source-unavailable");
+        }
+        const identity = await expectedIdentityAsync({ ...project, path: enrolledPath }, gitAsync);
+        if (!identity || (groupRepo.key && identity.key !== groupRepo.key)) throw new Error("source-identity-changed");
+        const head = await readGitHeadAsync(enrolledPath, gitResult);
+        if (head === undefined) throw new Error("mission-brief-source-unavailable");
+        results.set(projectId, {
+          enrolledPath,
+          projectDevice: String(info.dev),
+          projectInode: String(info.ino),
+          repoIdentity: digest(identity.key),
+          head,
+        });
+      } catch (error) {
+        if (failure === undefined) failure = error;
+        return;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: limit }, () => worker()));
+  if (failure !== undefined) throw failure;
+  const pinned: Record<string, PinnedRepositoryBinding> = {};
+  for (const projectId of ids) pinned[projectId] = results.get(projectId)!;
   return pinned;
 }
 

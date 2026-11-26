@@ -17,6 +17,7 @@ type SessionState = "live" | "missing" | "unreadable" | "unowned" | "rebound-cwd
 
 interface PublishedMissionBrief {
   id: string;
+  pinKey: string;
   pinnedHeads: Record<string, string>;
   pinnedIdentities: Record<string, string>;
   pinnedPaths: Record<string, string>;
@@ -94,6 +95,48 @@ function sameSorted(left: readonly string[], right: readonly string[]): boolean 
   const a = [...left].sort((x, y) => x.localeCompare(y));
   const b = [...right].sort((x, y) => x.localeCompare(y));
   return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+function pinTupleKey(world: SimWorld): string {
+  const ids = [...world.missionRepos].sort((a, b) => a.localeCompare(b));
+  return JSON.stringify(ids.map(id => [id, world.heads[id], world.identities[id], world.enrolledPaths[id], world.recordedPaths[id]]));
+}
+
+function verifyPublicationOutcome(
+  liveView: WorkspaceUnderstanding,
+  world: SimWorld,
+  knownIds: ReadonlySet<string>,
+  expectNewGeneration: boolean,
+  label: string,
+): UnderstandingArtifact | undefined {
+  const apiMission = liveView.repositories.find(r => r.id === "api")!.current.filter(a => a.pinnedSources !== undefined);
+  const newArtifacts = apiMission.filter(a => !knownIds.has(a.id));
+  const expectedPinnedSources = Object.fromEntries(
+    [...world.missionRepos].sort((a, b) => a.localeCompare(b)).map(id => [id, { head: world.heads[id], repoIdentity: world.identities[id] }]),
+  );
+  if (expectNewGeneration) {
+    assert.equal(
+      newArtifacts.length,
+      1,
+      `${label} [INV_PUBLICATION_DURABLE]: summarize() for a new pin set must persist exactly one new mission artifact`,
+    );
+    assert.deepEqual(
+      newArtifacts[0]!.pinnedSources,
+      expectedPinnedSources,
+      `${label} [INV_PUBLICATION_DURABLE]: newly persisted mission artifact pinnedSources must match captured world state`,
+    );
+    return newArtifacts[0]!;
+  }
+  assert.equal(
+    newArtifacts.length,
+    0,
+    `${label} [INV_PUBLICATION_DURABLE]: summarize() for an already-published pin set must reuse without writing a duplicate artifact`,
+  );
+  assert.ok(
+    apiMission.some(a => JSON.stringify(a.pinnedSources) === JSON.stringify(expectedPinnedSources)),
+    `${label} [INV_PUBLICATION_DURABLE]: reused pin set must remain exposed after summarize()`,
+  );
+  return undefined;
 }
 
 function oracleVisibleMissionIds(world: SimWorld): string[] {
@@ -373,10 +416,12 @@ test("seeded durable-state simulator verifies mission-binding invariants across 
     && world.missionRepos.every(id => world.enrolledPaths[id] === world.recordedPaths[id]);
 
   try {
+    const initialKnown = new Set<string>();
     await sim.briefings.summarize(sim.session(), "0");
-    const first = service.get("platform").repositories.find(r => r.id === "api")!.current.find(a => a.pinnedSources)!;
+    const first = verifyPublicationOutcome(service.get("platform"), world, initialKnown, true, "init")!;
     world.published.push({
       id: first.id,
+      pinKey: pinTupleKey(world),
       pinnedHeads: { api: world.heads.api, web: world.heads.web },
       pinnedIdentities: { api: world.identities.api, web: world.identities.web },
       pinnedPaths: { api: world.enrolledPaths.api, web: world.enrolledPaths.web },
@@ -421,21 +466,23 @@ test("seeded durable-state simulator verifies mission-binding invariants across 
         world.sessionState = pick(["live", "missing", "unreadable", "unowned", "rebound-cwd"] as const);
       } else {
         if (canPublish()) {
-          if (world.published.length < 12 || oracleVisibleMissionIds(world).length > 0) {
+          const expectedPinKey = pinTupleKey(world);
+          const alreadyPublished = world.published.some(item => item.pinKey === expectedPinKey);
+          const expectNewGeneration = !alreadyPublished;
+          if (!expectNewGeneration || world.published.length < 12) {
             const knownIds = new Set(world.published.map(item => item.id));
             await sim.briefings.summarize(sim.session(), "0");
-            const currentApi = service.get("platform").repositories.find(r => r.id === "api")!.current;
-            for (const artifact of currentApi) {
-              if (artifact.pinnedSources && !knownIds.has(artifact.id)) {
-                world.published.push({
-                  id: artifact.id,
-                  pinnedHeads: Object.fromEntries(world.missionRepos.map(id => [id, world.heads[id]])),
-                  pinnedIdentities: Object.fromEntries(world.missionRepos.map(id => [id, world.identities[id]])),
-                  pinnedPaths: Object.fromEntries(world.missionRepos.map(id => [id, world.enrolledPaths[id]])),
-                  missionRepos: [...world.missionRepos],
-                  retainedAt: artifact.retainedAt,
-                });
-              }
+            const created = verifyPublicationOutcome(service.get("platform"), world, knownIds, expectNewGeneration, `step-${step}`);
+            if (created) {
+              world.published.push({
+                id: created.id,
+                pinKey: expectedPinKey,
+                pinnedHeads: Object.fromEntries(world.missionRepos.map(id => [id, world.heads[id]])),
+                pinnedIdentities: Object.fromEntries(world.missionRepos.map(id => [id, world.identities[id]])),
+                pinnedPaths: Object.fromEntries(world.missionRepos.map(id => [id, world.enrolledPaths[id]])),
+                missionRepos: [...world.missionRepos],
+                retainedAt: created.retainedAt,
+              });
             }
           }
         } else if (world.sessionState === "live" || world.sessionState === "unowned" || world.sessionState === "rebound-cwd") {
@@ -471,6 +518,7 @@ test("simulator mutation checks prove every named invariant catches a targeted f
     const artifact = liveView.repositories.find(r => r.id === "api")!.current.find(a => a.pinnedSources)!;
     world.published.push({
       id: artifact.id,
+      pinKey: pinTupleKey(world),
       pinnedHeads: { api: world.heads.api, web: world.heads.web },
       pinnedIdentities: { api: world.identities.api, web: world.identities.web },
       pinnedPaths: { api: world.enrolledPaths.api, web: world.enrolledPaths.web },
@@ -478,6 +526,11 @@ test("simulator mutation checks prove every named invariant catches a targeted f
       retainedAt: artifact.retainedAt,
     });
     checkInvariants(liveView, reloadedView, world, "baseline");
+
+    const droppedWriteView = structuredClone(liveView);
+    droppedWriteView.repositories.find(r => r.id === "api")!.current = droppedWriteView.repositories.find(r => r.id === "api")!.current.filter(a => !a.pinnedSources);
+    assert.throws(() => verifyPublicationOutcome(droppedWriteView, world, new Set<string>(), true, "mut-dropped-write"), /INV_PUBLICATION_DURABLE/);
+    assert.throws(() => verifyPublicationOutcome(liveView, world, new Set<string>(), false, "mut-duplicate-write"), /INV_PUBLICATION_DURABLE/);
 
     const dropMissionOnApi = structuredClone(liveView);
     dropMissionOnApi.repositories.find(r => r.id === "api")!.current = dropMissionOnApi.repositories.find(r => r.id === "api")!.current.filter(a => !a.pinnedSources);

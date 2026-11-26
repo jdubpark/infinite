@@ -12,7 +12,7 @@ import { hostEgressEnvironment } from "./egress.js";
 export class TeamError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
 }
-export interface CommandResult { exitCode: number | null; output: string; stdout: string; interrupted: boolean; truncated: boolean; leftover: boolean }
+export interface CommandResult { exitCode: number | null; output: string; stdout: string; interrupted: boolean; notStarted?: true; truncated: boolean; leftover: boolean }
 export function teamCommandEnvironment(extra?: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const name of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"])
@@ -43,7 +43,7 @@ export class CommandStopUnconfirmed extends TeamError {
 }
 export async function teamOperationCommand(command: TeamCommand, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, prefix?: TeamCommand, input?: string, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
   const result = await teamCommand(command, cwd, signal, timeoutMs, prefix, input, undefined, STOP_SETTLE_MS, onOutput);
-  if (prefix && result.interrupted) throw new CommandStopUnconfirmed(result.output, result.exitCode);
+  if (prefix && result.interrupted && !result.notStarted) throw new CommandStopUnconfirmed(result.output, result.exitCode);
   return result;
 }
 export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string, extraEnv?: Record<string, string>, forceSettleAfterMs?: number, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
@@ -55,7 +55,7 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
   return new Promise((resolveResult, reject) => {
     if (signal?.aborted) {
       scope?.started(undefined);
-      resolveResult({ exitCode: null, output: "", stdout: "", interrupted: true, truncated: false, leftover: false });
+      resolveResult({ exitCode: null, output: "", stdout: "", interrupted: true, notStarted: true, truncated: false, leftover: false });
       return;
     }
     let child: ReturnType<typeof spawn>;

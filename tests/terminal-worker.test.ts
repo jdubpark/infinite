@@ -148,8 +148,7 @@ async function fixture(provider: "demo" | "claude" | "codex" = "demo", initialPr
   const runtime = { id: randomUUID(), location: "cloud" as const, transport: "pty" as const };
   const bootstrap: Bootstrap = {
     session: { id, ...(team ? { team } : {}), executionIdentity: "production", provider, title: "Terminal contract", projectId: "fixture", cwd: root, createdAt: new Date().toISOString(), status: "starting", contextVersion: 0, context: "", initialPrompt, runtime },
-    executionIdentity: "production",
-    profile: { command: process.execPath, args: [script] },
+    executionIdentity: "production", profile: { command: process.execPath, args: [script] },
     runDir, stateDir, key: key.toString("base64"), prompt: initialPrompt, codeMode: false,
     attention: { idleAfterMs: 60_000, limitConfirmMs: 30_000, hooks: { claude: true, codex: true } },
   };

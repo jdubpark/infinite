@@ -6,8 +6,10 @@ import { z } from "zod";
 import { questionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
 import { INTERRUPT_CLASSES, REJECT_CODES, type InterruptClass, type RejectCode } from "./permission-policy.js";
 import { TEAM_ROLE_VALUES, type TeamRole } from "./team-role.js";
+import { teamCommandSchema, type TeamCommand } from "./schema-primitives.js";
 
 export { TEAM_ROLE_VALUES, type TeamRole } from "./team-role.js";
+export { teamCommandSchema, type TeamCommand };
 
 const nonNegInt = z.number().int().min(0);
 const usageTokensSchema = z.object({
@@ -102,12 +104,6 @@ const decisionRecommendationSchema = questionRecommendationSchema.extend({
 }).strict();
 const teamPublicationCategorySchema = z.enum(["auth", "network", "not-found", "rejected", "nested-repository", "other"]);
 export type TeamPublicationCategory = z.infer<typeof teamPublicationCategorySchema>;
-
-export const teamCommandSchema = z.object({
-  command: z.string().min(1).max(4096).refine(value => !value.includes("\0")),
-  args: z.array(z.string().max(4096).refine(value => !value.includes("\0"))).max(64).default([]),
-}).strict();
-export type TeamCommand = z.infer<typeof teamCommandSchema>;
 
 export const githubRepositorySchema = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/);
 export const gitBranchSchema = z.string().min(1).max(255).refine(value =>

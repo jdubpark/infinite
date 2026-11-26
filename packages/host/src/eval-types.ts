@@ -1,5 +1,19 @@
+import { z } from "zod";
 import type { TeamBrief, TeamGoalContext, TeamModelProfile } from "./team-types.js";
 import type { RoutineStatus } from "./routine-types.js";
+
+export const evalTaskIdSchema = z.string().regex(/^(captured|mined):[A-Za-z0-9:._-]{1,200}$/);
+
+export const evalConfigurationSchema = z.object({
+  profile: z.object({ provider: z.enum(["claude", "codex", "grok", "opencode", "demo"]) }).passthrough(),
+  guidance: z.literal("as-of-base"),
+  knowledge: z.literal("none"),
+}).strict();
+
+export const evalWindowSchema = z.object({
+  startHourUtc: z.number().int().min(0).max(23),
+  endHourUtc: z.number().int().min(1).max(24),
+}).strict().refine(window => window.endHourUtc !== window.startHourUtc, "a window must not be empty");
 
 export const EVAL_MODULE = "eval-corpus";
 export const EVAL_STATES = ["captured", "candidate", "valid", "rejected", "retired"] as const;

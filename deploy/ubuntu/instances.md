@@ -88,6 +88,7 @@ sudo install -d -o "infinite-$NAME-host" -g "infinite-$NAME-host" -m 0700 \
   "/srv/infinite-data/instances/$NAME/control-home"
 sudo install -d -o "infinite-$NAME-agent" -g "infinite-$NAME-agent" -m 0700 \
   "/srv/infinite-data/instances/$NAME/agent-home" \
+  "/srv/infinite-data/instances/$NAME/repository-graphs" \
   "/srv/infinite-data/instances/$NAME/tmp/agent"
 sudo install -d -o "infinite-$NAME-host" -g "infinite-$NAME-host" -m 0700 \
   "/srv/infinite-data/instances/$NAME/tmp/control"
@@ -211,10 +212,12 @@ permits, and without it the instance's sudo sessions report
 `0755`; the rendered sudoers permits it, and without it the instance cannot
 check for processes left by an earlier API process.
 
-The rendered sudoers permits no `jevcode` or `repository-graph` wrapper,
-because the tracked ones name the first instance's paths. The instance runs
-without repository briefings and the code graph until instance wrappers for
-them exist.
+The rendered sudoers also permits the instance's `jevcode` and
+`repository-graph` wrappers under `/usr/local/libexec/infinite-NAME/`. Each
+rendered wrapper confines paths strictly to `/srv/infinite-data/instances/NAME/`
+and refuses paths under the first instance or any sibling instance. Install them
+beside the provider wrappers; both features remain disabled until explicitly
+configured in `/etc/infinite-NAME/config.json`.
 
 ```sh
 sudo install -o root -g root -m 0644 ".local/instance-$NAME/infinite-$NAME.service" \
@@ -236,6 +239,10 @@ for provider in claude codex grok opencode; do
   sudo install -o root -g root -m 0755 ".local/instance-$NAME/agent-wrapper.sh" \
     "/usr/local/libexec/infinite-$NAME/$provider"
 done
+sudo install -o root -g root -m 0755 ".local/instance-$NAME/jevcode-wrapper.sh" \
+  "/usr/local/libexec/infinite-$NAME/jevcode"
+sudo install -o root -g root -m 0755 ".local/instance-$NAME/repository-graph-wrapper.py" \
+  "/usr/local/libexec/infinite-$NAME/repository-graph"
 sudo install -o root -g root -m 0755 ".local/instance-$NAME/transcript-drain.sh" \
   "/usr/local/libexec/infinite-$NAME/transcript-drain"
 sudo install -o root -g root -m 0755 ".local/instance-$NAME/process-census.sh" \

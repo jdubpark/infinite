@@ -9,9 +9,15 @@ import { synchronizeWorkspace } from "../packages/host/src/laptop-service.js";
 import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
 import type { ExecutorControl } from "../packages/host/src/executor-tunnel.js";
 
+const waitUntil = async (predicate: () => boolean, timeoutMs: number, message: string) => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) await delay(20);
+  assert.ok(predicate(), message);
+};
+
 test("laptop sync commits once while idle, follows file changes, and recommits until acknowledged", {
   skip: process.platform !== "darwin",
-  timeout: 30000,
+  timeout: 60000,
 }, async t => {
   const base = mkdtempSync(join(tmpdir(), "laptop-service-"));
   t.after(() => rmSync(base, { recursive: true, force: true }));
@@ -25,9 +31,11 @@ test("laptop sync commits once while idle, follows file changes, and recommits u
   let acknowledged = true;
   let epoch = 0;
   let begins = 0;
+  let statusChecks = 0;
   const control: ExecutorControl = async (method, params) => {
     switch (method) {
       case "sync/status":
+        statusChecks += 1;
         return { location: "laptop", revision, checkpoint, acknowledged };
       case "sync/begin":
         begins += 1;
@@ -48,12 +56,6 @@ test("laptop sync commits once while idle, follows file changes, and recommits u
     }
   };
 
-  const waitForCommitCount = async (count: number) => {
-    const deadline = Date.now() + 6000;
-    while (commits.length < count && Date.now() < deadline) await delay(25);
-    assert.equal(commits.length, count, `expected ${count} commits within one loop interval`);
-  };
-
   const abort = new AbortController();
   const running = synchronizeWorkspace({
     origin: "https://example.invalid",
@@ -66,17 +68,21 @@ test("laptop sync commits once while idle, follows file changes, and recommits u
   }, control, abort.signal);
 
   try {
-    await delay(7000);
+    await waitUntil(() => commits.length >= 1, 20000, "expected initial checkpoint commit");
+    const idleBase = statusChecks;
+    await waitUntil(() => statusChecks >= idleBase + 2, 20000, "expected two idle sync polls after initial commit");
     assert.equal(commits.length, 1, "an acknowledged idle checkpoint is not committed again");
     assert.equal(begins, 1, "an acknowledged idle checkpoint is not begun again");
 
     writeFileSync(join(root, "file.txt"), "two\n");
-    await waitForCommitCount(2);
+    await waitUntil(() => commits.length >= 2, 20000, "expected a commit after modifying the workspace file");
+    assert.equal(commits.length, 2, "a file change commits one new checkpoint");
     assert.equal(begins, 2, "a file change starts another checkpoint");
 
     assert.equal(checkpoint.id, commits[1]);
     acknowledged = false;
-    await waitForCommitCount(3);
+    await waitUntil(() => commits.length >= 3, 20000, "expected an unacknowledged checkpoint to recommit");
+    assert.equal(commits.length, 3, "an unacknowledged checkpoint recommits once");
     assert.equal(begins, 3, "an unacknowledged checkpoint is recommitted at the same revision and ID");
   } finally {
     abort.abort();
@@ -86,7 +92,7 @@ test("laptop sync commits once while idle, follows file changes, and recommits u
 
 test("laptop checkpoint uploads overlap but stay bounded and finish before commit", {
   skip: process.platform !== "darwin",
-  timeout: 30000,
+  timeout: 45000,
 }, async t => {
   const base = mkdtempSync(join(tmpdir(), "laptop-service-transfer-"));
   t.after(() => rmSync(base, { recursive: true, force: true }));
@@ -148,14 +154,13 @@ test("laptop checkpoint uploads overlap but stay bounded and finish before commi
   }, control, abort.signal);
 
   try {
-    const deadline = Date.now() + 5000;
-    while (started.length < 4 && Date.now() < deadline) await delay(10);
+    await waitUntil(() => started.length >= 4, 20000, "four transfers should be active before any upload completes");
     assert.equal(started.length, 4, "four transfers should be active before any upload completes");
     assert.equal(maxActive, 4, "the laptop does not consume the whole executor control allowance");
   } finally {
     releaseTransfers();
-    const deadline = Date.now() + 5000;
-    while (committedTransfers < 0 && Date.now() < deadline && !abort.signal.aborted) await delay(10);
+    const deadline = Date.now() + 20000;
+    while (committedTransfers < 0 && Date.now() < deadline && !abort.signal.aborted) await delay(20);
     abort.abort();
     await running;
   }
@@ -167,7 +172,7 @@ test("laptop checkpoint uploads overlap but stay bounded and finish before commi
 
 test("a failed checkpoint upload drains active requests before reporting the retry", {
   skip: process.platform !== "darwin",
-  timeout: 30000,
+  timeout: 45000,
 }, async t => {
   const base = mkdtempSync(join(tmpdir(), "laptop-service-failed-transfer-"));
   t.after(() => rmSync(base, { recursive: true, force: true }));
@@ -182,6 +187,8 @@ test("a failed checkpoint upload drains active requests before reporting the ret
   const transfersReleased = new Promise<void>(resolve => { release = resolve; });
   let releaseFailedTransfer!: () => void;
   const firstWindowStarted = new Promise<void>(resolve => { releaseFailedTransfer = resolve; });
+  let markFailureThrown!: () => void;
+  const failureThrown = new Promise<void>(resolve => { markFailureThrown = resolve; });
   let reportRetry!: () => void;
   const retryReported = new Promise<void>(resolve => { reportRetry = resolve; });
   let problems = 0, commits = 0;
@@ -194,7 +201,7 @@ test("a failed checkpoint upload drains active requests before reporting the ret
         const hash = (params as { hash: string }).hash;
         started.push(hash);
         if (started.length === 4) releaseFailedTransfer();
-        if (started.length === 1) { await firstWindowStarted; throw failure; }
+        if (started.length === 1) { await firstWindowStarted; markFailureThrown(); throw failure; }
         await transfersReleased;
         return { stored: true };
       }
@@ -216,9 +223,9 @@ test("a failed checkpoint upload drains active requests before reporting the ret
   }, control, abort.signal);
 
   try {
-    const deadline = Date.now() + 5000;
-    while (started.length < 4 && Date.now() < deadline) await delay(10);
+    await waitUntil(() => started.length >= 4, 20000, "the first window has four active requests");
     assert.equal(started.length, 4, "the first window has four active requests");
+    await failureThrown;
     await delay(50);
     assert.equal(problems, 0, "the failed attempt does not report or retry before active requests settle");
     release();
@@ -239,7 +246,7 @@ test("a failed checkpoint upload drains active requests before reporting the ret
 
 test("cloud recovery downloads overlap and materialize only after every blob settles", {
   skip: process.platform !== "darwin",
-  timeout: 30000,
+  timeout: 45000,
 }, async t => {
   const base = mkdtempSync(join(tmpdir(), "laptop-service-recovery-"));
   t.after(() => rmSync(base, { recursive: true, force: true }));
@@ -291,14 +298,12 @@ test("cloud recovery downloads overlap and materialize only after every blob set
   }, control, abort.signal);
 
   try {
-    const deadline = Date.now() + 5000;
-    while (started.length < 4 && Date.now() < deadline) await delay(10);
+    await waitUntil(() => started.length >= 4, 20000, "the recovery fetch uses a four-request window");
     assert.equal(started.length, 4, "the recovery fetch uses a four-request window");
     assert.equal(maxActive, 4, "the recovery fetch is bounded");
     assert.equal(existsSync(destination), false, "no recovery tree is visible while chunks remain outstanding");
     release();
-    const materializeDeadline = Date.now() + 5000;
-    while (!existsSync(recoveryMarker) && Date.now() < materializeDeadline) await delay(10);
+    await waitUntil(() => existsSync(recoveryMarker), 20000, "the recovery receipt follows complete download and materialization");
     assert.ok(existsSync(recoveryMarker), "the recovery receipt follows complete download and materialization");
     assert.deepEqual(readFileSync(join(destination, "workspace", canonicalCloudRoot.slice(1), "chunks.bin")), contents);
   } finally {

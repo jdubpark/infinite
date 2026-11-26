@@ -1,4 +1,4 @@
-import { learningPurpose, type Provider, type SessionPurpose } from "./types.js";
+import type { ExecutionIdentity, Provider } from "./types.js";
 
 export const CLAUDE_CODE_MODE_ENV = "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE";
 
@@ -14,9 +14,9 @@ export function codeModeEnabled(
   provider: Provider,
   facts: CodeModeLaunchFacts,
   recorded?: boolean,
-  purpose?: SessionPurpose,
+  executionIdentity: ExecutionIdentity = "production",
 ): boolean {
-  if (provider !== "claude" || learningPurpose(purpose)) return false;
+  if (provider !== "claude" || executionIdentity === "eval") return false;
   if (facts.excluded || (facts.headless && !facts.served)) return false;
   if (recorded !== undefined) return recorded;
   return facts.headless ? level === "headless" || level === "all" : level === "all";

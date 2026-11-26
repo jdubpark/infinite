@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { type Config, type Session, learningPurpose } from "./types.js";
+import { type Config, type Session, isEvalSession } from "./types.js";
 import { TeamStopRefused, type Manager } from "./manager.js";
 import { bootId, extendWitness, hostProcesses, newWitness, recordCommand, type CensusResult, type HostProcesses, type ProcessWitness } from "./process-census.js";
 import type { WorkerError } from "./ipc.js";
@@ -1620,7 +1620,7 @@ export class TeamService {
             const rows = await this.manager.list().catch(() => undefined);
             if (rows) {
               await this.usage?.tick(rows).catch(() => {});
-              await this.limits.reconcile(this.manager, rows.filter(row => !learningPurpose(row.purpose)), this.currentDate()).catch(() => {});
+              await this.limits.reconcile(this.manager, rows.filter(row => !isEvalSession(row)), this.currentDate()).catch(() => {});
             }
           }
           await mapConcurrent([...this.records.keys()], 16, id => this.enqueue(id, async () => {

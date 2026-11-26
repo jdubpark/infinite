@@ -10,6 +10,7 @@ import { checkLabel, objectivePromptsOn } from "./objective-digest.js";
 import { TeamError } from "./team-workspace.js";
 
 export const PROVISIONAL_REASON = "An agent assessment, provisional, found every criterion met. Record your assessment: achieved, or not achieved with continue.";
+export const PROVISIONAL_WITHDRAWN_REASON = "A later agent assessment no longer finds every criterion met. Record your assessment: achieved, or not achieved with continue.";
 export const PROVISIONAL_EVENT = "Agent assessment, provisional: every criterion met. The goal stopped for your assessment and is not marked achieved.";
 export const DELIVERY_HOLD_MS = 600_000;
 export const DELIVERY_HOLD_REASON = "Waiting up to 10 minutes for the host to see this delivery on the base branch before the goal continues.";

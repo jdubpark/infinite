@@ -12,6 +12,7 @@ import {
   assertVerdictAnswer,
   continueGoal,
   answerProvisional,
+  applyLateVerdict,
   criteriaRowsFor,
   cycleVerdict,
   deliveryHold,
@@ -20,6 +21,7 @@ import {
   provisionalStop,
   verdictFailed,
   verdictIdsOf,
+  PROVISIONAL_WITHDRAWN_REASON,
 } from "../packages/host/src/goal-verdicts.js";
 import { createGoalObjective, correctGoalObjective, goalObjectiveView, type GoalHolder } from "../packages/host/src/objective-goals.js";
 import { recordDigest, type ObjectiveRecord } from "../packages/host/src/objective-types.js";
@@ -152,6 +154,29 @@ test("a provisional stop needs an autonomous finite goal and a met reviewed verd
   assert.equal(stopOf(answered("earlier"), good, false, true, { supersededVerdictIds: ["earlier"] }), false);
   assert.equal(stopOf(answered()), true);
   assert.equal(stopOf(answered(randomUUID())), true);
+  assert.equal(stopOf({}, good, false, true, { status: "merged" }), true);
+  for (const status of ["cancelled", "blocked", "no-change", "running"]) assert.equal(stopOf({}, good, false, true, { status }), false, status);
+});
+
+test("a later verdict that is no longer met withdraws the provisional reason and keeps the goal stopped", () => {
+  const first = assessment();
+  const reverted = assessment({ result: "not-met", counts: { met: 0, notMet: 1, inconclusive: 0, pendingOwner: 0 }, criteria: [{ id: "c0", state: "not-met" }] });
+  const stopped = (cycles: GoalCycle[]) => goal({ status: "ready-for-review", stopReason: "provisional-met", reason: PROVISIONAL_REASON, cycles });
+  const held = cycle(1, { assessment: { ...first, progress: 1 } });
+  const g = stopped([held]);
+  assert.equal(applyLateVerdict(g, held, team({ assessment: reverted })), true);
+  assert.equal(held.assessment?.verdictId, reverted.verdictId);
+  assert.equal(g.status, "ready-for-review");
+  assert.equal(g.stopReason, "provisional-met");
+  assert.equal(g.reason, PROVISIONAL_WITHDRAWN_REASON);
+  const again = cycle(1, { assessment: { ...first, progress: 1 } });
+  const kept = stopped([again]);
+  assert.equal(applyLateVerdict(kept, again, team({ assessment: assessment() })), true);
+  assert.equal(kept.reason, PROVISIONAL_REASON);
+  const older = cycle(1, { assessment: { ...first, progress: 1 } });
+  const elsewhere = stopped([older, cycle(2, { teamId: "team-2", assessment: { ...assessment(), progress: 1 } })]);
+  assert.equal(applyLateVerdict(elsewhere, older, team({ assessment: reverted })), true);
+  assert.equal(elsewhere.reason, PROVISIONAL_REASON);
 });
 
 const FINISHED = Date.parse("2026-01-01T00:00:00.000Z");

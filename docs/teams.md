@@ -487,8 +487,13 @@ process record, so its run keeps the earlier behavior: elapsed time alone never
 closes it, and the owner cancels or reconciles it. Started and completed removals are
 recorded as host events, and a failed removal is retried on later scheduler
 ticks. A blocked run whose workspace is being removed cannot resume, continue,
-or be steered. An owner can cancel a blocked run directly after its goal or
-mission is no longer active. `DELETE /api/teams/:id` and `infinite team delete ID` remove a settled
+or be steered. An owner can cancel a stopped goal's leftover blocked or paused
+run directly via `POST /api/teams/:id/cancel` once the goal has stopped, has no
+queued control or pending time extension for that run, and cannot be extended
+from it after a deadline stop; cancelling updates the cycle to `cancelled` so
+goal cleanup removes the run record after workspace removal. An owner can also
+cancel a blocked mission subteam directly after its mission is no longer active.
+`DELETE /api/teams/:id` and `infinite team delete ID` remove a settled
 cancelled, merged, or no-change run (clones and record) immediately. A live
 goal, mission, or handoff that still uses the run as its source receives
 `team-retained`; `team-in-use` means another run has a pending preparation that
@@ -4317,7 +4322,7 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
 | `POST /api/teams/:id/continue` | `requestId` (UUID), `revision`, optional trimmed `text` (1–8,000 characters) | Owner; continuable standalone blocked runs |
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
-| `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
+| `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams (`/cancel` also accepts a stopped goal's leftover blocked or paused run once the goal has stopped, has no queued control or pending time extension for the run, and cannot be extended from it after a deadline stop, updating the cycle to `cancelled` so goal cleanup removes the run record after workspace removal; and a blocked mission subteam after its mission is no longer active) |
 | `DELETE /api/teams/:id` | None; removes a settled cancelled, merged, or no-change run and its workspace | Owner |
 | `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
 | `GET /api/teams/:id/entries`, `GET /api/teams/:id/entries/:entryId`, `POST /api/teams/:id/entries/:entryId/withdraw` | List/read blackboard entries (`?kind=`, `?task=`, `?since=`); withdraw hides an entry from members | Reads: any paired device; `withdraw`: Owner |
@@ -4751,6 +4756,11 @@ for a caller that is not the owner, `409` with
 Goal-owned team lifecycle and steering routes return `409` with
 `code: "goal-owned-team"`. Use the owning goal's endpoints. The decision route
 remains available for its active cycle while the goal is running.
+`POST /api/teams/:id/cancel` is also accepted for a stopped goal's leftover
+blocked or paused run once the goal has stopped, has no queued control or
+pending time extension for the run, and cannot be extended from it after a
+deadline stop; it updates the goal cycle to `cancelled` so goal cleanup removes
+the run record after workspace removal.
 
 The legacy team parallelism endpoint refuses owner capacity changes with `409`
 and `code: "agent-managed-capacity"`. Legacy team creation requests may include

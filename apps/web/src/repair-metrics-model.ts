@@ -1,0 +1,314 @@
+import type { RepairLoopCause, RepairLoopOutcome, RepairLoopReport, RepairLoopSample } from "./api";
+
+export const DEFAULT_REPAIR_WINDOW_DAYS = 30;
+export const EXPERIMENT_MIN_LOOPS = 20;
+export const EXPERIMENT_MIN_COVERAGE = 0.8;
+
+export type RepairLoopErrorKind = "unsupported" | "unavailable" | "failed";
+
+export type RepairLoopLoadError = {
+  kind: RepairLoopErrorKind;
+  status?: number;
+  message: string;
+};
+
+export type RepairExperimentGate = {
+  loopsTotal: number;
+  minLoops: number;
+  measuredLoops: number;
+  unmeasuredLoops: number;
+  unmeasuredMembers: number;
+  coverageRatio: number | null;
+  coveragePercent: number | null;
+  hasMinLoops: boolean;
+  hasMeasuredCoverage: boolean;
+  baselineGateMet: boolean;
+  statusLabel: string;
+  detailText: string;
+};
+
+export type RepairSampleCostView = {
+  measured: boolean;
+  label: string;
+  tokensText: string;
+  usdText: string;
+};
+
+export type RepairLoopSampleView = {
+  key: string;
+  runId: string;
+  shortRunId: string;
+  projectId: string;
+  revision: number;
+  cause: RepairLoopCause;
+  causeLabel: string;
+  outcome: RepairLoopOutcome;
+  outcomeLabel: string;
+  outcomeTone: "resolved" | "active" | "unresolved";
+  rounds: number;
+  attempts: number;
+  coldReplacements: number;
+  failedResumes: number;
+  startedAt: string;
+  durationText: string;
+  failedCommitShort?: string;
+  passingCommitShort?: string;
+  cost: RepairSampleCostView;
+};
+
+export type RepairMetricsViewModel = {
+  windowDays: number;
+  projectId?: string;
+  runsExamined: number;
+  loopsTotal: number;
+  outcomes: {
+    resolved: number;
+    inProgress: number;
+    unresolved: number;
+    resolvedPercent: number | null;
+  };
+  causes: {
+    cause: RepairLoopCause;
+    label: string;
+    count: number;
+  }[];
+  overhead: {
+    coldReplacements: number;
+    failedResumes: number;
+  };
+  coverage: {
+    measuredLoops: number;
+    unmeasuredLoops: number;
+    unmeasuredMembers: number;
+    coveragePercent: number | null;
+  };
+  latency: {
+    medianText: string;
+    p90Text: string;
+    hasResolvedLatency: boolean;
+  };
+  cost: {
+    medianTokensText: string;
+    medianUsdText: string;
+    hasMeasuredCost: boolean;
+  };
+  gate: RepairExperimentGate;
+  samples: RepairLoopSampleView[];
+};
+
+const CAUSE_LABELS: Record<RepairLoopCause, string> = {
+  review: "Review",
+  check: "Check",
+  delivery: "Delivery",
+};
+
+const OUTCOME_LABELS: Record<RepairLoopOutcome, string> = {
+  resolved: "Resolved",
+  "in-progress": "In progress",
+  blocked: "Blocked",
+  cancelled: "Cancelled",
+  superseded: "Superseded",
+  unresolved: "Unresolved",
+};
+
+export function repairLoopsPath(options?: { projectId?: string; days?: number }): string {
+  const days = options?.days ?? DEFAULT_REPAIR_WINDOW_DAYS;
+  const params = new URLSearchParams();
+  if (options?.projectId) params.set("project", options.projectId);
+  params.set("days", String(days));
+  return `/usage/repair-loops?${params.toString()}`;
+}
+
+export function classifyRepairLoopError(error: unknown): RepairLoopLoadError {
+  const status = typeof error === "object" && error !== null && "status" in error && typeof (error as { status: unknown }).status === "number"
+    ? (error as { status: number }).status
+    : undefined;
+  if (status === 404) {
+    return {
+      kind: "unsupported",
+      status: 404,
+      message: "Repair-loop metrics are not available on this host.",
+    };
+  }
+  if (status === 503) {
+    return {
+      kind: "unavailable",
+      status: 503,
+      message: "Repair-loop metrics are unavailable because the usage ledger cannot be read.",
+    };
+  }
+  return {
+    kind: "failed",
+    ...(status !== undefined ? { status } : {}),
+    message: "Repair-loop metrics could not be loaded.",
+  };
+}
+
+export function formatRepairMinutes(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return "—";
+  if (value >= 90) return `${(value / 60).toFixed(1)} h`;
+  return `${value.toFixed(1)} min`;
+}
+
+export function formatRepairDurationMs(durationMs: number | undefined): string {
+  if (durationMs === undefined || !Number.isFinite(durationMs)) return "—";
+  return formatRepairMinutes(durationMs / 60_000);
+}
+
+export function formatTokenCount(value: number): string {
+  if (value >= 1e6) return `${(value / 1e6).toFixed(value >= 1e7 ? 0 : 1)}M`;
+  if (value >= 1000) return `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}K`;
+  return String(Math.round(value));
+}
+
+export function formatUsdAmount(value: number): string {
+  const sign = value < 0 ? "−" : "";
+  const abs = Math.abs(value);
+  const digits = abs === 0 ? 2 : abs >= 1000 ? 0 : abs >= 0.01 ? 2 : 4;
+  const figure = abs.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  return `${sign}$${figure}`;
+}
+
+export function formatMedianTokens(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return "Unmeasured";
+  return formatTokenCount(value);
+}
+
+export function formatMedianUsd(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return "Unmeasured";
+  return formatUsdAmount(value);
+}
+
+export function formatSampleCost(sample: Pick<RepairLoopSample, "measured" | "tokens" | "usd">): RepairSampleCostView {
+  if (!sample.measured || sample.tokens === undefined || sample.usd === undefined) {
+    return {
+      measured: false,
+      label: "Unmeasured",
+      tokensText: "Unmeasured",
+      usdText: "Unmeasured",
+    };
+  }
+  const tokensText = `${formatTokenCount(sample.tokens)} tok`;
+  const usdText = formatUsdAmount(sample.usd);
+  return {
+    measured: true,
+    label: `${tokensText} · ${usdText}`,
+    tokensText,
+    usdText,
+  };
+}
+
+export function evaluateExperimentGate(report: Pick<RepairLoopReport, "windowDays" | "totals">): RepairExperimentGate {
+  const { totals, windowDays } = report;
+  const coverageRatio = totals.loopsTotal > 0 ? totals.measuredLoops / totals.loopsTotal : null;
+  const coveragePercent = coverageRatio === null ? null : Math.round(coverageRatio * 100);
+  const hasMinLoops = totals.loopsTotal >= EXPERIMENT_MIN_LOOPS;
+  const hasMeasuredCoverage = totals.loopsTotal > 0 && (
+    (totals.measuredLoops / totals.loopsTotal) >= EXPERIMENT_MIN_COVERAGE || totals.measuredLoops >= EXPERIMENT_MIN_LOOPS
+  );
+  const baselineGateMet = hasMinLoops && hasMeasuredCoverage;
+
+  let statusLabel: string;
+  let detailText: string;
+
+  if (totals.loopsTotal === 0) {
+    statusLabel = "No baseline loops";
+    detailText = `0 of ${EXPERIMENT_MIN_LOOPS} minimum repair loops observed in the ${windowDays}-day window.`;
+  } else if (baselineGateMet) {
+    statusLabel = "Baseline sample met";
+    detailText = `${totals.loopsTotal} repair loops observed (${totals.measuredLoops} measured, ${coveragePercent}% coverage; ${totals.unmeasuredLoops} unmeasured).`;
+  } else if (!hasMinLoops) {
+    statusLabel = "Collecting baseline";
+    detailText = `${totals.loopsTotal} of ${EXPERIMENT_MIN_LOOPS} minimum repair loops observed (${totals.measuredLoops} measured${coveragePercent !== null ? `, ${coveragePercent}% coverage` : ""}).`;
+  } else {
+    statusLabel = "Coverage below threshold";
+    detailText = `${totals.loopsTotal} repair loops observed with ${totals.measuredLoops} measured (${coveragePercent}% coverage; threshold is >= 80% coverage or ${EXPERIMENT_MIN_LOOPS} measured loops).`;
+  }
+
+  return {
+    loopsTotal: totals.loopsTotal,
+    minLoops: EXPERIMENT_MIN_LOOPS,
+    measuredLoops: totals.measuredLoops,
+    unmeasuredLoops: totals.unmeasuredLoops,
+    unmeasuredMembers: totals.unmeasuredMembers,
+    coverageRatio,
+    coveragePercent,
+    hasMinLoops,
+    hasMeasuredCoverage,
+    baselineGateMet,
+    statusLabel,
+    detailText,
+  };
+}
+
+function outcomeTone(outcome: RepairLoopOutcome): "resolved" | "active" | "unresolved" {
+  if (outcome === "resolved") return "resolved";
+  if (outcome === "in-progress") return "active";
+  return "unresolved";
+}
+
+export function buildRepairMetricsViewModel(report: RepairLoopReport): RepairMetricsViewModel {
+  const { totals } = report;
+  const coveragePercent = totals.loopsTotal > 0 ? Math.round((totals.measuredLoops / totals.loopsTotal) * 100) : null;
+  const resolvedPercent = totals.loopsTotal > 0 ? Math.round((totals.resolved / totals.loopsTotal) * 100) : null;
+
+  return {
+    windowDays: report.windowDays,
+    ...(report.projectId ? { projectId: report.projectId } : {}),
+    runsExamined: totals.runsExamined,
+    loopsTotal: totals.loopsTotal,
+    outcomes: {
+      resolved: totals.resolved,
+      inProgress: totals.inProgress,
+      unresolved: totals.unresolved,
+      resolvedPercent,
+    },
+    causes: (["review", "check", "delivery"] as const).map(cause => ({
+      cause,
+      label: CAUSE_LABELS[cause],
+      count: totals.byCause[cause] ?? 0,
+    })),
+    overhead: {
+      coldReplacements: totals.coldReplacements,
+      failedResumes: totals.failedResumes,
+    },
+    coverage: {
+      measuredLoops: totals.measuredLoops,
+      unmeasuredLoops: totals.unmeasuredLoops,
+      unmeasuredMembers: totals.unmeasuredMembers,
+      coveragePercent,
+    },
+    latency: {
+      medianText: formatRepairMinutes(totals.medianMinutes),
+      p90Text: formatRepairMinutes(totals.p90Minutes),
+      hasResolvedLatency: totals.medianMinutes !== null,
+    },
+    cost: {
+      medianTokensText: formatMedianTokens(totals.medianTokens),
+      medianUsdText: formatMedianUsd(totals.medianUsd),
+      hasMeasuredCost: totals.medianTokens !== null && totals.medianUsd !== null,
+    },
+    gate: evaluateExperimentGate(report),
+    samples: report.loops.map((loop, index) => ({
+      key: `${loop.runId}:${loop.revision}:${loop.startedAt}:${index}`,
+      runId: loop.runId,
+      shortRunId: loop.runId.slice(0, 8),
+      projectId: loop.projectId,
+      revision: loop.revision,
+      cause: loop.cause,
+      causeLabel: CAUSE_LABELS[loop.cause],
+      outcome: loop.outcome,
+      outcomeLabel: OUTCOME_LABELS[loop.outcome],
+      outcomeTone: outcomeTone(loop.outcome),
+      rounds: loop.rounds,
+      attempts: loop.attempts,
+      coldReplacements: loop.coldReplacements,
+      failedResumes: loop.failedResumes,
+      startedAt: loop.startedAt,
+      durationText: formatRepairDurationMs(loop.durationMs),
+      ...(loop.failedCommit ? { failedCommitShort: loop.failedCommit.slice(0, 7) } : {}),
+      ...(loop.passingCommit ? { passingCommitShort: loop.passingCommit.slice(0, 7) } : {}),
+      cost: formatSampleCost(loop),
+    })),
+  };
+}

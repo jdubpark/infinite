@@ -1,6 +1,6 @@
 # Swarm view
 
-> **Scope note:** This page documents the read-only **web Swarm visualization** (`#/swarm`, `#/swarm/wall`, `#/swarm/graph`) and the **Decision Queue** (`#/decisions`). For multi-agent orchestration lifecycles, mission-to-subteam scheduling, and the Blackboard, see [System Architecture](architecture.md#orchestration-stack-and-state-machines), [Missions](missions.md), and [Blackboard and member entry tools](teams.md#blackboard-and-member-entry-tools).
+> **Scope note:** This page documents the read-only **web Swarm visualization** (`#/swarm`, `#/swarm/wall`, `#/swarm/graph`), its links into the **Team Run Inspector** (`#/teams/:id`) and **Mission Inspector** (`#/missions/:id`), and the **Decision Queue** (`#/decisions`). For multi-agent orchestration lifecycles, mission-to-subteam scheduling, and the Blackboard, see [System Architecture](architecture.md#orchestration-stack-and-state-machines), [Teams](teams.md#team-runs), [Missions](missions.md), and [Blackboard and member entry tools](teams.md#blackboard-and-member-entry-tools).
 
 The Swarm view is the web client's landing page. It shows the agents on the
 active machine: how they are organised into teams and missions, what each one
@@ -80,6 +80,70 @@ delivery agent's report.
 - **Tool** is the loud tool the host reports as in flight. Reads and other
   quiet tools never appear, and the slot empties when a tool ends.
 
+## Wait reasons, stalled, and spinner-only indicators
+
+The host computes ordered wait reasons for non-paused, non-terminal team runs
+(`packages/host/src/team-wait-reasons.ts`) and projects them on `GET /api/teams?view=list`
+(`packages/host/src/team-list.ts`), capped at 16 ordered wait reasons per run
+with whitespace-collapsed summaries truncated at 240 characters, alongside member
+liveness fields (`stalledAt`, `spinnerOnlySince`, `pendingLimit`).
+
+Wait-reason kinds are ordered from highest actionability to structural waits:
+
+| Kind | Meaning |
+| --- | --- |
+| `owner-decision` | An open team decision on the active revision waits for an answer. |
+| `provider-prompt` | A provider prompt is waiting for owner response or permission coordinator review. |
+| `stalled` | An active unreported member stalled without substantive activity and is stopping. |
+| `spinner-only` | An active unreported member shows spinner or status redraws without substantive screen changes. |
+| `provider-limit` | A corroborated provider limit or member `pendingLimit` holds new or current work. |
+| `worker-slot` | Ready tasks, scouts, or queued members are waiting for an available worker or session slot. |
+| `dependency` | Pending tasks are waiting on upstream `dependsOn` tasks to integrate. |
+| `integration-order` | A reported implementer is waiting to integrate behind earlier tasks in plan order. |
+| `linear-sync` | Linear issue tracking confirmation is pending or retrying. |
+
+Swarm views render these indicators consistently from the same host projection:
+
+- **Lanes**: each unit label displays a wait-count pill (`1 wait` / `N waits`,
+  with all summaries on hover), and agent mark titles append `provider limit`,
+  `stalled`, or `spinner-only` when set.
+- **Wall**: standalone team headers and mission subteam sections display wait
+  badges (`1 wait` / `N waits`), and each agent tile shows compact `lim`,
+  `stall`, `spin`, and `earlier` tags.
+- **Swarm Inspector (bottom bar)**: selecting a unit shows `wait N` with the
+  highest-priority wait-reason summary (all summaries on hover) and a `team`
+  link; selecting an agent shows `stalled` and `spinner-only` flags alongside
+  `session` and `team` links.
+
+## Team Run and Mission Inspectors
+
+Swarm stays read-only and routes into dedicated detail views when you open a
+unit or mission:
+
+- **Web Team Run Inspector (`#/teams/:id`)**: clicking `team` in the Swarm
+  inspector or double-clicking a unit title opens `TeamDetail`
+  (`apps/web/src/teams.tsx`), composed of `TeamOverview` and
+  `TeamEvidenceBoard`. `TeamOverview` separates task integration progress and
+  criterion outcome groups from provisional criterion assessments and reviewer
+  acceptance claims, lists ordered host wait reasons (`Why this run is waiting`)
+  with `Logs`, `Entries`, and `Session` actions plus `Stalled since` /
+  `Spinner-only screen since` member flags, and collapses finished or prior
+  attempts under a `Finished (N)` toggle with replacement links. The `Board`
+  tab (`TeamEvidenceBoard`, deep-linkable at `#/teams/:id/entries/:entryId`)
+  filters Blackboard entries, distinguishes `Host receipt`, `Agent claim`, and
+  `Owner direction` authority, and navigates supersession chains. See
+  [Teams](teams.md#team-runs) and [Blackboard and member entry tools](teams.md#blackboard-and-member-entry-tools).
+- **Web Mission Inspector (`#/missions/:id`)**: clicking a mission title in
+  Lanes or a held mission row opens `MissionPage` (`apps/web/src/missions.tsx`,
+  `apps/web/src/mission-inspector/MissionInspector.tsx`). It polls
+  `GET /api/missions/:id/progress` using a generation-scoped cursor
+  (`mp1.<generation>.<missionId>.<instance>.<sequence>`), surfaces a
+  resync banner (`MissionResyncBanner`) on `host-restarted`, `history-evicted`,
+  `retention-gap`, `cursor-ahead`, `invalid-cursor`, or `mission-mismatch`,
+  separates recorded state from live worker status, compacts finished subteam
+  assignments under `Finished (N)`, and lets owners inspect child subteam
+  Blackboard entries or open a child team directly. See [Missions](missions.md).
+
 ## Code context in the Graph view
 
 The Graph view is layered from left to right: mission hub, unit hubs, agents,
@@ -125,6 +189,7 @@ All three are `GET`, open to every paired role, and admitted over the relay.
 
 | Endpoint | Returns |
 | --- | --- |
+| `/api/teams?view=list` | Bounded team list projection (capped at 16 ordered wait reasons / 240-char summaries and member liveness fields). |
 | `/api/projects/:id/graph/map?lane=` | The directory-level code map for a project lane. |
 | `/api/teams/:id/context` | Touched files per member of a team run. |
 | `/api/sessions/:id/context` | Touched files for one session. |

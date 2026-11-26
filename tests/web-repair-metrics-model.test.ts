@@ -19,6 +19,8 @@ function makeReport(overrides: Partial<RepairLoopReport> = {}): RepairLoopReport
     windowDays: 30,
     totals: {
       runsExamined: 12,
+      eventCoverage: "complete",
+      incompleteRuns: 0,
       loopsTotal: 4,
       resolved: 2,
       unresolved: 1,
@@ -28,6 +30,7 @@ function makeReport(overrides: Partial<RepairLoopReport> = {}): RepairLoopReport
       failedResumes: 1,
       measuredLoops: 2,
       unmeasuredLoops: 2,
+      unfinishedLoops: 0,
       unmeasuredMembers: 3,
       medianMinutes: 14.5,
       p90Minutes: 32,
@@ -266,4 +269,100 @@ test("classifyRepairLoopError separates 404/remote-403 unsupported, 503 unavaila
     kind: "failed",
     message: "Repair-loop metrics could not be loaded.",
   });
+});
+
+test("formatSampleCost distinguishes unfinished loops from unmeasured finished loops", () => {
+  const inProgress = formatSampleCost({ measured: false, unfinished: true, outcome: "in-progress" });
+  assert.equal(inProgress.measured, false);
+  assert.equal(inProgress.unfinished, true);
+  assert.equal(inProgress.label, "In progress");
+  assert.equal(inProgress.tokensText, "In progress");
+  assert.equal(inProgress.usdText, "In progress");
+
+  const unfinishedSuperseded = formatSampleCost({ measured: false, unfinished: true, outcome: "superseded" });
+  assert.equal(unfinishedSuperseded.measured, false);
+  assert.equal(unfinishedSuperseded.unfinished, true);
+  assert.equal(unfinishedSuperseded.label, "Unfinished");
+
+  const unmeasured = formatSampleCost({ measured: false, outcome: "blocked" });
+  assert.equal(unmeasured.measured, false);
+  assert.equal(unmeasured.unfinished, false);
+  assert.equal(unmeasured.label, "Unmeasured");
+});
+
+test("buildRepairMetricsViewModel projects incompleteRuns, unfinishedLoops, notices, and older-host defaults", () => {
+  const withGaps = buildRepairMetricsViewModel(makeReport({
+    totals: {
+      ...makeReport().totals,
+      runsExamined: 5,
+      eventCoverage: "incomplete",
+      incompleteRuns: 2,
+      loopsTotal: 3,
+      measuredLoops: 1,
+      unmeasuredLoops: 0,
+      unfinishedLoops: 2,
+      unmeasuredMembers: 0,
+    },
+    loops: [
+      {
+        ...makeReport().loops[1]!,
+        outcome: "in-progress",
+        measured: false,
+        unfinished: true,
+      },
+      {
+        ...makeReport().loops[1]!,
+        outcome: "superseded",
+        measured: false,
+        unfinished: true,
+      },
+    ],
+  }));
+  assert.equal(withGaps.eventCoverage, "incomplete");
+  assert.equal(withGaps.incompleteRuns, 2);
+  assert.equal(
+    withGaps.incompleteCoverageNotice,
+    "Event coverage is incomplete for 2 of 5 examined runs; loop counts may undercount actual repairs.",
+  );
+  assert.equal(withGaps.unfinishedLoops, 2);
+  assert.equal(withGaps.coverage.unfinishedLoops, 2);
+  assert.equal(
+    withGaps.unfinishedLoopsNotice,
+    "2 of 3 loops are unfinished and excluded from token/USD medians until final session usage settles.",
+  );
+  assert.equal(
+    withGaps.emptyLoopsMessage,
+    "No repair loops reconstructed from complete ledger events in this window.",
+  );
+  assert.equal(withGaps.samples[0]!.cost.label, "In progress");
+  assert.equal(withGaps.samples[0]!.cost.unfinished, true);
+  assert.equal(withGaps.samples[1]!.cost.label, "Unfinished");
+  assert.equal(withGaps.samples[1]!.cost.unfinished, true);
+
+  const legacyTotals = { ...makeReport().totals };
+  delete legacyTotals.eventCoverage;
+  delete legacyTotals.incompleteRuns;
+  delete legacyTotals.unfinishedLoops;
+  const legacy = buildRepairMetricsViewModel(makeReport({ totals: legacyTotals, loops: [] }));
+  assert.equal(legacy.eventCoverage, "complete");
+  assert.equal(legacy.incompleteRuns, 0);
+  assert.equal(legacy.incompleteCoverageNotice, null);
+  assert.equal(legacy.unfinishedLoops, 0);
+  assert.equal(legacy.unfinishedLoopsNotice, null);
+  assert.equal(legacy.emptyLoopsMessage, "No repair loops recorded in this window.");
+
+  const gateWithIncompleteAndUnfinished = evaluateExperimentGate(makeReport({
+    totals: {
+      ...makeReport().totals,
+      eventCoverage: "incomplete",
+      incompleteRuns: 1,
+      loopsTotal: 20,
+      measuredLoops: 16,
+      unmeasuredLoops: 2,
+      unfinishedLoops: 2,
+    },
+  }));
+  assert.equal(gateWithIncompleteAndUnfinished.baselineGateMet, true);
+  assert.equal(gateWithIncompleteAndUnfinished.unfinishedLoops, 2);
+  assert.match(gateWithIncompleteAndUnfinished.detailText, /2 unfinished/);
 });

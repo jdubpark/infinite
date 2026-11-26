@@ -124,6 +124,9 @@ export function RepairMetricsPanel({ projectId, days = DEFAULT_REPAIR_WINDOW_DAY
             {vm.coverage.unmeasuredLoops > 0 && (
               <> · <span className="cost-badge">{vm.coverage.unmeasuredLoops} unmeasured</span></>
             )}
+            {vm.unfinishedLoops > 0 && (
+              <> · <span className="repair-outcome is-active">{vm.unfinishedLoops} unfinished</span></>
+            )}
           </span>
         </li>
         <li className="repair-kpi">
@@ -137,11 +140,25 @@ export function RepairMetricsPanel({ projectId, days = DEFAULT_REPAIR_WINDOW_DAY
         </li>
       </ul>
 
+      {vm.incompleteCoverageNotice && (
+        <p className="repair-note repair-warning" role="status">
+          <span className="cost-badge">Incomplete events</span>
+          <span>{vm.incompleteCoverageNotice}</span>
+        </p>
+      )}
+
       {(vm.coverage.unmeasuredLoops > 0 || vm.coverage.unmeasuredMembers > 0) && (
         <p className="repair-note quiet">
           <span className="cost-badge">{vm.coverage.unmeasuredLoops} unmeasured</span>{" "}
           {vm.coverage.unmeasuredLoops} of {vm.loopsTotal} loops ({vm.coverage.unmeasuredMembers} unmeasured{" "}
           {vm.coverage.unmeasuredMembers === 1 ? "member" : "members"}) lack complete pricing and are excluded from token and USD medians, never counted as $0.
+        </p>
+      )}
+
+      {vm.unfinishedLoopsNotice && (
+        <p className="repair-note quiet" role="status">
+          <span className="repair-outcome is-active">{vm.unfinishedLoops} unfinished</span>
+          <span>{vm.unfinishedLoopsNotice}</span>
         </p>
       )}
 
@@ -182,7 +199,9 @@ export function RepairMetricsPanel({ projectId, days = DEFAULT_REPAIR_WINDOW_DAY
                   {sample.cost.measured ? (
                     sample.cost.label
                   ) : (
-                    <span className="cost-badge">Unmeasured</span>
+                    <span className={sample.cost.unfinished ? "repair-outcome is-active" : "cost-badge"}>
+                      {sample.cost.label}
+                    </span>
                   )}
                 </td>
               </tr>
@@ -190,11 +209,11 @@ export function RepairMetricsPanel({ projectId, days = DEFAULT_REPAIR_WINDOW_DAY
           </tbody>
         </table>
       ) : (
-        <p className="quiet">No repair loops recorded in this window.</p>
+        <p className="quiet">{vm.emptyLoopsMessage}</p>
       )}
 
       <p className="cost-foot quiet">
-        Denominator includes resolved, in-progress, blocked, cancelled, and superseded loops · {vm.coverage.measuredLoops} measured / {vm.coverage.unmeasuredLoops} unmeasured · unmeasured work is never coerced to $0
+        Denominator includes resolved, in-progress, blocked, cancelled, and superseded loops · {vm.coverage.measuredLoops} measured / {vm.coverage.unmeasuredLoops} unmeasured{vm.unfinishedLoops > 0 ? ` / ${vm.unfinishedLoops} unfinished` : ""} · unmeasured work is never coerced to $0
       </p>
     </section>
   );

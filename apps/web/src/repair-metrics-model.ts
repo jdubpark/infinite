@@ -1,4 +1,4 @@
-import type { RepairLoopCause, RepairLoopOutcome, RepairLoopReport, RepairLoopSample } from "./api";
+import type { RepairEventCoverage, RepairLoopCause, RepairLoopOutcome, RepairLoopReport, RepairLoopSample } from "./api";
 
 export const DEFAULT_REPAIR_WINDOW_DAYS = 30;
 export const EXPERIMENT_MIN_LOOPS = 20;
@@ -17,6 +17,7 @@ export type RepairExperimentGate = {
   minLoops: number;
   measuredLoops: number;
   unmeasuredLoops: number;
+  unfinishedLoops: number;
   unmeasuredMembers: number;
   coverageRatio: number | null;
   coveragePercent: number | null;
@@ -29,6 +30,7 @@ export type RepairExperimentGate = {
 
 export type RepairSampleCostView = {
   measured: boolean;
+  unfinished: boolean;
   label: string;
   tokensText: string;
   usdText: string;
@@ -62,6 +64,12 @@ export type RepairMetricsViewModel = {
   projectId?: string;
   runsExamined: number;
   loopsTotal: number;
+  eventCoverage: RepairEventCoverage;
+  incompleteRuns: number;
+  incompleteCoverageNotice: string | null;
+  unfinishedLoops: number;
+  unfinishedLoopsNotice: string | null;
+  emptyLoopsMessage: string;
   outcomes: {
     resolved: number;
     inProgress: number;
@@ -80,6 +88,7 @@ export type RepairMetricsViewModel = {
   coverage: {
     measuredLoops: number;
     unmeasuredLoops: number;
+    unfinishedLoops: number;
     unmeasuredMembers: number;
     coveragePercent: number | null;
   };
@@ -189,33 +198,48 @@ export function formatMedianUsd(value: number | null): string {
   return formatUsdAmount(value);
 }
 
-export function formatSampleCost(sample: Pick<RepairLoopSample, "measured" | "tokens" | "usd">): RepairSampleCostView {
+export function formatSampleCost(
+  sample: Pick<RepairLoopSample, "measured" | "tokens" | "usd"> & Partial<Pick<RepairLoopSample, "unfinished" | "outcome">>,
+): RepairSampleCostView {
   if (
-    !sample.measured
-    || sample.tokens === undefined
-    || sample.usd === undefined
-    || !Number.isFinite(sample.tokens)
-    || !Number.isFinite(sample.usd)
+    sample.measured
+    && sample.tokens !== undefined
+    && sample.usd !== undefined
+    && Number.isFinite(sample.tokens)
+    && Number.isFinite(sample.usd)
   ) {
+    const tokensText = `${formatTokenCount(sample.tokens)} tok`;
+    const usdText = formatUsdAmount(sample.usd);
     return {
-      measured: false,
-      label: "Unmeasured",
-      tokensText: "Unmeasured",
-      usdText: "Unmeasured",
+      measured: true,
+      unfinished: false,
+      label: `${tokensText} · ${usdText}`,
+      tokensText,
+      usdText,
     };
   }
-  const tokensText = `${formatTokenCount(sample.tokens)} tok`;
-  const usdText = formatUsdAmount(sample.usd);
+  if (sample.unfinished) {
+    const label = sample.outcome === "in-progress" ? "In progress" : "Unfinished";
+    return {
+      measured: false,
+      unfinished: true,
+      label,
+      tokensText: label,
+      usdText: label,
+    };
+  }
   return {
-    measured: true,
-    label: `${tokensText} · ${usdText}`,
-    tokensText,
-    usdText,
+    measured: false,
+    unfinished: false,
+    label: "Unmeasured",
+    tokensText: "Unmeasured",
+    usdText: "Unmeasured",
   };
 }
 
 export function evaluateExperimentGate(report: Pick<RepairLoopReport, "windowDays" | "totals">): RepairExperimentGate {
   const { totals, windowDays } = report;
+  const unfinishedLoops = totals.unfinishedLoops ?? 0;
   const coverageRatio = totals.loopsTotal > 0 ? totals.measuredLoops / totals.loopsTotal : null;
   const coveragePercent = coverageRatio === null ? null : Math.round(coverageRatio * 100);
   const hasMinLoops = totals.loopsTotal >= EXPERIMENT_MIN_LOOPS;
@@ -232,7 +256,7 @@ export function evaluateExperimentGate(report: Pick<RepairLoopReport, "windowDay
     detailText = `0 of ${EXPERIMENT_MIN_LOOPS} minimum repair loops observed in the ${windowDays}-day window.`;
   } else if (baselineGateMet) {
     statusLabel = "Baseline sample met";
-    detailText = `${totals.loopsTotal} repair loops observed (${totals.measuredLoops} measured, ${coveragePercent}% coverage; ${totals.unmeasuredLoops} unmeasured).`;
+    detailText = `${totals.loopsTotal} repair loops observed (${totals.measuredLoops} measured, ${coveragePercent}% coverage; ${totals.unmeasuredLoops} unmeasured${unfinishedLoops > 0 ? `, ${unfinishedLoops} unfinished` : ""}).`;
   } else if (!hasMinLoops) {
     statusLabel = "Collecting baseline";
     detailText = `${totals.loopsTotal} of ${EXPERIMENT_MIN_LOOPS} minimum repair loops observed (${totals.measuredLoops} measured${coveragePercent !== null ? `, ${coveragePercent}% coverage` : ""}).`;
@@ -246,6 +270,7 @@ export function evaluateExperimentGate(report: Pick<RepairLoopReport, "windowDay
     minLoops: EXPERIMENT_MIN_LOOPS,
     measuredLoops: totals.measuredLoops,
     unmeasuredLoops: totals.unmeasuredLoops,
+    unfinishedLoops,
     unmeasuredMembers: totals.unmeasuredMembers,
     coverageRatio,
     coveragePercent,
@@ -265,6 +290,20 @@ function outcomeTone(outcome: RepairLoopOutcome): "resolved" | "active" | "unres
 
 export function buildRepairMetricsViewModel(report: RepairLoopReport): RepairMetricsViewModel {
   const { totals } = report;
+  const incompleteRuns = totals.incompleteRuns ?? 0;
+  const unfinishedLoops = totals.unfinishedLoops ?? 0;
+  const eventCoverage: RepairEventCoverage = totals.eventCoverage ?? (incompleteRuns > 0 ? "incomplete" : "complete");
+  const incompleteCoverageNotice = incompleteRuns > 0
+    ? `Event coverage is incomplete for ${incompleteRuns} of ${totals.runsExamined} examined ${totals.runsExamined === 1 ? "run" : "runs"}; loop counts may undercount actual repairs.`
+    : eventCoverage === "incomplete"
+      ? "Event coverage is incomplete for examined runs; loop counts may undercount actual repairs."
+      : null;
+  const unfinishedLoopsNotice = unfinishedLoops > 0
+    ? `${unfinishedLoops} of ${totals.loopsTotal} ${totals.loopsTotal === 1 ? "loop" : "loops"} ${unfinishedLoops === 1 ? "is" : "are"} unfinished and excluded from token/USD medians until final session usage settles.`
+    : null;
+  const emptyLoopsMessage = incompleteRuns > 0 || eventCoverage === "incomplete"
+    ? "No repair loops reconstructed from complete ledger events in this window."
+    : "No repair loops recorded in this window.";
   const coveragePercent = totals.loopsTotal > 0 ? Math.round((totals.measuredLoops / totals.loopsTotal) * 100) : null;
   const resolvedPercent = totals.loopsTotal > 0 ? Math.round((totals.resolved / totals.loopsTotal) * 100) : null;
 
@@ -273,6 +312,12 @@ export function buildRepairMetricsViewModel(report: RepairLoopReport): RepairMet
     ...(report.projectId ? { projectId: report.projectId } : {}),
     runsExamined: totals.runsExamined,
     loopsTotal: totals.loopsTotal,
+    eventCoverage,
+    incompleteRuns,
+    incompleteCoverageNotice,
+    unfinishedLoops,
+    unfinishedLoopsNotice,
+    emptyLoopsMessage,
     outcomes: {
       resolved: totals.resolved,
       inProgress: totals.inProgress,
@@ -291,6 +336,7 @@ export function buildRepairMetricsViewModel(report: RepairLoopReport): RepairMet
     coverage: {
       measuredLoops: totals.measuredLoops,
       unmeasuredLoops: totals.unmeasuredLoops,
+      unfinishedLoops,
       unmeasuredMembers: totals.unmeasuredMembers,
       coveragePercent,
     },

@@ -59,6 +59,8 @@ const mixedReport: RepairLoopReport = {
   windowDays: 30,
   totals: {
     runsExamined: 12,
+    eventCoverage: "complete",
+    incompleteRuns: 0,
     loopsTotal: 4,
     resolved: 2,
     unresolved: 1,
@@ -68,6 +70,7 @@ const mixedReport: RepairLoopReport = {
     failedResumes: 1,
     measuredLoops: 2,
     unmeasuredLoops: 2,
+    unfinishedLoops: 0,
     unmeasuredMembers: 3,
     medianMinutes: 12.5,
     p90Minutes: 28,
@@ -115,6 +118,8 @@ const projectUnmeasuredReport: RepairLoopReport = {
   projectId: "proj-alpha",
   totals: {
     runsExamined: 3,
+    eventCoverage: "complete",
+    incompleteRuns: 0,
     loopsTotal: 1,
     resolved: 1,
     unresolved: 0,
@@ -124,6 +129,7 @@ const projectUnmeasuredReport: RepairLoopReport = {
     failedResumes: 1,
     measuredLoops: 0,
     unmeasuredLoops: 1,
+    unfinishedLoops: 0,
     unmeasuredMembers: 4,
     medianMinutes: 8,
     p90Minutes: 8,
@@ -149,6 +155,102 @@ const projectUnmeasuredReport: RepairLoopReport = {
   ],
 };
 
+const incompleteUnfinishedReport: RepairLoopReport = {
+  windowDays: 30,
+  totals: {
+    runsExamined: 5,
+    eventCoverage: "incomplete",
+    incompleteRuns: 2,
+    loopsTotal: 3,
+    resolved: 1,
+    unresolved: 1,
+    inProgress: 1,
+    byCause: { review: 1, check: 1, delivery: 1 },
+    coldReplacements: 1,
+    failedResumes: 0,
+    measuredLoops: 1,
+    unmeasuredLoops: 0,
+    unfinishedLoops: 2,
+    unmeasuredMembers: 0,
+    medianMinutes: 10,
+    p90Minutes: 10,
+    medianTokens: 21000,
+    medianUsd: 0.19,
+  },
+  loops: [
+    {
+      runId: "dddddddd-4444-4444-8444-444444444444",
+      projectId: "proj-alpha",
+      revision: 1,
+      cause: "check",
+      outcome: "resolved",
+      rounds: 1,
+      attempts: 2,
+      coldReplacements: 0,
+      failedResumes: 0,
+      startedAt: "2026-11-26T08:00:00.000Z",
+      finishedAt: "2026-11-26T08:10:00.000Z",
+      durationMs: 600_000,
+      measured: true,
+      tokens: 21000,
+      usd: 0.19,
+    },
+    {
+      runId: "eeeeeeee-5555-4555-8555-555555555555",
+      projectId: "proj-alpha",
+      revision: 2,
+      cause: "review",
+      outcome: "in-progress",
+      rounds: 1,
+      attempts: 1,
+      coldReplacements: 0,
+      failedResumes: 0,
+      startedAt: "2026-11-26T09:00:00.000Z",
+      measured: false,
+      unfinished: true,
+    },
+    {
+      runId: "ffffffff-6666-4666-8666-666666666666",
+      projectId: "proj-alpha",
+      revision: 1,
+      cause: "delivery",
+      outcome: "superseded",
+      rounds: 1,
+      attempts: 2,
+      coldReplacements: 1,
+      failedResumes: 0,
+      startedAt: "2026-11-26T07:00:00.000Z",
+      measured: false,
+      unfinished: true,
+    },
+  ],
+};
+
+const emptyIncompleteReport: RepairLoopReport = {
+  windowDays: 30,
+  totals: {
+    runsExamined: 4,
+    eventCoverage: "incomplete",
+    incompleteRuns: 3,
+    loopsTotal: 0,
+    resolved: 0,
+    unresolved: 0,
+    inProgress: 0,
+    byCause: { review: 0, check: 0, delivery: 0 },
+    coldReplacements: 0,
+    failedResumes: 0,
+    measuredLoops: 0,
+    unmeasuredLoops: 0,
+    unfinishedLoops: 0,
+    unmeasuredMembers: 0,
+    medianMinutes: null,
+    p90Minutes: null,
+    medianTokens: null,
+    medianUsd: null,
+  },
+  loops: [],
+};
+
 const host = (async (path: string) => {
   requests.push(path);
   if (path === "/usage") return fixtureSummary;
@@ -157,6 +259,8 @@ const host = (async (path: string) => {
   if (path.startsWith("/usage/repair-loops?")) {
     if (scenario === "legacy-404") throw new ApiError("Not found", 404, "not-found");
     if (scenario === "unavailable-503") throw new ApiError("Usage ledger unavailable", 503, "unavailable");
+    if (scenario === "incomplete-unfinished") return incompleteUnfinishedReport;
+    if (scenario === "empty-incomplete") return emptyIncompleteReport;
     if (path.includes("project=proj-alpha")) return projectUnmeasuredReport;
     return mixedReport;
   }

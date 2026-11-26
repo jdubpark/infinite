@@ -139,4 +139,49 @@ describe("web repair metrics Playwright E2E", { skip: skipBrowser }, () => {
       await page.close();
     }
   });
+
+  test("renders incomplete event coverage warning, unfinished loops note, and In progress / Unfinished badges", async () => {
+    const { page, errors } = await open("?scenario=incomplete-unfinished", "#/cost");
+    try {
+      await page.waitForSelector(".repair-table");
+      const warningText = await page.locator(".repair-warning").textContent();
+      assert.match(warningText ?? "", /Incomplete events/);
+      assert.match(
+        warningText ?? "",
+        /Event coverage is incomplete for 2 of 5 examined runs; loop counts may undercount actual repairs\./,
+      );
+
+      const repairText = await page.locator(".repair-section").textContent();
+      assert.match(
+        repairText ?? "",
+        /2 of 3 loops are unfinished and excluded from token\/USD medians until final session usage settles\./,
+      );
+
+      const costCells = await page.locator(".repair-table tbody td[data-label='Measured cost']").allTextContents();
+      assert.deepEqual(costCells, ["21.0K tok · $0.19", "In progress", "Unfinished"]);
+      assert.deepEqual(errors, []);
+    } finally {
+      await page.close();
+    }
+  });
+
+  test("empty loops with incomplete event coverage explains reconstruction gap", async () => {
+    const { page, errors } = await open("?scenario=empty-incomplete", "#/cost");
+    try {
+      await page.waitForSelector(".repair-warning");
+      const repairText = await page.locator(".repair-section").textContent();
+      assert.match(
+        repairText ?? "",
+        /Event coverage is incomplete for 3 of 4 examined runs; loop counts may undercount actual repairs\./,
+      );
+      assert.match(
+        repairText ?? "",
+        /No repair loops reconstructed from complete ledger events in this window\./,
+      );
+      assert.equal(await page.locator(".repair-table").count(), 0);
+      assert.deepEqual(errors, []);
+    } finally {
+      await page.close();
+    }
+  });
 });

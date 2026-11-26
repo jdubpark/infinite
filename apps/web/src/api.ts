@@ -255,6 +255,7 @@ export type GoalVerdictView = {
 
 export type RepairLoopCause = "review" | "check" | "delivery";
 export type RepairLoopOutcome = "resolved" | "blocked" | "cancelled" | "superseded" | "unresolved" | "in-progress";
+export type RepairEventCoverage = "complete" | "incomplete";
 export type RepairLoopSample = {
   runId: string;
   projectId: string;
@@ -271,11 +272,14 @@ export type RepairLoopSample = {
   failedCommit?: string;
   passingCommit?: string;
   measured: boolean;
+  unfinished?: true;
   tokens?: number;
   usd?: number;
 };
 export type RepairLoopTotals = {
   runsExamined: number;
+  eventCoverage?: RepairEventCoverage;
+  incompleteRuns?: number;
   loopsTotal: number;
   resolved: number;
   unresolved: number;
@@ -285,6 +289,7 @@ export type RepairLoopTotals = {
   failedResumes: number;
   measuredLoops: number;
   unmeasuredLoops: number;
+  unfinishedLoops?: number;
   unmeasuredMembers: number;
   medianMinutes: number | null;
   p90Minutes: number | null;

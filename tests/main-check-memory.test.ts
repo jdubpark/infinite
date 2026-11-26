@@ -331,23 +331,27 @@ test("a check that finishes while start tokens of its commands are still being r
   }
 });
 
-test("after a host stop, a live process in the group and session of a command whose start token was never saved holds the copy, and once it ends the copy retires in the same boot (INF-502)", async () => {
+test("after a host stop, a live process in the group and session of any command whose start token was never saved holds the copy, and once it ends the copy retires in the same boot (INF-502)", async () => {
   for (const early of [0, 1]) {
-    const { host, directory, unread } = await finishedWithUnreadTokens(early);
-    const command = unread[0]!.pid;
-    const child = host.world.hide();
-    Object.assign(host.world.processes.get(child)!, { pgid: command, sid: command, uninspectable: false });
-    await host.service.close();
-    for (const { deliver } of unread) deliver();
-    await host.open();
-    for (let pass = 1; pass <= 3; pass += 1) {
-      await host.advance(PASS_MS);
-      assert.equal(retiringOf(host), 1, `${early} late token(s) saved, pass ${pass}: process ${child} in the group of command ${command} holds the copy`);
-      assert.equal(host.view().waiting, "processes");
+    const first = await finishedWithUnreadTokens(early);
+    await first.host.service.close();
+    for (const [index, { pid: command }] of first.unread.entries()) {
+      const { host, directory, unread } = await finishedWithUnreadTokens(early);
+      assert.equal(unread[index]?.pid, command, "every run starts the same commands");
+      const child = host.world.hide();
+      Object.assign(host.world.processes.get(child)!, { pgid: command, sid: command, uninspectable: false });
+      await host.service.close();
+      for (const { deliver } of unread) deliver();
+      await host.open();
+      for (let pass = 1; pass <= 3; pass += 1) {
+        await host.advance(PASS_MS);
+        assert.equal(retiringOf(host), 1, `${early} late token(s) saved, pass ${pass}: process ${child} in the group of command ${command} holds the copy`);
+        assert.equal(host.view().waiting, "processes");
+      }
+      host.world.end(child);
+      await untilRetired(host);
+      assert.equal(retiringOf(host), 0, `${early} late token(s) saved: the copy retired in the same boot once process ${child} ended`);
+      assert.equal(host.world.runs.get(`${ANCHOR_ROOT}/${directory}`)?.exists, false, "the copy was removed");
     }
-    host.world.end(child);
-    await untilRetired(host);
-    assert.equal(retiringOf(host), 0, `${early} late token(s) saved: the copy retired in the same boot once that process ended`);
-    assert.equal(host.world.runs.get(`${ANCHOR_ROOT}/${directory}`)?.exists, false, "the copy was removed");
   }
 });

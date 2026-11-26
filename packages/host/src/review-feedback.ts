@@ -18,13 +18,14 @@ export type ReviewIntake = { intents: ReviewIntent[]; handled: string[]; accepte
 export type OwnerReview = { id: string; state: ReviewFeedbackEntry["state"]; submittedAt: string; body: string; commit?: string };
 
 const commit = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i).transform(value => value.toLowerCase());
+const reviewCommitOid = z.union([commit, z.literal("")]).nullable().optional();
 const reviewSchema = z.object({
   id: z.string().min(1).max(200),
-  author: z.object({ login: z.string().max(100) }).passthrough().nullable().optional(),
+  author: z.object({ login: z.string().max(100).nullable().optional() }).passthrough().nullable().optional(),
   state: z.string().max(40),
   submittedAt: z.iso.datetime({ offset: true }).nullable().optional(),
   body: z.string().max(1_000_000).nullable().optional(),
-  commit: z.object({ oid: commit }).passthrough().nullable().optional(),
+  commit: z.object({ oid: reviewCommitOid }).passthrough().nullable().optional(),
 }).passthrough();
 const pullRequestSchema = z.object({
   state: z.enum(["OPEN", "CLOSED", "MERGED"]),
@@ -76,9 +77,10 @@ export function newestOwnerReview(pr: Pick<PullRequestRead, "reviews">, ownerLog
   const owner = ownerLogin.toLowerCase();
   let newest: OwnerReview | undefined;
   for (const review of pr.reviews) {
-    if (review.author?.login.toLowerCase() !== owner || !COUNTED.has(review.state) || !review.submittedAt) continue;
+    const login = review.author?.login?.toLowerCase();
+    if (!login || login !== owner || !COUNTED.has(review.state) || !review.submittedAt) continue;
     const candidate: OwnerReview = { id: review.id, state: review.state as OwnerReview["state"], submittedAt: review.submittedAt, body: review.body ?? "",
-      ...(review.commit ? { commit: review.commit.oid } : {}) };
+      ...(review.commit?.oid ? { commit: review.commit.oid } : {}) };
     const order = newest ? Date.parse(candidate.submittedAt) - Date.parse(newest.submittedAt) : 1;
     if (order > 0 || order === 0 && newest && candidate.id > newest.id) newest = candidate;
   }

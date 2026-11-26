@@ -13,6 +13,7 @@ export type TakenCensus = { at: string; operation?: { pendingId: string; result:
 export type FenceHost = Pick<TeamKernel, "records" | "commands" | "config" | "save" | "event" | "enqueue"> & { readonly options: TeamServiceOptions | undefined };
 type OperationCensus = NonNullable<Stored["census"]>;
 type CensusState = OperationCensus["state"];
+const SEVERITY: CensusState[] = ["ended", "unknown", "in-use", "running"];
 type Fenced = {
   pending?: { id: string; failure?: { code?: string }; processesEnded?: OwnerStatement };
   census?: { pendingId: string; state: CensusState };
@@ -94,7 +95,13 @@ export class CommandFence {
     if (leftover && stored.leftover?.witness !== leftover.record.witness) return undefined;
     const state = operation ? this.applyOperation(stored, taken.at, censusCounts(operation.result)) : "ended";
     const left = leftover ? this.applyLeftover(stored, taken.at, censusCounts(leftover.result)) : "ended";
-    return state === "ended" ? left : state;
+    return SEVERITY.indexOf(left) > SEVERITY.indexOf(state) ? left : state;
+  }
+  busy(stored: Stored) {
+    const left = stored.leftover?.census?.state;
+    return left === "running" || left === "in-use"
+      ? new TeamError(409, "team-command-running", "The host still sees a process an earlier command of this run left behind, or a process using this run's directory, so it does not accept the statement. Retry after it has exited.")
+      : new TeamError(409, "team-command-running", "The host still sees processes of this run's operation, or processes using its directory, so it does not accept the statement. Retry after they have exited.");
   }
   private applyLeftover(stored: Stored, at: string, counts: ReturnType<typeof censusCounts>): CensusState {
     const current = stored.leftover!;

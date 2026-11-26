@@ -176,7 +176,10 @@ test("an active run keeps an integrated member clone while it records a process 
     assert.equal(teams.get(f.run.id).members.find(item => item.memberId === member.memberId)?.workspaceRemovedAt, undefined);
     assert.equal(teams.get(f.run.id).leftoverProcesses?.state, "unchecked", "an active run takes no census for the record");
     (teams as unknown as Internals).records.get(f.run.id)!.leftover = undefined;
-    await waitFor(() => !existsSync(cwd), "the clone should be removed once the record is gone");
+    const stepped = passes.count;
+    await waitFor(() => passes.count >= stepped + 2, "the scheduler should step the run again", 30_000);
+    await teams.idle();
+    assert.equal(existsSync(cwd), false, "the clone is removed once the record is gone");
     assert.equal(teams.get(f.run.id).status, "implementing");
   } finally { await close(f, teams); }
 });

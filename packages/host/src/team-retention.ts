@@ -365,8 +365,9 @@ export class TeamRetention {
     const state = taken && this.host.fence.apply(stored, taken);
     const pendingCleared = !stored.pending?.witness || (taken?.operation?.pendingId === stored.pending.id && processesCleared(stored));
     if (state !== undefined && pendingCleared && !stored.leftover) return;
-    if (!stored.leftover) throw this.operationRunning(stored);
-    if (state === "unknown") throw new TeamError(409, "team-leftover-unknown", "The host cannot tell whether a process an earlier command of this run left behind still runs, so it keeps this run's directories. After checking the host, state that it ended with `infinite team processes-ended RUN_ID`, then retry removal.");
+    const left = state === undefined ? undefined : stored.leftover?.census?.state;
+    if (!stored.leftover || !pendingCleared && left !== "running" && left !== "in-use") throw this.operationRunning(stored);
+    if (left === "unknown") throw new TeamError(409, "team-leftover-unknown", "The host cannot tell whether a process an earlier command of this run left behind still runs, so it keeps this run's directories. After checking the host, state that it ended with `infinite team processes-ended RUN_ID`, then retry removal.");
     throw new TeamError(409, "team-leftover-running", "The host still sees a process an earlier command of this run left behind, or a process using this run's directory. Retry removal after it has exited.");
   }
   private async processesEnded(stored: Stored, witnessed: boolean) {

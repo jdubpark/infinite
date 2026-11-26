@@ -69,6 +69,30 @@ async function until(check: () => boolean, message: string, timeoutMs = 30_000) 
 }
 
 const code = (expected: string) => (error: unknown) => error instanceof TeamError && error.code === expected;
+
+function mixedProcesses(running: number): HostProcesses {
+  return { table: async () => ({ boot: "test-boot", rows: [] }), start: async () => "test-start",
+    census: async (recorded): Promise<CensusResult> => ({ ok: true, findings: [{ pid: 999, reason: "unreadable" as const },
+      ...(pidsOf(recorded).includes(running) ? [{ pid: running, reason: "recorded-group" as const }] : [])] }) };
+}
+
+function mixedRun(running: number) {
+  const f = schedulerFixture();
+  const at = settledRun(f, "cancelled");
+  f.run.events.push({ at, text: "Team cancelled." });
+  f.config.teams!.retention = { ...DEFAULT_TEAM_RETENTION, cancelledMinutes: 600 };
+  f.writeTeam();
+  const { teams, internal } = openTeam(f, () => Date.parse(at) + 1000, mixedProcesses(running));
+  const stored = internal.records.get(f.run.id)!;
+  stored.pending = { id: randomUUID(), kind: "check", revision: 1, witness: witness(101) };
+  stored.leftover = { since: at, witness: witness(202) };
+  return { f, teams, stored };
+}
+
+const MIXED = [
+  { running: 202, record: "the left process", removal: "team-leftover-running", removalText: "left behind", statementText: "left behind", states: ["unknown", "running"] },
+  { running: 101, record: "the operation", removal: "team-operation-running", removalText: "still sees, or cannot rule out", statementText: "processes of this run's operation", states: ["running", "unknown"] },
+] as const;
 const count = (teams: TeamService, run: TeamRun, text: string) => teams.get(run.id).events.filter(event => event.text === text).length;
 
 test("retention looks for an unfinished operation's processes and a left process separately, and records each record's result once while it stays the same", async () => {
@@ -192,5 +216,38 @@ test("a goal's resume within the census reuse window is not refused for a left p
     await goals.close();
     await teams.close();
     f.close();
+  }
+});
+
+test("removal answers from the record whose own look finds a process when the other record's look cannot tell", async () => {
+  for (const mixed of MIXED) {
+    const { f, teams } = mixedRun(mixed.running);
+    try {
+      const answered = await teams.removeRun(f.run.id).then(() => "removed", (error: unknown) => error);
+      assert.ok(code(mixed.removal)(answered) && (answered as TeamError).message.includes(mixed.removalText), `${mixed.record} runs: ${String(answered)}`);
+      const view = teams.get(f.run.id);
+      assert.deepEqual([view.pendingOperation?.processes, view.leftoverProcesses?.state], mixed.states);
+      assert.equal(existsSync(dirname(f.run.workspace)), true);
+    } finally {
+      await teams.close();
+      f.close();
+    }
+  }
+});
+
+test("the owner's statement is refused while either record's own look finds a process, and the refusal names that record", async () => {
+  for (const mixed of MIXED) {
+    const { f, teams, stored } = mixedRun(mixed.running);
+    try {
+      const answered = await teams.processesEnded(f.run.id, { requestId: randomUUID() }).then(() => "accepted", (error: unknown) => error);
+      assert.ok(code("team-command-running")(answered) && (answered as TeamError).message.includes(mixed.statementText), `${mixed.record} runs: ${String(answered)}`);
+      const view = teams.get(f.run.id);
+      assert.deepEqual([view.pendingOperation?.processes, view.leftoverProcesses?.state], mixed.states);
+      assert.equal((stored.pending as { processesEnded?: unknown }).processesEnded, undefined, "the statement is not recorded for the operation");
+      assert.equal(view.events.some(event => event.text.startsWith("The owner stated")), false);
+    } finally {
+      await teams.close();
+      f.close();
+    }
   }
 });

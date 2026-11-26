@@ -510,6 +510,10 @@ command's hold: `POST /api/teams/:id/processes-ended` with
 takes a look of its own for the statement. While it finds a process, the host
 answers `team-command-running` (409) and does not record the statement; the
 look's result is recorded as for any other look, with an event when it changed.
+The statement is refused in the same way while a process uses the run's
+directory, and while the look for either record finds a process even though
+the other record's look cannot tell; each refusal and each removal answer names
+the record whose look found the process.
 When it finds none,
 the record clears as after any look. When it cannot tell, the host records the
 statement as a run event that names what the look reported and clears the

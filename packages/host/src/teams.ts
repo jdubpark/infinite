@@ -1429,7 +1429,7 @@ export class TeamService {
       if (!pending?.witness && !stored.leftover) throw new TeamError(409, "team-no-process-record", "This run holds no record of an operation's processes, or of processes an earlier command left behind, for the owner to state as ended.");
       const state = taken && this.fence.apply(stored, taken);
       if (state === undefined) throw new TeamError(409, "team-operation-running", "The run's operation is running, or changed during the host's census. Retry the statement after it settles.");
-      if (state === "running" || state === "in-use") throw new TeamError(409, "team-command-running", "The host still sees processes of this run's operation, or processes using its directory, so it does not accept the statement. Retry after they have exited.");
+      if (state === "running" || state === "in-use") throw this.fence.busy(stored);
       if (state === "unknown") this.fence.state(stored, body.requestId);
       stored.receipts[body.requestId] = fingerprint;
       this.save(stored);

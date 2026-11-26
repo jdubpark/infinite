@@ -15,18 +15,21 @@ const repairLoopsQuerySchema = z.object({
 export interface RepairMetricsRouteDeps {
   runs: () => readonly TeamRun[];
   memberUsage: (runId: string, memberId: string) => SessionUsage | UnmeasuredUsage;
+  readable?: () => boolean;
   now?: () => number;
 }
 
 export function registerRepairMetricsRoute(app: Pick<express.Express, "get">, deps: RepairMetricsRouteDeps): void {
   app.get("/api/usage/repair-loops", (req, res) => {
     const query = repairLoopsQuerySchema.parse(req.query);
+    if (deps.readable && !deps.readable()) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
     const lookup = (member: TeamMember, _fallbackProvider: Provider): UsageTotals | undefined => {
       const found = deps.memberUsage(member.runId, member.memberId);
       if (!found.measured) {
         if (found.unavailable) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
         return undefined;
       }
+      if (found.coverage !== "complete" || found.pricing.unknown > 0) return undefined;
       return found;
     };
     const report = computeRepairLoopMetrics(deps.runs(), lookup, {

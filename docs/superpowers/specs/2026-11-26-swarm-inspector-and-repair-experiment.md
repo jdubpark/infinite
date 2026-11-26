@@ -6,12 +6,16 @@ Date: 2026-11-26. Status: accepted design and baseline instrumentation gate.
 
 Infinite coordinates multi-agent team runs on the host (`packages/host/src/teams.ts`), separating durable authority in sealed run records from SQLite-backed evidence and client projections.
 
-### Existing Observability & Coordination Primitives
+### Existing Observability & Coordination Primitives (on `main`)
 
-- **Blackboard (`packages/host/src/evidence/blackboard.ts`)**: Stores encrypted, typed run entries (`contract`, `finding`, `blocker`, `handoff`, `report`, `integration`, `check`, `direction`) in `evidence/evidence.sqlite3`. Workers post entries via session journals (`team-entry`) and read them through a read-only SQLite connection (`team-entry-read`) under fixed digest and call caps (`member_scopes`). The host remains the sole SQLite writer and the sealed run record remains the state authority.
+- **Blackboard (`packages/host/src/evidence/blackboard.ts`, `packages/host/src/evidence/reader.ts`, `packages/host/src/team-entry-route.ts`)**: Stores encrypted, typed run entries (`contract`, `finding`, `blocker`, `handoff`, `report`, `integration`, `check`, `direction`) in `evidence/evidence.sqlite3`. Workers post entries via session journals (`team-entry`) and read entries via `EvidenceReader` through the `team-entry` worker route (`team-entry-route.ts`), recording `"team-entry-read"` session journal events under fixed digest and call caps (`member_scopes`). The host remains the sole SQLite writer and the sealed run record remains the state authority.
 - **MissionProgress (`packages/host/src/mission-progress.ts`)**: `MissionProgressService` and `projectMissionChild` project bounded snapshots of linked child runs, current-revision assignments, latest verification checks, and concurrent worker liveness probes for mission oversight.
-- **Web, CLI, and Mobile Run Inspector (`packages/host/src/team-list.ts`, `packages/host/src/team-watch.ts`, `packages/host/src/team-cli.ts`, `packages/host/src/server.ts`)**: Surfaces run status, member roles, task states, check results, open owner decisions, and live SSE topic updates (`/api/events`) without exposing internal continuation secrets (`TeamView` strips `prompt`, `nativeSessionId`, `continuation`, and `turns`).
-- **Spinner-Immune Stall Detection and Wait Reasons (`packages/host/src/teams.ts`)**: Distinguishes active work and explicit wait states (`needs-you` attention prompts, `pendingLimit` provider cooldowns, host load holds, and Linear tracking holds) from true inactivity before triggering `replaceStalledMember`. Explicit wait reasons (`run.reason`, `member.stoppedReason`, `member.stalledAt`) separate operator/provider waits from silent stalls.
+- **Host and CLI Team Surfaces (`packages/host/src/team-list.ts`, `packages/host/src/team-watch.ts`, `packages/host/src/team-cli.ts`, `packages/host/src/server.ts`)**: Expose run status, member roles, task states, check results, open owner decisions, and live SSE topic updates (`/api/events`) while stripping internal continuation secrets from `TeamView` (`prompt`, `nativeSessionId`, `continuation`, and `turns`).
+- **Stall Replacement and Limit Fallback (`packages/host/src/teams.ts`)**: Uses inactivity quiet windows (`stallWindowFor`, `lastActivityAt`, `stalledAt`, `pendingLimit`) and recorded wait reasons (`run.reason`, `member.stoppedReason`) before triggering `replaceStalledMember` or `switchLimitedMember`.
+
+### Companion Inspector & Stall Hardening Work
+
+Planned companion PRs build on these primitives to add Web/CLI/Mobile Run Inspector views and spinner-immune stall detection with richer wait reasons, while this PR establishes baseline repair-loop measurement on `main` before altering repair execution.
 
 ### Baseline Measurement Before Execution Changes
 
@@ -48,8 +52,8 @@ Every measurement MUST honor strict denominator completeness:
 1. **Resolution latency (`medianMinutes`, `p90Minutes`)**:
    - Elapsed wall-clock time (`durationMs`) from the loop trigger timestamp (`changes-requested` `reportedAt`, failed `check` `finishedAt` leading into an integrator attempt, or `delivery-repair` `reportedAt`) to the resolution timestamp (`approved` `reviewer` `reportedAt` on a passing checked commit).
 2. **Measured repair cost (`medianTokens`, `medianUsd`)**:
-   - Sum of tokens (`input + output + reasoning + cacheRead + cacheWrite`) and priced USD across all integrator, check-associated, and re-review member attempts inside each loop where **every** member in the loop has measured usage.
-   - **Unmeasured honesty invariant**: Loops containing any unmeasured member are excluded from `medianTokens` and `medianUsd` and reported separately in `unmeasuredLoops` and `unmeasuredMembers`. Unmeasured work is **never** coerced to `0` tokens or `$0`.
+   - Sum of tokens (`input + output + reasoning + cacheRead + cacheWrite`) and priced USD across all integrator, check-associated, and re-review member attempts inside each loop where **every** member in the loop has complete, fully priced measured usage.
+   - **Unmeasured honesty invariant**: Loops containing any unmeasured, partial-coverage, or unpriced (`pricing.unknown > 0`) member are excluded from `medianTokens` and `medianUsd` and reported separately in `unmeasuredLoops` and `unmeasuredMembers`. Unmeasured work is **never** coerced to `0` tokens or `$0`.
 3. **Denominator completeness invariant**:
    - All repair loops in the window enter `loopsTotal`, including unresolved outcomes (`blocked`, `cancelled`, `superseded`, `unresolved`) and `in-progress` loops.
    - All integrator, verification check, and re-review attempts enter `attempts`, explicitly counting **cold replacements** (stalled, provider-limit-switched, retired, or evidence-rejected retries) and **failed resumes** (any member whose `turns` record a `resume` fallback to `start`, or whose `stoppedReason` records resume failure).

@@ -524,7 +524,241 @@ test("filters by projectId and days, skips replay runs, and caps sample at 50", 
   assert.equal(report.totals.loopsTotal, 55);
   assert.equal(report.loops.length, 50);
   assert.equal(report.loops[0]!.runId, "run-00");
+  assert.equal(report.loops[0]!.attempts, 3);
+  assert.equal(report.loops[0]!.tokens, 200);
+  assert.equal(report.loops[0]!.usd, 0.02);
   assert.equal(report.loops[49]!.runId, "run-49");
+  assert.equal(report.loops[49]!.attempts, 3);
+  assert.equal(report.loops[49]!.tokens, 200);
+  assert.equal(report.loops[49]!.usd, 0.02);
+});
+
+test("treats pricing.unknown > 0 and partial coverage as unmeasured in metrics and route", async () => {
+  const run = makeRun({
+    id: "run-pricing-unknown",
+    members: [
+      makeMember({ runId: "run-pricing-unknown", memberId: "r0", role: "reviewer", baseCommit: COMMIT_A, reportedAt: "2026-11-25T10:00:00.000Z", report: { kind: "review", verdict: "changes-requested", summary: "Fix" } }),
+      makeMember({ runId: "run-pricing-unknown", memberId: "i1", role: "integrator", baseCommit: COMMIT_A, startedAt: "2026-11-25T10:01:00.000Z", reportedAt: "2026-11-25T10:02:00.000Z", report: { kind: "result", summary: "Fixed" } }),
+      makeMember({ runId: "run-pricing-unknown", memberId: "r1", role: "reviewer", baseCommit: COMMIT_B, startedAt: "2026-11-25T10:03:00.000Z", reportedAt: "2026-11-25T10:04:00.000Z", report: { kind: "review", verdict: "approved", summary: "OK" } }),
+    ],
+    checks: [makeCheck({ status: "passed", round: 1, headCommit: COMMIT_B, startedAt: "2026-11-25T10:02:10.000Z", finishedAt: "2026-11-25T10:02:50.000Z" })],
+  });
+
+  const unknownUsage: UsageTotals = {
+    cost: 0,
+    tokens: { input: 500, output: 100, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+    messages: 1,
+    pricing: { configured: 0, catalog: 0, provider: 0, unknown: 1 },
+  };
+  const direct = computeRepairLoopMetrics(
+    [run],
+    member => member.memberId === "i1" ? makeUsage(0.2, 500) : unknownUsage,
+    { now: Date.parse("2026-11-26T00:00:00.000Z") },
+  );
+  assert.equal(direct.totals.measuredLoops, 0);
+  assert.equal(direct.totals.unmeasuredLoops, 1);
+  assert.equal(direct.totals.unmeasuredMembers, 1);
+  assert.equal(direct.totals.medianTokens, null);
+  assert.equal(direct.totals.medianUsd, null);
+  assert.equal(direct.loops[0]!.measured, false);
+  assert.equal(direct.loops[0]!.usd, undefined);
+
+  const app = express();
+  let mode: "partial" | "unknown" | "unreadable" = "partial";
+  registerRepairMetricsRoute(app, {
+    runs: () => mode === "unreadable" ? [] : [run],
+    readable: () => mode !== "unreadable",
+    memberUsage: (_runId, memberId) => mode === "partial"
+      ? (memberId === "i1" ? { ...makeUsage(0.2, 500), measured: true, coverage: "complete" } : { ...makeUsage(0.1, 300), measured: true, coverage: "partial", coverageReason: "drain-incomplete" })
+      : { ...unknownUsage, measured: true, coverage: "complete" },
+    now: () => Date.parse("2026-11-26T00:00:00.000Z"),
+  });
+  app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "unavailable") {
+      return void res.status(503).json({ error: "The usage ledger is unavailable" });
+    }
+    return void res.status(400).json({ error: "Invalid request" });
+  });
+
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise<void>(resolve => server.once("listening", resolve));
+  const port = (server.address() as { port: number }).port;
+  try {
+    const partialRes = await fetch(`http://127.0.0.1:${port}/api/usage/repair-loops`);
+    assert.equal(partialRes.status, 200);
+    const partialBody = await partialRes.json() as RepairLoopReport;
+    assert.equal(partialBody.totals.measuredLoops, 0);
+    assert.equal(partialBody.totals.unmeasuredLoops, 1);
+    assert.equal(partialBody.totals.unmeasuredMembers, 1);
+    assert.equal(partialBody.totals.medianUsd, null);
+
+    mode = "unknown";
+    const unknownRes = await fetch(`http://127.0.0.1:${port}/api/usage/repair-loops`);
+    assert.equal(unknownRes.status, 200);
+    const unknownBody = await unknownRes.json() as RepairLoopReport;
+    assert.equal(unknownBody.totals.measuredLoops, 0);
+    assert.equal(unknownBody.totals.unmeasuredLoops, 1);
+    assert.equal(unknownBody.totals.unmeasuredMembers, 2);
+    assert.equal(unknownBody.totals.medianUsd, null);
+
+    mode = "unreadable";
+    const unreadableRes = await fetch(`http://127.0.0.1:${port}/api/usage/repair-loops`);
+    assert.equal(unreadableRes.status, 503);
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test("preserves member order for same-millisecond delivery-repair + integrator and check ties", () => {
+  const ts = "2026-11-25T10:00:00.000Z";
+  const sameMsDelivery = makeRun({
+    id: "run-same-ms-delivery",
+    members: [
+      makeMember({
+        runId: "run-same-ms-delivery",
+        memberId: "del-0",
+        role: "delivery",
+        baseCommit: COMMIT_A,
+        startedAt: ts,
+        reportedAt: ts,
+        report: { kind: "delivery-repair", headCommit: COMMIT_A, summary: "Conflict" },
+      }),
+      makeMember({
+        runId: "run-same-ms-delivery",
+        memberId: "int-1",
+        role: "integrator",
+        baseCommit: COMMIT_A,
+        startedAt: ts,
+        reportedAt: ts,
+        report: { kind: "result", summary: "Rebased" },
+      }),
+      makeMember({
+        runId: "run-same-ms-delivery",
+        memberId: "rev-1",
+        role: "reviewer",
+        baseCommit: COMMIT_B,
+        startedAt: ts,
+        reportedAt: ts,
+        report: { kind: "review", verdict: "approved", summary: "OK" },
+      }),
+    ],
+    checks: [makeCheck({ status: "passed", round: 1, headCommit: COMMIT_B, startedAt: ts, finishedAt: ts })],
+  });
+
+  const report = computeRepairLoopMetrics([sameMsDelivery], () => makeUsage(0.1, 100), {
+    now: Date.parse("2026-11-26T00:00:00.000Z"),
+  });
+  assert.equal(report.totals.resolved, 1);
+  assert.deepEqual(report.totals.byCause, { review: 0, check: 0, delivery: 1 });
+  assert.equal(report.loops[0]!.attempts, 3);
+  assert.equal(report.loops[0]!.tokens, 200);
+  assert.equal(report.loops[0]!.usd, 0.2);
+});
+
+test("rejects resolution on missing check, stale round check, setup-only check, and evidence-rejected approval retry", () => {
+  const noCheckRun = makeRun({
+    id: "run-no-check",
+    status: "blocked",
+    members: [
+      makeMember({ runId: "run-no-check", memberId: "r0", role: "reviewer", baseCommit: COMMIT_A, reportedAt: "2026-11-25T10:00:00.000Z", report: { kind: "review", verdict: "changes-requested", summary: "Fix" } }),
+      makeMember({ runId: "run-no-check", memberId: "i1", role: "integrator", baseCommit: COMMIT_A, startedAt: "2026-11-25T10:01:00.000Z", reportedAt: "2026-11-25T10:02:00.000Z", report: { kind: "result", summary: "Fixed" } }),
+      makeMember({ runId: "run-no-check", memberId: "r1", role: "reviewer", baseCommit: COMMIT_B, startedAt: "2026-11-25T10:03:00.000Z", reportedAt: "2026-11-25T10:04:00.000Z", report: { kind: "review", verdict: "approved", summary: "Approved without check" } }),
+    ],
+  });
+
+  const staleCheckRun = makeRun({
+    id: "run-stale-check",
+    status: "blocked",
+    members: [
+      makeMember({ runId: "run-stale-check", memberId: "r0", role: "reviewer", baseCommit: COMMIT_A, reportedAt: "2026-11-25T10:00:00.000Z", report: { kind: "review", verdict: "changes-requested", summary: "Fix" } }),
+      makeMember({ runId: "run-stale-check", memberId: "i1", role: "integrator", baseCommit: COMMIT_A, startedAt: "2026-11-25T10:01:00.000Z", reportedAt: "2026-11-25T10:02:00.000Z", report: { kind: "result", summary: "Round 1" } }),
+      makeMember({ runId: "run-stale-check", memberId: "r1", role: "reviewer", baseCommit: COMMIT_B, startedAt: "2026-11-25T10:04:00.000Z", reportedAt: "2026-11-25T10:05:00.000Z", report: { kind: "review", verdict: "changes-requested", summary: "Round 2" } }),
+      makeMember({ runId: "run-stale-check", memberId: "i2", role: "integrator", baseCommit: COMMIT_B, startedAt: "2026-11-25T10:06:00.000Z", reportedAt: "2026-11-25T10:07:00.000Z", report: { kind: "result", summary: "Round 2 fix" } }),
+      makeMember({ runId: "run-stale-check", memberId: "r2", role: "reviewer", baseCommit: COMMIT_B, startedAt: "2026-11-25T10:08:00.000Z", reportedAt: "2026-11-25T10:09:00.000Z", report: { kind: "review", verdict: "approved", summary: "Stale commit" } }),
+    ],
+    checks: [
+      makeCheck({ status: "passed", round: 1, headCommit: COMMIT_B, startedAt: "2026-11-25T10:02:10.000Z", finishedAt: "2026-11-25T10:03:00.000Z" }),
+      makeCheck({ status: "failed", round: 2, headCommit: COMMIT_C, startedAt: "2026-11-25T10:07:10.000Z", finishedAt: "2026-11-25T10:07:50.000Z" }),
+    ],
+  });
+
+  const setupOnlyRun = makeRun({
+    id: "run-setup-only",
+    status: "blocked",
+    members: [
+      makeMember({ runId: "run-setup-only", memberId: "r0", role: "reviewer", baseCommit: COMMIT_A, reportedAt: "2026-11-25T10:00:00.000Z", report: { kind: "review", verdict: "changes-requested", summary: "Fix" } }),
+      makeMember({ runId: "run-setup-only", memberId: "i1", role: "integrator", baseCommit: COMMIT_A, startedAt: "2026-11-25T10:01:00.000Z", reportedAt: "2026-11-25T10:02:00.000Z", report: { kind: "result", summary: "Fixed" } }),
+      makeMember({ runId: "run-setup-only", memberId: "r1", role: "reviewer", baseCommit: COMMIT_B, startedAt: "2026-11-25T10:03:00.000Z", reportedAt: "2026-11-25T10:04:00.000Z", report: { kind: "review", verdict: "approved", summary: "Setup only" } }),
+    ],
+    checks: [
+      makeCheck({ status: "passed", phase: "setup", round: 1, headCommit: COMMIT_B, startedAt: "2026-11-25T10:02:10.000Z", finishedAt: "2026-11-25T10:02:50.000Z" }),
+    ],
+  });
+
+  const evidenceRetryRun = makeRun({
+    id: "run-evidence-retry",
+    brief: {
+      title: "UI change",
+      problem: "Broken button",
+      evidence: [{ source: "tests", observation: "fails" }],
+      dataShape: "string",
+      acceptance: ["Button works"],
+      expectedOutcome: "Works",
+      uiChanges: true,
+    },
+    members: [
+      makeMember({ runId: "run-evidence-retry", memberId: "r0", role: "reviewer", baseCommit: COMMIT_A, reportedAt: "2026-11-25T10:00:00.000Z", report: { kind: "review", verdict: "changes-requested", summary: "Fix" } }),
+      makeMember({ runId: "run-evidence-retry", memberId: "i1", role: "integrator", baseCommit: COMMIT_A, startedAt: "2026-11-25T10:01:00.000Z", reportedAt: "2026-11-25T10:02:00.000Z", report: { kind: "result", summary: "Fixed" } }),
+      makeMember({
+        runId: "run-evidence-retry",
+        memberId: "r1a",
+        role: "reviewer",
+        baseCommit: COMMIT_B,
+        startedAt: "2026-11-25T10:03:00.000Z",
+        reportedAt: "2026-11-25T10:04:00.000Z",
+        report: { kind: "review", verdict: "approved", summary: "Missing UI evidence" },
+      }),
+      makeMember({
+        runId: "run-evidence-retry",
+        memberId: "r1b",
+        role: "reviewer",
+        baseCommit: COMMIT_B,
+        startedAt: "2026-11-25T10:05:00.000Z",
+        reportedAt: "2026-11-25T10:06:00.000Z",
+        report: {
+          kind: "review",
+          verdict: "approved",
+          summary: "Verified UI",
+          uiEvidence: "Clicked button in browser",
+          acceptance: [{ criterion: 1, verdict: "verified", evidence: "Button worked" }],
+        },
+      }),
+    ],
+    checks: [
+      makeCheck({ status: "passed", round: 1, headCommit: COMMIT_B, startedAt: "2026-11-25T10:02:10.000Z", finishedAt: "2026-11-25T10:02:50.000Z" }),
+    ],
+  });
+
+  const report = computeRepairLoopMetrics(
+    [noCheckRun, staleCheckRun, setupOnlyRun, evidenceRetryRun],
+    () => makeUsage(0.05, 100),
+    { now: Date.parse("2026-11-26T00:00:00.000Z") },
+  );
+
+  assert.equal(report.totals.loopsTotal, 4);
+  assert.equal(report.totals.resolved, 1);
+  assert.equal(report.totals.unresolved, 3);
+
+  assert.equal(report.loops.find(loop => loop.runId === "run-no-check")!.outcome, "blocked");
+  assert.equal(report.loops.find(loop => loop.runId === "run-stale-check")!.outcome, "blocked");
+  assert.equal(report.loops.find(loop => loop.runId === "run-setup-only")!.outcome, "blocked");
+
+  const retrySample = report.loops.find(loop => loop.runId === "run-evidence-retry")!;
+  assert.equal(retrySample.outcome, "resolved");
+  assert.equal(retrySample.coldReplacements, 1);
+  assert.equal(retrySample.attempts, 4);
+  assert.equal(retrySample.finishedAt, "2026-11-25T10:06:00.000Z");
+  assert.equal(retrySample.durationMs, 360_000);
 });
 
 test("registerRepairMetricsRoute serves validated metrics and maps unavailable ledger to 503", async () => {

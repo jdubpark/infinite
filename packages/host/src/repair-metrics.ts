@@ -1,4 +1,5 @@
-import type { TeamCheck, TeamMember, TeamRun } from "./team-types.js";
+import { reviewEvidenceProblems } from "./team-acceptance.js";
+import type { TeamBrief, TeamCheck, TeamMember, TeamRun } from "./team-types.js";
 import type { Provider } from "./types.js";
 import type { UsageTotals } from "./usage.js";
 
@@ -60,17 +61,20 @@ interface CheckBatch {
   kind: "check";
   order: number;
   sortMs: number;
+  slot: number;
   round?: number;
   headCommit?: string;
   startedAt: string;
   finishedAt?: string;
   status: "running" | "passed" | "failed" | "interrupted";
+  hasVerificationCheck: boolean;
 }
 
 interface MemberItem {
   kind: "member";
   order: number;
   sortMs: number;
+  slot: number;
   member: TeamMember;
 }
 
@@ -83,6 +87,7 @@ interface OpenLoop {
   rounds: number;
   awaitingNewRound: boolean;
   lastRoleInRound?: "integrator" | "reviewer";
+  latestCheck: CheckBatch | null;
   members: TeamMember[];
   checkBatches: CheckBatch[];
   coldReplacements: number;
@@ -132,17 +137,20 @@ function batchChecks(checks: readonly TeamCheck[]): CheckBatch[] {
     const canAppend = Boolean(current && sameRound && current.status !== "failed" && current.status !== "interrupted");
     if (canAppend && current) {
       current.finishedAt = check.finishedAt ?? current.finishedAt;
+      if (check.phase !== "setup") current.hasVerificationCheck = true;
       if (check.status === "failed" || check.status === "interrupted" || check.status === "running") current.status = check.status;
     } else {
       batches.push({
         kind: "check",
         order: index,
         sortMs: ms,
+        slot: index,
         round: check.round,
         headCommit: check.headCommit,
         startedAt: check.startedAt,
         finishedAt: check.finishedAt,
         status: check.status,
+        hasVerificationCheck: check.phase !== "setup",
       });
     }
   }
@@ -157,28 +165,60 @@ function memberSortMs(member: TeamMember): number {
     ?? Number.POSITIVE_INFINITY;
 }
 
-function itemRank(item: TimelineItem): number {
-  if (item.kind === "check") return item.status === "failed" ? 0 : 2;
-  if (item.member.role === "integrator") return 1;
-  if (item.member.role === "reviewer") return 3;
-  return 4;
+function checkSlotForTie(batch: CheckBatch, sameTimeMembers: readonly MemberItem[]): number {
+  if (sameTimeMembers.length === 0) return batch.order;
+  if (batch.round === 0) return -0.5;
+  if (batch.status === "failed") {
+    const targetIntegrator = sameTimeMembers.find(item =>
+      item.member.role === "integrator"
+      && (batch.headCommit === undefined || item.member.baseCommit === batch.headCommit)
+      && (parseTime(batch.finishedAt) ?? batch.sortMs) <= (parseTime(item.member.startedAt) ?? item.sortMs),
+    );
+    if (targetIntegrator) return targetIntegrator.slot - 0.5;
+  }
+  if (batch.headCommit) {
+    const targetReviewer = sameTimeMembers.find(item =>
+      item.member.role === "reviewer" && item.member.baseCommit === batch.headCommit,
+    );
+    if (targetReviewer) return targetReviewer.slot - 0.5;
+  }
+  const integrators = sameTimeMembers.filter(item => item.member.role === "integrator");
+  if (batch.round !== undefined && batch.round >= 1 && integrators.length > 0) {
+    const target = integrators[Math.min(batch.round - 1, integrators.length - 1)]!;
+    return target.slot + 0.5;
+  }
+  const firstReviewer = sameTimeMembers.find(item => item.member.role === "reviewer");
+  if (firstReviewer) return firstReviewer.slot - 0.5;
+  const firstIntegrator = integrators[0];
+  if (firstIntegrator && batch.status === "failed") return firstIntegrator.slot - 0.5;
+  return sameTimeMembers.at(-1)!.slot + 0.5;
 }
 
 function buildTimeline(run: TeamRun, revision: number): TimelineItem[] {
   const checks = batchChecks(run.checks.filter(check => check.revision === revision));
   const members: MemberItem[] = run.members
     .filter(member => member.revision === revision && LOOP_ROLES.has(member.role))
-    .map((member, index) => ({ kind: "member", order: index, sortMs: memberSortMs(member), member }));
+    .map((member, index) => ({ kind: "member", order: index, sortMs: memberSortMs(member), slot: index, member }));
+  const membersBySortMs = new Map<number, MemberItem[]>();
+  for (const item of members) {
+    const group = membersBySortMs.get(item.sortMs);
+    if (group) group.push(item);
+    else membersBySortMs.set(item.sortMs, [item]);
+  }
+  for (const batch of checks) {
+    batch.slot = checkSlotForTie(batch, membersBySortMs.get(batch.sortMs) ?? []);
+  }
   return [...checks, ...members].sort((a, b) => {
     if (a.sortMs !== b.sortMs) return a.sortMs - b.sortMs;
-    const rankDiff = itemRank(a) - itemRank(b);
-    if (rankDiff !== 0) return rankDiff;
+    if (a.slot !== b.slot) return a.slot - b.slot;
+    if (a.kind !== b.kind) return a.kind === "check" ? -1 : 1;
     return a.order - b.order;
   });
 }
 
-function hasPassingCheckForCommit(loop: OpenLoop, commit: string): boolean {
-  return loop.checkBatches.some(batch => batch.status === "passed" && (!batch.headCommit || batch.headCommit === commit));
+function briefForRevision(run: TeamRun, revision: number): TeamBrief | undefined {
+  if (revision === run.revision) return run.brief;
+  return run.continuations?.find(item => item.revision === revision)?.brief;
 }
 
 function endOutcome(run: TeamRun, revision: number): RepairLoopOutcome {
@@ -196,6 +236,7 @@ function finalizeLoop(
   outcome: RepairLoopOutcome,
   memberUsage: (member: TeamMember, fallbackProvider: Provider) => UsageTotals | undefined,
   finishedAt?: string,
+  passingCommit?: string,
 ): { sample: RepairLoopSample; unmeasuredMembers: number } {
   let failedResumes = 0;
   let unmeasuredMembers = 0;
@@ -205,7 +246,7 @@ function finalizeLoop(
   for (const member of loop.members) {
     if (hasFailedResume(member)) failedResumes += 1;
     const usage = memberUsage(member, run.provider);
-    if (!usage) {
+    if (!usage || usage.pricing.unknown > 0) {
       unmeasuredMembers += 1;
       allMeasured = false;
     } else {
@@ -216,7 +257,6 @@ function finalizeLoop(
   const startMs = parseTime(loop.startedAt);
   const finishMs = finishedAt ? parseTime(finishedAt) : undefined;
   const durationMs = startMs !== undefined && finishMs !== undefined ? Math.max(0, finishMs - startMs) : undefined;
-  const lastPassed = [...loop.checkBatches].reverse().find(batch => batch.status === "passed");
   const sample: RepairLoopSample = {
     runId: run.id,
     projectId: run.projectId,
@@ -231,7 +271,7 @@ function finalizeLoop(
     ...(finishedAt ? { finishedAt } : {}),
     ...(durationMs !== undefined ? { durationMs } : {}),
     ...(loop.failedCommit ? { failedCommit: loop.failedCommit } : {}),
-    ...(outcome === "resolved" && lastPassed?.headCommit ? { passingCommit: lastPassed.headCommit } : {}),
+    ...(outcome === "resolved" && passingCommit ? { passingCommit } : {}),
     measured: allMeasured,
     ...(allMeasured ? { tokens, usd: microUsd / 1_000_000 } : {}),
   };
@@ -245,6 +285,7 @@ function extractRevisionLoops(
 ): { sample: RepairLoopSample; unmeasuredMembers: number }[] {
   const timeline = buildTimeline(run, revision);
   const extracted: { sample: RepairLoopSample; unmeasuredMembers: number }[] = [];
+  const brief = briefForRevision(run, revision);
   let active: OpenLoop | null = null;
 
   for (let index = 0; index < timeline.length; index++) {
@@ -252,6 +293,7 @@ function extractRevisionLoops(
     if (item.kind === "check") {
       if (active) {
         active.checkBatches.push(item);
+        active.latestCheck = item;
         active.lastRoleInRound = undefined;
         if (item.status === "failed") active.awaitingNewRound = true;
       } else if (item.status === "failed") {
@@ -263,6 +305,7 @@ function extractRevisionLoops(
             failedCommit: item.headCommit,
             rounds: 1,
             awaitingNewRound: false,
+            latestCheck: item,
             members: [],
             checkBatches: [item],
             coldReplacements: 0,
@@ -276,6 +319,7 @@ function extractRevisionLoops(
     if (member.role === "integrator") {
       if (!active) continue;
       active.members.push(member);
+      active.latestCheck = null;
       if (active.awaitingNewRound) {
         active.rounds += 1;
         active.awaitingNewRound = false;
@@ -297,6 +341,7 @@ function extractRevisionLoops(
             failedCommit: member.baseCommit,
             rounds: 1,
             awaitingNewRound: false,
+            latestCheck: null,
             members: [],
             checkBatches: [],
             coldReplacements: 0,
@@ -307,14 +352,26 @@ function extractRevisionLoops(
       active.members.push(member);
       if (active.lastRoleInRound === "reviewer") active.coldReplacements += 1;
       else active.lastRoleInRound = "reviewer";
-      if (member.report?.kind === "review" && member.report.verdict === "approved" && hasPassingCheckForCommit(active, member.baseCommit)) {
-        const finishedAt = member.reportedAt ?? member.startedAt ?? run.updatedAt;
-        const finalized = finalizeLoop(run, revision, active, "resolved", memberUsage, finishedAt);
-        if (!finalized.sample.passingCommit) finalized.sample.passingCommit = member.baseCommit;
-        extracted.push(finalized);
-        active = null;
+
+      if (member.report?.kind === "review" && member.report.verdict === "approved") {
+        const nextItem = timeline[index + 1];
+        const replacedSameCommit = nextItem?.kind === "member"
+          && nextItem.member.role === "reviewer"
+          && nextItem.member.baseCommit === member.baseCommit;
+        const evidenceProblems = reviewEvidenceProblems(brief, member.report);
+        const checkReady = !active.awaitingNewRound
+          && active.latestCheck?.status === "passed"
+          && active.latestCheck.hasVerificationCheck
+          && (!active.latestCheck.headCommit || active.latestCheck.headCommit === member.baseCommit);
+        if (checkReady && evidenceProblems.length === 0 && !replacedSameCommit) {
+          const finishedAt = member.reportedAt ?? member.startedAt ?? run.updatedAt;
+          const passingCommit = active.latestCheck!.headCommit ?? member.baseCommit;
+          extracted.push(finalizeLoop(run, revision, active, "resolved", memberUsage, finishedAt, passingCommit));
+          active = null;
+        }
       } else if (member.report?.kind === "review" && member.report.verdict === "changes-requested") {
         active.awaitingNewRound = true;
+        active.latestCheck = null;
       }
       continue;
     }
@@ -327,12 +384,14 @@ function extractRevisionLoops(
           failedCommit: member.report.headCommit ?? member.baseCommit,
           rounds: 1,
           awaitingNewRound: false,
+          latestCheck: null,
           members: [],
           checkBatches: [],
           coldReplacements: 0,
         };
       } else {
         active.awaitingNewRound = true;
+        active.latestCheck = null;
       }
     }
   }

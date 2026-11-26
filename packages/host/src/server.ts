@@ -864,7 +864,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   });
   app.get("/api/usage/projects", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query); return void res.json(usage.projects({ tz: query.tz })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
   app.get("/api/usage/projects/:id", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query), result = usage.project(String(req.params.id), { tz: query.tz }); if (!result) return void res.status(404).json({ error: "Project usage not found" }); return void res.json(result); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
-  registerRepairMetricsRoute(app, { runs: () => teams.understandingRecords(), memberUsage: (runId, memberId) => usage.member(runId, memberId) });
+  registerRepairMetricsRoute(app, { runs: () => teams.understandingRecords(), memberUsage: (runId, memberId) => usage.member(runId, memberId), readable: () => usage.readable() });
   app.put("/api/usage/accounts/:id/plan", requireRole(["owner"]), (req, res) => {
     const accounts = config.usage?.accounts, accountId = String(req.params.id);
     const account = accounts && Object.hasOwn(accounts, accountId) ? accounts[accountId] : undefined;

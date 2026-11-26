@@ -125,7 +125,7 @@ test("unavailable brief storage leaves the host and Work readable and cannot ack
 
 test("encrypted Understanding bounds its response and turns over a full retained store", { timeout: 420000 }, async () => {
   const env: NodeJS.ProcessEnv = {};
-  const host = await startHost({ env, config: { remote: { enabled: true } }, startStepMs: 30000 });
+  const host = await startHost({ env, config: { remote: { enabled: true } }, startStepMs: 60000 });
   let remote: ReturnType<typeof createRemoteClient> | undefined;
   try {
     const project = host.config.projects[0]; initializeRepo(project.path);

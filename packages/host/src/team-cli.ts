@@ -8,7 +8,7 @@ import { pipeline } from "node:stream/promises";
 import { z } from "zod";
 import { createTeamSchema, gitBranchSchema, githubRepositorySchema, teamDeliverySchema, teamDeliveryReconcileSchema, teamPermissionsSchema, type ProjectSource, type TeamDelivery, DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE} from "./team-types.js";
 import { describeSource } from "./client.js";
-import type { ClientApi as Api, ClientConfig } from "./client-api.js";
+import { HttpError, type ClientApi as Api, type ClientConfig } from "./client-api.js";
 import { assertRoutingSupport, requestedRouting, ROUTING_AUTO_NOTE } from "./routing-cli.js";
 import { autonomyModeSchema } from "./autonomy.js";
 import type { EntryPage } from "./evidence/blackboard.js";
@@ -351,9 +351,9 @@ function outputTeam(team: any, json: boolean) {
     console.log(`Member ${clean(member.memberId)} (${clean(member.role)}): blocked on a permission (${clean(member.permissionBlocked.code)})`);
   for (const question of team.decisions ?? []) if (!question.answer) console.log(openQuestionLines(question).join("\n"));
 }
-function receipt(path: string, key: string, body: unknown) {
+function receipt(path: string, key: string, body: unknown, extra: Record<string, unknown> = {}) {
   const records = readPrivateJson(path, {}) as Record<string, unknown>;
-  const record = { requestId: (body as { requestId: string }).requestId, body, createdAt: new Date().toISOString(), state: "pending" };
+  const record = { requestId: (body as { requestId: string }).requestId, body, createdAt: new Date().toISOString(), state: "pending", ...extra };
   records[key] = record;
   privateJson(path, records);
 }
@@ -437,7 +437,16 @@ export const olderHost = (error: unknown): boolean => {
   const failure = error as { status?: unknown; code?: unknown } | null | undefined;
   return failure?.status === 404 && (failure.code === "route-not-found" || failure.code === undefined);
 };
-async function uploadCommit(api: Api, projectId: string, root: string, commit: string, tempStore: string, captured: (manifestId: string) => void) {
+async function uploadCommit(
+  api: Api,
+  projectId: string,
+  root: string,
+  commit: string,
+  tempStore: string,
+  captured: (manifestId: string) => void,
+  committing?: () => void,
+  committed?: () => void,
+) {
   const detail = await api.json<any>(`/projects/${projectId}`);
   if (detail.sync?.pendingGeneration) throw new Error("The cloud project has a pending sync generation. Resolve it before capturing local source.");
   const cloned = mkdtempSync(join(tmpdir(), "infinite-team-source-"));
@@ -463,13 +472,23 @@ async function uploadCommit(api: Api, projectId: string, root: string, commit: s
       },
       put: async (hash, bytes, signal) => { await (await api.request(`/projects/${projectId}/sync/blob/${hash}`, bytes, AbortSignal.any([signal, AbortSignal.timeout(CHUNK_TIMEOUT)]), octets, "PUT")).body?.cancel(); },
     } });
-    const committed = await api.json<any>(`/projects/${projectId}/sync/commit`, { generation, manifest }, undefined, syncHeaders, undefined, 300000);
+    committing?.();
+    const reply = await api.json<any>(`/projects/${projectId}/sync/commit`, { generation, manifest }, undefined, syncHeaders, undefined, 300000);
+    committed?.();
     const current = await api.json<any>(`/projects/${projectId}`);
-    return { manifestId: manifest.id, committed, sync: current.sync };
+    return { manifestId: manifest.id, committed: reply, sync: current.sync };
   } finally { rmSync(cloned, { recursive: true, force: true }); }
 }
 
-async function uploadEmptyBaseline(api: Api, projectId: string, sourceRoot: string, tempStore: string, captured: (manifestId: string) => void) {
+async function uploadEmptyBaseline(
+  api: Api,
+  projectId: string,
+  sourceRoot: string,
+  tempStore: string,
+  captured: (manifestId: string) => void,
+  committing?: () => void,
+  committed?: () => void,
+) {
   const baseline = mkdtempSync(join(tmpdir(), "infinite-team-empty-baseline-"));
   try {
     const objectFormat = git(sourceRoot, ["rev-parse", "--show-object-format=storage"]);
@@ -485,7 +504,7 @@ async function uploadEmptyBaseline(api: Api, projectId: string, sourceRoot: stri
     execFileSync("git", ["init", "--quiet", "--template=", "--initial-branch=main", `--object-format=${objectFormat}`], { cwd: baseline, stdio: "ignore", timeout: 10000, env: neutralEnv });
     execFileSync("git", ["-c", "user.name=Infinite", "-c", "user.email=baseline@infinite.invalid", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "-C", baseline, "commit", "--allow-empty", "-m", "Initial empty cloud baseline"], { encoding: "utf8", stdio: ["ignore", "ignore", "pipe"], timeout: 10000, env: neutralEnv });
     const commit = execFileSync("git", ["-C", baseline, "rev-parse", "--verify", "HEAD^{commit}"], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "pipe"], env: neutralEnv }).trim();
-    return await uploadCommit(api, projectId, baseline, commit, tempStore, captured);
+    return await uploadCommit(api, projectId, baseline, commit, tempStore, captured, committing, committed);
   } finally { rmSync(baseline, { recursive: true, force: true }); }
 }
 
@@ -663,12 +682,21 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       process.stderr.write(`[Infinite] Request ${requestId}\n`);
       const temp = mkdtempSync(join(tmpdir(), "infinite-team-blobs-"));
       sourceReceipt = readPrivateJson(receiptsPath, {})[uploadKey];
+      const noHostSync = !detail.sync?.lastSyncedAt && !detail.sync?.lastSyncedManifest && !detail.sync?.appliedManifest && !detail.sync?.pendingGeneration;
       if (sourceReceipt?.state === "pending") {
-        rmSync(temp, { recursive: true, force: true });
-        throw new Error("A prior source upload has an uncertain result. Inspect the cloud project before attempting another capture.");
+        const recoverablePreCommit = sourceReceipt.phase === "preparing" || (sourceReceipt.phase === undefined && noHostSync);
+        if (!recoverablePreCommit) {
+          rmSync(temp, { recursive: true, force: true });
+          throw new Error("A prior source upload has an uncertain result. Inspect the cloud project before attempting another capture.");
+        }
+        const cleared = readPrivateJson(receiptsPath, {}) as Record<string, any>;
+        delete cleared[uploadKey];
+        privateJson(receiptsPath, cleared);
+        sourceReceipt = undefined;
       }
       const alreadyUploaded = sourceReceipt?.state === "confirmed";
-      if (!alreadyUploaded) receipt(receiptsPath, uploadKey, { requestId, projectId: selected, commit: sourceRevision });
+      if (!alreadyUploaded) receipt(receiptsPath, uploadKey, { requestId, projectId: selected, commit: sourceRevision }, { phase: "preparing" });
+      let commitAttempted = false, commitCompleted = false;
       try {
         if (!alreadyUploaded) {
           const captured = (manifestId: string) => {
@@ -676,9 +704,16 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
             prepared[uploadKey] = { ...prepared[uploadKey], manifestId };
             privateJson(receiptsPath, prepared);
           };
+          const committing = () => {
+            commitAttempted = true;
+            const prepared = readPrivateJson(receiptsPath, {}) as Record<string, any>;
+            prepared[uploadKey] = { ...prepared[uploadKey], phase: "committing" };
+            privateJson(receiptsPath, prepared);
+          };
+          const committed = () => { commitCompleted = true; };
           const result = head.commit
-            ? await uploadCommit(api, selected, root, head.commit, join(temp, "objects"), captured)
-            : await uploadEmptyBaseline(api, selected, root, join(temp, "objects"), captured);
+            ? await uploadCommit(api, selected, root, head.commit, join(temp, "objects"), captured, committing, committed)
+            : await uploadEmptyBaseline(api, selected, root, join(temp, "objects"), captured, committing, committed);
           if (result.committed.pendingGeneration || result.committed.appliedManifest !== result.manifestId || result.sync?.pendingGeneration || result.sync?.appliedManifest !== result.manifestId) {
             const reason = clean(result.sync?.pendingGeneration?.reason ?? result.committed.pendingGeneration?.reason ?? "not-applied");
             const pending = readPrivateJson(receiptsPath, {}) as Record<string, any>;
@@ -690,6 +725,19 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
           completed[uploadKey] = { ...completed[uploadKey], state: "confirmed" };
           privateJson(receiptsPath, completed);
         }
+      } catch (error) {
+        const preWriteCommitRefusal = !commitCompleted && error instanceof HttpError && (
+          [400, 401, 403, 404, 413].includes(error.status) ||
+          (error.status === 409 && ["stale-generation", "missing-content", "source-github"].includes(error.code ?? ""))
+        );
+        if (!alreadyUploaded && (!commitAttempted || preWriteCommitRefusal)) {
+          const cleared = readPrivateJson(receiptsPath, {}) as Record<string, any>;
+          if (cleared[uploadKey]?.state === "pending") {
+            delete cleared[uploadKey];
+            privateJson(receiptsPath, cleared);
+          }
+        }
+        throw error;
       } finally { rmSync(temp, { recursive: true, force: true }); }
     }
     assertSourceUnchanged();

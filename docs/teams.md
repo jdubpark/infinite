@@ -2810,7 +2810,7 @@ Observations are grouped into an episode held in the worker. An episode starts a
 - A limit seen in any session, team member or not, updates the host-level entry. Nothing else happens to a non-team session.
 - Clients show the entry on the Teams list and the observation on session rows. Reset times are the provider's own statement, and a missing time means the provider gave none.
 
-The Codex working rule in a member prompt is recognised by exact text, so a retarget after a limit can find it. `packages/host/src/team-rule-texts.ts` lists every rule text main has generated; the list is append-only. When a member tool schema changes, the generated rule changes with it, and `tests/team-prompt-retarget.test.ts` fails until the new text is appended to the list and its hash to the pin.
+Member records persist structured prompt sections (`promptSections`) alongside the rendered `prompt` string. On launch and on provider-limit retargeting, the host renders provider-specific profile, escalation, Codex sandbox and tool-signature, context, entry, and reporting blocks deterministically from those sections in `packages/host/src/team-prompt-sections.ts`, so wording or tool-schema updates never strand live prompts. Persisted pre-upgrade member records that only carry `prompt` continue to load and fail closed on unrecognized legacy retargets.
 
 ### What the host never does
 

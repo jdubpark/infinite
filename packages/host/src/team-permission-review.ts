@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import type { Manager } from "./manager.js";
 import { accountSettingPrompt, type Prompt } from "@infinite/attention";
-import { ownerDirectionLines, permissionFollowUpPrompt, teamDeliveryBranch, teamPrompt, withoutRouting } from "./team-prompts.js";
+import { ownerDirectionLines, permissionFollowUpPromptSpec, setMemberPrompt, teamDeliveryBranch, teamPromptSpec, withoutRouting, type BuiltPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { assertMemberReadOnly, memberChangedPaths, prepareMemberWorkspace, TeamError } from "./team-workspace.js";
 import { isCollapsedPermissionPrompt, oneShotPermissionOption, permissionAuthorityHash, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
@@ -358,12 +358,12 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
         decision.reviewerProfileId = member.modelProfile.id;
         decision.reviewerProfileHash = digest(member.modelProfile);
       }
-      let turnPrompt: string;
+      let turnPrompt: BuiltPrompt;
       try {
-        try { turnPrompt = permissionFollowUpPrompt(feedback(permissionRecoveryHistory), ownerDirectionLines(run)); }
+        try { turnPrompt = permissionFollowUpPromptSpec(feedback(permissionRecoveryHistory), ownerDirectionLines(run)); }
         catch (error) {
           if (!tooLarge(error) || !permissionRecoveryHistory.length) throw error;
-          turnPrompt = permissionFollowUpPrompt(feedback([]), ownerDirectionLines(run));
+          turnPrompt = permissionFollowUpPromptSpec(feedback([]), ownerDirectionLines(run));
         }
       } catch (error) {
         if (!tooLarge(error)) throw error;
@@ -384,7 +384,7 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
         member.pendingLimit = undefined;
         member.report = undefined;
         member.exitConfirmedAt = undefined;
-        member.prompt = turnPrompt;
+        setMemberPrompt(member, turnPrompt);
         member.pendingFeedback = feedback(permissionRecoveryHistory);
         member.continuation = { mode: "resume", nativeSessionId: member.nativeSessionId! };
         (member.turns ??= []).push({ sessionId, decisionId: decision.id, startedAt, mode: "resume" });
@@ -402,11 +402,11 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
     try {
       member = this.host.newMember(run, "permission-coordinator", "", run.headCommit!, undefined, undefined, reviewer);
       try {
-        member.prompt = teamPrompt(run, "permission-coordinator", undefined, feedback(permissionRecoveryHistory), member.provider ?? run.provider,
-          member.modelProfile, undefined, permissionRecoveryHistory);
+        setMemberPrompt(member, teamPromptSpec(run, "permission-coordinator", undefined, feedback(permissionRecoveryHistory), member.provider ?? run.provider,
+          member.modelProfile, undefined, permissionRecoveryHistory));
       } catch (error) {
         if (!tooLarge(error) || !permissionRecoveryHistory.length) throw error;
-        member.prompt = teamPrompt(run, "permission-coordinator", undefined, feedback([]), member.provider ?? run.provider, member.modelProfile, undefined, []);
+        setMemberPrompt(member, teamPromptSpec(run, "permission-coordinator", undefined, feedback([]), member.provider ?? run.provider, member.modelProfile, undefined, []));
       }
     } catch (error) {
       if (!tooLarge(error)) throw error;

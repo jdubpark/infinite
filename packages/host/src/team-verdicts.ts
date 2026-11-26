@@ -12,7 +12,8 @@ import type { TeamCommand, TeamMember, TeamModelProfile, TeamReport, TeamRun } f
 import { assertMemberReadOnly } from "./team-workspace.js";
 import { composeVerdict, deliveryReceiptOf, verdictRecord } from "./verdict-compose.js";
 import type { ComposedCriterion, ComposedVerdict } from "./verdict-compose.js";
-import { evaluatorPrompt, finalCheckRound, verdictContext } from "./verdict-prompt.js";
+import { evaluatorPromptSpec, finalCheckRound, verdictContext } from "./verdict-prompt.js";
+import type { TeamPromptSection } from "./team-prompt-sections.js";
 import type { VerdictContext } from "./verdict-prompt.js";
 import type { VerdictEventData } from "./verdict-store.js";
 import type { AssessedState, DeliveryFact, RunAssessment, VerdictCounts, VerdictReason, VerdictReport } from "./verdict-types.js";
@@ -52,7 +53,7 @@ export type VerdictHolder = { run: TeamRun; verdict?: VerdictState; objectiveRec
 
 export type VerdictHost = {
   holder(runId: string): VerdictHolder | undefined;
-  prepare(holder: VerdictHolder, onPrepared: (member: TeamMember) => void, prebuilt: { prompt: string; profile: TeamModelProfile }, onFailed: () => void): void;
+  prepare(holder: VerdictHolder, onPrepared: (member: TeamMember) => void, prebuilt: { prompt: string; promptSections?: TeamPromptSection[]; profile: TeamModelProfile }, onFailed: () => void): void;
   consume(holder: VerdictHolder, member: TeamMember): void;
   operation(holder: VerdictHolder, perform: (signal: AbortSignal) => Promise<boolean | undefined>, complete: (clean: boolean | undefined) => void, member: TeamMember): void;
   save(holder: VerdictHolder): void;
@@ -437,7 +438,7 @@ export class TeamVerdicts {
     this.host.prepare(holder, member => {
       const live = holder.verdict;
       if (live?.verdictId === verdictId && live.status === "evaluating") live.evaluatorMemberId = member.memberId;
-    }, { prompt: evaluatorPrompt(profile.provider, profile), profile }, () => {
+    }, { ...evaluatorPromptSpec(profile.provider, profile), profile }, () => {
       const live = holder.verdict;
       if (STOPPED.includes(holder.run.status) || holder.run.recovery?.status === "stopping") return;
       if (live?.verdictId === verdictId && live.status === "evaluating" && live.evaluatorMemberId === undefined) this.finish(holder, live, undefined, "evaluator-unavailable");

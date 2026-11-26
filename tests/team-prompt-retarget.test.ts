@@ -1,22 +1,37 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
+  appendBuiltPrompt,
   codexMemberToolInstructions,
   codexSandboxInstructions,
   contextAccessInstructions,
   entryInstructions,
+  escalationInstructions,
+  escalationSpec,
+  permissionFollowUpPromptSpec,
   profileInstructions,
   readOnlyWorkspaceInstructions,
+  refreshBuiltPrompt,
   refreshReportingInstructions,
+  renderPromptSections,
   reportingInstructions,
+  retargetBuiltPrompt,
   retargetPrompt,
+  retargetPromptSections,
   teamPrompt,
+  teamPromptSpec,
+  type TeamPromptSection,
 } from "../packages/host/src/team-prompts.js";
-import { KNOWN_RULE_TEXTS } from "../packages/host/src/team-rule-texts.js";
-import { intentCheckerPrompt } from "../packages/host/src/intent-prompt.js";
-import type { TeamMember, TeamModelProfile } from "../packages/host/src/team-types.js";
+import { intentCheckerPrompt, intentCheckerPromptSpec } from "../packages/host/src/intent-prompt.js";
+import { evaluatorPrompt, evaluatorPromptSpec } from "../packages/host/src/verdict-prompt.js";
+import { judgePrompt, judgePromptSpec } from "../packages/host/src/judge-prompt.js";
+import { commitProviderLimitSwitch, resolveProviderLimitLaunch } from "../packages/host/src/team-diagnostics.js";
+import type { Manager } from "../packages/host/src/manager.js";
+import { TeamService, type Stored } from "../packages/host/src/teams.js";
+import type { TeamLineup, TeamMember, TeamModelProfile, TeamRun } from "../packages/host/src/team-types.js";
 import { ENTRY_PROFILE, ENTRY_PROVIDERS, smallRun } from "./fixtures/team-prompt-run.js";
+import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
 test("refreshes a profile-less implementer prompt's reporting helper", () => {
   const prompt = teamPrompt(smallRun(), "implementer", undefined, undefined, "opencode");
@@ -310,46 +325,396 @@ test("seeded retarget comparisons preserve quoted prompt evidence across every r
   }
 });
 
-const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+const ALL_ROLES = [
+  "implementer",
+  "reviewer",
+  "project-manager",
+  "scout",
+  "integrator",
+  "delivery",
+  "permission-coordinator",
+] as const;
+const ENTRY_TOOL_ROLES = new Set(["implementer", "reviewer", "project-manager", "scout", "integrator"]);
 
-test("the known working rule texts are kept byte for byte", () => {
-  const pinned = [
-    "77d618fea6ee839cec3d9641f560e0ce2749985fc0330a1463b38c75470833b5",
-    "7595d799220ed280b9f93aacd694e6362570b107e7bb19ac814a8c431ae4ac10",
-    "e6ff71704aae9e01b8e94482cd8f49b02fd685de11b68cb863b6129f14888887",
-    "6896da1485bc8ccbafa98bc08d6a3f27eaf54884f17acdb68c4e725ff0845bab",
-  ];
-  assert.deepEqual(KNOWN_RULE_TEXTS.map(sha256), pinned,
-    "KNOWN_RULE_TEXTS is append-only: an existing entry is never edited or removed, and a new text is appended with its hash here.");
-});
-
-test("the generated working rule is one of the known rule texts", () => {
-  for (const entryTools of [false, true]) {
-    const generated = codexMemberToolInstructions(entryTools);
-    assert.ok(
-      KNOWN_RULE_TEXTS.includes(generated),
-      `entryTools ${entryTools}: append the new generated text to KNOWN_RULE_TEXTS in packages/host/src/team-rule-texts.ts and its hash to the pin in this file, and leave the earlier entries in place. Hash: ${sha256(generated)}. Text: ${JSON.stringify(generated)}`,
-    );
-  }
-});
-
-test("a prompt that carries any known working rule is retargeted to the current one", () => {
-  const codexProfile = { ...ENTRY_PROFILE, provider: "codex" as const };
-  for (const entryTools of [false, true]) {
-    const current = codexMemberToolInstructions(entryTools);
-    const prompt = teamPrompt(smallRun(entryTools ? { blackboard: { tools: true } } : {}), "implementer", undefined, undefined, "codex", codexProfile);
-    assert.equal(prompt.split(current).length - 1, 1, `entryTools ${entryTools} current prompt carries the rule once`);
-    const forClaude = retargetPrompt(prompt, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools });
-    assert.ok(forClaude);
-    assert.equal(forClaude.includes("Working rule for tools"), false, `entryTools ${entryTools} no Codex rule reaches Claude`);
-    const others = KNOWN_RULE_TEXTS.filter(rule => rule !== current);
-    assert.equal(others.length, KNOWN_RULE_TEXTS.length - 1);
-    for (const known of others) {
-      const carried = prompt.replace(current, known);
-      assert.notEqual(carried, prompt);
-      const label = `entryTools ${entryTools}, known text ${KNOWN_RULE_TEXTS.indexOf(known)}`;
-      assert.equal(retargetPrompt(carried, { provider: "codex", profile: codexProfile, role: "implementer", entryTools }), prompt, `${label}: Codex gets the current rule once`);
-      assert.equal(retargetPrompt(carried, { provider: "claude", profile: ENTRY_PROFILE, role: "implementer", entryTools }), forClaude, `${label}: Claude gets no rule, straight from the known text`);
+test("structured prompt sections render deterministically for Claude, Codex, OpenCode, and demo", () => {
+  const providers = ["claude", "codex", "opencode", "demo"] as const;
+  for (const provider of providers) {
+    const profile: TeamModelProfile = provider === "opencode"
+      ? { id: "deepseek-light", label: "DeepSeek", provider: "opencode", model: "deepseek/deepseek-flash", variant: "high", tier: "light" }
+      : { ...ENTRY_PROFILE, id: `${provider}-profile`, provider: provider === "demo" ? "claude" : provider };
+    for (const role of ALL_ROLES) {
+      for (const toolsOn of [false, true]) {
+        const run = smallRun(toolsOn ? { blackboard: { tools: true } } : {});
+        const entryTools = toolsOn && ENTRY_TOOL_ROLES.has(role);
+        const built = teamPromptSpec(run, role, undefined, undefined, provider, profile);
+        const target = { provider, profile, role, entryTools };
+        assert.equal(built.prompt, teamPrompt(run, role, undefined, undefined, provider, profile), `${role} ${provider}`);
+        assert.equal(renderPromptSections(built.promptSections, target), built.prompt, `${role} ${provider} deterministic re-render`);
+        assert.equal(renderPromptSections(built.promptSections, target), built.prompt, `${role} ${provider} repeatable re-render`);
+        const expectCodex = provider === "codex" && role !== "permission-coordinator";
+        assert.equal(built.prompt.includes(codexSandboxInstructions), expectCodex, `${role} ${provider} sandbox`);
+        assert.equal(built.prompt.includes(codexMemberToolInstructions(entryTools)), expectCodex, `${role} ${provider} tool rule`);
+        assert.equal(built.prompt.includes(reportingInstructions(provider)), true, `${role} ${provider} reporting`);
+        assert.equal(built.prompt.includes(entryInstructions(provider)), entryTools, `${role} ${provider} entry`);
+      }
     }
+    const checker = intentCheckerPromptSpec(provider, profile);
+    assert.equal(checker.prompt, intentCheckerPrompt(provider, profile));
+    assert.equal(renderPromptSections(checker.promptSections, { provider, profile, role: "intent-checker", entryTools: false }), checker.prompt);
+
+    const evaluator = evaluatorPromptSpec(provider, profile);
+    assert.equal(evaluator.prompt, evaluatorPrompt(provider, profile));
+    assert.equal(renderPromptSections(evaluator.promptSections, { provider, profile, role: "evaluator", entryTools: false }), evaluator.prompt);
+
+    const judge = judgePromptSpec(provider);
+    assert.equal(judge.prompt, judgePrompt(provider));
+    assert.equal(renderPromptSections(judge.promptSections, { provider, role: "judge", entryTools: false }), judge.prompt);
+    assert.equal(judge.prompt.includes("Requested runtime profile:"), false);
   }
+
+  const followUp = permissionFollowUpPromptSpec('{"decisionId":"d1"}', ["Keep checks strict."]);
+  assert.equal(renderPromptSections(followUp.promptSections, { provider: "claude", role: "permission-coordinator", entryTools: false }), followUp.prompt);
+  assert.equal(retargetPromptSections(followUp.promptSections, { provider: "codex", profile: { ...ENTRY_PROFILE, provider: "codex" }, role: "permission-coordinator", entryTools: false }), undefined);
+});
+
+test("structured retargeting switches providers, profiles, and escalation modes even when prior prose wording differs or quotes host blocks", () => {
+  const claudeProfile: TeamModelProfile = { id: "claude-light", label: "Claude Light", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" };
+  const codexProfile: TeamModelProfile = { id: "codex-light", label: "Codex Light", provider: "codex", model: "gpt-6-astra", effort: "low", tier: "light" };
+  const opencodeProfile: TeamModelProfile = { id: "deepseek-light", label: "DeepSeek", provider: "opencode", model: "deepseek/deepseek-flash", variant: "high", tier: "light" };
+  const strongEsc: TeamModelProfile = { id: "opus-strong", label: "Opus Strong", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" };
+  const secondEsc: TeamModelProfile = { id: "astra-strong", label: "Astra Strong", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" };
+
+  const quotedWholeBlock = [
+    "Owner quoted an ambiguous host block:",
+    codexSandboxInstructions,
+    codexMemberToolInstructions(true),
+    contextAccessInstructions(),
+    entryInstructions("codex"),
+    reportingInstructions("codex"),
+    escalationInstructions({ lineup: { coordinator: strongEsc, integrator: strongEsc, reviewer: secondEsc, implementers: [claudeProfile], escalations: [strongEsc] } }, claudeProfile.id)!,
+  ].join("\n\n");
+
+  const run = smallRun({
+    blackboard: { tools: true },
+    lineup: {
+      coordinator: strongEsc,
+      integrator: strongEsc,
+      reviewer: secondEsc,
+      implementers: [claudeProfile, codexProfile, opencodeProfile],
+      escalations: [strongEsc, secondEsc],
+    },
+    routing: {
+      mode: "auto",
+      algorithmVersion: 2,
+      knobs: { allowContributor: true, points: ["escalation"] },
+    } as TeamRun["routing"],
+    decisions: [{
+      id: "d-quote",
+      memberId: "owner",
+      revision: 1,
+      question: "Keep quoted evidence?",
+      options: [],
+      createdAt: "2026-11-01T00:00:00.000Z",
+      answer: quotedWholeBlock,
+      answeredBy: "owner",
+      answeredAt: "2026-11-01T00:01:00.000Z",
+    }],
+  });
+
+  const claudeBuilt = teamPromptSpec(run, "implementer", undefined, quotedWholeBlock, "claude", claudeProfile);
+  assert.equal(
+    retargetPrompt(claudeBuilt.prompt, { provider: "codex", profile: codexProfile, role: "implementer", entryTools: true }),
+    undefined,
+    "legacy flat string retargeter refuses the ambiguous quoted block",
+  );
+
+  const stalePersisted = {
+    prompt: "Pre-upgrade rendered prose with completely different Codex working rule and reporting wording.",
+    promptSections: claudeBuilt.promptSections,
+  };
+  const withNotes = appendBuiltPrompt(stalePersisted, ["User answered: Preserve the quote.", "Host-assigned task scratch directory: /srv/scratch/m1."]);
+
+  const toCodex = retargetBuiltPrompt(withNotes, {
+    provider: "codex",
+    profile: codexProfile,
+    role: "implementer",
+    entryTools: true,
+    escalation: { spec: { mode: "pool", pool: [strongEsc] } },
+  });
+  assert.ok(toCodex?.promptSections);
+  assert.equal(toCodex.prompt.split(codexSandboxInstructions).length - 1, 3, "two quoted copies plus one live Codex sandbox block");
+  assert.equal(toCodex.prompt.split(codexMemberToolInstructions(true)).length - 1, 3, "two quoted copies plus one live Codex tool rule");
+  assert.ok(toCodex.prompt.includes(profileInstructions(codexProfile)));
+  assert.equal(toCodex.prompt.split("to this approved pool:").length - 1, 3, "two quoted escalation copies plus one live escalation pool");
+  assert.ok(toCodex.prompt.includes(`to this approved pool: ${JSON.stringify([strongEsc])}`));
+  assert.ok(toCodex.prompt.includes("User answered: Preserve the quote."));
+  assert.ok(toCodex.prompt.includes("Host-assigned task scratch directory: /srv/scratch/m1."));
+
+  const toClaudeNoEsc = retargetBuiltPrompt(toCodex, {
+    provider: "claude",
+    profile: strongEsc,
+    role: "implementer",
+    entryTools: true,
+    escalation: { spec: undefined },
+  });
+  assert.ok(toClaudeNoEsc?.promptSections);
+  assert.equal(toClaudeNoEsc.prompt.split(codexSandboxInstructions).length - 1, 2, "live Codex sandbox block removed while quotes stay intact");
+  assert.equal(toClaudeNoEsc.prompt.split(codexMemberToolInstructions(true)).length - 1, 2, "live Codex rule removed while quotes stay intact");
+  assert.ok(toClaudeNoEsc.prompt.includes(profileInstructions(strongEsc)));
+  assert.ok(toClaudeNoEsc.prompt.includes(reportingInstructions("claude")));
+  assert.ok(toClaudeNoEsc.prompt.includes(entryInstructions("claude")));
+  assert.equal(toClaudeNoEsc.prompt.split("to this approved pool:").length - 1, 2, "live escalation omitted when spec is undefined while quoted copies stay intact");
+
+  const toOpenCodeHostEsc = retargetBuiltPrompt(toClaudeNoEsc, {
+    provider: "opencode",
+    profile: opencodeProfile,
+    role: "implementer",
+    entryTools: true,
+    escalation: { spec: escalationSpec(run, opencodeProfile.id) },
+  });
+  assert.ok(toOpenCodeHostEsc?.promptSections);
+  assert.ok(toOpenCodeHostEsc.prompt.includes(profileInstructions(opencodeProfile)));
+  assert.ok(toOpenCodeHostEsc.prompt.includes(reportingInstructions("opencode")));
+  assert.ok(toOpenCodeHostEsc.prompt.includes(entryInstructions("opencode")));
+  assert.ok(toOpenCodeHostEsc.prompt.includes("The host selects the stronger profile."));
+
+  const customStaticSections: TeamPromptSection[] = [
+    { kind: "text", text: "Completely revised intro wording from a future release." },
+    { kind: "profile" },
+    { kind: "text", text: "Completely revised body wording that never existed before." },
+    { kind: "codex" },
+    { kind: "context" },
+    { kind: "report" },
+  ];
+  const customCodex = retargetPromptSections(customStaticSections, {
+    provider: "codex",
+    profile: codexProfile,
+    role: "intent-checker",
+    entryTools: false,
+  });
+  assert.ok(customCodex);
+  assert.equal(
+    customCodex.prompt,
+    [
+      "Completely revised intro wording from a future release.",
+      profileInstructions(codexProfile),
+      "Completely revised body wording that never existed before.",
+      codexSandboxInstructions,
+      codexMemberToolInstructions(false),
+      contextAccessInstructions(),
+      reportingInstructions("codex"),
+    ].join("\n\n"),
+  );
+
+  const refreshed = refreshBuiltPrompt(
+    { prompt: "Old helper command prose", promptSections: judgePromptSpec("opencode").promptSections },
+    { provider: "opencode", role: "judge", entryTools: false },
+  );
+  assert.equal(refreshed.prompt, judgePrompt("opencode"));
+  assert.equal(
+    retargetPromptSections(judgePromptSpec("claude").promptSections, { provider: "codex", profile: codexProfile, role: "judge", entryTools: false }),
+    undefined,
+    "profile-less structured prompts refuse retargeting",
+  );
+});
+
+type PromptRetargetServiceInternal = {
+  records: Map<string, Stored>;
+  limits: { observe(limit: { provider: "claude" | "codex" | "opencode" | "demo"; detectedAt: string; resetsAt?: string; sessionId: string; runId?: string; confidence: "corroborated" }): void };
+  step(stored: Stored): Promise<void>;
+  switchLimitedMember(stored: Stored, member: TeamMember, limit: { kind: "limit"; limit: "usage" | "credits"; confidence: "corroborated"; message: string; resetsAt?: string; at: string; seq: number }): Promise<void>;
+};
+
+test("sealed persisted members re-render stale pre-upgrade wording from promptSections on launch and fallback, and redact promptSections from TeamView", async t => {
+  const f = schedulerFixture();
+  t.after(() => f.close());
+  const now = Date.parse("2026-11-26T09:00:00.000Z");
+  const claudeFallback: TeamModelProfile = { id: "claude-fallback", label: "Claude Fallback", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" };
+  const codexPrimary: TeamModelProfile = { id: "codex-primary", label: "Codex Primary", provider: "codex", model: "gpt-6-astra", effort: "low", tier: "light", limitFallback: "claude-fallback" };
+  const lineup: TeamLineup = {
+    coordinator: { id: "coord", label: "Coord", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" },
+    integrator: { id: "integ", label: "Integ", provider: "codex", model: "gpt-6-astra", effort: "high", tier: "strong" },
+    reviewer: { id: "rev", label: "Rev", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
+    implementers: [codexPrimary],
+    fallbacks: [claudeFallback],
+  };
+
+  f.config.teams!.stallMinutes = 60;
+  f.run.lineup = lineup;
+  f.run.provider = "codex";
+  f.run.blackboard = { tools: true };
+  f.run.status = "implementing";
+  f.run.headCommit = f.run.baseCommit;
+  f.run.tasks = [
+    { id: "t1", title: "Task 1", instructions: "Implement T1", agentProfileId: "codex-primary", paths: ["a.txt"], dependsOn: [], revision: 1, status: "running" },
+    { id: "t2", title: "Task 2", instructions: "Implement T2", agentProfileId: "codex-primary", paths: ["b.txt"], dependsOn: [], revision: 1, status: "running" },
+  ];
+  f.run.parallelism = 2;
+
+  const builtOne = appendBuiltPrompt(
+    teamPromptSpec(f.run, "implementer", f.run.tasks[0], undefined, "codex", codexPrimary),
+    "User answered: Keep existing API.",
+  );
+  const builtTwo = appendBuiltPrompt(
+    teamPromptSpec(f.run, "implementer", f.run.tasks[1], undefined, "codex", codexPrimary),
+    "User answered: Switch cleanly on limit.",
+  );
+
+  const memberOne: TeamMember = {
+    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "t1", entryTools: true,
+    provider: "codex", modelProfile: structuredClone(codexPrimary), sessionId: randomUUID(), title: "implementer: t1",
+    status: "queued", cwd: f.run.workspace, baseCommit: f.run.baseCommit,
+    prompt: "Stale pre-upgrade Codex prompt with obsolete tool-rule prose.",
+    promptSections: builtOne.promptSections,
+    cursor: 0, stopRequestId: randomUUID(),
+  };
+  const memberTwo: TeamMember = {
+    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "t2", entryTools: true,
+    provider: "codex", modelProfile: structuredClone(codexPrimary), sessionId: randomUUID(), title: "implementer: t2",
+    status: "queued", cwd: f.run.workspace, baseCommit: f.run.baseCommit,
+    prompt: "Stale pre-upgrade Codex prompt that should switch to Claude.",
+    promptSections: builtTwo.promptSections,
+    cursor: 0, stopRequestId: randomUUID(),
+  };
+  f.run.tasks[0]!.memberId = memberOne.memberId;
+  f.run.tasks[1]!.memberId = memberTwo.memberId;
+  f.run.members = [memberOne];
+  f.writeTeam();
+
+  const teams = new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { now: () => now });
+  t.after(() => teams.close());
+  const internal = teams as unknown as PromptRetargetServiceInternal;
+  const stored = internal.records.get(f.run.id)!;
+
+  const view = teams.get(f.run.id);
+  assert.equal("promptSections" in view.members[0]!, false, "TeamView omits internal promptSections");
+
+  await internal.step(stored);
+  assert.equal(f.launches.length, 1);
+  assert.equal(f.launches[0]!.provider, "codex");
+  assert.ok(f.launches[0]!.prompt.includes(codexSandboxInstructions), "same-provider launch renders current Codex sandbox block");
+  assert.ok(f.launches[0]!.prompt.includes(codexMemberToolInstructions(true)), "same-provider launch renders current Codex tool signatures");
+  assert.ok(f.launches[0]!.prompt.includes(entryInstructions("codex")));
+  assert.ok(f.launches[0]!.prompt.includes(reportingInstructions("codex")));
+  assert.ok(f.launches[0]!.prompt.includes("User answered: Keep existing API."));
+  assert.equal(f.launches[0]!.prompt.includes("Stale pre-upgrade Codex prompt"), false);
+
+  const codexLimit = { provider: "codex" as const, detectedAt: new Date(now).toISOString(), resetsAt: new Date(now + 10 * 60_000).toISOString(), expiresAt: new Date(now + 10 * 60_000).toISOString(), sessionId: "s-codex", confidence: "corroborated" as const };
+  const switchDecision = resolveProviderLimitLaunch(stored.run, memberTwo, [codexLimit], new Set(["codex"]));
+  assert.equal(switchDecision.kind, "switch");
+  const originalSections = memberTwo.promptSections;
+  const undo = commitProviderLimitSwitch(stored.run, memberTwo, switchDecision, () => {});
+  assert.equal(memberTwo.provider, "claude");
+  assert.ok(memberTwo.prompt.includes(reportingInstructions("claude")));
+  assert.equal(undo(), true);
+  assert.equal(memberTwo.provider, "codex");
+  assert.equal(memberTwo.prompt, "Stale pre-upgrade Codex prompt that should switch to Claude.");
+  assert.equal(memberTwo.promptSections, originalSections, "rollback restores original promptSections");
+
+  stored.run.members.push(memberTwo);
+  internal.limits.observe(codexLimit);
+  await internal.step(stored);
+  assert.equal(f.launches.length, 2);
+  assert.equal(f.launches[1]!.provider, "claude");
+  assert.equal(f.launches[1]!.profile?.id, "claude-fallback");
+  assert.ok(f.launches[1]!.prompt.includes(profileInstructions(claudeFallback)));
+  assert.ok(f.launches[1]!.prompt.includes(entryInstructions("claude")));
+  assert.ok(f.launches[1]!.prompt.includes(reportingInstructions("claude")));
+  assert.ok(f.launches[1]!.prompt.includes("User answered: Switch cleanly on limit."));
+  assert.equal(f.launches[1]!.prompt.includes(codexSandboxInstructions), false);
+  assert.equal(f.launches[1]!.prompt.includes("Working rule for tools:"), false);
+});
+
+test("legacy persisted prompt-only members load, retarget recognizable prompts, defer unrecognized ones, and upgrade on running limit switch", async t => {
+  const f = schedulerFixture();
+  t.after(() => f.close());
+  let now = Date.parse("2026-11-26T10:00:00.000Z");
+  const claudeFallback: TeamModelProfile = { id: "claude-fallback", label: "Claude Fallback", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" };
+  const codexPrimary: TeamModelProfile = { id: "codex-primary", label: "Codex Primary", provider: "codex", model: "gpt-6-astra", effort: "low", tier: "light", limitFallback: "claude-fallback" };
+  const lineup: TeamLineup = {
+    coordinator: { id: "coord", label: "Coord", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" },
+    integrator: { id: "integ", label: "Integ", provider: "codex", model: "gpt-6-astra", effort: "high", tier: "strong" },
+    reviewer: { id: "rev", label: "Rev", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
+    implementers: [codexPrimary],
+    fallbacks: [claudeFallback],
+  };
+
+  f.config.teams!.stallMinutes = 60;
+  f.run.lineup = lineup;
+  f.run.provider = "codex";
+  f.run.status = "implementing";
+  f.run.headCommit = f.run.baseCommit;
+  f.run.parallelism = 3;
+  f.run.tasks = [
+    { id: "legacy-ok", title: "Legacy recognizable", instructions: "Do ok", agentProfileId: "codex-primary", paths: ["a.txt"], dependsOn: [], revision: 1, status: "running" },
+    { id: "legacy-old-rule", title: "Legacy old rule", instructions: "Do old", agentProfileId: "codex-primary", paths: ["b.txt"], dependsOn: [], revision: 1, status: "running" },
+    { id: "legacy-running", title: "Legacy running", instructions: "Do running", agentProfileId: "codex-primary", paths: ["c.txt"], dependsOn: [], revision: 1, status: "running" },
+  ];
+
+  const currentCodexPrompt = teamPrompt(f.run, "implementer", f.run.tasks[0], undefined, "codex", codexPrimary);
+  const obsoleteRulePrompt = teamPrompt(f.run, "implementer", f.run.tasks[1], undefined, "codex", codexPrimary)
+    .replace(codexMemberToolInstructions(false), "Working rule for tools: obsolete schema wording from an older release.");
+  assert.notEqual(obsoleteRulePrompt, teamPrompt(f.run, "implementer", f.run.tasks[1], undefined, "codex", codexPrimary));
+
+  const legacyOk: TeamMember = {
+    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "legacy-ok",
+    provider: "codex", modelProfile: structuredClone(codexPrimary), sessionId: randomUUID(), title: "implementer: legacy-ok",
+    status: "queued", cwd: f.run.workspace, baseCommit: f.run.baseCommit, prompt: currentCodexPrompt, cursor: 0, stopRequestId: randomUUID(),
+  };
+  const legacyOldRule: TeamMember = {
+    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "legacy-old-rule",
+    provider: "codex", modelProfile: structuredClone(codexPrimary), sessionId: randomUUID(), title: "implementer: legacy-old-rule",
+    status: "queued", cwd: f.run.workspace, baseCommit: f.run.baseCommit, prompt: obsoleteRulePrompt, cursor: 0, stopRequestId: randomUUID(),
+  };
+  const legacyRunning: TeamMember = {
+    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "legacy-running",
+    provider: "codex", modelProfile: structuredClone(codexPrimary), sessionId: f.run.members[0]!.sessionId, title: "implementer: legacy-running",
+    status: "running", cwd: f.run.workspace, baseCommit: f.run.baseCommit, prompt: obsoleteRulePrompt, cursor: 0, stopRequestId: randomUUID(),
+    startedAt: new Date(now - 60_000).toISOString(),
+  };
+  f.run.decisions = [{
+    id: "d-legacy", memberId: legacyRunning.memberId, revision: 1, question: "Which format?", options: [],
+    createdAt: new Date(now - 30_000).toISOString(), answer: "Keep JSON.", answeredBy: "owner", answeredAt: new Date(now - 20_000).toISOString(),
+  }];
+  f.run.tasks[0]!.memberId = legacyOk.memberId;
+  f.run.tasks[1]!.memberId = legacyOldRule.memberId;
+  f.run.tasks[2]!.memberId = legacyRunning.memberId;
+  f.run.members = [legacyOk, legacyOldRule, legacyRunning];
+  f.writeTeam();
+
+  const teams = new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { now: () => now });
+  t.after(() => teams.close());
+  const internal = teams as unknown as PromptRetargetServiceInternal;
+  const stored = internal.records.get(f.run.id)!;
+  const codexReset = new Date(now + 10 * 60_000).toISOString();
+  internal.limits.observe({ provider: "codex", detectedAt: new Date(now).toISOString(), resetsAt: codexReset, sessionId: "s-codex", confidence: "corroborated" });
+
+  await internal.step(stored);
+  assert.equal(f.launches.length, 1, "recognizable legacy member switches onto Claude while unrecognized legacy member defers fail-closed");
+  assert.equal(f.launches[0]!.provider, "claude");
+  assert.ok(f.launches[0]!.prompt.includes(reportingInstructions("claude")));
+  assert.equal(f.launches[0]!.prompt.includes(codexSandboxInstructions), false);
+  assert.equal(stored.run.members[1]!.status, "queued");
+  assert.equal(stored.run.members[1]!.pendingLimit, true);
+
+  await internal.switchLimitedMember(stored, stored.run.members[2]!, {
+    kind: "limit", limit: "usage", confidence: "corroborated", message: "limit", resetsAt: codexReset, at: new Date(now).toISOString(), seq: 1,
+  });
+  const deadline = Date.now() + 10_000;
+  while (stored.pending && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+  await teams.idle();
+  const upgraded = stored.run.members.at(-1)!;
+  assert.equal(upgraded.taskId, "legacy-running");
+  assert.equal(upgraded.provider, "claude");
+  assert.ok(Array.isArray(upgraded.promptSections), "running legacy fallback rebuilds with structured promptSections");
+  assert.ok(upgraded.prompt.includes(reportingInstructions("claude")));
+  assert.ok(upgraded.prompt.includes("User answered: Keep JSON."));
+  assert.equal(upgraded.prompt.includes("obsolete schema wording"), false);
+
+  now = Date.parse(codexReset) + 1000;
+  await internal.step(stored);
+  const oldRuleLaunch = f.launches.find(launch => launch.requestId === stored.run.members[1]!.sessionId);
+  assert.ok(oldRuleLaunch, "deferred legacy prompt launches once Codex limit clears");
+  assert.equal(oldRuleLaunch!.provider, "codex");
+  assert.equal(oldRuleLaunch!.prompt.includes("obsolete schema wording"), true);
 });

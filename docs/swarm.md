@@ -104,7 +104,7 @@ Wait-reason kinds are ordered from highest actionability to structural waits:
 
 Swarm views render these indicators consistently from the same host projection:
 
-- **Lanes**: each unit label displays a wait-count pill (`1 wait` / `N waits`,
+- **Lanes**: each live unit label displays a wait-count pill (`1 wait` / `N waits`,
   with all summaries on hover), and agent mark titles append `provider limit`,
   `stalled`, or `spinner-only` when set.
 - **Wall**: standalone team headers and mission subteam sections display wait
@@ -141,7 +141,7 @@ unit or mission:
   resync banner (`MissionResyncBanner`) on `host-restarted`, `history-evicted`,
   `retention-gap`, `cursor-ahead`, `invalid-cursor`, or `mission-mismatch`,
   separates recorded state from live worker status, compacts finished subteam
-  assignments under `Finished (N)`, and lets owners inspect child subteam
+  assignments under `Finished (N)`, and lets paired viewers inspect child subteam
   Blackboard entries or open a child team directly. See [Missions](missions.md).
 
 ## Code context in the Graph view
@@ -185,7 +185,7 @@ drawn, because a coordinator belongs to no single project.
 
 ## Host endpoints
 
-All three are `GET`, open to every paired role, and admitted over the relay.
+All four are `GET`, open to every paired role, and admitted over the relay.
 
 | Endpoint | Returns |
 | --- | --- |
@@ -194,8 +194,11 @@ All three are `GET`, open to every paired role, and admitted over the relay.
 | `/api/teams/:id/context` | Touched files per member of a team run. |
 | `/api/sessions/:id/context` | Touched files for one session. |
 
-`/api/me` reports `capabilities.swarmContext` on a host that serves them, along
-with `providerCapabilities.<provider>.observesToolInputs` so clients derive
+`/api/me` reports `capabilities.swarmContext` on a host that serves the three
+code-map and context endpoints (`/api/projects/:id/graph/map?lane=`,
+`/api/teams/:id/context`, `/api/sessions/:id/context`) — not
+`/api/teams?view=list`, which is always available — along with
+`providerCapabilities.<provider>.observesToolInputs` so clients derive
 tool-input observability from host metadata rather than hardcoded provider IDs.
 On an older host the Graph view draws the swarm without a code map or observed
 touches.

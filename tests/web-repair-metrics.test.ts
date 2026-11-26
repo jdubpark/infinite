@@ -35,22 +35,27 @@ describe("web repair metrics Playwright E2E", { skip: skipBrowser }, () => {
 
   async function open(query = "", hash = "#/cost"): Promise<{ page: Page; errors: string[] }> {
     const page = await browser.newPage({ viewport: { width: 1360, height: 900 } });
-    const errors: string[] = [];
-    page.on("pageerror", error => errors.push(`pageerror: ${error.message}`));
-    page.on("console", msg => {
-      if (msg.type() === "error") errors.push(`console.error: ${msg.text()}`);
-    });
-    await page.route(`${ORIGIN}*`, route =>
-      route.fulfill({
-        contentType: "text/html",
-        body: '<!doctype html><html><head><link rel="icon" href="data:,"></head><body><div id="root"></div></body></html>',
-      }),
-    );
-    await page.goto(`${ORIGIN}${query}${hash}`);
-    await page.addStyleTag({ content: `html,body{margin:0;height:100%}${styles}` });
-    await page.addScriptTag({ content: script });
-    await page.waitForSelector(".cost-page");
-    return { page, errors };
+    try {
+      const errors: string[] = [];
+      page.on("pageerror", error => errors.push(`pageerror: ${error.message}`));
+      page.on("console", msg => {
+        if (msg.type() === "error") errors.push(`console.error: ${msg.text()}`);
+      });
+      await page.route(`${ORIGIN}*`, route =>
+        route.fulfill({
+          contentType: "text/html",
+          body: '<!doctype html><html><head><link rel="icon" href="data:,"></head><body><div id="root"></div></body></html>',
+        }),
+      );
+      await page.goto(`${ORIGIN}${query}${hash}`);
+      await page.addStyleTag({ content: `html,body{margin:0;height:100%}${styles}` });
+      await page.addScriptTag({ content: script });
+      await page.waitForSelector(".cost-page");
+      return { page, errors };
+    } catch (error) {
+      await page.close();
+      throw error;
+    }
   }
 
   test("renders mixed measured and unmeasured repair loops with denominator counts, gate status, and sample rows", async () => {
@@ -68,7 +73,7 @@ describe("web repair metrics Playwright E2E", { skip: skipBrowser }, () => {
       assert.match(text ?? "", /45\.2K median tokens/);
       assert.match(text ?? "", /2 unmeasured/);
       assert.match(text ?? "", /3 unmeasured members/);
-      assert.match(text ?? "", /2 cold · 1 resume/);
+      assert.match(text ?? "", /2 cold · 1 failed resume/);
       assert.match(text ?? "", /Review 2 · Check 1 · Delivery 1/);
       assert.match(text ?? "", /45\.2K tok · \$0\.42/);
       assert.match(text ?? "", /Unmeasured/);
@@ -89,12 +94,12 @@ describe("web repair metrics Playwright E2E", { skip: skipBrowser }, () => {
       await page.waitForSelector(".repair-table");
       const costKpi = await page.locator(".repair-kpi", { hasText: "Measured repair cost" }).textContent();
       assert.match(costKpi ?? "", /Unmeasured/);
-      assert.doesNotMatch(costKpi ?? "", /\$0(?:\.00)?\b/);
+      assert.doesNotMatch(costKpi ?? "", /\$0(?:\.00)?(?![.\d])/);
       assert.doesNotMatch(costKpi ?? "", /\b0\s+median tokens/i);
 
       const tableText = await page.locator(".repair-table tbody").textContent();
       assert.match(tableText ?? "", /Unmeasured/);
-      assert.doesNotMatch(tableText ?? "", /\$0(?:\.00)?\b/);
+      assert.doesNotMatch(tableText ?? "", /\$0(?:\.00)?(?![.\d])/);
 
       const requests = await page.evaluate(
         () => (window as unknown as { __repairMetricsTest: { requests: string[] } }).__repairMetricsTest.requests,

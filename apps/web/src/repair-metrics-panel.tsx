@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { useApi, type RepairLoopReport } from "./api";
 import { useLiveRefresh } from "./live-refresh";
@@ -12,30 +12,39 @@ import {
 
 export function RepairMetricsPanel({ projectId, days = DEFAULT_REPAIR_WINDOW_DAYS }: { projectId?: string; days?: number }) {
   const api = useApi();
-  const [report, setReport] = useState<RepairLoopReport | null>(null);
-  const [loadError, setLoadError] = useState<RepairLoopLoadError | null>(null);
+  const scopeKey = `${projectId ?? "all"}:${days}`;
+  const [reportState, setReportState] = useState<{ key: string; value: RepairLoopReport } | null>(null);
+  const [errorState, setErrorState] = useState<{ key: string; value: RepairLoopLoadError } | null>(null);
+
+  useEffect(() => {
+    setReportState(previous => (previous?.key === scopeKey ? previous : null));
+    setErrorState(previous => (previous?.key === scopeKey ? previous : null));
+  }, [scopeKey]);
+
+  const report = reportState?.key === scopeKey ? reportState.value : null;
+  const loadError = errorState?.key === scopeKey ? errorState.value : null;
 
   const view = useLiveRefresh(async current => {
     try {
       const next = await api<RepairLoopReport>(repairLoopsPath({ projectId, days }));
       if (current()) {
-        setReport(next);
-        setLoadError(null);
+        setReportState({ key: scopeKey, value: next });
+        setErrorState(null);
       }
       return 30000;
     } catch (error) {
       const classified = classifyRepairLoopError(error);
       if (current()) {
-        setLoadError(classified);
+        setErrorState({ key: scopeKey, value: classified });
         if (classified.kind === "unsupported" || classified.kind === "unavailable") {
-          setReport(null);
+          setReportState(null);
         }
       }
       if (classified.kind === "unsupported") return 300000;
       if (classified.kind === "unavailable") return 60000;
       throw error;
     }
-  }, 30000, `${projectId ?? "all"}:${days}`);
+  }, 30000, scopeKey);
 
   const headingMeta = report
     ? `last ${report.windowDays} days · ${report.totals.runsExamined} ${report.totals.runsExamined === 1 ? "run" : "runs"} examined`
@@ -120,7 +129,7 @@ export function RepairMetricsPanel({ projectId, days = DEFAULT_REPAIR_WINDOW_DAY
         <li className="repair-kpi">
           <span className="repair-kpi-label">Overhead & causes</span>
           <strong className="repair-kpi-figure">
-            {vm.overhead.coldReplacements} cold · {vm.overhead.failedResumes} resume
+            {vm.overhead.coldReplacements} cold · {vm.overhead.failedResumes} {vm.overhead.failedResumes === 1 ? "failed resume" : "failed resumes"}
           </strong>
           <span className="repair-kpi-sub">
             {vm.causes.map(item => `${item.label} ${item.count}`).join(" · ")}
@@ -155,7 +164,7 @@ export function RepairMetricsPanel({ projectId, days = DEFAULT_REPAIR_WINDOW_DAY
                   <strong><code>{sample.shortRunId}</code> · r{sample.revision}</strong>
                   <small>
                     {!projectId ? `${sample.projectId} · ` : ""}
-                    {sample.failedCommitShort ? `${sample.failedCommitShort}${sample.passingCommitShort ? ` -> ${sample.passingCommitShort}` : ""}` : sample.startedAt.slice(0, 10)}
+                    {sample.failedCommitShort ? `${sample.failedCommitShort}${sample.passingCommitShort ? ` -> ${sample.passingCommitShort}` : ""}` : sample.startedDate}
                   </small>
                 </th>
                 <td data-label="Cause">{sample.causeLabel}</td>

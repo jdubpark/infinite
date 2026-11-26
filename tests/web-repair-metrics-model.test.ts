@@ -10,6 +10,7 @@ import {
   formatRepairDurationMs,
   formatRepairMinutes,
   formatSampleCost,
+  formatTokenCount,
   repairLoopsPath,
 } from "../apps/web/src/repair-metrics-model";
 
@@ -87,8 +88,12 @@ test("repairLoopsPath builds overview and project-scoped query URLs", () => {
 test("unmeasured honesty invariant: null medians and unmeasured samples never coerce to 0 or $0", () => {
   assert.equal(formatRepairMinutes(null), "—");
   assert.equal(formatRepairDurationMs(undefined), "—");
+  assert.equal(formatRepairDurationMs(-100), "—");
+  assert.equal(formatRepairDurationMs(Number.NaN), "—");
   assert.equal(formatMedianTokens(null), "Unmeasured");
   assert.equal(formatMedianUsd(null), "Unmeasured");
+  assert.equal(formatTokenCount(45200), "45.2K");
+  assert.equal(formatTokenCount(125000), "125K");
 
   const unmeasuredSample = formatSampleCost({ measured: false, tokens: 0, usd: 0 });
   assert.equal(unmeasuredSample.measured, false);
@@ -99,6 +104,10 @@ test("unmeasured honesty invariant: null medians and unmeasured samples never co
   const missingFieldsSample = formatSampleCost({ measured: true, tokens: undefined, usd: undefined });
   assert.equal(missingFieldsSample.measured, false);
   assert.equal(missingFieldsSample.label, "Unmeasured");
+
+  const nonFiniteSample = formatSampleCost({ measured: true, tokens: Number.NaN, usd: Number.POSITIVE_INFINITY });
+  assert.equal(nonFiniteSample.measured, false);
+  assert.equal(nonFiniteSample.label, "Unmeasured");
 
   const zeroMeasuredSample = formatSampleCost({ measured: true, tokens: 0, usd: 0 });
   assert.equal(zeroMeasuredSample.measured, true);
@@ -215,15 +224,38 @@ test("buildRepairMetricsViewModel projects denominator counts, cause breakdown, 
   assert.equal(vm.cost.medianTokensText, "45.2K");
   assert.equal(vm.cost.medianUsdText, "$0.42");
   assert.equal(vm.samples[0]!.cost.label, "45.2K tok · $0.42");
+  assert.equal(vm.samples[0]!.startedDate, "2026-11-25");
   assert.equal(vm.samples[0]!.failedCommitShort, "aaaa111");
   assert.equal(vm.samples[0]!.passingCommitShort, "bbbb222");
+
+  const malformed = buildRepairMetricsViewModel(makeReport({
+    loops: [
+      {
+        ...makeReport().loops[1]!,
+        startedAt: "not-a-date",
+        durationMs: -50,
+      },
+    ],
+  }));
+  assert.equal(malformed.samples[0]!.startedDate, "—");
+  assert.equal(malformed.samples[0]!.durationText, "—");
 });
 
-test("classifyRepairLoopError separates 404 unsupported, 503 unavailable ledger, and generic errors", () => {
+test("classifyRepairLoopError separates 404/remote-403 unsupported, 503 unavailable ledger, and generic errors", () => {
   assert.deepEqual(classifyRepairLoopError({ status: 404 }), {
     kind: "unsupported",
     status: 404,
     message: "Repair-loop metrics are not available on this host.",
+  });
+  assert.deepEqual(classifyRepairLoopError({ status: 403, code: "remote-endpoint-denied" }), {
+    kind: "unsupported",
+    status: 403,
+    message: "Repair-loop metrics are not available on this host.",
+  });
+  assert.deepEqual(classifyRepairLoopError({ status: 403, code: "forbidden" }), {
+    kind: "failed",
+    status: 403,
+    message: "Repair-loop metrics could not be loaded.",
   });
   assert.deepEqual(classifyRepairLoopError({ status: 503 }), {
     kind: "unavailable",

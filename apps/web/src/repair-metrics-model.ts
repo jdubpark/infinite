@@ -50,6 +50,7 @@ export type RepairLoopSampleView = {
   coldReplacements: number;
   failedResumes: number;
   startedAt: string;
+  startedDate: string;
   durationText: string;
   failedCommitShort?: string;
   passingCommitShort?: string;
@@ -123,10 +124,13 @@ export function classifyRepairLoopError(error: unknown): RepairLoopLoadError {
   const status = typeof error === "object" && error !== null && "status" in error && typeof (error as { status: unknown }).status === "number"
     ? (error as { status: number }).status
     : undefined;
-  if (status === 404) {
+  const code = typeof error === "object" && error !== null && "code" in error && typeof (error as { code: unknown }).code === "string"
+    ? (error as { code: string }).code
+    : undefined;
+  if (status === 404 || (status === 403 && code === "remote-endpoint-denied")) {
     return {
       kind: "unsupported",
-      status: 404,
+      status,
       message: "Repair-loop metrics are not available on this host.",
     };
   }
@@ -151,13 +155,19 @@ export function formatRepairMinutes(value: number | null): string {
 }
 
 export function formatRepairDurationMs(durationMs: number | undefined): string {
-  if (durationMs === undefined || !Number.isFinite(durationMs)) return "—";
+  if (durationMs === undefined || !Number.isFinite(durationMs) || durationMs < 0) return "—";
   return formatRepairMinutes(durationMs / 60_000);
 }
 
+export function formatRepairDate(iso: string | undefined): string {
+  if (typeof iso !== "string" || !Number.isFinite(Date.parse(iso))) return "—";
+  return iso.slice(0, 10);
+}
+
 export function formatTokenCount(value: number): string {
+  if (!Number.isFinite(value)) return "Unmeasured";
   if (value >= 1e6) return `${(value / 1e6).toFixed(value >= 1e7 ? 0 : 1)}M`;
-  if (value >= 1000) return `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}K`;
+  if (value >= 1000) return `${(value / 1000).toFixed(value >= 100_000 ? 0 : 1)}K`;
   return String(Math.round(value));
 }
 
@@ -180,7 +190,13 @@ export function formatMedianUsd(value: number | null): string {
 }
 
 export function formatSampleCost(sample: Pick<RepairLoopSample, "measured" | "tokens" | "usd">): RepairSampleCostView {
-  if (!sample.measured || sample.tokens === undefined || sample.usd === undefined) {
+  if (
+    !sample.measured
+    || sample.tokens === undefined
+    || sample.usd === undefined
+    || !Number.isFinite(sample.tokens)
+    || !Number.isFinite(sample.usd)
+  ) {
     return {
       measured: false,
       label: "Unmeasured",
@@ -305,6 +321,7 @@ export function buildRepairMetricsViewModel(report: RepairLoopReport): RepairMet
       coldReplacements: loop.coldReplacements,
       failedResumes: loop.failedResumes,
       startedAt: loop.startedAt,
+      startedDate: formatRepairDate(loop.startedAt),
       durationText: formatRepairDurationMs(loop.durationMs),
       ...(loop.failedCommit ? { failedCommitShort: loop.failedCommit.slice(0, 7) } : {}),
       ...(loop.passingCommit ? { passingCommitShort: loop.passingCommit.slice(0, 7) } : {}),

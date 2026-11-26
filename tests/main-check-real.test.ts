@@ -474,7 +474,7 @@ test("l. after a host stop the next service retires the copy with the anchor the
     await sandbox.until("the admission", () => sandbox.view().running !== undefined);
     after = await hiddenProcess();
     await sandbox.until("a result", () => sandbox.view().results.length === 1);
-    await sandbox.until("the copy waiting", () => sandbox.view().retiring === 1 && sandbox.view().waiting === "processes", "alpha");
+    await sandbox.until("the copy waiting", () => sandbox.view().retiring === 1 && sandbox.view().waiting === "processes" && sandbox.record().retiring?.[0]?.recording === undefined, "alpha");
     await sandbox.service!.close();
     assert.equal(anchorFiles(sandbox).length, 1, "the anchor is on disk after the host stop");
     await end(after);

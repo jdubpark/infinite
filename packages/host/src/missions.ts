@@ -1427,7 +1427,7 @@ function teamDetail(team: TeamView) {
   if (waitsOnProvider(team)) return providerInputReason;
   if (team.status === "blocked" || team.status === "cancelled") return team.reason ?? teamStep[team.status] ?? team.status;
   const integrated = team.tasks.filter(task => task.status === "integrated").length;
-  return `${teamStep[team.status] ?? team.status}${team.tasks.length && team.status === "implementing" ? `: ${integrated} of ${team.tasks.length} tasks integrated` : ""}`;
+  return `${teamStep[team.status] ?? team.status}${team.tasks.length && team.status === "implementing" ? `: ${integrated} of ${team.tasks.length} ${team.tasks.length === 1 ? "task" : "tasks"} integrated` : ""}`;
 }
 const subtaskCounts = (mission: Mission) => ({ total: mission.subtasks.filter(item => item.status !== "cancelled").length,
   running: mission.subtasks.filter(item => item.status === "running").length, done: mission.subtasks.filter(item => item.status === "done").length });
@@ -1443,9 +1443,9 @@ function missionDetail(mission: Mission, teamById: Map<string, TeamView>) {
   const next = openFollowUps(mission).sort((a, b) => a.dueAt.localeCompare(b.dueAt))[0];
   if (next && mission.coordinator?.status === "waiting" && !mission.subtasks.some(item => item.status === "running"))
     return `Waiting until ${utcMinute(next.dueAt)} to look again: ${next.reason}`;
-  if (!mission.subtasks.length) return "Planning subtasks";
   const counts = subtaskCounts(mission), running = mission.subtasks.filter(item => item.status === "running");
-  return `${running.length ? `Running: ${running.map(item => item.title).join(", ")}. ` : ""}${counts.done} of ${counts.total} subtasks done`;
+  if (!counts.total) return "Planning subtasks";
+  return running.length ? `Running: ${running.map(item => item.title).join(", ")}` : "";
 }
 
 function markAttempts(entries: { item: BoardItem; scope: string; objective: string | undefined }[]) {
@@ -1464,6 +1464,7 @@ function markAttempts(entries: { item: BoardItem; scope: string; objective: stri
     });
   }
 }
+const unmappedGroupId = (kind: "group" | "project" | "mission" | "team" | "goal", id: string) => `unmapped:${kind}:${id}`;
 export function missionBoard(
   missions: Mission[], teams: TeamView[], goals: ProductGoal[], projects: Config["projects"],
   containing: (projectId: string) => { id: string; name: string } | undefined,
@@ -1474,25 +1475,28 @@ export function missionBoard(
   for (const mission of missions) {
     const column: BoardColumn = ["needs-input", "blocked"].includes(mission.status) || promptedSubtask(mission, teamById) ? "needs-input" : mission.status === "ready-for-review" ? "review" : mission.status === "cancelled" ? "ended" : "working";
     const owner = mission.repoProjectIds.map(id => containing(id)).find(Boolean);
-    items.push({ kind: "mission", id: mission.id, title: mission.title, groupId: owner?.id ?? mission.groupId, projectName: owner?.name ?? mission.groupName, column, status: mission.status,
+    const groupId = owner?.id.trim() || (mission.groupId.trim() ? unmappedGroupId("group", mission.groupId.trim()) : mission.repoProjectIds[0]?.trim() ? unmappedGroupId("project", mission.repoProjectIds[0].trim()) : unmappedGroupId("mission", mission.id));
+    items.push({ kind: "mission", id: mission.id, title: mission.title, groupId, projectName: owner?.name ?? (mission.groupName || mission.groupId || groupId), column, status: mission.status,
       ...(mission.stopReason ? { stopReason: mission.stopReason } : {}),
       detail: oneLine(missionDetail(mission, teamById)), createdAt: mission.createdAt, updatedAt: mission.updatedAt,
       subtasks: subtaskCounts(mission) });
-    attempts.push({ item: items.at(-1)!, scope: owner?.id ?? mission.groupId, objective: mission.objective });
+    attempts.push({ item: items.at(-1)!, scope: groupId, objective: mission.objective });
   }
   for (const team of teams) {
     if (team.missionId || team.goal) continue;
     const owner = containing(team.projectId);
+    const groupId = owner?.id.trim() || (team.projectId.trim() ? unmappedGroupId("project", team.projectId.trim()) : unmappedGroupId("team", team.id));
     const column: BoardColumn = ["needs-input", "blocked"].includes(team.status) || waitsOnProvider(team) ? "needs-input" : team.status === "ready-for-review" ? "review" : ["merged", "no-change", "cancelled"].includes(team.status) ? "ended" : "working";
-    items.push({ kind: "team", id: team.id, title: team.title, ...(owner ? { groupId: owner.id } : {}), projectName: owner?.name ?? projectName(team.projectId), column, status: team.status, detail: oneLine(teamDetail(team)), createdAt: team.createdAt, updatedAt: team.updatedAt });
+    items.push({ kind: "team", id: team.id, title: team.title, groupId, projectName: owner?.name ?? projectName(team.projectId), column, status: team.status, detail: oneLine(teamDetail(team)), createdAt: team.createdAt, updatedAt: team.updatedAt });
     attempts.push({ item: items.at(-1)!, scope: team.projectId, objective: team.objective });
   }
   for (const goal of goals) {
     const owner = containing(goal.projectId);
+    const groupId = owner?.id.trim() || (goal.projectId.trim() ? unmappedGroupId("project", goal.projectId.trim()) : unmappedGroupId("goal", goal.id));
     const column: BoardColumn = ["needs-input", "blocked"].includes(goal.status) || (["running", "paused"].includes(goal.status) && goal.activeTeamId && waitsOnProvider(teamById.get(goal.activeTeamId))) ? "needs-input" : ["running", "paused"].includes(goal.status) ? "working" : goal.status === "ready-for-review" ? "review" : "ended";
     const active = goal.activeTeamId ? teamById.get(goal.activeTeamId) : undefined;
     const detail = openTeamQuestion(active) ?? (goal.status === "running" && active ? `Feature ${goal.cycles.length}: ${teamDetail(active)}` : goal.reason ?? goal.status);
-    items.push({ kind: "goal", id: goal.id, title: goal.title, ...(owner ? { groupId: owner.id } : {}), projectName: owner?.name ?? projectName(goal.projectId), column, status: goal.status, detail: oneLine(detail), createdAt: goal.createdAt, updatedAt: goal.updatedAt });
+    items.push({ kind: "goal", id: goal.id, title: goal.title, groupId, projectName: owner?.name ?? projectName(goal.projectId), column, status: goal.status, detail: oneLine(detail), createdAt: goal.createdAt, updatedAt: goal.updatedAt });
   }
   markAttempts(attempts);
   const order: BoardColumn[] = ["needs-input", "working", "review", "ended"];

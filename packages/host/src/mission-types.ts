@@ -339,7 +339,7 @@ export interface BoardAttempt {
 interface BoardItemBase {
   id: string;
   title: string;
-  groupId?: string;
+  groupId: string;
   projectName: string;
   column: BoardColumn;
   status: string;
@@ -368,7 +368,7 @@ const boardAttemptSchema = z.object({
 const boardItemBaseShape = {
   id: z.string().min(1),
   title: z.string().min(1),
-  groupId: z.string().min(1).optional(),
+  groupId: z.string().min(1),
   projectName: z.string().min(1),
   column: z.enum(["needs-input", "working", "review", "ended"]),
   status: z.string().min(1),

@@ -39,6 +39,12 @@ test("the match rules", () => {
     matchLandings(commits, [{ runId: "r", reviewedTree: "T1" }]).map((l) => [l.method, l.commit]),
     [["tree-equal", "M"]],
   );
+  const headOf = (candidate: { mergeCommit?: string; reviewedHead?: string; reviewedTree?: string }) =>
+    matchLandings(commits, [{ runId: "r", ...candidate }]).map((l) => [l.method, l.reviewedHead]);
+  assert.deepEqual(headOf({ mergeCommit: "M", reviewedHead: "K" }), [["merge-commit", "K"]]);
+  assert.deepEqual(headOf({ reviewedHead: "H" }), [["merge-parent", "H"]]);
+  assert.deepEqual(headOf({ reviewedHead: "K", reviewedTree: "T1" }), [["tree-equal", "K"]]);
+  assert.deepEqual(headOf({ mergeCommit: "M" }), [["merge-commit", undefined]]);
   assert.deepEqual(
     matchLandings(commits, [{ runId: "r", mergeCommit: "M", reviewedTree: "T1" }]).map((l) => l.method),
     ["merge-commit"],

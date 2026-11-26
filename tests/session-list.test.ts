@@ -6,20 +6,20 @@ import { sessionListReader } from "../packages/remote/src/session-list.js";
 import { sendSessionList } from "../packages/host/src/session-list.js";
 import { claimControl, inProcessHost, waitFor } from "./helpers.js";
 
-type Row = { id: string; status: string };
+type Row = { id: string; status: string; attention?: { state: string } };
 
 test("GET /api/sessions answers a client that names the version it holds", { timeout: 60_000 }, async () => {
   const host = await inProcessHost();
   try {
     const id = randomUUID();
-    const created = await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Listed", prompt: "Wait here" });
+    const created = await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Listed", prompt: "yesno" });
     assert.equal(created.status, 201, JSON.stringify(created.body));
     const list = async (query = "") => {
       const response = await fetch(`${host.origin}/api/sessions${query}`, { headers: { Authorization: `Bearer ${host.tokens.owner}` } });
       return { status: response.status, type: response.headers.get("content-type"), text: await response.text() };
     };
     const plain = await waitFor(async () => [await list(), await list()], ([a, b]) =>
-      a.text === b.text && (JSON.parse(a.text).sessions as Row[]).some(row => row.id === id && row.status === "running"), 20_000).then(([a]) => a);
+      a.text === b.text && (JSON.parse(a.text).sessions as Row[]).some(row => row.id === id && row.status === "running" && row.attention?.state === "needs-you"), 20_000).then(([a]) => a);
 
     assert.equal(plain.type, "application/json; charset=utf-8");
     const rows = JSON.parse(plain.text).sessions as Row[];

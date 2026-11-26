@@ -12,7 +12,7 @@ import type { ConnectorSource } from "./mcp-types.js";
 import { reportName } from "./config.js";
 import type { Config } from "./types.js";
 import { ROUTE_INPUT_LIMIT, decideRoute, explicitRoute, type RouteReading } from "./intake-route.js";
-import { intakeRecordAudienceAllowed, intakeRecordAudienceIdentityMatches, slackAudienceIdentity } from "./intake-audience.js";
+import { intakeRecordAudienceIdentityMatches, slackAudienceIdentity } from "./intake-audience.js";
 
 const objectiveLimit = 24000, descriptionLimit = 12000, threadUnreadableMs = 60 * 60 * 1000;
 const omissionReserve = 40;
@@ -231,9 +231,8 @@ export class IntakeService {
   private readonly pendingMentions = new Map<string, string>();
   private recordAudienceAllowed(record: IntakeRecord, check = this.options.audience?.recordAllowed): boolean {
     if (!intakeRecordAudienceIdentityMatches(this.config, record)) return false;
-    const mission = record.missionId ? this.missions.peek(record.missionId) : undefined;
-    if (this.config.intake?.slack) return check?.(record, mission) ?? false;
-    return intakeRecordAudienceAllowed(this.config, record, mission);
+    if (!this.config.intake?.slack) return true;
+    return check?.(record, record.missionId ? this.missions.peek(record.missionId) : undefined) ?? false;
   }
 
   private requireRecordAudience(record: IntakeRecord): void {

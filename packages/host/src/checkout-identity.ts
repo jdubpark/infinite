@@ -10,6 +10,8 @@ export type CheckoutIdentity = {
   from: "source" | "host-scan";
 };
 
+export interface WorkspaceRepositoryBinding { companyId: string; repositoryId: string }
+
 export type GitReader = (cwd: string, args: string[]) => string | undefined;
 
 const READ_ONLY_GIT = ["-c", "safe.directory=*", "-c", "core.fsmonitor=false"];

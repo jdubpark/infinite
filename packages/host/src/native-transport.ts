@@ -1,4 +1,5 @@
 import type { WebSocket } from "ws";
+import { replyDeadline } from "./deadline.js";
 
 export const NATIVE_MAX_MESSAGE = 32 * 1024 * 1024;
 export const NATIVE_MAX_BUFFERED = 64 * 1024 * 1024;
@@ -27,7 +28,8 @@ export function nativeCatalogSender(socket: WebSocket, fail: () => void) {
     frame.writeUInt32BE(current.data.length, 8);
     current.data.copy(frame, 12, current.offset, end);
     current.offset = end;
-    timer = setTimeout(fail, 20000);
+    const waiting = replyDeadline(20000, () => { if (timer === waiting) fail(); });
+    timer = waiting;
     socket.send(frame, { binary: true }, error => { if (error) fail(); });
   };
   return {
@@ -41,11 +43,11 @@ export function nativeCatalogSender(socket: WebSocket, fail: () => void) {
     acknowledge(frame: Buffer) {
       const current = queue[0];
       if (frame.length !== 8 || !current || frame.readUInt32BE(0) !== current.id || frame.readUInt32BE(4) !== current.offset) throw new Error("Invalid native catalog acknowledgement");
-      clearTimeout(timer);
+      clearTimeout(timer); timer = undefined;
       if (current.offset === current.data.length) { bytes -= current.data.length; queue.shift(); }
       next();
     },
-    close() { clearTimeout(timer); queue.length = 0; bytes = 0; },
+    close() { clearTimeout(timer); timer = undefined; queue.length = 0; bytes = 0; },
   };
 }
 

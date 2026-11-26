@@ -17,26 +17,22 @@ import type { MissionService } from "../packages/host/src/missions.js";
 import type { TeamService } from "../packages/host/src/teams.js";
 import type { Mission, MissionReport, MissionSubtaskPlan } from "../packages/host/src/mission-types.js";
 import type { TeamPublication } from "../packages/host/src/team-types.js";
-import { slackAudienceFixture, slackClientForFixture as slackClient, startSlackServer, testIntakeAudience } from "./fixtures/slack-server.js";
+import { slackClientForFixture as slackClient, startSlackServer, testIntakeAudience } from "./fixtures/slack-server.js";
+import { BINDING, BOT, OTHER, OWNER, PROJECT_PATH, TEST_AUDIENCE_ID, TEST_PROJECTS, TEST_SCOPE, surfaceFor, wrapSlackClient,
+  type Services } from "./fixtures/intake-slack-surface.js";
 
 const delay = (ms: number) => new Promise(done => setTimeout(done, ms));
-const OWNER = "U00000000", TEAMMATE = "U00000002", BOT = "U00000001";
-const BINDING: IntakeThread = { channelId: "C0000000000", threadTs: "1700000000.000100" };
-const OTHER: IntakeThread = { channelId: "C0000000001", threadTs: "1700000000.000200" };
-const THIRD: IntakeThread = { channelId: "C0000000002", threadTs: "1700000000.000300" };
-const PROJECT_PATH = "/data/instances/work/api";
-const { scope: TEST_SCOPE, identity: TEST_AUDIENCE_ID, projects: TEST_PROJECTS } = slackAudienceFixture();
+const TEAMMATE = "U00000002";
 const ISSUE = randomUUID();
 const NOW = new Date().toISOString();
 const ACK = 'Started on TEST-1 "Export fails on empty rows". I\'ll post questions and the result here.\nReply with a mention to answer or steer.';
 const QUEUED = 'Queued TEST-1 "Export fails on empty rows". It starts when a running request finishes. I\'ll post questions and the result here.';
 const FINISHED = "This request has finished. File a follow-up with Linear's agent in this thread.";
 const ALREADY = "That question was already answered.";
-const CANCEL_REASON = "Cancelled by Owner. Subteam workspaces remain available for inspection.";
+const CANCEL_REASON = "Cancelled by the owner. Subteam workspaces remain available for inspection.";
 const CANCELLED = `Cancelled: ${CANCEL_REASON}\nFile a follow-up with Linear's agent in this thread.`;
 
 type Harness = ReturnType<typeof harness>;
-type Services = { missions: MissionService; teams: TeamService };
 
 let sequence = 0;
 const stamp = () => `1700000100.${String(++sequence).padStart(6, "0")}`;
@@ -51,36 +47,11 @@ function intakeRecord(issueId: string, state: IntakeRecord["state"], extra: Reco
     description: "Rows with no values fail the export.", issueCreatedAt: NOW, issueUpdatedAt: NOW, comments: {}, messages: [], questions: [], inbound: [], createdAt: NOW, updatedAt: NOW };
   if (state === "skipped") return { ...base, ...extra, state, skipReason: "creator-mismatch" } as IntakeRecord;
   if (state === "queued") return { ...base, ...extra, state } as IntakeRecord;
-  return { ...base, rule: 'label "infinite", owner creator', missionId: "mission-1", ...extra, state } as IntakeRecord;
+  return { ...base, rule: 'label "infinite", owner creator', ...extra, state } as IntakeRecord;
 }
 
 type LogLine = { line: string; error: unknown };
 const collector = () => { const calls: LogLine[] = []; return { calls, log: (line: string, error: unknown) => { calls.push({ line, error }); } }; };
-
-async function surfaceFor(services: Services, stateRoot: string, options: { bindByMention?: boolean; serverTeamId?: string; wrapClient?: (client: SlackClient) => SlackClient; log?: (line: string, error: unknown) => void;
-  directRequests?: boolean; direct?: (store: IntakeStore) => DirectRequest } = {}) {
-  const slack = await startSlackServer({ teamId: options.serverTeamId });
-  for (const thread of [BINDING, OTHER]) slack.seedThread(thread, [{ user: OWNER, text: "Export fails on empty rows" }]);
-  const realClient = slackClient(slack);
-  const client = options.wrapClient ? options.wrapClient(realClient) : realClient;
-  const config = { stateDir: join(stateRoot, "intake"), runDir: join(stateRoot, "run"), projects: TEST_PROJECTS, intake: {
-    linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
-    slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER,
-      bindByMention: options.bindByMention ?? false, endpoint: slack.endpoint, organizationScope: TEST_SCOPE,
-      ...(options.directRequests !== undefined ? { directRequests: options.directRequests } : {}) },
-    mission: { groupId: "shop", maxSubtasks: 8, maxMinutes: 30 }, maxActive: 3, requireSlackThread: true,
-  } } as unknown as Config;
-  const store = new IntakeStore({ stateDir: join(stateRoot, "intake") } as Config, randomBytes(32));
-  const surface = new IntakeSlackSurface(config, store, services.missions, services.teams, client,
-    { log: options.log ?? collector().log, audience: testIntakeAudience(config),
-      ...(options.direct ? { direct: options.direct(store) } : {}) });
-  return {
-    slack, store, surface, client, realClient, config,
-    texts: (binding: IntakeThread = BINDING) => slack.posts(binding).map(post => post.text),
-    connected: () => waitFor(async () => surface.status().connected, connected => connected, 10000),
-    close: async () => { surface.close(); await slack.close(); },
-  };
-}
 
 async function questionFlow(h: Harness, missions: Services["missions"]) {
   const { id } = await missions.create(h.create(), undefined, origin(ISSUE));
@@ -99,6 +70,16 @@ test("a started record gets one acknowledgement in its thread", { timeout: 60000
     await delay(300);
     assert.deepEqual(s.texts(), [ACK]);
   } finally { await s.close(); await h.close(); }
+});
+
+test("a started record with an unresolvable mission is not read or announced", async () => {
+  const { s, close } = await scriptedSurface();
+  try {
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: "mission-1" }));
+    await s.surface.start(); await s.connected();
+    assert.equal(s.store.get(ISSUE)!.messages.length, 0);
+    assert.equal(s.slack.calls.some(call => ["conversations.info", "conversations.replies", "chat.postMessage"].includes(call.method)), false);
+  } finally { await close(); }
 });
 
 test("a queued record says queued, then started", { timeout: 60000 }, async () => {
@@ -145,11 +126,13 @@ test("a question is posted with its number and options, and an option number ans
 
 test("decision controls commit only on valid submit and denial keeps the question open", { timeout: 60000 }, async () => {
   const h = harness();
-  const makeDecisionServices = (mode: "approval" | "single" | "single-alt" | "multiple") => {
+  const makeDecisionServices = async (mode: "approval" | "single" | "single-alt" | "multiple") => {
+    const identityHarness = scripted();
+    const handle = await identityHarness.create();
     const isSingle = mode === "single" || mode === "single-alt";
     const options = isSingle ? [`Preserve ${"shared ".repeat(12)}alpha`, `Preserve ${"shared ".repeat(12)}beta`] : ["Skip", "Write blanks"];
     const decision = { id: randomUUID(), memberId: randomUUID(), revision: 1, question: "Choose the export behavior?", options, answerMode: isSingle ? "single" : mode, createdAt: NOW };
-    const mission = { id: randomUUID(), groupId: "shop", repoProjectIds: ["api", "web"], revision: 1, status: "needs-input",
+    const mission = { ...identityHarness.get(handle.id), revision: 1, status: "needs-input",
       decisions: [decision], subtasks: [], events: [] } as unknown as Mission;
     const listeners = new Set<(value: Mission) => void>();
     const missions = {
@@ -162,10 +145,10 @@ test("decision controls commit only on valid submit and denial keeps the questio
       },
       pause: async () => undefined, resume: async () => undefined, cancel: async () => undefined, steer: async () => undefined,
     } as unknown as MissionService;
-    return { missions, mission, decision };
+    return { missions, mission, decision, close: () => identityHarness.close() };
   };
   const run = async (mode: "approval" | "single" | "single-alt" | "multiple") => {
-    const services = makeDecisionServices(mode);
+    const services = await makeDecisionServices(mode);
     const slack = await startSlackServer();
     const config = { stateDir: join(h.root, `state-${mode}`), runDir: join(h.root, `run-${mode}`), projects: TEST_PROJECTS, intake: {
       linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
@@ -260,7 +243,7 @@ test("decision controls commit only on valid submit and denial keeps the questio
         assert.equal(services.mission.revision, answeredRevision, "A persisted interactive answer redelivery after restart does not answer twice");
         assert.equal(slack.posts(BINDING).filter(post => post.text === "Received your answer to Q1.").length, 1);
       }
-    } finally { surface.close(); restartedSurface?.close(); await slack.close(); }
+    } finally { surface.close(); restartedSurface?.close(); await slack.close(); services.close(); }
   };
   try { await run("approval"); await run("single"); await run("single-alt"); await run("multiple"); }
   finally { await h.close(); }
@@ -589,20 +572,26 @@ test("a token for another workspace stops the surface and nothing is posted", { 
 });
 
 test("a Slack outage blocks no mission, and messages arrive when it ends", { timeout: 90000 }, async () => {
-  const { sh, s, close } = await scriptedSurface();
+  let unavailable = false;
+  const { sh, s, close } = await scriptedSurface({ wrapClient: real => wrapSlackClient(real, {
+    post: async (binding, text, key, blocks) => {
+      if (unavailable) throw new SlackError("network", true);
+      return real.post(binding, text, key, blocks);
+    },
+  }) });
   try {
     const { id } = await sh.create();
     s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start(); await s.connected();
     await waitFor(async () => s.texts(), list => list.length === 1);
-    s.slack.unavailable(true);
+    unavailable = true;
     await sh.report(1, { kind: "question", question: "Skip empty rows?", options: ["Skip", "Write blanks"] });
     const asked = await until(() => sh.get(id), mission => mission.status === "needs-input");
     await waitFor(async () => s.store.get(ISSUE)!.messages.find(message => message.key.startsWith("q:"))?.uncertain, uncertain => uncertain === true, 15000);
     await sh.missions.answer(id, asked.decisions[0].id, { requestId: randomUUID(), revision: sh.get(id).revision, text: "Skip" });
     assert.equal(sh.get(id).decisions[0].answer, "Skip", "The owner answers through the apps during the outage");
     assert.notEqual(sh.get(id).status, "blocked", "The outage blocks no mission");
-    s.slack.unavailable(false);
+    unavailable = false;
     await waitFor(async () => s.texts(), list => list.some(text => text.startsWith("**Q1: Skip empty rows?**")), 20000);
     assert.deepEqual(s.texts(), [ACK, s.texts()[1]]);
     assert.equal(s.texts()[1], "**Q1: Skip empty rows?**\n\n1. Skip\n2. Write blanks\n\nChoose below, or reply with a mention and your answer.");
@@ -772,10 +761,7 @@ test("a post is marked uncertain before it is sent, so a crash inside the send i
   const observed: boolean[] = [];
   let current: { store: IntakeStore; surface: IntakeSlackSurface } | undefined;
   let died = false;
-  const { sh, s, close } = await scriptedSurface({ wrapClient: real => ({
-    authTest: () => real.authTest(),
-    connect: handle => real.connect(handle),
-    thread: binding => real.thread(binding),
+  const { sh, s, close } = await scriptedSurface({ wrapClient: real => wrapSlackClient(real, {
     post: async (binding: IntakeThread, text: string, key: string) => {
       if (died) return new Promise<never>(() => undefined);
       observed.push(current!.store.get(ISSUE)!.messages.find(message => message.key === "ack")?.uncertain === true);
@@ -784,10 +770,11 @@ test("a post is marked uncertain before it is sent, so a crash inside the send i
       current!.surface.close();
       return new Promise<never>(() => undefined);
     },
-  }) as unknown as SlackClient });
+  }) });
   try {
     current = s;
-    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING }));
+    const { id } = await sh.create();
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start();
     await waitFor(async () => died, done => done, 15000);
     const second = new IntakeSlackSurface(s.config, s.store, sh.missions, sh.teams, s.realClient, { audience: testIntakeAudience(s.config) });
@@ -802,13 +789,15 @@ test("a post is marked uncertain before it is sent, so a crash inside the send i
 });
 
 test("two records in one thread keep their Slack receipts apart", { timeout: 90000 }, async () => {
-  const { s, close } = await scriptedSurface();
+  const { sh, s, close } = await scriptedSurface();
   try {
-    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING }));
+    const first = await sh.create();
+    const secondMission = await sh.create();
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: first.id }));
     await s.surface.start();
     await waitFor(async () => s.texts(), list => list.length === 1);
     const second = randomUUID();
-    s.store.create(intakeRecord(second, "started", { thread: BINDING, identifier: "TEST-2", title: "Second request" }));
+    s.store.create(intakeRecord(second, "started", { thread: BINDING, missionId: secondMission.id, identifier: "TEST-2", title: "Second request" }));
     s.slack.unavailable(true);
     s.store.update(second, record => { record.updatedAt = new Date().toISOString(); });
     await waitFor(async () => s.store.get(second)!.messages[0]?.uncertain, uncertain => uncertain === true, 15000);
@@ -880,19 +869,17 @@ test("a delivery failure that is not Slack's keeps no part of the error's text",
   const leak = Object.assign(new Error("connect ECONNRESET 192.0.2.7 /srv/infinite-data/work/checkout"), { code: "ECONNRESET" });
   const leaks = (text: string) => !text.includes("192.0.2.7") && !text.includes("/srv/infinite-data/work/checkout");
   let calls = 0;
-  const { s, close } = await scriptedSurface({ log: log.log, wrapClient: real => ({
-    authTest: () => real.authTest(),
-    connect: handle => real.connect(handle),
-    thread: binding => real.thread(binding),
+  const { sh, s, close } = await scriptedSurface({ log: log.log, wrapClient: real => wrapSlackClient(real, {
     post: async (binding: IntakeThread, text: string, key: string) => {
       calls += 1;
       if (calls === 1) throw leak;
       if (calls === 2) throw new SlackError("ratelimited", true);
       return real.post(binding, text, key);
     },
-  }) as unknown as SlackClient });
+  }) });
   try {
-    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING }));
+    const { id } = await sh.create();
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start();
     const first = await waitFor(async () => s.store.get(ISSUE)!.messages[0]?.error, error => error !== undefined, 15000);
     assert.equal(first, "Error (ECONNRESET)", "A non-Slack error is stored as its summary");
@@ -908,13 +895,15 @@ test("a delivery failure that is not Slack's keeps no part of the error's text",
 test("questions, results, and blocked reasons reach Slack without host paths or addresses", { timeout: 60000 }, async () => {
   const leak = `/srv/infinite-data/instances/work/workspaces/api/src/a.ts, ${PROJECT_PATH}/src/b.ts and 192.0.2.7`;
   const leaks = (text: string) => ["/srv/infinite-data", PROJECT_PATH, "192.0.2.7"].filter(value => text.includes(value));
-  const base = { revision: 1, decisions: [], subtasks: [], steering: [], events: [] };
+  const sh = scripted();
+  const questionId = (await sh.create()).id, resultId = (await sh.create()).id, blockedId = (await sh.create()).id;
+  const base = (id: string) => ({ ...sh.get(id), revision: 1, decisions: [], subtasks: [], steering: [], events: [] });
   const missions = new Map<string, Mission>([
-    ["m-question", { ...base, id: "m-question", status: "needs-input",
-      decisions: [{ id: "d1", question: `Keep ${leak}?`, options: ["Keep", `Move it from ${leak}`], recommendation: { answers: ["Keep"], reason: `It matches the current default at ${leak}` } }] } as unknown as Mission],
-    ["m-result", { ...base, id: "m-result", status: "ready-for-review", result: { revision: 1, summary: `Changed ${leak}. Docs: https://example.com/opt/x` },
-      subtasks: [{ id: "a", status: "done", teamStatus: "ready-for-review", teamId: "team-a" }] } as unknown as Mission],
-    ["m-blocked", { ...base, id: "m-blocked", status: "blocked", reason: `Cannot reach ${leak}` } as unknown as Mission],
+    [questionId, { ...base(questionId), status: "needs-input",
+      decisions: [{ id: "d1", question: `Keep ${leak}?`, options: ["Keep", `Move it from ${leak}`], recommendation: { answers: ["Keep"], reason: `It matches the current default at ${leak}` } }] } as Mission],
+    [resultId, { ...base(resultId), status: "ready-for-review", result: { revision: 1, summary: `Changed ${leak}. Docs: https://example.com/opt/x` },
+      subtasks: [{ id: "a", status: "done", teamStatus: "ready-for-review", teamId: "team-a" }] } as Mission],
+    [blockedId, { ...base(blockedId), status: "blocked", reason: `Cannot reach ${leak}` } as Mission],
   ]);
   const services = {
     missions: { peek: (id: string) => missions.get(id), onChange: () => () => undefined } as unknown as MissionService,
@@ -925,9 +914,9 @@ test("questions, results, and blocked reasons reach Slack without host paths or 
   try {
     s.slack.seedThread(THIRD, [{ user: OWNER, text: "Export fails on empty rows" }]);
     const second = randomUUID(), third = randomUUID();
-    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: "m-question" }));
-    s.store.create(intakeRecord(second, "started", { thread: OTHER, missionId: "m-result", identifier: "TEST-2" }));
-    s.store.create(intakeRecord(third, "started", { thread: THIRD, missionId: "m-blocked", identifier: "TEST-3" }));
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: questionId }));
+    s.store.create(intakeRecord(second, "started", { thread: OTHER, missionId: resultId, identifier: "TEST-2" }));
+    s.store.create(intakeRecord(third, "started", { thread: THIRD, missionId: blockedId, identifier: "TEST-3" }));
     await s.surface.start();
     for (const thread of [BINDING, OTHER, THIRD]) await waitFor(async () => s.texts(thread), list => list.length === 2, 15000);
     const stored = [ISSUE, second, third].flatMap(id => s.store.get(id)!.messages.map(message => message.text));
@@ -936,7 +925,7 @@ test("questions, results, and blocked reasons reach Slack without host paths or 
     assert.equal(s.texts(BINDING)[1], "**Q1: Keep [local path omitted], [local path omitted] and [address omitted]?**\n\nThe asking agent recommends: Keep. Reason: It matches the current default at [local path omitted], [local path omitted] and [address omitted]\n\n1. Keep (recommended)\n2. Move it from [local path omitted], [local path omitted] and [address omitted]\n\nChoose below, or reply with a mention and your answer.");
     assert.equal(s.texts(OTHER)[1], "Ready for review (agent report):\nChanged [local path omitted], [local path omitted] and [address omitted]. Docs: https://example.com/opt/x\nPull request: https://github.com/example/api/pull/1");
     assert.match(s.texts(THIRD)[1], /^Blocked: Cannot reach \[local path omitted\]/);
-  } finally { await s.close(); rmSync(stateRoot, { recursive: true, force: true }); }
+  } finally { await s.close(); sh.close(); rmSync(stateRoot, { recursive: true, force: true }); }
 });
 
 const AMBIGUOUS = "More than one request is open in this thread: TEST-1, TEST-2. Start your reply with an identifier or a question number.";
@@ -1114,12 +1103,13 @@ test("a request that starts on its first attempt with a split acknowledgement ge
 });
 
 test("a record over the message bound keeps its composed messages, so nothing is posted again", { timeout: 60000 }, async () => {
-  const { s, close } = await scriptedSurface();
+  const { sh, s, close } = await scriptedSurface();
   try {
+    const { id } = await sh.create();
     const sent = (key: string, kind: IntakeRecord["messages"][number]["kind"], text: string, n: number) =>
       ({ key, kind, text, createdAt: NOW, status: "sent" as const, attempts: 1, ts: `1700000300.${String(n).padStart(6, "0")}` });
     const replies = Array.from({ length: 400 }, (_, index) => sent(`reply:Ev-${index}`, "reply", "That question was already answered.", index + 2));
-    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, editNotedAt: NOW,
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id, editNotedAt: NOW,
       messages: [sent("ack", "ack", ACK, 0), sent("edit-note", "edit-note", "TEST-1 was edited after the run started.", 1), ...replies] }));
     const kept = s.store.get(ISSUE)!.messages;
     assert.equal(kept.length, 400);
@@ -1199,7 +1189,9 @@ async function directSurface(options: { directRequests?: boolean } = {}) {
   const stub: { calls: Parameters<DirectRequest>[0][] } = { calls: [] };
   const s = await surfaceFor(services, h.root, { directRequests: options.directRequests ?? true,
     direct: store => { const made = directStub(store); stub.calls = made.calls; return made.direct; } });
-  return { s, calls: () => stub.calls, close: async () => { await s.close(); await h.close(); } };
+  return { s, calls: () => stub.calls, mission: (id: string) => services.missions.peek(id),
+    createMission: (issueId = ISSUE) => services.missions.create(h.create(), undefined, origin(issueId)),
+    close: async () => { await s.close(); await h.close(); } };
 }
 const inOther = (text: string, overrides: Record<string, unknown> = {}) => mention(text, { channel: OTHER.channelId, thread_ts: OTHER.threadTs, ...overrides });
 
@@ -1249,9 +1241,10 @@ test("a bare top-level mention is dropped, and a bare mention inside a thread fi
 });
 
 test("in a thread whose request has finished, a plain mention files a follow-up while Q, identifier and command prefixes keep the old routing", { timeout: 60000 }, async () => {
-  const { s, calls, close } = await directSurface();
+  const { s, calls, createMission, close } = await directSurface();
   try {
-    s.store.create(intakeRecord(ISSUE, "finished", { thread: BINDING }));
+    const { id } = await createMission();
+    s.store.create(intakeRecord(ISSUE, "finished", { thread: BINDING, missionId: id }));
     await s.surface.start(); await s.connected();
     await s.slack.emit(mention("Q1 which one"));
     await s.slack.emit(mention("TEST-1 also the CSV"));
@@ -1267,9 +1260,10 @@ test("in a thread whose request has finished, a plain mention files a follow-up 
 });
 
 test("a thread with an unfinished record keeps today's routing for a plain mention", { timeout: 60000 }, async () => {
-  const { s, calls, close } = await directSurface();
+  const { s, calls, createMission, close } = await directSurface();
   try {
-    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING }));
+    const { id } = await createMission();
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start(); await s.connected();
     await s.slack.emit(mention("also cover the CSV export"));
     await waitFor(async () => s.store.get(ISSUE)!.inbound.length, count => count === 1);
@@ -1331,9 +1325,10 @@ test("a direct request that cannot be recorded is logged, counted and not acknow
 });
 
 test("with direct requests off, mentions behave as before", { timeout: 60000 }, async () => {
-  const { s, calls, close } = await directSurface({ directRequests: false });
+  const { s, calls, createMission, close } = await directSurface({ directRequests: false });
   try {
-    s.store.create(intakeRecord(ISSUE, "finished", { thread: BINDING }));
+    const { id } = await createMission();
+    s.store.create(intakeRecord(ISSUE, "finished", { thread: BINDING, missionId: id }));
     await s.surface.start(); await s.connected();
     await s.slack.emit(inOther("fix the export"));
     await waitFor(() => Promise.resolve(s.surface.status().dropped), dropped => dropped === 1);
@@ -1345,15 +1340,19 @@ test("with direct requests off, mentions behave as before", { timeout: 60000 }, 
 });
 
 test("a redelivered earlier reply never files a follow-up once its record has finished", { timeout: 60000 }, async () => {
-  const { s, calls, close } = await directSurface();
+  const { s, calls, mission, createMission, close } = await directSurface();
   try {
-    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING }));
+    const { id } = await createMission();
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start(); await s.connected();
     const reply = mention("also cover the CSV export");
     const envelope = await s.slack.emit(reply, { eventId: "EvReply" });
-    await waitFor(async () => s.store.get(ISSUE)!.inbound.length, count => count === 1);
-    await waitFor(async () => s.store.get(ISSUE)!.inbound[0].handledAt, handled => Boolean(handled));
-    await waitFor(async () => s.texts(), list => list.includes("This request has not started yet."));
+    await waitFor(async () => s.store.get(ISSUE)!.inbound[0]?.outcome, outcome => outcome === "steered");
+    assert.ok(s.store.get(ISSUE)!.inbound[0]!.handledAt);
+    assert.equal(s.store.get(ISSUE)!.inbound.length, 1);
+    assert.equal(s.surface.status().dropped, 0);
+    assert.equal(s.store.get(ISSUE)!.messages.length, 1, "A valid action needs no refusal reply");
+    const revision = mission(id)!.revision;
     s.store.update(ISSUE, record => { record.state = "finished"; });
     const before = s.texts();
     await s.slack.redeliver(envelope);
@@ -1363,6 +1362,7 @@ test("a redelivered earlier reply never files a follow-up once its record has fi
     assert.equal(s.store.list().length, 1);
     assert.equal(s.store.get(ISSUE)!.inbound.length, 1);
     assert.deepEqual(s.texts(), before, "Nothing is posted");
+    assert.equal(mission(id)!.revision, revision, "The replay does not repeat the completed mission action");
   } finally { await close(); }
 });
 

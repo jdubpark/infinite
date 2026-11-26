@@ -21,7 +21,10 @@ infinite usage projects
 infinite usage project PROJECT_ID
 infinite usage goal GOAL_ID
 infinite usage models [--role implementer]
+infinite usage outcomes [--run ID | --goal ID | --mission ID]
 infinite usage --json
+infinite cost [plan ACCOUNT USD | reset] [--json]
+infinite fuse [close --host | --project ID]
 infinite evidence status               # evidence store state, modules, sizes, and event count
 infinite evidence status --json
 infinite egress                        # hosts agents reached through the egress proxy, per project
@@ -63,6 +66,8 @@ infinite understand create projects|features|plans --workspace WORKSPACE_ID --re
 infinite understand update projects|features|plans|components ENTITY_ID --workspace WORKSPACE_ID --revision N --request-id UUID --file INPUT.json
 infinite understand archive projects|features|plans ENTITY_ID --workspace WORKSPACE_ID --revision N --request-id UUID
 infinite understand policy --workspace WORKSPACE_ID --revision N --request-id UUID --file POLICY.json
+infinite understand behaviors|behavior ID|behavior-suite ID|behavior-save|behavior-run --workspace WORKSPACE_ID
+infinite understand check --file definition.json [--json]
 ```
 
 With no workspace selector, `understand` lists visible workspaces using existing
@@ -102,6 +107,7 @@ infinite projects show PROJECT_ID
 infinite projects primary PROJECT_ID CHECKOUT_ID
 infinite start [--project PROJECT_ID] "task"
 infinite mission status MISSION_ID [--json]
+infinite mission progress MISSION_ID [--after CURSOR] [--json]
 infinite mission answer MISSION_ID DECISION_ID "text"
 infinite mission steer MISSION_ID "text"
 infinite mission pause|resume|cancel MISSION_ID
@@ -172,6 +178,7 @@ Initialize a project from a clean Git checkout, then start and control teams fro
 infinite repo init [DIRECTORY] [--project PROJECT_ID] [--source github|laptop] [--teamwork PATH|none]
 infinite repo init --delivery pr --repository OWNER/REPO --base-branch main
 infinite repo refresh [--project PROJECT_ID]
+infinite repo link|unlink|links ...
 infinite repo init --check-json '[{"command":"make","args":["test"]}]'
 infinite repo init --linear-team TEAM_UUID --linear-project PROJECT_UUID
 infinite team start "Add a feature"
@@ -187,12 +194,16 @@ infinite team steer TEAM_ID "Keep the change within the API package"
 infinite team answer TEAM_ID QUESTION_ID "Use the existing route"
 infinite team pause TEAM_ID
 infinite team resume TEAM_ID
+infinite team continue TEAM_ID ["direction"]
+infinite team revoke-routing TEAM_ID
 infinite team cancel TEAM_ID
 infinite team delete TEAM_ID [--json]
 infinite team entries TEAM_ID [--kind KIND] [--task TASK_ID] [--since SEQ] [--json]
 infinite team entry TEAM_ID ENTRY_ID [--json]
 infinite team entry TEAM_ID ENTRY_ID withdraw [--json]
 ```
+
+Additional orchestration and evaluation command families follow the same paired owner CLI conventions (`--json` supported across read commands): `infinite goal ...`, `infinite routine ...`, `infinite autonomy ...`, `infinite routing ...`, `infinite eval ...`, `infinite duels ...`, `infinite permissions ...`, `infinite signal ...`, and `infinite halt ...`. See [Goals and agent teams](teams.md) and [docs/README.md](README.md) for full details.
 
 `team entries` lists a team's stored entries, one line each, with the next `--since` value when more remain. `team entry` prints one entry's head and its body as indented JSON. Entry text is data: the output escapes control characters, and nothing in it runs. `team entry ... withdraw` needs an owner device key. It withdraws one entry, so members stop listing and getting it while the owner still reads its body. The command says whether the entry changed, or was already withdrawn.
 
@@ -271,7 +282,7 @@ Ordinary provider launches from an enrolled directory also use its saved project
 
 Team mutations save a private request receipt before sending and do not retry an uncertain request. Supply `--request-id UUID` only when deliberately resuming the same request. `status` and `watch` show the host's workspace, branch, Linear URL, and pending questions. Ctrl+C detaches from `watch`; it does not stop the team.
 
-For terminal sessions, `resume` attaches to the existing OS process. It does not invoke the provider's resume command, fork a conversation, or submit the initial request again. An exited process remains available as a recording through `monitor`; restarting it requires explicit native-provider recovery. For example, `infinite codex resume NATIVE_ID` passes that native command through and creates a new Infinite recording. Use `infinite resume INFINITE_ID` while the existing process is alive.
+For terminal sessions, `resume` attaches to the existing OS process. It does not invoke the provider's resume command, fork a conversation, or submit the initial request again. An exited process remains available as a recording through `monitor`; continuing a confirmed exited session uses explicit host resumption (`POST /api/sessions/:id/resume` or Resume in the web/mobile/Mac clients), which creates a new runtime and recording without resending the initial prompt. Fresh CLI launches refuse provider-native resume flags (`codex resume`, Claude `-c`/`-r`/`--resume`/`--fork-session`, Grok `-c`/`-r`, OpenCode `-c`/`-s`) with HTTP 400 (`assertFreshNativeContext`) so a new recording never splices into an unrecorded conversation. Use `infinite resume INFINITE_ID` while the existing process is alive.
 
 ## The app's cmux workspaces from a terminal
 

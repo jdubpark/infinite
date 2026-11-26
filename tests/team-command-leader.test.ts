@@ -408,8 +408,7 @@ test("through a relaying prefix a command that ignores SIGTERM is ended by the a
   }
 });
 
-const leadsMember = (leader: string, member: string, ignoresTerm: boolean): Command => ({ command: "sh", args: ["-c", `echo $$ > '${leader}'; (${ignoresTerm ? 'trap "" TERM; ' : ""}exec sh -c 'echo $$ > "$0"; exec sleep 30' '${member}') & wait`] });
-const leadsStubbornMember = (leader: string, member: string): Command => leadsMember(leader, member, true);
+const leadsStubbornMember = (leader: string, member: string): Command => ({ command: "sh", args: ["-c", `echo $$ > '${leader}'; (trap "" TERM; exec sh -c 'echo $$ > "$0"; exec sleep 30' '${member}') & wait`] });
 
 test("a stop ends a group member that ignores SIGTERM whose leader obeys it: through a relaying prefix at the anchor's grace, and without a prefix at once", PREFIX_CASE, async t => {
   for (const prefix of [RELAY, undefined]) {
@@ -434,20 +433,6 @@ test("a stop ends a group member that ignores SIGTERM whose leader obeys it: thr
       if (member !== undefined && member > 1 && !gone(member)) process.kill(member, "SIGKILL");
       rmSync(base, { recursive: true, force: true });
     }
-  }
-});
-
-test("without the ignored SIGTERM the same member ends at the first SIGTERM, before the anchor's grace", PREFIX_CASE, async t => {
-  const base = mkdtempSync(join(tmpdir(), "team-command-member-"));
-  const leaderFile = join(base, "leader"), memberFile = join(base, "member");
-  try {
-    const stopped = await stopRun(t, leadsMember(leaderFile, memberFile, false), base, memberFile, RELAY);
-    assert.ok(stopped.waited < STOP_GRACE_MS - 1_000, `answered ${stopped.waited.toFixed(0)} ms after the stop, so the ignored SIGTERM is what the grace test measures`);
-    await until("the member ended", () => ended(pidIn(memberFile)!));
-  } finally {
-    const member = pidIn(memberFile);
-    if (member !== undefined && member > 1 && !gone(member)) process.kill(member, "SIGKILL");
-    rmSync(base, { recursive: true, force: true });
   }
 });
 

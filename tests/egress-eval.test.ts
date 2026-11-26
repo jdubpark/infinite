@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import * as egress from "../packages/host/src/egress.js";
+import type { ExecutionIdentity } from "../packages/host/src/types.js";
 // @ts-expect-error
 import { createEgressProxy } from "../scripts/egress-proxy.mjs";
 
@@ -73,10 +74,10 @@ function authorizationOf(proxyUrl: string | undefined): string {
 
 const projectOf = (proxyUrl: string | undefined) => decodeURIComponent(new URL(proxyUrl ?? "http://missing.invalid").username).split(".")[0];
 
-function workerEnv(port: number, projectId: string, purpose?: string, nowMs?: number) {
+function workerEnv(port: number, projectId: string, executionIdentity?: ExecutionIdentity, nowMs?: number) {
   return egress.workerEgressEnvironment(projectId, SESSION, {
     INFINITE_EGRESS_PROXY_URL: `http://127.0.0.1:${port}`, INFINITE_EGRESS_KEY_FILE: keyPath,
-  } as NodeJS.ProcessEnv, nowMs, purpose as never);
+  } as NodeJS.ProcessEnv, nowMs, executionIdentity);
 }
 
 test("an eval session leaves the network only for its own list", async t => {
@@ -92,13 +93,13 @@ test("an eval session leaves the network only for its own list", async t => {
   egress.installHostEgress({ autonomy: { boundary: { egress: { proxyUrl: `http://127.0.0.1:${fixture.port}`, keyPath } } } } as never, {} as NodeJS.ProcessEnv);
   assert.deepEqual(fixture.loaded, { mode: "enforce", error: null }, "the policy with the eval lists loads");
 
-  const replay = workerEnv(fixture.port, "project-a", "replay");
-  assert.equal(replay.status, "on");
-  assert.equal(projectOf(replay.env.HTTPS_PROXY), "_eval", "a replay session mints the _eval identity");
-  const replayAuth = authorizationOf(replay.env.HTTPS_PROXY);
-  assert.equal(await connectStatus(fixture.port, `api.example:${echo.port}`, replayAuth), 200);
-  assert.equal(await connectStatus(fixture.port, `registry.example:${echo.port}`, replayAuth), 403, "the host-wide allow list never applies to _eval");
-  assert.equal(await connectStatus(fixture.port, `packages.example:${echo.port}`, replayAuth), 403);
+  const evalEnv = workerEnv(fixture.port, "project-a", "eval");
+  assert.equal(evalEnv.status, "on");
+  assert.equal(projectOf(evalEnv.env.HTTPS_PROXY), "_eval", "an eval session mints the _eval identity");
+  const evalAuth = authorizationOf(evalEnv.env.HTTPS_PROXY);
+  assert.equal(await connectStatus(fixture.port, `api.example:${echo.port}`, evalAuth), 200);
+  assert.equal(await connectStatus(fixture.port, `registry.example:${echo.port}`, evalAuth), 403, "the host-wide allow list never applies to _eval");
+  assert.equal(await connectStatus(fixture.port, `packages.example:${echo.port}`, evalAuth), 403);
 
   const setup = egress.evalProxyUrl("_eval-setup", SESSION, SETUP_SECONDS);
   assert.equal(projectOf(setup), "_eval-setup");
@@ -109,15 +110,15 @@ test("an eval session leaves the network only for its own list", async t => {
   const expired = egress.evalProxyUrl("_eval-setup", SESSION, SETUP_SECONDS, Date.now() - (SETUP_SECONDS + 1) * 1000);
   assert.equal(await connectStatus(fixture.port, `packages.example:${echo.port}`, authorizationOf(expired)), 407, "a setup credential past its 900 seconds is refused");
 
-  const work = workerEnv(fixture.port, "project-a", "work");
-  assert.equal(projectOf(work.env.HTTPS_PROXY), "project-a", "a work session keeps its project");
-  assert.equal(await connectStatus(fixture.port, `registry.example:${echo.port}`, authorizationOf(work.env.HTTPS_PROXY)), 200);
+  const production = workerEnv(fixture.port, "project-a", "production");
+  assert.equal(projectOf(production.env.HTTPS_PROXY), "project-a", "a production session keeps its project");
+  assert.equal(await connectStatus(fixture.port, `registry.example:${echo.port}`, authorizationOf(production.env.HTTPS_PROXY)), 200);
 
   const bare = await startProxy({ mode: "enforce", ports: [echo.port], allow: ["registry.example"], allowPrivate });
   t.after(() => bare.proxy.close());
-  const bareReplay = workerEnv(bare.port, "project-a", "replay");
-  assert.equal(await connectStatus(bare.port, `registry.example:${echo.port}`, authorizationOf(bareReplay.env.HTTPS_PROXY)), 403);
-  assert.equal(await connectStatus(bare.port, `api.example:${echo.port}`, authorizationOf(bareReplay.env.HTTPS_PROXY)), 403);
+  const bareEval = workerEnv(bare.port, "project-a", "eval");
+  assert.equal(await connectStatus(bare.port, `registry.example:${echo.port}`, authorizationOf(bareEval.env.HTTPS_PROXY)), 403);
+  assert.equal(await connectStatus(bare.port, `api.example:${echo.port}`, authorizationOf(bareEval.env.HTTPS_PROXY)), 403);
 });
 
 test("a summary that holds eval traffic survives a reload", async t => {

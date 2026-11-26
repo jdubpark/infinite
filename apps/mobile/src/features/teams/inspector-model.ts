@@ -1,5 +1,82 @@
 import type { TeamEntryAuthorKind, TeamEntryAuthority, TeamEntryHead, TeamEntryKind, TeamEntryPage } from "../../api/client";
-import { ROLE_NAMES, type TeamAcceptanceEvidence, type TeamMember, type TeamRole, type TeamTask, type TeamView } from "./model";
+import { ROLE_NAMES, shortDate, type TeamAcceptanceEvidence, type TeamMember, type TeamRole, type TeamTask, type TeamView, type TeamWaitReason, type TeamWaitReasonKind } from "./model";
+
+const WAIT_REASON_LABELS: Record<TeamWaitReasonKind, string> = {
+  "owner-decision": "Owner decision",
+  "provider-prompt": "Provider prompt",
+  "provider-limit": "Provider limit",
+  stalled: "Stalled",
+  "spinner-only": "Spinner-only",
+  "worker-slot": "Worker slot",
+  dependency: "Dependency",
+  "integration-order": "Integration order",
+  "linear-sync": "Linear sync",
+};
+
+const WAIT_REASON_PRIORITY: Record<TeamWaitReasonKind, number> = {
+  "owner-decision": 0,
+  "provider-prompt": 1,
+  stalled: 2,
+  "spinner-only": 3,
+  "provider-limit": 4,
+  "worker-slot": 5,
+  dependency: 6,
+  "integration-order": 7,
+  "linear-sync": 8,
+};
+
+export function waitReasonLabel(kind: TeamWaitReasonKind): string {
+  return WAIT_REASON_LABELS[kind];
+}
+
+export function waitReasonTone(kind: TeamWaitReasonKind): "error" | "attention" | undefined {
+  if (kind === "stalled") return "error";
+  if (kind === "owner-decision" || kind === "provider-prompt" || kind === "provider-limit" || kind === "spinner-only") {
+    return "attention";
+  }
+  return undefined;
+}
+
+export function orderMobileWaitReasons(reasons: readonly TeamWaitReason[] | undefined): TeamWaitReason[] {
+  if (!reasons?.length) return [];
+  return reasons
+    .map((reason, index) => ({ reason, index }))
+    .sort((left, right) =>
+      WAIT_REASON_PRIORITY[left.reason.kind] - WAIT_REASON_PRIORITY[right.reason.kind] || left.index - right.index,
+    )
+    .map(({ reason }) => reason);
+}
+
+export type MemberScreenNotice = {
+  kind: "spinner-only" | "stalled";
+  tone: "warning" | "error";
+  text: string;
+};
+
+export function memberScreenNotices(
+  member: Pick<TeamMember, "spinnerOnlySince" | "stalledAt"> & Partial<Pick<TeamMember, "status">>,
+  formatTime: (iso: string) => string = shortDate,
+): MemberScreenNotice[] {
+  const notices: MemberScreenNotice[] = [];
+  const suppressSpinner = Boolean(member.stalledAt) || member.status === "stopped" || member.status === "reported";
+  if (member.spinnerOnlySince?.trim() && !suppressSpinner) {
+    const formatted = formatTime(member.spinnerOnlySince).trim();
+    notices.push({
+      kind: "spinner-only",
+      tone: "warning",
+      text: formatted ? `Spinner-only screen since ${formatted}` : "Spinner-only screen",
+    });
+  }
+  if (member.stalledAt?.trim()) {
+    const formatted = formatTime(member.stalledAt).trim();
+    notices.push({
+      kind: "stalled",
+      tone: "error",
+      text: formatted ? `Stalled since ${formatted}` : "Stalled",
+    });
+  }
+  return notices;
+}
 
 export type MobileOutcomeGroup = {
   id: string;

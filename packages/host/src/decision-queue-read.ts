@@ -1,5 +1,5 @@
 import { publicAttention, type Manager } from "./manager.js";
-import { learningPurpose } from "./types.js";
+import { isEvalSession } from "./types.js";
 import type { CmuxSessions } from "./cmux/index.js";
 import type { TeamService } from "./teams.js";
 import type { GoalService } from "./goals.js";
@@ -16,7 +16,7 @@ export async function readDecisionQueue(input: {
   missions: Pick<MissionService, "decisionQueueCandidates">;
 }): Promise<DecisionQueue> {
   const native = (await input.manager.list({ includeFullMessage: true }))
-    .filter(session => !learningPurpose(session.purpose));
+    .filter(session => !isEvalSession(session));
   const known = new Set(native.filter(session => session.status === "running" && session.nativeSession && session.pid)
     .map(session => `${session.provider}:${session.nativeSession!.id}:${session.pid}`));
   const external = input.cmux ? (await input.cmux.list()).filter(session => session.status !== "running" || !session.nativeSession || !session.pid ||

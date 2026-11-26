@@ -20,8 +20,8 @@ test("Code Mode launch forms match the host switch", () => {
   assert.equal(codeModeEnabled("headless", "claude", servedHeadless), true);
   assert.equal(codeModeEnabled("headless", "claude", interactive), false);
   assert.equal(codeModeEnabled("off", "claude", interactive), false);
-  assert.equal(codeModeEnabled("all", "claude", interactive, undefined, "replay"), false);
-  assert.equal(codeModeEnabled("all", "claude", interactive, undefined, "gate"), false);
+  assert.equal(codeModeEnabled("all", "claude", interactive, undefined, "eval"), false);
+  assert.equal(codeModeEnabled("all", "claude", interactive, undefined, "production"), true);
   assert.equal(codeModeEnabled(undefined, "claude", interactive), false, "absent config is off");
 });
 
@@ -30,7 +30,8 @@ test("native relaunch follows the recorded conversation mode", () => {
   assert.equal(codeModeEnabled("all", "claude", { headless: false, served: false, excluded: false }, false), false);
   assert.equal(codeModeEnabled("all", "claude", { headless: true, served: true, excluded: false }, false), false);
   assert.equal(codeModeEnabled("off", "claude", { headless: false, served: false, excluded: true }, true), false);
-  assert.equal(codeModeEnabled("off", "claude", { headless: false, served: false, excluded: false }, true, "replay"), false);
+  assert.equal(codeModeEnabled("off", "claude", { headless: false, served: false, excluded: false }, true, "eval"), false);
+  assert.equal(codeModeEnabled("off", "claude", { headless: false, served: false, excluded: false }, true, "production"), true);
   assert.equal(codeModeEnabled("off", "claude", { headless: true, served: true, excluded: false }, true), true);
   assert.equal(codeModeEnabled("all", "claude", { headless: true, served: false, excluded: false }, true), false);
 });

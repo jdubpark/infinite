@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { ArrowUpRight, ChevronDown, ChevronRight } from "lucide-react";
-import type { Session } from "../api";
+import { clock, type Session } from "../api";
 import type { TeamView } from "../teams";
-import { deriveOutcomeGroups, inspectorRoleLabel, partitionRoster, type RosterMemberNode } from "./model";
+import { deriveOutcomeGroups, inspectorRoleLabel, orderWaitReasons, partitionRoster, waitReasonMeta, type RosterMemberNode } from "./model";
 
 type TeamOverviewProps = {
   team: TeamView;
@@ -31,6 +31,13 @@ function producerLabel(producer: "host" | "evaluator" | "owner"): string {
   return "Owner";
 }
 
+function safeClock(iso: string | undefined): string {
+  const trimmed = iso?.trim() ?? "";
+  if (!trimmed) return "";
+  if (Number.isNaN(Date.parse(trimmed))) return trimmed;
+  return clock(trimmed);
+}
+
 export function TeamOverview({
   team,
   sessions,
@@ -40,6 +47,7 @@ export function TeamOverview({
 }: TeamOverviewProps) {
   const overview = deriveOutcomeGroups(team);
   const roster = partitionRoster(team.members, team.revision);
+  const waitReasons = orderWaitReasons(team.waitReasons ?? []);
   const [showFinished, setShowFinished] = useState(false);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
   const sessionIds = new Set(sessions.map(session => session.id));
@@ -57,6 +65,8 @@ export function TeamOverview({
     const replacement = replacedByMemberId ? roster.byMemberId[replacedByMemberId]?.member : undefined;
     const replaced = replacesMemberId ? roster.byMemberId[replacesMemberId]?.member : undefined;
     const highlighted = highlightedId === member.memberId;
+    const stalledLabel = safeClock(member.stalledAt);
+    const spinnerLabel = safeClock(member.spinnerOnlySince);
     return (
       <article
         key={member.memberId}
@@ -71,6 +81,12 @@ export function TeamOverview({
           {member.title} · r{member.revision}
           {member.taskId ? ` · ${member.taskId}` : ""}
         </div>
+        {stalledLabel && (
+          <div className="ti-roster-sub ti-roster-flag is-attention">Stalled since {stalledLabel}</div>
+        )}
+        {spinnerLabel && (
+          <div className="ti-roster-sub ti-roster-flag is-warning">Spinner-only screen since {spinnerLabel}</div>
+        )}
         {member.stoppedReason && (
           <div className="ti-roster-sub">Stopped: {member.stoppedReason}</div>
         )}
@@ -215,6 +231,54 @@ export function TeamOverview({
                 <span className="quiet">{claim.evidence}</span>
               </li>
             ))}
+          </ul>
+        </div>
+      )}
+
+      {waitReasons.length > 0 && (
+        <div className="ti-summary-box ti-wait-reasons">
+          <div className="ti-roster-head">
+            <h3>Why this run is waiting</h3>
+            <span className="quiet">{waitReasons.length}</span>
+          </div>
+          <ul className="ti-wait-list">
+            {waitReasons.map((reason, index) => {
+              const meta = waitReasonMeta(reason.kind);
+              const member = reason.memberId ? roster.byMemberId[reason.memberId]?.member : undefined;
+              const hasSession = Boolean(member && sessionIds.has(member.sessionId));
+              const sinceLabel = safeClock(reason.since);
+              const resetsLabel = safeClock(reason.resetsAt);
+              return (
+                <li className="ti-wait-item" key={`${reason.kind}-${reason.memberId ?? ""}-${reason.taskId ?? ""}-${reason.decisionId ?? ""}-${index}`}>
+                  <div className="ti-wait-main">
+                    <span className={`ti-pill is-wait-${meta.tone}`}>{meta.label}</span>
+                    <span className="ti-wait-summary">{reason.summary}</span>
+                    {(sinceLabel || resetsLabel) && (
+                      <span className="ti-wait-meta">
+                        {sinceLabel ? `since ${sinceLabel}` : ""}
+                        {sinceLabel && resetsLabel ? " · " : ""}
+                        {resetsLabel ? `resets ${resetsLabel}` : ""}
+                      </span>
+                    )}
+                  </div>
+                  {member && (
+                    <div className="ti-wait-actions">
+                      <button type="button" className="ti-link-btn" onClick={() => onViewMemberLogs(member.memberId)}>
+                        Logs
+                      </button>
+                      <button type="button" className="ti-link-btn" onClick={() => onInspectMemberEntries(member.memberId)}>
+                        Entries
+                      </button>
+                      {hasSession && (
+                        <button type="button" className="ti-link-btn" onClick={() => onOpenSession(member.sessionId)}>
+                          Session <ArrowUpRight size={12} />
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         </div>
       )}

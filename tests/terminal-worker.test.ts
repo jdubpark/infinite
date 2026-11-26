@@ -12,7 +12,7 @@ import { WebSocket } from "ws";
 import { hashToken } from "../packages/host/src/config.js";
 import { workerCall } from "../packages/host/src/ipc.js";
 import { Manager } from "../packages/host/src/manager.js";
-import { connectTerminals } from "../packages/host/src/terminal-stream.js";
+import { connectTerminals, terminalPages } from "../packages/host/src/terminal-stream.js";
 import { readEvents, unseal, writeSealed } from "../packages/host/src/vault.js";
 import { permissionEvidenceHash, oneShotPermissionOption } from "../packages/host/src/team-permissions.js";
 import { requesterNotice } from "../packages/host/src/permission-policy.js";
@@ -147,10 +147,10 @@ async function fixture(provider: "demo" | "claude" | "codex" = "demo", initialPr
   writeFileSync(script, AGENT);
   const runtime = { id: randomUUID(), location: "cloud" as const, transport: "pty" as const };
   const bootstrap: Bootstrap = {
-    session: { id, ...(team ? { team } : {}), provider, title: "Terminal contract", projectId: "fixture", cwd: root, createdAt: new Date().toISOString(), status: "starting", contextVersion: 0, context: "", initialPrompt, runtime },
-    profile: { command: process.execPath, args: [script] },
-    runDir, stateDir, key: key.toString("base64"), prompt: initialPrompt,
-    attention: { idleAfterMs: 60_000, hooks: { claude: true, codex: true } },
+    session: { id, ...(team ? { team } : {}), executionIdentity: "production", provider, title: "Terminal contract", projectId: "fixture", cwd: root, createdAt: new Date().toISOString(), status: "starting", contextVersion: 0, context: "", initialPrompt, runtime },
+    executionIdentity: "production", profile: { command: process.execPath, args: [script] },
+    runDir, stateDir, key: key.toString("base64"), prompt: initialPrompt, codeMode: false,
+    attention: { idleAfterMs: 60_000, limitConfirmMs: 30_000, hooks: { claude: true, codex: true } },
   };
   const worker = spawn(process.execPath, ["--import", "tsx", "--import", resolve("tests/fixtures/worker-clock.mjs"), resolve("packages/host/src/worker.ts")], { stdio: ["pipe", "ignore", "pipe"], env: { ...process.env, INFINITE_TEST_CLOCK_FILE: join(root, "clock") } });
   let diagnostics = "";
@@ -976,5 +976,25 @@ test("terminal sockets dispatch zero control claims or PTY writes after aborting
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
     await worker.stop();
+  }
+});
+
+test("a live terminal stream outlasts one unavailable state read and ends after three in a row", { timeout: 20_000 }, async () => {
+  const stateDir = mkdtempSync("/tmp/inf-stream-");
+  const id = randomUUID();
+  mkdirSync(join(stateDir, "sessions", id, "events"), { recursive: true });
+  const statuses = ["unavailable", "running", "unavailable", "unavailable", "unavailable"];
+  let reads = 0;
+  const manager = {
+    config: { stateDir },
+    state: async () => ({ status: statuses[reads++] ?? "running" }),
+    events: (_session: string, after: number) => ({ events: [], cursor: after, more: false }),
+  } as unknown as Manager;
+  const streamed: string[] = [];
+  try {
+    for await (const page of terminalPages(manager, id, 0, new AbortController().signal, false, { status: "running" } as WorkerState)) if ("state" in page) streamed.push(page.state.status);
+    assert.deepEqual(streamed, statuses);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
   }
 });

@@ -111,7 +111,7 @@ import { LinearService } from "./linear.js";
 import { goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
-import { type Config, type Role, type Receipt, type Session, httpControlRequestSchema, learningPurpose, normalizeControlRequest } from "./types.js";
+import { type Config, type Role, type Receipt, type Session, httpControlRequestSchema, isEvalSession, normalizeControlRequest } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
 import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
@@ -427,7 +427,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
   const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
   const listSessions = async (options: { includeFullMessage?: boolean } = {}) => {
-    const native = (await manager.list({ includeFullMessage: options.includeFullMessage === true || Boolean(config.jev && config.jev.sessionReadings !== false) })).filter(session => !learningPurpose(session.purpose)).map(session => {
+    const native = (await manager.list({ includeFullMessage: options.includeFullMessage === true || Boolean(config.jev && config.jev.sessionReadings !== false) })).filter(session => !isEvalSession(session)).map(session => {
       const handoff = handoffs.listedView(session.id);
       const managed = managedBy(session);
       return { ...session, ...(managed ? { managedBy: managed } : {}), handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
@@ -867,7 +867,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.get("/api/usage/daily", (req, res, next) => { try { const query = z.object({ days: z.coerce.number().int().min(1).max(366).default(30), tz: z.string().default("UTC"), project: z.string().optional() }).strict().parse(req.query); return void res.json(usage.daily({ days: query.days, tz: query.tz, projectId: query.project })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone or day range" }); return next(error); } });
   app.get("/api/usage/projects", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query); return void res.json(usage.projects({ tz: query.tz })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
   app.get("/api/usage/projects/:id", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query), result = usage.project(String(req.params.id), { tz: query.tz }); if (!result) return void res.status(404).json({ error: "Project usage not found" }); return void res.json(result); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
-  registerRepairMetricsRoute(app, { runs: () => teams.understandingRecords(), memberUsage: (runId, memberId) => usage.member(runId, memberId), readable: () => usage.readable() });
+  registerRepairMetricsRoute(app, { runs: filter => teams.repairMetricsRuns(filter), memberUsage: (runId, memberId) => usage.memberFinal(runId, memberId), evidence, readable: () => usage.readable() });
   app.put("/api/usage/accounts/:id/plan", requireRole(["owner"]), (req, res) => {
     const accounts = config.usage?.accounts, accountId = String(req.params.id);
     const account = accounts && Object.hasOwn(accounts, accountId) ? accounts[accountId] : undefined;

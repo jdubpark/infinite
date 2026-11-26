@@ -88,3 +88,25 @@ export type TeamCriterionRefs = {
   objectiveVersion: number;
   criteria: string[];
 };
+
+export type TeamWaitReasonKind =
+  | "worker-slot"
+  | "dependency"
+  | "owner-decision"
+  | "provider-prompt"
+  | "provider-limit"
+  | "integration-order"
+  | "linear-sync"
+  | "spinner-only"
+  | "stalled";
+
+export type TeamWaitReason = {
+  kind: TeamWaitReasonKind;
+  summary: string;
+  taskId?: string;
+  memberId?: string;
+  decisionId?: string;
+  blockedByTaskIds?: string[];
+  since?: string;
+  resetsAt?: string;
+};

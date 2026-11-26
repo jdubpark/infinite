@@ -408,14 +408,14 @@ test("through a relaying prefix a command that ignores SIGTERM is ended by the a
   }
 });
 
-const leadsStubbornMember = (leader: string, member: string): Command => ({ command: "sh", args: ["-c", `echo $$ > '${leader}'; (trap "" TERM; exec sleep 30) & echo $! > '${member}'; wait`] });
+const leadsStubbornMember = (leader: string, member: string): Command => ({ command: "sh", args: ["-c", `echo $$ > '${leader}'; (trap "" TERM; echo $$ > '${member}'; exec sleep 30) & wait`] });
 
 test("a stop ends a group member that ignores SIGTERM whose leader obeys it: through a relaying prefix at the anchor's grace, and without a prefix at once", PREFIX_CASE, async t => {
   for (const prefix of [RELAY, undefined]) {
     const base = mkdtempSync(join(tmpdir(), "team-command-member-"));
     const leaderFile = join(base, "leader"), memberFile = join(base, "member");
     try {
-      const stopped = await stopRun(t, leadsStubbornMember(leaderFile, memberFile), base, leaderFile, prefix);
+      const stopped = await stopRun(t, leadsStubbornMember(leaderFile, memberFile), base, memberFile, prefix);
       await until("the member is recorded", () => pidIn(memberFile) !== undefined);
       const member = pidIn(memberFile)!;
       if (prefix) {

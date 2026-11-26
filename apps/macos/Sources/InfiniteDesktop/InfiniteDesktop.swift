@@ -142,8 +142,12 @@ struct DesktopView: View {
         case .understanding: return "Understand"
         case .home: return app.projectFilter.flatMap(app.projectGroups.group)?.name ?? "Home"
         case .cost: return "Cost"
-        case .mission(let id): return app.missionModel(for: id)?.mission.title ?? "Infinite"
-        case .team(let id, _): return app.teamModel(for: id)?.run.title ?? "Infinite"
+        case .mission(let id):
+            let title = app.missionModel(for: id)?.title ?? ""
+            return title.isEmpty ? "Infinite" : title
+        case .team(let id, _):
+            let title = app.teamModel(for: id)?.title ?? ""
+            return title.isEmpty ? "Infinite" : title
         case .sessions: return app.sessions.first { $0.id == app.selectedID }?.title ?? "Infinite"
         }
     }

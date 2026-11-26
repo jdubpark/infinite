@@ -58,7 +58,7 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (method === "GET" && raw.length === 4 && raw[1] === "permissions" && raw[2] === "decisions" && DECISION_ID.test(decoded[3])) return true;
   if (method === "POST" && rawPathname === "/api/permissions/marks") return true;
   if (method === "GET" && rawPathname === "/api/halt") return true;
-  if (method === "GET" && ["/api/usage", "/api/usage/daily", "/api/usage/models", "/api/usage/projects"].includes(rawPathname)) return true;
+  if (method === "GET" && ["/api/usage", "/api/usage/daily", "/api/usage/models", "/api/usage/projects", "/api/usage/repair-loops"].includes(rawPathname)) return true;
   if (method === "GET" && raw.length === 4 && raw[1] === "usage" && raw[2] === "projects" && PROJECT_ID.test(decoded[3])) return true;
   if (method === "POST" && rawPathname === "/api/usage/balances/refresh") return true;
   if (method === "PUT" && raw.length === 5 && raw[1] === "usage" && raw[2] === "accounts" && raw[4] === "plan") return true;
@@ -88,13 +88,15 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   }
   if (raw[1] === "missions" && raw.length >= 3 && UUID.test(decoded[2])) {
     if (raw.length === 3) return method === "GET";
+    if (raw.length === 4 && raw[3] === "progress") return method === "GET";
     if (raw.length === 4) return method === "POST" && ["steer", "pause", "resume", "cancel", "extend"].includes(raw[3]);
     return raw.length === 5 && method === "POST" && raw[3] === "answer" && UUID.test(decoded[4]);
   }
   if (raw[1] === "teams" && raw.length >= 3 && UUID.test(decoded[2])) {
     if (raw.length === 3) return method === "GET";
-    if (raw.length === 4 && raw[3] === "context") return method === "GET";
+    if (raw.length === 4 && ["context", "context-usage", "entries"].includes(raw[3])) return method === "GET";
     if (raw.length === 4) return method === "POST" && ["steer", "pause", "resume", "continue", "cancel"].includes(raw[3]);
+    if (raw.length === 5 && raw[3] === "entries" && UUID.test(decoded[4])) return method === "GET";
     return raw.length === 6 && method === "POST" && raw[3] === "decisions" && UUID.test(decoded[4]) && raw[5] === "answer";
   }
   if (["POST", "DELETE"].includes(method) && rawPathname === "/api/devices/push") return true;

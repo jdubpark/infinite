@@ -12,7 +12,7 @@ export default function MissionRoute() {
   const [connection, setConnection] = useState<Connection | null>(null);
   useEffect(() => { let live = true; loadConnection(machine).then(value => { if (live) setConnection(value); }); return () => { live = false; }; }, [machine]);
   if (!connection || !id) return <SafeAreaView style={s.safe}><ActivityIndicator style={s.loading} color={theme.colors.forest} /></SafeAreaView>;
-  return <SafeAreaView style={s.safe}><MissionDetail connection={connection} id={id} /></SafeAreaView>;
+  return <SafeAreaView style={s.safe}><MissionDetail key={`${machine ?? ""}/${id}`} connection={connection} id={id} /></SafeAreaView>;
 }
 
 const s = StyleSheet.create({ safe: { flex: 1, backgroundColor: theme.colors.paper }, loading: { marginTop: 100 } });

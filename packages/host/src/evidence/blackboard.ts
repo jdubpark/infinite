@@ -51,12 +51,13 @@ type EntryRow = {
   kind: string;
   author: string;
   authority: string;
+  author_member_id: string | null;
   state: string;
   body_bytes: number;
   supersedes: string | null;
   encrypted_head: string;
 };
-type SealedHead = { taskId?: string; authorRole?: EntryAuthorRole | "mission-coordinator"; paths: string[]; summary: string };
+type SealedHead = { taskId?: string; authorRole?: EntryAuthorRole | "mission-coordinator"; headCommit?: string; paths: string[]; summary: string };
 type ScopeRow = {
   member_id: string;
   role: string;
@@ -72,7 +73,7 @@ type ScopeRow = {
 const MEMBER_KIND_SQL = MEMBER_ENTRY_KINDS.map(kind => `'${kind}'`).join(", ");
 export const MEMBER_COUNT_SQL = `SELECT count(*) AS n FROM entries WHERE run_id=? AND kind IN (${MEMBER_KIND_SQL})`;
 
-const HEAD_COLUMNS ="seq, entry_id, scope, run_id, revision, at, kind, author, authority, state, body_bytes, supersedes, encrypted_head";
+const HEAD_COLUMNS = "seq, entry_id, scope, run_id, revision, at, kind, author, authority, author_member_id, state, body_bytes, supersedes, encrypted_head";
 
 const SCHEMA = [
   "CREATE TABLE entries ("
@@ -504,6 +505,7 @@ export class Blackboard {
     const head: SealedHead = {
       ...(entry.taskId === undefined ? {} : { taskId: entry.taskId }),
       ...(entry.authorRole === undefined ? {} : { authorRole: entry.authorRole }),
+      ...(entry.headCommit === undefined ? {} : { headCommit: entry.headCommit }),
       paths: [],
       summary: entry.summary,
     };
@@ -586,8 +588,10 @@ function headOf(db: EvidenceDb, row: EntryRow): EntryHead {
     kind: row.kind as EntryKind,
     author: row.author as EntryHead["author"],
     authority: row.authority as EntryHead["authority"],
+    ...(row.author_member_id === null ? {} : { authorMemberId: row.author_member_id }),
     ...(sealed.authorRole === undefined ? {} : { authorRole: sealed.authorRole }),
     ...(sealed.taskId === undefined ? {} : { taskId: sealed.taskId }),
+    ...(sealed.headCommit === undefined ? {} : { headCommit: sealed.headCommit }),
     paths: sealed.paths,
     summary: sealed.summary,
     bodyBytes: row.body_bytes,

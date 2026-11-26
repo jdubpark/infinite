@@ -184,7 +184,12 @@ review feedback the host runs only `gh pr view`:
 - **How often.** Once per watched run every `pollMinutes` (default 5, from 1 to
   1440). There is one more read before the host applies a review, and one before
   a mission coordinator's forward steers the subteam. A failed forward read is
-  retried a minute later. Each read times out after 60 seconds.
+  retried a minute later. Each read times out after 60 seconds. While the run
+  refuses the steer because a stopped command of the run may still be running,
+  the review or forward waits and reads at most once a minute: a forward keeps
+  its last read for 60 seconds after that read completed and reads again before
+  the next steer after that, and a review is read again only at the next
+  `pollMinutes` pass.
 - **Through what.** With the [GitHub credential proxy](github-proxy.md), each
   read carries a host-signed grant for that one repository with the `pr`
   operation and no branch refs, valid for 15 minutes. Because the grant carries

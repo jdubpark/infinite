@@ -33,7 +33,7 @@ export type MissionReviewRecord =
   | ReviewFields & { state: "superseded" | "refused"; reason: string };
 export type ReviewForwardOp = { kind: "review-forward"; subtaskId: string; teamId: string; requestId: string; text: string; source?: ConnectorSource; waiting?: string };
 type ForwardRequest = { kind: "none" } | { kind: "refused"; reason: string } | { kind: "late" } | { kind: "queued" } | { kind: "waiting" };
-type ForwardRead = { state: "reading" } | { state: "read"; current: boolean } | { state: "failed"; at: number };
+type ForwardRead = { state: "reading" } | { state: "read"; current: boolean; at: number } | { state: "failed"; at: number };
 type MissionReviewStored = {
   mission: Mission;
   receipts: Record<string, string>;
@@ -158,6 +158,7 @@ export class MissionReview<S extends MissionReviewStored> implements MissionRevi
       if (error.code === "team-command-running") {
         if (op.waiting !== error.message) this.host.event(stored, `The owner's review ${review.reviewId} for subtask ${op.subtaskId} waits for its subteam. ${error.message}`);
         op.waiting = error.message;
+        this.reads.set(op.requestId, read);
         return true;
       }
       return this.end(stored, review, "refused", error.message);
@@ -169,7 +170,7 @@ export class MissionReview<S extends MissionReviewStored> implements MissionRevi
     const read = this.reads.get(requestId);
     if (read?.state !== "read") return undefined;
     this.reads.delete(requestId);
-    return read;
+    return Date.now() - read.at < READ_RETRY_MS ? read : undefined;
   }
 
   private read(op: ReviewForwardOp, review: ForwardingReview) {
@@ -177,7 +178,7 @@ export class MissionReview<S extends MissionReviewStored> implements MissionRevi
     if (prior?.state === "reading" || prior?.state === "failed" && Date.now() - prior.at < READ_RETRY_MS) return true;
     this.reads.set(op.requestId, { state: "reading" });
     void this.teams.stillCurrent(op.teamId, review.reviewId).catch(() => undefined)
-      .then(current => this.reads.set(op.requestId, current === undefined ? { state: "failed", at: Date.now() } : { state: "read", current }));
+      .then(current => this.reads.set(op.requestId, current === undefined ? { state: "failed", at: Date.now() } : { state: "read", current, at: Date.now() }));
     return true;
   }
 

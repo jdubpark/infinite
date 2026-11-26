@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -640,7 +640,7 @@ test("a review whose steer meets a stopped command that may still run waits with
   }
 });
 
-test("a coordinator's forward that meets a stopped command that may still run waits with one event and no refusal, and steers the run once after the command ended", async () => {
+test("a coordinator's forward that meets a stopped command that may still run waits with one event, no refusal and one GitHub read a minute, and steers the run once after the command ended", async () => {
   const f = schedulerFixture();
   const seen: Census = { result: RUNNING, count: 0, now: Date.now() };
   let teams: TeamService | undefined;
@@ -662,14 +662,22 @@ test("a coordinator's forward that meets a stopped command that may still run wa
     assert.deepEqual(stored.inbox.splice(0).map(message => message.type), ["review-direction"]);
     assert.deepEqual(review.queueForward(stored, subtask, forwarded, true), { kind: "queued" });
     (service as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = stoppedCheck(1);
-    const steer = service.steer.bind(service);
-    let steers = 0;
+    const steer = service.steer.bind(service), clock = Date.now.bind(Date), reads = gh.commands().length;
+    let steers = 0, skew = 0;
     service.steer = (...args: Parameters<TeamService["steer"]>) => { steers++; return steer(...args); };
-    for (let passes = 0; steers < 3; passes++) {
-      assert.ok(passes < 500, "the forward tries its steer three times within 10 s");
-      assert.equal(await review.applyForward(stored, stored.ops[0]!), true, `the forward waits: ${recorded.at(-1)}`);
-      await new Promise(resolve => setTimeout(resolve, 20));
-    }
+    mock.method(Date, "now", () => clock() + skew);
+    const tickUntil = async (steered: number) => {
+      for (let passes = 0; steers < steered; passes++) {
+        assert.ok(passes < 500, `the forward tries its steer ${steered} times within 10 s`);
+        assert.equal(await review.applyForward(stored, stored.ops[0]!), true, `the forward waits: ${recorded.at(-1)}`);
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+    };
+    await tickUntil(10);
+    assert.equal(gh.commands().length - reads, 1, "ten steer attempts within a minute follow one GitHub read");
+    skew = 61_000;
+    await tickUntil(11);
+    assert.equal(gh.commands().length - reads, 2, "a read older than a minute is taken again before the next steer");
     const waits = recorded.filter(text => text.startsWith("The owner's review PRR_1 for subtask a waits for its subteam."));
     assert.equal(waits.length, 1, JSON.stringify(recorded.slice(-4)));
     assert.ok(waits[0]!.includes(`The stopped command of team run ${f.run.id} may still be running.`), waits[0]);
@@ -687,7 +695,9 @@ test("a coordinator's forward that meets a stopped command that may still run wa
     const saved = f.readRecord<Saved>("team", f.run.id);
     assert.deepEqual([saved.run.revision, saved.run.steering.map(item => [item.text, item.source])], [2, [[forwarded, "coordinator"]]], "the forward steered the run once");
     assert.deepEqual(stored.reviews?.map(item => item.state), ["forwarded"]);
+    assert.equal(gh.commands().length - reads, 2, "the steer used the read taken within the last minute");
   } finally {
+    mock.restoreAll();
     await teams?.close();
     f.close();
   }

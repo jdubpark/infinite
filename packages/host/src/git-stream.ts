@@ -3,6 +3,7 @@ import { COMMIT_ID } from "./outcome-hold.js";
 import { isScopedPath } from "./goal-types.js";
 import type { TeamCommand } from "./team-types.js";
 import { teamGitArgs, teamGitEnvironment } from "./team-workspace.js";
+import { leaderExited, signalGroup, watchLeader } from "./process-group.js";
 
 export type StreamRead = { state: "read"; bytes: Buffer } | { state: "too-large" } | { state: "failed" };
 export type GitStreamRead =
@@ -29,13 +30,7 @@ function isMissingRefStderr(stderr: string, refs: readonly string[] | undefined)
 }
 
 export function stopGroup(child: ChildProcess): boolean {
-  try {
-    if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
-    else child.kill("SIGKILL");
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "EPERM";
-  }
-  return true;
+  return signalGroup(child, "SIGKILL") !== "refused";
 }
 
 export type GitStreamInput = {
@@ -56,6 +51,7 @@ export function readGitStream(input: GitStreamInput): Promise<GitStreamRead> {
       resolveRead({ state: "failed" });
       return;
     }
+    const leader = watchLeader(child);
     const chunks: Buffer[] = [];
     let stderrTail = Buffer.alloc(0);
     let total = 0, decided: GitStreamRead | undefined, resolved = false, timer: NodeJS.Timeout | undefined, release: NodeJS.Timeout | undefined;
@@ -75,7 +71,7 @@ export function readGitStream(input: GitStreamInput): Promise<GitStreamRead> {
       child.stdout?.destroy();
       child.stderr?.destroy();
       report?.(read);
-      if (!stop(child)) {
+      if (!leaderExited(child) && !stop(child)) {
         release = setTimeout(() => child.unref(), releaseMs);
         release.unref();
       }
@@ -112,8 +108,8 @@ export function readGitStream(input: GitStreamInput): Promise<GitStreamRead> {
     child.once("close", (exitCode, closeSignal) => {
       clear();
       if (release) clearTimeout(release);
-      if (decided) {
-        finish(decided);
+      if (decided || leader.leftover) {
+        finish(decided ?? { state: "failed" });
         return;
       }
       if (exitCode === 0 && closeSignal === null && child.stdout!.readableEnded) {

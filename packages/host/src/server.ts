@@ -63,6 +63,7 @@ import { withoutCodeMode } from "./session-listing.js";
 import { parseGoalCreateBody } from "./objective-input.js";
 import { routingRoutes } from "./routing-routes.js";
 import { spawnTeamBundle } from "./team-workspace.js";
+import { signalGroup, watchLeader } from "./process-group.js";
 import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
 import { scorecardFromRows, type ProfileIdentityOf } from "./scorecard.js";
 import { profileIdentity } from "./run-events.js";
@@ -1270,7 +1271,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     let finished = false, child: ReturnType<typeof spawnTeamBundle> | undefined;
     const stop = () => {
       if (!child || finished) return;
-      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch {}
+      signalGroup(child, "SIGKILL");
       child.stdout.destroy();
     };
     const disconnect = () => { if (!res.writableEnded) { stop(); finished = true; clearTimeout(timer); } };
@@ -1283,6 +1284,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     if (req.aborted || res.destroyed || res.writableEnded) return;
     const limit = 512 * 1024 * 1024;
     child = spawnTeamBundle(bundle.workspace, bundle.branch, config.teams?.commandPrefix);
+    const leader = watchLeader(child);
     res.status(200).set({ "Content-Type": "application/octet-stream", "X-Infinite-Branch": bundle.branch, "X-Infinite-Head": bundle.head });
     let size = 0;
     child.stdout.on("data", (chunk: Buffer) => {
@@ -1297,7 +1299,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       if (finished) return;
       finished = true;
       clearTimeout(timer);
-      if (code !== 0) res.destroy(); else res.end();
+      if (code !== 0 || leader.leftover) res.destroy(); else res.end();
     });
   });
   app.post("/api/teams", requireRole(["owner"]), async (req, res) => {

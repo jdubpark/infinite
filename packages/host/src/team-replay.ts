@@ -6,7 +6,7 @@ import { planDigest } from "./run-events.js";
 import type { Capsule, EvalFeatures, TrialEnding } from "./eval-types.js";
 import { JUDGE_PACKAGE_DIR, type Judgement, type JudgeEnding } from "./judge-types.js";
 import { judgePrompt } from "./judge-prompt.js";
-import type { Config, SessionPurpose } from "./types.js";
+import type { Config, ExecutionIdentity, SessionPurpose } from "./types.js";
 import type { TeamCommand, TeamMember, TeamModelProfile, TeamReport, TeamRun } from "./team-types.js";
 import { assertMemberReadOnly, assertSecureAncestors, TeamError } from "./team-workspace.js";
 
@@ -153,8 +153,8 @@ export class TeamReplay {
     return { prefix: this.launcher("setup"), input: `${url ?? ""}\n` };
   }
 
-  header(run: TeamRun): { purpose?: SessionPurpose } {
-    return run.replay ? { purpose: run.replay.purpose } : {};
+  header(run: TeamRun): { purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity } {
+    return run.replay ? { purpose: run.replay.purpose, executionIdentity: "eval" } : {};
   }
 
   trusted(run: TeamRun): boolean {

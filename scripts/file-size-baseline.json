@@ -12,7 +12,7 @@
     "packages/host/src/team-cli.ts": 1224,
     "packages/host/src/teams.ts": 3223,
     "packages/host/src/understanding-work.ts": 1021,
-    "packages/host/src/worker.ts": 1724,
+    "packages/host/src/worker.ts": 1720,
     "scripts/egress-proxy.mjs": 1253,
     "tests/client-cli.test.ts": 1349,
     "tests/evidence-outbox.test.ts": 1017,

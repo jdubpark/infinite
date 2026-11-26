@@ -111,7 +111,7 @@ export class Journal {
   append(type: Event["type"], data: Event["data"]): Event {
     return this.appendAll(type, [data])[0];
   }
-  appendAll(type: Event["type"], items: Event["data"][]): Event[] {
+  appendAll(type: Event["type"], items: readonly Event["data"][]): Event[] {
     const at = new Date().toISOString();
     const first = this.seq;
     const events = items.map(
@@ -136,12 +136,15 @@ export class Journal {
         closeSync(fd);
       }
       let size = segmentBytes - bytes.length;
-      for (let at = start; at < end; at++) {
-        size += Buffer.byteLength(lines[at - start]);
-        this.seq = events[at].seq;
-        this.options?.onAppend?.(events[at], { segment: name, bytes: size });
+      try {
+        for (let at = start; at < end; at++) {
+          size += Buffer.byteLength(lines[at - start]);
+          this.seq = events[at].seq;
+          this.options?.onAppend?.(events[at], { segment: name, bytes: size });
+        }
+      } finally {
+        this.seq = events[end - 1].seq;
       }
-      this.seq = events[end - 1].seq;
       start = end;
     }
     return events;

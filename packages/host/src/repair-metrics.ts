@@ -1,10 +1,46 @@
 import { reviewEvidenceProblems } from "./team-acceptance.js";
-import type { TeamBrief, TeamCheck, TeamMember, TeamRun } from "./team-types.js";
+import type { TeamBrief, TeamCheck, TeamContinuation, TeamMember, TeamRun } from "./team-types.js";
 import type { Provider } from "./types.js";
 import type { UsageTotals } from "./usage.js";
 
 export type RepairLoopCause = "review" | "check" | "delivery";
 export type RepairLoopOutcome = "resolved" | "blocked" | "cancelled" | "superseded" | "unresolved" | "in-progress";
+export type RepairEventCoverage = "complete" | "incomplete";
+
+export interface RepairRunEvent {
+  seq?: number;
+  kind: string;
+  revision: number;
+  at: string;
+  memberId?: string;
+  data: Record<string, unknown>;
+}
+
+export interface RepairRunFilter {
+  projectId?: string;
+  cutoffMs?: number;
+}
+
+export type RepairMetricsMember = Pick<
+  TeamMember,
+  "runId" | "memberId" | "revision" | "role" | "provider" | "status" | "baseCommit"
+  | "startedAt" | "reportedAt" | "stalledAt" | "stoppedReason" | "continuation" | "turns" | "report"
+>;
+
+export type RepairMetricsCheck = Pick<
+  TeamCheck,
+  "revision" | "round" | "headCommit" | "startedAt" | "finishedAt" | "status" | "phase"
+>;
+
+export type RepairMetricsRun = Pick<
+  TeamRun,
+  "id" | "projectId" | "provider" | "replay" | "revision" | "status" | "createdAt" | "updatedAt" | "brief"
+> & {
+  round?: number;
+  continuations?: readonly Pick<TeamContinuation, "revision" | "brief">[];
+  members: readonly RepairMetricsMember[];
+  checks: readonly RepairMetricsCheck[];
+};
 
 export interface RepairLoopSample {
   runId: string;
@@ -22,12 +58,15 @@ export interface RepairLoopSample {
   failedCommit?: string;
   passingCommit?: string;
   measured: boolean;
+  unfinished?: true;
   tokens?: number;
   usd?: number;
 }
 
 export interface RepairLoopTotals {
   runsExamined: number;
+  eventCoverage: RepairEventCoverage;
+  incompleteRuns: number;
   loopsTotal: number;
   resolved: number;
   unresolved: number;
@@ -37,6 +76,7 @@ export interface RepairLoopTotals {
   failedResumes: number;
   measuredLoops: number;
   unmeasuredLoops: number;
+  unfinishedLoops: number;
   unmeasuredMembers: number;
   medianMinutes: number | null;
   p90Minutes: number | null;
@@ -55,6 +95,7 @@ export interface RepairLoopOptions {
   projectId?: string;
   days?: number;
   now?: number;
+  runEvents?: (runId: string) => readonly RepairRunEvent[];
 }
 
 interface CheckBatch {
@@ -75,10 +116,26 @@ interface MemberItem {
   order: number;
   sortMs: number;
   slot: number;
-  member: TeamMember;
+  member: RepairMetricsMember;
 }
 
 type TimelineItem = CheckBatch | MemberItem;
+
+interface ParsedReviewEvent {
+  memberId: string;
+  verdict: "approved" | "changes-requested";
+  headCommit?: string;
+  at: string;
+  seq?: number;
+}
+
+interface ParsedRepairEvent {
+  round: number;
+  cause: RepairLoopCause;
+  headCommit?: string;
+  at: string;
+  seq?: number;
+}
 
 interface OpenLoop {
   cause: RepairLoopCause;
@@ -88,9 +145,18 @@ interface OpenLoop {
   awaitingNewRound: boolean;
   lastRoleInRound?: "integrator" | "reviewer";
   latestCheck: CheckBatch | null;
-  members: TeamMember[];
+  members: RepairMetricsMember[];
   checkBatches: CheckBatch[];
   coldReplacements: number;
+  sawUnrecordedApproval?: true;
+}
+
+interface ExtractedLoop {
+  revision: number;
+  loop: OpenLoop;
+  outcome: RepairLoopOutcome;
+  finishedAt?: string;
+  passingCommit?: string;
 }
 
 const DEFAULT_DAYS = 30;
@@ -113,7 +179,7 @@ function usageTokensSum(usage: UsageTotals): number {
   return input + output + reasoning + cacheRead + cacheWrite;
 }
 
-function hasFailedResume(member: TeamMember): boolean {
+function hasFailedResume(member: RepairMetricsMember): boolean {
   if (member.stoppedReason && /resume/i.test(member.stoppedReason)) return true;
   const turns = member.turns;
   if (!turns?.length) return false;
@@ -126,7 +192,87 @@ function hasFailedResume(member: TeamMember): boolean {
   return sawResume && member.continuation?.mode === "start";
 }
 
-function batchChecks(checks: readonly TeamCheck[]): CheckBatch[] {
+function memberAttempts(member: RepairMetricsMember): number {
+  const turns = member.turns;
+  if (!turns?.length) return 1;
+  const launches = new Set(turns.map(turn => `${turn.sessionId}\u0000${turn.mode}\u0000${turn.startedAt}`));
+  return Math.max(1, launches.size);
+}
+
+export function runMayOverlapWindow(
+  run: Pick<RepairMetricsRun, "replay" | "projectId" | "createdAt" | "updatedAt" | "members" | "checks">,
+  filter?: RepairRunFilter,
+): boolean {
+  if (run.replay) return false;
+  if (filter?.projectId !== undefined && run.projectId !== filter.projectId) return false;
+  if (filter?.cutoffMs === undefined) return true;
+  const runActivityMs = parseTime(run.updatedAt) ?? parseTime(run.createdAt);
+  if (runActivityMs !== undefined && runActivityMs >= filter.cutoffMs) return true;
+  for (const member of run.members) {
+    if (!LOOP_ROLES.has(member.role)) continue;
+    const ms = parseTime(member.reportedAt)
+      ?? parseTime(member.startedAt)
+      ?? parseTime(member.turns?.[0]?.startedAt)
+      ?? parseTime(member.stalledAt);
+    if (ms !== undefined && ms >= filter.cutoffMs) return true;
+  }
+  for (const check of run.checks) {
+    const ms = parseTime(check.finishedAt) ?? parseTime(check.startedAt);
+    if (ms !== undefined && ms >= filter.cutoffMs) return true;
+  }
+  return false;
+}
+
+export function snapshotRepairRun(run: TeamRun): RepairMetricsRun {
+  return {
+    id: run.id,
+    projectId: run.projectId,
+    provider: run.provider,
+    revision: run.revision,
+    round: run.round,
+    status: run.status,
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+    ...(run.brief ? { brief: structuredClone(run.brief) } : {}),
+    ...(run.continuations
+      ? {
+          continuations: run.continuations.map(item => ({
+            revision: item.revision,
+            ...(item.brief ? { brief: structuredClone(item.brief) } : {}),
+          })),
+        }
+      : {}),
+    members: run.members
+      .filter(member => LOOP_ROLES.has(member.role))
+      .map(member => ({
+        runId: member.runId,
+        memberId: member.memberId,
+        revision: member.revision,
+        role: member.role,
+        ...(member.provider === undefined ? {} : { provider: member.provider }),
+        status: member.status,
+        baseCommit: member.baseCommit,
+        ...(member.startedAt === undefined ? {} : { startedAt: member.startedAt }),
+        ...(member.reportedAt === undefined ? {} : { reportedAt: member.reportedAt }),
+        ...(member.stalledAt === undefined ? {} : { stalledAt: member.stalledAt }),
+        ...(member.stoppedReason === undefined ? {} : { stoppedReason: member.stoppedReason }),
+        ...(member.continuation === undefined ? {} : { continuation: { ...member.continuation } }),
+        ...(member.turns === undefined ? {} : { turns: member.turns.map(turn => ({ ...turn })) }),
+        ...(member.report === undefined ? {} : { report: structuredClone(member.report) }),
+      })),
+    checks: run.checks.map(check => ({
+      revision: check.revision,
+      ...(check.round === undefined ? {} : { round: check.round }),
+      ...(check.headCommit === undefined ? {} : { headCommit: check.headCommit }),
+      startedAt: check.startedAt,
+      ...(check.finishedAt === undefined ? {} : { finishedAt: check.finishedAt }),
+      status: check.status,
+      ...(check.phase === undefined ? {} : { phase: check.phase }),
+    })),
+  };
+}
+
+function batchChecks(checks: readonly RepairMetricsCheck[]): CheckBatch[] {
   const ordered = checks
     .map((check, index) => ({ check, index, ms: parseTime(check.startedAt) ?? Number.POSITIVE_INFINITY }))
     .sort((a, b) => a.ms - b.ms || a.index - b.index);
@@ -157,7 +303,7 @@ function batchChecks(checks: readonly TeamCheck[]): CheckBatch[] {
   return batches;
 }
 
-function memberSortMs(member: TeamMember): number {
+function memberSortMs(member: RepairMetricsMember): number {
   return parseTime(member.startedAt)
     ?? parseTime(member.turns?.[0]?.startedAt)
     ?? parseTime(member.stalledAt)
@@ -194,7 +340,7 @@ function checkSlotForTie(batch: CheckBatch, sameTimeMembers: readonly MemberItem
   return sameTimeMembers.at(-1)!.slot + 0.5;
 }
 
-function buildTimeline(run: TeamRun, revision: number): TimelineItem[] {
+function buildTimeline(run: RepairMetricsRun, revision: number): TimelineItem[] {
   const checks = batchChecks(run.checks.filter(check => check.revision === revision));
   const members: MemberItem[] = run.members
     .filter(member => member.revision === revision && LOOP_ROLES.has(member.role))
@@ -216,12 +362,129 @@ function buildTimeline(run: TeamRun, revision: number): TimelineItem[] {
   });
 }
 
-function briefForRevision(run: TeamRun, revision: number): TeamBrief | undefined {
+function parseRevisionEvents(
+  events: readonly RepairRunEvent[],
+  revision: number,
+): { reviewByMember: Map<string, ParsedReviewEvent>; repairs: ParsedRepairEvent[] } {
+  const reviewByMember = new Map<string, ParsedReviewEvent>();
+  const repairsByRound = new Map<number, ParsedRepairEvent>();
+  for (const event of events) {
+    if (event.revision !== revision) continue;
+    if (event.kind === "review.recorded") {
+      const verdict = event.data.verdict;
+      if (!event.memberId || (verdict !== "approved" && verdict !== "changes-requested")) continue;
+      const headCommit = typeof event.data.headCommit === "string" ? event.data.headCommit : undefined;
+      reviewByMember.set(event.memberId, {
+        memberId: event.memberId,
+        verdict,
+        ...(headCommit === undefined ? {} : { headCommit }),
+        at: event.at,
+        ...(event.seq === undefined ? {} : { seq: event.seq }),
+      });
+    } else if (event.kind === "repair.started") {
+      const round = event.data.round;
+      const cause = event.data.cause;
+      if (typeof round !== "number" || !Number.isInteger(round) || round < 1) continue;
+      if (cause !== "check" && cause !== "review" && cause !== "delivery") continue;
+      const headCommit = typeof event.data.headCommit === "string" ? event.data.headCommit : undefined;
+      repairsByRound.set(round, {
+        round,
+        cause,
+        ...(headCommit === undefined ? {} : { headCommit }),
+        at: event.at,
+        ...(event.seq === undefined ? {} : { seq: event.seq }),
+      });
+    }
+  }
+  const repairs = [...repairsByRound.values()].sort((a, b) =>
+    a.round - b.round || (a.seq ?? 0) - (b.seq ?? 0) || (parseTime(a.at) ?? 0) - (parseTime(b.at) ?? 0),
+  );
+  return { reviewByMember, repairs };
+}
+
+function bindRepairsToTimeline(
+  timeline: readonly TimelineItem[],
+  reviewByMember: ReadonlyMap<string, ParsedReviewEvent>,
+  repairs: readonly ParsedRepairEvent[],
+  brief: TeamBrief | undefined,
+): Map<TimelineItem, ParsedRepairEvent> {
+  const bound = new Map<TimelineItem, ParsedRepairEvent>();
+  for (const repair of repairs) {
+    const repairMs = parseTime(repair.at);
+    if (repair.cause === "check") {
+      let chosen: { item: CheckBatch; ms: number; index: number } | undefined;
+      for (let index = 0; index < timeline.length; index++) {
+        const item = timeline[index]!;
+        if (item.kind !== "check" || item.status !== "failed" || bound.has(item)) continue;
+        if (item.round !== undefined && item.round !== repair.round - 1) continue;
+        if (repair.headCommit !== undefined && item.headCommit !== undefined && item.headCommit !== repair.headCommit) continue;
+        const itemMs = parseTime(item.finishedAt ?? item.startedAt);
+        if (repairMs !== undefined && itemMs !== undefined && itemMs > repairMs) continue;
+        const scoreMs = itemMs ?? Number.NEGATIVE_INFINITY;
+        if (!chosen || scoreMs > chosen.ms || (scoreMs === chosen.ms && index > chosen.index)) {
+          chosen = { item, ms: scoreMs, index };
+        }
+      }
+      if (chosen) bound.set(chosen.item, repair);
+      continue;
+    }
+
+    if (repair.cause === "review") {
+      let chosen: { item: MemberItem; seq?: number; ms: number; index: number } | undefined;
+      for (let index = 0; index < timeline.length; index++) {
+        const item = timeline[index]!;
+        if (item.kind !== "member" || item.member.role !== "reviewer" || bound.has(item)) continue;
+        const report = item.member.report;
+        if (report?.kind !== "review" || report.verdict !== "changes-requested") continue;
+        if (reviewEvidenceProblems(brief, report).length > 0) continue;
+        const recorded = reviewByMember.get(item.member.memberId);
+        if (!recorded || recorded.verdict !== "changes-requested") continue;
+        if (recorded.headCommit !== undefined && recorded.headCommit !== item.member.baseCommit) continue;
+        if (repair.headCommit !== undefined && item.member.baseCommit !== repair.headCommit) continue;
+        if (repair.seq !== undefined && recorded.seq !== undefined) {
+          if (recorded.seq >= repair.seq) continue;
+          if (!chosen || (chosen.seq ?? Number.NEGATIVE_INFINITY) < recorded.seq) {
+            chosen = { item, seq: recorded.seq, ms: parseTime(recorded.at) ?? Number.NEGATIVE_INFINITY, index };
+          }
+          continue;
+        }
+        const itemMs = parseTime(item.member.reportedAt ?? recorded.at ?? item.member.startedAt);
+        if (repairMs !== undefined && itemMs !== undefined && itemMs > repairMs) continue;
+        const scoreMs = itemMs ?? Number.NEGATIVE_INFINITY;
+        if (!chosen || scoreMs > chosen.ms) {
+          chosen = { item, ms: scoreMs, index };
+        }
+      }
+      if (chosen) bound.set(chosen.item, repair);
+      continue;
+    }
+
+    let chosen: { item: MemberItem; ms: number; index: number } | undefined;
+    for (let index = 0; index < timeline.length; index++) {
+      const item = timeline[index]!;
+      if (item.kind !== "member" || item.member.role !== "delivery" || bound.has(item)) continue;
+      const report = item.member.report;
+      if (report?.kind !== "delivery-repair") continue;
+      if (report.headCommit !== item.member.baseCommit) continue;
+      if (repair.headCommit !== undefined && report.headCommit !== repair.headCommit) continue;
+      const itemMs = parseTime(item.member.reportedAt ?? item.member.startedAt);
+      if (repairMs !== undefined && itemMs !== undefined && itemMs > repairMs) continue;
+      const scoreMs = itemMs ?? Number.NEGATIVE_INFINITY;
+      if (!chosen || scoreMs > chosen.ms || (scoreMs === chosen.ms && index > chosen.index)) {
+        chosen = { item, ms: scoreMs, index };
+      }
+    }
+    if (chosen) bound.set(chosen.item, repair);
+  }
+  return bound;
+}
+
+function briefForRevision(run: RepairMetricsRun, revision: number): TeamBrief | undefined {
   if (revision === run.revision) return run.brief;
   return run.continuations?.find(item => item.revision === revision)?.brief;
 }
 
-function endOutcome(run: TeamRun, revision: number): RepairLoopOutcome {
+function endOutcome(run: RepairMetricsRun, revision: number): RepairLoopOutcome {
   if (run.revision > revision) return "superseded";
   if (run.status === "blocked") return "blocked";
   if (run.status === "cancelled") return "cancelled";
@@ -230,26 +493,30 @@ function endOutcome(run: TeamRun, revision: number): RepairLoopOutcome {
 }
 
 function finalizeLoop(
-  run: TeamRun,
-  revision: number,
-  loop: OpenLoop,
-  outcome: RepairLoopOutcome,
-  memberUsage: (member: TeamMember, fallbackProvider: Provider) => UsageTotals | undefined,
-  finishedAt?: string,
-  passingCommit?: string,
+  run: RepairMetricsRun,
+  extracted: ExtractedLoop,
+  memberUsage: (member: RepairMetricsMember, fallbackProvider: Provider) => UsageTotals | undefined,
 ): { sample: RepairLoopSample; unmeasuredMembers: number } {
+  const { revision, loop, outcome, finishedAt, passingCommit } = extracted;
+  const unfinished = outcome === "in-progress" || loop.members.some(member => member.status !== "stopped");
   let failedResumes = 0;
   let unmeasuredMembers = 0;
-  let allMeasured = loop.members.length > 0;
+  let memberLaunchAttempts = 0;
+  let allMeasured = !unfinished && loop.members.length > 0;
   let tokens = 0;
   let microUsd = 0;
   for (const member of loop.members) {
+    memberLaunchAttempts += memberAttempts(member);
     if (hasFailedResume(member)) failedResumes += 1;
+    if (member.status !== "stopped") {
+      allMeasured = false;
+      continue;
+    }
     const usage = memberUsage(member, run.provider);
     if (!usage || usage.pricing.unknown > 0) {
       unmeasuredMembers += 1;
       allMeasured = false;
-    } else {
+    } else if (!unfinished) {
       tokens += usageTokensSum(usage);
       microUsd += Math.round(usage.cost * 1_000_000);
     }
@@ -264,7 +531,7 @@ function finalizeLoop(
     cause: loop.cause,
     outcome,
     rounds: loop.rounds,
-    attempts: loop.members.length + loop.checkBatches.length,
+    attempts: memberLaunchAttempts + loop.checkBatches.length,
     coldReplacements: loop.coldReplacements,
     failedResumes,
     startedAt: loop.startedAt,
@@ -273,51 +540,104 @@ function finalizeLoop(
     ...(loop.failedCommit ? { failedCommit: loop.failedCommit } : {}),
     ...(outcome === "resolved" && passingCommit ? { passingCommit } : {}),
     measured: allMeasured,
+    ...(unfinished ? { unfinished: true as const } : {}),
     ...(allMeasured ? { tokens, usd: microUsd / 1_000_000 } : {}),
   };
   return { sample, unmeasuredMembers };
 }
 
-function extractRevisionLoops(
-  run: TeamRun,
+function revisionOverlapsWindow(
+  run: RepairMetricsRun,
   revision: number,
-  memberUsage: (member: TeamMember, fallbackProvider: Provider) => UsageTotals | undefined,
-): { sample: RepairLoopSample; unmeasuredMembers: number }[] {
+  events: readonly RepairRunEvent[],
+  cutoffMs: number,
+  runActivityMs: number | undefined,
+): boolean {
+  if (revision === run.revision && runActivityMs !== undefined && runActivityMs >= cutoffMs) return true;
+  for (const member of run.members) {
+    if (member.revision !== revision || !LOOP_ROLES.has(member.role)) continue;
+    const ms = parseTime(member.reportedAt)
+      ?? parseTime(member.startedAt)
+      ?? parseTime(member.turns?.[0]?.startedAt)
+      ?? parseTime(member.stalledAt);
+    if (ms !== undefined && ms >= cutoffMs) return true;
+  }
+  for (const check of run.checks) {
+    if (check.revision !== revision) continue;
+    const ms = parseTime(check.finishedAt) ?? parseTime(check.startedAt);
+    if (ms !== undefined && ms >= cutoffMs) return true;
+  }
+  for (const event of events) {
+    if (event.revision !== revision) continue;
+    const ms = parseTime(event.at);
+    if (ms !== undefined && ms >= cutoffMs) return true;
+  }
+  return false;
+}
+
+function extractRevisionLoops(
+  run: RepairMetricsRun,
+  revision: number,
+  events: readonly RepairRunEvent[],
+): { loops: ExtractedLoop[]; incomplete: boolean } {
   const timeline = buildTimeline(run, revision);
-  const extracted: { sample: RepairLoopSample; unmeasuredMembers: number }[] = [];
+  const extracted: ExtractedLoop[] = [];
   const brief = briefForRevision(run, revision);
+  const { reviewByMember, repairs } = parseRevisionEvents(events, revision);
+  const repairByTrigger = bindRepairsToTimeline(timeline, reviewByMember, repairs, brief);
+  const repairRounds = new Set(repairs.map(item => item.round));
+  let incomplete = repairByTrigger.size < repairs.length;
+  if (revision === run.revision && (run.round ?? 0) >= 1) {
+    for (let round = 1; round <= run.round!; round++) {
+      if (!repairRounds.has(round)) incomplete = true;
+    }
+  }
+  for (const check of run.checks) {
+    if (check.revision === revision && check.round !== undefined && check.round >= 1 && !repairRounds.has(check.round)) {
+      incomplete = true;
+    }
+  }
+  let sawRepairTriggerSignal = false;
   let active: OpenLoop | null = null;
 
   for (let index = 0; index < timeline.length; index++) {
     const item = timeline[index]!;
+    const boundRepair = repairByTrigger.get(item);
+
     if (item.kind === "check") {
+      if (item.status === "failed") sawRepairTriggerSignal = true;
       if (active) {
         active.checkBatches.push(item);
         active.latestCheck = item;
         active.lastRoleInRound = undefined;
-        if (item.status === "failed") active.awaitingNewRound = true;
-      } else if (item.status === "failed") {
-        const leadsToIntegrator = timeline.slice(index + 1).some(later => later.kind === "member" && later.member.role === "integrator");
-        if (leadsToIntegrator) {
-          active = {
-            cause: "check",
-            startedAt: item.finishedAt ?? item.startedAt,
-            failedCommit: item.headCommit,
-            rounds: 1,
-            awaitingNewRound: false,
-            latestCheck: item,
-            members: [],
-            checkBatches: [item],
-            coldReplacements: 0,
-          };
+        if (boundRepair) {
+          active.rounds += 1;
+          active.awaitingNewRound = false;
+        } else if (item.status === "failed") {
+          active.awaitingNewRound = true;
         }
+      } else if (item.status === "failed" && boundRepair) {
+        active = {
+          cause: "check",
+          startedAt: item.finishedAt ?? item.startedAt,
+          failedCommit: item.headCommit ?? boundRepair.headCommit,
+          rounds: 1,
+          awaitingNewRound: false,
+          latestCheck: item,
+          members: [],
+          checkBatches: [item],
+          coldReplacements: 0,
+        };
       }
       continue;
     }
 
     const { member } = item;
     if (member.role === "integrator") {
-      if (!active) continue;
+      if (!active) {
+        if (sawRepairTriggerSignal) incomplete = true;
+        continue;
+      }
       active.members.push(member);
       active.latestCheck = null;
       if (active.awaitingNewRound) {
@@ -333,11 +653,15 @@ function extractRevisionLoops(
     }
 
     if (member.role === "reviewer") {
+      if (member.report?.kind === "review" && member.report.verdict === "changes-requested") {
+        sawRepairTriggerSignal = true;
+      }
+      const recorded = reviewByMember.get(member.memberId);
       if (!active) {
-        if (member.report?.kind === "review" && member.report.verdict === "changes-requested") {
+        if (boundRepair) {
           active = {
             cause: "review",
-            startedAt: member.reportedAt ?? member.startedAt ?? run.updatedAt,
+            startedAt: member.reportedAt ?? recorded?.at ?? member.startedAt ?? run.updatedAt,
             failedCommit: member.baseCommit,
             rounds: 1,
             awaitingNewRound: false,
@@ -363,25 +687,42 @@ function extractRevisionLoops(
           && active.latestCheck?.status === "passed"
           && active.latestCheck.hasVerificationCheck
           && (!active.latestCheck.headCommit || active.latestCheck.headCommit === member.baseCommit);
-        if (checkReady && evidenceProblems.length === 0 && !replacedSameCommit) {
-          const finishedAt = member.reportedAt ?? member.startedAt ?? run.updatedAt;
+        const approvedByHost = recorded?.verdict === "approved"
+          && typeof recorded.headCommit === "string"
+          && recorded.headCommit === member.baseCommit
+          && (!active.latestCheck?.headCommit || recorded.headCommit === active.latestCheck.headCommit);
+        if (checkReady && approvedByHost && evidenceProblems.length === 0 && !replacedSameCommit) {
+          const finishedAt = member.reportedAt ?? recorded.at ?? member.startedAt ?? run.updatedAt;
           const passingCommit = active.latestCheck!.headCommit ?? member.baseCommit;
-          extracted.push(finalizeLoop(run, revision, active, "resolved", memberUsage, finishedAt, passingCommit));
+          extracted.push({ revision, loop: active, outcome: "resolved", finishedAt, passingCommit });
           active = null;
+        } else if (checkReady && !approvedByHost && evidenceProblems.length === 0 && !replacedSameCommit) {
+          active.sawUnrecordedApproval = true;
         }
-      } else if (member.report?.kind === "review" && member.report.verdict === "changes-requested") {
+      } else if (boundRepair) {
+        active.rounds += 1;
+        active.awaitingNewRound = false;
+        active.latestCheck = null;
+        active.lastRoleInRound = undefined;
+      } else if (
+        member.report?.kind === "review"
+        && member.report.verdict === "changes-requested"
+        && recorded?.verdict === "changes-requested"
+      ) {
         active.awaitingNewRound = true;
         active.latestCheck = null;
       }
       continue;
     }
 
-    if (member.role === "delivery" && member.report?.kind === "delivery-repair") {
+    if (member.role === "delivery") {
+      if (member.report?.kind === "delivery-repair") sawRepairTriggerSignal = true;
+      if (!boundRepair) continue;
       if (!active) {
         active = {
           cause: "delivery",
           startedAt: member.reportedAt ?? member.startedAt ?? run.updatedAt,
-          failedCommit: member.report.headCommit ?? member.baseCommit,
+          failedCommit: member.report?.kind === "delivery-repair" ? member.report.headCommit : member.baseCommit,
           rounds: 1,
           awaitingNewRound: false,
           latestCheck: null,
@@ -390,14 +731,21 @@ function extractRevisionLoops(
           coldReplacements: 0,
         };
       } else {
-        active.awaitingNewRound = true;
+        active.rounds += 1;
+        active.awaitingNewRound = false;
         active.latestCheck = null;
+        active.lastRoleInRound = undefined;
       }
     }
   }
 
-  if (active) extracted.push(finalizeLoop(run, revision, active, endOutcome(run, revision), memberUsage));
-  return extracted;
+  if (active) {
+    if (active.sawUnrecordedApproval && revision === run.revision && (run.status === "ready-for-review" || run.status === "merged")) {
+      incomplete = true;
+    }
+    extracted.push({ revision, loop: active, outcome: endOutcome(run, revision) });
+  }
+  return { loops: extracted, incomplete };
 }
 
 function median(values: readonly number[]): number | null {
@@ -414,32 +762,52 @@ function p90(values: readonly number[]): number | null {
 }
 
 export function computeRepairLoopMetrics(
-  runs: readonly TeamRun[],
-  memberUsage: (member: TeamMember, fallbackProvider: Provider) => UsageTotals | undefined,
+  runs: readonly RepairMetricsRun[],
+  memberUsage: (member: RepairMetricsMember, fallbackProvider: Provider) => UsageTotals | undefined,
   options?: RepairLoopOptions,
 ): RepairLoopReport {
   const windowDays = options?.days ?? DEFAULT_DAYS;
   const now = options?.now ?? Date.now();
   const cutoffMs = now - windowDays * DAY_MS;
   const projectId = options?.projectId;
+  const filter: RepairRunFilter = { ...(projectId === undefined ? {} : { projectId }), cutoffMs };
 
   let runsExamined = 0;
+  let incompleteRuns = 0;
   let unmeasuredMembers = 0;
   const allSamples: RepairLoopSample[] = [];
 
   for (const run of runs) {
-    if (run.replay) continue;
-    if (projectId !== undefined && run.projectId !== projectId) continue;
-    const revisions = [...new Set([...run.members.map(m => m.revision), ...run.checks.map(c => c.revision)])].sort((a, b) => a - b);
-    const runLoops = revisions.flatMap(revision => extractRevisionLoops(run, revision, memberUsage));
-    const inWindowLoops = runLoops.filter(item => {
-      const startMs = parseTime(item.sample.startedAt);
+    if (!runMayOverlapWindow(run, filter)) continue;
+    const events = options?.runEvents ? options.runEvents(run.id) : [];
+    const runActivityMs = parseTime(run.updatedAt) ?? parseTime(run.createdAt);
+    const hasLedgerGap = events.some(event => event.kind === "ledger.gap");
+    const revisions = [...new Set([
+      run.revision,
+      ...run.members.map(m => m.revision),
+      ...run.checks.map(c => c.revision),
+      ...events.map(e => e.revision),
+    ])].sort((a, b) => a - b);
+    const extractedLoops: ExtractedLoop[] = [];
+    let runIncomplete = hasLedgerGap;
+    for (const revision of revisions) {
+      const result = extractRevisionLoops(run, revision, events);
+      extractedLoops.push(...result.loops);
+      if (result.incomplete && revisionOverlapsWindow(run, revision, events, cutoffMs, runActivityMs)) {
+        runIncomplete = true;
+      }
+    }
+    const inWindowExtracted = extractedLoops.filter(item => {
+      const startMs = parseTime(item.loop.startedAt);
       return startMs !== undefined && startMs >= cutoffMs;
     });
-    const runActivityMs = parseTime(run.updatedAt) ?? parseTime(run.createdAt);
-    const runInWindow = (runActivityMs !== undefined && runActivityMs >= cutoffMs) || inWindowLoops.length > 0;
-    if (runInWindow) runsExamined += 1;
-    for (const item of inWindowLoops) {
+    const runInWindow = (runActivityMs !== undefined && runActivityMs >= cutoffMs) || inWindowExtracted.length > 0;
+    if (runInWindow) {
+      runsExamined += 1;
+      if (runIncomplete) incompleteRuns += 1;
+    }
+    for (const extracted of inWindowExtracted) {
+      const item = finalizeLoop(run, extracted, memberUsage);
       allSamples.push(item.sample);
       unmeasuredMembers += item.unmeasuredMembers;
     }
@@ -455,6 +823,7 @@ export function computeRepairLoopMetrics(
   let failedResumes = 0;
   let measuredLoops = 0;
   let unmeasuredLoops = 0;
+  let unfinishedLoops = 0;
   const resolvedMinutes: number[] = [];
   const measuredTokens: number[] = [];
   const measuredUsd: number[] = [];
@@ -475,6 +844,8 @@ export function computeRepairLoopMetrics(
       measuredLoops += 1;
       measuredTokens.push(sample.tokens);
       measuredUsd.push(sample.usd);
+    } else if (sample.unfinished) {
+      unfinishedLoops += 1;
     } else {
       unmeasuredLoops += 1;
     }
@@ -490,6 +861,8 @@ export function computeRepairLoopMetrics(
     ...(projectId === undefined ? {} : { projectId }),
     totals: {
       runsExamined,
+      eventCoverage: incompleteRuns > 0 ? "incomplete" : "complete",
+      incompleteRuns,
       loopsTotal: allSamples.length,
       resolved,
       unresolved,
@@ -499,6 +872,7 @@ export function computeRepairLoopMetrics(
       failedResumes,
       measuredLoops,
       unmeasuredLoops,
+      unfinishedLoops,
       unmeasuredMembers,
       medianMinutes: medianMin === null ? null : roundTo(medianMin, 100),
       p90Minutes: p90Min === null ? null : roundTo(p90Min, 100),

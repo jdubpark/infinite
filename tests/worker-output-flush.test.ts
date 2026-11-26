@@ -206,12 +206,13 @@ test("a resize refused by a full output queue leaves the program, the worker's s
   }
 });
 
-test("a resize refused at the drain deadline leaves the program, the worker's state, the journal and the size index at the old size", { timeout: 60_000 }, async () => {
-  const worker = await start({ INFINITE_TEST_TERMINAL_DRAIN_DELAY_MS: "1500" });
+test("a resize refused at the drain deadline leaves the program, the worker's state, the journal and the size index at the last applied size", { timeout: 60_000 }, async () => {
+  const worker = await start({ INFINITE_TEST_TERMINAL_DRAIN_DELAY_MS: "1500", INFINITE_TEST_TERMINAL_DRAIN_FAST: "1" });
   try {
+    await worker.call({ op: "resize", cols: 110, rows: 31 });
     await assert.rejects(worker.call({ op: "resize", cols: 100, rows: 30 }), { message: "Terminal renderer is busy" });
-    const old = { ...DEFAULT_TERMINAL_SIZE };
-    assert.deepEqual(await worker.sizes(), { program: old, state: old, index: old, resizes: 0 });
+    const applied = { cols: 110, rows: 31 };
+    assert.deepEqual(await worker.sizes(), { program: applied, state: applied, index: applied, resizes: 1 });
   } finally {
     await worker.stop();
   }

@@ -398,7 +398,8 @@ test("n. under a command prefix the check's command runs behind the anchor, and 
   try {
     sandbox.config.teams!.commandPrefix = RELAY_PREFIX;
     const run: MainCheckPorts["run"] = (command, cwd, signal, _timeoutMs, prefix, input, extraEnv, forceSettleAfterMs, onOutput) => { seen.push(command); return teamCommand(command, cwd, signal, 1_500, prefix, input, extraEnv, forceSettleAfterMs, onOutput); };
-    await sandbox.start({ run });
+    const processes: MainCheckPorts["processes"] = { table: async () => ({ boot: bootId(), rows: [] }), start: async () => undefined, census: async () => ({ ok: true, findings: [] }) };
+    await sandbox.start({ run, processes });
     sandbox.fetch();
     await sandbox.until("the end of the check", () => sandbox.view().last !== undefined);
     assert.equal(seen[0]?.command, "sh");

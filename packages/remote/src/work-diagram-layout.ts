@@ -180,19 +180,28 @@ function placeGroupsAndNonMembersOutside(
   return groupBoxes(diagram, nodes);
 }
 
+function deduplicateById<T extends { id: string }>(items: readonly T[]): T[] {
+  const seen = new Set<string>();
+  const unique: T[] = [];
+  for (const item of items) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    unique.push(item);
+  }
+  return unique;
+}
+
 function layoutSequence(sequence: NonNullable<Diagram["sequence"]>): DiagramLayout {
   const spacing = NODE_W + LAYER_GAP;
-  const lanes = sequence.participants.map((participant, index) => ({
+  const participants = deduplicateById(sequence.participants);
+  const lanes = participants.map((participant, index) => ({
     id: participant.id,
     label: participant.label,
     x: index * spacing,
   }));
-  const laneById = new Map<string, number>();
-  sequence.participants.forEach((participant, index) => {
-    if (!laneById.has(participant.id)) laneById.set(participant.id, index);
-  });
+  const laneById = new Map(participants.map((participant, index) => [participant.id, index]));
 
-  const nodes: LayoutNode[] = sequence.participants.map((participant, index) => ({
+  const nodes: LayoutNode[] = participants.map((participant, index) => ({
     id: participant.id,
     x: index * spacing,
     y: 0,
@@ -243,11 +252,11 @@ function layoutSequence(sequence: NonNullable<Diagram["sequence"]>): DiagramLayo
 export function layoutDiagram(diagram: Pick<Diagram, "direction" | "nodes" | "edges" | "groups" | "sequence">): DiagramLayout {
   if (diagram.sequence) return layoutSequence(diagram.sequence);
 
-  const ids = diagram.nodes.map(node => node.id);
-  const indexById = new Map<string, number>();
-  ids.forEach((id, index) => {
-    if (!indexById.has(id)) indexById.set(id, index);
-  });
+  const uniqueNodes = deduplicateById(diagram.nodes);
+  const uniqueGroups = deduplicateById(diagram.groups);
+  const normalized = { ...diagram, nodes: uniqueNodes, groups: uniqueGroups };
+  const ids = uniqueNodes.map(node => node.id);
+  const indexById = new Map(ids.map((id, index) => [id, index]));
   const edges: EdgeRef[] = diagram.edges
     .map((edge, index) => ({ from: edge.from, to: edge.to, index }))
     .filter(edge => indexById.has(edge.from) && indexById.has(edge.to));
@@ -373,13 +382,13 @@ export function layoutDiagram(diagram: Pick<Diagram, "direction" | "nodes" | "ed
         y: diagram.direction === "LR" ? crossOffset : MARGIN + layerIndex * (NODE_H + LAYER_GAP),
         w: NODE_W,
         h: NODE_H,
-        lines: wrapLabel(diagram.nodes[indexById.get(id) ?? 0]?.label ?? ""),
+        lines: wrapLabel(uniqueNodes[indexById.get(id) ?? 0]?.label ?? ""),
       };
       nodesById.set(id, node);
     }
   }
   const nodes = ids.map(id => nodesById.get(id)).filter((node): node is LayoutNode => node !== undefined);
-  const groups = placeGroupsAndNonMembersOutside(diagram, layerIds, nodes);
+  const groups = placeGroupsAndNonMembersOutside(normalized, layerIds, nodes);
 
   const layoutEdges: LayoutEdge[] = [];
   for (const edge of diagram.edges) {

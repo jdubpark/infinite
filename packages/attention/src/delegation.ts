@@ -1,4 +1,5 @@
 import type { Prompt } from "./types.js";
+import { isTruncatedArrayMarker } from "./truncate.js";
 
 const CODEX_COMMAND_TITLE = /^would you like to run the following command\?$/i;
 
@@ -32,9 +33,10 @@ export function oneShotPermissionOption(prompt: Prompt): number | undefined {
   return accepted.length === 1 && rejected ? accepted[0].index : undefined;
 }
 
-function hasTruncatedEvidence(value: unknown): boolean {
+export function hasTruncatedEvidence(value: unknown): boolean {
   if (typeof value === "string") return /(?:…|\.\.\.)\s*\[\+\d+ chars\]$/.test(value) || value === "[truncated]";
-  if (Array.isArray(value)) return value.length >= 50 || value.some(hasTruncatedEvidence);
+  if (isTruncatedArrayMarker(value)) return true;
+  if (Array.isArray(value)) return value.some(hasTruncatedEvidence);
   if (value && typeof value === "object") return Object.values(value).some(hasTruncatedEvidence);
   return false;
 }

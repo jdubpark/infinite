@@ -81,3 +81,74 @@ test("sequence layout gives lanes and ordered message rows", () => {
   assert.equal(l.edges[0]!.points[0]![1], NODE_H + 36);
   assert.equal(l.edges[1]!.points[0]![1], NODE_H + 72);
 });
+
+test("duplicate node IDs deduplicate first-wins without corrupting topological layering or groups", () => {
+  const d: Pick<Diagram, "direction" | "nodes" | "edges" | "groups" | "sequence"> = {
+    direction: "LR",
+    nodes: [
+      { id: "A", label: "First A", shape: "box", group: "G1" },
+      { id: "A", label: "Second A", shape: "box", group: "G2" },
+      { id: "B", label: "B", shape: "box" },
+      { id: "C", label: "C", shape: "box" },
+      { id: "Y", label: "Y", shape: "box" },
+      { id: "X", label: "X", shape: "box" },
+    ],
+    edges: [
+      { from: "A", to: "B", style: "solid" },
+      { from: "Y", to: "X", style: "solid" },
+      { from: "X", to: "B", style: "solid" },
+      { from: "B", to: "C", style: "solid" },
+    ],
+    groups: [
+      { id: "G1", label: "Group 1" },
+      { id: "G1", label: "Group 1 duplicate" },
+      { id: "G2", label: "Group 2" },
+    ],
+  };
+  const l = layoutDiagram(d);
+  assert.deepEqual(l.nodes.map(node => node.id), ["A", "B", "C", "Y", "X"]);
+  assert.deepEqual(l.nodes.find(node => node.id === "A")!.lines, ["First A"]);
+  assert.deepEqual(l.groups.map(group => ({ id: group.id, label: group.label })), [{ id: "G1", label: "Group 1" }]);
+  const x = Object.fromEntries(l.nodes.map(node => [node.id, node.x]));
+  assert.ok(x.A < x.B && x.Y < x.X && x.X < x.B && x.B < x.C);
+  const a = l.nodes.find(node => node.id === "A")!;
+  const g1 = l.groups[0]!;
+  assert.ok(a.x >= g1.x && a.y >= g1.y && a.x + a.w <= g1.x + g1.w && a.y + a.h <= g1.y + g1.h);
+  assert.deepEqual(l, layoutDiagram(d));
+});
+
+test("duplicate node IDs in cycles and sequence participants remain unique and deterministic", () => {
+  const cyclic = flow("LR", ["A", "B", "A", "C"], [["A", "B"], ["B", "A"], ["B", "C"], ["A", "A"]]);
+  const l = layoutDiagram(cyclic);
+  assert.deepEqual(l.nodes.map(node => node.id), ["A", "B", "C"]);
+  assert.equal(l.edges.length, 4);
+  assert.ok(l.width > 0 && l.height > 0);
+  assert.deepEqual(l, layoutDiagram(cyclic));
+
+  const seq = layoutDiagram({
+    direction: "LR",
+    nodes: [],
+    edges: [],
+    groups: [],
+    sequence: {
+      participants: [
+        { id: "A", label: "First API" },
+        { id: "B", label: "Worker" },
+        { id: "A", label: "Second API" },
+      ],
+      messages: [
+        { from: "A", to: "B", text: "req", style: "solid" },
+        { from: "B", to: "A", text: "rep", style: "dashed" },
+      ],
+    },
+  });
+  assert.deepEqual(seq.lanes?.map(lane => ({ id: lane.id, label: lane.label, x: lane.x })), [
+    { id: "A", label: "First API", x: 0 },
+    { id: "B", label: "Worker", x: NODE_W + LAYER_GAP },
+  ]);
+  assert.deepEqual(seq.nodes.map(node => ({ id: node.id, lines: node.lines })), [
+    { id: "A", lines: ["First API"] },
+    { id: "B", lines: ["Worker"] },
+  ]);
+  assert.equal(seq.edges.length, 2);
+});

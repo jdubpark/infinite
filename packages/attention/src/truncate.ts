@@ -1,6 +1,12 @@
 const SHORT_FIELDS = new Set(["content", "old_string", "new_string"]);
 const CAP_BYTES = 16 * 1024;
 const MIN_CHARS = 200;
+export const MAX_ARRAY_ITEMS = 50;
+
+export interface TruncatedArrayMarker {
+  "[truncated]": true;
+  omitted: number;
+}
 
 export function cut(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)} … [+${text.length - max} chars]`;
@@ -23,6 +29,13 @@ interface Slot { container: Record<string, unknown> | unknown[]; key: string | n
 const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 const set = (slot: Slot, value: string) => { (slot.container as Record<string | number, unknown>)[slot.key] = value; };
 
+export function isTruncatedArrayMarker(value: unknown): value is TruncatedArrayMarker {
+  if (!isObject(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === 2 && value["[truncated]"] === true &&
+    typeof value.omitted === "number" && Number.isInteger(value.omitted) && value.omitted > 0;
+}
+
 export function truncateInput(input: Record<string, unknown>): Record<string, unknown> {
   const slots: Slot[] = [];
 
@@ -33,7 +46,9 @@ export function truncateInput(input: Record<string, unknown>): Record<string, un
     }
     if (Array.isArray(value)) {
       const arr: unknown[] = [];
-      value.slice(0, 50).forEach((item, i) => { arr[i] = copyValue(arr, i, item, depth + 1, 4000); });
+      const kept = Math.min(value.length, MAX_ARRAY_ITEMS);
+      for (let i = 0; i < kept; i++) arr[i] = copyValue(arr, i, value[i], depth + 1, 4000);
+      if (value.length > MAX_ARRAY_ITEMS) arr.push({ "[truncated]": true, omitted: value.length - MAX_ARRAY_ITEMS } satisfies TruncatedArrayMarker);
       return arr;
     }
     if (isObject(value) && depth < 3) return copyObject(value, depth + 1);

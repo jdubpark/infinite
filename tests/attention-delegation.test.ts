@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { Prompt } from "@infinite/attention";
-import { detectPrompt, dialogCommand, oneShotPermissionOption } from "@infinite/attention";
+import { detectPrompt, dialogCommand, hasTruncatedEvidence, oneShotPermissionOption, truncateInput } from "@infinite/attention";
 
 const dialog: Prompt = {
   id: 7,
@@ -198,4 +198,47 @@ test("a dialog whose detail runs past the parser's cap is marked truncated and n
   assert.match(prompt.detail ?? "", /… \[\+\d+ chars\]$/);
   assert.equal(dialogCommand(prompt), undefined, "a cut command is not a complete command");
   assert.equal(oneShotPermissionOption(prompt), undefined);
+});
+
+test("array truncation detection accepts untruncated 50-item arrays and rejects truncated top-level and nested arrays", () => {
+  const hookPrompt = (input: Record<string, unknown>): Prompt => ({
+    ...dialog,
+    source: "hook",
+    tool: { name: "MultiEdit", input: JSON.parse(JSON.stringify(input)) as Record<string, unknown>, inputComplete: true },
+  });
+
+  const exact50 = truncateInput({ edits: Array.from({ length: 50 }, (_, i) => ({ old_string: String(i), new_string: "x" })) });
+  assert.equal(hasTruncatedEvidence(exact50), false);
+  assert.equal(oneShotPermissionOption(hookPrompt(exact50)), 0);
+
+  const truncated51 = truncateInput({ edits: Array.from({ length: 51 }, (_, i) => ({ old_string: String(i), new_string: "x" })) });
+  assert.equal(hasTruncatedEvidence(truncated51), true);
+  assert.equal(oneShotPermissionOption(hookPrompt(truncated51)), undefined);
+
+  const nestedExact = truncateInput({
+    batch: { groups: [{ items: Array.from({ length: 50 }, (_, i) => i) }] },
+    matrix: [Array.from({ length: 50 }, (_, i) => i)],
+  });
+  assert.equal(hasTruncatedEvidence(nestedExact), false);
+  assert.equal(oneShotPermissionOption(hookPrompt(nestedExact)), 0);
+
+  const nestedObjectTruncated = truncateInput({
+    batch: { groups: [{ items: Array.from({ length: 51 }, (_, i) => i) }] },
+  });
+  assert.equal(hasTruncatedEvidence(nestedObjectTruncated), true);
+  assert.equal(oneShotPermissionOption(hookPrompt(nestedObjectTruncated)), undefined);
+
+  const nestedArrayTruncated = truncateInput({
+    matrix: [[Array.from({ length: 51 }, (_, i) => i)]],
+  });
+  assert.equal(hasTruncatedEvidence(nestedArrayTruncated), true);
+  assert.equal(oneShotPermissionOption(hookPrompt(nestedArrayTruncated)), undefined);
+
+  const collapsed = truncateInput({
+    items: Array.from({ length: 51 }, () => ({ a: "x".repeat(200), b: "y".repeat(200) })),
+  });
+  assert.equal(hasTruncatedEvidence(collapsed), true);
+  assert.equal(oneShotPermissionOption(hookPrompt(collapsed)), undefined);
+  assert.equal(hasTruncatedEvidence({ nested: { note: "abc … [+5 chars]" } }), true);
+  assert.equal(hasTruncatedEvidence({ nested: "[truncated]" }), true);
 });

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mapClaudeHook, claudeAgent } from "../packages/attention/src/claude.js";
 import { mapCodexHook, mapCodexNotify, mapCodexOsc } from "../packages/attention/src/codex.js";
-import { cut, truncateInput } from "../packages/attention/src/truncate.js";
+import { cut, isTruncatedArrayMarker, MAX_ARRAY_ITEMS, truncateInput } from "../packages/attention/src/truncate.js";
 
 const base = { session_id: "s", transcript_path: "/t", cwd: "/w", permission_mode: "default" };
 
@@ -117,10 +117,34 @@ test("truncateInput enforces the 16 KiB UTF-8 cap", () => {
   const bytes = (v: unknown) => new TextEncoder().encode(JSON.stringify(v)).length;
   const arr = truncateInput({ items: Array.from({ length: 50 }, () => "x".repeat(4000)) });
   assert.ok(bytes(arr) <= 16384, `array case was ${bytes(arr)}`);
+  const overArr = truncateInput({ items: Array.from({ length: 51 }, () => "x".repeat(4000)) });
+  assert.ok(bytes(overArr) <= 16384, `truncated array case was ${bytes(overArr)}`);
   const nested = truncateInput({ a: { b: { c: "x".repeat(5000) } } });
   assert.ok(bytes(nested) <= 16384);
   const wide = truncateInput({ a: "日".repeat(4000), b: "日".repeat(4000), c: "日".repeat(4000) });
   assert.ok(bytes(wide) <= 16384, `multibyte case was ${bytes(wide)}`);
+});
+
+test("truncateInput annotates dropped array items without altering 50-item arrays", () => {
+  const exact = truncateInput({ items: Array.from({ length: MAX_ARRAY_ITEMS }, (_, i) => i) });
+  assert.equal((exact.items as unknown[]).length, MAX_ARRAY_ITEMS);
+  assert.equal((exact.items as unknown[]).some(isTruncatedArrayMarker), false);
+
+  const over = truncateInput({
+    items: Array.from({ length: MAX_ARRAY_ITEMS + 1 }, (_, i) => i),
+    nested: { items: Array.from({ length: MAX_ARRAY_ITEMS + 3 }, (_, i) => `v${i}`) },
+    matrix: [Array.from({ length: MAX_ARRAY_ITEMS + 2 }, (_, i) => i)],
+  });
+  const roundTrip = JSON.parse(JSON.stringify(over)) as {
+    items: unknown[];
+    nested: { items: unknown[] };
+    matrix: unknown[][];
+  };
+  assert.equal(roundTrip.items.length, MAX_ARRAY_ITEMS + 1);
+  assert.deepEqual(roundTrip.items[MAX_ARRAY_ITEMS], { "[truncated]": true, omitted: 1 });
+  assert.equal(isTruncatedArrayMarker(roundTrip.items[MAX_ARRAY_ITEMS]), true);
+  assert.deepEqual(roundTrip.nested.items[MAX_ARRAY_ITEMS], { "[truncated]": true, omitted: 3 });
+  assert.deepEqual(roundTrip.matrix[0]![MAX_ARRAY_ITEMS], { "[truncated]": true, omitted: 2 });
 });
 
 test("claude StopFailure rate_limit adds a single-source provider-limit; other errors do not", () => {
@@ -148,6 +172,7 @@ test("permission evidence distinguishes complete input from omitted array items 
   const cases = [
     { input: { command: "npm test" }, complete: true },
     { input: { command: "x".repeat(5000) }, complete: false },
+    { input: { edits: Array.from({ length: 50 }, (_, n) => ({ old_string: String(n), new_string: "replacement" })) }, complete: true },
     { input: { edits: Array.from({ length: 51 }, (_, n) => ({ old_string: String(n), new_string: "replacement" })) }, complete: false },
   ];
   for (const { input, complete } of cases) {

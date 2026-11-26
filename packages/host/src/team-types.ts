@@ -1,6 +1,7 @@
 import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
 import { featureMapSchema, TASK_KINDS } from "./task-features.js";
+import { MAX_TASK_LIMITATION_CHARS, MAX_TASK_LIMITATIONS } from "./team-task-limitations.js";
 import { evalProjectSchema, CANDIDATE_PROFILES_MAX } from "./eval-config.js";
 import type { TrialEnding } from "./eval-types.js";
 import { POINTS_ALGORITHM_VERSION, teamRoutingSchema } from "./routing-policy.js";
@@ -548,6 +549,8 @@ export type BlockerEvidence = z.infer<typeof blockerEvidenceSchema>;
 const questionReportShape = { kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), answerMode: z.enum(["approval", "single", "multiple"]).optional() };
 const recordedDeliveryReconciliationReportSchema = z.object({ kind: z.literal("delivery-reconciliation"), headCommit: commitHashSchema, repository: githubRepository, branch: gitBranch, baseHeadCommit: commitHashSchema, disposition: z.enum(["no-publication", "owned-branch", "pull-request"]), remoteHeadCommit: commitHashSchema.optional(), pullRequestUrl: z.string().trim().min(1).max(500).optional(), summary: z.string().trim().min(1).max(4000) }).strict();
 export const strictDeliveryReconciliationReportSchema = deliveryReconciliationReportSchema;
+export const taskLimitationsSchema = z.array(z.string().trim().min(1).max(MAX_TASK_LIMITATION_CHARS)).max(MAX_TASK_LIMITATIONS)
+  .describe("Optional list of concrete limitations or unverified gaps.");
 const sharedTeamReportVariants = [
   permissionDecisionReportSchema,
   z.object({ kind: z.literal("plan"), summary: z.string().min(1).max(4000), parallelism: z.number().int().min(1).max(4).optional(), brief: teamBriefSchema.optional(), tasks: z.array(teamTaskPlanSchema).min(1).max(12), verification: teamVerificationSchema.optional() }).strict(),
@@ -555,7 +558,7 @@ const sharedTeamReportVariants = [
   z.object({ kind: z.literal("findings"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
   z.object({ kind: z.literal("no-change"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
   z.object({ kind: z.literal("escalate"), agentProfileId: z.string().regex(ID_RE).optional(), reason: z.string().min(1).max(4000) }).strict(),
-  z.object({ kind: z.literal("result"), summary: z.string().min(1).max(8000) }).strict(),
+  z.object({ kind: z.literal("result"), summary: z.string().min(1).max(8000), limitations: taskLimitationsSchema.optional() }).strict(),
   z.object({ kind: z.literal("review"), verdict: z.enum(["approved", "changes-requested"]), summary: z.string().min(1).max(8000), uiEvidence: z.string().trim().min(1).max(4000).optional(), acceptance: z.array(teamAcceptanceEvidenceSchema).max(8).optional(), rubric: z.array(z.object({ taskId, correctness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), cleanliness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), extensibility: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), docs: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict() }).strict()).max(12).optional() }).strict(),
   z.object({ kind: z.literal("delivery"), headCommit: commitHashSchema, pullRequestUrl: z.string().trim().min(1).max(500), mergeCommit: commitHashSchema, summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("delivery-repair"), headCommit: commitHashSchema, summary: z.string().trim().min(1).max(4000) }).strict(),
@@ -633,6 +636,7 @@ export interface TeamTask extends TeamTaskPlan {
   memberId?: string;
   commit?: string;
   summary?: string;
+  limitations?: string[];
   rubric?: { version: 1; correctness: { score: number; why: string }; cleanliness: { score: number; why: string }; extensibility: { score: number; why: string }; docs: { score: number; why: string }; reviewerProfileId: string };
   ownerRating?: { score: 1 | 2 | 3 | 4 | 5; note?: string; at: string };
   diffStat?: { added: number; removed: number; files: number; docs: boolean; tests: boolean };

@@ -372,6 +372,7 @@ test("MissionService steps independent missions concurrently, serializes same-mi
   } as unknown as Manager;
   const fakeTeams = {
     useMissionReservations() {},
+    useMissionReviews() {},
     ensureMissionCapacityCeiling() { return undefined; },
     isActiveRun() { return false; },
     activeForProject() { return false; },
@@ -772,6 +773,7 @@ test("HaltService.engage drains held Goal, Routine, and Mission creates and clos
     get: () => { throw new TeamError(404, "team-not-found", "missing"); },
     useGoalRecords() {},
     useMissionReservations() {},
+    useMissionReviews() {},
     ensureMissionCapacityCeiling() { return undefined; },
     isActiveRun() { return false; },
     activeForProject() { return false; },
@@ -876,6 +878,7 @@ test("MissionService.pendingProjectIds covers default checkouts of un-overridden
 
   const fakeTeams = {
     useMissionReservations() {},
+    useMissionReviews() {},
     ensureMissionCapacityCeiling() { return undefined; },
     isActiveRun() { return false; },
     activeForProject() { return false; },

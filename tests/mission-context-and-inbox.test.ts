@@ -180,6 +180,7 @@ function customCoordinatorHarness(options?: {
   const runs = new Map<string, TeamView>();
   const teams = {
     useMissionReservations() {},
+    useMissionReviews() {},
     isActiveRun(id: string) { const current = runs.get(id); return Boolean(current && !["cancelled", "ready-for-review", "merged", "no-change"].includes(current.status)); },
     async createForMission(request: CreateTeam, missionId: string) {
       const existing = runs.get(request.requestId);

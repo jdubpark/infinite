@@ -375,7 +375,7 @@ test("a coordinator for several projects is refused at final admission when one 
   const gate = halt.gate(fuse);
   const manager = new Manager(shortRun(f.config), f.key);
   manager.useFuse(gate);
-  const teams = { useMissionReservations() {}, isActiveRun() { return false; } } as unknown as TeamService;
+  const teams = { useMissionReservations() {}, useMissionReviews() {}, isActiveRun() { return false; } } as unknown as TeamService;
   const missions = new MissionService(f.config, f.key, manager, teams, { get: () => { throw new Error("Not queried in this test"); } });
   missions.useFuse(gate);
   try {

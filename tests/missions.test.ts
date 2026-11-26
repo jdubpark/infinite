@@ -59,7 +59,7 @@ function missionCheckoutAdmission(primaryReady: boolean) {
         ] },
       ] };
   } };
-  const teams = { useMissionReservations() {}, isActiveRun() { return false; } };
+  const teams = { useMissionReservations() {}, useMissionReviews() {}, isActiveRun() { return false; } };
   const missions = new MissionService(config, randomBytes(32), {} as Manager, teams as unknown as TeamService, groups);
   return { missions, close: () => { missions.close(); rmSync(root, { recursive: true, force: true }); } };
 }
@@ -992,6 +992,7 @@ test("mission restore adopts a legacy pending solo launch and persists capacity 
   let parallelism = 4, ceiling: number | undefined, reconciliations = 0;
   const teams = {
     useMissionReservations() {},
+    useMissionReviews() {},
     ensureMissionCapacityCeiling(_id: string, linkedMission: string, expected: number) {
       assert.equal(linkedMission, missionId);
       if (ceiling !== expected || parallelism > expected) {

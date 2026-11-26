@@ -1,5 +1,5 @@
 import { PROVIDER_NAMES, type Attention, type Prompt, type Provider } from "@infinite/attention";
-import type { Manager } from "./manager.js";
+import { publicAttention, type Manager } from "./manager.js";
 import type { PushSender, PushStore } from "./push.js";
 import type { FuseService, FuseInterrupt } from "./fuse/service.js";
 import type { MainCheckNotice, MainCheckService } from "./main-check.js";
@@ -94,8 +94,9 @@ export class Notifier {
   async tick() {
     const due: Row[] = [];
     try {
-      const rows = ((await this.manager.list()) as unknown as Row[]).filter(row => !learningPurpose(row.purpose));
+      const rows = ((await this.manager.list({ includeFullMessage: true })) as unknown as Row[]).filter(row => !learningPurpose(row.purpose));
       const now = Date.now();
+      const redact = (row: Row): Row => ({ ...row, attention: publicAttention(row.attention) });
       for (const row of rows) {
         const key = `${row.attention.state}:${row.attention.prompt?.id ?? ""}`;
         const previous = this.previous("session", row.id, this.seen);
@@ -104,18 +105,18 @@ export class Notifier {
         if (held && held.key !== key) this.deferred.delete(row.id);
         if (this.primed && previous !== key && PUSH_STATES.has(row.attention.state) && this.options.events.includes(row.attention.state)) {
           if (this.promptOwner(row) !== "user") { this.deferred.set(row.id, { key, since: now }); continue; }
-          due.push(row);
+          due.push(redact(row));
         } else if (held && held.key === key) {
           const owner = this.promptOwner(row);
           const heldFor = now - held.since;
           if (owner === "user" || (owner === "undecided" && heldFor >= (this.options.reviewGraceMs ?? REVIEW_START_GRACE_MS)) ||
               heldFor >= (this.options.reviewHoldLimitMs ?? REVIEW_HOLD_LIMIT_MS)) {
             this.deferred.delete(row.id);
-            due.push(row);
+            due.push(redact(row));
           }
         }
       }
-      due.push(...this.channelNotices(rows));
+      due.push(...this.channelNotices(rows).map(redact));
       this.prune("session", this.seen, new Set(rows.map(row => row.id)));
       for (const [id, held] of this.deferred) if (!this.seen.has(id) && now - held.since >= (this.options.reviewHoldLimitMs ?? REVIEW_HOLD_LIMIT_MS)) this.deferred.delete(id);
       this.primed = true;

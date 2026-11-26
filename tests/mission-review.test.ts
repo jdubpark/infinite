@@ -453,3 +453,60 @@ test("at its time limit a mission keeps a new review waiting and holds a queued 
     assert.deepEqual(h.steers, [{ teamId, text: forwarded }]);
   } finally { h.close(); mock.timers.reset(); }
 });
+
+test("across a pause, a review the coordinator received is not sent again and its forward settles it, and a review held while paused arrives once", { timeout: 90000 }, async () => {
+  const confirmed = async (h: Harness, n: number) => {
+    await h.confirmNative(n);
+    await h.signal(n, { kind: "tool-start", tool: "Read", input: {}, quiet: true });
+  };
+  const stopped = async (h: Harness, id: string) => {
+    await h.missions.pause(id, action(h, id));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "stopped");
+  };
+  const h = scripted();
+  try {
+    const { id, teamId, direction } = await delivered(h);
+    const saved = () => (h.stored(id) as unknown as { deliveredUnapplied?: { inbox: MissionMessage[] }[] }).deliveredUnapplied;
+    await h.missions.reviewDirection(id, direction());
+    await h.report(2, { kind: "wait", summary: "Reading the review." });
+    assert.equal(reviewMessages(await h.messages(3)).length, 1);
+    await confirmed(h, 3);
+    await stopped(h, id);
+    assert.equal(saved()?.flatMap(batch => reviewMessages(batch.inbox)).length, 1);
+    await h.missions.resume(id, action(h, id));
+    const resumed = (await h.attempt(4)).request.continuation;
+    assert.equal(resumed?.mode, "resume");
+    assert.deepEqual(reviewMessages(await h.messages(4)), [], "the resumed conversation already holds the review");
+    await h.confirmNative(4);
+    await h.usage(4, 130000);
+    await h.report(4, { kind: "steer-subtask", subtaskId: "a", text: forwarded });
+    await until(() => h.get(id), received);
+    assert.deepEqual(h.steers, [{ teamId, text: forwarded }]);
+    await h.missions.steer(id, { ...action(h, id), text: "Also keep the changelog current." });
+    const fresh = (await h.attempt(5)).request.continuation;
+    assert.equal(fresh?.mode, "start");
+    assert.notEqual(fresh?.nativeSessionId, resumed?.nativeSessionId);
+    assert.deepEqual(reviewMessages(await h.messages(5)), [], "a fresh conversation after the forward does not receive the review again");
+  } finally { h.close(); }
+
+  const g = scripted();
+  try {
+    const { id, direction } = await delivered(g);
+    await confirmed(g, 2);
+    await stopped(g, id);
+    assert.equal(await g.missions.reviewDirection(id, direction()), "waiting");
+    await g.missions.resume(id, action(g, id));
+    assert.equal(await g.missions.reviewDirection(id, direction()), "applied");
+    const seen: MissionMessage[] = [];
+    let n = 3;
+    for (; n < 6; n++) {
+      const reviews = reviewMessages(await g.messages(n));
+      seen.push(...reviews);
+      if (reviews.length) break;
+      await g.report(n, { kind: "wait", summary: "Waiting for the review." });
+    }
+    assert.equal(seen.length, 1, "the held review reaches the coordinator once");
+    await g.report(n, { kind: "wait", summary: "Reading the review." });
+    assert.deepEqual(reviewMessages(await g.messages(n + 1)), [], "and is not sent again");
+  } finally { g.close(); }
+});

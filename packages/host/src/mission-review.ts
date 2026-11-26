@@ -6,6 +6,7 @@ import { githubReviewSource, type TeamView } from "./team-types.js";
 import { TeamError } from "./team-workspace.js";
 import { deterministicUuid } from "./intake-types.js";
 import type { TeamService } from "./teams.js";
+import { settleCoordinatorReport, type DeliveredUnappliedBatch } from "./mission-coordinator.js";
 
 const reopenedMissionMinutes = (mission: Pick<Mission, "maxMinutes">) => mission.maxMinutes;
 const READ_RETRY_MS = 60_000;
@@ -36,6 +37,8 @@ type MissionReviewStored = {
   mission: Mission;
   receipts: Record<string, string>;
   inbox: MissionMessage[];
+  notes: MissionMessage[];
+  deliveredUnapplied?: DeliveredUnappliedBatch[];
   notified: string[];
   ops: { push(op: ReviewForwardOp): number };
   refusals: number;
@@ -217,7 +220,7 @@ export class MissionReview<S extends MissionReviewStored> implements MissionRevi
     } catch (error) {
       if (!notFound(error)) throw error;
     }
-    stored.refusals = 0;
+    settleCoordinatorReport(stored, "accepted");
     this.host.event(stored, `Subtask ${review.subtaskId} received the owner's review ${review.reviewId} through the coordinator and continues from its delivered commit.`);
     return false;
   }

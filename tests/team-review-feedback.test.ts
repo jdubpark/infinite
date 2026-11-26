@@ -246,7 +246,7 @@ test("a coordinator's forward of a mission run's review reads GitHub once more a
     gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
     const subtask = { id: "a", title: "Subtask a", objective: "Do a", repoProjectId: f.run.projectId, size: "solo", parallelism: 1, dependsOn: [], status: "done", teamId: f.run.id } as unknown as MissionSubtask;
     const stored = { mission: { id: "mission-1", status: "working", revision: 1, maxMinutes: 30, steering: [], subtasks: [subtask] } as unknown as Mission,
-      receipts: {} as Record<string, string>, inbox: [] as MissionMessage[], notified: [] as string[], ops: [] as ReviewForwardOp[], refusals: 0, reviews: undefined as MissionReviewRecord[] | undefined };
+      receipts: {} as Record<string, string>, inbox: [] as MissionMessage[], notes: [] as MissionMessage[], notified: [] as string[], ops: [] as ReviewForwardOp[], refusals: 0, reviews: undefined as MissionReviewRecord[] | undefined };
     const connect = (teams: TeamService, record: typeof stored) => {
       const review = new MissionReview({ records: new Map([["mission-1", record]]), teams, enqueue: async (_id, task) => task(), save: () => {}, event: () => {},
         follow: () => {}, held: () => false, steeringFull: () => false });

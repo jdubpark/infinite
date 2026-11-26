@@ -1510,18 +1510,17 @@ const EXTEND_HELP = "Extend by 5 minutes to 24 hours, for example `extend 6h` or
 const handledOutcomes = (s: Awaited<ReturnType<typeof surfaceFor>>, count: number) =>
   waitFor(async () => s.store.get(ISSUE)!.inbound.filter(item => item.handledAt).map(item => item.outcome), outcomes => outcomes.length === count, 30000);
 
-async function deadlineSurface(t: TestContext, options: { maxMinutes?: number; mode?: "deadline" | "running" | "cancelled"; wrapMissions?: (missions: MissionService) => MissionService; directRequests?: boolean; direct?: (store: IntakeStore) => DirectRequest; state?: IntakeRecord["state"] } = {}) {
+async function deadlineSurface(t: TestContext, options: { mode?: "deadline" | "running" | "cancelled"; wrapMissions?: (missions: MissionService) => MissionService; directRequests?: boolean; direct?: (store: IntakeStore) => DirectRequest; state?: IntakeRecord["state"] } = {}) {
   t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-15T11:00:00Z") });
   const { sh, s, close: closeSurface } = await scriptedSurface({ wrapMissions: options.wrapMissions, directRequests: options.directRequests, direct: options.direct });
   let closed = false;
   const close = async () => { if (closed) return; closed = true; try { await closeSurface(); } finally { t.mock.timers.reset(); } };
   t.after(close);
   try {
-    const minutes = options.maxMinutes ?? 30, capped = Math.min(minutes, 1440), mode = options.mode ?? "deadline", state = options.state ?? "started";
-    const created = await sh.missions.create({ requestId: randomUUID(), groupId: "shop", objective: "Change the API and the web client", maxSubtasks: 8, maxMinutes: capped });
-    if (minutes > 1440) (sh.missions as unknown as { records: Map<string, { mission: Mission }> }).records.get(created.id)!.mission.maxMinutes = minutes;
+    const mode = options.mode ?? "deadline", state = options.state ?? "started";
+    const created = await sh.missions.create({ requestId: randomUUID(), groupId: "shop", objective: "Change the API and the web client", maxSubtasks: 8, maxMinutes: 30 });
     if (mode === "deadline") {
-      await sh.attempt(1); t.mock.timers.tick(capped * 60000);
+      await sh.attempt(1); t.mock.timers.tick(30 * 60000);
       await until(() => sh.get(created.id), mission => mission.status === "blocked" && mission.stopReason === "deadline");
     } else if (mode === "cancelled") await sh.missions.cancel(created.id, { requestId: randomUUID(), revision: created.revision });
     s.store.create(intakeRecord(ISSUE, state, { thread: BINDING, missionId: created.id }));
@@ -1550,7 +1549,11 @@ test("extend commands parse to minutes: bare extend uses the mission's maxMinute
 });
 
 test("a bare extend is capped at 1440 minutes when the mission's maxMinutes is larger", { timeout: 60000 }, async t => {
-  const { sh, s, id, close } = await deadlineSurface(t, { maxMinutes: 2000 });
+  const wrapMissions = (missions: MissionService) => new Proxy(missions, { get: (target, property) => {
+    if (property === "peek") return (missionId: string) => { const mission = target.peek(missionId); return mission ? { ...mission, maxMinutes: 2000 } : undefined; };
+    const value = Reflect.get(target, property); return typeof value === "function" ? value.bind(target) : value;
+  } });
+  const { sh, s, id, close } = await deadlineSurface(t, { wrapMissions });
   try {
     const before = Date.parse(sh.get(id).deadlineAt);
     await s.slack.emit(mention("extend")); await handledOutcomes(s, 1);

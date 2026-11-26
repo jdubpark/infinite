@@ -2,7 +2,7 @@ import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 import { accessSync, chmodSync, constants as fsConstants, existsSync, lstatSync, mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, rmSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { hashToken } from "../packages/host/src/config.js";
 import { createApp } from "../packages/host/src/server.js";
@@ -288,17 +288,25 @@ function hasSecureAncestors(directory: string, trustedUid: number): boolean {
   }
 }
 
+function isOutsideDirectory(candidate: string, boundary: string): boolean {
+  const rel = relative(boundary, candidate);
+  return rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+}
+
 export function mkdtempSecure(prefix: string): string {
   const uid = process.getuid!();
+  let home: string | undefined;
+  try { home = realpathSync(homedir()); } catch { }
   const candidates = [
+    process.env.INFINITE_TEST_STAGING_ROOT,
     process.env.XDG_RUNTIME_DIR,
     process.platform === "linux" ? `/run/user/${uid}` : undefined,
     tmpdir(),
-    process.env.XDG_CACHE_HOME,
   ].filter((value): value is string => Boolean(value));
   for (const candidate of candidates) {
     try {
       const canonical = realpathSync(candidate);
+      if (home && !isOutsideDirectory(canonical, home)) continue;
       accessSync(canonical, fsConstants.W_OK | fsConstants.X_OK);
       if (!hasSecureAncestors(canonical, uid)) continue;
       const root = realpathSync(mkdtempSync(join(canonical, prefix)));
@@ -306,12 +314,5 @@ export function mkdtempSecure(prefix: string): string {
       return root;
     } catch { }
   }
-  const cacheRoot = join(realpathSync(homedir()), ".cache");
-  if (!existsSync(cacheRoot)) mkdirSync(cacheRoot, { mode: 0o700 });
-  const stagingRoot = join(cacheRoot, "infinite-test-staging");
-  if (!existsSync(stagingRoot)) mkdirSync(stagingRoot, { mode: 0o700 });
-  chmodSync(stagingRoot, 0o700);
-  const root = realpathSync(mkdtempSync(join(stagingRoot, prefix)));
-  chmodSync(root, 0o700);
-  return root;
+  throw new Error("No writable non-home directory with secure ancestors is available; set INFINITE_TEST_STAGING_ROOT or XDG_RUNTIME_DIR.");
 }

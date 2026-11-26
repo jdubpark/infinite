@@ -56,11 +56,15 @@ class Run {
     this.drainTimers = t.mock.timers;
   }
 
-  releaseDrain() {
+  releaseDrain(tickMs = 0) {
     if (!this.drainTimers) return;
     const timers = this.drainTimers;
     this.drainTimers = undefined;
-    timers.reset();
+    try {
+      if (tickMs > 0) timers.tick(tickMs);
+    } finally {
+      timers.reset();
+    }
   }
 
   start(command: (leader: string, left: string) => Command, scope?: CommandScope): Promise<CommandResult> {
@@ -135,7 +139,7 @@ test("a leftover that left the leader's group and session is neither waited for 
     const stoppedAt = performance.now();
     run.controller.abort();
     const settled = await result;
-    run.releaseDrain();
+    run.releaseDrain(500);
     const waited = run.settledAt! - stoppedAt;
     assert.ok(waited >= 0 && waited < 250, `settled ${waited.toFixed(0)} ms after the stop`);
     assert.equal(settled.exitCode, 0);
@@ -159,7 +163,7 @@ test("a stop inside the drain settles at once and signals nothing", CASE, async 
     const stoppedAt = performance.now();
     run.controller.abort();
     const settled = await result;
-    run.releaseDrain();
+    run.releaseDrain(500);
     const waited = run.settledAt! - stoppedAt;
     assert.ok(waited >= 0 && waited < 250, `settled ${waited.toFixed(0)} ms after the stop`);
     assert.equal(settled.exitCode, 3);
@@ -201,7 +205,7 @@ test("a command inside a scope that records it ends with its leader the same way
     assert.equal(run.settledAt, undefined, "the command stays in its drain until stopped");
     run.controller.abort();
     const settled = await result;
-    run.releaseDrain();
+    run.releaseDrain(500);
     assert.equal(settled.interrupted, false);
     assert.equal(settled.leftover, true);
     await new Promise(resolve => setTimeout(resolve, 500));

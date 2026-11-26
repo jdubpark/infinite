@@ -323,6 +323,7 @@ test("a host stop inside a command's drain signals nothing, and after a restart 
     assert.equal(commandSettled, false, "the command stays in its drain until the host stops");
     teams.close();
     await teams.idle();
+    t.mock.timers.tick(300);
     t.mock.timers.reset();
     assert.ok(stored.pending, "a stop during the drain leaves the operation's intent for the next start");
     await new Promise(resolve => setTimeout(resolve, 300));

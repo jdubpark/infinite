@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { ContextGaugeTail } from "../packages/host/src/context-gauge.js";
+import { ContextGaugeTail, saturate } from "../packages/host/src/context-gauge.js";
 
 const fixture = (name: string) => new URL(`./fixtures/usage/${name}`, import.meta.url);
 
@@ -63,16 +63,205 @@ test("Codex session gives the exact gauge", () => {
   });
 });
 
-test("Codex direct item is not inside a program; the two documented limits are counted inside", () => {
-  const shell = (rows: unknown[]) => {
+test("Codex direct item is never attributed inside a program regardless of row order", () => {
+  const c = call("d", "exec");
+  const it = item("d", { type: "CommandExecution", aggregated_output: "hi" });
+  const out = output("d", "hi");
+  const permutations: [string, unknown[]][] = [
+    ["call -> item -> output", [c, it, out]],
+    ["call -> output -> item", [c, out, it]],
+    ["item -> call -> output", [it, c, out]],
+    ["item -> output -> call", [it, out, c]],
+    ["output -> call -> item", [out, c, it]],
+    ["output -> item -> call", [out, it, c]],
+    ["duplicate before and between", [it, c, it, out]],
+    ["duplicate between and after", [c, it, out, it]],
+  ];
+  for (const [label, rows] of permutations) {
     const tail = new ContextGaugeTail("codex");
     for (const row of rows) tail.push(row);
-    return tail.snapshot().insidePrograms;
-  };
-  const direct = [call("d", "exec"), item("d", { type: "CommandExecution", aggregated_output: "hi" }), output("d", "hi")];
-  assert.deepEqual(shell(direct), {});
-  assert.deepEqual(shell([item("d", { type: "CommandExecution", aggregated_output: "hi" }), ...direct]), { shell: { calls: 1, chars: 2, maxChars: 2 } });
-  assert.deepEqual(shell([...direct, item("d", { type: "CommandExecution", aggregated_output: "hi" })]), { shell: { calls: 1, chars: 2, maxChars: 2 } });
+    const gauge = tail.snapshot();
+    assert.deepEqual(gauge.insidePrograms, {}, label);
+    assert.deepEqual(gauge.received, { program: { calls: 1, chars: 2, maxChars: 2 } }, label);
+    assert.equal(gauge.unmatched, 0, label);
+  }
+});
+
+test("out-of-order Codex correlation reconciles mid-stream snapshots and preserves program items", () => {
+  const tail = new ContextGaugeTail("codex");
+  tail.push(item("prog_before", { type: "CommandExecution", aggregated_output: "a".repeat(10) }));
+  tail.push(item("direct_1", { type: "CommandExecution", aggregated_output: "x".repeat(500) }));
+  assert.deepEqual(tail.snapshot().insidePrograms, { shell: { calls: 2, chars: 510, maxChars: 500 } });
+
+  tail.push(call("direct_1", "exec"));
+  assert.deepEqual(tail.snapshot().insidePrograms, { shell: { calls: 1, chars: 10, maxChars: 10 } });
+
+  tail.push(output("direct_2", [{ type: "input_text", text: "result-two" }, { type: "input_image", image_url: "data:omitted" }], "function_call_output"));
+  tail.push({ type: "event_msg", payload: { type: "item_completed", item: { id: "", call_id: "direct_2", type: "McpToolCall", result: { content: [{ type: "text", text: "y".repeat(40) }] } } } });
+  tail.push({ type: "event_msg", payload: { type: "item_completed", item: { id: 123, call_id: "direct_2", type: "CommandExecution", aggregated_output: "ignored" } } });
+  assert.deepEqual(tail.snapshot().insidePrograms, { shell: { calls: 1, chars: 10, maxChars: 10 } });
+  assert.equal(tail.snapshot().unmatched, 1);
+  assert.equal(tail.snapshot().images, 1);
+
+  tail.push(call("direct_2", "spawn_agent", "function_call"));
+  tail.push(output("direct_1", "ok"));
+  tail.push(item("prog_after", { type: "McpToolCall", result: { content: [{ type: "text", text: "m".repeat(7) }] } }));
+  tail.push(item("direct_3", { type: "FileChange", stdout: "abc", stderr: "de" }));
+  tail.push(output("direct_3", "done", "function_call_output"));
+
+  const gauge = tail.snapshot();
+  assert.deepEqual(gauge.insidePrograms, {
+    shell: { calls: 1, chars: 10, maxChars: 10 },
+    mcp: { calls: 1, chars: 7, maxChars: 7 },
+  });
+  assert.deepEqual(gauge.received, {
+    program: { calls: 1, chars: 2, maxChars: 2 },
+    agent: { calls: 1, chars: 10, maxChars: 10 },
+    other: { calls: 1, chars: 4, maxChars: 4 },
+  });
+  assert.equal(gauge.images, 1);
+  assert.equal(gauge.unmatched, 1);
+
+  const claudeOutOfOrder = new ContextGaugeTail("claude");
+  claudeOutOfOrder.push({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t_late", content: "hello" }] } });
+  assert.deepEqual(claudeOutOfOrder.snapshot().received, { other: { calls: 1, chars: 5, maxChars: 5 } });
+  assert.equal(claudeOutOfOrder.snapshot().unmatched, 1);
+  claudeOutOfOrder.push({ type: "assistant", message: { id: "m_late", usage: { input_tokens: 10 }, content: [{ type: "tool_use", id: "t_late", name: "Read" }] } });
+  assert.deepEqual(claudeOutOfOrder.snapshot().received, { "file-read": { calls: 1, chars: 5, maxChars: 5 } });
+  assert.equal(claudeOutOfOrder.snapshot().unmatched, 0);
+});
+
+test("out-of-order Codex correlation enforces bounded pending buffers without losing counts", () => {
+  const manyItems = new ContextGaugeTail("codex");
+  for (let i = 0; i < 8200; i += 1) {
+    manyItems.push(item(`p_${i}`, { type: "CommandExecution", aggregated_output: "ab" }));
+  }
+  assert.deepEqual(manyItems.snapshot().insidePrograms, { shell: { calls: 8200, chars: 16400, maxChars: 2 } });
+  manyItems.push(call("p_8199", "exec"));
+  assert.deepEqual(manyItems.snapshot().insidePrograms, { shell: { calls: 8199, chars: 16398, maxChars: 2 } });
+
+  const manyOutputs = new ContextGaugeTail("codex");
+  for (let i = 0; i < 8200; i += 1) {
+    manyOutputs.push(output(`o_${i}`, "xy", "function_call_output"));
+  }
+  assert.equal(manyOutputs.snapshot().unmatched, 8200);
+  assert.deepEqual(manyOutputs.snapshot().received, { other: { calls: 8200, chars: 16400, maxChars: 2 } });
+  manyOutputs.push(call("o_8199", "exec"));
+  assert.equal(manyOutputs.snapshot().unmatched, 8199);
+  assert.deepEqual(manyOutputs.snapshot().received, {
+    program: { calls: 1, chars: 2, maxChars: 2 },
+    other: { calls: 8199, chars: 16398, maxChars: 2 },
+  });
+
+  const dupOutputs = new ContextGaugeTail("codex");
+  dupOutputs.push(output("dup", "a"));
+  dupOutputs.push(output("dup", "bb"));
+  dupOutputs.push(call("dup", "exec"));
+  assert.deepEqual(dupOutputs.snapshot().received, {
+    program: { calls: 1, chars: 1, maxChars: 1 },
+    other: { calls: 1, chars: 2, maxChars: 2 },
+  });
+  assert.equal(dupOutputs.snapshot().unmatched, 1);
+});
+
+test("Codex Extension items measure known payload shapes and stay safe on empty or hostile inputs", () => {
+  const webResults = [
+    { type: "text_result", ref_id: "turn0search0", url: "https://example.com/result", future_field: { preserved: true } },
+  ];
+  const structuredResult = { title: "Docs", score: 2, tags: ["a", "b"] };
+  const cases: { label: string; body: Record<string, unknown>; cls: "web" | "other"; chars: number }[] = [
+    { label: "bare Extension", body: { type: "Extension" }, cls: "web", chars: 0 },
+    { label: "web.search with structured results", body: { type: "Extension", kind: "web.search", query: "docs", action: { type: "search", query: "docs", queries: null }, results: webResults }, cls: "web", chars: JSON.stringify(webResults).length },
+    { label: "web.search with null results ignores input query", body: { type: "Extension", kind: "web.search", query: "ignored query text", action: { type: "search", query: "ignored" }, results: null }, cls: "web", chars: 0 },
+    { label: "web.search with empty results array", body: { type: "Extension", kind: "web.search", query: "docs", results: [] }, cls: "web", chars: 0 },
+    { label: "image_gen.generation with inline result", body: { type: "Extension", kind: "image_gen.generation", status: "completed", revisedPrompt: "A blue square", result: "cG5n" }, cls: "other", chars: 4 },
+    { label: "image_gen.generation with fileId only", body: { type: "Extension", kind: "image_gen.generation", status: "completed", revisedPrompt: "A blue square", fileId: "file-1" }, cls: "other", chars: 0 },
+    { label: "clock.sleep has no result payload", body: { type: "Extension", kind: "clock.sleep", durationMs: 1000 }, cls: "other", chars: 0 },
+    { label: "plain text payload", body: { type: "Extension", text: "hello world" }, cls: "web", chars: 11 },
+    { label: "plain output string", body: { type: "Extension", output: "fetched body" }, cls: "web", chars: 12 },
+    { label: "plain content string", body: { type: "Extension", content: "page text" }, cls: "web", chars: 9 },
+    { label: "content-part array with image", body: { type: "Extension", content: [{ type: "output_text", text: "abc" }, { type: "input_image", image_url: "data:omitted" }, { type: "text", text: "de" }] }, cls: "web", chars: 5 },
+    { label: "text-only part array without type", body: { type: "Extension", content: [{ text: "abc" }, { text: "defg" }] }, cls: "web", chars: 7 },
+    { label: "nested MCP-style result.content", body: { type: "Extension", result: { content: [{ type: "text", text: "alpha" }, { type: "text", text: "beta" }], isError: false } }, cls: "web", chars: 9 },
+    { label: "nested empty result.content", body: { type: "Extension", result: { content: [], isError: false } }, cls: "web", chars: 0 },
+    { label: "nested result.structuredContent when content is empty", body: { type: "Extension", result: { content: [], structuredContent: structuredResult } }, cls: "web", chars: JSON.stringify(structuredResult).length },
+    { label: "image-only content array", body: { type: "Extension", content: [{ type: "input_image", image_url: "data:omitted" }] }, cls: "web", chars: 0 },
+    { label: "falls back from null results to output", body: { type: "Extension", kind: "web.search", results: null, output: "fallback" }, cls: "web", chars: 8 },
+    { label: "nested result.output", body: { type: "Extension", result: { output: "nested-out" } }, cls: "web", chars: 10 },
+    { label: "string array results", body: { type: "Extension", results: ["one", "two", "three"] }, cls: "web", chars: 11 },
+    { label: "structured JSON result object", body: { type: "Extension", result: structuredResult }, cls: "web", chars: JSON.stringify(structuredResult).length },
+    { label: "empty object and primitive payloads", body: { type: "Extension", result: {}, output: 42, content: true, text: null }, cls: "web", chars: 0 },
+    { label: "non-serializable BigInt payload", body: { type: "Extension", result: { count: 1n } }, cls: "web", chars: 0 },
+  ];
+
+  for (const entry of cases) {
+    const tail = new ContextGaugeTail("codex");
+    tail.push(item("ext_case", entry.body));
+    const snap = tail.snapshot();
+    assert.deepEqual(snap.insidePrograms, { [entry.cls]: { calls: 1, chars: entry.chars, maxChars: entry.chars } }, entry.label);
+    assert.equal(snap.images, 0, entry.label);
+  }
+
+  const sparse: unknown[] = [];
+  sparse[1] = "ab";
+  const sparseTail = new ContextGaugeTail("codex");
+  assert.doesNotThrow(() => sparseTail.push(item("ext_sparse", { type: "Extension", results: sparse })));
+  assert.deepEqual(sparseTail.snapshot().insidePrograms, { web: { calls: 1, chars: JSON.stringify(sparse).length, maxChars: JSON.stringify(sparse).length } });
+
+  const circular: Record<string, unknown> = {};
+  circular.self = circular;
+  const cyclicTail = new ContextGaugeTail("codex");
+  assert.doesNotThrow(() => cyclicTail.push(item("ext_cycle", { type: "Extension", result: circular })));
+  assert.deepEqual(cyclicTail.snapshot().insidePrograms, { web: { calls: 1, chars: 0, maxChars: 0 } });
+
+  let deep: Record<string, unknown> = { text: "deep" };
+  for (let i = 0; i < 32; i += 1) deep = { result: deep };
+  const deepTail = new ContextGaugeTail("codex");
+  assert.doesNotThrow(() => deepTail.push(item("ext_deep", { type: "Extension", result: deep })));
+  assert.ok((deepTail.snapshot().insidePrograms.web?.chars ?? 0) > 0);
+
+  const directExt = new ContextGaugeTail("codex");
+  directExt.push(item("ws_direct", { type: "Extension", kind: "web.search", results: webResults }));
+  directExt.push(call("ws_direct", "web.run", "function_call"));
+  directExt.push(output("ws_direct", "search summary", "function_call_output"));
+  assert.deepEqual(directExt.snapshot().insidePrograms, {});
+  assert.deepEqual(directExt.snapshot().received, { other: { calls: 1, chars: 14, maxChars: 14 } });
+});
+
+test("saturate clamps totals at safe and custom thresholds and handles invalid inputs", () => {
+  const safe = Number.MAX_SAFE_INTEGER;
+  assert.equal(saturate(0, 0), 0);
+  assert.equal(saturate(0, 0, 100), 0);
+  assert.equal(saturate(12, 30), 42);
+  assert.equal(saturate(30, 20, 100), 50);
+  assert.equal(saturate(safe - 5, 5), safe);
+  assert.equal(saturate(60, 40, 100), 100);
+  assert.equal(saturate(safe - 5, 6), safe);
+  assert.equal(saturate(safe, 1), safe);
+  assert.equal(saturate(safe, safe), safe);
+  assert.equal(saturate(Number.MAX_VALUE, Number.MAX_VALUE), safe);
+  assert.equal(saturate(Infinity, 1), safe);
+  assert.equal(saturate(1, Infinity, 100), 100);
+  assert.equal(saturate(60, 50, 100), 100);
+  assert.equal(saturate(150, 0, 100), 100);
+  assert.equal(saturate(0, 150, 100), 100);
+  assert.equal(saturate(10, 20, 10.9), 10);
+  assert.equal(saturate(safe, 100, safe + 1000), safe);
+
+  for (const invalidLimit of [0, -1, -100, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    assert.equal(saturate(10, 20, invalidLimit), 0, `limit ${String(invalidLimit)}`);
+  }
+
+  assert.equal(saturate(-5, 10, 100), 10);
+  assert.equal(saturate(10, -5, 100), 10);
+  assert.equal(saturate(-5, -10, 100), 0);
+  assert.equal(saturate(Number.NaN, 10, 100), 10);
+  assert.equal(saturate(10, Number.NaN, 100), 10);
+  assert.equal(saturate(Number.NEGATIVE_INFINITY, 10, 100), 10);
+  assert.equal(saturate(Number.NaN, Number.NaN), 0);
+
+  const ratios = [0, 25, 50, 100, 150].map(value => saturate(value, 0, 100) / 100);
+  assert.deepEqual(ratios, [0, 0.25, 0.5, 1, 1]);
 });
 
 test("Codex usage kinds: token_count rows count only without record rows", () => {
@@ -278,11 +467,11 @@ test("an id of 256 characters links rows and one of 257 does not", () => {
 test("an output or a program item without a usable id is still measured", () => {
   const parts = [{ type: "input_text", text: "abc" }, { type: "input_image", image_url: "data:omitted" }];
   const codex = new ContextGaugeTail("codex");
-  for (const callId of [undefined, 7, "x".repeat(257)]) codex.push({ type: "response_item", payload: { type: "function_call_output", call_id: callId, output: parts } });
-  for (const id of [undefined, 7, "x".repeat(257)]) codex.push({ type: "event_msg", payload: { type: "item_completed", item: { id, type: "CommandExecution", aggregated_output: "hi" } } });
+  for (const callId of [undefined, "", 7, "x".repeat(257)]) codex.push({ type: "response_item", payload: { type: "function_call_output", call_id: callId, output: parts } });
+  for (const id of [undefined, "", 7, "x".repeat(257)]) codex.push({ type: "event_msg", payload: { type: "item_completed", item: { id, type: "CommandExecution", aggregated_output: "hi" } } });
   const gauge = codex.snapshot();
   assert.deepEqual({ received: gauge.received, inside: gauge.insidePrograms, images: gauge.images, unmatched: gauge.unmatched },
-    { received: { other: { calls: 3, chars: 9, maxChars: 3 } }, inside: { shell: { calls: 3, chars: 6, maxChars: 2 } }, images: 3, unmatched: 3 });
+    { received: { other: { calls: 4, chars: 12, maxChars: 3 } }, inside: { shell: { calls: 4, chars: 8, maxChars: 2 } }, images: 4, unmatched: 4 });
 
   const claude = new ContextGaugeTail("claude");
   claude.push({ type: "user", message: { content: [{ type: "tool_result", content: "abc" }, { type: "tool_result", tool_use_id: 9, content: [{ type: "image" }, { type: "text", text: "de" }] }] } });

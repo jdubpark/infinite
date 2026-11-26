@@ -40,13 +40,23 @@ type Table = Partial<Record<ToolClass, ClassCount>>;
 interface Measure { chars: number; images: number }
 
 const SAFE = Number.MAX_SAFE_INTEGER;
+const TEXT_PART_TYPES = new Set(["text", "input_text", "output_text"]);
+const EXTENSION_PAYLOAD_KEYS = ["results", "result", "output", "content", "structuredContent", "text"] as const;
+const MAX_PAYLOAD_DEPTH = 8;
 const object = (value: unknown): Record<string, unknown> | undefined =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const list = (value: unknown): unknown[] | undefined => Array.isArray(value) ? value : undefined;
 const isCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-const isId = (value: unknown): value is string => typeof value === "string" && value.length <= MAX_ID_LENGTH;
+const isId = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= MAX_ID_LENGTH;
 const claudeCount = (value: unknown): number => isCount(value) ? value : 0;
-const saturate = (a: number, b: number): number => Math.min(SAFE, a + b);
+
+export function saturate(a: number, b: number, limit = SAFE): number {
+  const cap = Number.isFinite(limit) && limit > 0 ? Math.min(SAFE, Math.floor(limit)) : 0;
+  if (cap === 0) return 0;
+  const left = Number.isFinite(a) && a > 0 ? Math.min(cap, a) : a === Infinity ? cap : 0;
+  const right = Number.isFinite(b) && b > 0 ? Math.min(cap, b) : b === Infinity ? cap : 0;
+  return left >= cap - right ? cap : left + right;
+}
 
 function measure(content: unknown, isImage: (type: string) => boolean): Measure {
   if (typeof content === "string") return { chars: content.length, images: 0 };
@@ -54,15 +64,100 @@ function measure(content: unknown, isImage: (type: string) => boolean): Measure 
   for (const part of list(content) ?? []) {
     const value = object(part);
     if (!value) continue;
-    if (typeof value.type === "string" && isImage(value.type)) result.images += 1;
+    if (typeof value.type === "string" && isImage(value.type)) result.images = saturate(result.images, 1);
     else if (typeof value.text === "string") result.chars = saturate(result.chars, value.text.length);
   }
   return result;
 }
 
+function serializedLength(value: unknown): number {
+  try {
+    const text = JSON.stringify(value);
+    if (typeof text !== "string" || text === "{}" || text === "[]") return 0;
+    return text.length;
+  } catch {
+    return 0;
+  }
+}
+
+function isContentPart(part: unknown): boolean {
+  const value = object(part);
+  if (!value) return false;
+  if (typeof value.type === "string") {
+    return value.type.includes("image") || (TEXT_PART_TYPES.has(value.type) && typeof value.text === "string");
+  }
+  return value.type === undefined && typeof value.text === "string" && Object.keys(value).length === 1;
+}
+
+function measureArray(items: unknown[]): number {
+  if (items.length === 0) return 0;
+  let allStrings = true;
+  let allParts = true;
+  let stringChars = 0;
+  for (let i = 0; i < items.length; i += 1) {
+    const part = items[i];
+    if (typeof part === "string") {
+      stringChars = saturate(stringChars, part.length);
+      allParts = false;
+    } else {
+      allStrings = false;
+      if (!isContentPart(part)) allParts = false;
+    }
+    if (!allStrings && !allParts) break;
+  }
+  if (allStrings) return stringChars;
+  if (allParts) return measure(items, type => type.includes("image")).chars;
+  return serializedLength(items);
+}
+
+function measurePayload(value: unknown, depth = 0): number {
+  if (typeof value === "string") return value.length;
+  if (Array.isArray(value)) return measureArray(value);
+  const record = object(value);
+  if (!record) return 0;
+  if (depth < MAX_PAYLOAD_DEPTH) {
+    let matched = false;
+    for (const key of EXTENSION_PAYLOAD_KEYS) {
+      if (!Object.hasOwn(record, key)) continue;
+      matched = true;
+      const chars = measurePayload(record[key], depth + 1);
+      if (chars > 0) return chars;
+    }
+    if (matched) return 0;
+  }
+  return serializedLength(record);
+}
+
+function extensionClass(item: Record<string, unknown>): ToolClass {
+  const kind = typeof item.kind === "string" ? item.kind : undefined;
+  return !kind || kind.startsWith("web.") ? "web" : "other";
+}
+
+function measureExtension(item: Record<string, unknown>): number {
+  for (const key of EXTENSION_PAYLOAD_KEYS) {
+    if (!Object.hasOwn(item, key)) continue;
+    const chars = measurePayload(item[key]);
+    if (chars > 0) return chars;
+  }
+  return 0;
+}
+
 function tally(table: Table, cls: ToolClass, chars: number): void {
   const count = table[cls] ?? { calls: 0, chars: 0, maxChars: 0 };
   table[cls] = { calls: saturate(count.calls, 1), chars: saturate(count.chars, chars), maxChars: Math.max(count.maxChars, chars) };
+}
+
+function mergeTable(target: Table, source: Table): void {
+  for (const cls of TOOL_CLASSES) {
+    const add = source[cls];
+    if (!add) continue;
+    const count = target[cls] ?? { calls: 0, chars: 0, maxChars: 0 };
+    target[cls] = {
+      calls: saturate(count.calls, add.calls),
+      chars: saturate(count.chars, add.chars),
+      maxChars: Math.max(count.maxChars, add.maxChars),
+    };
+  }
 }
 
 function copyTable(table: Table): Table {
@@ -79,8 +174,8 @@ function programItem(item: Record<string, unknown>): { cls: ToolClass; chars: nu
   switch (item.type) {
     case "CommandExecution": return { cls: "shell", chars: length(item.aggregated_output) };
     case "McpToolCall": return { cls: "mcp", chars: measure(object(item.result)?.content, () => false).chars };
-    case "FileChange": return { cls: "file-write", chars: length(item.stdout) + length(item.stderr) };
-    case "Extension": return { cls: "web", chars: 0 };
+    case "FileChange": return { cls: "file-write", chars: saturate(length(item.stdout), length(item.stderr)) };
+    case "Extension": return { cls: extensionClass(item), chars: measureExtension(item) };
     default: return undefined;
   }
 }
@@ -92,6 +187,9 @@ const codexClass = (name: string): ToolClass =>
 export class ContextGaugeTail {
   private readonly provider: GaugeProvider;
   private readonly calls = new Map<string, ToolClass>();
+  private readonly directIds = new Set<string>();
+  private readonly pendingOutputs = new Map<string, number>();
+  private readonly pendingItems = new Map<string, Table>();
   private readonly stepIds = new Set<string>();
   private modelSteps = 0;
   private peak = 0;
@@ -127,15 +225,23 @@ export class ContextGaugeTail {
 
   snapshot(): ContextGauge {
     const legacy = this.provider === "codex" && !this.sawRecord;
+    const received = copyTable(this.received);
+    let unmatched = this.unmatched;
+    for (const chars of this.pendingOutputs.values()) {
+      tally(received, "other", chars);
+      unmatched = saturate(unmatched, 1);
+    }
+    const inside = copyTable(this.inside);
+    for (const table of this.pendingItems.values()) mergeTable(inside, table);
     return {
       v: 1,
       provider: this.provider,
       modelSteps: legacy ? this.legacySteps : this.modelSteps,
       peakInputTokens: legacy ? this.legacyPeak : this.peak,
-      received: copyTable(this.received),
-      insidePrograms: copyTable(this.inside),
+      received,
+      insidePrograms: inside,
       images: this.images,
-      unmatched: this.unmatched,
+      unmatched,
       dropped: this.dropped,
     };
   }
@@ -179,17 +285,56 @@ export class ContextGaugeTail {
       }
     } else if (row.type === "event_msg" && payload?.type === "item_completed") {
       const item = object(payload.item);
-      const direct = item !== undefined && isId(item.id) && this.calls.has(item.id);
-      const found = item && !direct ? programItem(item) : undefined;
-      if (found) tally(this.inside, found.cls, found.chars);
+      if (!item) return;
+      const id = isId(item.id) ? item.id : isId(item.call_id) ? item.call_id : undefined;
+      if (id !== undefined && (this.calls.has(id) || this.directIds.has(id))) return;
+      const found = programItem(item);
+      if (found) this.recordProgramItem(id, found.cls, found.chars);
     } else if (row.type === "response_item" && payload) {
       const callId = payload.call_id;
       if ((payload.type === "custom_tool_call" || payload.type === "function_call") && isId(callId) && typeof payload.name === "string") {
+        this.markDirect(callId);
         this.remember(callId, codexClass(payload.name));
       } else if (payload.type === "custom_tool_call_output" || payload.type === "function_call_output") {
-        this.output(isId(callId) ? callId : undefined, payload.output, type => type.includes("image"));
+        const id = isId(callId) ? callId : undefined;
+        if (id !== undefined) this.markDirect(id);
+        this.output(id, payload.output, type => type.includes("image"));
       }
     }
+  }
+
+  private markDirect(id: string): void {
+    this.pendingItems.delete(id);
+    if (this.directIds.delete(id)) { this.directIds.add(id); return; }
+    if (this.directIds.size >= MAX_CALLS) {
+      const oldest = this.directIds.values().next();
+      if (!oldest.done) this.directIds.delete(oldest.value);
+    }
+    this.directIds.add(id);
+  }
+
+  private recordProgramItem(id: string | undefined, cls: ToolClass, chars: number): void {
+    if (id === undefined) {
+      tally(this.inside, cls, chars);
+      return;
+    }
+    const existing = this.pendingItems.get(id);
+    if (existing) {
+      tally(existing, cls, chars);
+      this.pendingItems.delete(id);
+      this.pendingItems.set(id, existing);
+      return;
+    }
+    if (this.pendingItems.size >= MAX_CALLS) {
+      const oldest = this.pendingItems.entries().next();
+      if (!oldest.done) {
+        this.pendingItems.delete(oldest.value[0]);
+        mergeTable(this.inside, oldest.value[1]);
+      }
+    }
+    const table: Table = {};
+    tally(table, cls, chars);
+    this.pendingItems.set(id, table);
   }
 
   private step(id: string, input: number): void {
@@ -205,6 +350,12 @@ export class ContextGaugeTail {
 
   private remember(id: string, cls: ToolClass): void {
     if (this.calls.has(id)) return;
+    const pending = this.pendingOutputs.get(id);
+    if (pending !== undefined) {
+      this.pendingOutputs.delete(id);
+      tally(this.received, cls, pending);
+      return;
+    }
     if (this.calls.size >= MAX_CALLS) {
       const oldest = this.calls.keys().next();
       if (!oldest.done) this.calls.delete(oldest.value);
@@ -214,11 +365,32 @@ export class ContextGaugeTail {
   }
 
   private output(callId: string | undefined, content: unknown, isImage: (type: string) => boolean): void {
-    const cls = callId === undefined ? undefined : this.calls.get(callId);
-    if (callId !== undefined) this.calls.delete(callId);
-    if (cls === undefined) this.unmatched = saturate(this.unmatched, 1);
     const measured = measure(content, isImage);
-    tally(this.received, cls ?? "other", measured.chars);
     this.images = saturate(this.images, measured.images);
+    if (callId === undefined) {
+      this.unmatched = saturate(this.unmatched, 1);
+      tally(this.received, "other", measured.chars);
+      return;
+    }
+    const cls = this.calls.get(callId);
+    if (cls !== undefined) {
+      this.calls.delete(callId);
+      tally(this.received, cls, measured.chars);
+      return;
+    }
+    if (this.pendingOutputs.has(callId)) {
+      this.unmatched = saturate(this.unmatched, 1);
+      tally(this.received, "other", measured.chars);
+      return;
+    }
+    if (this.pendingOutputs.size >= MAX_CALLS) {
+      const oldest = this.pendingOutputs.entries().next();
+      if (!oldest.done) {
+        this.pendingOutputs.delete(oldest.value[0]);
+        this.unmatched = saturate(this.unmatched, 1);
+        tally(this.received, "other", oldest.value[1]);
+      }
+    }
+    this.pendingOutputs.set(callId, measured.chars);
   }
 }

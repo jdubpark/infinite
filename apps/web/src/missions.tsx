@@ -7,6 +7,8 @@ import { requestStore } from "./requests";
 import { haltNotice, missionHaltPlace, type HaltView } from "./halt";
 import { HaltBanner } from "./halt-banner";
 import {
+  missionCanAnswer,
+  missionComposerNotice,
   missionControls,
   missionExtendChoices,
   missionExtensionConfirmation,
@@ -124,8 +126,9 @@ export function MissionPage({ id, me, connected, openTeam, halt }: { id: string;
   const fresh = connected && view.fresh;
   const controls = mission ? missionControls(mission, me.role, fresh, Date.now()) : { extend: false, pause: false, resume: false, cancel: false };
   const liveMission = Boolean(mission && ["planning", "working", "needs-input"].includes(mission.status));
-  const canAnswer = Boolean(fresh && me.role === "owner" && mission && (liveMission || mission.status === "paused"));
+  const canAnswer = Boolean(mission && missionCanAnswer(mission, me.role, fresh));
   const canSteer = Boolean(fresh && me.role === "owner" && liveMission);
+  const progressLoading = progressState.snapshot === null && !progressError && (progressView.refreshing || (!progressView.failed && !progressView.seen));
 
   async function mutate(
     action: MissionAction,
@@ -218,6 +221,7 @@ export function MissionPage({ id, me, connected, openTeam, halt }: { id: string;
   const stoppedAtLimit = missionStoppedAtLimit(mission);
   const stopLine = missionStopLine(mission, Date.now(), date);
   const refreshing = view.refreshing || progressView.refreshing;
+  const composerNotice = missionComposerNotice(mission, me.role, Date.now());
 
   return <div className="team-detail mission-detail">
     <header className="team-detail-heading">
@@ -252,6 +256,8 @@ export function MissionPage({ id, me, connected, openTeam, halt }: { id: string;
         mission={mission}
         me={me}
         progress={progressState}
+        progressError={progressError}
+        progressLoading={progressLoading}
         selectedSubtaskId={selectedSubtaskId}
         onSelectSubtask={setSelectedSubtaskId}
         openTeam={openTeam}
@@ -286,14 +292,8 @@ export function MissionPage({ id, me, connected, openTeam, halt }: { id: string;
           )}
         </div>
       )}
-      {me.role !== "owner" ? (
-        <p className="quiet">Only an owner can steer this mission or answer its decisions.</p>
-      ) : mission.status === "cancelled" ? (
-        <p className="quiet">This mission is cancelled. Its recorded subtasks and evidence remain available above.</p>
-      ) : mission.status === "ready-for-review" ? (
-        <p className="quiet">This mission is ready for review. Inspect the subtasks and evidence above.</p>
-      ) : !liveMission ? (
-        <p className="quiet">Resume or extend this mission before sending new direction.</p>
+      {composerNotice ? (
+        <p className="quiet">{composerNotice}</p>
       ) : (
         <form onSubmit={(event: FormEvent) => { event.preventDefault(); if (direction.trim()) void mutate("steer", { text: direction.trim() }); }}>
           <label className="sr-only" htmlFor="mission-steer-direction">Steer this mission</label>

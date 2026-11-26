@@ -4,12 +4,15 @@ import { useApi, type DecisionRecommendation, type Me } from "../api";
 import { Decision } from "../team-decision";
 import {
   compactAssignments,
+  currentAssignmentCount,
+  isAwaitingExitMember,
   missionProgressResyncNotice,
+  resolveMissionChild,
   type MissionProgressCheck,
-  type MissionProgressChild,
   type MissionProgressMember,
   type MissionProgressState,
   type MissionProgressWorkerStatus,
+  type ResolvedMissionChild,
 } from "./progress-store";
 import type { MissionStatus } from "../mission-model";
 
@@ -66,6 +69,7 @@ export type MissionView = {
   createdAt: string;
   deadlineAt: string;
   clockStoppedAt?: string;
+  canAnswerPaused?: true;
   maxMinutes: number;
   repoProjectIds: string[];
   coordinator?: { memberId: string; sessionId: string; status: "running" | "waiting" | "stopped" };
@@ -225,6 +229,12 @@ export function MissionOpenDecisions({
         Open mission decisions <span className="quiet">{open.length}</span>
       </h2>
       {readOnly && <p className="quiet">Only an owner can answer mission decisions.</p>}
+      {!readOnly && mission.status === "paused" && mission.canAnswerPaused && (
+        <p className="quiet">A halt holds this mission. Your answer is kept and takes effect when the mission resumes.</p>
+      )}
+      {!readOnly && mission.status === "paused" && !mission.canAnswerPaused && (
+        <p className="quiet">Resume this mission before answering its decisions.</p>
+      )}
       {open.map(decision => (
         <Decision
           key={decision.id}
@@ -325,6 +335,8 @@ export function MissionSubtaskInspector({
   mission,
   me,
   progress,
+  progressError,
+  progressLoading,
   selectedSubtaskId,
   onSelectSubtask,
   openTeam,
@@ -333,6 +345,8 @@ export function MissionSubtaskInspector({
   mission: MissionView;
   me: Me;
   progress: MissionProgressState;
+  progressError: string;
+  progressLoading: boolean;
   selectedSubtaskId: string | null;
   onSelectSubtask: (subtaskId: string) => void;
   openTeam: (teamId: string) => void;
@@ -345,13 +359,14 @@ export function MissionSubtaskInspector({
     ? selectedSubtaskId
     : mission.subtasks[0]?.id ?? null;
   const selectedSubtask = mission.subtasks.find(item => item.id === effectiveId) ?? null;
-  const progressSubtask = progress.snapshot?.subtasks.find(item => item.id === effectiveId);
-  const child: MissionProgressChild = progressSubtask?.child ?? { kind: "not-created" };
-  const teamId = selectedSubtask?.teamId ?? (child.kind === "linked" ? child.runId : undefined);
+  const resolvedChild: ResolvedMissionChild | null = selectedSubtask
+    ? resolveMissionChild(mission, selectedSubtask, progress.snapshot, { progressError, progressLoading })
+    : null;
+  const verifiedTeamId = resolvedChild?.kind === "linked" ? resolvedChild.verifiedTeamId : undefined;
 
   useEffect(() => {
-    if (!teamId && tab === "entries") setTab("status");
-  }, [teamId, tab]);
+    if (!verifiedTeamId && tab === "entries") setTab("status");
+  }, [verifiedTeamId, tab]);
 
   return (
     <section className="team-section">
@@ -362,13 +377,17 @@ export function MissionSubtaskInspector({
         <div className="mission-inspector-grid">
           <div className="mission-subtask-list" role="listbox" aria-label="Mission subtasks">
             {mission.subtasks.map(subtask => {
-              const childSnap = progress.snapshot?.subtasks.find(item => item.id === subtask.id)?.child;
+              const resolved = resolveMissionChild(mission, subtask, progress.snapshot, { progressError, progressLoading });
               const childLabel =
-                childSnap?.kind === "linked"
-                  ? `${childSnap.status} · ${childSnap.assignments.length} assigned`
-                  : childSnap
-                    ? childSnap.kind
-                    : subtask.teamStatus ?? "no team";
+                resolved.kind === "linked"
+                  ? `${resolved.child.status} · ${currentAssignmentCount(resolved.child.assignments)} assigned`
+                  : resolved.kind === "loading"
+                    ? "loading progress"
+                    : resolved.kind === "unavailable"
+                      ? "progress unavailable"
+                      : resolved.kind === "mismatched"
+                        ? "link mismatch"
+                        : resolved.kind;
               const isSelected = subtask.id === effectiveId;
               return (
                 <button
@@ -387,7 +406,7 @@ export function MissionSubtaskInspector({
               );
             })}
           </div>
-          {selectedSubtask && (
+          {selectedSubtask && resolvedChild && (
             <div className="mission-subtask-detail">
               <div className="mission-subtask-header">
                 <div>
@@ -399,8 +418,8 @@ export function MissionSubtaskInspector({
                     {selectedSubtask.dependsOn?.length ? ` · after ${selectedSubtask.dependsOn.join(", ")}` : ""}
                   </p>
                 </div>
-                {teamId && (
-                  <button type="button" className="text-button" onClick={() => openTeam(teamId)}>
+                {verifiedTeamId && (
+                  <button type="button" className="text-button" onClick={() => openTeam(verifiedTeamId)}>
                     Open team <ArrowUpRight size={14} />
                   </button>
                 )}
@@ -415,7 +434,7 @@ export function MissionSubtaskInspector({
                 >
                   Assignments &amp; checks
                 </button>
-                {teamId && (
+                {verifiedTeamId && (
                   <button
                     type="button"
                     role="tab"
@@ -428,9 +447,9 @@ export function MissionSubtaskInspector({
               </div>
 
               {tab === "status" ? (
-                <ChildStatusPanel subtask={selectedSubtask} child={child} formatDate={formatDate} />
+                <ChildStatusPanel subtask={selectedSubtask} resolved={resolvedChild} formatDate={formatDate} />
               ) : (
-                teamId && <ChildBlackboardPanel key={teamId} teamId={teamId} formatDate={formatDate} />
+                verifiedTeamId && <ChildBlackboardPanel key={verifiedTeamId} teamId={verifiedTeamId} formatDate={formatDate} />
               )}
             </div>
           )}
@@ -442,20 +461,22 @@ export function MissionSubtaskInspector({
 
 function ChildStatusPanel({
   subtask,
-  child,
+  resolved,
   formatDate,
 }: {
   subtask: MissionSubtaskView;
-  child: MissionProgressChild;
+  resolved: ResolvedMissionChild;
   formatDate: (value: string) => string;
 }) {
-  if (child.kind !== "linked") {
+  if (resolved.kind !== "linked") {
     return (
       <div>
-        <p className="quiet">
-          {child.kind === "not-created" && "No subteam run has been created for this subtask yet."}
-          {child.kind === "missing" && "The linked subteam record is no longer present on the host."}
-          {child.kind === "mismatched" && "The linked subteam record does not match this mission or project."}
+        <p className="quiet" role={resolved.kind === "loading" ? "status" : undefined}>
+          {resolved.kind === "loading" && resolved.reason}
+          {resolved.kind === "unavailable" && resolved.reason}
+          {resolved.kind === "not-created" && "No subteam run has been created for this subtask yet."}
+          {resolved.kind === "missing" && "The linked subteam record is no longer present on the host."}
+          {resolved.kind === "mismatched" && `${resolved.reason} Blackboard entries and team navigation are disabled until the subteam link is verified.`}
         </p>
         {subtask.finalEvidence?.reason && <p className="mission-overview-sub">Final reason: {subtask.finalEvidence.reason}</p>}
         {subtask.finalEvidence?.headCommit && (
@@ -473,6 +494,7 @@ function ChildStatusPanel({
     );
   }
 
+  const { child } = resolved;
   const compacted = compactAssignments(child.assignments);
   return (
     <div>
@@ -485,33 +507,38 @@ function ChildStatusPanel({
       <h3>Active assignments ({compacted.active.length})</h3>
       {compacted.active.length ? (
         <ul className="mission-assignment-list">
-          {compacted.active.map(({ member, priorAttempts }) => (
-            <li className="mission-assignment-item" key={member.memberId}>
-              <div className="mission-assignment-top">
-                <strong>
-                  {roleLabel(member.role)}
-                  {member.taskId ? ` · ${member.taskId}` : ""}
-                </strong>
-                <span className="mission-badge-pair">
-                  <span className="mission-badge">recorded: {member.recordedStatus}</span>
-                  <span className={"mission-badge " + workerToneClass(member.workerStatus)}>
-                    worker: {member.workerStatus}
+          {compacted.active.map(({ member, priorAttempts }) => {
+            const awaitingExit = isAwaitingExitMember(member);
+            return (
+              <li className="mission-assignment-item" key={member.memberId}>
+                <div className="mission-assignment-top">
+                  <strong>
+                    {roleLabel(member.role)}
+                    {member.taskId ? ` · ${member.taskId}` : ""}
+                  </strong>
+                  <span className="mission-badge-pair">
+                    <span className={"mission-badge" + (awaitingExit ? " is-warn" : "")}>
+                      recorded: {awaitingExit ? "reported (awaiting exit)" : member.recordedStatus}
+                    </span>
+                    <span className={"mission-badge " + workerToneClass(member.workerStatus)}>
+                      worker: {member.workerStatus}
+                    </span>
+                    <span className="mission-badge">r{member.revision}</span>
                   </span>
-                  <span className="mission-badge">r{member.revision}</span>
-                </span>
-              </div>
-              {priorAttempts.length > 0 && (
-                <div className="mission-prior-attempts">
-                  {priorAttempts.map(prior => (
-                    <div key={prior.memberId}>
-                      Earlier attempt ({prior.recordedStatus} · r{prior.revision}
-                      {prior.exitConfirmedAt ? ` · exited ${formatDate(prior.exitConfirmedAt)}` : ""})
-                    </div>
-                  ))}
                 </div>
-              )}
-            </li>
-          ))}
+                {priorAttempts.length > 0 && (
+                  <div className="mission-prior-attempts">
+                    {priorAttempts.map(prior => (
+                      <div key={prior.memberId}>
+                        Earlier attempt ({prior.recordedStatus} · r{prior.revision}
+                        {prior.exitConfirmedAt ? ` · exited ${formatDate(prior.exitConfirmedAt)}` : ""})
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </li>
+            );
+          })}
         </ul>
       ) : (
         <p className="quiet">No active assignments on this revision.</p>

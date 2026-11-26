@@ -15,11 +15,11 @@ import { periodEnd, periodStart, type ProviderSpendSnapshot, type ProviderSpendU
 const MICRO_USD = 1_000_000;
 
 export type EvalUsageReader = {
-  providerSpend(provider: Provider, period: EvalBudgetPeriod, now?: Date): ProviderSpendSnapshot;
+  providerSpend(provider: Provider, period: EvalBudgetPeriod, now?: Date, projectId?: string): ProviderSpendSnapshot;
 };
 
 export type EvalBudgetSource = {
-  providerSpend?: (provider: Provider, period: EvalBudgetPeriod, now: Date) => ProviderSpendSnapshot;
+  providerSpend?: (provider: Provider, period: EvalBudgetPeriod, now: Date, projectId?: string) => ProviderSpendSnapshot;
   fuseCheck?: (projectId: string) => FuseCheck;
 };
 
@@ -58,15 +58,16 @@ export function evalBudgetSource(options: {
   if (options.usage === undefined && options.fuse === undefined) return undefined;
   return {
     ...(options.usage === undefined ? {} : {
-      providerSpend: (provider: Provider, period: EvalBudgetPeriod, now: Date): ProviderSpendSnapshot => {
+      providerSpend: (provider: Provider, period: EvalBudgetPeriod, now: Date, projectId?: string): ProviderSpendSnapshot => {
         try {
-          return options.usage!().providerSpend(provider, period, now);
+          return options.usage!().providerSpend(provider, period, now, projectId);
         } catch {
           const start = periodStart(period, now);
           const end = periodEnd(period, start);
           return {
             measured: false,
             provider,
+            ...(projectId === undefined ? {} : { projectId }),
             period: { kind: period, start: start.toISOString(), end: end.toISOString() },
             reason: "ledger-unavailable",
           };
@@ -97,6 +98,7 @@ export function evaluateFuse(
 
 export function evaluateConstraint(
   provider: EvalProvider,
+  projectId: string,
   constraint: TrialBudgetConstraint,
   spend: EvalBudgetSource["providerSpend"],
   now: Date,
@@ -105,16 +107,26 @@ export function evaluateConstraint(
   if (!Number.isFinite(constraint.usd) || constraint.usd < 0) {
     return { ...base, spentUsd: null, state: "unmeasurable", reason: "invalid-measurement" };
   }
+  const scopeProjectId = constraint.source === "project" ? projectId : undefined;
+  if (constraint.source === "project" && !scopeProjectId) {
+    return { ...base, spentUsd: null, state: "unmeasurable", reason: "invalid-measurement" };
+  }
   if (spend === undefined) {
     return { ...base, spentUsd: null, state: "unmeasurable", reason: "ledger-unavailable" };
   }
   let snapshot: ProviderSpendSnapshot;
   try {
-    snapshot = spend(provider, constraint.period, now);
+    snapshot = spend(provider, constraint.period, now, scopeProjectId);
   } catch {
     return { ...base, spentUsd: null, state: "unmeasurable", reason: "ledger-unavailable" };
   }
   if (snapshot.provider !== provider) {
+    return { ...base, spentUsd: null, state: "unmeasurable", reason: "invalid-measurement" };
+  }
+  if (constraint.source === "project" && snapshot.projectId !== undefined && snapshot.projectId !== projectId) {
+    return { ...base, spentUsd: null, state: "unmeasurable", reason: "invalid-measurement" };
+  }
+  if (constraint.source === "host" && snapshot.projectId !== undefined) {
     return { ...base, spentUsd: null, state: "unmeasurable", reason: "invalid-measurement" };
   }
   const validUsd = typeof snapshot.usd === "number" && Number.isFinite(snapshot.usd) && snapshot.usd >= 0;
@@ -141,12 +153,13 @@ export function evaluateConstraint(
 
 export function evaluateProviderBudget(
   provider: EvalProvider,
+  projectId: string,
   constraints: readonly TrialBudgetConstraint[],
   spend: EvalBudgetSource["providerSpend"],
   now: Date,
 ): ProviderBudgetVerdict {
   if (constraints.length === 0) return { state: "unconfigured", provider };
-  const checks = constraints.map(constraint => evaluateConstraint(provider, constraint, spend, now));
+  const checks = constraints.map(constraint => evaluateConstraint(provider, projectId, constraint, spend, now));
   const exceeded = checks.find(item => item.state === "exceeded");
   if (exceeded !== undefined) {
     return {
@@ -174,6 +187,7 @@ export function evaluateProviderBudget(
 }
 
 export function summarizeProjectBudgets(
+  projectId: string,
   projectBudgets: EvalProviderBudgets | undefined,
   hostBudgets: HostUsageBudgets | undefined,
   budget: EvalBudgetSource | undefined,
@@ -183,7 +197,7 @@ export function summarizeProjectBudgets(
   for (const provider of EVAL_PROVIDERS) {
     const constraints = providerBudgetConstraints(provider, projectBudgets, hostBudgets);
     for (const constraint of constraints) {
-      statuses.push(evaluateConstraint(provider, constraint, budget?.providerSpend, now));
+      statuses.push(evaluateConstraint(provider, projectId, constraint, budget?.providerSpend, now));
     }
   }
   return statuses;

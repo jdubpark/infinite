@@ -52,7 +52,9 @@ type Filter = { origins?: Set<string>; areas?: Set<string>; ids?: Set<string> };
 type Project = Config["projects"][number];
 type Pass = NextTrial | { kind: "slots" };
 
-const WAITS_ONLY: ReadonlySet<EvalJobWait> = new Set<EvalJobWait>(["mirror", "halt"]);
+const WAITS_ONLY: ReadonlySet<EvalJobWait> = new Set<EvalJobWait>([
+  "mirror", "halt", "spend-fuse", "provider-limit", "provider-budget", "budget-unmeasurable", "daily-cap",
+]);
 
 const NONE: NextTrial = { kind: "none" };
 const EMPTY_COUNTS: TrialCounts = { plannedTasks: 0, plannedTrials: 0, tasks: 0, skipped: 0, started: 0, graded: 0, resolved: 0, ended: 0, void: 0, voidStreak: 0, reused: 0 };
@@ -291,6 +293,26 @@ export class TrialJobs {
     return this.store.write(tx => this.expireIdleIn(tx));
   }
 
+  launchWait(projectId: string, provider: Provider, settings: TrialSettings, limited?: ReadonlySet<Provider>, excludeTrialId?: string): EvalJobWait | undefined {
+    const nowMs = Date.parse(this.now());
+    const fuse = evaluateFuse(this.budget?.fuseCheck, projectId);
+    if (fuse.state === "halted") return "halt";
+    if (fuse.state === "open") return "spend-fuse";
+    const project = this.projectOf(projectId);
+    const found = project === undefined ? undefined : trialSettings(project, this.config.usage?.budgets);
+    const activeSettings = found !== undefined && "settings" in found ? found.settings : settings;
+    const block = this.providerBlock(projectId, provider, activeSettings, limited, new Date(nowMs));
+    if (block !== undefined) return block;
+    if (activeSettings.trialsPerDay !== null) {
+      try {
+        if (this.store.read(db => trialsSince(db, projectId, utcDayStart(nowMs), excludeTrialId)) >= activeSettings.trialsPerDay) return "daily-cap";
+      } catch {
+        return "budget-unmeasurable";
+      }
+    }
+    return undefined;
+  }
+
   private expireIdleIn(tx: EvidenceTx): number {
     const at = this.now();
     let ended = 0;
@@ -362,12 +384,8 @@ export class TrialJobs {
     if (gates.grader.state !== "ready" || (gates.grader.version ?? 0) < 2) return this.waitOn(tx, row, "grader");
     if (gates.grader.storage !== true || gates.identity.storage !== true) return this.waitOn(tx, row, "storage");
     if (gates.trialLive) return this.waitOn(tx, row, "another-job");
-    if (fuse.state === "open") return this.waitOn(tx, row, "spend-fuse");
-    const blocks = this.providerBlocks(request.configurations, pinned.settings, gates.limited, new Date(nowMs));
-    const jobWait = this.jobProviderWait(request.configurations, blocks, row.kind !== "baseline");
-    if (jobWait !== undefined) return this.waitOn(tx, row, jobWait);
-    if (row.kind !== "baseline") return this.scanFixed(tx, row, projectId, payload, pinned.settings, free, nowMs);
-    return this.scan(tx, row, projectId, request as BaselineJobRequest, pinned.settings, free, nowMs, blocks);
+    if (row.kind !== "baseline") return this.scanFixed(tx, row, projectId, payload, pinned.settings, gates, fuse.state === "open", free, nowMs);
+    return this.scan(tx, row, projectId, request as BaselineJobRequest, pinned.settings, gates, fuse.state === "open", free, nowMs);
   }
 
   private scan(
@@ -376,16 +394,16 @@ export class TrialJobs {
     projectId: string,
     request: BaselineJobRequest,
     settings: TrialSettings,
+    gates: TrialGates,
+    fuseOpen: boolean,
     free: number | undefined,
     nowMs: number,
-    blocks: ReadonlyMap<Provider, "provider-limit" | "provider-budget" | "budget-unmeasurable">,
   ): Pass {
     const at = this.now();
     const filter = filterOf(tx, request);
     const maxTasks = request.taskFilter?.maxTasks ?? TRIAL_TASKS_DEFAULT;
     const trialsPerTask = request.trialsPerTask ?? TRIALS_PER_TASK_DEFAULT;
     const configRefs = request.configurations.map(configuration => configRef(configuration));
-    const eligibleRefs = configRefs.filter((_, index) => !blocks.has(request.configurations[index]!.profile.provider));
     let reached = (trialCounts(tx, [row.job_id]).get(row.job_id) ?? EMPTY_COUNTS).tasks;
     let cursor = row.cursor;
     for (;;) {
@@ -417,6 +435,11 @@ export class TrialJobs {
         continue;
       }
       if (index > 0) setJob(tx, row.job_id, at, { cursor });
+      if (fuseOpen) return this.waitOn(tx, row, "spend-fuse");
+      const blocks = this.providerBlocks(projectId, request.configurations, settings, gates.limited, new Date(nowMs));
+      const jobWait = this.jobProviderWait(request.configurations, blocks, false);
+      if (jobWait !== undefined) return this.waitOn(tx, row, jobWait);
+      const eligibleRefs = configRefs.filter((_, i) => !blocks.has(request.configurations[i]!.profile.provider));
       const pick = eligibleRefs.length === configRefs.length
         ? allPick
         : nextSlot({ tasks: [candidate.task_id], configRefs: eligibleRefs, trialsPerTask, rows });
@@ -435,6 +458,8 @@ export class TrialJobs {
     projectId: string,
     payload: TrialJobPayload,
     settings: TrialSettings,
+    gates: TrialGates,
+    fuseOpen: boolean,
     free: number | undefined,
     nowMs: number,
   ): Pass {
@@ -454,7 +479,13 @@ export class TrialJobs {
       const taskId = tasks[index] as string;
       const valid = tx.get("SELECT 1 FROM eval_tasks WHERE task_id = ? AND state = 'valid'", taskId) !== undefined;
       const pick = valid ? nextSlot({ tasks: [taskId], configRefs, trialsPerTask, rows: jobSlots(tx, row.job_id, taskId) }) : undefined;
-      if (pick !== undefined) return this.handOut(tx, row, projectId, request.configurations, settings, free, nowMs, taskId, pick);
+      if (pick !== undefined) {
+        if (fuseOpen) return this.waitOn(tx, row, "spend-fuse");
+        const blocks = this.providerBlocks(projectId, request.configurations, settings, gates.limited, new Date(nowMs));
+        const jobWait = this.jobProviderWait(request.configurations, blocks, true);
+        if (jobWait !== undefined) return this.waitOn(tx, row, jobWait);
+        return this.handOut(tx, row, projectId, request.configurations, settings, free, nowMs, taskId, pick);
+      }
       advanceTask(tx, row.job_id, !valid);
       setJob(tx, row.job_id, at, { cursor: taskId });
     }
@@ -504,6 +535,7 @@ export class TrialJobs {
   }
 
   private providerBlock(
+    projectId: string,
     provider: Provider,
     settings: TrialSettings,
     limited: ReadonlySet<Provider> | undefined,
@@ -512,7 +544,7 @@ export class TrialJobs {
     if (limited?.has(provider)) return "provider-limit";
     if (!isEvalProvider(provider)) return "budget-unmeasurable";
     const constraints = providerBudgetConstraints(provider, settings.providerBudgets, this.config.usage?.budgets);
-    const verdict = evaluateProviderBudget(provider, constraints, this.budget?.providerSpend, now);
+    const verdict = evaluateProviderBudget(provider, projectId, constraints, this.budget?.providerSpend, now);
     if (verdict.state === "exceeded") return "provider-budget";
     if (verdict.state === "unmeasurable") return "budget-unmeasurable";
     if (verdict.state === "unconfigured" && settings.trialsPerDay === null) return "budget-unmeasurable";
@@ -520,6 +552,7 @@ export class TrialJobs {
   }
 
   private providerBlocks(
+    projectId: string,
     configurations: readonly TrialConfiguration[],
     settings: TrialSettings,
     limited: ReadonlySet<Provider>,
@@ -527,7 +560,7 @@ export class TrialJobs {
   ): Map<Provider, "provider-limit" | "provider-budget" | "budget-unmeasurable"> {
     const blocks = new Map<Provider, "provider-limit" | "provider-budget" | "budget-unmeasurable">();
     for (const provider of new Set(configurations.map(configuration => configuration.profile.provider))) {
-      const block = this.providerBlock(provider, settings, limited, now);
+      const block = this.providerBlock(projectId, provider, settings, limited, now);
       if (block !== undefined) blocks.set(provider, block);
     }
     return blocks;
@@ -556,7 +589,7 @@ export class TrialJobs {
     if (fuse.state === "open") return refusal(409, "spend-fuse-open");
     let unmeasurable = false;
     for (const provider of new Set(configurations.map(configuration => configuration.profile.provider))) {
-      const block = this.providerBlock(provider, settings, undefined, now);
+      const block = this.providerBlock(projectId, provider, settings, undefined, now);
       if (block === "provider-budget") return refusal(409, "provider-budget-exceeded");
       if (block === "budget-unmeasurable") unmeasurable = true;
     }

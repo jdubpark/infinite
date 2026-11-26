@@ -262,8 +262,10 @@ export function jobTrialCount(db: EvidenceDb, jobId: string): number {
   return db.get<{ n: number }>(JOB_TRIALS_SQL, jobId)?.n ?? 0;
 }
 
-export function trialsSince(db: EvidenceDb, projectId: string, since: string): number {
-  return db.get<{ n: number }>(PROJECT_DAY_SQL, db.index("project", projectId), since)?.n ?? 0;
+export function trialsSince(db: EvidenceDb, projectId: string, since: string, excludeTrialId?: string): number {
+  const ref = db.index("project", projectId);
+  if (excludeTrialId === undefined) return db.get<{ n: number }>(PROJECT_DAY_SQL, ref, since)?.n ?? 0;
+  return db.get<{ n: number }>(`${PROJECT_DAY_SQL} AND trial_id != ?`, ref, since, excludeTrialId)?.n ?? 0;
 }
 
 export function trialCounts(db: EvidenceDb, jobIds: readonly string[]): Map<string, TrialCounts> {

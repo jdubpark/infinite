@@ -190,7 +190,7 @@ export class EvalHost implements EvalHostApi {
     const at = this.now();
     const day = `${at.slice(0, 10)}T00:00:00.000Z`;
     const identity = this.trials?.identityStatus() ?? { state: "not-configured" as const };
-    const budgets = summarizeProjectBudgets(project.team?.eval?.providerBudgets, this.config.usage?.budgets, this.budget, new Date(at));
+    const budgets = summarizeProjectBudgets(projectId, project.team?.eval?.providerBudgets, this.config.usage?.budgets, this.budget, new Date(at));
     return this.guard(() => evalSummary(this.store, {
       project,
       mining: this.miner.status(projectId),

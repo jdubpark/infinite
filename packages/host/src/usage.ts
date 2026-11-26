@@ -8,11 +8,14 @@ export type ProviderSpendUnmeasurableReason =
   | "unmeasured-sessions"
   | "partial-sessions"
   | "unpriced-records"
+  | "read-failed"
+  | "ingestion-incomplete"
   | "invalid-measurement";
 export type ProviderSpendSnapshot =
   | {
       measured: true;
       provider: "claude" | "codex" | "grok" | "opencode" | "demo";
+      projectId?: string;
       period: { kind: UsagePeriod; start: string; end: string };
       usd: number;
       tokens: UsageTokens;
@@ -24,6 +27,7 @@ export type ProviderSpendSnapshot =
   | {
       measured: false;
       provider: "claude" | "codex" | "grok" | "opencode" | "demo";
+      projectId?: string;
       period: { kind: UsagePeriod; start: string; end: string };
       reason: ProviderSpendUnmeasurableReason;
       usd?: number;

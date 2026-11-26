@@ -442,6 +442,13 @@ export class TrialPump {
       }
       return this.release(next, trialId, waitOf(source.cause));
     }
+    const launchWait = this.halted(next.projectId)
+      ? "halt"
+      : this.options.jobs.launchWait(next.projectId, next.configuration.profile.provider, next.settings, this.limitedProviders(), trialId);
+    if (launchWait !== undefined) {
+      await this.cleanAfterJudgement();
+      return this.release(next, trialId, launchWait);
+    }
     this.options.store.write(tx => startTrial(tx, trialId, this.now()));
     const live: TrialLive = { kind: "trial", trialId, jobId: next.jobId, taskId: next.taskId, projectId: next.projectId, configuration: next.configuration,
       settings: next.settings, source, ctx, launchedAt: Date.now() };
@@ -537,6 +544,14 @@ export class TrialPump {
       } catch {
         judgements.finish(id, { ending: "void-host", sessionId: null });
         return await this.cleanAfterJudgement();
+      }
+      const launchWait = this.halted(start.projectId)
+        ? "halt"
+        : judgements.launchWait(start.projectId, start.profile, this.limitedProviders());
+      if (launchWait !== undefined) {
+        this.cooldown = 1;
+        await this.cleanAfterJudgement();
+        return judgements.release(id, launchWait);
       }
       const live: JudgementLive = { kind: "judgement", judgementId: id, calibrationId: start.calibrationId, projectId: start.projectId,
         provider: start.profile.provider, judgeMinutes: start.judgeMinutes, ctx, launchedAt: Date.now() };
@@ -654,7 +669,7 @@ export class TrialPump {
     this.limits.set(provider, until);
   }
 
-  private gates(identity: EvalProbe, grader: GraderProbe): TrialGates {
+  private limitedProviders(): Set<Provider> {
     const limited = new Set<Provider>();
     const now = Date.parse(this.now());
     for (const [provider, until] of this.limits) if (until > now) limited.add(provider);
@@ -662,6 +677,11 @@ export class TrialPump {
       for (const item of this.options.teams().providerLimits()) limited.add(item.provider);
     } catch {
     }
+    return limited;
+  }
+
+  private gates(identity: EvalProbe, grader: GraderProbe): TrialGates {
+    const limited = this.limitedProviders();
     return {
       identity, grader, hostLoadHeld: this.loadHeld(), halted: projectId => this.halted(projectId), limited,
       freeSlots: async () => {

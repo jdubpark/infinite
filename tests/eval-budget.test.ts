@@ -316,19 +316,20 @@ test("evaluateProviderBudget enforces configured USD ceilings, precision, and fa
   assert.equal(usdExceeded(0, 0), true);
   assert.equal(usdExceeded(0, 1e-7), false);
 
-  const badLimit = evaluateProviderBudget("opencode", [{ source: "project", usd: Number.NaN, period: "day" }], () => measuredSnapshot("opencode", "day", 0), now);
+  const badLimit = evaluateProviderBudget("opencode", PROJECT_A, [{ source: "project", usd: Number.NaN, period: "day" }], () => measuredSnapshot("opencode", "day", 0), now);
   assert.equal(badLimit.state === "unmeasurable" && badLimit.reason, "invalid-measurement");
-  const badUsd = evaluateProviderBudget("opencode", [{ source: "project", usd: 5, period: "day" }], () => measuredSnapshot("opencode", "day", -1), now);
+  const badUsd = evaluateProviderBudget("opencode", PROJECT_A, [{ source: "project", usd: 5, period: "day" }], () => measuredSnapshot("opencode", "day", -1), now);
   assert.equal(badUsd.state === "unmeasurable" && badUsd.reason, "invalid-measurement");
 
-  assert.deepEqual(evaluateProviderBudget("opencode", [], undefined, now), { state: "unconfigured", provider: "opencode" });
+  assert.deepEqual(evaluateProviderBudget("opencode", PROJECT_A, [], undefined, now), { state: "unconfigured", provider: "opencode" });
 
-  const missingReader = evaluateProviderBudget("opencode", [{ source: "project", usd: 5, period: "day" }], undefined, now);
+  const missingReader = evaluateProviderBudget("opencode", PROJECT_A, [{ source: "project", usd: 5, period: "day" }], undefined, now);
   assert.equal(missingReader.state, "unmeasurable");
   assert.equal(missingReader.state === "unmeasurable" && missingReader.reason, "ledger-unavailable");
 
   const admitted = evaluateProviderBudget(
     "opencode",
+    PROJECT_A,
     [{ source: "project", usd: 5, period: "day" }, { source: "host", usd: 20, period: "month" }],
     (provider, period) => measuredSnapshot(provider, period, period === "day" ? 2.5 : 15),
     now,
@@ -337,6 +338,7 @@ test("evaluateProviderBudget enforces configured USD ceilings, precision, and fa
 
   const hostExceeded = evaluateProviderBudget(
     "opencode",
+    PROJECT_A,
     [{ source: "project", usd: 5, period: "day" }, { source: "host", usd: 20, period: "month" }],
     (provider, period) => measuredSnapshot(provider, period, period === "day" ? 2.5 : 20),
     now,
@@ -346,6 +348,7 @@ test("evaluateProviderBudget enforces configured USD ceilings, precision, and fa
 
   const exceededBeatsUnmeasurable = evaluateProviderBudget(
     "opencode",
+    PROJECT_A,
     [{ source: "project", usd: 5, period: "day" }],
     (provider, period) => unmeasuredSnapshot(provider, period, "unpriced-records", 5.25),
     now,
@@ -354,6 +357,7 @@ test("evaluateProviderBudget enforces configured USD ceilings, precision, and fa
 
   const underWithGapFailsClosed = evaluateProviderBudget(
     "opencode",
+    PROJECT_A,
     [{ source: "project", usd: 5, period: "day" }],
     (provider, period) => unmeasuredSnapshot(provider, period, "unpriced-records", 2.0),
     now,
@@ -363,6 +367,7 @@ test("evaluateProviderBudget enforces configured USD ceilings, precision, and fa
 
   const wrongProvider = evaluateProviderBudget(
     "claude",
+    PROJECT_A,
     [{ source: "project", usd: 5, period: "day" }],
     (_provider, period) => measuredSnapshot("opencode", period, 0),
     now,
@@ -372,6 +377,7 @@ test("evaluateProviderBudget enforces configured USD ceilings, precision, and fa
 
   const throwing = evaluateProviderBudget(
     "opencode",
+    PROJECT_A,
     [{ source: "project", usd: 5, period: "day" }],
     () => { throw new Error("boom"); },
     now,
@@ -574,7 +580,7 @@ test("fail-closed behavior when budget is configured without a usage reader", as
     assert.equal(refused.status, 409);
     assert.equal(refused.code, "provider-budget-unmeasurable");
 
-    const summary = summarizeProjectBudgets({ opencode: { usd: 5, period: "day" } }, undefined, undefined, new Date(START));
+    const summary = summarizeProjectBudgets(PROJECT_A, { opencode: { usd: 5, period: "day" } }, undefined, undefined, new Date(START));
     assert.deepEqual(summary, [{
       provider: "opencode",
       source: "project",

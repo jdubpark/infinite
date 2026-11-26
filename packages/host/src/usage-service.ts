@@ -75,11 +75,15 @@ function journaledCoverage(data: unknown): LedgerState["journaled"] | undefined 
   };
 }
 
-export function ledgerCoverage(input: { provider: Provider; measuredLaunch: boolean; closed: boolean; journaled?: LedgerCoverage; valid: number; refused: number }): LedgerCoverage {
-  const { provider, measuredLaunch, closed, journaled, valid, refused } = input;
-  if (provider === "opencode" && measuredLaunch) return refused > 0 ? { coverage: "partial", reason: "row-dropped" } : { coverage: "complete" };
+export function ledgerCoverage(input: { provider: Provider; measuredLaunch: boolean; closed: boolean; journaled?: LedgerCoverage; valid: number; refused: number; drained?: boolean }): LedgerCoverage {
+  const { provider, measuredLaunch, closed, journaled, valid, refused, drained = true } = input;
+  if (provider === "opencode" && measuredLaunch) {
+    if (!drained) return { coverage: "partial", reason: "drain-incomplete" };
+    return refused > 0 ? { coverage: "partial", reason: "row-dropped" } : { coverage: "complete" };
+  }
   if (!COVERED.has(provider)) return { coverage: "none", reason: "unsupported" };
   if (journaled) {
+    if (!drained) return { coverage: "partial", reason: "drain-incomplete" };
     if (journaled.coverage === "complete" && refused > 0) return { coverage: "partial", reason: "row-dropped" };
     return { coverage: journaled.coverage, ...(journaled.reason ? { reason: journaled.reason } : {}) };
   }
@@ -95,6 +99,7 @@ export class UsageService {
   private imported = false;
   private tickFailed = false;
   private readonly failed = new Set<string>();
+  private readonly ingestionGaps = new Map<string, { provider: Provider; projectId: string; reason: "read-failed" | "ingestion-incomplete" }>();
   private readonly exitedAt = new Map<string, number>();
   private kept?: Ledger;
   private keptAt = 0;
@@ -156,13 +161,17 @@ export class UsageService {
     this.ticking = true;
     try {
       const stored = new Map(this.store.read(db => readSessions(db)).map(row => [row.sessionId, row]));
+      for (const id of [...this.ingestionGaps.keys()]) if (stored.get(id)?.exited) this.ingestionGaps.delete(id);
       const now = Date.now();
       let pages = MAX_PAGES;
       let wroteRecords = false;
       for (const session of rows ?? await this.manager.list()) {
         if (this.closed) break;
         const previous = stored.get(session.id);
-        if (previous?.exited) continue;
+        if (previous?.exited) {
+          this.ingestionGaps.delete(session.id);
+          continue;
+        }
         const observed = session.provider === "opencode" && (session.teamModelProfile ? session.teamModelProfile.provider === "opencode" : !session.team && session.runtime?.nativeUi === "opencode");
         const covered = COVERED.has(session.provider);
         const read = observed || covered;
@@ -180,16 +189,16 @@ export class UsageService {
         const exitedSince = this.exitedAt.get(session.id);
         const closes = (complete: boolean, journaled: LedgerState["journaled"]) => exitedListed && complete
           && (!covered || journaled !== undefined || (exitedSince !== undefined && now - exitedSince >= EXIT_GRACE_MS));
-        const stateOf = (row: Row): LedgerState => {
+        const stateOf = (row: Row, drained = true): LedgerState => {
           const coverage = ledgerCoverage({ provider: session.provider, measuredLaunch: observed, closed: row.exited, journaled: row.journaled,
-            valid: row.seen - row.refused, refused: row.refused });
+            valid: row.seen - row.refused, refused: row.refused, drained });
           return { ...coverage, cursor: row.cursor, seen: row.seen, refused: row.refused, exited: row.exited, ...(row.journaled ? { journaled: row.journaled } : {}) };
         };
-        const keyed = (row: Row) => keyOf({ lastActiveAt, ...stateOf(row) });
+        const keyed = (row: Row, drained = true) => keyOf({ lastActiveAt, ...stateOf(row, drained) });
         let current: Row = read
           ? { exited: false, lastActiveAt, cursor: previous?.cursor ?? 0, seen: previous?.seen ?? 0, refused: previous?.refused ?? 0, ...(previous?.journaled ? { journaled: previous.journaled } : {}) }
           : { exited: false, lastActiveAt, cursor: 0, seen: 0, refused: 0 };
-        let saved = previous ? keyOf(previous) : undefined, complete = !read;
+        let saved = previous ? keyOf(previous) : undefined, complete = !read, readFailed = false;
         if (read) {
           while (!this.closed && pages > 0) {
             let page: ReturnType<Manager["events"]>;
@@ -197,6 +206,7 @@ export class UsageService {
               page = this.manager.events(session.id, current.cursor, PAGE, new Set(["usage", "usage-coverage"]));
               this.failed.delete(session.id);
             } catch (error) {
+              readFailed = true;
               if (!this.failed.has(session.id)) {
                 this.failed.add(session.id);
                 console.warn(`[Infinite] Usage for session ${session.id} cannot be read: ${error instanceof Error ? error.message : String(error)}`);
@@ -213,12 +223,13 @@ export class UsageService {
                 if (record) records.push(record); else refused++;
               } else journaled = journaledCoverage(event.data) ?? journaled;
             }
-            const next: Row = { exited: closes(!page.more, journaled), lastActiveAt, cursor: page.cursor,
+            const drained = !page.more;
+            const next: Row = { exited: closes(drained, journaled), lastActiveAt, cursor: page.cursor,
               seen: current.seen + seen, refused: current.refused + refused, ...(journaled ? { journaled } : {}) };
-            const key = keyed(next);
+            const key = keyed(next, drained);
             if (key !== saved || records.length > 0) {
               const written = this.write(tx => {
-                if (!writeSession(tx, header, stateOf(next))) return false;
+                if (!writeSession(tx, header, stateOf(next, drained))) return false;
                 const owners = new Set<string>([session.id]);
                 for (const record of records) {
                   const res = writeRecordWithOwner(tx, session.id, record);
@@ -255,14 +266,18 @@ export class UsageService {
               saved = key;
             }
             current = next;
-            if (!page.more) { complete = true; break; }
+            if (drained) { complete = true; break; }
           }
+          if (complete) this.ingestionGaps.delete(session.id);
+          else this.ingestionGaps.set(session.id, { provider: session.provider, projectId: session.projectId, reason: readFailed ? "read-failed" : "ingestion-incomplete" });
+        } else {
+          this.ingestionGaps.delete(session.id);
         }
         const final: Row = { ...current, exited: closes(complete, current.journaled) };
         if (final.exited) this.exitedAt.delete(session.id);
-        if (keyed(final) !== saved) {
+        if (keyed(final, complete) !== saved) {
           this.write(tx => {
-            if (writeSession(tx, header, stateOf(final)) && this.store.status().modules[OUTCOMES_MODULE] === "ready") {
+            if (writeSession(tx, header, stateOf(final, complete)) && this.store.status().modules[OUTCOMES_MODULE] === "ready") {
               refreshOutcomeCostsForSessions(tx, [{ sessionId: session.id, runId: header.team?.runId, memberId: header.team?.memberId, exited: final.exited }], this.config.usage?.prices);
             }
           });
@@ -518,14 +533,26 @@ export class UsageService {
     return sumUsage(this.priced(ids.flatMap(id => data.bySession.get(id) ?? [])));
   }
 
-  private providerWindow(data: Snapshot, provider: Provider, period: Period, now: Date, includePrevious: boolean) {
+  private ingestionGap(provider: Provider, projectId?: string): "read-failed" | "ingestion-incomplete" | undefined {
+    let incomplete = false;
+    for (const gap of this.ingestionGaps.values()) {
+      if (gap.provider !== provider) continue;
+      if (projectId !== undefined && gap.projectId !== projectId) continue;
+      if (gap.reason === "read-failed") return "read-failed";
+      incomplete = true;
+    }
+    return incomplete ? "ingestion-incomplete" : undefined;
+  }
+
+  private providerWindow(data: Snapshot, provider: Provider, period: Period, now: Date, includePrevious: boolean, projectId?: string) {
     const start = periodStart(period, now);
     const end = periodEnd(period, start);
     const observed = provider === "opencode";
-    const sessions = data.sessions.filter(s => s.provider === provider);
-    const unmeasuredBriefings = provider === "opencode"
-      ? data.briefings.filter(row => !row.record && Date.parse(row.at) >= start.getTime() && Date.parse(row.at) <= now.getTime()).length
-      : 0;
+    const sessions = data.sessions.filter(s => s.provider === provider && (projectId === undefined || s.projectId === projectId));
+    const briefings = provider === "opencode"
+      ? data.briefings.filter(row => projectId === undefined || row.projectId === projectId)
+      : [];
+    const unmeasuredBriefings = briefings.filter(row => !row.record && Date.parse(row.at) >= start.getTime() && Date.parse(row.at) <= now.getTime()).length;
     const unmeasuredSessions = sessions.filter(s => {
       const at = Date.parse(s.lastActiveAt ?? s.createdAt);
       return !measured(s) && at >= start.getTime() && at < end.getTime();
@@ -537,7 +564,7 @@ export class UsageService {
     const within = (from: Date, to: Date) => {
       const rows = this.priced(sessions.filter(measured).flatMap(s => data.bySession.get(s.sessionId) ?? [])
         .filter(record => { const at = Date.parse(record.completedAt); return at >= from.getTime() && at < to.getTime(); }));
-      if (provider === "opencode") rows.push(...data.briefings.flatMap(row => row.record && Date.parse(row.at) >= from.getTime() && Date.parse(row.at) < to.getTime() ? this.priced([row.record]) : []));
+      if (provider === "opencode") rows.push(...briefings.flatMap(row => row.record && Date.parse(row.at) >= from.getTime() && Date.parse(row.at) < to.getTime() ? this.priced([row.record]) : []));
       return rows;
     };
     const current = sumUsage(within(start, new Date(now.getTime() + 1)));
@@ -545,21 +572,23 @@ export class UsageService {
     return { start, end, observed, unmeasuredSessions, partialSessions, current, previous };
   }
 
-  providerSpend(provider: Provider, period: Period, now = new Date()): ProviderSpendSnapshot {
+  providerSpend(provider: Provider, period: Period, now = new Date(), projectId?: string): ProviderSpendSnapshot {
     const start = periodStart(period, now);
     const end = periodEnd(period, start);
     const window = { kind: period, start: start.toISOString(), end: end.toISOString() };
+    const scoped = projectId === undefined ? {} : { projectId };
     let data: Snapshot;
     try {
       data = this.snapshot();
     } catch {
-      return { measured: false, provider, period: window, reason: "ledger-unavailable" };
+      return { measured: false, provider, ...scoped, period: window, reason: "ledger-unavailable" };
     }
-    const metrics = this.providerWindow(data, provider, period, now, false);
+    const metrics = this.providerWindow(data, provider, period, now, false, projectId);
     if (!metrics.observed) {
       return {
         measured: false,
         provider,
+        ...scoped,
         period: window,
         reason: "provider-unmeasured",
         tokens: metrics.current.tokens,
@@ -569,7 +598,13 @@ export class UsageService {
       };
     }
     const unpriced = metrics.current.pricing.unknown;
-    const gap = metrics.unmeasuredSessions > 0 ? "unmeasured-sessions" as const
+    const ingestion = this.ingestionGap(provider, projectId);
+    const undrainedStored = data.sessions.some(session => session.provider === provider
+      && (projectId === undefined || session.projectId === projectId)
+      && !session.exited && session.coverage === "partial" && session.reason === "drain-incomplete");
+    const gap = ingestion !== undefined ? ingestion
+      : undrainedStored ? "ingestion-incomplete" as const
+      : metrics.unmeasuredSessions > 0 ? "unmeasured-sessions" as const
       : metrics.partialSessions > 0 ? "partial-sessions" as const
       : unpriced > 0 ? "unpriced-records" as const
       : undefined;
@@ -577,6 +612,7 @@ export class UsageService {
       return {
         measured: false,
         provider,
+        ...scoped,
         period: window,
         reason: gap,
         usd: metrics.current.cost,
@@ -590,6 +626,7 @@ export class UsageService {
     return {
       measured: true,
       provider,
+      ...scoped,
       period: window,
       usd: metrics.current.cost,
       tokens: metrics.current.tokens,

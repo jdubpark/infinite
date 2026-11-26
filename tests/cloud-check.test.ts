@@ -306,14 +306,27 @@ print("guest rejected workspace", flush=True)
   assert.match(launch("--runner", "runner-a").stderr, /handshake/);
   rmSync(contact);
   writeFileSync(join(repo, example), "TEST_TOKEN=unapproved-fixture\n");
-  assert.match(launch("--runner", "runner-a").stderr, /environment example/);
+  assert.match(launch("--runner", "runner-a").stderr, /configuration/);
   assert.equal(existsSync(contact), false);
   git("add", example);
   writeFileSync(join(repo, example), approved);
-  assert.match(launch("--runner", "runner-a").stderr, /environment example/);
+  assert.match(launch("--runner", "runner-a").stderr, /configuration/);
   git("commit", "-qm", "changed example");
   git("add", example);
-  assert.match(launch("--runner", "runner-a").stderr, /environment example/);
+  assert.match(launch("--runner", "runner-a").stderr, /configuration/);
+  assert.equal(existsSync(contact), false);
+
+  git("commit", "-qm", "restore approved example");
+  const settings = "save-exact=true\n";
+  writeFileSync(join(repo, ".npmrc"), settings);
+  git("add", ".npmrc");
+  git("commit", "-qm", "package settings");
+  assert.match(launch("--runner", "runner-a").stderr, /private input/);
+  git("config", "--global", "--add", `infiniteProject.${originHash}.npmConfig`, createHash("sha256").update(settings).digest("hex") + " .npmrc");
+  assert.match(launch("--runner", "runner-a").stderr, /handshake/);
+  rmSync(contact);
+  writeFileSync(join(repo, ".npmrc"), settings + "changed=true\n");
+  assert.match(launch("--runner", "runner-a").stderr, /configuration/);
   assert.equal(existsSync(contact), false);
 });
 

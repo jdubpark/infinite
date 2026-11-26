@@ -253,6 +253,8 @@ Invoke the launcher inside the repository being checked. Workspace context store
 
 If a repository tracks a distributed environment template such as `.env.development-example`, review the template before approving it. In the operator's global Git config, add `<content SHA-256> <repository-relative path>` under `infiniteProject.<origin SHA-256>.envExample`. Only those exact bytes are accepted from the commit, index and working file. Keep credentials and machine-specific environment files outside source control.
 
+For a tracked, credential-free `.npmrc`, use the same digest and path format under `infiniteProject.<origin SHA-256>.npmConfig`. Review package settings in each new version before updating its approved digest.
+
 ### Mobile checks
 
 ```sh

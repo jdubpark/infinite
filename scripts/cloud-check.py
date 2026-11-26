@@ -92,25 +92,27 @@ def private_or_runtime_path(path: str, *, tracked: bool = False) -> bool:
     )
 
 
-def approved_env_examples(root: Path) -> dict[str, str]:
+def approved_config_inputs(root: Path) -> dict[str, str]:
     origin = git(root, "config", "--local", "--get", "remote.origin.url", check=False).rstrip(b"\n")
     if not origin:
         return {}
-    key = "infiniteProject." + hashlib.sha256(origin).hexdigest() + ".envExample"
-    records = git(root, "config", "--global", "-z", "--get-all", key, check=False)
+    prefix = "infiniteProject." + hashlib.sha256(origin).hexdigest() + "."
     approved = {}
-    for record in records.split(b"\0"):
-        if not record:
-            continue
-        digest, separator, path = decode_path(record).partition(" ")
-        if (not separator or not re.fullmatch(r"[0-9a-f]{64}", digest)
-                or not re.fullmatch(r"\.env\.[A-Za-z0-9_.-]+[.-]example", Path(path).name)
-                or any(part in PRIVATE_COMPONENTS for part in path.split("/"))):
-            raise RuntimeError("invalid owner-approved environment example")
-        path = safe_path(path)
-        if path in approved and approved[path] != digest:
-            raise RuntimeError("multiple approved digests for one environment example")
-        approved[path] = digest
+    patterns = {"envExample": r"\.env\.[A-Za-z0-9_.-]+[.-]example", "npmConfig": r"\.npmrc"}
+    for setting, pattern in patterns.items():
+        records = git(root, "config", "--global", "-z", "--get-all", prefix + setting, check=False)
+        for record in records.split(b"\0"):
+            if not record:
+                continue
+            digest, separator, path = decode_path(record).partition(" ")
+            if (not separator or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                    or not re.fullmatch(pattern, Path(path).name)
+                    or any(part in PRIVATE_COMPONENTS for part in path.split("/"))):
+                raise RuntimeError("invalid owner-approved configuration input")
+            path = safe_path(path)
+            if path in approved and approved[path] != digest:
+                raise RuntimeError("multiple approved digests for one configuration input")
+            approved[path] = digest
     return approved
 
 
@@ -120,7 +122,7 @@ def check_tracked_input(root: Path, path: str, mode: bytes, oid: bytes, approved
     if (path in approved and mode in (b"100644", b"100755")
             and hashlib.sha256(git(root, "cat-file", "blob", oid.decode("ascii"))).hexdigest() == approved[path]):
         return
-    raise RuntimeError("tracked private input or changed environment example cannot be transferred")
+    raise RuntimeError("tracked private input or changed approved configuration cannot be transferred")
 
 
 def config_value(root: Path, key: str) -> str | None:
@@ -309,7 +311,7 @@ def working_tree_archive(root: Path, entries: list[dict[str, object]], approved:
                 continue
             record, member, content = file_record(root, path)
             if path in approved and (record["type"] != "file" or record["sha256"] != approved[path]):
-                raise RuntimeError("working environment example differs from its owner-approved digest")
+                raise RuntimeError("working configuration differs from its owner-approved digest")
             files[path] = record
             if member.issym():
                 archive.addfile(member)
@@ -399,7 +401,7 @@ def capture(root: Path, cwd: Path, argv: list[str], worker: Path, project: Path,
     toolchain = toolchain_pin(root, mode)
     if git(root, "ls-files", "-u", "-z"):
         raise RuntimeError("unmerged paths are unsupported")
-    approved = approved_env_examples(root)
+    approved = approved_config_inputs(root)
     validate_head_tree(root, base_oid, approved)
     entries = index_entries(root, approved)
     status, omitted_status = status_entries(root)
@@ -717,7 +719,7 @@ def local_snapshot_matches(root: Path, payload: dict[str, bytes]) -> bool:
     metadata = json.loads(payload["snapshot.json"])
     head = git(root, "rev-parse", "HEAD").decode("ascii").strip()
     ref = git(root, "symbolic-ref", "-q", "HEAD", check=False).decode().strip() or None
-    approved = approved_env_examples(root)
+    approved = approved_config_inputs(root)
     entries = index_entries(root, approved)
     status, omitted_status = status_entries(root)
     archive, files, omitted_files = working_tree_archive(root, entries, approved)

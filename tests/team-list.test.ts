@@ -43,7 +43,7 @@ function finishedRun(index: number): TeamView {
   }));
   return {
     id, projectId: "rehearsal", provider: "claude", title: `Finished run ${index}`, objective: prose("Make the parser accept the documented grammar.", 5000),
-    parallelism: 4, revision: 1, status: "ready-for-review", createdAt: at(index), updatedAt: at(index + 100), workspace, branch: `team/run-${index}`,
+    parallelism: 4, revision: 1, status: "ready-for-review", createdAt: at(index), updatedAt: at(index + 100), lastActivityAt: at(index + 99), workspace, branch: `team/run-${index}`,
     baseCommit: commit(index), headCommit: commit(index + 1), round: 1, reason: "Ready for review.",
     lineup: { coordinator, integrator: coordinator, reviewer: coordinator, implementers: [implementer] },
     goal: { id: randomUUID(), revision: 2, cycle: 3, successCriteria: prose("The grammar suite passes.", 1500), nonGoals: ["No new syntax."], allowedPaths: ["src", "tests"],
@@ -96,7 +96,7 @@ test("thirty finished runs list in compact rows far under the relay's response l
 test("a list row keeps every field client list code reads, unchanged, and nothing the view lacks", () => {
   const view = json(finishedRun(7)), row = json(teamListItem(view));
   const listed = [
-    "id", "projectId", "provider", "title", "status", "revision", "parallelism", "createdAt", "updatedAt", "workspace", "branch", "baseCommit", "headCommit",
+    "id", "projectId", "provider", "title", "status", "revision", "parallelism", "createdAt", "updatedAt", "lastActivityAt", "workspace", "branch", "baseCommit", "headCommit",
     "reason", "missionId", "permissionsRevokedAt", "resumable", "continuable", "workers", "decisions", "lineup.coordinator", "goal.id", "goal.revision", "goal.cycle",
     "linear.status", "linear.reason", "linear.checkedAt", "linear.issue.identifier", "linear.issue.url", "linear.issue.title", "linear.issue.state",
     "deliveryReceipt.headCommit", "deliveryReceipt.pullRequestUrl", "deliveryReceipt.mergeCommit", "pullRequest.pullRequestUrl", "review.verdict", "review.revision", "discovery.revision",

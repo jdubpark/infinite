@@ -1,11 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { TaskCapture, type TaskCaptureOptions } from "../packages/host/src/eval-capture.js";
-import type { CaptureGit, ApprovalStart, BaseRead, CaptureStart, NameRead, PatchRead } from "../packages/host/src/eval-types.js";
+import { captureGit } from "../packages/host/src/eval-git.js";
+import type { CaptureGit, ApprovalStart, BaseRead, CaptureStart, NameRead, PatchRead, TreeCompare } from "../packages/host/src/eval-types.js";
 import { type Promoted, capturedTaskId, readEvalTask, readMaterial, runEvalTasks } from "../packages/host/src/eval-store.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { EvidenceTx } from "../packages/host/src/evidence/types.js";
@@ -76,6 +78,10 @@ class FakeGit implements CaptureGit {
 
   patch(_cwd: string, _from: string, to: string): Promise<PatchRead> {
     return this.call<PatchRead>("patch", to, { state: "read", bytes: Buffer.from(`patch ${to}`) });
+  }
+
+  sameTree(_cwd: string, _from: string, to: string): Promise<TreeCompare> {
+    return this.call<TreeCompare>("sameTree", to, "different");
   }
 
   names(_cwd: string, _from: string, to: string): Promise<NameRead> {
@@ -585,31 +591,345 @@ test("an owner exclusion demotes a candidate", async () => {
   }
 });
 
-test("a refused patch form leaves the patch missing", async () => {
+test("a missing patch ref leaves the patch missing while stream and empty reference failures reject explicitly", async () => {
   const w = world();
   try {
-    w.git.answer("patch", COMMIT, { state: "failed" });
+    w.git.answer("patch", COMMIT, { state: "missing" });
     w.capture.integrated(start());
     w.capture.approved(approval(REVIEWED));
     await w.capture.idle();
     const partial = taskRow(w.store);
     assert.equal(partial?.material, "partial");
+    assert.equal((partial?.payload as { reference?: string } | undefined)?.reference, "missing");
     const parts = partsOf(w.store);
     assert.notEqual(parts.capsule, undefined);
     assert.equal(parts.reference, undefined);
-    w.git.answer("names", OTHER_COMMIT, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
-    w.git.answer("patch", OTHER_COMMIT, { state: "read", bytes: Buffer.alloc(0) });
-    w.capture.integrated(start({ memberId: OTHER_MEMBER, commit: OTHER_COMMIT }));
-    await w.capture.idle();
-    assert.equal((taskRow(w.store, OTHER_MEMBER)?.payload as { reference?: string } | undefined)?.reference, "missing");
     writeLedger(w.store, ledger());
     w.capture.reconcile();
     const row = taskRow(w.store);
     assert.equal(row?.state, "rejected");
     assert.equal(row?.reason, "patch-missing");
     assert.deepEqual(partsOf(w.store), {});
+
+    const missingBase = "7".repeat(40);
+    w.git.answer("names", OTHER_COMMIT, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
+    w.git.answer("patch", missingBase, { state: "missing" });
+    w.capture.integrated(start({ memberId: "m-missing-base", memberBaseCommit: missingBase, commit: OTHER_COMMIT }));
+    await w.capture.idle();
+    const partialBase = taskRow(w.store, "m-missing-base");
+    assert.equal(partialBase?.material, "partial");
+    assert.equal((partialBase?.payload as { baseDelta?: string } | undefined)?.baseDelta, "missing");
+
+    const failedCommit = "6".repeat(40);
+    w.git.answer("names", failedCommit, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
+    w.git.answer("patch", failedCommit, { state: "failed" });
+    w.capture.integrated(start({ memberId: "m-failed-ref", commit: failedCommit }));
+    await w.capture.idle();
+    const failedRef = taskRow(w.store, "m-failed-ref");
+    assert.equal(failedRef?.state, "rejected");
+    assert.equal(failedRef?.reason, "capture-failed");
+    assert.equal(failedRef?.material, "none");
+    assert.deepEqual(partsOf(w.store, "m-failed-ref"), {});
+
+    const emptyCommit = "5".repeat(40);
+    w.git.answer("names", emptyCommit, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
+    w.git.answer("patch", emptyCommit, { state: "empty" });
+    w.capture.integrated(start({ memberId: "m-empty-ref", commit: emptyCommit }));
+    await w.capture.idle();
+    const emptyRef = taskRow(w.store, "m-empty-ref");
+    assert.equal(emptyRef?.state, "rejected");
+    assert.equal(emptyRef?.reason, "capture-failed");
+    assert.equal(emptyRef?.material, "none");
+    assert.deepEqual(partsOf(w.store, "m-empty-ref"), {});
+
+    const zeroCommit = "4".repeat(40);
+    w.git.answer("names", zeroCommit, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
+    w.git.answer("patch", zeroCommit, { state: "read", bytes: Buffer.alloc(0) });
+    w.capture.integrated(start({ memberId: "m-zero-ref", commit: zeroCommit }));
+    await w.capture.idle();
+    const zeroRef = taskRow(w.store, "m-zero-ref");
+    assert.equal(zeroRef?.state, "rejected");
+    assert.equal(zeroRef?.reason, "capture-failed");
+    assert.equal(zeroRef?.material, "none");
+    assert.deepEqual(partsOf(w.store, "m-zero-ref"), {});
+
+    const failedBase = "3".repeat(40);
+    w.git.answer("patch", failedBase, { state: "failed" });
+    w.capture.integrated(start({ memberId: "m-failed-base", memberBaseCommit: failedBase, commit: OTHER_COMMIT }));
+    await w.capture.idle();
+    const failedBaseRow = taskRow(w.store, "m-failed-base");
+    assert.equal(failedBaseRow?.state, "rejected");
+    assert.equal(failedBaseRow?.reason, "capture-failed");
+    assert.equal(failedBaseRow?.material, "none");
+
+    const equalBase = "2".repeat(40);
+    w.git.answer("patch", equalBase, { state: "empty" });
+    w.git.answer("sameTree", equalBase, "same");
+    w.capture.integrated(start({ memberId: "m-empty-base", memberBaseCommit: equalBase, commit: OTHER_COMMIT }));
+    w.capture.approved(approval(REVIEWED));
+    await w.capture.idle();
+    const equalBaseRow = taskRow(w.store, "m-empty-base");
+    assert.equal(equalBaseRow?.state, "captured");
+    assert.equal(equalBaseRow?.material, "stored");
+    assert.equal((equalBaseRow?.payload as { baseDelta?: string } | undefined)?.baseDelta, "stored");
+    assert.deepEqual(partsOf(w.store, "m-empty-base").baseDelta, Buffer.alloc(0));
+    writeLedger(w.store, ledger({ memberId: "m-empty-base" }));
+    assert.equal(w.capture.reconcile().promoted, 1);
+    assert.equal(taskRow(w.store, "m-empty-base")?.state, "candidate");
+
+    const diffBase = "1".repeat(40);
+    w.git.answer("patch", diffBase, { state: "empty" });
+    w.git.answer("sameTree", diffBase, "different");
+    w.capture.integrated(start({ memberId: "m-empty-base-diff", memberBaseCommit: diffBase, commit: OTHER_COMMIT }));
+    await w.capture.idle();
+    const diffBaseRow = taskRow(w.store, "m-empty-base-diff");
+    assert.equal(diffBaseRow?.state, "rejected");
+    assert.equal(diffBaseRow?.reason, "capture-failed");
+    assert.equal(diffBaseRow?.material, "none");
+
+    const missingTreeBase = "0".repeat(40);
+    w.git.answer("patch", missingTreeBase, { state: "empty" });
+    w.git.answer("sameTree", missingTreeBase, "missing");
+    w.capture.integrated(start({ memberId: "m-empty-base-missing", memberBaseCommit: missingTreeBase, commit: OTHER_COMMIT }));
+    await w.capture.idle();
+    const missingTreeRow = taskRow(w.store, "m-empty-base-missing");
+    assert.equal(missingTreeRow?.material, "partial");
+    assert.equal((missingTreeRow?.payload as { baseDelta?: string } | undefined)?.baseDelta, "missing");
   } finally {
     await finish(w);
+  }
+});
+
+test("empty baseDelta requires proven equal trees with real git and rejects silent prefixes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-eval-real-git-"));
+  const repo = join(root, "repo");
+  const mirror = join(root, "mirror.git");
+  const key = randomBytes(32);
+  const runGit = (cwd: string, ...args: string[]) => {
+    const res = spawnSync("git", ["-c", "commit.gpgsign=false", ...args], { cwd, encoding: "utf8" });
+    if (res.status !== 0) throw new Error(`git ${args[0]} failed: ${res.stderr}`);
+    return res.stdout.trim();
+  };
+  const commitFiles = (files: Record<string, string>, message: string) => {
+    for (const [rel, content] of Object.entries(files)) {
+      mkdirSync(dirname(join(repo, rel)), { recursive: true });
+      writeFileSync(join(repo, rel), content);
+    }
+    runGit(repo, "add", "-A");
+    runGit(repo, "commit", "-q", "--allow-empty", "-m", message);
+    return runGit(repo, "rev-parse", "HEAD");
+  };
+  mkdirSync(repo, { recursive: true });
+  runGit(repo, "init", "-q", "--template=");
+  runGit(repo, "config", "user.name", "Placeholder Author");
+  runGit(repo, "config", "user.email", "placeholder@example.invalid");
+  const anchor = commitFiles({ "a.txt": "base\n" }, "anchor");
+  const equalBase = commitFiles({}, "equal tree");
+  const equalCommit = commitFiles({ "a.txt": "changed\n", "tests/a.test.ts": "test\n" }, "equal ref");
+  runGit(repo, "checkout", "-q", "--detach", anchor);
+  const diffBase = commitFiles({ "other.txt": "diverged\n" }, "different tree");
+  const diffCommit = commitFiles({ "a.txt": "changed\n", "tests/a.test.ts": "test\n" }, "diff ref");
+  runGit(root, "clone", "-q", "--bare", repo, mirror);
+
+  const silentBaseOnly = join(root, "silent-base-only.sh");
+  writeFileSync(
+    silentBaseOnly,
+    `#!/bin/sh\nb=0; a=0; d=0\nfor arg in "$@"; do\n  [ "$arg" = "--binary" ] && b=1\n  [ "$arg" = "${anchor}" ] && a=1\n  [ "$arg" = "${diffBase}" ] && d=1\ndone\nif [ "$b" = 1 ] && [ "$a" = 1 ] && [ "$d" = 1 ]; then exit 0; fi\nshift\nexec git "$@"\n`,
+  );
+  const silentBaseAndTree = join(root, "silent-base-and-tree.sh");
+  writeFileSync(
+    silentBaseAndTree,
+    `#!/bin/sh\nb=0; a=0; d=0; l=0\nfor arg in "$@"; do\n  [ "$arg" = "--binary" ] && b=1\n  [ "$arg" = "${anchor}" ] && a=1\n  [ "$arg" = "${diffBase}" ] && d=1\n  [ "$arg" = "--no-walk=unsorted" ] && l=1\ndone\nif [ "$l" = 1 ] || { [ "$b" = 1 ] && [ "$a" = 1 ] && [ "$d" = 1 ]; }; then exit 0; fi\nshift\nexec git "$@"\n`,
+  );
+
+  const openRun = (label: string, prefix?: { command: string; args: string[] }) => {
+    const store = openStore(join(root, label), key);
+    const source = {
+      mirrorPath: () => mirror,
+      status: () => ({ mode: "github" as const, mirrorHead: equalCommit }),
+    } as unknown as Pick<ProjectSourceService, "mirrorPath" | "status">;
+    const projects = [{ id: PROJECT, name: "Project", path: repo, source: { mode: "github" as const }, team: { eval: { capture: true } } }];
+    const capture = new TaskCapture({
+      config: { projects } as unknown as TaskCaptureOptions["config"],
+      store,
+      source,
+      git: captureGit(() => prefix),
+      now: () => T0,
+    });
+    return { store, capture };
+  };
+
+  const direct = openRun("direct");
+  const swallowedPatch = openRun("swallowed-patch", { command: "/bin/sh", args: [silentBaseOnly] });
+  const swallowedBoth = openRun("swallowed-both", { command: "/bin/sh", args: [silentBaseAndTree] });
+  try {
+    const refControl = await captureGit(() => ({ command: "/bin/sh", args: [silentBaseOnly] })).patch(repo, diffBase, diffCommit);
+    assert.equal(refControl.state, "read");
+    assert.ok(refControl.state === "read" && refControl.bytes.length > 0);
+    const refControlBoth = await captureGit(() => ({ command: "/bin/sh", args: [silentBaseAndTree] })).patch(repo, diffBase, diffCommit);
+    assert.equal(refControlBoth.state, "read");
+
+    swallowedPatch.capture.integrated(start({ memberId: "m-silent-diff", workspace: repo, anchorCommit: anchor, memberBaseCommit: diffBase, commit: diffCommit, integratedHead: diffCommit }));
+    await swallowedPatch.capture.idle();
+    const silentDiffRow = taskRow(swallowedPatch.store, "m-silent-diff");
+    assert.equal(silentDiffRow?.state, "rejected");
+    assert.equal(silentDiffRow?.reason, "capture-failed");
+    assert.deepEqual(partsOf(swallowedPatch.store, "m-silent-diff"), {});
+
+    swallowedBoth.capture.integrated(start({ memberId: "m-silent-both", workspace: repo, anchorCommit: anchor, memberBaseCommit: diffBase, commit: diffCommit, integratedHead: diffCommit }));
+    await swallowedBoth.capture.idle();
+    const silentBothRow = taskRow(swallowedBoth.store, "m-silent-both");
+    assert.equal(silentBothRow?.state, "rejected");
+    assert.equal(silentBothRow?.reason, "capture-failed");
+
+    direct.capture.integrated(start({ memberId: "m-equal-real", workspace: repo, anchorCommit: anchor, memberBaseCommit: equalBase, commit: equalCommit, integratedHead: equalCommit }));
+    direct.capture.approved({ ...approval(equalCommit), workspace: repo, anchorCommit: anchor });
+    await direct.capture.idle();
+    const equalRow = taskRow(direct.store, "m-equal-real");
+    assert.equal(equalRow?.state, "captured");
+    assert.equal(equalRow?.material, "stored");
+    assert.equal((equalRow?.payload as { baseDelta?: string } | undefined)?.baseDelta, "stored");
+    assert.deepEqual(partsOf(direct.store, "m-equal-real").baseDelta, Buffer.alloc(0));
+    assert.ok((partsOf(direct.store, "m-equal-real").reference?.length ?? 0) > 0);
+    writeLedger(direct.store, ledger({ memberId: "m-equal-real" }));
+    assert.equal(direct.capture.reconcile().promoted, 1);
+    assert.equal(taskRow(direct.store, "m-equal-real")?.state, "candidate");
+  } finally {
+    direct.capture.close();
+    swallowedPatch.capture.close();
+    swallowedBoth.capture.close();
+    direct.store.close();
+    swallowedPatch.store.close();
+    swallowedBoth.store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("seeded randomized durable-state simulator preserves capture outcomes across approvals, reconciles, and reopens", async () => {
+  const SEED = 0x439c0de;
+  let rng = SEED >>> 0;
+  const nextInt = (max: number) => {
+    rng = (rng + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(rng ^ (rng >>> 15), 1 | rng);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return (((t ^ (t >>> 14)) >>> 0) % max);
+  };
+  type Kind = "stored" | "empty-equal" | "empty-diff" | "failed" | "missing";
+  type Spec = { memberId: string; kind: Kind; base: string; commit: string };
+  type Model = { integrated: boolean; approved: boolean; ledgered: boolean; state: "none" | "captured" | "candidate" | "rejected"; reason: string | null };
+  const kinds: readonly Kind[] = ["stored", "empty-equal", "empty-diff", "failed", "missing"];
+
+  for (let trial = 0; trial < 8; trial++) {
+    const root = mkdtempSync(join(tmpdir(), `infinite-eval-sim-${trial}-`));
+    const key = randomBytes(32);
+    const git = new FakeGit();
+    const specs: Spec[] = kinds.map((kind, i) => ({
+      memberId: `m-${kind}`,
+      kind,
+      base: `${(i + 1).toString(16)}`.repeat(40),
+      commit: `${(i + 6).toString(16)}`.repeat(40),
+    }));
+    const model = new Map<string, Model>();
+    for (const s of specs) {
+      model.set(s.memberId, { integrated: false, approved: false, ledgered: false, state: "none", reason: null });
+      git.answer("names", s.commit, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
+      if (s.kind === "missing") git.answer("patch", s.commit, { state: "missing" });
+      if (s.kind === "failed") git.answer("patch", s.commit, trial % 2 === 0 ? { state: "failed" } : { state: "empty" });
+      if (s.kind === "empty-equal") { git.answer("patch", s.base, { state: "empty" }); git.answer("sameTree", s.base, "same"); }
+      if (s.kind === "empty-diff") { git.answer("patch", s.base, { state: "empty" }); git.answer("sameTree", s.base, "different"); }
+    }
+    git.answer("names", REVIEWED, { state: "read", names: [] });
+
+    const ops: Array<{ kind: "integrate" | "ledger"; spec: Spec } | { kind: "approve" | "reconcile" | "reopen" }> = [
+      ...specs.map(spec => ({ kind: "integrate" as const, spec })),
+      ...specs.map(spec => ({ kind: "ledger" as const, spec })),
+      { kind: "approve" },
+      { kind: "approve" },
+      { kind: "reconcile" },
+      { kind: "reopen" },
+      { kind: "reopen" },
+    ];
+    for (let i = ops.length - 1; i > 0; i--) {
+      const j = nextInt(i + 1);
+      [ops[i], ops[j]] = [ops[j]!, ops[i]!];
+    }
+    ops.push({ kind: "approve" }, { kind: "reconcile" }, { kind: "reopen" }, { kind: "reconcile" });
+
+    let store = openStore(root, key);
+    let capture = new TaskCapture(captureOptions(root, store, git, { capture: true }));
+    let approvalStep = 0;
+    const checkAll = (step: number) => {
+      const tag = `seed=0x${SEED.toString(16)} trial=${trial} step=${step}`;
+      for (const s of specs) {
+        const m = model.get(s.memberId)!;
+        const row = taskRow(store, s.memberId);
+        const parts = partsOf(store, s.memberId);
+        if (m.state === "none") {
+          assert.equal(row, undefined, `${tag} ${s.memberId}`);
+          assert.deepEqual(parts, {}, `${tag} ${s.memberId}`);
+          continue;
+        }
+        assert.equal(row?.state, m.state, `${tag} ${s.memberId} state`);
+        assert.equal(row?.reason, m.reason, `${tag} ${s.memberId} reason`);
+        if (m.state === "rejected") {
+          assert.equal(row?.material, "none", `${tag} ${s.memberId} material`);
+          assert.deepEqual(parts, {}, `${tag} ${s.memberId} parts cleared`);
+        } else if (s.kind === "missing") {
+          assert.equal(row?.material, "partial", `${tag} ${s.memberId} partial`);
+          assert.notEqual(parts.capsule, undefined, `${tag} ${s.memberId} capsule`);
+          assert.equal(parts.reference, undefined, `${tag} ${s.memberId} no ref`);
+        } else {
+          assert.equal(row?.material, "stored", `${tag} ${s.memberId} stored`);
+          assert.notEqual(parts.capsule, undefined, `${tag} ${s.memberId} capsule`);
+          assert.ok((parts.reference?.length ?? 0) > 0, `${tag} ${s.memberId} ref`);
+          if (s.kind === "empty-equal") assert.deepEqual(parts.baseDelta, Buffer.alloc(0), `${tag} ${s.memberId} empty base`);
+          else assert.ok((parts.baseDelta?.length ?? 0) > 0, `${tag} ${s.memberId} base`);
+        }
+      }
+    };
+
+    try {
+      for (let step = 0; step < ops.length; step++) {
+        const op = ops[step]!;
+        if (op.kind === "integrate") {
+          capture.integrated(start({ memberId: op.spec.memberId, memberBaseCommit: op.spec.base, commit: op.spec.commit }));
+          await capture.idle();
+          const m = model.get(op.spec.memberId)!;
+          m.integrated = true;
+          if (op.spec.kind === "failed" || op.spec.kind === "empty-diff") { m.state = "rejected"; m.reason = "capture-failed"; }
+          else { m.state = "captured"; m.reason = null; }
+        } else if (op.kind === "ledger") {
+          writeLedger(store, ledger({ memberId: op.spec.memberId }));
+          model.get(op.spec.memberId)!.ledgered = true;
+        } else if (op.kind === "approve") {
+          const at = new Date(Date.parse(T0) + (++approvalStep) * 60_000).toISOString();
+          capture.approved(approval(REVIEWED, at));
+          await capture.idle();
+          for (const m of model.values()) if (m.state === "captured" || m.state === "candidate") m.approved = true;
+        } else if (op.kind === "reconcile") {
+          capture.reconcile();
+          for (const s of specs) {
+            const m = model.get(s.memberId)!;
+            if (m.state !== "captured" || !m.ledgered) continue;
+            if (s.kind === "missing") { m.state = "rejected"; m.reason = "patch-missing"; }
+            else if (!m.approved) { m.state = "rejected"; m.reason = "reference-unknown"; }
+            else { m.state = "candidate"; m.reason = null; }
+          }
+        } else {
+          capture.close();
+          await capture.idle();
+          store.close();
+          store = openStore(root, key);
+          capture = new TaskCapture(captureOptions(root, store, git, { capture: true }));
+        }
+        checkAll(step);
+      }
+    } finally {
+      capture.close();
+      await capture.idle();
+      store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
 

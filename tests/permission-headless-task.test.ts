@@ -37,7 +37,6 @@ function setSwitch(f: ReturnType<typeof fixture>, value: "on" | "off") {
 const judgement = (statement: string) => ({ statement, check: { kind: "judgement" as const, item: "sources" }, threshold: { kind: "pass" as const } });
 const add = (criterion: ReturnType<typeof judgement>) => ({ op: "criterion.add" as const, criterion });
 const correction = (version: number, ops: unknown[]) => ({ requestId: randomUUID(), version, ops });
-const barrier = (goals: GoalService, id: string) => goals.steer(id, { requestId: randomUUID(), revision: 999, text: "Barrier" }).catch(() => undefined);
 const createInput = (overrides: Partial<CreateGoal> = {}): CreateGoal => ({
   requestId: randomUUID(), projectId: "fixture", title: "Rank sources", objective: "Find ranked sources",
   successCriteria: "A ranked shortlist with reasons and sources", nonGoals: ["no paid sources"], allowedPaths: ["research"],
@@ -57,7 +56,7 @@ for (const prompts of ["on", "off"] as const) {
       await goals.correctObjective(created.id, correction(1, [add(judgement(criterion))]));
       setSwitch(f, prompts);
       goals.start();
-      await barrier(goals, created.id);
+      await goals.idle();
       const teamId = goals.get(created.id).activeTeamId;
       assert.ok(teamId, "the tick launched the first cycle");
       goals.close(); goals = undefined; teams.close();

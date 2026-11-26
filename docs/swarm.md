@@ -38,10 +38,11 @@ A unit is **live** while it works, waits for input, is paused, or still has an
 agent that is queued, working, waiting, or holding a prompt. Other runs are
 **quiet** and collapse to one row. A quiet run inside a live mission keeps its
 place in that mission. Runs of swarms with nothing live move to a quiet group,
-where each stays for 72 hours after its agents last started, acted, or
-reported, or after its creation when none did, and at most 12 are shown. The host rewrites a run's update time on
-every save, so that time is not used. Vitals
-count agents of live swarms only.
+where each stays for 72 hours after its host-recorded `lastActivityAt`
+timestamp (falling back on legacy hosts to the latest time its agents started,
+acted, or reported, or its creation when none did), and at most 12 are shown.
+Routine no-op saves on settled runs leave both `updatedAt` and `lastActivityAt`
+unchanged. Vitals count agents of live swarms only.
 
 Rows keep their order between polls. Live swarms are ordered by creation time,
 newest first, with the solo group last. A swarm that starts waiting on a
@@ -126,8 +127,10 @@ All three are `GET`, open to every paired role, and admitted over the relay.
 | `/api/teams/:id/context` | Touched files per member of a team run. |
 | `/api/sessions/:id/context` | Touched files for one session. |
 
-`/api/me` reports `capabilities.swarmContext` on a host that serves them. On
-an older host the Graph view draws the swarm without a code map or observed
+`/api/me` reports `capabilities.swarmContext` on a host that serves them, along
+with `providerCapabilities.<provider>.observesToolInputs` so clients derive
+tool-input observability from host metadata rather than hardcoded provider IDs.
+On an older host the Graph view draws the swarm without a code map or observed
 touches.
 
 The touch index is in memory, incremental, and bounded: eight journal reads

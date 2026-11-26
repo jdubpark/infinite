@@ -141,13 +141,18 @@ let pending = "";
 const usageLines = provider === "opencode" && session.team ? new JsonLineAssembler() : undefined;
 let flushTimer: ReturnType<typeof setTimeout> | undefined;
 const terminalBarrier = new TerminalBarrier();
-const persist = () =>
+let lastPersistedCoverage = 0;
+const persist = () => {
+  const covered = sizeIndex.coveredSeq(journal.seq);
+  if (covered !== undefined) lastPersistedCoverage = covered;
   writeSealed(join(dir, "status.sealed"), key, `${session.id}:status`, {
     ...state,
+    ...(covered !== undefined ? { sizeIndexCoveredSeq: covered } : {}),
     screen: "",
     seq: journal.seq,
     workerPid: process.pid,
   });
+};
 function append(type: Event["type"], data: Event["data"]): Event {
   try {
     return journal.append(type, data);
@@ -164,14 +169,16 @@ function flush() {
     pending = pending.slice(8192);
     append("output", { text: data });
   }
+  const covered = sizeIndex.coveredSeq(journal.seq);
+  if (covered !== undefined && covered - lastPersistedCoverage >= 256) persist();
 }
 
-function withTerminalBarrier<T>(fn: () => T): Promise<T> {
+function withTerminalBarrier<T>(fn: () => T, beforeDrain?: () => void): Promise<T> {
   if (state.status === "recording-error") return Promise.reject(new Error("Recording failed"));
   return terminalBarrier.run(flush, done => terminal.write("", done), () => {
     if ((state as WorkerState).status === "recording-error") throw new Error("Recording failed during snapshot");
     return fn();
-  });
+  }, beforeDrain);
 }
 
 async function snapshot(): Promise<TerminalSnapshot> {
@@ -1232,8 +1239,10 @@ const server = createServer((socket) => {
       let result: unknown;
       if (request.op === "state") {
         currentControl();
+        const sizeIndexCoveredSeq = sizeIndex.coveredSeq(journal.seq);
         result = {
           ...state,
+          ...(sizeIndexCoveredSeq !== undefined ? { sizeIndexCoveredSeq } : {}),
           attention,
           seq: journal.seq,
           screen: request.screen ? screen() : "",
@@ -1301,7 +1310,6 @@ const server = createServer((socket) => {
         result = await serialize(async () => {
           checkControl(request);
           await withTerminalBarrier(() => {
-            child?.resize(request.cols, request.rows);
             terminal.resize(request.cols, request.rows);
             const terminalSize = { cols: terminal.cols, rows: terminal.rows };
             if (state.terminalSize?.cols !== terminalSize.cols || state.terminalSize?.rows !== terminalSize.rows) {
@@ -1311,6 +1319,8 @@ const server = createServer((socket) => {
               persist();
             }
             refreshControl(request);
+          }, () => {
+            child?.resize(request.cols, request.rows);
           });
           return { ok: true };
         });

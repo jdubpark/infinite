@@ -34,7 +34,7 @@ describe("web TerminalView geometry and cursor resume", { skip }, () => {
 
   after(() => browser?.close());
 
-  async function openView(init: { pages: Record<number, unknown>; holdWriteText?: string }): Promise<Page> {
+  async function openView(init: { pages: Record<number, unknown>; holdWriteText?: string; holdFetchCount?: number }): Promise<Page> {
     const page = await browser.newPage({ viewport: { width: 400, height: 640 } });
     await page.route(ORIGIN, route =>
       route.fulfill({ contentType: "text/html", body: `<!doctype html><html><head><style>${css}</style></head><body><div id="root"></div></body></html>` }),
@@ -154,6 +154,88 @@ describe("web TerminalView geometry and cursor resume", { skip }, () => {
       assert.equal(result.writes.filter(chunk => chunk.includes("FIRST_EVENT_ROW")).length, 1, "first event is written once");
       assert.equal(result.writes.filter(chunk => chunk.includes("SECOND_EVENT_ROW")).length, 1, "second event is written once");
       assert.deepEqual(result.lines, ["FIRST_EVENT_ROW", "SECOND_EVENT_ROW"]);
+    } finally {
+      await page.close();
+    }
+  });
+
+  test("a stale poll resolving while a newer poll is mid-write does not clear the write guard", async () => {
+    const page = await openView({
+      holdFetchCount: 1,
+      holdWriteText: "POLL2_FIRST_ROW",
+      pages: {
+        0: {
+          cursor: 4,
+          more: false,
+          events: [
+            { seq: 2, at: "2026-11-26T00:00:00.000Z", type: "lifecycle", data: { status: "running", pid: 100, cols: 100, rows: 24 } },
+            { seq: 3, at: "2026-11-26T00:00:01.000Z", type: "output", data: { text: "POLL2_FIRST_ROW\r\n" } },
+            { seq: 4, at: "2026-11-26T00:00:02.000Z", type: "output", data: { text: "POLL2_SECOND_ROW\r\n" } },
+          ],
+        },
+        3: {
+          cursor: 4,
+          more: false,
+          events: [
+            { seq: 4, at: "2026-11-26T00:00:02.000Z", type: "output", data: { text: "POLL2_SECOND_ROW\r\n" } },
+          ],
+        },
+      },
+    });
+    try {
+      await page.waitForFunction(() => ((window as unknown as { terminalViewHarness?: { pendingFetches: unknown[] } }).terminalViewHarness?.pendingFetches.length ?? 0) === 1, undefined, { timeout: 5000 });
+
+      await page.evaluate(() => {
+        Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+        document.dispatchEvent(new Event("visibilitychange"));
+        Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+
+      await page.waitForFunction(() => Boolean((window as unknown as { terminalViewHarness?: { writeHeld: boolean } }).terminalViewHarness?.writeHeld), undefined, { timeout: 5000 });
+
+      await page.evaluate(() => {
+        const h = (window as unknown as { terminalViewHarness: { pendingFetches: Array<() => void> } }).terminalViewHarness;
+        h.pendingFetches.shift()?.();
+      });
+      await page.waitForTimeout(60);
+
+      await page.evaluate(() => {
+        Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+        document.dispatchEvent(new Event("visibilitychange"));
+        Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await page.waitForTimeout(60);
+
+      const requestsBeforeRelease = await page.evaluate(() => {
+        const h = (window as unknown as { terminalViewHarness: { requests: string[] } }).terminalViewHarness;
+        return [...h.requests];
+      });
+      assert.deepEqual(
+        requestsBeforeRelease,
+        ["/sessions/s1/events?after=0", "/sessions/s1/events?after=0"],
+        "stale poll1 settling must not unlock activeConsumer and allow poll3 to start while poll2 is mid-write",
+      );
+
+      await page.evaluate(() => {
+        const h = (window as unknown as { terminalViewHarness: { releaseWrite: (() => void) | null } }).terminalViewHarness;
+        h.releaseWrite?.();
+      });
+
+      await page.waitForFunction(() => {
+        const h = (window as unknown as { terminalViewHarness?: { terminalLines: () => string[] } }).terminalViewHarness;
+        return Boolean(h?.terminalLines().includes("POLL2_SECOND_ROW"));
+      }, undefined, { timeout: 5000 });
+
+      const finalState = await page.evaluate(() => {
+        const h = (window as unknown as { terminalViewHarness: { requests: string[]; writes: string[]; terminalLines: () => string[] } }).terminalViewHarness;
+        return { requests: h.requests, writes: h.writes, lines: h.terminalLines() };
+      });
+      assert.ok(finalState.requests.includes("/sessions/s1/events?after=3"));
+      assert.equal(finalState.writes.filter(chunk => chunk.includes("POLL2_FIRST_ROW")).length, 1);
+      assert.equal(finalState.writes.filter(chunk => chunk.includes("POLL2_SECOND_ROW")).length, 1);
+      assert.deepEqual(finalState.lines, ["POLL2_FIRST_ROW", "POLL2_SECOND_ROW"]);
     } finally {
       await page.close();
     }

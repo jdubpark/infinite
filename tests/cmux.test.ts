@@ -40,7 +40,7 @@ else if(method==='feed.list') {
   if(state.feedChanges){state.feed=state.feedChanges;delete state.feedChanges;writeFileSync(file,JSON.stringify(state));}
   reply({items:state.feed});
 }
-else if(method==='surface.read_text') reply({text:state.screen??'> '});
+else if(method==='surface.read_text') { if(state.resizeAfterRead){state.columns=state.resizeAfterRead.columns;state.rows=state.resizeAfterRead.rows;delete state.resizeAfterRead;writeFileSync(file,JSON.stringify(state));} reply({text:state.screen??'> '}); }
 else if(method==='terminal.replay') { if(state.replayOffline) process.exit(2); reply({...(state.omitReplaySize?{}:{columns:state.columns??80,rows:state.rows??24}),...(state.renderGrid?{render_grid:state.renderGrid}:{})}); }
 else {
   appendFileSync(join(root,'mutations.jsonl'),JSON.stringify({method,params})+'\n');
@@ -624,4 +624,23 @@ test("cmux journals resizes with unchanged screen text and omits stale dimension
   assert.ok(unsizedOutput);
   assert.equal(unsizedOutput.data.cols, undefined);
   assert.equal(unsizedOutput.data.rows, undefined);
+
+  const cursorBeforeMidResize = f.sessions.events(f.id, 0, 200).cursor;
+  f.setState({
+    omitReplaySize: false,
+    columns: 132,
+    rows: 40,
+    screen: "> text captured across resize",
+    resizeAfterRead: { columns: 140, rows: 42 },
+  });
+  const afterMidResize = await f.sessions.get(f.id);
+  assert.deepEqual(afterMidResize.terminalSize, { cols: 140, rows: 42 });
+  const midResizeEvents = f.sessions.events(f.id, cursorBeforeMidResize, 200).events;
+  const ambiguousOutput = midResizeEvents.find(event => event.type === "output");
+  const confirmedResize = midResizeEvents.find(event => event.type === "lifecycle" && event.data.event === "resize" && event.data.cols === 140 && event.data.rows === 42);
+  assert.ok(ambiguousOutput, "screen update is still recorded");
+  assert.equal(ambiguousOutput.data.cols, undefined, "output captured while geometry changed must not be tagged with post-resize cols");
+  assert.equal(ambiguousOutput.data.rows, undefined, "output captured while geometry changed must not be tagged with post-resize rows");
+  assert.ok(confirmedResize, "confirmed post-read geometry is journaled as a resize lifecycle event");
+  assert.ok(ambiguousOutput.seq < confirmedResize.seq, "confirmed post-read resize follows the ambiguous output event");
 });

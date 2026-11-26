@@ -56,7 +56,7 @@ export function TerminalView({
       cursor = 0,
       retry = 1800,
       generation = 0,
-      consuming = false,
+      activeConsumer: number | null = null,
       repoll = false,
       inFlight: number | undefined;
     let timer: ReturnType<typeof setTimeout>;
@@ -64,7 +64,7 @@ export function TerminalView({
     const write = (text: string) => new Promise<void>(resolve => terminal.write(text, resolve));
     const poll = async () => {
       clearTimeout(timer);
-      if (!active || consuming || inFlight === generation || isHidden()) return;
+      if (!active || activeConsumer !== null || inFlight === generation || isHidden()) return;
       const started = generation;
       const current = () => active && started === generation;
       inFlight = started;
@@ -75,8 +75,8 @@ export function TerminalView({
           cursor: number;
           more: boolean;
         }>(`/sessions/${id}/events?after=${cursor}`);
-        if (!current() || isHidden()) return;
-        consuming = true;
+        if (!current() || isHidden() || activeConsumer !== null) return;
+        activeConsumer = started;
         for (const event of page.events) {
           if (!active || isHidden()) {
             interrupted = true;
@@ -114,24 +114,26 @@ export function TerminalView({
           retry = Math.min(retry * 2, 15000);
         }
       } finally {
-        consuming = false;
         if (inFlight === started) inFlight = undefined;
-        if (repoll) {
-          repoll = false;
-          if (active && !isHidden()) void poll();
+        if (activeConsumer === started) {
+          activeConsumer = null;
+          if (repoll) {
+            repoll = false;
+            if (active && !isHidden()) void poll();
+          }
         }
       }
     };
     const resume = () => {
       generation++;
-      if (consuming) {
+      if (activeConsumer !== null) {
         repoll = true;
         return;
       }
       void poll();
     };
     const retryNow = () => {
-      if (consuming) {
+      if (activeConsumer !== null) {
         repoll = true;
         return;
       }

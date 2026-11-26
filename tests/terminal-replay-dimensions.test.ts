@@ -17,7 +17,9 @@ import {
   TERMINAL_SIZE_INDEX_FILE,
   TerminalSizeIndex,
   terminalSizeFromEvent,
+  type ResolveReplaySizeOptions,
   type TerminalSizeEntry,
+  type TerminalSizeIndexRead,
 } from "../packages/host/src/terminal-size.js";
 import { connectTerminals, terminalPages } from "../packages/host/src/terminal-stream.js";
 import { Journal, readEvents, unseal, writeSealed } from "../packages/host/src/vault.js";
@@ -38,6 +40,9 @@ type StreamFrame = {
 const AGENT = String.raw`
 process.stdin.setRawMode(true);
 process.stdin.setEncoding("utf8");
+process.stdout.on("resize", () => {
+  process.stdout.write("SIGWINCH_" + process.stdout.columns + "x" + process.stdout.rows + "\r\n");
+});
 process.stdout.write("READY\r\n");
 let pending = "";
 process.stdin.on("data", data => {
@@ -363,16 +368,24 @@ function terminalImage(terminal: headless.Terminal) {
   return { lines, cols: terminal.cols, rows: terminal.rows, cursorX: buffer.cursorX, cursorY: buffer.cursorY, type: buffer.type };
 }
 
-test("worker drains pending xterm writes across the resize barrier so snapshot and journal replay render identically", { timeout: 25_000 }, async () => {
+test("worker drains pending xterm writes across the resize barrier, orders SIGWINCH output after resize, and rejects stale leases before child.resize", { timeout: 25_000 }, async () => {
   const f = await startFixture();
   const terminals: headless.Terminal[] = [];
   try {
     const actor = { id: "barrier-owner", label: "Barrier" };
     const lease = await f.call<ControlLease>({ op: "control", action: "claim", actor });
     await f.call<Receipt>({ op: "raw", requestId: randomUUID(), text: "wideburst\n", actor, leaseId: lease.id });
+    await waitFor(async () => f.output(), text => text.includes("WIDEBURST_END"));
     await f.call({ op: "resize", cols: 70, rows: 20, actor, leaseId: lease.id });
     await f.call<Receipt>({ op: "raw", requestId: randomUUID(), text: "POST_BARRIER\n", actor, leaseId: lease.id });
-    await waitFor(async () => f.output(), text => text.includes("WIDEBURST_END") && text.includes("ECHO:POST_BARRIER"));
+    await waitFor(async () => f.output(), text => text.includes("SIGWINCH_70x20") && text.includes("ECHO:POST_BARRIER"));
+
+    const allEvents = f.events();
+    const preBurstEvent = allEvents.find(event => event.type === "output" && String(event.data.text).includes("WIDEBURST_END"))!;
+    const resizeEvent = allEvents.find(event => event.type === "lifecycle" && event.data.event === "resize" && event.data.cols === 70 && event.data.rows === 20)!;
+    const sigwinchEvent = allEvents.find(event => event.type === "output" && String(event.data.text).includes("SIGWINCH_70x20"))!;
+    assert.ok(preBurstEvent.seq < resizeEvent.seq, "pre-resize output stays strictly before the resize lifecycle event");
+    assert.ok(resizeEvent.seq < sigwinchEvent.seq, "post-resize SIGWINCH output lands strictly after the resize lifecycle event");
 
     const snap = await f.call<TerminalSnapshot>({ op: "snapshot" });
     assert.deepEqual([snap.cols, snap.rows], [70, 20]);
@@ -395,13 +408,19 @@ test("worker drains pending xterm writes across the resize barrier so snapshot a
     }
     await new Promise<void>(resolveWrite => restored.write(snap.ansi, resolveWrite));
     assert.deepEqual(terminalImage(replayed), terminalImage(restored));
+
+    const intruder = { id: "takeover-owner", label: "Takeover" };
+    await f.call<ControlLease>({ op: "control", action: "claim", actor: intruder, takeover: true });
+    await assert.rejects(f.call({ op: "resize", cols: 95, rows: 28, actor, leaseId: lease.id }), { code: "control-lost" });
+    assert.deepEqual((await f.call({ op: "state" })).terminalSize, { cols: 70, rows: 20 });
+    assert.equal(f.output().includes("SIGWINCH_95x28"), false, "rejected stale lease never reaches child.resize");
   } finally {
     terminals.forEach(terminal => terminal.dispose());
     await f.stop();
   }
 });
 
-test("reconnect geometry stays exact past 32 encrypted readEvents pages with size index and in legacy scan mode", { timeout: 25_000 }, () => {
+test("reconnect geometry stays exact past 32 encrypted pages with zero-scan covered index, zero-resize sessions, and async legacy scan", { timeout: 30_000 }, async () => {
   const root = mkdtempSync("/tmp/inf-long-replay-");
   const id = randomUUID();
   const key = randomBytes(32);
@@ -414,47 +433,68 @@ test("reconnect geometry stays exact past 32 encrypted readEvents pages with siz
     sizeIndex.append(running.seq, { cols: 120, rows: 32 });
     const chunk = "P".repeat(260 * 1024);
     for (let i = 0; i < 68; i++) journal.append("output", { text: chunk });
+    const lastNoResizeSeq = journal.seq;
+
+    let zeroResizeReads = 0;
+    const beforeResizeIndex = readTerminalSizeIndex(indexFile, key, id);
+    assert.equal(beforeResizeIndex.intact, true);
+    const zeroResizeResolved = await resolveReplayTerminalSize(
+      (after, limit, types) => {
+        zeroResizeReads++;
+        return readEvents(eventsDir, key, id, after, limit, types);
+      },
+      lastNoResizeSeq,
+      { index: beforeResizeIndex, coveredSeq: sizeIndex.coveredSeq(lastNoResizeSeq) },
+    );
+    assert.deepEqual(zeroResizeResolved, { cols: 120, rows: 32 });
+    assert.equal(zeroResizeReads, 0, "a long zero-resize session resolves directly from sizeIndex + sizeIndexCoveredSeq with zero journal reads");
+
     const resized = journal.append("lifecycle", { event: "resize", cols: 94, rows: 30 });
     sizeIndex.append(resized.seq, { cols: 94, rows: 30 });
     const afterResize = journal.append("output", { text: "AFTER_LONG_HISTORY\r\n" });
 
     let indexedReads = 0;
     const entries = readTerminalSizeIndex(indexFile, key, id);
-    const fromIndex = resolveReplayTerminalSize(
+    const fromIndex = await resolveReplayTerminalSize(
       (after, limit, types) => {
         indexedReads++;
         return readEvents(eventsDir, key, id, after, limit, types);
       },
       afterResize.seq,
-      undefined,
-      entries,
+      { index: entries, coveredSeq: sizeIndex.coveredSeq(afterResize.seq) },
     );
     assert.deepEqual(fromIndex, { cols: 94, rows: 30 });
-    assert.ok(indexedReads <= 1, `size index jumps past earlier pages (reads=${indexedReads})`);
+    assert.equal(indexedReads, 0);
 
-    const midHistory = resolveReplayTerminalSize(
+    const midHistory = await resolveReplayTerminalSize(
       (after, limit, types) => {
         indexedReads++;
         return readEvents(eventsDir, key, id, after, limit, types);
       },
       resized.seq - 1,
-      undefined,
-      entries,
+      { index: entries, coveredSeq: sizeIndex.coveredSeq(afterResize.seq) },
     );
     assert.deepEqual(midHistory, { cols: 120, rows: 32 });
+    assert.equal(indexedReads, 0);
 
     let legacyPages = 0;
-    const fromLegacyScan = resolveReplayTerminalSize(
+    const fromLegacyScan = await resolveReplayTerminalSize(
       (after, limit, types) => {
         legacyPages++;
         return readEvents(eventsDir, key, id, after, limit, types);
       },
       afterResize.seq,
-      undefined,
-      [],
+      { index: { entries: [], intact: false } },
     );
     assert.ok(legacyPages > 32, `recording must exceed 32 encrypted readEvents pages (saw ${legacyPages})`);
     assert.deepEqual(fromLegacyScan, { cols: 94, rows: 30 });
+
+    const brokenPath = join(root, "unwritable-dir");
+    mkdirSync(brokenPath);
+    const failingIndex = new TerminalSizeIndex(brokenPath, key, id);
+    assert.equal(failingIndex.append(2, { cols: 120, rows: 32 }), false);
+    assert.equal(failingIndex.isDisabled, true);
+    assert.equal(failingIndex.coveredSeq(100), undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -483,11 +523,14 @@ function oracleSizeAt(history: readonly TerminalSizeEntry[], after: number): Ter
 type Resolver = (
   readPage: (after: number, limit: number, types?: Set<string>) => { events: Event[]; cursor: number; more: boolean },
   after: number,
-  fallback: TerminalSize | undefined,
-  entries: readonly TerminalSizeEntry[],
-) => TerminalSize | undefined;
+  options: ResolveReplaySizeOptions,
+) => Promise<TerminalSize | undefined>;
 
-function runDurableGeometrySimulation(resolver: Resolver, seeds: readonly number[]) {
+async function runDurableGeometrySimulation(
+  resolver: Resolver,
+  seeds: readonly number[],
+  opts: { allowIndexAppendAfterMiss?: boolean } = {},
+) {
   const coverage = {
     resizes: 0,
     outputs: 0,
@@ -498,6 +541,7 @@ function runDurableGeometrySimulation(resolver: Resolver, seeds: readonly number
     crashAfterJournal: 0,
     tornSizeIndex: 0,
     crashAfterIndex: 0,
+    missedIndexAppendThenLaterResize: 0,
     legacyNoIndex: 0,
   };
   for (const seed of seeds) {
@@ -517,37 +561,47 @@ function runDurableGeometrySimulation(resolver: Resolver, seeds: readonly number
         rows: 10 + Math.floor(rng() * 60),
       };
       let statusSize: TerminalSize = current;
+      let missedAppendOccurred = false;
       const runEvent = journal.append("lifecycle", { status: "running", pid: 100 + seed, cols: current.cols, rows: current.rows });
       history.push({ seq: runEvent.seq, cols: current.cols, rows: current.rows });
       sizeIndex.append(runEvent.seq, current);
-      writeSealed(statusFile, key, `${id}:status`, {
-        status: "running",
-        seq: journal.seq,
-        screen: "",
-        terminalSize: statusSize,
-        attention: initialAttention("2026-11-26T00:00:00.000Z", false),
-      });
+      const persistStatus = () => {
+        const covered = sizeIndex.coveredSeq(journal.seq);
+        writeSealed(statusFile, key, `${id}:status`, {
+          status: "running",
+          seq: journal.seq,
+          screen: "",
+          terminalSize: statusSize,
+          ...(covered !== undefined ? { sizeIndexCoveredSeq: covered } : {}),
+          attention: initialAttention("2026-11-26T00:00:00.000Z", false),
+        });
+      };
+      persistStatus();
 
       const readPage = (after: number, limit: number, types?: Set<string>) => readEvents(eventsDir, key, id, after, limit, types);
-      const verifyCursor = (after: number, useIndex: boolean) => {
+      const verifyCursor = async (after: number, useIndex: boolean) => {
         const persisted = unseal<WorkerState>(key, `${id}:status`, readFileSync(statusFile, "utf8"));
-        const entries = useIndex ? readTerminalSizeIndex(indexFile, key, id) : [];
-        const actual = resolver(readPage, after, persisted.terminalSize, entries);
+        const index: TerminalSizeIndexRead = useIndex ? readTerminalSizeIndex(indexFile, key, id) : { entries: [], intact: false };
+        const actual = await resolver(readPage, after, {
+          fallback: persisted.terminalSize,
+          index,
+          coveredSeq: useIndex ? persisted.sizeIndexCoveredSeq : undefined,
+        });
         const expected = oracleSizeAt(history, after);
         assert.deepEqual(actual, expected, `seed=${seed} after=${after} useIndex=${useIndex}`);
       };
 
-      const steps = 28;
+      const steps = 32;
       let crashed = false;
       for (let step = 0; step < steps && !crashed; step++) {
         const roll = rng();
-        if (roll < 0.42) {
+        if (roll < 0.40) {
           const isLarge = rng() < 0.12;
           const text = isLarge ? "L".repeat(64 * 1024) : `step-${step}-${"x".repeat(Math.floor(rng() * 80))}\r\n`;
           journal.append("output", { text });
           coverage.outputs++;
           if (isLarge) coverage.largeBursts++;
-        } else if (roll < 0.72) {
+        } else if (roll < 0.74) {
           const next: TerminalSize = rng() < 0.1
             ? current
             : { cols: 20 + Math.floor(rng() * 200), rows: 5 + Math.floor(rng() * 80) };
@@ -556,57 +610,70 @@ function runDurableGeometrySimulation(resolver: Resolver, seeds: readonly number
             const resized = journal.append("lifecycle", { event: "resize", cols: current.cols, rows: current.rows });
             history.push({ seq: resized.seq, cols: current.cols, rows: current.rows });
             coverage.resizes++;
+            if (missedAppendOccurred) {
+              if (opts.allowIndexAppendAfterMiss) {
+                const brokenReopened = new TerminalSizeIndex(indexFile, key, id);
+                brokenReopened.append(resized.seq, current);
+              } else {
+                sizeIndex.append(resized.seq, current);
+              }
+              statusSize = current;
+              persistStatus();
+              coverage.missedIndexAppendThenLaterResize++;
+              continue;
+            }
             const fault = rng();
-            if (fault < 0.12) {
+            if (fault < 0.10) {
               coverage.crashAfterJournal++;
               crashed = true;
-            } else if (fault < 0.24) {
+            } else if (fault < 0.20) {
               appendFileSync(indexFile, "{\"v\":1,\"n\":\"torn");
               coverage.tornSizeIndex++;
               crashed = true;
-            } else if (fault < 0.36) {
+            } else if (fault < 0.30) {
               sizeIndex.append(resized.seq, current);
               coverage.crashAfterIndex++;
               crashed = true;
+            } else if (fault < 0.45) {
+              missedAppendOccurred = true;
+              if (!opts.allowIndexAppendAfterMiss) sizeIndex.invalidate(resized.seq - 1);
+              statusSize = current;
+              persistStatus();
             } else {
               sizeIndex.append(resized.seq, current);
               statusSize = current;
-              writeSealed(statusFile, key, `${id}:status`, {
-                status: "running",
-                seq: journal.seq,
-                screen: "",
-                terminalSize: statusSize,
-                attention: initialAttention("2026-11-26T00:00:00.000Z", false),
-              });
+              persistStatus();
             }
           }
         } else {
           const targetKind = rng();
           if (targetKind < 0.25) {
-            verifyCursor(0, true);
+            await verifyCursor(0, true);
             coverage.reconnectAtZero++;
           } else if (targetKind < 0.65) {
             const pick = history[Math.floor(rng() * history.length)];
             for (const candidate of [pick.seq - 1, pick.seq, Math.min(journal.seq, pick.seq + 1)]) {
-              verifyCursor(candidate, true);
+              await verifyCursor(candidate, true);
             }
             coverage.reconnectAtResizeBoundary++;
           } else {
             const mid = 1 + Math.floor(rng() * journal.seq);
-            verifyCursor(mid, true);
+            await verifyCursor(mid, true);
             coverage.reconnectMidStream++;
           }
         }
       }
 
-      verifyCursor(0, true);
+      await verifyCursor(0, true);
       coverage.reconnectAtZero++;
-      const lastResize = history.at(-1)!;
-      for (const candidate of [lastResize.seq - 1, lastResize.seq, journal.seq]) {
-        verifyCursor(candidate, true);
+      for (const entry of history) {
+        for (const candidate of [entry.seq - 1, entry.seq, Math.min(journal.seq, entry.seq + 1)]) {
+          await verifyCursor(candidate, true);
+        }
       }
       coverage.reconnectAtResizeBoundary++;
-      verifyCursor(journal.seq, false);
+      await verifyCursor(journal.seq, true);
+      await verifyCursor(journal.seq, false);
       coverage.legacyNoIndex++;
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -615,59 +682,64 @@ function runDurableGeometrySimulation(resolver: Resolver, seeds: readonly number
   return coverage;
 }
 
-test("seeded durable-state simulator verifies replay geometry across crashes and rejects broken mutants", { timeout: 30_000 }, () => {
+test("seeded durable-state simulator verifies replay geometry across crashes, missed index appends, and broken mutants", { timeout: 35_000 }, async () => {
   const seeds = Array.from({ length: 24 }, (_, index) => 1001 + index);
-  const coverage = runDurableGeometrySimulation(resolveReplayTerminalSize, seeds);
+  const coverage = await runDurableGeometrySimulation(resolveReplayTerminalSize, seeds);
   for (const [metric, count] of Object.entries(coverage)) {
     assert.ok(count > 0, `expected non-zero coverage for ${metric}, got ${count}`);
   }
 
-  const indexOnlyNoTailMutant: Resolver = (readPage, after, fallback, entries) => {
-    if (after === 0) return resolveReplayTerminalSize(readPage, 0, fallback, entries);
+  await assert.rejects(
+    () => runDurableGeometrySimulation(resolveReplayTerminalSize, seeds, { allowIndexAppendAfterMiss: true }),
+    "continuing to append to terminal-sizes.sealed after a missed append must fail reconnects between the missed and later resize",
+  );
+
+  const indexOnlyNoTailMutant: Resolver = async (readPage, after, options) => {
+    if (after === 0) return resolveReplayTerminalSize(readPage, 0, options);
     let found: TerminalSize | undefined;
-    for (const entry of entries) if (entry.seq <= after) found = { cols: entry.cols, rows: entry.rows };
-    return found ?? fallback;
+    for (const entry of options.index?.entries ?? []) if (entry.seq <= after) found = { cols: entry.cols, rows: entry.rows };
+    return found ?? options.fallback;
   };
-  assert.throws(
+  await assert.rejects(
     () => runDurableGeometrySimulation(indexOnlyNoTailMutant, seeds),
     "index-only mutant without journal tail catch-up must fail on crash-after-journal and torn-size-index faults",
   );
 
-  const finalSizeForZeroMutant: Resolver = (readPage, after, fallback, entries) => {
-    if (after === 0) return fallback;
-    return resolveReplayTerminalSize(readPage, after, fallback, entries);
+  const finalSizeForZeroMutant: Resolver = async (readPage, after, options) => {
+    if (after === 0) return options.fallback;
+    return resolveReplayTerminalSize(readPage, after, options);
   };
-  assert.throws(
+  await assert.rejects(
     () => runDurableGeometrySimulation(finalSizeForZeroMutant, seeds),
     "using final status.sealed terminalSize for after=0 must fail after any resize",
   );
 
-  const strictLessBoundaryMutant: Resolver = (readPage, after, fallback, entries) => {
-    if (after === 0) return resolveReplayTerminalSize(readPage, 0, fallback, entries);
-    return resolveReplayTerminalSize(readPage, Math.max(0, after - 1), fallback, entries);
+  const strictLessBoundaryMutant: Resolver = async (readPage, after, options) => {
+    if (after === 0) return resolveReplayTerminalSize(readPage, 0, options);
+    return resolveReplayTerminalSize(readPage, Math.max(0, after - 1), options);
   };
-  assert.throws(
+  await assert.rejects(
     () => runDurableGeometrySimulation(strictLessBoundaryMutant, seeds),
     "strict < boundary mutant must fail at exact resize seq boundaries",
   );
 
-  const staleBoundedScanMutant: Resolver = (readPage, after, fallback) => {
-    if (after === 0) return resolveReplayTerminalSize(readPage, 0, fallback, []);
+  const staleBoundedScanMutant: Resolver = async (readPage, after, options) => {
+    if (after === 0) return resolveReplayTerminalSize(readPage, 0, options);
     let cursor = 0;
     let resolved: TerminalSize | undefined;
     for (let scanned = 0; scanned < 2 && cursor < after; scanned++) {
       const page = readPage(cursor, 200, new Set(["lifecycle"]));
       for (const event of page.events) {
-        if (event.seq > after) return resolved ?? fallback;
+        if (event.seq > after) return resolved ?? options.fallback;
         const size = terminalSizeFromEvent(event);
         if (size) resolved = size;
       }
       if (!page.more || page.cursor <= cursor) break;
       cursor = page.cursor;
     }
-    return resolved ?? fallback;
+    return resolved ?? options.fallback;
   };
-  assert.throws(() => {
+  await assert.rejects(async () => {
     const root = mkdtempSync("/tmp/inf-mutant-bounded-");
     const id = randomUUID();
     const key = randomBytes(32);
@@ -679,11 +751,10 @@ test("seeded durable-state simulator verifies replay geometry across crashes and
       for (let i = 0; i < 6; i++) journal.append("output", { text: big });
       const resized = journal.append("lifecycle", { event: "resize", cols: 84, rows: 24 });
       const tail = journal.append("output", { text: "TAIL" });
-      const actual = staleBoundedScanMutant(
+      const actual = await staleBoundedScanMutant(
         (after, limit, types) => readEvents(eventsDir, key, id, after, limit, types),
         tail.seq,
-        undefined,
-        [],
+        {},
       );
       assert.deepEqual(actual, { cols: 84, rows: 24 });
       assert.ok(resized.seq < tail.seq);

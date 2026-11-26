@@ -59,11 +59,20 @@ export async function* terminalPages(
         manager.key,
         sessionId,
       );
-      activeSize = resolveReplayTerminalSize(
+      if (cursor > 0 && sizeIndex.intact && !state) {
+        try {
+          state = await manager.state(sessionId);
+        } catch {}
+      }
+      activeSize = await resolveReplayTerminalSize(
         (from, limit, types) => manager.events(sessionId, from, limit, types),
         cursor,
-        state?.terminalSize ?? snapshotSize,
-        sizeIndex,
+        {
+          fallback: state?.terminalSize ?? snapshotSize,
+          index: sizeIndex,
+          coveredSeq: state?.sizeIndexCoveredSeq,
+          signal,
+        },
       );
       if (!activeSize && !state) {
         try {

@@ -334,6 +334,7 @@ export interface WorkerState {
   control?: ControlLease | null;
   runtime?: SessionRuntime;
   terminalSize?: TerminalSize;
+  sizeIndexCoveredSeq?: number;
   nativeSession?: { id: string; source: "hook" | "protocol" };
   execution?: ExecutionState;
   permissionChannel?: PermissionChannelView;

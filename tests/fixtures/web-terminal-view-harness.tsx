@@ -16,6 +16,8 @@ interface HarnessControl {
   holdWriteText: string | null;
   releaseWrite: (() => void) | null;
   writeHeld: boolean;
+  holdFetchCount: number;
+  pendingFetches: Array<() => void>;
   terminalCols: () => number;
   terminalRows: () => number;
   terminalLines: () => string[];
@@ -30,6 +32,8 @@ const control: HarnessControl = {
   holdWriteText: null,
   releaseWrite: null,
   writeHeld: false,
+  holdFetchCount: 0,
+  pendingFetches: [],
   terminalCols: () => activeTerminal?.cols ?? 0,
   terminalRows: () => activeTerminal?.rows ?? 0,
   terminalLines: () => {
@@ -62,17 +66,23 @@ Terminal.prototype.write = function (this: Terminal, data: string | Uint8Array, 
   return originalWrite.call(this, data, callback);
 };
 
-const init = (window as unknown as { terminalViewInit?: { pages: Record<number, EventsPage>; holdWriteText?: string } }).terminalViewInit;
+const init = (window as unknown as { terminalViewInit?: { pages: Record<number, EventsPage>; holdWriteText?: string; holdFetchCount?: number } }).terminalViewInit;
 if (init) {
   control.pages = init.pages;
   control.holdWriteText = init.holdWriteText ?? null;
+  control.holdFetchCount = init.holdFetchCount ?? 0;
 }
 Object.assign(window, { terminalViewHarness: control });
 
 const host = (async (path: string) => {
   control.requests.push(path);
   const after = Number(new URL(path, "http://127.0.0.1").searchParams.get("after") ?? "0");
-  return control.pages[after] ?? { events: [], cursor: after, more: false };
+  const page = control.pages[after] ?? { events: [], cursor: after, more: false };
+  if (control.holdFetchCount > 0) {
+    control.holdFetchCount--;
+    await new Promise<void>(resolve => control.pendingFetches.push(resolve));
+  }
+  return page;
 }) as unknown as Api;
 
 createRoot(document.getElementById("root")!).render(

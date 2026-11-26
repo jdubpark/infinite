@@ -28,6 +28,7 @@ and any grant format other than the current one (`v2`).
 | Mission and permission coordinators | none | none | none |
 | Host mirror fetch | the project's repository | fetch | none, 15-minute grant |
 | Host team head publication | the delivery repository | push | the one published ref, 15-minute grant |
+| Host pull request read (review feedback, recorded branch lookup) | the run's delivery repository | pr | none, 15-minute grant |
 
 The project repository is the GitHub source of a GitHub-tracked project, or the
 team delivery repository otherwise. A project with neither gets no grant.

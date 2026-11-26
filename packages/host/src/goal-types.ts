@@ -4,12 +4,11 @@ import type { UsageRollup } from "./team-usage.js";
 import type { LinearTrackingView } from "./linear-types.js";
 import type { AutonomyMode } from "./autonomy.js";
 import { VERDICT_LIMITS, type RunAssessment } from "./verdict-types.js";
+import { ID_RE, SHARED_INPUT_LIMITS, isScopedPath } from "./schema-primitives.js";
 import { signalKinds, type PendingWake } from "./signals/types.js";
 
-export function isScopedPath(value: string): boolean {
-  return value === "." || (!value.startsWith("/") && !value.includes("\\") && !/[\0*?\[\]:]/.test(value) && !value.split("/").some(part => ["", ".", "..", ".git"].includes(part)));
-}
-const scopedPath = z.string().trim().min(1).max(300).refine(isScopedPath, "Use a repository-relative file or folder, or . for the whole project");
+export { isScopedPath };
+const scopedPath = z.string().trim().min(1).max(SHARED_INPUT_LIMITS.pathChars).refine(isScopedPath, "Use a repository-relative file or folder, or . for the whole project");
 export const defaultMaxRuns = 3;
 export const goalStandingSchema = z.object({
   shape: z.literal("objective"),
@@ -22,11 +21,11 @@ export const createGoalSchema = z.object({
   projectId: z.string().regex(/^[a-z0-9-]{1,80}$/),
   linearIssueId: z.union([z.uuid(), z.string().trim().max(100).regex(/^[A-Z][A-Z0-9]*-\d+$/i)]).optional(),
   title: z.string().trim().min(1).max(100),
-  objective: z.string().trim().min(1).max(12000),
-  successCriteria: z.string().trim().min(1).max(4000),
-  nonGoals: z.array(z.string().trim().min(1).max(1000)).max(20).default([]),
-  allowedPaths: z.array(scopedPath).min(1).max(32).default(["."]),
-  evidence: z.array(z.string().trim().min(1).max(2000)).max(20).default([]),
+  objective: z.string().trim().min(1).max(SHARED_INPUT_LIMITS.goalObjectiveChars),
+  successCriteria: z.string().trim().min(1).max(SHARED_INPUT_LIMITS.goalSuccessCriteriaChars),
+  nonGoals: z.array(z.string().trim().min(1).max(SHARED_INPUT_LIMITS.nonGoalChars)).max(SHARED_INPUT_LIMITS.nonGoals).default([]),
+  allowedPaths: z.array(scopedPath).min(1).max(SHARED_INPUT_LIMITS.allowedPaths).default(["."]),
+  evidence: z.array(z.string().trim().min(1).max(SHARED_INPUT_LIMITS.evidenceChars)).max(SHARED_INPUT_LIMITS.evidence).default([]),
   maxRuns: z.number().int().min(1).max(10).optional(),
   maxMinutes: z.number().int().min(5).max(1440).default(60),
   extendMinutes: z.number().int().min(0).max(240).optional(),
@@ -70,7 +69,7 @@ export type GoalReasonCode = "supervised-mode" | "repeated-failures" | "external
 export interface CycleWake { signalIds: string[]; dropped: number; owner?: true }
 export const goalActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
 export const goalExtendSchema = goalActionSchema.extend({ minutes: z.number().int().min(5).max(1440) }).strict();
-export const goalSteerSchema = goalActionSchema.extend({ text: z.string().trim().min(1).max(8000) }).strict();
+export const goalSteerSchema = goalActionSchema.extend({ text: z.string().trim().min(1).max(SHARED_INPUT_LIMITS.steeringChars) }).strict();
 export const goalParallelismSchema = goalActionSchema.extend({ parallelism: z.number().int().min(1).max(4) }).strict();
 interface GoalOutcomeInputBase {
   requestId: string;
@@ -173,7 +172,7 @@ const goalAssessmentSchema: z.ZodType<GoalAssessment> = z.object({
   evaluatorResult: z.enum(["met", "not-met", "inconclusive"]).optional(),
   reason: z.enum(["no-independent-evaluator", "evaluator-unavailable", "record-unavailable", "context-too-large"]).optional(),
   counts: z.object({ met: assessmentCountSchema, notMet: assessmentCountSchema, inconclusive: assessmentCountSchema, pendingOwner: assessmentCountSchema }).strict(),
-  criteria: z.array(z.object({ id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), state: z.enum(["met", "not-met", "inconclusive", "pending-owner"]) }).strict()).max(VERDICT_LIMITS.criteria),
+  criteria: z.array(z.object({ id: z.string().regex(ID_RE), state: z.enum(["met", "not-met", "inconclusive", "pending-owner"]) }).strict()).max(VERDICT_LIMITS.criteria),
   at: z.iso.datetime(),
   progress: z.number().int(),
 }).strict();

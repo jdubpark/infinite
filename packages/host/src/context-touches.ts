@@ -1,5 +1,25 @@
 import { posix } from "node:path";
 import { setImmediate as yieldMacrotask } from "node:timers/promises";
+import type { Provider } from "./types.js";
+
+export type ProviderToolInputCapability = { observesToolInputs: boolean };
+export const PROVIDER_TOOL_INPUT_OBSERVABILITY: Readonly<Record<Provider, boolean>> = {
+  claude: true,
+  codex: true,
+  grok: false,
+  opencode: false,
+  demo: false,
+};
+export function providerObservesToolInputs(provider: string): boolean {
+  return Object.hasOwn(PROVIDER_TOOL_INPUT_OBSERVABILITY, provider)
+    && PROVIDER_TOOL_INPUT_OBSERVABILITY[provider as Provider];
+}
+export function hostProviderCapabilities(includeDemo = false): Record<string, ProviderToolInputCapability> {
+  const entries = (Object.keys(PROVIDER_TOOL_INPUT_OBSERVABILITY) as Provider[])
+    .filter(provider => provider !== "demo" || includeDemo)
+    .map(provider => [provider, { observesToolInputs: PROVIDER_TOOL_INPUT_OBSERVABILITY[provider] }] as const);
+  return Object.fromEntries(entries);
+}
 
 export type FileTouch = { path: string; reads: number; edits: number; lastAt: string };
 export type SessionTouches = {
@@ -17,7 +37,6 @@ export type TouchPage = {
   more: boolean;
 };
 
-const EXTRACTABLE_PROVIDERS = new Set(["claude", "codex"]);
 const FILE_TOOLS: Record<string, { field: string; kind: "reads" | "edits" }> = {
   Read: { field: "file_path", kind: "reads" },
   Edit: { field: "file_path", kind: "edits" },
@@ -164,7 +183,7 @@ export class ContextTouches {
   }
 
   async session(source: TouchSource): Promise<SessionTouches> {
-    if (!EXTRACTABLE_PROVIDERS.has(source.provider)) {
+    if (!providerObservesToolInputs(source.provider)) {
       return { sessionId: source.sessionId, observable: false, complete: true, graphQueries: 0, files: [], truncated: false };
     }
     const state = this.stateFor(source.sessionId);

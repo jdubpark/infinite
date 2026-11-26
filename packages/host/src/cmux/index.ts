@@ -7,7 +7,8 @@ import { basename, isAbsolute, join, relative } from "node:path";
 import { applyLifecycle, initialAttention, type Attention, type Prompt } from "@infinite/attention";
 import { projectCwd, type CreateSession } from "../manager.js";
 import type { Config, ControlActor, ControlLease, Event, InputControl, Receipt, Session, WorkerRequest, WorkerState } from "../types.js";
-import { Journal, readEvents, unseal, writeSealed } from "../vault.js";
+import { Journal, unseal, writeSealed } from "../vault.js";
+import { readIndexedEvents, SignalIndex } from "../signal-index.js";
 import { CmuxClient, CmuxError, array, string, type Json, type Surface } from "./client.js";
 import { foregroundAgent, LAUNCH_ENV, processAlive, readHooks, type CmuxProvider, type HookSession } from "./discovery.js";
 import { digest, feedReply, matchingFeed, pendingPrompt, type PendingPrompt } from "./prompts.js";
@@ -43,6 +44,7 @@ interface Stored {
 }
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+const compareCodeUnits = (left: string, right: string) => (left < right ? -1 : left > right ? 1 : 0);
 const LEASE_MS = 30_000;
 const MAX_QUEUED = 8;
 const OBSERVATION_WAIT_MS = 5_000;
@@ -55,6 +57,7 @@ export class CmuxSessions {
   private readonly directory: string;
   private readonly records = new Map<string, Stored>();
   private readonly journals = new Map<string, Journal>();
+  private readonly signalIndexes = new Map<string, SignalIndex>();
   private readonly unreadable = new Set<string>();
   private readonly mutations: (() => Promise<void>)[] = [];
   private readonly observations: (() => Promise<void>)[] = [];
@@ -69,12 +72,12 @@ export class CmuxSessions {
     this.client = new CmuxClient(config.cmux?.command ?? "cmux");
     this.directory = join(config.stateDir, "cmux");
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
-    for (const id of readdirSync(this.directory).filter((value) => UUID.test(value))) {
+    for (const id of readdirSync(this.directory).filter((value) => UUID.test(value)).sort(compareCodeUnits)) {
       try {
         const stored = unseal<Stored>(key, `cmux:${id}:meta`, readFileSync(join(this.directory, id, "meta.sealed"), "utf8"));
         if (stored.session.id !== id) continue;
         this.records.set(id, stored);
-        try { this.journals.set(id, new Journal(join(this.directory, id, "events"), key, id)); }
+        try { this.openJournal(id); }
         catch { stored.recordingError = true; }
       } catch { this.unreadable.add(id); }
     }
@@ -130,14 +133,24 @@ export class CmuxSessions {
     catch (error) { record.recordingError = true; throw error; }
   }
 
+  private openJournal(id: string): Journal {
+    const sessionDir = join(this.directory, id);
+    let signalIndex: SignalIndex | undefined;
+    const journal = new Journal(join(sessionDir, "events"), this.key, id, {
+      onAppend: (event, meta) => {
+        signalIndex?.observe(event, meta);
+      },
+    });
+    signalIndex = new SignalIndex(sessionDir, this.key, id, journal.seq);
+    this.journals.set(id, journal);
+    this.signalIndexes.set(id, signalIndex);
+    return journal;
+  }
+
   private append(record: Stored, type: Event["type"], data: Event["data"]): Event {
     if (record.recordingError) throw new CmuxError("recording-error");
     try {
-      let journal = this.journals.get(record.session.id);
-      if (!journal) {
-        journal = new Journal(join(this.directory, record.session.id, "events"), this.key, record.session.id);
-        this.journals.set(record.session.id, journal);
-      }
+      const journal = this.journals.get(record.session.id) ?? this.openJournal(record.session.id);
       return journal.append(type, data);
     } catch (error) { record.recordingError = true; throw error; }
   }
@@ -276,15 +289,32 @@ export class CmuxSessions {
       let unreadable = false;
       if (record.session.id === screenId && live) {
         try {
+          const validReplaySize = (value?: Record<string, unknown>) =>
+            value && Number.isInteger(value.columns) && Number.isInteger(value.rows) &&
+            (value.columns as number) > 0 && (value.columns as number) <= 1000 &&
+            (value.rows as number) > 0 && (value.rows as number) <= 1000
+              ? { cols: value.columns as number, rows: value.rows as number }
+              : undefined;
+          const beforeReplay = await this.client.rpc("terminal.replay", { surface_id: record.surfaceId, workspace_id: record.workspaceId }).catch(() => undefined);
+          if (beforeReplay?.surface_id && beforeReplay.surface_id !== record.surfaceId) throw new CmuxError("snapshot-unavailable");
           const screen = await this.client.rpc("surface.read_text", { surface_id: record.surfaceId, workspace_id: record.workspaceId, scrollback: false });
           if (typeof screen.text !== "string") throw new CmuxError("snapshot-unavailable");
           if (screen.surface_id && screen.surface_id !== record.surfaceId || screen.workspace_id && screen.workspace_id !== record.workspaceId) throw new CmuxError("snapshot-unavailable");
-          const replay = await this.client.rpc("terminal.replay", { surface_id: record.surfaceId, workspace_id: record.workspaceId }).catch(() => undefined);
-          if (replay?.surface_id && replay.surface_id !== record.surfaceId) throw new CmuxError("snapshot-unavailable");
-          if (replay && Number.isInteger(replay.columns) && Number.isInteger(replay.rows) && replay.columns > 0 && replay.columns <= 1000 && replay.rows > 0 && replay.rows <= 1000) {
-            record.columns = replay.columns;
-            record.rows = replay.rows;
-          }
+          const afterReplay = await this.client.rpc("terminal.replay", { surface_id: record.surfaceId, workspace_id: record.workspaceId }).catch(() => undefined);
+          if (afterReplay?.surface_id && afterReplay.surface_id !== record.surfaceId) throw new CmuxError("snapshot-unavailable");
+          const previousSize = record.columns && record.rows ? { cols: record.columns, rows: record.rows } : undefined;
+          const beforeSize = validReplaySize(beforeReplay);
+          const afterSize = validReplaySize(afterReplay);
+          const consistentSize = beforeSize && afterSize && beforeSize.cols === afterSize.cols && beforeSize.rows === afterSize.rows ? afterSize : undefined;
+          const emitResize = (size: { cols: number; rows: number }) => {
+            record.columns = size.cols;
+            record.rows = size.rows;
+            if (!previousSize || previousSize.cols !== size.cols || previousSize.rows !== size.rows) {
+              this.append(record, "lifecycle", { event: "resize", cols: size.cols, rows: size.rows });
+            }
+          };
+          if (consistentSize) emitResize(consistentSize);
+          const replay = afterReplay ?? beforeReplay;
           const grid = replay?.render_grid;
           const cursorRow = grid?.cursor?.row;
           const styles = array(grid?.styles);
@@ -296,8 +326,9 @@ export class CmuxSessions {
           record.draft = Boolean(row && /^[\s│┃]*[>›❯]\s*\S/.test(row));
           if (record.screen !== screen.text) {
             record.screen = screen.text.slice(-512 * 1024);
-            this.append(record, "output", { text: `\u001b[2J\u001b[H${record.screen.replace(/\r?\n/g, "\r\n")}`, snapshot: true });
+            this.append(record, "output", { text: `\u001b[2J\u001b[H${record.screen.replace(/\r?\n/g, "\r\n")}`, snapshot: true, ...(consistentSize ? { cols: consistentSize.cols, rows: consistentSize.rows } : {}) });
           }
+          if (!consistentSize && afterSize) emitResize(afterSize);
         } catch { unreadable = true; }
       }
       try {
@@ -391,12 +422,13 @@ export class CmuxSessions {
       attention: record.recordingError ? applyLifecycle(record.attention, "recording-error", record.attention.lastActivityAt) : record.attention,
       capabilities: { terminalSnapshot: 1, inputControl: 1 }, control: this.currentControl(record),
       runtime: record.session.runtime,
+      ...(record.columns && record.rows ? { terminalSize: { cols: record.columns, rows: record.rows } } : {}),
       ...(record.nativeId ? { nativeSession: { id: record.nativeId, source: "hook" as const } } : {}),
     };
   }
 
   list() {
-    const rows = () => [...this.records.values()].map((record) => {
+    const rows = () => [...this.records.values()].sort((left, right) => compareCodeUnits(left.session.id, right.session.id)).map((record) => {
       const { context: _context, initialPrompt: _prompt, nativeArgs: _args, ...session } = record.session;
       const { screen: _screen, ...state } = this.state(record);
       return { ...session, ...state, attention: { ...state.attention, lastMessage: state.attention.lastMessage?.slice(0, 280) } };
@@ -423,7 +455,7 @@ export class CmuxSessions {
 
   events(id: string, after = 0, limit = 200, types?: Set<string>) {
     this.stored(id);
-    return readEvents(join(this.directory, id, "events"), this.key, id, after, limit, types);
+    return readIndexedEvents(join(this.directory, id), this.key, id, after, limit, types);
   }
 
   messages(id: string, after?: string, limit = 200) {
@@ -711,5 +743,12 @@ export class CmuxSessions {
     };
   }
 
-  async close(): Promise<void> { this.closed = true; await this.draining; }
+  async close(): Promise<void> {
+    this.closed = true;
+    while (this.draining) await this.draining;
+    for (const [id, index] of this.signalIndexes) {
+      const journal = this.journals.get(id);
+      if (journal) index.checkpoint(journal.seq);
+    }
+  }
 }

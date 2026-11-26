@@ -5,10 +5,10 @@ import { objectiveError, logValue, type ObjectiveErrorCode } from "./objective-r
 import { OBJECTIVE_LIMITS, canonicalBytes, cappedBytes, objectiveRecordSchema, producerOf, recordDigest, thresholdFits } from "./objective-types.js";
 import type { Check, Criterion, LogEntry, ObjectiveRecord, Assumption } from "./objective-types.js";
 import { recordDigestFor } from "./objective-digest.js";
+import { SHARED_INPUT_LIMITS, type TeamCommand } from "./schema-primitives.js";
 import { RECORD_DIGEST_BYTES, recordDigestBytes } from "./team-types.js";
-import type { TeamCommand } from "./team-types.js";
 
-export const CORRECTION_LOG = { entries: 380, bytes: 210 * 1024 } as const;
+export const CORRECTION_LOG = { entries: OBJECTIVE_LIMITS.logEntries - SHARED_INPUT_LIMITS.steeringEntries, bytes: 210 * 1024 } as const;
 export type OwnerOpContext = { configured: readonly TeamCommand[]; requestId: string; at: string;
   rating?: { commit: string; cycle: number } };
 export const REGISTER_OP_NAMES: ReadonlySet<CorrectionOp["op"]> = new Set<CorrectionOp["op"]>(["assumption.set", "rating.record"]);

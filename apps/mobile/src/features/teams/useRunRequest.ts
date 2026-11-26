@@ -45,7 +45,7 @@ export function useRunRequest<R extends { id: string; revision: number }>(connec
     dismissMessage,
     send(path: string, label: string, revision: number, fields: Record<string, string | number> = {}) {
       if (busy || pending) return;
-      void send(runRequests.begin(key, { requestId: Crypto.randomUUID(), revision, path, label, fields: fields as Record<string, string> }));
+      void send(runRequests.begin(key, { requestId: Crypto.randomUUID(), revision, path, label, fields }));
     },
     retry() { if (pending && !busy) { setRetrying(true); void send(pending); } },
     discard() { if (!busy) runRequests.clear(key); },

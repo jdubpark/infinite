@@ -1,11 +1,12 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, rmSync, realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { accessSync, chmodSync, constants as fsConstants, existsSync, lstatSync, mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, rmSync, realpathSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { hashToken } from "../packages/host/src/config.js";
 import { createApp } from "../packages/host/src/server.js";
-import { workerCall } from "../packages/host/src/ipc.js";
+import { readRecordedSocketPath, workerCall, type SocketTarget } from "../packages/host/src/ipc.js";
 import { unseal } from "../packages/host/src/vault.js";
 import type { Config, Role, ControlLease } from "../packages/host/src/types.js";
 
@@ -14,15 +15,21 @@ export const waitFor = async <T>(
   accepts: (value: T) => boolean,
   timeout = 10000,
 ): Promise<T> => {
-  const until = Date.now() + timeout;
+  const until = performance.now() + timeout;
   let last: T | undefined;
-  while (Date.now() < until) {
+  while (performance.now() < until) {
     last = await fn();
     if (accepts(last)) return last;
     await new Promise((r) => setTimeout(r, 100));
   }
   throw new Error(`Condition was not reached; last state: ${JSON.stringify(last)}`);
 };
+
+export async function moveWorkerClock(worker: ChildProcess, file: string, ms: number) {
+  writeFileSync(file, String(ms));
+  worker.kill("SIGUSR2");
+  await waitFor(async () => readFileSync(file, "utf8"), text => text === `moved ${ms}`);
+}
 
 export function processes(): { pid: number; parent: number; command: string }[] {
   return execFileSync("ps", ["-ww", "-eo", "pid=,ppid=,args="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).split("\n").flatMap(line => {
@@ -99,19 +106,21 @@ export function apiClient(origin: string, tokens: Record<Role, string>): Host["f
 }
 
 export async function stopSessionWorkers(config: Config) {
-  let ids: string[] = [], answered = 0;
+  let ids: string[] = [], answered = 0, key: Buffer | undefined;
   try {
     ids = readdirSync(join(config.stateDir, "sessions")).filter((n) => /^[a-f0-9-]{36}$/i.test(n));
   } catch {
   }
+  try { key = readFileSync(config.keyFile); } catch { }
+  const target: SocketTarget = key ? { runDir: config.runDir, socketDir: config.socketDir, recordedSocket: id => readRecordedSocketPath(config.stateDir, key!, id) } : config;
   for (const id of ids)
     try {
       const actor = { id: "test-cleanup", label: "Test cleanup" };
-      const state = await workerCall<{ capabilities?: { inputControl?: number } }>(config.runDir, id, { op: "state" });
+      const state = await workerCall<{ capabilities?: { inputControl?: number } }>(target, id, { op: "state" });
       answered++;
       const lease = state.capabilities?.inputControl
-        ? await workerCall<ControlLease>(config.runDir, id, { op: "control", action: "claim", actor, takeover: true }) : undefined;
-      await workerCall(config.runDir, id, { op: "stop", requestId: randomUUID(), ...(lease ? { actor, leaseId: lease.id } : {}) });
+        ? await workerCall<ControlLease>(target, id, { op: "control", action: "claim", actor, takeover: true }) : undefined;
+      await workerCall(target, id, { op: "stop", requestId: randomUUID(), ...(lease ? { actor, leaseId: lease.id } : {}) });
     } catch {
     }
   return answered;
@@ -135,7 +144,7 @@ export async function endSessionWorkers(config: Config, started?: readonly numbe
 }
 
 export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
-  const root = mkdtempSync("/tmp/inf-test-");
+  const root = mkdtempSync(join(tmpdir(), "inf-"));
   const port = await freePort();
   const origin = `http://127.0.0.1:${port}`;
   const tokens: Record<Role, string> = {
@@ -194,6 +203,7 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
         }
       },
       (status) => status === 200,
+      20000,
     );
   };
   const stop = async () => {
@@ -240,8 +250,8 @@ export async function claimControl(
   return { lease, headers: { "X-Infinite-Client": clientId, "X-Infinite-Control": lease.id } };
 }
 
-export async function inProcessHost(options?: { configure?: (config: Config) => void }) {
-  const root = realpathSync(mkdtempSync("/tmp/inf-psync-guard-"));
+export async function inProcessHost(options?: { configure?: (config: Config) => void; appOptions?: Parameters<typeof createApp>[2] }) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-")));
   const workspace = join(root, "workspace"); mkdirSync(workspace);
   const key = randomBytes(32);
   const keyFile = join(root, "key"); writeFileSync(keyFile, key, { mode: 0o600 });
@@ -254,7 +264,7 @@ export async function inProcessHost(options?: { configure?: (config: Config) => 
     tokens: roles.map(role => ({ id: role, label: role, role, hash: hashToken(tokens[role]) })),
   };
   options?.configure?.(config);
-  const host = createApp(config, key);
+  const host = createApp(config, key, options?.appOptions);
   await new Promise<void>(resolve => host.server.listen(0, "127.0.0.1", resolve));
   config.port = (host.server.address() as { port: number }).port;
   const origin = `http://127.0.0.1:${config.port}`;
@@ -274,4 +284,44 @@ export async function inProcessHost(options?: { configure?: (config: Config) => 
       }
     },
   };
+}
+
+function hasSecureAncestors(directory: string, trustedUid: number): boolean {
+  let current = directory;
+  for (; ; current = dirname(current)) {
+    let info;
+    try { info = lstatSync(current); } catch { return false; }
+    if (info.isSymbolicLink() || !info.isDirectory()) return false;
+    if ((info.uid !== 0 && info.uid !== trustedUid) || (info.mode & 0o022) !== 0) return false;
+    if (current === "/") return true;
+  }
+}
+
+function isOutsideDirectory(candidate: string, boundary: string): boolean {
+  const rel = relative(boundary, candidate);
+  return rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+}
+
+export function mkdtempSecure(prefix: string): string {
+  const uid = process.getuid!();
+  let home: string | undefined;
+  try { home = realpathSync(homedir()); } catch { }
+  const candidates = [
+    process.env.INFINITE_TEST_STAGING_ROOT,
+    process.env.XDG_RUNTIME_DIR,
+    process.platform === "linux" ? `/run/user/${uid}` : undefined,
+    tmpdir(),
+  ].filter((value): value is string => Boolean(value));
+  for (const candidate of candidates) {
+    try {
+      const canonical = realpathSync(candidate);
+      if (home && !isOutsideDirectory(canonical, home)) continue;
+      accessSync(canonical, fsConstants.W_OK | fsConstants.X_OK);
+      if (!hasSecureAncestors(canonical, uid)) continue;
+      const root = realpathSync(mkdtempSync(join(canonical, prefix)));
+      chmodSync(root, 0o700);
+      return root;
+    } catch { }
+  }
+  throw new Error("No writable non-home directory with secure ancestors is available; set INFINITE_TEST_STAGING_ROOT or XDG_RUNTIME_DIR.");
 }

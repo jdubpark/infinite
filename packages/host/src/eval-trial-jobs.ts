@@ -16,9 +16,11 @@ import {
   advanceTask, dropTrial, jobSlots, jobTrialCount, openTrialCounts, trialCounts, trialsSince, TRIAL_KEEP_DAYS_DEFAULT, type TrialCounts,
 } from "./eval-trial-store.js";
 import {
-  VOID_ENDINGS, type BaselineJobRequest, type BaselineJobView, type ComparisonJobRequest, type ComparisonJobView,
+  evalConfigurationSchema, evalTaskIdSchema, evalWindowSchema, VOID_ENDINGS,
+  type BaselineJobRequest, type BaselineJobView, type ComparisonJobRequest, type ComparisonJobView,
   type EvalJobReason, type EvalJobWait, type EvalRefusal, type TrialConfiguration, type TrialEnding, type TrialJobPayload,
 } from "./eval-types.js";
+import { ID_RE } from "./schema-primitives.js";
 import { lineupProfiles, type TeamModelProfile } from "./team-types.js";
 import type { Config, Provider } from "./types.js";
 
@@ -27,8 +29,6 @@ export const TRIAL_CONFIGURATIONS_MAX = 4, TRIALS_PER_TASK_DEFAULT = 3, TRIALS_P
 export const BASELINE_JOBS_SQL = "SELECT * FROM eval_jobs WHERE status = ? AND kind != 'validate' ORDER BY created_at, job_id LIMIT ?";
 
 const TASK_PAGE = 200;
-const TASK_ID_PATTERN = /^(captured|mined):[A-Za-z0-9:._-]{1,200}$/;
-const AREA_PATTERN = /^[a-z][a-z0-9-]{0,39}$/;
 const DAY_MS = 86_400_000;
 
 export type TrialGates = {
@@ -54,25 +54,14 @@ const WAITS_ONLY: ReadonlySet<EvalJobWait> = new Set<EvalJobWait>(["mirror", "ha
 const NONE: NextTrial = { kind: "none" };
 const EMPTY_COUNTS: TrialCounts = { plannedTasks: 0, plannedTrials: 0, tasks: 0, skipped: 0, started: 0, graded: 0, resolved: 0, ended: 0, void: 0, voidStreak: 0, reused: 0 };
 
-const profileSchema = z.object({ provider: z.enum(["claude", "codex", "grok", "opencode", "demo"]) }).passthrough();
-const configurationSchema = z.object({
-  profile: profileSchema,
-  guidance: z.literal("as-of-base"),
-  knowledge: z.literal("none"),
-}).strict();
-const windowSchema = z.object({
-  startHourUtc: z.number().int().min(0).max(23),
-  endHourUtc: z.number().int().min(1).max(24),
-}).strict().refine(window => window.endHourUtc !== window.startHourUtc, "a window must not be empty");
-
 export const baselineJobSchema = z.object({
   kind: z.literal("baseline"),
-  configurations: z.array(configurationSchema).min(1).max(TRIAL_CONFIGURATIONS_MAX)
+  configurations: z.array(evalConfigurationSchema).min(1).max(TRIAL_CONFIGURATIONS_MAX)
     .refine(list => new Set(list.map(item => configRef(item as unknown as TrialConfiguration))).size === list.length, "Two configurations name one configRef"),
   taskFilter: z.object({
-    taskIds: z.array(z.string().regex(TASK_ID_PATTERN)).max(JOB_TASKS_MAX).optional(),
+    taskIds: z.array(evalTaskIdSchema).max(JOB_TASKS_MAX).optional(),
     origins: z.array(z.enum(["captured", "mined"])).max(2).optional(),
-    areas: z.array(z.string().regex(AREA_PATTERN)).max(32).optional(),
+    areas: z.array(z.string().regex(ID_RE)).max(32).optional(),
     maxTasks: z.number().int().min(1).max(TRIAL_TASKS_MAX).optional(),
   }).strict().optional(),
   trialsPerTask: z.number().int().min(1).max(TRIALS_PER_TASK_MAX).optional(),
@@ -80,7 +69,7 @@ export const baselineJobSchema = z.object({
     maxTrials: z.number().int().min(1).max(MAX_TRIALS_MAX),
     maxWallMinutes: z.number().int().min(10).max(43_200),
   }).strict(),
-  windows: z.array(windowSchema).min(1).max(4).optional(),
+  windows: z.array(evalWindowSchema).min(1).max(4).optional(),
   expiresAt: z.iso.datetime().optional(),
 }).strict() as unknown as z.ZodType<BaselineJobRequest>;
 

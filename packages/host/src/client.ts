@@ -7,6 +7,7 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ControlLease, Receipt, Session, Status, WorkerState } from "./types.js";
+import { createClientApi, HttpError, type ClientApi, type ClientConfig } from "./client-api.js";
 import { terminalConnection, TerminalAccessError, TerminalControlError, type TerminalPage } from "./client-transport.js";
 import { draftTerminal } from "./client-draft.js";
 import { localDraftStore } from "./client-draft-store.js";
@@ -40,7 +41,6 @@ import { LEGACY_BATCH_MAX, parseLegacyFile, type LegacyLineOutcome } from "./out
 import type { LegacyImportResult } from "./outcome-import.js";
 import { handleUsageRepairsCommand } from "./repair-metrics-cli.js";
 
-type ClientConfig = { origin: string; token: string; projectId?: string };
 type Me = { role: string; capabilities?: { workspaceMirror?: number; mirrorForget?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
 const providers = new Set(["claude", "codex", "grok", "opencode"]);
 const providerNames: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok", opencode: "OpenCode" };
@@ -60,7 +60,6 @@ function startupProgress() {
     stop,
   };
 }
-class HttpError extends Error { constructor(readonly status: number, message: string, readonly code?: string) { super(message); } }
 function originOf(value: string) {
   const url = new URL(value);
   if (url.username || url.password || url.search || url.hash || url.pathname !== "/") throw new Error("Use the host origin without credentials, a path, or query parameters");
@@ -78,25 +77,6 @@ function loadConfig(path: string): ClientConfig {
   const config = JSON.parse(readFileSync(path, "utf8"));
   if (typeof config.token !== "string" || !/^[\x21-\x7e]{32,200}$/.test(config.token)) throw new Error("Invalid device key in client configuration");
   return { ...config, origin: originOf(config.origin) };
-}
-function connection(config: ClientConfig, clientId = randomUUID()) {
-  const request = async (path: string, body?: unknown, signal?: AbortSignal, headers: Record<string, string> = {}, method?: string) => {
-    const response = await fetch(config.origin + "/api" + path, {
-      method: method ?? (body === undefined ? "GET" : "POST"), redirect: "error",
-      headers: { Authorization: `Bearer ${config.token}`, "X-Infinite-Client": clientId, ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...headers },
-      body: body === undefined ? undefined : body instanceof Uint8Array ? body as unknown as BodyInit : JSON.stringify(body),
-      signal: signal ?? AbortSignal.timeout(15000),
-    });
-    if (!response.ok) {
-      const detail = await response.json().catch(() => ({})) as { code?: unknown };
-      const code = typeof detail.code === "string" && /^[a-z0-9-]{1,80}$/.test(detail.code) ? detail.code : undefined;
-      const guidance = code === "stale-enrollment-revision" ? "The repository enrollment changed; refresh its status and submit a new request ID." :
-        response.status === 401 ? "Pair a current device key." : response.status === 403 ? "This device is not permitted to perform that action." : "Inspect the current state before retrying a mutation.";
-      throw new HttpError(response.status, `Host returned HTTP ${response.status}${code ? ` (${code})` : ""}. ${guidance}`, code);
-    }
-    return response;
-  };
-  return { request, json: async <T>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T> => (await request(path, body, signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : undefined, headers, method)).json() as Promise<T> };
 }
 function sessionCwd(session: Session & Partial<WorkerState>) {
   return (session.execution?.location ?? session.executionLocation) === "laptop" ? session.workspace?.cwd : session.cwd;
@@ -144,7 +124,7 @@ function printResources(value: ResourceSnapshot) {
   for (const session of value.sessions) console.log(`Session ${clean(session.sessionId)} · PID ${session.pid ?? "unavailable"} · CPU ${percent(session.cpuPercent)} · RSS ${bytes(session.rssBytes)} (provider process)`);
   for (const item of value.unavailable) console.log(`Unavailable ${clean(item.field)}: ${clean(item.reason)}`);
 }
-async function resources(api: ReturnType<typeof connection>, options: Record<string, string | boolean>) {
+async function resources(api: ClientApi, options: Record<string, string | boolean>) {
   const abort = new AbortController(), stop = () => abort.abort();
   process.on("SIGINT", stop); process.on("SIGTERM", stop);
   try {
@@ -162,7 +142,7 @@ async function resources(api: ReturnType<typeof connection>, options: Record<str
   finally { process.off("SIGINT", stop); process.off("SIGTERM", stop); }
 }
 
-async function closeSession(api: ReturnType<typeof connection>, me: Me, selected: Session, options: Record<string, string | boolean>) {
+async function closeSession(api: ClientApi, me: Me, selected: Session, options: Record<string, string | boolean>) {
   if (me.role !== "owner") throw new Error("Closing a session requires an owner device key");
   const session = await api.json<Session & WorkerState>(`/sessions/${selected.id}`);
   if (session.status !== "running") throw new Error(`Session is ${clean(session.status)}. Inspect it with infinite monitor ${selected.id}; no close was sent.`);
@@ -244,7 +224,7 @@ function terminalRenderer() {
 async function attach(config: ClientConfig, configFile: string, me: Me, session: Session, watch: boolean, launched = false) {
   if (!me.terminal?.stream) throw new Error("Upgrade the host to a version with native CLI streaming support");
   if (!watch && !launched && !["running", "starting"].includes(session.status)) throw new Error("This process is no longer running. Use infinite monitor ID to replay its recording. A server reboot requires explicit provider-native recovery");
-  const clientId = randomUUID(), api = connection(config, clientId), abort = new AbortController();
+  const clientId = randomUUID(), api = createClientApi(config, clientId), abort = new AbortController();
   let render = terminalRenderer();
   const progress = startupProgress();
   const notice = (message: string) => process.stderr.write(`\r\n[Infinite] ${message}\r\n`);
@@ -442,8 +422,13 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
               render = terminalRenderer();
               await screen.snapshot(render(page.snapshot.ansi), page.snapshot.cols, page.snapshot.rows);
               progress.stop();
+            } else if (!interactive && typeof page.open?.cols === "number" && typeof page.open?.rows === "number") {
+              screen.resize(page.open.cols, page.open.rows);
             }
             for (const event of page.events ?? []) {
+              if (!interactive && event.type === "lifecycle" && typeof event.data.cols === "number" && typeof event.data.rows === "number") {
+                screen.resize(event.data.cols, event.data.rows);
+              }
               if (event.type === "output") {
                 const text = render(String(event.data.text));
                 if (text) progress.stop();
@@ -840,7 +825,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       token = token.trim();
       if (!/^[\x21-\x7e]{32,200}$/.test(token)) throw new Error("Provide a device key, not the devices JSON file");
       const config: ClientConfig = { origin: originOf(positional[0]), token };
-      const me = await connection(config).json<Me>("/me");
+      const me = await createClientApi(config).json<Me>("/me");
       if (!me.terminal?.stream) throw new Error("Upgrade the host before pairing this native CLI");
       config.projectId = String(options["--project"] ?? me.projects[0]?.id ?? "");
       if (!me.projects.some(p => p.id === config.projectId)) throw new Error("Unknown project ID");
@@ -850,7 +835,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       return true;
     }
     if (command === "list" && !existsSync(path) && !options["--client-config"] && !process.env.INFINITE_CLIENT_CONFIG) return false;
-    const config = loadConfig(path), api = connection(config);
+    const config = loadConfig(path), api = createClientApi(config);
     if (command === "understand") return await handleUnderstandingCommand(positional, options, api);
     if (command === "routine") return await handleRoutineClientCommand(positional, options, api);
     if (command === "autonomy") return await handleAutonomyClientCommand(positional, options, api);
@@ -1177,9 +1162,8 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
       const selected = await selectSession(sessions, positional[0], true);
       progress.start("Downloading a cloud checkpoint for reconciliation");
-      const call = async (method: string, extra: Record<string, unknown> = {}, signal?: AbortSignal) =>
-        (await api.request(`/sessions/${selected.id}/workspace-export`, { method, ...extra },
-          signal ? AbortSignal.any([signal, AbortSignal.timeout(300000)]) : AbortSignal.timeout(300000))).json();
+      const call = (method: string, extra: Record<string, unknown> = {}, signal?: AbortSignal) =>
+        api.json<any>(`/sessions/${selected.id}/workspace-export`, { method, ...extra }, signal, undefined, undefined, 300000);
       const exported = await call("sync/export");
       const manifest = validateWorkspaceManifest(exported.manifest);
       const directory = join(dirname(path), "workspaces", selected.id);
@@ -1207,11 +1191,11 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const projectId = String(enrolled ?? mapped?.id ?? options["--project"] ?? localSyncProject(join(dirname(path), "sync"), config.origin) ?? config.projectId ?? me.projects[0]?.id ?? "");
       if (!PROJECT_ID.test(projectId) || (!mapped && !me.projects.some(p => p.id === projectId))) throw new Error("Unknown project. Use infinite projects");
       if (options["--apply"]) {
-        const applied = await api.request(`/projects/${projectId}/sync/apply`, options["--force"] ? { force: true } : {}, AbortSignal.timeout(300000)).catch(async (error: unknown) => {
+        const applied = await api.json<ProjectDetail["sync"]>(`/projects/${projectId}/sync/apply`, options["--force"] ? { force: true } : {}, undefined, undefined, undefined, 300000).catch(async (error: unknown) => {
           if (!(error instanceof HttpError) || error.status !== 409) throw error;
           throw new Error(`Not applied. ${describeSync((await api.json<ProjectDetail>(`/projects/${projectId}`)).sync)}`);
         });
-        console.log(describeSync(await applied.json() as ProjectDetail["sync"])); return true;
+        console.log(describeSync(applied)); return true;
       }
       const sourceDetail = await api.json<ProjectDetail>(`/projects/${projectId}`);
       if (sourceDetail.source?.mode === "github") throw new Error("This project follows GitHub; laptop sync is off. Push to GitHub, or re-enroll with infinite repo init --source laptop.");
@@ -1236,8 +1220,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       if (syncRoots(join(dirname(path), "sync")).some(root => target === root || target.startsWith(root.endsWith(sep) ? root : root + sep)))
         throw new Error("Choose an --output directory outside every synced checkout; the sync service would upload the pulled copy");
       progress.start("Downloading the cloud project tree");
-      const exportSignal = AbortSignal.timeout(300000);
-      const { manifest: exported } = await (await api.request(`/projects/${projectId}/sync/export`, {}, exportSignal)).json() as { manifest: unknown };
+      const { manifest: exported } = await api.json<{ manifest: unknown }>(`/projects/${projectId}/sync/export`, {}, undefined, undefined, undefined, 300000);
       const manifest = validateWorkspaceManifest(exported);
       const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
       for (let offset = 0; offset < hashes.length; offset += 512)

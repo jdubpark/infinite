@@ -1,5 +1,5 @@
-import type { AttentionState } from "@infinite/attention";
-import { memberLimit, type TeamMember, type TeamRun } from "./team-types.js";
+import type { Attention, AttentionState } from "@infinite/attention";
+import { memberLimit, type TeamMember, type TeamPermissionDecision, type TeamRun, type TeamStatus } from "./team-types.js";
 
 export const MEMBER_STALL_REASON = "An agent showed no activity twice on the same assignment. Its workspace was preserved.";
 
@@ -11,9 +11,80 @@ const ACTIVE_STALL_RUN_STATUSES = new Set<TeamRun["status"]>([
   "verifying",
   "reviewing",
   "delivering",
+  "needs-input",
 ]);
-const OPEN_PERMISSION_DECISION_STATUSES = new Set(["pending", "reviewing", "approved", "answering", "escalated", "uncertain"]);
+const REVIEW_PERMISSION_DECISION_STATUSES = new Set(["pending", "reviewing", "approved"]);
 const LIVE_PERMISSION_RECOVERY_STATUSES = new Set(["expanding", "diagnosing", "reviewing-evidence"]);
+
+export interface LivePromptRef {
+  id: number;
+  hash?: string;
+}
+
+export function activeStageForRole(role: TeamMember["role"]): TeamStatus {
+  if (role === "project-manager" || role === "intent-checker") return "planning";
+  if (role === "scout") return "discovering";
+  if (role === "reviewer" || role === "evaluator" || role === "judge") return "reviewing";
+  if (role === "delivery") return "delivering";
+  if (role === "integrator") return "integrating";
+  return "implementing";
+}
+
+function matchesLivePrompt(decision: Pick<TeamPermissionDecision, "promptId" | "promptHash">, prompt: LivePromptRef): boolean {
+  return prompt.id === decision.promptId && (prompt.hash === undefined || prompt.hash === decision.promptHash);
+}
+
+export function syncObservedMemberState(
+  run: Pick<TeamRun, "revision" | "permissionDecisions">,
+  member: TeamMember,
+  state: { status: string; attention: Pick<Attention, "state" | "lastActivityAt" | "spinnerOnlySince" | "limit" | "prompt"> },
+  nowIso: string,
+): void {
+  if (!["unavailable", "recording-error"].includes(state.status)) {
+    member.lastActivityAt = state.attention.lastActivityAt;
+    member.spinnerOnlySince = state.attention.spinnerOnlySince;
+  } else {
+    member.spinnerOnlySince = undefined;
+  }
+  member.pendingLimit = Boolean(state.attention.limit);
+  if (state.status !== "running" && state.status !== "exited") return;
+  const livePrompt: LivePromptRef | undefined =
+    state.status === "running" && state.attention.state === "needs-you" && state.attention.prompt
+      ? { id: state.attention.prompt.id, ...(state.attention.prompt.hash ? { hash: state.attention.prompt.hash } : {}) }
+      : undefined;
+  for (const decision of run.permissionDecisions ?? []) {
+    if (
+      decision.revision !== run.revision ||
+      decision.targetMemberId !== member.memberId ||
+      decision.targetSessionId !== member.sessionId ||
+      decision.status !== "escalated" ||
+      decision.promptClosedAt !== undefined
+    ) {
+      continue;
+    }
+    if (!livePrompt || !matchesLivePrompt(decision, livePrompt)) {
+      decision.promptClosedAt = nowIso;
+    }
+  }
+}
+
+function isLivePermissionBlocker(
+  decision: Pick<TeamPermissionDecision, "promptId" | "promptHash" | "status" | "promptClosedAt">,
+  attentionState: AttentionState,
+  activePrompt: LivePromptRef | null | undefined,
+): boolean {
+  if (decision.status === "answering") return true;
+  if (decision.promptClosedAt !== undefined) return false;
+  if (decision.status === "escalated") {
+    if (attentionState !== "needs-you" || activePrompt === null) return false;
+    return activePrompt === undefined || matchesLivePrompt(decision, activePrompt);
+  }
+  if (REVIEW_PERMISSION_DECISION_STATUSES.has(decision.status)) {
+    if (activePrompt === null) return false;
+    return activePrompt === undefined || matchesLivePrompt(decision, activePrompt);
+  }
+  return false;
+}
 
 export type StallRecoveryGuard =
   | "current-assignment"
@@ -55,6 +126,7 @@ export interface StallRecoveryInput {
   >;
   member: TeamMember;
   attentionState: AttentionState;
+  activePrompt?: LivePromptRef | null;
   quietForMs: number;
   stallWindowMs: number;
   journalDrained: boolean;
@@ -64,7 +136,7 @@ export interface StallRecoveryInput {
 }
 
 export function evaluateStallRecovery(input: StallRecoveryInput): StallRecoveryDecision {
-  const { run, member, attentionState, quietForMs, stallWindowMs, journalDrained, hasDeliveryAttempt, nowMs, phase } = input;
+  const { run, member, attentionState, activePrompt, quietForMs, stallWindowMs, journalDrained, hasDeliveryAttempt, nowMs, phase } = input;
 
   if (run.members.some(item => item !== member && item.stalledSourceMemberId === member.memberId)) {
     return { action: "suppress-duplicate", guard: "duplicate-suppression", reason: "replacement-already-exists" };
@@ -88,6 +160,10 @@ export function evaluateStallRecovery(input: StallRecoveryInput): StallRecoveryD
   if (phase === "detect" && member.status === "stopped") {
     return { action: "none", guard: "current-assignment", reason: "member-already-stopped" };
   }
+  const memberIndex = run.members.findIndex(item => item === member || item.memberId === member.memberId);
+  if (memberIndex === -1) {
+    return { action: "none", guard: "current-assignment", reason: "not-in-run-members" };
+  }
   if (member.role === "implementer") {
     const task = run.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId);
     if (!task || (task.revision ?? run.revision) !== run.revision || task.status === "integrated") {
@@ -103,14 +179,11 @@ export function evaluateStallRecovery(input: StallRecoveryInput): StallRecoveryD
       return { action: "none", guard: "current-assignment", reason: "not-current-scout-member" };
     }
   }
-  const superseded = run.members.some(
+  const superseded = run.members.slice(memberIndex + 1).some(
     item =>
-      item !== member &&
       item.revision === member.revision &&
       item.role === member.role &&
-      item.taskId === member.taskId &&
-      !item.stalledAt &&
-      (item.report !== undefined || item.status === "queued" || item.status === "running" || item.status === "unavailable"),
+      item.taskId === member.taskId,
   );
   if (superseded) {
     return { action: "none", guard: "current-assignment", reason: "already-superseded" };
@@ -121,7 +194,10 @@ export function evaluateStallRecovery(input: StallRecoveryInput): StallRecoveryD
   }
 
   const memberPermissionDecisions = (run.permissionDecisions ?? []).filter(
-    decision => decision.revision === run.revision && decision.targetMemberId === member.memberId,
+    decision =>
+      decision.revision === run.revision &&
+      decision.targetMemberId === member.memberId &&
+      decision.targetSessionId === member.sessionId,
   );
   if (memberPermissionDecisions.some(decision => decision.status === "uncertain")) {
     return { action: "none", guard: "eligible-cause", reason: "uncertain-permission-decision" };
@@ -130,9 +206,19 @@ export function evaluateStallRecovery(input: StallRecoveryInput): StallRecoveryD
   const hasOpenOwnerDecision = run.decisions.some(
     decision => decision.revision === run.revision && !decision.answer && decision.memberId === member.memberId,
   );
-  const hasOpenPermissionDecision = memberPermissionDecisions.some(decision => OPEN_PERMISSION_DECISION_STATUSES.has(decision.status));
+  const hasOpenPermissionDecision = memberPermissionDecisions.some(decision =>
+    isLivePermissionBlocker(decision, attentionState, activePrompt),
+  );
   const hasLivePermissionRecovery = (run.permissionRecovery?.requests ?? []).some(
-    request => request.revision === run.revision && request.targetMemberId === member.memberId && LIVE_PERMISSION_RECOVERY_STATUSES.has(request.status),
+    request =>
+      request.revision === run.revision &&
+      request.targetMemberId === member.memberId &&
+      request.targetSessionId === member.sessionId &&
+      LIVE_PERMISSION_RECOVERY_STATUSES.has(request.status) &&
+      (activePrompt === undefined ||
+        request.status === "expanding" ||
+        (activePrompt !== null &&
+          (request.promptId === activePrompt.id || request.expansion?.observedPromptId === activePrompt.id))),
   );
 
   if (!member.stalledAt) {
@@ -175,14 +261,17 @@ export function evaluateStallRecovery(input: StallRecoveryInput): StallRecoveryD
     };
   }
 
-  const priorStalled = run.members.some(
-    item =>
-      item !== member &&
-      item.revision === member.revision &&
-      item.role === member.role &&
-      item.taskId === member.taskId &&
-      Boolean(item.stalledAt),
-  );
+  const sameSlotPrior = run.members
+    .slice(0, memberIndex)
+    .filter(item => item.revision === member.revision && item.role === member.role && item.taskId === member.taskId);
+  let lastReportedIndex = -1;
+  for (let i = sameSlotPrior.length - 1; i >= 0; i -= 1) {
+    if (sameSlotPrior[i]!.report !== undefined) {
+      lastReportedIndex = i;
+      break;
+    }
+  }
+  const priorStalled = sameSlotPrior.slice(lastReportedIndex + 1).some(item => Boolean(item.stalledAt));
   if (priorStalled) {
     return {
       action: "block",

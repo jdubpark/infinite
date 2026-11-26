@@ -5,6 +5,7 @@ import { describeTeamWaitReasons, PROVIDER_INPUT_REASON, SESSION_SLOT_REASON } f
 import { MEMBER_STALL_REASON } from "../packages/host/src/stall-recovery.js";
 import type { ProviderLimit } from "../packages/host/src/provider-limits.js";
 import type { TeamMember, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
+import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
 const T0 = "2026-11-26T00:00:00.000Z";
 const NOW_MS = Date.parse("2026-11-26T00:10:00.000Z");
@@ -121,7 +122,7 @@ test("describeTeamWaitReasons reports owner-decision, deduplicated provider-prom
     provider: "claude",
     spinnerOnlySince: "2026-11-26T00:01:00.000Z",
   });
-  const codexWorker = member({ memberId: "m-2", taskId: "task-b", provider: "codex" });
+  const codexWorker = member({ memberId: "m-2", sessionId: "s-other", taskId: "task-b", provider: "codex" });
   const run = baseRun({
     status: "needs-input",
     linearTracking: true,
@@ -315,4 +316,232 @@ test("describeTeamWaitReasons orders urgent reasons first and clips long interpo
   }
   assert.ok(reasons[0]!.summary.endsWith("..."));
   assert.ok(reasons[3]!.summary.endsWith("..."));
+});
+
+test("describeTeamWaitReasons scopes permission prompts, attributes provider limits only to affected members, and aligns discovery slots", () => {
+  const mActive = member({ memberId: "m-active", sessionId: "s-active", taskId: "task-a", spinnerOnlySince: "2026-11-26T00:05:00.000Z" });
+  const closedPromptRun = baseRun({
+    members: [mActive],
+    permissionDecisions: [
+      {
+        id: "perm-closed",
+        revision: 1,
+        policyHash: "p",
+        targetMemberId: "m-active",
+        targetSessionId: "s-active",
+        targetCwd: mActive.cwd,
+        promptId: 1,
+        promptHash: "h1",
+        evidenceHash: "e1",
+        prompt: { id: 1, kind: "permission", title: "Old prompt", options: [], acceptsText: false, source: "screen" },
+        option: 0,
+        expiresAt: "2026-11-26T01:00:00.000Z",
+        answerRequestId: "req-1",
+        status: "escalated",
+        promptClosedAt: "2026-11-26T00:04:00.000Z",
+      },
+      {
+        id: "perm-old-session",
+        revision: 1,
+        policyHash: "p",
+        targetMemberId: "m-active",
+        targetSessionId: "s-previous",
+        targetCwd: mActive.cwd,
+        promptId: 2,
+        promptHash: "h2",
+        evidenceHash: "e2",
+        prompt: { id: 2, kind: "permission", title: "Old session prompt", options: [], acceptsText: false, source: "screen" },
+        option: 0,
+        expiresAt: "2026-11-26T01:00:00.000Z",
+        answerRequestId: "req-2",
+        status: "escalated",
+      },
+    ],
+  });
+  const closedReasons = describeTeamWaitReasons(closedPromptRun, [], NOW_MS);
+  assert.equal(closedReasons.some((r) => r.kind === "provider-prompt"), false);
+  assert.equal(closedReasons.some((r) => r.kind === "spinner-only" && r.memberId === "m-active"), true);
+
+  const liveFilteredRun = baseRun({
+    members: [mActive],
+    permissionDecisions: [
+      {
+        id: "perm-live",
+        revision: 1,
+        policyHash: "p",
+        targetMemberId: "m-active",
+        targetSessionId: "s-active",
+        targetCwd: mActive.cwd,
+        promptId: 3,
+        promptHash: "h3",
+        evidenceHash: "e3",
+        prompt: { id: 3, kind: "permission", title: "Prompt", options: [], acceptsText: false, source: "screen" },
+        option: 0,
+        expiresAt: "2026-11-26T01:00:00.000Z",
+        answerRequestId: "req-3",
+        status: "escalated",
+      },
+    ],
+  });
+  assert.equal(
+    describeTeamWaitReasons(liveFilteredRun, [], NOW_MS, { livePrompts: new Map([["s-active", null]]) }).some(
+      (r) => r.kind === "provider-prompt",
+    ),
+    false,
+  );
+  assert.equal(
+    describeTeamWaitReasons(liveFilteredRun, [], NOW_MS, { livePrompts: new Map([["s-active", { id: 3, hash: "h3" }]]) }).some(
+      (r) => r.kind === "provider-prompt" && r.decisionId === "perm-live",
+    ),
+    true,
+  );
+
+  const globalCodexLimit: ProviderLimit[] = [
+    {
+      provider: "codex",
+      detectedAt: "2026-11-26T00:04:00.000Z",
+      resetsAt: "2026-11-26T02:00:00.000Z",
+      expiresAt: "2026-11-26T02:00:00.000Z",
+      sessionId: "s-other-team",
+      runId: "run-other",
+      confidence: "corroborated",
+    },
+  ];
+  const unaffectedRun = baseRun({
+    id: "run-2",
+    provider: "codex",
+    members: [member({ memberId: "m-healthy", sessionId: "s-healthy", provider: "codex", status: "running" })],
+  });
+  assert.equal(describeTeamWaitReasons(unaffectedRun, globalCodexLimit, NOW_MS).some((r) => r.kind === "provider-limit"), false);
+
+  const mixedDeferredRun = baseRun({
+    id: "run-3",
+    provider: "codex",
+    members: [
+      member({ memberId: "m-running", sessionId: "s-running", taskId: "task-1", provider: "codex", status: "running" }),
+      member({ memberId: "m-def-1", sessionId: "s-def-1", taskId: "task-2", provider: "codex", status: "queued", pendingLimit: true }),
+      member({ memberId: "m-def-2", sessionId: "s-def-2", taskId: "task-3", provider: "codex", status: "queued", pendingLimit: true }),
+    ],
+  });
+  const deferredLimitReasons = describeTeamWaitReasons(mixedDeferredRun, globalCodexLimit, NOW_MS).filter((r) => r.kind === "provider-limit");
+  assert.deepEqual(
+    deferredLimitReasons.map((r) => r.memberId),
+    ["m-def-1", "m-def-2"],
+  );
+  assert.ok(deferredLimitReasons.every((r) => r.resetsAt === "2026-11-26T02:00:00.000Z"));
+
+  const discoveryDeferredLimit = baseRun({
+    status: "discovering",
+    parallelism: 1,
+    discovery: {
+      revision: 1,
+      summary: "Explore",
+      tasks: [
+        { id: "sc-1", title: "Scout 1", instructions: "Read 1", status: "running", memberId: "m-sc-1" },
+        { id: "sc-2", title: "Scout 2", instructions: "Read 2", status: "pending" },
+      ],
+    },
+    members: [member({ memberId: "m-sc-1", role: "scout", taskId: "sc-1", status: "queued", pendingLimit: true })],
+  });
+  assert.equal(describeTeamWaitReasons(discoveryDeferredLimit, [], NOW_MS).some((r) => r.kind === "worker-slot"), false);
+
+  const discoveryDeferredCapacity = baseRun({
+    status: "discovering",
+    parallelism: 1,
+    discovery: {
+      revision: 1,
+      summary: "Explore",
+      tasks: [
+        { id: "sc-1", title: "Scout 1", instructions: "Read 1", status: "running", memberId: "m-sc-1" },
+        { id: "sc-2", title: "Scout 2", instructions: "Read 2", status: "pending" },
+      ],
+    },
+    members: [member({ memberId: "m-sc-1", role: "scout", taskId: "sc-1", status: "queued", pendingCapacity: true })],
+  });
+  const capReasons = describeTeamWaitReasons(discoveryDeferredCapacity, [], NOW_MS).filter((r) => r.kind === "worker-slot");
+  assert.equal(capReasons.length, 1);
+  assert.equal(capReasons[0]?.memberId, "m-sc-1");
+
+  const discoveryFull = baseRun({
+    status: "discovering",
+    parallelism: 1,
+    discovery: {
+      revision: 1,
+      summary: "Explore",
+      tasks: [
+        { id: "sc-1", title: "Scout 1", instructions: "Read 1", status: "running", memberId: "m-sc-1" },
+        { id: "sc-2", title: "Scout 2", instructions: "Read 2", status: "pending" },
+      ],
+    },
+    members: [member({ memberId: "m-sc-1", role: "scout", taskId: "sc-1", status: "running" })],
+  });
+  const fullReasons = describeTeamWaitReasons(discoveryFull, [], NOW_MS).filter((r) => r.kind === "worker-slot");
+  assert.equal(fullReasons.length, 1);
+  assert.equal(fullReasons[0]?.taskId, "sc-2");
+});
+
+test("TeamService restores active stage and stall detection after owner answers a PM question and retires obsolete escalated prompts", async () => {
+  const f = schedulerFixture();
+  try {
+    const pm1 = f.run.members[0]!;
+    const decisionId = randomUUID();
+    pm1.status = "waiting";
+    pm1.report = { kind: "question", question: "Use strict mode?", options: ["Yes", "No"] };
+    f.run.status = "needs-input";
+    f.run.decisions = [{ id: decisionId, memberId: pm1.memberId, revision: 1, question: "Use strict mode?", options: ["Yes", "No"], createdAt: T0 }];
+    f.writeTeam();
+
+    const teams = f.openTeam();
+    const scheduler = teams as unknown as {
+      record(id: string): { run: TeamRun; pending?: unknown };
+      step(stored: { run: TeamRun; pending?: unknown }): Promise<void>;
+    };
+    await teams.answer(f.run.id, decisionId, { requestId: randomUUID(), revision: 1, text: "Yes" });
+    const stored = scheduler.record(f.run.id);
+    await scheduler.step(stored);
+    assert.equal(stored.run.status, "planning");
+    assert.equal(stored.run.members.length, 2);
+    const pm2 = stored.run.members[1]!;
+    assert.equal(pm2.status, "queued");
+
+    await scheduler.step(stored);
+    assert.equal(pm2.status, "running");
+    assert.equal(stored.run.status, "planning");
+
+    const quietAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    pm2.startedAt = quietAt;
+    pm2.lastActivityAt = quietAt;
+    stored.run.permissionDecisions = [
+      {
+        id: randomUUID(),
+        revision: 1,
+        policyHash: "p",
+        targetMemberId: pm2.memberId,
+        targetSessionId: pm2.sessionId,
+        targetCwd: pm2.cwd,
+        promptId: 42,
+        promptHash: "h42",
+        evidenceHash: "e42",
+        prompt: { id: 42, kind: "permission", title: "Old prompt", options: [], acceptsText: false, source: "screen" },
+        option: 0,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        answerRequestId: randomUUID(),
+        status: "escalated",
+      },
+    ];
+    await scheduler.step(stored);
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && (stored.pending || stored.run.members.length < 3)) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    await teams.idle();
+
+    const view = teams.get(f.run.id);
+    assert.equal(view.members.length, 3);
+    assert.equal(view.members[2]?.stalledSourceMemberId, pm2.memberId);
+    assert.ok(view.permissionDecisions?.[0]?.promptClosedAt);
+    assert.equal(view.waitReasons?.some((r) => r.kind === "provider-prompt"), false);
+  } finally {
+    f.close();
+  }
 });

@@ -26,25 +26,31 @@ const SECONDS_TIMER_RE = /\b\d+(?:\.\d+)?s\b/g;
 const TOKEN_TICKER_RE = /(?:[↑↓]\s*)?\b\d[\d,]*(?:\.\d+)?[kKmM]?\s+tokens?\b/gi;
 const COST_TICKER_RE = /\$\d[\d,]*(?:\.\d+)?\b/g;
 const LABELED_TICKER_RE = /\b(?:tokens?|cost)\s*[:=]\s*\$?\d[\d,]*(?:\.\d+)?[kKmM]?\b/gi;
-const STATUS_CUE_RE = /\b(?:tokens?|cost|context|esc to interrupt|cached|reasoning|claude|codex|opencode|grok)\b|[·•|]/i;
+const PROVIDER_CHROME_RE =
+  /\b(?:esc to interrupt|ctrl\+c to interrupt|context\s+(?:left|used|remaining)|\d+(?:\.\d+)?%\s*context|context\s*[:=]\s*\d+(?:\.\d+)?%|\d[\d,]*(?:\.\d+)?[kKmM]?\s+tokens?|tokens?\s*[:=]\s*\d)\b/i;
+const PROVIDER_MODEL_STATUS_RE =
+  /^(?:[\s\u2800-\u28ff◐◓◑◒◴◷◶◵·✢✳✶✻✽•◦]*)(?:claude(?:-[a-z0-9._-]+)?|gpt-[a-z0-9._-]+|codex|opencode|grok(?:-[a-z0-9._-]+)?|o[134](?:-[a-z0-9._-]+)?)\b.*(?:[|·•]\s*(?:\$\d|\d+(?:\.\d+)?%|\d[\d,]*(?:\.\d+)?[kKmM]?\s+tokens?|\d{1,2}:\d{2}|context|cached|reasoning))/i;
 const STATUS_PERCENT_RE = /\b\d+(?:\.\d+)?%/g;
 const EMPTY_PARENS_RE = /\(\s*[·•,|/\-\s]*\)/g;
+
+function isProviderStatusRow(line: string): boolean {
+  return PROVIDER_CHROME_RE.test(line) || PROVIDER_MODEL_STATUS_RE.test(line);
+}
 
 function normalizeLine(raw: string, provider: Provider): string {
   let line = raw.replace(ANSI_ESCAPE_RE, "").replace(/\s+$/g, "");
   if (!line) return "";
-  const statusLine = STATUS_CUE_RE.test(line);
+  const statusLine = isProviderStatusRow(line);
   line = line
     .replace(BRAILLE_SPINNER_RE, " ")
     .replace(CIRCLE_SPINNER_RE, " ")
     .replace(ASCII_SPIN_TOKEN_RE, " ");
   if (provider === "claude") line = line.replace(CLAUDE_SPINNER_RE, " ");
   if (provider === "codex") line = line.replace(CODEX_SPINNER_RE, " ");
-  line = line
-    .replace(LABELED_TICKER_RE, (match) => match.split(/[:=]/)[0] + ":")
-    .replace(TOKEN_TICKER_RE, " ");
   if (statusLine) {
     line = line
+      .replace(LABELED_TICKER_RE, (match) => match.split(/[:=]/)[0] + ":")
+      .replace(TOKEN_TICKER_RE, " ")
       .replace(COST_TICKER_RE, " ")
       .replace(STATUS_PERCENT_RE, " ");
   }
@@ -66,6 +72,18 @@ export function substantiveScreenFingerprint(lines: readonly string[], provider:
     if (clean) normalized.push(clean);
   }
   return normalized.join("\n");
+}
+
+export function rebaselineScreenActivity(
+  state: ScreenActivityState | undefined,
+  lines: readonly string[],
+  provider: Provider,
+): ScreenActivityState {
+  const fingerprint = substantiveScreenFingerprint(lines, provider);
+  return {
+    ...state,
+    fingerprint,
+  };
 }
 
 export function evaluateScreenActivity(
@@ -101,6 +119,20 @@ export function evaluateScreenActivity(
     };
   }
   if (fingerprint !== state.fingerprint) {
+    if (!rawOutputSinceCheck) {
+      return {
+        nextState: {
+          fingerprint,
+          lastSubstantiveAtMs: state.lastSubstantiveAtMs,
+          ...(state.spinnerOnlySinceMs !== undefined ? { spinnerOnlySinceMs: state.spinnerOnlySinceMs } : {}),
+        },
+        substantiveChange: false,
+        spinnerOnly: state.spinnerOnlySinceMs !== undefined,
+        ...(state.spinnerOnlySinceMs !== undefined
+          ? { spinnerOnlySince: new Date(state.spinnerOnlySinceMs).toISOString() }
+          : {}),
+      };
+    }
     return {
       nextState: {
         fingerprint,

@@ -1,5 +1,6 @@
 import {
   evaluateScreenActivity,
+  rebaselineScreenActivity,
   type Attention,
   type Provider,
   type ScreenActivityState,
@@ -12,6 +13,7 @@ export interface ScreenCheckOutcome {
   freshOutput: boolean;
   substantiveChange: boolean;
   spinnerOnly: boolean;
+  rawOutputSinceCheck: boolean;
 }
 
 function withoutSpinnerOnly(attention: Attention): Attention {
@@ -23,15 +25,26 @@ function withoutSpinnerOnly(attention: Attention): Attention {
 export class WorkerScreenActivity {
   private screenState: ScreenActivityState | undefined;
   private lastSubstantiveOutputAt: number;
-  private rawOutputSinceCheck = false;
+  private pendingRawOutputAt: number | undefined;
+  private lastRawOutputAt: number | undefined;
 
   constructor(private readonly idleAfterMs: number, initialMs = Date.now()) {
     this.lastSubstantiveOutputAt = initialMs;
   }
 
   noteRawOutput(nowMs = Date.now()): void {
-    void nowMs;
-    this.rawOutputSinceCheck = true;
+    this.pendingRawOutputAt =
+      this.pendingRawOutputAt === undefined ? nowMs : Math.max(this.pendingRawOutputAt, nowMs);
+    this.lastRawOutputAt =
+      this.lastRawOutputAt === undefined ? nowMs : Math.max(this.lastRawOutputAt, nowMs);
+  }
+
+  hasPendingRawOutput(): boolean {
+    return this.pendingRawOutputAt !== undefined;
+  }
+
+  rebaseline(lines: readonly string[], provider: Provider): void {
+    this.screenState = rebaselineScreenActivity(this.screenState, lines, provider);
   }
 
   evaluate(
@@ -41,8 +54,9 @@ export class WorkerScreenActivity {
     idleScreen: boolean,
     nowMs = Date.now(),
   ): ScreenCheckOutcome {
-    const rawThisCheck = this.rawOutputSinceCheck;
-    this.rawOutputSinceCheck = false;
+    const rawOutputAt = this.pendingRawOutputAt;
+    const rawThisCheck = rawOutputAt !== undefined;
+    this.pendingRawOutputAt = undefined;
     const syncedState: ScreenActivityState | undefined = this.screenState
       ? {
           ...this.screenState,
@@ -54,19 +68,23 @@ export class WorkerScreenActivity {
     const result = evaluateScreenActivity(syncedState, lines, provider, rawThisCheck, nowMs);
     this.screenState = result.nextState;
 
-    const at = new Date(nowMs).toISOString();
     let nextAttention = attention;
     let changed = false;
+    let substantiveObservedAt: number | undefined;
 
     if (result.substantiveChange) {
-      this.lastSubstantiveOutputAt = nowMs;
+      substantiveObservedAt = rawOutputAt ?? this.lastRawOutputAt ?? nowMs;
+      if (substantiveObservedAt > this.lastSubstantiveOutputAt) {
+        this.lastSubstantiveOutputAt = substantiveObservedAt;
+      }
       const cleared = withoutSpinnerOnly(nextAttention);
       if (cleared !== nextAttention) {
         nextAttention = cleared;
         changed = true;
       }
-      if (nextAttention.hooks === "none" && nextAttention.lastActivityAt !== at) {
-        nextAttention = { ...nextAttention, lastActivityAt: at };
+      const prevActivityMs = Date.parse(nextAttention.lastActivityAt);
+      if (nextAttention.hooks === "none" && (!Number.isFinite(prevActivityMs) || substantiveObservedAt > prevActivityMs)) {
+        nextAttention = { ...nextAttention, lastActivityAt: new Date(substantiveObservedAt).toISOString() };
         changed = true;
       }
     }
@@ -93,7 +111,8 @@ export class WorkerScreenActivity {
       idleScreen;
     const freshOutput =
       result.substantiveChange &&
-      this.lastSubstantiveOutputAt > Date.parse(nextAttention.since);
+      substantiveObservedAt !== undefined &&
+      substantiveObservedAt > Date.parse(nextAttention.since);
 
     return {
       attention: nextAttention,
@@ -102,6 +121,7 @@ export class WorkerScreenActivity {
       freshOutput,
       substantiveChange: result.substantiveChange,
       spinnerOnly: result.spinnerOnly,
+      rawOutputSinceCheck: rawThisCheck,
     };
   }
 

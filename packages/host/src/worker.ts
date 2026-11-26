@@ -532,7 +532,7 @@ function checkScreen() {
     const at = new Date(nowMs).toISOString();
     const activity = screenActivity.evaluate(attention, lines, provider, isIdleScreen(lines, provider), nowMs);
     if (activity.changed) publish(activity.attention);
-    watchLimit(lines, nowMs, activity.substantiveChange);
+    watchLimit(lines, nowMs, activity.rawOutputSinceCheck);
     let decision = screenDecision(attention, detected, activity.idle, activity.freshOutput, at);
     const open = attention.prompt;
     const replaced =
@@ -1312,7 +1312,9 @@ const server = createServer((socket) => {
         result = await serialize(async () => {
           checkControl(request);
           await withTerminalBarrier(() => {
+            if (screenActivity.hasPendingRawOutput()) checkScreen();
             terminal.resize(request.cols, request.rows);
+            screenActivity.rebaseline(screen().split("\n"), provider);
             const terminalSize = { cols: terminal.cols, rows: terminal.rows };
             if (state.terminalSize?.cols !== terminalSize.cols || state.terminalSize?.rows !== terminalSize.rows) {
               state = { ...state, terminalSize };
@@ -1613,6 +1615,7 @@ server.listen(workerSocket, async () => {
     sizeIndex.append(runningEvent.seq, { cols: terminal.cols, rows: terminal.rows });
     persist();
     const output = (data: string) => {
+      const arrivedAt = Date.now();
       pending += data;
       try {
         if (usageLines) for (const event of usageLines.push(data)) {
@@ -1629,7 +1632,7 @@ server.listen(workerSocket, async () => {
       } catch {
         recordingFailure();
       }
-      screenActivity.noteRawOutput(Date.now());
+      screenActivity.noteRawOutput(arrivedAt);
       const flushed = pending.length >= 256 * 1024;
       if (flushed) try { flush(); } catch {}
       if (!flushTimer)

@@ -6,6 +6,8 @@ import {
   detectPrompt,
   evaluateScreenActivity,
   initialAttention,
+  rebaselineScreenActivity,
+  screenDecision,
   substantiveScreenFingerprint,
   type Attention,
   type SignalEvent,
@@ -206,4 +208,133 @@ test("WorkerScreenActivity only sets spinnerOnlySince when attention.state is wo
     const res = tracker.evaluate(nonWorking, ["⠹ Working (3s)"], "codex", false, t0 + 2000);
     assert.equal(res.attention.spinnerOnlySince, undefined);
   }
+});
+
+test("WorkerScreenActivity uses PTY arrival time so same-chunk text plus OSC turn-end does not flip back to working", () => {
+  const t0 = Date.parse("2026-11-26T04:00:00.000Z");
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const tracker = new WorkerScreenActivity(3000, t0);
+
+  let att: Attention = initialAttention(iso(t0), true);
+  tracker.noteRawOutput(t0 + 100);
+  att = tracker.evaluate(att, ["• Working (1s)"], "codex", false, t0 + 140).attention;
+
+  tracker.noteRawOutput(t0 + 1000);
+  att = applySignal(att, {
+    seq: 2,
+    at: iso(t0 + 1002),
+    type: "signal",
+    data: { kind: "turn-end", backgroundTasks: 0, source: "osc", provider: "codex" },
+  });
+  assert.equal(att.state, "turn-finished");
+  assert.equal(att.since, iso(t0 + 1002));
+
+  const delayed = tracker.evaluate(att, ["• Working (2s)", "Completed the requested change."], "codex", false, t0 + 1040);
+  assert.equal(delayed.substantiveChange, true);
+  assert.equal(delayed.freshOutput, false);
+  assert.equal(delayed.attention.lastActivityAt, iso(t0 + 1002));
+  assert.equal(screenDecision(delayed.attention, null, delayed.idle, delayed.freshOutput, iso(t0 + 1040)).kind, "none");
+
+  tracker.noteRawOutput(t0 + 5000);
+  const nextTurn = tracker.evaluate(
+    delayed.attention,
+    ["• Working (2s)", "Completed the requested change.", "Starting follow-up command."],
+    "codex",
+    false,
+    t0 + 5040,
+  );
+  assert.equal(nextTurn.substantiveChange, true);
+  assert.equal(nextTurn.freshOutput, true);
+  assert.equal(nextTurn.attention.lastActivityAt, iso(t0 + 5000));
+  assert.equal(screenDecision(nextTurn.attention, null, nextTurn.idle, nextTurn.freshOutput, iso(t0 + 5040)).kind, "working");
+});
+
+test("terminal resize reflow does not credit provider activity or wake an idle session", () => {
+  const t0 = Date.parse("2026-11-26T05:00:00.000Z");
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const wide = ["Finished building bundle for release target", "› "];
+  const narrow = ["Finished building bundle", "for release target", "› "];
+
+  const s1 = evaluateScreenActivity(undefined, wide, "codex", true, t0);
+  assert.equal(s1.substantiveChange, true);
+  const reflowNoOutput = evaluateScreenActivity(s1.nextState, narrow, "codex", false, t0 + 5000);
+  assert.equal(reflowNoOutput.substantiveChange, false);
+  assert.equal(reflowNoOutput.nextState.lastSubstantiveAtMs, t0);
+  assert.equal(reflowNoOutput.nextState.fingerprint, substantiveScreenFingerprint(narrow, "codex"));
+
+  const rebased = rebaselineScreenActivity(s1.nextState, narrow, "codex");
+  assert.equal(rebased.lastSubstantiveAtMs, t0);
+  assert.equal(rebased.fingerprint, substantiveScreenFingerprint(narrow, "codex"));
+
+  const tracker = new WorkerScreenActivity(3000, t0);
+  let att: Attention = initialAttention(iso(t0), true);
+  tracker.noteRawOutput(t0 + 100);
+  att = tracker.evaluate(att, wide, "codex", true, t0 + 100).attention;
+  att = { ...att, state: "idle", since: iso(t0 + 4000) };
+
+  tracker.rebaseline(narrow, "codex");
+  const afterResize = tracker.evaluate(att, narrow, "codex", true, t0 + 5000);
+  assert.equal(afterResize.substantiveChange, false);
+  assert.equal(afterResize.freshOutput, false);
+  assert.equal(afterResize.rawOutputSinceCheck, false);
+  assert.equal(afterResize.idle, true);
+  assert.equal(afterResize.attention.lastActivityAt, iso(t0 + 100));
+
+  tracker.noteRawOutput(t0 + 5100);
+  const afterSigwinchRedraw = tracker.evaluate(afterResize.attention, narrow, "codex", true, t0 + 5100);
+  assert.equal(afterSigwinchRedraw.substantiveChange, false);
+  assert.equal(afterSigwinchRedraw.freshOutput, false);
+  assert.equal(afterSigwinchRedraw.rawOutputSinceCheck, true);
+  assert.equal(afterSigwinchRedraw.attention.lastActivityAt, iso(t0 + 100));
+});
+
+test("substantiveScreenFingerprint preserves progress percentages and amounts outside provider chrome rows", () => {
+  assert.notEqual(
+    substantiveScreenFingerprint(["Downloading artifact | 42%"], "codex"),
+    substantiveScreenFingerprint(["Downloading artifact | 43%"], "codex"),
+  );
+  assert.notEqual(
+    substantiveScreenFingerprint(["• Downloading artifact 42%"], "codex"),
+    substantiveScreenFingerprint(["• Downloading artifact 43%"], "codex"),
+  );
+  assert.notEqual(
+    substantiveScreenFingerprint(["Syncing layers · 42% · $10.00"], "claude"),
+    substantiveScreenFingerprint(["Syncing layers · 43% · $11.00"], "claude"),
+  );
+  assert.notEqual(
+    substantiveScreenFingerprint(["Downloading codex-cli | 42%"], "codex"),
+    substantiveScreenFingerprint(["Downloading codex-cli | 43%"], "codex"),
+  );
+  assert.notEqual(
+    substantiveScreenFingerprint(["+ const cost = 42;"], "claude"),
+    substantiveScreenFingerprint(["+ const cost = 43;"], "claude"),
+  );
+  assert.equal(
+    substantiveScreenFingerprint(["claude-sonnet-4-5 | 42% | $0.04"], "claude"),
+    substantiveScreenFingerprint(["claude-sonnet-4-5 | 43% | $0.08"], "claude"),
+  );
+});
+
+test("WorkerScreenActivity exposes rawOutputSinceCheck independently of substantiveChange for limit corroboration", () => {
+  const t0 = Date.parse("2026-11-26T06:00:00.000Z");
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const tracker = new WorkerScreenActivity(3000, t0);
+  let att: Attention = initialAttention(iso(t0), true);
+
+  tracker.noteRawOutput(t0 + 100);
+  const first = tracker.evaluate(att, ["⠋ Working (1s)", "gpt-5-codex · ~/workspace · usage limited"], "codex", false, t0 + 100);
+  att = first.attention;
+  assert.equal(first.rawOutputSinceCheck, true);
+  assert.equal(first.substantiveChange, true);
+
+  tracker.noteRawOutput(t0 + 1000);
+  const spinnerRedraw = tracker.evaluate(att, ["⠙ Working (2s)", "gpt-5-codex · ~/workspace · usage limited"], "codex", false, t0 + 1000);
+  att = spinnerRedraw.attention;
+  assert.equal(spinnerRedraw.rawOutputSinceCheck, true);
+  assert.equal(spinnerRedraw.substantiveChange, false);
+  assert.equal(spinnerRedraw.spinnerOnly, true);
+
+  const quiet = tracker.evaluate(att, ["⠙ Working (2s)", "gpt-5-codex · ~/workspace · usage limited"], "codex", false, t0 + 2000);
+  assert.equal(quiet.rawOutputSinceCheck, false);
+  assert.equal(quiet.substantiveChange, false);
 });

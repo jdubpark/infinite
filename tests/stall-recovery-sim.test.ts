@@ -254,6 +254,19 @@ function assertInvariants(sim: SimState, where: string): void {
         `${where}: source member ${sourceId} produced ${replacements.length} replacements (${replacements.join(", ")})`,
       );
     }
+    const replacement = run.members.find((m) => m.memberId === replacements[0])!;
+    if (replacement.role === "implementer") {
+      const latestForTask = run.members
+        .filter((m) => m.revision === replacement.revision && m.role === "implementer" && m.taskId === replacement.taskId)
+        .at(-1);
+      const task = run.tasks.find((t) => t.id === replacement.taskId);
+      if (latestForTask?.memberId === replacement.memberId && task && task.memberId !== replacement.memberId) {
+        throw new InvariantFailure(
+          "I1_NO_DUPLICATE_REPLACEMENT_ACROSS_RESTART",
+          `${where}: replacement ${replacement.memberId} does not own task ${task.id} (task.memberId=${task.memberId})`,
+        );
+      }
+    }
   }
 
   for (const m of run.members) {
@@ -307,23 +320,30 @@ function assertInvariants(sim: SimState, where: string): void {
     }
   }
 
-  const stalledPerAssignment = new Map<string, TeamMember[]>();
+  const byAssignment = new Map<string, TeamMember[]>();
   for (const m of run.members) {
-    if (!m.stalledAt && !bySource.has(m.memberId)) continue;
     const key = `${m.revision}:${m.role}:${m.taskId ?? ""}`;
-    const list = stalledPerAssignment.get(key) ?? [];
+    const list = byAssignment.get(key) ?? [];
     list.push(m);
-    stalledPerAssignment.set(key, list);
+    byAssignment.set(key, list);
   }
-  for (const [key, list] of stalledPerAssignment) {
-    const nonReportedForKey = run.members.filter(
-      (m) => `${m.revision}:${m.role}:${m.taskId ?? ""}` === key && !m.report,
-    );
-    if (list.length >= 2 && nonReportedForKey.length > 2) {
-      throw new InvariantFailure(
-        "I4_SECOND_STALL_BLOCKS_INSTEAD_OF_LOOPING",
-        `${where}: assignment ${key} spawned ${nonReportedForKey.length} attempts after second stall`,
-      );
+  for (const [key, attempts] of byAssignment) {
+    let segmentStalls = 0;
+    let segmentNonReported = 0;
+    for (const m of attempts) {
+      if (m.report) {
+        segmentStalls = 0;
+        segmentNonReported = 0;
+        continue;
+      }
+      segmentNonReported += 1;
+      if (m.stalledAt || bySource.has(m.memberId)) segmentStalls += 1;
+      if (segmentStalls >= 2 && segmentNonReported > 2) {
+        throw new InvariantFailure(
+          "I4_SECOND_STALL_BLOCKS_INSTEAD_OF_LOOPING",
+          `${where}: assignment ${key} spawned ${segmentNonReported} attempts after second stall`,
+        );
+      }
     }
   }
 }
@@ -536,18 +556,30 @@ function stepHostStall(sim: SimState, r: Rand, where: string): void {
 
     if (replace.action === "replace") {
       const next = spawnMember(sim, member.taskId ?? "task-a", rt.attention.hooks, member.memberId);
+      const task = run.tasks.find((t) => t.id === member.taskId && t.memberId === member.memberId);
+      if (task) {
+        task.memberId = next.memberId;
+        task.status = "running";
+      }
       run.members.push(next);
       bump(sim.counts, "action:stall-replaced");
 
       if (r.chance(0.42)) {
-        member.status = "unavailable";
+        sim.run = JSON.parse(JSON.stringify(sim.run)) as TeamRun;
+        const reloadedMember = sim.run.members.find((m) => m.memberId === member.memberId);
+        const reloadedTask = sim.run.tasks.find((t) => t.id === member.taskId);
+        if (reloadedTask && reloadedTask.memberId !== next.memberId) {
+          throw new InvariantFailure(
+            "I1_NO_DUPLICATE_REPLACEMENT_ACROSS_RESTART",
+            `${where}: reloaded task ${reloadedTask.id} owned by ${reloadedTask.memberId}, expected ${next.memberId}`,
+          );
+        }
+        if (reloadedMember) reloadedMember.status = "unavailable";
         bump(sim.counts, "fault:crash-after-spawn-before-source-stopped");
         assertInvariants(sim, where);
         return;
       }
 
-      const task = run.tasks.find((t) => t.id === member.taskId && t.memberId === member.memberId);
-      if (task) task.memberId = next.memberId;
       assertInvariants(sim, where);
       return;
     }
@@ -631,6 +663,19 @@ function simulate(seed: number, counts: Record<string, number>, mutation?: Invar
           rt.controlBusy = !rt.controlBusy;
         } else if (draw < 0.84) {
           rt.pendingReports.push({ kind: "result", summary: "Completed task" });
+        } else if (draw < 0.87 && target.role === "implementer") {
+          const task = sim.run.tasks.find((t) => t.id === target.taskId && t.memberId === target.memberId);
+          if (task && !task.escalation && sim.run.members.length < (sim.run.goal?.maxMembers ?? 60)) {
+            target.report = { kind: "escalate", reason: "Needs stronger profile" };
+            target.status = "stopped";
+            target.reportedAt = iso(sim.nowMs);
+            task.escalation = { toProfileId: "strong", reason: "Needs stronger profile", memberId: target.memberId, at: iso(sim.nowMs) };
+            const escalated = spawnMember(sim, task.id, rt.attention.hooks);
+            task.memberId = escalated.memberId;
+            task.status = "running";
+            sim.run.members.push(escalated);
+            bump(sim.counts, "event:task-escalated");
+          }
         }
       }
     }
@@ -753,7 +798,7 @@ test("evaluateStallRecovery guards reject non-active run statuses, non-running m
     phase,
   });
 
-  for (const status of ["paused", "cancelled", "blocked", "needs-input", "ready-for-review", "merged", "no-change"] as const) {
+  for (const status of ["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"] as const) {
     const m = makeMember();
     const res = evaluateStallRecovery(baseArgs(makeRun({ status, members: [m] }), m));
     assert.equal(res.action, "none");
@@ -886,4 +931,53 @@ test("evaluateStallRecovery guards reject non-active run statuses, non-running m
     baseArgs(makeRun({ members: [stalledWithSingleSourceLimit] }), stalledWithSingleSourceLimit, "replace"),
   );
   assert.equal(replaceAfterSingleSourceLimit.action, "replace");
+
+  const escalatedOld = makeMember({ memberId: "m-esc-1", sessionId: "s-esc-1", status: "stopped", report: { kind: "escalate", reason: "Needs stronger model" } });
+  const escalatedNew = makeMember({ memberId: "m-esc-2", sessionId: "s-esc-2", status: "running" });
+  const escalatedRun = makeRun({
+    tasks: [{ id: "task-a", title: "A", instructions: "A", paths: ["a.ts"], dependsOn: [], revision: 1, status: "running", memberId: "m-esc-2" }],
+    members: [escalatedOld, escalatedNew],
+  });
+  assert.equal(evaluateStallRecovery(baseArgs(escalatedRun, escalatedNew, "detect")).action, "initiate-stop");
+  assert.equal(evaluateStallRecovery(baseArgs(escalatedRun, escalatedNew, "replace")).action, "replace");
+
+  const pm1 = makeMember({
+    memberId: "pm-1", sessionId: "s-pm-1", role: "project-manager", taskId: undefined, status: "stopped",
+    report: { kind: "explore", summary: "Explore first", tasks: [{ id: "sc-1", title: "S1", instructions: "Read" }] },
+  });
+  const pm2 = makeMember({ memberId: "pm-2", sessionId: "s-pm-2", role: "project-manager", taskId: undefined, status: "running" });
+  const postDiscoveryRun = makeRun({
+    status: "planning", tasks: [], members: [pm1, pm2],
+    discovery: { revision: 1, summary: "Explore first", completedAt: iso(T0 + 1000), tasks: [{ id: "sc-1", title: "S1", instructions: "Read", status: "complete" }] },
+  });
+  assert.equal(evaluateStallRecovery(baseArgs(postDiscoveryRun, pm2, "detect")).action, "initiate-stop");
+  assert.equal(evaluateStallRecovery(baseArgs(postDiscoveryRun, pm2, "replace")).action, "replace");
+
+  const obsoletePm = makeMember({ memberId: "pm-old", sessionId: "s-pm-old", role: "project-manager", taskId: undefined, status: "running" });
+  const currentPm = makeMember({ memberId: "pm-cur", sessionId: "s-pm-cur", role: "project-manager", taskId: undefined, status: "queued" });
+  assert.equal(evaluateStallRecovery(baseArgs(makeRun({ status: "planning", tasks: [], members: [obsoletePm, currentPm] }), obsoletePm, "detect")).action, "none");
+
+  const answeredPm = makeMember({ memberId: "pm-ans-2", sessionId: "s-ans-2", role: "project-manager", taskId: undefined, status: "running" });
+  const needsInputAnsweredRun = makeRun({
+    status: "needs-input", tasks: [],
+    decisions: [{ id: "d-ans", memberId: "pm-ans-1", revision: 1, question: "Proceed?", options: ["Yes"], createdAt: iso(T0), answer: "Yes" }],
+    members: [
+      makeMember({ memberId: "pm-ans-1", sessionId: "s-ans-1", role: "project-manager", taskId: undefined, status: "stopped", report: { kind: "question", question: "Proceed?", options: ["Yes"] } }),
+      answeredPm,
+    ],
+  });
+  assert.equal(evaluateStallRecovery(baseArgs(needsInputAnsweredRun, answeredPm, "detect")).action, "initiate-stop");
+
+  const historicalEscMember = makeMember({ memberId: "m-hist", sessionId: "s-hist" });
+  const historicalEscRun = makeRun({
+    tasks: [{ id: "task-a", title: "A", instructions: "A", paths: ["a.ts"], dependsOn: [], revision: 1, status: "running", memberId: "m-hist" }],
+    members: [historicalEscMember],
+    permissionDecisions: [{
+      id: "pd-hist", revision: 1, policyHash: "p", targetMemberId: "m-hist", targetSessionId: "s-hist", targetCwd: historicalEscMember.cwd,
+      promptId: 9, promptHash: "h9", evidenceHash: "e9", prompt: { id: 9, kind: "permission", title: "Old prompt", options: [], acceptsText: false, source: "screen" },
+      option: 0, expiresAt: iso(T0 + 60_000), answerRequestId: "ar-hist", status: "escalated",
+    }],
+  });
+  assert.equal(evaluateStallRecovery({ ...baseArgs(historicalEscRun, historicalEscMember, "detect"), activePrompt: null }).action, "initiate-stop");
+  assert.equal(evaluateStallRecovery({ ...baseArgs(historicalEscRun, historicalEscMember, "detect"), attentionState: "needs-you", activePrompt: { id: 9, hash: "h9" } }).action, "none");
 });

@@ -1,5 +1,6 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
+import { closeSync, constants, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
+import type { IPty } from "node-pty";
 import { seal, unseal } from "./vault.js";
 import type { Event, TerminalSize } from "./types.js";
 
@@ -80,14 +81,31 @@ export function readTerminalSizeIndex(file: string, key: Buffer, sessionId: stri
   return { entries, intact: intact && entries.length > 0 };
 }
 
+export function holdTerminalOpen(pty: IPty): void {
+  const path: unknown = Reflect.get(pty, "ptsName");
+  if (typeof path !== "string") return;
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDWR | constants.O_NOCTTY);
+  } catch {
+    return;
+  }
+  pty.onExit(() => {
+    try {
+      closeSync(fd);
+    } catch {
+    }
+  });
+}
+
 export class TerminalBarrier {
-  private queue: (() => unknown)[] | undefined;
+  private queue: ((queued: boolean) => void)[] | undefined;
   private bytes = 0;
   private abort: ((error: Error) => void) | undefined;
 
-  dispatch(task: () => unknown, byteLength = 0): void {
+  dispatch(task: (queued: boolean) => void, byteLength = 0): void {
     if (!this.queue) {
-      task();
+      task(false);
       return;
     }
     this.queue.push(task);
@@ -118,8 +136,7 @@ export class TerminalBarrier {
       this.abort = undefined;
       const queued = this.queue;
       try {
-        for (let index = 0; index < queued.length; index++)
-          if (queued[index]() === true) await new Promise<void>(resolve => setImmediate(resolve));
+        for (const task of queued) task(true);
       } finally {
         this.queue = undefined;
       }

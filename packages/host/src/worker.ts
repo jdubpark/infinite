@@ -57,7 +57,7 @@ import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv } from "./worker-
 import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrustAsync } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
-import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize, TERMINAL_SIZE_INDEX_FILE, TerminalBarrier, TerminalSizeIndex } from "./terminal-size.js";
+import { DEFAULT_TERMINAL_SIZE, holdTerminalOpen, isPtyTerminalSize, TERMINAL_SIZE_INDEX_FILE, TerminalBarrier, TerminalSizeIndex } from "./terminal-size.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
@@ -1605,12 +1605,13 @@ server.listen(workerSocket, async () => {
       rows: terminal.rows,
       name: "xterm-256color",
     });
+    holdTerminalOpen(child);
     state = { ...state, status: "running", pid: child.pid, terminalSize: { cols: terminal.cols, rows: terminal.rows } };
     publish(attention);
     const runningEvent = journal.append("lifecycle", { status: "running", pid: child.pid, cols: terminal.cols, rows: terminal.rows });
     sizeIndex.append(runningEvent.seq, { cols: terminal.cols, rows: terminal.rows });
     persist();
-    const output = (data: string) => {
+    const output = (data: string, queued: boolean) => {
       pending += data;
       try {
         if (usageLines) for (const event of usageLines.push(data)) {
@@ -1629,8 +1630,7 @@ server.listen(workerSocket, async () => {
       }
       lastOutputAt = Date.now();
       outputSinceCheck = true;
-      const flushed = pending.length >= 256 * 1024;
-      if (flushed) try { flush(); } catch {}
+      if (!queued && pending.length >= 256 * 1024) try { flush(); } catch {}
       if (!flushTimer)
         flushTimer = setTimeout(() => {
           try {
@@ -1640,9 +1640,8 @@ server.listen(workerSocket, async () => {
           }
           checkScreen();
         }, 40);
-      return flushed;
     };
-    const onData = (data: string) => terminalBarrier.dispatch(() => output(data), Buffer.byteLength(data, "utf8"));
+    const onData = (data: string) => terminalBarrier.dispatch(queued => output(data, queued), Buffer.byteLength(data, "utf8"));
     child.onData(onData);
     const finalDrain = async () => {
       try {
@@ -1695,6 +1694,7 @@ server.listen(workerSocket, async () => {
         config.codeMode,
       );
       const pty = spawn(next.command, next.args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
+      holdTerminalOpen(pty);
       child = pty;
       state = { ...state, status: "running", pid: pty.pid };
       const resumedEvent = append("lifecycle", { status: "running", pid: pty.pid, cols: terminal.cols, rows: terminal.rows, permissionChannel: { event: "resumed" } });
@@ -1703,7 +1703,7 @@ server.listen(workerSocket, async () => {
       pty.onData(onData);
       pty.onExit(onExit);
     };
-    endSession = () => exited(0);
+    endSession = () => terminalBarrier.dispatch(() => exited(0));
   } catch (error) {
     state = { ...state, status: "exited", exitCode: 1 };
     publish(applyLifecycle(attention, "exited", new Date().toISOString()));

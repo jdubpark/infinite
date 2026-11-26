@@ -56,24 +56,34 @@ struct TeamSeed: Equatable, Sendable {
     }
 
     var managedByMission: Bool { !missionID.isEmpty }
+
+    var progressFraction: Double {
+        switch typedStatus {
+        case .readyForReview, .merged, .delivering: return 1.0
+        case .verifying, .reviewing: return 0.75
+        case .integrating: return 0.5
+        case .planning, .discovering, .implementing, .needsInput, .paused, .blocked, .noChange, .cancelled, .unknown:
+            return 0.25
+        }
+    }
 }
 
 enum TeamLoadState: Equatable, Sendable {
     case loading(seed: TeamSeed, error: String?)
-    case listSeed(TeamRun)
+    case listSeed(TeamRun, error: String?)
     case loaded(TeamRun, latestListRow: TeamRun?)
 
     var id: String {
         switch self {
         case .loading(let seed, _): return seed.id
-        case .listSeed(let run), .loaded(let run, _): return run.id
+        case .listSeed(let run, _), .loaded(let run, _): return run.id
         }
     }
 
     var run: TeamRun? {
         switch self {
         case .loading: return nil
-        case .listSeed(let run), .loaded(let run, _): return run
+        case .listSeed(let run, _), .loaded(let run, _): return run
         }
     }
 
@@ -83,49 +93,51 @@ enum TeamLoadState: Equatable, Sendable {
     }
 
     var loadError: String? {
-        if case .loading(_, let error) = self { return error }
-        return nil
+        switch self {
+        case .loading(_, let error), .listSeed(_, let error): return error
+        case .loaded: return nil
+        }
     }
 
     var title: String {
         switch self {
         case .loading(let seed, _): return seed.title
-        case .listSeed(let run), .loaded(let run, _): return run.title
+        case .listSeed(let run, _), .loaded(let run, _): return run.title
         }
     }
 
     var status: String {
         switch self {
         case .loading(let seed, _): return seed.status
-        case .listSeed(let run), .loaded(let run, _): return run.status
+        case .listSeed(let run, _), .loaded(let run, _): return run.status
         }
     }
 
     var statusLabel: String {
         switch self {
         case .loading(let seed, _): return seed.statusLabel
-        case .listSeed(let run), .loaded(let run, _): return run.statusLabel
+        case .listSeed(let run, _), .loaded(let run, _): return run.statusLabel
         }
     }
 
     var projectID: String {
         switch self {
         case .loading(let seed, _): return seed.projectID
-        case .listSeed(let run), .loaded(let run, _): return run.projectID
+        case .listSeed(let run, _), .loaded(let run, _): return run.projectID
         }
     }
 
     var missionID: String {
         switch self {
         case .loading(let seed, _): return seed.missionID
-        case .listSeed(let run), .loaded(let run, _): return run.missionID
+        case .listSeed(let run, _), .loaded(let run, _): return run.missionID
         }
     }
 
     var managedByMission: Bool {
         switch self {
         case .loading(let seed, _): return seed.managedByMission
-        case .listSeed(let run), .loaded(let run, _): return run.managedByMission
+        case .listSeed(let run, _), .loaded(let run, _): return run.managedByMission
         }
     }
 }
@@ -175,6 +187,8 @@ enum TeamLoadState: Equatable, Sendable {
     }
 
     private var pollGeneration = UUID()
+    private var latestPollAttempt: UInt64 = 0
+    private var inFlightPoll: (attempt: UInt64, task: Task<PollOutcome, Never>)?
     private lazy var freshness = DisplayFreshness { [weak self] in self?.displayStale = $0 }
 
     init(
@@ -195,7 +209,7 @@ enum TeamLoadState: Equatable, Sendable {
         role: String,
         sendRequest: @escaping @Sendable (RemoteClient, String, JSON?) async throws -> JSON = { try await $0.request($1, body: $2) }
     ) {
-        self.loadState = .listSeed(run)
+        self.loadState = .listSeed(run, error: nil)
         self.client = client
         self.role = role
         self.sendRequest = sendRequest
@@ -216,7 +230,7 @@ enum TeamLoadState: Equatable, Sendable {
         switch loadState {
         case .loading:
             loadState = .loaded(next, latestListRow: nil)
-        case .listSeed(let current):
+        case .listSeed(let current, _):
             guard Self.supersedes(next, current) else { return }
             loadState = .loaded(next, latestListRow: nil)
         case .loaded(let current, let latestListRow):
@@ -230,11 +244,11 @@ enum TeamLoadState: Equatable, Sendable {
     func observeListRow(_ next: TeamRun) {
         guard next.id == id else { return }
         switch loadState {
-        case .loading:
-            loadState = .listSeed(next)
-        case .listSeed(let current):
+        case .loading(_, let error):
+            loadState = .listSeed(next, error: error)
+        case .listSeed(let current, let error):
             guard Self.supersedes(next, current) else { return }
-            if next != current { loadState = .listSeed(next) }
+            if next != current { loadState = .listSeed(next, error: error) }
         case .loaded(let current, let listed):
             guard Self.supersedes(next, current) else { return }
             if listed != next, listed.map({ !Self.later($0, than: next) }) ?? true {
@@ -255,7 +269,7 @@ enum TeamLoadState: Equatable, Sendable {
         let token = UUID(), generation = pollGeneration
         refreshToken = token
         Task { [weak self] in
-            await self?.poll(generation)
+            _ = await self?.runPoll(generation, coalesce: false)
             if self?.refreshToken == token { self?.refreshToken = nil }
         }
     }
@@ -273,13 +287,21 @@ enum TeamLoadState: Equatable, Sendable {
     func setDisplayVisible(_ visible: Bool) {
         guard displayVisible != visible else { return }
         displayVisible = visible
-        if !visible { fresh = false }
+        if !visible {
+            fresh = false
+            latestPollAttempt &+= 1
+            inFlightPoll?.task.cancel()
+            inFlightPoll = nil
+        }
         updatePolling()
     }
 
     private func updatePolling() {
         guard pageShown && displayVisible else {
             pollGeneration = UUID()
+            latestPollAttempt &+= 1
+            inFlightPoll?.task.cancel()
+            inFlightPoll = nil
             pollTask?.cancel()
             pollTask = nil
             return
@@ -299,22 +321,53 @@ enum TeamLoadState: Equatable, Sendable {
     }
 
     func poll() async {
-        _ = await performPoll(pollGeneration)
+        _ = await runPoll(pollGeneration, coalesce: false)
     }
 
     private func poll(_ generation: UUID) async {
-        _ = await performPoll(generation)
+        _ = await runPoll(generation, coalesce: true)
     }
 
-    private func performPoll(_ generation: UUID) async -> PollOutcome {
+    private func runPoll(_ generation: UUID, coalesce: Bool) async -> PollOutcome {
         guard displayVisible, generation == pollGeneration else { return .skipped }
+        if coalesce, let active = inFlightPoll {
+            return await active.task.value
+        }
+        latestPollAttempt &+= 1
+        let attempt = latestPollAttempt
+        inFlightPoll?.task.cancel()
+        let task = Task<PollOutcome, Never> { [weak self] in
+            guard let self else { return .skipped }
+            return await self.executePoll(generation: generation, attempt: attempt)
+        }
+        inFlightPoll = (attempt, task)
+        let outcome = await task.value
+        if inFlightPoll?.attempt == attempt {
+            inFlightPoll = nil
+        }
+        return outcome
+    }
+
+    private func recordLoadError(_ message: String) {
+        switch loadState {
+        case .loading(let seed, _):
+            loadState = .loading(seed: seed, error: message)
+        case .listSeed(let run, _):
+            loadState = .listSeed(run, error: message)
+        case .loaded:
+            break
+        }
+    }
+
+    private func executePoll(generation: UUID, attempt: UInt64) async -> PollOutcome {
+        guard displayVisible, generation == pollGeneration, attempt == latestPollAttempt else { return .skipped }
         do {
             let value = try await sendRequest(client, "/teams/\(id)", nil)
-            guard displayVisible, generation == pollGeneration else { return .skipped }
+            guard displayVisible, generation == pollGeneration, attempt == latestPollAttempt else { return .skipped }
             let fetched = TeamRun(value)
             guard fetched.id == id else {
                 let message = "The server returned a mismatched team."
-                if case .loading(let seed, _) = loadState { loadState = .loading(seed: seed, error: message) }
+                recordLoadError(message)
                 if fresh { fresh = false }
                 freshness.failed()
                 return .failed(message)
@@ -325,10 +378,8 @@ enum TeamLoadState: Equatable, Sendable {
             freshness.recovered()
             return .updated
         } catch {
-            guard displayVisible, generation == pollGeneration else { return .skipped }
-            if case .loading(let seed, _) = loadState {
-                loadState = .loading(seed: seed, error: error.localizedDescription)
-            }
+            guard displayVisible, generation == pollGeneration, attempt == latestPollAttempt else { return .skipped }
+            recordLoadError(error.localizedDescription)
             if fresh { fresh = false }
             freshness.failed()
             return .failed(error.localizedDescription)
@@ -337,15 +388,15 @@ enum TeamLoadState: Equatable, Sendable {
 
     var managed: Bool { loadState.managedByMission }
     var canSteer: Bool {
-        guard let run else { return false }
+        guard case .loaded(let run, _) = loadState else { return false }
         return !managed && fresh && role != "viewer" && run.typedStatus != .cancelled && !(run.typedStatus == .blocked && run.value["continuable"].bool) && mutationState == .idle
     }
     var canOwn: Bool {
-        guard run != nil else { return false }
+        guard isLoaded else { return false }
         return !managed && fresh && role == "owner" && mutationState == .idle
     }
     var offersContinue: Bool {
-        guard let run else { return false }
+        guard case .loaded(let run, _) = loadState else { return false }
         return role == "owner" && run.typedStatus == .blocked && run.value["continuable"].bool && !managed
             && run.value["goal"] == .null && run.value["deliveryReceipt"] == .null && run.value["pullRequest"] == .null
     }
@@ -415,7 +466,7 @@ enum TeamLoadState: Equatable, Sendable {
             let next = TeamRun(result)
             if next.id == id { observe(next) } else { await poll() }
             mutationState = .idle
-            let revision = run?.revision ?? next.revision
+            let revision = next.id == id ? next.revision : (run?.revision ?? next.revision)
             notice = "\(mutation.label) recorded · revision \(revision)."
             noticeIsError = false
             if mutation.path.hasSuffix("/steer") { direction = "" }
@@ -425,7 +476,7 @@ enum TeamLoadState: Equatable, Sendable {
             notice = "Delivery unconfirmed. Retry sends this exact request."
             noticeIsError = true
         } catch let error as DesktopError where (400...499).contains(error.status) {
-            let outcome = await performPoll(pollGeneration)
+            let outcome = await runPoll(pollGeneration, coalesce: false)
             mutationState = .idle
             switch outcome {
             case .updated:

@@ -78,13 +78,13 @@ struct StatusGlyph: View {
         case .needsInput: kind = .attention
         case .readyForReview: kind = .review
         case .planning, .discovering, .implementing, .integrating, .verifying, .reviewing, .delivering, .unknown:
-            kind = .progress(0.25)
+            kind = .progress(teamSeed.progressFraction)
         }
     }
     init(teamLoadState: TeamLoadState, size: CGFloat = 14) {
         switch teamLoadState {
         case .loading(let seed, _): self.init(teamSeed: seed, size: size)
-        case .listSeed(let run), .loaded(let run, _): self.init(team: run, size: size)
+        case .listSeed(let run, _), .loaded(let run, _): self.init(team: run, size: size)
         }
     }
     init(item: BoardItem, size: CGFloat = 14) { self.init(Self.board(item.column, item.status, item.progressFraction), size: size) }

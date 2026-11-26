@@ -54,7 +54,10 @@ struct TeamDetailView: View {
                         switch model.loadState {
                         case .loading(_, let error):
                             loadingContent(error: error)
-                        case .listSeed(let team), .loaded(let team, _):
+                        case .listSeed(let team, let error):
+                            banners(team)
+                            loadingContent(error: error)
+                        case .loaded(let team, _):
                             banners(team)
                             if team.status == "ready-for-review" && !model.managed { reviewPanel(team) }
                             decisions(team)
@@ -143,7 +146,24 @@ struct TeamDetailView: View {
                 } else if model.displayStale || error != nil {
                     Text("Updates unavailable").font(.caption).foregroundStyle(.orange)
                 }
-            case .listSeed(let team), .loaded(let team, _):
+            case .listSeed(let team, let error):
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(team.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                    Text("\(app.projectName(team.projectID)) · \(lead(team)) · Revision \(team.revision) · up to \(team.parallelism) implementer\(team.parallelism == 1 ? "" : "s")")
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                if error == nil {
+                    ProgressView().controlSize(.small)
+                }
+                HStack(spacing: 5) {
+                    Image(systemName: "wifi.exclamationmark").font(.caption).foregroundStyle(.orange)
+                        .frame(width: 12).opacity(model.displayStale || error != nil ? 1 : 0)
+                    Text(team.statusLabel).font(.caption.weight(.medium)).lineLimit(1)
+                }.padding(.horizontal, 9).padding(.vertical, 4)
+                    .glassSurface(in: Capsule(), tint: teamColor(team))
+                    .help(model.displayStale || error != nil ? "Updates unavailable. Controls stay disabled until the next successful refresh." : "")
+            case .loaded(let team, _):
                 VStack(alignment: .leading, spacing: 2) {
                     Text(team.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
                     Text("\(app.projectName(team.projectID)) · \(lead(team)) · Revision \(team.revision) · up to \(team.parallelism) implementer\(team.parallelism == 1 ? "" : "s")")
@@ -414,8 +434,8 @@ struct TeamDetailView: View {
                 }
             }
             if model.role == "viewer" { Text("This device can view the team. An owner or controller can answer decisions and send direction.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
-            else if let team = model.run, team.status == "cancelled" { Text("This run is cancelled. Its work and evidence remain available above.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
-            else if let team = model.run, continuationEligible(team) {
+            else if case .loaded(let team, _) = model.loadState, team.status == "cancelled" { Text("This run is cancelled. Its work and evidence remain available above.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
+            else if case .loaded(let team, _) = model.loadState, continuationEligible(team) {
                 if model.role == "owner" {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Direction for continuation (optional)").font(.caption.weight(.semibold))
@@ -436,7 +456,7 @@ struct TeamDetailView: View {
                 } else { Text("Only an owner can continue this blocked run.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
             }
             else {
-                let statusNotice = !model.notice.isEmpty ? model.notice : (model.loadError ?? (model.run == nil ? "Loading team details…" : "A direction records a new revision; the team replans from its integrated work."))
+                let statusNotice = !model.notice.isEmpty ? model.notice : (model.loadError ?? (!model.isLoaded ? "Loading team details…" : "A direction records a new revision; the team replans from its integrated work."))
                 let noticeError = model.noticeIsError || (model.notice.isEmpty && model.loadError != nil)
                 PromptEditor(text: Binding(get: { model.direction }, set: { model.direction = $0 }), placeholder: "Give the team a direction or change the requirements…",
                              enabled: model.canSteer, transparent: true, submit: { Task { await model.steer() } })

@@ -470,6 +470,7 @@ enum HostConnectionState: Equatable {
         route = .mission(id)
     }
     func openTeam(_ id: String, from mission: String? = nil) {
+        _ = prepareTeamModel(for: id, fromMission: mission)
         route = .team(id: id, fromMission: mission)
     }
     func missionModel(for id: String) -> MissionModel? {
@@ -545,18 +546,31 @@ enum HostConnectionState: Equatable {
     }
     func clearTeamResumeFailure(_ id: String) { teamResumeFailures[id] = nil }
     func teamModel(for id: String) -> TeamModel? {
+        prepareTeamModel(for: id, fromMission: selectedTeamID == id ? teamOpenedFrom : nil)
+    }
+    private func prepareTeamModel(for id: String, fromMission missionID: String?) -> TeamModel? {
         if let existing = teamModels[id] { return existing }
         guard let client else { return nil }
         let model: TeamModel
         if let team = teams.first(where: { $0.id == id }) {
             model = TeamModel(run: team, client: client, role: me["role"].string)
         } else {
-            model = TeamModel(seed: teamSeed(for: id), client: client, role: me["role"].string)
+            model = TeamModel(seed: teamSeed(for: id, fromMission: missionID), client: client, role: me["role"].string)
         }
         model.setDisplayVisible(displayVisible)
         teamModels[id] = model; return model
     }
-    private func teamSeed(for id: String) -> TeamSeed {
+    private func teamSeed(for id: String, fromMission missionID: String?) -> TeamSeed {
+        if let missionID, let mission = missionModels[missionID]?.mission,
+           let subtask = mission.subtasks.first(where: { $0.teamID == id }) {
+            return TeamSeed(
+                id: id,
+                title: subtask.title,
+                status: subtask.teamStatus,
+                projectID: subtask.repoProjectID,
+                missionID: mission.id
+            )
+        }
         for missionModel in missionModels.values {
             if let mission = missionModel.mission, let subtask = mission.subtasks.first(where: { $0.teamID == id }) {
                 return TeamSeed(
@@ -571,7 +585,7 @@ enum HostConnectionState: Equatable {
         if let row = board.items.first(where: { $0.kind == .team && $0.id == id }) {
             return TeamSeed(id: id, title: row.title, status: row.status)
         }
-        return TeamSeed(id: id, missionID: selectedTeamID == id ? (teamOpenedFrom ?? "") : "")
+        return TeamSeed(id: id, missionID: missionID ?? "")
     }
     private func pruneTeamModel(_ id: String) {
         guard id != selectedTeamID, let model = teamModels[id], !model.busy, model.pending == nil, model.direction.isEmpty else { return }

@@ -140,6 +140,8 @@ enum MissionLoadState: Equatable, Sendable {
     private var pageShown = false
     private var displayVisible = false
     private var pollGeneration = UUID()
+    private var latestPollAttempt: UInt64 = 0
+    private var inFlightPoll: (attempt: UInt64, task: Task<PollOutcome, Never>)?
 
     init(
         seed: MissionSeed,
@@ -199,13 +201,21 @@ enum MissionLoadState: Equatable, Sendable {
     func setDisplayVisible(_ visible: Bool) {
         guard displayVisible != visible else { return }
         displayVisible = visible
-        if !visible { fresh = false }
+        if !visible {
+            fresh = false
+            latestPollAttempt &+= 1
+            inFlightPoll?.task.cancel()
+            inFlightPoll = nil
+        }
         updatePolling()
     }
 
     private func updatePolling() {
         guard pageShown && displayVisible else {
             pollGeneration = UUID()
+            latestPollAttempt &+= 1
+            inFlightPoll?.task.cancel()
+            inFlightPoll = nil
             pollTask?.cancel()
             pollTask = nil
             return
@@ -225,18 +235,38 @@ enum MissionLoadState: Equatable, Sendable {
     }
 
     func poll() async {
-        _ = await performPoll(pollGeneration)
+        _ = await runPoll(pollGeneration, coalesce: false)
     }
 
     private func poll(_ generation: UUID) async {
-        _ = await performPoll(generation)
+        _ = await runPoll(generation, coalesce: true)
     }
 
-    private func performPoll(_ generation: UUID) async -> PollOutcome {
+    private func runPoll(_ generation: UUID, coalesce: Bool) async -> PollOutcome {
         guard displayVisible, generation == pollGeneration else { return .skipped }
+        if coalesce, let active = inFlightPoll {
+            return await active.task.value
+        }
+        latestPollAttempt &+= 1
+        let attempt = latestPollAttempt
+        inFlightPoll?.task.cancel()
+        let task = Task<PollOutcome, Never> { [weak self] in
+            guard let self else { return .skipped }
+            return await self.executePoll(generation: generation, attempt: attempt)
+        }
+        inFlightPoll = (attempt, task)
+        let outcome = await task.value
+        if inFlightPoll?.attempt == attempt {
+            inFlightPoll = nil
+        }
+        return outcome
+    }
+
+    private func executePoll(generation: UUID, attempt: UInt64) async -> PollOutcome {
+        guard displayVisible, generation == pollGeneration, attempt == latestPollAttempt else { return .skipped }
         do {
             let value = try await sendRequest(client, "/missions/\(id)", nil)
-            guard displayVisible, generation == pollGeneration else { return .skipped }
+            guard displayVisible, generation == pollGeneration, attempt == latestPollAttempt else { return .skipped }
             let fetched = Mission(value)
             guard fetched.id == id else {
                 let message = "The server returned a mismatched mission."
@@ -248,7 +278,7 @@ enum MissionLoadState: Equatable, Sendable {
             if !fresh { fresh = true }
             return .updated
         } catch {
-            guard displayVisible, generation == pollGeneration else { return .skipped }
+            guard displayVisible, generation == pollGeneration, attempt == latestPollAttempt else { return .skipped }
             if case .loading(let seed, _) = loadState {
                 loadState = .loading(seed: seed, error: error.localizedDescription)
             }
@@ -308,7 +338,7 @@ enum MissionLoadState: Equatable, Sendable {
             let next = Mission(result["mission"] == .null ? result : result["mission"])
             if next.id == id { observe(next) } else { await poll() }
             mutationState = .idle
-            let revision = mission?.revision ?? next.revision
+            let revision = next.id == id ? next.revision : (mission?.revision ?? next.revision)
             notice = "\(mutation.label) recorded · revision \(revision)."
             noticeIsError = false
             if mutation.path.hasSuffix("/steer") { direction = "" }
@@ -317,7 +347,7 @@ enum MissionLoadState: Equatable, Sendable {
             notice = "Delivery unconfirmed. Retry sends this exact request."
             noticeIsError = true
         } catch let error as DesktopError where (400...499).contains(error.status) {
-            let outcome = await performPoll(pollGeneration)
+            let outcome = await runPoll(pollGeneration, coalesce: false)
             mutationState = .idle
             switch outcome {
             case .updated:

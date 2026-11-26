@@ -1,11 +1,15 @@
 import SwiftUI
 import AppKit
+import Security
 import InfiniteCore
 
 @main struct InfiniteDesktopApp: App {
     @StateObject private var model = AppModel()
     @StateObject private var visibility = DisplayVisibilityMonitor()
     @NSApplicationDelegateAdaptor(DesktopDelegate.self) private var delegate
+    init() {
+        SecKeychainSetUserInteractionAllowed(false)
+    }
     var body: some Scene {
         Window("Infinite", id: "main") {
             DesktopView(app: model)

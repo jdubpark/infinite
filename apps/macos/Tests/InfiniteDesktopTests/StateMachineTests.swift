@@ -631,6 +631,7 @@ private actor ControlCallTracker {
         let app = AppModel(deps: deps)
         await app.connect()
 
+        app.openMission("m-new")
         let missionModel = app.missionModel(for: "m-new")
         XCTAssertNotNil(missionModel)
         XCTAssertEqual(missionModel?.loadState, .loading(seed: MissionSeed(id: "m-new"), error: nil))
@@ -649,11 +650,18 @@ private actor ControlCallTracker {
                     "title": .string("API rollout"),
                     "status": .string("running"),
                     "teamId": .string("team-sub-1"),
-                    "teamStatus": .string("implementing")
+                    "teamStatus": .string("verifying")
                 ])
             ])
         ]))
         missionModel?.observe(loadedMission)
+        XCTAssertEqual(missionModel?.direction, "")
+        XCTAssertNil(missionModel?.pending)
+        XCTAssertEqual(missionModel?.busy, false)
+
+        app.openTeam("team-sub-1", from: "m-new")
+        XCTAssertNil(app.missionModels["m-new"])
+        XCTAssertEqual(app.route, .team(id: "team-sub-1", fromMission: "m-new"))
 
         let subteamModel = app.teamModel(for: "team-sub-1")
         XCTAssertNotNil(subteamModel)
@@ -663,7 +671,7 @@ private actor ControlCallTracker {
                 seed: TeamSeed(
                     id: "team-sub-1",
                     title: "API rollout",
-                    status: "implementing",
+                    status: "verifying",
                     projectID: "api-repo",
                     missionID: "m-new"
                 ),
@@ -673,6 +681,8 @@ private actor ControlCallTracker {
         XCTAssertNil(subteamModel?.run)
         XCTAssertEqual(subteamModel?.managed, true)
         XCTAssertEqual(subteamModel?.projectID, "api-repo")
+        XCTAssertEqual(subteamModel?.title, "API rollout")
+        XCTAssertEqual(subteamModel?.status, "verifying")
 
         let unknownTeam = app.teamModel(for: "team-unlisted")
         XCTAssertEqual(unknownTeam?.loadState, .loading(seed: TeamSeed(id: "team-unlisted"), error: nil))
@@ -686,7 +696,92 @@ private actor ControlCallTracker {
         ]))
         app.teams = [listedRun]
         let listedModel = app.teamModel(for: "team-listed")
-        XCTAssertEqual(listedModel?.loadState, .listSeed(listedRun))
+        XCTAssertEqual(listedModel?.loadState, .listSeed(listedRun, error: nil))
         XCTAssertEqual(listedModel?.run, listedRun)
+        XCTAssertEqual(listedModel?.isLoaded, false)
+    }
+
+    func testLateFailingPollNeverClobbersNewerSuccessfulRetryInMissionAndTeamModels() async throws {
+        let missionAutoGate = StateMachineDeferred<JSON>()
+        actor PollCounter {
+            var count = 0
+            func next() -> Int { count += 1; return count }
+        }
+        let missionCounter = PollCounter()
+        let loadedMissionPayload: JSON = .object([
+            "id": .string("m-race"),
+            "title": .string("Race mission"),
+            "status": .string("working"),
+            "revision": .number(2),
+            "updatedAt": .string("2026-01-01T00:02:00.000Z")
+        ])
+        let missionModel = MissionModel(
+            seed: MissionSeed(id: "m-race", title: "Race mission", status: "working"),
+            client: makeClient(),
+            role: "owner",
+            sendRequest: { _, path, _ in
+                if path == "/missions/m-race", await missionCounter.next() == 1 {
+                    return try await missionAutoGate.wait()
+                }
+                return loadedMissionPayload
+            }
+        )
+        missionModel.setDisplayVisible(true)
+        missionModel.startPolling()
+        await missionAutoGate.waitUntilEntered()
+
+        await missionModel.poll()
+        XCTAssertTrue(missionModel.isLoaded)
+        XCTAssertTrue(missionModel.fresh)
+        XCTAssertTrue(missionModel.canSteer)
+        XCTAssertNil(missionModel.loadError)
+
+        await missionAutoGate.fail(DesktopError("Stale mission poll failed"))
+        try await Task.sleep(for: .milliseconds(25))
+        XCTAssertTrue(missionModel.isLoaded)
+        XCTAssertTrue(missionModel.fresh)
+        XCTAssertTrue(missionModel.canSteer)
+        XCTAssertNil(missionModel.loadError)
+        missionModel.stopPolling()
+
+        let teamAutoGate = StateMachineDeferred<JSON>()
+        let teamCounter = PollCounter()
+        let loadedTeamPayload: JSON = .object([
+            "id": .string("t-race"),
+            "title": .string("Race team"),
+            "status": .string("implementing"),
+            "revision": .number(3),
+            "updatedAt": .string("2026-01-01T00:03:00.000Z")
+        ])
+        let teamModel = TeamModel(
+            seed: TeamSeed(id: "t-race", title: "Race team", status: "implementing"),
+            client: makeClient(),
+            role: "owner",
+            sendRequest: { _, path, _ in
+                if path == "/teams/t-race", await teamCounter.next() == 1 {
+                    return try await teamAutoGate.wait()
+                }
+                return loadedTeamPayload
+            }
+        )
+        teamModel.setDisplayVisible(true)
+        teamModel.startPolling()
+        await teamAutoGate.waitUntilEntered()
+
+        await teamModel.poll()
+        XCTAssertTrue(teamModel.isLoaded)
+        XCTAssertTrue(teamModel.fresh)
+        XCTAssertTrue(teamModel.canSteer)
+        XCTAssertNil(teamModel.loadError)
+        XCTAssertFalse(teamModel.displayStale)
+
+        await teamAutoGate.fail(DesktopError("Stale team poll failed"))
+        try await Task.sleep(for: .milliseconds(25))
+        XCTAssertTrue(teamModel.isLoaded)
+        XCTAssertTrue(teamModel.fresh)
+        XCTAssertTrue(teamModel.canSteer)
+        XCTAssertNil(teamModel.loadError)
+        XCTAssertFalse(teamModel.displayStale)
+        teamModel.stopPolling()
     }
 }

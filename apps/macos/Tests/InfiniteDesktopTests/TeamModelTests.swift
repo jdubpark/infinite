@@ -2,6 +2,34 @@ import XCTest
 import InfiniteCore
 @testable import InfiniteDesktop
 
+private actor TeamDeferred<Value: Sendable> {
+    private var entered = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var valueWaiters: [CheckedContinuation<Value, Error>] = []
+    private var result: Result<Value, Error>?
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func wait() async throws -> Value {
+        if let result { return try result.get() }
+        entered = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        return try await withCheckedThrowingContinuation { valueWaiters.append($0) }
+    }
+
+    func succeed(_ value: Value) {
+        result = .success(value)
+        let waiters = valueWaiters
+        valueWaiters.removeAll()
+        for waiter in waiters { waiter.resume(returning: value) }
+    }
+}
+
 @MainActor final class TeamModelTests: XCTestCase {
     private func run(_ updatedAt: String, revision: Double = 1, status: String = "implementing", objective: String? = nil) -> TeamRun {
         var fields: [String: JSON] = ["id": .string("run-1"), "revision": .number(revision), "updatedAt": .string(updatedAt), "status": .string(status)]
@@ -138,10 +166,117 @@ import InfiniteCore
 
         let listRow = run("2026-01-01T00:01:00.000Z", revision: 2)
         model.observeListRow(listRow)
-        XCTAssertEqual(model.loadState, .listSeed(listRow))
+        XCTAssertEqual(model.loadState, .listSeed(listRow, error: nil))
         XCTAssertEqual(model.run, listRow)
         XCTAssertFalse(model.isLoaded)
         XCTAssertFalse(model.fresh)
         XCTAssertFalse(model.behind)
+    }
+
+    func testListSeedFailingDetailPollSurfacesErrorAndKeepsDetailLoadingUntilRetrySucceeds() async {
+        let initialRow = run("2026-01-01T00:00:00.000Z", revision: 1)
+        let newerRow = run("2026-01-01T00:01:00.000Z", revision: 2)
+        let fullRun = run("2026-01-01T00:02:00.000Z", revision: 2, status: "implementing", objective: "Full objective")
+        actor AttemptCounter {
+            var count = 0
+            func next() -> Int { count += 1; return count }
+        }
+        let counter = AttemptCounter()
+        let model = TeamModel(
+            run: initialRow,
+            client: RemoteClient(profile: HostProfile(label: "Test", origin: "http://127.0.0.1:1"), token: "token"),
+            role: "owner",
+            sendRequest: { _, _, _ in
+                if await counter.next() == 1 {
+                    throw DesktopError("Detail read failed")
+                }
+                return fullRun.value
+            }
+        )
+
+        XCTAssertEqual(model.loadState, .listSeed(initialRow, error: nil))
+        XCTAssertFalse(model.isLoaded)
+        XCTAssertNil(model.loadError)
+        XCTAssertFalse(model.canSteer)
+        XCTAssertFalse(model.canOwn)
+
+        model.setDisplayVisible(true)
+        await model.poll()
+        XCTAssertEqual(model.loadState, .listSeed(initialRow, error: "Detail read failed"))
+        XCTAssertEqual(model.loadError, "Detail read failed")
+        XCTAssertFalse(model.isLoaded)
+        XCTAssertFalse(model.fresh)
+        XCTAssertFalse(model.canSteer)
+        XCTAssertFalse(model.canOwn)
+
+        model.observeListRow(newerRow)
+        XCTAssertEqual(model.loadState, .listSeed(newerRow, error: "Detail read failed"))
+        XCTAssertEqual(model.loadError, "Detail read failed")
+        XCTAssertFalse(model.isLoaded)
+
+        await model.poll()
+        XCTAssertEqual(model.loadState, .loaded(fullRun, latestListRow: nil))
+        XCTAssertEqual(model.run, fullRun)
+        XCTAssertTrue(model.isLoaded)
+        XCTAssertNil(model.loadError)
+        XCTAssertTrue(model.fresh)
+        XCTAssertTrue(model.canSteer)
+        XCTAssertTrue(model.canOwn)
+    }
+
+    func testMutationReceiptReportsAcknowledgedRevisionWhenNewerPollArrivedFirst() async {
+        let initialRun = run("2026-01-01T00:06:00.000Z", revision: 6, objective: "Ship it")
+        let ackedRun = run("2026-01-01T00:07:00.000Z", revision: 7, objective: "Ship it")
+        let newerPolledRun = run("2026-01-01T00:08:00.000Z", revision: 8, objective: "Ship it")
+        let steerGate = TeamDeferred<JSON>()
+        let model = TeamModel(
+            run: initialRun,
+            client: RemoteClient(profile: HostProfile(label: "Test", origin: "http://127.0.0.1:1"), token: "token"),
+            role: "owner",
+            sendRequest: { _, path, body in
+                if body != nil, path.hasSuffix("/steer") {
+                    return try await steerGate.wait()
+                }
+                return initialRun.value
+            }
+        )
+
+        model.setDisplayVisible(true)
+        await model.poll()
+        XCTAssertEqual(model.run?.revision, 6)
+
+        model.direction = "Tighten scope"
+        let steerTask = Task { @MainActor in await model.steer() }
+        await steerGate.waitUntilEntered()
+
+        model.observe(newerPolledRun)
+        XCTAssertEqual(model.run?.revision, 8)
+
+        await steerGate.succeed(ackedRun.value)
+        await steerTask.value
+
+        XCTAssertEqual(model.run?.revision, 8)
+        XCTAssertEqual(model.notice, "Direction recorded · revision 7.")
+        XCTAssertFalse(model.noticeIsError)
+        XCTAssertEqual(model.direction, "")
+    }
+
+    func testTeamSeedGlyphAndProgressMatchLoadedRunAcrossStatuses() {
+        let statuses = [
+            "planning", "discovering", "implementing", "integrating", "verifying",
+            "reviewing", "delivering", "needs-input", "ready-for-review", "blocked",
+            "paused", "merged", "cancelled", "no-change", "some-future-status"
+        ]
+        for status in statuses {
+            let seed = TeamSeed(id: "run-1", status: status)
+            let loaded = TeamRun(.object(["id": .string("run-1"), "status": .string(status)]))
+            XCTAssertEqual(seed.progressFraction, loaded.progressFraction, status)
+            XCTAssertEqual(StatusGlyph(teamSeed: seed).kind, StatusGlyph(team: loaded).kind, status)
+        }
+        XCTAssertEqual(TeamSeed(id: "run-1", status: "integrating").progressFraction, 0.5)
+        XCTAssertEqual(TeamSeed(id: "run-1", status: "verifying").progressFraction, 0.75)
+        XCTAssertEqual(TeamSeed(id: "run-1", status: "reviewing").progressFraction, 0.75)
+        XCTAssertEqual(TeamSeed(id: "run-1", status: "delivering").progressFraction, 1.0)
+        XCTAssertEqual(StatusGlyph(teamSeed: TeamSeed(id: "run-1")).kind, .todo)
     }
 }

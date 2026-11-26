@@ -6,6 +6,7 @@
     "noEmit": true
   },
   "include": [
+    "tests/eval-config.test.ts",
     "tests/mobile-requests-types.test.ts",
     "tests/orchestration-state-types.test.ts",
     "tests/orchestration-wire-contracts.test.ts",

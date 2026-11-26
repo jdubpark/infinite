@@ -1,8 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { cappedBytes, logValueOf, objectiveRecordSchema, producerOf, recordDigest, thresholdFits } from "../packages/host/src/objective-types.js";
-import { recordDigestSchema } from "../packages/host/src/team-types.js";
+import { dirname, posix } from "node:path";
+import ts from "typescript";
+import { createGoalSchema, goalSteerSchema, type ProductGoal } from "../packages/host/src/goal-types.js";
+import { INTENT_REPORT_LIMITS, intentCheckReportSchema } from "../packages/host/src/intent-report.js";
+import { CORRECTION_LIMITS } from "../packages/host/src/objective-input.js";
+import { applyIntentReport } from "../packages/host/src/objective-intent.js";
+import { CORRECTION_LOG } from "../packages/host/src/objective-ops.js";
+import { PROPOSAL_LIMITS } from "../packages/host/src/objective-proposals.js";
+import { goalRecord, runRecord } from "../packages/host/src/objective-record.js";
+import { OBJECTIVE_LIMITS, cappedBytes, logValueOf, objectiveRecordSchema, producerOf, recordDigest, thresholdFits } from "../packages/host/src/objective-types.js";
+import { SHARED_INPUT_LIMITS } from "../packages/host/src/schema-primitives.js";
+import { RECORD_LABEL_BYTES, createTeamSchema, recordDigestSchema, teamContinueSchema, teamGoalContextSchema, teamMutationSchema, teamTaskPlanSchema, type TeamRun } from "../packages/host/src/team-types.js";
+import { VERDICT_LIMITS } from "../packages/host/src/verdict-types.js";
 
 const GOAL_ID = "6f1c2a3e-8b4d-4c5e-9f60-718293a4b5c6";
 const RUN_ID = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
@@ -385,4 +396,248 @@ test("the record digest schema holds c0 exactly once, first", () => {
   assert.equal(recordDigestSchema.safeParse({ version: 2, criteria: [c0, criterion("c1")] }).success, true);
   assert.equal(recordDigestSchema.safeParse({ version: 2, criteria: [criterion("c1"), c0] }).success, false, "c0 is not first");
   assert.equal(recordDigestSchema.safeParse({ version: 2, criteria: [c0, criterion("c0")] }).success, false, "a second c0 is refused");
+});
+
+test("OBJECTIVE_LIMITS caps align with API schemas and storage budgets", () => {
+  const L = OBJECTIVE_LIMITS;
+  const API = SHARED_INPUT_LIMITS;
+
+  assert.ok(L.goalObjectiveChars >= API.goalObjectiveChars);
+  assert.ok(L.runObjectiveChars >= API.runObjectiveChars);
+  assert.ok(L.c0Bytes >= API.goalSuccessCriteriaChars * 3);
+  assert.ok(L.nonGoals >= API.nonGoals);
+  assert.ok(L.nonGoalChars >= API.nonGoalChars);
+  assert.ok(L.allowedPaths >= API.allowedPaths);
+  assert.ok(L.excludedPaths >= API.allowedPaths);
+  assert.ok(L.pathChars >= API.pathChars);
+  assert.ok(L.ownerEvidence >= API.evidence);
+  assert.ok(L.evidenceChars >= API.evidenceChars);
+  assert.ok(L.directionChars >= API.steeringChars);
+  assert.ok(L.directions >= API.steeringEntries * 2);
+
+  assert.ok(L.criteria >= L.activeCriteria);
+  assert.ok(L.questions >= L.openQuestions);
+  assert.ok(L.questionAssumptions <= L.assumptions);
+  assert.equal(CORRECTION_LIMITS.creationCriteria, L.activeCriteria - 1);
+  assert.equal(CORRECTION_LIMITS.criterionCanonicalBytes, L.inlineValueBytes);
+  assert.ok(CORRECTION_LOG.entries + API.steeringEntries <= L.logEntries);
+  assert.ok(CORRECTION_LOG.bytes < L.logBytes);
+  assert.ok(PROPOSAL_LIMITS.log.entries < CORRECTION_LOG.entries);
+  assert.ok(PROPOSAL_LIMITS.log.bytes < CORRECTION_LOG.bytes);
+  assert.ok(PROPOSAL_LIMITS.cappedBytes < L.cappedBytes);
+  assert.ok(PROPOSAL_LIMITS.assumptions <= L.assumptions);
+  assert.equal(PROPOSAL_LIMITS.addedPerEntry, L.newAssumptionsPerAttempt);
+  assert.equal(INTENT_REPORT_LIMITS.items, L.intentItems);
+  assert.equal(INTENT_REPORT_LIMITS.scouts, L.scoutQuestions);
+  assert.equal(INTENT_REPORT_LIMITS.criteria, L.activeCriteria);
+  assert.equal(INTENT_REPORT_LIMITS.outOfScope, L.openFollowUps);
+  assert.equal(INTENT_REPORT_LIMITS.statementBytes, L.assumptionBytes);
+  assert.equal(INTENT_REPORT_LIMITS.refutedByBytes, L.assumptionBytes);
+  assert.equal(INTENT_REPORT_LIMITS.criterionBytes, L.inlineValueBytes);
+  assert.equal(VERDICT_LIMITS.criteria, L.activeCriteria);
+  assert.equal(VERDICT_LIMITS.noteBytes, L.noteBytes);
+  assert.equal(VERDICT_LIMITS.labelBytes, RECORD_LABEL_BYTES);
+
+  const maxIntentReport = intentCheckReportSchema.parse({
+    kind: "intent-check",
+    summary: "Maximal intent question bounds check.",
+    items: [{
+      dimension: "d".repeat(INTENT_REPORT_LIMITS.dimensionBytes),
+      why: "w".repeat(INTENT_REPORT_LIMITS.whyBytes),
+      criticality: "outcome",
+      disposition: "ask",
+      assumption: {
+        statement: "a".repeat(INTENT_REPORT_LIMITS.statementBytes),
+        refutedBy: "r".repeat(INTENT_REPORT_LIMITS.refutedByBytes),
+        test: { kind: "owner" },
+      },
+      question: {
+        text: "q".repeat(INTENT_REPORT_LIMITS.questionBytes),
+        options: Array.from({ length: INTENT_REPORT_LIMITS.options }, () => "o".repeat(INTENT_REPORT_LIMITS.optionBytes)),
+        default: "f".repeat(INTENT_REPORT_LIMITS.defaultBytes),
+      },
+    }],
+  });
+  const intentApplied = applyIntentReport(validGoalRecord(), maxIntentReport, {
+    runId: RUN_ID,
+    revision: 1,
+    checkerMemberId: "checker-1",
+    decisionId: GOAL_ID,
+    mode: "supervised",
+    goal: true,
+    configured: [],
+    at: AT,
+  });
+  assert.equal(intentApplied.added.questions.length, 1);
+  assert.equal(intentApplied.dropped.cap, 0);
+  assert.equal(intentApplied.dropped.shape, 0);
+  const formattedQuestion = intentApplied.record.questions.find(item => item.id === intentApplied.added.questions[0]);
+  assert.ok(formattedQuestion);
+  assert.ok(Buffer.byteLength(formattedQuestion.text, "utf8") <= L.questionBytes);
+  assert.ok(objectiveRecordSchema.safeParse(intentApplied.record).success);
+
+  const maxGoalInput = createGoalSchema.parse({
+    requestId: GOAL_ID,
+    projectId: "infinite",
+    title: "Maximal goal",
+    objective: "o".repeat(API.goalObjectiveChars),
+    successCriteria: "\u20ac".repeat(API.goalSuccessCriteriaChars),
+    nonGoals: Array.from({ length: API.nonGoals }, () => "n".repeat(API.nonGoalChars)),
+    allowedPaths: Array.from({ length: API.allowedPaths }, (_, index) => `${"\u20ac".repeat(API.pathChars - 2)}${String(index).padStart(2, "0")}`),
+    evidence: Array.from({ length: API.evidence }, () => "e".repeat(API.evidenceChars)),
+  });
+  const maxGoalSteering = Array.from({ length: API.steeringEntries }, (_, index) => {
+    const parsed = goalSteerSchema.parse({ requestId: GOAL_ID, revision: index + 1, text: "s".repeat(API.steeringChars) });
+    return { text: parsed.text, revision: parsed.revision, at: AT };
+  });
+  const builtGoal = goalRecord({ ...maxGoalInput, id: GOAL_ID, steering: maxGoalSteering } as unknown as ProductGoal, AT, "created");
+  assert.notEqual(builtGoal, "source-invalid");
+  if (builtGoal !== "source-invalid") {
+    assert.ok(objectiveRecordSchema.safeParse(builtGoal).success);
+    assert.ok(cappedBytes(builtGoal) < 30 * 1024);
+    assert.ok(cappedBytes(builtGoal) <= L.cappedBytes);
+  }
+
+  const escapedControlGoal = createGoalSchema.parse({
+    requestId: GOAL_ID,
+    projectId: "infinite",
+    title: "Escaped control paths",
+    objective: "Track JSON-escaped control path cap.",
+    successCriteria: "Fail closed at cappedBytes.",
+    allowedPaths: Array.from({ length: 20 }, (_, index) => `${"\u0001".repeat(288)}${String(index).padStart(2, "0")}`),
+  });
+  assert.ok(Buffer.byteLength(JSON.stringify(escapedControlGoal), "utf8") <= API.goalPayloadBytes);
+  assert.equal(goalRecord({ ...escapedControlGoal, id: GOAL_ID, steering: [] } as unknown as ProductGoal, AT, "created"), "source-invalid");
+
+  const maxTeamInput = createTeamSchema.parse({
+    requestId: RUN_ID,
+    projectId: "infinite",
+    provider: "claude",
+    title: "Maximal run",
+    objective: "r".repeat(API.runObjectiveChars),
+  });
+  const maxRunSteering = Array.from({ length: API.steeringEntries }, (_, index) => {
+    const parsed = teamMutationSchema.parse({ requestId: RUN_ID, revision: index + 1, text: "t".repeat(API.steeringChars) });
+    return { text: parsed.text, revision: parsed.revision, at: AT };
+  });
+  assert.ok(teamContinueSchema.safeParse({ requestId: RUN_ID, revision: 1, text: "c".repeat(API.steeringChars) }).success);
+  assert.ok(teamGoalContextSchema.safeParse({
+    id: GOAL_ID,
+    revision: 1,
+    cycle: 1,
+    successCriteria: "s".repeat(API.goalContextSuccessCriteriaChars),
+    nonGoals: maxGoalInput.nonGoals,
+    allowedPaths: maxGoalInput.allowedPaths,
+    evidence: maxGoalInput.evidence,
+    previousWork: [],
+    deadlineAt: AT,
+    maxMembers: 10,
+  }).success);
+  assert.ok(teamTaskPlanSchema.safeParse({
+    id: "t1",
+    title: "Max paths",
+    instructions: "Do work.",
+    paths: maxGoalInput.allowedPaths,
+    dependsOn: [],
+  }).success);
+  const builtRun = runRecord({ id: RUN_ID, objective: maxTeamInput.objective, steering: maxRunSteering } as unknown as TeamRun, AT, "member-1");
+  assert.notEqual(builtRun, "source-invalid");
+  if (builtRun !== "source-invalid") assert.ok(objectiveRecordSchema.safeParse(builtRun).success);
+});
+
+test("shared schema modules have zero runtime circular imports", () => {
+  const parseSource = (relativeFile: string) => {
+    const source = readFileSync(new URL(`../packages/host/src/${relativeFile}`, import.meta.url), "utf8");
+    return ts.createSourceFile(relativeFile, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  };
+  const resolveLocal = (relativeFile: string, specifier: string) =>
+    posix.normalize(posix.join(dirname(relativeFile), specifier.replace(/\.js$/, ".ts")));
+  const runtimeImportsOf = (relativeFile: string): string[] => {
+    const file = parseSource(relativeFile);
+    const edges: string[] = [];
+    for (const stmt of file.statements) {
+      if (ts.isImportDeclaration(stmt) && ts.isStringLiteral(stmt.moduleSpecifier) && stmt.moduleSpecifier.text.startsWith(".")) {
+        const clause = stmt.importClause;
+        if (!clause) {
+          edges.push(resolveLocal(relativeFile, stmt.moduleSpecifier.text));
+          continue;
+        }
+        if (clause.isTypeOnly) continue;
+        const hasRuntimeBinding = clause.name !== undefined
+          || (clause.namedBindings !== undefined && (
+            ts.isNamespaceImport(clause.namedBindings)
+            || clause.namedBindings.elements.some(element => !element.isTypeOnly)
+          ));
+        if (hasRuntimeBinding) edges.push(resolveLocal(relativeFile, stmt.moduleSpecifier.text));
+        continue;
+      }
+      if (ts.isExportDeclaration(stmt) && stmt.moduleSpecifier && ts.isStringLiteral(stmt.moduleSpecifier) && stmt.moduleSpecifier.text.startsWith(".")) {
+        if (stmt.isTypeOnly) continue;
+        const hasRuntimeExport = !stmt.exportClause
+          || ts.isNamespaceExport(stmt.exportClause)
+          || stmt.exportClause.elements.some(element => !element.isTypeOnly);
+        if (hasRuntimeExport) edges.push(resolveLocal(relativeFile, stmt.moduleSpecifier.text));
+      }
+    }
+    return edges;
+  };
+  const anyLocalImportsOf = (relativeFile: string): string[] => {
+    const file = parseSource(relativeFile);
+    const specifiers: string[] = [];
+    const visitNode = (node: ts.Node) => {
+      if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node))
+        && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier) && node.moduleSpecifier.text.startsWith(".")) {
+        specifiers.push(node.moduleSpecifier.text);
+      } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)
+        && ts.isStringLiteral(node.argument.literal) && node.argument.literal.text.startsWith(".")) {
+        specifiers.push(node.argument.literal.text);
+      }
+      ts.forEachChild(node, visitNode);
+    };
+    visitNode(file);
+    return specifiers;
+  };
+
+  assert.deepEqual(anyLocalImportsOf("schema-primitives.ts"), []);
+  assert.deepEqual(runtimeImportsOf("types.ts"), []);
+  assert.deepEqual(runtimeImportsOf("eval-types.ts"), []);
+
+  const roots = [
+    "schema-primitives.ts",
+    "types.ts",
+    "eval-types.ts",
+    "eval-config.ts",
+    "eval-jobs.ts",
+    "eval-trial-jobs.ts",
+    "eval-compare-jobs.ts",
+    "verdict-types.ts",
+    "verdict-store.ts",
+    "team-state-schemas.ts",
+    "team-types.ts",
+    "goal-types.ts",
+    "objective-types.ts",
+    "objective-input.ts",
+    "objective-ops.ts",
+    "objective-intent.ts",
+    "objective-proposals.ts",
+    "evidence/member-proposal.ts",
+  ];
+  const owned = new Set(roots);
+  const state = new Map<string, "visiting" | "done">();
+  const stack: string[] = [];
+  const visit = (file: string) => {
+    const current = state.get(file);
+    if (current === "done") return;
+    if (current === "visiting") {
+      const cycle = [...stack.slice(stack.indexOf(file)), file];
+      if (cycle.some(node => owned.has(node))) assert.fail(`Runtime import cycle detected: ${cycle.join(" -> ")}`);
+      return;
+    }
+    state.set(file, "visiting");
+    stack.push(file);
+    for (const dep of runtimeImportsOf(file)) visit(dep);
+    stack.pop();
+    state.set(file, "done");
+  };
+  for (const root of roots) visit(root);
 });

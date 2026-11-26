@@ -255,7 +255,15 @@ export function writeRecordWithOwner(tx: EvidenceTx, sessionId: string, record: 
   tx.run(upsert("usage_records", RECORD_COLUMNS, "record_key"), key, checked.provider, owner, checked.completedAt, modelRef,
     checked.modelSource, next.input, next.output, next.reasoning, next.cache_read, next.cache_write, next.cache_write_1h,
     checked.reportedCost, checked.secondary ? 1 : 0);
+  tx.run(
+    "INSERT INTO usage_meta (key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+    `headroom_rev:${checked.provider}`,
+  );
   return { status: prior ? "replaced" : "inserted", ownerSessionId: owner };
+}
+
+export function providerUsageRevision(db: EvidenceDb, provider: Provider): string {
+  return db.get<{ value: string }>("SELECT value FROM usage_meta WHERE key=?", `headroom_rev:${provider}`)?.value ?? "0";
 }
 
 export function writeRecord(tx: EvidenceTx, sessionId: string, record: UsageRecord): "inserted" | "replaced" | "kept" {

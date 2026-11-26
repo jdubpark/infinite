@@ -9,7 +9,7 @@ import { OUTCOMES_MODULE, selectRoutingEvidence } from "./outcome-store.js";
 import type { ProviderLimitEvent } from "./provider-limits.js";
 import { profileIdentity } from "./run-events.js";
 import { choose, expectedCost, RESCUE_USD, screen, TIER_COSTS, type Screened, type Scored } from "./routing-choice.js";
-import { readProviderHeadrooms } from "./routing-headroom.js";
+import { overlayLimitedHeadrooms, readProviderHeadrooms, type ProviderHeadroomCache } from "./routing-headroom.js";
 import { effectiveRouting, type TeamRouting } from "./routing-policy.js";
 import {
   betaMean, betaSd, CHOSEN_WEIGHT, MAX_AGE_DAYS, observedCost, posterior, type CurrentConfig, type RoutingTarget,
@@ -45,6 +45,8 @@ export type RoutingStatusInput = {
   limited?: ReadonlySet<Provider>;
   limitHistory?: readonly ProviderLimitEvent[];
   prices?: UsageConfig["prices"];
+  headrooms?: ReadonlyMap<Provider, ProviderHeadroom>;
+  headroomCache?: ProviderHeadroomCache;
 };
 
 const round3 = (value: number) => Math.round(value * 1000) / 1000;
@@ -153,9 +155,17 @@ export function routingStatus(store: EvidenceStore, input: RoutingStatusInput): 
     const endedAt = state.periodEndedAt ?? (computed !== undefined && Date.parse(computed.endsAt) <= Date.parse(input.now) ? computed.endsAt : null);
     const mode: RoutingMode = effective.mode === "off" ? "off" : pinsAuto && endedAt !== null ? "auto" : "shadow";
     const autoMode = mode === "auto";
-    const headrooms = input.lineup
-      ? readProviderHeadrooms(db, input.lineup.implementers.map(profile => profile.provider), input.limited ?? new Set(), input.limitHistory ?? [], input.prices, input.now)
-      : new Map<Provider, ProviderHeadroom>();
+    const headroomProviders = input.lineup
+      ? [
+        ...input.lineup.implementers.map(profile => profile.provider),
+        ...(knobs?.points.includes("escalation") ? (input.lineup.escalations ?? []).map(profile => profile.provider) : []),
+      ]
+      : [];
+    const limited = input.limited ?? new Set<Provider>();
+    const headrooms = headroomProviders.length === 0 ? new Map<Provider, ProviderHeadroom>()
+      : input.headrooms ? overlayLimitedHeadrooms(headroomProviders, input.headrooms, limited)
+      : input.headroomCache ? input.headroomCache.read(db, headroomProviders, limited, input.limitHistory ?? [], input.prices, input.now)
+      : readProviderHeadrooms(db, headroomProviders, limited, input.limitHistory ?? [], input.prices, input.now);
     let cells: { cell: StatusCell; profiles: StatusProfile[] }[] = [];
     let cellsCapped = false, unreadableCells = 0;
     if (knobs && reason === null && input.lineup) {

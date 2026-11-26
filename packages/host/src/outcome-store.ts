@@ -64,6 +64,7 @@ export type OutcomePayload = import("./outcome-gauges.js").GaugePayload & {
   legacy?: LegacyPayload;
   diff?: TeamTask["diffStat"];
   wallMs?: number;
+  tokens?: number;
   spentUsd?: number;
   listUsd?: number;
   limitEvents: number;

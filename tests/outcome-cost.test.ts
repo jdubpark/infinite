@@ -213,11 +213,11 @@ test("computeOutcomeCost and syncOutcomeCosts persist listUsd for complete price
 
     assert.deepEqual(
       store.read(db => computeOutcomeCost(db, { runId: "run-1", memberId: "m1", sessionId: "sess-metered", provider: "opencode" }, PRICES)),
-      { costCoverage: "complete", listUsd: 1.2, spentUsd: 1.2 },
+      { costCoverage: "complete", tokens: 1_100_000, listUsd: 1.2, spentUsd: 1.2 },
     );
     assert.deepEqual(
       store.read(db => computeOutcomeCost(db, { runId: "run-2", memberId: "m1", sessionId: "sess-sub", provider: "claude" }, PRICES)),
-      { costCoverage: "complete", listUsd: 2.1 },
+      { costCoverage: "complete", tokens: 300_000, listUsd: 2.1 },
     );
     assert.deepEqual(
       store.read(db => computeOutcomeCost(db, { runId: "run-3", memberId: "m1", sessionId: "sess-partial", provider: "opencode" }, PRICES)),
@@ -225,7 +225,7 @@ test("computeOutcomeCost and syncOutcomeCosts persist listUsd for complete price
     );
     assert.deepEqual(
       store.read(db => computeOutcomeCost(db, { runId: "run-4", memberId: "m1", sessionId: "sess-unpriced", provider: "opencode" }, PRICES)),
-      { costCoverage: "partial" },
+      { costCoverage: "partial", tokens: 1_100_000 },
     );
 
     assert.deepEqual(syncOutcomeCosts(store, PRICES), { updated: 4, scanned: 4, done: true });
@@ -497,7 +497,7 @@ test("provider-reported spend is never promoted to listUsd, and mixed-coverage m
 
     assert.deepEqual(
       store.read(db => computeOutcomeCost(db, { runId: "run-rep", memberId: "m1", sessionId: "sess-reported", provider: "opencode" }, PRICES)),
-      { costCoverage: "partial", spentUsd: 0.75 },
+      { costCoverage: "partial", tokens: 1_100_000, spentUsd: 0.75 },
     );
     assert.deepEqual(
       store.read(db => computeOutcomeCost(db, { runId: "run-multi", memberId: "m1", sessionId: "sess-multi-a", provider: "opencode" }, PRICES)),
@@ -678,6 +678,81 @@ test("syncOutcomeCosts pages past unpriceable rows across batches and restarts",
     assert.deepEqual(syncOutcomeCosts(store, PRICES, { limit: 2 }), { updated: 0, scanned: 0, done: true });
   } finally {
     store?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("undrained running sessions stay partial until exited and Codex cacheWrite leaves listUsd null", () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-outcome-drain-codex-"));
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: randomBytes(32) });
+  try {
+    store.register(configurationModule());
+    store.register(outcomeModule({ now: () => NOW }));
+    store.register(usageModule);
+
+    const prices = {
+      ...PRICES,
+      "openai/gpt-5.4": { input: 2, output: 8, cacheRead: 0.2, cacheWrite: 2 },
+    };
+    store.write(tx => {
+      writeSession(tx, {
+        sessionId: "sess-undrained",
+        provider: "opencode",
+        projectId: "example",
+        createdAt: "2026-11-15T11:00:00.000Z",
+        team: { runId: "run-drain", memberId: "m1", taskId: "t-drain", role: "implementer", revision: 1 },
+      }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: false });
+      writeRecord(tx, "sess-undrained", usageRecord({}));
+      writeOutcome(tx, sampleOutcome({ outcomeId: "run-drain:m1", runId: "run-drain", sessionId: "sess-undrained", provider: "opencode" }));
+
+      writeSession(tx, {
+        sessionId: "sess-codex-cw",
+        provider: "codex",
+        projectId: "example",
+        createdAt: "2026-11-15T11:00:00.000Z",
+        team: { runId: "run-cw", memberId: "m1", taskId: "t-cw", role: "implementer", revision: 1 },
+      }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+      writeRecord(tx, "sess-codex-cw", usageRecord({
+        provider: "codex",
+        providerId: "openai",
+        modelId: "gpt-5.4",
+        tokens: { input: 500_000, output: 100_000, reasoning: 0, cacheRead: 0, cacheWrite: 10_000 },
+        reportedCost: 0,
+      }));
+      writeOutcome(tx, sampleOutcome({ outcomeId: "run-cw:m1", runId: "run-cw", sessionId: "sess-codex-cw", provider: "codex", model: "gpt-5.4" }));
+    });
+
+    assert.deepEqual(
+      store.read(db => computeOutcomeCost(db, { runId: "run-drain", memberId: "m1", sessionId: "sess-undrained", provider: "opencode" }, prices)),
+      { costCoverage: "partial" },
+    );
+    assert.deepEqual(
+      store.read(db => computeOutcomeCost(db, { runId: "run-cw", memberId: "m1", sessionId: "sess-codex-cw", provider: "codex" }, prices)),
+      { costCoverage: "partial", tokens: 610_000 },
+    );
+    assert.deepEqual(syncOutcomeCosts(store, prices), { updated: 2, scanned: 2, done: true });
+    assert.deepEqual(
+      store.read(db => db.all<{ outcome_id: string; list_usd: number | null }>("SELECT outcome_id, list_usd FROM outcomes ORDER BY outcome_id").map(r => [r.outcome_id, r.list_usd])),
+      [["run-cw:m1", null], ["run-drain:m1", null]],
+    );
+
+    store.write(tx => {
+      writeSession(tx, {
+        sessionId: "sess-undrained",
+        provider: "opencode",
+        projectId: "example",
+        createdAt: "2026-11-15T11:00:00.000Z",
+        team: { runId: "run-drain", memberId: "m1", taskId: "t-drain", role: "implementer", revision: 1 },
+      }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+    });
+    assert.deepEqual(syncOutcomeCosts(store, prices, { reset: true }), { updated: 1, scanned: 2, done: true });
+    const afterDrain = store.read(db => readOutcome(db, "run-drain:m1"));
+    assert.equal(afterDrain?.payload.costCoverage, "complete");
+    assert.equal(afterDrain?.payload.listUsd, 1.2);
+    assert.equal(afterDrain?.payload.spentUsd, 1.2);
+    assert.equal(afterDrain?.payload.tokens, 1_100_000);
+  } finally {
+    store.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });

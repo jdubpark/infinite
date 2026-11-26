@@ -480,8 +480,7 @@ export class TeamService {
   }
   private currentDate() { return new Date(this.options?.now?.() ?? Date.now()); }
   diagnostics(): TeamDiagnosticsSnapshot { return this.diag.snapshot(); }
-  providerLimits() { return this.limits.active(this.currentDate()); }
-  providerLimitHistory() { return this.limits.history(this.currentDate()); }
+  providerLimits() { return this.limits.active(this.currentDate()); } providerLimitHistory() { return this.limits.history(this.currentDate()); } onLimitsChanged(listener: () => void) { this.limits.onChanged(listener); }
   private confirmed(id: string): Promise<void> {
     const run = this.records.get(id)?.run;
     if (!this.linear || !run || !(run.linearTracking || run.linear)) return Promise.resolve();

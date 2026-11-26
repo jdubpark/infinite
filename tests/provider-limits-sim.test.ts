@@ -163,7 +163,7 @@ async function simulateSeed(seed: number): Promise<{ steps: number; episodes: nu
       const nowIso = new Date(nowMs).toISOString();
       const provider = r.pick(PROVIDERS);
       const sessionId = `${provider}-${r.int(1, 2)}`;
-      const action = r.int(0, 5);
+      const action = r.int(0, 6);
       const prevCount = limits.history(new Date(nowMs)).length;
       let hadOpenFor: Provider | undefined;
       let openedNewAfterRecoveryFor: Provider | undefined;
@@ -226,6 +226,35 @@ async function simulateSeed(seed: number): Promise<{ steps: number; episodes: nu
       } else if (action === 4) {
         journals[sessionId]!.push({ at: nowIso, data: { kind: "provider-limit", limit: "usage", confidence: "single-source", provider, source: "screen" } });
         await limits.reconcile(sessions, Object.values(rows), new Date(nowMs));
+      } else if (action === 5 && ref.episodes[provider] !== undefined && nowMs > ref.floor[provider]) {
+        const recoverSession = `${provider}-${r.int(1, 2)}`;
+        const hitSession = `${provider}-${r.int(1, 2)}`;
+        const kind: "usage" | "credits" = r.next() < 0.3 ? "credits" : "usage";
+        const recoverIso = nowIso;
+        journals[recoverSession]!.push({
+          at: recoverIso,
+          data: { kind: "turn-end", source: provider === "codex" ? "protocol" : "hook", provider },
+        });
+        nowMs += r.int(1, 10) * MIN_MS;
+        const hitIso = new Date(nowMs).toISOString();
+        const resetsAt = r.next() < 0.5 ? new Date(nowMs + r.int(2, 6) * 3_600_000).toISOString() : undefined;
+        if (r.next() < 0.5) {
+          journals[hitSession]!.push({
+            at: hitIso,
+            data: { kind: "provider-limit", limit: kind, confidence: "corroborated", provider, source: "protocol", ...(resetsAt ? { resetsAt } : {}) },
+          });
+        }
+        rows[hitSession]!.attention.limit = { limit: kind, confidence: "corroborated", since: hitIso, ...(resetsAt ? { resetsAt } : {}) };
+        await limits.reconcile(sessions, Object.values(rows), new Date(nowMs));
+        recoveries++;
+        episodes++;
+        openedNewAfterRecoveryFor = provider;
+        ref.floor[provider] = nowMs;
+        ref.activeUntil[provider] = resetsAt ? Math.min(Date.parse(resetsAt), nowMs + DAY_MS) : nowMs + 15 * MIN_MS;
+        ref.episodes[provider] = { limit: kind, startedAt: nowMs, lastDetectedAt: nowMs, ...(resetsAt ? { resetsAt: Date.parse(resetsAt) } : {}) };
+        const cutoff = nowMs - HISTORY_MS;
+        ref.history = ref.history.filter(item => Date.parse(item.detectedAt) >= cutoff);
+        ref.history.push({ provider, limit: kind, detectedAt: hitIso, ...(resetsAt ? { resetsAt } : {}), sessionId: hitSession });
       } else {
         limits = new ProviderLimits(file, key);
         reloads++;
@@ -309,6 +338,75 @@ test("every provider-limits simulator invariant catches a deliberate mutation", 
       ],
     } as unknown as ProviderLimits;
     assert.ok(checkInvariants(unorderedMutant, unorderedMutant, baseRef(), nowMs, 2, undefined, undefined).some(v => v.name === "thirty-day-window-and-order"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("recovery followed by a second limit hit between reconciliations records two episodes across same-session, cross-session, and paginated journals", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-limits-between-"));
+  const key = randomBytes(32);
+  const t = (hhmm: string) => `2026-10-20T${hhmm}:00.000Z`;
+  try {
+    const file1 = join(dir, "same.sealed");
+    const limits1 = new ProviderLimits(file1, key);
+    limits1.observe({ provider: "claude", limit: "usage", detectedAt: t("10:00"), resetsAt: t("15:00"), sessionId: "s1", confidence: "corroborated" });
+    const j1: Record<string, JournalEntry[]> = {
+      s1: [
+        { at: t("11:00"), data: { kind: "turn-end", source: "hook", provider: "claude" } },
+        { at: t("12:00"), data: { kind: "provider-limit", limit: "usage", confidence: "corroborated", provider: "claude", source: "screen", resetsAt: t("17:00") } },
+      ],
+    };
+    const r1: LimitRow[] = [{ id: "s1", provider: "claude", attention: { limit: { limit: "usage", confidence: "corroborated", since: t("12:00"), resetsAt: t("17:00") } } }];
+    await limits1.reconcile({
+      events: (id, after, limit) => {
+        const all = (j1[id] ?? []).map((entry, idx) => ({ ...entry, seq: idx + 1 }));
+        const slice = all.filter(item => item.seq > after).slice(0, limit);
+        return { events: slice, cursor: slice.at(-1)?.seq ?? after, more: all.length > after + slice.length };
+      },
+    }, r1, new Date(t("12:05")));
+    assert.deepEqual(new ProviderLimits(file1, key).history(new Date(t("12:05"))).map(e => e.detectedAt), [t("10:00"), t("12:00")]);
+
+    const file2 = join(dir, "cross.sealed");
+    const limits2 = new ProviderLimits(file2, key);
+    limits2.observe({ provider: "codex", limit: "usage", detectedAt: t("10:00"), sessionId: "cx-1", confidence: "corroborated" });
+    const j2: Record<string, JournalEntry[]> = {
+      "cx-1": [],
+      "cx-2": [{ at: t("11:00"), data: { kind: "turn-end", source: "protocol", provider: "codex" } }],
+    };
+    const r2: LimitRow[] = [
+      { id: "cx-1", provider: "codex", attention: { limit: { limit: "usage", confidence: "corroborated", since: t("12:00"), resetsAt: t("17:00") } } },
+      { id: "cx-2", provider: "codex", attention: {} },
+    ];
+    await limits2.reconcile({
+      events: (id, after, limit) => {
+        const all = (j2[id] ?? []).map((entry, idx) => ({ ...entry, seq: idx + 1 }));
+        const slice = all.filter(item => item.seq > after).slice(0, limit);
+        return { events: slice, cursor: slice.at(-1)?.seq ?? after, more: all.length > after + slice.length };
+      },
+    }, r2, new Date(t("12:05")));
+    assert.deepEqual(new ProviderLimits(file2, key).history(new Date(t("12:05"))).map(e => e.detectedAt), [t("10:00"), t("12:00")]);
+
+    const file3 = join(dir, "paged.sealed");
+    const limits3 = new ProviderLimits(file3, key);
+    limits3.observe({ provider: "claude", limit: "usage", detectedAt: t("10:00"), resetsAt: t("15:00"), sessionId: "p1", confidence: "corroborated" });
+    const j3: Record<string, JournalEntry[]> = {
+      p1: [
+        { at: t("11:00"), data: { kind: "turn-end", source: "hook", provider: "claude" } },
+        { at: t("12:00"), data: { kind: "provider-limit", limit: "usage", confidence: "corroborated", provider: "claude", source: "screen", resetsAt: t("17:00") } },
+      ],
+    };
+    const r3: LimitRow[] = [{ id: "p1", provider: "claude", attention: { limit: { limit: "usage", confidence: "corroborated", since: t("12:00"), resetsAt: t("17:00") } } }];
+    const pagedSessions: LimitSessions = {
+      events: (id, after, limit) => {
+        const all = (j3[id] ?? []).map((entry, idx) => ({ ...entry, seq: idx + 1 }));
+        const slice = all.filter(item => item.seq > after).slice(0, Math.min(limit, 1));
+        return { events: slice, cursor: slice.at(-1)?.seq ?? after, more: all.length > after + slice.length };
+      },
+    };
+    await limits3.reconcile(pagedSessions, r3, new Date(t("12:05")));
+    await limits3.reconcile(pagedSessions, r3, new Date(t("12:06")));
+    assert.deepEqual(new ProviderLimits(file3, key).history(new Date(t("12:06"))).map(e => e.detectedAt), [t("10:00"), t("12:00")]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

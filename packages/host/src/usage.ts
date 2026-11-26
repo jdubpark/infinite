@@ -23,6 +23,7 @@ const MICRO_DOLLARS_PER_DOLLAR = 1_000_000;
 
 export function listPriceUsage(record: UsageRecord, prices: UsageConfig["prices"] | undefined, catalog: Record<string, CatalogPrice> = PRICE_CATALOG): { cost: number; pricing: "configured" | "catalog" | "unknown" } {
   if (record.modelSource === "unknown") return { cost: 0, pricing: "unknown" };
+  if (record.provider === "codex" && record.tokens.cacheWrite > 0) return { cost: 0, pricing: "unknown" };
   const key = `${record.providerId}/${record.modelId}`;
   const configured = prices?.[key], catalogPrice = catalog[key], price = configured ?? catalogPrice;
   if (!price) return { cost: 0, pricing: "unknown" };

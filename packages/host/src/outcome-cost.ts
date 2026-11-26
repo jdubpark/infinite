@@ -12,6 +12,7 @@ const COST_SYNC_CURSOR = "cost_sync_cursor";
 
 export type ObservedOutcomeCost = {
   costCoverage: "none" | "partial" | "complete";
+  tokens?: number;
   listUsd?: number;
   spentUsd?: number;
 };
@@ -27,6 +28,7 @@ type UsageSessionMeta = {
   created_at: string;
   coverage: UsageCoverage;
   coverage_reason: LedgerCoverageReason | null;
+  exited: number;
 };
 
 export function sessionCostOf(found: SessionUsage | UnmeasuredUsage): SessionCost | undefined {
@@ -48,14 +50,14 @@ export function sessionCostOf(found: SessionUsage | UnmeasuredUsage): SessionCos
 
 function usageSessionsFor(db: EvidenceDb, row: Pick<OutcomeRow, "runId" | "memberId" | "sessionId">): UsageSessionMeta[] {
   const byMember = db.all<UsageSessionMeta>(
-    "SELECT session_id, created_at, coverage, coverage_reason FROM usage_sessions WHERE run_id=? AND member_id=? ORDER BY created_at, session_id",
+    "SELECT session_id, created_at, coverage, coverage_reason, exited FROM usage_sessions WHERE run_id=? AND member_id=? ORDER BY created_at, session_id",
     row.runId,
     row.memberId,
   );
   if (byMember.length > 0) return byMember;
   if (row.sessionId === null) return [];
   return db.all<UsageSessionMeta>(
-    "SELECT session_id, created_at, coverage, coverage_reason FROM usage_sessions WHERE session_id=?",
+    "SELECT session_id, created_at, coverage, coverage_reason, exited FROM usage_sessions WHERE session_id=?",
     row.sessionId,
   );
 }
@@ -67,19 +69,21 @@ export function computeOutcomeCost(
 ): ObservedOutcomeCost {
   const sessions = usageSessionsFor(db, row);
   if (sessions.length === 0 || sessions.every(session => session.coverage === "none")) return { costCoverage: "none" };
-  if (sessions.some(session => session.coverage !== "complete")) return { costCoverage: "partial" };
+  if (sessions.some(session => session.coverage !== "complete" || session.exited !== 1)) return { costCoverage: "partial" };
   const records = readRecords(db, { sessionIds: sessions.map(session => session.session_id) });
   if (records.length === 0) return { costCoverage: "none" };
   const listed = sumUsage(records.map(({ record }) => ({ ...listPriceUsage(record, prices), tokens: record.tokens })));
+  const totalTokens = listed.tokens.input + listed.tokens.output + listed.tokens.reasoning + listed.tokens.cacheRead + listed.tokens.cacheWrite;
   const metered = isMetered(row.provider)
     ? sumUsage(records.map(({ record }) => ({ ...priceUsage(record, prices), tokens: record.tokens })))
     : undefined;
   const spent = metered !== undefined && metered.pricing.unknown === 0 ? metered.cost : undefined;
   if (listed.pricing.unknown > 0) {
-    return { costCoverage: "partial", ...(spent === undefined ? {} : { spentUsd: spent }) };
+    return { costCoverage: "partial", tokens: totalTokens, ...(spent === undefined ? {} : { spentUsd: spent }) };
   }
   return {
     costCoverage: "complete",
+    tokens: totalTokens,
     listUsd: listed.cost,
     ...(spent === undefined ? {} : { spentUsd: spent }),
   };
@@ -89,10 +93,13 @@ export function applyOutcomeCost(tx: EvidenceTx, row: OutcomeRow, prices?: Usage
   if (row.source === "legacy") return false;
   const observed = computeOutcomeCost(tx, row, prices);
   const same = row.payload.costCoverage === observed.costCoverage
+    && row.payload.tokens === observed.tokens
     && row.payload.listUsd === observed.listUsd
     && row.payload.spentUsd === observed.spentUsd;
   if (same) return false;
   row.payload.costCoverage = observed.costCoverage;
+  if (observed.tokens === undefined) delete row.payload.tokens;
+  else row.payload.tokens = observed.tokens;
   if (observed.listUsd === undefined) delete row.payload.listUsd;
   else row.payload.listUsd = observed.listUsd;
   if (observed.spentUsd === undefined) delete row.payload.spentUsd;

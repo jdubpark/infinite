@@ -168,15 +168,18 @@ function summarize(key: Record<string, string>, rows: readonly OutcomeRow[], que
 
   const tokens: number[] = [], usd: number[] = [], listUsd: number[] = [], minutes: number[] = [];
   for (const { row } of counted) {
+    const persistedTokens = typeof row.payload.tokens === "number" && Number.isFinite(row.payload.tokens) ? row.payload.tokens : undefined;
+    const persistedSpent = isMetered(row.provider) && typeof row.payload.spentUsd === "number" && Number.isFinite(row.payload.spentUsd) ? row.payload.spentUsd : undefined;
+    const persistedList = row.payload.costCoverage === "complete" && typeof row.payload.listUsd === "number" && Number.isFinite(row.payload.listUsd) ? row.payload.listUsd : undefined;
     const partialAttempt = row.payload.costCoverage === "partial";
     const raw = !partialAttempt && cost !== undefined && row.sessionId ? cost(row.sessionId) : undefined;
     const found = raw?.complete ? raw : undefined;
-    if (found !== undefined) {
-      tokens.push(found.tokens);
-      if (isMetered(row.provider)) usd.push(found.usd);
-    }
-    if (row.payload.costCoverage === "complete" && typeof row.payload.listUsd === "number" && Number.isFinite(row.payload.listUsd)) {
-      listUsd.push(row.payload.listUsd);
+    if (persistedTokens !== undefined) tokens.push(persistedTokens);
+    else if (found !== undefined) tokens.push(found.tokens);
+    if (persistedSpent !== undefined) usd.push(persistedSpent);
+    else if (found !== undefined && isMetered(row.provider)) usd.push(found.usd);
+    if (persistedList !== undefined) {
+      listUsd.push(persistedList);
     } else if (!partialAttempt && raw?.listUsd !== undefined && Number.isFinite(raw.listUsd)) {
       listUsd.push(raw.listUsd);
     }

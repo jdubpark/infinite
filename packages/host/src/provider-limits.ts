@@ -11,7 +11,11 @@ export interface LimitSessions {
   events(id: string, after: number, limit: number, types?: Set<string>): { events: { at: string; data: Record<string, unknown> }[]; cursor: number; more: boolean };
 }
 type LimitEpisode = { limit: "usage" | "credits"; startedAt: string; lastDetectedAt: string; resetsAt?: string; sessionId: string; runId?: string };
-type SessionCursor = { provider: Provider; cursor: number; limitAt?: number; turnAt?: string };
+type JournalTransition =
+  | { kind: "recovery"; at: number; iso: string; provider: Provider; sessionId: string }
+  | { kind: "limit"; at: number; iso: string; provider: Provider; limit: "usage" | "credits"; resetsAt?: string; sessionId: string; runId?: string }
+  | { kind: "single-limit"; at: number };
+type SessionCursor = { provider: Provider; cursor: number; limitAt?: number; singleLimitAt?: number; turnAt?: string; pending: JournalTransition[] };
 type State = { limits: Partial<Record<Provider, ProviderLimit>>; cleared: Partial<Record<Provider, string>>; episodes?: Partial<Record<Provider, LimitEpisode>>; history?: ProviderLimitEvent[] };
 
 const SCOPE = "provider-limits";
@@ -45,6 +49,7 @@ export class ProviderLimits {
   private state: State = { limits: {}, cleared: {} };
   private readonly sessions = new Map<string, SessionCursor>();
   private readonly recovery = new Map<string, SessionCursor>();
+  private listener?: () => void;
   constructor(private readonly file: string, private readonly key: Buffer) {
     if (existsSync(file)) try {
       const stored = unseal<State>(key, SCOPE, readFileSync(file, "utf8"));
@@ -143,26 +148,123 @@ export class ProviderLimits {
       return at !== undefined && at >= cutoff && at <= nowMs;
     });
   }
-  private scanRecovery(sessions: LimitSessions, session: LimitRow, map: Map<string, SessionCursor>, sinceMs: number): void {
-    const seen = map.get(session.id) ?? { provider: session.provider, cursor: 0 };
+  onChanged(listener: () => void) { this.listener = listener; }
+  private drainCursor(
+    sessions: LimitSessions,
+    session: LimitRow,
+    map: Map<string, SessionCursor>,
+    fallbackMap?: Map<string, SessionCursor>,
+  ): { drained: boolean; seen: SessionCursor } | undefined {
+    const seen = map.get(session.id) ?? fallbackMap?.get(session.id) ?? { provider: session.provider, cursor: 0, pending: [] };
     let page: ReturnType<LimitSessions["events"]>;
-    try { page = sessions.events(session.id, seen.cursor, 200, new Set(["signal"])); } catch { return; }
+    try { page = sessions.events(session.id, seen.cursor, 200, new Set(["signal"])); } catch { return undefined; }
     for (const event of page.events) {
       const at = time(event.at);
       if (at === undefined) continue;
-      if (event.data.kind === "provider-limit") seen.limitAt = Math.max(at, seen.limitAt ?? at);
-      else if (recoveryTurnEnd(event.data as unknown as SignalData) && at > (time(seen.turnAt) ?? -Infinity)) seen.turnAt = event.at;
+      if (event.data.kind === "provider-limit") {
+        seen.limitAt = Math.max(at, seen.limitAt ?? at);
+        if ((session.provider === "claude" || session.provider === "codex") && event.data.confidence === "corroborated") {
+          const resetsAt = typeof event.data.resetsAt === "string" && time(event.data.resetsAt) !== undefined ? event.data.resetsAt : undefined;
+          seen.pending.push({
+            kind: "limit",
+            at,
+            iso: event.at,
+            provider: session.provider,
+            limit: event.data.limit === "credits" ? "credits" : "usage",
+            ...(resetsAt ? { resetsAt } : {}),
+            sessionId: session.id,
+            ...(session.team ? { runId: session.team.runId } : {}),
+          });
+        } else {
+          seen.pending.push({ kind: "single-limit", at });
+        }
+      } else if (recoveryTurnEnd(event.data as unknown as SignalData)) {
+        if (at > (time(seen.turnAt) ?? -Infinity)) seen.turnAt = event.at;
+        seen.pending.push({ kind: "recovery", at, iso: event.at, provider: session.provider, sessionId: session.id });
+      }
     }
     seen.cursor = page.cursor;
     map.set(session.id, seen);
-    if (page.more) return;
-    const turnAt = time(seen.turnAt);
-    if (turnAt !== undefined && turnAt > sinceMs && (seen.limitAt === undefined || turnAt > seen.limitAt)) this.clear(session.provider, seen.turnAt);
+    if (fallbackMap && fallbackMap !== map) fallbackMap.delete(session.id);
+    return { drained: !page.more, seen };
+  }
+  private extractTransitions(seen: SessionCursor): Exclude<JournalTransition, { kind: "single-limit" }>[] {
+    const events = seen.pending;
+    seen.pending = [];
+    if (events.length === 0) return [];
+    const out: Exclude<JournalTransition, { kind: "single-limit" }>[] = [];
+    let segmentStart = 0;
+    const flushSegment = (end: number) => {
+      let singleAt = seen.singleLimitAt ?? -Infinity;
+      for (let index = segmentStart; index < end; index++) {
+        const item = events[index]!;
+        if (item.kind === "single-limit") singleAt = Math.max(singleAt, item.at);
+      }
+      seen.singleLimitAt = Number.isFinite(singleAt) ? singleAt : undefined;
+      for (let index = segmentStart; index < end; index++) {
+        const item = events[index]!;
+        if (item.kind === "recovery" && item.at > singleAt) out.push(item);
+      }
+    };
+    for (let index = 0; index < events.length; index++) {
+      const item = events[index]!;
+      if (item.kind !== "limit") continue;
+      flushSegment(index);
+      seen.singleLimitAt = undefined;
+      out.push(item);
+      segmentStart = index + 1;
+    }
+    flushSegment(events.length);
+    return out;
+  }
+  private replayTransitions(transitions: readonly Exclude<JournalTransition, { kind: "single-limit" }>[], now: Date): void {
+    const ordered = [...transitions].sort((left, right) => left.at - right.at || (left.kind === "recovery" ? -1 : 1));
+    for (const item of ordered) {
+      if (item.kind === "recovery") {
+        const entry = this.active(now).find(limit => limit.provider === item.provider);
+        const episode = this.state.episodes?.[item.provider];
+        const sinceMs = entry ? Date.parse(entry.detectedAt) : episode ? Date.parse(episode.lastDetectedAt) : undefined;
+        if (sinceMs !== undefined && item.at > sinceMs) this.clear(item.provider, item.iso);
+      } else {
+        this.observe({
+          provider: item.provider,
+          limit: item.limit,
+          detectedAt: item.iso,
+          ...(item.resetsAt ? { resetsAt: item.resetsAt } : {}),
+          sessionId: item.sessionId,
+          ...(item.runId ? { runId: item.runId } : {}),
+          confidence: "corroborated",
+        });
+      }
+    }
+  }
+  private scanOpenProviders(sessions: LimitSessions, rows: LimitRow[], now: Date, scanned: Set<string>, undrained: Set<Provider>): void {
+    const transitions: Exclude<JournalTransition, { kind: "single-limit" }>[] = [];
+    for (const session of rows) {
+      if (scanned.has(session.id)) continue;
+      const entry = this.active(now).find(limit => limit.provider === session.provider);
+      const episode = this.state.episodes?.[session.provider];
+      if (!entry && !episode) continue;
+      const map = entry ? this.sessions : this.recovery;
+      const fallback = entry ? this.recovery : this.sessions;
+      const read = this.drainCursor(sessions, session, map, fallback);
+      scanned.add(session.id);
+      if (read === undefined) continue;
+      if (read.drained) transitions.push(...this.extractTransitions(read.seen));
+      else undrained.add(session.provider);
+    }
+    if (transitions.length > 0) this.replayTransitions(transitions, now);
   }
   async reconcile(sessions: LimitSessions, rows: LimitRow[], now = new Date()) {
+    const scanned = new Set<string>();
+    const undrained = new Set<Provider>();
+    this.scanOpenProviders(sessions, rows, now, scanned, undrained);
+    let observedNew = false;
     for (const session of rows) {
       const shown = session.attention.limit;
-      if ((session.provider === "claude" || session.provider === "codex") && shown?.confidence === "corroborated")
+      if ((session.provider === "claude" || session.provider === "codex") && shown?.confidence === "corroborated") {
+        if (undrained.has(session.provider) && (this.state.limits[session.provider] || this.state.episodes?.[session.provider])) continue;
+        const before = this.state.limits[session.provider]?.detectedAt;
         this.observe({
           provider: session.provider,
           ...(shown.limit ? { limit: shown.limit } : {}),
@@ -172,17 +274,13 @@ export class ProviderLimits {
           ...(session.team ? { runId: session.team.runId } : {}),
           confidence: "corroborated",
         });
-      const entry = this.active(now).find(limit => limit.provider === session.provider);
-      if (entry) {
-        this.scanRecovery(sessions, session, this.sessions, Date.parse(entry.detectedAt));
-      } else {
-        const episode = this.state.episodes?.[session.provider];
-        if (episode) this.scanRecovery(sessions, session, this.recovery, Date.parse(episode.lastDetectedAt));
+        if (this.state.limits[session.provider]?.detectedAt !== before) observedNew = true;
       }
     }
+    if (observedNew) this.scanOpenProviders(sessions, rows, now, scanned, undrained);
     const listed = new Set(rows.map(row => row.id)), limited = this.limited(now);
     for (const [sessionId, seen] of this.sessions) if (!listed.has(sessionId) || !limited.has(seen.provider)) this.sessions.delete(sessionId);
     for (const [sessionId, seen] of this.recovery) if (!listed.has(sessionId) || !this.state.episodes?.[seen.provider] || limited.has(seen.provider)) this.recovery.delete(sessionId);
   }
-  private save() { writeSealed(this.file, this.key, SCOPE, this.state); }
+  private save() { writeSealed(this.file, this.key, SCOPE, this.state); try { this.listener?.(); } catch {} }
 }

@@ -101,6 +101,7 @@ export class UsageService {
   private readonly planFile: string;
   private planOverrides: Record<string, number> = Object.create(null) as Record<string, number>;
   private balances?: { get(id: string): Balance };
+  private onWritten?: () => void;
   private resolvers: UsageResolvers = { goalOfRun: () => undefined, runTitle: () => undefined, projectName: id => id, sessionTitle: () => undefined };
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly store: EvidenceStore) {
     this.planFile = join(config.stateDir, "usage-plans.sealed");
@@ -124,6 +125,7 @@ export class UsageService {
   close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); }
   useBalances(service: { get(id: string): Balance }) { this.balances = service; }
   useResolvers(resolvers: UsageResolvers) { this.resolvers = resolvers; }
+  onUpdated(listener: () => void) { this.onWritten = listener; }
 
   available(): boolean { return this.storeReady() && !this.tickFailed; }
   readable(): boolean {
@@ -155,6 +157,7 @@ export class UsageService {
       const stored = new Map(this.store.read(db => readSessions(db)).map(row => [row.sessionId, row]));
       const now = Date.now();
       let pages = MAX_PAGES;
+      let wroteRecords = false;
       for (const session of rows ?? await this.manager.list()) {
         if (this.closed) break;
         const previous = stored.get(session.id);
@@ -218,7 +221,10 @@ export class UsageService {
                 const owners = new Set<string>([session.id]);
                 for (const record of records) {
                   const res = writeRecordWithOwner(tx, session.id, record);
-                  if (res.status !== "kept") owners.add(res.ownerSessionId);
+                  if (res.status !== "kept") {
+                    owners.add(res.ownerSessionId);
+                    wroteRecords = true;
+                  }
                 }
                 if (this.store.status().modules[OUTCOMES_MODULE] === "ready") {
                   const targets: { sessionId: string; runId?: string; memberId?: string; exited?: boolean }[] = [];
@@ -262,6 +268,7 @@ export class UsageService {
         }
       }
       this.tickFailed = false;
+      if (wroteRecords) try { this.onWritten?.(); } catch {}
     } catch (error) {
       if (!this.tickFailed) console.warn(`[Infinite] The usage ledger could not record this tick: ${error instanceof Error ? error.message : String(error)}`);
       this.tickFailed = true;

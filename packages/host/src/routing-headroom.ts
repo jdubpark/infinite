@@ -5,7 +5,7 @@ import type { ProviderLimitEvent } from "./provider-limits.js";
 import type { ProviderHeadroom } from "./routing-types.js";
 import type { Provider } from "./types.js";
 import { listPriceUsage } from "./usage.js";
-import { readRecords } from "./usage-store.js";
+import { providerUsageRevision, readRecords } from "./usage-store.js";
 
 export const SHORT_WINDOW_MS = 5 * 3_600_000;
 export const LONG_WINDOW_MS = 7 * 86_400_000;
@@ -152,8 +152,242 @@ export function providerHeadroom(input: {
   };
 }
 
+const UNESTIMATED: ProviderHeadroom = { headroom: null, basis: "unestimated", pressure: 0, near: false };
+const LIMITED: ProviderHeadroom = { headroom: 0, basis: "limited", pressure: 1, near: true };
+
 function hasUsageRecords(db: EvidenceDb): boolean {
   return db.get("SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name='usage_records'") !== undefined;
+}
+
+function providerEventsKey(provider: Provider, events: readonly ProviderLimitEvent[]): string {
+  return events
+    .filter(event => event.provider === provider && event.limit === "usage")
+    .map(event => `${event.detectedAt}|${event.resetsAt ?? ""}`)
+    .sort()
+    .join("\n");
+}
+
+function pricesKeyOf(prices: UsageConfig["prices"] | undefined): string {
+  return prices === undefined ? "" : JSON.stringify(prices);
+}
+
+type ProviderWindowPlan = {
+  qualifies: boolean;
+  shortQualifies: boolean;
+  longQualifies: boolean;
+  earliest: number;
+  validUntilMs: number;
+};
+
+function windowPlanFor(provider: Provider, events: readonly ProviderLimitEvent[], nowMs: number): ProviderWindowPlan {
+  if (!Number.isFinite(nowMs)) {
+    return { qualifies: false, shortQualifies: false, longQualifies: false, earliest: Number.POSITIVE_INFINITY, validUntilMs: Number.POSITIVE_INFINITY };
+  }
+  const cutoff = nowMs - LIMIT_LOOKBACK_MS;
+  const shortTimes: number[] = [];
+  const longTimes: number[] = [];
+  let validUntilMs = Number.POSITIVE_INFINITY;
+  for (const event of events) {
+    if (event.provider !== provider || event.limit !== "usage") continue;
+    const at = Date.parse(event.detectedAt);
+    if (!Number.isFinite(at)) continue;
+    if (at > nowMs) {
+      validUntilMs = Math.min(validUntilMs, at);
+      continue;
+    }
+    if (at < cutoff) continue;
+    validUntilMs = Math.min(validUntilMs, at + LIMIT_LOOKBACK_MS + 1);
+    if (windowClass(at, event.resetsAt) === "short") shortTimes.push(at);
+    else longTimes.push(at);
+  }
+  const shortQualifies = shortTimes.length >= MIN_LIMIT_EVENTS;
+  const longQualifies = longTimes.length >= MIN_LIMIT_EVENTS;
+  let earliest = Number.POSITIVE_INFINITY;
+  if (shortQualifies) earliest = Math.min(earliest, ...shortTimes.map(at => at - SHORT_WINDOW_MS), nowMs - SHORT_WINDOW_MS);
+  if (longQualifies) earliest = Math.min(earliest, ...longTimes.map(at => at - LONG_WINDOW_MS), nowMs - LONG_WINDOW_MS);
+  return { qualifies: shortQualifies || longQualifies, shortQualifies, longQualifies, earliest, validUntilMs };
+}
+
+function computeProviderHeadroom(
+  db: EvidenceDb,
+  provider: Provider,
+  events: readonly ProviderLimitEvent[],
+  prices: UsageConfig["prices"] | undefined,
+  now: string,
+  nowMs: number,
+  plan: ProviderWindowPlan,
+): { headroom: ProviderHeadroom; validUntilMs: number } {
+  if (!plan.qualifies || !Number.isFinite(plan.earliest)) {
+    return { headroom: UNESTIMATED, validUntilMs: plan.validUntilMs };
+  }
+  let records: ReturnType<typeof readRecords>;
+  try {
+    records = readRecords(db, {
+      providers: [provider],
+      from: new Date(plan.earliest).toISOString(),
+    });
+  } catch {
+    return { headroom: UNESTIMATED, validUntilMs: plan.validUntilMs };
+  }
+  let validUntilMs = plan.validUntilMs;
+  const points: HeadroomUsagePoint[] = [];
+  for (const { record } of records) {
+    const at = Date.parse(record.completedAt);
+    if (!Number.isFinite(at)) continue;
+    if (at > nowMs) {
+      validUntilMs = Math.min(validUntilMs, at);
+      continue;
+    }
+    if (plan.shortQualifies && at > nowMs - SHORT_WINDOW_MS) {
+      validUntilMs = Math.min(validUntilMs, at + SHORT_WINDOW_MS);
+    }
+    if (plan.longQualifies && at > nowMs - LONG_WINDOW_MS) {
+      validUntilMs = Math.min(validUntilMs, at + LONG_WINDOW_MS);
+    }
+    const priced = listPriceUsage(record, prices);
+    const { input, output, reasoning, cacheRead, cacheWrite } = record.tokens;
+    points.push({
+      completedAt: record.completedAt,
+      listUsd: priced.pricing === "unknown" ? null : priced.cost,
+      tokens: input + output + reasoning + cacheRead + cacheWrite,
+    });
+  }
+  return {
+    headroom: providerHeadroom({ provider, limited: new Set(), events, usage: points, now }),
+    validUntilMs,
+  };
+}
+
+export function overlayLimitedHeadrooms(
+  providers: readonly Provider[],
+  cached: ReadonlyMap<Provider, ProviderHeadroom>,
+  limited: ReadonlySet<Provider>,
+): Map<Provider, ProviderHeadroom> {
+  const result = new Map<Provider, ProviderHeadroom>();
+  for (const provider of new Set(providers)) {
+    result.set(provider, limited.has(provider) ? LIMITED : (cached.get(provider) ?? UNESTIMATED));
+  }
+  return result;
+}
+
+type CachedEntry = {
+  eventsKey: string;
+  pricesKey: string;
+  usageRev: string;
+  computedAtMs: number;
+  validUntilMs: number;
+  headroom: ProviderHeadroom;
+};
+
+export class ProviderHeadroomCache {
+  private readonly entries = new Map<Provider, CachedEntry>();
+
+  clear(): void {
+    this.entries.clear();
+  }
+
+  refresh(
+    db: EvidenceDb,
+    providers: readonly Provider[],
+    events: readonly ProviderLimitEvent[],
+    prices: UsageConfig["prices"] | undefined,
+    now: string,
+  ): void {
+    const unique = [...new Set(providers)];
+    const nowMs = Date.parse(now);
+    const pricesKey = pricesKeyOf(prices);
+    let tableReady: boolean | undefined;
+    for (const provider of unique) {
+      const plan = windowPlanFor(provider, events, nowMs);
+      if (!plan.qualifies) {
+        this.entries.delete(provider);
+        continue;
+      }
+      if (tableReady === undefined) tableReady = hasUsageRecords(db);
+      if (!tableReady) {
+        this.entries.delete(provider);
+        continue;
+      }
+      const eventsKey = providerEventsKey(provider, events);
+      const usageRev = providerUsageRevision(db, provider);
+      const existing = this.entries.get(provider);
+      if (
+        existing !== undefined
+        && existing.eventsKey === eventsKey
+        && existing.pricesKey === pricesKey
+        && existing.usageRev === usageRev
+        && nowMs >= existing.computedAtMs
+        && nowMs < existing.validUntilMs
+      ) {
+        continue;
+      }
+      const computed = computeProviderHeadroom(db, provider, events, prices, now, nowMs, plan);
+      this.entries.set(provider, {
+        eventsKey,
+        pricesKey,
+        usageRev,
+        computedAtMs: nowMs,
+        validUntilMs: computed.validUntilMs,
+        headroom: computed.headroom,
+      });
+    }
+  }
+
+  read(
+    db: EvidenceDb,
+    providers: readonly Provider[],
+    limited: ReadonlySet<Provider>,
+    events: readonly ProviderLimitEvent[],
+    prices: UsageConfig["prices"] | undefined,
+    now: string,
+  ): Map<Provider, ProviderHeadroom> {
+    const unique = [...new Set(providers)];
+    const result = new Map<Provider, ProviderHeadroom>();
+    const nowMs = Date.parse(now);
+    const pricesKey = pricesKeyOf(prices);
+    let tableReady: boolean | undefined;
+    for (const provider of unique) {
+      if (limited.has(provider)) {
+        result.set(provider, LIMITED);
+        continue;
+      }
+      const plan = windowPlanFor(provider, events, nowMs);
+      if (!plan.qualifies) {
+        result.set(provider, UNESTIMATED);
+        continue;
+      }
+      if (tableReady === undefined) tableReady = hasUsageRecords(db);
+      if (!tableReady) {
+        result.set(provider, UNESTIMATED);
+        continue;
+      }
+      const eventsKey = providerEventsKey(provider, events);
+      const usageRev = providerUsageRevision(db, provider);
+      const existing = this.entries.get(provider);
+      if (
+        existing !== undefined
+        && existing.eventsKey === eventsKey
+        && existing.pricesKey === pricesKey
+        && existing.usageRev === usageRev
+        && nowMs >= existing.computedAtMs
+        && nowMs < existing.validUntilMs
+      ) {
+        result.set(provider, existing.headroom);
+        continue;
+      }
+      const computed = computeProviderHeadroom(db, provider, events, prices, now, nowMs, plan);
+      this.entries.set(provider, {
+        eventsKey,
+        pricesKey,
+        usageRev,
+        computedAtMs: nowMs,
+        validUntilMs: computed.validUntilMs,
+        headroom: computed.headroom,
+      });
+      result.set(provider, computed.headroom);
+    }
+    return result;
+  }
 }
 
 export function readProviderHeadrooms(
@@ -167,57 +401,23 @@ export function readProviderHeadrooms(
   const unique = [...new Set(providers)];
   const result = new Map<Provider, ProviderHeadroom>();
   const nowMs = Date.parse(now);
-  const cutoff = Number.isFinite(nowMs) ? nowMs - LIMIT_LOOKBACK_MS : Infinity;
-  const needUsage: Provider[] = [];
-  let earliest = Number.POSITIVE_INFINITY;
-
+  let tableReady: boolean | undefined;
   for (const provider of unique) {
     if (limited.has(provider)) {
-      result.set(provider, { headroom: 0, basis: "limited", pressure: 1, near: true });
+      result.set(provider, LIMITED);
       continue;
     }
-    const shortTimes: number[] = [];
-    const longTimes: number[] = [];
-    for (const event of events) {
-      if (event.provider !== provider || event.limit !== "usage") continue;
-      const at = Date.parse(event.detectedAt);
-      if (!Number.isFinite(at) || at < cutoff || at > nowMs) continue;
-      if (windowClass(at, event.resetsAt) === "short") shortTimes.push(at);
-      else longTimes.push(at);
-    }
-    if (shortTimes.length < MIN_LIMIT_EVENTS && longTimes.length < MIN_LIMIT_EVENTS) {
-      result.set(provider, { headroom: null, basis: "unestimated", pressure: 0, near: false });
+    const plan = windowPlanFor(provider, events, nowMs);
+    if (!plan.qualifies) {
+      result.set(provider, UNESTIMATED);
       continue;
     }
-    needUsage.push(provider);
-    if (shortTimes.length >= MIN_LIMIT_EVENTS) earliest = Math.min(earliest, ...shortTimes.map(at => at - SHORT_WINDOW_MS), nowMs - SHORT_WINDOW_MS);
-    if (longTimes.length >= MIN_LIMIT_EVENTS) earliest = Math.min(earliest, ...longTimes.map(at => at - LONG_WINDOW_MS), nowMs - LONG_WINDOW_MS);
-  }
-
-  if (needUsage.length === 0 || !Number.isFinite(earliest) || !hasUsageRecords(db)) {
-    for (const provider of needUsage) result.set(provider, { headroom: null, basis: "unestimated", pressure: 0, near: false });
-    return result;
-  }
-
-  const byProvider = new Map<Provider, HeadroomUsagePoint[]>();
-  const records = readRecords(db, {
-    providers: needUsage,
-    from: new Date(earliest).toISOString(),
-    to: new Date(nowMs + 1).toISOString(),
-  });
-  for (const { record } of records) {
-    const priced = listPriceUsage(record, prices);
-    const { input, output, reasoning, cacheRead, cacheWrite } = record.tokens;
-    const list = byProvider.get(record.provider) ?? [];
-    list.push({
-      completedAt: record.completedAt,
-      listUsd: priced.pricing === "unknown" ? null : priced.cost,
-      tokens: input + output + reasoning + cacheRead + cacheWrite,
-    });
-    byProvider.set(record.provider, list);
-  }
-  for (const provider of needUsage) {
-    result.set(provider, providerHeadroom({ provider, limited, events, usage: byProvider.get(provider) ?? [], now }));
+    if (tableReady === undefined) tableReady = hasUsageRecords(db);
+    if (!tableReady) {
+      result.set(provider, UNESTIMATED);
+      continue;
+    }
+    result.set(provider, computeProviderHeadroom(db, provider, events, prices, now, nowMs, plan).headroom);
   }
   return result;
 }

@@ -6,6 +6,7 @@ import { EvidenceError } from "./evidence/types.js";
 import { memberCodeModeExpected } from "./launch.js";
 import { objectivePromptFor } from "./objective-digest.js";
 import type { ProviderLimit, ProviderLimitEvent } from "./provider-limits.js";
+import type { ProviderHeadroomCache } from "./routing-headroom.js";
 import { routingExplain, routingStatus } from "./routing-reads.js";
 import { ROUTING_MODULE, setExplorePause } from "./routing-store.js";
 import { teamActionSchema } from "./team-types.js";
@@ -22,6 +23,7 @@ export type RoutingRouteDeps = {
     providerLimits?: () => ProviderLimit[];
     providerLimitHistory?: () => ProviderLimitEvent[];
   };
+  headroomCache?: ProviderHeadroomCache;
 };
 
 export function routingRoutes(app: express.Express, deps: RoutingRouteDeps, guard: express.RequestHandler, ownerGuard: express.RequestHandler): void {
@@ -72,6 +74,7 @@ export function routingRoutes(app: express.Express, deps: RoutingRouteDeps, guar
         limited: new Set((deps.teams.providerLimits?.() ?? []).map(item => item.provider)),
         limitHistory: deps.teams.providerLimitHistory?.() ?? [],
         prices: config.usage?.prices,
+        ...(deps.headroomCache ? { headroomCache: deps.headroomCache } : {}),
       }));
     } catch (error) {
       unavailable(error, res);

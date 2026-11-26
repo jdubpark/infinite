@@ -684,3 +684,252 @@ test("ProviderLimits.reconcile preserves credit limits and counts repeated signa
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("RoutingRecorder caches headroom off the decision path and invalidates on usage writes and window expiry", () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-headroom-cache-"));
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: randomBytes(32) });
+  try {
+    store.register(configurationModule());
+    store.register(outcomeModule({ now: () => NOW }));
+    store.register(routingModule());
+    store.register(usageModule);
+
+    const codexLight: TeamModelProfile = { id: "codex-light", label: "Codex Light", provider: "codex", model: "gpt-light", effort: "high", tier: "light" };
+    const claudeStrong: TeamModelProfile = { id: "claude-strong", label: "Claude Strong", provider: "claude", model: "claude-strong", effort: "high", tier: "strong" };
+    const claudeEscalation: TeamModelProfile = { id: "claude-esc", label: "Claude Esc", provider: "claude", model: "claude-strong", effort: "xhigh", tier: "strong" };
+    const codexEscalation: TeamModelProfile = { id: "codex-esc", label: "Codex Esc", provider: "codex", model: "gpt-light", effort: "xhigh", tier: "strong" };
+    const lineup: TeamLineup = {
+      ...mixedLineup,
+      implementers: [codexLight, claudeStrong],
+      escalations: [codexEscalation, claudeEscalation],
+      reviewer: { id: "rev", label: "Reviewer", provider: "claude", model: "claude-opus-rev", effort: "xhigh" },
+    };
+
+    const e1 = before(4 * DAY);
+    const e2 = before(2 * DAY);
+    const limitHistory: ProviderLimitEvent[] = [
+      { provider: "claude", limit: "usage", detectedAt: e1, resetsAt: after(5 * HOUR, e1), sessionId: "s-e1" },
+      { provider: "claude", limit: "usage", detectedAt: e2, resetsAt: after(5 * HOUR, e2), sessionId: "s-e2" },
+    ];
+    store.write(tx => {
+      for (const [sid, at, tokens] of [
+        ["s-e1", before(HOUR, e1), 4_000_000],
+        ["s-e2", before(HOUR, e2), 4_000_000],
+        ["s-now", before(2 * HOUR, NOW), 3_000_000],
+      ] as const) {
+        writeSession(tx, { sessionId: sid, provider: "claude", projectId: "rehearsal", createdAt: at }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+        writeRecord(tx, sid, {
+          provider: "claude",
+          providerId: "anthropic",
+          modelId: "claude-strong",
+          messageId: `m-${sid}`,
+          partId: `p-${sid}`,
+          modelSource: "reported",
+          completedAt: at,
+          tokens: { input: tokens, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+          reportedCost: 0,
+        });
+      }
+    });
+
+    let usageRecordScans = 0;
+    const rawRead = store.read.bind(store);
+    store.read = (<T>(fn: Parameters<EvidenceStore["read"]>[0]): T => rawRead(db => {
+      const wrapped = new Proxy(db, {
+        get(target, prop, receiver) {
+          if (prop === "all") {
+            return (sql: string, ...params: unknown[]) => {
+              if (sql.includes("FROM usage_records")) usageRecordScans++;
+              return target.all(sql, ...params);
+            };
+          }
+          const value = Reflect.get(target, prop, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      return fn(wrapped);
+    })) as EvidenceStore["read"];
+
+    let clockNow = NOW;
+    const routing = pinRouting({ mode: "auto", points: ["start", "escalation"], listWeight: 0.25, successValueUsd: 4, headroomWeight: 1 }, "supervised", lineup, ENDED)!;
+    const rec = new RoutingRecorder({ store, now: () => clockNow });
+
+    rec.refreshHeadrooms(lineup, limitHistory, PRICES);
+    assert.equal(usageRecordScans, 1);
+    usageRecordScans = 0;
+
+    for (let i = 0; i < 4; i++) {
+      const run = ({ id: `run-warm-${i}`, revision: 1, projectId: "rehearsal", lineup, routing, tasks: [], members: [], events: [] }) as unknown as TeamRun;
+      const task = ({ id: `task-warm-${i}`, title: `t-${i}`, instructions: "do it", paths: PATHS, dependsOn: [], revision: 1, status: "pending" }) as unknown as TeamTask;
+      run.tasks.push(task);
+      rec.applyStart({ run, task, publishHeads: false, entryTools: false, objectiveDigest: false, codeMode: false, featureMap: undefined, limited: new Set(), limitHistory, prices: PRICES });
+      rec.routeEscalation({
+        run,
+        task,
+        ownProfileId: "codex-light",
+        namedProfileId: undefined,
+        publishHeads: false,
+        entryTools: false,
+        objectiveDigest: false,
+        codeMode: false,
+        featureMap: undefined,
+        limited: new Set(),
+        limitHistory,
+        prices: PRICES,
+      });
+    }
+    assert.equal(usageRecordScans, 0);
+
+    const lazy = new RoutingRecorder({ store, now: () => clockNow });
+    for (let i = 0; i < 4; i++) {
+      const run = ({ id: `run-lazy-${i}`, revision: 1, projectId: "rehearsal", lineup, routing, tasks: [], members: [], events: [] }) as unknown as TeamRun;
+      const task = ({ id: `task-lazy-${i}`, title: `t-${i}`, instructions: "do it", paths: PATHS, dependsOn: [], revision: 1, status: "pending" }) as unknown as TeamTask;
+      run.tasks.push(task);
+      lazy.applyStart({ run, task, publishHeads: false, entryTools: false, objectiveDigest: false, codeMode: false, featureMap: undefined, limited: new Set(), limitHistory, prices: PRICES });
+    }
+    assert.equal(usageRecordScans, 1);
+
+    store.write(tx => {
+      writeSession(tx, { sessionId: "s-more", provider: "claude", projectId: "rehearsal", createdAt: before(HOUR / 2, NOW) }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+      writeRecord(tx, "s-more", {
+        provider: "claude",
+        providerId: "anthropic",
+        modelId: "claude-strong",
+        messageId: "m-more",
+        partId: "p-more",
+        modelSource: "reported",
+        completedAt: before(HOUR / 2, NOW),
+        tokens: { input: 800_000, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+        reportedCost: 0,
+      });
+    });
+
+    const runAfterWrite = ({ id: "run-after-write", revision: 1, projectId: "rehearsal", lineup, routing, tasks: [], members: [], events: [] }) as unknown as TeamRun;
+    const taskAfterWrite = ({ id: "task-after-write", title: "tw", instructions: "do it", paths: PATHS, dependsOn: [], revision: 1, status: "pending" }) as unknown as TeamTask;
+    runAfterWrite.tasks.push(taskAfterWrite);
+    lazy.applyStart({ run: runAfterWrite, task: taskAfterWrite, publishHeads: false, entryTools: false, objectiveDigest: false, codeMode: false, featureMap: undefined, limited: new Set(), limitHistory, prices: PRICES });
+    assert.equal(usageRecordScans, 2);
+    const afterWriteRow = rawRead(db => taskDecisions(db, runAfterWrite.id, taskAfterWrite.id)).rows[0]!;
+    const afterWriteClaude = afterWriteRow.payload?.candidates.find(c => c.profileId === "claude-strong");
+    assert.ok((afterWriteClaude?.pressure ?? 0) > 0.85);
+
+    clockNow = after(3 * HOUR, NOW);
+    const runAfterExpiry = ({ id: "run-after-expiry", revision: 1, projectId: "rehearsal", lineup, routing, tasks: [], members: [], events: [] }) as unknown as TeamRun;
+    const taskAfterExpiry = ({ id: "task-after-expiry", title: "te", instructions: "do it", paths: PATHS, dependsOn: [], revision: 1, status: "pending" }) as unknown as TeamTask;
+    runAfterExpiry.tasks.push(taskAfterExpiry);
+    lazy.applyStart({ run: runAfterExpiry, task: taskAfterExpiry, publishHeads: false, entryTools: false, objectiveDigest: false, codeMode: false, featureMap: undefined, limited: new Set(), limitHistory, prices: PRICES });
+    assert.equal(usageRecordScans, 3);
+    const afterExpiryRow = rawRead(db => taskDecisions(db, runAfterExpiry.id, taskAfterExpiry.id)).rows[0]!;
+    const afterExpiryClaude = afterExpiryRow.payload?.candidates.find(c => c.profileId === "claude-strong");
+    assert.equal(afterExpiryClaude?.pressure, 0);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("readProviderHeadrooms isolates corrupt usage_models per provider, treats Codex cacheWrite as unpriced, and routingStatus includes escalation-only providers", () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-headroom-isolation-"));
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: randomBytes(32) });
+  try {
+    store.register(configurationModule());
+    store.register(outcomeModule({ now: () => NOW }));
+    store.register(routingModule());
+    store.register(usageModule);
+
+    const e1 = before(4 * DAY);
+    const e2 = before(2 * DAY);
+    const limitHistory: ProviderLimitEvent[] = [
+      { provider: "claude", limit: "usage", detectedAt: e1, resetsAt: after(5 * HOUR, e1), sessionId: "cl-e1" },
+      { provider: "claude", limit: "usage", detectedAt: e2, resetsAt: after(5 * HOUR, e2), sessionId: "cl-e2" },
+      { provider: "codex", limit: "usage", detectedAt: e1, resetsAt: after(5 * HOUR, e1), sessionId: "cx-e1" },
+      { provider: "codex", limit: "usage", detectedAt: e2, resetsAt: after(5 * HOUR, e2), sessionId: "cx-e2" },
+    ];
+    store.write(tx => {
+      for (const [sid, at, tokens, cacheWrite] of [
+        ["cx-e1", before(HOUR, e1), 1_000_000, 0],
+        ["cx-e2", before(HOUR, e2), 1_000_000, 0],
+        ["cx-now", before(HOUR, NOW), 800_000, 50_000],
+      ] as const) {
+        writeSession(tx, { sessionId: sid, provider: "codex", projectId: "rehearsal", createdAt: at }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+        writeRecord(tx, sid, {
+          provider: "codex",
+          providerId: "openai",
+          modelId: "gpt-light",
+          messageId: `m-${sid}`,
+          partId: `p-${sid}`,
+          modelSource: "reported",
+          completedAt: at,
+          tokens: { input: tokens, output: 0, reasoning: 0, cacheRead: 0, cacheWrite },
+          reportedCost: 0,
+        });
+      }
+      writeSession(tx, { sessionId: "cl-bad", provider: "claude", projectId: "rehearsal", createdAt: before(HOUR, NOW) }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+      writeRecord(tx, "cl-bad", {
+        provider: "claude",
+        providerId: "anthropic",
+        modelId: "claude-strong",
+        messageId: "m-cl-bad",
+        partId: "p-cl-bad",
+        modelSource: "reported",
+        completedAt: before(HOUR, NOW),
+        tokens: { input: 500_000, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+        reportedCost: 0,
+      });
+      tx.run("UPDATE usage_models SET encrypted_model='corrupt' WHERE model_ref=(SELECT model_ref FROM usage_records WHERE session_id='cl-bad')");
+    });
+
+    const isolated = store.read(db => readProviderHeadrooms(db, ["claude", "codex"], new Set(), limitHistory, PRICES, NOW));
+    assert.deepEqual(isolated.get("claude"), { headroom: null, basis: "unestimated", pressure: 0, near: false });
+    const codex = isolated.get("codex")!;
+    assert.equal(codex.basis, "estimated");
+    assert.equal(codex.unit, "tokens");
+    assert.ok(Math.abs(codex.headroom! - 0.15) < 1e-12);
+    assert.equal(codex.near, true);
+
+    const codexLight: TeamModelProfile = { id: "codex-light", label: "Codex Light", provider: "codex", model: "gpt-light", effort: "high", tier: "light" };
+    const claudeEsc: TeamModelProfile = { id: "claude-esc", label: "Claude Esc", provider: "claude", model: "claude-strong", effort: "high", tier: "strong" };
+    const escLineup: TeamLineup = {
+      ...mixedLineup,
+      implementers: [codexLight],
+      escalations: [claudeEsc],
+      reviewer: { id: "rev", label: "Reviewer", provider: "claude", model: "claude-opus-rev", effort: "xhigh" },
+    };
+
+    const withEscalation = routingStatus(store, {
+      projectId: "rehearsal",
+      saved: { mode: "auto", points: ["start", "escalation"] },
+      autonomy: "supervised",
+      lineup: escLineup,
+      publishHeads: false,
+      entryTools: false,
+      objectiveDigest: false,
+      codeMode: false,
+      now: NOW,
+      limitHistory,
+      prices: PRICES,
+    });
+    assert.equal(withEscalation.providers?.codex?.basis, "estimated");
+    assert.equal(withEscalation.providers?.codex?.unit, "tokens");
+    assert.deepEqual(withEscalation.providers?.claude, { headroom: null, basis: "unestimated", pressure: 0, near: false });
+
+    const startOnly = routingStatus(store, {
+      projectId: "rehearsal",
+      saved: { mode: "auto", points: ["start"] },
+      autonomy: "supervised",
+      lineup: escLineup,
+      publishHeads: false,
+      entryTools: false,
+      objectiveDigest: false,
+      codeMode: false,
+      now: NOW,
+      limitHistory,
+      prices: PRICES,
+    });
+    assert.equal(startOnly.providers?.codex?.basis, "estimated");
+    assert.equal(startOnly.providers?.claude, undefined);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

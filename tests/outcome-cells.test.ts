@@ -339,6 +339,20 @@ test("cost spreads use complete costs only", () => {
   assert.equal(partialAttempt.tokens, null);
   assert.equal(partialAttempt.spentUsd, null);
   assert.equal(partialAttempt.listUsd, null);
+
+  const missingListOnly = only(buildCells([
+    row({ provider: "opencode", sessionId: "s-partial", payload: { costCoverage: "partial", tokens: 1500, spentUsd: 0.75 } }),
+  ], query({ by: [] }), lookupList));
+  assert.deepEqual(missingListOnly.tokens, { n: 1, median: 1500, iqr: [1500, 1500] });
+  assert.deepEqual(missingListOnly.spentUsd, { n: 1, median: 0.75, iqr: [0.75, 0.75] });
+  assert.equal(missingListOnly.listUsd, null);
+
+  const multiSessionAttempt = only(buildCells([
+    row({ provider: "opencode", sessionId: "s-partial", payload: { costCoverage: "complete", tokens: 2800, spentUsd: 1.4, listUsd: 1.4 } }),
+  ], query({ by: [] }), lookupList));
+  assert.deepEqual(multiSessionAttempt.tokens, { n: 1, median: 2800, iqr: [2800, 2800] });
+  assert.deepEqual(multiSessionAttempt.spentUsd, { n: 1, median: 1.4, iqr: [1.4, 1.4] });
+  assert.deepEqual(multiSessionAttempt.listUsd, { n: 1, median: 1.4, iqr: [1.4, 1.4] });
 });
 
 test("minutes, ratings, and times", () => {

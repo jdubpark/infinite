@@ -8,7 +8,7 @@ import type { ProviderLimitEvent } from "./provider-limits.js";
 import { profileIdentity } from "./run-events.js";
 import { choose, expectedCost, RESCUE_USD, screen, TIER_COSTS, tierCost, type Choice, type Screened, type Scored } from "./routing-choice.js";
 import { guardExploration } from "./routing-guards.js";
-import { readProviderHeadrooms } from "./routing-headroom.js";
+import { overlayLimitedHeadrooms, readProviderHeadrooms, type ProviderHeadroomCache } from "./routing-headroom.js";
 import { COST_HEADROOM_ALGORITHM_VERSION } from "./routing-policy.js";
 import { CHOSEN_WEIGHT, MAX_AGE_DAYS, observedCost, posterior, type CurrentConfig, type RoutingTarget } from "./routing-posterior.js";
 import { decisionSeed } from "./routing-sample.js";
@@ -18,7 +18,7 @@ import {
   readProjectState, releaseStalePending, ROUTING_MODULE, shareWindow,
 } from "./routing-store.js";
 import { taskFeatures, type FeatureMap, type TaskFeatures } from "./task-features.js";
-import type { CostsBasis, DecisionRow, ExploreGuards, RoutingKnobs, RoutingPayload } from "./routing-types.js";
+import type { CostsBasis, DecisionRow, ExploreGuards, ProviderHeadroom, RoutingKnobs, RoutingPayload } from "./routing-types.js";
 import type { TeamModelProfile, TeamRun, TeamTask } from "./team-types.js";
 import type { Provider } from "./types.js";
 
@@ -37,6 +37,8 @@ export type RouterStart = {
   limited: ReadonlySet<Provider>;
   limitHistory?: readonly ProviderLimitEvent[];
   prices?: UsageConfig["prices"];
+  headrooms?: ReadonlyMap<Provider, ProviderHeadroom>;
+  headroomCache?: ProviderHeadroomCache;
 };
 
 export type AutoFailure = "unavailable" | "budget" | "tooLarge" | "write" | "failed";
@@ -108,9 +110,10 @@ export function evaluateImplementer(db: EvidenceDb, input: RouterStart, frame: S
   const since = new Date(Date.parse(now) - MAX_AGE_DAYS * DAY_MS).toISOString();
   const useCostHeadroom = routing.algorithmVersion >= COST_HEADROOM_ALGORITHM_VERSION;
   const providers = [...new Set(frame.screened.map(item => item.profile.provider))];
-  const headrooms = useCostHeadroom
-    ? readProviderHeadrooms(db, providers, input.limited, input.limitHistory ?? [], input.prices, now)
-    : undefined;
+  const headrooms = !useCostHeadroom ? undefined
+    : input.headrooms ? overlayLimitedHeadrooms(providers, input.headrooms, input.limited)
+    : input.headroomCache ? input.headroomCache.read(db, providers, input.limited, input.limitHistory ?? [], input.prices, now)
+    : readProviderHeadrooms(db, providers, input.limited, input.limitHistory ?? [], input.prices, now);
   const scored = new Map<string, Scored>();
   const current: { identity: string; epoch: number; promptVersion: string }[] = [];
   let observedCount = 0;

@@ -473,8 +473,11 @@ test("many eligible rows keep pending Jev work within the 50-job cap", () => {
 test("pending work coalesces to the newest hash and rechecks the gate before send", async () => {
   const calls: any[] = [];
   const releases: Array<(value: any) => void> = [];
+  let resolveThirdCall!: () => void;
+  const thirdCallStarted = new Promise<void>(resolve => { resolveThirdCall = resolve; });
   const transport = { systemOne: (request: any) => {
     calls.push(request);
+    if (calls.length === 3) resolveThirdCall();
     return new Promise(resolve => releases.push(resolve));
   } } as unknown as JevTransport;
   const f = setup({ transport });
@@ -498,10 +501,15 @@ test("pending work coalesces to the newest hash and rechecks the gate before sen
       waiting: { type: "noul", noul: 0.1 },
     } };
     releases.forEach(release => release(answer));
-    await eventually(() => calls.length === 3);
+    await thirdCallStarted;
+    assert.equal(calls.length, 3, "the coalesced pending slot starts exactly one provider call");
     assert.equal(calls[2].state.lastSentence, "New queued sentence.", "the pending slot sends only its newest hash");
     assert.equal(calls.some(request => request.state.lastSentence === "Gate held sentence."), false, "a message that no longer passes the turn-finished gate is skipped before send");
     releases.slice(2).forEach(release => release(answer));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const completed = f.readings.merge([target("coalesced", now(newerMessage))])[0]!;
+    assert.equal(completed.reading?.now?.text, candidateSentences(newerMessage)[0], "the newest reading completes through the normal merge path");
+    assert.equal(calls.length, 3, "settling the newest reading does not send the gated job as a fourth provider call");
   } finally { f.dispose(); }
 });
 

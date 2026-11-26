@@ -77,14 +77,15 @@ function lateHolder(steps: string[], atDrainEnd: (step: () => void) => void) {
   const flag = join(base, "step");
   const leaderScript = `const holder = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(LATE_HOLDER)}, ${JSON.stringify(flag)}, ...${JSON.stringify(steps)}], { detached: true, stdio: ['ignore', 'inherit', 'pipe'] }); holder.stderr.once('data', () => { holder.stderr.destroy(); holder.unref(); process.stdout.write(holder.pid + '\\n'); });`;
   const { child, closed } = watched(["-e", leaderScript]);
-  let output = "", holder = 0, taken = 0;
+  let output = "", holder = 0, taken = 0, ended = false, timer: NodeJS.Timeout | undefined;
   const step = () => {
+    if (ended || holder <= 1 || gone(holder)) return;
     taken += 1;
-    if (holder > 1) process.kill(holder, "SIGUSR2");
+    process.kill(holder, "SIGUSR2");
     const deadline = Date.now() + 5_000;
     while (!existsSync(`${flag}.${taken}`) && Date.now() < deadline);
   };
-  child.once("exit", () => setTimeout(atDrainEnd, EXIT_DRAIN_MS, step));
+  child.once("exit", () => { timer = setTimeout(atDrainEnd, EXIT_DRAIN_MS, step); });
   const leader = watchLeader(child);
   child.stdout!.on("data", (chunk: Buffer) => {
     output += chunk.toString("latin1");
@@ -93,10 +94,12 @@ function lateHolder(steps: string[], atDrainEnd: (step: () => void) => void) {
   child.stderr!.resume();
   const everyStep = () => steps.every((_, index) => existsSync(`${flag}.${index + 1}`));
   const end = () => {
+    ended = true;
+    clearTimeout(timer);
     if (holder > 1 && !gone(holder)) process.kill(holder, "SIGKILL");
     rmSync(base, { recursive: true, force: true });
   };
-  return { child, closed, leader, output: () => output, holder: () => holder, everyStep, end };
+  return { child, closed, leader, step, output: () => output, holder: () => holder, everyStep, end };
 }
 
 const outcome = (work: Promise<unknown>) => work.then(
@@ -258,7 +261,7 @@ test("a reader paused when the drain ends and resumed in that loop turn is not a
 
 test("a reader that pauses on bytes read after the drain ends is not a leftover and its output arrives whole", CASE, async () => {
   let armed = false;
-  const late = lateHolder(["wc"], step => {
+  const late = lateHolder(["w", "c"], step => {
     armed = true;
     step();
   });
@@ -266,13 +269,16 @@ test("a reader that pauses on bytes read after the drain ends is not a leftover 
     if (!armed) return;
     armed = false;
     late.child.stdout!.pause();
-    setTimeout(() => late.child.stdout!.resume(), 500);
+    setTimeout(() => {
+      late.child.stdout!.resume();
+      late.step();
+    }, 500);
   });
   try {
     assert.equal(await within(late.closed, 2 * EXIT_DRAIN_MS + 5_000, "the watched child closes"), 0);
-    assert.equal(late.everyStep(), true, "the holder wrote its last bytes and closed as the drain ended");
     assert.equal(late.leader.leftover, false, "a reader that backpressure paused after the drain ended is not a leftover holder");
     assert.equal(late.output(), `${late.holder()}\n${"y".repeat(4096)}`);
+    assert.equal(late.everyStep(), true, "the holder wrote as the drain ended and closed after the reader resumed");
   } finally {
     late.end();
   }
@@ -288,9 +294,9 @@ test("bytes arriving in each of the first two drain turns hold the output open u
   });
   try {
     assert.equal(await within(late.closed, SETTLE_MS, "the watched child closes"), 0);
-    assert.equal(late.everyStep(), true, "the holder wrote in two turns and closed in the third");
     assert.equal(late.leader.leftover, false, "an output that ends in the third turn is not a leftover");
     assert.equal(late.output(), `${late.holder()}\n${"y".repeat(8192)}`);
+    assert.equal(late.everyStep(), true, "the holder wrote in two turns and closed in the third");
   } finally {
     late.end();
   }

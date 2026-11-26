@@ -214,7 +214,7 @@ export async function gradeTrial(
   if (read.state === "too-large") {
     return { kind: "graded", grade: gradeOf({ ...common, ending: "scope-violation", overwritten: 0, diff: null }), patch: "too-large" };
   }
-  if (read.state === "failed") {
+  if (read.state !== "read") {
     const stopState = await stopEvalIdentity(ctx.identity, ctx.evalUid, ctx.inventory);
     return { kind: "environment", cause: stopState === "stopped" ? "grader-failed" : "eval-processes-alive" };
   }

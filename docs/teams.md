@@ -595,7 +595,7 @@ Eval capture keeps each implementer task of a finished team run as an eval task.
 
 Capture is off by default. Only a project in `github` source mode captures. A laptop project writes nothing and reads nothing.
 
-**Turn capture on only after the owner has admitted the patch form and the capture name list in the launcher** (see [Git forms](#git-forms)). Until then every task ends `capture-failed`. While the base check form is refused, every task ends `base-not-proven`.
+**Turn capture on only after the owner has admitted the patch form, the capture name list, and the tree check form in the launcher** (see [Git forms](#git-forms)). Until then every task ends `capture-failed` (or equal-tree base deltas end `capture-failed` if only the tree check is missing). While the base check form is refused, every task ends `base-not-proven`.
 
 Capture never changes a run. A failed, stalled, or slow capture never delays a run, takes an enrichment slot, or reaches a member.
 
@@ -655,7 +655,7 @@ Material codes. The task is `rejected` after the reads.
 
 | Code | Meaning |
 |---|---|
-| `capture-failed` | The reference's name read failed or threw. |
+| `capture-failed` | The reference's name read or a patch read failed, threw, or produced an empty reference diff. |
 | `reference-too-wide` | The reference lists more than 500 files, or its list was cut. |
 | `excluded-area` | A reference file is in an excluded area. |
 | `no-hidden-tests` | The reference has no test file, or only test files. |
@@ -672,7 +672,7 @@ Promotion codes. The ledger's decision rule runs first, then the facts, in this 
 | `same-model-review` | The approving review ran on the same model as the work. |
 | `not-accepted` | The ledger counts the attempt as not accepted. |
 | `acceptance-unknown` | The ledger cannot tell whether the attempt was accepted. |
-| `patch-missing` | A patch could not be read, or the patch form is refused. |
+| `patch-missing` | A patch commit/ref is missing (pre-upgrade partial rows created before empty/failed patch reads were split can also settle here; newly read failures record `capture-failed`). |
 | `reference-unknown` | The approval read is missing, or the later-change list was too wide. |
 | `reference-ambiguous` | A later commit of the run changed a reference file. |
 | `base-not-proven` | Form 3 did not prove that the anchor is on the mirror's branch. |
@@ -681,7 +681,7 @@ Promotion codes. The ledger's decision rule runs first, then the facts, in this 
 
 An unfrozen ledger row waits. A ledger row that does not open leaves its task as it is, and the pass counts it as `unreadable`.
 
-A missing fact stays missing. A refused patch is never stored as empty. A truncated list is never read as complete. An unknown acceptance is never a refusal or an acceptance. An empty reference patch counts as missing, because a captured task has at least two files, so an empty read means the read failed without saying so. An empty base delta is kept, because two different commits may have equal trees.
+A missing fact stays missing. A refused or failed patch read is never stored as empty or coerced to missing: it rejects the capture as `capture-failed`. A truncated list is never read as complete. An unknown acceptance is never a refusal or an acceptance. An empty reference patch also rejects as `capture-failed`, because a captured task has at least two files, so an empty read indicates a read failure rather than a missing ref. An empty base delta is kept only after Form 4 proves both commits have equal tree OIDs, because two different commits may have equal trees while a silent launcher could also exit zero with empty output.
 
 ### Deletion and retention
 
@@ -724,11 +724,12 @@ Each capture read runs through the team Git prefix, with the six `-c` settings. 
 
 | Form | Command | Limit | If refused |
 |---|---|---|---|
-| 1. Patch (new) | `git diff --no-ext-diff --no-textconv --no-color --binary --default-prefix --no-renames --submodule=short --ignore-submodules=none --unified=3 --inter-hunk-context=0 FROM TO --`, in the run's integration checkout | 1,048,576 bytes; Git 2.41 or later | The patch is `missing`, and the task ends `patch-missing`. |
+| 1. Patch (new) | `git diff --no-ext-diff --no-textconv --no-color --binary --default-prefix --no-renames --submodule=short --ignore-submodules=none --unified=3 --inter-hunk-context=0 FROM TO --`, in the run's integration checkout | 1,048,576 bytes; Git 2.41 or later | A missing ref leaves the patch `missing` (`patch-missing`); a refused/failed read or empty reference diff rejects as `capture-failed`. |
 | 2. Name list of capture (new) | `git diff --no-ext-diff --no-textconv --name-only --no-renames --ignore-submodules=none -z FROM TO --`, in the same checkout | 500 names for a reference; 2,000 for later changes; 64 KiB of output | Every capture ends `capture-failed`; a later-change list leaves the approval unknown. |
 | 3. Base check (reused, form 1 of the base scan) | `git merge-base --is-ancestor ANCHOR HEAD`, in the source mirror, where `HEAD` is the mirror's head | 30 seconds | Every task ends `base-not-proven`. |
+| 4. Tree check (new, same shape as form 4 of the base scan) | `git log --no-walk=unsorted --no-show-signature --format=%H %T %P FROM TO --`, in the run's integration checkout | 30 seconds; 4,096 bytes | An empty base delta rejects as `capture-failed`; non-empty base deltas do not run this form. |
 
-Form 3 is in a launcher audit that is pending with the outcome-ledger release. Forms 1 and 2 need the owner's launcher approval before capture is turned on. The launcher must also end each of the three reads by itself after 35 seconds: the host may not signal a command that the launcher runs as another account, and a read that hangs there holds one of four places until it ends.
+Form 3 is in a launcher audit that is pending with the outcome-ledger release. Forms 1, 2, and 4 need the owner's launcher approval before capture is turned on. The launcher must also end each of the four reads by itself after 35 seconds: the host may not signal a command that the launcher runs as another account, and a read that hangs there holds one of four places until it ends.
 
 ## Eval mining and validation
 

@@ -6,10 +6,19 @@ export type SwarmSession = Session;
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering"
   | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 
+export type SwarmWaitReason = {
+  kind: string;
+  summary: string;
+  memberId?: string;
+  taskId?: string;
+  since?: string;
+  resetsAt?: string;
+};
+
 export type SwarmMember = {
   memberId: string; sessionId: string; role: string; revision: number; title: string; status: string;
   taskId?: string; provider?: string; modelProfile?: Pick<TeamModelProfile, "label" | "tier">; usage?: Pick<UsageTotals, "cost">;
-  startedAt?: string; reportedAt?: string; lastActivityAt?: string; pendingLimit?: boolean; stalledAt?: string; stoppedReason?: string;
+  startedAt?: string; reportedAt?: string; lastActivityAt?: string; spinnerOnlySince?: string; pendingLimit?: boolean; stalledAt?: string; stoppedReason?: string;
 };
 export type SwarmTask = {
   id: string; title: string; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; paths: string[];
@@ -29,6 +38,7 @@ export type SwarmTeam = {
   permissionDecisions?: { targetSessionId: string; promptId: number; status: string }[];
   usage?: { total: UsageTotals; unmeasuredMembers?: number };
   workers?: { limit: number; max: number; running: number; ready: number };
+  waitReasons?: SwarmWaitReason[];
 };
 export type SwarmMission = {
   id: string; title: string; status: MissionStatus; stopReason?: "deadline";
@@ -79,6 +89,7 @@ export interface Agent {
   earlier: boolean;
   limited: boolean;
   stalled: boolean;
+  spinnerOnly: boolean;
   observable: boolean;
   title: string;
   provider: string;
@@ -113,6 +124,7 @@ type UnitBase = {
   baseCommit: string;
   headCommit?: string;
   tasks: SwarmTask[];
+  waitReasons: SwarmWaitReason[];
 };
 
 export type LiveUnit = UnitBase & {

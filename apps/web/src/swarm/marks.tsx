@@ -19,7 +19,7 @@ export function RoleChip({ role }: { role: RoleCode }) {
   return <abbr className="sw-role" title={ROLE_NAME[role]}>{role}</abbr>;
 }
 
-export function agentName(agent: { role: RoleCode; state: AgentState; tool?: string; earlier?: boolean; limited?: boolean; stalled?: boolean }) {
+export function agentName(agent: { role: RoleCode; state: AgentState; tool?: string; earlier?: boolean; limited?: boolean; stalled?: boolean; spinnerOnly?: boolean }) {
   return [ROLE_NAME[agent.role], STATE_LABEL[agent.state], agent.tool ? `tool ${agent.tool}` : "", agent.earlier ? "earlier revision" : "",
-    agent.limited ? "provider limit" : "", agent.stalled ? "stalled" : ""].filter(Boolean).join(", ");
+    agent.limited ? "provider limit" : "", agent.stalled ? "stalled" : "", agent.spinnerOnly ? "spinner-only" : ""].filter(Boolean).join(", ");
 }

@@ -83,6 +83,7 @@ async function startFixture() {
   const runtime = { id: randomUUID(), location: "cloud" as const, transport: "pty" as const };
   const session: Bootstrap["session"] = {
     id,
+    executionIdentity: "production",
     provider: "demo",
     title: "Replay dimensions",
     projectId: "fixture",
@@ -100,6 +101,7 @@ async function startFixture() {
   });
   const bootstrap: Bootstrap = {
     session,
+    executionIdentity: "production",
     profile: { command: process.execPath, args: [script] },
     runDir,
     stateDir,

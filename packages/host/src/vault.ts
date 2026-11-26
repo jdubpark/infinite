@@ -109,26 +109,45 @@ export class Journal {
     }
   }
   append(type: Event["type"], data: Event["data"]): Event {
-    const seq = this.seq + 1;
-    const event: Event = { seq, at: new Date().toISOString(), type, data };
-    const segment = `${String(Math.floor((seq - 1) / SEGMENT_SIZE)).padStart(10, "0")}.journal`;
-    const file = join(this.directory, segment);
-    const bytes = Buffer.from(
-      seal(this.key, `${this.sessionId}:${seq}`, event) + "\n",
+    return this.appendAll(type, [data])[0];
+  }
+  appendAll(type: Event["type"], items: readonly Event["data"][]): Event[] {
+    const at = new Date().toISOString();
+    const first = this.seq;
+    const events = items.map(
+      (data, index): Event => ({ seq: first + index + 1, at, type, data }),
     );
-    const fd = openSync(file, "a", 0o600);
-    let segmentBytes = 0;
-    try {
-      let offset = 0;
-      while (offset < bytes.length) offset += writeSync(fd, bytes, offset);
-      fsyncSync(fd);
-      segmentBytes = fstatSync(fd).size;
-    } finally {
-      closeSync(fd);
+    for (let start = 0; start < events.length; ) {
+      const segment = Math.floor((events[start].seq - 1) / SEGMENT_SIZE);
+      const end = Math.min(events.length, (segment + 1) * SEGMENT_SIZE - first);
+      const lines = events
+        .slice(start, end)
+        .map((event) => seal(this.key, `${this.sessionId}:${event.seq}`, event) + "\n");
+      const bytes = Buffer.from(lines.join(""));
+      const name = `${String(segment).padStart(10, "0")}.journal`;
+      const fd = openSync(join(this.directory, name), "a", 0o600);
+      let segmentBytes = 0;
+      try {
+        let offset = 0;
+        while (offset < bytes.length) offset += writeSync(fd, bytes, offset);
+        fsyncSync(fd);
+        segmentBytes = fstatSync(fd).size;
+      } finally {
+        closeSync(fd);
+      }
+      let size = segmentBytes - bytes.length;
+      try {
+        for (let at = start; at < end; at++) {
+          size += Buffer.byteLength(lines[at - start]);
+          this.seq = events[at].seq;
+          this.options?.onAppend?.(events[at], { segment: name, bytes: size });
+        }
+      } finally {
+        this.seq = events[end - 1].seq;
+      }
+      start = end;
     }
-    this.seq = seq;
-    this.options?.onAppend?.(event, { segment, bytes: segmentBytes });
-    return event;
+    return events;
   }
 }
 

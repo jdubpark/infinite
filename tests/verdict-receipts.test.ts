@@ -172,14 +172,17 @@ test("a restart at any save of a late verdict writes nothing twice", () => {
   assert.equal(f.host.deliveryReads, reads, "no store read");
   counts(f, 2);
 
-  const g = delivered();
-  g.host.deliveryFact = "landed";
-  g.host.failSaveAt = 2;
-  assert.throws(() => g.verdicts.settleReceipt(g.holder));
-  const kept = snapshot(g);
-  assert.equal(g.verdicts.settleReceipt(g.holder), false);
-  unchanged(g, kept);
-  counts(g, 2);
+  for (const failing of [2, 3]) {
+    const g = delivered();
+    g.host.deliveryFact = "landed";
+    g.host.failSaveAt = failing;
+    assert.throws(() => g.verdicts.settleReceipt(g.holder));
+    const read = g.host.deliveryReads;
+    assert.equal(g.verdicts.settleReceipt(g.holder), true, "the retry in the same process finishes the late verdict");
+    assert.equal(g.host.deliveryReads, read, "no second store read");
+    counts(g, 2);
+    assert.equal(g.verdicts.settleReceipt(g.holder), false);
+  }
 });
 
 test("a late verdict judges only what its earlier verdict held, and replaces what any earlier id wrote", () => {

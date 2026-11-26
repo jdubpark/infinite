@@ -50,7 +50,7 @@ export function markProvisional(goal: ProductGoal): void {
   goal.status = "ready-for-review"; goal.reason = PROVISIONAL_REASON; goal.stopReason = "provisional-met";
 }
 
-export function applyLateVerdict(goal: ProductGoal, cycle: GoalCycle, team: Pick<TeamView, "assessment">): boolean {
+export function applyLateVerdict(goal: ProductGoal, cycle: GoalCycle, team: Pick<TeamView, "revision" | "assessment">): boolean {
   const late = lateVerdict(goal, cycle, team);
   if (late === undefined) return false;
   Object.assign(cycle, late);

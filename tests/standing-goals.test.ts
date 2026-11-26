@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { GoalService } from "../packages/host/src/goals.js";
 import { createGoalSchema, parseCreateGoal, type CreateGoal, type GoalCycle, type ProductGoal } from "../packages/host/src/goal-types.js";
+import { unresolvedOperation } from "../packages/host/src/goal-standing.js";
 import { createRoutineSchema } from "../packages/host/src/routine-types.js";
 import { TeamError, type TeamService } from "../packages/host/src/teams.js";
 import { emptyUsage } from "../packages/host/src/team-usage.js";
@@ -649,4 +650,45 @@ test("a standing goal refuses an objective over 24,000 bytes; a finite goal keep
   await goals.create(standing({ objective: "\uAC00".repeat(8000) }));
   const { standing: _standing, ...finite } = standing({ objective: "\uAC00".repeat(9000) });
   await goals.create(finite as CreateGoal);
+});
+
+test("a standing goal waits while a background head publication is in flight, then advances once it settles or blocks on failure", async t => {
+  const { teams, goals, advance } = fixture(t);
+  const created = await goals.create(standing());
+  goals.start();
+  const first = await until(() => teams.launches[0], Boolean);
+  const firstHead = "b".repeat(40);
+  teams.settle(first.request.requestId, "ready-for-review", { headCommit: firstHead, publishing: true });
+  assert.match(unresolvedOperation(teams.get(first.request.requestId), false) ?? "", /head publication/i);
+  advance(30);
+  await sleep(1200);
+  const waiting = goals.get(created.id);
+  assert.equal(waiting.activeTeamId, first.request.requestId, "the cycle stays active while head publication runs");
+  assert.equal(waiting.cycles[0]!.class, undefined, "the cycle does not settle while publication is in flight");
+  assert.equal(teams.launches.length, 1, "no next cycle launches while publication is in flight");
+
+  teams.settle(first.request.requestId, "ready-for-review", {
+    headCommit: firstHead,
+    publishing: false,
+    publication: { repository: "example/app", branch: "main", commit: firstHead, publishedAt: new Date().toISOString() },
+  });
+  const second = await until(() => teams.launches[1], Boolean);
+  assert.equal(second.context.parentRunId, first.request.requestId);
+  assert.equal(goals.get(created.id).cycles[0]!.class, "reviewed");
+
+  const secondHead = "c".repeat(40);
+  teams.settle(second.request.requestId, "ready-for-review", { headCommit: secondHead, publishing: true });
+  advance(30);
+  await sleep(1200);
+  assert.equal(teams.launches.length, 2, "the second cycle also waits while head publication runs");
+
+  const failedAt = new Date().toISOString();
+  teams.settle(second.request.requestId, "ready-for-review", {
+    headCommit: secondHead,
+    publishing: false,
+    publication: { repository: "example/app", branch: "main", failure: { commit: secondHead, category: "network", attempts: 1, at: failedAt, retryAt: failedAt } },
+  });
+  const blocked = await until(() => goals.get(created.id), goal => goal.status === "blocked");
+  assert.equal(blocked.reasonCode, "external-operation");
+  assert.equal(teams.launches.length, 2);
 });

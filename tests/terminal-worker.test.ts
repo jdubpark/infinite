@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createConnection } from "node:net";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import headless from "@xterm/headless";
@@ -136,7 +137,7 @@ process.stdin.on("data", data => {
 `;
 
 async function fixture(provider: "demo" | "claude" | "codex" = "demo", initialPrompt = "", team?: TeamAssignment) {
-  const root = mkdtempSync("/tmp/inf-worker-");
+  const root = mkdtempSync(join(tmpdir(), "inf-worker-"));
   const id = randomUUID();
   const key = randomBytes(32);
   const runDir = join(root, "run");
@@ -187,6 +188,17 @@ async function fixture(provider: "demo" | "claude" | "codex" = "demo", initialPr
     }, state => Boolean(state?.screen.includes("READY")));
   } catch (error) { await stop(); throw error; }
   return { id, root, stateDir, runDir, key, session: bootstrap.session, cwd: realpathSync(root), runtime, call, events, output, command, stop, persisted: () => unseal<WorkerState>(key, `${id}:status`, readFileSync(join(stateDir, "sessions", id, "status.sealed"), "utf8")) };
+}
+
+async function fixtures(count: number, start: () => ReturnType<typeof fixture>) {
+  const started = await Promise.allSettled(Array.from({ length: count }, start));
+  const workers = started.flatMap(result => result.status === "fulfilled" ? [result.value] : []);
+  const failure = started.find(result => result.status === "rejected");
+  if (failure?.status === "rejected") {
+    await Promise.all(workers.map(worker => worker.stop()));
+    throw failure.reason;
+  }
+  return workers;
 }
 
 async function dialogHold() {
@@ -488,92 +500,97 @@ test("delegated answers stay bound to the assigned one-shot prompt and stop afte
   const team: TeamAssignment = { runId: randomUUID(), memberId: randomUUID(), revision: 1, role: "implementer", taskId: "task-one" };
   const decisionId = randomUUID();
   const actor = { id: `team-permission:${decisionId}`, label: "Team permission" };
-  const worker = await fixture("demo", "", team);
-  try {
-    await worker.command("permission");
-    const open = await waitFor(() => worker.call({ op: "state" }), state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
-    const prompt = open.attention.prompt!;
-    const lease = await worker.call<ControlLease>({ op: "control", action: "claim", actor });
-    const stale = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), promptHash: "0".repeat(64) };
-    await assert.rejects(worker.call(stale), { code: "prompt-changed" });
-    const staleEvidence = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), evidenceHash: "0".repeat(64) };
-    await assert.rejects(worker.call(staleEvidence), { code: "prompt-changed" });
-    const wrongTarget = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), assignment: { ...team, memberId: randomUUID() } };
-    await assert.rejects(worker.call(wrongTarget), { code: "unsupported" });
-    const wrongSession = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), targetSessionId: randomUUID() };
-    await assert.rejects(worker.call(wrongSession), /Invalid delegated answer request/);
-    const wrongCwd = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), targetCwd: `${worker.cwd}/other` };
-    await assert.rejects(worker.call(wrongCwd), { code: "unsupported" });
-    for (const assignment of [null, [], {}]) {
-      const malformed = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), assignment } as unknown as WorkerRequest;
-      await assert.rejects(worker.call(malformed), /Invalid delegated answer request/);
-    }
-    const answerIntents = () => worker.events().filter(event => event.type === "input-intent" && event.data.op === "answer");
-    assert.equal(answerIntents().length, 0, "stale hashes and foreign assignments never journal or type an answer");
-
-    const valid = teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId);
-    const answer = await worker.call<Receipt & { result?: string }>(valid);
-    assert.equal(answer.state, "delivered");
-    assert.equal(answer.result, "closed");
-    assert.equal(answerIntents().length, 1);
-    const again = await worker.call<Receipt & { result?: string }>(valid);
-    assert.deepEqual(again, answer);
-    assert.equal(answerIntents().length, 1, "receipt replay does not type the permission twice");
-    const intent = answerIntents()[0];
-    assert.equal((intent.data.delegation as { decisionId: string }).decisionId, valid.decisionId);
-    assert.equal(worker.output().match(/APPROVED/g)?.length, 1);
-  } finally { await worker.stop(); }
-
-  const takeoverWorker = await fixture("demo", "", team);
+  const workers = await fixtures(3, () => fixture("demo", "", team));
+  const [worker, takeoverWorker, invalidationWorker] = workers;
   let takeoverHold: DialogHold | undefined;
-  try {
-    takeoverHold = await dialogHold();
-    await takeoverWorker.command(`permission ${takeoverHold.url}`);
-    const open = await waitFor(() => takeoverWorker.call({ op: "state" }), state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
-    const human = { id: "human-control", label: "Human" };
-    const humanLease = await takeoverWorker.call<ControlLease>({ op: "control", action: "claim", actor: human });
-    await assert.rejects(takeoverWorker.call({ op: "control", action: "claim", actor }), { code: "control-busy" });
-    await takeoverWorker.call({ op: "control", action: "release", actor: human, leaseId: humanLease.id });
-    const hostLease = await takeoverWorker.call<ControlLease>({ op: "control", action: "claim", actor });
-    const request = teamAnswerRequest(takeoverWorker, team, open.attention.prompt!, randomUUID(), actor, hostLease.id, decisionId);
-    const pending = takeoverWorker.call(request);
-    await takeoverHold.reached(pending);
-    const takeover = await takeoverWorker.call<ControlLease>({ op: "control", action: "claim", actor: human, takeover: true });
-    takeoverHold.release();
-    const interrupted = await pending as Receipt & { result?: string };
-    assert.equal(interrupted.state, "uncertain");
-    assert.equal(interrupted.result, undefined);
-    assert.equal((await takeoverWorker.call({ op: "state" })).control?.id, takeover.id);
-    const repeated = await takeoverWorker.call<Receipt & { result?: string }>(request);
-    assert.equal(repeated.state, "uncertain");
-    assert.equal(takeoverWorker.events().filter(event => event.type === "input-intent" && event.data.requestId === request.requestId).length, 1);
-    assert.equal(takeoverWorker.events().filter(event => event.type === "input-result" && event.data.requestId === request.requestId).length, 0);
-    assert.doesNotMatch(takeoverWorker.output(), /APPROVED/);
-  } finally { takeoverHold?.close(); await takeoverWorker.stop(); }
-
-  const invalidationWorker = await fixture("demo", "", team);
   let invalidationHold: DialogHold | undefined;
   try {
-    invalidationHold = await dialogHold();
-    await invalidationWorker.command(`permission ${invalidationHold.url}`);
-    const open = await waitFor(() => invalidationWorker.call({ op: "state" }), state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
-    const hostLease = await invalidationWorker.call<ControlLease>({ op: "control", action: "claim", actor });
-    const request = teamAnswerRequest(invalidationWorker, team, open.attention.prompt!, randomUUID(), actor, hostLease.id, decisionId);
-    const pending = invalidationWorker.call<Receipt & { result?: string }>(request);
-    await invalidationHold.reached(pending);
-    assert.deepEqual(await invalidationWorker.call({ op: "team-answer-invalidate", decisionId }), { invalidated: true });
-    invalidationHold.release();
-    const interrupted = await pending;
-    assert.equal(interrupted.state, "uncertain");
-    assert.equal(interrupted.result, undefined);
-    assert.equal(invalidationWorker.events().filter(event => event.type === "input-result" && event.data.requestId === request.requestId).length, 0);
-    assert.doesNotMatch(invalidationWorker.output(), /APPROVED/);
-    const afterInvalidation = await invalidationWorker.call({ op: "state", screen: true });
-    assert.equal(afterInvalidation.attention.prompt?.id, open.attention.prompt?.id);
-    assert.equal(afterInvalidation.attention.state, "needs-you");
-    assert.equal(afterInvalidation.control, null);
-    await assert.rejects(invalidationWorker.call({ ...request, requestId: randomUUID() }), { code: "unsupported" });
-  } finally { invalidationHold?.close(); await invalidationWorker.stop(); }
+    {
+      await worker.command("permission");
+      const open = await waitFor(() => worker.call({ op: "state" }), state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
+      const prompt = open.attention.prompt!;
+      const lease = await worker.call<ControlLease>({ op: "control", action: "claim", actor });
+      const stale = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), promptHash: "0".repeat(64) };
+      await assert.rejects(worker.call(stale), { code: "prompt-changed" });
+      const staleEvidence = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), evidenceHash: "0".repeat(64) };
+      await assert.rejects(worker.call(staleEvidence), { code: "prompt-changed" });
+      const wrongTarget = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), assignment: { ...team, memberId: randomUUID() } };
+      await assert.rejects(worker.call(wrongTarget), { code: "unsupported" });
+      const wrongSession = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), targetSessionId: randomUUID() };
+      await assert.rejects(worker.call(wrongSession), /Invalid delegated answer request/);
+      const wrongCwd = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), targetCwd: `${worker.cwd}/other` };
+      await assert.rejects(worker.call(wrongCwd), { code: "unsupported" });
+      for (const assignment of [null, [], {}]) {
+        const malformed = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), assignment } as unknown as WorkerRequest;
+        await assert.rejects(worker.call(malformed), /Invalid delegated answer request/);
+      }
+      const answerIntents = () => worker.events().filter(event => event.type === "input-intent" && event.data.op === "answer");
+      assert.equal(answerIntents().length, 0, "stale hashes and foreign assignments never journal or type an answer");
+
+      const valid = teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId);
+      const answer = await worker.call<Receipt & { result?: string }>(valid);
+      assert.equal(answer.state, "delivered");
+      assert.equal(answer.result, "closed");
+      assert.equal(answerIntents().length, 1);
+      const again = await worker.call<Receipt & { result?: string }>(valid);
+      assert.deepEqual(again, answer);
+      assert.equal(answerIntents().length, 1, "receipt replay does not type the permission twice");
+      const intent = answerIntents()[0];
+      assert.equal((intent.data.delegation as { decisionId: string }).decisionId, valid.decisionId);
+      assert.equal(worker.output().match(/APPROVED/g)?.length, 1);
+    }
+
+    {
+      takeoverHold = await dialogHold();
+      await takeoverWorker.command(`permission ${takeoverHold.url}`);
+      const open = await waitFor(() => takeoverWorker.call({ op: "state" }), state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
+      const human = { id: "human-control", label: "Human" };
+      const humanLease = await takeoverWorker.call<ControlLease>({ op: "control", action: "claim", actor: human });
+      await assert.rejects(takeoverWorker.call({ op: "control", action: "claim", actor }), { code: "control-busy" });
+      await takeoverWorker.call({ op: "control", action: "release", actor: human, leaseId: humanLease.id });
+      const hostLease = await takeoverWorker.call<ControlLease>({ op: "control", action: "claim", actor });
+      const request = teamAnswerRequest(takeoverWorker, team, open.attention.prompt!, randomUUID(), actor, hostLease.id, decisionId);
+      const pending = takeoverWorker.call(request);
+      await takeoverHold.reached(pending);
+      const takeover = await takeoverWorker.call<ControlLease>({ op: "control", action: "claim", actor: human, takeover: true });
+      takeoverHold.release();
+      const interrupted = await pending as Receipt & { result?: string };
+      assert.equal(interrupted.state, "uncertain");
+      assert.equal(interrupted.result, undefined);
+      assert.equal((await takeoverWorker.call({ op: "state" })).control?.id, takeover.id);
+      const repeated = await takeoverWorker.call<Receipt & { result?: string }>(request);
+      assert.equal(repeated.state, "uncertain");
+      assert.equal(takeoverWorker.events().filter(event => event.type === "input-intent" && event.data.requestId === request.requestId).length, 1);
+      assert.equal(takeoverWorker.events().filter(event => event.type === "input-result" && event.data.requestId === request.requestId).length, 0);
+      assert.doesNotMatch(takeoverWorker.output(), /APPROVED/);
+    }
+
+    {
+      invalidationHold = await dialogHold();
+      await invalidationWorker.command(`permission ${invalidationHold.url}`);
+      const open = await waitFor(() => invalidationWorker.call({ op: "state" }), state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
+      const hostLease = await invalidationWorker.call<ControlLease>({ op: "control", action: "claim", actor });
+      const request = teamAnswerRequest(invalidationWorker, team, open.attention.prompt!, randomUUID(), actor, hostLease.id, decisionId);
+      const pending = invalidationWorker.call<Receipt & { result?: string }>(request);
+      await invalidationHold.reached(pending);
+      assert.deepEqual(await invalidationWorker.call({ op: "team-answer-invalidate", decisionId }), { invalidated: true });
+      invalidationHold.release();
+      const interrupted = await pending;
+      assert.equal(interrupted.state, "uncertain");
+      assert.equal(interrupted.result, undefined);
+      assert.equal(invalidationWorker.events().filter(event => event.type === "input-result" && event.data.requestId === request.requestId).length, 0);
+      assert.doesNotMatch(invalidationWorker.output(), /APPROVED/);
+      const afterInvalidation = await invalidationWorker.call({ op: "state", screen: true });
+      assert.equal(afterInvalidation.attention.prompt?.id, open.attention.prompt?.id);
+      assert.equal(afterInvalidation.attention.state, "needs-you");
+      assert.equal(afterInvalidation.control, null);
+      await assert.rejects(invalidationWorker.call({ ...request, requestId: randomUUID() }), { code: "unsupported" });
+    }
+  } finally {
+    takeoverHold?.close();
+    invalidationHold?.close();
+    await Promise.all(workers.map(started => started.stop()));
+  }
 });
 
 function sessionAnswerRequest(worker: Awaited<ReturnType<typeof fixture>>, prompt: NonNullable<WorkerState["attention"]["prompt"]>, actor: ControlActor, leaseId: string, decisionId: string, option: number) {

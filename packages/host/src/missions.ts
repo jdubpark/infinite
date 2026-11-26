@@ -1119,7 +1119,7 @@ export class MissionService {
     const waiting = stored.inbox.length + stored.notes.length - inbox.length - notes.length;
     const undelivered = stored.inbox.filter(isDirectionMessage).length;
     const messages = [...inbox, ...notes], context = { openChildDecisions: this.openChildDecisions(stored), waiting, answerProjectId: this.config.intake?.mission.answerProjectId,
-      notes: stored.coordinatorNotes ?? [], deliveredDirections: Math.max(0, mission.steering.length - undelivered) };
+      notes: stored.coordinatorNotes ?? [], deliveredDirections: Math.max(0, mission.steering.length - undelivered), queuedForwards: this.review.queuedForwards(stored) };
     const build = (list: MissionMessage[], promptContext: typeof context) => continuation?.mode === "resume"
       ? missionFollowUpPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext)
       : missionPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext);

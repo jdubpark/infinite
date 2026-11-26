@@ -11,6 +11,7 @@ import { intakeEndedByRemoval } from "./review-feedback.js";
 import type { RetentionState, Stored, TeamServiceOptions } from "./teams.js";
 import { MemberTraces, removeMemberTraces, type TraceSettlementHost } from "./member-traces.js";
 import { processesCleared, type CommandFence } from "./team-command-fence.js";
+import { TrackedTaskSet } from "./team-diagnostics.js";
 
 function retentionEventAt(run: TeamRun) {
   const event = [...run.events].reverse().find(item => {
@@ -57,6 +58,7 @@ export type RetentionHost = Pick<TeamKernel, "records" | "commands" | "manager" 
   refreshOperationCensus(stored: Stored, force?: boolean): Promise<NonNullable<Stored["census"]>["state"] | undefined>;
   readonly fence: CommandFence;
   closeStaleBlockedRun(stored: Stored, hours: number): Promise<void>;
+  onBackgroundTask?: () => void;
 };
 
 const REMOVAL_RETRY_MS = 5 * 60_000;
@@ -70,16 +72,19 @@ function pathStrictlyInside(root: string, target: string) {
 export class TeamRetention {
   readonly removingRuns = new Set<string>();
   readonly deletingRuns = new Set<string>();
-  readonly removalTasks = new Set<Promise<void>>();
+  readonly removalTasks: Set<Promise<void>>;
   private readonly memberWorkSaveRuns = new Set<string>();
-  readonly memberWorkSaveTasks = new Set<Promise<void>>();
+  readonly memberWorkSaveTasks: Set<Promise<void>>;
   readonly memberWorkSaveControllers = new Map<string, AbortController>();
   private readonly removalWaiters: Array<() => void> = [];
   private activeRemovals = 0;
   private memberTraces?: MemberTraces;
   private get traces() { return this.memberTraces ??= new MemberTraces(this.host.config.stateDir); }
   findMemberTraces() { void this.traces; }
-  constructor(private readonly host: RetentionHost) {}
+  constructor(private readonly host: RetentionHost) {
+    this.removalTasks = new TrackedTaskSet<Promise<void>>(() => this.host.onBackgroundTask?.());
+    this.memberWorkSaveTasks = new TrackedTaskSet<Promise<void>>(() => this.host.onBackgroundTask?.());
+  }
   private traceHost(): TraceSettlementHost {
     const { manager } = this.host;
     return {

@@ -615,6 +615,7 @@ export interface TeamMember extends TeamAssignment {
   reportedAt?: string;
   lastActivityAt?: string;
   pendingLimit?: boolean;
+  pendingCapacity?: boolean;
   stalledAt?: string;
   report?: TeamReport;
   cursor: number;
@@ -760,6 +761,7 @@ export interface TeamRun {
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permissionRecovery"> & {
   lastActivityAt: string;
   pendingOperation?: TeamPendingOperation;
+  publishing?: boolean;
   members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback" | "goalCriteriaPlan">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt" | "coordinatorSessionId">[];
   permissionRecovery?: { outcomes: TeamPermissionRecoveryView[] };

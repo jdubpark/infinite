@@ -31,7 +31,6 @@ function deferred<T = void>() {
 const lineup: TeamLineup = {
   coordinator: { id: "coord", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "high", tier: "strong" },
   implementers: [{ id: "light", label: "Light", provider: "codex", model: "gpt-6-luna", effort: "high", tier: "light" }],
-  escalations: [],
   integrator: { id: "integrator", label: "Integrator", provider: "claude", model: "claude-opus-5-5", effort: "high", tier: "strong" },
   reviewer: { id: "reviewer", label: "Reviewer", provider: "claude", model: "claude-opus-5-5", effort: "high", tier: "strong" },
 };

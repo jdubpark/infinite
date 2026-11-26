@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
-import { createConnection } from "node:net";
+import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { unseal } from "./vault.js";
@@ -301,6 +301,22 @@ export function ensureSocketDir(dir: string, label: "runDir" | "socketDir" = "so
 
 export type WorkerError = Error & { code?: string };
 
+export function destroyWhenSilent(socket: Socket, timeoutMs: number, message: string) {
+  let events = 0;
+  const count = () => {
+    events += 1;
+  };
+  socket.on("connect", count);
+  socket.on("data", count);
+  socket.setTimeout(timeoutMs);
+  socket.on("timeout", () => {
+    const seen = events;
+    setImmediate(() => {
+      if (events === seen) socket.destroy(new Error(message));
+    });
+  });
+}
+
 export function workerCallAt<T>(
   path: string,
   request: WorkerRequest,
@@ -309,10 +325,10 @@ export function workerCallAt<T>(
   return new Promise((resolve, reject) => {
     const socket = createConnection(path);
     let data = "";
-    socket.setTimeout(timeoutMs, () =>
-      socket.destroy(
-        new Error("Worker response timed out; delivery may be uncertain"),
-      ),
+    destroyWhenSilent(
+      socket,
+      timeoutMs,
+      "Worker response timed out; delivery may be uncertain",
     );
     socket.on("connect", () => socket.write(JSON.stringify(request) + "\n"));
     socket.on("data", (chunk) => {

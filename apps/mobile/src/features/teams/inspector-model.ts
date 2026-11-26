@@ -1,5 +1,82 @@
 import type { TeamEntryAuthorKind, TeamEntryAuthority, TeamEntryHead, TeamEntryKind, TeamEntryPage } from "../../api/client";
-import { ROLE_NAMES, type TeamAcceptanceEvidence, type TeamMember, type TeamRole, type TeamTask, type TeamView } from "./model";
+import { ROLE_NAMES, shortDate, type TeamAcceptanceEvidence, type TeamMember, type TeamRole, type TeamTask, type TeamView, type TeamWaitReason, type TeamWaitReasonKind } from "./model";
+
+const WAIT_REASON_LABELS: Record<TeamWaitReasonKind, string> = {
+  "owner-decision": "Owner decision",
+  "provider-prompt": "Provider prompt",
+  "provider-limit": "Provider limit",
+  stalled: "Stalled",
+  "spinner-only": "Spinner-only",
+  "worker-slot": "Worker slot",
+  dependency: "Dependency",
+  "integration-order": "Integration order",
+  "linear-sync": "Linear sync",
+};
+
+const WAIT_REASON_PRIORITY: Record<TeamWaitReasonKind, number> = {
+  "owner-decision": 0,
+  "provider-prompt": 1,
+  stalled: 2,
+  "spinner-only": 3,
+  "provider-limit": 4,
+  "worker-slot": 5,
+  dependency: 6,
+  "integration-order": 7,
+  "linear-sync": 8,
+};
+
+export function waitReasonLabel(kind: TeamWaitReasonKind): string {
+  return WAIT_REASON_LABELS[kind];
+}
+
+export function waitReasonTone(kind: TeamWaitReasonKind): "error" | "attention" | undefined {
+  if (kind === "stalled") return "error";
+  if (kind === "owner-decision" || kind === "provider-prompt" || kind === "provider-limit" || kind === "spinner-only") {
+    return "attention";
+  }
+  return undefined;
+}
+
+export function orderMobileWaitReasons(reasons: readonly TeamWaitReason[] | undefined): TeamWaitReason[] {
+  if (!reasons?.length) return [];
+  return reasons
+    .map((reason, index) => ({ reason, index }))
+    .sort((left, right) =>
+      WAIT_REASON_PRIORITY[left.reason.kind] - WAIT_REASON_PRIORITY[right.reason.kind] || left.index - right.index,
+    )
+    .map(({ reason }) => reason);
+}
+
+export type MemberScreenNotice = {
+  kind: "spinner-only" | "stalled";
+  tone: "warning" | "error";
+  text: string;
+};
+
+export function memberScreenNotices(
+  member: Pick<TeamMember, "spinnerOnlySince" | "stalledAt"> & Partial<Pick<TeamMember, "status">>,
+  formatTime: (iso: string) => string = shortDate,
+): MemberScreenNotice[] {
+  const notices: MemberScreenNotice[] = [];
+  const suppressSpinner = Boolean(member.stalledAt) || member.status === "stopped" || member.status === "reported";
+  if (member.spinnerOnlySince?.trim() && !suppressSpinner) {
+    const formatted = formatTime(member.spinnerOnlySince).trim();
+    notices.push({
+      kind: "spinner-only",
+      tone: "warning",
+      text: formatted ? `Spinner-only screen since ${formatted}` : "Spinner-only screen",
+    });
+  }
+  if (member.stalledAt?.trim()) {
+    const formatted = formatTime(member.stalledAt).trim();
+    notices.push({
+      kind: "stalled",
+      tone: "error",
+      text: formatted ? `Stalled since ${formatted}` : "Stalled",
+    });
+  }
+  return notices;
+}
 
 export type MobileOutcomeGroup = {
   id: string;
@@ -91,8 +168,9 @@ function isActiveMember(member: Pick<TeamMember, "revision" | "status">, current
   return member.revision === currentRevision && ACTIVE_MEMBER_STATUSES.has(member.status);
 }
 
-function attemptKey(member: Pick<TeamMember, "taskId" | "role">): string {
-  return member.taskId ? `task:${member.taskId}` : `role:${member.role}`;
+function attemptKey(member: Pick<TeamMember, "revision" | "planRevision" | "taskId" | "role">): string {
+  const scopeRevision = member.planRevision ?? member.revision;
+  return `${scopeRevision}\0${member.role}\0${member.taskId ?? ""}`;
 }
 
 export function partitionMobileRoster<T extends TeamMember>(members: readonly T[], revision: number): MobileRosterPartition<T> {
@@ -105,16 +183,28 @@ export function partitionMobileRoster<T extends TeamMember>(members: readonly T[
     return left.index - right.index;
   });
 
+  const memberIds = new Set(members.map(member => member.memberId));
   const replacedBy = new Map<string, string>();
   const replaces = new Map<string, string>();
+
+  for (const { member } of chronological) {
+    const explicit = member.replaces?.memberId ?? member.replacesMemberId;
+    if (explicit && explicit !== member.memberId && memberIds.has(explicit)) {
+      replacedBy.set(explicit, member.memberId);
+      replaces.set(member.memberId, explicit);
+    }
+  }
+
   const lastFinishedByKey = new Map<string, T>();
 
   for (const { member } of chronological) {
     const key = attemptKey(member);
-    const previous = lastFinishedByKey.get(key);
-    if (previous && previous.memberId !== member.memberId) {
-      replacedBy.set(previous.memberId, member.memberId);
-      replaces.set(member.memberId, previous.memberId);
+    if (!replaces.has(member.memberId)) {
+      const previous = lastFinishedByKey.get(key);
+      if (previous && previous.memberId !== member.memberId && !replacedBy.has(previous.memberId)) {
+        replacedBy.set(previous.memberId, member.memberId);
+        replaces.set(member.memberId, previous.memberId);
+      }
     }
     if (!isActiveMember(member, revision)) lastFinishedByKey.set(key, member);
     else lastFinishedByKey.delete(key);
@@ -136,11 +226,148 @@ export function partitionMobileRoster<T extends TeamMember>(members: readonly T[
   return { active, finished };
 }
 
+const ENTRY_STATE_RANK: Record<TeamEntryHead["state"], number> = {
+  active: 0,
+  superseded: 1,
+  withdrawn: 2,
+};
+
+function mergeEntryHead(existing: TeamEntryHead | undefined, incoming: TeamEntryHead): TeamEntryHead {
+  if (!existing) return incoming;
+  if (ENTRY_STATE_RANK[existing.state] > ENTRY_STATE_RANK[incoming.state]) {
+    return { ...incoming, state: existing.state };
+  }
+  return incoming;
+}
+
+function sameEntryHead(left: TeamEntryHead, right: TeamEntryHead): boolean {
+  return left.entryId === right.entryId
+    && left.seq === right.seq
+    && left.revision === right.revision
+    && left.at === right.at
+    && left.kind === right.kind
+    && left.author === right.author
+    && left.authority === right.authority
+    && left.authorRole === right.authorRole
+    && left.authorMemberId === right.authorMemberId
+    && left.taskId === right.taskId
+    && left.supersedes === right.supersedes
+    && left.headCommit === right.headCommit
+    && left.summary === right.summary
+    && left.bodyBytes === right.bodyBytes
+    && left.state === right.state;
+}
+
+function canSupersedeEntry(replacement: TeamEntryHead, target: TeamEntryHead): boolean {
+  if (replacement.entryId === target.entryId) return false;
+  if (replacement.supersedes !== target.entryId) return false;
+  if (replacement.author !== "member" || target.author !== "member") return false;
+  if (replacement.kind !== target.kind) return false;
+  const sameAuthor = replacement.authorMemberId !== undefined && target.authorMemberId === replacement.authorMemberId;
+  const sameTask = replacement.taskId !== undefined && target.taskId !== undefined && target.taskId === replacement.taskId;
+  return sameAuthor || sameTask;
+}
+
 export function mergeMobileEntries(existing: readonly TeamEntryHead[], page: Pick<TeamEntryPage, "entries">): TeamEntryHead[] {
   const byId = new Map<string, TeamEntryHead>();
   for (const entry of existing) byId.set(entry.entryId, entry);
-  for (const entry of page.entries) byId.set(entry.entryId, entry);
+  const incomingIds = new Set<string>();
+  for (const entry of page.entries) {
+    byId.set(entry.entryId, mergeEntryHead(byId.get(entry.entryId), entry));
+    incomingIds.add(entry.entryId);
+  }
+  for (const entry of page.entries) {
+    if (!entry.supersedes || incomingIds.has(entry.supersedes)) continue;
+    const prior = byId.get(entry.supersedes);
+    if (prior && prior.state === "active" && canSupersedeEntry(entry, prior)) {
+      byId.set(prior.entryId, { ...prior, state: "superseded" });
+    }
+  }
   return [...byId.values()].sort((left, right) => left.seq - right.seq);
+}
+
+export type MobileEvidenceFeedState = {
+  key: string;
+  entries: TeamEntryHead[];
+  cursor: number;
+  more: boolean;
+  revalidateCursor: number;
+  lastLoadedAt?: string;
+  lastRevalidatedAtMs?: number;
+};
+
+export function createMobileEvidenceFeedState(key: string): MobileEvidenceFeedState {
+  return {
+    key,
+    entries: [],
+    cursor: 0,
+    more: false,
+    revalidateCursor: 0,
+  };
+}
+
+export function applyMobileEvidencePage(
+  state: MobileEvidenceFeedState,
+  page: TeamEntryPage,
+  options: { mode?: "incremental" | "revalidate"; observedAt?: string } = {},
+): MobileEvidenceFeedState {
+  const mode = options.mode ?? "incremental";
+  const cursor = Math.max(state.cursor, page.cursor);
+  const more = mode === "incremental"
+    ? (page.cursor >= state.cursor ? page.more : state.more)
+    : (page.cursor > state.cursor ? page.more : state.more);
+  const entries = page.entries.length === 0 ? state.entries : mergeMobileEntries(state.entries, page);
+  const entriesChanged = entries.length !== state.entries.length
+    || entries.some((entry, index) => !sameEntryHead(entry, state.entries[index]!));
+  if (!entriesChanged && cursor === state.cursor && more === state.more && (state.lastLoadedAt !== undefined || !options.observedAt)) {
+    return state;
+  }
+  return {
+    ...state,
+    entries: entriesChanged ? entries : state.entries,
+    cursor,
+    more,
+    ...(options.observedAt ? { lastLoadedAt: options.observedAt } : {}),
+  };
+}
+
+export function applyMobileEvidenceHead(
+  state: MobileEvidenceFeedState,
+  head: TeamEntryHead,
+): MobileEvidenceFeedState {
+  const entries = mergeMobileEntries(state.entries, { entries: [head] });
+  const entriesChanged = entries.length !== state.entries.length
+    || entries.some((entry, index) => !sameEntryHead(entry, state.entries[index]!));
+  if (!entriesChanged) return state;
+  return {
+    ...state,
+    entries,
+  };
+}
+
+export function sliceVisibleMobileEntries(
+  entries: readonly TeamEntryHead[],
+  limit: number,
+): { visible: TeamEntryHead[]; hiddenCount: number } {
+  const cap = Math.max(1, limit);
+  const visible = entries.slice(0, cap);
+  return {
+    visible,
+    hiddenCount: Math.max(0, entries.length - visible.length),
+  };
+}
+
+export function resolveSelectedEntryHead(
+  detailHead: TeamEntryHead | undefined,
+  listHead: TeamEntryHead | undefined,
+): TeamEntryHead | undefined {
+  if (!listHead) return detailHead;
+  if (!detailHead) return listHead;
+  if (detailHead.entryId !== listHead.entryId) return listHead;
+  if (ENTRY_STATE_RANK[detailHead.state] > ENTRY_STATE_RANK[listHead.state]) {
+    return { ...listHead, state: detailHead.state };
+  }
+  return listHead;
 }
 
 export function filterMobileEntries(entries: readonly TeamEntryHead[], kind: TeamEntryKind | "all"): TeamEntryHead[] {

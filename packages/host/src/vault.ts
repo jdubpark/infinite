@@ -113,11 +113,11 @@ export class Journal {
   append(type: Event["type"], data: Event["data"]): Event {
     return this.appendAll(type, [data])[0];
   }
-  appendAll(type: Event["type"], items: Event["data"][]): Event[] {
+  appendAll(type: Event["type"], items: readonly Event["data"][]): Event[] {
     if (this.failed) throw new Error("Journal closed after a failed write", { cause: this.failure });
     return this.write(type, items);
   }
-  private write(type: Event["type"], items: Event["data"][]): Event[] {
+  private write(type: Event["type"], items: readonly Event["data"][]): Event[] {
     const at = new Date().toISOString();
     const first = this.seq;
     const events = items.map(

@@ -13,7 +13,7 @@ import { Decision } from "./team-decision";
 import { TeamOverview } from "./team-inspector/TeamOverview";
 import { TeamEvidenceBoard } from "./team-inspector/TeamEvidenceBoard";
 import { buildTeamEntryHash, parseTeamEntryHash } from "./team-inspector/model";
-import type { TeamAcceptanceEvidence, TeamCriterionRefs, TeamGoalRecord, TeamRunAssessment } from "./team-inspector/types";
+import type { TeamAcceptanceEvidence, TeamCriterionRefs, TeamGoalRecord, TeamRunAssessment, TeamWaitReason } from "./team-inspector/types";
 
 type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 type TeamRole = "project-manager" | "intent-checker" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery" | "evaluator";
@@ -21,7 +21,7 @@ type TeamCommand = { command: string; args: string[] };
 export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; revision?: number; memberId?: string; commit?: string; summary?: string; limitations?: string[]; agentProfileId?: string; criterionRefs?: TeamCriterionRefs; changedPaths?: { paths: string[]; truncated: boolean }; reviewRounds?: number; escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string }; limitSwitches?: LimitSwitch[]; usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric };
 type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; baseCommit?: string; headCommit: string; tasks: TeamTask[]; review?: TeamView["review"]; brief?: TeamBrief };
 type TeamScout = { id: string; title: string; instructions: string; agentProfileId: string; status: "pending" | "running" | "waiting" | "complete"; memberId?: string; summary?: string; evidence?: TeamEvidence[] };
-export type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; cwd: string; baseCommit: string; provider?: string; modelProfile?: TeamModelProfile; usage?: UsageTotals; stoppedReason?: string; startedAt?: string; reportedAt?: string; lastActivityAt?: string; pendingLimit?: boolean; stalledAt?: string };
+export type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; cwd: string; baseCommit: string; provider?: string; modelProfile?: TeamModelProfile; usage?: UsageTotals; stoppedReason?: string; startedAt?: string; reportedAt?: string; lastActivityAt?: string; spinnerOnlySince?: string; pendingLimit?: boolean; stalledAt?: string };
 
 export function directionSourceLabel(source: { kind: string; name: string } | string | undefined): string {
   if (typeof source === "object") return source.kind === "github-review" ? "Owner (GitHub review)" : source.name;
@@ -53,10 +53,11 @@ export type TeamView = {
   continuable?: boolean;
   continuations?: TeamContinuation[];
   workers?: { limit: number; max: number; running: number; ready: number };
+  waitReasons?: TeamWaitReason[];
 };
 export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "revision" | "status" | "createdAt" | "updatedAt" | "lastActivityAt"
-  | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "missionId" | "resumable" | "continuable" | "workers"> & {
-  members: (Omit<TeamMember, "cwd" | "baseCommit" | "modelProfile" | "usage"> & { startedAt?: string; reportedAt?: string; lastActivityAt?: string; pendingLimit?: boolean; stalledAt?: string;
+  | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "missionId" | "resumable" | "continuable" | "workers" | "waitReasons"> & {
+  members: (Omit<TeamMember, "cwd" | "baseCommit" | "modelProfile" | "usage"> & { startedAt?: string; reportedAt?: string; lastActivityAt?: string; spinnerOnlySince?: string; pendingLimit?: boolean; stalledAt?: string;
     modelProfile?: Pick<TeamModelProfile, "label" | "provider" | "tier">; usage?: Pick<UsageTotals, "cost"> })[];
   tasks: (Pick<TeamTask, "id" | "title" | "status" | "paths" | "memberId" | "ownerRating"> & { changedPaths?: { paths: string[]; truncated: boolean } })[];
   checks: Pick<TeamView["checks"][number], "status" | "revision">[];
@@ -278,7 +279,7 @@ export function TeamCreate({ me, connected, done }: { me: Me; connected: boolean
 function eventLabel(event: LogEvent) {
   if (event.type === "signal") return String(event.data.kind ?? "Signal");
   if (event.type === "input-result") return event.data.state === "delivered" ? "Input delivered" : "Input";
-  if (event.type === "lifecycle") return String(event.data.status ?? "Session updated");
+  if (event.type === "lifecycle") return `${String(event.data.status ?? "Session updated")}${event.data.outputTailIncomplete ? " (the recording may be missing the session’s last output)" : ""}`;
   return event.type;
 }
 function eventDetail(event: LogEvent) {

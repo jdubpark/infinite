@@ -26,7 +26,7 @@ import { AgentApproval } from "./TeamApprovals";
 import { TeamEvidenceSection } from "./TeamEvidenceSection";
 import { TeamOverviewGroups } from "./TeamOverviewGroups";
 import { AgentLog, UnderstandingSummary } from "./TeamSummary";
-import { partitionMobileRoster } from "./inspector-model";
+import { memberScreenNotices, partitionMobileRoster } from "./inspector-model";
 import { orderedMembers } from "./summary";
 import { CostLine, RatingControl, RubricLine } from "../cost/parts";
 import { useTaskRating } from "../cost/useCost";
@@ -153,8 +153,17 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
     const open = agentId === member.memberId;
     const session = listed.get(member.sessionId);
     const approval = approvals.find(item => item.member.memberId === member.memberId);
+    const workTitle = work(member);
+    const notices = memberScreenNotices(member);
+    const accessibilityParts = [
+      `${ROLE_NAMES[member.role]}${workTitle ? `, ${workTitle}` : ""}`,
+      MEMBER_LABELS[member.status] ?? member.status,
+      ...notices.map(notice => notice.text),
+      member.stoppedReason ? `Stopped: ${member.stoppedReason}` : undefined,
+      `${open ? "Hide" : "Show"} log`,
+    ].filter(Boolean);
     return <View key={member.memberId}>
-      <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityLabel={`${ROLE_NAMES[member.role]}, ${MEMBER_LABELS[member.status] ?? member.status}. ${open ? "Hide" : "Show"} log`}
+      <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityLabel={accessibilityParts.join(". ")}
         onPress={() => setAgentId(open ? "" : member.memberId)} style={({ pressed }) => [s.row, pressed && s.pressed]}>
         <Avatar label={agentLabel(member)} provider={member.modelProfile?.provider ?? member.provider ?? team.provider} size={30} state={agentState(member)} />
         <View style={s.main}>
@@ -164,9 +173,14 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
             <Text style={s.state}>{MEMBER_LABELS[member.status] ?? member.status}</Text>
             {member.revision !== team.revision ? <Text style={t.note}>rev {member.revision}</Text> : null}
           </View>
-          <Text style={t.note} numberOfLines={1}>{[work(member), agentLabel(member)].filter(Boolean).join(" · ")}</Text>
+          <Text style={t.note} numberOfLines={1}>{[workTitle, agentLabel(member)].filter(Boolean).join(" · ")}</Text>
           {coordinatorOwned(member) ? <Text style={t.note} numberOfLines={2}>{`Coordinator reviewing${session?.attention.now ? `: ${session.attention.now}` : ""}`}</Text>
             : session?.attention.now ? <Text style={[s.now, personOwned.has(member.memberId) && s.attentionText]} numberOfLines={2}>{session.attention.now}</Text> : null}
+          {notices.map(notice => (
+            <Text key={notice.kind} style={notice.tone === "error" ? t.error : t.warning} numberOfLines={2}>
+              {notice.text}
+            </Text>
+          ))}
           {member.stoppedReason ? <Text style={t.warning} numberOfLines={2}>Stopped: {member.stoppedReason}</Text> : null}
         </View>
         <Glyph name={open ? "down" : "forward"} size={12} color={theme.colors.mutedInk} />
@@ -176,8 +190,16 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
         {(() => {
           const replacementId = replacedByMap.get(member.memberId);
           const replacement = replacementId && isFailedOrStopped(member) ? memberById.get(replacementId) : undefined;
+          const replacementWork = replacement ? work(replacement) : "";
           return replacement ? <View style={s.approval}>
-            <Button compact secondary glyph="forward" title="Jump to replacement" onPress={() => showAgent(replacement)} />
+            <Button
+              compact
+              secondary
+              glyph="forward"
+              title="Jump to replacement"
+              accessibilityLabel={`Jump to replacement ${ROLE_NAMES[replacement.role]}${replacementWork ? `, ${replacementWork}` : ""}`}
+              onPress={() => showAgent(replacement)}
+            />
           </View> : null;
         })()}
         <AgentLog connection={connection} member={member} live={live(member)} onOpen={() => openSession(member.sessionId)} onStaleChange={setAgentStale} />
@@ -351,7 +373,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       </View> : null}
 
       {tab === "activity" ? <View>
-        <TeamEvidenceSection connection={connection} team={team} me={me ?? null} onOpenSession={openSession} />
+        <TeamEvidenceSection connection={connection} team={team} onOpenSession={openSession} />
         <Section title="Checks" count={team.checks.length}>
           {team.checks.length ? team.checks.map((check, index) => <CheckRow key={`${check.startedAt}/${index}`} check={check} />) : <Text style={t.note}>None yet.</Text>}
         </Section>

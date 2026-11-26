@@ -167,6 +167,7 @@ export type SessionRow = {
   createdAt: string;
   pid?: number;
   exitCode?: number;
+  outputTailIncomplete?: true;
   seq: number;
   attention: Attention;
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1 };
@@ -338,7 +339,6 @@ export type TeamEntryHead = {
 };
 export type TeamEntryPage = { entries: TeamEntryHead[]; cursor: number; more: boolean };
 export type TeamEntryDetail = { head: TeamEntryHead; body: unknown };
-export type TeamEntryWithdrawResult = { entryId: string; state: "withdrawn"; changed: boolean };
 export type TeamEntryQuery = { kinds?: TeamEntryKind[]; taskId?: string; since?: number; limit?: number };
 
 export type MissionProgressWorkerStatus = "starting" | "running" | "exited" | "unavailable" | "recording-error" | "unknown" | "mismatched" | "not-sampled";
@@ -396,6 +396,7 @@ export type MissionProgressSnapshot = {
     title: string;
     repoProjectId: string;
     status: MissionSubtask["status"];
+    replacesSubtaskId?: string;
     child: MissionProgressChild;
   }[];
   subtasksTruncated?: true;
@@ -429,13 +430,6 @@ export function listTeamEntries(connection: Connection, teamId: string, query: T
 
 export function getTeamEntry(connection: Connection, teamId: string, entryId: string): Promise<TeamEntryDetail> {
   return api<TeamEntryDetail>(connection, `/teams/${teamId}/entries/${entryId}`);
-}
-
-export function withdrawTeamEntry(connection: Connection, teamId: string, entryId: string, requestId: string): Promise<TeamEntryWithdrawResult> {
-  return api<TeamEntryWithdrawResult>(connection, `/teams/${teamId}/entries/${entryId}/withdraw`, {
-    method: "POST",
-    body: { requestId },
-  });
 }
 
 export function getMissionProgress(connection: Connection, missionId: string, cursor?: string): Promise<MissionProgressPage> {

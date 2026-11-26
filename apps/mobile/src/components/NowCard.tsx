@@ -22,12 +22,14 @@ export function NowCard({
   provider,
   pickedLine,
   exitCode,
+  outputTailIncomplete,
   onOpenTerminal,
 }: {
   attention: Attention;
   provider: Provider;
   pickedLine?: string;
   exitCode?: number;
+  outputTailIncomplete?: boolean;
   onOpenTerminal: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -91,6 +93,9 @@ export function NowCard({
         <Card state="exited" heading="Process exited">
           {exitCode !== undefined ? (
             <Text style={s.body}>Exit code {exitCode}.</Text>
+          ) : null}
+          {outputTailIncomplete ? (
+            <Text style={s.meta}>The recording may be missing the session’s last output.</Text>
           ) : null}
         </Card>
       );

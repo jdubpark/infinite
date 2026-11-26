@@ -86,7 +86,7 @@ export function controlEventText(event: { type?: string; data?: Record<string, u
   const data = event.data ?? {};
   const label = event.type === "signal" ? String(data.kind ?? "Signal")
     : event.type === "input-result" ? (data.state === "delivered" ? "Input delivered" : "Input")
-    : event.type === "lifecycle" ? String(data.status ?? "Session updated")
+    : event.type === "lifecycle" ? `${String(data.status ?? "Session updated")}${data.outputTailIncomplete ? " (the recording may be missing the session’s last output)" : ""}`
     : String(event.type ?? "Event");
   const detail = data.message ?? data.text ?? data.error;
   return typeof detail === "string" && detail.trim() ? `${label}: ${detail}` : label;

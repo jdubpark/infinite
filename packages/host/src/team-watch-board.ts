@@ -19,6 +19,7 @@ import {
   teamWatchCommand,
   teamWatchFrame,
   teamWatchScreen,
+  waitReasonLines,
   wrapText,
   type TeamBriefRow,
   type TeamBriefStatus,
@@ -184,7 +185,11 @@ function overviewLines(lines: string[], team: any): void {
   const active = members.filter((member: any) => member?.revision === revision && ["queued", "running", "waiting"].includes(member?.status));
   const finished = members.length - active.length;
   const activeText = active.length
-    ? active.slice(0, 4).map((member: any) => `${roleNames[member.role] ?? clean(member.role)} ${clean(member.status)}${member.taskId ? `(${clean(member.taskId)})` : ""}`).join(", ")
+    ? active.slice(0, 4).map((member: any) => {
+        const flags = [member.stalledAt ? "stalled" : "", member.spinnerOnlySince ? "spinner-only" : ""].filter(Boolean);
+        const flagText = flags.length ? ` [${flags.join(", ")}]` : "";
+        return `${roleNames[member.role] ?? clean(member.role)} ${clean(member.status)}${member.taskId ? `(${clean(member.taskId)})` : ""}${flagText}`;
+      }).join(", ")
     : "none";
   lines.push(`  Roster: Active (${active.length}) ${activeText} · Finished (${finished})`);
 }
@@ -243,6 +248,7 @@ export function teamBoardText(
 ): string {
   const lines = teamHeading(team, "board");
   if (team?.reason) lines.push(`Reason: ${short(team.reason, 400)}`);
+  waitReasonLines(lines, team);
   decisionLines(lines, team);
   overviewLines(lines, team);
   const membersById = new Map<string, any>((Array.isArray(team?.members) ? team.members : []).map((m: any) => [m.memberId, m]));
@@ -317,7 +323,7 @@ function eventLine(event: { type?: string; data?: Record<string, unknown> }) {
   const data = event.data ?? {};
   const label = event.type === "signal" ? String(data.kind ?? "Signal")
     : event.type === "input-result" ? (data.state === "delivered" ? "Input delivered" : "Input")
-    : event.type === "lifecycle" ? String(data.status ?? "Session updated")
+    : event.type === "lifecycle" ? `${String(data.status ?? "Session updated")}${data.outputTailIncomplete ? " (the recording may be missing the session's last output)" : ""}`
     : String(event.type ?? "Event");
   const detail = data.message ?? data.text ?? data.error;
   return typeof detail === "string" && detail.trim() ? `${label}: ${detail}` : label;

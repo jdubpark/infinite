@@ -1,14 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  applyMobileEvidenceHead,
+  applyMobileEvidencePage,
   authorityLabel,
+  createMobileEvidenceFeedState,
   deriveMobileOutcomeGroups,
   deriveReviewerAcceptanceClaims,
   entryAuthorLabel,
   filterMobileEntries,
   formatEntryBodySummary,
+  memberScreenNotices,
   mergeMobileEntries,
+  orderMobileWaitReasons,
   partitionMobileRoster,
+  resolveSelectedEntryHead,
+  sliceVisibleMobileEntries,
+  waitReasonLabel,
+  waitReasonTone,
 } from "../apps/mobile/src/features/teams/inspector-model.ts";
 import {
   applyMissionProgressPage,
@@ -17,9 +26,10 @@ import {
   linkedTeamIdOf,
   partitionMissionSubtasks,
   resyncNoticeForReason,
+  summarizeMissionProgressChild,
 } from "../apps/mobile/src/features/board/mission-progress-model.ts";
 import type { MissionProgressPage, TeamEntryHead } from "../apps/mobile/src/api/client.ts";
-import type { TeamMember, TeamTask, TeamView } from "../apps/mobile/src/features/teams/model.ts";
+import { shortDate, type TeamMember, type TeamTask, type TeamView, type TeamWaitReason, type TeamWaitReasonKind } from "../apps/mobile/src/features/teams/model.ts";
 
 const makeTask = (id: string, status: TeamTask["status"], criteria?: string[], objectiveVersion = 3): TeamTask => ({
   id,
@@ -188,25 +198,37 @@ test("deriveMobileOutcomeGroups uses c0 successCriteria and keeps provisional as
   });
 });
 
-test("partitionMobileRoster preserves creation-order replacement links when startedAt is absent or equal", () => {
+test("partitionMobileRoster scopes replacement links to revision, role, and taskId unless explicit host link exists", () => {
   const members: TeamMember[] = [
     makeMember("m-old-pm", { role: "project-manager", revision: 1, status: "stopped", startedAt: "2026-11-26T00:00:00.000Z" }),
     makeMember("m-pm", { role: "project-manager", revision: 2, status: "waiting", startedAt: "2026-11-26T00:01:00.000Z" }),
-    makeMember("m-t1-a", { taskId: "t1", status: "stopped", stoppedReason: "timed out" }),
-    makeMember("m-t1-b", { taskId: "t1", status: "running" }),
-    makeMember("m-t2-done", { taskId: "t2", status: "reported", startedAt: "2026-11-26T00:01:40.000Z" }),
-    makeMember("m-t3-a", { taskId: "t3", status: "stopped", startedAt: "2026-11-26T00:02:00.000Z" }),
-    makeMember("m-t3-b", { taskId: "t3", status: "running", startedAt: "2026-11-26T00:02:00.000Z" }),
+    makeMember("m-rev1-t1", { role: "implementer", revision: 1, taskId: "t1", status: "stopped", startedAt: "2026-11-26T00:00:30.000Z" }),
+    makeMember("m-scout-t1", { role: "scout", revision: 2, taskId: "t1", status: "reported", startedAt: "2026-11-26T00:01:10.000Z" }),
+    makeMember("m-t1-a", { role: "implementer", revision: 2, taskId: "t1", status: "stopped", stoppedReason: "timed out" }),
+    makeMember("m-t1-b", { role: "implementer", revision: 2, taskId: "t1", status: "running" }),
+    makeMember("m-t2-done", { role: "implementer", revision: 2, taskId: "t2", status: "reported", startedAt: "2026-11-26T00:01:40.000Z" }),
+    makeMember("m-t3-a", { role: "implementer", revision: 2, taskId: "t3", status: "stopped", startedAt: "2026-11-26T00:02:00.000Z" }),
+    makeMember("m-t3-b", { role: "implementer", revision: 2, taskId: "t3", status: "running", startedAt: "2026-11-26T00:02:00.000Z" }),
+    makeMember("m-explicit-old", { role: "implementer", revision: 1, taskId: "t9", status: "stopped" }),
+    makeMember("m-explicit-new", { role: "integrator", revision: 2, taskId: "t9", status: "running", replaces: { memberId: "m-explicit-old", cause: "escalation" } }),
   ];
 
   const partitioned = partitionMobileRoster(members, 2);
-  assert.deepEqual(partitioned.active.map(item => item.member.memberId), ["m-pm", "m-t1-b", "m-t3-b"]);
-  assert.deepEqual(partitioned.finished.map(item => item.member.memberId), ["m-old-pm", "m-t1-a", "m-t2-done", "m-t3-a"]);
+  assert.deepEqual(partitioned.active.map(item => item.member.memberId), ["m-pm", "m-t1-b", "m-t3-b", "m-explicit-new"]);
+  assert.deepEqual(
+    partitioned.finished.map(item => item.member.memberId),
+    ["m-old-pm", "m-rev1-t1", "m-scout-t1", "m-t1-a", "m-t2-done", "m-t3-a", "m-explicit-old"],
+  );
 
   const oldPm = partitioned.finished.find(item => item.member.memberId === "m-old-pm")!;
   const activePm = partitioned.active.find(item => item.member.memberId === "m-pm")!;
-  assert.equal(oldPm.replacedByMemberId, "m-pm");
-  assert.equal(activePm.replacesMemberId, "m-old-pm");
+  assert.equal(oldPm.replacedByMemberId, undefined);
+  assert.equal(activePm.replacesMemberId, undefined);
+
+  const rev1T1 = partitioned.finished.find(item => item.member.memberId === "m-rev1-t1")!;
+  const scoutT1 = partitioned.finished.find(item => item.member.memberId === "m-scout-t1")!;
+  assert.equal(rev1T1.replacedByMemberId, undefined);
+  assert.equal(scoutT1.replacedByMemberId, undefined);
 
   const stoppedT1 = partitioned.finished.find(item => item.member.memberId === "m-t1-a")!;
   const runningT1 = partitioned.active.find(item => item.member.memberId === "m-t1-b")!;
@@ -220,6 +242,11 @@ test("partitionMobileRoster preserves creation-order replacement links when star
 
   const doneT2 = partitioned.finished.find(item => item.member.memberId === "m-t2-done")!;
   assert.equal(doneT2.replacedByMemberId, undefined);
+
+  const explicitOld = partitioned.finished.find(item => item.member.memberId === "m-explicit-old")!;
+  const explicitNew = partitioned.active.find(item => item.member.memberId === "m-explicit-new")!;
+  assert.equal(explicitOld.replacedByMemberId, "m-explicit-new");
+  assert.equal(explicitNew.replacesMemberId, "m-explicit-old");
 });
 
 test("mergeMobileEntries deduplicates by entryId, preserves sparse seq order, and formats author labels", () => {
@@ -376,24 +403,32 @@ test("mission-progress-model advances generation-scoped cursors and sets explici
   assert.equal(state.resyncNotice, "Resynchronized after host restart.");
 });
 
-test("partitionMissionSubtasks keeps blocked subtasks active with replacement links and compacts finished attempts", () => {
+test("partitionMissionSubtasks does not infer replacements from repo order and honors explicit host links", () => {
   const subtasks: MissionProgressPage["snapshot"]["subtasks"] = [
     {
       id: "sub-1",
-      title: "Repo A attempt 1",
+      title: "Repo A cancelled work",
       repoProjectId: "repo-a",
-      status: "blocked",
-      child: { kind: "linked", runId: "team-1", missionId: "m1", projectId: "repo-a", revision: 1, status: "blocked", assignments: [], checks: [] },
+      status: "cancelled",
+      child: { kind: "linked", runId: "team-1", missionId: "m1", projectId: "repo-a", revision: 1, status: "cancelled", assignments: [], checks: [] },
     },
     {
       id: "sub-2",
-      title: "Repo A attempt 2",
+      title: "Repo A unrelated follow-up",
       repoProjectId: "repo-a",
-      status: "running",
-      child: { kind: "linked", runId: "team-2", missionId: "m1", projectId: "repo-a", revision: 1, status: "implementing", assignments: [], checks: [] },
+      status: "blocked",
+      child: { kind: "linked", runId: "team-2", missionId: "m1", projectId: "repo-a", revision: 1, status: "blocked", assignments: [], checks: [] },
     },
     {
       id: "sub-3",
+      title: "Repo A explicit retry",
+      repoProjectId: "repo-a",
+      status: "running",
+      replacesSubtaskId: "sub-2",
+      child: { kind: "linked", runId: "team-3", missionId: "m1", projectId: "repo-a", revision: 1, status: "implementing", assignments: [], checks: [] },
+    },
+    {
+      id: "sub-4",
       title: "Repo B",
       repoProjectId: "repo-b",
       status: "done",
@@ -401,10 +436,317 @@ test("partitionMissionSubtasks keeps blocked subtasks active with replacement li
     },
   ];
   const partitioned = partitionMissionSubtasks(subtasks);
-  assert.deepEqual(partitioned.active.map(item => item.subtask.id), ["sub-1", "sub-2"]);
-  assert.deepEqual(partitioned.finished.map(item => item.subtask.id), ["sub-3"]);
-  assert.equal(partitioned.active[0]!.replacedBySubtaskId, "sub-2");
-  assert.equal(partitioned.active[1]!.replacesSubtaskId, "sub-1");
+  assert.deepEqual(partitioned.active.map(item => item.subtask.id), ["sub-2", "sub-3"]);
+  assert.deepEqual(partitioned.finished.map(item => item.subtask.id), ["sub-1", "sub-4"]);
+  assert.equal(partitioned.finished[0]!.replacedBySubtaskId, undefined);
+  assert.equal(partitioned.active[0]!.replacesSubtaskId, undefined);
+  assert.equal(partitioned.active[0]!.replacedBySubtaskId, "sub-3");
+  assert.equal(partitioned.active[1]!.replacesSubtaskId, "sub-2");
   assert.equal(linkedTeamIdOf(subtasks[0]!.child), "team-1");
-  assert.equal(linkedTeamIdOf(subtasks[2]!.child), undefined);
+  assert.equal(linkedTeamIdOf(subtasks[3]!.child), undefined);
+});
+
+test("mobile evidence feed retains intermediate pages past 500 entries, enforces host supersedes eligibility, preserves monotonic state, avoids no-op updates, and bounds mounted rows", () => {
+  let feed = createMobileEvidenceFeedState("m1/team-1");
+  feed = applyMobileEvidencePage(feed, {
+    entries: [
+      makeEntry("e-1", 1, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1" }),
+      makeEntry("e-500", 500, { kind: "contract", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1" }),
+    ],
+    cursor: 500,
+    more: true,
+  }, { mode: "incremental", observedAt: "2026-11-26T00:01:00.000Z" });
+  assert.equal(feed.cursor, 500);
+  assert.equal(feed.more, true);
+
+  feed = applyMobileEvidencePage(feed, {
+    entries: [
+      makeEntry("e-501", 501, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1" }),
+      makeEntry("e-502", 502, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m2", taskId: "t2" }),
+    ],
+    cursor: 502,
+    more: true,
+  }, { mode: "incremental", observedAt: "2026-11-26T00:02:00.000Z" });
+  assert.equal(feed.cursor, 502);
+  assert.equal(feed.more, true);
+
+  feed = applyMobileEvidencePage(feed, {
+    entries: [
+      makeEntry("e-503", 503, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m2", taskId: "t2", supersedes: "e-502" }),
+      makeEntry("e-504", 504, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1", supersedes: "e-500" }),
+      makeEntry("e-505", 505, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m9", taskId: "t9", supersedes: "e-501" }),
+      makeEntry("e-506", 506, { kind: "finding", author: "host", authority: "receipt", supersedes: "e-1" }),
+    ],
+    cursor: 506,
+    more: false,
+  }, { mode: "incremental", observedAt: "2026-11-26T00:03:00.000Z" });
+  assert.deepEqual(feed.entries.map(item => [item.entryId, item.state]), [
+    ["e-1", "active"],
+    ["e-500", "active"],
+    ["e-501", "active"],
+    ["e-502", "superseded"],
+    ["e-503", "active"],
+    ["e-504", "active"],
+    ["e-505", "active"],
+    ["e-506", "active"],
+  ]);
+  assert.equal(feed.cursor, 506);
+  assert.equal(feed.more, false);
+
+  const steady = applyMobileEvidencePage(feed, { entries: [], cursor: 506, more: false }, { mode: "incremental", observedAt: "2026-11-26T00:03:04.000Z" });
+  assert.equal(steady, feed);
+
+  feed = applyMobileEvidencePage(feed, {
+    entries: [
+      makeEntry("e-1", 1, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1", state: "withdrawn" }),
+      makeEntry("e-503", 503, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m2", taskId: "t2", supersedes: "e-502", state: "withdrawn" }),
+    ],
+    cursor: 503,
+    more: true,
+  }, { mode: "revalidate", observedAt: "2026-11-26T00:04:00.000Z" });
+  assert.equal(feed.cursor, 506);
+  assert.equal(feed.more, false);
+  assert.equal(feed.entries.find(item => item.entryId === "e-1")?.state, "withdrawn");
+  assert.equal(feed.entries.find(item => item.entryId === "e-503")?.state, "withdrawn");
+  assert.equal(feed.entries.find(item => item.entryId === "e-502")?.state, "superseded");
+
+  const staleDetailHead = makeEntry("e-1", 1, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1", state: "active", summary: "Old" });
+  const afterLateDetail = applyMobileEvidenceHead(feed, staleDetailHead);
+  assert.equal(afterLateDetail.entries.find(item => item.entryId === "e-1")?.state, "withdrawn");
+  assert.equal(resolveSelectedEntryHead(staleDetailHead, afterLateDetail.entries.find(item => item.entryId === "e-1"))?.state, "withdrawn");
+
+  const lateSupersededDetail = makeEntry("e-502", 502, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m2", taskId: "t2", state: "active" });
+  assert.equal(applyMobileEvidenceHead(feed, lateSupersededDetail).entries.find(item => item.entryId === "e-502")?.state, "superseded");
+
+  const detailFirst = applyMobileEvidenceHead(feed, makeEntry("e-504", 504, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1", state: "withdrawn" }));
+  const afterStaleList = applyMobileEvidencePage(detailFirst, {
+    entries: [makeEntry("e-504", 504, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1", state: "active" })],
+    cursor: 504,
+    more: false,
+  }, { mode: "revalidate", observedAt: "2026-11-26T00:05:00.000Z" });
+  assert.equal(afterStaleList.entries.find(item => item.entryId === "e-504")?.state, "withdrawn");
+
+  const sliced = sliceVisibleMobileEntries(afterStaleList.entries, 3);
+  assert.equal(sliced.visible.length, 3);
+  assert.equal(sliced.hiddenCount, 5);
+});
+
+test("summarizeMissionProgressChild distinguishes recorded assignments, confirmed live workers, unsampled workers, and truncated samples", () => {
+  const exitedSummary = summarizeMissionProgressChild({
+    kind: "linked",
+    runId: "team-1",
+    missionId: "m1",
+    projectId: "repo-a",
+    revision: 1,
+    status: "implementing",
+    assignments: [
+      { runId: "team-1", memberId: "m1", sessionId: "s1", revision: 1, role: "implementer", recordedStatus: "running", workerStatus: "exited" },
+    ],
+    checks: [],
+  });
+  assert.equal(exitedSummary, "Implementing · recorded 1/1 active · 0 workers live (1 exited)");
+
+  const recErrorSummary = summarizeMissionProgressChild({
+    kind: "linked",
+    runId: "team-2",
+    missionId: "m1",
+    projectId: "repo-a",
+    revision: 1,
+    status: "verifying",
+    assignments: [
+      { runId: "team-2", memberId: "m1", sessionId: "s1", revision: 1, role: "implementer", recordedStatus: "running", workerStatus: "recording-error" },
+    ],
+    checks: [
+      { revision: 1, status: "failed", exitCode: 1, headCommit: "abcdef123456", startedAt: "2026-11-26T00:00:00.000Z" },
+    ],
+  });
+  assert.equal(recErrorSummary, "Running checks · recorded 1/1 active · 0 workers live (1 recording-error) · check failed (1) · abcdef12");
+
+  const unsampledReportedSummary = summarizeMissionProgressChild({
+    kind: "linked",
+    runId: "team-2b",
+    missionId: "m1",
+    projectId: "repo-a",
+    revision: 1,
+    status: "reviewing",
+    assignments: [
+      { runId: "team-2b", memberId: "m1", sessionId: "s1", revision: 1, role: "implementer", recordedStatus: "reported", workerStatus: "not-sampled" },
+    ],
+    checks: [],
+  });
+  assert.equal(unsampledReportedSummary, "Reviewing · recorded 0/1 active · workers unsampled (1 not-sampled)");
+
+  const partialSampledSummary = summarizeMissionProgressChild({
+    kind: "linked",
+    runId: "team-2c",
+    missionId: "m1",
+    projectId: "repo-a",
+    revision: 1,
+    status: "implementing",
+    assignments: [
+      { runId: "team-2c", memberId: "m1", sessionId: "s1", revision: 1, role: "implementer", recordedStatus: "running", workerStatus: "exited" },
+      { runId: "team-2c", memberId: "m2", sessionId: "s2", revision: 1, role: "reviewer", recordedStatus: "unavailable", workerStatus: "unknown" },
+    ],
+    checks: [],
+  });
+  assert.equal(partialSampledSummary, "Implementing · recorded 1/2 active · 0 of 1 sampled worker live (1 exited, 1 unknown)");
+
+  const confirmedExitReportedSummary = summarizeMissionProgressChild({
+    kind: "linked",
+    runId: "team-2d",
+    missionId: "m1",
+    projectId: "repo-a",
+    revision: 1,
+    status: "ready-for-review",
+    assignments: [
+      { runId: "team-2d", memberId: "m1", sessionId: "s1", revision: 1, role: "implementer", recordedStatus: "reported", exitConfirmedAt: "2026-11-26T00:02:00.000Z", workerStatus: "not-sampled" },
+    ],
+    checks: [],
+  });
+  assert.equal(confirmedExitReportedSummary, "Ready for your review · recorded 0/1 active · 0 workers live");
+
+  const truncatedSummary = summarizeMissionProgressChild({
+    kind: "linked",
+    runId: "team-3",
+    missionId: "m1",
+    projectId: "repo-a",
+    revision: 1,
+    status: "implementing",
+    assignments: [
+      { runId: "team-3", memberId: "m1", sessionId: "s1", revision: 1, role: "implementer", recordedStatus: "running", workerStatus: "running" },
+      { runId: "team-3", memberId: "m2", sessionId: "s2", revision: 1, role: "implementer", recordedStatus: "running", workerStatus: "not-sampled" },
+    ],
+    assignmentsTruncated: true,
+    checks: [],
+    checksTruncated: true,
+  });
+  assert.equal(truncatedSummary, "Implementing · recorded 2 active (2 shown, truncated) · 1 of 1 sampled worker live (1 not-sampled) · checks truncated");
+});
+
+test("waitReasonLabel and waitReasonTone map all nine wait reason kinds accurately", () => {
+  const expected: Record<TeamWaitReasonKind, { label: string; tone: "error" | "attention" | undefined }> = {
+    "owner-decision": { label: "Owner decision", tone: "attention" },
+    "provider-prompt": { label: "Provider prompt", tone: "attention" },
+    "provider-limit": { label: "Provider limit", tone: "attention" },
+    stalled: { label: "Stalled", tone: "error" },
+    "spinner-only": { label: "Spinner-only", tone: "attention" },
+    "worker-slot": { label: "Worker slot", tone: undefined },
+    dependency: { label: "Dependency", tone: undefined },
+    "integration-order": { label: "Integration order", tone: undefined },
+    "linear-sync": { label: "Linear sync", tone: undefined },
+  };
+
+  for (const kind of Object.keys(expected) as TeamWaitReasonKind[]) {
+    assert.equal(waitReasonLabel(kind), expected[kind].label);
+    assert.equal(waitReasonTone(kind), expected[kind].tone);
+  }
+});
+
+test("orderMobileWaitReasons places actionable and stall reasons ahead of scheduling waits and preserves stability", () => {
+  assert.deepEqual(orderMobileWaitReasons(undefined), []);
+  assert.deepEqual(orderMobileWaitReasons([]), []);
+
+  const input: TeamWaitReason[] = [
+    { kind: "linear-sync", summary: "Linear sync pending" },
+    { kind: "integration-order", summary: "Waiting to integrate t2", taskId: "t2" },
+    { kind: "dependency", summary: "Waiting on t1", taskId: "t2", blockedByTaskIds: ["t1"] },
+    { kind: "worker-slot", summary: "Waiting for slot 1", taskId: "t3" },
+    { kind: "provider-limit", summary: "Codex limit active", resetsAt: "2026-11-26T02:00:00.000Z" },
+    { kind: "spinner-only", summary: "Spinner-only redraws", memberId: "m-spin", since: "2026-11-26T00:10:00.000Z" },
+    { kind: "stalled", summary: "Member stalled", memberId: "m-stall", since: "2026-11-26T00:08:00.000Z" },
+    { kind: "provider-prompt", summary: "Prompt waiting", memberId: "m-prompt" },
+    { kind: "owner-decision", summary: "Decision 1", decisionId: "d1", memberId: "m-dec" },
+    { kind: "worker-slot", summary: "Waiting for slot 2", taskId: "t4" },
+  ];
+  const snapshot = input.map(item => ({ ...item }));
+  const ordered = orderMobileWaitReasons(input);
+
+  assert.deepEqual(ordered.map(item => item.kind), [
+    "owner-decision",
+    "provider-prompt",
+    "stalled",
+    "spinner-only",
+    "provider-limit",
+    "worker-slot",
+    "worker-slot",
+    "dependency",
+    "integration-order",
+    "linear-sync",
+  ]);
+  assert.deepEqual(
+    ordered.filter(item => item.kind === "worker-slot").map(item => item.summary),
+    ["Waiting for slot 1", "Waiting for slot 2"],
+  );
+  assert.deepEqual(input, snapshot);
+});
+
+test("shortDate guards empty, undefined, and invalid timestamps", () => {
+  assert.equal(shortDate(undefined), "");
+  assert.equal(shortDate(""), "");
+  assert.equal(shortDate("   "), "");
+  assert.equal(shortDate("not-a-date"), "");
+  assert.notEqual(shortDate("2026-11-26T00:12:00.000Z"), "");
+});
+
+test("spinnerOnlySince and stalledAt metadata are preserved in roster partitions and formatted into screen notices", () => {
+  const members: TeamMember[] = [
+    makeMember("m-spin", {
+      status: "running",
+      spinnerOnlySince: "2026-11-26T00:12:00.000Z",
+    }),
+    makeMember("m-stall", {
+      status: "stopped",
+      stalledAt: "2026-11-26T00:15:00.000Z",
+      stoppedReason: "No activity for 15 minutes",
+    }),
+    makeMember("m-clean", {
+      status: "running",
+    }),
+  ];
+
+  const partitioned = partitionMobileRoster(members, 2);
+  const activeSpin = partitioned.active.find(entry => entry.member.memberId === "m-spin")!.member;
+  const finishedStall = partitioned.finished.find(entry => entry.member.memberId === "m-stall")!.member;
+  assert.equal(activeSpin.spinnerOnlySince, "2026-11-26T00:12:00.000Z");
+  assert.equal(finishedStall.stalledAt, "2026-11-26T00:15:00.000Z");
+
+  assert.deepEqual(memberScreenNotices(activeSpin, iso => `fmt(${iso})`), [
+    { kind: "spinner-only", tone: "warning", text: "Spinner-only screen since fmt(2026-11-26T00:12:00.000Z)" },
+  ]);
+  assert.deepEqual(memberScreenNotices(finishedStall, iso => `fmt(${iso})`), [
+    { kind: "stalled", tone: "error", text: "Stalled since fmt(2026-11-26T00:15:00.000Z)" },
+  ]);
+
+  assert.deepEqual(
+    memberScreenNotices({ status: "running", spinnerOnlySince: "invalid-date" }),
+    [{ kind: "spinner-only", tone: "warning", text: "Spinner-only screen" }],
+  );
+  assert.deepEqual(
+    memberScreenNotices({ status: "running", stalledAt: "invalid-date" }, () => "   "),
+    [{ kind: "stalled", tone: "error", text: "Stalled" }],
+  );
+  assert.deepEqual(
+    memberScreenNotices({ status: "running", spinnerOnlySince: "2026-11-26T00:12:00.000Z" }, () => ""),
+    [{ kind: "spinner-only", tone: "warning", text: "Spinner-only screen" }],
+  );
+
+  assert.deepEqual(
+    memberScreenNotices({
+      status: "running",
+      spinnerOnlySince: "2026-11-26T00:12:00.000Z",
+      stalledAt: "2026-11-26T00:15:00.000Z",
+    }, iso => iso),
+    [
+      { kind: "stalled", tone: "error", text: "Stalled since 2026-11-26T00:15:00.000Z" },
+    ],
+  );
+  assert.deepEqual(
+    memberScreenNotices({ status: "stopped", spinnerOnlySince: "2026-11-26T00:12:00.000Z" }, iso => iso),
+    [],
+  );
+  assert.deepEqual(
+    memberScreenNotices({ status: "reported", spinnerOnlySince: "2026-11-26T00:12:00.000Z" }, iso => iso),
+    [],
+  );
+  assert.deepEqual(memberScreenNotices(members[2]!), []);
 });

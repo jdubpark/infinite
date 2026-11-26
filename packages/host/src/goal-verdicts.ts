@@ -55,6 +55,8 @@ export function applyLateVerdict(goal: ProductGoal, cycle: GoalCycle, team: Pick
   const late = lateVerdict(goal, cycle, team);
   if (late === undefined) return false;
   Object.assign(cycle, late);
+  const withdrawn = late.assessment.result !== "met" && goal.cycles.at(-1) === cycle;
+  if (withdrawn && goal.status === "ready-for-review" && goal.stopReason === "provisional-met" && goal.reason === PROVISIONAL_REASON) goal.reason = PROVISIONAL_WITHDRAWN_REASON;
   return true;
 }
 
@@ -68,7 +70,8 @@ export function owedStop(goal: ProductGoal, busy: boolean): boolean {
   if (goal.status !== "running" || goal.activeTeamId !== undefined || busy) return false;
   if (autonomyOf(goal) !== "autonomous" || goal.standing !== undefined) return false;
   const cycle = goal.cycles.at(-1);
-  if (cycle?.assessment?.kind !== "reviewed" || cycle.assessment.result !== "met") return false;
+  if (cycle === undefined || !["ready-for-review", "merged"].includes(cycle.status)) return false;
+  if (cycle.assessment?.kind !== "reviewed" || cycle.assessment.result !== "met") return false;
   const ids = verdictIdsOf(cycle);
   return !goal.outcomes.some(item => item.verdictId !== undefined && ids.includes(item.verdictId));
 }

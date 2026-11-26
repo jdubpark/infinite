@@ -51,9 +51,11 @@ export type TeamTask = {
 };
 export type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; headCommit: string; tasks: TeamTask[]; review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string; acceptance?: TeamAcceptanceEvidence[] }; brief?: TeamBrief };
 export type TeamMember = {
-  memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string;
+  memberId: string; sessionId: string; role: TeamRole; revision: number; planRevision?: number; title: string; status: string;
   taskId?: string; provider?: string; modelProfile?: ModelProfile; stoppedReason?: string;
   startedAt?: string; reportedAt?: string; lastActivityAt?: string; stalledAt?: string;
+  replacesMemberId?: string;
+  replaces?: { memberId: string; cause?: string };
 };
 export type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" | "connector"; source?: { kind: "connector"; id: string; name: string }; recommendation?: { answers: string[]; reason: string; outcome?: "matched" | "different" | "other" } };
 export type TeamWorkers = { limit: number; max: number; running: number; ready: number };

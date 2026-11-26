@@ -81,16 +81,16 @@ const patchReplay = (wrap: (host: Private, replay: Private["replay"]) => Private
   host.replay = wrap(host, host.replay.bind(host));
 } });
 
-const patchLateStopEffects: Variant = { patch: service => {
+const lateStopEffects = (late: { event: boolean; reason: boolean }): Variant => ({ patch: service => {
   const host = internals(service), stopRun = host.stopRun.bind(host);
   const invalidate = host.invalidatePermissionDecisions.bind(host), emit = host.event.bind(host);
   let stopping: { action: "pause" | "cancel"; reason: string | undefined; events: string[] } | undefined;
   host.event = (stored, text) => {
-    if (stopping && text.startsWith(stopping.action === "pause" ? "Team paused" : "Team cancelled")) stopping.events.push(text);
+    if (late.event && stopping && text.startsWith(stopping.action === "pause" ? "Team paused" : "Team cancelled")) stopping.events.push(text);
     else emit(stored, text);
   };
   host.invalidatePermissionDecisions = async (stored, reason, fenceAgent) => {
-    if (!stopping || reason !== `The team was ${stopping.action === "pause" ? "paused" : "cancelled"} before the permission request could be answered.`)
+    if (!late.reason || !stopping || reason !== `The team was ${stopping.action === "pause" ? "paused" : "cancelled"} before the permission request could be answered.`)
       return invalidate(stored, reason, fenceAgent);
     const reasonAtFence = stored.run.reason;
     stored.run.reason = stopping.reason;
@@ -107,7 +107,7 @@ const patchLateStopEffects: Variant = { patch: service => {
       host.save(stored);
     }
   };
-} };
+} });
 
 const MUTATIONS: readonly Mutation[] = [
   { name: "the receipt is recorded at admission, before the permission fence's save (INF-331)", invariant: "I3", kind: "source",
@@ -145,7 +145,8 @@ const MUTATIONS: readonly Mutation[] = [
       if (receipt && operation === "steer") stored.halt = "steer";
       return receipt;
     }) },
-  { name: "pause and cancel record their reason and event after the permission fence's save (INF-359)", invariant: "I3", kind: "source", variant: patchLateStopEffects },
+  { name: "pause and cancel record their event after the permission fence's save (INF-359)", invariant: "I3", kind: "source", variant: lateStopEffects({ event: true, reason: false }) },
+  { name: "pause and cancel record their reason after the permission fence's save (INF-526)", invariant: "I3", kind: "source", variant: lateStopEffects({ event: false, reason: true }) },
   { name: "a stop tears the record write", invariant: "I3", kind: "harness", variant: { stop: "torn" } },
   { name: "a stop loses the last record write", invariant: "I4", kind: "harness", variant: { stop: "lost" } },
   { name: "a save moves member cursors back to the journal's start", invariant: "I4", kind: "source",

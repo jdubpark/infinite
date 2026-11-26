@@ -342,13 +342,26 @@ after first pairing. Initial pairing still trusts the manually provisioned devic
 key and the identity it authenticates; this is not independent hardware attestation
 or an expiring enrollment protocol.
 
-The allowlist (`allowedPath()` in `packages/host/src/remote-access.ts`) admits terminal and live-event streams, resource observations, bounded project file operations, `POST /api/projects/:id/sync/apply`, `GET/POST/PUT/DELETE /api/project-groups[/:id]` and Understanding/behavior endpoints, `/api/teams/*`, `/api/goals/*`, `/api/missions/*`, `/api/board`, `/api/halt`, `/api/permissions/*` (including marks), `/api/usage/*` (including subscription plan edits), `/api/devices/push`, `/api/dictation/cleanup`, and `/api/sessions/:id/{handoff,archive}`. It also admits three read-only `GET`
-paths for the web [Swarm view](swarm.md): a project's directory-level code map
+The allowlist (`allowedPath()` in `packages/host/src/remote-access.ts`) admits only explicit method-and-path operations (never wildcards), plus multiplexed `terminal-*` and `events-*` streams:
+
+- **Status, queues, push, dictation:** `GET /api/me`, `GET /api/machine/resources`, `GET /api/board`, `GET /api/decision-queue`, `POST`/`DELETE /api/devices/push`, and `POST /api/dictation/cleanup`.
+- **Halt (read-only):** `GET /api/halt` only (`POST /api/halt` and `POST /api/halt/release` are denied).
+- **Permissions (audit reads and marks only):** `GET /api/permissions/log`, `GET /api/permissions/candidates`, `GET /api/permissions/decisions/:id`, and `POST /api/permissions/marks` (delegation, revocation, unlock/reopen, and replay mutations are denied).
+- **Usage and plans:** `GET /api/usage`, `GET /api/usage/daily`, `GET /api/usage/models`, `GET /api/usage/projects`, `GET /api/usage/projects/:id`, `POST /api/usage/balances/refresh`, and `PUT /api/usage/accounts/:id/plan`.
+- **Sessions:** `GET`/`POST /api/sessions` (excluding `workspace`, `nativeArgs`, and `localUi` body fields), `GET`/`DELETE /api/sessions/:id`, `GET /api/sessions/:id/{events,messages,summary,file,handoff,context}`, and `POST /api/sessions/:id/{control,input,answer,key,stop,resize,resume,archive}` (`workspace-export` and native/OpenCode/executor bridges are denied).
+- **Projects, files, code map, and sync apply:** `GET /api/projects/:id`, `GET`/`PUT /api/projects/:id/context`, bounded file operations (`GET /files`, `GET`/`DELETE /file`, `POST /directories`, `POST /uploads`, `PUT`/`DELETE /uploads/:uploadId`, `POST /uploads/:uploadId/commit`), `GET /api/projects/:id/graph/map`, and `POST /api/projects/:id/sync/apply` (sync ingest/export, source refresh, main-check, signals, and project team/autonomy config routes are denied).
+- **Project groups and Understanding:** `GET`/`POST /api/project-groups`, `GET`/`PUT`/`DELETE /api/project-groups/:id`, `GET /api/project-groups/:id/understanding` and its listed read subroutes (`catalog`, `components`, `components/:componentId`, `briefs`, `planned`, `work`, `generated`, `brief`, `diagrams/:diagramId`, `behaviors`, `behaviors/:behaviorId`, `behaviors/:behaviorId/suite`), plus `POST` to `/understanding/refresh`, `/understanding/behaviors`, `/understanding/behaviors/:behaviorId/run`, and `/understanding/catalog/{projects,features,plans,components,policy}[/:componentId]`.
+- **Teams:** `GET`/`POST /api/teams`, `GET /api/teams/:id`, `GET /api/teams/:id/{context,context-usage,entries}`, `GET /api/teams/:id/entries/:entryId`, `POST /api/teams/:id/{steer,pause,resume,continue,cancel}`, and `POST /api/teams/:id/decisions/:decisionId/answer` (`DELETE /api/teams/:id`, entry `withdraw`, `bundle`, `members/:memberId/{runtime,retire}`, `reconcile-*`, `permissions/revoke`, `routing/revoke`, `rating`, `record`, and `routing/:taskId` are denied).
+- **Goals:** `GET`/`POST /api/goals`, `GET /api/goals/:id`, and `POST /api/goals/:id/{steer,pause,resume,cancel,outcome}` (`record`, `verdicts`, `metrics`, `extend`, and `parallelism` are denied).
+- **Missions:** `GET`/`POST /api/missions`, `GET /api/missions/:id`, `GET /api/missions/:id/progress`, `POST /api/missions/:id/{steer,pause,resume,cancel,extend}`, and `POST /api/missions/:id/answer/:decisionId`.
+
+Routines, launch-rate fuse, intake, outcomes, routing, eval, duels, and evidence-status routes remain outside the remote allowlist. The three read-only `GET`
+paths for the web [Swarm view](swarm.md)—a project's directory-level code map
 (`/api/projects/:id/graph/map`) and the touched-file sets of a team or a
-session (`/api/teams/:id/context`, `/api/sessions/:id/context`). They carry
+session (`/api/teams/:id/context`, `/api/sessions/:id/context`)—carry
 directory names, repository-relative file paths, and counts, which is the
 class of data the file listing and session events already serve, and no source
-text. The allowlist also admits `GET /api/decision-queue` as a read; global API
+text. `GET /api/decision-queue` is admitted as a read; global API
 authentication still applies, and the route adds no role guard. The read answers
 nothing. Like `GET /api/sessions`, it first shows the listed dialogs to the session
 permission service, which may then start its review of a dialog the owner delegated

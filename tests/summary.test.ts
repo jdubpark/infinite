@@ -70,6 +70,11 @@ test("a summary covers the chat after a cursor, names its model, and is cached p
     const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
     const control = await claimControl(host, id, "owner");
     await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId: detail.body.attention.prompt.id, option: 0 }, control.headers);
+    await waitFor(() => host.fetchApi(`/sessions/${id}/events?limit=200`), (r) => {
+      const hasTurnEnd = r.body.events.some((event: any) => event.type === "signal" && event.data.kind === "turn-end");
+      const output = r.body.events.filter((event: any) => event.type === "output").map((event: any) => event.data.text).join("");
+      return hasTurnEnd && /Selected: Yes[\s\S]*> /.test(output);
+    }, 15000);
     const chat = await waitFor(() => host.fetchApi(`/sessions/${id}/messages`), (r) => r.body.messages.some((m: any) => /Removed the build directory/.test(m.text)), 15000);
 
     const summary = await host.fetchApi(`/sessions/${id}/summary`, "viewer");

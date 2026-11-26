@@ -1,9 +1,11 @@
 import type {
+  MissionProgressChild,
   MissionProgressObservation,
   MissionProgressPage,
   MissionProgressResyncReason,
   MissionProgressSnapshot,
 } from "../../api/client";
+import { TEAM_LABELS } from "../teams/model";
 
 export type MissionProgressSubtaskEntry = {
   subtask: MissionProgressSnapshot["subtasks"][number];
@@ -107,20 +109,15 @@ export function dismissMissionProgressNotice(state: MissionProgressState): Missi
 export function partitionMissionSubtasks(
   subtasks: readonly MissionProgressSnapshot["subtasks"][number][],
 ): MissionProgressSubtaskPartition {
+  const subtaskIds = new Set(subtasks.map(item => item.id));
   const replacedBy = new Map<string, string>();
   const replaces = new Map<string, string>();
-  const lastStoppedByRepo = new Map<string, MissionProgressSnapshot["subtasks"][number]>();
 
   for (const subtask of subtasks) {
-    const previous = lastStoppedByRepo.get(subtask.repoProjectId);
-    if (previous && previous.id !== subtask.id && subtask.status !== "cancelled") {
-      replacedBy.set(previous.id, subtask.id);
-      replaces.set(subtask.id, previous.id);
-    }
-    if (subtask.status === "blocked" || subtask.status === "cancelled") {
-      lastStoppedByRepo.set(subtask.repoProjectId, subtask);
-    } else if (subtask.status === "running" || subtask.status === "queued" || subtask.status === "done") {
-      lastStoppedByRepo.delete(subtask.repoProjectId);
+    const prior = subtask.replacesSubtaskId;
+    if (prior && prior !== subtask.id && subtaskIds.has(prior)) {
+      replacedBy.set(prior, subtask.id);
+      replaces.set(subtask.id, prior);
     }
   }
 
@@ -138,6 +135,82 @@ export function partitionMissionSubtasks(
   }
 
   return { active, finished };
+}
+
+const STATUS_AWAITING_WORKER = new Set(["running", "waiting", "reported", "unavailable"]);
+
+export function summarizeMissionProgressChild(child: MissionProgressChild): string {
+  if (child.kind === "not-created") return "Team not created yet";
+  if (child.kind === "missing") return "Child team record missing";
+  if (child.kind === "mismatched") return "Child team mismatch";
+
+  const teamLabel = TEAM_LABELS[child.status] ?? child.status;
+  const assignments = child.assignments;
+  const recordedActive = assignments.filter(
+    member => member.recordedStatus === "running" || member.recordedStatus === "waiting",
+  ).length;
+  const liveWorkers = assignments.filter(
+    member => member.workerStatus === "running" || member.workerStatus === "starting",
+  ).length;
+
+  let sampledAwaiting = 0;
+  let unsampledAwaiting = 0;
+  let unknownAwaiting = 0;
+  const issueCounts = new Map<string, number>();
+  const bump = (label: string) => issueCounts.set(label, (issueCounts.get(label) ?? 0) + 1);
+
+  for (const member of assignments) {
+    const expectedActive = member.recordedStatus === "running" || member.recordedStatus === "waiting";
+    const awaitingWorker = STATUS_AWAITING_WORKER.has(member.recordedStatus) && !member.exitConfirmedAt;
+    if (awaitingWorker) {
+      if (member.workerStatus === "not-sampled") {
+        unsampledAwaiting += 1;
+      } else if (member.workerStatus === "unknown") {
+        unknownAwaiting += 1;
+      } else {
+        sampledAwaiting += 1;
+      }
+    }
+    if (member.workerStatus === "recording-error" || member.workerStatus === "unavailable" || member.workerStatus === "mismatched") {
+      bump(member.workerStatus);
+    } else if (expectedActive && member.workerStatus === "exited") {
+      bump("exited");
+    } else if (awaitingWorker && (member.workerStatus === "unknown" || member.workerStatus === "not-sampled")) {
+      bump(member.workerStatus);
+    }
+  }
+
+  let assignmentText: string;
+  let workerText: string | undefined;
+  if (assignments.length === 0) {
+    assignmentText = child.assignmentsTruncated ? "assignments truncated" : "0 assignments";
+  } else {
+    assignmentText = child.assignmentsTruncated
+      ? `recorded ${recordedActive} active (${assignments.length} shown, truncated)`
+      : `recorded ${recordedActive}/${assignments.length} active`;
+    const incompleteSampling = Boolean(child.assignmentsTruncated) || unsampledAwaiting > 0 || unknownAwaiting > 0;
+    const issueSummary = [...issueCounts.entries()].map(([label, count]) => `${count} ${label}`).join(", ");
+    let workerBase: string;
+    if (!incompleteSampling) {
+      workerBase = `${liveWorkers} ${liveWorkers === 1 ? "worker" : "workers"} live`;
+    } else if (sampledAwaiting === 0 && liveWorkers === 0) {
+      workerBase = child.assignmentsTruncated && unsampledAwaiting === 0 && unknownAwaiting === 0
+        ? "0 sampled workers live"
+        : "workers unsampled";
+    } else if (sampledAwaiting > 0 && liveWorkers <= sampledAwaiting) {
+      workerBase = `${liveWorkers} of ${sampledAwaiting} sampled ${sampledAwaiting === 1 ? "worker" : "workers"} live`;
+    } else {
+      workerBase = `${liveWorkers} sampled ${liveWorkers === 1 ? "worker" : "workers"} live`;
+    }
+    workerText = issueSummary ? `${workerBase} (${issueSummary})` : workerBase;
+  }
+
+  const latestCheck = child.checks[child.checks.length - 1];
+  const checkText = latestCheck
+    ? `check ${latestCheck.status}${latestCheck.exitCode !== undefined ? ` (${String(latestCheck.exitCode)})` : ""}${latestCheck.headCommit ? ` · ${latestCheck.headCommit.slice(0, 8)}` : ""}${child.checksTruncated ? " (checks truncated)" : ""}`
+    : child.checksTruncated ? "checks truncated" : undefined;
+
+  return [teamLabel, assignmentText, workerText, checkText].filter(Boolean).join(" · ");
 }
 
 export function linkedTeamIdOf(child: MissionProgressSnapshot["subtasks"][number]["child"]): string | undefined {

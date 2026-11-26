@@ -4050,9 +4050,15 @@ a five-minute quiet window so a silent review can recover before a goal deadline
 One replacement then continues the same task in that workspace, with feedback
 that the earlier attempt stalled. A second
 stall on the same assignment blocks the team with the reason "An agent showed no
-activity twice on the same assignment." Activity means attention activity from the
-member's terminal or hooks. Screen output also counts, so an agent stuck behind an
-animated spinner looks active. Older runs blocked by the former one-hour limit
+activity twice on the same assignment." Activity means attention signals from hooks
+or protocol, or genuine substantive screen changes on hookless terminals; animated
+spinner glyphs, elapsed timers, and status-line token or cost ticker redraws alone do
+not reset the stall window (the session records `spinnerOnlySince` when raw output
+continues without substantive screen changes). Team views also expose host-derived
+`waitReasons` (`worker-slot`, `dependency`, `owner-decision`, `provider-prompt`,
+`provider-limit`, `integration-order`, `linear-sync`, `spinner-only`, `stalled`)
+projected strictly from recorded team and member state without guessing progress.
+Older runs blocked by the former one-hour limit
 still resume. A team blocked only by a stall can resume with
 `infinite team resume ID`. That starts a fresh plan from the integration commit;
 stopped member copies remain subject to the workspace retention policy.
@@ -4268,9 +4274,9 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | `GET /api/teams/:id/context-usage` | None; returns recorded launch and blackboard read sizes per member (`member_scopes`) | Any paired device |
 | `GET /api/teams/:id/routing/:taskId` | None; explains the shadow or auto routing decision for a task | Any paired device |
 | `POST /api/teams/:id/reconcile-delivery`, `/reconcile-verification` | `requestId`, `revision`, reconciliation attestation fields (standalone runs) | Owner |
-| `GET /api/teams/:id/members/:memberId/runtime`, `POST /api/teams/:id/members/:memberId/retire` | Inspect live process census or retire a member runtime tree (`SIGSTOP` -> `SIGKILL`) | Reads: any; `retire`: Owner |
+| `GET /api/teams/:id/members/:memberId/runtime`, `POST /api/teams/:id/members/:memberId/retire` | Inspect live process census or retire a member runtime tree (`SIGSTOP` -> `SIGKILL`) | Owner |
 | `POST /api/teams/:id/permissions/revoke`, `/routing/revoke` | `requestId`, `revision`; revokes active permission delegation or auto routing for the run | Owner |
-| `GET /api/teams/:id/bundle` | None; downloads the run's inspection bundle | Owner |
+| `GET /api/teams/:id/bundle` | None; downloads the run's inspection bundle | Owner bearer key (owner CLI; session cookies refused) |
 
 Related subsystem routes documented in their respective sections above and in [System Architecture](architecture.md#api-surface-index): `/api/routines/*` (scheduled routines), `/api/fuse` and `POST /api/fuse/close` (launch-rate fuse), `/api/permissions/*` (host permission agent journal, delegations, unlocks, and replay), `/api/routing/*` (project routing status and exploration pause/resume), `/api/outcomes/*` (outcome ledger), `/api/eval/*` (replay eval jobs and priors), and `/api/duels/judges/*` (judge calibrations).
 

@@ -1629,7 +1629,8 @@ server.listen(workerSocket, async () => {
       }
       lastOutputAt = Date.now();
       outputSinceCheck = true;
-      if (pending.length >= 256 * 1024) try { flush(); } catch {}
+      const flushed = pending.length >= 256 * 1024;
+      if (flushed) try { flush(); } catch {}
       if (!flushTimer)
         flushTimer = setTimeout(() => {
           try {
@@ -1639,6 +1640,7 @@ server.listen(workerSocket, async () => {
           }
           checkScreen();
         }, 40);
+      return flushed;
     };
     const onData = (data: string) => terminalBarrier.dispatch(() => output(data), Buffer.byteLength(data, "utf8"));
     child.onData(onData);

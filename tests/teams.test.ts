@@ -984,7 +984,7 @@ test("a team builds concurrently in isolated copies and produces checked, review
     assert.ok(commands.some(command => command.cwd === f.source && command.command === "git"), "Source Git inspection must use the configured execution identity");
     for (const worker of workers)
       assert.ok(commands.some(command => command.cwd === worker.cwd && command.command === "git" && command.args.includes("add")), "Git must not stage agent-controlled files as the API identity");
-    const checkCommands = commands.filter(command => command.command === process.execPath && command.args.includes("check.mjs"));
+    const checkCommands = commands.filter(command => [process.execPath, "sh"].includes(command.command) && command.args.includes("check.mjs"));
     assert.ok(checkCommands.length > 0, "Configured checks must use the execution identity");
     for (const command of checkCommands) {
       assert.ok(command.cwd.startsWith(join(dirname(finished.workspace), "verification") + "/"), "Configured checks must run in a separate verification copy");

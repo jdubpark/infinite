@@ -25,6 +25,8 @@ export function signalGroup(child: ChildProcess, signal: NodeJS.Signals): GroupS
 }
 
 export function spawnGroup(command: string, args: readonly string[], options: SpawnOptions & { cwd?: string }, graceMs: number): ChildProcess {
+  if (Array.isArray(options.stdio) && (options.stdio.length > 3 || options.stdio.includes("ipc")))
+    throw new Error("A grouped spawn takes at most three stdio entries and no ipc entry, because its anchor keeps the caller's stderr on descriptor 3.");
   const [file, argv] = anchoredCommand(command, args, options, graceMs);
   return spawn(file, argv, { ...options, detached: process.platform !== "win32" });
 }

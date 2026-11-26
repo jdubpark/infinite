@@ -4,7 +4,7 @@ import { execFileSync, spawn, type ChildProcess, type StdioOptions } from "node:
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { signalGroup, spawnGroup, watchLeader } from "../packages/host/src/process-group.js";
+import { signalGroup, spawnGroup, terminateGroup, watchLeader } from "../packages/host/src/process-group.js";
 import { SUPERVISOR_GRACE_MS, supervisorArgs } from "../packages/host/src/group-supervisor.js";
 import { EXIT_DRAIN_MS } from "../packages/host/src/team-workspace.js";
 import { blobReader } from "../packages/host/src/git-stream.js";
@@ -551,4 +551,20 @@ test("a grouped spawn reports the status, signal, output and missing command tha
   }
   const missing = "no-such-command-for-a-grouped-spawn";
   assert.equal(await report(spawnGroup(missing, [], { stdio }, 500)), await report(spawn(missing, [], { stdio })));
+});
+
+test("a grouped stop closes the caller's pipes well before its grace, because the sleeper it leaves holds none of them", CASE, async () => {
+  const graceMs = 5_000;
+  const child = spawnGroup(process.execPath, ["-e", "process.stdout.write('ready'); setInterval(() => {}, 1000)"], { stdio: ["pipe", "pipe", "pipe"] }, graceMs);
+  const closed = new Promise<number>(done => child.once("close", () => done(Date.now())));
+  await new Promise<void>((ready, fail) => { child.stdout!.once("data", () => ready()); child.once("error", fail); });
+  const stopped = Date.now();
+  terminateGroup(child, graceMs);
+  const elapsed = (await closed) - stopped;
+  assert.ok(elapsed < graceMs / 2, `close arrived ${elapsed} ms after the stop, with a grace of ${graceMs} ms`);
+});
+
+test("a grouped spawn refuses a fourth stdio entry and an ipc entry, because its anchor keeps the caller's stderr on descriptor 3", () => {
+  const refused: StdioOptions[] = [["pipe", "pipe", "pipe", "pipe"], ["ignore", "pipe", "pipe", "ipc"], ["ignore", "pipe", "ipc"]];
+  for (const stdio of refused) assert.throws(() => spawnGroup(process.execPath, ["-e", ""], { stdio }, 500), /descriptor 3/, JSON.stringify(stdio));
 });

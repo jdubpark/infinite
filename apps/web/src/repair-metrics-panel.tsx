@@ -12,7 +12,7 @@ import {
 
 export function RepairMetricsPanel({ projectId, days = DEFAULT_REPAIR_WINDOW_DAYS }: { projectId?: string; days?: number }) {
   const api = useApi();
-  const scopeKey = `${projectId ?? "all"}:${days}`;
+  const scopeKey = projectId !== undefined ? `project:${projectId}:${days}` : `all:${days}`;
   const [reportState, setReportState] = useState<{ key: string; value: RepairLoopReport } | null>(null);
   const [errorState, setErrorState] = useState<{ key: string; value: RepairLoopLoadError } | null>(null);
 
@@ -149,9 +149,22 @@ export function RepairMetricsPanel({ projectId, days = DEFAULT_REPAIR_WINDOW_DAY
 
       {(vm.coverage.unmeasuredLoops > 0 || vm.coverage.unmeasuredMembers > 0) && (
         <p className="repair-note quiet">
-          <span className="cost-badge">{vm.coverage.unmeasuredLoops} unmeasured</span>{" "}
-          {vm.coverage.unmeasuredLoops} of {vm.loopsTotal} loops ({vm.coverage.unmeasuredMembers} unmeasured{" "}
-          {vm.coverage.unmeasuredMembers === 1 ? "member" : "members"}) lack complete pricing and are excluded from token and USD medians, never counted as $0.
+          {vm.coverage.unmeasuredLoops > 0 ? (
+            <>
+              <span className="cost-badge">{vm.coverage.unmeasuredLoops} unmeasured</span>{" "}
+              {vm.coverage.unmeasuredLoops} of {vm.loopsTotal} loops ({vm.coverage.unmeasuredMembers} unmeasured{" "}
+              {vm.coverage.unmeasuredMembers === 1 ? "member" : "members"}) lack complete pricing and are excluded from token and USD medians, never counted as $0.
+            </>
+          ) : (
+            <>
+              <span className="cost-badge">
+                {vm.coverage.unmeasuredMembers} unmeasured {vm.coverage.unmeasuredMembers === 1 ? "member" : "members"}
+              </span>{" "}
+              {vm.coverage.unmeasuredMembers} unmeasured {vm.coverage.unmeasuredMembers === 1 ? "member" : "members"} across these runs{" "}
+              {vm.coverage.unmeasuredMembers === 1 ? "lacks" : "lack"} complete pricing and{" "}
+              {vm.coverage.unmeasuredMembers === 1 ? "is" : "are"} never counted as $0.
+            </>
+          )}
         </p>
       )}
 
@@ -191,7 +204,7 @@ export function RepairMetricsPanel({ projectId, days = DEFAULT_REPAIR_WINDOW_DAY
                 <td data-label="Attempts">
                   {sample.rounds}r · {sample.attempts} att
                   {(sample.coldReplacements > 0 || sample.failedResumes > 0) && (
-                    <small>{sample.coldReplacements} cold · {sample.failedResumes} failed resume</small>
+                    <small>{sample.coldReplacements} cold · {sample.failedResumes} failed {sample.failedResumes === 1 ? "resume" : "resumes"}</small>
                   )}
                 </td>
                 <td data-label="Duration">{sample.durationText}</td>

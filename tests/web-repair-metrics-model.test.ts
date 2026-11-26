@@ -354,15 +354,92 @@ test("buildRepairMetricsViewModel projects incompleteRuns, unfinishedLoops, noti
   const gateWithIncompleteAndUnfinished = evaluateExperimentGate(makeReport({
     totals: {
       ...makeReport().totals,
+      runsExamined: 30,
       eventCoverage: "incomplete",
-      incompleteRuns: 1,
+      incompleteRuns: 2,
+      loopsTotal: 22,
+      measuredLoops: 20,
+      unmeasuredLoops: 0,
+      unfinishedLoops: 2,
+    },
+  }));
+  assert.equal(gateWithIncompleteAndUnfinished.hasCompleteCoverage, false);
+  assert.equal(gateWithIncompleteAndUnfinished.baselineGateMet, false);
+  assert.equal(gateWithIncompleteAndUnfinished.statusLabel, "Incomplete event coverage");
+  assert.equal(gateWithIncompleteAndUnfinished.unfinishedLoops, 2);
+  assert.match(gateWithIncompleteAndUnfinished.detailText, /2 of 30 examined runs/);
+  assert.match(gateWithIncompleteAndUnfinished.detailText, /22 of 20 minimum repair loops observed/);
+  assert.match(gateWithIncompleteAndUnfinished.detailText, /2 unfinished/);
+  assert.match(gateWithIncompleteAndUnfinished.detailText, /loop counts may undercount actual repairs/);
+
+  const gateWithIncompleteFlagOnly = evaluateExperimentGate(makeReport({
+    totals: {
+      ...makeReport().totals,
+      eventCoverage: "incomplete",
+      incompleteRuns: 0,
+      loopsTotal: 25,
+      measuredLoops: 25,
+      unmeasuredLoops: 0,
+      unfinishedLoops: 0,
+    },
+  }));
+  assert.equal(gateWithIncompleteFlagOnly.hasCompleteCoverage, false);
+  assert.equal(gateWithIncompleteFlagOnly.baselineGateMet, false);
+  assert.equal(gateWithIncompleteFlagOnly.statusLabel, "Incomplete event coverage");
+  assert.match(gateWithIncompleteFlagOnly.detailText, /Event coverage is incomplete for examined runs/);
+
+  const gateZeroLoopsIncomplete = evaluateExperimentGate(makeReport({
+    totals: {
+      ...makeReport().totals,
+      runsExamined: 4,
+      eventCoverage: "incomplete",
+      incompleteRuns: 3,
+      loopsTotal: 0,
+      measuredLoops: 0,
+      unmeasuredLoops: 0,
+      unfinishedLoops: 0,
+    },
+  }));
+  assert.equal(gateZeroLoopsIncomplete.hasCompleteCoverage, false);
+  assert.equal(gateZeroLoopsIncomplete.baselineGateMet, false);
+  assert.equal(gateZeroLoopsIncomplete.statusLabel, "Incomplete event coverage");
+  assert.match(gateZeroLoopsIncomplete.detailText, /3 of 4 examined runs/);
+
+  const gateCollectingWithUnfinished = evaluateExperimentGate(makeReport({
+    totals: {
+      ...makeReport().totals,
+      loopsTotal: 5,
+      measuredLoops: 3,
+      unmeasuredLoops: 1,
+      unfinishedLoops: 1,
+    },
+  }));
+  assert.equal(gateCollectingWithUnfinished.statusLabel, "Collecting baseline");
+  assert.match(gateCollectingWithUnfinished.detailText, /1 unfinished/);
+
+  const gateLowCoverageWithUnfinished = evaluateExperimentGate(makeReport({
+    totals: {
+      ...makeReport().totals,
+      loopsTotal: 24,
+      measuredLoops: 15,
+      unmeasuredLoops: 6,
+      unfinishedLoops: 3,
+    },
+  }));
+  assert.equal(gateLowCoverageWithUnfinished.statusLabel, "Coverage below threshold");
+  assert.match(gateLowCoverageWithUnfinished.detailText, /3 unfinished/);
+
+  const gateMetWithUnfinished = evaluateExperimentGate(makeReport({
+    totals: {
+      ...makeReport().totals,
       loopsTotal: 20,
       measuredLoops: 16,
       unmeasuredLoops: 2,
       unfinishedLoops: 2,
     },
   }));
-  assert.equal(gateWithIncompleteAndUnfinished.baselineGateMet, true);
-  assert.equal(gateWithIncompleteAndUnfinished.unfinishedLoops, 2);
-  assert.match(gateWithIncompleteAndUnfinished.detailText, /2 unfinished/);
+  assert.equal(gateMetWithUnfinished.hasCompleteCoverage, true);
+  assert.equal(gateMetWithUnfinished.baselineGateMet, true);
+  assert.equal(gateMetWithUnfinished.statusLabel, "Baseline sample met");
+  assert.match(gateMetWithUnfinished.detailText, /2 unfinished/);
 });

@@ -184,4 +184,25 @@ describe("web repair metrics Playwright E2E", { skip: skipBrowser }, () => {
       await page.close();
     }
   });
+
+  test("gate stays pending with Incomplete event coverage even when loops and measured counts exceed 20", async () => {
+    const { page, errors } = await open("?scenario=incomplete-high-volume", "#/cost");
+    try {
+      await page.waitForSelector(".repair-gate-badge");
+      const badge = page.locator(".repair-gate-badge");
+      assert.equal(await badge.textContent(), "Incomplete event coverage");
+      const badgeClass = await badge.getAttribute("class");
+      assert.match(badgeClass ?? "", /\bis-pending\b/);
+      assert.doesNotMatch(badgeClass ?? "", /\bis-met\b/);
+
+      const detailText = await page.locator(".repair-gate-detail").textContent();
+      assert.match(detailText ?? "", /2 of 30 examined runs/);
+      assert.match(detailText ?? "", /25 of 20 minimum repair loops observed/);
+      assert.match(detailText ?? "", /2 unfinished/);
+      assert.match(detailText ?? "", /loop counts may undercount actual repairs/);
+      assert.deepEqual(errors, []);
+    } finally {
+      await page.close();
+    }
+  });
 });

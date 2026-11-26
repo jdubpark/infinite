@@ -251,6 +251,49 @@ const emptyIncompleteReport: RepairLoopReport = {
   loops: [],
 };
 
+const incompleteHighVolumeReport: RepairLoopReport = {
+  windowDays: 30,
+  totals: {
+    runsExamined: 30,
+    eventCoverage: "incomplete",
+    incompleteRuns: 2,
+    loopsTotal: 25,
+    resolved: 22,
+    unresolved: 1,
+    inProgress: 2,
+    byCause: { review: 12, check: 10, delivery: 3 },
+    coldReplacements: 2,
+    failedResumes: 1,
+    measuredLoops: 22,
+    unmeasuredLoops: 1,
+    unfinishedLoops: 2,
+    unmeasuredMembers: 1,
+    medianMinutes: 9.5,
+    p90Minutes: 21,
+    medianTokens: 32000,
+    medianUsd: 0.31,
+  },
+  loops: [
+    {
+      runId: "12121212-7777-4777-8777-777777777777",
+      projectId: "proj-alpha",
+      revision: 1,
+      cause: "review",
+      outcome: "resolved",
+      rounds: 1,
+      attempts: 2,
+      coldReplacements: 0,
+      failedResumes: 0,
+      startedAt: "2026-11-26T10:00:00.000Z",
+      finishedAt: "2026-11-26T10:09:30.000Z",
+      durationMs: 570_000,
+      measured: true,
+      tokens: 32000,
+      usd: 0.31,
+    },
+  ],
+};
+
 const host = (async (path: string) => {
   requests.push(path);
   if (path === "/usage") return fixtureSummary;
@@ -261,6 +304,7 @@ const host = (async (path: string) => {
     if (scenario === "unavailable-503") throw new ApiError("Usage ledger unavailable", 503, "unavailable");
     if (scenario === "incomplete-unfinished") return incompleteUnfinishedReport;
     if (scenario === "empty-incomplete") return emptyIncompleteReport;
+    if (scenario === "incomplete-high-volume") return incompleteHighVolumeReport;
     if (path.includes("project=proj-alpha")) return projectUnmeasuredReport;
     return mixedReport;
   }

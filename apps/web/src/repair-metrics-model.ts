@@ -23,6 +23,7 @@ export type RepairExperimentGate = {
   coveragePercent: number | null;
   hasMinLoops: boolean;
   hasMeasuredCoverage: boolean;
+  hasCompleteCoverage: boolean;
   baselineGateMet: boolean;
   statusLabel: string;
   detailText: string;
@@ -239,30 +240,41 @@ export function formatSampleCost(
 
 export function evaluateExperimentGate(report: Pick<RepairLoopReport, "windowDays" | "totals">): RepairExperimentGate {
   const { totals, windowDays } = report;
+  const incompleteRuns = totals.incompleteRuns ?? 0;
   const unfinishedLoops = totals.unfinishedLoops ?? 0;
+  const eventCoverage: RepairEventCoverage = totals.eventCoverage ?? (incompleteRuns > 0 ? "incomplete" : "complete");
+  const hasCompleteCoverage = eventCoverage === "complete" && incompleteRuns === 0;
   const coverageRatio = totals.loopsTotal > 0 ? totals.measuredLoops / totals.loopsTotal : null;
   const coveragePercent = coverageRatio === null ? null : Math.round(coverageRatio * 100);
   const hasMinLoops = totals.loopsTotal >= EXPERIMENT_MIN_LOOPS;
   const hasMeasuredCoverage = totals.loopsTotal > 0 && (
     (totals.measuredLoops / totals.loopsTotal) >= EXPERIMENT_MIN_COVERAGE || totals.measuredLoops >= EXPERIMENT_MIN_LOOPS
   );
-  const baselineGateMet = hasMinLoops && hasMeasuredCoverage;
+  const baselineGateMet = hasCompleteCoverage && hasMinLoops && hasMeasuredCoverage;
+  const coverageSuffix = coveragePercent !== null ? `, ${coveragePercent}% coverage` : "";
+  const unfinishedSuffix = unfinishedLoops > 0 ? `, ${unfinishedLoops} unfinished` : "";
 
   let statusLabel: string;
   let detailText: string;
 
-  if (totals.loopsTotal === 0) {
+  if (!hasCompleteCoverage) {
+    statusLabel = "Incomplete event coverage";
+    const gapPrefix = incompleteRuns > 0
+      ? `Event coverage is incomplete for ${incompleteRuns} of ${totals.runsExamined} examined ${totals.runsExamined === 1 ? "run" : "runs"}`
+      : "Event coverage is incomplete for examined runs";
+    detailText = `${gapPrefix}; ${totals.loopsTotal} of ${EXPERIMENT_MIN_LOOPS} minimum repair loops observed (${totals.measuredLoops} measured${coverageSuffix}${unfinishedSuffix}); loop counts may undercount actual repairs.`;
+  } else if (totals.loopsTotal === 0) {
     statusLabel = "No baseline loops";
     detailText = `0 of ${EXPERIMENT_MIN_LOOPS} minimum repair loops observed in the ${windowDays}-day window.`;
   } else if (baselineGateMet) {
     statusLabel = "Baseline sample met";
-    detailText = `${totals.loopsTotal} repair loops observed (${totals.measuredLoops} measured, ${coveragePercent}% coverage; ${totals.unmeasuredLoops} unmeasured${unfinishedLoops > 0 ? `, ${unfinishedLoops} unfinished` : ""}).`;
+    detailText = `${totals.loopsTotal} repair loops observed (${totals.measuredLoops} measured${coverageSuffix}; ${totals.unmeasuredLoops} unmeasured${unfinishedSuffix}).`;
   } else if (!hasMinLoops) {
     statusLabel = "Collecting baseline";
-    detailText = `${totals.loopsTotal} of ${EXPERIMENT_MIN_LOOPS} minimum repair loops observed (${totals.measuredLoops} measured${coveragePercent !== null ? `, ${coveragePercent}% coverage` : ""}).`;
+    detailText = `${totals.loopsTotal} of ${EXPERIMENT_MIN_LOOPS} minimum repair loops observed (${totals.measuredLoops} measured${coverageSuffix}${unfinishedSuffix}).`;
   } else {
     statusLabel = "Coverage below threshold";
-    detailText = `${totals.loopsTotal} repair loops observed with ${totals.measuredLoops} measured (${coveragePercent}% coverage; threshold is >= 80% coverage or ${EXPERIMENT_MIN_LOOPS} measured loops).`;
+    detailText = `${totals.loopsTotal} repair loops observed with ${totals.measuredLoops} measured (${coveragePercent}% coverage${unfinishedSuffix}; threshold is >= 80% coverage or ${EXPERIMENT_MIN_LOOPS} measured loops).`;
   }
 
   return {
@@ -276,6 +288,7 @@ export function evaluateExperimentGate(report: Pick<RepairLoopReport, "windowDay
     coveragePercent,
     hasMinLoops,
     hasMeasuredCoverage,
+    hasCompleteCoverage,
     baselineGateMet,
     statusLabel,
     detailText,

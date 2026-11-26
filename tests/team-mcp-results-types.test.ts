@@ -28,6 +28,10 @@ const nullableLooseOptionalSchema = looseOptionalSchema.nullable();
 const readonlyLooseOptionalSchema = looseOptionalSchema.readonly();
 const transformedSchema = pendingEntrySchema.shape.entryId.transform(value => value);
 const defaultedSchema = pendingEntrySchema.shape.entryId.default("11111111-1111-4111-8111-111111111111");
+const looseObjectSchema = pendingEntrySchema.passthrough();
+const catchallOptionalSchema = pendingEntrySchema.catchall(looseOptionalSchema);
+const cleanPipeSchema = pendingEntrySchema.shape.entryId.pipe(pendingEntrySchema.shape.entryId);
+const optionalInputPipeSchema = pendingEntrySchema.shape.entryId.optional().pipe(pendingEntrySchema.shape.entryId);
 
 export type WireShapeTypeTests = [
   Check<Exact<[], readonly []>>,
@@ -35,7 +39,9 @@ export type WireShapeTypeTests = [
   Check<Exact<[string, ...number[]], readonly [string, ...number[]]>>,
   Check<Exact<[...string[], number], readonly [...string[], number]>>,
   Check<Exact<[string, number?], readonly [string, number?]>>,
+  Check<Exact<[unknown?, ...number[]], readonly [unknown?, ...number[]]>>,
   Check<Exact<[{ id: string }, { count: number }], readonly [{ id: string }, { count: number }]>>,
+  Check<NoExplicitUndefined<typeof cleanPipeSchema>>,
   Check<WireSchemaMatches<typeof exactOptionalSchema, { entryId: string; state: "pending"; at?: string }>>,
   Check<WireSchemaMatches<typeof pendingEntrySchema, PendingEntry>>,
   Check<WireSchemaMatches<typeof memberHeadSchema, MemberHead>>,
@@ -63,6 +69,14 @@ export type WireShapeTypeTests = [
   Check<Exact<[string, ...string[]], string[]>>,
   // @ts-expect-error Trailing variadic tuple does not match leading variadic tuple.
   Check<Exact<[...string[], number], [number, ...string[]]>>,
+  // @ts-expect-error Variadic tuple with optional unknown head and different rest element fails Exact.
+  Check<Exact<[unknown?, ...number[]], [unknown?, ...string[]]>>,
+  // @ts-expect-error Variadic tuple with optional unknown head does not match unknown array.
+  Check<Exact<[unknown?, ...number[]], unknown[]>>,
+  // @ts-expect-error Variadic tuple with optional any head and different rest element fails Exact.
+  Check<Exact<[any?, ...number[]], [any?, ...string[]]>>,
+  // @ts-expect-error Variadic tuple with optional any head does not match any array.
+  Check<Exact<[any?, ...number[]], any[]>>,
   // @ts-expect-error Optional tuple element does not match required element.
   Check<Exact<[string, number?], [string, number]>>,
   // @ts-expect-error Nested object mismatch inside tuple slot fails Exact.
@@ -93,6 +107,12 @@ export type WireShapeTypeTests = [
   Check<NoExplicitUndefined<typeof transformedSchema>>,
   // @ts-expect-error Uninspected ZodDefault fails closed in NoExplicitUndefined.
   Check<NoExplicitUndefined<typeof defaultedSchema>>,
+  // @ts-expect-error Loose passthrough object fails NoExplicitUndefined.
+  Check<NoExplicitUndefined<typeof looseObjectSchema>>,
+  // @ts-expect-error Catchall schema allowing explicit undefined fails NoExplicitUndefined.
+  Check<NoExplicitUndefined<typeof catchallOptionalSchema>>,
+  // @ts-expect-error Pipe schema whose input accepts undefined fails NoExplicitUndefined.
+  Check<NoExplicitUndefined<typeof optionalInputPipeSchema>>,
 ];
 
 test("wire schemas omit optional fields cleanly and reject explicit undefined values including memberEntrySchema.body", () => {
@@ -142,4 +162,8 @@ test("wire schemas omit optional fields cleanly and reject explicit undefined va
   assert.equal(readonlyLooseOptionalSchema.safeParse({ entryId, state: "pending", at: undefined }).success, true);
   assert.equal(transformedSchema.safeParse(entryId).success, true);
   assert.equal(defaultedSchema.safeParse(undefined).success, true);
+  assert.equal(looseObjectSchema.safeParse({ entryId, state: "pending", extra: undefined }).success, true);
+  assert.equal(catchallOptionalSchema.safeParse({ entryId, state: "pending", extra: { entryId, state: "pending", at: undefined } }).success, true);
+  assert.equal(cleanPipeSchema.safeParse(entryId).success, true);
+  assert.equal(optionalInputPipeSchema.safeParse(entryId).success, true);
 });

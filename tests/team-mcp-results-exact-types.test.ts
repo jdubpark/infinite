@@ -29,6 +29,8 @@ export type ExactOptionalContractTests = [
   Check<Exact<{ at?: undefined }, { at?: never }>>,
   // @ts-expect-error Optional tuple element without undefined does not match optional tuple element with undefined.
   Check<Exact<[string, number?], [string, (number | undefined)?]>>,
+  // @ts-expect-error Optional variadic tuple head without undefined does not match optional head with undefined.
+  Check<Exact<[string?, ...number[]], [(string | undefined)?, ...number[]]>>,
   // @ts-expect-error Widening MemberList.cursor to number | undefined fails exactOptionalPropertyTypes contract check.
   Check<WireSchemaMatches<typeof memberListSchema, Omit<MemberList, "cursor"> & { cursor?: number | undefined }>>,
   // @ts-expect-error Widening MemberHead.taskId to string | undefined fails exactOptionalPropertyTypes contract check.
@@ -90,6 +92,10 @@ test("actual team-mcp-results.ts contracts pass under exactOptionalPropertyTypes
     'import { z } from "zod";\nimport type { Check, NoExplicitUndefined } from "./team-mcp-results.js";\nconst s = z.object({ body: z.any() });\nexport type Fail = Check<NoExplicitUndefined<typeof s>>;\n',
     'import { z } from "zod";\nimport type { Check, NoExplicitUndefined } from "./team-mcp-results.js";\nconst s = z.object({ at: z.string().optional() }).readonly().nullable();\nexport type Fail = Check<NoExplicitUndefined<typeof s>>;\n',
     'import { z } from "zod";\nimport type { Check, NoExplicitUndefined } from "./team-mcp-results.js";\nconst s = z.string().transform(value => value);\nexport type Fail = Check<NoExplicitUndefined<typeof s>>;\n',
+    'import { z } from "zod";\nimport type { Check, NoExplicitUndefined } from "./team-mcp-results.js";\nconst s = z.object({ ok: z.boolean() }).catchall(z.unknown());\nexport type Fail = Check<NoExplicitUndefined<typeof s>>;\n',
+    'import { z } from "zod";\nimport type { Check, NoExplicitUndefined } from "./team-mcp-results.js";\nconst s = z.looseObject({ ok: z.boolean() });\nexport type Fail = Check<NoExplicitUndefined<typeof s>>;\n',
+    'import { z } from "zod";\nimport type { Check, NoExplicitUndefined } from "./team-mcp-results.js";\nconst s = z.object({ x: z.coerce.string().exactOptional() });\nexport type Fail = Check<NoExplicitUndefined<typeof s>>;\n',
+    'import { z } from "zod";\nimport type { Check, NoExplicitUndefined } from "./team-mcp-results.js";\nconst s = z.object({ x: z.pipe(z.unknown(), z.string()) });\nexport type Fail = Check<NoExplicitUndefined<typeof s>>;\n',
   ];
   for (const snippet of failingSnippets) {
     const diagnostics = compileExactWithOverrides([virtualProbe], new Map([[virtualProbe, snippet]]));

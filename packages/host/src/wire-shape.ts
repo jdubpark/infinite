@@ -3,16 +3,16 @@ type TupleShape<T extends readonly unknown[]> =
   : T extends readonly [infer Head, ...infer Tail] ? readonly [Shape<Head>, ...TupleShape<Tail>]
   : T extends readonly [...infer Init, infer Last] ? readonly [...TupleShape<Init>, Shape<Last>]
   : number extends T["length"]
-    ? readonly T[number][] extends Readonly<T>
-      ? readonly Shape<T[number]>[]
-      : T extends readonly [(infer Head)?, ...infer Tail]
+    ? "0" extends keyof T
+      ? T extends readonly [unknown?, ...infer Tail]
         ? readonly [{
             optionalElement: true;
-            explicitUndefined: [undefined] extends readonly [Head?] ? true : false;
-            value: Shape<Required<readonly [Head?]>[0]>;
-            raw: Shape<(readonly [Head?])[0]>;
+            explicitUndefined: { 0: undefined } extends Pick<T, "0"> ? true : false;
+            value: Shape<Required<T>[0]>;
+            raw: Shape<T[0]>;
           }?, ...TupleShape<Tail>]
         : readonly Shape<T[number]>[]
+      : readonly Shape<T[number]>[]
     : { readonly [K in keyof T]: {
         optionalElement: {} extends Pick<T, K> ? true : false;
         explicitUndefined: { [P in K]: undefined } extends Pick<T, K> ? true : false;

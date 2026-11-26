@@ -23,9 +23,23 @@ function isDefinedJsonTree(value: unknown, seen = new Set<unknown>()): boolean {
 const definedWireValue = (): DefinedWireUnknown =>
   z.unknown().refine(value => isDefinedJsonTree(value), "Wire value must not contain undefined.") as DefinedWireUnknown;
 
-type OutputAllowsUndefined<T> = 0 extends 1 & T ? true
+type AllowsUndefined<T> = 0 extends 1 & T ? true
   : unknown extends T ? true
   : [Extract<T, undefined>] extends [never] ? false : true;
+
+type SchemaIOAllowsUndefined<S extends z.ZodType> =
+  AllowsUndefined<z.output<S>> extends true ? true
+  : AllowsUndefined<z.input<S>> extends true ? true
+  : false;
+
+type ObjectConfigNoUndefined<Config> =
+  Config extends { out: infer Out; in: infer In }
+    ? [keyof Out] extends [never]
+      ? [keyof In] extends [never] ? true : false
+      : Config extends { catchall: infer Catchall }
+        ? NoExplicitUndefined<Catchall>
+        : false
+    : false;
 
 type SchemaListNoUndefined<T extends readonly unknown[]> =
   T extends readonly [] ? true
@@ -38,13 +52,15 @@ export type NoExplicitUndefined<S> =
   0 extends 1 & S ? false
   : S extends { readonly [DEFINED_WIRE_VALUE]: true } ? true
   : S extends z.ZodExactOptional<infer Inner>
-    ? OutputAllowsUndefined<z.output<S>> extends true ? false : NoExplicitUndefined<Inner>
+    ? SchemaIOAllowsUndefined<S> extends true ? false : NoExplicitUndefined<Inner>
   : S extends z.ZodOptional<any> ? false
   : S extends z.ZodUndefined ? false
   : S extends z.ZodUnknown ? false
   : S extends z.ZodAny ? false
-  : S extends z.ZodObject<infer Fields, any>
-    ? false extends { [K in keyof Fields]: NoExplicitUndefined<Fields[K]> }[keyof Fields] ? false : true
+  : S extends z.ZodObject<infer Fields, infer Config>
+    ? ObjectConfigNoUndefined<Config> extends true
+      ? false extends { [K in keyof Fields]: NoExplicitUndefined<Fields[K]> }[keyof Fields] ? false : true
+      : false
   : S extends z.ZodArray<infer Item> ? NoExplicitUndefined<Item>
   : S extends z.ZodTuple<infer Items, infer Rest>
     ? SchemaListNoUndefined<Items> extends true
@@ -57,11 +73,12 @@ export type NoExplicitUndefined<S> =
   : S extends z.ZodNullable<infer Inner> ? NoExplicitUndefined<Inner>
   : S extends z.ZodReadonly<infer Inner> ? NoExplicitUndefined<Inner>
   : S extends z.ZodLazy<infer Inner> ? NoExplicitUndefined<Inner>
-  : S extends z.ZodPipe<any, infer Out> ? NoExplicitUndefined<Out>
+  : S extends z.ZodPipe<infer In, infer Out>
+    ? NoExplicitUndefined<In> extends true ? NoExplicitUndefined<Out> : false
   : S extends z.ZodRecord<infer Key, infer Value>
     ? NoExplicitUndefined<Key> extends true ? NoExplicitUndefined<Value> : false
-  : S extends { _zod: { def: { type: "string" | "number" | "boolean" | "null" | "never" | "literal" | "enum" } } }
-    ? OutputAllowsUndefined<z.output<S>> extends true ? false : true
+  : S extends z.ZodType & { _zod: { def: { type: "string" | "number" | "boolean" | "null" | "never" | "literal" | "enum" } } }
+    ? SchemaIOAllowsUndefined<S> extends true ? false : true
   : false;
 
 export type WireSchemaMatches<S extends z.ZodType, T> =
@@ -79,12 +96,16 @@ type SampleBareUnknownSchema = z.ZodObject<{ body: z.ZodUnknown }>;
 type SampleBareAnySchema = z.ZodObject<{ body: z.ZodAny }>;
 type SampleTransformSchema = z.ZodPipe<z.ZodString, z.ZodTransform<string, string>>;
 type SampleLiteralUndefinedSchema = z.ZodLiteral<undefined>;
+type SampleCoerceExactOptionalSchema = z.ZodObject<{ at: z.ZodExactOptional<ReturnType<typeof z.coerce.string>> }>;
+type SampleUnknownPipeSchema = z.ZodObject<{ at: z.ZodPipe<z.ZodUnknown, z.ZodString> }>;
+type SampleLooseObjectSchema = ReturnType<typeof z.looseObject<{ ok: z.ZodBoolean }>>;
 
 export type ExactCases = [
   Check<Exact<Head, { id: string; tags: readonly string[]; body: unknown; kind: "b" | "a"; at?: string }>>,
   Check<Exact<{ heads: Head[]; next?: number }, { heads: readonly Head[]; next?: number }>>,
   Check<Exact<{ pair: [string, number] }, { pair: readonly [string, number] }>>,
   Check<Exact<{ rest: [string, ...number[]] }, { rest: readonly [string, ...number[]] }>>,
+  Check<Exact<[unknown?, ...number[]], readonly [unknown?, ...number[]]>>,
   Check<WireSchemaMatches<SampleExactOptionalSchema, { id: string; at?: string }>>,
   Check<WireSchemaMatches<SampleTupleSchema, { pair: [string, number] }>>,
   Check<WireSchemaMatches<SampleLazyExactOptionalSchema, { at?: string }>>,
@@ -114,6 +135,14 @@ export type ExactCases = [
   Check<Exact<[string, number], [string, number, boolean]>>,
   // @ts-expect-error Tuple collapsed to an array.
   Check<Exact<[string, number], (string | number)[]>>,
+  // @ts-expect-error Variadic tuple with optional unknown slot and different rest type.
+  Check<Exact<[unknown?, ...number[]], [unknown?, ...string[]]>>,
+  // @ts-expect-error Variadic tuple with optional unknown slot collapsed to unknown array.
+  Check<Exact<[unknown?, ...number[]], unknown[]>>,
+  // @ts-expect-error Variadic tuple with optional any slot and different rest type.
+  Check<Exact<[any?, ...number[]], [any?, ...string[]]>>,
+  // @ts-expect-error Variadic tuple with optional any slot collapsed to any array.
+  Check<Exact<[any?, ...number[]], any[]>>,
   // @ts-expect-error Wire schema using `.optional()` instead of `.exactOptional()`.
   Check<WireSchemaMatches<SampleOptionalSchema, { id: string; at?: string }>>,
   // @ts-expect-error Wire schema allowing explicit `undefined` via union.
@@ -132,6 +161,12 @@ export type ExactCases = [
   Check<NoExplicitUndefined<SampleTransformSchema>>,
   // @ts-expect-error Literal `undefined` fails NoExplicitUndefined.
   Check<NoExplicitUndefined<SampleLiteralUndefinedSchema>>,
+  // @ts-expect-error Coerced schema accepting `undefined` input fails NoExplicitUndefined.
+  Check<NoExplicitUndefined<SampleCoerceExactOptionalSchema>>,
+  // @ts-expect-error Pipe schema whose input accepts `undefined` fails NoExplicitUndefined.
+  Check<NoExplicitUndefined<SampleUnknownPipeSchema>>,
+  // @ts-expect-error Loose object schema fails NoExplicitUndefined.
+  Check<NoExplicitUndefined<SampleLooseObjectSchema>>,
 ];
 
 const TEAM_ROLES = ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker"] as const satisfies readonly TeamRole[];

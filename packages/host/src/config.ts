@@ -119,6 +119,7 @@ const schema = z
     }).strict().optional(),
     port: z.number().int().min(0).max(65535),
     origin: z.url(),
+    browserSessions: z.boolean().default(true),
     stateDir: z.string(),
     runDir: z.string(),
     keyFile: z.string(),

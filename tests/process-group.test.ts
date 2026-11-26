@@ -284,6 +284,33 @@ test("a reader that pauses on bytes read after the drain ends is not a leftover 
   }
 });
 
+test("a reader paused at a drain's end and again on a late chunk re-arms the drain each time and still finds the holder one drain later", CASE, async () => {
+  let armed = false;
+  const late = lateHolder(["w"], step => {
+    const out = late.child.stdout!;
+    out.pause();
+    setTimeout(() => out.resume(), 500);
+    setTimeout(() => {
+      armed = true;
+      step();
+    }, EXIT_DRAIN_MS);
+  });
+  late.child.stdout!.on("data", () => {
+    if (!armed) return;
+    armed = false;
+    late.child.stdout!.pause();
+    setTimeout(() => late.child.stdout!.resume(), 500);
+  });
+  try {
+    assert.equal(await within(late.closed, 3 * EXIT_DRAIN_MS + 5_000, "the watched child closes"), 0);
+    assert.equal(late.everyStep(), true, "the holder wrote its late chunk and kept the output open");
+    assert.equal(late.leader.leftover, true, "the drain after the last resume ends the output the holder keeps open");
+    assert.equal(late.output(), `${late.holder()}\n${"y".repeat(4096)}`);
+  } finally {
+    late.end();
+  }
+});
+
 test("bytes arriving in each of the first two drain turns hold the output open until it ends in the third", CASE, async () => {
   const late = lateHolder(["w", "w", "c"], step => {
     step();

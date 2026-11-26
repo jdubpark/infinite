@@ -10,7 +10,7 @@ import type { Manager } from "./manager.js";
 import { normalizeControlRequest, type ControlActor, type Receipt, type TerminalSnapshot, type WorkerState } from "./types.js";
 
 export async function* terminalPages(manager: Manager, sessionId: string, after: number, signal: AbortSignal, snapshot = false) {
-  let cursor = after, changed = true, wake: (() => void) | undefined, lastState = 0;
+  let cursor = after, changed = true, wake: (() => void) | undefined, lastState = 0, unavailable = 0;
   const notify = () => { changed = true; wake?.(); };
   const watcher = watch(join(manager.config.stateDir, "sessions", sessionId, "events"), notify);
   watcher.on("error", notify);
@@ -36,7 +36,8 @@ export async function* terminalPages(manager: Manager, sessionId: string, after:
         const { status, pid, exitCode, control, capabilities, runtime, nativeSession } = await manager.state(sessionId);
         yield { state: { status, pid, exitCode, control, capabilities, runtime, nativeSession } };
         lastState = Date.now();
-        if (status === "exited" || status === "unavailable") {
+        unavailable = status === "unavailable" ? unavailable + 1 : 0;
+        if (status === "exited" || unavailable >= 3) {
           const final = manager.events(sessionId, cursor, 200, new Set(["output", "lifecycle"]));
           yield final;
           if (!final.more) return;

@@ -1,9 +1,9 @@
 import { createConnection, createServer, type Server } from "node:net";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { chmodSync, lstatSync, realpathSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { matchDestructive } from "@infinite/attention";
-import { MAX_SOCKET_PATH_BYTES, isTrustedPrivateDir } from "./ipc.js";
+import { MAX_SOCKET_PATH_BYTES, canonicalOrResolved, isTrustedPrivateDir, permissionChannelPath, runDirOf, socketDirOf, type SocketTarget } from "./ipc.js";
 import { headlessLaunch } from "./launch.js";
 import { REJECT_CODES, requesterNotice, type InterruptClass, type RejectCode } from "./permission-policy.js";
 import { teamPermissionAssignment } from "./team-permission-adapter.js";
@@ -156,13 +156,18 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
   private closed = false;
   constructor(private readonly options: {
     key: Buffer;
-    runDir: string;
-    legacyRunDir?: string;
+    runDir?: string;
+    target?: SocketTarget;
+    legacySockets?: () => readonly string[];
     sessions: Sessions;
     services: PermissionAgentServices;
     teamLive?: (session: Session) => boolean;
     teamTask?: (session: Pick<Session, "team">) => { title: string; text: string } | undefined;
   }) {}
+
+  primarySocketPath(): string {
+    return this.options.target ? permissionChannelPath(this.options.target) : channelSocketPath(this.options.runDir!);
+  }
 
   private pipeline(): PermissionPipeline | undefined { return this.options.services.pipeline; }
 
@@ -222,7 +227,7 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     let served;
     try { served = pipeline.serves(input.session.projectId); } catch { return refuse("The permission pipeline could not be read."); }
     if (!served.served) return refuse(served.reason === "not-ready" ? "The host is not ready to serve permission requests." : "No owner act covers this project.");
-    return { record: { channel: true, ...(shape.allowlist.length ? { allowlist: shape.allowlist } : {}) }, bootstrap: { socket: channelSocketPath(this.options.runDir) } };
+    return { record: { channel: true, ...(shape.allowlist.length ? { allowlist: shape.allowlist } : {}) }, bootstrap: { socket: this.primarySocketPath() } };
   }
 
   private bindSocket(path: string): Promise<Server> {
@@ -258,25 +263,32 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     });
   }
 
-  private legacySocketPath(): string | undefined {
-    const legacy = this.options.legacyRunDir;
-    if (!legacy) return undefined;
-    const trusted = isTrustedPrivateDir(legacy);
-    if (!trusted) return undefined;
-    try {
-      if (realpathSync(trusted) === realpathSync(this.options.runDir)) return undefined;
-    } catch {
-      return undefined;
+  private migrationSocketPaths(primary: string): string[] {
+    const seen = new Set<string>([`${canonicalOrResolved(dirname(primary))}\0${basename(primary)}`]);
+    const extras: string[] = [];
+    const addCandidate = (candidate: string) => {
+      if (Buffer.byteLength(candidate) > MAX_SOCKET_PATH_BYTES) return;
+      const trustedDir = isTrustedPrivateDir(dirname(candidate));
+      if (!trustedDir) return;
+      const path = join(trustedDir, basename(candidate));
+      const key = `${canonicalOrResolved(trustedDir)}\0${basename(path)}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      extras.push(path);
+    };
+    if (this.options.target && typeof this.options.target !== "string" && this.options.target.socketDir !== undefined) {
+      const legacyDir = runDirOf(this.options.target);
+      if (canonicalOrResolved(legacyDir) !== canonicalOrResolved(socketDirOf(this.options.target)))
+        addCandidate(channelSocketPath(legacyDir));
     }
-    const candidate = channelSocketPath(trusted);
-    return Buffer.byteLength(candidate) <= MAX_SOCKET_PATH_BYTES ? candidate : undefined;
+    for (const extra of this.options.legacySockets?.() ?? []) addCandidate(extra);
+    return extras;
   }
 
   async listen(): Promise<void> {
     this.closed = false;
-    const paths = [channelSocketPath(this.options.runDir)];
-    const legacy = this.legacySocketPath();
-    if (legacy) paths.push(legacy);
+    const primary = this.primarySocketPath();
+    const paths = [primary, ...this.migrationSocketPaths(primary)];
     const bound: Server[] = [];
     try {
       for (const path of paths) {

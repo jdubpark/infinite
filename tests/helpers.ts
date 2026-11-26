@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { hashToken } from "../packages/host/src/config.js";
 import { createApp } from "../packages/host/src/server.js";
-import { workerCall } from "../packages/host/src/ipc.js";
+import { readRecordedSocketPath, workerCall, type SocketTarget } from "../packages/host/src/ipc.js";
 import { unseal } from "../packages/host/src/vault.js";
 import type { Config, Role, ControlLease } from "../packages/host/src/types.js";
 
@@ -100,19 +100,21 @@ export function apiClient(origin: string, tokens: Record<Role, string>): Host["f
 }
 
 export async function stopSessionWorkers(config: Config) {
-  let ids: string[] = [], answered = 0;
+  let ids: string[] = [], answered = 0, key: Buffer | undefined;
   try {
     ids = readdirSync(join(config.stateDir, "sessions")).filter((n) => /^[a-f0-9-]{36}$/i.test(n));
   } catch {
   }
+  try { key = readFileSync(config.keyFile); } catch { }
+  const target: SocketTarget = key ? { runDir: config.runDir, socketDir: config.socketDir, recordedSocket: id => readRecordedSocketPath(config.stateDir, key!, id) } : config;
   for (const id of ids)
     try {
       const actor = { id: "test-cleanup", label: "Test cleanup" };
-      const state = await workerCall<{ capabilities?: { inputControl?: number } }>(config, id, { op: "state" });
+      const state = await workerCall<{ capabilities?: { inputControl?: number } }>(target, id, { op: "state" });
       answered++;
       const lease = state.capabilities?.inputControl
-        ? await workerCall<ControlLease>(config, id, { op: "control", action: "claim", actor, takeover: true }) : undefined;
-      await workerCall(config, id, { op: "stop", requestId: randomUUID(), ...(lease ? { actor, leaseId: lease.id } : {}) });
+        ? await workerCall<ControlLease>(target, id, { op: "control", action: "claim", actor, takeover: true }) : undefined;
+      await workerCall(target, id, { op: "stop", requestId: randomUUID(), ...(lease ? { actor, leaseId: lease.id } : {}) });
     } catch {
     }
   return answered;

@@ -327,6 +327,8 @@ export interface WorkerState {
   status: Status;
   pid?: number;
   workerPid?: number;
+  socketPath?: string;
+  permissionSocketPath?: string;
   exitCode?: number;
   seq: number;
   screen: string;

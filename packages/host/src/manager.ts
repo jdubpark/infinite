@@ -12,7 +12,7 @@ import {
   type Attention,
 } from "@infinite/attention";
 import { readEvents, unseal, writeSealed } from "./vault.js";
-import { claimSocketDir, ensureSocketDir, existingWorkerSocket, removeWorkerSockets, workerCall } from "./ipc.js";
+import { canonicalOrResolved, collectLivePermissionSockets, ensureSocketDir, existingWorkerSocket, readRecordedSocketPath, removeWorkerSockets, trustedWorkerSocket, workerCall, workerCallAt, type SocketTarget } from "./ipc.js";
 import { SealedFileCache, listedSavedState, listedSession, savedState, unavailableState, type ListedSession, type SavedStatus } from "./session-listing.js";
 import { assertRunnerDeployment } from "./deployment.js";
 import { DEFAULT_HOOKS } from "./config.js";
@@ -171,12 +171,12 @@ export class Manager {
   private readonly pendingCreates = new Set<string>();
   private createAdmission: Promise<unknown> = Promise.resolve();
   readonly hostLoad: HostLoadGate;
-  readonly socketDir: string; readonly socketTarget: Pick<Config, "runDir" | "socketDir">;
-  private readonly releaseSocketDir: () => void;
+  readonly socketDir: string; readonly socketTarget: Exclude<SocketTarget, string>;
+  private readonly staticSocketTarget: Exclude<SocketTarget, string>;
   private readonly handoffProjects = new Map<string, string>();
   private fuse?: FuseGate;
   private readonly listedMeta = new SealedFileCache<ListedSession>((id, raw) => listedSession(unseal<StoredSession>(this.key, `${id}:meta`, raw).session));
-  private readonly savedStatus = new SealedFileCache<SavedStatus>((id, raw, mtimeMs) => ({ state: unseal<WorkerState>(this.key, `${id}:status`, raw), savedAt: new Date(mtimeMs).toISOString() }));
+  private readonly savedStatus = new SealedFileCache<SavedStatus>((id, raw, mtimeMs) => { const state = unseal<WorkerState>(this.key, `${id}:status`, raw); return { state, savedAt: new Date(mtimeMs).toISOString(), ...(state.socketPath ? { socketPath: state.socketPath } : {}), ...(state.permissionSocketPath ? { permissionSocketPath: state.permissionSocketPath } : {}) }; });
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
   private headlessChannel?: Pick<HeadlessPermissionChannel, "admit">;
   useHeadlessChannel(channel: Pick<HeadlessPermissionChannel, "admit">) { this.headlessChannel = channel; }
@@ -219,28 +219,27 @@ export class Manager {
     assertRunnerDeployment(config);
     const configuredSocketDir = options?.socketDir ?? config.socketDir;
     this.socketDir = ensureSocketDir(configuredSocketDir ?? config.runDir, configuredSocketDir !== undefined ? "socketDir" : "runDir");
-    this.socketTarget = { runDir: config.runDir, socketDir: this.socketDir };
-    this.releaseSocketDir = claimSocketDir(this.socketDir, config.runDir);
-    try {
-      this.hostLoad = new HostLoadGate(config.hostLoad, hostProbe);
-      mkdirSync(join(config.stateDir, "sessions"), { recursive: true, mode: 0o700 });
-      const deletedDir = join(config.stateDir, "deleted-sessions");
-      mkdirSync(deletedDir, { recursive: true, mode: 0o700 });
-      for (const name of readdirSync(deletedDir).filter(name => /^[a-f0-9-]{36}\.sealed$/i.test(name))) {
-        const id = name.slice(0, -7);
-        let receipt: DeletedSessionReceipt;
-        try {
-          receipt = unseal<DeletedSessionReceipt>(key, `deleted:${id}`, readFileSync(join(deletedDir, name), "utf8"));
-        } catch {
-          continue;
-        }
-        if (receipt.id !== id || !/^[a-f0-9]{64}$/.test(receipt.fingerprint)) continue;
-        rmSync(join(config.stateDir, "sessions", id), { recursive: true, force: true });
+    const hostKey = canonicalOrResolved(config.runDir);
+    this.staticSocketTarget = { runDir: config.runDir, socketDir: this.socketDir, hostKey };
+    this.socketTarget = { ...this.staticSocketTarget, recordedSocket: id => readRecordedSocketPath(this.config.stateDir, this.key, id) };
+    this.hostLoad = new HostLoadGate(config.hostLoad, hostProbe);
+    mkdirSync(join(config.stateDir, "sessions"), { recursive: true, mode: 0o700 });
+    const deletedDir = join(config.stateDir, "deleted-sessions");
+    mkdirSync(deletedDir, { recursive: true, mode: 0o700 });
+    for (const name of readdirSync(deletedDir).filter(name => /^[a-f0-9-]{36}\.sealed$/i.test(name))) {
+      const id = name.slice(0, -7);
+      let receipt: DeletedSessionReceipt;
+      try {
+        receipt = unseal<DeletedSessionReceipt>(key, `deleted:${id}`, readFileSync(join(deletedDir, name), "utf8"));
+      } catch {
+        continue;
       }
-      mkdirSync(config.runDir, { recursive: true, mode: 0o700 });
-    } catch (error) { this.releaseSocketDir(); throw error; }
+      if (receipt.id !== id || !/^[a-f0-9]{64}$/.test(receipt.fingerprint)) continue;
+      rmSync(join(config.stateDir, "sessions", id), { recursive: true, force: true });
+    }
+    mkdirSync(config.runDir, { recursive: true, mode: 0o700 });
   }
-  close() { this.releaseSocketDir(); }
+  activePermissionSockets(): string[] { return collectLivePermissionSockets(this.config.stateDir, this.key); }
   private deletedReceiptPath(id: string) { return join(this.config.stateDir, "deleted-sessions", `${id}.sealed`); }
   private sessionDirEntry(id: string): string | undefined {
     const lower = id.toLowerCase();
@@ -322,7 +321,7 @@ export class Manager {
 
       writeSealed(this.deletedReceiptPath(id), this.key, `deleted:${id}`, { id, fingerprint: stored.fingerprint } satisfies DeletedSessionReceipt);
       rmSync(join(this.config.stateDir, "sessions", id), { recursive: true });
-      removeWorkerSockets(this.socketTarget, id);
+      removeWorkerSockets(this.socketTarget, id, saved.socketPath);
     });
   }
   async state(id: string, screen = false): Promise<WorkerState> {
@@ -334,18 +333,16 @@ export class Manager {
       return unavailableState(now);
     }
   }
-  private async listedState(id: string, createdAt: string): Promise<WorkerState> {
-    if (existingWorkerSocket(this.socketTarget, id)) {
-      try {
-        return withDefaultAttention(await workerCall(this.socketTarget, id, { op: "state", screen: false }));
-      } catch {
-      }
-    }
+  private async listedState(id: string, createdAt: string, dirTrustCache: Map<string, boolean>): Promise<WorkerState> {
+    const direct = existingWorkerSocket(this.staticSocketTarget, id, undefined, dirTrustCache);
+    if (direct) try { return withDefaultAttention(await workerCallAt(direct, { op: "state", screen: false })); } catch {}
     const saved = this.savedStatus.read(id, join(this.config.stateDir, "sessions", id, "status.sealed"), Date.now());
+    const recorded = saved?.socketPath ? trustedWorkerSocket(saved.socketPath, dirTrustCache) : undefined;
+    if (recorded) try { return withDefaultAttention(await workerCallAt(recorded, { op: "state", screen: false })); } catch {}
     return saved === undefined ? unavailableState(createdAt) : listedSavedState(saved);
   }
   async list(options: { includeFullMessage?: boolean } = {}) {
-    const now = Date.now();
+    const now = Date.now(), dirTrustCache = new Map<string, boolean>();
     const ids = readdirSync(join(this.config.stateDir, "sessions")).filter(
       (n) => /^[a-f0-9-]{36}$/i.test(n) && !existsSync(this.deletedReceiptPath(n)),
     );
@@ -356,7 +353,7 @@ export class Manager {
         if (existsSync(this.deletedReceiptPath(id))) throw new Error("Session not found");
         const summary = this.listedMeta.read(id, join(this.config.stateDir, "sessions", id, "meta.sealed"), now);
         if (summary === undefined) throw new Error("Session not found");
-        const { screen: _screen, ...state } = await this.listedState(id, summary.createdAt).catch(
+        const { screen: _screen, ...state } = await this.listedState(id, summary.createdAt, dirTrustCache).catch(
           () => unavailableState(summary.createdAt),
         );
         return {

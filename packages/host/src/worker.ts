@@ -84,6 +84,7 @@ for await (const chunk of process.stdin) {
 const config = JSON.parse(bootstrap) as Bootstrap;
 bootstrap = "";
 const { session, profile, stateDir, runDir, socketDir } = config;
+const workerSocket = socketPath({ runDir, socketDir: ensureSocketDir(socketDir ?? runDir, socketDir !== undefined ? "socketDir" : "runDir") }, session.id);
 const provider = session.provider;
 const key = Buffer.from(config.key, "base64");
 config.key = "";
@@ -150,7 +151,7 @@ const persist = () => {
     ...(covered !== undefined ? { sizeIndexCoveredSeq: covered } : {}),
     screen: "",
     seq: journal.seq,
-    workerPid: process.pid,
+    workerPid: process.pid, socketPath: workerSocket, ...(config.permissionChannel?.socket ? { permissionSocketPath: config.permissionChannel.socket } : {}),
   });
 };
 function append(type: Event["type"], data: Event["data"]): Event {
@@ -1438,7 +1439,6 @@ async function exitWorker(code: number) {
   process.exit(code);
 }
 
-const workerSocket = socketPath(ensureSocketDir(socketDir ?? runDir, socketDir !== undefined ? "socketDir" : "runDir"), session.id);
 server.on("error", () => process.exit(1));
 server.listen(workerSocket, async () => {
   chmodSync(workerSocket, 0o600);

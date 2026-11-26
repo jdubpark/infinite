@@ -1,72 +1,30 @@
-import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import type { Config, WorkerRequest } from "./types.js";
+import { unseal } from "./vault.js";
+import type { Config, WorkerRequest, WorkerState } from "./types.js";
 
 export const MAX_SOCKET_PATH_BYTES = 100;
 const SAMPLE_SESSION_ID = "00000000-0000-0000-0000-000000000000";
-const HOST_LOCK_FILE = "host.lock";
+const DEFAULT_PERMISSION_SOCKET = "permission-channel.sock";
 const SYSTEM_SYMLINK_PREFIXES = new Set(["/tmp", "/var", "/var/run"]);
 
-export type SocketTarget = string | Pick<Config, "runDir" | "socketDir">;
+export type SocketTarget =
+  | string
+  | (Pick<Config, "runDir" | "socketDir"> & {
+      hostKey?: string;
+      recordedSocket?: (id: string) => string | undefined;
+    });
 
 export const socketDirOf = (target: SocketTarget): string =>
   typeof target === "string" ? target : target.socketDir ?? target.runDir;
 
-export const workerSocketName = (id: string): string =>
-  `${createHash("sha256").update(id.toLowerCase()).digest("hex").slice(0, 16)}.sock`;
+export const runDirOf = (target: SocketTarget): string =>
+  typeof target === "string" ? target : target.runDir;
 
-export const socketPath = (target: SocketTarget, id: string): string =>
-  join(socketDirOf(target), workerSocketName(id));
-
-export const legacySocketPath = (runDir: string, id: string): string =>
-  join(runDir, `${id}.sock`);
-
-function normalizeDirPath(dir: string, label: string): string {
-  if (!dir || dir.includes("\0")) throw new Error(`${label} must be a valid directory path`);
-  const trimmed = dir.length > 1 ? dir.replace(/\/+$/, "") : dir;
-  if (!trimmed) throw new Error(`${label} must be a valid directory path`);
-  const collapsed = trimmed.replace(/\/{2,}/g, "/");
-  if (collapsed.split("/").some(part => part === "." || part === ".."))
-    throw new Error(`${label} must not contain relative path segments`);
-  return collapsed;
-}
-
-function assertNoUntrustedSymlinkAncestors(normalized: string, label: string): void {
-  const absolute = normalized.startsWith("/");
-  const parts = normalized.split("/").filter(Boolean);
-  let current = absolute ? "" : ".";
-  for (let index = 0; index < parts.length; index++) {
-    current = absolute ? `${current}/${parts[index]}` : index === 0 ? parts[index]! : `${current}/${parts[index]}`;
-    let info;
-    try {
-      info = lstatSync(current);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      throw error;
-    }
-    const isFinal = index === parts.length - 1;
-    if (info.isSymbolicLink()) {
-      if (isFinal || !SYSTEM_SYMLINK_PREFIXES.has(current))
-        throw new Error(`${label} must be a real directory, not a symlink`);
-    } else if (!info.isDirectory()) {
-      throw new Error(`${label} must be a real directory, not a symlink`);
-    }
-  }
-}
-
-function sharedRootPaths(): Set<string> {
-  const roots = new Set(["/", "/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", resolve(tmpdir())]);
-  try {
-    roots.add(realpathSync(tmpdir()));
-  } catch {
-  }
-  return roots;
-}
-
-function canonicalOrResolved(dir: string): string {
+export function canonicalOrResolved(dir: string): string {
   const resolved = resolve(dir);
   const tail: string[] = [];
   let current = resolved;
@@ -84,11 +42,94 @@ function canonicalOrResolved(dir: string): string {
   }
 }
 
+export const hostKeyOf = (target: SocketTarget): string =>
+  typeof target !== "string" && target.hostKey ? target.hostKey : canonicalOrResolved(runDirOf(target));
+
+export const legacyHashSocketName = (id: string): string =>
+  `${createHash("sha256").update(id.toLowerCase()).digest("hex").slice(0, 16)}.sock`;
+
+export const workerSocketName = (id: string, hostKey: string): string =>
+  `${createHash("sha256").update(`${hostKey}\0${id.toLowerCase()}`).digest("hex").slice(0, 16)}.sock`;
+
+export const socketPath = (target: SocketTarget, id: string): string =>
+  join(socketDirOf(target), workerSocketName(id, hostKeyOf(target)));
+
+export const legacySocketPath = (runDir: string, id: string): string =>
+  join(runDir, `${id}.sock`);
+
+export function permissionChannelPath(target: SocketTarget): string {
+  const dir = socketDirOf(target);
+  const hostKey = hostKeyOf(target);
+  if (typeof target === "string" || target.socketDir === undefined || canonicalOrResolved(dir) === hostKey)
+    return join(dir, DEFAULT_PERMISSION_SOCKET);
+  const tag = createHash("sha256").update(hostKey).digest("hex").slice(0, 12);
+  return join(dir, `p-${tag}.sock`);
+}
+
+function normalizeDirPath(dir: string, label: string): string {
+  if (!dir || dir.includes("\0")) throw new Error(`${label} must be a valid directory path`);
+  const trimmed = dir.length > 1 ? dir.replace(/\/+$/, "") : dir;
+  if (!trimmed) throw new Error(`${label} must be a valid directory path`);
+  const collapsed = trimmed.replace(/\/{2,}/g, "/");
+  if (collapsed.split("/").some(part => part === "." || part === ".."))
+    throw new Error(`${label} must not contain relative path segments`);
+  return collapsed;
+}
+
+function assertTrustedParentMode(info: { uid: number; mode: number }, uid: number | undefined, label: string): void {
+  if (uid !== undefined && info.uid !== 0 && info.uid !== uid)
+    throw new Error(`${label} has an untrusted parent directory owner`);
+  if ((info.mode & 0o022) !== 0 && (info.mode & 0o1000) === 0)
+    throw new Error(`${label} must not live beneath a writable non-sticky parent directory`);
+}
+
+function assertTrustedAncestors(normalized: string, label: string, allowMissing: boolean): void {
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  const rootInfo = lstatSync("/");
+  if (!rootInfo.isDirectory()) throw new Error(`${label} has an invalid root directory`);
+  assertTrustedParentMode(rootInfo, uid, label);
+  const abs = normalized.startsWith("/") ? normalized : resolve(normalized);
+  const parts = abs.split("/").filter(Boolean);
+  let current = "";
+  for (let index = 0; index < parts.length; index++) {
+    current = `${current}/${parts[index]}`;
+    const isFinal = index === parts.length - 1;
+    let info;
+    try {
+      info = lstatSync(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && allowMissing) return;
+      throw error;
+    }
+    if (info.isSymbolicLink()) {
+      if (isFinal || !SYSTEM_SYMLINK_PREFIXES.has(current) || (uid !== undefined && info.uid !== 0))
+        throw new Error(`${label} must be a real directory, not a symlink`);
+      const targetInfo = statSync(current);
+      if (!targetInfo.isDirectory())
+        throw new Error(`${label} must be a real directory, not a symlink`);
+      assertTrustedParentMode(targetInfo, uid, label);
+      continue;
+    }
+    if (!info.isDirectory())
+      throw new Error(`${label} must be a real directory, not a symlink`);
+    if (!isFinal) assertTrustedParentMode(info, uid, label);
+  }
+}
+
+function sharedRootPaths(): Set<string> {
+  const roots = new Set(["/", "/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", resolve(tmpdir())]);
+  try {
+    roots.add(realpathSync(tmpdir()));
+  } catch {
+  }
+  return roots;
+}
+
 export function isTrustedPrivateDir(dir: string): string | undefined {
   let normalized: string;
   try {
     normalized = normalizeDirPath(dir, "directory");
-    assertNoUntrustedSymlinkAncestors(normalized, "directory");
+    assertTrustedAncestors(normalized, "directory", false);
   } catch {
     return undefined;
   }
@@ -124,40 +165,101 @@ function isOwnedNonSymlinkEntry(path: string, requireSocket: boolean): boolean {
   }
 }
 
-export function existingWorkerSocket(target: SocketTarget, id: string): string | undefined {
-  const primaryDir = socketDirOf(target);
+function isTrustedDirCached(dir: string, dirTrustCache?: Map<string, boolean>): boolean {
+  const cached = dirTrustCache?.get(dir);
+  if (cached !== undefined) return cached;
+  const trusted = isTrustedPrivateDir(dir) !== undefined;
+  dirTrustCache?.set(dir, trusted);
+  return trusted;
+}
+
+export function trustedWorkerSocket(path: string, dirTrustCache?: Map<string, boolean>): string | undefined {
+  if (!path || path.includes("\0") || Buffer.byteLength(path) > MAX_SOCKET_PATH_BYTES) return undefined;
+  if (!isOwnedNonSymlinkEntry(path, true)) return undefined;
+  return isTrustedDirCached(dirname(path), dirTrustCache) ? path : undefined;
+}
+
+export function existingWorkerSocket(
+  target: SocketTarget,
+  id: string,
+  recordedSocketPath?: string,
+  dirTrustCache?: Map<string, boolean>,
+): string | undefined {
   const primary = socketPath(target, id);
-  if (isOwnedNonSymlinkEntry(primary, false)) return primary;
-  const fallbackDir = typeof target === "string" ? target : target.runDir;
-  const trustedFallback = isTrustedPrivateDir(fallbackDir);
-  if (!trustedFallback) return undefined;
-  if (canonicalOrResolved(trustedFallback) !== canonicalOrResolved(primaryDir)) {
-    const previousShort = join(trustedFallback, workerSocketName(id));
-    if (Buffer.byteLength(previousShort) <= MAX_SOCKET_PATH_BYTES && isOwnedNonSymlinkEntry(previousShort, true))
-      return previousShort;
+  if (isOwnedNonSymlinkEntry(primary, false) && isTrustedDirCached(dirname(primary), dirTrustCache)) return primary;
+  const fallbackDir = runDirOf(target);
+  const hostKey = hostKeyOf(target);
+  const candidates = [
+    join(fallbackDir, workerSocketName(id, hostKey)),
+    join(fallbackDir, legacyHashSocketName(id)),
+    legacySocketPath(fallbackDir, id),
+  ];
+  const seen = new Set<string>([primary]);
+  for (const candidate of candidates) {
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    const trusted = trustedWorkerSocket(candidate, dirTrustCache);
+    if (trusted) return trusted;
   }
-  const legacy = legacySocketPath(trustedFallback, id);
-  if (Buffer.byteLength(legacy) <= MAX_SOCKET_PATH_BYTES && isOwnedNonSymlinkEntry(legacy, true))
-    return legacy;
+  const recorded = recordedSocketPath ?? (typeof target === "string" ? undefined : target.recordedSocket?.(id));
+  if (recorded && !seen.has(recorded)) return trustedWorkerSocket(recorded, dirTrustCache);
   return undefined;
 }
 
-export function removeWorkerSockets(target: SocketTarget, id: string): void {
-  const paths = new Set<string>([socketPath(target, id)]);
-  const fallbackDir = typeof target === "string" ? target : target.runDir;
-  const trustedFallback = isTrustedPrivateDir(fallbackDir);
-  if (trustedFallback) {
-    paths.add(join(trustedFallback, workerSocketName(id)));
-    paths.add(legacySocketPath(trustedFallback, id));
-  }
+export function removeWorkerSockets(target: SocketTarget, id: string, recordedSocketPath?: string): void {
+  const fallbackDir = runDirOf(target);
+  const hostKey = hostKeyOf(target);
+  const paths = new Set<string>([
+    socketPath(target, id),
+    join(fallbackDir, workerSocketName(id, hostKey)),
+    join(fallbackDir, legacyHashSocketName(id)),
+    legacySocketPath(fallbackDir, id),
+  ]);
+  if (recordedSocketPath) paths.add(recordedSocketPath);
+  const dirTrustCache = new Map<string, boolean>();
   for (const path of paths) {
-    if (isOwnedNonSymlinkEntry(path, true)) {
+    if (trustedWorkerSocket(path, dirTrustCache)) {
       try {
         rmSync(path, { force: true });
       } catch {
       }
     }
   }
+}
+
+export function readRecordedSocketPath(stateDir: string, key: Buffer, id: string): string | undefined {
+  const file = join(stateDir, "sessions", id, "status.sealed");
+  try {
+    const saved = unseal<WorkerState>(key, `${id}:status`, readFileSync(file, "utf8"));
+    return typeof saved.socketPath === "string" ? saved.socketPath : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function collectLivePermissionSockets(stateDir: string, key: Buffer): string[] {
+  const sessionsDir = join(stateDir, "sessions");
+  if (!existsSync(sessionsDir)) return [];
+  const deletedDir = join(stateDir, "deleted-sessions");
+  const sockets = new Set<string>();
+  const dirTrustCache = new Map<string, boolean>();
+  for (const id of readdirSync(sessionsDir).filter(name => /^[a-f0-9-]{36}$/i.test(name))) {
+    if (existsSync(join(deletedDir, `${id}.sealed`))) continue;
+    const file = join(sessionsDir, id, "status.sealed");
+    if (!existsSync(file)) continue;
+    try {
+      const saved = unseal<WorkerState>(key, `${id}:status`, readFileSync(file, "utf8"));
+      if (saved.status === "exited") continue;
+      const path = saved.permissionSocketPath;
+      if (typeof path !== "string" || !path || path.includes("\0") || Buffer.byteLength(path) > MAX_SOCKET_PATH_BYTES) continue;
+      const name = basename(path);
+      if (!name.endsWith(".sock") || name === "." || name === "..") continue;
+      const dir = dirname(path);
+      if (isTrustedDirCached(dir, dirTrustCache)) sockets.add(join(dir, name));
+    } catch {
+    }
+  }
+  return [...sockets];
 }
 
 export function ensureSocketDir(dir: string, label: "runDir" | "socketDir" = "socketDir"): string {
@@ -168,7 +270,7 @@ export function ensureSocketDir(dir: string, label: "runDir" | "socketDir" = "so
   const sharedRoots = sharedRootPaths();
   if (sharedRoots.has(resolve(normalized)))
     throw new Error(`${label} must be a private subdirectory, not a shared root`);
-  assertNoUntrustedSymlinkAncestors(normalized, label);
+  assertTrustedAncestors(normalized, label, true);
   let existing;
   try {
     existing = lstatSync(normalized);
@@ -178,7 +280,7 @@ export function ensureSocketDir(dir: string, label: "runDir" | "socketDir" = "so
   if (existing && (existing.isSymbolicLink() || !existing.isDirectory()))
     throw new Error(`${label} must be a real directory, not a symlink`);
   if (!existing) mkdirSync(normalized, { recursive: true, mode: 0o700 });
-  assertNoUntrustedSymlinkAncestors(normalized, label);
+  assertTrustedAncestors(normalized, label, false);
   let info = lstatSync(normalized);
   if (info.isSymbolicLink() || !info.isDirectory())
     throw new Error(`${label} must be a real directory, not a symlink`);
@@ -197,113 +299,14 @@ export function ensureSocketDir(dir: string, label: "runDir" | "socketDir" = "so
   return normalized;
 }
 
-interface SocketDirLockRecord {
-  pid: number;
-  runDir: string;
-  token: string;
-}
-
-const activeSocketDirClaims = new Map<string, { runDir: string; lockPath: string; ownerToken?: string; refs: Set<string> }>();
-
-function pidAlive(pid: number): boolean {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
-}
-
-function readSocketDirLock(lockPath: string): SocketDirLockRecord | undefined {
-  try {
-    const info = lstatSync(lockPath);
-    if (info.isSymbolicLink() || !info.isFile()) return undefined;
-    if (typeof process.getuid === "function" && info.uid !== process.getuid()) return undefined;
-    const parsed = JSON.parse(readFileSync(lockPath, "utf8")) as Partial<SocketDirLockRecord>;
-    if (typeof parsed.pid === "number" && typeof parsed.runDir === "string" && typeof parsed.token === "string")
-      return { pid: parsed.pid, runDir: parsed.runDir, token: parsed.token };
-  } catch {
-  }
-  return undefined;
-}
-
-export function claimSocketDir(socketDir: string, runDir: string): () => void {
-  const canonicalSocket = canonicalOrResolved(socketDir);
-  const canonicalRun = canonicalOrResolved(runDir);
-  const lockPath = join(socketDir, HOST_LOCK_FILE);
-  const token = randomUUID();
-  const inProcess = activeSocketDirClaims.get(canonicalSocket);
-  if (inProcess && inProcess.refs.size > 0) {
-    if (inProcess.runDir !== canonicalRun)
-      throw new Error("Another host owns this socket directory");
-    inProcess.refs.add(token);
-    return () => releaseSocketDirClaim(canonicalSocket, token);
-  }
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const fd = openSync(lockPath, "wx", 0o600);
-      try {
-        writeFileSync(fd, JSON.stringify({ pid: process.pid, runDir: canonicalRun, token } satisfies SocketDirLockRecord));
-      } finally {
-        closeSync(fd);
-      }
-      activeSocketDirClaims.set(canonicalSocket, { runDir: canonicalRun, lockPath, ownerToken: token, refs: new Set([token]) });
-      return () => releaseSocketDirClaim(canonicalSocket, token);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    }
-    const existing = readSocketDirLock(lockPath);
-    if (existing && pidAlive(existing.pid)) {
-      if (existing.runDir !== canonicalRun)
-        throw new Error("Another host owns this socket directory");
-      if (existing.pid !== process.pid) return () => {};
-      activeSocketDirClaims.set(canonicalSocket, { runDir: canonicalRun, lockPath, refs: new Set([token]) });
-      return () => releaseSocketDirClaim(canonicalSocket, token);
-    }
-    try {
-      const info = lstatSync(lockPath);
-      if (info.isSymbolicLink() || !info.isFile())
-        throw new Error("Invalid host lock entry in socket directory");
-      if (typeof process.getuid === "function" && info.uid !== process.getuid())
-        throw new Error("Another user owns the host lock in this socket directory");
-      unlinkSync(lockPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-  }
-  throw new Error("Another host owns this socket directory");
-}
-
-function releaseSocketDirClaim(canonicalSocket: string, token: string): void {
-  const entry = activeSocketDirClaims.get(canonicalSocket);
-  if (!entry || !entry.refs.delete(token)) return;
-  if (entry.refs.size > 0) return;
-  activeSocketDirClaims.delete(canonicalSocket);
-  if (!entry.ownerToken) return;
-  const current = readSocketDirLock(entry.lockPath);
-  if (current && current.pid === process.pid && current.token === entry.ownerToken) {
-    try {
-      unlinkSync(entry.lockPath);
-    } catch {
-    }
-  }
-}
-
 export type WorkerError = Error & { code?: string };
 
-export function workerCall<T>(
-  target: SocketTarget,
-  id: string,
+export function workerCallAt<T>(
+  path: string,
   request: WorkerRequest,
   timeoutMs = 4000,
 ): Promise<T> {
   return new Promise((resolve, reject) => {
-    const path = existingWorkerSocket(target, id);
-    if (!path) {
-      reject(Object.assign(new Error("Worker unavailable"), { code: "ENOENT" }));
-      return;
-    }
     const socket = createConnection(path);
     let data = "";
     socket.setTimeout(timeoutMs, () =>
@@ -336,4 +339,15 @@ export function workerCall<T>(
       if (!data.includes("\n")) reject(new Error("Worker unavailable"));
     });
   });
+}
+
+export function workerCall<T>(
+  target: SocketTarget,
+  id: string,
+  request: WorkerRequest,
+  timeoutMs = 4000,
+): Promise<T> {
+  const path = existingWorkerSocket(target, id);
+  if (!path) return Promise.reject(Object.assign(new Error("Worker unavailable"), { code: "ENOENT" }));
+  return workerCallAt(path, request, timeoutMs);
 }

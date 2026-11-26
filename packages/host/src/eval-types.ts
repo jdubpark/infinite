@@ -162,12 +162,19 @@ export type EvalTaskRow =
       payload: RejectedPayload;
     });
 
-export type PatchRead = { state: "read"; bytes: Buffer } | { state: "too-large" } | { state: "failed" };
+export type PatchRead =
+  | { state: "read"; bytes: Buffer }
+  | { state: "empty" }
+  | { state: "missing" }
+  | { state: "too-large" }
+  | { state: "failed" };
 export type NameRead = { state: "read"; names: string[] } | { state: "too-wide" } | { state: "failed" };
+export type TreeCompare = "same" | "different" | "missing" | "failed";
 export type BaseRead = "proven" | "not-proven";
 
 export interface CaptureGit {
   patch(cwd: string, from: string, to: string): Promise<PatchRead>;
+  sameTree(cwd: string, from: string, to: string): Promise<TreeCompare>;
   names(cwd: string, from: string, to: string, max: number): Promise<NameRead>;
   onBaseBranch(mirror: string, anchor: string, head: string): Promise<BaseRead>;
   close?(): void;

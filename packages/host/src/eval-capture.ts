@@ -14,6 +14,7 @@ import {
   type NameRead,
   type PatchRead,
   type ReconcileResult,
+  type TreeCompare,
 } from "./eval-types.js";
 import { outcomeId } from "./outcome-projector.js";
 import { OUTCOMES_MODULE, readOutcome, type OutcomeRow } from "./outcome-store.js";
@@ -329,7 +330,19 @@ export class TaskCapture implements CaptureSink {
         { state: "failed" },
       );
       if (read.state === "too-large") return { kind: "reject", reason: "patch-too-large" };
-      baseDelta = read.state === "read" ? { state: "stored", bytes: read.bytes } : { state: "missing" };
+      if (read.state === "failed") return { kind: "reject", reason: "capture-failed" };
+      if (read.state === "missing") baseDelta = { state: "missing" };
+      else if (read.state === "empty" || read.bytes.length === 0) {
+        const trees = await this.bounded<TreeCompare>(
+          () => this.git.sameTree(workspace, start.anchorCommit, start.memberBaseCommit),
+          "failed",
+        );
+        if (trees === "same") baseDelta = { state: "stored", bytes: Buffer.alloc(0) };
+        else if (trees === "missing") baseDelta = { state: "missing" };
+        else return { kind: "reject", reason: "capture-failed" };
+      } else {
+        baseDelta = { state: "stored", bytes: read.bytes };
+      }
     }
 
     const reference = await this.bounded<PatchRead>(
@@ -337,6 +350,8 @@ export class TaskCapture implements CaptureSink {
       { state: "failed" },
     );
     if (reference.state === "too-large") return { kind: "reject", reason: "patch-too-large" };
+    if (reference.state === "failed" || reference.state === "empty") return { kind: "reject", reason: "capture-failed" };
+    if (reference.state === "read" && reference.bytes.length === 0) return { kind: "reject", reason: "capture-failed" };
 
     const base = await this.baseCheck(start);
     return {
@@ -344,7 +359,7 @@ export class TaskCapture implements CaptureSink {
       files: verdict.files,
       hiddenFiles: verdict.hiddenFiles,
       baseDelta,
-      reference: reference.state === "read" && reference.bytes.length > 0 ? { state: "stored", bytes: reference.bytes } : { state: "missing" },
+      reference: reference.state === "read" ? { state: "stored", bytes: reference.bytes } : { state: "missing" },
       base,
     };
   }

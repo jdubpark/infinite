@@ -282,6 +282,7 @@ export interface Config {
   repositoryGraphs?: { command: string; args: string[]; graphifyCommand: string; cacheDir: string; projectIds?: string[]; timeoutMs: number; debounceMs: number; intervalMs: number };
   port: number;
   origin: string;
+  browserSessions?: boolean;
   stateDir: string;
   runDir: string;
   keyFile: string;

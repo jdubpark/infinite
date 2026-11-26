@@ -198,7 +198,7 @@ class Sim {
     this.runtime = rand(seed ^ 0x5bd1e995);
     const r = rand(seed + 1_000_003);
     this.heads = Object.fromEntries(PROJECTS.map(project => [project, Array.from({ length: HEADS }, () => hex(r, 40))])) as Record<ProjectId, string[]>;
-    this.world = new World(this.clock, rand(seed + 2_000_003), counts, this.hooks());
+    this.world = new World(this.clock, rand(seed + 2_000_003), counts, this.hooks(), rand(seed + 3_000_017));
     const agents = { claude: s.sudo ? { command: "/usr/bin/sudo", args: ["-n", "-u", "agent", "--", "claude"] } : { command: "claude", args: [] } };
     this.config = {
       stateDir: `${ROOT}/state`, projects: PROJECTS.map(id => projectOf(id, 0)), agents,
@@ -771,6 +771,7 @@ class Sim {
 
   private async drain() {
     this.disarm();
+    this.world.stopArrivals();
     this.world.faults = clearFaults();
     this.haltSince.clear();
     this.noteHalts();

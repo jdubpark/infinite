@@ -306,6 +306,14 @@ device key and a separate client config. Reserve browser login for the
 dedicated HTTPS hostname. [OpenSSH local forwarding](https://man.openbsd.org/ssh.1#L)
 and [Infinite CLI pairing](../../packages/host/src/client.ts)
 
+If a legacy service must remain on a shared hostname, set
+`"browserSessions": false` in its private config and restart it. Browser login
+then stops before body parsing, existing cookies are ignored, and the web
+entry returns a static unavailable page. Paired bearer APIs, event streams,
+native sockets, and machine access remain enabled. The in-memory cookie
+sessions end when the service restarts. Keep browser sessions disabled until
+the service has its own private HTTPS hostname.
+
 ```sh
 ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:4781:127.0.0.1:4781 SSH_HOST
 ```
@@ -813,3 +821,42 @@ Before enabling intake on a new instance, record the applicable outcomes,
 pass the host acceptance checks, and configure its owner identity, allowed
 Linear teams and label, Slack app and credentials. Do not configure teammate
 identities or a public callback endpoint.
+
+## Retired native session custody
+
+A project halt stops autonomous work. Native sessions have their own direct API
+and transcript routes. To retire positively identified sessions from those
+routes, an operator can move their complete directories into offline custody.
+The move keeps the original ciphertext and directory identities on the same
+filesystem.
+
+Stop admission and establish that the selected sessions have no live workers,
+open files or sockets. Fence writers while applying or restoring the selection.
+Create separate root-owned directories for the private receipt and for custody.
+Give the custody directory and its empty `sessions` child mode `0700`. Put the
+approved UUIDs in a root-owned mode `0400` receipt using the following format.
+
+```json
+{"version":1,"sessionIds":["00000000-0000-4000-8000-000000000001"]}
+```
+
+Run the utility as root. Include each service-accessible project, runtime and
+provider root with a separate `--service-root` argument. Keep the receipt,
+custody and executable outside those roots. Install the reviewed
+`verify-instance-boundaries.py` beside the utility for its mount checks.
+
+```sh
+python3 deploy/ubuntu/quarantine-session-state.py plan \
+  --selection "$RECEIPT" --state-root "$STATE" --custody-root "$CUSTODY" \
+  --service-root "$RUNTIME" --service-root "$WORKSPACES" --service-root "$PROVIDER_HOME"
+```
+
+Use `apply` with the same arguments for the move. After an interruption, repeat
+the same operation. Use `restore` during a fenced maintenance window to return
+the original directories. Keep the receipt and custody checkpoint together for
+recovery. After restarting the API, verify the inventory, a direct session
+read, a transcript read and continuity of unrelated workers.
+
+The utility covers host-native session directories. Team, goal and mission
+records, provider homes, shared evidence, client caches and backups have
+separate retention and access boundaries.

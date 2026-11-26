@@ -9,6 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { createTeamSchema, gitBranchSchema, githubRepositorySchema, teamDeliverySchema, teamDeliveryReconcileSchema, teamPermissionsSchema, type ProjectSource, type TeamDelivery, DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE} from "./team-types.js";
 import { describeSource } from "./client.js";
+import type { ClientApi as Api, ClientConfig } from "./client-api.js";
 import { assertRoutingSupport, requestedRouting, ROUTING_AUTO_NOTE } from "./routing-cli.js";
 import { autonomyModeSchema } from "./autonomy.js";
 import type { EntryPage } from "./evidence/blackboard.js";
@@ -20,11 +21,6 @@ import { localProjectPath } from "./mirrored-projects.js";
 import { readSyncState, stopSyncService, syncServiceRunning } from "./sync-service.js";
 import { canAskForBrief, chooseTeamBrief, failedTeamBriefRow, openQuestionLines, orderedTeamMembers, summaryMember, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, wrapText, type TeamBriefRow, type TeamBriefStatus, type TeamWatchCommand } from "./team-watch.js";
 
-type ClientConfig = { origin: string; token: string; projectId?: string };
-type Api = {
-  request(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<Response>;
-  json<T>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T>;
-};
 type Options = Record<string, string | boolean>;
 const commandSchema = z.object({ command: z.string().min(1).max(4096).refine(value => !value.includes("\0")), args: z.array(z.string().max(4096).refine(value => !value.includes("\0"))).max(64).default([]) }).strict();
 const projectConfigSchema = z.object({ setup: commandSchema.optional(), checks: z.array(commandSchema).max(8), establishChecks: z.literal(true).optional() }).strict();
@@ -405,15 +401,14 @@ async function printTeamLogs(api: Api, team: any, signal: AbortSignal) {
   if (current.length > shown.length) console.log(`+ ${current.length - shown.length} more agents. Follow one with infinite team watch ${clean(team?.id)} --logs\n`);
 }
 
-async function askForBrief(api: Api, team: any, rows: BriefRow[], signal: AbortSignal, show: (text: string) => void, checkedAt: string): Promise<BriefRow[]> {
+export async function askForBrief(api: Api, team: any, rows: BriefRow[], signal: AbortSignal, show: (text: string) => void, checkedAt: string): Promise<BriefRow[]> {
   const chosen = chooseTeamBrief(rows, summaryMember(team)?.sessionId);
   if (!chosen || !canAskForBrief(team, rows)) return rows;
   const card = teamSummaryText(team, rows, checkedAt, true, Date.now()).split("\n");
   const footer = card.pop() ?? "";
   show([...card, "", "Refreshing the Brief. This can take a few minutes.", "", footer].join("\n"));
   try {
-    const response = await api.request(`/sessions/${chosen.sessionId}/summary?after=0`, undefined, AbortSignal.any([signal, AbortSignal.timeout(180000)]));
-    const summary = await response.json() as TeamBriefStatus["summary"];
+    const summary = await api.json<TeamBriefStatus["summary"]>(`/sessions/${chosen.sessionId}/summary?after=0`, undefined, signal, undefined, undefined, 180000);
     const ready = Boolean(summary?.repository?.brief?.summary || summary?.text);
     const next: BriefRow = { sessionId: chosen.sessionId, status: { state: ready ? "ready" : "empty", summary, ...(ready ? {} : { error: "No recorded chat is available for a repository brief." }) } };
     return [...rows.filter(row => row.sessionId !== chosen.sessionId), next];
@@ -553,8 +548,7 @@ async function uploadCommit(api: Api, projectId: string, root: string, commit: s
       },
       put: async (hash, bytes, signal) => { await (await api.request(`/projects/${projectId}/sync/blob/${hash}`, bytes, AbortSignal.any([signal, AbortSignal.timeout(CHUNK_TIMEOUT)]), octets, "PUT")).body?.cancel(); },
     } });
-    const commitResponse = await api.request(`/projects/${projectId}/sync/commit`, { generation, manifest }, AbortSignal.timeout(300000));
-    const committed = await commitResponse.json() as any;
+    const committed = await api.json<any>(`/projects/${projectId}/sync/commit`, { generation, manifest }, undefined, undefined, undefined, 300000);
     const current = await api.json<any>(`/projects/${projectId}`);
     return { manifestId: manifest.id, committed, sync: current.sync };
   } finally { rmSync(cloned, { recursive: true, force: true }); }

@@ -6,7 +6,9 @@
     "noEmit": true
   },
   "include": [
+    "tests/mobile-requests-types.test.ts",
     "tests/orchestration-state-types.test.ts",
-    "tests/orchestration-wire-contracts.test.ts"
+    "tests/orchestration-wire-contracts.test.ts",
+    "tests/team-mcp-results-types.test.ts"
   ]
 }

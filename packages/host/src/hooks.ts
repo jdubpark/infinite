@@ -22,12 +22,14 @@ export type HookAnswer = import("./permission-hook.js").ChannelAnswer;
 
 export function startHookServer(opts: {
   token: string;
-  onPayload: (route: HookRoute, body: unknown) => HookReply | HookAnswer | void | Promise<HookReply | HookAnswer | void>;
+  onPayload: (route: HookRoute, body: unknown, run?: string) => HookReply | HookAnswer | void | Promise<HookReply | HookAnswer | void>;
   onError: () => void;
 }): Promise<{ port: number; url: string; close: () => void }> {
   const expected = Buffer.from(opts.token);
   const server = createServer((req, res) => {
-    const route = (req.url ?? "").replace(/^\/hook\//, "").replace(/^\//, "");
+    const path = (req.url ?? "").replace(/^\/hook\//, "").replace(/^\//, "");
+    const marked = /^(permission-check|permission-request)\/([0-9]{1,9})$/.exec(path);
+    const route = marked?.[1] ?? path;
     if (req.method !== "POST" || !ROUTES.has(route)) {
       res.writeHead(404).end();
       return;
@@ -70,7 +72,7 @@ export function startHookServer(opts: {
       }
       let reply: HookReply | HookAnswer | void = undefined;
       try {
-        reply = await opts.onPayload(route as HookRoute, parsed);
+        reply = await opts.onPayload(route as HookRoute, parsed, marked?.[2]);
       } catch (error) {
         opts.onError();
         if (error instanceof HookPayloadError && error.message !== "Hook payload was refused")

@@ -552,7 +552,7 @@ export class GoalService {
           if (stored.goal.status !== "blocked" || stored.goal.reason !== reason) this.event(stored, reason);
           if (!["paused", "cancelled", "limit-reached"].includes(stored.goal.status)) this.block(stored, reason);
           else stored.goal.reason = reason;
-          this.save(stored);
+          try { this.save(stored); } catch {}
         }
       })).catch(() => {}).finally(() => { this.tickQueued = false; this.activeTicks.delete(run); });
       this.activeTicks.add(run);
@@ -564,6 +564,12 @@ export class GoalService {
     if (this.timer) clearInterval(this.timer);
     while (this.activeTicks.size > 0) await Promise.allSettled([...this.activeTicks]);
     await this.queues.drain();
+  }
+  async idle(): Promise<void> {
+    while (this.activeTicks.size > 0 || this.queues.size > 0) {
+      if (this.activeTicks.size > 0) await Promise.allSettled([...this.activeTicks]);
+      if (this.queues.size > 0) await this.queues.settle();
+    }
   }
   private refresh(stored: Stored, team: TeamView) {
     const cycle = stored.goal.cycles.find(value => value.teamId === team.id)!;

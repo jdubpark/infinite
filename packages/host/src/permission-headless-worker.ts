@@ -79,6 +79,8 @@ export class HeadlessChannelWorker {
   private deferred?: Deferred;
   private recent = new Map<string, string | number>();
   private lost = false;
+  private runs = 1;
+  private running = true;
   private continueOwed = false;
   private consumed = new Set<string>();
   private answers = new Map<string, StoredAnswer>();
@@ -87,6 +89,10 @@ export class HeadlessChannelWorker {
   constructor(private readonly host: ChannelWorkerHost) {}
 
   private now() { return (this.host.now ?? Date.now)(); }
+
+  get run(): number { return this.runs; }
+
+  private stale(run: string | undefined) { return !this.running || run !== String(this.runs); }
 
   private ask(request: ChannelRequest extends infer R ? R extends ChannelRequest ? Omit<R, "v" | "sessionId" | "token"> : never : never, timeoutMs: number): Promise<ChannelReply> {
     return (this.host.call ?? channelCall)(this.host.socket, { v: 1, sessionId: this.host.sessionId, token: this.host.token, ...request } as ChannelRequest, timeoutMs);
@@ -98,6 +104,11 @@ export class HeadlessChannelWorker {
   }
 
   private deny(code: RejectCode): ChannelAnswer { return { decision: "deny", reason: requesterNotice(code) }; }
+
+  private late(reply: ChannelReply): ChannelAnswer {
+    this.delivery("decisionId" in reply ? reply : undefined, "refusal", "Headless: the provider run that made the call ended while the call was decided; the verdict never reached the call, which was denied as unavailable.");
+    return this.deny("unavailable");
+  }
 
   private leftOpen(key: string, callId?: string) {
     if (this.lost) return;
@@ -135,7 +146,8 @@ export class HeadlessChannelWorker {
     this.host.publish(this.view());
   }
 
-  async check(body: unknown): Promise<ChannelAnswer> {
+  async check(body: unknown, run: string | undefined): Promise<ChannelAnswer> {
+    if (this.stale(run)) return this.deny("unavailable");
     const call = readCall(body);
     if (!call) return this.deny("unavailable");
     this.first(call);
@@ -161,6 +173,10 @@ export class HeadlessChannelWorker {
         try { reply = await this.ask({ op: "resume", sessionRoot: deferred.sessionRoot, ...(deferred.issued ?? {}), call }, CLASS_CHECK_MS); }
         catch { reply = undefined; }
       }
+      if (this.stale(run)) {
+        this.retireCall("resume-ended", deferred);
+        return this.deny("unavailable");
+      }
       if (reply?.result !== "ok") {
         const reason = reply?.result === "withheld" ? reply.reason : "unavailable";
         return settle("withheld", "stale", `Headless: the owner's allow was withheld at the resume (${reason}); the call was denied as unavailable.`, this.deny("unavailable"));
@@ -171,6 +187,7 @@ export class HeadlessChannelWorker {
     let reply: ChannelReply;
     try { reply = await this.ask({ op: "class", call }, CLASS_CHECK_MS); }
     catch { return this.deny("unavailable"); }
+    if (this.stale(run)) return this.late(reply);
     if (reply.result === "not-served" || reply.result === "none") {
       this.leftOpen(callKey(call, inputHash), call.toolUseId);
       return { decision: "none" };
@@ -204,7 +221,8 @@ export class HeadlessChannelWorker {
     return { decision: "defer", reason: DEFERRED_REASON };
   }
 
-  async request(body: unknown): Promise<ChannelAnswer> {
+  async request(body: unknown, run: string | undefined): Promise<ChannelAnswer> {
+    if (this.stale(run)) return this.deny("unavailable");
     const call = readCall(body);
     if (!call) return this.deny("unavailable");
     this.first(call);
@@ -216,6 +234,7 @@ export class HeadlessChannelWorker {
     let reply: ChannelReply;
     try { reply = await this.ask({ op: "decide", call: forwarded, requestId }, DECIDE_MS); }
     catch { return this.deny("unavailable"); }
+    if (this.stale(run)) return this.late(reply);
     if (reply.result === "not-served") return { decision: "none" };
     if (reply.result === "allow") return { decision: "allow" };
     if (reply.result !== "deny") return this.deny("unavailable");
@@ -225,7 +244,7 @@ export class HeadlessChannelWorker {
 
   exited(exitCode: number): boolean {
     this.recent.clear();
-    this.lost = true;
+    this.running = false;
     const deferred = this.deferred;
     if (!deferred) return false;
     if (deferred.phase === "deferring" && exitCode === 0 && this.nativeSessionId) {
@@ -276,6 +295,9 @@ export class HeadlessChannelWorker {
     this.host.closePrompt(deferred.promptId!, [OWNER_ALLOW, OWNER_DENY, OWNER_DENY_TEXT][option]);
     this.delivery(deferred.issued, "intent", `Headless: the owner ${decision === "allow" ? "allowed the call once" : "refused the call"}; the session resumes.`);
     this.host.publish(this.view());
+    this.runs++;
+    this.running = true;
+    this.lost = false;
     try {
       this.host.resume(this.nativeSessionId!);
       this.continueOwed = true;
@@ -299,13 +321,14 @@ export class HeadlessChannelWorker {
     return owed;
   }
 
-  private retireCall(reason: string) {
-    const deferred = this.deferred;
+  private retireCall(reason: string, deferred = this.deferred) {
     if (!deferred) return;
-    this.deferred = undefined;
+    if (this.deferred === deferred) this.deferred = undefined;
     if (deferred.promptId !== undefined && deferred.phase === "waiting") this.host.closePrompt(deferred.promptId, OWNER_DENY);
     this.host.record({ event: "retired", callId: deferred.callId, reason });
-    this.delivery(deferred.issued, "refusal", `Headless: the deferred call was retired unanswered (${reason}).`);
+    this.delivery(deferred.issued, "refusal", deferred.answer
+      ? `Headless: the deferred call was retired before the owner's answer reached it (${reason}).`
+      : `Headless: the deferred call was retired unanswered (${reason}).`);
     this.host.publish(this.view());
   }
 

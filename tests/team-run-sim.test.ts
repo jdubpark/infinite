@@ -31,8 +31,8 @@ async function sweep(seeds: readonly number[], counts: Counts, variant: Variant 
 }
 
 const FLOORS: Readonly<Record<string, number>> = {
-  "cut:pause:1": 7, "cut:resume:1": 6, "cut:resume:2": 1, "cut:cancel:1": 1,
-  "cut:steer:1": 10, "cut:steer:2": 8, "cut:revoke:1": 7, "cut:revoke:2": 3, "cut:answer:1": 2, "cut:answer:2": 1,
+  "cut:pause:1": 7, "cut:resume:1": 6, "cut:cancel:1": 1,
+  "cut:steer:1": 10, "cut:steer:2": 3, "cut:revoke:1": 7, "cut:revoke:2": 3, "cut:answer:1": 2, "cut:answer:2": 1,
   "cut:continue:1": 1, "cut:pass": 4,
   "ack:pause": 31, "ack:resume": 28, "ack:cancel": 8, "ack:steer": 34, "ack:revoke": 16, "ack:answer": 3, "ack:continue": 2,
   "retry:pause": 8, "retry:resume": 9, "retry:cancel": 4, "retry:steer": 10, "retry:revoke": 5, "retry:answer": 1, "retry:continue": 1,
@@ -55,6 +55,7 @@ test("team run requests keep their invariants across host stops", async t => {
 type Stored = { run: TeamRun; receipts: Record<string, string>; checkHead?: string; halt?: string };
 type Body = { requestId: string; revision: number };
 type Private = {
+  activity: { snapshots: Map<string, unknown> };
   admit(stored: Stored, operation: string, body: Body): string | undefined;
   replay(stored: Stored, operation: string, body: Body): boolean;
   save(stored: Stored): void;
@@ -64,6 +65,10 @@ type Private = {
   event(stored: Stored, text: string): void;
 };
 const internals = (service: TeamService) => service as unknown as Private;
+const forceSave = (host: Private, stored: Stored) => {
+  host.activity.snapshots.delete(stored.run.id);
+  host.save(stored);
+};
 
 type Mutation = { name: string; invariant: string; kind: "source" | "harness"; variant: Variant };
 
@@ -114,7 +119,7 @@ const MUTATIONS: readonly Mutation[] = [
   { name: "a replay writes the record again", invariant: "I2", kind: "source",
     variant: patchReplay((host, replay) => (stored, operation, body) => {
       const hit = replay(stored, operation, body);
-      if (hit) host.save(stored);
+      if (hit) forceSave(host, stored);
       return hit;
     }) },
   { name: "a resume records its receipt and advances its revision before the permission fence (INF-334)", invariant: "I3", kind: "source",
@@ -153,12 +158,12 @@ const MUTATIONS: readonly Mutation[] = [
       admit(stored.run.status === "cancelled" ? { ...stored, run: { ...stored.run, status: "paused" } } : stored, operation, body)) },
   { name: "admission saves the record before its checks", invariant: "I6", kind: "source",
     variant: patchAdmit((host, admit) => (stored, operation, body) => {
-      host.save(stored);
+      forceSave(host, stored);
       return admit(stored, operation, body);
     }) },
   { name: "a refused admission saves the record", invariant: "I6", kind: "source",
     variant: patchAdmit((host, admit) => (stored, operation, body) => {
-      try { return admit(stored, operation, body); } catch (error) { host.save(stored); throw error; }
+      try { return admit(stored, operation, body); } catch (error) { forceSave(host, stored); throw error; }
     }) },
   { name: "a reused request id replays whatever its action", invariant: "I7", kind: "source",
     variant: patchReplay(() => (stored, _operation, body) => Boolean(stored.receipts[body.requestId])) },

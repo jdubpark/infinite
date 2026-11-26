@@ -82,6 +82,19 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.sw-unit-sub-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+}
+.sw-unit-sub-meta {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .sw-dep {
   color: var(--sw-ink-3);
 }
@@ -270,10 +283,19 @@
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
   height: 20px;
   line-height: 20px;
 }
+.sw-wall-unit-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .sw-wait-pill {
+  flex: none;
+  white-space: nowrap;
   color: var(--sw-needs);
 }
 .sw-wall-grid {

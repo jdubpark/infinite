@@ -5,8 +5,9 @@ import { isDeepStrictEqual } from "node:util";
 import { createRemoteClient } from "@infinite/remote";
 import { MAX_RESPONSE_BYTES } from "@infinite/remote/protocol";
 import { connectRemoteAccess } from "../packages/host/src/remote-access.js";
-import { teamListItem } from "../packages/host/src/team-list.js";
+import { LIST_WAIT_REASONS, teamListItem } from "../packages/host/src/team-list.js";
 import type { TeamModelProfile, TeamView } from "../packages/host/src/team-types.js";
+import { describeTeamWaitReasons } from "../packages/host/src/team-wait-reasons.js";
 import type { UsageTotals } from "../packages/host/src/usage.js";
 import { inProcessHost, waitFor } from "./helpers.js";
 import { fixture } from "./team-fixture.js";
@@ -166,4 +167,41 @@ test("the remote channel answers a team list over its limit with compact rows", 
     t.mock.timers.tick(5 * 60_000);
     assert.equal((await owner.request<Listed>("/teams")).teams.length, 2, "after the retry interval the full list is read again");
   } finally { t.mock.timers.reset(); teams.list = original.list; teams.listItems = original.listItems; owner.close(); closeRemote(); await host.stop(); }
+});
+
+test("teamListItem caps waitReasons to LIST_WAIT_REASONS, clips summaries, and keeps urgent reasons first", () => {
+  const base = finishedRun(1);
+  const longQuestion = `${"A".repeat(3990)} tail`;
+  const described = describeTeamWaitReasons({
+    ...base,
+    status: "implementing",
+    linearTracking: true,
+    linear: { status: "pending", reason: "B".repeat(500) },
+    decisions: [
+      { id: "d-long", memberId: base.members[0]!.memberId, revision: 1, question: longQuestion, options: ["Yes"], createdAt: at(10) },
+    ],
+    members: [
+      { ...base.members[0]!, status: "running", stalledAt: at(12) },
+    ],
+  }, [], Date.parse(at(20)));
+  const ownerReason = described.find(item => item.kind === "owner-decision");
+  assert.ok(ownerReason);
+  assert.ok(ownerReason.summary.length <= 240 && ownerReason.summary.endsWith("..."));
+
+  const manyReasons = [
+    ...Array.from({ length: 18 }, (_, index) => ({
+      kind: "worker-slot" as const,
+      taskId: `task-${index}`,
+      summary: `Worker slot ${index} ${"x".repeat(400)}`,
+    })),
+    { kind: "linear-sync" as const, summary: "Linear sync pending" },
+    { kind: "stalled" as const, memberId: base.members[0]!.memberId, summary: "Coordinator stalled" },
+    ownerReason,
+  ];
+  const row = teamListItem({ ...base, waitReasons: manyReasons });
+  assert.equal(row.waitReasons?.length, LIST_WAIT_REASONS);
+  assert.equal(row.waitReasons?.[0]?.kind, "owner-decision");
+  assert.equal(row.waitReasons?.[1]?.kind, "stalled");
+  assert.ok(row.waitReasons?.every(item => item.summary.length <= 240));
+  assert.ok(row.waitReasons?.slice(2).every(item => item.summary.endsWith("...")));
 });

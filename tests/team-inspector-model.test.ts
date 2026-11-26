@@ -12,7 +12,7 @@ import {
   partitionRoster,
   waitReasonMeta,
 } from "../apps/web/src/team-inspector/model.ts";
-import type { TeamEntryHead, TeamWaitReason } from "../apps/web/src/team-inspector/types.ts";
+import type { TeamEntryHead, TeamWaitReason, TeamWaitReasonKind } from "../apps/web/src/team-inspector/types.ts";
 import type { TeamMember, TeamView } from "../apps/web/src/teams.tsx";
 
 function baseTeam(): TeamView {
@@ -219,6 +219,7 @@ test("waitReasonMeta and orderWaitReasons classify and prioritize host wait reas
   assert.deepEqual(waitReasonMeta("dependency"), { label: "Task dependency", tone: "muted" });
   assert.deepEqual(waitReasonMeta("integration-order"), { label: "Integration order", tone: "muted" });
   assert.deepEqual(waitReasonMeta("linear-sync"), { label: "Linear sync", tone: "muted" });
+  assert.deepEqual(waitReasonMeta("custom-kind" as TeamWaitReasonKind), { label: "custom-kind", tone: "muted" });
 
   const input: TeamWaitReason[] = [
     { kind: "linear-sync", summary: "Linear sync" },

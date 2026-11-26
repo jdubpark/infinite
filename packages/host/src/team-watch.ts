@@ -1,4 +1,5 @@
 import { recommendationLine, type QuestionRecommendation } from "./question-recommendation.js";
+import { orderTeamWaitReasons } from "./team-wait-reasons.js";
 
 export const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 
@@ -170,7 +171,8 @@ function section(lines: string[], title: string, items: (string | string[])[], n
 }
 
 export function waitReasonLines(lines: string[], team: any) {
-  const reasons = Array.isArray(team?.waitReasons) ? team.waitReasons : [];
+  const raw: { kind?: unknown; summary?: unknown }[] = Array.isArray(team?.waitReasons) ? team.waitReasons : [];
+  const reasons = orderTeamWaitReasons(raw);
   if (!reasons.length) return;
   lines.push("", `WAIT REASONS (${reasons.length})`);
   for (const reason of reasons.slice(0, 6)) {

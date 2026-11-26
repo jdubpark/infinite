@@ -89,7 +89,7 @@ function WallSwarm({ swarm, ...props }: ViewProps & { swarm: Swarm }) {
       <span className="sw-cost sw-num" title={spend.title}>{spend.text}</span>
     </header>
     <div className="sw-wall-sections">{sections.map(section => <div key={section.key} className="sw-wall-section">
-      {swarm.kind === "mission" && <div className="sw-wall-unit sw-dim">{section.label}{(section.waitCount ?? 0) > 0 && <span className="sw-tag" title={section.waitSummary}>{section.waitCount === 1 ? "1 wait" : `${section.waitCount} waits`}</span>}</div>}
+      {swarm.kind === "mission" && <div className="sw-wall-unit sw-dim"><span className="sw-wall-unit-label">{section.label}</span>{(section.waitCount ?? 0) > 0 && <span className="sw-tag" title={section.waitSummary}>{section.waitCount === 1 ? "1 wait" : `${section.waitCount} waits`}</span>}</div>}
       <div className="sw-wall-grid">
         {sortByState(section.agents).map(agent => <WallTile key={agent.id} agent={agent}
           selected={selection?.kind === "agent" && selection.id === agent.id}

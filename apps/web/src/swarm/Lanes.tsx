@@ -76,11 +76,13 @@ function UnitLabel({ unit, own, model, selection, onSelect, openTeam }: Pick<Vie
       title={unit.title} onClick={() => onSelect({ kind: "unit", id: unit.id })} onDoubleClick={() => openTeam(unit.id)}>
       {deps.length > 0 && <span className="sw-dep" title={`after ${deps.join(", ")}`}>↳ </span>}{own ? unit.projectId : unit.title}
     </button>
-    <span className="sw-unit-sub sw-dim">
-      {own ? "" : `${unit.projectId} `}r{unit.revision}{unit.goalCycle !== undefined ? ` c${unit.goalCycle}` : ""}
+    <span className="sw-unit-sub-row sw-dim">
+      <span className="sw-unit-sub-meta">
+        {own ? "" : `${unit.projectId} `}r{unit.revision}{unit.goalCycle !== undefined ? ` c${unit.goalCycle}` : ""}
+      </span>
       {unit.waitReasons.length > 0 && (
         <span className="sw-wait-pill" title={unit.waitReasons.map(reason => reason.summary).join(" · ")}>
-          {" "}· {unit.waitReasons.length === 1 ? "1 wait" : `${unit.waitReasons.length} waits`}
+          {unit.waitReasons.length === 1 ? "1 wait" : `${unit.waitReasons.length} waits`}
         </span>
       )}
     </span>

@@ -384,7 +384,7 @@ const WAIT_REASON_ORDER: Record<TeamWaitReasonKind, number> = {
 };
 
 export function waitReasonMeta(kind: TeamWaitReasonKind): WaitReasonMeta {
-  return WAIT_REASON_META[kind];
+  return WAIT_REASON_META[kind] ?? { label: String(kind), tone: "muted" };
 }
 
 export function orderWaitReasons(reasons: readonly TeamWaitReason[]): TeamWaitReason[] {

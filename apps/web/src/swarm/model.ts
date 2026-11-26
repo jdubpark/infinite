@@ -34,6 +34,29 @@ const ROLES = new Map<string, { code: RoleCode; stage?: Stage }>([
   ["permission-coordinator", { code: "PR" }],
 ]);
 
+const WAIT_REASON_ORDER: Record<string, number> = {
+  "owner-decision": 0,
+  "provider-prompt": 1,
+  stalled: 2,
+  "spinner-only": 3,
+  "provider-limit": 4,
+  "worker-slot": 5,
+  dependency: 6,
+  "integration-order": 7,
+  "linear-sync": 8,
+};
+
+function orderWaitReasons<T extends { kind: string }>(reasons: readonly T[]): T[] {
+  return reasons
+    .map((reason, index) => ({ reason, index }))
+    .sort((left, right) => {
+      const a = WAIT_REASON_ORDER[left.reason.kind] ?? 99;
+      const b = WAIT_REASON_ORDER[right.reason.kind] ?? 99;
+      return a - b || left.index - right.index;
+    })
+    .map(item => item.reason);
+}
+
 const timeOf = (iso: string | undefined) => (iso === undefined ? 0 : Date.parse(iso) || 0);
 const isFault = (attention?: Attention) => attention?.state === "recording-error" || attention?.state === "unavailable";
 
@@ -211,7 +234,7 @@ function buildUnit(args: {
     baseCommit: team.baseCommit,
     headCommit: team.headCommit,
     tasks: team.tasks,
-    waitReasons: team.waitReasons ?? [],
+    waitReasons: orderWaitReasons(team.waitReasons ?? []),
   };
 
   if (live) {

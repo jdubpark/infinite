@@ -256,4 +256,24 @@ test("teamMonitorText and teamSummaryText render WAIT REASONS and member stall/s
   assert.match(summary, /WAIT REASONS \(2\)/);
   assert.match(summary, /\[stalled\] Plan stalled without substantive activity\./);
   assert.match(summary, /\[spinner-only\] Alarm stop is showing spinner redraws only\./);
+
+  const unsortedTeam = {
+    ...team,
+    waitReasons: [
+      { kind: "linear-sync", summary: "Linear\x1b[31m sync\nwaiting" },
+      { kind: "worker-slot", summary: "Slot 1" },
+      { kind: "worker-slot", summary: "Slot 2" },
+      { kind: "worker-slot", summary: "Slot 3" },
+      { kind: "worker-slot", summary: "Slot 4" },
+      { kind: "stalled", summary: "Worker stalled" },
+      { kind: "owner-decision", summary: "Need owner\u0007 choice" },
+    ],
+  };
+  const prioritized = teamMonitorText(unsortedTeam);
+  assert.match(prioritized, /WAIT REASONS \(7\)/);
+  assert.match(prioritized, /\+ 1 more/);
+  assert.ok(prioritized.indexOf("[owner-decision]") < prioritized.indexOf("[stalled]"));
+  assert.ok(prioritized.indexOf("[stalled]") < prioritized.indexOf("[worker-slot]"));
+  assert.doesNotMatch(prioritized, /\[linear-sync\]/);
+  assert.doesNotMatch(prioritized, /\u0007|\x1b\[31m/);
 });

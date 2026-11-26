@@ -31,6 +31,13 @@ function producerLabel(producer: "host" | "evaluator" | "owner"): string {
   return "Owner";
 }
 
+function safeClock(iso: string | undefined): string {
+  const trimmed = iso?.trim() ?? "";
+  if (!trimmed) return "";
+  if (Number.isNaN(Date.parse(trimmed))) return trimmed;
+  return clock(trimmed);
+}
+
 export function TeamOverview({
   team,
   sessions,
@@ -58,6 +65,8 @@ export function TeamOverview({
     const replacement = replacedByMemberId ? roster.byMemberId[replacedByMemberId]?.member : undefined;
     const replaced = replacesMemberId ? roster.byMemberId[replacesMemberId]?.member : undefined;
     const highlighted = highlightedId === member.memberId;
+    const stalledLabel = safeClock(member.stalledAt);
+    const spinnerLabel = safeClock(member.spinnerOnlySince);
     return (
       <article
         key={member.memberId}
@@ -72,11 +81,11 @@ export function TeamOverview({
           {member.title} · r{member.revision}
           {member.taskId ? ` · ${member.taskId}` : ""}
         </div>
-        {member.stalledAt && (
-          <div className="ti-roster-sub ti-roster-flag is-attention">Stalled since {clock(member.stalledAt)}</div>
+        {stalledLabel && (
+          <div className="ti-roster-sub ti-roster-flag is-attention">Stalled since {stalledLabel}</div>
         )}
-        {member.spinnerOnlySince && (
-          <div className="ti-roster-sub ti-roster-flag is-warning">Spinner-only screen since {clock(member.spinnerOnlySince)}</div>
+        {spinnerLabel && (
+          <div className="ti-roster-sub ti-roster-flag is-warning">Spinner-only screen since {spinnerLabel}</div>
         )}
         {member.stoppedReason && (
           <div className="ti-roster-sub">Stopped: {member.stoppedReason}</div>
@@ -237,16 +246,18 @@ export function TeamOverview({
               const meta = waitReasonMeta(reason.kind);
               const member = reason.memberId ? roster.byMemberId[reason.memberId]?.member : undefined;
               const hasSession = Boolean(member && sessionIds.has(member.sessionId));
+              const sinceLabel = safeClock(reason.since);
+              const resetsLabel = safeClock(reason.resetsAt);
               return (
                 <li className="ti-wait-item" key={`${reason.kind}-${reason.memberId ?? ""}-${reason.taskId ?? ""}-${reason.decisionId ?? ""}-${index}`}>
                   <div className="ti-wait-main">
                     <span className={`ti-pill is-wait-${meta.tone}`}>{meta.label}</span>
                     <span className="ti-wait-summary">{reason.summary}</span>
-                    {(reason.since || reason.resetsAt) && (
+                    {(sinceLabel || resetsLabel) && (
                       <span className="ti-wait-meta">
-                        {reason.since ? `since ${clock(reason.since)}` : ""}
-                        {reason.since && reason.resetsAt ? " · " : ""}
-                        {reason.resetsAt ? `resets ${clock(reason.resetsAt)}` : ""}
+                        {sinceLabel ? `since ${sinceLabel}` : ""}
+                        {sinceLabel && resetsLabel ? " · " : ""}
+                        {resetsLabel ? `resets ${resetsLabel}` : ""}
                       </span>
                     )}
                   </div>

@@ -500,4 +500,19 @@ test("buildSwarm maps spinnerOnly on agents and waitReasons on units", () => {
   assert.equal(findAgent(model, "m-clear")?.spinnerOnly, false);
   assert.deepEqual(findUnit(model, "wait-run")?.waitReasons, waitReasons);
   assert.deepEqual(findUnit(model, "quiet-run")?.waitReasons, []);
+
+  const unsortedReasons = [
+    { kind: "linear-sync", summary: "Linear sync" },
+    { kind: "worker-slot", summary: "Worker slot" },
+    { kind: "custom-wait", summary: "Custom wait" },
+    { kind: "stalled", summary: "Stalled" },
+    { kind: "owner-decision", summary: "Owner decision" },
+  ];
+  const prioritizedModel = buildSwarm(input({
+    teams: [team("unsorted-run", { waitReasons: unsortedReasons })],
+  }));
+  assert.deepEqual(
+    findUnit(prioritizedModel, "unsorted-run")?.waitReasons.map(reason => reason.kind),
+    ["owner-decision", "stalled", "worker-slot", "linear-sync", "custom-wait"],
+  );
 });

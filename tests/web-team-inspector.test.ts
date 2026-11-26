@@ -68,6 +68,45 @@ test("TeamOverview renders criteria groups, separate provisional assessment, rev
   assert.ok(!html.includes("check failed on commit A"));
 });
 
+test("TeamOverview tolerates unparseable and blank wait timestamps without throwing", () => {
+  const noop = () => {};
+  const badTimestampsTeam = {
+    ...fixtureTeam,
+    members: [
+      {
+        ...fixtureTeam.members[1]!,
+        stalledAt: "not-iso",
+        spinnerOnlySince: "   ",
+      },
+    ],
+    waitReasons: [
+      {
+        kind: "provider-limit" as const,
+        since: "   ",
+        resetsAt: "next Tuesday",
+        summary: "Provider limit active.",
+      },
+    ],
+  };
+  const html = renderToStaticMarkup(
+    createElement(
+      ApiContext.Provider,
+      { value: (async () => ({})) as unknown as Api },
+      createElement(TeamOverview, {
+        team: badTimestampsTeam,
+        sessions: fixtureSessions,
+        onOpenSession: noop,
+        onInspectMemberEntries: noop,
+        onViewMemberLogs: noop,
+      }),
+    ),
+  );
+  assert.ok(html.includes("Stalled since not-iso"));
+  assert.ok(!html.includes("Spinner-only screen since"));
+  assert.ok(html.includes("resets next Tuesday"));
+  assert.ok(!html.includes("since    "));
+});
+
 describe("web team inspector repair trace", { skip: skipBrowser }, () => {
   let browser: Browser;
   let script = "";

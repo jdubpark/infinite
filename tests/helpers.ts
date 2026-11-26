@@ -226,7 +226,7 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
       }
       return status;
     };
-    const lock = join(config.runDir, "server.lock"), step = options.startStepMs ?? 20000;
+    const lock = join(config.runDir, "server.lock"), step = options.startStepMs ?? 45000;
     const loaded = () => { try { return readFileSync(lock, "utf8") === String(api.pid); } catch { return false; } };
     await waitFor(async () => loaded() || await answer() === 200, (ready) => ready, step);
     await waitFor(answer, (status) => status === 200, step);

@@ -343,3 +343,49 @@ test("nested npm cannot reuse a cloud job from a different repository", (t) => {
   assert.notEqual(result.status, 0);
   assert.equal(existsSync(proof), false);
 });
+
+test("a fresh non-Node project runs pinned Compose against its working checkout", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "portable-compose-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const repo = join(dir, "project");
+  const bin = join(dir, "bin");
+  mkdirSync(join(repo, ".infinite"), { recursive: true });
+  mkdirSync(bin);
+  const env = { ...process.env, HOME: dir, XDG_CONFIG_HOME: join(dir, ".config"), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: join(dir, "gitconfig"), PATH: `${bin}:${process.env.PATH}` };
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, env });
+  const run = () => spawnSync("python3", [client, "--runner", "fixture-runner"], { cwd: repo, env, encoding: "utf8" });
+  const platform = process.arch === "arm64" ? "linux/arm64" : "linux/amd64";
+  const image = "busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec";
+  writeFileSync(join(repo, ".infinite", "check.json"), JSON.stringify({ version: 1, composeFile: "compose.json", service: "test", platform }));
+  writeFileSync(join(repo, "compose.json"), JSON.stringify({ services: { test: {
+    image, platform, working_dir: "/checkout", volumes: [".:/checkout:ro"],
+    command: ["sh", "verify.sh"], network_mode: "none",
+  } } }));
+  writeFileSync(join(repo, "verify.sh"), 'set -eu\n[ "$(cat input)" = "$(cat expected)" ] || exit 17\nprintf "fixture-result=%s\\n" "$(cat input)"\n');
+  writeFileSync(join(repo, "input"), "committed");
+  git("init", "-q", "--template=");
+  git("config", "user.name", "Fixture");
+  git("config", "user.email", "fixture@example.invalid");
+  git("add", ".");
+  git("commit", "-qm", "new project");
+  writeFileSync(join(repo, "input"), "staged");
+  git("add", "input");
+  writeFileSync(join(repo, "input"), "working");
+  writeFileSync(join(repo, "expected"), "working");
+  bindFixtureRunner(dir, repo);
+  execFileSync("python3", [client, "--enroll", "fixture-runner"], { cwd: repo, env });
+  writeFileSync(join(bin, "ssh"), '#!/bin/sh\nfor command do :; done\nexec sh -c "$command"\n', { mode: 0o755 });
+  const passed = run();
+  assert.equal(passed.status, 0, passed.stdout + passed.stderr);
+  assert.match(passed.stdout, /^fixture-result=working$/m);
+  const path = /^RECEIPT (.+)$/m.exec(passed.stdout)?.[1];
+  assert.ok(path);
+  const report = JSON.parse(readFileSync(path, "utf8"));
+  assert.equal(report.current, true);
+  assert.equal(report.worktreeChanges, 2);
+  assert.equal(report.runs[0].receipt.stdout, createHash("sha256").update("fixture-result=working\n").digest("hex"));
+  writeFileSync(join(repo, "expected"), "different");
+  const failed = run();
+  assert.equal(failed.status, 17, failed.stdout + failed.stderr);
+  assert.match(failed.stdout, /RESULT FAIL exit=17/);
+});

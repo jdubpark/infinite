@@ -12,7 +12,7 @@ import {
   type Attention,
 } from "@infinite/attention";
 import { readEvents, unseal, writeSealed } from "./vault.js";
-import { ensureSocketDir, existingWorkerSocket, removeWorkerSockets, workerCall } from "./ipc.js";
+import { claimSocketDir, ensureSocketDir, existingWorkerSocket, removeWorkerSockets, workerCall } from "./ipc.js";
 import { SealedFileCache, listedSavedState, listedSession, savedState, unavailableState, type ListedSession, type SavedStatus } from "./session-listing.js";
 import { assertRunnerDeployment } from "./deployment.js";
 import { DEFAULT_HOOKS } from "./config.js";
@@ -171,8 +171,8 @@ export class Manager {
   private readonly pendingCreates = new Set<string>();
   private createAdmission: Promise<unknown> = Promise.resolve();
   readonly hostLoad: HostLoadGate;
-  readonly socketDir: string;
-  readonly socketTarget: Pick<Config, "runDir" | "socketDir">;
+  readonly socketDir: string; readonly socketTarget: Pick<Config, "runDir" | "socketDir">;
+  private readonly releaseSocketDir: () => void;
   private readonly handoffProjects = new Map<string, string>();
   private fuse?: FuseGate;
   private readonly listedMeta = new SealedFileCache<ListedSession>((id, raw) => listedSession(unseal<StoredSession>(this.key, `${id}:meta`, raw).session));
@@ -220,26 +220,27 @@ export class Manager {
     const configuredSocketDir = options?.socketDir ?? config.socketDir;
     this.socketDir = ensureSocketDir(configuredSocketDir ?? config.runDir, configuredSocketDir !== undefined ? "socketDir" : "runDir");
     this.socketTarget = { runDir: config.runDir, socketDir: this.socketDir };
-    this.hostLoad = new HostLoadGate(config.hostLoad, hostProbe);
-    mkdirSync(join(config.stateDir, "sessions"), {
-      recursive: true,
-      mode: 0o700,
-    });
-    const deletedDir = join(config.stateDir, "deleted-sessions");
-    mkdirSync(deletedDir, { recursive: true, mode: 0o700 });
-    for (const name of readdirSync(deletedDir).filter(name => /^[a-f0-9-]{36}\.sealed$/i.test(name))) {
-      const id = name.slice(0, -7);
-      let receipt: DeletedSessionReceipt;
-      try {
-        receipt = unseal<DeletedSessionReceipt>(key, `deleted:${id}`, readFileSync(join(deletedDir, name), "utf8"));
-      } catch {
-        continue;
+    this.releaseSocketDir = claimSocketDir(this.socketDir, config.runDir);
+    try {
+      this.hostLoad = new HostLoadGate(config.hostLoad, hostProbe);
+      mkdirSync(join(config.stateDir, "sessions"), { recursive: true, mode: 0o700 });
+      const deletedDir = join(config.stateDir, "deleted-sessions");
+      mkdirSync(deletedDir, { recursive: true, mode: 0o700 });
+      for (const name of readdirSync(deletedDir).filter(name => /^[a-f0-9-]{36}\.sealed$/i.test(name))) {
+        const id = name.slice(0, -7);
+        let receipt: DeletedSessionReceipt;
+        try {
+          receipt = unseal<DeletedSessionReceipt>(key, `deleted:${id}`, readFileSync(join(deletedDir, name), "utf8"));
+        } catch {
+          continue;
+        }
+        if (receipt.id !== id || !/^[a-f0-9]{64}$/.test(receipt.fingerprint)) continue;
+        rmSync(join(config.stateDir, "sessions", id), { recursive: true, force: true });
       }
-      if (receipt.id !== id || !/^[a-f0-9]{64}$/.test(receipt.fingerprint)) continue;
-      rmSync(join(config.stateDir, "sessions", id), { recursive: true, force: true });
-    }
-    mkdirSync(config.runDir, { recursive: true, mode: 0o700 });
+      mkdirSync(config.runDir, { recursive: true, mode: 0o700 });
+    } catch (error) { this.releaseSocketDir(); throw error; }
   }
+  close() { this.releaseSocketDir(); }
   private deletedReceiptPath(id: string) { return join(this.config.stateDir, "deleted-sessions", `${id}.sealed`); }
   private sessionDirEntry(id: string): string | undefined {
     const lower = id.toLowerCase();

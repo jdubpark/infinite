@@ -363,7 +363,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     try { return permissionAgent.pipeline && permissionDelivery.active() && permissionCore.readiness().ready ? "active" as const : "inactive" as const; }
     catch { return "inactive" as const; }
   };
-  const headlessChannel = new HeadlessPermissionChannel({ key, runDir: manager.socketDir, sessions: manager, services: permissionAgent,
+  const headlessChannel = new HeadlessPermissionChannel({ key, runDir: manager.socketDir, legacyRunDir: config.runDir, sessions: manager, services: permissionAgent,
     teamLive: session => teams.permissionAgentLive(session), teamTask: session => teams.permissionAgentTask(session) });
   permissionAgent.headless = headlessChannel;
   manager.useHeadlessChannel(headlessChannel);
@@ -2113,7 +2113,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     void mainCheck?.start().catch(() => {});
   });
   server.once("close", () => {
-    headlessChannel.close();
+    headlessChannel.close(); manager.close();
     void mcp?.close();
     teams.close();
     usage.close();
@@ -2139,7 +2139,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { const mainCheckClosed = mainCheck?.close() ?? Promise.resolve(); routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); const teamsClosed = teams.close(); halt.stop(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.allSettled([teamsClosed, mainCheckClosed, mcp?.close(), repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(results => { const failed = results.find(result => result.status === "rejected"); if (failed) throw failed.reason; }); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  const closeConnections = () => { const mainCheckClosed = mainCheck?.close() ?? Promise.resolve(); routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); const teamsClosed = teams.close(); halt.stop(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.allSettled([teamsClosed, mainCheckClosed, mcp?.close(), repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(results => { const failed = results.find(result => result.status === "rejected"); if (failed) throw failed.reason; }); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); manager.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, mcpServer: mcp?.server, closeConnections, fuse, halt, mainCheck,
     permissions: { holder: (sessionId: string, promptId: number) => sessionPermissions.holder(sessionId, promptId),
       ownerClass: (sessionId: string, promptId: number) => permissionDelivery.ownerClass(sessionId, promptId) }, permissionAgent };

@@ -3,6 +3,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { chmodSync, lstatSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { matchDestructive } from "@infinite/attention";
+import { MAX_SOCKET_PATH_BYTES, isTrustedPrivateDir } from "./ipc.js";
 import { headlessLaunch } from "./launch.js";
 import { REJECT_CODES, requesterNotice, type InterruptClass, type RejectCode } from "./permission-policy.js";
 import { teamPermissionAssignment } from "./team-permission-adapter.js";
@@ -151,10 +152,12 @@ type Sessions = {
 };
 
 export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
-  private server?: Server;
+  private servers: Server[] = [];
+  private closed = false;
   constructor(private readonly options: {
     key: Buffer;
     runDir: string;
+    legacyRunDir?: string;
     sessions: Sessions;
     services: PermissionAgentServices;
     teamLive?: (session: Session) => boolean;
@@ -222,9 +225,11 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
     return { record: { channel: true, ...(shape.allowlist.length ? { allowlist: shape.allowlist } : {}) }, bootstrap: { socket: channelSocketPath(this.options.runDir) } };
   }
 
-  listen(): Promise<void> {
-    const path = channelSocketPath(this.options.runDir);
-    try { if (lstatSync(path).isSocket()) rmSync(path); } catch {}
+  private bindSocket(path: string): Promise<Server> {
+    try {
+      const info = lstatSync(path);
+      if (!info.isSymbolicLink() && info.isSocket()) rmSync(path);
+    } catch {}
     const server = createServer(connection => {
       let data = "";
       connection.setTimeout(10_000, () => connection.destroy());
@@ -244,17 +249,58 @@ export class HeadlessPermissionChannel implements PermissionHeadlessChannel {
         );
       });
     });
-    this.server = server;
     return new Promise((resolve, reject) => {
       server.once("error", reject);
       server.listen(path, () => {
         try { chmodSync(path, 0o600); } catch {}
-        resolve();
+        resolve(server);
       });
     });
   }
 
-  close() { this.server?.close(); this.server = undefined; }
+  private legacySocketPath(): string | undefined {
+    const legacy = this.options.legacyRunDir;
+    if (!legacy) return undefined;
+    const trusted = isTrustedPrivateDir(legacy);
+    if (!trusted) return undefined;
+    try {
+      if (realpathSync(trusted) === realpathSync(this.options.runDir)) return undefined;
+    } catch {
+      return undefined;
+    }
+    const candidate = channelSocketPath(trusted);
+    return Buffer.byteLength(candidate) <= MAX_SOCKET_PATH_BYTES ? candidate : undefined;
+  }
+
+  async listen(): Promise<void> {
+    this.closed = false;
+    const paths = [channelSocketPath(this.options.runDir)];
+    const legacy = this.legacySocketPath();
+    if (legacy) paths.push(legacy);
+    const bound: Server[] = [];
+    try {
+      for (const path of paths) {
+        if (this.closed) break;
+        const server = await this.bindSocket(path);
+        if (this.closed) {
+          server.close();
+          break;
+        }
+        bound.push(server);
+        this.servers.push(server);
+      }
+    } catch (error) {
+      for (const server of bound) server.close();
+      this.servers = this.servers.filter(server => !bound.includes(server));
+      throw error;
+    }
+  }
+
+  close() {
+    this.closed = true;
+    for (const server of this.servers) server.close();
+    this.servers = [];
+  }
 
   async handle(raw: unknown): Promise<ChannelReply> {
     const request = raw as ChannelRequest;

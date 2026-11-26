@@ -22,7 +22,7 @@ import { Notifier } from "./notifier.js";
 import { sampleVolumes } from "./desktop.js";
 import { expoSender } from "./push.js";
 import { DEFAULT_HOOKS, readConfig, hashToken, machineLabelSchema } from "./config.js";
-import { workerCall } from "./ipc.js";
+import { claimSocketDir, ensureSocketDir, workerCall } from "./ipc.js";
 import { Manager } from "./manager.js";
 import { parseDeployment } from "./deployment.js";
 import { planFleet } from "./fleet.js";
@@ -415,10 +415,14 @@ else if (command === "plan-fleet") {
     const fd = openSync(lock, "wx", 0o600);
     writeFileSync(fd, String(process.pid));
     closeSync(fd);
-    const unlock = () => { try { unlinkSync(lock); } catch {} };
+    let releaseSocketDir: (() => void) | undefined;
+    const unlock = () => { try { releaseSocketDir?.(); } catch {} try { unlinkSync(lock); } catch {} };
     let host: ReturnType<typeof createApp>;
-    try { host = createApp(config, key, { configFile }); }
-    catch (error) { unlock(); throw error; }
+    try {
+      const targetSocketDir = ensureSocketDir(config.socketDir ?? config.runDir, config.socketDir !== undefined ? "socketDir" : "runDir");
+      releaseSocketDir = claimSocketDir(targetSocketDir, config.runDir);
+      host = createApp(config, key, { configFile });
+    } catch (error) { unlock(); throw error; }
     const { sessions, teams, goals, pushStore, server, mcpServer, closeConnections, fuse, permissions, mainCheck } = host;
     let stopping: Promise<void> | undefined;
     const stop = () => stopping ??= (async () => {

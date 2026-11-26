@@ -48,6 +48,7 @@ function rig(options: { eval?: boolean } = {}) {
     labels: () => existsSync(marks) ? readFileSync(marks, "utf8").split("\n").filter(Boolean) : [],
     close: async () => {
       await stopSessionWorkers(config);
+      manager.close();
       await new Promise(done => setTimeout(done, 1000));
       rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       rmSync(socketDir, { recursive: true, force: true });

@@ -6,7 +6,16 @@ import type { TrialEnding } from "./eval-types.js";
 import { POINTS_ALGORITHM_VERSION, teamRoutingSchema } from "./routing-policy.js";
 import { intentCheckReportSchema } from "./intent-report.js";
 import { judgementReportSchema, type Judgement, type JudgeEnding } from "./judge-types.js";
-import { criteriaRowsSchema, verdictReportSchema, type RunAssessment } from "./verdict-types.js";
+import { verdictReportSchema, type RunAssessment } from "./verdict-types.js";
+import {
+  CRITERIA_LABEL_BYTES,
+  CRITERIA_ROWS_MAX,
+  ID_RE,
+  SHARED_INPUT_LIMITS,
+  criteriaRowsSchema,
+  idSchema,
+  ownedPathSchema,
+} from "./schema-primitives.js";
 import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema } from "./question-recommendation.js";
 import type { RoutingKnobs, TeamRunRouting } from "./routing-types.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
@@ -229,12 +238,12 @@ export const teamVerificationSchema = z.object({
 }).strict();
 export type TeamVerification = z.infer<typeof teamVerificationSchema>;
 const modelProfileFields = {
-  id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/),
+  id: z.string().regex(ID_RE),
   label: z.string().trim().min(1).max(100),
   model: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$/),
   tier: z.enum(["light", "strong"]).optional(),
   dataUse: z.enum(["standard", "contributor"]).optional(),
-  limitFallback: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional(),
+  limitFallback: z.string().regex(ID_RE).optional(),
 };
 const effort = z.enum(["low", "medium", "high", "xhigh", "max"]);
 export const teamModelProfileSchema = z.discriminatedUnion("provider", [
@@ -387,13 +396,13 @@ export const createTeamSchema = z.object({
   provider: z.enum(["claude", "codex", "grok", "opencode", "demo"]),
   useConfiguredLineup: z.boolean().optional(),
   title: z.string().trim().min(1).max(100),
-  objective: z.string().trim().min(1).max(24000),
+  objective: z.string().trim().min(1).max(SHARED_INPUT_LIMITS.runObjectiveChars),
   parallelism: z.number().int().min(1).max(4).default(2),
 }).strict();
 export type CreateTeam = z.infer<typeof createTeamSchema>;
-export const teamMutationSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000) }).strict();
+export const teamMutationSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(SHARED_INPUT_LIMITS.steeringChars) }).strict();
 export const teamDeliveryReconcileSchema = z.object({
-  requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000),
+  requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(SHARED_INPUT_LIMITS.steeringChars),
   failedOperation: z.object({ pendingId: z.uuid(), headCommit: commitHashSchema,
     attestation: z.object({ boundary: z.literal("delivery-preparation"), processesStopped: z.literal(true), text: z.string().trim().min(1).max(4000) }).strict() }).strict().optional(),
 }).strict();
@@ -408,25 +417,24 @@ export type TeamMemberRetire = z.infer<typeof teamMemberRetireSchema>;
 export const teamActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
 export const teamProcessesEndedSchema = z.object({ requestId: z.uuid() }).strict();
 export type TeamProcessesEnded = z.infer<typeof teamProcessesEndedSchema>;
-export const teamContinueSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000).optional() }).strict();
+export const teamContinueSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(SHARED_INPUT_LIMITS.steeringChars).optional() }).strict();
 export type TeamContinue = z.infer<typeof teamContinueSchema>;
 export const teamTaskRatingSchema = z.object({ requestId: z.uuid(), score: z.number().int().min(1).max(5), note: z.string().trim().max(1000).optional() }).strict();
 export const teamParallelismSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), parallelism: z.number().int().min(1).max(4) }).strict();
 export type TeamParallelism = z.infer<typeof teamParallelismSchema>;
-const taskId = z.string().regex(/^[a-z][a-z0-9-]{0,39}$/);
+const taskId = idSchema;
 export const taskIdSchema = taskId;
-const ownedPath = z.string().min(1).max(300).refine(value => !value.startsWith("/") && !value.includes("\\") && !value.includes("\0") && !value.split("/").some(part => part === ".." || part === ".git" || part === "." || part === ""), "Use a repository-relative file or directory without glob syntax").refine(value => !/[*?\[\]:]/.test(value));
-export const ownedPathSchema = ownedPath;
+export { ownedPathSchema };
 export const RECORD_DIGEST_BYTES = 6 * 1024;
 export const RECORD_REGISTER_BYTES = 6 * 1024;
 export const registerDigestSchema = z.strictObject({
   assumptions: z.array(z.strictObject({
-    id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/),
+    id: z.string().regex(ID_RE),
     status: z.enum(["refuted", "unchecked", "assumed", "verified"]),
     criticality: z.enum(["outcome", "plan", "detail"]),
     statement: z.string(),
   })).max(32),
-  questions: z.array(z.strictObject({ id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), text: z.string() })).max(8),
+  questions: z.array(z.strictObject({ id: z.string().regex(ID_RE), text: z.string() })).max(8),
   omitted: z.number().int().min(1).max(40).optional(),
 }).superRefine((register, context) => {
   register.assumptions.forEach((item, index) => {
@@ -441,16 +449,16 @@ export const registerDigestSchema = z.strictObject({
 });
 export type RegisterDigest = z.infer<typeof registerDigestSchema>;
 export function registerDigestBytes(register: RegisterDigest): number { return Buffer.byteLength(JSON.stringify(register)); }
-export const RECORD_LABEL_BYTES = 120;
+export const RECORD_LABEL_BYTES = CRITERIA_LABEL_BYTES;
 export const recordDigestSchema = z.strictObject({
   version: z.number().int().min(1).max(1_000_000),
   criteria: z.array(z.strictObject({
-    id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/),
+    id: z.string().regex(ID_RE),
     statement: z.string(),
     check: z.string(),
     producer: z.enum(["host", "evaluator", "owner"]),
     derived: z.literal(true).optional(),
-  })).min(1).max(8),
+  })).min(1).max(CRITERIA_ROWS_MAX),
   register: registerDigestSchema.optional(),
 }).superRefine((digest, context) => {
   const [first, ...rest] = digest.criteria;
@@ -470,10 +478,10 @@ export type RecordDigest = z.infer<typeof recordDigestSchema>;
 export function recordDigestBytes(digest: RecordDigest): number { return Buffer.byteLength(JSON.stringify({ version: digest.version, criteria: digest.criteria })); }
 export const teamGoalContextSchema = z.object({
   id: z.uuid(), revision: z.number().int().min(1), cycle: z.number().int().min(1),
-  successCriteria: z.string().trim().min(1).max(8000),
-  nonGoals: z.array(z.string().trim().min(1).max(1000)).max(20),
-  allowedPaths: z.array(z.union([z.literal("."), ownedPath])).min(1).max(32),
-  evidence: z.array(z.string().trim().min(1).max(2000)).max(20),
+  successCriteria: z.string().trim().min(1).max(SHARED_INPUT_LIMITS.goalContextSuccessCriteriaChars),
+  nonGoals: z.array(z.string().trim().min(1).max(SHARED_INPUT_LIMITS.nonGoalChars)).max(SHARED_INPUT_LIMITS.nonGoals),
+  allowedPaths: z.array(z.union([z.literal("."), ownedPathSchema])).min(1).max(SHARED_INPUT_LIMITS.allowedPaths),
+  evidence: z.array(z.string().trim().min(1).max(SHARED_INPUT_LIMITS.evidenceChars)).max(SHARED_INPUT_LIMITS.evidence),
   sourceIssue: z.object({ id: z.uuid(), identifier: z.string().max(100), url: z.url(), title: z.string().max(1000), description: z.string().max(24000).nullable() }).strict().optional(),
   previousWork: z.array(z.string().trim().min(1).max(2000)).max(16),
   deadlineAt: z.iso.datetime(), maxMembers: z.number().int().min(1).max(60), parentRunId: z.uuid().optional(),
@@ -502,11 +510,11 @@ export const teamAcceptanceEvidenceSchema = z.object({
   evidence: z.string().trim().min(1).max(600),
 }).strict();
 export type TeamAcceptanceEvidence = z.infer<typeof teamAcceptanceEvidenceSchema>;
-export const teamScoutPlanSchema = z.object({ id: taskId, title: z.string().trim().min(1).max(100), instructions: z.string().trim().min(1).max(4000), agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional() }).strict();
+export const teamScoutPlanSchema = z.object({ id: taskId, title: z.string().trim().min(1).max(100), instructions: z.string().trim().min(1).max(4000), agentProfileId: z.string().regex(ID_RE).optional() }).strict();
 export type TeamScoutPlan = z.infer<typeof teamScoutPlanSchema>;
 export const teamTaskCriterionRefsSchema = z.strictObject({
   objectiveVersion: z.number().int().min(1).max(1_000_000),
-  criteria: z.array(z.string().regex(/^[a-z][a-z0-9-]{0,39}$/)).min(1).max(8),
+  criteria: z.array(z.string().regex(ID_RE)).min(1).max(CRITERIA_ROWS_MAX),
 }).superRefine((refs, context) => {
   if (new Set(refs.criteria).size !== refs.criteria.length)
     context.addIssue({ code: "custom", path: ["criteria"], message: "A task may name each objective criterion only once." });
@@ -517,8 +525,8 @@ export const teamTaskPlanSchema = z.object({
   id: taskId,
   title: z.string().trim().min(1).max(100),
   instructions: z.string().trim().min(1).max(8000),
-  agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional(),
-  paths: z.array(ownedPath).min(1).max(32),
+  agentProfileId: z.string().regex(ID_RE).optional(),
+  paths: z.array(ownedPathSchema).min(1).max(SHARED_INPUT_LIMITS.allowedPaths),
   dependsOn: z.array(taskId).max(12),
   criterionRefs: teamTaskCriterionRefsSchema.optional(),
   kind: z.enum(TASK_KINDS).optional(),
@@ -547,7 +555,7 @@ const sharedTeamReportVariants = [
   z.object({ kind: z.literal("explore"), summary: z.string().min(1).max(4000), parallelism: z.number().int().min(1).max(4).optional(), tasks: z.array(teamScoutPlanSchema).min(1).max(3) }).strict(),
   z.object({ kind: z.literal("findings"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
   z.object({ kind: z.literal("no-change"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
-  z.object({ kind: z.literal("escalate"), agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional(), reason: z.string().min(1).max(4000) }).strict(),
+  z.object({ kind: z.literal("escalate"), agentProfileId: z.string().regex(ID_RE).optional(), reason: z.string().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("result"), summary: z.string().min(1).max(8000) }).strict(),
   z.object({ kind: z.literal("review"), verdict: z.enum(["approved", "changes-requested"]), summary: z.string().min(1).max(8000), uiEvidence: z.string().trim().min(1).max(4000).optional(), acceptance: z.array(teamAcceptanceEvidenceSchema).max(8).optional(), rubric: z.array(z.object({ taskId, correctness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), cleanliness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), extensibility: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), docs: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict() }).strict()).max(12).optional() }).strict(),
   z.object({ kind: z.literal("delivery"), headCommit: commitHashSchema, pullRequestUrl: z.string().trim().min(1).max(500), mergeCommit: commitHashSchema, summary: z.string().trim().min(1).max(4000) }).strict(),
@@ -729,6 +737,7 @@ export interface TeamRun {
   status: TeamStatus;
   createdAt: string;
   updatedAt: string;
+  lastActivityAt?: string;
   workspace: string;
   branch: string;
   baseCommit: string;
@@ -746,6 +755,7 @@ export interface TeamRun {
   round: number;
 }
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permissionRecovery"> & {
+  lastActivityAt: string;
   pendingOperation?: TeamPendingOperation;
   leftoverProcesses?: TeamLeftoverProcesses;
   members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback" | "goalCriteriaPlan">[];

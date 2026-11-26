@@ -6,6 +6,7 @@ import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { autonomyStartEvent, startMode } from "./evaluator-profiles.js";
 import { TeamService, TeamError } from "./teams.js";
 import { goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalParallelismSchema, goalSteerSchema, parseCreateGoal, type CreateGoal, type CycleClass, type GoalCycle, type GoalOutcomeInput, type GoalReasonCode, type ProductGoal } from "./goal-types.js";
+import { SHARED_INPUT_LIMITS } from "./schema-primitives.js";
 import type { Config } from "./types.js";
 import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type CreateTeam, type TeamGoalContext, type TeamView } from "./team-types.js";
 import { addRollups, emptyRollup, type StoredRollup, type UsageRollup } from "./team-usage.js";
@@ -230,7 +231,7 @@ export class GoalService {
       }
       admit?.();
       if (!this.enabled()) throw new TeamError(409, "goals-not-configured", "Configure a team lineup with a strong coordinator and reviewer before starting a goal.");
-      if (Buffer.byteLength(JSON.stringify(payload)) > 40000) throw new TeamError(409, "goal-too-large", "Keep the goal and evidence below 40 KiB. Link to longer source material.");
+      if (Buffer.byteLength(JSON.stringify(payload)) > SHARED_INPUT_LIMITS.goalPayloadBytes) throw new TeamError(409, "goal-too-large", "Keep the goal and evidence below 40 KiB. Link to longer source material.");
       const project = this.config.projects.find(value => value.id === request.projectId);
       if (!project?.team || (!project.team.checks.length && !project.team.establishChecks)) throw new TeamError(409, "goal-project-not-configured", "Configure required checks or authorize the team to establish them before a goal can start.");
       if (request.linearIssueId && !project.linear) throw new TeamError(409, "linear-not-configured", "Configure Linear for this project before linking an issue.");
@@ -477,7 +478,7 @@ export class GoalService {
       if (this.replay(stored, "steer", body)) return structuredClone(goal);
       if (!["running", "needs-input"].includes(goal.status)) throw new TeamError(409, "goal-not-running", "Resume the goal before sending direction, or start a new goal if it has stopped.");
       if (stored.launch) throw new TeamError(409, "goal-launch-pending", "The next feature is being attached. Retry this direction after it appears.");
-      if (goal.steering.length >= 20 || Buffer.byteLength([goal.objective, ...goal.steering.map(item => `User direction: ${item.text}`), `User direction: ${body.text}`].join("\n\n")) > 24000)
+      if (goal.steering.length >= SHARED_INPUT_LIMITS.steeringEntries || Buffer.byteLength([goal.objective, ...goal.steering.map(item => `User direction: ${item.text}`), `User direction: ${body.text}`].join("\n\n")) > SHARED_INPUT_LIMITS.goalSteeringBytes)
         throw new TeamError(409, "goal-steering-limit", "Start a new goal with consolidated directions.");
       this.admit(stored, "steer", body);
       goal.steering.push({ text: body.text, revision: goal.revision, at: now() });
@@ -552,7 +553,7 @@ export class GoalService {
           if (stored.goal.status !== "blocked" || stored.goal.reason !== reason) this.event(stored, reason);
           if (!["paused", "cancelled", "limit-reached"].includes(stored.goal.status)) this.block(stored, reason);
           else stored.goal.reason = reason;
-          this.save(stored);
+          try { this.save(stored); } catch {}
         }
       })).catch(() => {}).finally(() => { this.tickQueued = false; this.activeTicks.delete(run); });
       this.activeTicks.add(run);
@@ -564,6 +565,12 @@ export class GoalService {
     if (this.timer) clearInterval(this.timer);
     while (this.activeTicks.size > 0) await Promise.allSettled([...this.activeTicks]);
     await this.queues.drain();
+  }
+  async idle(): Promise<void> {
+    while (this.activeTicks.size > 0 || this.queues.size > 0) {
+      if (this.activeTicks.size > 0) await Promise.allSettled([...this.activeTicks]);
+      if (this.queues.size > 0) await this.queues.settle();
+    }
   }
   private refresh(stored: Stored, team: TeamView) {
     const cycle = stored.goal.cycles.find(value => value.teamId === team.id)!;

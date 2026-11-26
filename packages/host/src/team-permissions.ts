@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { accountSettingPrompt, dialogCommand, oneShotPermissionOption, type Prompt } from "@infinite/attention";
+import { accountSettingPrompt, dialogCommand, hasTruncatedEvidence, oneShotPermissionOption, type Prompt } from "@infinite/attention";
 import type { WorkerError } from "./ipc.js";
 import type { PermissionRequestShape } from "./permission-agent-types.js";
 import { ContentError } from "./session-content.js";
@@ -38,17 +38,10 @@ export function permissionRequestShape(prompt: Prompt): PermissionRequestShape {
 }
 
 function completeDialogEvidence(prompt: Prompt): boolean {
-  if (prompt.kind !== "permission" || !prompt.hash || truncated(prompt.detail)) return false;
+  if (prompt.kind !== "permission" || !prompt.hash || hasTruncatedEvidence(prompt.detail)) return false;
   if (prompt.tool) return Boolean(prompt.tool.name) && prompt.tool.inputComplete === true &&
-    Object.keys(prompt.tool.input).length > 0 && !truncated(prompt.tool.input);
+    Object.keys(prompt.tool.input).length > 0 && !hasTruncatedEvidence(prompt.tool.input);
   return prompt.source === "screen" && prompt.pinned === true && dialogCommand(prompt) !== undefined;
-}
-
-function truncated(value: unknown): boolean {
-  if (typeof value === "string") return /(?:…|\.\.\.)\s*\[\+\d+ chars\]$/.test(value) || value === "[truncated]";
-  if (Array.isArray(value)) return value.length >= 50 || value.some(truncated);
-  if (value && typeof value === "object") return Object.values(value).some(truncated);
-  return false;
 }
 
 export function permissionAction(prompt: Prompt): string {

@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   ContextTouches,
   extractTouches,
+  hostProviderCapabilities,
+  providerObservesToolInputs,
   type TouchPage,
   type TouchSource,
 } from "../packages/host/src/context-touches.js";
@@ -373,4 +375,26 @@ test("a journal read that throws frees its slot and the session can be read agai
   assert.equal(again.complete, true);
   assert.equal(other.complete, true);
   assert.equal(reading, 0);
+});
+
+test("host provider capabilities report tool-input observability consistently with touch extraction", () => {
+  assert.equal(providerObservesToolInputs("claude"), true);
+  assert.equal(providerObservesToolInputs("codex"), true);
+  assert.equal(providerObservesToolInputs("opencode"), false);
+  assert.equal(providerObservesToolInputs("grok"), false);
+  assert.equal(providerObservesToolInputs("demo"), false);
+  assert.equal(providerObservesToolInputs("unknown"), false);
+  assert.deepEqual(hostProviderCapabilities(false), {
+    claude: { observesToolInputs: true },
+    codex: { observesToolInputs: true },
+    grok: { observesToolInputs: false },
+    opencode: { observesToolInputs: false },
+  });
+  assert.deepEqual(hostProviderCapabilities(true), {
+    claude: { observesToolInputs: true },
+    codex: { observesToolInputs: true },
+    grok: { observesToolInputs: false },
+    opencode: { observesToolInputs: false },
+    demo: { observesToolInputs: false },
+  });
 });

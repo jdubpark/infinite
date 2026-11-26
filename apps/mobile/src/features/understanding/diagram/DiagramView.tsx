@@ -2,7 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import { Animated, Modal, Pressable, ScrollView, StyleSheet, Text, View, type LayoutChangeEvent } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Svg, { G, Line, Path, Rect, Text as SvgText } from "react-native-svg";
-import { layoutDiagram, NODE_H, NODE_W, type Diagram, type DiagramLayout } from "@infinite/remote";
+import { describeDiagram, layoutDiagram, normalizeDiagram, relatedDiagramGroups, NODE_H, NODE_W, type Diagram, type DiagramLayout } from "@infinite/remote";
 import { Button } from "../../../components/Button";
 import { theme } from "../../../theme";
 import { ArrowMarker, NodeShape } from "./shapes";
@@ -12,17 +12,6 @@ const DEFAULT_HEIGHT = 260;
 const EDGE_OPACITY = 0.35;
 const CONTROLS_HEIGHT = 42;
 const DETAIL_HEIGHT = 48;
-
-function describeDiagram(diagram: Diagram): string {
-  const changes = diagram.nodes.reduce((counts, node) => {
-    if (node.change) counts[node.change] += 1;
-    return counts;
-  }, { added: 0, modified: 0, removed: 0 });
-  const title = diagram.title || "Change map";
-  const count = diagram.sequence?.participants.length ?? diagram.nodes.length;
-  const relationships = diagram.sequence?.messages.length ?? diagram.edges.length;
-  return `${title}: ${count} components, ${changes.modified} modified, ${changes.added} added, ${changes.removed} removed; ${relationships} relationships`;
-}
 
 function contentKey(diagram: Diagram): string {
   const text = JSON.stringify([diagram.id, diagram.direction, diagram.nodes, diagram.edges, diagram.groups, diagram.sequence ?? null]);
@@ -70,6 +59,7 @@ function DiagramCanvas({ diagram, layout, height, onOpenComponent, onExpand }: {
     }
     return neighbors;
   }, [diagram.edges, diagram.sequence?.messages, selectedId]);
+  const relatedGroups = useMemo(() => relatedDiagramGroups(diagram, selectedId), [diagram, selectedId]);
   const measureFrameOrigin = () => frameRef.current?.measureInWindow((x, y) =>
     setFrameOrigin(current => current.x === x && current.y === y ? current : { x, y }));
   const onFrameLayout = (event: LayoutChangeEvent) => {
@@ -118,7 +108,7 @@ function DiagramCanvas({ diagram, layout, height, onOpenComponent, onExpand }: {
           </G>;
         }) : null}
         {layout.groups.map(group => {
-          const related = !selectedId || diagram.nodes.some(node => node.group === group.id && neighborIds.has(node.id));
+          const related = !selectedId || relatedGroups.has(group.id);
           const groupOpacity = related ? 1 : EDGE_OPACITY;
           return <G key={`group-${group.id}`}>
             <Rect x={group.x} y={group.y} width={group.w} height={group.h} rx={10} fill="none" stroke={theme.colors.fieldRule}
@@ -193,23 +183,24 @@ export function DiagramView({ diagram, height = DEFAULT_HEIGHT, onOpenComponent 
   const [expanded, setExpanded] = useState(false);
   const [expandedSpaceHeight, setExpandedSpaceHeight] = useState(0);
   const insets = useSafeAreaInsets();
-  const layout = useMemo(() => diagram.parseError
+  const normalized = useMemo(() => normalizeDiagram(diagram), [diagram]);
+  const layout = useMemo(() => normalized.parseError
     ? { width: 1, height: 1, nodes: [], edges: [], groups: [] } satisfies DiagramLayout
-    : layoutDiagram(diagram), [diagram]);
+    : layoutDiagram(normalized), [normalized]);
   const onExpandedSpaceLayout = (event: LayoutChangeEvent) => setExpandedSpaceHeight(event.nativeEvent.layout.height);
   const expandedCanvasHeight = Math.max(DEFAULT_HEIGHT, expandedSpaceHeight - CONTROLS_HEIGHT - DETAIL_HEIGHT);
 
   return <View style={s.card}>
-    <DiagramCanvas diagram={diagram} layout={layout} height={height} onOpenComponent={onOpenComponent}
+    <DiagramCanvas diagram={normalized} layout={layout} height={height} onOpenComponent={onOpenComponent}
       onExpand={() => setExpanded(true)} />
     <Modal visible={expanded} animationType="slide" onRequestClose={() => setExpanded(false)} statusBarTranslucent navigationBarTranslucent>
       <View style={[s.modal, { paddingTop: insets.top + 12, paddingBottom: insets.bottom + 12 }]}>
         <View style={s.modalHeader}>
-          <Text accessibilityRole="header" numberOfLines={1} style={s.modalTitle}>{diagram.title}</Text>
+          <Text accessibilityRole="header" numberOfLines={1} style={s.modalTitle}>{normalized.title}</Text>
           <Button title="Close" onPress={() => setExpanded(false)} secondary compact />
         </View>
         <View onLayout={onExpandedSpaceLayout} style={s.expandedContent}>
-          <DiagramCanvas diagram={diagram} layout={layout} height={expandedCanvasHeight} onOpenComponent={onOpenComponent ? componentId => {
+          <DiagramCanvas diagram={normalized} layout={layout} height={expandedCanvasHeight} onOpenComponent={onOpenComponent ? componentId => {
             setExpanded(false);
             onOpenComponent(componentId);
           } : undefined} />

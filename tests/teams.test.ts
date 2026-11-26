@@ -2585,8 +2585,8 @@ test("an identical approved permission request reuses the review and delivers on
       revision: target.revision, role: target.role } } });
     let deliveries = 0;
     let deliveredCoordinatorId: string | undefined;
-    (f.manager as any).answerTeamPermission = async (_sessionId: string, _requestId: string, _assignment: unknown, decision: { coordinatorMemberId?: string }) => {
-      deliveries++; deliveredCoordinatorId = decision.coordinatorMemberId;
+    (f.manager as any).answerTeamPermission = async (_sessionId: string, _requestId: string, _assignment: unknown, decision: { coordinatorMemberId?: string }, _current?: unknown, sourceCoordinatorMemberId?: string) => {
+      deliveries++; assert.equal(decision.coordinatorMemberId, undefined); deliveredCoordinatorId = sourceCoordinatorMemberId;
       return { requestId: _requestId, state: "delivered", result: "closed", seq: 1 };
     };
     f.writeTeam();

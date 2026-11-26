@@ -9,6 +9,7 @@ import type { ProjectGroup, ProjectGroupList, ProjectGroupRepo } from "./project
 import { expectedIdentity, readGit } from "./checkout-identity.js";
 import { agentModelClientEnvironment } from "./egress.js";
 import { failureReason } from "./failure-reason.js";
+import { signalGroup, watchLeader } from "./process-group.js";
 import { componentGraph, diagramFromMermaid, diagramGraphSchema, linkDiagramNodes } from "./understanding-diagrams.js";
 import { seal, unseal, writeSealed } from "./vault.js";
 import { CatalogError, understandingCatalogLimits } from "./understanding-catalog.js";
@@ -229,7 +230,7 @@ export class UnderstandingRuntime {
     if (this.lifecycle.kind === "closing") return this.lifecycle.done;
     if (this.lifecycle.timer) clearInterval(this.lifecycle.timer);
     for (const controller of this.controllers) controller.abort();
-    for (const child of this.children) this.stopChild(child);
+    for (const child of this.children) stopContextChild(child);
     this.queue = []; this.queued.clear();
     if (this.lifecycle.kind === "idle") {
       this.lifecycle = { kind: "closed" };
@@ -776,13 +777,7 @@ export class UnderstandingRuntime {
   }
 
   private async runContext(root: string, options: UnderstandingAdapterOptions): Promise<RepoContext> {
-    return runRepositoryContext(this.options.config, root, options, child => this.children.add(child), child => this.children.delete(child), child => this.stopChild(child));
-  }
-  private stopChild(child: ChildProcess) {
-    if (child.exitCode !== null || child.killed) return;
-    try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGTERM"); else child.kill("SIGTERM"); } catch { child.kill("SIGTERM"); }
-    const timer = setTimeout(() => { try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { child.kill("SIGKILL"); } }, 500);
-    timer.unref();
+    return runRepositoryContext(this.options.config, root, options, child => this.children.add(child), child => this.children.delete(child));
   }
 
   private binding(repo: ProjectGroupRepo, group: ProjectGroup): SourceBinding {
@@ -827,7 +822,7 @@ export class UnderstandingRuntime {
   }
 }
 
-export function runRepositoryContext(config: Config, root: string, options: UnderstandingAdapterOptions, onChild: (child: ChildProcess) => void = () => {}, onDone: (child: ChildProcess) => void = () => {}, stop: (child: ChildProcess) => void = stopContextChild): Promise<RepoContext> {
+export function runRepositoryContext(config: Config, root: string, options: UnderstandingAdapterOptions, onChild: (child: ChildProcess) => void = () => {}, onDone: (child: ChildProcess) => void = () => {}): Promise<RepoContext> {
   const briefing = config.repositoryBriefings;
   if (!briefing) return Promise.reject(new Error("repository-briefings-unavailable"));
   const commandArgs = [...briefing.args, "context", "--repo", root];
@@ -836,6 +831,7 @@ export function runRepositoryContext(config: Config, root: string, options: Unde
     try { child = spawn(briefing.command, commandArgs, { cwd: root, env: agentModelClientEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }); }
     catch { rejectPromise(new Error("context-spawn-failed")); return; }
     onChild(child);
+    const leader = watchLeader(child);
     let out = Buffer.alloc(0), stderrTail = Buffer.alloc(0), settled = false;
     const failed = (name: string) => new Error(failureReason(new Error(name), stderrTail.toString("utf8")));
     const finish = (error?: Error) => {
@@ -844,20 +840,22 @@ export function runRepositoryContext(config: Config, root: string, options: Unde
       try { resolvePromise(parseRepoContext(JSON.parse(out.toString("utf8")))); }
       catch (error) { rejectPromise(new Error(`context-output-invalid: ${error instanceof Error ? error.message : "invalid context"}`)); }
     };
-    const abort = () => { stop(child); finish(failed("context-aborted")); };
+    const abort = () => { stopContextChild(child); finish(failed("context-aborted")); };
     options.signal.addEventListener("abort", abort, { once: true });
     child.stdout?.on("data", (chunk: Buffer) => {
       out = Buffer.concat([out, chunk]);
-      if (out.length > Math.min(options.maxBytes, MAX_CONTEXT_BYTES)) { stop(child); finish(new Error("context-output-too-large")); }
+      if (out.length > Math.min(options.maxBytes, MAX_CONTEXT_BYTES)) { stopContextChild(child); finish(new Error("context-output-too-large")); }
     });
     child.stderr?.on("data", (chunk: Buffer) => { stderrTail = Buffer.concat([stderrTail, chunk]).subarray(-2048); });
     child.once("error", () => finish(new Error("context-process-error")));
-    child.once("close", code => { if (code !== 0) finish(failed("context-process-failed")); else finish(); });
+    child.once("close", code => {
+      if (leader.leftover) finish(failed("context-output-held"));
+      else if (code !== 0) finish(failed("context-process-failed"));
+      else finish();
+    });
   });
 }
 function stopContextChild(child: ChildProcess) {
-  if (child.exitCode !== null || child.killed) return;
-  try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGTERM"); else child.kill("SIGTERM"); } catch { child.kill("SIGTERM"); }
-  const timer = setTimeout(() => { try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { child.kill("SIGKILL"); } }, 500);
-  timer.unref();
+  if (signalGroup(child, "SIGTERM") === "leader-exited") return;
+  setTimeout(() => signalGroup(child, "SIGKILL"), 500).unref();
 }

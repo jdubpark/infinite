@@ -1,7 +1,7 @@
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -11,7 +11,7 @@ const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const temporaryDirectories: string[] = [];
 const templateFiles = ["agent-anchor.sh", "agent-env.sh", "agent-wrapper.sh", "config.example.json", "github-app-gh.sh",
   "infinite-github-refresh.service", "infinite-github-refresh.timer", "infinite.service", "infinite.sudoers", "infinite-tmpfiles.conf", "install-agent-env.sh",
-  "transcript-drain.sh", "process-census.sh"];
+  "jevcode-wrapper.sh", "process-census.sh", "repository-graph-wrapper.py", "transcript-drain.sh"];
 
 function tmp() {
   const path = mkdtempSync(join(tmpdir(), "infinite-instance-"));
@@ -81,7 +81,7 @@ test("no rendered file for an instance names the first instance", () => {
   const files = rendered(["--instance", "work"]);
   assert.deepEqual(files.map(([name]) => name).sort(), ["agent-anchor.sh", "agent-env.sh", "agent-wrapper.sh", "config.example.json", "github-app-gh.sh",
     "infinite-work-github-refresh.service", "infinite-work-github-refresh.timer", "infinite-work.service", "infinite-work.sudoers", "infinite-work-tmpfiles.conf", "install-agent-env.sh",
-    "process-census.sh", "transcript-drain.sh"].sort());
+    "jevcode-wrapper.sh", "process-census.sh", "repository-graph-wrapper.py", "transcript-drain.sh"].sort());
   for (const [name, text] of files)
     for (const pattern of first) assert.doesNotMatch(text, pattern, `${name} ${pattern}`);
 });
@@ -100,14 +100,15 @@ test("both sudoers files keep the mission assignment", () => {
   assert.match(file("infinite-work.sudoers"), /^Defaults:infinite-work-host env_keep \+= "[^"]*INFINITE_MISSION_ASSIGNMENT/m);
 });
 
-test("the instance drain wrapper runs the instance's relay, and the instance sudoers permits it and neither jevcode nor repository-graph", () => {
+test("the instance drain wrapper runs the instance's relay, and the instance sudoers permits instance-scoped jevcode and repository-graph", () => {
   const out = render(["--instance", "work"]);
   assert.match(readFileSync(join(out, "transcript-drain.sh"), "utf8"),
     /^exec \/usr\/local\/bin\/node \/opt\/infinite-work\/packages\/host\/dist\/hook-relay\.js drain$/m);
   const sudoers = readFileSync(join(out, "infinite-work.sudoers"), "utf8");
   assert.match(sudoers, /^infinite-work-host ALL=\(infinite-work-agent\) NOPASSWD: \/usr\/local\/libexec\/infinite-work\/transcript-drain ""$/m);
-  assert.match(sudoers, /NOPASSWD: \/usr\/local\/libexec\/infinite-work\/claude \*, /);
-  assert.doesNotMatch(sudoers, /jevcode|repository-graph/);
+  assert.match(sudoers, /NOPASSWD: \/usr\/local\/libexec\/infinite-work\/claude \*, .*\/usr\/local\/libexec\/infinite-work\/jevcode \*/);
+  assert.match(sudoers, /^infinite-work-host ALL=\(infinite-work-agent\) NOPASSWD: \/usr\/local\/libexec\/infinite-work\/repository-graph \*$/m);
+  assert.doesNotMatch(sudoers, /\/usr\/local\/libexec\/infinite\/(?:jevcode|repository-graph)/);
 });
 
 test("the instance census wrapper runs the instance's census, and the instance sudoers permits it", () => {
@@ -132,8 +133,6 @@ test("every deploy file with a first-instance path has a per-instance template o
     ["github-proxy.md", "the first instance's GitHub credential proxy; a second instance needs its own key, account, port, unit, and token directory"],
     ["public-relay.md", "the relay and the first instance's connection to it; instances.md registers an instance"],
     ["instances.md", "names first-instance paths to tell them apart from an instance's"],
-    ["jevcode-wrapper.sh", "repository briefings, which an instance runs without until an instance wrapper exists"],
-    ["repository-graph-wrapper.py", "the code graph, which an instance runs without until an instance wrapper exists"],
     ["grader.md", "the replay grader's runbook; a second instance changes each name by hand, as its third paragraph says"],
     ["grader.sudoers", "the first instance's grader rule; a second instance writes its own from grader.md"],
     ["eval-wrapper.sh", "the first instance's eval provider wrapper; rendering the eval files for an instance is a later slice"],
@@ -228,10 +227,11 @@ test("valid names that overlap template words are substituted only once", async 
   });
 });
 
-test("rendered shell files parse", () => {
+test("rendered shell and python wrappers parse", () => {
   const out = render(["--instance", "work"]);
-  for (const name of ["agent-wrapper.sh", "github-app-gh.sh", "install-agent-env.sh", "process-census.sh", "transcript-drain.sh"])
+  for (const name of ["agent-wrapper.sh", "github-app-gh.sh", "install-agent-env.sh", "jevcode-wrapper.sh", "process-census.sh", "transcript-drain.sh"])
     execFileSync("sh", ["-n", join(out, name)]);
+  execFileSync("python3", ["-c", "import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())", join(out, "repository-graph-wrapper.py")]);
 });
 
 test("the config skeleton has the teams and hostLoad blocks and the default session limit", () => {
@@ -264,4 +264,430 @@ test("bad and reserved names are refused", () => {
     assert.equal(result.status, 64, `${name}: ${result.stderr || result.stdout}`);
     assert.equal(`${result.stderr}${result.stdout}`.trim().split("\n").length, 1, name);
   }
+});
+
+test("rendered secondary jevcode and repository-graph wrappers scope every path to the instance", () => {
+  const out = render(["--instance", "work"]);
+  const jevcode = readFileSync(join(out, "jevcode-wrapper.sh"), "utf8");
+  for (const part of [
+    "WORKSPACES=/srv/infinite-data/instances/work/workspaces",
+    "TEAM_WORKSPACES=/srv/infinite-data/instances/work/team-workspaces",
+    "AGENT_HOME=/srv/infinite-data/instances/work/agent-home",
+    "TMPDIR=/srv/infinite-data/instances/work/tmp/agent",
+    "npm_config_store_dir=/srv/infinite-data/instances/work/agent-home/.pnpm-store",
+    "COREPACK_HOME=/srv/infinite-data/instances/work/agent-home/.cache/corepack",
+    "PATH=/srv/infinite-data/instances/work/agents/v1/bin:/usr/local/bin:/usr/bin:/bin",
+    "exec /usr/local/bin/node /opt/jevcode-repo-agent/dist/cli.js \"$@\"",
+  ]) assert.ok(jevcode.includes(part), part);
+
+  const graph = readFileSync(join(out, "repository-graph-wrapper.py"), "utf8");
+  for (const part of [
+    'WORKSPACES = Path("/srv/infinite-data/instances/work/workspaces")',
+    'TEAM_WORKSPACES = Path("/srv/infinite-data/instances/work/team-workspaces")',
+    'CACHE = Path("/srv/infinite-data/instances/work/repository-graphs")',
+    'BUILDER = "/opt/infinite-work/scripts/repository_graph.py"',
+    'GRAPHIFY = "/usr/local/bin/graphify"',
+    '"TMPDIR": "/srv/infinite-data/instances/work/tmp/agent"',
+  ]) assert.ok(graph.includes(part), part);
+});
+
+test("secondary and primary repository-graph wrappers enforce strict instance root isolation", () => {
+  const workOut = render(["--instance", "work"]);
+  const workWrapper = join(workOut, "repository-graph-wrapper.py");
+  const primaryWrapper = resolve("deploy/ubuntu/repository-graph-wrapper.py");
+  const runGraph = (script: string, args: string[], env?: NodeJS.ProcessEnv) =>
+    spawnSync("python3", [script, ...args], { encoding: "utf8", env });
+
+  const workRefusals: Array<[string, string[]]> = [
+    ["first-instance workspace", ["--repo", "/srv/infinite-data/workspaces/project-a", "--cache-dir", "/srv/infinite-data/instances/work/repository-graphs/lane/shared", "--ref", "HEAD"]],
+    ["first-instance team workspace", ["--repo", "/srv/infinite-data/team-workspaces/run-1/member", "--cache-dir", "/srv/infinite-data/instances/work/repository-graphs/lane/shared", "--ref", "HEAD"]],
+    ["first-instance cache", ["--repo", "/srv/infinite-data/instances/work/workspaces/project-a", "--cache-dir", "/srv/infinite-data/repository-graphs/lane/shared", "--ref", "HEAD"]],
+    ["first-instance seed cache", ["--repo", "/srv/infinite-data/instances/work/workspaces/project-a", "--cache-dir", "/srv/infinite-data/instances/work/repository-graphs/lane/run-1", "--seed-cache-dir", "/srv/infinite-data/repository-graphs/lane/shared", "--ref", "HEAD"]],
+    ["sibling instance workspace", ["--repo", "/srv/infinite-data/instances/other/workspaces/project-a", "--cache-dir", "/srv/infinite-data/instances/work/repository-graphs/lane/shared", "--ref", "HEAD"]],
+    ["traversal to first instance", ["--repo", "/srv/infinite-data/instances/work/workspaces/../../workspaces/project-a", "--cache-dir", "/srv/infinite-data/instances/work/repository-graphs/lane/shared", "--ref", "HEAD"]],
+    ["exact workspace root", ["--repo", "/srv/infinite-data/instances/work/workspaces", "--cache-dir", "/srv/infinite-data/instances/work/repository-graphs/lane/shared", "--ref", "HEAD"]],
+    ["prefix sibling root", ["--repo", "/srv/infinite-data/instances/work/workspaces-evil/project-a", "--cache-dir", "/srv/infinite-data/instances/work/repository-graphs/lane/shared", "--ref", "HEAD"]],
+    ["relative path", ["--repo", "project-a", "--cache-dir", "/srv/infinite-data/instances/work/repository-graphs/lane/shared", "--ref", "HEAD"]],
+    ["empty seed cache dir", ["--repo", "/srv/infinite-data/instances/work/workspaces/project-a", "--cache-dir", "/srv/infinite-data/instances/work/repository-graphs/lane/shared", "--seed-cache-dir", "", "--ref", "HEAD"]],
+  ];
+  for (const [label, args] of workRefusals) {
+    const result = runGraph(workWrapper, args);
+    assert.notEqual(result.status, 0, label);
+    assert.match(result.stderr, /Repository graph request refused: (?:The requested path is outside its assigned root|An absolute path is required)/, label);
+  }
+
+  const primaryRefusal = runGraph(primaryWrapper, ["--repo", "/srv/infinite-data/instances/work/workspaces/project-a", "--cache-dir", "/srv/infinite-data/repository-graphs/lane/shared", "--ref", "HEAD"]);
+  assert.notEqual(primaryRefusal.status, 0);
+  assert.match(primaryRefusal.stderr, /outside its assigned root/);
+
+  const sandbox = realpathSync(tmp());
+  const ws = join(sandbox, "workspaces");
+  const teamWs = join(sandbox, "team-workspaces");
+  const cacheRoot = join(sandbox, "repository-graphs");
+  const tmpAgent = join(sandbox, "tmp", "agent");
+  const repoA = join(ws, "project-a");
+  const teamRepo = join(teamWs, "run-1", "member");
+  const laneCache = join(cacheRoot, "lane", "shared");
+  const seedCache = join(cacheRoot, "lane", "seed");
+  const other = join(sandbox, "other");
+  const gitCmd = (cwd: string, args: string[]) => {
+    const res = spawnSync("git", args, {
+      cwd,
+      env: {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_AUTHOR_NAME: "deploy-test",
+        GIT_AUTHOR_EMAIL: "deploy-test@example.invalid",
+        GIT_COMMITTER_NAME: "deploy-test",
+        GIT_COMMITTER_EMAIL: "deploy-test@example.invalid",
+      },
+      encoding: "utf8",
+    });
+    assert.equal(res.status, 0, `git ${args.join(" ")}: ${res.stderr}`);
+  };
+  mkdirSync(repoA, { recursive: true });
+  mkdirSync(teamRepo, { recursive: true });
+  mkdirSync(laneCache, { recursive: true });
+  mkdirSync(seedCache, { recursive: true });
+  mkdirSync(tmpAgent, { recursive: true });
+  mkdirSync(other, { recursive: true });
+  gitCmd(repoA, ["init", "--quiet"]);
+  gitCmd(teamRepo, ["init", "--quiet"]);
+  symlinkSync(other, join(ws, "out-link"));
+  symlinkSync(repoA, join(ws, "in-link"));
+
+  const externalGit = join(sandbox, "external-repo");
+  mkdirSync(externalGit, { recursive: true });
+  gitCmd(externalGit, ["init", "--quiet"]);
+  gitCmd(externalGit, ["commit", "--quiet", "--allow-empty", "-m", "init"]);
+  const linkedWorktree = join(ws, "linked-worktree");
+  gitCmd(externalGit, ["worktree", "add", "--quiet", "--detach", linkedWorktree]);
+  const fakeGitDir = join(ws, "fake-gitdir");
+  mkdirSync(fakeGitDir, { recursive: true });
+  writeFileSync(join(fakeGitDir, ".git"), `gitdir: ${join(externalGit, ".git")}\n`);
+
+  const stubBuilder = join(sandbox, "stub-builder.py");
+  writeFileSync(stubBuilder, "import json, os, sys\nprint(json.dumps({'cwd': os.getcwd(), 'argv': sys.argv[1:], 'env': dict(os.environ)}))\n", { mode: 0o700 });
+  const stubGraphify = join(sandbox, "stub-graphify");
+  writeFileSync(stubGraphify, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+
+  for (const [label, sourceFile, rootToken, builderToken] of [
+    ["secondary", workWrapper, "/srv/infinite-data/instances/work", "/opt/infinite-work/scripts/repository_graph.py"],
+    ["primary", primaryWrapper, "/srv/infinite-data", "/opt/infinite/scripts/repository_graph.py"],
+  ] as const) {
+    const isolatedWrapper = join(sandbox, `${label}-graph-wrapper.py`);
+    const text = readFileSync(sourceFile, "utf8")
+      .replaceAll(rootToken, sandbox)
+      .replaceAll(builderToken, stubBuilder)
+      .replaceAll("/usr/local/bin/graphify", stubGraphify);
+    writeFileSync(isolatedWrapper, text, { mode: 0o700 });
+
+    for (const [caseName, repo, extra] of [
+      ["workspace", repoA, []],
+      ["team-workspace", teamRepo, ["--seed-cache-dir", seedCache]],
+    ] as const) {
+      const ok = runGraph(isolatedWrapper, ["--repo", repo, "--cache-dir", laneCache, "--ref", "HEAD", "--graphify", stubGraphify, ...extra], {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        SECRET_CALLER_VAR: "must-not-leak",
+      });
+      assert.equal(ok.status, 0, `${label}/${caseName}: ${ok.stderr}`);
+      const payload = JSON.parse(ok.stdout) as { cwd: string; argv: string[]; env: Record<string, string> };
+      assert.equal(payload.cwd, cacheRoot, `${label}/${caseName}`);
+      assert.deepEqual(payload.argv, [
+        "--repo", repo, "--cache-dir", laneCache, "--ref", "HEAD", "--graphify", stubGraphify,
+        "--timeout-seconds", "120", "--max-workers", "2", ...extra,
+      ], `${label}/${caseName}`);
+      assert.equal(payload.env.HOME, join(cacheRoot, "tool-home"));
+      assert.equal(payload.env.TMPDIR, tmpAgent);
+      assert.equal(payload.env.SECRET_CALLER_VAR, undefined);
+    }
+
+    for (const bad of [join(ws, "out-link"), join(ws, "in-link"), linkedWorktree, fakeGitDir, other, ws]) {
+      const denied = runGraph(isolatedWrapper, ["--repo", bad, "--cache-dir", laneCache, "--ref", "HEAD", "--graphify", stubGraphify]);
+      assert.notEqual(denied.status, 0, `${label} ${bad}`);
+      assert.match(denied.stderr, /Repository graph request refused:/);
+    }
+  }
+
+  const gitRootSb = realpathSync(tmp());
+  const gitRootWs = join(gitRootSb, "workspaces");
+  const gitRootChild = join(gitRootWs, "child");
+  const gitRootCache = join(gitRootSb, "repository-graphs", "lane");
+  mkdirSync(gitRootChild, { recursive: true });
+  mkdirSync(join(gitRootSb, "team-workspaces"), { recursive: true });
+  mkdirSync(gitRootCache, { recursive: true });
+  mkdirSync(join(gitRootSb, "tmp", "agent"), { recursive: true });
+  gitCmd(gitRootWs, ["init", "--quiet"]);
+  const gitRootGraphWrapper = join(gitRootSb, "gitroot-graph-wrapper.py");
+  writeFileSync(
+    gitRootGraphWrapper,
+    readFileSync(workWrapper, "utf8")
+      .replaceAll("/srv/infinite-data/instances/work", gitRootSb)
+      .replaceAll("/opt/infinite-work/scripts/repository_graph.py", stubBuilder)
+      .replaceAll("/usr/local/bin/graphify", stubGraphify),
+    { mode: 0o700 },
+  );
+  const gitRootDenied = runGraph(gitRootGraphWrapper, ["--repo", gitRootChild, "--cache-dir", gitRootCache, "--ref", "HEAD", "--graphify", stubGraphify]);
+  assert.notEqual(gitRootDenied.status, 0);
+  assert.match(gitRootDenied.stderr, /Repository graph request refused: The requested path is outside its assigned root/);
+
+  const ancestorSb = realpathSync(tmp());
+  const realParent = join(ancestorSb, "real-parent");
+  mkdirSync(join(realParent, "workspaces", "repo"), { recursive: true });
+  mkdirSync(join(realParent, "team-workspaces"), { recursive: true });
+  mkdirSync(join(realParent, "repository-graphs", "lane"), { recursive: true });
+  mkdirSync(join(realParent, "tmp", "agent"), { recursive: true });
+  const linkParent = join(ancestorSb, "link-parent");
+  symlinkSync(realParent, linkParent);
+  const ancestorWrapper = join(ancestorSb, "ancestor-graph-wrapper.py");
+  writeFileSync(
+    ancestorWrapper,
+    readFileSync(workWrapper, "utf8")
+      .replaceAll("/srv/infinite-data/instances/work", linkParent)
+      .replaceAll("/opt/infinite-work/scripts/repository_graph.py", stubBuilder)
+      .replaceAll("/usr/local/bin/graphify", stubGraphify),
+    { mode: 0o700 },
+  );
+  const ancestorRefused = runGraph(ancestorWrapper, [
+    "--repo", join(linkParent, "workspaces", "repo"),
+    "--cache-dir", join(linkParent, "repository-graphs", "lane"),
+    "--ref", "HEAD",
+    "--graphify", stubGraphify,
+  ]);
+  assert.notEqual(ancestorRefused.status, 0);
+  assert.match(ancestorRefused.stderr, /Symlinked repository or cache paths are not supported/);
+});
+
+test("secondary and primary jevcode wrappers enforce strict instance root isolation", {
+  skip: process.platform !== "linux" && "Ubuntu shell wrapper tests require Linux coreutils",
+}, () => {
+  const workOut = render(["--instance", "work"]);
+  const workWrapper = join(workOut, "jevcode-wrapper.sh");
+  const primaryWrapper = resolve("deploy/ubuntu/jevcode-wrapper.sh");
+  const runJevcode = (script: string, args: string[], cwd = tmp()) => spawnSync("/bin/sh", [script, ...args], {
+    cwd,
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
+    encoding: "utf8",
+  });
+  const gitInit = (dir: string) => {
+    const res = spawnSync("git", ["init", "--quiet"], { cwd: dir, encoding: "utf8" });
+    assert.equal(res.status, 0, res.stderr);
+  };
+
+  const workRefusals: Array<[string, string[]]> = [
+    ["first-instance workspace", ["auto", "--repo", "/srv/infinite-data/workspaces/project-a"]],
+    ["first-instance workspace equals form", ["auto", "--repo=/srv/infinite-data/workspaces/project-a"]],
+    ["first-instance team workspace", ["auto", "--repo", "/srv/infinite-data/team-workspaces/run-1/member"]],
+    ["sibling instance workspace", ["auto", "--repo", "/srv/infinite-data/instances/other/workspaces/project-a"]],
+    ["traversal to first instance", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/../../workspaces/project-a"]],
+    ["exact workspace root", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces"]],
+    ["prefix sibling root", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces-evil/project-a"]],
+    ["duplicate repo with second escaping", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--repo", "/srv/infinite-data/workspaces/escape"]],
+    ["relative repo", ["auto", "--repo", "project-a"]],
+    ["missing repo value", ["auto", "--repo"]],
+    ["first-instance log path", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--log", "/srv/infinite-data/control/state"]],
+    ["in-instance tmp log refused", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--log", "/srv/infinite-data/instances/work/tmp/agent/session.jsonl"]],
+    ["agent-home jev api key as log", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--log", "/srv/infinite-data/instances/work/agent-home/.config/jevcode/jev-api-key"]],
+    ["agent-home codex auth as equals log", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--log=/srv/infinite-data/instances/work/agent-home/.codex/auth.json"]],
+    ["unsupported state-dir flag", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--state-dir=/srv/infinite-data/agent-home/.jevcode"]],
+    ["first-instance absolute focus", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--focus", "/srv/infinite-data/workspaces/project-a"]],
+    ["traversing relative focus", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--focus", "../../workspaces/project-a"]],
+    ["flag-like focus desync", ["auto", "--focus", "--repo", "/srv/infinite-data/instances/work/agent-home/x"]],
+    ["unknown flag absolute path escape", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--transcript", "/srv/infinite-data/workspaces/project-a"]],
+    ["unknown flag relative traversal", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--transcript", "../../etc/passwd"]],
+    ["unknown equals flag file url", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "--transcript=file:///srv/infinite-data/workspaces/project-a"]],
+    ["short option attached path", ["auto", "-r/srv/infinite-data/workspaces/project-a"]],
+    ["short option cwd override", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "-C/etc"]],
+    ["extra positional traversal", ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/ok", "../../etc/passwd"]],
+    ["missing subcommand", ["--repo", "/srv/infinite-data/instances/work/workspaces/ok"]],
+    ["implicit cwd outside root", ["show"]],
+  ];
+  for (const [label, args] of workRefusals) {
+    const result = runJevcode(workWrapper, args);
+    assert.equal(result.status, 64, `${label}: stderr=${result.stderr}`);
+    assert.match(result.stderr, /^jevcode request refused:/, label);
+  }
+
+  for (const args of [
+    ["auto", "--repo", "/srv/infinite-data/instances/work/workspaces/project-a"],
+    ["auto", "--repo", "/etc/passwd"],
+    ["auto", "--repo", "/srv/infinite-data/workspaces/project-a", "--log", "/srv/infinite-data/agent-home/.config/jevcode/jev-api-key"],
+  ]) {
+    const refused = runJevcode(primaryWrapper, args);
+    assert.equal(refused.status, 64, args.join(" "));
+    assert.match(refused.stderr, /^jevcode request refused:/);
+  }
+
+  const sb = realpathSync(tmp());
+  const ws = join(sb, "workspaces");
+  const teamWs = join(sb, "team-workspaces");
+  const realRepo = join(ws, "real-repo");
+  const realRepoSub = join(realRepo, "packages", "sub");
+  const teamRepo = join(teamWs, "run-1", "member");
+  const outside = join(sb, "outside");
+  mkdirSync(join(realRepo, "src"), { recursive: true });
+  mkdirSync(realRepoSub, { recursive: true });
+  mkdirSync(teamRepo, { recursive: true });
+  mkdirSync(join(sb, "agent-home", ".config", "jevcode"), { recursive: true });
+  mkdirSync(join(sb, "tmp", "agent"), { recursive: true });
+  mkdirSync(outside, { recursive: true });
+  gitInit(realRepo);
+  gitInit(teamRepo);
+  writeFileSync(join(sb, "agent-home", ".config", "jevcode", "jev-api-key"), "test-jev-key\n", { mode: 0o600 });
+  writeFileSync(join(sb, "tmp", "agent", "session.jsonl"), "{}\n");
+  symlinkSync(outside, join(ws, "out-link"));
+  symlinkSync(realRepo, join(ws, "in-link"));
+  symlinkSync(outside, join(realRepo, "focus-out-link"));
+  symlinkSync(join(realRepo, "src"), join(realRepo, "focus-in-link"));
+
+  const stubCli = join(sb, "stub-jevcode-cli.mjs");
+  writeFileSync(stubCli, [
+    "process.stdout.write(JSON.stringify({",
+    "  cwd: process.cwd(),",
+    "  argv: process.argv.slice(2),",
+    "  env: {",
+    "    HOME: process.env.HOME,",
+    "    TMPDIR: process.env.TMPDIR,",
+    "    npm_config_store_dir: process.env.npm_config_store_dir,",
+    "    COREPACK_HOME: process.env.COREPACK_HOME,",
+    "    PATH: process.env.PATH,",
+    "    JEV_API_KEY: process.env.JEV_API_KEY,",
+    "  },",
+    "}));",
+  ].join("\n"));
+
+  const makeIsolatedJevcode = (sourceFile: string, rootToken: string, outFile: string) => {
+    const text = readFileSync(sourceFile, "utf8")
+      .replaceAll(rootToken, sb)
+      .replaceAll("/opt/infinite-agents/v1", join(sb, "agents", "v1"))
+      .replace("exec /usr/local/bin/node /opt/jevcode-repo-agent/dist/cli.js \"$@\"", `exec "${process.execPath}" "${stubCli}" "$@"`);
+    writeFileSync(outFile, text, { mode: 0o700 });
+    return outFile;
+  };
+
+  for (const [label, sourceFile, rootToken] of [
+    ["secondary", workWrapper, "/srv/infinite-data/instances/work"],
+    ["primary", primaryWrapper, "/srv/infinite-data"],
+  ] as const) {
+    const scopedWrapper = makeIsolatedJevcode(sourceFile, rootToken, join(sb, `${label}-jevcode-scoped.sh`));
+    const validCases: Array<[string, string[], string, string]> = [
+      [
+        "auto host briefing args",
+        ["--report-usage", "auto", "--trigger", "host", "--format", "json", "--activity-stdin", "--session", "sess-1", "--repo", realRepo, "--timeout", "300", "--base", "a".repeat(40), "--runner", "codex", "--model", "meta/muse-spark-1.3-contributor"],
+        sb,
+        realRepo,
+      ],
+      [
+        "team workspace repo with activity-stdin",
+        ["auto", `--repo=${teamRepo}`, "--activity-stdin", "--format", "json"],
+        sb,
+        teamRepo,
+      ],
+      [
+        "subdirectory repo with top-level relative focus",
+        ["brief", "--repo", realRepoSub, "--focus", "src", "--format", "json", "--no-state"],
+        sb,
+        realRepoSub,
+      ],
+      [
+        "brief with leading-slash question and relative focus",
+        ["brief", "--repo", realRepo, "--focus", "src", "--question", "/api/sessions summary", "--format", "json", "--no-state"],
+        sb,
+        realRepo,
+      ],
+      [
+        "brief with empty focus and equals leading-slash question",
+        ["brief", "--repo", realRepo, "--focus", "", "--question=/api/sessions summary", "--format", "json", "--no-state"],
+        sb,
+        realRepo,
+      ],
+      [
+        "context call",
+        ["context", "--repo", realRepo],
+        sb,
+        realRepo,
+      ],
+      [
+        "implicit physical cwd inside repo",
+        ["show"],
+        realRepo,
+        realRepo,
+      ],
+    ];
+    for (const [caseName, args, cwd, expectedCwd] of validCases) {
+      const ok = runJevcode(scopedWrapper, args, cwd);
+      assert.equal(ok.status, 0, `${label}/${caseName}: stderr=${ok.stderr}`);
+      const payload = JSON.parse(ok.stdout) as { cwd: string; argv: string[]; env: Record<string, string> };
+      assert.equal(payload.cwd, expectedCwd, `${label}/${caseName}`);
+      assert.deepEqual(payload.argv, args, `${label}/${caseName}`);
+      assert.equal(payload.env.HOME, join(sb, "agent-home"));
+      assert.equal(payload.env.TMPDIR, join(sb, "tmp", "agent"));
+      assert.equal(payload.env.JEV_API_KEY, "test-jev-key");
+    }
+
+    for (const [caseName, args, cwd] of [
+      ["symlink repo pointing outside", ["auto", "--repo", join(ws, "out-link")], sb],
+      ["symlink repo pointing inside", ["auto", "--repo", join(ws, "in-link")], sb],
+      ["relative focus symlink pointing outside", ["brief", "--repo", realRepo, "--focus", "focus-out-link"], sb],
+      ["relative focus symlink pointing inside", ["brief", "--repo", realRepo, "--focus", "focus-in-link"], sb],
+      ["subdirectory repo with top-level focus symlink outside", ["brief", "--repo", realRepoSub, "--focus", "focus-out-link"], sb],
+      ["cwd via symlink pointing outside", ["show"], join(ws, "out-link")],
+      ["log flag refused even under tmp", ["auto", "--repo", realRepo, "--log", join(sb, "tmp", "agent", "session.jsonl")], sb],
+      ["agent-home api key as log", ["auto", "--repo", realRepo, "--log", join(sb, "agent-home", ".config", "jevcode", "jev-api-key")], sb],
+    ] as Array<[string, string[], string]>) {
+      const res = runJevcode(scopedWrapper, args, cwd);
+      assert.equal(res.status, 64, `${label}/${caseName}: stderr=${res.stderr}`);
+      assert.match(res.stderr, /^jevcode request refused:/, `${label}/${caseName}`);
+    }
+  }
+
+  const gitRootSb = realpathSync(tmp());
+  const gitRootWs = join(gitRootSb, "workspaces");
+  const childDir = join(gitRootWs, "child");
+  const escapedWorktree = join(gitRootWs, "escaped-worktree");
+  const externalGit = join(gitRootSb, "external-repo");
+  mkdirSync(childDir, { recursive: true });
+  mkdirSync(escapedWorktree, { recursive: true });
+  mkdirSync(externalGit, { recursive: true });
+  mkdirSync(join(gitRootSb, "team-workspaces"), { recursive: true });
+  mkdirSync(join(gitRootSb, "agent-home"), { recursive: true });
+  mkdirSync(join(gitRootSb, "tmp", "agent"), { recursive: true });
+  gitInit(gitRootWs);
+  gitInit(externalGit);
+  writeFileSync(join(escapedWorktree, ".git"), `gitdir: ${join(externalGit, ".git")}\n`);
+  const gitRootWrapper = join(gitRootSb, "jevcode-gitroot.sh");
+  writeFileSync(
+    gitRootWrapper,
+    readFileSync(workWrapper, "utf8")
+      .replaceAll("/srv/infinite-data/instances/work", gitRootSb)
+      .replace("exec /usr/local/bin/node /opt/jevcode-repo-agent/dist/cli.js \"$@\"", `exec "${process.execPath}" "${stubCli}" "$@"`),
+    { mode: 0o700 },
+  );
+  const gitTopRefused = runJevcode(gitRootWrapper, ["auto", "--repo", childDir], gitRootSb);
+  assert.equal(gitTopRefused.status, 64, gitTopRefused.stderr);
+  assert.match(gitTopRefused.stderr, /^jevcode request refused: path is outside its assigned root/);
+  const gitWorktreeRefused = runJevcode(gitRootWrapper, ["auto", "--repo", escapedWorktree], gitRootSb);
+  assert.equal(gitWorktreeRefused.status, 64, gitWorktreeRefused.stderr);
+  assert.match(gitWorktreeRefused.stderr, /^jevcode request refused:/);
+
+  const symRootSb = realpathSync(tmp());
+  const realTarget = join(symRootSb, "target");
+  mkdirSync(join(realTarget, "workspaces", "repo"), { recursive: true });
+  mkdirSync(join(realTarget, "team-workspaces"), { recursive: true });
+  mkdirSync(join(realTarget, "agent-home"), { recursive: true });
+  mkdirSync(join(realTarget, "tmp", "agent"), { recursive: true });
+  const linkParent = join(symRootSb, "link-parent");
+  symlinkSync(realTarget, linkParent);
+  const ancestorWrapper = join(symRootSb, "jevcode-ancestor.sh");
+  writeFileSync(
+    ancestorWrapper,
+    readFileSync(workWrapper, "utf8")
+      .replaceAll("/srv/infinite-data/instances/work", linkParent)
+      .replace("exec /usr/local/bin/node /opt/jevcode-repo-agent/dist/cli.js \"$@\"", `exec "${process.execPath}" "${stubCli}" "$@"`),
+    { mode: 0o700 },
+  );
+  const ancestorRefused = runJevcode(ancestorWrapper, ["auto", "--repo", join(linkParent, "workspaces", "repo")], symRootSb);
+  assert.equal(ancestorRefused.status, 64, ancestorRefused.stderr);
+  assert.match(ancestorRefused.stderr, /^jevcode request refused: symlinked root is not supported/);
 });

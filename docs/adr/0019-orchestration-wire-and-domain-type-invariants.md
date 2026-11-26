@@ -50,7 +50,7 @@ The host's core orchestration and wire-contract modules (`team-types.ts`, `missi
 - **Record digest and register byte budgets (`team-types.ts`)**:
   - `recordDigestSchema` requires `c0` first (once) with empty `statement` (`""`) because `c0`'s text lives in `TeamGoalContext.successCriteria`. `derived: true` marks intent-check-derived criteria.
   - `recordDigestBytes` counts `{ version, criteria }` only (`<= 6 KiB`), leaving `register` (`registerDigestSchema`) its own independent `6 KiB` budget (`RECORD_REGISTER_BYTES`) containing intent-check and owner assumptions plus open questions; member prose never enters the register digest.
-  - `recordDigestSchema` duplicates the `ID_RE` pattern (`^[a-z][a-z0-9-]{0,39}$`) from `objective-types.ts` to avoid closing a circular import until shared primitive schemas are extracted.
+  - `packages/host/src/schema-primitives.ts` owns the zero-local-dependency leaf primitives (`ID_RE`, `ownedPathSchema` / `ownedPathSchemaFor`, `isScopedPath`, `teamCommandSchema`, `criteriaRowSchema` / `criteriaRowsSchema` / `criteriaRowsText`, and `SHARED_INPUT_LIMITS`), imported across `team-types.ts`, `team-state-schemas.ts`, `team-prompts.ts`, `eval-config.ts`, `verdict-types.ts`, `goal-types.ts`, `objective-types.ts`, and `objective-input.ts` with no circular imports.
 
 ### 3. Honesty, Authority, and Client Redaction Boundaries
 

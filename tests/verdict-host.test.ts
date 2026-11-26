@@ -395,7 +395,7 @@ test("a crash between the record's write and the save writes nothing twice", { t
     const goal = await goals.create({ requestId: randomUUID(), projectId: "fixture", title: "Rank sources", objective: "Find ranked sources",
       successCriteria: "A ranked shortlist", nonGoals: [], allowedPaths: ["research"], evidence: [], maxRuns: 2, maxMinutes: 60, maxMembers: 4, parallelism: 2 } as CreateGoal);
     goals.start();
-    await goals.steer(goal.id, { requestId: randomUUID(), revision: 999, text: "Barrier" }).catch(() => undefined);
+    await goals.idle();
     const teamId = goals.get(goal.id).activeTeamId!;
     assert.ok(teamId, "the first cycle's run exists");
     goals.close();

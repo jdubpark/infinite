@@ -316,6 +316,15 @@ test("a host stop inside a command's drain signals nothing, and after a restart 
   const leaderFile = join(directory, "leader"), leftFile = join(directory, "left"), release = join(directory, "release");
   const pidIn = (file: string) => { const text = existsSync(file) ? readFileSync(file, "utf8") : ""; return text.endsWith("\n") ? Number.parseInt(text, 10) : undefined; };
   const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; } };
+  const realSetTimeout = globalThis.setTimeout;
+  const waitReal = async (check: () => boolean, message: string, timeoutMs = 10_000) => {
+    const deadline = performance.now() + timeoutMs;
+    while (performance.now() < deadline) {
+      if (check()) return;
+      await new Promise(resolve => realSetTimeout(resolve, 10));
+    }
+    assert.fail(message);
+  };
   type Internals = { records: Map<string, { pending?: unknown }>; operation: (stored: unknown, kind: string, perform: (signal: AbortSignal) => Promise<unknown>, complete: () => void) => void;
     fence: { refresh: (stored: unknown, force: boolean) => Promise<string | undefined> } };
   const teams = openTeam(f);
@@ -328,14 +337,15 @@ test("a host stop inside a command's drain signals nothing, and after a restart 
     internals.operation(stored, "check", signal => teamCommand({ command: "sh", args: ["-c", script] }, f.run.workspace, signal).finally(() => { commandSettled = true; }), () => {});
     await waitFor(() => pidIn(leftFile) !== undefined && savedRecord(f).pending?.recording === undefined && (savedRecord(f).pending?.witness?.sessions.length ?? 0) > 0,
       "the saved intent should hold the command", 10_000);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     writeFileSync(release, "");
     const leader = pidIn(leaderFile)!;
-    const deadline = Date.now() + 10_000;
-    while (alive(leader) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
-    assert.equal(alive(leader), false, "the leader exits once released");
-    if (commandSettled) return t.skip("the command settled at the end of the drain before the host stop");
+    await waitReal(() => !alive(leader), "the leader exits once released", 10_000);
+    assert.equal(commandSettled, false, "the command stays in its drain until the host stops");
     teams.close();
     await teams.idle();
+    t.mock.timers.tick(300);
+    t.mock.timers.reset();
     assert.ok(stored.pending, "a stop during the drain leaves the operation's intent for the next start");
     await new Promise(resolve => setTimeout(resolve, 300));
     assert.equal(alive(pidIn(leftFile)!), true, "the host stop signalled nothing after the leader's exit");
@@ -343,8 +353,9 @@ test("a host stop inside a command's drain signals nothing, and after a restart 
     const restartedInternals = restarted as unknown as Internals;
     assert.equal(await restartedInternals.fence.refresh(restartedInternals.records.get(f.run.id)!, true), "running", "the census finds the sleep in the recorded group");
   } finally {
-    const left = pidIn(leftFile);
-    if (left !== undefined && Number.isSafeInteger(left) && left > 1 && alive(left)) process.kill(left, "SIGKILL");
+    t.mock.timers.reset();
+    for (const pid of [pidIn(leaderFile), pidIn(leftFile)])
+      if (pid !== undefined && Number.isSafeInteger(pid) && pid > 1 && alive(pid)) process.kill(pid, "SIGKILL");
     if (restarted) { restarted.close(); await restarted.idle(); }
     else teams.close();
     f.close();

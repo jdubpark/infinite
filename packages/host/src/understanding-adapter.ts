@@ -7,6 +7,7 @@ import { parseMermaid, type Diagram, type UnderstandingBrief, type KnowledgeClai
 import { expectedIdentity, normalizeRemote, readGit } from "./checkout-identity.js";
 import { agentModelClientEnvironment } from "./egress.js";
 import { failureReason } from "./failure-reason.js";
+import { signalGroup, watchLeader } from "./process-group.js";
 import { createContextAdapter, runRepositoryContext, understandingOutputLimits, type RepoContext, type RepositoryBriefOutput, type UnderstandingAdapter, type UnderstandingAdapterOptions } from "./understanding-runtime.js";
 import type { Config } from "./types.js";
 
@@ -71,6 +72,7 @@ function run(command: string, args: string[], options: UnderstandingAdapterOptio
     let child: ChildProcess;
     try { child = spawn(command, args, { cwd: options.cwd, env: options.env ?? agentModelClientEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }); }
     catch { rejectPromise(new Error("understanding-process-unavailable")); return; }
+    const leader = watchLeader(child);
     let output = Buffer.alloc(0), stderrTail = Buffer.alloc(0), reason: string | undefined, closed: number | null | undefined, escalated = false, settled = false;
     const finish = () => {
       if (settled || closed === undefined || (reason && !escalated)) return;
@@ -81,9 +83,9 @@ function run(command: string, args: string[], options: UnderstandingAdapterOptio
     };
     const stop = (why: string) => {
       if (reason) return; reason = why;
-      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGTERM"); else child.kill("SIGTERM"); } catch {}
+      signalGroup(child, "SIGTERM");
       const escalation = setTimeout(() => {
-        try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch {}
+        signalGroup(child, "SIGKILL");
         escalated = true; finish();
       }, 500);
       escalation.unref();
@@ -95,7 +97,15 @@ function run(command: string, args: string[], options: UnderstandingAdapterOptio
     child.stdout!.on("data", (chunk: Buffer) => { if (output.length + chunk.length > (options.maxBytes ?? MAX_STDOUT)) stop("understanding-output-too-large"); else output = Buffer.concat([output, chunk]); });
     child.stderr!.on("data", (chunk: Buffer) => { stderrTail = Buffer.concat([stderrTail, chunk]).subarray(-2048); });
     child.on("error", () => { reason ??= "understanding-process-unavailable"; closed = -1; escalated = true; finish(); });
-    child.on("close", code => { closed = code; if (!reason) clearTimeout(timer); finish(); });
+    child.on("close", code => {
+      closed = code;
+      if (leader.leftover && !reason) {
+        reason = "understanding-output-held";
+        escalated = true;
+      }
+      if (!reason) clearTimeout(timer);
+      finish();
+    });
     if (options.signal.aborted) abort();
   });
 }

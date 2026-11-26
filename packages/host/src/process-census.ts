@@ -27,6 +27,8 @@ export interface ProcessWitness {
 export type CensusReason = "recorded-process" | "recorded-session" | "recorded-group" | "working-directory" | "open-file" | "command-line" | "unreadable";
 export interface CensusFinding { pid: number; reason: CensusReason }
 export type CensusResult = { ok: true; findings: CensusFinding[] } | { ok: false; problem: string };
+export type ProcessIdentity = { pid: number; start: string };
+export type EarlierProcesses = "all" | readonly ProcessIdentity[];
 
 export const CENSUS_WRAPPER = "process-census";
 export const WITNESS_LIMIT = 4096;
@@ -135,15 +137,31 @@ export async function directoryCensus(directory: string): Promise<CensusResult> 
     return { ok: false, problem: problemText(error) };
   }
 }
-export async function operationCensus(witness: ProcessWitness, directory: string, prefix?: TeamCommand): Promise<CensusResult> {
-  const first = await censusPass(witness, directory, prefix);
+export async function operationCensus(witness: ProcessWitness, directory: string, prefix?: TeamCommand, earlier?: EarlierProcesses): Promise<CensusResult> {
+  const first = await censusPass(witness, directory, prefix, earlier);
   if (!first.ok || first.findings.some(finding => finding.reason !== "unreadable")) return first;
   if (witness.overflow) return { ok: false, problem: "the operation started more processes than the host records" };
   if (first.findings.length > 0) return first;
   await new Promise(resolvePromise => setTimeout(resolvePromise, SECOND_PASS_MS));
-  return censusPass(witness, directory, prefix);
+  return censusPass(witness, directory, prefix, earlier);
 }
-async function censusPass(witness: ProcessWitness, directory: string, prefix?: TeamCommand): Promise<CensusResult> {
+export async function excuseEarlier(findings: CensusFinding[], earlier: EarlierProcesses | undefined, start: (pid: number) => Promise<string | undefined>): Promise<CensusFinding[]> {
+  if (earlier === undefined) return findings;
+  const kept: CensusFinding[] = [];
+  for (const finding of findings) {
+    if (finding.reason !== "unreadable" || !(await wasEarlier(finding.pid, earlier, start))) kept.push(finding);
+  }
+  return kept;
+}
+async function wasEarlier(pid: number, earlier: EarlierProcesses, start: (pid: number) => Promise<string | undefined>): Promise<boolean> {
+  if (earlier === "all") return true;
+  const recorded = earlier.filter(item => item.pid === pid);
+  if (recorded.length === 0) return false;
+  let current: string | undefined;
+  try { current = await start(pid); } catch { return false; }
+  return current !== undefined && recorded.some(item => item.start === current);
+}
+async function censusPass(witness: ProcessWitness, directory: string, prefix?: TeamCommand, earlier?: EarlierProcesses): Promise<CensusResult> {
   let recorded: CensusFinding[];
   try {
     recorded = witnessFindings(witness, await readProcessTable());
@@ -157,12 +175,12 @@ async function censusPass(witness: ProcessWitness, directory: string, prefix?: T
     if (!part.ok) return part;
     for (const finding of part.findings) if (!byPid.has(finding.pid)) byPid.set(finding.pid, finding.reason);
   }
-  return { ok: true, findings: [...byPid].map(([pid, reason]) => ({ pid, reason })) };
+  return { ok: true, findings: await excuseEarlier([...byPid].map(([pid, reason]) => ({ pid, reason })), earlier, processStart) };
 }
 export interface HostProcesses {
   table(): Promise<ProcessTable>;
   start(pid: number): Promise<string | undefined>;
-  census(witness: ProcessWitness, directory: string, prefix?: TeamCommand): Promise<CensusResult>;
+  census(witness: ProcessWitness, directory: string, prefix?: TeamCommand, earlier?: EarlierProcesses): Promise<CensusResult>;
 }
 export const hostProcesses: HostProcesses = { table: readProcessTable, start: processStart, census: operationCensus };
 

@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { startHost } from "./helpers.js";
 import { missionBoard } from "../packages/host/src/missions.js";
-import type { Mission } from "../packages/host/src/mission-types.js";
+import { boardItemSchema, type Mission } from "../packages/host/src/mission-types.js";
+import { ProjectGroupService } from "../packages/host/src/project-groups.js";
 import type { TeamView } from "../packages/host/src/team-types.js";
 import type { ProductGoal } from "../packages/host/src/goal-types.js";
 import type { Config } from "../packages/host/src/types.js";
@@ -68,7 +69,7 @@ test("the board maps missions, standalone teams, and goals to columns and hides 
   const find = (title: string) => items.find(item => item.title === title)!;
   assert.equal(find("Mission needs-input").detail, "Ship on Friday?");
   assert.equal(find("Mission blocked").detail, "The coordinator reported a blocker.");
-  assert.equal(find("Mission working").detail, "Running: Endpoint. 1 of 2 subtasks done");
+  assert.equal(find("Mission working").detail, "Running: Endpoint");
   assert.deepEqual(find("Mission working").subtasks, { total: 2, running: 1, done: 1 });
   assert.equal(find("Mission working").projectName, "Shop");
   assert.equal(find("Mission working").groupId, "shop");
@@ -81,7 +82,166 @@ test("the board maps missions, standalone teams, and goals to columns and hides 
   assert.equal(find("Goal running").projectName, "Shop");
   assert.equal(find("Goal running").groupId, "shop");
   assert.equal(find("Unmapped team").projectName, "Docs");
-  assert.ok(!Object.hasOwn(find("Unmapped team"), "groupId"));
+  assert.equal(find("Unmapped team").groupId, "unmapped:project:docs");
+  for (const row of items) assert.equal(boardItemSchema.safeParse(row).success, true, `board item ${row.id} matches schema`);
+});
+
+test("mission and team board details emit clean structured status without redundant subtask count suffixes", () => {
+  const subtask = (id: string, title: string, status: Mission["subtasks"][number]["status"]) => ({
+    id, repoProjectId: "api", title, objective: "x", size: "solo" as const, parallelism: 1, dependsOn: [], status,
+  });
+  const missions = [
+    mission("planning", 1, { title: "Zero subtasks", subtasks: [] }),
+    mission("working", 2, { title: "Only cancelled", subtasks: [subtask("c", "Dropped", "cancelled")] }),
+    mission("working", 3, { title: "One running", subtasks: [subtask("a", "API", "running")] }),
+    mission("working", 4, { title: "Two running", subtasks: [subtask("a", "API", "running"), subtask("b", "Web", "running")] }),
+    mission("working", 5, { title: "One queued", subtasks: [subtask("a", "API", "queued")] }),
+    mission("working", 6, { title: "One done", subtasks: [subtask("a", "API", "done")] }),
+    mission("working", 7, { title: "Mixed idle", subtasks: [subtask("a", "API", "done"), subtask("b", "Web", "queued"), subtask("c", "Docs", "queued")] }),
+    mission("ready-for-review", 8, { title: "Ready", result: { summary: "All checks pass.", revision: 1, at: at(8) }, subtasks: [subtask("a", "API", "done")] }),
+    mission("paused", 9, { title: "Paused", reason: "Paused by owner.", subtasks: [subtask("a", "API", "running")] }),
+    mission("blocked", 10, { title: "Blocked", reason: "Missing secret.", subtasks: [subtask("a", "API", "blocked")] }),
+    mission("cancelled", 11, { title: "Cancelled", reason: "No longer needed.", subtasks: [subtask("a", "API", "cancelled")] }),
+  ];
+  const task = (id: string, status: TeamView["tasks"][number]["status"]) => ({
+    id, title: id, instructions: "do", paths: ["a.ts"], dependsOn: [], revision: 1, status,
+  });
+  const teams = [
+    team("implementing", 12, { title: "Team zero tasks", tasks: [] }),
+    team("implementing", 13, { title: "Team one task pending", tasks: [task("a", "running")] }),
+    team("implementing", 14, { title: "Team one task integrated", tasks: [task("a", "integrated")] }),
+    team("implementing", 15, { title: "Team multiple tasks", tasks: [task("a", "integrated"), task("b", "running")] }),
+    team("verifying", 16, { title: "Team verifying", tasks: [task("a", "integrated")] }),
+  ];
+  const { items } = missionBoard(missions, teams, [], projects, () => undefined);
+  const byTitle = new Map(items.map(item => [item.title, item]));
+
+  assert.equal(byTitle.get("Zero subtasks")!.detail, "Planning subtasks");
+  assert.deepEqual(byTitle.get("Zero subtasks")!.subtasks, { total: 0, running: 0, done: 0 });
+  assert.equal(byTitle.get("Only cancelled")!.detail, "Planning subtasks");
+  assert.deepEqual(byTitle.get("Only cancelled")!.subtasks, { total: 0, running: 0, done: 0 });
+  assert.equal(byTitle.get("One running")!.detail, "Running: API");
+  assert.deepEqual(byTitle.get("One running")!.subtasks, { total: 1, running: 1, done: 0 });
+  assert.equal(byTitle.get("Two running")!.detail, "Running: API, Web");
+  assert.deepEqual(byTitle.get("Two running")!.subtasks, { total: 2, running: 2, done: 0 });
+  assert.equal(byTitle.get("One queued")!.detail, "");
+  assert.deepEqual(byTitle.get("One queued")!.subtasks, { total: 1, running: 0, done: 0 });
+  assert.equal(byTitle.get("One done")!.detail, "");
+  assert.deepEqual(byTitle.get("One done")!.subtasks, { total: 1, running: 0, done: 1 });
+  assert.equal(byTitle.get("Mixed idle")!.detail, "");
+  assert.deepEqual(byTitle.get("Mixed idle")!.subtasks, { total: 3, running: 0, done: 1 });
+  assert.equal(byTitle.get("Ready")!.detail, "All checks pass.");
+  assert.equal(byTitle.get("Paused")!.detail, "Paused by owner.");
+  assert.equal(byTitle.get("Blocked")!.detail, "Missing secret.");
+  assert.equal(byTitle.get("Cancelled")!.detail, "No longer needed.");
+  assert.equal(byTitle.get("Team zero tasks")!.detail, "Implementing");
+  assert.equal(byTitle.get("Team one task pending")!.detail, "Implementing: 0 of 1 task integrated");
+  assert.equal(byTitle.get("Team one task integrated")!.detail, "Implementing: 1 of 1 task integrated");
+  assert.equal(byTitle.get("Team multiple tasks")!.detail, "Implementing: 1 of 2 tasks integrated");
+  assert.equal(byTitle.get("Team verifying")!.detail, "Running checks");
+  for (const row of items) {
+    assert.doesNotMatch(row.detail, /\d+ of \d+ subtasks? done/);
+    assert.equal(boardItemSchema.safeParse(row).success, true);
+  }
+});
+
+test("every board item carries a canonical groupId matching project groups even when distinct projects share a display name", () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-board-groups-"));
+  const eastPath = join(root, "east"), westPath = join(root, "west");
+  mkdirSync(eastPath); mkdirSync(westPath);
+  try {
+    const duplicateProjects: Config["projects"] = [
+      { id: "app-east", name: "App", path: eastPath },
+      { id: "app-west", name: "App", path: westPath },
+    ];
+    const groups = new ProjectGroupService({ stateDir: join(root, "state"), projects: duplicateProjects } as Config, randomBytes(32));
+    const listed = groups.list().groups;
+    assert.deepEqual(listed.map(group => ({ id: group.id, name: group.name })), [
+      { id: "app-east", name: "App" },
+      { id: "app-west", name: "App" },
+    ]);
+    const memberships = groups.membershipSnapshot();
+    const { items } = missionBoard(
+      [
+        mission("working", 1, { id: "m-east", title: "East mission", groupId: "app-east", groupName: "App", repoProjectIds: ["app-east"] }),
+        mission("working", 2, { id: "m-west", title: "West mission", groupId: "app-west", groupName: "App", repoProjectIds: ["app-west"] }),
+      ],
+      [
+        team("implementing", 3, { id: "t-east", projectId: "app-east", title: "East team" }),
+        team("implementing", 4, { id: "t-west", projectId: "app-west", title: "West team" }),
+        team("implementing", 5, { id: "t-retired", projectId: "retired-repo", title: "Retired team" }),
+      ],
+      [
+        goal("running", 6, { id: "g-east", projectId: "app-east", title: "East goal" }),
+        goal("running", 7, { id: "g-west", projectId: "app-west", title: "West goal" }),
+        goal("running", 8, { id: "g-retired", projectId: "retired-repo", title: "Retired goal" }),
+      ],
+      duplicateProjects,
+      id => memberships.get(id),
+    );
+
+    const groupIds = new Set(listed.map(group => group.id));
+    const byId = new Map(items.map(item => [item.id, item]));
+    for (const id of ["m-east", "t-east", "g-east"]) {
+      assert.equal(byId.get(id)!.groupId, "app-east");
+      assert.equal(byId.get(id)!.projectName, "App");
+      assert.ok(groupIds.has(byId.get(id)!.groupId));
+    }
+    for (const id of ["m-west", "t-west", "g-west"]) {
+      assert.equal(byId.get(id)!.groupId, "app-west");
+      assert.equal(byId.get(id)!.projectName, "App");
+      assert.ok(groupIds.has(byId.get(id)!.groupId));
+    }
+    assert.equal(byId.get("t-retired")!.groupId, "unmapped:project:retired-repo");
+    assert.equal(byId.get("g-retired")!.groupId, "unmapped:project:retired-repo");
+    assert.deepEqual(items.filter(item => item.groupId === "app-east").map(item => item.id).sort(), ["g-east", "m-east", "t-east"]);
+    assert.deepEqual(items.filter(item => item.groupId === "app-west").map(item => item.id).sort(), ["g-west", "m-west", "t-west"]);
+    for (const row of items) assert.equal(boardItemSchema.safeParse(row).success, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("retired projects stay in a disjoint unmapped groupId namespace and never leak into a new group that recycles the slug", () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-board-recycled-slug-"));
+  const billingPath = join(root, "billing");
+  mkdirSync(billingPath);
+  try {
+    const liveProjects: Config["projects"] = [{ id: "billing-service", name: "Billing", path: billingPath }];
+    const groups = new ProjectGroupService({ stateDir: join(root, "state"), projects: liveProjects } as Config, randomBytes(32));
+    const recycled = groups.create({ requestId: randomUUID(), name: "API", repos: ["billing-service"] });
+    assert.equal(recycled.id, "api");
+
+    const memberships = groups.membershipSnapshot();
+    const sharedObjective = "Harden endpoint validation";
+    const { items } = missionBoard(
+      [
+        mission("blocked", 1, { id: "m-retired", title: "Retired API mission", groupId: "api", groupName: "Old API", repoProjectIds: ["api"], objective: sharedObjective }),
+        mission("working", 2, { id: "m-live", title: "New API mission", groupId: recycled.id, groupName: recycled.name, repoProjectIds: ["billing-service"], objective: sharedObjective }),
+      ],
+      [
+        team("ready-for-review", 3, { id: "t-retired", projectId: "api", title: "Retired API team" }),
+        team("implementing", 4, { id: "t-live", projectId: "billing-service", title: "New API team" }),
+      ],
+      [
+        goal("blocked", 5, { id: "g-retired", projectId: "api", title: "Retired API goal" }),
+        goal("running", 6, { id: "g-live", projectId: "billing-service", title: "New API goal" }),
+      ],
+      liveProjects,
+      id => memberships.get(id),
+    );
+
+    const byId = new Map(items.map(item => [item.id, item]));
+    assert.equal(byId.get("m-retired")!.groupId, "unmapped:group:api");
+    assert.equal(byId.get("t-retired")!.groupId, "unmapped:project:api");
+    assert.equal(byId.get("g-retired")!.groupId, "unmapped:project:api");
+    assert.equal(byId.get("m-retired")!.attempt, undefined, "a retired mission does not merge attempts with a live mission whose new group recycled the slug");
+    assert.equal(byId.get("m-live")!.attempt, undefined);
+    assert.deepEqual(items.filter(item => item.groupId === recycled.id).map(item => item.id).sort(), ["g-live", "m-live", "t-live"]);
+    for (const row of items) assert.equal(boardItemSchema.safeParse(row).success, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("the board numbers repeated attempts of the same work and marks stopped older ones superseded", () => {

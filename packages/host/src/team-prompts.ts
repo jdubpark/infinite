@@ -625,6 +625,8 @@ export type MissionMessage = (
   | { type: "follow-up"; followUpId: string; dueAt: string; reason: string; check: string }
   | { type: "refused"; kind: string; reason: string }
 ) & { truncated?: string };
+export const queuedForwardText = (subtaskId: string, reviewId: string) =>
+  `The owner's review ${reviewId} of subtask ${subtaskId} is already forwarded and queued until the subtask's repository is free; the host then steers that subteam once. Do not steer subtask ${subtaskId} again for this review.`;
 export const isDirectionMessage = (message: MissionMessage) => message.type === "owner-direction" || message.type === "connector-direction" || message.type === "review-direction";
 const reviewDirectionGuidance = (messages: MissionMessage[]) => messages.some(message => message.type === "review-direction" || message.type === "repository-held" && message.reviewId)
   ? "A review-direction message is the owner's own changes-requested review of a subtask's pull request, quoted unchanged; it is owner direction. A steer-subtask report on that subtask continues its subteam from the delivered commit and updates the same pull request. The host accepts it once per review, only while that subteam still waits for review at the reviewed head, and reads GitHub again before it steers. Decide as for any owner direction: forward it, ask the owner, or do something else in scope. A repository-held message with a reviewId means the forward of that review waits until those runs release the subtask's repository; until then a result is refused, so ask the owner, set a follow-up, or report blocked."
@@ -733,7 +735,8 @@ Use the note (up to 2,000 characters) for what the mission state does not show: 
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max - 3)}...` : text;
 export type MissionPromptContext = { openChildDecisions: MissionOpenChildDecision[]; waiting: number; answerProjectId?: string;
   notes?: MissionCoordinatorNote[];
-  deliveredDirections?: number };
+  deliveredDirections?: number;
+  queuedForwards?: { subtaskId: string; reviewId: string }[] };
 const MISSION_PROMPT_LIMIT_BYTES = 80 * 1024;
 function missionNotesText(kept: MissionCoordinatorNote[], omitted: number) {
   const left = omitted ? `${omitted} older note${omitted === 1 ? "" : "s"} did not fit in this prompt and ${omitted === 1 ? "was" : "were"} left out.` : "";
@@ -763,6 +766,7 @@ function missionPromptState(mission: Mission, context: MissionPromptContext) {
     decisions: mission.decisions.filter((decision, index, all) => !decision.answer || index >= all.length - 20).map(decision => ({ id: decision.id, question: clip(decision.question, 600), subtaskId: decision.subtaskId, childDecisionId: decision.childDecisionId, answerMode: decision.answerMode,
       answer: decision.answer && clip(decision.answer, 600), answeredBy: decision.answeredBy, source: decision.source })),
     dispatchSummary: mission.dispatchSummary && clip(mission.dispatchSummary, 1000),
+    ...(context.queuedForwards?.length ? { queuedForwards: context.queuedForwards.map(item => ({ ...item, note: queuedForwardText(item.subtaskId, item.reviewId) })) } : {}),
     openChildDecisions: context.openChildDecisions.map(decision => ({ ...decision, question: clip(decision.question, 2000),
       ...(decision.recommendation ? { recommendation: recommendationLine(decision.recommendation) } : {}) })),
   };

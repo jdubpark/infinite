@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { Manager } from "../packages/host/src/manager.js";
 import { ProjectContexts } from "../packages/host/src/project-context.js";
 import { intakeConfigSchema } from "../packages/host/src/intake-types.js";
 import { createIntakeAudienceGuard } from "../packages/host/src/intake-audience.js";
@@ -14,7 +15,7 @@ import { writeSealed } from "../packages/host/src/vault.js";
 import type { Project } from "../packages/host/src/types.js";
 import { startHost } from "./helpers.js";
 
-test("project context and links bind to the verified company and repository once per operation", t => {
+test("project context and links bind to the verified company and repository once per operation", async t => {
   const root = mkdtempSync(join(tmpdir(), "project-context-identity-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const alphaPath = join(root, "alpha"), betaPath = join(root, "beta"), gammaPath = join(root, "gamma"), outsidePath = join(root, "outside"), localRepoPath = join(root, "local-repo");
@@ -63,6 +64,13 @@ test("project context and links bind to the verified company and repository once
   contexts.setContext("beta", "beta private marker", 0);
   contexts.setContext("gamma", "gamma private marker", 0);
   contexts.setContext("outside", "outside local marker", 0);
+  const listing = new Manager({
+    port: 0, origin: "http://127.0.0.1", keyFile: join(root, "key"), stateDir: config.stateDir, runDir: join(root, "run"),
+    environment: "local", enableDemo: false, maxSessions: 8, agents: {}, tokens: [], projects,
+  }, key);
+  await listing.list();
+  const reopened = new ProjectContexts(config, key, guard.workspaceBindings);
+  assert.equal(reopened.context("alpha").text, "alpha private marker", "a read-only manager cannot revoke the serving host's context enrollment");
   contexts.setContext("local-repo", "owner repository context", 0);
   contexts.setLinks("alpha", { expectedVersion: 0, links: [
     { projectId: "beta", relationship: "Uses the API" }, { projectId: "gamma", relationship: "Uses the events" },

@@ -157,7 +157,8 @@ export function withDefaultAttention(
   };
 }
 export class Manager {
-  readonly projectContexts: ProjectContexts;
+  private contexts?: ProjectContexts;
+  get projectContexts() { return this.contexts ??= new ProjectContexts(this.config, this.key); }
   private readonly sessionQueues = new Map<string, Promise<unknown>>();
   private readonly conversationQueues = new Map<string, Promise<unknown>>();
   private readonly pendingCreates = new Set<string>();
@@ -208,7 +209,7 @@ export class Manager {
     hostProbe: HostLoadProbe = readHostLoad,
     options?: { socketDir?: string; projectContexts?: ProjectContexts },
   ) {
-    this.projectContexts = options?.projectContexts ?? new ProjectContexts(config, key);
+    this.contexts = options?.projectContexts;
     assertRunnerDeployment(config);
     const configuredSocketDir = options?.socketDir ?? config.socketDir;
     this.socketDir = ensureSocketDir(configuredSocketDir ?? config.runDir, configuredSocketDir !== undefined ? "socketDir" : "runDir");

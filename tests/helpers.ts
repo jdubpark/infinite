@@ -146,7 +146,7 @@ export async function endSessionWorkers(config: Config, started?: readonly numbe
 export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
   const root = mkdtempSync(join(tmpdir(), "inf-"));
   const port = await freePort();
-  const origin = `http://127.0.0.1:${port}`;
+  let origin = `http://127.0.0.1:${port}`;
   const tokens: Record<Role, string> = {
     owner: randomBytes(32).toString("base64url"),
     controller: randomBytes(32).toString("base64url"),
@@ -170,11 +170,20 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     agents: options.agents ?? { demo: demoProfile() },
     ...options.config,
   };
+  origin = config.origin;
   const configFile = join(root, "config.json");
   writeFileSync(configFile, JSON.stringify(config));
   let child: ChildProcess | undefined;
 
-  const fetchApi = apiClient(origin, tokens);
+  let client = apiClient(origin, tokens);
+  const fetchApi: Host["fetchApi"] = (...args) => client(...args);
+  const bindPort = (nextPort: number) => {
+    config.port = nextPort;
+    origin = `http://127.0.0.1:${nextPort}`;
+    config.origin = origin;
+    writeFileSync(configFile, JSON.stringify(config));
+    client = apiClient(origin, tokens);
+  };
   const stopApi = async () => {
     const api = child;
     if (!api || api.exitCode !== null || api.signalCode !== null) return;
@@ -190,20 +199,30 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     });
     child = api;
     let diagnostics = "";
+    const stderrDone = new Promise<void>((resolveStderr) => {
+      api.stderr!.once("end", resolveStderr);
+      api.stderr!.once("close", resolveStderr);
+    });
     api.stderr!.on("data", (chunk) => {
       diagnostics += chunk;
     });
     await waitFor(
       async () => {
+        let status = 0;
         try {
-          return (await fetchApi("/me")).status;
+          status = (await fetchApi("/me")).status;
         } catch {
-          if (api.exitCode !== null) throw new Error(diagnostics);
-          return 0;
+          status = 0;
         }
+        if (status === 200) return 200;
+        if (api.exitCode !== null || api.signalCode !== null) {
+          await Promise.race([stderrDone, new Promise((resolveTimeout) => setTimeout(resolveTimeout, 1000))]);
+          throw new Error(diagnostics || `Host exited before listening (${api.signalCode ?? api.exitCode})`);
+        }
+        return status;
       },
       (status) => status === 200,
-      20000,
+      45000,
     );
   };
   const stop = async () => {
@@ -223,8 +242,18 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     }
   };
 
+  const canRebind = options.config?.port === undefined && options.config?.origin === undefined;
   try {
-    await start();
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await start();
+        break;
+      } catch (error) {
+        if (!canRebind || attempt >= 4 || !/EADDRINUSE/.test(String(error))) throw error;
+        await stopApi();
+        bindPort(await freePort());
+      }
+    }
   } catch (error) {
     await stop();
     throw error;

@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Journal, readEvents, unseal, writeSealed } from "../packages/host/src/vault.js";
+import { Journal, readEvents, SEGMENT_SIZE, unseal, writeSealed, type JournalAppendMeta } from "../packages/host/src/vault.js";
 
 test("encrypted replay crosses segment boundaries and rejects wrong keys and record substitution", () => {
   const directory = mkdtempSync(join(tmpdir(), "inf-vault-"));
@@ -162,6 +162,48 @@ test("appendAll hands onAppend each event with its own size, after the data is o
       assert.ok(call.bytes > (previous.get(call.segment) ?? 0));
       previous.set(call.segment, call.bytes);
     }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("appendAll crosses segment boundaries with exact cumulative byte metadata and durable replay", () => {
+  const directory = mkdtempSync(join(tmpdir(), "inf-vault-batch-"));
+  const key = randomBytes(32);
+  try {
+    const observed: { seq: number; meta: JournalAppendMeta }[] = [];
+    const journal = new Journal(directory, key, "session-batch", {
+      onAppend: (event, meta) => observed.push({ seq: event.seq, meta }),
+    });
+    const initial = Array.from({ length: SEGMENT_SIZE - 2 }, (_, i) => ({ text: `m-${i}` }));
+    const first = journal.appendAll("message", initial);
+    assert.equal(first.length, SEGMENT_SIZE - 2);
+    const crossing = journal.appendAll("message", [
+      { text: "before-edge" },
+      { text: "at-edge" },
+      { text: "after-edge-1" },
+      { text: "after-edge-2" },
+    ]);
+    assert.deepEqual(crossing.map((event) => event.seq), [SEGMENT_SIZE - 1, SEGMENT_SIZE, SEGMENT_SIZE + 1, SEGMENT_SIZE + 2]);
+    assert.equal(journal.seq, SEGMENT_SIZE + 2);
+    assert.equal(observed.length, SEGMENT_SIZE + 2);
+    const seg0 = readFileSync(join(directory, "0000000000.journal"));
+    const seg1 = readFileSync(join(directory, "0000000001.journal"));
+    const seg0Last = observed[SEGMENT_SIZE - 1]!;
+    assert.equal(seg0Last.meta.segment, "0000000000.journal");
+    assert.equal(seg0Last.meta.bytes, seg0.length);
+    const seg1First = observed[SEGMENT_SIZE]!;
+    const seg1Last = observed[SEGMENT_SIZE + 1]!;
+    assert.equal(seg1First.meta.segment, "0000000001.journal");
+    assert.ok(seg1First.meta.bytes > 0 && seg1First.meta.bytes < seg1Last.meta.bytes);
+    assert.equal(seg1Last.meta.segment, "0000000001.journal");
+    assert.equal(seg1Last.meta.bytes, seg1.length);
+    const seg1Lines = seg1.toString("utf8").trimEnd().split("\n");
+    assert.equal(seg1First.meta.bytes, Buffer.byteLength(`${seg1Lines[0]}\n`));
+    const reopened = new Journal(directory, key, "session-batch");
+    assert.equal(reopened.seq, SEGMENT_SIZE + 2);
+    const page = readEvents(directory, key, "session-batch", SEGMENT_SIZE - 2, 10);
+    assert.deepEqual(page.events.map((event) => event.data.text), ["before-edge", "at-edge", "after-edge-1", "after-edge-2"]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

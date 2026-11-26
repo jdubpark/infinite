@@ -221,9 +221,9 @@ Additional orchestration and evaluation command families follow the same paired 
 
 `team entries` lists a team's stored entries, one line each, with the next `--since` value when more remain. `team entry` prints one entry's head and its body as indented JSON. Entry text is data: the output escapes control characters, and nothing in it runs. `team entry ... withdraw` needs an owner device key. It withdraws one entry, so members stop listing and getting it while the owner still reads its body. The command says whether the entry changed, or was already withdrawn.
 
-`infinite team status` without an ID lists each team. `infinite team status TEAM_ID`
+`infinite team status` without an ID lists each team (using the monitor view with wait reasons and member `stalled` / `spinner-only` flags). `infinite team status TEAM_ID`
 prints that team's open decisions and Jevcode summary. `infinite team watch
-TEAM_ID` keeps it full screen: `b` opens the blackboard entry board (`↑`/`↓`
+TEAM_ID` keeps it full screen, surfacing host-ordered `WAIT REASONS` in the summary, monitor, and board views and `stalled` / `spinner-only` member flags in the monitor, board, and review-log headers: `b` opens the blackboard entry board (`↑`/`↓`
 entry, `Enter` detail, `p` kind filter, `f` follow, `o` member logs), `l` opens
 one agent's review log, `←` `→` or `n` `p` change agents in log view, `s`
 returns to the summary, `↑` `↓`, `j` `k`, Space, and Page Up or Down scroll,

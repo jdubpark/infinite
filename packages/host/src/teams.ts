@@ -275,7 +275,7 @@ export class TeamService {
   private readonly permissions = new TeamPermissionReview(this.permissionHost());
   private readonly reviewFeedback = new TeamReviewFeedback((service => ({ get records() { return service.records; }, get config() { return service.config; },
     get key() { return service.key; }, get directory() { return service.directory; }, save: stored => service.save(stored), event: (stored, text) => service.event(stored, text),
-    enqueue: (runId, task) => service.enqueue(runId, task), steer: (id, input, source) => service.steer(id, input, source), held: projectId => Boolean(service.fuse?.held?.([projectId])),
+    enqueue: (runId, task) => service.enqueue(runId, task), steer: (id, input, source, censusReuseMs) => service.steer(id, input, source, censusReuseMs), held: projectId => Boolean(service.fuse?.held?.([projectId])),
     now: () => service.options?.now?.() ?? Date.now(), block: (stored, error) => service.block(stored, error), step: stored => service.step(stored),
     rebuildDeliveryPrompts: stored => service.rebuildDeliveryPrompts(stored) }) satisfies ReviewFeedbackHost)(this));
   private readonly directory: string;

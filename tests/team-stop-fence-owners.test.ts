@@ -63,11 +63,11 @@ async function endCommand(f: Fixture, teams: TeamService, seen: Census, outcome:
   seen.now += 31_000;
 }
 
-function pausedGoal(f: Fixture, seen: Census) {
+function pausedGoal(f: Fixture, seen: Census, status: "paused" | "running" = "paused") {
   const at = new Date().toISOString();
   const goal: ProductGoal = { id: randomUUID(), projectId: f.run.projectId, title: "Inspect the fixture", objective: "Choose scoped work",
     successCriteria: "The owner has evidence", nonGoals: [], allowedPaths: ["."], evidence: [], maxRuns: 2, maxMinutes: 60,
-    maxMembers: 4, parallelism: 1, revision: 1, status: "paused", createdAt: at, updatedAt: at,
+    maxMembers: 4, parallelism: 1, revision: 1, status, createdAt: at, updatedAt: at,
     deadlineAt: new Date(Date.now() + 60 * 60000).toISOString(), lineup: mixedLineup, activeTeamId: f.run.id, memberCount: 1,
     cycles: [{ teamId: f.run.id, cycle: 1, goalRevision: 1, status: "paused", startedAt: at, memberCount: 1 }],
     steering: [], events: [], outcomes: [] };
@@ -167,6 +167,86 @@ test(`a mission's ${kind} of a subteam whose stopped command census is ${outcome
     assert.equal(team.status, "planning");
     assert.equal(team.pendingOperation, undefined);
     if (kind === "steer") assert.equal(team.steering.at(-1)?.text, "Use the smaller fix.");
+  } finally {
+    await m.missions.close();
+    await m.teams.close();
+    f.close();
+  }
+});
+
+const DIRECTION = "Use the smaller fix.";
+
+async function waitingGoal(f: Fixture, seen: Census, kind: "resume" | "steer") {
+  const { goal, teams, goals } = pausedGoal(f, seen, kind === "resume" ? "paused" : "running");
+  const read = async () => f.readRecord<GoalRecord>("goal", goal.id);
+  if (kind === "resume") await goals.resume(goal.id, { requestId: randomUUID(), revision: 1 });
+  else await goals.steer(goal.id, { requestId: randomUUID(), revision: 1, text: DIRECTION });
+  goals.start();
+  const waits = `The goal's ${kind} waits for its team.`;
+  const waiting = await waitFor(read, value => value.goal.reason?.startsWith(waits) === true || value.goal.status === "blocked", 10_000);
+  assert.ok(waiting.goal.reason?.startsWith(waits), waiting.goal.reason);
+  return { goal, teams, goals, read, revision: waiting.goal.revision };
+}
+
+for (const kind of ["resume", "steer"] as const)
+for (const action of ["pause", "cancel"] as const)
+test(`the owner's ${action} of a goal whose ${kind} waits on its team's stopped command replaces that ${kind}, which never reaches the team`, async () => {
+  const f = schedulerFixture();
+  const seen = census("running");
+  const g = await waitingGoal(f, seen, kind);
+  try {
+    const stopped = await g.goals[action](g.goal.id, { requestId: randomUUID(), revision: g.revision });
+    assert.equal(stopped.status, action === "pause" ? "paused" : "cancelled");
+    const settled = await waitFor(g.read, value => !value.control, 10_000);
+    const replaced = settled.goal.events.filter(event => event.text.startsWith(`The owner's ${action} replaced the goal's ${kind} that waited for its team.`));
+    assert.equal(replaced.length, 1, JSON.stringify(settled.goal.events.slice(-4)));
+    if (kind === "steer") assert.deepEqual(settled.goal.steering.map(item => item.text), [DIRECTION], "the direction stays in the goal");
+    const team = g.teams.get(f.run.id);
+    assert.equal(team.status, action === "pause" ? "paused" : "cancelled");
+    assert.equal(team.steering.some(item => item.text === DIRECTION), false, "the team never received the replaced steer");
+  } finally {
+    await g.goals.close();
+    await g.teams.close();
+    f.close();
+  }
+});
+
+test("a halt pauses a goal whose steer waits on its team's stopped command, and the direction stays in the goal", async () => {
+  const f = schedulerFixture();
+  const seen = census("running");
+  const g = await waitingGoal(f, seen, "steer");
+  try {
+    const outcomes = await g.goals.haltPause({ haltId: randomUUID(), reason: "The owner halted all work." }, () => true);
+    assert.deepEqual(outcomes.map(item => item.result), ["paused"], JSON.stringify(outcomes));
+    const halted = await g.read();
+    assert.equal(halted.goal.status, "paused");
+    assert.deepEqual(halted.goal.steering.map(item => item.text), [DIRECTION]);
+    assert.equal(halted.goal.events.filter(event => event.text.startsWith("The halt replaced the goal's steer that waited for its team.")).length, 1);
+    assert.equal(g.teams.get(f.run.id).steering.some(item => item.text === DIRECTION), false);
+  } finally {
+    await g.goals.close();
+    await g.teams.close();
+    f.close();
+  }
+});
+
+for (const action of ["pause", "cancel"] as const)
+test(`the owner's ${action} of a mission whose steer waits on its subteam's stopped command applies at once, and the steer does not reach the stopped subteam`, async () => {
+  const f = schedulerFixture();
+  const seen = census("running");
+  const m = fencedMission(f, seen, "steer");
+  try {
+    await m.applyOps();
+    assert.deepEqual(m.ops(), ["steer"], "the steer waits");
+    const body = { requestId: randomUUID(), revision: m.missions.get(m.missionId).revision };
+    const stopped = action === "pause" ? await m.missions.pause(m.missionId, body) : await m.missions.cancel(m.missionId, body);
+    assert.equal(stopped.status, action === "pause" ? "paused" : "cancelled");
+    await endCommand(f, m.teams, seen, "running");
+    for (let pass = 0; pass < 3; pass++) await m.applyOps();
+    assert.deepEqual(m.ops(), action === "pause" ? ["steer"] : [], action === "pause" ? "the steer stays held while the mission is paused" : "the cancel drops the steer");
+    const team = m.teams.get(f.run.id);
+    assert.equal(team.status, action === "pause" ? "blocked" : "cancelled");
+    assert.equal(team.steering.some(item => item.text === DIRECTION), false);
   } finally {
     await m.missions.close();
     await m.teams.close();

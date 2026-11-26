@@ -4,6 +4,7 @@ import type { Mission, MissionSubtask } from "./mission-types.js";
 import type { MissionMessage } from "./team-prompts.js";
 import { githubReviewSource, type TeamView } from "./team-types.js";
 import { TeamError } from "./team-workspace.js";
+import { HALT_CENSUS_MS } from "./team-command-fence.js";
 import { deterministicUuid } from "./intake-types.js";
 import type { TeamService } from "./teams.js";
 import { settleCoordinatorReport, type DeliveredUnappliedBatch } from "./mission-coordinator.js";
@@ -30,7 +31,7 @@ export type MissionReviewRecord =
   | ForwardingReview
   | ReviewFields & { state: "forwarded"; forwardRequestId: string }
   | ReviewFields & { state: "superseded" | "refused"; reason: string };
-export type ReviewForwardOp = { kind: "review-forward"; subtaskId: string; teamId: string; requestId: string; text: string; source?: ConnectorSource };
+export type ReviewForwardOp = { kind: "review-forward"; subtaskId: string; teamId: string; requestId: string; text: string; source?: ConnectorSource; waiting?: string };
 type ForwardRequest = { kind: "none" } | { kind: "refused"; reason: string } | { kind: "late" } | { kind: "queued" };
 type ForwardRead = { state: "reading" } | { state: "read"; current: boolean } | { state: "failed"; at: number };
 type MissionReviewStored = {
@@ -137,10 +138,15 @@ export class MissionReview<S extends MissionReviewStored> implements MissionRevi
     const moved = this.moved(review);
     if (moved) return this.end(stored, review, "refused", moved);
     try {
-      await this.host.teams.steer(op.teamId, { requestId: op.requestId, revision: review.revision, text: op.text }, op.source ?? "coordinator");
+      await this.host.teams.steer(op.teamId, { requestId: op.requestId, revision: review.revision, text: op.text }, op.source ?? "coordinator", HALT_CENSUS_MS);
     } catch (error) {
       if (!(error instanceof TeamError)) throw error;
       if (["members-stopping", "team-operation-running", "team-paused"].includes(error.code)) return true;
+      if (error.code === "team-command-running") {
+        if (op.waiting !== error.message) this.host.event(stored, `The owner's review ${review.reviewId} for subtask ${op.subtaskId} waits for its subteam. ${error.message}`);
+        op.waiting = error.message;
+        return true;
+      }
       return this.end(stored, review, "refused", error.message);
     }
     return this.used(stored, review);

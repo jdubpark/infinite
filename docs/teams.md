@@ -2992,7 +2992,15 @@ keeps the request and retries it, with the same 30-second reuse. The goal's
 reason, or one event of the mission for each answer it gets, says that the
 request waits for the run's stopped command. While the look cannot tell, that
 answer names the owner's statement for the run; while the look sees the
-command's processes, the host refuses the statement.
+command's processes, the host refuses the statement. The owner's review on
+GitHub waits the same way, whether it steers the run directly or through the
+mission coordinator's forward: the run records one event for each answer to a
+direct review, the mission one for each answer to its forward, and the wait
+does not count as a refusal of the coordinator's report. The owner's pause or
+cancel of the goal, or a halt, replaces a goal's Resume or steer that waits this
+way; a replaced steer's direction stays in the goal's steering and does not
+reach the run. A mission's pause or cancel is not held by such a request: the
+request waits while the mission is paused, and a cancel drops it.
 
 The look supports no prefix, or a `sudo` prefix whose launcher has the
 `process-census` wrapper beside it. Under any other prefix, the instance

@@ -16,6 +16,7 @@ export type ReviewIntent = {
   requestId: string; targetRevision: number;
   state: "pending" | "applied" | "superseded" | "refused"; reason?: string;
   mission?: MissionReviewTarget & { pullRequestUrl: string };
+  waiting?: string;
 };
 export type ReviewIntake = { intents: ReviewIntent[]; handled: string[]; accepted: number; ended?: { at: string; reason: string } };
 export type OwnerReview = { id: string; state: ReviewFeedbackEntry["state"]; submittedAt: string; body: string; commit?: string };

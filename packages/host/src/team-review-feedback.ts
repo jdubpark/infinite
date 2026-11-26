@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { githubReviewSource, type GithubReviewSource } from "./team-types.js";
 import { hostGithubGrantEnvironment } from "./github-grants.js";
 import { teamCommand, TeamError } from "./team-workspace.js";
+import { HALT_CENSUS_MS } from "./team-command-fence.js";
 import { unseal, writeSealed } from "./vault.js";
 import type { TeamKernel } from "./team-kernel.js";
 import type { Stored } from "./teams.js";
@@ -15,7 +16,7 @@ import {
 export type ReviewFeedbackHost = Pick<TeamKernel, "records" | "config" | "save" | "event" | "enqueue"> & {
   readonly key: Buffer;
   readonly directory: string;
-  steer(id: string, input: { requestId: string; revision: number; text: string }, source: GithubReviewSource): Promise<unknown>;
+  steer(id: string, input: { requestId: string; revision: number; text: string }, source: GithubReviewSource, censusReuseMs?: number): Promise<unknown>;
   held(projectId: string): boolean;
   now(): number;
   block?(stored: Stored, error: unknown): void;
@@ -192,11 +193,12 @@ export class TeamReviewFeedback {
     if (this.closed) return;
     let outcome: "applied" | "refused" | undefined, reason: string | undefined;
     try {
-      if (!intent.mission) await this.host.steer(id, { requestId: intent.requestId, revision: intent.targetRevision, text: intent.text }, githubReviewSource(intent.reviewId));
+      if (!intent.mission) await this.host.steer(id, { requestId: intent.requestId, revision: intent.targetRevision, text: intent.text }, githubReviewSource(intent.reviewId), HALT_CENSUS_MS);
       else if (await this.missions?.direct(intent.mission.missionId, { requestId: intent.requestId, runId: id, subtaskId: intent.mission.subtaskId, reviewId: intent.reviewId,
         pullRequestUrl: intent.mission.pullRequestUrl, text: intent.text, revision: intent.targetRevision, headCommit: intent.commit }) !== "applied") return;
       outcome = "applied";
     } catch (error) {
+      if (error instanceof TeamError && error.code === "team-command-running") return await this.wait(id, intent, error.message);
       if (error instanceof TeamError && error.code !== "team-operation-running") { outcome = "refused"; reason = error.message; }
       else console.warn("A review's steer did not run; it is retried at the next interval.", error instanceof Error ? error.message : "unknown error");
     }
@@ -204,6 +206,16 @@ export class TeamReviewFeedback {
     await this.host.enqueue(id, () => {
       const stored = this.current(id, intent);
       if (stored) this.settle(stored, intent, outcome, reason);
+    });
+  }
+
+  private wait(id: string, intent: ReviewIntent, reason: string) {
+    return this.host.enqueue(id, () => {
+      const stored = this.current(id, intent), saved = stored?.reviewIntake?.intents.find(item => item.requestId === intent.requestId);
+      if (!stored || !saved || saved.waiting === reason) return;
+      saved.waiting = reason;
+      this.host.event(stored, `The owner's review ${saved.reviewId} waits for this run. ${reason}`);
+      this.host.save(stored);
     });
   }
 

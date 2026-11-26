@@ -33,6 +33,11 @@ export async function moveWorkerClock(worker: ChildProcess, file: string, ms: nu
   await waitFor(async () => readFileSync(file, "utf8"), text => text === `moved ${ms}`);
 }
 
+export async function settleAll(work: readonly Promise<unknown>[]) {
+  const failure = (await Promise.allSettled(work)).find(result => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
+}
+
 export function processes(): { pid: number; parent: number; command: string }[] {
   return execFileSync("ps", ["-ww", "-eo", "pid=,ppid=,args="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).split("\n").flatMap(line => {
     const row = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);

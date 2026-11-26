@@ -307,7 +307,7 @@ import InfiniteCore
             connectionLost()
             notice = session.status == "running"
                 ? "Terminal stream closed. Checking server status; your draft stays here."
-                : "This session is \(session.status). Your draft stays here."
+                : "This session is \(session.status).\(session.outputTailIncomplete ? " The recording may be missing the session’s last output." : "") Your draft stays here."
             return
         }
         let message = event["message"]

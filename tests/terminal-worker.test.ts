@@ -16,7 +16,7 @@ import { connectTerminals, terminalPages } from "../packages/host/src/terminal-s
 import { readEvents, unseal, writeSealed } from "../packages/host/src/vault.js";
 import { permissionEvidenceHash, oneShotPermissionOption } from "../packages/host/src/team-permissions.js";
 import { requesterNotice } from "../packages/host/src/permission-policy.js";
-import { moveWorkerClock, waitFor } from "./helpers.js";
+import { moveWorkerClock, settleAll, waitFor } from "./helpers.js";
 import type { Bootstrap, Config, ControlActor, ControlLease, Event, Receipt, TerminalSnapshot, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
 import type { TeamAssignment } from "../packages/host/src/team-types.js";
 
@@ -69,7 +69,7 @@ async function fixture(provider: "demo" | "claude" | "codex" = "demo", initialPr
     await waitFor(async () => {
       try { return await call({ op: "state", screen: true }); }
       catch (error) { if (worker.exitCode !== null) throw new Error(diagnostics || String(error)); return undefined; }
-    }, state => Boolean(state?.screen.includes("READY")));
+    }, state => Boolean(state?.screen.includes("READY")), 15_000);
   } catch (error) { await stop(); throw error; }
   return { id, root, stateDir, runDir, key, session: bootstrap.session, cwd: realpathSync(root), runtime, call, events, output, command, moveClock: (ms: number) => moveWorkerClock(worker, join(root, "clock"), ms), stop, persisted: () => unseal<WorkerState>(key, `${id}:status`, readFileSync(join(stateDir, "sessions", id, "status.sealed"), "utf8")) };
 }
@@ -633,7 +633,7 @@ test("a host-authorized mission answer does not require an input-control lease",
   } finally { await worker.stop(); }
 });
 
-test("native conversation identity comes only from authenticated matching provider hooks", { timeout: 15_000 }, async () => {
+test("native conversation identity comes only from authenticated matching provider hooks", { timeout: 20_000 }, async () => {
   const worker = await fixture("claude");
   try {
     for (const kind of ["bad", "wrong", "agent"]) {

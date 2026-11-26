@@ -58,6 +58,7 @@ import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrustAsync } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize, TERMINAL_SIZE_INDEX_FILE, TerminalBarrier, TerminalSizeIndex } from "./terminal-size.js";
+import { ptyTails } from "./pty-tail.js";
 import { SignalIndex } from "./signal-index.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
@@ -199,6 +200,7 @@ function publish(next: Attention) {
   state = { ...state, attention };
 }
 function recordingFailure() {
+  if (state.status === "recording-error") return;
   state = { ...state, status: "recording-error" };
   publish(
     applyLifecycle(attention, "recording-error", new Date().toISOString()),
@@ -390,7 +392,7 @@ async function onHook(route: HookRoute, body: unknown, run?: string): Promise<Ho
     return;
   }
   if (route === "drain") { const started = drainOpen ? transcriptWatch.drainFinal() : undefined; return started ? { transcript: started } : undefined; }
-  if (route === "transcript") return state.status === "running" || drainOpen ? onTranscript(body) : undefined;
+  if (route === "transcript") return state.status === "running" || (drainOpen && state.status !== "recording-error") ? onTranscript(body) : undefined;
   if (state.status !== "running") return;
   const signals = route === "claude" ? claudeTurnSignals(mapClaudeHook(body), () => permissionChannel?.takeContinue() === true) : route === "codex" ? mapCodexHook(body) : mapCodexNotify(body);
   const linkOnly = route === "codex-notify" && !config.attention.hooks.codex;
@@ -1327,6 +1329,7 @@ const server = createServer((socket) => {
       } else if (request.op === "answer") {
         if (!validAnswer(request)) throw new Error("Invalid answer request");
         result = await serialize(() => {
+          if (state.status === "recording-error") throw new Error("Recording failed");
           if (!permissionChannel?.owns(request.promptId, request.requestId)) return answer(request);
           if (!request.missionManaged) checkControl(request);
           return permissionChannel.answer(request);
@@ -1408,7 +1411,7 @@ const permissionChannel = config.permissionChannel && session.headless?.channel 
       refusal: code => new Refusal(code),
     })
   : undefined;
-if (permissionChannel) setInterval(() => permissionChannel.tick(), 60_000).unref();
+if (permissionChannel) setInterval(() => { try { permissionChannel.tick(); } catch { recordingFailure(); } }, 60_000).unref();
 const wantsHooks =
   !session.runtime?.nativeUi &&
   (Boolean(session.handoff?.policy) || session.nativeArgs === undefined) &&
@@ -1640,6 +1643,7 @@ server.listen(workerSocket, async () => {
     };
     const onData = (data: string) => terminalBarrier.dispatch(() => output(data), Buffer.byteLength(data, "utf8"));
     child.onData(onData);
+    const tails = ptyTails(child, onData);
     const finalDrain = async () => {
       try {
         if (!hookServer || !transcriptWatch.reading) return;
@@ -1656,20 +1660,24 @@ server.listen(workerSocket, async () => {
         try { await runFinalDrain(launch, drainEnv); } finally { drainOpen = false; }
       } catch {}
     };
-    const exited = (exitCode: number) => {
+    const exited = (exitCode: number, forced = false) => {
       if (permissionChannel?.exited(exitCode)) return;
       native?.stop();
       void hybrid?.close().catch(() => {}); executor?.close();
       try {
         flush();
         controller = null;
-        state = { ...state, status: "exited", exitCode, control: null };
+        const tail = tails.marker(forced ? child : undefined);
+        state = { ...state, status: "exited", exitCode, control: null, ...tail };
         publish(applyLifecycle(attention, "exited", new Date().toISOString()));
-        append("lifecycle", { status: "exited", exitCode });
+        append("lifecycle", { status: "exited", exitCode, ...tail });
         signalIndex?.checkpoint(journal.seq);
         persist();
       } catch {
         recordingFailure();
+        controller = null;
+        state = { ...state, exitCode, control: null };
+        try { persist(); } catch {}
       }
       void (async () => {
         await finalDrain();
@@ -1699,18 +1707,21 @@ server.listen(workerSocket, async () => {
       sizeIndex.append(resumedEvent.seq, { cols: terminal.cols, rows: terminal.rows });
       persist();
       pty.onData(onData);
+      tails.track(pty);
       pty.onExit(onExit);
     };
-    endSession = () => terminalBarrier.dispatch(() => exited(0));
+    endSession = () => terminalBarrier.dispatch(() => exited(0, true));
   } catch (error) {
     state = { ...state, status: "exited", exitCode: 1 };
     publish(applyLifecycle(attention, "exited", new Date().toISOString()));
-    journal.append("lifecycle", {
-      status: "exited",
-      error: (error as Error).message,
-    });
-    signalIndex?.checkpoint(journal.seq);
-    persist();
+    try {
+      journal.append("lifecycle", {
+        status: "exited",
+        error: (error as Error).message,
+      });
+      signalIndex?.checkpoint(journal.seq);
+      persist();
+    } catch {}
     void exitWorker(1);
   }
 });

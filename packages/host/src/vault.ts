@@ -5,6 +5,7 @@ import {
   closeSync,
   writeSync,
   fsyncSync,
+  fstatSync,
   renameSync,
   rmSync,
   readFileSync,
@@ -77,13 +78,19 @@ export function writeSealed(
   }
 }
 
-const SEGMENT_SIZE = 256;
+export const SEGMENT_SIZE = 256;
+export const MAX_EVENT_PAGE_BYTES = 512 * 1024;
+export interface JournalAppendMeta {
+  segment: string;
+  bytes: number;
+}
 export class Journal {
   seq = 0;
   constructor(
     readonly directory: string,
     readonly key: Buffer,
     readonly sessionId: string,
+    private readonly options?: { onAppend?: (event: Event, meta: JournalAppendMeta) => void },
   ) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const segments = readdirSync(directory)
@@ -118,21 +125,21 @@ export class Journal {
           .map((event) => seal(this.key, `${this.sessionId}:${event.seq}`, event) + "\n")
           .join(""),
       );
-      const fd = openSync(
-        join(this.directory, `${String(segment).padStart(10, "0")}.journal`),
-        "a",
-        0o600,
-      );
+      const name = `${String(segment).padStart(10, "0")}.journal`;
+      const fd = openSync(join(this.directory, name), "a", 0o600);
+      let segmentBytes = 0;
       try {
         let offset = 0;
         while (offset < bytes.length) offset += writeSync(fd, bytes, offset);
         fsyncSync(fd);
+        segmentBytes = fstatSync(fd).size;
       } finally {
         closeSync(fd);
       }
+      this.seq = events[end - 1].seq;
+      for (let at = start; at < end; at++) this.options?.onAppend?.(events[at], { segment: name, bytes: segmentBytes });
       start = end;
     }
-    this.seq += events.length;
     return events;
   }
 }
@@ -160,7 +167,7 @@ export function readEvents(
     for (let i = 0; i < lines.length; i++) {
       const seq = segment * SEGMENT_SIZE + i + 1;
       if (seq <= after) continue;
-      if (events.length >= limit || totalBytes >= 512 * 1024)
+      if (events.length >= limit || totalBytes >= MAX_EVENT_PAGE_BYTES)
         return { events, cursor: scanned, more: true };
       const event = unseal<Event>(key, `${sessionId}:${seq}`, lines[i]);
       if (event.seq !== seq) throw new Error("Journal sequence mismatch");

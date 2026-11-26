@@ -14,7 +14,7 @@ import { accountSettingPrompt, PROVIDER_NAMES, recoveryTurnEnd, type Prompt, typ
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { buildTeamPendingOperation, createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamMemberRetireSchema, teamParallelismSchema, recordedTeamReportEnvelopeSchema, type CreateTeam, type TeamContinue, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryView, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
-import { deliveryPromptStale, pullRequestBranch, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
+import { deliveryPromptStale, pullRequestBranch, refreshReportingInstructions, retargetPrompt, TEAM_PROMPT_LIMIT_BYTES, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
 import { reviewEvidenceProblems } from "./team-acceptance.js";
 import { memberCodeModeExpected, teamModelLaunch } from "./launch.js";
 import { CheckOutputScanner, checkFeedback } from "./team-check-output.js";
@@ -33,7 +33,7 @@ import type { Blackboard } from "./evidence/blackboard.js";
 import { canonicalJson } from "./evidence/crypto.js";
 import { entryToolsFor } from "./entry-roles.js";
 import type { RoutingRecorder } from "./routing-recorder.js";
-import { assertTaskProfiles, fallbackProfile, fallbackRule, routingComponent } from "./routing-rules.js";
+import { assertTaskProfiles, fallbackProfile, routingComponent } from "./routing-rules.js";
 import { ENTRY_DROP_TEXT, ENTRY_INGEST_MEMBERS, ENTRY_INGEST_MS, EntryIngestQueue, ingestRunMemberEntries } from "./team-entry-ingest.js";
 import { MAX_OUTBOX_EVENTS, appendRunEvent as runEvent, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
 import { taskFeatures } from "./task-features.js";
@@ -58,6 +58,7 @@ import type { PermissionHost } from "./team-permission-agent.js";
 import { TeamPermissionReview } from "./team-permission-review.js";
 import { teamRetentionState, TeamRetention, type RetentionHost } from "./team-retention.js";
 import { TeamPublisher, type PublisherHost } from "./team-publisher.js";
+import { applyLaunchHoldReason, commitProviderLimitSwitch, ENRICH_LIMIT, escalationRetargetFor, evaluateLaunchAdmission, expireQueuedPermissionReview, isBenignEnrichError, isBenignFenceError, isBenignOutboxError, isBenignSourceRefreshError, isBenignStopError, isDeferredWorkerMember, limitFallbackEligibility, resolveLaunchHoldReason, TeamDiagnostics, TrackedTaskSet, type TeamDiagnosticsSnapshot } from "./team-diagnostics.js";
 import { TeamReviewFeedback, type ReviewFeedbackHost } from "./team-review-feedback.js";
 import type { ReviewIntake } from "./review-feedback.js";
 import { TeamRecovery, automaticOperationRecoveryCodes, deliveryBranchMatches, deliveryInspectionHash, genericOperationFailureReason, interruptedOperationReason, recoverableOperationFailure, recoverableUnattributedResult, type RecoveryHost } from "./team-recovery.js";
@@ -101,12 +102,8 @@ export type TeamServiceOptions = {
 };
 export type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string>;
   evidenceHeldAt?: string };
-const ENRICH_LIMIT = 16;
-let enrichSkipLogged = false;
 const ENTRY_DRAIN_RUNS = 4;
 const REVIEW_QUIET_WINDOW_MS = 5 * 60_000;
-const droppedEventKinds = new Set<string>();
-const unbuiltEventKinds = new Set<string>();
 const SESSION_SLOT_REASON = "Waiting for an available host session slot.";
 export type PendingOperation = { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number;
   source?: { memberId: string; role: TeamMember["role"]; cwd: string; baseCommit: string; headCommit: string; workspace: "member" | "integration" };
@@ -117,7 +114,7 @@ export type PendingOperation = { id: string; kind: "prepare" | "member" | "resul
 type OperationCensus = { pendingId: string; at: string; state: "running" | "in-use" | "ended" | "unknown"; recorded?: number; using?: number; detail?: string };
 const CENSUS_TTL_MS = 10 * 60_000;
 const WITNESS_SAVE_MS = 200;
-type OperationRecorder = { pendingId: string; inFlight: number; sampling?: true; save?: NodeJS.Timeout };
+type OperationRecorder = { pendingId: string; inFlight: number; spawning: number; sampling?: true; save?: NodeJS.Timeout };
 function operationCensusEvent(kind: PendingOperation["kind"], census: Omit<OperationCensus, "at" | "pendingId">) {
   if (census.state === "running") return `The host still sees ${census.recorded} process(es) that match its record of the interrupted ${kind} operation${census.using ? `, and ${census.using} more using this run's directory` : ""}.`;
   if (census.state === "in-use") return `The host sees ${census.using} process(es) using this run's directory. None matches its record of the interrupted ${kind} operation.`;
@@ -163,7 +160,7 @@ const receiptDigest = <T extends object>(value: T & { source?: SteeringSource | 
 const heldWaiting = (stored: Stored) => stored.run.status === "paused" && stored.ownerHalt?.waiting === true;
 const holdsWorkerSlot = (member: TeamMember, revision: number) => member.revision === revision &&
   (member.role === "scout" || member.role === "implementer") &&
-  (["queued", "running", "unavailable"].includes(member.status) || member.status === "reported" && !member.exitConfirmedAt);
+  (!isDeferredWorkerMember(member) && ["queued", "running", "unavailable"].includes(member.status) || member.status === "reported" && !member.exitConfirmedAt);
 export const providerInputReason = "A provider needs user input. Open the member session to respond; the team will not approve it.";
 const permissionReviewReason = "The permission coordinator is reviewing a provider request.";
 const permissionAgentReason = "The permission agent is deciding a provider request.";
@@ -261,7 +258,8 @@ export class TeamService {
   private readonly retiredRunIds = new Set<string>();
   private readonly queues = new KeyedQueue();
   private readonly pendingCreates = new PendingCreates();
-  private readonly activeTicks = new Set<Promise<unknown>>();
+  private readonly diag = new TeamDiagnostics(() => this.options?.now?.() ?? Date.now());
+  private readonly activeTicks = new TrackedTaskSet<Promise<unknown>>(() => this.diag.idle.bump());
   private timer?: NodeJS.Timeout;
   private running = false;
   private closed = false;
@@ -292,9 +290,9 @@ export class TeamService {
   private readonly replays = new TeamReplay({ config: () => this.config, emit: (s, k, keys, ids, data) => this.emit(s as Stored, k, keys, ids, data), save: s => this.save(s as Stored), cancel: s => this.enqueue((s as Stored).run.id, () => this.stopRun(s as Stored, "cancel")), sessionStatus: async id => (await this.manager.state(id).catch(() => undefined))?.status, activeMember,
     prepare: (s, o, p) => this.prepareMember(s as Stored, "judge", undefined, undefined, o, p),
     operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m) });
-  private readonly intentChecks = new TeamIntent({ prepare: (s, r, f, o, p) => this.prepareMember(s as Stored, r, undefined, f, o, p), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t), block: (s, e, m) => this.block(s as Stored, e, m), project: run => this.config.projects.find(project => project.id === run.projectId), limited: () => this.limits.limited(), prefix: () => this.config.teams?.commandPrefix });
+  private readonly intentChecks = new TeamIntent({ prepare: (s, r, f, o, p) => this.prepareMember(s as Stored, r, undefined, f, o, p), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t), block: (s, e, m) => this.block(s as Stored, e, m), project: run => this.config.projects.find(project => project.id === run.projectId), limited: () => this.limits.limited(this.currentDate()), prefix: () => this.config.teams?.commandPrefix });
   private readonly objectiveTests = new TeamRegister({ holder: id => this.records.get(id), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], workspace: s => { try { this.assertRunPath(s as Stored, s.run.workspace); return s.run.workspace; } catch { return undefined; } }, enqueue: (runId, work) => this.enqueue(runId, work), save: s => this.save(s as Stored), event: (s, text) => this.event(s as Stored, text), prefix: () => this.config.teams?.commandPrefix, now: timestamp });
-  readonly verdicts = new TeamVerdicts({ holder: id => this.records.get(id), prepare: (s, o, p) => this.prepareMember(s as Stored, "evaluator", undefined, undefined, o, p), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t), emit: (s, d) => this.emitWith(s as Stored, "verdict.recorded", [d.verdictId], { revision: s.verdict?.revision ?? s.run.revision }, () => d), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], limited: () => this.limits.limited(), prefix: () => this.config.teams?.commandPrefix, register: this.objectiveTests, now: timestamp, uuid: randomUUID });
+  readonly verdicts = new TeamVerdicts({ holder: id => this.records.get(id), prepare: (s, o, p) => this.prepareMember(s as Stored, "evaluator", undefined, undefined, o, p), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t), emit: (s, d) => this.emitWith(s as Stored, "verdict.recorded", [d.verdictId], { revision: s.verdict?.revision ?? s.run.revision }, () => d), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], limited: () => this.limits.limited(this.currentDate()), prefix: () => this.config.teams?.commandPrefix, register: this.objectiveTests, now: timestamp, uuid: randomUUID });
   private reconciledAt = 0;
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService, private readonly titler?: Pick<Readings, "requestTitle">, private readonly options?: TeamServiceOptions) {
     this.directory = join(config.stateDir, "teams");
@@ -479,15 +477,15 @@ export class TeamService {
       throw error;
     }
   }
-  providerLimits() { return this.limits.active(); }
+  private currentDate() { return new Date(this.options?.now?.() ?? Date.now()); }
+  diagnostics(): TeamDiagnosticsSnapshot { return this.diag.snapshot(); }
+  providerLimits() { return this.limits.active(this.currentDate()); }
   private confirmed(id: string): Promise<void> {
     const run = this.records.get(id)?.run;
     if (!this.linear || !run || !(run.linearTracking || run.linear)) return Promise.resolve();
     return this.linear.confirmTeam(id).then(() => undefined, () => undefined);
   }
-  private enqueue<T>(runId: string, task: () => T | Promise<T>): Promise<T> {
-    return this.queues.enqueue(runId, task);
-  }
+  private enqueue<T>(runId: string, task: () => T | Promise<T>): Promise<T> { this.diag.idle.bump(); return this.queues.enqueue(runId, task); }
   private record(id: string) {
     const stored = this.records.get(id);
     if (!stored) throw new TeamError(404, "team-not-found", "This team does not exist.");
@@ -596,13 +594,13 @@ export class TeamService {
     const ready = run.tasks.filter(task => task.status === "pending" && task.dependsOn.every(id => run.tasks.find(item => item.id === id)?.status === "integrated")).length +
       (run.discovery && run.discovery.revision === run.revision && !run.discovery.completedAt ? run.discovery.tasks.filter(task => task.status === "pending").length : 0);
     const workers = { limit: run.parallelism, max, running: members.filter(member => holdsWorkerSlot(member, run.revision)).length, ready };
-    return { ...safeRun, ...(stored.pending ? { pendingOperation: buildTeamPendingOperation({ id: stored.pending.id, kind: stored.pending.kind, revision: stored.pending.revision, failure: stored.pending.failure, source: stored.pending.source, census: stored.census?.pendingId === stored.pending.id ? stored.census : undefined }) } : {}), tasks: safeRun.tasks.map(task => {
+    return { ...safeRun, ...(this.publisher.isPublicationPending(stored) ? { publishing: true } : {}), ...(stored.pending ? { pendingOperation: buildTeamPendingOperation({ id: stored.pending.id, kind: stored.pending.kind, revision: stored.pending.revision, failure: stored.pending.failure, source: stored.pending.source, census: stored.census?.pendingId === stored.pending.id ? stored.census : undefined }) } : {}), tasks: safeRun.tasks.map(task => {
       const revision = task.revision ?? safeRun.revision;
       const attempts = withUsage.members.filter(member => member.taskId === task.id && member.revision === revision);
       const usage = attempts.flatMap(member => member.usage?.messages ? [member.usage] : []);
       const coverage = combineCoverage(attempts.map(member => member.usage ?? { coverage: "none" as const }));
       return { ...task, revision, limitations: taskLimitations(task), ...(usage.length ? { usage: { usd: Math.round(usage.reduce((n, row) => n + row.cost, 0) * 1_000_000) / 1_000_000, unpriced: usage.reduce((n, row) => n + row.pricing.unknown, 0), tokens: usage.reduce((n, row) => n + Object.values(row.tokens).reduce((a, b) => a + b, 0), 0), attempts: attempts.length, profiles: [...new Set(attempts.map(member => member.modelProfile?.id).filter((id): id is string => Boolean(id)))].sort(), coverage: coverage.coverage as "partial" | "complete", ...(coverage.reason ? { coverageReason: coverage.reason } : {}) } } : {}) };
-    }), members: withUsage.members, usage: withUsage.rollup, providerLimits: this.limits.active(), workers };
+    }), members: withUsage.members, usage: withUsage.rollup, providerLimits: this.limits.active(this.currentDate()), workers };
   }
   private save(stored: Stored) {
     const retention = this.retentionState(stored);
@@ -652,7 +650,7 @@ export class TeamService {
   private async ingestEntriesAsync() { if (this.options?.entries && this.entryQueue.size > 0) await mapConcurrent(this.ingestGroups(), 16, ([runId, memberIds]) => this.enqueue(runId, () => { this.ingestRun(runId, memberIds); })); }
   private sealedRun(id: string): TeamRun | undefined {
     try { return unseal<Stored>(this.key, `team:${id}`, readFileSync(join(this.directory, `${id}.sealed`), "utf8")).run; }
-    catch { return undefined; }
+    catch (error) { if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") this.diag.warnUnexpected("sealed-run", error); return undefined; }
   }
   private emitStatusEvents(stored: Stored, statusAt: string) {
     const run = stored.run;
@@ -680,45 +678,33 @@ export class TeamService {
         data: { v: 1, ...Object.fromEntries(Object.entries(data).filter(([, value]) => value !== undefined)) },
       };
       const problem = eventProblem(event);
-      if (problem !== undefined) {
-        if (!droppedEventKinds.has(kind)) {
-          droppedEventKinds.add(kind);
-          console.warn(`A run event of kind ${kind} was dropped: ${problem}.`);
-        }
-        return;
-      }
+      if (problem !== undefined) { this.diag.warnDroppedEventKind(kind, problem); return; }
       if (outbox.length >= MAX_OUTBOX_EVENTS) {
         outbox.shift();
         stored.ledgerGap = { dropped: (stored.ledgerGap?.dropped ?? 0) + 1, firstAt: stored.ledgerGap?.firstAt ?? timestamp() };
       }
       outbox.push(event);
-    } catch { }
+    } catch (error) { this.diag.warnUnexpected("emit", error); }
   }
   private emitWith(stored: Stored, kind: string, keyParts: readonly (string | number)[],
     ids: { memberId?: string; taskId?: string; revision?: number }, build: () => Record<string, unknown>): void {
     if (!this.options?.events) return;
     let data: Record<string, unknown>;
     try { data = build(); }
-    catch {
-      if (!unbuiltEventKinds.has(kind)) {
-        unbuiltEventKinds.add(kind);
-        console.warn(`A run event of kind ${kind} could not be built; the run continues without it.`);
-      }
-      return;
-    }
+    catch { this.diag.warnUnbuiltEventKind(kind); return; }
     this.emit(stored, kind, keyParts, ids, data);
   }
   private captureIntegrated(stored: Stored, member: TeamMember, task: TeamTask, commit: string, head: string): void {
     try {
       if (!this.options?.capture?.enabled(stored.run.projectId)) return;
       this.options?.capture?.integrated(captureStart(stored.run, task, member, { commit, head, at: timestamp() }));
-    } catch { }
+    } catch (error) { this.diag.warnUnexpected("capture-integrated", error); }
   }
   private captureApproved(stored: Stored, reviewedHead: string): void {
     try {
       if (!this.options?.capture?.enabled(stored.run.projectId)) return;
       this.options?.capture?.approved({ runId: stored.run.id, workspace: stored.run.workspace, anchorCommit: stored.run.baseCommit, reviewedHead, at: timestamp() });
-    } catch { }
+    } catch (error) { this.diag.warnUnexpected("capture-approved", error); }
   }
   private linkReplacement(stored: Stored, next: TeamMember, previous: TeamMember, cause: ReplacementCause): void {
     if (previous.goalCriteriaPlan) next.goalCriteriaPlan = previous.goalCriteriaPlan;
@@ -746,7 +732,7 @@ export class TeamService {
       stored.ledgerGap = undefined;
       this.emit(stored, "ledger.gap", [gap.firstAt], {}, { dropped: gap.dropped });
       return this.flushOutbox(stored, true);
-    } catch { return false; }
+    } catch (error) { if (!isBenignOutboxError(error, this.closed)) this.diag.warnUnexpected("flush-outbox", error); return false; }
   }
   private async nameRequest(id: string, objective: string) {
     try {
@@ -759,7 +745,7 @@ export class TeamService {
         run.titleSource = "model";
         this.save(stored);
       });
-    } catch { }
+    } catch (error) { if (!isBenignFenceError(error, this.closed)) this.diag.warnUnexpected("name-request", error); }
   }
   private event(stored: Stored, text: string) { runEvent(stored.run, text); }
   private async noteLeftover(stored: Stored, result: CommandResult) {
@@ -873,6 +859,7 @@ export class TeamService {
       startPublication: stored => service.startPublication(stored),
       refreshOperationCensus: (stored, force) => service.refreshOperationCensus(stored, force),
       closeStaleBlockedRun: (stored, hours) => service.closeStaleBlockedRun(stored, hours),
+      onBackgroundTask: () => service.diag.idle.bump(),
     };
   }
   private get removingRuns() { return this.retention.removingRuns; }
@@ -892,6 +879,7 @@ export class TeamService {
       enqueue: (runId, task) => service.enqueue(runId, task),
       get options() { return service.options; },
       retentionNow: () => service.retentionNow(),
+      onBackgroundTask: () => service.diag.idle.bump(),
     };
   }
   private get publicationTasks() { return this.publisher.publicationTasks; }
@@ -1108,7 +1096,8 @@ export class TeamService {
               this.event(stored, "GitHub could not be reached; the run starts from the last fetched base.");
             }
           } else if (githubProject && parent && this.options?.source) {
-            try { await this.options.source.refresh(project.id, { maxAgeMs: 60_000 }); } catch { }
+            try { await this.options.source.refresh(project.id, { maxAgeMs: 60_000 }); }
+            catch (error) { if (!isBenignSourceRefreshError(error, signal.aborted)) this.diag.warnUnexpected("source-refresh", error); }
             try {
               const mirrorHead = this.options.source.status(project.id).mirrorHead;
               if (mirrorHead && mirrorHead !== parent.headCommit) {
@@ -1118,7 +1107,7 @@ export class TeamService {
                   if (ancestry.exitCode === 0 && !ancestry.interrupted && !ancestry.truncated) run.baseBehind = { mirrorHead };
                 }
               }
-            } catch { }
+            } catch (error) { if (!isBenignSourceRefreshError(error, signal.aborted) && (error as NodeJS.ErrnoException)?.code !== "ENOENT") this.diag.warnUnexpected("source-ancestry", error); }
           }
           const prepareWorkspace = async () => {
             assertParent();
@@ -1191,7 +1180,7 @@ export class TeamService {
       if (!receipt) return this.view(stored);
       if (stored.run.pullRequest && !pullRequestBranch(stored.run)) await this.reviewFeedback.resolveLegacyPullRequestBranch(stored);
       this.commands.get(id)?.abort();
-      await this.invalidatePermissionDecisions(stored, "The team revision changed before the permission request could be answered.");
+      await this.invalidatePermissionDecisions(stored, "A steer started before the permission request could be answered.");
       this.recordReceipt(stored, body.requestId, receipt);
       if (stored.run.recovery && stored.run.recovery.status !== "exhausted") {
         stored.run.recovery.status = "exhausted";
@@ -1376,7 +1365,8 @@ export class TeamService {
     let uncertain = false;
     for (const decision of inFlight) {
       let fence: "invalidated" | "uncertain" = "uncertain";
-      try { fence = await this.manager.invalidateTeamPermission(decision.targetSessionId, decision.id); } catch { }
+      try { fence = await this.manager.invalidateTeamPermission(decision.targetSessionId, decision.id); }
+      catch (error) { if (!isBenignFenceError(error, this.closed)) this.diag.warnUnexpected("permission-fence", error); }
       if (fence !== "invalidated") {
         uncertain = true;
         stored.unfencedAnswers = [...new Set([...(stored.unfencedAnswers ?? []), decision.id])];
@@ -1394,10 +1384,11 @@ export class TeamService {
       const decision = stored.run.permissionDecisions?.find(item => item.id === decisionId);
       if (!decision) continue;
       let settled = false;
-      try { settled = (await this.manager.state(decision.targetSessionId)).status === "exited"; } catch { settled = false; }
+      try { settled = (await this.manager.state(decision.targetSessionId)).status === "exited"; }
+      catch (error) { if (!isBenignFenceError(error, this.closed)) this.diag.warnUnexpected("permission-refence-state", error); settled = false; }
       if (!settled) {
         try { settled = await this.manager.invalidateTeamPermission(decision.targetSessionId, decision.id) === "invalidated"; }
-        catch { settled = false; }
+        catch (error) { if (!isBenignFenceError(error, this.closed)) this.diag.warnUnexpected("permission-refence", error); settled = false; }
       }
       if (!settled) left.push(decisionId);
     }
@@ -1472,7 +1463,7 @@ export class TeamService {
   }
   private async resumeRun(stored: Stored, inPlace = false, record?: () => void) {
     const run = stored.run;
-    if (!inPlace) await this.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
+    if (!inPlace) await this.invalidatePermissionDecisions(stored, "A resume started before the permission request could be answered.");
     record?.();
     if (inPlace) { run.status = "needs-input"; run.reason = undefined; return; }
     run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
@@ -1492,7 +1483,7 @@ export class TeamService {
     run.reason = reason;
     if (line) this.event(stored, line);
     if (action === "cancel") this.intentChecks.release(stored, "cancelled");
-    await this.invalidatePermissionDecisions(stored, `The team was ${action} before the permission request could be answered.`);
+    await this.invalidatePermissionDecisions(stored, `The team was ${action === "pause" ? "paused" : "cancelled"} before the permission request could be answered.`);
     this.commands.get(run.id)?.abort();
   }
   private waitsWithNothingInFlight(stored: Stored) {
@@ -1628,12 +1619,12 @@ export class TeamService {
             const rows = await this.manager.list().catch(() => undefined);
             if (rows) {
               await this.usage?.tick(rows).catch(() => {});
-              await this.limits.reconcile(this.manager, rows.filter(row => !learningPurpose(row.purpose))).catch(() => {});
+              await this.limits.reconcile(this.manager, rows.filter(row => !learningPurpose(row.purpose)), this.currentDate()).catch(() => {});
             }
           }
           await mapConcurrent([...this.records.keys()], 16, id => this.enqueue(id, async () => {
             const stored = this.records.get(id);
-            if (stored && !this.closed) { try { await this.step(stored); } catch {} }
+            if (stored && !this.closed) { try { await this.step(stored); } catch (error) { if (!this.closed) this.diag.warnUnexpected("step", error); } }
           }));
           if (this.closed) return;
           this.drainEntries();
@@ -1648,12 +1639,12 @@ export class TeamService {
   }
   async close(): Promise<void> { const reviewFeedback = this.reviewFeedback.close(); this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const timer of this.sampleTimers) clearTimeout(timer); this.sampleTimers.clear(); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); for (const controller of this.memberWorkSaveControllers.values()) controller.abort(); for (const controller of this.agentControllers.values()) controller.abort(); this.objectiveTests.close(); this.removeAgentSource?.(); while (this.activeTicks.size > 0) await Promise.allSettled([...this.activeTicks]); await Promise.allSettled([reviewFeedback, this.queues.drain()]); }
   async idle() {
-    await this.reviewFeedback.settled();
-    while (this.activeTicks.size > 0) await Promise.allSettled([...this.activeTicks]);
-    await this.queues.settle();
-    for (let pass = 0; pass < 5 && this.removalTasks.size; pass++) { await Promise.allSettled([...this.removalTasks]); await this.queues.settle(); }
-    for (let pass = 0; pass < 5 && (this.publicationTasks.size || this.memberWorkSaveTasks.size); pass++) { await Promise.allSettled([...this.publicationTasks, ...this.memberWorkSaveTasks]); await this.queues.settle(); }
-    await this.queues.settle();
+    await this.diag.idle.drain({
+      reviewFeedback: () => this.reviewFeedback.settled(),
+      activeTicks: this.activeTicks, removalTasks: this.removalTasks,
+      publicationTasks: this.publicationTasks, memberWorkSaveTasks: this.memberWorkSaveTasks,
+      queuesSize: () => this.queues.size, settleQueues: () => this.queues.settle(),
+    }, { onUnsettled: detail => this.diag.warnIdleUnsettled(detail) });
   }
   private stallWindow() { return (this.config.teams?.stallMinutes ?? 30) * 60000; }
   private stallWindowFor(member: TeamMember) {
@@ -1712,23 +1703,28 @@ export class TeamService {
     }
   }
   private commandRecorder(stored: Stored, id: string): CommandScope {
-    const recorder: OperationRecorder = { pendingId: id, inFlight: 0 };
+    const recorder: OperationRecorder = { pendingId: id, inFlight: 0, spawning: 0 };
     this.recorders.set(stored.run.id, recorder);
     const settle = () => { recorder.inFlight--; this.saveWitnessSoon(stored, recorder); };
+    const failed = () => new TeamError(409, "command-unavailable", "The team operation failed; the command was not started.");
     this.saveWitnessSoon(stored, recorder);
     return {
       starting: () => {
+        if (this.intent(stored, id)?.failure) return Promise.reject(failed());
         recorder.inFlight++;
+        recorder.spawning++;
         if (this.intent(stored, id)?.recording) return undefined;
         return this.enqueue(stored.run.id, () => {
           if (this.closed) throw new TeamError(409, "command-unavailable", "The host is stopping; the command was not started.");
           const pending = this.intent(stored, id);
+          if (pending?.failure) throw failed();
           if (!pending || pending.recording) return;
           pending.recording = true;
           try { this.save(stored); } catch (error) { delete pending.recording; throw error; }
-        }).catch(error => { recorder.inFlight--; throw error; });
+        }).catch(error => { recorder.inFlight--; recorder.spawning--; throw error; });
       },
       started: pid => {
+        recorder.spawning--;
         const witness = this.intent(stored, id)?.witness;
         if (pid === undefined || !witness) { settle(); return; }
         if (process.platform !== "win32") recordCommand(witness, pid);
@@ -1831,9 +1827,10 @@ export class TeamService {
       this.save(stored);
     }), error => this.enqueue(stored.run.id, () => {
       if (this.closed || stored.pending?.id !== pending.id) return;
+      this.commands.get(stored.run.id)?.abort();
       this.commands.delete(stored.run.id);
-      const failed = stored.pending;
-      if (this.recorderOf(stored, failed)?.inFlight === 0) delete failed.recording;
+      const failed = stored.pending, recorder = this.recorderOf(stored, failed);
+      if (recorder?.spawning === 0 && (process.platform !== "win32" || recorder.inFlight === 0)) delete failed.recording;
       failed.failure = { code: error instanceof TeamError ? error.code : "workspace-operation-failed",
         reason: error instanceof Error ? error.message : "A team workspace operation failed.", at: timestamp() };
       this.save(stored);
@@ -1929,6 +1926,11 @@ export class TeamService {
     if (state.status !== "exited") return undefined;
     member.status = "stopped"; return state;
   }
+  private expirePermissionDecision(stored: Stored, decision: TeamPermissionDecision, expired: ReturnType<typeof expireQueuedPermissionReview>) {
+    if (!expired.decisionChanged) return false;
+    if (decision.purpose === "diagnose" && expired.recovery) return this.queuePermissionRecoveryPm(stored, expired.recovery, decision.reason!, decision.id);
+    this.finishLinkedPermissionRecovery(stored, decision, decision.reason!, "coordinator-timeout", "review-expired", "No provider answer was sent; the request remains with the owner."); return false;
+  }
   private async stopObsoletePermissionCoordinators(stored: Stored) {
     const run = stored.run;
     for (const member of run.members.filter(item => item.role === "permission-coordinator" &&
@@ -1958,7 +1960,7 @@ export class TeamService {
           if (obsolete && state.status === "running" && state.attention.state === "needs-you" &&
               (!state.control || state.control.expiresAt <= Date.now()) && prompt && recovery)
             continuedAfterExpansion = this.advanceExpandedPermissionPrompt(stored, recovery, target, prompt);
-        } catch { obsolete = true; }
+        } catch (error) { if (!isBenignFenceError(error, this.closed)) this.diag.warnUnexpected("permission-target-state", error); obsolete = true; }
       }
       if (!obsolete) continue;
       const decisionChanged = decision?.status === "reviewing";
@@ -1984,7 +1986,7 @@ export class TeamService {
       const wasUnavailable = member.status === "unavailable";
       let stopConfirmed = false;
       try { stopConfirmed = Boolean(await this.stopped(member)); }
-      catch { }
+      catch (error) { if (!isBenignStopError(error, this.closed)) this.diag.warnUnexpected("stop-permission-coordinator", error); }
       if (!stopConfirmed) {
         member.status = "unavailable";
         if (!wasUnavailable) {
@@ -2089,25 +2091,26 @@ export class TeamService {
       this.assertRunPath(stored, run.workspace);
       for (const member of run.members.filter(item => item.revision === run.revision && activeMember(item))) {
         if (member.status === "queued") {
+          const decision = member.role === "permission-coordinator" && !this.hasLaunch(member) ? permissionCoordinatorDecision(run, member) : undefined;
+          if (decision && this.currentDate().getTime() >= Date.parse(decision.expiresAt)) {
+            if (this.expirePermissionDecision(stored, decision, expireQueuedPermissionReview(run, member, decision, this.limits.active(this.currentDate()), { reviewing: permissionReviewReason, userInput: providerInputReason }))) return;
+            this.event(stored, "The permission coordinator exceeded its review window; the request remains with the user."); this.save(stored); continue;
+          }
           await this.launch(stored, member);
           if (run.status === "ready-for-review") return;
           continue;
         }
         if (!member.report) {
           if (member.role === "permission-coordinator" && member.startedAt && Date.now() - Date.parse(member.startedAt) > 5 * 60 * 1000) {
-            const decision = permissionCoordinatorDecision(run, member);
-            const decisionChanged = decision?.status === "reviewing", before = member.status;
+            const decision = permissionCoordinatorDecision(run, member), decisionChanged = decision?.status === "reviewing", before = member.status;
             if (decision && decisionChanged) {
               decision.status = "escalated"; decision.reason = "The five-minute review window expired without a decision.";
               const recovery = decision.recoveryRequestId ? run.permissionRecovery?.requests.find(item => item.id === decision.recoveryRequestId) : undefined;
-              if (decision.purpose === "diagnose" && recovery) {
-                if (this.queuePermissionRecoveryPm(stored, recovery, decision.reason, decision.id)) return;
-              } else this.finishLinkedPermissionRecovery(stored, decision, decision.reason, "coordinator-timeout", "review-expired",
-                "No provider answer was sent; the request remains with the owner.");
+              if (this.expirePermissionDecision(stored, decision, { decisionChanged: true, recovery })) return;
             }
             let stopConfirmed = false;
             try { stopConfirmed = Boolean(await this.stopped(member)); }
-            catch { }
+            catch (error) { if (!isBenignStopError(error, this.closed)) this.diag.warnUnexpected("stop-permission-timeout", error); }
             member.status = stopConfirmed ? "waiting" : "unavailable";
             if (stopConfirmed) member.report = undefined;
             if (decisionChanged || before !== "unavailable") this.event(stored, "The permission coordinator exceeded its review window; the request remains with the user.");
@@ -2378,16 +2381,19 @@ export class TeamService {
   private reviewerProfile(run: TeamRun): TeamModelProfile | undefined {
     return run.lineup?.permissionReviewer ?? run.lineup?.coordinator;
   }
-  private newMember(run: TeamRun, role: TeamMember["role"], cwd: string, baseCommit: string, taskId?: string, prompt?: string, pinnedProfile?: TeamModelProfile): TeamMember {
+  private newMember(run: TeamRun, role: TeamMember["role"], cwd: string, baseCommit: string, taskId?: string, prompt?: string, pinnedProfile?: TeamModelProfile, planMemberId?: string): TeamMember {
     this.assertBudget(run, true);
     const memberId = randomUUID();
     const task = role === "scout" ? run.discovery?.tasks.find(task => task.id === taskId) : run.tasks.find(task => task.id === taskId);
     let selected = pinnedProfile ?? this.memberProfile(run, role, task);
-    const limit = selected && this.limits.active().find(item => item.provider === selected!.provider);
-    const fallback = limit && run.lineup ? resolveLimitFallback(run.lineup, selected!.id, this.limits.limited(), fallbackRule(run, role)) : undefined;
-    const retargeted = fallback && prompt !== undefined ? retargetPrompt(prompt, { provider: fallback.provider, profile: fallback, role, entryTools: entryToolsFor(run, role) }) : undefined;
-    if (selected && limit && fallback && (prompt === undefined || retargeted !== undefined)) {
-      runEvent(run, `${selected.label} launched on ${fallback.label}: ${PROVIDER_NAMES[limit.provider]} is limited until ${clock(limit.expiresAt)}`);
+    const now = this.currentDate(), targetProvider = selected?.provider ?? run.provider;
+    const limit = this.limits.active(now).find(item => item.provider === targetProvider);
+    const fallback = !run.replay && selected && limit && run.lineup ? resolveLimitFallback(run.lineup, selected.id, this.limits.limited(now), limitFallbackEligibility(run, role, planMemberId)) : undefined;
+    const retargetedRaw = fallback && prompt !== undefined ? retargetPrompt(prompt, { provider: fallback.provider, profile: fallback, role, entryTools: entryToolsFor(run, role), ...(escalationRetargetFor(run, role, selected?.id, fallback.id) ? { escalation: escalationRetargetFor(run, role, selected?.id, fallback.id) } : {}) }) : undefined;
+    const retargeted = retargetedRaw !== undefined && Buffer.byteLength(retargetedRaw, "utf8") <= TEAM_PROMPT_LIMIT_BYTES ? retargetedRaw : undefined;
+    const switched = Boolean(selected && limit && fallback && (prompt === undefined || retargeted !== undefined));
+    if (switched) {
+      runEvent(run, `${selected!.label} launched on ${fallback!.label}: ${PROVIDER_NAMES[limit!.provider]} is limited until ${clock(limit!.expiresAt)}`);
       prompt = retargeted; selected = fallback;
     }
     const modelProfile = selected ? structuredClone(selected) : undefined;
@@ -2398,7 +2404,7 @@ export class TeamService {
     if (role !== "permission-coordinator" && Buffer.byteLength(instructions) > 80 * 1024)
       instructions = teamPrompt(run, role, task, prompt, provider, modelProfile, configuredProject, permissionRecoveryHistory, this.publishHeadsEnabled());
     if (Buffer.byteLength(instructions) > 80 * 1024) throw new TeamError(409, "team-prompt-too-large", "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
-    return { runId: run.id, memberId, revision: run.revision, role, ...(role === "project-manager" && !run.establishChecks && !run.verification ? { verificationRefused: true as const } : {}), ...(entryToolsFor(run, role) ? { entryTools: true as const } : {}), ...(hostProfilesFor(run, role, modelProfile?.id) ? { hostProfiles: true as const } : {}), provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: instructions, ...(prompt ? { contextFeedback: prompt } : {}), cursor: 0, stopRequestId: randomUUID() };
+    return { runId: run.id, memberId, revision: run.revision, role, ...(role === "project-manager" && !run.establishChecks && !run.verification ? { verificationRefused: true as const } : {}), ...(entryToolsFor(run, role) ? { entryTools: true as const } : {}), ...(hostProfilesFor(run, role, modelProfile?.id) ? { hostProfiles: true as const } : {}), provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), ...(limit && !switched ? { pendingLimit: true } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: instructions, ...(prompt ? { contextFeedback: prompt } : {}), cursor: 0, stopRequestId: randomUUID() };
   }
   private readMemberJournal(stored: Stored, member: TeamMember, exited = false, singlePage = false) {
     const run = stored.run;
@@ -2499,7 +2505,7 @@ export class TeamService {
     if (member.role === "delivery" && stored.deliveryAttempt) {
       this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery provider stopped at a limit. Inspect the remote branch and PR before replacing a possibly completed publication.")); return;
     }
-    const from = member.modelProfile, selected = from && run.lineup ? switchFallback(run.lineup, from.id, provider, this.limits.limited(), fallbackRule(run, member.role)) : undefined;
+    const from = member.modelProfile, selected = from && run.lineup ? switchFallback(run.lineup, from.id, provider, this.limits.limited(this.currentDate()), limitFallbackEligibility(run, member.role, stored.intentCheck?.planMemberId)) : undefined;
     const fallback = selected;
     if (!from || !fallback) {
       this.block(stored, new TeamError(409, "provider-limit", `${name} ${kind} reached at ${clock(limit.at)}${resets ? `, resets ${resets}` : ""}; no fallback profile is configured for ${from?.id ?? provider}.`));
@@ -2513,7 +2519,7 @@ export class TeamService {
       : `The previous ${member.role} stopped at a ${name} ${kind} before reporting. Its working copy was checked unchanged; complete the same assignment.`;
     this.operation(stored, "result", signal => editing ? assertMemberScope(member.cwd, member.baseCommit, task ? task.paths : run.goal?.allowedPaths, prefix, signal) : assertMemberReadOnly(member.cwd, member.baseCommit, prefix, signal), () => {
       const configuredProject = this.config.projects.find(project => project.id === run.projectId)?.team;
-      const carried = retargetPrompt(member.prompt, { provider: fallback.provider, profile: fallback, role: member.role, entryTools: entryToolsFor(run, member.role) }) ?? [teamPrompt(run, member.role, task ?? scout, undefined, fallback.provider, fallback, configuredProject, this.permissionRecoveryHistory(run), this.publishHeadsEnabled()),
+      const carried = retargetPrompt(member.prompt, { provider: fallback.provider, profile: fallback, role: member.role, entryTools: entryToolsFor(run, member.role), ...(escalationRetargetFor(run, member.role, from.id, fallback.id, member.hostProfiles === true) ? { escalation: escalationRetargetFor(run, member.role, from.id, fallback.id, member.hostProfiles === true) } : {}) }) ?? [teamPrompt(run, member.role, task ?? scout, undefined, fallback.provider, fallback, configuredProject, this.permissionRecoveryHistory(run), this.publishHeadsEnabled()),
         ...run.decisions.filter(decision => decision.answer && run.members.some(prior => prior.memberId === decision.memberId && prior.role === member.role && prior.taskId === member.taskId && prior.revision === member.revision)).map(decision => `${decisionAnswerLabel(decision)} answered: ${decision.answer}`)].join("\n\n");
       const next = this.newMember(run, member.role, member.cwd, member.baseCommit, member.taskId, `${carried}\n\n${note}`, fallback);
       next.contextFeedback = [member.contextFeedback ?? member.prompt, note].filter(Boolean).join("\n\n");
@@ -2538,7 +2544,7 @@ export class TeamService {
     if (this.publicationGate(stored, role)) return;
     const run = stored.run, routed = task && run.routing && this.router && (role === "implementer" || role === "scout") ? this.routerInput(run) : undefined;
     const start = routed && role === "implementer" ? { ...routed, run, task: task as TeamTask } : undefined, scout = routed && role === "scout" ? { run, scout: task as TeamScout, limited: routed.limited, featureMap: routed.featureMap } : undefined;
-    const member = this.newMember(run, role, "", run.headCommit!, task?.id, prebuilt?.prompt, prebuilt?.profile ?? (start && autoPinned(run) ? this.router!.applyStart(start) : scout ? this.router!.routeScout(scout) : undefined));
+    const member = this.newMember(run, role, "", run.headCommit!, task?.id, prebuilt?.prompt, prebuilt?.profile ?? (start && autoPinned(run) ? this.router!.applyStart(start) : scout ? this.router!.routeScout(scout) : undefined), stored.intentCheck?.planMemberId);
     if (role === "project-manager" && run.goal?.record) member.goalCriteriaPlan = { objectiveVersion: run.goal.record.version };
     if (start) this.router!.recordStart(start);
     const continuationHead = role === "project-manager" && stored.continuationHead?.revision === run.revision
@@ -2588,7 +2594,7 @@ export class TeamService {
   }
   private routerInput(run: TeamRun) {
     return { publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"), objectiveDigest: objectivePromptOf(run), codeMode: memberCodeModeExpected(this.config),
-      limited: this.limits.limited(), featureMap: (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features };
+      limited: this.limits.limited(this.currentDate()), featureMap: (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features };
   }
   private rebuildDeliveryPrompts(stored: Stored, target?: TeamMember): () => void {
     const run = stored.run, members = target ? [target] : run.members.filter(m => m.role === "delivery" && m.revision === run.revision && m.status === "queued");
@@ -2611,11 +2617,17 @@ export class TeamService {
       if (tracking && tracking.status !== "synced") return;
     }
     if (this.fuse && !this.hasLaunch(member) && this.fuseWait(stored, this.fuse.check({ projectId: stored.run.projectId, role: member.role }))) return;
+    let pendingSwitch: Extract<ReturnType<typeof evaluateLaunchAdmission>, { proceed: true }>["pendingSwitch"];
     if (!this.hasLaunch(member)) {
-      const hold = this.manager.hostLoad.held();
-      if (hold) { this.holdForHostLoad(stored, hold); return; }
+      const now = this.currentDate(), activeLimits = this.limits.active(now), hostLoadReason = this.manager.hostLoad.held();
+      if (run.replay) { const limit = activeLimits.find(item => item.provider === (member.provider ?? run.provider)); if (limit) { this.replays.end(stored, "void-limit", limit.resetsAt ?? limit.expiresAt); return; } }
+      const workerCapacityFull = (member.role === "scout" || member.role === "implementer") && run.members.filter(other => other !== member && holdsWorkerSlot(other, run.revision) && (isDeferredWorkerMember(member) || other.status !== "queued")).length >= run.parallelism;
+      const sessionSlotFull = !hostLoadReason && (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= this.config.maxSessions;
+      const gate = evaluateLaunchAdmission(run, member, activeLimits, this.limits.limited(now), SESSION_SLOT_REASON, text => this.event(stored, text), { planMemberId: stored.intentCheck?.planMemberId, workerCapacityFull, hostLoadReason, sessionSlotFull });
+      if (gate.changed) this.save(stored);
+      if (!gate.proceed) return;
+      pendingSwitch = gate.pendingSwitch;
     }
-    if (!this.hasLaunch(member) && (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= this.config.maxSessions) { stored.run.reason = SESSION_SLOT_REASON; this.save(stored); return; }
     if (member.role === "delivery") {
       this.assertDelivery(stored);
       if (!this.hasLaunch(member) && this.holdAutomaticMerge(stored, member)) return;
@@ -2633,6 +2645,7 @@ export class TeamService {
       }
       this.save(stored);
     }
+    const undoSwitch = pendingSwitch ? commitProviderLimitSwitch(run, member, pendingSwitch, text => this.event(stored, text)) : () => false;
     if (!this.hasLaunch(member) && member.role !== "permission-coordinator") {
       if (!member.scratchDirectory && !stored.run.replay) {
         member.scratchDirectory = prepareMemberScratch(stored.run.workspace, member.memberId);
@@ -2640,14 +2653,14 @@ export class TeamService {
         this.save(stored);
       }
       const configuredProject = stored.run.handoff?.project ?? this.config.projects.find(project => project.id === stored.run.projectId)?.team;
-      const intentContext = member.role === "intent-checker" ? this.intentChecks.context(stored, member) : member.role === "evaluator" ? this.verdicts.context(stored, member) : member.role === "judge" ? this.replays.judgeContext(stored, member) : undefined; if (intentContext === null) return;
+      const intentContext = member.role === "intent-checker" ? this.intentChecks.context(stored, member) : member.role === "evaluator" ? this.verdicts.context(stored, member) : member.role === "judge" ? this.replays.judgeContext(stored, member) : undefined; if (intentContext === null) { if (undoSwitch()) this.save(stored); return; }
       const launchSeq = this.options?.entries?.launchMark(stored.run.id);
       const digest = intentContext ? undefined : this.options?.entries?.memberDigest(stored.run, member, launchSeq);
       const contextBytes = await writeTeamContext(member.cwd, { ...(intentContext ?? teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run))), ...(digest ? { entries: digest } : {}), ...(member.role === "judge" ? {} : { assignment: assignment(member, true) }), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.prefixFor(run));
       this.options?.entries?.recordLaunch(stored.run, member, { launchSeq, promptBytes: Buffer.byteLength(member.prompt, "utf8"), contextBytes, digestBytes: digest ? Buffer.byteLength(canonicalJson(digest), "utf8") : 0 });
     }
     if (this.fuse && !this.hasLaunch(member) && this.fuseWait(stored, this.fuse.admit(workLaunch({ launchId: member.sessionId, projectId: stored.run.projectId,
-      provider: member.provider ?? stored.run.provider, team: assignment(member), profile: member.modelProfile })))) return;
+      provider: member.provider ?? stored.run.provider, team: assignment(member), profile: member.modelProfile })))) { if (undoSwitch()) this.save(stored); return; }
     let result;
     const request = { requestId: member.sessionId, provider: member.provider ?? stored.run.provider,
       projectId: stored.run.projectId, title: member.title, prompt: member.prompt,
@@ -2659,15 +2672,12 @@ export class TeamService {
     try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession(request, assignment(member), member.cwd, member.modelProfile, stored.root, this.replays.trusted(stored.run), this.replays.header(stored.run), github)); }
     catch (error) {
       this.fuse?.release(member.sessionId);
-      if (error instanceof LaunchHeldError) { this.holdForHostLoad(stored, error.reason); return; }
-      if (error instanceof Error && /configured session limit/.test(error.message)) { stored.run.reason = SESSION_SLOT_REASON; this.save(stored); return; }
-      if (error instanceof TeamError && (error.code === "fuse-open" || error.code === "halted")) {
-        if (stored.run.reason !== error.message) { stored.run.reason = error.message; this.save(stored); }
-        return;
-      }
+      if (error instanceof LaunchHeldError) { const rolled = undoSwitch(); if (applyLaunchHoldReason(stored.run, error.reason, SESSION_SLOT_REASON) || rolled) this.save(stored); return; }
+      if (error instanceof Error && /configured session limit/.test(error.message)) { const rolled = undoSwitch(); if (applyLaunchHoldReason(stored.run, resolveLaunchHoldReason(stored.run, this.limits.active(this.currentDate()), SESSION_SLOT_REASON, { sessionSlotFull: true }), SESSION_SLOT_REASON) || rolled) this.save(stored); return; }
+      if (error instanceof TeamError && (error.code === "fuse-open" || error.code === "halted")) { const rolled = undoSwitch(); if (stored.run.reason !== error.message) { stored.run.reason = error.message; this.save(stored); } else if (rolled) this.save(stored); return; }
       throw error;
     }
-    if (stored.run.reason?.startsWith(HOST_LOAD_REASON_PREFIX)) stored.run.reason = undefined;
+    applyLaunchHoldReason(stored.run, resolveLaunchHoldReason(stored.run, this.limits.active(this.currentDate()), SESSION_SLOT_REASON), SESSION_SLOT_REASON);
     member.status = result.status === "unavailable" ? "unavailable" : "running";
     member.startedAt ??= timestamp();
     const turn = member.turns?.at(-1);
@@ -2697,10 +2707,7 @@ export class TeamService {
     this.save(stored);
   }
   private holdForHostLoad(stored: Stored, reason: string) {
-    const current = stored.run.reason;
-    const replaceable = current === undefined || current === SESSION_SLOT_REASON || current.startsWith(HOST_LOAD_REASON_PREFIX);
-    if (!replaceable || current === reason) return;
-    stored.run.reason = reason; this.save(stored);
+    if (applyLaunchHoldReason(stored.run, reason, SESSION_SLOT_REASON)) this.save(stored);
   }
   private applyProjectManagerCapacity(stored: Stored, requested?: number) {
     const run = stored.run, ceiling = capacityCeiling(run), limit = requested ?? ceiling;
@@ -3000,7 +3007,7 @@ export class TeamService {
           if (run.recovery) run.recovery.status = "complete";
           if (run.deliveryRecovery) run.deliveryRecovery.status = "complete";
           this.event(stored, "The delivery agent reported a merged pull request for the reviewed commit. This is agent-reported delivery evidence, not proof of product impact.");
-          try { this.options?.onMerged?.(run.projectId); } catch { }
+          try { this.options?.onMerged?.(run.projectId); } catch (error) { this.diag.warnUnexpected("on-merged", error); }
         }
       }, member); return;
     }
@@ -3131,10 +3138,7 @@ export class TeamService {
   }
   private enrich(stored: Stored, read: (signal: AbortSignal) => Promise<(() => void) | undefined>): void {
     if (!this.options?.events) return;
-    if (this.enrichments >= ENRICH_LIMIT) {
-      if (!enrichSkipLogged) { enrichSkipLogged = true; console.warn("Ledger reads are waiting on earlier reads that have not ended; some run events are skipped."); }
-      return;
-    }
+    if (this.enrichments >= ENRICH_LIMIT) { this.diag.warnEnrichSkip(); return; }
     this.enrichments += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 30000);
@@ -3145,7 +3149,7 @@ export class TeamService {
         if (!emit || this.closed || this.records.get(stored.run.id) !== stored) return;
         emit();
         this.flushOutbox(stored);
-      } catch { }
+      } catch (error) { if (!isBenignEnrichError(error, controller.signal.aborted, this.closed)) this.diag.warnUnexpected("enrich", error); }
       finally { clearTimeout(timer); this.enrichments -= 1; }
     })();
   }
@@ -3154,7 +3158,7 @@ export class TeamService {
       const result = await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["rev-parse", "--verify", `${commit}^{tree}`]) }, run.workspace, signal, 30000, this.config.teams?.commandPrefix);
       const tree = result.exitCode === 0 && !result.interrupted ? result.stdout.trim() : "";
       return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tree) ? tree : undefined;
-    } catch { return undefined; }
+    } catch (error) { if (!isBenignEnrichError(error, signal.aborted, this.closed)) this.diag.warnUnexpected("read-tree", error); return undefined; }
   }
   private check(stored: Stored) {
     const run = stored.run, revision = run.revision, head = run.headCommit!;

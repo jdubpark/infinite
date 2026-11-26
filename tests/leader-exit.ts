@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 export const LEADER_LEAVES = resolve("tests/fixtures/leader-leaves.mjs");
-export type LeftBehind = { leader: number; holder: number; witness: number };
+export type LeftBehind = { leader: number; group: number; holder: number; witness: number };
 export type Stubborn = { leader: number; member: number };
 
 export function gone(pid: number): boolean {
@@ -23,7 +23,7 @@ export async function until(what: string, ready: () => boolean, limitMs = 10_000
   }
 }
 
-type Recorded = { leader: number; holder?: number; witness?: number; member?: number; ready?: boolean };
+type Recorded = { leader: number; group: number; holder?: number; witness?: number; member?: number; ready?: boolean };
 
 function recorded(record: string): Recorded | undefined {
   const text = existsSync(record) ? readFileSync(record, "utf8") : "";
@@ -43,13 +43,24 @@ export async function leaderGone(record: string): Promise<LeftBehind> {
   await until("the leader records what it leaves", () => leftBehind(record) !== undefined);
   const left = leftBehind(record)!;
   await until("the leader is reaped", () => gone(left.leader));
+  if (left.group !== left.leader) await until("the process that leads the leader's group is reaped", () => gone(left.group));
   return left;
 }
 
 export function endLeftBehind(record: string) {
   const left = recorded(record);
-  for (const pid of left ? [left.holder, left.witness, left.member] : [])
+  for (const pid of left ? [left.holder, left.witness, left.member, left.ready ? left.leader : undefined] : [])
     if (pid !== undefined && Number.isSafeInteger(pid) && pid > 1 && !gone(pid)) process.kill(pid, "SIGKILL");
+}
+
+export function groupSignals(group: number) {
+  const kill = process.kill;
+  const sent: string[] = [];
+  process.kill = ((pid: number, signal?: string | number) => {
+    if (pid === -group) sent.push(String(signal ?? "SIGTERM"));
+    return kill.call(process, pid, signal);
+  }) as typeof process.kill;
+  return { sent, restore: () => { process.kill = kill; } };
 }
 
 export async function within<T>(work: Promise<T>, limitMs: number, what: string): Promise<T> {

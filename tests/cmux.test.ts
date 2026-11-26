@@ -13,7 +13,8 @@ import { sendSessionList } from "../packages/host/src/session-list.js";
 import { createApp } from "../packages/host/src/server.js";
 import { hashToken } from "../packages/host/src/config.js";
 import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
-import { unseal } from "../packages/host/src/vault.js";
+import { readEvents, unseal } from "../packages/host/src/vault.js";
+import { journalTipSeq, readSignalIndexState, SIGNAL_INDEX_STATE_FILE } from "../packages/host/src/signal-index.js";
 import type { Config, ControlLease, Receipt } from "../packages/host/src/types.js";
 import { apiClient, claimControl, startHost, waitFor } from "./helpers.js";
 
@@ -643,4 +644,36 @@ test("cmux journals resizes with unchanged screen text and omits stale dimension
   assert.equal(ambiguousOutput.data.rows, undefined, "output captured while geometry changed must not be tagged with post-resize rows");
   assert.ok(confirmedResize, "confirmed post-read geometry is journaled as a resize lifecycle event");
   assert.ok(ambiguousOutput.seq < confirmedResize.seq, "confirmed post-read resize follows the ambiguous output event");
+});
+
+test("cmux close checkpoints trailing output so signal indexing survives restart with zero output decryptions", { timeout: 20000 }, async (t) => {
+  const f = await fixture(t);
+  const permission = { request_id: "perm-checkpoint", kind: "permission", source: "claude", session_id: f.nativeId, surface_id: "surface", status: "pending", title: "Run tool" };
+  f.setState({ feed: [permission], screen: "prompt-1" });
+  assert.equal((await f.sessions.get(f.id)).attention.state, "needs-you");
+  f.setState({ screen: "prompt-1-trailing-output" });
+  await f.sessions.get(f.id);
+  const sessionDir = join(f.config.stateDir, "cmux", f.id);
+  const eventsDir = join(sessionDir, "events");
+  const stateFile = join(sessionDir, SIGNAL_INDEX_STATE_FILE);
+  await f.restart();
+  const stateAfterClose = readSignalIndexState(stateFile, f.key, f.id);
+  assert.ok(stateAfterClose && !stateAfterClose.disabled);
+  assert.equal(stateAfterClose.coveredSeq, journalTipSeq(eventsDir));
+  f.setState({ feed: [], screen: "prompt-closed-trailing" });
+  await f.sessions.get(f.id);
+  await f.restart();
+  const stateAfterSecondClose = readSignalIndexState(stateFile, f.key, f.id);
+  assert.ok(stateAfterSecondClose && !stateAfterSecondClose.disabled);
+  assert.equal(stateAfterSecondClose.coveredSeq, journalTipSeq(eventsDir));
+  const seg0 = join(eventsDir, "0000000000.journal");
+  const lines = readFileSync(seg0, "utf8").split("\n");
+  const outputSeq = f.sessions.events(f.id, 0, 200).events.find(event => event.type === "output")?.seq;
+  assert.ok(outputSeq);
+  lines[outputSeq - 1] = JSON.stringify({ v: 1, n: "AAAAAAAAAAAAAAAA", c: "AAAA", t: "AAAAAAAAAAAAAAAAAAAAAA==" });
+  writeFileSync(seg0, lines.join("\n"));
+  assert.throws(() => readEvents(eventsDir, f.key, f.id, 0, 200, new Set(["signal"])));
+  const page = f.sessions.events(f.id, 0, 200, new Set(["signal"]));
+  assert.deepEqual(page.events.map(event => event.data.kind), ["prompt-open", "prompt-closed"]);
+  assert.equal(page.more, false);
 });

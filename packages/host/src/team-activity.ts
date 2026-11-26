@@ -63,8 +63,8 @@ export function teamLastActivityAt(run: TeamRun): string {
 }
 
 function normalizeMember(member: TeamMember) {
-  const { cursor: _cursor, entryCursor: _entryCursor, pendingLimit, ...rest } = member;
-  return { ...rest, ...(pendingLimit ? { pendingLimit: true } : {}) };
+  const { cursor: _cursor, entryCursor: _entryCursor, pendingLimit, pendingCapacity, ...rest } = member;
+  return { ...rest, ...(pendingLimit ? { pendingLimit: true } : {}), ...(pendingCapacity ? { pendingCapacity: true } : {}) };
 }
 
 function normalizeLinear(linear: TeamRun["linear"], status: TeamRun["status"]) {

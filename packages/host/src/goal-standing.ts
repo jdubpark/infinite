@@ -34,13 +34,15 @@ export function classifyCycle(input: {
   return "failed";
 }
 
-export function unresolvedOperation(team: Pick<TeamView, "status" | "headCommit" | "deliveryReceipt" | "deliveryRecovery" | "pendingOperation" | "publication">, deliveryAttempt: boolean): string | undefined {
+export function unresolvedOperation(team: Pick<TeamView, "status" | "headCommit" | "deliveryReceipt" | "deliveryRecovery" | "pendingOperation" | "publication" | "publishing">, deliveryAttempt: boolean): string | undefined {
   if (team.deliveryReceipt && team.status !== "merged")
     return "A cycle reported a merge that the host has not validated as a baseline. Inspect its delivery before more work starts.";
   if (team.deliveryRecovery && team.deliveryRecovery.status !== "complete")
     return "A cycle stopped during delivery recovery. Inspect its remote branch and pull request before more work starts.";
   if (team.pendingOperation?.sourceRole === "delivery" || deliveryAttempt)
     return "A cycle stopped with an unresolved delivery attempt. Inspect its remote branch and pull request before more work starts.";
+  if (team.publishing)
+    return "A cycle's head publication to GitHub is still running. Wait for publication to settle before more work starts.";
   const failure = team.publication?.failure;
   if (team.headCommit && failure?.commit === team.headCommit && team.publication?.commit !== team.headCommit)
     return "The host could not confirm that a cycle's head reached GitHub. Inspect the run branch before more work starts.";

@@ -222,22 +222,50 @@ export function appendBuiltPrompt(built: BuiltPrompt, extra: string | readonly s
   };
 }
 
-export type MemberPromptSectionStore = {
-  memberPromptSections?: Record<string, TeamPromptSection[]>;
+export type StoredMemberPromptSections = {
+  promptSha256: string;
+  sections: TeamPromptSection[];
 };
+
+export type MemberPromptSectionStore = {
+  memberPromptSections?: Record<string, StoredMemberPromptSections>;
+};
+
+export function promptDigest(prompt: string): string {
+  return createHash("sha256").update(prompt).digest("hex");
+}
+
+export function storedPromptSectionsEntry(
+  prompt: string,
+  sections: TeamPromptSection[],
+): StoredMemberPromptSections {
+  return { promptSha256: promptDigest(prompt), sections };
+}
+
+function validStoredPromptEntry(
+  entry: unknown,
+  prompt: string,
+): entry is StoredMemberPromptSections {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  const record = entry as { promptSha256?: unknown; sections?: unknown };
+  return typeof record.promptSha256 === "string"
+    && Array.isArray(record.sections)
+    && record.promptSha256 === promptDigest(prompt);
+}
 
 export function getMemberPromptSections(
   store: MemberPromptSectionStore | undefined,
-  memberId: string,
+  member: Pick<TeamMember, "memberId" | "prompt">,
 ): TeamPromptSection[] | undefined {
-  return store?.memberPromptSections?.[memberId];
+  const entry = store?.memberPromptSections?.[member.memberId];
+  return validStoredPromptEntry(entry, member.prompt) ? entry.sections : undefined;
 }
 
 export function builtPromptForMember(
   store: MemberPromptSectionStore | undefined,
   member: Pick<TeamMember, "memberId" | "prompt">,
 ): BuiltPrompt {
-  const promptSections = getMemberPromptSections(store, member.memberId);
+  const promptSections = getMemberPromptSections(store, member);
   return promptSections ? { prompt: member.prompt, promptSections } : { prompt: member.prompt };
 }
 
@@ -245,10 +273,11 @@ export function setMemberPromptSections(
   store: MemberPromptSectionStore | undefined,
   memberId: string,
   sections: TeamPromptSection[] | undefined,
+  prompt?: string,
 ): void {
   if (!store) return;
-  if (sections) {
-    (store.memberPromptSections ??= {})[memberId] = sections;
+  if (sections && prompt !== undefined) {
+    (store.memberPromptSections ??= {})[memberId] = storedPromptSectionsEntry(prompt, sections);
   } else if (store.memberPromptSections) {
     delete store.memberPromptSections[memberId];
     if (!Object.keys(store.memberPromptSections).length) delete store.memberPromptSections;
@@ -257,19 +286,19 @@ export function setMemberPromptSections(
 
 export function takeMemberPromptStore(
   store: MemberPromptSectionStore | undefined,
-  memberId: string,
+  member: Pick<TeamMember, "memberId" | "prompt">,
 ): MemberPromptSectionStore {
-  const sections = getMemberPromptSections(store, memberId);
-  setMemberPromptSections(store, memberId, undefined);
-  return sections ? { memberPromptSections: { [memberId]: sections } } : {};
+  const sections = getMemberPromptSections(store, member);
+  setMemberPromptSections(store, member.memberId, undefined);
+  return sections ? { memberPromptSections: { [member.memberId]: storedPromptSectionsEntry(member.prompt, sections) } } : {};
 }
 
 export function commitMemberPromptStore(
   target: MemberPromptSectionStore | undefined,
   draft: MemberPromptSectionStore,
-  memberId: string,
+  member: Pick<TeamMember, "memberId" | "prompt">,
 ): void {
-  setMemberPromptSections(target, memberId, getMemberPromptSections(draft, memberId));
+  setMemberPromptSections(target, member.memberId, getMemberPromptSections(draft, member), member.prompt);
 }
 
 export function setStoredMemberPrompt(
@@ -278,7 +307,7 @@ export function setStoredMemberPrompt(
   built: BuiltPrompt,
 ): void {
   member.prompt = built.prompt;
-  setMemberPromptSections(store, member.memberId, built.promptSections);
+  setMemberPromptSections(store, member.memberId, built.promptSections, built.prompt);
 }
 
 export function appendStoredMemberPrompt(
@@ -287,20 +316,45 @@ export function appendStoredMemberPrompt(
   text: string,
 ): void {
   if (!text) return;
+  const sections = getMemberPromptSections(store, member);
   member.prompt = `${member.prompt}\n\n${text}`;
-  const sections = getMemberPromptSections(store, member.memberId);
-  if (sections) setMemberPromptSections(store, member.memberId, appendPromptText(sections, text));
+  setMemberPromptSections(store, member.memberId, sections ? appendPromptText(sections, text) : undefined, member.prompt);
+}
+
+export function assertPromptWithinLimit(prompt: string): void {
+  if (Buffer.byteLength(prompt, "utf8") > TEAM_PROMPT_LIMIT_BYTES) {
+    throw new TeamError(409, "team-prompt-too-large", "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
+  }
+}
+
+export function scratchDirectoryInstructions(scratchDirectory: string): string {
+  return `Host-assigned task scratch directory: ${scratchDirectory}. Use this directory for temporary scripts, browser probes, and generated check outputs. Keep repository files unchanged in read-only roles. This directory belongs only to your current assignment; do not read other members' scratch files.`;
+}
+
+export function attachMemberScratchPrompt(
+  store: MemberPromptSectionStore | undefined,
+  member: Pick<TeamMember, "memberId" | "prompt" | "scratchDirectory">,
+  prepareScratch: () => string,
+): boolean {
+  if (member.scratchDirectory) return false;
+  const scratchDirectory = prepareScratch();
+  const note = scratchDirectoryInstructions(scratchDirectory);
+  assertPromptWithinLimit(`${member.prompt}\n\n${note}`);
+  member.scratchDirectory = scratchDirectory;
+  appendStoredMemberPrompt(store, member, note);
+  return true;
 }
 
 export function pruneMemberPromptSections(
   store: MemberPromptSectionStore,
-  members: readonly Pick<TeamMember, "memberId">[],
+  members: readonly Pick<TeamMember, "memberId" | "prompt">[],
 ): boolean {
   if (!store.memberPromptSections) return false;
-  const live = new Set(members.map(member => member.memberId));
+  const live = new Map(members.map(member => [member.memberId, member]));
   let changed = false;
-  for (const memberId of Object.keys(store.memberPromptSections)) {
-    if (!live.has(memberId)) {
+  for (const [memberId, entry] of Object.entries(store.memberPromptSections)) {
+    const member = live.get(memberId);
+    if (!member || !validStoredPromptEntry(entry, member.prompt)) {
       delete store.memberPromptSections[memberId];
       changed = true;
     }
@@ -314,8 +368,11 @@ export function pruneMemberPromptSections(
 
 export function storedWithPrunedPromptSections<T extends MemberPromptSectionStore & { run: Pick<TeamRun, "members"> }>(stored: T): T {
   if (!stored.memberPromptSections) return stored;
-  const live = new Set(stored.run.members.map(member => member.memberId));
-  const entries = Object.entries(stored.memberPromptSections).filter(([memberId]) => live.has(memberId));
+  const live = new Map(stored.run.members.map(member => [member.memberId, member]));
+  const entries = Object.entries(stored.memberPromptSections).filter(([memberId, entry]) => {
+    const member = live.get(memberId);
+    return Boolean(member && validStoredPromptEntry(entry, member.prompt));
+  });
   if (entries.length === Object.keys(stored.memberPromptSections).length) return stored;
   const copy = { ...stored };
   if (entries.length) copy.memberPromptSections = Object.fromEntries(entries);
@@ -328,19 +385,22 @@ export function refreshMemberPromptForLaunch(
   member: Pick<TeamMember, "memberId" | "prompt" | "provider" | "modelProfile" | "role" | "entryTools">,
   fallbackProvider: Provider,
 ): boolean {
-  const sections = getMemberPromptSections(store, member.memberId);
-  if (!sections) return false;
+  const hadRawEntry = Boolean(store?.memberPromptSections?.[member.memberId]);
+  const sections = getMemberPromptSections(store, member);
+  if (!sections) {
+    if (hadRawEntry) setMemberPromptSections(store, member.memberId, undefined);
+    assertPromptWithinLimit(member.prompt);
+    return hadRawEntry;
+  }
   const rendered = renderPromptSections(sections, {
     provider: member.provider ?? fallbackProvider,
     profile: member.modelProfile,
     role: member.role,
     entryTools: member.entryTools === true,
   });
+  assertPromptWithinLimit(rendered);
   if (rendered === member.prompt) return false;
-  if (Buffer.byteLength(rendered, "utf8") > TEAM_PROMPT_LIMIT_BYTES) {
-    throw new TeamError(409, "team-prompt-too-large", "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
-  }
-  member.prompt = rendered;
+  setStoredMemberPrompt(store, member, { prompt: rendered, promptSections: sections });
   return true;
 }
 
@@ -442,60 +502,142 @@ export function refreshReportingInstructions(prompt: string, provider: Provider,
   return paragraphs.join("\n\n");
 }
 
-function updateCodexGuidance(paragraphs: string[], role: PromptLayoutRole, provider: Provider, entryTools: boolean) {
-  let layout = promptLayout(paragraphs, role);
-  if (!layout) return false;
-  if (role === "intent-checker" && layout.profile !== undefined
+const POOL_ESCALATION_PREFIX = "If this task exceeds your reasoning capacity or the approach is failing, you may request one explicit escalation to this approved pool: ";
+const POOL_ESCALATION_SUFFIX = `. Report {"kind":"escalate","agentProfileId":"Approved different profile ID","reason":"What failed or requires deeper reasoning; identify partial edits and remaining work"}. The host checks your partial edits, stops you, and continues in the same working copy. If this task already records an escalation, ask a material user question or report blocked; do not switch models yourself.`;
+
+function parseEscalationParagraph(text: string): PromptEscalation | undefined {
+  if (text === HOST_ESCALATION) return { mode: "host" };
+  if (!text.startsWith(POOL_ESCALATION_PREFIX) || !text.endsWith(POOL_ESCALATION_SUFFIX)) return undefined;
+  try {
+    const parsed = JSON.parse(text.slice(POOL_ESCALATION_PREFIX.length, -POOL_ESCALATION_SUFFIX.length));
+    if (Array.isArray(parsed) && parsed.length > 0 && parsed.every(item => item && typeof item === "object" && typeof (item as { id?: unknown }).id === "string")) {
+      return { mode: "pool", pool: parsed as TeamModelProfile[] };
+    }
+  } catch {}
+  return undefined;
+}
+
+function retargetLegacyPrompt(prompt: string, to: PromptRetargetTarget): BuiltPrompt | undefined {
+  const paragraphs = prompt.split("\n\n");
+  const initialLayout = promptLayout(paragraphs, to.role);
+  if (!initialLayout || initialLayout.profile === undefined) return undefined;
+  paragraphs[initialLayout.report] = reportingInstructions(to.provider);
+  if (initialLayout.entry !== undefined) paragraphs[initialLayout.entry] = entryInstructions(to.provider);
+  paragraphs[initialLayout.profile] = profileInstructions(to.profile);
+
+  let escalationIndex: number | undefined;
+  let escalationSpecResolved: PromptEscalation | undefined;
+  let escalationRemoved = false;
+  let escalationUpgradeable = true;
+  if (to.escalation) {
+    if (!to.escalation.candidates) return undefined;
+    const matches = paragraphs.flatMap((text, index) => to.escalation!.candidates!.includes(text) ? [index] : []);
+    if (matches.length === 0) {
+      if (to.escalation.next !== undefined) return undefined;
+    } else if (matches.length === 1) {
+      const index = matches[0]!;
+      const resolved = resolveEscalationSpec(to.escalation);
+      if (resolved.ok) {
+        escalationSpecResolved = resolved.spec;
+      } else if (to.escalation.next !== undefined) {
+        const parsedNext = parseEscalationParagraph(to.escalation.next);
+        if (parsedNext) escalationSpecResolved = parsedNext;
+        else escalationUpgradeable = false;
+      }
+      escalationIndex = index;
+      if (to.escalation.next === undefined) {
+        paragraphs.splice(index, 1);
+        escalationRemoved = true;
+      } else {
+        paragraphs[index] = to.escalation.next;
+      }
+    } else {
+      return undefined;
+    }
+  }
+
+  let layout = promptLayout(paragraphs, to.role);
+  if (!layout) return undefined;
+  if (to.role === "intent-checker" && layout.profile !== undefined
     && paragraphKind(paragraphs[layout.profile - 1]) === "sandbox"
     && paragraphKind(paragraphs[layout.profile - 2]) === "readonly") {
-    paragraphs.splice(layout.profile - 1, 1);
-    layout = promptLayout(paragraphs, role);
-    if (!layout) return false;
+    const removedAt = layout.profile - 1;
+    paragraphs.splice(removedAt, 1);
+    if (escalationIndex !== undefined && removedAt < escalationIndex) escalationIndex -= 1;
+    layout = promptLayout(paragraphs, to.role);
+    if (!layout) return undefined;
   }
   let anchor = layout.context ?? layout.report;
   if (paragraphKind(paragraphs[anchor - 2]) === "sandbox") {
-    if (paragraphKind(paragraphs[anchor - 1]) !== "rule") return false;
+    if (paragraphKind(paragraphs[anchor - 1]) !== "rule") return undefined;
     paragraphs.splice(anchor - 2, 2);
+    if (escalationIndex !== undefined && anchor - 2 < escalationIndex) escalationIndex -= 2;
   } else if (paragraphKind(paragraphs[anchor - 1]) === "sandbox") {
     paragraphs.splice(anchor - 1, 1);
+    if (escalationIndex !== undefined && anchor - 1 < escalationIndex) escalationIndex -= 1;
   }
-  layout = promptLayout(paragraphs, role);
-  if (!layout) return false;
-  if (provider === "codex" && role !== "permission-coordinator") {
-    anchor = layout.context ?? layout.report;
-    paragraphs.splice(anchor, 0, codexSandboxInstructions, codexMemberToolInstructions(entryTools));
-  }
-  return true;
-}
+  layout = promptLayout(paragraphs, to.role);
+  if (!layout || layout.profile === undefined) return undefined;
 
-function updateEscalationGuidance(paragraphs: string[], escalation: { candidates: readonly string[]; next: string | undefined }) {
-  const matches = paragraphs.flatMap((text, index) => escalation.candidates.includes(text) ? [index] : []);
-  if (matches.length === 0) return escalation.next === undefined;
-  if (matches.length !== 1) return false;
-  const index = matches[0]!;
-  if (escalation.next === undefined) paragraphs.splice(index, 1);
-  else paragraphs[index] = escalation.next;
-  return true;
+  const codexAnchor = to.role !== "permission-coordinator" ? (layout.context ?? layout.report) : undefined;
+  let sections: TeamPromptSection[] | undefined;
+  if (escalationUpgradeable) {
+    let resolvedEscIndex = escalationIndex;
+    let resolvedEscSpec = escalationSpecResolved;
+    if (!to.escalation && to.role === "implementer") {
+      const found = paragraphs.flatMap((text, index) => {
+        const parsed = parseEscalationParagraph(text);
+        return parsed ? [{ index, spec: parsed }] : [];
+      });
+      if (found.length === 1) {
+        resolvedEscIndex = found[0]!.index;
+        resolvedEscSpec = found[0]!.spec;
+      } else if (found.length > 1) {
+        escalationUpgradeable = false;
+      }
+    }
+    if (escalationUpgradeable) {
+      const built: TeamPromptSection[] = [];
+      for (let index = 0; index < paragraphs.length; index++) {
+        if (escalationRemoved && index === resolvedEscIndex) built.push({ kind: "escalation" });
+        if (codexAnchor !== undefined && index === codexAnchor) built.push({ kind: "codex" });
+        if (index === layout.profile) {
+          built.push({ kind: "profile" });
+          if (to.role === "implementer" && resolvedEscIndex === undefined) built.push({ kind: "escalation" });
+        } else if (!escalationRemoved && resolvedEscIndex !== undefined && index === resolvedEscIndex) {
+          built.push(resolvedEscSpec ? { kind: "escalation", escalation: resolvedEscSpec } : { kind: "escalation" });
+        } else if (layout.context !== undefined && index === layout.context) {
+          built.push({ kind: "context" });
+        } else if (layout.entry !== undefined && index === layout.entry) {
+          built.push({ kind: "entry" });
+        } else if (index === layout.report) {
+          built.push({ kind: "report" });
+        } else {
+          built.push({ kind: "text", text: paragraphs[index]! });
+        }
+      }
+      if (escalationRemoved && resolvedEscIndex === paragraphs.length) built.push({ kind: "escalation" });
+      sections = built;
+    }
+  }
+
+  if (to.provider === "codex" && to.role !== "permission-coordinator") {
+    paragraphs.splice(codexAnchor!, 0, codexSandboxInstructions, codexMemberToolInstructions(to.entryTools));
+  }
+  const rendered = paragraphs.join("\n\n");
+  if (sections && renderPromptSections(sections, to) === rendered) {
+    return { prompt: rendered, promptSections: sections };
+  }
+  return { prompt: rendered };
 }
 
 export function retargetPrompt(prompt: string, to: PromptRetargetTarget) {
-  const paragraphs = prompt.split("\n\n");
-  const layout = promptLayout(paragraphs, to.role);
-  if (!layout || layout.profile === undefined) return undefined;
-  paragraphs[layout.report] = reportingInstructions(to.provider);
-  if (layout.entry !== undefined) paragraphs[layout.entry] = entryInstructions(to.provider);
-  paragraphs[layout.profile] = profileInstructions(to.profile);
-  if (to.escalation) {
-    if (!to.escalation.candidates) return undefined;
-    if (!updateEscalationGuidance(paragraphs, { candidates: to.escalation.candidates, next: to.escalation.next })) return undefined;
-  }
-  return updateCodexGuidance(paragraphs, to.role, to.provider, to.entryTools) ? paragraphs.join("\n\n") : undefined;
+  return retargetLegacyPrompt(prompt, to)?.prompt;
 }
 
 export function retargetBuiltPrompt(built: BuiltPrompt, to: PromptRetargetTarget): BuiltPrompt | undefined {
   if (built.promptSections) return retargetPromptSections(built.promptSections, to);
-  const prompt = retargetPrompt(built.prompt, to);
-  return prompt === undefined ? undefined : { prompt };
+  return retargetLegacyPrompt(built.prompt, to);
 }
 
 export function refreshBuiltPrompt(built: BuiltPrompt, target: PromptRenderTarget): BuiltPrompt {

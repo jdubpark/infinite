@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   TEAM_PROMPT_LIMIT_BYTES,
   appendBuiltPrompt,
+  attachMemberScratchPrompt,
   codexMemberToolInstructions,
   codexSandboxInstructions,
   contextAccessInstructions,
@@ -22,6 +23,7 @@ import {
   retargetBuiltPrompt,
   retargetPrompt,
   retargetPromptSections,
+  storedPromptSectionsEntry,
   teamPrompt,
   teamPromptSpec,
   type MemberPromptSectionStore,
@@ -31,6 +33,7 @@ import { intentCheckerPrompt, intentCheckerPromptSpec } from "../packages/host/s
 import { evaluatorPrompt, evaluatorPromptSpec } from "../packages/host/src/verdict-prompt.js";
 import { judgePrompt, judgePromptSpec } from "../packages/host/src/judge-prompt.js";
 import { commitProviderLimitSwitch, resolveProviderLimitLaunch } from "../packages/host/src/team-diagnostics.js";
+import { permissionEvidenceHash } from "../packages/host/src/team-permissions.js";
 import type { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService, type Stored } from "../packages/host/src/teams.js";
 import type { TeamLineup, TeamMember, TeamModelProfile, TeamRun } from "../packages/host/src/team-types.js";
@@ -546,13 +549,13 @@ const LEGACY_SHIPPED_CODEX_RULES = [
     name: "v2-schema-report-only",
     entryTools: false,
     sha256: "e6ff71704aae9e01b8e94482cd8f49b02fd685de11b68cb863b6129f14888887",
-    text: codexMemberToolInstructions(false),
+    text: "Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures inside exec (generated from the tools' declared schemas, no lookup needed): await tools.mcp__infinite_team__report({ report }) returns { structuredContent: { requestId: string, runId: string, memberId: string, revision: number, message: string } }. Each type is the result of a successful call. When a tool reports a failure the call does not throw: its result has isError true and the reason in content[0].text, and no structuredContent. Check isError before you read structuredContent, and print the reason.",
   },
   {
     name: "v2-schema-with-entries",
     entryTools: true,
     sha256: "6896da1485bc8ccbafa98bc08d6a3f27eaf54884f17acdb68c4e725ff0845bab",
-    text: codexMemberToolInstructions(true),
+    text: "Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures inside exec (generated from the tools' declared schemas, no lookup needed): await tools.mcp__infinite_team__report({ report }) returns { structuredContent: { requestId: string, runId: string, memberId: string, revision: number, message: string } }. await tools.mcp__infinite_team__entry_list({ kinds?, taskId?, path?, since?, limit? }) returns { structuredContent: { notice: string, heads: Array<{ entryId: string, seq: number, at: string, kind: \"contract\"|\"finding\"|\"blocker\"|\"handoff\"|\"report\"|\"integration\"|\"check\"|\"direction\", author: \"host\"|\"member\"|\"owner\", authority: \"receipt\"|\"claim\"|\"direction\", authorRole?: \"permission-coordinator\"|\"project-manager\"|\"scout\"|\"implementer\"|\"integrator\"|\"reviewer\"|\"delivery\"|\"intent-checker\"|\"mission-coordinator\", taskId?: string, paths: string[], summary: string, bodyBytes: number, supersedes?: string, state: \"active\"|\"superseded\"|\"withdrawn\" }>, more: boolean, cursor?: number, unreadable: number } }. await tools.mcp__infinite_team__entry_get({ entryId }) returns { structuredContent: { notice: string, head: { entryId: string, seq: number, at: string, kind: \"contract\"|\"finding\"|\"blocker\"|\"handoff\"|\"report\"|\"integration\"|\"check\"|\"direction\", author: \"host\"|\"member\"|\"owner\", authority: \"receipt\"|\"claim\"|\"direction\", authorRole?: \"permission-coordinator\"|\"project-manager\"|\"scout\"|\"implementer\"|\"integrator\"|\"reviewer\"|\"delivery\"|\"intent-checker\"|\"mission-coordinator\", taskId?: string, paths: string[], summary: string, bodyBytes: number, supersedes?: string, state: \"active\"|\"superseded\"|\"withdrawn\" }, body: unknown } }. await tools.mcp__infinite_team__entry_post({ entry }) returns { structuredContent: { entryId: string, state: \"pending\", message: string } }. Each type is the result of a successful call. When a tool reports a failure the call does not throw: its result has isError true and the reason in content[0].text, and no structuredContent. Check isError before you read structuredContent, and print the reason.",
   },
 ] as const;
 
@@ -594,7 +597,7 @@ test("sealed persisted members keep promptSections outside run.members for rollb
     { id: "t1", title: "Task 1", instructions: "Implement T1", agentProfileId: "codex-primary", paths: ["a.txt"], dependsOn: [], revision: 1, status: "running" },
     { id: "t2", title: "Task 2", instructions: "Implement T2", agentProfileId: "codex-primary", paths: ["b.txt"], dependsOn: [], revision: 1, status: "running" },
   ];
-  f.run.parallelism = 2;
+  f.run.parallelism = 3;
 
   const builtOne = appendBuiltPrompt(
     teamPromptSpec(f.run, "implementer", f.run.tasks[0], undefined, "codex", codexPrimary),
@@ -635,15 +638,39 @@ test("sealed persisted members keep promptSections outside run.members for rollb
     prompt: builtCoordinator.prompt,
     cursor: 0, stopRequestId: randomUUID(),
   };
+  const targetMember = f.run.members[0]!;
+  targetMember.role = "implementer";
+  targetMember.taskId = "t1";
+  const screenPrompt = { id: "perm-b", hash: "hash-b", kind: "permission" as const, title: "Run check", summary: "Run check", options: [{ label: "Yes", key: "y" }] };
+  f.state.attention = { ...f.state.attention, state: "needs-you", prompt: screenPrompt };
+  f.run.permissions = { mode: "coordinator", scope: "Run tests." };
+  const overwrittenCoordSentinel = "NEW_DECISION_B_EVIDENCE_FROM_ROLLED_BACK_HOST";
+  const staleCoordSentinel = "OLD_DECISION_A_EVIDENCE_BEFORE_ROLLBACK";
+  const builtOldCoordTurn = teamPromptSpec(f.run, "permission-coordinator", undefined, `Old decision A: ${staleCoordSentinel}`, "claude", lineup.reviewer);
+  const rolledBackCoordMember: TeamMember = {
+    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "permission-coordinator",
+    provider: "claude", modelProfile: structuredClone(lineup.reviewer), sessionId: randomUUID(), title: "permission-coordinator-turn-b",
+    status: "queued", cwd: f.run.workspace, baseCommit: f.run.baseCommit,
+    prompt: teamPrompt(f.run, "permission-coordinator", undefined, `New decision B: ${overwrittenCoordSentinel}`, "claude", lineup.reviewer),
+    cursor: 0, stopRequestId: randomUUID(),
+  };
+  f.run.permissionDecisions = [{
+    id: randomUUID(), revision: 1, status: "reviewing", policyHash: "p", authorityHash: "a",
+    targetMemberId: targetMember.memberId, targetSessionId: targetMember.sessionId,
+    coordinatorMemberId: rolledBackCoordMember.memberId, coordinatorSessionId: rolledBackCoordMember.sessionId,
+    promptId: screenPrompt.id, promptHash: screenPrompt.hash, evidenceHash: permissionEvidenceHash(screenPrompt),
+    prompt: screenPrompt, createdAt: new Date(now).toISOString(), expiresAt: new Date(now + 5 * 60_000).toISOString(),
+  }];
   const orphanMemberId = randomUUID();
   f.run.tasks[0]!.memberId = memberOne.memberId;
   f.run.tasks[1]!.memberId = memberTwo.memberId;
-  f.run.members = [memberOne, coordinatorMember];
+  f.run.members = [targetMember, memberOne, coordinatorMember, rolledBackCoordMember];
   f.writeTeam({
     memberPromptSections: {
-      [memberOne.memberId]: builtOne.promptSections,
-      [coordinatorMember.memberId]: builtCoordinator.promptSections,
-      [orphanMemberId]: builtTwo.promptSections,
+      [memberOne.memberId]: storedPromptSectionsEntry(memberOne.prompt, builtOne.promptSections!),
+      [coordinatorMember.memberId]: storedPromptSectionsEntry(coordinatorMember.prompt, builtCoordinator.promptSections!),
+      [rolledBackCoordMember.memberId]: storedPromptSectionsEntry(builtOldCoordTurn.prompt, builtOldCoordTurn.promptSections),
+      [orphanMemberId]: storedPromptSectionsEntry(memberTwo.prompt, builtTwo.promptSections!),
     },
   });
 
@@ -652,9 +679,19 @@ test("sealed persisted members keep promptSections outside run.members for rollb
   const internal = teams as unknown as PromptRetargetServiceInternal;
   const stored = internal.records.get(f.run.id)!;
 
-  assert.equal(getMemberPromptSections(stored, orphanMemberId), undefined, "stale orphan sections are pruned on load");
-  assert.ok(getMemberPromptSections(stored, memberOne.memberId), "live member sections remain loaded on Stored");
-  assert.ok(getMemberPromptSections(stored, coordinatorMember.memberId), "permission coordinator sections remain loaded on Stored");
+  assert.equal(getMemberPromptSections(stored, { memberId: orphanMemberId, prompt: memberTwo.prompt }), undefined, "stale orphan sections are pruned on load");
+  assert.equal(getMemberPromptSections(stored, rolledBackCoordMember), undefined, "mismatched digest from rolled-back host discards stale permission sections");
+  assert.equal(stored.memberPromptSections?.[rolledBackCoordMember.memberId], undefined, "stale mismatched entry is pruned on load");
+  assert.ok(getMemberPromptSections(stored, memberOne), "live member sections remain loaded on Stored");
+  assert.ok(getMemberPromptSections(stored, coordinatorMember), "permission coordinator sections remain loaded on Stored");
+
+  const directMismatchStore: MemberPromptSectionStore = {
+    memberPromptSections: { [rolledBackCoordMember.memberId]: storedPromptSectionsEntry(builtOldCoordTurn.prompt, builtOldCoordTurn.promptSections) },
+  };
+  assert.equal(refreshMemberPromptForLaunch(directMismatchStore, rolledBackCoordMember, "claude"), true, "direct refresh discards stale mismatched entry");
+  assert.equal(directMismatchStore.memberPromptSections, undefined, "stale mismatched entry removed from store");
+  assert.ok(rolledBackCoordMember.prompt.includes(overwrittenCoordSentinel), "newer prompt is preserved");
+  assert.equal(rolledBackCoordMember.prompt.includes(staleCoordSentinel), false, "older sections never overwrite newer prompt");
 
   const view = teams.get(f.run.id);
   for (const item of view.members) {
@@ -663,14 +700,18 @@ test("sealed persisted members keep promptSections outside run.members for rollb
   assert.equal(JSON.stringify(view).includes(permissionEvidenceSentinel), false, "TeamView hides permission coordinator prompt evidence");
 
   await internal.step(stored);
-  assert.equal(f.launches.length, 1);
-  assert.equal(f.launches[0]!.provider, "codex");
-  assert.ok(f.launches[0]!.prompt.includes(codexSandboxInstructions), "same-provider launch renders current Codex sandbox block");
-  assert.ok(f.launches[0]!.prompt.includes(codexMemberToolInstructions(true)), "same-provider launch renders current Codex tool signatures");
-  assert.ok(f.launches[0]!.prompt.includes(entryInstructions("codex")));
-  assert.ok(f.launches[0]!.prompt.includes(reportingInstructions("codex")));
-  assert.ok(f.launches[0]!.prompt.includes("User answered: Keep existing API."));
-  assert.equal(f.launches[0]!.prompt.includes("Stale pre-upgrade Codex prompt"), false);
+  assert.equal(f.launches.length, 2);
+  const impLaunch = f.launches.find(item => item.requestId === memberOne.sessionId)!;
+  const coordLaunch = f.launches.find(item => item.requestId === rolledBackCoordMember.sessionId)!;
+  assert.equal(impLaunch.provider, "codex");
+  assert.ok(impLaunch.prompt.includes(codexSandboxInstructions), "same-provider launch renders current Codex sandbox block");
+  assert.ok(impLaunch.prompt.includes(codexMemberToolInstructions(true)), "same-provider launch renders current Codex tool signatures");
+  assert.ok(impLaunch.prompt.includes(entryInstructions("codex")));
+  assert.ok(impLaunch.prompt.includes(reportingInstructions("codex")));
+  assert.ok(impLaunch.prompt.includes("User answered: Keep existing API."));
+  assert.equal(impLaunch.prompt.includes("Stale pre-upgrade Codex prompt"), false);
+  assert.ok(coordLaunch.prompt.includes(overwrittenCoordSentinel), "rolled-back permission turn launches with newer decision B prompt");
+  assert.equal(coordLaunch.prompt.includes(staleCoordSentinel), false, "stale decision A sections never leak into decision B launch");
 
   const persistedAfterLaunch = f.readRecord<Stored>("team", f.run.id);
   assert.equal(persistedAfterLaunch.memberPromptSections?.[orphanMemberId], undefined, "sealed disk state omits pruned orphans");
@@ -682,10 +723,10 @@ test("sealed persisted members keep promptSections outside run.members for rollb
   }
 
   const codexLimit = { provider: "codex" as const, detectedAt: new Date(now).toISOString(), resetsAt: new Date(now + 10 * 60_000).toISOString(), expiresAt: new Date(now + 10 * 60_000).toISOString(), sessionId: "s-codex", confidence: "corroborated" as const };
-  const rollbackStore: MemberPromptSectionStore = { memberPromptSections: { [memberTwo.memberId]: builtTwo.promptSections! } };
-  const switchDecision = resolveProviderLimitLaunch(stored.run, memberTwo, [codexLimit], new Set(["codex"]), undefined, getMemberPromptSections(rollbackStore, memberTwo.memberId));
+  const rollbackStore: MemberPromptSectionStore = { memberPromptSections: { [memberTwo.memberId]: storedPromptSectionsEntry(memberTwo.prompt, builtTwo.promptSections!) } };
+  const switchDecision = resolveProviderLimitLaunch(stored.run, memberTwo, [codexLimit], new Set(["codex"]), undefined, getMemberPromptSections(rollbackStore, memberTwo));
   assert.equal(switchDecision.kind, "switch");
-  const originalSections = getMemberPromptSections(rollbackStore, memberTwo.memberId);
+  const originalSections = getMemberPromptSections(rollbackStore, memberTwo);
   const undo = commitProviderLimitSwitch(stored.run, memberTwo, switchDecision, () => {}, rollbackStore);
   assert.equal(memberTwo.provider, "claude");
   assert.ok(memberTwo.prompt.includes(reportingInstructions("claude")));
@@ -693,21 +734,22 @@ test("sealed persisted members keep promptSections outside run.members for rollb
   assert.equal(undo(), true);
   assert.equal(memberTwo.provider, "codex");
   assert.equal(memberTwo.prompt, "Stale pre-upgrade Codex prompt that should switch to Claude.");
-  assert.equal(getMemberPromptSections(rollbackStore, memberTwo.memberId), originalSections, "rollback restores original Stored promptSections");
+  assert.equal(getMemberPromptSections(rollbackStore, memberTwo), originalSections, "rollback restores original Stored promptSections");
 
   stored.run.members.push(memberTwo);
-  (stored.memberPromptSections ??= {})[memberTwo.memberId] = builtTwo.promptSections!;
+  (stored.memberPromptSections ??= {})[memberTwo.memberId] = storedPromptSectionsEntry(memberTwo.prompt, builtTwo.promptSections!);
   internal.limits.observe(codexLimit);
   await internal.step(stored);
-  assert.equal(f.launches.length, 2);
-  assert.equal(f.launches[1]!.provider, "claude");
-  assert.equal(f.launches[1]!.profile?.id, "claude-fallback");
-  assert.ok(f.launches[1]!.prompt.includes(profileInstructions(claudeFallback)));
-  assert.ok(f.launches[1]!.prompt.includes(entryInstructions("claude")));
-  assert.ok(f.launches[1]!.prompt.includes(reportingInstructions("claude")));
-  assert.ok(f.launches[1]!.prompt.includes("User answered: Switch cleanly on limit."));
-  assert.equal(f.launches[1]!.prompt.includes(codexSandboxInstructions), false);
-  assert.equal(f.launches[1]!.prompt.includes("Working rule for tools:"), false);
+  assert.equal(f.launches.length, 3);
+  const switchedLaunch = f.launches.find(item => item.requestId === memberTwo.sessionId)!;
+  assert.equal(switchedLaunch.provider, "claude");
+  assert.equal(switchedLaunch.profile?.id, "claude-fallback");
+  assert.ok(switchedLaunch.prompt.includes(profileInstructions(claudeFallback)));
+  assert.ok(switchedLaunch.prompt.includes(entryInstructions("claude")));
+  assert.ok(switchedLaunch.prompt.includes(reportingInstructions("claude")));
+  assert.ok(switchedLaunch.prompt.includes("User answered: Switch cleanly on limit."));
+  assert.equal(switchedLaunch.prompt.includes(codexSandboxInstructions), false);
+  assert.equal(switchedLaunch.prompt.includes("Working rule for tools:"), false);
   const persistedFinal = f.readRecord<Stored>("team", f.run.id);
   for (const savedMember of persistedFinal.run.members) {
     assert.equal("promptSections" in savedMember, false, "sealed run.members stays free of promptSections after fallback switch");
@@ -734,12 +776,16 @@ test("legacy persisted prompt-only members recognize all four shipped Codex rule
     const run = smallRun(variant.entryTools ? { blackboard: { tools: true } } : {});
     const legacyPrompt = teamPrompt(run, "implementer", undefined, undefined, "codex", codexPrimary)
       .replace(codexMemberToolInstructions(variant.entryTools), variant.text);
-    const toClaude = retargetPrompt(legacyPrompt, { provider: "claude", profile: claudeFallback, role: "implementer", entryTools: variant.entryTools });
-    assert.equal(toClaude, teamPrompt(run, "implementer", undefined, undefined, "claude", claudeFallback), `${variant.name} -> claude`);
-    const toOpenCode = retargetPrompt(legacyPrompt, { provider: "opencode", profile: opencodeProfile, role: "implementer", entryTools: variant.entryTools });
-    assert.equal(toOpenCode, teamPrompt(run, "implementer", undefined, undefined, "opencode", opencodeProfile), `${variant.name} -> opencode`);
-    const toCodex = retargetPrompt(legacyPrompt, { provider: "codex", profile: codexPrimary, role: "implementer", entryTools: variant.entryTools });
-    assert.equal(toCodex, teamPrompt(run, "implementer", undefined, undefined, "codex", codexPrimary), `${variant.name} -> codex upgrades rule`);
+    const toClaudeBuilt = retargetBuiltPrompt({ prompt: legacyPrompt }, { provider: "claude", profile: claudeFallback, role: "implementer", entryTools: variant.entryTools });
+    assert.equal(toClaudeBuilt?.prompt, teamPrompt(run, "implementer", undefined, undefined, "claude", claudeFallback), `${variant.name} -> claude`);
+    assert.ok(Array.isArray(toClaudeBuilt?.promptSections), `${variant.name} -> claude upgrades to structured sections`);
+    assert.equal(renderPromptSections(toClaudeBuilt!.promptSections!, { provider: "claude", profile: claudeFallback, role: "implementer", entryTools: variant.entryTools }), toClaudeBuilt!.prompt);
+    const toOpenCode = retargetBuiltPrompt({ prompt: legacyPrompt }, { provider: "opencode", profile: opencodeProfile, role: "implementer", entryTools: variant.entryTools });
+    assert.equal(toOpenCode?.prompt, teamPrompt(run, "implementer", undefined, undefined, "opencode", opencodeProfile), `${variant.name} -> opencode`);
+    assert.ok(Array.isArray(toOpenCode?.promptSections), `${variant.name} -> opencode upgrades to structured sections`);
+    const toCodex = retargetBuiltPrompt({ prompt: legacyPrompt }, { provider: "codex", profile: codexPrimary, role: "implementer", entryTools: variant.entryTools });
+    assert.equal(toCodex?.prompt, teamPrompt(run, "implementer", undefined, undefined, "codex", codexPrimary), `${variant.name} -> codex upgrades rule`);
+    assert.ok(Array.isArray(toCodex?.promptSections), `${variant.name} -> codex upgrades to structured sections`);
   }
 
   f.config.teams!.stallMinutes = 60;
@@ -811,6 +857,9 @@ test("legacy persisted prompt-only members recognize all four shipped Codex rule
     assert.equal(launch.prompt.includes(codexSandboxInstructions), false);
     assert.equal(launch.prompt.includes("Working rule for tools:"), false);
   }
+  const persistedLegacyUpgrade = f.readRecord<Stored>("team", f.run.id);
+  assert.ok(Array.isArray(getMemberPromptSections(persistedLegacyUpgrade, stored.run.members[0]!)), "switched legacy v1 short member persists structured sections");
+  assert.ok(Array.isArray(getMemberPromptSections(persistedLegacyUpgrade, stored.run.members[1]!)), "switched legacy v1 entries member persists structured sections");
   assert.equal(stored.run.members[2]!.status, "queued");
   assert.equal(stored.run.members[2]!.pendingLimit, true);
 
@@ -824,7 +873,7 @@ test("legacy persisted prompt-only members recognize all four shipped Codex rule
   assert.equal(upgraded.taskId, "legacy-running");
   assert.equal(upgraded.provider, "claude");
   assert.equal("promptSections" in upgraded, false, "upgraded member stores sections on Stored, not on TeamMember");
-  assert.ok(Array.isArray(getMemberPromptSections(stored, upgraded.memberId)), "running legacy fallback rebuilds with structured sections on Stored");
+  assert.ok(Array.isArray(getMemberPromptSections(stored, upgraded)), "running legacy fallback rebuilds with structured sections on Stored");
   assert.ok(upgraded.prompt.includes(reportingInstructions("claude")));
   assert.ok(upgraded.prompt.includes("User answered: Keep JSON."));
   assert.equal(upgraded.prompt.includes("unrecognized unshipped wording"), false);
@@ -837,7 +886,7 @@ test("legacy persisted prompt-only members recognize all four shipped Codex rule
   assert.equal(oldRuleLaunch!.prompt.includes("unrecognized unshipped wording"), true);
 });
 
-test("same-provider launch refresh enforces TEAM_PROMPT_LIMIT_BYTES and fails closed without launching", async t => {
+test("same-provider launch refresh, unchanged retries, and scratch append enforce TEAM_PROMPT_LIMIT_BYTES", async t => {
   const f = schedulerFixture();
   t.after(() => f.close());
   const now = Date.parse("2026-11-26T11:00:00.000Z");
@@ -854,11 +903,10 @@ test("same-provider launch refresh enforces TEAM_PROMPT_LIMIT_BYTES and fails cl
   const baseSpec = teamPromptSpec(f.run, "implementer", f.run.tasks[0], undefined, "codex", codexPrimary);
   const fillerBytes = TEAM_PROMPT_LIMIT_BYTES - Buffer.byteLength(baseSpec.prompt, "utf8") + 128;
   const overgrownSections: TeamPromptSection[] = [...baseSpec.promptSections, { kind: "text", text: "x".repeat(fillerBytes) }];
+  const overgrownRendered = renderPromptSections(overgrownSections, { provider: "codex", profile: codexPrimary, role: "implementer", entryTools: true });
   const staleShorterPrompt = baseSpec.prompt;
   assert.ok(Buffer.byteLength(staleShorterPrompt, "utf8") <= TEAM_PROMPT_LIMIT_BYTES);
-  assert.ok(
-    Buffer.byteLength(renderPromptSections(overgrownSections, { provider: "codex", profile: codexPrimary, role: "implementer", entryTools: true }), "utf8") > TEAM_PROMPT_LIMIT_BYTES,
-  );
+  assert.ok(Buffer.byteLength(overgrownRendered, "utf8") > TEAM_PROMPT_LIMIT_BYTES);
 
   const member: TeamMember = {
     runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "near-cap", entryTools: true,
@@ -868,7 +916,7 @@ test("same-provider launch refresh enforces TEAM_PROMPT_LIMIT_BYTES and fails cl
     cursor: 0, stopRequestId: randomUUID(),
   };
 
-  const directStore: MemberPromptSectionStore = { memberPromptSections: { [member.memberId]: overgrownSections } };
+  const directStore: MemberPromptSectionStore = { memberPromptSections: { [member.memberId]: storedPromptSectionsEntry(staleShorterPrompt, overgrownSections) } };
   assert.throws(
     () => refreshMemberPromptForLaunch(directStore, member, "codex"),
     error => error instanceof TeamError && error.code === "team-prompt-too-large",
@@ -876,9 +924,19 @@ test("same-provider launch refresh enforces TEAM_PROMPT_LIMIT_BYTES and fails cl
   );
   assert.equal(member.prompt, staleShorterPrompt, "refused refresh leaves member.prompt unchanged");
 
+  const unchangedOverLimitMember: TeamMember = { ...member, memberId: randomUUID(), prompt: overgrownRendered };
+  const unchangedStore: MemberPromptSectionStore = {
+    memberPromptSections: { [unchangedOverLimitMember.memberId]: storedPromptSectionsEntry(overgrownRendered, overgrownSections) },
+  };
+  assert.throws(
+    () => refreshMemberPromptForLaunch(unchangedStore, unchangedOverLimitMember, "codex"),
+    error => error instanceof TeamError && error.code === "team-prompt-too-large",
+    "unchanged retry prompt exceeding TEAM_PROMPT_LIMIT_BYTES still fails closed",
+  );
+
   f.run.tasks[0]!.memberId = member.memberId;
   f.run.members = [member];
-  f.writeTeam({ memberPromptSections: { [member.memberId]: overgrownSections } });
+  f.writeTeam({ memberPromptSections: { [member.memberId]: storedPromptSectionsEntry(staleShorterPrompt, overgrownSections) } });
 
   const teams = new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { now: () => now });
   t.after(() => teams.close());
@@ -890,4 +948,36 @@ test("same-provider launch refresh enforces TEAM_PROMPT_LIMIT_BYTES and fails cl
   assert.equal(stored.run.status, "blocked");
   assert.equal(stored.run.blockCode, "team-prompt-too-large");
   assert.equal(stored.run.members[0]!.prompt, staleShorterPrompt, "blocked launch leaves persisted member.prompt untouched");
+
+  const boundaryFill = TEAM_PROMPT_LIMIT_BYTES - Buffer.byteLength(baseSpec.prompt, "utf8") - 80;
+  const boundarySections: TeamPromptSection[] = [...baseSpec.promptSections, { kind: "text", text: "b".repeat(boundaryFill) }];
+  const boundaryRendered = renderPromptSections(boundarySections, { provider: "codex", profile: codexPrimary, role: "implementer", entryTools: true });
+  assert.ok(Buffer.byteLength(boundaryRendered, "utf8") <= TEAM_PROMPT_LIMIT_BYTES, "boundary prompt fits before scratch append");
+  const boundaryMember: TeamMember = {
+    ...member, memberId: randomUUID(), sessionId: randomUUID(), prompt: boundaryRendered, scratchDirectory: undefined,
+  };
+  const boundaryStore: MemberPromptSectionStore = {
+    memberPromptSections: { [boundaryMember.memberId]: storedPromptSectionsEntry(boundaryRendered, boundarySections) },
+  };
+  assert.equal(refreshMemberPromptForLaunch(boundaryStore, boundaryMember, "codex"), false, "refresh passes before scratch append");
+  assert.throws(
+    () => attachMemberScratchPrompt(boundaryStore, boundaryMember, () => "/srv/scratch/boundary"),
+    error => error instanceof TeamError && error.code === "team-prompt-too-large",
+    "appending scratch directory past TEAM_PROMPT_LIMIT_BYTES fails closed",
+  );
+  assert.equal(boundaryMember.scratchDirectory, undefined, "refused scratch append does not set scratchDirectory");
+  assert.equal(boundaryMember.prompt, boundaryRendered, "refused scratch append leaves member.prompt unchanged");
+
+  stored.run.status = "implementing";
+  stored.run.blockCode = undefined;
+  stored.run.reason = undefined;
+  stored.halt = undefined;
+  stored.run.members = [boundaryMember];
+  stored.memberPromptSections = { [boundaryMember.memberId]: storedPromptSectionsEntry(boundaryRendered, boundarySections) };
+  await internal.step(stored);
+  assert.equal(f.launches.length, 0, "scratch-overflow launch never calls createTeamSession");
+  assert.equal(stored.run.status, "blocked");
+  assert.equal(stored.run.blockCode, "team-prompt-too-large");
+  assert.equal(boundaryMember.scratchDirectory, undefined);
+  assert.equal(boundaryMember.prompt, boundaryRendered);
 });

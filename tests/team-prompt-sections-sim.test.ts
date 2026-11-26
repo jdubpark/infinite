@@ -7,19 +7,26 @@ import { join } from "node:path";
 import {
   TEAM_PROMPT_LIMIT_BYTES,
   appendStoredMemberPrompt,
+  attachMemberScratchPrompt,
   codexMemberToolInstructions,
   codexSandboxInstructions,
   entryInstructions,
   getMemberPromptSections,
   profileInstructions,
+  promptDigest,
   pruneMemberPromptSections,
   refreshMemberPromptForLaunch,
   renderPromptSections,
   reportingInstructions,
+  retargetBuiltPrompt,
+  scratchDirectoryInstructions,
   setMemberPromptSections,
   setStoredMemberPrompt,
+  storedPromptSectionsEntry,
   storedWithPrunedPromptSections,
+  teamPrompt,
   teamPromptSpec,
+  type MemberPromptSectionStore,
   type TeamPromptSection,
 } from "../packages/host/src/team-prompts.js";
 import { intentCheckerPromptSpec } from "../packages/host/src/intent-prompt.js";
@@ -35,6 +42,9 @@ type PromptSimMutant =
   | "drop-appended-section"
   | "stale-provider-blocks"
   | "bypass-refresh-byte-limit"
+  | "bypass-scratch-byte-limit"
+  | "apply-stale-rollback-sections"
+  | "skip-legacy-retarget-upgrade"
   | "corrupt-switch-rollback"
   | "keep-orphan-sections-on-disk";
 
@@ -43,11 +53,16 @@ interface PromptSimCoverage {
   appends: number;
   sameProviderRefreshes: number;
   overLimitRefreshRefusals: number;
+  scratchOverLimitRefusals: number;
+  rollbackPromptOverwrites: number;
+  legacyRetargetUpgrades: number;
   providerSwitches: number;
   switchRollbacks: number;
   permissionCoordinators: number;
   orphanPrunes: number;
 }
+
+const FROZEN_LEGACY_V1_ENTRY_RULE = "Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures (arguments -> fields of a successful result's structuredContent): report({report}) -> {requestId, runId, memberId, revision, message}; entry_list({kinds?, taskId?, path?, since?, limit?}) -> {notice, heads, more, cursor?, unreadable}; entry_get({entryId}) -> {notice, head, body}; entry_post({entry}) -> {entryId, state, message}.";
 
 const claudeLight: TeamModelProfile = {
   id: "claude-light",
@@ -153,11 +168,15 @@ function runPromptStateSimulation(seed: number, mutant: PromptSimMutant): Prompt
   const oracleNotes = new Map<string, string[]>();
   const permissionSentinels = new Set<string>();
   const staleMembers = new Set<string>();
+  const promptOnlyMembers = new Set<string>();
   const coverage: PromptSimCoverage = {
     restarts: 0,
     appends: 0,
     sameProviderRefreshes: 0,
     overLimitRefreshRefusals: 0,
+    scratchOverLimitRefusals: 0,
+    rollbackPromptOverwrites: 0,
+    legacyRetargetUpgrades: 0,
     providerSwitches: 0,
     switchRollbacks: 0,
     permissionCoordinators: 0,
@@ -173,13 +192,15 @@ function runPromptStateSimulation(seed: number, mutant: PromptSimMutant): Prompt
   const assertInvariants = (step: number) => {
     saveDisk();
     const disk = unseal<Stored>(key, `sim:${stored.run.id}`, readFileSync(sealPath, "utf8"));
-    const liveIds = new Set(disk.run.members.map(member => member.memberId));
+    const liveById = new Map(disk.run.members.map(member => [member.memberId, member]));
 
     if (disk.memberPromptSections) {
       const diskKeys = Object.keys(disk.memberPromptSections);
       assert.ok(diskKeys.length > 0, `noOrphanSectionsOnDisk step=${step}: empty memberPromptSections object persisted`);
-      for (const memberId of diskKeys) {
-        assert.ok(liveIds.has(memberId), `noOrphanSectionsOnDisk step=${step}: orphan section key ${memberId} on disk`);
+      for (const [memberId, entry] of Object.entries(disk.memberPromptSections)) {
+        const liveMember = liveById.get(memberId);
+        assert.ok(liveMember, `noOrphanSectionsOnDisk step=${step}: orphan section key ${memberId} on disk`);
+        assert.equal(entry.promptSha256, promptDigest(liveMember.prompt), `noOrphanSectionsOnDisk step=${step}: mismatched promptSha256 persisted for ${memberId}`);
       }
     }
 
@@ -194,7 +215,11 @@ function runPromptStateSimulation(seed: number, mutant: PromptSimMutant): Prompt
     }
 
     for (const member of stored.run.members) {
-      const sections = getMemberPromptSections(stored, member.memberId);
+      if (promptOnlyMembers.has(member.memberId)) {
+        assert.equal(getMemberPromptSections(stored, member), undefined, `staleSectionsNeverOverwriteNewPrompt step=${step}: prompt-only member still bound to stale sections`);
+        continue;
+      }
+      const sections = getMemberPromptSections(stored, member);
       assert.ok(Array.isArray(sections), `appendedAnswersPreserved step=${step}: missing structured sections for ${member.memberId}`);
       const notes = oracleNotes.get(member.memberId) ?? [];
       const rendered = renderPromptSections(sections, {
@@ -299,7 +324,7 @@ function runPromptStateSimulation(seed: number, mutant: PromptSimMutant): Prompt
       cursor: 0,
       stopRequestId: randomUUID(),
     };
-    const tempStore = { memberPromptSections: { [memberId]: sections } };
+    const tempStore: MemberPromptSectionStore = { memberPromptSections: { [memberId]: storedPromptSectionsEntry(base.prompt, sections) } };
     if (mutant === "bypass-refresh-byte-limit") {
       candidate.prompt = renderPromptSections(sections, { provider: "codex", profile: codexPrimary, role: "implementer", entryTools: true });
       assert.ok(Buffer.byteLength(candidate.prompt, "utf8") <= TEAM_PROMPT_LIMIT_BYTES, `refreshByteLimitEnforced step=${step}: accepted over-limit refreshed prompt`);
@@ -316,6 +341,94 @@ function runPromptStateSimulation(seed: number, mutant: PromptSimMutant): Prompt
     coverage.overLimitRefreshRefusals += 1;
   };
 
+  const runScratchBoundaryCheck = (step: number) => {
+    const base = teamPromptSpec(stored.run, "implementer", stored.run.tasks[1], undefined, "codex", codexPrimary);
+    const nearCapPad = TEAM_PROMPT_LIMIT_BYTES - Buffer.byteLength(base.prompt, "utf8") - 80;
+    const sections: TeamPromptSection[] = [...base.promptSections, { kind: "text", text: "s".repeat(nearCapPad) }];
+    const rendered = renderPromptSections(sections, { provider: "codex", profile: codexPrimary, role: "implementer", entryTools: true });
+    assert.ok(Buffer.byteLength(rendered, "utf8") <= TEAM_PROMPT_LIMIT_BYTES);
+    const memberId = randomUUID();
+    const candidate: TeamMember = {
+      runId: stored.run.id,
+      memberId,
+      revision: 1,
+      role: "implementer",
+      taskId: "t2",
+      entryTools: true,
+      provider: "codex",
+      modelProfile: structuredClone(codexPrimary),
+      sessionId: randomUUID(),
+      title: `scratch-cap-${step}`,
+      status: "queued",
+      cwd: stored.run.workspace,
+      baseCommit: stored.run.baseCommit,
+      prompt: rendered,
+      cursor: 0,
+      stopRequestId: randomUUID(),
+    };
+    const tempStore: MemberPromptSectionStore = { memberPromptSections: { [memberId]: storedPromptSectionsEntry(rendered, sections) } };
+    assert.equal(refreshMemberPromptForLaunch(tempStore, candidate, "codex"), false);
+    if (mutant === "bypass-scratch-byte-limit") {
+      const note = scratchDirectoryInstructions("/srv/scratch/sim-overflow");
+      candidate.scratchDirectory = "/srv/scratch/sim-overflow";
+      appendStoredMemberPrompt(tempStore, candidate, note);
+      assert.ok(Buffer.byteLength(candidate.prompt, "utf8") <= TEAM_PROMPT_LIMIT_BYTES, `scratchAppendByteLimitEnforced step=${step}: scratch append exceeded 80 KiB`);
+      return;
+    }
+    let refused = false;
+    try {
+      attachMemberScratchPrompt(tempStore, candidate, () => "/srv/scratch/sim-overflow");
+    } catch (error) {
+      refused = error instanceof TeamError && error.code === "team-prompt-too-large";
+    }
+    assert.equal(refused, true, `scratchAppendByteLimitEnforced step=${step}: scratch append past 80 KiB must fail closed`);
+    assert.equal(candidate.scratchDirectory, undefined, `scratchAppendByteLimitEnforced step=${step}: scratchDirectory mutated on refusal`);
+    assert.equal(candidate.prompt, rendered, `scratchAppendByteLimitEnforced step=${step}: prompt mutated on refusal`);
+    coverage.scratchOverLimitRefusals += 1;
+  };
+
+  const runRollbackOverwriteCheck = (step: number) => {
+    const coord = stored.run.members.find(m => m.role === "permission-coordinator" && !promptOnlyMembers.has(m.memberId)) ?? addMember("permission-coordinator", step);
+    const oldPrompt = coord.prompt;
+    const rawOldEntry = stored.memberPromptSections?.[coord.memberId];
+    assert.ok(rawOldEntry);
+    const newSentinel = `ROLLBACK_TURN_${seed}_${step}_${coord.memberId.slice(0, 8)}`;
+    permissionSentinels.add(newSentinel);
+    const newTurnPrompt = teamPrompt(stored.run, "permission-coordinator", undefined, `Rolled-back host decision ${newSentinel}`, "claude", strongReviewer);
+    coord.prompt = newTurnPrompt;
+    if (mutant === "apply-stale-rollback-sections") {
+      coord.prompt = renderPromptSections(rawOldEntry.sections, { provider: "claude", profile: coord.modelProfile, role: "permission-coordinator", entryTools: false });
+      assert.equal(coord.prompt, newTurnPrompt, `staleSectionsNeverOverwriteNewPrompt step=${step}: stale sections overwrote newer permission prompt`);
+      return;
+    }
+    assert.equal(getMemberPromptSections(stored, coord), undefined, `staleSectionsNeverOverwriteNewPrompt step=${step}: mismatched sections were not ignored`);
+    refreshMemberPromptForLaunch(stored, coord, stored.run.provider);
+    assert.equal(coord.prompt, newTurnPrompt, `staleSectionsNeverOverwriteNewPrompt step=${step}: newer permission prompt was overwritten`);
+    assert.notEqual(coord.prompt, oldPrompt);
+    promptOnlyMembers.add(coord.memberId);
+    coverage.rollbackPromptOverwrites += 1;
+  };
+
+  const runLegacyRetargetUpgradeCheck = (step: number) => {
+    const legacyPrompt = teamPrompt(stored.run, "implementer", stored.run.tasks[1], undefined, "codex", codexPrimary)
+      .replace(codexMemberToolInstructions(true), FROZEN_LEGACY_V1_ENTRY_RULE);
+    const retargeted = retargetBuiltPrompt(
+      { prompt: legacyPrompt },
+      { provider: "opencode", profile: opencodeFallback, role: "implementer", entryTools: true },
+    );
+    assert.ok(retargeted);
+    const upgraded = mutant === "skip-legacy-retarget-upgrade" ? { prompt: retargeted.prompt } : retargeted;
+    assert.ok(Array.isArray(upgraded.promptSections), `legacyRetargetUpgradesToSections step=${step}: unambiguous legacy retarget must emit structured sections`);
+    const reRendered = renderPromptSections(upgraded.promptSections!, {
+      provider: "opencode",
+      profile: opencodeFallback,
+      role: "implementer",
+      entryTools: true,
+    });
+    assert.equal(reRendered, upgraded.prompt, `legacyRetargetUpgradesToSections step=${step}: upgraded sections must re-render identically`);
+    coverage.legacyRetargetUpgrades += 1;
+  };
+
   try {
     addMember("implementer", 0);
     addMember("permission-coordinator", 1);
@@ -323,11 +436,12 @@ function runPromptStateSimulation(seed: number, mutant: PromptSimMutant): Prompt
 
     for (let step = 1; step <= 40; step++) {
       now += 60_000;
-      const queuedImplementers = stored.run.members.filter(m => m.role === "implementer" && m.status === "queued");
+      const structuredMembers = stored.run.members.filter(m => !promptOnlyMembers.has(m.memberId));
+      const queuedImplementers = structuredMembers.filter(m => m.role === "implementer" && m.status === "queued");
 
       if (step === 4) {
         const orphanId = randomUUID();
-        setMemberPromptSections(stored, orphanId, [{ kind: "text", text: "orphan" }]);
+        setMemberPromptSections(stored, orphanId, [{ kind: "text", text: "orphan" }], "orphan");
         assertInvariants(step);
         const pruned = pruneMemberPromptSections(stored, stored.run.members);
         assert.equal(pruned, true);
@@ -339,26 +453,45 @@ function runPromptStateSimulation(seed: number, mutant: PromptSimMutant): Prompt
         assertInvariants(step);
         continue;
       }
+      if (step === 12) {
+        runRollbackOverwriteCheck(step);
+        assertInvariants(step);
+        continue;
+      }
+      if (step === 16) {
+        runScratchBoundaryCheck(step);
+        assertInvariants(step);
+        continue;
+      }
+      if (step === 20) {
+        runLegacyRetargetUpgradeCheck(step);
+        assertInvariants(step);
+        continue;
+      }
 
       const roll = rand();
       if (roll < 0.22 && stored.run.members.length < 7) {
         const roles = ["implementer", "reviewer", "intent-checker", "permission-coordinator"] as const;
         addMember(roles[Math.floor(rand() * roles.length)]!, step);
-      } else if (roll < 0.42 && stored.run.members.length > 0) {
-        const target = stored.run.members[Math.floor(rand() * stored.run.members.length)]!;
+      } else if (roll < 0.42 && structuredMembers.length > 0) {
+        const target = structuredMembers[Math.floor(rand() * structuredMembers.length)]!;
         const note = `User answered step ${step}: decision-${seed}-${step}`;
         if (mutant === "drop-appended-section") {
+          const oldSections = getMemberPromptSections(stored, target)!;
           target.prompt = `${target.prompt}\n\n${note}`;
+          setMemberPromptSections(stored, target.memberId, oldSections, target.prompt);
         } else {
           appendStoredMemberPrompt(stored, target, note);
         }
         oracleNotes.get(target.memberId)!.push(note);
         coverage.appends += 1;
-      } else if (roll < 0.62 && stored.run.members.length > 0) {
-        const target = stored.run.members[Math.floor(rand() * stored.run.members.length)]!;
+      } else if (roll < 0.62 && structuredMembers.length > 0) {
+        const target = structuredMembers[Math.floor(rand() * structuredMembers.length)]!;
+        const currentSections = getMemberPromptSections(stored, target)!;
         const staleProse = `Pre-upgrade stale prompt step ${step}`;
         const existingNotes = oracleNotes.get(target.memberId) ?? [];
         target.prompt = [staleProse, ...existingNotes].join("\n\n");
+        setMemberPromptSections(stored, target.memberId, currentSections, target.prompt);
         staleMembers.add(target.memberId);
         if (mutant === "stale-provider-blocks") {
           staleMembers.delete(target.memberId);
@@ -385,25 +518,25 @@ function runPromptStateSimulation(seed: number, mutant: PromptSimMutant): Prompt
           [limit],
           new Set([provider]),
           undefined,
-          getMemberPromptSections(stored, target.memberId),
+          getMemberPromptSections(stored, target),
         );
         if (decision.kind === "switch") {
           const beforePrompt = target.prompt;
           const beforeProvider = target.provider;
           const beforeProfile = structuredClone(target.modelProfile);
-          const beforeSections = structuredClone(getMemberPromptSections(stored, target.memberId));
+          const beforeSections = structuredClone(getMemberPromptSections(stored, target));
           const undo = commitProviderLimitSwitch(stored.run, target, decision, text => stored.run.events.push({ at: new Date(now).toISOString(), text }), stored);
           staleMembers.delete(target.memberId);
           const doRollback = step % 2 === 0 || coverage.switchRollbacks === 0;
           if (doRollback) {
             assert.equal(undo(), true);
             if (mutant === "corrupt-switch-rollback") {
-              setMemberPromptSections(stored, target.memberId, decision.promptSections);
+              setMemberPromptSections(stored, target.memberId, decision.promptSections, beforePrompt);
             }
             assert.equal(target.prompt, beforePrompt, `switchRollbackExact step=${step}: prompt mismatch after undo`);
             assert.equal(target.provider, beforeProvider, `switchRollbackExact step=${step}: provider mismatch after undo`);
             assert.deepEqual(target.modelProfile, beforeProfile, `switchRollbackExact step=${step}: profile mismatch after undo`);
-            assert.deepEqual(getMemberPromptSections(stored, target.memberId), beforeSections, `switchRollbackExact step=${step}: sections mismatch after undo`);
+            assert.deepEqual(getMemberPromptSections(stored, target), beforeSections, `switchRollbackExact step=${step}: sections mismatch after undo`);
             coverage.switchRollbacks += 1;
           } else {
             coverage.providerSwitches += 1;
@@ -420,7 +553,7 @@ function runPromptStateSimulation(seed: number, mutant: PromptSimMutant): Prompt
     }
 
     if (coverage.providerSwitches === 0) {
-      const imp = stored.run.members.find(m => m.role === "implementer" && (m.modelProfile?.id === "claude-light" || m.modelProfile?.id === "codex-primary")) ?? addMember("implementer", 41);
+      const imp = stored.run.members.find(m => !promptOnlyMembers.has(m.memberId) && m.role === "implementer" && (m.modelProfile?.id === "claude-light" || m.modelProfile?.id === "codex-primary")) ?? addMember("implementer", 41);
       const provider = imp.provider ?? stored.run.provider;
       const limit = {
         provider,
@@ -430,7 +563,7 @@ function runPromptStateSimulation(seed: number, mutant: PromptSimMutant): Prompt
         sessionId: "lim-final",
         confidence: "corroborated" as const,
       };
-      const decision = resolveProviderLimitLaunch(stored.run, imp, [limit], new Set([provider]), undefined, getMemberPromptSections(stored, imp.memberId));
+      const decision = resolveProviderLimitLaunch(stored.run, imp, [limit], new Set([provider]), undefined, getMemberPromptSections(stored, imp));
       assert.equal(decision.kind, "switch");
       commitProviderLimitSwitch(stored.run, imp, decision, text => stored.run.events.push({ at: new Date(now).toISOString(), text }), stored);
       coverage.providerSwitches += 1;
@@ -443,7 +576,7 @@ function runPromptStateSimulation(seed: number, mutant: PromptSimMutant): Prompt
   }
 }
 
-test("seeded structured-prompt durable-state simulator enforces storage privacy, refresh limit, and switch invariants across seeds and catches all named mutants", t => {
+test("seeded structured-prompt durable-state simulator enforces storage privacy, digest binding, byte limits, legacy upgrade, and switch invariants across seeds and catches all named mutants", t => {
   const override = process.env.SIM_SEED ? Number.parseInt(process.env.SIM_SEED, 10) : undefined;
   const seeds = Number.isFinite(override) ? [override!] : [101, 202, 303, 404, 505, 606, 707, 808];
   const totals: PromptSimCoverage = {
@@ -451,6 +584,9 @@ test("seeded structured-prompt durable-state simulator enforces storage privacy,
     appends: 0,
     sameProviderRefreshes: 0,
     overLimitRefreshRefusals: 0,
+    scratchOverLimitRefusals: 0,
+    rollbackPromptOverwrites: 0,
+    legacyRetargetUpgrades: 0,
     providerSwitches: 0,
     switchRollbacks: 0,
     permissionCoordinators: 0,
@@ -470,6 +606,9 @@ test("seeded structured-prompt durable-state simulator enforces storage privacy,
     ["drop-appended-section", /appendedAnswersPreserved/],
     ["stale-provider-blocks", /providerBlocksConsistent/],
     ["bypass-refresh-byte-limit", /refreshByteLimitEnforced/],
+    ["bypass-scratch-byte-limit", /scratchAppendByteLimitEnforced/],
+    ["apply-stale-rollback-sections", /staleSectionsNeverOverwriteNewPrompt/],
+    ["skip-legacy-retarget-upgrade", /legacyRetargetUpgradesToSections/],
     ["corrupt-switch-rollback", /switchRollbackExact/],
     ["keep-orphan-sections-on-disk", /noOrphanSectionsOnDisk/],
   ];

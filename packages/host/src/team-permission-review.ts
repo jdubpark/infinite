@@ -402,7 +402,7 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
     let promptDraft: ReturnType<typeof takeMemberPromptStore>;
     try {
       member = this.host.newMember(run, "permission-coordinator", "", run.headCommit!, undefined, undefined, reviewer);
-      promptDraft = takeMemberPromptStore(stored, member.memberId);
+      promptDraft = takeMemberPromptStore(stored, member);
       try {
         setStoredMemberPrompt(promptDraft, member, teamPromptSpec(run, "permission-coordinator", undefined, feedback(permissionRecoveryHistory), member.provider ?? run.provider,
           member.modelProfile, undefined, permissionRecoveryHistory));
@@ -450,7 +450,7 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
       await assertMemberReadOnly(cwd, member.baseCommit, this.host.prefixFor(run), signal);
       return cwd;
     }, cwd => {
-      member.cwd = cwd; run.members.push(member); commitMemberPromptStore(stored, promptDraft, member.memberId); decision.status = "reviewing";
+      member.cwd = cwd; run.members.push(member); commitMemberPromptStore(stored, promptDraft, member); decision.status = "reviewing";
       if (recovery) recovery.status = recovery.rounds ? "reviewing-evidence" : "diagnosing";
       this.host.event(stored, assignedEvent);
     });

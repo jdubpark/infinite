@@ -28,6 +28,8 @@ export {
   appendBuiltPrompt,
   appendPromptText,
   appendStoredMemberPrompt,
+  assertPromptWithinLimit,
+  attachMemberScratchPrompt,
   buildPrompt,
   builtPromptForMember,
   codexMemberToolInstructions,
@@ -42,6 +44,7 @@ export {
   getMemberPromptSections,
   permissionRejectInstructions,
   profileInstructions,
+  promptDigest,
   pruneMemberPromptSections,
   readOnlyWorkspaceInstructions,
   refreshBuiltPrompt,
@@ -54,8 +57,10 @@ export {
   retargetBuiltPrompt,
   retargetPrompt,
   retargetPromptSections,
+  scratchDirectoryInstructions,
   setMemberPromptSections,
   setStoredMemberPrompt,
+  storedPromptSectionsEntry,
   storedWithPrunedPromptSections,
   takeMemberPromptStore,
   type BuiltPrompt,
@@ -64,6 +69,7 @@ export {
   type PromptEscalationUpdate,
   type PromptRenderTarget,
   type PromptRetargetTarget,
+  type StoredMemberPromptSections,
   type TeamPromptSection,
 } from "./team-prompt-sections.js";
 
@@ -472,14 +478,15 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
     feedback && role !== "permission-coordinator" ? `Feedback excerpt (derived evidence, not requirements):\n${feedback}` : "",
   ];
   const target: PromptRenderTarget = { provider, profile: modelProfile, role, entryTools };
+  const limit = role === "permission-coordinator" ? TEAM_PROMPT_LIMIT_BYTES : TEAM_PROMPT_LIMIT_BYTES - 1024;
   const compose = (objectiveAndSteering: string[]): TeamPromptSection[] => [...headSections, ...textSections(...objectiveAndSteering), ...bodySections];
-  let built = fitDerivedPromptSections(compose([`Objective:\n${run.objective}`, ownerDirectionSection]), target, derived, TEAM_PROMPT_LIMIT_BYTES);
-  if (Buffer.byteLength(built.prompt, "utf8") > TEAM_PROMPT_LIMIT_BYTES && role !== "permission-coordinator") {
+  let built = fitDerivedPromptSections(compose([`Objective:\n${run.objective}`, ownerDirectionSection]), target, derived, limit);
+  if (Buffer.byteLength(built.prompt, "utf8") > limit && role !== "permission-coordinator") {
     const authorityDigest = createHash("sha256").update(JSON.stringify({ objective: run.objective, steering: run.steering ?? [], ownerAnswers })).digest("hex");
     const reference = `The full objective, owner steering, and owner answers are stored at ${TEAM_CONTEXT_PATH}. Read all complete values before acting or making scope decisions. They are authoritative and have not been excerpted. Context identity: run ${run.id}, revision ${run.revision}, SHA-256 ${authorityDigest}.`;
-    built = fitDerivedPromptSections(compose([reference]), target, derived, TEAM_PROMPT_LIMIT_BYTES);
+    built = fitDerivedPromptSections(compose([reference]), target, derived, limit);
   }
-  if (Buffer.byteLength(built.prompt, "utf8") > TEAM_PROMPT_LIMIT_BYTES) {
+  if (Buffer.byteLength(built.prompt, "utf8") > limit) {
     const reason = role === "permission-coordinator"
       ? "The complete permission evidence, objective, and owner-authorized review scope exceed the 80 KiB prompt limit. Leave the permission request unanswered and reduce the supplied evidence before retrying."
       : "The pinned policy, distinct Linear description, and role instructions exceed the 80 KiB prompt limit even after moving full objective and owner directions to the context file. Consolidate applicable context before starting this member.";

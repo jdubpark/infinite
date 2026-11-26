@@ -626,7 +626,7 @@ export function commitProviderLimitSwitch(
   const prevProfile = member.modelProfile;
   const prevProvider = member.provider;
   const prevPrompt = member.prompt;
-  const prevPromptSections = getMemberPromptSections(promptStore, member.memberId);
+  const prevPromptSections = getMemberPromptSections(promptStore, member);
   const prevHostProfiles = member.hostProfiles;
   const prevScratch = member.scratchDirectory;
   const prevEventsLen = run.events.length;
@@ -634,7 +634,7 @@ export function commitProviderLimitSwitch(
   member.modelProfile = structuredClone(pendingSwitch.fallback);
   member.provider = pendingSwitch.fallback.provider;
   member.prompt = pendingSwitch.prompt;
-  setMemberPromptSections(promptStore, member.memberId, pendingSwitch.promptSections);
+  setMemberPromptSections(promptStore, member.memberId, pendingSwitch.promptSections, member.prompt);
   if (hostProfilesFor(run, member.role, pendingSwitch.fallback.id)) member.hostProfiles = true;
   else delete member.hostProfiles;
   appendEvent(pendingSwitch.eventText);
@@ -644,7 +644,7 @@ export function commitProviderLimitSwitch(
     member.modelProfile = prevProfile;
     member.provider = prevProvider;
     member.prompt = prevPrompt;
-    setMemberPromptSections(promptStore, member.memberId, prevPromptSections);
+    setMemberPromptSections(promptStore, member.memberId, prevPromptSections, prevPrompt);
     if (prevHostProfiles) member.hostProfiles = prevHostProfiles;
     else delete member.hostProfiles;
     if (prevScratch) member.scratchDirectory = prevScratch;
@@ -663,7 +663,7 @@ export function applyProviderLimitGate(
   appendEvent: (text: string) => void,
   options: { planMemberId?: string; workerCapacityFull?: boolean; hostLoadReason?: string; sessionSlotFull?: boolean; promptSections?: readonly TeamPromptSection[]; promptStore?: MemberPromptSectionStore } = {},
 ): { proceed: boolean; changed: boolean } {
-  const promptSections = options.promptSections ?? getMemberPromptSections(options.promptStore, member.memberId);
+  const promptSections = options.promptSections ?? getMemberPromptSections(options.promptStore, member);
   const result = evaluateLaunchAdmission(run, member, activeLimits, limitedProviders, sessionSlotReason, appendEvent, { ...options, ...(promptSections ? { promptSections } : {}) });
   if (!result.proceed) return result;
   if (result.pendingSwitch) {

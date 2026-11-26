@@ -2315,7 +2315,6 @@ test(`a report written during a stall stop wins over replacement${limited ? " an
         f.journal.append("team-report", { ...envelope, memberId: randomUUID() });
         f.journal.append("team-report", { ...envelope, revision: member.revision + 1 });
         f.journal.append("team-report", envelope);
-        f.journal.append("lifecycle", { status: "exited" });
         f.state.status = "exited";
       }
       return f.manager.state();

@@ -1,88 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { Manager } from "../packages/host/src/manager.js";
 import { workerCall } from "../packages/host/src/ipc.js";
 import { headlessChannelArgs } from "../packages/host/src/launch.js";
-import {
-  HeadlessPermissionChannel, channelToken, deferredCallOpen, deliveryKey, type ChannelReply,
-} from "../packages/host/src/permission-headless.js";
-import {
-  claudeTurnSignals, DEFERRAL_RETENTION_MS, HeadlessChannelWorker, OPEN_CALL_KEYS, OWNER_DENIED, PENDING_NOTICE, type ChannelWorkerHost,
-} from "../packages/host/src/permission-headless-worker.js";
+import { HeadlessPermissionChannel, channelToken, deferredCallOpen, deliveryKey, type ChannelReply } from "../packages/host/src/permission-headless.js";
+import { claudeTurnSignals, DEFERRAL_RETENTION_MS, HeadlessChannelWorker, OPEN_CALL_KEYS, OWNER_DENIED, PENDING_NOTICE, type ChannelWorkerHost } from "../packages/host/src/permission-headless-worker.js";
 import { ask, hookOutput, type ChannelPost } from "../packages/host/src/permission-hook.js";
 import { requesterNotice } from "../packages/host/src/permission-policy.js";
-import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
-import type { PermissionAgentServices, PermissionOutcome, PermissionPipeline, PermissionRequest } from "../packages/host/src/permission-agent-types.js";
-import type { Config, Event, Session } from "../packages/host/src/types.js";
-import { stopSessionWorkers, waitFor } from "./helpers.js";
-
-const FAKE = resolve("tests/fixtures/headless-claude.mjs");
-
-function fakePipeline(overrides: Partial<PermissionPipeline> = {}) {
-  const deliveries: Array<{ decisionId: string; kind: string; detail?: string }> = [];
-  const decided: PermissionRequest[] = [];
-  const classOf = (request: PermissionRequest) =>
-    /production/.test(request.action) ? { interruptClass: "production-or-staging" as const, rule: "production-deploy" } : undefined;
-  const pipeline: PermissionPipeline = {
-    serves: () => ({ served: true }),
-    classOf,
-    async decide(request): Promise<PermissionOutcome> {
-      decided.push(request);
-      const decisionId = randomUUID();
-      const match = classOf(request);
-      if (match) return { kind: "owner", decisionId, interruptClass: match.interruptClass };
-      if (/safe-build/.test(request.action)) return { kind: "allow", decisionId, strongTier: false };
-      return { kind: "reject", decisionId, code: "unsafe", notice: "MODEL TEXT that must never reach the agent" };
-    },
-    applicable: () => true,
-    recordDelivery: (decisionId, kind, detail) => { deliveries.push({ decisionId, kind, ...(detail ? { detail } : {}) }); },
-    taskEnded() {},
-    ...overrides,
-  };
-  return { pipeline, deliveries, decided };
-}
-
-async function rig(options: { args?: string[]; pipeline?: PermissionPipeline; overrides?: Partial<PermissionPipeline> } = {}) {
-  const root = realpathSync(mkdtempSync("/tmp/inf-headless-"));
-  const workspace = join(root, "workspace");
-  mkdirSync(workspace);
-  const key = randomBytes(32);
-  const keyFile = join(root, "key");
-  writeFileSync(keyFile, key, { mode: 0o600 });
-  const config: Config = {
-    port: 0, origin: "http://127.0.0.1", keyFile, stateDir: join(root, "state"), runDir: join(root, "run"),
-    environment: "local", enableDemo: false, maxSessions: 8,
-    agents: { claude: { command: process.execPath, args: [FAKE, "--print", ...(options.args ?? [])] } },
-    projects: [{ id: "rehearsal", name: "Rehearsal", path: workspace }],
-    tokens: [],
-    attention: { hooks: { claude: true, codex: false }, idleAfterMs: 3000, limitConfirmMs: 30000 },
-  } as Config;
-  const manager = new Manager(config, key);
-  const fake = fakePipeline(options.overrides);
-  const services: PermissionAgentServices = { pipeline: options.pipeline ?? fake.pipeline };
-  const channel = new HeadlessPermissionChannel({ key, runDir: config.runDir, sessions: manager, services });
-  manager.useHeadlessChannel(channel);
-  await channel.listen();
-  return {
-    root, workspace, config, key, manager, channel, services, ...fake,
-    log: (name: string) => existsSync(join(workspace, name)) ? readFileSync(join(workspace, name), "utf8") : "",
-    channelEvents: (id: string) => manager.events(id, 0, 500, new Set(["lifecycle"])).events
-      .map(event => (event.data as { permissionChannel?: Record<string, unknown> }).permissionChannel).filter(Boolean) as Array<Record<string, unknown>>,
-    stop: async () => {
-      await stopSessionWorkers(config);
-      channel.close();
-      await new Promise(done => setTimeout(done, 1700));
-      rmSync(root, { recursive: true, force: true });
-    },
-  };
-}
-
-type Live = Session & { status: string; attention: { state: string; prompt?: { id: number; source: string; options: Array<{ label: string }> } }; permissionChannel?: { served: boolean; waiting?: { interruptClass: string; tool: string }; notice?: { id: string; interruptClass?: string } } };
-const live = async (r: Awaited<ReturnType<typeof rig>>, id: string) => ({ ...r.manager.meta(id).session, ...(await r.manager.state(id)) }) as unknown as Live;
+import { Journal, writeSealed } from "../packages/host/src/vault.js";
+import type { PermissionPipeline, PermissionRequest } from "../packages/host/src/permission-agent-types.js";
+import type { Event, Session } from "../packages/host/src/types.js";
+import { waitFor } from "./helpers.js";
+import { fakePipeline, live, rig } from "./headless-rig.js";
 
 test("a class call waits for the owner, and the owner's allow runs that one call once in the same session", { timeout: 90_000 }, async () => {
   const r = await rig();
@@ -205,54 +137,6 @@ test("an owner's refusal reaches the call with the host's notice and the owner's
     assert.equal(r.log("ran.log"), "");
     assert.equal(r.log("denied.log"), `deploy production: ${OWNER_DENIED} Owner direction: Use the staging checklist\n`);
   } finally { await r.stop(); }
-});
-
-async function failJournal(r: Awaited<ReturnType<typeof rig>>, id: string) {
-  const events = join(r.config.stateDir, "sessions", id, "events");
-  const files = readdirSync(events).map(name => join(events, name));
-  for (const file of files) chmodSync(file, 0o400);
-  await assert.rejects(workerCall(r.config.runDir, id, { op: "stop", requestId: randomUUID() }), /EACCES/);
-  for (const file of files) chmodSync(file, 0o600);
-  return waitFor(() => r.manager.state(id), s => s.status === "recording-error", 10_000);
-}
-
-test("after a recording error an owner's answer neither resumes the session nor appends", { timeout: 90_000 }, async () => {
-  const r = await rig();
-  try {
-    const id = randomUUID();
-    await r.manager.create({ requestId: id, provider: "claude", projectId: "rehearsal", title: "Headless", prompt: "mixed" });
-    const waiting = await waitFor(() => live(r, id), s => s.attention.state === "needs-you" && Boolean(s.permissionChannel?.waiting), 40_000);
-    const failed = await failJournal(r, id);
-    await assert.rejects(workerCall(r.config.runDir, id, { op: "answer", requestId: randomUUID(), promptId: waiting.attention.prompt!.id, option: 0 }));
-    const after = await r.manager.state(id);
-    assert.deepEqual([after.status, after.seq], ["recording-error", failed.seq]);
-    assert.equal(r.log("ran.log"), "make safe-build\n");
-  } finally { await r.stop(); }
-});
-
-test("a worker whose journal failed outlives its waiting call's retention and keeps its status", { timeout: 150_000 }, async () => {
-  const r = await rig();
-  const clock = join(r.root, "clock");
-  const saved = [process.env.NODE_OPTIONS, process.env.INFINITE_TEST_CLOCK_FILE];
-  try {
-    const id = randomUUID();
-    process.env.NODE_OPTIONS = `--import=${pathToFileURL(resolve("tests/fixtures/worker-clock.mjs")).href}`;
-    process.env.INFINITE_TEST_CLOCK_FILE = clock;
-    await r.manager.create({ requestId: id, provider: "claude", projectId: "rehearsal", title: "Headless", prompt: "mixed" });
-    await waitFor(() => live(r, id), s => s.attention.state === "needs-you" && Boolean(s.permissionChannel?.waiting), 40_000);
-    await failJournal(r, id);
-    const pid = unseal<{ workerPid: number }>(r.key, `${id}:status`, readFileSync(join(r.config.stateDir, "sessions", id, "status.sealed"), "utf8")).workerPid;
-    writeFileSync(clock, String(DEFERRAL_RETENTION_MS + 120_000));
-    process.kill(pid, "SIGUSR2");
-    await waitFor(async () => readFileSync(clock, "utf8"), text => text.startsWith("moved"), 10_000);
-    await new Promise(done => setTimeout(done, 65_000));
-    assert.equal((await workerCall<{ status: string }>(r.config.runDir, id, { op: "state" })).status, "recording-error");
-  } finally {
-    [process.env.NODE_OPTIONS, process.env.INFINITE_TEST_CLOCK_FILE] = saved as [string, string];
-    if (saved[0] === undefined) delete process.env.NODE_OPTIONS;
-    if (saved[1] === undefined) delete process.env.INFINITE_TEST_CLOCK_FILE;
-    await r.stop();
-  }
 });
 
 test("stop retires a waiting call unanswered, and the session cannot be resumed past it", { timeout: 90_000 }, async () => {

@@ -148,12 +148,15 @@ export class Journal {
         throw error;
       }
       let size = segmentBytes - bytes.length;
-      for (let at = start; at < end; at++) {
-        size += Buffer.byteLength(lines[at - start]);
-        this.seq = events[at].seq;
-        this.options?.onAppend?.(events[at], { segment: name, bytes: size });
+      try {
+        for (let at = start; at < end; at++) {
+          size += Buffer.byteLength(lines[at - start]);
+          this.seq = events[at].seq;
+          this.options?.onAppend?.(events[at], { segment: name, bytes: size });
+        }
+      } finally {
+        this.seq = events[end - 1].seq;
       }
-      this.seq = events[end - 1].seq;
       start = end;
     }
     return events;

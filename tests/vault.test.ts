@@ -181,3 +181,13 @@ test("a batch that fails in its second segment leaves the first segment readable
   const events = readEvents(directory, key, "latch", 0, 1000).events;
   assert.deepEqual(events.map(event => event.seq), Array.from({ length: 256 }, (_, index) => index + 1));
 });
+
+test("a hook that throws midway through a segment leaves the sequence at that segment's last event", () => {
+  const directory = mkdtempSync(join(tmpdir(), "inf-vault-"));
+  const key = randomBytes(32);
+  const journal = new Journal(directory, key, "hook", { onAppend: event => { if (event.seq === 3) throw new Error("hook failed"); } });
+  assert.throws(() => journal.appendAll("output", Array.from({ length: 10 }, (_, index) => ({ text: String(index) }))), /hook failed/);
+  assert.equal(journal.seq, 10);
+  assert.equal(journal.append("output", { text: "next" }).seq, 11);
+  assert.deepEqual(readEvents(directory, key, "hook", 0, 100).events.map(event => event.seq), Array.from({ length: 11 }, (_, index) => index + 1));
+});

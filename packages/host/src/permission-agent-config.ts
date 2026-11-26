@@ -58,12 +58,12 @@ export function permissionAgentSettings(config: {
 }
 
 export function hostProtectedPaths(config: {
-  stateDir: string; runDir: string; keyFile: string;
+  stateDir: string; runDir: string; socketDir?: string; keyFile: string;
   agents: Partial<Record<string, { command: string; args: string[]; appServerCommand?: string }>>;
   teams?: { commandPrefix?: { command: string } };
   cmux?: { hooksDir?: string };
 }, installRoot: string, extra: readonly string[] = []): string[] {
-  const paths = [config.stateDir, config.runDir, config.keyFile, protectedInstallPath(installRoot), config.cmux?.hooksDir, config.teams?.commandPrefix?.command, ...extra];
+  const paths = [config.stateDir, config.runDir, config.socketDir, config.keyFile, protectedInstallPath(installRoot), config.cmux?.hooksDir, config.teams?.commandPrefix?.command, ...extra];
   for (const profile of Object.values(config.agents)) {
     if (!profile) continue;
     paths.push(profile.command, profile.appServerCommand);

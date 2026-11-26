@@ -173,7 +173,7 @@ const octet = "(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)";
 const ipv4 = new RegExp(`(?<![\\d.])(?:${octet}\\.){3}${octet}(?!\\.?\\d)`, "g");
 
 export function outboundText(config: Config, value: string): string {
-  const directories = [config.stateDir, config.runDir, config.teams?.workspaceDir,
+  const directories = [config.stateDir, config.runDir, config.socketDir, config.teams?.workspaceDir,
     ...(config.projects ?? []).flatMap(project => [project.path, project.teamworkDir])]
     .filter((directory): directory is string => typeof directory === "string" && isAbsolute(directory))
     .map(directory => resolve(directory))
@@ -222,6 +222,7 @@ export class IntakeService {
   private timer?: NodeJS.Timeout;
   private unsubscribe?: () => void;
   private closed = false;
+  private reopenScan = false;
   private inFlight?: Promise<void>;
   private lastError?: { at: string; step: string; message: string };
   private readonly log: (line: string, error: unknown) => void;
@@ -262,6 +263,7 @@ export class IntakeService {
 
   start(): void {
     if (!this.enabled() || this.timer || this.closed) return;
+    this.reopenScan = this.config.github?.reviewFeedback?.enabled === true;
     this.unsubscribe = this.missions.onChange(mission => this.observe(mission));
     this.timer = setInterval(() => void this.poll(), this.pollMs);
     this.timer.unref();
@@ -336,8 +338,10 @@ export class IntakeService {
     await this.attempt("route", () => this.route());
     await this.attempt("file", () => this.file());
     await this.attempt("start", () => this.startQueued());
+    const reopening = this.reopenScan;
+    this.reopenScan = false;
     for (const record of this.store.list())
-      if (record.state === "started") {
+      if (record.state === "started" || reopening && record.state === "finished") {
         const mission = this.missions.peek(record.missionId);
         if (mission) this.observe(mission);
       }
@@ -647,6 +651,10 @@ export class IntakeService {
 
   private observe(mission: Mission): void {
     if (this.closed) return;
+    if (liveStatuses.has(mission.status)) {
+      this.reopen(mission);
+      return;
+    }
     const stopped = deadlineStopped(mission);
     if (!stopped && !finishedStatuses.has(mission.status)) return;
     const record = this.store.forMission(mission.id);
@@ -660,6 +668,13 @@ export class IntakeService {
       next.state = "finished";
       if (!isAnswerRecord(next) && !this.mirrors(next)) next.comments.outcome = { id: randomUUID(), body: outcomeBody(this.config, mission, Boolean(next.direct || next.external)), delivered: false, attempts: 0 };
     }), record.identifier);
+  }
+
+  private reopen(mission: Mission): void {
+    const record = this.store.forMission(mission.id);
+    if (record?.state !== "finished") return;
+    try { this.store.update(record.issueId, next => { next.state = "started"; }); }
+    catch (error) { this.reopenScan = true; this.fail("observe", error, record.identifier); }
   }
 
   private observeDeadline(record: IntakeRecord, mission: Mission): void {

@@ -362,6 +362,7 @@ export class EvalHost implements EvalHostApi {
       this.config.keyFile,
       this.config.stateDir,
       this.config.runDir,
+      ...(this.config.socketDir ? [this.config.socketDir] : []),
       ...(workspace === undefined ? [] : [workspace]),
       ...mirrors,
     ];

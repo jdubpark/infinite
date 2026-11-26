@@ -162,7 +162,7 @@ test("workspace retention follows delivery and reconciliation errors for team co
 
 test("DELETE /api/teams/:id enforces ownership and removes only settled runs", { timeout: 15000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), "team-delete-api-")),
-    runDir = mkdtempSync(join(resolve(tmpdir(), "../../../../../tmp"), "team-delete-run-")), fixture = schedulerFixture();
+    runDir = mkdtempSync(join(tmpdir(), "team-delete-run-")), fixture = schedulerFixture();
   const workspace = join(root, "workspace");
   mkdirSync(workspace, { recursive: true });
   const key = randomBytes(32), token = randomBytes(32).toString("base64url"), controllerToken = randomBytes(32).toString("base64url");

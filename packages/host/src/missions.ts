@@ -14,7 +14,6 @@ import { askedRecommendation, isDirectionMessage, missionFollowUpPromptWithMessa
 import { questionProblem, recommendationOutcome } from "./question-recommendation.js";
 import { addRollups, emptyRollup, teamUsage } from "./team-usage.js";
 import type { UsageService } from "./usage-service.js";
-import { ledgerRecord } from "./usage-store.js";
 import { missionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory } from "./team-workspace.js";
 import { resumeFailed } from "./native-continuation.js";
@@ -25,6 +24,17 @@ import { KeyedQueue, PendingCreates, mapConcurrent, pauseWithPendingCreates } fr
 import { HALT_PAUSED_TEAM, KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import { missionDecisionQueueCandidates } from "./decision-queue.js";
 import { projectMissionSource } from "./mission-progress.js";
+import { MissionReview, type MissionReviewRecord, type ReviewDirection, type ReviewForwardOp } from "./mission-review.js";
+import {
+  CoordinatorContextReadTracker,
+  readSessionPromptContext,
+  reconcileDeliveredUnapplied,
+  returnConsumedMessages,
+  selectCoordinatorContinuation,
+  settleCoordinatorReport,
+  settleUnappliedConsumed,
+  type DeliveredUnappliedBatch,
+} from "./mission-coordinator.js";
 
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
 
@@ -33,7 +43,7 @@ type Attempt = { memberId: string; sessionId: string; revision: number; prompt: 
   stopping?: true;
   continuation?: NativeContinuation;
   nativeConfirmed?: boolean;
-  resumeFailed?: boolean;
+  resumeFailed?: boolean; deliveryUncertain?: boolean;
   consumedInbox?: MissionMessage[];
   consumedNotes?: MissionMessage[];
   ownerInputs?: number;
@@ -58,9 +68,10 @@ type Stored = {
   attempts: Attempt[];
   inbox: MissionMessage[];
   notes: MissionMessage[];
+  deliveredUnapplied?: DeliveredUnappliedBatch[];
   notified: string[];
   launches: Record<string, CreateTeam>;
-  ops: ChildOp[];
+  ops: (ChildOp | ReviewForwardOp)[];
   controlSource?: ConnectorSource;
   refusals: number;
   ownerInputs?: number;
@@ -68,9 +79,11 @@ type Stored = {
   clockStoppedAt?: string;
   blockedAt?: string;
   coordinatorNotes?: MissionCoordinatorNote[];
+  reviews?: MissionReviewRecord[];
 };
 
 const now = () => new Date().toISOString();
+const steeringFull = (mission: Mission, text: string) => mission.steering.length >= 20 || Buffer.byteLength([...mission.steering.map(item => item.text), text].join("\n\n")) > 10000;
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const receiptDigest = <T extends object>(value: T & { source?: ConnectorSource | string }) => {
   const { source, ...body } = value;
@@ -94,11 +107,6 @@ const rotationText: Record<RotationRule, string> = {
 };
 const utcMinute = (iso: string) => `${iso.slice(0, 16).replace("T", " ")} UTC`;
 const endAttempt = (attempt: Attempt) => { attempt.status = "stopped"; attempt.endedAt ??= now(); };
-function returnConsumed(stored: Stored, attempt: Attempt) {
-  stored.inbox = [...(attempt.consumedInbox ?? []), ...stored.inbox];
-  stored.notes = [...(attempt.consumedNotes ?? []), ...stored.notes];
-  delete attempt.consumedInbox; delete attempt.consumedNotes;
-}
 const openFollowUps = (mission: Mission) => (mission.followUps ?? []).filter(item => item.state === "open");
 function cancelFollowUps(mission: Mission) {
   const at = now();
@@ -131,6 +139,11 @@ export class MissionService {
   private usage?: UsageService;
   private readonly listeners = new Set<(mission: Mission) => void>();
   private fuse?: FuseGate;
+  private readonly review = new MissionReview<Stored>((service => ({ get records() { return service.records; }, get teams() { return service.teams; },
+    enqueue: (id, task) => service.enqueue(id, task), save: stored => service.save(stored), event: (stored, text) => service.event(stored, text),
+    follow: (subtask, team) => Object.assign(subtask, { status: subtaskStatus(team.status), teamStatus: team.status }), held: projectId => service.held(projectId), steeringFull,
+    reportHeld: (stored, subtask, reviewId) => service.reportHeld(stored, subtask, reviewId) }))(this));
+  private readonly contextReads = new CoordinatorContextReadTracker();
 
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly teams: TeamService, private readonly groups: ProjectGroupLookup) {
     this.directory = join(config.stateDir, "missions");
@@ -164,6 +177,7 @@ export class MissionService {
       }
       return undefined;
     });
+    this.review.connect(this.teams.useMissionReviews(this.review));
   }
   useUsage(service: UsageService) { this.usage = service; }
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
@@ -505,7 +519,7 @@ export class MissionService {
       authorize?.();
       if (this.replay(stored, "steer", body)) return this.view(stored);
       if (!live.has(mission.status)) throw new TeamError(409, "mission-not-running", "Resume the mission before sending direction, or start a new mission if it has stopped.");
-      if (mission.steering.length >= 20 || Buffer.byteLength([...mission.steering.map(item => item.text), body.text].join("\n\n")) > 10000)
+      if (steeringFull(mission, body.text))
         throw new TeamError(409, "mission-steering-limit", "Start a new mission with consolidated directions.");
       this.admit(stored, "steer", body);
       mission.steering.push({ text: body.text, revision: mission.revision, at: now(), ...(source ? { source } : {}) });
@@ -517,6 +531,7 @@ export class MissionService {
       this.save(stored); return this.view(stored);
     });
   }
+  reviewDirection(id: string, direction: ReviewDirection) { return this.review.direct(id, direction); }
   answer(id: string, decisionId: string, input: Action & { text: string }, source?: MissionInputSource, authorize?: () => void) {
     const body = { ...missionTextSchema.parse(input), ...(source === undefined ? {} : { source }) };
     return this.enqueue(id, () => {
@@ -620,7 +635,7 @@ export class MissionService {
       if (subtask.status === "queued" && !stored.launches[subtask.id]) subtask.status = "cancelled";
       else if (subtask.teamId && ["running", "blocked"].includes(subtask.status)) this.queueOp(stored, { kind: "cancel", subtaskId: subtask.id, teamId: subtask.teamId, ...(source ? { source } : {}) });
     }
-    stored.inbox = []; stored.notes = [];
+    stored.inbox = []; stored.notes = []; delete stored.deliveredUnapplied;
     cancelFollowUps(mission);
   }
   private closeStaleBlocked(stored: Stored) {
@@ -745,15 +760,17 @@ export class MissionService {
       delete stored.launches[subtaskId]; delete stored.bases?.[subtaskId]; this.save(stored);
     }
   }
+  private held(projectId: string) {
+    for (const other of this.records.values())
+      if (other.mission.subtasks.some(item => item.repoProjectId === projectId && (item.status === "running" || other.launches[item.id]))) return true;
+    return this.teams.activeForProject(projectId);
+  }
   private schedule(stored: Stored) {
     const mission = stored.mission;
-    const busy = new Set<string>();
-    for (const other of this.records.values())
-      for (const item of other.mission.subtasks) if (item.status === "running" || other.launches[item.id]) busy.add(item.repoProjectId);
     for (const subtask of mission.subtasks) {
       if (subtask.status !== "queued" || stored.launches[subtask.id]) continue;
       if (!subtask.dependsOn.every(id => mission.subtasks.find(item => item.id === id)?.status === "done")) continue;
-      if (busy.has(subtask.repoProjectId) || this.teams.activeForProject(subtask.repoProjectId)) { busy.add(subtask.repoProjectId); this.reportHeld(stored, subtask); continue; }
+      if (this.held(subtask.repoProjectId)) { this.reportHeld(stored, subtask); continue; }
       const base = this.baseSubtask(mission, subtask);
       const objective = [
         `Mission: ${mission.title}`,
@@ -766,18 +783,17 @@ export class MissionService {
       if (base) (stored.bases ??= {})[subtask.id] = base.teamId!;
       stored.launches[subtask.id] = { requestId: randomUUID(), projectId: subtask.repoProjectId, provider: mission.lineup.coordinator.provider, useConfiguredLineup: true,
         title: `${subtask.title} · ${mission.title}`.slice(0, 100), objective, parallelism: subtask.size === "solo" ? 1 : subtask.parallelism };
-      busy.add(subtask.repoProjectId);
       this.save(stored);
     }
   }
-  private reportHeld(stored: Stored, subtask: Mission["subtasks"][number]) {
+  private reportHeld(stored: Stored, subtask: Mission["subtasks"][number], reviewId?: string) {
     if ((stored.attempts.at(-1)?.status ?? "stopped") !== "stopped") return;
     if (stored.mission.subtasks.some(item => item.repoProjectId === subtask.repoProjectId && (item.status === "running" || stored.launches[item.id]))) return;
     const holders = holdersOf(this.teams.list(), subtask.repoProjectId);
     if (!holders.length || holders.some(run => run.missionId === stored.mission.id || !waitsOnPerson(run.status))) return;
     for (const run of holders)
-      this.message(stored, `${subtask.id}:held:${run.id}:${run.status}`, { type: "repository-held", subtaskId: subtask.id, repoProjectId: subtask.repoProjectId,
-        teamId: run.id, teamStatus: run.status, ...(run.reason ? { reason: run.reason } : {}) });
+      this.message(stored, `${subtask.id}:held:${reviewId ? `${reviewId}:` : ""}${run.id}:${run.status}`, { type: "repository-held", subtaskId: subtask.id, repoProjectId: subtask.repoProjectId,
+        teamId: run.id, teamStatus: run.status, ...(run.reason ? { reason: run.reason } : {}), ...(reviewId ? { reviewId } : {}) });
   }
   private baseSubtask(mission: Mission, subtask: Mission["subtasks"][number]) {
     const byId = new Map(mission.subtasks.map(item => [item.id, item]));
@@ -856,16 +872,20 @@ export class MissionService {
   }
   private connectorSource(mission: Mission): ConnectorSource | undefined {
     return [...mission.decisions].reverse().find(item => item.source)?.source
-      ?? [...mission.steering].reverse().map(item => item.source).find((source): source is ConnectorSource => typeof source === "object")
+      ?? [...mission.steering].reverse().map(item => item.source).find((source): source is ConnectorSource => typeof source === "object" && source.kind === "connector")
       ?? mission.origin?.source;
   }
   private async applyOps(stored: Stored) {
     await this.applySettlements(stored);
     if (this.closed) return;
-    const remaining: ChildOp[] = [], steered: (string | undefined)[] = [];
+    const remaining: Stored["ops"] = [], steered: (string | undefined)[] = [];
     const mission = stored.mission, resumeHeld = mission.status === "paused" || (mission.status === "blocked" && mission.stopReason === "deadline") ||
       Boolean(this.fuse?.held?.(mission.repoProjectIds));
     for (const op of [...stored.ops]) {
+      if (op.kind === "review-forward") {
+        if (await this.review.applyForward(stored, op)) remaining.push(op);
+        continue;
+      }
       let team: TeamView;
       try { team = this.teams.get(op.teamId); } catch (error) { if (notFound(error)) continue; throw error; }
       const settled = teamDone.has(team.status) || team.status === "cancelled";
@@ -922,7 +942,7 @@ export class MissionService {
     if (this.closed) return;
     stored.ops = remaining;
     for (const reason of steered) {
-      if (reason === undefined) stored.refusals = 0;
+      if (reason === undefined) settleCoordinatorReport(stored, "accepted");
       else if (live.has(stored.mission.status)) this.refuse(stored, "steer-subtask", reason);
       else this.event(stored, `A steer was not applied: ${reason}`);
     }
@@ -1011,7 +1031,7 @@ export class MissionService {
       if (live.has(mission.status)) { await this.launch(stored, attempt); return; }
       if (!this.launched(attempt)) {
         endAttempt(attempt);
-        if (mission.status === "paused" || mission.status === "blocked" && mission.stopReason === "deadline") returnConsumed(stored, attempt);
+        if (mission.status === "paused" || mission.status === "blocked" && mission.stopReason === "deadline") returnConsumedMessages(stored, attempt);
         this.save(stored); return;
       }
       attempt.status = "running";
@@ -1057,7 +1077,8 @@ export class MissionService {
       delete attempt.note;
     } else if (attempt.missedReport && live.has(mission.status) && !attempt.stopping)
       this.refuse(stored, "missing", "Your previous attempt ended without a mission report. File exactly one report in every attempt; report wait when nothing needs a decision.");
-    if (!applied && (attempt.stopping && live.has(mission.status) || mission.status === "paused" || mission.status === "blocked" && mission.stopReason === "deadline")) returnConsumed(stored, attempt);
+    if (!applied && (attempt.stopping && live.has(mission.status) || mission.status === "paused" || mission.status === "blocked" && mission.stopReason === "deadline"))
+      settleUnappliedConsumed(stored, attempt, (sessionId, after, limit, types) => this.manager.events(sessionId, after, limit, types), readSessionPromptContext(attempt.sessionId, id => this.manager.meta(id)));
     this.save(stored);
   }
   private keepNote(stored: Stored, attempt: Attempt) {
@@ -1070,7 +1091,7 @@ export class MissionService {
     attempt.resumeFailed = true;
     attempt.missedReport = false;
     endAttempt(attempt);
-    returnConsumed(stored, attempt);
+    returnConsumedMessages(stored, attempt);
     this.event(stored, "The coordinator's conversation could not be resumed; a fresh attempt starts with the full mission state.");
   }
   private async wake(stored: Stored) {
@@ -1083,16 +1104,9 @@ export class MissionService {
     const revision = stored.attempts.length + 1, profile = mission.lineup.coordinator;
     let continuation: NativeContinuation | undefined, rotated: RotationRule | undefined;
     if (profile.provider === "claude") {
-      for (let index = stored.attempts.length - 1; index >= 0; index--) {
-        const previous = stored.attempts[index], nativeSessionId = previous.continuation?.nativeSessionId;
-        const failedLater = (id: string) => stored.attempts.slice(index + 1).some(attempt => attempt.resumeFailed && attempt.continuation?.nativeSessionId === id);
-        if (previous.nativeConfirmed && nativeSessionId && !failedLater(nativeSessionId)) { continuation = { mode: "resume", nativeSessionId }; break; }
-        if (previous.rotated) break;
-      }
-      rotated = continuation && this.rotation(stored, continuation.nativeSessionId);
-      if (rotated) continuation = undefined;
-      continuation ??= { mode: "start", nativeSessionId: randomUUID() };
+      ({ continuation, rotated } = selectCoordinatorContinuation(stored.attempts, nativeSessionId => this.rotation(stored, nativeSessionId), randomUUID));
     }
+    reconcileDeliveredUnapplied(stored, continuation?.mode === "resume" ? continuation.nativeSessionId : undefined);
     const inbox = stored.inbox.slice(0, messageLimit), notes = stored.notes.slice(0, messageLimit - inbox.length);
     const waiting = stored.inbox.length + stored.notes.length - inbox.length - notes.length;
     const undelivered = stored.inbox.filter(isDirectionMessage).length;
@@ -1133,27 +1147,15 @@ export class MissionService {
     const ran = conversation.filter(attempt => attempt.startedAt), latest = ran.at(-1);
     if (idleMinutes && latest?.endedAt && Date.now() - Date.parse(latest.endedAt) >= idleMinutes * 60000) return "idle";
     if (contextTokens) {
-      if (latest) this.observeContext(latest);
+      if (latest) this.observeContext(stored, latest);
       const observed = [...ran].reverse().find(attempt => attempt.contextTokens !== undefined)?.contextTokens;
       if (observed !== undefined && observed >= contextTokens) return "size";
     }
     if (attempts && conversation.length >= attempts) return "age";
     return undefined;
   }
-  private observeContext(attempt: Attempt) {
-    try {
-      for (let pages = 0; pages < 50; pages++) {
-        const page = this.manager.events(attempt.sessionId, attempt.usageCursor ?? 0, 200, new Set(["usage"]));
-        attempt.usageCursor = page.cursor;
-        for (const event of page.events) {
-          const record = event.type === "usage" ? ledgerRecord(event.data) : undefined;
-          if (!record || record.secondary) continue;
-          const { input, cacheRead, cacheWrite, output } = record.tokens;
-          attempt.contextTokens = input + cacheRead + cacheWrite + output;
-        }
-        if (!page.more) return;
-      }
-    } catch { }
+  private observeContext(stored: Stored, attempt: Attempt) {
+    this.contextReads.observe(stored.mission.id, attempt, (sessionId, after, limit, types) => this.manager.events(sessionId, after, limit, types));
   }
 
   private openChildDecisions(stored: Stored): MissionOpenChildDecision[] {
@@ -1163,7 +1165,7 @@ export class MissionService {
       try { team = this.teams.get(subtask.teamId!); } catch (error) { if (notFound(error)) continue; throw error; }
       for (const decision of team.decisions.filter(item => item.revision === team.revision && !item.answer)) {
         const escalated = mission.decisions.find(item => item.childDecisionId === decision.id && !item.answer);
-        const answering = stored.ops.find(op => op.kind === "answer" && op.decisionId === decision.id);
+        const answering = stored.ops.find((op): op is ChildOp => op.kind === "answer" && op.decisionId === decision.id);
         open.push({ subtaskId: subtask.id, teamId: team.id, decisionId: decision.id, question: decision.question, options: decision.options,
           ...(decision.answerMode ? { answerMode: decision.answerMode } : {}), ...askedRecommendation(decision),
           ...(escalated ? { ownerDecisionId: escalated.id } : {}), ...(answering ? { answerPendingBy: answering.by ?? "owner" } : {}) });
@@ -1175,6 +1177,8 @@ export class MissionService {
     const mission = stored.mission;
     if (mission.decisions.some(item => !item.answer)) return true;
     if (openFollowUps(mission).length) return true;
+    const free = (projectId: string) => holdersOf(this.teams.list(), projectId).every(run => !waitsOnPerson(run.status));
+    if (stored.ops.some(op => op.kind === "review-forward" && mission.subtasks.some(item => item.id === op.subtaskId && free(item.repoProjectId)))) return true;
     const working = (teamId: string) => {
       if (stored.ops.some(op => op.kind === "resume" && op.teamId === teamId)) return true;
       try { return this.teams.get(teamId).status !== "paused"; } catch (error) { if (notFound(error)) return false; throw error; }
@@ -1184,11 +1188,10 @@ export class MissionService {
     const ready = mission.subtasks.filter(item => item.status === "queued" && !stalled.has(item.id) &&
       item.dependsOn.every(id => mission.subtasks.find(other => other.id === id)?.status === "done"));
     if (ready.some(item => stored.launches[item.id])) return true;
-    if (!ready.length) return false;
-    const runs = this.teams.list();
-    return ready.some(item => holdersOf(runs, item.repoProjectId).every(run => !waitsOnPerson(run.status)));
+    return ready.some(item => free(item.repoProjectId));
   }
   private refuse(stored: Stored, kind: string, reason: string, wake = true) {
+    settleCoordinatorReport(stored, "refused");
     stored.refusals++;
     this.event(stored, `The coordinator's ${kind} report was refused: ${reason}`);
     if (stored.refusals >= 3) {
@@ -1320,6 +1323,9 @@ export class MissionService {
         break;
       }
       case "steer-subtask": {
+        const forward = this.review.queueForward(stored, subtask!, report.text, (stored.ownerInputs ?? 0) === (attempt.ownerInputs ?? 0), this.connectorSource(mission));
+        if (forward.kind === "refused") return this.refuse(stored, report.kind, forward.reason, false);
+        if (forward.kind !== "none") break;
         if (!["running", "blocked"].includes(subtask!.status) || !subtask!.teamId)
           return this.refuse(stored, report.kind, `Subtask ${subtask!.id} has no running or blocked subteam. A queued subtask receives owner direction when it starts; dispatch a follow-up subtask for finished work.`, false);
         this.queueOp(stored, { kind: "steer", subtaskId: subtask!.id, teamId: subtask!.teamId, text: report.text, by: this.connectorSource(mission) ? "connector" : "coordinator", ...(this.connectorSource(mission) ? { source: this.connectorSource(mission) } : {}) });
@@ -1348,13 +1354,14 @@ export class MissionService {
           if (!mission.subtasks.some(item => item.status === "done")) return this.refuse(stored, report.kind, "No subtask has finished. Dispatch a subtask before reporting a result, or report blocked.");
           const stalled = stalledSubtasks(mission);
           const pending = mission.subtasks.filter(item => item.status === "running" || (item.status === "queued" && !stalled.has(item.id))).length;
+          if (stored.ops.some(op => op.kind === "review-forward")) return this.refuse(stored, report.kind, "The owner's review is still on its way to its subtask. Wait for that subteam before reporting a result.", false);
           if (pending) return this.refuse(stored, report.kind, `${pending} subtask${pending === 1 ? " is" : "s are"} still queued or running. Wait for them to finish or cancel them first.`, false);
           const unfinished = mission.subtasks.filter(item => item.status === "blocked" || stalled.has(item.id)).map(item => item.id);
           if (unfinished.length) return this.refuse(stored, report.kind, `Subtask${unfinished.length === 1 ? "" : "s"} ${unfinished.join(", ")} did not finish. Cancel each with cancel-subtask, dispatch a replacement, or report blocked.`);
         }
         if (mission.decisions.some(item => !item.answer)) return this.refuse(stored, report.kind, "An owner decision is still open.", false);
         mission.result = { summary: report.summary, revision: mission.revision, at: now() };
-        mission.status = "ready-for-review"; mission.reason = undefined; stored.inbox = []; stored.notes = [];
+        mission.status = "ready-for-review"; mission.reason = undefined; stored.inbox = []; stored.notes = []; delete stored.deliveredUnapplied;
         cancelFollowUps(mission);
         this.event(stored, answering ? "The coordinator reported an answer. The mission started no subteam and changed nothing." : "Every subtask finished and the coordinator reported a result. Ready for owner review; the mission itself published nothing.");
         break;
@@ -1391,13 +1398,13 @@ export class MissionService {
           const reason = `A subteam's bounded recovery is still in progress. Reassess the mission blocker after it finishes. Your deferred report was: ${report.summary}`;
           this.event(stored, `The coordinator's blocked report was deferred: ${reason}`);
           stored.notes.push({ type: "refused", kind: report.kind, reason });
-          break;
+          settleCoordinatorReport(stored, "deferred-blocked"); this.settle(stored); return;
         }
         this.stop(stored, "blocked", report.summary);
         this.event(stored, "The coordinator reported that the mission is blocked.");
         break;
     }
-    if (report.kind !== "steer-subtask") stored.refusals = 0;
+    settleCoordinatorReport(stored, report.kind === "steer-subtask" ? "deferred-steer" : "accepted");
     this.settle(stored);
   }
 }
@@ -1438,7 +1445,7 @@ function teamDetail(team: TeamView) {
   if (waitsOnProvider(team)) return providerInputReason;
   if (team.status === "blocked" || team.status === "cancelled") return team.reason ?? teamStep[team.status] ?? team.status;
   const integrated = team.tasks.filter(task => task.status === "integrated").length;
-  return `${teamStep[team.status] ?? team.status}${team.tasks.length && team.status === "implementing" ? `: ${integrated} of ${team.tasks.length} tasks integrated` : ""}`;
+  return `${teamStep[team.status] ?? team.status}${team.tasks.length && team.status === "implementing" ? `: ${integrated} of ${team.tasks.length} ${team.tasks.length === 1 ? "task" : "tasks"} integrated` : ""}`;
 }
 const subtaskCounts = (mission: Mission) => ({ total: mission.subtasks.filter(item => item.status !== "cancelled").length,
   running: mission.subtasks.filter(item => item.status === "running").length, done: mission.subtasks.filter(item => item.status === "done").length });
@@ -1454,9 +1461,9 @@ function missionDetail(mission: Mission, teamById: Map<string, TeamView>) {
   const next = openFollowUps(mission).sort((a, b) => a.dueAt.localeCompare(b.dueAt))[0];
   if (next && mission.coordinator?.status === "waiting" && !mission.subtasks.some(item => item.status === "running"))
     return `Waiting until ${utcMinute(next.dueAt)} to look again: ${next.reason}`;
-  if (!mission.subtasks.length) return "Planning subtasks";
   const counts = subtaskCounts(mission), running = mission.subtasks.filter(item => item.status === "running");
-  return `${running.length ? `Running: ${running.map(item => item.title).join(", ")}. ` : ""}${counts.done} of ${counts.total} subtasks done`;
+  if (!counts.total) return "Planning subtasks";
+  return running.length ? `Running: ${running.map(item => item.title).join(", ")}` : "";
 }
 
 function markAttempts(entries: { item: BoardItem; scope: string; objective: string | undefined }[]) {
@@ -1475,6 +1482,7 @@ function markAttempts(entries: { item: BoardItem; scope: string; objective: stri
     });
   }
 }
+const unmappedGroupId = (kind: "group" | "project" | "mission" | "team" | "goal", id: string) => `unmapped:${kind}:${id}`;
 export function missionBoard(
   missions: Mission[], teams: TeamView[], goals: ProductGoal[], projects: Config["projects"],
   containing: (projectId: string) => { id: string; name: string } | undefined,
@@ -1485,25 +1493,28 @@ export function missionBoard(
   for (const mission of missions) {
     const column: BoardColumn = ["needs-input", "blocked"].includes(mission.status) || promptedSubtask(mission, teamById) ? "needs-input" : mission.status === "ready-for-review" ? "review" : mission.status === "cancelled" ? "ended" : "working";
     const owner = mission.repoProjectIds.map(id => containing(id)).find(Boolean);
-    items.push({ kind: "mission", id: mission.id, title: mission.title, groupId: owner?.id ?? mission.groupId, projectName: owner?.name ?? mission.groupName, column, status: mission.status,
+    const groupId = owner?.id.trim() || (mission.groupId.trim() ? unmappedGroupId("group", mission.groupId.trim()) : mission.repoProjectIds[0]?.trim() ? unmappedGroupId("project", mission.repoProjectIds[0].trim()) : unmappedGroupId("mission", mission.id));
+    items.push({ kind: "mission", id: mission.id, title: mission.title, groupId, projectName: owner?.name ?? (mission.groupName || mission.groupId || groupId), column, status: mission.status,
       ...(mission.stopReason ? { stopReason: mission.stopReason } : {}),
       detail: oneLine(missionDetail(mission, teamById)), createdAt: mission.createdAt, updatedAt: mission.updatedAt,
       subtasks: subtaskCounts(mission) });
-    attempts.push({ item: items.at(-1)!, scope: owner?.id ?? mission.groupId, objective: mission.objective });
+    attempts.push({ item: items.at(-1)!, scope: groupId, objective: mission.objective });
   }
   for (const team of teams) {
     if (team.missionId || team.goal) continue;
     const owner = containing(team.projectId);
+    const groupId = owner?.id.trim() || (team.projectId.trim() ? unmappedGroupId("project", team.projectId.trim()) : unmappedGroupId("team", team.id));
     const column: BoardColumn = ["needs-input", "blocked"].includes(team.status) || waitsOnProvider(team) ? "needs-input" : team.status === "ready-for-review" ? "review" : ["merged", "no-change", "cancelled"].includes(team.status) ? "ended" : "working";
-    items.push({ kind: "team", id: team.id, title: team.title, ...(owner ? { groupId: owner.id } : {}), projectName: owner?.name ?? projectName(team.projectId), column, status: team.status, detail: oneLine(teamDetail(team)), createdAt: team.createdAt, updatedAt: team.updatedAt });
+    items.push({ kind: "team", id: team.id, title: team.title, groupId, projectName: owner?.name ?? projectName(team.projectId), column, status: team.status, detail: oneLine(teamDetail(team)), createdAt: team.createdAt, updatedAt: team.updatedAt });
     attempts.push({ item: items.at(-1)!, scope: team.projectId, objective: team.objective });
   }
   for (const goal of goals) {
     const owner = containing(goal.projectId);
+    const groupId = owner?.id.trim() || (goal.projectId.trim() ? unmappedGroupId("project", goal.projectId.trim()) : unmappedGroupId("goal", goal.id));
     const column: BoardColumn = ["needs-input", "blocked"].includes(goal.status) || (["running", "paused"].includes(goal.status) && goal.activeTeamId && waitsOnProvider(teamById.get(goal.activeTeamId))) ? "needs-input" : ["running", "paused"].includes(goal.status) ? "working" : goal.status === "ready-for-review" ? "review" : "ended";
     const active = goal.activeTeamId ? teamById.get(goal.activeTeamId) : undefined;
     const detail = openTeamQuestion(active) ?? (goal.status === "running" && active ? `Feature ${goal.cycles.length}: ${teamDetail(active)}` : goal.reason ?? goal.status);
-    items.push({ kind: "goal", id: goal.id, title: goal.title, ...(owner ? { groupId: owner.id } : {}), projectName: owner?.name ?? projectName(goal.projectId), column, status: goal.status, detail: oneLine(detail), createdAt: goal.createdAt, updatedAt: goal.updatedAt });
+    items.push({ kind: "goal", id: goal.id, title: goal.title, groupId, projectName: owner?.name ?? projectName(goal.projectId), column, status: goal.status, detail: oneLine(detail), createdAt: goal.createdAt, updatedAt: goal.updatedAt });
   }
   markAttempts(attempts);
   const order: BoardColumn[] = ["needs-input", "working", "review", "ended"];

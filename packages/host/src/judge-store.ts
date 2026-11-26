@@ -207,6 +207,10 @@ export function releaseJudgement(tx: EvidenceTx, judgementId: string): boolean {
   return tx.run("DELETE FROM judge_judgements WHERE judgement_id=? AND state='preparing'", judgementId).changes === 1;
 }
 
+export function releaseUnstartedJudgement(tx: EvidenceTx, judgementId: string): boolean {
+  return tx.run("DELETE FROM judge_judgements WHERE judgement_id=? AND state IN ('preparing', 'live') AND session_id IS NULL", judgementId).changes === 1;
+}
+
 export function clearJudgementSession(tx: EvidenceTx, judgementId: string, cost?: JudgementCost): void {
   if (cost !== undefined) addCost(tx, judgementId, cost);
   tx.run("UPDATE judge_judgements SET session_id=NULL WHERE judgement_id=?", judgementId);

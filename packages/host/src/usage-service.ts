@@ -14,7 +14,7 @@ import type { EvidenceTx } from "./evidence/types.js";
 import { OUTCOMES_MODULE } from "./outcome-store.js";
 import { refreshOutcomeCostsForSessions } from "./outcome-cost.js";
 import {
-  SESSION_PURPOSES, combineCoverage, importLedger, importState, ledgerRecord, readBriefings, readRecords, readSessions, usageModule, writeBriefing, writeRecordWithOwner, writeSession,
+  SESSION_PURPOSES, closeMissingSession, combineCoverage, importLedger, importState, ledgerRecord, readBriefings, readRecords, readSessions, usageModule, writeBriefing, writeRecordWithOwner, writeSession,
   type LedgerCoverage, type LedgerCoverageReason, type LedgerHeader, type LedgerState, type SealedLedger, type StoredSession,
 } from "./usage-store.js";
 
@@ -46,7 +46,9 @@ type Ledger = {
 };
 const memberKey = (runId: string, memberId: string) => `${runId}\u0000${memberId}`;
 export const LEDGER_KEEP_MS = 2_000;
+export const USAGE_RECONCILE_STALE_MS = 15_000;
 type Row = Pick<LedgerState, "exited" | "cursor" | "seen" | "refused" | "journaled"> & { lastActiveAt?: string };
+type UsageServiceOptions = { now?: () => number; reconcileStaleMs?: number };
 
 const PROVIDERS: Provider[] = ["claude", "codex", "grok", "opencode", "demo"];
 const COVERED: ReadonlySet<Provider> = new Set<Provider>(["claude", "codex", "demo"]);
@@ -60,6 +62,28 @@ const isRecord = (value: unknown): value is Record<string, unknown> => value !==
 const measured = (session: StoredSession) => session.coverage !== "none";
 const partial = (session: StoredSession) => session.coverage === "partial" && session.reason !== "running";
 const inWindow = (at: string, from?: Date, to?: Date) => { const time = Date.parse(at); return (!from || time >= from.getTime()) && (!to || time <= to.getTime()); };
+const maxIso = (...values: (string | undefined)[]): string | undefined => {
+  let best: number | undefined;
+  let result: string | undefined;
+  for (const value of values) {
+    if (value === undefined) continue;
+    const ms = Date.parse(value);
+    if (Number.isNaN(ms)) continue;
+    if (best === undefined || ms > best) { best = ms; result = new Date(ms).toISOString(); }
+  }
+  return result;
+};
+const sessionOverlaps = (session: StoredSession, records: readonly UsageRecord[] | undefined, startMs: number, endMs: number): boolean => {
+  const sStart = Date.parse(session.createdAt);
+  let sEnd = Math.max(sStart, session.lastActiveAt ? Date.parse(session.lastActiveAt) : sStart);
+  if (records) {
+    for (const record of records) {
+      const at = Date.parse(record.completedAt);
+      if (at > sEnd) sEnd = at;
+    }
+  }
+  return sStart < endMs && sEnd >= startMs;
+};
 const keyOf = (state: { lastActiveAt?: string; exited: boolean; cursor: number; seen: number; refused: number; coverage: string; reason?: string; journaled?: object }) =>
   JSON.stringify([state.lastActiveAt ?? null, state.exited, state.cursor, state.seen, state.refused, state.coverage, state.reason ?? null, state.journaled ?? null]);
 
@@ -75,13 +99,15 @@ function journaledCoverage(data: unknown): LedgerState["journaled"] | undefined 
   };
 }
 
-export function ledgerCoverage(input: { provider: Provider; measuredLaunch: boolean; closed: boolean; journaled?: LedgerCoverage; valid: number; refused: number; drained?: boolean }): LedgerCoverage {
-  const { provider, measuredLaunch, closed, journaled, valid, refused, drained = true } = input;
+export function ledgerCoverage(input: { provider: Provider; measuredLaunch: boolean; closed: boolean; journaled?: LedgerCoverage; valid: number; refused: number; drained?: boolean; recordingError?: boolean }): LedgerCoverage {
+  const { provider, measuredLaunch, closed, journaled, valid, refused, drained = true, recordingError = false } = input;
   if (provider === "opencode" && measuredLaunch) {
+    if (recordingError) return { coverage: "partial", reason: "recording-error" };
     if (!drained) return { coverage: "partial", reason: "drain-incomplete" };
     return refused > 0 ? { coverage: "partial", reason: "row-dropped" } : { coverage: "complete" };
   }
   if (!COVERED.has(provider)) return { coverage: "none", reason: "unsupported" };
+  if (recordingError) return { coverage: "partial", reason: "recording-error" };
   if (journaled) {
     if (!drained) return { coverage: "partial", reason: "drain-incomplete" };
     if (journaled.coverage === "complete" && refused > 0) return { coverage: "partial", reason: "row-dropped" };
@@ -98,6 +124,10 @@ export class UsageService {
   private ticking = false;
   private imported = false;
   private tickFailed = false;
+  private lastReconciledAt?: number;
+  private backlogOffset = 0;
+  private readonly clock: () => number;
+  private readonly reconcileStaleMs: number;
   private readonly failed = new Set<string>();
   private readonly ingestionGaps = new Map<string, { provider: Provider; projectId: string; reason: "read-failed" | "ingestion-incomplete" }>();
   private readonly exitedAt = new Map<string, number>();
@@ -109,7 +139,9 @@ export class UsageService {
   private balances?: { get(id: string): Balance };
   private onWritten?: () => void;
   private resolvers: UsageResolvers = { goalOfRun: () => undefined, runTitle: () => undefined, projectName: id => id, sessionTitle: () => undefined };
-  constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly store: EvidenceStore) {
+  constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly store: EvidenceStore, options: UsageServiceOptions = {}) {
+    this.clock = options.now ?? (() => Date.now());
+    this.reconcileStaleMs = options.reconcileStaleMs ?? USAGE_RECONCILE_STALE_MS;
     this.planFile = join(config.stateDir, "usage-plans.sealed");
     store.register(usageModule);
     this.imported = this.importOnce();
@@ -134,6 +166,7 @@ export class UsageService {
   onUpdated(listener: () => void) { this.onWritten = listener; }
 
   available(): boolean { return this.storeReady() && !this.tickFailed; }
+  markReconciliationFailed(): void { this.tickFailed = true; }
   readable(): boolean {
     if (!this.available()) return false;
     try { this.store.read(db => importState(db)); return true; } catch { return false; }
@@ -156,17 +189,50 @@ export class UsageService {
     return "updated";
   }
 
+  private sessionRemoved(sessionId: string): boolean {
+    if (typeof (this.manager as { meta?: unknown }).meta === "function") {
+      try {
+        this.manager.meta(sessionId);
+        return false;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ENOENT";
+      }
+    }
+    return true;
+  }
+
   async tick(rows?: UsageSessionRow[]) {
     if (this.ticking || this.closed || !this.storeReady()) return;
     this.ticking = true;
     try {
       const stored = new Map(this.store.read(db => readSessions(db)).map(row => [row.sessionId, row]));
       for (const id of [...this.ingestionGaps.keys()]) if (stored.get(id)?.exited) this.ingestionGaps.delete(id);
-      const now = Date.now();
-      let pages = MAX_PAGES;
+      const now = this.clock();
+      const nowIso = new Date(now).toISOString();
+      const list = rows ?? await this.manager.list();
+      const listedIds = new Set(list.map(item => item.id));
+      for (const [sessionId, previous] of stored) {
+        if (previous.exited || listedIds.has(sessionId)) continue;
+        const missingGap = this.ingestionGaps.has(sessionId) || (previous.coverage === "partial" && previous.reason === "drain-incomplete");
+        if (!missingGap || !this.sessionRemoved(sessionId)) continue;
+        const reason: LedgerCoverageReason = previous.reason === "recording-error" ? "recording-error" : "drain-incomplete";
+        const closedAt = maxIso(previous.lastActiveAt, previous.createdAt, nowIso) ?? nowIso;
+        this.write(tx => {
+          if (closeMissingSession(tx, sessionId, closedAt, reason) && this.store.status().modules[OUTCOMES_MODULE] === "ready") {
+            refreshOutcomeCostsForSessions(tx, [{ sessionId, runId: previous.runId, memberId: previous.memberId, exited: true }], this.config.usage?.prices);
+          }
+        });
+        this.ingestionGaps.delete(sessionId);
+        this.exitedAt.delete(sessionId);
+      }
+      let backlogPages = MAX_PAGES - 1;
+      let nextOffset: number | undefined;
       let wroteRecords = false;
-      for (const session of rows ?? await this.manager.list()) {
+      const startOffset = list.length > 0 ? this.backlogOffset % list.length : 0;
+      for (let step = 0; step < list.length; step++) {
         if (this.closed) break;
+        const listIndex = (startOffset + step) % list.length;
+        const session = list[listIndex]!;
         const previous = stored.get(session.id);
         if (previous?.exited) {
           this.ingestionGaps.delete(session.id);
@@ -176,31 +242,34 @@ export class UsageService {
         const covered = COVERED.has(session.provider);
         const read = observed || covered;
         const active = ["starting", "running"].includes(session.status);
+        const recordingError = session.status === "recording-error" || previous?.reason === "recording-error";
+        const exitedListed = session.status === "exited";
         const stale = !previous?.lastActiveAt || now - Date.parse(previous.lastActiveAt) > 60_000;
-        const lastActiveAt = active && stale ? new Date().toISOString() : previous?.lastActiveAt;
-        const header: LedgerHeader = {
+        const baseLastActiveAt = active && stale ? nowIso : previous?.lastActiveAt;
+        const headerOf = (lastActiveAt: string | undefined): LedgerHeader => ({
           sessionId: session.id, provider: session.provider, projectId: session.projectId, createdAt: session.createdAt,
           ...(lastActiveAt ? { lastActiveAt } : {}),
           ...(session.team ? { team: session.team } : {}), ...(session.teamModelProfile ? { profileId: session.teamModelProfile.id } : {}),
           ...(session.purpose ? { purpose: session.purpose } : {}), ...(session.configId ? { configId: session.configId } : {}),
-        };
-        const exitedListed = session.status === "exited";
+        });
         if (covered && exitedListed && !this.exitedAt.has(session.id)) this.exitedAt.set(session.id, now);
         const exitedSince = this.exitedAt.get(session.id);
         const closes = (complete: boolean, journaled: LedgerState["journaled"]) => exitedListed && complete
           && (!covered || journaled !== undefined || (exitedSince !== undefined && now - exitedSince >= EXIT_GRACE_MS));
         const stateOf = (row: Row, drained = true): LedgerState => {
           const coverage = ledgerCoverage({ provider: session.provider, measuredLaunch: observed, closed: row.exited, journaled: row.journaled,
-            valid: row.seen - row.refused, refused: row.refused, drained });
+            valid: row.seen - row.refused, refused: row.refused, drained, recordingError });
           return { ...coverage, cursor: row.cursor, seen: row.seen, refused: row.refused, exited: row.exited, ...(row.journaled ? { journaled: row.journaled } : {}) };
         };
-        const keyed = (row: Row, drained = true) => keyOf({ lastActiveAt, ...stateOf(row, drained) });
+        const keyed = (row: Row, drained = true) => keyOf({ lastActiveAt: row.lastActiveAt, ...stateOf(row, drained) });
         let current: Row = read
-          ? { exited: false, lastActiveAt, cursor: previous?.cursor ?? 0, seen: previous?.seen ?? 0, refused: previous?.refused ?? 0, ...(previous?.journaled ? { journaled: previous.journaled } : {}) }
-          : { exited: false, lastActiveAt, cursor: 0, seen: 0, refused: 0 };
-        let saved = previous ? keyOf(previous) : undefined, complete = !read, readFailed = false;
+          ? { exited: false, lastActiveAt: baseLastActiveAt, cursor: previous?.cursor ?? 0, seen: previous?.seen ?? 0, refused: previous?.refused ?? 0, ...(previous?.journaled ? { journaled: previous.journaled } : {}) }
+          : { exited: false, lastActiveAt: baseLastActiveAt, cursor: 0, seen: 0, refused: 0 };
+        let saved = previous ? keyOf(previous) : undefined, complete = !read, readFailed = false, headChecked = false;
         if (read) {
-          while (!this.closed && pages > 0) {
+          while (!this.closed && (!headChecked || backlogPages > 0)) {
+            if (headChecked) backlogPages--;
+            headChecked = true;
             let page: ReturnType<Manager["events"]>;
             try {
               page = this.manager.events(session.id, current.cursor, PAGE, new Set(["usage", "usage-coverage"]));
@@ -213,22 +282,32 @@ export class UsageService {
               }
               break;
             }
-            pages--;
             const records: UsageRecord[] = [];
-            let seen = 0, refused = 0, journaled = current.journaled;
+            let seen = 0, refused = 0, journaled = current.journaled, maxEventAt: string | undefined;
             for (const event of page.events) {
+              maxEventAt = maxIso(maxEventAt, typeof event.at === "string" ? event.at : undefined);
               if (event.type === "usage") {
                 seen++;
                 const record = ledgerRecord(event.data);
-                if (record) records.push(record); else refused++;
+                if (record) {
+                  records.push(record);
+                  maxEventAt = maxIso(maxEventAt, record.completedAt);
+                } else refused++;
               } else journaled = journaledCoverage(event.data) ?? journaled;
             }
             const drained = !page.more;
-            const next: Row = { exited: closes(drained, journaled), lastActiveAt, cursor: page.cursor,
+            const sawEvents = seen > 0 || refused > 0;
+            const stepLastActiveAt = recordingError || !drained || ((exitedListed || sawEvents) && (previous !== undefined || active))
+              ? maxIso(current.lastActiveAt, nowIso, maxEventAt)
+              : sawEvents
+                ? maxIso(current.lastActiveAt, maxEventAt)
+                : current.lastActiveAt;
+            const next: Row = { exited: closes(drained, journaled), lastActiveAt: stepLastActiveAt, cursor: page.cursor,
               seen: current.seen + seen, refused: current.refused + refused, ...(journaled ? { journaled } : {}) };
             const key = keyed(next, drained);
             if (key !== saved || records.length > 0) {
               const written = this.write(tx => {
+                const header = headerOf(next.lastActiveAt);
                 if (!writeSession(tx, header, stateOf(next, drained))) return false;
                 const owners = new Set<string>([session.id]);
                 for (const record of records) {
@@ -269,21 +348,33 @@ export class UsageService {
             if (drained) { complete = true; break; }
           }
           if (complete) this.ingestionGaps.delete(session.id);
-          else this.ingestionGaps.set(session.id, { provider: session.provider, projectId: session.projectId, reason: readFailed ? "read-failed" : "ingestion-incomplete" });
+          else {
+            if (!readFailed && nextOffset === undefined && list.length > 0) nextOffset = (listIndex + 1) % list.length;
+            this.ingestionGaps.set(session.id, { provider: session.provider, projectId: session.projectId, reason: readFailed ? "read-failed" : "ingestion-incomplete" });
+          }
         } else {
           this.ingestionGaps.delete(session.id);
         }
-        const final: Row = { ...current, exited: closes(complete, current.journaled) };
+        const finalState = stateOf({ ...current, exited: closes(complete, current.journaled) }, complete);
+        const finalLastActiveAt = recordingError || !complete || (previous !== undefined && exitedListed) || (finalState.coverage === "none" && active)
+          ? maxIso(current.lastActiveAt, nowIso)
+          : current.lastActiveAt;
+        const final: Row = { ...current, lastActiveAt: finalLastActiveAt, exited: closes(complete, current.journaled) };
         if (final.exited) this.exitedAt.delete(session.id);
         if (keyed(final, complete) !== saved) {
           this.write(tx => {
+            const header = headerOf(final.lastActiveAt);
             if (writeSession(tx, header, stateOf(final, complete)) && this.store.status().modules[OUTCOMES_MODULE] === "ready") {
               refreshOutcomeCostsForSessions(tx, [{ sessionId: session.id, runId: header.team?.runId, memberId: header.team?.memberId, exited: final.exited }], this.config.usage?.prices);
             }
           });
         }
       }
-      this.tickFailed = false;
+      if (nextOffset !== undefined) this.backlogOffset = nextOffset;
+      if (!this.closed) {
+        this.lastReconciledAt = this.clock();
+        this.tickFailed = false;
+      }
       if (wroteRecords) try { this.onWritten?.(); } catch {}
     } catch (error) {
       if (!this.tickFailed) console.warn(`[Infinite] The usage ledger could not record this tick: ${error instanceof Error ? error.message : String(error)}`);
@@ -547,20 +638,17 @@ export class UsageService {
   private providerWindow(data: Snapshot, provider: Provider, period: Period, now: Date, includePrevious: boolean, projectId?: string) {
     const start = periodStart(period, now);
     const end = periodEnd(period, start);
+    const startMs = start.getTime();
+    const endMs = end.getTime();
     const observed = provider === "opencode";
     const sessions = data.sessions.filter(s => s.provider === provider && (projectId === undefined || s.projectId === projectId));
     const briefings = provider === "opencode"
       ? data.briefings.filter(row => projectId === undefined || row.projectId === projectId)
       : [];
-    const unmeasuredBriefings = briefings.filter(row => !row.record && Date.parse(row.at) >= start.getTime() && Date.parse(row.at) <= now.getTime()).length;
-    const unmeasuredSessions = sessions.filter(s => {
-      const at = Date.parse(s.lastActiveAt ?? s.createdAt);
-      return !measured(s) && at >= start.getTime() && at < end.getTime();
-    }).length + unmeasuredBriefings;
-    const partialSessions = sessions.filter(s => {
-      const at = Date.parse(s.lastActiveAt ?? s.createdAt);
-      return partial(s) && at >= start.getTime() && at < end.getTime();
-    }).length;
+    const unmeasuredBriefings = briefings.filter(row => !row.record && Date.parse(row.at) >= startMs && Date.parse(row.at) <= now.getTime()).length;
+    const unmeasuredSessions = sessions.filter(s => !measured(s) && sessionOverlaps(s, data.bySession.get(s.sessionId), startMs, endMs)).length + unmeasuredBriefings;
+    const partialSessions = sessions.filter(s => partial(s) && sessionOverlaps(s, data.bySession.get(s.sessionId), startMs, endMs)).length;
+    const recordingErrorSessions = sessions.filter(s => s.coverage === "partial" && s.reason === "recording-error" && sessionOverlaps(s, data.bySession.get(s.sessionId), startMs, endMs)).length;
     const within = (from: Date, to: Date) => {
       const rows = this.priced(sessions.filter(measured).flatMap(s => data.bySession.get(s.sessionId) ?? [])
         .filter(record => { const at = Date.parse(record.completedAt); return at >= from.getTime() && at < to.getTime(); }));
@@ -568,8 +656,8 @@ export class UsageService {
       return rows;
     };
     const current = sumUsage(within(start, new Date(now.getTime() + 1)));
-    const previous = includePrevious && observed ? sumUsage(within(periodStart(period, new Date(start.getTime() - 1)), start)) : undefined;
-    return { start, end, observed, unmeasuredSessions, partialSessions, current, previous };
+    const previous = includePrevious && observed ? sumUsage(within(periodStart(period, new Date(startMs - 1)), start)) : undefined;
+    return { start, end, observed, unmeasuredSessions, partialSessions, recordingErrorSessions, current, previous };
   }
 
   providerSpend(provider: Provider, period: Period, now = new Date(), projectId?: string): ProviderSpendSnapshot {
@@ -598,12 +686,17 @@ export class UsageService {
       };
     }
     const unpriced = metrics.current.pricing.unknown;
+    const reconciliation = this.lastReconciledAt === undefined ? "reconciliation-pending" as const
+      : this.clock() - this.lastReconciledAt > this.reconcileStaleMs ? "reconciliation-stale" as const
+      : undefined;
     const ingestion = this.ingestionGap(provider, projectId);
     const undrainedStored = data.sessions.some(session => session.provider === provider
       && (projectId === undefined || session.projectId === projectId)
       && !session.exited && session.coverage === "partial" && session.reason === "drain-incomplete");
-    const gap = ingestion !== undefined ? ingestion
+    const gap = reconciliation !== undefined ? reconciliation
+      : ingestion !== undefined ? ingestion
       : undrainedStored ? "ingestion-incomplete" as const
+      : metrics.recordingErrorSessions > 0 ? "recording-error" as const
       : metrics.unmeasuredSessions > 0 ? "unmeasured-sessions" as const
       : metrics.partialSessions > 0 ? "partial-sessions" as const
       : unpriced > 0 ? "unpriced-records" as const

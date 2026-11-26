@@ -1027,7 +1027,7 @@ The Git commands that validation runs inside the grader's root are grader comman
 
 A baseline job runs replay trials. A trial gives one implementer one task of the project's `valid` set, under one configuration, in a workspace that holds only the task's base. The grader then grades the result against the hidden tests. A trial spends model tokens on one member launch, which runs as the eval account. Read [the eval member account install](../deploy/ubuntu/eval.md) and [the eval member account](security.md#eval-member-account) before you turn trials on.
 
-Trials are off in every project until the owner configures a provider budget (`providerBudgets` in the project's `eval` block, or host `usage.budgets` for the job's providers) or sets the optional `trialsPerDay` safety cap. A project without a budget covering the requested providers and without `trialsPerDay` runs no trial, and its job is refused `409` `eval-config-incomplete`.
+Trials are off in every project until the owner configures a provider budget (`providerBudgets` in the project's `eval` block, or host `usage.budgets` for the job's providers) or sets the optional `trialsPerDay` safety cap. A project without a budget covering the requested providers and without `trialsPerDay` runs no trial, and its job is refused `409` `eval-config-incomplete`. Before removing eval firewall isolation, cancel active eval jobs and judge calibrations, remove `trialsPerDay` and `providerBudgets` from every project and any eval-enabling provider entries from host `usage.budgets` (or remove `eval.member`), and confirm no active or schedulable eval launches remain.
 
 #### Turn it on
 

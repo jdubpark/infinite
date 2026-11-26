@@ -282,7 +282,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     source: projectSource,
     graphs: repositoryGraphs,
     events: outbox,
-    capture: evalHost.capture,
+    capture: evalHost.capture, replayLaunchGate: input => evalHost.replayLaunchWait(input),
     entries: blackboard, ...(options.processCensus ? { processes: options.processCensus } : {}),
     delivery: deliveryPort(evidence),
     onMerged: id => {

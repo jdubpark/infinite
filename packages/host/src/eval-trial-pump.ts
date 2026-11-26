@@ -6,7 +6,7 @@ import { type EvalIdentity, type EvalProbe, evalCanaries, repositoryUrl, stopEva
 import { EVAL_MODULE, TRIAL_ENDINGS, type EvalJobWait, type CapturedPayload, type MinedPayload, type TrialEnding, type TrialConfiguration, type TrialGrade } from "./eval-types.js";
 import type { EvalIdentityState } from "./eval-types.js";
 import { type NextTrial, type TrialGates, type TrialJobs } from "./eval-trial-jobs.js";
-import { trialSettings, type TrialSettings } from "./eval-config.js";
+import { hasTrialBudgetFor, isEvalProvider, trialSettings, type TrialSettings } from "./eval-config.js";
 import { readTrialPatch } from "./eval-calibration.js";
 import { gradeOf, TRIAL_HARNESS_VERSION } from "./eval-trial-rules.js";
 import {
@@ -318,6 +318,21 @@ export class TrialPump {
       live.endedSeenAt ??= Date.now();
       if (Date.now() - live.endedSeenAt < EVAL_STOPPING_MS) return;
     }
+    if (state.launchWait !== undefined && state.memberStartedAt === undefined) {
+      const stopped = await this.stop(live);
+      if (stopped === "failed" && (live.stopFailures = (live.stopFailures ?? 0) + 1) < STOP_TRIES) return;
+      if (stopped === "alive") this.options.jobs.block(live.jobId, "eval-processes-alive");
+      if (stopped !== "stopped") {
+        this.started = false;
+        this.dirty = true;
+      }
+      await this.cleanAfterJudgement();
+      await this.options.teams().forgetReplay(live.trialId).catch(() => false);
+      this.cooldown = 1;
+      this.options.jobs.releaseRunning(live.jobId, live.trialId, state.launchWait as EvalJobWait | "configuration-changed");
+      this.live = undefined;
+      return;
+    }
     const stopped = await this.stop(live);
     if (stopped === "failed" && (live.stopFailures = (live.stopFailures ?? 0) + 1) < STOP_TRIES) return;
     if (stopped !== "stopped") {
@@ -444,9 +459,15 @@ export class TrialPump {
     }
     const launchWait = this.halted(next.projectId)
       ? "halt"
-      : this.options.jobs.launchWait(next.projectId, next.configuration.profile.provider, next.settings, this.limitedProviders(), trialId);
+      : this.options.jobs.launchWait(next.projectId, next.configuration.profile.provider, this.limitedProviders(), trialId, next.pairedProviders);
     if (launchWait !== undefined) {
       await this.cleanAfterJudgement();
+      if (launchWait === "configuration-changed") {
+        this.cooldown = 1;
+        this.options.store.write(tx => dropTrial(tx, trialId));
+        this.options.jobs.block(next.jobId, "configuration-changed");
+        return;
+      }
       return this.release(next, trialId, launchWait);
     }
     this.options.store.write(tx => startTrial(tx, trialId, this.now()));
@@ -456,7 +477,7 @@ export class TrialPump {
     try {
       await this.options.teams().createForReplay({ trialId, jobId: next.jobId, purpose: "replay", projectId: next.projectId,
         profile: next.configuration.profile as TeamModelProfile, capsule: source.capsule, features: source.features,
-        baseCommit: source.baseCommit, workspace: source.workspace });
+        baseCommit: source.baseCommit, workspace: source.workspace, ...(next.pairedProviders ? { pairedProviders: next.pairedProviders } : {}) });
     } catch {
       try {
         await this.options.teams().endReplay(trialId, "void-host");
@@ -514,6 +535,10 @@ export class TrialPump {
       if (!("settings" in found)) {
         this.cooldown = 1;
         return judgements.finish(id, { ending: "void-host", sessionId: null });
+      }
+      if (!isEvalProvider(start.profile.provider) || !hasTrialBudgetFor(start.profile.provider, found.settings, this.options.config.usage?.budgets)) {
+        this.cooldown = 1;
+        return judgements.release(id, "budget-unmeasurable");
       }
       const ctx = this.contextOf({ projectId: start.projectId, jobId: graderJob }, found.settings, id, identity, grader);
       if (ctx === undefined) {
@@ -591,6 +616,20 @@ export class TrialPump {
     if (!state.sessionExited) {
       live.endedSeenAt ??= Date.now();
       if (Date.now() - live.endedSeenAt < EVAL_STOPPING_MS) return;
+    }
+    if (state.launchWait !== undefined && state.memberStartedAt === undefined) {
+      const stopped = await this.stop(live);
+      if (stopped === "failed" && (live.stopFailures = (live.stopFailures ?? 0) + 1) < STOP_TRIES) return;
+      if (stopped !== "stopped") {
+        this.started = false;
+        this.dirty = true;
+      }
+      await this.cleanAfterJudgement();
+      await this.options.teams().forgetReplay(live.judgementId).catch(() => false);
+      this.cooldown = 1;
+      this.options.judgements?.releaseLive(live.judgementId, state.launchWait === "configuration-changed" ? "budget-unmeasurable" : state.launchWait as Parameters<JudgeCalibrations["releaseLive"]>[1]);
+      this.live = undefined;
+      return;
     }
     const stopped = await this.stop(live);
     if (stopped === "failed" && (live.stopFailures = (live.stopFailures ?? 0) + 1) < STOP_TRIES) return;

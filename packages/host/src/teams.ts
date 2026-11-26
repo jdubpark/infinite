@@ -67,7 +67,7 @@ import { TeamRecovery, automaticOperationRecoveryCodes, deliveryBranchMatches, d
 import { planRunObjective, runObjectiveNote, runObjectiveView, steerRunObjective, type ObjectiveUnavailable } from "./objective-runs.js";
 import { TeamIntent, type GoalRecordPort, type IntentCheckState } from "./team-intent.js";
 import { TeamRegister, objectivePromptOf, registerPin, type RegisterState } from "./team-register.js";
-import { TeamReplay, type JudgeCreate, type ReplayCreate, type ReplayState } from "./team-replay.js";
+import { TeamReplay, type JudgeCreate, type ReplayCreate, type ReplayLaunchGate, type ReplayState } from "./team-replay.js";
 import { autonomyStartEvent, intentCheckPin, startMode, verdictPin } from "./evaluator-profiles.js";
 import { applyTeamBriefTitle, assertPlannerCapacity, capacityCeiling, plannedTasks, plannerCorrectionFeedback } from "./team-planning.js";
 import { validateGoalTaskCriterionRefs } from "./team-goal-criteria.js";
@@ -102,7 +102,7 @@ export type TeamServiceOptions = {
   events?: EventOutbox;
   entries?: Blackboard;
   capture?: CaptureSink;
-  delivery?: (runId: string, head: string, since: string) => DeliveryFact | undefined;
+  delivery?: (runId: string, head: string, since: string) => DeliveryFact | undefined; replayLaunchGate?: ReplayLaunchGate;
 };
 export type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string>;
   evidenceHeldAt?: string };
@@ -1638,7 +1638,7 @@ export class TeamService {
             if (rows) {
               await this.usage?.tick(rows).catch(() => {});
               await this.limits.reconcile(this.manager, rows.filter(row => !isEvalSession(row)), this.currentDate()).catch(() => {});
-            }
+            } else this.usage?.markReconciliationFailed();
           }
           await mapConcurrent([...this.records.keys()], 16, id => this.enqueue(id, async () => {
             const stored = this.records.get(id);
@@ -2639,7 +2639,7 @@ export class TeamService {
     let pendingSwitch: Extract<ReturnType<typeof evaluateLaunchAdmission>, { proceed: true }>["pendingSwitch"];
     if (!this.hasLaunch(member)) {
       const now = this.currentDate(), activeLimits = this.limits.active(now), hostLoadReason = this.manager.hostLoad.held();
-      if (run.replay) { const limit = activeLimits.find(item => item.provider === (member.provider ?? run.provider)); if (limit) { this.replays.end(stored, "void-limit", limit.resetsAt ?? limit.expiresAt); return; } }
+      if (run.replay && this.replays.launchBlocked(stored, member, activeLimits, this.options?.replayLaunchGate)) return;
       const workerCapacityFull = (member.role === "scout" || member.role === "implementer") && run.members.filter(other => other !== member && holdsWorkerSlot(other, run.revision) && (isDeferredWorkerMember(member) || other.status !== "queued")).length >= run.parallelism;
       const sessionSlotFull = !hostLoadReason && (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= this.config.maxSessions;
       const gate = evaluateLaunchAdmission(run, member, activeLimits, this.limits.limited(now), SESSION_SLOT_REASON, text => this.event(stored, text), { planMemberId: stored.intentCheck?.planMemberId, workerCapacityFull, hostLoadReason, sessionSlotFull });
@@ -2680,7 +2680,7 @@ export class TeamService {
     }
     if (this.fuse && !this.hasLaunch(member) && this.fuseWait(stored, this.fuse.admit(workLaunch({ launchId: member.sessionId, projectId: stored.run.projectId,
       provider: member.provider ?? stored.run.provider, team: assignment(member), profile: member.modelProfile })))) { if (undoSwitch()) this.save(stored); return; }
-    let result;
+    if (run.replay && !this.hasLaunch(member) && this.replays.launchBlocked(stored, member, this.limits.active(this.currentDate()), this.options?.replayLaunchGate)) { this.fuse?.release(member.sessionId); if (undoSwitch()) this.save(stored); return; } let result;
     const request = { requestId: member.sessionId, provider: member.provider ?? stored.run.provider,
       projectId: stored.run.projectId, title: member.title, prompt: member.prompt,
       ...(member.role === "permission-coordinator" ? { continuation: member.continuation } : {}) };

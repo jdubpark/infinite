@@ -339,8 +339,13 @@ test("UsageService fails closed on per-session journal read errors and recovers 
 
     r.reopen();
     const afterReopen = r.usage.providerSpend("opencode", "day", new Date(r.now()), PROJECT_A);
-    assert.equal(afterReopen.measured, false, "undrained session persists as fail-closed across restart before next tick");
-    assert.equal(!afterReopen.measured && afterReopen.reason, "ingestion-incomplete");
+    assert.equal(afterReopen.measured, false, "fresh UsageService after restart must fail closed before reconciliation");
+    assert.equal(!afterReopen.measured && afterReopen.reason, "reconciliation-pending");
+
+    await r.usage.tick();
+    const stillFailing = r.usage.providerSpend("opencode", "day", new Date(r.now()), PROJECT_A);
+    assert.equal(stillFailing.measured, false);
+    assert.equal(!stillFailing.measured && stillFailing.reason, "read-failed");
 
     r.failingSessions.delete("oc-read-fail");
     await r.usage.tick();
@@ -368,7 +373,10 @@ test("UsageService fails closed when page cap leaves a session undrained mid-ses
 
     const records = Array.from({ length: 22 }, (_, i) => openCodeRecord(r.now(), `p-${i}`, 1_000_000));
     r.addSessionEvents(PROJECT_A, "oc-big-journal", records);
-    r.addSessionEvents(PROJECT_B, "oc-unvisited", [openCodeRecord(r.now(), "pb-0", 6_000_000)]);
+    r.addSessionEvents(PROJECT_B, "oc-second-backlog", [
+      openCodeRecord(r.now(), "pb-0", 3_000_000),
+      openCodeRecord(r.now(), "pb-1", 3_000_000),
+    ]);
 
     await r.usage.tick();
 
@@ -378,9 +386,9 @@ test("UsageService fails closed when page cap leaves a session undrained mid-ses
     assert.equal(snapA.usd, 20);
 
     const snapB = r.usage.providerSpend("opencode", "day", new Date(r.now()), PROJECT_B);
-    assert.equal(snapB.measured, false, "unvisited session after page cap exhausted must fail closed");
+    assert.equal(snapB.measured, false, "backlogged session after page cap exhausted must fail closed");
     assert.equal(!snapB.measured && snapB.reason, "ingestion-incomplete");
-    assert.equal(snapB.usd, 0);
+    assert.equal(snapB.usd, 3);
 
     const refusedA = r.host.create(PROJECT_A, baselineReq([OPENCODE]), randomUUID()) as EvalRefusal;
     assert.equal(refusedA.code, "provider-budget-unmeasurable");
@@ -811,6 +819,7 @@ test("completed compare and baseline jobs finish immediately before spend gates 
     seedTask(r.store, PROJECT_A, "captured:done:a01", r.now());
     seedTask(r.store, PROJECT_A, "captured:done:a02", r.now());
     seedTask(r.store, PROJECT_B, "captured:done:b01", r.now());
+    await r.usage.tick();
 
     const cmp = r.trialJobs.create(PROJECT_A, compareReq([OPENCODE, CODEX], { limits: { maxTrials: 20, maxWallMinutes: 10_000 } }), randomUUID());
     assert.ok("job" in cmp, `expected compare job, got ${JSON.stringify(cmp)}`);

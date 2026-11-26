@@ -7,7 +7,7 @@ import { usageRecordKey } from "./transcript-usage.js";
 import type { UsageRecord, UsageTokens } from "./usage.js";
 
 export { SESSION_PURPOSES };
-export type LedgerCoverageReason = UsageCoverageReason | "running";
+export type LedgerCoverageReason = UsageCoverageReason | "running" | "recording-error";
 export interface LedgerCoverage { coverage: UsageCoverage; reason?: LedgerCoverageReason }
 
 export function combineCoverage(parts: readonly { coverage: UsageCoverage; coverageReason?: LedgerCoverageReason }[]): LedgerCoverage {
@@ -229,6 +229,15 @@ export function writeSession(tx: EvidenceTx, header: LedgerHeader, state: Ledger
   ];
   tx.run(upsert("usage_sessions", SESSION_COLUMNS, "session_id"), ...values);
   return true;
+}
+
+export function closeMissingSession(tx: EvidenceTx, sessionId: string, lastActiveAt: string, reason: LedgerCoverageReason): boolean {
+  const at = isoTime(lastActiveAt);
+  if (!at || !REASON.test(reason)) return false;
+  return tx.run(
+    "UPDATE usage_sessions SET last_active_at=?, coverage='partial', coverage_reason=?, exited=1 WHERE session_id=? AND exited=0",
+    at, reason, sessionId,
+  ).changes === 1;
 }
 
 type Stored = { session_id?: string; input: number; output: number; reasoning: number; cache_read: number; cache_write: number; cache_write_1h: number };

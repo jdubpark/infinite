@@ -4,7 +4,10 @@ import { PRICE_CATALOG, type CatalogPrice } from "./price-catalog.js";
 export type UsagePeriod = "day" | "week" | "month";
 export type ProviderSpendUnmeasurableReason =
   | "ledger-unavailable"
+  | "reconciliation-pending"
+  | "reconciliation-stale"
   | "provider-unmeasured"
+  | "recording-error"
   | "unmeasured-sessions"
   | "partial-sessions"
   | "unpriced-records"

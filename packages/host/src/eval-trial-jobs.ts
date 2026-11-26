@@ -16,7 +16,7 @@ import { applyComparison, comparisonJobSchema, pinsChanged, planComparison } fro
 import { TRIAL_TASKS_SQL, type TrialTaskRow } from "./eval-sets.js";
 import { configRef, nextSlot, TRIAL_RELEASES, VOID_STREAK_PAUSE } from "./eval-trial-rules.js";
 import {
-  advanceTask, dropTrial, jobSlots, jobTrialCount, openTrialCounts, trialCounts, trialsSince, TRIAL_KEEP_DAYS_DEFAULT, type TrialCounts,
+  advanceTask, dropTrial, jobSlots, jobTrialCount, openTrialCounts, releaseRunningTrial, trialCounts, trialsSince, TRIAL_KEEP_DAYS_DEFAULT, type TrialCounts,
 } from "./eval-trial-store.js";
 import {
   evalConfigurationSchema, evalTaskIdSchema, evalWindowSchema, VOID_ENDINGS,
@@ -41,7 +41,7 @@ export type TrialGates = {
 };
 export type NextTrial =
   | { kind: "trial"; jobId: string; projectId: string; taskId: string; configuration: TrialConfiguration; configRef: string;
-      slot: number; attempt: number; settings: TrialSettings }
+      slot: number; attempt: number; settings: TrialSettings; pairedProviders?: Provider[] }
   | { kind: "wait"; jobId: string; waiting: EvalJobWait } | { kind: "none" };
 
 type JobRequest = BaselineJobRequest | ComparisonJobRequest;
@@ -268,11 +268,24 @@ export class TrialJobs {
     });
   }
 
-  block(jobId: string, reason: "eval-processes-alive"): void {
+  block(jobId: string, reason: "eval-processes-alive" | "configuration-changed"): void {
     this.store.write(tx => {
       const row = this.rowOf(tx, jobId);
       if (row === undefined || (row.status !== "scheduled" && row.status !== "running")) return;
       setJob(tx, jobId, this.now(), { status: "blocked", reason, waiting: null });
+    });
+  }
+
+  releaseRunning(jobId: string, trialId: string, waiting: EvalJobWait | "configuration-changed"): void {
+    this.store.write(tx => {
+      releaseRunningTrial(tx, trialId);
+      const row = this.rowOf(tx, jobId);
+      if (row === undefined || (row.status !== "scheduled" && row.status !== "running")) return;
+      if (waiting === "configuration-changed") {
+        setJob(tx, jobId, this.now(), { status: "blocked", reason: "configuration-changed", waiting: null });
+        return;
+      }
+      if (row.waiting !== waiting) setJob(tx, jobId, this.now(), { waiting });
     });
   }
 
@@ -293,16 +306,38 @@ export class TrialJobs {
     return this.store.write(tx => this.expireIdleIn(tx));
   }
 
-  launchWait(projectId: string, provider: Provider, settings: TrialSettings, limited?: ReadonlySet<Provider>, excludeTrialId?: string): EvalJobWait | undefined {
+  launchWait(
+    projectId: string,
+    provider: Provider,
+    limited?: ReadonlySet<Provider>,
+    excludeTrialId?: string,
+    pairedProviders?: readonly Provider[],
+  ): EvalJobWait | "configuration-changed" | undefined {
     const nowMs = Date.parse(this.now());
+    const project = this.projectOf(projectId);
+    if (project === undefined) return "configuration-changed";
+    const found = trialSettings(project, this.config.usage?.budgets);
+    if ("missing" in found) return "configuration-changed";
+    const activeSettings = found.settings;
+    const checked = pairedProviders && pairedProviders.length > 0
+      ? [...new Set([provider, ...pairedProviders])]
+      : [provider];
+    for (const candidate of checked) {
+      if (!isEvalProvider(candidate) || !hasTrialBudgetFor(candidate, activeSettings, this.config.usage?.budgets)) {
+        return "configuration-changed";
+      }
+    }
     const fuse = evaluateFuse(this.budget?.fuseCheck, projectId);
     if (fuse.state === "halted") return "halt";
     if (fuse.state === "open") return "spend-fuse";
-    const project = this.projectOf(projectId);
-    const found = project === undefined ? undefined : trialSettings(project, this.config.usage?.budgets);
-    const activeSettings = found !== undefined && "settings" in found ? found.settings : settings;
-    const block = this.providerBlock(projectId, provider, activeSettings, limited, new Date(nowMs));
-    if (block !== undefined) return block;
+    const blocks = new Map<Provider, "provider-limit" | "provider-budget" | "budget-unmeasurable">();
+    for (const candidate of checked) {
+      const block = this.providerBlock(projectId, candidate, activeSettings, limited, new Date(nowMs));
+      if (block !== undefined) blocks.set(candidate, block);
+    }
+    for (const reason of ["provider-limit", "provider-budget", "budget-unmeasurable"] as const) {
+      if (checked.some(candidate => blocks.get(candidate) === reason)) return reason;
+    }
     if (activeSettings.trialsPerDay !== null) {
       try {
         if (this.store.read(db => trialsSince(db, projectId, utcDayStart(nowMs), excludeTrialId)) >= activeSettings.trialsPerDay) return "daily-cap";
@@ -513,9 +548,11 @@ export class TrialJobs {
     const started: Record<string, SQLInputValue> = row.status === "scheduled" ? { status: "running", started_at: at } : {};
     if (row.waiting !== null) started.waiting = null;
     if (Object.keys(started).length > 0) setJob(tx, row.job_id, at, started);
+    const pairedProviders = row.kind === "baseline" ? undefined : [...new Set(configurations.map(item => item.profile.provider))];
     return {
       kind: "trial", jobId: row.job_id, projectId, taskId, configuration,
       configRef: pick.configRef, slot: pick.slot, attempt: pick.attempt, settings,
+      ...(pairedProviders === undefined ? {} : { pairedProviders }),
     };
   }
 

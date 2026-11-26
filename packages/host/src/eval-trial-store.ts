@@ -129,6 +129,14 @@ export function dropTrial(tx: EvidenceTx, trialId: string): boolean {
   return tx.run("DELETE FROM eval_trials WHERE trial_id=? AND state='preparing'", trialId).changes === 1;
 }
 
+export function releaseRunningTrial(tx: EvidenceTx, trialId: string): boolean {
+  const row = tx.get<{ job_id: string }>("SELECT job_id FROM eval_trials WHERE trial_id=? AND state='running' AND session_id IS NULL", trialId);
+  if (row === undefined) return false;
+  const changes = tx.run("DELETE FROM eval_trials WHERE trial_id=? AND state='running' AND session_id IS NULL", trialId).changes;
+  if (changes === 1) tx.run("UPDATE eval_trial_counts SET started = max(0, started - 1) WHERE job_id=?", row.job_id);
+  return changes === 1;
+}
+
 export function startTrial(tx: EvidenceTx, trialId: string, at: string): boolean {
   const changes = tx.run("UPDATE eval_trials SET state='running', started_at=? WHERE trial_id=? AND state='preparing'", at, trialId).changes;
   if (changes === 0) return false;

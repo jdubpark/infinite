@@ -44,6 +44,7 @@ import type { CostLookup } from "./outcome-cells.js";
 import { spawnTeamBundle } from "./team-workspace.js";
 import { inventoryRuntimeProcesses, type RuntimeProcess } from "./team-retirement.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "./project-source.js";
+import type { ReplayLaunchInput, ReplayLaunchWait } from "./team-replay.js";
 import type { TeamRun } from "./team-types.js";
 import type { Config } from "./types.js";
 
@@ -246,6 +247,12 @@ export class EvalHost implements EvalHostApi {
     const project = this.config.projects.find(item => item.id === projectId);
     if (project === undefined) return refusal(404, "unknown-project");
     return this.guard(() => ({ projectId, priors: this.store.read(db => readPriors(db, project)) }));
+  }
+
+  replayLaunchWait(input: ReplayLaunchInput): ReplayLaunchWait | undefined {
+    if (this.halted(input.projectId)) return "halt";
+    if (input.purpose === "duel") return this.judgements.launchWait(input.projectId, input.profile, input.limited);
+    return this.trialJobs.launchWait(input.projectId, input.provider, input.limited, input.trialId, input.pairedProviders);
   }
 
   private validate(): void {

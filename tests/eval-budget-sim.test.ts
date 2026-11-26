@@ -5,7 +5,7 @@ import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configurationModule } from "../packages/host/src/configuration-store.js";
-import { evalBudgetSource, evaluateConstraint, evaluateProviderBudget, type EvalBudgetSource } from "../packages/host/src/eval-budget.js";
+import { evalBudgetSource, evaluateProviderBudget, type EvalBudgetSource } from "../packages/host/src/eval-budget.js";
 import type { Grader, GraderProbe } from "../packages/host/src/eval-grader.js";
 import type { EvalIdentity, EvalProbe } from "../packages/host/src/eval-identity.js";
 import { EvalJobs } from "../packages/host/src/eval-jobs.js";
@@ -239,7 +239,7 @@ class BudgetSimHarness {
       },
     } as unknown as Manager;
 
-    this.usage = new UsageService(this.config, this.key, manager, this.store);
+    this.usage = new UsageService(this.config, this.key, manager, this.store, { now: () => this.clock });
     this.fuse = new FuseService({ config: this.config, key: this.key, store: this.store, sessionExists: () => false, now: () => this.clock });
     this.halt = new HaltService({ config: this.config, key: this.key });
 
@@ -395,7 +395,15 @@ class BudgetSimHarness {
     }
   }
 
+  reconciled = false;
+
+  async tickUsage(): Promise<void> {
+    await this.usage.tick();
+    this.reconciled = true;
+  }
+
   restart(): void {
+    this.reconciled = false;
     this.fuse.stop();
     this.halt.stop();
     this.usage.close();
@@ -468,7 +476,7 @@ class BudgetSimHarness {
     });
     if (live.provider === "opencode" && costUsd > 0) {
       this.recordSpend(live.projectId, costUsd);
-      await this.usage.tick();
+      await this.tickUsage();
     }
     (this.pump as unknown as { live: unknown }).live = undefined;
   }
@@ -536,18 +544,12 @@ function checkInvariants(
   }
 
   const stateB = h.trueDaySpend(PROJECT_B);
-  if (stateB.usd < BUDGET_B && !stateB.hasUnpriced && !h.hasUnreadOrFailedSession(PROJECT_B) && !h.fuseOpen) {
-    const verdictB = evaluateConstraint(
-      "opencode",
-      PROJECT_B,
-      { source: "project", usd: BUDGET_B, period: "day" },
-      (provider, period, now, pid) => h.mutant === "drop-project-scope"
-        ? h.usage.providerSpend(provider, period, now, undefined)
-        : h.usage.providerSpend(provider, period, now, pid),
-      new Date(h.clock),
-    );
-    if (verdictB.state !== "admitted") {
-      throw new SimViolation("I3", seed, step, `project B budget returned ${verdictB.state} (${verdictB.reason ?? ""}) despite clean project B spend $${stateB.usd}`);
+  const priorSpendB = h.modelRecords.filter(item => item.projectId === PROJECT_B).reduce((sum, item) => sum + item.usd, 0);
+  if (h.reconciled && stateB.usd < BUDGET_B && !stateB.hasUnpriced && !h.hasUnreadOrFailedSession(PROJECT_B) && !h.fuseOpen) {
+    const waitB = h.trialJobs.launchWait(PROJECT_B, "opencode");
+    if (waitB !== undefined) {
+      const invariant = priorSpendB < BUDGET_B ? "I3" : "I6";
+      throw new SimViolation(invariant, seed, step, `SUT blocked project B (${waitB}) despite independent oracle showing clean project B day spend $${stateB.usd}`);
     }
   }
 
@@ -591,7 +593,7 @@ async function runSeed(seed: number, counts: Record<string, number>, mutant?: Mu
     if (useReadFail) {
       const failId = h.recordSpend(PROJECT_A, 6.0);
       h.failingSessions.add(failId);
-      await h.usage.tick();
+      await h.tickUsage();
       counts.readFail = (counts.readFail ?? 0) + 1;
       checkInvariants(h, seed, ++step, expectedJobs, checkedLaunches);
 
@@ -606,12 +608,12 @@ async function runSeed(seed: number, counts: Record<string, number>, mutant?: Mu
       }
 
       h.failingSessions.delete(failId);
-      await h.usage.tick();
+      await h.tickUsage();
       checkInvariants(h, seed, ++step, expectedJobs, checkedLaunches);
     } else {
       h.pageSize = 1;
       h.recordSpend(PROJECT_A, 6.0, { count: 22 });
-      await h.usage.tick();
+      await h.tickUsage();
       counts.pageCap = (counts.pageCap ?? 0) + 1;
       checkInvariants(h, seed, ++step, expectedJobs, checkedLaunches);
 
@@ -626,12 +628,12 @@ async function runSeed(seed: number, counts: Record<string, number>, mutant?: Mu
       }
 
       h.pageSize = 200;
-      await h.usage.tick();
+      await h.tickUsage();
       checkInvariants(h, seed, ++step, expectedJobs, checkedLaunches);
     }
 
     h.recordSpend(PROJECT_A, 1.0, { unpriced: true });
-    await h.usage.tick();
+    await h.tickUsage();
     checkInvariants(h, seed, ++step, expectedJobs, checkedLaunches);
 
     const createdB = h.trialJobs.create(PROJECT_B, {
@@ -654,7 +656,7 @@ async function runSeed(seed: number, counts: Record<string, number>, mutant?: Mu
         h.fuseOpen = true;
       } else {
         h.recordSpend(projectId, BUDGET_B);
-        await h.usage.tick();
+        await h.tickUsage();
       }
     };
     await h.pump.step();
@@ -669,7 +671,7 @@ async function runSeed(seed: number, counts: Record<string, number>, mutant?: Mu
     h.fuseOpen = false;
     h.clock += DAY_MS;
     counts.rollovers = (counts.rollovers ?? 0) + 1;
-    await h.usage.tick();
+    await h.tickUsage();
     checkInvariants(h, seed, ++step, expectedJobs, checkedLaunches);
 
     const compareMode = seed % 2 === 1;
@@ -700,7 +702,7 @@ async function runSeed(seed: number, counts: Record<string, number>, mutant?: Mu
         await h.settleLiveTrial(cost);
         if (isLastSlot && live.configuration.profile.provider !== "opencode") {
           h.recordSpend(live.projectId, BUDGET_A + 1);
-          await h.usage.tick();
+          await h.tickUsage();
         }
         checkInvariants(h, seed, ++step, expectedJobs, checkedLaunches);
 
@@ -719,6 +721,7 @@ async function runSeed(seed: number, counts: Record<string, number>, mutant?: Mu
           }
           exhaustedFinalCheck = true;
           counts.finalSlotDone = (counts.finalSlotDone ?? 0) + 1;
+          await h.tickUsage();
         }
       } else {
         const pumpState = h.pump as unknown as { cooldown: number };
@@ -727,7 +730,7 @@ async function runSeed(seed: number, counts: Record<string, number>, mutant?: Mu
         } else {
           h.clock += DAY_MS;
           counts.rollovers = (counts.rollovers ?? 0) + 1;
-          await h.usage.tick();
+          await h.tickUsage();
         }
       }
       checkInvariants(h, seed, ++step, expectedJobs, checkedLaunches);

@@ -4,7 +4,7 @@ import { judgePromptVersion, profileIdentityKey } from "./config-identity.js";
 import { epochAt } from "./configuration-store.js";
 import { evaluateFuse, evaluateProviderBudget, type EvalBudgetSource } from "./eval-budget.js";
 import { calibrationPairs } from "./eval-calibration.js";
-import { isEvalProvider, providerBudgetConstraints } from "./eval-config.js";
+import { EVAL_PROVIDERS, isEvalProvider, providerBudgetConstraints } from "./eval-config.js";
 import { JOB_EXPIRY_DAYS_MAX } from "./eval-jobs.js";
 import { trialProfileKey } from "./eval-trial-rules.js";
 import { TRIAL_SLOTS_FREE_MIN, type TrialGates } from "./eval-trial-jobs.js";
@@ -18,7 +18,7 @@ import {
 import { labelDraw } from "./judge-package.js";
 import {
   activeCalibration, calibrationJudgements, calibrationViews, dropJudgement, finishCalibration, finishJudgement, insertCalibration,
-  insertJudgement, liveJudgements, readCalibration, releaseJudgement, startJudgement, sweepJudge, type CalibrationEnd, type CalibrationPairRef, type CalibrationRow,
+  insertJudgement, liveJudgements, readCalibration, releaseJudgement, releaseUnstartedJudgement, startJudgement, sweepJudge, type CalibrationEnd, type CalibrationPairRef, type CalibrationRow,
   type CalibrationView, type CalibrationWait, type JudgementRow,
 } from "./judge-store.js";
 import { JUDGE_VOID_ENDINGS, type Judgement, type JudgeEnding } from "./judge-types.js";
@@ -136,7 +136,7 @@ export class JudgeCalibrations {
     if (this.config.eval?.member?.agents?.[judge.provider] === undefined) return refuse(409, "judge-launch-missing");
     const early = this.store.read(db => this.replayOrActive(db, request));
     if (early !== undefined) return "replay" in early ? this.viewOrRefusal(early.replay) : early;
-    const projects = this.poolOf(request.projects);
+    const projects = this.poolOf(request.projects, judge);
     if (projects === undefined) return refuse(409, "eval-config-incomplete");
     const pairs = this.select(judge, projects, request.pairs ?? CALIBRATION_DEFAULT_PAIRS);
     const count = pairs.list.length;
@@ -212,6 +212,16 @@ export class JudgeCalibrations {
     if (running) this.waiting = reason;
   }
 
+  releaseLive(judgementId: string, reason: CalibrationWait): void {
+    const running = this.store.write(tx => {
+      const row = tx.get<{ calibration_id: string }>("SELECT calibration_id FROM judge_judgements WHERE judgement_id = ? AND state IN ('preparing', 'live') AND session_id IS NULL", judgementId);
+      if (row === undefined) return undefined;
+      releaseUnstartedJudgement(tx, judgementId);
+      return activeCalibration(tx)?.calibrationId === row.calibration_id;
+    });
+    if (running) this.waiting = reason;
+  }
+
   launchWait(projectId: string, judge: TeamModelProfile, limited?: ReadonlySet<Provider>): CalibrationWait | undefined {
     const fuse = evaluateFuse(this.budget?.fuseCheck, projectId);
     if (fuse.state === "halted") return "halt";
@@ -276,10 +286,20 @@ export class JudgeCalibrations {
     return activeCalibration(db) === undefined ? undefined : refuse(409, "calibration-active");
   }
 
-  private poolOf(named: readonly string[] | undefined): string[] | undefined {
-    const withEval = new Set(this.config.projects.filter(project => project.team?.eval !== undefined).map(project => project.id));
-    if (named === undefined) return [...withEval].sort();
-    return named.every(id => withEval.has(id)) ? [...named].sort() : undefined;
+  private judgeCovered(project: Config["projects"][number], judge: TeamModelProfile): boolean {
+    const eval_ = project.team?.eval;
+    if (eval_ === undefined) return false;
+    if (eval_.trialsPerDay !== undefined) return true;
+    const hasUsdBudget = Object.keys(eval_.providerBudgets ?? {}).length > 0
+      || (this.config.usage?.budgets !== undefined && EVAL_PROVIDERS.some(provider => this.config.usage?.budgets?.[provider] !== undefined));
+    if (!hasUsdBudget && this.budget === undefined) return true;
+    return isEvalProvider(judge.provider) && providerBudgetConstraints(judge.provider, eval_.providerBudgets, this.config.usage?.budgets).length > 0;
+  }
+
+  private poolOf(named: readonly string[] | undefined, judge: TeamModelProfile): string[] | undefined {
+    const covered = new Set(this.config.projects.filter(project => this.judgeCovered(project, judge)).map(project => project.id));
+    if (named === undefined) return [...covered].sort();
+    return named.every(id => covered.has(id)) ? [...named].sort() : undefined;
   }
 
   private select(judge: TeamModelProfile, projects: readonly string[], want: number): { list: CalibrationPairRef[]; perProject: { projectId: string; pairs: number }[] } {
@@ -373,9 +393,11 @@ export class JudgeCalibrations {
   private spendWait(projectId: string, judge: TeamModelProfile, fuseOpen: boolean, limited: ReadonlySet<Provider> | undefined, at: string): CalibrationWait | undefined {
     if (fuseOpen) return "spend-fuse";
     if (limited?.has(judge.provider)) return "provider-limit";
+    const project = this.config.projects.find(item => item.id === projectId);
+    if (project?.team?.eval === undefined) return this.budget === undefined ? undefined : "budget-unmeasurable";
+    if (!this.judgeCovered(project, judge)) return "budget-unmeasurable";
     if (isEvalProvider(judge.provider)) {
-      const project = this.config.projects.find(item => item.id === projectId);
-      const constraints = providerBudgetConstraints(judge.provider, project?.team?.eval?.providerBudgets, this.config.usage?.budgets);
+      const constraints = providerBudgetConstraints(judge.provider, project.team.eval.providerBudgets, this.config.usage?.budgets);
       const verdict = evaluateProviderBudget(judge.provider, projectId, constraints, this.budget?.providerSpend, new Date(at));
       if (verdict.state === "exceeded") return "provider-budget";
       if (verdict.state === "unmeasurable") return "budget-unmeasurable";

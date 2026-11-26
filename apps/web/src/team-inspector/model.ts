@@ -8,6 +8,8 @@ import type {
   TeamEntryKind,
   TeamEntryPage,
   TeamRunAssessment,
+  TeamWaitReason,
+  TeamWaitReasonKind,
 } from "./types";
 
 export type ReviewerClaimRow = {
@@ -350,4 +352,48 @@ export function parseTeamEntryHash(hash: string, teamId?: string): TeamEntryHash
 export function buildTeamEntryHash(machine: string, teamId: string, entryId?: string | null): string {
   const prefix = !machine || machine === "direct" ? "" : `/machines/${encodeURIComponent(machine)}`;
   return `#${prefix}/teams/${encodeURIComponent(teamId)}${entryId ? `/entries/${encodeURIComponent(entryId)}` : ""}`;
+}
+
+export type WaitReasonMeta = {
+  label: string;
+  tone: "attention" | "warning" | "muted";
+};
+
+const WAIT_REASON_META: Record<TeamWaitReasonKind, WaitReasonMeta> = {
+  "owner-decision": { label: "Owner decision", tone: "attention" },
+  "provider-prompt": { label: "Provider prompt", tone: "attention" },
+  stalled: { label: "Stalled", tone: "attention" },
+  "spinner-only": { label: "Spinner-only screen", tone: "warning" },
+  "provider-limit": { label: "Provider limit", tone: "warning" },
+  "worker-slot": { label: "Worker slot", tone: "muted" },
+  dependency: { label: "Task dependency", tone: "muted" },
+  "integration-order": { label: "Integration order", tone: "muted" },
+  "linear-sync": { label: "Linear sync", tone: "muted" },
+};
+
+const WAIT_REASON_ORDER: Record<TeamWaitReasonKind, number> = {
+  "owner-decision": 0,
+  "provider-prompt": 1,
+  stalled: 2,
+  "spinner-only": 3,
+  "provider-limit": 4,
+  "worker-slot": 5,
+  dependency: 6,
+  "integration-order": 7,
+  "linear-sync": 8,
+};
+
+export function waitReasonMeta(kind: TeamWaitReasonKind): WaitReasonMeta {
+  return WAIT_REASON_META[kind];
+}
+
+export function orderWaitReasons(reasons: readonly TeamWaitReason[]): TeamWaitReason[] {
+  return reasons
+    .map((reason, index) => ({ reason, index }))
+    .sort((left, right) => {
+      const a = WAIT_REASON_ORDER[left.reason.kind] ?? 99;
+      const b = WAIT_REASON_ORDER[right.reason.kind] ?? 99;
+      return a - b || left.index - right.index;
+    })
+    .map(item => item.reason);
 }

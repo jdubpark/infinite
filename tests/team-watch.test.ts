@@ -232,3 +232,28 @@ test("the evaluator has a name and a place", () => {
   assert.equal(ordered.indexOf("evaluator") < ordered.indexOf("delivery"), true);
   assert.match(teamMonitorText({ ...team, workspace: "w", branch: "b", projectId: "p" }), /Evaluator/);
 });
+
+test("teamMonitorText and teamSummaryText render WAIT REASONS and member stall/spinner-only annotations", () => {
+  const waitingTeam = {
+    ...team,
+    members: [
+      { memberId: "pm", sessionId: "s-pm", role: "project-manager", revision: 2, title: "Plan", status: "running", stalledAt: "2026-11-26T00:05:00.000Z" },
+      { memberId: "impl", sessionId: "s-impl", role: "implementer", revision: 2, title: "Alarm stop", status: "running", taskId: "task-1", spinnerOnlySince: "2026-11-26T00:03:00.000Z" },
+    ],
+    waitReasons: [
+      { kind: "stalled", memberId: "pm", summary: "Plan stalled without substantive activity." },
+      { kind: "spinner-only", memberId: "impl", summary: "Alarm stop is showing spinner redraws only." },
+    ],
+  };
+  const monitor = teamMonitorText(waitingTeam);
+  assert.match(monitor, /WAIT REASONS \(2\)/);
+  assert.match(monitor, /\[stalled\] Plan stalled without substantive activity\./);
+  assert.match(monitor, /\[spinner-only\] Alarm stop is showing spinner redraws only\./);
+  assert.match(monitor, /Coordinator {2}running {2}Plan · stalled/);
+  assert.match(monitor, /Implementer {2}running {2}Alarm stop · task-1 · spinner-only/);
+
+  const summary = teamSummaryText(waitingTeam, [{ sessionId: "s-pm", status: { state: "ready", summary: { text: "Brief" } } }]);
+  assert.match(summary, /WAIT REASONS \(2\)/);
+  assert.match(summary, /\[stalled\] Plan stalled without substantive activity\./);
+  assert.match(summary, /\[spinner-only\] Alarm stop is showing spinner redraws only\./);
+});

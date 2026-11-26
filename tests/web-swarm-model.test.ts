@@ -468,3 +468,36 @@ test("unit lastActivityAt prefers authoritative host value and falls back cleanl
   assert.equal(findUnit(model, "host-recent")?.lastActivityAt, iso(6 * HOUR));
   assert.equal(findUnit(model, "legacy-run")?.lastActivityAt, iso(12 * HOUR));
 });
+
+test("buildSwarm maps spinnerOnly on agents and waitReasons on units", () => {
+  const waitReasons = [
+    { kind: "spinner-only", memberId: "m-spin-member", taskId: "t1", since: iso(120_000), summary: "Spinner-only screen." },
+    { kind: "worker-slot", taskId: "t2", summary: "Waiting for worker slot." },
+  ];
+  const model = buildSwarm(input({
+    sessions: [
+      session("s-spin-member", { attention: attention("working") }),
+      session("s-spin-att", { attention: attention("working", { spinnerOnlySince: iso(90_000) }) }),
+      session("s-clear", { attention: attention("working") }),
+    ],
+    teams: [
+      team("wait-run", {
+        waitReasons,
+        members: [
+          member("m-spin-member", { sessionId: "s-spin-member", spinnerOnlySince: iso(120_000) }),
+          member("m-spin-att", { sessionId: "s-spin-att" }),
+          member("m-clear", { sessionId: "s-clear" }),
+        ],
+      }),
+      team("quiet-run", {
+        status: "ready-for-review",
+        members: [member("m-done", { status: "reported" })],
+      }),
+    ],
+  }));
+  assert.equal(findAgent(model, "m-spin-member")?.spinnerOnly, true);
+  assert.equal(findAgent(model, "m-spin-att")?.spinnerOnly, true);
+  assert.equal(findAgent(model, "m-clear")?.spinnerOnly, false);
+  assert.deepEqual(findUnit(model, "wait-run")?.waitReasons, waitReasons);
+  assert.deepEqual(findUnit(model, "quiet-run")?.waitReasons, []);
+});

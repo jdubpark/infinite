@@ -123,6 +123,7 @@ export const fixtureTeam: TeamView = {
       taskId: "task-repair",
       cwd: "/work/repo",
       baseCommit: COMMIT_A,
+      stalledAt: "2026-11-26T01:02:00.000Z",
       stoppedReason: "check failed on commit A",
       startedAt: "2026-11-26T01:00:00.000Z",
     },
@@ -137,6 +138,7 @@ export const fixtureTeam: TeamView = {
       cwd: "/work/repo",
       baseCommit: COMMIT_B,
       startedAt: "2026-11-26T01:03:00.000Z",
+      spinnerOnlySince: "2026-11-26T01:04:00.000Z",
     },
     {
       memberId: MEMBER_IDS.reviewer,
@@ -186,6 +188,20 @@ export const fixtureTeam: TeamView = {
   ],
   steering: [{ text: "Keep commit A trace", revision: 2, at: "2026-11-26T01:02:00.000Z" }],
   events: [{ at: "2026-11-26T01:04:30.000Z", text: "Checks passed on commit B" }],
+  waitReasons: [
+    {
+      kind: "worker-slot",
+      taskId: "task-repair",
+      summary: "Waiting for an available worker slot (2/2).",
+    },
+    {
+      kind: "spinner-only",
+      memberId: MEMBER_IDS.integratorRepair,
+      taskId: "task-repair",
+      since: "2026-11-26T01:04:00.000Z",
+      summary: "Repair attempt is showing spinner or status redraws without substantive screen changes.",
+    },
+  ],
   review: {
     verdict: "approved",
     summary: "Repair on commit B passes all checks.",

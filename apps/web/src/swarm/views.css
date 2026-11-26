@@ -267,8 +267,14 @@
   text-align: right;
 }
 .sw-wall-unit {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   height: 20px;
   line-height: 20px;
+}
+.sw-wait-pill {
+  color: var(--sw-needs);
 }
 .sw-wall-grid {
   display: flex;

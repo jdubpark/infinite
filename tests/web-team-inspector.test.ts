@@ -62,6 +62,9 @@ test("TeamOverview renders criteria groups, separate provisional assessment, rev
   assert.ok(html.includes("Reviewer acceptance claims"));
   assert.ok(html.includes("Verified (claim)"));
   assert.ok(html.includes("Finished (2)"));
+  assert.ok(html.includes("Why this run is waiting"));
+  assert.ok(html.includes("Spinner-only screen"));
+  assert.ok(html.includes("Spinner-only screen since"));
   assert.ok(!html.includes("check failed on commit A"));
 });
 
@@ -105,9 +108,30 @@ describe("web team inspector repair trace", { skip: skipBrowser }, () => {
       const decisionText = await page.locator(".team-decisions").textContent();
       assert.match(decisionText ?? "", /Confirm release window\?/);
 
+      await page.waitForSelector(".ti-wait-reasons");
+      const waitText = await page.locator(".ti-wait-reasons").textContent();
+      assert.match(waitText ?? "", /Why this run is waiting/);
+      assert.match(waitText ?? "", /Spinner-only screen/);
+      assert.match(waitText ?? "", /Repair attempt is showing spinner or status redraws/);
+      assert.ok((waitText ?? "").indexOf("Spinner-only screen") < (waitText ?? "").indexOf("Worker slot"));
+
+      const activeMemberText = await page.locator(`#ti-member-${fixtureTeam.members[1]!.memberId}`).textContent();
+      assert.match(activeMemberText ?? "", /Spinner-only screen since/);
+
+      const waitBtnHeights = await page.evaluate(() =>
+        [...document.querySelectorAll(".ti-wait-reasons .ti-link-btn")].map(el => Math.round(el.getBoundingClientRect().height)),
+      );
+      assert.ok(waitBtnHeights.length >= 2 && waitBtnHeights.every(h => h >= 44), `expected >= 44px wait action buttons, got ${JSON.stringify(waitBtnHeights)}`);
+
       await page.getByRole("button", { name: /Finished \(2\)/ }).click();
       await page.getByRole("button", { name: /Replacement/ }).click();
       assert.ok(await page.locator(`#ti-member-${fixtureTeam.members[1]!.memberId}.is-highlighted`).count() === 1);
+
+      await page.locator(".ti-wait-reasons").getByRole("button", { name: "Logs" }).click();
+      await page.waitForSelector(".team-logs");
+      const logsText = await page.locator(".team-logs").textContent();
+      assert.match(logsText ?? "", /Integrator/);
+      assert.match(logsText ?? "", /Repair attempt/);
 
       await page.getByRole("button", { name: "Board" }).click();
       await page.waitForSelector(".ti-entry-row");

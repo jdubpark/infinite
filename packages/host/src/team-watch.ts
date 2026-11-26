@@ -32,6 +32,7 @@ export function teamMonitorText(team: any, checkedAt = "", detach = false): stri
   if (team.linear?.issue?.url) lines.push(`Linear ${clean(team.linear.issue.url)}`);
   else if (team.linear?.url) lines.push(`Linear ${clean(team.linear.url)}`);
   if (team.reason) lines.push(`Reason: ${short(team.reason, 240)}`);
+  waitReasonLines(lines, team);
   const members = Array.isArray(team.members) ? team.members : [];
   const current = members.filter((member: any) => member?.revision === team.revision);
   const shown = (current.length ? current : members).slice(0, 8);
@@ -40,8 +41,10 @@ export function teamMonitorText(team: any, checkedAt = "", detach = false): stri
     for (const member of shown) {
       const role = roleNames[member.role] ?? short(member.role, 24);
       const task = member.taskId ? ` · ${short(member.taskId, 40)}` : "";
+      const flags = [member.stalledAt ? "stalled" : "", member.spinnerOnlySince ? "spinner-only" : ""].filter(Boolean);
+      const flagText = flags.length ? ` · ${flags.join(" · ")}` : "";
       const stopped = member.stoppedReason ? ` · ${short(member.stoppedReason, 80)}` : "";
-      lines.push(`  ${role}  ${clean(member.status)}  ${short(member.title, 80)}${task}${stopped}`);
+      lines.push(`  ${role}  ${clean(member.status)}  ${short(member.title, 80)}${task}${flagText}${stopped}`);
     }
     const hidden = (current.length ? current.length : members.length) - shown.length;
     if (hidden > 0) lines.push(`  + ${hidden} more`);
@@ -166,6 +169,18 @@ function section(lines: string[], title: string, items: (string | string[])[], n
   if (shown.length > 8) lines.push(`  + ${shown.length - 8} more`);
 }
 
+export function waitReasonLines(lines: string[], team: any) {
+  const reasons = Array.isArray(team?.waitReasons) ? team.waitReasons : [];
+  if (!reasons.length) return;
+  lines.push("", `WAIT REASONS (${reasons.length})`);
+  for (const reason of reasons.slice(0, 6)) {
+    const kind = clean(reason?.kind || "wait");
+    const summary = short(reason?.summary ?? "", 240);
+    lines.push(`  • [${kind}] ${summary}`);
+  }
+  if (reasons.length > 6) lines.push(`  + ${reasons.length - 6} more`);
+}
+
 export function decisionLines(lines: string[], team: any) {
   const open = (team?.decisions ?? []).filter((question: any) => !question?.answer && question?.revision === team?.revision);
   if (!open.length) return;
@@ -193,6 +208,7 @@ export function canAskForBrief(team: any, rows: { sessionId: string; status: Tea
 export function teamSummaryText(team: any, rows: { sessionId: string; status: TeamBriefStatus }[], checkedAt = "", interactive = false, now?: number, repainted = false): string {
   const lines = teamHeading(team, "summary");
   if (team?.reason) lines.push(`Reason: ${short(team.reason, 400)}`);
+  waitReasonLines(lines, team);
   decisionLines(lines, team);
   const coordinator = summaryMember(team);
   const chosen = chooseTeamBrief(rows, coordinator?.sessionId);
@@ -279,7 +295,8 @@ export function teamLogsText(team: any, agents: any[], member: any, screen: unkn
   if (agents.length > 8) strip.push(` +${agents.length - 8} more`);
   lines.push("", `  ${strip.join("  ")}`.slice(0, Math.max(1, width)));
   const role = roleNames[member?.role] ?? short(member?.role, 24);
-  lines.push("", `${role.toUpperCase()} · ${clean(member?.status)} · ${short(member?.title, 120)}${member?.taskId ? ` · ${short(member.taskId, 40)}` : ""}`);
+  const memberFlags = [member?.stalledAt ? "stalled" : "", member?.spinnerOnlySince ? "spinner-only" : ""].filter(Boolean);
+  lines.push("", `${role.toUpperCase()} · ${clean(member?.status)} · ${short(member?.title, 120)}${member?.taskId ? ` · ${short(member.taskId, 40)}` : ""}${memberFlags.length ? ` · ${memberFlags.join(" · ")}` : ""}`);
   if (member?.stoppedReason) lines.push(`Stopped: ${short(member.stoppedReason, 240)}`);
   lines.push("", "SCREEN", visibleScreen(screen));
   const recent = events.filter(event => clean(event.text).trim()).slice(-8);

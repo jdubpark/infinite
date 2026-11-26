@@ -26,7 +26,7 @@ function finishedRun(index: number): TeamView {
     runId: id, memberId: randomUUID(), revision: 1, role, provider: slot ? implementer.provider : coordinator.provider, modelProfile: slot ? implementer : coordinator,
     sessionId: randomUUID(), title: `${role} ${slot + 1}`, status: "reported" as const, cwd: `${workspace}/member-${slot}`, baseCommit: commit(index),
     taskId: role === "implementer" ? `task-${slot}` : undefined, stoppedReason: slot === 6 ? "The provider reported a usage limit." : undefined,
-    startedAt: at(slot), reportedAt: at(slot + 20), lastActivityAt: at(slot + 19), cursor: 400 + slot, stopRequestId: randomUUID(),
+    startedAt: at(slot), reportedAt: at(slot + 20), lastActivityAt: at(slot + 19), spinnerOnlySince: slot === 1 ? at(slot + 18) : undefined, cursor: 400 + slot, stopRequestId: randomUUID(),
     report: { kind: "result" as const, summary: prose(`Member ${slot} changed the parser, ran the focused tests and recorded the evidence.`, 6000) }, usage: totals(0.42 + slot),
   }));
   const tasks = Array.from({ length: 12 }, (_, slot) => ({
@@ -65,7 +65,9 @@ function finishedRun(index: number): TeamView {
     deliveryReceipt: { revision: 1, headCommit: commit(index + 1), pullRequestUrl: `https://git.example/pull/${index}`, mergeCommit: commit(index + 3), summary: prose("Merged after review.", 1000), reportedAt: at(99) },
     permissions: { mode: "coordinator", scope: prose("Routine reads and test runs inside the workspace.", 600), maxDecisions: 30 }, permissionsRevokedAt: at(97),
     usage: { total: totals(12.5), byProfile: { [coordinator.id]: totals(4), [implementer.id]: totals(8.5) }, byProvider: { claude: totals(4), codex: totals(8.5) }, unmeasuredMembers: 1, partialMembers: 0 },
-    providerLimits: [], workers: { limit: 4, max: 4, running: 0, ready: 0 }, resumable: false, continuable: false,
+    providerLimits: [], workers: { limit: 4, max: 4, running: 0, ready: 0 },
+    waitReasons: [{ kind: "worker-slot", taskId: "task-1", summary: "Task task-1 is ready and waiting for a worker slot (4/4)." }],
+    resumable: false, continuable: false,
   };
 }
 
@@ -97,13 +99,13 @@ test("a list row keeps every field client list code reads, unchanged, and nothin
   const view = json(finishedRun(7)), row = json(teamListItem(view));
   const listed = [
     "id", "projectId", "provider", "title", "status", "revision", "parallelism", "createdAt", "updatedAt", "lastActivityAt", "workspace", "branch", "baseCommit", "headCommit",
-    "reason", "missionId", "permissionsRevokedAt", "resumable", "continuable", "workers", "decisions", "lineup.coordinator", "goal.id", "goal.revision", "goal.cycle",
+    "reason", "missionId", "permissionsRevokedAt", "resumable", "continuable", "workers", "waitReasons", "decisions", "lineup.coordinator", "goal.id", "goal.revision", "goal.cycle",
     "linear.status", "linear.reason", "linear.checkedAt", "linear.issue.identifier", "linear.issue.url", "linear.issue.title", "linear.issue.state",
     "deliveryReceipt.headCommit", "deliveryReceipt.pullRequestUrl", "deliveryReceipt.mergeCommit", "pullRequest.pullRequestUrl", "review.verdict", "review.revision", "discovery.revision",
     "permissions.mode", "permissions.maxDecisions", "permissionDecisions.*.targetSessionId", "permissionDecisions.*.promptId", "permissionDecisions.*.status",
     "usage.total", "usage.unmeasuredMembers", "checks.*.status", "checks.*.revision",
     "checks.*.command", "checks.*.phase", "tasks.*.dependsOn",
-    ...["memberId", "sessionId", "role", "revision", "title", "status", "taskId", "provider", "startedAt", "reportedAt", "lastActivityAt", "stalledAt", "stoppedReason",
+    ...["memberId", "sessionId", "role", "revision", "title", "status", "taskId", "provider", "startedAt", "reportedAt", "lastActivityAt", "spinnerOnlySince", "stalledAt", "stoppedReason",
       "pendingLimit", "modelProfile.label", "modelProfile.provider", "modelProfile.tier", "usage.cost"].map(key => `members.*.${key}`),
     ...["id", "title", "status", "paths", "memberId", "changedPaths", "ownerRating"].map(key => `tasks.*.${key}`),
   ];

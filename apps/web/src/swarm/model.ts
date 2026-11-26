@@ -103,6 +103,7 @@ function sessionAgent(args: {
     earlier: args.earlier,
     limited: Boolean(attention?.limit),
     stalled: false,
+    spinnerOnly: Boolean(attention?.spinnerOnlySince),
     observable: isProviderObservable(args.provider, args.providerCapabilities),
     title: args.title,
     provider: args.provider,
@@ -138,6 +139,7 @@ function memberAgent(
     sessionId: member.sessionId,
     limited: Boolean(member.pendingLimit) || agent.limited,
     stalled: Boolean(member.stalledAt),
+    spinnerOnly: Boolean(member.spinnerOnlySince || attention?.spinnerOnlySince),
     lastActivityAt: attention?.lastActivityAt ?? member.lastActivityAt,
   };
 }
@@ -209,6 +211,7 @@ function buildUnit(args: {
     baseCommit: team.baseCommit,
     headCommit: team.headCommit,
     tasks: team.tasks,
+    waitReasons: team.waitReasons ?? [],
   };
 
   if (live) {

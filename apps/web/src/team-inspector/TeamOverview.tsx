@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { ArrowUpRight, ChevronDown, ChevronRight } from "lucide-react";
-import type { Session } from "../api";
+import { clock, type Session } from "../api";
 import type { TeamView } from "../teams";
-import { deriveOutcomeGroups, inspectorRoleLabel, partitionRoster, type RosterMemberNode } from "./model";
+import { deriveOutcomeGroups, inspectorRoleLabel, orderWaitReasons, partitionRoster, waitReasonMeta, type RosterMemberNode } from "./model";
 
 type TeamOverviewProps = {
   team: TeamView;
@@ -40,6 +40,7 @@ export function TeamOverview({
 }: TeamOverviewProps) {
   const overview = deriveOutcomeGroups(team);
   const roster = partitionRoster(team.members, team.revision);
+  const waitReasons = orderWaitReasons(team.waitReasons ?? []);
   const [showFinished, setShowFinished] = useState(false);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
   const sessionIds = new Set(sessions.map(session => session.id));
@@ -71,6 +72,12 @@ export function TeamOverview({
           {member.title} · r{member.revision}
           {member.taskId ? ` · ${member.taskId}` : ""}
         </div>
+        {member.stalledAt && (
+          <div className="ti-roster-sub ti-roster-flag is-attention">Stalled since {clock(member.stalledAt)}</div>
+        )}
+        {member.spinnerOnlySince && (
+          <div className="ti-roster-sub ti-roster-flag is-warning">Spinner-only screen since {clock(member.spinnerOnlySince)}</div>
+        )}
         {member.stoppedReason && (
           <div className="ti-roster-sub">Stopped: {member.stoppedReason}</div>
         )}
@@ -215,6 +222,52 @@ export function TeamOverview({
                 <span className="quiet">{claim.evidence}</span>
               </li>
             ))}
+          </ul>
+        </div>
+      )}
+
+      {waitReasons.length > 0 && (
+        <div className="ti-summary-box ti-wait-reasons">
+          <div className="ti-roster-head">
+            <h3>Why this run is waiting</h3>
+            <span className="quiet">{waitReasons.length}</span>
+          </div>
+          <ul className="ti-wait-list">
+            {waitReasons.map((reason, index) => {
+              const meta = waitReasonMeta(reason.kind);
+              const member = reason.memberId ? roster.byMemberId[reason.memberId]?.member : undefined;
+              const hasSession = Boolean(member && sessionIds.has(member.sessionId));
+              return (
+                <li className="ti-wait-item" key={`${reason.kind}-${reason.memberId ?? ""}-${reason.taskId ?? ""}-${reason.decisionId ?? ""}-${index}`}>
+                  <div className="ti-wait-main">
+                    <span className={`ti-pill is-wait-${meta.tone}`}>{meta.label}</span>
+                    <span className="ti-wait-summary">{reason.summary}</span>
+                    {(reason.since || reason.resetsAt) && (
+                      <span className="ti-wait-meta">
+                        {reason.since ? `since ${clock(reason.since)}` : ""}
+                        {reason.since && reason.resetsAt ? " · " : ""}
+                        {reason.resetsAt ? `resets ${clock(reason.resetsAt)}` : ""}
+                      </span>
+                    )}
+                  </div>
+                  {member && (
+                    <div className="ti-wait-actions">
+                      <button type="button" className="ti-link-btn" onClick={() => onViewMemberLogs(member.memberId)}>
+                        Logs
+                      </button>
+                      <button type="button" className="ti-link-btn" onClick={() => onInspectMemberEntries(member.memberId)}>
+                        Entries
+                      </button>
+                      {hasSession && (
+                        <button type="button" className="ti-link-btn" onClick={() => onOpenSession(member.sessionId)}>
+                          Session <ArrowUpRight size={12} />
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         </div>
       )}

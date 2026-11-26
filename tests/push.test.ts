@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { createServer as createSocketServer } from "node:net";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -12,7 +12,7 @@ import { createApp } from "../packages/host/src/server.js";
 import { socketPath } from "../packages/host/src/ipc.js";
 import { writeSealed } from "../packages/host/src/vault.js";
 import type { Session, WorkerState } from "../packages/host/src/types.js";
-import { initialAttention, type Attention, type Prompt } from "@infinite/attention";
+import { describeNow, initialAttention, type Attention, type Prompt } from "@infinite/attention";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { limitLineup } from "./team-fixture.js";
 
@@ -733,84 +733,94 @@ test("a headless call that waits names its class, and a call that could not wait
 
 test("notifier holds a delegated member's complete hook prompt for the review grace period without leaking tool input", async () => {
   const f = schedulerFixture();
-  const member = f.run.members[0]!;
-  f.run.status = "implementing";
-  f.run.permissions = { mode: "coordinator", scope: "Approve one-time checks.", maxDecisions: 2 };
-  f.run.lineup = limitLineup;
-  f.writeTeam();
-  mkdirSync(join(f.config.stateDir, "sessions", member.sessionId), { recursive: true, mode: 0o700 });
-  const session: Session = {
-    id: member.sessionId,
-    team: { runId: f.run.id, memberId: member.memberId, revision: member.revision, role: member.role },
-    provider: "demo",
-    title: "Delegated member",
-    projectId: f.run.projectId,
-    cwd: member.cwd,
-    createdAt: "2026-11-26T00:00:00.000Z",
-    status: "running",
-    contextVersion: 1,
-    context: "",
-    initialPrompt: "Run checks",
-  };
-  writeSealed(join(f.config.stateDir, "sessions", member.sessionId, "meta.sealed"), f.key, `${member.sessionId}:meta`, {
-    session,
-    fingerprint: "fixture",
-  });
-  const app = createApp(f.config, f.key);
-  const working: WorkerState = {
-    status: "running",
-    seq: 1,
-    screen: "",
-    attention: { ...initialAttention("2026-11-26T00:00:00.000Z", true), state: "working", now: "Running" },
-  };
-  const secretInput = "private-tool-input-token-9f8e7d";
-  const secretCommand = "npm run check --token=secret-cmd-value";
-  const unredactedTail = "UNREDACTED_LAST_MESSAGE_TAIL";
-  const hookPrompt: Prompt = {
-    id: 1,
-    kind: "permission",
-    source: "hook",
-    hash: "a".repeat(64),
-    acceptsText: false,
-    title: "Run command?",
-    options: [
-      { index: 0, label: "Yes, proceed", role: "accept" },
-      { index: 1, label: "No", role: "reject" },
-    ],
-    tool: { name: "Bash", input: { command: secretCommand, secret: secretInput }, inputComplete: true },
-  };
-  const waiting: WorkerState = {
-    status: "running",
-    seq: 2,
-    screen: "",
-    attention: {
+  const socketDir = realpathSync(mkdtempSync("/tmp/inf-sock-"));
+  chmodSync(socketDir, 0o700);
+  const originalNow = Date.now;
+  let app: ReturnType<typeof createApp> | undefined;
+  let worker: ReturnType<typeof createSocketServer> | undefined;
+  let sock: string | undefined;
+  try {
+    const member = f.run.members[0]!;
+    f.run.status = "implementing";
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time checks.", maxDecisions: 2 };
+    f.run.lineup = limitLineup;
+    f.writeTeam();
+    mkdirSync(join(f.config.stateDir, "sessions", member.sessionId), { recursive: true, mode: 0o700 });
+    const session: Session = {
+      id: member.sessionId,
+      team: { runId: f.run.id, memberId: member.memberId, revision: member.revision, role: member.role },
+      provider: "demo",
+      title: "Delegated member",
+      projectId: f.run.projectId,
+      cwd: member.cwd,
+      createdAt: "2026-11-26T00:00:00.000Z",
+      status: "running",
+      contextVersion: 1,
+      context: "",
+      initialPrompt: "Run checks",
+    };
+    writeSealed(join(f.config.stateDir, "sessions", member.sessionId, "meta.sealed"), f.key, `${member.sessionId}:meta`, {
+      session,
+      fingerprint: "fixture",
+    });
+    app = createApp({ ...f.config, socketDir }, f.key);
+    const working: WorkerState = {
+      status: "running",
+      seq: 1,
+      screen: "",
+      attention: { ...initialAttention("2026-11-26T00:00:00.000Z", true), state: "working", now: "Running" },
+    };
+    const secretInput = "private-tool-input-token-9f8e7d";
+    const secretCommand = "npm run check --token=secret-cmd-value";
+    const unredactedTail = "UNREDACTED_LAST_MESSAGE_TAIL";
+    const hookPrompt: Prompt = {
+      id: 1,
+      kind: "permission",
+      source: "hook",
+      hash: "a".repeat(64),
+      acceptsText: false,
+      title: "Run command?",
+      options: [
+        { index: 0, label: "Yes, proceed", role: "accept" },
+        { index: 1, label: "No", role: "reject" },
+      ],
+      tool: { name: "Bash", input: { command: secretCommand, secret: secretInput }, inputComplete: true },
+    };
+    const waitingBase: Attention = {
       ...initialAttention("2026-11-26T00:00:01.000Z", true),
       state: "needs-you",
       source: "hook",
-      now: "Run command?",
+      now: "",
       lastMessage: `${"x".repeat(320)}${unredactedTail}`,
       prompt: hookPrompt,
-    },
-  };
-  let current: WorkerState = working;
-  const sock = socketPath(app.manager.socketTarget, member.sessionId);
-  const worker = createSocketServer(socket => {
-    socket.on("error", () => {});
-    let buffered = "";
-    socket.on("data", chunk => {
-      buffered += chunk;
-      if (buffered.includes("\n")) socket.end(`${JSON.stringify({ result: current })}\n`);
+    };
+    const waitingAttention: Attention = { ...waitingBase, now: describeNow(waitingBase, session.provider) };
+    assert.equal(waitingAttention.now, `Run command? ${secretCommand}`);
+    const waiting: WorkerState = {
+      status: "running",
+      seq: 2,
+      screen: "",
+      attention: waitingAttention,
+    };
+    let current: WorkerState = working;
+    sock = socketPath(app.manager.socketTarget, member.sessionId);
+    worker = createSocketServer(socket => {
+      socket.on("error", () => {});
+      let buffered = "";
+      socket.on("data", chunk => {
+        buffered += chunk;
+        if (buffered.includes("\n")) socket.end(`${JSON.stringify({ result: current })}\n`);
+      });
     });
-  });
-  await new Promise<void>((resolve, reject) => {
-    worker.once("error", reject);
-    worker.listen(sock, () => resolve());
-  });
-  app.pushStore.add("owner", "ExponentPushToken[a]", "android");
-  const originalNow = Date.now;
-  let now = originalNow();
-  Date.now = () => now;
-  try {
+    const activeWorker = worker;
+    const activeSock = sock;
+    await new Promise<void>((resolve, reject) => {
+      activeWorker.once("error", reject);
+      activeWorker.listen(activeSock, () => resolve());
+    });
+    app.pushStore.add("owner", "ExponentPushToken[a]", "android");
+    let now = originalNow();
+    Date.now = () => now;
     for (const [label, source, detail] of [
       ["manager minimal", app.manager, "minimal"],
       ["sessions minimal", app.sessions, "minimal"],
@@ -847,10 +857,10 @@ test("notifier holds a delegated member's complete hook prompt for the review gr
       const pushed = sent[0]![0]!;
       assert.deepEqual(Object.keys(pushed).sort(), ["body", "channelId", "collapseId", "data", "priority", "title", "to"]);
       assert.deepEqual(Object.keys(pushed.data), ["url"]);
-      assert.equal(pushed.body, detail === "full" ? "Run command?" : "Rehearsal needs your approval in Delegated member");
+      assert.equal(pushed.body, detail === "full" ? waitingAttention.now : "Rehearsal needs your approval in Delegated member");
       const serialized = JSON.stringify(pushed);
-      assert.equal(serialized.includes(secretInput), false, `${label}: push payload never carries tool.input fields`);
-      assert.equal(serialized.includes(secretCommand), false, `${label}: push payload never carries tool.input command`);
+      assert.equal(serialized.includes(secretInput), false, `${label}: push payload never carries raw tool.input fields`);
+      if (detail === "minimal") assert.equal(serialized.includes(secretCommand), false, `${label}: minimal push payload never carries command text`);
       assert.equal(serialized.includes("inputComplete"), false, `${label}: push payload never carries inputComplete`);
       assert.equal(serialized.includes(unredactedTail), false, `${label}: push payload never carries unredacted lastMessage`);
     }
@@ -862,8 +872,10 @@ test("notifier holds a delegated member's complete hook prompt for the review gr
     assert.equal(redactedRow?.attention.lastMessage?.includes(unredactedTail), false);
   } finally {
     Date.now = originalNow;
-    await new Promise<void>(resolve => worker.close(() => { rmSync(sock, { force: true }); resolve(); }));
-    await app.closeConnections();
+    if (worker?.listening) await new Promise<void>(resolve => worker!.close(() => resolve()));
+    if (sock) rmSync(sock, { force: true });
+    if (app) await app.closeConnections();
+    rmSync(socketDir, { recursive: true, force: true });
     f.close();
   }
 });

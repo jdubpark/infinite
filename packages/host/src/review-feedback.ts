@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import type { ReviewFeedbackEntry, ReviewFeedbackOutcome, TeamRun } from "./team-types.js";
+import { gitBranchSchema, githubRepositorySchema, type ReviewFeedbackEntry, type ReviewFeedbackOutcome, type TeamRun } from "./team-types.js";
 
 export const REVIEW_TEXT_LIMIT = 8000;
 export const REVIEW_LIMIT = 3;
 const HANDLED_LIMIT = 20;
 const ENTRY_LIMIT = 20;
 export const PULL_REQUEST_FIELDS = "state,isCrossRepository,baseRefName,headRefName,headRefOid,reviews";
+export const PULL_REQUEST_BRANCH_FIELDS = "state,isCrossRepository,baseRefName,headRefName";
 
 export type ReviewIntent = {
   reviewId: string; submittedAt: string; commit: string;
@@ -37,16 +38,28 @@ const pullRequestSchema = z.object({
 }).passthrough();
 export type PullRequestRead = z.infer<typeof pullRequestSchema>;
 
+const pullRequestBranchSchema = z.object({
+  state: z.enum(["OPEN", "CLOSED", "MERGED"]),
+  isCrossRepository: z.boolean(),
+  baseRefName: z.string().min(1).max(255),
+  headRefName: gitBranchSchema,
+}).passthrough();
+export type PullRequestBranchRead = z.infer<typeof pullRequestBranchSchema>;
+
 export function parsePullRequestView(stdout: string): PullRequestRead {
   return pullRequestSchema.parse(JSON.parse(stdout));
 }
 
+export function parsePullRequestBranchView(stdout: string): PullRequestBranchRead {
+  return pullRequestBranchSchema.parse(JSON.parse(stdout));
+}
+
 export function pullRequestTarget(run: Pick<TeamRun, "pullRequest" | "delivery">) {
-  if (!run.pullRequest || !run.delivery) return undefined;
+  if (!run.pullRequest || !run.delivery || !githubRepositorySchema.safeParse(run.delivery.repository).success) return undefined;
   let url: URL;
   try { url = new URL(run.pullRequest.pullRequestUrl); } catch { return undefined; }
   const match = /^\/([^/]+\/[^/]+)\/pull\/([1-9][0-9]{0,9})$/.exec(url.pathname);
-  if (url.origin !== "https://github.com" || !match || match[1]!.toLowerCase() !== run.delivery.repository.toLowerCase()) return undefined;
+  if (url.origin !== "https://github.com" || url.username || url.password || url.search || url.hash || !match || match[1]!.toLowerCase() !== run.delivery.repository.toLowerCase()) return undefined;
   return { repository: run.delivery.repository, number: Number(match[2]) };
 }
 
@@ -54,16 +67,35 @@ export function pullRequestViewArgs(target: { repository: string; number: number
   return ["pr", "view", String(target.number), "--json", PULL_REQUEST_FIELDS, "--repo", target.repository];
 }
 
+export function pullRequestBranchViewArgs(target: { repository: string; number: number }) {
+  return ["pr", "view", String(target.number), "--json", PULL_REQUEST_BRANCH_FIELDS, "--repo", target.repository];
+}
+
 export function watchedRun(run: TeamRun, intake?: ReviewIntake) {
   return run.status === "ready-for-review" && run.delivery?.mode === "pr" && run.pullRequest?.revision === run.revision &&
     !run.workspaceRemovedAt && !run.goal && !run.handoff && !run.missionId && !run.replay && !intake?.ended && pullRequestTarget(run) !== undefined;
 }
 
-export function recordedDeliveryBranch(run: Pick<TeamRun, "pullRequest" | "branch" | "publication">, pr: Pick<PullRequestRead, "headRefName">) {
+export function recordedDeliveryBranch(run: Pick<TeamRun, "pullRequest" | "branch" | "publication" | "delivery">, pr: Pick<PullRequestRead, "headRefName">) {
   if (!run.pullRequest) return undefined;
   if (run.pullRequest.branch) return run.pullRequest.branch;
-  const published = run.publication?.commit === run.pullRequest.headCommit ? run.publication.branch : undefined;
+  if (!gitBranchSchema.safeParse(pr.headRefName).success || pr.headRefName === run.delivery?.baseBranch) return undefined;
+  const published = run.publication?.commit === run.pullRequest.headCommit && (!run.delivery || run.publication.repository === run.delivery.repository) ? run.publication.branch : undefined;
   return pr.headRefName === run.branch || pr.headRefName === published ? pr.headRefName : undefined;
+}
+
+export type PullRequestBranchResolution =
+  | { ok: true; branch: string }
+  | { ok: false; reason: "closed" | "merged" | "fork" | "base" | "branch" };
+
+export function resolvePullRequestBranch(run: Pick<TeamRun, "pullRequest" | "delivery" | "branch" | "publication">, pr: PullRequestBranchRead): PullRequestBranchResolution {
+  if (!run.pullRequest || !run.delivery) return { ok: false, reason: "branch" };
+  if (pr.state !== "OPEN") return { ok: false, reason: pr.state === "MERGED" ? "merged" : "closed" };
+  if (pr.isCrossRepository) return { ok: false, reason: "fork" };
+  if (pr.baseRefName !== run.delivery.baseBranch) return { ok: false, reason: "base" };
+  const branch = recordedDeliveryBranch(run, pr);
+  if (!branch || !gitBranchSchema.safeParse(branch).success) return { ok: false, reason: "branch" };
+  return { ok: true, branch };
 }
 
 export function intakeEndedByRemoval(run: TeamRun, intake: ReviewIntake | undefined, enabled: boolean) {

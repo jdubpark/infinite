@@ -5,6 +5,7 @@ import { writeSealed, unseal } from "./vault.js";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { autonomyStartEvent, startMode } from "./evaluator-profiles.js";
 import { TeamService, TeamError } from "./teams.js";
+import { HALT_CENSUS_MS } from "./team-command-fence.js";
 import { goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalParallelismSchema, goalSteerSchema, parseCreateGoal, type CreateGoal, type CycleClass, type GoalCycle, type GoalOutcomeInput, type GoalReasonCode, type ProductGoal } from "./goal-types.js";
 import { SHARED_INPUT_LIMITS } from "./schema-primitives.js";
 import type { Config } from "./types.js";
@@ -599,13 +600,18 @@ export class GoalService {
     }
     const body = { requestId: control.requestId, revision: control.revision };
     try {
-      if (control.action === "steer") await this.teams.steer(control.teamId, { ...body, text: control.text! });
+      if (control.action === "steer") await this.teams.steer(control.teamId, { ...body, text: control.text! }, undefined, HALT_CENSUS_MS);
       else if (control.action === "pause" && control.halt) await this.teams.haltPauseChild(control.teamId, control.halt.token, control.halt.reason);
+      else if (control.action === "resume") await this.teams.resume(control.teamId, body, undefined, HALT_CENSUS_MS);
       else await this.teams[control.action](control.teamId, body);
     } catch (error) {
       if (this.closed) return false;
       if (!(error instanceof TeamError)) throw error;
       if (["members-stopping", "team-operation-running"].includes(error.code)) return false;
+      if (error.code === "team-command-running") {
+        this.awaitStoppedCommand(stored, `The goal's ${control.action} waits for its team. ${error.message}`);
+        return false;
+      }
       if (error.code === "stale-team-revision" && ["pause", "cancel"].includes(control.action)) {
         let team: TeamView;
         try { team = this.teams.get(control.teamId); }
@@ -634,6 +640,12 @@ export class GoalService {
     }
     if (this.closed) return false;
     stored.control = undefined; this.save(stored); return true;
+  }
+  private awaitStoppedCommand(stored: Stored, reason: string) {
+    if (stored.goal.reason === reason) return;
+    stored.goal.reason = reason;
+    this.event(stored, reason);
+    this.save(stored);
   }
   private async launch(stored: Stored) {
     const pending = stored.launch!;

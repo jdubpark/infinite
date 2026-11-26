@@ -32,10 +32,10 @@ export function stopFenceLifted(stored: Fenced) {
   return stopFenced(stored) && processesCleared(stored);
 }
 
-function stopFenceRefusal(state: CensusState | undefined, code = "team-command-running") {
+function stopFenceRefusal(id: string, state: CensusState | undefined, code = "team-command-running") {
   return state === "unknown"
-    ? new TeamError(409, code, "The host cannot tell whether an earlier command of this run still runs. After checking the host, state that its processes ended with `infinite team processes-ended RUN_ID`, then retry.")
-    : new TeamError(409, code, "An earlier command of this run may still be running. The host accepts this request once a process census finds none of that operation's processes.");
+    ? new TeamError(409, code, `The host cannot tell whether the stopped command of team run ${id} still runs. The run accepts this request after the owner checks the host and states that its processes ended with \`infinite team processes-ended ${id}\`.`)
+    : new TeamError(409, code, `The stopped command of team run ${id} may still be running. The run accepts this request once a process census finds none of that command's processes.`);
 }
 
 function ownerStatementEvent(kind: string, detail: string) {
@@ -130,17 +130,21 @@ export class CommandFence {
     if (!stopFenced(stored)) return;
     void this.take(stored.run.id).then(taken => taken && this.host.enqueue(stored.run.id, () => this.apply(stored, taken))).catch(() => {});
   }
-  forHalt(id: string, haltId: string, reuseMs = 0): Promise<TakenCensus | undefined> {
+  recent(id: string, reuseMs: number): Promise<TakenCensus | undefined> {
     const stored = this.host.records.get(id), census = stored?.census;
-    if (!stored || stored.ownerHalt?.haltId !== haltId || stored.run.status !== "paused") return Promise.resolve(undefined);
-    const fresh = census && census.pendingId === stored.pending?.id && this.now() - Date.parse(census.at) < reuseMs;
+    const fresh = census && census.pendingId === stored?.pending?.id && this.now() - Date.parse(census.at) < reuseMs;
     return fresh ? Promise.resolve(undefined) : this.take(id);
+  }
+  forHalt(id: string, haltId: string, reuseMs = 0): Promise<TakenCensus | undefined> {
+    const stored = this.host.records.get(id);
+    if (!stored || stored.ownerHalt?.haltId !== haltId || stored.run.status !== "paused") return Promise.resolve(undefined);
+    return this.recent(id, reuseMs);
   }
   refusal(stored: Stored, taken: TakenCensus | undefined, code?: string): TeamError | undefined {
     if (!stopFenced(stored) || this.host.commands.has(stored.run.id)) return undefined;
     if (taken) this.apply(stored, taken);
     const census = stored.census?.pendingId === stored.pending?.id ? stored.census : undefined;
-    return stopFenceLifted(stored) ? undefined : stopFenceRefusal(census?.state, code);
+    return stopFenceLifted(stored) ? undefined : stopFenceRefusal(stored.run.id, census?.state, code);
   }
   check(stored: Stored, taken: TakenCensus | undefined) {
     const refusal = this.refusal(stored, taken);

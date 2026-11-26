@@ -12,7 +12,7 @@ import { Card, Chip, Sheet } from "../../components/Glass";
 import { theme } from "../../theme";
 import {
   applyMobileEvidenceHead, applyMobileEvidencePage, authorityLabel, createMobileEvidenceFeedState,
-  entryAuthorLabel, filterMobileEntries, formatEntryBodySummary, resolveSelectedEntryHead,
+  entryAuthorLabel, filterMobileEntries, formatEntryBodySummary, resolveSelectedEntryHead, sliceVisibleMobileEntries,
   type MobileEvidenceFeedState,
 } from "./inspector-model";
 import { shortDate, type TeamView } from "./model";
@@ -22,6 +22,7 @@ const PAGE_LIMIT = 100;
 const MAX_INCREMENTAL_PAGES = 5;
 const MAX_REVALIDATE_PAGES = 5;
 const REVALIDATE_INTERVAL_MS = 30_000;
+const VISIBLE_ENTRY_STEP = 60;
 
 const KIND_LABELS: Record<TeamEntryKind | "all", string> = {
   all: "All",
@@ -47,6 +48,18 @@ type SheetState = {
 type ScopedError = {
   key: string;
   message: string;
+  lastSuccessAt?: string;
+};
+
+type LoadMoreToken = {
+  key: string;
+  epoch: number;
+  id: number;
+};
+
+type VisibleLimitState = {
+  key: string;
+  limit: number;
 };
 
 export function TeamEvidenceSection({
@@ -60,8 +73,10 @@ export function TeamEvidenceSection({
 }) {
   const scopeKey = `${connectionKey(connection)}/${team.id}`;
   const [kindFilter, setKindFilter] = useState<TeamEntryKind | "all">("all");
+  const filterScopeKey = `${scopeKey}/${kindFilter}`;
   const [feedState, setFeedState] = useState<MobileEvidenceFeedState>(() => createMobileEvidenceFeedState(scopeKey));
-  const [loadingMore, setLoadingMore] = useState(false);
+  const [loadMoreToken, setLoadMoreToken] = useState<LoadMoreToken | null>(null);
+  const [visibleLimitState, setVisibleLimitState] = useState<VisibleLimitState>({ key: filterScopeKey, limit: VISIBLE_ENTRY_STEP });
   const [pollError, setPollError] = useState<ScopedError | null>(null);
   const [sheetState, setSheetState] = useState<SheetState>({
     key: scopeKey,
@@ -73,7 +88,9 @@ export function TeamEvidenceSection({
   });
 
   const epochRef = useRef(0);
+  const loadMoreIdRef = useRef(0);
   const feedRef = useRef<MobileEvidenceFeedState>(feedState);
+  const lastSuccessAtRef = useRef<{ key: string; at: string }>({ key: scopeKey, at: "" });
   const manualRefreshRef = useRef(false);
   const focused = useIsFocused();
   const focusedRef = useRef(focused);
@@ -81,6 +98,7 @@ export function TeamEvidenceSection({
   const commitFeed = useCallback((targetKey: string, updater: (prev: MobileEvidenceFeedState) => MobileEvidenceFeedState) => {
     const base = feedRef.current.key === targetKey ? feedRef.current : createMobileEvidenceFeedState(targetKey);
     const updated = updater(base);
+    if (updated === base) return;
     feedRef.current = updated;
     setFeedState(updated);
   }, []);
@@ -88,6 +106,7 @@ export function TeamEvidenceSection({
   useEffect(() => {
     epochRef.current += 1;
     feedRef.current = createMobileEvidenceFeedState(scopeKey);
+    lastSuccessAtRef.current = { key: scopeKey, at: "" };
     manualRefreshRef.current = false;
     return () => {
       epochRef.current += 1;
@@ -99,6 +118,7 @@ export function TeamEvidenceSection({
     epochRef.current += 1;
     const removeForeground = onForegroundChange(() => {
       epochRef.current += 1;
+      setLoadMoreToken(null);
     });
     return () => {
       focusedRef.current = false;
@@ -113,6 +133,8 @@ export function TeamEvidenceSection({
     const targetTeamId = team.id;
     const isCurrent = () => epoch === epochRef.current && focusedRef.current && inForeground();
     if (!isCurrent()) return null;
+
+    setLoadMoreToken(prev => (prev && (prev.key !== targetKey || prev.epoch !== epoch) ? null : prev));
 
     const current = feedRef.current.key === targetKey
       ? feedRef.current
@@ -134,6 +156,7 @@ export function TeamEvidenceSection({
         if (!isCurrent()) return null;
         fetchedAny = true;
         const observedAt = new Date().toISOString();
+        lastSuccessAtRef.current = { key: targetKey, at: observedAt };
         commitFeed(targetKey, prev => {
           const applied = applyMobileEvidencePage(prev, page, { mode: "incremental", observedAt });
           return applied.lastRevalidatedAtMs === undefined && applied.entries.length > 0
@@ -152,6 +175,7 @@ export function TeamEvidenceSection({
           const page = await listTeamEntries(connection, targetTeamId, { since: revalidateSince, limit: PAGE_LIMIT });
           if (!isCurrent()) return null;
           const observedAt = new Date().toISOString();
+          lastSuccessAtRef.current = { key: targetKey, at: observedAt };
           commitFeed(targetKey, prev => applyMobileEvidencePage(prev, page, { mode: "revalidate", observedAt }));
           if (!page.more || page.cursor <= revalidateSince || page.cursor >= upperBound) {
             revalidateSince = 0;
@@ -162,11 +186,15 @@ export function TeamEvidenceSection({
           completedSweep = false;
         }
         if (isCurrent()) {
-          commitFeed(targetKey, prev => ({
-            ...prev,
-            revalidateCursor: revalidateSince,
-            ...(completedSweep ? { lastRevalidatedAtMs: Date.now() } : {}),
-          }));
+          commitFeed(targetKey, prev => {
+            const nextAt = completedSweep ? Date.now() : prev.lastRevalidatedAtMs;
+            if (prev.revalidateCursor === revalidateSince && prev.lastRevalidatedAtMs === nextAt) return prev;
+            return {
+              ...prev,
+              revalidateCursor: revalidateSince,
+              ...(nextAt !== undefined ? { lastRevalidatedAtMs: nextAt } : {}),
+            };
+          });
         }
       }
 
@@ -175,7 +203,14 @@ export function TeamEvidenceSection({
       return fetchedAny ? { key: targetKey, at: Date.now() } : null;
     } catch (error) {
       if (isCurrent()) {
-        setPollError({ key: targetKey, message: error instanceof Error ? error.message : "Could not load blackboard entries." });
+        const lastSuccessAt = lastSuccessAtRef.current.key === targetKey && lastSuccessAtRef.current.at
+          ? lastSuccessAtRef.current.at
+          : undefined;
+        setPollError({
+          key: targetKey,
+          message: error instanceof Error ? error.message : "Could not load blackboard entries.",
+          ...(lastSuccessAt ? { lastSuccessAt } : {}),
+        });
       }
       throw error;
     }
@@ -187,30 +222,37 @@ export function TeamEvidenceSection({
     : { key: scopeKey, selectedId: null, historyIds: [], detail: null, loading: false, error: "" };
 
   const mergedEntries = scopedFeed.entries;
-  const visibleEntries = [...filterMobileEntries(mergedEntries, kindFilter)].reverse();
+  const allVisibleEntries = [...filterMobileEntries(mergedEntries, kindFilter)].reverse();
+  const visibleLimit = visibleLimitState.key === filterScopeKey ? visibleLimitState.limit : VISIBLE_ENTRY_STEP;
+  const { visible: displayedEntries, hiddenCount } = sliceVisibleMobileEntries(allVisibleEntries, visibleLimit);
   const hasMore = scopedFeed.more;
+  const loadingMore = loadMoreToken?.key === scopeKey;
   const activePollError = pollError?.key === scopeKey ? pollError.message : "";
+  const lastUpdatedAt = (pollError?.key === scopeKey ? pollError.lastSuccessAt : undefined) ?? scopedFeed.lastLoadedAt;
   const isStale = poll.stale || Boolean(activePollError);
 
   async function loadNewerEntries() {
     if (loadingMore || !hasMore) return;
     const epoch = epochRef.current;
+    const requestId = ++loadMoreIdRef.current;
     const targetKey = scopeKey;
     const targetTeamId = team.id;
     const isCurrent = () => epoch === epochRef.current && focusedRef.current && inForeground();
     const startCursor = feedRef.current.key === targetKey ? feedRef.current.cursor : scopedFeed.cursor;
-    setLoadingMore(true);
+    setLoadMoreToken({ key: targetKey, epoch, id: requestId });
     try {
       const page = await listTeamEntries(connection, targetTeamId, { since: startCursor, limit: PAGE_LIMIT });
       if (!isCurrent()) return;
-      commitFeed(targetKey, prev => applyMobileEvidencePage(prev, page, { mode: "incremental", observedAt: new Date().toISOString() }));
+      const observedAt = new Date().toISOString();
+      lastSuccessAtRef.current = { key: targetKey, at: observedAt };
+      commitFeed(targetKey, prev => applyMobileEvidencePage(prev, page, { mode: "incremental", observedAt }));
       setPollError(prev => (prev?.key === targetKey ? null : prev));
     } catch (error) {
-      if (epoch === epochRef.current) {
+      if (isCurrent()) {
         Alert.alert("Could not load entries", error instanceof Error ? error.message : "Request failed.");
       }
     } finally {
-      if (epoch === epochRef.current) setLoadingMore(false);
+      setLoadMoreToken(prev => (prev && prev.id === requestId ? null : prev));
     }
   }
 
@@ -318,7 +360,7 @@ export function TeamEvidenceSection({
 
     {isStale && mergedEntries.length > 0 ? <Card attention style={s.staleBanner}>
       <Text style={t.warning}>
-        Evidence may be stale{scopedFeed.lastLoadedAt ? ` · last updated ${shortDate(scopedFeed.lastLoadedAt)}` : ""}.{activePollError ? ` ${activePollError}` : ""}
+        Evidence may be stale{lastUpdatedAt ? ` · last updated ${shortDate(lastUpdatedAt)}` : ""}.{activePollError ? ` ${activePollError}` : ""}
       </Text>
     </Card> : null}
 
@@ -326,10 +368,10 @@ export function TeamEvidenceSection({
     {!poll.loading && isStale && !mergedEntries.length ? <Text style={t.warning}>
       Could not load blackboard entries.{activePollError ? ` ${activePollError}` : ""}
     </Text> : null}
-    {!poll.loading && !isStale && !visibleEntries.length ? <Text style={t.note}>No matching entries yet.</Text> : null}
+    {!poll.loading && !isStale && !displayedEntries.length ? <Text style={t.note}>No matching entries yet.</Text> : null}
 
-    {visibleEntries.length ? <Card style={s.listCard}>
-      {visibleEntries.map((entry, index) => {
+    {displayedEntries.length ? <Card style={s.listCard}>
+      {displayedEntries.map((entry, index) => {
         const author = entryAuthorLabel(entry.author, entry.authorRole);
         return <Pressable
           key={entry.entryId}
@@ -353,6 +395,13 @@ export function TeamEvidenceSection({
         </Pressable>;
       })}
     </Card> : null}
+
+    {hiddenCount > 0 ? <Button
+      compact
+      secondary
+      title={`Show older (${hiddenCount} hidden)`}
+      onPress={() => setVisibleLimitState({ key: filterScopeKey, limit: visibleLimit + VISIBLE_ENTRY_STEP })}
+    /> : null}
 
     <Sheet
       visible={Boolean(scopedSheet.selectedId)}

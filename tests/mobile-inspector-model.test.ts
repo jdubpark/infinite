@@ -13,6 +13,7 @@ import {
   mergeMobileEntries,
   partitionMobileRoster,
   resolveSelectedEntryHead,
+  sliceVisibleMobileEntries,
 } from "../apps/mobile/src/features/teams/inspector-model.ts";
 import {
   applyMissionProgressPage,
@@ -441,10 +442,13 @@ test("partitionMissionSubtasks does not infer replacements from repo order and h
   assert.equal(linkedTeamIdOf(subtasks[3]!.child), undefined);
 });
 
-test("mobile evidence feed retains intermediate pages past 500 entries, propagates supersedes, revalidates without rewinding cursor, and reconciles open sheet head", () => {
+test("mobile evidence feed retains intermediate pages past 500 entries, enforces host supersedes eligibility, preserves monotonic state, avoids no-op updates, and bounds mounted rows", () => {
   let feed = createMobileEvidenceFeedState("m1/team-1");
   feed = applyMobileEvidencePage(feed, {
-    entries: [makeEntry("e-1", 1), makeEntry("e-500", 500)],
+    entries: [
+      makeEntry("e-1", 1, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1" }),
+      makeEntry("e-500", 500, { kind: "contract", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1" }),
+    ],
     cursor: 500,
     more: true,
   }, { mode: "incremental", observedAt: "2026-11-26T00:01:00.000Z" });
@@ -452,7 +456,10 @@ test("mobile evidence feed retains intermediate pages past 500 entries, propagat
   assert.equal(feed.more, true);
 
   feed = applyMobileEvidencePage(feed, {
-    entries: [makeEntry("e-501", 501), makeEntry("e-502", 502)],
+    entries: [
+      makeEntry("e-501", 501, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1" }),
+      makeEntry("e-502", 502, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m2", taskId: "t2" }),
+    ],
     cursor: 502,
     more: true,
   }, { mode: "incremental", observedAt: "2026-11-26T00:02:00.000Z" });
@@ -460,8 +467,13 @@ test("mobile evidence feed retains intermediate pages past 500 entries, propagat
   assert.equal(feed.more, true);
 
   feed = applyMobileEvidencePage(feed, {
-    entries: [makeEntry("e-503", 503, { supersedes: "e-502" })],
-    cursor: 503,
+    entries: [
+      makeEntry("e-503", 503, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m2", taskId: "t2", supersedes: "e-502" }),
+      makeEntry("e-504", 504, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1", supersedes: "e-500" }),
+      makeEntry("e-505", 505, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m9", taskId: "t9", supersedes: "e-501" }),
+      makeEntry("e-506", 506, { kind: "finding", author: "host", authority: "receipt", supersedes: "e-1" }),
+    ],
+    cursor: 506,
     more: false,
   }, { mode: "incremental", observedAt: "2026-11-26T00:03:00.000Z" });
   assert.deepEqual(feed.entries.map(item => [item.entryId, item.state]), [
@@ -470,32 +482,52 @@ test("mobile evidence feed retains intermediate pages past 500 entries, propagat
     ["e-501", "active"],
     ["e-502", "superseded"],
     ["e-503", "active"],
+    ["e-504", "active"],
+    ["e-505", "active"],
+    ["e-506", "active"],
   ]);
-  assert.equal(feed.cursor, 503);
+  assert.equal(feed.cursor, 506);
   assert.equal(feed.more, false);
+
+  const steady = applyMobileEvidencePage(feed, { entries: [], cursor: 506, more: false }, { mode: "incremental", observedAt: "2026-11-26T00:03:04.000Z" });
+  assert.equal(steady, feed);
 
   feed = applyMobileEvidencePage(feed, {
-    entries: [makeEntry("e-1", 1, { state: "withdrawn" })],
-    cursor: 500,
+    entries: [
+      makeEntry("e-1", 1, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1", state: "withdrawn" }),
+      makeEntry("e-503", 503, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m2", taskId: "t2", supersedes: "e-502", state: "withdrawn" }),
+    ],
+    cursor: 503,
     more: true,
   }, { mode: "revalidate", observedAt: "2026-11-26T00:04:00.000Z" });
-  assert.equal(feed.cursor, 503);
+  assert.equal(feed.cursor, 506);
   assert.equal(feed.more, false);
   assert.equal(feed.entries.find(item => item.entryId === "e-1")?.state, "withdrawn");
+  assert.equal(feed.entries.find(item => item.entryId === "e-503")?.state, "withdrawn");
   assert.equal(feed.entries.find(item => item.entryId === "e-502")?.state, "superseded");
 
-  const staleDetailHead = makeEntry("e-1", 1, { state: "active", summary: "Old" });
-  const latestListHead = feed.entries.find(item => item.entryId === "e-1");
-  assert.equal(resolveSelectedEntryHead(staleDetailHead, latestListHead)?.state, "withdrawn");
+  const staleDetailHead = makeEntry("e-1", 1, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1", state: "active", summary: "Old" });
+  const afterLateDetail = applyMobileEvidenceHead(feed, staleDetailHead);
+  assert.equal(afterLateDetail.entries.find(item => item.entryId === "e-1")?.state, "withdrawn");
+  assert.equal(resolveSelectedEntryHead(staleDetailHead, afterLateDetail.entries.find(item => item.entryId === "e-1"))?.state, "withdrawn");
 
-  const fresherDetailHead = makeEntry("e-503", 503, { state: "withdrawn" });
-  assert.equal(resolveSelectedEntryHead(fresherDetailHead, feed.entries.find(item => item.entryId === "e-503"))?.state, "withdrawn");
+  const lateSupersededDetail = makeEntry("e-502", 502, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m2", taskId: "t2", state: "active" });
+  assert.equal(applyMobileEvidenceHead(feed, lateSupersededDetail).entries.find(item => item.entryId === "e-502")?.state, "superseded");
 
-  feed = applyMobileEvidenceHead(feed, fresherDetailHead);
-  assert.equal(feed.entries.find(item => item.entryId === "e-503")?.state, "withdrawn");
+  const detailFirst = applyMobileEvidenceHead(feed, makeEntry("e-504", 504, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1", state: "withdrawn" }));
+  const afterStaleList = applyMobileEvidencePage(detailFirst, {
+    entries: [makeEntry("e-504", 504, { kind: "finding", author: "member", authority: "claim", authorMemberId: "m1", taskId: "t1", state: "active" })],
+    cursor: 504,
+    more: false,
+  }, { mode: "revalidate", observedAt: "2026-11-26T00:05:00.000Z" });
+  assert.equal(afterStaleList.entries.find(item => item.entryId === "e-504")?.state, "withdrawn");
+
+  const sliced = sliceVisibleMobileEntries(afterStaleList.entries, 3);
+  assert.equal(sliced.visible.length, 3);
+  assert.equal(sliced.hiddenCount, 5);
 });
 
-test("summarizeMissionProgressChild distinguishes recorded assignments from sampled worker status and qualifies truncated samples", () => {
+test("summarizeMissionProgressChild distinguishes recorded assignments, confirmed live workers, unsampled workers, and truncated samples", () => {
   const exitedSummary = summarizeMissionProgressChild({
     kind: "linked",
     runId: "team-1",
@@ -526,6 +558,49 @@ test("summarizeMissionProgressChild distinguishes recorded assignments from samp
   });
   assert.equal(recErrorSummary, "Running checks · recorded 1/1 active · 0 workers live (1 recording-error) · check failed (1) · abcdef12");
 
+  const unsampledReportedSummary = summarizeMissionProgressChild({
+    kind: "linked",
+    runId: "team-2b",
+    missionId: "m1",
+    projectId: "repo-a",
+    revision: 1,
+    status: "reviewing",
+    assignments: [
+      { runId: "team-2b", memberId: "m1", sessionId: "s1", revision: 1, role: "implementer", recordedStatus: "reported", workerStatus: "not-sampled" },
+    ],
+    checks: [],
+  });
+  assert.equal(unsampledReportedSummary, "Reviewing · recorded 0/1 active · workers unsampled (1 not-sampled)");
+
+  const partialSampledSummary = summarizeMissionProgressChild({
+    kind: "linked",
+    runId: "team-2c",
+    missionId: "m1",
+    projectId: "repo-a",
+    revision: 1,
+    status: "implementing",
+    assignments: [
+      { runId: "team-2c", memberId: "m1", sessionId: "s1", revision: 1, role: "implementer", recordedStatus: "running", workerStatus: "exited" },
+      { runId: "team-2c", memberId: "m2", sessionId: "s2", revision: 1, role: "reviewer", recordedStatus: "unavailable", workerStatus: "unknown" },
+    ],
+    checks: [],
+  });
+  assert.equal(partialSampledSummary, "Implementing · recorded 1/2 active · 0 of 1 sampled worker live (1 exited, 1 unknown)");
+
+  const confirmedExitReportedSummary = summarizeMissionProgressChild({
+    kind: "linked",
+    runId: "team-2d",
+    missionId: "m1",
+    projectId: "repo-a",
+    revision: 1,
+    status: "ready-for-review",
+    assignments: [
+      { runId: "team-2d", memberId: "m1", sessionId: "s1", revision: 1, role: "implementer", recordedStatus: "reported", exitConfirmedAt: "2026-11-26T00:02:00.000Z", workerStatus: "not-sampled" },
+    ],
+    checks: [],
+  });
+  assert.equal(confirmedExitReportedSummary, "Ready for your review · recorded 0/1 active · 0 workers live");
+
   const truncatedSummary = summarizeMissionProgressChild({
     kind: "linked",
     runId: "team-3",
@@ -541,5 +616,5 @@ test("summarizeMissionProgressChild distinguishes recorded assignments from samp
     checks: [],
     checksTruncated: true,
   });
-  assert.equal(truncatedSummary, "Implementing · recorded 2 active (2 shown, truncated) · 1 sampled worker live (1 not-sampled) · checks truncated");
+  assert.equal(truncatedSummary, "Implementing · recorded 2 active (2 shown, truncated) · 1 of 1 sampled worker live (1 not-sampled) · checks truncated");
 });

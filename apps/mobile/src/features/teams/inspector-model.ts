@@ -155,18 +155,54 @@ const ENTRY_STATE_RANK: Record<TeamEntryHead["state"], number> = {
   withdrawn: 2,
 };
 
+function mergeEntryHead(existing: TeamEntryHead | undefined, incoming: TeamEntryHead): TeamEntryHead {
+  if (!existing) return incoming;
+  if (ENTRY_STATE_RANK[existing.state] > ENTRY_STATE_RANK[incoming.state]) {
+    return { ...incoming, state: existing.state };
+  }
+  return incoming;
+}
+
+function sameEntryHead(left: TeamEntryHead, right: TeamEntryHead): boolean {
+  return left.entryId === right.entryId
+    && left.seq === right.seq
+    && left.revision === right.revision
+    && left.at === right.at
+    && left.kind === right.kind
+    && left.author === right.author
+    && left.authority === right.authority
+    && left.authorRole === right.authorRole
+    && left.authorMemberId === right.authorMemberId
+    && left.taskId === right.taskId
+    && left.supersedes === right.supersedes
+    && left.headCommit === right.headCommit
+    && left.summary === right.summary
+    && left.bodyBytes === right.bodyBytes
+    && left.state === right.state;
+}
+
+function canSupersedeEntry(replacement: TeamEntryHead, target: TeamEntryHead): boolean {
+  if (replacement.entryId === target.entryId) return false;
+  if (replacement.supersedes !== target.entryId) return false;
+  if (replacement.author !== "member" || target.author !== "member") return false;
+  if (replacement.kind !== target.kind) return false;
+  const sameAuthor = replacement.authorMemberId !== undefined && target.authorMemberId === replacement.authorMemberId;
+  const sameTask = replacement.taskId !== undefined && target.taskId !== undefined && target.taskId === replacement.taskId;
+  return sameAuthor || sameTask;
+}
+
 export function mergeMobileEntries(existing: readonly TeamEntryHead[], page: Pick<TeamEntryPage, "entries">): TeamEntryHead[] {
   const byId = new Map<string, TeamEntryHead>();
   for (const entry of existing) byId.set(entry.entryId, entry);
   const incomingIds = new Set<string>();
   for (const entry of page.entries) {
-    byId.set(entry.entryId, entry);
+    byId.set(entry.entryId, mergeEntryHead(byId.get(entry.entryId), entry));
     incomingIds.add(entry.entryId);
   }
   for (const entry of page.entries) {
-    if (!entry.supersedes || entry.state === "withdrawn" || incomingIds.has(entry.supersedes)) continue;
+    if (!entry.supersedes || incomingIds.has(entry.supersedes)) continue;
     const prior = byId.get(entry.supersedes);
-    if (prior && prior.state === "active") {
+    if (prior && prior.state === "active" && canSupersedeEntry(entry, prior)) {
       byId.set(prior.entryId, { ...prior, state: "superseded" });
     }
   }
@@ -199,14 +235,19 @@ export function applyMobileEvidencePage(
   options: { mode?: "incremental" | "revalidate"; observedAt?: string } = {},
 ): MobileEvidenceFeedState {
   const mode = options.mode ?? "incremental";
-  const entries = mergeMobileEntries(state.entries, page);
   const cursor = Math.max(state.cursor, page.cursor);
   const more = mode === "incremental"
     ? (page.cursor >= state.cursor ? page.more : state.more)
     : (page.cursor > state.cursor ? page.more : state.more);
+  const entries = page.entries.length === 0 ? state.entries : mergeMobileEntries(state.entries, page);
+  const entriesChanged = entries.length !== state.entries.length
+    || entries.some((entry, index) => !sameEntryHead(entry, state.entries[index]!));
+  if (!entriesChanged && cursor === state.cursor && more === state.more && (state.lastLoadedAt !== undefined || !options.observedAt)) {
+    return state;
+  }
   return {
     ...state,
-    entries,
+    entries: entriesChanged ? entries : state.entries,
     cursor,
     more,
     ...(options.observedAt ? { lastLoadedAt: options.observedAt } : {}),
@@ -217,9 +258,25 @@ export function applyMobileEvidenceHead(
   state: MobileEvidenceFeedState,
   head: TeamEntryHead,
 ): MobileEvidenceFeedState {
+  const entries = mergeMobileEntries(state.entries, { entries: [head] });
+  const entriesChanged = entries.length !== state.entries.length
+    || entries.some((entry, index) => !sameEntryHead(entry, state.entries[index]!));
+  if (!entriesChanged) return state;
   return {
     ...state,
-    entries: mergeMobileEntries(state.entries, { entries: [head] }),
+    entries,
+  };
+}
+
+export function sliceVisibleMobileEntries(
+  entries: readonly TeamEntryHead[],
+  limit: number,
+): { visible: TeamEntryHead[]; hiddenCount: number } {
+  const cap = Math.max(1, limit);
+  const visible = entries.slice(0, cap);
+  return {
+    visible,
+    hiddenCount: Math.max(0, entries.length - visible.length),
   };
 }
 

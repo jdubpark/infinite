@@ -137,6 +137,8 @@ export function partitionMissionSubtasks(
   return { active, finished };
 }
 
+const STATUS_AWAITING_WORKER = new Set(["running", "waiting", "reported", "unavailable"]);
+
 export function summarizeMissionProgressChild(child: MissionProgressChild): string {
   if (child.kind === "not-created") return "Team not created yet";
   if (child.kind === "missing") return "Child team record missing";
@@ -151,13 +153,29 @@ export function summarizeMissionProgressChild(child: MissionProgressChild): stri
     member => member.workerStatus === "running" || member.workerStatus === "starting",
   ).length;
 
+  let sampledAwaiting = 0;
+  let unsampledAwaiting = 0;
+  let unknownAwaiting = 0;
   const issueCounts = new Map<string, number>();
   const bump = (label: string) => issueCounts.set(label, (issueCounts.get(label) ?? 0) + 1);
+
   for (const member of assignments) {
     const expectedActive = member.recordedStatus === "running" || member.recordedStatus === "waiting";
+    const awaitingWorker = STATUS_AWAITING_WORKER.has(member.recordedStatus) && !member.exitConfirmedAt;
+    if (awaitingWorker) {
+      if (member.workerStatus === "not-sampled") {
+        unsampledAwaiting += 1;
+      } else if (member.workerStatus === "unknown") {
+        unknownAwaiting += 1;
+      } else {
+        sampledAwaiting += 1;
+      }
+    }
     if (member.workerStatus === "recording-error" || member.workerStatus === "unavailable" || member.workerStatus === "mismatched") {
       bump(member.workerStatus);
-    } else if (expectedActive && (member.workerStatus === "exited" || member.workerStatus === "unknown" || member.workerStatus === "not-sampled")) {
+    } else if (expectedActive && member.workerStatus === "exited") {
+      bump("exited");
+    } else if (awaitingWorker && (member.workerStatus === "unknown" || member.workerStatus === "not-sampled")) {
       bump(member.workerStatus);
     }
   }
@@ -170,10 +188,20 @@ export function summarizeMissionProgressChild(child: MissionProgressChild): stri
     assignmentText = child.assignmentsTruncated
       ? `recorded ${recordedActive} active (${assignments.length} shown, truncated)`
       : `recorded ${recordedActive}/${assignments.length} active`;
-    const workerBase = child.assignmentsTruncated
-      ? `${liveWorkers} sampled ${liveWorkers === 1 ? "worker" : "workers"} live`
-      : `${liveWorkers} ${liveWorkers === 1 ? "worker" : "workers"} live`;
+    const incompleteSampling = Boolean(child.assignmentsTruncated) || unsampledAwaiting > 0 || unknownAwaiting > 0;
     const issueSummary = [...issueCounts.entries()].map(([label, count]) => `${count} ${label}`).join(", ");
+    let workerBase: string;
+    if (!incompleteSampling) {
+      workerBase = `${liveWorkers} ${liveWorkers === 1 ? "worker" : "workers"} live`;
+    } else if (sampledAwaiting === 0 && liveWorkers === 0) {
+      workerBase = child.assignmentsTruncated && unsampledAwaiting === 0 && unknownAwaiting === 0
+        ? "0 sampled workers live"
+        : "workers unsampled";
+    } else if (sampledAwaiting > 0 && liveWorkers <= sampledAwaiting) {
+      workerBase = `${liveWorkers} of ${sampledAwaiting} sampled ${sampledAwaiting === 1 ? "worker" : "workers"} live`;
+    } else {
+      workerBase = `${liveWorkers} sampled ${liveWorkers === 1 ? "worker" : "workers"} live`;
+    }
     workerText = issueSummary ? `${workerBase} (${issueSummary})` : workerBase;
   }
 

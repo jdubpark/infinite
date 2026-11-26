@@ -12,7 +12,7 @@ def install() -> None:
     if os.path.lexists(command) and not (command.is_symlink() and command.resolve().is_relative_to(parent)):
         raise SystemExit(f"An unmanaged command already exists at {command}")
     paths = (".nvmrc", "package.json", "scripts/cloud-check.py", "scripts/cloud-check/worker.py",
-             "scripts/cloud-check/project.py", "scripts/cloud-check/workspace_policy.py",
+             "scripts/cloud-check/project.py", "scripts/cloud-check/workspace_policy.py", "scripts/cloud-check/npm-shell.sh",
              "scripts/cloud-check/bootstrap.py", "scripts/cloud-check/linux-runner.json")
     files = {name: (project / name).read_bytes() for name in paths}
     fingerprint = hashlib.sha256(b"".join(hashlib.sha256(data).digest() for data in files.values()))

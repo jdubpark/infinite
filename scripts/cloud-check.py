@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import importlib.util
 import io
@@ -413,6 +412,7 @@ def capture(root: Path, cwd: Path, argv: list[str], worker: Path, project: Path,
     payload: dict[str, bytes] = {
         "worker.py": worker.read_bytes(),
         "project.py": project.read_bytes(),
+        "npm-shell.sh": (worker.parent / "npm-shell.sh").read_bytes(),
         "toolchain.json": toolchain,
         "source.pack": pack,
         "working-tree.tar": archive,
@@ -462,7 +462,7 @@ def outer_archive(payload: dict[str, bytes]) -> bytes:
 
 
 READY_LINE = b"INFINITE-CHECK-READY-v2\n"
-HANDSHAKE_TIMEOUT_SECONDS = 30
+HANDSHAKE_TIMEOUT_SECONDS = 120
 
 
 def stop_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -661,29 +661,6 @@ def workspace_marker() -> str | None:
     return text
 
 
-def admitted_npm_checkout(root: Path, scope: str | None) -> bool:
-    handle = os.environ.get("INFINITE_CHECK_LEASE", "")
-    if sys.platform != "linux" or not re.fullmatch(r"[1-9][0-9]*/[0-9]+", handle):
-        return False
-    owner, descriptor = (int(part) for part in handle.split("/"))
-    try:
-        parent = os.getppid()
-        while parent != owner:
-            if parent <= 1:
-                return False
-            fields = Path(f"/proc/{parent}/stat").read_bytes().rsplit(b") ", 1)[1].split()
-            parent = int(fields[1])
-        with open(f"/proc/{owner}/fd/{descriptor}", "rb") as lease:
-            required = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL
-            if fcntl.fcntl(lease, fcntl.F_GET_SEALS) & required != required:
-                return False
-            return json.loads(lease.read(8192)) == {
-                "checkout": str(root), "run": os.environ.get("INFINITE_CHECK_RUN_ID"), "workspace": scope or "-"
-            }
-    except (OSError, IndexError, ValueError, UnicodeError):
-        return False
-
-
 def enroll(root: Path, aliases: list[str], policy, scope: str | None,
            origin: bytes | None, common_hash: str) -> None:
     if not aliases or any(not ALIAS_RE.fullmatch(alias) for alias in aliases):
@@ -801,11 +778,6 @@ def main() -> int:
         cwd = Path.cwd().resolve()
         cwd.relative_to(root)
         host_scope = workspace_marker()
-        if args.npm_script is not None and not args.runner and not args.also_on and admitted_npm_checkout(root, host_scope):
-            event = os.environ.get("npm_lifecycle_event")
-            if not event:
-                raise RuntimeError("npm dispatch requires a lifecycle event")
-            os.execvp("sh", ["sh", "-c", args.npm_script + ' "$@"', event, *argv])
         runtime = Path(__file__).resolve().parent / "cloud-check"
         policy = runtime_policy(runtime)
         origin = origin_url(root)
@@ -903,9 +875,15 @@ def main() -> int:
         comparison = None
         if len(results) == 2 and current:
             comparison = "PARITY" if mode == "compose" else "REPLAY"
-            if code == 0 and results[0]["receipt"] != results[1]["receipt"]:
-                code = 4
-                print("cloud-check: replay receipts differ across runners", file=sys.stderr, flush=True)
+            if code == 0:
+                first, second = (job["receipt"] for job in results)
+                identity = {"machine", "engine"}
+                if any(not first.get(key) or not second.get(key) or first[key] == second[key] for key in identity):
+                    code = 4
+                    print("cloud-check: replay requires distinct guests and Docker engines", file=sys.stderr, flush=True)
+                elif {k: v for k, v in first.items() if k not in identity} != {k: v for k, v in second.items() if k not in identity}:
+                    code = 4
+                    print("cloud-check: replay receipts differ across runners", file=sys.stderr, flush=True)
             verdict = "PASS" if code == 0 else "FAIL"
             print(f"{comparison} {verdict} runners={results[0]['runner']},{results[1]['runner']}", flush=True)
 

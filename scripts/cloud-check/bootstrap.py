@@ -14,7 +14,7 @@ import tempfile
 import time
 
 os.umask(0o022)
-allowed = {"worker.py", "project.py", "toolchain.json", "snapshot.json", "source.pack", "working-tree.tar"}
+allowed = {"worker.py", "project.py", "npm-shell.sh", "toolchain.json", "snapshot.json", "source.pack", "working-tree.tar"}
 interrupted = 0
 def admit_workspace():
     if len(sys.argv) != 2:
@@ -209,7 +209,6 @@ try:
         token = secrets.token_hex(16)
         run_id = "iv-" + token
         env["INFINITE_CHECK_RUN_ID"] = run_id
-        env["INFINITE_CHECK_WORKSPACE"] = sys.argv[1]
         env["INFINITE_CHECK_HOME"] = private_home
         systemd = systemd_probe(token, base, env)
         try:

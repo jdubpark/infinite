@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import importlib.util
 import json
@@ -18,6 +17,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from urllib.parse import urlsplit
 
 
 PAYLOAD = pathlib.Path(__file__).resolve().parent
@@ -159,7 +159,7 @@ def verify_linux_profile(expected: object, git_version: str) -> dict[str, str]:
     return actual
 
 
-def private_env(home: pathlib.Path, temp: pathlib.Path, marker: pathlib.Path, run_id: str) -> dict[str, str]:
+def private_env(home: pathlib.Path, temp: pathlib.Path, run_id: str) -> dict[str, str]:
     config = home / ".npmrc"
     config.write_text("fund=false\naudit=false\n")
     git_config = home / ".gitconfig"
@@ -188,13 +188,30 @@ def private_env(home: pathlib.Path, temp: pathlib.Path, marker: pathlib.Path, ru
         "GIT_CONFIG_GLOBAL": str(git_config),
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
-        "INFINITE_CLOUD_CHECK": str(marker),
         "INFINITE_CHECK_RUN_ID": run_id,
         "COMPOSE_PROJECT_NAME": run_id,
     }
     for key in ("ANDROID_HOME", "ANDROID_SDK_ROOT", "JAVA_HOME"):
         if key in os.environ:
             env[key] = os.environ[key]
+    try:
+        descriptor = os.open("/etc/infinite-check-proxy", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return env
+    with os.fdopen(descriptor, "rb") as config:
+        info = os.fstat(config.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_size > 1024:
+            raise CheckError("runner proxy configuration is not administrator-owned")
+        proxy = config.read(1025).decode("ascii").strip()
+    endpoint = urlsplit(proxy)
+    if endpoint.scheme != "http" or not endpoint.hostname or endpoint.username or endpoint.password or endpoint.path not in ("", "/") or endpoint.query or endpoint.fragment:
+        raise CheckError("runner proxy must be a credential-free HTTP endpoint")
+    bypass = "localhost,127.0.0.1,::1"
+    env.update(http_proxy=proxy, https_proxy=proxy, HTTP_PROXY=proxy, HTTPS_PROXY=proxy, no_proxy=bypass, NO_PROXY=bypass)
+    docker_config = home / ".docker"
+    docker_config.mkdir(mode=0o700, exist_ok=True)
+    (docker_config / "config.json").write_text(json.dumps({"proxies": {"default": {
+        "httpProxy": proxy, "httpsProxy": proxy, "noProxy": bypass}}}))
     return env
 
 
@@ -421,7 +438,7 @@ def main() -> int:
             raise CheckError("snapshot status entries are missing")
         if not isinstance(status.get("omitted_untracked", 0), int) or status.get("omitted_untracked", 0) < 0:
             raise CheckError("snapshot omitted-file count is invalid")
-        expected_files = ("worker.py", "project.py", "toolchain.json", "source.pack", "working-tree.tar")
+        expected_files = ("worker.py", "project.py", "npm-shell.sh", "toolchain.json", "source.pack", "working-tree.tar")
         for name in expected_files:
             path = PAYLOAD / name
             if not path.is_file() or not isinstance(hashes.get(name), str) or sha256_file(path) != hashes[name]:
@@ -446,9 +463,7 @@ def main() -> int:
         home = pathlib.Path(os.environ["INFINITE_CHECK_HOME"])
         temp = RUN_DIR / "x"
         temp.mkdir(mode=0o700)
-        marker = RUN_DIR / "cloud-executor"
-        marker.write_text("infinite-cloud-check-v1\n")
-        env = private_env(home, temp, marker, run_id)
+        env = private_env(home, temp, run_id)
         GIT_ENV = env
         if legacy:
             node, npm, git_version = ensure_pin(pin)
@@ -459,11 +474,6 @@ def main() -> int:
             node, npm = "", ""
         profile = verify_linux_profile(pin.get("runner"), git_version)
         checkout = RUN_DIR / "t"
-        lease = os.memfd_create("cloud-check-lease", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
-        binding = {"checkout": str(checkout), "run": run_id, "workspace": os.environ["INFINITE_CHECK_WORKSPACE"]}
-        os.write(lease, json.dumps(binding).encode())
-        fcntl.fcntl(lease, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL)
-        env["INFINITE_CHECK_LEASE"] = f"{os.getpid()}/{lease}"
         checkout.mkdir()
         git(checkout, "init", "--quiet")
         git(checkout, "config", "core.autocrlf", "false")
@@ -492,6 +502,14 @@ def main() -> int:
             raise CheckError("reconstructed working tree status does not match snapshot metadata")
         if git(checkout, "rev-parse", "HEAD", capture=True).decode("ascii").strip() != base:
             raise CheckError("reconstructed HEAD does not match caller base")
+        wrapper = checkout / "scripts/cloud-npm.sh"
+        if wrapper.is_file() and b'cloud-check.py" --npm-script "$script"' in wrapper.read_bytes():
+            shell_dir = RUN_DIR / "bin"
+            shell_dir.mkdir(mode=0o700)
+            shell = shell_dir / "sh"
+            shutil.copyfile(PAYLOAD / "npm-shell.sh", shell)
+            shell.chmod(0o700)
+            env["PATH"] = str(shell_dir) + os.pathsep + env["PATH"]
 
         snapshot_state = {
             "base_oid": base,
@@ -502,6 +520,12 @@ def main() -> int:
         snapshot_id = sha256_bytes(json.dumps(snapshot_state, sort_keys=True, separators=(",", ":")).encode("utf-8"))
         receipt = {"base": base, "snapshot": snapshot_id, "envelope": sha256_file(PAYLOAD / "snapshot.json"),
                    "mode": "npm" if legacy else mode, "profile": profile, "kernel": platform.release()}
+        engine = version("docker", ["info", "--format", "{{.ID}}"])
+        machine_id = pathlib.Path("/etc/machine-id").read_text().strip()
+        if not engine or engine in ("<no value>", "<nil>") or len(machine_id) != 32:
+            raise CheckError("runner identity is unavailable")
+        receipt["engine"] = sha256_bytes(engine.encode())
+        receipt["machine"] = sha256_bytes(machine_id.encode())
         lock_hash = ""
         if legacy:
             lockfile = checkout / "package-lock.json"

@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import { randomBytes, randomUUID } from "node:crypto";
 import { workerCall, type WorkerError } from "../packages/host/src/ipc.js";
 import { readEvents } from "../packages/host/src/vault.js";
+import { DEFAULT_TERMINAL_SIZE, readTerminalSizeIndex, TERMINAL_SIZE_INDEX_FILE } from "../packages/host/src/terminal-size.js";
 import { waitFor } from "./helpers.js";
 import type { Bootstrap, ControlLease, Event, Receipt, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
 
@@ -15,16 +16,28 @@ const AGENT = String.raw`
 process.stdin.setRawMode(true);
 process.stdin.setEncoding("utf8");
 process.stdout.write("READY\r\n");
+const burst = size => {
+  let text = "";
+  for (let row = 1; text.length < size; row++) text += "\x1b[3" + (row % 7 + 1) + "mROW " + row + " café 界 " + "lorem ipsum dolor sit amet ".repeat(3) + "\x1b[0m\r\n";
+  process.stdout.write(text + "BURST DONE\r\n");
+};
+let burstOnResize = 0;
+process.stdout.on("resize", () => {
+  if (burstOnResize) burst(burstOnResize);
+  burstOnResize = 0;
+});
 let pending = "";
 process.stdin.on("data", data => {
   pending += data;
   let end;
   while ((end = pending.indexOf("\n")) >= 0) {
-    const size = Number(pending.slice(0, end));
+    const command = pending.slice(0, end);
     pending = pending.slice(end + 1);
-    let text = "";
-    for (let row = 1; text.length < size; row++) text += "\x1b[3" + (row % 7 + 1) + "mROW " + row + " café 界 " + "lorem ipsum dolor sit amet ".repeat(3) + "\x1b[0m\r\n";
-    process.stdout.write(text + "BURST DONE\r\n");
+    if (command === "size") process.stdout.write("SIZE " + process.stdout.getWindowSize().join("x") + "\r\n");
+    else if (command.startsWith("burst-on-resize ")) {
+      burstOnResize = Number(command.slice(16));
+      process.stdout.write("ARMED\r\n");
+    } else burst(Number(command));
   }
 });
 `;
@@ -55,15 +68,28 @@ async function start(env: Record<string, string>) {
   worker.stderr.on("data", data => { diagnostics += data; });
   worker.stdin.end(JSON.stringify(bootstrap));
   const call = <T = WorkerState>(request: WorkerRequest, timeout?: number) => workerCall<T>(runDir, id, request, timeout);
-  const output = () => {
+  const read = (type: Event["type"]) => {
     const events: Event[] = [];
     for (let cursor = 0, more = true; more;) {
-      const page = readEvents(join(stateDir, "sessions", id, "events"), key, id, cursor, 200, new Set(["output"]));
+      const page = readEvents(join(stateDir, "sessions", id, "events"), key, id, cursor, 200, new Set([type]));
       events.push(...page.events);
       cursor = page.cursor;
       more = page.more;
     }
-    return events.map(event => String(event.data.text));
+    return events;
+  };
+  const output = () => read("output").map(event => String(event.data.text));
+  const sizes = async () => {
+    await call<Receipt>({ op: "raw", requestId: randomUUID(), text: "size\n" });
+    const { screen } = await waitFor(() => call({ op: "state", screen: true }), state => /SIZE \d+x\d+/.test(state.screen), 60_000);
+    const [, cols, rows] = /SIZE (\d+)x(\d+)/.exec(screen)!;
+    const index = readTerminalSizeIndex(join(stateDir, "sessions", id, TERMINAL_SIZE_INDEX_FILE), key, id).entries.at(-1);
+    return {
+      program: { cols: Number(cols), rows: Number(rows) },
+      state: (await call({ op: "state" })).terminalSize,
+      index: index && { cols: index.cols, rows: index.rows },
+      resizes: read("lifecycle").filter(event => event.data.event === "resize").length,
+    };
   };
   const stop = async (agent?: number) => {
     if (agent) try { process.kill(agent, "SIGKILL"); } catch {}
@@ -84,7 +110,7 @@ async function start(env: Record<string, string>) {
     }, state => Boolean(state?.screen.includes("READY")));
   } catch (error) { await stop(); throw error; }
   return {
-    call, output, stop,
+    call, output, sizes, stop,
     burst: (size: number) => call<Receipt>({ op: "raw", requestId: randomUUID(), text: `${size}\n` }),
     synced: () => JSON.parse(readFileSync(report, "utf8")) as { synced: number; largest: number },
   };
@@ -161,5 +187,29 @@ test("a failed journal sync during an output flush enters recording-error and re
     assert.equal(state.seq, worker.synced().synced, "the worker reports only events whose sync succeeded");
   } finally {
     await worker.stop(agent);
+  }
+});
+
+test("a resize refused by a full output queue leaves the program, the worker's state, the journal and the size index at the old size", { timeout: 90_000 }, async () => {
+  const worker = await start({ INFINITE_TEST_TERMINAL_DRAIN_DELAY_MS: "5000" });
+  try {
+    await worker.call<Receipt>({ op: "raw", requestId: randomUUID(), text: `burst-on-resize ${BURST}\n` });
+    await waitFor(() => worker.call({ op: "state", screen: true }), state => state.screen.includes("ARMED"));
+    await assert.rejects(worker.call({ op: "resize", cols: 100, rows: 30 }), { message: "Snapshot output queue is full" });
+    const old = { ...DEFAULT_TERMINAL_SIZE };
+    assert.deepEqual(await worker.sizes(), { program: old, state: old, index: old, resizes: 0 });
+  } finally {
+    await worker.stop();
+  }
+});
+
+test("a resize refused at the drain deadline leaves the program, the worker's state, the journal and the size index at the old size", { timeout: 60_000 }, async () => {
+  const worker = await start({ INFINITE_TEST_TERMINAL_DRAIN_DELAY_MS: "1500" });
+  try {
+    await assert.rejects(worker.call({ op: "resize", cols: 100, rows: 30 }), { message: "Terminal renderer is busy" });
+    const old = { ...DEFAULT_TERMINAL_SIZE };
+    assert.deepEqual(await worker.sizes(), { program: old, state: old, index: old, resizes: 0 });
+  } finally {
+    await worker.stop();
   }
 });

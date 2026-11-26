@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import * as Crypto from "expo-crypto";
 import {
-  connectionKey, getTeamEntry, listTeamEntries, TEAM_ENTRY_KINDS, withdrawTeamEntry,
-  type Connection, type Me, type TeamEntryDetail, type TeamEntryHead, type TeamEntryKind,
+  connectionKey, getTeamEntry, listTeamEntries, TEAM_ENTRY_KINDS,
+  type Connection, type TeamEntryDetail, type TeamEntryHead, type TeamEntryKind,
 } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
@@ -47,12 +46,10 @@ type SheetState = {
 export function TeamEvidenceSection({
   connection,
   team,
-  me,
   onOpenSession,
 }: {
   connection: Connection;
   team: TeamView;
-  me: Me | null;
   onOpenSession: (sessionId: string) => void;
 }) {
   const scopeKey = `${connectionKey(connection)}/${team.id}`;
@@ -67,7 +64,6 @@ export function TeamEvidenceSection({
     loading: false,
     error: "",
   });
-  const [withdrawing, setWithdrawing] = useState(false);
 
   const epochRef = useRef(0);
   const highWaterRef = useRef<{ key: string; cursor: number }>({ key: scopeKey, cursor: 0 });
@@ -226,46 +222,6 @@ export function TeamEvidenceSection({
     });
   }
 
-  function confirmWithdraw(head: TeamEntryHead) {
-    const epoch = epochRef.current;
-    const targetKey = scopeKey;
-    const targetTeamId = team.id;
-    Alert.alert("Withdraw this entry?", "Marks the entry as withdrawn on the host blackboard. It remains visible as withdrawn.", [
-      { text: "Keep entry", style: "cancel" },
-      {
-        text: "Withdraw",
-        style: "destructive",
-        onPress: () => {
-          void (async () => {
-            if (epoch !== epochRef.current) return;
-            setWithdrawing(true);
-            try {
-              const result = await withdrawTeamEntry(connection, targetTeamId, head.entryId, Crypto.randomUUID());
-              if (epoch !== epochRef.current) return;
-              const updatedHead: TeamEntryHead = { ...head, state: result.state };
-              setExtraState(prev => ({
-                key: targetKey,
-                entries: mergeMobileEntries(prev.key === targetKey ? prev.entries : [], { entries: [updatedHead] }),
-                cursor: prev.key === targetKey ? prev.cursor : 0,
-                more: prev.key === targetKey ? prev.more : false,
-              }));
-              setSheetState(prev => (prev.key === targetKey && prev.detail?.head.entryId === head.entryId
-                ? { ...prev, detail: { ...prev.detail, head: updatedHead } }
-                : prev));
-              poll.refresh();
-            } catch (error) {
-              if (epoch === epochRef.current) {
-                Alert.alert("Withdraw failed", error instanceof Error ? error.message : "Could not withdraw entry.");
-              }
-            } finally {
-              if (epoch === epochRef.current) setWithdrawing(false);
-            }
-          })();
-        },
-      },
-    ]);
-  }
-
   const detailHead = scopedSheet.detail?.head ?? mergedEntries.find(item => item.entryId === scopedSheet.selectedId);
   const formatted = scopedSheet.detail ? formatEntryBodySummary(scopedSheet.detail.body) : null;
   const authorMember = detailHead?.authorMemberId
@@ -398,15 +354,6 @@ export function TeamEvidenceSection({
               onOpenSession(authorMember.sessionId);
             }}
           /> : null}
-          {me?.role === "owner" && detailHead && detailHead.state !== "withdrawn" ? (
-            connection.relay ? <Text style={t.note}>Direct host connection required to withdraw entries.</Text> : <Button
-              compact
-              destructive
-              title={withdrawing ? "Withdrawing…" : "Withdraw entry"}
-              disabled={withdrawing}
-              onPress={() => confirmWithdraw(detailHead)}
-            />
-          ) : null}
         </View>
       </ScrollView>
     </Sheet>

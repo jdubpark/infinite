@@ -100,3 +100,18 @@ test("a refused resize arrives as a resizeRefusal frame on an open duplex stream
     abort.abort(); await reading;
   } finally { abort.abort(); await r.stop(); }
 });
+
+test("a newer resize cancels the pending retry of a refused one and restarts the bounded retries", { timeout: 90_000 }, async () => {
+  const r = await rig();
+  try {
+    writeFileSync(r.gate, "");
+    r.pty.resize(90, 25);
+    while (r.drains() < 1) await new Promise(resolve => setTimeout(resolve, 10));
+    await new Promise(resolve => setTimeout(resolve, 1130));
+    r.pty.resize(100, 28);
+    await waitFor(async () => r.drains(), count => count >= 5, 40_000);
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    assert.equal(r.drains(), 5, "first send, the newer send, then three retries: the stale retry did not fire");
+    assert.deepEqual(await r.size(), { cols: 110, rows: 30 });
+  } finally { await r.stop(); }
+});

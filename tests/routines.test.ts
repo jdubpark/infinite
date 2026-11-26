@@ -246,7 +246,7 @@ test("a pending project run prevents overlap and launch is skipped when the appr
     const created = await service.create(f.create()); advance(30); await service.tick();
     assert.equal(f.launched.length, 0); assert.match(service.get(created.id).reason!, /active work/);
   } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
-  const second = setup(); const service2 = second.createService();
+  const second = setup({ busy: async () => true }); const service2 = second.createService();
   try {
     const req = second.create({ expiresAt: new Date(Date.now() + 1000).toISOString(), startsAt: new Date(Date.now() + 10).toISOString() });
     const created = await service2.create(req); advance(30); await service2.tick();

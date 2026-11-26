@@ -111,7 +111,7 @@ struct CmuxWorkspaceView: View {
                     }.opacity(!model.attached || model.attaching ? 1 : 0)
                         .disabled(model.attached || model.attaching || model.busy || !model.connected)
                     Toggle("Enable input", isOn: Binding(get: { model.inputEnabled }, set: { model.setInputEnabled($0) })).toggleStyle(.checkbox).disabled(!model.attached || !model.connected || !model.snapshotReady)
-                    Toggle("Direct keys", isOn: $model.directInput).toggleStyle(.checkbox).disabled(!model.inputEnabled)
+                    Toggle("Direct keys", isOn: Binding(get: { model.directInput }, set: { model.setDirectInput($0) })).toggleStyle(.checkbox).disabled(!model.inputEnabled)
                     Button { terminateID = id } label: { Image(systemName: "stop.circle") }.help("Terminate this server terminal").disabled(model.busy || !model.connected)
                 }.padding(10)
                 GeometryReader { area in

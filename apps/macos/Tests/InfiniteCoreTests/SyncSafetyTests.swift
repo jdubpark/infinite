@@ -131,8 +131,6 @@ final class SyncSafetyTests: XCTestCase {
         XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? NSNumber)?.intValue, 0o600)
     }
 
-    /// The installed app keeps the draft key and folder it always used; every other build gets its own, so a
-    /// rehearsal copy or unbundled binary never reads, rotates, or writes beside the installed app's drafts.
     func testDraftLocationIsTheInstalledAppsOnlyForItsBundleID() {
         XCTAssertEqual(DraftLocation(bundleID: "dev.infinite.desktop").service, "dev.infinite.desktop.device")
         XCTAssertEqual(DraftLocation(bundleID: "dev.infinite.desktop").directory, "Infinite/Drafts")
@@ -184,7 +182,6 @@ final class SyncSafetyTests: XCTestCase {
         let components = try JSON.array([.object(["id": .string("component-a")])]).data()
         let detail = try JSON.object(["component": .object(["id": .string("component-a")]), "relationships": .array([])]).data()
 
-        // Exercise overview-first and knowledge-first writer orders, then cold-open as an offline reader.
         try await store.mergeOverview(host: "host-A", credential: "credential-A", workspace: "workspace-4",
                                       membershipRevision: 4, data: overview)
         try await store.mergeKnowledge(host: "host-A", credential: "credential-A", workspace: "workspace-4",

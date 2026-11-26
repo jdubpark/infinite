@@ -1,6 +1,5 @@
 import Foundation
 
-/// Delays stale display warnings while keeping request and control state immediate.
 @MainActor final class DisplayFreshness {
     private var stale = false
     private var task: Task<Void, Never>?

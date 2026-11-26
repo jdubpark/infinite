@@ -2,7 +2,6 @@ import Foundation
 import CryptoKit
 import Security
 
-/// Compatibility with Infinite's existing remote-v1 protocol. It has no forward secrecy.
 public struct RemoteHandshake {
     private let key: SymmetricKey
     public let hello: JSON

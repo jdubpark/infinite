@@ -1,8 +1,6 @@
 import SwiftUI
 import InfiniteCore
 
-/// One mission: the coordinator's open questions first, then its subtasks by repository, each
-/// opening its subteam's page, and a box to steer the coordinator.
 struct MissionDetailView: View {
     @ObservedObject var app: AppModel
     @ObservedObject var model: MissionModel
@@ -83,12 +81,9 @@ struct MissionDetailView: View {
     }
 
     @ViewBuilder private var decisions: some View {
-        // A cancelled mission's unanswered question is no longer for the owner; its history keeps the record.
         let open = mission.ended ? [] : mission.openDecisions
         if !open.isEmpty {
             section("Decisions for you", count: open.count) {
-                // Keyed by decision ID: when polling drops an answered question, a typed draft stays
-                // with its own question instead of moving to the next card.
                 let revision = mission.revision
                 ForEach(open) { decision in
                     DecisionCard(decision: decision.value, caption: caption(decision), disabled: !model.canAct || !mission.canAnswer) { text in
@@ -99,13 +94,11 @@ struct MissionDetailView: View {
             }
         }
     }
-    /// The coordinator asks every owner question; one escalated from a subteam names it.
     private func caption(_ decision: MissionDecision) -> String {
         let asker = mission.origin(of: decision).map { "Coordinator, for \($0.title) in \(repoName($0.repoProjectID))" } ?? "Coordinator"
         return "\(asker) · \(teamDate(decision.value["createdAt"].string))"
     }
 
-    /// The coordinator's claim that every subtask finished. It is a report, not acceptance.
     @ViewBuilder private var result: some View {
         if mission.result != .null {
             VStack(alignment: .leading, spacing: 10) {
@@ -128,7 +121,6 @@ struct MissionDetailView: View {
         section("Subtasks", count: total) {
             if total > 0 { Text("\(done) of \(total) done").font(.caption).foregroundStyle(.secondary) }
             if !mission.dispatchSummary.isEmpty {
-                // The coordinator's latest plan can run long; it folds so the subtasks stay in view.
                 FoldingText(text: mission.dispatchSummary, lines: 4, secondary: true)
             }
             if mission.subtasks.isEmpty { Text("The coordinator has not dispatched any subtasks yet.").font(.callout).foregroundStyle(.secondary) }
@@ -216,8 +208,6 @@ struct MissionDetailView: View {
     }
 }
 
-/// One subtask: what it does, in which repository, how large a subteam runs it, and where it stands.
-/// A subtask whose subteam has started opens that team's page.
 struct SubtaskRow: View {
     let subtask: MissionSubtask
     let repo: String
@@ -258,8 +248,6 @@ struct SubtaskRow: View {
     }
 }
 
-/// Text clipped to a few lines that offers "Show all" exactly when the clip hides something. A hidden copy
-/// laid out at the same width measures the full height, so wrapping, newlines, and window width all count.
 struct FoldingText: View {
     let text: String
     let lines: Int
@@ -280,7 +268,6 @@ struct FoldingText: View {
                         .background(GeometryReader { full in Color.clear.preference(key: Clipped.self, value: full.size.height > shown.size.height + 1) })
                 })
                 .onPreferenceChange(Clipped.self) { clipped = $0 }
-            // Once expanded nothing is clipped, so "Show less" stays until the owner folds it again.
             if clipped || expanded { Button(expanded ? "Show less" : "Show all") { expanded.toggle() }.buttonStyle(.link).font(.caption) }
         }
     }

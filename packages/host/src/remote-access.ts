@@ -57,11 +57,17 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (method === "GET" && /^\/api\/project-groups\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
   if (["PUT", "DELETE"].includes(method) && /^\/api\/project-groups\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
   if (["GET", "POST"].includes(method) && url.pathname === "/api/missions") return true;
-  const mission = /^\/api\/missions\/([^/]+)(?:\/(steer|pause|resume|cancel|extend|answer\/([^/]+)))?$/.exec(url.pathname);
-  if (mission && UUID.test(mission[1])) return method === "GET" ? !mission[2]
-    : method === "POST" && Boolean(mission[2]) && (!mission[3] || UUID.test(mission[3]));
-  const teamContext = /^\/api\/teams\/([^/]+)\/context$/.exec(url.pathname);
+  const mission = /^\/api\/missions\/([^/]+)(?:\/(progress|steer|pause|resume|cancel|extend|answer\/([^/]+)))?$/.exec(url.pathname);
+  if (mission && UUID.test(mission[1])) return method === "GET" ? (!mission[2] || mission[2] === "progress")
+    : method === "POST" && Boolean(mission[2]) && mission[2] !== "progress" && (!mission[3] || UUID.test(mission[3]));
+  const teamContext = /^\/api\/teams\/([^/]+)\/(context|context-usage)$/.exec(url.pathname);
   if (teamContext) return method === "GET" && UUID.test(teamContext[1]);
+  const teamEntries = /^\/api\/teams\/([^/]+)\/entries(?:\/([^/]+)(?:\/(withdraw))?)?$/.exec(url.pathname);
+  if (teamEntries && UUID.test(teamEntries[1])) {
+    if (!teamEntries[2]) return method === "GET";
+    if (!UUID.test(teamEntries[2])) return false;
+    return teamEntries[3] === "withdraw" ? method === "POST" : method === "GET";
+  }
   if (method === "GET" && /^\/api\/projects\/[a-z0-9-]{1,80}\/graph\/map$/.test(url.pathname)) return true;
   const team = /^\/api\/teams\/([^/]+)(?:\/(steer|pause|resume|continue|cancel|decisions\/([^/]+)\/answer))?$/.exec(url.pathname);
   if (team && UUID.test(team[1])) return method === "GET" ? !team[2]

@@ -75,6 +75,34 @@ export function missionControls(
   };
 }
 
+export function missionCanAnswer(
+  mission: { status: MissionStatus; canAnswerPaused?: boolean },
+  role: string | undefined,
+  fresh: boolean,
+): boolean {
+  if (role !== "owner" || !fresh) return false;
+  return ["planning", "working", "needs-input"].includes(mission.status)
+    || (mission.status === "paused" && mission.canAnswerPaused === true);
+}
+
+export function missionComposerNotice(
+  mission: MissionState & { deadlineAt: string; clockStoppedAt?: string },
+  role: string | undefined,
+  now: number,
+): string | null {
+  if (role !== "owner") return "Only an owner can steer this mission or answer its decisions.";
+  if (["planning", "working", "needs-input"].includes(mission.status)) return null;
+  if (mission.status === "cancelled") return "This mission is cancelled. Its recorded subtasks and evidence remain available above.";
+  if (mission.status === "ready-for-review") return "This mission is ready for review. Inspect the subtasks and evidence above.";
+  const available = missionControls(mission, "owner", true, now);
+  if (available.resume) return "Resume this mission before sending new direction.";
+  if (available.extend) return "Extend this mission's time limit to continue before sending new direction.";
+  if (mission.status === "blocked") {
+    return "This mission is blocked and cannot take new direction. Inspect the subtasks and evidence above, cancel it, or start a new mission.";
+  }
+  return "This mission cannot take new direction right now.";
+}
+
 export function missionExtendChoices(maxMinutes: number): { minutes: number; label: string; ownLimit: boolean }[] {
   const minutes = [60, 360, 1440];
   if (Number.isInteger(maxMinutes) && maxMinutes >= 5 && maxMinutes <= 1440 && !minutes.includes(maxMinutes)) minutes.push(maxMinutes);

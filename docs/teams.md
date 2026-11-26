@@ -4050,9 +4050,15 @@ a five-minute quiet window so a silent review can recover before a goal deadline
 One replacement then continues the same task in that workspace, with feedback
 that the earlier attempt stalled. A second
 stall on the same assignment blocks the team with the reason "An agent showed no
-activity twice on the same assignment." Activity means attention activity from the
-member's terminal or hooks. Screen output also counts, so an agent stuck behind an
-animated spinner looks active. Older runs blocked by the former one-hour limit
+activity twice on the same assignment." Activity means attention signals from hooks
+or protocol, or genuine substantive screen changes on hookless terminals; animated
+spinner glyphs, elapsed timers, and status-line token or cost ticker redraws alone do
+not reset the stall window (the session records `spinnerOnlySince` when raw output
+continues without substantive screen changes). Team views also expose host-derived
+`waitReasons` (`worker-slot`, `dependency`, `owner-decision`, `provider-prompt`,
+`provider-limit`, `integration-order`, `linear-sync`, `spinner-only`, `stalled`)
+projected strictly from recorded team and member state without guessing progress.
+Older runs blocked by the former one-hour limit
 still resume. A team blocked only by a stall can resume with
 `infinite team resume ID`. That starts a fresh plan from the integration commit;
 stopped member copies remain subject to the workspace retention policy.

@@ -59,9 +59,28 @@ for (const size of [0, 1024 * 1024])
     }
   });
 
+test("a long reply whose transfer straddles the caller's blocked event loop is returned", async () => {
+  const line = JSON.stringify({ result: { pad: "x".repeat(1024 * 1024) } }) + "\n";
+  const worker = await standIn(socket => socket.once("data", () => {
+    socket.write(line.slice(0, 10));
+    setImmediate(() => setImmediate(() => {
+      socket.end(line.slice(10));
+      block(750);
+    }));
+  }));
+  try {
+    const call = workerCallAt<{ pad: string }>(worker.path, { op: "state" }, 250).then(value => value.pad.length);
+    assert.deepEqual(await settle(call, 5000), { value: 1024 * 1024 });
+  } finally {
+    worker.close();
+  }
+});
+
 for (const replies of [true, false])
-  test(`a call whose caller blocks before the request is sent ${replies ? "returns the reply" : "still times out on a silent worker"}`, async () => {
+  test(`a call whose caller blocks before the request is sent ${replies ? "returns the reply" : "still sends it and times out on a silent worker"}`, async () => {
+    let requests = 0;
     const worker = await standIn(socket => socket.once("data", () => {
+      requests += 1;
       if (replies) socket.end(reply);
     }));
     try {
@@ -70,7 +89,7 @@ for (const replies of [true, false])
         block(750);
         resolve(call);
       }));
-      assert.deepEqual(outcome, replies ? { value: result } : timedOut);
+      assert.deepEqual({ outcome, requests }, { outcome: replies ? { value: result } : timedOut, requests: 1 });
     } finally {
       worker.close();
     }
@@ -83,6 +102,24 @@ test("a worker that never replies still times out after 4 s", async () => {
     assert.deepEqual(await settle(workerCallAt(worker.path, { op: "state" }), 10_000), timedOut);
     const elapsed = performance.now() - started;
     assert.ok(elapsed >= 3_900 && elapsed < 6_000, `timed out after ${Math.round(elapsed)} ms`);
+  } finally {
+    worker.close();
+  }
+});
+
+test("a partial reply followed by silence times out one timeout after its last byte", async () => {
+  let lastByte = 0;
+  const worker = await standIn(socket => socket.once("data", () => {
+    setTimeout(() => {
+      socket.write(reply.slice(0, 10));
+      lastByte = performance.now();
+    }, 100);
+  }));
+  try {
+    const outcome = await settle(workerCallAt(worker.path, { op: "state" }, 500), 5000);
+    const quiet = performance.now() - lastByte;
+    assert.deepEqual(outcome, timedOut);
+    assert.ok(lastByte > 0 && quiet >= 490 && quiet < 2_000, `timed out ${Math.round(quiet)} ms after the last byte`);
   } finally {
     worker.close();
   }

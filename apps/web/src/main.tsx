@@ -776,6 +776,7 @@ function SessionView({
             Started {time(session.createdAt)} <span>·</span>{" "}
             {session.pid ? `PID ${session.pid}` : "No live process"}
           </p>
+          {session.outputTailIncomplete && <p className="session-meta">The recording may be missing the session’s last output.</p>}
           {session.execution && (
             <p className="session-meta">
               <span className="session-freshness-label">{view.stale ? "Last received tools:" : "Tools:"}</span>{" "}{session.execution.location === "cloud" ? "Cloud" : "Laptop"} <span>·</span>{" "}

@@ -237,6 +237,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   let handoffTimer: ReturnType<typeof setTimeout> | undefined, handoffBusy = false, handoffNotice = "";
   let renewal: ReturnType<typeof setInterval> | undefined;
   let lastStatus: Status = session.status;
+  let tailIncomplete = false;
   const stop = () => { restoreTerminal(); process.exit(0); };
   const owner = me.role === "owner" && me.terminal.raw;
   const resize = () => {
@@ -437,6 +438,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
             }
             if (page.cursor !== undefined) cursor = page.cursor;
             if (page.state) { lastStatus = page.state.status; if (page.state.exitCode !== undefined) process.exitCode = page.state.exitCode; }
+            if (page.state?.outputTailIncomplete) tailIncomplete = true;
             if (!online && page.state) {
               progress.stop(); online = true;
               leasesSupported = Boolean(duplex && me.terminal.control && page.state.capabilities?.inputControl);
@@ -449,7 +451,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
               initialControl = false; warned = false;
             }
         }
-        if (["exited", "unavailable"].includes(lastStatus)) { notice(`Session ${lastStatus}. The recording remains on the host.`); break; }
+        if (["exited", "unavailable"].includes(lastStatus)) { notice(`Session ${lastStatus}. The recording remains on the host${tailIncomplete ? ", but may be missing the session's last output" : ""}.`); break; }
         throw new Error("Stream ended");
       } catch (error) {
         if (abort.signal.aborted) break;

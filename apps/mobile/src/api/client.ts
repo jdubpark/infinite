@@ -167,6 +167,7 @@ export type SessionRow = {
   createdAt: string;
   pid?: number;
   exitCode?: number;
+  outputTailIncomplete?: true;
   seq: number;
   attention: Attention;
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1 };

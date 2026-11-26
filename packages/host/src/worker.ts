@@ -58,6 +58,7 @@ import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrustAsync } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize, TERMINAL_SIZE_INDEX_FILE, TerminalBarrier, TerminalSizeIndex } from "./terminal-size.js";
+import { ptyTails } from "./pty-tail.js";
 import { SignalIndex } from "./signal-index.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
@@ -1640,6 +1641,7 @@ server.listen(workerSocket, async () => {
     };
     const onData = (data: string) => terminalBarrier.dispatch(() => output(data), Buffer.byteLength(data, "utf8"));
     child.onData(onData);
+    const tails = ptyTails(child, onData);
     const finalDrain = async () => {
       try {
         if (!hookServer || !transcriptWatch.reading) return;
@@ -1656,16 +1658,17 @@ server.listen(workerSocket, async () => {
         try { await runFinalDrain(launch, drainEnv); } finally { drainOpen = false; }
       } catch {}
     };
-    const exited = (exitCode: number) => {
+    const exited = (exitCode: number, forced = false) => {
       if (permissionChannel?.exited(exitCode)) return;
       native?.stop();
       void hybrid?.close().catch(() => {}); executor?.close();
       try {
         flush();
         controller = null;
-        state = { ...state, status: "exited", exitCode, control: null };
+        const tail = tails.marker(forced ? child : undefined);
+        state = { ...state, status: "exited", exitCode, control: null, ...tail };
         publish(applyLifecycle(attention, "exited", new Date().toISOString()));
-        append("lifecycle", { status: "exited", exitCode });
+        append("lifecycle", { status: "exited", exitCode, ...tail });
         signalIndex?.checkpoint(journal.seq);
         persist();
       } catch {
@@ -1699,9 +1702,10 @@ server.listen(workerSocket, async () => {
       sizeIndex.append(resumedEvent.seq, { cols: terminal.cols, rows: terminal.rows });
       persist();
       pty.onData(onData);
+      tails.track(pty);
       pty.onExit(onExit);
     };
-    endSession = () => terminalBarrier.dispatch(() => exited(0));
+    endSession = () => terminalBarrier.dispatch(() => exited(0, true));
   } catch (error) {
     state = { ...state, status: "exited", exitCode: 1 };
     publish(applyLifecycle(attention, "exited", new Date().toISOString()));

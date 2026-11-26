@@ -79,7 +79,7 @@ if (args[0] === "exec-server") {
             replayCompletedTurn = undefined;
           }
         }
-        else if (method === "environment/info") reply(await execute(params.environmentId, "fixture/info"));
+        else if (method === "environment/info") reply(await execute(params.environmentId, "environment/info"));
         else if (method === "thread/start") {
           threadId = randomUUID(); selections = params.environments;
           reply({ thread: thread() }); broadcast({ method: "thread/started", params: { thread: thread() } });

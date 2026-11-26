@@ -8,7 +8,13 @@ import { WebSocket, WebSocketServer } from "ws";
 import type { Signal } from "@infinite/attention";
 import type { AgentProfile, InputControl } from "./types.js";
 import { NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
-import { connectCodexEnvironments, type CodexEnvironmentClient, type CodexExecutor } from "./codex-environment.js";
+import {
+  connectCodexEnvironments,
+  type CodexEnvironmentClient,
+  type CodexEnvironmentPersistenceOptions,
+  type CodexEnvironmentStore,
+  type CodexExecutor,
+} from "./codex-environment.js";
 
 export function validateNativeCodexArgs(args: string[], initialPrompt = "", allowEmpty = false) {
   const values = new Set(["-m", "--model", "-c", "--config", "-a", "--ask-for-approval", "-s", "--sandbox"]);
@@ -66,6 +72,8 @@ export function nativeItemMessage(item: unknown): TranscriptMessage | undefined 
 export async function startNativeCodex(options: {
   profile: AgentProfile; cwd: string; env: Record<string, string>;
   execution?: Executor;
+  environmentState?: CodexEnvironmentPersistenceOptions;
+  environmentStore?: CodexEnvironmentStore;
   onExecutionUnavailable?: () => void;
   checkControl: (authority: InputControl) => void;
   onThread: (id: string) => void;
@@ -122,7 +130,13 @@ export async function startNativeCodex(options: {
     });
     child.stdout!.resume(); child.stderr!.resume();
     if (execution) {
-      environments = await connectCodexEnvironments({ endpoint, token, onDisconnect: options.onExecutionUnavailable });
+      environments = await connectCodexEnvironments({
+        endpoint,
+        token,
+        onDisconnect: options.onExecutionUnavailable,
+        ...(options.environmentState ? { persistence: options.environmentState } : {}),
+        ...(options.environmentStore ? { store: options.environmentStore } : {}),
+      });
       await environments.register(execution);
     }
     http.on("upgrade", (req, socket, head) => {
@@ -171,6 +185,15 @@ export async function startNativeCodex(options: {
             if (execution && method) {
               if (selecting && ["thread/start", "thread/resume", "thread/settings/update", "turn/start", "turn/settings/update"].includes(method)) { refuse("Execution is moving to the cloud. Retry after handoff completes."); return; }
               const executor = execution;
+              if (method === "turn/start" && threadId && environments) {
+                const decision = environments.checkDispatch({
+                  threadId,
+                  environmentId: executor.environmentId,
+                  cwd: executor.cwd,
+                  roots: executor.roots,
+                });
+                if (!decision.allowed) { refuse(decision.reason); return; }
+              }
               if (method === "initialize") message.params = { ...params, capabilities: { ...params?.capabilities, experimentalApi: true } };
               if (method === "thread/start" || method === "turn/start") {
                 message.params = { ...message.params, cwd: executor.cwd, runtimeWorkspaceRoots: executor.roots,
@@ -209,14 +232,26 @@ export async function startNativeCodex(options: {
             const message = JSON.parse(data.toString()) as Message;
             if (message.id === checkpointRequest) {
               checking = false;
-              ready = !message.error && message.result?.thread?.id === threadId;
+              const thread = message.result?.thread;
+              ready = !message.error && thread?.id === threadId;
+              if (ready && environments && execution && threadId && Array.isArray(thread?.environments)) {
+                try { environments.assertObservedEnvironments(threadId, thread.environments); } catch { ready = false; }
+              }
               return;
             }
-            if (observer && startRequest !== undefined && message.id === startRequest && message.result?.thread?.id) {
-              if (threadId && threadId !== message.result.thread.id) throw new Error("Native conversation changed");
-              threadId = message.result.thread.id;
-              environments?.observe({ method: "thread/started", params: { thread: { id: threadId } } });
-              options.onThread(threadId!);
+            if (observer && startRequest !== undefined && message.id === startRequest && typeof message.result?.thread?.id === "string" && message.result.thread.id) {
+              const startedThreadId: string = message.result.thread.id;
+              if (threadId && threadId !== startedThreadId) throw new Error("Native conversation changed");
+              threadId = startedThreadId;
+              environments?.observe({ method: "thread/started", params: { thread: { id: startedThreadId } } });
+              if (environments && execution) {
+                environments.confirmInitialPlacement({
+                  threadId: startedThreadId,
+                  executor: execution,
+                  reportedEnvironments: message.result.thread.environments,
+                });
+              }
+              options.onThread(startedThreadId);
             }
             if (observer && threadId && !ready && !checking && ["turn/started", "turn/completed"].includes(message.method ?? "")) {
               checking = true;
@@ -234,6 +269,10 @@ export async function startNativeCodex(options: {
             }
             const method = message.id === undefined ? undefined : pending.get(message.id);
             if (message.id !== undefined && !message.method) pending.delete(message.id);
+            if (!selecting && environments && threadId && (method === "thread/read" || method === "thread/resume") &&
+                Array.isArray(message.result?.thread?.environments) && environments.placement(threadId).status === "verified") {
+              try { environments.assertObservedEnvironments(threadId, message.result.thread.environments); } catch {}
+            }
             if (method === "thread/list" && Array.isArray(message.result?.data)) {
               message.result.data = message.result.data.filter((thread: { id: string }) => thread.id === threadId);
               message.result.nextCursor = null;

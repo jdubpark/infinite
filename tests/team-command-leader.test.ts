@@ -193,17 +193,26 @@ test("a stop while the leader runs kills its group as before", CASE, async () =>
   }
 });
 
-test("a command asked for after its stop never starts, and its scope hears of no process (INF-505)", CASE, async () => {
-  const run = new Run();
+test("a command whose stop comes before its start never starts, whether it was asked for after the stop or stopped while it waited for its turn, and its scope hears of no process (INF-505)", CASE, async () => {
+  const stopped = new Run(), waiting = new Run();
   const heard: (number | undefined)[] = [];
+  const started = (pid: number | undefined) => { heard.push(pid); };
+  let open!: () => void;
+  const turn = new Promise<void>(resolve => { open = resolve; });
   try {
-    run.controller.abort();
-    const result = await run.start(waits, { starting: () => undefined, started: pid => { heard.push(pid); } });
-    assert.deepEqual(heard, [undefined], "the scope heard of a started process");
-    assert.deepEqual(result, { exitCode: null, output: "", stdout: "", interrupted: true, truncated: false, leftover: false });
-    assert.equal(existsSync(run.leaderFile), false, "the command ran");
+    stopped.controller.abort();
+    const asked = await stopped.start(waits, { starting: () => undefined, started });
+    const queued = waiting.start(waits, { starting: () => turn, started });
+    waiting.controller.abort();
+    open();
+    const results = [asked, await queued];
+    assert.deepEqual(heard, [undefined, undefined], "the scope heard of a started process");
+    for (const result of results) assert.deepEqual(result, { exitCode: null, output: "", stdout: "", interrupted: true, truncated: false, leftover: false });
+    assert.deepEqual([existsSync(stopped.leaderFile), existsSync(waiting.leaderFile)], [false, false], "a command ran");
   } finally {
-    run.dispose();
+    open();
+    stopped.dispose();
+    waiting.dispose();
   }
 });
 

@@ -16,6 +16,7 @@ import {
   partitionMobileRoster,
   resolveSelectedEntryHead,
   sliceVisibleMobileEntries,
+  summarizeMobileListWaitReason,
   waitReasonLabel,
   waitReasonTone,
 } from "../apps/mobile/src/features/teams/inspector-model.ts";
@@ -749,4 +750,131 @@ test("spinnerOnlySince and stalledAt metadata are preserved in roster partitions
     [],
   );
   assert.deepEqual(memberScreenNotices(members[2]!), []);
+});
+
+test("summarizeMobileListWaitReason prioritizes wait reasons, reports extraCount, and sanitizes whitespace", () => {
+  const ordered = summarizeMobileListWaitReason(makeTeam({
+    status: "implementing",
+    waitReasons: [
+      { kind: "dependency", summary: "Waiting on task t1" },
+      { kind: "worker-slot", summary: "Waiting for slot" },
+      { kind: "stalled", summary: "  Implementer\n stalled \t without   activity  " },
+    ],
+  }));
+  assert.deepEqual(ordered, {
+    kind: "stalled",
+    label: "Stalled",
+    summary: "Implementer stalled without activity",
+    extraCount: 2,
+    tone: "error",
+  });
+
+  const decisionFirst = summarizeMobileListWaitReason(makeTeam({
+    status: "needs-input",
+    waitReasons: [
+      { kind: "spinner-only", summary: "Spinner redraws" },
+      { kind: "provider-prompt", summary: "Prompt pending" },
+      { kind: "owner-decision", summary: "Pick schema" },
+    ],
+  }));
+  assert.deepEqual(decisionFirst, {
+    kind: "owner-decision",
+    label: "Owner decision",
+    summary: "Pick schema",
+    extraCount: 2,
+    tone: "attention",
+  });
+
+  const promptFirst = summarizeMobileListWaitReason(makeTeam({
+    status: "implementing",
+    waitReasons: [
+      { kind: "worker-slot", summary: "Slot busy" },
+      { kind: "provider-prompt", summary: "Approval needed" },
+    ],
+  }));
+  assert.deepEqual(promptFirst, {
+    kind: "provider-prompt",
+    label: "Provider prompt",
+    summary: "Approval needed",
+    extraCount: 1,
+    tone: "attention",
+  });
+
+  const emptySummary = summarizeMobileListWaitReason(makeTeam({
+    status: "implementing",
+    waitReasons: [{ kind: "worker-slot", summary: "   \n\t  " }],
+  }));
+  assert.deepEqual(emptySummary, {
+    kind: "worker-slot",
+    label: "Worker slot",
+    summary: "",
+    extraCount: 0,
+    tone: undefined,
+  });
+
+  assert.equal(summarizeMobileListWaitReason(makeTeam({ status: "implementing", waitReasons: [], members: [] })), undefined);
+});
+
+test("summarizeMobileListWaitReason falls back to active current-revision spinnerOnlySince members and suppresses closed/stale/stopped/stalled cases", () => {
+  const fallback = summarizeMobileListWaitReason(makeTeam({
+    status: "implementing",
+    revision: 2,
+    waitReasons: undefined,
+    members: [
+      makeMember("m-stale", { revision: 1, status: "running", spinnerOnlySince: "2026-11-26T00:01:00.000Z", title: "Stale" }),
+      makeMember("m-stopped", { revision: 2, status: "stopped", spinnerOnlySince: "2026-11-26T00:02:00.000Z", title: "Stopped" }),
+      makeMember("m-reported", { revision: 2, status: "reported", spinnerOnlySince: "2026-11-26T00:03:00.000Z", title: "Reported" }),
+      makeMember("m-stalled", { revision: 2, status: "running", spinnerOnlySince: "2026-11-26T00:04:00.000Z", stalledAt: "2026-11-26T00:10:00.000Z", title: "Stalled" }),
+      makeMember("m-spin", { revision: 2, status: "waiting", spinnerOnlySince: "2026-11-26T00:12:00.000Z", title: "Implementer 2" }),
+    ],
+  }), iso => `fmt(${iso})`);
+  assert.deepEqual(fallback, {
+    kind: "spinner-only",
+    label: "Spinner-only",
+    summary: "Implementer 2 showing spinner redraws since fmt(2026-11-26T00:12:00.000Z)",
+    extraCount: 0,
+    tone: "attention",
+  });
+
+  const aheadOfLowerWait = summarizeMobileListWaitReason(makeTeam({
+    status: "implementing",
+    revision: 2,
+    waitReasons: [{ kind: "worker-slot", summary: "Slot 1 busy" }],
+    members: [
+      makeMember("m-spin-1", { revision: 2, status: "running", spinnerOnlySince: "invalid-date", title: "Scout 1" }),
+      makeMember("m-spin-2", { revision: 2, status: "waiting", spinnerOnlySince: "2026-11-26T00:14:00.000Z", title: "Scout 2" }),
+    ],
+  }));
+  assert.deepEqual(aheadOfLowerWait, {
+    kind: "spinner-only",
+    label: "Spinner-only",
+    summary: "Scout 1 showing spinner redraws",
+    extraCount: 2,
+    tone: "attention",
+  });
+
+  const suppressedByHigherWait = summarizeMobileListWaitReason(makeTeam({
+    status: "implementing",
+    revision: 2,
+    waitReasons: [{ kind: "stalled", summary: "Coordinator stalled" }],
+    members: [
+      makeMember("m-spin", { revision: 2, status: "running", spinnerOnlySince: "2026-11-26T00:12:00.000Z" }),
+    ],
+  }));
+  assert.deepEqual(suppressedByHigherWait, {
+    kind: "stalled",
+    label: "Stalled",
+    summary: "Coordinator stalled",
+    extraCount: 0,
+    tone: "error",
+  });
+
+  for (const closedStatus of ["cancelled", "no-change", "merged", "ready-for-review"] as const) {
+    assert.equal(summarizeMobileListWaitReason(makeTeam({
+      status: closedStatus,
+      revision: 2,
+      waitReasons: [{ kind: "stalled", summary: "Old wait reason" }],
+      members: [makeMember("m-spin", { revision: 2, status: "running", spinnerOnlySince: "2026-11-26T00:12:00.000Z" })],
+    })), undefined);
+  }
 });

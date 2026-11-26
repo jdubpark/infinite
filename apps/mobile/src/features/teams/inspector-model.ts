@@ -1,5 +1,5 @@
 import type { TeamEntryAuthorKind, TeamEntryAuthority, TeamEntryHead, TeamEntryKind, TeamEntryPage } from "../../api/client";
-import { ROLE_NAMES, shortDate, type TeamAcceptanceEvidence, type TeamMember, type TeamRole, type TeamTask, type TeamView, type TeamWaitReason, type TeamWaitReasonKind } from "./model";
+import { ROLE_NAMES, shortDate, type TeamAcceptanceEvidence, type TeamListItem, type TeamMember, type TeamRole, type TeamStatus, type TeamTask, type TeamView, type TeamWaitReason, type TeamWaitReasonKind } from "./model";
 
 const WAIT_REASON_LABELS: Record<TeamWaitReasonKind, string> = {
   "owner-decision": "Owner decision",
@@ -42,9 +42,84 @@ export function orderMobileWaitReasons(reasons: readonly TeamWaitReason[] | unde
   return reasons
     .map((reason, index) => ({ reason, index }))
     .sort((left, right) =>
-      WAIT_REASON_PRIORITY[left.reason.kind] - WAIT_REASON_PRIORITY[right.reason.kind] || left.index - right.index,
+      (WAIT_REASON_PRIORITY[left.reason.kind] ?? Number.MAX_SAFE_INTEGER)
+      - (WAIT_REASON_PRIORITY[right.reason.kind] ?? Number.MAX_SAFE_INTEGER)
+      || left.index - right.index,
     )
     .map(({ reason }) => reason);
+}
+
+const CLOSED_TEAM_STATUSES = new Set<TeamStatus>(["ready-for-review", "cancelled", "no-change", "merged"]);
+const SPINNER_FALLBACK_MEMBER_STATUSES = new Set(["running", "waiting"]);
+const SPINNER_ONLY_PRIORITY = WAIT_REASON_PRIORITY["spinner-only"];
+
+export type MobileListWaitReasonSummary = {
+  kind: TeamWaitReasonKind;
+  label: string;
+  summary: string;
+  extraCount: number;
+  tone: "error" | "attention" | undefined;
+};
+
+function normalizeWaitReasonSummary(summary: unknown): string {
+  return typeof summary === "string" ? summary.replace(/\s+/g, " ").trim() : "";
+}
+
+function memberSpinnerFallbackSummary(
+  member: Pick<TeamListItem["members"][number], "role" | "title" | "spinnerOnlySince">,
+  formatTime: (iso: string) => string,
+): string {
+  const title = member.title?.trim() || (ROLE_NAMES[member.role] ?? member.role);
+  const since = member.spinnerOnlySince?.trim() ? formatTime(member.spinnerOnlySince).trim() : "";
+  return since ? `${title} showing spinner redraws since ${since}` : `${title} showing spinner redraws`;
+}
+
+export function summarizeMobileListWaitReason(
+  team: Pick<TeamListItem, "status" | "revision" | "waitReasons" | "members">,
+  formatTime: (iso: string) => string = shortDate,
+): MobileListWaitReasonSummary | undefined {
+  if (CLOSED_TEAM_STATUSES.has(team.status)) return undefined;
+
+  const ordered = orderMobileWaitReasons(team.waitReasons);
+  const top = ordered[0];
+  const topPriority = top ? (WAIT_REASON_PRIORITY[top.kind] ?? Number.MAX_SAFE_INTEGER) : Number.MAX_SAFE_INTEGER;
+
+  if (top && topPriority <= SPINNER_ONLY_PRIORITY) {
+    return {
+      kind: top.kind,
+      label: waitReasonLabel(top.kind) ?? top.kind,
+      summary: normalizeWaitReasonSummary(top.summary),
+      extraCount: ordered.length - 1,
+      tone: waitReasonTone(top.kind),
+    };
+  }
+
+  const spinnerMembers = (team.members ?? []).filter(member =>
+    member.revision === team.revision
+    && SPINNER_FALLBACK_MEMBER_STATUSES.has(member.status)
+    && !member.stalledAt?.trim()
+    && Boolean(member.spinnerOnlySince?.trim()),
+  );
+
+  if (spinnerMembers.length > 0) {
+    return {
+      kind: "spinner-only",
+      label: waitReasonLabel("spinner-only"),
+      summary: memberSpinnerFallbackSummary(spinnerMembers[0]!, formatTime),
+      extraCount: ordered.length + spinnerMembers.length - 1,
+      tone: waitReasonTone("spinner-only"),
+    };
+  }
+
+  if (!top) return undefined;
+
+  return {
+    kind: top.kind,
+    label: waitReasonLabel(top.kind) ?? top.kind,
+    summary: normalizeWaitReasonSummary(top.summary),
+    extraCount: ordered.length - 1,
+    tone: waitReasonTone(top.kind),
+  };
 }
 
 export type MemberScreenNotice = {

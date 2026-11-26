@@ -114,7 +114,7 @@ export type PendingOperation = { id: string; kind: "prepare" | "member" | "resul
 type OperationCensus = { pendingId: string; at: string; state: "running" | "in-use" | "ended" | "unknown"; recorded?: number; using?: number; detail?: string };
 const CENSUS_TTL_MS = 10 * 60_000;
 const WITNESS_SAVE_MS = 200;
-type OperationRecorder = { pendingId: string; inFlight: number; sampling?: true; save?: NodeJS.Timeout };
+type OperationRecorder = { pendingId: string; inFlight: number; spawning: number; sampling?: true; save?: NodeJS.Timeout };
 function operationCensusEvent(kind: PendingOperation["kind"], census: Omit<OperationCensus, "at" | "pendingId">) {
   if (census.state === "running") return `The host still sees ${census.recorded} process(es) that match its record of the interrupted ${kind} operation${census.using ? `, and ${census.using} more using this run's directory` : ""}.`;
   if (census.state === "in-use") return `The host sees ${census.using} process(es) using this run's directory. None matches its record of the interrupted ${kind} operation.`;
@@ -1703,23 +1703,28 @@ export class TeamService {
     }
   }
   private commandRecorder(stored: Stored, id: string): CommandScope {
-    const recorder: OperationRecorder = { pendingId: id, inFlight: 0 };
+    const recorder: OperationRecorder = { pendingId: id, inFlight: 0, spawning: 0 };
     this.recorders.set(stored.run.id, recorder);
     const settle = () => { recorder.inFlight--; this.saveWitnessSoon(stored, recorder); };
+    const failed = () => new TeamError(409, "command-unavailable", "The team operation failed; the command was not started.");
     this.saveWitnessSoon(stored, recorder);
     return {
       starting: () => {
+        if (this.intent(stored, id)?.failure) return Promise.reject(failed());
         recorder.inFlight++;
+        recorder.spawning++;
         if (this.intent(stored, id)?.recording) return undefined;
         return this.enqueue(stored.run.id, () => {
           if (this.closed) throw new TeamError(409, "command-unavailable", "The host is stopping; the command was not started.");
           const pending = this.intent(stored, id);
+          if (pending?.failure) throw failed();
           if (!pending || pending.recording) return;
           pending.recording = true;
           try { this.save(stored); } catch (error) { delete pending.recording; throw error; }
-        }).catch(error => { recorder.inFlight--; throw error; });
+        }).catch(error => { recorder.inFlight--; recorder.spawning--; throw error; });
       },
       started: pid => {
+        recorder.spawning--;
         const witness = this.intent(stored, id)?.witness;
         if (pid === undefined || !witness) { settle(); return; }
         if (process.platform !== "win32") recordCommand(witness, pid);
@@ -1822,9 +1827,10 @@ export class TeamService {
       this.save(stored);
     }), error => this.enqueue(stored.run.id, () => {
       if (this.closed || stored.pending?.id !== pending.id) return;
+      this.commands.get(stored.run.id)?.abort();
       this.commands.delete(stored.run.id);
-      const failed = stored.pending;
-      if (this.recorderOf(stored, failed)?.inFlight === 0) delete failed.recording;
+      const failed = stored.pending, recorder = this.recorderOf(stored, failed);
+      if (recorder?.spawning === 0 && (process.platform !== "win32" || recorder.inFlight === 0)) delete failed.recording;
       failed.failure = { code: error instanceof TeamError ? error.code : "workspace-operation-failed",
         reason: error instanceof Error ? error.message : "A team workspace operation failed.", at: timestamp() };
       this.save(stored);

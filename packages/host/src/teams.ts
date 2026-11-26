@@ -2019,7 +2019,7 @@ export class TeamService {
         for (const member of run.members.filter(item => item.revision === run.revision && item.status === "running" && !item.report)) {
           const state = await this.manager.state(member.sessionId);
           if (state.status !== "running") member.status = "unavailable";
-          member.lastActivityAt = state.attention.lastActivityAt;
+          if (!["unavailable", "recording-error"].includes(state.status)) member.lastActivityAt = state.attention.lastActivityAt;
           member.pendingLimit = Boolean(state.attention.limit);
         }
         this.save(stored);
@@ -2122,7 +2122,7 @@ export class TeamService {
           }
           if (!member.report) {
             const state = await this.manager.state(member.sessionId);
-            member.lastActivityAt = state.attention.lastActivityAt;
+            if (!["unavailable", "recording-error"].includes(state.status)) member.lastActivityAt = state.attention.lastActivityAt;
             member.pendingLimit = Boolean(state.attention.limit);
             const journalDrained = !page.more && member.cursor >= state.seq;
             if (state.status === "exited" && (page.more || member.cursor < state.seq)) { this.save(stored); continue; }

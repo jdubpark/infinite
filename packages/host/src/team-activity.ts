@@ -3,7 +3,7 @@ import type { TeamMember, TeamRun } from "./team-types.js";
 import type { Stored } from "./teams.js";
 
 export interface TeamSaveSnapshot {
-  persisted: string;
+  persisted?: string;
   runState: string;
   activity: string;
 }
@@ -69,13 +69,20 @@ function normalizeMember(member: TeamMember) {
 
 function normalizeLinear(linear: TeamRun["linear"]) {
   if (!linear) return undefined;
+  if (linear.status === "synced" || (linear.status === "pending" && linear.issue)) {
+    return { status: "synced" as const, issue: linear.issue };
+  }
   const { checkedAt: _checkedAt, retryAt: _retryAt, ...rest } = linear;
   return rest;
 }
 
-export function teamSaveSnapshot(stored: Stored): TeamSaveSnapshot {
+export function persistedDigest(stored: Stored): string {
+  const { updatedAt: _updatedAt, lastActivityAt: _lastActivityAt, ...runWithoutTimes } = stored.run;
+  return digest({ ...stored, run: runWithoutTimes });
+}
+
+function stateDigests(stored: Stored): { runState: string; activity: string } {
   const { updatedAt: _updatedAt, lastActivityAt: _lastActivityAt, linear, members, ...runRest } = stored.run;
-  const persisted = digest({ ...stored, run: { ...runRest, members, ...(linear ? { linear } : {}) } });
   const normalizedMembers = members.map(normalizeMember);
   const {
     run: _run,
@@ -101,7 +108,11 @@ export function teamSaveSnapshot(stored: Stored): TeamSaveSnapshot {
     },
   });
   const activity = digest({ ...runRest, members: normalizedMembers });
-  return { persisted, runState, activity };
+  return { runState, activity };
+}
+
+export function teamSaveSnapshot(stored: Stored): TeamSaveSnapshot {
+  return { persisted: persistedDigest(stored), ...stateDigests(stored) };
 }
 
 export class TeamSaveTracker {
@@ -114,10 +125,11 @@ export class TeamSaveTracker {
   commit(stored: Stored, write: () => void, now: () => string, records?: ReadonlyMap<string, Stored>): boolean {
     const id = stored.run.id;
     const prior = this.snapshots.get(id);
-    const next = teamSaveSnapshot(stored);
-    if (prior !== undefined && next.persisted === prior.persisted) return false;
-    const runStateChanged = prior === undefined || next.runState !== prior.runState;
-    const activityChanged = prior === undefined || next.activity !== prior.activity;
+    const persisted = persistedDigest(stored);
+    if (prior?.persisted !== undefined && persisted === prior.persisted) return false;
+    const { runState, activity } = stateDigests(stored);
+    const runStateChanged = prior === undefined || runState !== prior.runState;
+    const activityChanged = prior === undefined || activity !== prior.activity;
     const previousUpdatedAt = stored.run.updatedAt;
     const previousLastActivityAt = stored.run.lastActivityAt;
     if (runStateChanged || activityChanged) {
@@ -132,9 +144,12 @@ export class TeamSaveTracker {
     } catch (error) {
       stored.run.updatedAt = previousUpdatedAt;
       stored.run.lastActivityAt = previousLastActivityAt;
+      if (prior !== undefined) {
+        this.snapshots.set(id, { persisted: undefined, runState: prior.runState, activity: prior.activity });
+      }
       throw error;
     }
-    this.snapshots.set(id, next);
+    this.snapshots.set(id, { persisted, runState, activity });
     if (records && this.snapshots.size > records.size + 64) {
       for (const key of this.snapshots.keys()) if (!records.has(key)) this.snapshots.delete(key);
     }

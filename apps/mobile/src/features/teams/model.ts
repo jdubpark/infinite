@@ -53,7 +53,7 @@ export type TeamContinuation = { revision: number; requestId: string; at: string
 export type TeamMember = {
   memberId: string; sessionId: string; role: TeamRole; revision: number; planRevision?: number; title: string; status: string;
   taskId?: string; provider?: string; modelProfile?: ModelProfile; stoppedReason?: string;
-  startedAt?: string; reportedAt?: string; lastActivityAt?: string; spinnerOnlySince?: string; stalledAt?: string;
+  startedAt?: string; reportedAt?: string; lastActivityAt?: string; spinnerOnlySince?: string; pendingLimit?: boolean; stalledAt?: string;
   replacesMemberId?: string;
   replaces?: { memberId: string; cause?: string };
 };
